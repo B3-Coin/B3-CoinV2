@@ -164,7 +164,7 @@ void SendCoinsDialog::on_sendButton_clicked()
     }
 
     fNewRecipientAllowed = false;
-    if(!IsTimeGood){
+    if(!IsTimeGood && ui->checkBoxFnPayment->isChecked()){
         int ret = QMessageBox::warning(this, tr("Fundamental node Payment"),
                                         tr("Fundamental node implementation is not started yet\n"
 
