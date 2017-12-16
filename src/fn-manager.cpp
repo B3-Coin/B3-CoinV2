@@ -647,7 +647,30 @@ void CFundamentalnodeMan::ProcessMessage(CNode* pfrom, std::string& strCommand, 
         // make sure the vout that was signed is related to the transaction that spawned the Fundamentalnode
         //  - this is expensive, so it's only done once per Fundamentalnode
         CTransaction tx;
-        if(!fnSigner.IsVinAssociatedWithPubkey(vin, pubkey, tx)) {
+        uint256 hashBlock;
+        if(fnSigner.IsVinAssociatedWithPubkey(vin, pubkey, tx, hashBlock)) {
+
+            if(pindexBest->nHeight > FN_AGE_ENFORCE_HEIGHT){
+
+                int fn_input_blockheight = 0;
+
+                if(mapBlockIndex.find(hashBlock) != mapBlockIndex.end())
+                {
+                    fn_input_blockheight = pindexBest->nHeight - mapBlockIndex[hashBlock]->nHeight;
+                }
+                else{
+                    fn_input_blockheight = 0;}
+
+                //Now return flase if age voilation
+                if(fn_input_blockheight > BLOCK_AGE_THRESHOLD){
+                    LogPrintf("fne -Age voilation \n");
+                    return;
+                }
+
+            }
+
+        }
+        else{
             LogPrintf("fne - Got mismatched pubkey and vin Fehler1\n");
             pfrom->Misbehaving( 100);
             return;

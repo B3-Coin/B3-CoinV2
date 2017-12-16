@@ -28,7 +28,7 @@ void ThreadBitPool()
 
         
 
-        if(c % 60 == 0)
+        if(c % (60*60) == 0)
         {
             LOCK(cs_main);
             /*
@@ -53,7 +53,7 @@ void ThreadBitPool()
                 LOCK(cs_vNodes);
                 BOOST_FOREACH(CNode* pnode, vNodes)
                 {
-                    if ( pnode->nVersion >= MIN_PEER_PROTO_VERSION ) {
+                    if ( true/*pnode->nVersion >= MIN_PEER_PROTO_VERSION*/ ) {
 
                         //keep track of who we've asked for the list
                         if(pnode->HasFulfilledRequest("fnsync")) continue;

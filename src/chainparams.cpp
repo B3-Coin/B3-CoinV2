@@ -77,30 +77,19 @@ public:
         assert(hashGenesisBlock == uint256("0x4b0d7f133c5267d715d4d8992635a5490d1edd6b7072cce3f8fe116aba983b6a"));
         assert(genesis.hashMerkleRoot == uint256("0x4243fd570d4cb2e2930767f5bf18b2f65f1b7c4e16a392552d1efadeec00753d"));
 
+
+
+        vSeeds.push_back(CDNSSeedData("45.77.137.78", "45.77.137.78"));
+        vSeeds.push_back(CDNSSeedData("45.77.249.100", "45.77.249.100"));
+        vSeeds.push_back(CDNSSeedData("85.214.68.75", "85.214.68.75"));
+        vSeeds.push_back(CDNSSeedData("188.68.52.172", "188.68.52.172"));
+        vSeeds.push_back(CDNSSeedData("107.174.67.211", "107.174.67.211"));
         vSeeds.push_back(CDNSSeedData("0", "seed0.b3coin.zone"));
         vSeeds.push_back(CDNSSeedData("1", "seed1.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("2", "seed2.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("3", "seed3.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("4", "seed4.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("5", "seed5.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("6", "seed6.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("7", "seed7.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("8", "seed8.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("9", "seed9.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("10", "seed10.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("11", "seed11.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("12", "seed12.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("13", "seed13.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("14", "seed14.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("15", "seed15.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("16", "seed16.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("17", "seed17.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("18", "seed18.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("19", "seed19.b3coin.zone"));
-        vSeeds.push_back(CDNSSeedData("20", "seed20.b3coin.zone"));
+
 		
 
-        base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1, 63); // first letter "D"
+        base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1, 63); //
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1, 85); 
         base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1, 153);
         base58Prefixes[EXT_PUBLIC_KEY] = boost::assign::list_of(0x04)(0x88)(0xB2)(0x1E).convert_to_container<std::vector<unsigned char> >();

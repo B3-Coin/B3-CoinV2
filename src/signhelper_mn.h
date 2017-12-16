@@ -17,15 +17,14 @@ class CFNSignHelper{
 	public:
 	CScript collateralPubKey;
     /// Is the inputs associated with this public key? 
-    bool IsVinAssociatedWithPubkey(CTxIn& vin, CPubKey& pubkey, CTransaction& tx){
+    bool IsVinAssociatedWithPubkey(CTxIn& vin, CPubKey& pubkey, CTransaction& tx, uint256& hashBlock){
 		CScript payee2;
 		payee2.SetDestination(pubkey.GetID());
         //bool IsBurntTxn;TODO: implement input check
         //bool IsFnTxn;
 
-        //CTransaction txVin;
-        uint256 hashBlock;
         if(GetTransaction(vin.prevout.hash, tx, hashBlock)){
+
             BOOST_FOREACH(CTxOut out, tx.vout){
                 if(out.nValue == 1*COIN){
                     if(out.scriptPubKey == payee2) return true;
@@ -89,7 +88,7 @@ class CFNSignHelper{
 		CBitcoinAddress address;
 		if (!address.SetString(strAddress))
 		{
-			LogPrintf("CFnSigner::SetCollateralAddress - Invalid Darksend collateral address\n");
+            LogPrintf("CFnSigner::SetCollateralAddress - Invalid collateral address\n");
 			return false;
 		}
 		collateralPubKey.SetDestination(address.Get());

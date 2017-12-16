@@ -346,7 +346,7 @@ CBlock* CreateNewBlock(CReserveKey& reservekey, bool fProofOfStake, int64_t* pFe
             if (fSortedByFee && (dFeePerKb < nMinTxFee) && (nBlockSize + nTxSize >= nBlockMinSize)){
                 if(dPriority != 0 || dFeePerKb !=0){
                     continue;
-                }
+               }
                 //LogPrintf(" fundamental node payment ");
                 //continue;
             }
@@ -374,10 +374,10 @@ CBlock* CreateNewBlock(CReserveKey& reservekey, bool fProofOfStake, int64_t* pFe
             //check if fundamental node payment
             if((tx.GetValueIn(mapInputs)-tx.GetValueOut()) >= GetFNCollateral(pindexBest->nHeight) ){
                 nTxFees = tx.GetValueIn(mapInputs) - GetFNCollateral(pindexBest->nHeight) - tx.GetValueOut();
-                LogPrintf("CreateNewBlock : Funamental Transaction nTxFees  = %d \n", nTxFees);
+                //LogPrintf("CreateNewBlock : Funamental Transaction nTxFees  = %d \n", nTxFees);
             } else{
                 nTxFees = tx.GetValueIn(mapInputs)-tx.GetValueOut();
-                LogPrintf("CreateNewBlock : Not a Funamental Transaction, nTxFees = %d \n",nTxFees);
+                //LogPrintf("CreateNewBlock : Not a Funamental Transaction, nTxFees = %d \n",nTxFees);
             }
 
             //tx.GetValueIn(mapInputs)-tx.GetValueOut();

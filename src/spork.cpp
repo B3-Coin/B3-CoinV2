@@ -175,8 +175,8 @@ bool CSporkManager::UpdateSpork(int nSporkID, int64_t nValue)
     msg.nSporkID = nSporkID;
     msg.nValue = nValue;
     msg.nTimeSigned = GetTime();
-    uint256 txnhash = uint256("0x401a59a4295259a01ec0c7fb21903d77b90ada0bce1e40b17648d42c17bd05bf");
-    msg.vtxhash.push_back(txnhash);
+    //uint256 txnhash = uint256("0x401a59a4295259a01ec0c7fb21903d77b90ada0bce1e40b17648d42c17bd05bf");
+    //msg.vtxhash.push_back(txnhash);
 
     if(Sign(msg)){
         Relay(msg);

@@ -1141,7 +1141,7 @@ void CWallet::AvailableCoins(vector<COutput>& vCoins, bool fOnlyConfirmed, const
             } else{
 
                 for (unsigned int i = 0; i < pcoin->vout.size(); i++)
-                    if (!(pcoin->IsSpent(i)) && IsMine(pcoin->vout[i]) && pcoin->vout[i].nValue >= nMinimumInputValue &&
+                    if (!(pcoin->IsSpent(i)) && IsMine(pcoin->vout[i]) && pcoin->vout[i].nValue > 1*COIN &&
                     (!coinControl || !coinControl->HasSelected() || coinControl->IsSelected((*it).first, i)))
                         vCoins.push_back(COutput(pcoin, i, nDepth));
             }
@@ -1854,6 +1854,7 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
         LogPrintf("restructed rewards are true");
         restrictedRewards = true;
     } else {
+        restrictedRewards = false;
         LogPrintf("restructed rewards are false");
     }
 	
@@ -1866,8 +1867,8 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
         txNew.vout[1].nValue = (blockValue / 2 / CENT) * CENT;
         txNew.vout[2].nValue = blockValue - txNew.vout[1].nValue;
         }else {
-            txNew.vout[1].nValue = ((blockValue / 2 / CENT) * CENT)/100;
-            txNew.vout[2].nValue = (blockValue - txNew.vout[1].nValue)/100;
+            txNew.vout[1].nValue = 0;
+            txNew.vout[2].nValue = 0;
         }
     }
     else if(hasPayment && txNew.vout.size() == 4) // 2 stake outputs, stake was split, plus a fundamentalnode payment
@@ -1878,15 +1879,15 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
         txNew.vout[1].nValue = (blockValue / 2 / CENT) * CENT;
         txNew.vout[2].nValue = blockValue - txNew.vout[1].nValue;
         } else {
-            txNew.vout[1].nValue = ((blockValue / 2 / CENT) * CENT)/100;
-            txNew.vout[2].nValue = (blockValue - txNew.vout[1].nValue)/100;
+            txNew.vout[1].nValue = 0;
+            txNew.vout[2].nValue = 0;
         }
     }
     else if(!hasPayment && txNew.vout.size() == 2){ // only 1 stake output, was not split, no fundamentalnode payment
         if(!restrictedRewards){
         txNew.vout[1].nValue = blockValue;
         } else {
-            txNew.vout[1].nValue = (blockValue)/100;
+            txNew.vout[1].nValue = 0;
         }
     }
     else if(hasPayment && txNew.vout.size() == 3) // only 1 stake output, was not split, plus a fundamentalnode payment
@@ -1897,7 +1898,7 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
         if(!restrictedRewards){
         txNew.vout[1].nValue = blockValue;
         }else {
-            txNew.vout[1].nValue = (blockValue)/100;
+            txNew.vout[1].nValue = 0;
         }
     } else{
         if(hasPayment){
@@ -1906,7 +1907,7 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
             if(!restrictedRewards){
                 txNew.vout[1].nValue = blockValue;
             } else {
-                txNew.vout[1].nValue = (blockValue)/100;
+                txNew.vout[1].nValue = 0;
             }
 
         } else{
