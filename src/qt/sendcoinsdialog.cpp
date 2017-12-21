@@ -168,7 +168,7 @@ void SendCoinsDialog::on_sendButton_clicked()
     if(IsFundamentNodePayment){
 
                 if(!IsTimeGood){
-                    int ret = QMessageBox::warning(this, tr("Fundamental node Payment"),
+                    int ret = QMessageBox::warning(this, tr("Fundamental Node Payment"),
                                                     tr("Fundamental node implementation is not started yet\n"
 
                                                        "Please wait till appropriate time."),
@@ -180,8 +180,11 @@ void SendCoinsDialog::on_sendButton_clicked()
                     }
                 }
         
-                int ret = QMessageBox::warning(this, tr("Fundamental node Payment"),
-                                                tr("You are about to do burning for Fundamentalnode payment, Please make sure that you send (25,000,001, before block 85000, 20,000,001 before block 95000, otherwise 15,000,001 after block 95000) excluding fees\n"
+                int ret = QMessageBox::warning(this, tr("Fundamental Node Payment"),
+                                                tr("You are about to send burn payment for a B3 Fundamental Node. Please make sure that you send the following excluding fees:\n"
+                                                    "Before block 85000: 25000001 (B3) or 25000.001 (kB3)\n"
+                                                    "Block 85001-95000: 20000001 (B3) or 20000.001 (kB3)\n"
+                                                    "After Block 95000: 15000001 (B3) or 15000.001 (kB3)\n"
 
                                                    "Are you sure? "),
                                                 QMessageBox::Yes | QMessageBox::Cancel);
