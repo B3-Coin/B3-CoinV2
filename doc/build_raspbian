@@ -1,0 +1,156 @@
+Copyright (c) 2009-2012 Bitcoin Developers
+Distributed under the MIT/X11 software license, see the accompanying
+file license.txt or http://www.opensource.org/licenses/mit-license.php.
+This product includes software developed by the OpenSSL Project for use in
+the OpenSSL Toolkit (http://www.openssl.org/).  This product includes
+cryptographic software written by Eric Young (eay@cryptsoft.com) and UPnP
+software written by Thomas Bernard.
+
+
+RASPBIAN BUILD NOTES
+================
+Prerequisites
+--------
+
+Raspberry Pi (tested Pi 3 1GB RAM)
+Another PC with SD card slot
+Internet access
+SD card for OS (min 8 GB, 32GB recommended)
+HDD for blockchain (optional)
+
+Raspbian OS
+--------
+
+Get these Raspbian OS Jessie IMG -> https://downloads.raspberrypi.org/raspbian/images/raspbian-2017-07-05/
+Flash it into Your SD card.
+* You could also use distribution swap on live Raspbian, but I've never tried it myself, some tutorials could be found on the internet.
+
+Raspbian - Configuration
+--------
+
+First boot could take a while. When You are loged on access terminal.
+1. Raspi-config
+type: 
+  sudo raspi-config
+->Make filesystem use whole SD card
+->Change Memory Split to 16MB
+->Set Your locale
+->Enable login into CLI client
+->Finish & Reboot
+2. Cleaning an Image
+type following commands one by one:
+  sudo apt-get remove --purge libreoffice*
+  sudo apt-get clean
+  sudo apt-get autoremove
+3.Updating repositories
+type:
+  sudo apt-get update
+  sudo apt-get upgrade
+  sudo reboot
+
+Dependencies Building
+--------
+
+Type following in teminal:
+  sudo apt update
+  sudo apt install git build-essential libdb++-dev libboost-all-dev make libssl-dev libminiupnpc-dev && reboot
+Wait for it to fininsh and reboot
+Then make pull directory (or just navigate to main directory):
+  mkdir ~/B3coin && cd ~/B3coin
+  or 
+  cd ~/
+Then type following:
+  git clone https://github.com/B3-Coin/B3-CoinV2.git
+When it finish type one by one:
+  cd ~/[B3Coin diretory]/src/leveldb/
+  chmod +x build_detect_platform
+  make clean
+  make libmemenv.a libleveldb.a
+Once it's done, You're ready to go. If You are using previous versions of RPi you may consider creating SWAP file now, with RPi 3 there is no need to do so. Various tutorials could be found over internet.
+
+To Build
+--------
+
+  cd src/
+  make -f makefile.unix            # Headless b3coin
+  strip b3coind                    # Optional but greatly reduce binary size
+Be patient now, proccess could take up to few hours, once it's done b3coind executable will be created in main B3coin directory.
+For easy of future use of Your newly compiled b3coind type following:
+  sudo mv b3coind /usr/local/bin
+This little trick allows You to access b3coind from any directory on Your RPi.
+
+Right now You can just type:
+  b3coind -daemon
+And enjoy Your CLI Raspberry Pi B3coin wallet! :D
+For future use You can compile QT wallet or use console command paired with 'b3coind' to access Your wallet, examples:
+  b3coind getstakinginfo
+  b3coind getinfo
+  b3coind listunspent
+  etc...
+
+Donations greatly appreciated :)
+BTC: 1AGq5MBRuz1N5nhNbu2dijxQueXBrEpeue
+B3Coin: SWREBw4FfnQ7u3n2xUYSCJRunBhXd5q4gk
+ETH: 0x0FFEB241A155C85420704efa283e4B440943d613
+
+List of Dependencies
+------------
+
+ Library     Purpose           Description
+ -------     -------           -----------
+ libssl      SSL Support       Secure communications
+ libdb       Berkeley DB       Blockchain & wallet storage
+ libboost    Boost             C++ Library
+ miniupnpc   UPnP Support      Optional firewall-jumping support
+
+miniupnpc may be used for UPnP port mapping.  It can be downloaded from
+http://miniupnp.tuxfamily.org/files/.  UPnP support is compiled in and
+turned off by default.  Set USE_UPNP to a different value to control this:
+ USE_UPNP=-    No UPnP support - miniupnp not required
+ USE_UPNP=0    (the default) UPnP support turned off by default at runtime
+ USE_UPNP=1    UPnP support turned on by default at runtime
+
+Licenses of statically linked libraries:
+ Berkeley DB   New BSD license with additional requirement that linked
+               software must be free open source
+ Boost         MIT-like license
+ miniupnpc     New (3-clause) BSD license
+
+Versions used in this release:
+ GCC           4.9.0
+ OpenSSL       1.0.1g
+ Berkeley DB   5.3.28.NC
+ Boost         1.55.0
+ miniupnpc     1.9.20140401
+
+Dependency Build Instructions: Raspbian Jessie 2017-07-05
+----------------------------------------------
+sudo apt-get install build-essential
+sudo apt-get install libssl-dev
+sudo apt-get install libdb++-dev
+sudo apt-get install libboost-all-dev
+sudo apt-get install libqrencode-dev
+
+
+miniupnpc
+---------
+tar -xzvf miniupnpc-1.6.tar.gz
+cd miniupnpc-1.6
+make
+sudo su
+make install
+
+
+Berkeley DB
+-----------
+You need Berkeley DB. If you have to build Berkeley DB yourself:
+../dist/configure --enable-cxx
+make
+
+
+Boost
+-----
+If you need to build Boost yourself:
+sudo su
+./bootstrap.sh
+./bjam install
