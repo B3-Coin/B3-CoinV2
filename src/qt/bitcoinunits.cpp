@@ -72,7 +72,8 @@ int BitcoinUnits::amountDigits(int unit)
 {
     switch(unit)
     {
-    case KBTC: return 5; // 21,000 (# digits, without commas)
+    case KBTC: return 6; // 210,000 (# digits, without commas). 
+                         // previously set to 5. 5 limits kB3 transfers up to 99 million B3 whereas now 6 will support 999 million B3 transfer
     case BTC: return 10; // 21,000,000
     case mBTC: return 11; // 21,000,000,000
     case uBTC: return 14; // 21,000,000,000,000
