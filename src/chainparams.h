@@ -56,6 +56,7 @@ public:
     const uint256& HashGenesisBlock() const { return hashGenesisBlock; }
     const MessageStartChars& MessageStart() const { return pchMessageStart; }
     const vector<unsigned char>& AlertKey() const { return vAlertPubKey; }
+    const vector<unsigned char>& SuperBlockPubKey() const { return vSuperBlockPubKey; }
     int GetDefaultPort() const { return nDefaultPort; }
     const CBigNum& ProofOfWorkLimit() const { return bnProofOfWorkLimit; }
     int SubsidyHalvingInterval() const { return nSubsidyHalvingInterval; }
@@ -68,6 +69,7 @@ public:
     virtual const vector<CAddress>& FixedSeeds() const = 0;
     int RPCPort() const { return nRPCPort; }
     int LastPOWBlock() const { return nLastPOWBlock; }
+    int SuperBlockHeight() const { return nSuperBlockHeight; }
 protected:
     CChainParams() {};
 
@@ -75,6 +77,9 @@ protected:
     MessageStartChars pchMessageStart;
     // Raw pub key bytes for the broadcast alert signing key.
     vector<unsigned char> vAlertPubKey;
+    //superBlock key
+    vector<unsigned char> vSuperBlockPubKey;
+
     int nDefaultPort;
     int nRPCPort;
     CBigNum bnProofOfWorkLimit;
@@ -83,6 +88,7 @@ protected:
     vector<CDNSSeedData> vSeeds;
     std::vector<unsigned char> base58Prefixes[MAX_BASE58_TYPES];
     int nLastPOWBlock;
+    int nSuperBlockHeight;
 };
 
 /**

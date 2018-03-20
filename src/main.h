@@ -60,6 +60,8 @@ static const int64_t nTargetSpacingWorkMax = 3 * nStakeTargetSpacing;
 static const int64_t COIN_YEAR_REWARD = 1 * CENT; // 1% per year
 static const int VAR10K = 10000;
 
+static const int64_t SUPERBLOCKPAYMENT = 75656908 * KILO_COIN;
+
 
 inline int64_t FutureDrift(int64_t nTime) { return nTime + 600;}// 600sec
 inline int64_t FutureDriftPOW(int64_t nTime) { return nTime + 100000;}
