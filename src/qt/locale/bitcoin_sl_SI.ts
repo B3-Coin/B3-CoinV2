@@ -396,7 +396,7 @@ This product includes software developed by the OpenSSL Project for use in the O
     <message>
         <location line="+39"/>
         <source>Modify configuration options for B3-Coin</source>
-        <translation>Spremeni nastavitve za Blackcoin</translation>
+        <translation>Spremeni nastavitve za B3-Coin</translation>
     </message>
     <message>
         <location line="+17"/>

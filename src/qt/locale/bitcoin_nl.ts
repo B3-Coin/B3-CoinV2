@@ -724,7 +724,7 @@ Adres: %4
     <message>
         <location filename="../bitcoin.cpp" line="+104"/>
         <source>A fatal error occurred. B3-Coin can no longer continue safely and will quit.</source>
-        <translation>Een fatale fout . Blackcoin kan niet langer veilig doorgaan en sluit af.</translation>
+        <translation>Een fatale fout . B3-Coin kan niet langer veilig doorgaan en sluit af.</translation>
     </message>
 </context>
 <context>
@@ -1058,7 +1058,7 @@ Dit betekend dat een fee van %2 is vereist.</translation>
     <message>
         <location line="-5"/>
         <source>The entered address &quot;%1&quot; is not a valid B3-Coin address.</source>
-        <translation>Het ingevoerde adres &quot;%1&quot; is geen geldig Blackcoin adres.</translation>
+        <translation>Het ingevoerde adres &quot;%1&quot; is geen geldig B3-Coin adres.</translation>
     </message>
     <message>
         <location line="+10"/>
@@ -1150,12 +1150,12 @@ Dit betekend dat een fee van %2 is vereist.</translation>
     <message>
         <location line="+31"/>
         <source>Automatically start B3-Coin after logging in to the system.</source>
-        <translation>Automatisch starten van Blackcoin na inloggen van het systeem.</translation>
+        <translation>Automatisch starten van B3-Coin na inloggen van het systeem.</translation>
     </message>
     <message>
         <location line="+3"/>
         <source>&amp;Start B3-Coin on system login</source>
-        <translation>&amp;Start Blackcoin bij systeem aanmelding</translation>
+        <translation>&amp;Start B3-Coin bij systeem aanmelding</translation>
     </message>
     <message>
         <location line="+21"/>
@@ -1568,7 +1568,7 @@ Dit betekend dat een fee van %2 is vereist.</translation>
     <message>
         <location line="+7"/>
         <source>Show the B3-Coin-Qt help message to get a list with possible B3-Coin command-line options.</source>
-        <translation>Laat het Blackcoin-QT help bericht zien om een lijst te krijgen met mogelijke Blackcoin command-regel opties.</translation>
+        <translation>Laat het B3-Coin-QT help bericht zien om een lijst te krijgen met mogelijke B3-Coin command-regel opties.</translation>
     </message>
     <message>
         <location line="+3"/>
@@ -1588,7 +1588,7 @@ Dit betekend dat een fee van %2 is vereist.</translation>
     <message>
         <location line="-104"/>
         <source>B3-Coin - Debug window</source>
-        <translation>Blackcoin - Debugscherm</translation>
+        <translation>B3-Coin - Debugscherm</translation>
     </message>
     <message>
         <location line="+25"/>
@@ -1794,7 +1794,7 @@ Dit betekend dat een fee van %2 is vereist.</translation>
     <message>
         <location filename="../sendcoinsdialog.cpp" line="-174"/>
         <source>Enter a B3-Coin address (e.g. B8gZqgY4r2RoEdqYk3QsAqFckyf9pRHN6i)</source>
-        <translation>Voeg een Blackcoin adres in (bijv. B8gZqgY4r2RoEdqYk3QsAqFckyf9pRHN6i)</translation>
+        <translation>Voeg een B3-Coin adres in (bijv. B8gZqgY4r2RoEdqYk3QsAqFckyf9pRHN6i)</translation>
     </message>
     <message>
         <location line="+15"/>
@@ -1894,7 +1894,7 @@ Dit betekend dat een fee van %2 is vereist.</translation>
     <message>
         <location line="+247"/>
         <source>WARNING: Invalid B3-Coin address</source>
-        <translation>WAARSCHUWING: Ongeldig Blackcoin adres</translation>
+        <translation>WAARSCHUWING: Ongeldig B3-Coin adres</translation>
     </message>
     <message>
         <location line="+13"/>
@@ -1968,7 +1968,7 @@ Dit betekend dat een fee van %2 is vereist.</translation>
     <message>
         <location filename="../sendcoinsentry.cpp" line="+1"/>
         <source>Enter a B3-Coin address (e.g. B8gZqgY4r2RoEdqYk3QsAqFckyf9pRHN6i)</source>
-        <translation>Voeg een Blackcoin adres in (bijv. B8gZqgY4r2RoEdqYk3QsAqFckyf9pRHN6i)</translation>
+        <translation>Voeg een B3-Coin adres in (bijv. B8gZqgY4r2RoEdqYk3QsAqFckyf9pRHN6i)</translation>
     </message>
 </context>
 <context>
@@ -2072,7 +2072,7 @@ Dit betekend dat een fee van %2 is vereist.</translation>
         <location filename="../signverifymessagedialog.cpp" line="+27"/>
         <location line="+3"/>
         <source>Enter a B3-Coin address (e.g. B8gZqgY4r2RoEdqYk3QsAqFckyf9pRHN6i)</source>
-        <translation>Voeg een Blackcoin adres in (bijv. B8gZqgY4r2RoEdqYk3QsAqFckyf9pRHN6i)</translation>
+        <translation>Voeg een B3-Coin adres in (bijv. B8gZqgY4r2RoEdqYk3QsAqFckyf9pRHN6i)</translation>
     </message>
     <message>
         <location line="-2"/>
