@@ -72,11 +72,11 @@ int BitcoinUnits::amountDigits(int unit)
 {
     switch(unit)
     {
-    case KBTC: return 5; // 21,000 (# digits, without commas)
-    case BTC: return 10; // 21,000,000
-    case mBTC: return 11; // 21,000,000,000
-    case uBTC: return 14; // 21,000,000,000,000
-    default: return 0;
+    case KBTC: return 7; // 9,999,999 KB3 (# digits, without commas)
+    case BTC: return 10; // 9,999,999,999 B3
+    case mBTC: return 13; // 9,999,999,999,999 mB3
+    case uBTC: return 16; // 9,999,999,999,999,999 uB3
+    default: return 10;
     }
 }
 
