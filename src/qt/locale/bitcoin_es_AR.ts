@@ -4,7 +4,7 @@
     <message>
         <location filename="../forms/aboutdialog.ui" line="+14"/>
         <source>About B3-Coin</source>
-        <translation>Sobre Blackcoin</translation>
+        <translation>Sobre B3-Coin</translation>
     </message>
     <message>
         <location line="+39"/>

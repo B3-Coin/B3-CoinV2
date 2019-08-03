@@ -4,7 +4,7 @@
     <message>
         <location filename="../forms/aboutdialog.ui" line="+14"/>
         <source>About B3-Coin</source>
-        <translation>Vad du behöver veta om Blackcoin</translation>
+        <translation>Vad du behöver veta om B3-Coin</translation>
     </message>
     <message>
         <location line="+39"/>
@@ -259,7 +259,7 @@ This product includes software developed by the OpenSSL Project for use in the O
     <message>
         <location line="+82"/>
         <source>B3-Coin will close now to finish the encryption process. Remember that encrypting your wallet cannot fully protect your coins from being stolen by malware infecting your computer.</source>
-        <translation>Blackcoin plånboken kommer nu att stängas för att slutföra krypteringen: Kom ihåg att även en krypterad plånboks säkerhet kan äventyras genom keyloggers eller dylika malwares.</translation>
+        <translation>B3-Coin plånboken kommer nu att stängas för att slutföra krypteringen: Kom ihåg att även en krypterad plånboks säkerhet kan äventyras genom keyloggers eller dylika malwares.</translation>
     </message>
     <message>
         <location line="+13"/>
@@ -724,7 +724,7 @@ Adress: %4
     <message>
         <location filename="../bitcoin.cpp" line="+104"/>
         <source>A fatal error occurred. B3-Coin can no longer continue safely and will quit.</source>
-        <translation>Ett fatalt fel uppstod. Blackcoin kan inte fortsätta och stänger programmet.</translation>
+        <translation>Ett fatalt fel uppstod. B3-Coin kan inte fortsätta och stänger programmet.</translation>
     </message>
 </context>
 <context>
@@ -1018,7 +1018,7 @@ Detta betyder att en avgift på minst %2 krävs.</translation>
     <message>
         <location line="+10"/>
         <source>The label associated with this address book entry</source>
-        <translation>Namnet som kopplats till denna Blackcoin-adress</translation>
+        <translation>Namnet som kopplats till denna B3-Coin-adress</translation>
     </message>
     <message>
         <location line="+7"/>
@@ -1058,7 +1058,7 @@ Detta betyder att en avgift på minst %2 krävs.</translation>
     <message>
         <location line="-5"/>
         <source>The entered address &quot;%1&quot; is not a valid B3-Coin address.</source>
-        <translation>Den inslagna adressen &quot;%1&quot; är inte en giltig Blackcoin adress.</translation>
+        <translation>Den inslagna adressen &quot;%1&quot; är inte en giltig B3-Coin adress.</translation>
     </message>
     <message>
         <location line="+10"/>
@@ -1150,12 +1150,12 @@ Detta betyder att en avgift på minst %2 krävs.</translation>
     <message>
         <location line="+31"/>
         <source>Automatically start B3-Coin after logging in to the system.</source>
-        <translation>Starta Blackcoin automatiskt vid inloggning.</translation>
+        <translation>Starta B3-Coin automatiskt vid inloggning.</translation>
     </message>
     <message>
         <location line="+3"/>
         <source>&amp;Start B3-Coin on system login</source>
-        <translation>&amp;Starta Blackcoin vid inloggning</translation>
+        <translation>&amp;Starta B3-Coin vid inloggning</translation>
     </message>
     <message>
         <location line="+21"/>
@@ -2826,7 +2826,7 @@ for example: alertnotify=echo %%s | mail -s &quot;B3-Coin Alert&quot; admin@foo.
     <message>
         <location line="-103"/>
         <source>Warning: Please check that your computer&apos;s date and time are correct! If your clock is wrong B3-Coin will not work properly.</source>
-        <translation>Varning: Kolla att din dators tid och datum är rätt. Blackcoin kan inte fungera ordentligt om tiden i datorn är fel.</translation>
+        <translation>Varning: Kolla att din dators tid och datum är rätt. B3-Coin kan inte fungera ordentligt om tiden i datorn är fel.</translation>
     </message>
     <message>
         <location line="+130"/>
@@ -3176,12 +3176,12 @@ for example: alertnotify=echo %%s | mail -s &quot;B3-Coin Alert&quot; admin@foo.
     <message>
         <location line="+4"/>
         <source>Error loading wallet.dat: Wallet requires newer version of B3-Coin</source>
-        <translation>Kunde inte ladda wallet.dat: En nyare version av Blackcoin krävs</translation>
+        <translation>Kunde inte ladda wallet.dat: En nyare version av B3-Coin krävs</translation>
     </message>
     <message>
         <location line="+1"/>
         <source>Wallet needed to be rewritten: restart B3-Coin to complete</source>
-        <translation>Plånboken måste skrivas om: Starta om Blackcoin för att slutföra</translation>
+        <translation>Plånboken måste skrivas om: Starta om B3-Coin för att slutföra</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -3241,7 +3241,7 @@ for example: alertnotify=echo %%s | mail -s &quot;B3-Coin Alert&quot; admin@foo.
     <message>
         <location line="+124"/>
         <source>Unable to bind to %s on this computer. B3-Coin is probably already running.</source>
-        <translation>Kan inte binda till %s på denna dator. Blackcoin är sannolikt redan startad.</translation>
+        <translation>Kan inte binda till %s på denna dator. B3-Coin är sannolikt redan startad.</translation>
     </message>
     <message>
         <location line="-101"/>

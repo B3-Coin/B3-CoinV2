@@ -4,7 +4,7 @@
     <message>
         <location filename="../forms/aboutdialog.ui" line="+14"/>
         <source>About B3-Coin</source>
-        <translation>Acerca de Blackcoin</translation>
+        <translation>Acerca de B3-Coin</translation>
     </message>
     <message>
         <location line="+39"/>
@@ -59,7 +59,7 @@ This product includes software developed by the OpenSSL Project for use in the O
     <message>
         <location line="-43"/>
         <source>These are your B3-Coin addresses for receiving payments. You may want to give a different one to each sender so you can keep track of who is paying you.</source>
-        <translation>Estas son as túas dIreccións de Blackcoin para recibir os pagos. Pode que quieras asignarlle unha a cada remitente e así reconocer quen te está a pagar.</translation>
+        <translation>Estas son as túas dIreccións de B3-Coin para recibir os pagos. Pode que quieras asignarlle unha a cada remitente e así reconocer quen te está a pagar.</translation>
     </message>
     <message>
         <location line="+53"/>
@@ -74,7 +74,7 @@ This product includes software developed by the OpenSSL Project for use in the O
     <message>
         <location line="+7"/>
         <source>Sign a message to prove you own a B3-Coin address</source>
-        <translation>Firma a mensaxe para probar que tes unha dirección Blackcoin</translation>
+        <translation>Firma a mensaxe para probar que tes unha dirección B3-Coin</translation>
     </message>
     <message>
         <location line="+3"/>
@@ -89,7 +89,7 @@ This product includes software developed by the OpenSSL Project for use in the O
     <message>
         <location line="-10"/>
         <source>Verify a message to ensure it was signed with a specified B3-Coin address</source>
-        <translation>Verifica a mensaxe para asegurar que foi asinada por unha concreta dirección de Blackcoin</translation>
+        <translation>Verifica a mensaxe para asegurar que foi asinada por unha concreta dirección de B3-Coin</translation>
     </message>
     <message>
         <location line="+3"/>
@@ -391,7 +391,7 @@ This product includes software developed by the OpenSSL Project for use in the O
     <message>
         <location line="-55"/>
         <source>Send coins to a B3-Coin address</source>
-        <translation>Enviar moedas a unha dirección Blackcoin</translation>
+        <translation>Enviar moedas a unha dirección B3-Coin</translation>
     </message>
     <message>
         <location line="+39"/>

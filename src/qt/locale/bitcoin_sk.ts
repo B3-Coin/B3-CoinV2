@@ -1607,7 +1607,7 @@ To znamená, že je potrebný poplatok aspoň %2.</translation>
     <message>
         <location line="+7"/>
         <source>Open the B3-Coin debug log file from the current data directory. This can take a few seconds for large log files.</source>
-        <translation>Otvorte Blackcoin súbor denníku ladenia z aktuálneho adresára dát. To môže trvať niekoľko sekúnd pre veľké súbory denníka.</translation>
+        <translation>Otvorte B3-Coin súbor denníku ladenia z aktuálneho adresára dát. To môže trvať niekoľko sekúnd pre veľké súbory denníka.</translation>
     </message>
     <message>
         <location line="+102"/>
@@ -1617,7 +1617,7 @@ To znamená, že je potrebný poplatok aspoň %2.</translation>
     <message>
         <location filename="../rpcconsole.cpp" line="+325"/>
         <source>Welcome to the B3-Coin RPC console.</source>
-        <translation>Vitajte v konzole Blackcoin RPC.</translation>
+        <translation>Vitajte v konzole B3-Coin RPC.</translation>
     </message>
     <message>
         <location line="+1"/>
