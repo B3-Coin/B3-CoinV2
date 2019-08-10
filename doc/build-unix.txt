@@ -10,11 +10,23 @@ software written by Thomas Bernard.
 UNIX BUILD NOTES
 ================
 
-To Build
+To Build on Debian or Ubuntu
 --------
 
-cd src/
-make -f makefile.unix            # Headless b3coin
+sudo apt-get update
+sudo apt-get upgrade
+sudo reboot
+sudo apt-get install -y git build-essential libssl-dev libdb++-dev libboost-all-dev libqrencode-dev
+git clone https://github.com/B3-Coin/B3-CoinV2/
+cd B3-CoinV2/src/leveldb
+make clean
+make libmemenv.a libleveldb.a
+cd ..
+make -f makefile.unix
+sudo ln -s ~/B3-CoinV2/src/b3coind /usr/bin/b3coind
+b3coind
+
+(configure ~/.B3-CoinV2/b3coin.conf and ~/.B3-CoinV2/fundamentalnode.conf if it is a fundamental node)
 
 See readme-qt.rst for instructions on building B3-Coin QT,
 the graphical b3coin.
