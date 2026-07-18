@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+
+__sleep_amount() {
+  if [ -n "$constant_sleep" ]; then
+    sleep_time=$constant_sleep
+  else
+    sleep_time=`awk "BEGIN {t = $min_sleep * $(( (1<<($attempts -1)) )); print (t > $max_sleep ? $max_sleep : t)}"`
+  fi
+}
+
+__log_out() {
+  echo "$1" 1>&2
+}
+
+# Parameters: max_tries min_sleep max_sleep constant_sleep fail_script EXECUTION_COMMAND
+retry()
+{
+  local max_tries="$1"; shift
+  local min_sleep="$1"; shift
+  local max_sleep="$1"; shift
+  local constant_sleep="$1"; shift
+  local fail_script="$1"; shift
+  if [ -n "$VERBOSE" ]; then
+    __log_out "Retry Parameters: max_tries=$max_tries min_sleep=$min_sleep max_sleep=$max_sleep constant_sleep=$constant_sleep"
+    if [ -n "$fail_script" ]; then __log_out "Fail script: $fail_script"; fi
+    __log_out ""
+    __log_out "Execution Command: $*"
+    __log_out ""
+  fi
+
+  local attempts=0
+  local return_code=1
+
+
+  while [[ $return_code -ne 0 && $attempts -le $max_tries ]]; do
+    if [ $attempts -gt 0 ]; then
+      __sleep_amount
+      __log_out "Before retry #$attempts: sleeping $sleep_time seconds"
+      sleep $sleep_time
+    fi
+
+    P="$1"
+    for param in "${@:2}"; do P="$P '$param'"; done
+    export RETRY_ATTEMPT=$attempts
+    bash -c "$P"
+    return_code=$?
+    #__log_out "Process returned $return_code on attempt $attempts"
+    if [ $return_code -eq 127 ]; then
+      # command not found
+      exit $return_code
+    elif [ $return_code -ne 0 ]; then
+      attempts=$[$attempts +1]
+    fi
+  done
+
+  if [ $attempts -gt $max_tries ]; then
+    if [ -n "$fail_script" ]; then
+      __log_out "Retries exhausted, running fail script"
+      eval $fail_script
+    else
+      __log_out "Retries exhausted"
+    fi
+  fi
+
+  exit $return_code
+}
+
+  max_tries=10
+  min_sleep=0.3
+  max_sleep=60.0
+  constant_sleep=
+  fail_script=
+
+  retry "$max_tries" "$min_sleep" "$max_sleep" "$constant_sleep" "$fail_script" "$@"
