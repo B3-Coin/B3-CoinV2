@@ -1,5 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-present The Bitcoin Core developers
+// Copyright (c) 2026 The B3Coin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -13,6 +14,7 @@
 #include <chrono>
 #include <limits>
 #include <map>
+#include <optional>
 #include <vector>
 
 namespace Consensus {
@@ -84,6 +86,14 @@ struct BIP9Deployment {
 struct Params {
     uint256 hashGenesisBlock;
     int nSubsidyHalvingInterval;
+    /**
+     * First block height governed by post-fork consensus. When unset, the
+     * hard fork is disabled and all heights remain in the legacy era.
+     *
+     * This must be pinned together with the activation block hash before a
+     * production release enables post-fork validation.
+     */
+    std::optional<int> hard_fork_height;
     /**
      * Hashes of blocks that
      * - are known to be consensus valid, and

@@ -47,6 +47,7 @@ add_executable(test_bitcoin
   flatfile_tests.cpp
   fs_tests.cpp
   getarg_tests.cpp
+  hardfork_tests.cpp
   hash_tests.cpp
   headers_sync_chainwork_tests.cpp
   httpserver_tests.cpp
@@ -55,6 +56,8 @@ add_executable(test_bitcoin
   key_io_tests.cpp
   key_tests.cpp
   logging_tests.cpp
+  legacy_genesis_tests.cpp
+  legacy_pos_tests.cpp
   mempool_tests.cpp
   merkle_tests.cpp
   merkleblock_tests.cpp

@@ -18,7 +18,7 @@ using node::NodeContext;
 
 namespace init {
 namespace {
-const char* EXE_NAME = "bitcoind";
+const char* EXE_NAME = "b3coind";
 
 class BitcoindInit : public interfaces::Init
 {
