@@ -16,6 +16,7 @@
 #include <kernel/messagestartchars.h>
 #include <kernel/notifications_interface.h>
 #include <kernel/types.h>
+#include <legacy/consensus.h>
 #include <pow.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
@@ -131,7 +132,7 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
             CDiskBlockIndex diskindex;
             if (pcursor->GetValue(diskindex)) {
                 // Construct block index object
-                CBlockIndex* pindexNew = insertBlockIndex(diskindex.ConstructBlockHash());
+                CBlockIndex* pindexNew = insertBlockIndex(diskindex.ConstructBlockHash(consensusParams));
                 pindexNew->pprev          = insertBlockIndex(diskindex.hashPrev);
                 pindexNew->nHeight        = diskindex.nHeight;
                 pindexNew->nFile          = diskindex.nFile;
@@ -142,10 +143,18 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->nTime          = diskindex.nTime;
                 pindexNew->nBits          = diskindex.nBits;
                 pindexNew->nNonce         = diskindex.nNonce;
+                pindexNew->m_legacy_proof_of_stake = diskindex.m_legacy_proof_of_stake;
+                pindexNew->m_legacy_stake_modifier_generated = diskindex.m_legacy_stake_modifier_generated;
+                pindexNew->m_legacy_stake_modifier = diskindex.m_legacy_stake_modifier;
+                pindexNew->m_legacy_hash_proof = diskindex.m_legacy_hash_proof;
                 pindexNew->nStatus        = diskindex.nStatus;
                 pindexNew->nTx            = diskindex.nTx;
 
-                if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
+                // A stored legacy header can be header-only, in which case
+                // its PoW/PoS type is not knowable after restart. Full PoW
+                // blocks and PoS kernels are revalidated when connected.
+                const bool needs_proof_of_work{!legacy::IsActive(consensusParams, pindexNew->nHeight)};
+                if (needs_proof_of_work && !CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
                     LogError("%s: CheckProofOfWork failed: %s\n", __func__, pindexNew->ToString());
                     return false;
                 }
@@ -225,7 +234,9 @@ CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockInde
 {
     AssertLockHeld(cs_main);
 
-    auto [mi, inserted] = m_block_index.try_emplace(block.GetHash(), block);
+    const BlockMap::iterator previous{m_block_index.find(block.hashPrevBlock)};
+    const int height{previous == m_block_index.end() ? 0 : previous->second.nHeight + 1};
+    auto [mi, inserted] = m_block_index.try_emplace(block.GetHash(GetConsensus(), height), block);
     if (!inserted) {
         return &mi->second;
     }
@@ -1033,7 +1044,8 @@ bool BlockManager::WriteBlockUndo(const CBlockUndo& blockundo, BlockValidationSt
     return true;
 }
 
-bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::optional<uint256>& expected_hash) const
+bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::optional<uint256>& expected_hash,
+                             const std::optional<int> expected_height) const
 {
     block.SetNull();
 
@@ -1051,10 +1063,13 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
         return false;
     }
 
-    const auto block_hash{block.GetHash()};
+    const auto block_hash{block.GetHash(GetConsensus(), expected_height.value_or(/*legacy-safe fallback=*/0))};
 
-    // Check the header
-    if (!CheckProofOfWork(block_hash, block.nBits, GetConsensus())) {
+    // Legacy B3Coin proof-of-stake blocks carry their proof in the coinstake
+    // transaction, not the header hash. Their kernel is checked by
+    // Chainstate::ConnectBlock after the UTXO view is available.
+    const bool requires_header_pow{!GetConsensus().legacy_b3coin || block.IsProofOfWork()};
+    if (requires_header_pow && !CheckProofOfWork(block_hash, block.nBits, GetConsensus())) {
         LogError("Errors in block header at %s while reading block", pos.ToString());
         return false;
     }
@@ -1077,7 +1092,7 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
 bool BlockManager::ReadBlock(CBlock& block, const CBlockIndex& index) const
 {
     const FlatFilePos block_pos{WITH_LOCK(cs_main, return index.GetBlockPos())};
-    return ReadBlock(block, block_pos, index.GetBlockHash());
+    return ReadBlock(block, block_pos, index.GetBlockHash(), index.nHeight);
 }
 
 BlockManager::ReadRawBlockResult BlockManager::ReadRawBlock(const FlatFilePos& pos, std::optional<std::pair<size_t, size_t>> block_part) const

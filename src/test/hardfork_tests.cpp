@@ -4,6 +4,7 @@
 
 #include <consensus/hardfork.h>
 #include <consensus/params.h>
+#include <primitives/block.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -31,6 +32,25 @@ BOOST_AUTO_TEST_CASE(activation_height_is_first_post_fork_block)
     BOOST_CHECK(Consensus::GetEra(params, 100) == Consensus::Era::POST_HARD_FORK);
     BOOST_CHECK(Consensus::GetEra(params, 101) == Consensus::Era::POST_HARD_FORK);
     BOOST_CHECK(Consensus::IsHardForkActive(params, 100));
+}
+
+BOOST_AUTO_TEST_CASE(block_header_hash_switches_at_activation_height)
+{
+    CBlockHeader header;
+    header.nVersion = 4;
+    header.hashPrevBlock = uint256{"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"};
+    header.hashMerkleRoot = uint256{"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"};
+    header.nTime = 1'481'667'355;
+    header.nBits = 0x1e0fffff;
+    header.nNonce = 499'515;
+
+    Consensus::Params params{};
+    params.legacy_b3coin = true;
+    params.hard_fork_height = 100;
+
+    BOOST_CHECK(header.GetLegacyB3Hash() != header.GetHash());
+    BOOST_CHECK_EQUAL(header.GetHash(params, 99).GetHex(), header.GetLegacyB3Hash().GetHex());
+    BOOST_CHECK_EQUAL(header.GetHash(params, 100).GetHex(), header.GetHash().GetHex());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -139,14 +139,20 @@ void CCoinsViewCache::EmplaceCoinInternalDANGER(COutPoint&& outpoint, Coin&& coi
     }
 }
 
-void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, bool check_for_overwrite) {
+void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight,
+              bool check_for_overwrite, uint32_t nTxOffset) {
     bool fCoinbase = tx.IsCoinBase();
+    bool fCoinstake = tx.IsCoinStake();
     const Txid& txid = tx.GetHash();
     for (size_t i = 0; i < tx.vout.size(); ++i) {
+        // Empty outputs are historical B3Coin marker outputs (including the
+        // first output of a coinstake transaction), not spendable UTXOs.
+        if (tx.vout[i].nValue == 0 && tx.vout[i].scriptPubKey.empty()) continue;
         bool overwrite = check_for_overwrite ? cache.HaveCoin(COutPoint(txid, i)) : fCoinbase;
         // Coinbase transactions can always be overwritten, in order to correctly
         // deal with the pre-BIP30 occurrences of duplicate coinbase transactions.
-        cache.AddCoin(COutPoint(txid, i), Coin(tx.vout[i], nHeight, fCoinbase), overwrite);
+        cache.AddCoin(COutPoint(txid, i), Coin(tx.vout[i], nHeight, fCoinbase, fCoinstake,
+                                               tx.nTime, nTxOffset), overwrite);
     }
 }
 

@@ -69,7 +69,13 @@ RPCHelpMan importprunedfunds()
 
     LOCK(pwallet->cs_wallet);
     int height;
-    if (!pwallet->chain().findAncestorByHash(pwallet->GetLastBlockHash(), merkleBlock.header.GetHash(), FoundBlock().height(height))) {
+    uint256 block_hash{merkleBlock.header.GetHash()};
+    bool found_block{pwallet->chain().findAncestorByHash(pwallet->GetLastBlockHash(), block_hash, FoundBlock().height(height))};
+    if (!found_block) {
+        block_hash = merkleBlock.header.GetLegacyB3Hash();
+        found_block = pwallet->chain().findAncestorByHash(pwallet->GetLastBlockHash(), block_hash, FoundBlock().height(height));
+    }
+    if (!found_block) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found in chain");
     }
 
@@ -82,7 +88,7 @@ RPCHelpMan importprunedfunds()
 
     CTransactionRef tx_ref = MakeTransactionRef(tx);
     if (pwallet->IsMine(*tx_ref)) {
-        pwallet->AddToWallet(std::move(tx_ref), TxStateConfirmed{merkleBlock.header.GetHash(), height, static_cast<int>(txnIndex)});
+        pwallet->AddToWallet(std::move(tx_ref), TxStateConfirmed{block_hash, height, static_cast<int>(txnIndex)});
         return UniValue::VNULL;
     }
 

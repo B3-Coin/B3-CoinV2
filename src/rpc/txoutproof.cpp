@@ -158,6 +158,9 @@ static RPCHelpMan verifytxoutproof()
             LOCK(cs_main);
 
             const CBlockIndex* pindex = chainman.m_blockman.LookupBlockIndex(merkleBlock.header.GetHash());
+            if (!pindex && chainman.GetConsensus().legacy_b3coin) {
+                pindex = chainman.m_blockman.LookupBlockIndex(merkleBlock.header.GetLegacyB3Hash());
+            }
             if (!pindex || !chainman.ActiveChain().Contains(pindex) || pindex->nTx == 0) {
                 throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found in chain");
             }

@@ -23,6 +23,7 @@
 #include <headerssync.h>
 #include <index/blockfilterindex.h>
 #include <kernel/types.h>
+#include <legacy/consensus.h>
 #include <logging.h>
 #include <merkleblock.h>
 #include <net.h>
@@ -391,6 +392,18 @@ struct Peer {
 
     /** Whether we've sent this peer a getheaders in response to an inv prior to initial-headers-sync completing */
     bool m_inv_triggered_getheaders_before_sync GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+
+    /**
+     * Historical B3Coin blocks cannot be validated from headers alone: a
+     * header may describe either PoW or PoS. Legacy synchronization therefore
+     * asks for one complete block at a time through getblocks/inv/getdata.
+     */
+    bool m_legacy_getblocks_in_flight GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    std::optional<uint256> m_legacy_block_request GUARDED_BY(NetEventsInterface::g_msgproc_mutex){};
+    /** A peer has answered the current getblocks request without a new block. */
+    bool m_legacy_sync_complete GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    /** Time of the current legacy getblocks/getdata request. */
+    NodeClock::time_point m_legacy_request_time GUARDED_BY(NetEventsInterface::g_msgproc_mutex){};
 
     /** Protects m_getdata_requests **/
     Mutex m_getdata_requests_mutex;
@@ -2114,7 +2127,7 @@ void PeerManagerImpl::NewPoWValidBlock(const CBlockIndex *pindex, const std::sha
 
     if (!DeploymentActiveAt(*pindex, m_chainman, Consensus::DEPLOYMENT_SEGWIT)) return;
 
-    uint256 hashBlock(pblock->GetHash());
+    uint256 hashBlock{pindex->GetBlockHash()};
     const std::shared_future<CSerializedNetMsg> lazy_ser{
         std::async(std::launch::deferred, [&] { return NetMsg::Make(NetMsgType::CMPCTBLOCK, *pcmpctblock); })};
 
@@ -2199,7 +2212,9 @@ void PeerManagerImpl::BlockChecked(const std::shared_ptr<const CBlock>& block, c
 {
     LOCK(cs_main);
 
-    const uint256 hash(block->GetHash());
+    const CBlockIndex* parent{m_chainman.m_blockman.LookupBlockIndex(block->hashPrevBlock)};
+    const int height{parent ? parent->nHeight + 1 : 0};
+    const uint256 hash{block->GetHash(m_chainparams.GetConsensus(), height)};
     std::map<uint256, std::pair<NodeId, bool>>::iterator it = mapBlockSource.find(hash);
 
     // If the block failed validation, we know where it came from and we're still connected
@@ -2401,7 +2416,7 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
     }
 
     std::shared_ptr<const CBlock> pblock;
-    if (a_recent_block && a_recent_block->GetHash() == inv.hash) {
+    if (a_recent_block && a_recent_block->GetHash(m_chainparams.GetConsensus(), pindex->nHeight) == inv.hash) {
         pblock = a_recent_block;
     } else if (inv.IsMsgWitnessBlk()) {
         // Fast-path: in this case it is possible to serve the block directly from disk,
@@ -2421,7 +2436,7 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
     } else {
         // Send block from disk
         std::shared_ptr<CBlock> pblockRead = std::make_shared<CBlock>();
-        if (!m_chainman.m_blockman.ReadBlock(*pblockRead, block_pos, inv.hash)) {
+        if (!m_chainman.m_blockman.ReadBlock(*pblockRead, block_pos, inv.hash, pindex->nHeight)) {
             if (WITH_LOCK(m_chainman.GetMutex(), return m_chainman.m_blockman.IsBlockPruned(*pindex))) {
                 LogDebug(BCLog::NET, "Block was pruned before it could be read, %s\n", pfrom.DisconnectMsg(fLogIPs));
             } else {
@@ -2461,19 +2476,25 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
             // else
             // no response
         } else if (inv.IsMsgCmpctBlk()) {
-            // If a peer is asking for old blocks, we're almost guaranteed
-            // they won't have a useful mempool to match against a compact block,
-            // and we don't feel like constructing the object for them, so
-            // instead we respond with the full, non-compact block.
-            if (can_direct_fetch && pindex->nHeight >= tip->nHeight - MAX_CMPCTBLOCK_DEPTH) {
-                if (a_recent_compact_block && a_recent_compact_block->header.GetHash() == inv.hash) {
-                    MakeAndPushMessage(pfrom, NetMsgType::CMPCTBLOCK, *a_recent_compact_block);
-                } else {
-                    CBlockHeaderAndShortTxIDs cmpctblock{*pblock, m_rng.rand64()};
-                    MakeAndPushMessage(pfrom, NetMsgType::CMPCTBLOCK, cmpctblock);
-                }
+            if (m_chainparams.GetConsensus().legacy_b3coin) {
+                // Hybrid legacy headers do not prove whether the block is PoW
+                // or PoS, so BIP152's header-first relay is not safe here.
+                MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_NO_WITNESS(*pblock));
             } else {
-                MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_WITH_WITNESS(*pblock));
+                // If a peer is asking for old blocks, we're almost guaranteed
+                // they won't have a useful mempool to match against a compact block,
+                // and we don't feel like constructing the object for them, so
+                // instead we respond with the full, non-compact block.
+                if (can_direct_fetch && pindex->nHeight >= tip->nHeight - MAX_CMPCTBLOCK_DEPTH) {
+                    if (a_recent_compact_block && a_recent_compact_block->header.GetHash(m_chainparams.GetConsensus(), pindex->nHeight) == inv.hash) {
+                        MakeAndPushMessage(pfrom, NetMsgType::CMPCTBLOCK, *a_recent_compact_block);
+                    } else {
+                        CBlockHeaderAndShortTxIDs cmpctblock{*pblock, m_rng.rand64()};
+                        MakeAndPushMessage(pfrom, NetMsgType::CMPCTBLOCK, cmpctblock);
+                    }
+                } else {
+                    MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_WITH_WITNESS(*pblock));
+                }
             }
         }
     }
@@ -2591,7 +2612,7 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
 uint32_t PeerManagerImpl::GetFetchFlags(const Peer& peer) const
 {
     uint32_t nFetchFlags = 0;
-    if (CanServeWitnesses(peer)) {
+    if (!m_chainparams.GetConsensus().legacy_b3coin && CanServeWitnesses(peer)) {
         nFetchFlags |= MSG_WITNESS_FLAG;
     }
     return nFetchFlags;
@@ -2766,6 +2787,12 @@ bool PeerManagerImpl::IsContinuationOfLowWorkHeadersSync(Peer& peer, CNode& pfro
 
 bool PeerManagerImpl::TryLowWorkHeadersSync(Peer& peer, CNode& pfrom, const CBlockIndex& chain_start_header, std::vector<CBlockHeader>& headers)
 {
+    if (m_chainparams.GetConsensus().legacy_b3coin) {
+        // A B3Coin header alone cannot establish its hybrid PoW/PoS proof.
+        // Legacy synchronization therefore validates sequential full blocks.
+        return false;
+    }
+
     // Calculate the claimed total work on this chain.
     arith_uint256 total_work = chain_start_header.nChainWork + CalculateClaimedHeadersWork(headers);
 
@@ -2824,6 +2851,28 @@ bool PeerManagerImpl::IsAncestorOfBestHeaderOrTip(const CBlockIndex* header)
 
 bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer)
 {
+    if (m_chainparams.GetConsensus().legacy_b3coin) {
+        // A legacy B3Coin header cannot establish whether it meets a PoW
+        // target or contains a valid stake kernel. Use inventory to request
+        // and validate the next full block before advancing the locator.
+        const auto current_time = NodeClock::now();
+        if (peer.m_legacy_sync_complete) {
+            return false;
+        }
+        if (peer.m_legacy_getblocks_in_flight || peer.m_legacy_block_request) {
+            if (current_time - peer.m_legacy_request_time <= HEADERS_RESPONSE_TIME) {
+                return false;
+            }
+            LogDebug(BCLog::NET, "Retrying stalled legacy B3Coin block request to peer=%d\n", pfrom.GetId());
+            peer.m_legacy_getblocks_in_flight = false;
+            peer.m_legacy_block_request.reset();
+        }
+        MakeAndPushMessage(pfrom, NetMsgType::GETBLOCKS, locator, uint256{});
+        peer.m_legacy_getblocks_in_flight = true;
+        peer.m_legacy_request_time = current_time;
+        return true;
+    }
+
     const auto current_time = NodeClock::now();
 
     // Only allow a new getheaders message to go out if we don't have a recent
@@ -2977,6 +3026,13 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
         // A headers message with no headers cannot be an announcement, so assume
         // it is a response to our last getheaders request, if there is one.
         peer.m_last_getheaders_timestamp = {};
+        return;
+    }
+
+    if (m_chainparams.GetConsensus().legacy_b3coin) {
+        // Do not add unvalidated hybrid headers to the block index. They must
+        // arrive as complete blocks so PoW or the stake kernel can be checked.
+        LogDebug(BCLog::NET, "Ignoring header-only legacy B3Coin announcement from peer=%d\n", pfrom.GetId());
         return;
     }
 
@@ -3426,6 +3482,14 @@ void PeerManagerImpl::ProcessGetCFCheckPt(CNode& node, Peer& peer, DataStream& v
 
 void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
 {
+    uint256 block_hash;
+    {
+        LOCK(cs_main);
+        const CBlockIndex* parent{m_chainman.m_blockman.LookupBlockIndex(block->hashPrevBlock)};
+        const int height{parent ? parent->nHeight + 1 : 0};
+        block_hash = block->GetHash(m_chainparams.GetConsensus(), height);
+    }
+
     bool new_block{false};
     m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &new_block);
     if (new_block) {
@@ -3434,10 +3498,10 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
         // from, we can erase the block request now anyway (as we just stored
         // this block to disk).
         LOCK(cs_main);
-        RemoveBlockRequest(block->GetHash(), std::nullopt);
+        RemoveBlockRequest(block_hash, std::nullopt);
     } else {
         LOCK(cs_main);
-        mapBlockSource.erase(block->GetHash());
+        mapBlockSource.erase(block_hash);
     }
 }
 
@@ -4137,6 +4201,17 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
 
         const auto current_time{GetTime<std::chrono::microseconds>()};
         uint256* best_block{nullptr};
+        const bool legacy_chain{m_chainparams.GetConsensus().legacy_b3coin};
+        bool legacy_block_inventory{false};
+        bool legacy_unknown_block{false};
+        std::optional<uint256> legacy_block_to_request;
+        const bool legacy_getblocks_response{legacy_chain && peer.m_legacy_getblocks_in_flight};
+
+        if (legacy_chain && vInv.empty()) {
+            peer.m_legacy_getblocks_in_flight = false;
+            peer.m_legacy_sync_complete = true;
+            peer.m_legacy_request_time = {};
+        }
 
         for (CInv& inv : vInv) {
             if (interruptMsgProc) return;
@@ -4153,6 +4228,18 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             if (inv.IsMsgBlk()) {
                 const bool fAlreadyHave = AlreadyHaveBlock(inv.hash);
                 LogDebug(BCLog::NET, "got inv: %s  %s peer=%d\n", inv.ToString(), fAlreadyHave ? "have" : "new", pfrom.GetId());
+
+                if (legacy_chain) {
+                    legacy_block_inventory = true;
+                    if (!fAlreadyHave) {
+                        legacy_unknown_block = true;
+                        peer.m_legacy_sync_complete = false;
+                        if (peer.m_legacy_getblocks_in_flight && !peer.m_legacy_block_request && !legacy_block_to_request) {
+                            legacy_block_to_request = inv.hash;
+                        }
+                    }
+                    continue;
+                }
 
                 UpdateBlockAvailability(pfrom.GetId(), inv.hash);
                 if (!fAlreadyHave && !m_chainman.m_blockman.LoadingBlocks() && !IsBlockRequested(inv.hash)) {
@@ -4180,6 +4267,27 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             } else {
                 LogDebug(BCLog::NET, "Unknown inv type \"%s\" received from peer=%d\n", inv.ToString(), pfrom.GetId());
             }
+        }
+
+        if (legacy_chain) {
+            if (legacy_block_inventory) {
+                peer.m_legacy_getblocks_in_flight = false;
+            }
+            if (legacy_block_to_request) {
+                peer.m_legacy_block_request = *legacy_block_to_request;
+                peer.m_legacy_request_time = NodeClock::now();
+                MakeAndPushMessage(pfrom, NetMsgType::GETDATA,
+                                   std::vector<CInv>{CInv{MSG_BLOCK, *legacy_block_to_request}});
+                return;
+            }
+            if (legacy_getblocks_response && legacy_block_inventory && !legacy_unknown_block) {
+                peer.m_legacy_sync_complete = true;
+                peer.m_legacy_request_time = {};
+            }
+            if (legacy_unknown_block && !peer.m_legacy_block_request) {
+                (void)MaybeSendGetHeaders(pfrom, GetLocator(m_chainman.ActiveChain().Tip()), peer);
+            }
+            return;
         }
 
         if (best_block != nullptr) {
@@ -4559,6 +4667,11 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             return;
         }
 
+        if (m_chainparams.GetConsensus().legacy_b3coin) {
+            LogDebug(BCLog::NET, "Ignoring compact block on legacy B3Coin chain from peer=%d\n", pfrom.GetId());
+            return;
+        }
+
         CBlockHeaderAndShortTxIDs cmpctblock;
         vRecv >> cmpctblock;
 
@@ -4865,27 +4978,33 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
         vRecv >> TX_WITH_WITNESS(*pblock);
 
-        LogDebug(BCLog::NET, "received block %s peer=%d\n", pblock->GetHash().ToString(), pfrom.GetId());
-
         const CBlockIndex* prev_block{WITH_LOCK(m_chainman.GetMutex(), return m_chainman.m_blockman.LookupBlockIndex(pblock->hashPrevBlock))};
+        const int block_height{prev_block ? prev_block->nHeight + 1 : 0};
+        const uint256 hash{pblock->GetHash(m_chainparams.GetConsensus(), block_height)};
+        const bool legacy_block_requested{
+            m_chainparams.GetConsensus().legacy_b3coin && peer.m_legacy_block_request &&
+            *peer.m_legacy_block_request == hash};
+        LogDebug(BCLog::NET, "received block %s peer=%d\n", hash.ToString(), pfrom.GetId());
 
-        // Check for possible mutation if it connects to something we know so we can check for DEPLOYMENT_SEGWIT being active
-        if (prev_block && IsBlockMutated(/*block=*/*pblock,
+        // Bitcoin Core's post-2012 merkle-mutation and witness checks were
+        // not historical B3Coin consensus rules. The preserved legacy block
+        // checker performs its own old-chain-safe structural checks.
+        const bool legacy_block{prev_block && legacy::IsActive(m_chainparams.GetConsensus(), prev_block->nHeight + 1)};
+        if (prev_block && !legacy_block && IsBlockMutated(/*block=*/*pblock,
                            /*check_witness_root=*/DeploymentActiveAfter(prev_block, m_chainman, Consensus::DEPLOYMENT_SEGWIT))) {
             LogDebug(BCLog::NET, "Received mutated block from peer=%d\n", peer.m_id);
             Misbehaving(peer, "mutated block");
-            WITH_LOCK(cs_main, RemoveBlockRequest(pblock->GetHash(), peer.m_id));
+            WITH_LOCK(cs_main, RemoveBlockRequest(hash, peer.m_id));
             return;
         }
 
         bool forceProcessing = false;
-        const uint256 hash(pblock->GetHash());
         bool min_pow_checked = false;
         {
             LOCK(cs_main);
             // Always process the block if we requested it, since we may
             // need it even when it's not a candidate for a new best tip.
-            forceProcessing = IsBlockRequested(hash);
+            forceProcessing = IsBlockRequested(hash) || legacy_block_requested;
             RemoveBlockRequest(hash, pfrom.GetId());
             // mapBlockSource is only used for punishing peers and setting
             // which peers send us compact blocks, so the race between here and
@@ -4898,6 +5017,22 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             }
         }
         ProcessBlock(pfrom, pblock, forceProcessing, min_pow_checked);
+
+        if (legacy_block_requested) {
+            peer.m_legacy_block_request.reset();
+            peer.m_legacy_request_time = {};
+            std::optional<CBlockLocator> next_locator;
+            {
+                LOCK(cs_main);
+                const CBlockIndex* active_tip{m_chainman.ActiveChain().Tip()};
+                if (active_tip && active_tip->GetBlockHash() == hash) {
+                    next_locator = GetLocator(active_tip);
+                }
+            }
+            if (next_locator) {
+                (void)MaybeSendGetHeaders(pfrom, *next_locator, peer);
+            }
+        }
         return;
     }
 
@@ -5794,7 +5929,12 @@ bool PeerManagerImpl::SendMessages(CNode& node)
             }
         }
 
-        if (!state.fSyncStarted && CanServeBlocks(peer) && !m_chainman.m_blockman.LoadingBlocks()) {
+        if (m_chainparams.GetConsensus().legacy_b3coin && CanServeBlocks(peer) &&
+            !m_chainman.m_blockman.LoadingBlocks() && sync_blocks_and_headers_from_peer) {
+            // Hybrid legacy headers are not independently valid, so avoid the
+            // headers-sync state machine and advance only after a full block.
+            (void)MaybeSendGetHeaders(node, GetLocator(m_chainman.ActiveChain().Tip()), peer);
+        } else if (!state.fSyncStarted && CanServeBlocks(peer) && !m_chainman.m_blockman.LoadingBlocks()) {
             // Only actively request headers from a single peer, unless we're close to today.
             if ((nSyncStarted == 0 && sync_blocks_and_headers_from_peer) || m_chainman.m_best_header->Time() > NodeClock::now() - 24h) {
                 const CBlockIndex* pindexStart = m_chainman.m_best_header;
@@ -5836,7 +5976,8 @@ bool PeerManagerImpl::SendMessages(CNode& node)
             // add all to the inv queue.
             LOCK(peer.m_block_inv_mutex);
             std::vector<CBlock> vHeaders;
-            bool fRevertToInv = ((!peer.m_prefers_headers &&
+            bool fRevertToInv = (m_chainparams.GetConsensus().legacy_b3coin ||
+                                 (!peer.m_prefers_headers &&
                                  (!state.m_requested_hb_cmpctblocks || peer.m_blocks_for_headers_relay.size() > 1)) ||
                                  peer.m_blocks_for_headers_relay.size() > MAX_BLOCKS_TO_ANNOUNCE);
             const CBlockIndex *pBestIndex = nullptr; // last header queued for delivery

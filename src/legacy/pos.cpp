@@ -33,16 +33,25 @@ std::optional<KernelResult> EvaluateKernel(const KernelInput& input,
                       Params::MIN_AGE};
     if (age <= 0) return std::nullopt;
 
-    const uint64_t coin_day_weight{
-        static_cast<uint64_t>(value) * static_cast<uint64_t>(age) /
-        Params::COIN / (24 * 60 * 60)};
+    arith_uint256 coin_day_weight_wide{static_cast<uint64_t>(value)};
+    coin_day_weight_wide *= static_cast<uint32_t>(age);
+    coin_day_weight_wide /= arith_uint256{Params::COIN};
+    coin_day_weight_wide /= arith_uint256{24 * 60 * 60};
+    if (coin_day_weight_wide.bits() > 64) return std::nullopt;
+    const uint64_t coin_day_weight{coin_day_weight_wide.GetLow64()};
 
     arith_uint256 target;
     bool negative{false};
     bool overflow{false};
     target.SetCompact(bits, &negative, &overflow);
     if (negative || overflow || target == 0 || coin_day_weight == 0) return std::nullopt;
-    target *= arith_uint256{coin_day_weight};
+    const arith_uint256 max_target{~arith_uint256{0}};
+    const arith_uint256 weight{coin_day_weight};
+    if (target > max_target / weight) {
+        target = max_target;
+    } else {
+        target *= weight;
+    }
 
     return KernelResult{
         .proof_hash = ComputeKernelHash(input),

@@ -28,8 +28,14 @@
  * A UTXO entry.
  *
  * Serialized format:
- * - VARINT((coinbase ? 1 : 0) | (height << 1))
+ * - VARINT((coinbase ? 2 : 0) | (coinstake ? 1 : 0) | (height << 2))
  * - the non-spent CTxOut (via TxOutCompression)
+ * - uint32 transaction timestamp
+ * - uint32 transaction offset inside its containing block
+ *
+ * The final two fields retain the historical B3Coin PoS kernel inputs. This
+ * B3Coin Core chainstate format is intentionally not compatible with an
+ * upstream Bitcoin Core chainstate.
  */
 class Coin
 {
@@ -40,41 +46,66 @@ public:
     //! whether containing transaction was a coinbase
     unsigned int fCoinBase : 1;
 
+    //! whether containing transaction was a legacy proof-of-stake transaction
+    unsigned int fCoinStake : 1;
+
     //! at which height this containing transaction was included in the active block chain
-    uint32_t nHeight : 31;
+    uint32_t nHeight : 30;
+
+    //! legacy transaction timestamp and on-disk offset used by the stake kernel
+    uint32_t nTime{0};
+    uint32_t nTxOffset{0};
 
     //! construct a Coin from a CTxOut and height/coinbase information.
-    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), nHeight(nHeightIn) {}
-    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn) : out(outIn), fCoinBase(fCoinBaseIn),nHeight(nHeightIn) {}
+    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fCoinStakeIn = false,
+         uint32_t nTimeIn = 0, uint32_t nTxOffsetIn = 0)
+        : out(std::move(outIn)), fCoinBase(fCoinBaseIn), fCoinStake(fCoinStakeIn),
+          nHeight(nHeightIn), nTime(nTimeIn), nTxOffset(nTxOffsetIn) {}
+    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fCoinStakeIn = false,
+         uint32_t nTimeIn = 0, uint32_t nTxOffsetIn = 0)
+        : out(outIn), fCoinBase(fCoinBaseIn), fCoinStake(fCoinStakeIn),
+          nHeight(nHeightIn), nTime(nTimeIn), nTxOffset(nTxOffsetIn) {}
 
     void Clear() {
         out.SetNull();
         fCoinBase = false;
+        fCoinStake = false;
         nHeight = 0;
+        nTime = 0;
+        nTxOffset = 0;
     }
 
     //! empty constructor
-    Coin() : fCoinBase(false), nHeight(0) { }
+    Coin() : fCoinBase(false), fCoinStake(false), nHeight(0) { }
 
     bool IsCoinBase() const {
         return fCoinBase;
     }
 
+    bool IsCoinStake() const {
+        return fCoinStake;
+    }
+
     template<typename Stream>
     void Serialize(Stream &s) const {
         assert(!IsSpent());
-        uint32_t code = nHeight * uint32_t{2} + fCoinBase;
+        uint64_t code = uint64_t{nHeight} * 4 + (fCoinBase ? 2 : 0) + (fCoinStake ? 1 : 0);
         ::Serialize(s, VARINT(code));
         ::Serialize(s, Using<TxOutCompression>(out));
+        ::Serialize(s, nTime);
+        ::Serialize(s, nTxOffset);
     }
 
     template<typename Stream>
     void Unserialize(Stream &s) {
-        uint32_t code = 0;
+        uint64_t code = 0;
         ::Unserialize(s, VARINT(code));
-        nHeight = code >> 1;
-        fCoinBase = code & 1;
+        nHeight = code >> 2;
+        fCoinBase = code & 2;
+        fCoinStake = code & 1;
         ::Unserialize(s, Using<TxOutCompression>(out));
+        ::Unserialize(s, nTime);
+        ::Unserialize(s, nTxOffset);
     }
 
     /** Either this coin never existed (see e.g. coinEmpty in coins.cpp), or it
@@ -553,7 +584,8 @@ public:
 //! an overwrite.
 // TODO: pass in a boolean to limit these possible overwrites to known
 // (pre-BIP34) cases.
-void AddCoins(CCoinsViewCache& cache, const CTransaction& tx, int nHeight, bool check = false);
+void AddCoins(CCoinsViewCache& cache, const CTransaction& tx, int nHeight,
+              bool check = false, uint32_t nTxOffset = 0);
 
 //! Utility function to find any unspent output with a given txid.
 //! This function can be quite expensive because in the event of a transaction

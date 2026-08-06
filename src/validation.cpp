@@ -28,6 +28,7 @@
 #include <kernel/notifications_interface.h>
 #include <kernel/types.h>
 #include <kernel/warning.h>
+#include <legacy/consensus.h>
 #include <logging/timer.h>
 #include <node/blockstorage.h>
 #include <node/utxo_snapshot.h>
@@ -71,6 +72,7 @@
 #include <numeric>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <span>
 #include <string>
 #include <tuple>
@@ -2000,7 +2002,8 @@ void Chainstate::InvalidBlockFound(CBlockIndex* pindex, const BlockValidationSta
     }
 }
 
-void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight)
+static void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo& txundo,
+                        const int nHeight, const uint32_t tx_offset)
 {
     // mark inputs spent
     if (!tx.IsCoinBase()) {
@@ -2012,8 +2015,61 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txund
         }
     }
     // add outputs
-    AddCoins(inputs, tx, nHeight);
+    AddCoins(inputs, tx, nHeight, /*check=*/false, tx_offset);
 }
+
+// Kept for the existing tests and non-legacy callers. B3Coin's historical
+// kernel metadata is only needed when a block is connected through the legacy
+// validation path below.
+void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo& txundo, int nHeight)
+{
+    UpdateCoins(tx, inputs, txundo, nHeight, /*tx_offset=*/0);
+}
+
+/** Input/value checks frozen from the old B3Coin ConnectInputs path. */
+static bool CheckLegacyTxInputs(const CTransaction& tx, TxValidationState& state,
+                                const CCoinsViewCache& inputs, const int spend_height,
+                                CAmount& txfee, CAmount& value_in)
+{
+    if (!inputs.HaveInputs(tx)) {
+        return state.Invalid(TxValidationResult::TX_MISSING_INPUTS, "bad-txns-inputs-missingorspent", "inputs missing or spent");
+    }
+
+    value_in = 0;
+    for (const CTxIn& txin : tx.vin) {
+        const Coin& coin{inputs.AccessCoin(txin.prevout)};
+        assert(!coin.IsSpent());
+        if ((coin.IsCoinBase() || coin.IsCoinStake()) &&
+            spend_height - static_cast<int>(coin.nHeight) < static_cast<int>(legacy::COINBASE_MATURITY)) {
+            return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "bad-txns-premature-spend",
+                                 "tried to spend an immature coinbase or coinstake");
+        }
+        if (coin.nTime > tx.nTime) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-time", "input transaction timestamp is later than spending transaction");
+        }
+        if (coin.out.nValue < 0 || !MoneyRange(coin.out.nValue) || coin.out.nValue > MAX_MONEY - value_in) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-inputvalues-outofrange");
+        }
+        value_in += coin.out.nValue;
+    }
+
+    const CAmount value_out{tx.GetValueOut()};
+    if (!tx.IsCoinStake() && value_in < value_out) {
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout",
+                             strprintf("value in (%s) < value out (%s)", FormatMoney(value_in), FormatMoney(value_out)));
+    }
+
+    txfee = legacy::GetLegacyTransactionFee(value_in, value_out, tx.IsCoinStake());
+    if (!MoneyRange(txfee)) {
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-fee-outofrange");
+    }
+    return true;
+}
+
+static bool ContextualCheckLegacyBlock(const CBlock& block, BlockValidationState& state,
+                                       const Consensus::Params& params,
+                                       const CBlockIndex* pindex_prev,
+                                       bool check_target);
 
 std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
     const CScript &scriptSig = ptxTo->vin[nIn].scriptSig;
@@ -2255,6 +2311,12 @@ script_verify_flags GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
 {
     const Consensus::Params& consensusparams = chainman.GetConsensus();
 
+    if (legacy::IsActive(consensusparams, block_index.nHeight)) {
+        // Frozen from the old B3Coin ConnectBlock path. In particular, P2SH,
+        // witness, CSV, and Taproot rules were not consensus rules there.
+        return SCRIPT_VERIFY_NULLDUMMY | SCRIPT_VERIFY_STRICTENC | SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY;
+    }
+
     // BIP16 didn't become active until Apr 1 2012 (on mainnet, and
     // retroactively applied to testnet)
     // However, only one historical block violated the P2SH rules (on both
@@ -2302,11 +2364,12 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     AssertLockHeld(cs_main);
     assert(pindex);
 
-    uint256 block_hash{block.GetHash()};
+    const CChainParams& params{m_chainman.GetParams()};
+    uint256 block_hash{block.GetHash(params.GetConsensus(), pindex->nHeight)};
     assert(*pindex->phashBlock == block_hash);
 
     const auto time_start{SteadyClock::now()};
-    const CChainParams& params{m_chainman.GetParams()};
+    const bool use_legacy_b3coin{legacy::IsActive(params.GetConsensus(), pindex->nHeight)};
 
     // Check it again in case a previous version let a bad block in
     // NOTE: We don't currently (re-)invoke ContextualCheckBlock() or
@@ -2332,6 +2395,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         return false;
     }
 
+    // The normal Core flow deliberately does not repeat contextual header and
+    // block checks here. The legacy B3Coin target depends on whether a full
+    // block is PoW or PoS, so it must be checked at connection time after all
+    // ancestors and their PoS metadata are available.
+    if (use_legacy_b3coin &&
+        !ContextualCheckLegacyBlock(block, state, params.GetConsensus(), pindex->pprev, /*check_target=*/true)) {
+        LogError("%s: legacy contextual check failed: %s\n", __func__, state.ToString());
+        return false;
+    }
+
     // verify that the view's current state corresponds to the previous block
     uint256 hashPrevBlock = pindex->pprev == nullptr ? uint256() : pindex->pprev->GetBlockHash();
     assert(hashPrevBlock == view.GetBestBlock());
@@ -2344,6 +2417,19 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         if (!fJustCheck)
             view.SetBestBlock(pindex->GetBlockHash());
         return true;
+    }
+
+    std::optional<legacy::StakeProof> legacy_stake_proof;
+    std::optional<uint64_t> legacy_coin_age;
+    if (use_legacy_b3coin && block.IsProofOfStake()) {
+        legacy_stake_proof = legacy::CheckStakeKernel(pindex->pprev, *block.vtx[1], view, block.nBits);
+        if (!legacy_stake_proof) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-pos-kernel", "legacy proof-of-stake kernel failed");
+        }
+        legacy_coin_age = legacy::GetCoinAge(*block.vtx[1], pindex->pprev, view);
+        if (!legacy_coin_age) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-pos-coinage", "unable to calculate legacy coinstake coin age");
+        }
     }
 
     const char* script_check_reason;
@@ -2521,8 +2607,12 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
     std::vector<int> prevheights;
     CAmount nFees = 0;
+    CAmount legacy_stake_reward = 0;
     int nInputs = 0;
     int64_t nSigOpsCost = 0;
+    uint64_t legacy_sigops = 0;
+    uint32_t legacy_tx_offset = static_cast<uint32_t>(GetSerializeSize(CBlockHeader{})) +
+                                GetSizeOfCompactSize(block.vtx.size());
     blockundo.vtxundo.reserve(block.vtx.size() - 1);
     for (unsigned int i = 0; i < block.vtx.size(); i++)
     {
@@ -2531,47 +2621,80 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
         nInputs += tx.vin.size();
 
+        if (use_legacy_b3coin) {
+            legacy_sigops += GetLegacySigOpCount(tx);
+            if (legacy_sigops > legacy::MAX_BLOCK_SIGOPS) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", "too many legacy sigops");
+                break;
+            }
+        }
+
+        CAmount txfee = 0;
+        CAmount tx_value_in = 0;
         if (!tx.IsCoinBase())
         {
-            CAmount txfee = 0;
             TxValidationState tx_state;
-            if (!Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee)) {
+            const bool inputs_valid{use_legacy_b3coin ?
+                CheckLegacyTxInputs(tx, tx_state, view, pindex->nHeight, txfee, tx_value_in) :
+                Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee)};
+            if (!inputs_valid) {
                 // Any transaction validation failure in ConnectBlock is a block consensus failure
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                               tx_state.GetRejectReason(),
                               tx_state.GetDebugMessage() + " in transaction " + tx.GetHash().ToString());
                 break;
             }
-            nFees += txfee;
-            if (!MoneyRange(nFees)) {
-                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-accumulated-fee-outofrange",
-                              "accumulated fee in the block out of range");
-                break;
+
+            if (use_legacy_b3coin) {
+                if (txfee > MAX_MONEY - nFees) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-accumulated-fee-outofrange",
+                                  "accumulated fee in the block out of range");
+                    break;
+                }
+                nFees += txfee;
+                legacy_sigops += GetP2SHSigOpCount(tx, view);
+                if (legacy_sigops > legacy::MAX_BLOCK_SIGOPS) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", "too many legacy sigops");
+                    break;
+                }
+            } else {
+                nFees += txfee;
+                if (!MoneyRange(nFees)) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-accumulated-fee-outofrange",
+                                  "accumulated fee in the block out of range");
+                    break;
+                }
             }
 
-            // Check that transaction is BIP68 final
-            // BIP68 lock checks (as opposed to nLockTime checks) must
-            // be in ConnectBlock because they require the UTXO set
-            prevheights.resize(tx.vin.size());
-            for (size_t j = 0; j < tx.vin.size(); j++) {
-                prevheights[j] = view.AccessCoin(tx.vin[j].prevout).nHeight;
-            }
+            if (!use_legacy_b3coin) {
+                // Check that transaction is BIP68 final
+                // BIP68 lock checks (as opposed to nLockTime checks) must
+                // be in ConnectBlock because they require the UTXO set
+                prevheights.resize(tx.vin.size());
+                for (size_t j = 0; j < tx.vin.size(); j++) {
+                    prevheights[j] = view.AccessCoin(tx.vin[j].prevout).nHeight;
+                }
 
-            if (!SequenceLocks(tx, nLockTimeFlags, prevheights, *pindex)) {
-                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-nonfinal",
-                              "contains a non-BIP68-final transaction " + tx.GetHash().ToString());
-                break;
+                if (!SequenceLocks(tx, nLockTimeFlags, prevheights, *pindex)) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-nonfinal",
+                                  "contains a non-BIP68-final transaction " + tx.GetHash().ToString());
+                    break;
+                }
             }
         }
 
-        // GetTransactionSigOpCost counts 3 types of sigops:
-        // * legacy (always)
-        // * p2sh (when P2SH enabled in flags and excludes coinbase)
-        // * witness (when witness enabled in flags and excludes coinbase)
-        nSigOpsCost += GetTransactionSigOpCost(tx, view, flags);
-        if (nSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
-            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", "too many sigops");
-            break;
+        if (use_legacy_b3coin) {
+            nSigOpsCost = static_cast<int64_t>(legacy_sigops);
+        } else {
+            // GetTransactionSigOpCost counts 3 types of sigops:
+            // * legacy (always)
+            // * p2sh (when P2SH enabled in flags and excludes coinbase)
+            // * witness (when witness enabled in flags and excludes coinbase)
+            nSigOpsCost += GetTransactionSigOpCost(tx, view, flags);
+            if (nSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", "too many sigops");
+                break;
+            }
         }
 
         if (!tx.IsCoinBase() && fScriptChecks)
@@ -2600,7 +2723,14 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         if (i > 0) {
             blockundo.vtxundo.emplace_back();
         }
-        UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight);
+        UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight,
+                    use_legacy_b3coin ? legacy_tx_offset : 0);
+        if (use_legacy_b3coin) {
+            if (tx.IsCoinStake()) {
+                legacy_stake_reward = tx.GetValueOut() - tx_value_in;
+            }
+            legacy_tx_offset += static_cast<uint32_t>(GetSerializeSize(TX_NO_WITNESS(tx)));
+        }
     }
     const auto time_3{SteadyClock::now()};
     m_chainman.time_connect += time_3 - time_2;
@@ -2610,10 +2740,27 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
              Ticks<SecondsDouble>(m_chainman.time_connect),
              Ticks<MillisecondsDouble>(m_chainman.time_connect) / m_chainman.num_blocks_total);
 
-    CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, params.GetConsensus());
-    if (block.vtx[0]->GetValueOut() > blockReward && state.IsValid()) {
-        state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
-                      strprintf("coinbase pays too much (actual=%d vs limit=%d)", block.vtx[0]->GetValueOut(), blockReward));
+    if (use_legacy_b3coin) {
+        if (block.IsProofOfWork()) {
+            const CAmount block_reward{legacy::GetProofOfWorkReward(nFees, pindex->nHeight, params.GetConsensus())};
+            if (block.vtx[0]->GetValueOut() > block_reward && state.IsValid()) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
+                              strprintf("coinbase pays too much (actual=%d vs limit=%d)", block.vtx[0]->GetValueOut(), block_reward));
+            }
+        } else if (state.IsValid()) {
+            assert(legacy_coin_age.has_value());
+            const CAmount allowed_reward{legacy::GetProofOfStakeReward(pindex->pprev, *legacy_coin_age, nFees)};
+            if (!legacy::IsHistoricalStakeRewardCapException(pindex->nHeight) && legacy_stake_reward > allowed_reward) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cs-amount",
+                              strprintf("coinstake pays too much (actual=%d vs limit=%d)", legacy_stake_reward, allowed_reward));
+            }
+        }
+    } else {
+        const CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, params.GetConsensus());
+        if (block.vtx[0]->GetValueOut() > blockReward && state.IsValid()) {
+            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
+                          strprintf("coinbase pays too much (actual=%d vs limit=%d)", block.vtx[0]->GetValueOut(), blockReward));
+        }
     }
     if (control) {
         auto parallel_result = control->Complete();
@@ -2624,6 +2771,21 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     if (!state.IsValid()) {
         LogInfo("Block validation error: %s", state.ToString());
         return false;
+    }
+
+    if (use_legacy_b3coin) {
+        uint64_t stake_modifier{0};
+        bool stake_modifier_generated{false};
+        if (!legacy::ComputeNextStakeModifier(pindex->pprev, stake_modifier, stake_modifier_generated)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-stake-modifier", "unable to compute legacy stake modifier");
+        }
+        if (!fJustCheck) {
+            pindex->m_legacy_proof_of_stake = block.IsProofOfStake();
+            pindex->m_legacy_hash_proof = block.IsProofOfStake() ? legacy_stake_proof->hash : block_hash;
+            pindex->m_legacy_stake_modifier = stake_modifier;
+            pindex->m_legacy_stake_modifier_generated = stake_modifier_generated;
+            m_blockman.m_dirty_blockindex.insert(pindex);
+        }
     }
     const auto time_4{SteadyClock::now()};
     m_chainman.time_verify += time_4 - time_2;
@@ -3430,7 +3592,9 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
                 // in case snapshot validation is completed during ActivateBestChainStep, the
                 // result of GetRole() changes from BACKGROUND to NORMAL.
                const ChainstateRole chainstate_role{this->GetRole()};
-                if (!ActivateBestChainStep(state, pindexMostWork, pblock && pblock->GetHash() == pindexMostWork->GetBlockHash() ? pblock : nullBlockPtr, fInvalidFound, connectTrace)) {
+                if (!ActivateBestChainStep(state, pindexMostWork,
+                                           pblock && pblock->GetHash(m_chainman.GetConsensus(), pindexMostWork->nHeight) == pindexMostWork->GetBlockHash() ? pblock : nullBlockPtr,
+                                           fInvalidFound, connectTrace)) {
                     // A system error occurred
                     return false;
                 }
@@ -3876,7 +4040,10 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
 static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true)
 {
     // Check proof of work matches claimed amount
-    if (fCheckPOW && !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
+    // A legacy B3Coin header does not reveal whether its full block is PoW or
+    // PoS. The full-block legacy path performs the PoW check only for PoW
+    // blocks, and validates PoS kernels after the UTXO view is available.
+    if (fCheckPOW && !consensusParams.legacy_b3coin && !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
 
     return true;
@@ -3906,6 +4073,135 @@ static bool CheckMerkleRoot(const CBlock& block, BlockValidationState& state)
     }
 
     block.m_checked_merkle_root = true;
+    return true;
+}
+
+/**
+ * The B3Coin chain predates SegWit and used a five-megabyte serialized block
+ * limit. Keep these checks separate from Bitcoin Core's current transaction
+ * checks so the historical rules are neither weakened nor applied to the
+ * eventual post-fork protocol.
+ */
+static bool CheckLegacyTransaction(const CTransaction& tx, TxValidationState& state)
+{
+    if (tx.HasWitness()) {
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-witness", "witness data is not valid on the legacy B3Coin chain");
+    }
+    if (tx.vin.empty()) return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-vin-empty");
+    if (tx.vout.empty()) return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-vout-empty");
+    if (::GetSerializeSize(TX_NO_WITNESS(tx)) > legacy::MAX_BLOCK_SIZE) {
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-oversize");
+    }
+
+    CAmount value_out{0};
+    for (const CTxOut& txout : tx.vout) {
+        if (txout.nValue < 0) return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-vout-negative");
+        if (txout.nValue > MAX_MONEY) return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-vout-toolarge");
+        if (txout.nValue > MAX_MONEY - value_out) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-txouttotal-toolarge");
+        }
+        value_out += txout.nValue;
+    }
+
+    std::set<COutPoint> inputs;
+    for (const CTxIn& txin : tx.vin) {
+        if (!inputs.insert(txin.prevout).second) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-inputs-duplicate");
+        }
+    }
+
+    if (tx.IsCoinBase()) {
+        if (tx.vin[0].scriptSig.size() < 2 || tx.vin[0].scriptSig.size() > 100) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-cb-length");
+        }
+    } else {
+        for (const CTxIn& txin : tx.vin) {
+            if (txin.prevout.IsNull()) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-prevout-null");
+            }
+        }
+    }
+
+    return true;
+}
+
+/** The old chain did not apply Bitcoin Core's post-2012 merkle mutation rule. */
+static bool CheckLegacyMerkleRoot(const CBlock& block, BlockValidationState& state)
+{
+    if (block.m_checked_merkle_root) return true;
+
+    if (block.hashMerkleRoot != BlockMerkleRoot(block)) {
+        return state.Invalid(BlockValidationResult::BLOCK_MUTATED, "bad-txnmrklroot", "hashMerkleRoot mismatch");
+    }
+    block.m_checked_merkle_root = true;
+    return true;
+}
+
+static bool CheckLegacyBlock(const CBlock& block, BlockValidationState& state,
+                             const Consensus::Params& consensusParams,
+                             const bool fCheckPOW, const bool fCheckMerkleRoot)
+{
+    if (fCheckPOW && block.IsProofOfWork() &&
+        !CheckProofOfWork(block.GetLegacyB3Hash(), block.nBits, consensusParams)) {
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
+    }
+    if (block.Time() > NodeClock::now() + std::chrono::seconds{legacy::MAX_FUTURE_BLOCK_TIME}) {
+        return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new", "block timestamp too far in the future");
+    }
+    if (block.vtx.empty() || block.vtx.size() > legacy::MAX_BLOCK_SIZE ||
+        ::GetSerializeSize(TX_NO_WITNESS(block)) > legacy::MAX_BLOCK_SIZE) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-length", "size limits failed");
+    }
+    if (!block.vtx[0]->IsCoinBase()) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-missing", "first transaction is not coinbase");
+    }
+    for (size_t i{1}; i < block.vtx.size(); ++i) {
+        if (block.vtx[i]->IsCoinBase()) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-multiple", "more than one coinbase");
+        }
+    }
+
+    if (block.IsProofOfStake()) {
+        if (block.vtx[0]->vout.size() != 1 || block.vtx[0]->vout[0].nValue != 0 ||
+            !block.vtx[0]->vout[0].scriptPubKey.empty()) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-pos", "proof-of-stake coinbase is not empty");
+        }
+        if (block.vtx.size() < 2 || !block.vtx[1]->IsCoinStake()) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cs-missing", "proof-of-stake block has no coinstake transaction");
+        }
+        for (size_t i{2}; i < block.vtx.size(); ++i) {
+            if (block.vtx[i]->IsCoinStake()) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cs-multiple", "more than one coinstake transaction");
+            }
+        }
+    }
+
+    if (!legacy::CheckBlockSignature(block)) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-signature", "invalid proof-of-stake block signature");
+    }
+
+    std::set<Txid> unique_txids;
+    uint64_t sigops{0};
+    for (const auto& tx : block.vtx) {
+        TxValidationState tx_state;
+        if (!CheckLegacyTransaction(*tx, tx_state)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, tx_state.GetRejectReason(),
+                                 strprintf("Transaction check failed (tx hash %s) %s", tx->GetHash().ToString(), tx_state.GetDebugMessage()));
+        }
+        if (block.GetBlockTime() < tx->nTime) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-time-too-new", "transaction timestamp is later than its block");
+        }
+        if (!unique_txids.insert(tx->GetHash()).second) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-duplicate", "duplicate transaction");
+        }
+        sigops += GetLegacySigOpCount(*tx);
+        if (sigops > legacy::MAX_BLOCK_SIGOPS) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", "out-of-bounds sigop count");
+        }
+    }
+
+    if (fCheckMerkleRoot && !CheckLegacyMerkleRoot(block, state)) return false;
+    if (fCheckPOW && fCheckMerkleRoot) block.fChecked = true;
     return true;
 }
 
@@ -3974,6 +4270,10 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
     // redundant with the call in AcceptBlockHeader.
     if (!CheckBlockHeader(block, state, consensusParams, fCheckPOW))
         return false;
+
+    if (consensusParams.legacy_b3coin) {
+        return CheckLegacyBlock(block, state, consensusParams, fCheckPOW, fCheckMerkleRoot);
+    }
 
     // Signet only: check block solution
     if (consensusParams.signet_blocks && fCheckPOW && !CheckSignetBlockSolution(block, consensusParams)) {
@@ -4068,6 +4368,10 @@ void ChainstateManager::GenerateCoinbaseCommitment(CBlock& block, const CBlockIn
 
 bool HasValidProofOfWork(std::span<const CBlockHeader> headers, const Consensus::Params& consensusParams)
 {
+    // Legacy B3Coin PoS headers are indistinguishable from PoW headers until
+    // their transaction vector is available. Full-block validation supplies
+    // the required kernel proof before a block can connect.
+    if (consensusParams.legacy_b3coin) return true;
     return std::ranges::all_of(headers,
                                [&](const auto& header) { return CheckProofOfWork(header.GetHash(), header.nBits, consensusParams); });
 }
@@ -4112,6 +4416,58 @@ arith_uint256 CalculateClaimedHeadersWork(std::span<const CBlockHeader> headers)
     return total_work;
 }
 
+/**
+ * Contextual validation for the preserved B3Coin era. `check_target` is false
+ * only while a parent is header-only; ConnectBlock always calls this with true
+ * before changing the UTXO view.
+ */
+static bool ContextualCheckLegacyBlock(const CBlock& block, BlockValidationState& state,
+                                       const Consensus::Params& params,
+                                       const CBlockIndex* pindex_prev,
+                                       const bool check_target)
+{
+    if (pindex_prev == nullptr) return true; // Genesis is constructed locally.
+
+    const int height{pindex_prev->nHeight + 1};
+    if (block.nVersion > 4) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-version", "unknown legacy B3Coin block version");
+    }
+    if (block.IsProofOfWork() && height > params.legacy_last_pow_block) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-pow-after-last-pow", "proof-of-work is no longer allowed");
+    }
+    if (check_target && block.nBits != legacy::GetNextTargetRequired(pindex_prev, block.IsProofOfStake(), params)) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-diffbits", "incorrect proof target");
+    }
+    if (block.GetBlockTime() <= pindex_prev->GetMedianTimePast() ||
+        block.GetBlockTime() + legacy::MAX_FUTURE_BLOCK_TIME < pindex_prev->GetBlockTime()) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "time-too-old", "block timestamp is too early");
+    }
+
+    const int64_t coinbase_drift{pindex_prev->nHeight <= params.legacy_last_pow_block ?
+                                     legacy::MAX_FUTURE_COINBASE_TIME_POW :
+                                     legacy::MAX_FUTURE_BLOCK_TIME};
+    if (block.GetBlockTime() > static_cast<int64_t>(block.vtx[0]->nTime) + coinbase_drift) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-time", "coinbase timestamp is too early");
+    }
+    if (block.IsProofOfStake() && block.GetBlockTime() != block.vtx[1]->nTime) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cs-time", "coinstake timestamp differs from block timestamp");
+    }
+
+    for (const auto& tx : block.vtx) {
+        if (!IsFinalTx(*tx, height, block.GetBlockTime())) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-nonfinal", "non-final transaction");
+        }
+    }
+
+    const CScript expected_coinbase_height{CScript() << height};
+    if (block.vtx[0]->vin[0].scriptSig.size() < expected_coinbase_height.size() ||
+        !std::equal(expected_coinbase_height.begin(), expected_coinbase_height.end(),
+                    block.vtx[0]->vin[0].scriptSig.begin())) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-height", "block height mismatch in coinbase");
+    }
+    return true;
+}
+
 /** Context-dependent validity checks.
  *  By "context", we mean only the previous block headers, but not the UTXO
  *  set; UTXO-related validity checks are done in ConnectBlock().
@@ -4133,6 +4489,22 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
 
     // Check proof of work
     const Consensus::Params& consensusParams = chainman.GetConsensus();
+    if (legacy::IsActive(consensusParams, nHeight)) {
+        // Header-only B3Coin blocks cannot disclose whether they are PoW or
+        // PoS, so their hybrid target is checked once the full block reaches
+        // ConnectBlock. Keep the old timestamp and version limits here.
+        if (block.nVersion > 4) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-version", "unknown legacy B3Coin block version");
+        }
+        if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast() ||
+            block.GetBlockTime() + legacy::MAX_FUTURE_BLOCK_TIME < pindexPrev->GetBlockTime()) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "time-too-old", "block timestamp is too early");
+        }
+        if (block.Time() > NodeClock::now() + std::chrono::seconds{legacy::MAX_FUTURE_BLOCK_TIME}) {
+            return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new", "block timestamp too far in the future");
+        }
+        return true;
+    }
     if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits", "incorrect proof of work");
 
@@ -4177,6 +4549,14 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
 static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& state, const ChainstateManager& chainman, const CBlockIndex* pindexPrev)
 {
     const int nHeight = pindexPrev == nullptr ? 0 : pindexPrev->nHeight + 1;
+    const Consensus::Params& consensus_params{chainman.GetConsensus()};
+
+    if (legacy::IsActive(consensus_params, nHeight)) {
+        // Do not reject a valid out-of-order child merely because its parent
+        // is header-only. The mandatory target check is repeated in
+        // ConnectBlock after every parent has been connected.
+        return ContextualCheckLegacyBlock(block, state, consensus_params, pindexPrev, /*check_target=*/false);
+    }
 
     // Enforce BIP113 (Median Time Past).
     bool enforce_locktime_median_time_past{false};
@@ -4236,7 +4616,9 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
     AssertLockHeld(cs_main);
 
     // Check for duplicate
-    uint256 hash = block.GetHash();
+    const auto previous{m_blockman.m_block_index.find(block.hashPrevBlock)};
+    const int height{previous == m_blockman.m_block_index.end() ? 0 : previous->second.nHeight + 1};
+    uint256 hash = block.GetHash(GetConsensus(), height);
     BlockMap::iterator miSelf{m_blockman.m_block_index.find(hash)};
     if (hash != GetConsensus().hashGenesisBlock) {
         if (miSelf != m_blockman.m_block_index.end()) {
@@ -4274,7 +4656,7 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
             return false;
         }
     }
-    if (!min_pow_checked) {
+    if (!min_pow_checked && !GetConsensus().legacy_b3coin) {
         LogDebug(BCLog::VALIDATION, "%s: not adding new block header %s, missing anti-dos proof-of-work validation\n", __func__, hash.ToString());
         return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "too-little-chainwork");
     }
@@ -4402,6 +4784,14 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
         }
         LogError("%s: %s\n", __func__, state.ToString());
         return false;
+    }
+
+    if (legacy::IsActive(params.GetConsensus(), pindex->nHeight)) {
+        // Full blocks disclose the PoW/PoS type that headers intentionally do
+        // not carry. Persist it as soon as the full block is structurally
+        // valid, so descendants can derive the historical hybrid target.
+        pindex->m_legacy_proof_of_stake = block.IsProofOfStake();
+        m_blockman.m_dirty_blockindex.insert(pindex);
     }
 
     // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW
@@ -4563,7 +4953,7 @@ BlockValidationState TestBlockValidity(
     // We don't want ConnectBlock to update the actual chainstate, so create
     // a cache on top of it, along with a dummy block index.
     CBlockIndex index_dummy{block};
-    uint256 block_hash(block.GetHash());
+    uint256 block_hash(block.GetHash(chainstate.m_chainman.GetConsensus(), tip->nHeight + 1));
     index_dummy.pprev = tip;
     index_dummy.nHeight = tip->nHeight + 1;
     index_dummy.phashBlock = &block_hash;
@@ -4981,7 +5371,7 @@ bool Chainstate::LoadGenesisBlock()
     // m_blockman.m_block_index. Note that we can't use m_chain here, since it is
     // set based on the coins db, not the block index db, which is the only
     // thing loaded at this point.
-    if (m_blockman.m_block_index.contains(params.GenesisBlock().GetHash()))
+    if (m_blockman.m_block_index.contains(params.GenesisBlock().GetHash(params.GetConsensus(), /*height=*/0)))
         return true;
 
     try {
@@ -4992,6 +5382,15 @@ bool Chainstate::LoadGenesisBlock()
             return false;
         }
         CBlockIndex* pindex = m_blockman.AddToBlockIndex(block, m_chainman.m_best_header);
+        if (legacy::IsActive(params.GetConsensus(), /*height=*/0)) {
+            // The historical genesis block is the first generated modifier
+            // and supplies its own PoW hash as the initial proof hash.
+            pindex->m_legacy_proof_of_stake = false;
+            pindex->m_legacy_stake_modifier_generated = true;
+            pindex->m_legacy_stake_modifier = 0;
+            pindex->m_legacy_hash_proof = block.GetHash(params.GetConsensus(), /*height=*/0);
+            m_blockman.m_dirty_blockindex.insert(pindex);
+        }
         m_chainman.ReceivedBlockTransactions(block, pindex, blockPos);
     } catch (const std::runtime_error& e) {
         LogError("%s: failed to write genesis block: %s\n", __func__, e.what());
@@ -5051,18 +5450,21 @@ void ChainstateManager::LoadExternalBlockFile(
                 blkdat.SetLimit(nBlockPos + nSize);
                 CBlockHeader header;
                 blkdat >> header;
-                const uint256 hash{header.GetHash()};
                 // Skip the rest of this block (this may read from disk into memory); position to the marker before the
                 // next block, but it's still possible to rewind to the start of the current block (without a disk read).
                 nRewind = nBlockPos + nSize;
                 blkdat.SkipTo(nRewind);
 
                 std::shared_ptr<CBlock> pblock{}; // needs to remain available after the cs_main lock is released to avoid duplicate reads from disk
+                uint256 hash;
 
                 {
                     LOCK(cs_main);
+                    const CBlockIndex* parent{m_blockman.LookupBlockIndex(header.hashPrevBlock)};
+                    const int height{parent ? parent->nHeight + 1 : 0};
+                    hash = header.GetHash(params.GetConsensus(), height);
                     // detect out of order blocks, and store them for later
-                    if (hash != params.GetConsensus().hashGenesisBlock && !m_blockman.LookupBlockIndex(header.hashPrevBlock)) {
+                    if (hash != params.GetConsensus().hashGenesisBlock && !parent) {
                         LogDebug(BCLog::REINDEX, "%s: Out of order block %s, parent %s not known\n", __func__, hash.ToString(),
                                  header.hashPrevBlock.ToString());
                         if (dbp && blocks_with_unknown_parent) {
@@ -5135,9 +5537,11 @@ void ChainstateManager::LoadExternalBlockFile(
                         std::multimap<uint256, FlatFilePos>::iterator it = range.first;
                         std::shared_ptr<CBlock> pblockrecursive = std::make_shared<CBlock>();
                         if (m_blockman.ReadBlock(*pblockrecursive, it->second, {})) {
-                            const auto& block_hash{pblockrecursive->GetHash()};
-                            LogDebug(BCLog::REINDEX, "%s: Processing out of order child %s of %s", __func__, block_hash.ToString(), head.ToString());
                             LOCK(cs_main);
+                            const CBlockIndex* parent{m_blockman.LookupBlockIndex(pblockrecursive->hashPrevBlock)};
+                            const int height{parent ? parent->nHeight + 1 : 0};
+                            const uint256 block_hash{pblockrecursive->GetHash(params.GetConsensus(), height)};
+                            LogDebug(BCLog::REINDEX, "%s: Processing out of order child %s of %s", __func__, block_hash.ToString(), head.ToString());
                             BlockValidationState dummy;
                             if (AcceptBlock(pblockrecursive, dummy, nullptr, true, &it->second, nullptr, true)) {
                                 nLoaded++;

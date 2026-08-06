@@ -12,6 +12,7 @@
 #include <crypto/hex_base.h>
 #include <hash.h>
 #include <kernel/messagestartchars.h>
+#include <legacy/primitives.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <span>
 #include <utility>
@@ -79,23 +81,21 @@ class CMainParams : public CChainParams {
 public:
     CMainParams() {
         m_chain_type = ChainType::MAIN;
+        consensus.legacy_b3coin = true;
+        consensus.legacy_last_pow_block = 500;
         consensus.signet_blocks = false;
         consensus.signet_challenge.clear();
         consensus.nSubsidyHalvingInterval = 210000;
-        consensus.script_flag_exceptions.emplace( // BIP16 exception
-            uint256{"00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"}, SCRIPT_VERIFY_NONE);
-        consensus.script_flag_exceptions.emplace( // Taproot exception
-            uint256{"0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"}, SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS);
-        consensus.BIP34Height = 227931;
-        consensus.BIP34Hash = uint256{"000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"};
-        consensus.BIP65Height = 388381; // 000000000000000004c2b624ed5d7756c508d90fd0da2c7c679febfa6c4735f0
-        consensus.BIP66Height = 363725; // 00000000000000000379eaa19dce8c9b722d46ae6a57c2f1a988119488b50931
-        consensus.CSVHeight = 419328; // 000000000000000004a1b34462cb8aeebd5799177f7a29cf28f2d1961716b5b5
-        consensus.SegwitHeight = 481824; // 0000000000000000001c8018d9cb3b742ef25114f27563e3fc4a1902167f9893
-        consensus.MinBIP9WarningHeight = 483840; // segwit activation height + miner confirmation window
-        consensus.powLimit = uint256{"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
-        consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
-        consensus.nPowTargetSpacing = 10 * 60;
+        consensus.BIP34Height = std::numeric_limits<int>::max();
+        consensus.BIP34Hash = uint256{};
+        consensus.BIP65Height = std::numeric_limits<int>::max();
+        consensus.BIP66Height = std::numeric_limits<int>::max();
+        consensus.CSVHeight = std::numeric_limits<int>::max();
+        consensus.SegwitHeight = std::numeric_limits<int>::max();
+        consensus.MinBIP9WarningHeight = std::numeric_limits<int>::max();
+        consensus.powLimit = uint256{"00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+        consensus.nPowTargetTimespan = 360 * 20;
+        consensus.nPowTargetSpacing = 360;
         consensus.fPowAllowMinDifficultyBlocks = false;
         consensus.enforce_BIP94 = false;
         consensus.fPowNoRetargeting = false;
@@ -106,59 +106,63 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].threshold = 1815; // 90%
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].period = 2016;
 
-        // Deployment of Taproot (BIPs 340-342)
+        // Bitcoin deployments stay disabled until B3Coin's post-fork rules
+        // are explicitly specified and activated.
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit = 2;
-        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = 1619222400; // April 24th, 2021
-        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = 1628640000; // August 11th, 2021
-        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 709632; // Approximately November 12th, 2021
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].threshold = 1815; // 90%
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].period = 2016;
 
-        consensus.nMinimumChainWork = uint256{"0000000000000000000000000000000000000001128750f82f4c366153a3a030"};
-        consensus.defaultAssumeValid = uint256{"00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac"}; // 938343
+        consensus.nMinimumChainWork = uint256{};
+        consensus.defaultAssumeValid = uint256{};
 
         /**
          * The message start string is designed to be unlikely to occur in normal data.
          * The characters are rarely used upper ASCII, not valid as UTF-8, and produce
          * a large 32-bit integer with any alignment.
          */
-        pchMessageStart[0] = 0xf9;
-        pchMessageStart[1] = 0xbe;
-        pchMessageStart[2] = 0xb4;
-        pchMessageStart[3] = 0xd9;
-        nDefaultPort = 8333;
-        nPruneAfterHeight = 100000;
-        m_assumed_blockchain_size = 856;
-        m_assumed_chain_state_size = 14;
+        // Preserve the legacy B3Coin wire protocol so existing peers can
+        // exchange the historical chain with B3Coin Core.
+        pchMessageStart[0] = 0xd1;
+        pchMessageStart[1] = 0x2e;
+        pchMessageStart[2] = 0x1e;
+        pchMessageStart[3] = 0xe6;
+        nDefaultPort = 5647;
+        nPruneAfterHeight = 1000;
+        m_assumed_blockchain_size = 0;
+        m_assumed_chain_state_size = 0;
 
-        genesis = CreateGenesisBlock(1231006505, 2083236893, 0x1d00ffff, 1, 50 * COIN);
-        consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"});
-        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+        genesis = legacy::CreateCoreGenesisBlock();
+        consensus.hashGenesisBlock = genesis.GetHash(consensus, /*height=*/0);
+        assert(consensus.hashGenesisBlock == uint256{"4b0d7f133c5267d715d4d8992635a5490d1edd6b7072cce3f8fe116aba983b6a"});
+        assert(genesis.hashMerkleRoot == uint256{"4243fd570d4cb2e2930767f5bf18b2f65f1b7c4e16a392552d1efadeec00753d"});
 
-        // Note that of those which support the service bits prefix, most only support a subset of
-        // possible options.
-        // This is fine at runtime as we'll fall back to using them as an addrfetch if they don't support the
-        // service bits we want, but we should get them updated to support all service bits wanted by any
-        // release ASAP to avoid it where possible.
-        vSeeds.emplace_back("seed.bitcoin.sipa.be."); // Pieter Wuille, only supports x1, x5, x9, and xd
-        vSeeds.emplace_back("dnsseed.bluematt.me."); // Matt Corallo, only supports x9
-        vSeeds.emplace_back("seed.bitcoin.jonasschnelli.ch."); // Jonas Schnelli, only supports x1, x5, x9, and xd
-        vSeeds.emplace_back("seed.btc.petertodd.net."); // Peter Todd, only supports x1, x5, x9, and xd
-        vSeeds.emplace_back("seed.bitcoin.sprovoost.nl."); // Sjors Provoost
-        vSeeds.emplace_back("dnsseed.emzy.de."); // Stephan Oeste
-        vSeeds.emplace_back("seed.bitcoin.wiz.biz."); // Jason Maurice
-        vSeeds.emplace_back("seed.mainnet.achownodes.xyz."); // Ava Chow, only supports x1, x5, x9, x49, x809, x849, xd, x400, x404, x408, x448, xc08, xc48, x40c
+        for (const char* seed : {
+                 "101.111.89.85", "188.68.52.172", "101.176.118.103",
+                 "103.255.4.54", "104.189.159.228", "107.150.7.122",
+                 "107.174.128.179", "107.191.104.80", "108.196.185.164",
+                 "111.220.140.83", "112.78.8.135", "114.109.204.56",
+                 "115.145.145.32", "115.178.255.103", "115.70.149.98",
+                 "116.15.107.248", "116.206.223.111", "122.161.174.38",
+                 "13.82.93.189", "13.94.154.103", "134.119.181.157",
+             }) {
+            // These are the literal peers distributed by the legacy client.
+            // They are kept as historical bootstrap addresses, not a claim
+            // that each address is still online.
+            vSeeds.emplace_back(seed);
+        }
 
-        base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,0);
-        base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,5);
-        base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,128);
+        base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,63);
+        base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,85);
+        base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,153);
         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x88, 0xB2, 0x1E};
         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x88, 0xAD, 0xE4};
 
-        bech32_hrp = "bc";
+        bech32_hrp = "b3";
 
-        vFixedSeeds = std::vector<uint8_t>(std::begin(chainparams_seed_main), std::end(chainparams_seed_main));
+        vFixedSeeds.clear();
 
         fDefaultConsistencyChecks = false;
         m_is_mockable_chain = false;
@@ -202,6 +206,11 @@ public:
             .commitment_period = 641,
             .redownload_buffer_size = 15218, // 15218/641 = ~23.7 commitments
         };
+
+        // No B3Coin AssumeUTXO snapshot has been independently verified yet.
+        m_assumeutxo_data.clear();
+        chainTxData = ChainTxData{.nTime = 0, .tx_count = 0, .dTxRate = 0.0};
+        m_headers_sync_params = HeadersSyncParams{};
     }
 };
 
@@ -259,8 +268,8 @@ public:
 
         genesis = CreateGenesisBlock(1296688602, 414098458, 0x1d00ffff, 1, 50 * COIN);
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"});
-        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+        assert(consensus.hashGenesisBlock == uint256{"e5bae5775ab0ada1c1c25cac80c3070794553b4f31ccfe23ae0507c1813b8fcd"});
+        assert(genesis.hashMerkleRoot == uint256{"8e239f7b7f2d1fbccf21733d75dc43dd049c30ec387fff8e2390ecd37b56e5ab"});
 
         vFixedSeeds.clear();
         vSeeds.clear();
@@ -375,8 +384,8 @@ public:
                 1,
                 50 * COIN);
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"});
-        assert(genesis.hashMerkleRoot == uint256{"7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"});
+        assert(consensus.hashGenesisBlock == uint256{"9e1f11db988a3a1d39836cd44134687ffbab0cc3e4f58551faf16835835f02ef"});
+        assert(genesis.hashMerkleRoot == uint256{"e9cf0a68ec7454223ccdba442af0f8894ee78f55fc9817087dd285d9e52f3f03"});
 
         vFixedSeeds.clear();
         vSeeds.clear();
@@ -515,8 +524,8 @@ public:
 
         genesis = CreateGenesisBlock(1598918400, 52613770, 0x1e0377ae, 1, 50 * COIN);
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"});
-        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+        assert(consensus.hashGenesisBlock == uint256{"a9912d778e276d82845dfbd70e28a1a7f88c671037c6431b293a43b06aa04d83"});
+        assert(genesis.hashMerkleRoot == uint256{"8e239f7b7f2d1fbccf21733d75dc43dd049c30ec387fff8e2390ecd37b56e5ab"});
 
         m_assumeutxo_data = {
             {
@@ -633,8 +642,8 @@ public:
 
         genesis = CreateGenesisBlock(1296688602, 2, 0x207fffff, 1, 50 * COIN);
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"});
-        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+        assert(consensus.hashGenesisBlock == uint256{"e58cfac223f2b0b6b70a6211897a01f422fc8cc39862f89dc7673197863c3fdd"});
+        assert(genesis.hashMerkleRoot == uint256{"8e239f7b7f2d1fbccf21733d75dc43dd049c30ec387fff8e2390ecd37b56e5ab"});
 
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.
         vSeeds.clear();

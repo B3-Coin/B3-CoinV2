@@ -143,6 +143,16 @@ public:
     uint32_t nBits{0};
     uint32_t nNonce{0};
 
+    /**
+     * Data needed to reproduce B3Coin's historical Peercoin-v1 PoS checks.
+     * These fields are consensus data for the legacy era and are persisted in
+     * the block index. They deliberately do not describe post-fork consensus.
+     */
+    bool m_legacy_proof_of_stake{false};
+    bool m_legacy_stake_modifier_generated{false};
+    uint64_t m_legacy_stake_modifier{0};
+    uint256 m_legacy_hash_proof{};
+
     //! (memory only) Sequential id assigned to distinguish order in which blocks are received.
     //! Initialized to SEQ_ID_INIT_FROM_DISK{1} when loading blocks from disk, except for blocks
     //! belonging to the best chain which overwrite it to SEQ_ID_BEST_CHAIN_FROM_DISK{0}.
@@ -357,9 +367,13 @@ public:
         READWRITE(obj.nTime);
         READWRITE(obj.nBits);
         READWRITE(obj.nNonce);
+        READWRITE(obj.m_legacy_proof_of_stake);
+        READWRITE(obj.m_legacy_stake_modifier_generated);
+        READWRITE(obj.m_legacy_stake_modifier);
+        READWRITE(obj.m_legacy_hash_proof);
     }
 
-    uint256 ConstructBlockHash() const
+    uint256 ConstructBlockHash(const Consensus::Params& consensus_params) const
     {
         CBlockHeader block;
         block.nVersion = nVersion;
@@ -368,7 +382,7 @@ public:
         block.nTime = nTime;
         block.nBits = nBits;
         block.nNonce = nNonce;
-        return block.GetHash();
+        return block.GetHash(consensus_params, nHeight);
     }
 
     uint256 GetBlockHash() = delete;

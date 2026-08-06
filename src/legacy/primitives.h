@@ -6,6 +6,7 @@
 #define B3COIN_LEGACY_PRIMITIVES_H
 
 #include <primitives/transaction.h>
+#include <primitives/block.h>
 #include <serialize.h>
 #include <uint256.h>
 
@@ -64,6 +65,8 @@ struct Block : BlockHeader {
 
 uint256 ComputeMerkleRoot(const Block& block);
 Block CreateGenesisBlock();
+/** Build the same genesis block using the active Core block/transaction types. */
+CBlock CreateCoreGenesisBlock();
 
 } // namespace legacy
 

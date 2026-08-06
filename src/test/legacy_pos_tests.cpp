@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
+#include <legacy/consensus.h>
 #include <legacy/pos.h>
 
 #include <boost/test/unit_test.hpp>
@@ -45,6 +46,21 @@ BOOST_AUTO_TEST_CASE(enforces_old_chain_age_and_timestamp_rules)
 
     BOOST_CHECK(legacy::pos::CheckCoinStakeTimestamp(10, 10));
     BOOST_CHECK(!legacy::pos::CheckCoinStakeTimestamp(10, 11));
+}
+
+BOOST_AUTO_TEST_CASE(preserves_historical_special_burn_fee_accounting)
+{
+    const CAmount output{10 * COIN};
+
+    BOOST_CHECK_EQUAL(
+        legacy::GetLegacyTransactionFee(output + legacy::LEGACY_FUNDAMENTALNODE_BURN, output, /*is_coinstake=*/false),
+        0);
+    BOOST_CHECK_EQUAL(
+        legacy::GetLegacyTransactionFee(output + legacy::LEGACY_FUNDAMENTALNODE_BURN + COIN, output, /*is_coinstake=*/false),
+        COIN);
+    BOOST_CHECK_EQUAL(
+        legacy::GetLegacyTransactionFee(output + COIN, output, /*is_coinstake=*/true),
+        0);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

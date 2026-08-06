@@ -116,6 +116,8 @@ bool TxIndex::FindTx(const Txid& tx_hash, uint256& block_hash, CTransactionRef& 
         LogError("txid mismatch");
         return false;
     }
-    block_hash = header.GetHash();
+    block_hash = m_chainstate->m_chainman.GetConsensus().legacy_b3coin
+        ? header.GetLegacyB3Hash()
+        : header.GetHash();
     return true;
 }

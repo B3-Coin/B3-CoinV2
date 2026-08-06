@@ -160,7 +160,7 @@ BOOST_AUTO_TEST_CASE(processnewblock_signals_ordering)
     std::vector<std::shared_ptr<const CBlock>> blocks;
     while (blocks.size() < 50) {
         blocks.clear();
-        BuildChain(Params().GenesisBlock().GetHash(), 100, 15, 10, 500, blocks);
+        BuildChain(Params().GenesisBlock().GetHash(Params().GetConsensus(), /*height=*/0), 100, 15, 10, 500, blocks);
     }
 
     bool ignored;
@@ -238,7 +238,7 @@ BOOST_AUTO_TEST_CASE(mempool_locks_reorg)
 
     // Process all mined blocks
     BOOST_REQUIRE(ProcessBlock(std::make_shared<CBlock>(Params().GenesisBlock())));
-    auto last_mined = GoodBlock(Params().GenesisBlock().GetHash());
+    auto last_mined = GoodBlock(Params().GenesisBlock().GetHash(Params().GetConsensus(), /*height=*/0));
     BOOST_REQUIRE(ProcessBlock(last_mined));
 
     // Run the test multiple times

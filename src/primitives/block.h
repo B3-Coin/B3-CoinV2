@@ -16,6 +16,10 @@
 #include <utility>
 #include <vector>
 
+namespace Consensus {
+struct Params;
+}
+
 /** Nodes collect new transactions into a block, hash them into a hash tree,
  * and scan through nonce values to make the block's hash satisfy proof-of-work
  * requirements.  When they solve the proof-of-work, they broadcast the block
@@ -56,7 +60,18 @@ public:
         return (nBits == 0);
     }
 
+    /** Bitcoin Core's normal SHA256d block-header hash. */
     uint256 GetHash() const;
+
+    /**
+     * Consensus-selected block-header hash at a known chain height.
+     * Historical B3Coin heights use scrypt while post-fork and non-B3Coin
+     * networks retain SHA256d.
+     */
+    uint256 GetHash(const Consensus::Params& consensus_params, int height) const;
+
+    /** Historical B3Coin scrypt header hash (always scrypt, no version test). */
+    uint256 GetLegacyB3Hash() const;
 
     NodeSeconds Time() const
     {
@@ -75,6 +90,8 @@ class CBlock : public CBlockHeader
 public:
     // network and disk
     std::vector<CTransactionRef> vtx;
+    /** Legacy proof-of-stake block signature, serialized after transactions. */
+    std::vector<unsigned char> vchBlockSig;
 
     // Memory-only flags for caching expensive checks
     mutable bool fChecked;                            // CheckBlock()
@@ -94,19 +111,27 @@ public:
 
     SERIALIZE_METHODS(CBlock, obj)
     {
-        READWRITE(AsBase<CBlockHeader>(obj), obj.vtx);
+        READWRITE(AsBase<CBlockHeader>(obj), obj.vtx, obj.vchBlockSig);
     }
 
     void SetNull()
     {
         CBlockHeader::SetNull();
         vtx.clear();
+        vchBlockSig.clear();
         fChecked = false;
         m_checked_witness_commitment = false;
         m_checked_merkle_root = false;
     }
 
     std::string ToString() const;
+
+    bool IsProofOfStake() const
+    {
+        return vtx.size() > 1 && vtx[1]->IsCoinStake();
+    }
+
+    bool IsProofOfWork() const { return !IsProofOfStake(); }
 };
 
 /** Describes a place in the block chain to another node such that if the

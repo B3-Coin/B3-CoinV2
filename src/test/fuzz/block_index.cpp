@@ -50,7 +50,7 @@ void init_block_index()
 {
     static const auto testing_setup = MakeNoLogFileContext<>(ChainType::MAIN);
     g_setup = testing_setup.get();
-    g_block_hash = Params().GenesisBlock().GetHash();
+    g_block_hash = Params().GenesisBlock().GetHash(Params().GetConsensus(), /*height=*/0);
 }
 
 FUZZ_TARGET(block_index, .init = init_block_index)

@@ -4,9 +4,12 @@
 
 #include <legacy/primitives.h>
 
+#include <consensus/merkle.h>
 #include <streams.h>
 
 #include <boost/test/unit_test.hpp>
+
+#include <algorithm>
 
 BOOST_AUTO_TEST_SUITE(legacy_genesis_tests)
 
@@ -23,6 +26,24 @@ BOOST_AUTO_TEST_CASE(matches_existing_b3coin_chain)
     DataStream encoded_header;
     encoded_header << static_cast<const legacy::BlockHeader&>(genesis);
     BOOST_CHECK_EQUAL(encoded_header.size(), 80U);
+}
+
+BOOST_AUTO_TEST_CASE(active_core_primitives_match_legacy_wire_format)
+{
+    const legacy::Block legacy_genesis{legacy::CreateGenesisBlock()};
+    const CBlock core_genesis{legacy::CreateCoreGenesisBlock()};
+
+    BOOST_CHECK_EQUAL(core_genesis.hashMerkleRoot.GetHex(), legacy_genesis.merkle_root.GetHex());
+    BOOST_CHECK_EQUAL(core_genesis.GetLegacyB3Hash().GetHex(), legacy_genesis.GetHash().GetHex());
+    BOOST_CHECK_EQUAL(BlockMerkleRoot(core_genesis).GetHex(), legacy_genesis.merkle_root.GetHex());
+
+    DataStream legacy_serialized;
+    legacy_serialized << legacy_genesis;
+    DataStream core_serialized;
+    core_serialized << TX_WITH_WITNESS(core_genesis);
+    BOOST_REQUIRE_EQUAL(core_serialized.size(), legacy_serialized.size());
+    BOOST_CHECK(std::equal(core_serialized.begin(), core_serialized.end(),
+                           legacy_serialized.begin(), legacy_serialized.end()));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

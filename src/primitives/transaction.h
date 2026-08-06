@@ -183,12 +183,14 @@ static constexpr TransactionSerParams TX_NO_WITNESS{.allow_witness = false};
 /**
  * Basic transaction serialization format:
  * - uint32_t version
+ * - uint32_t nTime
  * - std::vector<CTxIn> vin
  * - std::vector<CTxOut> vout
  * - uint32_t nLockTime
  *
  * Extended transaction serialization format:
  * - uint32_t version
+ * - uint32_t nTime
  * - unsigned char dummy = 0x00
  * - unsigned char flags (!= 0)
  * - std::vector<CTxIn> vin
@@ -203,6 +205,7 @@ void UnserializeTransaction(TxType& tx, Stream& s, const TransactionSerParams& p
     const bool fAllowWitness = params.allow_witness;
 
     s >> tx.version;
+    s >> tx.nTime;
     unsigned char flags = 0;
     tx.vin.clear();
     tx.vout.clear();
@@ -243,6 +246,7 @@ void SerializeTransaction(const TxType& tx, Stream& s, const TransactionSerParam
     const bool fAllowWitness = params.allow_witness;
 
     s << tx.version;
+    s << tx.nTime;
     unsigned char flags = 0;
     // Consistency check
     if (fAllowWitness) {
@@ -291,6 +295,8 @@ public:
     const std::vector<CTxIn> vin;
     const std::vector<CTxOut> vout;
     const uint32_t version;
+    /** B3Coin legacy transaction timestamp. Included in every transaction ID. */
+    const uint32_t nTime;
     const uint32_t nLockTime;
 
 private:
@@ -343,6 +349,13 @@ public:
         return (vin.size() == 1 && vin[0].prevout.IsNull());
     }
 
+    /** Historical B3Coin proof-of-stake transaction marker. */
+    bool IsCoinStake() const
+    {
+        return !vin.empty() && !vin[0].prevout.IsNull() && vout.size() >= 2 &&
+               vout[0].nValue == 0 && vout[0].scriptPubKey.empty();
+    }
+
     friend bool operator==(const CTransaction& a, const CTransaction& b)
     {
         return a.GetWitnessHash() == b.GetWitnessHash();
@@ -359,6 +372,7 @@ struct CMutableTransaction
     std::vector<CTxIn> vin;
     std::vector<CTxOut> vout;
     uint32_t version;
+    uint32_t nTime;
     uint32_t nLockTime;
 
     explicit CMutableTransaction();

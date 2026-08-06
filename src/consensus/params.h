@@ -87,6 +87,14 @@ struct Params {
     uint256 hashGenesisBlock;
     int nSubsidyHalvingInterval;
     /**
+     * Enables historical B3Coin consensus before the configured hard fork.
+     * This is a network property, not a run-time option: nodes must agree on
+     * legacy transaction serialization, scrypt PoW, and hybrid PoW/PoS rules.
+     */
+    bool legacy_b3coin{false};
+    /** Last height at which historical B3Coin proof-of-work is allowed. */
+    int legacy_last_pow_block{500};
+    /**
      * First block height governed by post-fork consensus. When unset, the
      * hard fork is disabled and all heights remain in the legacy era.
      *
