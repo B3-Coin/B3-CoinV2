@@ -42,24 +42,34 @@ connected `CBlockIndex`, or a height derived from a known parent. Callers in
 `validation.cpp`, `net_processing.cpp`, `node/blockstorage.cpp` and
 `primitives/block.cpp` all satisfy this.
 
-## Decoder selection is NOT consensus-era selection
+## Decoder selection: a header marker plus an authoritative height
 
-The era selector cannot pick a wire decoder: the height of a
-not-yet-decoded blob is unknown until after decoding. These are two distinct
-problems:
+A block header is fixed at 80 bytes, so a node can parse its `nVersion` before
+it parses the transaction body. B3 permanently reserves VersionBits bit 27
+(`0x08000000`) as the modern block-body codec marker. A modern B3 block must
+have the normal BIP9 top pattern plus that bit: `0x28000000`, serialized as
+the little-endian bytes `00 00 00 28`. Lower versionbits remain available for
+later deployments; bit 28 remains Core's testdummy bit.
 
-1. **Consensus-era selection** (`GetB3Era`) — given a *connected* block's
-   height, which rules govern it.
-2. **Format selection** — given raw bytes, which decoder parses them. Today
-   this is resolved **per chain**, not per height: on a legacy-B3Coin chain
-   the unified serialization in `primitives/` tolerates the legacy fields
-   (transaction `nTime`, trailing PoS block signature) at every height. If
-   the modern format ever diverges incompatibly, selection must come from
-   *transport context* — which protocol/peer delivered the bytes, or which
-   storage era they were read from — never from consensus height.
+This gives two separate, mutually checked decisions:
 
-Skeleton interfaces for the eventual split live in
-[`src/legacy/codec.h`](../../src/legacy/codec.h).
+1. **Raw format selection** — the marker chooses the legacy body codec
+   (transaction `nTime` plus trailing PoS block signature) or the exact Core
+   body codec (no transaction `nTime`, no trailing signature).
+2. **Consensus-era selection** (`GetB3Era`) — after the previous block is
+   known, its height determines the only valid codec. A marker/height mismatch
+   is invalid. The marker is not a miner signal and cannot override height.
+
+This makes header-first parsing possible even for an unknown-parent block;
+when the parent arrives, the height check confirms the preliminary codec and
+hash choice. Standalone `tx` messages have no header, so they must instead be
+accepted only in the active transaction era; the mempool is flushed at the
+boundary and on a prohibited cross-boundary reorg.
+
+The current `src/legacy/codec.h` interfaces remain a skeleton. Before a fork
+height is configured, the implementation must restore stock Core primitives
+and make the legacy codec explicit; merely adding the marker does not make
+global `CTransaction` serialization height-aware.
 
 ## What stays global today, and what can move behind src/legacy
 

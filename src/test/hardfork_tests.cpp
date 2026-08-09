@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
+#include <consensus/block_codec.h>
 #include <consensus/era.h>
 #include <consensus/hardfork.h>
 #include <consensus/params.h>
@@ -9,6 +10,8 @@
 #include <legacy/replay.h>
 #include <modern/validation.h>
 #include <primitives/block.h>
+#include <streams.h>
+#include <util/strencodings.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -83,6 +86,34 @@ BOOST_AUTO_TEST_CASE(block_header_hash_switches_at_activation_height)
     BOOST_CHECK(header.GetLegacyB3Hash() != header.GetHash());
     BOOST_CHECK_EQUAL(header.GetHash(params, 99).GetHex(), header.GetLegacyB3Hash().GetHex());
     BOOST_CHECK_EQUAL(header.GetHash(params, 100).GetHex(), header.GetHash().GetHex());
+}
+
+BOOST_AUTO_TEST_CASE(b3_block_codec_marker_is_height_bound_and_versionbits_compatible)
+{
+    const Consensus::Params params{B3Params()};
+    constexpr int32_t legacy_version{4};
+    constexpr int32_t modern_version{static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION)};
+
+    // The marker is the BIP9 top pattern plus reserved B3 bit 27. It must
+    // leave lower versionbits usable for future upgrades.
+    BOOST_CHECK_EQUAL(modern_version, 0x28000000);
+    BOOST_CHECK(Consensus::HasB3BlockCodecV2(modern_version));
+    BOOST_CHECK(Consensus::HasB3BlockCodecV2(modern_version | 0x00000004));
+    BOOST_CHECK(!Consensus::HasB3BlockCodecV2(legacy_version));
+    BOOST_CHECK(!Consensus::HasB3BlockCodecV2(0x30000000));
+
+    DataStream encoded;
+    encoded << modern_version;
+    BOOST_CHECK_EQUAL(HexStr(encoded), "00000028");
+
+    BOOST_CHECK(Consensus::HasExpectedB3BlockCodec(legacy_version, SYNTHETIC_H, params));
+    BOOST_CHECK(!Consensus::HasExpectedB3BlockCodec(modern_version, SYNTHETIC_H, params));
+    BOOST_CHECK(!Consensus::HasExpectedB3BlockCodec(legacy_version, SYNTHETIC_H + 1, params));
+    BOOST_CHECK(Consensus::HasExpectedB3BlockCodec(modern_version, SYNTHETIC_H + 1, params));
+
+    Consensus::Params core_params{};
+    BOOST_CHECK(Consensus::HasExpectedB3BlockCodec(legacy_version, SYNTHETIC_H + 1, core_params));
+    BOOST_CHECK(Consensus::HasExpectedB3BlockCodec(modern_version, SYNTHETIC_H + 1, core_params));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

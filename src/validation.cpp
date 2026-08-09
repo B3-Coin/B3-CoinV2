@@ -12,6 +12,7 @@
 #include <checkqueue.h>
 #include <clientversion.h>
 #include <consensus/amount.h>
+#include <consensus/block_codec.h>
 #include <consensus/consensus.h>
 #include <consensus/era.h>
 #include <consensus/merkle.h>
@@ -2383,6 +2384,10 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     assert(*pindex->phashBlock == block_hash);
 
     const auto time_start{SteadyClock::now()};
+    if (!Consensus::HasExpectedB3BlockCodec(block.nVersion, pindex->nHeight, params.GetConsensus())) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-block-codec",
+                             "block version selects the wrong B3 transaction codec for its height");
+    }
     const bool use_legacy_b3coin{Consensus::GetB3Era(pindex->nHeight, params.GetConsensus()) == Consensus::B3Era::LEGACY};
 
     // Check it again in case a previous version let a bad block in
@@ -4513,8 +4518,17 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
     assert(pindexPrev != nullptr);
     const int nHeight = pindexPrev->nHeight + 1;
 
-    // Check proof of work
     const Consensus::Params& consensusParams = chainman.GetConsensus();
+    // The format marker is selected from the fixed-size header before the
+    // block body is decoded, but its truth is determined by this known parent
+    // height. Do not let a peer select legacy rules or a legacy transaction
+    // codec beyond the configured boundary (or vice versa).
+    if (!Consensus::HasExpectedB3BlockCodec(block.nVersion, nHeight, consensusParams)) {
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-block-codec",
+                             "block version selects the wrong B3 transaction codec for its height");
+    }
+
+    // Check proof of work
     if (Consensus::GetB3Era(nHeight, consensusParams) == Consensus::B3Era::LEGACY) {
         // Header-only B3Coin blocks cannot disclose whether they are PoW or
         // PoS, so their hybrid target is checked once the full block reaches
