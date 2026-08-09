@@ -604,13 +604,13 @@ def get_temp_default_datadir(temp_dir: pathlib.Path) -> tuple[dict, pathlib.Path
     temp_dir, as well as the complete path it would return."""
     if platform.system() == "Windows":
         env = dict(APPDATA=str(temp_dir))
-        datadir = temp_dir / "B3CoinCore"
+        datadir = temp_dir / "B3Coin"
     else:
         env = dict(HOME=str(temp_dir))
         if platform.system() == "Darwin":
-            datadir = temp_dir / "Library/Application Support/B3CoinCore"
+            datadir = temp_dir / "Library/Application Support/B3Coin"
         else:
-            datadir = temp_dir / ".b3coin-core"
+            datadir = temp_dir / ".b3coin"
     return env, datadir
 
 

@@ -756,12 +756,11 @@ bool HasTestOption(const ArgsManager& args, const std::string& test_option)
 
 fs::path GetDefaultDataDir()
 {
-    // Windows:
-    // Windows: C:\Users\Username\AppData\Local\B3CoinCore
-    // macOS: ~/Library/Application Support/B3CoinCore
-    // Unix-like: ~/.b3coin-core
+    // Windows: C:\Users\Username\AppData\Local\B3Coin
+    // macOS: ~/Library/Application Support/B3Coin
+    // Unix-like: ~/.b3coin
 #ifdef WIN32
-    return GetSpecialFolderPath(CSIDL_LOCAL_APPDATA) / "B3CoinCore";
+    return GetSpecialFolderPath(CSIDL_LOCAL_APPDATA) / "B3Coin";
 #else
     fs::path pathRet;
     char* pszHome = getenv("HOME");
@@ -771,10 +770,10 @@ fs::path GetDefaultDataDir()
         pathRet = fs::path(pszHome);
 #ifdef __APPLE__
     // macOS
-    return pathRet / "Library/Application Support/B3CoinCore";
+    return pathRet / "Library/Application Support/B3Coin";
 #else
     // Unix-like
-    return pathRet / ".b3coin-core";
+    return pathRet / ".b3coin";
 #endif
 #endif
 }

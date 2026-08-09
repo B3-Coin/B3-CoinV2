@@ -14,7 +14,7 @@ EXAMPLE_CONF_FILE=${EXAMPLE_CONF_FILE:-$SHARE_EXAMPLES_DIR/b3coin.conf}
 [ ! -x "$BITCOIND" ] && echo "$BITCOIND not found or not executable." && exit 1
 
 DIRTY=""
-VERSION_OUTPUT=$($BITCOIND --version)
+VERSION_OUTPUT=$($BITCOIND -nosettings --version)
 if [[ $VERSION_OUTPUT == *"dirty"* ]]; then
   DIRTY="${DIRTY}${BITCOIND}\n"
 fi
@@ -49,7 +49,7 @@ EOF
 # parse the output from b3coind --help
 # adding newlines is a bit funky to ensure portability for BSD
 # see here for more details: https://stackoverflow.com/a/24575385
-${BITCOIND} --help \
+${BITCOIND} -nosettings --help \
     | sed '1,/Options:/d' \
     | sed -E '/^[[:space:]]{2}-help/,/^[[:space:]]*$/d' \
     | sed -E 's/^[[:space:]]{2}\-/#/' \
