@@ -64,10 +64,13 @@ std::string CTxOut::ToString() const
 }
 
 CMutableTransaction::CMutableTransaction() : version{CTransaction::CURRENT_VERSION}, nTime{0}, nLockTime{0} {}
-CMutableTransaction::CMutableTransaction(const CTransaction& tx) : vin(tx.vin), vout(tx.vout), version{tx.version}, nTime{tx.nTime}, nLockTime{tx.nLockTime} {}
+CMutableTransaction::CMutableTransaction(const CTransaction& tx) : vin(tx.vin), vout(tx.vout), version{tx.version}, nTime{tx.nTime}, nLockTime{tx.nLockTime}, m_legacy_encoding{tx.IsLegacyEncoded()} {}
 
 Txid CMutableTransaction::GetHash() const
 {
+    if (m_legacy_encoding) {
+        return Txid::FromUint256((HashWriter{} << TX_LEGACY_B3(*this)).GetHash());
+    }
     return Txid::FromUint256((HashWriter{} << TX_NO_WITNESS(*this)).GetHash());
 }
 
@@ -80,6 +83,11 @@ bool CTransaction::ComputeHasWitness() const
 
 Txid CTransaction::ComputeHash() const
 {
+    if (m_legacy_encoding) {
+        // The legacy encoding is this transaction's identity: the historical
+        // txid commits to nTime and the legacy field order.
+        return Txid::FromUint256((HashWriter{} << TX_LEGACY_B3(*this)).GetHash());
+    }
     return Txid::FromUint256((HashWriter{} << TX_NO_WITNESS(*this)).GetHash());
 }
 
@@ -92,8 +100,8 @@ Wtxid CTransaction::ComputeWitnessHash() const
     return Wtxid::FromUint256((HashWriter{} << TX_WITH_WITNESS(*this)).GetHash());
 }
 
-CTransaction::CTransaction(const CMutableTransaction& tx) : vin(tx.vin), vout(tx.vout), version{tx.version}, nTime{tx.nTime}, nLockTime{tx.nLockTime}, m_has_witness{ComputeHasWitness()}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()} {}
-CTransaction::CTransaction(CMutableTransaction&& tx) : vin(std::move(tx.vin)), vout(std::move(tx.vout)), version{tx.version}, nTime{tx.nTime}, nLockTime{tx.nLockTime}, m_has_witness{ComputeHasWitness()}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()} {}
+CTransaction::CTransaction(const CMutableTransaction& tx) : vin(tx.vin), vout(tx.vout), version{tx.version}, nTime{tx.nTime}, nLockTime{tx.nLockTime}, m_has_witness{ComputeHasWitness()}, m_legacy_encoding{tx.m_legacy_encoding}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()} {}
+CTransaction::CTransaction(CMutableTransaction&& tx) : vin(std::move(tx.vin)), vout(std::move(tx.vout)), version{tx.version}, nTime{tx.nTime}, nLockTime{tx.nLockTime}, m_has_witness{ComputeHasWitness()}, m_legacy_encoding{tx.m_legacy_encoding}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()} {}
 
 CAmount CTransaction::GetValueOut() const
 {

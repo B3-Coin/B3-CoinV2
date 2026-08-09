@@ -389,9 +389,12 @@ TestChain100Setup::TestChain100Setup(
 
     {
         LOCK(::cs_main);
+        // Deterministic-chain pin re-recorded for B3: the regtest subsidy is
+        // 50 * COIN in B3's 1e6-subunit COIN, so the mined chain differs from
+        // upstream's while remaining fully deterministic.
         assert(
             m_node.chainman->ActiveChain().Tip()->GetBlockHash().ToString() ==
-            "0c8c5f79505775a0f6aed6aca2350718ceb9c6f2c878667864d5c7a6d8ffa2a6");
+            "581a540491b9751f6a3daaf0d3414def0024dd4d8177efb03c9bdb73b8a08d75");
     }
 }
 

@@ -1328,10 +1328,13 @@ public:
     void Serialize(S &s) const {
         // Serialize version
         ::Serialize(s, txTo.version);
-        // B3Coin transaction serialization commits a timestamp immediately
-        // after the version. Keep the signature preimage consistent with the
-        // transaction ID and the historical chain.
-        ::Serialize(s, txTo.nTime);
+        // Historical B3 transactions commit a timestamp immediately after
+        // the version, and their signatures were produced over a preimage
+        // with the same layout. Only legacy-encoded transactions include it;
+        // the modern Base preimage is unmodified Core.
+        if (txTo.IsLegacyEncoded()) {
+            ::Serialize(s, txTo.nTime);
+        }
         // Serialize vin
         unsigned int nInputs = fAnyoneCanPay ? 1 : txTo.vin.size();
         ::WriteCompactSize(s, nInputs);

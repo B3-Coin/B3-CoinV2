@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
+#include <legacy/codec.h>
 #include <legacy/consensus.h>
 #include <legacy/primitives.h>
 
@@ -11,6 +12,7 @@
 #include <netaddress.h>
 #include <protocol.h>
 #include <streams.h>
+#include <util/strencodings.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
@@ -47,11 +49,74 @@ BOOST_AUTO_TEST_CASE(active_core_primitives_match_legacy_wire_format)
 
     DataStream legacy_serialized;
     legacy_serialized << legacy_genesis;
+    // The explicit legacy codec reproduces the historical block bytes; the
+    // modern default encoding intentionally does not.
     DataStream core_serialized;
-    core_serialized << TX_WITH_WITNESS(core_genesis);
+    core_serialized << legacy::TX_LEGACY(core_genesis);
     BOOST_REQUIRE_EQUAL(core_serialized.size(), legacy_serialized.size());
     BOOST_CHECK(std::equal(core_serialized.begin(), core_serialized.end(),
                            legacy_serialized.begin(), legacy_serialized.end()));
+
+    DataStream modern_serialized;
+    modern_serialized << TX_WITH_WITNESS(core_genesis);
+    BOOST_CHECK(modern_serialized.size() < legacy_serialized.size());
+}
+
+BOOST_AUTO_TEST_CASE(frozen_legacy_transaction_golden_vector)
+{
+    const CBlock genesis{legacy::CreateCoreGenesisBlock()};
+    const CTransaction& coinbase{*genesis.vtx[0]};
+
+    BOOST_CHECK(coinbase.IsLegacyEncoded());
+    BOOST_CHECK_EQUAL(coinbase.nTime, 1481667355U);
+
+    DataStream encoded;
+    encoded << legacy::TX_LEGACY(coinbase);
+    // Frozen historical bytes: version 1, nTime 1481667355 (1b735058 LE),
+    // one null-prevout input carrying the timestamp string, one empty
+    // zero-value output, lock time 0.
+    BOOST_CHECK_EQUAL(HexStr(encoded),
+        "010000001b735058010000000000000000000000000000000000000000000000000000"
+        "000000000000ffffffff5300012a4c4e4368696e61206c61756e636865732047616f66"
+        "656e2d3320537461656c6c69746520746f2067657420616363757261746520696d6167"
+        "6573206f66206561727468206f6e2031312d617567757374ffffffff01"
+        "00000000000000000000000000");
+    // The historical single-transaction merkle root IS the coinbase txid.
+    BOOST_CHECK_EQUAL(coinbase.GetHash().GetHex(),
+        "4243fd570d4cb2e2930767f5bf18b2f65f1b7c4e16a392552d1efadeec00753d");
+    BOOST_CHECK_EQUAL(legacy::TxId(coinbase).GetHex(), coinbase.GetHash().GetHex());
+
+    // Round-trip through the explicit legacy codec preserves the identity.
+    CTransactionRef decoded;
+    DataStream copy{encoded};
+    copy >> legacy::TX_LEGACY(decoded);
+    BOOST_CHECK(decoded->IsLegacyEncoded());
+    BOOST_CHECK_EQUAL(decoded->nTime, coinbase.nTime);
+    BOOST_CHECK_EQUAL(decoded->GetHash().GetHex(), coinbase.GetHash().GetHex());
+
+    // The modern default encoding omits nTime and yields a different txid.
+    DataStream modern;
+    modern << TX_NO_WITNESS(coinbase);
+    BOOST_CHECK_EQUAL(modern.size() + 4, encoded.size());
+    const CMutableTransaction modern_copy{[&] {
+        CMutableTransaction m{coinbase};
+        m.m_legacy_encoding = false;
+        return m;
+    }()};
+    BOOST_CHECK(modern_copy.GetHash().GetHex() != coinbase.GetHash().GetHex());
+}
+
+BOOST_AUTO_TEST_CASE(legacy_codec_rejects_truncated_bytes)
+{
+    const CBlock genesis{legacy::CreateCoreGenesisBlock()};
+    DataStream encoded;
+    encoded << legacy::TX_LEGACY(*genesis.vtx[0]);
+
+    for (const size_t len : {size_t{0}, size_t{3}, encoded.size() / 2, encoded.size() - 1}) {
+        DataStream truncated{std::span{encoded}.first(len)};
+        CTransactionRef decoded;
+        BOOST_CHECK_THROW(truncated >> legacy::TX_LEGACY(decoded), std::ios_base::failure);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(accepts_the_configured_historical_genesis_exception)

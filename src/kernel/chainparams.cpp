@@ -78,6 +78,13 @@ constexpr std::array<uint8_t, 32 * 8> B3COIN_FIXED_SEEDS{
 
 } // namespace
 
+/**
+ * The test chains keep Bitcoin Core's original genesis blocks. Their coinbase
+ * value is the stock 50 BTC spelled in stock 1e8 subunits, independent of the
+ * B3 COIN unit, so the historical genesis hashes remain byte-exact.
+ */
+static constexpr CAmount BITCOIN_GENESIS_REWARD{5'000'000'000};
+
 static CBlock CreateGenesisBlock(const char* pszTimestamp, const CScript& genesisOutputScript, uint32_t nTime, uint32_t nNonce, uint32_t nBits, int32_t nVersion, const CAmount& genesisReward)
 {
     CMutableTransaction txNew;
@@ -299,10 +306,10 @@ public:
         m_assumed_blockchain_size = 245;
         m_assumed_chain_state_size = 19;
 
-        genesis = CreateGenesisBlock(1296688602, 414098458, 0x1d00ffff, 1, 50 * COIN);
+        genesis = CreateGenesisBlock(1296688602, 414098458, 0x1d00ffff, 1, BITCOIN_GENESIS_REWARD);
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"e5bae5775ab0ada1c1c25cac80c3070794553b4f31ccfe23ae0507c1813b8fcd"});
-        assert(genesis.hashMerkleRoot == uint256{"8e239f7b7f2d1fbccf21733d75dc43dd049c30ec387fff8e2390ecd37b56e5ab"});
+        assert(consensus.hashGenesisBlock == uint256{"000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"});
+        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
 
         vFixedSeeds.clear();
         vSeeds.clear();
@@ -415,10 +422,10 @@ public:
                 393743547,
                 0x1d00ffff,
                 1,
-                50 * COIN);
+                BITCOIN_GENESIS_REWARD);
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"9e1f11db988a3a1d39836cd44134687ffbab0cc3e4f58551faf16835835f02ef"});
-        assert(genesis.hashMerkleRoot == uint256{"e9cf0a68ec7454223ccdba442af0f8894ee78f55fc9817087dd285d9e52f3f03"});
+        assert(consensus.hashGenesisBlock == uint256{"00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"});
+        assert(genesis.hashMerkleRoot == uint256{"7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"});
 
         vFixedSeeds.clear();
         vSeeds.clear();
@@ -555,10 +562,10 @@ public:
         nDefaultPort = 38333;
         nPruneAfterHeight = 1000;
 
-        genesis = CreateGenesisBlock(1598918400, 52613770, 0x1e0377ae, 1, 50 * COIN);
+        genesis = CreateGenesisBlock(1598918400, 52613770, 0x1e0377ae, 1, BITCOIN_GENESIS_REWARD);
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"a9912d778e276d82845dfbd70e28a1a7f88c671037c6431b293a43b06aa04d83"});
-        assert(genesis.hashMerkleRoot == uint256{"8e239f7b7f2d1fbccf21733d75dc43dd049c30ec387fff8e2390ecd37b56e5ab"});
+        assert(consensus.hashGenesisBlock == uint256{"00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"});
+        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
 
         m_assumeutxo_data = {
             {
@@ -673,10 +680,10 @@ public:
             consensus.vDeployments[deployment_pos].min_activation_height = version_bits_params.min_activation_height;
         }
 
-        genesis = CreateGenesisBlock(1296688602, 2, 0x207fffff, 1, 50 * COIN);
+        genesis = CreateGenesisBlock(1296688602, 2, 0x207fffff, 1, BITCOIN_GENESIS_REWARD);
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"e58cfac223f2b0b6b70a6211897a01f422fc8cc39862f89dc7673197863c3fdd"});
-        assert(genesis.hashMerkleRoot == uint256{"8e239f7b7f2d1fbccf21733d75dc43dd049c30ec387fff8e2390ecd37b56e5ab"});
+        assert(consensus.hashGenesisBlock == uint256{"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"});
+        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
 
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.
         vSeeds.clear();

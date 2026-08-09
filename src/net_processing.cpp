@@ -24,6 +24,7 @@
 #include <headerssync.h>
 #include <index/blockfilterindex.h>
 #include <kernel/types.h>
+#include <legacy/codec.h>
 #include <legacy/consensus.h>
 #include <logging.h>
 #include <merkleblock.h>
@@ -2499,10 +2500,21 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
         pblock = pblockRead;
     }
     if (pblock) {
+        // On the legacy chain every peer speaks the historical block
+        // encoding; the codec choice is explicit from the chain context.
+        const bool legacy_wire{m_chainparams.GetConsensus().legacy_b3coin};
         if (inv.IsMsgBlk()) {
-            MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_NO_WITNESS(*pblock));
+            if (legacy_wire) {
+                MakeAndPushMessage(pfrom, NetMsgType::BLOCK, legacy::TX_LEGACY(*pblock));
+            } else {
+                MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_NO_WITNESS(*pblock));
+            }
         } else if (inv.IsMsgWitnessBlk()) {
-            MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_WITH_WITNESS(*pblock));
+            if (legacy_wire) {
+                MakeAndPushMessage(pfrom, NetMsgType::BLOCK, legacy::TX_LEGACY(*pblock));
+            } else {
+                MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_WITH_WITNESS(*pblock));
+            }
         } else if (inv.IsMsgFilteredBlk()) {
             bool sendMerkleBlock = false;
             CMerkleBlock merkleBlock;
@@ -2522,15 +2534,15 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
                 // Thus, the protocol spec specified allows for us to provide duplicate txn here,
                 // however we MUST always provide at least what the remote peer needs
                 for (const auto& [tx_idx, _] : merkleBlock.vMatchedTxn)
-                    MakeAndPushMessage(pfrom, NetMsgType::TX, TX_NO_WITNESS(*pblock->vtx[tx_idx]));
+                    MakeAndPushMessage(pfrom, NetMsgType::TX, (legacy_wire ? legacy::TX_LEGACY : TX_NO_WITNESS)(*pblock->vtx[tx_idx]));
             }
             // else
             // no response
         } else if (inv.IsMsgCmpctBlk()) {
-            if (m_chainparams.GetConsensus().legacy_b3coin) {
+            if (legacy_wire) {
                 // Hybrid legacy headers do not prove whether the block is PoW
                 // or PoS, so BIP152's header-first relay is not safe here.
-                MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_NO_WITNESS(*pblock));
+                MakeAndPushMessage(pfrom, NetMsgType::BLOCK, legacy::TX_LEGACY(*pblock));
             } else {
                 // If a peer is asking for old blocks, we're almost guaranteed
                 // they won't have a useful mempool to match against a compact block,
@@ -2616,9 +2628,12 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
         }
 
         if (auto tx{FindTxForGetData(*tx_relay, ToGenTxid(inv))}) {
-            // WTX and WITNESS_TX imply we serialize with witness
-            const auto maybe_with_witness = (inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS);
-            MakeAndPushMessage(pfrom, NetMsgType::TX, maybe_with_witness(*tx));
+            // WTX and WITNESS_TX imply we serialize with witness; legacy
+            // peers always get the historical encoding.
+            const TransactionSerParams& tx_ser{
+                m_chainparams.GetConsensus().legacy_b3coin ? legacy::TX_LEGACY :
+                inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS};
+            MakeAndPushMessage(pfrom, NetMsgType::TX, tx_ser(*tx));
             m_mempool.RemoveUnbroadcastTx(tx->GetHash());
         } else {
             vNotFound.push_back(inv);
@@ -4461,7 +4476,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // that we INVed to the peer earlier.
             if (vInv.size() == 1 && vInv[0].IsMsgTx() && vInv[0].hash == pushed_tx->GetHash().ToUint256()) {
 
-                MakeAndPushMessage(pfrom, NetMsgType::TX, TX_WITH_WITNESS(*pushed_tx));
+                MakeAndPushMessage(pfrom, NetMsgType::TX, (m_chainparams.GetConsensus().legacy_b3coin ? legacy::TX_LEGACY : TX_WITH_WITNESS)(*pushed_tx));
 
                 peer.m_ping_queued = true; // Ensure a ping will be sent: mimic a request via RPC.
                 MaybeSendPing(pfrom, peer, GetTime<std::chrono::microseconds>());
@@ -4701,7 +4716,13 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         if (m_chainman.IsInitialBlockDownload()) return;
 
         CTransactionRef ptx;
-        vRecv >> TX_WITH_WITNESS(ptx);
+        if (m_chainparams.GetConsensus().legacy_b3coin) {
+            // Legacy peers relay the historical transaction encoding; the
+            // codec choice is explicit from the connection context.
+            vRecv >> legacy::TX_LEGACY(ptx);
+        } else {
+            vRecv >> TX_WITH_WITNESS(ptx);
+        }
 
         const Txid& txid = ptx->GetHash();
         const Wtxid& wtxid = ptx->GetWitnessHash();
@@ -5086,7 +5107,14 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         }
 
         std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
-        vRecv >> TX_WITH_WITNESS(*pblock);
+        if (m_chainparams.GetConsensus().legacy_b3coin) {
+            // Legacy peers send the historical block encoding (nTime
+            // transactions plus a trailing signature); the codec choice is
+            // explicit from the connection context.
+            vRecv >> legacy::TX_LEGACY(*pblock);
+        } else {
+            vRecv >> TX_WITH_WITNESS(*pblock);
+        }
 
         const CBlockIndex* prev_block{nullptr};
         {

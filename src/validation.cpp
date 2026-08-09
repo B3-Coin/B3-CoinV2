@@ -30,6 +30,7 @@
 #include <kernel/notifications_interface.h>
 #include <kernel/types.h>
 #include <kernel/warning.h>
+#include <legacy/codec.h>
 #include <legacy/consensus.h>
 #include <logging/timer.h>
 #include <node/blockstorage.h>
@@ -2755,7 +2756,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             if (tx.IsCoinStake()) {
                 legacy_stake_reward = tx.GetValueOut() - tx_value_in;
             }
-            legacy_tx_offset += static_cast<uint32_t>(GetSerializeSize(TX_NO_WITNESS(tx)));
+            legacy_tx_offset += static_cast<uint32_t>(GetSerializeSize(legacy::TX_LEGACY(tx)));
         }
     }
     const auto time_3{SteadyClock::now()};
@@ -4115,7 +4116,7 @@ static bool CheckLegacyTransaction(const CTransaction& tx, TxValidationState& st
     }
     if (tx.vin.empty()) return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-vin-empty");
     if (tx.vout.empty()) return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-vout-empty");
-    if (::GetSerializeSize(TX_NO_WITNESS(tx)) > legacy::MAX_BLOCK_SIZE) {
+    if (::GetSerializeSize(legacy::TX_LEGACY(tx)) > legacy::MAX_BLOCK_SIZE) {
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-oversize");
     }
 
@@ -4180,7 +4181,7 @@ static bool CheckLegacyBlock(const CBlock& block, BlockValidationState& state,
         return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new", "block timestamp too far in the future");
     }
     if (block.vtx.empty() || block.vtx.size() > legacy::MAX_BLOCK_SIZE ||
-        ::GetSerializeSize(TX_NO_WITNESS(block)) > legacy::MAX_BLOCK_SIZE) {
+        ::GetSerializeSize(legacy::TX_LEGACY(block)) > legacy::MAX_BLOCK_SIZE) {
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-length", "size limits failed");
     }
     if (!block.vtx[0]->IsCoinBase()) {
@@ -5250,7 +5251,7 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
         AddCoins(inputs, *tx, pindex->nHeight, true,
                  use_legacy_b3coin ? legacy_tx_offset : 0);
         if (use_legacy_b3coin) {
-            legacy_tx_offset += static_cast<uint32_t>(GetSerializeSize(TX_NO_WITNESS(*tx)));
+            legacy_tx_offset += static_cast<uint32_t>(GetSerializeSize(legacy::TX_LEGACY(*tx)));
         }
     }
     return true;

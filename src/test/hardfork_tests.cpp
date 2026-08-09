@@ -15,6 +15,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <limits>
 
 BOOST_AUTO_TEST_SUITE(hardfork_tests)
@@ -114,6 +115,48 @@ BOOST_AUTO_TEST_CASE(b3_block_codec_marker_is_height_bound_and_versionbits_compa
     Consensus::Params core_params{};
     BOOST_CHECK(Consensus::HasExpectedB3BlockCodec(legacy_version, SYNTHETIC_H + 1, core_params));
     BOOST_CHECK(Consensus::HasExpectedB3BlockCodec(modern_version, SYNTHETIC_H + 1, core_params));
+}
+
+BOOST_AUTO_TEST_CASE(legacy_chain_block_codec_is_marker_aware)
+{
+    CMutableTransaction mtx;
+    mtx.version = 2;
+    mtx.vin.resize(1);
+    mtx.vin[0].prevout = COutPoint{Txid::FromUint256(uint256{1}), 0};
+    mtx.vout.emplace_back(1 * COIN, CScript() << OP_TRUE);
+
+    CBlock block;
+    block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+    block.vtx.push_back(MakeTransactionRef(mtx));
+
+    // A marker-modern block keeps the unmodified Core body even when read
+    // or written through the legacy-chain codec.
+    DataStream via_legacy;
+    via_legacy << legacy::TX_LEGACY(block);
+    DataStream via_modern;
+    via_modern << TX_WITH_WITNESS(block);
+    BOOST_REQUIRE_EQUAL(via_legacy.size(), via_modern.size());
+    BOOST_CHECK(std::equal(via_legacy.begin(), via_legacy.end(), via_modern.begin()));
+
+    CBlock decoded;
+    via_legacy >> legacy::TX_LEGACY(decoded);
+    BOOST_REQUIRE_EQUAL(decoded.vtx.size(), 1U);
+    BOOST_CHECK(!decoded.vtx[0]->IsLegacyEncoded());
+    BOOST_CHECK_EQUAL(decoded.vtx[0]->GetHash().GetHex(), block.vtx[0]->GetHash().GetHex());
+
+    // Without the marker the same chain codec produces the historical body:
+    // nTime transactions plus the trailing block signature.
+    block.nVersion = 4;
+    block.vchBlockSig = {0x01};
+    DataStream legacy_bytes;
+    legacy_bytes << legacy::TX_LEGACY(block);
+    BOOST_CHECK(legacy_bytes.size() > via_modern.size());
+
+    CBlock legacy_decoded;
+    legacy_bytes >> legacy::TX_LEGACY(legacy_decoded);
+    BOOST_REQUIRE_EQUAL(legacy_decoded.vtx.size(), 1U);
+    BOOST_CHECK(legacy_decoded.vtx[0]->IsLegacyEncoded());
+    BOOST_CHECK_EQUAL(legacy_decoded.vchBlockSig.size(), 1U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

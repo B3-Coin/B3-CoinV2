@@ -5,58 +5,61 @@
 #ifndef B3COIN_LEGACY_CODEC_H
 #define B3COIN_LEGACY_CODEC_H
 
+#include <hash.h>
+#include <primitives/block.h>
 #include <primitives/transaction.h>
-
-#include <cstddef>
-#include <memory>
-#include <optional>
-#include <span>
-
-class CBlock;
+#include <serialize.h>
 
 namespace legacy {
 
 /**
- * PROTOTYPE-ONLY SKELETON. Interfaces isolating the historical B3Coin wire
- * formats (transactions carrying nTime, blocks carrying a trailing
- * proof-of-stake signature) behind src/legacy.
+ * The explicit legacy B3 codec.
  *
- * NOTE ON FORMAT SELECTION: a decoder can never be chosen with
- * Consensus::GetB3Era(), because the height of a not-yet-decoded blob is
- * unknown until after decoding. Today the tree sidesteps the problem with a
- * chain-level unified serialization in primitives/ that tolerates the legacy
- * fields on every height of a legacy-B3Coin chain. If the MODERN format ever
- * diverges incompatibly, selection must come from the transport context
- * (which peer/protocol delivered the bytes, or which era of storage they were
- * read from) — never from consensus height. See
- * doc/design/b3-era-architecture.md.
+ * Historical B3Coin wire encoding: transactions carry an nTime field after
+ * the version and have no witness; blocks append a trailing proof-of-stake
+ * signature after the transactions. A transaction deserialized through this
+ * codec is marked legacy-encoded, which makes the legacy bytes its identity:
+ * GetHash() returns the exact historical txid, so merkle roots, outpoints
+ * and UTXO keys stay byte-compatible with the existing chain without any
+ * further caller involvement.
+ *
+ * Usage mirrors the modern params wrappers and must be explicit at the call
+ * site, from a trusted format context (a legacy peer connection, legacy
+ * chain block storage, or legacy genesis construction):
+ *
+ *     stream >> TX_LEGACY(block);     // decode a legacy block
+ *     stream << TX_LEGACY(tx);        // encode a legacy transaction
+ *     GetSerializeSize(TX_LEGACY(tx)) // historical serialized size
+ *
+ * NOTE ON FORMAT SELECTION: never choose this codec from a block height —
+ * the height of undecoded bytes is unknown until after decoding. Selection
+ * comes from transport or storage context, and for whole blocks the codec
+ * is additionally marker-aware: the fixed-size header parses first, so a
+ * post-fork block carrying the permanent B3 codec marker
+ * (consensus/block_codec.h) keeps the unmodified Core body even when read
+ * through TX_LEGACY. Whether the marker may appear at a given height is
+ * enforced separately in ContextualCheckBlockHeader. Standalone
+ * transactions have no header, so they rely on connection/era context
+ * alone. See doc/design/b3-era-architecture.md.
  */
-class TransactionDecoder
+static constexpr TransactionSerParams TX_LEGACY{.allow_witness = false, .legacy_time = true};
+
+/** Exact historical serialized size of a legacy transaction. */
+inline size_t TxSerializedSize(const CTransaction& tx)
 {
-public:
-    virtual ~TransactionDecoder() = default;
+    return GetSerializeSize(TX_LEGACY(tx));
+}
 
-    /**
-     * Decode one historical transaction (nVersion, nTime, vin, vout,
-     * nLockTime), preserving txid, outpoints, values and scriptPubKeys
-     * exactly. Returns std::nullopt when the bytes are not a well-formed
-     * legacy transaction.
-     */
-    virtual std::optional<CTransactionRef> Decode(std::span<const std::byte> bytes) const = 0;
-};
-
-class BlockDecoder
+/**
+ * The historical transaction ID of `tx` regardless of how it was decoded:
+ * the cached hash when the transaction is legacy-encoded, otherwise a fresh
+ * hash of the legacy byte layout.
+ */
+inline Txid TxId(const CTransaction& tx)
 {
-public:
-    virtual ~BlockDecoder() = default;
-
-    /**
-     * Decode one historical block, including the trailing legacy
-     * proof-of-stake block signature. Returns nullptr when the bytes are not
-     * a well-formed legacy block.
-     */
-    virtual std::shared_ptr<CBlock> Decode(std::span<const std::byte> bytes) const = 0;
-};
+    if (tx.IsLegacyEncoded()) return tx.GetHash();
+    return Txid::FromUint256((HashWriter{} << TX_LEGACY(tx)).GetHash());
+}
 
 } // namespace legacy
 

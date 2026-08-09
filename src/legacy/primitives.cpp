@@ -91,6 +91,9 @@ CBlock CreateCoreGenesisBlock()
     CMutableTransaction transaction;
     transaction.version = 1;
     transaction.nTime = 1481667355;
+    // The genesis coinbase identity is its historical legacy encoding; the
+    // txid (and therefore the merkle root) commits to nTime.
+    transaction.m_legacy_encoding = true;
     transaction.vin.resize(1);
     transaction.vin[0].scriptSig = CScript() << 0 << CScriptNum{42}
         << std::vector<unsigned char>{timestamp.begin(), timestamp.end()};

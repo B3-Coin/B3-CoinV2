@@ -175,28 +175,42 @@ struct CMutableTransaction;
 
 struct TransactionSerParams {
     const bool allow_witness;
+    /**
+     * Historical B3Coin transaction encoding: an nTime field follows the
+     * version, there is no witness, and (for blocks) a trailing block
+     * signature follows the transactions. Never set in the modern default
+     * params; select it explicitly via legacy::TX_LEGACY (legacy/codec.h).
+     */
+    const bool legacy_time{false};
     SER_PARAMS_OPFUNC
 };
 static constexpr TransactionSerParams TX_WITH_WITNESS{.allow_witness = true};
 static constexpr TransactionSerParams TX_NO_WITNESS{.allow_witness = false};
+/** Canonical legacy-B3 params. Use through legacy::TX_LEGACY, not directly. */
+static constexpr TransactionSerParams TX_LEGACY_B3{.allow_witness = false, .legacy_time = true};
 
 /**
  * Basic transaction serialization format:
  * - uint32_t version
- * - uint32_t nTime
  * - std::vector<CTxIn> vin
  * - std::vector<CTxOut> vout
  * - uint32_t nLockTime
  *
  * Extended transaction serialization format:
  * - uint32_t version
- * - uint32_t nTime
  * - unsigned char dummy = 0x00
  * - unsigned char flags (!= 0)
  * - std::vector<CTxIn> vin
  * - std::vector<CTxOut> vout
  * - if (flags & 1):
  *   - CScriptWitness scriptWitness; (deserialized into CTxIn)
+ * - uint32_t nLockTime
+ *
+ * Historical B3Coin format (params.legacy_time; see legacy/codec.h):
+ * - uint32_t version
+ * - uint32_t nTime
+ * - std::vector<CTxIn> vin
+ * - std::vector<CTxOut> vout
  * - uint32_t nLockTime
  */
 template<typename Stream, typename TxType>
@@ -205,7 +219,12 @@ void UnserializeTransaction(TxType& tx, Stream& s, const TransactionSerParams& p
     const bool fAllowWitness = params.allow_witness;
 
     s >> tx.version;
-    s >> tx.nTime;
+    if (params.legacy_time) {
+        s >> tx.nTime;
+    } else {
+        tx.nTime = 0;
+    }
+    tx.m_legacy_encoding = params.legacy_time;
     unsigned char flags = 0;
     tx.vin.clear();
     tx.vout.clear();
@@ -246,7 +265,9 @@ void SerializeTransaction(const TxType& tx, Stream& s, const TransactionSerParam
     const bool fAllowWitness = params.allow_witness;
 
     s << tx.version;
-    s << tx.nTime;
+    if (params.legacy_time) {
+        s << tx.nTime;
+    }
     unsigned char flags = 0;
     // Consistency check
     if (fAllowWitness) {
@@ -295,13 +316,23 @@ public:
     const std::vector<CTxIn> vin;
     const std::vector<CTxOut> vout;
     const uint32_t version;
-    /** B3Coin legacy transaction timestamp. Included in every transaction ID. */
+    /**
+     * B3Coin legacy transaction timestamp. Zero and unserialized for modern
+     * transactions; carried on the wire — and committed to by the txid —
+     * only for transactions decoded through the explicit legacy codec.
+     */
     const uint32_t nTime;
     const uint32_t nLockTime;
 
 private:
     /** Memory only. */
     const bool m_has_witness;
+    /**
+     * Provenance: true when this transaction was constructed through the
+     * legacy B3 codec, making the legacy encoding its identity — GetHash()
+     * and GetWitnessHash() are then computed over the legacy bytes.
+     */
+    const bool m_legacy_encoding;
     const Txid hash;
     const Wtxid m_witness_hash;
 
@@ -364,6 +395,8 @@ public:
     std::string ToString() const;
 
     bool HasWitness() const { return m_has_witness; }
+    /** True when this transaction's identity is the legacy B3 encoding. */
+    bool IsLegacyEncoded() const { return m_legacy_encoding; }
 };
 
 /** A mutable version of CTransaction. */
@@ -374,6 +407,8 @@ struct CMutableTransaction
     uint32_t version;
     uint32_t nTime;
     uint32_t nLockTime;
+    /** Memory only; see CTransaction::IsLegacyEncoded(). */
+    bool m_legacy_encoding{false};
 
     explicit CMutableTransaction();
     explicit CMutableTransaction(const CTransaction& tx);
@@ -412,6 +447,9 @@ struct CMutableTransaction
         }
         return false;
     }
+
+    /** True when this transaction's identity is the legacy B3 encoding. */
+    bool IsLegacyEncoded() const { return m_legacy_encoding; }
 };
 
 typedef std::shared_ptr<const CTransaction> CTransactionRef;

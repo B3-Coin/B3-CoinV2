@@ -8,6 +8,7 @@
 #include <chain.h>
 #include <consensus/era.h>
 #include <consensus/params.h>
+#include <legacy/codec.h>
 #include <crypto/hex_base.h>
 #include <dbwrapper.h>
 #include <flatfile.h>
@@ -954,7 +955,9 @@ void BlockManager::UpdateBlockInfo(const CBlock& block, unsigned int nHeight, co
     }
 
     // Update the file information with the current block.
-    const unsigned int added_size = ::GetSerializeSize(TX_WITH_WITNESS(block));
+    const unsigned int added_size = GetConsensus().legacy_b3coin ?
+        ::GetSerializeSize(legacy::TX_LEGACY(block)) :
+        ::GetSerializeSize(TX_WITH_WITNESS(block));
     const int nFile = pos.nFile;
     if (static_cast<int>(m_blockfile_info.size()) <= nFile) {
         m_blockfile_info.resize(nFile + 1);
@@ -1067,8 +1070,13 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
     }
 
     try {
-        // Read block
-        SpanReader{*block_data} >> TX_WITH_WITNESS(block);
+        // Read block. Legacy-chain block files hold the exact historical
+        // encoding; the codec choice is explicit from the storage context.
+        if (GetConsensus().legacy_b3coin) {
+            SpanReader{*block_data} >> legacy::TX_LEGACY(block);
+        } else {
+            SpanReader{*block_data} >> TX_WITH_WITNESS(block);
+        }
     } catch (const std::exception& e) {
         LogError("Deserialize or I/O error - %s at %s while reading block", e.what(), pos.ToString());
         return false;
@@ -1167,7 +1175,10 @@ BlockManager::ReadRawBlockResult BlockManager::ReadRawBlock(const FlatFilePos& p
 
 FlatFilePos BlockManager::WriteBlock(const CBlock& block, int nHeight)
 {
-    const unsigned int block_size{static_cast<unsigned int>(GetSerializeSize(TX_WITH_WITNESS(block)))};
+    const bool legacy_storage{GetConsensus().legacy_b3coin};
+    const unsigned int block_size{static_cast<unsigned int>(
+        legacy_storage ? GetSerializeSize(legacy::TX_LEGACY(block))
+                       : GetSerializeSize(TX_WITH_WITNESS(block)))};
     FlatFilePos pos{FindNextBlockPos(block_size + STORAGE_HEADER_BYTES, nHeight, block.GetBlockTime())};
     if (pos.IsNull()) {
         LogError("FindNextBlockPos failed for %s while writing block", pos.ToString());
@@ -1186,7 +1197,11 @@ FlatFilePos BlockManager::WriteBlock(const CBlock& block, int nHeight)
         fileout << GetParams().MessageStart() << block_size;
         pos.nPos += STORAGE_HEADER_BYTES;
         // Write block
-        fileout << TX_WITH_WITNESS(block);
+        if (legacy_storage) {
+            fileout << legacy::TX_LEGACY(block);
+        } else {
+            fileout << TX_WITH_WITNESS(block);
+        }
     }
 
     if (file.fclose() != 0) {

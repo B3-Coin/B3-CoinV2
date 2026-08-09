@@ -5,6 +5,7 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <clientversion.h>
+#include <legacy/codec.h>
 #include <legacy/consensus.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
@@ -57,7 +58,8 @@ BOOST_AUTO_TEST_CASE(blockmanager_find_block_pos)
     // 8 bytes (for serialization header) + 285 (for serialized genesis block) = 293
     // add another 8 bytes for the second block's serialization header and we get 293 + 8 = 301
     FlatFilePos actual{blockman.WriteBlock(params->GenesisBlock(), 1)};
-    BOOST_CHECK_EQUAL(actual.nPos, STORAGE_HEADER_BYTES + ::GetSerializeSize(TX_WITH_WITNESS(params->GenesisBlock())) + STORAGE_HEADER_BYTES);
+    // Legacy-chain block files store the historical B3 encoding.
+    BOOST_CHECK_EQUAL(actual.nPos, STORAGE_HEADER_BYTES + ::GetSerializeSize(legacy::TX_LEGACY(params->GenesisBlock())) + STORAGE_HEADER_BYTES);
 }
 
 BOOST_AUTO_TEST_CASE(legacy_genesis_reindex_initializes_stake_modifier)
@@ -290,7 +292,9 @@ BOOST_AUTO_TEST_CASE(blockmanager_flush_block_file)
     block3.nVersion = 3;
 
     // They are 80 bytes header + 1 byte 0x00 for vtx length
-    constexpr int TEST_BLOCK_SIZE{81};
+    // 80-byte header + 1-byte empty vtx count + 1-byte empty legacy block
+    // signature: this fixture writes blocks in the legacy-chain encoding.
+    constexpr int TEST_BLOCK_SIZE{82};
 
     // Blockstore is empty
     BOOST_CHECK_EQUAL(blockman.CalculateCurrentUsage(), 0);

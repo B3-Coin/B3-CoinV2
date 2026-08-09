@@ -6,6 +6,7 @@
 #ifndef BITCOIN_PRIMITIVES_BLOCK_H
 #define BITCOIN_PRIMITIVES_BLOCK_H
 
+#include <consensus/block_codec.h>
 #include <primitives/transaction.h>
 #include <serialize.h>
 #include <uint256.h>
@@ -111,7 +112,24 @@ public:
 
     SERIALIZE_METHODS(CBlock, obj)
     {
-        READWRITE(AsBase<CBlockHeader>(obj), obj.vtx, obj.vchBlockSig);
+        READWRITE(AsBase<CBlockHeader>(obj));
+        // The legacy-chain codec (legacy::TX_LEGACY) is marker-aware: the
+        // fixed-size header is (de)serialized first, so the permanent B3
+        // codec marker (consensus/block_codec.h) can select the body format
+        // before any transaction is parsed. A marker-modern block keeps the
+        // unmodified Core body; a legacy body carries nTime transactions
+        // plus the historical trailing proof-of-stake signature. Whether the
+        // marker may appear at a given height is a separate consensus rule
+        // (ContextualCheckBlockHeader); this only selects the raw codec.
+        if (s.template GetParams<TransactionSerParams>().legacy_time) {
+            if (Consensus::HasB3BlockCodecV2(obj.nVersion)) {
+                READWRITE(TX_WITH_WITNESS(obj.vtx));
+            } else {
+                READWRITE(obj.vtx, obj.vchBlockSig);
+            }
+        } else {
+            READWRITE(obj.vtx);
+        }
     }
 
     void SetNull()
