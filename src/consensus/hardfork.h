@@ -5,27 +5,19 @@
 #ifndef BITCOIN_CONSENSUS_HARDFORK_H
 #define BITCOIN_CONSENSUS_HARDFORK_H
 
+#include <consensus/era.h>
 #include <consensus/params.h>
 
 namespace Consensus {
 
-enum class Era {
-    LEGACY,
-    POST_HARD_FORK,
-};
-
-/** Return the consensus era governing a block at height. */
-constexpr Era GetEra(const Params& params, int height)
-{
-    if (height >= 0 && params.hard_fork_height && height >= *params.hard_fork_height) {
-        return Era::POST_HARD_FORK;
-    }
-    return Era::LEGACY;
-}
-
+/**
+ * True once the block at `height` is governed by post-fork (MODERN)
+ * consensus. Thin convenience wrapper over the central era selector in
+ * consensus/era.h; new code should call GetB3Era() directly.
+ */
 constexpr bool IsHardForkActive(const Params& params, int height)
 {
-    return GetEra(params, height) == Era::POST_HARD_FORK;
+    return GetB3Era(height, params) == B3Era::MODERN;
 }
 
 } // namespace Consensus

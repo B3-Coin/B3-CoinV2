@@ -2,8 +2,12 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
+#include <consensus/era.h>
 #include <consensus/hardfork.h>
 #include <consensus/params.h>
+#include <legacy/codec.h>
+#include <legacy/replay.h>
+#include <modern/validation.h>
 #include <primitives/block.h>
 
 #include <boost/test/unit_test.hpp>
@@ -12,26 +16,54 @@
 
 BOOST_AUTO_TEST_SUITE(hardfork_tests)
 
-BOOST_AUTO_TEST_CASE(unset_height_disables_activation)
-{
-    const Consensus::Params params{};
+namespace {
 
-    BOOST_CHECK(Consensus::GetEra(params, 0) == Consensus::Era::LEGACY);
-    BOOST_CHECK(Consensus::GetEra(params, std::numeric_limits<int>::max()) == Consensus::Era::LEGACY);
+//! Synthetic legacy boundary for era-selection tests. H is the final legacy
+//! height, so Params::hard_fork_height carries the first MODERN height H + 1.
+constexpr int SYNTHETIC_H{1000};
+
+Consensus::Params B3Params()
+{
+    Consensus::Params params{};
+    params.legacy_b3coin = true;
+    params.hard_fork_height = SYNTHETIC_H + 1;
+    return params;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(era_boundary_is_inclusive_of_final_legacy_height)
+{
+    const Consensus::Params params{B3Params()};
+
+    BOOST_CHECK(Consensus::GetB3Era(SYNTHETIC_H - 1, params) == Consensus::B3Era::LEGACY);
+    BOOST_CHECK(Consensus::GetB3Era(SYNTHETIC_H, params) == Consensus::B3Era::LEGACY);
+    BOOST_CHECK(Consensus::GetB3Era(SYNTHETIC_H + 1, params) == Consensus::B3Era::MODERN);
+
+    BOOST_CHECK(!Consensus::IsHardForkActive(params, SYNTHETIC_H));
+    BOOST_CHECK(Consensus::IsHardForkActive(params, SYNTHETIC_H + 1));
+}
+
+BOOST_AUTO_TEST_CASE(unset_boundary_keeps_b3_chain_legacy)
+{
+    Consensus::Params params{};
+    params.legacy_b3coin = true;
+
+    BOOST_CHECK(Consensus::GetB3Era(-1, params) == Consensus::B3Era::LEGACY);
+    BOOST_CHECK(Consensus::GetB3Era(0, params) == Consensus::B3Era::LEGACY);
+    BOOST_CHECK(Consensus::GetB3Era(std::numeric_limits<int>::max(), params) ==
+                Consensus::B3Era::LEGACY);
     BOOST_CHECK(!Consensus::IsHardForkActive(params, 0));
 }
 
-BOOST_AUTO_TEST_CASE(activation_height_is_first_post_fork_block)
+BOOST_AUTO_TEST_CASE(non_b3_chains_are_modern_at_every_height)
 {
-    Consensus::Params params{};
-    params.hard_fork_height = 100;
+    const Consensus::Params params{};
 
-    BOOST_CHECK(Consensus::GetEra(params, -1) == Consensus::Era::LEGACY);
-    BOOST_CHECK(Consensus::GetEra(params, 0) == Consensus::Era::LEGACY);
-    BOOST_CHECK(Consensus::GetEra(params, 99) == Consensus::Era::LEGACY);
-    BOOST_CHECK(Consensus::GetEra(params, 100) == Consensus::Era::POST_HARD_FORK);
-    BOOST_CHECK(Consensus::GetEra(params, 101) == Consensus::Era::POST_HARD_FORK);
-    BOOST_CHECK(Consensus::IsHardForkActive(params, 100));
+    BOOST_CHECK(Consensus::GetB3Era(-1, params) == Consensus::B3Era::MODERN);
+    BOOST_CHECK(Consensus::GetB3Era(0, params) == Consensus::B3Era::MODERN);
+    BOOST_CHECK(Consensus::GetB3Era(std::numeric_limits<int>::max(), params) ==
+                Consensus::B3Era::MODERN);
 }
 
 BOOST_AUTO_TEST_CASE(block_header_hash_switches_at_activation_height)
