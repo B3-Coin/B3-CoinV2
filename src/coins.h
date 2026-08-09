@@ -101,8 +101,8 @@ public:
         uint64_t code = 0;
         ::Unserialize(s, VARINT(code));
         nHeight = code >> 2;
-        fCoinBase = code & 2;
-        fCoinStake = code & 1;
+        fCoinBase = (code & 2) != 0;
+        fCoinStake = (code & 1) != 0;
         ::Unserialize(s, Using<TxOutCompression>(out));
         ::Unserialize(s, nTime);
         ::Unserialize(s, nTxOffset);

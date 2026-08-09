@@ -204,9 +204,9 @@ bool CheckSignatureEncoding(const std::vector<unsigned char> &vchSig, script_ver
     if (vchSig.size() == 0) {
         return true;
     }
-    if ((flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC)) != 0 && !IsValidSignatureEncoding(vchSig)) {
+    if ((flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC | SCRIPT_VERIFY_LEGACY_B3_STRICTENC)) != 0 && !IsValidSignatureEncoding(vchSig)) {
         return set_error(serror, SCRIPT_ERR_SIG_DER);
-    } else if ((flags & SCRIPT_VERIFY_LOW_S) != 0 && !IsLowDERSignature(vchSig, serror)) {
+    } else if ((flags & (SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_LEGACY_B3_STRICTENC)) != 0 && !IsLowDERSignature(vchSig, serror)) {
         // serror is set
         return false;
     } else if ((flags & SCRIPT_VERIFY_STRICTENC) != 0 && !IsDefinedHashtypeSignature(vchSig)) {
@@ -216,7 +216,7 @@ bool CheckSignatureEncoding(const std::vector<unsigned char> &vchSig, script_ver
 }
 
 bool static CheckPubKeyEncoding(const valtype &vchPubKey, script_verify_flags flags, const SigVersion &sigversion, ScriptError* serror) {
-    if ((flags & SCRIPT_VERIFY_STRICTENC) != 0 && !IsCompressedOrUncompressedPubKey(vchPubKey)) {
+    if ((flags & (SCRIPT_VERIFY_STRICTENC | SCRIPT_VERIFY_LEGACY_B3_STRICTENC)) != 0 && !IsCompressedOrUncompressedPubKey(vchPubKey)) {
         return set_error(serror, SCRIPT_ERR_PUBKEYTYPE);
     }
     // Only compressed keys are accepted in segwit
@@ -1328,6 +1328,10 @@ public:
     void Serialize(S &s) const {
         // Serialize version
         ::Serialize(s, txTo.version);
+        // B3Coin transaction serialization commits a timestamp immediately
+        // after the version. Keep the signature preimage consistent with the
+        // transaction ID and the historical chain.
+        ::Serialize(s, txTo.nTime);
         // Serialize vin
         unsigned int nInputs = fAnyoneCanPay ? 1 : txTo.vin.size();
         ::WriteCompactSize(s, nInputs);

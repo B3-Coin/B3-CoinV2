@@ -39,8 +39,8 @@ struct TxInUndoFormatter
         uint64_t nCode = 0;
         ::Unserialize(s, VARINT(nCode));
         txout.nHeight = nCode >> 2;
-        txout.fCoinBase = nCode & 2;
-        txout.fCoinStake = nCode & 1;
+        txout.fCoinBase = (nCode & 2) != 0;
+        txout.fCoinStake = (nCode & 1) != 0;
         if (txout.nHeight > 0) {
             // Old versions stored the version number for the last spend of
             // a transaction's outputs. Non-final spends were indicated with

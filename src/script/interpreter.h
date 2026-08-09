@@ -145,6 +145,13 @@ enum class script_verify_flag_name : uint8_t {
     // Making unknown public key versions (in BIP 342 scripts) non-standard
     SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
 
+    // Historical B3Coin strict encoding: require strict DER, low-S
+    // signatures, and canonical public keys, while retaining the old
+    // FIX_HASHTYPE behavior that permits undefined ECDSA sighash bytes.
+    // This is consensus-only and must only be selected for the preserved
+    // pre-hard-fork chain.
+    SCRIPT_VERIFY_LEGACY_B3_STRICTENC,
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER

@@ -9,6 +9,7 @@
 #include <arith_uint256.h>
 #include <chain.h>
 #include <coins.h>
+#include <consensus/era.h>
 #include <hash.h>
 #include <legacy/pos.h>
 #include <primitives/block.h>
@@ -88,8 +89,15 @@ std::optional<uint64_t> ToUint64(const arith_uint256& value)
 
 bool IsActive(const Consensus::Params& params, const int height)
 {
-    return params.legacy_b3coin &&
-           (!params.hard_fork_height || height < *params.hard_fork_height);
+    return Consensus::GetB3Era(height, params) == Consensus::B3Era::LEGACY;
+}
+
+void InitializeGenesisBlockIndex(CBlockIndex& index, const uint256& proof_hash)
+{
+    index.m_legacy_proof_of_stake = false;
+    index.m_legacy_stake_modifier_generated = true;
+    index.m_legacy_stake_modifier = 0;
+    index.m_legacy_hash_proof = proof_hash;
 }
 
 uint32_t GetNextTargetRequired(const CBlockIndex* pindex_last, const bool proof_of_stake,
@@ -242,7 +250,10 @@ bool ComputeNextStakeModifier(const CBlockIndex* pindex_prev,
     std::reverse(candidates.begin(), candidates.end());
     std::sort(candidates.begin(), candidates.end(), [](const CBlockIndex* a, const CBlockIndex* b) {
         if (a->GetBlockTime() != b->GetBlockTime()) return a->GetBlockTime() < b->GetBlockTime();
-        return a->GetBlockHash() < b->GetBlockHash();
+        // The historical uint256 type ordered hashes as numeric little-endian
+        // integers. Core's uint256 orders raw bytes lexicographically, which
+        // is different and would select a different stake modifier.
+        return UintToArith256(a->GetBlockHash()) < UintToArith256(b->GetBlockHash());
     });
 
     uint64_t next_modifier{0};
@@ -251,7 +262,7 @@ bool ComputeNextStakeModifier(const CBlockIndex* pindex_prev,
     for (int round{0}; round < std::min<int>(64, candidates.size()); ++round) {
         selection_stop += SelectionIntervalSection(round);
         const CBlockIndex* best{nullptr};
-        uint256 best_hash;
+        arith_uint256 best_hash;
         for (const CBlockIndex* candidate : candidates) {
             if (best && candidate->GetBlockTime() > selection_stop) break;
             if (selected.contains(candidate->GetBlockHash())) continue;
@@ -259,10 +270,9 @@ bool ComputeNextStakeModifier(const CBlockIndex* pindex_prev,
             writer << candidate->m_legacy_hash_proof << stake_modifier;
             arith_uint256 selection_hash{UintToArith256(writer.GetHash())};
             if (candidate->m_legacy_proof_of_stake) selection_hash >>= 32;
-            const uint256 comparison{ArithToUint256(selection_hash)};
-            if (!best || comparison < best_hash) {
+            if (!best || selection_hash < best_hash) {
                 best = candidate;
-                best_hash = comparison;
+                best_hash = selection_hash;
             }
         }
         if (!best) return false;

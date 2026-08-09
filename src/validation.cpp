@@ -13,6 +13,7 @@
 #include <clientversion.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/era.h>
 #include <consensus/merkle.h>
 #include <consensus/tx_check.h>
 #include <consensus/tx_verify.h>
@@ -2240,6 +2241,7 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
 {
     AssertLockHeld(::cs_main);
     bool fClean = true;
+    const bool use_legacy_b3coin{Consensus::GetB3Era(pindex->nHeight, m_chainman.GetConsensus()) == Consensus::B3Era::LEGACY};
 
     CBlockUndo blockUndo;
     if (!m_blockman.ReadBlockUndo(blockUndo, *pindex)) {
@@ -2271,7 +2273,14 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
         // Check that all outputs are available and match the outputs in the block itself
         // exactly.
         for (size_t o = 0; o < tx.vout.size(); o++) {
-            if (!tx.vout[o].scriptPubKey.IsUnspendable()) {
+            // Historical B3Coin proof-of-stake blocks use a zero-value,
+            // empty-script marker output. ConnectBlock deliberately does not
+            // add that marker to the UTXO set, so DisconnectBlock must skip it
+            // as well. Otherwise VerifyDB mistakes every clean restart for
+            // coin-database corruption.
+            const bool legacy_marker{use_legacy_b3coin && tx.vout[o].nValue == 0 &&
+                                     tx.vout[o].scriptPubKey.empty()};
+            if (!tx.vout[o].scriptPubKey.IsUnspendable() && !legacy_marker) {
                 COutPoint out(hash, o);
                 Coin coin;
                 bool is_spent = view.SpendCoin(out, &coin);
@@ -2311,10 +2320,15 @@ script_verify_flags GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
 {
     const Consensus::Params& consensusparams = chainman.GetConsensus();
 
-    if (legacy::IsActive(consensusparams, block_index.nHeight)) {
-        // Frozen from the old B3Coin ConnectBlock path. In particular, P2SH,
-        // witness, CSV, and Taproot rules were not consensus rules there.
-        return SCRIPT_VERIFY_NULLDUMMY | SCRIPT_VERIFY_STRICTENC | SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY;
+    if (Consensus::GetB3Era(block_index.nHeight, consensusparams) == Consensus::B3Era::LEGACY) {
+        // Frozen from the old B3Coin ConnectBlock path. Its VerifyScript
+        // implementation evaluated P2SH redeem scripts unconditionally;
+        // LEGACY_B3_STRICTENC preserves its strict DER, low-S, and pubkey
+        // rules without applying modern defined-sighash enforcement.
+        // Witness, CSV, and Taproot were not legacy consensus rules.
+        return SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_NULLDUMMY |
+               SCRIPT_VERIFY_LEGACY_B3_STRICTENC |
+               SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY;
     }
 
     // BIP16 didn't become active until Apr 1 2012 (on mainnet, and
@@ -2369,7 +2383,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     assert(*pindex->phashBlock == block_hash);
 
     const auto time_start{SteadyClock::now()};
-    const bool use_legacy_b3coin{legacy::IsActive(params.GetConsensus(), pindex->nHeight)};
+    const bool use_legacy_b3coin{Consensus::GetB3Era(pindex->nHeight, params.GetConsensus()) == Consensus::B3Era::LEGACY};
 
     // Check it again in case a previous version let a bad block in
     // NOTE: We don't currently (re-)invoke ContextualCheckBlock() or
@@ -2414,6 +2428,13 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // Special case for the genesis block, skipping connection of its transactions
     // (its coinbase is unspendable)
     if (block_hash == params.GetConsensus().hashGenesisBlock) {
+        // Reindex reaches genesis through this path rather than
+        // LoadGenesisBlock(). Keep the legacy index state initialized before
+        // the first child needs to inherit its stake modifier.
+        if (use_legacy_b3coin && !fJustCheck) {
+            legacy::InitializeGenesisBlockIndex(*pindex, block_hash);
+            m_blockman.m_dirty_blockindex.insert(pindex);
+        }
         if (!fJustCheck)
             view.SetBestBlock(pindex->GetBlockHash());
         return true;
@@ -4141,7 +4162,12 @@ static bool CheckLegacyBlock(const CBlock& block, BlockValidationState& state,
                              const Consensus::Params& consensusParams,
                              const bool fCheckPOW, const bool fCheckMerkleRoot)
 {
-    if (fCheckPOW && block.IsProofOfWork() &&
+    // The legacy client created genesis locally rather than feeding it through
+    // CheckBlock(). Its fixed scrypt hash is outside its nominal target, so
+    // this is deliberately restricted to the configured historical genesis.
+    const bool legacy_genesis{block.hashPrevBlock.IsNull() &&
+                              block.GetLegacyB3Hash() == consensusParams.hashGenesisBlock};
+    if (fCheckPOW && !legacy_genesis && block.IsProofOfWork() &&
         !CheckProofOfWork(block.GetLegacyB3Hash(), block.nBits, consensusParams)) {
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
     }
@@ -4489,7 +4515,7 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
 
     // Check proof of work
     const Consensus::Params& consensusParams = chainman.GetConsensus();
-    if (legacy::IsActive(consensusParams, nHeight)) {
+    if (Consensus::GetB3Era(nHeight, consensusParams) == Consensus::B3Era::LEGACY) {
         // Header-only B3Coin blocks cannot disclose whether they are PoW or
         // PoS, so their hybrid target is checked once the full block reaches
         // ConnectBlock. Keep the old timestamp and version limits here.
@@ -4551,7 +4577,7 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
     const int nHeight = pindexPrev == nullptr ? 0 : pindexPrev->nHeight + 1;
     const Consensus::Params& consensus_params{chainman.GetConsensus()};
 
-    if (legacy::IsActive(consensus_params, nHeight)) {
+    if (Consensus::GetB3Era(nHeight, consensus_params) == Consensus::B3Era::LEGACY) {
         // Do not reject a valid out-of-order child merely because its parent
         // is header-only. The mandatory target check is repeated in
         // ConnectBlock after every parent has been connected.
@@ -4786,7 +4812,7 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
         return false;
     }
 
-    if (legacy::IsActive(params.GetConsensus(), pindex->nHeight)) {
+    if (Consensus::GetB3Era(pindex->nHeight, params.GetConsensus()) == Consensus::B3Era::LEGACY) {
         // Full blocks disclose the PoW/PoS type that headers intentionally do
         // not carry. Persist it as soon as the full block is structurally
         // valid, so descendants can derive the historical hybrid target.
@@ -5196,6 +5222,10 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
         return false;
     }
 
+    const bool use_legacy_b3coin{
+        Consensus::GetB3Era(pindex->nHeight, m_chainman.GetConsensus()) == Consensus::B3Era::LEGACY};
+    uint32_t legacy_tx_offset{static_cast<uint32_t>(GetSerializeSize(CBlockHeader{})) +
+                              GetSizeOfCompactSize(block.vtx.size())};
     for (const CTransactionRef& tx : block.vtx) {
         if (!tx->IsCoinBase()) {
             for (const CTxIn &txin : tx->vin) {
@@ -5203,7 +5233,11 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
             }
         }
         // Pass check = true as every addition may be an overwrite.
-        AddCoins(inputs, *tx, pindex->nHeight, true);
+        AddCoins(inputs, *tx, pindex->nHeight, true,
+                 use_legacy_b3coin ? legacy_tx_offset : 0);
+        if (use_legacy_b3coin) {
+            legacy_tx_offset += static_cast<uint32_t>(GetSerializeSize(TX_NO_WITNESS(*tx)));
+        }
     }
     return true;
 }
@@ -5371,8 +5405,18 @@ bool Chainstate::LoadGenesisBlock()
     // m_blockman.m_block_index. Note that we can't use m_chain here, since it is
     // set based on the coins db, not the block index db, which is the only
     // thing loaded at this point.
-    if (m_blockman.m_block_index.contains(params.GenesisBlock().GetHash(params.GetConsensus(), /*height=*/0)))
+    const uint256 genesis_hash{params.GenesisBlock().GetHash(params.GetConsensus(), /*height=*/0)};
+    auto genesis_it{m_blockman.m_block_index.find(genesis_hash)};
+    if (genesis_it != m_blockman.m_block_index.end()) {
+        // Repair metadata written by builds that initialized genesis only on
+        // the fresh-datadir path. This is harmless for a correctly persisted
+        // index and avoids requiring a reindex merely to restore the marker.
+        if (Consensus::GetB3Era(/*height=*/0, params.GetConsensus()) == Consensus::B3Era::LEGACY) {
+            legacy::InitializeGenesisBlockIndex(genesis_it->second, genesis_hash);
+            m_blockman.m_dirty_blockindex.insert(&genesis_it->second);
+        }
         return true;
+    }
 
     try {
         const CBlock& block = params.GenesisBlock();
@@ -5382,13 +5426,8 @@ bool Chainstate::LoadGenesisBlock()
             return false;
         }
         CBlockIndex* pindex = m_blockman.AddToBlockIndex(block, m_chainman.m_best_header);
-        if (legacy::IsActive(params.GetConsensus(), /*height=*/0)) {
-            // The historical genesis block is the first generated modifier
-            // and supplies its own PoW hash as the initial proof hash.
-            pindex->m_legacy_proof_of_stake = false;
-            pindex->m_legacy_stake_modifier_generated = true;
-            pindex->m_legacy_stake_modifier = 0;
-            pindex->m_legacy_hash_proof = block.GetHash(params.GetConsensus(), /*height=*/0);
+        if (Consensus::GetB3Era(/*height=*/0, params.GetConsensus()) == Consensus::B3Era::LEGACY) {
+            legacy::InitializeGenesisBlockIndex(*pindex, genesis_hash);
             m_blockman.m_dirty_blockindex.insert(pindex);
         }
         m_chainman.ReceivedBlockTransactions(block, pindex, blockPos);

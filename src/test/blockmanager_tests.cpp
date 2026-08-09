@@ -5,6 +5,7 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <clientversion.h>
+#include <legacy/consensus.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
 #include <node/kernel_notifications.h>
@@ -57,6 +58,41 @@ BOOST_AUTO_TEST_CASE(blockmanager_find_block_pos)
     // add another 8 bytes for the second block's serialization header and we get 293 + 8 = 301
     FlatFilePos actual{blockman.WriteBlock(params->GenesisBlock(), 1)};
     BOOST_CHECK_EQUAL(actual.nPos, STORAGE_HEADER_BYTES + ::GetSerializeSize(TX_WITH_WITNESS(params->GenesisBlock())) + STORAGE_HEADER_BYTES);
+}
+
+BOOST_AUTO_TEST_CASE(legacy_genesis_reindex_initializes_stake_modifier)
+{
+    const CChainParams& params{Params()};
+    KernelNotifications notifications{Assert(m_node.shutdown_request), m_node.exit_status, *Assert(m_node.warnings)};
+    const BlockManager::Options blockman_opts{
+        .chainparams = params,
+        .blocks_dir = m_args.GetBlocksDirPath(),
+        .notifications = notifications,
+        .block_tree_db_params = DBParams{
+            .path = m_args.GetDataDirNet() / "blocks" / "index",
+            .cache_bytes = 0,
+        },
+    };
+    BlockManager blockman{*Assert(m_node.shutdown_signal), blockman_opts};
+
+    CBlockIndex* best_header{nullptr};
+    CBlockIndex* genesis{nullptr};
+    {
+        LOCK(cs_main);
+        genesis = blockman.AddToBlockIndex(params.GenesisBlock(), best_header);
+    }
+
+    BOOST_REQUIRE(genesis);
+    BOOST_CHECK(genesis->m_legacy_stake_modifier_generated);
+    BOOST_CHECK_EQUAL(genesis->m_legacy_stake_modifier, 0U);
+    BOOST_CHECK_EQUAL(genesis->m_legacy_hash_proof, params.GetConsensus().hashGenesisBlock);
+
+    uint64_t stake_modifier{0};
+    bool generated{true};
+    // This is the exact inherited-modifier calculation block 1 performs.
+    BOOST_CHECK(legacy::ComputeNextStakeModifier(genesis, stake_modifier, generated));
+    BOOST_CHECK_EQUAL(stake_modifier, 0U);
+    BOOST_CHECK(!generated);
 }
 
 BOOST_FIXTURE_TEST_CASE(blockmanager_scan_unlink_already_pruned_files, TestChain100Setup)

@@ -95,6 +95,7 @@ void RandomScript(CScript &script) {
 void RandomTransaction(CMutableTransaction& tx, bool fSingle)
 {
     tx.version = m_rng.rand32();
+    tx.nTime = m_rng.rand32();
     tx.vin.clear();
     tx.vout.clear();
     tx.nLockTime = (m_rng.randbool()) ? m_rng.rand32() : 0;

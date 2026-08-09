@@ -217,7 +217,7 @@ void ValidationSignals::BlockConnected(const ChainstateRole& role, const std::sh
         m_internals->Iterate([&](CValidationInterface& callbacks) { callbacks.BlockConnected(role, pblock, pindex); });
     };
     ENQUEUE_AND_LOG_EVENT(event, "%s: block hash=%s block height=%d", __func__,
-                          pblock->GetHash().ToString(),
+                          pindex->GetBlockHash().ToString(),
                           pindex->nHeight);
 }
 
@@ -237,7 +237,7 @@ void ValidationSignals::BlockDisconnected(const std::shared_ptr<const CBlock>& p
         m_internals->Iterate([&](CValidationInterface& callbacks) { callbacks.BlockDisconnected(pblock, pindex); });
     };
     ENQUEUE_AND_LOG_EVENT(event, "%s: block hash=%s block height=%d", __func__,
-                          pblock->GetHash().ToString(),
+                          pindex->GetBlockHash().ToString(),
                           pindex->nHeight);
 }
 
@@ -252,12 +252,15 @@ void ValidationSignals::ChainStateFlushed(const ChainstateRole& role, const CBlo
 
 void ValidationSignals::BlockChecked(const std::shared_ptr<const CBlock>& block, const BlockValidationState& state)
 {
-    LOG_EVENT("%s: block hash=%s state=%s", __func__,
+    // No height is supplied with this callback, so the bare header hash is
+    // deliberately labeled as SHA256d. Legacy B3Coin block identity uses
+    // the height-selected scrypt hash held by the block index.
+    LOG_EVENT("%s: header sha256d=%s state=%s", __func__,
               block->GetHash().ToString(), state.ToString());
     m_internals->Iterate([&](CValidationInterface& callbacks) { callbacks.BlockChecked(block, state); });
 }
 
 void ValidationSignals::NewPoWValidBlock(const CBlockIndex *pindex, const std::shared_ptr<const CBlock> &block) {
-    LOG_EVENT("%s: block hash=%s", __func__, block->GetHash().ToString());
+    LOG_EVENT("%s: block hash=%s", __func__, pindex->GetBlockHash().ToString());
     m_internals->Iterate([&](CValidationInterface& callbacks) { callbacks.NewPoWValidBlock(pindex, block); });
 }

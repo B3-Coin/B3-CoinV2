@@ -602,7 +602,6 @@ BOOST_AUTO_TEST_CASE(script_build)
     tests.push_back(TestBuilder(CScript() << ToByteVector(keys.pubkey2C) << OP_CHECKSIG,
                                 "P2PK with high S", SCRIPT_VERIFY_LOW_S
                                ).PushSig(keys.key2, SIGHASH_ALL, 32, 33).ScriptError(SCRIPT_ERR_SIG_HIGH_S));
-
     tests.push_back(TestBuilder(CScript() << ToByteVector(keys.pubkey0H) << OP_CHECKSIG,
                                 "P2PK with hybrid pubkey but no STRICTENC", 0
                                ).PushSig(keys.key0, SIGHASH_ALL));
@@ -903,6 +902,35 @@ BOOST_AUTO_TEST_CASE(script_build)
     fputs(strGen.c_str(), file);
     fclose(file);
 #endif
+}
+
+BOOST_AUTO_TEST_CASE(legacy_b3_strict_encoding)
+{
+    CKey key;
+    key.MakeNewKey(/*fCompressed=*/true);
+
+    std::vector<unsigned char> signature;
+    BOOST_REQUIRE(key.Sign(uint256::ONE, signature));
+    signature.push_back(5); // Historically accepted under B3Coin FIX_HASHTYPE.
+
+    ScriptError error{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(CheckSignatureEncoding(signature, SCRIPT_VERIFY_LEGACY_B3_STRICTENC, &error));
+
+    error = SCRIPT_ERR_UNKNOWN_ERROR;
+    BOOST_CHECK(!CheckSignatureEncoding(signature, SCRIPT_VERIFY_STRICTENC, &error));
+    BOOST_CHECK_EQUAL(error, SCRIPT_ERR_SIG_HASHTYPE);
+
+    error = SCRIPT_ERR_UNKNOWN_ERROR;
+    BOOST_CHECK(!CheckSignatureEncoding(signature,
+                                        SCRIPT_VERIFY_LEGACY_B3_STRICTENC | SCRIPT_VERIFY_STRICTENC,
+                                        &error));
+    BOOST_CHECK_EQUAL(error, SCRIPT_ERR_SIG_HASHTYPE);
+
+    auto malformed_signature{signature};
+    malformed_signature.push_back(0);
+    error = SCRIPT_ERR_UNKNOWN_ERROR;
+    BOOST_CHECK(!CheckSignatureEncoding(malformed_signature, SCRIPT_VERIFY_LEGACY_B3_STRICTENC, &error));
+    BOOST_CHECK_EQUAL(error, SCRIPT_ERR_SIG_DER);
 }
 
 BOOST_AUTO_TEST_CASE(script_json_test)

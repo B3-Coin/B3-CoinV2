@@ -34,6 +34,20 @@ inline constexpr uint32_t TARGET_TIMESPAN{STAKE_TARGET_SPACING * 20};
 inline constexpr uint32_t TARGET_SPACING_WORK_MAX{STAKE_TARGET_SPACING * 3};
 inline constexpr uint32_t MAX_FUTURE_BLOCK_TIME{10 * 60};
 inline constexpr uint32_t MAX_FUTURE_COINBASE_TIME_POW{100'000};
+/**
+ * The final historical B3Coin daemon rejects peers advertising a protocol
+ * version below 80006. Advertise its final protocol version during the
+ * preserved legacy-chain handshake, while keeping Bitcoin Core's own version
+ * unchanged for every non-legacy chain.
+ */
+inline constexpr int P2P_PROTOCOL_VERSION{80'008};
+/**
+ * The legacy protocol's version numbering diverged from Bitcoin Core's. Cap
+ * Core feature negotiation below SENDHEADERS_VERSION so an 80008 B3Coin peer
+ * is not sent post-legacy Core-only messages such as sendaddrv2, wtxidrelay,
+ * sendcmpct, sendheaders, or feefilter.
+ */
+inline constexpr int P2P_COMPATIBILITY_VERSION{70'011};
 inline constexpr CAmount CENT{COIN / 100};
 inline constexpr CAmount COIN_YEAR_REWARD{CENT};
 /**
@@ -43,8 +57,20 @@ inline constexpr CAmount COIN_YEAR_REWARD{CENT};
  */
 inline constexpr CAmount LEGACY_FUNDAMENTALNODE_BURN{2'500'000 * COIN};
 
-/** True when a height must use the preserved B3Coin consensus rules. */
+/**
+ * True when a height must use the preserved B3Coin consensus rules.
+ * Transitional wrapper over Consensus::GetB3Era() in consensus/era.h,
+ * which is the single source of truth; new code should call that
+ * directly where the height is unambiguous.
+ */
 bool IsActive(const Consensus::Params& params, int height);
+
+/**
+ * Restore the historical genesis block's stake-modifier state whenever its
+ * index entry is created or reconstructed. This is required before block 1
+ * can compute its inherited modifier during a reindex.
+ */
+void InitializeGenesisBlockIndex(CBlockIndex& index, const uint256& proof_hash);
 
 /** Old hybrid PoW/PoS per-block target adjustment. */
 uint32_t GetNextTargetRequired(const CBlockIndex* pindex_last, bool proof_of_stake,

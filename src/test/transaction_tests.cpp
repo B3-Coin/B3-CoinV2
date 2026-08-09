@@ -52,6 +52,12 @@ typedef std::vector<unsigned char> valtype;
 static CFeeRate g_dust{DUST_RELAY_TX_FEE};
 static bool g_bare_multi{DEFAULT_PERMIT_BAREMULTISIG};
 
+// The upstream transaction vectors describe Bitcoin Core's generic script
+// flag space. Historical B3Coin's encoding profile is exercised separately
+// and is selected only by the legacy chain-validation path.
+static const auto GENERIC_SCRIPT_VERIFY_FLAGS = script_verify_flags::from_int(
+    MAX_SCRIPT_VERIFY_FLAGS & ~script_verify_flags{SCRIPT_VERIFY_LEGACY_B3_STRICTENC}.as_int());
+
 static const std::map<std::string, script_verify_flag_name>& mapFlagNames = ScriptFlagNamesToEnum();
 
 script_verify_flags ParseScriptFlags(std::string strFlags)
@@ -217,22 +223,23 @@ BOOST_AUTO_TEST_CASE(tx_valid)
             script_verify_flags verify_flags = ParseScriptFlags(test[2].get_str());
 
             // Check that the test gives a valid combination of flags (otherwise VerifyScript will throw). Don't edit the flags.
-            if (~verify_flags != FillFlags(~verify_flags)) {
+            const script_verify_flags all_generic_flags{(~verify_flags) & GENERIC_SCRIPT_VERIFY_FLAGS};
+            if (all_generic_flags != FillFlags(all_generic_flags)) {
                 BOOST_ERROR("Bad test flags: " << strTest);
             }
 
-            BOOST_CHECK_MESSAGE(CheckTxScripts(tx, mapprevOutScriptPubKeys, mapprevOutValues, ~verify_flags, txdata, strTest, /*expect_valid=*/true),
+            BOOST_CHECK_MESSAGE(CheckTxScripts(tx, mapprevOutScriptPubKeys, mapprevOutValues, all_generic_flags, txdata, strTest, /*expect_valid=*/true),
                                 "Tx unexpectedly failed: " << strTest);
 
             // Backwards compatibility of script verification flags: Removing any flag(s) should not invalidate a valid transaction
             for (const auto& [name, flag] : mapFlagNames) {
                 // Removing individual flags
-                script_verify_flags flags = TrimFlags(~(verify_flags | flag));
+                script_verify_flags flags = TrimFlags((~(verify_flags | flag)) & GENERIC_SCRIPT_VERIFY_FLAGS);
                 if (!CheckTxScripts(tx, mapprevOutScriptPubKeys, mapprevOutValues, flags, txdata, strTest, /*expect_valid=*/true)) {
                     BOOST_ERROR("Tx unexpectedly failed with flag " << name << " unset: " << strTest);
                 }
                 // Removing random combinations of flags
-                flags = TrimFlags(~(verify_flags | script_verify_flags::from_int(m_rng.randbits(MAX_SCRIPT_VERIFY_FLAGS_BITS))));
+                flags = TrimFlags((~(verify_flags | script_verify_flags::from_int(m_rng.randbits(MAX_SCRIPT_VERIFY_FLAGS_BITS)))) & GENERIC_SCRIPT_VERIFY_FLAGS);
                 if (!CheckTxScripts(tx, mapprevOutScriptPubKeys, mapprevOutValues, flags, txdata, strTest, /*expect_valid=*/true)) {
                     BOOST_ERROR("Tx unexpectedly failed with random flags " << ToString(flags.as_int()) << ": " << strTest);
                 }
@@ -240,7 +247,9 @@ BOOST_AUTO_TEST_CASE(tx_valid)
 
             // Check that flags are maximal: transaction should fail if any unset flags are set.
             for (auto flags_excluding_one : ExcludeIndividualFlags(verify_flags)) {
-                if (!CheckTxScripts(tx, mapprevOutScriptPubKeys, mapprevOutValues, ~flags_excluding_one, txdata, strTest, /*expect_valid=*/false)) {
+                if (!CheckTxScripts(tx, mapprevOutScriptPubKeys, mapprevOutValues,
+                                    (~flags_excluding_one) & GENERIC_SCRIPT_VERIFY_FLAGS,
+                                    txdata, strTest, /*expect_valid=*/false)) {
                     BOOST_ERROR("Too many flags unset: " << strTest);
                 }
             }
@@ -323,7 +332,8 @@ BOOST_AUTO_TEST_CASE(tx_invalid)
                     BOOST_ERROR("Tx unexpectedly passed with flag " << name << " set: " << strTest);
                 }
                 // Adding random combinations of flags
-                flags = FillFlags(verify_flags | script_verify_flags::from_int(m_rng.randbits(MAX_SCRIPT_VERIFY_FLAGS_BITS)));
+                flags = FillFlags(verify_flags |
+                                  (script_verify_flags::from_int(m_rng.randbits(MAX_SCRIPT_VERIFY_FLAGS_BITS)) & GENERIC_SCRIPT_VERIFY_FLAGS));
                 if (!CheckTxScripts(tx, mapprevOutScriptPubKeys, mapprevOutValues, flags, txdata, strTest, /*expect_valid=*/false)) {
                     BOOST_ERROR("Tx unexpectedly passed with random flags " << name << ": " << strTest);
                 }

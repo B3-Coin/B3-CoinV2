@@ -6,6 +6,7 @@
 
 #include <arith_uint256.h>
 #include <chain.h>
+#include <consensus/era.h>
 #include <consensus/params.h>
 #include <crypto/hex_base.h>
 #include <dbwrapper.h>
@@ -153,7 +154,7 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 // A stored legacy header can be header-only, in which case
                 // its PoW/PoS type is not knowable after restart. Full PoW
                 // blocks and PoS kernels are revalidated when connected.
-                const bool needs_proof_of_work{!legacy::IsActive(consensusParams, pindexNew->nHeight)};
+                const bool needs_proof_of_work{Consensus::GetB3Era(pindexNew->nHeight, consensusParams) == Consensus::B3Era::MODERN};
                 if (needs_proof_of_work && !CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
                     LogError("%s: CheckProofOfWork failed: %s\n", __func__, pindexNew->ToString());
                     return false;
@@ -236,7 +237,9 @@ CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockInde
 
     const BlockMap::iterator previous{m_block_index.find(block.hashPrevBlock)};
     const int height{previous == m_block_index.end() ? 0 : previous->second.nHeight + 1};
-    auto [mi, inserted] = m_block_index.try_emplace(block.GetHash(GetConsensus(), height), block);
+    const Consensus::Params& consensus_params{GetConsensus()};
+    const uint256 block_hash{block.GetHash(consensus_params, height)};
+    auto [mi, inserted] = m_block_index.try_emplace(block_hash, block);
     if (!inserted) {
         return &mi->second;
     }
@@ -259,6 +262,14 @@ CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockInde
     pindexNew->RaiseValidity(BLOCK_VALID_TREE);
     if (best_header == nullptr || best_header->nChainWork < pindexNew->nChainWork) {
         best_header = pindexNew;
+    }
+
+    // Reindex imports genesis through AcceptBlock(), not LoadGenesisBlock().
+    // Set the old Peercoin-v1 state here so its first child can inherit the
+    // historical stake modifier on either initialization path.
+    if (Consensus::GetB3Era(pindexNew->nHeight, consensus_params) == Consensus::B3Era::LEGACY &&
+        block_hash == consensus_params.hashGenesisBlock) {
+        legacy::InitializeGenesisBlockIndex(*pindexNew, block_hash);
     }
 
     m_dirty_blockindex.insert(pindexNew);
@@ -1065,10 +1076,18 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
 
     const auto block_hash{block.GetHash(GetConsensus(), expected_height.value_or(/*legacy-safe fallback=*/0))};
 
+    // The original B3Coin client constructed the historical genesis block
+    // locally and did not run its header PoW check when reading it back. Its
+    // fixed scrypt hash does not meet the nominal target, so preserve only
+    // this exact genesis exception; every other PoW block remains checked.
+    const bool legacy_genesis{Consensus::GetB3Era(/*height=*/0, GetConsensus()) == Consensus::B3Era::LEGACY &&
+                              block.hashPrevBlock.IsNull() &&
+                              block_hash == GetConsensus().hashGenesisBlock};
+
     // Legacy B3Coin proof-of-stake blocks carry their proof in the coinstake
     // transaction, not the header hash. Their kernel is checked by
     // Chainstate::ConnectBlock after the UTXO view is available.
-    const bool requires_header_pow{!GetConsensus().legacy_b3coin || block.IsProofOfWork()};
+    const bool requires_header_pow{(!GetConsensus().legacy_b3coin || block.IsProofOfWork()) && !legacy_genesis};
     if (requires_header_pow && !CheckProofOfWork(block_hash, block.nBits, GetConsensus())) {
         LogError("Errors in block header at %s while reading block", pos.ToString());
         return false;

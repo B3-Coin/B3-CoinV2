@@ -5,7 +5,7 @@
 
 #include <primitives/block.h>
 
-#include <consensus/hardfork.h>
+#include <consensus/era.h>
 #include <consensus/params.h>
 #include <hash.h>
 #include <legacy/scrypt.h>
@@ -32,8 +32,7 @@ uint256 CBlockHeader::GetLegacyB3Hash() const
 
 uint256 CBlockHeader::GetHash(const Consensus::Params& consensus_params, const int height) const
 {
-    if (consensus_params.legacy_b3coin &&
-        Consensus::GetEra(consensus_params, height) == Consensus::Era::LEGACY) {
+    if (Consensus::GetB3Era(height, consensus_params) == Consensus::B3Era::LEGACY) {
         return GetLegacyB3Hash();
     }
     return GetHash();

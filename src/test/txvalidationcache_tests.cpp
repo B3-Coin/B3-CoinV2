@@ -229,7 +229,11 @@ BOOST_FIXTURE_TEST_CASE(checkinputs_test, Dersig100Setup)
         // not present.  Don't add these checks to the cache, so that we can
         // test later that block validation works fine in the absence of cached
         // successes.
-        ValidateCheckInputsForAllFlags(CTransaction(spend_tx), SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC, false, m_node.chainman->ActiveChainstate().CoinsTip(), m_node.chainman->m_validation_cache);
+        ValidateCheckInputsForAllFlags(CTransaction(spend_tx),
+                                       SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S |
+                                           SCRIPT_VERIFY_STRICTENC | SCRIPT_VERIFY_LEGACY_B3_STRICTENC,
+                                       false, m_node.chainman->ActiveChainstate().CoinsTip(),
+                                       m_node.chainman->m_validation_cache);
     }
 
     // And if we produce a block with this tx, it should be valid (DERSIG not
