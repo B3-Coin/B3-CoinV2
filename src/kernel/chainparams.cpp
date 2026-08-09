@@ -35,6 +35,49 @@
 
 using namespace util::hex_literals;
 
+namespace {
+
+// BIP155-serialized CService entries for B3Coin IPv4 bootstrap peers. Each
+// entry is:
+// IPv4 network id, address length, IPv4 octets, then port 5647 (big-endian).
+constexpr std::array<uint8_t, 32 * 8> B3COIN_FIXED_SEEDS{
+    0x01, 0x04, 0x65, 0x6f, 0x59, 0x55, 0x16, 0x0f, // 101.111.89.85
+    0x01, 0x04, 0xbc, 0x44, 0x34, 0xac, 0x16, 0x0f, // 188.68.52.172
+    0x01, 0x04, 0x65, 0xb0, 0x76, 0x67, 0x16, 0x0f, // 101.176.118.103
+    0x01, 0x04, 0x67, 0xff, 0x04, 0x36, 0x16, 0x0f, // 103.255.4.54
+    0x01, 0x04, 0x68, 0xbd, 0x9f, 0xe4, 0x16, 0x0f, // 104.189.159.228
+    0x01, 0x04, 0x6b, 0x96, 0x07, 0x7a, 0x16, 0x0f, // 107.150.7.122
+    0x01, 0x04, 0x6b, 0xae, 0x80, 0xb3, 0x16, 0x0f, // 107.174.128.179
+    0x01, 0x04, 0x6b, 0xbf, 0x68, 0x50, 0x16, 0x0f, // 107.191.104.80
+    0x01, 0x04, 0x6c, 0xc4, 0xb9, 0xa4, 0x16, 0x0f, // 108.196.185.164
+    0x01, 0x04, 0x6f, 0xdc, 0x8c, 0x53, 0x16, 0x0f, // 111.220.140.83
+    0x01, 0x04, 0x70, 0x4e, 0x08, 0x87, 0x16, 0x0f, // 112.78.8.135
+    0x01, 0x04, 0x72, 0x6d, 0xcc, 0x38, 0x16, 0x0f, // 114.109.204.56
+    0x01, 0x04, 0x73, 0x91, 0x91, 0x20, 0x16, 0x0f, // 115.145.145.32
+    0x01, 0x04, 0x73, 0xb2, 0xff, 0x67, 0x16, 0x0f, // 115.178.255.103
+    0x01, 0x04, 0x73, 0x46, 0x95, 0x62, 0x16, 0x0f, // 115.70.149.98
+    0x01, 0x04, 0x74, 0x0f, 0x6b, 0xf8, 0x16, 0x0f, // 116.15.107.248
+    0x01, 0x04, 0x74, 0xce, 0xdf, 0x6f, 0x16, 0x0f, // 116.206.223.111
+    0x01, 0x04, 0x7a, 0xa1, 0xae, 0x26, 0x16, 0x0f, // 122.161.174.38
+    0x01, 0x04, 0x0d, 0x52, 0x5d, 0xbd, 0x16, 0x0f, // 13.82.93.189
+    0x01, 0x04, 0x0d, 0x5e, 0x9a, 0x67, 0x16, 0x0f, // 13.94.154.103
+    0x01, 0x04, 0x86, 0x77, 0xb5, 0x9d, 0x16, 0x0f, // 134.119.181.157
+    // Operator-supplied live bootstrap peers.
+    0x01, 0x04, 0xae, 0xc5, 0x01, 0xc4, 0x16, 0x0f, // 174.197.1.196
+    0x01, 0x04, 0xae, 0xc5, 0x02, 0x1a, 0x16, 0x0f, // 174.197.2.26
+    0x01, 0x04, 0xae, 0xf6, 0xc0, 0x25, 0x16, 0x0f, // 174.246.192.37
+    0x01, 0x04, 0x2d, 0x4c, 0x24, 0xf9, 0x16, 0x0f, // 45.76.36.249
+    0x01, 0x04, 0x46, 0x78, 0xb0, 0x3e, 0x16, 0x0f, // 70.120.176.62
+    0x01, 0x04, 0x4d, 0xa9, 0xf6, 0xdc, 0x16, 0x0f, // 77.169.246.220
+    0x01, 0x04, 0x51, 0x38, 0x1a, 0x29, 0x16, 0x0f, // 81.56.26.41
+    0x01, 0x04, 0x51, 0x38, 0x2d, 0x62, 0x16, 0x0f, // 81.56.45.98
+    0x01, 0x04, 0x5f, 0xb3, 0x97, 0xba, 0x16, 0x0f, // 95.179.151.186
+    0x01, 0x04, 0x5f, 0xb3, 0x9d, 0x37, 0x16, 0x0f, // 95.179.157.55
+    0x01, 0x04, 0x62, 0x61, 0x8f, 0x0e, 0x16, 0x0f, // 98.97.143.14
+};
+
+} // namespace
+
 static CBlock CreateGenesisBlock(const char* pszTimestamp, const CScript& genesisOutputScript, uint32_t nTime, uint32_t nNonce, uint32_t nBits, int32_t nVersion, const CAmount& genesisReward)
 {
     CMutableTransaction txNew;
@@ -123,9 +166,9 @@ public:
          * The characters are rarely used upper ASCII, not valid as UTF-8, and produce
          * a large 32-bit integer with any alignment.
          */
-        // Preserve the legacy B3Coin wire protocol so existing peers can
-        // exchange the historical chain with B3Coin Core.
-        pchMessageStart[0] = 0xd1;
+        // Preserve the final legacy B3Coin wire protocol so existing peers
+        // can exchange the historical chain with B3Coin Core.
+        pchMessageStart[0] = 0xb3;
         pchMessageStart[1] = 0x2e;
         pchMessageStart[2] = 0x1e;
         pchMessageStart[3] = 0xe6;
@@ -139,20 +182,12 @@ public:
         assert(consensus.hashGenesisBlock == uint256{"4b0d7f133c5267d715d4d8992635a5490d1edd6b7072cce3f8fe116aba983b6a"});
         assert(genesis.hashMerkleRoot == uint256{"4243fd570d4cb2e2930767f5bf18b2f65f1b7c4e16a392552d1efadeec00753d"});
 
-        for (const char* seed : {
-                 "101.111.89.85", "188.68.52.172", "101.176.118.103",
-                 "103.255.4.54", "104.189.159.228", "107.150.7.122",
-                 "107.174.128.179", "107.191.104.80", "108.196.185.164",
-                 "111.220.140.83", "112.78.8.135", "114.109.204.56",
-                 "115.145.145.32", "115.178.255.103", "115.70.149.98",
-                 "116.15.107.248", "116.206.223.111", "122.161.174.38",
-                 "13.82.93.189", "13.94.154.103", "134.119.181.157",
-             }) {
-            // These are the literal peers distributed by the legacy client.
-            // They are kept as historical bootstrap addresses, not a claim
-            // that each address is still online.
-            vSeeds.emplace_back(seed);
-        }
+        // Core treats vSeeds as DNS hostnames. These legacy values are literal
+        // IPv4 endpoints, so feed them through its fixed-seed path instead.
+        // They are historical bootstrap addresses, not a claim that each is
+        // still online.
+        vSeeds.clear();
+        vFixedSeeds.assign(B3COIN_FIXED_SEEDS.begin(), B3COIN_FIXED_SEEDS.end());
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,63);
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,85);
@@ -161,8 +196,6 @@ public:
         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x88, 0xAD, 0xE4};
 
         bech32_hrp = "b3";
-
-        vFixedSeeds.clear();
 
         fDefaultConsistencyChecks = false;
         m_is_mockable_chain = false;

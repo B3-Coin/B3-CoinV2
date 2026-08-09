@@ -984,8 +984,12 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         }
     }
 
-    // Signal NODE_P2P_V2 if BIP324 v2 transport is enabled.
-    if (args.GetBoolArg("-v2transport", DEFAULT_V2_TRANSPORT)) {
+    // Historical B3Coin peers use only the legacy v1 transport. Do not
+    // advertise BIP324 v2 on the preserved network: an old peer treats its
+    // encrypted handshake as an invalid message start.
+    const bool use_v2_transport{!chainparams.GetConsensus().legacy_b3coin &&
+                                args.GetBoolArg("-v2transport", DEFAULT_V2_TRANSPORT)};
+    if (use_v2_transport) {
         g_local_services = ServiceFlags(g_local_services | NODE_P2P_V2);
     }
 
