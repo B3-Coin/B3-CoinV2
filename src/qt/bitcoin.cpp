@@ -21,6 +21,7 @@
 #include <qt/bitcoingui.h>
 #include <qt/clientmodel.h>
 #include <qt/guiconstants.h>
+#include <qt/b3theme.h>
 #include <qt/guiutil.h>
 #include <qt/initexecutor.h>
 #include <qt/intro.h>
@@ -503,6 +504,8 @@ int GuiMain(int argc, char* argv[])
 
     BitcoinApplication app;
     GUIUtil::LoadFont(QStringLiteral(":/fonts/monospace"));
+    // Apply the centralized B3FlowMesh visual system (palette + stylesheet).
+    B3Theme::apply(app);
 
     /// 2. Parse command-line options. We do this after qt in order to show an error if there are problems parsing these
     // Command-line options take precedence:

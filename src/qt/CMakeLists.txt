@@ -67,6 +67,16 @@ unset(warn_flags)
 # The bitcoinqt sources have to include headers in
 # order to parse them to collect translatable strings.
 add_library(bitcoinqt STATIC EXCLUDE_FROM_ALL
+  b3navsidebar.cpp
+  b3navsidebar.h
+  b3placeholderpage.cpp
+  b3placeholderpage.h
+  b3shell.cpp
+  b3shell.h
+  b3theme.cpp
+  b3theme.h
+  b3topstatus.cpp
+  b3topstatus.h
   bantablemodel.cpp
   bantablemodel.h
   bitcoin.cpp

@@ -39,6 +39,8 @@ class WalletFrame;
 class WalletModel;
 class HelpMessageDialog;
 class ModalOverlay;
+class B3Shell;
+enum class B3Page;
 enum class SynchronizationState;
 
 namespace interfaces {
@@ -119,6 +121,7 @@ private:
     std::unique_ptr<interfaces::Handler> m_handler_question;
     ClientModel* clientModel = nullptr;
     WalletFrame* walletFrame = nullptr;
+    B3Shell* m_shell = nullptr;
 
     UnitDisplayStatusBarControl* unitDisplayControl = nullptr;
     GUIUtil::ThemedLabel* labelWalletEncryptionIcon = nullptr;
@@ -274,6 +277,8 @@ private:
     void updateWindowTitle();
 
 public Q_SLOTS:
+    /** Route a B3FlowMesh shell navigation choice to existing functionality. */
+    void onShellPageSelected(B3Page page);
 #ifdef ENABLE_WALLET
     /** Switch to overview (home) page */
     void gotoOverviewPage();

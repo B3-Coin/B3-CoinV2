@@ -11,6 +11,9 @@
 #include <qt/createwalletdialog.h>
 #include <qt/guiconstants.h>
 #include <qt/guiutil.h>
+#include <qt/b3navsidebar.h>
+#include <qt/b3shell.h>
+#include <qt/b3topstatus.h>
 #include <qt/modaloverlay.h>
 #include <qt/networkstyle.h>
 #include <qt/notificator.h>
@@ -122,7 +125,15 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
             this->message(title, message, style);
         });
         connect(walletFrame, &WalletFrame::currentWalletSet, [this] { updateWalletStatus(); });
-        setCentralWidget(walletFrame);
+        // Host the existing wallet UI inside the B3FlowMesh shell (top
+        // status + navigation sidebar + content stack). The shell routes
+        // navigation back to existing functionality; it invents nothing.
+        m_shell = new B3Shell(this);
+        m_shell->setWalletWidget(walletFrame);
+        m_shell->topStatus()->setNetwork(m_network_style->getAppName(),
+                                         m_network_style->getTitleAddText());
+        connect(m_shell, &B3Shell::pageSelected, this, &BitcoinGUI::onShellPageSelected);
+        setCentralWidget(m_shell);
     } else
 #endif // ENABLE_WALLET
     {
@@ -147,6 +158,22 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
 
     // Create the toolbars
     createToolBars();
+
+#ifdef ENABLE_WALLET
+    // The B3FlowMesh sidebar replaces the tab toolbar for navigation. Hide
+    // the redundant toolbar (its actions remain live, driven by the
+    // sidebar and menus) and relocate the wallet selector into the shell's
+    // top status area so multi-wallet selection keeps working.
+    if (m_shell && appToolBar) {
+        appToolBar->setVisible(false);
+        if (m_wallet_selector_label && m_wallet_selector) {
+            m_shell->topStatus()->addTrailingWidget(m_wallet_selector_label);
+            m_shell->topStatus()->addTrailingWidget(m_wallet_selector);
+            m_wallet_selector_label->setVisible(false);
+            m_wallet_selector->setVisible(false);
+        }
+    }
+#endif
 
     // Create system tray icon and notification
     if (QSystemTrayIcon::isSystemTrayAvailable()) {
@@ -783,8 +810,9 @@ void BitcoinGUI::addWallet(WalletModel* walletModel)
     if (m_wallet_selector->count() == 0) {
         setWalletActionsEnabled(true);
     } else if (m_wallet_selector->count() == 1) {
-        m_wallet_selector_label_action->setVisible(true);
-        m_wallet_selector_action->setVisible(true);
+        // Relocated into the top status area: toggle the widgets directly.
+        m_wallet_selector_label->setVisible(true);
+        m_wallet_selector->setVisible(true);
     }
 
     connect(wallet_view, &WalletView::outOfSyncWarningClicked, this, &BitcoinGUI::showModalOverlay);
@@ -814,8 +842,8 @@ void BitcoinGUI::removeWallet(WalletModel* walletModel)
         setWalletActionsEnabled(false);
         overviewAction->setChecked(true);
     } else if (m_wallet_selector->count() == 1) {
-        m_wallet_selector_label_action->setVisible(false);
-        m_wallet_selector_action->setVisible(false);
+        m_wallet_selector_label->setVisible(false);
+        m_wallet_selector->setVisible(false);
     }
     rpcConsole->removeWallet(walletModel);
     walletFrame->removeWallet(walletModel);
@@ -1008,24 +1036,28 @@ void BitcoinGUI::openClicked()
 void BitcoinGUI::gotoOverviewPage()
 {
     overviewAction->setChecked(true);
+    if (m_shell) m_shell->showPage(B3Page::Dashboard);
     if (walletFrame) walletFrame->gotoOverviewPage();
 }
 
 void BitcoinGUI::gotoHistoryPage()
 {
     historyAction->setChecked(true);
+    if (m_shell) m_shell->showPage(B3Page::Activity);
     if (walletFrame) walletFrame->gotoHistoryPage();
 }
 
 void BitcoinGUI::gotoReceiveCoinsPage()
 {
     receiveCoinsAction->setChecked(true);
+    if (m_shell) m_shell->showPage(B3Page::Dashboard);
     if (walletFrame) walletFrame->gotoReceiveCoinsPage();
 }
 
 void BitcoinGUI::gotoSendCoinsPage(QString addr)
 {
     sendCoinsAction->setChecked(true);
+    if (m_shell) m_shell->showPage(B3Page::Dashboard);
     if (walletFrame) walletFrame->gotoSendCoinsPage(addr);
 }
 
@@ -1076,6 +1108,35 @@ void BitcoinGUI::updateNetworkState()
     connectionsControl->setToolTip(tooltip);
 
     connectionsControl->setThemedPixmap(icon, STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE);
+
+    if (m_shell) m_shell->topStatus()->setConnections(count, m_node.getNetworkActive());
+}
+
+void BitcoinGUI::onShellPageSelected(B3Page page)
+{
+    // Route each navigation choice to existing functionality; the shell's
+    // own content stack already handled the placeholder pages.
+    switch (page) {
+#ifdef ENABLE_WALLET
+    case B3Page::Dashboard:
+        if (walletFrame) gotoOverviewPage();
+        break;
+    case B3Page::Activity:
+        if (walletFrame) gotoHistoryPage();
+        break;
+#else
+    case B3Page::Dashboard:
+    case B3Page::Activity:
+        break;
+#endif
+    case B3Page::Settings:
+        if (optionsAction) optionsAction->trigger();
+        break;
+    case B3Page::Trade:
+    case B3Page::Assets:
+    case B3Page::Stake:
+        break;
+    }
 }
 
 void BitcoinGUI::setNumConnections(int count)
@@ -1196,6 +1257,7 @@ void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVer
     if (secs < MAX_BLOCK_TIME_GAP) {
         tooltip = tr("Up to date") + QString(".<br>") + tooltip;
         labelBlocksIcon->setThemedPixmap(QStringLiteral(":/icons/synced"), STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE);
+        if (m_shell) m_shell->topStatus()->setSync(tr("Synced"), -1);
 
 #ifdef ENABLE_WALLET
         if(walletFrame)
@@ -1217,6 +1279,10 @@ void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVer
         progressBar->setMaximum(1000000000);
         progressBar->setValue(nVerificationProgress * 1000000000.0 + 0.5);
         progressBar->setVisible(true);
+        if (m_shell) {
+            m_shell->topStatus()->setSync(timeBehindText,
+                                          static_cast<int>(nVerificationProgress * 1000.0 + 0.5));
+        }
 
         tooltip = tr("Catching up…") + QString("<br>") + tooltip;
         if(count != prevBlocks)
@@ -1499,6 +1565,10 @@ void BitcoinGUI::updateWalletStatus()
     WalletModel * const walletModel = walletView->getWalletModel();
     setEncryptionStatus(walletModel->getEncryptionStatus());
     setHDStatus(walletModel->wallet().privateKeysDisabled(), walletModel->wallet().hdEnabled());
+    if (m_shell) {
+        const QString name{walletModel->getDisplayName()};
+        m_shell->topStatus()->setWalletStatus(name);
+    }
 }
 #endif // ENABLE_WALLET
 
