@@ -10,6 +10,7 @@
 
 #include <QStackedWidget>
 
+class B3DashboardPage;
 class ClientModel;
 class OverviewPage;
 class PlatformStyle;
@@ -58,6 +59,7 @@ private:
     //!
     WalletModel* const walletModel;
 
+    B3DashboardPage* dashboardPage;
     OverviewPage *overviewPage;
     QWidget *transactionsPage;
     ReceiveCoinsDialog *receiveCoinsPage;

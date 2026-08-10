@@ -6,6 +6,7 @@
 
 #include <qt/addressbookpage.h>
 #include <qt/askpassphrasedialog.h>
+#include <qt/b3dashboardpage.h>
 #include <qt/clientmodel.h>
 #include <qt/guiutil.h>
 #include <qt/optionsmodel.h>
@@ -37,6 +38,9 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
     assert(walletModel);
 
     // Create tabs
+    dashboardPage = new B3DashboardPage(platformStyle);
+    dashboardPage->setWalletModel(walletModel);
+
     overviewPage = new OverviewPage(platformStyle);
     overviewPage->setWalletModel(walletModel);
 
@@ -69,10 +73,18 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
     usedReceivingAddressesPage = new AddressBookPage(platformStyle, AddressBookPage::ForEditing, AddressBookPage::ReceivingTab, this);
     usedReceivingAddressesPage->setModel(walletModel->getAddressTableModel());
 
+    addWidget(dashboardPage);
     addWidget(overviewPage);
     addWidget(transactionsPage);
     addWidget(receiveCoinsPage);
     addWidget(sendCoinsPage);
+
+    // Dashboard interactions reuse the existing per-wallet pages.
+    connect(dashboardPage, &B3DashboardPage::transactionClicked, this, &WalletView::transactionClicked);
+    connect(dashboardPage, &B3DashboardPage::transactionClicked, transactionView, qOverload<const QModelIndex&>(&TransactionView::focusTransaction));
+    connect(dashboardPage, &B3DashboardPage::sendRequested, this, [this] { gotoSendCoinsPage(); });
+    connect(dashboardPage, &B3DashboardPage::receiveRequested, this, &WalletView::gotoReceiveCoinsPage);
+    connect(this, &WalletView::setPrivacy, dashboardPage, &B3DashboardPage::setPrivacy);
 
     connect(overviewPage, &OverviewPage::transactionClicked, this, &WalletView::transactionClicked);
     // Clicking on a transaction on the overview pre-selects the transaction on the transaction history page
@@ -117,6 +129,7 @@ void WalletView::setClientModel(ClientModel *_clientModel)
 {
     this->clientModel = _clientModel;
 
+    dashboardPage->setClientModel(_clientModel);
     overviewPage->setClientModel(_clientModel);
     sendCoinsPage->setClientModel(_clientModel);
     walletModel->setClientModel(_clientModel);
@@ -145,7 +158,7 @@ void WalletView::processNewTransaction(const QModelIndex& parent, int start, int
 
 void WalletView::gotoOverviewPage()
 {
-    setCurrentWidget(overviewPage);
+    setCurrentWidget(dashboardPage);
 }
 
 void WalletView::gotoHistoryPage()
@@ -197,6 +210,7 @@ bool WalletView::handlePaymentRequest(const SendCoinsRecipient& recipient)
 
 void WalletView::showOutOfSyncWarning(bool fShow)
 {
+    dashboardPage->showOutOfSyncWarning(fShow);
     overviewPage->showOutOfSyncWarning(fShow);
 }
 

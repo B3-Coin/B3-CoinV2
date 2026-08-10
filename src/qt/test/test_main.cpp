@@ -18,6 +18,7 @@
 
 #ifdef ENABLE_WALLET
 #include <qt/test/addressbooktests.h>
+#include <qt/test/b3dashboardtests.h>
 #include <qt/test/wallettests.h>
 #endif // ENABLE_WALLET
 
@@ -84,6 +85,11 @@ int main(int argc, char* argv[])
 
         B3ShellTests b3_shell_tests;
         num_test_failures += QTest::qExec(&b3_shell_tests);
+
+#ifdef ENABLE_WALLET
+        B3DashboardTests b3_dashboard_tests;
+        num_test_failures += QTest::qExec(&b3_dashboard_tests);
+#endif
 
         OptionTests options_tests(app.node());
         num_test_failures += QTest::qExec(&options_tests);
