@@ -64,12 +64,21 @@ inline constexpr size_t MAX_POLICY_PARAMS_SIZE{80};
  *    definition and exists so supply reduction is visible and exactly
  *    accounted (modern/asset.h). Part of the coloured-asset policy set,
  *    activated for tests only until the asset rules ship.
+ *  - DEX_VAULT: DEX custody (modern/vault.h). v1: the commitment is the
+ *    approved vault identity (non-zero) and params are exactly a 2-byte
+ *    shard id, so custody spreads over many parallel UTXOs. A vault has
+ *    no private key: spending is authorized only by finalized withdrawal
+ *    receipts. Same test-only activation as the asset policy set.
  */
 enum class PolicyType : uint16_t {
     LEGACY_LOCK = 0,
     OWNER = 1,
     BURN = 2,
+    DEX_VAULT = 3,
 };
+
+//! DEX_VAULT v1 params: exactly a little-endian 2-byte shard id.
+inline constexpr size_t VAULT_SHARD_PARAMS_SIZE{2};
 
 //! First and, at this stage, only version of either policy.
 inline constexpr uint16_t POLICY_VERSION_V1{1};
@@ -126,7 +135,8 @@ inline bool IsActivatedPolicy(const uint16_t policy_type, const uint16_t policy_
         policy_type == static_cast<uint16_t>(PolicyType::OWNER)) {
         return true;
     }
-    if (policy_type == static_cast<uint16_t>(PolicyType::BURN)) {
+    if (policy_type == static_cast<uint16_t>(PolicyType::BURN) ||
+        policy_type == static_cast<uint16_t>(PolicyType::DEX_VAULT)) {
         return AssetPoliciesActiveSlot();
     }
     return false;
@@ -178,6 +188,13 @@ inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int he
         // Canonical v1 burn: no parameters, all-zero commitment.
         if (!out.policy_params.empty()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
         if (!out.policy_commitment.IsNull()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        break;
+    case PolicyType::DEX_VAULT:
+        // The commitment names the approved vault; params carry the shard.
+        if (out.policy_commitment.IsNull()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        if (out.policy_params.size() != VAULT_SHARD_PARAMS_SIZE) {
+            return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        }
         break;
     }
     return PolicyOutputCheck::OK;

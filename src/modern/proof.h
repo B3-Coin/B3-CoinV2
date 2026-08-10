@@ -14,6 +14,7 @@
 #include <uint256.h>
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace modern {
@@ -132,7 +133,34 @@ enum class ProofCheck {
     OVERSIZED,
     MALFORMED,
     COMMITMENT_MISMATCH,
+    UNSPENDABLE,
 };
+
+//! Upper bound of withdrawal receipts one vault proof may claim.
+inline constexpr size_t MAX_VAULT_RECEIPTS_PER_PROOF{64};
+
+/**
+ * Strictly parse a DEX_VAULT v1 proof payload: a non-empty,
+ * strictly-ascending (sorted, duplicate-free) list of receipt ids, fully
+ * consuming the payload. Returns std::nullopt on any violation.
+ */
+inline std::optional<std::vector<uint256>> ParseVaultReceiptIds(
+    const std::vector<unsigned char>& payload)
+{
+    std::vector<uint256> ids;
+    try {
+        SpanReader reader{std::as_bytes(std::span{payload})};
+        reader >> ids;
+        if (!reader.empty()) return std::nullopt;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    if (ids.empty() || ids.size() > MAX_VAULT_RECEIPTS_PER_PROOF) return std::nullopt;
+    for (size_t i{1}; i < ids.size(); ++i) {
+        if (!(ids[i - 1] < ids[i])) return std::nullopt;
+    }
+    return ids;
+}
 
 /**
  * Verify one proof against the previous output it spends. Dispatch is
@@ -173,6 +201,16 @@ inline ProofCheck VerifyTransitionProof(const ModernOutput& prev_output,
     }
     case PolicyType::OWNER:
         if (proof.payload.empty()) return ProofCheck::MALFORMED;
+        return ProofCheck::OK;
+    case PolicyType::BURN:
+        // Burned value is destroyed: no proof can ever spend it.
+        return ProofCheck::UNSPENDABLE;
+    case PolicyType::DEX_VAULT:
+        // A vault has no private key. The only spendable form is a
+        // canonical finalized-receipt list; its semantic verification
+        // (finalization, destinations, change, conservation) lives in
+        // modern/vault.h.
+        if (!ParseVaultReceiptIds(proof.payload)) return ProofCheck::MALFORMED;
         return ProofCheck::OK;
     }
     return ProofCheck::UNKNOWN_POLICY;
