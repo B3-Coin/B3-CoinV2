@@ -57,6 +57,7 @@ add_executable(test_bitcoin
   key_tests.cpp
   logging_tests.cpp
   legacy_genesis_tests.cpp
+  legacy_identity_tests.cpp
   legacy_pos_tests.cpp
   mempool_tests.cpp
   merkle_tests.cpp
