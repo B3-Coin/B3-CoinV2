@@ -116,6 +116,28 @@ public:
         return true;
     }
 
+    /**
+     * Internal settlement move: reserved funds of `from` become available
+     * funds of `to`, same asset. Total liability (available + reserved
+     * across accounts) and per-asset custody are both unchanged, so the
+     * solvency invariant is preserved. This is how a batch fill settles —
+     * a payer's reserved balance moves to a payee's available balance with
+     * no per-fill UTXO spend. from == to degenerates to Release.
+     */
+    bool MoveReservedToAvailable(const AccountId& from, const AccountId& to,
+                                 const AssetId& asset, const CAmount amount)
+    {
+        if (amount <= 0) return false;
+        const auto it{m_balances.find({from, asset})};
+        if (it == m_balances.end() || it->second.reserved < amount) return false;
+        Balance& dst{m_balances[{to, asset}]};
+        if (amount > MAX_MONEY - dst.available) { Prune(from, asset); return false; }
+        it->second.reserved -= amount;
+        dst.available += amount;
+        Prune(from, asset);
+        return true;
+    }
+
     // ---- Protocol fees --------------------------------------------------
 
     //! Charge a fee: an internal transfer to the protocol fee account.
