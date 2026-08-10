@@ -51,11 +51,17 @@ inline constexpr int P2P_COMPATIBILITY_VERSION{70'011};
 inline constexpr CAmount CENT{COIN / 100};
 inline constexpr CAmount COIN_YEAR_REWARD{CENT};
 /**
- * Historical fee accounting treated a 2.5M B3 shortfall as a special burn.
- * It is retained solely to reproduce existing blocks; it does not enable any
- * Fundamental Node service, payment, vote, or validation mechanism.
+ * Height-tiered Fundamental Node collateral of the historical client
+ * (fn-activity.h GetFNCollateral in the old tree): 25M B3 through height
+ * 85000, 20M through 105000, 15M afterwards. The collateral was destroyed
+ * by proof of integration: the transaction claims less than it spends by
+ * at least this amount, so the value appears in no output at all (unlike
+ * proof of burn, which parks coins on an unspendable address). Exactly the
+ * collateral is excluded from the fee. Only this accounting is preserved;
+ * it enables no Fundamental Node service, payment, vote, or validation
+ * mechanism.
  */
-inline constexpr CAmount LEGACY_FUNDAMENTALNODE_BURN{2'500'000 * COIN};
+CAmount GetFNCollateral(int height);
 
 /**
  * True when a height must use the preserved B3Coin consensus rules.
@@ -110,7 +116,7 @@ CAmount GetProofOfStakeReward(const CBlockIndex* pindex_prev,
                               uint64_t coin_age, CAmount fees);
 
 /** Return the fee amount the legacy block-reward calculation counted. */
-CAmount GetLegacyTransactionFee(CAmount value_in, CAmount value_out, bool is_coinstake);
+CAmount GetLegacyTransactionFee(CAmount value_in, CAmount value_out, bool is_coinstake, int height);
 
 /**
  * Heights where the legacy client deliberately bypassed its normal coinstake

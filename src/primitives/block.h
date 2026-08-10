@@ -74,6 +74,16 @@ public:
     /** Historical B3Coin scrypt header hash (always scrypt, no version test). */
     uint256 GetLegacyB3Hash() const;
 
+    /**
+     * Marker-aware header hash for contexts with no authoritative parent
+     * height (an unknown-parent block from the wire, a disk read without a
+     * recorded height). The permanent B3 codec marker selects the hash
+     * domain: modern SHA256d with it, legacy scrypt without it on a legacy
+     * chain. Never assume height zero for an unknown-parent block; once the
+     * parent is known the height-aware overload is authoritative.
+     */
+    uint256 GetMarkerHash(const Consensus::Params& consensus_params) const;
+
     NodeSeconds Time() const
     {
         return NodeSeconds{std::chrono::seconds{nTime}};

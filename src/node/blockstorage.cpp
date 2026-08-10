@@ -149,6 +149,8 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->m_legacy_stake_modifier_generated = diskindex.m_legacy_stake_modifier_generated;
                 pindexNew->m_legacy_stake_modifier = diskindex.m_legacy_stake_modifier;
                 pindexNew->m_legacy_hash_proof = diskindex.m_legacy_hash_proof;
+                pindexNew->m_legacy_money_supply = diskindex.m_legacy_money_supply;
+                pindexNew->m_legacy_fn_integrated = diskindex.m_legacy_fn_integrated;
                 pindexNew->nStatus        = diskindex.nStatus;
                 pindexNew->nTx            = diskindex.nTx;
 
@@ -1082,7 +1084,10 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
         return false;
     }
 
-    const auto block_hash{block.GetHash(GetConsensus(), expected_height.value_or(/*legacy-safe fallback=*/0))};
+    // Without a recorded height the block's own codec marker selects the
+    // hash domain — never an assumed height of zero.
+    const auto block_hash{expected_height ? block.GetHash(GetConsensus(), *expected_height)
+                                          : block.GetMarkerHash(GetConsensus())};
 
     // The original B3Coin client constructed the historical genesis block
     // locally and did not run its header PoW check when reading it back. Its

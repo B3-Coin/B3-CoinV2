@@ -38,6 +38,14 @@ uint256 CBlockHeader::GetHash(const Consensus::Params& consensus_params, const i
     return GetHash();
 }
 
+uint256 CBlockHeader::GetMarkerHash(const Consensus::Params& consensus_params) const
+{
+    if (consensus_params.legacy_b3coin && !Consensus::HasB3BlockCodecV2(nVersion)) {
+        return GetLegacyB3Hash();
+    }
+    return GetHash();
+}
+
 std::string CBlock::ToString() const
 {
     std::stringstream s;

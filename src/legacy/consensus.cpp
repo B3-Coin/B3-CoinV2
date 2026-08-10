@@ -326,12 +326,20 @@ CAmount GetProofOfStakeReward(const CBlockIndex* pindex_prev,
     return base + fees + COIN;
 }
 
+CAmount GetFNCollateral(const int height)
+{
+    if (height > 105'000) return 15'000'000 * COIN;
+    if (height > 85'000) return 20'000'000 * COIN;
+    return 25'000'000 * COIN;
+}
+
 CAmount GetLegacyTransactionFee(const CAmount value_in, const CAmount value_out,
-                                const bool is_coinstake)
+                                const bool is_coinstake, const int height)
 {
     if (is_coinstake) return 0;
     const CAmount raw_fee{value_in - value_out};
-    return raw_fee >= LEGACY_FUNDAMENTALNODE_BURN ? raw_fee - LEGACY_FUNDAMENTALNODE_BURN : raw_fee;
+    const CAmount collateral{GetFNCollateral(height)};
+    return raw_fee >= collateral ? raw_fee - collateral : raw_fee;
 }
 
 bool IsHistoricalStakeRewardCapException(const int height)

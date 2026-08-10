@@ -803,6 +803,20 @@ private:
 
     FeeFilterRounder m_fee_filter_rounder GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
 
+    /**
+     * Whether standalone transactions on this connection use the historical
+     * legacy encoding. Selected from connection context — this peer
+     * negotiated the pinned legacy protocol — never from a process-global
+     * codec switch (doc/design/b3-architecture-contract.md, STANDALONE
+     * TRANSACTIONS). Blocks are not selected this way: their codec is
+     * self-described by the header marker.
+     */
+    bool UsesLegacyWireTransactions(const CNode& node) const
+    {
+        return m_chainparams.GetConsensus().legacy_b3coin &&
+               node.GetCommonVersion() <= legacy::P2P_COMPATIBILITY_VERSION;
+    }
+
     const CChainParams& m_chainparams;
     CConnman& m_connman;
     AddrMan& m_addrman;
@@ -2534,7 +2548,7 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
                 // Thus, the protocol spec specified allows for us to provide duplicate txn here,
                 // however we MUST always provide at least what the remote peer needs
                 for (const auto& [tx_idx, _] : merkleBlock.vMatchedTxn)
-                    MakeAndPushMessage(pfrom, NetMsgType::TX, (legacy_wire ? legacy::TX_LEGACY : TX_NO_WITNESS)(*pblock->vtx[tx_idx]));
+                    MakeAndPushMessage(pfrom, NetMsgType::TX, (UsesLegacyWireTransactions(pfrom) ? legacy::TX_LEGACY : TX_NO_WITNESS)(*pblock->vtx[tx_idx]));
             }
             // else
             // no response
@@ -2628,10 +2642,11 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
         }
 
         if (auto tx{FindTxForGetData(*tx_relay, ToGenTxid(inv))}) {
-            // WTX and WITNESS_TX imply we serialize with witness; legacy
-            // peers always get the historical encoding.
+            // WTX and WITNESS_TX imply we serialize with witness; a peer
+            // that negotiated the legacy protocol gets the historical
+            // encoding.
             const TransactionSerParams& tx_ser{
-                m_chainparams.GetConsensus().legacy_b3coin ? legacy::TX_LEGACY :
+                UsesLegacyWireTransactions(pfrom) ? legacy::TX_LEGACY :
                 inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS};
             MakeAndPushMessage(pfrom, NetMsgType::TX, tx_ser(*tx));
             m_mempool.RemoveUnbroadcastTx(tx->GetHash());
@@ -4476,7 +4491,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // that we INVed to the peer earlier.
             if (vInv.size() == 1 && vInv[0].IsMsgTx() && vInv[0].hash == pushed_tx->GetHash().ToUint256()) {
 
-                MakeAndPushMessage(pfrom, NetMsgType::TX, (m_chainparams.GetConsensus().legacy_b3coin ? legacy::TX_LEGACY : TX_WITH_WITNESS)(*pushed_tx));
+                MakeAndPushMessage(pfrom, NetMsgType::TX, (UsesLegacyWireTransactions(pfrom) ? legacy::TX_LEGACY : TX_WITH_WITNESS)(*pushed_tx));
 
                 peer.m_ping_queued = true; // Ensure a ping will be sent: mimic a request via RPC.
                 MaybeSendPing(pfrom, peer, GetTime<std::chrono::microseconds>());
@@ -4716,9 +4731,9 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         if (m_chainman.IsInitialBlockDownload()) return;
 
         CTransactionRef ptx;
-        if (m_chainparams.GetConsensus().legacy_b3coin) {
-            // Legacy peers relay the historical transaction encoding; the
-            // codec choice is explicit from the connection context.
+        if (UsesLegacyWireTransactions(pfrom)) {
+            // This peer negotiated the legacy protocol and relays the
+            // historical transaction encoding.
             vRecv >> legacy::TX_LEGACY(ptx);
         } else {
             vRecv >> TX_WITH_WITNESS(ptx);
@@ -5127,8 +5142,12 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         // Switching sync itself off at that boundary is future modern-sync
         // work (see doc/design/b3-era-architecture.md).
         const bool legacy_sync{m_chainparams.GetConsensus().legacy_b3coin};
-        const int block_height{prev_block ? prev_block->nHeight + 1 : 0};
-        const uint256 hash{pblock->GetHash(m_chainparams.GetConsensus(), block_height)};
+        // With a known parent the height selects the hash domain; for an
+        // unknown-parent block the codec marker does — never an assumed
+        // height of zero (doc/design/b3-architecture-contract.md).
+        const uint256 hash{prev_block ?
+            pblock->GetHash(m_chainparams.GetConsensus(), prev_block->nHeight + 1) :
+            pblock->GetMarkerHash(m_chainparams.GetConsensus())};
         bool legacy_block_requested{false};
         bool legacy_block_is_next{false};
         if (legacy_sync) {

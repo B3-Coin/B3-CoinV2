@@ -152,6 +152,18 @@ public:
     bool m_legacy_stake_modifier_generated{false};
     uint64_t m_legacy_stake_modifier{0};
     uint256 m_legacy_hash_proof{};
+    /**
+     * Cumulative supply records up to and including this block, mirroring
+     * the historical client's nMoneySupply: total created minus destroyed,
+     * and the running total of coins destroyed as Fundamental Node
+     * collateral via proof of integration. Unlike proof of burn, the
+     * collateral is never sent to any address: the transaction claims less
+     * than it spends by exactly the collateral, so the value is removed at
+     * the ledger level and appears in no output. Persisted with the other
+     * legacy index fields.
+     */
+    int64_t m_legacy_money_supply{0};
+    int64_t m_legacy_fn_integrated{0};
 
     //! (memory only) Sequential id assigned to distinguish order in which blocks are received.
     //! Initialized to SEQ_ID_INIT_FROM_DISK{1} when loading blocks from disk, except for blocks
@@ -371,6 +383,8 @@ public:
         READWRITE(obj.m_legacy_stake_modifier_generated);
         READWRITE(obj.m_legacy_stake_modifier);
         READWRITE(obj.m_legacy_hash_proof);
+        READWRITE(obj.m_legacy_money_supply);
+        READWRITE(obj.m_legacy_fn_integrated);
     }
 
     uint256 ConstructBlockHash(const Consensus::Params& consensus_params) const

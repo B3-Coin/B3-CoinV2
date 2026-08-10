@@ -2062,7 +2062,7 @@ static bool CheckLegacyTxInputs(const CTransaction& tx, TxValidationState& state
                              strprintf("value in (%s) < value out (%s)", FormatMoney(value_in), FormatMoney(value_out)));
     }
 
-    txfee = legacy::GetLegacyTransactionFee(value_in, value_out, tx.IsCoinStake());
+    txfee = legacy::GetLegacyTransactionFee(value_in, value_out, tx.IsCoinStake(), spend_height);
     if (!MoneyRange(txfee)) {
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-fee-outofrange");
     }
@@ -2635,6 +2635,13 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     std::vector<int> prevheights;
     CAmount nFees = 0;
     CAmount legacy_stake_reward = 0;
+    // Legacy supply bookkeeping, mirroring the historical client: per-block
+    // value totals feed the cumulative money supply, and Fundamental Node
+    // proof-of-integration collateral (destroyed as an input/output
+    // shortfall, never sent to any address) is recorded.
+    CAmount legacy_value_in = 0;
+    CAmount legacy_value_out = 0;
+    CAmount legacy_fn_integrated = 0;
     int nInputs = 0;
     int64_t nSigOpsCost = 0;
     uint64_t legacy_sigops = 0;
@@ -2679,6 +2686,10 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                     break;
                 }
                 nFees += txfee;
+                if (!tx.IsCoinStake() &&
+                    tx_value_in - tx.GetValueOut() >= legacy::GetFNCollateral(pindex->nHeight)) {
+                    legacy_fn_integrated += legacy::GetFNCollateral(pindex->nHeight);
+                }
                 legacy_sigops += GetP2SHSigOpCount(tx, view);
                 if (legacy_sigops > legacy::MAX_BLOCK_SIGOPS) {
                     state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", "too many legacy sigops");
@@ -2708,6 +2719,14 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                     break;
                 }
             }
+        }
+
+        if (use_legacy_b3coin) {
+            // tx_value_in stays zero for the coinbase, so the running totals
+            // reproduce the historical per-block supply delta of all outputs
+            // minus all inputs.
+            legacy_value_in += tx_value_in;
+            legacy_value_out += tx.GetValueOut();
         }
 
         if (use_legacy_b3coin) {
@@ -2811,6 +2830,14 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             pindex->m_legacy_hash_proof = block.IsProofOfStake() ? legacy_stake_proof->hash : block_hash;
             pindex->m_legacy_stake_modifier = stake_modifier;
             pindex->m_legacy_stake_modifier_generated = stake_modifier_generated;
+            // Cumulative supply records, mirroring the historical client's
+            // nMoneySupply, plus the running total of Fundamental Node
+            // proof-of-integration collateral destroyed.
+            pindex->m_legacy_money_supply =
+                (pindex->pprev ? pindex->pprev->m_legacy_money_supply : 0) +
+                legacy_value_out - legacy_value_in;
+            pindex->m_legacy_fn_integrated =
+                (pindex->pprev ? pindex->pprev->m_legacy_fn_integrated : 0) + legacy_fn_integrated;
             m_blockman.m_dirty_blockindex.insert(pindex);
         }
     }

@@ -1387,6 +1387,8 @@ RPCHelpMan getblockchaininfo()
                 {RPCResult::Type::BOOL, "automatic_pruning", /*optional=*/true, "whether automatic pruning is enabled (only present if pruning is enabled)"},
                 {RPCResult::Type::NUM, "prune_target_size", /*optional=*/true, "the target size used by pruning (only present if automatic pruning is enabled)"},
                 {RPCResult::Type::STR_HEX, "signet_challenge", /*optional=*/true, "the block challenge (aka. block script), in hexadecimal (only present if the current network is a signet)"},
+                {RPCResult::Type::STR_AMOUNT, "moneysupply", /*optional=*/true, "cumulative money supply at the tip (only present on a legacy B3 chain)"},
+                {RPCResult::Type::STR_AMOUNT, "fn_integrated", /*optional=*/true, "total coins destroyed as historical Fundamental Node collateral via proof of integration (only present on a legacy B3 chain)"},
                 (IsDeprecatedRPCEnabled("warnings") ?
                     RPCResult{RPCResult::Type::STR, "warnings", "any network and blockchain warnings (DEPRECATED)"} :
                     RPCResult{RPCResult::Type::ARR, "warnings", "any network and blockchain warnings (run with `-deprecatedrpc=warnings` to return the latest warning as a single string)",
@@ -1437,6 +1439,10 @@ RPCHelpMan getblockchaininfo()
         const std::vector<uint8_t>& signet_challenge =
             chainman.GetParams().GetConsensus().signet_challenge;
         obj.pushKV("signet_challenge", HexStr(signet_challenge));
+    }
+    if (chainman.GetConsensus().legacy_b3coin) {
+        obj.pushKV("moneysupply", ValueFromAmount(tip.m_legacy_money_supply));
+        obj.pushKV("fn_integrated", ValueFromAmount(tip.m_legacy_fn_integrated));
     }
 
     NodeContext& node = EnsureAnyNodeContext(request.context);

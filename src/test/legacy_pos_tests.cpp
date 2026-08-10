@@ -102,18 +102,41 @@ BOOST_AUTO_TEST_CASE(stake_modifier_uses_historical_numeric_hash_order)
     BOOST_CHECK_EQUAL(stake_modifier, 2U);
 }
 
-BOOST_AUTO_TEST_CASE(preserves_historical_special_burn_fee_accounting)
+BOOST_AUTO_TEST_CASE(preserves_historical_proof_of_integration_fee_accounting)
 {
+    // The historical client's height-tiered Fundamental Node collateral
+    // (fn-activity.h GetFNCollateral): 25M B3 through 85000, 20M through
+    // 105000, 15M afterwards. Destroyed by proof of integration: an
+    // input/output shortfall, never an output to a burn address.
+    const std::pair<int, CAmount> tiers[]{
+        {1, 25'000'000 * COIN},
+        {85'000, 25'000'000 * COIN},
+        {85'001, 20'000'000 * COIN},
+        {105'000, 20'000'000 * COIN},
+        {105'001, 15'000'000 * COIN},
+        {1'000'000, 15'000'000 * COIN},
+    };
+
     const CAmount output{10 * COIN};
+    for (const auto& [height, collateral] : tiers) {
+        BOOST_CHECK_EQUAL(legacy::GetFNCollateral(height), collateral);
+        // Exactly the collateral destroyed: the whole shortfall is a burn,
+        // none of it counts as fees.
+        BOOST_CHECK_EQUAL(
+            legacy::GetLegacyTransactionFee(output + collateral, output, /*is_coinstake=*/false, height),
+            0);
+        // Excess above the collateral counts as an ordinary fee.
+        BOOST_CHECK_EQUAL(
+            legacy::GetLegacyTransactionFee(output + collateral + COIN, output, /*is_coinstake=*/false, height),
+            COIN);
+        // Below the collateral nothing is treated as a burn.
+        BOOST_CHECK_EQUAL(
+            legacy::GetLegacyTransactionFee(output + collateral - COIN, output, /*is_coinstake=*/false, height),
+            collateral - COIN);
+    }
 
     BOOST_CHECK_EQUAL(
-        legacy::GetLegacyTransactionFee(output + legacy::LEGACY_FUNDAMENTALNODE_BURN, output, /*is_coinstake=*/false),
-        0);
-    BOOST_CHECK_EQUAL(
-        legacy::GetLegacyTransactionFee(output + legacy::LEGACY_FUNDAMENTALNODE_BURN + COIN, output, /*is_coinstake=*/false),
-        COIN);
-    BOOST_CHECK_EQUAL(
-        legacy::GetLegacyTransactionFee(output + COIN, output, /*is_coinstake=*/true),
+        legacy::GetLegacyTransactionFee(output + COIN, output, /*is_coinstake=*/true, /*height=*/1),
         0);
 }
 
