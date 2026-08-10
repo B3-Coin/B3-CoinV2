@@ -984,10 +984,15 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         }
     }
 
-    // Historical B3Coin peers use only the legacy v1 transport. Do not
-    // advertise BIP324 v2 on the preserved network: an old peer treats its
-    // encrypted handshake as an invalid message start.
-    const bool use_v2_transport{!chainparams.GetConsensus().legacy_b3coin &&
+    // Historical B3Coin peers use only the legacy v1 transport, so BIP324
+    // v2 stays off while the network has no configured boundary: an old
+    // peer treats the encrypted handshake as an invalid message start. Once
+    // the hard-fork boundary is configured, modern transport is available
+    // again (v1 fallback still serves legacy peers) — the legacy_b3coin
+    // flag alone never permanently disables it.
+    const bool legacy_only_network{chainparams.GetConsensus().legacy_b3coin &&
+                                   !chainparams.GetConsensus().hard_fork_height.has_value()};
+    const bool use_v2_transport{!legacy_only_network &&
                                 args.GetBoolArg("-v2transport", DEFAULT_V2_TRANSPORT)};
     if (use_v2_transport) {
         g_local_services = ServiceFlags(g_local_services | NODE_P2P_V2);

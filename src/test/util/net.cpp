@@ -4,6 +4,8 @@
 
 #include <test/util/net.h>
 
+#include <chainparams.h>
+#include <legacy/consensus.h>
 #include <net.h>
 #include <net_processing.h>
 #include <netaddress.h>
@@ -56,7 +58,14 @@ void ConnmanTestMsg::Handshake(CNode& node,
     FlushSendBuffer(node); // Drop the verack message added by SendMessages.
     if (node.fDisconnect) return;
     assert(node.nVersion == version);
-    assert(node.GetCommonVersion() == std::min(version, PROTOCOL_VERSION));
+    // A peer speaking the historical B3Coin protocol family negotiates the
+    // legacy compatibility cap instead of Core's feature range.
+    const bool b3_legacy_peer{Params().GetConsensus().legacy_b3coin &&
+                              version >= 80'000 && version <= legacy::P2P_PROTOCOL_VERSION};
+    const int expected_common_version{b3_legacy_peer
+                                          ? std::min(version, legacy::P2P_COMPATIBILITY_VERSION)
+                                          : std::min(version, PROTOCOL_VERSION)};
+    assert(node.GetCommonVersion() == expected_common_version);
     CNodeStateStats statestats;
     assert(peerman.GetNodeStateStats(node.GetId(), statestats));
     assert(statestats.m_relay_txs == (relay_txs && !node.IsBlockOnlyConn()));

@@ -59,6 +59,7 @@ add_executable(test_bitcoin
   legacy_boundary_tests.cpp
   legacy_genesis_tests.cpp
   legacy_identity_tests.cpp
+  legacy_net_tests.cpp
   legacy_pos_tests.cpp
   legacy_replay_tests.cpp
   mempool_tests.cpp

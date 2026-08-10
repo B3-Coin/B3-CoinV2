@@ -453,6 +453,15 @@ struct Peer {
     /** Whether we've sent our peer a sendheaders message. **/
     std::atomic<bool> m_sent_sendheaders{false};
 
+    /**
+     * Protocol capability negotiated at VERSION: true when the peer speaks
+     * the historical B3Coin protocol family (versions 80000..80008). A
+     * property of this connection only — distinct from the chain having
+     * legacy history, from any candidate block's consensus era, and from
+     * the codec of any particular message.
+     */
+    std::atomic<bool> m_legacy_protocol{false};
+
     /** When to potentially disconnect peer for stalling headers download */
     std::chrono::microseconds m_headers_sync_timeout GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0us};
 
@@ -806,16 +815,30 @@ private:
 
     /**
      * Whether standalone transactions on this connection use the historical
-     * legacy encoding. Selected from connection context — this peer
-     * negotiated the pinned legacy protocol — never from a process-global
-     * codec switch (doc/design/b3-architecture-contract.md, STANDALONE
-     * TRANSACTIONS). Blocks are not selected this way: their codec is
-     * self-described by the header marker.
+     * legacy encoding. Selected from the peer's negotiated protocol
+     * capability — never from a process-global codec switch
+     * (doc/design/b3-architecture-contract.md, STANDALONE TRANSACTIONS).
+     * Blocks are not selected this way: their codec is self-described by
+     * the header marker.
      */
-    bool UsesLegacyWireTransactions(const CNode& node) const
+    bool UsesLegacyWireTransactions(const Peer& peer) const
     {
-        return m_chainparams.GetConsensus().legacy_b3coin &&
-               node.GetCommonVersion() <= legacy::P2P_COMPATIBILITY_VERSION;
+        return peer.m_legacy_protocol.load(std::memory_order_relaxed);
+    }
+
+    /**
+     * The chain carries legacy history and its tip is still inside the
+     * legacy era: the network runs the historical protocol. Once the tip
+     * crosses the finalized boundary this turns false, and modern headers
+     * sync, compact blocks and witness relay apply to capable peers — the
+     * chain-level legacy_b3coin flag never permanently disables them.
+     */
+    bool IsLegacyPhase() const EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+    {
+        if (!m_chainparams.GetConsensus().legacy_b3coin) return false;
+        const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
+        return Consensus::GetB3Era((tip ? tip->nHeight : -1) + 1, m_chainparams.GetConsensus()) ==
+               Consensus::B3Era::LEGACY;
     }
 
     const CChainParams& m_chainparams;
@@ -1341,8 +1364,10 @@ void PeerManagerImpl::MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid)
 {
     AssertLockHeld(cs_main);
 
-    // The preserved B3Coin protocol has no BIP152 compact-block support.
-    if (m_chainparams.GetConsensus().legacy_b3coin) return;
+    // No BIP152 during the legacy network phase, and never towards a peer
+    // speaking the historical protocol (which has no compact-block support).
+    if (IsLegacyPhase()) return;
+    if (const PeerRef peer{GetPeerRef(nodeid)}; peer && peer->m_legacy_protocol) return;
 
     // When in -blocksonly mode, never request high-bandwidth mode from peers. Our
     // mempool will not contain the transactions necessary to reconstruct the
@@ -1618,10 +1643,13 @@ void PeerManagerImpl::FindNextBlocks(std::vector<const CBlockIndex*>& vBlocks, c
 void PeerManagerImpl::PushNodeVersion(CNode& pnode, const Peer& peer)
 {
     // Final legacy B3Coin peers disconnect clients which advertise less than
-    // 80006.
-    // This is a wire-compatibility value only: do not change Core's global
-    // PROTOCOL_VERSION, since it controls feature negotiation on other chains.
-    const int protocol_version{m_chainparams.GetConsensus().legacy_b3coin
+    // 80006, so the legacy handshake banner is advertised while the network
+    // is still in its legacy phase. Once the tip crosses the finalized
+    // boundary, new connections negotiate the modern protocol. This is a
+    // wire-compatibility value only: do not change Core's global
+    // PROTOCOL_VERSION, since it controls feature negotiation on other
+    // chains.
+    const int protocol_version{WITH_LOCK(cs_main, return IsLegacyPhase())
                                    ? legacy::P2P_PROTOCOL_VERSION
                                    : PROTOCOL_VERSION};
     uint64_t my_services;
@@ -2515,6 +2543,13 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
         pblock = pblockRead;
     }
     if (pblock) {
+        // A legacy-protocol peer cannot decode a marker-modern block; it is
+        // served history through the boundary only. Modern (archival) peers
+        // are served both eras — each block in its own self-described codec.
+        if (peer.m_legacy_protocol && Consensus::HasB3BlockCodecV2(pblock->nVersion)) {
+            LogDebug(BCLog::NET, "Not serving modern block to legacy-protocol peer=%d\n", pfrom.GetId());
+            return;
+        }
         // Legacy-codec blocks are served in their historical encoding. A
         // marker-modern block keeps stock witness semantics: MSG_BLOCK
         // strips witnesses, MSG_WITNESS_BLOCK carries them.
@@ -2552,7 +2587,7 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
                 // Thus, the protocol spec specified allows for us to provide duplicate txn here,
                 // however we MUST always provide at least what the remote peer needs
                 for (const auto& [tx_idx, _] : merkleBlock.vMatchedTxn)
-                    MakeAndPushMessage(pfrom, NetMsgType::TX, (UsesLegacyWireTransactions(pfrom) ? legacy::TX_LEGACY : TX_NO_WITNESS)(*pblock->vtx[tx_idx]));
+                    MakeAndPushMessage(pfrom, NetMsgType::TX, (UsesLegacyWireTransactions(peer) ? legacy::TX_LEGACY : TX_NO_WITNESS)(*pblock->vtx[tx_idx]));
             }
             // else
             // no response
@@ -2651,7 +2686,7 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
             // that negotiated the legacy protocol gets the historical
             // encoding.
             const TransactionSerParams& tx_ser{
-                UsesLegacyWireTransactions(pfrom) ? legacy::TX_LEGACY :
+                UsesLegacyWireTransactions(peer) ? legacy::TX_LEGACY :
                 inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS};
             MakeAndPushMessage(pfrom, NetMsgType::TX, tx_ser(*tx));
             m_mempool.RemoveUnbroadcastTx(tx->GetHash());
@@ -2698,7 +2733,9 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
 uint32_t PeerManagerImpl::GetFetchFlags(const Peer& peer) const
 {
     uint32_t nFetchFlags = 0;
-    if (!m_chainparams.GetConsensus().legacy_b3coin && CanServeWitnesses(peer)) {
+    // Witness relay is a peer capability: only the historical protocol
+    // lacks it, never the chain as a whole.
+    if (!peer.m_legacy_protocol && CanServeWitnesses(peer)) {
         nFetchFlags |= MSG_WITNESS_FLAG;
     }
     return nFetchFlags;
@@ -2937,7 +2974,7 @@ bool PeerManagerImpl::IsAncestorOfBestHeaderOrTip(const CBlockIndex* header)
 
 bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer)
 {
-    if (m_chainparams.GetConsensus().legacy_b3coin) {
+    if (WITH_LOCK(cs_main, return IsLegacyPhase()) && peer.m_legacy_protocol) {
         // A legacy B3Coin header cannot establish whether it meets a PoW
         // target or contains a valid stake kernel. Retain the old peer's
         // getblocks inventory and validate full blocks sequentially, with
@@ -3149,9 +3186,11 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
         return;
     }
 
-    if (m_chainparams.GetConsensus().legacy_b3coin) {
-        // Do not add unvalidated hybrid headers to the block index. They must
-        // arrive as complete blocks so PoW or the stake kernel can be checked.
+    if (WITH_LOCK(cs_main, return IsLegacyPhase()) || peer.m_legacy_protocol) {
+        // During the legacy phase — and always from a legacy-protocol peer —
+        // header-only announcements describe unvalidatable hybrid headers.
+        // They must arrive as complete blocks so PoW or the stake kernel can
+        // be checked. Modern peers regain headers sync after the boundary.
         LogDebug(BCLog::NET, "Ignoring header-only legacy B3Coin announcement from peer=%d\n", pfrom.GetId());
         return;
     }
@@ -3794,7 +3833,22 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // messages are only ever added but cannot replace existing ones.
             m_addrman.SetServices(pfrom.addr, nServices);
         }
-        if (pfrom.ExpectServicesFromConn() && !HasAllDesirableServiceFlags(nServices))
+        // Classify the peer's protocol capability from its advertised
+        // version before judging its services: the historical B3Coin client
+        // family used 80000..80008, while modern B3 peers use Core-line
+        // versions. The capability is a property of this connection only —
+        // it does not describe the chain or any block's era.
+        const bool legacy_protocol_peer{m_chainparams.GetConsensus().legacy_b3coin &&
+                                        nVersion >= 80'000 &&
+                                        nVersion <= legacy::P2P_PROTOCOL_VERSION};
+        peer.m_legacy_protocol = legacy_protocol_peer;
+
+        // A legacy-protocol peer can never offer modern service bits such
+        // as NODE_WITNESS; it only needs to serve the network.
+        const bool acceptable_services{legacy_protocol_peer
+                                           ? (nServices & NODE_NETWORK) != 0
+                                           : HasAllDesirableServiceFlags(nServices)};
+        if (pfrom.ExpectServicesFromConn() && !acceptable_services)
         {
             LogDebug(BCLog::NET, "peer does not offer the expected services (%08x offered, %08x expected), %s\n",
                      nServices,
@@ -3848,17 +3902,18 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             PushNodeVersion(pfrom, peer);
         }
 
-        // The old B3Coin protocol used its own version sequence. Although a
-        // legacy peer advertises 80008, it does not implement modern Core
-        // extensions keyed off the 70012+ range. Keep its negotiated feature
-        // set in the last mutually understood range.
-        const int greatest_common_version = m_chainparams.GetConsensus().legacy_b3coin
+        // A legacy peer does not implement modern Core extensions keyed off
+        // the 70012+ range. Keep its negotiated feature set in the last
+        // mutually understood range; modern peers negotiate normally.
+        const int greatest_common_version = legacy_protocol_peer
             ? std::min(nVersion, legacy::P2P_COMPATIBILITY_VERSION)
             : std::min(nVersion, PROTOCOL_VERSION);
         pfrom.SetCommonVersion(greatest_common_version);
         pfrom.nVersion = nVersion;
 
-        pfrom.m_has_all_wanted_services = HasAllDesirableServiceFlags(nServices);
+        pfrom.m_has_all_wanted_services = legacy_protocol_peer
+                                              ? (nServices & NODE_NETWORK) != 0
+                                              : HasAllDesirableServiceFlags(nServices);
         peer.m_their_services = nServices;
         pfrom.SetAddrLocal(addrMe);
         {
@@ -4496,7 +4551,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // that we INVed to the peer earlier.
             if (vInv.size() == 1 && vInv[0].IsMsgTx() && vInv[0].hash == pushed_tx->GetHash().ToUint256()) {
 
-                MakeAndPushMessage(pfrom, NetMsgType::TX, (UsesLegacyWireTransactions(pfrom) ? legacy::TX_LEGACY : TX_WITH_WITNESS)(*pushed_tx));
+                MakeAndPushMessage(pfrom, NetMsgType::TX, (UsesLegacyWireTransactions(peer) ? legacy::TX_LEGACY : TX_WITH_WITNESS)(*pushed_tx));
 
                 peer.m_ping_queued = true; // Ensure a ping will be sent: mimic a request via RPC.
                 MaybeSendPing(pfrom, peer, GetTime<std::chrono::microseconds>());
@@ -4736,12 +4791,21 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         if (m_chainman.IsInitialBlockDownload()) return;
 
         CTransactionRef ptx;
-        if (UsesLegacyWireTransactions(pfrom)) {
+        if (UsesLegacyWireTransactions(peer)) {
             // This peer negotiated the legacy protocol and relays the
             // historical transaction encoding.
             vRecv >> legacy::TX_LEGACY(ptx);
         } else {
             vRecv >> TX_WITH_WITNESS(ptx);
+        }
+
+        // After activation the mempool is modern-only: a legacy-format
+        // standalone transaction is never admitted once the tip has crossed
+        // the finalized boundary.
+        if (ptx->IsLegacyEncoded() && !WITH_LOCK(cs_main, return IsLegacyPhase())) {
+            LogDebug(BCLog::NET, "Ignoring legacy-encoded transaction %s outside the legacy phase, peer=%d\n",
+                     ptx->GetHash().ToString(), pfrom.GetId());
+            return;
         }
 
         const Txid& txid = ptx->GetHash();
@@ -4818,8 +4882,11 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             return;
         }
 
-        if (m_chainparams.GetConsensus().legacy_b3coin) {
-            LogDebug(BCLog::NET, "Ignoring compact block on legacy B3Coin chain from peer=%d\n", pfrom.GetId());
+        if (WITH_LOCK(cs_main, return IsLegacyPhase())) {
+            // Hybrid legacy blocks cannot be safely reconstructed from
+            // compact announcements; compact blocks resume after the
+            // boundary.
+            LogDebug(BCLog::NET, "Ignoring compact block during the legacy B3Coin phase, peer=%d\n", pfrom.GetId());
             return;
         }
 
@@ -6211,12 +6278,13 @@ bool PeerManagerImpl::SendMessages(CNode& node)
             }
         }
 
-        if (m_chainparams.GetConsensus().legacy_b3coin && CanServeBlocks(peer) &&
+        if (IsLegacyPhase() && peer.m_legacy_protocol && CanServeBlocks(peer) &&
             !m_chainman.m_blockman.LoadingBlocks() && sync_blocks_and_headers_from_peer) {
             // Hybrid legacy headers are not independently valid, so avoid the
             // headers-sync state machine and advance only after a full block.
             // Old peers retain a per-connection inventory-known set, so only
-            // one peer may own this ordered download at a time.
+            // one legacy-protocol peer may own this ordered download at a
+            // time; the historical window is never duplicated across peers.
             if (m_legacy_sync_peer == -1) {
                 m_legacy_sync_peer = node.GetId();
                 LogDebug(BCLog::NET, "Selected peer=%d for legacy B3Coin block sync\n", node.GetId());
@@ -6266,7 +6334,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
             // add all to the inv queue.
             LOCK(peer.m_block_inv_mutex);
             std::vector<CBlock> vHeaders;
-            bool fRevertToInv = (m_chainparams.GetConsensus().legacy_b3coin ||
+            bool fRevertToInv = (IsLegacyPhase() || peer.m_legacy_protocol ||
                                  (!peer.m_prefers_headers &&
                                  (!state.m_requested_hb_cmpctblocks || peer.m_blocks_for_headers_relay.size() > 1)) ||
                                  peer.m_blocks_for_headers_relay.size() > MAX_BLOCKS_TO_ANNOUNCE);
