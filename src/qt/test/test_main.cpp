@@ -10,6 +10,7 @@
 #include <qt/guiconstants.h>
 #include <qt/test/apptests.h>
 #include <qt/test/b3shelltests.h>
+#include <qt/test/b3splashtests.h>
 #include <qt/test/optiontests.h>
 #include <qt/test/rpcnestedtests.h>
 #include <qt/test/uritests.h>
@@ -85,6 +86,9 @@ int main(int argc, char* argv[])
 
         B3ShellTests b3_shell_tests;
         num_test_failures += QTest::qExec(&b3_shell_tests);
+
+        B3SplashTests b3_splash_tests(app.node());
+        num_test_failures += QTest::qExec(&b3_splash_tests);
 
 #ifdef ENABLE_WALLET
         B3DashboardTests b3_dashboard_tests;

@@ -5,9 +5,17 @@
 #ifndef BITCOIN_QT_SPLASHSCREEN_H
 #define BITCOIN_QT_SPLASHSCREEN_H
 
+#include <QElapsedTimer>
+#include <QPointF>
 #include <QWidget>
 
 #include <memory>
+#include <utility>
+#include <vector>
+
+QT_BEGIN_NAMESPACE
+class QTimer;
+QT_END_NAMESPACE
 
 class NetworkStyle;
 
@@ -32,6 +40,10 @@ public:
     ~SplashScreen();
     void setNode(interfaces::Node& node);
 
+    //! Whether the mesh animation timer is running (false under reduced
+    //! motion, where a complete static frame is painted instead).
+    bool animationRunning() const;
+
 protected:
     void paintEvent(QPaintEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
@@ -54,10 +66,36 @@ private:
     /** Initiate shutdown */
     void shutdown();
 
+    /** Build the static background (title, version, copyright, network). */
+    void buildBackground(const NetworkStyle* networkStyle);
+    /** Deterministic mesh layout (no randomness at runtime). */
+    void buildMesh();
+    /** Advance the animation clock; adjusts the frame rate after the
+     *  intro settles into the subtle idle pulse. */
+    void animationTick();
+    /** 0..1 progress of one animation phase at elapsed time `now_ms`. */
+    static qreal phaseProgress(qint64 now_ms, int start_ms, int duration_ms);
+
+    // A mesh point drifting from a scattered start toward its place in
+    // the converged mesh around the B3 mark.
+    struct MeshNode {
+        QPointF from;     // normalized [0..1] start position
+        QPointF to;       // normalized [0..1] final position
+        int fade_start_ms;
+    };
+
     QPixmap pixmap;
+    QPixmap m_mark;
     QString curMessage;
     QColor curColor;
     int curAlignment{0};
+
+    std::vector<MeshNode> m_nodes;
+    std::vector<std::pair<int, int>> m_edges;
+    QTimer* m_anim_timer{nullptr};
+    QElapsedTimer m_clock;
+    bool m_reduced_motion{false};
+    bool m_idle_rate{false};
 
     interfaces::Node* m_node = nullptr;
     bool m_shutdown = false;

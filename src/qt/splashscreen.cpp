@@ -11,127 +11,188 @@
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
+#include <qt/b3theme.h>
 #include <qt/guiutil.h>
 #include <qt/networkstyle.h>
 #include <qt/walletmodel.h>
 #include <util/translation.h>
 
+#include <algorithm>
+#include <cmath>
 #include <functional>
+#include <iterator>
 
 #include <QApplication>
 #include <QCloseEvent>
 #include <QPainter>
-#include <QRadialGradient>
 #include <QScreen>
+#include <QTimer>
 
+namespace {
+// Animation timeline (milliseconds since show).
+constexpr int kNodesStartMs{150};
+constexpr int kNodeFadeMs{500};
+constexpr int kNodeStaggerMs{60};
+constexpr int kEdgesStartMs{700};
+constexpr int kEdgeFadeMs{900};
+constexpr int kMarkStartMs{1400};
+constexpr int kMarkFadeMs{600};
+constexpr int kIntroEndMs{2200};
+// Subtle idle pulse: low frequency, small amplitude, low frame rate.
+constexpr double kPulseHz{0.25};
+constexpr double kPulseAmplitude{0.05};
+constexpr int kIntroFrameMs{33};
+constexpr int kIdleFrameMs{100};
+
+constexpr QSize kSplashSize{480, 320};
+constexpr QPointF kMeshCenter{0.5, 0.42};
+} // namespace
 
 SplashScreen::SplashScreen(const NetworkStyle* networkStyle)
     : QWidget()
 {
-    // set reference point, paddings
-    int paddingRight            = 50;
-    int paddingTop              = 50;
-    int titleVersionVSpace      = 17;
-    int titleCopyrightVSpace    = 40;
+    m_reduced_motion = B3Theme::reducedMotion();
 
-    float fontFactor            = 1.0;
-    float devicePixelRatio      = 1.0;
-    devicePixelRatio = static_cast<QGuiApplication*>(QCoreApplication::instance())->devicePixelRatio();
+    buildBackground(networkStyle);
+    buildMesh();
 
-    // define text to place
-    QString titleText       = CLIENT_NAME;
-    QString versionText     = QString("Version %1").arg(QString::fromStdString(FormatFullVersion()));
-    QString copyrightText   = QString::fromUtf8(CopyrightHolders(strprintf("\xc2\xA9 %u-%u ", 2009, COPYRIGHT_YEAR)).c_str());
-    const QString& titleAddText    = networkStyle->getTitleAddText();
-
-    QString font            = QApplication::font().toString();
-
-    // create a bitmap according to device pixelratio
-    QSize splashSize(480*devicePixelRatio,320*devicePixelRatio);
-    pixmap = QPixmap(splashSize);
-
-    // change to HiDPI if it makes sense
-    pixmap.setDevicePixelRatio(devicePixelRatio);
-
-    QPainter pixPaint(&pixmap);
-    pixPaint.setPen(QColor(100,100,100));
-
-    // draw a slightly radial gradient
-    QRadialGradient gradient(QPoint(0,0), splashSize.width()/devicePixelRatio);
-    gradient.setColorAt(0, Qt::white);
-    gradient.setColorAt(1, QColor(247,247,247));
-    QRect rGradient(QPoint(0,0), splashSize);
-    pixPaint.fillRect(rGradient, gradient);
-
-    // draw the bitcoin icon, expected size of PNG: 1024x1024
-    QRect rectIcon(QPoint(-150,-122), QSize(430,430));
-
-    const QSize requiredSize(1024,1024);
-    QPixmap icon(networkStyle->getAppIcon().pixmap(requiredSize));
-
-    pixPaint.drawPixmap(rectIcon, icon);
-
-    // check font size and drawing with
-    pixPaint.setFont(QFont(font, 33*fontFactor));
-    QFontMetrics fm = pixPaint.fontMetrics();
-    int titleTextWidth = GUIUtil::TextWidth(fm, titleText);
-    if (titleTextWidth > 176) {
-        fontFactor = fontFactor * 176 / titleTextWidth;
-    }
-
-    pixPaint.setFont(QFont(font, 33*fontFactor));
-    fm = pixPaint.fontMetrics();
-    titleTextWidth  = GUIUtil::TextWidth(fm, titleText);
-    pixPaint.drawText(pixmap.width()/devicePixelRatio-titleTextWidth-paddingRight,paddingTop,titleText);
-
-    pixPaint.setFont(QFont(font, 15*fontFactor));
-
-    // if the version string is too long, reduce size
-    fm = pixPaint.fontMetrics();
-    int versionTextWidth  = GUIUtil::TextWidth(fm, versionText);
-    if(versionTextWidth > titleTextWidth+paddingRight-10) {
-        pixPaint.setFont(QFont(font, 10*fontFactor));
-        titleVersionVSpace -= 5;
-    }
-    pixPaint.drawText(pixmap.width()/devicePixelRatio-titleTextWidth-paddingRight+2,paddingTop+titleVersionVSpace,versionText);
-
-    // draw copyright stuff
-    {
-        pixPaint.setFont(QFont(font, 10*fontFactor));
-        const int x = pixmap.width()/devicePixelRatio-titleTextWidth-paddingRight;
-        const int y = paddingTop+titleCopyrightVSpace;
-        QRect copyrightRect(x, y, pixmap.width() - x - paddingRight, pixmap.height() - y);
-        pixPaint.drawText(copyrightRect, Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, copyrightText);
-    }
-
-    // draw additional text if special network
-    if(!titleAddText.isEmpty()) {
-        QFont boldFont = QFont(font, 10*fontFactor);
-        boldFont.setWeight(QFont::Bold);
-        pixPaint.setFont(boldFont);
-        fm = pixPaint.fontMetrics();
-        int titleAddTextWidth  = GUIUtil::TextWidth(fm, titleAddText);
-        pixPaint.drawText(pixmap.width()/devicePixelRatio-titleAddTextWidth-10,15,titleAddText);
-    }
-
-    pixPaint.end();
+    // The approved B3 mark that the mesh converges around; the artwork
+    // itself stays replaceable in the Qt resource system via NetworkStyle.
+    const qreal dpr = devicePixelRatioF();
+    m_mark = networkStyle->getAppIcon().pixmap(QSize(96 * dpr, 96 * dpr));
+    m_mark.setDevicePixelRatio(dpr);
 
     // Set window title
-    setWindowTitle(titleText + " " + titleAddText);
+    setWindowTitle(QString(CLIENT_NAME) + " " + networkStyle->getTitleAddText());
 
     // Resize window and move to center of desktop, disallow resizing
-    QRect r(QPoint(), QSize(pixmap.size().width()/devicePixelRatio,pixmap.size().height()/devicePixelRatio));
+    QRect r(QPoint(), kSplashSize);
     resize(r.size());
     setFixedSize(r.size());
     move(QGuiApplication::primaryScreen()->geometry().center() - r.center());
 
     installEventFilter(this);
 
+    if (!m_reduced_motion) {
+        m_clock.start();
+        m_anim_timer = new QTimer(this);
+        connect(m_anim_timer, &QTimer::timeout, this, [this] { animationTick(); });
+        m_anim_timer->start(kIntroFrameMs);
+    }
+
     GUIUtil::handleCloseWindowShortcut(this);
+}
+
+void SplashScreen::buildBackground(const NetworkStyle* networkStyle)
+{
+    const QString versionText = QString("Version %1").arg(QString::fromStdString(FormatFullVersion()));
+    const QString copyrightText = QString::fromUtf8(CopyrightHolders(strprintf("\xc2\xA9 %u-%u ", 2009, COPYRIGHT_YEAR)).c_str());
+    const QString& titleAddText = networkStyle->getTitleAddText();
+    const QString font = QApplication::font().toString();
+
+    const qreal dpr = static_cast<QGuiApplication*>(QCoreApplication::instance())->devicePixelRatio();
+    pixmap = QPixmap(kSplashSize * dpr);
+    pixmap.setDevicePixelRatio(dpr);
+
+    QPainter pixPaint(&pixmap);
+    pixPaint.fillRect(QRect(QPoint(0, 0), kSplashSize), B3Theme::kBackground);
+
+    // Version + copyright, bottom left, quiet.
+    pixPaint.setPen(B3Theme::kTextMuted);
+    pixPaint.setFont(QFont(font, 9));
+    pixPaint.drawText(QRect(16, kSplashSize.height() - 64, kSplashSize.width() - 32, 24),
+                      Qt::AlignLeft | Qt::AlignBottom, versionText);
+    pixPaint.drawText(QRect(16, kSplashSize.height() - 44, kSplashSize.width() - 32, 40),
+                      Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, copyrightText);
+
+    // Unmistakable network badge for non-mainnet chains, top right.
+    if (!titleAddText.isEmpty()) {
+        const bool regtest = titleAddText.contains("regtest", Qt::CaseInsensitive);
+        const QColor badge = regtest ? B3Theme::kRegtest : B3Theme::kWarning;
+        QFont boldFont(font, 11);
+        boldFont.setWeight(QFont::Bold);
+        pixPaint.setFont(boldFont);
+        QString network = titleAddText.toUpper();
+        network.remove('[');
+        network.remove(']');
+        const QFontMetrics fm(boldFont);
+        const int w = GUIUtil::TextWidth(fm, network) + 20;
+        const QRect badgeRect(kSplashSize.width() - w - 14, 14, w, fm.height() + 8);
+        pixPaint.setPen(Qt::NoPen);
+        pixPaint.setBrush(badge);
+        pixPaint.setRenderHint(QPainter::Antialiasing);
+        pixPaint.drawRoundedRect(badgeRect, 6, 6);
+        pixPaint.setPen(B3Theme::kBackground);
+        pixPaint.drawText(badgeRect, Qt::AlignCenter, network);
+    }
+
+    pixPaint.end();
+}
+
+void SplashScreen::buildMesh()
+{
+    // Deterministic layout: scattered start positions drift into two
+    // rings converging around the mark. No runtime randomness, so every
+    // start looks identical and tests are reproducible.
+    static constexpr struct { double fx, fy; } kFrom[] = {
+        {0.05, 0.10}, {0.92, 0.06}, {0.15, 0.85}, {0.85, 0.90}, {0.50, 0.02},
+        {0.03, 0.50}, {0.97, 0.45}, {0.30, 0.95}, {0.70, 0.03}, {0.10, 0.30},
+        {0.90, 0.70}, {0.40, 0.08}, {0.60, 0.95}, {0.05, 0.70}, {0.95, 0.25},
+        {0.25, 0.05}, {0.75, 0.92}, {0.50, 0.98},
+    };
+    const int n = static_cast<int>(std::size(kFrom));
+    m_nodes.clear();
+    m_nodes.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        const bool inner = (i % 3 == 0);
+        const double radius = inner ? 0.16 : 0.26;
+        const double angle = (2.0 * M_PI * i) / n;
+        MeshNode node;
+        node.from = QPointF(kFrom[i].fx, kFrom[i].fy);
+        node.to = QPointF(kMeshCenter.x() + radius * std::cos(angle),
+                          kMeshCenter.y() + radius * std::sin(angle) * 0.85);
+        node.fade_start_ms = kNodesStartMs + i * kNodeStaggerMs;
+        m_nodes.push_back(node);
+    }
+
+    // Connect each node to its ring neighbours and a few spokes across.
+    m_edges.clear();
+    for (int i = 0; i < n; ++i) {
+        m_edges.emplace_back(i, (i + 1) % n);
+        if (i % 3 == 0) m_edges.emplace_back(i, (i + n / 2) % n);
+    }
+}
+
+qreal SplashScreen::phaseProgress(qint64 now_ms, int start_ms, int duration_ms)
+{
+    if (now_ms <= start_ms) return 0.0;
+    if (now_ms >= start_ms + duration_ms) return 1.0;
+    const qreal linear = static_cast<qreal>(now_ms - start_ms) / duration_ms;
+    // Ease in/out for calm motion.
+    return linear * linear * (3.0 - 2.0 * linear);
+}
+
+bool SplashScreen::animationRunning() const
+{
+    return m_anim_timer && m_anim_timer->isActive();
+}
+
+void SplashScreen::animationTick()
+{
+    // After the intro, drop to a low idle frame rate: the remaining
+    // motion is only the subtle mesh pulse.
+    if (!m_idle_rate && m_clock.elapsed() > kIntroEndMs) {
+        m_idle_rate = true;
+        m_anim_timer->setInterval(kIdleFrameMs);
+    }
+    update();
 }
 
 SplashScreen::~SplashScreen()
 {
+    // Stop the animation before teardown so no timer fires into a
+    // partially-destroyed widget.
+    if (m_anim_timer) m_anim_timer->stop();
     if (m_node) unsubscribeFromCoreSignals();
 }
 
@@ -165,7 +226,7 @@ static void InitMessage(SplashScreen *splash, const std::string &message)
         Qt::QueuedConnection,
         Q_ARG(QString, QString::fromStdString(message)),
         Q_ARG(int, Qt::AlignBottom|Qt::AlignHCenter),
-        Q_ARG(QColor, QColor(55,55,55)));
+        Q_ARG(QColor, B3Theme::kTextSecondary));
     assert(invoked);
 }
 
@@ -226,7 +287,68 @@ void SplashScreen::paintEvent(QPaintEvent *event)
 {
     QPainter painter(this);
     painter.drawPixmap(0, 0, pixmap);
+    painter.setRenderHint(QPainter::Antialiasing);
+
+    // Under reduced motion the timeline is pinned past its end: a
+    // complete, static mesh frame with no pulse.
+    const qint64 now = m_reduced_motion ? kIntroEndMs + 1 : m_clock.elapsed();
+    const double pulse = (m_reduced_motion || now < kIntroEndMs)
+        ? 0.0
+        : kPulseAmplitude * std::sin(2.0 * M_PI * kPulseHz * (now - kIntroEndMs) / 1000.0);
+
+    const qreal w = width();
+    const qreal h = height();
+    auto nodePos = [&](const MeshNode& node) {
+        const qreal drift = phaseProgress(now, node.fade_start_ms, kNodeFadeMs + 500);
+        const QPointF p = node.from + (node.to - node.from) * drift;
+        return QPointF(p.x() * w, p.y() * h);
+    };
+
+    // Mesh edges.
+    const qreal edge_alpha = phaseProgress(now, kEdgesStartMs, kEdgeFadeMs) * (0.5 + pulse);
+    if (edge_alpha > 0.0) {
+        QColor line = B3Theme::kAccentMuted;
+        line.setAlphaF(std::clamp(edge_alpha, 0.0, 1.0));
+        painter.setPen(QPen(line, 1.0));
+        for (const auto& [a, b] : m_edges) {
+            painter.drawLine(nodePos(m_nodes[a]), nodePos(m_nodes[b]));
+        }
+    }
+
+    // Mesh nodes.
+    painter.setPen(Qt::NoPen);
+    for (const MeshNode& node : m_nodes) {
+        const qreal alpha = phaseProgress(now, node.fade_start_ms, kNodeFadeMs) * (0.9 + pulse);
+        if (alpha <= 0.0) continue;
+        QColor dot = B3Theme::kAccent;
+        dot.setAlphaF(std::clamp(alpha, 0.0, 1.0));
+        painter.setBrush(dot);
+        painter.drawEllipse(nodePos(node), 2.2, 2.2);
+    }
+
+    // The B3 mark and the B3FlowMesh wordmark fade in as the mesh
+    // converges.
+    const qreal mark_alpha = phaseProgress(now, kMarkStartMs, kMarkFadeMs);
+    if (mark_alpha > 0.0) {
+        painter.setOpacity(mark_alpha);
+        const QPointF center(kMeshCenter.x() * w, kMeshCenter.y() * h);
+        const QSizeF markSize = QSizeF(m_mark.size()) / m_mark.devicePixelRatio();
+        painter.drawPixmap(QPointF(center.x() - markSize.width() / 2.0,
+                                   center.y() - markSize.height() / 2.0),
+                           m_mark);
+        QFont brandFont = font();
+        brandFont.setPointSize(15);
+        brandFont.setWeight(QFont::DemiBold);
+        painter.setFont(brandFont);
+        painter.setPen(B3Theme::kTextPrimary);
+        painter.drawText(QRectF(0, center.y() + markSize.height() / 2.0 + 6, w, 28),
+                         Qt::AlignHCenter | Qt::AlignTop, QStringLiteral("B3FlowMesh"));
+        painter.setOpacity(1.0);
+    }
+
+    // Real initialization messages from the node.
     QRect r = rect().adjusted(5, 5, -5, -5);
+    painter.setFont(QFont(font().family(), 9));
     painter.setPen(curColor);
     painter.drawText(r, curAlignment, curMessage);
 }

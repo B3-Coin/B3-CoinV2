@@ -18,10 +18,10 @@ namespace B3Theme {
 
 bool reducedMotion()
 {
+    // An explicit user/test setting wins over the platform heuristic.
     const QByteArray env{qgetenv("B3_REDUCED_MOTION")};
     if (env == "1" || env == "true") return true;
-#if defined(QT_QPA_PLATFORM)
-#endif
+    if (env == "0" || env == "false") return false;
     // Offscreen/headless test platforms should not animate.
     if (qgetenv("QT_QPA_PLATFORM") == "offscreen") return true;
     return false;

@@ -7,6 +7,7 @@ set(CMAKE_AUTOMOC_MOC_OPTIONS "-p${CMAKE_CURRENT_SOURCE_DIR}")
 add_executable(test_bitcoin-qt
   apptests.cpp
   b3shelltests.cpp
+  b3splashtests.cpp
   optiontests.cpp
   rpcnestedtests.cpp
   test_main.cpp
