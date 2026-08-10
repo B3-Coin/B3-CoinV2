@@ -33,6 +33,7 @@
 #include <kernel/warning.h>
 #include <legacy/codec.h>
 #include <legacy/consensus.h>
+#include <modern/pos.h>
 #include <logging/timer.h>
 #include <node/blockstorage.h>
 #include <node/utxo_snapshot.h>
@@ -2447,6 +2448,17 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         return true;
     }
 
+    // Belt-and-braces on top of the contextual codec check: a marker-modern
+    // block must never enter legacy stake-kernel validation, and a
+    // legacy-codec block must never be judged by modern rules.
+    if (params.GetConsensus().legacy_b3coin &&
+        modern::SelectStakeRules(block.nVersion,
+                                 use_legacy_b3coin ? Consensus::B3Era::LEGACY : Consensus::B3Era::MODERN) ==
+            modern::StakeRules::MISMATCH) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-pos-codec",
+                             "block codec does not match the stake rules of its era");
+    }
+
     std::optional<legacy::StakeProof> legacy_stake_proof;
     std::optional<uint64_t> legacy_coin_age;
     if (use_legacy_b3coin && block.IsProofOfStake()) {
@@ -2801,6 +2813,15 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cs-amount",
                               strprintf("coinstake pays too much (actual=%d vs limit=%d)", legacy_stake_reward, allowed_reward));
             }
+        }
+    } else if (params.GetConsensus().legacy_b3coin) {
+        // MODERN-era B3 block: dispatch by connected era to the modern PoS
+        // interface only — never the legacy kernel, modifiers, rewards or
+        // difficulty, and no stock Bitcoin subsidy rule either. Until an
+        // approved modern rule set is installed this rejects every block
+        // (modern/pos.h documents the missing rule set precisely).
+        if (state.IsValid()) {
+            (void)modern::CheckModernStake(block, *pindex->pprev, view, state);
         }
     } else {
         const CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, params.GetConsensus());
