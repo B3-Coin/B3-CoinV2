@@ -133,11 +133,15 @@ public:
         // (ContextualCheckBlockHeader); this only selects the raw codec.
         if (s.template GetParams<TransactionSerParams>().legacy_time) {
             if (Consensus::HasB3BlockCodecV2(obj.nVersion)) {
+                // Reused objects must not leak a previous legacy block's
+                // trailing signature into a marker-modern block.
+                SER_READ(obj, obj.vchBlockSig.clear());
                 READWRITE(TX_WITH_WITNESS(obj.vtx));
             } else {
                 READWRITE(obj.vtx, obj.vchBlockSig);
             }
         } else {
+            SER_READ(obj, obj.vchBlockSig.clear());
             READWRITE(obj.vtx);
         }
     }

@@ -396,7 +396,9 @@ public:
         block.nTime = nTime;
         block.nBits = nBits;
         block.nNonce = nNonce;
-        return block.GetHash(consensus_params, nHeight);
+        // Marker-derived identity, matching AddToBlockIndex so index keys
+        // are stable across restarts.
+        return block.GetMarkerHash(consensus_params);
     }
 
     uint256 GetBlockHash() = delete;

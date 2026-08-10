@@ -14,6 +14,7 @@
 #include <chainparams.h>
 #include <common/bloom.h>
 #include <consensus/amount.h>
+#include <consensus/block_codec.h>
 #include <consensus/era.h>
 #include <consensus/params.h>
 #include <consensus/validation.h>
@@ -2514,17 +2515,20 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
         pblock = pblockRead;
     }
     if (pblock) {
-        // On the legacy chain every peer speaks the historical block
-        // encoding; the codec choice is explicit from the chain context.
+        // Legacy-codec blocks are served in their historical encoding. A
+        // marker-modern block keeps stock witness semantics: MSG_BLOCK
+        // strips witnesses, MSG_WITNESS_BLOCK carries them.
         const bool legacy_wire{m_chainparams.GetConsensus().legacy_b3coin};
+        const bool legacy_codec_block{legacy_wire &&
+                                      !Consensus::HasB3BlockCodecV2(pblock->nVersion)};
         if (inv.IsMsgBlk()) {
-            if (legacy_wire) {
+            if (legacy_codec_block) {
                 MakeAndPushMessage(pfrom, NetMsgType::BLOCK, legacy::TX_LEGACY(*pblock));
             } else {
                 MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_NO_WITNESS(*pblock));
             }
         } else if (inv.IsMsgWitnessBlk()) {
-            if (legacy_wire) {
+            if (legacy_codec_block) {
                 MakeAndPushMessage(pfrom, NetMsgType::BLOCK, legacy::TX_LEGACY(*pblock));
             } else {
                 MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_WITH_WITNESS(*pblock));
@@ -2556,7 +2560,8 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
             if (legacy_wire) {
                 // Hybrid legacy headers do not prove whether the block is PoW
                 // or PoS, so BIP152's header-first relay is not safe here.
-                MakeAndPushMessage(pfrom, NetMsgType::BLOCK, legacy::TX_LEGACY(*pblock));
+                MakeAndPushMessage(pfrom, NetMsgType::BLOCK,
+                                   (legacy_codec_block ? legacy::TX_LEGACY : TX_WITH_WITNESS)(*pblock));
             } else {
                 // If a peer is asking for old blocks, we're almost guaranteed
                 // they won't have a useful mempool to match against a compact block,
@@ -5142,12 +5147,11 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         // Switching sync itself off at that boundary is future modern-sync
         // work (see doc/design/b3-era-architecture.md).
         const bool legacy_sync{m_chainparams.GetConsensus().legacy_b3coin};
-        // With a known parent the height selects the hash domain; for an
-        // unknown-parent block the codec marker does — never an assumed
-        // height of zero (doc/design/b3-architecture-contract.md).
-        const uint256 hash{prev_block ?
-            pblock->GetHash(m_chainparams.GetConsensus(), prev_block->nHeight + 1) :
-            pblock->GetMarkerHash(m_chainparams.GetConsensus())};
+        // Identity always comes from the codec marker — never an assumed
+        // height (doc/design/b3-architecture-contract.md). The connected
+        // height later decides only whether the codec is legal, so the
+        // identity is unchanged once the parent becomes known.
+        const uint256 hash{pblock->GetMarkerHash(m_chainparams.GetConsensus())};
         bool legacy_block_requested{false};
         bool legacy_block_is_next{false};
         if (legacy_sync) {

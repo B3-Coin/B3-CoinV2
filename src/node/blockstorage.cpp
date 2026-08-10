@@ -6,6 +6,7 @@
 
 #include <arith_uint256.h>
 #include <chain.h>
+#include <consensus/block_codec.h>
 #include <consensus/era.h>
 #include <consensus/params.h>
 #include <legacy/codec.h>
@@ -238,10 +239,11 @@ CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockInde
 {
     AssertLockHeld(cs_main);
 
-    const BlockMap::iterator previous{m_block_index.find(block.hashPrevBlock)};
-    const int height{previous == m_block_index.end() ? 0 : previous->second.nHeight + 1};
     const Consensus::Params& consensus_params{GetConsensus()};
-    const uint256 block_hash{block.GetHash(consensus_params, height)};
+    // Identity comes from the codec marker, independent of whether the
+    // parent (and therefore the height) is known yet; height only decides
+    // codec legality in ContextualCheckBlockHeader.
+    const uint256 block_hash{block.GetMarkerHash(consensus_params)};
     auto [mi, inserted] = m_block_index.try_emplace(block_hash, block);
     if (!inserted) {
         return &mi->second;
@@ -1100,7 +1102,13 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
     // Legacy B3Coin proof-of-stake blocks carry their proof in the coinstake
     // transaction, not the header hash. Their kernel is checked by
     // Chainstate::ConnectBlock after the UTXO view is available.
-    const bool requires_header_pow{(!GetConsensus().legacy_b3coin || block.IsProofOfWork()) && !legacy_genesis};
+    // Marker-modern blocks never take the legacy header-PoW read check; the
+    // modern validation path owns them at connect time.
+    const bool legacy_codec_block{GetConsensus().legacy_b3coin &&
+                                  !Consensus::HasB3BlockCodecV2(block.nVersion)};
+    const bool requires_header_pow{(!GetConsensus().legacy_b3coin ||
+                                    (legacy_codec_block && block.IsProofOfWork())) &&
+                                   !legacy_genesis};
     if (requires_header_pow && !CheckProofOfWork(block_hash, block.nBits, GetConsensus())) {
         LogError("Errors in block header at %s while reading block", pos.ToString());
         return false;

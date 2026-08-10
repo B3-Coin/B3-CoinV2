@@ -17,6 +17,7 @@
 #include <script/script.h>
 #include <streams.h>
 #include <util/strencodings.h>
+#include <validation.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -271,6 +272,36 @@ BOOST_AUTO_TEST_CASE(era_and_codec_combinations_at_the_boundary)
         BOOST_CHECK_EQUAL(Consensus::HasExpectedB3BlockCodec(modern_version, row.height, params),
                           row.modern_codec_allowed);
     }
+}
+
+BOOST_AUTO_TEST_CASE(modern_blocks_reject_trailing_signature_and_clear_stale_state)
+{
+    // A reused block object must not leak the previous legacy block's
+    // trailing signature into a marker-modern block.
+    CBlock reused;
+    DataStream legacy_bytes{ParseHex<std::byte>(LEGACY_BLOCK_HEX)};
+    legacy_bytes >> legacy::TX_LEGACY(reused);
+    BOOST_REQUIRE_EQUAL(reused.vchBlockSig.size(), 4U);
+    DataStream modern_bytes{ParseHex<std::byte>(MODERN_BLOCK_HEX)};
+    modern_bytes >> legacy::TX_LEGACY(reused);
+    BOOST_CHECK(reused.vchBlockSig.empty());
+    BOOST_CHECK_EQUAL(reused.GetMarkerHash(B3Params()).GetHex(), MODERN_BLOCK_HASH);
+
+    // A marker-modern block carrying a legacy trailing signature is invalid
+    // and never enters the legacy checker.
+    CBlock modern{ModernBlockVector()};
+    modern.vchBlockSig = {0x01};
+    BlockValidationState state;
+    BOOST_CHECK(!CheckBlock(modern, state, B3Params(), /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/true));
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-blk-signature");
+
+    // Without the stray signature the same block passes the context-free
+    // stock structural path it is routed to... up to its non-coinbase first
+    // transaction, proving it reached the stock checker, not the legacy one.
+    CBlock clean{ModernBlockVector()};
+    BlockValidationState clean_state;
+    BOOST_CHECK(!CheckBlock(clean, clean_state, B3Params(), /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/true));
+    BOOST_CHECK_EQUAL(clean_state.GetRejectReason(), "bad-cb-missing");
 }
 
 BOOST_AUTO_TEST_CASE(unknown_parent_modern_identity_ignores_guessed_height)

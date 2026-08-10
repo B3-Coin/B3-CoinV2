@@ -4097,7 +4097,12 @@ static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& st
     // A legacy B3Coin header does not reveal whether its full block is PoW or
     // PoS. The full-block legacy path performs the PoW check only for PoW
     // blocks, and validates PoS kernels after the UTXO view is available.
-    if (fCheckPOW && !consensusParams.legacy_b3coin && !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
+    // Only legacy-codec headers take that deferral: a marker-modern header
+    // never enters legacy validation and receives the stock check until the
+    // modern B3 PoS activation task replaces it.
+    const bool legacy_header{consensusParams.legacy_b3coin &&
+                             !Consensus::HasB3BlockCodecV2(block.nVersion)};
+    if (fCheckPOW && !legacy_header && !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
 
     return true;
@@ -4330,8 +4335,18 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
     if (!CheckBlockHeader(block, state, consensusParams, fCheckPOW))
         return false;
 
-    if (consensusParams.legacy_b3coin) {
+    // Only legacy-codec blocks enter the preserved legacy checker (structural
+    // rules, hybrid PoW, trailing block signature). A marker-modern block
+    // takes the stock path below.
+    if (consensusParams.legacy_b3coin && !Consensus::HasB3BlockCodecV2(block.nVersion)) {
         return CheckLegacyBlock(block, state, consensusParams, fCheckPOW, fCheckMerkleRoot);
+    }
+
+    // Modern and non-B3 blocks never carry the legacy trailing block
+    // signature.
+    if (!block.vchBlockSig.empty()) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-signature",
+                             "unexpected legacy block signature");
     }
 
     // Signet only: check block solution
@@ -4683,10 +4698,9 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
 {
     AssertLockHeld(cs_main);
 
-    // Check for duplicate
-    const auto previous{m_blockman.m_block_index.find(block.hashPrevBlock)};
-    const int height{previous == m_blockman.m_block_index.end() ? 0 : previous->second.nHeight + 1};
-    uint256 hash = block.GetHash(GetConsensus(), height);
+    // Check for duplicate. Identity comes from the codec marker so a header
+    // whose parent is not yet known keeps the same identity once it is.
+    const uint256 hash{block.GetMarkerHash(GetConsensus())};
     BlockMap::iterator miSelf{m_blockman.m_block_index.find(hash)};
     if (hash != GetConsensus().hashGenesisBlock) {
         if (miSelf != m_blockman.m_block_index.end()) {
@@ -5021,7 +5035,7 @@ BlockValidationState TestBlockValidity(
     // We don't want ConnectBlock to update the actual chainstate, so create
     // a cache on top of it, along with a dummy block index.
     CBlockIndex index_dummy{block};
-    uint256 block_hash(block.GetHash(chainstate.m_chainman.GetConsensus(), tip->nHeight + 1));
+    uint256 block_hash(block.GetMarkerHash(chainstate.m_chainman.GetConsensus()));
     index_dummy.pprev = tip;
     index_dummy.nHeight = tip->nHeight + 1;
     index_dummy.phashBlock = &block_hash;
@@ -5542,8 +5556,9 @@ void ChainstateManager::LoadExternalBlockFile(
                 {
                     LOCK(cs_main);
                     const CBlockIndex* parent{m_blockman.LookupBlockIndex(header.hashPrevBlock)};
-                    const int height{parent ? parent->nHeight + 1 : 0};
-                    hash = header.GetHash(params.GetConsensus(), height);
+                    // Marker-derived identity: import and reindex must agree
+                    // with the P2P and disk paths without guessing a height.
+                    hash = header.GetMarkerHash(params.GetConsensus());
                     // detect out of order blocks, and store them for later
                     if (hash != params.GetConsensus().hashGenesisBlock && !parent) {
                         LogDebug(BCLog::REINDEX, "%s: Out of order block %s, parent %s not known\n", __func__, hash.ToString(),
@@ -5619,9 +5634,7 @@ void ChainstateManager::LoadExternalBlockFile(
                         std::shared_ptr<CBlock> pblockrecursive = std::make_shared<CBlock>();
                         if (m_blockman.ReadBlock(*pblockrecursive, it->second, {})) {
                             LOCK(cs_main);
-                            const CBlockIndex* parent{m_blockman.LookupBlockIndex(pblockrecursive->hashPrevBlock)};
-                            const int height{parent ? parent->nHeight + 1 : 0};
-                            const uint256 block_hash{pblockrecursive->GetHash(params.GetConsensus(), height)};
+                            const uint256 block_hash{pblockrecursive->GetMarkerHash(params.GetConsensus())};
                             LogDebug(BCLog::REINDEX, "%s: Processing out of order child %s of %s", __func__, block_hash.ToString(), head.ToString());
                             BlockValidationState dummy;
                             if (AcceptBlock(pblockrecursive, dummy, nullptr, true, &it->second, nullptr, true)) {
