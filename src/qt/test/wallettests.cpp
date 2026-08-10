@@ -329,7 +329,7 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
             QCOMPARE(receiveRequestDialog->QObject::findChild<QLabel*>("payment_header")->text(), QString("Payment information"));
             QCOMPARE(receiveRequestDialog->QObject::findChild<QLabel*>("uri_tag")->text(), QString("URI:"));
             QString uri = receiveRequestDialog->QObject::findChild<QLabel*>("uri_content")->text();
-            QCOMPARE(uri.count("bitcoin:"), 2);
+            QCOMPARE(uri.count("b3coin:"), 2);
             QCOMPARE(receiveRequestDialog->QObject::findChild<QLabel*>("address_tag")->text(), QString("Address:"));
             QVERIFY(address.isEmpty());
             address = receiveRequestDialog->QObject::findChild<QLabel*>("address_content")->text();
@@ -337,7 +337,9 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
 
             QCOMPARE(uri.count("amount=0.00000001"), 2);
             QCOMPARE(receiveRequestDialog->QObject::findChild<QLabel*>("amount_tag")->text(), QString("Amount:"));
-            QCOMPARE(receiveRequestDialog->QObject::findChild<QLabel*>("amount_content")->text(), QString::fromStdString("0.00000001 " + CURRENCY_UNIT));
+            // The GUI renders amounts with the Qt display unit ("B3"),
+            // independent of the node's internal CURRENCY_UNIT string.
+            QCOMPARE(receiveRequestDialog->QObject::findChild<QLabel*>("amount_content")->text(), QString("0.00000001 B3"));
 
             QCOMPARE(uri.count("label=TEST_LABEL_1"), 2);
             QCOMPARE(receiveRequestDialog->QObject::findChild<QLabel*>("label_tag")->text(), QString("Label:"));
