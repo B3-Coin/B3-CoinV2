@@ -11,16 +11,16 @@
 #include <legacy/codec.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
+#include <dbwrapper.h>
 #include <script/script.h>
 #include <streams.h>
+#include <test/util/setup_common.h>
 
 #include <boost/test/unit_test.hpp>
 
 #include <map>
 #include <string>
 #include <vector>
-
-BOOST_AUTO_TEST_SUITE(legacy_replay_tests)
 
 namespace {
 
@@ -107,6 +107,8 @@ struct SyntheticChain {
 };
 
 } // namespace
+
+BOOST_AUTO_TEST_SUITE(legacy_replay_tests)
 
 BOOST_AUTO_TEST_CASE(replays_a_synthetic_chain_mechanically)
 {
@@ -303,6 +305,144 @@ BOOST_AUTO_TEST_CASE(respects_the_boundary_and_the_codec)
         resumed.ResumeAt(2, chain.block1.GetLegacyB3Hash());
         BOOST_CHECK_MESSAGE(resumed.ApplyBlock(chain.block2, view, error), error);
         BOOST_CHECK_EQUAL(resumed.NextHeight(), 3);
+    }
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(legacy_replay_persist_tests, BasicTestingSetup)
+
+BOOST_AUTO_TEST_CASE(persists_and_resumes_atomically)
+{
+    const SyntheticChain chain;
+    const fs::path path{m_args.GetDataDirBase() / "replay_persist"};
+    std::string error;
+
+    {
+        legacy::ReplayDB db{DBParams{.path = path, .cache_bytes = 1 << 20}};
+        legacy::PersistentReplay replay{chain.params, 2, {}, db};
+        BOOST_REQUIRE_MESSAGE(replay.Load(error), error);
+        BOOST_CHECK_EQUAL(replay.NextHeight(), 0);
+        BOOST_REQUIRE_MESSAGE(replay.ApplyBlock(chain.genesis, error), error);
+        BOOST_REQUIRE_MESSAGE(replay.ApplyBlock(chain.block1, error), error);
+    } // simulated shutdown
+
+    {
+        legacy::ReplayDB db{DBParams{.path = path, .cache_bytes = 1 << 20}};
+        legacy::PersistentReplay replay{chain.params, 2, {}, db};
+        BOOST_REQUIRE_MESSAGE(replay.Load(error), error);
+        // Restart resumes at exactly the next block.
+        BOOST_CHECK_EQUAL(replay.NextHeight(), 2);
+        BOOST_CHECK_EQUAL(replay.TipHash().GetHex(), chain.block1.GetLegacyB3Hash().GetHex());
+        BOOST_REQUIRE_MESSAGE(replay.ApplyBlock(chain.block2, error), error);
+        BOOST_REQUIRE_MESSAGE(replay.Finish(error), error);
+
+        CCoinsViewCache view{&db};
+        BOOST_CHECK(!view.HaveCoin(COutPoint{chain.genesis_coinbase, 0}));
+        const Coin& stake{view.AccessCoin(COutPoint{chain.coinstake_txid, 1})};
+        BOOST_REQUIRE(!stake.IsSpent());
+        BOOST_CHECK(stake.fCoinStake);
+    }
+
+    {
+        legacy::ReplayDB db{DBParams{.path = path, .cache_bytes = 1 << 20}};
+        legacy::PersistentReplay replay{chain.params, 2, {}, db};
+        BOOST_REQUIRE_MESSAGE(replay.Load(error), error);
+        BOOST_CHECK(replay.Completed());
+        BOOST_CHECK(!replay.ApplyBlock(chain.block2, error));
+        BOOST_CHECK(error.find("completed") != std::string::npos);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(interrupted_block_is_never_considered_applied)
+{
+    const SyntheticChain chain;
+    const fs::path path{m_args.GetDataDirBase() / "replay_interrupt"};
+    std::string error;
+
+    {
+        legacy::ReplayDB db{DBParams{.path = path, .cache_bytes = 1 << 20}};
+        legacy::PersistentReplay replay{chain.params, 2, {}, db};
+        BOOST_REQUIRE_MESSAGE(replay.Load(error), error);
+        BOOST_REQUIRE_MESSAGE(replay.ApplyBlock(chain.genesis, error), error);
+
+        // Simulated interruption mid-block: block 1 is fully processed into
+        // a cache, but the process dies before the atomic commit.
+        legacy::TrustedReplay engine{chain.params, 2, {}};
+        engine.ResumeAt(1, chain.params.hashGenesisBlock);
+        CCoinsViewCache doomed{&db};
+        BOOST_REQUIRE_MESSAGE(engine.ApplyBlock(chain.block1, doomed, error), error);
+        // No Flush(): the in-memory cache dies with the "process".
+    }
+
+    {
+        legacy::ReplayDB db{DBParams{.path = path, .cache_bytes = 1 << 20}};
+        legacy::PersistentReplay replay{chain.params, 2, {}, db};
+        BOOST_REQUIRE_MESSAGE(replay.Load(error), error);
+        // The partial block was never considered applied.
+        BOOST_CHECK_EQUAL(replay.NextHeight(), 1);
+        CCoinsViewCache view{&db};
+        BOOST_CHECK(view.HaveCoin(COutPoint{chain.genesis_coinbase, 0}));
+        BOOST_CHECK(!view.HaveCoin(COutPoint{chain.spend_txid, 1}));
+        // And the same block replays cleanly now.
+        BOOST_REQUIRE_MESSAGE(replay.ApplyBlock(chain.block1, error), error);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(recovery_never_guesses)
+{
+    const SyntheticChain chain;
+    const fs::path path{m_args.GetDataDirBase() / "replay_guess"};
+    std::string error;
+
+    {
+        legacy::ReplayDB db{DBParams{.path = path, .cache_bytes = 1 << 20}};
+        legacy::PersistentReplay replay{chain.params, 2, {}, db};
+        BOOST_REQUIRE_MESSAGE(replay.Load(error), error);
+        BOOST_REQUIRE_MESSAGE(replay.ApplyBlock(chain.genesis, error), error);
+    }
+
+    // Marker erased while coins remain: refuse instead of guessing.
+    {
+        CDBWrapper raw{DBParams{.path = path, .cache_bytes = 1 << 20}};
+        raw.Erase(uint8_t{'R'}, /*fSync=*/true);
+    }
+    {
+        legacy::ReplayDB db{DBParams{.path = path, .cache_bytes = 1 << 20}};
+        legacy::PersistentReplay replay{chain.params, 2, {}, db};
+        BOOST_CHECK(!replay.Load(error));
+        BOOST_CHECK(error.find("no marker") != std::string::npos);
+    }
+
+    // Unsupported format version fails safely.
+    {
+        CDBWrapper raw{DBParams{.path = path, .cache_bytes = 1 << 20}};
+        const legacy::ReplayDB::Marker bogus{.version = 99, .height = 0,
+                                             .hash = chain.params.hashGenesisBlock,
+                                             .completed = false};
+        raw.Write(uint8_t{'R'}, bogus, /*fSync=*/true);
+    }
+    {
+        legacy::ReplayDB db{DBParams{.path = path, .cache_bytes = 1 << 20}};
+        legacy::PersistentReplay replay{chain.params, 2, {}, db};
+        BOOST_CHECK(!replay.Load(error));
+        BOOST_CHECK(error.find("version") != std::string::npos);
+    }
+
+    // A marker beyond the configured boundary fails safely.
+    {
+        CDBWrapper raw{DBParams{.path = path, .cache_bytes = 1 << 20}};
+        const legacy::ReplayDB::Marker bogus{.version = legacy::ReplayDB::FORMAT_VERSION,
+                                             .height = 7,
+                                             .hash = chain.params.hashGenesisBlock,
+                                             .completed = false};
+        raw.Write(uint8_t{'R'}, bogus, /*fSync=*/true);
+    }
+    {
+        legacy::ReplayDB db{DBParams{.path = path, .cache_bytes = 1 << 20}};
+        legacy::PersistentReplay replay{chain.params, 2, {}, db};
+        BOOST_CHECK(!replay.Load(error));
+        BOOST_CHECK(error.find("boundary") != std::string::npos);
     }
 }
 

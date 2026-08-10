@@ -8,6 +8,7 @@
 #include <consensus/amount.h>
 #include <consensus/block_codec.h>
 #include <consensus/merkle.h>
+#include <dbwrapper.h>
 #include <legacy/codec.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
@@ -18,7 +19,34 @@
 #include <exception>
 #include <utility>
 
+namespace {
+
+constexpr uint8_t DB_REPLAY_COIN{'C'};
+constexpr uint8_t DB_REPLAY_MARKER{'R'};
+
+struct ReplayCoinKey {
+    COutPoint* outpoint;
+    uint8_t key{DB_REPLAY_COIN};
+    explicit ReplayCoinKey(const COutPoint* ptr) : outpoint(const_cast<COutPoint*>(ptr)) {}
+
+    SERIALIZE_METHODS(ReplayCoinKey, obj) { READWRITE(obj.key, obj.outpoint->hash, VARINT(obj.outpoint->n)); }
+};
+
+} // namespace
+
 namespace legacy {
+
+bool DecodeLegacyBlock(const std::span<const std::byte> raw, CBlock& block, std::string& error)
+{
+    try {
+        SpanReader reader{raw};
+        reader >> TX_LEGACY(block);
+    } catch (const std::exception& e) {
+        error = strprintf("undecodable legacy block: %s", e.what());
+        return false;
+    }
+    return true;
+}
 
 TrustedReplay::TrustedReplay(const Consensus::Params& params, const int final_height,
                              std::map<int, uint256> checkpoints)
@@ -162,14 +190,182 @@ bool TrustedReplay::ApplyRawBlock(const std::span<const std::byte> raw, CCoinsVi
                                   std::string& error)
 {
     CBlock block;
-    try {
-        SpanReader reader{raw};
-        reader >> TX_LEGACY(block);
-    } catch (const std::exception& e) {
-        error = strprintf("undecodable legacy block at height %d: %s", m_next_height, e.what());
+    if (!DecodeLegacyBlock(raw, block, error)) return false;
+    return ApplyBlock(block, view, error);
+}
+
+ReplayDB::ReplayDB(DBParams db_params) : m_db{std::make_unique<CDBWrapper>(std::move(db_params))}
+{
+    Marker marker;
+    if (m_db->Read(DB_REPLAY_MARKER, marker)) m_marker = marker;
+}
+
+ReplayDB::~ReplayDB() = default;
+
+std::optional<ReplayDB::Marker> ReplayDB::ReadMarker() const
+{
+    return m_marker;
+}
+
+bool ReplayDB::HasAnyCoins() const
+{
+    std::unique_ptr<CDBIterator> cursor{m_db->NewIterator()};
+    // Coin keys start with the prefix byte; seek to the smallest such key.
+    const std::pair<uint8_t, uint256> start{DB_REPLAY_COIN, uint256{}};
+    cursor->Seek(start);
+    if (!cursor->Valid()) return false;
+    std::pair<uint8_t, uint256> key;
+    return cursor->GetKey(key) && key.first == DB_REPLAY_COIN;
+}
+
+void ReplayDB::WriteMarker(const Marker& marker)
+{
+    m_db->Write(DB_REPLAY_MARKER, marker, /*fSync=*/true);
+    m_marker = marker;
+}
+
+std::optional<Coin> ReplayDB::GetCoin(const COutPoint& outpoint) const
+{
+    Coin coin;
+    if (!m_db->Read(ReplayCoinKey{&outpoint}, coin)) return std::nullopt;
+    return coin;
+}
+
+uint256 ReplayDB::GetBestBlock() const
+{
+    return m_marker ? m_marker->hash : uint256{};
+}
+
+void ReplayDB::BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock)
+{
+    // One block, one batch: the coin changes and the replay marker become
+    // durable together or not at all.
+    if (!m_pending || m_pending->hash != hashBlock) {
+        throw std::logic_error("replay marker/chainstate disagreement in BatchWrite");
+    }
+    CDBBatch batch{*m_db};
+    for (auto it{cursor.Begin()}; it != cursor.End();) {
+        if (it->second.IsDirty()) {
+            ReplayCoinKey entry{&it->first};
+            if (it->second.coin.IsSpent()) {
+                batch.Erase(entry);
+            } else {
+                batch.Write(entry, it->second.coin);
+            }
+        }
+        it = cursor.NextAndMaybeErase(*it);
+    }
+    batch.Write(DB_REPLAY_MARKER, *m_pending);
+    m_db->WriteBatch(batch, /*fSync=*/true);
+    m_marker = m_pending;
+    m_pending.reset();
+}
+
+PersistentReplay::PersistentReplay(const Consensus::Params& params, const int final_height,
+                                   std::map<int, uint256> checkpoints, ReplayDB& db)
+    : m_db{db}, m_replay{params, final_height, std::move(checkpoints)}
+{
+}
+
+bool PersistentReplay::Load(std::string& error)
+{
+    const std::optional<ReplayDB::Marker> marker{m_db.ReadMarker()};
+    if (!marker) {
+        // Recovery never guesses: a database holding coins without a marker
+        // is inconsistent, not resumable.
+        if (m_db.HasAnyCoins()) {
+            error = "replay database holds coins but no marker";
+            return false;
+        }
+        m_replay.ResumeAt(0, uint256{});
+        m_loaded = true;
+        return true;
+    }
+    if (marker->version != ReplayDB::FORMAT_VERSION) {
+        error = strprintf("unsupported replay format version %d (expected %d)",
+                          marker->version, ReplayDB::FORMAT_VERSION);
         return false;
     }
-    return ApplyBlock(block, view, error);
+    if (marker->height > m_replay.FinalHeight()) {
+        error = strprintf("replay marker height %d disagrees with the configured boundary %d",
+                          marker->height, m_replay.FinalHeight());
+        return false;
+    }
+    if (marker->completed && marker->height != m_replay.FinalHeight()) {
+        error = strprintf("replay marked complete at height %d but the boundary is %d",
+                          marker->height, m_replay.FinalHeight());
+        return false;
+    }
+    m_replay.ResumeAt(marker->height + 1, marker->hash);
+    m_completed = marker->completed;
+    m_loaded = true;
+    return true;
+}
+
+bool PersistentReplay::ApplyBlock(const CBlock& block, std::string& error)
+{
+    if (!m_loaded) {
+        error = "replay position not loaded";
+        return false;
+    }
+    if (m_completed) {
+        error = "replay already completed";
+        return false;
+    }
+
+    const int height{m_replay.NextHeight()};
+    const uint256 prev_tip{m_replay.TipHash()};
+    CCoinsViewCache cache{&m_db};
+    if (!m_replay.ApplyBlock(block, cache, error)) return false;
+
+    const ReplayDB::Marker marker{.version = ReplayDB::FORMAT_VERSION,
+                                  .height = height,
+                                  .hash = m_replay.TipHash(),
+                                  .completed = false};
+    try {
+        m_db.SetPendingMarker(marker);
+        cache.SetBestBlock(marker.hash);
+        cache.Flush(); // one atomic batch: coins + marker
+    } catch (const std::exception& e) {
+        // Nothing durable changed; rewind so restartless retry stays exact.
+        m_replay.ResumeAt(height, prev_tip);
+        error = strprintf("failed to commit block at height %d: %s", height, e.what());
+        return false;
+    }
+    return true;
+}
+
+bool PersistentReplay::ApplyRawBlock(const std::span<const std::byte> raw, std::string& error)
+{
+    CBlock block;
+    if (!DecodeLegacyBlock(raw, block, error)) return false;
+    return ApplyBlock(block, error);
+}
+
+bool PersistentReplay::Finish(std::string& error)
+{
+    if (!m_loaded) {
+        error = "replay position not loaded";
+        return false;
+    }
+    if (m_completed) return true;
+    if (m_replay.NextHeight() <= m_replay.FinalHeight()) {
+        error = strprintf("replay is at height %d, boundary %d not yet reached",
+                          m_replay.NextHeight(), m_replay.FinalHeight());
+        return false;
+    }
+    ReplayDB::Marker marker{.version = ReplayDB::FORMAT_VERSION,
+                            .height = m_replay.FinalHeight(),
+                            .hash = m_replay.TipHash(),
+                            .completed = true};
+    try {
+        m_db.WriteMarker(marker);
+    } catch (const std::exception& e) {
+        error = strprintf("failed to persist completion: %s", e.what());
+        return false;
+    }
+    m_completed = true;
+    return true;
 }
 
 } // namespace legacy

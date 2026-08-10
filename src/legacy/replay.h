@@ -5,18 +5,28 @@
 #ifndef B3COIN_LEGACY_REPLAY_H
 #define B3COIN_LEGACY_REPLAY_H
 
+#include <coins.h>
 #include <consensus/params.h>
+#include <serialize.h>
 #include <uint256.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <map>
+#include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
 class CBlock;
-class CCoinsViewCache;
+class CDBWrapper;
+struct DBParams;
 
 namespace legacy {
+
+//! Safely decode a raw legacy-encoded block. Returns false (with `error`
+//! set) instead of throwing on malformed bytes.
+bool DecodeLegacyBlock(std::span<const std::byte> raw, CBlock& block, std::string& error);
 
 /**
  * Trusted mechanical replay of the legacy era (heights <= the finalized
@@ -71,12 +81,96 @@ public:
     int NextHeight() const { return m_next_height; }
     const uint256& TipHash() const { return m_tip_hash; }
 
+    int FinalHeight() const { return m_final_height; }
+
 private:
     const Consensus::Params& m_params;
     const int m_final_height;
     const std::map<int, uint256> m_checkpoints;
     int m_next_height{0};
     uint256 m_tip_hash{};
+};
+
+/**
+ * Durable coins storage for trusted replay. The UTXO entries and a single
+ * replay marker — format version, last completely applied height and hash,
+ * and the completion state — live in one database, and every block commits
+ * its coin changes together with its marker in ONE atomic batch write. A
+ * crash therefore either persists a block completely (coins and marker) or
+ * not at all; a partial block can never be observed.
+ */
+class ReplayDB final : public CCoinsView
+{
+public:
+    static constexpr int32_t FORMAT_VERSION{1};
+
+    struct Marker {
+        int32_t version{FORMAT_VERSION};
+        int32_t height{-1};
+        uint256 hash{};
+        bool completed{false};
+        SERIALIZE_METHODS(Marker, obj) { READWRITE(obj.version, obj.height, obj.hash, obj.completed); }
+    };
+
+    explicit ReplayDB(DBParams db_params);
+    ~ReplayDB();
+
+    //! The persisted marker, if any.
+    std::optional<Marker> ReadMarker() const;
+    //! Whether any UTXO entry exists (used to detect a marker-less database
+    //! that nevertheless holds coins — an inconsistent state).
+    bool HasAnyCoins() const;
+    //! Synchronously persist a marker on its own (completion state).
+    void WriteMarker(const Marker& marker);
+    //! The marker committed together with the next BatchWrite.
+    void SetPendingMarker(const Marker& marker) { m_pending = marker; }
+
+    std::optional<Coin> GetCoin(const COutPoint& outpoint) const override;
+    uint256 GetBestBlock() const override;
+    void BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock) override;
+
+private:
+    std::unique_ptr<CDBWrapper> m_db;
+    std::optional<Marker> m_marker;
+    std::optional<Marker> m_pending;
+};
+
+/**
+ * Atomically resumable trusted replay: TrustedReplay's mechanical checks
+ * with per-block durable commits into a ReplayDB. Load() restores the
+ * position exactly from the marker and never guesses — a marker-less
+ * database with coins, an unknown format version, or a marker that
+ * disagrees with the configured boundary all fail safely instead.
+ */
+class PersistentReplay
+{
+public:
+    PersistentReplay(const Consensus::Params& params, int final_height,
+                     std::map<int, uint256> checkpoints, ReplayDB& db);
+
+    //! Restore the replay position from the persisted marker. Must succeed
+    //! before blocks can be applied.
+    bool Load(std::string& error);
+
+    //! Apply the next block and durably commit its coins and marker in one
+    //! atomic batch. On failure nothing changes and restart resumes at
+    //! exactly the same block.
+    bool ApplyBlock(const CBlock& block, std::string& error);
+    bool ApplyRawBlock(std::span<const std::byte> raw, std::string& error);
+
+    //! Persist the completion state once every block through the finalized
+    //! boundary has been applied.
+    bool Finish(std::string& error);
+
+    int NextHeight() const { return m_replay.NextHeight(); }
+    const uint256& TipHash() const { return m_replay.TipHash(); }
+    bool Completed() const { return m_completed; }
+
+private:
+    ReplayDB& m_db;
+    TrustedReplay m_replay;
+    bool m_loaded{false};
+    bool m_completed{false};
 };
 
 } // namespace legacy
