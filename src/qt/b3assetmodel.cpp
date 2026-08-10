@@ -8,6 +8,7 @@
 
 #include <qt/b3assetmodel.h>
 
+#include <qt/b3fixed.h>
 #include <qt/walletmodel.h>
 
 #include <interfaces/wallet.h>
@@ -121,21 +122,6 @@ QVariant B3AssetTableModel::headerData(int section, Qt::Orientation orientation,
 
 QString B3AssetTableModel::formatAmount(CAmount amount, int decimals)
 {
-    const bool negative = amount < 0;
     // Integer arithmetic only: no float ever touches a financial value.
-    quint64 magnitude = negative ? -static_cast<quint64>(amount) : static_cast<quint64>(amount);
-    quint64 divisor = 1;
-    for (int i = 0; i < decimals; ++i) divisor *= 10;
-    const quint64 whole = divisor > 1 ? magnitude / divisor : magnitude;
-    const quint64 frac = divisor > 1 ? magnitude % divisor : 0;
-
-    QString text = QString::number(whole);
-    // Thin-space thousand separators for readability of large balances.
-    for (int pos = text.size() - 3; pos > 0; pos -= 3) {
-        text.insert(pos, QChar(0x2009));
-    }
-    if (decimals > 0) {
-        text += QLatin1Char('.') + QString::number(frac).rightJustified(decimals, QLatin1Char('0'));
-    }
-    return negative ? QLatin1Char('-') + text : text;
+    return B3Fixed::format(amount, decimals);
 }

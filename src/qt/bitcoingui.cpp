@@ -14,6 +14,7 @@
 #include <qt/b3navsidebar.h>
 #include <qt/b3shell.h>
 #include <qt/b3topstatus.h>
+#include <qt/b3tradepage.h>
 #ifdef ENABLE_WALLET
 #include <qt/b3assetspage.h>
 #endif
@@ -142,6 +143,9 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         m_shell->setAssetsPage(m_assets_page);
         connect(m_assets_page, &B3AssetsPage::sendRequested, this, [this] { gotoSendCoinsPage(); });
         connect(m_assets_page, &B3AssetsPage::receiveRequested, this, &BitcoinGUI::gotoReceiveCoinsPage);
+        // The trading workspace ships with the null backend only: every
+        // surface reports honestly unavailable and nothing can submit.
+        m_shell->setTradePage(new B3TradePage(m_shell));
         setCentralWidget(m_shell);
     } else
 #endif // ENABLE_WALLET

@@ -8,6 +8,7 @@ add_executable(test_bitcoin-qt
   apptests.cpp
   b3shelltests.cpp
   b3splashtests.cpp
+  b3tradetests.cpp
   optiontests.cpp
   rpcnestedtests.cpp
   test_main.cpp
