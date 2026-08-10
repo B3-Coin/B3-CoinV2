@@ -36,6 +36,7 @@ if(ENABLE_WALLET)
       addressbooktests.cpp
       b3assettests.cpp
       b3dashboardtests.cpp
+      b3hardeningtests.cpp
       b3stakesettingstests.cpp
       wallettests.cpp
       ../../wallet/test/wallet_test_fixture.cpp

@@ -22,6 +22,7 @@
 #include <qt/test/addressbooktests.h>
 #include <qt/test/b3assettests.h>
 #include <qt/test/b3dashboardtests.h>
+#include <qt/test/b3hardeningtests.h>
 #include <qt/test/b3stakesettingstests.h>
 #include <qt/test/wallettests.h>
 #endif // ENABLE_WALLET
@@ -105,6 +106,9 @@ int main(int argc, char* argv[])
 
         B3StakeSettingsTests b3_stake_settings_tests;
         num_test_failures += QTest::qExec(&b3_stake_settings_tests);
+
+        B3HardeningTests b3_hardening_tests;
+        num_test_failures += QTest::qExec(&b3_hardening_tests);
 #endif
 
         OptionTests options_tests(app.node());
