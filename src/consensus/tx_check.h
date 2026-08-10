@@ -5,6 +5,8 @@
 #ifndef BITCOIN_CONSENSUS_TX_CHECK_H
 #define BITCOIN_CONSENSUS_TX_CHECK_H
 
+#include <consensus/amount.h>
+
 /**
  * Context-independent transaction checking code that can be called outside the
  * bitcoin server and doesn't depend on chain or mempool state. Transaction
@@ -15,6 +17,12 @@
 class CTransaction;
 class TxValidationState;
 
-bool CheckTransaction(const CTransaction& tx, TxValidationState& state);
+/**
+ * `max_value_out` bounds each output and the output total: B3's historical
+ * cap by default, or a chain's Params::max_money at call sites with chain
+ * context (the retained Bitcoin test chains keep the stock bound).
+ */
+bool CheckTransaction(const CTransaction& tx, TxValidationState& state,
+                      CAmount max_value_out = MAX_MONEY);
 
 #endif // BITCOIN_CONSENSUS_TX_CHECK_H

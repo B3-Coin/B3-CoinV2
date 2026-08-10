@@ -26,4 +26,13 @@ static constexpr CAmount COIN = 1000000;
 static constexpr CAmount MAX_MONEY = 662200000000 * COIN;
 inline bool MoneyRange(const CAmount& nValue) { return (nValue >= 0 && nValue <= MAX_MONEY); }
 
+/**
+ * Stock Bitcoin monetary values, retained for the non-B3 test chains and
+ * for upstream generic vectors. B3 consensus uses COIN and MAX_MONEY above;
+ * these exist so the retained Bitcoin test chains keep their original
+ * semantics without touching B3's historical constants.
+ */
+static constexpr CAmount BITCOIN_COIN = 100000000;
+static constexpr CAmount GENERIC_MAX_MONEY = 21000000 * BITCOIN_COIN;
+
 #endif // BITCOIN_CONSENSUS_AMOUNT_H

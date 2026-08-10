@@ -62,7 +62,13 @@ static constexpr auto FEELER_INTERVAL = 2min;
 /** Run the extra block-relay-only connection loop once every 5 minutes. **/
 static constexpr auto EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL = 5min;
 /** Maximum length of incoming protocol messages (no message over 4 MB is currently acceptable). */
-static const unsigned int MAX_PROTOCOL_MESSAGE_LENGTH = 5 * 1000 * 1000;
+static const unsigned int MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000;
+/**
+ * Message-length bound on chains carrying legacy B3 history: historical
+ * blocks may reach the legacy 5 MB block-size limit, and archival peers
+ * serve them over both transports. Stock chains keep the stock bound.
+ */
+static const unsigned int MAX_LEGACY_PROTOCOL_MESSAGE_LENGTH = 5 * 1000 * 1000;
 /** Maximum length of the user agent string in `version` message */
 static const unsigned int MAX_SUBVERSION_LENGTH = 256;
 /** Maximum number of automatic outgoing nodes over which we'll relay everything (blocks, tx, addrs, etc) */

@@ -216,7 +216,10 @@ BOOST_AUTO_TEST_CASE(tx_valid)
             CTransaction tx(deserialize, TX_WITH_WITNESS, stream);
 
             TxValidationState state;
-            BOOST_CHECK_MESSAGE(CheckTransaction(tx, state), strTest);
+            // Upstream tx vectors describe Bitcoin's monetary bound, not
+            // B3's larger historical cap; check them against the generic
+            // Bitcoin bound without touching the vectors or B3's constant.
+            BOOST_CHECK_MESSAGE(CheckTransaction(tx, state, GENERIC_MAX_MONEY), strTest);
             BOOST_CHECK(state.IsValid());
 
             PrecomputedTransactionData txdata(tx);
@@ -307,7 +310,7 @@ BOOST_AUTO_TEST_CASE(tx_invalid)
             CTransaction tx(deserialize, TX_WITH_WITNESS, stream);
 
             TxValidationState state;
-            if (!CheckTransaction(tx, state) || state.IsInvalid()) {
+            if (!CheckTransaction(tx, state, GENERIC_MAX_MONEY) || state.IsInvalid()) {
                 BOOST_CHECK_MESSAGE(test[2].get_str() == "BADTX", strTest);
                 continue;
             }
