@@ -46,6 +46,7 @@ add_executable(test_bitcoin
   feefrac_tests.cpp
   feerounder_tests.cpp
   flatfile_tests.cpp
+  flowmesh_batch_tests.cpp
   flowmesh_clearing_tests.cpp
   flowmesh_ledger_tests.cpp
   fs_tests.cpp
