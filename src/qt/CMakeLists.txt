@@ -77,6 +77,8 @@ add_library(bitcoinqt STATIC EXCLUDE_FROM_ALL
   b3navsidebar.h
   b3placeholderpage.cpp
   b3placeholderpage.h
+  b3settingspage.cpp
+  b3settingspage.h
   b3shell.cpp
   b3shell.h
   b3theme.cpp
@@ -189,6 +191,8 @@ if(ENABLE_WALLET)
       b3assetspage.h
       b3dashboardpage.cpp
       b3dashboardpage.h
+      b3stakepage.cpp
+      b3stakepage.h
       coincontroldialog.cpp
       coincontroldialog.h
       coincontroltreewidget.cpp

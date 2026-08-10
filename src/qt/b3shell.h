@@ -47,6 +47,11 @@ public:
     void setTradePage(QWidget* page);
     void setAssetsPage(QWidget* page);
     void setStakePage(QWidget* page);
+    //! Install an in-shell Settings page. Until one is set, selecting
+    //! Settings leaves the content stack unchanged (the window opens the
+    //! options dialog instead).
+    void setSettingsPage(QWidget* page);
+    bool hasSettingsPage() const { return m_settingsIndex >= 0; }
 
 Q_SIGNALS:
     //! A navigation destination was chosen by the user.
@@ -63,6 +68,7 @@ private:
     int m_tradeIndex{-1};
     int m_assetsIndex{-1};
     int m_stakeIndex{-1};
+    int m_settingsIndex{-1};
 };
 
 #endif // BITCOIN_QT_B3SHELL_H

@@ -7,6 +7,7 @@
 #include <qt/addressbookpage.h>
 #include <qt/askpassphrasedialog.h>
 #include <qt/b3dashboardpage.h>
+#include <qt/b3theme.h>
 #include <qt/clientmodel.h>
 #include <qt/guiutil.h>
 #include <qt/optionsmodel.h>
@@ -26,6 +27,7 @@
 #include <QAction>
 #include <QFileDialog>
 #include <QHBoxLayout>
+#include <QLabel>
 #include <QProgressDialog>
 #include <QPushButton>
 #include <QVBoxLayout>
@@ -46,7 +48,14 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
 
     transactionsPage = new QWidget(this);
     QVBoxLayout *vbox = new QVBoxLayout();
+    vbox->setContentsMargins(B3Theme::kSpaceLg, B3Theme::kSpaceLg, B3Theme::kSpaceLg, B3Theme::kSpaceLg);
+    vbox->setSpacing(B3Theme::kSpaceMd);
     QHBoxLayout *hbox_buttons = new QHBoxLayout();
+    // Themed Activity framing around the existing TransactionView, which
+    // keeps its filtering, details, copy/export and model behavior.
+    QLabel* activityHeading = new QLabel(tr("Activity"), transactionsPage);
+    B3Theme::markTextRole(activityHeading, QStringLiteral("h1"));
+    vbox->addWidget(activityHeading);
     transactionView = new TransactionView(platformStyle, this);
     transactionView->setModel(walletModel);
 

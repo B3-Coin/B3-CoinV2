@@ -12,11 +12,13 @@
 #include <qt/guiconstants.h>
 #include <qt/guiutil.h>
 #include <qt/b3navsidebar.h>
+#include <qt/b3settingspage.h>
 #include <qt/b3shell.h>
 #include <qt/b3topstatus.h>
 #include <qt/b3tradepage.h>
 #ifdef ENABLE_WALLET
 #include <qt/b3assetspage.h>
+#include <qt/b3stakepage.h>
 #endif
 #include <qt/modaloverlay.h>
 #include <qt/networkstyle.h>
@@ -146,6 +148,14 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         // The trading workspace ships with the null backend only: every
         // surface reports honestly unavailable and nothing can submit.
         m_shell->setTradePage(new B3TradePage(m_shell));
+        // Stake shows real wallet state and reward history only; the
+        // staking backend itself is honestly unavailable.
+        m_stake_page = new B3StakePage(m_shell);
+        m_shell->setStakePage(m_stake_page);
+        // Settings organizes the existing dialogs; nothing changes meaning.
+        m_settings_page = new B3SettingsPage(m_shell);
+        m_shell->setSettingsPage(m_settings_page);
+        connect(m_settings_page, &B3SettingsPage::openOptionsRequested, this, &BitcoinGUI::openOptionsDialogWithTab);
         setCentralWidget(m_shell);
     } else
 #endif // ENABLE_WALLET
@@ -184,6 +194,11 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
             m_shell->topStatus()->addTrailingWidget(m_wallet_selector);
             m_wallet_selector_label->setVisible(false);
             m_wallet_selector->setVisible(false);
+        }
+        if (m_settings_page) {
+            // Existing wallet-security actions, surfaced on the Settings
+            // page; ownership and behavior stay with the window.
+            m_settings_page->setWalletActions({encryptWalletAction, changePassphraseAction, backupWalletAction});
         }
     }
 #endif
@@ -860,10 +875,10 @@ void BitcoinGUI::removeWallet(WalletModel* walletModel)
     }
     rpcConsole->removeWallet(walletModel);
     walletFrame->removeWallet(walletModel);
-    if (m_assets_page) {
-        // Never leave the page attached to a removed wallet model.
-        m_assets_page->setWalletModel(m_wallet_selector->count() > 0 ? walletFrame->currentWalletModel() : nullptr);
-    }
+    // Never leave shell pages attached to a removed wallet model.
+    WalletModel* const remaining = m_wallet_selector->count() > 0 ? walletFrame->currentWalletModel() : nullptr;
+    if (m_assets_page) m_assets_page->setWalletModel(remaining);
+    if (m_stake_page) m_stake_page->setWalletModel(remaining);
     updateWindowTitle();
 }
 
@@ -872,6 +887,7 @@ void BitcoinGUI::setCurrentWallet(WalletModel* wallet_model)
     if (!walletFrame || !m_wallet_controller) return;
     walletFrame->setCurrentWallet(wallet_model);
     if (m_assets_page) m_assets_page->setWalletModel(wallet_model);
+    if (m_stake_page) m_stake_page->setWalletModel(wallet_model);
     for (int index = 0; index < m_wallet_selector->count(); ++index) {
         if (m_wallet_selector->itemData(index).value<WalletModel*>() == wallet_model) {
             m_wallet_selector->setCurrentIndex(index);
@@ -893,6 +909,7 @@ void BitcoinGUI::removeAllWallets()
         return;
     setWalletActionsEnabled(false);
     if (m_assets_page) m_assets_page->setWalletModel(nullptr);
+    if (m_stake_page) m_stake_page->setWalletModel(nullptr);
     walletFrame->removeAllWallets();
 }
 #endif // ENABLE_WALLET
@@ -1149,7 +1166,9 @@ void BitcoinGUI::onShellPageSelected(B3Page page)
         break;
 #endif
     case B3Page::Settings:
-        if (optionsAction) optionsAction->trigger();
+        // The shell shows the in-shell Settings page; without one, fall
+        // back to the existing options dialog.
+        if (m_shell && !m_shell->hasSettingsPage() && optionsAction) optionsAction->trigger();
         break;
     case B3Page::Trade:
     case B3Page::Assets:

@@ -102,8 +102,9 @@ void B3Shell::showPage(B3Page page)
         m_content->setCurrentIndex(m_stakeIndex);
         break;
     case B3Page::Settings:
-        // Settings opens the existing options dialog; the content stack is
-        // left where it was.
+        // With an installed Settings page, show it; otherwise the window
+        // opens the existing options dialog and the stack stays put.
+        if (m_settingsIndex >= 0) m_content->setCurrentIndex(m_settingsIndex);
         break;
     }
 }
@@ -123,3 +124,14 @@ void B3Shell::replacePage(int index, QWidget* page)
 void B3Shell::setTradePage(QWidget* page) { replacePage(m_tradeIndex, page); }
 void B3Shell::setAssetsPage(QWidget* page) { replacePage(m_assetsIndex, page); }
 void B3Shell::setStakePage(QWidget* page) { replacePage(m_stakeIndex, page); }
+
+void B3Shell::setSettingsPage(QWidget* page)
+{
+    if (!page) return;
+    if (m_settingsIndex >= 0) {
+        replacePage(m_settingsIndex, page);
+    } else {
+        page->setParent(m_content);
+        m_settingsIndex = m_content->addWidget(page);
+    }
+}
