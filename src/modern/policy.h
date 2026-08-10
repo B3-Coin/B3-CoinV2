@@ -59,10 +59,16 @@ inline constexpr size_t MAX_POLICY_PARAMS_SIZE{80};
  *    enforceable spending condition.
  *  - OWNER: value owned by a modern owner commitment. v1: params must be
  *    empty; the commitment is an opaque 32-byte owner binding.
+ *  - BURN: value explicitly and provably destroyed. v1: params empty,
+ *    commitment must be all-zero; a burn output is unspendable by
+ *    definition and exists so supply reduction is visible and exactly
+ *    accounted (modern/asset.h). Part of the coloured-asset policy set,
+ *    activated for tests only until the asset rules ship.
  */
 enum class PolicyType : uint16_t {
     LEGACY_LOCK = 0,
     OWNER = 1,
+    BURN = 2,
 };
 
 //! First and, at this stage, only version of either policy.
@@ -91,15 +97,39 @@ struct ModernOutput {
 };
 
 /**
- * Whether a (type, version) pair is an activated policy. Exactly
- * LEGACY_LOCK v1 and OWNER v1 at this stage; anything else — including
- * future versions of these types — is unactivated and therefore invalid.
+ * Test-only activation switch for the coloured-asset policy set (BURN and
+ * the conservation rules in modern/asset.h). Production consensus never
+ * sets this; until the asset rules ship, the asset policies stay
+ * unactivated and therefore invalid.
  */
-constexpr bool IsActivatedPolicy(const uint16_t policy_type, const uint16_t policy_version)
+inline bool& AssetPoliciesActiveSlot()
+{
+    static bool active{false};
+    return active;
+}
+
+inline void SetAssetPoliciesActiveForTesting(const bool active)
+{
+    AssetPoliciesActiveSlot() = active;
+}
+
+/**
+ * Whether a (type, version) pair is an activated policy. LEGACY_LOCK v1
+ * and OWNER v1 are always active; BURN v1 only under the test-only asset
+ * activation. Anything else — including future versions of these types —
+ * is unactivated and therefore invalid.
+ */
+inline bool IsActivatedPolicy(const uint16_t policy_type, const uint16_t policy_version)
 {
     if (policy_version != POLICY_VERSION_V1) return false;
-    return policy_type == static_cast<uint16_t>(PolicyType::LEGACY_LOCK) ||
-           policy_type == static_cast<uint16_t>(PolicyType::OWNER);
+    if (policy_type == static_cast<uint16_t>(PolicyType::LEGACY_LOCK) ||
+        policy_type == static_cast<uint16_t>(PolicyType::OWNER)) {
+        return true;
+    }
+    if (policy_type == static_cast<uint16_t>(PolicyType::BURN)) {
+        return AssetPoliciesActiveSlot();
+    }
+    return false;
 }
 
 enum class PolicyOutputCheck {
@@ -143,6 +173,11 @@ inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int he
         break;
     case PolicyType::OWNER:
         if (!out.policy_params.empty()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        break;
+    case PolicyType::BURN:
+        // Canonical v1 burn: no parameters, all-zero commitment.
+        if (!out.policy_params.empty()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        if (!out.policy_commitment.IsNull()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
         break;
     }
     return PolicyOutputCheck::OK;
