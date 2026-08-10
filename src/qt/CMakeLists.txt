@@ -175,6 +175,10 @@ if(ENABLE_WALLET)
       addresstablemodel.h
       askpassphrasedialog.cpp
       askpassphrasedialog.h
+      b3assetmodel.cpp
+      b3assetmodel.h
+      b3assetspage.cpp
+      b3assetspage.h
       b3dashboardpage.cpp
       b3dashboardpage.h
       coincontroldialog.cpp

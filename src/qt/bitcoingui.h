@@ -39,6 +39,7 @@ class WalletFrame;
 class WalletModel;
 class HelpMessageDialog;
 class ModalOverlay;
+class B3AssetsPage;
 class B3Shell;
 enum class B3Page;
 enum class SynchronizationState;
@@ -122,6 +123,7 @@ private:
     ClientModel* clientModel = nullptr;
     WalletFrame* walletFrame = nullptr;
     B3Shell* m_shell = nullptr;
+    B3AssetsPage* m_assets_page = nullptr;
 
     UnitDisplayStatusBarControl* unitDisplayControl = nullptr;
     GUIUtil::ThemedLabel* labelWalletEncryptionIcon = nullptr;

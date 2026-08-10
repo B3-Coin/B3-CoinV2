@@ -14,6 +14,9 @@
 #include <qt/b3navsidebar.h>
 #include <qt/b3shell.h>
 #include <qt/b3topstatus.h>
+#ifdef ENABLE_WALLET
+#include <qt/b3assetspage.h>
+#endif
 #include <qt/modaloverlay.h>
 #include <qt/networkstyle.h>
 #include <qt/notificator.h>
@@ -133,6 +136,12 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         m_shell->topStatus()->setNetwork(m_network_style->getAppName(),
                                          m_network_style->getTitleAddText());
         connect(m_shell, &B3Shell::pageSelected, this, &BitcoinGUI::onShellPageSelected);
+        // The Assets page starts in the honest no-wallet state; wallet
+        // attach/detach below keeps it current.
+        m_assets_page = new B3AssetsPage(m_shell);
+        m_shell->setAssetsPage(m_assets_page);
+        connect(m_assets_page, &B3AssetsPage::sendRequested, this, [this] { gotoSendCoinsPage(); });
+        connect(m_assets_page, &B3AssetsPage::receiveRequested, this, &BitcoinGUI::gotoReceiveCoinsPage);
         setCentralWidget(m_shell);
     } else
 #endif // ENABLE_WALLET
@@ -847,6 +856,10 @@ void BitcoinGUI::removeWallet(WalletModel* walletModel)
     }
     rpcConsole->removeWallet(walletModel);
     walletFrame->removeWallet(walletModel);
+    if (m_assets_page) {
+        // Never leave the page attached to a removed wallet model.
+        m_assets_page->setWalletModel(m_wallet_selector->count() > 0 ? walletFrame->currentWalletModel() : nullptr);
+    }
     updateWindowTitle();
 }
 
@@ -854,6 +867,7 @@ void BitcoinGUI::setCurrentWallet(WalletModel* wallet_model)
 {
     if (!walletFrame || !m_wallet_controller) return;
     walletFrame->setCurrentWallet(wallet_model);
+    if (m_assets_page) m_assets_page->setWalletModel(wallet_model);
     for (int index = 0; index < m_wallet_selector->count(); ++index) {
         if (m_wallet_selector->itemData(index).value<WalletModel*>() == wallet_model) {
             m_wallet_selector->setCurrentIndex(index);
@@ -874,6 +888,7 @@ void BitcoinGUI::removeAllWallets()
     if(!walletFrame)
         return;
     setWalletActionsEnabled(false);
+    if (m_assets_page) m_assets_page->setWalletModel(nullptr);
     walletFrame->removeAllWallets();
 }
 #endif // ENABLE_WALLET
