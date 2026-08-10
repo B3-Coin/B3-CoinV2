@@ -7,6 +7,8 @@
 
 #include <consensus/params.h>
 
+#include <optional>
+
 namespace Consensus {
 
 /**
@@ -49,6 +51,28 @@ constexpr B3Era GetB3Era(int height, const Params& params)
         return B3Era::LEGACY;
     }
     return B3Era::MODERN;
+}
+
+/**
+ * LEGACY_FINAL_HEIGHT (H): the last legacy height, when a boundary is
+ * configured on a legacy-B3 chain.
+ */
+constexpr std::optional<int> LegacyFinalHeight(const Params& params)
+{
+    if (!params.legacy_b3coin || !params.hard_fork_height) return std::nullopt;
+    return *params.hard_fork_height - 1;
+}
+
+/**
+ * A disconnect of the block at `disconnect_height` would cross the
+ * finalized legacy boundary. Reorganizations that disconnect H or anything
+ * below it are permanently prohibited; forks entirely above H may still
+ * reorganize.
+ */
+constexpr bool DisconnectCrossesLegacyBoundary(const Params& params, const int disconnect_height)
+{
+    const std::optional<int> final_height{LegacyFinalHeight(params)};
+    return final_height.has_value() && disconnect_height <= *final_height;
 }
 
 } // namespace Consensus

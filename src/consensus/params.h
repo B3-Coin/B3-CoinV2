@@ -103,6 +103,14 @@ struct Params {
      */
     std::optional<int> hard_fork_height;
     /**
+     * LEGACY_FINAL_HASH (X): the exact hash required of the final legacy
+     * block at LEGACY_FINAL_HEIGHT (hard_fork_height - 1). When set together
+     * with hard_fork_height, the block at H must hash to X, the block at
+     * H + 1 must reference X, and no disconnect or reorganization may cross
+     * H. Unset until a boundary is explicitly finalized.
+     */
+    std::optional<uint256> legacy_final_hash;
+    /**
      * Hashes of blocks that
      * - are known to be consensus valid, and
      * - buried in the chain, and

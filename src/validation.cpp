@@ -13,6 +13,7 @@
 #include <clientversion.h>
 #include <consensus/amount.h>
 #include <consensus/block_codec.h>
+#include <consensus/boundary.h>
 #include <consensus/consensus.h>
 #include <consensus/era.h>
 #include <consensus/merkle.h>
@@ -3162,6 +3163,14 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     CBlockIndex *pindexDelete = m_chain.Tip();
     assert(pindexDelete);
     assert(pindexDelete->pprev);
+    // Reorganizations across the finalized legacy boundary are permanently
+    // prohibited: the block at H and everything below it can never be
+    // disconnected.
+    if (Consensus::DisconnectCrossesLegacyBoundary(m_chainman.GetConsensus(), pindexDelete->nHeight)) {
+        LogError("DisconnectTip(): refusing to disconnect %s at height %d across the finalized legacy boundary\n",
+                 pindexDelete->GetBlockHash().ToString(), pindexDelete->nHeight);
+        return false;
+    }
     // Read block from disk.
     std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
     CBlock& block = *pblock;
@@ -4569,6 +4578,19 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
     if (!Consensus::HasExpectedB3BlockCodec(block.nVersion, nHeight, consensusParams)) {
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-block-codec",
                              "block version selects the wrong B3 transaction codec for its height");
+    }
+
+    // The finalized legacy boundary pins exact identities: the block at H
+    // must hash to X and the block at H + 1 must reference X.
+    switch (Consensus::CheckLegacyBoundaryHeader(block, nHeight, consensusParams)) {
+    case Consensus::BoundaryCheck::OK:
+        break;
+    case Consensus::BoundaryCheck::WRONG_FINAL_HASH:
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-legacy-final-hash",
+                             "block at the finalized legacy boundary does not match LEGACY_FINAL_HASH");
+    case Consensus::BoundaryCheck::WRONG_FINAL_PARENT:
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-legacy-final-parent",
+                             "first modern block does not reference LEGACY_FINAL_HASH");
     }
 
     // Check proof of work
