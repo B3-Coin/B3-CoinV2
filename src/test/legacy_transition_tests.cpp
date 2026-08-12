@@ -262,6 +262,51 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
                           X.GetHex());
     }
 
+    // ---- (D2) Legacy is blocks-only. Build a distinct side branch forking
+    // below H: a height-3 sibling carrying a spend, so its hash differs from
+    // the canonical block 3. Its header alone must not be admitted -- a legacy
+    // proof-of-stake header cannot be validated without its block, so it gains
+    // no index entry and thus no chain-selection weight.
+    const CBlockIndex* side_parent{WITH_LOCK(cs_main, return chainman.ActiveChain()[2])};
+    CMutableTransaction side_spend;
+    side_spend.version = 1;
+    side_spend.nTime = static_cast<uint32_t>(side_parent->GetBlockTime() + 17);
+    side_spend.vin.resize(1);
+    side_spend.vin[0].prevout = COutPoint{mature_coinbase, 0};
+    side_spend.vin[0].scriptSig = CScript{};
+    side_spend.vout.emplace_back(1 * COIN, CScript() << OP_TRUE);
+    const auto side_submitted{CodecRoundTrip(build_legacy(side_parent, {side_spend}))};
+    // Legacy blocks are indexed by their marker (scrypt) hash, not SHA256d.
+    const uint256 side_hash{side_submitted->GetLegacyB3Hash()};
+    {
+        const std::vector<CBlockHeader> headers{*side_submitted};
+        BlockValidationState hstate;
+        BOOST_CHECK(!chainman.ProcessNewBlockHeaders(headers, /*min_pow_checked=*/true, hstate));
+        BOOST_CHECK_EQUAL(hstate.GetRejectReason(), "legacy-header-only");
+        // The refused header created no index entry.
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(side_hash)) == nullptr);
+    }
+
+    // ---- (D1/anchor) The same block, submitted whole, is accepted as stored
+    // side-branch history, but once X is pinned it is anchor-ineligible: it
+    // lies off the X-anchored chain and can never be a chain-selection
+    // candidate. Blocks on the canonical prefix, and X itself, stay eligible.
+    {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(side_submitted, /*force_processing=*/true,
+                                               /*min_pow_checked=*/true, &new_block));
+        BOOST_REQUIRE(new_block);
+        LOCK(cs_main);
+        Chainstate& cs{chainman.ActiveChainstate()};
+        const CBlockIndex* side_index{chainman.m_blockman.LookupBlockIndex(side_hash)};
+        BOOST_REQUIRE(side_index);
+        BOOST_CHECK_EQUAL(side_index->nHeight, 3);
+        BOOST_CHECK(cs.IsAnchorIneligible(*side_index));
+        BOOST_CHECK(!cs.setBlockIndexCandidates.contains(side_index));
+        BOOST_CHECK(!cs.IsAnchorIneligible(*chainman.ActiveChain()[SYNTHETIC_H])); // X
+        BOOST_CHECK(!cs.IsAnchorIneligible(*side_parent));                          // ancestor of X
+    }
+
     // ---- (6)+(7) Marker-modern blocks from H+1 through the modern
     // PoS dispatch (test adapter; no economic rules invented).
     AcceptingPos pos;
@@ -312,6 +357,10 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
     }
     BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->nHeight), SYNTHETIC_H + 1);
     BOOST_CHECK_EQUAL(pos.m_calls, 1);
+    // A modern block descending from X is on the anchored chain, so it is not
+    // anchor-ineligible.
+    BOOST_CHECK(WITH_LOCK(cs_main,
+        return !chainman.ActiveChainstate().IsAnchorIneligible(*chainman.ActiveChain().Tip())));
     BOOST_CHECK(WITH_LOCK(cs_main,
         return !chainman.ActiveChainstate().CoinsTip().HaveCoin(COutPoint{pre_h_txid, 0})));
 

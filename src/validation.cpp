@@ -4810,7 +4810,7 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
     return true;
 }
 
-bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValidationState& state, CBlockIndex** ppindex, bool min_pow_checked)
+bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValidationState& state, CBlockIndex** ppindex, bool min_pow_checked, bool full_block)
 {
     AssertLockHeld(cs_main);
 
@@ -4854,7 +4854,25 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
             return false;
         }
     }
-    if (!min_pow_checked && !GetConsensus().legacy_b3coin) {
+    // Anti-DoS admission control: a header that has not passed a sufficient
+    // check must not create an index entry, and so must gain no chain-selection
+    // weight, until it does.
+    if (GetConsensus().legacy_b3coin) {
+        // Legacy-codec B3 headers are proof-of-stake: the stake kernel can only
+        // be checked once the full block is available, so the historical client
+        // had no headers-first path and was blocks-only. Mirror that: a
+        // legacy-codec header presented without its block is not admitted, and
+        // so never gains chain-selection weight, regardless of the claimed
+        // work. This is the legacy-era anti-DoS gate, replacing the
+        // proof-of-work check that cannot apply to proof-of-stake -- without
+        // imposing proof-of-work on legacy blocks or constraining their nBits.
+        // Modern-codec headers on a legacy chain (post-boundary) are not gated
+        // here; their anti-DoS handling belongs with modern PoS (unresolved).
+        if (!Consensus::HasB3BlockCodecV2(block.nVersion) && hash != GetConsensus().hashGenesisBlock && !full_block) {
+            LogDebug(BCLog::VALIDATION, "%s: refusing legacy block header %s without its block (blocks-only)\n", __func__, hash.ToString());
+            return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "legacy-header-only");
+        }
+    } else if (!min_pow_checked) {
         LogDebug(BCLog::VALIDATION, "%s: not adding new block header %s, missing anti-dos proof-of-work validation\n", __func__, hash.ToString());
         return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "too-little-chainwork");
     }
@@ -4933,7 +4951,7 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     CBlockIndex *pindexDummy = nullptr;
     CBlockIndex *&pindex = ppindex ? *ppindex : pindexDummy;
 
-    bool accepted_header{AcceptBlockHeader(block, state, &pindex, min_pow_checked)};
+    bool accepted_header{AcceptBlockHeader(block, state, &pindex, min_pow_checked, /*full_block=*/true)};
     CheckBlockIndex();
 
     if (!accepted_header)

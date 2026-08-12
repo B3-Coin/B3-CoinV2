@@ -974,12 +974,20 @@ private:
      * Caller must set min_pow_checked=true in order to add a new header to the
      * block index (permanent memory storage), indicating that the header is
      * known to be part of a sufficiently high-work chain (anti-dos check).
+     *
+     * full_block indicates the header is being admitted as part of a complete
+     * block (from AcceptBlock), not header-only. Legacy-codec B3 headers are
+     * proof-of-stake and cannot be validated without their block, so they are
+     * admitted only when full_block is true (blocks-only); this is the
+     * anti-DoS admission control for the legacy era, in place of the
+     * proof-of-work check that cannot apply to proof-of-stake.
      */
     bool AcceptBlockHeader(
         const CBlockHeader& block,
         BlockValidationState& state,
         CBlockIndex** ppindex,
-        bool min_pow_checked) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+        bool min_pow_checked,
+        bool full_block = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     friend Chainstate;
 
     /** Most recent headers presync progress update, for rate-limiting. */
