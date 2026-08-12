@@ -18,6 +18,7 @@
 #include <consensus/merkle.h>
 #include <consensus/validation.h>
 #include <dbwrapper.h>
+#include <key.h>
 #include <legacy/codec.h>
 #include <legacy/consensus.h>
 #include <legacy/primitives.h>
@@ -25,6 +26,7 @@
 #include <modern/pos.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
+#include <pubkey.h>
 #include <script/script.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
@@ -305,6 +307,74 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
         BOOST_CHECK(!cs.setBlockIndexCandidates.contains(side_index));
         BOOST_CHECK(!cs.IsAnchorIneligible(*chainman.ActiveChain()[SYNTHETIC_H])); // X
         BOOST_CHECK(!cs.IsAnchorIneligible(*side_parent));                          // ancestor of X
+    }
+
+    // ---- (D2 adversarial) A full legacy block forking below H that claims
+    // absurd chain work through a fake nBits, with no valid stake authority.
+    // It is proof-of-stake (so the scrypt proof-of-work check is skipped) with
+    // a well-formed block signature but a bogus kernel. The accept path does
+    // not check the retarget, so it is stored with attacker-selected
+    // chainwork exceeding the tip. Membership -- not stake validation -- keeps
+    // it out of fork choice: being off the X-anchored chain, it is marked
+    // anchor-ineligible, never enters the candidate set, is never connected
+    // (its bogus kernel is never even reached), and the tip does not move.
+    {
+        const CBlockIndex* fork{WITH_LOCK(cs_main, return chainman.ActiveChain()[2])};
+        const uint32_t t{static_cast<uint32_t>(fork->GetBlockTime() + 17)};
+        CKey stake_key;
+        stake_key.MakeNewKey(/*fCompressed=*/true);
+        const CPubKey stake_pub{stake_key.GetPubKey()};
+
+        CMutableTransaction cb; // empty proof-of-stake coinbase
+        cb.version = 1;
+        cb.m_legacy_encoding = true;
+        cb.nTime = t;
+        cb.vin.resize(1);
+        cb.vin[0].prevout.SetNull();
+        cb.vin[0].scriptSig = CScript() << 3 << CScriptNum{7};
+        cb.vout.emplace_back(0, CScript{});
+
+        CMutableTransaction cs_tx; // coinstake with a bogus (unchecked-here) kernel
+        cs_tx.version = 1;
+        cs_tx.m_legacy_encoding = true;
+        cs_tx.nTime = t;
+        cs_tx.vin.resize(1);
+        cs_tx.vin[0].prevout = COutPoint{mature_coinbase, 0};
+        cs_tx.vin[0].scriptSig = CScript{};
+        cs_tx.vout.emplace_back(0, CScript{}); // coinstake marker output
+        cs_tx.vout.emplace_back(1 * COIN, CScript() << ToByteVector(stake_pub) << OP_CHECKSIG);
+
+        CBlock evil;
+        evil.nVersion = 4;
+        evil.hashPrevBlock = fork->GetBlockHash();
+        evil.nTime = t;
+        evil.nBits = 0x14000001; // absurdly low target => enormous GetBlockProof
+        evil.vtx = {MakeTransactionRef(std::move(cb)), MakeTransactionRef(std::move(cs_tx))};
+        evil.hashMerkleRoot = BlockMerkleRoot(evil);
+        BOOST_REQUIRE(evil.IsProofOfStake());
+        BOOST_REQUIRE(stake_key.Sign(evil.GetLegacyB3Hash(), evil.vchBlockSig));
+
+        const arith_uint256 tip_work{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->nChainWork)};
+        const uint256 evil_hash{evil.GetLegacyB3Hash()};
+        const uint256 tip_before{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->GetBlockHash())};
+
+        bool new_block{false};
+        // Accepted as stored side-branch history: structure and signature are
+        // valid, and the retarget is not checked on the accept path.
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(CodecRoundTrip(evil), /*force_processing=*/true,
+                                                       /*min_pow_checked=*/true, &new_block),
+                              "adversarial block unexpectedly rejected at accept");
+        BOOST_REQUIRE(new_block);
+
+        LOCK(cs_main);
+        Chainstate& cs{chainman.ActiveChainstate()};
+        const CBlockIndex* evil_index{chainman.m_blockman.LookupBlockIndex(evil_hash)};
+        BOOST_REQUIRE(evil_index);
+        BOOST_CHECK(evil_index->nChainWork > tip_work);              // it did carry attacker chainwork
+        BOOST_CHECK(evil_index->nStatus & BLOCK_ANCHOR_INELIGIBLE);  // yet membership excludes it
+        BOOST_CHECK(!cs.setBlockIndexCandidates.contains(evil_index));
+        BOOST_CHECK(cs.IsAnchorIneligible(*evil_index));
+        BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->GetBlockHash().GetHex(), tip_before.GetHex());
     }
 
     // ---- (6)+(7) Marker-modern blocks from H+1 through the modern

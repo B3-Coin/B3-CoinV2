@@ -93,8 +93,39 @@ allowed. The fix makes the legacy era blocks-only again: a legacy-codec header
 is admitted only as part of a full block, so it earns no chain weight until the
 block is present to be validated.
 
-Two historical mechanisms are noted but **not yet ported**, tracked as
-follow-on hardening (see the status document):
+## Post-X synchronization is membership, not recomputed trust
+
+A decision that scopes all of the above. Once H/X is finalized:
+
+- **Legacy history (height <= H) is reconstructed by trusted replay**, not by
+  header-first consensus. Full legacy blocks are downloaded only to rebuild
+  state and to verify their **membership in the pinned chain ending at X**
+  (previous-hash linkage, checkpoints, Merkle roots). The stake kernel and the
+  legacy trust competition are **not** recomputed. A proof-of-stake block
+  cannot be validated without its full block, and there is no need to: the
+  checkpoints up to H and the pinned X are what establish trust.
+- **Headers-first synchronization begins at H+1** under modern consensus.
+- **Live full legacy consensus is required only before the transition is
+  finalized**, for blocks at height <= H while the chain is still being
+  extended and selected under the historical rules.
+
+The consequence for anti-DoS: do **not** build accept-time legacy
+proof-of-stake trust machinery to keep unvalidated chainwork out of fork
+choice. That job is done by membership. A full legacy block that lies off the
+X-anchored chain is anchor-ineligible regardless of its claimed `nBits` or the
+validity of its kernel, so it never enters `setBlockIndexCandidates` and never
+influences tip selection -- even though `AddToBlockIndex` still credits its
+`GetBlockProof(nBits)` (a block off the anchor keeps its stored trust, exactly
+as the historical client left a `ConnectBlock`-failed block in its index). This
+is exercised adversarially in `legacy_transition_tests`: a signed PoS block
+with absurd `nBits` and a bogus kernel, forking below H, is stored with
+chainwork exceeding the tip yet is marked `BLOCK_ANCHOR_INELIGIBLE`, kept out
+of the candidate set, never connected, and leaves the tip unmoved.
+
+## Follow-on hardening
+
+Two historical mechanisms are noted but **not yet ported**, tracked in the
+status document:
 
 - the rolling `CheckSync` depth bound (`nCheckpointSpan = 500`); and
 - the hardened checkpoint list.
