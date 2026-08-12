@@ -90,8 +90,20 @@ enum BlockStatus : uint32_t {
     //! not a violation of the block's own legacy rules -- the block may be
     //! valid side-branch history that we still store and serve. It is kept out
     //! of setBlockIndexCandidates so it is never repeatedly reconsidered.
+    //!
+    //! Bit 9 (512). Newly allocated by B3; unused by upstream Bitcoin Core
+    //! 31.1, so it is safe to persist in nStatus alongside the existing flags.
+    //! The static_assert below fails at compile time if that ever stops holding
+    //! (e.g. a future upstream flag is given the same bit).
     BLOCK_ANCHOR_INELIGIBLE  =   512,
 };
+
+//! BLOCK_ANCHOR_INELIGIBLE must not overlap any pre-existing block-status flag,
+//! since it is OR'd into and read out of the same persisted nStatus field.
+static_assert((BLOCK_ANCHOR_INELIGIBLE &
+               (BLOCK_VALID_MASK | BLOCK_HAVE_MASK | BLOCK_FAILED_VALID |
+                BLOCK_FAILED_CHILD | BLOCK_OPT_WITNESS | BLOCK_STATUS_RESERVED)) == 0,
+              "BLOCK_ANCHOR_INELIGIBLE collides with an existing block-status flag");
 
 /** The block chain is a tree shaped structure starting with the
  * genesis block at the root, with each block potentially having multiple

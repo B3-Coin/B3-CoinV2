@@ -100,6 +100,18 @@ follow-on hardening (see the status document):
 - the hardened checkpoint list.
 
 Both are legacy-era consensus rules and must be ported faithfully (values and
-placement) rather than reinvented. H/X chain eligibility — once X is pinned, no
-alternate legacy branch may compete regardless of claimed trust — is a separate
-concern handled by the anchor-ineligibility check, not by trust.
+placement) rather than reinvented.
+
+**Scope for `CheckSync`.** The 500-block rolling depth bound belongs to **live
+legacy consensus** — the regime where the node still extends and selects the
+legacy chain under the historical rules, i.e. before H/X is pinned. It must
+**not** become a trusted-replay rejection rule after X. Once X is finalized the
+legacy prefix is fixed and reconstructed deterministically by following X's
+linkage backward (`TrustedReplay`), which does no competitive chain selection;
+imposing a rolling-depth reorg limit there would be a new rule the historical
+client never applied to already-settled history. After X, alternate-branch
+exclusion is the job of the anchor-ineligibility check, not of `CheckSync`.
+
+H/X chain eligibility — once X is pinned, no alternate legacy branch may compete
+regardless of claimed trust — is thus a separate concern from `CheckSync`,
+handled by the anchor-ineligibility check, not by trust.
