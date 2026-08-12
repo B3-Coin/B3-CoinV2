@@ -815,6 +815,17 @@ public:
     /** Add a block to the candidate set if it has as much work as the current tip. */
     void TryAddBlockIndexCandidate(CBlockIndex* pindex) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+    /**
+     * True if `block` can never become part of the active chain because it lies
+     * off the chain anchored by the finalized legacy boundary hash X: activating
+     * it would reorganize across that boundary. This is a topological property
+     * of the block relative to X, independent of the current tip, and is stable
+     * once X is present in the block index. Returns false while the boundary is
+     * unconfigured or X is not yet known (the block cannot yet be classified),
+     * and never treats a block as violating its own legacy rules.
+     */
+    bool IsAnchorIneligible(const CBlockIndex& block) const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
     void PruneBlockIndexCandidates();
 
     void ClearBlockIndexCandidates() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);

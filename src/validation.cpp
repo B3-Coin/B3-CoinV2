@@ -3404,6 +3404,31 @@ bool Chainstate::ConnectTip(
  * Return the tip of the chain with the most work in it, that isn't
  * known to be invalid (it's however far from certain to be valid).
  */
+bool Chainstate::IsAnchorIneligible(const CBlockIndex& block) const
+{
+    AssertLockHeld(::cs_main);
+
+    const Consensus::Params& params{m_chainman.GetConsensus()};
+    const std::optional<int> final_height{Consensus::LegacyFinalHeight(params)};
+    // Not classifiable unless both the boundary height H and the finalized
+    // hash X are configured: without X there is no anchor to measure against.
+    if (!final_height || !params.legacy_final_hash) return false;
+
+    const CBlockIndex* pindexX{m_blockman.LookupBlockIndex(*params.legacy_final_hash)};
+    // X itself is not in our index yet, so the block's relationship to it is
+    // not yet determined. It will be reclassified once X is known.
+    if (!pindexX) return false;
+
+    const int H{*final_height};
+    if (block.nHeight <= H) {
+        // At or below H a block is eligible only if it is on the canonical
+        // prefix, i.e. it is X itself or one of X's ancestors.
+        return pindexX->GetAncestor(block.nHeight) != &block;
+    }
+    // Above H a block is eligible only if it descends from X.
+    return block.GetAncestor(H) != pindexX;
+}
+
 CBlockIndex* Chainstate::FindMostWorkChain()
 {
     AssertLockHeld(::cs_main);
@@ -3418,21 +3443,22 @@ CBlockIndex* Chainstate::FindMostWorkChain()
             pindexNew = *it;
         }
 
-        // Reject candidates whose activation would reorganize across the
-        // finalized legacy boundary. Such a branch can never become the active
-        // chain, so it must be discarded here rather than surfacing later as a
-        // refused disconnect. The block itself is not marked invalid: it may be
-        // well-formed history we still store and serve, it is only unusable as
-        // a chain tip.
-        if (m_chain.Tip() != nullptr) {
-            const CBlockIndex* pindexFork = m_chain.FindFork(pindexNew);
-            const int fork_height{pindexFork ? pindexFork->nHeight : -1};
-            if (Consensus::ReorgFromForkCrossesLegacyBoundary(m_chainman.GetConsensus(), fork_height)) {
-                LogInfo("%s: discarding candidate %s (height %d): forks at height %d, which would reorganize across the finalized legacy boundary\n",
-                        __func__, pindexNew->GetBlockHash().ToString(), pindexNew->nHeight, fork_height);
-                setBlockIndexCandidates.erase(pindexNew);
-                continue;
+        // Reject candidates that lie off the chain anchored by the finalized
+        // legacy boundary X: activating one would reorganize across the
+        // boundary, which can never happen. Mark it persistently so it is not
+        // reconsidered on every pass or re-added after a reload, and discard it
+        // here rather than letting it surface later as a refused disconnect.
+        // The block is not marked invalid: it may be well-formed side-branch
+        // history we still store and serve, it is only unusable as a chain tip.
+        if (IsAnchorIneligible(*pindexNew)) {
+            if (!(pindexNew->nStatus & BLOCK_ANCHOR_INELIGIBLE)) {
+                pindexNew->nStatus |= BLOCK_ANCHOR_INELIGIBLE;
+                m_blockman.m_dirty_blockindex.insert(pindexNew);
             }
+            LogInfo("%s: discarding candidate %s (height %d): lies off the finalized legacy boundary anchor\n",
+                    __func__, pindexNew->GetBlockHash().ToString(), pindexNew->nHeight);
+            setBlockIndexCandidates.erase(pindexNew);
+            continue;
         }
 
         // Check whether all blocks on the path between the currently active chain and the candidate are valid.
@@ -4072,6 +4098,21 @@ void Chainstate::TryAddBlockIndexCandidate(CBlockIndex* pindex)
     // The block only is a candidate for the most-work-chain if it has the same
     // or more work than our current tip.
     if (m_chain.Tip() != nullptr && setBlockIndexCandidates.value_comp()(pindex, m_chain.Tip())) {
+        return;
+    }
+
+    // A block off the finalized legacy boundary anchor can never become the
+    // active tip. Keep it out of the candidate set entirely so it is not
+    // repeatedly reconsidered here or by FindMostWorkChain, and record the
+    // status so a reload does not have to reclassify it. This is checked after
+    // the work gate above, matching CheckBlockIndex, which only requires
+    // candidacy for blocks with at least the tip's work.
+    if (pindex->nStatus & BLOCK_ANCHOR_INELIGIBLE) {
+        return;
+    }
+    if (IsAnchorIneligible(*pindex)) {
+        pindex->nStatus |= BLOCK_ANCHOR_INELIGIBLE;
+        m_blockman.m_dirty_blockindex.insert(pindex);
         return;
     }
 
@@ -5802,6 +5843,7 @@ void ChainstateManager::CheckBlockIndex() const
     const CBlockIndex* pindexFirstNotTransactionsValid = nullptr; // Oldest ancestor of pindex which does not have BLOCK_VALID_TRANSACTIONS (regardless of being valid or not), since assumeutxo snapshot if used.
     const CBlockIndex* pindexFirstNotChainValid = nullptr;        // Oldest ancestor of pindex which does not have BLOCK_VALID_CHAIN (regardless of being valid or not), since assumeutxo snapshot if used.
     const CBlockIndex* pindexFirstNotScriptsValid = nullptr;      // Oldest ancestor of pindex which does not have BLOCK_VALID_SCRIPTS (regardless of being valid or not), since assumeutxo snapshot if used.
+    const CBlockIndex* pindexFirstAnchorIneligible = nullptr;     // Oldest ancestor of pindex which is off the finalized legacy boundary anchor (BLOCK_ANCHOR_INELIGIBLE), and so is not required to be a candidate.
 
     // After checking an assumeutxo snapshot block, reset pindexFirst pointers
     // to earlier blocks that have not been downloaded or validated yet, so
@@ -5822,6 +5864,7 @@ void ChainstateManager::CheckBlockIndex() const
     while (pindex != nullptr) {
         nNodes++;
         if (pindexFirstInvalid == nullptr && pindex->nStatus & BLOCK_FAILED_VALID) pindexFirstInvalid = pindex;
+        if (pindexFirstAnchorIneligible == nullptr && pindex->nStatus & BLOCK_ANCHOR_INELIGIBLE) pindexFirstAnchorIneligible = pindex;
         if (pindexFirstMissing == nullptr && !(pindex->nStatus & BLOCK_HAVE_DATA)) {
             pindexFirstMissing = pindex;
         }
@@ -5926,9 +5969,10 @@ void ChainstateManager::CheckBlockIndex() const
             //   also a potential candidate.
             if (!CBlockIndexWorkComparator()(pindex, c->m_chain.Tip()) && (pindexFirstNeverProcessed == nullptr || pindex == snap_base)) {
                 // If pindex was detected as invalid (pindexFirstInvalid is
-                // non-null), it is not required to be in
-                // setBlockIndexCandidates.
-                if (pindexFirstInvalid == nullptr) {
+                // non-null), or lies off the finalized legacy boundary anchor
+                // (pindexFirstAnchorIneligible is non-null), it is not required
+                // to be in setBlockIndexCandidates.
+                if (pindexFirstInvalid == nullptr && pindexFirstAnchorIneligible == nullptr) {
                     // If pindex and all its parents back to the genesis block
                     // or an assumeutxo snapshot block downloaded transactions,
                     // and the transactions were not pruned (pindexFirstMissing
@@ -6035,6 +6079,7 @@ void ChainstateManager::CheckBlockIndex() const
             if (pindex == pindexFirstNotTransactionsValid) pindexFirstNotTransactionsValid = nullptr;
             if (pindex == pindexFirstNotChainValid) pindexFirstNotChainValid = nullptr;
             if (pindex == pindexFirstNotScriptsValid) pindexFirstNotScriptsValid = nullptr;
+            if (pindex == pindexFirstAnchorIneligible) pindexFirstAnchorIneligible = nullptr;
             // Find our parent.
             CBlockIndex* pindexPar = pindex->pprev;
             // Find which child we just visited.

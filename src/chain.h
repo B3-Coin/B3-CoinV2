@@ -83,6 +83,14 @@ enum BlockStatus : uint32_t {
 
     BLOCK_STATUS_RESERVED    =   256, //!< Unused flag that was previously set on assumeutxo snapshot blocks and their
                                       //!< ancestors before they were validated, and unset when they were validated.
+
+    //! The block can never become part of the active chain because activating
+    //! it would reorganize across the finalized legacy boundary X: it lies off
+    //! the chain anchored by X. This is a topological property relative to X,
+    //! not a violation of the block's own legacy rules -- the block may be
+    //! valid side-branch history that we still store and serve. It is kept out
+    //! of setBlockIndexCandidates so it is never repeatedly reconsidered.
+    BLOCK_ANCHOR_INELIGIBLE  =   512,
 };
 
 /** The block chain is a tree shaped structure starting with the
