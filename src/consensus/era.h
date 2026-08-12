@@ -75,6 +75,20 @@ constexpr bool DisconnectCrossesLegacyBoundary(const Params& params, const int d
     return final_height.has_value() && disconnect_height <= *final_height;
 }
 
+/**
+ * Reorganizing the active chain onto a branch that forks at `fork_height`
+ * would cross the finalized legacy boundary.
+ *
+ * Activating such a branch disconnects every block above the fork point, so
+ * the lowest block it would disconnect sits at `fork_height + 1`. A branch
+ * that forks at or below H - 1 therefore requires disconnecting H or lower
+ * and can never become the active chain.
+ */
+constexpr bool ReorgFromForkCrossesLegacyBoundary(const Params& params, const int fork_height)
+{
+    return DisconnectCrossesLegacyBoundary(params, fork_height + 1);
+}
+
 } // namespace Consensus
 
 #endif // BITCOIN_CONSENSUS_ERA_H

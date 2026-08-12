@@ -136,6 +136,42 @@ BOOST_AUTO_TEST_CASE(reorg_crossing_H_is_prohibited)
     BOOST_CHECK(Consensus::DisconnectCrossesLegacyBoundary(params, 0));
 }
 
+BOOST_AUTO_TEST_CASE(candidate_forking_below_H_is_refused_by_fork_height)
+{
+    const Consensus::Params params{BoundaryParams()};
+
+    // Chain selection asks the question by fork point rather than by
+    // disconnect height: activating a branch that forks at `fork_height`
+    // disconnects everything above it, so the lowest block it would
+    // disconnect is at fork_height + 1.
+
+    // Forking at H - 1 would disconnect H itself: prohibited.
+    BOOST_CHECK(Consensus::ReorgFromForkCrossesLegacyBoundary(params, SYNTHETIC_H - 1));
+    BOOST_CHECK(Consensus::ReorgFromForkCrossesLegacyBoundary(params, SYNTHETIC_H - 2));
+    BOOST_CHECK(Consensus::ReorgFromForkCrossesLegacyBoundary(params, 0));
+
+    // A branch with no common ancestor at all (fork height -1) would
+    // disconnect the genesis block: prohibited.
+    BOOST_CHECK(Consensus::ReorgFromForkCrossesLegacyBoundary(params, -1));
+
+    // Forking at H keeps H connected and only disconnects H + 1 upward:
+    // permitted. This is the exact boundary case.
+    BOOST_CHECK(!Consensus::ReorgFromForkCrossesLegacyBoundary(params, SYNTHETIC_H));
+    BOOST_CHECK(!Consensus::ReorgFromForkCrossesLegacyBoundary(params, SYNTHETIC_H + 1));
+
+    // The two predicates agree: forking at `f` disconnects `f + 1`.
+    for (const int fork_height : {-1, 0, SYNTHETIC_H - 2, SYNTHETIC_H - 1, SYNTHETIC_H, SYNTHETIC_H + 1}) {
+        BOOST_CHECK_EQUAL(Consensus::ReorgFromForkCrossesLegacyBoundary(params, fork_height),
+                          Consensus::DisconnectCrossesLegacyBoundary(params, fork_height + 1));
+    }
+
+    // Without a configured boundary no fork point is restricted.
+    Consensus::Params unconfigured{};
+    unconfigured.legacy_b3coin = true;
+    BOOST_CHECK(!Consensus::ReorgFromForkCrossesLegacyBoundary(unconfigured, -1));
+    BOOST_CHECK(!Consensus::ReorgFromForkCrossesLegacyBoundary(unconfigured, 0));
+}
+
 BOOST_AUTO_TEST_CASE(modern_reorg_entirely_above_H_is_permitted)
 {
     const Consensus::Params params{BoundaryParams()};

@@ -3418,6 +3418,23 @@ CBlockIndex* Chainstate::FindMostWorkChain()
             pindexNew = *it;
         }
 
+        // Reject candidates whose activation would reorganize across the
+        // finalized legacy boundary. Such a branch can never become the active
+        // chain, so it must be discarded here rather than surfacing later as a
+        // refused disconnect. The block itself is not marked invalid: it may be
+        // well-formed history we still store and serve, it is only unusable as
+        // a chain tip.
+        if (m_chain.Tip() != nullptr) {
+            const CBlockIndex* pindexFork = m_chain.FindFork(pindexNew);
+            const int fork_height{pindexFork ? pindexFork->nHeight : -1};
+            if (Consensus::ReorgFromForkCrossesLegacyBoundary(m_chainman.GetConsensus(), fork_height)) {
+                LogInfo("%s: discarding candidate %s (height %d): forks at height %d, which would reorganize across the finalized legacy boundary\n",
+                        __func__, pindexNew->GetBlockHash().ToString(), pindexNew->nHeight, fork_height);
+                setBlockIndexCandidates.erase(pindexNew);
+                continue;
+            }
+        }
+
         // Check whether all blocks on the path between the currently active chain and the candidate are valid.
         // Just going until the active chain is an optimization, as we know all blocks in it are valid already.
         CBlockIndex *pindexTest = pindexNew;
@@ -3492,6 +3509,21 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
     // Disconnect active blocks which are no longer in the best chain.
     bool fBlocksDisconnected = false;
     DisconnectedBlockTransactions disconnectpool{MAX_DISCONNECTED_TX_POOL_BYTES};
+    // A branch that forks below the finalized legacy boundary can never become
+    // the active chain. FindMostWorkChain() discards such candidates, so this
+    // is a defensive check for a candidate that appeared after selection: treat
+    // it as a rejected chain rather than a local failure, so the caller
+    // reselects instead of the node aborting.
+    if (m_chain.Tip() != nullptr &&
+        Consensus::ReorgFromForkCrossesLegacyBoundary(m_chainman.GetConsensus(), pindexFork ? pindexFork->nHeight : -1)) {
+        LogWarning("%s: refusing to activate %s (height %d): would reorganize across the finalized legacy boundary\n",
+                   __func__, pindexMostWork->GetBlockHash().ToString(), pindexMostWork->nHeight);
+        setBlockIndexCandidates.erase(pindexMostWork);
+        // Signals the caller to drop its cached candidate and reselect.
+        fInvalidFound = true;
+        return true;
+    }
+
     while (m_chain.Tip() && m_chain.Tip() != pindexFork) {
         if (!DisconnectTip(state, &disconnectpool)) {
             // This is likely a fatal error, but keep the mempool consistent,
