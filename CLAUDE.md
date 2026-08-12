@@ -24,6 +24,9 @@ Every change must be tested against that statement.
 - **[doc/design/b3-implementation-status.md](doc/design/b3-implementation-status.md)** —
   the implementation-status / gap matrix: what is LOCKED / IMPLEMENTED / PARTIAL / WRONG /
   MISSING / SECURITY-BLOCKER, and the minimal critical path to a clean H+1.
+- [doc/design/b3-legacy-fork-choice.md](doc/design/b3-legacy-fork-choice.md) — how a
+  legacy PoS block earns chain weight, traced from the historical `master` client. The
+  reference for legacy-era anti-DoS work.
 - [doc/design/b3-era-architecture.md](doc/design/b3-era-architecture.md) and
   [doc/design/b3-test-baseline.md](doc/design/b3-test-baseline.md) — supporting
   background (historical spike + test baseline). Non-authoritative where they differ
