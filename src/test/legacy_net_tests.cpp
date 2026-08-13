@@ -221,6 +221,143 @@ BOOST_AUTO_TEST_CASE(stalled_sync_owner_is_reassigned_after_the_progress_lease)
     SetMockTime(0s);
 }
 
+BOOST_AUTO_TEST_CASE(empty_inventory_does_not_declare_sync_complete)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ConnmanTestMsg& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    connman.SetPeerConnectTimeout(99999s);
+    PeerManager& peerman = *m_node.peerman;
+
+    std::vector<std::unique_ptr<CNode>> nodes;
+    for (NodeId id{0}; id < 2; ++id) {
+        nodes.push_back(MakeNode(id));
+        connman.Handshake(*nodes.back(),
+                          /*successfully_connected=*/true,
+                          /*remote_services=*/ServiceFlags(NODE_NETWORK),
+                          /*local_services=*/ServiceFlags(NODE_NETWORK),
+                          /*version=*/legacy::P2P_PROTOCOL_VERSION,
+                          /*relay_txs=*/true);
+        BOOST_REQUIRE(!nodes.back()->fDisconnect);
+    }
+
+    // Peer 0 claims the window and sends its getblocks.
+    for (auto& node : nodes) BOOST_CHECK(peerman.SendMessages(*node));
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*nodes[0]), NetMsgType::GETBLOCKS), 1U);
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*nodes[1]), NetMsgType::GETBLOCKS), 0U);
+
+    // Peer 0 answers with an empty inventory. The synthetic chain is nowhere
+    // near any pinned target, so this is peer-local exhaustion: it must not
+    // permanently end legacy synchronization.
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(*nodes[0], NetMsg::Make(NetMsgType::INV, std::vector<CInv>{})));
+    nodes[0]->fPauseSend = false; // ReceiveMsgFrom routes through the send path
+    connman.ProcessMessagesOnce(*nodes[0]);
+    BOOST_CHECK(!nodes[0]->fDisconnect); // exhaustion is not misbehavior
+
+    // The window is released, so the other peer continues synchronization
+    // immediately -- no disconnect and no waiting for the progress lease.
+    BOOST_CHECK(peerman.SendMessages(*nodes[1]));
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*nodes[1]), NetMsgType::GETBLOCKS), 1U);
+
+    // And the exhausted peer does not immediately re-poll while another peer
+    // holds the window.
+    BOOST_CHECK(peerman.SendMessages(*nodes[0]));
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*nodes[0]), NetMsgType::GETBLOCKS), 0U);
+
+    // Exhaust the second peer too. Both are now unproductive, so neither may
+    // retake the window: the per-peer retry bar must hold them both off. If
+    // exhaustion were tracked in a single shared slot, the second exhaustion
+    // would clear the first peer's bar and the two would hand the window back
+    // and forth, one getblocks per round trip, indefinitely.
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(*nodes[1], NetMsg::Make(NetMsgType::INV, std::vector<CInv>{})));
+    nodes[1]->fPauseSend = false;
+    connman.ProcessMessagesOnce(*nodes[1]);
+    for (auto& node : nodes) {
+        BOOST_CHECK(peerman.SendMessages(*node));
+        BOOST_CHECK(!node->fDisconnect);
+    }
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*nodes[0]), NetMsgType::GETBLOCKS), 0U);
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*nodes[1]), NetMsgType::GETBLOCKS), 0U);
+
+    for (auto& node : nodes) peerman.FinalizeNode(*node);
+}
+
+BOOST_AUTO_TEST_CASE(exhausted_peer_repolls_after_its_retry_bar_expires)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ConnmanTestMsg& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    connman.SetPeerConnectTimeout(99999s);
+    PeerManager& peerman = *m_node.peerman;
+
+    const auto t0{std::chrono::seconds{1'700'000'000}};
+    SetMockTime(t0);
+
+    // A single legacy peer: after it exhausts, only it can continue, so this
+    // isolates the re-poll behaviour that the exhaustion reset enables.
+    auto node{MakeNode(0)};
+    connman.Handshake(*node,
+                      /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK),
+                      /*version=*/legacy::P2P_PROTOCOL_VERSION,
+                      /*relay_txs=*/true);
+    BOOST_REQUIRE(!node->fDisconnect);
+
+    const auto exhaust{[&] {
+        BOOST_REQUIRE(connman.ReceiveMsgFrom(*node, NetMsg::Make(NetMsgType::INV, std::vector<CInv>{})));
+        node->fPauseSend = false;
+        connman.ProcessMessagesOnce(*node);
+    }};
+
+    // Claim, then exhaust: the window is released and this peer is barred for
+    // one lease period.
+    BOOST_CHECK(peerman.SendMessages(*node));
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*node), NetMsgType::GETBLOCKS), 1U);
+    exhaust();
+    BOOST_CHECK(!node->fDisconnect);
+
+    // Still inside the bar: no re-poll.
+    SetMockTime(t0 + 119s);
+    BOOST_CHECK(peerman.SendMessages(*node));
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*node), NetMsgType::GETBLOCKS), 0U);
+
+    // Past the bar: the peer reclaims the window and asks again. This is what
+    // makes exhaustion temporary rather than a permanent completion latch --
+    // without clearing the exhausted flag on reclaim, no getblocks is sent and
+    // synchronization stays dead.
+    SetMockTime(t0 + 121s);
+    BOOST_CHECK(peerman.SendMessages(*node));
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*node), NetMsgType::GETBLOCKS), 1U);
+    BOOST_CHECK(!node->fDisconnect);
+
+    // And it is a poll, not a one-shot: exhaust and wait again, and it asks a
+    // third time.
+    exhaust();
+    SetMockTime(t0 + 242s);
+    BOOST_CHECK(peerman.SendMessages(*node));
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*node), NetMsgType::GETBLOCKS), 1U);
+
+    peerman.FinalizeNode(*node);
+    SetMockTime(0s);
+}
+
+BOOST_AUTO_TEST_CASE(legacy_peer_services_are_outbound_eligible)
+{
+    PeerManager& peerman = *m_node.peerman;
+
+    // A historical B3 peer advertises NODE_NETWORK only: the legacy era has no
+    // witness data, so NODE_WITNESS is not a capability it can ever offer.
+    // Outbound selection must still consider it eligible, or every legacy peer
+    // becomes unreachable once its real services are recorded in addrman.
+    BOOST_CHECK(peerman.HasAllDesirableServiceFlags(ServiceFlags(NODE_NETWORK)));
+    BOOST_CHECK(!(peerman.GetDesirableServiceFlags(ServiceFlags(NODE_NETWORK)) & NODE_WITNESS));
+
+    // A peer offering nothing useful is still undesirable.
+    BOOST_CHECK(!peerman.HasAllDesirableServiceFlags(ServiceFlags(NODE_NONE)));
+
+    // A peer that also advertises witness remains eligible.
+    BOOST_CHECK(peerman.HasAllDesirableServiceFlags(ServiceFlags(NODE_NETWORK | NODE_WITNESS)));
+}
+
 BOOST_AUTO_TEST_CASE(modern_capability_peer_does_not_own_the_legacy_window)
 {
     LOCK(NetEventsInterface::g_msgproc_mutex);

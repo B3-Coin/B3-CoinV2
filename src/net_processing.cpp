@@ -442,8 +442,24 @@ struct Peer {
      * batch.
      */
     size_t m_legacy_blocks_in_flight GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0};
-    /** A peer has answered the current getblocks request without a new block. */
-    bool m_legacy_sync_complete GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    /**
+     * This peer answered the current getblocks request with nothing new: it is
+     * exhausted, i.e. it has no further legacy inventory to offer us right now.
+     * This is a statement about the peer only. It never means legacy
+     * synchronization is complete -- only reaching the pinned target does that
+     * (see PeerManagerImpl::LegacySyncTargetReached) -- so an exhausted peer
+     * releases the download window rather than ending sync.
+     */
+    bool m_legacy_sync_exhausted GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    /**
+     * This peer may not claim the legacy download window before this time. Set
+     * when it gives the window up without finishing the job -- by stalling out
+     * its progress lease, or by having nothing further to offer -- so that a
+     * peer which cannot advance synchronization does not immediately retake the
+     * slot. It is per-peer, so several unproductive peers each wait their own
+     * turn instead of handing the window back and forth.
+     */
+    NodeClock::time_point m_legacy_sync_retry_after GUARDED_BY(NetEventsInterface::g_msgproc_mutex){};
     /** Time of the current legacy getblocks/getdata request. */
     NodeClock::time_point m_legacy_request_time GUARDED_BY(NetEventsInterface::g_msgproc_mutex){};
 
@@ -846,10 +862,67 @@ private:
      */
     bool IsLegacyPhase() const EXCLUSIVE_LOCKS_REQUIRED(cs_main)
     {
+        return IsLegacyPhaseAt(m_chainman.ActiveChain().Tip());
+    }
+
+    /** IsLegacyPhase computed against a specific tip, requiring no lock. */
+    bool IsLegacyPhaseAt(const CBlockIndex* tip) const
+    {
         if (!m_chainparams.GetConsensus().legacy_b3coin) return false;
-        const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
         return Consensus::GetB3Era((tip ? tip->nHeight : -1) + 1, m_chainparams.GetConsensus()) ==
                Consensus::B3Era::LEGACY;
+    }
+
+    /**
+     * Lock-free mirror of IsLegacyPhase for the connection thread, which
+     * chooses desirable service flags without cs_main. Updated on every tip
+     * change (ActiveTipChange) and initialized from the loaded tip. The legacy
+     * era carries no witness data, so NODE_WITNESS is dropped from the
+     * desirable set only while this is true; once the tip crosses the boundary
+     * the modern era's requirements apply again.
+     */
+    std::atomic<bool> m_in_legacy_phase{false};
+
+    /**
+     * Legacy synchronization has objectively reached its target: the pinned
+     * boundary hash X is on the active chain, so the legacy prefix is complete
+     * and nothing further can be legitimately downloaded for that era.
+     *
+     * Before H/X is configured there is no pinned target, so this is false: in
+     * live-legacy operation a node cannot objectively know it has every block,
+     * and a peer's silence is only evidence about that peer. If a live-legacy
+     * target is defined later it plugs in here.
+     *
+     * Note that reaching X also ends the legacy phase (IsLegacyPhase turns
+     * false once the tip is at H), so in the current design this is a
+     * belt-and-braces guard; it becomes load-bearing if that phase test ever
+     * changes.
+     */
+    bool LegacySyncTargetReached() const EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+    {
+        const Consensus::Params& params{m_chainparams.GetConsensus()};
+        if (!Consensus::LegacyFinalHeight(params) || !params.legacy_final_hash) return false;
+        const CBlockIndex* pindexX{m_chainman.m_blockman.LookupBlockIndex(*params.legacy_final_hash)};
+        return pindexX && m_chainman.ActiveChain().Contains(pindexX);
+    }
+
+    /**
+     * Record that a legacy peer has no further inventory to offer. Unless
+     * synchronization has objectively reached its target, this releases the
+     * download window so another eligible peer can continue, and holds this
+     * peer off briefly so a lone exhausted peer does not immediately reclaim
+     * and re-poll. Exhaustion is ordinary behaviour, never misbehavior.
+     */
+    void NoteLegacyPeerExhausted(NodeId nodeid, Peer& peer)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, NetEventsInterface::g_msgproc_mutex)
+    {
+        peer.m_legacy_sync_exhausted = true;
+        if (LegacySyncTargetReached()) return;
+        if (m_legacy_sync_peer != nodeid) return;
+        LogDebug(BCLog::NET, "Legacy sync peer=%d has no further inventory; releasing the window\n", nodeid);
+        peer.m_legacy_sync_retry_after = NodeClock::now() + LEGACY_SYNC_PROGRESS_LEASE;
+        m_legacy_sync_peer = -1;
+        m_legacy_sync_lease = {};
     }
 
     const CChainParams& m_chainparams;
@@ -948,9 +1021,6 @@ private:
     NodeId m_legacy_sync_peer GUARDED_BY(cs_main){-1};
     /** Deadline of the owner's forward-progress lease (see LEGACY_SYNC_PROGRESS_LEASE). */
     NodeClock::time_point m_legacy_sync_lease GUARDED_BY(cs_main){};
-    /** Peer whose lease last expired, barred from reclaiming until the time below. */
-    NodeId m_legacy_sync_cooldown_peer GUARDED_BY(cs_main){-1};
-    NodeClock::time_point m_legacy_sync_cooldown_until GUARDED_BY(cs_main){};
 
     /**
      * Bounded holding area for structurally-valid legacy-chain blocks that
@@ -1810,12 +1880,6 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
         m_legacy_sync_peer = -1;
         m_legacy_sync_lease = {};
     }
-    // A disconnecting peer carries no cooldown: the bar only applies to a peer
-    // that stalled while still connected.
-    if (m_legacy_sync_cooldown_peer == nodeid) {
-        m_legacy_sync_cooldown_peer = -1;
-        m_legacy_sync_cooldown_until = {};
-    }
     {
         // We remove the PeerRef from g_peer_map here, but we don't always
         // destruct the Peer. Sometimes another thread is still holding a
@@ -1896,13 +1960,29 @@ bool PeerManagerImpl::HasAllDesirableServiceFlags(ServiceFlags services) const
 
 ServiceFlags PeerManagerImpl::GetDesirableServiceFlags(ServiceFlags services) const
 {
+    // The legacy era has no witness data, so NODE_WITNESS is not a capability
+    // any legitimate legacy B3 peer can advertise. Requiring it would judge
+    // legacy peers by a modern capability they cannot have -- and, because the
+    // version handshake overwrites the stored services with the peer's real
+    // flags, would make every legacy peer permanently ineligible for automatic
+    // outbound connections after the first successful connect. While the chain
+    // is in the legacy phase, judge peers by the capability meaningful for
+    // them (serving blocks) instead.
+    //
+    // This is scoped to the legacy PHASE, not the whole chain: once the tip
+    // crosses the finalized boundary the modern era's requirements apply again
+    // (modern blocks carry witness data), so the relaxation does not survive
+    // the transition. Non-B3 chains are never in the legacy phase and keep the
+    // stock witness requirement in full. Distinguishing modern B3 peers by
+    // explicit modern service bits is separate, later work.
+    const ServiceFlags witness{m_in_legacy_phase.load(std::memory_order_relaxed) ? NODE_NONE : NODE_WITNESS};
     if (services & NODE_NETWORK_LIMITED) {
         // Limited peers are desirable when we are close to the tip.
         if (ApproximateBestBlockDepth() < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS) {
-            return ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS);
+            return ServiceFlags(NODE_NETWORK_LIMITED | witness);
         }
     }
-    return ServiceFlags(NODE_NETWORK | NODE_WITNESS);
+    return ServiceFlags(NODE_NETWORK | witness);
 }
 
 PeerRef PeerManagerImpl::GetPeerRef(NodeId id) const
@@ -2160,6 +2240,9 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
     if (opts.reconcile_txs) {
         m_txreconciliation = std::make_unique<TxReconciliationTracker>(TXRECONCILIATION_VERSION);
     }
+    // Seed the lock-free legacy-phase mirror from the loaded tip so outbound
+    // service-flag selection is correct before the first tip change.
+    m_in_legacy_phase.store(WITH_LOCK(cs_main, return IsLegacyPhase()), std::memory_order_relaxed);
 }
 
 void PeerManagerImpl::StartScheduledTasks(CScheduler& scheduler)
@@ -2186,6 +2269,9 @@ void PeerManagerImpl::ActiveTipChange(const CBlockIndex& new_tip, bool is_ibd)
     // m_tx_download_mutex waits on the mempool mutex.
     AssertLockNotHeld(m_mempool.cs);
     AssertLockNotHeld(m_tx_download_mutex);
+
+    // Keep the lock-free legacy-phase mirror current for the connection thread.
+    m_in_legacy_phase.store(IsLegacyPhaseAt(&new_tip), std::memory_order_relaxed);
 
     if (!is_ibd) {
         LOCK(m_tx_download_mutex);
@@ -3044,7 +3130,7 @@ bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& loc
             // expected to keep streaming in.
             return false;
         }
-        if (peer.m_legacy_sync_complete) {
+        if (peer.m_legacy_sync_exhausted) {
             return false;
         }
         if (peer.m_legacy_getblocks_in_flight) {
@@ -4420,9 +4506,12 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
 
         if (legacy_sync_peer && vInv.empty() && legacy_getblocks_response &&
             peer.m_legacy_blocks_in_flight == 0 && peer.m_legacy_block_queue.empty()) {
+            // An empty inventory says this peer has nothing more; it cannot
+            // declare synchronization finished. Release the window unless the
+            // pinned target is actually reached.
             peer.m_legacy_getblocks_in_flight = false;
-            peer.m_legacy_sync_complete = true;
             peer.m_legacy_request_time = {};
+            NoteLegacyPeerExhausted(pfrom.GetId(), peer);
         }
 
         for (CInv& inv : vInv) {
@@ -4450,7 +4539,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                     legacy_block_inventory = true;
                     if (!fAlreadyHave) {
                         legacy_unknown_block = true;
-                        peer.m_legacy_sync_complete = false;
+                        peer.m_legacy_sync_exhausted = false;
                         // A legacy peer marks every hash in its getblocks
                         // response as already announced. Keep the complete
                         // ordered batch or the remaining blocks cannot be
@@ -4504,8 +4593,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             if (legacy_getblocks_response && legacy_block_inventory && !legacy_unknown_block &&
                 peer.m_legacy_blocks_in_flight == 0 && peer.m_legacy_block_queue.empty()) {
                 if (vInv.size() < LEGACY_GETBLOCKS_RESPONSE_SIZE) {
-                    peer.m_legacy_sync_complete = true;
+                    // A short page of blocks we already have: same as an empty
+                    // inventory, this peer is exhausted but sync is not done.
                     peer.m_legacy_request_time = {};
+                    NoteLegacyPeerExhausted(pfrom.GetId(), peer);
                 } else {
                     // A full-size response of already-known blocks is a
                     // truncated page (another peer supplied this range);
@@ -5303,7 +5394,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                 (void)m_legacy_orphanage.Add(hash, pblock->hashPrevBlock, pblock, pfrom.GetId(),
                                              GetSerializeSize(legacy::TX_LEGACY(*pblock)), now);
 
-                peer.m_legacy_sync_complete = false;
+                peer.m_legacy_sync_exhausted = false;
                 if (legacy_block_requested) {
                     // Account for the answered request even though the block
                     // cannot connect yet; zeroing the timer here would turn
@@ -6381,15 +6472,19 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                 // peer can take the window.
                 LogDebug(BCLog::NET, "Legacy sync peer=%d made no progress within the lease; releasing ownership\n",
                          m_legacy_sync_peer);
-                m_legacy_sync_cooldown_peer = m_legacy_sync_peer;
-                m_legacy_sync_cooldown_until = now + LEGACY_SYNC_PROGRESS_LEASE;
+                if (PeerRef stalled{GetPeerRef(m_legacy_sync_peer)}) {
+                    stalled->m_legacy_sync_retry_after = now + LEGACY_SYNC_PROGRESS_LEASE;
+                }
                 m_legacy_sync_peer = -1;
+                m_legacy_sync_lease = {};
             }
-            const bool in_cooldown{node.GetId() == m_legacy_sync_cooldown_peer &&
-                                   now < m_legacy_sync_cooldown_until};
-            if (m_legacy_sync_peer == -1 && !in_cooldown) {
+            if (m_legacy_sync_peer == -1 && now >= peer.m_legacy_sync_retry_after) {
                 m_legacy_sync_peer = node.GetId();
                 m_legacy_sync_lease = now + LEGACY_SYNC_PROGRESS_LEASE;
+                // A fresh turn at the window: ask again from the current tip.
+                // Exhaustion was only ever a statement about what this peer had
+                // to offer at the time, and the chain may have moved since.
+                peer.m_legacy_sync_exhausted = false;
                 LogDebug(BCLog::NET, "Selected peer=%d for legacy B3Coin block sync\n", node.GetId());
             }
             if (m_legacy_sync_peer == node.GetId()) {
