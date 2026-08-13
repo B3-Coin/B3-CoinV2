@@ -147,6 +147,16 @@ static constexpr size_t MAX_LEGACY_BLOCK_QUEUE_SIZE{MAX_INV_SZ};
  * far below the peer's send-buffer pause threshold.
  */
 static constexpr size_t LEGACY_BLOCK_DOWNLOAD_WINDOW{32};
+/**
+ * Forward-progress lease on the legacy sync owner, independent of the
+ * per-request retry timer. It is renewed only when a connectable requested
+ * block from the owner advances synchronization; when it expires the owner is
+ * released (an ordinary stall, not misbehavior) and another eligible peer may
+ * claim the window. The expired owner sits out one lease period before it may
+ * claim again, so a stalled peer cannot immediately re-win the slot while
+ * alternatives exist.
+ */
+static constexpr auto LEGACY_SYNC_PROGRESS_LEASE{120s};
 /** Number of blocks that can be requested at any given time from a single peer. */
 static const int MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16;
 /** Default time during which a peer must stall block download progress before being disconnected.
@@ -936,6 +946,11 @@ private:
      * lets another eligible peer take over.
      */
     NodeId m_legacy_sync_peer GUARDED_BY(cs_main){-1};
+    /** Deadline of the owner's forward-progress lease (see LEGACY_SYNC_PROGRESS_LEASE). */
+    NodeClock::time_point m_legacy_sync_lease GUARDED_BY(cs_main){};
+    /** Peer whose lease last expired, barred from reclaiming until the time below. */
+    NodeId m_legacy_sync_cooldown_peer GUARDED_BY(cs_main){-1};
+    NodeClock::time_point m_legacy_sync_cooldown_until GUARDED_BY(cs_main){};
 
     /**
      * Bounded holding area for structurally-valid legacy-chain blocks that
@@ -1793,6 +1808,13 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
     LOCK(cs_main);
     if (m_legacy_sync_peer == nodeid) {
         m_legacy_sync_peer = -1;
+        m_legacy_sync_lease = {};
+    }
+    // A disconnecting peer carries no cooldown: the bar only applies to a peer
+    // that stalled while still connected.
+    if (m_legacy_sync_cooldown_peer == nodeid) {
+        m_legacy_sync_cooldown_peer = -1;
+        m_legacy_sync_cooldown_until = {};
     }
     {
         // We remove the PeerRef from g_peer_map here, but we don't always
@@ -5402,12 +5424,23 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                 }
             }
             // Any in-flight arrival proves the stream is alive; restart the
-            // stall timer from here.
+            // per-request stall timer from here.
             peer.m_legacy_request_time = NodeClock::now();
 
             std::optional<CBlockLocator> next_locator;
             {
                 LOCK(cs_main);
+                // Renew the owner's forward-progress lease only when this
+                // requested block actually advanced synchronization, i.e. it
+                // connected to the active chain. A peer that keeps answering
+                // getdata with blocks that never connect does not hold the
+                // window: the lease still expires and ownership moves on.
+                if (m_legacy_sync_peer == pfrom.GetId()) {
+                    const CBlockIndex* index{m_chainman.m_blockman.LookupBlockIndex(hash)};
+                    if (index && m_chainman.ActiveChain().Contains(index)) {
+                        m_legacy_sync_lease = NodeClock::now() + LEGACY_SYNC_PROGRESS_LEASE;
+                    }
+                }
                 if (const CBlockIndex* active_tip{m_chainman.ActiveChain().Tip()}) {
                     next_locator = GetLocator(active_tip);
                 }
@@ -6340,8 +6373,23 @@ bool PeerManagerImpl::SendMessages(CNode& node)
             // Old peers retain a per-connection inventory-known set, so only
             // one legacy-protocol peer may own this ordered download at a
             // time; the historical window is never duplicated across peers.
-            if (m_legacy_sync_peer == -1) {
+            const auto now{NodeClock::now()};
+            if (m_legacy_sync_peer != -1 && now >= m_legacy_sync_lease) {
+                // The owner made no synchronization progress for a full lease
+                // period. Release it -- an ordinary stall, not misbehavior --
+                // and bar it from immediately reclaiming so another eligible
+                // peer can take the window.
+                LogDebug(BCLog::NET, "Legacy sync peer=%d made no progress within the lease; releasing ownership\n",
+                         m_legacy_sync_peer);
+                m_legacy_sync_cooldown_peer = m_legacy_sync_peer;
+                m_legacy_sync_cooldown_until = now + LEGACY_SYNC_PROGRESS_LEASE;
+                m_legacy_sync_peer = -1;
+            }
+            const bool in_cooldown{node.GetId() == m_legacy_sync_cooldown_peer &&
+                                   now < m_legacy_sync_cooldown_until};
+            if (m_legacy_sync_peer == -1 && !in_cooldown) {
                 m_legacy_sync_peer = node.GetId();
+                m_legacy_sync_lease = now + LEGACY_SYNC_PROGRESS_LEASE;
                 LogDebug(BCLog::NET, "Selected peer=%d for legacy B3Coin block sync\n", node.GetId());
             }
             if (m_legacy_sync_peer == node.GetId()) {

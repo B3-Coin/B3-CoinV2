@@ -170,6 +170,57 @@ BOOST_AUTO_TEST_CASE(one_owner_deterministic_failover_no_duplicate_download)
     peerman.FinalizeNode(*nodes[2]);
 }
 
+BOOST_AUTO_TEST_CASE(stalled_sync_owner_is_reassigned_after_the_progress_lease)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ConnmanTestMsg& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    connman.SetPeerConnectTimeout(99999s);
+    PeerManager& peerman = *m_node.peerman;
+
+    const auto t0{std::chrono::seconds{1'700'000'000}};
+    SetMockTime(t0);
+
+    std::vector<std::unique_ptr<CNode>> nodes;
+    for (NodeId id{0}; id < 2; ++id) {
+        nodes.push_back(MakeNode(id));
+        connman.Handshake(*nodes.back(),
+                          /*successfully_connected=*/true,
+                          /*remote_services=*/ServiceFlags(NODE_NETWORK),
+                          /*local_services=*/ServiceFlags(NODE_NETWORK),
+                          /*version=*/legacy::P2P_PROTOCOL_VERSION,
+                          /*relay_txs=*/true);
+        BOOST_REQUIRE(!nodes.back()->fDisconnect);
+    }
+
+    // Peer 0 claims the window; peer 1 does not.
+    for (auto& node : nodes) BOOST_CHECK(peerman.SendMessages(*node));
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*nodes[0]), NetMsgType::GETBLOCKS), 1U);
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*nodes[1]), NetMsgType::GETBLOCKS), 0U);
+
+    // No block ever connects, so the owner makes no forward progress. Before
+    // the lease expires ownership is unchanged: peer 1 still gets nothing, and
+    // no disconnect is used to move the window.
+    SetMockTime(t0 + 119s);
+    for (auto& node : nodes) BOOST_CHECK(peerman.SendMessages(*node));
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*nodes[1]), NetMsgType::GETBLOCKS), 0U);
+    BOOST_CHECK(!nodes[0]->fDisconnect);
+    (void)DrainSentMessages(*nodes[0]);
+
+    // Past the lease, the stalled owner is released (not banned) and peer 1
+    // takes over on its own SendMessages pass.
+    SetMockTime(t0 + 121s);
+    BOOST_CHECK(peerman.SendMessages(*nodes[1]));
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*nodes[1]), NetMsgType::GETBLOCKS), 1U);
+    BOOST_CHECK(!nodes[0]->fDisconnect);
+
+    // The just-stalled peer 0 is in cooldown and cannot immediately reclaim.
+    BOOST_CHECK(peerman.SendMessages(*nodes[0]));
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*nodes[0]), NetMsgType::GETBLOCKS), 0U);
+
+    for (auto& node : nodes) peerman.FinalizeNode(*node);
+    SetMockTime(0s);
+}
+
 BOOST_AUTO_TEST_CASE(modern_capability_peer_does_not_own_the_legacy_window)
 {
     LOCK(NetEventsInterface::g_msgproc_mutex);
