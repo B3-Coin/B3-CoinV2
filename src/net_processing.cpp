@@ -36,6 +36,7 @@
 #include <netmessagemaker.h>
 #include <node/blockstorage.h>
 #include <node/connection_types.h>
+#include <node/legacy_orphanage.h>
 #include <node/protocol_version.h>
 #include <node/timeoffsets.h>
 #include <node/txdownloadman.h>
@@ -935,6 +936,13 @@ private:
      * lets another eligible peer take over.
      */
     NodeId m_legacy_sync_peer GUARDED_BY(cs_main){-1};
+
+    /**
+     * Bounded holding area for structurally-valid legacy-chain blocks that
+     * arrived before their parent (count/bytes/per-peer/expiry capped).
+     * Accessed only from the message-processing thread.
+     */
+    node::LegacyBlockOrphanage m_legacy_orphanage GUARDED_BY(g_msgproc_mutex);
 
     /** Stalling timeout for blocks in IBD */
     std::atomic<std::chrono::seconds> m_block_stalling_timeout{BLOCK_STALLING_TIMEOUT_DEFAULT};
@@ -5245,21 +5253,33 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         }
 
         // The historical B3Coin network can relay a child block before its
-        // parent. Its original client kept an orphan-block cache for that
-        // case, but this serial downloader only ever asks for one block at a
-        // time. Validate the context-free parts first, then restart the
-        // request from our connected tip instead of sending a valid legacy
-        // block into Core's missing-parent rejection path.
+        // parent. Its original client kept a bounded orphan-block cache for
+        // that case; keep one here so a structurally-valid child is retained
+        // (bounded by count, bytes, per-peer share, and expiry) instead of
+        // being re-downloaded, and restart the request from our connected tip
+        // rather than sending it into Core's missing-parent rejection path.
         const bool legacy_missing_parent{
             legacy_sync && !prev_block && !pblock->hashPrevBlock.IsNull()};
         if (legacy_missing_parent) {
+            // Context-free validation: no chain state involved, so cs_main is
+            // deliberately not held for this attacker-sized (up to 5 MB) work.
             BlockValidationState state;
-            const bool structurally_valid{WITH_LOCK(cs_main,
-                return CheckBlock(*pblock, state, m_chainparams.GetConsensus()))};
-            if (structurally_valid) {
+            const bool structurally_valid{CheckBlock(*pblock, state, m_chainparams.GetConsensus())};
+            if (!structurally_valid) {
+                // An objectively malformed block: its bytes fail context-free
+                // consensus checks regardless of any missing parent.
+                Misbehaving(peer, "invalid unknown-parent block");
+                return;
+            }
+            {
                 LogDebug(BCLog::NET,
                          "received legacy block %s before parent %s; requesting from connected tip peer=%d\n",
                          hash.ToString(), pblock->hashPrevBlock.ToString(), pfrom.GetId());
+
+                const auto now{NodeClock::now()};
+                m_legacy_orphanage.Expire(now);
+                (void)m_legacy_orphanage.Add(hash, pblock->hashPrevBlock, pblock, pfrom.GetId(),
+                                             GetSerializeSize(legacy::TX_LEGACY(*pblock)), now);
 
                 peer.m_legacy_sync_complete = false;
                 if (legacy_block_requested) {
@@ -5288,11 +5308,16 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                     peer.m_legacy_getblocks_in_flight = false;
                 }
 
+                // Only the sync owner drives discovery. Restarting getblocks
+                // for every peer that delivers an orphan lets any peer
+                // trigger repeated discovery traffic at will.
                 std::optional<CBlockLocator> next_locator;
                 {
                     LOCK(cs_main);
-                    if (const CBlockIndex* active_tip{m_chainman.ActiveChain().Tip()}) {
-                        next_locator = GetLocator(active_tip);
+                    if (m_legacy_sync_peer == pfrom.GetId()) {
+                        if (const CBlockIndex* active_tip{m_chainman.ActiveChain().Tip()}) {
+                            next_locator = GetLocator(active_tip);
+                        }
                     }
                 }
                 if (next_locator) {
@@ -5333,6 +5358,36 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             }
         }
         ProcessBlock(pfrom, pblock, forceProcessing, min_pow_checked);
+
+        if (legacy_sync) {
+            // Reprocess any cached orphans whose parent just arrived; each
+            // accepted child may in turn release its own children. The cache
+            // only holds structurally-validated blocks and is bounded, so this
+            // drain is bounded with it.
+            std::deque<uint256> connectable{hash};
+            while (!connectable.empty()) {
+                const uint256 parent{connectable.front()};
+                connectable.pop_front();
+                for (auto& entry : m_legacy_orphanage.TakeChildrenOf(parent)) {
+                    const uint256 child_hash{entry.block->GetMarkerHash(m_chainparams.GetConsensus())};
+                    bool child_min_pow_checked{false};
+                    {
+                        LOCK(cs_main);
+                        mapBlockSource.emplace(child_hash, std::make_pair(entry.from, true));
+                        const CBlockIndex* parent_index{m_chainman.m_blockman.LookupBlockIndex(parent)};
+                        if (parent_index && parent_index->nChainWork + GetBlockProof(*entry.block) >= GetAntiDoSWorkThreshold()) {
+                            child_min_pow_checked = true;
+                        }
+                    }
+                    LogDebug(BCLog::NET, "processing cached orphan %s now that parent %s arrived\n",
+                             child_hash.ToString(), parent.ToString());
+                    bool child_new_block{false};
+                    m_chainman.ProcessNewBlock(entry.block, /*force_processing=*/true,
+                                               child_min_pow_checked, &child_new_block);
+                    if (child_new_block) connectable.push_back(child_hash);
+                }
+            }
+        }
 
         if (legacy_block_requested) {
             // Bookkeeping happens whatever the connect outcome: a duplicate
