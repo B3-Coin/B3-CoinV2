@@ -6,6 +6,7 @@
 
 #include <clientversion.h>
 #include <consensus/amount.h>
+#include <legacy/codec.h>
 #include <logging.h>
 #include <primitives/transaction.h>
 #include <random.h>
@@ -39,6 +40,14 @@ namespace node {
 
 static const uint64_t MEMPOOL_DUMP_VERSION_NO_XOR_KEY{1};
 static const uint64_t MEMPOOL_DUMP_VERSION{2};
+/**
+ * B3 provenance-aware format: each transaction is prefixed with one byte of
+ * codec provenance (1 = legacy encoding, 0 = modern) and serialized with the
+ * codec it was decoded with. Versions 1 and 2 wrote every transaction with the
+ * modern codec regardless of provenance, which silently dropped a legacy
+ * transaction's nTime and changed its txid across a dump/load cycle.
+ */
+static const uint64_t MEMPOOL_DUMP_VERSION_B3_PROVENANCE{3};
 
 bool LoadMempool(CTxMemPool& pool, const fs::path& load_path, Chainstate& active_chainstate, ImportMempoolOptions&& opts)
 {
@@ -63,13 +72,14 @@ bool LoadMempool(CTxMemPool& pool, const fs::path& load_path, Chainstate& active
 
         if (version == MEMPOOL_DUMP_VERSION_NO_XOR_KEY) {
             file.SetObfuscation({});
-        } else if (version == MEMPOOL_DUMP_VERSION) {
+        } else if (version == MEMPOOL_DUMP_VERSION || version == MEMPOOL_DUMP_VERSION_B3_PROVENANCE) {
             Obfuscation obfuscation;
             file >> obfuscation;
             file.SetObfuscation(obfuscation);
         } else {
             return false;
         }
+        const bool provenance_aware{version == MEMPOOL_DUMP_VERSION_B3_PROVENANCE};
 
         uint64_t total_txns_to_load;
         file >> total_txns_to_load;
@@ -88,7 +98,23 @@ bool LoadMempool(CTxMemPool& pool, const fs::path& load_path, Chainstate& active
             CTransactionRef tx;
             int64_t nTime;
             int64_t nFeeDelta;
-            file >> TX_WITH_WITNESS(tx);
+            if (provenance_aware) {
+                // Restore each transaction with the codec it was decoded with,
+                // so its provenance -- and therefore its identity -- survives
+                // the round trip. Whether it is still admissible is decided by
+                // the era gate inside AcceptToMemoryPool below, which refuses
+                // legacy entries once the next block is modern: a pre-boundary
+                // mempool.dat can never repopulate a post-boundary node.
+                uint8_t legacy_encoded;
+                file >> legacy_encoded;
+                if (legacy_encoded != 0) {
+                    file >> legacy::TX_LEGACY(tx);
+                } else {
+                    file >> TX_WITH_WITNESS(tx);
+                }
+            } else {
+                file >> TX_WITH_WITNESS(tx);
+            }
             file >> nTime;
             file >> nFeeDelta;
 
@@ -179,7 +205,11 @@ bool DumpMempool(const CTxMemPool& pool, const fs::path& dump_path, FopenFn mock
     }
 
     try {
-        const uint64_t version{pool.m_opts.persist_v1_dat ? MEMPOOL_DUMP_VERSION_NO_XOR_KEY : MEMPOOL_DUMP_VERSION};
+        // The provenance-aware format is the default: it is the only encoding
+        // that round-trips a legacy transaction without dropping its nTime and
+        // changing its txid. persist_v1_dat keeps the stock downgrade format
+        // and with it the stock limitation.
+        const uint64_t version{pool.m_opts.persist_v1_dat ? MEMPOOL_DUMP_VERSION_NO_XOR_KEY : MEMPOOL_DUMP_VERSION_B3_PROVENANCE};
         file << version;
 
         if (!pool.m_opts.persist_v1_dat) {
@@ -194,7 +224,17 @@ bool DumpMempool(const CTxMemPool& pool, const fs::path& dump_path, FopenFn mock
         file << mempool_transactions_to_write;
         LogInfo("Writing %u mempool transactions to file...\n", mempool_transactions_to_write);
         for (const auto& i : vinfo) {
-            file << TX_WITH_WITNESS(*(i.tx));
+            if (!pool.m_opts.persist_v1_dat) {
+                const bool legacy_encoded{i.tx->IsLegacyEncoded()};
+                file << uint8_t{legacy_encoded};
+                if (legacy_encoded) {
+                    file << legacy::TX_LEGACY(*(i.tx));
+                } else {
+                    file << TX_WITH_WITNESS(*(i.tx));
+                }
+            } else {
+                file << TX_WITH_WITNESS(*(i.tx));
+            }
             file << int64_t{count_seconds(i.m_time)};
             file << int64_t{i.nFeeDelta};
             mapDeltas.erase(i.tx->GetHash());
