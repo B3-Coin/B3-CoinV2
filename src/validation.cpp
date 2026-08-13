@@ -380,13 +380,19 @@ void Chainstate::MaybeUpdateMempoolForReorg(
         }
 
         // If the transaction spends any coinbase outputs, it must be mature.
+        // Legacy-era coinstake outputs carry the same maturity rule, matching
+        // the legacy admission checks.
         if (it->GetSpendsCoinbase()) {
+            const bool next_block_legacy{
+                Consensus::GetB3Era(m_chain.Tip()->nHeight + 1, m_chainman.GetConsensus()) ==
+                Consensus::B3Era::LEGACY};
             for (const CTxIn& txin : tx.vin) {
                 if (m_mempool->exists(txin.prevout.hash)) continue;
                 const Coin& coin{CoinsTip().AccessCoin(txin.prevout)};
                 assert(!coin.IsSpent());
                 const auto mempool_spend_height{m_chain.Tip()->nHeight + 1};
-                if (coin.IsCoinBase() && mempool_spend_height - coin.nHeight < COINBASE_MATURITY) {
+                if ((coin.IsCoinBase() || (next_block_legacy && coin.IsCoinStake())) &&
+                    mempool_spend_height - coin.nHeight < COINBASE_MATURITY) {
                     return true;
                 }
             }
@@ -443,6 +449,22 @@ static bool CheckInputsFromMempoolAndCache(const CTransaction& tx, TxValidationS
     // Call CheckInputScripts() to cache signature and script validity against current tip consensus rules.
     return CheckInputScripts(tx, state, view, flags, /* cacheSigStore= */ true, /* cacheFullScriptStore= */ true, txdata, validation_cache);
 }
+
+// Legacy-era input rules (maturity for coinbase and coinstake, input-time
+// ordering, proof-of-integration fee accounting); defined with the other
+// legacy block helpers below and shared with the mempool accept path.
+static bool CheckLegacyTxInputs(const CTransaction& tx, TxValidationState& state,
+                                const CCoinsViewCache& inputs, int spend_height,
+                                CAmount& txfee, CAmount& value_in);
+
+//! Frozen legacy-era consensus script flags (the legacy branch of
+//! GetBlockScriptFlags); also used by the mempool for legacy-era admission.
+static constexpr script_verify_flags LEGACY_BLOCK_SCRIPT_FLAGS{
+    SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_NULLDUMMY |
+    SCRIPT_VERIFY_LEGACY_B3_STRICTENC | SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY};
+
+//! The modern (deployment-derived) branch of GetBlockScriptFlags.
+static script_verify_flags GetModernBlockScriptFlags(const CBlockIndex& block_index, const ChainstateManager& chainman);
 
 namespace {
 
@@ -809,6 +831,23 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // Alias what we need out of ws
     TxValidationState& state = ws.m_state;
 
+    // B3: mempool admission is defined by the era of the NEXT block, the one
+    // this pool feeds. Before the finalized boundary only legacy-encoded
+    // transactions are eligible, validated under legacy next-block rules; from
+    // the moment H is the active tip only modern-encoded transactions are.
+    // The encoding is the transaction's decode provenance (per-peer wire
+    // codec, block codec, or local construction) and is never reinterpreted
+    // here; a mismatch is rejected outright. This single gate covers every
+    // admission path: P2P, RPC, wallet, packages, reorg resurrection and
+    // mempool.dat reload all funnel through PreChecks.
+    const int next_block_height{m_active_chainstate.m_chain.Height() + 1};
+    const bool next_block_legacy{Consensus::GetB3Era(next_block_height, m_active_chainstate.m_chainman.GetConsensus()) ==
+                                 Consensus::B3Era::LEGACY};
+    if (next_block_legacy != tx.IsLegacyEncoded()) {
+        return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                             next_block_legacy ? "modern-txn-in-legacy-era" : "legacy-txn-in-modern-era");
+    }
+
     if (!CheckTransaction(tx, state)) {
         return false; // state filled in by CheckTransaction
     }
@@ -816,6 +855,12 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // Coinbase is only valid in a block, not as a loose transaction
     if (tx.IsCoinBase())
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "coinbase");
+
+    // A coinstake is likewise only valid inside a block. The historical client
+    // refused "coinstake as individual tx"; the modern era has no standalone
+    // coinstake either.
+    if (tx.IsCoinStake())
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, "coinstake");
 
     // Rather not work on nonstandard transactions (unless -testnet/-regtest)
     std::string reason;
@@ -903,7 +948,15 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     }
 
     // The mempool holds txs for the next block, so pass height+1 to CheckTxInputs
-    if (!Consensus::CheckTxInputs(tx, state, m_view, m_active_chainstate.m_chain.Height() + 1, ws.m_base_fees)) {
+    if (next_block_legacy) {
+        // Legacy next-block input rules: coinbase AND coinstake maturity, the
+        // input-time ordering rule (an input's transaction time may not exceed
+        // the spender's), and proof-of-integration fee accounting.
+        CAmount legacy_value_in{0};
+        if (!CheckLegacyTxInputs(tx, state, m_view, next_block_height, ws.m_base_fees, legacy_value_in)) {
+            return false; // state filled in by CheckLegacyTxInputs
+        }
+    } else if (!Consensus::CheckTxInputs(tx, state, m_view, next_block_height, ws.m_base_fees)) {
         return false; // state filled in by CheckTxInputs
     }
 
@@ -919,11 +972,13 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     int64_t nSigOpsCost = GetTransactionSigOpCost(tx, m_view, STANDARD_SCRIPT_VERIFY_FLAGS);
 
     // Keep track of transactions that spend a coinbase, which we re-scan
-    // during reorgs to ensure COINBASE_MATURITY is still met.
+    // during reorgs to ensure COINBASE_MATURITY is still met. In the legacy
+    // era coinstake outputs carry the same maturity rule, so their spends are
+    // flagged for the same re-scan.
     bool fSpendsCoinbase = false;
     for (const CTxIn &txin : tx.vin) {
         const Coin &coin = m_view.AccessCoin(txin.prevout);
-        if (coin.IsCoinBase()) {
+        if (coin.IsCoinBase() || (next_block_legacy && coin.IsCoinStake())) {
             fSpendsCoinbase = true;
             break;
         }
@@ -1189,7 +1244,16 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     // There is a similar check in CreateNewBlock() to prevent creating
     // invalid blocks (using TestBlockValidity), however allowing such
     // transactions into the mempool can be exploited as a DoS attack.
-    script_verify_flags currentBlockScriptVerifyFlags{GetBlockScriptFlags(*m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman)};
+    // B3: the consensus flags must be the NEXT block's. Everywhere except the
+    // finalized boundary this equals the tip's flags, but at tip == H the next
+    // block is modern while the tip is legacy, and a modern transaction must
+    // not be cached as valid under legacy flags (which check no witness data).
+    const bool next_block_legacy{
+        Consensus::GetB3Era(m_active_chainstate.m_chain.Height() + 1, m_active_chainstate.m_chainman.GetConsensus()) ==
+        Consensus::B3Era::LEGACY};
+    const script_verify_flags currentBlockScriptVerifyFlags{
+        next_block_legacy ? LEGACY_BLOCK_SCRIPT_FLAGS
+                          : GetModernBlockScriptFlags(*m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman)};
     if (!CheckInputsFromMempoolAndCache(tx, state, m_view, m_pool, currentBlockScriptVerifyFlags,
                                         ws.m_precomputed_txdata, m_active_chainstate.CoinsTip(), GetValidationCache())) {
         LogError("BUG! PLEASE REPORT THIS! CheckInputScripts failed against latest-block but not STANDARD flags %s, %s", hash.ToString(), state.ToString());
@@ -2322,18 +2386,20 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
 
 script_verify_flags GetBlockScriptFlags(const CBlockIndex& block_index, const ChainstateManager& chainman)
 {
-    const Consensus::Params& consensusparams = chainman.GetConsensus();
-
-    if (Consensus::GetB3Era(block_index.nHeight, consensusparams) == Consensus::B3Era::LEGACY) {
+    if (Consensus::GetB3Era(block_index.nHeight, chainman.GetConsensus()) == Consensus::B3Era::LEGACY) {
         // Frozen from the old B3Coin ConnectBlock path. Its VerifyScript
         // implementation evaluated P2SH redeem scripts unconditionally;
         // LEGACY_B3_STRICTENC preserves its strict DER, low-S, and pubkey
         // rules without applying modern defined-sighash enforcement.
         // Witness, CSV, and Taproot were not legacy consensus rules.
-        return SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_NULLDUMMY |
-               SCRIPT_VERIFY_LEGACY_B3_STRICTENC |
-               SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY;
+        return LEGACY_BLOCK_SCRIPT_FLAGS;
     }
+    return GetModernBlockScriptFlags(block_index, chainman);
+}
+
+static script_verify_flags GetModernBlockScriptFlags(const CBlockIndex& block_index, const ChainstateManager& chainman)
+{
+    const Consensus::Params& consensusparams = chainman.GetConsensus();
 
     // BIP16 didn't become active until Apr 1 2012 (on mainnet, and
     // retroactively applied to testnet)
@@ -3366,6 +3432,22 @@ bool Chainstate::ConnectTip(
     if (m_mempool) {
         m_mempool->removeForBlock(block_to_connect->vtx, pindexNew->nHeight);
         disconnectpool.removeForBlock(block_to_connect->vtx);
+        // B3: connecting the final legacy block H flips the next-block era to
+        // modern. Every remaining entry is legacy-encoded (admission allowed
+        // nothing else while the next block was legacy) and can never be mined
+        // again -- no reorganization may cross the boundary -- so the pool is
+        // emptied here, atomically under cs_main and the mempool lock, before
+        // any modern admission can happen. Entries are dropped, never
+        // reinterpreted as modern transactions.
+        if (const std::optional<int> final_height{Consensus::LegacyFinalHeight(m_chainman.GetConsensus())};
+            final_height && pindexNew->nHeight == *final_height) {
+            const auto legacy_entries{m_mempool->infoAll()};
+            for (const auto& entry : legacy_entries) {
+                m_mempool->removeRecursive(*entry.tx, MemPoolRemovalReason::REORG);
+            }
+            LogInfo("Cleared %zu legacy mempool transaction(s): the final legacy block %s (height %d) is connected and the next block is modern\n",
+                    legacy_entries.size(), pindexNew->GetBlockHash().ToString(), pindexNew->nHeight);
+        }
     }
     // Update m_chain & related variables.
     m_chain.SetTip(*pindexNew);
