@@ -111,6 +111,22 @@ struct Params {
      */
     std::optional<uint256> legacy_final_hash;
     /**
+     * Historical hardened checkpoints of the live legacy chain (height -> exact
+     * block hash), ported verbatim from the historical client. A legacy block
+     * accepted at a pinned height must hash to the pinned value. Empty on chains
+     * with no legacy history. Applies to live legacy validation only, never to
+     * post-X trusted replay (which verifies its own configured checkpoints).
+     */
+    std::map<int, uint256> legacy_checkpoints;
+    /**
+     * Rolling maximum reorg depth for the live legacy chain (the historical
+     * client's nCheckpointSpan). A legacy block whose height is at least this
+     * far below the active tip is refused (without peer penalty). Zero disables
+     * the rule. Live legacy validation only; never applied during trusted
+     * replay of the settled pre-X prefix or in the modern era.
+     */
+    int legacy_checkpoint_span{0};
+    /**
      * Hashes of blocks that
      * - are known to be consensus valid, and
      * - buried in the chain, and

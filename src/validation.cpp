@@ -4688,6 +4688,32 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         if (block.Time() > NodeClock::now() + std::chrono::seconds{legacy::MAX_FUTURE_BLOCK_TIME}) {
             return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new", "block timestamp too far in the future");
         }
+
+        // Live-legacy historical checkpoint rules (mode: PRE-X LIVE LEGACY).
+        // These are not consulted by trusted replay of the settled pre-X prefix
+        // (a separate engine) and never run for the modern era.
+        //
+        // Hardened checkpoints: a block at a pinned height must match its pinned
+        // hash. A mismatch is a hard, bannable rejection, as in the historical
+        // client. Identity is the marker hash, exactly as elsewhere.
+        if (!legacy::CheckpointAllows(consensusParams, nHeight, block.GetMarkerHash(consensusParams))) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-legacy-checkpoint",
+                                 strprintf("legacy block at height %d does not match its hardened checkpoint", nHeight));
+        }
+        // Rolling deep-reorg bound: a block more than the historical span below
+        // the active tip is refused, so a peer cannot spam deep-fork history or
+        // force an unboundedly deep reorg. This is measured against the live
+        // active tip, so it must be skipped while importing/reindexing our own
+        // blocks from disk (which may be read out of height order), and it is a
+        // no-penalty rejection: an honest node on a stale branch can hit it.
+        if (!blockman.LoadingBlocks()) {
+            if (const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+                tip && legacy::ReorgDepthExceeded(consensusParams, nHeight, tip->nHeight)) {
+                return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "legacy-reorg-too-deep",
+                                     strprintf("legacy block at height %d is more than %d blocks below the tip at %d",
+                                               nHeight, consensusParams.legacy_checkpoint_span, tip->nHeight));
+            }
+        }
         return true;
     }
     if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))

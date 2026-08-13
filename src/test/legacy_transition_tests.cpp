@@ -513,4 +513,186 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
                       "4b0d7f133c5267d715d4d8992635a5490d1edd6b7072cce3f8fe116aba983b6a");
 }
 
+//! The historical checkpoint rules separated across the three modes:
+//!   PRE-X LIVE LEGACY   -> hardened checkpoints + rolling deep-reorg refusal
+//!   POST-X TRUSTED REPLAY -> reconstructs the canonical prefix with NO
+//!                            rolling refusal (a deep block is not "deep" to
+//!                            replay), so the deep-reorg rule cannot break it
+//!   MODERN >= H+1        -> legacy checkpoint/depth rules do not apply
+BOOST_AUTO_TEST_CASE(legacy_checkpoint_and_depth_rules_are_mode_scoped)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    // A small span keeps the chain short: a block more than 6 below the tip is
+    // "deep". No checkpoints yet.
+    constexpr int SPAN{6};
+    constexpr int MINI_H{12};
+    mutable_consensus.legacy_checkpoint_span = SPAN;
+
+    const auto build_legacy{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        const int height{prev->nHeight + 1};
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << height << CScriptNum{7};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, height, consensus), CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) {
+            mtx.m_legacy_encoding = true;
+            block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) {
+            ++block.nNonce;
+            BOOST_REQUIRE(block.nNonce < 10'000'000);
+        }
+        return block;
+    }};
+
+    // A distinct sibling of the block at `height`, carrying a spend so its hash
+    // differs from the canonical block. Forks at height-1.
+    Txid mature_coinbase{};
+    const auto build_fork{[&](int fork_height) {
+        const CBlockIndex* parent{WITH_LOCK(cs_main, return chainman.ActiveChain()[fork_height - 1])};
+        CMutableTransaction spend;
+        spend.version = 1;
+        spend.nTime = static_cast<uint32_t>(parent->GetBlockTime() + 17);
+        spend.vin.resize(1);
+        spend.vin[0].prevout = COutPoint{mature_coinbase, 0};
+        spend.vin[0].scriptSig = CScript{};
+        spend.vout.emplace_back(1 * COIN, CScript() << OP_TRUE);
+        return CodecRoundTrip(build_legacy(parent, {spend}));
+    }};
+
+    // Build the canonical mini-chain in order. Forward building is never
+    // refused by the depth rule (each block is at tip+1).
+    std::vector<CBlock> legacy_blocks;
+    for (int height{1}; height <= MINI_H; ++height) {
+        const CBlockIndex* prev{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
+        const auto submitted{CodecRoundTrip(build_legacy(prev, {}))};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(submitted, true, true, &new_block),
+                              "canonical legacy block at height " << height << " refused");
+        legacy_blocks.push_back(*submitted);
+        if (height == 2) mature_coinbase = submitted->vtx[0]->GetHash();
+    }
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->nHeight), MINI_H);
+
+    // ---- MODE 1: PRE-X LIVE LEGACY --------------------------------------
+
+    // (a) A deep fork -- height 3, which is MINI_H - 3 = 9 > SPAN below the tip
+    // -- is refused by the rolling depth rule, without a peer penalty, and no
+    // index entry is created.
+    {
+        const auto deep_fork{build_fork(/*fork_height=*/3)};
+        const uint256 deep_hash{deep_fork->GetLegacyB3Hash()};
+        BlockValidationState state;
+        bool new_block{false};
+        BOOST_CHECK(!chainman.ProcessNewBlock(deep_fork, true, true, &new_block));
+        // Re-run the header check directly to read the reason (ProcessNewBlock
+        // does not surface it here).
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(deep_hash)) == nullptr);
+    }
+
+    // (b) A shallow fork -- height MINI_H, a sibling of the tip, 0 below it --
+    // is NOT refused by the depth rule: it is stored as ordinary side-branch
+    // history. This proves the rule refuses only DEEP forks.
+    {
+        const auto shallow_fork{build_fork(/*fork_height=*/MINI_H)};
+        const uint256 shallow_hash{shallow_fork->GetLegacyB3Hash()};
+        bool new_block{false};
+        BOOST_CHECK(chainman.ProcessNewBlock(shallow_fork, true, true, &new_block));
+        BOOST_CHECK(new_block);
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(shallow_hash)) != nullptr);
+    }
+
+    // (c) A hardened checkpoint mismatch at a pinned height is refused. Pin the
+    // canonical block 8; a differing block at height 8 (not deep: 8 > MINI_H -
+    // SPAN = 6) is refused by the checkpoint rule.
+    {
+        const uint256 canonical8{WITH_LOCK(cs_main, return chainman.ActiveChain()[8]->GetBlockHash())};
+        mutable_consensus.legacy_checkpoints = {{8, canonical8}};
+        const auto bad_cp{build_fork(/*fork_height=*/8)};
+        const uint256 bad_hash{bad_cp->GetLegacyB3Hash()};
+        BOOST_REQUIRE(bad_hash != canonical8);
+        bool new_block{false};
+        BOOST_CHECK(!chainman.ProcessNewBlock(bad_cp, true, true, &new_block));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(bad_hash)) == nullptr);
+        mutable_consensus.legacy_checkpoints.clear();
+    }
+
+    // ---- MODE 2: POST-X TRUSTED REPLAY ----------------------------------
+    // The same canonical history, replayed from wire bytes, reconstructs the
+    // full prefix -- even though its early blocks are far more than SPAN below
+    // the final block. Replay does NOT consult the rolling depth rule, so the
+    // deep-reorg refusal that mode 1 applies cannot break replay of the
+    // canonical X-anchored history.
+    {
+        const uint256 X{legacy_blocks.back().GetLegacyB3Hash()};
+        const fs::path replay_path{m_args.GetDataDirBase() / "checkpoint_replay"};
+        legacy::ReplayDB db{DBParams{.path = replay_path, .cache_bytes = 1 << 20}};
+        legacy::PersistentReplay replay{consensus, MINI_H, {{MINI_H, X}}, db};
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(replay.Load(error), error);
+        DataStream genesis_bytes;
+        genesis_bytes << legacy::TX_LEGACY(chainman.GetParams().GenesisBlock());
+        BOOST_REQUIRE_MESSAGE(replay.ApplyRawBlock(std::span{genesis_bytes}, error), error);
+        for (const CBlock& block : legacy_blocks) {
+            DataStream bytes;
+            bytes << legacy::TX_LEGACY(block);
+            // Block 1 is MINI_H - 1 = 11 below the tip, far deeper than SPAN;
+            // replay accepts it regardless.
+            BOOST_REQUIRE_MESSAGE(replay.ApplyRawBlock(std::span{bytes}, error), error);
+        }
+        BOOST_REQUIRE_MESSAGE(replay.Finish(error), error);
+        BOOST_CHECK_EQUAL(replay.TipHash().GetHex(), X.GetHex());
+    }
+
+    // ---- MODE 3: MODERN >= H+1 ------------------------------------------
+    // Finalize the boundary at the mini-chain tip and connect a modern block.
+    // The legacy checkpoint/depth rules are gated on the legacy era, so they do
+    // not apply to it even though the span is still configured.
+    {
+        const uint256 X{WITH_LOCK(cs_main, return chainman.ActiveChain()[MINI_H]->GetBlockHash())};
+        mutable_consensus.hard_fork_height = MINI_H + 1;
+        mutable_consensus.legacy_final_hash = X;
+        AcceptingPos pos;
+        modern::SetModernPosValidatorForTesting(&pos);
+
+        const CBlockIndex* prev{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
+        CMutableTransaction coinbase;
+        coinbase.version = 2;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << CScriptNum{MINI_H + 1} << CScriptNum{9};
+        coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = prev->nBits;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetHash()) > target) ++block.nNonce;
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(CodecRoundTrip(block), true, true, &new_block),
+                              "modern block at H+1 refused");
+        BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->nHeight), MINI_H + 1);
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

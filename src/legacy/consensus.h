@@ -12,6 +12,7 @@
 #include <uint256.h>
 
 #include <cstdint>
+#include <map>
 #include <optional>
 
 class CBlock;
@@ -124,6 +125,34 @@ CAmount GetLegacyTransactionFee(CAmount value_in, CAmount value_out, bool is_coi
  * no Fundamental Node mechanism is enabled by this function.
  */
 bool IsHistoricalStakeRewardCapException(int height);
+
+/**
+ * Historical hardened checkpoints of the B3 mainnet chain and the rolling
+ * reorg-depth span (nCheckpointSpan), ported verbatim from the historical
+ * client's checkpoints.cpp. Installed into CMainParams; other chains carry
+ * their own (test chains have none). Never invent new heights or a new span.
+ */
+inline constexpr int LEGACY_CHECKPOINT_SPAN{500};
+const std::map<int, uint256>& MainnetCheckpoints();
+
+/**
+ * Live-legacy hardened checkpoint rule (Checkpoints::CheckHardened). Returns
+ * false only when `height` is a pinned checkpoint and `hash` is not the pinned
+ * value; heights with no checkpoint always pass. A false result is a hard,
+ * bannable rejection in the historical client (DoS 100).
+ */
+bool CheckpointAllows(const Consensus::Params& params, int height, const uint256& hash);
+
+/**
+ * Live-legacy rolling deep-reorg rule (Checkpoints::CheckSync). Returns true
+ * when a block at `block_height` is too deep to accept given the active tip at
+ * `active_tip_height`: it lies at or below active_tip_height - span, so
+ * accepting it would reorganize more than `span` blocks. The span comes from
+ * params (zero disables the rule). A true result rejects the block WITHOUT a
+ * peer penalty in the historical client. Must not be consulted during trusted
+ * replay of the settled pre-X prefix.
+ */
+bool ReorgDepthExceeded(const Consensus::Params& params, int block_height, int active_tip_height);
 
 } // namespace legacy
 

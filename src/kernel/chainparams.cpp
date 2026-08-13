@@ -12,6 +12,7 @@
 #include <crypto/hex_base.h>
 #include <hash.h>
 #include <kernel/messagestartchars.h>
+#include <legacy/consensus.h>
 #include <legacy/primitives.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
@@ -133,6 +134,9 @@ public:
         m_chain_type = ChainType::MAIN;
         consensus.legacy_b3coin = true;
         consensus.legacy_last_pow_block = 500;
+        // Historical live-legacy checkpoint rules, ported verbatim.
+        consensus.legacy_checkpoints = legacy::MainnetCheckpoints();
+        consensus.legacy_checkpoint_span = legacy::LEGACY_CHECKPOINT_SPAN;
         consensus.signet_blocks = false;
         consensus.signet_challenge.clear();
         consensus.nSubsidyHalvingInterval = 210000;
