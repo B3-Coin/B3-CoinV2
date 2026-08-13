@@ -376,6 +376,19 @@ public:
     CBlockIndex* LookupBlockIndex(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     const CBlockIndex* LookupBlockIndex(const uint256& hash) const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+    /**
+     * True if `block` can never become part of the active chain because it lies
+     * off the chain anchored by the finalized legacy boundary hash X: activating
+     * it would reorganize across that boundary. This is a topological property
+     * of the block relative to X, independent of any chain tip, and is stable
+     * once X is present in the block index. Returns false while the boundary is
+     * unconfigured or X is not yet known, so a block is never classified before
+     * it can be judged, and it never treats a block as violating its own legacy
+     * rules. Used to keep such blocks out of both fork choice and best-header
+     * selection without erasing their recorded chain work.
+     */
+    bool IsAnchorIneligible(const CBlockIndex& block) const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
     /** Get block file info entry for one block file */
     CBlockFileInfo* GetBlockFileInfo(size_t n);
 

@@ -235,6 +235,31 @@ const CBlockIndex* BlockManager::LookupBlockIndex(const uint256& hash) const
     return it == m_block_index.end() ? nullptr : &it->second;
 }
 
+bool BlockManager::IsAnchorIneligible(const CBlockIndex& block) const
+{
+    AssertLockHeld(cs_main);
+
+    const Consensus::Params& params{GetConsensus()};
+    const std::optional<int> final_height{Consensus::LegacyFinalHeight(params)};
+    // Not classifiable unless both the boundary height H and the finalized
+    // hash X are configured: without X there is no anchor to measure against.
+    if (!final_height || !params.legacy_final_hash) return false;
+
+    const CBlockIndex* pindexX{LookupBlockIndex(*params.legacy_final_hash)};
+    // X itself is not in the index yet, so the block's relationship to it is
+    // not yet determined; it will be reclassified once X is known.
+    if (!pindexX) return false;
+
+    const int H{*final_height};
+    if (block.nHeight <= H) {
+        // At or below H a block is eligible only if it is on the canonical
+        // prefix, i.e. it is X itself or one of X's ancestors.
+        return pindexX->GetAncestor(block.nHeight) != &block;
+    }
+    // Above H a block is eligible only if it descends from X.
+    return block.GetAncestor(H) != pindexX;
+}
+
 CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockIndex*& best_header)
 {
     AssertLockHeld(cs_main);
@@ -265,7 +290,18 @@ CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockInde
     pindexNew->nTimeMax = (pindexNew->pprev ? std::max(pindexNew->pprev->nTimeMax, pindexNew->nTime) : pindexNew->nTime);
     pindexNew->nChainWork = (pindexNew->pprev ? pindexNew->pprev->nChainWork : 0) + GetBlockProof(*pindexNew);
     pindexNew->RaiseValidity(BLOCK_VALID_TREE);
-    if (best_header == nullptr || best_header->nChainWork < pindexNew->nChainWork) {
+    // A block off the finalized legacy boundary anchor keeps its recorded chain
+    // work but must never influence fork choice or sync targeting. Classify it
+    // once, here at creation, so the status is authoritative (and persisted)
+    // from the moment the index entry exists: it is then excluded from
+    // best-header selection below, and from setBlockIndexCandidates when its
+    // data arrives. Its chain work is deliberately not erased.
+    if (IsAnchorIneligible(*pindexNew)) {
+        pindexNew->nStatus |= BLOCK_ANCHOR_INELIGIBLE;
+        m_dirty_blockindex.insert(pindexNew);
+    }
+    if ((best_header == nullptr || best_header->nChainWork < pindexNew->nChainWork) &&
+        !(pindexNew->nStatus & BLOCK_ANCHOR_INELIGIBLE)) {
         best_header = pindexNew;
     }
 

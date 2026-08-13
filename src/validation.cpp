@@ -3407,26 +3407,10 @@ bool Chainstate::ConnectTip(
 bool Chainstate::IsAnchorIneligible(const CBlockIndex& block) const
 {
     AssertLockHeld(::cs_main);
-
-    const Consensus::Params& params{m_chainman.GetConsensus()};
-    const std::optional<int> final_height{Consensus::LegacyFinalHeight(params)};
-    // Not classifiable unless both the boundary height H and the finalized
-    // hash X are configured: without X there is no anchor to measure against.
-    if (!final_height || !params.legacy_final_hash) return false;
-
-    const CBlockIndex* pindexX{m_blockman.LookupBlockIndex(*params.legacy_final_hash)};
-    // X itself is not in our index yet, so the block's relationship to it is
-    // not yet determined. It will be reclassified once X is known.
-    if (!pindexX) return false;
-
-    const int H{*final_height};
-    if (block.nHeight <= H) {
-        // At or below H a block is eligible only if it is on the canonical
-        // prefix, i.e. it is X itself or one of X's ancestors.
-        return pindexX->GetAncestor(block.nHeight) != &block;
-    }
-    // Above H a block is eligible only if it descends from X.
-    return block.GetAncestor(H) != pindexX;
+    // The property is topological and index-level; BlockManager owns it so that
+    // best-header selection (in AddToBlockIndex) and fork choice share one
+    // definition.
+    return m_blockman.IsAnchorIneligible(block);
 }
 
 CBlockIndex* Chainstate::FindMostWorkChain()
@@ -3979,13 +3963,15 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
             }
             if (!CBlockIndexWorkComparator()(candidate, new_tip) &&
                 candidate->IsValid(BLOCK_VALID_TRANSACTIONS) &&
-                candidate->HaveNumChainTxs()) {
+                candidate->HaveNumChainTxs() &&
+                !m_blockman.IsAnchorIneligible(*candidate)) {
                 setBlockIndexCandidates.insert(candidate);
                 // Do not remove candidate from the highpow_outofchain_headers cache, because it might be a descendant of the block being invalidated
                 // which needs to be marked failed later.
             }
             if (best_header_needs_update &&
-                m_chainman.m_best_header->nChainWork < candidate->nChainWork) {
+                m_chainman.m_best_header->nChainWork < candidate->nChainWork &&
+                !m_blockman.IsAnchorIneligible(*candidate)) {
                 m_chainman.m_best_header = candidate;
             }
             ++candidate_it;
@@ -5578,7 +5564,8 @@ bool ChainstateManager::LoadBlockIndex()
             if (pindex->nStatus & BLOCK_FAILED_VALID && (!m_best_invalid || pindex->nChainWork > m_best_invalid->nChainWork)) {
                 m_best_invalid = pindex;
             }
-            if (pindex->IsValid(BLOCK_VALID_TREE) && (m_best_header == nullptr || CBlockIndexWorkComparator()(m_best_header, pindex)))
+            if (pindex->IsValid(BLOCK_VALID_TREE) && (m_best_header == nullptr || CBlockIndexWorkComparator()(m_best_header, pindex)) &&
+                !m_blockman.IsAnchorIneligible(*pindex))
                 m_best_header = pindex;
         }
     }
@@ -5966,8 +5953,12 @@ void ChainstateManager::CheckBlockIndex() const
             // block, and must be set if it is.
             assert((pindex->m_chain_tx_count != 0) == (pindex == snap_base));
         }
-        // There should be no block with more work than m_best_header, unless it's known to be invalid
-        assert((pindex->nStatus & BLOCK_FAILED_VALID) || pindex->nChainWork <= m_best_header->nChainWork);
+        // There should be no block with more work than m_best_header, unless it's
+        // known to be invalid or it lies off the finalized legacy boundary anchor
+        // (anchor-ineligible blocks keep their recorded work but are excluded from
+        // best-header selection).
+        assert((pindex->nStatus & BLOCK_FAILED_VALID) || (pindex->nStatus & BLOCK_ANCHOR_INELIGIBLE) ||
+               pindex->nChainWork <= m_best_header->nChainWork);
 
         // Chainstate-specific checks on setBlockIndexCandidates
         for (const auto& c : m_chainstates) {
@@ -6929,7 +6920,8 @@ void ChainstateManager::RecalculateBestHeader()
     AssertLockHeld(cs_main);
     m_best_header = ActiveChain().Tip();
     for (auto& entry : m_blockman.m_block_index) {
-        if (!(entry.second.nStatus & BLOCK_FAILED_VALID) && m_best_header->nChainWork < entry.second.nChainWork) {
+        if (!(entry.second.nStatus & BLOCK_FAILED_VALID) && m_best_header->nChainWork < entry.second.nChainWork &&
+            !m_blockman.IsAnchorIneligible(entry.second)) {
             m_best_header = &entry.second;
         }
     }

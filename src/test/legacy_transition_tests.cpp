@@ -375,6 +375,11 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
         BOOST_CHECK(!cs.setBlockIndexCandidates.contains(evil_index));
         BOOST_CHECK(cs.IsAnchorIneligible(*evil_index));
         BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->GetBlockHash().GetHex(), tip_before.GetHex());
+        // Sync-control state is not poisoned either: despite its greater work,
+        // the block is not selected as the best header.
+        BOOST_CHECK(chainman.m_best_header != evil_index);
+        BOOST_CHECK(!chainman.m_blockman.IsAnchorIneligible(*chainman.m_best_header));
+        BOOST_CHECK_EQUAL(chainman.m_best_header->GetBlockHash().GetHex(), tip_before.GetHex());
     }
 
     // ---- (6)+(7) Marker-modern blocks from H+1 through the modern
