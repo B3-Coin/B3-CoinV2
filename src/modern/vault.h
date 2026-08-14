@@ -105,7 +105,7 @@ inline VaultCheck CheckVaultWithdrawal(const std::vector<ModernOutput>& prev_out
                                        const Consensus::Params& params,
                                        std::vector<uint256>* consumed_out = nullptr)
 {
-    if (!AssetPoliciesActiveSlot()) return VaultCheck::NOT_ACTIVE;
+    if (!params.test_only_asset_policies_active) return VaultCheck::NOT_ACTIVE;
     if (CheckAssetConservation(prev_outputs, t, height, params) != AssetCheck::OK) {
         return VaultCheck::BASE_INVALID;
     }

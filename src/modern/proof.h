@@ -168,9 +168,10 @@ inline std::optional<std::vector<uint256>> ParseVaultReceiptIds(
  * match it, and each policy defines its v1 payload rules.
  */
 inline ProofCheck VerifyTransitionProof(const ModernOutput& prev_output,
-                                        const TransitionProof& proof)
+                                        const TransitionProof& proof,
+                                        const bool assets_active = false)
 {
-    if (!IsActivatedPolicy(prev_output.policy_type, prev_output.policy_version)) {
+    if (!IsActivatedPolicy(prev_output.policy_type, prev_output.policy_version, assets_active)) {
         return ProofCheck::UNKNOWN_POLICY;
     }
     if (proof.proof_type != prev_output.policy_type ||
@@ -223,14 +224,15 @@ inline ProofCheck VerifyTransitionProof(const ModernOutput& prev_output,
  * position — then dispatches each proof by its previous output's policy.
  */
 inline ProofCheck VerifyTransitionProofs(const std::vector<ModernOutput>& prev_outputs,
-                                         const ModernTransition& t)
+                                         const ModernTransition& t,
+                                         const bool assets_active = false)
 {
     if (t.proofs.size() != t.inputs.size() || prev_outputs.size() != t.inputs.size()) {
         return ProofCheck::PROOF_COUNT_MISMATCH;
     }
     for (size_t i{0}; i < t.inputs.size(); ++i) {
         if (t.inputs[i].proof_index != i) return ProofCheck::PROOF_REF_NONCANONICAL;
-        const ProofCheck result{VerifyTransitionProof(prev_outputs[i], t.proofs[i])};
+        const ProofCheck result{VerifyTransitionProof(prev_outputs[i], t.proofs[i], assets_active)};
         if (result != ProofCheck::OK) return result;
     }
     return ProofCheck::OK;

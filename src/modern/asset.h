@@ -69,7 +69,7 @@ inline AssetCheck CheckAssetConservation(const std::vector<ModernOutput>& prev_o
                                          const ModernTransition& t, const int height,
                                          const Consensus::Params& params)
 {
-    if (!AssetPoliciesActiveSlot()) return AssetCheck::NOT_ACTIVE;
+    if (!params.test_only_asset_policies_active) return AssetCheck::NOT_ACTIVE;
     if (t.inputs.empty() || prev_outputs.size() != t.inputs.size()) {
         return AssetCheck::STRUCTURE_INVALID;
     }

@@ -2913,7 +2913,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         // approved modern rule set is installed this rejects every block
         // (modern/pos.h documents the missing rule set precisely).
         if (state.IsValid()) {
-            (void)modern::CheckModernStake(block, *pindex->pprev, view, state);
+            (void)modern::CheckModernStake(block, *pindex->pprev, view, state,
+                                           params.GetConsensus().test_only_modern_pos_validator);
         }
     } else {
         const CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, params.GetConsensus());

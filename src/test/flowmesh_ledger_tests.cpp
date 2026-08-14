@@ -129,7 +129,7 @@ BOOST_AUTO_TEST_CASE(end_to_end_solvency_against_the_vault_checker)
     Consensus::Params params{};
     params.legacy_b3coin = true;
     params.hard_fork_height = 1001;
-    modern::SetAssetPoliciesActiveForTesting(true);
+    params.test_only_asset_policies_active = true;
 
     flowmesh::Ledger ledger{VAULT};
     BOOST_CHECK(ledger.Deposit(ALICE, AssetX(), 1000));
@@ -179,8 +179,6 @@ BOOST_AUTO_TEST_CASE(end_to_end_solvency_against_the_vault_checker)
     BOOST_CHECK(ledger.ConsumeReceipt(consumed[0]));
     BOOST_CHECK_EQUAL(ledger.Custody(AssetX()), 600);
     BOOST_CHECK(ledger.SolvencyHolds());
-
-    modern::SetAssetPoliciesActiveForTesting(false);
 }
 
 BOOST_AUTO_TEST_CASE(state_root_is_deterministic_and_path_independent)

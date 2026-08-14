@@ -106,29 +106,16 @@ struct ModernOutput {
 };
 
 /**
- * Test-only activation switch for the coloured-asset policy set (BURN and
- * the conservation rules in modern/asset.h). Production consensus never
- * sets this; until the asset rules ship, the asset policies stay
- * unactivated and therefore invalid.
- */
-inline bool& AssetPoliciesActiveSlot()
-{
-    static bool active{false};
-    return active;
-}
-
-inline void SetAssetPoliciesActiveForTesting(const bool active)
-{
-    AssetPoliciesActiveSlot() = active;
-}
-
-/**
  * Whether a (type, version) pair is an activated policy. LEGACY_LOCK v1
- * and OWNER v1 are always active; BURN v1 only under the test-only asset
- * activation. Anything else — including future versions of these types —
- * is unactivated and therefore invalid.
+ * and OWNER v1 are always active; BURN v1 and DEX_VAULT v1 only when the
+ * coloured-asset policy set is active (assets_active). Anything else —
+ * including future versions of these types — is unactivated and therefore
+ * invalid. assets_active is sourced from Params::test_only_asset_policies_active
+ * and is false in production, so the asset policies stay invalid until they
+ * ship.
  */
-inline bool IsActivatedPolicy(const uint16_t policy_type, const uint16_t policy_version)
+inline bool IsActivatedPolicy(const uint16_t policy_type, const uint16_t policy_version,
+                              const bool assets_active = false)
 {
     if (policy_version != POLICY_VERSION_V1) return false;
     if (policy_type == static_cast<uint16_t>(PolicyType::LEGACY_LOCK) ||
@@ -137,7 +124,7 @@ inline bool IsActivatedPolicy(const uint16_t policy_type, const uint16_t policy_
     }
     if (policy_type == static_cast<uint16_t>(PolicyType::BURN) ||
         policy_type == static_cast<uint16_t>(PolicyType::DEX_VAULT)) {
-        return AssetPoliciesActiveSlot();
+        return assets_active;
     }
     return false;
 }
@@ -163,7 +150,7 @@ inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int he
     if (Consensus::GetB3Era(height, params) != Consensus::B3Era::MODERN) {
         return PolicyOutputCheck::NOT_MODERN_ERA;
     }
-    if (!IsActivatedPolicy(out.policy_type, out.policy_version)) {
+    if (!IsActivatedPolicy(out.policy_type, out.policy_version, params.test_only_asset_policies_active)) {
         return PolicyOutputCheck::UNKNOWN_POLICY;
     }
     // Per-asset supply rules arrive with issuance; until then every amount

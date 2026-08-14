@@ -54,20 +54,6 @@ public:
                             const CCoinsViewCache& view, BlockValidationState& state) const = 0;
 };
 
-//! Test-only registry: install a fixture/adapter validator (nullptr to
-//! remove). Production code never installs one until an approved modern
-//! rule set exists.
-inline const PosValidator*& ModernPosValidatorSlot()
-{
-    static const PosValidator* g_validator{nullptr};
-    return g_validator;
-}
-
-inline void SetModernPosValidatorForTesting(const PosValidator* validator)
-{
-    ModernPosValidatorSlot() = validator;
-}
-
 /**
  * Which stake-rule family may judge a block, given its codec marker and
  * its connected era. Legacy blocks can never enter modern PoS; modern
@@ -97,7 +83,8 @@ constexpr StakeRules SelectStakeRules(const int32_t block_version, const Consens
  * block is rejected.
  */
 inline bool CheckModernStake(const CBlock& block, const CBlockIndex& parent,
-                             const CCoinsViewCache& view, BlockValidationState& state)
+                             const CCoinsViewCache& view, BlockValidationState& state,
+                             const PosValidator* validator)
 {
     if (SelectStakeRules(block.nVersion, Consensus::B3Era::MODERN) != StakeRules::MODERN) {
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-pos-codec",
@@ -109,7 +96,7 @@ inline bool CheckModernStake(const CBlock& block, const CBlockIndex& parent,
                                  "legacy-encoded transaction cannot enter modern PoS validation");
         }
     }
-    if (const PosValidator* validator{ModernPosValidatorSlot()}) {
+    if (validator) {
         return validator->CheckStake(block, parent, view, state);
     }
     return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "no-modern-pos-rules",

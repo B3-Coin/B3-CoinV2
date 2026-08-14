@@ -32,10 +32,14 @@ Consensus::Params B3Params()
     return params;
 }
 
-struct AssetActivation {
-    AssetActivation() { modern::SetAssetPoliciesActiveForTesting(true); }
-    ~AssetActivation() { modern::SetAssetPoliciesActiveForTesting(false); }
-};
+// The asset policy set (BURN / DEX_VAULT / conservation) activated for a test,
+// via the per-instance Params field that replaces the former global switch.
+Consensus::Params B3ParamsActive()
+{
+    Consensus::Params params{B3Params()};
+    params.test_only_asset_policies_active = true;
+    return params;
+}
 
 COutPoint DefiningPrevout()
 {
@@ -97,8 +101,7 @@ BOOST_AUTO_TEST_CASE(issuance_identity_is_deterministic)
 
 BOOST_AUTO_TEST_CASE(fixed_supply_issuance_then_no_reissuance)
 {
-    const AssetActivation active;
-    const Consensus::Params params{B3Params()};
+    const Consensus::Params params{B3ParamsActive()};
     const modern::AssetId asset{modern::IssuanceAssetId(DefiningPrevout())};
 
     // Issue 1000 units (600 + 400) with native change and a native fee.
@@ -128,8 +131,7 @@ BOOST_AUTO_TEST_CASE(fixed_supply_issuance_then_no_reissuance)
 
 BOOST_AUTO_TEST_CASE(transfer_conserves_exactly)
 {
-    const AssetActivation active;
-    const Consensus::Params params{B3Params()};
+    const Consensus::Params params{B3ParamsActive()};
     const modern::AssetId asset{modern::IssuanceAssetId(DefiningPrevout())};
     const COutPoint other{DefiningPrevout().hash, 9};
     const std::vector<modern::ModernOutput> prevs{Out(asset, 1000),
@@ -157,8 +159,7 @@ BOOST_AUTO_TEST_CASE(transfer_conserves_exactly)
 
 BOOST_AUTO_TEST_CASE(explicit_burn_is_exact_and_visible)
 {
-    const AssetActivation active;
-    const Consensus::Params params{B3Params()};
+    const Consensus::Params params{B3ParamsActive()};
     const modern::AssetId asset{modern::IssuanceAssetId(DefiningPrevout())};
     const COutPoint other{DefiningPrevout().hash, 11};
     const std::vector<modern::ModernOutput> prevs{Out(asset, 1000)};
@@ -189,8 +190,7 @@ BOOST_AUTO_TEST_CASE(explicit_burn_is_exact_and_visible)
 
 BOOST_AUTO_TEST_CASE(fees_are_native_only_and_native_never_mints)
 {
-    const AssetActivation active;
-    const Consensus::Params params{B3Params()};
+    const Consensus::Params params{B3ParamsActive()};
     const COutPoint other{DefiningPrevout().hash, 13};
 
     // Native deficit is the fee.
@@ -210,8 +210,7 @@ BOOST_AUTO_TEST_CASE(fees_are_native_only_and_native_never_mints)
 
 BOOST_AUTO_TEST_CASE(arithmetic_is_overflow_safe)
 {
-    const AssetActivation active;
-    const Consensus::Params params{B3Params()};
+    const Consensus::Params params{B3ParamsActive()};
     const modern::AssetId asset{modern::IssuanceAssetId(DefiningPrevout())};
     const COutPoint other{DefiningPrevout().hash, 17};
 

@@ -98,7 +98,6 @@ struct TransitionSetup : public ChainTestingSetup {
         consensus.hashGenesisBlock = genesis.GetLegacyB3Hash();
         LoadVerifyActivateChainstate();
     }
-    ~TransitionSetup() { modern::SetModernPosValidatorForTesting(nullptr); }
 };
 
 //! Accept-all modern PoS adapter, counting dispatches.
@@ -550,7 +549,7 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
     // ---- (6)+(7) Marker-modern blocks from H+1 through the modern
     // PoS dispatch (test adapter; no economic rules invented).
     AcceptingPos pos;
-    modern::SetModernPosValidatorForTesting(&pos);
+    mutable_consensus.test_only_modern_pos_validator = &pos;
 
     const auto build_modern{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
         const int height{prev->nHeight + 1};
@@ -834,7 +833,7 @@ BOOST_AUTO_TEST_CASE(legacy_checkpoint_and_depth_rules_are_mode_scoped)
         mutable_consensus.hard_fork_height = MINI_H + 1;
         mutable_consensus.legacy_final_hash = X;
         AcceptingPos pos;
-        modern::SetModernPosValidatorForTesting(&pos);
+        mutable_consensus.test_only_modern_pos_validator = &pos;
 
         const CBlockIndex* prev{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
         CMutableTransaction coinbase;

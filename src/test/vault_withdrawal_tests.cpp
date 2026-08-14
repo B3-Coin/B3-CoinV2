@@ -37,10 +37,14 @@ Consensus::Params B3Params()
     return params;
 }
 
-struct AssetActivation {
-    AssetActivation() { modern::SetAssetPoliciesActiveForTesting(true); }
-    ~AssetActivation() { modern::SetAssetPoliciesActiveForTesting(false); }
-};
+// The asset policy set (BURN / DEX_VAULT / conservation) activated for a test,
+// via the per-instance Params field that replaces the former global switch.
+Consensus::Params B3ParamsActive()
+{
+    Consensus::Params params{B3Params()};
+    params.test_only_asset_policies_active = true;
+    return params;
+}
 
 //! Bounded mock of FlowMesh finalized-receipt state, with consumption.
 class MockReceipts final : public modern::FinalizedReceiptView
@@ -157,8 +161,7 @@ const uint256 ID2{uint256{"00000000000000000000000000000000000000000000000000000
 
 BOOST_AUTO_TEST_CASE(keyless_receipt_authorized_partial_withdrawal)
 {
-    const AssetActivation active;
-    const Consensus::Params params{B3Params()};
+    const Consensus::Params params{B3ParamsActive()};
     MockReceipts receipts;
     receipts.m_finalized[ID1] = Receipt(ID1, Asset(), 400, DEST_A);
 
@@ -168,7 +171,7 @@ BOOST_AUTO_TEST_CASE(keyless_receipt_authorized_partial_withdrawal)
 
     // The vault spend carries no key material: its proof is only the
     // receipt list, structurally valid under the generic dispatcher.
-    BOOST_CHECK(modern::VerifyTransitionProofs(prevs, t) == modern::ProofCheck::OK);
+    BOOST_CHECK(modern::VerifyTransitionProofs(prevs, t, /*assets_active=*/true) == modern::ProofCheck::OK);
 
     std::vector<uint256> consumed;
     BOOST_CHECK(modern::CheckVaultWithdrawal(prevs, t, receipts, MODERN_HEIGHT, params,
@@ -186,8 +189,7 @@ BOOST_AUTO_TEST_CASE(keyless_receipt_authorized_partial_withdrawal)
 
 BOOST_AUTO_TEST_CASE(remainder_must_return_to_the_approved_vault)
 {
-    const AssetActivation active;
-    const Consensus::Params params{B3Params()};
+    const Consensus::Params params{B3ParamsActive()};
     MockReceipts receipts;
     receipts.m_finalized[ID1] = Receipt(ID1, Asset(), 400, DEST_A);
     const std::vector<modern::ModernOutput> prevs{VaultOut(Asset(), 1000)};
@@ -220,8 +222,7 @@ BOOST_AUTO_TEST_CASE(remainder_must_return_to_the_approved_vault)
 
 BOOST_AUTO_TEST_CASE(redirection_is_impossible)
 {
-    const AssetActivation active;
-    const Consensus::Params params{B3Params()};
+    const Consensus::Params params{B3ParamsActive()};
     MockReceipts receipts;
     receipts.m_finalized[ID1] = Receipt(ID1, Asset(), 400, DEST_A);
     const std::vector<modern::ModernOutput> prevs{VaultOut(Asset(), 1000)};
@@ -244,8 +245,7 @@ BOOST_AUTO_TEST_CASE(redirection_is_impossible)
 
 BOOST_AUTO_TEST_CASE(receipts_are_finalized_and_consumed_once)
 {
-    const AssetActivation active;
-    const Consensus::Params params{B3Params()};
+    const Consensus::Params params{B3ParamsActive()};
     MockReceipts receipts;
     const std::vector<modern::ModernOutput> prevs{VaultOut(Asset(), 1000)};
     const modern::ModernTransition t{Withdrawal(
@@ -274,8 +274,7 @@ BOOST_AUTO_TEST_CASE(receipts_are_finalized_and_consumed_once)
 
 BOOST_AUTO_TEST_CASE(batched_withdrawals_across_shards)
 {
-    const AssetActivation active;
-    const Consensus::Params params{B3Params()};
+    const Consensus::Params params{B3ParamsActive()};
     MockReceipts receipts;
     receipts.m_finalized[ID1] = Receipt(ID1, Asset(), 400, DEST_A);
     receipts.m_finalized[ID2] = Receipt(ID2, modern::NativeAsset(), 50, DEST_B);
@@ -326,7 +325,7 @@ BOOST_AUTO_TEST_CASE(vault_is_fail_closed_and_burn_is_unspendable)
         static_cast<uint16_t>(modern::PolicyType::DEX_VAULT), modern::POLICY_VERSION_V1));
 
     // With the set active, a burned coin still can never be spent.
-    const AssetActivation active;
+    const Consensus::Params active_params{B3ParamsActive()};
     modern::ModernOutput burned;
     burned.asset = Asset();
     burned.amount = 5;
@@ -336,13 +335,13 @@ BOOST_AUTO_TEST_CASE(vault_is_fail_closed_and_burn_is_unspendable)
     any.proof_type = static_cast<uint16_t>(modern::PolicyType::BURN);
     any.proof_version = modern::POLICY_VERSION_V1;
     any.payload = {0x00};
-    BOOST_CHECK(modern::VerifyTransitionProof(burned, any) == modern::ProofCheck::UNSPENDABLE);
+    BOOST_CHECK(modern::VerifyTransitionProof(burned, any, /*assets_active=*/true) == modern::ProofCheck::UNSPENDABLE);
 
     // A withdrawal with no vault input is not a vault spend.
     const std::vector<modern::ModernOutput> owner_prevs{OwnerOut(Asset(), 10, DEST_B)};
     BOOST_CHECK(modern::CheckVaultWithdrawal(
                     owner_prevs, Withdrawal(owner_prevs, {ID1}, {OwnerOut(Asset(), 10, DEST_B)}),
-                    receipts, MODERN_HEIGHT, params) == modern::VaultCheck::NO_VAULT_INPUT);
+                    receipts, MODERN_HEIGHT, active_params) == modern::VaultCheck::NO_VAULT_INPUT);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

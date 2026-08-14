@@ -54,11 +54,6 @@ public:
     }
 };
 
-struct ValidatorGuard {
-    explicit ValidatorGuard(const modern::PosValidator* v) { modern::SetModernPosValidatorForTesting(v); }
-    ~ValidatorGuard() { modern::SetModernPosValidatorForTesting(nullptr); }
-};
-
 } // namespace
 
 BOOST_AUTO_TEST_CASE(stake_rules_follow_marker_and_era)
@@ -85,7 +80,7 @@ BOOST_AUTO_TEST_CASE(modern_pos_fails_closed_without_a_rule_set)
 
     // No rule set installed: every modern block is rejected, with the
     // documented reason.
-    BOOST_CHECK(!modern::CheckModernStake(block, parent, view, state));
+    BOOST_CHECK(!modern::CheckModernStake(block, parent, view, state, /*validator=*/nullptr));
     BOOST_CHECK_EQUAL(state.GetRejectReason(), "no-modern-pos-rules");
 }
 
@@ -95,14 +90,13 @@ BOOST_AUTO_TEST_CASE(modern_pos_consumes_only_modern_codecs)
     CCoinsView base;
     CCoinsViewCache view{&base};
     RecordingValidator recorder;
-    const ValidatorGuard guard{&recorder};
 
     // A legacy-codec block never reaches the installed rule set.
     {
         CBlock legacy_block{ModernBlock()};
         legacy_block.nVersion = LEGACY_VERSION;
         BlockValidationState state;
-        BOOST_CHECK(!modern::CheckModernStake(legacy_block, parent, view, state));
+        BOOST_CHECK(!modern::CheckModernStake(legacy_block, parent, view, state, &recorder));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-pos-codec");
         BOOST_CHECK_EQUAL(recorder.m_calls, 0);
     }
@@ -116,7 +110,7 @@ BOOST_AUTO_TEST_CASE(modern_pos_consumes_only_modern_codecs)
         legacy_tx.m_legacy_encoding = true;
         block.vtx[0] = MakeTransactionRef(std::move(legacy_tx));
         BlockValidationState state;
-        BOOST_CHECK(!modern::CheckModernStake(block, parent, view, state));
+        BOOST_CHECK(!modern::CheckModernStake(block, parent, view, state, &recorder));
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-pos-codec");
         BOOST_CHECK_EQUAL(recorder.m_calls, 0);
     }
@@ -126,7 +120,7 @@ BOOST_AUTO_TEST_CASE(modern_pos_consumes_only_modern_codecs)
     {
         const CBlock block{ModernBlock()};
         BlockValidationState state;
-        BOOST_CHECK(modern::CheckModernStake(block, parent, view, state));
+        BOOST_CHECK(modern::CheckModernStake(block, parent, view, state, &recorder));
         BOOST_CHECK_EQUAL(recorder.m_calls, 1);
     }
 }

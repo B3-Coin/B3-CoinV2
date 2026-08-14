@@ -17,6 +17,8 @@
 #include <optional>
 #include <vector>
 
+namespace modern { class PosValidator; }
+
 namespace Consensus {
 
 /**
@@ -136,6 +138,22 @@ struct Params {
      */
     std::optional<int> legacy_superblock_height;
     std::vector<unsigned char> legacy_superblock_pubkey;
+    /**
+     * Test-only injection points, never set by real chainparams. They replace
+     * former process-global mutable statics so a test override lives on the
+     * chain instance (a test constructs its own Params), never in the
+     * production binary's global state, and cannot be flipped by anything but
+     * code holding a mutable Params -- which production never does after init.
+     *
+     * - test_only_modern_pos_validator: an installed modern proof-of-stake
+     *   rule set. Null in production, so modern PoS stays fail-closed
+     *   (CheckModernStake rejects every block) until a real rule set ships.
+     * - test_only_asset_policies_active: activates the coloured-asset policy
+     *   set (BURN / DEX_VAULT and the conservation rules). False in
+     *   production, so those policies stay unactivated and therefore invalid.
+     */
+    const modern::PosValidator* test_only_modern_pos_validator{nullptr};
+    bool test_only_asset_policies_active{false};
     /**
      * Hashes of blocks that
      * - are known to be consensus valid, and
