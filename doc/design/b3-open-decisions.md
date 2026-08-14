@@ -42,13 +42,15 @@ Constraints already locked and not open for reinterpretation:
 **Required to unblock:** a written modern PoS consensus specification covering every bullet
 above.
 
-**Draft under review:** [b3-modern-pos-spec.md](b3-modern-pos-spec.md) — a DRAFT
-specification following the agreed direction (STAKE policy outputs, locked-amount
-weight, owner/validator key split, no auto-compounding, bounded age, VRF
-eligibility with ranked fallbacks, cheap pre-verification), carrying the pending
-decisions list PD-1..PD-17 with concrete options per item. **OD-1 stays
-UNRESOLVED until that document is approved with every PD decided; nothing may be
-implemented from the draft.**
+**Design base accepted:** [b3-modern-pos-spec.md](b3-modern-pos-spec.md) is the
+accepted structural base (STAKE policy outputs, locked-amount weight,
+owner/validator key split, no auto-compounding, bounded age, VRF eligibility
+with ranked fallbacks, cheap pre-verification). Every remaining decision is
+tracked there with LOCKED/OPEN status: PD-1..PD-17 are all OPEN, all numeric
+parameters are simulation-gated, and **PD-16 — the H+1 validator bootstrap —
+is the primary unresolved consensus question** (dedicated section §10).
+**OD-1 stays UNRESOLVED and nothing may be implemented until every PD is
+explicitly locked; the numeric PDs lock only from simulation results.**
 
 ---
 
