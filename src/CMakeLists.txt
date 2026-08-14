@@ -242,6 +242,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/txreconciliation.cpp
   node/utxo_commitment.cpp
   node/utxo_equivalence_check.cpp
+  node/utxo_rows.cpp
   node/utxo_snapshot.cpp
   node/warnings.cpp
   noui.cpp

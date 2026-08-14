@@ -31,6 +31,7 @@
 #include <legacy/codec.h>
 #include <node/blockstorage.h>
 #include <node/utxo_equivalence_check.h>
+#include <node/utxo_rows.h>
 #include <primitives/block.h>
 #include <streams.h>
 #include <sync.h>
@@ -45,6 +46,7 @@
 
 #include <array>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <functional>
 #include <map>
@@ -74,7 +76,14 @@ void Usage()
                 "  -hash=<X>              the exact block hash at height <H>\n"
                 "  -workdir=<dir>         scratch directory for the replay reconstruction\n"
                 "                         (default: <datadir>/utxo-verify.tmp; created fresh)\n"
-                "  -max-mismatches=<n>    mismatch diagnostics to print (default: 20)\n");
+                "  -max-mismatches=<n>    mismatch diagnostics to print (default: 20)\n"
+                "\n"
+                "Three-way invariant (doc/design/b3-utxo-equivalence.md):\n"
+                "  -portrows=<file>       write the live chainstate (U_port) as canonical rows\n"
+                "  -replayrows=<file>     write the replay reconstruction (U_replay) as canonical rows\n"
+                "  -masterrows=<file>     read the legacy master client's exported rows (U_master)\n"
+                "                         and verify U_master == U_port == U_replay; with this\n"
+                "                         option, exit 0 only when all three sets agree\n");
 }
 
 struct ToolArgs {
@@ -83,6 +92,9 @@ struct ToolArgs {
     uint256 hash{};
     fs::path workdir;
     size_t max_mismatches{20};
+    fs::path portrows;
+    fs::path replayrows;
+    fs::path masterrows;
 };
 
 std::optional<ToolArgs> ParseArgs(const int argc, char* argv[])
@@ -104,6 +116,12 @@ std::optional<ToolArgs> ParseArgs(const int argc, char* argv[])
             args.workdir = fs::PathFromString(*v);
         } else if (const auto v{eat("-max-mismatches=")}) {
             if (const auto n{ToIntegral<size_t>(*v)}) args.max_mismatches = *n;
+        } else if (const auto v{eat("-portrows=")}) {
+            args.portrows = fs::PathFromString(*v);
+        } else if (const auto v{eat("-replayrows=")}) {
+            args.replayrows = fs::PathFromString(*v);
+        } else if (const auto v{eat("-masterrows=")}) {
+            args.masterrows = fs::PathFromString(*v);
         } else {
             tfm::format(std::cerr, "Unknown argument: %s\n", arg);
             return std::nullopt;
@@ -121,6 +139,48 @@ std::string DescribeSide(const std::optional<Coin>& coin)
     return strprintf("value=%d height=%u coinbase=%d coinstake=%d ntime=%u",
                      coin->out.nValue, unsigned{coin->nHeight}, coin->fCoinBase ? 1 : 0,
                      coin->fCoinStake ? 1 : 0, coin->nTime);
+}
+
+//! One side of a row-level difference, printed as a full canonical row so
+//! the exact divergent field is visible.
+std::string DescribeRowSide(const COutPoint& outpoint, const std::optional<Coin>& coin)
+{
+    if (!coin) return "absent";
+    return node::UtxoRowLine({outpoint, *coin});
+}
+
+//! Write one UTXO set as a canonical row file.
+bool WriteRowsFile(const fs::path& path, std::vector<node::UtxoEntry> entries,
+                   const uint256& tip_hash, const int tip_height)
+{
+    std::ofstream out{path.std_path(), std::ios::binary | std::ios::trunc};
+    std::string error;
+    if (!out || !node::WriteUtxoRows(out, {tip_hash, tip_height, std::move(entries)}, error)) {
+        tfm::format(std::cerr, "error: cannot write rows to %s%s%s\n", fs::PathToString(path),
+                    error.empty() ? "" : ": ", error);
+        return false;
+    }
+    tfm::format(std::cout, "rows written:       %s\n", fs::PathToString(path));
+    return true;
+}
+
+//! Print one pairwise comparison of the three-way check; returns equality.
+bool ReportPair(const std::string& label_a, const std::string& label_b,
+                node::UtxoComparison cmp, const size_t max_mismatches)
+{
+    tfm::format(std::cout, "%s vs %s:  %s (%d vs %d rows)\n", label_a, label_b,
+                cmp.Equal() ? "EQUAL" : "NOT EQUAL", cmp.count_a, cmp.count_b);
+    const size_t shown{std::min(max_mismatches, cmp.mismatches.size())};
+    if (!cmp.mismatches.empty()) {
+        tfm::format(std::cout, "  differing rows: %d (showing %d)\n", cmp.mismatches.size(), shown);
+    }
+    for (size_t i{0}; i < shown; ++i) {
+        const auto& m{cmp.mismatches[i]};
+        tfm::format(std::cout, "  %s\n    %s: %s\n    %s: %s\n", m.outpoint.ToString(),
+                    label_a, DescribeRowSide(m.outpoint, m.in_a),
+                    label_b, DescribeRowSide(m.outpoint, m.in_b));
+    }
+    return cmp.Equal();
 }
 
 } // namespace
@@ -266,7 +326,68 @@ int main(int argc, char* argv[])
                             m.outpoint.ToString(), DescribeSide(m.in_a), DescribeSide(m.in_b));
             }
         }
-        tfm::format(std::cout, "result:             %s\n", result.ok ? "EQUAL (U == U')" : "NOT EQUAL");
+        tfm::format(std::cout, "result:             %s\n",
+                    result.ok ? "EQUAL (U_port == U_replay)" : "NOT EQUAL");
+
+        // ---- Canonical row export and the three-way invariant
+        // U_master == U_port == U_replay (doc/design/b3-utxo-equivalence.md).
+        // Only meaningful once the two-way pipeline itself ran to completion;
+        // row export deliberately proceeds on a row MISMATCH (result.ok
+        // false), which is exactly when the rows are needed for diagnosis.
+        if (!result.errors.empty()) {
+            if (!args->portrows.empty() || !args->replayrows.empty() || !args->masterrows.empty()) {
+                tfm::format(std::cerr,
+                            "error: skipping row export/comparison: the verification pipeline "
+                            "did not complete\n");
+            }
+            return 1;
+        }
+
+        if (!args->portrows.empty() &&
+            !WriteRowsFile(args->portrows, node::EnumerateUtxos(live), args->hash, args->height)) {
+            return 2;
+        }
+        if (!args->replayrows.empty() &&
+            !WriteRowsFile(args->replayrows, node::EnumerateUtxos(scratch), args->hash, args->height)) {
+            return 2;
+        }
+
+        if (!args->masterrows.empty()) {
+            std::ifstream in{args->masterrows.std_path(), std::ios::binary};
+            if (!in) {
+                tfm::format(std::cerr, "error: cannot open %s\n", fs::PathToString(args->masterrows));
+                return 2;
+            }
+            node::UtxoRowsFile master;
+            std::string error;
+            if (!node::ReadUtxoRows(in, master, error)) {
+                tfm::format(std::cerr, "error: %s: %s\n", fs::PathToString(args->masterrows), error);
+                return 2;
+            }
+            if (master.tip_hash != args->hash || master.tip_height != args->height) {
+                tfm::format(std::cerr,
+                            "error: master rows were captured at %s (height %d), not the "
+                            "requested block %s (height %d)\n",
+                            master.tip_hash.ToString(), master.tip_height,
+                            args->hash.ToString(), args->height);
+                return 2;
+            }
+
+            const std::vector<node::UtxoEntry> port_entries{node::EnumerateUtxos(live)};
+            const std::vector<node::UtxoEntry> replay_entries{node::EnumerateUtxos(scratch)};
+            tfm::format(std::cout, "master rows:        %d\n", master.entries.size());
+            tfm::format(std::cout, "master commitment:  %s\n",
+                        node::UtxoSetCommitment(master.entries).ToString());
+            const bool master_port{ReportPair("master", "port",
+                node::CompareUtxoSets(master.entries, port_entries), args->max_mismatches)};
+            const bool master_replay{ReportPair("master", "replay",
+                node::CompareUtxoSets(master.entries, replay_entries), args->max_mismatches)};
+            const bool three_way{master_port && master_replay && result.ok};
+            tfm::format(std::cout, "three-way result:   %s\n",
+                        three_way ? "EQUAL (U_master == U_port == U_replay)" : "NOT EQUAL");
+            return three_way ? 0 : 1;
+        }
+
         return result.ok ? 0 : 1;
     } catch (const std::exception& e) {
         tfm::format(std::cerr, "error: %s\n", e.what());
