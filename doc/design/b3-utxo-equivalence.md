@@ -97,6 +97,119 @@ tree computes it — for all three states, from rows or views uniformly — so t
 full three-way verdict: one commitment per state, pairwise equality, and bounded
 per-row differences for every unequal pair. Exit 0 only when all three agree.
 
+## The exact membership predicate of `U_master` (audited)
+
+The exporter emits a row for output `n` of the transaction with id `txid` **iff
+all** of the following hold, where every datum comes from the legacy client's
+own structures:
+
+1. **Indexed:** a `("tx", txid)` record exists in the client's LevelDB
+   transaction index. Audited lifecycle: `ConnectBlock` queues
+   `CTxIndex(posThisTx, vout.size())` for *every* transaction of a connected
+   block (coinbase and coinstake included) plus the spent-markers of its
+   inputs, and all writes commit inside the `SetBestChain`/`Reorganize`
+   `TxnBegin`/`TxnCommit` batch — the index and `hashBestChain` move
+   atomically; `DisconnectInputs` erases the record and un-marks its inputs'
+   spent-markers on disconnect; the mempool path (`fBlock=false`) never writes
+   the database; `AddTxIndex` is uncalled; the genesis coinbase is never
+   indexed (`SetBestChain` short-circuits genesis before `ConnectBlock`).
+2. **Unspent by the client's own spent-state:** `vSpent[n].IsNull()` in that
+   record. The exporter aborts if `vSpent.size()` disagrees with the
+   deserialized transaction's `vout.size()`.
+3. **On the canonical chain ending at `T`:** the record's
+   `(pos.nFile, pos.nBlockPos)` matches a block on the best chain walked back
+   from `pindexBest`, whose tip the exporter requires to be exactly `X_T`
+   (else it refuses to run). An entry with an unspent output whose block is
+   *not* on that chain aborts the export. (Records whose outputs are all
+   spent are skipped before this check: the client legitimately retains
+   fully-spent duplicates from reorganized-away chains — the documented
+   `EraseTxIndex` caveat — and they contribute no rows.)
+4. **Master's own deserialization:** amount, script bytes and `nTime` come
+   from `CTransaction::ReadFromDisk(pos)` through the client's own codec; the
+   exporter aborts unless the re-read transaction hashes to the indexed
+   `txid`. Height comes from the client's own block index; the in-block
+   offset is `pos.nTxPos - pos.nBlockPos`.
+5. **Not excluded by the shared logical rules:** not a marker output
+   (`nValue == 0` with an empty script — every coinstake's first output), not
+   an unspendable script (leading `OP_RETURN` or larger than 10000 bytes),
+   not at height 0.
+6. **Duplicate-txid overwrites:** the index holds one record per txid, the
+   later instance having overwritten the earlier (`UpdateTxIndex`), matching
+   the port's one-coin-per-outpoint overwrite semantics by construction.
+
+Rows stream out in LevelDB's bytewise key order — which *is* the canonical
+raw-txid-byte order — and the exporter verifies the ordering as it writes
+instead of assuming it.
+
+## Verified exporter build (arm64 macOS reference recipe)
+
+The export branch compiles and links unmodified legacy sources; commit
+`makefile.osx-arm64` documents the only build-system changes. Staged
+dependencies (source-built, no system installs; SHA256 as published):
+OpenSSL 1.0.2u (`ecd0c6…9d16`; `no-asm no-shared`, `-arch` switched to
+arm64), Berkeley DB 4.8.30.NC (`12edc0…64ef`; the standard
+`__atomic_compare_exchange`/`atomic_init` renames applied *to the
+dependency*), boost 1.63 (`fe34a4…088b`; the five static libs compiled
+directly with `-std=c++11`), and the tree's vendored LevelDB. Then:
+
+    make -f makefile.osx-arm64 STATIC=1 DEPSDIR=<staging>/local b3coind
+
+Verified on a scratch datadir with `-connect=0 -listen=0 -dnsseed=0`: the
+export mode refuses a tip that is not the requested capture block (fresh
+datadir at genesis vs. a foreign hash), and succeeds at the genuine B3
+genesis `4b0d7f13…83b6a` (matching the port's pinned genesis and checkpoint
+0), emitting a well-formed `b3-utxo-rows/v1` file with `count=0` — the
+genesis coinbase is excluded by predicate.
+
+## The three real-history capture heights
+
+Run the full three-way comparison at **three** real heights before any H/X
+decision — each `T` with its exact real block hash `X_T`:
+
+| | `T` | `X_T` source | What it exercises |
+|---|---|---|---|
+| 1 | **95350** (the highest hardened checkpoint) | pinned identically in both codebases' checkpoint maps: `095f1cb3cf1f1300ad99f891c2c0bb13cc374d9215781ad988e82cc0086a8e45` | plain-era history under a hash both implementations already assert |
+| 2 | **110000** | old client `getblockhash 110000`, cross-checked against an independent explorer | the entire unusual-reward region: the 77447–77505 repair window, the restricted-stake rule from 78001, the 107488 superblock (checkpoint 78961 is a pinned-hash intermediate if a closer anchor is wanted) |
+| 3 | **tip − 10000, rounded down to a thousand** (recent, well buried) | old client + explorer cross-check | the full modern-era state size and every rule change up to the present |
+
+Capture procedure (staged, forward-only — one sync pass):
+
+1. Old client (export branch), isolated once synced history is available
+   locally; sync with `-exportstopatheight=95350`; the node freezes and shuts
+   down at exactly that height. Copy the datadir. Run
+   `b3coind -exportutxo=master-95350.rows -exportutxoat=<X_95350>`
+   (with `-connect=0 -listen=0 -dnsseed=0`).
+2. Restart on the same datadir with `-exportstopatheight=110000`; repeat.
+   Then again for `T3`. Keep every per-height datadir copy — bisection reuses
+   them.
+3. Port node per height: fresh sync with `-stopatheight=T` (verify best block
+   `== X_T`), stop cleanly, then
+   `b3coin-utxo-verify -datadir=… -height=T -hash=X_T
+    -portrows=port-T.rows -replayrows=replay-T.rows
+    -masterrows=master-T.rows`.
+4. Required for each `T`: equal row counts, equal commitments, and
+   `diff master-T.rows port-T.rows` / `diff master-T.rows replay-T.rows`
+   empty (byte-identical canonical rows). The tool exits 0 only on full
+   three-way agreement.
+
+**On inequality:** the tool prints the differing outpoints in canonical order
+— the first one is the entry point. Bisect by height: re-run the capture at
+the midpoint between the highest agreeing `T` and the lowest disagreeing `T`
+(forward-staged datadir copies make each probe a resume, not a resync) until
+the first divergent height is isolated; then diagnose that block's
+transactions against the pairwise-failure table below.
+
+**Mutation (negative) test — run once per campaign on a real `master.rows`:**
+
+- *Consistent mutation:* copy the file, change one row's value field (keep
+  the row count intact), re-run with `-masterrows=<mutated>`. Required
+  result: `master vs port: NOT EQUAL` naming exactly that outpoint with both
+  canonical rows printed, and exit status 1.
+- *Naive deletion:* delete one row without adjusting `count=`. Required
+  result: deterministic rejection `count line says N rows but N-1 were read`,
+  exit status 2 — a malformed reference file is refused outright, never
+  silently compared.
+
 ## What each pairwise failure means
 
 - `U_port != U_replay`, `U_master == U_port`: replay engine defect.
