@@ -33,6 +33,7 @@
 #include <kernel/warning.h>
 #include <legacy/codec.h>
 #include <legacy/consensus.h>
+#include <legacy/replay.h>
 #include <modern/pos.h>
 #include <logging/timer.h>
 #include <node/blockstorage.h>
@@ -2523,6 +2524,44 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             modern::StakeRules::MISMATCH) {
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-pos-codec",
                              "block codec does not match the stake rules of its era");
+    }
+
+    // B3: with the boundary (H, X) pinned this legacy block is attested
+    // history, and its state transition is reconstructed by the trusted
+    // replay engine — the same engine behind the b3coin-utxo-verify
+    // equivalence tool, so the node's rebuilt state is by construction the
+    // state that tool attests. The engine verifies linkage, the configured
+    // checkpoints (including X itself at H), Merkle commitments, prevout
+    // existence, duplicate spends and overflow-safe accounting, and applies
+    // outputs exactly; it deliberately never re-judges historical PoW, the
+    // kernel, difficulty, scripts, signatures, maturity or rewards
+    // (contract section 11). Undo data is captured mechanically so the
+    // block remains disconnectable while X is not yet on the active chain.
+    if (use_legacy_b3coin && Consensus::LegacyBoundaryPinned(params.GetConsensus())) {
+        const Consensus::Params& consensus{params.GetConsensus()};
+        const int final_height{*Consensus::LegacyFinalHeight(consensus)};
+        std::map<int, uint256> replay_checkpoints{consensus.legacy_checkpoints};
+        replay_checkpoints.insert_or_assign(final_height, *consensus.legacy_final_hash);
+        legacy::TrustedReplay replay{consensus, final_height, std::move(replay_checkpoints)};
+        replay.ResumeAt(pindex->nHeight, pindex->pprev->GetBlockHash());
+
+        CBlockUndo replay_undo;
+        std::string replay_error;
+        if (!replay.ApplyBlock(block, view, replay_error, fJustCheck ? nullptr : &replay_undo)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-legacy-replay", replay_error);
+        }
+        if (fJustCheck) {
+            return true;
+        }
+        if (!m_blockman.WriteBlockUndo(replay_undo, state, *pindex)) {
+            return false;
+        }
+        if (!pindex->IsValid(BLOCK_VALID_SCRIPTS)) {
+            pindex->RaiseValidity(BLOCK_VALID_SCRIPTS);
+            m_blockman.m_dirty_blockindex.insert(pindex);
+        }
+        view.SetBestBlock(pindex->GetBlockHash());
+        return true;
     }
 
     std::optional<legacy::StakeProof> legacy_stake_proof;

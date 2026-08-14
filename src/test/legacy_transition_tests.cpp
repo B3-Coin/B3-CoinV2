@@ -990,6 +990,163 @@ BOOST_AUTO_TEST_CASE(legacy_checkpoint_and_depth_rules_are_mode_scoped)
     }
 }
 
+//! With the boundary (H, X) pinned, legacy blocks CONNECT through the
+//! trusted replay engine: live-only connect rules (rewards, maturity, the
+//! kernel, scripts) are never re-judged, while the engine's mechanical
+//! checks (prevout existence, duplicate spends, linkage, Merkle) still
+//! reject internally inconsistent data at connect time.
+BOOST_AUTO_TEST_CASE(pinned_boundary_blocks_connect_through_replay)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int LIVE_TIP{10};
+    constexpr int PINNED_H{12};
+
+    const auto build_legacy{[&](const CBlockIndex* prev) {
+        const int height{prev->nHeight + 1};
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << height << CScriptNum{7};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, height, consensus), CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) {
+            ++block.nNonce;
+            BOOST_REQUIRE(block.nNonce < 10'000'000);
+        }
+        return block;
+    }};
+
+    // Canonical live chain to height 10; remember block 10's coinbase (it
+    // will be spent, deeply immature, in block 11).
+    Txid immature_coinbase{};
+    for (int height{1}; height <= LIVE_TIP; ++height) {
+        const CBlockIndex* prev{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
+        const auto submitted{CodecRoundTrip(build_legacy(prev))};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(submitted, true, true, &new_block),
+                              "canonical legacy block at height " << height << " refused");
+        if (height == LIVE_TIP) immature_coinbase = submitted->vtx[0]->GetHash();
+    }
+
+    // Offline raw builder for the pinned era: deliberately no grinding and
+    // no retarget conformance -- attested history is not re-judged.
+    const auto make_pinned_block{[](const uint256& prev_hash, const uint32_t ntime, const int height,
+                                    const CAmount coinbase_value, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = ntime;
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << height << CScriptNum{21};
+        coinbase.vout.emplace_back(coinbase_value, CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev_hash;
+        block.nTime = ntime;
+        block.nBits = 0x207fffff;
+        block.nNonce = 0;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) {
+            mtx.m_legacy_encoding = true;
+            block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        return block;
+    }};
+
+    const CBlockIndex* live_tip{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
+    const uint32_t t11{static_cast<uint32_t>(live_tip->GetBlockTime() + 17)};
+
+    // Block 11 violates two live connect rules at once: the coinbase pays
+    // far more than the allowed reward, and a plain transaction spends the
+    // deeply immature block-10 coinbase. Mechanically it is fully
+    // consistent.
+    const CAmount excessive{legacy::GetProofOfWorkReward(0, LIVE_TIP + 1, consensus) + 12'345 * COIN};
+    CMutableTransaction immature_spend;
+    immature_spend.version = 1;
+    immature_spend.nTime = t11;
+    immature_spend.vin.resize(1);
+    immature_spend.vin[0].prevout = COutPoint{immature_coinbase, 0};
+    immature_spend.vin[0].scriptSig = CScript() << std::vector<unsigned char>{0x01};
+    immature_spend.vout.emplace_back(1 * COIN, CScript() << OP_2);
+    const CBlock good11{make_pinned_block(live_tip->GetBlockHash(), t11, LIVE_TIP + 1,
+                                          excessive, {immature_spend})};
+    const CBlock good12{make_pinned_block(good11.GetLegacyB3Hash(), t11 + 17, PINNED_H,
+                                          legacy::GetProofOfWorkReward(0, PINNED_H, consensus), {})};
+
+    // Pin the boundary at the not-yet-submitted block 12.
+    const uint256 X{good12.GetLegacyB3Hash()};
+    mutable_consensus.hard_fork_height = PINNED_H + 1;
+    mutable_consensus.legacy_final_hash = X;
+
+    // A mechanically inconsistent sibling of block 11 -- it spends an
+    // outpoint that does not exist -- still fails at connect time: the
+    // engine's mechanical checks are the consensus of the pinned era.
+    {
+        CMutableTransaction ghost_spend;
+        ghost_spend.version = 1;
+        ghost_spend.nTime = t11 + 1;
+        ghost_spend.vin.resize(1);
+        ghost_spend.vin[0].prevout = COutPoint{Txid::FromUint256(uint256{
+            "00000000000000000000000000000000000000000000000000000000000000aa"}), 0};
+        ghost_spend.vin[0].scriptSig = CScript() << std::vector<unsigned char>{0x02};
+        ghost_spend.vout.emplace_back(1 * COIN, CScript() << OP_TRUE);
+        const auto bad11{CodecRoundTrip(make_pinned_block(live_tip->GetBlockHash(), t11 + 1, LIVE_TIP + 1,
+                                                          excessive, {ghost_spend}))};
+        bool new_block{false};
+        chainman.ProcessNewBlock(bad11, true, true, &new_block);
+        const CBlockIndex* pindex{WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(
+                                      bad11->GetLegacyB3Hash()))};
+        BOOST_REQUIRE(pindex != nullptr);
+        BOOST_CHECK(pindex->nStatus & BLOCK_FAILED_VALID);
+        BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->nHeight), LIVE_TIP);
+    }
+
+    // The live-invalid but attested blocks connect through the replay
+    // engine and the boundary is reached exactly.
+    {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(CodecRoundTrip(good11), true, true, &new_block));
+        BOOST_REQUIRE(chainman.ProcessNewBlock(CodecRoundTrip(good12), true, true, &new_block));
+        LOCK(cs_main);
+        BOOST_REQUIRE_EQUAL(chainman.ActiveChain().Tip()->nHeight, PINNED_H);
+        BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->GetBlockHash().GetHex(), X.GetHex());
+    }
+
+    // The reconstructed state preserves exact historical identity: the
+    // excessive coinbase exists as attested, the immature spend consumed
+    // its input and created its output with the legacy metadata intact.
+    {
+        LOCK(cs_main);
+        CCoinsViewCache& coins{chainman.ActiveChainstate().CoinsTip()};
+        const Coin& cb{coins.AccessCoin(COutPoint{good11.vtx[0]->GetHash(), 0})};
+        BOOST_REQUIRE(!cb.IsSpent());
+        BOOST_CHECK(cb.fCoinBase);
+        BOOST_CHECK_EQUAL(cb.out.nValue, excessive);
+        BOOST_CHECK_EQUAL(cb.nHeight, static_cast<uint32_t>(LIVE_TIP + 1));
+        BOOST_CHECK(!coins.HaveCoin(COutPoint{immature_coinbase, 0}));
+        const Coin& spent_out{coins.AccessCoin(COutPoint{good11.vtx[1]->GetHash(), 0})};
+        BOOST_REQUIRE(!spent_out.IsSpent());
+        BOOST_CHECK_EQUAL(spent_out.out.nValue, 1 * COIN);
+        BOOST_CHECK_EQUAL(spent_out.nTime, t11);
+    }
+}
+
 //! Once the boundary (H, X) is pinned, legacy admission is replay-scoped:
 //! it keeps the structural checks, the hardened checkpoints, the exact X at
 //! H and the physical future-time bound, but stops re-judging attested
