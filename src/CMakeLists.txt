@@ -241,6 +241,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/txorphanage.cpp
   node/txreconciliation.cpp
   node/utxo_commitment.cpp
+  node/utxo_equivalence_check.cpp
   node/utxo_snapshot.cpp
   node/warnings.cpp
   noui.cpp
@@ -326,6 +327,21 @@ if(BUILD_DAEMON)
   )
   install_binary_component(b3coind HAS_MANPAGE)
 endif()
+
+# Standalone operator diagnostic: verify a trusted replay of the legacy chain
+# against a fully-validated chainstate (U == U'). Outside consensus and node
+# startup by construction.
+add_executable(b3coin-utxo-verify
+  bitcoin-utxo-verify.cpp
+)
+add_windows_application_manifest(b3coin-utxo-verify)
+target_link_libraries(b3coin-utxo-verify
+  PRIVATE
+    core_interface
+    bitcoin_node
+)
+install_binary_component(b3coin-utxo-verify INTERNAL)
+
 if(ENABLE_IPC AND BUILD_DAEMON)
   add_executable(b3coin-node
     bitcoind.cpp

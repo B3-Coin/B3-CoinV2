@@ -25,6 +25,7 @@
 #include <legacy/primitives.h>
 #include <legacy/replay.h>
 #include <node/utxo_commitment.h>
+#include <node/utxo_equivalence_check.h>
 #include <kernel/mempool_removal_reason.h>
 #include <modern/pos.h>
 #include <node/mempool_persist.h>
@@ -464,6 +465,86 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
         BOOST_CHECK_EQUAL(cmp.commitment_a.GetHex(), cmp.commitment_b.GetHex());
         BOOST_CHECK_EQUAL(cmp.count_a, cmp.count_b);
         BOOST_CHECK_GT(cmp.count_a, size_t{0}); // the reconstructed set is non-trivial
+    }
+
+    // ---- The operator-facing U == U' check (b3coin-utxo-verify's core),
+    // driven end to end against this chain: same-H/X verification, replay from
+    // a block source, full-set comparison. Entirely outside consensus.
+    {
+        const auto block_source{[&](const int height) -> std::optional<CBlock> {
+            if (height == 0) return chainman.GetParams().GenesisBlock();
+            if (height < 1 || height > SYNTHETIC_H) return std::nullopt;
+            return legacy_blocks[static_cast<size_t>(height) - 1];
+        }};
+        const auto scratch_db{[&](const std::string& name) {
+            return CCoinsViewDB{DBParams{.path = m_args.GetDataDirBase() / fs::u8path(name),
+                                         .cache_bytes = size_t{1} << 20,
+                                         .wipe_data = true},
+                                CoinsViewOptions{}};
+        }};
+
+        LOCK(cs_main);
+        chainman.ActiveChainstate().ForceFlushStateToDisk();
+        const CCoinsViewDB& live{chainman.ActiveChainstate().CoinsDB()};
+
+        // Positive: the reconstruction equals the validated chainstate.
+        {
+            CCoinsViewDB scratch{scratch_db("uve_ok")};
+            const auto res{node::VerifyReplayEquivalence(
+                consensus, live, block_source, scratch,
+                {.final_height = SYNTHETIC_H, .final_hash = X})};
+            if (!res.errors.empty()) BOOST_TEST_MESSAGE("verify error: " + res.errors.front());
+            BOOST_CHECK(res.errors.empty());
+            BOOST_CHECK(res.ok);
+            BOOST_CHECK_EQUAL(res.blocks_replayed, SYNTHETIC_H + 1);
+            BOOST_CHECK_EQUAL(res.live_commitment.GetHex(), res.replay_commitment.GetHex());
+            BOOST_CHECK_EQUAL(res.live_count, res.replay_count);
+            BOOST_CHECK_GT(res.live_count, size_t{0});
+            BOOST_CHECK_EQUAL(res.mismatch_total, size_t{0});
+        }
+        // Wrong X: refused up front with a same-H/X verification error.
+        {
+            CCoinsViewDB scratch{scratch_db("uve_wrongx")};
+            uint256 wrong{X};
+            wrong.begin()[0] ^= 0x01;
+            const auto res{node::VerifyReplayEquivalence(
+                consensus, live, block_source, scratch,
+                {.final_height = SYNTHETIC_H, .final_hash = wrong})};
+            BOOST_CHECK(!res.ok);
+            BOOST_REQUIRE(!res.errors.empty());
+            BOOST_CHECK(res.errors.front().find("best block") != std::string::npos);
+            BOOST_CHECK_EQUAL(res.blocks_replayed, 0);
+        }
+        // A block source with a hole fails cleanly.
+        {
+            CCoinsViewDB scratch{scratch_db("uve_hole")};
+            const auto holed{[&](const int height) -> std::optional<CBlock> {
+                if (height == 3) return std::nullopt;
+                return block_source(height);
+            }};
+            const auto res{node::VerifyReplayEquivalence(
+                consensus, live, holed, scratch,
+                {.final_height = SYNTHETIC_H, .final_hash = X})};
+            BOOST_CHECK(!res.ok);
+            BOOST_REQUIRE(!res.errors.empty());
+            BOOST_CHECK(res.errors.front().find("height 3") != std::string::npos);
+        }
+        // A tampered source (two blocks swapped) breaks linkage inside the
+        // replay engine rather than producing a bogus comparison.
+        {
+            CCoinsViewDB scratch{scratch_db("uve_swap")};
+            const auto swapped{[&](const int height) -> std::optional<CBlock> {
+                if (height == 3) return block_source(4);
+                if (height == 4) return block_source(3);
+                return block_source(height);
+            }};
+            const auto res{node::VerifyReplayEquivalence(
+                consensus, live, swapped, scratch,
+                {.final_height = SYNTHETIC_H, .final_hash = X})};
+            BOOST_CHECK(!res.ok);
+            BOOST_REQUIRE(!res.errors.empty());
+            BOOST_CHECK(res.errors.front().find("replay failed") != std::string::npos);
+        }
     }
 
     // ---- (11) A competing branch crossing H is rejected: X pins height H,

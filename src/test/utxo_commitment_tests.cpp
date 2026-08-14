@@ -4,6 +4,7 @@
 
 #include <coins.h>
 #include <node/utxo_commitment.h>
+#include <node/utxo_equivalence_check.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
 #include <uint256.h>
@@ -113,6 +114,30 @@ BOOST_AUTO_TEST_CASE(exact_coin_content_differences_are_detected)
     const auto same{CompareUtxoSets({Entry(op, base)}, {Entry(op, base)})};
     BOOST_CHECK(same.Equal());
     BOOST_CHECK_EQUAL(same.commitment_a.GetHex(), same.commitment_b.GetHex());
+}
+
+BOOST_AUTO_TEST_CASE(mismatch_diagnostics_are_bounded)
+{
+    // 25 one-sided entries; the summary keeps the exact total but bounds the
+    // retained sample, in canonical order.
+    std::vector<UtxoEntry> a;
+    for (uint8_t i{1}; i <= 25; ++i) {
+        a.push_back(Entry(Op(i, 0), MakeCoin(100 + i, 5, false, false)));
+    }
+    const auto summary{node::SummarizeComparison(CompareUtxoSets(a, {}), /*max_sample=*/20)};
+    BOOST_CHECK(!summary.ok);
+    BOOST_CHECK_EQUAL(summary.live_count, 25U);
+    BOOST_CHECK_EQUAL(summary.replay_count, 0U);
+    BOOST_CHECK_EQUAL(summary.mismatch_total, 25U);
+    BOOST_REQUIRE_EQUAL(summary.mismatch_sample.size(), 20U);
+    BOOST_CHECK(summary.mismatch_sample.front().outpoint == Op(1, 0));
+    BOOST_CHECK(summary.mismatch_sample.back().outpoint == Op(20, 0));
+
+    // A clean comparison summarizes as ok with no sample.
+    const auto equal{node::SummarizeComparison(CompareUtxoSets(a, a), /*max_sample=*/20)};
+    BOOST_CHECK(equal.ok);
+    BOOST_CHECK_EQUAL(equal.mismatch_total, 0U);
+    BOOST_CHECK(equal.mismatch_sample.empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
