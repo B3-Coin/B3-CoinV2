@@ -990,4 +990,197 @@ BOOST_AUTO_TEST_CASE(legacy_checkpoint_and_depth_rules_are_mode_scoped)
     }
 }
 
+//! Once the boundary (H, X) is pinned, legacy admission is replay-scoped:
+//! it keeps the structural checks, the hardened checkpoints, the exact X at
+//! H and the physical future-time bound, but stops re-judging attested
+//! history with the live rules (version whitelist, PoW and target, block
+//! signature, rolling depth bar). Off-anchor data that passes admission is
+//! stored as side history, classified anchor-ineligible, and never moves
+//! the tip.
+BOOST_AUTO_TEST_CASE(pinned_admission_stops_re_judging_live_rules)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int SPAN{6};
+    constexpr int MINI_H{12};
+    mutable_consensus.legacy_checkpoint_span = SPAN;
+
+    const auto build_legacy{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        const int height{prev->nHeight + 1};
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << height << CScriptNum{7};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, height, consensus), CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) {
+            mtx.m_legacy_encoding = true;
+            block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) {
+            ++block.nNonce;
+            BOOST_REQUIRE(block.nNonce < 10'000'000);
+        }
+        return block;
+    }};
+
+    // Build the canonical mini-chain in live mode (boundary unpinned).
+    Txid mature_coinbase{};
+    for (int height{1}; height <= MINI_H; ++height) {
+        const CBlockIndex* prev{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
+        const auto submitted{CodecRoundTrip(build_legacy(prev, {}))};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(submitted, true, true, &new_block),
+                              "canonical legacy block at height " << height << " refused");
+        if (height == 2) mature_coinbase = submitted->vtx[0]->GetHash();
+    }
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->nHeight), MINI_H);
+
+    // A sibling of the block at `height`, spending the mature coinbase so
+    // its hash differs; live rules (target, PoW grinding) deliberately
+    // violated when `wreck` is set.
+    const auto build_fork{[&](const int fork_height, const bool wreck, const int32_t version) {
+        const CBlockIndex* parent{WITH_LOCK(cs_main, return chainman.ActiveChain()[fork_height - 1])};
+        CMutableTransaction spend;
+        spend.version = 1;
+        spend.nTime = static_cast<uint32_t>(parent->GetBlockTime() + 17);
+        spend.vin.resize(1);
+        spend.vin[0].prevout = COutPoint{mature_coinbase, 0};
+        spend.vin[0].scriptSig = CScript{};
+        spend.vout.emplace_back(1 * COIN, CScript() << OP_TRUE);
+        CBlock block{build_legacy(parent, {spend})};
+        block.nVersion = version;
+        if (wreck) {
+            block.nBits = 0x1d00ffff; // not the required target, and no grinding
+            block.nNonce = 0;
+        }
+        return CodecRoundTrip(block);
+    }};
+
+    // Live-mode contrast: an unknown legacy version is refused outright.
+    {
+        const auto unknown_version{build_fork(MINI_H, /*wreck=*/false, /*version=*/7)};
+        bool new_block{false};
+        BOOST_CHECK(!chainman.ProcessNewBlock(unknown_version, true, true, &new_block));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(
+                                  unknown_version->GetLegacyB3Hash())) == nullptr);
+    }
+
+    // Pin the boundary at the mini-chain tip.
+    const uint256 X{WITH_LOCK(cs_main, return chainman.ActiveChain()[MINI_H]->GetBlockHash())};
+    mutable_consensus.hard_fork_height = MINI_H + 1;
+    mutable_consensus.legacy_final_hash = X;
+
+    // (a) A DEEP fork (height 3, more than SPAN below the tip) with a wrong,
+    // ungrounded target and an unknown version: the depth bar, version
+    // whitelist, PoW and target checks are all live-only, so admission now
+    // stores it as side history — immediately anchor-ineligible, tip unmoved.
+    {
+        const auto deep{build_fork(3, /*wreck=*/true, /*version=*/7)};
+        const uint256 deep_hash{deep->GetLegacyB3Hash()};
+        bool new_block{false};
+        BOOST_CHECK(chainman.ProcessNewBlock(deep, true, true, &new_block));
+        BOOST_CHECK(new_block);
+        const CBlockIndex* pindex{WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(deep_hash))};
+        BOOST_REQUIRE(pindex != nullptr);
+        BOOST_CHECK(pindex->nStatus & BLOCK_ANCHOR_INELIGIBLE);
+        BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->GetBlockHash().GetHex()), X.GetHex());
+    }
+
+    // (b) A proof-of-stake-shaped fork (below H, so the boundary pin does not
+    // apply) with a garbage block signature: signature validation is
+    // live-only adjudication, so admission stores it.
+    {
+        const CBlockIndex* parent{WITH_LOCK(cs_main, return chainman.ActiveChain()[MINI_H - 2])};
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(parent->GetBlockTime() + 16);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (MINI_H - 1) << CScriptNum{11};
+        coinbase.vout.emplace_back(0, CScript{});
+        CMutableTransaction stake;
+        stake.version = 1;
+        stake.nTime = static_cast<uint32_t>(parent->GetBlockTime() + 16);
+        stake.m_legacy_encoding = true;
+        stake.vin.resize(1);
+        stake.vin[0].prevout = COutPoint{mature_coinbase, 0};
+        stake.vin[0].scriptSig = CScript() << std::vector<unsigned char>{0xaa};
+        stake.vout.emplace_back(0, CScript{});
+        stake.vout.emplace_back(1 * COIN, CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = parent->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(parent->GetBlockTime() + 16);
+        block.nBits = 0x1d00ffff;
+        block.nNonce = 0;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        block.vtx.push_back(MakeTransactionRef(std::move(stake)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.vchBlockSig = {0xde, 0xad};
+        const auto submitted{CodecRoundTrip(block)};
+        bool new_block{false};
+        BOOST_CHECK(chainman.ProcessNewBlock(submitted, true, true, &new_block));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(
+                                  submitted->GetLegacyB3Hash())) != nullptr);
+        BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->GetBlockHash().GetHex()), X.GetHex());
+    }
+
+    // (c) A hardened checkpoint mismatch is still refused when pinned: the
+    // checkpoints are the membership anchors of the attested chain.
+    {
+        const uint256 canonical8{WITH_LOCK(cs_main, return chainman.ActiveChain()[8]->GetBlockHash())};
+        mutable_consensus.legacy_checkpoints = {{8, canonical8}};
+        const auto bad_cp{build_fork(8, /*wreck=*/true, /*version=*/4)};
+        bool new_block{false};
+        BOOST_CHECK(!chainman.ProcessNewBlock(bad_cp, true, true, &new_block));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(
+                                  bad_cp->GetLegacyB3Hash())) == nullptr);
+        mutable_consensus.legacy_checkpoints.clear();
+    }
+
+    // (d) A block at H that is not X is still refused: the boundary pin is
+    // exact identity, not a live rule.
+    {
+        const auto not_x{build_fork(MINI_H, /*wreck=*/true, /*version=*/4)};
+        BOOST_REQUIRE(not_x->GetLegacyB3Hash() != X);
+        bool new_block{false};
+        BOOST_CHECK(!chainman.ProcessNewBlock(not_x, true, true, &new_block));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(
+                                  not_x->GetLegacyB3Hash())) == nullptr);
+    }
+
+    // (e) The physical future-time bound survives pinning (below H, so only
+    // the time bound can refuse): attested history is in the past by
+    // construction, so this only refuses fabricated data.
+    {
+        const CBlockIndex* parent{WITH_LOCK(cs_main, return chainman.ActiveChain()[MINI_H - 2])};
+        CBlock block{build_legacy(parent, {})};
+        block.nTime = static_cast<uint32_t>(MOCK_NOW + legacy::MAX_FUTURE_BLOCK_TIME + 100);
+        CMutableTransaction cb{*block.vtx[0]};
+        cb.nTime = block.nTime;
+        block.vtx[0] = MakeTransactionRef(std::move(cb));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const auto submitted{CodecRoundTrip(block)};
+        bool new_block{false};
+        BOOST_CHECK(!chainman.ProcessNewBlock(submitted, true, true, &new_block));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(
+                                  submitted->GetLegacyB3Hash())) == nullptr);
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

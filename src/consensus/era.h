@@ -64,6 +64,26 @@ constexpr std::optional<int> LegacyFinalHeight(const Params& params)
 }
 
 /**
+ * True once the legacy boundary is PINNED: both the final height H and the
+ * exact boundary hash X are consensus constants of this chain.
+ *
+ * From that moment every height <= H is attested history: the node
+ * reconstructs it mechanically through the trusted replay engine, and the
+ * preserved live legacy rule set (PoW, kernel, difficulty, signatures,
+ * historical timestamp semantics, rewards) is never used to re-judge it.
+ * While the boundary is unpinned the chain is in live legacy operation and
+ * the full preserved rule set applies.
+ *
+ * Distinct from Chainstate::LegacyBoundaryActive(), which additionally
+ * requires X to be connected on the active chain and gates the
+ * cross-boundary reorganization prohibition.
+ */
+constexpr bool LegacyBoundaryPinned(const Params& params)
+{
+    return LegacyFinalHeight(params).has_value() && params.legacy_final_hash.has_value();
+}
+
+/**
  * A disconnect of the block at `disconnect_height` would cross the
  * finalized legacy boundary. Reorganizations that disconnect H or anything
  * below it are permanently prohibited; forks entirely above H may still

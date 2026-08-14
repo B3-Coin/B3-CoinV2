@@ -4414,12 +4414,21 @@ static bool CheckLegacyBlock(const CBlock& block, BlockValidationState& state,
                              const Consensus::Params& consensusParams,
                              const bool fCheckPOW, const bool fCheckMerkleRoot)
 {
+    // Once the boundary (H, X) is pinned, every legacy block is attested
+    // history and only the structural checks below remain: replay must not
+    // re-judge historical consensus (contract section 11), so the PoW
+    // check, the block signature and the historical timestamp semantics
+    // are only enforced in live legacy operation (boundary unpinned).
+    // Membership of the attested chain is enforced by the hardened
+    // checkpoints, the exact hash X at H, and the replay engine itself.
+    const bool live_legacy{!Consensus::LegacyBoundaryPinned(consensusParams)};
+
     // The legacy client created genesis locally rather than feeding it through
     // CheckBlock(). Its fixed scrypt hash is outside its nominal target, so
     // this is deliberately restricted to the configured historical genesis.
     const bool legacy_genesis{block.hashPrevBlock.IsNull() &&
                               block.GetLegacyB3Hash() == consensusParams.hashGenesisBlock};
-    if (fCheckPOW && !legacy_genesis && block.IsProofOfWork() &&
+    if (live_legacy && fCheckPOW && !legacy_genesis && block.IsProofOfWork() &&
         !CheckProofOfWork(block.GetLegacyB3Hash(), block.nBits, consensusParams)) {
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
     }
@@ -4454,7 +4463,7 @@ static bool CheckLegacyBlock(const CBlock& block, BlockValidationState& state,
         }
     }
 
-    if (!legacy::CheckBlockSignature(block)) {
+    if (live_legacy && !legacy::CheckBlockSignature(block)) {
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-signature", "invalid proof-of-stake block signature");
     }
 
@@ -4466,7 +4475,7 @@ static bool CheckLegacyBlock(const CBlock& block, BlockValidationState& state,
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, tx_state.GetRejectReason(),
                                  strprintf("Transaction check failed (tx hash %s) %s", tx->GetHash().ToString(), tx_state.GetDebugMessage()));
         }
-        if (block.GetBlockTime() < tx->nTime) {
+        if (live_legacy && block.GetBlockTime() < tx->nTime) {
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-time-too-new", "transaction timestamp is later than its block");
         }
         if (!unique_txids.insert(tx->GetHash()).second) {
@@ -4716,6 +4725,15 @@ static bool ContextualCheckLegacyBlock(const CBlock& block, BlockValidationState
 {
     if (pindex_prev == nullptr) return true; // Genesis is constructed locally.
 
+    // Every rule below is live legacy adjudication (version policy, PoW
+    // retirement, the retarget schedule, historical timestamp semantics,
+    // finality, the coinbase height commitment). Once the boundary (H, X)
+    // is pinned these blocks are attested history reconstructed by the
+    // trusted replay engine, which must not re-judge them (contract
+    // section 11); membership is enforced by the checkpoints and the exact
+    // hash X instead.
+    if (Consensus::LegacyBoundaryPinned(params)) return true;
+
     const int height{pindex_prev->nHeight + 1};
     if (block.nVersion > 4) {
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-version", "unknown legacy B3Coin block version");
@@ -4800,38 +4818,52 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
 
     // Check proof of work
     if (Consensus::GetB3Era(nHeight, consensusParams) == Consensus::B3Era::LEGACY) {
+        // Once the boundary (H, X) is pinned, legacy heights are attested
+        // history reconstructed by the trusted replay engine: admission keeps
+        // only the codec/boundary identity checks above, the hardened
+        // checkpoints, and the physical future-time bound. The live rules
+        // (version policy, historical timestamp semantics, the rolling
+        // deep-reorg bar) must not re-judge attested history — and the
+        // deep-reorg bar would refuse the genuine chain's blocks while
+        // recovering from a fabricated off-anchor chain, which is measured
+        // against exactly the fake tip it needs to displace.
+        const bool live_legacy{!Consensus::LegacyBoundaryPinned(consensusParams)};
+
         // Header-only B3Coin blocks cannot disclose whether they are PoW or
         // PoS, so their hybrid target is checked once the full block reaches
         // ConnectBlock. Keep the old timestamp and version limits here.
-        if (block.nVersion > 4) {
+        if (live_legacy && block.nVersion > 4) {
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-version", "unknown legacy B3Coin block version");
         }
-        if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast() ||
-            block.GetBlockTime() + legacy::MAX_FUTURE_BLOCK_TIME < pindexPrev->GetBlockTime()) {
+        if (live_legacy &&
+            (block.GetBlockTime() <= pindexPrev->GetMedianTimePast() ||
+             block.GetBlockTime() + legacy::MAX_FUTURE_BLOCK_TIME < pindexPrev->GetBlockTime())) {
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "time-too-old", "block timestamp is too early");
         }
+        // A physical clock bound, kept in both modes: attested history is in
+        // the past by construction, so this can only refuse fabricated data.
         if (block.Time() > NodeClock::now() + std::chrono::seconds{legacy::MAX_FUTURE_BLOCK_TIME}) {
             return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new", "block timestamp too far in the future");
         }
 
-        // Live-legacy historical checkpoint rules (mode: PRE-X LIVE LEGACY).
-        // These are not consulted by trusted replay of the settled pre-X prefix
-        // (a separate engine) and never run for the modern era.
-        //
-        // Hardened checkpoints: a block at a pinned height must match its pinned
-        // hash. A mismatch is a hard, bannable rejection, as in the historical
-        // client. Identity is the marker hash, exactly as elsewhere.
+        // Hardened checkpoints, kept in both modes: a block at a pinned height
+        // must match its pinned hash. Live legacy inherits them from the
+        // historical client as a hard, bannable rejection; with the boundary
+        // pinned they are the membership anchors of the attested chain
+        // (contract section 11 step 5), re-verified by the replay engine at
+        // connect time. Identity is the marker hash, exactly as elsewhere.
         if (!legacy::CheckpointAllows(consensusParams, nHeight, block.GetMarkerHash(consensusParams))) {
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-legacy-checkpoint",
                                  strprintf("legacy block at height %d does not match its hardened checkpoint", nHeight));
         }
-        // Rolling deep-reorg bound: a block more than the historical span below
-        // the active tip is refused, so a peer cannot spam deep-fork history or
-        // force an unboundedly deep reorg. This is measured against the live
-        // active tip, so it must be skipped while importing/reindexing our own
-        // blocks from disk (which may be read out of height order), and it is a
-        // no-penalty rejection: an honest node on a stale branch can hit it.
-        if (!blockman.LoadingBlocks()) {
+        // Rolling deep-reorg bound (mode: LIVE LEGACY only): a block more than
+        // the historical span below the active tip is refused, so a peer
+        // cannot spam deep-fork history or force an unboundedly deep reorg.
+        // This is measured against the live active tip, so it must be skipped
+        // while importing/reindexing our own blocks from disk (which may be
+        // read out of height order), and it is a no-penalty rejection: an
+        // honest node on a stale branch can hit it.
+        if (live_legacy && !blockman.LoadingBlocks()) {
             if (const CBlockIndex* tip{chainman.ActiveChain().Tip()};
                 tip && legacy::ReorgDepthExceeded(consensusParams, nHeight, tip->nHeight)) {
                 return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "legacy-reorg-too-deep",
