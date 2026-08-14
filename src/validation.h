@@ -826,6 +826,16 @@ public:
      */
     bool IsAnchorIneligible(const CBlockIndex& block) const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+    /**
+     * True once the finalized legacy boundary is ACTIVE on this chain: H/X are
+     * configured and the pinned block X is part of the active chain. Only from
+     * that moment is the cross-boundary reorganization prohibition binding --
+     * before X has ever connected, the node is in pre-X live-legacy operation,
+     * where ordinary (depth-bounded) legacy reorganization below H is
+     * legitimate and refusing it would strand a node on a minority branch.
+     */
+    bool LegacyBoundaryActive() const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
     void PruneBlockIndexCandidates();
 
     void ClearBlockIndexCandidates() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);

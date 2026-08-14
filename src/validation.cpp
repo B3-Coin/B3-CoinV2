@@ -3250,10 +3250,14 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     CBlockIndex *pindexDelete = m_chain.Tip();
     assert(pindexDelete);
     assert(pindexDelete->pprev);
-    // Reorganizations across the finalized legacy boundary are permanently
-    // prohibited: the block at H and everything below it can never be
-    // disconnected.
-    if (Consensus::DisconnectCrossesLegacyBoundary(m_chainman.GetConsensus(), pindexDelete->nHeight)) {
+    // Once the boundary is ACTIVE -- the pinned block X is part of the active
+    // chain -- reorganizations across it are permanently prohibited: the block
+    // at H and everything below it can never be disconnected. Before X has
+    // connected this must not fire: pre-X live-legacy operation legitimately
+    // reorganizes below H (bounded by the historical depth rule), and a node
+    // syncing toward X with H/X already configured would otherwise freeze.
+    if (LegacyBoundaryActive() &&
+        Consensus::DisconnectCrossesLegacyBoundary(m_chainman.GetConsensus(), pindexDelete->nHeight)) {
         LogError("DisconnectTip(): refusing to disconnect %s at height %d across the finalized legacy boundary\n",
                  pindexDelete->GetBlockHash().ToString(), pindexDelete->nHeight);
         return false;
@@ -3495,6 +3499,15 @@ bool Chainstate::IsAnchorIneligible(const CBlockIndex& block) const
     return m_blockman.IsAnchorIneligible(block);
 }
 
+bool Chainstate::LegacyBoundaryActive() const
+{
+    AssertLockHeld(::cs_main);
+    const Consensus::Params& params{m_chainman.GetConsensus()};
+    if (!Consensus::LegacyFinalHeight(params) || !params.legacy_final_hash) return false;
+    const CBlockIndex* pindexX{m_blockman.LookupBlockIndex(*params.legacy_final_hash)};
+    return pindexX && m_chain.Contains(pindexX);
+}
+
 CBlockIndex* Chainstate::FindMostWorkChain()
 {
     AssertLockHeld(::cs_main);
@@ -3601,12 +3614,15 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
     // Disconnect active blocks which are no longer in the best chain.
     bool fBlocksDisconnected = false;
     DisconnectedBlockTransactions disconnectpool{MAX_DISCONNECTED_TX_POOL_BYTES};
-    // A branch that forks below the finalized legacy boundary can never become
-    // the active chain. FindMostWorkChain() discards such candidates, so this
-    // is a defensive check for a candidate that appeared after selection: treat
-    // it as a rejected chain rather than a local failure, so the caller
-    // reselects instead of the node aborting.
-    if (m_chain.Tip() != nullptr &&
+    // Once the boundary is active, a branch whose activation would disconnect
+    // blocks at or below the finalized legacy boundary can never become the
+    // active chain. FindMostWorkChain() discards such candidates, so this is a
+    // defensive check for a candidate that appeared after selection: treat it
+    // as a rejected chain rather than a local failure, so the caller reselects
+    // instead of the node aborting. A pure extension (fork point == tip)
+    // disconnects nothing and must never be refused -- otherwise a node whose
+    // tip is still below H could not even connect the canonical chain to X.
+    if (m_chain.Tip() != nullptr && m_chain.Tip() != pindexFork && LegacyBoundaryActive() &&
         Consensus::ReorgFromForkCrossesLegacyBoundary(m_chainman.GetConsensus(), pindexFork ? pindexFork->nHeight : -1)) {
         LogWarning("%s: refusing to activate %s (height %d): would reorganize across the finalized legacy boundary\n",
                    __func__, pindexMostWork->GetBlockHash().ToString(), pindexMostWork->nHeight);
