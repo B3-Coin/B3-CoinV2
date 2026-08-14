@@ -1147,6 +1147,101 @@ BOOST_AUTO_TEST_CASE(pinned_boundary_blocks_connect_through_replay)
     }
 }
 
+//! Fake-chain-first poisoning: with the boundary pinned, a fabricated
+//! legacy chain claiming an extremely hard target can become the active
+//! chain before X is known (admission no longer re-judges difficulty and
+//! connection is mechanical). Once the genuine chain arrives and X's index
+//! entry exists, the node must classify the fabricated tip off-anchor,
+//! unwind it through the standard undo path, and activate the attested
+//! chain even though it carries far less recorded work; the best header
+//! must recover with it.
+BOOST_AUTO_TEST_CASE(off_anchor_active_tip_recovers_once_x_is_known)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int PINNED_H{8};
+
+    // Offline raw chain builder off the synthetic genesis. No grinding, no
+    // retarget conformance: the pinned era never re-judges either.
+    const auto make_chain{[&](const uint32_t nbits, const int64_t tag, const int length) {
+        std::vector<CBlock> blocks;
+        uint256 prev{consensus.hashGenesisBlock};
+        uint32_t ntime{GENESIS_TIME};
+        for (int height{1}; height <= length; ++height) {
+            ntime += 17;
+            CMutableTransaction coinbase;
+            coinbase.version = 1;
+            coinbase.nTime = ntime;
+            coinbase.m_legacy_encoding = true;
+            coinbase.vin.resize(1);
+            coinbase.vin[0].prevout.SetNull();
+            coinbase.vin[0].scriptSig = CScript() << height << CScriptNum{tag};
+            coinbase.vout.emplace_back(100 * COIN, CScript() << OP_TRUE);
+            CBlock block;
+            block.nVersion = 4;
+            block.hashPrevBlock = prev;
+            block.nTime = ntime;
+            block.nBits = nbits;
+            block.nNonce = 0;
+            block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+            block.hashMerkleRoot = BlockMerkleRoot(block);
+            blocks.push_back(block);
+            prev = block.GetLegacyB3Hash();
+        }
+        return blocks;
+    }};
+
+    // The genuine chain claims ordinary regtest-grade work; the fabricated
+    // one claims a target hard enough that a single block outweighs the
+    // whole attested chain.
+    const std::vector<CBlock> genuine{make_chain(0x207fffff, 1, PINNED_H)};
+    const std::vector<CBlock> fake{make_chain(0x1c00ffff, 2, PINNED_H - 1)};
+
+    const uint256 X{genuine.back().GetLegacyB3Hash()};
+    mutable_consensus.hard_fork_height = PINNED_H + 1;
+    mutable_consensus.legacy_final_hash = X;
+
+    // The fabricated chain arrives first and becomes the active chain: with
+    // X not yet in the block index it is not classifiable.
+    for (const CBlock& block : fake) {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(CodecRoundTrip(block), true, true, &new_block));
+    }
+    const uint256 fake_tip{fake.back().GetLegacyB3Hash()};
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE_EQUAL(chainman.ActiveChain().Tip()->GetBlockHash().GetHex(), fake_tip.GetHex());
+        BOOST_CHECK(chainman.m_best_header == chainman.ActiveChain().Tip());
+    }
+
+    // The genuine chain arrives second, every block below the fabricated
+    // tip's recorded work. When X itself is stored, the fabricated tip
+    // becomes classifiable and must be abandoned.
+    for (const CBlock& block : genuine) {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(CodecRoundTrip(block), true, true, &new_block));
+    }
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+        BOOST_REQUIRE_EQUAL(tip->nHeight, PINNED_H);
+        BOOST_CHECK_EQUAL(tip->GetBlockHash().GetHex(), X.GetHex());
+        const CBlockIndex* fake_index{chainman.m_blockman.LookupBlockIndex(fake_tip)};
+        BOOST_REQUIRE(fake_index != nullptr);
+        // The fabricated chain still records more work than the attested
+        // chain -- membership, not work, decided...
+        BOOST_CHECK(fake_index->nChainWork > tip->nChainWork);
+        // ...and it is now persistently off-anchor: stored side history,
+        // not invalid, never again a fork-choice or sync influence.
+        BOOST_CHECK(fake_index->nStatus & BLOCK_ANCHOR_INELIGIBLE);
+        BOOST_CHECK(!(fake_index->nStatus & BLOCK_FAILED_VALID));
+        BOOST_CHECK(chainman.m_best_header == tip);
+        BOOST_CHECK(chainman.ActiveChainstate().LegacyBoundaryActive());
+    }
+}
+
 //! Once the boundary (H, X) is pinned, legacy admission is replay-scoped:
 //! it keeps the structural checks, the hardened checkpoints, the exact X at
 //! H and the physical future-time bound, but stops re-judging attested

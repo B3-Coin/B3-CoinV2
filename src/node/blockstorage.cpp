@@ -1140,10 +1140,16 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
     // Chainstate::ConnectBlock after the UTXO view is available.
     // Marker-modern blocks never take the legacy header-PoW read check; the
     // modern validation path owns them at connect time.
+    // Once the boundary (H, X) is pinned, stored legacy blocks are attested
+    // history (or stored off-anchor side data awaiting unwinding) and PoW is
+    // never re-judged, on read or anywhere else; identity is still verified
+    // against the indexed hash below, which is the integrity check that
+    // matters.
     const bool legacy_codec_block{GetConsensus().legacy_b3coin &&
                                   !Consensus::HasB3BlockCodecV2(block.nVersion)};
     const bool requires_header_pow{(!GetConsensus().legacy_b3coin ||
-                                    (legacy_codec_block && block.IsProofOfWork())) &&
+                                    (legacy_codec_block && block.IsProofOfWork() &&
+                                     !Consensus::LegacyBoundaryPinned(GetConsensus()))) &&
                                    !legacy_genesis};
     if (requires_header_pow && !CheckProofOfWork(block_hash, block.nBits, GetConsensus())) {
         LogError("Errors in block header at %s while reading block", pos.ToString());

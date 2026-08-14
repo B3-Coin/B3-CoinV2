@@ -3819,6 +3819,71 @@ static void LimitValidationInterfaceQueue(ValidationSignals& signals) LOCKS_EXCL
     }
 }
 
+bool Chainstate::AbandonOffAnchorTip(BlockValidationState& state)
+{
+    AssertLockNotHeld(::cs_main);
+
+    bool unwound{false};
+    while (true) {
+        if (m_chainman.m_interrupt) break;
+        // Make sure the queue of validation callbacks doesn't grow unboundedly.
+        if (m_chainman.m_options.signals) LimitValidationInterfaceQueue(*m_chainman.m_options.signals);
+
+        LOCK(cs_main);
+        // Lock for as long as disconnectpool is in scope to make sure
+        // MaybeUpdateMempoolForReorg is called after DisconnectTip without
+        // unlocking in between.
+        LOCK(MempoolMutex());
+        CBlockIndex* tip{m_chain.Tip()};
+        // Genesis (no pprev) can never be off its own chain's anchor.
+        if (!tip || !tip->pprev || !m_blockman.IsAnchorIneligible(*tip)) break;
+
+        if (!unwound) {
+            LogWarning("%s: active tip %s (height %d) lies off the finalized legacy boundary anchor; unwinding to the anchor fork\n",
+                       __func__, tip->GetBlockHash().ToString(), tip->nHeight);
+        }
+        unwound = true;
+
+        // Record the classification persistently before the tip moves: the
+        // block stays stored side history (it is not invalid), but it must
+        // never again influence fork choice or sync targeting.
+        if (!(tip->nStatus & BLOCK_ANCHOR_INELIGIBLE)) {
+            tip->nStatus |= BLOCK_ANCHOR_INELIGIBLE;
+            m_blockman.m_dirty_blockindex.insert(tip);
+        }
+
+        DisconnectedBlockTransactions disconnectpool{MAX_DISCONNECTED_TX_POOL_BYTES};
+        const bool ok{DisconnectTip(state, &disconnectpool)};
+        // Transactions from an off-anchor chain are never resurrected.
+        MaybeUpdateMempoolForReorg(disconnectpool, /*fAddToMempool=*/false);
+        if (!ok) return false;
+
+        // Keep the candidate set consistent while unwinding: the unwound
+        // block can no longer be a candidate, and the (possibly still
+        // off-anchor) new tip always has an entry, mirroring InvalidateBlock.
+        setBlockIndexCandidates.erase(tip);
+        setBlockIndexCandidates.insert(m_chain.Tip());
+    }
+
+    if (!unwound) return true;
+
+    {
+        LOCK(cs_main);
+        // The work bar has dropped to the anchor fork: repopulate the
+        // candidate set from the whole index, because anchor-eligible blocks
+        // (the genuine chain) were skipped while the fabricated tip carried
+        // more recorded work. The recorded best header may equally be
+        // fabricated; recompute it -- best-header selection filters
+        // off-anchor entries.
+        PopulateBlockIndexCandidates();
+        m_chainman.RecalculateBestHeader();
+        LogInfo("%s: unwound to %s (height %d); candidate set and best header rebuilt\n",
+                __func__, m_chain.Tip()->GetBlockHash().ToString(), m_chain.Tip()->nHeight);
+    }
+    m_chainman.CheckBlockIndex();
+    return true;
+}
+
 bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<const CBlock> pblock)
 {
     AssertLockNotHeld(m_chainstate_mutex);
@@ -3841,6 +3906,13 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
         LogError("%s", STR_INTERNAL_BUG("m_target_utxohash is set - this chainstate should not be in operation."));
         return Assume(false);
     }
+
+    // B3: an active tip proven off the finalized legacy boundary anchor must
+    // be unwound before candidate selection: work-based fork choice can
+    // never displace it, because the genuine anchor-eligible chain may carry
+    // less recorded work than a fabricated one (pinned-boundary admission
+    // does not re-judge the claimed difficulty).
+    if (!AbandonOffAnchorTip(state)) return false;
 
     CBlockIndex *pindexMostWork = nullptr;
     CBlockIndex *pindexNewTip = nullptr;

@@ -836,6 +836,23 @@ public:
      */
     bool LegacyBoundaryActive() const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+    /**
+     * Unwind an active tip that is provably off the finalized legacy
+     * boundary anchor. Once the boundary is pinned, legacy admission no
+     * longer re-judges the claimed difficulty, so a fabricated chain with
+     * inflated recorded work can become active before X is known; when X's
+     * index entry appears, the tip is classifiable and work-based fork
+     * choice can never displace it (the genuine chain may carry less
+     * recorded work). Disconnects tip blocks until the tip is
+     * anchor-eligible (the anchor fork point), marking each off-anchor
+     * block persistently, then rebuilds the candidate set and the best
+     * header so the attested chain can activate. A no-op whenever the tip
+     * is eligible or not yet classifiable. Returns false only on a system
+     * error.
+     */
+    bool AbandonOffAnchorTip(BlockValidationState& state)
+        EXCLUSIVE_LOCKS_REQUIRED(m_chainstate_mutex, !::cs_main);
+
     void PruneBlockIndexCandidates();
 
     void ClearBlockIndexCandidates() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
