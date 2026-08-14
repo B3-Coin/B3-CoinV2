@@ -15,6 +15,7 @@
 #include <script/script.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
+#include <undo.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -170,6 +171,59 @@ BOOST_AUTO_TEST_CASE(raw_decoding_is_safe_and_round_trips)
     more << legacy::TX_LEGACY(chain.block1);
     BOOST_CHECK(!replay.ApplyRawBlock(std::span{more}.first(more.size() / 2), view, error));
     BOOST_CHECK_EQUAL(replay.NextHeight(), 1);
+}
+
+BOOST_AUTO_TEST_CASE(captures_standard_undo_data)
+{
+    const SyntheticChain chain;
+    legacy::TrustedReplay replay{chain.params, /*final_height=*/2, {}};
+    CCoinsView base;
+    CCoinsViewCache view{&base};
+    std::string error;
+
+    BOOST_REQUIRE_MESSAGE(replay.ApplyBlock(chain.genesis, view, error), error);
+    BOOST_REQUIRE_MESSAGE(replay.ApplyBlock(chain.block1, view, error), error);
+
+    CBlockUndo undo;
+    BOOST_REQUIRE_MESSAGE(replay.ApplyBlock(chain.block2, view, error, &undo), error);
+
+    // Standard undo layout: one entry per transaction after the coinbase,
+    // spent coins in input order.
+    BOOST_REQUIRE_EQUAL(undo.vtxundo.size(), chain.block2.vtx.size() - 1);
+    BOOST_REQUIRE_EQUAL(undo.vtxundo[0].vprevout.size(), chain.block2.vtx[1]->vin.size());
+
+    // The captured coin is the exact coin the coinstake spent: value,
+    // script, creation height, class and legacy transaction time.
+    const Coin& spent{undo.vtxundo[0].vprevout[0]};
+    BOOST_CHECK_EQUAL(spent.out.nValue, 400 * COIN);
+    BOOST_CHECK(spent.out.scriptPubKey == (CScript() << OP_TRUE));
+    BOOST_CHECK_EQUAL(spent.nHeight, 1U);
+    BOOST_CHECK(!spent.fCoinBase);
+    BOOST_CHECK(!spent.fCoinStake);
+    BOOST_CHECK_EQUAL(spent.nTime, 1'100U);
+
+    // Undoing with the captured data restores the pre-block state exactly:
+    // remove the block's created outputs, re-add its spent inputs.
+    for (size_t i{chain.block2.vtx.size()}; i-- > 0;) {
+        const CTransaction& tx{*chain.block2.vtx[i]};
+        for (size_t o{0}; o < tx.vout.size(); ++o) {
+            view.SpendCoin(COutPoint{tx.GetHash(), static_cast<uint32_t>(o)});
+        }
+        if (i == 0) continue; // the coinbase spent nothing
+        for (size_t in{tx.vin.size()}; in-- > 0;) {
+            Coin restored{undo.vtxundo[i - 1].vprevout[in]};
+            view.AddCoin(tx.vin[in].prevout, std::move(restored), /*possible_overwrite=*/true);
+        }
+    }
+
+    BOOST_CHECK(!view.HaveCoin(COutPoint{chain.block2.vtx[0]->GetHash(), 0}));
+    BOOST_CHECK(!view.HaveCoin(COutPoint{chain.coinstake_txid, 1}));
+    const Coin& back{view.AccessCoin(COutPoint{chain.spend_txid, 0})};
+    BOOST_REQUIRE(!back.IsSpent());
+    BOOST_CHECK_EQUAL(back.out.nValue, 400 * COIN);
+    BOOST_CHECK_EQUAL(back.nHeight, 1U);
+    BOOST_CHECK_EQUAL(back.nTime, 1'100U);
+    BOOST_CHECK(view.HaveCoin(COutPoint{chain.spend_txid, 1}));
 }
 
 BOOST_AUTO_TEST_CASE(rejects_inconsistent_data)

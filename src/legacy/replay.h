@@ -19,6 +19,7 @@
 #include <string>
 
 class CBlock;
+class CBlockUndo;
 class CDBWrapper;
 struct DBParams;
 
@@ -73,7 +74,15 @@ public:
     //! Mechanically apply the next block in height order to `view`.
     //! All-or-nothing: on failure `error` is set and neither the view nor
     //! the replay position changes.
-    bool ApplyBlock(const CBlock& block, CCoinsViewCache& view, std::string& error);
+    //!
+    //! When `undo` is provided, the spent coins are captured per
+    //! transaction in the standard CBlockUndo layout (one entry per
+    //! transaction after the coinbase, inputs in order), so a caller that
+    //! connects blocks through replay can disconnect them through the
+    //! ordinary undo path. On failure the partially filled contents of
+    //! `undo` are meaningless and must be discarded.
+    bool ApplyBlock(const CBlock& block, CCoinsViewCache& view, std::string& error,
+                    CBlockUndo* undo = nullptr);
 
     //! Safely decode a raw legacy-encoded block, then apply it.
     bool ApplyRawBlock(std::span<const std::byte> raw, CCoinsViewCache& view, std::string& error);

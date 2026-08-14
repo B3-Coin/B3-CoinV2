@@ -15,6 +15,7 @@
 #include <serialize.h>
 #include <streams.h>
 #include <tinyformat.h>
+#include <undo.h>
 
 #include <exception>
 #include <utility>
@@ -60,7 +61,8 @@ void TrustedReplay::ResumeAt(const int next_height, const uint256& tip_hash)
     m_tip_hash = tip_hash;
 }
 
-bool TrustedReplay::ApplyBlock(const CBlock& block, CCoinsViewCache& view, std::string& error)
+bool TrustedReplay::ApplyBlock(const CBlock& block, CCoinsViewCache& view, std::string& error,
+                               CBlockUndo* const undo)
 {
     const int height{m_next_height};
     if (height > m_final_height) {
@@ -131,12 +133,18 @@ bool TrustedReplay::ApplyBlock(const CBlock& block, CCoinsViewCache& view, std::
     CCoinsViewCache block_view(&view);
     uint32_t tx_offset{static_cast<uint32_t>(GetSerializeSize(CBlockHeader{})) +
                        static_cast<uint32_t>(GetSizeOfCompactSize(block.vtx.size()))};
-    for (const CTransactionRef& ptx : block.vtx) {
-        const CTransaction& tx{*ptx};
+    if (undo) undo->vtxundo.reserve(block.vtx.size() - 1);
+    for (size_t tx_index{0}; tx_index < block.vtx.size(); ++tx_index) {
+        const CTransaction& tx{*block.vtx[tx_index]};
         const Txid txid{tx.GetHash()};
+
+        // The standard undo layout: one entry per transaction after the
+        // coinbase, holding the spent coins in input order.
+        CTxUndo* txundo{undo && tx_index > 0 ? &undo->vtxundo.emplace_back() : nullptr};
 
         CAmount value_in{0};
         if (!tx.IsCoinBase()) {
+            if (txundo) txundo->vprevout.reserve(tx.vin.size());
             for (const CTxIn& txin : tx.vin) {
                 // Missing prevouts and duplicate spends (within a
                 // transaction, a block, or against history) fail here.
@@ -152,7 +160,7 @@ bool TrustedReplay::ApplyBlock(const CBlock& block, CCoinsViewCache& view, std::
                     return false;
                 }
                 value_in += coin.out.nValue;
-                block_view.SpendCoin(txin.prevout);
+                block_view.SpendCoin(txin.prevout, txundo ? &txundo->vprevout.emplace_back() : nullptr);
             }
         }
 
