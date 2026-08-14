@@ -42,6 +42,14 @@ Constraints already locked and not open for reinterpretation:
 **Required to unblock:** a written modern PoS consensus specification covering every bullet
 above.
 
+**Draft under review:** [b3-modern-pos-spec.md](b3-modern-pos-spec.md) — a DRAFT
+specification following the agreed direction (STAKE policy outputs, locked-amount
+weight, owner/validator key split, no auto-compounding, bounded age, VRF
+eligibility with ranked fallbacks, cheap pre-verification), carrying the pending
+decisions list PD-1..PD-17 with concrete options per item. **OD-1 stays
+UNRESOLVED until that document is approved with every PD decided; nothing may be
+implemented from the draft.**
+
 ---
 
 ## OD-2 — Modern B3 monetary policy
