@@ -127,6 +127,16 @@ struct Params {
      */
     int legacy_checkpoint_span{0};
     /**
+     * The historical client's one-off superblock (chainparams nSuperBlockHeight
+     * and vSuperBlockPubKey). At exactly this height the general coinstake
+     * reward cap is replaced by a structured rule: the last coinstake output
+     * must pay at most legacy::LEGACY_SUPERBLOCK_PAYMENT to the P2PKH script of
+     * this public key. Unset on chains without one. Live legacy validation
+     * only; trusted replay does not adjudicate rewards.
+     */
+    std::optional<int> legacy_superblock_height;
+    std::vector<unsigned char> legacy_superblock_pubkey;
+    /**
      * Hashes of blocks that
      * - are known to be consensus valid, and
      * - buried in the chain, and

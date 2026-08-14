@@ -137,6 +137,10 @@ public:
         // Historical live-legacy checkpoint rules, ported verbatim.
         consensus.legacy_checkpoints = legacy::MainnetCheckpoints();
         consensus.legacy_checkpoint_span = legacy::LEGACY_CHECKPOINT_SPAN;
+        // The historical one-off superblock (chainparams nSuperBlockHeight /
+        // vSuperBlockPubKey in the final client, hex verbatim).
+        consensus.legacy_superblock_height = 107'488;
+        consensus.legacy_superblock_pubkey = ParseHex("0432160bdb95ec14c30a3c76ed742403a34d3b57841f49caec6971eee735bcc68d35d35936c66719910b32c51db72621191437d23659785fe20ee7268e7d340522");
         consensus.signet_blocks = false;
         consensus.signet_challenge.clear();
         consensus.nSubsidyHalvingInterval = 210000;

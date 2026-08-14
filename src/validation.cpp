@@ -2875,9 +2875,35 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         } else if (state.IsValid()) {
             assert(legacy_coin_age.has_value());
             const CAmount allowed_reward{legacy::GetProofOfStakeReward(pindex->pprev, *legacy_coin_age, nFees)};
-            if (!legacy::IsHistoricalStakeRewardCapException(pindex->nHeight) && legacy_stake_reward > allowed_reward) {
-                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cs-amount",
-                              strprintf("coinstake pays too much (actual=%d vs limit=%d)", legacy_stake_reward, allowed_reward));
+            // The final client's control flow, ported faithfully: the whole
+            // cap check is skipped inside the historical repair window; at the
+            // one superblock height the cap is replaced by a structured rule
+            // (last coinstake output pays at most the superblock payment to
+            // the pinned payee script); everywhere else the cap applies.
+            const Consensus::Params& consensus{params.GetConsensus()};
+            const bool superblock{consensus.legacy_superblock_height &&
+                                  pindex->nHeight == *consensus.legacy_superblock_height};
+            if (!legacy::IsRepairWindowHeight(pindex->nHeight)) {
+                if (superblock) {
+                    const CTxOut& last{block.vtx[1]->vout.back()};
+                    if (last.nValue > legacy::LEGACY_SUPERBLOCK_PAYMENT ||
+                        last.scriptPubKey != legacy::SuperblockPayeeScript(consensus.legacy_superblock_pubkey)) {
+                        state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cs-superblock",
+                                      strprintf("superblock coinstake does not pay the pinned payee within its bound (actual=%d vs limit=%d)",
+                                                last.nValue, legacy::LEGACY_SUPERBLOCK_PAYMENT));
+                    }
+                } else if (legacy_stake_reward > allowed_reward) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cs-amount",
+                                  strprintf("coinstake pays too much (actual=%d vs limit=%d)", legacy_stake_reward, allowed_reward));
+                }
+            }
+            // Above the restriction height the second coinstake output may not
+            // pay the restricted destination while earning a positive reward.
+            if (state.IsValid() && pindex->nHeight > legacy::LEGACY_RESTRICTED_STAKE_HEIGHT &&
+                block.vtx[1]->vout.size() > 1 && legacy_stake_reward > 0 &&
+                legacy::StakeDestinationIsRestricted(block.vtx[1]->vout[1].scriptPubKey)) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cs-restricted",
+                              strprintf("coinstake pays the restricted destination (reward=%d)", legacy_stake_reward));
             }
         }
     } else if (params.GetConsensus().legacy_b3coin) {

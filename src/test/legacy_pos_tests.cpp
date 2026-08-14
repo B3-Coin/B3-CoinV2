@@ -6,6 +6,10 @@
 #include <legacy/pos.h>
 
 #include <chain.h>
+#include <key.h>
+#include <pubkey.h>
+#include <script/script.h>
+#include <util/strencodings.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -138,6 +142,58 @@ BOOST_AUTO_TEST_CASE(preserves_historical_proof_of_integration_fee_accounting)
     BOOST_CHECK_EQUAL(
         legacy::GetLegacyTransactionFee(output + COIN, output, /*is_coinstake=*/true, /*height=*/1),
         0);
+}
+
+BOOST_AUTO_TEST_CASE(historical_reward_rule_exceptions_are_sourced)
+{
+    // Repair window: the final client skips the reward-cap check strictly
+    // inside (77446, 77506).
+    BOOST_CHECK(!legacy::IsRepairWindowHeight(77'446));
+    BOOST_CHECK(legacy::IsRepairWindowHeight(77'447));
+    BOOST_CHECK(legacy::IsRepairWindowHeight(77'505));
+    BOOST_CHECK(!legacy::IsRepairWindowHeight(77'506));
+    BOOST_CHECK(!legacy::IsRepairWindowHeight(107'488)); // the superblock is NOT a cap bypass
+
+    // Superblock payment bound: main.h SUPERBLOCKPAYMENT = 75656908 * 1e9.
+    BOOST_CHECK_EQUAL(legacy::LEGACY_SUPERBLOCK_PAYMENT, CAmount{75'656'908'000'000'000});
+
+    // Superblock payee: the P2PKH script of the pinned key's hash. The hash160
+    // of the historical vSuperBlockPubKey is pinned here as a golden vector.
+    const auto pubkey{ParseHex("0432160bdb95ec14c30a3c76ed742403a34d3b57841f49caec6971eee735bcc68d35d35936c66719910b32c51db72621191437d23659785fe20ee7268e7d340522")};
+    const CScript payee{legacy::SuperblockPayeeScript(pubkey)};
+    const CScript expected{CScript() << OP_DUP << OP_HASH160
+                                     << ParseHex("1c49f78e1a406c64996da1bc5fda3b371bd33706")
+                                     << OP_EQUALVERIFY << OP_CHECKSIG};
+    BOOST_CHECK(payee == expected);
+
+    // Restriction activation boundary.
+    BOOST_CHECK_EQUAL(legacy::LEGACY_RESTRICTED_STAKE_HEIGHT, 78'000);
+
+    // The restricted key id is the base58 payload of
+    // ShJsVNBQMa2M7cfCVPzRMt8nVZxHitBp7v (version byte 63).
+    BOOST_CHECK_EQUAL(HexStr(legacy::RestrictedStakeKeyId()), "db8ca2a4493aaed6b7d2f30acb4467b823e0b0a5");
+
+    // Old-client destination semantics: P2PKH of the key id matches...
+    const CScript restricted_p2pkh{CScript() << OP_DUP << OP_HASH160
+                                             << ToByteVector(legacy::RestrictedStakeKeyId())
+                                             << OP_EQUALVERIFY << OP_CHECKSIG};
+    BOOST_CHECK(legacy::StakeDestinationIsRestricted(restricted_p2pkh));
+    // ...an unrelated P2PKH does not...
+    const CScript other_p2pkh{CScript() << OP_DUP << OP_HASH160
+                                        << ParseHex("1c49f78e1a406c64996da1bc5fda3b371bd33706")
+                                        << OP_EQUALVERIFY << OP_CHECKSIG};
+    BOOST_CHECK(!legacy::StakeDestinationIsRestricted(other_p2pkh));
+    // ...and pay-to-pubkey folds to the key's hash exactly as the old Solver
+    // did: the (known) superblock key matches its own id through the P2PK arm,
+    // and does not match a different id.
+    const CScript p2pk{CScript() << pubkey << OP_CHECKSIG};
+    uint160 superblock_id;
+    const auto superblock_id_bytes{ParseHex("1c49f78e1a406c64996da1bc5fda3b371bd33706")};
+    std::copy(superblock_id_bytes.begin(), superblock_id_bytes.end(), superblock_id.begin());
+    BOOST_CHECK(legacy::StakeDestinationMatches(p2pk, superblock_id));
+    BOOST_CHECK(!legacy::StakeDestinationMatches(p2pk, legacy::RestrictedStakeKeyId()));
+    // Non-standard scripts never match.
+    BOOST_CHECK(!legacy::StakeDestinationMatches(CScript() << OP_TRUE, legacy::RestrictedStakeKeyId()));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

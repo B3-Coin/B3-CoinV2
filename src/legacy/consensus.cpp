@@ -17,6 +17,7 @@
 #include <pubkey.h>
 #include <script/script.h>
 #include <script/solver.h>
+#include <util/strencodings.h>
 
 #include <algorithm>
 #include <limits>
@@ -342,12 +343,52 @@ CAmount GetLegacyTransactionFee(const CAmount value_in, const CAmount value_out,
     return raw_fee >= collateral ? raw_fee - collateral : raw_fee;
 }
 
-bool IsHistoricalStakeRewardCapException(const int height)
+bool IsRepairWindowHeight(const int height)
 {
-    // The original B3Coin validator exempted this short repair interval and
-    // one historical superblock from its usual cap. This preserves existing
-    // chain history without reintroducing Fundamental Node consensus.
-    return (height > 77'446 && height < 77'506) || height == 107'488;
+    // Verbatim from the final client's ConnectBlock: the whole coinstake
+    // reward-cap check is skipped for 77447..77505 inclusive.
+    return height > 77'446 && height < 77'506;
+}
+
+CScript SuperblockPayeeScript(const std::vector<unsigned char>& pubkey)
+{
+    // superlockPayee.SetDestination(superblockPubkey.GetID()): the P2PKH
+    // script of the superblock key's hash.
+    const CPubKey key{pubkey};
+    return CScript() << OP_DUP << OP_HASH160 << ToByteVector(key.GetID()) << OP_EQUALVERIFY << OP_CHECKSIG;
+}
+
+bool StakeDestinationMatches(const CScript& script_pub_key, const uint160& key_id)
+{
+    // The 0.8-era client compared CTxDestination equality after its
+    // ExtractDestination, whose Solver folded both pay-to-pubkey-hash and
+    // pay-to-pubkey into the key's address. Reproduce exactly that fold.
+    std::vector<std::vector<unsigned char>> solutions;
+    switch (Solver(script_pub_key, solutions)) {
+    case TxoutType::PUBKEYHASH:
+        return uint160{solutions[0]} == key_id;
+    case TxoutType::PUBKEY:
+        return CPubKey{solutions[0]}.GetID() == CKeyID{key_id};
+    default:
+        return false;
+    }
+}
+
+const uint160& RestrictedStakeKeyId()
+{
+    // Base58 payload of ShJsVNBQMa2M7cfCVPzRMt8nVZxHitBp7v (version byte 63).
+    static const uint160 key_id{[] {
+        uint160 id;
+        const auto bytes{ParseHex("db8ca2a4493aaed6b7d2f30acb4467b823e0b0a5")};
+        std::copy(bytes.begin(), bytes.end(), id.begin());
+        return id;
+    }()};
+    return key_id;
+}
+
+bool StakeDestinationIsRestricted(const CScript& script_pub_key)
+{
+    return StakeDestinationMatches(script_pub_key, RestrictedStakeKeyId());
 }
 
 const std::map<int, uint256>& MainnetCheckpoints()

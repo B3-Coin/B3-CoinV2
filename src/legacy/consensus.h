@@ -9,11 +9,13 @@
 
 #include <consensus/amount.h>
 #include <consensus/params.h>
+#include <script/script.h>
 #include <uint256.h>
 
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <vector>
 
 class CBlock;
 class CBlockIndex;
@@ -120,11 +122,47 @@ CAmount GetProofOfStakeReward(const CBlockIndex* pindex_prev,
 CAmount GetLegacyTransactionFee(CAmount value_in, CAmount value_out, bool is_coinstake, int height);
 
 /**
- * Heights where the legacy client deliberately bypassed its normal coinstake
- * reward cap. They remain a narrow historical compatibility exception only;
- * no Fundamental Node mechanism is enabled by this function.
+ * The historical repair window: the final client skips its entire coinstake
+ * reward-cap check for blocks at heights 77447..77505 inclusive
+ * (master:src/main.cpp, "if (!(pindex->nHeight > 77446 && pindex->nHeight <
+ * 77506))"). The dense hardened checkpoints at 77900-78961 and the
+ * restricted-staker rule below are the rest of the same incident response.
  */
-bool IsHistoricalStakeRewardCapException(int height);
+bool IsRepairWindowHeight(int height);
+
+/**
+ * The historical superblock payment bound (main.h SUPERBLOCKPAYMENT =
+ * 75656908 * KILO_COIN, KILO_COIN = 1e9). At the superblock height the last
+ * coinstake output must pay at most this to SuperblockPayeeScript().
+ */
+inline constexpr CAmount LEGACY_SUPERBLOCK_PAYMENT{75'656'908LL * 1'000'000'000LL};
+
+/**
+ * The P2PKH script of the superblock public key's hash, exactly as the final
+ * client built it (superlockPayee.SetDestination(superblockPubkey.GetID())).
+ */
+CScript SuperblockPayeeScript(const std::vector<unsigned char>& pubkey);
+
+/**
+ * From this height (exclusive) the final client refuses any proof-of-stake
+ * block whose second coinstake output pays the restricted destination while
+ * earning a positive reward (master:src/main.cpp, "if(pindex->nHeight >
+ * 78000)"). The address is hardcoded in the client's ConnectBlock.
+ */
+inline constexpr int LEGACY_RESTRICTED_STAKE_HEIGHT{78'000};
+
+/**
+ * True if the script pays the restricted staking destination under the old
+ * client's ExtractDestination semantics: pay-to-pubkey-hash of that key id,
+ * or pay-to-pubkey whose key hashes to it (the 0.8-era Solver mapped both to
+ * the same CBitcoinAddress). Modern ExtractDestination no longer folds
+ * pay-to-pubkey into a key hash, so this must not use it.
+ */
+bool StakeDestinationMatches(const CScript& script_pub_key, const uint160& key_id);
+bool StakeDestinationIsRestricted(const CScript& script_pub_key);
+
+/** Key hash of the restricted staking address ShJsVNBQMa2M7cfCVPzRMt8nVZxHitBp7v. */
+const uint160& RestrictedStakeKeyId();
 
 /**
  * Historical hardened checkpoints of the B3 mainnet chain and the rolling
