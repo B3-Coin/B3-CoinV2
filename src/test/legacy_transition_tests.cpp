@@ -26,6 +26,7 @@
 #include <legacy/replay.h>
 #include <node/utxo_commitment.h>
 #include <node/utxo_equivalence_check.h>
+#include <node/utxo_rows.h>
 #include <kernel/mempool_removal_reason.h>
 #include <modern/pos.h>
 #include <node/mempool_persist.h>
@@ -45,6 +46,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1432,6 +1434,272 @@ BOOST_AUTO_TEST_CASE(pinned_admission_stops_re_judging_live_rules)
         BOOST_CHECK(!chainman.ProcessNewBlock(submitted, true, true, &new_block));
         BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(
                                   submitted->GetLegacyB3Hash())) == nullptr);
+    }
+}
+
+//! Non-empty regtest transition, ending at the deliberate fail-closed modern
+//! PoS gate. Integration-only: it does not stand in for the real-history
+//! three-way U_master == U_port == U_replay proof. The legacy chain is built
+//! through the LIVE legacy consensus path (unpinned: real target, reward cap,
+//! maturity, script and codec checks), carries meaningful UTXO history
+//! (matured coinbase spends, an output split, a two-input merge, unclaimed
+//! fees, varied scripts), then the boundary is frozen at (H, X) and the flow
+//! is verified end to end: boundary active, exact coin-level state, full-set
+//! replay equivalence with byte-identical canonical row files, and — with no
+//! modern PoS rule set installed — every modern block at H+1 refused by the
+//! fail-closed gate while the chain stays exactly at X.
+BOOST_AUTO_TEST_CASE(non_empty_transition_fails_closed_at_h_plus_one)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int H{36};
+    BOOST_REQUIRE(consensus.test_only_modern_pos_validator == nullptr); // fail-closed setup
+
+    const auto build_legacy{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        const int height{prev->nHeight + 1};
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << height << CScriptNum{13};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, height, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) {
+            mtx.m_legacy_encoding = true;
+            block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) {
+            ++block.nNonce;
+            BOOST_REQUIRE(block.nNonce < 10'000'000);
+        }
+        return block;
+    }};
+    const auto submit{[&](const CBlock& block, std::vector<CBlock>& chain_log) {
+        const auto submitted{CodecRoundTrip(block)};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(submitted, true, true, &new_block),
+                              "live legacy block at height "
+                                  << WITH_LOCK(cs_main, return chainman.ActiveChain().Height() + 1)
+                                  << " rejected");
+        BOOST_REQUIRE(new_block);
+        chain_log.push_back(*submitted);
+        return submitted;
+    }};
+    const auto tip{[&] { return WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()); }};
+
+    // Distinct anyone-can-spend scripts so the set carries varied script bytes.
+    const CScript script_a{CScript() << std::vector<unsigned char>(24, 0xb3) << OP_DROP << OP_TRUE};
+    const CScript script_b{CScript() << std::vector<unsigned char>(24, 0xc4) << OP_DROP << OP_TRUE};
+    const CScript script_c{CScript() << std::vector<unsigned char>(24, 0xd5) << OP_DROP << OP_TRUE};
+
+    // ---- Live legacy history. Heights 1..31: plain reward coinbases.
+    std::vector<CBlock> legacy_blocks;
+    Txid coinbase1{};
+    Txid coinbase2{};
+    for (int height{1}; height <= 31; ++height) {
+        const auto submitted{submit(build_legacy(tip(), {}), legacy_blocks)};
+        if (height == 1) coinbase1 = submitted->vtx[0]->GetHash();
+        if (height == 2) coinbase2 = submitted->vtx[0]->GetHash();
+    }
+    const CAmount r1{legacy::GetProofOfWorkReward(0, 1, consensus)};
+    const CAmount r2{legacy::GetProofOfWorkReward(0, 2, consensus)};
+
+    // Height 32: spend the long-matured coinbase 1, splitting it in two and
+    // leaving an unclaimed fee (the reward cap is an upper bound).
+    CMutableTransaction split;
+    split.version = 1;
+    split.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 17);
+    split.vin.resize(1);
+    split.vin[0].prevout = COutPoint{coinbase1, 0};
+    split.vin[0].scriptSig = CScript{};
+    split.vout.emplace_back(r1 / 4, script_a);
+    split.vout.emplace_back(r1 / 2, script_b);
+    const Txid split_txid{submit(build_legacy(tip(), {split}), legacy_blocks)->vtx[1]->GetHash()};
+
+    // Height 33: chain-spend the second split output into three coins.
+    CMutableTransaction fan;
+    fan.version = 1;
+    fan.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 17);
+    fan.vin.resize(1);
+    fan.vin[0].prevout = COutPoint{split_txid, 1};
+    fan.vin[0].scriptSig = CScript{};
+    fan.vout.emplace_back(r1 / 8, script_a);
+    fan.vout.emplace_back(r1 / 8, script_b);
+    fan.vout.emplace_back(r1 / 8, script_c);
+    const Txid fan_txid{submit(build_legacy(tip(), {fan}), legacy_blocks)->vtx[1]->GetHash()};
+
+    // Height 34: a two-input merge of the matured coinbase 2 and a fanned
+    // coin into one output, again leaving a fee unclaimed.
+    CMutableTransaction merge;
+    merge.version = 1;
+    merge.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 17);
+    merge.vin.resize(2);
+    merge.vin[0].prevout = COutPoint{coinbase2, 0};
+    merge.vin[0].scriptSig = CScript{};
+    merge.vin[1].prevout = COutPoint{fan_txid, 0};
+    merge.vin[1].scriptSig = CScript{};
+    merge.vout.emplace_back(r2, script_c);
+    const Txid merge_txid{submit(build_legacy(tip(), {merge}), legacy_blocks)->vtx[1]->GetHash()};
+
+    // Height 35 plain; height 36 = H carries one final spend.
+    submit(build_legacy(tip(), {}), legacy_blocks);
+    CMutableTransaction last;
+    last.version = 1;
+    last.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 17);
+    last.vin.resize(1);
+    last.vin[0].prevout = COutPoint{fan_txid, 1};
+    last.vin[0].scriptSig = CScript{};
+    last.vout.emplace_back(r1 / 8 - 1000, script_a);
+    const auto block_h{submit(build_legacy(tip(), {last}), legacy_blocks)};
+    const Txid last_txid{block_h->vtx[1]->GetHash()};
+    BOOST_REQUIRE_EQUAL(tip()->nHeight, H);
+
+    // ---- Freeze the boundary at the just-built (H, X).
+    const uint256 X{block_h->GetLegacyB3Hash()};
+    mutable_consensus.hard_fork_height = H + 1;
+    mutable_consensus.legacy_final_hash = X;
+    BOOST_CHECK(WITH_LOCK(cs_main, return chainman.ActiveChainstate().LegacyBoundaryActive()));
+
+    // Exact coin-level state at the frozen boundary.
+    {
+        LOCK(cs_main);
+        CCoinsViewCache& coins{chainman.ActiveChainstate().CoinsTip()};
+        BOOST_CHECK(!coins.HaveCoin(COutPoint{coinbase1, 0}));    // spent at 32
+        BOOST_CHECK(!coins.HaveCoin(COutPoint{coinbase2, 0}));    // spent at 34
+        BOOST_CHECK(!coins.HaveCoin(COutPoint{split_txid, 1}));   // fanned at 33
+        BOOST_CHECK(coins.HaveCoin(COutPoint{split_txid, 0}));
+        BOOST_CHECK(!coins.HaveCoin(COutPoint{fan_txid, 0}));     // merged at 34
+        BOOST_CHECK(!coins.HaveCoin(COutPoint{fan_txid, 1}));     // spent at 36
+        BOOST_CHECK(coins.HaveCoin(COutPoint{fan_txid, 2}));
+        const Coin& merged{coins.AccessCoin(COutPoint{merge_txid, 0})};
+        BOOST_REQUIRE(!merged.IsSpent());
+        BOOST_CHECK_EQUAL(merged.out.nValue, r2);
+        BOOST_CHECK(merged.out.scriptPubKey == script_c);
+        BOOST_CHECK_EQUAL(merged.nHeight, 34U);
+        BOOST_CHECK(!merged.fCoinBase);
+        BOOST_CHECK(coins.HaveCoin(COutPoint{last_txid, 0}));
+    }
+
+    // ---- Full-set replay equivalence at the frozen boundary, plus canonical
+    // row files: the reconstruction and the live state must be byte-identical
+    // rows, and the set must be genuinely non-empty.
+    {
+        const fs::path replay_path{m_args.GetDataDirBase() / "nonempty_replay_utxo"};
+        CCoinsViewDB replay_db{DBParams{.path = replay_path, .cache_bytes = size_t{1} << 20,
+                                        .wipe_data = true},
+                               CoinsViewOptions{}};
+        {
+            CCoinsViewCache replay_cache{&replay_db};
+            legacy::TrustedReplay replay{consensus, H, {{H, X}}};
+            std::string error;
+            DataStream genesis_bytes;
+            genesis_bytes << legacy::TX_LEGACY(chainman.GetParams().GenesisBlock());
+            BOOST_REQUIRE_MESSAGE(replay.ApplyRawBlock(std::span{genesis_bytes}, replay_cache, error), error);
+            for (const CBlock& block : legacy_blocks) {
+                DataStream bytes;
+                bytes << legacy::TX_LEGACY(block);
+                BOOST_REQUIRE_MESSAGE(replay.ApplyRawBlock(std::span{bytes}, replay_cache, error), error);
+            }
+            replay_cache.SetBestBlock(X);
+            replay_cache.Flush();
+        }
+
+        LOCK(cs_main);
+        chainman.ActiveChainstate().ForceFlushStateToDisk();
+        const node::UtxoComparison cmp{
+            node::CompareUtxoViews(chainman.ActiveChainstate().CoinsDB(), replay_db)};
+        BOOST_CHECK(cmp.Equal());
+        BOOST_CHECK_EQUAL(cmp.count_a, cmp.count_b);
+        BOOST_CHECK_GE(cmp.count_a, size_t{35}); // ~34 unspent coinbases + the spend outputs
+
+        std::ostringstream port_rows;
+        std::ostringstream replay_rows;
+        std::string error;
+        BOOST_REQUIRE(node::WriteUtxoRows(
+            port_rows, {X, H, node::EnumerateUtxos(chainman.ActiveChainstate().CoinsDB())}, error));
+        BOOST_REQUIRE(node::WriteUtxoRows(
+            replay_rows, {X, H, node::EnumerateUtxos(replay_db)}, error));
+        BOOST_CHECK(port_rows.str() == replay_rows.str());
+        BOOST_CHECK(port_rows.str().find("b3-utxo-rows/v1") == 0);
+    }
+
+    // ---- H+1: with no modern rule set installed, the modern era fails
+    // closed. Build a well-formed marker-modern block on X.
+    const auto build_modern{[&](const int64_t tag) {
+        const CBlockIndex* prev{tip()};
+        CMutableTransaction coinbase;
+        coinbase.version = 2;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << CScriptNum{H + 1} << CScriptNum{tag};
+        coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = prev->nBits;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetHash()) > target) ++block.nNonce;
+        return block;
+    }};
+
+    // The precise refusal, observed at connect via the just-check path.
+    {
+        LOCK(cs_main);
+        const BlockValidationState state{TestBlockValidity(
+            chainman.ActiveChainstate(), build_modern(1), /*check_pow=*/true, /*check_merkle_root=*/true)};
+        BOOST_REQUIRE(state.IsInvalid());
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "no-modern-pos-rules");
+    }
+
+    // The network path: the block is stored (structurally fine), fails at
+    // connect, and the chain stays exactly at X — twice, deterministically.
+    for (int64_t tag : {2, 3}) {
+        const CBlock modern{build_modern(tag)};
+        bool new_block{false};
+        chainman.ProcessNewBlock(CodecRoundTrip(modern), true, true, &new_block);
+        LOCK(cs_main);
+        const CBlockIndex* pindex{chainman.m_blockman.LookupBlockIndex(modern.GetHash())};
+        BOOST_REQUIRE(pindex != nullptr);
+        BOOST_CHECK(pindex->nStatus & BLOCK_FAILED_VALID);
+        BOOST_CHECK(!chainman.ActiveChain().Contains(pindex));
+        BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->GetBlockHash().GetHex(), X.GetHex());
+    }
+
+    // A LEGACY-codec block at H+1 is refused outright at the header: the
+    // frozen boundary hard-switches the codec, so no legacy block can ever
+    // extend X.
+    {
+        const CBlockIndex* prev{tip()};
+        CBlock stale{build_legacy(prev, {})};
+        bool new_block{false};
+        BOOST_CHECK(!chainman.ProcessNewBlock(CodecRoundTrip(stale), true, true, &new_block));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(
+                                  stale.GetLegacyB3Hash())) == nullptr);
+    }
+
+    // The boundary survives it all: still active, tip still X at H.
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(chainman.ActiveChainstate().LegacyBoundaryActive());
+        BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->nHeight, H);
+        BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->GetBlockHash().GetHex(), X.GetHex());
     }
 }
 
