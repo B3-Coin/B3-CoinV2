@@ -12,6 +12,7 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <coins.h>
+#include <txdb.h>
 #include <consensus/block_codec.h>
 #include <consensus/boundary.h>
 #include <consensus/era.h>
@@ -23,6 +24,7 @@
 #include <legacy/consensus.h>
 #include <legacy/primitives.h>
 #include <legacy/replay.h>
+#include <node/utxo_commitment.h>
 #include <kernel/mempool_removal_reason.h>
 #include <modern/pos.h>
 #include <node/mempool_persist.h>
@@ -414,6 +416,54 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
         BOOST_CHECK_EQUAL(a.nHeight, b.nHeight);
         BOOST_CHECK_EQUAL(a.fCoinBase, b.fCoinBase);
         BOOST_CHECK_EQUAL(a.fCoinStake, b.fCoinStake);
+    }
+
+    // ---- Full-set UTXO equivalence: the whole trusted-replay reconstruction
+    // of the legacy prefix (genesis..H) must equal the fully-validated live
+    // chainstate -- every outpoint and the exact Coin contents (value, script,
+    // height, coinbase/coinstake flags, legacy nTime/nTxOffset), not aggregate
+    // supply. Compared by canonical commitment with per-outpoint diagnostics
+    // (node/utxo_commitment.h). Diagnostic only; never consensus. This is the
+    // deterministic mechanism a real-chain U == U' proof would run against the
+    // live chainstate DB and a replay DB.
+    {
+        const fs::path replay_utxo_path{m_args.GetDataDirBase() / "transition_replay_utxo"};
+        CCoinsViewDB replay_db{
+            DBParams{.path = replay_utxo_path, .cache_bytes = size_t{1} << 20, .wipe_data = true},
+            CoinsViewOptions{}};
+        {
+            CCoinsViewCache replay_cache{&replay_db};
+            legacy::TrustedReplay replay{consensus, SYNTHETIC_H, {{SYNTHETIC_H, X}}};
+            std::string error;
+            DataStream genesis_bytes;
+            genesis_bytes << legacy::TX_LEGACY(chainman.GetParams().GenesisBlock());
+            BOOST_REQUIRE_MESSAGE(replay.ApplyRawBlock(std::span{genesis_bytes}, replay_cache, error), error);
+            for (const CBlock& block : legacy_blocks) {
+                DataStream bytes;
+                bytes << legacy::TX_LEGACY(block);
+                BOOST_REQUIRE_MESSAGE(replay.ApplyRawBlock(std::span{bytes}, replay_cache, error), error);
+            }
+            // The reconstruction has reached X at H; record it so the flush has
+            // a best-block marker (the coins, not the marker, are compared).
+            replay_cache.SetBestBlock(X);
+            replay_cache.Flush();
+        }
+
+        LOCK(cs_main);
+        chainman.ActiveChainstate().ForceFlushStateToDisk();
+        const node::UtxoComparison cmp{
+            node::CompareUtxoViews(chainman.ActiveChainstate().CoinsDB(), replay_db)};
+
+        for (const auto& m : cmp.mismatches) {
+            BOOST_TEST_MESSAGE("UTXO mismatch at " + m.outpoint.ToString() +
+                               ": live=" + (m.in_a ? "present" : "absent") +
+                               " replay=" + (m.in_b ? "present" : "absent"));
+        }
+        BOOST_CHECK(cmp.mismatches.empty());
+        BOOST_CHECK(cmp.Equal());
+        BOOST_CHECK_EQUAL(cmp.commitment_a.GetHex(), cmp.commitment_b.GetHex());
+        BOOST_CHECK_EQUAL(cmp.count_a, cmp.count_b);
+        BOOST_CHECK_GT(cmp.count_a, size_t{0}); // the reconstructed set is non-trivial
     }
 
     // ---- (11) A competing branch crossing H is rejected: X pins height H,
