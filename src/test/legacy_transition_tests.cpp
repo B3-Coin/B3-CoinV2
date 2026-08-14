@@ -23,13 +23,16 @@
 #include <legacy/consensus.h>
 #include <legacy/primitives.h>
 #include <legacy/replay.h>
+#include <kernel/mempool_removal_reason.h>
 #include <modern/pos.h>
+#include <node/mempool_persist.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <pubkey.h>
 #include <script/script.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
+#include <txmempool.h>
 #include <uint256.h>
 #include <util/time.h>
 #include <validation.h>
@@ -74,7 +77,10 @@ CBlock MakeSyntheticLegacyGenesis()
 //! Regtest-based fixture whose consensus params become a synthetic
 //! legacy-B3 chain (own legacy genesis) before chainstate activation.
 struct TransitionSetup : public ChainTestingSetup {
-    TransitionSetup() : ChainTestingSetup{ChainType::REGTEST}
+    // The synthetic chain pays to anyone-can-spend scripts, which stock
+    // standardness policy would reject; the mempool boundary tests exercise
+    // the era gate, not standardness, so allow non-standard transactions.
+    TransitionSetup() : ChainTestingSetup{ChainType::REGTEST, {.extra_args = {"-acceptnonstdtxn=1"}}}
     {
         SetMockTime(MOCK_NOW);
         auto& consensus{const_cast<Consensus::Params&>(m_node.chainman->GetConsensus())};
@@ -176,23 +182,11 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
         return block;
     }};
 
-    for (int height{1}; height <= SYNTHETIC_H; ++height) {
+    Txid coinbase3{}; // mature coinbases feeding the mempool boundary tests
+    Txid coinbase4{};
+    for (int height{1}; height <= SYNTHETIC_H - 1; ++height) {
         const CBlockIndex* prev{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
-        std::vector<CMutableTransaction> extra;
-        if (height == SYNTHETIC_H) {
-            // A legacy transaction spending a long-matured legacy coinbase:
-            // its output becomes the pre-H UTXO spent in the modern era.
-            CMutableTransaction spend;
-            spend.version = 1;
-            spend.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
-            spend.vin.resize(1);
-            spend.vin[0].prevout = COutPoint{mature_coinbase, 0};
-            spend.vin[0].scriptSig = CScript{}; // OP_TRUE output: no signature
-            spend.vout.emplace_back(legacy::GetProofOfWorkReward(0, 2, consensus),
-                                    CScript() << OP_TRUE);
-            extra.push_back(spend);
-        }
-        CBlock block{build_legacy(prev, std::move(extra))};
+        CBlock block{build_legacy(prev, {})};
         const auto submitted{CodecRoundTrip(block)};
         bool new_block{false};
         BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(submitted, /*force_processing=*/true,
@@ -201,9 +195,180 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
         BOOST_REQUIRE(new_block);
         legacy_blocks.push_back(*submitted);
         if (height == 2) mature_coinbase = submitted->vtx[0]->GetHash();
-        if (height == SYNTHETIC_H) pre_h_txid = submitted->vtx[1]->GetHash();
+        if (height == 3) coinbase3 = submitted->vtx[0]->GetHash();
+        if (height == 4) coinbase4 = submitted->vtx[0]->GetHash();
+    }
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->nHeight), SYNTHETIC_H - 1);
+
+    // The final legacy block H carries a transaction spending a long-matured
+    // legacy coinbase: its output becomes the pre-H UTXO spent in the modern
+    // era. Built here so X is known before H connects, as in production.
+    // Anyone-can-spend output large enough that its spender clears the
+    // 65-byte minimum standalone transaction size.
+    const CScript padded_script{CScript() << std::vector<unsigned char>(24, 0xb3) << OP_DROP << OP_TRUE};
+    const auto legacy_spend_of{[&](const Txid& coinbase, CAmount fee) {
+        const CBlockIndex* tip{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
+        CMutableTransaction spend;
+        spend.version = 1;
+        spend.m_legacy_encoding = true;
+        spend.nTime = static_cast<uint32_t>(tip->GetBlockTime() + 17);
+        spend.vin.resize(1);
+        spend.vin[0].prevout = COutPoint{coinbase, 0};
+        spend.vin[0].scriptSig = CScript{}; // OP_TRUE output: no signature
+        spend.vout.emplace_back(legacy::GetProofOfWorkReward(0, 2, consensus) - fee,
+                                padded_script);
+        return spend;
+    }};
+    CBlock block_h;
+    {
+        const CBlockIndex* prev{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
+        block_h = build_legacy(prev, {legacy_spend_of(mature_coinbase, /*fee=*/0)});
+    }
+    const auto submitted_h{CodecRoundTrip(block_h)};
+    pre_h_txid = submitted_h->vtx[1]->GetHash();
+    {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(submitted_h, true, true, &new_block));
+        BOOST_REQUIRE(new_block);
+        legacy_blocks.push_back(*submitted_h);
     }
     BOOST_REQUIRE_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->nHeight), SYNTHETIC_H);
+
+    // ---- Mempool at the boundary, part 1: within-era reorg resurrection.
+    // Disconnecting H (legal here: no boundary is finalized yet) returns its
+    // non-coinbase transaction to the mempool with its legacy provenance.
+    CTxMemPool& pool{*Assert(m_node.mempool)};
+    {
+        CBlockIndex* pindex_h{WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(submitted_h->GetLegacyB3Hash()))};
+        BOOST_REQUIRE(pindex_h);
+        BlockValidationState state;
+        BOOST_REQUIRE(chainman.ActiveChainstate().InvalidateBlock(state, pindex_h));
+        BOOST_REQUIRE_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->nHeight), SYNTHETIC_H - 1);
+        if (!pool.exists(pre_h_txid)) {
+            // Diagnose exactly what resurrection's silent AcceptToMemoryPool
+            // call would have said.
+            LOCK(cs_main);
+            const auto probe{AcceptToMemoryPool(chainman.ActiveChainstate(), submitted_h->vtx[1], GetTime(),
+                                                /*bypass_limits=*/true, /*test_accept=*/true)};
+            BOOST_REQUIRE_MESSAGE(false, "resurrection did not enter the pool (size " << pool.size()
+                                             << "); direct bypass resubmit says: " << probe.m_state.ToString());
+        }
+        const CTransactionRef resurrected{pool.get(pre_h_txid)};
+        BOOST_REQUIRE(resurrected);
+        BOOST_CHECK(resurrected->IsLegacyEncoded());
+    }
+
+    // ---- Mempool at the boundary, part 2: pre-H admission (tip = H-1, the
+    // next block is legacy). A modern-encoded transaction is refused; a
+    // legacy-encoded spend of a mature coinbase is admitted.
+    {
+        CMutableTransaction modern_tx;
+        modern_tx.version = 2;
+        modern_tx.vin.resize(1);
+        modern_tx.vin[0].prevout = COutPoint{pre_h_txid, 0};
+        modern_tx.vout.emplace_back(1 * COIN, CScript() << OP_TRUE);
+        const auto res{chainman.ProcessTransaction(MakeTransactionRef(modern_tx))};
+        BOOST_REQUIRE(res.m_result_type != MempoolAcceptResult::ResultType::VALID);
+        BOOST_CHECK_EQUAL(res.m_state.GetRejectReason(), "modern-txn-in-legacy-era");
+
+        CMutableTransaction legacy_tx{legacy_spend_of(coinbase3, /*fee=*/100'000)};
+        const auto ok{chainman.ProcessTransaction(MakeTransactionRef(legacy_tx))};
+        BOOST_REQUIRE_MESSAGE(ok.m_result_type == MempoolAcceptResult::ResultType::VALID,
+                              "legacy mempool admission failed: " << ok.m_state.ToString());
+    }
+    BOOST_CHECK_EQUAL(pool.size(), 2U); // the resurrected spend + the coinbase3 spend
+
+    // ---- Mempool at the boundary, part 3: persistence round trip pre-H.
+    // Provenance survives dump+load: the reloaded entry is the same legacy
+    // transaction with the same txid.
+    const fs::path mempool_dat{m_args.GetDataDirBase() / "boundary_mempool.dat"};
+    const Txid coinbase3_spend_txid{[&] {
+        LOCK(pool.cs);
+        for (const auto& entry_info : pool.infoAll()) {
+            if (entry_info.tx->GetHash() != pre_h_txid) return entry_info.tx->GetHash();
+        }
+        return Txid{};
+    }()};
+    BOOST_REQUIRE(coinbase3_spend_txid != Txid{});
+    BOOST_REQUIRE(node::DumpMempool(pool, mempool_dat));
+    {
+        const CTransactionRef tx3{pool.get(coinbase3_spend_txid)};
+        BOOST_REQUIRE(tx3);
+        WITH_LOCK(pool.cs, pool.removeRecursive(*tx3, MemPoolRemovalReason::REORG));
+        BOOST_CHECK(!pool.exists(coinbase3_spend_txid));
+        BOOST_REQUIRE(node::LoadMempool(pool, mempool_dat, chainman.ActiveChainstate(), {}));
+        BOOST_REQUIRE(pool.exists(coinbase3_spend_txid));
+        const CTransactionRef reloaded{pool.get(coinbase3_spend_txid)};
+        BOOST_REQUIRE(reloaded);
+        BOOST_CHECK(reloaded->IsLegacyEncoded());
+    }
+
+    // ---- Mempool at the boundary, part 4: finalize H/X BEFORE H connects --
+    // the production sequence -- then reconnect H. Connecting the final legacy
+    // block atomically empties the pool: the included spend leaves via the
+    // block, and the still-unmined coinbase3 spend leaves via the era flush.
+    mutable_consensus.hard_fork_height = SYNTHETIC_H + 1;
+    mutable_consensus.legacy_final_hash = submitted_h->GetLegacyB3Hash();
+    {
+        CBlockIndex* pindex_h{WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(submitted_h->GetLegacyB3Hash()))};
+        BOOST_REQUIRE(pindex_h);
+        {
+            // Mirror the reconsiderblock RPC: clearing failure flags must be
+            // paired with a best-header recalculation.
+            LOCK(cs_main);
+            chainman.ActiveChainstate().ResetBlockFailureFlags(pindex_h);
+            chainman.RecalculateBestHeader();
+        }
+        BlockValidationState state;
+        BOOST_REQUIRE(chainman.ActiveChainstate().ActivateBestChain(state));
+        BOOST_REQUIRE_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->nHeight), SYNTHETIC_H);
+    }
+    BOOST_CHECK_EQUAL(pool.size(), 0U);
+
+    // ---- Mempool at the boundary, part 5: post-H admission (tip = H, the
+    // next block is modern). A legacy-encoded transaction is refused; a
+    // modern-encoded spend of the pre-H UTXO is admitted; and the pre-H
+    // mempool.dat does not repopulate the pool.
+    Txid modern_mempool_txid{};
+    {
+        CMutableTransaction stale_legacy{legacy_spend_of(coinbase4, /*fee=*/100'000)};
+        const auto res{chainman.ProcessTransaction(MakeTransactionRef(stale_legacy))};
+        BOOST_REQUIRE(res.m_result_type != MempoolAcceptResult::ResultType::VALID);
+        BOOST_CHECK_EQUAL(res.m_state.GetRejectReason(), "legacy-txn-in-modern-era");
+
+        CMutableTransaction modern_tx;
+        modern_tx.version = 2;
+        modern_tx.vin.resize(1);
+        modern_tx.vin[0].prevout = COutPoint{pre_h_txid, 0};
+        modern_tx.vout.emplace_back(legacy::GetProofOfWorkReward(0, 2, consensus) - 100'000,
+                                    padded_script);
+        const auto ok{chainman.ProcessTransaction(MakeTransactionRef(modern_tx))};
+        BOOST_REQUIRE_MESSAGE(ok.m_result_type == MempoolAcceptResult::ResultType::VALID,
+                              "modern mempool admission failed: " << ok.m_state.ToString());
+        modern_mempool_txid = CTransaction{modern_tx}.GetHash();
+        BOOST_CHECK(pool.get(modern_mempool_txid) && !pool.get(modern_mempool_txid)->IsLegacyEncoded());
+
+        // The pre-H dump holds only legacy transactions; the era gate refuses
+        // every one of them, so a pre-H mempool.dat can never repopulate a
+        // post-H node.
+        BOOST_REQUIRE(node::LoadMempool(pool, mempool_dat, chainman.ActiveChainstate(), {}));
+        BOOST_CHECK(!pool.exists(coinbase3_spend_txid));
+        BOOST_CHECK_EQUAL(pool.size(), 1U);
+    }
+
+    // ---- Mempool at the boundary, part 6: with X now ACTIVE on the chain,
+    // the cross-boundary prohibition is binding end to end: invalidating H is
+    // refused cleanly (no crash, no shutdown), the tip stays put, and the
+    // modern mempool entry survives untouched.
+    {
+        CBlockIndex* pindex_h{WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(submitted_h->GetLegacyB3Hash()))};
+        BOOST_REQUIRE(pindex_h);
+        BOOST_REQUIRE(WITH_LOCK(cs_main, return chainman.ActiveChainstate().LegacyBoundaryActive()));
+        BlockValidationState state;
+        BOOST_CHECK(!chainman.ActiveChainstate().InvalidateBlock(state, pindex_h));
+        BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->nHeight), SYNTHETIC_H);
+        BOOST_CHECK(pool.exists(modern_mempool_txid));
+    }
 
     // ---- (5) Finalize the boundary: exact H and X.
     const uint256 X{legacy_blocks.back().GetLegacyB3Hash()};
