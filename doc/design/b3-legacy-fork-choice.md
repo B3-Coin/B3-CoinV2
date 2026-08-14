@@ -122,16 +122,15 @@ with absurd `nBits` and a bogus kernel, forking below H, is stored with
 chainwork exceeding the tip yet is marked `BLOCK_ANCHOR_INELIGIBLE`, kept out
 of the candidate set, never connected, and leaves the tip unmoved.
 
-## Follow-on hardening
+## Checkpoints and the depth bound (ported)
 
-Two historical mechanisms are noted but **not yet ported**, tracked in the
-status document:
+Both historical mechanisms are now ported faithfully (values and placement,
+never reinvented):
 
-- the rolling `CheckSync` depth bound (`nCheckpointSpan = 500`); and
-- the hardened checkpoint list.
-
-Both are legacy-era consensus rules and must be ported faithfully (values and
-placement) rather than reinvented.
+- the hardened checkpoint list (13 mainnet heights, `legacy::MainnetCheckpoints`);
+- the rolling `CheckSync` depth bound (`nCheckpointSpan = 500`,
+  `legacy::ReorgDepthExceeded`), enforced in the live-legacy branch of
+  `ContextualCheckBlockHeader` and skipped while importing our own blocks.
 
 **Scope for `CheckSync`.** The 500-block rolling depth bound belongs to **live
 legacy consensus** — the regime where the node still extends and selects the
@@ -146,3 +145,57 @@ exclusion is the job of the anchor-ineligibility check, not of `CheckSync`.
 H/X chain eligibility — once X is pinned, no alternate legacy branch may compete
 regardless of claimed trust — is thus a separate concern from `CheckSync`,
 handled by the anchor-ineligibility check, not by trust.
+
+## Historical reward-rule exceptions: provenance
+
+The port originally carried a single unsourced predicate
+(`IsHistoricalStakeRewardCapException`) exempting heights 77447-77505 and
+107488 from the coinstake reward cap. A provenance investigation against the
+final client (`master`, commit `4aa1b16`) resolved it into **three distinct
+sourced rules**, now ported faithfully. Chain data was not available offline;
+every fact below is grounded in the final client's source, which is the
+operative consensus for any node syncing that history (whatever the affected
+blocks contain, the final client accepts it through these exact rules, so
+per-block observed rewards are not needed for a faithful port).
+
+1. **The repair window, heights 77447-77505 inclusive** (`master:src/main.cpp`,
+   `if (!(pindex->nHeight > 77446 && pindex->nHeight < 77506))`, introduced by
+   commit `e0f3256` "fix small sync bug and change the fork"). The final client
+   skips its whole coinstake reward-cap check inside the window. Ported
+   verbatim as `legacy::IsRepairWindowHeight`. The dense hardened checkpoints
+   at 77900-78961 and rule 3 below are the rest of the same incident response.
+
+2. **The superblock at height 107488** (`chainparams.cpp` `nSuperBlockHeight =
+   107488`, `vSuperBlockPubKey = 0432160b...0522`; `main.h` `SUPERBLOCKPAYMENT
+   = 75656908 * KILO_COIN` with `KILO_COIN = 1e9`; enforcement in
+   `ConnectBlock`; introduced by commit `dafa714` "Added superblock on
+   mainnet"). This was **not** a cap bypass: at exactly that height the general
+   cap is replaced by a structured rule — the last coinstake output must pay at
+   most 75,656,908,000,000,000 units to the P2PKH script of the pinned key
+   (hash160 `1c49f78e1a406c64996da1bc5fda3b371bd33706`), else the block is
+   rejected. The port's former blanket `height == 107488` bypass dropped that
+   validation entirely; it is now enforced via
+   `Consensus::Params::legacy_superblock_height/pubkey` and
+   `legacy::LEGACY_SUPERBLOCK_PAYMENT` / `legacy::SuperblockPayeeScript`.
+
+3. **The restricted staker, heights above 78000** (`ConnectBlock`,
+   `if(pindex->nHeight > 78000)`; lineage includes commit `d10f4fd` "Change
+   address to destroy address"). A proof-of-stake block whose second coinstake
+   output pays the destination of address
+   `ShJsVNBQMa2M7cfCVPzRMt8nVZxHitBp7v` (version byte 63, hash160
+   `db8ca2a4493aaed6b7d2f30acb4467b823e0b0a5`) while earning a positive reward
+   is rejected. This unconditional consensus rule was **missing** from the
+   port and is now implemented (`legacy::StakeDestinationIsRestricted`),
+   reproducing the 0.8-era `ExtractDestination` fold of pay-to-pubkey into the
+   key's hash, which modern `ExtractDestination` no longer performs.
+
+One further check in the same code region is deliberately **not** ported: the
+Fundamental Node payment check (`foundfnpayment`) is gated on
+`!IsInitialBlockDownload()` in the final client, so it never applied to a node
+validating the historical chain from genesis — it is not a sync-consensus rule
+— and porting it would also reintroduce FN consensus against the standing
+scope decision.
+
+Trusted replay is unaffected by all of the above: replay attests rewards via
+the pinned X and never adjudicates them (`legacy/replay.cpp`), so these rules
+exist only for faithful pre-X live legacy validation.
