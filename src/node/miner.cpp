@@ -143,6 +143,25 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     if (chainparams.MineBlocksOnDemand()) {
         pblock->nVersion = gArgs.GetIntArg("-blockversion", pblock->nVersion);
     }
+    // B3: block production is era- and phase-aware. Legacy-era production is
+    // the historical staker's job and is not supported here; MODERN-era
+    // blocks must carry the codec marker so their body serializes with the
+    // modern codec and their identity stays in the modern hash domain.
+    const Consensus::Params& b3_consensus{chainparams.GetConsensus()};
+    const bool b3_modern{b3_consensus.legacy_b3coin &&
+                         Consensus::GetB3Era(nHeight, b3_consensus) == Consensus::B3Era::MODERN};
+    const bool b3_corridor{b3_consensus.legacy_b3coin &&
+                           Consensus::GetConsensusPhase(nHeight, b3_consensus) ==
+                               Consensus::ConsensusPhase::TRANSITION_POW};
+    if (b3_consensus.legacy_b3coin && !b3_modern) {
+        throw std::runtime_error("legacy-era B3 block production is not supported");
+    }
+    if (b3_modern) {
+        pblock->nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+    }
+    if (b3_corridor && !b3_consensus.transition_pow_bits) {
+        throw std::runtime_error("temporary-PoW corridor difficulty is not configured");
+    }
 
     pblock->nTime = TicksSinceEpoch<std::chrono::seconds>(NodeClock::now());
     m_lock_time_cutoff = pindexPrev->GetMedianTimePast();
@@ -174,8 +193,11 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // Add an output that spends the full coinbase reward.
     coinbaseTx.vout.resize(1);
     coinbaseTx.vout[0].scriptPubKey = m_options.coinbase_output_script;
-    // Block subsidy + fees
-    const CAmount block_reward{nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
+    // Block subsidy + fees. Corridor blocks claim fees plus the configured
+    // corridor reward (0, fees only, until the corridor reward model is
+    // decided) instead of the stock subsidy schedule.
+    const CAmount block_reward{b3_corridor ? nFees + b3_consensus.transition_pow_reward
+                                           : nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
     coinbaseTx.vout[0].nValue = block_reward;
     coinbase_tx.block_reward_remaining = block_reward;
 
@@ -217,7 +239,8 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // Fill in header
     pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
     UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
-    pblock->nBits          = GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
+    pblock->nBits          = b3_corridor ? *b3_consensus.transition_pow_bits
+                                         : GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
     pblock->nNonce         = 0;
 
     if (m_options.test_block_validity) {

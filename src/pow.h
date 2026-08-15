@@ -31,6 +31,14 @@ unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nF
 
 /** Check whether a block hash satisfies the proof-of-work requirement specified by nBits */
 bool CheckProofOfWork(uint256 hash, unsigned int nBits, const Consensus::Params&);
+
+/**
+ * Temporary-PoW corridor eligibility: the historical B3 scrypt hash of the
+ * 80-byte header must not exceed the target encoded by the header's nBits.
+ * Used only for TRANSITION_POW-phase blocks; block identity is never this
+ * hash. Rejects negative/overflowing/zero targets.
+ */
+bool CheckTransitionPowEligibility(const CBlockHeader& header);
 bool CheckProofOfWorkImpl(uint256 hash, unsigned int nBits, const Consensus::Params&);
 
 /**

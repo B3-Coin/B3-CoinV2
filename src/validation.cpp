@@ -4920,7 +4920,7 @@ static bool ContextualCheckLegacyBlock(const CBlock& block, BlockValidationState
  *  v0.12 and v0.15 (when no additional protection was in place) whereby an attacker could unboundedly
  *  grow our in-memory block index. See https://bitcoincore.org/en/2024/07/03/disclose-header-spam.
  */
-static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, BlockManager& blockman, const ChainstateManager& chainman, const CBlockIndex* pindexPrev) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, BlockManager& blockman, const ChainstateManager& chainman, const CBlockIndex* pindexPrev, const bool check_pow = true) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
 {
     AssertLockHeld(::cs_main);
     assert(pindexPrev != nullptr);
@@ -5022,15 +5022,7 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits",
                                  "incorrect temporary-PoW corridor difficulty");
         }
-        bool neg{false};
-        bool overflow{false};
-        arith_uint256 target;
-        target.SetCompact(block.nBits, &neg, &overflow);
-        if (neg || overflow || target == 0) {
-            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits",
-                                 "invalid temporary-PoW corridor target");
-        }
-        if (UintToArith256(block.GetLegacyB3Hash()) > target) {
+        if (check_pow && !CheckTransitionPowEligibility(block)) {
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash",
                                  "temporary-PoW scrypt eligibility hash exceeds target");
         }
@@ -5040,7 +5032,7 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         // The deferred context-free check for post-corridor marker-modern
         // headers (CheckBlockHeader skips it whenever a corridor is
         // configured, since it has no height there).
-        if (consensusParams.legacy_b3coin && consensusParams.transition_pow_length > 0 &&
+        if (check_pow && consensusParams.legacy_b3coin && consensusParams.transition_pow_length > 0 &&
             !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams)) {
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
         }
@@ -5495,7 +5487,7 @@ BlockValidationState TestBlockValidity(
      * - do run ContextualCheckBlock()
      */
 
-    if (!ContextualCheckBlockHeader(block, state, chainstate.m_blockman, chainstate.m_chainman, tip)) {
+    if (!ContextualCheckBlockHeader(block, state, chainstate.m_blockman, chainstate.m_chainman, tip, check_pow)) {
         if (state.IsValid()) NONFATAL_UNREACHABLE();
         return state;
     }

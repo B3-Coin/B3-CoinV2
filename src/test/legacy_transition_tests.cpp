@@ -30,6 +30,7 @@
 #include <kernel/mempool_removal_reason.h>
 #include <modern/pos.h>
 #include <node/mempool_persist.h>
+#include <node/miner.h>
 #include <pow.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
@@ -1845,6 +1846,98 @@ BOOST_AUTO_TEST_CASE(transition_pow_corridor_validation)
         }
         BOOST_CHECK_EQUAL(tip()->nHeight, H + CORRIDOR);
     }
+}
+
+//! Corridor block production (stage 3): the assembler produces marker-modern
+//! corridor templates with the configured corridor difficulty and a
+//! fees-plus-corridor-reward coinbase; ground with the scrypt eligibility
+//! helper they connect through the full network path. Production fails
+//! cleanly when the corridor difficulty is unset, for legacy-era heights,
+//! and at the first modern-PoS height (fail-closed gate).
+BOOST_AUTO_TEST_CASE(transition_pow_corridor_production)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int H{3};
+    constexpr int CORRIDOR{3};
+    constexpr uint32_t EASY_BITS{0x207fffff};
+
+    const auto tip{[&] { return WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()); }};
+    const auto build_legacy{[&](const CBlockIndex* prev) {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (prev->nHeight + 1) << CScriptNum{99};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, prev->nHeight + 1, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        return block;
+    }};
+
+    node::BlockAssembler::Options options;
+    options.coinbase_output_script = CScript() << OP_TRUE;
+    options.include_dummy_extranonce = true; // two-byte coinbase scriptSig at tiny heights
+
+    // Legacy-era production is refused up front.
+    BOOST_CHECK_THROW(
+        node::BlockAssembler(chainman.ActiveChainstate(), nullptr, options).CreateNewBlock(),
+        std::runtime_error);
+
+    for (int height{1}; height <= H; ++height) {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(CodecRoundTrip(build_legacy(tip())), true, true, &new_block));
+        BOOST_REQUIRE(new_block);
+    }
+    mutable_consensus.hard_fork_height = H + 1;
+    mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
+    mutable_consensus.transition_pow_length = CORRIDOR;
+
+    // Unset corridor difficulty refuses production (fail closed).
+    BOOST_CHECK_THROW(
+        node::BlockAssembler(chainman.ActiveChainstate(), nullptr, options).CreateNewBlock(),
+        std::runtime_error);
+    mutable_consensus.transition_pow_bits = EASY_BITS;
+
+    // Produce, grind and submit the whole corridor through the assembler.
+    for (int i{0}; i < CORRIDOR; ++i) {
+        SetMockTime(GetTime<std::chrono::seconds>() + std::chrono::seconds{20});
+        const auto tmpl{node::BlockAssembler(chainman.ActiveChainstate(), nullptr, options).CreateNewBlock()};
+        BOOST_REQUIRE(tmpl);
+        CBlock block{tmpl->block};
+        BOOST_CHECK(Consensus::HasB3BlockCodecV2(block.nVersion));
+        BOOST_CHECK_EQUAL(block.nBits, EASY_BITS);
+        BOOST_CHECK_EQUAL(block.vtx[0]->GetValueOut(), 0); // fees only, reward param 0
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.nNonce = 0;
+        while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(
+            chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+            "assembled corridor block at height " << tip()->nHeight + 1 << " rejected");
+        BOOST_REQUIRE(new_block);
+    }
+    BOOST_CHECK_EQUAL(tip()->nHeight, H + CORRIDOR);
+
+    // The first modern-PoS height cannot be produced: the template's own
+    // validity check hits the fail-closed modern gate.
+    BOOST_CHECK_THROW(
+        node::BlockAssembler(chainman.ActiveChainstate(), nullptr, options).CreateNewBlock(),
+        std::runtime_error);
+    BOOST_CHECK_EQUAL(tip()->nHeight, H + CORRIDOR);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
