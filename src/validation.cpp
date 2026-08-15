@@ -2946,12 +2946,25 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             }
         }
     } else if (params.GetConsensus().legacy_b3coin) {
-        // MODERN-era B3 block: dispatch by connected era to the modern PoS
-        // interface only — never the legacy kernel, modifiers, rewards or
-        // difficulty, and no stock Bitcoin subsidy rule either. Until an
-        // approved modern rule set is installed this rejects every block
-        // (modern/pos.h documents the missing rule set precisely).
-        if (state.IsValid()) {
+        // MODERN-era B3 block: dispatch by production phase. A temporary-PoW
+        // corridor block earned its place through the scrypt eligibility
+        // check at header accept; here only its coinbase claim is bounded
+        // (fees plus the configured corridor reward — 0, fees-only, until
+        // the corridor reward model is decided). A modern-PoS block goes to
+        // the modern PoS interface only — never the legacy kernel,
+        // modifiers, rewards or difficulty, and no stock Bitcoin subsidy
+        // rule either. Until an approved modern rule set is installed that
+        // path rejects every block (modern/pos.h documents the missing rule
+        // set precisely).
+        if (Consensus::GetConsensusPhase(pindex->nHeight, params.GetConsensus()) ==
+            Consensus::ConsensusPhase::TRANSITION_POW) {
+            const CAmount corridor_reward{nFees + params.GetConsensus().transition_pow_reward};
+            if (block.vtx[0]->GetValueOut() > corridor_reward && state.IsValid()) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
+                              strprintf("corridor coinbase pays too much (actual=%d vs limit=%d)",
+                                        block.vtx[0]->GetValueOut(), corridor_reward));
+            }
+        } else if (state.IsValid()) {
             (void)modern::CheckModernStake(block, *pindex->pprev, view, state,
                                            params.GetConsensus().test_only_modern_pos_validator);
         }
@@ -4424,10 +4437,19 @@ static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& st
     // blocks, and validates PoS kernels after the UTXO view is available.
     // Only legacy-codec headers take that deferral: a marker-modern header
     // never enters legacy validation and receives the stock check until the
-    // modern B3 PoS activation task replaces it.
+    // modern B3 PoS activation task replaces it. When a temporary-PoW
+    // corridor is configured, marker-modern headers defer too: without a
+    // height this function cannot tell a corridor header (scrypt eligibility
+    // hash) from a post-corridor one, so both are checked contextually in
+    // ContextualCheckBlockHeader, where the height is known.
     const bool legacy_header{consensusParams.legacy_b3coin &&
                              !Consensus::HasB3BlockCodecV2(block.nVersion)};
-    if (fCheckPOW && !legacy_header && !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
+    const bool corridor_deferred{consensusParams.legacy_b3coin &&
+                                 Consensus::HasB3BlockCodecV2(block.nVersion) &&
+                                 consensusParams.hard_fork_height.has_value() &&
+                                 consensusParams.transition_pow_length > 0};
+    if (fCheckPOW && !legacy_header && !corridor_deferred &&
+        !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
 
     return true;
@@ -4984,8 +5006,45 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         }
         return true;
     }
-    if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
-        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits", "incorrect proof of work");
+    if (Consensus::GetConsensusPhase(nHeight, consensusParams) ==
+        Consensus::ConsensusPhase::TRANSITION_POW) {
+        // Temporary-PoW corridor block. Identity stays in the modern hash
+        // domain; the historical B3 scrypt primitive is used ONLY as the
+        // proof-of-work eligibility hash against nBits. The corridor
+        // difficulty is the constant configured target; while the corridor
+        // difficulty policy is unresolved (mainnet), no target is configured
+        // and corridor blocks fail closed here.
+        if (!consensusParams.transition_pow_bits) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "no-transition-pow-rules",
+                                 "temporary-PoW corridor difficulty policy is not configured");
+        }
+        if (block.nBits != *consensusParams.transition_pow_bits) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits",
+                                 "incorrect temporary-PoW corridor difficulty");
+        }
+        bool neg{false};
+        bool overflow{false};
+        arith_uint256 target;
+        target.SetCompact(block.nBits, &neg, &overflow);
+        if (neg || overflow || target == 0) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits",
+                                 "invalid temporary-PoW corridor target");
+        }
+        if (UintToArith256(block.GetLegacyB3Hash()) > target) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash",
+                                 "temporary-PoW scrypt eligibility hash exceeds target");
+        }
+    } else {
+        if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits", "incorrect proof of work");
+        // The deferred context-free check for post-corridor marker-modern
+        // headers (CheckBlockHeader skips it whenever a corridor is
+        // configured, since it has no height there).
+        if (consensusParams.legacy_b3coin && consensusParams.transition_pow_length > 0 &&
+            !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams)) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
+        }
+    }
 
     // Check timestamp against prev
     if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())

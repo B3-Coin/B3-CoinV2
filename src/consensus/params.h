@@ -125,6 +125,22 @@ struct Params {
      */
     int transition_pow_length{0};
     /**
+     * The compact-bits target every temporary-PoW corridor block must carry
+     * (constant corridor difficulty). The block's scrypt eligibility hash
+     * must not exceed this target. Unset means the corridor difficulty
+     * policy is unresolved and corridor blocks FAIL CLOSED: regtest fixtures
+     * set a trivially easy value as test scaffolding; the mainnet corridor
+     * difficulty policy is an OPEN design decision and must not be chosen
+     * here silently.
+     */
+    std::optional<uint32_t> transition_pow_bits;
+    /**
+     * The subsidy a temporary-PoW corridor coinbase may claim on top of
+     * fees. The mainnet corridor reward model is an OPEN design decision;
+     * 0 (fees only) is the neutral default used by regtest scaffolding.
+     */
+    int64_t transition_pow_reward{0};
+    /**
      * Historical hardened checkpoints of the live legacy chain (height -> exact
      * block hash), ported verbatim from the historical client. A legacy block
      * accepted at a pinned height must hash to the pinned value. Empty on chains

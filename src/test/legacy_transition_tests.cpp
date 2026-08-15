@@ -30,6 +30,7 @@
 #include <kernel/mempool_removal_reason.h>
 #include <modern/pos.h>
 #include <node/mempool_persist.h>
+#include <pow.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <pubkey.h>
@@ -1700,6 +1701,149 @@ BOOST_AUTO_TEST_CASE(non_empty_transition_fails_closed_at_h_plus_one)
         BOOST_CHECK(chainman.ActiveChainstate().LegacyBoundaryActive());
         BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->nHeight, H);
         BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->GetBlockHash().GetHex(), X.GetHex());
+    }
+}
+
+//! Temporary-PoW corridor validation (stage 2 of the corridor build-out):
+//! with a pinned boundary and a configured corridor, marker-modern blocks in
+//! H+1..H+length validate by the historical scrypt eligibility hash against
+//! the constant corridor target — block identity stays in the modern hash
+//! domain — and connect WITHOUT modern PoS; the fail-closed modern gate
+//! moves to the first post-corridor height. An unset corridor target fails
+//! closed; wrong nBits and an insufficient scrypt hash are refused.
+BOOST_AUTO_TEST_CASE(transition_pow_corridor_validation)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int H{3};
+    constexpr int CORRIDOR{5};
+    constexpr uint32_t EASY_BITS{0x207fffff};
+
+    const auto tip{[&] { return WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()); }};
+
+    // A short live-legacy chain to H.
+    const auto build_legacy{[&](const CBlockIndex* prev) {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (prev->nHeight + 1) << CScriptNum{99};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, prev->nHeight + 1, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        return block;
+    }};
+    for (int height{1}; height <= H; ++height) {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(CodecRoundTrip(build_legacy(tip())), true, true, &new_block));
+        BOOST_REQUIRE(new_block);
+    }
+    const uint256 X{tip()->GetBlockHash()};
+
+    // Pin the boundary and configure the corridor (regtest scaffolding bits).
+    mutable_consensus.hard_fork_height = H + 1;
+    mutable_consensus.legacy_final_hash = X;
+    mutable_consensus.transition_pow_length = CORRIDOR;
+    mutable_consensus.transition_pow_bits = EASY_BITS;
+    BOOST_REQUIRE(consensus.test_only_modern_pos_validator == nullptr);
+
+    // Corridor block builder: modern codec identity, scrypt-ground nBits.
+    const auto build_corridor{[&](const CBlockIndex* prev, const uint32_t bits, const bool grind_scrypt) {
+        CMutableTransaction coinbase;
+        coinbase.version = 2;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << CScriptNum{prev->nHeight + 1} << CScriptNum{7};
+        coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = bits;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        if (grind_scrypt) {
+            while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        } else {
+            // Find a nonce whose scrypt eligibility hash FAILS the target.
+            while (UintToArith256(block.GetLegacyB3Hash()) <= target) ++block.nNonce;
+        }
+        return block;
+    }};
+
+    // Wrong corridor difficulty is refused at the header.
+    {
+        CBlock bad{build_corridor(tip(), /*bits=*/0x207ffffe, /*grind_scrypt=*/true)};
+        bool new_block{false};
+        BOOST_CHECK(!chainman.ProcessNewBlock(CodecRoundTrip(bad), true, true, &new_block));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(bad.GetHash())) == nullptr);
+    }
+    // A failing scrypt eligibility hash is refused, regardless of the
+    // modern-domain identity hash.
+    {
+        CBlock bad{build_corridor(tip(), EASY_BITS, /*grind_scrypt=*/false)};
+        bool new_block{false};
+        BOOST_CHECK(!chainman.ProcessNewBlock(CodecRoundTrip(bad), true, true, &new_block));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(bad.GetHash())) == nullptr);
+    }
+    // An unset corridor target fails closed.
+    {
+        mutable_consensus.transition_pow_bits.reset();
+        CBlock blocked{build_corridor(tip(), EASY_BITS, /*grind_scrypt=*/true)};
+        bool new_block{false};
+        BOOST_CHECK(!chainman.ProcessNewBlock(CodecRoundTrip(blocked), true, true, &new_block));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(blocked.GetHash())) == nullptr);
+        mutable_consensus.transition_pow_bits = EASY_BITS;
+    }
+
+    // The whole corridor connects under temporary PoW — no modern PoS
+    // involvement, no test validator installed.
+    for (int i{0}; i < CORRIDOR; ++i) {
+        CBlock block{build_corridor(tip(), EASY_BITS, /*grind_scrypt=*/true)};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(CodecRoundTrip(block), true, true, &new_block),
+                              "corridor block at height " << tip()->nHeight + 1 << " rejected");
+        BOOST_REQUIRE(new_block);
+    }
+    BOOST_CHECK_EQUAL(tip()->nHeight, H + CORRIDOR);
+
+    // The first post-corridor height is modern PoS: fail-closed, exactly the
+    // reason the modern gate gives, and the tip stays at the corridor end.
+    {
+        CBlock modern{build_corridor(tip(), EASY_BITS, /*grind_scrypt=*/true)};
+        // Post-corridor nBits follow the stock modern rule (placeholder until
+        // the modern PoS spec defines them); regtest's min-difficulty
+        // walk-back lands on the last non-limit legacy bits. Grind the
+        // modern-domain identity hash so only the PoS gate can refuse it.
+        modern.nBits = GetNextWorkRequired(tip(), &modern, consensus);
+        {
+            const arith_uint256 sha_target{arith_uint256().SetCompact(modern.nBits)};
+            modern.nNonce = 0;
+            while (UintToArith256(modern.GetHash()) > sha_target) ++modern.nNonce;
+        }
+        {
+            LOCK(cs_main);
+            const BlockValidationState state{TestBlockValidity(
+                chainman.ActiveChainstate(), modern, /*check_pow=*/false, /*check_merkle_root=*/true)};
+            BOOST_REQUIRE(state.IsInvalid());
+            BOOST_CHECK_EQUAL(state.GetRejectReason(), "no-modern-pos-rules");
+        }
+        BOOST_CHECK_EQUAL(tip()->nHeight, H + CORRIDOR);
     }
 }
 
