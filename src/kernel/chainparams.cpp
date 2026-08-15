@@ -134,6 +134,11 @@ public:
         m_chain_type = ChainType::MAIN;
         consensus.legacy_b3coin = true;
         consensus.legacy_last_pow_block = 500;
+        // The locked transition design: 1,000 temporary-PoW corridor blocks
+        // between the final legacy block H and the first modern-PoS block.
+        // Inert until a mainnet H/X boundary is finalized (hard_fork_height
+        // and legacy_final_hash stay unset here).
+        consensus.transition_pow_length = 1000;
         // Historical live-legacy checkpoint rules, ported verbatim.
         consensus.legacy_checkpoints = legacy::MainnetCheckpoints();
         consensus.legacy_checkpoint_span = legacy::LEGACY_CHECKPOINT_SPAN;

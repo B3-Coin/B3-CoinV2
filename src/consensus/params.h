@@ -113,6 +113,18 @@ struct Params {
      */
     std::optional<uint256> legacy_final_hash;
     /**
+     * TRANSITION_LENGTH: the number of temporary-PoW corridor blocks between
+     * the final legacy block H and the first modern-PoS block. Heights
+     * H+1 .. H+transition_pow_length are the corridor: modern-format blocks
+     * whose production consensus is the historical B3 scrypt PoW (used only
+     * as the eligibility hash against nBits; block identity stays in the
+     * modern hash domain). Height H+transition_pow_length+1 is the first
+     * modern-PoS block. 0 disables the corridor (modern PoS directly after
+     * H). The locked mainnet design length is 1000; it is inert until a
+     * mainnet H/X boundary is finalized.
+     */
+    int transition_pow_length{0};
+    /**
      * Historical hardened checkpoints of the live legacy chain (height -> exact
      * block hash), ported verbatim from the historical client. A legacy block
      * accepted at a pinned height must hash to the pinned value. Empty on chains

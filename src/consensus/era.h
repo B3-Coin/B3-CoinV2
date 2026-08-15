@@ -54,6 +54,28 @@ constexpr B3Era GetB3Era(int height, const Params& params)
 }
 
 /**
+ * The three block-production consensus phases of the continuous B3 chain.
+ *
+ * Distinct from B3Era, which selects the block/transaction FORMAT (codec and
+ * hash domain). The MODERN era spans two production phases: the bounded
+ * temporary-PoW transition corridor immediately after H, and modern PoS from
+ * the first post-corridor height onward.
+ *
+ *     height <= H                 LEGACY_POS      legacy codec, legacy PoS
+ *     H+1 .. H+corridor_length    TRANSITION_POW  modern codec, B3 scrypt PoW
+ *     height > H+corridor_length  MODERN_POS      modern codec, modern PoS
+ *
+ * Chains that never had a legacy B3Coin history are MODERN_POS at every
+ * height and never have a corridor. While no boundary is configured on a
+ * legacy-B3 chain, every height is LEGACY_POS (live legacy operation).
+ */
+enum class ConsensusPhase {
+    LEGACY_POS,
+    TRANSITION_POW,
+    MODERN_POS,
+};
+
+/**
  * LEGACY_FINAL_HEIGHT (H): the last legacy height, when a boundary is
  * configured on a legacy-B3 chain.
  */
@@ -81,6 +103,33 @@ constexpr std::optional<int> LegacyFinalHeight(const Params& params)
 constexpr bool LegacyBoundaryPinned(const Params& params)
 {
     return LegacyFinalHeight(params).has_value() && params.legacy_final_hash.has_value();
+}
+
+/**
+ * The final temporary-PoW corridor height (H + transition_pow_length), when
+ * a boundary is configured and the chain has a corridor.
+ */
+constexpr std::optional<int> TransitionPowFinalHeight(const Params& params)
+{
+    const std::optional<int> final_height{LegacyFinalHeight(params)};
+    if (!final_height || params.transition_pow_length <= 0) return std::nullopt;
+    return *final_height + params.transition_pow_length;
+}
+
+/**
+ * Return the block-production consensus phase governing the block at
+ * `height`. Single source of truth for phase selection; like GetB3Era it
+ * must only be consulted where the height is already unambiguous, and never
+ * to choose a wire decoder.
+ */
+constexpr ConsensusPhase GetConsensusPhase(const int height, const Params& params)
+{
+    if (GetB3Era(height, params) == B3Era::LEGACY) return ConsensusPhase::LEGACY_POS;
+    if (params.legacy_b3coin && params.hard_fork_height &&
+        height < *params.hard_fork_height + params.transition_pow_length) {
+        return ConsensusPhase::TRANSITION_POW;
+    }
+    return ConsensusPhase::MODERN_POS;
 }
 
 /**
