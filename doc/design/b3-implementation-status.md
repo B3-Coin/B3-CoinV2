@@ -4,6 +4,23 @@ Status of the tree against [b3-architecture-contract.md](b3-architecture-contrac
 Baseline: commit `a8ad010` (the tip of the completed experimental stack, from which
 `claude/b3-clean-architecture` is branched).
 
+> **Phase-model note (2026-08-16).** The transition architecture now inserts a
+> **temporary-PoW corridor** between legacy PoS and modern PoS
+> ([b3-during-fork-transition.md](b3-during-fork-transition.md)): H+1…H+1000
+> are modern-format PoW blocks (Policy Outputs active, STAKE outputs created
+> and matured); modern PoS begins at M = H+1001. Everything below that says
+> "modern" for heights immediately after H refers to the modern *format*;
+> the modern *PoS* rows now bind at M. Current code and tests still encode
+> the two-phase model (H+1 = modern PoS) — the exact contradiction register
+> is corridor doc §11 and is deliberately unresolved until the corridor
+> design is approved for implementation. In particular the H+1 fail-closed
+> integration expectation (`no-modern-pos-rules`) will eventually move to
+> the first attempted M-block, and a future `ConsensusPhase`
+> {LEGACY_POS, TRANSITION_POW, MODERN_POS} abstraction will replace boolean
+> era checks for block production. Step 3 of the critical path acquires a
+> corridor-validation stage (scrypt work check + corridor difficulty on
+> modern-format blocks) before modern PoS.
+
 **Legend**
 
 | Mark | Meaning |

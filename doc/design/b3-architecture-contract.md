@@ -55,21 +55,23 @@ configuration option may change them on mainnet (no `-finallegacyheight=`,
 
 Existing mainnet H and X are not configured until a later explicitly approved task.
 
-**Terminology reconciliation (2026-08-15,
-[b3-during-fork-transition.md](b3-during-fork-transition.md)):** the fork is a
-staged process. The symbol this contract calls `H` is, in the transition
-terminology, `F = FINAL_LEGACY_HEIGHT`; `hard_fork_height` is
-`M = MODERN_START_HEIGHT = F + 1`; `X = hash(F)` is unchanged. The final
-`W = 1,000` legacy blocks `T … F` (`T = TRANSITION_START_HEIGHT = F − 999`)
-form the transition window: ordinary legacy blocks under unchanged legacy
-consensus, within which upgraded wallets create legacy-compatible stake
-declarations that deterministically prepare the initial modern validator set
-derived at `(F, X)`. This adds preparation *inside* the legacy era; it does
-not move, soften or duplicate the boundary. Everything this contract states
-about `H`/`H+1` — the single absolute era/codec/PoS switch, the finality
-boundary, the reorg prohibition — applies at `F`/`M` exactly as written, and
-the §5 grace period is where the window lives operationally. Do not use "H"
-ambiguously for the transition start; the transition start is `T`.
+**Transition-corridor reconciliation (2026-08-16,
+[b3-during-fork-transition.md](b3-during-fork-transition.md)):** the fork is
+a staged process. `H = FINAL_LEGACY_POS_HEIGHT` and `X = hash(H)` are exactly
+this contract's boundary: everything stated about `H`/`H+1` — the immutable
+anchor, the finality boundary, the reorg prohibition, the absolute
+format/codec switch at `H+1`, trusted replay ending at `H` — applies
+unchanged. What the corridor refines is the **block-production consensus**
+inside the modern format: heights `H+1 … H+1000` are the temporary-PoW
+corridor (modern blocks, modern transactions, Policy Outputs, block
+production by B3's historically existing PoW primitive), during which real
+STAKE Policy Outputs are created and matured; `M = H+1001` is the first
+modern-PoS block, validated against the registry derived deterministically
+at the end of `H+1000`. "Modern era" in this contract therefore spans two
+production phases (TRANSITION_POW, then MODERN_POS) over one unchanged
+modern block/transaction format; where this contract says modern PoS begins
+at `H+1`, read: the modern *format* begins at `H+1`, modern *PoS* begins at
+`M = H+1001`. After `H`, legacy PoS never resumes under any circumstances.
 
 ## 3. H is a finality boundary
 

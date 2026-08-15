@@ -1,344 +1,327 @@
-# B3 transition window — the 1,000-block pre-modern process
-
-**Status: AUTHORITATIVE DESIGN DIRECTION (2026-08-15).** This document
-supersedes every earlier transition interpretation, in particular the
-post-boundary "self-activating bootstrap" analysis that previously appeared
-here and in the modern PoS specification §10. Specification only: nothing in
-this document is implemented, no consensus code changes with it, and the
-`no-modern-pos-rules` fail-closed gate stays in force. Items marked OPEN are
-undecided and must not be closed by implementation choice.
-
-## 1. Terminology (use these names; never use "H" ambiguously)
-
-    T = TRANSITION_START_HEIGHT        first block of the transition window
-    W = TRANSITION_LENGTH = 1,000      legacy blocks in the window
-    F = FINAL_LEGACY_HEIGHT = T+W−1    last legacy block  (= T+999)
-    M = MODERN_START_HEIGHT = F+1      first modern block (= T+1,000)
-    X = FINAL_LEGACY_HASH              hash of block F
-    C = INITIAL_STAKE_CUTOFF_HEIGHT    declaration cutoff for initial ACTIVE
-
-If the transition is colloquially said to "start at H", the exact meaning is:
-`H … H+999` are the 1,000 legacy transition blocks and `H+1000` is the first
-modern block. The existing code's `hard_fork_height` (first modern height)
-and `LegacyFinalHeight()`/`legacy_final_hash` map to **M**, **F** and **X**
-respectively — the existing boundary value is **F**, not T. Until
-implementation is deliberately revised, every "H"/"H+1" in existing code and
-documents reads as **F**/**M**. The only block-format/PoS switch is `F → M`;
-`T` is **not** a format switch of any kind.
-
-## 2. Timeline
-
-    ─────────────┬──────────────────────────────┬──────────────────────────
-     Phase A     │  Phase B — "during the fork" │  Phase C — modern era
-     pure legacy │  T ………… C ………………………… F        │  M = F+1  onward
-     genesis…T−1 │  1,000 ordinary legacy blocks│  modern codec + modern PoS
-                 │  legacy PoS keeps producing  │  mandatory from M
-                 │  stake declarations allowed  │  initial validator set
-                 │  ≤C → initial ACTIVE at M    │  already exists
-                 │  >C → enters M as PENDING    │
-    ─────────────┴──────────────────────────────┴──────────────────────────
-                                        └ X = hash(F) attests everything ≤ F
-
-At the legacy six-minute interval, W = 1,000 blocks ≈ 6,000 minutes ≈ 100
-hours ≈ 4 days 4 hours. The public software-upgrade notice begins well
-before T; the window is the on-chain validator-declaration period, not the
-whole operator-notification period.
-
-## 3. The three phases
-
-**Phase A — pure legacy era (genesis … T−1).** Legacy block codec, legacy
-transaction codec, legacy `CTxOut`, legacy script rules, legacy PoS.
-Existing stakers operate normally. No modern validator registry, no modern
-duties of any kind.
-
-**Phase B — the transition window (T … F, exactly 1,000 blocks).** Blocks
-remain ordinary legacy-format blocks, produced and validated by legacy PoS;
-legacy nodes follow the same historical consensus throughout; legacy stakers
-keep the chain operating. There is no modern block production, no modern
-rewards, and no modern duties (§9). What is new: **upgraded wallets may
-create legacy-compatible modern-stake declarations** (§4) inside ordinary
-legacy transactions. These prepare the initial modern validator set and are
-committed by the legacy history ending at X. This window is the "meantime
-between legacy and modern" that the transition has always meant.
-
-**Phase C — modern era (M = F+1 onward).** Block M is the first modern
-block. Modern block codec and modern PoS are mandatory from M; a
-legacy-format block at any height ≥ M is invalid; a modern-format block at
-any height ≤ F is invalid. The initial modern validator set already exists,
-prepared during T…F. Old undeclared legacy UTXOs remain spendable through
-`LEGACY_LOCK`; new outputs use the modern Policy Output system.
-
-There is **no** post-F self-activating bootstrap phase, **no** temporary
-operator committee, **no** trusted validator list, **no** snapshot-created
-validator set, and **no** administrator key producing the first modern block.
-
-## 4. Declarations are legacy-compatible — NOT ModernOutput serialization
-
-Mandatory distinction: blocks T…F must remain valid to legacy software, so
-they cannot contain any transaction or output serialization that legacy
-consensus cannot decode. Before M, a stake registration is a
-**legacy-compatible STAKE declaration**, not a serialized
-`modern::ModernOutput`.
-
-Working model:
-
-    ordinary legacy transaction
-            │
-            ├── principal output
-            │     value        = locked B3 principal
-            │     scriptPubKey = owner's ordinary legacy lock
-            │
-            └── canonical declaration data
-                  version / domain
-                  principal output index
-                  validator public key
-
-One encoding **candidate** is an `OP_RETURN`-style companion output carrying
-`"B3STAKE/V1" || principal_vout || validator_pubkey`. This is a candidate
-only — the exact encoding is **OPEN** until analyzed against: legacy
-transaction consensus; legacy script limits; standard relay policy on the
-legacy network; transaction-size limits; canonical parsing requirements; and
-ambiguity/duplicate-declaration handling. Convenience does not lock it.
-
-The non-negotiable requirement: **old nodes see an ordinary valid legacy
-transaction; upgraded nodes additionally recognize a deterministic stake
-declaration.**
-
-## 5. Who must use the window (and who need not)
-
-Only a holder who wants **eligibility in the initial modern validator set**
-must create a qualifying declaration during T…F. Ordinary holders may leave
-legacy UTXOs untouched:
-
-    undeclared legacy UTXO survives F
-            ▼
-    modern era begins at M
-            ▼
-    modern transaction spends the old outpoint
-            ▼
-    frozen legacy script rules validate ownership
-            ▼
-    new OWNER / STAKE / DEX_VAULT output
-
-There is no forced balance migration, no new genesis allocation, no
-rewritten txid, no rewritten outpoint, no mandatory wallet sweep. Only
-*immediate* modern-validator eligibility requires declaring before the
-cutoff.
-
-## 6. Cancellation is self-policing
-
-The declaration's principal output remains an **ordinary spendable legacy
-output** during the window. Spending it before F automatically voids the
-declaration; at F, only declarations whose identified principal is still
-unspent qualify. No special legacy lock and no pre-F consensus restriction
-exists (and none may be created unless separately approved):
-
-    declare stake → change mind before F → spend principal → not qualifying
-
-## 7. Deterministic initial-stake derivation at (F, X)
-
-At the exact final legacy state (F, X), upgraded nodes derive the initial
-modern validator registry from the attested legacy history. A declaration
-qualifies only if **all** applicable conditions hold:
-
- 1. It appears within the window T … F.
- 2. Its transaction is part of the exact chain ending at X.
- 3. Its encoding is canonical and version-recognized.
- 4. It identifies exactly one principal output without ambiguity.
- 5. The principal output contains native B3.
- 6. The principal output is still unspent at F.
- 7. The amount meets the (eventual) minimum stake requirement.
- 8. The validator-key encoding is valid and canonical.
- 9. It satisfies the immediate-activation cutoff rule (§8).
-10. It is not made ambiguous by conflicting duplicate declarations.
-11. Any additional anti-DoS limits are satisfied.
-
-Malformed or ambiguous declarations **never** retroactively invalidate an
-otherwise valid legacy block — legacy blocks remain governed by legacy
-consensus through F. Instead:
-
-    malformed / ambiguous declaration
-            ↓ ignored for initial stake eligibility
-            ↓ its principal remains an ordinary legacy UTXO
-
-## 8. Eligibility cutoff C inside the window
-
-A declaration in the final legacy blocks must not automatically control the
-first modern block:
-
-    declaration height ≤ C → initial ACTIVE validator set at M
-    declaration height > C → valid, but enters M as PENDING and
-                              activates under normal modern maturity rules
-
-The mechanism is part of the design; the exact depth `F − C` is **OPEN**
-(candidates such as 100 or 200 may be simulated but are not locked).
-`W = TRANSITION_LENGTH = 1,000` is the currently selected transition length.
-
-## 9. No modern duties during the window
-
-Declarations are pending preparations only. For every block before M:
-no modern proposer eligibility, no VRF evaluation, no modern rewards, no
-modern penalties, no slashing, no uptime requirement, no heartbeat, no
-committee duty. **Legacy PoS exclusively secures and produces the chain
-through F.** Modern duties begin at M.
-
-## 10. Who produces the first modern block
-
-The bootstrap circularity is removed by construction. At F the chain already
-contains the deterministic set of qualifying declarations:
-
-    initial active stake registry (derived at F/X)
-            ↓ modern eligibility/randomness rule
-            ↓ eligible modern proposer
-            ↓ first modern block M
-
-The first proposer is selected from the initial validator set prepared
-during the window. There is no self-activating block that creates its own
-authority, and no "prove ownership and become proposer in the same block."
-The exact initial randomness/VRF seed at M is **OPEN** and must be specified
-separately.
-
-## 11. Readiness versus consensus fallback
-
-Operational readiness before finalizing the mainnet transition should
-require adequate: total declared B3 stake; number of operational validators;
-client adoption; validator-key availability; network reachability; software
-readiness. Exact thresholds are **OPEN**. A validator-count threshold is a
-liveness metric, not Sybil resistance — economic weight comes from declared
-stake.
-
-Explicitly forbidden fallback: "F reached, stake inadequate → quietly
-continue accepting legacy blocks." Once F/X are final, block M is modern and
-legacy continuation is invalid. Any postponement decision happens
-*operationally, before* the boundary becomes irreversible (choose a later T
-and re-run the window). If declaration participation proves inadequate, the
-correct outcomes are: postpone before finalization, or proceed knowingly
-with a small (but economically weighted) initial set — never an automatic
-legacy-extension rule. No such rule may be invented.
-
-## 12. Crossing mapping at M
-
-A qualifying declaration is never rewritten inside historical storage. At M,
-the modern validator derives a **policy view** over the original principal
-outpoint:
-
-    stake identity        = original declaration principal outpoint
-    stake amount          = exact original legacy output amount
-    owner authorization   = exact original legacy scriptPubKey,
-                            interpreted under the frozen legacy script rules
-    validator key         = canonical key from the declaration
-    initial state         = ACTIVE or PENDING per the cutoff rule (§8)
-
-The mapping is **exclusive**: a qualifying declared principal takes the
-STAKE policy view; an ordinary undeclared pre-F output takes the
-LEGACY_LOCK policy view; no outpoint is ever both. Historical transaction
-bytes, txids and outpoints are unchanged. When a bootstrap-origin stake
-eventually exits, the owner authorizes under the original frozen legacy
-owner script and directs the value into a normal modern `OWNER` output
-(exact authorization flow: OPEN). `STAKE` remains the appended modern policy
-type; existing serialized policy enum values are never renumbered.
-
-## 13. The X-distribution problem — OPEN
-
-The window solves initial-validator preparation. It does not solve
-distribution of the exact final hash X = hash(F), which is unknown until
-block F exists. This remains an explicit unresolved operational choice:
-
-- **Option A — wall-clock pause.** F is produced → legacy production stops
-  operationally → X recorded and independently verified → the X-pinned
-  release/configuration is distributed → the first accepted next-height
-  block is modern M. No extra consensus height exists between F and M; only
-  a possible wall-clock pause.
-- **Option B — on-chain precommit/handoff.** An automatic commitment
-  mechanism before F letting M begin without a release pause. Not yet
-  designed.
-
-Neither option is chosen. Mainnet T/F/X must never become an ordinary
-user-controlled runtime override; regtest may use explicit overrides for
-testing.
-
-## 14. Compatibility with completed work
-
-This design keeps every completed piece conceptually intact: one continuous
-chain; same genesis; same historical txids/outpoints; TrustedReplay of
-legacy history (the window is ordinary legacy history and replays
-mechanically, so the initial registry derivation is itself attested by X);
-the three-way UTXO equivalence framework; marker-based era enforcement; the
-final anchor (F, X); the cross-boundary reorg prohibition once X is active;
-the mempool flush when F connects; legacy transaction rejection after F;
-legacy block rejection at M; `LEGACY_LOCK` compatibility; the modern PoS
-fail-closed gate; D1–D4 hardening; checkpoint and live-legacy `CheckSync`
-behavior; the historical reward-rule reconstruction.
-
-The primary future code-level change (not in this mission) is additive:
-
-    TRANSITION_START_HEIGHT = T
-    TRANSITION_LENGTH       = 1,000
-    INITIAL_STAKE_CUTOFF    = C
-
-plus deterministic recognition of declarations and derivation of the
-initial registry. The existing boundary values remain
-`FINAL_LEGACY_HEIGHT = F` and `FINAL_LEGACY_HASH = X`.
-
-## 15. Decision status
-
-**LOCKED / DESIGN DIRECTION**
-
-- One continuous chain.
-- Legacy PoS continues through F.
-- Transition preparation happens during T…F.
-- W = 1,000 blocks for the current design.
-- Pre-F declarations must remain legacy-compatible.
-- Initial modern stake derives deterministically from pre-F facts committed
-  by X.
-- No operator keys and no trusted validator committee.
-- No validator snapshot granting authority from passive historical balances.
-- No post-F self-activating bootstrap blocks.
-- Only qualifying unspent declarations participate.
-- Spending the principal before F voids the declaration.
-- No modern duties or rewards before M.
-- Ordinary undeclared legacy UTXOs remain spendable after M via LEGACY_LOCK.
-- M is the first modern block.
-- Once F/X is active, no legacy fallback is allowed.
-
-**OPEN**
-
-- Exact declaration wire encoding (OP_RETURN companion is a candidate only).
-- Declaration versioning.
-- Validator-key type.
-- Minimum stake amount.
-- Cutoff depth F − C.
-- Minimum total declared stake / readiness thresholds.
-- Duplicate-declaration resolution.
-- Declaration indexing / state representation in the node.
-- Initial randomness/VRF seed at M.
-- Exact owner-to-modern exit authorization flow for bootstrap-origin stake.
-- X distribution: wall-clock pause vs. on-chain precommit.
-- Relay-policy handling of declarations on legacy nodes and upgraded wallets.
-
-No OPEN item may be closed silently by an implementation choice.
-
-## 16. Forbidden interpretations (do not return to these)
-
-- "F reached with no stake → M creates stake and authority in the same
-  block."
-- "Foundation/operator keys produce the first modern blocks."
-- "A passive balance snapshot automatically becomes validator authority."
-- "Actual ModernOutput bytes appear in blocks legacy nodes must decode."
-- "All holders must migrate all UTXOs during the window."
-- "A malformed declaration invalidates an otherwise valid legacy block."
-- "Legacy blocks continue after F if modern readiness is insufficient."
-- "T is itself the modern block-format switch."
-
-The only block-format/PoS switch is F → M. The 1,000 blocks before it are
-the preparation process.
-
-## 17. Destination (unchanged; not blocked by this design)
-
-After the first valid modern blocks: modern PoS → typed Policy Outputs →
-asset registry → bridge policies → TEST_USDT and test colored assets →
-FlowMesh DEX → spot trading → TEST_USDT/approved USDC-USDT fees → isolated
-leverage up to 10× → positions, PnL and liquidation → deterministic
-epochs/state roots → microblocks → real bridge and FN systems. FlowMesh
-remains account-model execution; UTXOs remain custody/deposit/withdrawal
-boundaries.
+# B3 transition corridor — temporary PoW between legacy PoS and modern PoS
+
+**Status: AUTHORITATIVE DESIGN DIRECTION (2026-08-16).** This document
+supersedes BOTH earlier transition models: the post-boundary
+"self-activating bootstrap" and the **1,000-block legacy-PoS declaration
+window (SUPERSEDED)** — the corridor is no longer legacy blocks carrying
+declarations; it is temporary PoW with modern semantics. Specification and
+inspection only: no consensus code is implemented by this mission, and the
+`no-modern-pos-rules` fail-closed gate is untouched. OPEN items must not be
+closed by implementation choice.
+
+## 1. Timeline
+
+    Genesis … 500            historical legacy B3 PoW   (LAST_POW_BLOCK = 500)
+    501 … H                  legacy B3 PoS
+    P0 = H+1 … PF = H+1000   TEMPORARY B3 PoW corridor  (1,000 blocks, locked count)
+                             modern block/tx/output semantics, Policy Outputs
+    M = H+1001 onward        modern B3 PoS
+
+    H = FINAL_LEGACY_POS_HEIGHT      X = hash(H)     (unchanged legacy anchor)
+
+B3 already ran PoW for its first 500 blocks; the corridor's default
+direction is to **reuse that historically proven PoW mechanism** — not
+RandomX, not a novel algorithm, not a new hash function — inside a new
+bounded phase with modern semantics. The 1,000-block corridor length is a
+locked design direction; numeric subparameters inside the corridor remain
+OPEN unless stated otherwise.
+
+## 2. Why PoW returns temporarily: legacy coinstake churn
+
+Under legacy B3 PoS, staking consumes the staking outpoint: the coinstake
+spends it and creates a new output, which must rebury before staking again.
+Measured from `master`: `nCoinbaseMaturity = 30` (coinstake outputs unusable
+for ~30 confirmations; the "~20 confirmations" churn description is this
+same friction) plus `nStakeMinAge = 3600 s` before an output can stake.
+A declaration bound to a specific legacy outpoint therefore forces a staker
+to choose between continuing to stake (churning the outpoint, voiding the
+declaration) and freezing the outpoint (going offline as a staker). The
+corridor removes the dilemma:
+
+    legacy PoS stops at H
+        ↓ temporary PoW produces blocks (stake is not consumed by anyone)
+        ↓ holders spend old UTXOs ONCE into real modern STAKE Policy Outputs
+        ↓ STAKE outputs sit unchanged and mature
+        ↓ modern PoS begins at M with a ready validator registry
+
+The corridor is not a permanent mining economy; it exists to establish
+modern ownership + modern stake + the initial validator registry. Nothing
+more.
+
+## 3. Three independent dimensions — do not collapse into one boolean
+
+    dimension                LEGACY_POS        TRANSITION_POW      MODERN_POS
+    ─────────────────────    ──────────────    ────────────────    ────────────
+    block format             legacy codec      MODERN codec        modern codec
+    tx/output format         legacy CTxOut     MODERN + Policy     modern + Policy
+    block production         legacy PoS        existing B3 PoW     modern PoS
+
+The corridor does **not** revert to the 2016 legacy format: transition
+blocks are modern-family blocks with modern transactions, Policy Outputs and
+LEGACY_LOCK spending support, produced under the existing B3 PoW mechanism.
+Recommended future abstraction (NOT implemented in this mission):
+
+    enum class ConsensusPhase { LEGACY_POS, TRANSITION_POW, MODERN_POS };
+    height <= H              → LEGACY_POS
+    H+1 <= height <= H+1000  → TRANSITION_POW
+    height >= H+1001         → MODERN_POS
+
+Existing two-state assumptions that will eventually need refactoring for
+three phases are catalogued in §11.
+
+## 4. Historical B3 PoW — traced from `master` (not from memory)
+
+| # | Item | Finding (file:line in `master`) |
+|---|---|---|
+| 1 | Hash algorithm | scrypt, N=1024 r=1 p=1, 80-byte header as both input and salt (`scrypt.cpp:136,193`; `SCRYPT_BUFFER_SIZE = 131072+63`) |
+| 2 | Where computed | `CBlock::GetPoWHash() = scrypt_blockhash(&nVersion)` (`main.h:665`); **`GetHash()` is version-dependent: `nVersion > 6` → SHA256d, else the scrypt hash** (`main.h:658`) |
+| 3 | `CheckProofOfWork` | `main.cpp:1329` — `CBigNum::SetCompact(nBits)`; reject if target ≤ 0 or > `ProofOfWorkLimit()`; reject if `hash > target`. Called from `CheckBlock` only for `IsProofOfWork()` blocks (`main.cpp:2302`) and on disk reads (`main.h:808`) |
+| 4 | Target interpretation | Compact-bits big-number encoding via `CBigNum::SetCompact/GetCompact` (OpenSSL BN) — same encoding the port already handles |
+| 5 | Difficulty adjustment | `GetNextTargetRequired(pindexLast, fProofOfStake)` (`main.cpp:1286`): PPC-style per-block exponential move toward target spacing over last two same-type blocks; `bnNew *= ((n−1)·S + 2·A) / ((n+1)·S)` with `n = nTargetTimespan/nTargetSpacing`; clamps: negative spacing → 1, spacing capped by `nTargetTimespan` and `10 × nTargetSpacing`; result capped at the limit. PoW spacing in the hybrid era: `min(nTargetSpacingWorkMax, 360·(1+height−lastPoWheight))` — it *stretches* as PoW blocks thin out. Constants: `nStakeTargetSpacing = 360 s`, `nTargetTimespan = 7200 s`, `nTargetSpacingWorkMax = 1080 s` (`main.h:56-58`). Enforced exactly at accept: `nBits != GetNextTargetRequired(...) → reject` (`main.cpp:2496`) |
+| 6 | Initial difficulty | `bnProofOfWorkLimit = ~uint256(0) >> 20` mainnet; genesis `nBits = limit` (`chainparams.cpp:58,73`); retarget returns the limit for the first two same-type blocks |
+| 7 | Timestamp constraints | `FutureDrift = +600 s`, `FutureDriftPOW = +100000 s` (`main.h:66-67`); PoW blocks: `GetBlockTime() > FutureDriftPOW(coinbase.nTime)` rejected while `height ≤ LastPOWBlock` (`main.cpp:2481`); block vs prev: `> GetPastTimeLimit()` and drift bound (`main.cpp:2500`); network future bound `FutureDrift(GetAdjustedTime())` (`main.cpp:2306`) |
+| 8 | PoW reward | `GetProofOfWorkReward` (`main.cpp:1146`): 10 COIN + fees; height 1 = 260,000 COIN; **fees-only above `LastPOWBlock()`** — the schedule assumes the first-500 context and must NOT be reused as-is |
+| 9 | Miner | `miner.cpp`: `CreateNewBlock(reservekey, fProofOfStake, &fees)` (line 105) sets `nNonce = 0` (line 459); `IncrementExtraNonce` (line 466); PoW scan = in-process loop hashing with `GetHash()`/`GetPoWHash()` (lines ~490-560); FN-payment logic embedded — not reusable |
+| 10 | PoW→PoS activation | `nLastPOWBlock = 500` mainnet, 100 testnet (`chainparams.cpp:118,174`); enforced: `IsProofOfWork() && nHeight > LastPOWBlock() → reject` (`main.cpp:2475`) |
+| 11 | Shared header fields | Yes — one `CBlockHeader` for both; PoW/PoS distinguished by transaction shape (`IsProofOfStake()` = coinstake at vtx[1]), not header bits |
+| 12 | `nNonce` | PoW grinding counter; PoS blocks carry `nNonce = 0` (miner sets 0; PoS validity never inspects nonce) |
+| 13 | Chain trust | `CBlockIndex::GetBlockTrust() = 2^256/(target+1)` from `nBits`, identical formula for PoW and PoS blocks (`main.cpp:2561`); accumulated in `nChainTrust` (`main.cpp:2242`). The port's `GetBlockProof` already reproduces this |
+| 14 | Scrypt implementation | `scrypt.cpp` generic C + `scrypt-x86.S`, `scrypt-x86_64.S`, `scrypt-arm.S` (32-bit ARM) assembly |
+| 15 | Platform assumptions | x86/x86_64/ARMv7 asm; no arm64 asm. The port (`src/legacy/scrypt.cpp`, 143 lines) is generic C only — portable everywhere, already used by all legacy tests |
+| 16 | Test coverage | `master`: none. Port: real scrypt PoW grinding against the ported `legacy::GetNextTargetRequired` in `legacy_transition_tests`, `legacy_checkpoint_tests`, reward/fork-choice suites (5 test files reference the retarget) — historical PoW validation is already exercised end-to-end in the port's legacy era |
+
+### Reuse verdicts
+
+**Reusable unchanged:** the scrypt primitive (port's generic implementation);
+compact-bits target encoding and the `hash ≤ target` check shape; the
+trust/chainwork formula (already era-uniform in the port); the shared-header
+approach (no header change; corridor blocks are modern-format blocks whose
+work check hashes the header with scrypt while identity stays the modern
+SHA256d marker domain — the two-hash separation already exists in the port).
+
+**Reusable with transition-specific parameters (OPEN):** the PPC-style
+per-block exponential retarget as the *candidate* difficulty policy —
+corridor spacing, timespan, starting target at P0, min/max target and clamp
+behavior must be corridor-specific (§8); timestamp bounds (the 600 s modern
+drift, not the 100000 s early-PoW drift).
+
+**Must NOT be reused:** the historical reward schedule (10 COIN + the
+260,000-COIN height-1 block and the fees-only-after-500 branch); the
+`LastPOWBlock = 500` early-chain activation switch and its hybrid
+PoW-spacing stretch (`nTargetSpacingWorkMax` logic assumes PoW/PoS
+interleaving — the corridor is PoW-only); `FutureDriftPOW = +100000 s`;
+the miner's FN-payment and wallet coupling; the version-dependent
+`GetHash()` quirk (identity in the corridor is the modern marker domain,
+never scrypt).
+
+## 5. Corridor semantics
+
+**Block P0 = H+1** is: the first block after the immutable legacy anchor X;
+the first modern-format block; the first modern-transaction block; the first
+Policy Output block; the first temporary-PoW block. It is NOT the first
+modern-PoS block. The existing integration expectation "H+1 →
+`no-modern-pos-rules`" is recorded as a contradiction (§11) and will
+eventually move to the first attempted M = H+1001; tests are not modified in
+this mission.
+
+**Policy surface during the corridor (minimal):** OWNER, LEGACY_LOCK, STAKE,
+BURN (already part of the model, where needed), basic native B3 transfers.
+NOT activated: FlowMesh, DEX, bridge, FN, real USDT/USDC, advanced
+colored-asset issuance, microblocks, leverage, general smart contracts.
+
+**Legacy UTXO spending:** old outputs keep original txid/vout/nValue/
+scriptPubKey; a modern corridor transaction spends them through
+ViewLegacyCoin/LEGACY_LOCK under frozen legacy script rules into modern
+OWNER or STAKE outputs. No rewrite, no migration, no snapshot, no new
+genesis; non-stakers may leave UTXOs untouched forever.
+
+**STAKE outputs are real modern outputs** committing to: native B3 principal
+amount, owner authorization, validator public key, creation height, policy
+version, and lifecycle state where needed. Owner authority (exit/withdrawal/
+ownership changes) and validator authority (PoS operations) stay separate;
+the validator machine never needs the owner's cold key. One STAKE policy
+type; any number of STAKE outputs.
+
+**Validator aggregation — LOCKED:** consensus weight is
+`validator_weight = SUM(qualifying ACTIVE STAKE principal assigned to the
+validator key)`. Splitting 100,000 B3 across 10,000 outputs must confer
+exactly the proposer opportunity of one 100,000 B3 output: eligibility is
+evaluated per validator identity with aggregated weight, never one lottery
+ticket per UTXO. (This supersedes the earlier per-output eligibility
+wording in the PoS spec, which is corrected to per-validator aggregation.)
+
+**Maturity — 20 confirmations (design decision preserved; off-by-one made
+explicit):** a STAKE output created in a block at height `b` is MATURE at
+height `h` iff `h − b ≥ 20` — i.e. it counts toward registry qualification
+from height `b+20` onward, after 20 subsequent-or-including-block
+confirmations in the same sense as the existing maturity comparisons
+(`spend_height − create_height ≥ maturity`) used by both codebases. The
+alternative reading ("20 blocks strictly after, usable at b+21") is
+rejected for consistency with that convention. No technical contradiction
+with the number 20 was found (it is a new modern constant, independent of
+the legacy `nCoinbaseMaturity = 30`). During the corridor, mature STAKE
+contributes to the future registry only — it produces no corridor blocks;
+temporary PoW is the corridor's only block-production mechanism.
+
+**Initial validator cutoff C (OPEN):** stake must be valid, unspent, mature,
+created at-or-before the cutoff, and validly assigned to a validator key to
+join the initial ACTIVE set at M. Later stake stays valid and locked, enters
+the modern era PENDING, and activates under ordinary modern rules. Candidate
+shape (NOT locked): registration `H+1 … H+800`, stabilization/burial
+`H+801 … H+1000`.
+
+**Registry derivation:** at the end of block PF = H+1000, every node derives
+the identical initial modern validator registry from qualifying STAKE
+outputs in the modern UTXO state — no legacy reinterpretation, no snapshot,
+no administrator list, no operator committee, no self-authorizing first PoS
+block. Then M: registry → modern VRF/eligibility → eligible proposer(s) →
+first modern-PoS block.
+
+## 6. Corridor difficulty (analysis; numerics OPEN)
+
+Preference: existing PoW primitive + a simple transition-specific policy.
+To analyze before locking: target block interval; the initial P0 target
+(there is no meaningful prior scrypt hashrate to inherit — the last PoW
+observation is from height 500, years stale); retarget frequency and
+response speed (the historical per-block exponential filter is the
+candidate; its 2-hour timespan may be too slow for a 4-day corridor whose
+hashrate can swing by orders of magnitude); minimum/maximum target;
+timestamp interaction; very-low-hashrate behavior (corridor must not stall
+for days on an overshot target) and very-high-hashrate behavior (rented
+scrypt bursts compressing the corridor to minutes). Do not blindly reuse
+the first-500-block schedule; do not invent complexity beyond a simple
+corridor policy.
+
+## 7. Corridor security (concrete questions; mitigations OPEN)
+
+Unequal hashpower is accepted ("more computing power → more expected
+blocks"); scrypt is memory-touched but has mature ASIC/rental markets —
+it is not CPU-only and is not claimed to be. The concrete questions:
+Can one miner censor STAKE creation? Can corridor blocks be cheaply
+reorganized (rented hashrate vs. the corridor's history that defines the
+registry)? Can a miner shape the initial validator set (censorship +
+reorg near C)? Can the chain stall if hashrate disappears? Can difficulty
+be manipulated (timestamp gaming the exponential filter)? Can timestamp
+manipulation affect the handoff at PF? Can the final corridor blocks be
+withheld to grief the M transition? Candidate mitigations (none locked):
+responsive difficulty; cutoff C well before H+1000 with a large burial
+period; bounded corridor reorg depth; corridor timestamp rules; broad
+mining-client availability; a temporary block reward attracting honest
+hashrate.
+
+## 8. Corridor mining reward (OPEN — historical schedule must NOT return)
+
+Options to analyze: fees only; fixed temporary B3 reward; small temporary
+subsidy + fees; declining reward across the corridor. Separately analyze
+**miner→validator capture**: whether corridor-PoW reward B3 may join the
+initial validator set. A dominant corridor miner must not automatically
+convert subsidy into initial-set domination. Candidate rules (none locked):
+corridor rewards mature beyond H+1000; rewards spendable but ineligible for
+the initial set; rewards stake normally only after M. Any subsidy also
+needs an issuance-cap accounting statement (contract cap invariant).
+
+## 9. Insufficient stake at the end of the corridor
+
+Block counts, STAKE-output counts and validator counts are unrelated
+(1,000 PoW blocks / 50 validators / 120 STAKE outputs may be perfectly
+healthy). If mature qualifying stake at H+1000 is inadequate, the options
+to analyze (NONE selected without approval): (A) H is not finalized
+operationally until expected participation is adequate; (B) a deterministic
+bounded corridor-extension mechanism; (C) M begins with whatever valid
+stake exists; (D) abort the attempt — possible only before H becomes final.
+**FIRM: after H, legacy PoS never resumes.** There is no silent fallback
+from transition PoW to legacy PoS under any circumstances.
+
+## 10. The legacy anchor and the activation gate are unchanged
+
+Genesis…H remains the legacy prefix: TrustedReplay ends at H; X = hash(H)
+is the immutable anchor; corridor blocks H+1…H+1000 are ordinary
+modern-format blocks under normal (PoW) validation, and M onward is normal
+modern-PoS validation. The mandatory mainnet activation gate
+`U_master(H) == U_port(H) == U_replay(H)` on real history stands; regtest
+does not replace it. All completed work retains its value: D1–D4
+hardening, legacy checkpoints and live CheckSync, mempool boundary work,
+historical reward-rule reconstruction, TrustedReplay, the three-way
+equivalence framework, legacy UTXO identity, LEGACY_LOCK, Policy Output
+models, marker/codec work, boundary finality, and the modern PosValidator
+interface. What changes is only the phase immediately after H.
+
+## 11. Contradiction register — current code/tests encoding "H+1 = modern PoS"
+
+Recorded only; nothing modified in this mission.
+
+1. `src/test/legacy_transition_tests.cpp` —
+   `non_empty_transition_fails_closed_at_h_plus_one` expects H+1 →
+   `no-modern-pos-rules`; under the corridor, H+1 should eventually
+   validate under TRANSITION_POW and the fail-closed expectation moves to
+   the first attempted H+1001.
+2. Same file — `full_legacy_to_modern_transition` installs the test PoS
+   validator for H+1 and treats H-connect as "next block is modern PoS";
+   under the corridor the installed validator would first bind at M.
+3. `src/modern/pos.h` — `SelectStakeRules` is two-state (LEGACY/MODERN by
+   codec marker × era); a third TRANSITION_POW phase must dispatch
+   modern-codec corridor blocks to PoW validation, not `CheckModernStake`.
+4. `src/consensus/era.h` — `GetB3Era` is boolean (LEGACY/MODERN); correct
+   for format/tx dimensions but not for block-production phase; the future
+   `ConsensusPhase` abstraction (§3) supersedes it as the production
+   selector; `hard_fork_height` remains the format boundary = H+1.
+5. `src/validation.cpp` modern branch of `CheckBlock`/
+   `ContextualCheckBlockHeader` — checks stock SHA256d
+   `CheckProofOfWork(block.GetHash(), nBits)` and Bitcoin
+   `GetNextWorkRequired`; corridor blocks need scrypt-hash work checks and
+   the corridor difficulty policy while identity stays SHA256d.
+6. `src/modern/policy.h` — no STAKE policy type exists yet (types 0–3),
+   and OWNER/BURN/DEX_VAULT activation is test-only
+   (`test_only_asset_policies_active`); the corridor requires a production
+   activation story for the minimal surface OWNER/LEGACY_LOCK/STAKE(/BURN)
+   from H+1.
+7. Mempool era gate (`MemPoolAccept::PreChecks`) — era-of-next-block logic
+   is correct for the corridor (modern txs from H+1) but "next block
+   modern" currently implies modern-PoS context in tests; corridor-phase
+   awareness will be needed for miner/relay policy, not admission.
+8. `Consensus::Params` — no corridor constants exist
+   (`TRANSITION_LENGTH`, cutoff C, corridor difficulty/reward params);
+   `legacy_last_pow_block = 500` exists and must remain untouched by the
+   corridor (it governs the historical era only).
+9. The PoS spec's per-output eligibility wording (threshold "split-
+   invariant" per STAKE output) conflicts with the now-LOCKED
+   per-validator aggregation rule; corrected in the PoS spec by this
+   mission (documentation only).
+10. No mining/block-production path exists for any era (miner/submitblock
+    are stock Bitcoin); corridor mining needs the marker-aware production
+    path already listed as missing in the status matrix.
+
+## 12. Decision status
+
+**LOCKED / DESIGN DIRECTION:** corridor model `legacy PoS → temporary
+existing-B3 PoW → modern PoS`; corridor length 1,000 blocks; corridor
+blocks are modern-format/modern-tx/Policy Output blocks (never legacy
+codec); reuse of B3's existing scrypt PoW primitive as the default
+direction; H/X as the immutable legacy anchor with TrustedReplay ending at
+H; the three-way real-history gate; minimal corridor policy surface;
+LEGACY_LOCK crossing; owner/validator key separation; per-validator
+weight aggregation (splitting confers no advantage); 20-confirmation STAKE
+maturity with `h − b ≥ 20` semantics; mature-stake-produces-no-corridor-
+blocks (PoW is the only corridor production); deterministic registry
+derivation at H+1000 with no snapshot/committee/administrator/self-
+authorizing block; after H, legacy PoS never resumes; unequal hashpower
+accepted; no new hash function.
+
+**OPEN:** corridor difficulty policy and every numeric parameter (initial
+P0 target, spacing, retarget response, min/max targets, timestamp bounds);
+corridor reward model and miner→validator-capture rule; cutoff C and the
+registration/burial split; insufficient-stake handling (options A–D);
+corridor reorg-depth bounds and other §7 mitigations; STAKE policy-output
+serialization details and activation mechanics for the minimal surface;
+X-distribution operations (pause vs. precommit — unchanged from before);
+minimum stake amount; duplicate/invalid validator-key handling in STAKE
+outputs; initial randomness/VRF seed at M; everything listed OPEN in the
+modern PoS spec (VRF primitive, slots/epochs, fork choice, finality,
+rewards, slashing, unbonding).
+
+## 13. Destination unchanged
+
+After modern PoS: asset registry → bridge → TEST_USDT → FlowMesh → spot DEX
+→ USDT/USDC fees → isolated leverage ≤10× → PnL/liquidation →
+deterministic epochs → microblocks → real bridges → FN system. The corridor
+must not couple to or redesign any of these.

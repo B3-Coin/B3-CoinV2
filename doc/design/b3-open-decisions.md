@@ -49,28 +49,33 @@ with ranked fallbacks, cheap pre-verification). Every remaining decision is
 tracked there with LOCKED/OPEN status: PD-1..PD-17 are all OPEN and all numeric
 parameters are simulation-gated.
 
-**The transition model is AUTHORITATIVE design direction (2026-08-15):**
-[b3-during-fork-transition.md](b3-during-fork-transition.md) — the fork is a
-staged process, not an instantaneous migration. The final 1,000 legacy
-blocks `T … F` (W = TRANSITION_LENGTH = 1,000) are the transition window:
-ordinary legacy blocks under unchanged legacy PoS, inside which upgraded
-wallets create legacy-compatible stake declarations; the era/format/PoS
-switch happens exactly once, at `F → M` (M = F+1), and the initial modern
-validator set derives deterministically at (F, X) from qualifying unspent
-declarations (cutoff C splits initial ACTIVE from PENDING). The earlier
-post-boundary self-activating bootstrap analysis is superseded; operator
-keys, trusted validator lists and passive-balance snapshots are forbidden.
-The existing code's boundary (`hard_fork_height` = M; `LegacyFinalHeight` =
-F; `legacy_final_hash` = X) is unchanged; T/W/C are future additive
-constants.
+**The transition model is AUTHORITATIVE design direction (2026-08-16):**
+[b3-during-fork-transition.md](b3-during-fork-transition.md) — the
+**temporary-PoW corridor**. Both earlier models (post-boundary
+self-activating bootstrap; the 1,000-block legacy-PoS declaration window)
+are SUPERSEDED. Timeline: Genesis…500 historical B3 PoW
+(`LAST_POW_BLOCK = 500`); 501…H legacy PoS with X = hash(H) the immutable
+anchor; H+1…H+1000 temporary PoW reusing B3's existing scrypt PoW primitive
+in **modern-format blocks** with Policy Outputs active, in which holders
+spend legacy UTXOs once (LEGACY_LOCK) into real modern STAKE outputs that
+mature undisturbed (legacy coinstake churn is why declarations inside
+legacy PoS were abandoned); M = H+1001 first modern-PoS block, starting
+from the registry derived deterministically at the end of H+1000. Corridor
+length 1,000 is a locked count; per-validator weight aggregation is LOCKED
+(no per-UTXO lottery tickets); 20-conf STAKE maturity (`h − b ≥ 20`) is the
+preserved design number; after H, legacy PoS never resumes. Operator keys,
+snapshots, committees and self-authorizing blocks remain forbidden.
 
 **OD-1 stays UNRESOLVED and nothing may be implemented until every remaining
 OPEN item is explicitly locked** — the PoS PDs (PD-1..15, 17) plus the
-transition document's OPEN list (declaration encoding and versioning,
-validator-key type, minimum stake, cutoff depth F−C, readiness thresholds,
-duplicate resolution, declaration indexing, initial seed at M, exit
-authorization flow, X distribution pause-vs-precommit, relay policy); the
-numeric ones lock only from simulation results.
+corridor document's OPEN list (corridor difficulty policy and numerics,
+corridor reward and the miner→validator-capture rule, cutoff C,
+insufficient-stake handling A–D, corridor reorg bounds, STAKE serialization
+and activation mechanics, minimum stake, initial seed at M, X distribution
+pause-vs-precommit); the numeric ones lock only from simulation results.
+The corridor's code/test contradiction register (including the H+1
+fail-closed integration test that will eventually move to H+1001) is in the
+corridor document §11 — recorded, not yet resolved in code.
 
 ---
 
