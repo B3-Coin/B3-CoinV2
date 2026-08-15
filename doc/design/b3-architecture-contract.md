@@ -55,6 +55,22 @@ configuration option may change them on mainnet (no `-finallegacyheight=`,
 
 Existing mainnet H and X are not configured until a later explicitly approved task.
 
+**Terminology reconciliation (2026-08-15,
+[b3-during-fork-transition.md](b3-during-fork-transition.md)):** the fork is a
+staged process. The symbol this contract calls `H` is, in the transition
+terminology, `F = FINAL_LEGACY_HEIGHT`; `hard_fork_height` is
+`M = MODERN_START_HEIGHT = F + 1`; `X = hash(F)` is unchanged. The final
+`W = 1,000` legacy blocks `T … F` (`T = TRANSITION_START_HEIGHT = F − 999`)
+form the transition window: ordinary legacy blocks under unchanged legacy
+consensus, within which upgraded wallets create legacy-compatible stake
+declarations that deterministically prepare the initial modern validator set
+derived at `(F, X)`. This adds preparation *inside* the legacy era; it does
+not move, soften or duplicate the boundary. Everything this contract states
+about `H`/`H+1` — the single absolute era/codec/PoS switch, the finality
+boundary, the reorg prohibition — applies at `F`/`M` exactly as written, and
+the §5 grace period is where the window lives operationally. Do not use "H"
+ambiguously for the transition start; the transition start is `T`.
+
 ## 3. H is a finality boundary
 
 Stronger than an ordinary checkpoint. Once modern activation exists:

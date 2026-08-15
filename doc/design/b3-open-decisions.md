@@ -49,16 +49,28 @@ with ranked fallbacks, cheap pre-verification). Every remaining decision is
 tracked there with LOCKED/OPEN status: PD-1..PD-17 are all OPEN and all numeric
 parameters are simulation-gated.
 
-**PD-16 (H+1 bootstrap) has a PROPOSED resolution:** the during-fork
-declaration window — [b3-during-fork-transition.md](b3-during-fork-transition.md)
-— per the user's transition model: the fork is a process spanning the legacy
-tail (declarations from `H−W`, modern era from `H+1` with a non-empty initial
-validator set derived from the attested window). It replaces PD-16 with the
-DF-1..DF-6 decision set. **PROPOSED, not locked.**
+**The transition model is AUTHORITATIVE design direction (2026-08-15):**
+[b3-during-fork-transition.md](b3-during-fork-transition.md) — the fork is a
+staged process, not an instantaneous migration. The final 1,000 legacy
+blocks `T … F` (W = TRANSITION_LENGTH = 1,000) are the transition window:
+ordinary legacy blocks under unchanged legacy PoS, inside which upgraded
+wallets create legacy-compatible stake declarations; the era/format/PoS
+switch happens exactly once, at `F → M` (M = F+1), and the initial modern
+validator set derives deterministically at (F, X) from qualifying unspent
+declarations (cutoff C splits initial ACTIVE from PENDING). The earlier
+post-boundary self-activating bootstrap analysis is superseded; operator
+keys, trusted validator lists and passive-balance snapshots are forbidden.
+The existing code's boundary (`hard_fork_height` = M; `LegacyFinalHeight` =
+F; `legacy_final_hash` = X) is unchanged; T/W/C are future additive
+constants.
 
-**OD-1 stays UNRESOLVED and nothing may be implemented until every PD and DF
-item is explicitly locked; the numeric ones lock only from simulation
-results.**
+**OD-1 stays UNRESOLVED and nothing may be implemented until every remaining
+OPEN item is explicitly locked** — the PoS PDs (PD-1..15, 17) plus the
+transition document's OPEN list (declaration encoding and versioning,
+validator-key type, minimum stake, cutoff depth F−C, readiness thresholds,
+duplicate resolution, declaration indexing, initial seed at M, exit
+authorization flow, X distribution pause-vs-precommit, relay policy); the
+numeric ones lock only from simulation results.
 
 ---
 
