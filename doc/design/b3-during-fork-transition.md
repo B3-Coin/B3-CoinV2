@@ -150,16 +150,15 @@ evaluated per validator identity with aggregated weight, never one lottery
 ticket per UTXO. (This supersedes the earlier per-output eligibility
 wording in the PoS spec, which is corrected to per-validator aggregation.)
 
-**Maturity — 20 confirmations (design decision preserved; off-by-one made
-explicit):** a STAKE output created in a block at height `b` is MATURE at
-height `h` iff `h − b ≥ 20` — i.e. it counts toward registry qualification
-from height `b+20` onward, after 20 subsequent-or-including-block
-confirmations in the same sense as the existing maturity comparisons
-(`spend_height − create_height ≥ maturity`) used by both codebases. The
-alternative reading ("20 blocks strictly after, usable at b+21") is
-rejected for consistency with that convention. No technical contradiction
-with the number 20 was found (it is a new modern constant, independent of
-the legacy `nCoinbaseMaturity = 30`). During the corridor, mature STAKE
+**Maturity — `STAKE_ACTIVATION_DEPTH = 20` (precise consensus rule):**
+a STAKE output created in a block at height `b` is MATURE at height `h`
+iff `h − b ≥ STAKE_ACTIVATION_DEPTH`, i.e. from height `b+20` onward.
+Conventional confirmation-count terminology is deliberately NOT used —
+"20 confirmations" creates an off-by-one ambiguity; the depth comparison
+above is the rule. It matches the existing maturity-comparison shape
+(`spend_height − create_height ≥ depth`) used by both codebases. The
+constant is a new modern one, independent of the legacy
+`nCoinbaseMaturity = 30`. During the corridor, mature STAKE
 contributes to the future registry only — it produces no corridor blocks;
 temporary PoW is the corridor's only block-production mechanism.
 
@@ -300,8 +299,9 @@ codec); reuse of B3's existing scrypt PoW primitive as the default
 direction; H/X as the immutable legacy anchor with TrustedReplay ending at
 H; the three-way real-history gate; minimal corridor policy surface;
 LEGACY_LOCK crossing; owner/validator key separation; per-validator
-weight aggregation (splitting confers no advantage); 20-confirmation STAKE
-maturity with `h − b ≥ 20` semantics; mature-stake-produces-no-corridor-
+weight aggregation (splitting confers no advantage);
+`STAKE_ACTIVATION_DEPTH = 20` (mature iff `h − b ≥ 20`, never
+"confirmations"); mature-stake-produces-no-corridor-
 blocks (PoW is the only corridor production); deterministic registry
 derivation at H+1000 with no snapshot/committee/administrator/self-
 authorizing block; after H, legacy PoS never resumes; unequal hashpower

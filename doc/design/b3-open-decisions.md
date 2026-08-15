@@ -62,7 +62,7 @@ mature undisturbed (legacy coinstake churn is why declarations inside
 legacy PoS were abandoned); M = H+1001 first modern-PoS block, starting
 from the registry derived deterministically at the end of H+1000. Corridor
 length 1,000 is a locked count; per-validator weight aggregation is LOCKED
-(no per-UTXO lottery tickets); 20-conf STAKE maturity (`h − b ≥ 20`) is the
+(no per-UTXO lottery tickets); `STAKE_ACTIVATION_DEPTH = 20` (mature iff `h − b ≥ 20`) is the
 preserved design number; after H, legacy PoS never resumes. Operator keys,
 snapshots, committees and self-authorizing blocks remain forbidden.
 
