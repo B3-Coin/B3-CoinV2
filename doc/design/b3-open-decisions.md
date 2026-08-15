@@ -46,11 +46,19 @@ above.
 accepted structural base (STAKE policy outputs, locked-amount weight,
 owner/validator key split, no auto-compounding, bounded age, VRF eligibility
 with ranked fallbacks, cheap pre-verification). Every remaining decision is
-tracked there with LOCKED/OPEN status: PD-1..PD-17 are all OPEN, all numeric
-parameters are simulation-gated, and **PD-16 — the H+1 validator bootstrap —
-is the primary unresolved consensus question** (dedicated section §10).
-**OD-1 stays UNRESOLVED and nothing may be implemented until every PD is
-explicitly locked; the numeric PDs lock only from simulation results.**
+tracked there with LOCKED/OPEN status: PD-1..PD-17 are all OPEN and all numeric
+parameters are simulation-gated.
+
+**PD-16 (H+1 bootstrap) has a PROPOSED resolution:** the during-fork
+declaration window — [b3-during-fork-transition.md](b3-during-fork-transition.md)
+— per the user's transition model: the fork is a process spanning the legacy
+tail (declarations from `H−W`, modern era from `H+1` with a non-empty initial
+validator set derived from the attested window). It replaces PD-16 with the
+DF-1..DF-6 decision set. **PROPOSED, not locked.**
+
+**OD-1 stays UNRESOLVED and nothing may be implemented until every PD and DF
+item is explicitly locked; the numeric ones lock only from simulation
+results.**
 
 ---
 
