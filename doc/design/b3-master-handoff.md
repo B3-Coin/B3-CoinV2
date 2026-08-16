@@ -22,11 +22,29 @@ Scope: B3 transition context, modern colored assets, FN Coin/Proof of Disintegra
 >    **marker-spend design in §4.5 below is SUPERSEDED and must not be implemented.**
 > 2. **Modern PoD encoding:** remains OPEN exactly as §4.6 states (unrelated to
 >    legacy claims; the owner will lock it separately).
+>    *[Since resolved: see the 2026-08-17 reconciliation below.]*
 > 3. **Activation:** FN legacy claims activate exactly at the derived height
 >    `M = TransitionPowFinalHeight(params) + 1`; there is no independently
 >    configured FN activation parameter (supersedes item 13's "configured" wording).
 > 4. **§4.4 verification completed:** the historical PoD test correction is commit
 >    `d6a30ae`; the evolution suite is green — see the §4.4 note below.
+
+> **Owner reconciliation (2026-08-17).** The owner has since ruled:
+> 1. **Modern PoD encoding is LOCKED** (§4.6 below, updated): an implicit
+>    on-chain gap with a **validation-only hypothetical disintegration
+>    output** — `I >= O + D` enforced at validation, `fee = I − O − D`,
+>    the hypothetical amount never serialized, stored, indexed, spendable,
+>    or given an outpoint, and never miner-claimable. Full normative text:
+>    [b3-fn-pod.md](b3-fn-pod.md) §10.1.
+> 2. **FN lifecycle:** an FN-preserving spend (same-PoDId successor)
+>    transfers the FN with its rewards/perks; an ordinary B3 spend is
+>    valid and permanently extinguishes the FN (never recreatable from the
+>    same PoDId). [b3-fn-pod.md](b3-fn-pod.md) §10.2.
+> 3. A same-day proposal applying the hypothetical-output idea to the
+>    LEGACY claim anchor (virtual claim outpoints materialized into the
+>    UTXO set) was **rejected in full** and must not be revived; §8 of
+>    b3-fn-pod.md remains the governing legacy claim design
+>    (conflict register C-R3).
 
 ## 0. How this document must be used
 
@@ -443,7 +461,7 @@ Still verify/specify before coding the consensus portion:
 - fee input/change behavior for the marker's 1 B3;
 - mempool conflicts, replacement policy, indexes, DoS bounds, and compatibility behavior.
 
-### 4.6 Modern FN creation — OPEN ENCODING, LOCKED ECONOMIC INTENT
+### 4.6 Modern FN creation — ENCODING LOCKED (2026-08-17), LOCKED ECONOMIC INTENT
 
 The intended economic lineage is:
 
@@ -455,14 +473,22 @@ destroy B3 through a B3-specific modern PoD operation
 
 Modern ownership must be fully on-chain, unlike the historical P2P operator binding.
 
-There is an unresolved contradiction in earlier prompts:
+The contradiction this section originally recorded — an implicit PoD
+accounting gap vs an explicit visible modern BURN policy (because modern
+conservation forbids hidden gaps) — is **RESOLVED by owner ruling
+2026-08-17** in favor of the **implicit on-chain gap with a
+validation-only hypothetical disintegration output**
+([b3-fn-pod.md](b3-fn-pod.md) §10.1; conflict register C-R3): for a
+recognized modern FN-creation transaction, validation temporarily
+includes the required disintegration `D` in the output total, enforces
+`I >= O + D`, and computes the ordinary fee as `I − O − D`. The
+hypothetical amount is never serialized, stored, indexed, spendable, or
+given an outpoint; it never enters the UTXO set or any persistent state;
+and it is never miner-claimable. Conservation's objection is answered
+because the gap is consensus-validated, not hidden.
 
-- one direction preserves an implicit PoD accounting gap in the modern transaction; and
-- another direction preserves PoD semantics but uses an explicit visible modern BURN policy because modern conservation forbids hidden gaps.
-
-Claude must not choose between these while implementing. The project owner must lock the modern PoD encoding after reviewing its effect on conservation, fees, supply accounting, visibility, and auditability.
-
-Generic `BURN` and FN-specific `PoD` remain semantically distinct even if the final modern encoding reuses a visible burn primitive.
+Generic `BURN` and FN-specific `PoD` remain semantically distinct; the
+locked encoding does not reuse the BURN primitive.
 
 ### 4.7 FN Coin's FlowMesh role — DESIGN DIRECTION
 

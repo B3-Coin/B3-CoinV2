@@ -51,7 +51,7 @@ defined over the recoverable facts — the natural candidate being
 "beneficiary = controller of the disintegration transaction's marker
 output" — and never over network-layer state.
 
-## 2. Modern FN creation preserves PoD — economic intent LOCKED, encoding OPEN
+## 2. Modern FN creation preserves PoD — economic intent LOCKED, encoding LOCKED (2026-08-17)
 
 Modern B3 keeps Proof of Disintegration as the FN creation mechanism in its
 ECONOMIC lineage: **B3 is permanently sacrificed, and an FN right is
@@ -59,13 +59,15 @@ created**; the destroyed amount is permanently excluded from B3 supply and
 never claimable by the block producer; the creation is explicitly
 recognizable by consensus.
 
-**The modern ENCODING is OPEN** (master handoff §4.6; owner reconciliation
-2026-08-16): whether the modern transaction expresses the destruction as an
-implicit accounting gap (the historical shape) or through an explicit
-visible burn primitive (which modern conservation would otherwise require)
-is an unresolved owner decision. It must not be selected during the legacy
-FN claim work, which is unrelated: legacy claims mint FN Coins for
-destruction that already happened historically.
+**The modern ENCODING is LOCKED** by owner ruling 2026-08-17 (§10),
+closing the question the master handoff §4.6 recorded — implicit
+accounting gap vs explicit visible burn primitive — **in favor of an
+implicit on-chain gap with a validation-only hypothetical disintegration
+output**. Modern conservation's objection to hidden gaps is answered
+because the gap is not hidden: validation explicitly recognizes and
+enforces the destroyed amount `D` (§10.1). This lock is unrelated to
+legacy claims, which mint FN Coins for destruction that already happened
+historically and follow §8 unchanged.
 
 ### PoD is not BURN
 
@@ -110,8 +112,11 @@ state.
     LEGACY FN                          MODERN FN
     =========                          =========
     historical PoD                     modern PoD
-    implicit input/output gap          implicit input/output gap
-    historical collateral schedule     modern PoD amount (OPEN)
+    implicit input/output gap          implicit gap, validated through the
+                                       hypothetical disintegration output
+                                       (§10.1)
+    historical collateral schedule     modern required disintegration D
+                                       (determination OPEN)
     historical marker + P2P binding    explicit on-chain FN ownership
     aggregate-only chain accounting    FN Coin / FN policy object
                                        deterministic replay protection
@@ -314,17 +319,24 @@ Validation at connected height ht, for every FN-claiming output:
     else: mint exactly one FN {pod_id, ownership outpoint, owner suffix,
           claim height}; FN Coin supply += 1; claimed[pod_id] = true
 
-**FN TRANSFER** is unchanged from the approved conservation rule and is
-distinguished by the authorizing INPUT: spending an existing FN ownership
-output (owner suffix, modern rules) requires exactly one successor FN
-ownership output with the SAME pod_id — else "fn-transfer-no-successor";
-transfers never mint, never split/merge, never burn (MVP), and several
-independent FNs may move in one transaction under the both-directions
-pod_id bijection. A transfer carries no proof output and no funding
-signatures. A transaction that neither spends the FN object nor carries a
-valid claim proof for a pod_id it emits is INVALID
+**FN TRANSFER** is distinguished by the authorizing INPUT: spending an
+existing FN ownership output (owner suffix, modern rules) with exactly one
+successor FN ownership output with the SAME pod_id transfers the FN;
+transfers never mint and never split/merge, and several independent FNs
+may move in one transaction under the both-directions pod_id bijection. A
+transfer carries no proof output and no funding signatures. A transaction
+that emits an FN ownership output for a pod_id without either spending
+that FN object or carrying a valid claim proof is INVALID
 "fn-claim-missing-authority". Wallets present one FN asset balance with
 per-object PoD provenance.
+
+> **Revised 2026-08-17 (§10.2):** the earlier rule that a spend of the FN
+> object without a same-PoDId successor is INVALID
+> ("fn-transfer-no-successor") is superseded. An ordinary B3 spend of the
+> FN output is VALID and permanently **extinguishes** the FN — the color,
+> the PoDId association and all future rewards/perks end, and the FN can
+> never be recreated from the same PoDId. Wallets MUST separate "Transfer
+> FN" from "Spend as ordinary B3" (§10.2).
 
 **Explicit invariants:**
 
@@ -398,10 +410,12 @@ Persisted node state, all reorg-managed and reconstructible:
 is implicit destruction through the accounting gap; PoD value is never a
 miner fee; PoD permanently reduces B3 spendable supply; modern FN creation
 preserves PoD's ECONOMIC lineage (PoD remains semantically distinct from
-generic BURN — the modern ENCODING is OPEN, §2); modern FN ownership is
+generic BURN); **the modern ENCODING is LOCKED (2026-08-17)** to the
+implicit gap with a validation-only hypothetical disintegration output
+(§2, §10.1); the FN lifecycle rule — FN-preserving transfer vs
+ordinary-spend extinguishment — is LOCKED (§10.2); modern FN ownership is
 explicit and on-chain; FN Coin is separate from B3 supply; one PoD event
-creates at most one FN; historical and modern mechanisms share lineage but
-not encoding; mainnet historical collateral rules unchanged.
+creates at most one FN; mainnet historical collateral rules unchanged.
 
 **LOCKED for the legacy-claim MVP (2026-08-16, integrated scan-and-claim):**
 every qualifying historical PoD (gap ≥ tier, through H) → exactly one FN
@@ -418,14 +432,102 @@ inferred from markers, change heuristics or input ordering; explicit claim
 intent + FN destination required; one-claim-per-PoD enforced by a
 reorg-managed claimed flag keyed by PoDId; perpetual claims; activation
 exactly at M = TransitionPowFinalHeight + 1 (derived, never node-local);
-pre-activation claim forms invalid; safe post-claim conservation (same-
-PoDId successor rule, no split/merge/burn); no administrator list or
+pre-activation claim forms invalid; safe post-claim conservation (the
+same-PoDId successor rule preserves the FN; no split/merge; per the
+2026-08-17 revision an ordinary spend without a successor is valid and
+permanently extinguishes the FN, §10.2); no administrator list or
 off-chain ownership anywhere in consensus.
 
-**OPEN (unchanged by the MVP):** modern (post-legacy) FN PoD amount; FN
-Coin issuance rate for NEW modern PoDs; dynamic vs fixed pricing;
-excess-gap treatment; ordinary-fee calculation for modern FN creation;
-final FN ownership serialization beyond the MVP claim form; FN Coin
-lifecycle beyond the MVP same-PoDId transfer rule; FN reward economics
-(OD-4); claim expiry (none unless a future consensus change introduces
-one). Implementation must not close these silently.
+**OPEN (after the 2026-08-17 encoding/lifecycle lock):** modern
+(post-legacy) FN required-disintegration amount `D` and its
+determination; FN Coin issuance rate for NEW modern PoDs; pricing
+structure (the owner's economics direction is to be reconciled in its own
+documentation commit); final FN ownership serialization beyond the MVP
+claim form; the modern FN-creation transaction form's exact detection/
+serialization (§10.1); FN reward economics (OD-4); claim expiry (none
+unless a future consensus change introduces one). Implementation must not
+close these silently. *Resolved since the earlier list:* excess-gap
+treatment and modern ordinary-fee calculation (`fee = I − O − D`, excess
+is ordinary fee — §10.1); FN lifecycle beyond transfer (ordinary-spend
+extinguishment defined, §10.2; still no split/merge).
+
+## 10. Modern FN accounting and lifecycle — LOCKED (owner ruling, 2026-08-17)
+
+**Status: LOCKED.** This section records the owner's hypothetical-output
+ruling in its intended scope: **modern FN-creation accounting only**. It
+does not touch the legacy claim mechanism — §8 remains the governing
+historical funding-key scan-and-claim design, and its claim carrier and
+`claimed[pod_id]` registry are unchanged pending their own later review.
+(A same-day proposal that misapplied the hypothetical-output idea to the
+legacy claim anchor — virtual claim outpoints materialized into the UTXO
+set at M — was **rejected in full by the owner and must not be revived**.)
+
+### 10.1 The validation-only hypothetical disintegration output
+
+For a transaction recognized as a **modern FN-creation transaction**
+(the exact detection/serialization of that form is OPEN, §9):
+
+    I = real input value (sum of spent prevouts)
+    O = the sum of EVERY real serialized B3 output — including the real
+        FN-colored ownership output the creation emits. The hypothetical
+        disintegration amount D is separate from and never conflated
+        with the FN ownership output.
+    D = the required disintegration for this creation — a
+        consensus-determined atomic amount (its determination is the
+        economics direction, recorded separately)
+
+    During validation ONLY, the transaction is treated as though its
+    output total also contained a hypothetical output of value D.
+
+    Mathematical rule:  I >= O + D,  fee = I − O − D
+
+    Overflow-safe evaluation (normative — `O + D` must never be computed
+    directly in a type where it could overflow; subtraction first):
+
+        validate I and O with MoneyRange
+        if I < O:      reject
+        gap = I − O
+        if gap < D:    reject
+        fee = gap − D
+        validate D and fee with MoneyRange
+
+The hypothetical disintegration output is:
+
+- **never serialized**, stored, or indexed;
+- **never given an outpoint**;
+- **never added to the UTXO set or any other persistent state**;
+- **never spendable**;
+- without any effect on the txid;
+- present **only** in the validator's arithmetic, to account for the
+  permanently destroyed creation cost.
+
+The destroyed `D` is **never miner-claimable** and never recoverable B3 —
+the exact continuation of the historical rule (§1: the disintegrated
+amount is not a fee). Value beyond `O + D` is **ordinary transaction
+fee** and creates no additional FN (owner-approved resolution of the
+excess-gap question).
+
+**Arithmetic discipline:** consensus arithmetic uses raw atomic
+`CAmount` units exclusively — integer only, no floating point.
+Human-facing modern prices may be expressed in modern B3 (= kB3, the
+locked denomination model in `b3-test-baseline.md`); validation must
+never use display-unit arithmetic.
+
+### 10.2 FN lifecycle — FN-preserving transfer vs ordinary-spend extinguishment
+
+An FN Coin is a colored, normally spendable B3 output, and it must remain
+**freely transferable as FN** — never locked permanently to its creator:
+
+- An **FN-preserving spend** — exactly one successor FN ownership output
+  with the same PoDId (§8.4) — transfers the FN, its PoDId and its
+  future rewards/perks to the new owner.
+- An **ordinary B3 spend is VALID** and permanently **extinguishes** the
+  FN: the color is removed and its future rewards/perks end. This
+  supersedes the earlier `fn-transfer-no-successor` invalidity rule.
+- An extinguished FN **cannot be recreated from the same PoDId** — by
+  any party, under any rule. The same PoDId can never create FN twice.
+- No FN split or merge (MVP, unchanged).
+- **Wallets MUST clearly separate "Transfer FN" from "Spend as ordinary
+  B3"**, and MUST exclude FN-colored outputs from ordinary automatic
+  coin selection by default — extinguishment must be an explicit act,
+  never an accident of coin selection.

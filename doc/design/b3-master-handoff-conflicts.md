@@ -211,3 +211,26 @@ The historical PoD test correction is commit `d6a30ae`; the evolution suite
 (`./build/bin/test_bitcoin --run_test=b3_evolution_tests`) is green as of
 2026-08-16 (macOS arm64, Darwin 25.5.0, ~5m15s), covering every property §4.4
 lists.
+
+## C-R3 — C-1 / §4.6 modern PoD encoding — **RESOLVED (2026-08-17)**
+
+The gap-vs-explicit-burn contradiction recorded in C-1 and handoff §4.6 is
+closed by owner ruling 2026-08-17: modern FN creation uses an **implicit
+on-chain gap with a validation-only hypothetical disintegration output**
+([b3-fn-pod.md](b3-fn-pod.md) §10.1). For a recognized modern FN-creation
+transaction, validation temporarily includes the required disintegration
+`D` in the output total, enforces `I >= O + D`, and computes
+`fee = I − O − D`; the hypothetical amount is never serialized, stored,
+indexed, spendable, or given an outpoint, never enters the UTXO set or any
+persistent state, and is never miner-claimable. Conservation's hidden-gap
+objection is answered: the gap is a consensus-validated quantity.
+
+For the record, so it cannot be revived: a same-day working-tree proposal
+misapplied the hypothetical-output idea to the LEGACY claim anchor —
+virtual claim outpoints `(pod_id, output_count)` materialized into the
+consensus UTXO set at M, replacing `claimed[pod_id]` with spend-once
+semantics. The owner **rejected that proposal in full**; it was never
+committed. The hypothetical-output idea applies ONLY to modern FN-creation
+accounting; b3-fn-pod.md §8 (integrated funding-key scan-and-claim, its
+claim carrier, and the `claimed[pod_id]` registry) remains the governing
+legacy claim design pending its own later review.
