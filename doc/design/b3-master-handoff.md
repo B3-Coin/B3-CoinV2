@@ -526,9 +526,17 @@ demand for FlowMesh capacity
 
 **Locked direction (owner ruling 2026-08-17; full normative text in
 [b3-fn-pod.md](b3-fn-pod.md) §11):** FN has both a **limited total
-supply** (`MAX_FN_EVER_CREATED`, consensus constant, value OPEN — hard
-floor: the complete historical reservation count) and a
-**deterministically increasing creation cost**
+supply** (`MAX_FN_EVER_CREATED`, consensus constant — **current
+owner-selected value 1,000**, covering every historical right claimed or
+unclaimed plus every modern creation; revisable before activation through
+the reviewed process only; after activation only by a versioned consensus
+upgrade at a defined height, never node-local; the real-chain
+`-podreport` is a **pre-activation release gate**: it must run before
+H/X are pinned, and if the historical reservation count exceeds 1,000
+the release process stops — H/X are not pinned, FN activation is not
+enabled, and the decision returns to the owner; historical rights are
+never discarded, and this is not a block-validation rule that halts a
+running chain at M) and a **deterministically increasing creation cost**
 (`RequiredDisintegration(M)` over the modern-creations-ever counter,
 nondecreasing, integer atomic-unit arithmetic, numbers OPEN; supply
 invariants `0 <= H <= R`, `R + M <= C`, `H + M = A + X`, remaining

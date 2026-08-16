@@ -445,10 +445,12 @@ permanently extinguishes the FN, §10.2); no administrator list or
 off-chain ownership anywhere in consensus.
 
 **OPEN (after the 2026-08-17 locks):** the numerical values of §11.5 —
-`MAX_FN_EVER_CREATED` (hard floor: the real-chain historical reservation
-count), starting modern creation cost, tranche size, cost increase per
-tranche, reward amount and schedule, reward ownership cutoff on
-transfer/extinguishment, legacy claim expiry policy (none by default);
+starting modern creation cost, tranche size, cost increase per tranche,
+reward amount and schedule, reward ownership cutoff on
+transfer/extinguishment, legacy claim expiry policy (none by default) —
+`MAX_FN_EVER_CREATED` is no longer open: its current owner-selected
+value is 1,000 (D-1), revisable before activation through the reviewed
+process, gated on the real-chain reservation count;
 final FN ownership serialization beyond the MVP claim form; the modern
 FN-creation transaction form's exact detection/serialization (§10.1); FN
 reward economics beyond the §11.5 parameters (OD-4). Implementation must
@@ -549,7 +551,9 @@ An FN Coin is a colored, normally spendable B3 output, and it must remain
 
 ## 11. FN scarcity and market economics — LOCKED direction (owner ruling, 2026-08-17)
 
-**Status: LOCKED direction; every numerical parameter OPEN (§11.5).**
+**Status: LOCKED direction; numerical parameters OPEN (§11.5) except
+D-1, whose current owner-selected value is `MAX_FN_EVER_CREATED = 1,000`
+(2026-08-17, revisable before activation through the reviewed process).**
 FN has **both a limited total supply and a deterministically increasing
 creation cost**. The combination is intentional: FN is to become a
 scarce, transferable market asset whose future creation becomes
@@ -559,8 +563,20 @@ economic structure above them. No consensus code accompanies it.
 
 ### 11.1 Limited supply — `MAX_FN_EVER_CREATED`
 
-A consensus constant **`MAX_FN_EVER_CREATED`** caps FN creation. Its
-numerical value is OPEN for owner selection (§11.5, D-1).
+A consensus constant **`MAX_FN_EVER_CREATED`** caps FN creation.
+
+**Owner parameter decision (2026-08-17): `MAX_FN_EVER_CREATED = 1,000`.**
+The cap includes every qualifying historical FN right, claimed or
+unclaimed, and every modern FN ever created; therefore
+`remaining modern capacity = 1,000 − historical_reserved − modern_created`
+(the `C − R − M` invariant below with `C = 1,000`). Revision rules:
+
+- **Until activation**, the owner may revise the numerical value through
+  the reviewed protocol process (a reviewed documentation commit, as
+  here).
+- **After activation**, changing the cap requires an explicit versioned
+  consensus upgrade at a defined activation height. It is never
+  node-local or independently configurable.
 
 Supply rules, all consensus-enforced:
 
@@ -570,11 +586,22 @@ Supply rules, all consensus-enforced:
   any modern FN creation is allowed.** Historical rights can never be
   crowded out by modern issuance.
 - **Modern mint capacity = `MAX_FN_EVER_CREATED` − reserved historical
-  FN rights.** Owner-approved hard constraint on the OPEN value:
-  `MAX_FN_EVER_CREATED` cannot be lower than the complete historical
-  reservation count — which the real-chain `-podreport` run through H
-  (§8.4 capacity gate) will establish; choosing D-1 therefore waits on
-  that run.
+  FN rights.**
+- **Historical-count activation gate — a PRE-ACTIVATION release gate,
+  not a block-validation rule.** The real-chain `-podreport` run through
+  H (§8.4 capacity gate, counting every qualifying PoD including rights
+  whose script form is not yet supported) is mandatory **before H/X are
+  pinned and before an activation-ready mainnet release is produced**.
+  If it establishes `R > 1,000`: do not pin H/X, do not enable FN
+  activation, and return the decision to the owner. Historical rights
+  are never truncated, discarded or reprioritized to force them under
+  the cap. This gate is **not** an ordinary block-validation rule that
+  unexpectedly halts an otherwise-running chain at M — once H/X are
+  pinned, the reviewed report must already have established
+  `R <= 1,000`. A defensive implementation MAY fail node initialization
+  loudly if committed activation parameters contradict the derived
+  historical count, but that is protection against an invalid release,
+  not the normal activation mechanism.
 - Burning or extinguishing an FN (§10.2) **reduces active supply but
   never reopens a creation slot**.
 - The same PoDId can **never** create FN twice (§10.2, §8.5).
@@ -705,14 +732,15 @@ Every value below awaits explicit owner selection. Implementation must
 not proceed on any of them; the locked structure (§11.1–11.4) is
 independent of the values chosen.
 
-**D-1: `MAX_FN_EVER_CREATED`**
+**D-1: `MAX_FN_EVER_CREATED` — SELECTED: 1,000 (owner, 2026-08-17)**
 
-| Consideration | Constraint / note |
+| Item | Status |
 |---|---|
-| Hard floor (owner-approved) | ≥ the complete real-chain historical reservation count (from the `-podreport` run through H — not yet available) |
-| Scarcity target | smaller cap → stronger scarcity, less future FlowMesh capacity headroom |
-| FlowMesh sizing | one active FN = one microblock seat (handoff §4.7); the cap bounds the maximum seat pool ever |
-| Upgrade posture | cap changes require an explicit consensus upgrade (locked); choose assuming it is permanent |
+| Current owner-selected value | **1,000** — includes every qualifying historical right (claimed or unclaimed) and every modern FN ever created |
+| Activation gate | pre-activation RELEASE gate (§11.1): the real-chain `-podreport` count `R` is mandatory before H/X are pinned and before an activation-ready release; `R > 1,000` → do not pin H/X, do not enable FN activation, return the decision to the owner — historical rights are never discarded to fit the cap; not a block-validation halt |
+| Revision before activation | permitted, through the reviewed protocol process only |
+| Revision after activation | only by an explicit versioned consensus upgrade at a defined activation height; never node-local or independently configurable |
+| FlowMesh sizing | conditional: under the current handoff §4.7 DESIGN DIRECTION ("one active FN Coin -> one microblock seat"; seat details OPEN there), 1,000 would bound the maximum seat pool — binding only if that direction is locked |
 
 **D-2: starting modern creation cost — `RequiredDisintegration(0)`**
 
@@ -755,3 +783,22 @@ independent of the values chosen.
 
 **D-7: legacy claim expiry policy** — none exists; perpetual reservation
 unless the owner later establishes one explicitly (§11.4).
+
+### 11.6 Future implementation tests — the cap (owner-required, 2026-08-17)
+
+Implementation commits for the cap must cover, in addition to the §8.6
+matrix:
+
+| Case | Expected |
+|---|---|
+| Historical reservation `R < 1,000` | activation proceeds; modern capacity = `1,000 − R` |
+| At `R + M = 999` | one additional modern creation succeeds (`R + M` reaches 1,000) |
+| At `R + M = 1,000` | every further modern creation is rejected |
+| `R = 1,000` | modern capacity is zero; every modern creation rejected |
+| `R > 1,000` | the **activation-ready release gate fails before H/X are pinned** (§11.1); no historical right discarded; not a running-chain halt |
+| Extinguishment | does not decrease `R + M`; at the cap, capacity remains 0 — no slot reopens |
+| Reorganization | reverses canonical-chain modern creations and restores capacity exactly; re-connection reproduces the counters identically |
+
+(The special case "modern creation number 1,001 is rejected" holds only
+when `R = 0`; the general invariant is `R + M <= 1,000`, tested through
+the exact-arithmetic rows above.)
