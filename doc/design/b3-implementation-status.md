@@ -20,6 +20,26 @@ Baseline: commit `a8ad010` (the tip of the completed experimental stack, from wh
 > era checks for block production. Step 3 of the critical path acquires a
 > corridor-validation stage (scrypt work check + corridor difficulty on
 > modern-format blocks) before modern PoS.
+>
+> **Corridor implementation status (2026-08-16, regtest-complete).** The
+> approved staged build-out landed: `ConsensusPhase` dispatch
+> (`consensus/era.h`, `transition_pow_length` on params, mainnet 1000 inert);
+> corridor validation by scrypt eligibility (`CheckTransitionPowEligibility`,
+> constant `transition_pow_bits`, fail-closed `no-transition-pow-rules` when
+> unset); phase-aware production (assembler + regtest generate);
+> LEGACY_LOCK crossing spends under the frozen legacy rule set with frozen
+> legacy maturity; `STAKE = 4` with the v1 script carrier (**a proposal
+> embodied in code — ratify before any mainnet H/X pin**);
+> `STAKE_ACTIVATION_DEPTH = 20` (`h − b ≥ 20`); per-validator-key weight
+> aggregation (`node/stake_registry`); and the full 1,000-block regtest
+> corridor test ending at the fail-closed modern gate at the first
+> post-corridor height. Mainnet corridor difficulty, rewards, cutoff C and
+> readiness thresholds remain OPEN and unset (mainnet H/X unset). The
+> earlier H+1-fail-closed test expectation has moved to H+1001 as the
+> corridor design requires. Known follow-ups: P2P headers-first relay of
+> corridor headers still assumes SHA256d PoW in `HasValidProofOfWork`
+> (corridor sync by full blocks only until addressed); post-corridor header
+> rules (nBits semantics) are the modern-PoS placeholder.
 
 **Legend**
 
