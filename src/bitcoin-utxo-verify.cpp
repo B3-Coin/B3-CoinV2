@@ -83,7 +83,13 @@ void Usage()
                 "  -replayrows=<file>     write the replay reconstruction (U_replay) as canonical rows\n"
                 "  -masterrows=<file>     read the legacy master client's exported rows (U_master)\n"
                 "                         and verify U_master == U_port == U_replay; with this\n"
-                "                         option, exit 0 only when all three sets agree\n");
+                "                         option, exit 0 only when all three sets agree\n"
+                "\n"
+                "FN Proof-of-Disintegration capacity gate (doc/design/b3-fn-pod.md):\n"
+                "  -podreport             derive every qualifying historical PoD during the\n"
+                "                         replay pass and print the capacity-gate report\n"
+                "                         (totals, claimability reasons, max distinct funding\n"
+                "                         scripts, max authorization payload, B3FP fit)\n");
 }
 
 struct ToolArgs {
@@ -95,6 +101,7 @@ struct ToolArgs {
     fs::path portrows;
     fs::path replayrows;
     fs::path masterrows;
+    bool podreport{false};
 };
 
 std::optional<ToolArgs> ParseArgs(const int argc, char* argv[])
@@ -120,6 +127,8 @@ std::optional<ToolArgs> ParseArgs(const int argc, char* argv[])
             args.portrows = fs::PathFromString(*v);
         } else if (const auto v{eat("-replayrows=")}) {
             args.replayrows = fs::PathFromString(*v);
+        } else if (arg == "-podreport") {
+            args.podreport = true;
         } else if (const auto v{eat("-masterrows=")}) {
             args.masterrows = fs::PathFromString(*v);
         } else {
@@ -307,7 +316,8 @@ int main(int argc, char* argv[])
         const node::ReplayEquivalenceResult result{node::VerifyReplayEquivalence(
             consensus, live, read_block, scratch,
             {.final_height = args->height, .final_hash = args->hash,
-             .max_mismatch_sample = args->max_mismatches})};
+             .max_mismatch_sample = args->max_mismatches,
+             .derive_pod_report = args->podreport})};
 
         // ---- Report.
         for (const std::string& error : result.errors) {
@@ -328,6 +338,30 @@ int main(int argc, char* argv[])
         }
         tfm::format(std::cout, "result:             %s\n",
                     result.ok ? "EQUAL (U_port == U_replay)" : "NOT EQUAL");
+
+        // ---- FN PoD capacity-gate report (doc/design/b3-fn-pod.md §8.4).
+        if (result.pod_report) {
+            const node::PodCapacityReport& pod{*result.pod_report};
+            tfm::format(std::cout, "PoD qualifying:     %d\n", pod.total_qualifying);
+            tfm::format(std::cout, "PoD claimable:      %d\n", pod.claimable);
+            for (const auto& [reason, count] : pod.by_reason) {
+                tfm::format(std::cout, "PoD reason %d:       %d (%s)\n", reason, count,
+                            reason == 0 ? "SUPPORTED" : "UNSUPPORTED_FUNDING_SCRIPT");
+            }
+            tfm::format(std::cout, "PoD max scripts:    %d (largest eligible claim)\n",
+                        pod.max_distinct_funding_scripts);
+            tfm::format(std::cout, "PoD max auth bytes: %d\n", pod.max_authorization_payload);
+            tfm::format(std::cout, "PoD B3FP fit:       %s\n",
+                        pod.fits_b3fp_carrier ? "yes (every claim fits the approved carrier)"
+                                              : "NO - REVISE THE CARRIER BEFORE COMMIT 3");
+            for (const node::PodRecord& record : result.pod_records) {
+                tfm::format(std::cout,
+                            "  pod %s h=%d gap=%d tier=%d scripts=%d claimable=%s markers=%d\n",
+                            record.pod_id.ToString(), record.height, record.disintegrated,
+                            record.tier, record.funding_scripts.size(),
+                            record.claimable ? "yes" : "no", record.marker_vouts.size());
+            }
+        }
 
         // ---- Canonical row export and the three-way invariant
         // U_master == U_port == U_replay (doc/design/b3-utxo-equivalence.md).

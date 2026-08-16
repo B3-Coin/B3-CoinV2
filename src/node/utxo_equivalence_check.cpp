@@ -6,6 +6,8 @@
 
 #include <coins.h>
 #include <legacy/replay.h>
+#include <node/fn_pod.h>
+#include <undo.h>
 #include <tinyformat.h>
 
 #include <algorithm>
@@ -68,9 +70,16 @@ ReplayEquivalenceResult VerifyReplayEquivalence(
                 res.errors.push_back(strprintf("no block available at height %d", height));
                 return res;
             }
-            if (!replay.ApplyBlock(*block, cache, error)) {
+            CBlockUndo undo;
+            if (!replay.ApplyBlock(*block, cache, error,
+                                   opts.derive_pod_report ? &undo : nullptr)) {
                 res.errors.push_back(strprintf("trusted replay failed at height %d: %s", height, error));
                 return res;
+            }
+            if (opts.derive_pod_report) {
+                for (auto& record : DerivePodRecords(*block, undo, height, params)) {
+                    res.pod_records.push_back(std::move(record));
+                }
             }
             ++res.blocks_replayed;
             if (height % 1000 == 0) {
@@ -90,8 +99,13 @@ ReplayEquivalenceResult VerifyReplayEquivalence(
     }
 
     const int blocks_replayed{res.blocks_replayed};
+    std::vector<PodRecord> pod_records{std::move(res.pod_records)};
     res = SummarizeComparison(CompareUtxoViews(live_view, replay_scratch), opts.max_mismatch_sample);
     res.blocks_replayed = blocks_replayed;
+    if (opts.derive_pod_report) {
+        res.pod_report = BuildPodCapacityReport(pod_records);
+        res.pod_records = std::move(pod_records);
+    }
     return res;
 }
 

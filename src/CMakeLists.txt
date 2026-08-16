@@ -240,6 +240,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/txdownloadman_impl.cpp
   node/txorphanage.cpp
   node/txreconciliation.cpp
+  node/fn_pod.cpp
   node/stake_registry.cpp
   node/utxo_commitment.cpp
   node/utxo_equivalence_check.cpp

@@ -51,6 +51,7 @@ add_executable(test_bitcoin
   flowmesh_batch_tests.cpp
   flowmesh_clearing_tests.cpp
   flowmesh_ledger_tests.cpp
+  fn_pod_tests.cpp
   fs_tests.cpp
   getarg_tests.cpp
   hardfork_tests.cpp
