@@ -11,6 +11,7 @@ add_executable(test_bitcoin
   amount_tests.cpp
   argsman_tests.cpp
   asset_conservation_tests.cpp
+  b3_evolution_tests.cpp
   arith_uint256_tests.cpp
   banman_tests.cpp
   base32_tests.cpp
