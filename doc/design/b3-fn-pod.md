@@ -115,8 +115,8 @@ state.
     implicit input/output gap          implicit gap, validated through the
                                        hypothetical disintegration output
                                        (§10.1)
-    historical collateral schedule     modern required disintegration D
-                                       (determination OPEN)
+    historical collateral schedule     RequiredDisintegration curve
+                                       (§11.2; numbers OPEN)
     historical marker + P2P binding    explicit on-chain FN ownership
     aggregate-only chain accounting    FN Coin / FN policy object
                                        deterministic replay protection
@@ -415,7 +415,13 @@ implicit gap with a validation-only hypothetical disintegration output
 (§2, §10.1); the FN lifecycle rule — FN-preserving transfer vs
 ordinary-spend extinguishment — is LOCKED (§10.2); modern FN ownership is
 explicit and on-chain; FN Coin is separate from B3 supply; one PoD event
-creates at most one FN; mainnet historical collateral rules unchanged.
+creates at most one FN; mainnet historical collateral rules unchanged;
+**FN economic direction LOCKED (2026-08-17, §11):** limited total supply
+(`MAX_FN_EVER_CREATED`, value OPEN) plus a deterministically nondecreasing
+creation cost (`RequiredDisintegration`, numbers OPEN) — FN as a scarce,
+freely transferable market asset; all historical rights reserved before
+modern issuance and never crowded out; scarcity counted on
+total-ever-created; extinguishment never reopens a creation slot.
 
 **LOCKED for the legacy-claim MVP (2026-08-16, integrated scan-and-claim):**
 every qualifying historical PoD (gap ≥ tier, through H) → exactly one FN
@@ -438,18 +444,20 @@ same-PoDId successor rule preserves the FN; no split/merge; per the
 permanently extinguishes the FN, §10.2); no administrator list or
 off-chain ownership anywhere in consensus.
 
-**OPEN (after the 2026-08-17 encoding/lifecycle lock):** modern
-(post-legacy) FN required-disintegration amount `D` and its
-determination; FN Coin issuance rate for NEW modern PoDs; pricing
-structure (the owner's economics direction is to be reconciled in its own
-documentation commit); final FN ownership serialization beyond the MVP
-claim form; the modern FN-creation transaction form's exact detection/
-serialization (§10.1); FN reward economics (OD-4); claim expiry (none
-unless a future consensus change introduces one). Implementation must not
-close these silently. *Resolved since the earlier list:* excess-gap
+**OPEN (after the 2026-08-17 locks):** the numerical values of §11.5 —
+`MAX_FN_EVER_CREATED` (hard floor: the real-chain historical reservation
+count), starting modern creation cost, tranche size, cost increase per
+tranche, reward amount and schedule, reward ownership cutoff on
+transfer/extinguishment, legacy claim expiry policy (none by default);
+final FN ownership serialization beyond the MVP claim form; the modern
+FN-creation transaction form's exact detection/serialization (§10.1); FN
+reward economics beyond the §11.5 parameters (OD-4). Implementation must
+not close these silently. *Resolved since the earlier list:* excess-gap
 treatment and modern ordinary-fee calculation (`fee = I − O − D`, excess
 is ordinary fee — §10.1); FN lifecycle beyond transfer (ordinary-spend
-extinguishment defined, §10.2; still no split/merge).
+extinguishment defined, §10.2; still no split/merge); dynamic-vs-fixed
+pricing (deterministic nondecreasing curve, §11.2); FN issuance-rate
+structure (capped total, tranche curve — values OPEN, §11.5).
 
 ## 10. Modern FN accounting and lifecycle — LOCKED (owner ruling, 2026-08-17)
 
@@ -501,11 +509,18 @@ The hypothetical disintegration output is:
 - present **only** in the validator's arithmetic, to account for the
   permanently destroyed creation cost.
 
-The destroyed `D` is **never miner-claimable** and never recoverable B3 —
-the exact continuation of the historical rule (§1: the disintegrated
-amount is not a fee). Value beyond `O + D` is **ordinary transaction
-fee** and creates no additional FN (owner-approved resolution of the
-excess-gap question).
+**Fee calculation vs fee distribution — kept distinct:**
+
+    ordinary fee amount = I − O − D
+
+The equation defines the ordinary fee AMOUNT only. **Who receives that
+amount remains OPEN** under the modern reward/fee policy; no statement
+that a miner or block producer necessarily receives it may be made until
+that policy is locked. `D` itself is **never distributable and never
+recoverable** B3, to anyone, under any policy — the exact continuation of
+the historical rule (§1: the disintegrated amount is not a fee). Value
+beyond `O + D` is part of the ordinary fee amount and creates no
+additional FN (owner-approved resolution of the excess-gap question).
 
 **Arithmetic discipline:** consensus arithmetic uses raw atomic
 `CAmount` units exclusively — integer only, no floating point.
@@ -531,3 +546,212 @@ An FN Coin is a colored, normally spendable B3 output, and it must remain
   B3"**, and MUST exclude FN-colored outputs from ordinary automatic
   coin selection by default — extinguishment must be an explicit act,
   never an accident of coin selection.
+
+## 11. FN scarcity and market economics — LOCKED direction (owner ruling, 2026-08-17)
+
+**Status: LOCKED direction; every numerical parameter OPEN (§11.5).**
+FN has **both a limited total supply and a deterministically increasing
+creation cost**. The combination is intentional: FN is to become a
+scarce, transferable market asset whose future creation becomes
+progressively more expensive. The accounting mechanics (§10.1) and the
+lifecycle rules (§10.2) are already locked; this section locks the
+economic structure above them. No consensus code accompanies it.
+
+### 11.1 Limited supply — `MAX_FN_EVER_CREATED`
+
+A consensus constant **`MAX_FN_EVER_CREATED`** caps FN creation. Its
+numerical value is OPEN for owner selection (§11.5, D-1).
+
+Supply rules, all consensus-enforced:
+
+- The cap applies to **total FN creation rights ever**, not merely
+  currently active FN.
+- **All qualifying historical PoDs have their FN rights reserved before
+  any modern FN creation is allowed.** Historical rights can never be
+  crowded out by modern issuance.
+- **Modern mint capacity = `MAX_FN_EVER_CREATED` − reserved historical
+  FN rights.** Owner-approved hard constraint on the OPEN value:
+  `MAX_FN_EVER_CREATED` cannot be lower than the complete historical
+  reservation count — which the real-chain `-podreport` run through H
+  (§8.4 capacity gate) will establish; choosing D-1 therefore waits on
+  that run.
+- Burning or extinguishing an FN (§10.2) **reduces active supply but
+  never reopens a creation slot**.
+- The same PoDId can **never** create FN twice (§10.2, §8.5).
+- Once all permitted creation rights are used, modern FN creation
+  **permanently stops** unless a future explicit consensus upgrade
+  changes the cap.
+
+**Supply accounting — normative counters, invariants and transitions.**
+(Within this subsection the symbols `H` and `M` denote COUNTERS per the
+owner's definition — not the chain heights `H` = LEGACY_FINAL_HEIGHT and
+`M` = activation height used elsewhere in this document. Where the
+prose could be ambiguous it says "the counter" explicitly.)
+
+    R = complete historical FN rights reserved
+        (qualifying claimable PoDs through the final legacy height,
+         fixed at activation)
+    H = historical FN rights successfully claimed        (a counter)
+    M = modern FN Coins ever created on the active chain (a counter)
+    A = currently active FN
+    X = permanently extinguished FN
+    C = MAX_FN_EVER_CREATED
+
+Required invariants, holding at every block on the active chain:
+
+    0 <= H <= R
+    R + M <= C
+    H + M = A + X
+    remaining modern capacity = C − R − M
+
+Terminology, so nothing can be double-counted:
+
+- `R + M` is the **cap-consuming rights count**.
+- `H + M` is the number of **FN Coins actually issued**.
+- Unclaimed historical reservations (`R − H`) consume cap capacity but
+  are not yet active FN Coins.
+- A historical claim moves one right from unclaimed to claimed; it does
+  **not** consume modern capacity.
+- Extinguishment reduces active supply but changes neither `H`, `M`,
+  nor the remaining modern capacity.
+
+State transitions (the only ones that exist):
+
+    Historical claim:  H += 1;  A += 1
+    Modern creation:   M += 1;  A += 1
+    FN transfer:       no counter changes
+    FN extinguish:     A −= 1;  X += 1
+
+Reorganizations reverse the corresponding transitions exactly —
+disconnecting a block undoes its transitions in reverse order, and every
+counter is reorg-managed and restart/reindex/replay-deterministic.
+
+### 11.2 Increasing creation cost — `RequiredDisintegration`
+
+The required disintegration `D` of §10.1 is determined by a
+**nondecreasing consensus function** of the counter `M` (modern FN Coins
+ever created, §11.1):
+
+    D = RequiredDisintegration(M) -> CAmount
+
+The exact starting cost, tranche size and progression are OPEN (§11.5).
+The possible (owner-suggested) form: deterministic supply **tranches**,
+every tranche carrying a higher B3 disintegration requirement than the
+previous one.
+
+Locked properties of the function and its evaluation:
+
+- **Cost never decreases.** The function is nondecreasing in its
+  argument, and the argument (the counter `M`) never decreases:
+  extinguishing FN does not reduce `M` and does not lower the cost.
+- **Historical FN claims do not advance the curve.** Their owners
+  already paid through historical disintegration; only modern creations
+  increment `M` (§11.1 transitions: a historical claim increments `H`,
+  never `M`).
+- **Multiple modern creations in one block use serialized block
+  transaction order.** Each creation transaction's `D` is calculated
+  using the **current** `M`; after each successful creation, `M` is
+  incremented **before the next creation transaction is validated** —
+  within one block and across blocks alike.
+- **A transaction paying the previous tranche's price after the boundary
+  has been crossed is rejected** (its `D` is evaluated at its own
+  position on the curve; the §10.1 subtraction-first validation fails if
+  it paid for a cheaper slot).
+- **Integer atomic-unit arithmetic only** — the §10.1 discipline applies
+  to the curve's definition and evaluation: raw atomic `CAmount` units,
+  no floating point; human-facing modern prices may read in modern B3
+  (= kB3, the locked denomination model), historical tiers remain in
+  legacy B3 and are never reinterpreted; validation never uses
+  display-unit arithmetic.
+
+### 11.3 Market effect — intended economic behavior
+
+Recorded accurately, with no stronger claims than the mechanism supports:
+
+- Increasing creation cost raises the **marginal price of new FN
+  supply**.
+- The hard cap prevents **unlimited dilution**.
+- Existing FN can trade **below or above** the current creation cost,
+  depending on demand, liquidity, provenance and expected perks — the
+  curve sets the cost of *new* supply, not the price of existing supply.
+- Reward eligibility creates **utility but does not guarantee market
+  value**.
+- Unique PoDId history may give individual FN Coins **different market
+  valuations** (provenance is on-chain and per-coin).
+- Scarcity is based on **total-ever-created** supply, so intentional FN
+  destruction (§10.2 extinguishment) makes the active market **more
+  scarce** — without ever reopening a creation slot (§11.1).
+
+### 11.4 Legacy protection — legacy FN rights come first
+
+- Derive the **complete eligible historical count through H** (the §8.2
+  PodRecord set; the real-chain `-podreport` run is the authoritative
+  count).
+- **Reserve one FN right for every qualifying historical PoD** before
+  modern creation opens.
+- Legacy claimants **do not pay the modern creation cost** — no
+  `RequiredDisintegration` applies to a legacy claim; the price was paid
+  historically.
+- Modern issuance must **never consume a reserved legacy slot**
+  (`modern_capacity_remaining` excludes the full reservation, claimed or
+  not).
+- **Unclaimed legacy rights remain reserved perpetually** unless the
+  owner later establishes an explicit expiry policy (OPEN, §11.5 D-7 —
+  nothing expires by default).
+
+### 11.5 OPEN numerical decisions — decision tables
+
+Every value below awaits explicit owner selection. Implementation must
+not proceed on any of them; the locked structure (§11.1–11.4) is
+independent of the values chosen.
+
+**D-1: `MAX_FN_EVER_CREATED`**
+
+| Consideration | Constraint / note |
+|---|---|
+| Hard floor (owner-approved) | ≥ the complete real-chain historical reservation count (from the `-podreport` run through H — not yet available) |
+| Scarcity target | smaller cap → stronger scarcity, less future FlowMesh capacity headroom |
+| FlowMesh sizing | one active FN = one microblock seat (handoff §4.7); the cap bounds the maximum seat pool ever |
+| Upgrade posture | cap changes require an explicit consensus upgrade (locked); choose assuming it is permanent |
+
+**D-2: starting modern creation cost — `RequiredDisintegration(0)`**
+
+| Consideration | Constraint / note |
+|---|---|
+| Unit discipline | atomic units, integer; display in modern B3 (kB3) per the denomination model |
+| Historical anchor | historical tiers were 25M/20M/15M legacy B3 (= 25,000/20,000/15,000 kB3) — a reference point, not a constraint |
+| Accessibility vs scarcity | low start widens early participation; high start prices the first tranche as already-scarce |
+
+**D-3: tranche size**
+
+| Consideration | Constraint / note |
+|---|---|
+| Granularity | small tranches → smooth curve, frequent boundary crossings; large tranches → step function, long price plateaus |
+| Divisibility | tranche boundaries must divide the modern capacity cleanly or define the final partial tranche explicitly |
+| In-block dynamics | boundary crossings inside one block are well-defined (canonical order, counter advances per creation — §11.2) but small tranches make them common |
+
+**D-4: cost increase per tranche**
+
+| Consideration | Constraint / note |
+|---|---|
+| Form | fixed increment (linear), fixed multiplier (geometric — integer arithmetic required, e.g. rational multiplier with an explicit rounding rule), or an explicit table |
+| Rounding | if not an explicit table, the rounding rule is consensus-critical and must be specified with the value |
+| Monotonicity | whatever the form, nondecreasing is locked |
+
+**D-5: reward amount and schedule**
+
+| Consideration | Constraint / note |
+|---|---|
+| Source | FlowMesh fee flows (handoff §4.8) — distribution OPEN there as well; these decisions should land together |
+| Guarantee level | rewards are utility, not guaranteed value (§11.3) — the schedule must not promise yield |
+
+**D-6: reward ownership cutoff on transfer / extinguishment**
+
+| Consideration | Constraint / note |
+|---|---|
+| Transfer | rewards/perks follow the FN to the new owner (§10.2) — the cutoff moment (block height of transfer? epoch boundary?) is the open detail |
+| Extinguishment | rewards/perks end permanently (§10.2) — the cutoff moment is the open detail |
+| Determinism | whatever the cutoff, it must be a pure function of chain state |
+
+**D-7: legacy claim expiry policy** — none exists; perpetual reservation
+unless the owner later establishes one explicitly (§11.4).

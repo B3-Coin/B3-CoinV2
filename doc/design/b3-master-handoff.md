@@ -513,7 +513,7 @@ This avoids making `100 FN Coins` automatically equal one node with `100x` vote 
 
 FN Coin does not silently add B3 PoS weight.
 
-### 4.8 FN economics — DESIGN DIRECTION / OPEN PARAMETERS
+### 4.8 FN economics — DIRECTION LOCKED (2026-08-17) / NUMERICAL PARAMETERS OPEN
 
 ```text
 demand for FlowMesh capacity
@@ -524,7 +524,32 @@ demand for FlowMesh capacity
     -> operator may earn approved stablecoin trading fees
 ```
 
-Exact fee distribution is OPEN. Possible destinations include active FNs, insurance, treasury, or another approved allocation. B3 PoS validators do not automatically receive the FlowMesh fee pool.
+**Locked direction (owner ruling 2026-08-17; full normative text in
+[b3-fn-pod.md](b3-fn-pod.md) §11):** FN has both a **limited total
+supply** (`MAX_FN_EVER_CREATED`, consensus constant, value OPEN — hard
+floor: the complete historical reservation count) and a
+**deterministically increasing creation cost**
+(`RequiredDisintegration(M)` over the modern-creations-ever counter,
+nondecreasing, integer atomic-unit arithmetic, numbers OPEN; supply
+invariants `0 <= H <= R`, `R + M <= C`, `H + M = A + X`, remaining
+modern capacity `= C − R − M` — [b3-fn-pod.md](b3-fn-pod.md) §11.1).
+The combination is intentional: FN
+is a scarce, freely transferable market asset whose future creation
+becomes progressively more expensive. Legacy rights come first: every
+qualifying historical PoD's right is reserved before modern creation
+opens, legacy claimants pay no modern cost, modern issuance never
+consumes a reserved slot, and unclaimed legacy rights remain reserved
+perpetually absent a future explicit expiry policy. Historical claims do
+not advance the modern cost curve. Scarcity counts total-ever-created;
+extinguishment (§4.6 lifecycle, b3-fn-pod.md §10.2) reduces active
+supply only and never reopens a creation slot.
+
+Exact fee distribution remains OPEN. Possible destinations include active
+FNs, insurance, treasury, or another approved allocation. B3 PoS
+validators do not automatically receive the FlowMesh fee pool. The other
+OPEN numerical decisions (cap value, starting cost, tranche size,
+progression, reward amount/schedule, reward cutoff) carry decision tables
+in [b3-fn-pod.md](b3-fn-pod.md) §11.5.
 
 ## 5. FlowMesh DEX
 
