@@ -155,13 +155,40 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->nStatus        = diskindex.nStatus;
                 pindexNew->nTx            = diskindex.nTx;
 
-                // A stored legacy header can be header-only, in which case
-                // its PoW/PoS type is not knowable after restart. Full PoW
-                // blocks and PoS kernels are revalidated when connected.
-                const bool needs_proof_of_work{Consensus::GetB3Era(pindexNew->nHeight, consensusParams) == Consensus::B3Era::MODERN};
-                if (needs_proof_of_work && !CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
-                    LogError("%s: CheckProofOfWork failed: %s\n", __func__, pindexNew->ToString());
-                    return false;
+                // Proof validation at load is selected by the block's
+                // consensus PHASE, never by a two-state era assumption:
+                //  - LEGACY_POS: a stored legacy header can be header-only,
+                //    so its PoW/PoS type is not knowable after restart; full
+                //    PoW blocks and PoS kernels are revalidated on connect.
+                //  - TRANSITION_POW: the corridor's proof is the historical
+                //    B3 scrypt eligibility hash against the header's nBits
+                //    (block identity stays the modern SHA256d hash and is
+                //    deliberately NOT what is checked here).
+                //  - MODERN_POS: the stock SHA256d check remains the
+                //    placeholder until the modern PoS header spec.
+                switch (Consensus::GetConsensusPhase(pindexNew->nHeight, consensusParams)) {
+                case Consensus::ConsensusPhase::LEGACY_POS:
+                    break;
+                case Consensus::ConsensusPhase::TRANSITION_POW: {
+                    CBlockHeader header;
+                    header.nVersion = diskindex.nVersion;
+                    header.hashPrevBlock = diskindex.hashPrev;
+                    header.hashMerkleRoot = diskindex.hashMerkleRoot;
+                    header.nTime = diskindex.nTime;
+                    header.nBits = diskindex.nBits;
+                    header.nNonce = diskindex.nNonce;
+                    if (!CheckTransitionPowEligibility(header)) {
+                        LogError("%s: transition scrypt eligibility failed: %s\n", __func__, pindexNew->ToString());
+                        return false;
+                    }
+                    break;
+                }
+                case Consensus::ConsensusPhase::MODERN_POS:
+                    if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
+                        LogError("%s: CheckProofOfWork failed: %s\n", __func__, pindexNew->ToString());
+                        return false;
+                    }
+                    break;
                 }
 
                 pcursor->Next();
