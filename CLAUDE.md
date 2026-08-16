@@ -13,11 +13,35 @@ consensus) that begins at a single, immutable transition boundary.
 
 Every change must be tested against that statement.
 
+## Authority and precedence
+
+Direct, explicit project-owner decisions are the highest authority. When such a
+decision conflicts with tracked governing documentation, implementation must stop
+until the documentation is reconciled in a reviewed commit. Untracked or
+unreviewed working-tree documents are proposals only and cannot acquire governing
+authority merely by declaring precedence. The persistent order is:
+
+1. Latest explicit project-owner ruling
+2. Reviewed and committed architecture contract / master handoff
+3. Reviewed subordinate design documents
+4. Implementation assumptions
+
 ## Authoritative documents (read before consensus-adjacent work)
 
+- **[doc/design/b3-master-handoff.md](doc/design/b3-master-handoff.md)** — the **top
+  authority**. The complete project concept: one chain, three economic roles (B3+STAKE
+  secures the base chain, FN Coin operates FlowMesh, approved stablecoins denominate
+  trading), the transition corridor, colored assets, FN Coin / Proof of Disintegration,
+  the FlowMesh DEX, microblocks, the 12-step build order, and Claude's operating
+  contract. Where it disagrees with any other document here, **it governs** — subject
+  only to its own §0 precedence order (the owner's later explicit corrections outrank
+  it). Read it before any consensus-adjacent work.
+- **[doc/design/b3-master-handoff-conflicts.md](doc/design/b3-master-handoff-conflicts.md)** —
+  every known disagreement between the master handoff and the older documents, reported
+  rather than silently resolved. Check it before trusting a "LOCKED" label anywhere else.
 - **[doc/design/b3-architecture-contract.md](doc/design/b3-architecture-contract.md)** —
-  the authoritative, locked architecture contract. It supersedes all earlier design
-  notes where they conflict.
+  the locked architecture contract. Authoritative over all earlier design notes, and
+  still binding in every area the master handoff does not contradict.
 - **[doc/design/b3-open-decisions.md](doc/design/b3-open-decisions.md)** — decisions
   that are **not yet locked**. Notably, **modern PoS is UNRESOLVED at the protocol-detail
   level** and must not be implemented until its consensus specification is supplied.

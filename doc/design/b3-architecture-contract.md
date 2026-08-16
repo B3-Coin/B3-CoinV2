@@ -5,6 +5,22 @@ where they conflict. Do not reinterpret these decisions. If an implementation pr
 appears to require changing something here, **stop and report the contradiction** rather
 than choosing a new protocol.
 
+> **Precedence note (2026-08-16).** [b3-master-handoff.md](b3-master-handoff.md) is now
+> the **top authority** among the documents in this directory. This contract remains
+> binding everywhere the handoff does not contradict it — which is nearly everywhere —
+> but where the two disagree, the handoff governs. This document was deliberately
+> **not** rewritten to match; the known disagreements are catalogued in
+> [b3-master-handoff-conflicts.md](b3-master-handoff-conflicts.md).
+>
+> **Precedence safeguard (2026-08-16).** Direct, explicit project-owner decisions
+> are the highest authority. When such a decision conflicts with tracked governing
+> documentation, implementation must stop until the documentation is reconciled in
+> a reviewed commit. Untracked or unreviewed working-tree documents are proposals
+> only and cannot acquire governing authority merely by declaring precedence. The
+> persistent order: (1) latest explicit project-owner ruling; (2) reviewed and
+> committed architecture contract / master handoff; (3) reviewed subordinate
+> design documents; (4) implementation assumptions.
+
 Items marked *(open)* are deliberately unresolved and are tracked in
 [b3-open-decisions.md](b3-open-decisions.md).
 

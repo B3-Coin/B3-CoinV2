@@ -51,24 +51,21 @@ defined over the recoverable facts — the natural candidate being
 "beneficiary = controller of the disintegration transaction's marker
 output" — and never over network-layer state.
 
-## 2. Modern FN creation preserves PoD
+## 2. Modern FN creation preserves PoD — economic intent LOCKED, encoding OPEN
 
-Modern B3 keeps Proof of Disintegration as the FN creation mechanism — it
-is NOT replaced by a generic BURN output. The economic signature is
-preserved: **B3 is permanently sacrificed, and an FN right is created.**
+Modern B3 keeps Proof of Disintegration as the FN creation mechanism in its
+ECONOMIC lineage: **B3 is permanently sacrificed, and an FN right is
+created**; the destroyed amount is permanently excluded from B3 supply and
+never claimable by the block producer; the creation is explicitly
+recognizable by consensus.
 
-    Modern FN creation transaction
-
-    Inputs:   B3 being disintegrated
-    Outputs:  ordinary change / payment outputs
-              one explicit FN ownership (FN Coin) output
-    Gap:      exactly the required PoD amount (plus the ordinary fee)
-
-    invariant:  inputs − outputs − ordinary_fee = PoD amount
-
-The PoD amount remains permanently excluded from B3 supply; the miner can
-never claim it; a modern FN creation transaction is explicitly recognizable
-by consensus (no ambiguity between fee and destruction).
+**The modern ENCODING is OPEN** (master handoff §4.6; owner reconciliation
+2026-08-16): whether the modern transaction expresses the destruction as an
+implicit accounting gap (the historical shape) or through an explicit
+visible burn primitive (which modern conservation would otherwise require)
+is an unresolved owner decision. It must not be selected during the legacy
+FN claim work, which is unrelated: legacy claims mint FN Coins for
+destruction that already happened historically.
 
 ### PoD is not BURN
 
@@ -397,13 +394,14 @@ Persisted node state, all reorg-managed and reconstructible:
 
 ## 9. Decision status
 
-**LOCKED / DESIGN DIRECTION:** historical FN creation = PoD; PoD is
-implicit destruction through the accounting gap; PoD value is never a miner
-fee; PoD permanently reduces B3 spendable supply; modern FN creation
-preserves PoD rather than generic BURN; modern FN ownership is explicit and
-on-chain; FN Coin is separate from B3 supply; one PoD event creates at most
-one FN; historical and modern mechanisms share lineage but not encoding;
-mainnet historical collateral rules unchanged.
+**LOCKED / DESIGN DIRECTION:** historical FN creation = PoD; historical PoD
+is implicit destruction through the accounting gap; PoD value is never a
+miner fee; PoD permanently reduces B3 spendable supply; modern FN creation
+preserves PoD's ECONOMIC lineage (PoD remains semantically distinct from
+generic BURN — the modern ENCODING is OPEN, §2); modern FN ownership is
+explicit and on-chain; FN Coin is separate from B3 supply; one PoD event
+creates at most one FN; historical and modern mechanisms share lineage but
+not encoding; mainnet historical collateral rules unchanged.
 
 **LOCKED for the legacy-claim MVP (2026-08-16, integrated scan-and-claim):**
 every qualifying historical PoD (gap ≥ tier, through H) → exactly one FN
