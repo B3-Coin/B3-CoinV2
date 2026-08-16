@@ -50,6 +50,21 @@ inline constexpr size_t STAKE_RESERVED_SIZE{2};
 inline constexpr size_t STAKE_PAYLOAD_SIZE{STAKE_MAGIC.size() + STAKE_VALIDATOR_KEY_SIZE +
                                            STAKE_RESERVED_SIZE};
 
+/**
+ * STAKE_ACTIVATION_DEPTH — the precise maturity rule (never expressed in
+ * confirmation-count terms, which carry an off-by-one ambiguity): a STAKE
+ * output created in the block at height `b` is MATURE at height `h` iff
+ * h - b >= STAKE_ACTIVATION_DEPTH, i.e. from height b + 20 onward. Immature
+ * stake carries no weight and joins no registry.
+ */
+inline constexpr int STAKE_ACTIVATION_DEPTH{20};
+
+//! The exact maturity comparison; the single place the rule is written.
+constexpr bool IsStakeMature(const int create_height, const int current_height)
+{
+    return current_height - create_height >= STAKE_ACTIVATION_DEPTH;
+}
+
 //! The consensus view of one STAKE output.
 struct StakeOutputView {
     CAmount amount{0};

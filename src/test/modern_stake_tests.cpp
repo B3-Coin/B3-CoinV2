@@ -121,4 +121,17 @@ BOOST_AUTO_TEST_CASE(claiming_but_malformed_outputs_are_invalid)
     BOOST_CHECK(!modern::CheckStakeOutputs(CTransaction{tx}, error));
 }
 
+BOOST_AUTO_TEST_CASE(stake_activation_depth_exact_boundary)
+{
+    // h - b >= 20, exactly: created at b, immature through b+19, mature at
+    // b+20. Written against the constant so a drift in either fails here.
+    BOOST_CHECK_EQUAL(modern::STAKE_ACTIVATION_DEPTH, 20);
+    constexpr int b{1'000};
+    BOOST_CHECK(!modern::IsStakeMature(b, b));
+    BOOST_CHECK(!modern::IsStakeMature(b, b + 1));
+    BOOST_CHECK(!modern::IsStakeMature(b, b + modern::STAKE_ACTIVATION_DEPTH - 1));
+    BOOST_CHECK(modern::IsStakeMature(b, b + modern::STAKE_ACTIVATION_DEPTH));
+    BOOST_CHECK(modern::IsStakeMature(b, b + modern::STAKE_ACTIVATION_DEPTH + 1));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
