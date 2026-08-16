@@ -1940,4 +1940,207 @@ BOOST_AUTO_TEST_CASE(transition_pow_corridor_production)
     BOOST_CHECK_EQUAL(tip()->nHeight, H + CORRIDOR);
 }
 
+//! Legacy UTXO -> modern OWNER crossing (stage 4): inside the corridor, a
+//! modern transaction spends pre-H coins through the LEGACY_LOCK view under
+//! the FROZEN legacy script rules — proven by a witness-program-shaped
+//! legacy script that modern flags would refuse and the frozen rules accept
+//! — while the same script created as a MODERN coin is refused under modern
+//! rules, and the frozen legacy maturity rides with legacy coinbases.
+BOOST_AUTO_TEST_CASE(legacy_lock_crossing_spend)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int H{32};
+    constexpr uint32_t EASY_BITS{0x207fffff};
+    const auto tip{[&] { return WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()); }};
+
+    const auto build_legacy{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (prev->nHeight + 1) << CScriptNum{99};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, prev->nHeight + 1, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) {
+            mtx.m_legacy_encoding = true;
+            block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        return block;
+    }};
+
+    // Legacy chain: 31 plain blocks, then H = 32 carries a spend of the
+    // (matured) coinbase 1 into a witness-program-SHAPED legacy script:
+    // OP_0 <32 bytes>. Historically creatable; under frozen legacy rules it
+    // is a plain push script, under modern flags it demands witness data.
+    Txid coinbase1{};
+    Txid coinbase31{};
+    for (int height{1}; height <= H - 1; ++height) {
+        const auto submitted{CodecRoundTrip(build_legacy(tip(), {}))};
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(submitted, true, true, &new_block));
+        if (height == 1) coinbase1 = submitted->vtx[0]->GetHash();
+        if (height == 31) coinbase31 = submitted->vtx[0]->GetHash();
+    }
+    const CScript witness_shaped{CScript() << OP_0 << std::vector<unsigned char>(32, 0xab)};
+    CMutableTransaction lock_spend;
+    lock_spend.version = 1;
+    lock_spend.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 17);
+    lock_spend.vin.resize(1);
+    lock_spend.vin[0].prevout = COutPoint{coinbase1, 0};
+    lock_spend.vin[0].scriptSig = CScript{};
+    lock_spend.vout.emplace_back(legacy::GetProofOfWorkReward(0, 1, consensus), witness_shaped);
+    const auto block_h{CodecRoundTrip(build_legacy(tip(), {lock_spend}))};
+    const Txid witness_shaped_txid{block_h->vtx[1]->GetHash()};
+    {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(block_h, true, true, &new_block));
+    }
+    BOOST_REQUIRE_EQUAL(tip()->nHeight, H);
+
+    mutable_consensus.hard_fork_height = H + 1;
+    mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
+    mutable_consensus.transition_pow_length = 8;
+    mutable_consensus.transition_pow_bits = EASY_BITS;
+
+    const auto build_corridor{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 2;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << CScriptNum{prev->nHeight + 1} << CScriptNum{7};
+        coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = EASY_BITS;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.nNonce = 0;
+        while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
+        return block;
+    }};
+
+    // Corridor block H+1: a MODERN transaction spends the witness-shaped
+    // legacy coin with an empty scriptSig — valid ONLY under the frozen
+    // legacy rule set — and a matured legacy coinbase, creating ordinary
+    // modern outputs (the OWNER policy view).
+    const CScript owner_script{CScript() << std::vector<unsigned char>(24, 0xc4) << OP_DROP << OP_TRUE};
+    CMutableTransaction crossing;
+    crossing.version = 2;
+    crossing.vin.resize(1);
+    crossing.vin[0].prevout = COutPoint{witness_shaped_txid, 0};
+    crossing.vin[0].scriptSig = CScript{};
+    crossing.vout.emplace_back(legacy::GetProofOfWorkReward(0, 1, consensus) - 1000, owner_script);
+    const Txid crossing_txid{CTransaction{crossing}.GetHash()};
+    {
+        CBlock block{build_corridor(tip(), {crossing})};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+                              "crossing spend refused");
+        BOOST_REQUIRE(new_block);
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 1);
+    }
+    {
+        LOCK(cs_main);
+        CCoinsViewCache& coins{chainman.ActiveChainstate().CoinsTip()};
+        BOOST_CHECK(!coins.HaveCoin(COutPoint{witness_shaped_txid, 0}));
+        const Coin& owner{coins.AccessCoin(COutPoint{crossing_txid, 0})};
+        BOOST_REQUIRE(!owner.IsSpent());
+        BOOST_CHECK(owner.out.scriptPubKey == owner_script);
+        BOOST_CHECK(!owner.fCoinBase);
+        BOOST_CHECK_EQUAL(owner.nHeight, static_cast<uint32_t>(H + 1));
+    }
+
+    // Control: the SAME witness-shaped script created as a MODERN coin is
+    // governed by modern rules — an empty-scriptSig spend is refused.
+    CMutableTransaction make_modern_witness_shaped;
+    make_modern_witness_shaped.version = 2;
+    make_modern_witness_shaped.vin.resize(1);
+    make_modern_witness_shaped.vin[0].prevout = COutPoint{crossing_txid, 0};
+    make_modern_witness_shaped.vin[0].scriptSig = CScript{};
+    make_modern_witness_shaped.vout.emplace_back(
+        legacy::GetProofOfWorkReward(0, 1, consensus) - 2000, witness_shaped);
+    const Txid modern_ws_txid{CTransaction{make_modern_witness_shaped}.GetHash()};
+    {
+        CBlock block{build_corridor(tip(), {make_modern_witness_shaped})};
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block));
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 2);
+    }
+    {
+        CMutableTransaction bad_spend;
+        bad_spend.version = 2;
+        bad_spend.vin.resize(1);
+        bad_spend.vin[0].prevout = COutPoint{modern_ws_txid, 0};
+        bad_spend.vin[0].scriptSig = CScript{};
+        bad_spend.vout.emplace_back(1000, owner_script);
+        CBlock block{build_corridor(tip(), {bad_spend})};
+        LOCK(cs_main);
+        const BlockValidationState state{TestBlockValidity(
+            chainman.ActiveChainstate(), block, /*check_pow=*/true, /*check_merkle_root=*/true)};
+        BOOST_REQUIRE(state.IsInvalid());
+        BOOST_CHECK(state.GetRejectReason().find("block-script-verify-flag-failed") != std::string::npos);
+    }
+
+    // The frozen legacy maturity rides with legacy coins: coinbase 31 has
+    // depth 3 < 30 at H + 3 and is refused; after enough corridor burial the
+    // same spend connects.
+    CMutableTransaction premature;
+    premature.version = 2;
+    premature.vin.resize(1);
+    premature.vin[0].prevout = COutPoint{coinbase31, 0};
+    premature.vin[0].scriptSig = CScript{};
+    premature.vout.emplace_back(legacy::GetProofOfWorkReward(0, 31, consensus) - 1000, owner_script);
+    {
+        CBlock block{build_corridor(tip(), {premature})};
+        LOCK(cs_main);
+        const BlockValidationState state{TestBlockValidity(
+            chainman.ActiveChainstate(), block, /*check_pow=*/true, /*check_merkle_root=*/true)};
+        BOOST_REQUIRE(state.IsInvalid());
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-txns-premature-spend-of-legacy-coin");
+    }
+    // Bury to depth >= 30 for coinbase 31 (spend height must reach 61) while
+    // staying inside the corridor? Depth 30 needs height 61 > corridor end
+    // (H + 8 = 40): instead prove the positive control with coinbase at
+    // height 5, depth 37 at the next corridor height.
+    {
+        // Rebuild a positive-control spend of an old, deep coinbase.
+        // coinbase1 is spent; use the block-2 coinbase via its known pattern:
+        // heights 2..31 all hold OP_TRUE coinbases; fetch block 2's coinbase
+        // from the chain index.
+        const CBlockIndex* idx2{WITH_LOCK(cs_main, return chainman.ActiveChain()[2])};
+        CBlock block2;
+        BOOST_REQUIRE(chainman.m_blockman.ReadBlock(block2, *idx2));
+        const Txid coinbase2{block2.vtx[0]->GetHash()};
+        CMutableTransaction deep;
+        deep.version = 2;
+        deep.vin.resize(1);
+        deep.vin[0].prevout = COutPoint{coinbase2, 0};
+        deep.vin[0].scriptSig = CScript{};
+        deep.vout.emplace_back(legacy::GetProofOfWorkReward(0, 2, consensus) - 1000, owner_script);
+        CBlock block{build_corridor(tip(), {deep})};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+                              "deep legacy coinbase crossing refused");
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 3);
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -414,6 +414,18 @@ BlockValidationState TestBlockValidity(
     bool check_pow,
     bool check_merkle_root) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+/**
+ * Frozen legacy-lock spend context for MODERN-era B3 transactions: an input
+ * whose coin was created at height <= final_height (a pre-H legacy coin,
+ * LEGACY_LOCK policy view) is verified under the frozen legacy script rule
+ * set instead of the modern flags. Ownership of historical outputs is proven
+ * exactly the way the historical chain proved it.
+ */
+struct LegacyLockSpendContext {
+    int final_height;
+    script_verify_flags legacy_flags;
+};
+
 /** Check that the proof of work on each blockheader matches the value in nBits */
 bool HasValidProofOfWork(std::span<const CBlockHeader> headers, const Consensus::Params& consensusParams);
 

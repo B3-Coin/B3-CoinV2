@@ -9,6 +9,7 @@
 #include <script/verify_flags.h>
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 class CBlockIndex;
@@ -25,7 +26,14 @@ namespace Consensus {
  * @param[out] txfee Set to the transaction fee if successful.
  * Preconditions: tx.IsCoinBase() is false.
  */
-[[nodiscard]] bool CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmount& txfee);
+/**
+ * When `legacy_final_height` is provided (a MODERN-era B3 spend context), an
+ * input coin created at or below that height is a pre-H legacy coin: its
+ * coinbase/coinstake maturity follows the frozen legacy rule (30 blocks,
+ * covering coinstake outputs the stock rule does not know), while modern
+ * coins keep the stock coinbase maturity.
+ */
+[[nodiscard]] bool CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmount& txfee, std::optional<int> legacy_final_height = std::nullopt);
 } // namespace Consensus
 
 /** Auxiliary functions for transaction validation (ideally should not be exposed) */
