@@ -69,12 +69,20 @@ inline constexpr size_t MAX_POLICY_PARAMS_SIZE{80};
  *    shard id, so custody spreads over many parallel UTXOs. A vault has
  *    no private key: spending is authorized only by finalized withdrawal
  *    receipts. Same test-only activation as the asset policy set.
+ *  - STAKE: locked native B3 carrying a validator binding (modern/stake.h
+ *    defines the v1 on-chain carrier). v1: the commitment is the owner
+ *    binding (SHA256 of the owner script suffix, the OWNER scheme) and
+ *    params are the 32-byte validator key plus 2 zero reserved bytes.
+ *    Weight aggregates per validator key, never per output. Active from
+ *    the modern era's first block: STAKE creation during the temporary-PoW
+ *    corridor is what prepares the initial validator registry.
  */
 enum class PolicyType : uint16_t {
     LEGACY_LOCK = 0,
     OWNER = 1,
     BURN = 2,
     DEX_VAULT = 3,
+    STAKE = 4,
 };
 
 //! DEX_VAULT v1 params: exactly a little-endian 2-byte shard id.
@@ -119,7 +127,8 @@ inline bool IsActivatedPolicy(const uint16_t policy_type, const uint16_t policy_
 {
     if (policy_version != POLICY_VERSION_V1) return false;
     if (policy_type == static_cast<uint16_t>(PolicyType::LEGACY_LOCK) ||
-        policy_type == static_cast<uint16_t>(PolicyType::OWNER)) {
+        policy_type == static_cast<uint16_t>(PolicyType::OWNER) ||
+        policy_type == static_cast<uint16_t>(PolicyType::STAKE)) {
         return true;
     }
     if (policy_type == static_cast<uint16_t>(PolicyType::BURN) ||

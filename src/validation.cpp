@@ -35,6 +35,7 @@
 #include <legacy/consensus.h>
 #include <legacy/replay.h>
 #include <modern/pos.h>
+#include <modern/stake.h>
 #include <logging/timer.h>
 #include <node/blockstorage.h>
 #include <node/utxo_snapshot.h>
@@ -850,6 +851,14 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     if (next_block_legacy != tx.IsLegacyEncoded()) {
         return state.Invalid(TxValidationResult::TX_CONSENSUS,
                              next_block_legacy ? "modern-txn-in-legacy-era" : "legacy-txn-in-modern-era");
+    }
+    if (!next_block_legacy) {
+        // Modern-era admission: a malformed STAKE-claiming output can never
+        // be mined (ContextualCheckBlock enforces the same rule), so refuse
+        // it here.
+        if (std::string stake_error; !modern::CheckStakeOutputs(tx, stake_error)) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-stake-output", stake_error);
+        }
     }
 
     if (!CheckTransaction(tx, state)) {
@@ -5149,6 +5158,18 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
         // is header-only. The mandatory target check is repeated in
         // ConnectBlock after every parent has been connected.
         return ContextualCheckLegacyBlock(block, state, consensus_params, pindexPrev, /*check_target=*/false);
+    }
+
+    // MODERN-era B3 blocks: every output claiming the STAKE magic must be a
+    // valid v1 STAKE output — a malformed claim is a block failure, never a
+    // silent reinterpretation as an ordinary output.
+    if (consensus_params.legacy_b3coin) {
+        for (const auto& tx : block.vtx) {
+            if (std::string stake_error; !modern::CheckStakeOutputs(*tx, stake_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-stake-output",
+                                     strprintf("%s in transaction %s", stake_error, tx->GetHash().ToString()));
+            }
+        }
     }
 
     // Enforce BIP113 (Median Time Past).

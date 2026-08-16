@@ -29,6 +29,7 @@
 #include <node/utxo_rows.h>
 #include <kernel/mempool_removal_reason.h>
 #include <modern/pos.h>
+#include <modern/stake.h>
 #include <node/mempool_persist.h>
 #include <node/miner.h>
 #include <pow.h>
@@ -2140,6 +2141,162 @@ BOOST_AUTO_TEST_CASE(legacy_lock_crossing_spend)
         BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
                               "deep legacy coinbase crossing refused");
         BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 3);
+    }
+}
+
+//! STAKE policy in the corridor (stage 5): a real STAKE Policy Output is
+//! created from legacy value crossing through LEGACY_LOCK, a malformed
+//! STAKE-claiming output is a block consensus failure, and cancelling is an
+//! ordinary owner spend of the principal (self-policing).
+BOOST_AUTO_TEST_CASE(stake_policy_in_corridor)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int H{32};
+    constexpr uint32_t EASY_BITS{0x207fffff};
+    const auto tip{[&] { return WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()); }};
+
+    const auto build_legacy{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (prev->nHeight + 1) << CScriptNum{99};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, prev->nHeight + 1, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) {
+            mtx.m_legacy_encoding = true;
+            block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        return block;
+    }};
+    const auto build_corridor{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 2;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << CScriptNum{prev->nHeight + 1} << CScriptNum{7};
+        coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = EASY_BITS;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.nNonce = 0;
+        while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
+        return block;
+    }};
+
+    // Legacy history; H carries a spend of the matured coinbase 1 into a
+    // plain legacy value coin (non-coinbase: no crossing maturity).
+    Txid coinbase1{};
+    for (int height{1}; height <= H - 1; ++height) {
+        const auto submitted{CodecRoundTrip(build_legacy(tip(), {}))};
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(submitted, true, true, &new_block));
+        if (height == 1) coinbase1 = submitted->vtx[0]->GetHash();
+    }
+    CMutableTransaction fund;
+    fund.version = 1;
+    fund.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 17);
+    fund.vin.resize(1);
+    fund.vin[0].prevout = COutPoint{coinbase1, 0};
+    fund.vin[0].scriptSig = CScript{};
+    fund.vout.emplace_back(legacy::GetProofOfWorkReward(0, 1, consensus), CScript() << OP_TRUE);
+    const auto block_h{CodecRoundTrip(build_legacy(tip(), {fund}))};
+    const Txid fund_txid{block_h->vtx[1]->GetHash()};
+    {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(block_h, true, true, &new_block));
+    }
+    mutable_consensus.hard_fork_height = H + 1;
+    mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
+    mutable_consensus.transition_pow_length = 6;
+    mutable_consensus.transition_pow_bits = EASY_BITS;
+
+    // Corridor block 1: legacy value crosses into a real STAKE output plus
+    // ordinary change.
+    std::array<unsigned char, 32> validator_key{};
+    validator_key.fill(0x42);
+    const CScript owner{CScript() << OP_TRUE};
+    const CAmount principal{legacy::GetProofOfWorkReward(0, 1, consensus) / 2};
+    CMutableTransaction stake_tx;
+    stake_tx.version = 2;
+    stake_tx.vin.resize(1);
+    stake_tx.vin[0].prevout = COutPoint{fund_txid, 0};
+    stake_tx.vin[0].scriptSig = CScript{};
+    stake_tx.vout.emplace_back(principal, modern::MakeStakeScript(validator_key, owner));
+    stake_tx.vout.emplace_back(legacy::GetProofOfWorkReward(0, 1, consensus) - principal - 1000,
+                               CScript() << OP_TRUE);
+    const Txid stake_txid{CTransaction{stake_tx}.GetHash()};
+    {
+        CBlock block{build_corridor(tip(), {stake_tx})};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+                              "stake creation refused");
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 1);
+    }
+    {
+        LOCK(cs_main);
+        const Coin& stake{chainman.ActiveChainstate().CoinsTip().AccessCoin(COutPoint{stake_txid, 0})};
+        BOOST_REQUIRE(!stake.IsSpent());
+        BOOST_REQUIRE(modern::ClaimsStakeMagic(stake.out.scriptPubKey));
+        std::string error;
+        const auto view{modern::ParseStakeOutput(stake.out, error)};
+        BOOST_REQUIRE_MESSAGE(view.has_value(), error);
+        BOOST_CHECK_EQUAL(view->amount, principal);
+        BOOST_CHECK(view->validator_key == validator_key);
+        BOOST_CHECK(view->owner_script == owner);
+    }
+
+    // A malformed STAKE claim (zero validator key) is a block failure.
+    {
+        CMutableTransaction bad;
+        bad.version = 2;
+        bad.vin.resize(1);
+        bad.vin[0].prevout = COutPoint{stake_txid, 1};
+        bad.vin[0].scriptSig = CScript{};
+        bad.vout.emplace_back(1000, modern::MakeStakeScript(std::array<unsigned char, 32>{}, owner));
+        CBlock block{build_corridor(tip(), {bad})};
+        LOCK(cs_main);
+        const BlockValidationState state{TestBlockValidity(
+            chainman.ActiveChainstate(), block, /*check_pow=*/true, /*check_merkle_root=*/true)};
+        BOOST_REQUIRE(state.IsInvalid());
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-stake-output");
+    }
+
+    // Cancelling is an ordinary owner spend of the principal.
+    {
+        CMutableTransaction cancel;
+        cancel.version = 2;
+        cancel.vin.resize(1);
+        cancel.vin[0].prevout = COutPoint{stake_txid, 0};
+        cancel.vin[0].scriptSig = CScript{};
+        cancel.vout.emplace_back(principal - 1000, CScript() << OP_TRUE);
+        CBlock block{build_corridor(tip(), {cancel})};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+                              "stake cancel refused");
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 2);
+        LOCK(cs_main);
+        BOOST_CHECK(!chainman.ActiveChainstate().CoinsTip().HaveCoin(COutPoint{stake_txid, 0}));
     }
 }
 
