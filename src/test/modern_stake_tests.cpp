@@ -3,6 +3,7 @@
 // file COPYING or https://opensource.org/license/mit/.
 
 #include <consensus/params.h>
+#include <crypto/sha256.h>
 #include <modern/policy.h>
 #include <modern/stake.h>
 #include <node/stake_registry.h>
@@ -213,16 +214,33 @@ BOOST_AUTO_TEST_CASE(validator_weight_aggregates_per_key)
     const int eval_height{H + 1 + modern::STAKE_ACTIVATION_DEPTH};
     const node::StakeRegistry registry{node::DeriveStakeRegistry(entries, eval_height, params)};
 
-    BOOST_REQUIRE_EQUAL(registry.weights.size(), 2U);
-    BOOST_CHECK_EQUAL(registry.weights.at(key_a), total);
-    BOOST_CHECK_EQUAL(registry.weights.at(key_b), total); // split == single
+    BOOST_REQUIRE_EQUAL(registry.validators.size(), 2U);
+    BOOST_CHECK_EQUAL(registry.validators.at(key_a).total_weight, total);
+    BOOST_CHECK_EQUAL(registry.validators.at(key_b).total_weight, total); // split == single
     BOOST_CHECK_EQUAL(registry.total_weight, 2 * total);
     BOOST_CHECK_EQUAL(registry.mature_outputs, 11U);
     BOOST_CHECK_EQUAL(registry.immature_outputs, 1U);
+    BOOST_CHECK_EQUAL(registry.WeightView().at(key_b), total);
 
-    // One block earlier the H+1 outputs are not yet mature.
+    // Per-output attribution is retained: validator A has one record with
+    // its outpoint, amount, creation height, ACTIVE state and the owner
+    // binding; validator B keeps 10 ACTIVE records plus 1 PENDING.
+    const node::ValidatorRecord& rec_a{registry.validators.at(key_a)};
+    BOOST_REQUIRE_EQUAL(rec_a.outputs.size(), 1U);
+    BOOST_CHECK(rec_a.outputs[0].outpoint == COutPoint(Txid::FromUint256(uint256::ONE), 0));
+    BOOST_CHECK_EQUAL(rec_a.outputs[0].amount, total);
+    BOOST_CHECK_EQUAL(rec_a.outputs[0].creation_height, H + 1);
+    BOOST_CHECK(rec_a.outputs[0].active);
+    uint256 expected_owner;
+    CSHA256().Write(owner.data(), owner.size()).Finalize(expected_owner.begin());
+    BOOST_CHECK_EQUAL(rec_a.outputs[0].owner_commitment.GetHex(), expected_owner.GetHex());
+    BOOST_CHECK_EQUAL(registry.validators.at(key_b).outputs.size(), 11U);
+
+    // One block earlier the H+1 outputs are not yet mature: attribution
+    // remains (both validators present) with zero weight.
     const node::StakeRegistry early{node::DeriveStakeRegistry(entries, eval_height - 1, params)};
-    BOOST_CHECK(early.weights.empty());
+    BOOST_CHECK_EQUAL(early.total_weight, 0);
+    BOOST_CHECK_EQUAL(early.validators.at(key_a).total_weight, 0);
     BOOST_CHECK_EQUAL(early.immature_outputs, 12U);
 }
 

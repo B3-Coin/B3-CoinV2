@@ -2465,13 +2465,16 @@ BOOST_AUTO_TEST_CASE(full_corridor_end_to_end)
         chainman.ActiveChainstate().ForceFlushStateToDisk();
         const node::StakeRegistry registry{node::DeriveStakeRegistry(
             chainman.ActiveChainstate().CoinsDB(), H + CORRIDOR, consensus)};
-        BOOST_REQUIRE_EQUAL(registry.weights.size(), 2U);
-        BOOST_CHECK_EQUAL(registry.weights.at(key_a), stake_total);
-        BOOST_CHECK_EQUAL(registry.weights.at(key_b), stake_total);
+        BOOST_REQUIRE_EQUAL(registry.validators.size(), 3U);
+        BOOST_CHECK_EQUAL(registry.validators.at(key_a).total_weight, stake_total);
+        BOOST_CHECK_EQUAL(registry.validators.at(key_b).total_weight, stake_total);
+        BOOST_CHECK_EQUAL(registry.validators.at(key_b).outputs.size(), 3U);
         BOOST_CHECK_EQUAL(registry.total_weight, 2 * stake_total);
         BOOST_CHECK_EQUAL(registry.mature_outputs, 4U);
         BOOST_CHECK_EQUAL(registry.immature_outputs, 1U); // validator C
-        BOOST_CHECK(!registry.weights.contains(key_c));
+        BOOST_CHECK_EQUAL(registry.validators.at(key_c).total_weight, 0); // PENDING, attributed
+        BOOST_REQUIRE_EQUAL(registry.validators.at(key_c).outputs.size(), 1U);
+        BOOST_CHECK(!registry.validators.at(key_c).outputs[0].active);
     }
 
     // ---- Phase C begins: H+1001 is modern PoS, and with no rule set

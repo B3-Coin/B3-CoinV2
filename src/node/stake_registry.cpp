@@ -5,6 +5,7 @@
 #include <node/stake_registry.h>
 
 #include <consensus/era.h>
+#include <crypto/sha256.h>
 
 #include <string>
 
@@ -25,13 +26,26 @@ StakeRegistry DeriveStakeRegistry(const std::vector<UtxoEntry>& entries, const i
         // A connected chain cannot contain an invalid claiming output
         // (ContextualCheckBlock enforces it); stay total anyway.
         if (!view) continue;
-        if (!modern::IsStakeMature(static_cast<int>(entry.coin.nHeight), current_height)) {
+
+        StakeOutputRecord record;
+        record.outpoint = entry.outpoint;
+        record.amount = view->amount;
+        record.creation_height = static_cast<int>(entry.coin.nHeight);
+        record.active = modern::IsStakeMature(record.creation_height, current_height);
+        CSHA256()
+            .Write(view->owner_script.data(), view->owner_script.size())
+            .Finalize(record.owner_commitment.begin());
+
+        ValidatorRecord& validator{registry.validators[view->validator_key]};
+        validator.key = view->validator_key;
+        if (record.active) {
+            ++registry.mature_outputs;
+            validator.total_weight += record.amount;
+            registry.total_weight += record.amount;
+        } else {
             ++registry.immature_outputs;
-            continue;
         }
-        ++registry.mature_outputs;
-        registry.weights[view->validator_key] += view->amount;
-        registry.total_weight += view->amount;
+        validator.outputs.push_back(std::move(record));
     }
     return registry;
 }
