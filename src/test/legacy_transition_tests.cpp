@@ -32,6 +32,8 @@
 #include <modern/stake.h>
 #include <node/mempool_persist.h>
 #include <node/miner.h>
+#include <node/chainstate.h>
+#include <node/kernel_notifications.h>
 #include <node/stake_registry.h>
 #include <pow.h>
 #include <primitives/block.h>
@@ -2380,10 +2382,35 @@ BOOST_AUTO_TEST_CASE(full_corridor_end_to_end)
         return block;
     }};
     const auto submit_corridor{[&](std::vector<CMutableTransaction> txs) {
+        SetMockTime(std::max<int64_t>(MOCK_NOW, tip()->GetBlockTime() + 60));
         CBlock block{build_corridor(tip(), std::move(txs))};
         bool new_block{false};
         BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
                               "corridor block at height " << tip()->nHeight + 1 << " rejected");
+        BOOST_REQUIRE(new_block);
+    }};
+    // Mining-path checkpoint: the ASSEMBLER produces the corridor block —
+    // marker-modern template with the corridor difficulty and a
+    // fees-plus-corridor-reward coinbase — then the shared scrypt grind and
+    // the ordinary submit path connect it.
+    const auto assemble_and_submit{[&](const CAmount expected_fees) {
+        SetMockTime(std::max<int64_t>(MOCK_NOW, tip()->GetBlockTime() + 60));
+        node::BlockAssembler::Options options;
+        options.coinbase_output_script = CScript() << OP_TRUE;
+        options.include_dummy_extranonce = true;
+        const auto tmpl{node::BlockAssembler(chainman.ActiveChainstate(), m_node.mempool.get(), options)
+                            .CreateNewBlock()};
+        BOOST_REQUIRE(tmpl);
+        CBlock block{tmpl->block};
+        BOOST_CHECK(Consensus::HasB3BlockCodecV2(block.nVersion));
+        BOOST_CHECK_EQUAL(block.nBits, EASY_BITS);
+        BOOST_CHECK_EQUAL(block.vtx[0]->GetValueOut(), expected_fees); // fees only, reward param 0
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.nNonce = 0;
+        while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+                              "assembled corridor block at height " << tip()->nHeight + 1 << " rejected");
         BOOST_REQUIRE(new_block);
     }};
 
@@ -2444,7 +2471,16 @@ BOOST_AUTO_TEST_CASE(full_corridor_end_to_end)
     stake_a.vout.emplace_back(stake_total, modern::MakeStakeScript(key_a, owner));
     stake_a.vout.emplace_back(fund_total / 2 - stake_total - 1000, CScript() << OP_TRUE);
     const Txid stake_a_txid{CTransaction{stake_a}.GetHash()};
-    submit_corridor({stake_a}); // H+1
+    {
+        // H+1 through the full production path: mempool admission of the
+        // crossing STAKE transaction, template creation, grind, submit.
+        const auto res{chainman.ProcessTransaction(MakeTransactionRef(stake_a))};
+        BOOST_REQUIRE_MESSAGE(res.m_result_type == MempoolAcceptResult::ResultType::VALID,
+                              "stake_a mempool admission failed: " << res.m_state.ToString());
+        assemble_and_submit(/*expected_fees=*/1000);
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 1);
+        BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
+    }
 
     CMutableTransaction stake_b;
     stake_b.version = 2;
@@ -2458,6 +2494,9 @@ BOOST_AUTO_TEST_CASE(full_corridor_end_to_end)
     const Txid change_b_txid{CTransaction{stake_b}.GetHash()};
     submit_corridor({stake_b}); // H+2
 
+    while (tip()->nHeight < H + 499) submit_corridor({});
+    assemble_and_submit(/*expected_fees=*/0); // H+500 via the mining path
+    BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 500);
     while (tip()->nHeight < H + CORRIDOR - 5) submit_corridor({});
 
     CMutableTransaction stake_c;
@@ -2468,7 +2507,8 @@ BOOST_AUTO_TEST_CASE(full_corridor_end_to_end)
     stake_c.vout.emplace_back(100'000, modern::MakeStakeScript(key_c, owner));
     submit_corridor({stake_c}); // H+996
 
-    while (tip()->nHeight < H + CORRIDOR) submit_corridor({});
+    while (tip()->nHeight < H + CORRIDOR - 1) submit_corridor({});
+    assemble_and_submit(/*expected_fees=*/0); // H+1000 via the mining path
     BOOST_REQUIRE_EQUAL(tip()->nHeight, H + CORRIDOR);
 
     // ---- The registry at the corridor end: A and B carry the identical
@@ -2713,6 +2753,181 @@ BOOST_FIXTURE_TEST_CASE(corridor_restart_and_reindex, TransitionDiskSetup)
         BOOST_CHECK(!rec.outputs[0].active);
         BOOST_CHECK_EQUAL(rec.outputs[0].amount, 200'000);
         BOOST_CHECK_EQUAL(rec.outputs[0].creation_height, H + 1);
+    }
+}
+
+//! Two-node corridor sync: node A builds the evolution chain (legacy
+//! history, frozen boundary, corridor with STAKE creation); node B starts
+//! from nothing but the same consensus parameters and syncs block by block
+//! through the transition — exercising exactly the pinned-boundary path a
+//! fresh node takes. Same tip, same UTXO commitment, same derived registry.
+BOOST_AUTO_TEST_CASE(two_node_corridor_sync)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int H{32};
+    constexpr int CORRIDOR{40};
+    constexpr uint32_t EASY_BITS{0x207fffff};
+    const auto tip{[&] { return WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()); }};
+
+    const auto build_legacy{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (prev->nHeight + 1) << CScriptNum{99};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, prev->nHeight + 1, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) {
+            mtx.m_legacy_encoding = true;
+            block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        return block;
+    }};
+    const auto build_corridor{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 2;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << CScriptNum{prev->nHeight + 1} << CScriptNum{7};
+        coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = EASY_BITS;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.nNonce = 0;
+        while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
+        return block;
+    }};
+
+    // ---- Node A builds the chain: legacy history with a crossing fund,
+    // frozen boundary, corridor with a STAKE and its cancellation-free life.
+    Txid coinbase1{};
+    for (int height{1}; height <= H - 1; ++height) {
+        const auto submitted{CodecRoundTrip(build_legacy(tip(), {}))};
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(submitted, true, true, &new_block));
+        if (height == 1) coinbase1 = submitted->vtx[0]->GetHash();
+    }
+    CMutableTransaction fund;
+    fund.version = 1;
+    fund.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 17);
+    fund.vin.resize(1);
+    fund.vin[0].prevout = COutPoint{coinbase1, 0};
+    fund.vin[0].scriptSig = CScript{};
+    fund.vout.emplace_back(legacy::GetProofOfWorkReward(0, 1, consensus), CScript() << OP_TRUE);
+    const auto block_h{CodecRoundTrip(build_legacy(tip(), {fund}))};
+    const Txid fund_txid{block_h->vtx[1]->GetHash()};
+    {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(block_h, true, true, &new_block));
+    }
+    mutable_consensus.hard_fork_height = H + 1;
+    mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
+    mutable_consensus.transition_pow_length = CORRIDOR;
+    mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.min_stake_amount = 1000;
+
+    std::array<unsigned char, 32> validator_key{};
+    validator_key.fill(0x77);
+    CMutableTransaction stake_tx;
+    stake_tx.version = 2;
+    stake_tx.vin.resize(1);
+    stake_tx.vin[0].prevout = COutPoint{fund_txid, 0};
+    stake_tx.vin[0].scriptSig = CScript{};
+    stake_tx.vout.emplace_back(300'000, modern::MakeStakeScript(validator_key, CScript() << OP_TRUE));
+    for (int i{0}; i < CORRIDOR; ++i) {
+        bool new_block{false};
+        CBlock block{build_corridor(tip(), i == 0 ? std::vector<CMutableTransaction>{stake_tx}
+                                                  : std::vector<CMutableTransaction>{})};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block));
+    }
+    BOOST_REQUIRE_EQUAL(tip()->nHeight, H + CORRIDOR);
+
+    // ---- Node B: a fresh ChainstateManager over its own directories, same
+    // (pinned) consensus parameters, fed the raw blocks in height order —
+    // the fresh-sync path with the boundary active from genesis.
+    const fs::path b_dir{m_args.GetDataDirNet() / "nodeB"};
+    fs::create_directories(b_dir / "blocks");
+    {
+        ChainstateManager::Options b_chainman_opts{
+            .chainparams = chainman.GetParams(),
+            .datadir = b_dir,
+            .check_block_index = 1,
+            .notifications = *m_node.notifications,
+            .worker_threads_num = 0,
+        };
+        const node::BlockManager::Options b_blockman_opts{
+            .chainparams = b_chainman_opts.chainparams,
+            .blocks_dir = b_dir / "blocks",
+            .notifications = b_chainman_opts.notifications,
+            .block_tree_db_params = DBParams{
+                .path = b_dir / "blocks" / "index",
+                .cache_bytes = m_kernel_cache_sizes.block_tree_db,
+                .memory_only = true,
+            },
+        };
+        ChainstateManager chainman_b{*Assert(m_node.shutdown_signal), b_chainman_opts, b_blockman_opts};
+        {
+            node::ChainstateLoadOptions b_load;
+            b_load.mempool = nullptr;
+            b_load.coins_db_in_memory = true;
+            const auto [status, error]{node::LoadChainstate(chainman_b, m_kernel_cache_sizes, b_load)};
+            BOOST_REQUIRE_MESSAGE(status == node::ChainstateLoadStatus::SUCCESS, error.original);
+            BlockValidationState state;
+            BOOST_REQUIRE(chainman_b.ActiveChainstate().ActivateBestChain(state));
+        }
+        BOOST_REQUIRE_EQUAL(WITH_LOCK(cs_main, return chainman_b.ActiveChain().Height()), 0);
+
+        for (int height{1}; height <= H + CORRIDOR; ++height) {
+            const CBlockIndex* pindex{WITH_LOCK(cs_main, return chainman.ActiveChain()[height])};
+            BOOST_REQUIRE(pindex != nullptr);
+            CBlock block;
+            BOOST_REQUIRE(chainman.m_blockman.ReadBlock(block, *pindex));
+            bool new_block{false};
+            BOOST_REQUIRE_MESSAGE(
+                chainman_b.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+                "node B refused block at height " << height);
+            BOOST_REQUIRE(new_block);
+        }
+
+        // Same tip, same chainstate, same UTXO commitment, same registry.
+        LOCK(cs_main);
+        BOOST_REQUIRE_EQUAL(chainman_b.ActiveChain().Height(), H + CORRIDOR);
+        BOOST_CHECK_EQUAL(chainman_b.ActiveChain().Tip()->GetBlockHash().GetHex(),
+                          chainman.ActiveChain().Tip()->GetBlockHash().GetHex());
+        chainman.ActiveChainstate().ForceFlushStateToDisk();
+        chainman_b.ActiveChainstate().ForceFlushStateToDisk();
+        const node::UtxoComparison cmp{node::CompareUtxoViews(
+            chainman.ActiveChainstate().CoinsDB(), chainman_b.ActiveChainstate().CoinsDB())};
+        BOOST_CHECK(cmp.Equal());
+        BOOST_CHECK_EQUAL(cmp.commitment_a.GetHex(), cmp.commitment_b.GetHex());
+        const node::StakeRegistry reg_a{node::DeriveStakeRegistry(
+            chainman.ActiveChainstate().CoinsDB(), H + CORRIDOR, consensus)};
+        const node::StakeRegistry reg_b{node::DeriveStakeRegistry(
+            chainman_b.ActiveChainstate().CoinsDB(), H + CORRIDOR, consensus)};
+        BOOST_CHECK(reg_a.WeightView() == reg_b.WeightView());
+        BOOST_CHECK_EQUAL(reg_a.total_weight, reg_b.total_weight);
+        BOOST_CHECK_EQUAL(reg_b.validators.at(validator_key).total_weight, 300'000);
+        BOOST_CHECK_EQUAL(reg_a.mature_outputs, reg_b.mature_outputs);
     }
 }
 
