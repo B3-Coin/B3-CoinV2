@@ -64,7 +64,7 @@ inline constexpr CAmount COIN_YEAR_REWARD{CENT};
  * it enables no Fundamental Node service, payment, vote, or validation
  * mechanism.
  */
-CAmount GetFNCollateral(int height);
+CAmount GetFNCollateral(int height, const Consensus::Params& params);
 
 /**
  * True when a height must use the preserved B3Coin consensus rules.
@@ -119,7 +119,7 @@ CAmount GetProofOfStakeReward(const CBlockIndex* pindex_prev,
                               uint64_t coin_age, CAmount fees);
 
 /** Return the fee amount the legacy block-reward calculation counted. */
-CAmount GetLegacyTransactionFee(CAmount value_in, CAmount value_out, bool is_coinstake, int height);
+CAmount GetLegacyTransactionFee(CAmount value_in, CAmount value_out, bool is_coinstake, int height, const Consensus::Params& params);
 
 /**
  * The historical repair window: the final client skips its entire coinstake

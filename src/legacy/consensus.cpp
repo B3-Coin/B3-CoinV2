@@ -327,19 +327,31 @@ CAmount GetProofOfStakeReward(const CBlockIndex* pindex_prev,
     return base + fees + COIN;
 }
 
-CAmount GetFNCollateral(const int height)
+CAmount GetFNCollateral(const int height, const Consensus::Params& params)
 {
+    // Historical Proof-of-Disintegration collateral tiers, verbatim from
+    // fn-activity.h. The test override exists ONLY so synthetic regtest
+    // chains can afford an authentic disintegration; the mainnet schedule
+    // is consensus history and never changes.
+    if (params.legacy_fn_collateral_test_override) {
+        return *params.legacy_fn_collateral_test_override;
+    }
     if (height > 105'000) return 15'000'000 * COIN;
     if (height > 85'000) return 20'000'000 * COIN;
     return 25'000'000 * COIN;
 }
 
 CAmount GetLegacyTransactionFee(const CAmount value_in, const CAmount value_out,
-                                const bool is_coinstake, const int height)
+                                const bool is_coinstake, const int height,
+                                const Consensus::Params& params)
 {
+    // Proof of Disintegration, exactly as the historical client accounted
+    // it: when a transaction's input/output gap reaches the collateral, the
+    // collateral portion is NOT a fee -- it is destroyed, unclaimable by
+    // the block producer, and leaves the spendable supply permanently.
     if (is_coinstake) return 0;
     const CAmount raw_fee{value_in - value_out};
-    const CAmount collateral{GetFNCollateral(height)};
+    const CAmount collateral{GetFNCollateral(height, params)};
     return raw_fee >= collateral ? raw_fee - collateral : raw_fee;
 }
 

@@ -148,6 +148,13 @@ struct Params {
      */
     std::optional<int64_t> min_stake_amount;
     /**
+     * TEST-ONLY override of the historical FN disintegration collateral
+     * (Proof of Disintegration). Unset everywhere except regtest fixtures:
+     * the mainnet historical collateral schedule (25M/20M/15M B3 by height)
+     * is consensus history and must never change.
+     */
+    std::optional<int64_t> legacy_fn_collateral_test_override;
+    /**
      * Historical hardened checkpoints of the live legacy chain (height -> exact
      * block hash), ported verbatim from the historical client. A legacy block
      * accepted at a pinned height must hash to the pinned value. Empty on chains

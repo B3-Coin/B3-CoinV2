@@ -460,7 +460,8 @@ static bool CheckInputsFromMempoolAndCache(const CTransaction& tx, TxValidationS
 // legacy block helpers below and shared with the mempool accept path.
 static bool CheckLegacyTxInputs(const CTransaction& tx, TxValidationState& state,
                                 const CCoinsViewCache& inputs, int spend_height,
-                                CAmount& txfee, CAmount& value_in);
+                                CAmount& txfee, CAmount& value_in,
+                                const Consensus::Params& params);
 
 //! Frozen legacy-era consensus script flags (the legacy branch of
 //! GetBlockScriptFlags); also used by the mempool for legacy-era admission.
@@ -967,7 +968,8 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         // input-time ordering rule (an input's transaction time may not exceed
         // the spender's), and proof-of-integration fee accounting.
         CAmount legacy_value_in{0};
-        if (!CheckLegacyTxInputs(tx, state, m_view, next_block_height, ws.m_base_fees, legacy_value_in)) {
+        if (!CheckLegacyTxInputs(tx, state, m_view, next_block_height, ws.m_base_fees, legacy_value_in,
+                                 m_active_chainstate.m_chainman.GetConsensus())) {
             return false; // state filled in by CheckLegacyTxInputs
         }
     } else if (!Consensus::CheckTxInputs(tx, state, m_view, next_block_height, ws.m_base_fees)) {
@@ -2134,7 +2136,8 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo& txund
 /** Input/value checks frozen from the old B3Coin ConnectInputs path. */
 static bool CheckLegacyTxInputs(const CTransaction& tx, TxValidationState& state,
                                 const CCoinsViewCache& inputs, const int spend_height,
-                                CAmount& txfee, CAmount& value_in)
+                                CAmount& txfee, CAmount& value_in,
+                                const Consensus::Params& params)
 {
     if (!inputs.HaveInputs(tx)) {
         return state.Invalid(TxValidationResult::TX_MISSING_INPUTS, "bad-txns-inputs-missingorspent", "inputs missing or spent");
@@ -2164,7 +2167,8 @@ static bool CheckLegacyTxInputs(const CTransaction& tx, TxValidationState& state
                              strprintf("value in (%s) < value out (%s)", FormatMoney(value_in), FormatMoney(value_out)));
     }
 
-    txfee = legacy::GetLegacyTransactionFee(value_in, value_out, tx.IsCoinStake(), spend_height);
+    txfee = legacy::GetLegacyTransactionFee(value_in, value_out, tx.IsCoinStake(), spend_height,
+                                            params);
     if (!MoneyRange(txfee)) {
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-fee-outofrange");
     }
@@ -2859,7 +2863,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         {
             TxValidationState tx_state;
             const bool inputs_valid{use_legacy_b3coin ?
-                CheckLegacyTxInputs(tx, tx_state, view, pindex->nHeight, txfee, tx_value_in) :
+                CheckLegacyTxInputs(tx, tx_state, view, pindex->nHeight, txfee, tx_value_in,
+                                    params.GetConsensus()) :
                 Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee,
                                          Consensus::LegacyFinalHeight(params.GetConsensus()))};
             if (!inputs_valid) {
@@ -2878,8 +2883,9 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 }
                 nFees += txfee;
                 if (!tx.IsCoinStake() &&
-                    tx_value_in - tx.GetValueOut() >= legacy::GetFNCollateral(pindex->nHeight)) {
-                    legacy_fn_integrated += legacy::GetFNCollateral(pindex->nHeight);
+                    tx_value_in - tx.GetValueOut() >=
+                        legacy::GetFNCollateral(pindex->nHeight, params.GetConsensus())) {
+                    legacy_fn_integrated += legacy::GetFNCollateral(pindex->nHeight, params.GetConsensus());
                 }
                 legacy_sigops += GetP2SHSigOpCount(tx, view);
                 if (legacy_sigops > legacy::MAX_BLOCK_SIGOPS) {

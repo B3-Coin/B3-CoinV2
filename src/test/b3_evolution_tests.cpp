@@ -41,6 +41,7 @@
 #include <script/solver.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
+#include <undo.h>
 #include <uint256.h>
 #include <util/time.h>
 #include <validation.h>
@@ -100,6 +101,10 @@ struct EvolutionSetup : public ChainTestingSetup {
         auto& consensus{const_cast<Consensus::Params&>(m_node.chainman->GetConsensus())};
         consensus.legacy_b3coin = true;
         consensus.legacy_last_pow_block = LEGACY_POW_END;
+        // Small regtest Proof-of-Disintegration collateral so the synthetic
+        // chain can afford an authentic disintegration; the mainnet
+        // historical schedule is untouched (override unset there).
+        consensus.legacy_fn_collateral_test_override = 100 * 1'000'000; // 100 COIN
         consensus.BIP34Height = std::numeric_limits<int>::max();
         consensus.BIP65Height = std::numeric_limits<int>::max();
         consensus.BIP66Height = std::numeric_limits<int>::max();
@@ -121,56 +126,31 @@ std::shared_ptr<CBlock> CodecRoundTrip(const CBlock& block)
     return decoded;
 }
 
-//! A test-convention FN object derived from an on-chain burn. TEST-ONLY:
-//! the marker and cost are a test convention, not consensus; FN economics
-//! (OD-4/OD-5) remain open.
-constexpr CAmount FN_TEST_COST{50'000};
-const std::vector<unsigned char> FN_MARKER{'B', '3', 'F', 'N'};
-
-struct FnObject {
-    COutPoint burn_outpoint;
-    std::array<unsigned char, 32> claim_key{};
-};
-
-CScript MakeFnBurnScript(const std::array<unsigned char, 32>& claim_key)
+//! Count historical Proof-of-Disintegration events from chain data alone:
+//! a non-coinbase, non-coinstake legacy transaction whose input/output gap
+//! reaches the collateral. Input values come from the block UNDO data, so
+//! the same scan works on a live-validated node and on a pinned-mode
+//! (trusted-replay) synced node — replay reconstructs the same facts.
+int CountPodEvents(ChainstateManager& chainman, const int through_height,
+                   const Consensus::Params& params) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
 {
-    std::vector<unsigned char> payload{FN_MARKER};
-    payload.insert(payload.end(), claim_key.begin(), claim_key.end());
-    return CScript() << OP_RETURN << payload;
-}
-
-//! Deterministically derive the FN set from the chain: every unspendable
-//! OP_RETURN burn output carrying the marker and EXACTLY the test cost
-//! yields one FN object, keyed (and deduplicated) by its burn outpoint.
-std::map<COutPoint, FnObject> DeriveFnObjects(ChainstateManager& chainman, const int from_height)
-    EXCLUSIVE_LOCKS_REQUIRED(cs_main)
-{
-    std::map<COutPoint, FnObject> objects;
-    for (int height{from_height}; height <= chainman.ActiveChain().Height(); ++height) {
+    int events{0};
+    for (int height{1}; height <= through_height; ++height) {
         const CBlockIndex* pindex{chainman.ActiveChain()[height]};
         CBlock block;
+        CBlockUndo undo;
         if (!chainman.m_blockman.ReadBlock(block, *pindex)) continue;
-        for (const auto& tx : block.vtx) {
-            for (uint32_t n{0}; n < tx->vout.size(); ++n) {
-                const CTxOut& out{tx->vout[n]};
-                CScript::const_iterator it{out.scriptPubKey.begin()};
-                opcodetype opcode;
-                std::vector<unsigned char> data;
-                if (!out.scriptPubKey.GetOp(it, opcode) || opcode != OP_RETURN) continue;
-                if (!out.scriptPubKey.GetOp(it, opcode, data)) continue;
-                if (data.size() != FN_MARKER.size() + 32 ||
-                    !std::equal(FN_MARKER.begin(), FN_MARKER.end(), data.begin())) {
-                    continue;
-                }
-                if (out.nValue != FN_TEST_COST) continue; // wrong-amount burns create nothing
-                FnObject fn;
-                fn.burn_outpoint = COutPoint{tx->GetHash(), n};
-                std::copy(data.begin() + FN_MARKER.size(), data.end(), fn.claim_key.begin());
-                objects.emplace(fn.burn_outpoint, fn); // outpoint-keyed: same burn never doubles
-            }
+        if (!chainman.m_blockman.ReadBlockUndo(undo, *pindex)) continue;
+        for (size_t i{1}; i < block.vtx.size(); ++i) {
+            const CTransaction& tx{*block.vtx[i]};
+            if (tx.IsCoinStake()) continue;
+            const CTxUndo& txundo{undo.vtxundo.at(i - 1)};
+            CAmount in{0};
+            for (const Coin& coin : txundo.vprevout) in += coin.out.nValue;
+            if (in - tx.GetValueOut() >= legacy::GetFNCollateral(height, params)) ++events;
         }
     }
-    return objects;
+    return events;
 }
 
 } // namespace
@@ -235,7 +215,9 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
     // ported kernel (CheckStakeKernel), claim exactly the real reward, pay
     // to P2PK and sign the block with that key — the historical
     // construction path, no PoW shortcut.
-    const auto build_pos{[&](const COutPoint& stake_prevout) {
+    const auto build_pos{[&](const COutPoint& stake_prevout,
+                             std::vector<CMutableTransaction> txs = {},
+                             const CAmount fees = 0, const CAmount claim_extra = 0) {
         const CBlockIndex* prev{tip()};
         const uint32_t bits{legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/true, consensus)};
 
@@ -267,8 +249,8 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
 
         const auto coin_age{legacy::GetCoinAge(CTransaction{coinstake}, prev, view)};
         BOOST_REQUIRE(coin_age.has_value());
-        const CAmount reward{legacy::GetProofOfStakeReward(prev, *coin_age, /*fees=*/0)};
-        coinstake.vout[1] = CTxOut{coin.out.nValue + reward, stake_payout_script};
+        const CAmount reward{legacy::GetProofOfStakeReward(prev, *coin_age, fees)};
+        coinstake.vout[1] = CTxOut{coin.out.nValue + reward + claim_extra, stake_payout_script};
 
         CMutableTransaction coinbase;
         coinbase.version = 1;
@@ -287,6 +269,10 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
         block.nNonce = 0;
         block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
         block.vtx.push_back(MakeTransactionRef(std::move(coinstake)));
+        for (CMutableTransaction& mtx : txs) {
+            mtx.m_legacy_encoding = true;
+            block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        }
         block.hashMerkleRoot = BlockMerkleRoot(block);
         BOOST_REQUIRE(stake_key.Sign(block.GetLegacyB3Hash(), block.vchBlockSig));
         return block;
@@ -368,13 +354,84 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
     // 1000 honest PoS blocks, each staking one aged pool coin through the
     // real kernel and claiming exactly the real reward. The staked outpoint
     // is consumed and a fresh P2PK output appears: legacy stake churn.
+    constexpr CAmount POD_COLLATERAL{100 * 1'000'000};
+    constexpr CAmount POD_FEE{1'000};
+    CAmount fn_integrated_before_pod{-1};
+    CAmount supply_before_pod{-1};
+    CAmount supply_after_pod{-1};
+    CAmount pod_coinstake_delta{0};
+    const auto utxo_sum{[&] {
+        LOCK(cs_main);
+        cm().ActiveChainstate().ForceFlushStateToDisk();
+        CAmount sum{0};
+        for (const auto& entry : node::EnumerateUtxos(cm().ActiveChainstate().CoinsDB())) {
+            sum += entry.coin.out.nValue;
+        }
+        return sum;
+    }};
     CAmount total_pos_rewards{0};
     for (int i{0}; i < LEGACY_POS_BLOCKS; ++i) {
         const COutPoint staked{stake_pool[i]};
         const CAmount staked_value{WITH_LOCK(
             cs_main, return cm().ActiveChainstate().CoinsTip().AccessCoin(staked).out.nValue)};
-        CBlock block{build_pos(staked)};
+        CBlock block;
+        if (i == 500) {
+            // ---- Historical Proof of Disintegration, the authentic
+            // mechanism: inputs exceed ordinary outputs by collateral + fee.
+            // The gap has no output; only the fee portion is claimable.
+            fn_integrated_before_pod = WITH_LOCK(cs_main, return tip()->m_legacy_fn_integrated);
+            supply_before_pod = utxo_sum();
+            CMutableTransaction pod;
+            pod.version = 1;
+            pod.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 200);
+            pod.vin.resize(1);
+            pod.vin[0].prevout = stake_pool[1000]; // spare 250-COIN pool coin
+            pod.vin[0].scriptSig = CScript{};
+            pod.vout.emplace_back(1'000'000, CScript() << OP_TRUE); // the 1-B3 FN marker
+            pod.vout.emplace_back(250'000'000 - 1'000'000 - POD_COLLATERAL - POD_FEE,
+                                  CScript() << OP_TRUE); // ordinary change
+            // gap = 100,001,000 = collateral (destroyed) + 1,000 (real fee)
+
+            // The miner cannot claim the disintegrated amount: a variant
+            // whose coinstake claims the collateral on top of the allowed
+            // reward-plus-fee is refused.
+            {
+                CBlock steal{build_pos(staked, {pod}, POD_FEE, /*claim_extra=*/POD_COLLATERAL)};
+                LOCK(cs_main);
+                const BlockValidationState state{TestBlockValidity(
+                    cm().ActiveChainstate(), steal, /*check_pow=*/false, /*check_merkle_root=*/true)};
+                BOOST_REQUIRE_MESSAGE(state.IsInvalid(), "PoD claimed as miner fee was accepted");
+            }
+            block = build_pos(staked, {pod}, POD_FEE);
+        } else if (i == 501) {
+            // Insufficient gap: collateral minus one unit. No FN state; the
+            // whole gap is an ordinary (large) fee, claimable in full.
+            const CAmount short_gap{POD_COLLATERAL - 1'000};
+            CMutableTransaction not_pod;
+            not_pod.version = 1;
+            not_pod.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 200);
+            not_pod.vin.resize(1);
+            not_pod.vin[0].prevout = stake_pool[1001];
+            not_pod.vin[0].scriptSig = CScript{};
+            not_pod.vout.emplace_back(1'000'000, CScript() << OP_TRUE); // fake marker, no real PoD
+            not_pod.vout.emplace_back(250'000'000 - 1'000'000 - short_gap, CScript() << OP_TRUE);
+            block = build_pos(staked, {not_pod}, /*fees=*/short_gap);
+        } else {
+            block = build_pos(staked);
+        }
         submit(block);
+        if (i == 500) {
+            supply_after_pod = utxo_sum();
+            pod_coinstake_delta = block.vtx[1]->vout[1].nValue - staked_value;
+            LOCK(cs_main);
+            // Recognized exactly once, at exactly the collateral.
+            BOOST_CHECK_EQUAL(tip()->m_legacy_fn_integrated - fn_integrated_before_pod, POD_COLLATERAL);
+        }
+        if (i == 501) {
+            LOCK(cs_main);
+            // The insufficient gap created no FN state.
+            BOOST_CHECK_EQUAL(tip()->m_legacy_fn_integrated - fn_integrated_before_pod, POD_COLLATERAL);
+        }
         total_pos_rewards += block.vtx[1]->vout[1].nValue - staked_value;
         if (i % 250 == 0) {
             LOCK(cs_main);
@@ -518,44 +575,25 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
         BOOST_CHECK(!registry.validators.contains(key_d));                      // cancelled
     }
 
-    // ------------------------- Phase 7: FN burns (test convention only)
-    std::array<unsigned char, 32> fn_key_1{};
-    fn_key_1.fill(0x11);
-    std::array<unsigned char, 32> fn_key_2{};
-    fn_key_2.fill(0x22);
-    const auto burn_from{[&](const uint32_t fund_n, const CAmount burn_value,
-                             const std::array<unsigned char, 32>& claim_key, const bool spendable_fake) {
-        CMutableTransaction tx;
-        tx.version = 2;
-        tx.vin.resize(1);
-        tx.vin[0].prevout = COutPoint{crossing_txid, fund_n};
-        tx.vin[0].scriptSig = CScript{};
-        if (spendable_fake) {
-            // Fake burn: carries the marker but is spendable (no OP_RETURN).
-            std::vector<unsigned char> payload{FN_MARKER};
-            payload.insert(payload.end(), claim_key.begin(), claim_key.end());
-            tx.vout.emplace_back(burn_value, CScript() << payload << OP_DROP << OP_TRUE);
-        } else {
-            tx.vout.emplace_back(burn_value, MakeFnBurnScript(claim_key));
-        }
-        tx.vout.emplace_back(900'000 - burn_value - 1000, CScript() << OP_TRUE);
-        return tx;
-    }};
-    const CMutableTransaction fn_valid{burn_from(5, FN_TEST_COST, fn_key_1, false)};
-    const CMutableTransaction fn_wrong_amount{burn_from(6, FN_TEST_COST - 10'000, fn_key_2, false)};
-    const CMutableTransaction fn_fake{burn_from(7, FN_TEST_COST, fn_key_2, true)};
-    const CMutableTransaction fn_valid_2{burn_from(8, FN_TEST_COST, fn_key_2, false)};
-    const Txid fn_valid_txid{CTransaction{fn_valid}.GetHash()};
-    submit_corridor({fn_valid, fn_wrong_amount, fn_fake, fn_valid_2});
+    // -------- Phase 7 (corrected): historical PoD verification. The
+    // authentic Proof of Disintegration happened in the LEGACY phase (block
+    // 801): here we prove the supply effect and its exclusion from fees.
     {
+        // Spendable supply fell by exactly the collateral relative to the
+        // coinstake's legitimate gain: the destroyed amount has no output
+        // and was never claimable.
+        BOOST_REQUIRE_GE(supply_before_pod, 0);
+        BOOST_CHECK_EQUAL(supply_after_pod - supply_before_pod,
+                          pod_coinstake_delta - POD_COLLATERAL - POD_FEE);
+        // The coinstake's gain contains the real fee, never the collateral:
+        // reward(base) + POD_FEE; independently, the steal variant above was
+        // refused. Exactly one PoD event exists on the chain, derivable from
+        // raw block + undo data alone.
         LOCK(cs_main);
-        const auto fn_set{DeriveFnObjects(cm(), EVO_H + 1)};
-        BOOST_REQUIRE_EQUAL(fn_set.size(), 2U); // valid + valid_2; wrong amount and fake create nothing
-        BOOST_CHECK(fn_set.contains(COutPoint{fn_valid_txid, 0}));
-        BOOST_CHECK(fn_set.at(COutPoint{fn_valid_txid, 0}).claim_key == fn_key_1);
-        // Deriving again never doubles an FN from the same burn.
-        const auto fn_again{DeriveFnObjects(cm(), EVO_H + 1)};
-        BOOST_CHECK_EQUAL(fn_again.size(), fn_set.size());
+        BOOST_CHECK_EQUAL(CountPodEvents(cm(), EVO_H, consensus), 1);
+        // The aggregate lives on LEGACY-era index entries; read it at H
+        // (modern-era entries never carry the legacy aggregates).
+        BOOST_CHECK_EQUAL(cm().ActiveChain()[EVO_H]->m_legacy_fn_integrated, POD_COLLATERAL);
     }
 
     // ----------------- Phase 6: colored assets (model level, test flag)
@@ -693,6 +731,8 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
             cm().ActiveChainstate().CoinsDB(), EVO_H + EVO_CORRIDOR, consensus)};
         expect_registry(after_restart);
         BOOST_CHECK(after_restart.WeightView() == registry_a.WeightView());
+        BOOST_CHECK_EQUAL(cm().ActiveChain()[EVO_H]->m_legacy_fn_integrated, POD_COLLATERAL);
+        BOOST_CHECK_EQUAL(CountPodEvents(cm(), EVO_H, consensus), 1);
     }
 
     // Reindex: rebuild the chainstate from the block files across all three
@@ -712,8 +752,10 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
         const node::StakeRegistry after_reindex{node::DeriveStakeRegistry(
             cm().ActiveChainstate().CoinsDB(), EVO_H + EVO_CORRIDOR, consensus)};
         expect_registry(after_reindex);
-        // The FN derivation is deterministic across the reindex too.
-        BOOST_CHECK_EQUAL(DeriveFnObjects(cm(), EVO_H + 1).size(), 2U);
+        // PoD facts are deterministic across the reindex too: one event,
+        // same aggregate (the index carries the live-validation record).
+        BOOST_CHECK_EQUAL(CountPodEvents(cm(), EVO_H, consensus), 1);
+        BOOST_CHECK_EQUAL(cm().ActiveChain()[EVO_H]->m_legacy_fn_integrated, POD_COLLATERAL);
     }
 
     // Node B: an empty second node syncs the whole evolution chain.
@@ -767,6 +809,9 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
             chainman_b.ActiveChainstate().CoinsDB(), EVO_H + EVO_CORRIDOR, consensus)};
         expect_registry(registry_b);
         BOOST_CHECK(registry_b.WeightView() == registry_a.WeightView());
+        // Trusted-replay-mode sync reconstructs the identical PoD facts from
+        // raw block + undo data.
+        BOOST_CHECK_EQUAL(CountPodEvents(chainman_b, EVO_H, consensus), 1);
     }
 
     // ----------------------- Phase 9: the modern PoS gate at H+corridor+1
