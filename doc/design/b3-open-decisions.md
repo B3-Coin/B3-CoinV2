@@ -105,6 +105,15 @@ conceptual direction is license scarcity + bond + performance-based revenue + B3
 new entry, but no curve, bond size, or revenue split is locked. The policy interface may
 exist; the economics may not be implemented.
 
+**Creation mechanism locked (2026-08-16, [b3-fn-pod.md](b3-fn-pod.md)):** modern
+FN creation preserves the historical **Proof of Disintegration** — implicit
+destruction through the transaction accounting gap, never claimable as a fee,
+never a generic BURN output — modernized with an explicit on-chain FN
+ownership (FN Coin) output. FN Coin is a separate asset/state from B3; one
+PoD event creates at most one FN. OPEN here: the modern PoD amount, FN Coin
+issuance rate/quantity, excess-gap treatment, ownership serialization,
+transfer rules and reward economics.
+
 ---
 
 ## OD-5 — FN claim derivation details
@@ -119,6 +128,14 @@ FundamentalNode, who the eligible beneficiary is, and what the claim amount is.
 per-owner identity**, so no beneficiary set can be derived from present data. Extracting
 owner identities requires a dedicated pass over legacy history — worth deciding early,
 since it may influence what trusted replay captures.
+
+**Recoverability boundary established (2026-08-16, [b3-fn-pod.md](b3-fn-pod.md)):**
+the historical operator/pubkey binding lived in P2P broadcasts and is
+unrecoverable from chain data. Recoverable: every disintegration transaction,
+its gap/height, and its outputs — including the customary 1-B3 marker output.
+The natural derivable claim rule is therefore "beneficiary = controller of the
+disintegration transaction's marker output"; any rule requiring network-layer
+state is impossible.
 
 ---
 
