@@ -141,6 +141,13 @@ struct Params {
      */
     int64_t transition_pow_reward{0};
     /**
+     * MIN_STAKE_AMOUNT: the smallest principal a v1 STAKE output may carry.
+     * Unset means the stake economics are unresolved and stake creation
+     * FAILS CLOSED (mainnet: OPEN decision); regtest fixtures set a small
+     * scaffolding value.
+     */
+    std::optional<int64_t> min_stake_amount;
+    /**
      * Historical hardened checkpoints of the live legacy chain (height -> exact
      * block hash), ported verbatim from the historical client. A legacy block
      * accepted at a pinned height must hash to the pinned value. Empty on chains

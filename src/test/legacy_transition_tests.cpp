@@ -2231,6 +2231,7 @@ BOOST_AUTO_TEST_CASE(stake_policy_in_corridor)
     mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
     mutable_consensus.transition_pow_length = 6;
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.min_stake_amount = 1000; // regtest scaffolding
 
     // Corridor block 1: legacy value crosses into a real STAKE output plus
     // ordinary change.
@@ -2404,6 +2405,7 @@ BOOST_AUTO_TEST_CASE(full_corridor_end_to_end)
     mutable_consensus.legacy_final_hash = X;
     mutable_consensus.transition_pow_length = CORRIDOR;
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.min_stake_amount = 1000; // regtest scaffolding
     BOOST_REQUIRE(consensus.test_only_modern_pos_validator == nullptr);
     BOOST_CHECK(WITH_LOCK(cs_main, return chainman.ActiveChainstate().LegacyBoundaryActive()));
 

@@ -856,7 +856,8 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         // Modern-era admission: a malformed STAKE-claiming output can never
         // be mined (ContextualCheckBlock enforces the same rule), so refuse
         // it here.
-        if (std::string stake_error; !modern::CheckStakeOutputs(tx, stake_error)) {
+        if (std::string stake_error;
+            !modern::CheckStakeOutputs(tx, m_active_chainstate.m_chainman.GetConsensus(), stake_error)) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-stake-output", stake_error);
         }
     }
@@ -5165,7 +5166,7 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
     // silent reinterpretation as an ordinary output.
     if (consensus_params.legacy_b3coin) {
         for (const auto& tx : block.vtx) {
-            if (std::string stake_error; !modern::CheckStakeOutputs(*tx, stake_error)) {
+            if (std::string stake_error; !modern::CheckStakeOutputs(*tx, consensus_params, stake_error)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-stake-output",
                                      strprintf("%s in transaction %s", stake_error, tx->GetHash().ToString()));
             }

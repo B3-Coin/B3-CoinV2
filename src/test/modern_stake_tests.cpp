@@ -102,6 +102,22 @@ BOOST_AUTO_TEST_CASE(claiming_but_malformed_outputs_are_invalid)
         BOOST_CHECK(!ParseStakeOutput(CTxOut{1000, script}, error));
         BOOST_CHECK_EQUAL(error, "stake output has no owner script");
     }
+    // A PUSHDATA1-encoded payload claims but is not minimally encoded:
+    // exactly one byte representation is valid.
+    {
+        std::vector<unsigned char> payload(STAKE_PAYLOAD_SIZE, 0x22);
+        std::copy(modern::STAKE_MAGIC.begin(), modern::STAKE_MAGIC.end(), payload.begin());
+        payload[STAKE_PAYLOAD_SIZE - 1] = 0;
+        payload[STAKE_PAYLOAD_SIZE - 2] = 0;
+        CScript script;
+        script.push_back(OP_PUSHDATA1);
+        script.push_back(static_cast<unsigned char>(STAKE_PAYLOAD_SIZE));
+        script.insert(script.end(), payload.begin(), payload.end());
+        script << OP_DROP << OP_TRUE;
+        BOOST_REQUIRE(ClaimsStakeMagic(script));
+        BOOST_CHECK(!ParseStakeOutput(CTxOut{1000, script}, error));
+        BOOST_CHECK_EQUAL(error, "stake payload not minimally encoded");
+    }
     // Non-zero reserved bytes.
     {
         std::vector<unsigned char> payload(STAKE_PAYLOAD_SIZE, 0x22);
@@ -114,13 +130,27 @@ BOOST_AUTO_TEST_CASE(claiming_but_malformed_outputs_are_invalid)
     }
 
     // CheckStakeOutputs flags the malformed claim inside a transaction while
-    // accepting valid and non-claiming outputs around it.
+    // accepting valid and non-claiming outputs around it; duplicate
+    // validator identities in one transaction are valid (aggregation, not
+    // conflict); an unconfigured or unmet minimum fails closed.
+    Consensus::Params params;
+    params.min_stake_amount = 500;
     CMutableTransaction tx;
     tx.vout.emplace_back(1000, CScript() << OP_TRUE);
     tx.vout.emplace_back(1000, MakeStakeScript(TestKey(), owner));
-    BOOST_CHECK(modern::CheckStakeOutputs(CTransaction{tx}, error));
+    tx.vout.emplace_back(1000, MakeStakeScript(TestKey(), owner)); // duplicate key: valid
+    BOOST_CHECK(modern::CheckStakeOutputs(CTransaction{tx}, params, error));
+    {
+        Consensus::Params unconfigured;
+        BOOST_CHECK(!modern::CheckStakeOutputs(CTransaction{tx}, unconfigured, error));
+        BOOST_CHECK_EQUAL(error, "stake minimum amount is not configured");
+    }
+    tx.vout.emplace_back(499, MakeStakeScript(TestKey(), owner)); // below minimum
+    BOOST_CHECK(!modern::CheckStakeOutputs(CTransaction{tx}, params, error));
+    BOOST_CHECK_EQUAL(error, "stake principal below the configured minimum");
+    tx.vout.pop_back();
     tx.vout.emplace_back(0, MakeStakeScript(TestKey(), owner)); // zero principal
-    BOOST_CHECK(!modern::CheckStakeOutputs(CTransaction{tx}, error));
+    BOOST_CHECK(!modern::CheckStakeOutputs(CTransaction{tx}, params, error));
 }
 
 BOOST_AUTO_TEST_CASE(stake_activation_depth_exact_boundary)

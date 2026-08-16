@@ -6,6 +6,7 @@
 #define B3COIN_MODERN_STAKE_H
 
 #include <consensus/amount.h>
+#include <consensus/params.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
 
@@ -36,13 +37,31 @@ namespace modern {
  * interpretation belongs to the modern PoS specification and is NOT decided
  * here.
  *
- * Recognition is deterministic on the magic: any output whose first push is
- * exactly STAKE_PAYLOAD_SIZE bytes beginning with "B3S1" claims to be a
- * STAKE output, and a claiming output that violates any v1 constraint
- * (missing OP_DROP, missing owner script, zero validator key, non-zero
- * reserved bytes, zero amount) is INVALID in a modern-era block — never
- * silently reinterpreted as an ordinary output. Outputs whose first push
- * has a different size or magic are ordinary outputs.
+ * Recognition is deterministic on the magic: any output whose first push
+ * carries exactly STAKE_PAYLOAD_SIZE bytes beginning with "B3S1" — under
+ * ANY push encoding — claims to be a STAKE output, and a claiming output
+ * that violates any v1 constraint (non-minimal push encoding, missing
+ * OP_DROP, missing owner script, zero validator key, non-zero reserved
+ * bytes, amount below the configured minimum) is INVALID in a modern-era
+ * block — never silently reinterpreted as an ordinary output. Outputs
+ * whose first push has a different size or magic are ordinary outputs.
+ *
+ * CANONICAL ENCODING (corridor-final): the payload push must be the
+ * minimal direct push (opcode 0x26 = 38). PUSHDATA1/2/4 encodings of a
+ * claiming payload are malformed claims, so one stake datum has exactly
+ * one valid script byte representation and the owner binding is
+ * unambiguous.
+ *
+ * VALIDATOR KEY (corridor rules): exactly 32 bytes, opaque — the
+ * cryptographic scheme is NOT decided here; the all-zero key is the only
+ * syntactically invalid value. Multiple STAKE outputs may carry the same
+ * validator key (in one transaction or many): they are valid and their
+ * weight AGGREGATES per the locked per-validator rule — a duplicate
+ * validator identity is aggregation, not a conflict.
+ *
+ * CORRIDOR CANCELLATION: before modern PoS begins, the owner spends the
+ * output and the stake is removed — no cooldown, no slashing, no duties.
+ * Those belong to modern PoS, after M.
  */
 inline constexpr std::array<unsigned char, 4> STAKE_MAGIC{'B', '3', 'S', '1'};
 inline constexpr size_t STAKE_VALIDATOR_KEY_SIZE{32};
@@ -114,6 +133,10 @@ inline std::optional<StakeOutputView> ParseStakeOutput(const CTxOut& out, std::s
         error = "stake payload malformed";
         return std::nullopt;
     }
+    if (opcode != static_cast<opcodetype>(STAKE_PAYLOAD_SIZE)) {
+        error = "stake payload not minimally encoded";
+        return std::nullopt;
+    }
     if (!out.scriptPubKey.GetOp(it, opcode) || opcode != OP_DROP) {
         error = "stake payload not followed by OP_DROP";
         return std::nullopt;
@@ -149,14 +172,27 @@ inline std::optional<StakeOutputView> ParseStakeOutput(const CTxOut& out, std::s
 
 /**
  * Modern-era per-transaction STAKE rule: every output claiming the STAKE
- * magic must parse as a valid v1 STAKE output. Returns false with `error`
- * set on the first invalid claiming output.
+ * magic must parse as a valid v1 STAKE output and carry at least the
+ * configured minimum principal. While MIN_STAKE_AMOUNT is unconfigured
+ * (mainnet: an OPEN economics decision), stake creation FAILS CLOSED,
+ * matching the corridor-difficulty policy. Returns false with `error` set
+ * on the first invalid claiming output.
  */
-inline bool CheckStakeOutputs(const CTransaction& tx, std::string& error)
+inline bool CheckStakeOutputs(const CTransaction& tx, const Consensus::Params& params,
+                              std::string& error)
 {
     for (const CTxOut& out : tx.vout) {
         if (!ClaimsStakeMagic(out.scriptPubKey)) continue;
-        if (!ParseStakeOutput(out, error)) return false;
+        const auto view{ParseStakeOutput(out, error)};
+        if (!view) return false;
+        if (!params.min_stake_amount) {
+            error = "stake minimum amount is not configured";
+            return false;
+        }
+        if (view->amount < *params.min_stake_amount) {
+            error = "stake principal below the configured minimum";
+            return false;
+        }
     }
     return true;
 }
