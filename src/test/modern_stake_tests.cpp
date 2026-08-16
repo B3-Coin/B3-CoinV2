@@ -2,8 +2,10 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
+#include <consensus/params.h>
 #include <modern/policy.h>
 #include <modern/stake.h>
+#include <node/stake_registry.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
 
@@ -132,6 +134,66 @@ BOOST_AUTO_TEST_CASE(stake_activation_depth_exact_boundary)
     BOOST_CHECK(!modern::IsStakeMature(b, b + modern::STAKE_ACTIVATION_DEPTH - 1));
     BOOST_CHECK(modern::IsStakeMature(b, b + modern::STAKE_ACTIVATION_DEPTH));
     BOOST_CHECK(modern::IsStakeMature(b, b + modern::STAKE_ACTIVATION_DEPTH + 1));
+}
+
+BOOST_AUTO_TEST_CASE(validator_weight_aggregates_per_key)
+{
+    // LOCKED design rule: splitting principal across outputs manufactures
+    // nothing — 100,000 split over many outputs weighs exactly one output
+    // of 100,000, and immature/pre-H/non-stake entries contribute nothing.
+    Consensus::Params params;
+    params.legacy_b3coin = true;
+    const int H{100};
+    params.hard_fork_height = H + 1;
+
+    const CScript owner{CScript() << OP_TRUE};
+    const auto key_a{TestKey(0xaa)};
+    const auto key_b{TestKey(0xbb)};
+    constexpr CAmount total{100'000};
+
+    std::vector<node::UtxoEntry> entries;
+    const auto add{[&](const uint32_t n, const CAmount amount, const auto& key, const int height) {
+        node::UtxoEntry e;
+        e.outpoint = COutPoint{Txid::FromUint256(uint256::ONE), n};
+        e.coin = Coin{CTxOut{amount, modern::MakeStakeScript(key, owner)}, height,
+                      /*fCoinBaseIn=*/false, /*fCoinStakeIn=*/false};
+        entries.push_back(e);
+    }};
+
+    // Validator A: one output of `total`. Validator B: the same total split
+    // into 10 outputs. Both created at H+1, evaluated when mature.
+    add(0, total, key_a, H + 1);
+    for (uint32_t i{1}; i <= 10; ++i) add(i, total / 10, key_b, H + 1);
+    // Immature stake for B (created too recently), a pre-H lookalike, and an
+    // ordinary output: all weightless.
+    add(20, 555'555, key_b, H + 30);
+    {
+        node::UtxoEntry e;
+        e.outpoint = COutPoint{Txid::FromUint256(uint256::ONE), 21};
+        e.coin = Coin{CTxOut{777'777, modern::MakeStakeScript(key_a, owner)}, H - 1, false, false};
+        entries.push_back(e);
+    }
+    {
+        node::UtxoEntry e;
+        e.outpoint = COutPoint{Txid::FromUint256(uint256::ONE), 22};
+        e.coin = Coin{CTxOut{999'999, CScript() << OP_TRUE}, H + 1, false, false};
+        entries.push_back(e);
+    }
+
+    const int eval_height{H + 1 + modern::STAKE_ACTIVATION_DEPTH};
+    const node::StakeRegistry registry{node::DeriveStakeRegistry(entries, eval_height, params)};
+
+    BOOST_REQUIRE_EQUAL(registry.weights.size(), 2U);
+    BOOST_CHECK_EQUAL(registry.weights.at(key_a), total);
+    BOOST_CHECK_EQUAL(registry.weights.at(key_b), total); // split == single
+    BOOST_CHECK_EQUAL(registry.total_weight, 2 * total);
+    BOOST_CHECK_EQUAL(registry.mature_outputs, 11U);
+    BOOST_CHECK_EQUAL(registry.immature_outputs, 1U);
+
+    // One block earlier the H+1 outputs are not yet mature.
+    const node::StakeRegistry early{node::DeriveStakeRegistry(entries, eval_height - 1, params)};
+    BOOST_CHECK(early.weights.empty());
+    BOOST_CHECK_EQUAL(early.immature_outputs, 12U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
