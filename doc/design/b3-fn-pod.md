@@ -98,8 +98,11 @@ to circulating supply. Two ledgers, one event.
 
 ## 5. One PoD event, at most one FN
 
-    PoDId = the modern FN creation transaction identity
-            (or its designated creation outpoint — exact identifier OPEN)
+    PoDId = a deterministic, non-self-referential modern creation
+            identifier; exact derivation remains OPEN.
+            (Neither the issuing transaction's identity nor a creation
+            outpoint can serve: both depend on the transaction that
+            contains the FN output, which itself serializes the PoDId.)
 
     one valid PoD event  → at most one FN creation
     same PoD reused      → INVALID / no second FN
@@ -178,6 +181,15 @@ exists. Legacy clients never follow past H (dead fork). From M, claims
 validate per 8.4.
 
 ### 8.2 Eligibility — derived during sync, reindex and replay
+
+> **REQUIRED SEPARATE CORRECTIVE COMMIT (recorded 2026-08-17; must land
+> before PodRecords become consensus-consumed):** the current
+> `SyncPodRecords` implementation (a) does not rewind persisted records
+> when its stored marker sits ABOVE a newly pinned final legacy height —
+> a datadir synced past the eventual H would retain over-range records —
+> and (b) must fail closed on malformed or incomplete undo data rather
+> than ever returning a silently partial claim set. Both are derivation
+> corrections, deliberately kept out of the encoding commits.
 
 Every node synchronizes from block 1; the deterministic PoD scan runs
 inside normal sync/reindex/trusted-replay (input values and funding
@@ -301,8 +313,11 @@ A claim is a MODERN transition (height ≥ M) carrying:
         amount             = the underlying modern B3 value
         policy_type        = FN (5), policy_version = 1
         policy_commitment  = the modern OWNER v1 owner binding
-        policy_params      = exactly the 32-byte PoDId (raw txid bytes,
-                             internal hash order; zero PoDId invalid)
+        policy_params      = exactly the 32-byte PoDId (zero invalid):
+                             a legacy claim carries the historical
+                             disintegration's txid (raw bytes, internal
+                             hash order); modern issuance will carry the
+                             still-OPEN non-self-referential identifier
 
    FN v1 is a wrapper around modern OWNER authorization: color and
    PoDId live in the FN policy; control is entirely the committed OWNER
@@ -313,7 +328,7 @@ A claim is a MODERN transition (height ≥ M) carrying:
    activated policy on any network in this stage (fail closed by
    modern/policy.h IsActivatedPolicy).
 
-2. **One FN claim creation action** (modern/fn.h `CreationAction`;
+2. **One FN claim creation action** (modern/creation_action.h `CreationAction`;
    registry: action_type `CREATION_ACTION_FN_CLAIM = 1`, version 1).
    Payload:
 
@@ -328,17 +343,64 @@ A claim is a MODERN transition (height ≥ M) carrying:
    action per FN output — no FN output without an action, no action
    without an FN output.
 
-   **Integration status (exact):** the FN claim action is ENCODED AND
-   TESTED as a standalone canonical codec in this stage. Carrying it
-   inside the segregated proof area requires a **future versioned
-   modern-transition extension**; that integration will make the new
-   action collection part of `ProofAreaCommitment` and
-   `FullTransitionId`, while `TransitionId` continues to commit to
-   inputs and outputs only. **Existing modern-transition v1 remains
-   byte-identical and does not carry FN actions** — the current v1
-   `ProofAreaCommitment` does NOT commit FN actions — and the committed
-   input-proof invariant (input i ↔ proof i) is untouched. **FN cannot
-   activate until the versioned integration is implemented.**
+   **Scope of the action rules (owner clarification, 2026-08-17):**
+   these are the LEGACY-CLAIM rules; `CheckFnCreationActions` is a
+   legacy-claim-context helper only. Modern FN ISSUANCE stays the
+   simple path: **no FN claim action and no historical funding-key
+   authorization** — one ordinary issuance transaction whose
+   authorization is paying the required disintegration `D` through the
+   locked §10.1 hypothetical-output arithmetic, alongside its ordinary
+   modern input proofs and whatever outer transaction format is
+   selected later. **The exact modern issuance identifier and the
+   exact issuance-vs-claim classifier remain OPEN owner decisions.**
+   (An issuance PoDId cannot be the issuing transaction's own id: the
+   FN output serializes the PoDId while the transition id hashes the
+   outputs — self-referential and impossible. §5's "exact identifier
+   OPEN" stands.)
+
+   **Integration status (exact, updated for the v2 envelope):**
+
+   - ENCODED AND TESTED: the standalone claim-action codec (Commit 3)
+     AND the inactive **v2 transition envelope** that carries the
+     action collection — `uint16 version (LE, = 2 only)` followed by
+     the v2 body (the v1-shaped inputs/outputs/proofs plus the
+     creation-action section; modern/proof.h, with the neutral frame
+     and bounds in modern/creation_action.h). The v2 identities are
+     version-domain-separated tagged hashes ("B3/MODERN/TX/ID/V2",
+     "…/PROOFAREA/V2", "…/FULL/V2"): `TransitionIdV2` commits to the
+     version and the canonical inputs/outputs and is blind to proofs
+     and actions; `ProofAreaCommitmentV2` and `FullTransitionIdV2`
+     commit to the action collection. Identical v1/v2 economic bodies
+     never share an id.
+   - UNCHANGED: raw modern-transition v1 remains the sole v1 format,
+     byte-frozen — serialization, `TransitionId`,
+     `ProofAreaCommitment`, `FullTransitionId` and every frozen vector.
+     v1 and v2 byte patterns CAN overlap — discrimination is never by
+     inspection: the future outer context explicitly selects one
+     decoder, with no sniffing or fallback and exact exhaustion. The v1
+     `ProofAreaCommitment` does not commit FN actions. The input-proof
+     invariant (input i ↔ proof i) is untouched in both versions.
+   - DECODE BOUNDS (enforced before allocation, for EVERY collection —
+     inputs, outputs incl. the 80-byte policy-params cap, proofs incl.
+     the 4,000-byte payload cap, and actions): per-action payload ≤
+     4,000 bytes (the existing proof-area bound); action count ≤ 64 and
+     aggregate action-section ≤ 20,000 bytes — after framing that
+     permits FOUR maximum-size actions — (**both owner-ratified
+     2026-08-17**); envelope ≤ 1,000,000 bytes (**owner-ruled a
+     TEMPORARY defensive parser ceiling while the codec is inactive —
+     NOT the final production consensus, relay or weight limit, which
+     must be reconciled with the future outer transaction/block codec
+     before activation**). Unknown action (type, version) pairs are
+     INVALID at decode — never silently ignored — and any future
+     consensus validation must keep that rule.
+   - NOT YET TRUE: **the active chain does not carry the v2 envelope**
+     — no production outer transaction/block codec selects it; defining
+     the format is not activating it. Claim validation (eligibility,
+     signature verification against PodRecords, `claimed[pod_id]`,
+     counters, supply), activation, state, wallet, RPC, mempool,
+     mining, rewards and economics remain untouched and FOR LATER
+     commits. **FN cannot activate until a production context selects
+     the envelope through its own reviewed change.**
 
         Size bound: a creation-action payload shares the segregated
         proof area's limit, MAX_TRANSITION_PROOF_SIZE = 4,000 bytes.
@@ -451,7 +513,7 @@ Persisted node state, all reorg-managed and reconstructible:
 | Claim with malformed FN output / creation action | INVALID bad-fn-claim / fn-claim-missing-auth |
 | Wrong pubkey for P2PKH funding script | INVALID fn-claim-bad-auth |
 | Transfer chain after claim | same pod_id, new outpoints, supply unchanged |
-| Transfer omitting successor | INVALID fn-transfer-no-successor |
+| Ordinary spend without a same-PoDId successor | VALID; the FN is permanently extinguished (§10.2 — supersedes the earlier fn-transfer-no-successor rejection) |
 | Transfer with changed pod_id | fails its authority check (fn-claim-missing-authority) |
 | One tx, several independent FN transfers | valid; bijection both directions |
 | Reorg across the claim | FN removed + claimed flag cleared atomically; reconnect identical |
@@ -670,9 +732,12 @@ owner's definition — not the chain heights `H` = LEGACY_FINAL_HEIGHT and
 `M` = activation height used elsewhere in this document. Where the
 prose could be ambiguous it says "the counter" explicitly.)
 
-    R = complete historical FN rights reserved
-        (qualifying claimable PoDs through the final legacy height,
-         fixed at activation)
+    R = complete historical FN rights reserved: EVERY qualifying
+        historical PodRecord through the final legacy height, fixed at
+        activation — INCLUDING records whose funding-script form is not
+        currently supported. "Claimable" controls redemption support,
+        never reservation: an unsupported-script right still consumes
+        its slot under the cap.
     H = historical FN rights successfully claimed        (a counter)
     M = modern FN Coins ever created on the active chain (a counter)
     A = currently active FN

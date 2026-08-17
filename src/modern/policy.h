@@ -80,8 +80,10 @@ inline constexpr size_t MAX_POLICY_PARAMS_SIZE{80};
  *    right (modern/fn.h, doc/design/b3-fn-pod.md §8). v1: the commitment
  *    is the modern OWNER v1 owner binding (control is entirely the OWNER
  *    mechanism — one party, a threshold group or an organization alike)
- *    and params are exactly the 32-byte PoDId of the historical
- *    disintegration the coin was claimed for. FN v1 is NOT activated on
+ *    and params are exactly the 32-byte PoDId: for a legacy claim, the
+ *    historical disintegration's txid; for modern issuance, the
+ *    still-OPEN deterministic, non-self-referential modern identifier.
+ *    FN v1 is NOT activated on
  *    any network yet: creation, transfer and extinguishment rules arrive
  *    with the FN validation commits, and until an explicit activation
  *    every FN output is invalid like any other unactivated policy.

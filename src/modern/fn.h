@@ -7,8 +7,8 @@
 
 #include <consensus/amount.h>
 #include <hash.h>
+#include <modern/creation_action.h>
 #include <modern/policy.h>
-#include <modern/proof.h>
 #include <pubkey.h>
 #include <primitives/transaction_identifier.h>
 #include <uint256.h>
@@ -56,42 +56,10 @@ inline constexpr uint16_t FN_POLICY_VERSION_V1{POLICY_VERSION_V1};
 //! FN v1 params are exactly the 32-byte PoDId.
 inline constexpr size_t FN_POD_ID_SIZE{32};
 
-//! Creation-action registry. Type 1 is the first and only registered
-//! action: the FN claim.
-inline constexpr uint16_t CREATION_ACTION_FN_CLAIM{1};
-inline constexpr uint16_t FN_CLAIM_ACTION_VERSION_V1{1};
-
-/**
- * A typed, versioned OUTPUT-BOUND creation action — a STANDALONE
- * canonical codec in this stage (owner ruling 2026-08-17). Input proofs
- * authorize spending a previous output; a creation action authorizes
- * CREATING one of the transition's own outputs. Modern-transition v1's
- * wire form is FROZEN and carries no creation actions: carrying them
- * inside the segregated proof area requires a future VERSIONED
- * modern-transition extension, which will make the action collection
- * part of ProofAreaCommitment and FullTransitionId. FN cannot activate
- * until that versioned integration is implemented. Until then this
- * struct is exercised by tests and offline tooling only.
- */
-struct CreationAction {
-    uint16_t action_type{0};
-    uint16_t action_version{0};
-    std::vector<unsigned char> payload{};
-
-    SERIALIZE_METHODS(CreationAction, obj)
-    {
-        READWRITE(obj.action_type, obj.action_version, obj.payload);
-    }
-
-    friend bool operator==(const CreationAction& a, const CreationAction& b)
-    {
-        return a.action_type == b.action_type && a.action_version == b.action_version &&
-               a.payload == b.payload;
-    }
-};
-
-//! Creation-action payloads share the segregated proof area's bound.
-inline constexpr size_t MAX_CREATION_ACTION_PAYLOAD{MAX_TRANSITION_PROOF_SIZE};
+// The generic CreationAction frame, the (type, version) registry and
+// the decode bounds live in the NEUTRAL layer, modern/creation_action.h
+// — this header adds only the FN-specific payload rules on top. The
+// v2-envelope carriage lives in modern/proof.h (versioned; v1 frozen).
 
 // ---- The FN v1 output ---------------------------------------------------
 
@@ -102,8 +70,11 @@ inline constexpr size_t MAX_CREATION_ACTION_PAYLOAD{MAX_TRANSITION_PROOF_SIZE};
  *     amount            = the underlying modern B3 value
  *     policy_type       = FN (5), policy_version = 1
  *     policy_commitment = the modern OWNER v1 owner binding
- *     policy_params     = the 32-byte PoDId (raw txid bytes, internal
- *                         hash order)
+ *     policy_params     = the 32-byte PoDId: a legacy claim carries the
+ *                         historical disintegration's txid (raw bytes,
+ *                         internal hash order); modern issuance will
+ *                         carry the still-OPEN deterministic,
+ *                         non-self-referential modern identifier
  *
  * FN v1 is a wrapper around modern OWNER authorization: the color and
  * PoDId live in the FN policy; spend control is the committed OWNER
@@ -278,62 +249,8 @@ inline bool CheckPubKeyForm(const std::vector<unsigned char>& pubkey, std::strin
     return true;
 }
 
-//! Bounded canonical compact-size read from a cursor over `data`.
-inline bool ReadCompact(std::span<const unsigned char> data, size_t& cursor, uint64_t& out)
-{
-    if (cursor >= data.size()) return false;
-    const uint8_t first{data[cursor++]};
-    if (first < 253) {
-        out = first;
-        return true;
-    }
-    size_t width{0};
-    uint64_t min{0};
-    if (first == 253) {
-        width = 2;
-        min = 253;
-    } else if (first == 254) {
-        width = 4;
-        min = 0x10000;
-    } else {
-        width = 8;
-        min = 0x100000000;
-    }
-    if (data.size() - cursor < width) return false;
-    uint64_t value{0};
-    for (size_t i{0}; i < width; ++i) {
-        value |= uint64_t{data[cursor + i]} << (8 * i);
-    }
-    cursor += width;
-    if (value < min) return false; // non-canonical
-    out = value;
-    return true;
-}
-
-inline void WriteCompact(std::vector<unsigned char>& out, uint64_t value)
-{
-    if (value < 253) {
-        out.push_back(static_cast<unsigned char>(value));
-    } else if (value <= 0xffff) {
-        out.push_back(253);
-        out.push_back(value & 0xff);
-        out.push_back((value >> 8) & 0xff);
-    } else if (value <= 0xffffffff) {
-        out.push_back(254);
-        for (int i{0}; i < 4; ++i) out.push_back((value >> (8 * i)) & 0xff);
-    } else {
-        out.push_back(255);
-        for (int i{0}; i < 8; ++i) out.push_back((value >> (8 * i)) & 0xff);
-    }
-}
-
-inline size_t CompactSizeLen(const uint64_t value)
-{
-    if (value < 253) return 1;
-    if (value <= 0xffff) return 3;
-    if (value <= 0xffffffff) return 5;
-    return 9;
-}
+// ReadCompact / WriteCompact / CompactSizeLen are shared with the
+// neutral layer (modern/creation_action.h, same detail namespace).
 
 } // namespace detail
 
@@ -585,6 +502,20 @@ inline size_t WorstCaseFnClaimActionPayload(const size_t n_scripts)
  *   - every referenced index exists and the output is FN v1;
  *   - exactly one claim action per FN v1 output — no FN output without
  *     an action, no action without an FN output.
+ *
+ * SCOPE (owner rulings 2026-08-17): this is a LEGACY-CLAIM-CONTEXT
+ * helper ONLY — a claim's FN output references a historical PoD and
+ * must carry the funding-key authorizations. MODERN ISSUANCE is the
+ * simple path and needs NO claim action and NO historical funding-key
+ * authorization: its authorization is paying the required
+ * disintegration D through the locked §10.1 hypothetical-output
+ * arithmetic; it still has ordinary modern input proofs and whatever
+ * outer transaction format is selected later. The exact modern
+ * issuance identifier and the exact issuance-vs-claim classifier are
+ * OPEN owner decisions — NOT solved here (in particular, an issuance
+ * PoDId cannot be the transaction's own id: the FN output serializes
+ * the PoDId while the transition id hashes the outputs, which would be
+ * self-referential).
  */
 inline bool CheckFnCreationActions(const std::vector<CreationAction>& actions,
                                    const std::vector<ModernOutput>& outputs, std::string& error)

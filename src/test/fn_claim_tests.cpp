@@ -653,6 +653,58 @@ BOOST_AUTO_TEST_CASE(claim_digest_vectors)
     BOOST_CHECK(pubkey.Verify(*digest, decoded.authorizations[0].signature));
 }
 
+BOOST_AUTO_TEST_CASE(v2_envelope_carriage)
+{
+    std::string error;
+
+    // A claim-FORMAT/CARRIAGE fixture (zero inputs; economic claim
+    // validation comes later): the FN v1 output in the id domain, its
+    // claim action in the versioned proof area — encode, pinned
+    // determinism, decode, and the SEMANTIC layer
+    // (CheckFnCreationActions) applied to the decoded collection,
+    // separately from generic decoding.
+    ModernTransitionV2 t2;
+    t2.outputs = {*MakeFnOutput(View())};
+    t2.creation_actions = {ClaimAction(0)};
+    const auto bytes{EncodeTransitionEnvelope(t2)};
+    BOOST_REQUIRE(bytes);
+    // Literal pinned full v2 envelope carrying a VALID FnClaimActionV1
+    // (encoder-independent expectation assembled from the pinned
+    // component vectors): version || inputs(0) || the FN output ||
+    // proofs(0) || one claim action.
+    const std::string expected_hex{
+        std::string{"0200"} + "00" + "01" + Repeat("00", 32) +
+        "404b4c0000000000" + "0500" + "0100" + "c7" + Repeat("00", 31) +
+        "20" + POD_HEX + "00" + "01" + "0100" + "0100" + "4c" +
+        ACTION_P2PK_PAYLOAD_HEX};
+    BOOST_CHECK_EQUAL(HexStr(*bytes), expected_hex);
+    ModernTransitionV2 decoded;
+    BOOST_REQUIRE_MESSAGE(DecodeTransitionEnvelope(*bytes, decoded, error), error);
+    BOOST_REQUIRE_EQUAL(decoded.creation_actions.size(), 1U);
+    BOOST_CHECK(decoded.creation_actions[0] == t2.creation_actions[0]);
+    BOOST_CHECK_MESSAGE(
+        CheckFnCreationActions(decoded.creation_actions, decoded.outputs, error), error);
+    // Round-trip identity and action-blind id domain.
+    BOOST_CHECK(FullTransitionIdV2(decoded) == FullTransitionIdV2(t2));
+    ModernTransitionV2 stripped{t2};
+    stripped.creation_actions.clear();
+    BOOST_CHECK(TransitionIdV2(stripped) == TransitionIdV2(t2));
+    BOOST_CHECK(FullTransitionIdV2(stripped) != FullTransitionIdV2(t2));
+
+    // The GENERIC decoder accepts a registered frame whose payload is
+    // FN-semantically wrong; the FN checker rejects it separately —
+    // duplicate actions for one output here.
+    ModernTransitionV2 dup{t2};
+    dup.creation_actions = {ClaimAction(0), ClaimAction(0)};
+    const auto dup_bytes{EncodeTransitionEnvelope(dup)};
+    BOOST_REQUIRE(dup_bytes);
+    ModernTransitionV2 dup_decoded;
+    BOOST_REQUIRE_MESSAGE(DecodeTransitionEnvelope(*dup_bytes, dup_decoded, error), error);
+    BOOST_CHECK(
+        !CheckFnCreationActions(dup_decoded.creation_actions, dup_decoded.outputs, error));
+    BOOST_CHECK_EQUAL(error, "creation actions not in ascending output-index order");
+}
+
 BOOST_AUTO_TEST_CASE(capacity_arithmetic)
 {
     // The offline capacity report's single source of truth: exact and
