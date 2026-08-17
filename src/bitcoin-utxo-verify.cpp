@@ -89,7 +89,8 @@ void Usage()
                 "  -podreport             derive every qualifying historical PoD during the\n"
                 "                         replay pass and print the capacity-gate report\n"
                 "                         (totals, claimability reasons, max distinct funding\n"
-                "                         scripts, max authorization payload, B3FP fit)\n");
+                "                         scripts, worst-case native claim-action payload,\n"
+                "                         fit against the 4,000-byte proof-area bound)\n");
 }
 
 struct ToolArgs {
@@ -350,10 +351,14 @@ int main(int argc, char* argv[])
             }
             tfm::format(std::cout, "PoD max scripts:    %d (largest eligible claim)\n",
                         pod.max_distinct_funding_scripts);
-            tfm::format(std::cout, "PoD max auth bytes: %d\n", pod.max_authorization_payload);
-            tfm::format(std::cout, "PoD B3FP fit:       %s\n",
-                        pod.fits_b3fp_carrier ? "yes (every claim fits the approved carrier)"
-                                              : "NO - REVISE THE CARRIER BEFORE COMMIT 3");
+            tfm::format(std::cout, "PoD max action:     %d bytes (worst-case FnClaimActionV1 payload)\n",
+                        pod.max_action_payload);
+            tfm::format(std::cout, "PoD within 4000:    %d\n", pod.within_native_bound);
+            tfm::format(std::cout, "PoD exceeding 4000: %d\n", pod.exceeding_native_bound);
+            tfm::format(std::cout, "PoD native fit:     %s\n",
+                        pod.fits_native_action
+                            ? "yes (every claim fits the native creation action)"
+                            : "NO - REVISE THE NATIVE ACTION BOUND BEFORE ACTIVATION");
             for (const node::PodRecord& record : result.pod_records) {
                 tfm::format(std::cout,
                             "  pod %s h=%d gap=%d tier=%d scripts=%d claimable=%s markers=%d\n",

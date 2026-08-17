@@ -224,24 +224,43 @@ authorization signature over the canonical claim message:
 
     claim_message = TaggedHash("B3/FN/CLAIM/V1",
                                chain_domain || pod_id
-                               || canonical_fn_destination_script)
+                               || fn_output_value
+                               || owner_v1_policy_commitment)
 
+    (Native-modern revision, 2026-08-17: FN Coin exists only in the
+    modern era and its ownership is the MODERN POLICY SYSTEM, never a
+    legacy destination script. The digest binds the complete
+    economically relevant FN output — network, PoDId, underlying B3
+    value and the modern owner — all fixed-width; no CScript appears.)
+
+    fn_output_value = the FN output's underlying modern B3 value:
+                      CAmount, fixed-width 8 bytes little-endian,
+                      validated nonnegative and within MoneyRange. A
+                      copied authorization can only recreate the same
+                      PoDId with the same value under the same owner;
+                      claimed[pod_id] prevents a second issuance.
     chain_domain  = ModernChainDomain — the contract's immutable
-                    anti-replay network identifier,
-                    H("B3/MODERN/CHAIN" || genesis_hash || X)
-                    (b3-architecture-contract.md; derived from the genesis
-                    hash and X per the existing project convention), so an
+                    anti-replay network identifier:
+                    TaggedHash("B3/MODERN/CHAIN", genesis_hash || X),
+                    both hashes as their 32 raw internal-order bytes;
+                    no defaults, no globals; fail-closed when either
+                    hash is unset (src/modern/fn.h), so an
                     authorization is valid on exactly one network.
     pod_id        = 32 raw bytes, internal hash order.
-    canonical_fn_destination_script
-                  = the exact owner-suffix bytes of the FN ownership
-                    output, serialized with a compact-size length prefix.
+    owner_v1_policy_commitment
+                  = the FN output's modern OWNER v1 policy commitment
+                    (32 bytes): one party, a threshold group or an
+                    organization alike — control is entirely the modern
+                    OWNER mechanism.
 
     authorization = { funding_script_index (compact size),
-                      pubkey (33-byte compressed or 65-byte uncompressed,
-                              must parse as a valid public key),
-                      signature (strict DER, LOW-S required, over
-                                 claim_message) }
+                      form (1 byte: P2PKH | P2PK),
+                      P2PKH only: pubkey (33/65 bytes, fully valid),
+                      signature (bare strict DER, LOW-S, over
+                                 claim_message; no sighash byte) }
+
+    (P2PK refinement, same ruling: a P2PK authorization carries the
+    SIGNATURE ONLY — the key is the funding script's embedded key.)
 
 The distinct funding scripts are canonically ordered lexicographically by
 script bytes and indexed 0..n−1; authorization records must appear in
@@ -260,75 +279,111 @@ hash; P2PK — the pubkey must equal the script's embedded key byte-for-byte;
 then the signature must verify over the claim message. Missing,
 duplicated, mis-ordered, or invalid authorizations invalidate the claim.
 
-### 8.4 The claim transaction
+### 8.4 The claim transaction — NATIVE MODERN FORM (owner ruling, 2026-08-17)
 
-A claim is a MODERN transaction (height ≥ M) carrying:
+**SUPERSEDED WIRE FORMS.** The earlier script-level carriers — the
+"B3F1" `PUSH36(envelope) OP_DROP <owner locking script>` ownership
+scriptPubKey and the "B3FP" `OP_RETURN` authorization proof output —
+are **superseded in full** and must not appear in code, tests, tooling
+or documentation. FN Coin exists only in the modern era; its objects
+are native modern policy objects, not legacy scripts, and an OP_RETURN
+carrier has no role in the modern codec (auxiliary data lives in the
+typed segregated proof area). The prior script-policy analysis
+(datacarrier budgets, NULL_DATA classification, script standardness) is
+obsolete with them. Implementation: `src/modern/fn.h`.
 
-1. **One FN ownership output** — the spendable ownership object:
+A claim is a MODERN transition (height ≥ M) carrying:
 
-        scriptPubKey = PUSH36(envelope) OP_DROP <owner locking script>
+1. **One FN v1 policy output** — the FN Coin (modern/policy.h
+   `PolicyType::FN = 5`, consensus-stable, v1):
 
-        envelope (exactly 36 bytes):
-          bytes 0..3    magic "B3F1" = 0x42 0x33 0x46 0x31 (v1; future
-                        versions change the magic)
-          bytes 4..35   pod_id: the 32 raw bytes of the PoD txid in
-                        transaction-serialization (internal hash) order
+        asset              = native B3
+        amount             = the underlying modern B3 value
+        policy_type        = FN (5), policy_version = 1
+        policy_commitment  = the modern OWNER v1 owner binding
+        policy_params      = exactly the 32-byte PoDId (raw txid bytes,
+                             internal hash order; zero PoDId invalid)
 
-        push rule: minimal direct push (opcode 0x24 = 36). PUSHDATA
-        variants, wrong lengths, zero txid → INVALID "bad-fn-claim".
-        The owner locking script suffix is the FN destination; its
-        satisfaction under modern rules is how the owner later proves
-        authority. The fn_destination_script signed in 8.3 is EXACTLY
-        this suffix.
+   FN v1 is a wrapper around modern OWNER authorization: color and
+   PoDId live in the FN policy; control is entirely the committed OWNER
+   mechanism, so one person, a threshold group or an organization are
+   all naturally supported and NO legacy destination script exists.
+   Future FN spend validation delegates owner authorization to OWNER,
+   then enforces transfer-vs-extinguishment (§10.2). FN v1 is NOT an
+   activated policy on any network in this stage (fail closed by
+   modern/policy.h IsActivatedPolicy).
 
-2. **One authorization proof output** (unspendable, zero value):
+2. **One FN claim creation action** (modern/fn.h `CreationAction`;
+   registry: action_type `CREATION_ACTION_FN_CLAIM = 1`, version 1).
+   Payload:
 
-        scriptPubKey = OP_RETURN PUSH("B3FP" || pod_id)
-                       PUSH(auth_1) [PUSH(auth_2) …]
+        compactSize(fn_output_index)      -- the FN output it creates
+        compactSize(n_authorizations)     (n >= 1)
+        n × { compactSize(len) authorization-record }   (8.3 records,
+              ascending, index_i == i, canonical compact sizes,
+              bounded reads, no trailing bytes)
 
-        one push per authorization, canonical serialization, ascending
-        funding_script_index order, exactly one authorization per
-        distinct funding script — nothing missing, nothing extra,
-        nothing duplicated.
+   Structural rules: actions sorted by ascending output index, no
+   duplicates, referenced output must exist and be FN v1, exactly one
+   action per FN output — no FN output without an action, no action
+   without an FN output.
 
-        Size limits: each push ≤ MAX_SCRIPT_ELEMENT_SIZE (520 bytes; one
-        authorization ≈ 107–139 bytes, fits easily); the whole script ≤
-        MAX_SCRIPT_SIZE (10,000 bytes) ⇒ ≥ ~70 authorizations per proof
-        output — far beyond any plausible historical PoD. Modern-era
-        mempool policy must accept well-formed B3FP proof outputs (a
-        policy carve-in, commit 6; stock datacarrier limits would refuse
-        them). CAPACITY GATE: commit 2 must report the maximum number of
-        distinct funding scripts across all eligible historical PoDs; if
-        every real claim fits this encoding it is retained, otherwise it
-        is revised before serialization is implemented so no
-        otherwise-valid PoD is stranded.
+   **Integration status (exact):** the FN claim action is ENCODED AND
+   TESTED as a standalone canonical codec in this stage. Carrying it
+   inside the segregated proof area requires a **future versioned
+   modern-transition extension**; that integration will make the new
+   action collection part of `ProofAreaCommitment` and
+   `FullTransitionId`, while `TransitionId` continues to commit to
+   inputs and outputs only. **Existing modern-transition v1 remains
+   byte-identical and does not carry FN actions** — the current v1
+   `ProofAreaCommitment` does NOT commit FN actions — and the committed
+   input-proof invariant (input i ↔ proof i) is untouched. **FN cannot
+   activate until the versioned integration is implemented.**
+
+        Size bound: a creation-action payload shares the segregated
+        proof area's limit, MAX_TRANSITION_PROOF_SIZE = 4,000 bytes.
+        CAPACITY GATE (native): the offline -podreport measures, per
+        eligible historical PoD, the worst-case serialized claim-action
+        payload (every record P2PKH, uncompressed key, 72-byte DER)
+        against the 4,000-byte bound and reports the counts fitting and
+        exceeding it plus the explicit native-action fit verdict. The
+        complete real-chain run remains a PRE-ACTIVATION gate; it does
+        not block the inactive codec.
+
+   Status note (owner ruling 2026-08-17): this encoding is implemented
+   and tested consensus-inactive (codec + vectors only, unreachable
+   from validation/mempool/wallet/RPC/mining; FN v1 unactivated
+   everywhere); `-podreport` remains mandatory before mainnet
+   activation and before the modern relay-policy bounds are finalized
+   (commit 6); H/X remain unset.
 
 3. Ordinary inputs paying fees and any ordinary outputs. The claim spends
    NO historical outpoint; the marker, if it still exists, is untouched
    and irrelevant.
 
-Validation at connected height ht, for every FN-claiming output:
+Validation at connected height ht, for every FN v1 output (native form):
 
     ht < M or no corridor            → INVALID "fn-claim-inactive"
-    envelope malformed               → INVALID "bad-fn-claim"
+    FN output malformed (v1 rules)   → INVALID "bad-fn-claim"
     duplicate pod_id among outputs   → INVALID "fn-claim-duplicate"
     pod_id ∉ PodRecords or !claimable→ INVALID "fn-claim-ineligible"
     pod_id already claimed           → INVALID "fn-already-claimed"
-    proof output missing/mismatched  → INVALID "fn-claim-missing-auth"
+    creation action missing/mismatched (8.4 structural rules)
+                                     → INVALID "fn-claim-missing-auth"
     any authorization fails 8.3      → INVALID "fn-claim-bad-auth"
-    else: mint exactly one FN {pod_id, ownership outpoint, owner suffix,
+    else: mint exactly one FN {pod_id, FN output, owner commitment,
           claim height}; FN Coin supply += 1; claimed[pod_id] = true
 
 **FN TRANSFER** is distinguished by the authorizing INPUT: spending an
-existing FN ownership output (owner suffix, modern rules) with exactly one
-successor FN ownership output with the SAME pod_id transfers the FN;
-transfers never mint and never split/merge, and several independent FNs
-may move in one transaction under the both-directions pod_id bijection. A
-transfer carries no proof output and no funding signatures. A transaction
-that emits an FN ownership output for a pod_id without either spending
-that FN object or carrying a valid claim proof is INVALID
-"fn-claim-missing-authority". Wallets present one FN asset balance with
-per-object PoD provenance.
+existing FN v1 output (modern OWNER authorization) with exactly one
+successor FN v1 output with the SAME pod_id transfers the FN; transfers
+never mint and never split/merge, and several independent FNs may move
+in one transaction under the both-directions pod_id bijection. A
+transfer carries no creation action and no funding signatures. A
+transaction that emits an FN v1 output for a pod_id without either
+spending that FN object or carrying a valid claim creation action is
+INVALID "fn-claim-missing-authority". Wallets present one FN asset
+balance with per-object PoD provenance.
 
 > **Revised 2026-08-17 (§10.2):** the earlier rule that a spend of the FN
 > object without a same-PoDId successor is INVALID
@@ -393,7 +448,7 @@ Persisted node state, all reorg-managed and reconstructible:
 | Non-qualifying gap (below tier) | not in PodRecords; claim INVALID fn-claim-ineligible |
 | Qualifying PoD with unsupported funding script | audit UNSUPPORTED_FUNDING_SCRIPT; claim INVALID fn-claim-ineligible |
 | Marker spent at any time, any way | irrelevant to the right; claim still valid |
-| Claim with malformed envelope / proof output | INVALID bad-fn-claim / fn-claim-missing-auth |
+| Claim with malformed FN output / creation action | INVALID bad-fn-claim / fn-claim-missing-auth |
 | Wrong pubkey for P2PKH funding script | INVALID fn-claim-bad-auth |
 | Transfer chain after claim | same pod_id, new outpoints, supply unchanged |
 | Transfer omitting successor | INVALID fn-transfer-no-successor |

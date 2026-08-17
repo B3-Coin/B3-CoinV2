@@ -78,6 +78,15 @@ struct TransitionProof {
  * policy outputs, and the segregated proof area. The future modern
  * transaction codec embeds this; nothing here touches CTxIn/CTxOut or any
  * pre-H data.
+ *
+ * v1 wire form is FROZEN as-is. The FN claim's output-bound creation
+ * actions (modern/fn.h CreationAction / FnClaimActionV1) are a STANDALONE
+ * codec in this stage: carrying them inside the segregated proof area
+ * requires a future VERSIONED modern-transition extension, which will
+ * make the action collection part of ProofAreaCommitment and
+ * FullTransitionId. Existing modern-transition v1 stays byte-identical
+ * and carries no FN actions; FN cannot activate until that versioned
+ * integration is implemented.
  */
 struct ModernTransition {
     std::vector<ModernInput> inputs;
@@ -212,6 +221,14 @@ inline ProofCheck VerifyTransitionProof(const ModernOutput& prev_output,
         // (finalization, destinations, change, conservation) lives in
         // modern/vault.h.
         if (!ParseVaultReceiptIds(proof.payload)) return ProofCheck::MALFORMED;
+        return ProofCheck::OK;
+    case PolicyType::FN:
+        // UNREACHABLE until FN v1 is activated (IsActivatedPolicy fails
+        // closed above). Spending an FN coin delegates owner
+        // authorization to the modern OWNER v1 mechanism — the same
+        // payload rules; transfer-vs-extinguishment semantics arrive
+        // with the FN lifecycle validation commits.
+        if (proof.payload.empty()) return ProofCheck::MALFORMED;
         return ProofCheck::OK;
     }
     return ProofCheck::UNKNOWN_POLICY;

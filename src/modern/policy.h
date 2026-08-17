@@ -76,6 +76,15 @@ inline constexpr size_t MAX_POLICY_PARAMS_SIZE{80};
  *    Weight aggregates per validator key, never per output. Active from
  *    the modern era's first block: STAKE creation during the temporary-PoW
  *    corridor is what prepares the initial validator registry.
+ *  - FN: an FN Coin — native B3 value colored with a Fundamental Node
+ *    right (modern/fn.h, doc/design/b3-fn-pod.md §8). v1: the commitment
+ *    is the modern OWNER v1 owner binding (control is entirely the OWNER
+ *    mechanism — one party, a threshold group or an organization alike)
+ *    and params are exactly the 32-byte PoDId of the historical
+ *    disintegration the coin was claimed for. FN v1 is NOT activated on
+ *    any network yet: creation, transfer and extinguishment rules arrive
+ *    with the FN validation commits, and until an explicit activation
+ *    every FN output is invalid like any other unactivated policy.
  */
 enum class PolicyType : uint16_t {
     LEGACY_LOCK = 0,
@@ -83,6 +92,7 @@ enum class PolicyType : uint16_t {
     BURN = 2,
     DEX_VAULT = 3,
     STAKE = 4,
+    FN = 5,
 };
 
 //! DEX_VAULT v1 params: exactly a little-endian 2-byte shard id.
@@ -191,6 +201,15 @@ inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int he
         if (out.policy_params.size() != VAULT_SHARD_PARAMS_SIZE) {
             return PolicyOutputCheck::BAD_POLICY_PARAMS;
         }
+        break;
+    case PolicyType::FN:
+        // UNREACHABLE until FN v1 is activated (IsActivatedPolicy above
+        // fails closed). The v1 structural rules, ready for that day:
+        // native B3 value, the OWNER v1 owner binding as commitment, and
+        // exactly the 32-byte nonzero PoDId as params.
+        if (out.asset != NativeAsset()) return PolicyOutputCheck::BAD_ASSET;
+        if (out.policy_commitment.IsNull()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        if (out.policy_params.size() != 32) return PolicyOutputCheck::BAD_POLICY_PARAMS;
         break;
     }
     return PolicyOutputCheck::OK;

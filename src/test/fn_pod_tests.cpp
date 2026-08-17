@@ -17,6 +17,7 @@
 #include <key.h>
 #include <legacy/codec.h>
 #include <legacy/consensus.h>
+#include <modern/fn.h>
 #include <node/blockstorage.h>
 #include <node/chainstate.h>
 #include <node/fn_pod.h>
@@ -447,7 +448,11 @@ BOOST_FIXTURE_TEST_CASE(chain_derivation_and_determinism, PodTestSetup)
         BOOST_CHECK_EQUAL(report.total_qualifying, 3U);
         BOOST_CHECK_EQUAL(report.claimable, 1U);
         BOOST_CHECK_EQUAL(report.max_distinct_funding_scripts, 1U);
-        BOOST_CHECK(report.fits_b3fp_carrier);
+        BOOST_CHECK_EQUAL(report.max_action_payload,
+                          modern::WorstCaseFnClaimActionPayload(1));
+        BOOST_CHECK_EQUAL(report.within_native_bound, 1U);
+        BOOST_CHECK_EQUAL(report.exceeding_native_bound, 0U);
+        BOOST_CHECK(report.fits_native_action);
     }
 
     mutable_consensus.hard_fork_height = 41;

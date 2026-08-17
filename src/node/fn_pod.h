@@ -151,16 +151,25 @@ private:
  */
 bool SyncPodRecords(ChainstateManager& chainman, PodDB& db, std::string& error);
 
-//! Capacity-gate report over a set of records (b3-fn-pod.md §8.4).
+//! Capacity-gate report over a set of records (b3-fn-pod.md §8.4). The
+//! measured carrier is the NATIVE modern claim action (modern/fn.h
+//! FnClaimActionV1): its worst-case serialized payload per claim against
+//! the segregated proof-area bound MAX_TRANSITION_PROOF_SIZE (4,000
+//! bytes). This is offline measurement, never validation.
 struct PodCapacityReport {
     size_t total_qualifying{0};
     size_t claimable{0};
     std::map<uint8_t, size_t> by_reason;
     size_t max_distinct_funding_scripts{0};
-    //! Upper-bound encoded size of one authorization payload for the
-    //! largest eligible claim (worst case: uncompressed keys, 72-byte DER).
-    size_t max_authorization_payload{0};
-    bool fits_b3fp_carrier{true};
+    //! Worst-case serialized FnClaimActionV1 payload for the largest
+    //! eligible claim (every record P2PKH, uncompressed key, 72-byte DER).
+    size_t max_action_payload{0};
+    //! Claimable PoDs whose worst-case action payload fits within /
+    //! exceeds the 4,000-byte native bound.
+    size_t within_native_bound{0};
+    size_t exceeding_native_bound{0};
+    //! The native-action fit verdict: every claimable PoD fits.
+    bool fits_native_action{true};
 };
 
 PodCapacityReport BuildPodCapacityReport(const std::vector<PodRecord>& records);

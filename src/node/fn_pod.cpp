@@ -8,6 +8,7 @@
 #include <compat/endian.h>
 #include <consensus/era.h>
 #include <legacy/consensus.h>
+#include <modern/fn.h>
 #include <node/blockstorage.h>
 #include <primitives/block.h>
 #include <script/script.h>
@@ -229,18 +230,18 @@ PodCapacityReport BuildPodCapacityReport(const std::vector<PodRecord>& records)
         ++report.claimable;
         report.max_distinct_funding_scripts =
             std::max(report.max_distinct_funding_scripts, record.funding_scripts.size());
+        // The native carrier: the worst-case serialized FnClaimActionV1
+        // payload (modern/fn.h, the single source of truth) against the
+        // segregated proof-area bound. Measurement only — no validation.
+        const size_t payload{modern::WorstCaseFnClaimActionPayload(record.funding_scripts.size())};
+        report.max_action_payload = std::max(report.max_action_payload, payload);
+        if (payload <= modern::MAX_CREATION_ACTION_PAYLOAD) {
+            ++report.within_native_bound;
+        } else {
+            ++report.exceeding_native_bound;
+        }
     }
-    // Worst-case one-authorization size: compact index (<=3) + key length
-    // prefix + 65-byte uncompressed key + sig length prefix + 72-byte DER.
-    constexpr size_t WORST_AUTH{3 + 1 + 65 + 1 + 72};
-    report.max_authorization_payload = report.max_distinct_funding_scripts * WORST_AUTH;
-    // One push per authorization (each <= 520 by construction); whole proof
-    // script bounded by MAX_SCRIPT_SIZE = 10,000 bytes including the tag.
-    constexpr size_t MAX_PROOF_SCRIPT{10'000};
-    constexpr size_t TAG_OVERHEAD{1 + 1 + 36}; // OP_RETURN + push + "B3FP"||pod_id
-    const size_t per_auth{WORST_AUTH + 3};     // + push opcode overhead
-    report.fits_b3fp_carrier =
-        TAG_OVERHEAD + report.max_distinct_funding_scripts * per_auth <= MAX_PROOF_SCRIPT;
+    report.fits_native_action = report.exceeding_native_bound == 0;
     return report;
 }
 
