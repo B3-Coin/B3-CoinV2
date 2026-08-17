@@ -59,6 +59,12 @@ ReplayEquivalenceResult VerifyReplayEquivalence(
     // Merkle roots and the checkpoint at H (which pins X) are verified by the
     // engine itself, so a wrong or tampered block source fails here instead of
     // yielding a misleading comparison.
+    // TRANSACTIONAL PoD publication (hardening ruling 2026-08-17):
+    // records accumulate PRIVATELY during the replay and are published
+    // into the result only after the complete H/X-anchored replay
+    // succeeds. Any failure — early or late — returns no records and no
+    // report, never a partial set.
+    std::vector<PodRecord> pod_records;
     {
         CCoinsViewCache cache{&replay_scratch};
         legacy::TrustedReplay replay{params, opts.final_height,
@@ -77,8 +83,6 @@ ReplayEquivalenceResult VerifyReplayEquivalence(
                 return res;
             }
             if (opts.derive_pod_report) {
-                // FAIL CLOSED: a derivation error aborts the report;
-                // a partial record set is never returned.
                 std::vector<PodRecord> records;
                 if (!DerivePodRecords(*block, undo, height, params, records, error)) {
                     res.errors.push_back(
@@ -86,7 +90,7 @@ ReplayEquivalenceResult VerifyReplayEquivalence(
                     return res;
                 }
                 for (auto& record : records) {
-                    res.pod_records.push_back(std::move(record));
+                    pod_records.push_back(std::move(record));
                 }
             }
             ++res.blocks_replayed;
@@ -107,10 +111,12 @@ ReplayEquivalenceResult VerifyReplayEquivalence(
     }
 
     const int blocks_replayed{res.blocks_replayed};
-    std::vector<PodRecord> pod_records{std::move(res.pod_records)};
     res = SummarizeComparison(CompareUtxoViews(live_view, replay_scratch), opts.max_mismatch_sample);
     res.blocks_replayed = blocks_replayed;
-    if (opts.derive_pod_report) {
+    if (opts.derive_pod_report && res.ok) {
+        // Publication requires BOTH the complete H/X-anchored replay
+        // AND U_port == U_replay: an activation-gate report is never
+        // presented as authoritative when equivalence failed.
         res.pod_report = BuildPodCapacityReport(pod_records);
         res.pod_records = std::move(pod_records);
     }

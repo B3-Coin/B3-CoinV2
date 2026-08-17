@@ -182,23 +182,67 @@ validate per 8.4.
 
 ### 8.2 Eligibility — derived during sync, reindex and replay
 
-> **CORRECTIVE COMMIT (recorded and implemented 2026-08-17):**
-> (a) a persisted marker ABOVE a newly pinned final legacy height is
-> atomically rewound — every record and the marker above H are removed
-> in one batch, and reconnect/restart then derives exactly the prefix
-> through H inclusive; (b) missing, truncated, malformed or mismatched
-> undo data FAILS CLOSED — `DerivePodRecords` returns an error and no
-> records, never a partial set, and the failure propagates through
-> sync, replay and `-podreport` leaving the database unchanged for the
-> failed height. Tested on the regtest evolution chain (genuine legacy
-> PoW → PoS → PoD → corridor → modern blocks; genuine undo copied and
-> deliberately mutated) and on the fn_pod chain fixture (undo-file
-> truncation, restart after rewind, deterministic recovery).
+> **CORRECTIVE + HARDENING (recorded and implemented 2026-08-17):**
+> (a) the H/X anchor is enforced BEFORE any PodDB mutation — H and X
+> configured together or not at all, H nonnegative, and once height H
+> exists on the active chain its hash must equal X, else sync fails
+> before any write, with the logical marker and records unchanged;
+> below H the derivation is
+> the LOCAL PREFIX only, never described as an anchored claim set;
+> (b) a persisted marker ABOVE a newly pinned H is atomically rewound —
+> reconnect/restart then holds exactly the prefix through H inclusive,
+> and a qualifying PoD exactly AT H survives the rewind; (c) missing,
+> truncated, malformed or mismatched undo data — wrong entry counts,
+> wrong per-input coin counts, spent/null coins, out-of-range amounts
+> or an out-of-range input-value sum — FAILS CLOSED: `DerivePodRecords`
+> leaves the caller's output completely UNMODIFIED (structural and
+> obviously-invalid-Coin validation only; the provenance rule is stated
+> once, below); (d) PodDB STRUCTURAL/CANONICAL damage fails closed —
+> the checked conditions are: noncanonical or trailing-byte keys and
+> values (exact-consumption decoding, deobfuscation applied),
+> key/record identity mismatches, negative record heights, records
+> above the marker height, an undecodable marker including an
+> 'm'-prefixed key with trailing bytes (CORRUPT, never mistaken for
+> missing), a missing marker over a nonempty record namespace, and
+> iterator I/O errors; a valid marker never bypasses the
+> full-namespace scan; rewinds validate the existing marker and the
+> namespace before writing anything, and reads fail rather than return
+> a partial prefix;
+> (e) `-podreport` publication is TRANSACTIONAL and EQUIVALENCE-GATED —
+> records accumulate privately during replay and publish only after
+> BOTH the complete H/X-anchored replay succeeds AND `U_port ==
+> U_replay`; a late failure or an equivalence mismatch returns no
+> partial records and no report, so the activation-gate numbers are
+> never presented as authoritative without equivalence; (f) input
+> summation uses a PRE-ADD MoneyRange guard (never add first, check
+> after), and PodDB decoding is STRICTLY CANONICAL — the complete
+> record namespace is scanned from the raw key prefix with
+> exact/full-consumption key and value decoding, key/record identity
+> checks and an iterator-status check at termination; a missing marker
+> is valid only over an empty record namespace; a damaged marker or key
+> fails closed (rewinds abort before writing, reads throw rather than
+> return partial data). The undo provenance rule, stated once: disk
+> checksums detect stored-byte corruption; validated ConnectBlock undo
+> data or TrustedReplay reconstruction supplies SEMANTIC provenance.
+> Normal production sync/reindex derivation is the REQUIRED FUTURE
+> INTEGRATION — not present behavior; the sync helper and the offline
+> replay paths are what exist and are tested today. Tested with the regtest evolution method:
+> genuine legacy PoW, genuinely validated legacy PoS with the authentic
+> PoD, the pinned H/X boundary and the transition-PoW corridor — the
+> chain then reaches the modern-PoS height and verifies the current
+> `no-modern-pos-rules` FAIL-CLOSED gate (no modern-PoS block is
+> produced yet) — plus the fn_pod chain fixture (undo-file truncation,
+> at-H boundary survival, anchor matrix, controlled marker/key
+> corruption, transactional replay, restart after rewind, deterministic
+> recovery; genuine undo copied and deliberately mutated throughout).
 
-Every node synchronizes from block 1; the deterministic PoD scan runs
-inside normal sync/reindex/trusted-replay (input values and funding
+Every node synchronizes from block 1; the deterministic PoD scan MUST
+run inside normal sync/reindex/trusted-replay (input values and funding
 scripts from the connect/undo path — the proven mechanism; no separate
-scanning pass, no optional index, no local configuration).
+scanning pass, no optional index, no local configuration). That
+production wiring is the REQUIRED FUTURE INTEGRATION (see the note
+above); today the checked sync helper and the offline replay paths
+implement and test the same derivation.
 
 A **qualifying PoD** is a transaction `P` at height `h ≤ H` on the chain
 ending at X: non-coinbase, non-coinstake, with

@@ -13,6 +13,7 @@
 #include <uint256.h>
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -31,6 +32,12 @@ namespace node {
  * indexes, wallet state and local settings. This module derives and
  * persists records only — no claim transaction, no FN minting, no
  * claimed-flag mutation lives here.
+ *
+ * INTEGRATION STATUS (honest): the sync helper and the offline replay
+ * path exist and are tested (unit fixtures + the regtest evolution
+ * suite + b3coin-utxo-verify -podreport). Normal production sync and
+ * reindex derivation is the REQUIRED FUTURE INTEGRATION — it is not
+ * present behavior; that wiring is a later, separately reviewed step.
  */
 
 //! Why a qualifying PoD is or is not claimable under the MVP.
@@ -105,12 +112,18 @@ std::optional<PodRecord> ClassifyPod(const CTransaction& tx,
 
 /**
  * Derive every PodRecord of one connected block (block + its undo data).
- * FAILS CLOSED (corrective ruling 2026-08-17): missing, truncated,
- * malformed or mismatched undo data — a wrong per-block entry count or
- * a wrong per-transaction spent-coin count — returns false with `error`
- * set and produces NO records; a partial set is never returned. Callers
- * (sync, replay, -podreport) must propagate the failure and leave any
- * persisted state unchanged for the failed height.
+ * FAILS CLOSED (corrective + hardening rulings 2026-08-17): missing,
+ * truncated, malformed or mismatched undo data — a wrong per-block
+ * entry count, a wrong per-transaction spent-coin count, a spent/null
+ * undo Coin, an out-of-range amount or an out-of-range input-value sum
+ * — returns false with `error` set and leaves the caller's `out`
+ * vector COMPLETELY UNCHANGED; a partial set is never produced. This
+ * validates STRUCTURE and obviously invalid Coins only: disk checksums
+ * detect stored-byte corruption, and SEMANTIC provenance of undo
+ * content comes from validated ConnectBlock undo data or TrustedReplay
+ * reconstruction — never from this function.
+ * Callers (sync, replay, -podreport) must propagate the failure and
+ * leave any persisted state unchanged for the failed height.
  */
 bool DerivePodRecords(const CBlock& block, const CBlockUndo& undo, int height,
                       const Consensus::Params& params, std::vector<PodRecord>& out,
@@ -136,12 +149,38 @@ public:
 
     explicit PodDB(DBParams db_params);
 
-    std::optional<Marker> ReadMarker() const;
+    //! Marker recovery distinguishes ABSENCE from DAMAGE: a present but
+    //! undecodable marker (wrong bytes OR trailing bytes — decoding is
+    //! full-consumption) is CORRUPT and must fail closed, never be
+    //! mistaken for missing data.
+    enum class MarkerRead { MISSING, OK, CORRUPT };
+    MarkerRead ReadMarkerChecked(Marker& out);
+    //! The marker when present and canonical; nullopt when truly
+    //! missing. THROWS on CORRUPT — corruption is never flattened into
+    //! "missing".
+    std::optional<Marker> ReadMarker();
     //! Atomically store one height's records and advance the marker.
     void WriteHeight(int height, const uint256& block_hash, const std::vector<PodRecord>& records);
-    //! Atomically delete every record above `height` and rewind the marker.
-    void RewindTo(int height, const uint256& block_hash);
-    //! All records in deterministic (height, txid) key order.
+    /**
+     * Strictly walk the COMPLETE record namespace from the raw 'p'
+     * prefix: exact/full-consumption key and value decoding, decoded
+     * record identity (height, PoDId) matching its key, and a clean
+     * iterator status at termination. Returns false + error on any
+     * violation without invoking `fn` further; used by every reader so
+     * a partial or corrupt namespace can never masquerade as data.
+     */
+    bool ScanRecordsStrict(
+        const std::function<void(int height, const Txid& txid, PodRecord&&)>& fn,
+        std::string& error, std::optional<int> max_height = std::nullopt);
+    //! Atomically delete every record above `height` and rewind the
+    //! marker. The EXISTING marker and the FULL record namespace are
+    //! validated BEFORE any deletion or the new marker is committed: a
+    //! missing or corrupt marker, or any namespace violation, fails
+    //! with nothing written and the original marker and records
+    //! preserved.
+    bool RewindTo(int height, const uint256& block_hash, std::string& error);
+    //! All records in deterministic (height, txid) key order. THROWS on
+    //! any namespace violation — never returns a partial set.
     std::vector<PodRecord> ReadAll();
 
 private:
@@ -153,8 +192,9 @@ private:
  * min(tip, LEGACY_FINAL_HEIGHT), deriving records from stored blocks and
  * undo data — the same bytes every sync mode (live, reindex, trusted
  * replay) produces. Detects a stale marker whose hash left the active
- * chain (legacy-era reorganization before the boundary is pinned), rewinds
- * to the fork point and re-derives; recovery never guesses. A marker
+ * chain (legacy-era reorganization before the boundary is pinned) and
+ * safely rewinds to GENESIS before re-deriving — deterministic, never
+ * guessing (a fork-point rewind would be an optimization only). A marker
  * ABOVE the newly selected final legacy height (records derived before H
  * was pinned) is atomically rewound to H, so the database holds exactly
  * the prefix through H inclusive (corrective ruling 2026-08-17). Returns
