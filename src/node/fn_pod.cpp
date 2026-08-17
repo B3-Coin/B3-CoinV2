@@ -102,21 +102,40 @@ std::optional<PodRecord> ClassifyPod(const CTransaction& tx,
     return record;
 }
 
-std::vector<PodRecord> DerivePodRecords(const CBlock& block, const CBlockUndo& undo,
-                                        const int height, const Consensus::Params& params)
+bool DerivePodRecords(const CBlock& block, const CBlockUndo& undo, const int height,
+                      const Consensus::Params& params, std::vector<PodRecord>& out,
+                      std::string& error)
 {
+    // FAIL CLOSED on undo inconsistency (corrective ruling 2026-08-17):
+    // a partial record set must never be returned or persisted. Undo
+    // data carries exactly one entry per non-coinbase transaction, and
+    // each entry exactly one spent coin per input.
+    const size_t expected{block.vtx.empty() ? 0 : block.vtx.size() - 1};
+    if (undo.vtxundo.size() != expected) {
+        error = strprintf("undo data mismatched at height %d: %d entries for %d "
+                          "non-coinbase transactions",
+                          height, undo.vtxundo.size(), expected);
+        return false;
+    }
     std::vector<PodRecord> records;
     for (size_t i{1}; i < block.vtx.size(); ++i) {
         const CTransaction& tx{*block.vtx[i]};
-        if (i - 1 >= undo.vtxundo.size()) break; // malformed undo: stay total
+        const auto& prevout_coins{undo.vtxundo[i - 1].vprevout};
+        if (prevout_coins.size() != tx.vin.size()) {
+            error = strprintf("undo data mismatched at height %d: transaction %d has %d "
+                              "spent coins for %d inputs",
+                              height, i, prevout_coins.size(), tx.vin.size());
+            return false;
+        }
         std::vector<CTxOut> prevouts;
-        prevouts.reserve(undo.vtxundo[i - 1].vprevout.size());
-        for (const Coin& coin : undo.vtxundo[i - 1].vprevout) prevouts.push_back(coin.out);
+        prevouts.reserve(prevout_coins.size());
+        for (const Coin& coin : prevout_coins) prevouts.push_back(coin.out);
         if (auto record{ClassifyPod(tx, prevouts, height, params)}) {
             records.push_back(std::move(*record));
         }
     }
-    return records;
+    out = std::move(records);
+    return true;
 }
 
 PodDB::PodDB(DBParams db_params) : m_db{std::move(db_params)} {}
@@ -196,6 +215,15 @@ bool SyncPodRecords(ChainstateManager& chainman, PodDB& db, std::string& error)
             // to how rare pre-pin reorgs are.
             db.RewindTo(0, chain[0]->GetBlockHash());
             synced = 0;
+        } else if (synced > target) {
+            // The marker sits ABOVE the newly selected final legacy
+            // height (records were derived before H was pinned, on a
+            // datadir synced past the eventual boundary). Atomically
+            // remove every record and the marker above H; the database
+            // then holds exactly the prefix through H inclusive
+            // (corrective ruling 2026-08-17).
+            db.RewindTo(target, chain[target]->GetBlockHash());
+            synced = target;
         }
     }
 
@@ -214,8 +242,12 @@ bool SyncPodRecords(ChainstateManager& chainman, PodDB& db, std::string& error)
                               "PoD derivation; reindex required)", height);
             return false;
         }
-        db.WriteHeight(height, pindex->GetBlockHash(),
-                       DerivePodRecords(block, undo, height, params));
+        // FAIL CLOSED: a derivation error leaves the database unchanged
+        // for this height — the persisted set stays the consistent
+        // prefix through the last successful marker, never partial.
+        std::vector<PodRecord> records;
+        if (!DerivePodRecords(block, undo, height, params, records, error)) return false;
+        db.WriteHeight(height, pindex->GetBlockHash(), records);
     }
     return true;
 }

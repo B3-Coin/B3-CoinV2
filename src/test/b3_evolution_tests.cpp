@@ -20,6 +20,7 @@
 #include <consensus/params.h>
 #include <crypto/sha256.h>
 #include <dbwrapper.h>
+#include <node/fn_pod.h>
 #include <key.h>
 #include <legacy/codec.h>
 #include <legacy/consensus.h>
@@ -444,6 +445,116 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
     BOOST_REQUIRE_EQUAL(tip()->nHeight, EVO_H);
     BOOST_CHECK_GE(total_pos_rewards, 0);
 
+    // -------- PodRecord corrective behavior on the authentic legacy chain
+    // (owner ruling 2026-08-17): derive against a HIGHER target, reopen
+    // with a LOWER final H, prove over-range records are removed
+    // deterministically; and prove fail-closed derivation on genuinely
+    // produced undo data that is then deliberately mutated.
+    const fs::path pod_evo_path{m_args.GetDataDirBase() / "fnpod-evolution"};
+    {
+        std::string pod_error;
+        node::PodDB pod_db{DBParams{.path = pod_evo_path, .cache_bytes = size_t{1} << 20,
+                              .wipe_data = true}};
+        // 1. Unpinned derivation to the legacy tip: exactly the one
+        //    authentic PoD (block 801) is recorded.
+        BOOST_REQUIRE_MESSAGE(node::SyncPodRecords(cm(), pod_db, pod_error), pod_error);
+        BOOST_REQUIRE(pod_db.ReadMarker());
+        BOOST_CHECK_EQUAL(pod_db.ReadMarker()->height, EVO_H);
+        const auto full_records{pod_db.ReadAll()};
+        BOOST_REQUIRE_EQUAL(full_records.size(), 1U);
+        BOOST_CHECK_EQUAL(full_records[0].height, 801);
+
+        // 2. Reopen with a LOWER final H (700 < 801): the over-range
+        //    record and marker are removed in one atomic rewind.
+        mutable_consensus.hard_fork_height = 701;
+        mutable_consensus.legacy_final_hash =
+            WITH_LOCK(cs_main, return cm().ActiveChain()[700]->GetBlockHash());
+        mutable_consensus.transition_pow_length = EVO_CORRIDOR;
+        BOOST_REQUIRE_MESSAGE(node::SyncPodRecords(cm(), pod_db, pod_error), pod_error);
+        BOOST_CHECK_EQUAL(pod_db.ReadMarker()->height, 700);
+        BOOST_CHECK(pod_db.ReadAll().empty()); // the 801 record is GONE
+    }
+    {
+        // 3. Restart after the rewind: a reopened database still holds
+        //    exactly the prefix through the lower H.
+        std::string pod_error;
+        node::PodDB pod_db{DBParams{.path = pod_evo_path, .cache_bytes = size_t{1} << 20,
+                              .wipe_data = false}};
+        BOOST_REQUIRE(pod_db.ReadMarker());
+        BOOST_CHECK_EQUAL(pod_db.ReadMarker()->height, 700);
+        BOOST_CHECK(pod_db.ReadAll().empty());
+
+        // 4. Unpin and re-sync: deterministic recovery to the full
+        //    prefix — identical to the original derivation.
+        mutable_consensus.hard_fork_height = std::nullopt;
+        mutable_consensus.legacy_final_hash = std::nullopt;
+        mutable_consensus.transition_pow_length = 0;
+        BOOST_REQUIRE_MESSAGE(node::SyncPodRecords(cm(), pod_db, pod_error), pod_error);
+        BOOST_CHECK_EQUAL(pod_db.ReadMarker()->height, EVO_H);
+        const auto recovered{pod_db.ReadAll()};
+        BOOST_REQUIRE_EQUAL(recovered.size(), 1U);
+        BOOST_CHECK_EQUAL(recovered[0].height, 801);
+        // The authentic PoD is OP_TRUE-funded (the stake pool's coins):
+        // it QUALIFIES — and therefore reserves a cap slot (R counts it)
+        // — but is not redeemable under the MVP key forms.
+        BOOST_CHECK(!recovered[0].claimable);
+        BOOST_CHECK(recovered[0].reason ==
+                    node::PodClaimability::UNSUPPORTED_FUNDING_SCRIPT);
+
+        // 5. Fail-closed derivation on GENUINE undo data, deliberately
+        //    mutated: the real block 801 and its real undo entries.
+        CBlock pod_block;
+        CBlockUndo pod_undo;
+        {
+            LOCK(cs_main);
+            const CBlockIndex* pindex{cm().ActiveChain()[801]};
+            BOOST_REQUIRE(cm().m_blockman.ReadBlock(pod_block, *pindex));
+            BOOST_REQUIRE(cm().m_blockman.ReadBlockUndo(pod_undo, *pindex));
+        }
+        std::vector<node::PodRecord> derived;
+        BOOST_REQUIRE_MESSAGE(node::DerivePodRecords(pod_block, pod_undo, 801, consensus,
+                                                     derived, pod_error),
+                              pod_error);
+        BOOST_REQUIRE_EQUAL(derived.size(), 1U);
+        BOOST_CHECK(derived[0] == recovered[0]); // genuine undo == synced record
+
+        const auto expect_fail{[&](CBlockUndo mutated) {
+            std::vector<node::PodRecord> sentinel{derived[0]};
+            std::string mutate_error;
+            BOOST_CHECK(!node::DerivePodRecords(pod_block, mutated, 801, consensus,
+                                                sentinel, mutate_error));
+            BOOST_CHECK(mutate_error.find("undo data mismatched") != std::string::npos);
+            BOOST_REQUIRE_EQUAL(sentinel.size(), 1U); // out never partially written
+            BOOST_CHECK(sentinel[0] == derived[0]);
+        }};
+        {
+            CBlockUndo missing{pod_undo};
+            missing.vtxundo.pop_back(); // remove a genuine entry
+            expect_fail(std::move(missing));
+        }
+        {
+            CBlockUndo extra{pod_undo};
+            extra.vtxundo.push_back(extra.vtxundo.back()); // duplicate an entry
+            expect_fail(std::move(extra));
+        }
+        {
+            CBlockUndo short_coins{pod_undo};
+            BOOST_REQUIRE(!short_coins.vtxundo.empty());
+            BOOST_REQUIRE(!short_coins.vtxundo.front().vprevout.empty());
+            short_coins.vtxundo.front().vprevout.pop_back(); // drop a spent coin
+            expect_fail(std::move(short_coins));
+        }
+        {
+            CBlockUndo extra_coins{pod_undo};
+            extra_coins.vtxundo.front().vprevout.push_back(
+                extra_coins.vtxundo.front().vprevout.front()); // add a spent coin
+            expect_fail(std::move(extra_coins));
+        }
+        // The database is untouched by the failed derivations.
+        BOOST_CHECK_EQUAL(pod_db.ReadMarker()->height, EVO_H);
+        BOOST_CHECK_EQUAL(pod_db.ReadAll().size(), 1U);
+    }
+
     // ---------------------------------- Freeze the boundary; open corridor
     const uint256 X{tip()->GetBlockHash()};
     mutable_consensus.hard_fork_height = EVO_H + 1;
@@ -734,6 +845,17 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
         BOOST_CHECK_EQUAL(cm().ActiveChain()[EVO_H]->m_legacy_fn_integrated, POD_COLLATERAL);
         BOOST_CHECK_EQUAL(CountPodEvents(cm(), EVO_H, consensus), 1);
     }
+    {
+        // PodDB after restart: pinned target = min(tip, H) = H; identical
+        // single record.
+        std::string pod_error;
+        node::PodDB pod_db{DBParams{.path = m_args.GetDataDirBase() / "fnpod-restart",
+                              .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+        BOOST_REQUIRE_MESSAGE(node::SyncPodRecords(cm(), pod_db, pod_error), pod_error);
+        BOOST_CHECK_EQUAL(pod_db.ReadMarker()->height, EVO_H);
+        BOOST_REQUIRE_EQUAL(pod_db.ReadAll().size(), 1U);
+        BOOST_CHECK_EQUAL(pod_db.ReadAll()[0].height, 801);
+    }
 
     // Reindex: rebuild the chainstate from the block files across all three
     // phases; identical result.
@@ -812,6 +934,17 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
         // Trusted-replay-mode sync reconstructs the identical PoD facts from
         // raw block + undo data.
         BOOST_CHECK_EQUAL(CountPodEvents(chainman_b, EVO_H, consensus), 1);
+        // ...and the derived PodDB is identical across the two nodes.
+        std::string pod_error;
+        node::PodDB pod_a{DBParams{.path = m_args.GetDataDirBase() / "fnpod-node-a",
+                             .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+        node::PodDB pod_b{DBParams{.path = m_args.GetDataDirBase() / "fnpod-node-b",
+                             .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+        BOOST_REQUIRE_MESSAGE(node::SyncPodRecords(cm(), pod_a, pod_error), pod_error);
+        BOOST_REQUIRE_MESSAGE(node::SyncPodRecords(chainman_b, pod_b, pod_error), pod_error);
+        BOOST_CHECK(pod_a.ReadAll() == pod_b.ReadAll());
+        BOOST_REQUIRE_EQUAL(pod_a.ReadAll().size(), 1U);
+        BOOST_CHECK_EQUAL(pod_a.ReadAll()[0].height, 801);
     }
 
     // ----------------------- Phase 9: the modern PoS gate at H+corridor+1

@@ -182,14 +182,18 @@ validate per 8.4.
 
 ### 8.2 Eligibility — derived during sync, reindex and replay
 
-> **REQUIRED SEPARATE CORRECTIVE COMMIT (recorded 2026-08-17; must land
-> before PodRecords become consensus-consumed):** the current
-> `SyncPodRecords` implementation (a) does not rewind persisted records
-> when its stored marker sits ABOVE a newly pinned final legacy height —
-> a datadir synced past the eventual H would retain over-range records —
-> and (b) must fail closed on malformed or incomplete undo data rather
-> than ever returning a silently partial claim set. Both are derivation
-> corrections, deliberately kept out of the encoding commits.
+> **CORRECTIVE COMMIT (recorded and implemented 2026-08-17):**
+> (a) a persisted marker ABOVE a newly pinned final legacy height is
+> atomically rewound — every record and the marker above H are removed
+> in one batch, and reconnect/restart then derives exactly the prefix
+> through H inclusive; (b) missing, truncated, malformed or mismatched
+> undo data FAILS CLOSED — `DerivePodRecords` returns an error and no
+> records, never a partial set, and the failure propagates through
+> sync, replay and `-podreport` leaving the database unchanged for the
+> failed height. Tested on the regtest evolution chain (genuine legacy
+> PoW → PoS → PoD → corridor → modern blocks; genuine undo copied and
+> deliberately mutated) and on the fn_pod chain fixture (undo-file
+> truncation, restart after rewind, deterministic recovery).
 
 Every node synchronizes from block 1; the deterministic PoD scan runs
 inside normal sync/reindex/trusted-replay (input values and funding

@@ -103,9 +103,18 @@ std::optional<PodRecord> ClassifyPod(const CTransaction& tx,
                                      const std::vector<CTxOut>& spent_prevouts,
                                      int height, const Consensus::Params& params);
 
-//! Derive every PodRecord of one connected block (block + its undo data).
-std::vector<PodRecord> DerivePodRecords(const CBlock& block, const CBlockUndo& undo,
-                                        int height, const Consensus::Params& params);
+/**
+ * Derive every PodRecord of one connected block (block + its undo data).
+ * FAILS CLOSED (corrective ruling 2026-08-17): missing, truncated,
+ * malformed or mismatched undo data — a wrong per-block entry count or
+ * a wrong per-transaction spent-coin count — returns false with `error`
+ * set and produces NO records; a partial set is never returned. Callers
+ * (sync, replay, -podreport) must propagate the failure and leave any
+ * persisted state unchanged for the failed height.
+ */
+bool DerivePodRecords(const CBlock& block, const CBlockUndo& undo, int height,
+                      const Consensus::Params& params, std::vector<PodRecord>& out,
+                      std::string& error);
 
 /**
  * Durable PodRecord storage with a single sync marker (format version,
@@ -145,9 +154,15 @@ private:
  * undo data — the same bytes every sync mode (live, reindex, trusted
  * replay) produces. Detects a stale marker whose hash left the active
  * chain (legacy-era reorganization before the boundary is pinned), rewinds
- * to the fork point and re-derives; recovery never guesses. Returns false
- * with `error` set if required block or undo data is unavailable (e.g.
- * pruned before derivation — reindex required).
+ * to the fork point and re-derives; recovery never guesses. A marker
+ * ABOVE the newly selected final legacy height (records derived before H
+ * was pinned) is atomically rewound to H, so the database holds exactly
+ * the prefix through H inclusive (corrective ruling 2026-08-17). Returns
+ * false with `error` set if required block or undo data is unavailable
+ * (e.g. pruned — reindex required) or inconsistent (DerivePodRecords
+ * fails closed); on failure the database is unchanged for the failed
+ * height — the persisted set is always a consistent prefix, never
+ * partial.
  */
 bool SyncPodRecords(ChainstateManager& chainman, PodDB& db, std::string& error);
 

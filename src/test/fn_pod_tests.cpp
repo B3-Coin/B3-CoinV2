@@ -29,6 +29,7 @@
 #include <script/script.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
+#include <undo.h>
 #include <uint256.h>
 #include <util/time.h>
 #include <validation.h>
@@ -37,6 +38,8 @@
 
 #include <algorithm>
 #include <array>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <vector>
 
@@ -644,6 +647,187 @@ BOOST_FIXTURE_TEST_CASE(rollback_recovery, PodTestSetup)
     BOOST_CHECK_EQUAL(db.ReadMarker()->height, 8);
     BOOST_CHECK_EQUAL(db.ReadMarker()->hash.GetHex(), tip()->GetBlockHash().GetHex());
     BOOST_CHECK(db.ReadAll().empty()); // no PoDs on this plain chain, before or after
+}
+
+//! Sync-level corrective behavior: undo corruption fails closed leaving
+//! the database at its consistent prefix; restoring the data recovers
+//! deterministically; pinning H BELOW the marker rewinds atomically; a
+//! reopen after the rewind sees exactly the prefix through H.
+BOOST_FIXTURE_TEST_CASE(pinned_h_rewind_and_fail_closed_sync, PodTestSetup)
+{
+    const auto cm{[&]() -> ChainstateManager& { return *m_node.chainman; }};
+    const Consensus::Params& consensus{cm().GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+    const auto tip{[&] { return WITH_LOCK(cs_main, return cm().ActiveChain().Tip()); }};
+
+    const auto submit{[&](std::vector<CMutableTransaction> txs) {
+        const CBlockIndex* prev{tip()};
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 360);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (prev->nHeight + 1) << CScriptNum{9};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, prev->nHeight + 1, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = coinbase.nTime;
+        block.nBits = legacy::GetNextTargetRequired(prev, false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) {
+            mtx.m_legacy_encoding = true;
+            block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        SetMockTime(static_cast<int64_t>(block.nTime) + 600);
+        DataStream bytes;
+        bytes << legacy::TX_LEGACY(block);
+        auto decoded{std::make_shared<CBlock>()};
+        bytes >> legacy::TX_LEGACY(*decoded);
+        bool new_block{false};
+        BOOST_REQUIRE(cm().ProcessNewBlock(decoded, true, true, &new_block));
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, prev->nHeight + 1);
+        return tip()->GetBlockHash();
+    }};
+
+    // Heights 1..30 plain; 31 fans coinbase 1 into two OP_TRUE coins;
+    // PoDs at 32 and 34; plain to 36.
+    for (int height{1}; height <= 30; ++height) submit({});
+    const Txid coinbase1{[&] {
+        CBlock block;
+        BOOST_REQUIRE(cm().m_blockman.ReadBlock(
+            block, *WITH_LOCK(cs_main, return cm().ActiveChain()[1])));
+        return block.vtx[0]->GetHash();
+    }()};
+    CMutableTransaction fan;
+    fan.version = 1;
+    fan.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 360);
+    fan.vin.resize(1);
+    fan.vin[0].prevout = COutPoint{coinbase1, 0};
+    fan.vin[0].scriptSig = CScript{};
+    fan.vout.emplace_back(150 * COIN_B3, CScript() << OP_TRUE);
+    fan.vout.emplace_back(110 * COIN_B3, CScript() << OP_TRUE);
+    // Change output keeps the fan's own gap at a plain 1000-unit fee so
+    // the fan itself is NOT a PoD.
+    fan.vout.emplace_back(legacy::GetProofOfWorkReward(0, 1, consensus) - 260 * COIN_B3 - 1000,
+                          CScript() << OP_TRUE);
+    submit({fan}); // height 31
+    const Txid fan_txid{[&] {
+        CBlock block;
+        BOOST_REQUIRE(cm().m_blockman.ReadBlock(
+            block, *WITH_LOCK(cs_main, return cm().ActiveChain()[31])));
+        return block.vtx[1]->GetHash();
+    }()};
+
+    CMutableTransaction pod_a;
+    pod_a.version = 1;
+    pod_a.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 360);
+    pod_a.vin.resize(1);
+    pod_a.vin[0].prevout = COutPoint{fan_txid, 0};
+    pod_a.vin[0].scriptSig = CScript{};
+    pod_a.vout.emplace_back(150 * COIN_B3 - TEST_COLLATERAL - 1000, CScript() << OP_TRUE);
+    submit({pod_a}); // height 32
+    submit({});      // height 33
+    CMutableTransaction pod_b;
+    pod_b.version = 1;
+    pod_b.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 360);
+    pod_b.vin.resize(1);
+    pod_b.vin[0].prevout = COutPoint{fan_txid, 1};
+    pod_b.vin[0].scriptSig = CScript{};
+    pod_b.vout.emplace_back(110 * COIN_B3 - TEST_COLLATERAL - 1000, CScript() << OP_TRUE);
+    submit({pod_b}); // height 34
+    submit({});      // 35
+    submit({});      // 36
+    BOOST_REQUIRE_EQUAL(tip()->nHeight, 36);
+    WITH_LOCK(cs_main, cm().ActiveChainstate().ForceFlushStateToDisk());
+
+    // ---- Corrupt the undo file: sync must FAIL CLOSED at the first
+    // block that needs undo data (31), leaving the database at the
+    // consistent prefix through 30 — never a partial set.
+    fs::path rev_path;
+    for (const auto& entry : fs::directory_iterator{m_args.GetDataDirNet() / "blocks"}) {
+        const std::string name{fs::PathToString(entry.path().filename())};
+        if (name.starts_with("rev") && name.ends_with(".dat")) rev_path = entry.path();
+    }
+    BOOST_REQUIRE(!rev_path.empty());
+    std::vector<char> saved_undo;
+    {
+        std::ifstream in{rev_path.std_path(), std::ios::binary};
+        saved_undo.assign(std::istreambuf_iterator<char>{in}, {});
+        BOOST_REQUIRE(!saved_undo.empty());
+    }
+    {
+        std::ofstream out{rev_path.std_path(), std::ios::binary | std::ios::trunc};
+        out.write(saved_undo.data(), 8); // truncated: undo unreadable
+    }
+
+    const fs::path pod_path{m_args.GetDataDirBase() / "fnpod-corrective"};
+    std::string error;
+    {
+        PodDB db{DBParams{.path = pod_path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+        BOOST_CHECK(!node::SyncPodRecords(cm(), db, error));
+        BOOST_CHECK(!error.empty());
+        BOOST_REQUIRE(db.ReadMarker());
+        BOOST_CHECK_EQUAL(db.ReadMarker()->height, 30); // prefix through 30 only
+        BOOST_CHECK(db.ReadAll().empty());
+
+        // ---- Restore the undo data: recovery is deterministic and
+        // completes to the tip.
+        {
+            std::ofstream out{rev_path.std_path(), std::ios::binary | std::ios::trunc};
+            out.write(saved_undo.data(), static_cast<std::streamsize>(saved_undo.size()));
+        }
+        error.clear();
+        BOOST_REQUIRE_MESSAGE(node::SyncPodRecords(cm(), db, error), error);
+        BOOST_CHECK_EQUAL(db.ReadMarker()->height, 36);
+        const auto recovered{db.ReadAll()};
+        BOOST_REQUIRE_EQUAL(recovered.size(), 2U);
+        BOOST_CHECK_EQUAL(recovered[0].height, 32);
+        BOOST_CHECK_EQUAL(recovered[1].height, 34);
+
+        // Deterministic: a clean from-scratch derivation matches exactly.
+        PodDB fresh{DBParams{.path = m_args.GetDataDirBase() / "fnpod-fresh",
+                             .cache_bytes = size_t{1} << 20,
+                             .wipe_data = true}};
+        BOOST_REQUIRE_MESSAGE(node::SyncPodRecords(cm(), fresh, error), error);
+        BOOST_CHECK(fresh.ReadAll() == recovered);
+
+        // ---- Pin H = 33 BELOW the marker (records were derived past the
+        // eventual boundary): sync must atomically rewind to exactly the
+        // prefix through H inclusive.
+        mutable_consensus.hard_fork_height = 34;
+        mutable_consensus.legacy_final_hash =
+            WITH_LOCK(cs_main, return cm().ActiveChain()[33]->GetBlockHash());
+        mutable_consensus.transition_pow_length = 4;
+        BOOST_REQUIRE_MESSAGE(node::SyncPodRecords(cm(), db, error), error);
+        BOOST_CHECK_EQUAL(db.ReadMarker()->height, 33);
+        BOOST_CHECK_EQUAL(db.ReadMarker()->hash.GetHex(),
+                          mutable_consensus.legacy_final_hash->GetHex());
+        const auto after_pin{db.ReadAll()};
+        BOOST_REQUIRE_EQUAL(after_pin.size(), 1U); // the height-34 record is GONE
+        BOOST_CHECK_EQUAL(after_pin[0].height, 32);
+    }
+    // ---- Restart after the rewind: a reopened database sees exactly the
+    // prefix through H, and a re-sync is a no-op.
+    {
+        PodDB db{DBParams{.path = pod_path, .cache_bytes = size_t{1} << 20,
+                          .wipe_data = false}};
+        BOOST_REQUIRE(db.ReadMarker());
+        BOOST_CHECK_EQUAL(db.ReadMarker()->height, 33);
+        const auto records{db.ReadAll()};
+        BOOST_REQUIRE_EQUAL(records.size(), 1U);
+        BOOST_CHECK_EQUAL(records[0].height, 32);
+        std::string error2;
+        BOOST_REQUIRE_MESSAGE(node::SyncPodRecords(cm(), db, error2), error2);
+        BOOST_CHECK_EQUAL(db.ReadMarker()->height, 33);
+        BOOST_CHECK_EQUAL(db.ReadAll().size(), 1U);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

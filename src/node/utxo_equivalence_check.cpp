@@ -77,7 +77,15 @@ ReplayEquivalenceResult VerifyReplayEquivalence(
                 return res;
             }
             if (opts.derive_pod_report) {
-                for (auto& record : DerivePodRecords(*block, undo, height, params)) {
+                // FAIL CLOSED: a derivation error aborts the report;
+                // a partial record set is never returned.
+                std::vector<PodRecord> records;
+                if (!DerivePodRecords(*block, undo, height, params, records, error)) {
+                    res.errors.push_back(
+                        strprintf("PoD derivation failed at height %d: %s", height, error));
+                    return res;
+                }
+                for (auto& record : records) {
                     res.pod_records.push_back(std::move(record));
                 }
             }
