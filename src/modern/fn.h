@@ -24,28 +24,50 @@
 namespace modern {
 
 /**
- * FN Coin v1 — the native-modern FN objects (doc/design/b3-fn-pod.md §8,
- * owner rulings 2026-08-17).
+ * FN Coin v1 — the modern FN Coin data model (owner rulings 2026-08-17
+ * and the corrective ruling 2026-08-18;
+ * doc/design/b3-legacy-fn-issuance-proposal.md).
  *
- * CONSENSUS-INACTIVE BY CONSTRUCTION: FN v1 is not an activated policy on
- * any network (modern/policy.h IsActivatedPolicy), and nothing in block
- * validation, mempool, wallet, RPC, mining, rewards, supply accounting or
- * claimed[pod_id] state calls this header. It defines only the canonical
- * data model, byte-stable serialization, strict parsing and the
- * claim-intent digest. The only permitted caller besides tests is the
- * OFFLINE capacity report (node/fn_pod.cpp -podreport), which measures —
- * never validates.
+ * THE LOCKED MODEL: FN Coin is ONE global, chain-scoped,
+ * fungible-but-indivisible modern colored asset — decimals = 0, at most
+ * MAX_FN_EVER_ISSUED units ever. Every FN unit is a unit of the same
+ * FnAssetId; there is NOT one asset per PoD, and the PoDId is never FN
+ * identity — it is only the one-time issuance receipt/nullifier
+ * (`issued[pod_id]`, future consensus state). After issuance an FN unit
+ * is ordinary fungible FN Coin; its historical origin is irrelevant to
+ * transfer semantics. Ownership is the modern ownership-policy
+ * commitment (one party, threshold or shared — ownership structure and
+ * divisibility are separate concepts: 2-of-3 over amount 1 is one
+ * jointly controlled unit, never thirds).
  *
- * Era separation (owner ruling): legacy history supplies PoD eligibility,
- * the PoDId, the historical funding scripts and fresh P2PKH/P2PK proofs
- * from the historical funding keys. Modern consensus supplies the claim
- * action, FN Coin creation, the modern B3 value, the OWNER v1 policy
- * commitment (one party, a threshold group or an organization — control
- * is entirely the modern OWNER mechanism), and later transfer, rewards,
- * extinguishment and claimed[pod_id]. The historical signatures authorize
- * the creation of ONE modern FN Coin; afterwards the legacy side has no
- * further authority. No legacy destination script exists anywhere in the
- * modern objects.
+ * THE COMMON PoD INVARIANT (both eras): valid PoD → the native B3
+ * sacrifice is permanent → authorized issuance of exactly +1
+ * FN_ASSET_ID. HISTORICAL FN: the legacy PoD destroyed native B3
+ * historically; a modern historical issuance verifies that sealed fact
+ * and creates exactly 1 FN Coin. MODERN FN (future work): a modern PoD
+ * destroys native B3 in the modern transaction itself and its validated
+ * issuance creates exactly 1 FN Coin. The eras differ ONLY in where the
+ * PoD evidence originates and when the B3 destruction occurred; in
+ * neither era does FN Coin replace, refund, denominate, or recreate the
+ * destroyed B3.
+ *
+ * CONSENSUS-INACTIVE BY CONSTRUCTION: FN v1 is not an activated policy
+ * on any network (modern/policy.h IsActivatedPolicy), and nothing in
+ * block validation, mempool, wallet, RPC, mining, rewards or supply
+ * accounting calls this header. It defines only the canonical data
+ * model, byte-stable serialization, strict parsing and pure model
+ * helpers. The only permitted caller besides tests is the OFFLINE
+ * capacity report (node/fn_pod.cpp -podreport), which measures — never
+ * validates.
+ *
+ * SUPERSEDED CONTENT KEPT AS RESERVED RECORD: the funding-key
+ * authorization records, FnClaimActionV1 and the claim-intent digest
+ * below belong to the abandoned funding-signature user-claim design
+ * (superseded by the archival-builder / stateless-proof issuance model,
+ * conflict register C-R4). Their registered creation-action type (1, 1)
+ * and codec bytes are preserved so old bytes never acquire new meaning;
+ * they are UNSUPPORTED for FN issuance and the issuance path rejects
+ * them (modern/legacy_fn_issuance.h carries the live action, type 2).
  */
 
 //! FN v1 policy identity, pinned. The numeric values are consensus-stable.
@@ -53,8 +75,32 @@ inline constexpr uint16_t FN_POLICY_TYPE{static_cast<uint16_t>(PolicyType::FN)};
 static_assert(FN_POLICY_TYPE == 5, "PolicyType::FN is pinned to 5");
 inline constexpr uint16_t FN_POLICY_VERSION_V1{POLICY_VERSION_V1};
 
-//! FN v1 params are exactly the 32-byte PoDId.
-inline constexpr size_t FN_POD_ID_SIZE{32};
+//! Hard cap on FN units EVER issued (legacy + modern issuance together;
+//! doc/design/b3-fn-pod.md §11.1 alias MAX_FN_EVER_CREATED, owner
+//! selection D-1). `issued_total` is monotonic: extinguishment reduces
+//! live supply but NEVER reopens issuance capacity.
+inline constexpr uint32_t MAX_FN_EVER_ISSUED{1000};
+
+/**
+ * The ONE global FN Coin asset identity (owner ruling 2026-08-18):
+ *
+ *     FN_ASSET_ID = TaggedHash("B3/FN/ASSET/V1") << ModernChainDomain
+ *
+ * Chain-scoped and deterministic — the domain input is the fail-closed
+ * ModernChainDomain (genesis || X), so the id exists only once H/X
+ * exist, is identical on every node of one chain, and differs across
+ * chains. "PoD A → +1, PoD B → +1": all units of the SAME asset. It
+ * cannot equal NativeAsset() (the all-zero id) short of a SHA256
+ * preimage. The MAINNET value is pinned only after mainnet H/X — and
+ * with it the mainnet domain — is frozen; tests pin the derivation
+ * (tag, preimage, byte order) on synthetic vectors.
+ */
+inline AssetId FnAssetId(const uint256& chain_domain)
+{
+    HashWriter writer{TaggedHash("B3/FN/ASSET/V1")};
+    writer << chain_domain;
+    return writer.GetSHA256();
+}
 
 // The generic CreationAction frame, the (type, version) registry and
 // the decode bounds live in the NEUTRAL layer, modern/creation_action.h
@@ -64,52 +110,63 @@ inline constexpr size_t FN_POD_ID_SIZE{32};
 // ---- The FN v1 output ---------------------------------------------------
 
 /**
- * Typed view of one FN v1 ModernOutput:
+ * Typed view of one FN v1 ModernOutput (corrected model, owner ruling
+ * 2026-08-18):
  *
- *     asset             = native B3
- *     amount            = the underlying modern B3 value
+ *     asset             = FN_ASSET_ID   (what asset this is — never
+ *                                        native B3, never per-PoD)
+ *     amount            = whole integer FN units (decimals = 0)
  *     policy_type       = FN (5), policy_version = 1
- *     policy_commitment = the modern OWNER v1 owner binding
- *     policy_params     = the 32-byte PoDId: a legacy claim carries the
- *                         historical disintegration's txid (raw bytes,
- *                         internal hash order); modern issuance will
- *                         carry the still-OPEN deterministic,
- *                         non-self-referential modern identifier
+ *     policy_commitment = the modern ownership-policy commitment
+ *                         (who controls the units)
+ *     policy_params     = EMPTY. Canonical for v1: no FN-v1 lifecycle
+ *                         parameters are approved, so none exist —
+ *                         opaque bytes that future code might
+ *                         reinterpret are not accepted. Any future
+ *                         lifecycle state requires a new explicitly
+ *                         defined FN policy version.
  *
- * FN v1 is a wrapper around modern OWNER authorization: the color and
- * PoDId live in the FN policy; spend control is the committed OWNER
- * mechanism, so shared/threshold/organizational ownership needs nothing
- * FN-specific. Future FN spend validation delegates owner authorization
- * to OWNER and then enforces transfer-vs-extinguishment (§10.2).
+ * No PoDId lives here: an FN output carries no issuance origin, is
+ * never bound to a disintegration, and transfers copy nothing
+ * historical. FN v1 wraps modern ownership authorization: the color is
+ * the asset id, control is the committed ownership policy, so
+ * shared/threshold/organizational ownership needs nothing FN-specific
+ * (one commitment controlling amount 1 is one jointly controlled whole
+ * unit, never fractions). STATUS: the commitment is a REPRESENTATION
+ * only — actual signature/threshold authorization is NOT implemented
+ * (VerifyTransitionProof today requires only a nonempty payload) and is
+ * a mandatory pre-activation item.
  */
 struct FnOutputView {
-    CAmount amount{0};
+    CAmount amount{0}; // whole FN units
     uint256 owner_commitment{};
-    Txid pod_id{};
 
     friend bool operator==(const FnOutputView& a, const FnOutputView& b)
     {
-        return a.amount == b.amount && a.owner_commitment == b.owner_commitment &&
-               a.pod_id == b.pod_id;
+        return a.amount == b.amount && a.owner_commitment == b.owner_commitment;
     }
 };
 
-//! Build the canonical FN v1 ModernOutput. Returns std::nullopt when the
-//! view violates v1 (zero PoDId, null owner commitment, amount outside
-//! MoneyRange).
-inline std::optional<ModernOutput> MakeFnOutput(const FnOutputView& view)
+//! Build the canonical FN v1 ModernOutput for the given chain's FN
+//! asset. Returns std::nullopt when the view violates v1 (null owner
+//! commitment, unit count outside [1, MAX_FN_EVER_ISSUED] — a zero FN
+//! balance is represented by NO output, never by a zero-amount output)
+//! or the asset id is the native asset.
+inline std::optional<ModernOutput> MakeFnOutput(const FnOutputView& view,
+                                                const AssetId& fn_asset_id)
 {
-    if (view.pod_id.ToUint256().IsNull()) return std::nullopt;
+    if (fn_asset_id == NativeAsset()) return std::nullopt;
     if (view.owner_commitment.IsNull()) return std::nullopt;
-    if (view.amount < 0 || view.amount > MAX_MONEY) return std::nullopt;
+    if (view.amount < 1 || view.amount > static_cast<CAmount>(MAX_FN_EVER_ISSUED)) {
+        return std::nullopt;
+    }
     ModernOutput out;
-    out.asset = NativeAsset();
+    out.asset = fn_asset_id;
     out.amount = view.amount;
     out.policy_type = FN_POLICY_TYPE;
     out.policy_version = FN_POLICY_VERSION_V1;
     out.policy_commitment = view.owner_commitment;
-    const uint256 raw{view.pod_id.ToUint256()};
-    out.policy_params.assign(raw.begin(), raw.end());
+    // policy_params: canonically EMPTY for v1 (default-constructed).
     return out;
 }
 
@@ -119,45 +176,120 @@ inline bool IsFnPolicyOutput(const ModernOutput& out)
     return out.policy_type == FN_POLICY_TYPE && out.policy_version == FN_POLICY_VERSION_V1;
 }
 
-//! Strict parse of an FN-claiming ModernOutput. Returns std::nullopt with
-//! `error` set when a claiming output violates any v1 rule; must only be
-//! called when IsFnPolicyOutput() is true.
-inline std::optional<FnOutputView> ParseFnOutput(const ModernOutput& out, std::string& error)
+//! Strict parse of an FN-claiming ModernOutput against the chain's FN
+//! asset id. Returns std::nullopt with `error` set when a claiming
+//! output violates any v1 rule. NOTE: the amount bound is STRUCTURAL
+//! representability only — an output holding up to MAX_FN_EVER_ISSUED
+//! units is well-formed, but no transaction may CREATE units because
+//! its amount parses: minting is authorized exclusively by validated
+//! issuance actions (+1 each), and totals are governed by the FN
+//! conservation equation, never by this parser.
+inline std::optional<FnOutputView> ParseFnOutput(const ModernOutput& out,
+                                                 const AssetId& fn_asset_id, std::string& error)
 {
     if (!IsFnPolicyOutput(out)) {
         error = "not an FN v1 output";
         return std::nullopt;
     }
-    if (out.asset != NativeAsset()) {
-        error = "FN output asset must be native B3";
+    if (out.asset == NativeAsset()) {
+        error = "FN output must not carry the native asset";
         return std::nullopt;
     }
-    if (out.amount < 0 || out.amount > MAX_MONEY) {
-        error = "FN output amount outside MoneyRange";
+    if (out.asset != fn_asset_id) {
+        error = "FN output asset is not the chain's FN asset id";
+        return std::nullopt;
+    }
+    if (out.amount < 1 || out.amount > static_cast<CAmount>(MAX_FN_EVER_ISSUED)) {
+        error = "FN unit count outside [1, MAX_FN_EVER_ISSUED]";
         return std::nullopt;
     }
     if (out.policy_commitment.IsNull()) {
         error = "FN owner commitment is null";
         return std::nullopt;
     }
-    if (out.policy_params.size() != FN_POD_ID_SIZE) {
-        error = "FN params must be exactly the 32-byte PoDId";
-        return std::nullopt;
-    }
-    uint256 raw;
-    std::copy(out.policy_params.begin(), out.policy_params.end(), raw.begin());
-    if (raw.IsNull()) {
-        error = "PoDId is zero";
+    if (!out.policy_params.empty()) {
+        error = "FN v1 params must be empty";
         return std::nullopt;
     }
     FnOutputView view;
     view.amount = out.amount;
     view.owner_commitment = out.policy_commitment;
-    view.pod_id = Txid::FromUint256(raw);
     return view;
 }
 
-// ---- Historical funding-key authorization records ----------------------
+// ---- Pure FN supply / conservation model (inactive) --------------------
+
+/**
+ * Pure model of the future issuance-cap and live-supply rules (owner
+ * ruling 2026-08-18). NOT wired anywhere: no persistent counters exist
+ * in this commit; consensus state arrives with FN activation.
+ *
+ *     fn_issued_total : monotonic, capped by MAX_FN_EVER_ISSUED
+ *     fn_live_supply  : reduced by extinguishment, which NEVER reopens
+ *                       issuance capacity
+ *
+ * Every helper validates the model invariant
+ * `live_supply <= issued_total <= MAX_FN_EVER_ISSUED` BEFORE acting —
+ * a malformed state is rejected, never operated on.
+ */
+struct FnSupplyModel {
+    uint32_t issued_total{0};
+    uint32_t live_supply{0};
+};
+
+//! The structural invariant every well-formed model satisfies.
+inline bool FnSupplyModelValid(const FnSupplyModel& model)
+{
+    return model.live_supply <= model.issued_total &&
+           model.issued_total <= MAX_FN_EVER_ISSUED;
+}
+
+//! One fresh, successfully validated legacy/modern FN issuance
+//! authorizes exactly +1 unit — and only below the ever-issued cap.
+//! Rejects malformed model state outright.
+inline bool FnAuthorizeIssuance(FnSupplyModel& model)
+{
+    if (!FnSupplyModelValid(model)) return false;
+    if (model.issued_total >= MAX_FN_EVER_ISSUED) return false;
+    ++model.issued_total;
+    ++model.live_supply;
+    return true;
+}
+
+//! Extinguishment destroys live units; issued_total is untouched, so
+//! capacity never reopens. Rejects malformed model state outright.
+inline bool FnExtinguish(FnSupplyModel& model, const uint32_t units)
+{
+    if (!FnSupplyModelValid(model)) return false;
+    if (units > model.live_supply) return false;
+    model.live_supply -= units;
+    return true;
+}
+
+//! The future FN conservation equation (recorded and testable here,
+//! deliberately NOT wired into the production asset checker):
+//!     Σ FN input units + validated fresh issuances
+//!         == Σ FN live output units + Σ FN extinguished units
+//! Overflow-safe: each side is guarded BEFORE the addition, so a
+//! wraparound (e.g. UINT64_MAX + 1) can never fabricate a balance.
+inline bool CheckFnUnitConservation(const uint64_t input_units, const uint64_t fresh_issuances,
+                                    const uint64_t output_units,
+                                    const uint64_t extinguished_units)
+{
+    if (input_units > std::numeric_limits<uint64_t>::max() - fresh_issuances) return false;
+    if (output_units > std::numeric_limits<uint64_t>::max() - extinguished_units) return false;
+    return input_units + fresh_issuances == output_units + extinguished_units;
+}
+
+// ========================================================================
+// SUPERSEDED RECORD from here to the end of this header: the funding-key
+// authorization records, FnClaimActionV1 and the claim-intent digest of
+// the abandoned funding-signature user-claim design. Codec history only
+// — see the header comment above for the full supersession contract.
+// Do not extend, do not reinterpret.
+// ========================================================================
+
+// ---- Historical funding-key authorization records (SUPERSEDED) ---------
 // These bytes prove control of LEGACY funding keys and are legitimately
 // legacy-shaped (P2PKH / P2PK key forms); everything they authorize is
 // modern. Strict form checks only — no verification against PodRecords
@@ -477,10 +609,13 @@ inline bool DecodeFnClaimAction(const CreationAction& action, FnClaimActionV1& o
     return true;
 }
 
-//! Exact worst-case serialized FN claim-action payload for a PoD with
-//! `n_scripts` distinct funding scripts: every record its P2PKH worst
-//! (uncompressed key, 72-byte DER). The single source of truth for the
-//! offline capacity report.
+//! SUPERSEDED MEASUREMENT: exact worst-case serialized payload of the
+//! ABANDONED type-1 claim action for a PoD with `n_scripts` distinct
+//! funding scripts (every record its P2PKH worst: uncompressed key,
+//! 72-byte DER). Feeds only the superseded, NON-AUTHORITATIVE
+//! -podreport payload figures (node/fn_pod.h PodCapacityReport); says
+//! nothing about the live type-2 issuance carrier, whose real encoded
+//! sizes remain unmeasured future work.
 inline size_t WorstCaseFnClaimActionPayload(const size_t n_scripts)
 {
     size_t payload{detail::CompactSizeLen(std::numeric_limits<uint32_t>::max())}; // output index
@@ -494,63 +629,21 @@ inline size_t WorstCaseFnClaimActionPayload(const size_t n_scripts)
 }
 
 /**
- * Structural rules for a transition's creation actions against its
- * outputs (owner ruling 2026-08-17) — syntactic only, NOT wired into any
- * validation path in this commit:
- *
- *   - actions sorted by ascending referenced output index, no duplicates;
- *   - every referenced index exists and the output is FN v1;
- *   - exactly one claim action per FN v1 output — no FN output without
- *     an action, no action without an FN output.
- *
- * SCOPE (owner rulings 2026-08-17): this is a LEGACY-CLAIM-CONTEXT
- * helper ONLY — a claim's FN output references a historical PoD and
- * must carry the funding-key authorizations. MODERN ISSUANCE is the
- * simple path and needs NO claim action and NO historical funding-key
- * authorization: its authorization is paying the required
- * disintegration D through the locked §10.1 hypothetical-output
- * arithmetic; it still has ordinary modern input proofs and whatever
- * outer transaction format is selected later. The exact modern
- * issuance identifier and the exact issuance-vs-claim classifier are
- * OPEN owner decisions — NOT solved here (in particular, an issuance
- * PoDId cannot be the transaction's own id: the FN output serializes
- * the PoDId while the transition id hashes the outputs, which would be
- * self-referential).
+ * The FN semantic gate over a transition's creation actions under the
+ * CORRECTED model. Type (1, 1) — the abandoned claim action — is codec
+ * history only: the generic framing layer may still decode its bytes,
+ * but NO current FN semantic checker accepts it, so this function
+ * REJECTS every type-1 action outright. Deep validation of the live
+ * issuance action (type 2) is chain-contextual and lives in
+ * modern/legacy_fn_issuance.h VerifyLegacyFnIssuanceAction — not here.
  */
 inline bool CheckFnCreationActions(const std::vector<CreationAction>& actions,
                                    const std::vector<ModernOutput>& outputs, std::string& error)
 {
-    std::set<uint32_t> claimed_outputs;
-    uint64_t last_index{0};
-    bool first{true};
+    (void)outputs;
     for (const CreationAction& action : actions) {
-        FnClaimActionV1 claim;
-        if (!DecodeFnClaimAction(action, claim, error)) return false;
-        if (!first && claim.fn_output_index <= last_index) {
-            error = "creation actions not in ascending output-index order";
-            return false;
-        }
-        first = false;
-        last_index = claim.fn_output_index;
-        if (claim.fn_output_index >= outputs.size()) {
-            error = "creation action references a nonexistent output";
-            return false;
-        }
-        const ModernOutput& target{outputs[claim.fn_output_index]};
-        if (!IsFnPolicyOutput(target)) {
-            error = "creation action references a non-FN output";
-            return false;
-        }
-        std::string parse_error;
-        if (!ParseFnOutput(target, parse_error)) {
-            error = "creation action references a malformed FN output: " + parse_error;
-            return false;
-        }
-        claimed_outputs.insert(claim.fn_output_index);
-    }
-    for (uint32_t n{0}; n < outputs.size(); ++n) {
-        if (IsFnPolicyOutput(outputs[n]) && !claimed_outputs.contains(n)) {
-            error = "FN output has no creation action";
+        if (action.action_type == CREATION_ACTION_FN_CLAIM) {
+            error = "superseded FN claim action is not accepted";
             return false;
         }
     }

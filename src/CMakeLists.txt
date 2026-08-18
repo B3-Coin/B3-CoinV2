@@ -241,6 +241,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/txorphanage.cpp
   node/txreconciliation.cpp
   node/fn_pod.cpp
+  node/legacy_fn_issuance.cpp
   node/stake_registry.cpp
   node/utxo_commitment.cpp
   node/utxo_equivalence_check.cpp

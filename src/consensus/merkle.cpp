@@ -178,3 +178,18 @@ std::vector<uint256> TransactionMerklePath(const CBlock& block, uint32_t positio
     }
     return ComputeMerklePath(leaves, position);
 }
+
+uint256 ComputeMerkleRootFromPath(const uint256& leaf, const std::vector<uint256>& path,
+                                  uint32_t position)
+{
+    uint256 hash{leaf};
+    for (const uint256& sibling : path) {
+        if (position & 1) {
+            hash = Hash(sibling, hash);
+        } else {
+            hash = Hash(hash, sibling);
+        }
+        position >>= 1;
+    }
+    return hash;
+}

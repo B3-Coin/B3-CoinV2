@@ -206,24 +206,38 @@ private:
  */
 bool SyncPodRecords(ChainstateManager& chainman, PodDB& db, std::string& error);
 
-//! Capacity-gate report over a set of records (b3-fn-pod.md §8.4). The
-//! measured carrier is the NATIVE modern claim action (modern/fn.h
-//! FnClaimActionV1): its worst-case serialized payload per claim against
-//! the segregated proof-area bound MAX_TRANSITION_PROOF_SIZE (4,000
-//! bytes). This is offline measurement, never validation.
+//! Offline PoD report over a set of records. The qualifying-PoD counts
+//! (the R counter against MAX_FN_EVER_ISSUED) remain the meaningful
+//! pre-activation gate; the payload arithmetic below is a SUPERSEDED
+//! type-1 diagnostic (see the PodCapacityReport banner) — NOT the
+//! type-2 issuance activation capacity gate. Offline measurement,
+//! never validation.
+/**
+ * SUPERSEDED MEASUREMENT — NON-AUTHORITATIVE FOR ACTIVATION (owner
+ * correction 2026-08-18). This report's payload arithmetic measures
+ * `WorstCaseFnClaimActionPayload`, the worst case of the ABANDONED
+ * type-1 funding-signature claim encoding (`FnClaimActionV1`). It is
+ * NOT the capacity gate for the live type-2 issuance carrier
+ * (`LegacyFnIssuanceActionV1`), whose real encoded sizes over actual
+ * mainnet history REMAIN UNMEASURED — that measurement is recorded
+ * future work, and FN activation stays blocked until it exists or a
+ * reviewed versioned carrier is selected. The qualifying-PoD counts
+ * (the R counter against MAX_FN_EVER_ISSUED) remain meaningful.
+ */
 struct PodCapacityReport {
     size_t total_qualifying{0};
     size_t claimable{0};
     std::map<uint8_t, size_t> by_reason;
     size_t max_distinct_funding_scripts{0};
-    //! Worst-case serialized FnClaimActionV1 payload for the largest
-    //! eligible claim (every record P2PKH, uncompressed key, 72-byte DER).
+    //! SUPERSEDED: worst-case serialized payload of the ABANDONED
+    //! FnClaimActionV1 (every record P2PKH, uncompressed key, 72-byte
+    //! DER) — kept as the historical measurement record only.
     size_t max_action_payload{0};
-    //! Claimable PoDs whose worst-case action payload fits within /
-    //! exceeds the 4,000-byte native bound.
+    //! SUPERSEDED: fit of the abandoned type-1 payload against the
+    //! 4,000-byte bound. Says nothing about the type-2 issuance proof.
     size_t within_native_bound{0};
     size_t exceeding_native_bound{0};
-    //! The native-action fit verdict: every claimable PoD fits.
+    //! SUPERSEDED verdict over the abandoned encoding.
     bool fits_native_action{true};
 };
 

@@ -457,6 +457,10 @@ BOOST_FIXTURE_TEST_CASE(chain_derivation_and_determinism, PodTestSetup)
         BOOST_CHECK(!records[2].claimable);
         BOOST_CHECK(records[2].reason == PodClaimability::UNSUPPORTED_FUNDING_SCRIPT);
 
+        // The report's PAYLOAD figures are the SUPERSEDED type-1
+        // arithmetic (non-authoritative for activation; the type-2
+        // issuance carrier is measured separately as future work) — the
+        // qualifying counts remain meaningful.
         const auto report{node::BuildPodCapacityReport(records)};
         BOOST_CHECK_EQUAL(report.total_qualifying, 3U);
         BOOST_CHECK_EQUAL(report.claimable, 1U);

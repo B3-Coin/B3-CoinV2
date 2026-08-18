@@ -76,13 +76,17 @@ inline constexpr size_t MAX_POLICY_PARAMS_SIZE{80};
  *    Weight aggregates per validator key, never per output. Active from
  *    the modern era's first block: STAKE creation during the temporary-PoW
  *    corridor is what prepares the initial validator registry.
- *  - FN: an FN Coin — native B3 value colored with a Fundamental Node
- *    right (modern/fn.h, doc/design/b3-fn-pod.md §8). v1: the commitment
- *    is the modern OWNER v1 owner binding (control is entirely the OWNER
- *    mechanism — one party, a threshold group or an organization alike)
- *    and params are exactly the 32-byte PoDId: for a legacy claim, the
- *    historical disintegration's txid; for modern issuance, the
- *    still-OPEN deterministic, non-self-referential modern identifier.
+ *  - FN: FN Coin (modern/fn.h,
+ *    doc/design/b3-legacy-fn-issuance-proposal.md; corrected owner
+ *    specification 2026-08-18) — the ONE global chain-scoped
+ *    fungible-but-indivisible colored asset, NEVER the native asset:
+ *    v1 carries the non-native global FN_ASSET_ID (modern/fn.h
+ *    FnAssetId, enforced by the FN layers — this layer can only pin
+ *    non-native), a whole-unit amount in [1, MAX_FN_EVER_ISSUED], the
+ *    modern ownership-policy commitment as the commitment (one party,
+ *    a threshold group or an organization alike), and canonically
+ *    EMPTY params. The PoDId lives ONLY in issuance evidence and the
+ *    future issued[pod_id] nullifier state — never in FN outputs.
  *    FN v1 is NOT activated on
  *    any network yet: creation, transfer and extinguishment rules arrive
  *    with the FN validation commits, and until an explicit activation
@@ -206,12 +210,17 @@ inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int he
         break;
     case PolicyType::FN:
         // UNREACHABLE until FN v1 is activated (IsActivatedPolicy above
-        // fails closed). The v1 structural rules, ready for that day:
-        // native B3 value, the OWNER v1 owner binding as commitment, and
-        // exactly the 32-byte nonzero PoDId as params.
-        if (out.asset != NativeAsset()) return PolicyOutputCheck::BAD_ASSET;
+        // fails closed). The v1 structural rules, ready for that day
+        // (owner ruling 2026-08-18): FN Coin is the ONE global
+        // chain-scoped colored asset — never the native asset (the exact
+        // FnAssetId needs the chain domain and is enforced by the FN
+        // layers, modern/fn.h) — with whole-unit amounts, the modern
+        // ownership-policy commitment, and canonically EMPTY params:
+        // PoDId is an issuance nullifier, never output identity, and no
+        // opaque future-reinterpretable bytes are accepted.
+        if (out.asset == NativeAsset()) return PolicyOutputCheck::BAD_ASSET;
         if (out.policy_commitment.IsNull()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
-        if (out.policy_params.size() != 32) return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        if (!out.policy_params.empty()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
         break;
     }
     return PolicyOutputCheck::OK;

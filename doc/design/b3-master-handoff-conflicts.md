@@ -234,3 +234,39 @@ committed. The hypothetical-output idea applies ONLY to modern FN-creation
 accounting; b3-fn-pod.md §8 (integrated funding-key scan-and-claim, its
 claim carrier, and the `claimed[pod_id]` registry) remains the governing
 legacy claim design pending its own later review.
+
+## C-R4 — §8 scan-and-claim + PodDB production plan — **SUPERSEDED (owner ruling 2026-08-17/18)**
+
+The owner's later explicit ruling replaces the legacy-claim mechanism a
+second time. The LOCKED direction is now the **archival-builder /
+stateless-proof issuance model**
+([b3-legacy-fn-issuance-proposal.md](b3-legacy-fn-issuance-proposal.md)):
+
+- Legacy PoDs stay plain confirmed legacy transactions. ONE archival
+  builder — no special authority; anyone with full history builds
+  byte-identical transactions — constructs proof-carrying FN issuance
+  transactions, holds them privately before the modern activation height
+  M, and broadcasts them at or after M.
+- Every node verifies STATELESSLY: embedded merkle proofs of the
+  disintegration and its funding transactions against the node's own
+  block index, whose roots are trusted only after confirming the active
+  block at H is exactly X; gap and tier recomputed from proven bytes.
+  No funding-key claim signatures, no user claim process, no every-node
+  legacy rescan, no production PodDB.
+- Eligibility: non-coinbase, non-coinstake, gap >= tier, AND a 1-COIN
+  byte-exact-P2PKH output — the historical client's own FN registration
+  rule (master `signhelper_mn.h:20`, `fn-activity.cpp:396`,
+  `main.cpp:825`). The canonical recipient is the LOWEST-INDEX such
+  output; a disintegration without one is IGNORED, no fallback.
+- Issuance uniqueness is enforced PER PoDID (the one-issuance-per-PoDId
+  rule; the future `claimed[pod_id]` state) — never by proof or
+  transaction byte identity.
+- §8.3's funding-key authorization encoding (`FnClaimActionV1`,
+  committed inactive) is superseded and awaits retirement in a reviewed
+  commit. §8.2's derivation machinery (classifier, `DerivePodRecords`,
+  `PodDB`, the sync helper) survives as BUILDER-SIDE tooling only; the
+  formerly "required future integration" of PodDB into production
+  sync/reindex is CANCELLED (an in-flight nine-file wiring diff was
+  reverted uncommitted on the owner's order).
+- C-R1 stands only in what it REJECTED (the marker-spend mechanism);
+  its scan-and-claim affirmation is superseded by this entry.

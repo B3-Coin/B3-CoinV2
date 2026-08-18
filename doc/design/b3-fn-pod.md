@@ -148,12 +148,44 @@ reduced; FN Coin supply independently accounted.
 
 ## 8. Legacy FN claims — NORMATIVE MVP (integrated scan-and-claim)
 
-Approved direction (2026-08-16, revised): FN eligibility is derived
-entirely during node synchronization from on-chain history, and claims are
-authorized by **fresh signatures from the historical funding keys** — the
-keys that actually paid the disintegration. There is no external scanner,
-no external claim registry, and no marker-based ownership. This section is
-normative.
+> **SUPERSEDED (owner ruling 2026-08-17/18; conflict register C-R4).**
+> The scan-and-claim mechanism of this section — funding-key claim
+> signatures (§8.3), the per-node claim activation flow, and any
+> production PodDB integration into sync/reindex — is replaced by the
+> **archival-builder / stateless-proof issuance model**, the owner-locked
+> direction:
+> [b3-legacy-fn-issuance-proposal.md](b3-legacy-fn-issuance-proposal.md).
+> One archival wallet builds proof-carrying issuance transactions from
+> the sealed prefix (deferred privately until M); every node verifies
+> the embedded evidence statelessly against the H/X anchor; issuance is
+> deduplicated per PoDId. What SURVIVES from this section as governing:
+> the qualifying-PoD definition and detector, the §8.2 derivation
+> machinery (classifier, `DerivePodRecords`, `PodDB`, sync helper) as
+> **builder-side tooling only**, the capacity-report machinery, and the
+> one-issuance-per-PoDId uniqueness principle (the future
+> `issued[pod_id]` state — the corrected terminology: this is ISSUANCE,
+> not a user claim protocol; `claimed[pod_id]` below reads as its
+> superseded name). Semantic reversals under the corrected FN model
+> (owner 2026-08-18): the 1-B3 **P2PKH** output is no longer audit-only
+> — it is the historical FN identity and designates the issuance
+> beneficiary (lowest index; a PoD without one is IGNORED, no
+> fallback); funding-script claimability (`claimable` /
+> `UNSUPPORTED_FUNDING_SCRIPT`) no longer gates issuance, because no
+> fresh signature is ever checked; and **FN Coin is ONE global
+> fungible-but-indivisible asset** (`FN_ASSET_ID`, decimals 0, cap
+> `MAX_FN_EVER_ISSUED = 1000`) — no per-PoD FN objects, no PoDId in
+> ordinary FN outputs, and the §10.2 "same-PoDId successor" transfer
+> lifecycle is superseded with it (transfers move whole units of the
+> one asset; extinguishment reduces live supply, never issuance
+> capacity).
+
+Approved direction (2026-08-16, revised; **superseded as annotated
+above**): FN eligibility is derived entirely during node synchronization
+from on-chain history, and claims are authorized by **fresh signatures
+from the historical funding keys** — the keys that actually paid the
+disintegration. There is no external scanner, no external claim registry,
+and no marker-based ownership. This section is retained as the record of
+the superseded design.
 
 ### 8.1 Activation and anchor — deterministic network values
 
@@ -452,20 +484,21 @@ A claim is a MODERN transition (height ≥ M) carrying:
 
         Size bound: a creation-action payload shares the segregated
         proof area's limit, MAX_TRANSITION_PROOF_SIZE = 4,000 bytes.
-        CAPACITY GATE (native): the offline -podreport measures, per
-        eligible historical PoD, the worst-case serialized claim-action
-        payload (every record P2PKH, uncompressed key, 72-byte DER)
-        against the 4,000-byte bound and reports the counts fitting and
-        exceeding it plus the explicit native-action fit verdict. The
-        complete real-chain run remains a PRE-ACTIVATION gate; it does
-        not block the inactive codec.
+        SUPERSEDED DIAGNOSTIC (owner correction 2026-08-18): the
+        -podreport payload arithmetic described here measures the
+        worst-case payload of THIS superseded type-1 encoding and is
+        NON-AUTHORITATIVE for activation — it is NOT the capacity gate
+        for the live type-2 issuance carrier (LegacyFnIssuanceActionV1,
+        b3-legacy-fn-issuance-proposal.md), whose real encoded sizes
+        over actual history remain unmeasured future work.
 
-   Status note (owner ruling 2026-08-17): this encoding is implemented
-   and tested consensus-inactive (codec + vectors only, unreachable
-   from validation/mempool/wallet/RPC/mining; FN v1 unactivated
-   everywhere); `-podreport` remains mandatory before mainnet
-   activation and before the modern relay-policy bounds are finalized
-   (commit 6); H/X remain unset.
+   Status note (owner rulings 2026-08-17/18): this encoding is a
+   RESERVED/SUPERSEDED frozen record, consensus-inactive (codec +
+   vectors only, unreachable from validation/mempool/wallet/RPC/mining;
+   FN v1 unactivated everywhere; no FN semantic checker accepts it).
+   The real-chain `-podreport` QUALIFYING COUNT (`R` vs the 1,000 cap,
+   §11.1) remains the mandatory pre-activation release gate; the
+   payload figures do not gate anything. H/X remain unset.
 
 3. Ordinary inputs paying fees and any ordinary outputs. The claim spends
    NO historical outpoint; the marker, if it still exists, is untouched

@@ -45,6 +45,27 @@ Scope: B3 transition context, modern colored assets, FN Coin/Proof of Disintegra
 >    UTXO set) was **rejected in full** and must not be revived; §8 of
 >    b3-fn-pod.md remains the governing legacy claim design
 >    (conflict register C-R3).
+>    *[Since superseded in turn — see the 2026-08-17/18 note below.]*
+
+> **Owner reconciliation (2026-08-17/18, second legacy-FN supersession).**
+> The owner's later explicit ruling replaces the legacy FN mechanism again.
+> The **OWNER-LOCKED direction** is the **archival-builder /
+> stateless-proof issuance model**
+> ([b3-legacy-fn-issuance-proposal.md](b3-legacy-fn-issuance-proposal.md),
+> conflict register C-R4): legacy disintegrations stay plain confirmed
+> legacy transactions; ONE archival wallet (no special authority) builds
+> proof-carrying FN issuance transactions from the sealed prefix, holds
+> them privately before M, and broadcasts them at or after M; every node
+> verifies the embedded merkle/value evidence STATELESSLY against the H/X
+> anchor (the chain view's block at H must be exactly X before any root is
+> trusted). No funding-key claim signatures, no user claim process, no
+> every-node legacy rescan, no production PodDB. The recipient rule is the
+> historical client's own FN registration rule: the lowest-index 1-B3
+> P2PKH output of the disintegration designates the recipient, and a
+> disintegration without one is IGNORED (no fallback). Issuance
+> uniqueness is per PoDId. The scan-and-claim affirmation in the
+> 2026-08-16 note above is superseded to that extent — its rejection of
+> the §4.5 marker-spend mechanism stands.
 
 ## 0. How this document must be used
 

@@ -31,9 +31,12 @@ struct ReplayEquivalenceOptions {
     int final_height{-1};          //!< H: the height under verification
     uint256 final_hash{};          //!< X: the exact block hash at H
     size_t max_mismatch_sample{20}; //!< bound on retained per-outpoint diagnostics
-    //! Also derive the historical PoD capacity-gate report during the
-    //! replay pass (b3-fn-pod.md §8.4): every qualifying PoD through H,
-    //! classified with the same single interpretation as the node.
+    //! Also derive the historical PoD report during the replay pass:
+    //! every qualifying PoD through H, classified with the same single
+    //! interpretation as the node. The qualifying COUNT is the
+    //! meaningful pre-activation gate; the report's payload arithmetic
+    //! is a SUPERSEDED type-1 diagnostic (node/fn_pod.h
+    //! PodCapacityReport banner), not the type-2 activation gate.
     bool derive_pod_report{false};
 };
 

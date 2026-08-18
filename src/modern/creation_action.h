@@ -21,28 +21,45 @@ namespace modern {
  * (owner ruling 2026-08-17). Input proofs authorize spending a previous
  * output; a creation action authorizes CREATING one of the transition's
  * own outputs. This header carries only the generic frame and the
- * bounded collection codec; the FN-specific payload rules
- * (FnClaimActionV1, historical authorizations, semantic checks) live in
- * modern/fn.h, which depends on this header — never the reverse, and
- * modern/proof.h depends only on this neutral layer.
+ * bounded collection codec. The LIVE FN issuance semantics (action type
+ * 2) live in modern/legacy_fn_issuance.h; modern/fn.h carries the FN
+ * data model plus the RESERVED superseded type-1 codec record. Both
+ * depend on this header — never the reverse — and modern/proof.h
+ * depends only on this neutral layer.
  *
- * Registry of (action_type, action_version). Type 1 is the first and
- * only registered action: the FN claim (payload rules in modern/fn.h).
- * Unknown pairs are INVALID, never ignored — the strict section decoder
- * rejects them outright, and any future consensus validation MUST do
- * the same (the same fail-closed rule modern/policy.h applies to
- * unknown policies). A future action type requires an explicit registry
- * entry and its own versioned review.
+ * Registry of (action_type, action_version). Unknown pairs are INVALID,
+ * never ignored — the strict section decoder rejects them outright, and
+ * any future consensus validation MUST do the same (the same
+ * fail-closed rule modern/policy.h applies to unknown policies). A
+ * future action type requires an explicit registry entry and its own
+ * versioned review.
+ *
+ *  - Type 1: the FN claim of the abandoned funding-signature design —
+ *    RESERVED/SUPERSEDED (owner ruling 2026-08-17/18, conflict register
+ *    C-R4). Its bytes and codec are preserved (modern/fn.h) so old
+ *    bytes never acquire new meaning; it is UNSUPPORTED for FN issuance
+ *    and the issuance path rejects it. Never reuse or reinterpret.
+ *  - Type 2: the legacy FN issuance action — the one-time
+ *    archival/historical issuance proof carrier (payload rules in
+ *    modern/legacy_fn_issuance.h). Carries no funding-key signatures,
+ *    no user claim authorization, no administrator authorization.
  */
-inline constexpr uint16_t CREATION_ACTION_FN_CLAIM{1};
+inline constexpr uint16_t CREATION_ACTION_FN_CLAIM{1}; // RESERVED/SUPERSEDED
 inline constexpr uint16_t FN_CLAIM_ACTION_VERSION_V1{1};
+inline constexpr uint16_t CREATION_ACTION_LEGACY_FN_ISSUANCE{2};
+inline constexpr uint16_t LEGACY_FN_ISSUANCE_ACTION_VERSION_V1{1};
 
 //! Whether a (type, version) pair is a registered creation action.
+//! Registration keeps a pair DECODABLE at the framing layer (so
+//! reserved superseded bytes stay well-defined); semantic acceptance is
+//! each action's own dispatch.
 inline constexpr bool IsKnownCreationAction(const uint16_t action_type,
                                             const uint16_t action_version)
 {
-    return action_type == CREATION_ACTION_FN_CLAIM &&
-           action_version == FN_CLAIM_ACTION_VERSION_V1;
+    return (action_type == CREATION_ACTION_FN_CLAIM &&
+            action_version == FN_CLAIM_ACTION_VERSION_V1) ||
+           (action_type == CREATION_ACTION_LEGACY_FN_ISSUANCE &&
+            action_version == LEGACY_FN_ISSUANCE_ACTION_VERSION_V1);
 }
 
 /**

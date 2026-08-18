@@ -85,12 +85,13 @@ void Usage()
                 "                         and verify U_master == U_port == U_replay; with this\n"
                 "                         option, exit 0 only when all three sets agree\n"
                 "\n"
-                "FN Proof-of-Disintegration capacity gate (doc/design/b3-fn-pod.md):\n"
+                "FN Proof-of-Disintegration report (doc/design/b3-fn-pod.md):\n"
                 "  -podreport             derive every qualifying historical PoD during the\n"
-                "                         replay pass and print the capacity-gate report\n"
-                "                         (totals, claimability reasons, max distinct funding\n"
-                "                         scripts, worst-case native claim-action payload,\n"
-                "                         fit against the 4,000-byte proof-area bound)\n");
+                "                         replay pass and print the report. The QUALIFYING\n"
+                "                         COUNT (R vs the 1,000 cap) is the pre-activation\n"
+                "                         gate; the payload figures are a SUPERSEDED type-1\n"
+                "                         diagnostic, NOT the type-2 issuance capacity gate\n"
+                "                         (real type-2 proof sizes = future measurement)\n");
 }
 
 struct ToolArgs {
@@ -340,7 +341,8 @@ int main(int argc, char* argv[])
         tfm::format(std::cout, "result:             %s\n",
                     result.ok ? "EQUAL (U_port == U_replay)" : "NOT EQUAL");
 
-        // ---- FN PoD capacity-gate report (doc/design/b3-fn-pod.md §8.4).
+        // ---- Historical PoD report (doc/design/b3-fn-pod.md §8.4);
+        // payload portion superseded/non-authoritative.
         if (result.pod_report) {
             const node::PodCapacityReport& pod{*result.pod_report};
             tfm::format(std::cout, "PoD qualifying:     %d\n", pod.total_qualifying);
@@ -351,14 +353,22 @@ int main(int argc, char* argv[])
             }
             tfm::format(std::cout, "PoD max scripts:    %d (largest eligible claim)\n",
                         pod.max_distinct_funding_scripts);
-            tfm::format(std::cout, "PoD max action:     %d bytes (worst-case FnClaimActionV1 payload)\n",
+            tfm::format(std::cout, "PoD max action:     %d bytes (SUPERSEDED: worst-case payload of the ABANDONED type-1 FnClaimActionV1)\n",
                         pod.max_action_payload);
-            tfm::format(std::cout, "PoD within 4000:    %d\n", pod.within_native_bound);
-            tfm::format(std::cout, "PoD exceeding 4000: %d\n", pod.exceeding_native_bound);
+            tfm::format(std::cout, "PoD within 4000:    %d (superseded type-1 arithmetic)\n",
+                        pod.within_native_bound);
+            tfm::format(std::cout, "PoD exceeding 4000: %d (superseded type-1 arithmetic)\n",
+                        pod.exceeding_native_bound);
             tfm::format(std::cout, "PoD native fit:     %s\n",
                         pod.fits_native_action
-                            ? "yes (every claim fits the native creation action)"
-                            : "NO - REVISE THE NATIVE ACTION BOUND BEFORE ACTIVATION");
+                            ? "yes (SUPERSEDED type-1 verdict; NOT the type-2 issuance capacity gate)"
+                            : "NO (superseded type-1 verdict)");
+            tfm::format(std::cout,
+                        "NOTE: the payload figures above measure the ABANDONED funding-signature\n"
+                        "claim encoding and are NON-AUTHORITATIVE for activation. Real encoded\n"
+                        "LegacyFnIssuanceActionV1 (type-2) proof sizes over actual history are\n"
+                        "UNMEASURED future work; FN activation remains blocked until that\n"
+                        "measurement exists or a reviewed versioned carrier is selected.\n");
             for (const node::PodRecord& record : result.pod_records) {
                 tfm::format(std::cout,
                             "  pod %s h=%d gap=%d tier=%d scripts=%d claimable=%s markers=%d\n",
