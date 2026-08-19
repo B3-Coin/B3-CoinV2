@@ -50,6 +50,7 @@ add_executable(test_bitcoin
   flatfile_tests.cpp
   flowmesh_batch_tests.cpp
   flowmesh_microblock_tests.cpp
+  flowmesh_sync_tests.cpp
   flowmesh_clearing_tests.cpp
   flowmesh_ledger_tests.cpp
   fn_claim_tests.cpp

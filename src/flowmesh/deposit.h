@@ -64,6 +64,24 @@ public:
                                                   const AnchorRef& anchor) const = 0;
 };
 
+/**
+ * Anchor acceptability, isolated: WHAT counts as an acceptable B3
+ * position (finality depth, reorg handling) is an OWNER DECISION (OD-6);
+ * validators consult this interface and node-side implementations read
+ * real chain state. `Current()` is the anchor a proposer should use now.
+ *
+ * CONTRACT: Acceptable must be deterministic for nodes sharing the same
+ * B3 chain view; disagreement across honest nodes is bounded by the
+ * chosen finality depth — exactly the risk parameter the owner sets.
+ */
+class AnchorPolicy
+{
+public:
+    virtual ~AnchorPolicy() = default;
+    virtual bool Acceptable(const AnchorRef& anchor) const = 0;
+    virtual AnchorRef Current() const = 0;
+};
+
 } // namespace flowmesh
 
 #endif // B3COIN_FLOWMESH_DEPOSIT_H
