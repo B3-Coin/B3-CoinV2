@@ -104,6 +104,12 @@ enum class PolicyType : uint16_t {
 //! DEX_VAULT v1 params: exactly a little-endian 2-byte shard id.
 inline constexpr size_t VAULT_SHARD_PARAMS_SIZE{2};
 
+//! STAKE v1 params: the 32-byte validator key plus 2 reserved bytes that
+//! must be zero (mirrors the script carrier's payload after its magic —
+//! modern/stake.h STAKE_VALIDATOR_KEY_SIZE/STAKE_RESERVED_SIZE).
+inline constexpr size_t STAKE_PARAMS_KEY_SIZE{32};
+inline constexpr size_t STAKE_PARAMS_SIZE{34};
+
 //! First and, at this stage, only version of either policy.
 inline constexpr uint16_t POLICY_VERSION_V1{1};
 
@@ -206,6 +212,22 @@ inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int he
         if (out.policy_commitment.IsNull()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
         if (out.policy_params.size() != VAULT_SHARD_PARAMS_SIZE) {
             return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        }
+        break;
+    case PolicyType::STAKE:
+        // Locked NATIVE B3 carrying a validator binding: the commitment
+        // is the owner binding (non-null) and the params are exactly the
+        // 32-byte validator key plus 2 zero reserved bytes — the
+        // ModernOutput view of the stake.h script carrier. Previously
+        // this case was missing and an activated STAKE output fell
+        // through the switch structurally unchecked.
+        if (out.asset != NativeAsset()) return PolicyOutputCheck::BAD_ASSET;
+        if (out.policy_commitment.IsNull()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        if (out.policy_params.size() != STAKE_PARAMS_SIZE) {
+            return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        }
+        for (size_t i{STAKE_PARAMS_KEY_SIZE}; i < STAKE_PARAMS_SIZE; ++i) {
+            if (out.policy_params[i] != 0x00) return PolicyOutputCheck::BAD_POLICY_PARAMS;
         }
         break;
     case PolicyType::FN:

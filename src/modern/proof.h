@@ -222,6 +222,15 @@ inline ProofCheck VerifyTransitionProof(const ModernOutput& prev_output,
         // modern/vault.h.
         if (!ParseVaultReceiptIds(proof.payload)) return ProofCheck::MALFORMED;
         return ProofCheck::OK;
+    case PolicyType::STAKE:
+        // DELIBERATELY UNSPENDABLE AT THIS LAYER for now: how locked
+        // stake exits (unbonding/cooldown, and whether cancel remains an
+        // ordinary script-carrier spend) is an OPEN modern-PoS decision
+        // (corridor audit S-3), and corridor STAKE lives as a script
+        // carrier spent under script rules, not as a ModernOutput. An
+        // explicit case so the gap is a decision on record, not a
+        // silent switch fall-through.
+        return ProofCheck::UNKNOWN_POLICY;
     case PolicyType::FN:
         // UNREACHABLE until FN v1 is activated (IsActivatedPolicy fails
         // closed above). Spending an FN coin delegates owner

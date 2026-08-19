@@ -182,4 +182,42 @@ BOOST_AUTO_TEST_CASE(pre_h_utxos_view_as_native_legacy_lock)
                 before.size() == after.size());
 }
 
+BOOST_AUTO_TEST_CASE(stake_v1_structure_is_enforced)
+{
+    const Consensus::Params params{B3Params()};
+    const int modern_height{SYNTHETIC_H + 1};
+
+    modern::ModernOutput out;
+    out.asset = modern::NativeAsset();
+    out.amount = 5'000'000;
+    out.policy_type = static_cast<uint16_t>(modern::PolicyType::STAKE);
+    out.policy_version = modern::POLICY_VERSION_V1;
+    out.policy_commitment =
+        uint256{"00000000000000000000000000000000000000000000000000000000000000c7"};
+    out.policy_params.assign(modern::STAKE_PARAMS_SIZE, 0x00);
+    for (size_t i{0}; i < modern::STAKE_PARAMS_KEY_SIZE; ++i) out.policy_params[i] = 0x42;
+
+    BOOST_CHECK(modern::CheckPolicyOutput(out, modern_height, params) ==
+                modern::PolicyOutputCheck::OK);
+
+    // Regression: an activated STAKE output must never fall through the
+    // structural switch unchecked.
+    modern::ModernOutput bad{out};
+    bad.asset = uint256{"00000000000000000000000000000000000000000000000000000000000000a5"};
+    BOOST_CHECK(modern::CheckPolicyOutput(bad, modern_height, params) ==
+                modern::PolicyOutputCheck::BAD_ASSET);
+    bad = out;
+    bad.policy_commitment = uint256{};
+    BOOST_CHECK(modern::CheckPolicyOutput(bad, modern_height, params) ==
+                modern::PolicyOutputCheck::BAD_POLICY_PARAMS);
+    bad = out;
+    bad.policy_params.resize(modern::STAKE_PARAMS_SIZE - 1);
+    BOOST_CHECK(modern::CheckPolicyOutput(bad, modern_height, params) ==
+                modern::PolicyOutputCheck::BAD_POLICY_PARAMS);
+    bad = out;
+    bad.policy_params[modern::STAKE_PARAMS_SIZE - 1] = 0x01; // reserved must stay zero
+    BOOST_CHECK(modern::CheckPolicyOutput(bad, modern_height, params) ==
+                modern::PolicyOutputCheck::BAD_POLICY_PARAMS);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
