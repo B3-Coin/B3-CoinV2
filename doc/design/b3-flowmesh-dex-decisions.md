@@ -9,18 +9,18 @@ authority once the owner has reviewed this commit. Where a ruling contradicts
 an earlier document, the contradiction is listed in §4 for reconciliation
 rather than silently resolved.
 
-**Leverage scope update (2026-08-19, late session):** with the spot
-certified-log foundation landed and green, the owner re-activated the leverage
-track ("we need to have leverage, like 10x"), superseding the production
-brief's §29 exclusion per precedence. The perp design direction discussed and
-presented: same uniform-price curve auction on a second (position-settled)
-book; oracle-free internal index (spot clearing) and mark (perp clearing);
-exact-integer funding with dust swept to the insurance fund; initial margin =
-notional/10; cross + isolated per L-6; liquidation as the Hyperliquid-parity
-cascade (forced order into the next clearing at bankruptcy bound → insurance
-fund takeover with remaining margin → ADL last resort). All numeric thresholds
-REVISABLE provisional constants. Implementation not yet started at the time of
-this commit.
+**Futures scope (CORRECTED per the Codex repair directive, 2026-08-19):** the
+ONLY locked futures requirements are:
+
+    FlowMesh will support futures.
+    Maximum leverage = 10×.
+
+Nothing else is decided. Perpetual vs dated futures, isolated vs cross
+margin, funding, the mark/index source, maintenance margin, liquidation
+mechanics/penalties, an insurance fund, and ADL are ALL OPEN owner
+decisions. The perp/margin/liquidation material discussed in-session
+(including the Hyperliquid-parity cascade) is a PROPOSAL record only and
+must not be read as approved. No futures/leverage code exists.
 
 ---
 
@@ -31,9 +31,7 @@ this commit.
 | L-1 | **Microblocks are FlowMesh's primary execution unit**, with speed comparable to Hyperliquid (sub-second cadence target). | Confirms the protocol brief §13 direction and adds a latency bar. |
 | L-2 | **Only FN Coin holders may produce microblocks** and confirm FlowMesh trading transitions. | Matches brief §11. Whether bare holding suffices or a lock/activate-1-FN seat is required stays OPEN (O-1). |
 | L-3 | **DEX fees are denominated in USDT** (a USDT-backed colored coin) **and collected by FN Coin holders.** | Matches brief §18. Distribution rule OPEN (O-4). |
-| L-4 | **Leverage up to 10x is required.** | Reverses the audit brief's own §15/§23 "no leverage / no liquidations in v1" scoping — see §4. |
-| L-5 | **The leveraged instrument is perpetual futures.** Spot remains fully collateralized; leverage lives only in the perp instrument. | Owner selection 2026-08-19. |
-| L-6 | **Margin modes: cross AND isolated, both from the start** (per-position selectable, Hyperliquid parity). | Owner selection 2026-08-19. |
+| L-4 | **FlowMesh will support futures; maximum leverage = 10×.** | The complete locked futures statement. Everything else about futures is OPEN (see the corrected scope note above); the previously recorded "perpetuals" and "cross+isolated" entries are WITHDRAWN as over-claims per the Codex repair directive. |
 
 ## 2. Defaults adopted (REVISABLE, not protocol-locked)
 
@@ -58,7 +56,7 @@ Ordered so that the earlier ones unblock the most work.
   (= OD-6 in [b3-open-decisions.md](b3-open-decisions.md)).
 - **O-4 Fee distribution rule** — proposer takes its block's fees vs pro-rata
   across all active seats (affects proposer incentives; decide with O-2).
-- **O-5 Deterministic mark price** for perps — every validator must compute the
+- **O-5 Deterministic mark price** for any future leveraged market — every validator must compute the
   identical price. Either derived purely from internal clearing state, or
   oracle inputs entering as ordered microblock actions (which makes the oracle
   a privileged actor to be specified). Hardest new decision L-4/L-5 creates.
@@ -76,14 +74,11 @@ Ordered so that the earlier ones unblock the most work.
 
 ## 4. Contradictions created (reconcile in reviewed commits)
 
-- **Leverage scope, final state (2026-08-19, two rulings same day):** the chat
-  ruling required 10x leverage (perps, cross+isolated — L-4/L-5/L-6); the
-  owner's subsequent production implementation brief §29 explicitly excludes
-  leverage/liquidations/perpetuals from *this* implementation ("future
-  research"). Read together per precedence (later ruling governs the current
-  scope): **v1 ships spot-only; L-4/L-5/L-6 stand as locked requirements for a
-  later phase**, layered on the same microblock rails. Neither ruling is
-  discarded.
+- **Leverage scope, final state (Codex repair directive, 2026-08-19):** only
+  "futures supported, max 10×" is locked. v1 ships spot-only; every other
+  futures mechanic is an open owner decision and earlier same-day recordings
+  claiming more (perpetuals, cross+isolated margin, liquidation cascade) are
+  corrected as over-claims.
 - L-4 reverses the 2026-08-19 audit brief's §15 ("no leverage initially, no
   liquidation system initially") and §23 (leverage/liquidations listed under
   "do not add yet") — resolved by the sequencing reading above.
@@ -96,8 +91,9 @@ Ordered so that the earlier ones unblock the most work.
 
 ## 5. Implementation status (2026-08-19, certified-log build-out)
 
-Landed on `claude/b3-clean-architecture` (commits `bd80478..`, all layers
-test-compiled only, nothing wired into B3 consensus):
+Landed on `claude/b3-clean-architecture` (commits `bd80478..`; the FlowMesh
+layer is COMPILED into the node library but ACTIVATION-UNWIRED — no consensus,
+networking or RPC path reaches it):
 
 - **FlowMeshState** value type (ledger + persistent curve book + signer
   sequences + consumed deposits) with a PURE canonical state root;
@@ -171,11 +167,11 @@ Layered so spot determinism lands first and perps reuse the same rails:
    stream → byte-identical roots.
 5. **Fee hook** — clearing charges a USDT-denominated fee (rate provisional,
    zero acceptable for tests) into per-seat accrual; distribution per O-4.
-6. **Perp layer on the same rails** (after spot determinism): position/margin
-   account state (cross + isolated per L-6), funding accrual (O-6), mark-price
-   rule (O-5), liquidation engine (O-7) — all as new action types and state
-   under the same microblock/certification structure. 10x enforced at margin
-   check (per-market caps per O-8).
+6. **Futures layer on the same rails** (after spot determinism; instrument
+   form, margin modes, funding, mark price, liquidation and backstop are ALL
+   open owner decisions — only "futures, max 10×" is locked). Structured as
+   new action types and state under the same microblock/certification
+   machinery when the decisions land.
 
 Consensus wiring of any of this remains gated behind the contract's clean-H+1
 sequencing and the O-9/OD-6 decisions; everything above is buildable and
