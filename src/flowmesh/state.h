@@ -73,6 +73,20 @@ public:
         return it == next_seq.end() ? 0 : it->second;
     }
 
+    /**
+     * Canonical whole-state serialization (snapshots). Deserializes INTO
+     * a state constructed with the same configuration (vault, market,
+     * max_k) — the embedded book stream enforces the market config and
+     * throws on mismatch. A decoded snapshot is UNTRUSTED until its
+     * Root() is checked against certified history (the log's
+     * resulting_state_root at the snapshot sequence).
+     */
+    SERIALIZE_METHODS(FlowMeshState, obj)
+    {
+        READWRITE(obj.ledger, obj.book, obj.next_seq, obj.consumed_deposits);
+        SER_READ(obj, obj.book.Rebind(obj.ledger));
+    }
+
     //! Pure, canonically framed state root. The book root already frames
     //! the ledger root (and the slot counter) inside it.
     uint256 Root() const

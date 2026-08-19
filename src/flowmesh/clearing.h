@@ -236,11 +236,55 @@ public:
         return h.GetHash();
     }
 
+    /**
+     * Canonical whole-book serialization (snapshots). The ledger binding
+     * and market configuration are NOT streamed: a book deserializes
+     * into an engine whose base/quote/max_k were fixed at construction,
+     * and the stream must agree (mismatch throws). Snapshot consumers
+     * must verify the decoded state's root against certified history.
+     */
+    template <typename Stream>
+    void Serialize(Stream& s) const
+    {
+        s << m_base << m_quote << static_cast<uint64_t>(m_max_k);
+        s << static_cast<uint64_t>(m_curves.size());
+        for (const auto& [key, curve] : m_curves) {
+            s << static_cast<uint8_t>(key.first) << key.second << curve;
+        }
+    }
+    template <typename Stream>
+    void Unserialize(Stream& s)
+    {
+        AssetId base, quote;
+        uint64_t max_k, n;
+        s >> base >> quote >> max_k >> n;
+        if (base != m_base || quote != m_quote || max_k != m_max_k) {
+            throw std::ios_base::failure("flowmesh book snapshot is for a different market");
+        }
+        std::map<std::pair<Side, AccountId>, Curve> curves;
+        for (uint64_t i{0}; i < n; ++i) {
+            uint8_t side;
+            AccountId account;
+            Curve curve;
+            s >> side >> account >> curve;
+            if (side > static_cast<uint8_t>(Side::ASK)) {
+                throw std::ios_base::failure("flowmesh book snapshot has an invalid side");
+            }
+            if (!curves.emplace(std::make_pair(static_cast<Side>(side), account),
+                                std::move(curve)).second) {
+                throw std::ios_base::failure("flowmesh book snapshot has a duplicate curve");
+            }
+        }
+        m_curves = std::move(curves);
+    }
+
 private:
     struct Curve {
         std::vector<Breakpoint> points;
         CAmount filled{0};
         CAmount reserved{0};
+
+        SERIALIZE_METHODS(Curve, obj) { READWRITE(obj.points, obj.filled, obj.reserved); }
     };
 
     static CAmount FloorDiv128(const __int128 a, const __int128 b) // b > 0

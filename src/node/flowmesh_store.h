@@ -81,7 +81,38 @@ public:
                 const flowmesh::DepositVerifier* deposits, const std::set<XOnlyPubKey>& seats,
                 uint64_t threshold, std::string& error);
 
+    /**
+     * Persist a snapshot of the state reached AFTER entries [0,
+     * upto_sequence) — one slot, overwritten. Fail-closed at write time:
+     * the snapshot's root must equal the CERTIFIED resulting_state_root
+     * of entry upto_sequence-1 already in this log, so a caller bug can
+     * never persist an unattested state.
+     */
+    bool WriteSnapshot(uint64_t upto_sequence, const flowmesh::FlowMeshState& state,
+                       std::string& error);
+
+    /**
+     * Reconstruct via the stored snapshot when one is usable: decode it
+     * INTO `state` (which must carry the genesis configuration), verify
+     * its root against the certified resulting_state_root at its
+     * sequence (re-verifying that entry's certificate), then replay only
+     * the tail. A missing, undecodable or unverifiable snapshot is
+     * DISCARDED and reconstruction falls back to the full deterministic
+     * replay from genesis — an unauthenticated snapshot can never become
+     * state.
+     */
+    bool ReplayFromBestSnapshot(flowmesh::FlowMeshState& state, uint256& last_hash,
+                                const flowmesh::ActionAuthenticator& auth,
+                                const flowmesh::DepositVerifier* deposits,
+                                const std::set<XOnlyPubKey>& seats, uint64_t threshold,
+                                std::string& error);
+
 private:
+    bool ReplayRange(flowmesh::FlowMeshState& state, uint256& last_hash, uint64_t from_sequence,
+                     const Marker& marker, const flowmesh::ActionAuthenticator& auth,
+                     const flowmesh::DepositVerifier* deposits,
+                     const std::set<XOnlyPubKey>& seats, uint64_t threshold, std::string& error);
+
     CDBWrapper m_db;
 };
 

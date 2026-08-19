@@ -60,6 +60,8 @@ public:
     struct Balance {
         CAmount available{0};
         CAmount reserved{0};
+
+        SERIALIZE_METHODS(Balance, obj) { READWRITE(obj.available, obj.reserved); }
     };
 
     explicit Ledger(const uint256& vault_commitment) : m_vault{vault_commitment} {}
@@ -288,6 +290,15 @@ public:
             h << receipt;
         }
         return h.GetHash();
+    }
+
+    //! Canonical whole-ledger serialization (snapshots). Decoding fully
+    //! replaces this ledger; snapshot consumers must verify the decoded
+    //! state's root against certified history before trusting it.
+    SERIALIZE_METHODS(Ledger, obj)
+    {
+        READWRITE(obj.m_vault, obj.m_slot, obj.m_next_receipt_seq, obj.m_balances,
+                  obj.m_custody, obj.m_pending);
     }
 
 private:

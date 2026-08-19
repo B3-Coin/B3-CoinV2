@@ -536,4 +536,63 @@ BOOST_AUTO_TEST_CASE(b3_reorg_invalidates_previously_acceptable_anchors)
     BOOST_CHECK(policy.Acceptable(after));
 }
 
+BOOST_AUTO_TEST_CASE(snapshots_accelerate_restart_but_never_become_truth)
+{
+    const fs::path store_path{m_args.GetDataDirBase() / "flowmesh_snap"};
+    MeshNet net{3, 0};
+    auto store{std::make_unique<node::FlowMeshStore>(
+        DBParams{.path = store_path, .cache_bytes = size_t{1} << 20, .wipe_data = true})};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(store->OpenForDomain(MESH_DOMAIN, error), error);
+    node::StoreCommitSink sink{*store};
+    net.nodes[0] = net.MakeNode(net.keys[0], &sink);
+
+    net.RunRound({net.Deposit(Outpoint(0x0a, 0)), net.Deposit(Outpoint(0x0b, 1)),
+                  net.SignedOrder(net.alice_key, 0, true, 50'000, 10),
+                  net.SignedOrder(net.bob_key, 0, false, 50'000, 10)});
+    const FlowMeshState mid_state{net.nodes[0]->State()}; // after entries [0, 1)
+    net.RunRound({net.SignedOrder(net.alice_key, 1, true, 40'000, 2)});
+    BOOST_REQUIRE(!sink.LastError().has_value());
+    const uint256 live_root{net.nodes[0]->State().Root()};
+    const uint256 live_hash{net.nodes[0]->LastHash()};
+
+    // Write-time fail-closed: only a state matching the CERTIFIED root
+    // at its sequence may become a snapshot.
+    BOOST_REQUIRE_MESSAGE(store->WriteSnapshot(1, mid_state, error), error);
+    BOOST_CHECK(!store->WriteSnapshot(2, mid_state, error));
+
+    // Snapshot-accelerated reconstruction lands exactly on the live tip.
+    {
+        FlowMeshState state{VAULT, BaseX(), Quote()};
+        uint256 last_hash;
+        BOOST_REQUIRE_MESSAGE(store->ReplayFromBestSnapshot(state, last_hash, net.auth,
+                                                            &net.deposits, net.seats,
+                                                            net.threshold, error),
+                              error);
+        BOOST_CHECK_EQUAL(state.Root().GetHex(), live_root.GetHex());
+        BOOST_CHECK_EQUAL(last_hash.GetHex(), live_hash.GetHex());
+    }
+
+    // Corrupt the stored snapshot bytes on disk: it is DISCARDED (never
+    // trusted) and reconstruction falls back to full certified replay.
+    net.nodes[0] = net.MakeNode(net.keys[0]); // detach the sink
+    store.reset();
+    {
+        CDBWrapper raw{DBParams{.path = store_path, .cache_bytes = size_t{1} << 20}};
+        raw.Write(uint8_t{'s'},
+                  std::make_pair(uint64_t{1}, std::vector<unsigned char>(64, 0x5a)),
+                  /*fSync=*/true);
+    }
+    node::FlowMeshStore reopened{DBParams{.path = store_path, .cache_bytes = size_t{1} << 20}};
+    BOOST_REQUIRE(reopened.OpenForDomain(MESH_DOMAIN, error));
+    FlowMeshState state{VAULT, BaseX(), Quote()};
+    uint256 last_hash;
+    BOOST_REQUIRE_MESSAGE(reopened.ReplayFromBestSnapshot(state, last_hash, net.auth,
+                                                          &net.deposits, net.seats,
+                                                          net.threshold, error),
+                          error);
+    BOOST_CHECK_EQUAL(state.Root().GetHex(), live_root.GetHex());
+    BOOST_CHECK_EQUAL(last_hash.GetHex(), live_hash.GetHex());
+}
+
 BOOST_AUTO_TEST_SUITE_END()
