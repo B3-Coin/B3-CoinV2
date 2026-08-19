@@ -510,4 +510,30 @@ BOOST_AUTO_TEST_CASE(flowmesh_outage_never_stalls_b3)
     BOOST_CHECK(net.nodes[p0]->State().ledger.SolvencyHolds());
 }
 
+BOOST_AUTO_TEST_CASE(b3_reorg_invalidates_previously_acceptable_anchors)
+{
+    // A base-chain reorganization deeper than the finality depth is the
+    // one event that can strip acceptability from an anchored position —
+    // exactly the residual risk the OD-6 depth prices. Deposits judged
+    // at an anchor become unjudgeable when the anchor leaves the active
+    // chain, and new proposals must move to the reorganized chain.
+    const node::ChainAnchorPolicy policy{*Assert(m_node.chainman), /*min_depth=*/2};
+    const AnchorRef before{policy.Current()};
+    BOOST_REQUIRE(policy.Acceptable(before));
+
+    // Invalidate the anchored block: everything from it up is
+    // disconnected, so the anchor is no longer on the active chain.
+    BlockValidationState state;
+    CBlockIndex* anchored{WITH_LOCK(
+        cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(before.hash))};
+    BOOST_REQUIRE(anchored != nullptr);
+    m_node.chainman->ActiveChainstate().InvalidateBlock(state, anchored);
+    BOOST_REQUIRE(state.IsValid());
+
+    BOOST_CHECK(!policy.Acceptable(before));
+    const AnchorRef after{policy.Current()};
+    BOOST_CHECK(after.height < before.height);
+    BOOST_CHECK(policy.Acceptable(after));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
