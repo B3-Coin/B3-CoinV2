@@ -51,6 +51,8 @@ public:
     struct Breakpoint {
         CAmount price{0}; // ticks
         CAmount qty{0};   // lots
+
+        SERIALIZE_METHODS(Breakpoint, obj) { READWRITE(obj.price, obj.qty); }
     };
 
     struct ClearingResult {
@@ -63,7 +65,15 @@ public:
     };
 
     ClearingEngine(const AssetId& base, const AssetId& quote, Ledger& ledger, size_t max_k = 8)
-        : m_base{base}, m_quote{quote}, m_ledger{ledger}, m_max_k{max_k} {}
+        : m_base{base}, m_quote{quote}, m_ledger{&ledger}, m_max_k{max_k} {}
+
+    //! Point this engine at another ledger instance. Used ONLY by
+    //! FlowMeshState's copy/assignment so a copied engine settles against
+    //! the copied ledger rather than aliasing the original.
+    void Rebind(Ledger& ledger) { m_ledger = &ledger; }
+
+    const AssetId& BaseAsset() const { return m_base; }
+    const AssetId& QuoteAsset() const { return m_quote; }
 
     //! Validate a curve independently of the ledger (bounds + monotonicity).
     //! A BID must terminate at zero quantity so its worst-case spend — and
@@ -125,13 +135,13 @@ public:
         const auto it{m_curves.find({side, account})};
         const CAmount old_reserved{it == m_curves.end() ? 0 : it->second.reserved};
         if (*need > old_reserved) {
-            if (!m_ledger.Reserve(account, reserve_asset, *need - old_reserved)) return false;
+            if (!m_ledger->Reserve(account, reserve_asset, *need - old_reserved)) return false;
         } else if (*need < old_reserved) {
             // The recorded amount tracks consumption exactly (Consume),
             // so this release matches what the ledger holds for this
             // curve; a failure would mean internal inconsistency — fail
             // closed, changing nothing.
-            if (!m_ledger.Release(account, reserve_asset, old_reserved - *need)) return false;
+            if (!m_ledger->Release(account, reserve_asset, old_reserved - *need)) return false;
         }
         Curve& slot{it == m_curves.end() ? m_curves[{side, account}] : it->second};
         slot.points = points;
@@ -151,7 +161,7 @@ public:
         if (it == m_curves.end()) return false;
         const AssetId& reserve_asset{side == Side::BID ? m_quote : m_base};
         if (it->second.reserved > 0 &&
-            !m_ledger.Release(account, reserve_asset, it->second.reserved)) {
+            !m_ledger->Release(account, reserve_asset, it->second.reserved)) {
             return false;
         }
         m_curves.erase(it);
@@ -199,7 +209,7 @@ public:
             result.ask_fill = Allocate(Side::ASK, p, result.volume);
             SettleAndConsume(result);
         }
-        m_ledger.AdvanceSlot();
+        m_ledger->AdvanceSlot();
         return result;
     }
 
@@ -215,14 +225,14 @@ public:
     {
         HashWriter h;
         h << std::string{"b3/flowmesh/clearing/v2"} << m_base << m_quote
-          << static_cast<uint64_t>(m_max_k) << m_ledger.Slot();
+          << static_cast<uint64_t>(m_max_k) << m_ledger->Slot();
         h << static_cast<uint64_t>(m_curves.size());
         for (const auto& [key, curve] : m_curves) {
             h << static_cast<uint8_t>(key.first) << key.second << curve.filled << curve.reserved;
             h << static_cast<uint64_t>(curve.points.size());
             for (const Breakpoint& bp : curve.points) h << bp.price << bp.qty;
         }
-        h << m_ledger.StateRoot();
+        h << m_ledger->StateRoot();
         return h.GetHash();
     }
 
@@ -407,14 +417,14 @@ private:
             const auto it{m_curves.find({Side::BID, account})};
             assert(it != m_curves.end());
             assert(*quote <= it->second.reserved); // staircase invariant
-            assert(*quote <= m_ledger.Reserved(account, m_quote)); // ledger backs the whole leg
+            assert(*quote <= m_ledger->Reserved(account, m_quote)); // ledger backs the whole leg
         }
         for (const auto& [account, fill] : result.ask_fill) {
             if (fill <= 0) continue;
             const auto it{m_curves.find({Side::ASK, account})};
             assert(it != m_curves.end());
             assert(fill <= it->second.reserved);
-            assert(fill <= m_ledger.Reserved(account, m_base)); // ledger backs the whole leg
+            assert(fill <= m_ledger->Reserved(account, m_base)); // ledger backs the whole leg
         }
 
         // Two-pointer pairwise matching in account order: deterministic and
@@ -441,11 +451,11 @@ private:
             // BEFORE the delivery leg executes: a failed first leg never
             // lets the second leg run.
             if (*quote > 0) {
-                const bool paid{m_ledger.MoveReservedToAvailable(bids[bi].first, asks[ai].first,
+                const bool paid{m_ledger->MoveReservedToAvailable(bids[bi].first, asks[ai].first,
                                                                  m_quote, *quote)};
                 assert(paid); // preflighted; fail fast before touching the base leg
             }
-            const bool delivered{m_ledger.MoveReservedToAvailable(asks[ai].first, bids[bi].first,
+            const bool delivered{m_ledger->MoveReservedToAvailable(asks[ai].first, bids[bi].first,
                                                                   m_base, fill)};
             assert(delivered); // preflighted; a failure here is a real bug
             b_rem -= fill;
@@ -486,7 +496,7 @@ private:
                         it->second.filled <= 0) {
                 if (it->second.reserved > 0) {
                     const bool released{
-                        m_ledger.Release(account, reserve_asset, it->second.reserved)};
+                        m_ledger->Release(account, reserve_asset, it->second.reserved)};
                     assert(released); // exact tracking makes this infallible
                 }
                 m_curves.erase(it);
@@ -494,10 +504,13 @@ private:
         }
     }
 
-    const AssetId m_base;
-    const AssetId m_quote;
-    Ledger& m_ledger;
-    const size_t m_max_k;
+    // Not const so the engine is assignable (FlowMeshState candidate
+    // execution copies and replaces whole states); reassigned only by
+    // copy/assignment, and the ledger pointer only via Rebind.
+    AssetId m_base;
+    AssetId m_quote;
+    Ledger* m_ledger;
+    size_t m_max_k;
     std::map<std::pair<Side, AccountId>, Curve> m_curves;
 };
 

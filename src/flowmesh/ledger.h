@@ -301,7 +301,10 @@ private:
         }
     }
 
-    const uint256 m_vault;
+    // Not const so the ledger is assignable (FlowMeshState candidate
+    // execution copies and replaces whole states); never reassigned
+    // outside copy/assignment.
+    uint256 m_vault;
     uint64_t m_slot{0};
     uint64_t m_next_receipt_seq{0};
     std::map<std::pair<AccountId, AssetId>, Balance> m_balances;

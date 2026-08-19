@@ -35,6 +35,7 @@
 #include <flowmesh/batch.h>
 #include <flowmesh/clearing.h>
 #include <flowmesh/ledger.h>
+#include <flowmesh/state.h>
 #include <modern/asset.h>
 #include <modern/policy.h>
 #include <primitives/transaction.h>
@@ -66,8 +67,8 @@ modern::AssetId Base()
 }
 
 struct SlotBench {
-    flowmesh::Ledger ledger;
-    flowmesh::ClearingEngine engine;
+    flowmesh::FlowMeshState state;
+    flowmesh::Ledger& ledger;
     PassAuth auth;
     flowmesh::BatchExecutor exec;
     const size_t n_accounts;
@@ -75,9 +76,9 @@ struct SlotBench {
     const bool crossing;
 
     SlotBench(const size_t n, const size_t k_points, const bool cross)
-        : ledger{uint256::ONE},
-          engine{Base(), modern::NativeAsset(), ledger, k_points},
-          exec{ledger, engine, auth},
+        : state{uint256::ONE, Base(), modern::NativeAsset(), k_points},
+          ledger{state.ledger},
+          exec{state, auth},
           n_accounts{n},
           k{k_points},
           crossing{cross}

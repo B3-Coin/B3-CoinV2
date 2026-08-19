@@ -98,10 +98,11 @@ Action Withdraw(const flowmesh::AccountId& signer, uint64_t seq, const modern::A
 }
 
 struct Fixture {
-    flowmesh::Ledger ledger{VAULT};
-    flowmesh::ClearingEngine engine{BaseX(), Quote(), ledger};
+    flowmesh::FlowMeshState state{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger{state.ledger};
+    flowmesh::ClearingEngine& engine{state.book};
     MockAuth auth;
-    flowmesh::BatchExecutor exec{ledger, engine, auth};
+    flowmesh::BatchExecutor exec{state, auth};
     Fixture()
     {
         ledger.Deposit(ALICE, Quote(), 2400); // staircase reservation bound of the standard bid
@@ -348,20 +349,18 @@ BOOST_AUTO_TEST_CASE(credential_checks_are_canonical)
     std::vector<std::vector<unsigned char>> calls_a, calls_b;
     uint256 root_a, root_b;
     {
-        flowmesh::Ledger ledger{VAULT};
-        flowmesh::ClearingEngine engine{BaseX(), Quote(), ledger};
+        flowmesh::FlowMeshState state{VAULT, BaseX(), Quote()};
         CountingAuth auth;
-        flowmesh::BatchExecutor exec{ledger, engine, auth};
-        ledger.Deposit(ALICE, Quote(), 2400);
+        flowmesh::BatchExecutor exec{state, auth};
+        state.ledger.Deposit(ALICE, Quote(), 2400);
         root_a = exec.ExecuteSlot(order_a).state_root;
         calls_a = auth.calls;
     }
     {
-        flowmesh::Ledger ledger{VAULT};
-        flowmesh::ClearingEngine engine{BaseX(), Quote(), ledger};
+        flowmesh::FlowMeshState state{VAULT, BaseX(), Quote()};
         CountingAuth auth;
-        flowmesh::BatchExecutor exec{ledger, engine, auth};
-        ledger.Deposit(ALICE, Quote(), 2400);
+        flowmesh::BatchExecutor exec{state, auth};
+        state.ledger.Deposit(ALICE, Quote(), 2400);
         root_b = exec.ExecuteSlot(order_b).state_root;
         calls_b = auth.calls;
     }
