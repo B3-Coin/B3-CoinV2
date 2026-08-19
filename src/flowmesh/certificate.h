@@ -15,6 +15,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <ios>
 #include <set>
 #include <string>
 #include <vector>
@@ -84,17 +85,52 @@ inline bool VerifyAttestation(const Attestation& a, const uint256& domain,
     return a.validator.VerifySchnorr(AttestationDigest(domain, sequence, microblock_hash), a.sig);
 }
 
+//! Decode bound: enforced before attestations are allocated.
+inline constexpr size_t MAX_CERTIFICATE_ATTESTATIONS{4096};
+
 struct MicroblockCertificate {
     uint256 microblock_hash;
     uint64_t sequence{0};
     //! Canonical: strictly ascending by validator key, no duplicates.
     std::vector<Attestation> attestations;
 
-    SERIALIZE_METHODS(MicroblockCertificate, obj)
+    template <typename Stream>
+    void Serialize(Stream& s) const
     {
-        READWRITE(obj.microblock_hash, obj.sequence, obj.attestations);
+        s << microblock_hash << sequence;
+        WriteCompactSize(s, attestations.size());
+        for (const Attestation& a : attestations) s << a;
+    }
+    template <typename Stream>
+    void Unserialize(Stream& s)
+    {
+        s >> microblock_hash >> sequence;
+        const uint64_t n{ReadCompactSize(s)};
+        if (n > MAX_CERTIFICATE_ATTESTATIONS) {
+            throw std::ios_base::failure("flowmesh certificate has too many attestations");
+        }
+        attestations.clear();
+        attestations.reserve(n);
+        for (uint64_t i{0}; i < n; ++i) {
+            Attestation a;
+            s >> a;
+            attestations.push_back(a);
+        }
     }
 };
+
+/**
+ * Mathematically valid quorum configuration: at least one seat, a
+ * threshold of at least one attestation, and a threshold satisfiable by
+ * the seat set. This validates SHAPE only — the actual fault bound f
+ * (and therefore the production threshold, committee size and timeout
+ * policy) is an OWNER DECISION this function deliberately does not
+ * choose or imply.
+ */
+inline bool ValidQuorumConfig(const size_t seat_count, const uint64_t threshold)
+{
+    return seat_count > 0 && threshold >= 1 && threshold <= seat_count;
+}
 
 //! Smallest threshold giving certificate uniqueness under at most `f`
 //! Byzantine seats out of `k` (see the fault-model note above). Returns
@@ -115,6 +151,9 @@ enum class CertificateCheck : uint8_t {
     NOT_A_SEAT = 3,      // an attester outside the active seat set
     BAD_SIGNATURE = 4,
     BELOW_THRESHOLD = 5,
+    //! Nonsensical quorum configuration (e.g. threshold zero): refused
+    //! outright — a certificate can never be judged against it.
+    BAD_QUORUM_CONFIG = 6,
 };
 
 /**
@@ -127,6 +166,7 @@ inline CertificateCheck CheckCertificate(const MicroblockCertificate& cert, cons
                                          const std::set<XOnlyPubKey>& seats,
                                          const uint64_t threshold)
 {
+    if (!ValidQuorumConfig(seats.size(), threshold)) return CertificateCheck::BAD_QUORUM_CONFIG;
     if (cert.attestations.empty()) return CertificateCheck::EMPTY;
     for (size_t i{0}; i < cert.attestations.size(); ++i) {
         if (i > 0 && !(cert.attestations[i - 1].validator < cert.attestations[i].validator)) {

@@ -146,7 +146,7 @@ struct SlotBench {
             action.credential = {0x01};
             actions.push_back(std::move(action));
         }
-        return exec.ExecuteSlot(actions);
+        return *exec.ExecuteSlot(actions);
     }
 
     //! Untimed verification that the workload is what it claims.
@@ -195,7 +195,7 @@ void RunRootBench(benchmark::Bench& bench, const size_t n_accounts)
         const std::vector<Breakpoint> curve{bid
             ? std::vector<Breakpoint>{{100, 50}, {200, 0}}
             : std::vector<Breakpoint>{{299, 0}, {300, 50}}}; // standing, never crossing
-        const bool ok{state.book.SubmitCurve(Account(i),
+        const bool ok{state.book.SubmitCurve(state.ledger, Account(i),
                                              bid ? flowmesh::ClearingEngine::Side::BID
                                                  : flowmesh::ClearingEngine::Side::ASK,
                                              curve)};

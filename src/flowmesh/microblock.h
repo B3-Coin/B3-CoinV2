@@ -9,11 +9,11 @@
 #include <flowmesh/deposit.h>
 #include <flowmesh/state.h>
 #include <hash.h>
-#include <pubkey.h>
 #include <serialize.h>
 #include <uint256.h>
 
 #include <cstdint>
+#include <ios>
 #include <optional>
 #include <string>
 #include <vector>
@@ -26,11 +26,25 @@ namespace flowmesh {
  * chain weight; finality is a certificate (certificate.h) over this
  * structure's hash, and the certified log IS the history.
  *
- * The certificate is deliberately NOT part of the microblock or its
- * hash: attestations accumulate over an already-fixed identity.
+ * IDENTITY IS EXECUTION CONTENT ONLY. The microblock commits exactly
+ * what deterministic execution consumes: domain, position, anchor,
+ * previous root, the CANONICAL action body, and the claimed results.
+ * The certificate is separate (attestations accumulate over a fixed
+ * identity), and the PROPOSER is separate too — proposer identity and
+ * round live in the proposal ENVELOPE (sync.h), never in the candidate
+ * hash, so a replacement proposer in a later recovery round can
+ * re-propose a locked candidate under the SAME hash and locked
+ * validators can re-attest it. Authorship is authorization metadata,
+ * not content.
+ *
+ * The action body MUST be in canonical form (batch.h
+ * CanonicalizeActions): a non-canonical body is rejected outright, so
+ * one logical candidate set has exactly one microblock hash regardless
+ * of network arrival order.
  */
 
-//! Hard consensus bounds on validator work per microblock. Checked
+//! Hard consensus bounds on validator work per microblock. Enforced
+//! during decode (before element allocation) and re-checked
 //! structurally before any execution or cryptography.
 inline constexpr size_t MAX_MICROBLOCK_ACTIONS{4096};
 
@@ -50,23 +64,42 @@ struct MicroblockCore {
     //! by the caller's anchor rules — OWNER DECISION (OD-6).
     AnchorRef anchor;
     uint256 prev_state_root;
+    //! CANONICAL action body (see above).
     std::vector<Action> actions;
-    //! Commitment to `actions` (framed); must match ActionsRoot().
+    //! Commitment to `actions` (framed); must match ComputeActionsRoot.
     uint256 actions_root;
     //! ExecutionResultCommitment of applying `actions` to the previous
     //! state (see BatchResult::result_commitment).
     uint256 result_commitment;
     //! PURE FlowMeshState::Root() after execution.
     uint256 resulting_state_root;
-    //! The proposing FN seat's operator key. Eligibility is judged by
-    //! the caller against the proposer schedule (recovery.h).
-    XOnlyPubKey proposer;
 
-    SERIALIZE_METHODS(MicroblockCore, obj)
+    //! Bounded strict codec: the action count is checked BEFORE actions
+    //! are read.
+    template <typename Stream>
+    void Serialize(Stream& s) const
     {
-        READWRITE(obj.version, obj.domain, obj.sequence, obj.parent_hash, obj.anchor,
-                  obj.prev_state_root, obj.actions, obj.actions_root, obj.result_commitment,
-                  obj.resulting_state_root, obj.proposer);
+        s << version << domain << sequence << parent_hash << anchor << prev_state_root;
+        WriteCompactSize(s, actions.size());
+        for (const Action& action : actions) s << action;
+        s << actions_root << result_commitment << resulting_state_root;
+    }
+    template <typename Stream>
+    void Unserialize(Stream& s)
+    {
+        s >> version >> domain >> sequence >> parent_hash >> anchor >> prev_state_root;
+        const uint64_t n{ReadCompactSize(s)};
+        if (n > MAX_MICROBLOCK_ACTIONS) {
+            throw std::ios_base::failure("flowmesh microblock has too many actions");
+        }
+        actions.clear();
+        actions.reserve(n);
+        for (uint64_t i{0}; i < n; ++i) {
+            Action action;
+            s >> action;
+            actions.push_back(std::move(action));
+        }
+        s >> actions_root >> result_commitment >> resulting_state_root;
     }
 
     static uint256 ComputeActionsRoot(const std::vector<Action>& actions)
@@ -80,27 +113,31 @@ struct MicroblockCore {
 
     //! Canonical identity: the tagged hash of the full canonical
     //! serialization. Domain-separated from every other B3 hash.
+    //! (v2 preimage: the proposer moved out to the proposal envelope.)
     uint256 GetHash() const
     {
         HashWriter h;
-        h << std::string{"b3/flowmesh/microblock/v1"} << *this;
+        h << std::string{"b3/flowmesh/microblock/v2"} << *this;
         return h.GetHash();
     }
 
-    //! Structural bounds only — no state, no cryptography.
+    //! Structural rules — no state, no cryptography. Includes the
+    //! canonical-body requirement: identity is only defined over the one
+    //! canonical representation of the action set.
     bool ShapeIsValid() const
     {
         if (version != MICROBLOCK_VERSION_V1) return false;
         if (actions.size() > MAX_MICROBLOCK_ACTIONS) return false;
         if (sequence == 0 && !parent_hash.IsNull()) return false;
         if (sequence != 0 && parent_hash.IsNull()) return false;
+        if (!ActionsAreCanonical(actions)) return false;
         return true;
     }
 };
 
 enum class CandidateError : uint8_t {
     NONE = 0,
-    SHAPE = 1,
+    SHAPE = 1, // structural bounds or non-canonical action body
     WRONG_DOMAIN = 2,
     SEQUENCE = 3,
     PARENT = 4,
@@ -108,6 +145,10 @@ enum class CandidateError : uint8_t {
     ACTIONS_ROOT = 6,
     RESULT_COMMITMENT = 7,
     RESULT_ROOT = 8,
+    //! Fatal internal execution failure (clearing/settlement
+    //! inconsistency): the candidate is unusable and NOTHING was
+    //! committed — never a mere per-action rejection.
+    EXECUTION_FAILURE = 9,
 };
 
 /**
@@ -119,8 +160,8 @@ enum class CandidateError : uint8_t {
  *
  * `expect_parent` is the caller's last certified microblock hash (null
  * before the first). Anchor acceptability and proposer eligibility are
- * the caller's checks (anchor rules / proposer schedule) — this function
- * verifies exactly the deterministic execution claim.
+ * the caller's checks (anchor rules / proposer schedule + envelope) —
+ * this function verifies exactly the deterministic execution claim.
  */
 inline CandidateError ExecuteCandidate(const FlowMeshState& prev, const uint256& domain,
                                        const uint256& expect_parent, const MicroblockCore& mb,
@@ -139,30 +180,32 @@ inline CandidateError ExecuteCandidate(const FlowMeshState& prev, const uint256&
 
     FlowMeshState next{prev};
     BatchExecutor exec{next, auth, deposits};
-    BatchResult result{exec.ExecuteSlot(mb.actions, mb.anchor)};
+    std::optional<BatchResult> result{exec.ExecuteSlot(mb.actions, mb.anchor)};
+    if (!result) return CandidateError::EXECUTION_FAILURE;
 
-    if (result.result_commitment != mb.result_commitment) {
+    if (result->result_commitment != mb.result_commitment) {
         return CandidateError::RESULT_COMMITMENT;
     }
-    if (result.state_root != mb.resulting_state_root) return CandidateError::RESULT_ROOT;
+    if (result->state_root != mb.resulting_state_root) return CandidateError::RESULT_ROOT;
 
     next_out = std::move(next);
-    result_out = std::move(result);
+    result_out = std::move(*result);
     return CandidateError::NONE;
 }
 
 /**
- * Proposer construction: execute the action set on a copy of the
- * previous state and emit the microblock whose claims match that
- * execution exactly. The proposer has no authority beyond ordering —
- * every claim is recomputed by every validator via ExecuteCandidate.
+ * Proposer construction: canonicalize the candidate action set, execute
+ * it on a copy of the previous state, and emit the microblock whose
+ * claims match that execution exactly. Returns nullopt on fatal
+ * execution failure. The proposer has no authority beyond selecting the
+ * candidate set — the body is canonicalized, the identity is
+ * proposer-free, and every claim is recomputed by every validator via
+ * ExecuteCandidate.
  */
-inline MicroblockCore BuildMicroblock(const FlowMeshState& prev, const uint256& domain,
-                                      const uint256& parent_hash, const AnchorRef& anchor,
-                                      std::vector<Action> actions, const XOnlyPubKey& proposer,
-                                      const ActionAuthenticator& auth,
-                                      const DepositVerifier* deposits, FlowMeshState& next_out,
-                                      BatchResult& result_out)
+inline std::optional<MicroblockCore> BuildMicroblock(
+    const FlowMeshState& prev, const uint256& domain, const uint256& parent_hash,
+    const AnchorRef& anchor, std::vector<Action> actions, const ActionAuthenticator& auth,
+    const DepositVerifier* deposits, FlowMeshState& next_out, BatchResult& result_out)
 {
     MicroblockCore mb;
     mb.domain = domain;
@@ -170,18 +213,18 @@ inline MicroblockCore BuildMicroblock(const FlowMeshState& prev, const uint256& 
     mb.parent_hash = parent_hash;
     mb.anchor = anchor;
     mb.prev_state_root = prev.Root();
-    mb.actions = std::move(actions);
+    mb.actions = CanonicalizeActions(std::move(actions));
     mb.actions_root = MicroblockCore::ComputeActionsRoot(mb.actions);
-    mb.proposer = proposer;
 
     FlowMeshState next{prev};
     BatchExecutor exec{next, auth, deposits};
-    BatchResult result{exec.ExecuteSlot(mb.actions, mb.anchor)};
-    mb.result_commitment = result.result_commitment;
-    mb.resulting_state_root = result.state_root;
+    std::optional<BatchResult> result{exec.ExecuteSlot(mb.actions, mb.anchor)};
+    if (!result) return std::nullopt;
+    mb.result_commitment = result->result_commitment;
+    mb.resulting_state_root = result->state_root;
 
     next_out = std::move(next);
-    result_out = std::move(result);
+    result_out = std::move(*result);
     return mb;
 }
 
@@ -194,7 +237,8 @@ inline MicroblockCore BuildMicroblock(const FlowMeshState& prev, const uint256& 
 // NOT built.)
 
 //! BUY `qty` lots at limit `price`: full demand at or below the limit,
-//! zero above it. Requires price + 1 to be representable.
+//! zero above it. Reserves exactly qty × price (the integer-price
+//! worst case; no fill above the limit is possible).
 inline std::optional<std::vector<ClearingEngine::Breakpoint>> MakeLimitBidCurve(CAmount price,
                                                                                 CAmount qty)
 {

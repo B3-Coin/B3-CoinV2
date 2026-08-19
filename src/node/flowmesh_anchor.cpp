@@ -25,6 +25,16 @@ bool ChainAnchorPolicy::Acceptable(const flowmesh::AnchorRef& anchor) const
     return active.Height() - index->nHeight >= m_min_depth;
 }
 
+bool ChainAnchorPolicy::StillCanonical(const flowmesh::AnchorRef& anchor) const
+{
+    if (anchor.IsNull()) return true; // references no B3 state
+    if (anchor.height < 0 || anchor.hash.IsNull()) return false;
+    LOCK(cs_main);
+    const CBlockIndex* index{m_chainman.m_blockman.LookupBlockIndex(anchor.hash)};
+    if (index == nullptr || index->nHeight != anchor.height) return false;
+    return m_chainman.ActiveChain().Contains(index); // depth-free: canonicality only
+}
+
 flowmesh::AnchorRef ChainAnchorPolicy::Current() const
 {
     LOCK(cs_main);

@@ -214,22 +214,32 @@ inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int he
             return PolicyOutputCheck::BAD_POLICY_PARAMS;
         }
         break;
-    case PolicyType::STAKE:
-        // Locked NATIVE B3 carrying a validator binding: the commitment
-        // is the owner binding (non-null) and the params are exactly the
-        // 32-byte validator key plus 2 zero reserved bytes — the
-        // ModernOutput view of the stake.h script carrier. Previously
-        // this case was missing and an activated STAKE output fell
-        // through the switch structurally unchecked.
+    case PolicyType::STAKE: {
+        // Locked NATIVE B3 carrying a validator binding: a POSITIVE
+        // amount (zero-amount stake would be a free registry entry — the
+        // standalone stake model requires amount > 0 and so does this
+        // view), the owner binding (non-null) as the commitment, and
+        // params of exactly the 32-byte validator key plus 2 zero
+        // reserved bytes, with the key not all-zero (an all-zero "key"
+        // can never be valid under any eventual key scheme and would
+        // aggregate dead weight). Previously this case was missing and
+        // an activated STAKE output fell through the switch unchecked.
         if (out.asset != NativeAsset()) return PolicyOutputCheck::BAD_ASSET;
+        if (out.amount == 0) return PolicyOutputCheck::BAD_AMOUNT;
         if (out.policy_commitment.IsNull()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
         if (out.policy_params.size() != STAKE_PARAMS_SIZE) {
             return PolicyOutputCheck::BAD_POLICY_PARAMS;
         }
+        bool key_nonzero{false};
+        for (size_t i{0}; i < STAKE_PARAMS_KEY_SIZE; ++i) {
+            key_nonzero = key_nonzero || out.policy_params[i] != 0x00;
+        }
+        if (!key_nonzero) return PolicyOutputCheck::BAD_POLICY_PARAMS;
         for (size_t i{STAKE_PARAMS_KEY_SIZE}; i < STAKE_PARAMS_SIZE; ++i) {
             if (out.policy_params[i] != 0x00) return PolicyOutputCheck::BAD_POLICY_PARAMS;
         }
         break;
+    }
     case PolicyType::FN:
         // UNREACHABLE until FN v1 is activated (IsActivatedPolicy above
         // fails closed). The v1 structural rules, ready for that day

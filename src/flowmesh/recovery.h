@@ -83,6 +83,23 @@ private:
     std::vector<XOnlyPubKey> m_seats;
 };
 
+/**
+ * Durable write-ahead journal for safety-critical lock state. A
+ * validator MUST persist its lock BEFORE an attestation leaves the
+ * process: a restart may not erase what the validator has signed, or a
+ * conflicting candidate could be signed for the same sequence after
+ * recovery. Storage failure means DO NOT SIGN (non-participation, never
+ * unsafe participation).
+ */
+class LockJournal
+{
+public:
+    virtual ~LockJournal() = default;
+    [[nodiscard]] virtual bool WriteLock(uint64_t sequence, const uint256& microblock_hash) = 0;
+    //! Certification through `sequence` makes its lock obsolete.
+    [[nodiscard]] virtual bool ClearLocksThrough(uint64_t sequence) = 0;
+};
+
 enum class AttestDecision : uint8_t {
     ATTEST = 0,
     WRONG_ROUND = 1,     // proposal round is not this validator's current round
@@ -142,6 +159,15 @@ public:
         m_rounds.erase(sequence);
         m_locked.erase(sequence);
     }
+
+    //! Restart restore: import the durably journaled locks so the
+    //! validator cannot sign a conflicting candidate after recovery.
+    void ImportLocks(const std::map<uint64_t, uint256>& locks)
+    {
+        for (const auto& [sequence, hash] : locks) m_locked.emplace(sequence, hash);
+    }
+
+    const std::map<uint64_t, uint256>& Locks() const { return m_locked; }
 
 private:
     std::map<uint64_t, uint32_t> m_rounds;

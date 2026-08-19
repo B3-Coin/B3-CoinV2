@@ -32,6 +32,7 @@ public:
     ChainAnchorPolicy(const ChainstateManager& chainman, int min_depth);
 
     bool Acceptable(const flowmesh::AnchorRef& anchor) const override;
+    bool StillCanonical(const flowmesh::AnchorRef& anchor) const override;
     flowmesh::AnchorRef Current() const override;
 
 private:
