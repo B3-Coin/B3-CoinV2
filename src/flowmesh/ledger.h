@@ -266,16 +266,24 @@ public:
     uint64_t Slot() const { return m_slot; }
 
     //! Deterministic root over the canonical (zero-pruned, ordered) state.
+    //! CANONICALLY FRAMED (v2): each variable-length collection — balances,
+    //! custody, pending receipts — is preceded by its entry count, so the
+    //! boundaries between collections are part of the preimage and no two
+    //! distinct layouts can flatten to one byte stream. The domain tag was
+    //! bumped from v1 because the preimage format changed.
     uint256 StateRoot() const
     {
         HashWriter h;
-        h << std::string{"b3/flowmesh/state/v1"} << m_vault << m_slot << m_next_receipt_seq;
+        h << std::string{"b3/flowmesh/state/v2"} << m_vault << m_slot << m_next_receipt_seq;
+        h << static_cast<uint64_t>(m_balances.size());
         for (const auto& [key, balance] : m_balances) {
             h << key.first << key.second << balance.available << balance.reserved;
         }
+        h << static_cast<uint64_t>(m_custody.size());
         for (const auto& [asset, custody] : m_custody) {
             h << asset << custody;
         }
+        h << static_cast<uint64_t>(m_pending.size());
         for (const auto& [id, receipt] : m_pending) {
             h << receipt;
         }

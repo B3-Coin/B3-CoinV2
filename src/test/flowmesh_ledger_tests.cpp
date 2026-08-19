@@ -8,6 +8,7 @@
 
 #include <flowmesh/ledger.h>
 
+#include <hash.h>
 #include <modern/policy.h>
 #include <modern/vault.h>
 #include <primitives/transaction.h>
@@ -213,6 +214,54 @@ BOOST_AUTO_TEST_CASE(state_root_is_deterministic_and_path_independent)
     flowmesh::Ledger d{VAULT};
     d.Deposit(ALICE, AssetX(), 1000);
     BOOST_CHECK_EQUAL(c.StateRoot().GetHex(), d.StateRoot().GetHex());
+}
+
+//! Pass-3 fix: the ledger state root is canonically framed (v2 domain).
+//! Each variable-length collection — balances, custody, pending
+//! receipts — is preceded by its entry count, so the boundaries between
+//! collections are part of the preimage: different collection layouts
+//! can never rely on unframed boundaries (incidental byte alignment)
+//! to distinguish themselves. The empty-ledger root is pinned
+//! byte-exactly, and the framed preimage is reconstructed field by
+//! field: with the counts it reproduces the root exactly; without
+//! them it does not — the counts are load-bearing, not decorative.
+BOOST_AUTO_TEST_CASE(state_root_v2_is_canonically_framed)
+{
+    // Pinned empty-ledger v2 vector (VAULT, slot 0, seq 0, all
+    // collections empty) — filled from the first computed value, frozen
+    // since; changes only with a reviewed format bump.
+    BOOST_CHECK_EQUAL(
+        flowmesh::Ledger{VAULT}.StateRoot().GetHex(),
+        "ce335b8fce42d09636c1d5c6fd5a2159d307ca0629f452c44a624e237fb77222");
+
+    // Populate all three collections: two balance entries, one custody
+    // entry, one pending receipt.
+    flowmesh::Ledger ledger{VAULT};
+    BOOST_REQUIRE(ledger.Deposit(ALICE, AssetX(), 1000));
+    BOOST_REQUIRE(ledger.Deposit(BOB, AssetX(), 500));
+    BOOST_REQUIRE(ledger.Reserve(ALICE, AssetX(), 200));
+    const auto receipt{ledger.FinalizeWithdrawal(BOB, AssetX(), 100, DEST)};
+    BOOST_REQUIRE(receipt.has_value());
+
+    // Byte-exact reconstruction of the v2 preimage. Balances iterate in
+    // (account, asset) map order: ALICE (…a1) before BOB (…b2).
+    const auto reconstruct{[&](const bool framed) {
+        HashWriter h;
+        h << std::string{"b3/flowmesh/state/v2"} << VAULT << uint64_t{0} /*slot*/
+          << uint64_t{1} /*next receipt seq*/;
+        if (framed) h << uint64_t{2}; // balance count
+        h << ALICE << AssetX() << CAmount{800} << CAmount{200};
+        h << BOB << AssetX() << CAmount{400} << CAmount{0};
+        if (framed) h << uint64_t{1}; // custody count
+        h << AssetX() << CAmount{1500};
+        if (framed) h << uint64_t{1}; // pending receipt count
+        h << *receipt;
+        return h.GetHash();
+    }};
+    BOOST_CHECK_EQUAL(reconstruct(true).GetHex(), ledger.StateRoot().GetHex());
+    // The same field bytes WITHOUT the counts hash differently: the
+    // collection boundaries genuinely live in the preimage.
+    BOOST_CHECK(reconstruct(false) != ledger.StateRoot());
 }
 
 BOOST_AUTO_TEST_CASE(adversarial_overflow_and_underflow)

@@ -104,7 +104,7 @@ struct Fixture {
     flowmesh::BatchExecutor exec{ledger, engine, auth};
     Fixture()
     {
-        ledger.Deposit(ALICE, Quote(), 2000);
+        ledger.Deposit(ALICE, Quote(), 2400); // staircase reservation bound of the standard bid
         ledger.Deposit(BOB, BaseX(), 80);
     }
 };
@@ -253,6 +253,124 @@ BOOST_AUTO_TEST_CASE(distinct_slots_advance_and_produce_distinct_roots)
     BOOST_CHECK(s1.clearing.cleared);
     BOOST_CHECK_EQUAL(s1.clearing.price, 20);
     BOOST_CHECK(s0.state_root != s1.state_root);
+}
+
+//! D5 fix: dedup is credential-aware and arrival-order independent. One
+//! id may arrive with several credentials; it authenticates iff ANY of
+//! them does — a junk-credential copy can neither shadow a valid
+//! submission nor make the outcome depend on which copy arrived first.
+BOOST_AUTO_TEST_CASE(credential_variants_are_order_independent)
+{
+    Action good{Bid(ALICE, 0, Pts({{10, 100}, {20, 40}, {30, 0}}))};
+    Action junk{good};
+    junk.credential = {0x00}; // same id, failing credential
+    BOOST_CHECK(good.Id() == junk.Id());
+
+    uint256 root_junk_first, root_good_first;
+    {
+        Fixture f;
+        const auto r{f.exec.ExecuteSlot({junk, good})};
+        BOOST_REQUIRE_EQUAL(r.applied.size(), 1U);
+        BOOST_CHECK(r.rejected.empty());
+        root_junk_first = r.state_root;
+    }
+    {
+        Fixture f;
+        const auto r{f.exec.ExecuteSlot({good, junk})};
+        BOOST_REQUIRE_EQUAL(r.applied.size(), 1U);
+        BOOST_CHECK(r.rejected.empty());
+        root_good_first = r.state_root;
+    }
+    BOOST_CHECK_EQUAL(root_junk_first.GetHex(), root_good_first.GetHex());
+
+    // The junk-credential copy ALONE still rejects, without consuming
+    // the sequence.
+    Fixture f;
+    const auto r{f.exec.ExecuteSlot({junk})};
+    BOOST_CHECK(r.applied.empty());
+    BOOST_REQUIRE_EQUAL(r.rejected.size(), 1U);
+    BOOST_CHECK(r.rejected.front().second == ActionReject::UNAUTHENTICATED);
+    BOOST_CHECK_EQUAL(f.exec.NextSequence(ALICE), 0);
+}
+
+//! D5 fix: authentication runs before equivocation grouping, so a
+//! forged (unauthenticated) action at an honest signer's (signer,
+//! sequence) can no longer manufacture an equivocation and kill the
+//! honest submission.
+BOOST_AUTO_TEST_CASE(forgery_cannot_manufacture_equivocation)
+{
+    Fixture f;
+    const Action honest{Bid(ALICE, 0, Pts({{10, 100}, {20, 40}, {30, 0}}))};
+    Action forged{Bid(ALICE, 0, Pts({{10, 1}, {20, 0}}))}; // different id, same (signer, seq)
+    forged.credential = {0x00};
+    BOOST_CHECK(honest.Id() != forged.Id());
+
+    const auto r{f.exec.ExecuteSlot({forged, honest})};
+    BOOST_REQUIRE_EQUAL(r.applied.size(), 1U);
+    BOOST_CHECK(r.applied.front() == honest.Id());
+    BOOST_REQUIRE_EQUAL(r.rejected.size(), 1U);
+    BOOST_CHECK(r.rejected.front().first == forged.Id());
+    BOOST_CHECK(r.rejected.front().second == ActionReject::UNAUTHENTICATED);
+    BOOST_CHECK_EQUAL(f.exec.NextSequence(ALICE), 1); // honest action advanced
+}
+
+//! Pass-2 fix: credential variants are CANONICALIZED (lexicographically
+//! sorted, exact duplicates removed) before authentication, so every
+//! node performs the same authentication calls in the same order no
+//! matter how the network delivered the set.
+BOOST_AUTO_TEST_CASE(credential_checks_are_canonical)
+{
+    //! Records every credential it is asked about, in call order;
+    //! accepts only the sentinel {0x02}.
+    class CountingAuth final : public flowmesh::ActionAuthenticator
+    {
+    public:
+        mutable std::vector<std::vector<unsigned char>> calls;
+        bool Authenticate(const Action& action) const override
+        {
+            calls.push_back(action.credential);
+            return action.credential == std::vector<unsigned char>{0x02};
+        }
+    };
+
+    const Action base{Bid(ALICE, 0, Pts({{10, 100}, {20, 40}, {30, 0}}))};
+    const auto with_credential{[&](const uint8_t byte) {
+        Action a{base};
+        a.credential = {byte};
+        return a;
+    }};
+    // Same credential SET in two arrival orders, with an exact duplicate.
+    const std::vector<Action> order_a{with_credential(0x03), with_credential(0x01),
+                                      with_credential(0x02), with_credential(0x01)};
+    const std::vector<Action> order_b{with_credential(0x01), with_credential(0x02),
+                                      with_credential(0x03), with_credential(0x01)};
+
+    std::vector<std::vector<unsigned char>> calls_a, calls_b;
+    uint256 root_a, root_b;
+    {
+        flowmesh::Ledger ledger{VAULT};
+        flowmesh::ClearingEngine engine{BaseX(), Quote(), ledger};
+        CountingAuth auth;
+        flowmesh::BatchExecutor exec{ledger, engine, auth};
+        ledger.Deposit(ALICE, Quote(), 2400);
+        root_a = exec.ExecuteSlot(order_a).state_root;
+        calls_a = auth.calls;
+    }
+    {
+        flowmesh::Ledger ledger{VAULT};
+        flowmesh::ClearingEngine engine{BaseX(), Quote(), ledger};
+        CountingAuth auth;
+        flowmesh::BatchExecutor exec{ledger, engine, auth};
+        ledger.Deposit(ALICE, Quote(), 2400);
+        root_b = exec.ExecuteSlot(order_b).state_root;
+        calls_b = auth.calls;
+    }
+    // Identical call count AND order: canonical {0x01}, then {0x02}
+    // (accepted — {0x03} is never reached), duplicates checked once.
+    const std::vector<std::vector<unsigned char>> expected{{0x01}, {0x02}};
+    BOOST_CHECK(calls_a == expected);
+    BOOST_CHECK(calls_b == expected);
+    BOOST_CHECK_EQUAL(root_a.GetHex(), root_b.GetHex());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

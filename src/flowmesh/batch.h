@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -75,6 +76,12 @@ struct Action {
  * what a valid credential is — a single signature, a quorum certificate,
  * a threshold scheme — and none of those semantics are defined here. The
  * batch layer only ever asks yes or no about an action's credential.
+ *
+ * CONTRACT: Authenticate must be DETERMINISTIC (a pure function of the
+ * action bytes, identical on every node) and SIDE-EFFECT-FREE — the
+ * executor calls it in canonical credential order and may call it any
+ * number of times; nothing about consensus may depend on how often or
+ * in what request order a node happens to invoke it.
  */
 class ActionAuthenticator
 {
@@ -118,12 +125,22 @@ public:
     /**
      * Execute one slot over an unordered action set.
      *
-     * Canonicalization: identical actions (equal id) deduplicate
-     * harmlessly. Two DIFFERENT actions from one signer at the same
-     * sequence are equivocation: every action of that (signer, sequence)
-     * is rejected and the sequence does not advance — deterministically,
-     * regardless of which arrived "first". Survivors execute sorted by
-     * (signer, sequence, id).
+     * Canonicalization is a pure function of the action SET — nothing
+     * depends on arrival order:
+     *
+     *  1. Actions dedupe by id. The credential is not part of the id, so
+     *     one id may arrive with several credentials; the action
+     *     authenticates iff ANY supplied credential authenticates. (A
+     *     first-arrival rule here would make the outcome depend on
+     *     ordering, and a canonical-credential rule would let a griefer
+     *     shadow a valid submission with a junk credential.)
+     *  2. Authentication runs FIRST. Unauthenticated ids are rejected
+     *     and take no further part — so a forged action can never
+     *     manufacture an equivocation against an honest signer.
+     *  3. Two DIFFERENT authenticated actions from one signer at the
+     *     same sequence are equivocation: every such id is rejected and
+     *     the sequence does not advance. Survivors execute sorted by
+     *     (signer, sequence, id).
      *
      * Sequencing: an action must carry exactly the signer's next sequence.
      * Applied actions and actions rejected by state (insufficient funds,
@@ -135,44 +152,64 @@ public:
         BatchResult result;
         result.slot = m_ledger.Slot();
 
-        // Group by (signer, sequence); dedupe identical ids; flag
-        // equivocation. std::map keeps groups in canonical order and makes
-        // the result independent of arrival order.
-        std::map<std::pair<AccountId, uint64_t>, std::vector<Action>> groups;
+        // 1. Canonicalize by id (std::map: arrival-order independent).
+        // The credential is outside the id, so one id may arrive with
+        // several credential variants: they are CANONICALIZED too —
+        // deduplicated exactly and sorted lexicographically — so every
+        // node performs the same authentication calls in the same order
+        // no matter how the network delivered the set.
+        std::map<uint256, std::pair<const Action*, std::set<std::vector<unsigned char>>>> by_id;
         for (const Action& action : actions) {
-            std::vector<Action>& group{groups[{action.signer, action.sequence}]};
-            const uint256 id{action.Id()};
-            bool duplicate{false};
-            for (const Action& seen : group) {
-                if (seen.Id() == id) { duplicate = true; break; }
-            }
-            if (!duplicate) group.push_back(action);
+            auto& entry{by_id[action.Id()]};
+            entry.first = &action; // equal id => equal action fields
+            entry.second.insert(action.credential);
         }
 
-        std::vector<Action> ordered;
+        // 2. Authenticate each id in canonical credential order: any
+        // valid credential vouches for the id. Only authenticated
+        // actions proceed to equivocation grouping.
+        std::map<std::pair<AccountId, uint64_t>, std::vector<const Action*>> groups;
+        for (const auto& [id, entry] : by_id) {
+            const auto& [representative, credentials]{entry};
+            bool authenticated{false};
+            for (const std::vector<unsigned char>& credential : credentials) {
+                Action candidate{*representative};
+                candidate.credential = credential;
+                if (m_auth.Authenticate(candidate)) {
+                    authenticated = true;
+                    break;
+                }
+            }
+            if (!authenticated) {
+                result.rejected.emplace_back(id, ActionReject::UNAUTHENTICATED);
+                continue;
+            }
+            groups[{representative->signer, representative->sequence}].push_back(representative);
+        }
+
+        // 3. Equivocation over AUTHENTICATED actions only.
+        std::vector<const Action*> ordered;
         for (const auto& [key, group] : groups) {
             if (group.size() > 1) {
                 // Same-sequence equivocation: reject the whole group and do
                 // not advance the sequence.
-                for (const Action& action : group) {
-                    result.rejected.emplace_back(action.Id(), ActionReject::EQUIVOCATION);
+                for (const Action* action : group) {
+                    result.rejected.emplace_back(action->Id(), ActionReject::EQUIVOCATION);
                 }
                 continue;
             }
             ordered.push_back(group.front());
         }
-        std::stable_sort(ordered.begin(), ordered.end(), [](const Action& a, const Action& b) {
-            if (a.signer != b.signer) return a.signer < b.signer;
-            if (a.sequence != b.sequence) return a.sequence < b.sequence;
-            return a.Id() < b.Id();
-        });
+        std::stable_sort(ordered.begin(), ordered.end(),
+                         [](const Action* a, const Action* b) {
+                             if (a->signer != b->signer) return a->signer < b->signer;
+                             if (a->sequence != b->sequence) return a->sequence < b->sequence;
+                             return a->Id() < b->Id();
+                         });
 
-        for (const Action& action : ordered) {
+        for (const Action* action_ptr : ordered) {
+            const Action& action{*action_ptr};
             const uint256 id{action.Id()};
-            if (!m_auth.Authenticate(action)) {
-                result.rejected.emplace_back(id, ActionReject::UNAUTHENTICATED);
-                continue;
-            }
             if (action.sequence != NextSequence(action.signer)) {
                 result.rejected.emplace_back(id, ActionReject::BAD_SEQUENCE);
                 continue;
