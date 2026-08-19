@@ -182,8 +182,40 @@ void FlowMeshSlot16x4Crossing(benchmark::Bench& bench) { RunSlotBench(bench, 16,
 void FlowMeshSlot256x8Crossing(benchmark::Bench& bench) { RunSlotBench(bench, 256, 8, true); }
 void FlowMeshSlot256x8NoCross(benchmark::Bench& bench) { RunSlotBench(bench, 256, 8, false); }
 
+//! Price the flat full-state root at scale: the known candidate for an
+//! incremental commitment IF the numbers ever demand one. n accounts on
+//! both sides of a standing book plus n funded balances.
+void RunRootBench(benchmark::Bench& bench, const size_t n_accounts)
+{
+    flowmesh::FlowMeshState state{uint256::ONE, Base(), modern::NativeAsset()};
+    for (uint32_t i{0}; i < n_accounts; ++i) {
+        state.ledger.Deposit(Account(i), modern::NativeAsset(), CAmount{1} << 40);
+        state.ledger.Deposit(Account(i), Base(), CAmount{1} << 40);
+        const bool bid{i % 2 == 0};
+        const std::vector<Breakpoint> curve{bid
+            ? std::vector<Breakpoint>{{100, 50}, {200, 0}}
+            : std::vector<Breakpoint>{{299, 0}, {300, 50}}}; // standing, never crossing
+        const bool ok{state.book.SubmitCurve(Account(i),
+                                             bid ? flowmesh::ClearingEngine::Side::BID
+                                                 : flowmesh::ClearingEngine::Side::ASK,
+                                             curve)};
+        assert(ok);
+        state.next_seq[Account(i)] = i + 1;
+    }
+    assert(state.ledger.SolvencyHolds());
+    bench.unit("root").run([&] {
+        const uint256 root{state.Root()};
+        ankerl::nanobench::doNotOptimizeAway(root);
+    });
+}
+
+void FlowMeshStateRoot1k(benchmark::Bench& bench) { RunRootBench(bench, 1'000); }
+void FlowMeshStateRoot10k(benchmark::Bench& bench) { RunRootBench(bench, 10'000); }
+
 } // namespace
 
 BENCHMARK(FlowMeshSlot16x4Crossing);
 BENCHMARK(FlowMeshSlot256x8Crossing);
 BENCHMARK(FlowMeshSlot256x8NoCross);
+BENCHMARK(FlowMeshStateRoot1k);
+BENCHMARK(FlowMeshStateRoot10k);
