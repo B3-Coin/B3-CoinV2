@@ -37,10 +37,13 @@ namespace flowmesh {
  * validators can re-attest it. Authorship is authorization metadata,
  * not content.
  *
- * The action body MUST be in canonical form (batch.h
- * CanonicalizeActions): a non-canonical body is rejected outright, so
- * one logical candidate set has exactly one microblock hash regardless
- * of network arrival order.
+ * The action body MUST be the canonical SEMANTIC form (batch.h
+ * CanonicalizeActions): credential-free, duplicate-free, canonically
+ * ordered. A non-canonical body is rejected outright, so one logical
+ * candidate set has exactly one microblock hash regardless of network
+ * arrival order or observed credential encodings — authentication
+ * EVIDENCE travels beside the body (proposal envelope / certified
+ * entry) and never enters identity.
  */
 
 //! Hard consensus bounds on validator work per microblock. Enforced
@@ -165,13 +168,12 @@ enum class CandidateError : uint8_t {
  */
 inline CandidateError ExecuteCandidate(const FlowMeshState& prev, const uint256& domain,
                                        const uint256& expect_parent, const MicroblockCore& mb,
-                                       const ActionAuthenticator& auth,
                                        const DepositVerifier* deposits, FlowMeshState& next_out,
                                        BatchResult& result_out)
 {
     if (!mb.ShapeIsValid()) return CandidateError::SHAPE;
     if (mb.domain != domain) return CandidateError::WRONG_DOMAIN;
-    if (mb.sequence != prev.ledger.Slot()) return CandidateError::SEQUENCE;
+    if (mb.sequence != prev.Slot()) return CandidateError::SEQUENCE;
     if (mb.parent_hash != expect_parent) return CandidateError::PARENT;
     if (mb.prev_state_root != prev.Root()) return CandidateError::PREV_ROOT;
     if (mb.actions_root != MicroblockCore::ComputeActionsRoot(mb.actions)) {
@@ -179,7 +181,7 @@ inline CandidateError ExecuteCandidate(const FlowMeshState& prev, const uint256&
     }
 
     FlowMeshState next{prev};
-    BatchExecutor exec{next, auth, deposits};
+    BatchExecutor exec{next, deposits};
     std::optional<BatchResult> result{exec.ExecuteSlot(mb.actions, mb.anchor)};
     if (!result) return CandidateError::EXECUTION_FAILURE;
 
@@ -194,30 +196,74 @@ inline CandidateError ExecuteCandidate(const FlowMeshState& prev, const uint256&
 }
 
 /**
- * Proposer construction: canonicalize the candidate action set, execute
- * it on a copy of the previous state, and emit the microblock whose
- * claims match that execution exactly. Returns nullopt on fatal
- * execution failure. The proposer has no authority beyond selecting the
- * candidate set — the body is canonicalized, the identity is
- * proposer-free, and every claim is recomputed by every validator via
- * ExecuteCandidate.
+ * Authentication EVIDENCE for a microblock body: one credential per
+ * SIGNED action, aligned with the body's canonical order (deposits
+ * carry no evidence). Evidence lives OUTSIDE identity — different valid
+ * encodings never change the hash — and is verified at admission
+ * (proposal handling, certified-entry acceptance, store replay), never
+ * during execution.
+ */
+inline bool VerifyActionEvidence(const MicroblockCore& mb,
+                                 const std::vector<std::vector<unsigned char>>& credentials,
+                                 const ActionAuthenticator& auth)
+{
+    size_t next{0};
+    for (const Action& action : mb.actions) {
+        if (action.IsDeposit()) continue;
+        if (next >= credentials.size()) return false;
+        const std::vector<unsigned char>& credential{credentials[next++]};
+        if (credential.size() > MAX_ACTION_CREDENTIAL_SIZE) return false;
+        Action candidate{action};
+        candidate.credential = credential;
+        if (!auth.Authenticate(candidate)) return false;
+    }
+    return next == credentials.size(); // no dangling evidence
+}
+
+/**
+ * Proposer construction: canonicalize the candidate action set, split
+ * the admitted credentials into the evidence vector, execute on a copy
+ * of the previous state, and emit the microblock whose claims match
+ * that execution exactly. Returns nullopt on fatal execution failure
+ * (or missing evidence for a signed action). The proposer has no
+ * authority beyond selecting the candidate set — the body is canonical,
+ * the identity is proposer- and evidence-free, and every claim is
+ * recomputed by every validator via ExecuteCandidate.
  */
 inline std::optional<MicroblockCore> BuildMicroblock(
     const FlowMeshState& prev, const uint256& domain, const uint256& parent_hash,
-    const AnchorRef& anchor, std::vector<Action> actions, const ActionAuthenticator& auth,
-    const DepositVerifier* deposits, FlowMeshState& next_out, BatchResult& result_out)
+    const AnchorRef& anchor, const std::vector<Action>& actions,
+    const DepositVerifier* deposits, FlowMeshState& next_out, BatchResult& result_out,
+    std::vector<std::vector<unsigned char>>& credentials_out)
 {
     MicroblockCore mb;
     mb.domain = domain;
-    mb.sequence = prev.ledger.Slot();
+    mb.sequence = prev.Slot();
     mb.parent_hash = parent_hash;
     mb.anchor = anchor;
     mb.prev_state_root = prev.Root();
-    mb.actions = CanonicalizeActions(std::move(actions));
+    mb.actions = CanonicalizeActions(actions);
     mb.actions_root = MicroblockCore::ComputeActionsRoot(mb.actions);
 
+    // Evidence: the first observed credential per signed semantic id
+    // (the pool admits exactly one, already authenticated).
+    credentials_out.clear();
+    for (const Action& canonical : mb.actions) {
+        if (canonical.IsDeposit()) continue;
+        const uint256 id{canonical.Id()};
+        bool found{false};
+        for (const Action& original : actions) {
+            if (original.Id() == id) {
+                credentials_out.push_back(original.credential);
+                found = true;
+                break;
+            }
+        }
+        if (!found) return std::nullopt; // cannot happen: canonical <= input
+    }
+
     FlowMeshState next{prev};
-    BatchExecutor exec{next, auth, deposits};
+    BatchExecutor exec{next, deposits};
     std::optional<BatchResult> result{exec.ExecuteSlot(mb.actions, mb.anchor)};
     if (!result) return std::nullopt;
     mb.result_commitment = result->result_commitment;

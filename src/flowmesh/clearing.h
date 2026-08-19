@@ -23,6 +23,8 @@
 
 namespace flowmesh {
 
+class FlowMeshState;
+
 //! Snapshot decode bound for the persistent book, enforced before
 //! elements are read.
 inline constexpr uint64_t BOOK_SNAPSHOT_MAX_CURVES{uint64_t{1} << 22};
@@ -34,11 +36,12 @@ inline constexpr uint64_t BOOK_SNAPSHOT_MAX_CURVES{uint64_t{1} << 22};
  * anywhere — and fills settle internally against the ledger with no
  * per-fill UTXO spend.
  *
- * OWNERSHIP: the engine stores NO ledger binding. Every operation that
- * moves value takes the authoritative Ledger as an explicit parameter,
- * so an engine can never be attached to (or drift onto) a different
- * ledger than its owner's — FlowMeshState passes its own ledger and the
- * pairing is correct by construction.
+ * OWNERSHIP: the engine stores NO ledger binding, and its value-moving
+ * operations (submit/cancel/clear) are PRIVATE with FlowMeshState as
+ * their only caller — the sole way to reach them is through the owning
+ * state, which always pairs its own book with its own ledger. No public
+ * API accepts an arbitrary Ledger&, so book A + ledger B cannot be
+ * combined even accidentally.
  *
  * A demand curve is bounded piecewise-linear and monotone: at most K
  * breakpoints (price, quantity), strictly ascending in price, with
@@ -123,9 +126,13 @@ public:
         return EvalCurve(points, price);
     }
 
+private:
+    friend class FlowMeshState;
+
     /**
      * Submit or replace an account's curve on a side, reserving against
-     * `ledger` (the owner's authoritative ledger). The worst-case
+     * `ledger` (the owning FlowMeshState's ledger — FlowMeshState is
+     * the only caller). The worst-case
      * reservation (quote for a bid, base for an ask) must be backed by
      * the account's available balance, or the submission is rejected and
      * nothing changes. A replacement adjusts the ledger by exactly the
@@ -174,6 +181,7 @@ public:
         return true;
     }
 
+public:
     //! Effective (remaining) demand of a curve at price p.
     CAmount EffectiveQty(Side side, const AccountId& account, CAmount price) const
     {
@@ -182,8 +190,10 @@ public:
         return std::max<CAmount>(0, EvalCurve(it->second.points, price) - it->second.filled);
     }
 
+private:
     /**
-     * Clear the current slot against `ledger`: compute the uniform price
+     * Clear the current slot against `ledger` (FlowMeshState is the
+     * only caller): compute the uniform price
      * and volume, allocate deterministically, settle fills internally,
      * deduct filled quantities from the persistent curves (dropping
      * exhausted ones), and advance the ledger slot.
@@ -200,18 +210,31 @@ public:
         ClearingResult result;
         const std::vector<CAmount> candidates{CandidatePrices()};
 
+        // EXACT widened aggregation: aggregate demand can legitimately
+        // exceed MAX_MONEY (many bids), so totals are computed in 128
+        // bits with NO saturation — saturation must never change
+        // selection or allocation semantics. The traded volume itself
+        // is bounded by the reserved supply side (<= per-asset custody
+        // <= MAX_MONEY); a violation of that bound is a fatal internal
+        // inconsistency, not a clamp.
+        __int128 best_imbalance{0};
         for (const CAmount p : candidates) {
-            const CAmount demand{SideTotal(Side::BID, p)};
-            const CAmount supply{SideTotal(Side::ASK, p)};
-            const CAmount volume{std::min(demand, supply)};
+            const __int128 demand{SideTotal128(Side::BID, p)};
+            const __int128 supply{SideTotal128(Side::ASK, p)};
+            const __int128 volume{demand < supply ? demand : supply};
             if (volume <= 0) continue;
-            const CAmount imbalance{demand > supply ? demand - supply : supply - demand};
-            if (!result.cleared || volume > result.volume ||
-                (volume == result.volume && imbalance < result.imbalance)) {
+            const __int128 imbalance{demand > supply ? demand - supply : supply - demand};
+            if (!result.cleared || volume > static_cast<__int128>(result.volume) ||
+                (volume == static_cast<__int128>(result.volume) &&
+                 imbalance < best_imbalance)) {
+                if (volume > static_cast<__int128>(MAX_MONEY)) return std::nullopt; // fatal
                 result.cleared = true;
                 result.price = p;
-                result.volume = volume;
-                result.imbalance = imbalance;
+                result.volume = static_cast<CAmount>(volume);
+                result.imbalance = imbalance > static_cast<__int128>(MAX_MONEY)
+                                       ? MAX_MONEY
+                                       : static_cast<CAmount>(imbalance); // tie-break only
+                best_imbalance = imbalance;
             }
         }
 
@@ -225,6 +248,7 @@ public:
         return result;
     }
 
+public:
     //! Deterministic root binding the whole persistent book to the given
     //! ledger's state and slot. CANONICALLY FRAMED end to end (identical
     //! preimage to the pre-refactor form).
@@ -283,6 +307,16 @@ public:
             const std::pair<Side, AccountId> key{static_cast<Side>(side), account};
             if (!curves.empty() && !(std::prev(curves.end())->first < key)) {
                 throw std::ios_base::failure("flowmesh book snapshot keys not canonical");
+            }
+            // Semantic curve validity on decode: count/monotonicity/
+            // range via the same rule live submission enforces, plus
+            // sane fill/reservation accounting fields.
+            if (!CurveIsValid(key.first, curve.points)) {
+                throw std::ios_base::failure("flowmesh book snapshot curve invalid");
+            }
+            if (curve.filled < 0 || curve.filled > MAX_MONEY || curve.reserved < 0 ||
+                curve.reserved > MAX_MONEY) {
+                throw std::ios_base::failure("flowmesh book snapshot curve accounting invalid");
             }
             curves.emplace_hint(curves.end(), key, std::move(curve));
         }
@@ -369,13 +403,19 @@ private:
         // an integer price p with demand(p) >= λ > q_{i+1} = demand at
         // p_{i+1}; demand is non-increasing, hence p <= p_{i+1} - 1.
         // Total spend is therefore bounded by the staircase sum
-        //     Σ (q_i − q_{i+1}) · (price_{i+1} − 1)
-        // — the EXACT integer-price worst case. (The earlier
-        // right-edge-price bound over-reserved by one tick per lot: a
-        // degenerate BUY {(P,Q),(P+1,0)} reserved Q·(P+1) although no
-        // fill above P is possible.) Strictly ascending prices with
-        // p_0 >= 0 guarantee price_{i+1} >= 1, so the subtraction is
-        // safe.
+        //     Σ (q_i − q_{i+1}) · (price_{i+1} − 1).
+        // HONEST CHARACTERIZATION: this is a SAFE UPPER BOUND (every
+        // per-lot price is individually maximal), proven EXACT for the
+        // degenerate single-segment limit order {(P,Q),(P+1,0)} — which
+        // reserves exactly Q·P — but CONSERVATIVE in general: no proof
+        // is claimed that every lot can reach its per-lot maximum
+        // simultaneously across multi-segment curves, so multi-segment
+        // bids may reserve somewhat more than any realizable spend.
+        // That conservatism is deliberate and economically acceptable
+        // (funds are merely reserved, released exactly on cancel or
+        // exhaustion); the settlement invariants only require an upper
+        // bound. Strictly ascending prices with p_0 >= 0 guarantee
+        // price_{i+1} >= 1, so the subtraction is safe.
         CAmount worst{0};
         for (size_t i{0}; i + 1 < points.size(); ++i) {
             const std::optional<CAmount> spend{
@@ -396,14 +436,16 @@ private:
         return {prices.begin(), prices.end()};
     }
 
-    CAmount SideTotal(Side side, const CAmount price) const
+    //! Exact widened side total: never saturates (curve count and
+    //! per-curve quantities are bounded, so the 128-bit sum cannot
+    //! overflow).
+    __int128 SideTotal128(Side side, const CAmount price) const
     {
-        CAmount total{0};
+        __int128 total{0};
         for (const auto& [key, curve] : m_curves) {
             if (key.first != side) continue;
             const CAmount q{std::max<CAmount>(0, EvalCurve(curve.points, price) - curve.filled)};
-            if (q > MAX_MONEY - total) return MAX_MONEY; // saturate; volume is bounded anyway
-            total += q;
+            total += static_cast<__int128>(q);
         }
         return total;
     }
@@ -413,30 +455,32 @@ private:
     std::map<AccountId, CAmount> Allocate(Side side, const CAmount price, const CAmount volume)
     {
         std::map<AccountId, CAmount> desired;
-        CAmount total{0};
+        unsigned __int128 total{0}; // exact: an intermediate sum may exceed MAX_MONEY
         for (const auto& [key, curve] : m_curves) {
             if (key.first != side) continue;
             const CAmount q{std::max<CAmount>(0, EvalCurve(curve.points, price) - curve.filled)};
             if (q > 0) {
                 desired[key.second] = q;
-                if (q > MAX_MONEY - total) return desired; // unreachable; bounded by custody
-                total += q;
+                total += static_cast<unsigned __int128>(q);
             }
         }
         std::map<AccountId, CAmount> alloc;
-        if (total <= volume) { // short side: everyone fully filled
+        if (total <= static_cast<unsigned __int128>(volume)) { // short side: fully filled
             return desired;
         }
+        // Long side: largest-remainder rationing in account order, with
+        // every product/total widened — an aggregate overflow can never
+        // hand back an un-rationed map.
         struct Rem { AccountId account; unsigned __int128 rem; };
         std::vector<Rem> remainders;
         CAmount handed{0};
         for (const auto& [account, q] : desired) {
             const unsigned __int128 num{static_cast<unsigned __int128>(q) *
                                         static_cast<unsigned __int128>(volume)};
-            const CAmount base{static_cast<CAmount>(num / static_cast<unsigned __int128>(total))};
+            const CAmount base{static_cast<CAmount>(num / total)};
             alloc[account] = base;
             handed += base;
-            remainders.push_back({account, num % static_cast<unsigned __int128>(total)});
+            remainders.push_back({account, num % total});
         }
         CAmount leftover{volume - handed};
         std::stable_sort(remainders.begin(), remainders.end(),
@@ -462,6 +506,26 @@ private:
      */
     [[nodiscard]] bool SettleAndConsume(Ledger& ledger, const ClearingResult& result)
     {
+        // ---- Allocation invariant, before ANY mutation: both advertised
+        // fill maps must sum exactly to the clearing volume. Any
+        // violation is a fatal execution failure — never settle a
+        // mis-rationed allocation.
+        {
+            unsigned __int128 bid_sum{0}, ask_sum{0};
+            for (const auto& [account, fill] : result.bid_fill) {
+                if (fill < 0) return false;
+                bid_sum += static_cast<unsigned __int128>(fill);
+            }
+            for (const auto& [account, fill] : result.ask_fill) {
+                if (fill < 0) return false;
+                ask_sum += static_cast<unsigned __int128>(fill);
+            }
+            if (bid_sum != static_cast<unsigned __int128>(result.volume) ||
+                ask_sum != static_cast<unsigned __int128>(result.volume)) {
+                return false;
+            }
+        }
+
         // ---- Preflight, before any mutation.
         for (const auto& [account, fill] : result.bid_fill) {
             if (fill <= 0) continue;

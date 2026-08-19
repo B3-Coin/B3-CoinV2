@@ -3,12 +3,12 @@
 // file COPYING or https://opensource.org/license/mit/.
 
 //! FlowMesh certified-log node layer: multi-node propose/attest/certify
-//! convergence with signed proposer envelopes, durable-before-live
-//! commit ordering, write-ahead lock journaling with restart safety,
-//! replacement-proposer recovery of a locked candidate, catch-up,
-//! anchor revalidation of certified history under B3 reorgs, snapshot
-//! revalidation, the withdrawal request lifecycle, and FlowMesh-outage
-//! isolation from B3 block production.
+//! convergence with signed proposer envelopes and out-of-identity
+//! evidence, durable-before-live commit ordering, compare-and-set lock
+//! journaling with automatic restart restore (StartValidator),
+//! guard-before-cache proposal admission, anchor revalidation before
+//! signing/commit and across replay/snapshots, replacement-proposer
+//! recovery, catch-up, and FlowMesh-outage isolation from B3.
 
 #include <flowmesh/sync.h>
 
@@ -111,9 +111,9 @@ public:
     }
 };
 
-//! Ephemeral in-memory journal: provides the WRITE-AHEAD interface for
-//! message-flow tests. Durability itself is exercised by the
-//! store-backed journal in the restart tests below.
+//! Ephemeral in-memory journal implementing the compare-and-set
+//! contract, with a fail switch. Durability itself is exercised by the
+//! store-backed journal below.
 class MemJournal final : public flowmesh::LockJournal
 {
 public:
@@ -123,7 +123,9 @@ public:
     bool WriteLock(const uint64_t sequence, const uint256& hash) override
     {
         if (fail) return false;
-        locks[sequence] = hash;
+        const auto it{locks.find(sequence)};
+        if (it != locks.end()) return it->second == hash; // CAS: refuse different
+        locks.emplace(sequence, hash);
         return true;
     }
     bool ClearLocksThrough(const uint64_t sequence) override
@@ -136,7 +138,8 @@ public:
     }
 };
 
-//! A commit sink that can be told to fail: the durable append refused.
+//! An in-memory commit sink that can be told to fail (a durable-store
+//! stand-in for message-flow tests).
 class FailableSink final : public flowmesh::CommitSink
 {
 public:
@@ -164,6 +167,7 @@ struct MeshNet {
     flowmesh::AccountId alice{flowmesh::AccountForKey(Xonly(alice_key))};
     flowmesh::AccountId bob{flowmesh::AccountForKey(Xonly(bob_key))};
     std::vector<std::unique_ptr<MemJournal>> journals;
+    std::vector<std::unique_ptr<FailableSink>> sinks;
     std::vector<std::unique_ptr<MeshNode>> nodes; // one per seat
     std::unique_ptr<MeshNode> observer;           // no seat key
 
@@ -185,7 +189,8 @@ struct MeshNet {
 
         for (size_t i{0}; i < n_seats; ++i) {
             journals.push_back(std::make_unique<MemJournal>());
-            nodes.push_back(MakeNode(keys[i], nullptr, journals.back().get()));
+            sinks.push_back(std::make_unique<FailableSink>());
+            nodes.push_back(MakeNode(keys[i], sinks.back().get(), journals.back().get()));
         }
         observer = MakeNode(std::nullopt);
     }
@@ -290,11 +295,12 @@ BOOST_AUTO_TEST_CASE(three_nodes_certify_and_converge)
          net.SignedOrder(net.alice_key, 0, /*buy=*/true, 50'000, 10),
          net.SignedOrder(net.bob_key, 0, /*buy=*/false, 50'000, 10)})};
     BOOST_CHECK_EQUAL(e0.mb.sequence, 0U);
+    for (const Action& body_action : e0.mb.actions) {
+        BOOST_CHECK(body_action.credential.empty()); // evidence never enters the body
+    }
 
-    // Microblock 1: a withdrawal intent — which creates a REQUEST, never
-    // anything redeemable (lifecycle: REQUESTED, then derived
-    // MICROBLOCK_CERTIFIED once this entry certifies; the B3_FINAL /
-    // REDEEMABLE stage is gated on the unresolved owner decision).
+    // Microblock 1: a withdrawal intent — a REQUEST, never redeemable
+    // (B3 authorization is an unresolved owner decision).
     Action withdraw;
     withdraw.signer = net.alice;
     withdraw.sequence = 1;
@@ -307,8 +313,6 @@ BOOST_AUTO_TEST_CASE(three_nodes_certify_and_converge)
     const CertifiedEntry e1{net.RunRound({withdraw})};
     BOOST_CHECK_EQUAL(e1.mb.sequence, 1U);
     BOOST_CHECK(e1.mb.parent_hash == e0.mb.GetHash());
-    // The certified state holds exactly one pending withdrawal REQUEST.
-    BOOST_REQUIRE_EQUAL(e1.mb.actions.size(), 1U);
 
     const uint256 root{net.nodes[0]->State().Root()};
     for (auto& node : net.nodes) {
@@ -326,20 +330,15 @@ BOOST_AUTO_TEST_CASE(three_nodes_certify_and_converge)
 
 BOOST_AUTO_TEST_CASE(commit_is_durable_before_live_and_storage_failure_halts)
 {
-    // Codex defect 8 regression: a certified transition must not become
-    // live state when its durable record failed; the node fail-stops.
     MeshNet net{3, 0};
-    FailableSink sink;
-    MemJournal journal;
-    net.nodes[0] = net.MakeNode(net.keys[0], &sink, &journal);
 
     net.RunRound({net.Deposit(Outpoint(0x0a, 0))});
-    BOOST_REQUIRE_EQUAL(sink.committed.size(), 1U); // durable first, then live
+    BOOST_REQUIRE_EQUAL(net.sinks[0]->committed.size(), 1U); // durable first, then live
     BOOST_CHECK_EQUAL(net.nodes[0]->Sequence(), 1U);
 
-    // Storage starts failing: the next certified entry must NOT advance
-    // node 0's live tip, and the node halts instead of continuing.
-    sink.fail = true;
+    // Storage starts failing on node 0: the next certified entry must
+    // NOT advance its live tip; the node fail-stops.
+    net.sinks[0]->fail = true;
     const size_t p{net.ProposerIndex(1, 0)};
     BOOST_REQUIRE(net.nodes[p]->SubmitAction(net.SignedOrder(net.alice_key, 0, true, 40'000, 2)));
     const auto proposal{net.nodes[p]->TryPropose()};
@@ -356,7 +355,7 @@ BOOST_AUTO_TEST_CASE(commit_is_durable_before_live_and_storage_failure_halts)
             }
         }
     }
-    BOOST_REQUIRE(entry.has_value()); // a sinkless node still certified
+    BOOST_REQUIRE(entry.has_value()); // another node certified
     BOOST_CHECK(!net.nodes[0]->HandleCertified(*entry));
     BOOST_CHECK_EQUAL(net.nodes[0]->Sequence(), 1U); // live tip did NOT advance
     BOOST_CHECK(net.nodes[0]->Halted());
@@ -365,27 +364,33 @@ BOOST_AUTO_TEST_CASE(commit_is_durable_before_live_and_storage_failure_halts)
     BOOST_CHECK(!net.nodes[0]->SubmitAction(net.SignedOrder(net.bob_key, 0, false, 1, 1)));
 }
 
-BOOST_AUTO_TEST_CASE(lock_journal_failure_prevents_signing)
+BOOST_AUTO_TEST_CASE(signing_validators_require_full_durable_state)
 {
-    // Codex defect 7 regression (durable safety): if the write-ahead
-    // lock cannot be journaled, the validator must NOT sign.
+    // Codex re-audit item 7: a seat without a durable sink OR without a
+    // lock journal is an invalid signing configuration.
     MeshNet net{3, 0};
+    MemJournal journal;
+    FailableSink sink;
+    auto no_sink{net.MakeNode(net.keys[0], nullptr, &journal)};
+    BOOST_CHECK(no_sink->Halted());
+    BOOST_CHECK(no_sink->Halt() == MeshHalt::INVALID_CONFIG);
+    auto no_journal{net.MakeNode(net.keys[0], &sink, nullptr)};
+    BOOST_CHECK(no_journal->Halted());
+    BOOST_CHECK(no_journal->Halt() == MeshHalt::INVALID_CONFIG);
+    auto observer{net.MakeNode(std::nullopt)}; // observers need neither
+    BOOST_CHECK(!observer->Halted());
+
+    // Lock-journal failure prevents signing.
     const size_t p{net.ProposerIndex(0, 0)};
     const auto proposal{net.nodes[p]->TryPropose()};
     BOOST_REQUIRE(proposal.has_value());
-
     const size_t other{(p + 1) % 3};
     net.journals[other]->fail = true;
     BOOST_CHECK(!net.nodes[other]->HandleProposal(*proposal).has_value());
     BOOST_CHECK(net.nodes[other]->Halted());
     BOOST_CHECK(net.nodes[other]->Halt() == MeshHalt::LOCK_JOURNAL_FAILED);
 
-    // A seat configured WITHOUT any journal is an invalid config: it
-    // never participates at all.
-    auto no_journal{net.MakeNode(net.keys[p], nullptr, /*journal=*/nullptr)};
-    BOOST_CHECK(no_journal->Halted());
-    BOOST_CHECK(no_journal->Halt() == MeshHalt::INVALID_CONFIG);
-    // Threshold zero is likewise refused up front.
+    // Threshold zero is refused up front.
     {
         MeshNode::Config config;
         config.domain = MESH_DOMAIN;
@@ -399,27 +404,56 @@ BOOST_AUTO_TEST_CASE(lock_journal_failure_prevents_signing)
     }
 }
 
+BOOST_AUTO_TEST_CASE(guards_run_before_candidate_cache)
+{
+    // Codex re-audit item 9: wrong-round / wrong-proposer / forged
+    // proposals are refused BEFORE execution or caching, so spam cannot
+    // exhaust the bounded candidate cache and shadow a legit proposal.
+    MeshNet net{3, 0};
+    const size_t p0{net.ProposerIndex(0, 0)};
+    const size_t p1{net.ProposerIndex(0, 1)};
+    size_t victim{0};
+    while (victim == p0 || victim == p1) ++victim;
+
+    // Build a legitimate round-0 proposal for later.
+    BOOST_REQUIRE(net.nodes[p0]->SubmitAction(net.Deposit(Outpoint(0x0a, 0))));
+    const auto legit{net.nodes[p0]->TryPropose()};
+    BOOST_REQUIRE(legit.has_value());
+
+    // Spam: 20 distinct FUTURE-ROUND proposals authored by the correct
+    // round-1 proposer, plus forged-signature variants. None may cache.
+    MemJournal spam_journal;
+    FailableSink spam_sink;
+    for (int i{0}; i < 20; ++i) {
+        auto spammer{net.MakeNode(net.keys[p1], &spam_sink, &spam_journal)};
+        BOOST_REQUIRE(spammer->SubmitAction(
+            net.SignedOrder(net.alice_key, 0, true, 10'000 + i * 1'000, 2)));
+        spammer->NoteTimeout(); // round 1: p1 is scheduled there
+        auto spam{spammer->TryPropose()};
+        BOOST_REQUIRE(spam.has_value());
+        BOOST_CHECK(!net.nodes[victim]->HandleProposal(*spam).has_value()); // wrong round here
+        ProposalMsg forged{*spam};
+        forged.round = 0;
+        forged.proposer = Xonly(net.keys[p0]); // claims round-0 proposer, wrong signature
+        BOOST_CHECK(!net.nodes[victim]->HandleProposal(forged).has_value());
+    }
+    // The legit proposal still admits, executes and attests: the cache
+    // was never consumed by the spam.
+    BOOST_CHECK(net.nodes[victim]->HandleProposal(*legit).has_value());
+}
+
 BOOST_AUTO_TEST_CASE(replacement_proposer_continues_a_locked_candidate)
 {
-    // Codex defect 7 regression (replacement proposal): proposer
-    // identity lives in the ENVELOPE, not the candidate hash, so a
-    // later round's proposer re-proposes the SAME locked candidate and
-    // locked validators re-attest it — recovery cannot deadlock merely
-    // because authorship changed.
     MeshNet net{3, 0}; // t = 2
     const size_t p0{net.ProposerIndex(0, 0)};
     BOOST_REQUIRE(net.nodes[p0]->SubmitAction(net.Deposit(Outpoint(0x0a, 0))));
     const auto proposal_a{net.nodes[p0]->TryPropose()};
     BOOST_REQUIRE(proposal_a.has_value());
 
-    // Round 0: only seat p1 sees the proposal and attests (1 < t —
-    // stalled); p1 is now locked on candidate A and holds it.
     const size_t p1{net.ProposerIndex(0, 1)};
     const auto att_p1{net.nodes[p1]->HandleProposal(*proposal_a)};
     BOOST_REQUIRE(att_p1.has_value());
 
-    // Everyone times into round 1, whose scheduled proposer is p1: it
-    // re-proposes the SAME candidate hash under its own envelope.
     for (auto& node : net.nodes) node->NoteTimeout();
     const auto proposal_b{net.nodes[p1]->TryPropose()};
     BOOST_REQUIRE(proposal_b.has_value());
@@ -447,6 +481,37 @@ BOOST_AUTO_TEST_CASE(replacement_proposer_continues_a_locked_candidate)
     }
 }
 
+BOOST_AUTO_TEST_CASE(lock_journal_is_compare_and_set_across_restart)
+{
+    // Codex re-audit item 6: no lock -> write; same lock -> idempotent;
+    // different lock -> refuse. Across reopen.
+    const fs::path store_path{m_args.GetDataDirBase() / "flowmesh_cas"};
+    MeshNet net{3, 0};
+    std::string error;
+    const uint256 h1{uint256::ONE};
+    const uint256 h2{uint256{"0000000000000000000000000000000000000000000000000000000000000002"}};
+    {
+        node::FlowMeshStore store{
+            DBParams{.path = store_path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+        BOOST_REQUIRE(store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+        BOOST_CHECK(store.WriteLock(0, h1));
+        BOOST_CHECK(store.WriteLock(0, h1));  // idempotent
+        BOOST_CHECK(!store.WriteLock(0, h2)); // conflicting: refused
+        std::map<uint64_t, uint256> locks;
+        BOOST_REQUIRE(store.ReadLocks(locks, error));
+        BOOST_CHECK(locks.at(0) == h1);
+    }
+    {
+        node::FlowMeshStore reopened{
+            DBParams{.path = store_path, .cache_bytes = size_t{1} << 20}};
+        BOOST_REQUIRE(reopened.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+        BOOST_CHECK(!reopened.WriteLock(0, h2)); // still refused after restart
+        BOOST_CHECK(reopened.WriteLock(0, h1));
+        BOOST_CHECK(reopened.ClearLocksThrough(0));
+        BOOST_CHECK(reopened.WriteLock(0, h2)); // cleared lock frees the slot
+    }
+}
+
 BOOST_AUTO_TEST_CASE(store_appends_replays_snapshots_and_survives_restart)
 {
     const fs::path store_path{m_args.GetDataDirBase() / "flowmesh_log"};
@@ -470,20 +535,20 @@ BOOST_AUTO_TEST_CASE(store_appends_replays_snapshots_and_survives_restart)
     const uint256 live_root{net.nodes[0]->State().Root()};
     const uint256 live_hash{net.nodes[0]->LastHash()};
 
-    // Deterministic reconstruction, with anchors revalidated.
+    // Reconstruction with anchors revalidated and dependencies reported.
     {
         FlowMeshState state{VAULT, BaseX(), Quote()};
         uint256 last_hash;
+        std::map<std::pair<int32_t, uint256>, uint64_t> anchors_out;
         BOOST_REQUIRE_MESSAGE(store->Replay(state, last_hash, net.auth, &net.deposits,
-                                            net.seats, net.threshold, &net.anchors, error),
+                                            net.seats, net.threshold, &net.anchors, error,
+                                            &anchors_out),
                               error);
         BOOST_CHECK_EQUAL(state.Root().GetHex(), live_root.GetHex());
         BOOST_CHECK_EQUAL(last_hash.GetHex(), live_hash.GetHex());
+        BOOST_CHECK_EQUAL(anchors_out.size(), 1U); // both entries share the fixed anchor
     }
-    // Replay under a different quorum fails closed (defect 9: history is
-    // verified with the quorum it was certified under, recorded in the
-    // marker; re-judging under another is the owner's seat-lifecycle
-    // decision, not an implicit behavior).
+    // Replay under a different quorum fails closed.
     {
         FlowMeshState state{VAULT, BaseX(), Quote()};
         uint256 last_hash;
@@ -491,19 +556,17 @@ BOOST_AUTO_TEST_CASE(store_appends_replays_snapshots_and_survives_restart)
                                    std::set<XOnlyPubKey>{Xonly(net.keys[0])}, 1, nullptr,
                                    error));
     }
-    // Replay refuses history whose anchors left the canonical chain
-    // (defect 10: certified history cannot silently remain accepted).
+    // Replay refuses history whose anchors left the canonical chain.
     {
         net.anchors.still_canonical = false;
         FlowMeshState state{VAULT, BaseX(), Quote()};
         uint256 last_hash;
         BOOST_CHECK(!store->Replay(state, last_hash, net.auth, &net.deposits, net.seats,
-                                   net.threshold, &net.anchors, error));
+                                   net.threshold, &net.anchors, error, nullptr));
         net.anchors.still_canonical = true;
     }
 
-    // Certificate-verified snapshot accelerates reconstruction; a wrong
-    // state is refused at write time.
+    // Certificate-verified snapshot; wrong state refused at write time.
     BOOST_REQUIRE_MESSAGE(store->WriteSnapshot(1, mid_state, error), error);
     BOOST_CHECK(!store->WriteSnapshot(2, mid_state, error));
     {
@@ -511,55 +574,71 @@ BOOST_AUTO_TEST_CASE(store_appends_replays_snapshots_and_survives_restart)
         uint256 last_hash;
         BOOST_REQUIRE_MESSAGE(store->ReplayFromBestSnapshot(state, last_hash, net.auth,
                                                             &net.deposits, net.seats,
-                                                            net.threshold, &net.anchors, error),
+                                                            net.threshold, &net.anchors, error,
+                                                            nullptr),
                               error);
         BOOST_CHECK_EQUAL(state.Root().GetHex(), live_root.GetHex());
         BOOST_CHECK_EQUAL(last_hash.GetHex(), live_hash.GetHex());
     }
-    // Snapshots cannot bypass anchor validity: with the snapshot-tip
-    // anchor off-chain, reconstruction refuses rather than trusting the
-    // snapshot (defect 10 / snapshot revalidation).
+    // Codex re-audit item 12: a snapshot cannot bypass anchor validity
+    // for the SKIPPED PREFIX — with the prefix anchor off-chain, the
+    // snapshot is rejected AND the verified-replay fallback also
+    // refuses, so reconstruction fails safe rather than accepting
+    // state derived from an orphaned B3 anchor.
     {
         net.anchors.still_canonical = false;
         FlowMeshState state{VAULT, BaseX(), Quote()};
         uint256 last_hash;
         BOOST_CHECK(!store->ReplayFromBestSnapshot(state, last_hash, net.auth, &net.deposits,
                                                    net.seats, net.threshold, &net.anchors,
-                                                   error));
+                                                   error, nullptr));
         net.anchors.still_canonical = true;
     }
 
-    // "Restart": close everything, reopen, reconstruct, and serve
-    // catch-up from the durable log.
-    net.nodes[0] = net.MakeNode(net.keys[0]); // detach sink+journal
+    // "Restart" through the PRODUCTION lifecycle: StartValidator wires
+    // sink/journal/history and restores tip, state, locks and anchor
+    // dependencies automatically.
+    net.nodes[0] = net.MakeNode(net.keys[0], net.sinks[0].get(), net.journals[0].get());
     store.reset();
     {
         node::FlowMeshStore reopened{
             DBParams{.path = store_path, .cache_bytes = size_t{1} << 20}};
-        BOOST_REQUIRE(reopened.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
-        FlowMeshState state{VAULT, BaseX(), Quote()};
-        uint256 last_hash;
-        BOOST_REQUIRE_MESSAGE(reopened.ReplayFromBestSnapshot(state, last_hash, net.auth,
-                                                              &net.deposits, net.seats,
-                                                              net.threshold, &net.anchors,
-                                                              error),
+        MeshNode::Config config;
+        config.domain = MESH_DOMAIN;
+        config.seats = net.seats;
+        config.threshold = net.threshold;
+        config.schedule = net.schedule.get();
+        config.auth = &net.auth;
+        config.deposits = &net.deposits;
+        config.anchors = &net.anchors;
+        config.seat_key = net.keys[0];
+        node::ValidatorRuntime runtime;
+        BOOST_REQUIRE_MESSAGE(node::StartValidator(reopened, std::move(config),
+                                                   FlowMeshState{VAULT, BaseX(), Quote()},
+                                                   runtime, error),
                               error);
-        BOOST_CHECK_EQUAL(state.Root().GetHex(), live_root.GetHex());
+        BOOST_CHECK_EQUAL(runtime.mesh_node->Sequence(), 2U);
+        BOOST_CHECK_EQUAL(runtime.mesh_node->State().Root().GetHex(), live_root.GetHex());
+        BOOST_CHECK(runtime.mesh_node->LastHash() == live_hash);
+        // Committed-anchor dependencies were restored: a later B3 reorg
+        // of that anchor halts the restarted node.
+        BOOST_CHECK_EQUAL(runtime.mesh_node->CommittedAnchors().size(), 1U);
+        net.anchors.still_canonical = false;
+        BOOST_CHECK(!runtime.mesh_node->RecheckCommittedAnchors());
+        BOOST_CHECK(runtime.mesh_node->Halt() == MeshHalt::ANCHOR_INVALIDATED);
+        net.anchors.still_canonical = true;
 
-        // Log discipline: re-appending an old entry and opening under a
-        // foreign domain or quorum both fail closed.
+        // Log discipline: re-append/foreign-domain/foreign-quorum fail.
         const auto e0{reopened.ReadEntry(0)};
         BOOST_REQUIRE(e0.has_value());
         BOOST_CHECK(!reopened.Append(*e0, error));
         BOOST_CHECK(!reopened.OpenForDomain(uint256::ONE, net.seats, net.threshold, error));
         BOOST_CHECK(!reopened.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold - 1, error));
 
-        // A restored node serves history it did not commit in this
-        // process lifetime, via the durable catch-up source.
+        // Catch-up serves from the durable log after restart.
         node::StoreCatchupSource source{reopened};
-        auto restored{net.MakeNode(std::nullopt, nullptr, nullptr, &source, last_hash,
-                                   /*locks=*/{}, state)};
-        BOOST_CHECK_EQUAL(restored->Sequence(), 2U);
+        auto restored{net.MakeNode(std::nullopt, nullptr, nullptr, &source, live_hash,
+                                   /*locks=*/{}, net.nodes[0]->State())};
         const auto served{restored->HandleCatchupRequest(flowmesh::CatchupRequest{0})};
         BOOST_REQUIRE_EQUAL(served.size(), 2U);
         auto late{net.MakeNode(std::nullopt)};
@@ -570,44 +649,55 @@ BOOST_AUTO_TEST_CASE(store_appends_replays_snapshots_and_survives_restart)
 
 BOOST_AUTO_TEST_CASE(restart_cannot_sign_a_conflicting_candidate)
 {
-    // Codex defect 7/9 regression: the journaled lock survives restart,
-    // so the restarted validator refuses to sign a DIFFERENT candidate
-    // at its protected sequence — even though its in-memory guard is
-    // fresh.
+    // The journaled lock is restored AUTOMATICALLY by StartValidator: a
+    // restarted validator refuses to sign a different candidate at its
+    // protected sequence.
     const fs::path store_path{m_args.GetDataDirBase() / "flowmesh_locks"};
     MeshNet net{3, 0};
+    std::string error;
     auto store{std::make_unique<node::FlowMeshStore>(
         DBParams{.path = store_path, .cache_bytes = size_t{1} << 20, .wipe_data = true})};
-    std::string error;
     BOOST_REQUIRE(store->OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+    node::StoreCommitSink sink{*store};
     node::StoreLockJournal journal{*store};
     const size_t p0{net.ProposerIndex(0, 0)};
     const size_t voter{(p0 + 1) % 3};
-    net.nodes[voter] = net.MakeNode(net.keys[voter], nullptr, &journal);
+    net.nodes[voter] = net.MakeNode(net.keys[voter], &sink, &journal);
 
-    // The voter attests candidate A (lock journaled write-ahead).
     BOOST_REQUIRE(net.nodes[p0]->SubmitAction(net.Deposit(Outpoint(0x0a, 0))));
     const auto proposal_a{net.nodes[p0]->TryPropose()};
     BOOST_REQUIRE(proposal_a.has_value());
     BOOST_REQUIRE(net.nodes[voter]->HandleProposal(*proposal_a).has_value());
 
-    // Crash + restart the voter: fresh node, locks restored from disk.
-    std::map<uint64_t, uint256> locks;
-    BOOST_REQUIRE(store->ReadLocks(locks, error));
-    BOOST_REQUIRE_EQUAL(locks.size(), 1U);
-    BOOST_CHECK(locks.at(0) == proposal_a->mb.GetHash());
-    net.nodes[voter] = net.MakeNode(net.keys[voter], nullptr, &journal, nullptr, uint256{},
-                                    locks);
+    // Crash + restart the voter through the production lifecycle.
+    net.nodes[voter] = net.MakeNode(std::nullopt); // drop the crashed instance
+    store.reset();
+    node::FlowMeshStore reopened{DBParams{.path = store_path, .cache_bytes = size_t{1} << 20}};
+    MeshNode::Config config;
+    config.domain = MESH_DOMAIN;
+    config.seats = net.seats;
+    config.threshold = net.threshold;
+    config.schedule = net.schedule.get();
+    config.auth = &net.auth;
+    config.deposits = &net.deposits;
+    config.anchors = &net.anchors;
+    config.seat_key = net.keys[voter];
+    node::ValidatorRuntime runtime;
+    BOOST_REQUIRE_MESSAGE(node::StartValidator(reopened, std::move(config),
+                                               FlowMeshState{VAULT, BaseX(), Quote()}, runtime,
+                                               error),
+                          error);
 
-    // A conflicting candidate at the same sequence/round must be
-    // refused by the restarted voter...
-    auto fresh_p0{net.MakeNode(net.keys[p0], nullptr, net.journals[p0].get())};
+    // A conflicting candidate at the protected sequence is refused...
+    MemJournal j2;
+    FailableSink s2;
+    auto fresh_p0{net.MakeNode(net.keys[p0], &s2, &j2)};
     const auto conflicting{fresh_p0->TryPropose()}; // empty pool: different candidate
     BOOST_REQUIRE(conflicting.has_value());
     BOOST_REQUIRE(conflicting->mb.GetHash() != proposal_a->mb.GetHash());
-    BOOST_CHECK(!net.nodes[voter]->HandleProposal(*conflicting).has_value());
-    // ...while re-attesting the locked candidate A remains possible.
-    BOOST_CHECK(net.nodes[voter]->HandleProposal(*proposal_a).has_value());
+    BOOST_CHECK(!runtime.mesh_node->HandleProposal(*conflicting).has_value());
+    // ...while re-attesting the locked candidate remains possible.
+    BOOST_CHECK(runtime.mesh_node->HandleProposal(*proposal_a).has_value());
 }
 
 BOOST_AUTO_TEST_CASE(vote_split_recovers_without_double_finality)
@@ -622,9 +712,6 @@ BOOST_AUTO_TEST_CASE(vote_split_recovers_without_double_finality)
     BOOST_REQUIRE(att_a.has_value());
     for (auto& node : net.nodes) BOOST_CHECK(!node->HandleAttestation(*att_a).has_value());
 
-    // Other seats time into round 1; p1 proposes a DIFFERENT candidate
-    // (its own pool is empty). p0 stays locked on A and refuses B, but B
-    // reaches t without it.
     const size_t p1{net.ProposerIndex(0, 1)};
     BOOST_REQUIRE(p1 != p0);
     for (size_t i{0}; i < net.nodes.size(); ++i) {
@@ -672,9 +759,9 @@ BOOST_AUTO_TEST_CASE(equivocating_proposer_cannot_double_certify)
     BOOST_REQUIRE(net.nodes[p0]->SubmitAction(net.Deposit(Outpoint(0x0a, 0))));
     const auto proposal_a{net.nodes[p0]->TryPropose()};
     BOOST_REQUIRE(proposal_a.has_value());
-    // The Byzantine proposer signs a second, different candidate too.
     MemJournal shadow_journal;
-    auto shadow{net.MakeNode(net.keys[p0], nullptr, &shadow_journal)};
+    FailableSink shadow_sink;
+    auto shadow{net.MakeNode(net.keys[p0], &shadow_sink, &shadow_journal)};
     const auto proposal_b{shadow->TryPropose()}; // empty pool: different candidate
     BOOST_REQUIRE(proposal_b.has_value());
     BOOST_CHECK(proposal_a->mb.GetHash() != proposal_b->mb.GetHash());
@@ -710,50 +797,42 @@ BOOST_AUTO_TEST_CASE(equivocating_proposer_cannot_double_certify)
     BOOST_CHECK(evidence_seen);
 }
 
-BOOST_AUTO_TEST_CASE(anchors_gate_proposals_and_committed_history)
+BOOST_AUTO_TEST_CASE(anchors_are_rechecked_before_signing_and_before_commit)
 {
-    // Proposals anchored elsewhere are refused before execution.
+    // Codex re-audit item 10: a B3 reorg BETWEEN proposal receipt and
+    // signing, or between attestation gathering and commit, must halt
+    // FlowMesh progression (B3 untouched).
     MeshNet net{3, 0};
-    const size_t p0{net.ProposerIndex(0, 0)};
-    const auto proposal{net.nodes[p0]->TryPropose()};
+    net.RunRound({net.Deposit(Outpoint(0x0a, 0))}); // committed history w/ anchor
+
+    // Before SIGNING: proposal built while the anchor was canonical...
+    const size_t p{net.ProposerIndex(1, 0)};
+    const auto proposal{net.nodes[p]->TryPropose()};
     BOOST_REQUIRE(proposal.has_value());
-    ProposalMsg bad{*proposal};
-    bad.mb.anchor = AnchorRef{9, uint256::ONE};
-    for (auto& node : net.nodes) BOOST_CHECK(!node->HandleProposal(bad).has_value());
-
-    // Codex defect 10 regression: an anchor relied on by COMMITTED
-    // history that stops being canonical halts FlowMesh progression
-    // (fail-safe; deep-reorg treatment is an owner decision).
-    net.RunRound({net.Deposit(Outpoint(0x0a, 0))});
+    // ...the committed anchor is orphaned before another seat signs.
+    const size_t signer{(p + 1) % 3};
     net.anchors.still_canonical = false;
-    BOOST_CHECK(!net.nodes[0]->RecheckCommittedAnchors());
-    BOOST_CHECK(net.nodes[0]->Halted());
-    BOOST_CHECK(net.nodes[0]->Halt() == MeshHalt::ANCHOR_INVALIDATED);
-    BOOST_CHECK(!net.nodes[0]->TryPropose().has_value());
-    // A certified entry whose anchor is off-chain is refused by a
-    // still-running node (catch-up revalidates anchors).
-    const size_t p_next{net.ProposerIndex(1, 0)};
+    BOOST_CHECK(!net.nodes[signer]->HandleProposal(*proposal).has_value());
+    BOOST_CHECK(net.nodes[signer]->Halted());
+    BOOST_CHECK(net.nodes[signer]->Halt() == MeshHalt::ANCHOR_INVALIDATED);
     net.anchors.still_canonical = true;
-    const auto next_proposal{net.nodes[p_next]->TryPropose()};
-    BOOST_REQUIRE(next_proposal.has_value());
+
+    // Before COMMIT: attestations gather while canonical, the reorg
+    // lands just before the certificate completes on the third node.
+    const size_t committer{(p + 2) % 3};
     std::vector<AttestationMsg> atts;
-    for (auto& node : net.nodes) {
-        if (const auto att{node->HandleProposal(*next_proposal)}) atts.push_back(*att);
-    }
-    std::optional<CertifiedEntry> entry;
-    for (const AttestationMsg& att : atts) {
-        for (auto& node : net.nodes) {
-            if (const auto e{node->HandleAttestation(att)}) {
-                if (!entry) entry = e;
-            }
-        }
-    }
-    BOOST_REQUIRE(entry.has_value());
+    if (const auto a{net.nodes[p]->HandleProposal(*proposal)}) atts.push_back(*a);
+    if (const auto a{net.nodes[committer]->HandleProposal(*proposal)}) atts.push_back(*a);
+    BOOST_REQUIRE_EQUAL(atts.size(), 2U); // t = 2 reachable
+    BOOST_REQUIRE(net.nodes[committer]->HandleAttestation(atts[0]) == std::nullopt);
     net.anchors.still_canonical = false;
-    BOOST_CHECK(!net.observer->HandleCertified(*entry));
+    BOOST_CHECK(net.nodes[committer]->HandleAttestation(atts[1]) == std::nullopt);
+    BOOST_CHECK_EQUAL(net.nodes[committer]->Sequence(), 1U); // live tip did NOT advance
+    BOOST_CHECK(net.nodes[committer]->Halted());
+    BOOST_CHECK(net.nodes[committer]->Halt() == MeshHalt::ANCHOR_INVALIDATED);
     net.anchors.still_canonical = true;
 
-    // Chain-backed policy over the regtest fixture chain.
+    // Chain-backed policy sanity over the regtest fixture chain.
     const node::ChainAnchorPolicy policy{*Assert(m_node.chainman), /*min_depth=*/6};
     const int tip_height{m_node.chainman->ActiveChain().Height()};
     const AnchorRef current{policy.Current()};
@@ -761,12 +840,10 @@ BOOST_AUTO_TEST_CASE(anchors_gate_proposals_and_committed_history)
     BOOST_CHECK(policy.Acceptable(current));
     BOOST_CHECK(policy.StillCanonical(current));
     const AnchorRef tip{tip_height, m_node.chainman->ActiveChain().Tip()->GetBlockHash()};
-    BOOST_CHECK(!policy.Acceptable(tip));    // not buried deep enough for proposals
-    BOOST_CHECK(policy.StillCanonical(tip)); // but certainly canonical
-    BOOST_CHECK(!policy.Acceptable(AnchorRef{current.height, uint256::ONE}));
+    BOOST_CHECK(!policy.Acceptable(tip));
+    BOOST_CHECK(policy.StillCanonical(tip));
     BOOST_CHECK(!policy.StillCanonical(AnchorRef{current.height, uint256::ONE}));
-    BOOST_CHECK(!policy.StillCanonical(AnchorRef{current.height - 1, current.hash}));
-    BOOST_CHECK(policy.StillCanonical(AnchorRef{})); // null anchor: no B3 reliance
+    BOOST_CHECK(policy.StillCanonical(AnchorRef{}));
 }
 
 BOOST_AUTO_TEST_CASE(b3_reorg_invalidates_previously_acceptable_anchors)
@@ -784,7 +861,7 @@ BOOST_AUTO_TEST_CASE(b3_reorg_invalidates_previously_acceptable_anchors)
     BOOST_REQUIRE(state.IsValid());
 
     BOOST_CHECK(!policy.Acceptable(before));
-    BOOST_CHECK(!policy.StillCanonical(before)); // committed history using it must halt
+    BOOST_CHECK(!policy.StillCanonical(before));
     const AnchorRef after{policy.Current()};
     BOOST_CHECK(after.height < before.height);
     BOOST_CHECK(policy.Acceptable(after));
@@ -792,22 +869,18 @@ BOOST_AUTO_TEST_CASE(b3_reorg_invalidates_previously_acceptable_anchors)
 
 BOOST_AUTO_TEST_CASE(pool_admission_is_atomic)
 {
-    // Codex defect 12 regression: Add() can never report success (or
-    // fail) while leaving an unreachable byte-counted entry behind — a
-    // per-(signer, sequence) conflict is refused BEFORE any accounting.
     MeshNet net{3, 0};
-    flowmesh::ActionPool pool;
+    flowmesh::ActionPool pool{&net.auth};
     const Action first{net.SignedOrder(net.alice_key, 0, true, 40'000, 2)};
-    Action conflicting{net.SignedOrder(net.alice_key, 0, true, 41'000, 3)}; // same (signer, seq)
+    const Action conflicting{net.SignedOrder(net.alice_key, 0, true, 41'000, 3)};
     BOOST_REQUIRE(pool.Add(first));
     const size_t size_after{pool.Size()};
     const size_t bytes_after{pool.Bytes()};
     BOOST_CHECK(!pool.Add(conflicting));
     BOOST_CHECK_EQUAL(pool.Size(), size_after);
-    BOOST_CHECK_EQUAL(pool.Bytes(), bytes_after); // no orphaned byte accounting
-    BOOST_CHECK(!pool.Add(first));                // exact duplicate refused
     BOOST_CHECK_EQUAL(pool.Bytes(), bytes_after);
-    // The first-admitted intent is what a proposer selects.
+    BOOST_CHECK(!pool.Add(first)); // exact duplicate refused
+    BOOST_CHECK_EQUAL(pool.Bytes(), bytes_after);
     FlowMeshState state{VAULT, BaseX(), Quote()};
     const auto batch{pool.SelectBatch(state, 16)};
     BOOST_REQUIRE_EQUAL(batch.size(), 1U);

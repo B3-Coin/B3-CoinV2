@@ -23,43 +23,49 @@ namespace flowmesh {
  * simple and deterministic anyway: canonical storage order, explicit
  * bounds, admit-or-refuse (no fancy eviction).
  *
- * Admission requires canonical shape and bounds only; authentication
- * happens at execution (and a proposer may pre-filter). Batch selection
- * is deterministic: unconsumed deposits in outpoint order, then per
- * signer the contiguous sequence run starting at the state's next
- * sequence — actions a microblock could actually apply.
+ * Signed actions AUTHENTICATE BEFORE they may occupy the authoritative
+ * (signer, sequence) index: a junk-credential submission is refused
+ * outright and can never shadow ("poison") a victim's legitimate
+ * future action at that sequence. Batch selection is deterministic:
+ * unconsumed deposits in outpoint order, then per signer the
+ * contiguous sequence run starting at the state's next sequence.
  */
 class ActionPool
 {
 public:
-    explicit ActionPool(const size_t max_actions = 65536, const size_t max_bytes = 16 << 20)
-        : m_max_actions{max_actions}, m_max_bytes{max_bytes}
+    explicit ActionPool(const ActionAuthenticator* auth = nullptr,
+                        const size_t max_actions = 65536, const size_t max_bytes = 16 << 20)
+        : m_auth{auth}, m_max_actions{max_actions}, m_max_bytes{max_bytes}
     {
     }
 
     size_t Size() const { return m_by_id.size(); }
     size_t Bytes() const { return m_bytes; }
 
-    //! Admit one action. Refuses malformed shapes, duplicates,
-    //! per-(signer, sequence) conflicts, and anything past the bounds.
-    //! ATOMIC: every admission precondition — including secondary-index
-    //! availability — is checked BEFORE any container or byte-count
-    //! mutation, so Add can never report success (or fail) while leaving
-    //! an unreachable, byte-counted entry behind.
+    //! Admit one action. Refuses malformed shapes, unauthenticated
+    //! signed actions, duplicates, per-(signer, sequence) conflicts,
+    //! and anything past the bounds. ATOMIC: every admission
+    //! precondition — authentication included — is checked BEFORE any
+    //! container or byte-count mutation, so Add can never report
+    //! success (or fail) while leaving an unreachable byte-counted
+    //! entry behind, and an invalid credential can never reserve a
+    //! (signer, sequence) slot.
     bool Add(const Action& action)
     {
         if (!action.ShapeIsCanonical()) return false;
+        const bool is_deposit{static_cast<ActionType>(action.type) == ActionType::DEPOSIT};
+        if (!is_deposit) {
+            // AUTHENTICATE FIRST: no index ownership for junk.
+            if (m_auth == nullptr || !m_auth->Authenticate(action)) return false;
+        }
         const uint256 id{action.Id()};
         if (m_by_id.count(id) > 0) return false;
         const size_t sz{static_cast<size_t>(::GetSerializeSize(action))};
         if (m_by_id.size() + 1 > m_max_actions || m_bytes + sz > m_max_bytes) return false;
-        const bool is_deposit{static_cast<ActionType>(action.type) == ActionType::DEPOSIT};
         if (is_deposit) {
             if (m_deposits.count(action.outpoint) > 0) return false;
         } else {
-            // First-seen wins per (signer, sequence); an equivocating
-            // second intent is refused here (pool policy) and judged at
-            // consensus level if it arrives in a microblock anyway.
+            // First-seen-VALID wins per (signer, sequence).
             if (m_signed.count({action.signer, action.sequence}) > 0) return false;
         }
 
@@ -139,6 +145,7 @@ private:
         m_by_id.erase(it);
     }
 
+    const ActionAuthenticator* m_auth;
     const size_t m_max_actions;
     const size_t m_max_bytes;
     size_t m_bytes{0};

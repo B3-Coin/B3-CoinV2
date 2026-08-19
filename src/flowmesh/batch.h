@@ -32,21 +32,20 @@ namespace flowmesh {
 /**
  * Canonical batch execution for one FlowMesh slot / microblock.
  *
- * CANONICAL FORM FIRST: a candidate action set has exactly one
- * canonical representation (CanonicalizeActions) — deposits in outpoint
- * order, then signed entries by (signer, sequence, id, credential),
- * exact duplicates removed. Identity (the microblock actions root) is
- * defined over that form, execution consumes that form, and validation
- * rejects any non-canonical body — so the same logical candidate set
- * yields the same encoded body, the same hash and the same result, no
- * matter how the network delivered it.
+ * IDENTITY IS SEMANTIC ONLY. A microblock body contains exactly ONE
+ * canonical representation per semantic action — actions in a body
+ * carry NO credentials at all (canonically empty). Authentication
+ * evidence travels OUTSIDE the semantic body (the proposal envelope /
+ * certified entry) and can therefore never make two bodies for the same
+ * logical action set hash differently: same semantic set => same
+ * canonical body => same microblock hash, regardless of which
+ * credential encodings any node happened to observe.
  *
- * Execution: authenticate signed entries through an opaque credential
- * interface (an id may carry several credential variants; the outcome is
- * a pure function of the variant SET), enforce per-signer sequencing,
- * apply deposits then signed survivors, clear the slot ONCE through the
- * uniform-price engine, and produce the pure resulting state root plus a
- * separate execution-result commitment.
+ * Consequently EXECUTION performs no authentication: authentication is
+ * a pre-admission filter (pool admission and proposal/evidence
+ * verification, sync.h). Execution outcomes are limited to the
+ * deterministic set {MALFORMED, EQUIVOCATION, BAD_SEQUENCE,
+ * REJECTED_BY_STATE} plus application.
  */
 
 //! Consensus-stable action type numbering; append only.
@@ -76,16 +75,17 @@ struct Action {
     uint256 destination;
     //! DEPOSIT: the B3 outpoint being consumed. The asset, amount and
     //! beneficiary account are established by the DepositVerifier from
-    //! chain data — an action-supplied claim of them is never trusted,
-    //! so there is nowhere to even carry one.
+    //! chain data — an action-supplied claim of them is never trusted.
     COutPoint outpoint;
-    //! Opaque authorization material, judged only by the
-    //! ActionAuthenticator. Not part of the action id.
+    //! TRANSPORT-LEVEL authorization material (pool submission), judged
+    //! only by the ActionAuthenticator. NEVER part of the action id and
+    //! NEVER part of a microblock body: canonical bodies carry this
+    //! field EMPTY, with the admitted evidence carried in the proposal
+    //! envelope / certified entry instead.
     std::vector<unsigned char> credential;
 
     //! Bounded strict codec: vector counts are checked BEFORE their
-    //! elements are read, so attacker-sized counts cannot drive
-    //! allocation past the FlowMesh limits.
+    //! elements are read/allocated.
     template <typename Stream>
     void Serialize(Stream& s) const
     {
@@ -124,8 +124,8 @@ struct Action {
         }
     }
 
-    //! Canonical identity of what is being authorized: every field except
-    //! the credential. (v2: the DEPOSIT outpoint joined the preimage.)
+    //! Canonical SEMANTIC identity: every field except the credential —
+    //! evidence can never perturb identity.
     uint256 Id() const
     {
         HashWriter h;
@@ -136,13 +136,8 @@ struct Action {
         return h.GetHash();
     }
 
-    /**
-     * Canonical shape EXCLUDING the credential: bounds, plus every field
-     * a type does not use held at its zero value. Credential validity is
-     * judged per VARIANT (an id may arrive with several credentials), so
-     * it is deliberately outside this check — a malformed variant must
-     * never change the disposition of a well-formed one.
-     */
+    //! Canonical SEMANTIC shape (credential excluded): bounds, plus
+    //! every field a type does not use held at its zero value.
     bool ShapeIsCanonicalSansCredential() const
     {
         if (curve.size() > MAX_ACTION_CURVE_POINTS) return false;
@@ -165,9 +160,9 @@ struct Action {
         return false;
     }
 
-    //! Full canonical shape of one entry (pool admission etc.): the
-    //! sans-credential rules plus this entry's credential bounds. A
-    //! DEPOSIT is chain-authorized and carries no credential.
+    //! Transport-level shape (pool admission): semantic shape plus this
+    //! entry's credential bounds. A DEPOSIT is chain-authorized and
+    //! carries no credential.
     bool ShapeIsCanonical() const
     {
         if (!ShapeIsCanonicalSansCredential()) return false;
@@ -177,64 +172,62 @@ struct Action {
         }
         return true;
     }
+
+    bool IsDeposit() const { return static_cast<ActionType>(type) == ActionType::DEPOSIT; }
 };
 
-//! Strict-weak canonical entry order: deposits first by outpoint, then
-//! signed entries by (signer, sequence, id, credential). Total over
-//! distinct (id, credential) pairs.
+//! Strict-weak canonical SEMANTIC order: deposits first by outpoint,
+//! then signed entries by (signer, sequence, id). Total over distinct
+//! semantic ids; credentials play no part.
 inline bool ActionCanonicalLess(const Action& a, const Action& b)
 {
-    const bool a_deposit{static_cast<ActionType>(a.type) == ActionType::DEPOSIT};
-    const bool b_deposit{static_cast<ActionType>(b.type) == ActionType::DEPOSIT};
+    const bool a_deposit{a.IsDeposit()};
+    const bool b_deposit{b.IsDeposit()};
     if (a_deposit != b_deposit) return a_deposit;
-    if (a_deposit) {
-        if (!(a.outpoint == b.outpoint)) return a.outpoint < b.outpoint;
-        return a.credential < b.credential; // non-canonical variants still order totally
-    }
+    if (a_deposit) return a.outpoint < b.outpoint;
     if (a.signer != b.signer) return a.signer < b.signer;
     if (a.sequence != b.sequence) return a.sequence < b.sequence;
-    const uint256 ida{a.Id()}, idb{b.Id()};
-    if (ida != idb) return ida < idb;
-    return a.credential < b.credential;
+    return a.Id() < b.Id();
 }
 
 /**
- * THE canonical representation of a candidate action set: sorted by
- * ActionCanonicalLess with exact duplicates (same id AND same
- * credential) removed. Pure and idempotent; identity, execution and
- * validation are all defined over this form, so network arrival order
- * can never influence a microblock hash or an execution result.
+ * THE canonical semantic representation of a candidate action set:
+ * credentials STRIPPED, deduplicated by semantic id, sorted by
+ * ActionCanonicalLess. Pure and idempotent. One logical action set has
+ * exactly one canonical body — and therefore exactly one microblock
+ * hash — no matter how many credential variants or arrival orders were
+ * observed.
  */
 inline std::vector<Action> CanonicalizeActions(std::vector<Action> actions)
 {
+    for (Action& action : actions) action.credential.clear();
     std::stable_sort(actions.begin(), actions.end(), ActionCanonicalLess);
     actions.erase(std::unique(actions.begin(), actions.end(),
                               [](const Action& a, const Action& b) {
-                                  return a.Id() == b.Id() && a.credential == b.credential;
+                                  return a.Id() == b.Id();
                               }),
                   actions.end());
     return actions;
 }
 
-//! Whether `actions` is already in canonical form (strictly increasing
-//! in the canonical order). Cheap: one linear scan.
+//! Whether `actions` is already the canonical semantic body: strictly
+//! increasing in the canonical order AND credential-free.
 inline bool ActionsAreCanonical(const std::vector<Action>& actions)
 {
-    for (size_t i{1}; i < actions.size(); ++i) {
-        if (!ActionCanonicalLess(actions[i - 1], actions[i])) return false;
+    for (size_t i{0}; i < actions.size(); ++i) {
+        if (!actions[i].credential.empty()) return false;
+        if (i > 0 && !ActionCanonicalLess(actions[i - 1], actions[i])) return false;
     }
     return true;
 }
 
 /**
- * The authorization boundary for SIGNED actions. Implementations decide
- * what a valid credential is; this layer only ever asks yes or no.
- * DEPOSIT actions never reach it.
+ * The authorization boundary for SIGNED actions — a PRE-ADMISSION
+ * filter (pool admission, proposal-evidence verification), never part
+ * of execution.
  *
  * CONTRACT: Authenticate must be DETERMINISTIC (a pure function of the
- * action bytes, identical on every node) and SIDE-EFFECT-FREE; it is
- * called in canonical credential order and may be called any number of
- * times.
+ * action bytes, identical on every node) and SIDE-EFFECT-FREE.
  */
 class ActionAuthenticator
 {
@@ -244,6 +237,9 @@ public:
 };
 
 enum class ActionReject : uint8_t {
+    //! Pre-admission concept only (pool / proposal evidence); an
+    //! executed microblock can never contain this outcome. Retained for
+    //! numbering stability.
     UNAUTHENTICATED = 0,
     EQUIVOCATION = 1,
     BAD_SEQUENCE = 2,
@@ -263,9 +259,8 @@ struct BatchResult {
     uint256 request_root;
     //! PURE resulting state root: FlowMeshState::Root() after the slot.
     uint256 state_root;
-    //! Commitment to what EXECUTING this slot did (applied/rejected sets,
-    //! requests, clearing outcome). Kept separate from the state root so
-    //! state identity never depends on how it was reached.
+    //! Commitment to what EXECUTING this slot did (applied/rejected
+    //! sets, requests, clearing outcome). Separate from the state root.
     uint256 result_commitment;
     ClearingEngine::ClearingResult clearing;
 };
@@ -275,9 +270,8 @@ class BatchExecutor
 public:
     //! `deposits` may be null: every DEPOSIT action is then rejected by
     //! state (fail closed) — custody facts must come from a verifier.
-    BatchExecutor(FlowMeshState& state, const ActionAuthenticator& auth,
-                  const DepositVerifier* deposits = nullptr)
-        : m_state{state}, m_auth{auth}, m_deposits{deposits}
+    explicit BatchExecutor(FlowMeshState& state, const DepositVerifier* deposits = nullptr)
+        : m_state{state}, m_deposits{deposits}
     {
     }
 
@@ -285,88 +279,47 @@ public:
 
     /**
      * Execute one slot over a candidate action set, against `anchor`.
-     * The set is reduced to canonical form first, so the result is a
-     * pure function of the SET.
+     * The set is reduced to canonical semantic form first, so the
+     * result is a pure function of the SET. No authentication happens
+     * here (pre-admission concern).
      *
-     * Per-id disposition (deterministic in the variant set):
-     *  - sans-credential shape invalid            -> MALFORMED
-     *  - DEPOSIT with only non-empty credentials  -> MALFORMED
-     *  - signed, no size-valid variant passes auth-> UNAUTHENTICATED
-     *  - same-signer same-sequence different ids  -> EQUIVOCATION (all;
-     *    sequence does not advance)
-     *  - wrong sequence                           -> BAD_SEQUENCE
-     *  - applied or refused by state              -> sequence consumed
-     *    either way (a state-rejected action cannot be silently
-     *    retried); this REJECTED_BY_STATE semantic is unchanged.
+     * Per-id disposition (deterministic):
+     *  - semantic shape invalid                    -> MALFORMED
+     *  - same-signer same-sequence different ids   -> EQUIVOCATION
+     *    (all; sequence does not advance)
+     *  - wrong sequence                            -> BAD_SEQUENCE
+     *  - applied or refused by state               -> sequence consumed
+     *    either way (REJECTED_BY_STATE semantics unchanged).
      *
      * Returns std::nullopt on a FATAL internal failure (clearing or
      * settlement inconsistency): the caller must discard this state
-     * copy — nothing may be committed from it. Ordinary rejections are
-     * NOT fatal and never roll anything back.
+     * copy. Ordinary rejections are never fatal.
      */
     [[nodiscard]] std::optional<BatchResult> ExecuteSlot(const std::vector<Action>& actions,
                                                          const AnchorRef& anchor = {})
     {
         BatchResult result;
-        result.slot = m_state.ledger.Slot();
+        result.slot = m_state.Slot();
 
         const std::vector<Action> canonical{CanonicalizeActions(actions)};
 
-        // Group canonical entries into per-id variant runs. Within an
-        // id, entries differ only in credential (every other field is in
-        // the id) and are credential-sorted by canonical order.
         std::map<COutPoint, const Action*> deposit_entries;
         std::map<std::pair<AccountId, uint64_t>, std::vector<const Action*>> groups;
-        for (size_t i{0}; i < canonical.size();) {
-            const Action& first{canonical[i]};
-            const uint256 id{first.Id()};
-            size_t j{i};
-            while (j < canonical.size() && canonical[j].Id() == id) ++j;
-
-            if (!first.ShapeIsCanonicalSansCredential()) {
-                result.rejected.emplace_back(id, ActionReject::MALFORMED);
-                i = j;
+        for (const Action& action : canonical) {
+            if (!action.ShapeIsCanonicalSansCredential()) {
+                result.rejected.emplace_back(action.Id(), ActionReject::MALFORMED);
                 continue;
             }
-            if (static_cast<ActionType>(first.type) == ActionType::DEPOSIT) {
-                // A deposit is authorized by the chain: only the
-                // canonical empty-credential entry is meaningful; junk
-                // variants beside it change nothing.
-                bool canonical_variant{false};
-                for (size_t k{i}; k < j; ++k) {
-                    canonical_variant = canonical_variant || canonical[k].credential.empty();
-                }
-                if (!canonical_variant) {
-                    result.rejected.emplace_back(id, ActionReject::MALFORMED);
-                } else {
-                    deposit_entries.emplace(first.outpoint, &first);
-                }
-                i = j;
+            if (action.IsDeposit()) {
+                deposit_entries.emplace(action.outpoint, &action);
                 continue;
             }
-            // Signed: authenticate against the size-valid variants in
-            // canonical credential order; ANY acceptance vouches for the
-            // id. Oversized variants are skipped deterministically and
-            // can never shadow a valid one.
-            bool authenticated{false};
-            for (size_t k{i}; k < j && !authenticated; ++k) {
-                if (canonical[k].credential.size() > MAX_ACTION_CREDENTIAL_SIZE) continue;
-                authenticated = m_auth.Authenticate(canonical[k]);
-            }
-            if (!authenticated) {
-                result.rejected.emplace_back(id, ActionReject::UNAUTHENTICATED);
-                i = j;
-                continue;
-            }
-            groups[{first.signer, first.sequence}].push_back(&first);
-            i = j;
+            groups[{action.signer, action.sequence}].push_back(&action);
         }
 
         std::vector<const Action*> ordered;
         for (const auto& [key, group] : groups) {
             if (group.size() > 1) {
-                // Same-sequence equivocation: reject the whole group and
-                // do not advance the sequence.
                 for (const Action* action : group) {
                     result.rejected.emplace_back(action->Id(), ActionReject::EQUIVOCATION);
                 }
@@ -398,25 +351,21 @@ public:
             bool ok{false};
             switch (static_cast<ActionType>(action.type)) {
             case ActionType::SUBMIT_BID:
-                ok = m_state.book.SubmitCurve(m_state.ledger, action.signer,
-                                              ClearingEngine::Side::BID, action.curve);
+                ok = m_state.SubmitCurve(action.signer, ClearingEngine::Side::BID, action.curve);
                 break;
             case ActionType::SUBMIT_ASK:
-                ok = m_state.book.SubmitCurve(m_state.ledger, action.signer,
-                                              ClearingEngine::Side::ASK, action.curve);
+                ok = m_state.SubmitCurve(action.signer, ClearingEngine::Side::ASK, action.curve);
                 break;
             case ActionType::CANCEL_BID:
-                ok = m_state.book.CancelCurve(m_state.ledger, action.signer,
-                                              ClearingEngine::Side::BID);
+                ok = m_state.CancelCurve(action.signer, ClearingEngine::Side::BID);
                 break;
             case ActionType::CANCEL_ASK:
-                ok = m_state.book.CancelCurve(m_state.ledger, action.signer,
-                                              ClearingEngine::Side::ASK);
+                ok = m_state.CancelCurve(action.signer, ClearingEngine::Side::ASK);
                 break;
             case ActionType::WITHDRAW: {
                 const std::optional<modern::WithdrawalReceipt> request{
-                    m_state.ledger.RequestWithdrawal(action.signer, action.asset, action.amount,
-                                                     action.destination)};
+                    m_state.RequestWithdrawal(action.signer, action.asset, action.amount,
+                                              action.destination)};
                 if (request) result.withdrawal_requests.push_back(*request);
                 ok = request.has_value();
                 break;
@@ -425,7 +374,7 @@ public:
                 break; // unreachable: deposits were split off above
             }
 
-            m_state.next_seq[action.signer] = action.sequence + 1;
+            m_state.AdvanceSequence(action.signer, action.sequence + 1);
             if (ok) {
                 result.applied.push_back(id);
             } else {
@@ -437,13 +386,10 @@ public:
 
         // ONE clearing pass per slot (advances the ledger slot). A fatal
         // clearing/settlement failure poisons this whole candidate.
-        const std::optional<ClearingEngine::ClearingResult> clearing{
-            m_state.book.ClearSlot(m_state.ledger)};
+        const std::optional<ClearingEngine::ClearingResult> clearing{m_state.ClearSlot()};
         if (!clearing) return std::nullopt;
         result.clearing = *clearing;
 
-        // Request root: a commitment to the withdrawal requests created
-        // this slot, each already carrying a unique deterministic id.
         {
             HashWriter h;
             h << std::string{"b3/flowmesh/receipts/v1"} << result.slot
@@ -454,7 +400,6 @@ public:
             result.request_root = h.GetHash();
         }
 
-        // Pure state root, and the separate execution-result commitment.
         result.state_root = m_state.Root();
         {
             HashWriter h;
@@ -481,17 +426,19 @@ public:
 private:
     bool ApplyDeposit(const Action& action, const AnchorRef& anchor)
     {
-        if (m_deposits == nullptr) return false; // fail closed: no verifier, no custody facts
-        if (m_state.consumed_deposits.count(action.outpoint) > 0) return false;
+        // consumed-deposit state is provisional model state only.
+        // OWNER DECISION REQUIRED: retain or defer consumed-deposit
+        // state, and define same-slot deposit/trading semantics.
+        // Production deposits stay fail-closed regardless (null
+        // verifier), and no additional semantics are added here.
+        if (m_deposits == nullptr) return false;
+        if (m_state.DepositConsumed(action.outpoint)) return false;
         const std::optional<DepositInfo> info{m_deposits->GetDeposit(action.outpoint, anchor)};
         if (!info) return false;
-        if (!m_state.ledger.Deposit(info->account, info->asset, info->amount)) return false;
-        m_state.consumed_deposits.insert(action.outpoint);
-        return true;
+        return m_state.CreditDeposit(action.outpoint, info->account, info->asset, info->amount);
     }
 
     FlowMeshState& m_state;
-    const ActionAuthenticator& m_auth;
     const DepositVerifier* m_deposits;
 };
 

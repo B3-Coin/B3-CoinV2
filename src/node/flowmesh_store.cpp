@@ -20,7 +20,7 @@ constexpr uint8_t KEY_ENTRY{'e'};
 constexpr uint8_t KEY_SNAPSHOT{'s'};
 constexpr uint8_t KEY_LOCK{'l'};
 
-//! Hard cap on a stored snapshot blob (strict pre-allocation bound).
+//! Hard cap on a stored snapshot blob, enforced BEFORE allocation.
 constexpr uint64_t SNAPSHOT_MAX_BYTES{uint64_t{1} << 28};
 
 std::pair<uint8_t, uint64_t> EntryKey(const uint64_t sequence)
@@ -31,20 +31,36 @@ std::pair<uint8_t, uint64_t> LockKey(const uint64_t sequence)
 {
     return {KEY_LOCK, sequence};
 }
-} // namespace
 
-uint256 QuorumHash(const std::set<XOnlyPubKey>& seats, const uint64_t threshold)
-{
-    HashWriter h;
-    h << std::string{"b3/flowmesh/quorum/v1"} << threshold
-      << static_cast<uint64_t>(seats.size());
-    for (const XOnlyPubKey& seat : seats) h << seat; // std::set: canonical order
-    return h.GetHash();
-}
+//! Snapshot record with a TRUE pre-allocation bound on the state blob.
+struct SnapshotRecord {
+    uint64_t upto_sequence{0};
+    std::vector<unsigned char> state_bytes;
 
-FlowMeshStore::FlowMeshStore(DBParams db_params) : m_db{std::move(db_params)} {}
+    template <typename Stream>
+    void Serialize(Stream& s) const
+    {
+        s << upto_sequence;
+        WriteCompactSize(s, state_bytes.size());
+        if (!state_bytes.empty()) {
+            s.write(std::as_bytes(std::span{state_bytes.data(), state_bytes.size()}));
+        }
+    }
+    template <typename Stream>
+    void Unserialize(Stream& s)
+    {
+        s >> upto_sequence;
+        const uint64_t len{ReadCompactSize(s)};
+        if (len > SNAPSHOT_MAX_BYTES) {
+            throw std::ios_base::failure("flowmesh snapshot blob too large");
+        }
+        state_bytes.resize(len);
+        if (len > 0) {
+            s.read(std::as_writable_bytes(std::span{state_bytes.data(), state_bytes.size()}));
+        }
+    }
+};
 
-namespace {
 //! STRICT keyed read: the key must exist, decode to exactly the
 //! requested key type, and the value must consume its stored bytes
 //! exactly (trailing bytes are corruption, never ignored).
@@ -65,6 +81,17 @@ bool ReadStrict(CDBWrapper& db, const K& key, V& value, bool& corrupt)
     return true;
 }
 } // namespace
+
+uint256 QuorumHash(const std::set<XOnlyPubKey>& seats, const uint64_t threshold)
+{
+    HashWriter h;
+    h << std::string{"b3/flowmesh/quorum/v1"} << threshold
+      << static_cast<uint64_t>(seats.size());
+    for (const XOnlyPubKey& seat : seats) h << seat; // std::set: canonical order
+    return h.GetHash();
+}
+
+FlowMeshStore::FlowMeshStore(DBParams db_params) : m_db{std::move(db_params)} {}
 
 bool FlowMeshStore::ReadMarker(std::optional<Marker>& out, std::string& error)
 {
@@ -104,9 +131,9 @@ bool FlowMeshStore::OpenForDomain(const uint256& domain, const std::set<XOnlyPub
         return false;
     }
     if (marker->quorum_hash != quorum) {
-        // Deliberate fail-closed boundary: re-judging persisted
-        // certificates against a DIFFERENT quorum needs the seat
-        // lifecycle rules — an unresolved owner decision.
+        // Fail-closed boundary: re-judging persisted certificates under
+        // a DIFFERENT quorum needs the seat-lifecycle rules — an
+        // unresolved owner decision.
         error = "flowmesh log was certified under a different quorum configuration";
         return false;
     }
@@ -156,6 +183,13 @@ std::optional<flowmesh::CertifiedEntry> FlowMeshStore::ReadEntry(const uint64_t 
 bool FlowMeshStore::WriteLock(const uint64_t sequence, const uint256& microblock_hash)
 {
     try {
+        // COMPARE-AND-SET: never overwrite a conflicting durable lock.
+        uint256 existing;
+        bool corrupt{false};
+        if (ReadStrict(m_db, LockKey(sequence), existing, corrupt)) {
+            return existing == microblock_hash; // idempotent same; refuse different
+        }
+        if (corrupt) return false; // undecodable lock: refuse, never replace
         CDBBatch batch{m_db};
         batch.Write(LockKey(sequence), microblock_hash);
         m_db.WriteBatch(batch, /*fSync=*/true);
@@ -188,7 +222,7 @@ bool FlowMeshStore::ReadLocks(std::map<uint64_t, uint256>& out, std::string& err
     std::unique_ptr<CDBIterator> it{m_db.NewIterator()};
     for (it->Seek(std::make_pair(KEY_LOCK, uint64_t{0})); it->Valid(); it->Next()) {
         uint8_t prefix;
-        if (!it->GetKey(prefix) || prefix != KEY_LOCK) break;
+        if (!it->GetKey(prefix) || prefix != KEY_LOCK) break; // next namespace
         std::pair<uint8_t, uint64_t> key;
         uint256 hash;
         if (!it->GetKeyExact(key) || !it->GetValueExact(hash)) {
@@ -198,6 +232,11 @@ bool FlowMeshStore::ReadLocks(std::map<uint64_t, uint256>& out, std::string& err
         }
         out.emplace(key.second, hash);
     }
+    if (!it->StatusOK()) {
+        error = "flowmesh lock journal iterator failed (I/O or checksum error)";
+        out.clear();
+        return false;
+    }
     return true;
 }
 
@@ -205,7 +244,8 @@ bool FlowMeshStore::Replay(flowmesh::FlowMeshState& state, uint256& last_hash,
                            const flowmesh::ActionAuthenticator& auth,
                            const flowmesh::DepositVerifier* deposits,
                            const std::set<XOnlyPubKey>& seats, const uint64_t threshold,
-                           const flowmesh::AnchorPolicy* anchors, std::string& error)
+                           const flowmesh::AnchorPolicy* anchors, std::string& error,
+                           std::map<std::pair<int32_t, uint256>, uint64_t>* anchors_out)
 {
     std::optional<Marker> marker;
     if (!ReadMarker(marker, error)) return false;
@@ -219,7 +259,7 @@ bool FlowMeshStore::Replay(flowmesh::FlowMeshState& state, uint256& last_hash,
     }
     last_hash = uint256{};
     return ReplayRange(state, last_hash, /*from_sequence=*/0, *marker, auth, deposits, seats,
-                       threshold, anchors, error);
+                       threshold, anchors, error, anchors_out);
 }
 
 bool FlowMeshStore::ReplayRange(flowmesh::FlowMeshState& state, uint256& last_hash,
@@ -227,7 +267,8 @@ bool FlowMeshStore::ReplayRange(flowmesh::FlowMeshState& state, uint256& last_ha
                                 const flowmesh::ActionAuthenticator& auth,
                                 const flowmesh::DepositVerifier* deposits,
                                 const std::set<XOnlyPubKey>& seats, const uint64_t threshold,
-                                const flowmesh::AnchorPolicy* anchors, std::string& error)
+                                const flowmesh::AnchorPolicy* anchors, std::string& error,
+                                std::map<std::pair<int32_t, uint256>, uint64_t>* anchors_out)
 {
     if (!flowmesh::ValidQuorumConfig(seats.size(), threshold)) {
         error = "flowmesh replay refused a nonsensical quorum configuration";
@@ -250,23 +291,26 @@ bool FlowMeshStore::ReplayRange(flowmesh::FlowMeshState& state, uint256& last_ha
             return false;
         }
         if (anchors != nullptr && !anchors->StillCanonical(entry->mb.anchor)) {
-            // Certified history that relies on an orphaned B3 anchor
-            // must not silently remain accepted; treatment beyond this
-            // fail-safe refusal is an OWNER DECISION.
             error = strprintf("flowmesh log entry %d relies on a non-canonical B3 anchor",
                               sequence);
             return false;
         }
+        if (!flowmesh::VerifyActionEvidence(entry->mb, entry->credentials, auth)) {
+            error = strprintf("flowmesh log entry %d admission evidence invalid", sequence);
+            return false;
+        }
         flowmesh::FlowMeshState next{state};
         flowmesh::BatchResult result;
-        if (flowmesh::ExecuteCandidate(state, marker.domain, last_hash, entry->mb, auth,
-                                       deposits, next, result) !=
-            flowmesh::CandidateError::NONE) {
+        if (flowmesh::ExecuteCandidate(state, marker.domain, last_hash, entry->mb, deposits,
+                                       next, result) != flowmesh::CandidateError::NONE) {
             error = strprintf("flowmesh log entry %d fails re-execution", sequence);
             return false;
         }
         state = std::move(next);
         last_hash = hash;
+        if (anchors_out != nullptr && !entry->mb.anchor.IsNull()) {
+            (*anchors_out)[{entry->mb.anchor.height, entry->mb.anchor.hash}] = sequence;
+        }
     }
     if (last_hash != marker.last_hash) {
         error = "flowmesh log tip does not match its marker";
@@ -297,19 +341,18 @@ bool FlowMeshStore::WriteSnapshot(const uint64_t upto_sequence,
         error = "flowmesh snapshot does not match the certified state at its sequence";
         return false;
     }
+    SnapshotRecord record;
+    record.upto_sequence = upto_sequence;
     DataStream body;
     body << state;
     if (body.size() > SNAPSHOT_MAX_BYTES) {
         error = "flowmesh snapshot exceeds the storage bound";
         return false;
     }
+    record.state_bytes.assign(UCharCast(body.data()), UCharCast(body.data()) + body.size());
     try {
         CDBBatch batch{m_db};
-        batch.Write(KEY_SNAPSHOT,
-                    std::make_pair(upto_sequence,
-                                   std::vector<unsigned char>{UCharCast(body.data()),
-                                                              UCharCast(body.data()) +
-                                                                  body.size()}));
+        batch.Write(KEY_SNAPSHOT, record);
         m_db.WriteBatch(batch, /*fSync=*/true);
     } catch (const std::exception& e) {
         error = std::string{"flowmesh snapshot write failed: "} + e.what();
@@ -318,13 +361,12 @@ bool FlowMeshStore::WriteSnapshot(const uint64_t upto_sequence,
     return true;
 }
 
-bool FlowMeshStore::ReplayFromBestSnapshot(flowmesh::FlowMeshState& state, uint256& last_hash,
-                                           const flowmesh::ActionAuthenticator& auth,
-                                           const flowmesh::DepositVerifier* deposits,
-                                           const std::set<XOnlyPubKey>& seats,
-                                           const uint64_t threshold,
-                                           const flowmesh::AnchorPolicy* anchors,
-                                           std::string& error)
+bool FlowMeshStore::ReplayFromBestSnapshot(
+    flowmesh::FlowMeshState& state, uint256& last_hash,
+    const flowmesh::ActionAuthenticator& auth, const flowmesh::DepositVerifier* deposits,
+    const std::set<XOnlyPubKey>& seats, const uint64_t threshold,
+    const flowmesh::AnchorPolicy* anchors, std::string& error,
+    std::map<std::pair<int32_t, uint256>, uint64_t>* anchors_out)
 {
     std::optional<Marker> marker;
     if (!ReadMarker(marker, error)) return false;
@@ -338,27 +380,56 @@ bool FlowMeshStore::ReplayFromBestSnapshot(flowmesh::FlowMeshState& state, uint2
     }
 
     // Try the snapshot; any defect discards it and falls back to the
-    // full verified replay from genesis. A snapshot is only ever
-    // trusted through CERTIFIED history: its tip entry's certificate is
-    // re-verified against the recorded quorum, its root must equal that
-    // entry's certified resulting root, and its tip anchor must still
-    // be canonical.
-    std::pair<uint64_t, std::vector<unsigned char>> stored;
+    // full verified replay from genesis. A snapshot is only trusted
+    // through CERTIFIED history: the tip entry's certificate is
+    // re-verified, the decoded root must equal that entry's certified
+    // resulting root, AND the FULL SKIPPED PREFIX is authenticated by
+    // walking the parent-hash chain up to the certified tip — which
+    // proves every prefix entry's bytes, so every prefix B3 anchor can
+    // be (and is) revalidated without re-execution. A snapshot can
+    // never hide state derived from a now-orphaned earlier anchor.
+    SnapshotRecord stored;
     bool corrupt{false};
-    if (ReadStrict(m_db, KEY_SNAPSHOT, stored, corrupt) && stored.first > 0 &&
-        stored.first <= marker->next_sequence &&
-        stored.second.size() <= SNAPSHOT_MAX_BYTES) {
-        const uint64_t upto{stored.first};
+    if (ReadStrict(m_db, KEY_SNAPSHOT, stored, corrupt) && stored.upto_sequence > 0 &&
+        stored.upto_sequence <= marker->next_sequence) {
+        const uint64_t upto{stored.upto_sequence};
         const std::optional<flowmesh::CertifiedEntry> tip_entry{ReadEntry(upto - 1)};
-        if (tip_entry && tip_entry->cert.microblock_hash == tip_entry->mb.GetHash() &&
-            tip_entry->cert.sequence == upto - 1 &&
-            flowmesh::CheckCertificate(tip_entry->cert, marker->domain, seats, threshold) ==
-                flowmesh::CertificateCheck::OK &&
-            (anchors == nullptr || anchors->StillCanonical(tip_entry->mb.anchor))) {
+        bool prefix_ok{tip_entry.has_value()};
+        std::map<std::pair<int32_t, uint256>, uint64_t> prefix_anchors;
+        if (prefix_ok) {
+            prefix_ok = tip_entry->cert.microblock_hash == tip_entry->mb.GetHash() &&
+                        tip_entry->cert.sequence == upto - 1 &&
+                        flowmesh::CheckCertificate(tip_entry->cert, marker->domain, seats,
+                                                   threshold) ==
+                            flowmesh::CertificateCheck::OK;
+        }
+        if (prefix_ok) {
+            uint256 expect_parent{};
+            for (uint64_t s{0}; prefix_ok && s < upto; ++s) {
+                const std::optional<flowmesh::CertifiedEntry> prefix{ReadEntry(s)};
+                if (!prefix || prefix->mb.sequence != s ||
+                    prefix->mb.parent_hash != expect_parent) {
+                    prefix_ok = false;
+                    break;
+                }
+                expect_parent = prefix->mb.GetHash();
+                if (anchors != nullptr && !anchors->StillCanonical(prefix->mb.anchor)) {
+                    prefix_ok = false;
+                    break;
+                }
+                if (!prefix->mb.anchor.IsNull()) {
+                    prefix_anchors[{prefix->mb.anchor.height, prefix->mb.anchor.hash}] = s;
+                }
+            }
+            // The chain must land exactly on the certified tip entry.
+            prefix_ok = prefix_ok && tip_entry.has_value() &&
+                        expect_parent == tip_entry->mb.GetHash();
+        }
+        if (prefix_ok) {
             flowmesh::FlowMeshState candidate{state};
             bool decoded{false};
             try {
-                DataStream body{std::span{stored.second}};
+                DataStream body{std::span{stored.state_bytes}};
                 body >> candidate;
                 decoded = body.empty(); // strict: full consumption
             } catch (const std::exception&) {
@@ -367,21 +438,56 @@ bool FlowMeshStore::ReplayFromBestSnapshot(flowmesh::FlowMeshState& state, uint2
             if (decoded && candidate.Root() == tip_entry->mb.resulting_state_root) {
                 flowmesh::FlowMeshState next{std::move(candidate)};
                 uint256 tail_hash{tip_entry->mb.GetHash()};
+                std::map<std::pair<int32_t, uint256>, uint64_t> all_anchors{prefix_anchors};
                 if (ReplayRange(next, tail_hash, upto, *marker, auth, deposits, seats,
-                                threshold, anchors, error)) {
+                                threshold, anchors, error, &all_anchors)) {
                     state = std::move(next);
                     last_hash = tail_hash;
+                    if (anchors_out != nullptr) *anchors_out = std::move(all_anchors);
                     return true;
                 }
             }
         }
     }
 
-    // Fallback: full verified replay from genesis (state still carries
-    // the genesis configuration the caller constructed it with).
+    // Fallback: full verified replay from genesis.
     last_hash = uint256{};
     return ReplayRange(state, last_hash, 0, *marker, auth, deposits, seats, threshold, anchors,
-                      error);
+                      error, anchors_out);
+}
+
+bool StartValidator(FlowMeshStore& store, flowmesh::MeshNode::Config config,
+                    flowmesh::FlowMeshState genesis, ValidatorRuntime& out, std::string& error)
+{
+    if (config.auth == nullptr || config.anchors == nullptr || config.schedule == nullptr) {
+        error = "flowmesh validator startup requires auth/anchors/schedule";
+        return false;
+    }
+    if (!store.OpenForDomain(config.domain, config.seats, config.threshold, error)) return false;
+
+    uint256 last_hash;
+    std::map<std::pair<int32_t, uint256>, uint64_t> committed_anchors;
+    if (!store.ReplayFromBestSnapshot(genesis, last_hash, *config.auth, config.deposits,
+                                      config.seats, config.threshold, config.anchors, error,
+                                      &committed_anchors)) {
+        return false;
+    }
+    std::map<uint64_t, uint256> locks;
+    if (!store.ReadLocks(locks, error)) return false;
+
+    out.sink = std::make_unique<StoreCommitSink>(store);
+    out.journal = std::make_unique<StoreLockJournal>(store);
+    out.history = std::make_unique<StoreCatchupSource>(store);
+    config.sink = out.sink.get();
+    config.lock_journal = out.journal.get();
+    config.history = out.history.get();
+    out.mesh_node = std::make_unique<flowmesh::MeshNode>(std::move(config), std::move(genesis),
+                                                         last_hash, locks, committed_anchors);
+    if (out.mesh_node->Halted()) {
+        error = "flowmesh validator startup produced an invalid node configuration";
+        return false;
+    }
+    return true;
 }
 
 } // namespace node

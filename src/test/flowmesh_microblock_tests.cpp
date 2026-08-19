@@ -2,13 +2,13 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
-//! FlowMesh certified-log layer: canonical proposer-free microblock
-//! identity (permutation-independent), deterministic duplicate/variant
-//! handling, independent candidate re-execution with MB-0 atomicity,
-//! BUY/SELL limit intents on the settled curve economics with the exact
-//! integer-price reservation, chain-bound once-only deposits, Schnorr
-//! action credentials, separate certificates with an explicit
-//! fault-model threshold, and the round/lock leader-recovery guard.
+//! FlowMesh certified-log layer: canonical SEMANTIC microblock identity
+//! (credential- and permutation-independent), evidence verified outside
+//! identity, pre-admission authentication, independent candidate
+//! re-execution with MB-0 atomicity, BUY/SELL limit intents on the
+//! settled curve economics, chain-bound once-only deposits, separate
+//! certificates with an explicit fault-model threshold, and the
+//! round/lock leader-recovery guard.
 
 #include <flowmesh/microblock.h>
 
@@ -17,8 +17,10 @@
 #include <flowmesh/certificate.h>
 #include <flowmesh/clearing.h>
 #include <flowmesh/deposit.h>
+#include <flowmesh/pool.h>
 #include <flowmesh/recovery.h>
 #include <flowmesh/state.h>
+#include <flowmesh/sync.h>
 #include <key.h>
 #include <modern/policy.h>
 #include <primitives/transaction.h>
@@ -140,14 +142,21 @@ struct Net {
     }
 };
 
-MicroblockCore MustBuild(Net& net, const std::vector<Action>& actions, FlowMeshState& next,
-                         BatchResult& result)
+struct Built {
+    MicroblockCore mb;
+    std::vector<std::vector<unsigned char>> credentials;
+};
+
+Built MustBuild(Net& net, const std::vector<Action>& actions, FlowMeshState& next,
+                BatchResult& result)
 {
+    Built built;
     const std::optional<MicroblockCore> mb{
         flowmesh::BuildMicroblock(net.state, MESH_DOMAIN, uint256{}, net.anchor, actions,
-                                  net.auth, &net.deposits, next, result)};
+                                  &net.deposits, next, result, built.credentials)};
     BOOST_REQUIRE(mb.has_value());
-    return *mb;
+    built.mb = *mb;
+    return built;
 }
 
 } // namespace
@@ -156,9 +165,6 @@ BOOST_AUTO_TEST_CASE(limit_intents_clear_on_the_curve_economics)
 {
     Net net;
 
-    // One microblock: both chain deposits, then Alice BUY 10 @ 50'000
-    // and Bob SELL 10 @ 50'000 as degenerate curves. The BUY reserves
-    // EXACTLY 10 × 50'000 = 500'000 (the integer-price worst case).
     std::vector<Action> actions{
         Deposit(Outpoint(0x0a, 0)), Deposit(Outpoint(0x0b, 1)),
         LimitOrder(MESH_DOMAIN, net.alice_key, 0, /*buy=*/true, 50'000, 10),
@@ -166,7 +172,7 @@ BOOST_AUTO_TEST_CASE(limit_intents_clear_on_the_curve_economics)
 
     FlowMeshState next{net.state};
     BatchResult result;
-    const MicroblockCore mb{MustBuild(net, actions, next, result)};
+    const Built built{MustBuild(net, actions, next, result)};
 
     BOOST_REQUIRE(result.clearing.cleared);
     BOOST_CHECK_EQUAL(result.clearing.price, 50'000);
@@ -177,13 +183,14 @@ BOOST_AUTO_TEST_CASE(limit_intents_clear_on_the_curve_economics)
     BOOST_CHECK_EQUAL(next.ledger.Available(net.alice, Quote()), 100'000); // 600k - 10*50k
     BOOST_CHECK(next.ledger.SolvencyHolds());
 
-    // An independent replica from the same genesis re-executes to the
-    // same state, root and result commitment.
+    // The admitted evidence authenticates the body — and an independent
+    // replica re-executes to the same state, root and result commitment.
+    BOOST_CHECK(flowmesh::VerifyActionEvidence(built.mb, built.credentials, net.auth));
     Net replica;
     FlowMeshState replica_next{replica.state};
     BatchResult replica_result;
-    BOOST_REQUIRE(flowmesh::ExecuteCandidate(replica.state, MESH_DOMAIN, uint256{}, mb,
-                                             replica.auth, &replica.deposits, replica_next,
+    BOOST_REQUIRE(flowmesh::ExecuteCandidate(replica.state, MESH_DOMAIN, uint256{}, built.mb,
+                                             &replica.deposits, replica_next,
                                              replica_result) == CandidateError::NONE);
     BOOST_CHECK_EQUAL(replica_next.Root().GetHex(), next.Root().GetHex());
     BOOST_CHECK_EQUAL(replica_result.result_commitment.GetHex(),
@@ -192,8 +199,10 @@ BOOST_AUTO_TEST_CASE(limit_intents_clear_on_the_curve_economics)
 
 BOOST_AUTO_TEST_CASE(buy_funded_with_exactly_the_notional_is_accepted)
 {
-    // Codex defect 5 regression: the degenerate BUY {(P,Q),(P+1,0)} must
-    // reserve Q×P, not Q×(P+1). A buyer holding exactly Q×P succeeds.
+    // The degenerate BUY {(P,Q),(P+1,0)} reserves exactly Q×P; a buyer
+    // holding exactly the notional succeeds. (The general multi-segment
+    // staircase bound is documented as SAFE AND CONSERVATIVE, exact for
+    // this degenerate mapping — no broader exactness is claimed.)
     Net net;
     net.deposits.entries[Outpoint(0x0c, 2)] = {Quote(), 500'000, net.alice};
     FlowMeshState next{net.state};
@@ -209,17 +218,23 @@ BOOST_AUTO_TEST_CASE(buy_funded_with_exactly_the_notional_is_accepted)
     BOOST_CHECK(next.ledger.SolvencyHolds());
 }
 
-BOOST_AUTO_TEST_CASE(microblock_identity_is_permutation_independent)
+BOOST_AUTO_TEST_CASE(microblock_identity_is_semantic_and_permutation_independent)
 {
-    // Codex defect 1 regression: the SAME candidate action set must
-    // yield the SAME canonical body, hash and result no matter how it
-    // arrived. Exercise every permutation of a four-action set (plus an
-    // exact duplicate) through the proposer path.
+    // Codex re-audit item 1: one logical action set => one canonical
+    // body => one hash — across every arrival permutation AND with
+    // valid/malformed/alternate credential variants mixed in. The body
+    // is credential-free, so evidence can never split identity.
     Net net;
     const std::vector<Action> base{
         Deposit(Outpoint(0x0a, 0)), Deposit(Outpoint(0x0b, 1)),
         LimitOrder(MESH_DOMAIN, net.alice_key, 0, true, 50'000, 10),
         LimitOrder(MESH_DOMAIN, net.bob_key, 0, false, 50'000, 10)};
+
+    // Credential variants of the SAME semantic actions.
+    Action alice_corrupt{base[2]};
+    alice_corrupt.credential[40] ^= 0x01;
+    Action bob_stripped{base[3]};
+    bob_stripped.credential.clear();
 
     std::optional<uint256> pinned_hash;
     std::optional<uint256> pinned_root;
@@ -227,102 +242,137 @@ BOOST_AUTO_TEST_CASE(microblock_identity_is_permutation_independent)
     do {
         std::vector<Action> permuted;
         for (const size_t i : idx) permuted.push_back(base[i]);
-        permuted.push_back(base[idx[0]]); // exact duplicate: canonicalized away
+        permuted.push_back(base[idx[0]]); // exact duplicate
+        permuted.push_back(alice_corrupt); // variant of an existing id
+        permuted.push_back(bob_stripped);  // another variant
 
         Net fresh;
         FlowMeshState next{fresh.state};
         BatchResult result;
-        const MicroblockCore mb{MustBuild(fresh, permuted, next, result)};
-        BOOST_REQUIRE(mb.ShapeIsValid());
-        BOOST_CHECK_EQUAL(mb.actions.size(), 4U); // duplicate removed
+        const Built built{MustBuild(fresh, permuted, next, result)};
+        BOOST_REQUIRE(built.mb.ShapeIsValid());
+        BOOST_CHECK_EQUAL(built.mb.actions.size(), 4U); // variants/dups collapsed
+        for (const Action& body_action : built.mb.actions) {
+            BOOST_CHECK(body_action.credential.empty()); // body is evidence-free
+        }
         if (!pinned_hash) {
-            pinned_hash = mb.GetHash();
-            pinned_root = mb.resulting_state_root;
+            pinned_hash = built.mb.GetHash();
+            pinned_root = built.mb.resulting_state_root;
         } else {
-            BOOST_CHECK_EQUAL(mb.GetHash().GetHex(), pinned_hash->GetHex());
-            BOOST_CHECK_EQUAL(mb.resulting_state_root.GetHex(), pinned_root->GetHex());
+            BOOST_CHECK_EQUAL(built.mb.GetHash().GetHex(), pinned_hash->GetHex());
+            BOOST_CHECK_EQUAL(built.mb.resulting_state_root.GetHex(), pinned_root->GetHex());
         }
     } while (std::next_permutation(idx.begin(), idx.end()));
 
-    // A validator refuses any NON-canonical body outright: identity is
-    // only ever defined over the canonical representation.
+    // A validator refuses any NON-canonical body outright — including a
+    // body that smuggles a credential.
     Net fresh;
     FlowMeshState next{fresh.state};
     BatchResult result;
-    MicroblockCore mb{MustBuild(fresh, base, next, result)};
-    std::swap(mb.actions[0], mb.actions[2]);
-    mb.actions_root = MicroblockCore::ComputeActionsRoot(mb.actions);
-    Net validator;
-    FlowMeshState out{validator.state};
-    BatchResult out_result;
-    BOOST_CHECK(flowmesh::ExecuteCandidate(validator.state, MESH_DOMAIN, uint256{}, mb,
-                                           validator.auth, &validator.deposits, out,
-                                           out_result) == CandidateError::SHAPE);
+    Built built{MustBuild(fresh, base, next, result)};
+    {
+        MicroblockCore bad{built.mb};
+        std::swap(bad.actions[0], bad.actions[2]);
+        bad.actions_root = MicroblockCore::ComputeActionsRoot(bad.actions);
+        Net validator;
+        FlowMeshState out{validator.state};
+        BatchResult out_result;
+        BOOST_CHECK(flowmesh::ExecuteCandidate(validator.state, MESH_DOMAIN, uint256{}, bad,
+                                               &validator.deposits, out,
+                                               out_result) == CandidateError::SHAPE);
+    }
+    {
+        MicroblockCore bad{built.mb};
+        bad.actions.back().credential = {0x01}; // evidence inside the body: refused
+        bad.actions_root = MicroblockCore::ComputeActionsRoot(bad.actions);
+        Net validator;
+        FlowMeshState out{validator.state};
+        BatchResult out_result;
+        BOOST_CHECK(flowmesh::ExecuteCandidate(validator.state, MESH_DOMAIN, uint256{}, bad,
+                                               &validator.deposits, out,
+                                               out_result) == CandidateError::SHAPE);
+    }
 }
 
-BOOST_AUTO_TEST_CASE(credential_variants_have_one_deterministic_disposition)
+BOOST_AUTO_TEST_CASE(evidence_lives_outside_identity_and_must_authenticate)
 {
-    // Codex defect 2 regression: an id arriving with several credential
-    // variants — valid, corrupted, oversized — must have ONE outcome
-    // regardless of arrival order, and junk variants can never shadow a
-    // valid one.
     Net net;
-    net.state.ledger.Deposit(net.alice, Quote(), 600'000);
+    FlowMeshState next{net.state};
+    BatchResult result;
+    const Built built{MustBuild(
+        net, {Deposit(Outpoint(0x0a, 0)), LimitOrder(MESH_DOMAIN, net.alice_key, 0, true,
+                                                     50'000, 4)},
+        next, result)};
+    BOOST_REQUIRE_EQUAL(built.credentials.size(), 1U); // one signed action
 
-    const Action good{LimitOrder(MESH_DOMAIN, net.alice_key, 0, true, 50'000, 10)};
-    Action corrupted{good};
-    corrupted.credential[40] ^= 0x01;
-    Action oversized{good};
-    oversized.credential.assign(flowmesh::MAX_ACTION_CREDENTIAL_SIZE + 40, 0x5a);
+    BOOST_CHECK(flowmesh::VerifyActionEvidence(built.mb, built.credentials, net.auth));
 
-    const std::vector<std::vector<Action>> arrival_orders{
-        {good, corrupted, oversized}, {oversized, corrupted, good}, {corrupted, oversized, good},
-        {corrupted, good, oversized}};
-    std::optional<uint256> pinned_root;
-    for (const auto& order : arrival_orders) {
-        FlowMeshState state{net.state};
-        flowmesh::BatchExecutor exec{state, net.auth, nullptr};
-        const auto result{exec.ExecuteSlot(order)};
-        BOOST_REQUIRE(result.has_value());
-        BOOST_CHECK_EQUAL(result->applied.size(), 1U); // the id applied exactly once
-        if (!pinned_root) {
-            pinned_root = result->state_root;
-        } else {
-            BOOST_CHECK_EQUAL(result->state_root.GetHex(), pinned_root->GetHex());
-        }
-    }
+    // Corrupted evidence fails; identity is untouched either way.
+    auto corrupted{built.credentials};
+    corrupted[0][40] ^= 0x01;
+    BOOST_CHECK(!flowmesh::VerifyActionEvidence(built.mb, corrupted, net.auth));
+    // Oversized evidence fails before any cryptography.
+    auto oversized{built.credentials};
+    oversized[0].assign(flowmesh::MAX_ACTION_CREDENTIAL_SIZE + 1, 0x5a);
+    BOOST_CHECK(!flowmesh::VerifyActionEvidence(built.mb, oversized, net.auth));
+    // Count mismatches fail: missing and dangling evidence alike.
+    BOOST_CHECK(!flowmesh::VerifyActionEvidence(built.mb, {}, net.auth));
+    auto dangling{built.credentials};
+    dangling.push_back({0x01});
+    BOOST_CHECK(!flowmesh::VerifyActionEvidence(built.mb, dangling, net.auth));
+    // Wrong-domain evidence fails (replay across domains).
+    const flowmesh::SchnorrActionAuthenticator other{OTHER_DOMAIN};
+    BOOST_CHECK(!flowmesh::VerifyActionEvidence(built.mb, built.credentials, other));
+}
 
-    // All-junk variants: deterministically UNAUTHENTICATED, never applied.
-    {
-        FlowMeshState state{net.state};
-        flowmesh::BatchExecutor exec{state, net.auth, nullptr};
-        const auto result{exec.ExecuteSlot({corrupted, oversized})};
-        BOOST_REQUIRE(result.has_value());
-        BOOST_CHECK_EQUAL(result->applied.size(), 0U);
-        BOOST_REQUIRE_EQUAL(result->rejected.size(), 1U);
-        BOOST_CHECK(result->rejected[0].second == ActionReject::UNAUTHENTICATED);
-    }
+BOOST_AUTO_TEST_CASE(pool_authenticates_before_index_ownership)
+{
+    // Codex re-audit item 2: a junk credential must not reserve the
+    // authoritative (signer, sequence) slot — the victim's legitimate
+    // action still admits afterwards.
+    Net net;
+    flowmesh::ActionPool pool{&net.auth};
+
+    const Action victim{LimitOrder(MESH_DOMAIN, net.alice_key, 0, true, 50'000, 4)};
+    Action poison{victim};
+    poison.credential[40] ^= 0x01; // same (signer, sequence), junk credential
+    Action forged_other{LimitOrder(MESH_DOMAIN, net.alice_key, 0, true, 40'000, 2)};
+    forged_other.credential = std::vector<unsigned char>(96, 0x00); // garbage credential
+
+    BOOST_CHECK(!pool.Add(poison));       // refused BEFORE index ownership
+    BOOST_CHECK(!pool.Add(forged_other)); // ditto for a different forged id
+    BOOST_CHECK_EQUAL(pool.Size(), 0U);
+    BOOST_CHECK_EQUAL(pool.Bytes(), 0U);
+    BOOST_CHECK(pool.Add(victim)); // the legitimate action is NOT shadowed
+    BOOST_CHECK_EQUAL(pool.Size(), 1U);
+
+    // A pool without an authenticator fails closed for signed actions
+    // but still admits chain-authorized deposits.
+    flowmesh::ActionPool no_auth;
+    BOOST_CHECK(!no_auth.Add(victim));
+    BOOST_CHECK(no_auth.Add(Deposit(Outpoint(0x0a, 0))));
 }
 
 BOOST_AUTO_TEST_CASE(state_root_excludes_execution_metadata)
 {
-    // Mandated regression: persistent state (and its root) must be
-    // identical whether or not an unrelated UNAUTHENTICATED no-op rode
-    // along; only the ExecutionResultCommitment may differ.
+    // Persistent state (and its root) must be identical whether or not
+    // an unrelated no-op rejection rode along; only the
+    // ExecutionResultCommitment may differ.
     Net net;
     net.state.ledger.Deposit(net.alice, Quote(), 600'000);
     const std::vector<Action> valid{LimitOrder(MESH_DOMAIN, net.alice_key, 0, true, 50'000, 4)};
 
-    Action noop{LimitOrder(MESH_DOMAIN, net.bob_key, 0, false, 40'000, 3)};
-    noop.credential[40] ^= 0x01; // unauthenticated: pure execution metadata
+    // A wrong-sequence action: recorded as BAD_SEQUENCE (metadata only),
+    // consumes nothing, changes no state.
+    const Action noop{LimitOrder(MESH_DOMAIN, net.bob_key, 5, false, 40'000, 3)};
 
     FlowMeshState state_a{net.state};
-    flowmesh::BatchExecutor exec_a{state_a, net.auth, nullptr};
+    flowmesh::BatchExecutor exec_a{state_a};
     const auto a{exec_a.ExecuteSlot(valid)};
     BOOST_REQUIRE(a.has_value());
 
     FlowMeshState state_b{net.state};
-    flowmesh::BatchExecutor exec_b{state_b, net.auth, nullptr};
+    flowmesh::BatchExecutor exec_b{state_b};
     std::vector<Action> with_noop{valid};
     with_noop.push_back(noop);
     const auto b{exec_b.ExecuteSlot(with_noop)};
@@ -340,7 +390,8 @@ BOOST_AUTO_TEST_CASE(candidate_reexecution_rejects_every_tamper_and_stays_atomic
                                 LimitOrder(MESH_DOMAIN, net.alice_key, 0, true, 50'000, 4)};
     FlowMeshState built_next{net.state};
     BatchResult built_result;
-    const MicroblockCore good{MustBuild(net, actions, built_next, built_result)};
+    const Built built{MustBuild(net, actions, built_next, built_result)};
+    const MicroblockCore good{built.mb};
 
     Net replica;
     const uint256 before{replica.state.Root()};
@@ -348,7 +399,7 @@ BOOST_AUTO_TEST_CASE(candidate_reexecution_rejects_every_tamper_and_stays_atomic
     BatchResult out_result;
     const auto run{[&](const MicroblockCore& mb) {
         return flowmesh::ExecuteCandidate(replica.state, MESH_DOMAIN, uint256{}, mb,
-                                          replica.auth, &replica.deposits, out, out_result);
+                                          &replica.deposits, out, out_result);
     }};
 
     MicroblockCore bad{good};
@@ -359,14 +410,11 @@ BOOST_AUTO_TEST_CASE(candidate_reexecution_rejects_every_tamper_and_stays_atomic
     BOOST_CHECK(run(bad) == CandidateError::WRONG_DOMAIN);
     bad = good;
     bad.sequence = 7;
-    bad.parent_hash = uint256::ONE; // keep shape valid (nonzero seq wants a parent)
+    bad.parent_hash = uint256::ONE;
     BOOST_CHECK(run(bad) == CandidateError::SEQUENCE);
     bad = good;
     bad.prev_state_root = uint256::ONE;
     BOOST_CHECK(run(bad) == CandidateError::PREV_ROOT);
-    bad = good;
-    bad.actions.push_back(Deposit(Outpoint(0x0c, 2)));
-    BOOST_CHECK(run(bad) == CandidateError::SHAPE); // canonical order broken
     bad = good;
     bad.actions = flowmesh::CanonicalizeActions(
         {good.actions[0], good.actions[1], Deposit(Outpoint(0x0c, 2))});
@@ -378,15 +426,13 @@ BOOST_AUTO_TEST_CASE(candidate_reexecution_rejects_every_tamper_and_stays_atomic
     bad.resulting_state_root = uint256::ONE;
     BOOST_CHECK(run(bad) == CandidateError::RESULT_ROOT);
 
-    // Wrong expected parent (caller-side view).
     BOOST_CHECK(flowmesh::ExecuteCandidate(replica.state, MESH_DOMAIN, uint256::ONE, good,
-                                           replica.auth, &replica.deposits, out,
+                                           &replica.deposits, out,
                                            out_result) == CandidateError::PARENT);
 
     // MB-0: none of the failures touched the committed state.
     BOOST_CHECK_EQUAL(replica.state.Root().GetHex(), before.GetHex());
 
-    // And the honest candidate still lands on the untouched state.
     BOOST_CHECK(run(good) == CandidateError::NONE);
     BOOST_CHECK_EQUAL(out.Root().GetHex(), good.resulting_state_root.GetHex());
 }
@@ -395,10 +441,9 @@ BOOST_AUTO_TEST_CASE(deposits_come_from_the_chain_and_consume_once)
 {
     Net net;
 
-    // Unknown outpoint and missing verifier both fail closed.
     {
         FlowMeshState next{net.state};
-        flowmesh::BatchExecutor exec{next, net.auth, &net.deposits};
+        flowmesh::BatchExecutor exec{next, &net.deposits};
         const auto r{exec.ExecuteSlot({Deposit(Outpoint(0x0c, 9))}, net.anchor)};
         BOOST_REQUIRE(r.has_value());
         BOOST_REQUIRE_EQUAL(r->rejected.size(), 1U);
@@ -406,25 +451,22 @@ BOOST_AUTO_TEST_CASE(deposits_come_from_the_chain_and_consume_once)
     }
     {
         FlowMeshState next{net.state};
-        flowmesh::BatchExecutor exec{next, net.auth, /*deposits=*/nullptr};
+        flowmesh::BatchExecutor exec{next, /*deposits=*/nullptr};
         const auto r{exec.ExecuteSlot({Deposit(Outpoint(0x0a, 0))}, net.anchor)};
         BOOST_REQUIRE(r.has_value());
         BOOST_REQUIRE_EQUAL(r->rejected.size(), 1U);
         BOOST_CHECK(r->rejected[0].second == ActionReject::REJECTED_BY_STATE);
     }
-    // A deposit judged at the wrong anchor fails: the custody facts are
-    // a function of the anchored B3 position, not of the action.
     {
         FlowMeshState next{net.state};
-        flowmesh::BatchExecutor exec{next, net.auth, &net.deposits};
+        flowmesh::BatchExecutor exec{next, &net.deposits};
         const AnchorRef wrong{net.anchor.height, uint256::ONE};
         const auto r{exec.ExecuteSlot({Deposit(Outpoint(0x0a, 0))}, wrong)};
         BOOST_REQUIRE(r.has_value());
         BOOST_REQUIRE_EQUAL(r->rejected.size(), 1U);
     }
 
-    // Applied once; the same outpoint can never credit again.
-    flowmesh::BatchExecutor exec{net.state, net.auth, &net.deposits};
+    flowmesh::BatchExecutor exec{net.state, &net.deposits};
     const auto first{exec.ExecuteSlot({Deposit(Outpoint(0x0a, 0))}, net.anchor)};
     BOOST_REQUIRE(first.has_value());
     BOOST_REQUIRE_EQUAL(first->applied.size(), 1U);
@@ -440,7 +482,6 @@ BOOST_AUTO_TEST_CASE(deposits_come_from_the_chain_and_consume_once)
 BOOST_AUTO_TEST_CASE(schnorr_credentials_bind_signer_and_domain)
 {
     Net net;
-    net.state.ledger.Deposit(net.alice, Quote(), 600'000);
 
     Action good{LimitOrder(MESH_DOMAIN, net.alice_key, 0, true, 50'000, 4)};
     BOOST_CHECK(net.auth.Authenticate(good));
@@ -449,7 +490,6 @@ BOOST_AUTO_TEST_CASE(schnorr_credentials_bind_signer_and_domain)
     bad.credential[40] ^= 0x01;
     BOOST_CHECK(!net.auth.Authenticate(bad));
 
-    // Credential from a different key cannot vouch for Alice's account.
     Action stolen{good};
     stolen.credential.clear();
     {
@@ -465,11 +505,6 @@ BOOST_AUTO_TEST_CASE(schnorr_credentials_bind_signer_and_domain)
     BOOST_CHECK(!net.auth.Authenticate(truncated));
     const flowmesh::SchnorrActionAuthenticator other_domain{OTHER_DOMAIN};
     BOOST_CHECK(!other_domain.Authenticate(good));
-
-    flowmesh::BatchExecutor exec{net.state, net.auth, nullptr};
-    const auto r{exec.ExecuteSlot({bad, good})};
-    BOOST_REQUIRE(r.has_value());
-    BOOST_CHECK_EQUAL(r->applied.size(), 1U);
 }
 
 BOOST_AUTO_TEST_CASE(certificates_are_separate_thresholded_attestations)
@@ -503,9 +538,6 @@ BOOST_AUTO_TEST_CASE(certificates_are_separate_thresholded_attestations)
     BOOST_CHECK(flowmesh::CheckCertificate(cert, MESH_DOMAIN, seats, *t) ==
                 CertificateCheck::OK);
 
-    // Codex defect 7 regression: nonsensical quorum configurations are
-    // refused outright — threshold zero (or an unsatisfiable threshold,
-    // or no seats) can never validate ANY certificate.
     BOOST_CHECK(!flowmesh::ValidQuorumConfig(4, 0));
     BOOST_CHECK(!flowmesh::ValidQuorumConfig(0, 1));
     BOOST_CHECK(!flowmesh::ValidQuorumConfig(4, 5));
@@ -568,7 +600,6 @@ BOOST_AUTO_TEST_CASE(recovery_rounds_and_lock_rule)
                 flowmesh::AttestDecision::LOCK_CONFLICT);
     BOOST_CHECK(guard.Consider(schedule, seq, 1, *p1, h1) == flowmesh::AttestDecision::ATTEST);
 
-    // Restart restore: imported locks keep protecting the sequence.
     flowmesh::AttestationGuard restarted;
     restarted.ImportLocks(guard.Locks());
     BOOST_CHECK(restarted.Consider(schedule, seq, 0, *p0, h2) ==
@@ -612,19 +643,17 @@ BOOST_AUTO_TEST_CASE(canonical_serialization_round_trips_strictly)
                                 LimitOrder(MESH_DOMAIN, net.alice_key, 0, true, 50'000, 4)};
     FlowMeshState next{net.state};
     BatchResult result;
-    const MicroblockCore mb{MustBuild(net, actions, next, result)};
+    const Built built{MustBuild(net, actions, next, result)};
 
     DataStream s;
-    s << mb;
+    s << built.mb;
     MicroblockCore decoded;
     s >> decoded;
     BOOST_CHECK(s.empty()); // full consumption
-    BOOST_CHECK_EQUAL(decoded.GetHash().GetHex(), mb.GetHash().GetHex());
-    BOOST_CHECK_EQUAL(decoded.actions.size(), mb.actions.size());
+    BOOST_CHECK_EQUAL(decoded.GetHash().GetHex(), built.mb.GetHash().GetHex());
+    BOOST_CHECK_EQUAL(decoded.actions.size(), built.mb.actions.size());
 
-    // Codex defect 12 regression: attacker-sized counts are refused
-    // BEFORE allocation — a claimed million-action microblock or a
-    // curve/credential/certificate beyond the caps throws on decode.
+    // Attacker-sized counts are refused BEFORE allocation.
     {
         DataStream bad;
         bad << flowmesh::MICROBLOCK_VERSION_V1 << MESH_DOMAIN << uint64_t{0} << uint256{}
@@ -647,20 +676,40 @@ BOOST_AUTO_TEST_CASE(canonical_serialization_round_trips_strictly)
         MicroblockCertificate refuse;
         BOOST_CHECK_THROW(bad >> refuse, std::ios_base::failure);
     }
+    // Evidence codec bounds: an oversized evidence list and an oversized
+    // single credential both throw before allocation.
+    {
+        DataStream bad;
+        WriteCompactSize(bad, flowmesh::MAX_MICROBLOCK_ACTIONS + 1);
+        std::vector<std::vector<unsigned char>> refuse;
+        BOOST_CHECK_THROW(flowmesh::UnserializeEvidence(bad, refuse), std::ios_base::failure);
+    }
+    {
+        DataStream bad;
+        WriteCompactSize(bad, 1);
+        WriteCompactSize(bad, flowmesh::MAX_ACTION_CREDENTIAL_SIZE + 1);
+        std::vector<std::vector<unsigned char>> refuse;
+        BOOST_CHECK_THROW(flowmesh::UnserializeEvidence(bad, refuse), std::ios_base::failure);
+    }
 
+    // A certified entry round-trips with its evidence intact.
     const CKey key{MakeKey(0x21)};
-    const auto att{flowmesh::SignAttestation(key, MESH_DOMAIN, mb.sequence, mb.GetHash())};
+    const auto att{flowmesh::SignAttestation(key, MESH_DOMAIN, built.mb.sequence,
+                                             built.mb.GetHash())};
     BOOST_REQUIRE(att.has_value());
-    const MicroblockCertificate cert{
-        flowmesh::AssembleCertificate(mb.GetHash(), mb.sequence, {*att})};
+    flowmesh::CertifiedEntry entry{built.mb,
+                                   flowmesh::AssembleCertificate(built.mb.GetHash(),
+                                                                 built.mb.sequence, {*att}),
+                                   built.credentials};
     DataStream s2;
-    s2 << cert;
-    MicroblockCertificate decoded_cert;
-    s2 >> decoded_cert;
+    s2 << entry;
+    flowmesh::CertifiedEntry decoded_entry;
+    s2 >> decoded_entry;
     BOOST_CHECK(s2.empty());
-    BOOST_CHECK(decoded_cert.microblock_hash == cert.microblock_hash);
-    BOOST_CHECK(flowmesh::VerifyAttestation(decoded_cert.attestations[0], MESH_DOMAIN,
-                                            mb.sequence, mb.GetHash()));
+    BOOST_CHECK(decoded_entry.mb.GetHash() == built.mb.GetHash());
+    BOOST_CHECK(decoded_entry.credentials == built.credentials);
+    BOOST_CHECK(flowmesh::VerifyActionEvidence(decoded_entry.mb, decoded_entry.credentials,
+                                               net.auth));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

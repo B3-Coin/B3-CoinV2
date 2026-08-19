@@ -10,6 +10,8 @@
 
 #include <flowmesh/clearing.h>
 
+#include <flowmesh/state.h>
+
 #include <flowmesh/ledger.h>
 #include <hash.h>
 #include <modern/policy.h>
@@ -62,25 +64,25 @@ const std::string EMPTY_BOOK_ROOT_HEX{
 
 BOOST_AUTO_TEST_CASE(curve_validity_bounds_and_monotonicity)
 {
-    flowmesh::Ledger ledger{VAULT};
-    flowmesh::ClearingEngine eng{BaseX(), Quote(), /*max_k=*/3};
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote(), /*max_k=*/3};
+    flowmesh::Ledger& ledger{st.ledger};
 
     // Valid bid (non-increasing, terminates at zero) and ask (non-decreasing).
-    BOOST_CHECK(eng.CurveIsValid(Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
-    BOOST_CHECK(eng.CurveIsValid(Side::ASK, Pts({{10, 20}, {20, 80}})));
+    BOOST_CHECK(st.CurveIsValid(Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
+    BOOST_CHECK(st.CurveIsValid(Side::ASK, Pts({{10, 20}, {20, 80}})));
 
     // K bound: 4 breakpoints exceeds max_k = 3.
-    BOOST_CHECK(!eng.CurveIsValid(Side::BID, Pts({{1, 3}, {2, 2}, {3, 1}, {4, 0}})));
+    BOOST_CHECK(!st.CurveIsValid(Side::BID, Pts({{1, 3}, {2, 2}, {3, 1}, {4, 0}})));
     // Empty is invalid.
-    BOOST_CHECK(!eng.CurveIsValid(Side::BID, {}));
+    BOOST_CHECK(!st.CurveIsValid(Side::BID, {}));
     // Non-ascending prices.
-    BOOST_CHECK(!eng.CurveIsValid(Side::BID, Pts({{20, 40}, {10, 0}})));
+    BOOST_CHECK(!st.CurveIsValid(Side::BID, Pts({{20, 40}, {10, 0}})));
     // Bid not monotone non-increasing.
-    BOOST_CHECK(!eng.CurveIsValid(Side::BID, Pts({{10, 10}, {20, 20}, {30, 0}})));
+    BOOST_CHECK(!st.CurveIsValid(Side::BID, Pts({{10, 10}, {20, 20}, {30, 0}})));
     // Bid not terminating at zero.
-    BOOST_CHECK(!eng.CurveIsValid(Side::BID, Pts({{10, 100}, {20, 40}})));
+    BOOST_CHECK(!st.CurveIsValid(Side::BID, Pts({{10, 100}, {20, 40}})));
     // Ask not monotone non-decreasing.
-    BOOST_CHECK(!eng.CurveIsValid(Side::ASK, Pts({{10, 80}, {20, 20}})));
+    BOOST_CHECK(!st.CurveIsValid(Side::ASK, Pts({{10, 80}, {20, 20}})));
 }
 
 BOOST_AUTO_TEST_CASE(integer_evaluation_clamps_and_floors)
@@ -102,16 +104,16 @@ BOOST_AUTO_TEST_CASE(integer_evaluation_clamps_and_floors)
 
 BOOST_AUTO_TEST_CASE(maximum_volume_clearing_golden_and_differential)
 {
-    flowmesh::Ledger ledger{VAULT};
-    flowmesh::ClearingEngine eng{BaseX(), Quote()};
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger{st.ledger};
 
     // Alice bids, Bob asks. Back them with ledger reservations.
     BOOST_REQUIRE(ledger.Deposit(ALICE, Quote(), 2400));
     BOOST_REQUIRE(ledger.Deposit(BOB, BaseX(), 80));
     const auto bid{Pts({{10, 100}, {20, 40}, {30, 0}})};
     const auto ask{Pts({{10, 20}, {20, 80}})};
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, ALICE, Side::BID, bid));
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, BOB, Side::ASK, ask));
+    BOOST_REQUIRE(st.SubmitCurve(ALICE, Side::BID, bid));
+    BOOST_REQUIRE(st.SubmitCurve(BOB, Side::ASK, ask));
 
     // Worst-case reservations under the exact integer-price bound
     // Σ (q_i − q_{i+1})·(p_{i+1} − 1): (100-40)*19 + 40*29 = 2300; ask 80.
@@ -129,7 +131,7 @@ BOOST_AUTO_TEST_CASE(maximum_volume_clearing_golden_and_differential)
     BOOST_CHECK_EQUAL(best_price, 20);
     BOOST_CHECK_EQUAL(best_vol, 40);
 
-    const auto result{*eng.ClearSlot(ledger)};
+    const auto result{*st.ClearSlot()};
     // Golden.
     BOOST_CHECK(result.cleared);
     BOOST_CHECK_EQUAL(result.price, 20);
@@ -150,8 +152,8 @@ BOOST_AUTO_TEST_CASE(maximum_volume_clearing_golden_and_differential)
 
 BOOST_AUTO_TEST_CASE(largest_remainder_allocation_is_deterministic)
 {
-    flowmesh::Ledger ledger{VAULT};
-    flowmesh::ClearingEngine eng{BaseX(), Quote()};
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger{st.ledger};
 
     // One bidder wanting 20 at price 5; three symmetric askers offering 10
     // each. The ask (long) side rations 20 across 30 desired.
@@ -160,12 +162,12 @@ BOOST_AUTO_TEST_CASE(largest_remainder_allocation_is_deterministic)
     BOOST_REQUIRE(ledger.Deposit(ACC_B, BaseX(), 10));
     BOOST_REQUIRE(ledger.Deposit(ALICE, BaseX(), 10));
 
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, ACC_C, Side::BID, Pts({{5, 20}, {6, 0}})));
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, ACC_A, Side::ASK, Pts({{5, 10}})));
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, ACC_B, Side::ASK, Pts({{5, 10}})));
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, ALICE, Side::ASK, Pts({{5, 10}})));
+    BOOST_REQUIRE(st.SubmitCurve(ACC_C, Side::BID, Pts({{5, 20}, {6, 0}})));
+    BOOST_REQUIRE(st.SubmitCurve(ACC_A, Side::ASK, Pts({{5, 10}})));
+    BOOST_REQUIRE(st.SubmitCurve(ACC_B, Side::ASK, Pts({{5, 10}})));
+    BOOST_REQUIRE(st.SubmitCurve(ALICE, Side::ASK, Pts({{5, 10}})));
 
-    const auto result{*eng.ClearSlot(ledger)};
+    const auto result{*st.ClearSlot()};
     BOOST_CHECK_EQUAL(result.price, 5);
     BOOST_CHECK_EQUAL(result.volume, 20);
     // floor(10*20/30) = 6 each (18), remainder 2 to the two lowest-id
@@ -180,20 +182,20 @@ BOOST_AUTO_TEST_CASE(largest_remainder_allocation_is_deterministic)
 
 BOOST_AUTO_TEST_CASE(reservation_backing_is_required)
 {
-    flowmesh::Ledger ledger{VAULT};
-    flowmesh::ClearingEngine eng{BaseX(), Quote()};
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger{st.ledger};
 
     // Insufficient available funds: submission rejected, nothing reserved.
     BOOST_REQUIRE(ledger.Deposit(ALICE, Quote(), 100)); // needs 2300
-    BOOST_CHECK(!eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
+    BOOST_CHECK(!st.SubmitCurve(ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
     BOOST_CHECK_EQUAL(ledger.Reserved(ALICE, Quote()), 0);
     BOOST_CHECK_EQUAL(ledger.Available(ALICE, Quote()), 100);
 
     // A cancelled curve releases its reservation.
     BOOST_REQUIRE(ledger.Deposit(BOB, BaseX(), 80));
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, BOB, Side::ASK, Pts({{10, 20}, {20, 80}})));
+    BOOST_REQUIRE(st.SubmitCurve(BOB, Side::ASK, Pts({{10, 20}, {20, 80}})));
     BOOST_CHECK_EQUAL(ledger.Reserved(BOB, BaseX()), 80);
-    BOOST_CHECK(eng.CancelCurve(ledger, BOB, Side::ASK));
+    BOOST_CHECK(st.CancelCurve(BOB, Side::ASK));
     BOOST_CHECK_EQUAL(ledger.Reserved(BOB, BaseX()), 0);
     BOOST_CHECK_EQUAL(ledger.Available(BOB, BaseX()), 80);
 }
@@ -201,19 +203,19 @@ BOOST_AUTO_TEST_CASE(reservation_backing_is_required)
 BOOST_AUTO_TEST_CASE(clearing_is_order_independent)
 {
     const auto run{[](bool ask_first) {
-        flowmesh::Ledger ledger{VAULT};
-        flowmesh::ClearingEngine eng{BaseX(), Quote()};
+        flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+        flowmesh::Ledger& ledger{st.ledger};
         ledger.Deposit(ALICE, Quote(), 2400);
         ledger.Deposit(BOB, BaseX(), 80);
         if (ask_first) {
-            eng.SubmitCurve(ledger, BOB, Side::ASK, Pts({{10, 20}, {20, 80}}));
-            eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}}));
+            st.SubmitCurve(BOB, Side::ASK, Pts({{10, 20}, {20, 80}}));
+            st.SubmitCurve(ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}}));
         } else {
-            eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}}));
-            eng.SubmitCurve(ledger, BOB, Side::ASK, Pts({{10, 20}, {20, 80}}));
+            st.SubmitCurve(ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}}));
+            st.SubmitCurve(BOB, Side::ASK, Pts({{10, 20}, {20, 80}}));
         }
-        const auto result{*eng.ClearSlot(ledger)};
-        return std::make_pair(result, eng.StateRoot(ledger));
+        const auto result{*st.ClearSlot()};
+        return std::make_pair(result, st.BookRoot());
     }};
 
     const auto [r1, root1]{run(false)};
@@ -228,12 +230,12 @@ BOOST_AUTO_TEST_CASE(clearing_is_order_independent)
 
 BOOST_AUTO_TEST_CASE(no_clearing_without_both_sides)
 {
-    flowmesh::Ledger ledger{VAULT};
-    flowmesh::ClearingEngine eng{BaseX(), Quote()};
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger{st.ledger};
     ledger.Deposit(ALICE, Quote(), 2400);
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
+    BOOST_REQUIRE(st.SubmitCurve(ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
 
-    const auto result{*eng.ClearSlot(ledger)};
+    const auto result{*st.ClearSlot()};
     BOOST_CHECK(!result.cleared);
     BOOST_CHECK_EQUAL(result.volume, 0);
     // Reservation untouched; the curve stands for a future slot.
@@ -243,18 +245,18 @@ BOOST_AUTO_TEST_CASE(no_clearing_without_both_sides)
 
 BOOST_AUTO_TEST_CASE(adversarial_overflow_is_rejected)
 {
-    flowmesh::Ledger ledger{VAULT};
-    flowmesh::ClearingEngine eng{BaseX(), Quote()};
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger{st.ledger};
     ledger.Deposit(ALICE, Quote(), MAX_MONEY);
 
     // A bid whose worst-case spend overflows the monetary range is
     // rejected outright; nothing is reserved. (MAX_MONEY lots that can
     // only fill at up to price 2: worst = 2·MAX_MONEY, overflow.)
-    BOOST_CHECK(!eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{2, MAX_MONEY}, {3, 0}})));
+    BOOST_CHECK(!st.SubmitCurve(ALICE, Side::BID, Pts({{2, MAX_MONEY}, {3, 0}})));
     BOOST_CHECK_EQUAL(ledger.Reserved(ALICE, Quote()), 0);
     // Exact boundary: the same quantity fillable only at up to price 1
     // needs exactly MAX_MONEY — accepted with a full-balance reservation.
-    BOOST_CHECK(eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{1, MAX_MONEY}, {2, 0}})));
+    BOOST_CHECK(st.SubmitCurve(ALICE, Side::BID, Pts({{1, MAX_MONEY}, {2, 0}})));
     BOOST_CHECK_EQUAL(ledger.Reserved(ALICE, Quote()), MAX_MONEY);
     BOOST_CHECK(ledger.SolvencyHolds());
 }
@@ -289,24 +291,24 @@ BOOST_AUTO_TEST_CASE(curve_evaluation_is_total_and_exact)
 //! rest, invisible to the solvency invariant).
 BOOST_AUTO_TEST_CASE(partial_fill_reservations_release_exactly)
 {
-    flowmesh::Ledger ledger{VAULT};
-    flowmesh::ClearingEngine eng{BaseX(), Quote()};
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger{st.ledger};
     BOOST_REQUIRE(ledger.Deposit(ALICE, Quote(), 2400));
     BOOST_REQUIRE(ledger.Deposit(BOB, BaseX(), 80));
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, BOB, Side::ASK, Pts({{10, 20}, {20, 80}})));
-    const auto result{*eng.ClearSlot(ledger)}; // 40 lots at price 20: spend 800
+    BOOST_REQUIRE(st.SubmitCurve(ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
+    BOOST_REQUIRE(st.SubmitCurve(BOB, Side::ASK, Pts({{10, 20}, {20, 80}})));
+    const auto result{*st.ClearSlot()}; // 40 lots at price 20: spend 800
     BOOST_REQUIRE(result.cleared);
     BOOST_REQUIRE_EQUAL(result.volume, 40);
 
     // Partial fill consumed 800 quote of Alice's 2300 reservation and 40
     // base of Bob's; cancelling both releases EXACTLY the remainder.
     BOOST_CHECK_EQUAL(ledger.Reserved(ALICE, Quote()), 1500);
-    BOOST_CHECK(eng.CancelCurve(ledger, ALICE, Side::BID));
+    BOOST_CHECK(st.CancelCurve(ALICE, Side::BID));
     BOOST_CHECK_EQUAL(ledger.Reserved(ALICE, Quote()), 0);
     BOOST_CHECK_EQUAL(ledger.Available(ALICE, Quote()), 1600); // 100 + 1500 released
     BOOST_CHECK_EQUAL(ledger.Reserved(BOB, BaseX()), 40);
-    BOOST_CHECK(eng.CancelCurve(ledger, BOB, Side::ASK));
+    BOOST_CHECK(st.CancelCurve(BOB, Side::ASK));
     BOOST_CHECK_EQUAL(ledger.Reserved(BOB, BaseX()), 0);
     BOOST_CHECK_EQUAL(ledger.Available(BOB, BaseX()), 40);
     BOOST_CHECK(ledger.SolvencyHolds());
@@ -314,7 +316,7 @@ BOOST_AUTO_TEST_CASE(partial_fill_reservations_release_exactly)
     // Fresh resubmission after the cancellations above (both curves are
     // gone, nothing is left to replace): reserves the new staircase
     // bound from scratch out of the released funds.
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{10, 10}, {20, 0}})));
+    BOOST_REQUIRE(st.SubmitCurve(ALICE, Side::BID, Pts({{10, 10}, {20, 0}})));
     BOOST_CHECK_EQUAL(ledger.Reserved(ALICE, Quote()), 190); // 10·(20−1)
     BOOST_CHECK(ledger.SolvencyHolds());
 }
@@ -328,21 +330,21 @@ BOOST_AUTO_TEST_CASE(partial_fill_reservations_release_exactly)
 //! bound could not honor.
 BOOST_AUTO_TEST_CASE(persistent_bid_survives_descending_price_fill_sequence)
 {
-    flowmesh::Ledger ledger{VAULT};
-    flowmesh::ClearingEngine eng{BaseX(), Quote()};
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger{st.ledger};
     // Bid staircase: (30−20)·19 + (20−10)·29 + (10−0)·39 = 870.
     // Old max-rectangle bound: max(30·20, 20·30, 10·40) = 600.
     BOOST_REQUIRE(ledger.Deposit(ALICE, Quote(), 870));
     BOOST_REQUIRE(ledger.Deposit(BOB, BaseX(), 63));
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, ALICE, Side::BID,
+    BOOST_REQUIRE(st.SubmitCurve(ALICE, Side::BID,
                                   Pts({{10, 30}, {20, 20}, {30, 10}, {40, 0}})));
     BOOST_CHECK_EQUAL(ledger.Reserved(ALICE, Quote()), 870);
 
     CAmount total_spend{0};
     const auto sell_slot{[&](const std::vector<Breakpoint>& ask, const CAmount want_price,
                              const CAmount want_volume) {
-        BOOST_REQUIRE(eng.SubmitCurve(ledger, BOB, Side::ASK, ask));
-        const auto result{*eng.ClearSlot(ledger)};
+        BOOST_REQUIRE(st.SubmitCurve(BOB, Side::ASK, ask));
+        const auto result{*st.ClearSlot()};
         BOOST_REQUIRE(result.cleared);
         BOOST_CHECK_EQUAL(result.price, want_price);
         BOOST_CHECK_EQUAL(result.volume, want_volume);
@@ -362,7 +364,7 @@ BOOST_AUTO_TEST_CASE(persistent_bid_survives_descending_price_fill_sequence)
     BOOST_CHECK_EQUAL(ledger.Available(ALICE, BaseX()), 30); // 30 lots bought
     // Bob: sold 30 of 63 base; cancel the partly-filled final ask —
     // exact remainder released.
-    BOOST_CHECK(eng.CancelCurve(ledger, BOB, Side::ASK));
+    BOOST_CHECK(st.CancelCurve(BOB, Side::ASK));
     BOOST_CHECK_EQUAL(ledger.Reserved(BOB, BaseX()), 0);
     BOOST_CHECK_EQUAL(ledger.Available(BOB, BaseX()), 33);
     BOOST_CHECK_EQUAL(ledger.Available(BOB, Quote()), 601);
@@ -375,30 +377,30 @@ BOOST_AUTO_TEST_CASE(persistent_bid_survives_descending_price_fill_sequence)
 //! curve is ever inserted.
 BOOST_AUTO_TEST_CASE(submit_curve_is_atomic)
 {
-    flowmesh::Ledger ledger{VAULT};
-    flowmesh::ClearingEngine eng{BaseX(), Quote()};
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger{st.ledger};
 
     // Failed FIRST submission (valid curve, unfunded account).
-    const uint256 empty_root{eng.StateRoot(ledger)};
-    BOOST_CHECK(!eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
-    BOOST_CHECK_EQUAL(eng.StateRoot(ledger).GetHex(), empty_root.GetHex()); // no ghost curve
-    BOOST_CHECK_EQUAL(eng.EffectiveQty(Side::BID, ALICE, 10), 0);
-    BOOST_CHECK(!eng.CancelCurve(ledger, ALICE, Side::BID)); // nothing to cancel
+    const uint256 empty_root{st.BookRoot()};
+    BOOST_CHECK(!st.SubmitCurve(ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
+    BOOST_CHECK_EQUAL(st.BookRoot().GetHex(), empty_root.GetHex()); // no ghost curve
+    BOOST_CHECK_EQUAL(st.EffectiveQty(Side::BID, ALICE, 10), 0);
+    BOOST_CHECK(!st.CancelCurve(ALICE, Side::BID)); // nothing to cancel
     BOOST_CHECK_EQUAL(ledger.Reserved(ALICE, Quote()), 0);
 
     // Failed REPLACEMENT preserves the previous curve entirely.
     BOOST_REQUIRE(ledger.Deposit(ALICE, Quote(), 300));
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{10, 10}, {20, 0}}))); // needs 190
-    const uint256 standing_root{eng.StateRoot(ledger)};
+    BOOST_REQUIRE(st.SubmitCurve(ALICE, Side::BID, Pts({{10, 10}, {20, 0}}))); // needs 190
+    const uint256 standing_root{st.BookRoot()};
     BOOST_CHECK_EQUAL(ledger.Reserved(ALICE, Quote()), 190);
     // Replacement needs 2300; only 110 more is available: rejected.
-    BOOST_CHECK(!eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
-    BOOST_CHECK_EQUAL(eng.StateRoot(ledger).GetHex(), standing_root.GetHex());
+    BOOST_CHECK(!st.SubmitCurve(ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
+    BOOST_CHECK_EQUAL(st.BookRoot().GetHex(), standing_root.GetHex());
     BOOST_CHECK_EQUAL(ledger.Reserved(ALICE, Quote()), 190);
-    BOOST_CHECK_EQUAL(eng.EffectiveQty(Side::BID, ALICE, 10), 10);
+    BOOST_CHECK_EQUAL(st.EffectiveQty(Side::BID, ALICE, 10), 10);
 
     // Successful replacement adjusts by the DELTA only.
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{10, 5}, {20, 0}}))); // needs 95
+    BOOST_REQUIRE(st.SubmitCurve(ALICE, Side::BID, Pts({{10, 5}, {20, 0}}))); // needs 95
     BOOST_CHECK_EQUAL(ledger.Reserved(ALICE, Quote()), 95);
     BOOST_CHECK_EQUAL(ledger.Available(ALICE, Quote()), 205);
 }
@@ -407,24 +409,24 @@ BOOST_AUTO_TEST_CASE(submit_curve_is_atomic)
 //! cannot add candidate prices or permanent book state for free.
 BOOST_AUTO_TEST_CASE(zero_demand_curves_are_rejected)
 {
-    flowmesh::Ledger ledger{VAULT};
-    flowmesh::ClearingEngine eng{BaseX(), Quote()};
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger{st.ledger};
     // Validity: a bid must OPEN positive (and still terminate at zero);
     // an ask must REACH positive.
-    BOOST_CHECK(!eng.CurveIsValid(Side::BID, Pts({{10, 0}})));
-    BOOST_CHECK(!eng.CurveIsValid(Side::BID, Pts({{10, 0}, {20, 0}})));
-    BOOST_CHECK(!eng.CurveIsValid(Side::ASK, Pts({{10, 0}})));
-    BOOST_CHECK(!eng.CurveIsValid(Side::ASK, Pts({{5, 0}, {10, 0}})));
-    BOOST_CHECK(eng.CurveIsValid(Side::BID, Pts({{10, 1}, {20, 0}})));
-    BOOST_CHECK(eng.CurveIsValid(Side::ASK, Pts({{5, 0}, {10, 1}})));
+    BOOST_CHECK(!st.CurveIsValid(Side::BID, Pts({{10, 0}})));
+    BOOST_CHECK(!st.CurveIsValid(Side::BID, Pts({{10, 0}, {20, 0}})));
+    BOOST_CHECK(!st.CurveIsValid(Side::ASK, Pts({{10, 0}})));
+    BOOST_CHECK(!st.CurveIsValid(Side::ASK, Pts({{5, 0}, {10, 0}})));
+    BOOST_CHECK(st.CurveIsValid(Side::BID, Pts({{10, 1}, {20, 0}})));
+    BOOST_CHECK(st.CurveIsValid(Side::ASK, Pts({{5, 0}, {10, 1}})));
 
     // A zero-balance account gets NOTHING into the book for free: the
     // state root — and with it the candidate-price set and per-slot scan
     // work — is untouched by its attempts.
-    const uint256 empty_root{eng.StateRoot(ledger)};
-    BOOST_CHECK(!eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{10, 0}})));
-    BOOST_CHECK(!eng.SubmitCurve(ledger, ALICE, Side::ASK, Pts({{999, 0}})));
-    BOOST_CHECK_EQUAL(eng.StateRoot(ledger).GetHex(), empty_root.GetHex());
+    const uint256 empty_root{st.BookRoot()};
+    BOOST_CHECK(!st.SubmitCurve(ALICE, Side::BID, Pts({{10, 0}})));
+    BOOST_CHECK(!st.SubmitCurve(ALICE, Side::ASK, Pts({{999, 0}})));
+    BOOST_CHECK_EQUAL(st.BookRoot().GetHex(), empty_root.GetHex());
     BOOST_CHECK(ledger.SolvencyHolds());
 }
 
@@ -453,21 +455,21 @@ BOOST_AUTO_TEST_CASE(curve_evaluation_extreme_inputs)
 //! reservation.
 BOOST_AUTO_TEST_CASE(replacement_after_partial_fill_without_cancel)
 {
-    flowmesh::Ledger ledger{VAULT};
-    flowmesh::ClearingEngine eng{BaseX(), Quote()};
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger{st.ledger};
     BOOST_REQUIRE(ledger.Deposit(ALICE, Quote(), 2400));
     BOOST_REQUIRE(ledger.Deposit(BOB, BaseX(), 80));
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, BOB, Side::ASK, Pts({{10, 20}, {20, 80}})));
-    const auto result{*eng.ClearSlot(ledger)}; // 40 @ 20: Alice spends 800
+    BOOST_REQUIRE(st.SubmitCurve(ALICE, Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
+    BOOST_REQUIRE(st.SubmitCurve(BOB, Side::ASK, Pts({{10, 20}, {20, 80}})));
+    const auto result{*st.ClearSlot()}; // 40 @ 20: Alice spends 800
     BOOST_REQUIRE(result.cleared);
     BOOST_CHECK_EQUAL(ledger.Reserved(ALICE, Quote()), 1500); // 2300 − 800
 
     // Direct replacement: new need 190, delta-release 1310.
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{10, 10}, {20, 0}})));
+    BOOST_REQUIRE(st.SubmitCurve(ALICE, Side::BID, Pts({{10, 10}, {20, 0}})));
     BOOST_CHECK_EQUAL(ledger.Reserved(ALICE, Quote()), 190);
     BOOST_CHECK_EQUAL(ledger.Available(ALICE, Quote()), 1410);
-    BOOST_CHECK_EQUAL(eng.EffectiveQty(Side::BID, ALICE, 10), 10); // filled reset
+    BOOST_CHECK_EQUAL(st.EffectiveQty(Side::BID, ALICE, 10), 10); // filled reset
     BOOST_CHECK(ledger.SolvencyHolds());
 }
 
@@ -485,33 +487,33 @@ BOOST_AUTO_TEST_CASE(state_root_is_canonically_framed)
 {
     // Pinned empty-book vector (clearing v2 embedding ledger v2).
     {
-        flowmesh::Ledger ledger{VAULT};
-        flowmesh::ClearingEngine eng{BaseX(), Quote()};
-        BOOST_CHECK_EQUAL(eng.StateRoot(ledger).GetHex(), EMPTY_BOOK_ROOT_HEX);
+        flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+        flowmesh::Ledger& ledger{st.ledger};
+        BOOST_CHECK_EQUAL(st.BookRoot().GetHex(), EMPTY_BOOK_ROOT_HEX);
     }
 
     // Two curve-book layouts over the same flattened breakpoint stream
     // (10,5),(20,5),(30,7), split [1|2] versus [2|1]. Ask reservations
     // are the terminal quantities (5 and 7) in BOTH layouts and deposits
     // match them exactly, so the two ledgers finish byte-identical.
-    flowmesh::Ledger ledger_x{VAULT};
-    flowmesh::ClearingEngine eng_x{BaseX(), Quote()};
+    flowmesh::FlowMeshState st_x{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger_x{st_x.ledger};
     BOOST_REQUIRE(ledger_x.Deposit(ALICE, BaseX(), 5));
     BOOST_REQUIRE(ledger_x.Deposit(BOB, BaseX(), 7));
-    BOOST_REQUIRE(eng_x.SubmitCurve(ledger_x, ALICE, Side::ASK, Pts({{10, 5}})));
-    BOOST_REQUIRE(eng_x.SubmitCurve(ledger_x, BOB, Side::ASK, Pts({{20, 5}, {30, 7}})));
+    BOOST_REQUIRE(st_x.SubmitCurve(ALICE, Side::ASK, Pts({{10, 5}})));
+    BOOST_REQUIRE(st_x.SubmitCurve(BOB, Side::ASK, Pts({{20, 5}, {30, 7}})));
 
-    flowmesh::Ledger ledger_y{VAULT};
-    flowmesh::ClearingEngine eng_y{BaseX(), Quote()};
+    flowmesh::FlowMeshState st_y{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger_y{st_y.ledger};
     BOOST_REQUIRE(ledger_y.Deposit(ALICE, BaseX(), 5));
     BOOST_REQUIRE(ledger_y.Deposit(BOB, BaseX(), 7));
-    BOOST_REQUIRE(eng_y.SubmitCurve(ledger_y, ALICE, Side::ASK, Pts({{10, 5}, {20, 5}})));
-    BOOST_REQUIRE(eng_y.SubmitCurve(ledger_y, BOB, Side::ASK, Pts({{30, 7}})));
+    BOOST_REQUIRE(st_y.SubmitCurve(ALICE, Side::ASK, Pts({{10, 5}, {20, 5}})));
+    BOOST_REQUIRE(st_y.SubmitCurve(BOB, Side::ASK, Pts({{30, 7}})));
 
     // The ledger halves of the commitment really are identical, so the
     // engine roots below can differ only through the curve-book framing.
     BOOST_REQUIRE_EQUAL(ledger_x.StateRoot().GetHex(), ledger_y.StateRoot().GetHex());
-    BOOST_CHECK(eng_x.StateRoot(ledger_x) != eng_y.StateRoot(ledger_y));
+    BOOST_CHECK(st_x.BookRoot() != st_y.BookRoot());
 
     // Byte-exact reconstruction of layout X's preimage. Curves iterate
     // in (side, account) map order: (ASK, ALICE), then (ASK, BOB).
@@ -529,8 +531,8 @@ BOOST_AUTO_TEST_CASE(state_root_is_canonically_framed)
         h << ledger_x.StateRoot();
         return h.GetHash();
     }};
-    BOOST_CHECK_EQUAL(reconstruct(true).GetHex(), eng_x.StateRoot(ledger_x).GetHex());
-    BOOST_CHECK(reconstruct(false) != eng_x.StateRoot(ledger_x));
+    BOOST_CHECK_EQUAL(reconstruct(true).GetHex(), st_x.BookRoot().GetHex());
+    BOOST_CHECK(reconstruct(false) != st_x.BookRoot());
 }
 
 //! Pass-3 fix: a ZERO uniform clearing price is a valid outcome (curve
@@ -543,20 +545,20 @@ BOOST_AUTO_TEST_CASE(state_root_is_canonically_framed)
 //! and the engine asserted only after that partial mutation.
 BOOST_AUTO_TEST_CASE(zero_price_clearing_settles_base_with_noop_quote_leg)
 {
-    flowmesh::Ledger ledger{VAULT};
-    flowmesh::ClearingEngine eng{BaseX(), Quote()};
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger{st.ledger};
     // A bid fillable ONLY at price 0 can spend nothing: its exact
     // integer-price reservation is ZERO — Alice needs no quote at all.
     BOOST_REQUIRE(ledger.Deposit(ALICE, Quote(), 10));
     BOOST_REQUIRE(ledger.Deposit(BOB, BaseX(), 10));
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, ALICE, Side::BID, Pts({{0, 10}, {1, 0}})));
-    BOOST_REQUIRE(eng.SubmitCurve(ledger, BOB, Side::ASK, Pts({{0, 10}})));
+    BOOST_REQUIRE(st.SubmitCurve(ALICE, Side::BID, Pts({{0, 10}, {1, 0}})));
+    BOOST_REQUIRE(st.SubmitCurve(BOB, Side::ASK, Pts({{0, 10}})));
     BOOST_CHECK_EQUAL(ledger.Reserved(ALICE, Quote()), 0);
     BOOST_CHECK_EQUAL(ledger.Reserved(BOB, BaseX()), 10);
 
     // The slot clears 10 lots at price 0 — no assertion, no partial
     // failure.
-    const auto result{*eng.ClearSlot(ledger)};
+    const auto result{*st.ClearSlot()};
     BOOST_REQUIRE(result.cleared);
     BOOST_CHECK_EQUAL(result.price, 0);
     BOOST_CHECK_EQUAL(result.volume, 10);
@@ -576,13 +578,51 @@ BOOST_AUTO_TEST_CASE(zero_price_clearing_settles_base_with_noop_quote_leg)
     BOOST_CHECK_EQUAL(ledger.Reserved(BOB, BaseX()), 0);
     // Both curves filled exactly to exhaustion: erased from the book,
     // reservations fully unwound.
-    BOOST_CHECK_EQUAL(eng.EffectiveQty(Side::BID, ALICE, 0), 0);
-    BOOST_CHECK_EQUAL(eng.EffectiveQty(Side::ASK, BOB, 0), 0);
-    BOOST_CHECK(!eng.CancelCurve(ledger, ALICE, Side::BID)); // nothing left to cancel
-    BOOST_CHECK(!eng.CancelCurve(ledger, BOB, Side::ASK));
+    BOOST_CHECK_EQUAL(st.EffectiveQty(Side::BID, ALICE, 0), 0);
+    BOOST_CHECK_EQUAL(st.EffectiveQty(Side::ASK, BOB, 0), 0);
+    BOOST_CHECK(!st.CancelCurve(ALICE, Side::BID)); // nothing left to cancel
+    BOOST_CHECK(!st.CancelCurve(BOB, Side::ASK));
     // Custody untouched by internal settlement; solvency holds.
     BOOST_CHECK_EQUAL(ledger.Custody(Quote()), 10);
     BOOST_CHECK_EQUAL(ledger.Custody(BaseX()), 10);
+    BOOST_CHECK(ledger.SolvencyHolds());
+}
+
+//! Codex re-audit item 3 regression: aggregate demand may exceed
+//! MAX_MONEY (it is computed EXACTLY, widened — never saturated in a
+//! way that changes semantics), and the advertised fills are always a
+//! fully rationed partition of the clearing volume. Two MAX_MONEY bids
+//! at price 0 against a single 1-lot ask must clear volume 1 with the
+//! bid fills summing to exactly 1 — never an un-rationed map — and
+//! settlement enforces sum(fills) == volume before any mutation.
+BOOST_AUTO_TEST_CASE(zero_price_two_bidder_allocation_is_exactly_rationed)
+{
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+    flowmesh::Ledger& ledger{st.ledger};
+    // Zero-price bids reserve zero quote; the ask reserves 1 base.
+    BOOST_REQUIRE(ledger.Deposit(ACC_C, BaseX(), 1));
+    BOOST_REQUIRE(st.SubmitCurve(ALICE, Side::BID, Pts({{0, MAX_MONEY}, {1, 0}})));
+    BOOST_REQUIRE(st.SubmitCurve(BOB, Side::BID, Pts({{0, MAX_MONEY}, {1, 0}})));
+    BOOST_REQUIRE(st.SubmitCurve(ACC_C, Side::ASK, Pts({{0, 1}})));
+
+    const auto result{st.ClearSlot()};
+    BOOST_REQUIRE(result.has_value()); // exact arithmetic: no fatal path
+    BOOST_REQUIRE(result->cleared);
+    BOOST_CHECK_EQUAL(result->price, 0);
+    BOOST_CHECK_EQUAL(result->volume, 1);
+    CAmount bid_sum{0};
+    for (const auto& [account, fill] : result->bid_fill) bid_sum += fill;
+    CAmount ask_sum{0};
+    for (const auto& [account, fill] : result->ask_fill) ask_sum += fill;
+    BOOST_CHECK_EQUAL(bid_sum, 1); // fully rationed: never sums past the volume
+    BOOST_CHECK_EQUAL(ask_sum, 1);
+    // Largest remainder on equal claims: the lowest-id account (ALICE
+    // ...a1 < BOB ...b1) receives the single lot.
+    BOOST_CHECK_EQUAL(result->bid_fill.at(ALICE), 1);
+    BOOST_CHECK_EQUAL(result->bid_fill.at(BOB), 0);
+    // The lot settled: base moved seller -> buyer, zero quote anywhere.
+    BOOST_CHECK_EQUAL(ledger.Available(ALICE, BaseX()), 1);
+    BOOST_CHECK_EQUAL(ledger.Available(ACC_C, Quote()), 0);
     BOOST_CHECK(ledger.SolvencyHolds());
 }
 

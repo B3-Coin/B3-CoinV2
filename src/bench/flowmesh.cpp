@@ -48,13 +48,6 @@ namespace {
 
 using Breakpoint = flowmesh::ClearingEngine::Breakpoint;
 
-//! Constant-true stub: see the honesty notes above.
-class PassAuth final : public flowmesh::ActionAuthenticator
-{
-public:
-    bool Authenticate(const flowmesh::Action&) const override { return true; }
-};
-
 flowmesh::AccountId Account(const uint32_t i)
 {
     return ArithToUint256(arith_uint256{i} + 1);
@@ -69,7 +62,6 @@ modern::AssetId Base()
 struct SlotBench {
     flowmesh::FlowMeshState state;
     flowmesh::Ledger& ledger;
-    PassAuth auth;
     flowmesh::BatchExecutor exec;
     const size_t n_accounts;
     const size_t k;
@@ -78,7 +70,7 @@ struct SlotBench {
     SlotBench(const size_t n, const size_t k_points, const bool cross)
         : state{uint256::ONE, Base(), modern::NativeAsset(), k_points},
           ledger{state.ledger},
-          exec{state, auth},
+          exec{state},
           n_accounts{n},
           k{k_points},
           crossing{cross}
@@ -143,7 +135,6 @@ struct SlotBench {
             action.type = static_cast<uint8_t>(bid ? flowmesh::ActionType::SUBMIT_BID
                                                    : flowmesh::ActionType::SUBMIT_ASK);
             action.curve = Curve(bid);
-            action.credential = {0x01};
             actions.push_back(std::move(action));
         }
         return *exec.ExecuteSlot(actions);
@@ -195,10 +186,10 @@ void RunRootBench(benchmark::Bench& bench, const size_t n_accounts)
         const std::vector<Breakpoint> curve{bid
             ? std::vector<Breakpoint>{{100, 50}, {200, 0}}
             : std::vector<Breakpoint>{{299, 0}, {300, 50}}}; // standing, never crossing
-        const bool ok{state.book.SubmitCurve(state.ledger, Account(i),
-                                             bid ? flowmesh::ClearingEngine::Side::BID
-                                                 : flowmesh::ClearingEngine::Side::ASK,
-                                             curve)};
+        const bool ok{state.SubmitCurve(Account(i),
+                                        bid ? flowmesh::ClearingEngine::Side::BID
+                                            : flowmesh::ClearingEngine::Side::ASK,
+                                        curve)};
         assert(ok);
         state.next_seq[Account(i)] = i + 1;
     }

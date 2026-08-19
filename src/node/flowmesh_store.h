@@ -16,34 +16,29 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 
 namespace node {
 
 //! Canonical commitment to the quorum configuration a log's
 //! certificates were verified against (sorted seats + threshold).
 //! Static for v1: seat ROTATION persistence is deliberately unsupported
-//! until the FN seat lifecycle (owner decision) exists — a log opened
-//! under a different quorum fails closed instead of re-judging history
-//! against the wrong seats.
+//! until the FN seat lifecycle (owner decision) exists.
 uint256 QuorumHash(const std::set<XOnlyPubKey>& seats, uint64_t threshold);
 
 /**
  * Durable FlowMesh certified log: the append-only sequence of finalized
- * (microblock, certificate) entries, a single marker (format version,
- * domain, quorum commitment, next sequence, last hash), the
+ * (microblock, certificate, evidence) entries, a single marker (format
+ * version, domain, quorum commitment, next sequence, last hash), the
  * safety-critical lock journal, and an optional certificate-verified
  * state snapshot. Every append commits the entry and the marker in ONE
  * atomic batch; every stored object decodes STRICTLY (exact
  * consumption, trailing bytes rejected) with bounds enforced before
  * allocation.
- *
- * The log IS the persistence model: state is reconstructed by
- * deterministic replay that re-executes and re-verifies every entry
- * (roots, parent linkage, certificates against the recorded quorum,
- * and B3 anchor canonicality when an anchor policy is supplied).
  */
 class FlowMeshStore
 {
@@ -66,87 +61,86 @@ public:
 
     explicit FlowMeshStore(DBParams db_params);
 
-    //! Marker when present and canonical; nullopt when truly missing.
-    //! A present-but-undecodable marker (wrong bytes, wrong version, or
-    //! trailing bytes) fails closed via `error`.
     bool ReadMarker(std::optional<Marker>& out, std::string& error);
 
-    //! Bind the store to `domain` under the given quorum configuration:
-    //! initialize an empty log's marker, or verify an existing log
-    //! matches domain, format AND quorum.
+    //! Bind the store to `domain` under the given quorum configuration.
     bool OpenForDomain(const uint256& domain, const std::set<XOnlyPubKey>& seats,
                        uint64_t threshold, std::string& error);
 
-    //! Append the next finalized entry. The entry's sequence must be
-    //! exactly the marker's next sequence and its parent hash the
-    //! marker's last hash — the log cannot skip, repeat or fork.
+    //! Append the next finalized entry (sequence and parent must extend
+    //! the stored tip exactly).
     [[nodiscard]] bool Append(const flowmesh::CertifiedEntry& entry, std::string& error);
 
     std::optional<flowmesh::CertifiedEntry> ReadEntry(uint64_t sequence);
 
     // ---- Safety-critical lock journal -----------------------------------
 
+    /**
+     * COMPARE-AND-SET, never overwrite: with no existing lock for
+     * `sequence` the hash is durably written; an identical existing
+     * lock is idempotent success; a DIFFERENT existing lock is refused
+     * (the caller must halt — a conflicting durable safety lock must
+     * never be replaced). Holds across restart.
+     */
     [[nodiscard]] bool WriteLock(uint64_t sequence, const uint256& microblock_hash);
     [[nodiscard]] bool ClearLocksThrough(uint64_t sequence);
-    //! All journaled locks (restart restore). Fails closed on any
-    //! undecodable journal entry.
+    //! All journaled locks (restart restore). Strictly validates the
+    //! full lock namespace and the iterator/database status.
     bool ReadLocks(std::map<uint64_t, uint256>& out, std::string& error);
 
     // ---- Reconstruction --------------------------------------------------
 
     /**
-     * Deterministic reconstruction from genesis: re-execute every stored
-     * entry in order, re-verifying certificates against
-     * `seats`/`threshold` (which must match the recorded quorum), parent
-     * linkage, every execution claim, and — when `anchors` is supplied —
-     * that every entry's B3 anchor is still canonical (an orphaned
-     * anchor fails the replay: certified history derived from it must
-     * not silently remain accepted).
+     * Deterministic reconstruction from genesis: re-verifies every
+     * entry's certificate (against the recorded quorum), parent
+     * linkage, admission evidence, execution claims, and — when
+     * `anchors` is supplied — B3 anchor canonicality. When
+     * `anchors_out` is non-null it receives every anchor the replayed
+     * history relies on (with its newest sequence), so a restarted node
+     * cannot forget the dependencies needed to detect a later B3 reorg.
      */
     bool Replay(flowmesh::FlowMeshState& state, uint256& last_hash,
                 const flowmesh::ActionAuthenticator& auth,
                 const flowmesh::DepositVerifier* deposits, const std::set<XOnlyPubKey>& seats,
-                uint64_t threshold, const flowmesh::AnchorPolicy* anchors, std::string& error);
+                uint64_t threshold, const flowmesh::AnchorPolicy* anchors, std::string& error,
+                std::map<std::pair<int32_t, uint256>, uint64_t>* anchors_out = nullptr);
 
-    /**
-     * Persist a snapshot of the state reached AFTER entries [0,
-     * upto_sequence). Fail-closed at write time: the snapshot's root
-     * must equal the CERTIFIED resulting_state_root of entry
-     * upto_sequence-1 already in this log.
-     */
+    //! Persist a snapshot of the state reached AFTER entries
+    //! [0, upto_sequence); fail-closed against the certified root.
     bool WriteSnapshot(uint64_t upto_sequence, const flowmesh::FlowMeshState& state,
                        std::string& error);
 
     /**
-     * Reconstruct via the stored snapshot when one is usable: strict
-     * bounded decode, certificate re-verification of the snapshot-tip
-     * entry against the recorded quorum, root equality with that
-     * CERTIFIED resulting root, anchor canonicality of the snapshot-tip
-     * entry (when `anchors` is supplied), then tail replay under the
-     * same rules. Any defect discards the snapshot and falls back to
-     * the full verified replay from genesis — a snapshot can never
-     * become authoritative merely because its root matches bytes stored
-     * beside it.
+     * Reconstruct via the stored snapshot when one is usable. The
+     * snapshot is validated against certified history INCLUDING the
+     * full skipped prefix's B3 dependencies: the prefix entries'
+     * parent-hash chain is walked up to the certificate-verified
+     * snapshot-tip entry (authenticating every prefix anchor without
+     * re-execution), and each prefix anchor must still be canonical.
+     * Any defect discards the snapshot and falls back to full verified
+     * replay. `anchors_out` as in Replay (prefix + tail).
      */
     bool ReplayFromBestSnapshot(flowmesh::FlowMeshState& state, uint256& last_hash,
                                 const flowmesh::ActionAuthenticator& auth,
                                 const flowmesh::DepositVerifier* deposits,
                                 const std::set<XOnlyPubKey>& seats, uint64_t threshold,
-                                const flowmesh::AnchorPolicy* anchors, std::string& error);
+                                const flowmesh::AnchorPolicy* anchors, std::string& error,
+                                std::map<std::pair<int32_t, uint256>, uint64_t>* anchors_out =
+                                    nullptr);
 
 private:
     bool ReplayRange(flowmesh::FlowMeshState& state, uint256& last_hash, uint64_t from_sequence,
                      const Marker& marker, const flowmesh::ActionAuthenticator& auth,
                      const flowmesh::DepositVerifier* deposits,
                      const std::set<XOnlyPubKey>& seats, uint64_t threshold,
-                     const flowmesh::AnchorPolicy* anchors, std::string& error);
+                     const flowmesh::AnchorPolicy* anchors, std::string& error,
+                     std::map<std::pair<int32_t, uint256>, uint64_t>* anchors_out);
 
     CDBWrapper m_db;
 };
 
-//! MeshNode -> store bridge with the mandatory ordering: OnCommit
-//! returns success only after the atomic durable append succeeded, so
-//! the node's live tip can never advance past its durable tip.
+//! MeshNode -> store bridge: OnCommit succeeds only after the atomic
+//! durable append succeeded.
 class StoreCommitSink final : public flowmesh::CommitSink
 {
 public:
@@ -169,7 +163,7 @@ private:
     std::optional<std::string> m_last_error;
 };
 
-//! Durable lock journal over the store (write-ahead of attestations).
+//! Durable compare-and-set lock journal over the store.
 class StoreLockJournal final : public flowmesh::LockJournal
 {
 public:
@@ -187,8 +181,7 @@ private:
     FlowMeshStore& m_store;
 };
 
-//! Serve certified history from the durable log (catch-up after
-//! restart, when in-memory history is gone).
+//! Serve certified history from the durable log.
 class StoreCatchupSource final : public flowmesh::CatchupSource
 {
 public:
@@ -201,6 +194,25 @@ public:
 private:
     FlowMeshStore& m_store;
 };
+
+/**
+ * THE production signing-validator lifecycle (Codex item 7): a node
+ * with a signing key must not become active until the store-backed
+ * startup restored ALL safety-critical state. This factory wires the
+ * durable sink, lock journal and catch-up source, reconstructs
+ * tip/state (snapshot-accelerated, fully verified), restores the
+ * journaled locks AND the committed-anchor dependency set, and only
+ * then constructs the node. Callers never pass restored state by hand.
+ */
+struct ValidatorRuntime {
+    std::unique_ptr<StoreCommitSink> sink;
+    std::unique_ptr<StoreLockJournal> journal;
+    std::unique_ptr<StoreCatchupSource> history;
+    std::unique_ptr<flowmesh::MeshNode> mesh_node;
+};
+
+bool StartValidator(FlowMeshStore& store, flowmesh::MeshNode::Config config,
+                    flowmesh::FlowMeshState genesis, ValidatorRuntime& out, std::string& error);
 
 } // namespace node
 
