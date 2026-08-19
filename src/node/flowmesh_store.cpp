@@ -61,25 +61,31 @@ struct SnapshotRecord {
     }
 };
 
-//! STRICT keyed read: the key must exist, decode to exactly the
-//! requested key type, and the value must consume its stored bytes
-//! exactly (trailing bytes are corruption, never ignored).
+//! STRICT keyed read with an explicit tri-state result: FOUND (exact
+//! key, value consumed exactly), NOT_FOUND (key genuinely absent), or
+//! ERROR (iterator/storage failure or an undecodable value). A storage
+//! error is NEVER interpreted as "key missing".
+enum class ReadResult : uint8_t { FOUND, NOT_FOUND, ERROR };
+
 template <typename K, typename V>
-bool ReadStrict(CDBWrapper& db, const K& key, V& value, bool& corrupt)
+ReadResult ReadStrict(CDBWrapper& db, const K& key, V& value)
 {
-    corrupt = false;
     std::unique_ptr<CDBIterator> it{db.NewIterator()};
     it->Seek(key);
-    if (!it->Valid()) return false;
-    K stored_key;
-    if (!it->GetKeyExact(stored_key)) return false; // different/longer key: not ours
-    if (!(stored_key == key)) return false;
-    if (!it->GetValueExact(value)) {
-        corrupt = true;
-        return false;
+    if (!it->Valid()) {
+        return it->StatusOK() ? ReadResult::NOT_FOUND : ReadResult::ERROR;
     }
-    return true;
+    K stored_key;
+    if (!it->GetKeyExact(stored_key) || !(stored_key == key)) {
+        return it->StatusOK() ? ReadResult::NOT_FOUND : ReadResult::ERROR;
+    }
+    if (!it->GetValueExact(value)) return ReadResult::ERROR;
+    return ReadResult::FOUND;
 }
+
+//! Hard cap on journaled locks (one per in-flight sequence; far above
+//! any real backlog, low enough to bound scans).
+constexpr size_t MAX_LOCK_JOURNAL_ENTRIES{4096};
 } // namespace
 
 uint256 QuorumHash(const std::set<XOnlyPubKey>& seats, const uint64_t threshold)
@@ -96,11 +102,18 @@ FlowMeshStore::FlowMeshStore(DBParams db_params) : m_db{std::move(db_params)} {}
 bool FlowMeshStore::ReadMarker(std::optional<Marker>& out, std::string& error)
 {
     out.reset();
-    if (!m_db.Exists(KEY_MARKER)) return true;
     Marker marker;
-    bool corrupt{false};
-    if (!ReadStrict(m_db, KEY_MARKER, marker, corrupt) || marker.version != FORMAT_VERSION) {
-        error = "flowmesh log marker is corrupt or from an unknown format";
+    switch (ReadStrict(m_db, KEY_MARKER, marker)) {
+    case ReadResult::NOT_FOUND:
+        return true; // genuinely absent
+    case ReadResult::ERROR:
+        error = "flowmesh log marker is corrupt or unreadable";
+        return false;
+    case ReadResult::FOUND:
+        break;
+    }
+    if (marker.version != FORMAT_VERSION) {
+        error = "flowmesh log marker is from an unknown format";
         return false;
     }
     out = marker;
@@ -118,6 +131,19 @@ bool FlowMeshStore::OpenForDomain(const uint256& domain, const std::set<XOnlyPub
     if (!ReadMarker(marker, error)) return false;
     const uint256 quorum{QuorumHash(seats, threshold)};
     if (!marker) {
+        // A missing marker means FRESH only when every FlowMesh
+        // namespace is empty — entries/locks/snapshots without a marker
+        // are inconsistent (torn or tampered) storage: fail closed.
+        std::unique_ptr<CDBIterator> it{m_db.NewIterator()};
+        it->SeekToFirst();
+        if (it->Valid()) {
+            error = "flowmesh storage has data but no marker: inconsistent or corrupt";
+            return false;
+        }
+        if (!it->StatusOK()) {
+            error = "flowmesh storage iterator failed while checking freshness";
+            return false;
+        }
         Marker fresh;
         fresh.domain = domain;
         fresh.quorum_hash = quorum;
@@ -175,21 +201,26 @@ bool FlowMeshStore::Append(const flowmesh::CertifiedEntry& entry, std::string& e
 std::optional<flowmesh::CertifiedEntry> FlowMeshStore::ReadEntry(const uint64_t sequence)
 {
     flowmesh::CertifiedEntry entry;
-    bool corrupt{false};
-    if (!ReadStrict(m_db, EntryKey(sequence), entry, corrupt)) return std::nullopt;
+    if (ReadStrict(m_db, EntryKey(sequence), entry) != ReadResult::FOUND) return std::nullopt;
     return entry;
 }
 
 bool FlowMeshStore::WriteLock(const uint64_t sequence, const uint256& microblock_hash)
 {
+    // SERIALIZED COMPARE-AND-SET: the read-check-write runs under one
+    // mutex so no concurrent caller can interleave, and a storage ERROR
+    // is refusal — never treated as "absent" and overwritten.
+    const std::lock_guard<std::mutex> guard{m_lock_mutex};
     try {
-        // COMPARE-AND-SET: never overwrite a conflicting durable lock.
         uint256 existing;
-        bool corrupt{false};
-        if (ReadStrict(m_db, LockKey(sequence), existing, corrupt)) {
+        switch (ReadStrict(m_db, LockKey(sequence), existing)) {
+        case ReadResult::FOUND:
             return existing == microblock_hash; // idempotent same; refuse different
+        case ReadResult::ERROR:
+            return false; // unreadable lock: refuse, never replace
+        case ReadResult::NOT_FOUND:
+            break;
         }
-        if (corrupt) return false; // undecodable lock: refuse, never replace
         CDBBatch batch{m_db};
         batch.Write(LockKey(sequence), microblock_hash);
         m_db.WriteBatch(batch, /*fSync=*/true);
@@ -201,6 +232,7 @@ bool FlowMeshStore::WriteLock(const uint64_t sequence, const uint256& microblock
 
 bool FlowMeshStore::ClearLocksThrough(const uint64_t sequence)
 {
+    const std::lock_guard<std::mutex> guard{m_lock_mutex};
     try {
         std::map<uint64_t, uint256> locks;
         std::string error;
@@ -231,6 +263,11 @@ bool FlowMeshStore::ReadLocks(std::map<uint64_t, uint256>& out, std::string& err
             return false;
         }
         out.emplace(key.second, hash);
+        if (out.size() > MAX_LOCK_JOURNAL_ENTRIES) {
+            error = "flowmesh lock journal exceeds its entry bound";
+            out.clear();
+            return false;
+        }
     }
     if (!it->StatusOK()) {
         error = "flowmesh lock journal iterator failed (I/O or checksum error)";
@@ -389,8 +426,8 @@ bool FlowMeshStore::ReplayFromBestSnapshot(
     // be (and is) revalidated without re-execution. A snapshot can
     // never hide state derived from a now-orphaned earlier anchor.
     SnapshotRecord stored;
-    bool corrupt{false};
-    if (ReadStrict(m_db, KEY_SNAPSHOT, stored, corrupt) && stored.upto_sequence > 0 &&
+    if (ReadStrict(m_db, KEY_SNAPSHOT, stored) == ReadResult::FOUND &&
+        stored.upto_sequence > 0 &&
         stored.upto_sequence <= marker->next_sequence) {
         const uint64_t upto{stored.upto_sequence};
         const std::optional<flowmesh::CertifiedEntry> tip_entry{ReadEntry(upto - 1)};
@@ -404,6 +441,15 @@ bool FlowMeshStore::ReplayFromBestSnapshot(
                             flowmesh::CertificateCheck::OK;
         }
         if (prefix_ok) {
+            // FULL prefix authentication (a valid tip certificate is
+            // NOT proof the skipped prefix was valid): exact
+            // parent-hash chain, EVERY prefix certificate against the
+            // recorded quorum (the log's historical seat context —
+            // rotation is unsupported pending the seat-lifecycle owner
+            // decision), EVERY admission-evidence set, and EVERY B3
+            // anchor dependency. Only re-EXECUTION is skipped — that is
+            // exactly what the certified resulting root at the tip
+            // attests.
             uint256 expect_parent{};
             for (uint64_t s{0}; prefix_ok && s < upto; ++s) {
                 const std::optional<flowmesh::CertifiedEntry> prefix{ReadEntry(s)};
@@ -413,6 +459,18 @@ bool FlowMeshStore::ReplayFromBestSnapshot(
                     break;
                 }
                 expect_parent = prefix->mb.GetHash();
+                if (prefix->cert.microblock_hash != expect_parent ||
+                    prefix->cert.sequence != s ||
+                    flowmesh::CheckCertificate(prefix->cert, marker->domain, seats,
+                                               threshold) !=
+                        flowmesh::CertificateCheck::OK) {
+                    prefix_ok = false;
+                    break;
+                }
+                if (!flowmesh::VerifyActionEvidence(prefix->mb, prefix->credentials, auth)) {
+                    prefix_ok = false;
+                    break;
+                }
                 if (anchors != nullptr && !anchors->StillCanonical(prefix->mb.anchor)) {
                     prefix_ok = false;
                     break;
@@ -481,8 +539,8 @@ bool StartValidator(FlowMeshStore& store, flowmesh::MeshNode::Config config,
     config.sink = out.sink.get();
     config.lock_journal = out.journal.get();
     config.history = out.history.get();
-    out.mesh_node = std::make_unique<flowmesh::MeshNode>(std::move(config), std::move(genesis),
-                                                         last_hash, locks, committed_anchors);
+    out.mesh_node = flowmesh::detail::SigningNodeFactory::Make(
+        std::move(config), std::move(genesis), last_hash, locks, committed_anchors);
     if (out.mesh_node->Halted()) {
         error = "flowmesh validator startup produced an invalid node configuration";
         return false;

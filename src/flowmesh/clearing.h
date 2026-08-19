@@ -279,7 +279,10 @@ public:
         s << m_base << m_quote << static_cast<uint64_t>(m_max_k);
         WriteCompactSize(s, m_curves.size());
         for (const auto& [key, curve] : m_curves) {
-            s << static_cast<uint8_t>(key.first) << key.second << curve;
+            s << static_cast<uint8_t>(key.first) << key.second;
+            WriteCompactSize(s, curve.points.size());
+            for (const Breakpoint& bp : curve.points) s << bp;
+            s << curve.filled << curve.reserved;
         }
     }
     template <typename Stream>
@@ -299,11 +302,24 @@ public:
         for (uint64_t i{0}; i < n; ++i) {
             uint8_t side;
             AccountId account;
-            Curve curve;
-            s >> side >> account >> curve;
+            s >> side >> account;
             if (side > static_cast<uint8_t>(Side::ASK)) {
                 throw std::ios_base::failure("flowmesh book snapshot has an invalid side");
             }
+            // Curve points: count validated against THIS market's bound
+            // BEFORE any allocation or element read.
+            Curve curve;
+            const uint64_t points{ReadCompactSize(s)};
+            if (points > m_max_k) {
+                throw std::ios_base::failure("flowmesh book snapshot curve too large");
+            }
+            curve.points.reserve(points);
+            for (uint64_t j{0}; j < points; ++j) {
+                Breakpoint bp;
+                s >> bp;
+                curve.points.push_back(bp);
+            }
+            s >> curve.filled >> curve.reserved;
             const std::pair<Side, AccountId> key{static_cast<Side>(side), account};
             if (!curves.empty() && !(std::prev(curves.end())->first < key)) {
                 throw std::ios_base::failure("flowmesh book snapshot keys not canonical");
@@ -328,8 +344,8 @@ private:
         std::vector<Breakpoint> points;
         CAmount filled{0};
         CAmount reserved{0};
-
-        SERIALIZE_METHODS(Curve, obj) { READWRITE(obj.points, obj.filled, obj.reserved); }
+        // No generic serializer on purpose: the book codec decodes
+        // points with a pre-allocation bound against m_max_k.
     };
 
     static CAmount FloorDiv128(const __int128 a, const __int128 b) // b > 0

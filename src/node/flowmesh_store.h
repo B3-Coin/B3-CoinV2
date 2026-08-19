@@ -15,6 +15,7 @@
 #include <uint256.h>
 
 #include <cstdint>
+#include <mutex>
 #include <map>
 #include <memory>
 #include <optional>
@@ -137,6 +138,11 @@ private:
                      std::map<std::pair<int32_t, uint256>, uint64_t>* anchors_out);
 
     CDBWrapper m_db;
+    //! Serializes lock-journal compare-and-set and clearing: the CAS
+    //! read-check-write must be atomic with respect to concurrent
+    //! callers in this process (LevelDB's LOCK file excludes other
+    //! processes).
+    std::mutex m_lock_mutex;
 };
 
 //! MeshNode -> store bridge: OnCommit succeeds only after the atomic

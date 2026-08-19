@@ -40,17 +40,29 @@ inline AccountId AccountForKey(const XOnlyPubKey& key)
     return h.GetHash();
 }
 
-inline uint256 ActionSignatureDigest(const uint256& domain, const Action& action)
+//! The signature digest binds the FlowMesh DOMAIN and the immutable
+//! MARKET/EXECUTION CONFIGURATION (vault, base, quote, curve bound —
+//! state.h ComputeExecutionConfigId) around the semantic action id
+//! (signer, sequence, type and all execution-relevant fields). An
+//! authorization therefore cannot be replayed or substituted into a
+//! different domain, market pair, vault or execution configuration.
+//! (v2: the execution-config id joined the preimage.)
+inline uint256 ActionSignatureDigest(const uint256& domain, const uint256& execution_config_id,
+                                     const Action& action)
 {
     HashWriter h;
-    h << std::string{"b3/flowmesh/action-sig/v1"} << domain << action.Id();
+    h << std::string{"b3/flowmesh/action-sig/v2"} << domain << execution_config_id
+      << action.Id();
     return h.GetHash();
 }
 
 class SchnorrActionAuthenticator final : public ActionAuthenticator
 {
 public:
-    explicit SchnorrActionAuthenticator(const uint256& domain) : m_domain{domain} {}
+    SchnorrActionAuthenticator(const uint256& domain, const uint256& execution_config_id)
+        : m_domain{domain}, m_config{execution_config_id}
+    {
+    }
 
     bool Authenticate(const Action& action) const override
     {
@@ -58,21 +70,24 @@ public:
         const XOnlyPubKey key{std::span<const unsigned char>{action.credential.data(), 32}};
         if (!key.IsFullyValid()) return false;
         if (AccountForKey(key) != action.signer) return false;
-        return key.VerifySchnorr(ActionSignatureDigest(m_domain, action),
+        return key.VerifySchnorr(ActionSignatureDigest(m_domain, m_config, action),
                                  std::span<const unsigned char>{action.credential.data() + 32, 64});
     }
 
 private:
     const uint256 m_domain;
+    const uint256 m_config;
 };
 
 //! Attach a valid credential to an action (wallet/tooling/tests).
-inline bool SignAction(const CKey& key, const uint256& domain, Action& action)
+inline bool SignAction(const CKey& key, const uint256& domain,
+                       const uint256& execution_config_id, Action& action)
 {
     const XOnlyPubKey xonly{key.GetPubKey()};
     if (AccountForKey(xonly) != action.signer) return false;
     std::array<unsigned char, 64> sig;
-    if (!key.SignSchnorr(ActionSignatureDigest(domain, action), sig, nullptr, uint256::ZERO)) {
+    if (!key.SignSchnorr(ActionSignatureDigest(domain, execution_config_id, action), sig,
+                         nullptr, uint256::ZERO)) {
         return false;
     }
     action.credential.assign(xonly.data(), xonly.data() + 32);

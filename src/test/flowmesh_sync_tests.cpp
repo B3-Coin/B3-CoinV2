@@ -27,8 +27,10 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <atomic>
 #include <map>
 #include <memory>
+#include <thread>
 #include <optional>
 #include <set>
 #include <vector>
@@ -51,6 +53,12 @@ using flowmesh::ProposalMsg;
 const uint256 VAULT{uint256{"00000000000000000000000000000000000000000000000000000000000000f1"}};
 const uint256 MESH_DOMAIN{
     uint256{"00000000000000000000000000000000000000000000000000000000000000dd"}};
+const uint256 MESH_CONFIG{flowmesh::ComputeExecutionConfigId(
+    uint256{"00000000000000000000000000000000000000000000000000000000000000f1"},
+    modern::IssuanceAssetId(COutPoint{
+        Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000011"}),
+        0}),
+    modern::NativeAsset(), 8)};
 
 modern::AssetId BaseX()
 {
@@ -159,7 +167,7 @@ struct MeshNet {
     std::set<XOnlyPubKey> seats;
     uint64_t threshold{0};
     std::unique_ptr<flowmesh::RoundRobinSchedule> schedule;
-    flowmesh::SchnorrActionAuthenticator auth{MESH_DOMAIN};
+    flowmesh::SchnorrActionAuthenticator auth{MESH_DOMAIN, MESH_CONFIG};
     FixedAnchors anchors;
     MapDeposits deposits;
     CKey alice_key{MakeKey(0xa1)};
@@ -205,6 +213,7 @@ struct MeshNet {
     {
         MeshNode::Config config;
         config.domain = MESH_DOMAIN;
+        config.market_config_id = MESH_CONFIG;
         config.seats = seats;
         config.threshold = threshold;
         config.schedule = schedule.get();
@@ -215,10 +224,17 @@ struct MeshNet {
         config.history = history;
         config.seat_key = std::move(seat_key);
         config.lock_journal = journal;
-        return std::make_unique<MeshNode>(
-            std::move(config),
-            state ? std::move(*state) : FlowMeshState{VAULT, BaseX(), Quote()}, last_hash,
-            locks);
+        FlowMeshState genesis{state ? std::move(*state)
+                                    : FlowMeshState{VAULT, BaseX(), Quote()}};
+        if (config.seat_key.has_value()) {
+            // TEST BRIDGE: unit tests construct signing nodes with
+            // in-memory sinks/journals; production signing nodes exist
+            // only via node::StartValidator.
+            return flowmesh::test_only::SigningBridge::UnsafeMake(std::move(config),
+                                                                  std::move(genesis),
+                                                                  last_hash, locks);
+        }
+        return std::make_unique<MeshNode>(std::move(config), std::move(genesis), last_hash);
     }
 
     size_t ProposerIndex(const uint64_t sequence, const uint32_t round) const
@@ -243,7 +259,7 @@ struct MeshNet {
                              : flowmesh::MakeLimitAskCurve(price, qty)};
         BOOST_REQUIRE(curve.has_value());
         a.curve = *curve;
-        BOOST_REQUIRE(flowmesh::SignAction(key, MESH_DOMAIN, a));
+        BOOST_REQUIRE(flowmesh::SignAction(key, MESH_DOMAIN, MESH_CONFIG, a));
         return a;
     }
 
@@ -309,7 +325,7 @@ BOOST_AUTO_TEST_CASE(three_nodes_certify_and_converge)
     withdraw.amount = 10;
     withdraw.destination =
         uint256{"00000000000000000000000000000000000000000000000000000000000000d1"};
-    BOOST_REQUIRE(flowmesh::SignAction(net.alice_key, MESH_DOMAIN, withdraw));
+    BOOST_REQUIRE(flowmesh::SignAction(net.alice_key, MESH_DOMAIN, MESH_CONFIG, withdraw));
     const CertifiedEntry e1{net.RunRound({withdraw})};
     BOOST_CHECK_EQUAL(e1.mb.sequence, 1U);
     BOOST_CHECK(e1.mb.parent_hash == e0.mb.GetHash());
@@ -320,12 +336,12 @@ BOOST_AUTO_TEST_CASE(three_nodes_certify_and_converge)
         BOOST_CHECK_EQUAL(node->State().Root().GetHex(), root.GetHex());
         BOOST_CHECK(node->Evidence().empty());
         BOOST_CHECK(!node->Halted());
-        BOOST_CHECK(node->State().ledger.SolvencyHolds());
+        BOOST_CHECK(node->State().LedgerView().SolvencyHolds());
     }
     BOOST_CHECK_EQUAL(net.observer->State().Root().GetHex(), root.GetHex());
 
-    BOOST_CHECK_EQUAL(net.nodes[0]->State().ledger.Available(net.bob, Quote()), 500'000);
-    BOOST_CHECK_EQUAL(net.nodes[0]->State().ledger.Available(net.alice, BaseX()), 0);
+    BOOST_CHECK_EQUAL(net.nodes[0]->State().LedgerView().Available(net.bob, Quote()), 500'000);
+    BOOST_CHECK_EQUAL(net.nodes[0]->State().LedgerView().Available(net.alice, BaseX()), 0);
 }
 
 BOOST_AUTO_TEST_CASE(commit_is_durable_before_live_and_storage_failure_halts)
@@ -394,6 +410,7 @@ BOOST_AUTO_TEST_CASE(signing_validators_require_full_durable_state)
     {
         MeshNode::Config config;
         config.domain = MESH_DOMAIN;
+        config.market_config_id = MESH_CONFIG;
         config.seats = net.seats;
         config.threshold = 0;
         config.schedule = net.schedule.get();
@@ -605,6 +622,7 @@ BOOST_AUTO_TEST_CASE(store_appends_replays_snapshots_and_survives_restart)
             DBParams{.path = store_path, .cache_bytes = size_t{1} << 20}};
         MeshNode::Config config;
         config.domain = MESH_DOMAIN;
+        config.market_config_id = MESH_CONFIG;
         config.seats = net.seats;
         config.threshold = net.threshold;
         config.schedule = net.schedule.get();
@@ -675,6 +693,7 @@ BOOST_AUTO_TEST_CASE(restart_cannot_sign_a_conflicting_candidate)
     node::FlowMeshStore reopened{DBParams{.path = store_path, .cache_bytes = size_t{1} << 20}};
     MeshNode::Config config;
     config.domain = MESH_DOMAIN;
+    config.market_config_id = MESH_CONFIG;
     config.seats = net.seats;
     config.threshold = net.threshold;
     config.schedule = net.schedule.get();
@@ -903,7 +922,247 @@ BOOST_AUTO_TEST_CASE(flowmesh_outage_never_stalls_b3)
     CreateAndProcessBlock({}, CScript{} << OP_TRUE);
     BOOST_CHECK_EQUAL(m_node.chainman->ActiveChain().Height(), height_before + 1);
     BOOST_CHECK_EQUAL(net.nodes[p0]->Sequence(), 0U);
-    BOOST_CHECK(net.nodes[p0]->State().ledger.SolvencyHolds());
+    BOOST_CHECK(net.nodes[p0]->State().LedgerView().SolvencyHolds());
+}
+
+BOOST_AUTO_TEST_CASE(public_construction_cannot_obtain_signing_capability)
+{
+    // Codex item 3: the public MeshNode constructor is observer-only —
+    // signing material is stripped and the instance is refused; no
+    // restore maps are accepted publicly. Signing nodes exist only via
+    // node::StartValidator (production) or the loud test bridge.
+    MeshNet net{3, 0};
+    MemJournal journal;
+    FailableSink sink;
+    MeshNode::Config config;
+    config.domain = MESH_DOMAIN;
+    config.market_config_id = MESH_CONFIG;
+    config.seats = net.seats;
+    config.threshold = net.threshold;
+    config.schedule = net.schedule.get();
+    config.auth = &net.auth;
+    config.anchors = &net.anchors;
+    config.sink = &sink;
+    config.seat_key = net.keys[0];
+    config.lock_journal = &journal;
+    MeshNode smuggled{std::move(config), FlowMeshState{VAULT, BaseX(), Quote()}};
+    BOOST_CHECK(smuggled.Halted());
+    BOOST_CHECK(smuggled.Halt() == MeshHalt::INVALID_CONFIG);
+    BOOST_CHECK(!smuggled.TryPropose().has_value());
+    // A config-id mismatch is likewise refused (wrong-market node).
+    MeshNode::Config wrong;
+    wrong.domain = MESH_DOMAIN;
+    wrong.market_config_id = uint256::ONE;
+    wrong.seats = net.seats;
+    wrong.threshold = net.threshold;
+    wrong.schedule = net.schedule.get();
+    wrong.auth = &net.auth;
+    wrong.anchors = &net.anchors;
+    const MeshNode mismatched{std::move(wrong), FlowMeshState{VAULT, BaseX(), Quote()}};
+    BOOST_CHECK(mismatched.Halt() == MeshHalt::INVALID_CONFIG);
+}
+
+BOOST_AUTO_TEST_CASE(store_freshness_cas_and_corruption_discipline)
+{
+    // Codex items 4/6 regressions.
+    MeshNet net{3, 0};
+    std::string error;
+    const fs::path path{m_args.GetDataDirBase() / "flowmesh_hardening"};
+
+    // (a) Missing marker with NONEMPTY namespaces is inconsistent
+    // storage, never "fresh".
+    {
+        CDBWrapper raw{DBParams{.path = path, .cache_bytes = size_t{1} << 20,
+                                .wipe_data = true}};
+        raw.Write(std::make_pair(uint8_t{'l'}, uint64_t{3}), uint256::ONE, /*fSync=*/true);
+    }
+    {
+        node::FlowMeshStore store{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        BOOST_CHECK(!store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+    }
+
+    // (b) Serialized conflicting CAS under concurrency: exactly one
+    // hash wins and persists; the loser is refused, never overwrites.
+    const uint256 h1{uint256::ONE};
+    const uint256 h2{uint256{"0000000000000000000000000000000000000000000000000000000000000002"}};
+    {
+        node::FlowMeshStore store{DBParams{.path = path, .cache_bytes = size_t{1} << 20,
+                                           .wipe_data = true}};
+        BOOST_REQUIRE(store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+        std::atomic<int> wins_h1{0}, wins_h2{0};
+        std::thread a{[&] {
+            for (int i{0}; i < 50; ++i) {
+                if (store.WriteLock(7, h1)) ++wins_h1;
+            }
+        }};
+        std::thread b{[&] {
+            for (int i{0}; i < 50; ++i) {
+                if (store.WriteLock(7, h2)) ++wins_h2;
+            }
+        }};
+        a.join();
+        b.join();
+        // One side won the slot; the other side never succeeded.
+        BOOST_CHECK((wins_h1 == 0) != (wins_h2 == 0));
+        std::map<uint64_t, uint256> locks;
+        BOOST_REQUIRE(store.ReadLocks(locks, error));
+        BOOST_REQUIRE_EQUAL(locks.size(), 1U);
+        BOOST_CHECK(locks.at(7) == (wins_h1 > 0 ? h1 : h2));
+    }
+
+    // (c) A storage ERROR is never "key missing": a lock slot holding
+    // undecodable bytes REFUSES a write instead of being overwritten,
+    // and the namespace scan reports corruption. A malformed short
+    // 'l'-prefixed key likewise fails the scan.
+    {
+        node::FlowMeshStore store{DBParams{.path = path, .cache_bytes = size_t{1} << 20,
+                                           .wipe_data = true}};
+        BOOST_REQUIRE(store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+        {
+            CDBWrapper raw{DBParams{.path = m_args.GetDataDirBase() / "flowmesh_raw",
+                                    .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+        }
+    }
+    {
+        // Corrupt lock VALUE (short bytes) written raw.
+        CDBWrapper raw{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        raw.Write(std::make_pair(uint8_t{'l'}, uint64_t{9}), uint8_t{0x42}, /*fSync=*/true);
+    }
+    {
+        node::FlowMeshStore store{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        BOOST_CHECK(!store.WriteLock(9, h1)); // ERROR != missing: refuse, never replace
+        std::map<uint64_t, uint256> locks;
+        BOOST_CHECK(!store.ReadLocks(locks, error)); // corrupt namespace reported
+    }
+}
+
+BOOST_AUTO_TEST_CASE(snapshot_rejects_invalid_historical_certificate_or_evidence)
+{
+    // Codex item 6: a valid TIP certificate is not proof of the skipped
+    // prefix. Corrupting entry 0's admission evidence (which leaves the
+    // microblock hash, parent chain AND its certificate fully valid)
+    // must reject the snapshot; the verified-replay fallback then also
+    // refuses, so reconstruction fails safe.
+    const fs::path store_path{m_args.GetDataDirBase() / "flowmesh_snapprefix"};
+    MeshNet net{3, 0};
+    std::string error;
+    auto store{std::make_unique<node::FlowMeshStore>(
+        DBParams{.path = store_path, .cache_bytes = size_t{1} << 20, .wipe_data = true})};
+    BOOST_REQUIRE(store->OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+    node::StoreCommitSink sink{*store};
+    node::StoreLockJournal journal{*store};
+    net.nodes[0] = net.MakeNode(net.keys[0], &sink, &journal);
+
+    // Entry 0 carries a SIGNED action (so it has evidence to corrupt).
+    net.RunRound({net.Deposit(Outpoint(0x0a, 0)),
+                  net.SignedOrder(net.alice_key, 0, true, 40'000, 2)});
+    const FlowMeshState mid_state{net.nodes[0]->State()};
+    net.RunRound({net.SignedOrder(net.alice_key, 1, true, 41'000, 2)});
+    BOOST_REQUIRE_MESSAGE(store->WriteSnapshot(2, net.nodes[0]->State(), error), error);
+    (void)mid_state;
+
+    // Corrupt entry 0's evidence in place (hash/cert unchanged). Close
+    // the store first: LevelDB holds an exclusive lock.
+    auto e0{store->ReadEntry(0)};
+    BOOST_REQUIRE(e0.has_value());
+    BOOST_REQUIRE(!e0->credentials.empty());
+    auto e0_evidence{*e0};
+    e0_evidence.credentials[0][40] ^= 0x01;
+    auto e0_cert{*e0};
+    e0_cert.cert.attestations[0].sig[7] ^= 0x01;
+    net.nodes[0] = net.MakeNode(std::nullopt); // detach sink/journal
+    store.reset();
+    {
+        CDBWrapper raw{DBParams{.path = store_path, .cache_bytes = size_t{1} << 20}};
+        raw.Write(std::make_pair(uint8_t{'e'}, uint64_t{0}), e0_evidence, /*fSync=*/true);
+    }
+    FlowMeshState state{VAULT, BaseX(), Quote()};
+    uint256 last_hash;
+    {
+        node::FlowMeshStore reopened{
+            DBParams{.path = store_path, .cache_bytes = size_t{1} << 20}};
+        BOOST_CHECK(!reopened.ReplayFromBestSnapshot(state, last_hash, net.auth, &net.deposits,
+                                                     net.seats, net.threshold, &net.anchors,
+                                                     error, nullptr));
+    }
+
+    // A corrupted historical CERTIFICATE is equally fatal.
+    {
+        CDBWrapper raw{DBParams{.path = store_path, .cache_bytes = size_t{1} << 20}};
+        raw.Write(std::make_pair(uint8_t{'e'}, uint64_t{0}), e0_cert, /*fSync=*/true);
+    }
+    {
+        node::FlowMeshStore reopened{
+            DBParams{.path = store_path, .cache_bytes = size_t{1} << 20}};
+        BOOST_CHECK(!reopened.ReplayFromBestSnapshot(state, last_hash, net.auth, &net.deposits,
+                                                     net.seats, net.threshold, &net.anchors,
+                                                     error, nullptr));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(known_split_lock_case_safely_does_not_finalize)
+{
+    // Codex item 8: k=4, f=1, t=3; honest locks split 2/1 and the
+    // Byzantine seat withholds. NO certificate may form (safety), the
+    // honest nodes neither halt nor equivocate, and B3 continues. No
+    // unlock rule exists — resolving this is an OWNER DECISION.
+    MeshNet net{4, 1}; // t = 3
+    const size_t p0{net.ProposerIndex(0, 0)};
+    const size_t p1{net.ProposerIndex(0, 1)};
+    std::vector<size_t> honest;
+    for (size_t i{0}; i < net.nodes.size(); ++i) {
+        if (i != p0) honest.push_back(i); // p0 plays the withholding Byzantine seat
+    }
+
+    // Round 0: candidate A reaches two honest seats, which lock on it.
+    BOOST_REQUIRE(net.nodes[p0]->SubmitAction(net.Deposit(Outpoint(0x0a, 0))));
+    const auto proposal_a{net.nodes[p0]->TryPropose()};
+    BOOST_REQUIRE(proposal_a.has_value());
+    std::vector<AttestationMsg> atts;
+    size_t locked_a{0};
+    for (const size_t i : honest) {
+        if (locked_a == 2) break;
+        if (const auto att{net.nodes[i]->HandleProposal(*proposal_a)}) {
+            atts.push_back(*att);
+            ++locked_a;
+        }
+    }
+    BOOST_REQUIRE_EQUAL(locked_a, 2U);
+
+    // Round 1: a different candidate B locks the remaining honest seat.
+    for (const size_t i : honest) net.nodes[i]->NoteTimeout();
+    size_t p1_honest{p1};
+    if (p1 == p0) p1_honest = honest[0]; // ensure an honest round-1 proposer path
+    MemJournal j2;
+    FailableSink s2;
+    auto round1_proposer{net.MakeNode(net.keys[net.ProposerIndex(0, 1)], &s2, &j2)};
+    round1_proposer->NoteTimeout();
+    const auto proposal_b{round1_proposer->TryPropose()};
+    BOOST_REQUIRE(proposal_b.has_value());
+    BOOST_CHECK(proposal_b->mb.GetHash() != proposal_a->mb.GetHash());
+    for (const size_t i : honest) {
+        if (const auto att{net.nodes[i]->HandleProposal(*proposal_b)}) atts.push_back(*att);
+    }
+    (void)p1_honest;
+
+    // Deliver every attestation everywhere: with locks split 2/1 and
+    // the Byzantine seat silent, neither hash can reach t = 3.
+    std::vector<CertifiedEntry> certificates;
+    for (const AttestationMsg& att : atts) {
+        for (auto& node : net.nodes) {
+            if (const auto e{node->HandleAttestation(att)}) certificates.push_back(*e);
+        }
+    }
+    BOOST_CHECK(certificates.empty()); // SAFE non-finalization
+    for (const size_t i : honest) {
+        BOOST_CHECK_EQUAL(net.nodes[i]->Sequence(), 0U);
+        BOOST_CHECK(!net.nodes[i]->Halted());       // stalled, not broken
+        BOOST_CHECK(net.nodes[i]->Evidence().empty()); // honest split != equivocation
+    }
+    // B3 continues regardless.
+    const int height_before{m_node.chainman->ActiveChain().Height()};
+    CreateAndProcessBlock({}, CScript{} << OP_TRUE);
+    BOOST_CHECK_EQUAL(m_node.chainman->ActiveChain().Height(), height_before + 1);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

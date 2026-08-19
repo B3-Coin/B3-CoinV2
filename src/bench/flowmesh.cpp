@@ -61,7 +61,7 @@ modern::AssetId Base()
 
 struct SlotBench {
     flowmesh::FlowMeshState state;
-    flowmesh::Ledger& ledger;
+    const flowmesh::Ledger& ledger;
     flowmesh::BatchExecutor exec;
     const size_t n_accounts;
     const size_t k;
@@ -69,7 +69,7 @@ struct SlotBench {
 
     SlotBench(const size_t n, const size_t k_points, const bool cross)
         : state{uint256::ONE, Base(), modern::NativeAsset(), k_points},
-          ledger{state.ledger},
+          ledger{state.LedgerView()},
           exec{state},
           n_accounts{n},
           k{k_points},
@@ -77,8 +77,8 @@ struct SlotBench {
     {
         assert(n_accounts % 2 == 0);
         for (uint32_t i{0}; i < n_accounts; ++i) {
-            ledger.Deposit(Account(i), modern::NativeAsset(), CAmount{1} << 40);
-            ledger.Deposit(Account(i), Base(), CAmount{1} << 40);
+            state.Deposit(Account(i), modern::NativeAsset(), CAmount{1} << 40);
+            state.Deposit(Account(i), Base(), CAmount{1} << 40);
         }
     }
 
@@ -180,8 +180,8 @@ void RunRootBench(benchmark::Bench& bench, const size_t n_accounts)
 {
     flowmesh::FlowMeshState state{uint256::ONE, Base(), modern::NativeAsset()};
     for (uint32_t i{0}; i < n_accounts; ++i) {
-        state.ledger.Deposit(Account(i), modern::NativeAsset(), CAmount{1} << 40);
-        state.ledger.Deposit(Account(i), Base(), CAmount{1} << 40);
+        state.Deposit(Account(i), modern::NativeAsset(), CAmount{1} << 40);
+        state.Deposit(Account(i), Base(), CAmount{1} << 40);
         const bool bid{i % 2 == 0};
         const std::vector<Breakpoint> curve{bid
             ? std::vector<Breakpoint>{{100, 50}, {200, 0}}
@@ -193,7 +193,7 @@ void RunRootBench(benchmark::Bench& bench, const size_t n_accounts)
         assert(ok);
         state.next_seq[Account(i)] = i + 1;
     }
-    assert(state.ledger.SolvencyHolds());
+    assert(state.LedgerView().SolvencyHolds());
     bench.unit("root").run([&] {
         const uint256 root{state.Root()};
         ankerl::nanobench::doNotOptimizeAway(root);

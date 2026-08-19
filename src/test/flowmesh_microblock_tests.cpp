@@ -56,6 +56,12 @@ using flowmesh::MicroblockCore;
 const uint256 VAULT{uint256{"00000000000000000000000000000000000000000000000000000000000000f1"}};
 const uint256 MESH_DOMAIN{
     uint256{"00000000000000000000000000000000000000000000000000000000000000dd"}};
+const uint256 MESH_CONFIG{flowmesh::ComputeExecutionConfigId(
+    uint256{"00000000000000000000000000000000000000000000000000000000000000f1"},
+    modern::IssuanceAssetId(COutPoint{
+        Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000011"}),
+        0}),
+    modern::NativeAsset(), 8)};
 const uint256 OTHER_DOMAIN{
     uint256{"00000000000000000000000000000000000000000000000000000000000000de"}};
 
@@ -120,7 +126,7 @@ Action LimitOrder(const uint256& domain, const CKey& key, const uint64_t seq, co
                          : flowmesh::MakeLimitAskCurve(price, qty)};
     BOOST_REQUIRE(curve.has_value());
     a.curve = *curve;
-    BOOST_REQUIRE(flowmesh::SignAction(key, domain, a));
+    BOOST_REQUIRE(flowmesh::SignAction(key, domain, MESH_CONFIG, a));
     return a;
 }
 
@@ -129,7 +135,7 @@ struct Net {
     CKey bob_key{MakeKey(0xb2)};
     flowmesh::AccountId alice{flowmesh::AccountForKey(Xonly(alice_key))};
     flowmesh::AccountId bob{flowmesh::AccountForKey(Xonly(bob_key))};
-    flowmesh::SchnorrActionAuthenticator auth{MESH_DOMAIN};
+    flowmesh::SchnorrActionAuthenticator auth{MESH_DOMAIN, MESH_CONFIG};
     MapDeposits deposits;
     AnchorRef anchor{100, uint256{"00000000000000000000000000000000000000000000000000000000000000aa"}};
     FlowMeshState state{VAULT, BaseX(), Quote()};
@@ -178,10 +184,10 @@ BOOST_AUTO_TEST_CASE(limit_intents_clear_on_the_curve_economics)
     BOOST_CHECK_EQUAL(result.clearing.price, 50'000);
     BOOST_CHECK_EQUAL(result.clearing.volume, 10);
     BOOST_CHECK_EQUAL(result.applied.size(), 4U);
-    BOOST_CHECK_EQUAL(next.ledger.Available(net.alice, BaseX()), 10);
-    BOOST_CHECK_EQUAL(next.ledger.Available(net.bob, Quote()), 500'000);
-    BOOST_CHECK_EQUAL(next.ledger.Available(net.alice, Quote()), 100'000); // 600k - 10*50k
-    BOOST_CHECK(next.ledger.SolvencyHolds());
+    BOOST_CHECK_EQUAL(next.LedgerView().Available(net.alice, BaseX()), 10);
+    BOOST_CHECK_EQUAL(next.LedgerView().Available(net.bob, Quote()), 500'000);
+    BOOST_CHECK_EQUAL(next.LedgerView().Available(net.alice, Quote()), 100'000); // 600k - 10*50k
+    BOOST_CHECK(next.LedgerView().SolvencyHolds());
 
     // The admitted evidence authenticates the body — and an independent
     // replica re-executes to the same state, root and result commitment.
@@ -213,9 +219,9 @@ BOOST_AUTO_TEST_CASE(buy_funded_with_exactly_the_notional_is_accepted)
                     next, result);
     BOOST_CHECK_EQUAL(result.applied.size(), 2U);
     BOOST_CHECK_EQUAL(result.rejected.size(), 0U);
-    BOOST_CHECK_EQUAL(next.ledger.Reserved(net.alice, Quote()), 500'000);
-    BOOST_CHECK_EQUAL(next.ledger.Available(net.alice, Quote()), 0);
-    BOOST_CHECK(next.ledger.SolvencyHolds());
+    BOOST_CHECK_EQUAL(next.LedgerView().Reserved(net.alice, Quote()), 500'000);
+    BOOST_CHECK_EQUAL(next.LedgerView().Available(net.alice, Quote()), 0);
+    BOOST_CHECK(next.LedgerView().SolvencyHolds());
 }
 
 BOOST_AUTO_TEST_CASE(microblock_identity_is_semantic_and_permutation_independent)
@@ -321,7 +327,7 @@ BOOST_AUTO_TEST_CASE(evidence_lives_outside_identity_and_must_authenticate)
     dangling.push_back({0x01});
     BOOST_CHECK(!flowmesh::VerifyActionEvidence(built.mb, dangling, net.auth));
     // Wrong-domain evidence fails (replay across domains).
-    const flowmesh::SchnorrActionAuthenticator other{OTHER_DOMAIN};
+    const flowmesh::SchnorrActionAuthenticator other{OTHER_DOMAIN, MESH_CONFIG};
     BOOST_CHECK(!flowmesh::VerifyActionEvidence(built.mb, built.credentials, other));
 }
 
@@ -359,7 +365,7 @@ BOOST_AUTO_TEST_CASE(state_root_excludes_execution_metadata)
     // an unrelated no-op rejection rode along; only the
     // ExecutionResultCommitment may differ.
     Net net;
-    net.state.ledger.Deposit(net.alice, Quote(), 600'000);
+    net.state.Deposit(net.alice, Quote(), 600'000);
     const std::vector<Action> valid{LimitOrder(MESH_DOMAIN, net.alice_key, 0, true, 50'000, 4)};
 
     // A wrong-sequence action: recorded as BAD_SEQUENCE (metadata only),
@@ -470,13 +476,13 @@ BOOST_AUTO_TEST_CASE(deposits_come_from_the_chain_and_consume_once)
     const auto first{exec.ExecuteSlot({Deposit(Outpoint(0x0a, 0))}, net.anchor)};
     BOOST_REQUIRE(first.has_value());
     BOOST_REQUIRE_EQUAL(first->applied.size(), 1U);
-    BOOST_CHECK_EQUAL(net.state.ledger.Available(net.alice, Quote()), 600'000);
+    BOOST_CHECK_EQUAL(net.state.LedgerView().Available(net.alice, Quote()), 600'000);
     const auto second{exec.ExecuteSlot({Deposit(Outpoint(0x0a, 0))}, net.anchor)};
     BOOST_REQUIRE(second.has_value());
     BOOST_REQUIRE_EQUAL(second->applied.size(), 0U);
     BOOST_REQUIRE_EQUAL(second->rejected.size(), 1U);
-    BOOST_CHECK_EQUAL(net.state.ledger.Available(net.alice, Quote()), 600'000);
-    BOOST_CHECK(net.state.ledger.SolvencyHolds());
+    BOOST_CHECK_EQUAL(net.state.LedgerView().Available(net.alice, Quote()), 600'000);
+    BOOST_CHECK(net.state.LedgerView().SolvencyHolds());
 }
 
 BOOST_AUTO_TEST_CASE(schnorr_credentials_bind_signer_and_domain)
@@ -495,7 +501,7 @@ BOOST_AUTO_TEST_CASE(schnorr_credentials_bind_signer_and_domain)
     {
         Action tmp{good};
         tmp.signer = flowmesh::AccountForKey(Xonly(net.bob_key));
-        BOOST_REQUIRE(flowmesh::SignAction(net.bob_key, MESH_DOMAIN, tmp));
+        BOOST_REQUIRE(flowmesh::SignAction(net.bob_key, MESH_DOMAIN, MESH_CONFIG, tmp));
         stolen.credential = tmp.credential;
     }
     BOOST_CHECK(!net.auth.Authenticate(stolen));
@@ -503,7 +509,7 @@ BOOST_AUTO_TEST_CASE(schnorr_credentials_bind_signer_and_domain)
     Action truncated{good};
     truncated.credential.resize(95);
     BOOST_CHECK(!net.auth.Authenticate(truncated));
-    const flowmesh::SchnorrActionAuthenticator other_domain{OTHER_DOMAIN};
+    const flowmesh::SchnorrActionAuthenticator other_domain{OTHER_DOMAIN, MESH_CONFIG};
     BOOST_CHECK(!other_domain.Authenticate(good));
 }
 
@@ -710,6 +716,42 @@ BOOST_AUTO_TEST_CASE(canonical_serialization_round_trips_strictly)
     BOOST_CHECK(decoded_entry.credentials == built.credentials);
     BOOST_CHECK(flowmesh::VerifyActionEvidence(decoded_entry.mb, decoded_entry.credentials,
                                                net.auth));
+}
+
+BOOST_AUTO_TEST_CASE(authorization_is_bound_to_the_execution_configuration)
+{
+    // Codex item 1: an authorization signed for market/config A must be
+    // rejected under market/config B — cross-market replay and
+    // substitution are impossible — and a foreign configuration's
+    // candidate is refused structurally (different state roots).
+    Net net; // market A: VAULT / BaseX / native quote
+    const modern::AssetId other_quote{modern::IssuanceAssetId(COutPoint{
+        Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000022"}),
+        0})};
+    const uint256 config_b{flowmesh::ComputeExecutionConfigId(VAULT, BaseX(), other_quote, 8)};
+    BOOST_CHECK(config_b != MESH_CONFIG);
+    BOOST_CHECK(net.state.ConfigId() == MESH_CONFIG);
+
+    const Action a_action{LimitOrder(MESH_DOMAIN, net.alice_key, 0, true, 50'000, 4)};
+    const flowmesh::SchnorrActionAuthenticator auth_b{MESH_DOMAIN, config_b};
+    BOOST_CHECK(net.auth.Authenticate(a_action));  // valid in its own market
+    BOOST_CHECK(!auth_b.Authenticate(a_action));   // dead in any other market
+
+    net.state.Deposit(net.alice, Quote(), 600'000);
+    FlowMeshState next{net.state};
+    BatchResult result;
+    const Built built{MustBuild(net, {a_action}, next, result)};
+    BOOST_CHECK(flowmesh::VerifyActionEvidence(built.mb, built.credentials, net.auth));
+    BOOST_CHECK(!flowmesh::VerifyActionEvidence(built.mb, built.credentials, auth_b));
+
+    // A different-config state refuses the candidate before execution:
+    // the config lives in the state roots.
+    FlowMeshState state_b{VAULT, BaseX(), other_quote};
+    BOOST_CHECK(state_b.ConfigId() == config_b);
+    FlowMeshState out{state_b};
+    BatchResult out_result;
+    BOOST_CHECK(flowmesh::ExecuteCandidate(state_b, MESH_DOMAIN, uint256{}, built.mb, nullptr,
+                                           out, out_result) == CandidateError::PREV_ROOT);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

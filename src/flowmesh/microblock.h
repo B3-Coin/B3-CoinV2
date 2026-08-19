@@ -22,9 +22,11 @@ namespace flowmesh {
 
 /**
  * FlowMesh microblock: one entry of the certified deterministic
- * execution log. NOT a blockchain block — there is no fork choice and no
- * chain weight; finality is a certificate (certificate.h) over this
- * structure's hash, and the certified log IS the history.
+ * execution log. NOT a blockchain block — there is no fork choice and
+ * no chain weight. A threshold certificate over this structure's hash
+ * triggers the PROVISIONAL commit model; whether a certificate is
+ * irreversible FlowMesh finality is an unresolved OWNER DECISION, and
+ * the layer stays activation-unwired either way.
  *
  * IDENTITY IS EXECUTION CONTENT ONLY. The microblock commits exactly
  * what deterministic execution consumes: domain, position, anchor,

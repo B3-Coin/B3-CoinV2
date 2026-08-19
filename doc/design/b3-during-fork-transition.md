@@ -322,6 +322,11 @@ rewards, slashing, unbonding).
 ## 13. Destination unchanged
 
 After modern PoS: asset registry → bridge → TEST_USDT → FlowMesh → spot DEX
-→ USDT/USDC fees → isolated leverage ≤10× → PnL/liquidation →
-deterministic epochs → microblocks → real bridges → FN system. The corridor
-must not couple to or redesign any of these.
+→ USDT/USDC fees → futures (only "supported, max leverage 10×" is locked;
+margin mode, funding, liquidation and every other mechanic are OPEN owner
+decisions) → microblocks → real bridges → FN system. (This roadmap line
+originally read "isolated leverage ≤10× → PnL/liquidation → deterministic
+epochs"; corrected 2026-08-20 per the Codex directive — no futures
+mechanics beyond the 10× cap are approved, and microblocks, not epochs,
+are the execution unit.) The corridor must not couple to or redesign any
+of these.

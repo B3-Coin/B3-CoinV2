@@ -31,12 +31,13 @@ inline constexpr uint64_t STATE_SNAPSHOT_MAX_DEPOSITS{uint64_t{1} << 22};
  * the consumed-deposit set. Candidate microblock execution copies a
  * state, applies to the copy, and commits by replacement (MB-0).
  *
- * OWNERSHIP IS STRUCTURAL: the book is a PRIVATE member and every
- * book-mutating operation (submit/cancel/clear) exists ONLY as a
- * FlowMeshState method that pairs the book with THIS state's ledger.
- * The engine's ledger-taking mutators are private to the engine with
- * FlowMeshState as their sole friend caller, so no code path can
- * combine book/state A with ledger B.
+ * OWNERSHIP IS STRUCTURAL: the LEDGER and the BOOK are both PRIVATE
+ * members. Every mutation exists only as a FlowMeshState method that
+ * pairs the book with THIS state's ledger, the engine's ledger-taking
+ * mutators are private with FlowMeshState their sole friend caller,
+ * and outside code sees the ledger only through the read-only
+ * LedgerView(). No code path can combine order/curve state A with
+ * ledger B.
  *
  * consumed_deposits: provisional model state.
  * OWNER DECISION REQUIRED — retain or defer consumed-deposit state, and
@@ -46,10 +47,22 @@ inline constexpr uint64_t STATE_SNAPSHOT_MAX_DEPOSITS{uint64_t{1} << 22};
  * Root() is the PURE state commitment: a function of state only (the
  * separate ExecutionResultCommitment carries execution metadata).
  */
+//! Canonical id of one immutable market/execution configuration: the
+//! vault commitment, market pair and curve bound. Actions and evidence
+//! are authorized AGAINST a configuration (auth.h binds this id into
+//! the signature digest), so authorization can never be replayed into a
+//! different market or execution setup.
+inline uint256 ComputeExecutionConfigId(const uint256& vault_commitment, const AssetId& base,
+                                        const AssetId& quote, const uint64_t max_k)
+{
+    HashWriter h;
+    h << std::string{"b3/flowmesh/execconfig/v1"} << vault_commitment << base << quote << max_k;
+    return h.GetHash();
+}
+
 class FlowMeshState
 {
 public:
-    Ledger ledger;
     //! Per-signer next expected sequence (nonce) for signed actions.
     std::map<AccountId, uint64_t> next_seq;
     //! B3 outpoints already consumed as deposits (see the owner-decision
@@ -58,8 +71,27 @@ public:
 
     FlowMeshState(const uint256& vault_commitment, const AssetId& base, const AssetId& quote,
                   size_t max_k = 8)
-        : ledger{vault_commitment}, book{base, quote, max_k}
+        : ledger{vault_commitment}, book{base, quote, max_k},
+          config_id{ComputeExecutionConfigId(vault_commitment, base, quote, max_k)}
     {
+    }
+
+    //! The immutable market/execution configuration this state runs
+    //! under. Authorization is bound to it; a foreign configuration's
+    //! actions/evidence must be rejected by the authorizing layer.
+    const uint256& ConfigId() const { return config_id; }
+
+    //! READ-ONLY view of the authoritative ledger. The Ledger instance
+    //! itself is private: every mutation goes through a state-owned
+    //! method, so order/curve state can never be combined with a
+    //! different Ledger through the production API.
+    const Ledger& LedgerView() const { return ledger; }
+
+    //! Fund an account directly (tests/tooling; production custody goes
+    //! through CreditDeposit behind the DepositVerifier).
+    bool Deposit(const AccountId& account, const AssetId& asset, const CAmount amount)
+    {
+        return ledger.Deposit(account, asset, amount);
     }
 
     uint64_t NextSequence(const AccountId& signer) const
@@ -198,7 +230,9 @@ public:
     }
 
 private:
+    Ledger ledger;
     ClearingEngine book;
+    uint256 config_id;
 };
 
 } // namespace flowmesh

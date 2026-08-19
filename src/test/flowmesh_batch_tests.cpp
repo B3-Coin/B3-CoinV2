@@ -88,12 +88,12 @@ Action Withdraw(const flowmesh::AccountId& signer, uint64_t seq, const modern::A
 
 struct Fixture {
     flowmesh::FlowMeshState state{VAULT, BaseX(), Quote()};
-    flowmesh::Ledger& ledger{state.ledger};
+    const flowmesh::Ledger& ledger{state.LedgerView()};
     flowmesh::BatchExecutor exec{state};
     Fixture()
     {
-        ledger.Deposit(ALICE, Quote(), 2400); // covers the standard bid's 2300 bound
-        ledger.Deposit(BOB, BaseX(), 80);
+        state.Deposit(ALICE, Quote(), 2400); // covers the standard bid's 2300 bound
+        state.Deposit(BOB, BaseX(), 80);
     }
 };
 
@@ -184,7 +184,7 @@ BOOST_AUTO_TEST_CASE(withdrawals_create_one_time_receipts_committed_by_root)
 {
     Fixture f;
     // ALICE deposits more native and withdraws twice in one slot.
-    f.ledger.Deposit(ALICE, Quote(), 1000);
+    f.state.Deposit(ALICE, Quote(), 1000);
     const auto result{*f.exec.ExecuteSlot({
         Withdraw(ALICE, 0, Quote(), 300, DEST),
         Withdraw(ALICE, 1, Quote(), 200, DEST)})};

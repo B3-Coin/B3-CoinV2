@@ -125,5 +125,5 @@ FUZZ_TARGET(flowmesh_state_snapshot)
     // Whatever decoded (before certificate verification would judge it),
     // the state's pure functions are total.
     (void)state.Root();
-    (void)state.ledger.SolvencyHolds();
+    (void)state.LedgerView().SolvencyHolds();
 }

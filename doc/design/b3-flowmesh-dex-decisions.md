@@ -67,6 +67,14 @@ Ordered so that the earlier ones unblock the most work.
   evaluation.
 - **O-8 Per-market parameters** — price tick / lot / fee precision (= OD-7),
   per-market leverage caps within the global 10x.
+- **O-9a Cross-round lock release / view-change rule** — permanent split
+  locks may halt FlowMesh indefinitely (safe floor); any unlock rule is
+  a consensus-safety choice reserved to the owner.
+- **O-9b Certificate finality semantics** — whether a threshold
+  certificate is irreversible FlowMesh finality; the current
+  certificate→commit behavior is a provisional implementation model.
+- **O-9c consumed_deposits retention and same-slot deposit/trading
+  semantics** — provisional model state; do not activate or extend.
 - **O-9 Vault mechanism ratification** — the consumed-finalized-receipt keyless
   vault in `src/modern/vault.h` is implemented model-only and was never
   owner-ratified; deposits/withdrawals for the DEX depend on it (or a
