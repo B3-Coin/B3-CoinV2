@@ -140,12 +140,13 @@ owner-accepted certified-log FlowMesh layer.
   (until seats exist); production deposit/withdrawal verifiers (until the
   base-chain policy/asset layer activates); incremental state root
   (until scale demands — bench is the tripwire).
-- **Leverage track: IN SCOPE (owner re-activation 2026-08-19late) but NOT
-  implemented** — 10x perpetual futures, cross + isolated margin,
-  oracle-free internal index/mark, funding vs the spot clearing price,
-  Hyperliquid-parity liquidation cascade (forced clearing order →
-  insurance-fund takeover → ADL last resort) as the accepted design
-  direction; all thresholds to land as REVISABLE constants.
+- **Futures track (corrected 2026-08-19 per the Codex repair directive):
+  the ONLY locked facts are "FlowMesh will support futures" and
+  "maximum leverage = 10×". NOT implemented.** Perpetual vs dated
+  futures, isolated vs cross margin, funding, the mark/index source,
+  maintenance margin, liquidation penalties, an insurance fund and ADL
+  are ALL open owner decisions; the in-session cascade design is a
+  proposal record only, not accepted direction.
 - Known open defects: txindex/txospenderindex hash-domain selection;
   `CDiskBlockIndex` format-version bump; corridor headers-first relay
   (`HasValidProofOfWork`) still SHA256d-assuming; the full-binary unit
