@@ -57,7 +57,8 @@ namespace modern {
  * accounting calls this header. It defines only the canonical data
  * model, byte-stable serialization, strict parsing and pure model
  * helpers. The only permitted caller besides tests is the OFFLINE
- * capacity report (node/fn_pod.cpp -podreport), which measures — never
+ * historical PoD report (node/fn_pod.cpp -podreport; its payload
+ * portion is superseded/non-authoritative), which measures — never
  * validates.
  *
  * SUPERSEDED CONTENT KEPT AS RESERVED RECORD: the funding-key
