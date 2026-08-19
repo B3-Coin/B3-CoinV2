@@ -9,6 +9,16 @@ Ledger advanced 2026-08-19 (owner-directed): corridor machinery, the legacy FN
 issuance model, the FlowMesh deterministic engine corrections, and the
 owner-accepted certified-log FlowMesh layer.
 
+**Branch accuracy note (2026-08-19, post-Codex):** this branch reflects the
+working tree as of merge `746cc72` and does NOT contain the subsequent Codex
+repair passes (`ded7024`, `0098aeb`), which live on
+`claude/b3-clean-architecture` pending review. The FlowMesh machinery
+descriptions below therefore describe the PRE-repair implementation; consult
+the working branch and its status matrix for the repaired state. FlowMesh code
+is compiled into the node library but activation-unwired ("test-only" below is
+the older, less precise phrasing). The approved spot matching model is the
+uniform-price curve auction; price-time matching was never selected.
+
 ## Finalized — architecture
 
 - One continuous chain; legacy era ≤ H attested by X, modern era from H+1;
