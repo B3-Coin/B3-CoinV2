@@ -23,10 +23,13 @@
 namespace flowmesh {
 
 /**
- * Microblock certificates: finality is enough eligible FN validator
- * attestations over ONE exact microblock hash. A certificate is a
- * SEPARATE object from the microblock — attestations accumulate over an
- * already-fixed identity and never enter it.
+ * Microblock certificates: CERTIFICATION is enough eligible FN
+ * validator attestations over ONE exact microblock hash. A certificate
+ * is a SEPARATE object from the microblock — attestations accumulate
+ * over an already-fixed identity and never enter it. NOTE: whether a
+ * certificate constitutes irreversible FlowMesh finality is an
+ * unresolved OWNER DECISION; the current certificate->commit behavior
+ * is a provisional model.
  *
  * Cryptography: BIP340 Schnorr over the repository's existing secp256k1
  * primitives. No aggregation; at seat-set scale (<= 1000) individual

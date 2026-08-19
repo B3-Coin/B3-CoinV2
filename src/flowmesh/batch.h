@@ -234,6 +234,13 @@ class ActionAuthenticator
 public:
     virtual ~ActionAuthenticator() = default;
     virtual bool Authenticate(const Action& action) const = 0;
+    //! The IMMUTABLE binding this authenticator judges under. Consumers
+    //! (MeshNode construction, store replay) verify these against their
+    //! own validated domain and execution configuration, so a
+    //! wrong-market or wrong-domain authenticator fails EXPLICITLY at
+    //! wiring time — never by accident downstream.
+    virtual const uint256& DomainId() const = 0;
+    virtual const uint256& ExecConfigId() const = 0;
 };
 
 enum class ActionReject : uint8_t {

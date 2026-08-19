@@ -62,7 +62,11 @@ inline constexpr uint64_t LEDGER_SNAPSHOT_MAX_ENTRIES{uint64_t{1} << 22};
  *                             for a user action);
  *     MICROBLOCK_CERTIFIED  — the request sits in a state committed
  *                             under a microblock certificate (derived
- *                             from log position, not stored);
+ *                             from log position, not stored; the
+ *                             certificate-commit model itself is
+ *                             provisional — certificate ==
+ *                             irreversible finality is an unresolved
+ *                             owner decision);
  *     B3_FINAL / REDEEMABLE — requires the OWNER-DECIDED trustless B3
  *                             vault authorization; NOTHING in this
  *                             codebase reports a request as redeemable;
@@ -256,6 +260,14 @@ public:
     {
         const auto it{m_custody.find(asset)};
         return it == m_custody.end() ? 0 : it->second;
+    }
+
+    //! Read-only visit of every balance entry (decode reconciliation,
+    //! diagnostics). Deterministic map order; no mutation possible.
+    template <typename Fn>
+    void ForEachBalance(Fn&& fn) const
+    {
+        for (const auto& [key, balance] : m_balances) fn(key.first, key.second, balance);
     }
 
     //! available + reserved + pending requests, per asset.

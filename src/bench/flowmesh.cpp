@@ -4,7 +4,7 @@
 
 //! Honest latency benchmark of the FlowMesh deterministic engine: the
 //! COMPLETE slot pipeline — action-set construction, canonicalization,
-//! authentication calls, per-signer sequencing, curve submission with
+//! per-signer sequencing, curve submission with
 //! ledger reservations, uniform-price clearing, internal settlement,
 //! and both commitment roots — measured per slot in steady state.
 //!
@@ -19,10 +19,11 @@
 //!    moves quote one way; funding gives ~10^7 slots of headroom, far
 //!    beyond any measurement horizon, and solvency is asserted after
 //!    the run.
-//!  - The authenticator is a constant-true stub: credential
-//!    cryptography does not exist in this engine yet and is therefore
-//!    EXCLUDED from these numbers; real signature/quorum verification
-//!    will add its own per-action cost on top of everything here.
+//!  - NO AUTHENTICATION is measured anywhere here: execution performs
+//!    no cryptography (credentials are pre-admission evidence, judged
+//!    at pool/proposal level, outside this engine); real signature and
+//!    quorum verification add their own per-action cost on top of
+//!    every number below.
 //!  - Per-slot cost includes hashing the ENTIRE persistent book and
 //!    ledger into the state root — the price of a per-slot commitment,
 //!    deliberately not excluded.
@@ -36,6 +37,7 @@
 #include <flowmesh/clearing.h>
 #include <flowmesh/ledger.h>
 #include <flowmesh/state.h>
+#include <test/util/flowmesh.h>
 #include <modern/asset.h>
 #include <modern/policy.h>
 #include <primitives/transaction.h>
@@ -77,8 +79,8 @@ struct SlotBench {
     {
         assert(n_accounts % 2 == 0);
         for (uint32_t i{0}; i < n_accounts; ++i) {
-            state.Deposit(Account(i), modern::NativeAsset(), CAmount{1} << 40);
-            state.Deposit(Account(i), Base(), CAmount{1} << 40);
+            flowmesh::test_only::StateFunding::Fund(state, Account(i), modern::NativeAsset(), CAmount{1} << 40);
+            flowmesh::test_only::StateFunding::Fund(state, Account(i), Base(), CAmount{1} << 40);
         }
     }
 
@@ -180,8 +182,8 @@ void RunRootBench(benchmark::Bench& bench, const size_t n_accounts)
 {
     flowmesh::FlowMeshState state{uint256::ONE, Base(), modern::NativeAsset()};
     for (uint32_t i{0}; i < n_accounts; ++i) {
-        state.Deposit(Account(i), modern::NativeAsset(), CAmount{1} << 40);
-        state.Deposit(Account(i), Base(), CAmount{1} << 40);
+        flowmesh::test_only::StateFunding::Fund(state, Account(i), modern::NativeAsset(), CAmount{1} << 40);
+        flowmesh::test_only::StateFunding::Fund(state, Account(i), Base(), CAmount{1} << 40);
         const bool bid{i % 2 == 0};
         const std::vector<Breakpoint> curve{bid
             ? std::vector<Breakpoint>{{100, 50}, {200, 0}}

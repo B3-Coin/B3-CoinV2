@@ -21,6 +21,7 @@
 #include <key.h>
 #include <node/flowmesh_anchor.h>
 #include <node/flowmesh_store.h>
+#include <test/util/flowmesh.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
 #include <validation.h>
@@ -92,10 +93,15 @@ public:
     AnchorRef current{7, uint256{"00000000000000000000000000000000000000000000000000000000000000aa"}};
     bool accept_all{true};
     bool still_canonical{true};
+    //! Simulates the owner-configured burial/finality requirement: an
+    //! anchor may remain canonical yet stop satisfying full
+    //! acceptability (e.g. a competing branch reduced its burial).
+    bool sufficiently_buried{true};
 
     bool Acceptable(const AnchorRef& anchor) const override
     {
-        return accept_all && anchor == current;
+        return accept_all && sufficiently_buried && anchor == current &&
+               StillCanonical(anchor);
     }
     bool StillCanonical(const AnchorRef& anchor) const override
     {
@@ -161,6 +167,13 @@ public:
         return true;
     }
 };
+
+//! Test funding shortcut over the test-only bridge.
+inline bool Fund(flowmesh::FlowMeshState& state, const flowmesh::AccountId& account,
+                 const modern::AssetId& asset, const CAmount amount)
+{
+    return flowmesh::test_only::StateFunding::Fund(state, account, asset, amount);
+}
 
 struct MeshNet {
     std::vector<CKey> keys;
@@ -631,9 +644,8 @@ BOOST_AUTO_TEST_CASE(store_appends_replays_snapshots_and_survives_restart)
         config.anchors = &net.anchors;
         config.seat_key = net.keys[0];
         node::ValidatorRuntime runtime;
-        BOOST_REQUIRE_MESSAGE(node::StartValidator(reopened, std::move(config),
-                                                   FlowMeshState{VAULT, BaseX(), Quote()},
-                                                   runtime, error),
+        BOOST_REQUIRE_MESSAGE(node::StartValidator(reopened, std::move(config), VAULT, BaseX(),
+                                                   Quote(), 8, runtime, error),
                               error);
         BOOST_CHECK_EQUAL(runtime.mesh_node->Sequence(), 2U);
         BOOST_CHECK_EQUAL(runtime.mesh_node->State().Root().GetHex(), live_root.GetHex());
@@ -702,9 +714,8 @@ BOOST_AUTO_TEST_CASE(restart_cannot_sign_a_conflicting_candidate)
     config.anchors = &net.anchors;
     config.seat_key = net.keys[voter];
     node::ValidatorRuntime runtime;
-    BOOST_REQUIRE_MESSAGE(node::StartValidator(reopened, std::move(config),
-                                               FlowMeshState{VAULT, BaseX(), Quote()}, runtime,
-                                               error),
+    BOOST_REQUIRE_MESSAGE(node::StartValidator(reopened, std::move(config), VAULT, BaseX(),
+                                               Quote(), 8, runtime, error),
                           error);
 
     // A conflicting candidate at the protected sequence is refused...
@@ -828,10 +839,13 @@ BOOST_AUTO_TEST_CASE(anchors_are_rechecked_before_signing_and_before_commit)
     const size_t p{net.ProposerIndex(1, 0)};
     const auto proposal{net.nodes[p]->TryPropose()};
     BOOST_REQUIRE(proposal.has_value());
-    // ...the committed anchor is orphaned before another seat signs.
+    // ...the committed anchor is orphaned before another seat signs:
+    // the proposal is refused (the full-acceptability gate fails), and
+    // the committed-dependency recheck halts the node.
     const size_t signer{(p + 1) % 3};
     net.anchors.still_canonical = false;
     BOOST_CHECK(!net.nodes[signer]->HandleProposal(*proposal).has_value());
+    BOOST_CHECK(!net.nodes[signer]->RecheckCommittedAnchors());
     BOOST_CHECK(net.nodes[signer]->Halted());
     BOOST_CHECK(net.nodes[signer]->Halt() == MeshHalt::ANCHOR_INVALIDATED);
     net.anchors.still_canonical = true;
@@ -1163,6 +1177,254 @@ BOOST_AUTO_TEST_CASE(known_split_lock_case_safely_does_not_finalize)
     const int height_before{m_node.chainman->ActiveChain().Height()};
     CreateAndProcessBlock({}, CScript{} << OP_TRUE);
     BOOST_CHECK_EQUAL(m_node.chainman->ActiveChain().Height(), height_before + 1);
+}
+
+BOOST_AUTO_TEST_CASE(authenticator_binding_is_verified_by_construction)
+{
+    // Codex finding 1: a Market-B (or wrong-domain) authenticator
+    // inside a Market-A node is refused EXPLICITLY at construction —
+    // never left to downstream accidents — and store replay applies
+    // the same binding check.
+    MeshNet net{3, 0};
+    const uint256 config_b{flowmesh::ComputeExecutionConfigId(VAULT, BaseX(), uint256::ONE, 8)};
+    const flowmesh::SchnorrActionAuthenticator auth_b{MESH_DOMAIN, config_b};
+    const uint256 other_domain{
+        uint256{"00000000000000000000000000000000000000000000000000000000000000de"}};
+    const flowmesh::SchnorrActionAuthenticator auth_wrong_domain{other_domain, MESH_CONFIG};
+
+    const auto observer_with{[&](const flowmesh::ActionAuthenticator* auth) {
+        MeshNode::Config config;
+        config.domain = MESH_DOMAIN;
+        config.market_config_id = MESH_CONFIG;
+        config.seats = net.seats;
+        config.threshold = net.threshold;
+        config.schedule = net.schedule.get();
+        config.auth = auth;
+        config.anchors = &net.anchors;
+        return MeshNode{std::move(config), FlowMeshState{VAULT, BaseX(), Quote()}};
+    }};
+    BOOST_CHECK(observer_with(&auth_b).Halt() == MeshHalt::INVALID_CONFIG);
+    BOOST_CHECK(observer_with(&auth_wrong_domain).Halt() == MeshHalt::INVALID_CONFIG);
+    BOOST_CHECK(!observer_with(&net.auth).Halted()); // correct binding is accepted
+
+    // Store replay refuses a wrong-binding authenticator outright.
+    const fs::path store_path{m_args.GetDataDirBase() / "flowmesh_authbind"};
+    std::string error;
+    node::FlowMeshStore store{
+        DBParams{.path = store_path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+    BOOST_REQUIRE(store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+    FlowMeshState state{VAULT, BaseX(), Quote()};
+    uint256 last_hash;
+    BOOST_CHECK(!store.Replay(state, last_hash, auth_b, &net.deposits, net.seats,
+                              net.threshold, nullptr, error, nullptr));
+    BOOST_CHECK(!store.Replay(state, last_hash, auth_wrong_domain, &net.deposits, net.seats,
+                              net.threshold, nullptr, error, nullptr));
+    BOOST_CHECK(store.Replay(state, last_hash, net.auth, &net.deposits, net.seats,
+                             net.threshold, nullptr, error, nullptr)); // empty log, bound ok
+}
+
+BOOST_AUTO_TEST_CASE(production_startup_builds_canonical_empty_genesis)
+{
+    // Codex finding 2: StartValidator no longer accepts a caller-built
+    // state at all (fabricated balances/custody/nonces are impossible
+    // at the API level); it derives the config id and starts from the
+    // canonical empty state. An out-of-cap curve bound is refused.
+    MeshNet net{3, 0};
+    std::string error;
+    const fs::path store_path{m_args.GetDataDirBase() / "flowmesh_genesis"};
+    node::FlowMeshStore store{
+        DBParams{.path = store_path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+    MeshNode::Config config;
+    config.domain = MESH_DOMAIN;
+    config.market_config_id = uint256::ONE; // caller lies: derived internally, ignored
+    config.seats = net.seats;
+    config.threshold = net.threshold;
+    config.schedule = net.schedule.get();
+    config.auth = &net.auth;
+    config.deposits = &net.deposits;
+    config.anchors = &net.anchors;
+    config.seat_key = net.keys[0];
+    node::ValidatorRuntime runtime;
+    BOOST_REQUIRE_MESSAGE(node::StartValidator(store, config, VAULT, BaseX(), Quote(), 8,
+                                               runtime, error),
+                          error);
+    BOOST_CHECK_EQUAL(runtime.mesh_node->Sequence(), 0U);
+    BOOST_CHECK_EQUAL(runtime.mesh_node->State().LedgerView().Custody(Quote()), 0);
+    BOOST_CHECK_EQUAL(runtime.mesh_node->State().LedgerView().Custody(BaseX()), 0);
+    BOOST_CHECK(runtime.mesh_node->State().ConfigId() == MESH_CONFIG);
+
+    // Curve bound outside the hard protocol cap: refused.
+    node::ValidatorRuntime refused;
+    BOOST_CHECK(!node::StartValidator(store, config, VAULT, BaseX(), Quote(),
+                                      flowmesh::HARD_MAX_CURVE_POINTS + 1, refused, error));
+}
+
+BOOST_AUTO_TEST_CASE(store_namespace_freshness_lock_bounds_and_tip_overrun)
+{
+    // Codex finding 4 regressions.
+    MeshNet net{3, 0};
+    std::string error;
+    const fs::path path{m_args.GetDataDirBase() / "flowmesh_hardening2"};
+
+    // (A) Non-FlowMesh database metadata does NOT defeat freshness...
+    {
+        CDBWrapper raw{DBParams{.path = path, .cache_bytes = size_t{1} << 20,
+                                .wipe_data = true}};
+        raw.Write(std::make_pair(uint8_t{0x0e}, uint8_t{0x01}), uint8_t{0x77}, true);
+    }
+    {
+        node::FlowMeshStore store{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        BOOST_CHECK(store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+    }
+    // ...but a FlowMesh-namespace key without a marker is fail-closed.
+    {
+        CDBWrapper raw{DBParams{.path = path, .cache_bytes = size_t{1} << 20,
+                                .wipe_data = true}};
+        raw.Write(std::make_pair(uint8_t{'e'}, uint64_t{0}), uint8_t{0x01}, true);
+    }
+    {
+        node::FlowMeshStore store{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        BOOST_CHECK(!store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+    }
+
+    // (B) A malformed SHORT 'l'-prefixed key fails the namespace scan.
+    {
+        CDBWrapper raw{DBParams{.path = path, .cache_bytes = size_t{1} << 20,
+                                .wipe_data = true}};
+        raw.Write(uint8_t{'l'}, uint256::ONE, true); // one-byte key: malformed
+    }
+    {
+        node::FlowMeshStore store{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        std::map<uint64_t, uint256> locks;
+        BOOST_CHECK(!store.ReadLocks(locks, error));
+        BOOST_CHECK(!store.WriteLock(0, uint256::ONE)); // journal unusable: never sign blind
+    }
+
+    // (C) The journal bound refuses entry MAX+1 BEFORE writing.
+    {
+        node::FlowMeshStore store{DBParams{.path = path, .cache_bytes = size_t{1} << 20,
+                                           .wipe_data = true},
+                                  /*max_lock_entries=*/2};
+        BOOST_REQUIRE(store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+        BOOST_CHECK(store.WriteLock(0, uint256::ONE));
+        BOOST_CHECK(store.WriteLock(1, uint256::ONE));
+        BOOST_CHECK(!store.WriteLock(2, uint256::ONE)); // bound reached: refuse to sign
+        BOOST_CHECK(store.ClearLocksThrough(0));
+        BOOST_CHECK(store.WriteLock(2, uint256::ONE)); // capacity freed
+    }
+
+    // (D) Entries beyond the authoritative tip are detected, not
+    // silently ignored.
+    {
+        node::FlowMeshStore store{DBParams{.path = path, .cache_bytes = size_t{1} << 20,
+                                           .wipe_data = true}};
+        BOOST_REQUIRE(store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+    }
+    {
+        MeshNet fresh{3, 0};
+        FlowMeshState state{VAULT, BaseX(), Quote()};
+        flowmesh::BatchExecutor exec{state};
+        const auto r{exec.ExecuteSlot({}, fresh.anchors.current)};
+        BOOST_REQUIRE(r.has_value());
+        flowmesh::MicroblockCore mb;
+        mb.domain = MESH_DOMAIN;
+        mb.anchor = fresh.anchors.current;
+        mb.prev_state_root = FlowMeshState{VAULT, BaseX(), Quote()}.Root();
+        mb.actions_root = flowmesh::MicroblockCore::ComputeActionsRoot({});
+        mb.result_commitment = r->result_commitment;
+        mb.resulting_state_root = r->state_root;
+        flowmesh::CertifiedEntry beyond{mb, {}, {}};
+        CDBWrapper raw{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        raw.Write(std::make_pair(uint8_t{'e'}, uint64_t{0}), beyond, true); // beyond tip 0
+    }
+    {
+        node::FlowMeshStore store{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        BOOST_CHECK(!store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(anchor_burial_loss_blocks_signing_and_commit)
+{
+    // Codex finding 5: the final pre-sign / pre-commit check is the
+    // FULL acceptability policy — an anchor that remains canonical but
+    // loses its required burial must not be signed against or
+    // committed; canonicality loss still halts.
+    MeshNet net{3, 0};
+    const size_t p{net.ProposerIndex(0, 0)};
+    const auto proposal{net.nodes[p]->TryPropose()};
+    BOOST_REQUIRE(proposal.has_value());
+
+    // Burial lost between proposal receipt and signing: refuse (no
+    // halt — the anchor is still canonical, so this is retriable).
+    const size_t signer{(p + 1) % 3};
+    net.anchors.sufficiently_buried = false;
+    BOOST_CHECK(!net.nodes[signer]->HandleProposal(*proposal).has_value());
+    BOOST_CHECK(!net.nodes[signer]->Halted());
+    net.anchors.sufficiently_buried = true;
+    BOOST_CHECK(net.nodes[signer]->HandleProposal(*proposal).has_value()); // buried again: signs
+
+    // Burial lost just before the certificate completes: commit refused
+    // (no halt), live tip unmoved.
+    const size_t committer{(p + 2) % 3};
+    std::vector<AttestationMsg> atts;
+    if (const auto a{net.nodes[p]->HandleProposal(*proposal)}) atts.push_back(*a);
+    if (const auto a{net.nodes[committer]->HandleProposal(*proposal)}) atts.push_back(*a);
+    BOOST_REQUIRE_EQUAL(atts.size(), 2U);
+    BOOST_REQUIRE(net.nodes[committer]->HandleAttestation(atts[0]) == std::nullopt);
+    net.anchors.sufficiently_buried = false;
+    BOOST_CHECK(net.nodes[committer]->HandleAttestation(atts[1]) == std::nullopt);
+    BOOST_CHECK_EQUAL(net.nodes[committer]->Sequence(), 0U);
+    BOOST_CHECK(!net.nodes[committer]->Halted());
+    net.anchors.sufficiently_buried = true;
+}
+
+BOOST_AUTO_TEST_CASE(decoded_book_state_must_reconcile_with_the_ledger)
+{
+    // Codex finding 7: a snapshot decode cannot construct impossible
+    // fill/reservation state or book/ledger divergence, and the curve
+    // bound has a hard protocol cap.
+    BOOST_CHECK_THROW(
+        (FlowMeshState{VAULT, BaseX(), Quote(), flowmesh::HARD_MAX_CURVE_POINTS + 1}),
+        std::invalid_argument);
+    BOOST_CHECK_THROW((FlowMeshState{VAULT, BaseX(), Quote(), 0}), std::invalid_argument);
+
+    // Craft state streams by serializing a standalone ledger/book pair
+    // and appending empty sequence/deposit maps, then decoding into a
+    // properly configured state.
+    const auto decode{[&](const flowmesh::Ledger& ledger,
+                          const flowmesh::ClearingEngine& book) {
+        DataStream s;
+        s << ledger << book;
+        WriteCompactSize(s, 0); // next_seq
+        WriteCompactSize(s, 0); // consumed deposits
+        FlowMeshState target{VAULT, BaseX(), Quote()};
+        s >> target;
+        return target;
+    }};
+
+    // Consistent state round-trips…
+    {
+        MeshNet net{3, 0};
+        FlowMeshState source{VAULT, BaseX(), Quote()};
+        Fund(source, net.alice, Quote(), 1'000);
+        BOOST_REQUIRE(source.SubmitCurve(net.alice, flowmesh::ClearingEngine::Side::BID,
+                                         {{10, 10}, {20, 0}}));
+        DataStream s;
+        s << source;
+        FlowMeshState target{VAULT, BaseX(), Quote()};
+        BOOST_CHECK_NO_THROW(s >> target);
+        BOOST_CHECK_EQUAL(target.Root().GetHex(), source.Root().GetHex());
+    }
+    // …but an orphan ledger reservation with NO backing curve is
+    // impossible state:
+    {
+        MeshNet net{3, 0};
+        flowmesh::Ledger ledger{VAULT};
+        BOOST_REQUIRE(ledger.Deposit(net.alice, Quote(), 1'000));
+        BOOST_REQUIRE(ledger.Reserve(net.alice, Quote(), 400)); // no curve backs this
+        const flowmesh::ClearingEngine book{BaseX(), Quote()};
+        BOOST_CHECK_THROW(decode(ledger, book), std::ios_base::failure);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

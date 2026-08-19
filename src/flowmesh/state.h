@@ -21,6 +21,10 @@
 
 namespace flowmesh {
 
+namespace test_only {
+struct StateFunding;
+} // namespace test_only
+
 //! Snapshot decode bounds, enforced before elements are read.
 inline constexpr uint64_t STATE_SNAPSHOT_MAX_SIGNERS{uint64_t{1} << 22};
 inline constexpr uint64_t STATE_SNAPSHOT_MAX_DEPOSITS{uint64_t{1} << 22};
@@ -87,12 +91,11 @@ public:
     //! different Ledger through the production API.
     const Ledger& LedgerView() const { return ledger; }
 
-    //! Fund an account directly (tests/tooling; production custody goes
-    //! through CreditDeposit behind the DepositVerifier).
-    bool Deposit(const AccountId& account, const AssetId& asset, const CAmount amount)
-    {
-        return ledger.Deposit(account, asset, amount);
-    }
+    // NO raw funding here: production custody enters ONLY through
+    // CreditDeposit behind a chain-fact DepositVerifier (fail-closed
+    // today). Test fixtures fund via test_only::StateFunding, which is
+    // defined only under src/test/util/ — a production build has no
+    // callable API that fabricates balances, custody or nonces.
 
     uint64_t NextSequence(const AccountId& signer) const
     {
@@ -227,9 +230,14 @@ public:
             }
             consumed_deposits = std::move(fresh);
         }
+        // A decoded snapshot must not be able to construct impossible
+        // fill/reservation state or book/ledger divergence.
+        book.CheckDecodedAccounting(ledger);
     }
 
 private:
+    friend struct test_only::StateFunding; // defined only in test code
+
     Ledger ledger;
     ClearingEngine book;
     uint256 config_id;

@@ -83,9 +83,6 @@ ReadResult ReadStrict(CDBWrapper& db, const K& key, V& value)
     return ReadResult::FOUND;
 }
 
-//! Hard cap on journaled locks (one per in-flight sequence; far above
-//! any real backlog, low enough to bound scans).
-constexpr size_t MAX_LOCK_JOURNAL_ENTRIES{4096};
 } // namespace
 
 uint256 QuorumHash(const std::set<XOnlyPubKey>& seats, const uint64_t threshold)
@@ -97,7 +94,10 @@ uint256 QuorumHash(const std::set<XOnlyPubKey>& seats, const uint64_t threshold)
     return h.GetHash();
 }
 
-FlowMeshStore::FlowMeshStore(DBParams db_params) : m_db{std::move(db_params)} {}
+FlowMeshStore::FlowMeshStore(DBParams db_params, const size_t max_lock_entries)
+    : m_db{std::move(db_params)}, m_max_lock_entries{max_lock_entries}
+{
+}
 
 bool FlowMeshStore::ReadMarker(std::optional<Marker>& out, std::string& error)
 {
@@ -131,14 +131,21 @@ bool FlowMeshStore::OpenForDomain(const uint256& domain, const std::set<XOnlyPub
     if (!ReadMarker(marker, error)) return false;
     const uint256 quorum{QuorumHash(seats, threshold)};
     if (!marker) {
-        // A missing marker means FRESH only when every FlowMesh
-        // namespace is empty — entries/locks/snapshots without a marker
-        // are inconsistent (torn or tampered) storage: fail closed.
+        // A missing marker means FRESH only when every FLOWMESH
+        // namespace ('m'/'e'/'s'/'l' first byte) is empty — entries,
+        // locks or snapshots without a marker are inconsistent (torn or
+        // tampered) storage. Keys outside those namespaces (database
+        // implementation metadata such as the obfuscation key) are NOT
+        // FlowMesh state and are ignored.
         std::unique_ptr<CDBIterator> it{m_db.NewIterator()};
-        it->SeekToFirst();
-        if (it->Valid()) {
-            error = "flowmesh storage has data but no marker: inconsistent or corrupt";
-            return false;
+        for (it->SeekToFirst(); it->Valid(); it->Next()) {
+            uint8_t prefix{0};
+            if (!it->GetKey(prefix)) continue; // not even a 1-byte-prefixed key
+            if (prefix == KEY_MARKER || prefix == KEY_ENTRY || prefix == KEY_SNAPSHOT ||
+                prefix == KEY_LOCK) {
+                error = "flowmesh storage has data but no marker: inconsistent or corrupt";
+                return false;
+            }
         }
         if (!it->StatusOK()) {
             error = "flowmesh storage iterator failed while checking freshness";
@@ -162,6 +169,17 @@ bool FlowMeshStore::OpenForDomain(const uint256& domain, const std::set<XOnlyPub
         // unresolved owner decision.
         error = "flowmesh log was certified under a different quorum configuration";
         return false;
+    }
+    // Log entries BEYOND the authoritative tip cannot arise from the
+    // atomic append (entry+marker commit together): their presence is
+    // tamper or corruption, never silently ignored. No rollback rule is
+    // defined, so this fails closed.
+    {
+        flowmesh::CertifiedEntry beyond;
+        if (ReadStrict(m_db, EntryKey(marker->next_sequence), beyond) != ReadResult::NOT_FOUND) {
+            error = "flowmesh log holds entries beyond its authoritative tip";
+            return false;
+        }
     }
     return true;
 }
@@ -221,6 +239,20 @@ bool FlowMeshStore::WriteLock(const uint64_t sequence, const uint256& microblock
         case ReadResult::NOT_FOUND:
             break;
         }
+        // Enforce the journal bound BEFORE writing entry MAX+1: a
+        // validator must never sign past its durable journal capacity.
+        {
+            size_t count{0};
+            std::unique_ptr<CDBIterator> it{m_db.NewIterator()};
+            for (it->Seek(uint8_t{KEY_LOCK}); it->Valid(); it->Next()) {
+                uint8_t prefix{0};
+                if (!it->GetKey(prefix) || prefix != KEY_LOCK) break;
+                std::pair<uint8_t, uint64_t> lock_key;
+                if (!it->GetKeyExact(lock_key)) return false; // corrupt journal: never sign
+                if (++count >= m_max_lock_entries) return false; // full: refuse to sign
+            }
+            if (!it->StatusOK()) return false;
+        }
         CDBBatch batch{m_db};
         batch.Write(LockKey(sequence), microblock_hash);
         m_db.WriteBatch(batch, /*fSync=*/true);
@@ -251,8 +283,11 @@ bool FlowMeshStore::ClearLocksThrough(const uint64_t sequence)
 bool FlowMeshStore::ReadLocks(std::map<uint64_t, uint256>& out, std::string& error)
 {
     out.clear();
+    // Seek to the RAW one-byte 'l' prefix so a malformed SHORT
+    // 'l'-prefixed key (which sorts before every well-formed lock key)
+    // is seen and rejected instead of silently skipped.
     std::unique_ptr<CDBIterator> it{m_db.NewIterator()};
-    for (it->Seek(std::make_pair(KEY_LOCK, uint64_t{0})); it->Valid(); it->Next()) {
+    for (it->Seek(uint8_t{KEY_LOCK}); it->Valid(); it->Next()) {
         uint8_t prefix;
         if (!it->GetKey(prefix) || prefix != KEY_LOCK) break; // next namespace
         std::pair<uint8_t, uint64_t> key;
@@ -263,7 +298,7 @@ bool FlowMeshStore::ReadLocks(std::map<uint64_t, uint256>& out, std::string& err
             return false;
         }
         out.emplace(key.second, hash);
-        if (out.size() > MAX_LOCK_JOURNAL_ENTRIES) {
+        if (out.size() > m_max_lock_entries) {
             error = "flowmesh lock journal exceeds its entry bound";
             out.clear();
             return false;
@@ -292,6 +327,10 @@ bool FlowMeshStore::Replay(flowmesh::FlowMeshState& state, uint256& last_hash,
     }
     if (marker->quorum_hash != QuorumHash(seats, threshold)) {
         error = "flowmesh log was certified under a different quorum configuration";
+        return false;
+    }
+    if (auth.DomainId() != marker->domain || auth.ExecConfigId() != state.ConfigId()) {
+        error = "flowmesh replay authenticator is bound to a different domain/configuration";
         return false;
     }
     last_hash = uint256{};
@@ -415,6 +454,10 @@ bool FlowMeshStore::ReplayFromBestSnapshot(
         error = "flowmesh log was certified under a different quorum configuration";
         return false;
     }
+    if (auth.DomainId() != marker->domain || auth.ExecConfigId() != state.ConfigId()) {
+        error = "flowmesh replay authenticator is bound to a different domain/configuration";
+        return false;
+    }
 
     // Try the snapshot; any defect discards it and falls back to the
     // full verified replay from genesis. A snapshot is only trusted
@@ -515,12 +558,25 @@ bool FlowMeshStore::ReplayFromBestSnapshot(
 }
 
 bool StartValidator(FlowMeshStore& store, flowmesh::MeshNode::Config config,
-                    flowmesh::FlowMeshState genesis, ValidatorRuntime& out, std::string& error)
+                    const uint256& vault_commitment, const uint256& base_asset,
+                    const uint256& quote_asset, const size_t max_k, ValidatorRuntime& out,
+                    std::string& error)
 {
     if (config.auth == nullptr || config.anchors == nullptr || config.schedule == nullptr) {
         error = "flowmesh validator startup requires auth/anchors/schedule";
         return false;
     }
+    if (max_k == 0 || max_k > flowmesh::HARD_MAX_CURVE_POINTS) {
+        error = "flowmesh validator startup refused a curve bound outside the hard cap";
+        return false;
+    }
+    // CANONICAL GENESIS: the initial state is constructed HERE from the
+    // immutable configuration — always the canonical empty state (no
+    // chain-derived initialization exists yet; deposits stay
+    // fail-closed). The market config id is DERIVED, never trusted from
+    // the caller.
+    flowmesh::FlowMeshState genesis{vault_commitment, base_asset, quote_asset, max_k};
+    config.market_config_id = genesis.ConfigId();
     if (!store.OpenForDomain(config.domain, config.seats, config.threshold, error)) return false;
 
     uint256 last_hash;

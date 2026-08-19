@@ -21,6 +21,7 @@
 #include <flowmesh/recovery.h>
 #include <flowmesh/state.h>
 #include <flowmesh/sync.h>
+#include <test/util/flowmesh.h>
 #include <key.h>
 #include <modern/policy.h>
 #include <primitives/transaction.h>
@@ -163,6 +164,14 @@ Built MustBuild(Net& net, const std::vector<Action>& actions, FlowMeshState& nex
     BOOST_REQUIRE(mb.has_value());
     built.mb = *mb;
     return built;
+}
+
+
+//! Test funding shortcut over the test-only bridge.
+inline bool Fund(flowmesh::FlowMeshState& state, const flowmesh::AccountId& account,
+                 const modern::AssetId& asset, const CAmount amount)
+{
+    return flowmesh::test_only::StateFunding::Fund(state, account, asset, amount);
 }
 
 } // namespace
@@ -365,7 +374,7 @@ BOOST_AUTO_TEST_CASE(state_root_excludes_execution_metadata)
     // an unrelated no-op rejection rode along; only the
     // ExecutionResultCommitment may differ.
     Net net;
-    net.state.Deposit(net.alice, Quote(), 600'000);
+    Fund(net.state, net.alice, Quote(), 600'000);
     const std::vector<Action> valid{LimitOrder(MESH_DOMAIN, net.alice_key, 0, true, 50'000, 4)};
 
     // A wrong-sequence action: recorded as BAD_SEQUENCE (metadata only),
@@ -737,7 +746,7 @@ BOOST_AUTO_TEST_CASE(authorization_is_bound_to_the_execution_configuration)
     BOOST_CHECK(net.auth.Authenticate(a_action));  // valid in its own market
     BOOST_CHECK(!auth_b.Authenticate(a_action));   // dead in any other market
 
-    net.state.Deposit(net.alice, Quote(), 600'000);
+    Fund(net.state, net.alice, Quote(), 600'000);
     FlowMeshState next{net.state};
     BatchResult result;
     const Built built{MustBuild(net, {a_action}, next, result)};

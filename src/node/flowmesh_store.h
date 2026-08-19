@@ -32,7 +32,7 @@ namespace node {
 uint256 QuorumHash(const std::set<XOnlyPubKey>& seats, uint64_t threshold);
 
 /**
- * Durable FlowMesh certified log: the append-only sequence of finalized
+ * Durable FlowMesh certified log: the append-only sequence of certified
  * (microblock, certificate, evidence) entries, a single marker (format
  * version, domain, quorum commitment, next sequence, last hash), the
  * safety-critical lock journal, and an optional certificate-verified
@@ -60,7 +60,7 @@ public:
         }
     };
 
-    explicit FlowMeshStore(DBParams db_params);
+    explicit FlowMeshStore(DBParams db_params, size_t max_lock_entries = 4096);
 
     bool ReadMarker(std::optional<Marker>& out, std::string& error);
 
@@ -68,7 +68,7 @@ public:
     bool OpenForDomain(const uint256& domain, const std::set<XOnlyPubKey>& seats,
                        uint64_t threshold, std::string& error);
 
-    //! Append the next finalized entry (sequence and parent must extend
+    //! Append the next certified entry (sequence and parent must extend
     //! the stored tip exactly).
     [[nodiscard]] bool Append(const flowmesh::CertifiedEntry& entry, std::string& error);
 
@@ -138,6 +138,7 @@ private:
                      std::map<std::pair<int32_t, uint256>, uint64_t>* anchors_out);
 
     CDBWrapper m_db;
+    const size_t m_max_lock_entries;
     //! Serializes lock-journal compare-and-set and clearing: the CAS
     //! read-check-write must be atomic with respect to concurrent
     //! callers in this process (LevelDB's LOCK file excludes other
@@ -217,8 +218,15 @@ struct ValidatorRuntime {
     std::unique_ptr<flowmesh::MeshNode> mesh_node;
 };
 
+//! Production validator startup: accepts ONLY the immutable market
+//! configuration and builds the canonical EMPTY genesis state
+//! internally (chain-derived initialization does not exist yet and
+//! deposit ingestion stays fail-closed) — fabricated caller-built
+//! balances/custody/nonces cannot enter production startup.
 bool StartValidator(FlowMeshStore& store, flowmesh::MeshNode::Config config,
-                    flowmesh::FlowMeshState genesis, ValidatorRuntime& out, std::string& error);
+                    const uint256& vault_commitment, const uint256& base_asset,
+                    const uint256& quote_asset, size_t max_k, ValidatorRuntime& out,
+                    std::string& error);
 
 } // namespace node
 

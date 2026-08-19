@@ -59,11 +59,11 @@ Ordered so that the earlier ones unblock the most work.
 - **O-5 Deterministic mark price** for any future leveraged market — every validator must compute the
   identical price. Either derived purely from internal clearing state, or
   oracle inputs entering as ordered microblock actions (which makes the oracle
-  a privileged actor to be specified). Hardest new decision L-4/L-5 creates.
+  a privileged actor to be specified). Hardest decision any future leveraged market creates.
 - **O-6 Funding-rate rule** — formula, interval, clamps.
 - **O-7 Liquidation mechanics** — trigger rule, who executes (keeper actions vs
   automatic engine step), penalty, and the insolvency backstop (insurance fund
-  vs socialized loss). Cross-margin (L-6) requires whole-account atomic
+  vs socialized loss). Any cross-margin design (undecided) would require whole-account atomic
   evaluation.
 - **O-8 Per-market parameters** — price tick / lot / fee precision (= OD-7),
   per-market leverage caps within the global 10x.
@@ -91,7 +91,7 @@ Ordered so that the earlier ones unblock the most work.
   liquidation system initially") and §23 (leverage/liquidations listed under
   "do not add yet") — resolved by the sequencing reading above.
 - [b3-implementation-status.md](b3-implementation-status.md) §7 lists
-  positions/margin/PnL as missing-by-scope for FlowMesh; with L-4/L-5 they are
+  positions/margin/PnL as missing-by-scope for FlowMesh; with the locked futures requirement they are
   now required scope (still gated behind the contract's clean-H+1 sequencing
   for any consensus wiring).
 - The master handoff's FlowMesh sections should gain the L-1..L-6 rulings when

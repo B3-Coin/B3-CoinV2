@@ -64,6 +64,9 @@ public:
     {
     }
 
+    const uint256& DomainId() const override { return m_domain; }
+    const uint256& ExecConfigId() const override { return m_config; }
+
     bool Authenticate(const Action& action) const override
     {
         if (action.credential.size() != SCHNORR_CREDENTIAL_SIZE) return false;

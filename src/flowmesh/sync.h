@@ -164,7 +164,7 @@ struct AttestationMsg {
     }
 };
 
-//! One finalized log entry: the microblock, its certificate, and the
+//! One certified log entry: the microblock, its certificate, and the
 //! authentication evidence its body was admitted under (needed so
 //! replay/catch-up can re-verify admission; NOT part of the microblock
 //! identity the certificate signs).
@@ -202,7 +202,7 @@ public:
     [[nodiscard]] virtual bool OnCommit(const CertifiedEntry& entry) = 0;
 };
 
-//! Read access to finalized history (serving catch-up after restart).
+//! Read access to certified history (serving catch-up after restart).
 class CatchupSource
 {
 public:
@@ -291,6 +291,12 @@ private:
             m_config.schedule == nullptr || m_config.auth == nullptr ||
             m_config.anchors == nullptr ||
             m_config.market_config_id != m_state.ConfigId() ||
+            // The authenticator must PROVE it judges this node's domain
+            // and this state's execution configuration — a Market-B
+            // authenticator inside a Market-A node is refused here
+            // explicitly, never left to downstream accidents.
+            m_config.auth->DomainId() != m_config.domain ||
+            m_config.auth->ExecConfigId() != m_state.ConfigId() ||
             (m_config.seat_key.has_value() &&
              (m_config.lock_journal == nullptr || m_config.sink == nullptr))) {
             m_halt = MeshHalt::INVALID_CONFIG;
@@ -421,13 +427,17 @@ public:
 
         if (!m_config.seat_key) return std::nullopt; // observer
         // IMMEDIATELY before signing (after candidate execution):
-        // revalidate every required B3 anchor — the committed
-        // dependency set and this candidate's own anchor. A reorg that
-        // landed since the proposal arrived halts instead of signing.
+        // revalidate every required B3 anchor. The committed dependency
+        // set must remain canonical, and this candidate's own anchor
+        // must still satisfy the FULL acceptability policy (canonical
+        // AND sufficiently buried per the owner-supplied depth) — mere
+        // canonicality is not enough to sign against.
         if (!RecheckCommittedAnchors()) return std::nullopt;
-        if (!m_config.anchors->StillCanonical(msg.mb.anchor)) {
-            m_halt = MeshHalt::ANCHOR_INVALIDATED;
-            return std::nullopt;
+        if (!m_config.anchors->Acceptable(msg.mb.anchor)) {
+            if (!m_config.anchors->StillCanonical(msg.mb.anchor)) {
+                m_halt = MeshHalt::ANCHOR_INVALIDATED; // orphaned: halt
+            }
+            return std::nullopt; // unburied: refuse to sign (retriable)
         }
         // SAFETY ORDER: durable compare-and-set lock BEFORE signing.
         if (!m_config.lock_journal->WriteLock(seq, hash)) {
@@ -493,7 +503,9 @@ public:
             CertificateCheck::OK) {
             return false;
         }
-        if (!m_config.anchors->StillCanonical(entry.mb.anchor)) return false;
+        // Full policy on the entry's own anchor (older anchors are only
+        // ever MORE buried, so legitimate certified history passes).
+        if (!m_config.anchors->Acceptable(entry.mb.anchor)) return false;
         if (!VerifyActionEvidence(entry.mb, entry.credentials, *m_config.auth)) return false;
         auto candidate{m_candidates.find(hash)};
         if (candidate == m_candidates.end()) {
@@ -576,9 +588,11 @@ private:
     {
         const uint64_t seq{entry.mb.sequence};
         if (!RecheckCommittedAnchors()) return false;
-        if (!m_config.anchors->StillCanonical(entry.mb.anchor)) {
-            m_halt = MeshHalt::ANCHOR_INVALIDATED;
-            return false;
+        if (!m_config.anchors->Acceptable(entry.mb.anchor)) {
+            if (!m_config.anchors->StillCanonical(entry.mb.anchor)) {
+                m_halt = MeshHalt::ANCHOR_INVALIDATED; // orphaned: halt
+            }
+            return false; // unburied: refuse this commit (retriable)
         }
         if (m_config.sink != nullptr && !m_config.sink->OnCommit(entry)) {
             m_halt = MeshHalt::PERSIST_FAILED;
@@ -625,8 +639,12 @@ private:
 namespace node {
 //! Declared here so it can be the signing factory's friend; defined in
 //! node/flowmesh_store.cpp (see flowmesh_store.h for documentation).
+//! Takes only the IMMUTABLE market configuration — the genesis state is
+//! constructed internally as the canonical empty state, so fabricated
+//! balances/custody/nonces cannot be injected at production startup.
 bool StartValidator(FlowMeshStore& store, flowmesh::MeshNode::Config config,
-                    flowmesh::FlowMeshState genesis, ValidatorRuntime& out,
+                    const uint256& vault_commitment, const uint256& base_asset,
+                    const uint256& quote_asset, size_t max_k, ValidatorRuntime& out,
                     std::string& error);
 } // namespace node
 
@@ -650,28 +668,18 @@ private:
     }
 
     friend bool ::node::StartValidator(::node::FlowMeshStore& store, MeshNode::Config config,
-                                       FlowMeshState genesis,
-                                       ::node::ValidatorRuntime& out, std::string& error);
+                                       const uint256& vault_commitment,
+                                       const uint256& base_asset, const uint256& quote_asset,
+                                       size_t max_k, ::node::ValidatorRuntime& out,
+                                       std::string& error);
     friend struct ::flowmesh::test_only::SigningBridge;
 };
 } // namespace detail
 
-namespace test_only {
-//! TEST-ONLY BRIDGE — never a production path. Unit tests use it to
-//! construct signing nodes with in-memory sinks/journals and injected
-//! failures; production signing nodes exist only via
-//! node::StartValidator's store-backed lifecycle.
-struct SigningBridge {
-    static std::unique_ptr<MeshNode> UnsafeMake(
-        MeshNode::Config config, FlowMeshState genesis, const uint256& last_hash = {},
-        const std::map<uint64_t, uint256>& restored_locks = {},
-        const std::map<std::pair<int32_t, uint256>, uint64_t>& restored_anchors = {})
-    {
-        return detail::SigningNodeFactory::Make(std::move(config), std::move(genesis),
-                                                last_hash, restored_locks, restored_anchors);
-    }
-};
-} // namespace test_only
+// test_only::SigningBridge is DECLARED as the factory's second friend
+// but DEFINED only under src/test/util/ — a production build contains
+// no callable API that can construct a signing MeshNode outside
+// node::StartValidator.
 
 } // namespace flowmesh
 

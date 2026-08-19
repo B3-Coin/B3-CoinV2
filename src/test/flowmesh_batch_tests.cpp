@@ -11,6 +11,8 @@
 
 #include <flowmesh/batch.h>
 
+#include <test/util/flowmesh.h>
+
 #include <flowmesh/clearing.h>
 #include <flowmesh/ledger.h>
 #include <modern/policy.h>
@@ -86,16 +88,24 @@ Action Withdraw(const flowmesh::AccountId& signer, uint64_t seq, const modern::A
     return a;
 }
 
+//! Test funding shortcut over the test-only bridge.
+inline bool Fund(flowmesh::FlowMeshState& state, const flowmesh::AccountId& account,
+                 const modern::AssetId& asset, const CAmount amount)
+{
+    return flowmesh::test_only::StateFunding::Fund(state, account, asset, amount);
+}
+
 struct Fixture {
     flowmesh::FlowMeshState state{VAULT, BaseX(), Quote()};
     const flowmesh::Ledger& ledger{state.LedgerView()};
     flowmesh::BatchExecutor exec{state};
     Fixture()
     {
-        state.Deposit(ALICE, Quote(), 2400); // covers the standard bid's 2300 bound
-        state.Deposit(BOB, BaseX(), 80);
+        Fund(state, ALICE, Quote(), 2400); // covers the standard bid's 2300 bound
+        Fund(state, BOB, BaseX(), 80);
     }
 };
+
 
 } // namespace
 
@@ -184,7 +194,7 @@ BOOST_AUTO_TEST_CASE(withdrawals_create_one_time_receipts_committed_by_root)
 {
     Fixture f;
     // ALICE deposits more native and withdraws twice in one slot.
-    f.state.Deposit(ALICE, Quote(), 1000);
+    Fund(f.state, ALICE, Quote(), 1000);
     const auto result{*f.exec.ExecuteSlot({
         Withdraw(ALICE, 0, Quote(), 300, DEST),
         Withdraw(ALICE, 1, Quote(), 200, DEST)})};

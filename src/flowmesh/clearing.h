@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <ios>
+#include <stdexcept>
 #include <map>
 #include <optional>
 #include <set>
@@ -28,6 +29,11 @@ class FlowMeshState;
 //! Snapshot decode bound for the persistent book, enforced before
 //! elements are read.
 inline constexpr uint64_t BOOK_SNAPSHOT_MAX_CURVES{uint64_t{1} << 22};
+
+//! HARD protocol safety ceiling on curve breakpoints. The configured
+//! per-market bound (m_max_k) may only tighten this, never exceed it —
+//! a bogus configuration cannot re-open the pre-allocation bound.
+inline constexpr size_t HARD_MAX_CURVE_POINTS{64};
 
 /**
  * FlowMesh persistent demand curves and deterministic batch clearing for
@@ -86,6 +92,9 @@ public:
     ClearingEngine(const AssetId& base, const AssetId& quote, size_t max_k = 8)
         : m_base{base}, m_quote{quote}, m_max_k{max_k}
     {
+        if (m_max_k == 0 || m_max_k > HARD_MAX_CURVE_POINTS) {
+            throw std::invalid_argument("flowmesh curve bound outside the hard protocol cap");
+        }
     }
 
     const AssetId& BaseAsset() const { return m_base; }
@@ -249,6 +258,49 @@ private:
     }
 
 public:
+    /**
+     * Post-decode accounting reconciliation (snapshots): every restored
+     * curve must be semantically reachable — fill within the curve's
+     * quantity range, reservation within the worst-case bound — and the
+     * ledger's reservations must match the book EXACTLY: for each
+     * account, Reserved(quote) equals its bid curve's recorded
+     * reservation, Reserved(base) equals its ask curve's, and no
+     * reservation exists without a backing curve (reservations have no
+     * other source in this system). Throws on any violation: a decoded
+     * snapshot cannot construct impossible reservation state.
+     */
+    void CheckDecodedAccounting(const Ledger& ledger) const
+    {
+        std::map<std::pair<AccountId, AssetId>, CAmount> expected;
+        for (const auto& [key, curve] : m_curves) {
+            const bool bid{key.first == Side::BID};
+            const CAmount max_qty{bid ? curve.points.front().qty : curve.points.back().qty};
+            if (curve.filled < 0 || curve.filled > max_qty) {
+                throw std::ios_base::failure("flowmesh book snapshot fill state impossible");
+            }
+            const std::optional<CAmount> worst{WorstCaseReservation(key.first, curve.points)};
+            if (!worst || curve.reserved < 0 || curve.reserved > *worst) {
+                throw std::ios_base::failure(
+                    "flowmesh book snapshot reservation state impossible");
+            }
+            expected[{key.second, bid ? m_quote : m_base}] += curve.reserved;
+        }
+        bool ok{true};
+        ledger.ForEachBalance([&](const AccountId& account, const AssetId& asset,
+                                  const Ledger::Balance& balance) {
+            if (balance.reserved == 0) return;
+            const auto it{expected.find({account, asset})};
+            if (it == expected.end() || it->second != balance.reserved) ok = false;
+        });
+        for (const auto& [key, reserved] : expected) {
+            if (ledger.Reserved(key.first, key.second) != reserved) ok = false;
+        }
+        if (!ok) {
+            throw std::ios_base::failure(
+                "flowmesh book reservations do not reconcile with the ledger");
+        }
+    }
+
     //! Deterministic root binding the whole persistent book to the given
     //! ledger's state and slot. CANONICALLY FRAMED end to end (identical
     //! preimage to the pre-refactor form).
@@ -310,7 +362,7 @@ public:
             // BEFORE any allocation or element read.
             Curve curve;
             const uint64_t points{ReadCompactSize(s)};
-            if (points > m_max_k) {
+            if (points > m_max_k || points > HARD_MAX_CURVE_POINTS) {
                 throw std::ios_base::failure("flowmesh book snapshot curve too large");
             }
             curve.points.reserve(points);
