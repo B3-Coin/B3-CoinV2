@@ -35,6 +35,7 @@
 #include <legacy/consensus.h>
 #include <legacy/replay.h>
 #include <modern/pos.h>
+#include <modern/stake.h>
 #include <logging/timer.h>
 #include <node/blockstorage.h>
 #include <node/utxo_snapshot.h>
@@ -156,7 +157,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, script_verify_flags flags, bool cacheSigStore,
                        bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
                        ValidationCache& validation_cache,
-                       std::vector<CScriptCheck>* pvChecks = nullptr)
+                       std::vector<CScriptCheck>* pvChecks = nullptr,
+                       const std::optional<LegacyLockSpendContext>& legacy_lock = std::nullopt)
                        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 bool CheckFinalTxAtTip(const CBlockIndex& active_chain_tip, const CTransaction& tx)
@@ -416,7 +418,8 @@ void Chainstate::MaybeUpdateMempoolForReorg(
 static bool CheckInputsFromMempoolAndCache(const CTransaction& tx, TxValidationState& state,
                 const CCoinsViewCache& view, const CTxMemPool& pool,
                 script_verify_flags flags, PrecomputedTransactionData& txdata, CCoinsViewCache& coins_tip,
-                ValidationCache& validation_cache)
+                ValidationCache& validation_cache,
+                const std::optional<LegacyLockSpendContext>& legacy_lock = std::nullopt)
                 EXCLUSIVE_LOCKS_REQUIRED(cs_main, pool.cs)
 {
     AssertLockHeld(cs_main);
@@ -448,7 +451,8 @@ static bool CheckInputsFromMempoolAndCache(const CTransaction& tx, TxValidationS
     }
 
     // Call CheckInputScripts() to cache signature and script validity against current tip consensus rules.
-    return CheckInputScripts(tx, state, view, flags, /* cacheSigStore= */ true, /* cacheFullScriptStore= */ true, txdata, validation_cache);
+    return CheckInputScripts(tx, state, view, flags, /* cacheSigStore= */ true, /* cacheFullScriptStore= */ true, txdata, validation_cache,
+                             nullptr, legacy_lock);
 }
 
 // Legacy-era input rules (maturity for coinbase and coinstake, input-time
@@ -456,7 +460,8 @@ static bool CheckInputsFromMempoolAndCache(const CTransaction& tx, TxValidationS
 // legacy block helpers below and shared with the mempool accept path.
 static bool CheckLegacyTxInputs(const CTransaction& tx, TxValidationState& state,
                                 const CCoinsViewCache& inputs, int spend_height,
-                                CAmount& txfee, CAmount& value_in);
+                                CAmount& txfee, CAmount& value_in,
+                                const Consensus::Params& params);
 
 //! Frozen legacy-era consensus script flags (the legacy branch of
 //! GetBlockScriptFlags); also used by the mempool for legacy-era admission.
@@ -848,6 +853,15 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         return state.Invalid(TxValidationResult::TX_CONSENSUS,
                              next_block_legacy ? "modern-txn-in-legacy-era" : "legacy-txn-in-modern-era");
     }
+    if (!next_block_legacy) {
+        // Modern-era admission: a malformed STAKE-claiming output can never
+        // be mined (ContextualCheckBlock enforces the same rule), so refuse
+        // it here.
+        if (std::string stake_error;
+            !modern::CheckStakeOutputs(tx, m_active_chainstate.m_chainman.GetConsensus(), stake_error)) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-stake-output", stake_error);
+        }
+    }
 
     if (!CheckTransaction(tx, state)) {
         return false; // state filled in by CheckTransaction
@@ -954,7 +968,8 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         // input-time ordering rule (an input's transaction time may not exceed
         // the spender's), and proof-of-integration fee accounting.
         CAmount legacy_value_in{0};
-        if (!CheckLegacyTxInputs(tx, state, m_view, next_block_height, ws.m_base_fees, legacy_value_in)) {
+        if (!CheckLegacyTxInputs(tx, state, m_view, next_block_height, ws.m_base_fees, legacy_value_in,
+                                 m_active_chainstate.m_chainman.GetConsensus())) {
             return false; // state filled in by CheckLegacyTxInputs
         }
     } else if (!Consensus::CheckTxInputs(tx, state, m_view, next_block_height, ws.m_base_fees)) {
@@ -1208,9 +1223,24 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
 
     constexpr script_verify_flags scriptVerifyFlags = STANDARD_SCRIPT_VERIFY_FLAGS;
 
+    // MODERN-era admission may spend pre-H legacy coins: frozen legacy rules
+    // for exactly those inputs, at policy time as well, so a spend that is
+    // valid under the frozen rule set is relayable even where modern policy
+    // flags would refuse the historical script shape.
+    std::optional<LegacyLockSpendContext> legacy_lock_context;
+    {
+        const Consensus::Params& consensus{m_active_chainstate.m_chainman.GetConsensus()};
+        if (consensus.legacy_b3coin &&
+            Consensus::GetB3Era(m_active_chainstate.m_chain.Height() + 1, consensus) == Consensus::B3Era::MODERN) {
+            if (const std::optional<int> H{Consensus::LegacyFinalHeight(consensus)}) {
+                legacy_lock_context = LegacyLockSpendContext{*H, LEGACY_BLOCK_SCRIPT_FLAGS};
+            }
+        }
+    }
+
     // Check input scripts and signatures.
     // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache())) {
+    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache(), nullptr, legacy_lock_context)) {
         // Detect a failure due to a missing witness so that p2p code can handle rejection caching appropriately.
         if (!tx.HasWitness() && SpendsNonAnchorWitnessProg(tx, m_view)) {
             state.Invalid(TxValidationResult::TX_WITNESS_STRIPPED,
@@ -1255,8 +1285,15 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     const script_verify_flags currentBlockScriptVerifyFlags{
         next_block_legacy ? LEGACY_BLOCK_SCRIPT_FLAGS
                           : GetModernBlockScriptFlags(*m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman)};
+    std::optional<LegacyLockSpendContext> legacy_lock_context;
+    if (!next_block_legacy && m_active_chainstate.m_chainman.GetConsensus().legacy_b3coin) {
+        if (const std::optional<int> H{Consensus::LegacyFinalHeight(m_active_chainstate.m_chainman.GetConsensus())}) {
+            legacy_lock_context = LegacyLockSpendContext{*H, LEGACY_BLOCK_SCRIPT_FLAGS};
+        }
+    }
     if (!CheckInputsFromMempoolAndCache(tx, state, m_view, m_pool, currentBlockScriptVerifyFlags,
-                                        ws.m_precomputed_txdata, m_active_chainstate.CoinsTip(), GetValidationCache())) {
+                                        ws.m_precomputed_txdata, m_active_chainstate.CoinsTip(), GetValidationCache(),
+                                        legacy_lock_context)) {
         LogError("BUG! PLEASE REPORT THIS! CheckInputScripts failed against latest-block but not STANDARD flags %s, %s", hash.ToString(), state.ToString());
         return Assume(false);
     }
@@ -2099,7 +2136,8 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo& txund
 /** Input/value checks frozen from the old B3Coin ConnectInputs path. */
 static bool CheckLegacyTxInputs(const CTransaction& tx, TxValidationState& state,
                                 const CCoinsViewCache& inputs, const int spend_height,
-                                CAmount& txfee, CAmount& value_in)
+                                CAmount& txfee, CAmount& value_in,
+                                const Consensus::Params& params)
 {
     if (!inputs.HaveInputs(tx)) {
         return state.Invalid(TxValidationResult::TX_MISSING_INPUTS, "bad-txns-inputs-missingorspent", "inputs missing or spent");
@@ -2129,7 +2167,8 @@ static bool CheckLegacyTxInputs(const CTransaction& tx, TxValidationState& state
                              strprintf("value in (%s) < value out (%s)", FormatMoney(value_in), FormatMoney(value_out)));
     }
 
-    txfee = legacy::GetLegacyTransactionFee(value_in, value_out, tx.IsCoinStake(), spend_height);
+    txfee = legacy::GetLegacyTransactionFee(value_in, value_out, tx.IsCoinStake(), spend_height,
+                                            params);
     if (!MoneyRange(txfee)) {
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-fee-outofrange");
     }
@@ -2192,12 +2231,25 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, script_verify_flags flags, bool cacheSigStore,
                        bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
                        ValidationCache& validation_cache,
-                       std::vector<CScriptCheck>* pvChecks)
+                       std::vector<CScriptCheck>* pvChecks,
+                       const std::optional<LegacyLockSpendContext>& legacy_lock)
 {
     if (tx.IsCoinBase()) return true;
 
     if (pvChecks) {
         pvChecks->reserve(tx.vin.size());
+    }
+
+    // Frozen legacy-lock inputs: identified by coin creation height, before
+    // the cache lookup so the cache key can commit to the selection.
+    std::vector<bool> legacy_input;
+    if (legacy_lock) {
+        legacy_input.resize(tx.vin.size(), false);
+        for (unsigned int i = 0; i < tx.vin.size(); i++) {
+            const Coin& coin{inputs.AccessCoin(tx.vin[i].prevout)};
+            assert(!coin.IsSpent());
+            legacy_input[i] = coin.nHeight <= legacy_lock->final_height;
+        }
     }
 
     // First check if script executions have been cached with the same
@@ -2207,7 +2259,19 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
     // transaction).
     uint256 hashCacheEntry;
     CSHA256 hasher = validation_cache.ScriptExecutionCacheHasher();
-    hasher.Write(UCharCast(tx.GetWitnessHash().begin()), 32).Write((unsigned char*)&flags, sizeof(flags)).Finalize(hashCacheEntry.begin());
+    hasher.Write(UCharCast(tx.GetWitnessHash().begin()), 32).Write((unsigned char*)&flags, sizeof(flags));
+    if (legacy_lock) {
+        // The per-input rule-set selection depends on coin creation heights,
+        // which the witness hash does not commit to; commit here so a cached
+        // approval can never carry across a different selection.
+        hasher.Write((const unsigned char*)&legacy_lock->final_height, sizeof(legacy_lock->final_height));
+        hasher.Write((const unsigned char*)&legacy_lock->legacy_flags, sizeof(legacy_lock->legacy_flags));
+        for (unsigned int i = 0; i < legacy_input.size(); i++) {
+            const unsigned char b{legacy_input[i] ? uint8_t{1} : uint8_t{0}};
+            hasher.Write(&b, 1);
+        }
+    }
+    hasher.Finalize(hashCacheEntry.begin());
     AssertLockHeld(cs_main); //TODO: Remove this requirement by making CuckooCache not require external locks
     if (validation_cache.m_script_execution_cache.contains(hashCacheEntry, !cacheFullScriptStore)) {
         return true;
@@ -2235,8 +2299,11 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         // failures through additional data in, eg, the coins being
         // spent being checked as a part of CScriptCheck.
 
-        // Verify signature
-        CScriptCheck check(txdata.m_spent_outputs[i], tx, validation_cache.m_signature_cache, i, flags, cacheSigStore, &txdata);
+        // Verify signature; a frozen legacy-lock input takes the legacy
+        // rule set, every other input the caller's flags.
+        const script_verify_flags input_flags{
+            (legacy_lock && legacy_input[i]) ? legacy_lock->legacy_flags : flags};
+        CScriptCheck check(txdata.m_spent_outputs[i], tx, validation_cache.m_signature_cache, i, input_flags, cacheSigStore, &txdata);
         if (pvChecks) {
             pvChecks->emplace_back(std::move(check));
         } else if (auto result = check(); result.has_value()) {
@@ -2718,6 +2785,15 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
     // Get the script flags for this block
     script_verify_flags flags{GetBlockScriptFlags(*pindex, m_chainman)};
+    // MODERN-era B3 blocks may spend pre-H legacy coins (LEGACY_LOCK): those
+    // inputs are verified under the frozen legacy rule set, so historical
+    // outputs remain spendable exactly as the historical chain defined them.
+    std::optional<LegacyLockSpendContext> legacy_lock_context;
+    if (!use_legacy_b3coin && params.GetConsensus().legacy_b3coin) {
+        if (const std::optional<int> H{Consensus::LegacyFinalHeight(params.GetConsensus())}) {
+            legacy_lock_context = LegacyLockSpendContext{*H, LEGACY_BLOCK_SCRIPT_FLAGS};
+        }
+    }
 
     const auto time_2{SteadyClock::now()};
     m_chainman.time_forks += time_2 - time_1;
@@ -2787,8 +2863,10 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         {
             TxValidationState tx_state;
             const bool inputs_valid{use_legacy_b3coin ?
-                CheckLegacyTxInputs(tx, tx_state, view, pindex->nHeight, txfee, tx_value_in) :
-                Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee)};
+                CheckLegacyTxInputs(tx, tx_state, view, pindex->nHeight, txfee, tx_value_in,
+                                    params.GetConsensus()) :
+                Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee,
+                                         Consensus::LegacyFinalHeight(params.GetConsensus()))};
             if (!inputs_valid) {
                 // Any transaction validation failure in ConnectBlock is a block consensus failure
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
@@ -2805,8 +2883,9 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 }
                 nFees += txfee;
                 if (!tx.IsCoinStake() &&
-                    tx_value_in - tx.GetValueOut() >= legacy::GetFNCollateral(pindex->nHeight)) {
-                    legacy_fn_integrated += legacy::GetFNCollateral(pindex->nHeight);
+                    tx_value_in - tx.GetValueOut() >=
+                        legacy::GetFNCollateral(pindex->nHeight, params.GetConsensus())) {
+                    legacy_fn_integrated += legacy::GetFNCollateral(pindex->nHeight, params.GetConsensus());
                 }
                 legacy_sigops += GetP2SHSigOpCount(tx, view);
                 if (legacy_sigops > legacy::MAX_BLOCK_SIGOPS) {
@@ -2870,7 +2949,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             // they need to be added to control which runs them asynchronously. Otherwise, CheckInputScripts runs the checks before returning.
             if (control) {
                 std::vector<CScriptCheck> vChecks;
-                tx_ok = CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], m_chainman.m_validation_cache, &vChecks);
+                tx_ok = CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], m_chainman.m_validation_cache, &vChecks, legacy_lock_context);
                 if (tx_ok) control->Add(std::move(vChecks));
             } else {
                 tx_ok = CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], m_chainman.m_validation_cache);
@@ -2946,12 +3025,25 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             }
         }
     } else if (params.GetConsensus().legacy_b3coin) {
-        // MODERN-era B3 block: dispatch by connected era to the modern PoS
-        // interface only — never the legacy kernel, modifiers, rewards or
-        // difficulty, and no stock Bitcoin subsidy rule either. Until an
-        // approved modern rule set is installed this rejects every block
-        // (modern/pos.h documents the missing rule set precisely).
-        if (state.IsValid()) {
+        // MODERN-era B3 block: dispatch by production phase. A temporary-PoW
+        // corridor block earned its place through the scrypt eligibility
+        // check at header accept; here only its coinbase claim is bounded
+        // (fees plus the configured corridor reward — 0, fees-only, until
+        // the corridor reward model is decided). A modern-PoS block goes to
+        // the modern PoS interface only — never the legacy kernel,
+        // modifiers, rewards or difficulty, and no stock Bitcoin subsidy
+        // rule either. Until an approved modern rule set is installed that
+        // path rejects every block (modern/pos.h documents the missing rule
+        // set precisely).
+        if (Consensus::GetConsensusPhase(pindex->nHeight, params.GetConsensus()) ==
+            Consensus::ConsensusPhase::TRANSITION_POW) {
+            const CAmount corridor_reward{nFees + params.GetConsensus().transition_pow_reward};
+            if (block.vtx[0]->GetValueOut() > corridor_reward && state.IsValid()) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
+                              strprintf("corridor coinbase pays too much (actual=%d vs limit=%d)",
+                                        block.vtx[0]->GetValueOut(), corridor_reward));
+            }
+        } else if (state.IsValid()) {
             (void)modern::CheckModernStake(block, *pindex->pprev, view, state,
                                            params.GetConsensus().test_only_modern_pos_validator);
         }
@@ -4424,10 +4516,19 @@ static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& st
     // blocks, and validates PoS kernels after the UTXO view is available.
     // Only legacy-codec headers take that deferral: a marker-modern header
     // never enters legacy validation and receives the stock check until the
-    // modern B3 PoS activation task replaces it.
+    // modern B3 PoS activation task replaces it. When a temporary-PoW
+    // corridor is configured, marker-modern headers defer too: without a
+    // height this function cannot tell a corridor header (scrypt eligibility
+    // hash) from a post-corridor one, so both are checked contextually in
+    // ContextualCheckBlockHeader, where the height is known.
     const bool legacy_header{consensusParams.legacy_b3coin &&
                              !Consensus::HasB3BlockCodecV2(block.nVersion)};
-    if (fCheckPOW && !legacy_header && !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
+    const bool corridor_deferred{consensusParams.legacy_b3coin &&
+                                 Consensus::HasB3BlockCodecV2(block.nVersion) &&
+                                 consensusParams.hard_fork_height.has_value() &&
+                                 consensusParams.transition_pow_length > 0};
+    if (fCheckPOW && !legacy_header && !corridor_deferred &&
+        !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
 
     return true;
@@ -4898,7 +4999,7 @@ static bool ContextualCheckLegacyBlock(const CBlock& block, BlockValidationState
  *  v0.12 and v0.15 (when no additional protection was in place) whereby an attacker could unboundedly
  *  grow our in-memory block index. See https://bitcoincore.org/en/2024/07/03/disclose-header-spam.
  */
-static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, BlockManager& blockman, const ChainstateManager& chainman, const CBlockIndex* pindexPrev) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, BlockManager& blockman, const ChainstateManager& chainman, const CBlockIndex* pindexPrev, const bool check_pow = true) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
 {
     AssertLockHeld(::cs_main);
     assert(pindexPrev != nullptr);
@@ -4984,8 +5085,37 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         }
         return true;
     }
-    if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
-        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits", "incorrect proof of work");
+    if (Consensus::GetConsensusPhase(nHeight, consensusParams) ==
+        Consensus::ConsensusPhase::TRANSITION_POW) {
+        // Temporary-PoW corridor block. Identity stays in the modern hash
+        // domain; the historical B3 scrypt primitive is used ONLY as the
+        // proof-of-work eligibility hash against nBits. The corridor
+        // difficulty is the constant configured target; while the corridor
+        // difficulty policy is unresolved (mainnet), no target is configured
+        // and corridor blocks fail closed here.
+        if (!consensusParams.transition_pow_bits) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "no-transition-pow-rules",
+                                 "temporary-PoW corridor difficulty policy is not configured");
+        }
+        if (block.nBits != *consensusParams.transition_pow_bits) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits",
+                                 "incorrect temporary-PoW corridor difficulty");
+        }
+        if (check_pow && !CheckTransitionPowEligibility(block)) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash",
+                                 "temporary-PoW scrypt eligibility hash exceeds target");
+        }
+    } else {
+        if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits", "incorrect proof of work");
+        // The deferred context-free check for post-corridor marker-modern
+        // headers (CheckBlockHeader skips it whenever a corridor is
+        // configured, since it has no height there).
+        if (check_pow && consensusParams.legacy_b3coin && consensusParams.transition_pow_length > 0 &&
+            !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams)) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
+        }
+    }
 
     // Check timestamp against prev
     if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())
@@ -5035,6 +5165,18 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
         // is header-only. The mandatory target check is repeated in
         // ConnectBlock after every parent has been connected.
         return ContextualCheckLegacyBlock(block, state, consensus_params, pindexPrev, /*check_target=*/false);
+    }
+
+    // MODERN-era B3 blocks: every output claiming the STAKE magic must be a
+    // valid v1 STAKE output — a malformed claim is a block failure, never a
+    // silent reinterpretation as an ordinary output.
+    if (consensus_params.legacy_b3coin) {
+        for (const auto& tx : block.vtx) {
+            if (std::string stake_error; !modern::CheckStakeOutputs(*tx, consensus_params, stake_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-stake-output",
+                                     strprintf("%s in transaction %s", stake_error, tx->GetHash().ToString()));
+            }
+        }
     }
 
     // Enforce BIP113 (Median Time Past).
@@ -5436,7 +5578,7 @@ BlockValidationState TestBlockValidity(
      * - do run ContextualCheckBlock()
      */
 
-    if (!ContextualCheckBlockHeader(block, state, chainstate.m_blockman, chainstate.m_chainman, tip)) {
+    if (!ContextualCheckBlockHeader(block, state, chainstate.m_blockman, chainstate.m_chainman, tip, check_pow)) {
         if (state.IsValid()) NONFATAL_UNREACHABLE();
         return state;
     }

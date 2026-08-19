@@ -5,6 +5,22 @@ where they conflict. Do not reinterpret these decisions. If an implementation pr
 appears to require changing something here, **stop and report the contradiction** rather
 than choosing a new protocol.
 
+> **Precedence note (2026-08-16).** [b3-master-handoff.md](b3-master-handoff.md) is now
+> the **top authority** among the documents in this directory. This contract remains
+> binding everywhere the handoff does not contradict it — which is nearly everywhere —
+> but where the two disagree, the handoff governs. This document was deliberately
+> **not** rewritten to match; the known disagreements are catalogued in
+> [b3-master-handoff-conflicts.md](b3-master-handoff-conflicts.md).
+>
+> **Precedence safeguard (2026-08-16).** Direct, explicit project-owner decisions
+> are the highest authority. When such a decision conflicts with tracked governing
+> documentation, implementation must stop until the documentation is reconciled in
+> a reviewed commit. Untracked or unreviewed working-tree documents are proposals
+> only and cannot acquire governing authority merely by declaring precedence. The
+> persistent order: (1) latest explicit project-owner ruling; (2) reviewed and
+> committed architecture contract / master handoff; (3) reviewed subordinate
+> design documents; (4) implementation assumptions.
+
 Items marked *(open)* are deliberately unresolved and are tracked in
 [b3-open-decisions.md](b3-open-decisions.md).
 
@@ -54,6 +70,24 @@ configuration option may change them on mainnet (no `-finallegacyheight=`,
 `-finallegacyhash=`). Regtest and testnet may expose override facilities; mainnet may not.
 
 Existing mainnet H and X are not configured until a later explicitly approved task.
+
+**Transition-corridor reconciliation (2026-08-16,
+[b3-during-fork-transition.md](b3-during-fork-transition.md)):** the fork is
+a staged process. `H = FINAL_LEGACY_POS_HEIGHT` and `X = hash(H)` are exactly
+this contract's boundary: everything stated about `H`/`H+1` — the immutable
+anchor, the finality boundary, the reorg prohibition, the absolute
+format/codec switch at `H+1`, trusted replay ending at `H` — applies
+unchanged. What the corridor refines is the **block-production consensus**
+inside the modern format: heights `H+1 … H+1000` are the temporary-PoW
+corridor (modern blocks, modern transactions, Policy Outputs, block
+production by B3's historically existing PoW primitive), during which real
+STAKE Policy Outputs are created and matured; `M = H+1001` is the first
+modern-PoS block, validated against the registry derived deterministically
+at the end of `H+1000`. "Modern era" in this contract therefore spans two
+production phases (TRANSITION_POW, then MODERN_POS) over one unchanged
+modern block/transaction format; where this contract says modern PoS begins
+at `H+1`, read: the modern *format* begins at `H+1`, modern *PoS* begins at
+`M = H+1001`. After `H`, legacy PoS never resumes under any circumstances.
 
 ## 3. H is a finality boundary
 

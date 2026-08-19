@@ -140,6 +140,37 @@ public:
 
     bool Valid() const;
 
+    //! Exact-consumption key read: deserializes and additionally
+    //! requires the key bytes to be COMPLETELY consumed — canonical
+    //! data followed by trailing bytes fails.
+    template<typename K> bool GetKeyExact(K& key) {
+        try {
+            DataStream ssKey{GetKeyImpl()};
+            ssKey >> key;
+            return ssKey.empty();
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+
+    //! Exact-consumption value read: applies the normal CDBWrapper
+    //! deobfuscation (like GetValue), deserializes, and requires the
+    //! value bytes to be COMPLETELY consumed.
+    template<typename V> bool GetValueExact(V& value) {
+        try {
+            DataStream ssValue{GetValueImpl()};
+            dbwrapper_private::GetObfuscation(parent)(ssValue);
+            ssValue >> value;
+            return ssValue.empty();
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+
+    //! Underlying iterator status: false on an I/O or checksum error —
+    //! iterator termination alone is NOT proof of a clean end-of-range.
+    bool StatusOK() const;
+
     void SeekToFirst();
 
     template<typename K> void Seek(const K& key) {

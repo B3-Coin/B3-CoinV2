@@ -29,7 +29,13 @@
 #include <node/utxo_rows.h>
 #include <kernel/mempool_removal_reason.h>
 #include <modern/pos.h>
+#include <modern/stake.h>
 #include <node/mempool_persist.h>
+#include <node/miner.h>
+#include <node/chainstate.h>
+#include <node/kernel_notifications.h>
+#include <node/stake_registry.h>
+#include <pow.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <pubkey.h>
@@ -85,7 +91,12 @@ struct TransitionSetup : public ChainTestingSetup {
     // The synthetic chain pays to anyone-can-spend scripts, which stock
     // standardness policy would reject; the mempool boundary tests exercise
     // the era gate, not standardness, so allow non-standard transactions.
-    TransitionSetup() : ChainTestingSetup{ChainType::REGTEST, {.extra_args = {"-acceptnonstdtxn=1"}}}
+    static TestOpts WithDefaults(TestOpts opts)
+    {
+        opts.extra_args.push_back("-acceptnonstdtxn=1");
+        return opts;
+    }
+    explicit TransitionSetup(TestOpts opts = {}) : ChainTestingSetup{ChainType::REGTEST, WithDefaults(std::move(opts))}
     {
         SetMockTime(MOCK_NOW);
         auto& consensus{const_cast<Consensus::Params&>(m_node.chainman->GetConsensus())};
@@ -103,6 +114,14 @@ struct TransitionSetup : public ChainTestingSetup {
         consensus.hashGenesisBlock = genesis.GetLegacyB3Hash();
         LoadVerifyActivateChainstate();
     }
+};
+
+//! Disk-backed variant: block-tree and coins databases on disk, so a
+//! simulated shutdown/restart (chainman teardown + reconstruction) reloads
+//! the persisted block index through LoadBlockIndexGuts.
+struct TransitionDiskSetup : public TransitionSetup {
+    TransitionDiskSetup()
+        : TransitionSetup{{.coins_db_in_memory = false, .block_tree_db_in_memory = false}} {}
 };
 
 //! Accept-all modern PoS adapter, counting dispatches.
@@ -1700,6 +1719,1215 @@ BOOST_AUTO_TEST_CASE(non_empty_transition_fails_closed_at_h_plus_one)
         BOOST_CHECK(chainman.ActiveChainstate().LegacyBoundaryActive());
         BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->nHeight, H);
         BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->GetBlockHash().GetHex(), X.GetHex());
+    }
+}
+
+//! Temporary-PoW corridor validation (stage 2 of the corridor build-out):
+//! with a pinned boundary and a configured corridor, marker-modern blocks in
+//! H+1..H+length validate by the historical scrypt eligibility hash against
+//! the constant corridor target — block identity stays in the modern hash
+//! domain — and connect WITHOUT modern PoS; the fail-closed modern gate
+//! moves to the first post-corridor height. An unset corridor target fails
+//! closed; wrong nBits and an insufficient scrypt hash are refused.
+BOOST_AUTO_TEST_CASE(transition_pow_corridor_validation)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int H{3};
+    constexpr int CORRIDOR{5};
+    constexpr uint32_t EASY_BITS{0x207fffff};
+
+    const auto tip{[&] { return WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()); }};
+
+    // A short live-legacy chain to H.
+    const auto build_legacy{[&](const CBlockIndex* prev) {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (prev->nHeight + 1) << CScriptNum{99};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, prev->nHeight + 1, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        return block;
+    }};
+    for (int height{1}; height <= H; ++height) {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(CodecRoundTrip(build_legacy(tip())), true, true, &new_block));
+        BOOST_REQUIRE(new_block);
+    }
+    const uint256 X{tip()->GetBlockHash()};
+
+    // Pin the boundary and configure the corridor (regtest scaffolding bits).
+    mutable_consensus.hard_fork_height = H + 1;
+    mutable_consensus.legacy_final_hash = X;
+    mutable_consensus.transition_pow_length = CORRIDOR;
+    mutable_consensus.transition_pow_bits = EASY_BITS;
+    BOOST_REQUIRE(consensus.test_only_modern_pos_validator == nullptr);
+
+    // Corridor block builder: modern codec identity, scrypt-ground nBits.
+    const auto build_corridor{[&](const CBlockIndex* prev, const uint32_t bits, const bool grind_scrypt) {
+        CMutableTransaction coinbase;
+        coinbase.version = 2;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << CScriptNum{prev->nHeight + 1} << CScriptNum{7};
+        coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = bits;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        if (grind_scrypt) {
+            while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        } else {
+            // Find a nonce whose scrypt eligibility hash FAILS the target.
+            while (UintToArith256(block.GetLegacyB3Hash()) <= target) ++block.nNonce;
+        }
+        return block;
+    }};
+
+    // Wrong corridor difficulty is refused at the header.
+    {
+        CBlock bad{build_corridor(tip(), /*bits=*/0x207ffffe, /*grind_scrypt=*/true)};
+        bool new_block{false};
+        BOOST_CHECK(!chainman.ProcessNewBlock(CodecRoundTrip(bad), true, true, &new_block));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(bad.GetHash())) == nullptr);
+    }
+    // A failing scrypt eligibility hash is refused, regardless of the
+    // modern-domain identity hash.
+    {
+        CBlock bad{build_corridor(tip(), EASY_BITS, /*grind_scrypt=*/false)};
+        bool new_block{false};
+        BOOST_CHECK(!chainman.ProcessNewBlock(CodecRoundTrip(bad), true, true, &new_block));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(bad.GetHash())) == nullptr);
+    }
+    // An unset corridor target fails closed.
+    {
+        mutable_consensus.transition_pow_bits.reset();
+        CBlock blocked{build_corridor(tip(), EASY_BITS, /*grind_scrypt=*/true)};
+        bool new_block{false};
+        BOOST_CHECK(!chainman.ProcessNewBlock(CodecRoundTrip(blocked), true, true, &new_block));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(blocked.GetHash())) == nullptr);
+        mutable_consensus.transition_pow_bits = EASY_BITS;
+    }
+
+    // The whole corridor connects under temporary PoW — no modern PoS
+    // involvement, no test validator installed.
+    for (int i{0}; i < CORRIDOR; ++i) {
+        CBlock block{build_corridor(tip(), EASY_BITS, /*grind_scrypt=*/true)};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(CodecRoundTrip(block), true, true, &new_block),
+                              "corridor block at height " << tip()->nHeight + 1 << " rejected");
+        BOOST_REQUIRE(new_block);
+    }
+    BOOST_CHECK_EQUAL(tip()->nHeight, H + CORRIDOR);
+
+    // The first post-corridor height is modern PoS: fail-closed, exactly the
+    // reason the modern gate gives, and the tip stays at the corridor end.
+    {
+        CBlock modern{build_corridor(tip(), EASY_BITS, /*grind_scrypt=*/true)};
+        // Post-corridor nBits follow the stock modern rule (placeholder until
+        // the modern PoS spec defines them); regtest's min-difficulty
+        // walk-back lands on the last non-limit legacy bits. Grind the
+        // modern-domain identity hash so only the PoS gate can refuse it.
+        modern.nBits = GetNextWorkRequired(tip(), &modern, consensus);
+        {
+            const arith_uint256 sha_target{arith_uint256().SetCompact(modern.nBits)};
+            modern.nNonce = 0;
+            while (UintToArith256(modern.GetHash()) > sha_target) ++modern.nNonce;
+        }
+        {
+            LOCK(cs_main);
+            const BlockValidationState state{TestBlockValidity(
+                chainman.ActiveChainstate(), modern, /*check_pow=*/false, /*check_merkle_root=*/true)};
+            BOOST_REQUIRE(state.IsInvalid());
+            BOOST_CHECK_EQUAL(state.GetRejectReason(), "no-modern-pos-rules");
+        }
+        BOOST_CHECK_EQUAL(tip()->nHeight, H + CORRIDOR);
+    }
+}
+
+//! Corridor block production (stage 3): the assembler produces marker-modern
+//! corridor templates with the configured corridor difficulty and a
+//! fees-plus-corridor-reward coinbase; ground with the scrypt eligibility
+//! helper they connect through the full network path. Production fails
+//! cleanly when the corridor difficulty is unset, for legacy-era heights,
+//! and at the first modern-PoS height (fail-closed gate).
+BOOST_AUTO_TEST_CASE(transition_pow_corridor_production)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int H{3};
+    constexpr int CORRIDOR{3};
+    constexpr uint32_t EASY_BITS{0x207fffff};
+
+    const auto tip{[&] { return WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()); }};
+    const auto build_legacy{[&](const CBlockIndex* prev) {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (prev->nHeight + 1) << CScriptNum{99};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, prev->nHeight + 1, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        return block;
+    }};
+
+    node::BlockAssembler::Options options;
+    options.coinbase_output_script = CScript() << OP_TRUE;
+    options.include_dummy_extranonce = true; // two-byte coinbase scriptSig at tiny heights
+
+    // Legacy-era production is refused up front.
+    BOOST_CHECK_THROW(
+        node::BlockAssembler(chainman.ActiveChainstate(), nullptr, options).CreateNewBlock(),
+        std::runtime_error);
+
+    for (int height{1}; height <= H; ++height) {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(CodecRoundTrip(build_legacy(tip())), true, true, &new_block));
+        BOOST_REQUIRE(new_block);
+    }
+    mutable_consensus.hard_fork_height = H + 1;
+    mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
+    mutable_consensus.transition_pow_length = CORRIDOR;
+
+    // Unset corridor difficulty refuses production (fail closed).
+    BOOST_CHECK_THROW(
+        node::BlockAssembler(chainman.ActiveChainstate(), nullptr, options).CreateNewBlock(),
+        std::runtime_error);
+    mutable_consensus.transition_pow_bits = EASY_BITS;
+
+    // Produce, grind and submit the whole corridor through the assembler.
+    for (int i{0}; i < CORRIDOR; ++i) {
+        SetMockTime(GetTime<std::chrono::seconds>() + std::chrono::seconds{20});
+        const auto tmpl{node::BlockAssembler(chainman.ActiveChainstate(), nullptr, options).CreateNewBlock()};
+        BOOST_REQUIRE(tmpl);
+        CBlock block{tmpl->block};
+        BOOST_CHECK(Consensus::HasB3BlockCodecV2(block.nVersion));
+        BOOST_CHECK_EQUAL(block.nBits, EASY_BITS);
+        BOOST_CHECK_EQUAL(block.vtx[0]->GetValueOut(), 0); // fees only, reward param 0
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.nNonce = 0;
+        while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(
+            chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+            "assembled corridor block at height " << tip()->nHeight + 1 << " rejected");
+        BOOST_REQUIRE(new_block);
+    }
+    BOOST_CHECK_EQUAL(tip()->nHeight, H + CORRIDOR);
+
+    // The first modern-PoS height cannot be produced: the template's own
+    // validity check hits the fail-closed modern gate.
+    BOOST_CHECK_THROW(
+        node::BlockAssembler(chainman.ActiveChainstate(), nullptr, options).CreateNewBlock(),
+        std::runtime_error);
+    BOOST_CHECK_EQUAL(tip()->nHeight, H + CORRIDOR);
+}
+
+//! Legacy UTXO -> modern OWNER crossing (stage 4): inside the corridor, a
+//! modern transaction spends pre-H coins through the LEGACY_LOCK view under
+//! the FROZEN legacy script rules — proven by a witness-program-shaped
+//! legacy script that modern flags would refuse and the frozen rules accept
+//! — while the same script created as a MODERN coin is refused under modern
+//! rules, and the frozen legacy maturity rides with legacy coinbases.
+BOOST_AUTO_TEST_CASE(legacy_lock_crossing_spend)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int H{32};
+    constexpr uint32_t EASY_BITS{0x207fffff};
+    const auto tip{[&] { return WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()); }};
+
+    const auto build_legacy{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (prev->nHeight + 1) << CScriptNum{99};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, prev->nHeight + 1, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) {
+            mtx.m_legacy_encoding = true;
+            block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        return block;
+    }};
+
+    // Legacy chain: 31 plain blocks, then H = 32 carries a spend of the
+    // (matured) coinbase 1 into a witness-program-SHAPED legacy script:
+    // OP_0 <32 bytes>. Historically creatable; under frozen legacy rules it
+    // is a plain push script, under modern flags it demands witness data.
+    Txid coinbase1{};
+    Txid coinbase31{};
+    for (int height{1}; height <= H - 1; ++height) {
+        const auto submitted{CodecRoundTrip(build_legacy(tip(), {}))};
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(submitted, true, true, &new_block));
+        if (height == 1) coinbase1 = submitted->vtx[0]->GetHash();
+        if (height == 31) coinbase31 = submitted->vtx[0]->GetHash();
+    }
+    const CScript witness_shaped{CScript() << OP_0 << std::vector<unsigned char>(32, 0xab)};
+    CMutableTransaction lock_spend;
+    lock_spend.version = 1;
+    lock_spend.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 17);
+    lock_spend.vin.resize(1);
+    lock_spend.vin[0].prevout = COutPoint{coinbase1, 0};
+    lock_spend.vin[0].scriptSig = CScript{};
+    lock_spend.vout.emplace_back(legacy::GetProofOfWorkReward(0, 1, consensus), witness_shaped);
+    const auto block_h{CodecRoundTrip(build_legacy(tip(), {lock_spend}))};
+    const Txid witness_shaped_txid{block_h->vtx[1]->GetHash()};
+    {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(block_h, true, true, &new_block));
+    }
+    BOOST_REQUIRE_EQUAL(tip()->nHeight, H);
+
+    mutable_consensus.hard_fork_height = H + 1;
+    mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
+    mutable_consensus.transition_pow_length = 8;
+    mutable_consensus.transition_pow_bits = EASY_BITS;
+
+    const auto build_corridor{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 2;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << CScriptNum{prev->nHeight + 1} << CScriptNum{7};
+        coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = EASY_BITS;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.nNonce = 0;
+        while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
+        return block;
+    }};
+
+    // Corridor block H+1: a MODERN transaction spends the witness-shaped
+    // legacy coin with an empty scriptSig — valid ONLY under the frozen
+    // legacy rule set — and a matured legacy coinbase, creating ordinary
+    // modern outputs (the OWNER policy view).
+    const CScript owner_script{CScript() << std::vector<unsigned char>(24, 0xc4) << OP_DROP << OP_TRUE};
+    CMutableTransaction crossing;
+    crossing.version = 2;
+    crossing.vin.resize(1);
+    crossing.vin[0].prevout = COutPoint{witness_shaped_txid, 0};
+    crossing.vin[0].scriptSig = CScript{};
+    crossing.vout.emplace_back(legacy::GetProofOfWorkReward(0, 1, consensus) - 1000, owner_script);
+    const Txid crossing_txid{CTransaction{crossing}.GetHash()};
+    {
+        CBlock block{build_corridor(tip(), {crossing})};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+                              "crossing spend refused");
+        BOOST_REQUIRE(new_block);
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 1);
+    }
+    {
+        LOCK(cs_main);
+        CCoinsViewCache& coins{chainman.ActiveChainstate().CoinsTip()};
+        BOOST_CHECK(!coins.HaveCoin(COutPoint{witness_shaped_txid, 0}));
+        const Coin& owner{coins.AccessCoin(COutPoint{crossing_txid, 0})};
+        BOOST_REQUIRE(!owner.IsSpent());
+        BOOST_CHECK(owner.out.scriptPubKey == owner_script);
+        BOOST_CHECK(!owner.fCoinBase);
+        BOOST_CHECK_EQUAL(owner.nHeight, static_cast<uint32_t>(H + 1));
+    }
+
+    // Control: the SAME witness-shaped script created as a MODERN coin is
+    // governed by modern rules — an empty-scriptSig spend is refused.
+    CMutableTransaction make_modern_witness_shaped;
+    make_modern_witness_shaped.version = 2;
+    make_modern_witness_shaped.vin.resize(1);
+    make_modern_witness_shaped.vin[0].prevout = COutPoint{crossing_txid, 0};
+    make_modern_witness_shaped.vin[0].scriptSig = CScript{};
+    make_modern_witness_shaped.vout.emplace_back(
+        legacy::GetProofOfWorkReward(0, 1, consensus) - 2000, witness_shaped);
+    const Txid modern_ws_txid{CTransaction{make_modern_witness_shaped}.GetHash()};
+    {
+        CBlock block{build_corridor(tip(), {make_modern_witness_shaped})};
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block));
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 2);
+    }
+    {
+        CMutableTransaction bad_spend;
+        bad_spend.version = 2;
+        bad_spend.vin.resize(1);
+        bad_spend.vin[0].prevout = COutPoint{modern_ws_txid, 0};
+        bad_spend.vin[0].scriptSig = CScript{};
+        bad_spend.vout.emplace_back(1000, owner_script);
+        CBlock block{build_corridor(tip(), {bad_spend})};
+        LOCK(cs_main);
+        const BlockValidationState state{TestBlockValidity(
+            chainman.ActiveChainstate(), block, /*check_pow=*/true, /*check_merkle_root=*/true)};
+        BOOST_REQUIRE(state.IsInvalid());
+        BOOST_CHECK(state.GetRejectReason().find("block-script-verify-flag-failed") != std::string::npos);
+    }
+
+    // The frozen legacy maturity rides with legacy coins: coinbase 31 has
+    // depth 3 < 30 at H + 3 and is refused; after enough corridor burial the
+    // same spend connects.
+    CMutableTransaction premature;
+    premature.version = 2;
+    premature.vin.resize(1);
+    premature.vin[0].prevout = COutPoint{coinbase31, 0};
+    premature.vin[0].scriptSig = CScript{};
+    premature.vout.emplace_back(legacy::GetProofOfWorkReward(0, 31, consensus) - 1000, owner_script);
+    {
+        CBlock block{build_corridor(tip(), {premature})};
+        LOCK(cs_main);
+        const BlockValidationState state{TestBlockValidity(
+            chainman.ActiveChainstate(), block, /*check_pow=*/true, /*check_merkle_root=*/true)};
+        BOOST_REQUIRE(state.IsInvalid());
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-txns-premature-spend-of-legacy-coin");
+    }
+    // Bury to depth >= 30 for coinbase 31 (spend height must reach 61) while
+    // staying inside the corridor? Depth 30 needs height 61 > corridor end
+    // (H + 8 = 40): instead prove the positive control with coinbase at
+    // height 5, depth 37 at the next corridor height.
+    {
+        // Rebuild a positive-control spend of an old, deep coinbase.
+        // coinbase1 is spent; use the block-2 coinbase via its known pattern:
+        // heights 2..31 all hold OP_TRUE coinbases; fetch block 2's coinbase
+        // from the chain index.
+        const CBlockIndex* idx2{WITH_LOCK(cs_main, return chainman.ActiveChain()[2])};
+        CBlock block2;
+        BOOST_REQUIRE(chainman.m_blockman.ReadBlock(block2, *idx2));
+        const Txid coinbase2{block2.vtx[0]->GetHash()};
+        CMutableTransaction deep;
+        deep.version = 2;
+        deep.vin.resize(1);
+        deep.vin[0].prevout = COutPoint{coinbase2, 0};
+        deep.vin[0].scriptSig = CScript{};
+        deep.vout.emplace_back(legacy::GetProofOfWorkReward(0, 2, consensus) - 1000, owner_script);
+        CBlock block{build_corridor(tip(), {deep})};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+                              "deep legacy coinbase crossing refused");
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 3);
+    }
+}
+
+//! STAKE policy in the corridor (stage 5): a real STAKE Policy Output is
+//! created from legacy value crossing through LEGACY_LOCK, a malformed
+//! STAKE-claiming output is a block consensus failure, and cancelling is an
+//! ordinary owner spend of the principal (self-policing).
+BOOST_AUTO_TEST_CASE(stake_policy_in_corridor)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int H{32};
+    constexpr uint32_t EASY_BITS{0x207fffff};
+    const auto tip{[&] { return WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()); }};
+
+    const auto build_legacy{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (prev->nHeight + 1) << CScriptNum{99};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, prev->nHeight + 1, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) {
+            mtx.m_legacy_encoding = true;
+            block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        return block;
+    }};
+    const auto build_corridor{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 2;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << CScriptNum{prev->nHeight + 1} << CScriptNum{7};
+        coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = EASY_BITS;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.nNonce = 0;
+        while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
+        return block;
+    }};
+
+    // Legacy history; H carries a spend of the matured coinbase 1 into a
+    // plain legacy value coin (non-coinbase: no crossing maturity).
+    Txid coinbase1{};
+    for (int height{1}; height <= H - 1; ++height) {
+        const auto submitted{CodecRoundTrip(build_legacy(tip(), {}))};
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(submitted, true, true, &new_block));
+        if (height == 1) coinbase1 = submitted->vtx[0]->GetHash();
+    }
+    CMutableTransaction fund;
+    fund.version = 1;
+    fund.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 17);
+    fund.vin.resize(1);
+    fund.vin[0].prevout = COutPoint{coinbase1, 0};
+    fund.vin[0].scriptSig = CScript{};
+    fund.vout.emplace_back(legacy::GetProofOfWorkReward(0, 1, consensus), CScript() << OP_TRUE);
+    const auto block_h{CodecRoundTrip(build_legacy(tip(), {fund}))};
+    const Txid fund_txid{block_h->vtx[1]->GetHash()};
+    {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(block_h, true, true, &new_block));
+    }
+    mutable_consensus.hard_fork_height = H + 1;
+    mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
+    mutable_consensus.transition_pow_length = 6;
+    mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.min_stake_amount = 1000; // regtest scaffolding
+
+    // Corridor block 1: legacy value crosses into a real STAKE output plus
+    // ordinary change.
+    std::array<unsigned char, 32> validator_key{};
+    validator_key.fill(0x42);
+    const CScript owner{CScript() << OP_TRUE};
+    const CAmount principal{legacy::GetProofOfWorkReward(0, 1, consensus) / 2};
+    CMutableTransaction stake_tx;
+    stake_tx.version = 2;
+    stake_tx.vin.resize(1);
+    stake_tx.vin[0].prevout = COutPoint{fund_txid, 0};
+    stake_tx.vin[0].scriptSig = CScript{};
+    stake_tx.vout.emplace_back(principal, modern::MakeStakeScript(validator_key, owner));
+    stake_tx.vout.emplace_back(legacy::GetProofOfWorkReward(0, 1, consensus) - principal - 1000,
+                               CScript() << OP_TRUE);
+    const Txid stake_txid{CTransaction{stake_tx}.GetHash()};
+    {
+        CBlock block{build_corridor(tip(), {stake_tx})};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+                              "stake creation refused");
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 1);
+    }
+    {
+        LOCK(cs_main);
+        const Coin& stake{chainman.ActiveChainstate().CoinsTip().AccessCoin(COutPoint{stake_txid, 0})};
+        BOOST_REQUIRE(!stake.IsSpent());
+        BOOST_REQUIRE(modern::ClaimsStakeMagic(stake.out.scriptPubKey));
+        std::string error;
+        const auto view{modern::ParseStakeOutput(stake.out, error)};
+        BOOST_REQUIRE_MESSAGE(view.has_value(), error);
+        BOOST_CHECK_EQUAL(view->amount, principal);
+        BOOST_CHECK(view->validator_key == validator_key);
+        BOOST_CHECK(view->owner_script == owner);
+    }
+
+    // A malformed STAKE claim (zero validator key) is a block failure.
+    {
+        CMutableTransaction bad;
+        bad.version = 2;
+        bad.vin.resize(1);
+        bad.vin[0].prevout = COutPoint{stake_txid, 1};
+        bad.vin[0].scriptSig = CScript{};
+        bad.vout.emplace_back(1000, modern::MakeStakeScript(std::array<unsigned char, 32>{}, owner));
+        CBlock block{build_corridor(tip(), {bad})};
+        LOCK(cs_main);
+        const BlockValidationState state{TestBlockValidity(
+            chainman.ActiveChainstate(), block, /*check_pow=*/true, /*check_merkle_root=*/true)};
+        BOOST_REQUIRE(state.IsInvalid());
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-stake-output");
+    }
+
+    // Cancelling is an ordinary owner spend of the principal.
+    {
+        CMutableTransaction cancel;
+        cancel.version = 2;
+        cancel.vin.resize(1);
+        cancel.vin[0].prevout = COutPoint{stake_txid, 0};
+        cancel.vin[0].scriptSig = CScript{};
+        cancel.vout.emplace_back(principal - 1000, CScript() << OP_TRUE);
+        CBlock block{build_corridor(tip(), {cancel})};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+                              "stake cancel refused");
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 2);
+        LOCK(cs_main);
+        BOOST_CHECK(!chainman.ActiveChainstate().CoinsTip().HaveCoin(COutPoint{stake_txid, 0}));
+    }
+}
+
+//! The complete transition corridor end to end (stage 8): a live legacy
+//! chain to H, the frozen boundary, all 1,000 temporary-PoW corridor blocks
+//! produced and connected, real STAKE outputs created from crossing legacy
+//! value (including a split-stake validator proving e2e aggregation and a
+//! late stake that stays PENDING), the registry derived at H+1000, and the
+//! first attempted modern-PoS block at H+1001 stopped by the deliberate
+//! fail-closed no-modern-pos-rules gate with the chain exactly at the
+//! corridor end.
+BOOST_AUTO_TEST_CASE(full_corridor_end_to_end)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int H{32};
+    constexpr int CORRIDOR{1000};
+    constexpr uint32_t EASY_BITS{0x207fffff};
+    const auto tip{[&] { return WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()); }};
+
+    const auto build_legacy{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (prev->nHeight + 1) << CScriptNum{99};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, prev->nHeight + 1, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) {
+            mtx.m_legacy_encoding = true;
+            block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        return block;
+    }};
+    const auto build_corridor{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 2;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << CScriptNum{prev->nHeight + 1} << CScriptNum{7};
+        coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = EASY_BITS;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.nNonce = 0;
+        while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
+        return block;
+    }};
+    const auto submit_corridor{[&](std::vector<CMutableTransaction> txs) {
+        SetMockTime(std::max<int64_t>(MOCK_NOW, tip()->GetBlockTime() + 60));
+        CBlock block{build_corridor(tip(), std::move(txs))};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+                              "corridor block at height " << tip()->nHeight + 1 << " rejected");
+        BOOST_REQUIRE(new_block);
+    }};
+    // Mining-path checkpoint: the ASSEMBLER produces the corridor block —
+    // marker-modern template with the corridor difficulty and a
+    // fees-plus-corridor-reward coinbase — then the shared scrypt grind and
+    // the ordinary submit path connect it.
+    const auto assemble_and_submit{[&](const CAmount expected_fees) {
+        SetMockTime(std::max<int64_t>(MOCK_NOW, tip()->GetBlockTime() + 60));
+        node::BlockAssembler::Options options;
+        options.coinbase_output_script = CScript() << OP_TRUE;
+        options.include_dummy_extranonce = true;
+        const auto tmpl{node::BlockAssembler(chainman.ActiveChainstate(), m_node.mempool.get(), options)
+                            .CreateNewBlock()};
+        BOOST_REQUIRE(tmpl);
+        CBlock block{tmpl->block};
+        BOOST_CHECK(Consensus::HasB3BlockCodecV2(block.nVersion));
+        BOOST_CHECK_EQUAL(block.nBits, EASY_BITS);
+        BOOST_CHECK_EQUAL(block.vtx[0]->GetValueOut(), expected_fees); // fees only, reward param 0
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.nNonce = 0;
+        while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+                              "assembled corridor block at height " << tip()->nHeight + 1 << " rejected");
+        BOOST_REQUIRE(new_block);
+    }};
+
+    // ---- Phase A: live legacy to H, with two crossing-fund outputs.
+    Txid coinbase1{};
+    for (int height{1}; height <= H - 1; ++height) {
+        const auto submitted{CodecRoundTrip(build_legacy(tip(), {}))};
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(submitted, true, true, &new_block));
+        if (height == 1) coinbase1 = submitted->vtx[0]->GetHash();
+    }
+    const CAmount fund_total{legacy::GetProofOfWorkReward(0, 1, consensus)};
+    CMutableTransaction fund;
+    fund.version = 1;
+    fund.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 17);
+    fund.vin.resize(1);
+    fund.vin[0].prevout = COutPoint{coinbase1, 0};
+    fund.vin[0].scriptSig = CScript{};
+    fund.vout.emplace_back(fund_total / 2, CScript() << OP_TRUE);
+    fund.vout.emplace_back(fund_total / 2, CScript() << OP_TRUE);
+    const auto block_h{CodecRoundTrip(build_legacy(tip(), {fund}))};
+    const Txid fund_txid{block_h->vtx[1]->GetHash()};
+    {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(block_h, true, true, &new_block));
+    }
+    BOOST_REQUIRE_EQUAL(tip()->nHeight, H);
+
+    // ---- Freeze the boundary; configure the full 1,000-block corridor.
+    const uint256 X{tip()->GetBlockHash()};
+    mutable_consensus.hard_fork_height = H + 1;
+    mutable_consensus.legacy_final_hash = X;
+    mutable_consensus.transition_pow_length = CORRIDOR;
+    mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.min_stake_amount = 1000; // regtest scaffolding
+    BOOST_REQUIRE(consensus.test_only_modern_pos_validator == nullptr);
+    BOOST_CHECK(WITH_LOCK(cs_main, return chainman.ActiveChainstate().LegacyBoundaryActive()));
+
+    // ---- Phase B: the corridor. Block H+1 stakes validator A in a single
+    // output; block H+2 stakes validator B with the SAME total split in
+    // three; the bulk of the corridor is plain temporary-PoW blocks; a late
+    // stake for validator C lands 5 blocks before the end and must stay
+    // immature at the handoff.
+    std::array<unsigned char, 32> key_a{};
+    key_a.fill(0xaa);
+    std::array<unsigned char, 32> key_b{};
+    key_b.fill(0xbb);
+    std::array<unsigned char, 32> key_c{};
+    key_c.fill(0xcc);
+    const CScript owner{CScript() << OP_TRUE};
+    const CAmount stake_total{900'000};
+
+    CMutableTransaction stake_a;
+    stake_a.version = 2;
+    stake_a.vin.resize(1);
+    stake_a.vin[0].prevout = COutPoint{fund_txid, 0};
+    stake_a.vin[0].scriptSig = CScript{};
+    stake_a.vout.emplace_back(stake_total, modern::MakeStakeScript(key_a, owner));
+    stake_a.vout.emplace_back(fund_total / 2 - stake_total - 1000, CScript() << OP_TRUE);
+    const Txid stake_a_txid{CTransaction{stake_a}.GetHash()};
+    {
+        // H+1 through the full production path: mempool admission of the
+        // crossing STAKE transaction, template creation, grind, submit.
+        const auto res{chainman.ProcessTransaction(MakeTransactionRef(stake_a))};
+        BOOST_REQUIRE_MESSAGE(res.m_result_type == MempoolAcceptResult::ResultType::VALID,
+                              "stake_a mempool admission failed: " << res.m_state.ToString());
+        assemble_and_submit(/*expected_fees=*/1000);
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 1);
+        BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
+    }
+
+    CMutableTransaction stake_b;
+    stake_b.version = 2;
+    stake_b.vin.resize(1);
+    stake_b.vin[0].prevout = COutPoint{fund_txid, 1};
+    stake_b.vin[0].scriptSig = CScript{};
+    stake_b.vout.emplace_back(stake_total / 3, modern::MakeStakeScript(key_b, owner));
+    stake_b.vout.emplace_back(stake_total / 3, modern::MakeStakeScript(key_b, owner));
+    stake_b.vout.emplace_back(stake_total - 2 * (stake_total / 3), modern::MakeStakeScript(key_b, owner));
+    stake_b.vout.emplace_back(fund_total / 2 - stake_total - 1000, CScript() << OP_TRUE);
+    const Txid change_b_txid{CTransaction{stake_b}.GetHash()};
+    submit_corridor({stake_b}); // H+2
+
+    while (tip()->nHeight < H + 499) submit_corridor({});
+    assemble_and_submit(/*expected_fees=*/0); // H+500 via the mining path
+    BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 500);
+    while (tip()->nHeight < H + CORRIDOR - 5) submit_corridor({});
+
+    CMutableTransaction stake_c;
+    stake_c.version = 2;
+    stake_c.vin.resize(1);
+    stake_c.vin[0].prevout = COutPoint{change_b_txid, 3};
+    stake_c.vin[0].scriptSig = CScript{};
+    stake_c.vout.emplace_back(100'000, modern::MakeStakeScript(key_c, owner));
+    submit_corridor({stake_c}); // H+996
+
+    while (tip()->nHeight < H + CORRIDOR - 1) submit_corridor({});
+    assemble_and_submit(/*expected_fees=*/0); // H+1000 via the mining path
+    BOOST_REQUIRE_EQUAL(tip()->nHeight, H + CORRIDOR);
+
+    // ---- The registry at the corridor end: A and B carry the identical
+    // aggregated weight (split == single, end to end); C is immature.
+    {
+        LOCK(cs_main);
+        chainman.ActiveChainstate().ForceFlushStateToDisk();
+        const node::StakeRegistry registry{node::DeriveStakeRegistry(
+            chainman.ActiveChainstate().CoinsDB(), H + CORRIDOR, consensus)};
+        BOOST_REQUIRE_EQUAL(registry.validators.size(), 3U);
+        BOOST_CHECK_EQUAL(registry.validators.at(key_a).total_weight, stake_total);
+        BOOST_CHECK_EQUAL(registry.validators.at(key_b).total_weight, stake_total);
+        BOOST_CHECK_EQUAL(registry.validators.at(key_b).outputs.size(), 3U);
+        BOOST_CHECK_EQUAL(registry.total_weight, 2 * stake_total);
+        BOOST_CHECK_EQUAL(registry.mature_outputs, 4U);
+        BOOST_CHECK_EQUAL(registry.immature_outputs, 1U); // validator C
+        BOOST_CHECK_EQUAL(registry.validators.at(key_c).total_weight, 0); // PENDING, attributed
+        BOOST_REQUIRE_EQUAL(registry.validators.at(key_c).outputs.size(), 1U);
+        BOOST_CHECK(!registry.validators.at(key_c).outputs[0].active);
+    }
+
+    // ---- Phase C begins: H+1001 is modern PoS, and with no rule set
+    // installed the fail-closed gate stops everything, deterministically.
+    {
+        CBlock modern_attempt{build_corridor(tip(), {})};
+        modern_attempt.nBits = GetNextWorkRequired(tip(), &modern_attempt, consensus);
+        const arith_uint256 sha_target{arith_uint256().SetCompact(modern_attempt.nBits)};
+        modern_attempt.nNonce = 0;
+        while (UintToArith256(modern_attempt.GetHash()) > sha_target) ++modern_attempt.nNonce;
+        {
+            LOCK(cs_main);
+            const BlockValidationState state{TestBlockValidity(
+                chainman.ActiveChainstate(), modern_attempt, /*check_pow=*/true, /*check_merkle_root=*/true)};
+            BOOST_REQUIRE(state.IsInvalid());
+            BOOST_CHECK_EQUAL(state.GetRejectReason(), "no-modern-pos-rules");
+        }
+        bool new_block{false};
+        chainman.ProcessNewBlock(std::make_shared<const CBlock>(modern_attempt), true, true, &new_block);
+        LOCK(cs_main);
+        const CBlockIndex* pindex{chainman.m_blockman.LookupBlockIndex(modern_attempt.GetHash())};
+        BOOST_REQUIRE(pindex != nullptr);
+        BOOST_CHECK(pindex->nStatus & BLOCK_FAILED_VALID);
+        BOOST_CHECK(!chainman.ActiveChain().Contains(pindex));
+    }
+    // A corridor-style block past the corridor end can never CONNECT: the
+    // placeholder post-corridor header rules may store it (on regtest the
+    // min-difficulty walk-back can even legitimize the corridor bits), but
+    // the phase dispatch sends it to the fail-closed modern gate and the tip
+    // never moves. A legacy-codec block is refused outright by the era codec
+    // switch.
+    {
+        CBlock stale_corridor{build_corridor(tip(), {})};
+        // Distinct time so it is not a duplicate of the failed attempt above.
+        stale_corridor.nTime += 1;
+        stale_corridor.nNonce = 0;
+        while (!CheckTransitionPowEligibility(stale_corridor)) ++stale_corridor.nNonce;
+        bool new_block{false};
+        chainman.ProcessNewBlock(std::make_shared<const CBlock>(stale_corridor), true, true, &new_block);
+        {
+            LOCK(cs_main);
+            BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->nHeight, H + CORRIDOR);
+            if (const CBlockIndex* pindex{chainman.m_blockman.LookupBlockIndex(stale_corridor.GetHash())}) {
+                BOOST_CHECK(pindex->nStatus & BLOCK_FAILED_VALID);
+                BOOST_CHECK(!chainman.ActiveChain().Contains(pindex));
+            }
+        }
+        CBlock stale_legacy{build_legacy(tip(), {})};
+        BOOST_CHECK(!chainman.ProcessNewBlock(CodecRoundTrip(stale_legacy), true, true, &new_block));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(
+                                  stale_legacy.GetLegacyB3Hash())) == nullptr);
+    }
+    // The chain holds exactly at the corridor end, boundary intact.
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(chainman.ActiveChainstate().LegacyBoundaryActive());
+        BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->nHeight, H + CORRIDOR);
+    }
+}
+
+//! Corridor restart and chainstate-reindex correctness with a NON-trivial
+//! corridor target: the persisted block index reloads through the
+//! phase-aware proof check (the old two-state code ran SHA256d over
+//! corridor entries and would fail here with overwhelming probability),
+//! the chain continues after the restart, and a chainstate rebuild
+//! reconnects the whole legacy+corridor history to the same tip and
+//! registry.
+BOOST_FIXTURE_TEST_CASE(corridor_restart_and_reindex, TransitionDiskSetup)
+{
+    const Consensus::Params& consensus{m_node.chainman->GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int H{32};
+    // Non-trivial corridor target: a random SHA256d identity hash fails it
+    // with probability ~255/256 per block, while the scrypt grind satisfies
+    // it deterministically. Six corridor blocks make the old SHA256d
+    // restart bug fail with probability ~1 - 2^-48.
+    constexpr uint32_t HARD_BITS{0x2000ffff};
+    const auto tip{[&] {
+        return WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip());
+    }};
+
+    const auto build_legacy{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (prev->nHeight + 1) << CScriptNum{99};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, prev->nHeight + 1, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) {
+            mtx.m_legacy_encoding = true;
+            block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        return block;
+    }};
+    const auto build_corridor{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 2;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << CScriptNum{prev->nHeight + 1} << CScriptNum{7};
+        coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = HARD_BITS;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.nNonce = 0;
+        while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
+        return block;
+    }};
+
+    // Legacy history with a crossing-fund output at H, boundary pinned,
+    // corridor with the hard target, one STAKE inside the corridor.
+    Txid coinbase1{};
+    for (int height{1}; height <= H - 1; ++height) {
+        const auto submitted{CodecRoundTrip(build_legacy(tip(), {}))};
+        bool new_block{false};
+        BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(submitted, true, true, &new_block));
+        if (height == 1) coinbase1 = submitted->vtx[0]->GetHash();
+    }
+    CMutableTransaction fund;
+    fund.version = 1;
+    fund.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 17);
+    fund.vin.resize(1);
+    fund.vin[0].prevout = COutPoint{coinbase1, 0};
+    fund.vin[0].scriptSig = CScript{};
+    fund.vout.emplace_back(legacy::GetProofOfWorkReward(0, 1, consensus), CScript() << OP_TRUE);
+    const auto block_h{CodecRoundTrip(build_legacy(tip(), {fund}))};
+    const Txid fund_txid{block_h->vtx[1]->GetHash()};
+    {
+        bool new_block{false};
+        BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(block_h, true, true, &new_block));
+    }
+    mutable_consensus.hard_fork_height = H + 1;
+    mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
+    mutable_consensus.transition_pow_length = 8;
+    mutable_consensus.transition_pow_bits = HARD_BITS;
+    mutable_consensus.min_stake_amount = 1000;
+
+    std::array<unsigned char, 32> validator_key{};
+    validator_key.fill(0x42);
+    CMutableTransaction stake_tx;
+    stake_tx.version = 2;
+    stake_tx.vin.resize(1);
+    stake_tx.vin[0].prevout = COutPoint{fund_txid, 0};
+    stake_tx.vin[0].scriptSig = CScript{};
+    stake_tx.vout.emplace_back(200'000, modern::MakeStakeScript(validator_key, CScript() << OP_TRUE));
+    for (int i{0}; i < 6; ++i) {
+        bool new_block{false};
+        CBlock block{build_corridor(tip(), i == 0 ? std::vector<CMutableTransaction>{stake_tx}
+                                                  : std::vector<CMutableTransaction>{})};
+        BOOST_REQUIRE_MESSAGE(
+            m_node.chainman->ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+            "corridor block at height " << tip()->nHeight + 1 << " rejected");
+    }
+    const int pre_restart_height{tip()->nHeight};
+    const uint256 pre_restart_hash{tip()->GetBlockHash()};
+    BOOST_REQUIRE_EQUAL(pre_restart_height, H + 6);
+
+    // ---- Simulated shutdown + restart: tear the chainman down and rebuild
+    // it over the persisted databases. LoadBlockIndexGuts must accept every
+    // corridor entry through the scrypt eligibility check.
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
+    }
+    m_node.chainman.reset();
+    m_make_chainman();
+    LoadVerifyActivateChainstate();
+    BOOST_REQUIRE_EQUAL(tip()->nHeight, pre_restart_height);
+    BOOST_CHECK_EQUAL(tip()->GetBlockHash().GetHex(), pre_restart_hash.GetHex());
+
+    // The chain continues after the restart.
+    {
+        bool new_block{false};
+        CBlock block{build_corridor(tip(), {})};
+        BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block));
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, pre_restart_height + 1);
+    }
+
+    // ---- Chainstate reindex: wipe the chainstate database and rebuild it
+    // by reconnecting the entire legacy + corridor history from the block
+    // files, reaching the same tip with the same derived registry.
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
+    }
+    m_node.chainman.reset();
+    m_args.ForceSetArg("-reindex-chainstate", "1");
+    m_make_chainman();
+    LoadVerifyActivateChainstate();
+    m_args.ForceSetArg("-reindex-chainstate", "0");
+    BOOST_REQUIRE_EQUAL(tip()->nHeight, pre_restart_height + 1);
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
+        const node::StakeRegistry registry{node::DeriveStakeRegistry(
+            m_node.chainman->ActiveChainstate().CoinsDB(), tip()->nHeight, consensus)};
+        // Created at H+1, evaluated at H+7: attributed but PENDING (depth
+        // 6 < STAKE_ACTIVATION_DEPTH) with zero weight — the reindex
+        // reproduced the exact registry state, not merely the tip.
+        BOOST_REQUIRE_EQUAL(registry.validators.size(), 1U);
+        const node::ValidatorRecord& rec{registry.validators.at(validator_key)};
+        BOOST_CHECK_EQUAL(rec.total_weight, 0);
+        BOOST_REQUIRE_EQUAL(rec.outputs.size(), 1U);
+        BOOST_CHECK(!rec.outputs[0].active);
+        BOOST_CHECK_EQUAL(rec.outputs[0].amount, 200'000);
+        BOOST_CHECK_EQUAL(rec.outputs[0].creation_height, H + 1);
+    }
+}
+
+//! Two-node corridor sync: node A builds the evolution chain (legacy
+//! history, frozen boundary, corridor with STAKE creation); node B starts
+//! from nothing but the same consensus parameters and syncs block by block
+//! through the transition — exercising exactly the pinned-boundary path a
+//! fresh node takes. Same tip, same UTXO commitment, same derived registry.
+BOOST_AUTO_TEST_CASE(two_node_corridor_sync)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int H{32};
+    constexpr int CORRIDOR{40};
+    constexpr uint32_t EASY_BITS{0x207fffff};
+    const auto tip{[&] { return WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()); }};
+
+    const auto build_legacy{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (prev->nHeight + 1) << CScriptNum{99};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, prev->nHeight + 1, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) {
+            mtx.m_legacy_encoding = true;
+            block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        return block;
+    }};
+    const auto build_corridor{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 2;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << CScriptNum{prev->nHeight + 1} << CScriptNum{7};
+        coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = EASY_BITS;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.nNonce = 0;
+        while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
+        return block;
+    }};
+
+    // ---- Node A builds the chain: legacy history with a crossing fund,
+    // frozen boundary, corridor with a STAKE and its cancellation-free life.
+    Txid coinbase1{};
+    for (int height{1}; height <= H - 1; ++height) {
+        const auto submitted{CodecRoundTrip(build_legacy(tip(), {}))};
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(submitted, true, true, &new_block));
+        if (height == 1) coinbase1 = submitted->vtx[0]->GetHash();
+    }
+    CMutableTransaction fund;
+    fund.version = 1;
+    fund.nTime = static_cast<uint32_t>(tip()->GetBlockTime() + 17);
+    fund.vin.resize(1);
+    fund.vin[0].prevout = COutPoint{coinbase1, 0};
+    fund.vin[0].scriptSig = CScript{};
+    fund.vout.emplace_back(legacy::GetProofOfWorkReward(0, 1, consensus), CScript() << OP_TRUE);
+    const auto block_h{CodecRoundTrip(build_legacy(tip(), {fund}))};
+    const Txid fund_txid{block_h->vtx[1]->GetHash()};
+    {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(block_h, true, true, &new_block));
+    }
+    mutable_consensus.hard_fork_height = H + 1;
+    mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
+    mutable_consensus.transition_pow_length = CORRIDOR;
+    mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.min_stake_amount = 1000;
+
+    std::array<unsigned char, 32> validator_key{};
+    validator_key.fill(0x77);
+    CMutableTransaction stake_tx;
+    stake_tx.version = 2;
+    stake_tx.vin.resize(1);
+    stake_tx.vin[0].prevout = COutPoint{fund_txid, 0};
+    stake_tx.vin[0].scriptSig = CScript{};
+    stake_tx.vout.emplace_back(300'000, modern::MakeStakeScript(validator_key, CScript() << OP_TRUE));
+    for (int i{0}; i < CORRIDOR; ++i) {
+        bool new_block{false};
+        CBlock block{build_corridor(tip(), i == 0 ? std::vector<CMutableTransaction>{stake_tx}
+                                                  : std::vector<CMutableTransaction>{})};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block));
+    }
+    BOOST_REQUIRE_EQUAL(tip()->nHeight, H + CORRIDOR);
+
+    // ---- Node B: a fresh ChainstateManager over its own directories, same
+    // (pinned) consensus parameters, fed the raw blocks in height order —
+    // the fresh-sync path with the boundary active from genesis.
+    const fs::path b_dir{m_args.GetDataDirNet() / "nodeB"};
+    fs::create_directories(b_dir / "blocks");
+    {
+        ChainstateManager::Options b_chainman_opts{
+            .chainparams = chainman.GetParams(),
+            .datadir = b_dir,
+            .check_block_index = 1,
+            .notifications = *m_node.notifications,
+            .worker_threads_num = 0,
+        };
+        const node::BlockManager::Options b_blockman_opts{
+            .chainparams = b_chainman_opts.chainparams,
+            .blocks_dir = b_dir / "blocks",
+            .notifications = b_chainman_opts.notifications,
+            .block_tree_db_params = DBParams{
+                .path = b_dir / "blocks" / "index",
+                .cache_bytes = m_kernel_cache_sizes.block_tree_db,
+                .memory_only = true,
+            },
+        };
+        ChainstateManager chainman_b{*Assert(m_node.shutdown_signal), b_chainman_opts, b_blockman_opts};
+        {
+            node::ChainstateLoadOptions b_load;
+            b_load.mempool = nullptr;
+            b_load.coins_db_in_memory = true;
+            const auto [status, error]{node::LoadChainstate(chainman_b, m_kernel_cache_sizes, b_load)};
+            BOOST_REQUIRE_MESSAGE(status == node::ChainstateLoadStatus::SUCCESS, error.original);
+            BlockValidationState state;
+            BOOST_REQUIRE(chainman_b.ActiveChainstate().ActivateBestChain(state));
+        }
+        BOOST_REQUIRE_EQUAL(WITH_LOCK(cs_main, return chainman_b.ActiveChain().Height()), 0);
+
+        for (int height{1}; height <= H + CORRIDOR; ++height) {
+            const CBlockIndex* pindex{WITH_LOCK(cs_main, return chainman.ActiveChain()[height])};
+            BOOST_REQUIRE(pindex != nullptr);
+            CBlock block;
+            BOOST_REQUIRE(chainman.m_blockman.ReadBlock(block, *pindex));
+            bool new_block{false};
+            BOOST_REQUIRE_MESSAGE(
+                chainman_b.ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block),
+                "node B refused block at height " << height);
+            BOOST_REQUIRE(new_block);
+        }
+
+        // Same tip, same chainstate, same UTXO commitment, same registry.
+        LOCK(cs_main);
+        BOOST_REQUIRE_EQUAL(chainman_b.ActiveChain().Height(), H + CORRIDOR);
+        BOOST_CHECK_EQUAL(chainman_b.ActiveChain().Tip()->GetBlockHash().GetHex(),
+                          chainman.ActiveChain().Tip()->GetBlockHash().GetHex());
+        chainman.ActiveChainstate().ForceFlushStateToDisk();
+        chainman_b.ActiveChainstate().ForceFlushStateToDisk();
+        const node::UtxoComparison cmp{node::CompareUtxoViews(
+            chainman.ActiveChainstate().CoinsDB(), chainman_b.ActiveChainstate().CoinsDB())};
+        BOOST_CHECK(cmp.Equal());
+        BOOST_CHECK_EQUAL(cmp.commitment_a.GetHex(), cmp.commitment_b.GetHex());
+        const node::StakeRegistry reg_a{node::DeriveStakeRegistry(
+            chainman.ActiveChainstate().CoinsDB(), H + CORRIDOR, consensus)};
+        const node::StakeRegistry reg_b{node::DeriveStakeRegistry(
+            chainman_b.ActiveChainstate().CoinsDB(), H + CORRIDOR, consensus)};
+        BOOST_CHECK(reg_a.WeightView() == reg_b.WeightView());
+        BOOST_CHECK_EQUAL(reg_a.total_weight, reg_b.total_weight);
+        BOOST_CHECK_EQUAL(reg_b.validators.at(validator_key).total_weight, 300'000);
+        BOOST_CHECK_EQUAL(reg_a.mature_outputs, reg_b.mature_outputs);
     }
 }
 

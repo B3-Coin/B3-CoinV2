@@ -12,6 +12,7 @@
 #include <uint256.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -50,6 +51,8 @@ public:
     struct Breakpoint {
         CAmount price{0}; // ticks
         CAmount qty{0};   // lots
+
+        SERIALIZE_METHODS(Breakpoint, obj) { READWRITE(obj.price, obj.qty); }
     };
 
     struct ClearingResult {
@@ -62,7 +65,15 @@ public:
     };
 
     ClearingEngine(const AssetId& base, const AssetId& quote, Ledger& ledger, size_t max_k = 8)
-        : m_base{base}, m_quote{quote}, m_ledger{ledger}, m_max_k{max_k} {}
+        : m_base{base}, m_quote{quote}, m_ledger{&ledger}, m_max_k{max_k} {}
+
+    //! Point this engine at another ledger instance. Used ONLY by
+    //! FlowMeshState's copy/assignment so a copied engine settles against
+    //! the copied ledger rather than aliasing the original.
+    void Rebind(Ledger& ledger) { m_ledger = &ledger; }
+
+    const AssetId& BaseAsset() const { return m_base; }
+    const AssetId& QuoteAsset() const { return m_quote; }
 
     //! Validate a curve independently of the ledger (bounds + monotonicity).
     //! A BID must terminate at zero quantity so its worst-case spend — and
@@ -82,6 +93,13 @@ public:
             }
         }
         if (side == Side::BID && points.back().qty != 0) return false;
+        // Zero demand means NO curve, never a free persistent book entry:
+        // an all-zero curve would add candidate prices, state-root bytes
+        // and per-slot scan work at zero reservation cost. A bid must
+        // open with positive quantity (and still terminate at zero); an
+        // ask must reach positive quantity.
+        if (side == Side::BID && points.front().qty <= 0) return false;
+        if (side == Side::ASK && points.back().qty <= 0) return false;
         return true;
     }
 
@@ -96,8 +114,10 @@ public:
      * Submit or replace an account's curve on a side. The worst-case
      * reservation it requires (quote for a bid, base for an ask) must be
      * backed by the account's available ledger balance, or the submission
-     * is rejected and nothing changes. A replacement releases the prior
-     * reservation first.
+     * is rejected and nothing changes. A replacement never releases the
+     * old reservation wholesale: it adjusts the ledger by exactly the
+     * DELTA between the old remaining reservation and the new requirement
+     * (reserving more, or releasing the difference).
      */
     bool SubmitCurve(const AccountId& account, Side side, const std::vector<Breakpoint>& points)
     {
@@ -106,14 +126,24 @@ public:
         const std::optional<CAmount> need{WorstCaseReservation(side, points)};
         if (!need) return false;
 
-        Curve& slot{m_curves[{side, account}]};
-        // Release any prior reservation before re-reserving.
-        if (slot.reserved > 0) m_ledger.Release(account, reserve_asset, slot.reserved);
-        if (*need > 0 && !m_ledger.Reserve(account, reserve_asset, *need)) {
-            // Restore the previous reservation on failure.
-            if (slot.reserved > 0) m_ledger.Reserve(account, reserve_asset, slot.reserved);
-            return false;
+        // ATOMIC by reservation-delta accounting: look up without
+        // inserting, adjust the ledger by exactly the difference, and
+        // only touch the book after the ledger operation succeeded. A
+        // failed first submission or failed replacement leaves balances,
+        // reservations, the curve, effective quantities and the state
+        // root completely unchanged — no ghost curve is ever created.
+        const auto it{m_curves.find({side, account})};
+        const CAmount old_reserved{it == m_curves.end() ? 0 : it->second.reserved};
+        if (*need > old_reserved) {
+            if (!m_ledger->Reserve(account, reserve_asset, *need - old_reserved)) return false;
+        } else if (*need < old_reserved) {
+            // The recorded amount tracks consumption exactly (Consume),
+            // so this release matches what the ledger holds for this
+            // curve; a failure would mean internal inconsistency — fail
+            // closed, changing nothing.
+            if (!m_ledger->Release(account, reserve_asset, old_reserved - *need)) return false;
         }
+        Curve& slot{it == m_curves.end() ? m_curves[{side, account}] : it->second};
         slot.points = points;
         slot.filled = 0;
         slot.reserved = *need;
@@ -121,12 +151,19 @@ public:
     }
 
     //! Cancel a standing curve and release its remaining reservation.
+    //! If the release fails — an impossible state under exact
+    //! consumption tracking — the curve is NOT erased and false is
+    //! returned: an accounting inconsistency must stay visible, never be
+    //! papered over by discarding the only record of the reservation.
     bool CancelCurve(const AccountId& account, Side side)
     {
         const auto it{m_curves.find({side, account})};
         if (it == m_curves.end()) return false;
         const AssetId& reserve_asset{side == Side::BID ? m_quote : m_base};
-        if (it->second.reserved > 0) m_ledger.Release(account, reserve_asset, it->second.reserved);
+        if (it->second.reserved > 0 &&
+            !m_ledger->Release(account, reserve_asset, it->second.reserved)) {
+            return false;
+        }
         m_curves.erase(it);
         return true;
     }
@@ -172,23 +209,73 @@ public:
             result.ask_fill = Allocate(Side::ASK, p, result.volume);
             SettleAndConsume(result);
         }
-        m_ledger.AdvanceSlot();
+        m_ledger->AdvanceSlot();
         return result;
     }
 
     //! Deterministic root binding the whole persistent book to the ledger
-    //! state and slot.
+    //! state and slot. CANONICALLY FRAMED end to end: the curve count and
+    //! each curve's breakpoint count precede the variable-length book
+    //! data (clearing v2 domain), and the embedded ledger root frames its
+    //! own three collections the same way (ledger v2 domain), so no two
+    //! distinct states can flatten to one preimage — a requirement before
+    //! this commitment can ever become consensus-facing. Each domain tag
+    //! was bumped when its preimage format changed.
     uint256 StateRoot() const
     {
         HashWriter h;
-        h << std::string{"b3/flowmesh/clearing/v1"} << m_base << m_quote
-          << static_cast<uint64_t>(m_max_k) << m_ledger.Slot();
+        h << std::string{"b3/flowmesh/clearing/v2"} << m_base << m_quote
+          << static_cast<uint64_t>(m_max_k) << m_ledger->Slot();
+        h << static_cast<uint64_t>(m_curves.size());
         for (const auto& [key, curve] : m_curves) {
             h << static_cast<uint8_t>(key.first) << key.second << curve.filled << curve.reserved;
+            h << static_cast<uint64_t>(curve.points.size());
             for (const Breakpoint& bp : curve.points) h << bp.price << bp.qty;
         }
-        h << m_ledger.StateRoot();
+        h << m_ledger->StateRoot();
         return h.GetHash();
+    }
+
+    /**
+     * Canonical whole-book serialization (snapshots). The ledger binding
+     * and market configuration are NOT streamed: a book deserializes
+     * into an engine whose base/quote/max_k were fixed at construction,
+     * and the stream must agree (mismatch throws). Snapshot consumers
+     * must verify the decoded state's root against certified history.
+     */
+    template <typename Stream>
+    void Serialize(Stream& s) const
+    {
+        s << m_base << m_quote << static_cast<uint64_t>(m_max_k);
+        s << static_cast<uint64_t>(m_curves.size());
+        for (const auto& [key, curve] : m_curves) {
+            s << static_cast<uint8_t>(key.first) << key.second << curve;
+        }
+    }
+    template <typename Stream>
+    void Unserialize(Stream& s)
+    {
+        AssetId base, quote;
+        uint64_t max_k, n;
+        s >> base >> quote >> max_k >> n;
+        if (base != m_base || quote != m_quote || max_k != m_max_k) {
+            throw std::ios_base::failure("flowmesh book snapshot is for a different market");
+        }
+        std::map<std::pair<Side, AccountId>, Curve> curves;
+        for (uint64_t i{0}; i < n; ++i) {
+            uint8_t side;
+            AccountId account;
+            Curve curve;
+            s >> side >> account >> curve;
+            if (side > static_cast<uint8_t>(Side::ASK)) {
+                throw std::ios_base::failure("flowmesh book snapshot has an invalid side");
+            }
+            if (!curves.emplace(std::make_pair(static_cast<Side>(side), account),
+                                std::move(curve)).second) {
+                throw std::ios_base::failure("flowmesh book snapshot has a duplicate curve");
+            }
+        }
+        m_curves = std::move(curves);
     }
 
 private:
@@ -196,13 +283,17 @@ private:
         std::vector<Breakpoint> points;
         CAmount filled{0};
         CAmount reserved{0};
+
+        SERIALIZE_METHODS(Curve, obj) { READWRITE(obj.points, obj.filled, obj.reserved); }
     };
 
-    static CAmount FloorDiv(const CAmount a, const CAmount b) // b > 0
+    static CAmount FloorDiv128(const __int128 a, const __int128 b) // b > 0
     {
-        CAmount q{a / b};
-        if (a % b != 0 && (a < 0)) --q;
-        return q;
+        __int128 q{a / b};
+        if (a % b != 0 && a < 0) --q;
+        // Callers only pass interpolants whose result lies between two
+        // validated quantities, so the cast is in range.
+        return static_cast<CAmount>(q);
     }
 
     //! quote = qty * price, exact and capped: std::nullopt on overflow of
@@ -218,14 +309,35 @@ private:
 
     static CAmount EvalCurve(const std::vector<Breakpoint>& points, const CAmount price)
     {
+        // GENUINELY TOTAL, even on adversarial garbage (the public
+        // EvaluateCurve entry accepts arbitrary vectors): an empty curve
+        // demands nothing; any point outside MoneyRange yields the
+        // deterministic zero result (stored, validated curves can never
+        // contain one); a non-ascending segment degrades to the left
+        // quantity instead of dividing by zero. Every subtraction is
+        // performed AFTER widening each operand to 128 bits, so no
+        // intermediate — including INT64_MIN/INT64_MAX inputs — can
+        // overflow a signed 64-bit value. Never undefined behavior.
+        if (points.empty()) return 0;
+        for (const Breakpoint& bp : points) {
+            if (bp.price < 0 || bp.price > MAX_MONEY || bp.qty < 0 || bp.qty > MAX_MONEY) {
+                return 0;
+            }
+        }
         if (price <= points.front().price) return points.front().qty;
         if (price >= points.back().price) return points.back().qty;
         for (size_t i{1}; i < points.size(); ++i) {
             if (price < points[i].price) {
                 const Breakpoint& a{points[i - 1]};
                 const Breakpoint& b{points[i]};
-                // Floor of the exact linear interpolant keeps monotonicity.
-                return a.qty + FloorDiv((b.qty - a.qty) * (price - a.price), b.price - a.price);
+                if (b.price <= a.price) return a.qty; // garbage guard (see above)
+                // Floor of the exact linear interpolant keeps
+                // monotonicity; exact in 128-bit throughout.
+                const __int128 num{(static_cast<__int128>(b.qty) - static_cast<__int128>(a.qty)) *
+                                   (static_cast<__int128>(price) - static_cast<__int128>(a.price))};
+                const __int128 den{static_cast<__int128>(b.price) -
+                                   static_cast<__int128>(a.price)};
+                return a.qty + FloorDiv128(num, den);
             }
         }
         return points.back().qty;
@@ -240,14 +352,23 @@ private:
             return points.back().qty;
         }
         // Bid terminates at zero, so demand is confined to [p0, p_last].
-        // On segment i the demand is at most q_i and the price at most
-        // price_{i+1}, so q_i * price_{i+1} upper-bounds every possible
-        // spend on that segment.
+        // The curve is PERSISTENT: fills can accumulate across many slots
+        // at many prices, so the bound must cover every possible fill
+        // SEQUENCE, not just one slot. Any lot filled at price p sits at
+        // a cumulative quantity where the (descending) demand still
+        // reaches it, i.e. p is at most the right-edge price of the
+        // quantity segment holding that lot — so total spend is bounded
+        // by the staircase sum over segments:
+        //     Σ (q_i − q_{i+1}) · price_{i+1}
+        // (a single-slot max-rectangle bound is NOT sufficient: adversarial
+        // descending-price fill sequences across slots exceed it).
         CAmount worst{0};
         for (size_t i{0}; i + 1 < points.size(); ++i) {
-            const std::optional<CAmount> spend{Quote(points[i].qty, points[i + 1].price)};
+            const std::optional<CAmount> spend{
+                Quote(points[i].qty - points[i + 1].qty, points[i + 1].price)};
             if (!spend) return std::nullopt;
-            worst = std::max(worst, *spend);
+            if (*spend > MAX_MONEY - worst) return std::nullopt;
+            worst += *spend;
         }
         return worst;
     }
@@ -316,8 +437,40 @@ private:
 
     //! Settle fills as internal ledger moves (no UTXO), then deduct the
     //! filled volume from the persistent curves and drop exhausted ones.
+    //!
+    //! NO SILENT MASKING, NO PARTIAL SETTLEMENT: every quote computation,
+    //! every per-curve reservation sufficiency AND every ledger source
+    //! reservation is PREFLIGHTED before the first ledger mutation, so
+    //! the moves below cannot fail; each leg's result is still checked,
+    //! and a first leg is checked before the second leg executes. A
+    //! violated invariant fails VISIBLY via assert — that is a fail-fast
+    //! abort, not transactional recovery: nothing is rolled back, which
+    //! is exactly why every failure condition is checked before any
+    //! state is touched.
     void SettleAndConsume(const ClearingResult& result)
     {
+        // ---- Preflight, before any mutation. Per side and account this
+        // covers the account's ENTIRE settled volume: the pairwise chunks
+        // below sum to exactly `fill` base lots and (at a uniform price)
+        // exactly `fill * price` quote, so per-account totals bound every
+        // individual chunk move.
+        for (const auto& [account, fill] : result.bid_fill) {
+            if (fill <= 0) continue;
+            const std::optional<CAmount> quote{Quote(fill, result.price)};
+            assert(quote.has_value()); // bounded by the buyer's validated reservation
+            const auto it{m_curves.find({Side::BID, account})};
+            assert(it != m_curves.end());
+            assert(*quote <= it->second.reserved); // staircase invariant
+            assert(*quote <= m_ledger->Reserved(account, m_quote)); // ledger backs the whole leg
+        }
+        for (const auto& [account, fill] : result.ask_fill) {
+            if (fill <= 0) continue;
+            const auto it{m_curves.find({Side::ASK, account})};
+            assert(it != m_curves.end());
+            assert(fill <= it->second.reserved);
+            assert(fill <= m_ledger->Reserved(account, m_base)); // ledger backs the whole leg
+        }
+
         // Two-pointer pairwise matching in account order: deterministic and
         // fully balanced (bid volume == ask volume == result.volume).
         std::vector<std::pair<AccountId, CAmount>> bids{result.bid_fill.begin(),
@@ -331,43 +484,77 @@ private:
             if (b_rem == 0) { ++bi; continue; }
             if (a_rem == 0) { ++ai; continue; }
             const CAmount fill{std::min(b_rem, a_rem)};
-            const CAmount quote{*Quote(fill, result.price)};
+            const std::optional<CAmount> quote{Quote(fill, result.price)};
+            assert(quote.has_value()); // preflighted above per account
             // Buyer pays quote to seller; seller delivers base to buyer.
-            m_ledger.MoveReservedToAvailable(bids[bi].first, asks[ai].first, m_quote, quote);
-            m_ledger.MoveReservedToAvailable(asks[ai].first, bids[bi].first, m_base, fill);
+            // A ZERO quote (possible only when the uniform price is zero:
+            // fill is always positive here) is an explicit successful
+            // no-op — zero value changes hands on the quote side, and the
+            // ledger by design rejects zero-amount moves, so the leg must
+            // be skipped rather than attempted. The paid leg is checked
+            // BEFORE the delivery leg executes: a failed first leg never
+            // lets the second leg run.
+            if (*quote > 0) {
+                const bool paid{m_ledger->MoveReservedToAvailable(bids[bi].first, asks[ai].first,
+                                                                 m_quote, *quote)};
+                assert(paid); // preflighted; fail fast before touching the base leg
+            }
+            const bool delivered{m_ledger->MoveReservedToAvailable(asks[ai].first, bids[bi].first,
+                                                                  m_base, fill)};
+            assert(delivered); // preflighted; a failure here is a real bug
             b_rem -= fill;
             a_rem -= fill;
         }
 
         // Deduct fills from the persistent curves; exhausted curves release
         // their remaining reservation and are removed.
-        Consume(Side::BID, result.bid_fill, m_quote);
-        Consume(Side::ASK, result.ask_fill, m_base);
+        Consume(Side::BID, result.bid_fill, m_quote, result.price);
+        Consume(Side::ASK, result.ask_fill, m_base, result.price);
     }
 
-    void Consume(Side side, const std::map<AccountId, CAmount>& fills, const AssetId& reserve_asset)
+    void Consume(Side side, const std::map<AccountId, CAmount>& fills,
+                 const AssetId& reserve_asset, const CAmount price)
     {
         for (const auto& [account, fill] : fills) {
             if (fill <= 0) continue;
             const auto it{m_curves.find({side, account})};
             if (it == m_curves.end()) continue;
             it->second.filled += fill;
+            // Settlement just consumed part of this curve's ledger
+            // reservation (base lots for an ask; quote = fill × price for
+            // a bid). Subtract it EXACTLY — preflighted in
+            // SettleAndConsume, so neither the quote computation nor the
+            // subtraction can fail; a clamp or fabricated zero here would
+            // only hide a real accounting bug.
+            CAmount consumed{fill};
+            if (side == Side::BID) {
+                const std::optional<CAmount> quote{Quote(fill, price)};
+                assert(quote.has_value());
+                consumed = *quote;
+            }
+            assert(consumed <= it->second.reserved);
+            it->second.reserved -= consumed;
             if (EvalCurve(it->second.points, it->second.points.back().price) -
                         it->second.filled <= 0 &&
                 EvalCurve(it->second.points, it->second.points.front().price) -
                         it->second.filled <= 0) {
                 if (it->second.reserved > 0) {
-                    m_ledger.Release(account, reserve_asset, it->second.reserved);
+                    const bool released{
+                        m_ledger->Release(account, reserve_asset, it->second.reserved)};
+                    assert(released); // exact tracking makes this infallible
                 }
                 m_curves.erase(it);
             }
         }
     }
 
-    const AssetId m_base;
-    const AssetId m_quote;
-    Ledger& m_ledger;
-    const size_t m_max_k;
+    // Not const so the engine is assignable (FlowMeshState candidate
+    // execution copies and replaces whole states); reassigned only by
+    // copy/assignment, and the ledger pointer only via Rebind.
+    AssetId m_base;
+    AssetId m_quote;
+    Ledger* m_ledger;
+    size_t m_max_k;
     std::map<std::pair<Side, AccountId>, Curve> m_curves;
 };
 

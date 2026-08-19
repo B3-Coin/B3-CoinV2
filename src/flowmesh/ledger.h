@@ -60,6 +60,8 @@ public:
     struct Balance {
         CAmount available{0};
         CAmount reserved{0};
+
+        SERIALIZE_METHODS(Balance, obj) { READWRITE(obj.available, obj.reserved); }
     };
 
     explicit Ledger(const uint256& vault_commitment) : m_vault{vault_commitment} {}
@@ -266,20 +268,37 @@ public:
     uint64_t Slot() const { return m_slot; }
 
     //! Deterministic root over the canonical (zero-pruned, ordered) state.
+    //! CANONICALLY FRAMED (v2): each variable-length collection — balances,
+    //! custody, pending receipts — is preceded by its entry count, so the
+    //! boundaries between collections are part of the preimage and no two
+    //! distinct layouts can flatten to one byte stream. The domain tag was
+    //! bumped from v1 because the preimage format changed.
     uint256 StateRoot() const
     {
         HashWriter h;
-        h << std::string{"b3/flowmesh/state/v1"} << m_vault << m_slot << m_next_receipt_seq;
+        h << std::string{"b3/flowmesh/state/v2"} << m_vault << m_slot << m_next_receipt_seq;
+        h << static_cast<uint64_t>(m_balances.size());
         for (const auto& [key, balance] : m_balances) {
             h << key.first << key.second << balance.available << balance.reserved;
         }
+        h << static_cast<uint64_t>(m_custody.size());
         for (const auto& [asset, custody] : m_custody) {
             h << asset << custody;
         }
+        h << static_cast<uint64_t>(m_pending.size());
         for (const auto& [id, receipt] : m_pending) {
             h << receipt;
         }
         return h.GetHash();
+    }
+
+    //! Canonical whole-ledger serialization (snapshots). Decoding fully
+    //! replaces this ledger; snapshot consumers must verify the decoded
+    //! state's root against certified history before trusting it.
+    SERIALIZE_METHODS(Ledger, obj)
+    {
+        READWRITE(obj.m_vault, obj.m_slot, obj.m_next_receipt_seq, obj.m_balances,
+                  obj.m_custody, obj.m_pending);
     }
 
 private:
@@ -293,7 +312,10 @@ private:
         }
     }
 
-    const uint256 m_vault;
+    // Not const so the ledger is assignable (FlowMeshState candidate
+    // execution copies and replaces whole states); never reassigned
+    // outside copy/assignment.
+    uint256 m_vault;
     uint64_t m_slot{0};
     uint64_t m_next_receipt_seq{0};
     std::map<std::pair<AccountId, AssetId>, Balance> m_balances;

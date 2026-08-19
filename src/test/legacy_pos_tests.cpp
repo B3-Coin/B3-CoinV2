@@ -121,26 +121,27 @@ BOOST_AUTO_TEST_CASE(preserves_historical_proof_of_integration_fee_accounting)
         {1'000'000, 15'000'000 * COIN},
     };
 
+    const Consensus::Params params{}; // no test override: the historical schedule
     const CAmount output{10 * COIN};
     for (const auto& [height, collateral] : tiers) {
-        BOOST_CHECK_EQUAL(legacy::GetFNCollateral(height), collateral);
+        BOOST_CHECK_EQUAL(legacy::GetFNCollateral(height, params), collateral);
         // Exactly the collateral destroyed: the whole shortfall is a burn,
         // none of it counts as fees.
         BOOST_CHECK_EQUAL(
-            legacy::GetLegacyTransactionFee(output + collateral, output, /*is_coinstake=*/false, height),
+            legacy::GetLegacyTransactionFee(output + collateral, output, /*is_coinstake=*/false, height, params),
             0);
         // Excess above the collateral counts as an ordinary fee.
         BOOST_CHECK_EQUAL(
-            legacy::GetLegacyTransactionFee(output + collateral + COIN, output, /*is_coinstake=*/false, height),
+            legacy::GetLegacyTransactionFee(output + collateral + COIN, output, /*is_coinstake=*/false, height, params),
             COIN);
         // Below the collateral nothing is treated as a burn.
         BOOST_CHECK_EQUAL(
-            legacy::GetLegacyTransactionFee(output + collateral - COIN, output, /*is_coinstake=*/false, height),
+            legacy::GetLegacyTransactionFee(output + collateral - COIN, output, /*is_coinstake=*/false, height, params),
             collateral - COIN);
     }
 
     BOOST_CHECK_EQUAL(
-        legacy::GetLegacyTransactionFee(output + COIN, output, /*is_coinstake=*/true, /*height=*/1),
+        legacy::GetLegacyTransactionFee(output + COIN, output, /*is_coinstake=*/true, /*height=*/1, params),
         0);
 }
 

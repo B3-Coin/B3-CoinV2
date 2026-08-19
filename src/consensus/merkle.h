@@ -33,4 +33,14 @@ uint256 BlockWitnessMerkleRoot(const CBlock& block);
  */
 std::vector<uint256> TransactionMerklePath(const CBlock& block, uint32_t position);
 
+/**
+ * Fold a leaf hash up a merkle path (as produced by TransactionMerklePath)
+ * back to the root it commits to: the exact inverse operation, using the
+ * bits of `position` to pick the combination side at each level. Equality
+ * of the returned hash with a block's committed hashMerkleRoot proves the
+ * leaf is a transaction of that block.
+ */
+uint256 ComputeMerkleRootFromPath(const uint256& leaf, const std::vector<uint256>& path,
+                                  uint32_t position);
+
 #endif // BITCOIN_CONSENSUS_MERKLE_H

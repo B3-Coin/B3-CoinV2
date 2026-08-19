@@ -11,6 +11,7 @@ add_executable(test_bitcoin
   amount_tests.cpp
   argsman_tests.cpp
   asset_conservation_tests.cpp
+  b3_evolution_tests.cpp
   arith_uint256_tests.cpp
   banman_tests.cpp
   base32_tests.cpp
@@ -37,6 +38,7 @@ add_executable(test_bitcoin
   coinsviewoverlay_tests.cpp
   common_url_tests.cpp
   compress_tests.cpp
+  consensus_phase_tests.cpp
   crypto_tests.cpp
   cuckoocache_tests.cpp
   dbwrapper_tests.cpp
@@ -47,8 +49,12 @@ add_executable(test_bitcoin
   feerounder_tests.cpp
   flatfile_tests.cpp
   flowmesh_batch_tests.cpp
+  flowmesh_microblock_tests.cpp
+  flowmesh_sync_tests.cpp
   flowmesh_clearing_tests.cpp
   flowmesh_ledger_tests.cpp
+  fn_claim_tests.cpp
+  fn_pod_tests.cpp
   fs_tests.cpp
   getarg_tests.cpp
   hardfork_tests.cpp
@@ -61,6 +67,7 @@ add_executable(test_bitcoin
   key_tests.cpp
   logging_tests.cpp
   legacy_boundary_tests.cpp
+  legacy_fn_issuance_tests.cpp
   legacy_genesis_tests.cpp
   legacy_identity_tests.cpp
   legacy_checkpoint_tests.cpp
@@ -73,6 +80,7 @@ add_executable(test_bitcoin
   merkle_tests.cpp
   merkleblock_tests.cpp
   miner_tests.cpp
+  modern_stake_tests.cpp
   miniminer_tests.cpp
   miniscript_tests.cpp
   minisketch_tests.cpp

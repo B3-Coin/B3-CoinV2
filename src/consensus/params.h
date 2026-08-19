@@ -113,6 +113,48 @@ struct Params {
      */
     std::optional<uint256> legacy_final_hash;
     /**
+     * TRANSITION_LENGTH: the number of temporary-PoW corridor blocks between
+     * the final legacy block H and the first modern-PoS block. Heights
+     * H+1 .. H+transition_pow_length are the corridor: modern-format blocks
+     * whose production consensus is the historical B3 scrypt PoW (used only
+     * as the eligibility hash against nBits; block identity stays in the
+     * modern hash domain). Height H+transition_pow_length+1 is the first
+     * modern-PoS block. 0 disables the corridor (modern PoS directly after
+     * H). The locked mainnet design length is 1000; it is inert until a
+     * mainnet H/X boundary is finalized.
+     */
+    int transition_pow_length{0};
+    /**
+     * The compact-bits target every temporary-PoW corridor block must carry
+     * (constant corridor difficulty). The block's scrypt eligibility hash
+     * must not exceed this target. Unset means the corridor difficulty
+     * policy is unresolved and corridor blocks FAIL CLOSED: regtest fixtures
+     * set a trivially easy value as test scaffolding; the mainnet corridor
+     * difficulty policy is an OPEN design decision and must not be chosen
+     * here silently.
+     */
+    std::optional<uint32_t> transition_pow_bits;
+    /**
+     * The subsidy a temporary-PoW corridor coinbase may claim on top of
+     * fees. The mainnet corridor reward model is an OPEN design decision;
+     * 0 (fees only) is the neutral default used by regtest scaffolding.
+     */
+    int64_t transition_pow_reward{0};
+    /**
+     * MIN_STAKE_AMOUNT: the smallest principal a v1 STAKE output may carry.
+     * Unset means the stake economics are unresolved and stake creation
+     * FAILS CLOSED (mainnet: OPEN decision); regtest fixtures set a small
+     * scaffolding value.
+     */
+    std::optional<int64_t> min_stake_amount;
+    /**
+     * TEST-ONLY override of the historical FN disintegration collateral
+     * (Proof of Disintegration). Unset everywhere except regtest fixtures:
+     * the mainnet historical collateral schedule (25M/20M/15M B3 by height)
+     * is consensus history and must never change.
+     */
+    std::optional<int64_t> legacy_fn_collateral_test_override;
+    /**
      * Historical hardened checkpoints of the live legacy chain (height -> exact
      * block hash), ported verbatim from the historical client. A legacy block
      * accepted at a pinned height must hash to the pinned value. Empty on chains

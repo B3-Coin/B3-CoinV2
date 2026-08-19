@@ -49,6 +49,7 @@ add_executable(fuzz
   feeratediagram.cpp
   fees.cpp
   flatfile.cpp
+  flowmesh.cpp
   float.cpp
   golomb_rice.cpp
   headerssync.cpp

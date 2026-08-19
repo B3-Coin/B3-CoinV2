@@ -69,16 +69,46 @@ inline constexpr size_t MAX_POLICY_PARAMS_SIZE{80};
  *    shard id, so custody spreads over many parallel UTXOs. A vault has
  *    no private key: spending is authorized only by finalized withdrawal
  *    receipts. Same test-only activation as the asset policy set.
+ *  - STAKE: locked native B3 carrying a validator binding (modern/stake.h
+ *    defines the v1 on-chain carrier). v1: the commitment is the owner
+ *    binding (SHA256 of the owner script suffix, the OWNER scheme) and
+ *    params are the 32-byte validator key plus 2 zero reserved bytes.
+ *    Weight aggregates per validator key, never per output. Active from
+ *    the modern era's first block: STAKE creation during the temporary-PoW
+ *    corridor is what prepares the initial validator registry.
+ *  - FN: FN Coin (modern/fn.h,
+ *    doc/design/b3-legacy-fn-issuance-proposal.md; corrected owner
+ *    specification 2026-08-18) — the ONE global chain-scoped
+ *    fungible-but-indivisible colored asset, NEVER the native asset:
+ *    v1 carries the non-native global FN_ASSET_ID (modern/fn.h
+ *    FnAssetId, enforced by the FN layers — this layer can only pin
+ *    non-native), a whole-unit amount in [1, MAX_FN_EVER_ISSUED], the
+ *    modern ownership-policy commitment as the commitment (one party,
+ *    a threshold group or an organization alike), and canonically
+ *    EMPTY params. The PoDId lives ONLY in issuance evidence and the
+ *    future issued[pod_id] nullifier state — never in FN outputs.
+ *    FN v1 is NOT activated on
+ *    any network yet: creation, transfer and extinguishment rules arrive
+ *    with the FN validation commits, and until an explicit activation
+ *    every FN output is invalid like any other unactivated policy.
  */
 enum class PolicyType : uint16_t {
     LEGACY_LOCK = 0,
     OWNER = 1,
     BURN = 2,
     DEX_VAULT = 3,
+    STAKE = 4,
+    FN = 5,
 };
 
 //! DEX_VAULT v1 params: exactly a little-endian 2-byte shard id.
 inline constexpr size_t VAULT_SHARD_PARAMS_SIZE{2};
+
+//! STAKE v1 params: the 32-byte validator key plus 2 reserved bytes that
+//! must be zero (mirrors the script carrier's payload after its magic —
+//! modern/stake.h STAKE_VALIDATOR_KEY_SIZE/STAKE_RESERVED_SIZE).
+inline constexpr size_t STAKE_PARAMS_KEY_SIZE{32};
+inline constexpr size_t STAKE_PARAMS_SIZE{34};
 
 //! First and, at this stage, only version of either policy.
 inline constexpr uint16_t POLICY_VERSION_V1{1};
@@ -119,7 +149,8 @@ inline bool IsActivatedPolicy(const uint16_t policy_type, const uint16_t policy_
 {
     if (policy_version != POLICY_VERSION_V1) return false;
     if (policy_type == static_cast<uint16_t>(PolicyType::LEGACY_LOCK) ||
-        policy_type == static_cast<uint16_t>(PolicyType::OWNER)) {
+        policy_type == static_cast<uint16_t>(PolicyType::OWNER) ||
+        policy_type == static_cast<uint16_t>(PolicyType::STAKE)) {
         return true;
     }
     if (policy_type == static_cast<uint16_t>(PolicyType::BURN) ||
@@ -182,6 +213,36 @@ inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int he
         if (out.policy_params.size() != VAULT_SHARD_PARAMS_SIZE) {
             return PolicyOutputCheck::BAD_POLICY_PARAMS;
         }
+        break;
+    case PolicyType::STAKE:
+        // Locked NATIVE B3 carrying a validator binding: the commitment
+        // is the owner binding (non-null) and the params are exactly the
+        // 32-byte validator key plus 2 zero reserved bytes — the
+        // ModernOutput view of the stake.h script carrier. Previously
+        // this case was missing and an activated STAKE output fell
+        // through the switch structurally unchecked.
+        if (out.asset != NativeAsset()) return PolicyOutputCheck::BAD_ASSET;
+        if (out.policy_commitment.IsNull()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        if (out.policy_params.size() != STAKE_PARAMS_SIZE) {
+            return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        }
+        for (size_t i{STAKE_PARAMS_KEY_SIZE}; i < STAKE_PARAMS_SIZE; ++i) {
+            if (out.policy_params[i] != 0x00) return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        }
+        break;
+    case PolicyType::FN:
+        // UNREACHABLE until FN v1 is activated (IsActivatedPolicy above
+        // fails closed). The v1 structural rules, ready for that day
+        // (owner ruling 2026-08-18): FN Coin is the ONE global
+        // chain-scoped colored asset — never the native asset (the exact
+        // FnAssetId needs the chain domain and is enforced by the FN
+        // layers, modern/fn.h) — with whole-unit amounts, the modern
+        // ownership-policy commitment, and canonically EMPTY params:
+        // PoDId is an issuance nullifier, never output identity, and no
+        // opaque future-reinterpretable bytes are accepted.
+        if (out.asset == NativeAsset()) return PolicyOutputCheck::BAD_ASSET;
+        if (out.policy_commitment.IsNull()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        if (!out.policy_params.empty()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
         break;
     }
     return PolicyOutputCheck::OK;

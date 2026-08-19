@@ -137,6 +137,16 @@ bool PermittedDifficultyTransition(const Consensus::Params& params, int64_t heig
 
 // Bypasses the actual proof of work check during fuzz testing with a simplified validation checking whether
 // the most significant bit of the last byte of the hash is set.
+bool CheckTransitionPowEligibility(const CBlockHeader& header)
+{
+    bool neg{false};
+    bool overflow{false};
+    arith_uint256 target;
+    target.SetCompact(header.nBits, &neg, &overflow);
+    if (neg || overflow || target == 0) return false;
+    return UintToArith256(header.GetLegacyB3Hash()) <= target;
+}
+
 bool CheckProofOfWork(uint256 hash, unsigned int nBits, const Consensus::Params& params)
 {
     if (EnableFuzzDeterminism()) return (hash.data()[31] & 0x80) == 0;

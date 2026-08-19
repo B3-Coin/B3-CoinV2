@@ -139,7 +139,20 @@ static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t&
     block_out.reset();
     block.hashMerkleRoot = BlockMerkleRoot(block);
 
-    while (max_tries > 0 && block.nNonce < std::numeric_limits<uint32_t>::max() && !CheckProofOfWork(block.GetHash(), block.nBits, chainman.GetConsensus()) && !chainman.m_interrupt) {
+    // B3 temporary-PoW corridor blocks grind the historical scrypt
+    // eligibility hash; everything else grinds the identity hash.
+    const bool corridor{[&] {
+        LOCK(cs_main);
+        const CBlockIndex* prev{chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock)};
+        return prev != nullptr &&
+               Consensus::GetConsensusPhase(prev->nHeight + 1, chainman.GetConsensus()) ==
+                   Consensus::ConsensusPhase::TRANSITION_POW;
+    }()};
+    const auto pow_ok{[&]() {
+        return corridor ? CheckTransitionPowEligibility(block)
+                        : CheckProofOfWork(block.GetHash(), block.nBits, chainman.GetConsensus());
+    }};
+    while (max_tries > 0 && block.nNonce < std::numeric_limits<uint32_t>::max() && !pow_ok() && !chainman.m_interrupt) {
         ++block.nNonce;
         --max_tries;
     }

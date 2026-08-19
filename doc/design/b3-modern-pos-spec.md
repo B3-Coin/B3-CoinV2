@@ -30,7 +30,9 @@ that behavior is pinned by `legacy_transition_tests/`
 1. **STAKE is a Policy Output.** Consensus stake exists only as an explicitly
    typed output; no plain UTXO stakes implicitly.
 2. **Independent per-wallet STAKE outputs**; each is an independent consensus
-   object; no aggregation, no registration authority.
+   object; no registration authority. (Outputs are independent as *value
+   objects*; eligibility nevertheless aggregates per validator key — §5 —
+   so output-splitting confers no advantage.)
 3. **Locked B3 is the consensus weight** — the amount in an *active* STAKE
    output, nothing else.
 4. **Owner key ≠ validator key.** The owner commitment controls the funds;
@@ -97,9 +99,14 @@ For slot `s` in epoch `e`, a validator with active weight `w` computes
 
     y, π = VRF_sk(ModernChainDomain || seed_e || s)
 
-and is eligible iff `y < T(w, W)`, with `T` calibrated (PD-5) so the expected
-eligible count per slot is a small constant `K` and so that splitting or
-merging stake does not change expected eligibility. Eligible validators rank
+and is eligible iff `y < T(w, W)`, where `w` is the validator's **aggregated**
+weight — `SUM(all qualifying ACTIVE STAKE principal assigned to this
+validator key)` — never per-output. **This aggregation rule is LOCKED**
+(2026-08-16): splitting 100,000 B3 across 10,000 STAKE outputs must confer
+exactly the proposer opportunity of one output; there is one VRF evaluation
+per validator identity per slot, not one lottery ticket per UTXO. `T` is
+calibrated (PD-5) so the expected eligible count per slot is a small
+constant `K`. Eligible validators rank
 by ascending `y`; rank 0 is the primary, higher ranks are fallbacks; rank `r`
 may not timestamp a block before `slot_start + r · RANK_DELAY` (OPEN, PD-5).
 Cheap verification uses only the header, the proposer proof and the parent's
@@ -142,67 +149,33 @@ as the attribution window; whether evidence-based stake burning (via the
 existing BURN policy) ships at H+1 or behind a later activation height is
 OPEN (PD-13).
 
-## 10. H+1 validator bootstrap — **PRIMARY UNRESOLVED CONSENSUS QUESTION (OPEN, PD-16)**
+## 10. Initial validator set — RESOLVED BY THE TEMPORARY-PoW CORRIDOR
 
-**The problem.** Eligibility requires ACTIVE stake; stake exists only as
-STAKE outputs; STAKE outputs exist only in modern blocks; the first modern
-block is H+1. Someone must be entitled to propose H+1 (and the blocks shortly
-after) under a rule that is deterministic, permissionless, verifiable by
-every node, free of trusted keys, and resistant to both stalling (nobody
-eligible) and capture (one party trivially owning the early chain). Every
-other section of this specification survives without this answer; H+1 does
-not. This section must be locked first, and it interacts with PD-4 (what
-seed the window uses), PD-5 (thresholds when `W` is tiny), PD-7 (whether
-waived delays apply) and PD-14 (early-chain reorg bounds).
+**Superseded twice and now settled in direction** (2026-08-16, authoritative
+user direction): both the post-boundary "self-activating bootstrap" and the
+1,000-block *legacy-PoS declaration window* are SUPERSEDED. The transition
+is a temporary-PoW corridor with modern semantics:
 
-**Requirements any mechanism must meet:**
+    Genesis…500        historical B3 PoW        (LAST_POW_BLOCK = 500)
+    501…H              legacy B3 PoS            X = hash(H), the anchor
+    H+1 … H+1000       TEMPORARY B3 PoW corridor — modern block/tx format,
+                       Policy Outputs active, real STAKE outputs created
+                       from legacy UTXOs via LEGACY_LOCK and matured
+    M = H+1001 onward  modern B3 PoS
 
-- R1 Deterministically verifiable from chain data available at X.
-- R2 Permissionless: any pre-H holder can contend on equal, weight-
-  proportional terms.
-- R3 No trusted or pre-published operator keys.
-- R4 Live: the chain can start as soon as at least one holder participates,
-  and cannot be stalled by non-participation of others.
-- R5 Bounded: fabricated contender blocks at H+1 are cheaply rejectable
-  (anti-DoS), and the window's special rules end crisply.
-- R6 No reinterpretation of attested legacy history (no new legacy-era
-  semantics may be introduced retroactively).
-
-**Candidate mechanisms:**
-
-- **(A) Self-activating transition window.** For blocks in `H+1 .. H+B`, a
-  block may carry — as its first non-reward transaction — a transaction
-  locking pre-H value into a STAKE output, and its proposer proof may
-  reference *that in-block output* with the activation delay waived. The
-  window seed derives deterministically from `ModernChainDomain` (fixed at
-  X). After the window only normally-activated stake is eligible.
-  Satisfies R1–R4, R6. Open sub-questions: window length `B`; the effective
-  `W` for thresholds while the registry is empty or tiny (a defined
-  bootstrap threshold schedule is needed, else the first slots are either
-  dead or trivially won); whether window-created stake keeps privileged
-  status after the window (proposed: no — it re-enters the normal lifecycle);
-  the anti-DoS bound on contender blocks per slot (R5); and whether the
-  window seed being fully deterministic at X lets large holders pre-compute
-  their best slots (it does — analysis needed on whether weight-
-  proportionality makes this acceptable, since pre-computation does not
-  change expected proposer share).
-- **(B) Snapshot-derived initial validator set.** Derive an initial set from
-  pre-H facts (e.g. UTXOs above a size floor at X). Deterministic (R1) but
-  requires binding a validator key to legacy outputs — either by
-  reinterpreting legacy data (violates R6) or by a pre-H declaration
-  convention (a new legacy-era semantic — also against R6, and excludes
-  holders who missed the declaration window, weakening R2).
-- **(C) Time-boxed operator bootstrap keys.** Violates R3; listed only to
-  record its rejection rationale (centralized start, political cost,
-  precedent risk).
-- **(D) Hybrid A+deposit-intent.** Like (A), but contention in the window
-  additionally requires the locking transaction to reference a pre-H output
-  above a floor, tightening R5's DoS bound at the cost of a parameter.
-
-**Working direction (not locked):** (A), possibly hardened with (D)'s floor.
-Locking PD-16 requires: the mechanism choice; the window length; the
-bootstrap threshold schedule; the DoS bound; and the post-window status rule
-— the threshold schedule and window length being simulation questions.
+There is no bootstrap circularity and no declaration indirection: during
+the corridor, holders create **actual modern STAKE Policy Outputs**; block
+production is temporary PoW (reusing B3's historically proven scrypt PoW
+primitive), so legacy coinstake churn never conflicts with stake creation.
+At the end of H+1000 every node derives the same initial validator registry
+from qualifying mature STAKE outputs (cutoff height C, OPEN); at M the
+modern eligibility rule selects the first proposer from that registry. The
+authoritative corridor specification is
+[b3-during-fork-transition.md](b3-during-fork-transition.md). The initial
+randomness/VRF seed at M remains OPEN. Every "H+1 = first modern-PoS
+block" statement elsewhere in this document predates the corridor and
+reads as **M = H+1001**; H+1 is the first modern-*format* (temporary-PoW)
+block.
 
 ## 11. Pending decisions — ALL OPEN
 
@@ -218,7 +191,7 @@ locked by the user.
 | PD-2 | Validator key type | (a) BIP340 x-only Schnorr (32 B, in-tree, same key signs blocks); (b) compressed ECDSA (33 B) | OPEN |
 | PD-3 | Slot duration | Simulation question. Candidates 32/64/128 s; constraint: `K_max · RANK_DELAY < SLOT_SECONDS` | OPEN — simulation |
 | PD-4 | Epoch length; seed derivation | Length: simulation question. Seed: (a) fold VRF outputs of an early fraction of the prior epoch with a cutoff (denies end-of-epoch grinding); (b) ⊘ last-block hash: last proposer grinds by withholding; (c) pure chaining from prior seed: ungrindable but far-future-predictable (targeted DoS on future proposers) | OPEN — mechanism + simulation |
-| PD-5 | Threshold function; K; rank ladder | Function: (a) per-output binomial `P(eligible) = 1−(1−K/W_slots)^w` — split-invariant; (b) linear `y < K·w·2^256/W` (equivalent in the small-p regime). K and RANK_DELAY: simulation questions | OPEN — function + simulation |
+| PD-5 | Threshold function; K; rank ladder | Function over the validator's **aggregated** weight `w` (per-validator evaluation is LOCKED — one VRF attempt per validator key per slot, never per STAKE output): (a) binomial `P(eligible) = 1−(1−K/W_slots)^w`; (b) linear `y < K·w·2^256/W` (equivalent in the small-p regime). K and RANK_DELAY: simulation questions | OPEN — function + simulation |
 | PD-6 | Proposer-proof placement | (a) payload in the reward transaction's first output (front of block, streams early); (b) dedicated proposer transaction at index 1; (c) block-level section before the tx vector (deepest codec change) | OPEN |
 | PD-7 | Lifecycle constants | `MIN_STAKE_AMOUNT` (economics input; registry-size bound), `N_activate`, `N_unlock` (relationship to epoch length and attribution window) | OPEN — economics + simulation |
 | PD-8 | Validator-key re-delegation | (a) static (change = unlock + re-lock, full delays); (b) owner-signed in-place re-delegation (no weight gap; more consensus surface) | OPEN |
@@ -229,24 +202,27 @@ locked by the user.
 | PD-13 | Equivocation posture at H+1 | (a) fork choice only, penalties behind a later activation height (H+1 minimalism); (b) evidence transactions burning locked stake from launch (evidence rules must ship in v1) | OPEN |
 | PD-14 | Modern reorg depth bar | (a) rolling depth bound, no-penalty refusal (legacy analog); (b) none (long-range exposure); (c) per-epoch hard finality (adds a finality gadget H+1 does not need) | OPEN — mechanism + value by simulation |
 | PD-15 | Registry commitment | (a) derived-only (H+1 minimal); (b) registry root committed at epoch boundaries (light clients; extra obligation) | OPEN |
-| PD-16 | **H+1 bootstrap** (§10) | (A) self-activating window; (B) snapshot-derived set; (C) ⊘ operator keys; (D) A + pre-H-value floor. Plus: window length, bootstrap threshold schedule, DoS bound, post-window status | **OPEN — primary blocker** |
+| PD-16 | Initial validator set at M | **RESOLVED IN DESIGN DIRECTION — the temporary-PoW corridor** ([b3-during-fork-transition.md](b3-during-fork-transition.md)): 1,000 modern-format PoW blocks H+1…H+1000 in which real STAKE Policy Outputs are created from legacy UTXOs and matured; deterministic registry derivation at the end of H+1000; cutoff C splits initial ACTIVE from PENDING; M = H+1001 is the first modern-PoS block. The earlier self-activating, snapshot, operator-key and legacy-declaration-window options are all superseded. Remaining OPEN sub-items live in the corridor document (§12 OPEN list: corridor difficulty and reward, cutoff C, miner-capture rule, insufficient-stake handling, initial seed at M, X distribution, …) | DIRECTION LOCKED; sub-items OPEN |
 | PD-17 | Timestamp rules | Future-drift bound (slots), MTP retention, exact slot/nTime binding (the binding itself is part of the eligibility mechanism and not optional; the bound value is a simulation question) | OPEN — simulation |
 
 ### Simulation phase
 
 Before locking the numeric PDs (PD-3, PD-4 length, PD-5 K/ladder, PD-7
-delays, PD-10 BASE, PD-12 maturity, PD-14 value, PD-17 bound, PD-16 window
-length + threshold schedule), a simulation must characterize, at minimum:
-slot-fill rate and fork rate vs. K and RANK_DELAY under realistic latency;
-stall probability vs. offline fraction; seed-grinding advantage vs. the PD-4
-cutoff fraction; bootstrap liveness and capture share vs. participation
+delays, PD-10 BASE, PD-12 maturity, PD-14 value, PD-17 bound, and the
+transition window's numeric OPEN items — cutoff depth F−C and the readiness
+thresholds), a simulation must characterize, at minimum: slot-fill rate and
+fork rate vs. K and RANK_DELAY under realistic latency; stall probability
+vs. offline fraction; seed-grinding advantage vs. the PD-4 cutoff fraction;
+initial-set liveness and capture share at M vs. declaration-participation
 assumptions; and reorg-depth distributions vs. the PD-14 bar. Simulation
 harness design is out of scope for this document and must not touch
 consensus code.
 
 ## 12. Sequencing
 
-1. Lock PD-16 (bootstrap) and the non-numeric mechanism PDs.
+1. Lock the transition window's OPEN items
+   ([b3-during-fork-transition.md](b3-during-fork-transition.md) §15) and
+   the non-numeric mechanism PDs.
 2. Run the simulation phase; lock the numeric PDs from its results.
 3. Only then: implementation as a `modern::PosValidator` behind the existing
    dispatch, replacing the fail-closed gate in reviewable steps (data model,

@@ -83,7 +83,15 @@ void Usage()
                 "  -replayrows=<file>     write the replay reconstruction (U_replay) as canonical rows\n"
                 "  -masterrows=<file>     read the legacy master client's exported rows (U_master)\n"
                 "                         and verify U_master == U_port == U_replay; with this\n"
-                "                         option, exit 0 only when all three sets agree\n");
+                "                         option, exit 0 only when all three sets agree\n"
+                "\n"
+                "FN Proof-of-Disintegration report (doc/design/b3-fn-pod.md):\n"
+                "  -podreport             derive every qualifying historical PoD during the\n"
+                "                         replay pass and print the report. The QUALIFYING\n"
+                "                         COUNT (R vs the 1,000 cap) is the pre-activation\n"
+                "                         gate; the payload figures are a SUPERSEDED type-1\n"
+                "                         diagnostic, NOT the type-2 issuance capacity gate\n"
+                "                         (real type-2 proof sizes = future measurement)\n");
 }
 
 struct ToolArgs {
@@ -95,6 +103,7 @@ struct ToolArgs {
     fs::path portrows;
     fs::path replayrows;
     fs::path masterrows;
+    bool podreport{false};
 };
 
 std::optional<ToolArgs> ParseArgs(const int argc, char* argv[])
@@ -120,6 +129,8 @@ std::optional<ToolArgs> ParseArgs(const int argc, char* argv[])
             args.portrows = fs::PathFromString(*v);
         } else if (const auto v{eat("-replayrows=")}) {
             args.replayrows = fs::PathFromString(*v);
+        } else if (arg == "-podreport") {
+            args.podreport = true;
         } else if (const auto v{eat("-masterrows=")}) {
             args.masterrows = fs::PathFromString(*v);
         } else {
@@ -307,7 +318,8 @@ int main(int argc, char* argv[])
         const node::ReplayEquivalenceResult result{node::VerifyReplayEquivalence(
             consensus, live, read_block, scratch,
             {.final_height = args->height, .final_hash = args->hash,
-             .max_mismatch_sample = args->max_mismatches})};
+             .max_mismatch_sample = args->max_mismatches,
+             .derive_pod_report = args->podreport})};
 
         // ---- Report.
         for (const std::string& error : result.errors) {
@@ -328,6 +340,43 @@ int main(int argc, char* argv[])
         }
         tfm::format(std::cout, "result:             %s\n",
                     result.ok ? "EQUAL (U_port == U_replay)" : "NOT EQUAL");
+
+        // ---- Historical PoD report (doc/design/b3-fn-pod.md §8.4);
+        // payload portion superseded/non-authoritative.
+        if (result.pod_report) {
+            const node::PodCapacityReport& pod{*result.pod_report};
+            tfm::format(std::cout, "PoD qualifying:     %d\n", pod.total_qualifying);
+            tfm::format(std::cout, "PoD claimable:      %d\n", pod.claimable);
+            for (const auto& [reason, count] : pod.by_reason) {
+                tfm::format(std::cout, "PoD reason %d:       %d (%s)\n", reason, count,
+                            reason == 0 ? "SUPPORTED" : "UNSUPPORTED_FUNDING_SCRIPT");
+            }
+            tfm::format(std::cout, "PoD max scripts:    %d (largest eligible claim)\n",
+                        pod.max_distinct_funding_scripts);
+            tfm::format(std::cout, "PoD max action:     %d bytes (SUPERSEDED: worst-case payload of the ABANDONED type-1 FnClaimActionV1)\n",
+                        pod.max_action_payload);
+            tfm::format(std::cout, "PoD within 4000:    %d (superseded type-1 arithmetic)\n",
+                        pod.within_native_bound);
+            tfm::format(std::cout, "PoD exceeding 4000: %d (superseded type-1 arithmetic)\n",
+                        pod.exceeding_native_bound);
+            tfm::format(std::cout, "PoD native fit:     %s\n",
+                        pod.fits_native_action
+                            ? "yes (SUPERSEDED type-1 verdict; NOT the type-2 issuance capacity gate)"
+                            : "NO (superseded type-1 verdict)");
+            tfm::format(std::cout,
+                        "NOTE: the payload figures above measure the ABANDONED funding-signature\n"
+                        "claim encoding and are NON-AUTHORITATIVE for activation. Real encoded\n"
+                        "LegacyFnIssuanceActionV1 (type-2) proof sizes over actual history are\n"
+                        "UNMEASURED future work; FN activation remains blocked until that\n"
+                        "measurement exists or a reviewed versioned carrier is selected.\n");
+            for (const node::PodRecord& record : result.pod_records) {
+                tfm::format(std::cout,
+                            "  pod %s h=%d gap=%d tier=%d scripts=%d claimable=%s markers=%d\n",
+                            record.pod_id.ToString(), record.height, record.disintegrated,
+                            record.tier, record.funding_scripts.size(),
+                            record.claimable ? "yes" : "no", record.marker_vouts.size());
+            }
+        }
 
         // ---- Canonical row export and the three-way invariant
         // U_master == U_port == U_replay (doc/design/b3-utxo-equivalence.md).

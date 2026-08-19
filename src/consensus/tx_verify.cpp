@@ -4,6 +4,8 @@
 
 #include <consensus/tx_verify.h>
 
+#include <legacy/consensus.h>
+
 #include <chain.h>
 #include <coins.h>
 #include <consensus/amount.h>
@@ -161,7 +163,7 @@ int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& i
     return nSigOps;
 }
 
-bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmount& txfee)
+bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmount& txfee, std::optional<int> legacy_final_height)
 {
     // are the actual inputs available?
     if (!inputs.HaveInputs(tx)) {
@@ -176,7 +178,17 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
         assert(!coin.IsSpent());
 
         // If prev is coinbase, check that it's matured
-        if (coin.IsCoinBase() && nSpendHeight - coin.nHeight < COINBASE_MATURITY) {
+        if (legacy_final_height && coin.nHeight <= *legacy_final_height) {
+            // Pre-H legacy coin spent by a MODERN-era transaction: the frozen
+            // legacy maturity rides with the coin, and covers coinstake
+            // outputs, which the stock rule below does not know about.
+            if ((coin.IsCoinBase() || coin.IsCoinStake()) &&
+                nSpendHeight - coin.nHeight < legacy::COINBASE_MATURITY) {
+                return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-legacy-coin",
+                    strprintf("tried to spend legacy %s at depth %d", coin.IsCoinBase() ? "coinbase" : "coinstake",
+                              nSpendHeight - coin.nHeight));
+            }
+        } else if (coin.IsCoinBase() && nSpendHeight - coin.nHeight < COINBASE_MATURITY) {
             return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase",
                 strprintf("tried to spend coinbase at depth %d", nSpendHeight - coin.nHeight));
         }

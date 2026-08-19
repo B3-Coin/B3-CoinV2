@@ -6,6 +6,7 @@
 #define BITCOIN_NODE_UTXO_EQUIVALENCE_CHECK_H
 
 #include <consensus/params.h>
+#include <node/fn_pod.h>
 #include <node/utxo_commitment.h>
 #include <primitives/block.h>
 #include <txdb.h>
@@ -30,6 +31,13 @@ struct ReplayEquivalenceOptions {
     int final_height{-1};          //!< H: the height under verification
     uint256 final_hash{};          //!< X: the exact block hash at H
     size_t max_mismatch_sample{20}; //!< bound on retained per-outpoint diagnostics
+    //! Also derive the historical PoD report during the replay pass:
+    //! every qualifying PoD through H, classified with the same single
+    //! interpretation as the node. The qualifying COUNT is the
+    //! meaningful pre-activation gate; the report's payload arithmetic
+    //! is a SUPERSEDED type-1 diagnostic (node/fn_pod.h
+    //! PodCapacityReport banner), not the type-2 activation gate.
+    bool derive_pod_report{false};
 };
 
 struct ReplayEquivalenceResult {
@@ -46,6 +54,10 @@ struct ReplayEquivalenceResult {
     //! At most max_mismatch_sample of them, in canonical order.
     std::vector<UtxoMismatch> mismatch_sample;
     int blocks_replayed{0};
+    //! Present when opts.derive_pod_report was set and replay succeeded.
+    std::optional<PodCapacityReport> pod_report;
+    //! The underlying records (deterministic order), for detailed output.
+    std::vector<PodRecord> pod_records;
 };
 
 //! Reduce a full comparison to counts, commitments and a bounded sample.
