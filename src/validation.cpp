@@ -35,6 +35,7 @@
 #include <legacy/consensus.h>
 #include <legacy/replay.h>
 #include <modern/pos.h>
+#include <modern/pos_v1.h>
 #include <modern/stake.h>
 #include <logging/timer.h>
 #include <node/blockstorage.h>
@@ -4801,11 +4802,15 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
         return CheckLegacyBlock(block, state, consensusParams, fCheckPOW, fCheckMerkleRoot);
     }
 
-    // Modern and non-B3 blocks never carry the legacy trailing block
-    // signature.
-    if (!block.vchBlockSig.empty()) {
+    // Non-B3 blocks never carry a trailing block signature. Marker-modern
+    // B3 blocks may carry exactly a 64-byte modern-PoS validator signature
+    // (context-free structural bound; the phase-exact rule — empty in the
+    // corridor, required and verified in the modern-PoS phase — is
+    // contextual).
+    if (!block.vchBlockSig.empty() &&
+        !(consensusParams.legacy_b3coin && block.vchBlockSig.size() == modern::MODERN_POS_SIG_SIZE)) {
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-signature",
-                             "unexpected legacy block signature");
+                             "unexpected block signature");
     }
 
     // Signet only: check block solution
@@ -5200,6 +5205,20 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-stake-output",
                                      strprintf("%s in transaction %s", stake_error, tx->GetHash().ToString()));
             }
+        }
+        // Phase-exact trailing-signature shape: corridor blocks earned their
+        // place by PoW and must carry no signature; with the modern-PoS rule
+        // set configured, a modern-PoS block must carry exactly the 64-byte
+        // validator signature (verified cryptographically at connect).
+        const Consensus::ConsensusPhase phase{Consensus::GetConsensusPhase(nHeight, consensus_params)};
+        if (phase == Consensus::ConsensusPhase::TRANSITION_POW && !block.vchBlockSig.empty()) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-corridor-sig",
+                                 "temporary-PoW corridor block carries a block signature");
+        }
+        if (phase == Consensus::ConsensusPhase::MODERN_POS && consensus_params.modern_pos &&
+            block.vchBlockSig.size() != modern::MODERN_POS_SIG_SIZE) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-pos-signature",
+                                 "modern-PoS block does not carry a 64-byte validator signature");
         }
     }
 

@@ -133,10 +133,13 @@ public:
         // (ContextualCheckBlockHeader); this only selects the raw codec.
         if (s.template GetParams<TransactionSerParams>().legacy_time) {
             if (Consensus::HasB3BlockCodecV2(obj.nVersion)) {
-                // Reused objects must not leak a previous legacy block's
-                // trailing signature into a marker-modern block.
-                SER_READ(obj, obj.vchBlockSig.clear());
-                READWRITE(TX_WITH_WITNESS(obj.vtx));
+                // Marker-modern blocks carry a trailing signature vector,
+                // exactly the legacy codec's own trailing-signature pattern:
+                // outside the header and merkle commitment, so identity is
+                // untouched. Consensus pins its content by phase — empty in
+                // the temporary-PoW corridor, a 64-byte BIP340 validator
+                // signature in the modern-PoS phase (frozen V1 spec §5).
+                READWRITE(TX_WITH_WITNESS(obj.vtx), obj.vchBlockSig);
             } else {
                 READWRITE(obj.vtx, obj.vchBlockSig);
             }

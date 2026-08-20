@@ -129,14 +129,16 @@ BOOST_AUTO_TEST_CASE(legacy_chain_block_codec_is_marker_aware)
     block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
     block.vtx.push_back(MakeTransactionRef(mtx));
 
-    // A marker-modern block keeps the unmodified Core body even when read
-    // or written through the legacy-chain codec.
+    // A marker-modern block keeps the unmodified Core body through the
+    // legacy-chain codec, plus the modern trailing signature vector (one
+    // byte here: the empty vector), per the frozen Modern PoS V1 spec §5.
     DataStream via_legacy;
     via_legacy << legacy::TX_LEGACY(block);
     DataStream via_modern;
     via_modern << TX_WITH_WITNESS(block);
-    BOOST_REQUIRE_EQUAL(via_legacy.size(), via_modern.size());
-    BOOST_CHECK(std::equal(via_legacy.begin(), via_legacy.end(), via_modern.begin()));
+    BOOST_REQUIRE_EQUAL(via_legacy.size(), via_modern.size() + 1);
+    BOOST_CHECK(std::equal(via_modern.begin(), via_modern.end(), via_legacy.begin()));
+    BOOST_CHECK_EQUAL(std::to_integer<int>(*(via_legacy.end() - 1)), 0); // empty sig vector
 
     CBlock decoded;
     via_legacy >> legacy::TX_LEGACY(decoded);

@@ -114,11 +114,15 @@ CBlock ModernBlockVector()
     return block;
 }
 
+// The marker-modern wire form carries a trailing signature vector (empty
+// here), per the frozen Modern PoS V1 spec §5 — a pre-mainnet wire revision:
+// no modern block exists outside regtest fixtures, so no historical bytes
+// change. The header (and therefore the identity hash) is untouched.
 const std::string MODERN_BLOCK_HEX{"00000028bb000000000000000000000000000000000000000000000000000000000000"
     "00ef7ee218844e99119f450a69dfd2ca7168eafaeece8fa2582ac233088399da6600b3"
     "3f71ffff001d07000000010200000001cc000000000000000000000000000000000000"
     "00000000000000000000000000000000000151ffffffff010f27000000000000015100"
-    "000000"};
+    "00000000"};
 const std::string MODERN_BLOCK_HASH{"067ba8182ca5c7911e29cc491c25e9594f6732d7deb2026b2975ac3f56f5d7bb"};
 
 //! Synthetic era boundary: H is the final legacy height.
@@ -233,12 +237,13 @@ BOOST_AUTO_TEST_CASE(marker_modern_block_body_is_frozen)
 {
     const CBlock block{ModernBlockVector()};
 
-    // The marker selects the stock Core body even through the legacy-chain
-    // codec: identical bytes both ways, no nTime, no trailing signature.
+    // The marker selects the stock Core body through the legacy-chain codec,
+    // no nTime transactions, plus the modern trailing signature vector (empty
+    // here) — exactly one byte beyond the stock encoding, outside identity.
     BOOST_CHECK_EQUAL(LegacyHex(block), MODERN_BLOCK_HEX);
     DataStream modern_bytes;
     modern_bytes << TX_WITH_WITNESS(block);
-    BOOST_CHECK_EQUAL(HexStr(modern_bytes), MODERN_BLOCK_HEX);
+    BOOST_CHECK_EQUAL(HexStr(modern_bytes) + "00", MODERN_BLOCK_HEX);
     BOOST_CHECK(!block.vtx[0]->IsLegacyEncoded());
 
     // Modern hash domain: SHA256d, selected by the marker.
@@ -274,10 +279,11 @@ BOOST_AUTO_TEST_CASE(era_and_codec_combinations_at_the_boundary)
     }
 }
 
-BOOST_AUTO_TEST_CASE(modern_blocks_reject_trailing_signature_and_clear_stale_state)
+BOOST_AUTO_TEST_CASE(modern_blocks_bound_the_trailing_signature)
 {
     // A reused block object must not leak the previous legacy block's
-    // trailing signature into a marker-modern block.
+    // trailing signature into a marker-modern block: the modern codec reads
+    // its own (here empty) signature vector, replacing any stale state.
     CBlock reused;
     DataStream legacy_bytes{ParseHex<std::byte>(LEGACY_BLOCK_HEX)};
     legacy_bytes >> legacy::TX_LEGACY(reused);
@@ -287,17 +293,27 @@ BOOST_AUTO_TEST_CASE(modern_blocks_reject_trailing_signature_and_clear_stale_sta
     BOOST_CHECK(reused.vchBlockSig.empty());
     BOOST_CHECK_EQUAL(reused.GetMarkerHash(B3Params()).GetHex(), MODERN_BLOCK_HASH);
 
-    // A marker-modern block carrying a legacy trailing signature is invalid
-    // and never enters the legacy checker.
+    // A marker-modern block may carry no signature or exactly the 64-byte
+    // modern-PoS validator signature; any other length is invalid at the
+    // context-free layer and never enters the legacy checker.
     CBlock modern{ModernBlockVector()};
     modern.vchBlockSig = {0x01};
     BlockValidationState state;
     BOOST_CHECK(!CheckBlock(modern, state, B3Params(), /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/true));
     BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-blk-signature");
 
-    // Without the stray signature the same block passes the context-free
-    // stock structural path it is routed to... up to its non-coinbase first
-    // transaction, proving it reached the stock checker, not the legacy one.
+    // A 64-byte signature passes the structural bound and the block proceeds
+    // to the stock structural path (failing on its non-coinbase first
+    // transaction, proving it reached the stock checker, not the legacy one);
+    // whether the signature is required, forbidden, or cryptographically
+    // valid is the contextual phase rule, not this layer's.
+    CBlock sized{ModernBlockVector()};
+    sized.vchBlockSig.assign(64, 0xab);
+    BlockValidationState sized_state;
+    BOOST_CHECK(!CheckBlock(sized, sized_state, B3Params(), /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/true));
+    BOOST_CHECK_EQUAL(sized_state.GetRejectReason(), "bad-cb-missing");
+
+    // Without the stray signature the same block takes the same stock path.
     CBlock clean{ModernBlockVector()};
     BlockValidationState clean_state;
     BOOST_CHECK(!CheckBlock(clean, clean_state, B3Params(), /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/true));
