@@ -7,30 +7,33 @@ Locked material lives in [b3-architecture-contract.md](b3-architecture-contract.
 
 ---
 
-## OD-1 — Modern PoS consensus specification — **UNRESOLVED (blocking)**
+## OD-1 — Modern PoS consensus specification — **V1 MECHANISM FROZEN (2026-08-20); numerics REVISABLE**
 
-**Status: UNRESOLVED at the protocol-detail level. Do not implement.**
+**Status: the V1 mechanism is FROZEN by explicit owner rulings (M1–M6,
+2026-08-20) and implementation is authorized.**
+[b3-modern-pos-spec.md](b3-modern-pos-spec.md) is the frozen V1 specification:
+deterministic stake-weighted hash eligibility over a chained seed, exact
+deterministic timestamps encoding recovery rounds, BIP340 validator block
+signatures, PoS-native height/round fork choice with a fixed reorganization
+horizon, and an unconditional modern coinbase cap. No VRF, epochs, committees,
+slashing, finality gadget, or delegation in V1 (all V2 research, spec §10).
 
-Modern PoS is the single unbuilt piece on the critical path to H+1, and its protocol
-details have not been specified. `src/modern/pos.h` deliberately **fails closed**:
-`modern::CheckModernStake` rejects every modern-era block with `no-modern-pos-rules`
-unless a test-only validator is installed. That is the correct state until a spec exists.
+What remains OPEN under OD-1 (numbers, not mechanism):
 
-Undefined and required before any implementation:
+- Every numeric parameter is provisional (`REVISABLE_BEFORE_MAINNET`, spec §9)
+  and never configured on mainnet: block interval, round length, f0, sentinel
+  bits, future-drift bound, and the reward schedule (with OD-2).
+- The modern reorganization horizon **D** is deliberately unchosen.
+- The STAKE v1 script carrier still requires explicit ratification before any
+  mainnet H/X pin (unchanged).
 
-- **Stake eligibility** — which UTXOs may stake; minimum amount; minimum/maximum age;
-  whether policy-typed outputs (e.g. a `STAKE` policy) are required or optional.
-- **Kernel / selection function** — the hash construction, its inputs, and its randomness
-  source. Legacy stake modifiers and legacy in-block transaction offsets are explicitly
-  **not** carried forward.
-- **Difficulty / target retarget** — algorithm and bounds for the modern era.
-- **Reward schedule** — modern B3 monetary policy, including the coinbase/subsidy cap.
-  (Note: today the modern branch has no issuance cap other than the fail-closed hook —
-  see IS-3 in the status document.)
-- **Modern PoS block structure** — how a modern block declares itself proof-of-stake.
-- **Block signature / attestation scheme.**
-- **Validator set and finality** — membership, rotation, and whether finality is
-  committee-certified.
+Resolved by the frozen spec (formerly listed as undefined): stake eligibility
+(STAKE policy outputs, aggregated per key, 20-block depth); the selection
+function (tagged-hash digest over the seed chain — no separate retarget: the
+`w/W` normalization is the difficulty); reward cap (unconditional, outside the
+validator); PoS block structure (coinbase key declaration + trailing BIP340
+signature); block signature scheme (BIP340); validator set (the derived stake
+registry; no committees; finality is fork-choice-plus-horizon only in V1).
 
 Constraints already locked and not open for reinterpretation:
 
@@ -39,15 +42,10 @@ Constraints already locked and not open for reinterpretation:
 - Modern PoS must be complete before FlowMesh (contract §53).
 - Validators and FlowMesh FNs are separate roles (contract §52).
 
-**Required to unblock:** a written modern PoS consensus specification covering every bullet
-above.
-
-**Design base accepted:** [b3-modern-pos-spec.md](b3-modern-pos-spec.md) is the
-accepted structural base (STAKE policy outputs, locked-amount weight,
-owner/validator key split, no auto-compounding, bounded age, VRF eligibility
-with ranked fallbacks, cheap pre-verification). Every remaining decision is
-tracked there with LOCKED/OPEN status: PD-1..PD-17 are all OPEN and all numeric
-parameters are simulation-gated.
+**Required to unblock mainnet activation:** explicit ratification of the
+numeric parameters (spec §9), the horizon D, and the STAKE carrier — after the
+real-history equivalence gate, as always. Implementation on regtest is no
+longer blocked.
 
 **The transition model is AUTHORITATIVE design direction (2026-08-16):**
 [b3-during-fork-transition.md](b3-during-fork-transition.md) — the
@@ -66,16 +64,14 @@ length 1,000 is a locked count; per-validator weight aggregation is LOCKED
 preserved design number; after H, legacy PoS never resumes. Operator keys,
 snapshots, committees and self-authorizing blocks remain forbidden.
 
-**OD-1 stays UNRESOLVED and nothing may be implemented until every remaining
-OPEN item is explicitly locked** — the PoS PDs (PD-1..15, 17) plus the
-corridor document's OPEN list (corridor difficulty policy and numerics,
-corridor reward and the miner→validator-capture rule, cutoff C,
-insufficient-stake handling A–D, corridor reorg bounds, STAKE serialization
-and activation mechanics, minimum stake, initial seed at M, X distribution
-pause-vs-precommit); the numeric ones lock only from simulation results.
-The corridor's code/test contradiction register (including the H+1
-fail-closed integration test that will eventually move to H+1001) is in the
-corridor document §11 — recorded, not yet resolved in code.
+**Mainnet activation stays gated** on the corridor document's OPEN list
+(corridor difficulty policy and numerics, corridor reward and the
+miner→validator-capture rule, cutoff C, insufficient-stake handling A–D,
+corridor reorg bounds, minimum stake, X distribution pause-vs-precommit)
+plus the spec-§9 numeric ratification and the horizon D. The earlier PD-1..17
+register is superseded by the frozen V1 spec; the initial seed at M is now
+resolved (spec §3: derived from the corridor-exit block's marker hash under
+the seed domain tag).
 
 ---
 
