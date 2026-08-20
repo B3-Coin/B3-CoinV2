@@ -80,6 +80,32 @@ Ordered so that the earlier ones unblock the most work.
   owner-ratified; deposits/withdrawals for the DEX depend on it (or a
   replacement).
 
+## 3b. PROVISIONAL DEFAULTS under the solve-don't-ask mandate (2026-08-20)
+
+**Owner mandate (chat, 2026-08-20): "you should solve issues instead of
+making ?" — pick working answers; the owner will change decisions where
+necessary.** Accordingly the open items above now carry CLAUDE-SELECTED
+PROVISIONAL DEFAULTS. Rules of this section: every default is (a)
+visibly recorded here, never silently embedded; (b) overridable by one
+owner sentence at any time; (c) INVALID FOR MAINNET until the owner
+ratifies it explicitly — staging/testnet only. "Provisional" is not
+"approved."
+
+| Open item | Provisional default | Rationale (two lines) |
+|---|---|---|
+| O-1 seat mechanism | Lock/activate exactly 1 FN → bind one operator key → 1 seat; unlocked FN stays freely transferable. | The brief's own v1 direction; makes the active set explicit state and keeps FN liquid. |
+| O-2 proposer/committee/threshold | Round-robin over the sorted active seats; committee = ALL active seats; fault bound f = floor((k−1)/3); threshold t = MinCertificateThreshold(k, f). | Matches the implemented schedule; classic BFT bound keeps t both safe (2t−k>f) and live (t≤k−f) for every k≥4. |
+| Timeout policy | Round timeout = 4× target cadence (cadence 250 ms → 1 s), doubling per round, capped at 30 s. | Local liveness only — never touches deterministic state; conservative against false timeouts. |
+| O-3 / OD-6 anchor | Finality depth d = 12 blocks; every microblock anchors the newest acceptable block; deposits credit at the same d; reorg beyond d = safe halt (already the floor). | 12 legacy-PoS blocks is deep for this chain's cadence; halting stays the only deep-reorg behavior. |
+| O-4 fee distribution | Proposer takes its block's fees; rate 0 on staging. | Simplest deterministic rule and a direct liveness incentive; trivially replaceable by pro-rata later. |
+| O-9 vault | The implemented consumed-receipt keyless vault IS the provisional mechanism. | Only implemented+tested candidate; ratify-or-replace remains open for mainnet. |
+| O-9a cross-round unlock | NONE — permanent locks, safe halt. | The conservative floor is itself the decision; any unlock rule would be a new consensus-safety surface. |
+| O-9b certificate finality | Certificate = FlowMesh-final (irreversible within FlowMesh). | The implementation already behaves this way; making it the stated default removes the ambiguity. |
+| O-9c consumed_deposits | Retained; deposits execute before trading within a slot (current behavior). | Matches the implemented canonical order; nothing activates until deposits exist anyway. |
+| OD-7 precision | QTY_LOT = 1e6, integer price ticks, per-market caps deferred until a second market exists. | The constants already in code, now named as the default rather than left implicit. |
+| Deposit beneficiary binding | NOT defaulted — needs real design (the DEX_VAULT v1 output carries no beneficiary slot). Next design task, not a parameter. | A paper default here would be invented protocol, not a solved issue. |
+| O-5..O-8 futures mechanics | Explicitly DEFERRED — deferral is the decision; nothing in spot v1 is blocked by them. | Only "supported, max 10×" is locked; mechanics wait for the leverage phase. |
+
 ## 4. Contradictions created (reconcile in reviewed commits)
 
 - **Leverage scope, final state (Codex repair directive, 2026-08-19):** only
