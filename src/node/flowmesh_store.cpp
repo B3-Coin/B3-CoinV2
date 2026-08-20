@@ -128,16 +128,17 @@ bool FlowMeshStore::ReadMarker(std::optional<Marker>& out, std::string& error)
     return true;
 }
 
-bool FlowMeshStore::OpenForDomain(const uint256& domain, const std::set<XOnlyPubKey>& seats,
-                                  const uint64_t threshold, std::string& error)
+bool FlowMeshStore::CheckForDomain(const uint256& domain, const std::set<XOnlyPubKey>& seats,
+                                   const uint64_t threshold, bool& fresh_out,
+                                   std::string& error)
 {
+    fresh_out = false;
     if (!flowmesh::ValidQuorumConfig(seats.size(), threshold)) {
         error = "flowmesh log refused a nonsensical quorum configuration";
         return false;
     }
     std::optional<Marker> marker;
     if (!ReadMarker(marker, error)) return false;
-    const uint256 quorum{QuorumHash(seats, threshold)};
     if (!marker) {
         // A missing marker means FRESH only when every FLOWMESH
         // namespace ('m'/'e'/'s'/'l' first byte) is empty — entries,
@@ -159,14 +160,10 @@ bool FlowMeshStore::OpenForDomain(const uint256& domain, const std::set<XOnlyPub
             error = "flowmesh storage iterator failed while checking freshness";
             return false;
         }
-        Marker fresh;
-        fresh.domain = domain;
-        fresh.quorum_hash = quorum;
-        CDBBatch batch{m_db};
-        batch.Write(KEY_MARKER, fresh);
-        m_db.WriteBatch(batch, /*fSync=*/true); // throws on database failure
-        return true;
+        fresh_out = true;
+        return true; // genuinely fresh; NOTHING written here
     }
+    const uint256 quorum{QuorumHash(seats, threshold)};
     if (marker->domain != domain) {
         error = "flowmesh log belongs to a different domain";
         return false;
@@ -205,6 +202,22 @@ bool FlowMeshStore::OpenForDomain(const uint256& domain, const std::set<XOnlyPub
             error = "flowmesh storage iterator failed while probing the log tail";
             return false;
         }
+    }
+    return true;
+}
+
+bool FlowMeshStore::OpenForDomain(const uint256& domain, const std::set<XOnlyPubKey>& seats,
+                                  const uint64_t threshold, std::string& error)
+{
+    bool fresh{false};
+    if (!CheckForDomain(domain, seats, threshold, fresh, error)) return false;
+    if (fresh) {
+        Marker marker;
+        marker.domain = domain;
+        marker.quorum_hash = QuorumHash(seats, threshold);
+        CDBBatch batch{m_db};
+        batch.Write(KEY_MARKER, marker);
+        m_db.WriteBatch(batch, /*fSync=*/true); // throws on database failure
     }
     return true;
 }
@@ -623,20 +636,35 @@ bool StartValidator(FlowMeshStore& store, flowmesh::MeshNode::Config config,
         error = "flowmesh validator startup refused a nonsensical quorum configuration";
         return false;
     }
-    if (!store.OpenForDomain(config.domain, config.seats, config.threshold, error)) return false;
-
-    uint256 last_hash;
-    std::map<std::pair<int32_t, uint256>, uint64_t> committed_anchors;
-    if (!store.ReplayFromBestSnapshot(genesis, last_hash, *config.auth, config.deposits,
-                                      config.seats, config.threshold, config.anchors, error,
-                                      &committed_anchors)) {
+    // STORE-NEUTRAL STARTUP: validate first WITHOUT writing; every
+    // fallible step (replay, lock restore, role claim) runs before the
+    // fresh marker is initialized, so a failed startup leaves a fresh
+    // store byte-identical.
+    bool fresh{false};
+    if (!store.CheckForDomain(config.domain, config.seats, config.threshold, fresh, error)) {
         return false;
     }
+    uint256 last_hash;
+    std::map<std::pair<int32_t, uint256>, uint64_t> committed_anchors;
     std::map<uint64_t, uint256> locks;
-    if (!store.ReadLocks(locks, error)) return false;
+    if (!fresh) {
+        if (!store.ReplayFromBestSnapshot(genesis, last_hash, *config.auth, config.deposits,
+                                          config.seats, config.threshold, config.anchors,
+                                          error, &committed_anchors)) {
+            return false;
+        }
+        if (!store.ReadLocks(locks, error)) return false;
+    }
+    // (A fresh store has verified-empty namespaces: genesis state, null
+    // tip, no locks, no anchor dependencies.)
 
     if (!store.ClaimValidatorRole()) {
         error = "flowmesh store already backs a signing validator";
+        return false;
+    }
+    // The ONLY store mutation of startup, after everything fallible:
+    if (!store.OpenForDomain(config.domain, config.seats, config.threshold, error)) {
+        store.ReleaseValidatorRole();
         return false;
     }
     out.sink = std::make_unique<StoreCommitSink>(store);
@@ -648,7 +676,10 @@ bool StartValidator(FlowMeshStore& store, flowmesh::MeshNode::Config config,
     out.mesh_node = flowmesh::detail::SigningNodeFactory::Make(
         std::move(config), std::move(genesis), last_hash, locks, committed_anchors);
     if (out.mesh_node->Halted()) {
+        // Unreachable by construction (every halt condition was
+        // pre-validated above); defensive all the same.
         error = "flowmesh validator startup produced an invalid node configuration";
+        store.ReleaseValidatorRole();
         out = {}; // never hand back a half-built runtime
         return false;
     }

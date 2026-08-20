@@ -427,7 +427,7 @@ DEX fills are **never** UTXO spends. One order is **never** one UTXO. The bounda
     DEX_VAULT
         ↓
     FlowMesh internal ledger
-        ├─ available   ├─ reserved  ├─ margin
+        ├─ available   ├─ reserved  ├─ margin (futures: every mechanic OPEN; only "supported, max 10×" is locked)
         ├─ positions   ├─ orders/demand curves  └─ PnL
         ↓ withdrawal receipt
     DEX_VAULT
@@ -488,8 +488,8 @@ never opportunistically selected by the withdrawing user.
 ## 36. FlowMesh accounting uses integers
 
 No `double`, `float`, or `long double` anywhere in consensus. Integer fixed-point only.
-Each market defines consensus precision: price ticks, quantity lots, fee units, funding
-units, margin precision. Overflow handling is explicit, using wide intermediate arithmetic
+Each market defines consensus precision: price ticks, quantity lots, fee units — and,
+only if the owner ever approves such mechanics, funding units and margin precision. Overflow handling is explicit, using wide intermediate arithmetic
 where necessary.
 
 ## 37. Determinism rules are global

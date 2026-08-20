@@ -399,6 +399,16 @@ public:
             msg.mb = *mb;
             msg.credentials = std::move(credentials);
         }
+        // IMMEDIATELY before signing the proposal: the committed
+        // dependency set and this candidate's own anchor must satisfy
+        // the full policy at signature time, not merely at entry.
+        if (!RecheckCommittedAnchors()) return std::nullopt;
+        if (!m_config.anchors->Acceptable(msg.mb.anchor)) {
+            if (!m_config.anchors->StillCanonical(msg.mb.anchor)) {
+                m_halt = MeshHalt::ANCHOR_INVALIDATED;
+            }
+            return std::nullopt;
+        }
         if (!SignProposal(*m_config.seat_key, m_config.domain, msg)) return std::nullopt;
         return msg;
     }
@@ -448,23 +458,23 @@ public:
         }
 
         if (!m_config.seat_key) return std::nullopt; // observer
-        // IMMEDIATELY before signing (after candidate execution):
-        // revalidate every required B3 anchor. The committed dependency
-        // set must remain canonical, and this candidate's own anchor
-        // must still satisfy the FULL acceptability policy (canonical
-        // AND sufficiently buried per the owner-supplied depth) — mere
-        // canonicality is not enough to sign against.
+        // SAFETY ORDER: durable compare-and-set lock BEFORE signing. A
+        // written lock without a signature is always safe.
+        if (!m_config.lock_journal->WriteLock(seq, hash)) {
+            m_halt = MeshHalt::LOCK_JOURNAL_FAILED;
+            return std::nullopt;
+        }
+        // IMMEDIATELY before attestation — AFTER the durable lock write
+        // and its flush, so no anchor can invalidate in the write
+        // window: the committed dependency set must remain canonical,
+        // and this candidate's own anchor must still satisfy the FULL
+        // acceptability policy (canonical AND sufficiently buried).
         if (!RecheckCommittedAnchors()) return std::nullopt;
         if (!m_config.anchors->Acceptable(msg.mb.anchor)) {
             if (!m_config.anchors->StillCanonical(msg.mb.anchor)) {
                 m_halt = MeshHalt::ANCHOR_INVALIDATED; // orphaned: halt
             }
             return std::nullopt; // unburied: refuse to sign (retriable)
-        }
-        // SAFETY ORDER: durable compare-and-set lock BEFORE signing.
-        if (!m_config.lock_journal->WriteLock(seq, hash)) {
-            m_halt = MeshHalt::LOCK_JOURNAL_FAILED;
-            return std::nullopt;
         }
         const std::optional<Attestation> att{
             SignAttestation(*m_config.seat_key, m_config.domain, seq, hash)};

@@ -1554,12 +1554,21 @@ BOOST_AUTO_TEST_CASE(self_audit_fixes_market_config_store_and_decode)
             FlowMeshState target{VAULT, BaseX(), Quote()};
             stream >> target;
         }};
-        // Consistent: reserved 90 == worst-case bound ((10-0)*(20-1)=190
-        // is the cap; 90 is fine) and matches the ledger reservation.
-        BOOST_CHECK_NO_THROW(craft(0, 90, 90));
-        BOOST_CHECK_THROW(craft(11, 90, 90), std::ios_base::failure);  // filled > max qty
+        // REACHABLE residuals only (Codex blocker 1): an unfilled bid
+        // must carry EXACTLY its submission-time reservation (worst =
+        // (10-0)*(20-1) = 190 here); after `filled` lots the residual
+        // may lie only within [worst - MaxPrefixSpend, worst] — each
+        // filled lot spends between 0 (a zero-price clear) and its
+        // per-lot bound (19 here).
+        BOOST_CHECK_NO_THROW(craft(0, 190, 190));                      // exact at filled == 0
+        BOOST_CHECK_THROW(craft(0, 90, 90), std::ios_base::failure);   // unreachable under-reserve
+        BOOST_CHECK_THROW(craft(0, 189, 189), std::ios_base::failure); // even one tick short
+        BOOST_CHECK_NO_THROW(craft(1, 171, 171));                      // band floor: 190 - 19
+        BOOST_CHECK_NO_THROW(craft(1, 190, 190));                      // zero-price fill: no spend
+        BOOST_CHECK_THROW(craft(1, 170, 170), std::ios_base::failure); // below the reachable band
+        BOOST_CHECK_THROW(craft(11, 190, 190), std::ios_base::failure); // filled > max qty
         BOOST_CHECK_THROW(craft(0, 191, 191), std::ios_base::failure); // reserved > worst case
-        BOOST_CHECK_THROW(craft(0, 90, 80), std::ios_base::failure);   // book != ledger
+        BOOST_CHECK_THROW(craft(0, 190, 180), std::ios_base::failure); // book != ledger
     }
 
     // The proposal envelope wire codec: strict round trip, and oversized
@@ -1780,6 +1789,57 @@ BOOST_AUTO_TEST_CASE(codex_followup_boundaries)
         std::optional<node::FlowMeshStore::Marker> marker;
         BOOST_REQUIRE(store.ReadMarker(marker, error));
         BOOST_CHECK(!marker.has_value()); // still a fresh, unmutated store
+    }
+}
+
+BOOST_AUTO_TEST_CASE(codex_final_blockers)
+{
+    MeshNet net{3, 0};
+    std::string error;
+
+    // Blocker 2: anchors are rechecked immediately before EVERY
+    // signature. Proposal signing: burial lost between eligibility and
+    // signing -> TryPropose refuses (no halt; canonical anchor).
+    {
+        const size_t p{net.ProposerIndex(0, 0)};
+        net.anchors.sufficiently_buried = false;
+        BOOST_CHECK(!net.nodes[p]->TryPropose().has_value());
+        BOOST_CHECK(!net.nodes[p]->Halted());
+        net.anchors.sufficiently_buried = true;
+        BOOST_CHECK(net.nodes[p]->TryPropose().has_value()); // buried again: proposes
+    }
+
+    // Blocker 3: startup is store-neutral on EVERY failure path — a
+    // fresh store that fails at the role claim (all validation passed)
+    // still carries no marker; only a fully successful startup writes.
+    {
+        const fs::path path{m_args.GetDataDirBase() / "flowmesh_neutral"};
+        node::FlowMeshStore store{
+            DBParams{.path = path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+        BOOST_REQUIRE(store.ClaimValidatorRole()); // pre-claim: startup must fail late
+        MeshNode::Config config;
+        config.domain = MESH_DOMAIN;
+        config.seats = net.seats;
+        config.threshold = net.threshold;
+        config.schedule = net.schedule.get();
+        config.auth = &net.auth;
+        config.deposits = &net.deposits;
+        config.anchors = &net.anchors;
+        config.seat_key = net.keys[0];
+        node::ValidatorRuntime runtime;
+        BOOST_CHECK(!node::StartValidator(store, config, VAULT, BaseX(), Quote(), 8, runtime,
+                                          error));
+        std::optional<node::FlowMeshStore::Marker> marker;
+        BOOST_REQUIRE(store.ReadMarker(marker, error));
+        BOOST_CHECK(!marker.has_value()); // fresh store byte-identical after the failure
+        // Releasing the stale claim lets a correct startup succeed and
+        // perform the single marker write.
+        store.ReleaseValidatorRole();
+        BOOST_REQUIRE_MESSAGE(node::StartValidator(store, config, VAULT, BaseX(), Quote(), 8,
+                                                   runtime, error),
+                              error);
+        BOOST_REQUIRE(store.ReadMarker(marker, error));
+        BOOST_CHECK(marker.has_value());
     }
 }
 

@@ -71,10 +71,20 @@ public:
     //! could otherwise each durably acknowledge a different entry at
     //! the same sequence.)
     [[nodiscard]] bool ClaimValidatorRole() { return !m_validator_started.exchange(true); }
+    void ReleaseValidatorRole() { m_validator_started.store(false); }
 
     bool ReadMarker(std::optional<Marker>& out, std::string& error);
 
-    //! Bind the store to `domain` under the given quorum configuration.
+    //! Validate the store against `domain`/quorum WITHOUT writing
+    //! anything (freshness/namespace scans included). `fresh_out`
+    //! reports whether the store is genuinely fresh (no marker, empty
+    //! FlowMesh namespaces). Startup uses this so a later failure can
+    //! never leave a marker behind.
+    bool CheckForDomain(const uint256& domain, const std::set<XOnlyPubKey>& seats,
+                        uint64_t threshold, bool& fresh_out, std::string& error);
+
+    //! Bind the store to `domain` under the given quorum configuration
+    //! (CheckForDomain + fresh-marker initialization).
     bool OpenForDomain(const uint256& domain, const std::set<XOnlyPubKey>& seats,
                        uint64_t threshold, std::string& error);
 

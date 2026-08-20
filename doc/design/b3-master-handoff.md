@@ -765,32 +765,18 @@ Maker/taker schedules, insurance allocations, rebates, and FN distributions rema
 > OPEN, not approved design. The sequencing rule itself (leverage only
 > after deterministic spot works) remains locked.
 
-After deterministic spot works, the test harness may add isolated margin up to 10x.
+LOCKED here is only the SEQUENCING: futures work of any kind begins only
+after deterministic spot works. The locked futures facts remain exactly
+two — futures will be supported, and maximum leverage is 10×.
 
-Test-only v1 shape:
-
-```text
-Position {
-    market;
-    signed_size;
-    entry_price;
-    isolated_collateral;
-    realized_pnl;
-}
-```
-
-- positive size = long;
-- negative size = short;
-- initial margin at 10x = 10% of notional;
-- a 5% maintenance threshold may be used only as an explicitly labeled TEST PARAMETER;
-- no cross margin;
-- no funding;
-- no ADL;
-- no portfolio margin;
-- no production oracle assumption;
-- no automatic claim that last trade or clearing price is the correct mark price.
-
-Use a `MarkPriceProvider` interface and a deterministic test price source. Production oracle/mark-price design is OPEN.
+*(A historical sketch that previously stood in this section — an
+isolated-margin test harness with a Position shape, a 10% initial-margin
+figure, a 5% maintenance test threshold, and a `MarkPriceProvider`
+interface — was NEVER approved design and was removed from normative
+text on 2026-08-20 per the Codex repair directive. Every futures
+mechanic — margin mode, margin parameters, funding, mark/oracle price,
+liquidation, insurance, ADL — is an OPEN owner decision recorded in
+[b3-flowmesh-dex-decisions.md](b3-flowmesh-dex-decisions.md).)*
 
 First liquidation version is deterministic full isolated liquidation. Production insurance and liquidation economics remain OPEN.
 
@@ -977,7 +963,9 @@ The present execution order is:
 
 10. Enable TEST_USDT fee accounting/distribution under explicit test rules.
 
-11. Add isolated leverage, PnL, deterministic test mark prices, and liquidation.
+11. Add futures support within the locked 10× maximum (every mechanic —
+    margin mode, PnL treatment, mark price, liquidation — is an OPEN
+    owner decision to be made before this step).
 
 12. Design/activate real stablecoin bridges and approved real fee AssetIds later.
 ```

@@ -292,11 +292,20 @@ public:
                 throw std::ios_base::failure("flowmesh book snapshot retains an exhausted curve");
             }
             if (bid) {
-                // BID residual: bounded by the (conservative) staircase
-                // — fills at varying prices make an exact live value
-                // non-derivable from (points, filled) alone.
+                // BID residual: REACHABLE range only. Live submission
+                // reserves EXACTLY the staircase bound; each fill of
+                // one lot consumes between 0 (a zero-price clear) and
+                // that lot's per-lot price bound. Hence:
+                //   filled == 0  =>  reserved == worst (exact), and
+                //   otherwise     worst - MaxPrefixSpend(filled)
+                //                   <= reserved <= worst.
+                // Anything outside that band cannot arise through
+                // execution and may fail settlement later.
                 const std::optional<CAmount> worst{WorstCaseReservation(key.first, curve.points)};
-                if (!worst || curve.reserved < 0 || curve.reserved > *worst) {
+                const std::optional<CAmount> max_spend{
+                    BidMaxPrefixSpend(curve.points, curve.filled)};
+                if (!worst || !max_spend || curve.reserved < 0 || curve.reserved > *worst ||
+                    curve.reserved < *worst - *max_spend) {
                     throw std::ios_base::failure(
                         "flowmesh book snapshot reservation state impossible");
                 }
@@ -481,6 +490,32 @@ private:
             }
         }
         return points.back().qty;
+    }
+
+    /**
+     * Maximum quote a BID can have spent after `filled` lots: the
+     * filled lots are always the SMALLEST cumulative positions (fills
+     * reduce effective quantity uniformly at every price), and the lot
+     * at cumulative position λ in (q_{i+1}, q_i] can never fill above
+     * integer price p_{i+1}-1 — so the maximum spend is the staircase
+     * prefix over the first `filled` lots, consumed from the
+     * highest-price segments downward.
+     */
+    static std::optional<CAmount> BidMaxPrefixSpend(const std::vector<Breakpoint>& points,
+                                                    const CAmount filled)
+    {
+        if (filled < 0) return std::nullopt;
+        __int128 spend{0};
+        CAmount remaining{filled};
+        for (size_t i{points.size()}; i-- > 1 && remaining > 0;) {
+            const CAmount width{points[i - 1].qty - points[i].qty};
+            const CAmount take{std::min(remaining, width)};
+            spend += static_cast<__int128>(take) * (points[i].price - 1);
+            remaining -= take;
+        }
+        if (remaining > 0) return std::nullopt; // filled exceeds the curve: impossible
+        if (spend > static_cast<__int128>(MAX_MONEY)) return MAX_MONEY;
+        return static_cast<CAmount>(spend);
     }
 
     std::optional<CAmount> WorstCaseReservation(Side side,

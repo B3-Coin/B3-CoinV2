@@ -94,7 +94,7 @@ Ordered so that the earlier ones unblock the most work.
   positions/margin/PnL as missing-by-scope for FlowMesh; with the locked futures requirement they are
   now required scope (still gated behind the contract's clean-H+1 sequencing
   for any consensus wiring).
-- The master handoff's FlowMesh sections should gain the L-1..L-6 rulings when
+- The master handoff's FlowMesh sections should gain the L-1..L-4 rulings when
   next revised; until then this register is the pointer.
 
 ## 5. Implementation status (2026-08-19, certified-log build-out)
@@ -157,9 +157,13 @@ DepositVerifier and withdrawal-authorization consensus wiring once O-9
 and base-chain activation land; incremental state root only if scale
 ever demands it (see above).
 
-## 6. Build consequences (original plan, superseded by §5 where they overlap)
+## 6. Build consequences — HISTORICAL SKETCH (non-normative)
 
-Layered so spot determinism lands first and perps reuse the same rails:
+Superseded by §5 where they overlap; retained only as a record of the
+original planning pass. Nothing here is approved futures design — the
+locked futures facts remain "supported" and "max leverage 10×" only.
+The original layering (spot determinism first, later markets reusing
+the same rails):
 
 1. **Microblock object** (`src/flowmesh/`, header-only/test-only): serializable
    `{sequence, parent_microblock_id, b3_anchor, actions, previous_state_root,
