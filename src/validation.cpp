@@ -3044,8 +3044,32 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                                         block.vtx[0]->GetValueOut(), corridor_reward));
             }
         } else if (state.IsValid()) {
-            (void)modern::CheckModernStake(block, *pindex->pprev, view, state,
-                                           params.GetConsensus().test_only_modern_pos_validator);
+            // The UNCONDITIONAL modern coinbase cap sits outside the PoS
+            // validator by design (frozen V1 spec section 8): no rule set,
+            // present or future, can bypass it. With no modern-PoS parameter
+            // block configured the cap is fees-only, so nothing can mint by
+            // omission.
+            const CAmount modern_reward{params.GetConsensus().modern_pos
+                                            ? params.GetConsensus().modern_pos->reward
+                                            : 0};
+            if (block.vtx[0]->GetValueOut() > nFees + modern_reward) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
+                              strprintf("modern coinbase pays too much (actual=%d vs limit=%d)",
+                                        block.vtx[0]->GetValueOut(), nFees + modern_reward));
+            }
+            // M6: a block reward can never directly create active STAKE. The
+            // reward pays ordinary outputs; restaking is an explicit STAKE
+            // output subject to the activation depth.
+            for (const CTxOut& cb_out : block.vtx[0]->vout) {
+                if (state.IsValid() && modern::ClaimsStakeMagic(cb_out.scriptPubKey)) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-stake",
+                                  "coinbase output claims the STAKE magic");
+                }
+            }
+            if (state.IsValid()) {
+                (void)modern::CheckModernStake(block, *pindex->pprev, view, state,
+                                               params.GetConsensus().test_only_modern_pos_validator);
+            }
         }
     } else {
         const CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, params.GetConsensus());
