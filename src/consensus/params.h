@@ -7,6 +7,7 @@
 #ifndef BITCOIN_CONSENSUS_PARAMS_H
 #define BITCOIN_CONSENSUS_PARAMS_H
 
+#include <consensus/modern_pos_params.h>
 #include <script/verify_flags.h>
 #include <uint256.h>
 
@@ -147,6 +148,14 @@ struct Params {
      * scaffolding value.
      */
     std::optional<int64_t> min_stake_amount;
+    /**
+     * Modern PoS V1 parameter block (consensus/modern_pos_params.h). Unset
+     * means modern-PoS rules are unconfigured and every modern-PoS block
+     * FAILS CLOSED (`no-modern-pos-rules`). Real chainparams never set it:
+     * every value inside is REVISABLE_BEFORE_MAINNET scaffolding until the
+     * owner ratifies mainnet numbers (a guard test pins this).
+     */
+    std::optional<ModernPosParams> modern_pos;
     /**
      * TEST-ONLY override of the historical FN disintegration collateral
      * (Proof of Disintegration). Unset everywhere except regtest fixtures:
