@@ -172,12 +172,21 @@ bool FlowMeshStore::OpenForDomain(const uint256& domain, const std::set<XOnlyPub
     }
     // Log entries BEYOND the authoritative tip cannot arise from the
     // atomic append (entry+marker commit together): their presence is
-    // tamper or corruption, never silently ignored. No rollback rule is
+    // tamper or corruption, never silently ignored. The COMPLETE tail
+    // of the entry namespace is probed (any key at or past
+    // next_sequence), not just the next slot. No rollback rule is
     // defined, so this fails closed.
     {
-        flowmesh::CertifiedEntry beyond;
-        if (ReadStrict(m_db, EntryKey(marker->next_sequence), beyond) != ReadResult::NOT_FOUND) {
+        std::unique_ptr<CDBIterator> it{m_db.NewIterator()};
+        it->Seek(EntryKey(marker->next_sequence));
+        for (; it->Valid(); it->Next()) {
+            uint8_t prefix{0};
+            if (!it->GetKey(prefix) || prefix != KEY_ENTRY) break; // past the namespace
             error = "flowmesh log holds entries beyond its authoritative tip";
+            return false;
+        }
+        if (!it->StatusOK()) {
+            error = "flowmesh storage iterator failed while probing the log tail";
             return false;
         }
     }
@@ -186,6 +195,7 @@ bool FlowMeshStore::OpenForDomain(const uint256& domain, const std::set<XOnlyPub
 
 bool FlowMeshStore::Append(const flowmesh::CertifiedEntry& entry, std::string& error)
 {
+    const std::lock_guard<std::mutex> guard{m_write_mutex};
     std::optional<Marker> marker;
     if (!ReadMarker(marker, error)) return false;
     if (!marker) {
@@ -228,7 +238,7 @@ bool FlowMeshStore::WriteLock(const uint64_t sequence, const uint256& microblock
     // SERIALIZED COMPARE-AND-SET: the read-check-write runs under one
     // mutex so no concurrent caller can interleave, and a storage ERROR
     // is refusal — never treated as "absent" and overwritten.
-    const std::lock_guard<std::mutex> guard{m_lock_mutex};
+    const std::lock_guard<std::mutex> guard{m_write_mutex};
     try {
         uint256 existing;
         switch (ReadStrict(m_db, LockKey(sequence), existing)) {
@@ -264,7 +274,7 @@ bool FlowMeshStore::WriteLock(const uint64_t sequence, const uint256& microblock
 
 bool FlowMeshStore::ClearLocksThrough(const uint64_t sequence)
 {
-    const std::lock_guard<std::mutex> guard{m_lock_mutex};
+    const std::lock_guard<std::mutex> guard{m_write_mutex};
     try {
         std::map<uint64_t, uint256> locks;
         std::string error;
@@ -398,6 +408,7 @@ bool FlowMeshStore::ReplayRange(flowmesh::FlowMeshState& state, uint256& last_ha
 bool FlowMeshStore::WriteSnapshot(const uint64_t upto_sequence,
                                   const flowmesh::FlowMeshState& state, std::string& error)
 {
+    const std::lock_guard<std::mutex> guard{m_write_mutex};
     std::optional<Marker> marker;
     if (!ReadMarker(marker, error)) return false;
     if (!marker) {
@@ -570,6 +581,10 @@ bool StartValidator(FlowMeshStore& store, flowmesh::MeshNode::Config config,
         error = "flowmesh validator startup refused a curve bound outside the hard cap";
         return false;
     }
+    if (base_asset == quote_asset) {
+        error = "flowmesh validator startup refused a market whose base equals its quote";
+        return false;
+    }
     // CANONICAL GENESIS: the initial state is constructed HERE from the
     // immutable configuration — always the canonical empty state (no
     // chain-derived initialization exists yet; deposits stay
@@ -589,6 +604,10 @@ bool StartValidator(FlowMeshStore& store, flowmesh::MeshNode::Config config,
     std::map<uint64_t, uint256> locks;
     if (!store.ReadLocks(locks, error)) return false;
 
+    if (!store.ClaimValidatorRole()) {
+        error = "flowmesh store already backs a signing validator";
+        return false;
+    }
     out.sink = std::make_unique<StoreCommitSink>(store);
     out.journal = std::make_unique<StoreLockJournal>(store);
     out.history = std::make_unique<StoreCatchupSource>(store);
@@ -599,6 +618,7 @@ bool StartValidator(FlowMeshStore& store, flowmesh::MeshNode::Config config,
         std::move(config), std::move(genesis), last_hash, locks, committed_anchors);
     if (out.mesh_node->Halted()) {
         error = "flowmesh validator startup produced an invalid node configuration";
+        out = {}; // never hand back a half-built runtime
         return false;
     }
     return true;

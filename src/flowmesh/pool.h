@@ -29,6 +29,9 @@ namespace flowmesh {
  * future action at that sequence. Batch selection is deterministic:
  * unconsumed deposits in outpoint order, then per signer the
  * contiguous sequence run starting at the state's next sequence.
+ *
+ * THREADING: NOT thread-safe by design — a pool belongs to exactly one
+ * MeshNode and is driven from that node's single execution context.
  */
 class ActionPool
 {

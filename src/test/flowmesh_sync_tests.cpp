@@ -816,6 +816,9 @@ BOOST_AUTO_TEST_CASE(equivocating_proposer_cannot_double_certify)
             if (const auto e{node->HandleAttestation(att)}) certificates.push_back(*e);
         }
     }
+    // A must actually certify (3 honest-side attestations reach t=3);
+    // without this the test could pass vacuously with nothing certified.
+    BOOST_REQUIRE(!certificates.empty());
     for (const CertifiedEntry& cert : certificates) {
         BOOST_CHECK(cert.mb.GetHash() == proposal_a->mb.GetHash());
     }
@@ -1032,10 +1035,6 @@ BOOST_AUTO_TEST_CASE(store_freshness_cas_and_corruption_discipline)
         node::FlowMeshStore store{DBParams{.path = path, .cache_bytes = size_t{1} << 20,
                                            .wipe_data = true}};
         BOOST_REQUIRE(store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
-        {
-            CDBWrapper raw{DBParams{.path = m_args.GetDataDirBase() / "flowmesh_raw",
-                                    .cache_bytes = size_t{1} << 20, .wipe_data = true}};
-        }
     }
     {
         // Corrupt lock VALUE (short bytes) written raw.
@@ -1145,8 +1144,6 @@ BOOST_AUTO_TEST_CASE(known_split_lock_case_safely_does_not_finalize)
 
     // Round 1: a different candidate B locks the remaining honest seat.
     for (const size_t i : honest) net.nodes[i]->NoteTimeout();
-    size_t p1_honest{p1};
-    if (p1 == p0) p1_honest = honest[0]; // ensure an honest round-1 proposer path
     MemJournal j2;
     FailableSink s2;
     auto round1_proposer{net.MakeNode(net.keys[net.ProposerIndex(0, 1)], &s2, &j2)};
@@ -1157,7 +1154,9 @@ BOOST_AUTO_TEST_CASE(known_split_lock_case_safely_does_not_finalize)
     for (const size_t i : honest) {
         if (const auto att{net.nodes[i]->HandleProposal(*proposal_b)}) atts.push_back(*att);
     }
-    (void)p1_honest;
+    // The split must actually exist for this test to mean anything:
+    // two honest locks on A plus exactly one honest lock on B.
+    BOOST_REQUIRE_EQUAL(atts.size(), 3U);
 
     // Deliver every attestation everywhere: with locks split 2/1 and
     // the Byzantine seat silent, neither hash can reach t = 3.
@@ -1424,6 +1423,201 @@ BOOST_AUTO_TEST_CASE(decoded_book_state_must_reconcile_with_the_ledger)
         BOOST_REQUIRE(ledger.Reserve(net.alice, Quote(), 400)); // no curve backs this
         const flowmesh::ClearingEngine book{BaseX(), Quote()};
         BOOST_CHECK_THROW(decode(ledger, book), std::ios_base::failure);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(self_audit_fixes_market_config_store_and_decode)
+{
+    MeshNet net{3, 0};
+    std::string error;
+
+    // base == quote markets are unconstructible (engine, state, startup).
+    BOOST_CHECK_THROW((FlowMeshState{VAULT, BaseX(), BaseX()}), std::invalid_argument);
+    {
+        const fs::path store_path{m_args.GetDataDirBase() / "flowmesh_samequote"};
+        node::FlowMeshStore store{
+            DBParams{.path = store_path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+        MeshNode::Config config;
+        config.domain = MESH_DOMAIN;
+        config.seats = net.seats;
+        config.threshold = net.threshold;
+        config.schedule = net.schedule.get();
+        config.auth = &net.auth;
+        config.anchors = &net.anchors;
+        config.seat_key = net.keys[0];
+        node::ValidatorRuntime runtime;
+        BOOST_CHECK(!node::StartValidator(store, config, VAULT, BaseX(), BaseX(), 8, runtime,
+                                          error));
+        BOOST_CHECK(!runtime.mesh_node); // failure never hands back a half-built runtime
+    }
+
+    // A negative anchor depth fails loudly instead of warping semantics.
+    BOOST_CHECK_THROW((node::ChainAnchorPolicy{*Assert(m_node.chainman), -1}),
+                      std::invalid_argument);
+
+    // One signing validator per store: a second StartValidator claim fails.
+    {
+        const fs::path store_path{m_args.GetDataDirBase() / "flowmesh_singleclaim"};
+        node::FlowMeshStore store{
+            DBParams{.path = store_path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+        MeshNode::Config config;
+        config.domain = MESH_DOMAIN;
+        config.seats = net.seats;
+        config.threshold = net.threshold;
+        config.schedule = net.schedule.get();
+        config.auth = &net.auth;
+        config.deposits = &net.deposits;
+        config.anchors = &net.anchors;
+        config.seat_key = net.keys[0];
+        node::ValidatorRuntime first;
+        BOOST_REQUIRE_MESSAGE(node::StartValidator(store, config, VAULT, BaseX(), Quote(), 8,
+                                                   first, error),
+                              error);
+        node::ValidatorRuntime second;
+        BOOST_CHECK(!node::StartValidator(store, config, VAULT, BaseX(), Quote(), 8, second,
+                                          error));
+        BOOST_CHECK(!second.mesh_node);
+    }
+
+    // A stray entry at tip+2 (not just tip) is detected at open.
+    {
+        const fs::path store_path{m_args.GetDataDirBase() / "flowmesh_straytail"};
+        {
+            node::FlowMeshStore store{
+                DBParams{.path = store_path, .cache_bytes = size_t{1} << 20,
+                         .wipe_data = true}};
+            BOOST_REQUIRE(store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+        }
+        {
+            CDBWrapper raw{DBParams{.path = store_path, .cache_bytes = size_t{1} << 20}};
+            raw.Write(std::make_pair(uint8_t{'e'}, uint64_t{2}), uint8_t{0x01}, true);
+        }
+        node::FlowMeshStore reopened{
+            DBParams{.path = store_path, .cache_bytes = size_t{1} << 20}};
+        BOOST_CHECK(!reopened.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+    }
+
+    // An idempotent lock rewrite still succeeds at journal capacity —
+    // a validator can always re-sign its locked hash after restart.
+    {
+        const fs::path store_path{m_args.GetDataDirBase() / "flowmesh_capidem"};
+        node::FlowMeshStore store{DBParams{.path = store_path, .cache_bytes = size_t{1} << 20,
+                                           .wipe_data = true},
+                                  /*max_lock_entries=*/2};
+        BOOST_REQUIRE(store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+        BOOST_CHECK(store.WriteLock(0, uint256::ONE));
+        BOOST_CHECK(store.WriteLock(1, uint256::ONE));
+        BOOST_CHECK(store.WriteLock(1, uint256::ONE)); // idempotent at capacity: allowed
+        BOOST_CHECK(!store.WriteLock(2, uint256::ONE)); // new entry at capacity: refused
+    }
+
+    // A snapshot stream carrying a DIFFERENT vault is refused at decode
+    // (the codec now enforces the whole configuration, not just the
+    // market pair), independent of the store's certified-root gate.
+    {
+        const uint256 other_vault{uint256::ONE};
+        FlowMeshState foreign{other_vault, BaseX(), Quote()};
+        DataStream stream;
+        stream << foreign;
+        FlowMeshState target{VAULT, BaseX(), Quote()};
+        BOOST_CHECK_THROW(stream >> target, std::ios_base::failure);
+    }
+
+    // CheckDecodedAccounting branch coverage: impossible fill, impossible
+    // reservation, and a curve/ledger reservation mismatch all throw.
+    {
+        const auto craft{[&](const CAmount filled, const CAmount reserved,
+                             const CAmount ledger_reserved) {
+            flowmesh::Ledger ledger{VAULT};
+            BOOST_REQUIRE(ledger.Deposit(net.alice, Quote(), 10'000));
+            if (ledger_reserved > 0) {
+                BOOST_REQUIRE(ledger.Reserve(net.alice, Quote(), ledger_reserved));
+            }
+            DataStream stream;
+            stream << ledger;
+            // Hand-build the book stream: one BID curve {(10,10),(20,0)}
+            // with the given filled/reserved accounting fields.
+            stream << BaseX() << Quote() << uint64_t{8};
+            WriteCompactSize(stream, 1);
+            stream << uint8_t{0} << net.alice; // Side::BID, account
+            WriteCompactSize(stream, 2);
+            stream << flowmesh::ClearingEngine::Breakpoint{10, 10}
+                   << flowmesh::ClearingEngine::Breakpoint{20, 0};
+            stream << filled << reserved;
+            WriteCompactSize(stream, 0); // next_seq
+            WriteCompactSize(stream, 0); // consumed deposits
+            FlowMeshState target{VAULT, BaseX(), Quote()};
+            stream >> target;
+        }};
+        // Consistent: reserved 90 == worst-case bound ((10-0)*(20-1)=190
+        // is the cap; 90 is fine) and matches the ledger reservation.
+        BOOST_CHECK_NO_THROW(craft(0, 90, 90));
+        BOOST_CHECK_THROW(craft(11, 90, 90), std::ios_base::failure);  // filled > max qty
+        BOOST_CHECK_THROW(craft(0, 191, 191), std::ios_base::failure); // reserved > worst case
+        BOOST_CHECK_THROW(craft(0, 90, 80), std::ios_base::failure);   // book != ledger
+    }
+
+    // The proposal envelope wire codec: strict round trip, and oversized
+    // embedded evidence refused before allocation.
+    {
+        const size_t p{net.ProposerIndex(0, 0)};
+        BOOST_REQUIRE(net.nodes[p]->SubmitAction(net.Deposit(Outpoint(0x0a, 0))));
+        const auto proposal{net.nodes[p]->TryPropose()};
+        BOOST_REQUIRE(proposal.has_value());
+        DataStream wire;
+        wire << *proposal;
+        ProposalMsg decoded;
+        wire >> decoded;
+        BOOST_CHECK(wire.empty());
+        BOOST_CHECK(decoded.mb.GetHash() == proposal->mb.GetHash());
+        BOOST_CHECK(decoded.credentials == proposal->credentials);
+        BOOST_CHECK(flowmesh::VerifyProposal(decoded, MESH_DOMAIN));
+
+        DataStream bad;
+        bad << proposal->mb << proposal->round << proposal->proposer
+            << proposal->proposer_sig;
+        WriteCompactSize(bad, flowmesh::MAX_MICROBLOCK_ACTIONS + 1);
+        ProposalMsg refuse;
+        BOOST_CHECK_THROW(bad >> refuse, std::ios_base::failure);
+    }
+
+    // Halted-node handlers are inert across the board.
+    {
+        MeshNet fresh{3, 0};
+        fresh.RunRound({fresh.Deposit(Outpoint(0x0a, 0))});
+        const size_t p{fresh.ProposerIndex(1, 0)};
+        fresh.sinks[p]->fail = true;
+        // Drive node p to a PERSIST_FAILED halt via a certified entry.
+        const size_t other{(p + 1) % 3};
+        BOOST_REQUIRE(fresh.nodes[other]->SubmitAction(
+            fresh.SignedOrder(fresh.alice_key, 0, true, 40'000, 2)));
+        const auto proposal{fresh.nodes[p]->TryPropose()};
+        BOOST_REQUIRE(proposal.has_value());
+        std::vector<AttestationMsg> atts;
+        for (auto& node : fresh.nodes) {
+            if (const auto att{node->HandleProposal(*proposal)}) atts.push_back(*att);
+        }
+        std::optional<CertifiedEntry> entry;
+        for (const AttestationMsg& att : atts) {
+            for (auto& node : fresh.nodes) {
+                if (const auto e{node->HandleAttestation(att)}) {
+                    if (!entry) entry = e;
+                }
+            }
+        }
+        BOOST_REQUIRE(entry.has_value());
+        BOOST_REQUIRE(!fresh.nodes[p]->HandleCertified(*entry));
+        BOOST_REQUIRE(fresh.nodes[p]->Halted());
+        const uint256 root_at_halt{fresh.nodes[p]->State().Root()};
+        BOOST_CHECK(!fresh.nodes[p]->HandleProposal(*proposal).has_value());
+        for (const AttestationMsg& att : atts) {
+            BOOST_CHECK(!fresh.nodes[p]->HandleAttestation(att).has_value());
+        }
+        BOOST_CHECK(!fresh.nodes[p]->HandleCertified(*entry));
+        fresh.nodes[p]->NoteTimeout(); // no effect while halted
+        BOOST_CHECK_EQUAL(fresh.nodes[p]->CurrentRound(), 0U);
+        BOOST_CHECK(fresh.nodes[p]->HandleCatchupRequest(flowmesh::CatchupRequest{0}).empty());
+        BOOST_CHECK_EQUAL(fresh.nodes[p]->State().Root().GetHex(), root_at_halt.GetHex());
     }
 }
 

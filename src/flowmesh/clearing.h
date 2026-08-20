@@ -95,6 +95,13 @@ public:
         if (m_max_k == 0 || m_max_k > HARD_MAX_CURVE_POINTS) {
             throw std::invalid_argument("flowmesh curve bound outside the hard protocol cap");
         }
+        // Reservation accounting assumes one asset per side: a BID
+        // reserves quote, an ASK reserves base. base == quote would
+        // merge the two pools (fails closed today, but the assumption
+        // must hold by construction, not by luck).
+        if (m_base == m_quote) {
+            throw std::invalid_argument("flowmesh market base and quote must differ");
+        }
     }
 
     const AssetId& BaseAsset() const { return m_base; }

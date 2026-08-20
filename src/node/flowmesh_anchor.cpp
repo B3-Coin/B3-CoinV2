@@ -7,11 +7,19 @@
 #include <chain.h>
 #include <validation.h>
 
+#include <stdexcept>
+
 namespace node {
 
 ChainAnchorPolicy::ChainAnchorPolicy(const ChainstateManager& chainman, const int min_depth)
     : m_chainman{chainman}, m_min_depth{min_depth}
 {
+    // The finality depth is a safety-critical owner input: a negative
+    // value would silently accept unburied tips while Current() walks
+    // past the tip. Fail loudly instead of warping semantics.
+    if (min_depth < 0) {
+        throw std::invalid_argument("flowmesh anchor depth must be non-negative");
+    }
 }
 
 bool ChainAnchorPolicy::Acceptable(const flowmesh::AnchorRef& anchor) const

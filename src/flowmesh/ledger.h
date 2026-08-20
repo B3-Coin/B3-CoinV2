@@ -90,6 +90,8 @@ public:
 
     explicit Ledger(const uint256& vault_commitment) : m_vault{vault_commitment} {}
 
+    const uint256& VaultCommitment() const { return m_vault; }
+
     // ---- Deposits -------------------------------------------------------
 
     //! Custody entered the vault on-chain; credit the account. A refusal

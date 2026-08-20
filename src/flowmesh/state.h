@@ -196,7 +196,15 @@ public:
     template <typename Stream>
     void Unserialize(Stream& s)
     {
+        const uint256 expected_vault{ledger.VaultCommitment()};
         s >> ledger >> book;
+        // The embedded book stream enforces base/quote/max_k; the vault
+        // must be enforced here — a snapshot for a different vault must
+        // never decode into this configuration (ConfigId() hashes the
+        // vault and is derived, never deserialized).
+        if (ledger.VaultCommitment() != expected_vault) {
+            throw std::ios_base::failure("flowmesh state snapshot is for a different vault");
+        }
         {
             const uint64_t n{ReadCompactSize(s)};
             if (n > STATE_SNAPSHOT_MAX_SIGNERS) {

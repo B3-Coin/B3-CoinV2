@@ -15,6 +15,7 @@
 #include <uint256.h>
 
 #include <cstdint>
+#include <atomic>
 #include <mutex>
 #include <map>
 #include <memory>
@@ -46,6 +47,9 @@ class FlowMeshStore
 public:
     static constexpr int32_t FORMAT_VERSION{2};
 
+    //! Format v1 stores are UNSUPPORTED: a v1 marker fails closed with
+    //! an unknown-format error (no migration path exists or is owed —
+    //! the layer has never been activated).
     struct Marker {
         int32_t version{FORMAT_VERSION};
         uint256 domain;
@@ -61,6 +65,12 @@ public:
     };
 
     explicit FlowMeshStore(DBParams db_params, size_t max_lock_entries = 4096);
+
+    //! One signing validator per store: StartValidator claims the role
+    //! atomically; a second claim fails. (Two appenders on one log
+    //! could otherwise each durably acknowledge a different entry at
+    //! the same sequence.)
+    [[nodiscard]] bool ClaimValidatorRole() { return !m_validator_started.exchange(true); }
 
     bool ReadMarker(std::optional<Marker>& out, std::string& error);
 
@@ -139,11 +149,13 @@ private:
 
     CDBWrapper m_db;
     const size_t m_max_lock_entries;
-    //! Serializes lock-journal compare-and-set and clearing: the CAS
-    //! read-check-write must be atomic with respect to concurrent
-    //! callers in this process (LevelDB's LOCK file excludes other
-    //! processes).
-    std::mutex m_lock_mutex;
+    //! Serializes every read-check-write cycle in this process: the
+    //! lock-journal compare-and-set AND the log/snapshot appends (two
+    //! concurrent Appends could otherwise both read marker N and the
+    //! loser's durably-acknowledged entry would be replaced).
+    //! LevelDB's LOCK file excludes other processes.
+    std::mutex m_write_mutex;
+    std::atomic<bool> m_validator_started{false};
 };
 
 //! MeshNode -> store bridge: OnCommit succeeds only after the atomic

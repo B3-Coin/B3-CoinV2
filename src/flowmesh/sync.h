@@ -68,6 +68,10 @@ struct SigningBridge;
  *    authoritative state (persist failure => fail-stop);
  *  - a SIGNING validator requires full durable state (sink + lock
  *    journal); observers may run without them but cannot attest.
+ *
+ * THREADING: MeshNode is NOT thread-safe — all handlers run in one
+ * execution context per node (the eventual network wiring owns the
+ * serialization). The durable store serializes its own writers.
  */
 
 //! Bounded evidence codec shared by proposals and certified entries:

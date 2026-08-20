@@ -226,14 +226,17 @@ BOOST_AUTO_TEST_CASE(state_root_is_deterministic_and_path_independent)
     b.AdvanceSlot();
     BOOST_CHECK_EQUAL(a.StateRoot().GetHex(), b.StateRoot().GetHex());
 
-    // A fully unwound fee leaves a fee-account entry, so it is NOT the same
-    // state — canonical pruning only removes truly empty entries.
+    // A REJECTED fee (zero amount) is a pure no-op: byte-identical root.
     flowmesh::Ledger c{VAULT};
     c.Deposit(ALICE, AssetX(), 1000);
-    c.ChargeFee(ALICE, AssetX(), 0); // rejected, no-op
+    BOOST_CHECK(!c.ChargeFee(ALICE, AssetX(), 0)); // rejected, no-op
     flowmesh::Ledger d{VAULT};
     d.Deposit(ALICE, AssetX(), 1000);
     BOOST_CHECK_EQUAL(c.StateRoot().GetHex(), d.StateRoot().GetHex());
+    // A REAL fee leaves a persistent fee-account entry: the roots must
+    // differ (canonical pruning removes only truly empty entries).
+    BOOST_CHECK(c.ChargeFee(ALICE, AssetX(), 1));
+    BOOST_CHECK(c.StateRoot() != d.StateRoot());
 }
 
 //! Pass-3 fix: the ledger state root is canonically framed (v2 domain).
@@ -309,10 +312,10 @@ BOOST_AUTO_TEST_CASE(adversarial_overflow_and_underflow)
     BOOST_CHECK_EQUAL(ledger.StateRoot().GetHex(), root.GetHex());
     BOOST_CHECK(ledger.SolvencyHolds());
 
-    // Codex defect 4 regression: a rejected deposit of a NEW asset must
-    // leave every persistent field unchanged — in particular no
-    // zero-valued custody entry may appear (the old code inserted the
-    // custody slot before its overflow checks).
+    // Rejected deposits of a NEW asset leave every persistent field
+    // unchanged (range refusals; the overflow-before-insert bug class
+    // itself is pinned by the fresh-balance-key custody-overflow case
+    // above, where a rejection genuinely follows the map lookups).
     BOOST_CHECK(!ledger.Deposit(ALICE, AssetY(), MAX_MONEY + 1)); // out of range
     BOOST_CHECK(!ledger.Deposit(ALICE, AssetY(), 0));
     BOOST_CHECK(!ledger.Deposit(ALICE, AssetY(), -1));
