@@ -27,6 +27,11 @@ struct StateFunding {
     {
         return state.ledger.Deposit(account, asset, amount);
     }
+    static void SetNextSequence(FlowMeshState& state, const AccountId& signer,
+                                const uint64_t next)
+    {
+        state.AdvanceSequence(signer, next);
+    }
 };
 
 struct SigningBridge {

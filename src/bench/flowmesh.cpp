@@ -193,7 +193,7 @@ void RunRootBench(benchmark::Bench& bench, const size_t n_accounts)
                                             : flowmesh::ClearingEngine::Side::ASK,
                                         curve)};
         assert(ok);
-        state.next_seq[Account(i)] = i + 1;
+        flowmesh::test_only::StateFunding::SetNextSequence(state, Account(i), i + 1);
     }
     assert(state.LedgerView().SolvencyHolds());
     bench.unit("root").run([&] {

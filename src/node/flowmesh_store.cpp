@@ -23,6 +23,9 @@ constexpr uint8_t KEY_LOCK{'l'};
 //! Hard cap on a stored snapshot blob, enforced BEFORE allocation.
 constexpr uint64_t SNAPSHOT_MAX_BYTES{uint64_t{1} << 28};
 
+//! Hard production ceiling on configured lock-journal bounds.
+constexpr size_t HARD_MAX_LOCK_JOURNAL_ENTRIES{4096};
+
 std::pair<uint8_t, uint64_t> EntryKey(const uint64_t sequence)
 {
     return {KEY_ENTRY, sequence};
@@ -97,6 +100,11 @@ uint256 QuorumHash(const std::set<XOnlyPubKey>& seats, const uint64_t threshold)
 FlowMeshStore::FlowMeshStore(DBParams db_params, const size_t max_lock_entries)
     : m_db{std::move(db_params)}, m_max_lock_entries{max_lock_entries}
 {
+    // The journal bound is a REAL hard limit: zero would brick signing,
+    // an arbitrarily huge value would defeat the bound's purpose.
+    if (m_max_lock_entries == 0 || m_max_lock_entries > HARD_MAX_LOCK_JOURNAL_ENTRIES) {
+        throw std::invalid_argument("flowmesh lock-journal bound outside [1, 4096]");
+    }
 }
 
 bool FlowMeshStore::ReadMarker(std::optional<Marker>& out, std::string& error)
@@ -170,20 +178,28 @@ bool FlowMeshStore::OpenForDomain(const uint256& domain, const std::set<XOnlyPub
         error = "flowmesh log was certified under a different quorum configuration";
         return false;
     }
-    // Log entries BEYOND the authoritative tip cannot arise from the
-    // atomic append (entry+marker commit together): their presence is
-    // tamper or corruption, never silently ignored. The COMPLETE tail
-    // of the entry namespace is probed (any key at or past
-    // next_sequence), not just the next slot. No rollback rule is
-    // defined, so this fails closed.
+    // STRICT validation of the COMPLETE entry-key namespace, from the
+    // RAW one-byte 'e' prefix (a malformed SHORT key sorts before every
+    // well-formed entry key and must be seen, not skipped): every key
+    // must decode exactly, and no key may lie at or beyond the
+    // authoritative tip — stray/beyond-tip entries cannot arise from
+    // the atomic append and are tamper or corruption, never silently
+    // ignored. No rollback rule is defined, so any violation fails
+    // closed. (Entry VALUES are fully validated by replay.)
     {
         std::unique_ptr<CDBIterator> it{m_db.NewIterator()};
-        it->Seek(EntryKey(marker->next_sequence));
-        for (; it->Valid(); it->Next()) {
+        for (it->Seek(uint8_t{KEY_ENTRY}); it->Valid(); it->Next()) {
             uint8_t prefix{0};
             if (!it->GetKey(prefix) || prefix != KEY_ENTRY) break; // past the namespace
-            error = "flowmesh log holds entries beyond its authoritative tip";
-            return false;
+            std::pair<uint8_t, uint64_t> entry_key;
+            if (!it->GetKeyExact(entry_key)) {
+                error = "flowmesh log entry namespace holds a malformed key";
+                return false;
+            }
+            if (entry_key.second >= marker->next_sequence) {
+                error = "flowmesh log holds entries beyond its authoritative tip";
+                return false;
+            }
         }
         if (!it->StatusOK()) {
             error = "flowmesh storage iterator failed while probing the log tail";
@@ -240,29 +256,32 @@ bool FlowMeshStore::WriteLock(const uint64_t sequence, const uint256& microblock
     // is refusal — never treated as "absent" and overwritten.
     const std::lock_guard<std::mutex> guard{m_write_mutex};
     try {
-        uint256 existing;
-        switch (ReadStrict(m_db, LockKey(sequence), existing)) {
-        case ReadResult::FOUND:
-            return existing == microblock_hash; // idempotent same; refuse different
-        case ReadResult::ERROR:
-            return false; // unreadable lock: refuse, never replace
-        case ReadResult::NOT_FOUND:
-            break;
-        }
-        // Enforce the journal bound BEFORE writing entry MAX+1: a
-        // validator must never sign past its durable journal capacity.
+        // ONE strict scan of the COMPLETE lock namespace before ANY
+        // decision — including the idempotent path: every key and every
+        // value must decode exactly, the entry bound is enforced, and
+        // the target's existing value (if any) is captured on the way.
+        // A validator never signs over a corrupt or over-full journal.
+        std::optional<uint256> existing;
+        size_t count{0};
         {
-            size_t count{0};
             std::unique_ptr<CDBIterator> it{m_db.NewIterator()};
             for (it->Seek(uint8_t{KEY_LOCK}); it->Valid(); it->Next()) {
                 uint8_t prefix{0};
                 if (!it->GetKey(prefix) || prefix != KEY_LOCK) break;
                 std::pair<uint8_t, uint64_t> lock_key;
-                if (!it->GetKeyExact(lock_key)) return false; // corrupt journal: never sign
-                if (++count >= m_max_lock_entries) return false; // full: refuse to sign
+                uint256 lock_hash;
+                if (!it->GetKeyExact(lock_key) || !it->GetValueExact(lock_hash)) {
+                    return false; // corrupt journal: never sign
+                }
+                if (lock_key.second == sequence) existing = lock_hash;
+                if (++count > m_max_lock_entries) return false; // over-full: never sign
             }
             if (!it->StatusOK()) return false;
         }
+        if (existing.has_value()) {
+            return *existing == microblock_hash; // idempotent same; refuse different
+        }
+        if (count >= m_max_lock_entries) return false; // full: refuse a NEW entry
         CDBBatch batch{m_db};
         batch.Write(LockKey(sequence), microblock_hash);
         m_db.WriteBatch(batch, /*fSync=*/true);
@@ -592,6 +611,18 @@ bool StartValidator(FlowMeshStore& store, flowmesh::MeshNode::Config config,
     // the caller.
     flowmesh::FlowMeshState genesis{vault_commitment, base_asset, quote_asset, max_k};
     config.market_config_id = genesis.ConfigId();
+    // Every binding is validated BEFORE the store is touched: an
+    // invalid startup must not mutate a fresh store (no marker write).
+    if (config.auth->DomainId() != config.domain ||
+        config.auth->ExecConfigId() != genesis.ConfigId()) {
+        error = "flowmesh validator startup authenticator is bound to a different "
+                "domain/configuration";
+        return false;
+    }
+    if (!flowmesh::ValidQuorumConfig(config.seats.size(), config.threshold)) {
+        error = "flowmesh validator startup refused a nonsensical quorum configuration";
+        return false;
+    }
     if (!store.OpenForDomain(config.domain, config.seats, config.threshold, error)) return false;
 
     uint256 last_hash;

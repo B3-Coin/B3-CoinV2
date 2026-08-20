@@ -757,6 +757,14 @@ Maker/taker schedules, insurance allocations, rebates, and FN distributions rema
 
 ### 5.11 Leverage follows spot — LOCKED sequencing
 
+> **Correction (2026-08-20, per the owner's Codex repair directives —
+> recorded, not silently rewritten):** the ONLY locked futures facts are
+> "FlowMesh will support futures" and "maximum leverage = 10×". Every
+> mechanic below — isolated margin, the 10% initial-margin figure, the
+> Position shape, the 5% test threshold — is HISTORICAL BRAINSTORM and
+> OPEN, not approved design. The sequencing rule itself (leverage only
+> after deterministic spot works) remains locked.
+
 After deterministic spot works, the test harness may add isolated margin up to 10x.
 
 Test-only v1 shape:

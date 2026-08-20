@@ -171,7 +171,12 @@ struct AttestationMsg {
 //! One certified log entry: the microblock, its certificate, and the
 //! authentication evidence its body was admitted under (needed so
 //! replay/catch-up can re-verify admission; NOT part of the microblock
-//! identity the certificate signs).
+//! identity the certificate signs). BYTE-IDENTITY CAVEAT: because
+//! evidence lives outside identity, two nodes may persist
+//! byte-DIFFERENT CertifiedEntry records (alternative valid credential
+//! encodings, differing attestation subsets) for the SAME certified
+//! microblock — certified logs are semantically identical, never
+//! claimed byte-identical.
 struct CertifiedEntry {
     MicroblockCore mb;
     MicroblockCertificate cert;
@@ -266,6 +271,15 @@ public:
      * through node::StartValidator, which restores state, tip, locks
      * and anchor dependencies from the durable store itself.
      */
+    //! NOT copyable or movable: a stale clone would share the durable
+    //! lock journal but fork the in-memory guard/state, letting the
+    //! clone sign a conflicting candidate after the original clears its
+    //! lock. One MeshNode per identity, by construction.
+    MeshNode(const MeshNode&) = delete;
+    MeshNode& operator=(const MeshNode&) = delete;
+    MeshNode(MeshNode&&) = delete;
+    MeshNode& operator=(MeshNode&&) = delete;
+
     MeshNode(Config config, FlowMeshState genesis, const uint256& last_hash = {})
         : MeshNode{[&] {
                        if (config.seat_key.has_value() || config.lock_journal != nullptr) {
@@ -411,10 +425,14 @@ public:
             return std::nullopt;
         }
         if (!VerifyProposal(msg, m_config.domain)) return std::nullopt;
-        // Cheap proposal-anchor gate (pre-cache DoS guard); the FULL
-        // anchor recheck runs after execution, immediately before
-        // signing (Codex item 5).
+        // Cheap proposal-anchor gate (pre-cache DoS guard)...
         if (!m_config.anchors->Acceptable(msg.mb.anchor)) return std::nullopt;
+        // ...and the COMMITTED dependency set BEFORE any execution or
+        // cache write: an acceptable new anchor must not buy execution
+        // while the history this state stands on is already orphaned.
+        // (The full recheck still runs again immediately before
+        // signing.) This also runs for observers.
+        if (!RecheckCommittedAnchors()) return std::nullopt;
         // Evidence: every signed body action must authenticate.
         if (!VerifyActionEvidence(msg.mb, msg.credentials, *m_config.auth)) return std::nullopt;
 
@@ -501,6 +519,7 @@ public:
         const uint64_t seq{Sequence()};
         if (entry.mb.sequence < seq) return true;  // stale; already final locally
         if (entry.mb.sequence > seq) return false; // missing parents: catch up first
+        if (!RecheckCommittedAnchors()) return false; // orphaned base: halt, no execution
         const uint256 hash{entry.mb.GetHash()};
         if (entry.cert.microblock_hash != hash || entry.cert.sequence != seq) return false;
         if (CheckCertificate(entry.cert, m_config.domain, m_config.seats, m_config.threshold) !=

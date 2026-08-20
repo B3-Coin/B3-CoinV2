@@ -158,7 +158,8 @@ enum class CandidateError : uint8_t {
 
 /**
  * Independent re-execution of a candidate microblock against the
- * previous FINALIZED state (MB-0 atomic): the previous state is copied,
+ * previously CERTIFIED-COMMITTED state (MB-0 atomic; the commit model
+ * is provisional — see sync.h): the previous state is copied,
  * the copy is mutated, and only a fully matching candidate yields a next
  * state — the caller commits by replacement. On any error the outputs
  * are untouched and the previous state was never mutated.

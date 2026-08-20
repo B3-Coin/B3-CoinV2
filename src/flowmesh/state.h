@@ -21,6 +21,8 @@
 
 namespace flowmesh {
 
+class BatchExecutor;
+
 namespace test_only {
 struct StateFunding;
 } // namespace test_only
@@ -67,12 +69,6 @@ inline uint256 ComputeExecutionConfigId(const uint256& vault_commitment, const A
 class FlowMeshState
 {
 public:
-    //! Per-signer next expected sequence (nonce) for signed actions.
-    std::map<AccountId, uint64_t> next_seq;
-    //! B3 outpoints already consumed as deposits (see the owner-decision
-    //! note above).
-    std::set<COutPoint> consumed_deposits;
-
     FlowMeshState(const uint256& vault_commitment, const AssetId& base, const AssetId& quote,
                   size_t max_k = 8)
         : ledger{vault_commitment}, book{base, quote, max_k},
@@ -102,26 +98,12 @@ public:
         const auto it{next_seq.find(signer)};
         return it == next_seq.end() ? 0 : it->second;
     }
-    void AdvanceSequence(const AccountId& signer, const uint64_t next)
-    {
-        next_seq[signer] = next;
-    }
 
     uint64_t Slot() const { return ledger.Slot(); }
 
     bool DepositConsumed(const COutPoint& outpoint) const
     {
         return consumed_deposits.count(outpoint) > 0;
-    }
-    //! Credit a verifier-established deposit and mark its outpoint
-    //! consumed, atomically from the caller's perspective.
-    bool CreditDeposit(const COutPoint& outpoint, const AccountId& account,
-                       const AssetId& asset, const CAmount amount)
-    {
-        if (consumed_deposits.count(outpoint) > 0) return false;
-        if (!ledger.Deposit(account, asset, amount)) return false;
-        consumed_deposits.insert(outpoint);
-        return true;
     }
 
     std::optional<modern::WithdrawalReceipt> RequestWithdrawal(const AccountId& account,
@@ -244,8 +226,33 @@ public:
     }
 
 private:
+    //! RAW STATE TRANSITIONS ARE EXECUTOR-ONLY: sequence advancement and
+    //! verifier-established deposit credits exist solely for
+    //! BatchExecutor's canonical execution path — no other caller can
+    //! fabricate custody, nonces or consumed-deposit state.
+    friend class BatchExecutor;
     friend struct test_only::StateFunding; // defined only in test code
 
+    void AdvanceSequence(const AccountId& signer, const uint64_t next)
+    {
+        next_seq[signer] = next;
+    }
+    //! Credit a verifier-established deposit and mark its outpoint
+    //! consumed, atomically from the caller's perspective.
+    bool CreditDeposit(const COutPoint& outpoint, const AccountId& account,
+                       const AssetId& asset, const CAmount amount)
+    {
+        if (consumed_deposits.count(outpoint) > 0) return false;
+        if (!ledger.Deposit(account, asset, amount)) return false;
+        consumed_deposits.insert(outpoint);
+        return true;
+    }
+
+    //! Per-signer next expected sequence (nonce) for signed actions.
+    std::map<AccountId, uint64_t> next_seq;
+    //! B3 outpoints already consumed as deposits (owner-decision note
+    //! above).
+    std::set<COutPoint> consumed_deposits;
     Ledger ledger;
     ClearingEngine book;
     uint256 config_id;

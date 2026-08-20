@@ -285,11 +285,33 @@ public:
             if (curve.filled < 0 || curve.filled > max_qty) {
                 throw std::ios_base::failure("flowmesh book snapshot fill state impossible");
             }
-            const std::optional<CAmount> worst{WorstCaseReservation(key.first, curve.points)};
-            if (!worst || curve.reserved < 0 || curve.reserved > *worst) {
-                throw std::ios_base::failure(
-                    "flowmesh book snapshot reservation state impossible");
+            // An EXHAUSTED curve never survives in live state (Consume
+            // erases it): a retained one is unreachable accounting.
+            if (EvalCurve(curve.points, curve.points.front().price) - curve.filled <= 0 &&
+                EvalCurve(curve.points, curve.points.back().price) - curve.filled <= 0) {
+                throw std::ios_base::failure("flowmesh book snapshot retains an exhausted curve");
             }
+            if (bid) {
+                // BID residual: bounded by the (conservative) staircase
+                // — fills at varying prices make an exact live value
+                // non-derivable from (points, filled) alone.
+                const std::optional<CAmount> worst{WorstCaseReservation(key.first, curve.points)};
+                if (!worst || curve.reserved < 0 || curve.reserved > *worst) {
+                    throw std::ios_base::failure(
+                        "flowmesh book snapshot reservation state impossible");
+                }
+            } else {
+                // ASK residual is EXACT in live state: reserved base ==
+                // remaining deliverable == max qty - filled. An ask
+                // "needing 10 but reserving 5" is unreachable.
+                if (curve.reserved != max_qty - curve.filled) {
+                    throw std::ios_base::failure(
+                        "flowmesh book snapshot ask reservation is not the exact residual");
+                }
+            }
+            // base != quote is enforced at construction, so each
+            // (account, asset) key aggregates exactly one curve's
+            // reservation — no summation overflow is possible.
             expected[{key.second, bid ? m_quote : m_base}] += curve.reserved;
         }
         bool ok{true};

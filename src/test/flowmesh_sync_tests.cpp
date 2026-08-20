@@ -103,9 +103,14 @@ public:
         return accept_all && sufficiently_buried && anchor == current &&
                StillCanonical(anchor);
     }
+    //! When set, exactly this hash is treated as reorged-away while
+    //! everything else stays canonical (models a targeted B3 reorg).
+    uint256 orphaned_hash;
+
     bool StillCanonical(const AnchorRef& anchor) const override
     {
         if (anchor.IsNull()) return true;
+        if (!orphaned_hash.IsNull() && anchor.hash == orphaned_hash) return false;
         return still_canonical;
     }
     AnchorRef Current() const override { return current; }
@@ -1618,6 +1623,163 @@ BOOST_AUTO_TEST_CASE(self_audit_fixes_market_config_store_and_decode)
         BOOST_CHECK_EQUAL(fresh.nodes[p]->CurrentRound(), 0U);
         BOOST_CHECK(fresh.nodes[p]->HandleCatchupRequest(flowmesh::CatchupRequest{0}).empty());
         BOOST_CHECK_EQUAL(fresh.nodes[p]->State().Root().GetHex(), root_at_halt.GetHex());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(codex_followup_boundaries)
+{
+    MeshNet net{3, 0};
+    std::string error;
+
+    // 1) Signing nodes are neither copyable nor movable: a stale clone
+    // could otherwise sign a conflicting candidate after the original
+    // cleared its durable lock.
+    static_assert(!std::is_copy_constructible_v<MeshNode>);
+    static_assert(!std::is_copy_assignable_v<MeshNode>);
+    static_assert(!std::is_move_constructible_v<MeshNode>);
+    static_assert(!std::is_move_assignable_v<MeshNode>);
+
+    // 3a) A malformed SHORT 'e'-prefixed key fails the strict open-time
+    // namespace validation.
+    {
+        const fs::path path{m_args.GetDataDirBase() / "flowmesh_shorte"};
+        {
+            node::FlowMeshStore store{
+                DBParams{.path = path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+            BOOST_REQUIRE(store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+        }
+        {
+            CDBWrapper raw{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+            raw.Write(uint8_t{'e'}, uint8_t{0x01}, true); // one-byte key: malformed
+        }
+        node::FlowMeshStore reopened{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        BOOST_CHECK(!reopened.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+    }
+
+    // 3b) The idempotent WriteLock path no longer succeeds over a
+    // corrupt journal: EVERY lock key AND value is decoded before any
+    // CAS decision.
+    {
+        const fs::path path{m_args.GetDataDirBase() / "flowmesh_idemcorrupt"};
+        {
+            node::FlowMeshStore store{
+                DBParams{.path = path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+            BOOST_REQUIRE(store.OpenForDomain(MESH_DOMAIN, net.seats, net.threshold, error));
+            BOOST_REQUIRE(store.WriteLock(0, uint256::ONE));
+        }
+        {
+            CDBWrapper raw{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+            raw.Write(std::make_pair(uint8_t{'l'}, uint64_t{5}), uint8_t{0x42}, true);
+        }
+        node::FlowMeshStore reopened{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        BOOST_CHECK(!reopened.WriteLock(0, uint256::ONE)); // idempotent rewrite refused
+    }
+
+    // 3c) The journal bound is a REAL hard limit: zero and huge
+    // configured values are refused at construction.
+    {
+        const fs::path path{m_args.GetDataDirBase() / "flowmesh_lockbound"};
+        BOOST_CHECK_THROW((node::FlowMeshStore{DBParams{.path = path,
+                                                        .cache_bytes = size_t{1} << 20,
+                                                        .wipe_data = true},
+                                               /*max_lock_entries=*/0}),
+                          std::invalid_argument);
+        BOOST_CHECK_THROW((node::FlowMeshStore{DBParams{.path = path,
+                                                        .cache_bytes = size_t{1} << 20,
+                                                        .wipe_data = true},
+                                               /*max_lock_entries=*/5000}),
+                          std::invalid_argument);
+    }
+
+    // 4) Unreachable decoded accounting: a retained EXHAUSTED curve and
+    // an ASK whose reservation is not the exact residual both throw.
+    {
+        const auto craft_ask{[&](const CAmount filled, const CAmount reserved,
+                                 const CAmount ledger_reserved) {
+            flowmesh::Ledger ledger{VAULT};
+            BOOST_REQUIRE(ledger.Deposit(net.alice, BaseX(), 1'000));
+            if (ledger_reserved > 0) {
+                BOOST_REQUIRE(ledger.Reserve(net.alice, BaseX(), ledger_reserved));
+            }
+            DataStream stream;
+            stream << ledger;
+            stream << BaseX() << Quote() << uint64_t{8};
+            WriteCompactSize(stream, 1);
+            stream << uint8_t{1} << net.alice; // Side::ASK
+            WriteCompactSize(stream, 2);
+            stream << flowmesh::ClearingEngine::Breakpoint{9, 0}
+                   << flowmesh::ClearingEngine::Breakpoint{10, 10};
+            stream << filled << reserved;
+            WriteCompactSize(stream, 0);
+            WriteCompactSize(stream, 0);
+            FlowMeshState target{VAULT, BaseX(), Quote()};
+            stream >> target;
+        }};
+        BOOST_CHECK_NO_THROW(craft_ask(4, 6, 6));                       // exact residual
+        BOOST_CHECK_THROW(craft_ask(0, 5, 5), std::ios_base::failure);  // needs 10, reserves 5
+        BOOST_CHECK_THROW(craft_ask(10, 0, 0), std::ios_base::failure); // exhausted, retained
+    }
+
+    // 5) Committed-anchor recheck runs BEFORE execution/cache: with the
+    // committed history orphaned, a proposal carrying a perfectly
+    // acceptable NEW anchor is refused (and the node halts) before any
+    // candidate work — observers included.
+    {
+        MeshNet fresh{3, 0};
+        const AnchorRef old_anchor{fresh.anchors.current};
+        fresh.RunRound({fresh.Deposit(Outpoint(0x0a, 0))}); // history at old_anchor
+        // The chain reorganizes: a NEW anchor becomes current and fully
+        // acceptable; the committed one is orphaned.
+        fresh.anchors.current =
+            AnchorRef{8, uint256{"00000000000000000000000000000000000000000000000000000000000000ab"}};
+        fresh.anchors.orphaned_hash = old_anchor.hash;
+
+        // Craft a valid round-0 proposal for sequence 1 at the NEW anchor.
+        const size_t p{fresh.ProposerIndex(1, 0)};
+        FlowMeshState next{fresh.nodes[p]->State()};
+        flowmesh::BatchResult result;
+        std::vector<std::vector<unsigned char>> credentials;
+        const auto mb{flowmesh::BuildMicroblock(fresh.nodes[p]->State(), MESH_DOMAIN,
+                                                fresh.nodes[p]->LastHash(),
+                                                fresh.anchors.current, {}, &fresh.deposits,
+                                                next, result, credentials)};
+        BOOST_REQUIRE(mb.has_value());
+        ProposalMsg proposal;
+        proposal.mb = *mb;
+        proposal.round = 0;
+        proposal.credentials = credentials;
+        BOOST_REQUIRE(flowmesh::SignProposal(fresh.keys[p], MESH_DOMAIN, proposal));
+
+        const size_t seat{(p + 1) % 3};
+        BOOST_CHECK(!fresh.nodes[seat]->HandleProposal(proposal).has_value());
+        BOOST_CHECK(fresh.nodes[seat]->Halted());
+        BOOST_CHECK(fresh.nodes[seat]->Halt() == MeshHalt::ANCHOR_INVALIDATED);
+        BOOST_CHECK(!fresh.observer->HandleProposal(proposal).has_value());
+        BOOST_CHECK(fresh.observer->Halted()); // observers recheck too
+    }
+
+    // 6) An invalid startup must not mutate a fresh store: a
+    // wrong-binding authenticator fails BEFORE the domain marker is
+    // written.
+    {
+        const fs::path path{m_args.GetDataDirBase() / "flowmesh_freshmarker"};
+        node::FlowMeshStore store{
+            DBParams{.path = path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+        const flowmesh::SchnorrActionAuthenticator wrong{MESH_DOMAIN, uint256::ONE};
+        MeshNode::Config config;
+        config.domain = MESH_DOMAIN;
+        config.seats = net.seats;
+        config.threshold = net.threshold;
+        config.schedule = net.schedule.get();
+        config.auth = &wrong;
+        config.anchors = &net.anchors;
+        config.seat_key = net.keys[0];
+        node::ValidatorRuntime runtime;
+        BOOST_CHECK(!node::StartValidator(store, config, VAULT, BaseX(), Quote(), 8, runtime,
+                                          error));
+        std::optional<node::FlowMeshStore::Marker> marker;
+        BOOST_REQUIRE(store.ReadMarker(marker, error));
+        BOOST_CHECK(!marker.has_value()); // still a fresh, unmutated store
     }
 }
 

@@ -93,7 +93,7 @@ public:
         std::vector<Action> out;
         for (const auto& [outpoint, id] : m_deposits) {
             if (out.size() >= max_actions) return out;
-            if (state.consumed_deposits.count(outpoint) > 0) continue;
+            if (state.DepositConsumed(outpoint)) continue;
             out.push_back(m_by_id.at(id));
         }
         const AccountId* current_signer{nullptr};
@@ -121,7 +121,7 @@ public:
     void PruneCommitted(const FlowMeshState& state)
     {
         for (auto it{m_deposits.begin()}; it != m_deposits.end();) {
-            if (state.consumed_deposits.count(it->first) > 0) {
+            if (state.DepositConsumed(it->first)) {
                 Drop(it->second);
                 it = m_deposits.erase(it);
             } else {
