@@ -686,4 +686,50 @@ BOOST_FIXTURE_TEST_CASE(v1_restart_and_reindex, ModernPosDiskSetup)
     BOOST_REQUIRE_EQUAL(Tip()->nHeight, pre_restart_height + 2);
 }
 
+//! The restored header-spam pre-filter: marker-modern headers are
+//! header-only checkable once a corridor or modern-PoS policy is
+//! configured; legacy headers stay body-judged; an unconfigured chain
+//! keeps the filter open (status quo ante).
+BOOST_AUTO_TEST_CASE(header_prefilter_is_marker_and_policy_aware)
+{
+    Consensus::Params params{};
+    params.legacy_b3coin = true;
+
+    CBlockHeader legacy_header;
+    legacy_header.nVersion = 4;
+    legacy_header.nBits = 0x207fffff;
+    legacy_header.nTime = 1'900'000'000;
+
+    CBlockHeader modern_header{legacy_header};
+    modern_header.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+
+    // Nothing configured: nothing checkable, filter open for both.
+    BOOST_CHECK(HasValidProofOfWork({&legacy_header, 1}, params));
+    BOOST_CHECK(HasValidProofOfWork({&modern_header, 1}, params));
+
+    // Modern-PoS policy configured: the sentinel is required of
+    // marker-modern headers; legacy headers stay unfiltered.
+    params.modern_pos = Consensus::ModernPosParams{};
+    modern_header.nBits = params.modern_pos->sentinel_bits;
+    BOOST_CHECK(HasValidProofOfWork({&modern_header, 1}, params));
+    modern_header.nBits = 0x207ffffe;
+    BOOST_CHECK(!HasValidProofOfWork({&modern_header, 1}, params));
+    BOOST_CHECK(HasValidProofOfWork({&legacy_header, 1}, params));
+
+    // Corridor policy configured as well: corridor-ground scrypt at the
+    // corridor target also satisfies the pre-filter (phase is unknowable
+    // header-only, so either policy admits the header).
+    params.transition_pow_bits = 0x207fffff;
+    modern_header.nBits = 0x207fffff;
+    modern_header.nNonce = 0;
+    while (!CheckTransitionPowEligibility(modern_header)) ++modern_header.nNonce;
+    BOOST_CHECK(HasValidProofOfWork({&modern_header, 1}, params));
+
+    // Corridor bits without a passing scrypt hash and without the sentinel:
+    // refused as spam.
+    while (CheckTransitionPowEligibility(modern_header)) ++modern_header.nNonce;
+    params.modern_pos->sentinel_bits = 0x1d00ffff; // sentinel no longer matches
+    BOOST_CHECK(!HasValidProofOfWork({&modern_header, 1}, params));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

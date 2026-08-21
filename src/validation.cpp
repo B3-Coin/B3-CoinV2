@@ -4991,8 +4991,32 @@ bool HasValidProofOfWork(std::span<const CBlockHeader> headers, const Consensus:
 {
     // Legacy B3Coin PoS headers are indistinguishable from PoW headers until
     // their transaction vector is available. Full-block validation supplies
-    // the required kernel proof before a block can connect.
-    if (consensusParams.legacy_b3coin) return true;
+    // the required kernel proof before a block can connect. Marker-modern
+    // headers, though, ARE header-only checkable once the corridor or
+    // modern-PoS policy is configured: a corridor header must satisfy the
+    // scrypt eligibility against the constant corridor target, and a
+    // modern-PoS header must carry the enforced sentinel bits. Without a
+    // height the two phases are indistinguishable here, so satisfying
+    // either is enough for this cheap anti-spam pre-filter — the exact
+    // phase rule is contextual. With neither policy configured nothing is
+    // checkable and the filter stays open, as before.
+    if (consensusParams.legacy_b3coin) {
+        return std::ranges::all_of(headers, [&](const auto& header) {
+            if (!Consensus::HasB3BlockCodecV2(header.nVersion)) return true;
+            bool checkable{false};
+            bool ok{false};
+            if (consensusParams.transition_pow_bits) {
+                checkable = true;
+                ok |= header.nBits == *consensusParams.transition_pow_bits &&
+                      CheckTransitionPowEligibility(header);
+            }
+            if (consensusParams.modern_pos) {
+                checkable = true;
+                ok |= header.nBits == consensusParams.modern_pos->sentinel_bits;
+            }
+            return !checkable || ok;
+        });
+    }
     return std::ranges::all_of(headers,
                                [&](const auto& header) { return CheckProofOfWork(header.GetHash(), header.nBits, consensusParams); });
 }
