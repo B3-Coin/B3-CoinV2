@@ -18,14 +18,16 @@ signatures, PoS-native height/round fork choice with a fixed reorganization
 horizon, and an unconditional modern coinbase cap. No VRF, epochs, committees,
 slashing, finality gadget, or delegation in V1 (all V2 research, spec §10).
 
-What remains OPEN under OD-1 (numbers, not mechanism):
+What remains OPEN under OD-1 (after the 2026-08-21 ratifications: block
+interval 60 s, round length 30 s, f0 = 1, ×2 relaxation, and the STAKE v1
+carrier are all RATIFIED; the corridor reward is ratified fees-only and
+fail-closed; cutoff C and the readiness gate are ruled out of existence):
 
-- Every numeric parameter is provisional (`REVISABLE_BEFORE_MAINNET`, spec §9)
-  and never configured on mainnet: block interval, round length, f0, sentinel
-  bits, future-drift bound, and the reward schedule (with OD-2).
 - The modern reorganization horizon **D** is deliberately unchosen.
-- The STAKE v1 script carrier still requires explicit ratification before any
-  mainnet H/X pin (unchanged).
+- The sentinel-bits and future-drift values stay provisional (spec §9).
+- The modern reward schedule (with OD-2).
+- The corridor difficulty VALUE (mechanism ruled: fixed constant), at H/X
+  pinning time.
 
 Resolved by the frozen spec (formerly listed as undefined): stake eligibility
 (STAKE policy outputs, aggregated per key, 20-block depth); the selection
@@ -42,10 +44,11 @@ Constraints already locked and not open for reinterpretation:
 - Modern PoS must be complete before FlowMesh (contract §53).
 - Validators and FlowMesh FNs are separate roles (contract §52).
 
-**Required to unblock mainnet activation:** explicit ratification of the
-numeric parameters (spec §9), the horizon D, and the STAKE carrier — after the
-real-history equivalence gate, as always. Implementation on regtest is no
-longer blocked.
+**Required to unblock mainnet activation:** the horizon D, the remaining
+provisional values (sentinel bits, future drift, modern reward with OD-2),
+the corridor difficulty value, `min_stake_amount`, and the real-history
+equivalence gate, as always. The timing numbers and the STAKE carrier are
+ratified; implementation on regtest is complete.
 
 **The transition model is AUTHORITATIVE design direction (2026-08-16):**
 [b3-during-fork-transition.md](b3-during-fork-transition.md) — the
@@ -64,14 +67,17 @@ length 1,000 is a locked count; per-validator weight aggregation is LOCKED
 preserved design number; after H, legacy PoS never resumes. Operator keys,
 snapshots, committees and self-authorizing blocks remain forbidden.
 
-**Mainnet activation stays gated** on the corridor document's OPEN list
-(corridor difficulty policy and numerics, corridor reward and the
-miner→validator-capture rule, cutoff C, insufficient-stake handling A–D,
-corridor reorg bounds, minimum stake, X distribution pause-vs-precommit)
-plus the spec-§9 numeric ratification and the horizon D. The earlier PD-1..17
-register is superseded by the frozen V1 spec; the initial seed at M is now
-resolved (spec §3: derived from the corridor-exit block's marker hash under
-the seed domain tag).
+**Mainnet activation stays gated** on the corridor document's remaining
+OPEN list — after the 2026-08-21 rulings that list is: the corridor
+difficulty VALUE (mechanism ruled: fixed constant, no retarget), corridor
+reorg-depth bounds and §7 mitigations, minimum stake amount, and
+X-distribution pause-vs-precommit — plus the horizon D and the remaining
+spec-§9 provisional values. Ruled out of existence on 2026-08-21: cutoff C
+(the 20-block activation depth alone governs), the readiness/minimum-stake
+consensus gate (operational, options A+C), and the corridor
+reward/capture question (ratified 0, fees-only, fail-closed). The earlier
+PD-1..17 register is superseded by the frozen V1 spec; the initial seed at
+M is resolved (spec §3).
 
 ---
 

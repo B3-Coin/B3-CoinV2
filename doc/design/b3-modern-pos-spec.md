@@ -39,8 +39,9 @@ Owner rulings incorporated (2026-08-20):
   ([b3-during-fork-transition.md](b3-during-fork-transition.md)) is unchanged:
   modern PoS begins at M = H + corridor length + 1.
 - Value lives in typed Policy Outputs; STAKE is `PolicyType::STAKE = 4` with
-  the v1 script carrier in `src/modern/stake.h` (still a proposal requiring
-  ratification before any mainnet H/X pin).
+  the v1 script carrier in `src/modern/stake.h` — **RATIFIED 2026-08-21
+  exactly as implemented and tested** (B3S1 payload, validator key,
+  owner-controlled funds).
 - `ModernChainDomain = TaggedHash("B3/MODERN/CHAIN", genesis || X)` is the
   anti-replay domain for new signed structures — never block identity.
 - Validators and FlowMesh FNs are separate roles. Modern issuance carries an
@@ -229,16 +230,21 @@ configured **only** by test fixtures; mainnet params never set the block, and a
 guard test enforces that. Unset ⇒ modern-PoS validation and production fail
 closed (`no-modern-pos-rules`), exactly as before this specification.
 
-| Parameter | Provisional | Meaning |
-|---|---|---|
-| `block_interval_seconds` | 60 | forced spacing floor |
-| `round_seconds` | 30 | recovery-round length |
-| `f0_num / f0_den` | 1 / 1 | round-0 expected eligible ≈ f0 · online fraction |
-| relaxation | ×2 per round (fixed in V1) | eligibility doubling |
-| `sentinel_bits` | 0x207fffff | enforced constant `nBits` |
-| `max_future_seconds` | 120 | clock-skew allowance / pacing gate |
-| `reward` | 0 (fees only) | per-block subsidy under the cap |
-| `reorg_horizon` (D) | **unset — owner decision** | modern reorg refusal depth |
+| Parameter | Value | Status | Meaning |
+|---|---|---|---|
+| `block_interval_seconds` | 60 | **RATIFIED 2026-08-21** | forced spacing floor |
+| `round_seconds` | 30 | **RATIFIED 2026-08-21** | recovery-round length |
+| `f0_num / f0_den` | 1 / 1 | **RATIFIED 2026-08-21** | round-0 expected eligible ≈ f0 · online fraction |
+| relaxation | ×2 per round | **RATIFIED 2026-08-21** (fixed in V1) | eligibility doubling |
+| `sentinel_bits` | 0x207fffff | provisional | enforced constant `nBits` |
+| `max_future_seconds` | 120 | provisional | clock-skew allowance / pacing gate |
+| `reward` | 0 (fees only) | provisional (OD-2) | per-block subsidy under the cap |
+| `reorg_horizon` (D) | **unset** | **owner decision pending** | modern reorg refusal depth |
+
+The ratified rows are the confirmed V1 numbers; the parameter block still
+ships unset on every network until the remaining rows (and D) are settled,
+so nothing activates piecemeal. The STAKE v1 carrier is likewise RATIFIED
+(2026-08-21) exactly as implemented and tested.
 
 Timing behavior at f0 = 1 (from the accepted analysis): ~63% of blocks in
 round 0 at full participation; 95% by round 2/3/4/5/8 at 100/50/25/10/1%

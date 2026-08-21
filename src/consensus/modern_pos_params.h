@@ -14,9 +14,12 @@ namespace Consensus {
  * Modern PoS V1 parameter block — THE single configurable home of every
  * modern-PoS number (doc/design/b3-modern-pos-spec.md §9).
  *
- * REVISABLE_BEFORE_MAINNET: every default below is a PROVISIONAL regtest
- * scaffolding value under the frozen V1 mechanism. None is ratified mainnet
- * policy. Real chainparams never construct this block — while
+ * Ratification state (owner rulings 2026-08-21): the timing values —
+ * block interval, round length, f0, and the fixed x2 relaxation — are
+ * RATIFIED as the V1 numbers. The remaining fields stay
+ * REVISABLE_BEFORE_MAINNET provisionals, and the reorganization horizon D
+ * is an owner decision with deliberately no default. Real chainparams
+ * still never construct this block — while
  * Params::modern_pos is unset, modern-PoS validation and production FAIL
  * CLOSED (`no-modern-pos-rules`), exactly like the corridor's unset
  * difficulty. A guard test pins that no shipped network configures it.
@@ -32,13 +35,13 @@ namespace Consensus {
  * nBits is a fixed enforced sentinel; nNonce must be 0.
  */
 struct ModernPosParams {
-    //! REVISABLE_BEFORE_MAINNET: forced minimum block spacing (seconds).
+    //! RATIFIED 2026-08-21: forced minimum block spacing (seconds).
     int64_t block_interval_seconds{60};
-    //! REVISABLE_BEFORE_MAINNET: recovery-round length (seconds). Each empty
+    //! RATIFIED 2026-08-21: recovery-round length (seconds). Each empty
     //! round doubles every validator's eligibility (f(r) = f0 * 2^r; the
-    //! doubling factor is fixed in V1).
+    //! doubling factor is likewise ratified as fixed x2 in V1).
     int64_t round_seconds{30};
-    //! REVISABLE_BEFORE_MAINNET: f0 as a rational. Expected eligible
+    //! RATIFIED 2026-08-21: f0 as a rational. Expected eligible
     //! validators in round 0 ~= f0 * (online stake fraction).
     uint32_t f0_num{1};
     uint32_t f0_den{1};

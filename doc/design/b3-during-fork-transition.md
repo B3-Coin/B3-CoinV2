@@ -162,12 +162,14 @@ constant is a new modern one, independent of the legacy
 contributes to the future registry only — it produces no corridor blocks;
 temporary PoW is the corridor's only block-production mechanism.
 
-**Initial validator cutoff C (OPEN):** stake must be valid, unspent, mature,
-created at-or-before the cutoff, and validly assigned to a validator key to
-join the initial ACTIVE set at M. Later stake stays valid and locked, enters
-the modern era PENDING, and activates under ordinary modern rules. Candidate
-shape (NOT locked): registration `H+1 … H+800`, stabilization/burial
-`H+801 … H+1000`.
+**Initial validator cutoff C (RULED 2026-08-21): there is NO separate
+cutoff.** The 20-block STAKE activation depth alone determines the initial
+ACTIVE set: a STAKE output is ACTIVE at M iff it was created at least
+STAKE_ACTIVATION_DEPTH blocks earlier (created at-or-before M−20), exactly
+the maturity rule the implementation already applies uniformly at every
+height. Later stake stays valid, enters PENDING, and activates under the
+same rule. The earlier registration/stabilization split is superseded; no
+second number exists.
 
 **Registry derivation:** at the end of block PF = H+1000, every node derives
 the identical initial modern validator registry from qualifying STAKE
@@ -212,26 +214,27 @@ period; bounded corridor reorg depth; corridor timestamp rules; broad
 mining-client availability; a temporary block reward attracting honest
 hashrate.
 
-## 8. Corridor mining reward (OPEN — historical schedule must NOT return)
+## 8. Corridor mining reward (RATIFIED 2026-08-21: 0 — fees only)
 
-Options to analyze: fees only; fixed temporary B3 reward; small temporary
-subsidy + fees; declining reward across the corridor. Separately analyze
-**miner→validator capture**: whether corridor-PoW reward B3 may join the
-initial validator set. A dominant corridor miner must not automatically
-convert subsidy into initial-set domination. Candidate rules (none locked):
-corridor rewards mature beyond H+1000; rewards spendable but ineligible for
-the initial set; rewards stake normally only after M. Any subsidy also
-needs an issuance-cap accounting statement (contract cap invariant).
+**Owner ruling: the corridor pays transaction fees only; no subsidy.** The
+historical schedule does not return, no new issuance occurs during the
+corridor, and the miner→validator-capture question dissolves — with zero
+subsidy there is no reward B3 to convert into initial-set weight; corridor
+miners bootstrap their validator position with coins they already hold,
+like every other holder. The parameter is stated explicitly on mainnet and
+FAILS CLOSED when unset on any network (never an accidental default).
 
-## 9. Insufficient stake at the end of the corridor
+## 9. Insufficient stake at the end of the corridor (RULED 2026-08-21)
 
-Block counts, STAKE-output counts and validator counts are unrelated
-(1,000 PoW blocks / 50 validators / 120 STAKE outputs may be perfectly
-healthy). If mature qualifying stake at H+1000 is inadequate, the options
-to analyze (NONE selected without approval): (A) H is not finalized
-operationally until expected participation is adequate; (B) a deterministic
-bounded corridor-extension mechanism; (C) M begins with whatever valid
-stake exists; (D) abort the attempt — possible only before H becomes final.
+**Owner ruling: NO minimum-total-stake consensus gate — options A + C.**
+M begins with whatever valid mature stake exists; the V1 recovery rounds
+make any nonzero active stake sufficient for liveness (even ~1% online
+produces blocks within minutes). The only true failure mode is exactly
+zero stake at M — a chain that can never produce a modern block — and
+that is prevented OPERATIONALLY: H is not finalized until adequate
+participation is evident (option A), never by consensus machinery. The
+corridor-extension mechanism (B) is rejected as complexity; abort (D)
+remains possible only before H is final, as before.
 **FIRM: after H, legacy PoS never resumes.** There is no silent fallback
 from transition PoW to legacy PoS under any circumstances.
 
@@ -311,17 +314,21 @@ derivation at H+1000 with no snapshot/committee/administrator/self-
 authorizing block; after H, legacy PoS never resumes; unequal hashpower
 accepted; no new hash function.
 
-**OPEN:** corridor difficulty policy and every numeric parameter (initial
-P0 target, spacing, retarget response, min/max targets, timestamp bounds);
-corridor reward model and miner→validator-capture rule; cutoff C and the
-registration/burial split; insufficient-stake handling (options A–D);
-corridor reorg-depth bounds and other §7 mitigations; STAKE policy-output
-serialization details and activation mechanics for the minimal surface;
-X-distribution operations (pause vs. precommit — unchanged from before);
-minimum stake amount; duplicate/invalid validator-key handling in STAKE
-outputs; initial randomness/VRF seed at M; everything listed OPEN in the
-modern PoS spec (VRF primitive, slots/epochs, fork choice, finality,
-rewards, slashing, unbonding).
+**RULED 2026-08-21 (no longer open):** corridor difficulty MECHANISM
+(fixed constant, no retarget — §6); corridor reward (0, fees only,
+fail-closed — §8, capture question dissolved); cutoff C (none — the
+20-block activation depth alone, §5); insufficient-stake handling
+(options A + C, no consensus gate — §9); the STAKE v1 carrier
+(RATIFIED as tested); the modern-PoS mechanism set and its timing
+numbers (frozen V1 spec: 60 s interval, 30 s rounds, f0 = 1, ×2
+relaxation — the VRF/slots/epochs items are superseded; the seed at M
+derives from the corridor-exit block).
+
+**STILL OPEN:** the corridor difficulty VALUE (one compact-bits number at
+H/X pinning); minimum stake amount; the modern reorganization horizon D;
+the modern-PoS sentinel-bits and future-drift values (provisional);
+corridor reorg-depth bounds and other §7 mitigations; X-distribution
+operations (pause vs. precommit); modern reward schedule (OD-2).
 
 ## 13. Destination unchanged
 

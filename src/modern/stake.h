@@ -19,9 +19,10 @@
 namespace modern {
 
 /**
- * The on-chain carrier of a STAKE Policy Output (v1 wire form — a design
- * PROPOSAL embodied in code; it requires explicit ratification before any
- * mainnet H/X is pinned, and is exercised on regtest only until then).
+ * The on-chain carrier of a STAKE Policy Output (v1 wire form —
+ * RATIFIED by owner ruling 2026-08-21, exactly as implemented and
+ * tested: B3S1 payload, opaque 32-byte validator key, owner-controlled
+ * funds).
  *
  * A STAKE output is an ordinary CTxOut whose scriptPubKey is
  *
