@@ -1776,6 +1776,7 @@ BOOST_AUTO_TEST_CASE(transition_pow_corridor_validation)
     mutable_consensus.legacy_final_hash = X;
     mutable_consensus.transition_pow_length = CORRIDOR;
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
     BOOST_REQUIRE(consensus.test_only_modern_pos_validator == nullptr);
 
     // Corridor block builder: modern codec identity, scrypt-ground nBits.
@@ -1827,6 +1828,7 @@ BOOST_AUTO_TEST_CASE(transition_pow_corridor_validation)
         BOOST_CHECK(!chainman.ProcessNewBlock(CodecRoundTrip(blocked), true, true, &new_block));
         BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(blocked.GetHash())) == nullptr);
         mutable_consensus.transition_pow_bits = EASY_BITS;
+        mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
     }
 
     // The whole corridor connects under temporary PoW — no modern PoS
@@ -1928,6 +1930,7 @@ BOOST_AUTO_TEST_CASE(transition_pow_corridor_production)
         node::BlockAssembler(chainman.ActiveChainstate(), nullptr, options).CreateNewBlock(),
         std::runtime_error);
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
 
     // Produce, grind and submit the whole corridor through the assembler.
     for (int i{0}; i < CORRIDOR; ++i) {
@@ -2033,6 +2036,7 @@ BOOST_AUTO_TEST_CASE(legacy_lock_crossing_spend)
     mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
     mutable_consensus.transition_pow_length = 8;
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
 
     const auto build_corridor{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
         CMutableTransaction coinbase;
@@ -2246,6 +2250,7 @@ BOOST_AUTO_TEST_CASE(stake_policy_in_corridor)
     mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
     mutable_consensus.transition_pow_length = 6;
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
     mutable_consensus.min_stake_amount = 1000; // regtest scaffolding
 
     // Corridor block 1: legacy value crosses into a real STAKE output plus
@@ -2445,6 +2450,7 @@ BOOST_AUTO_TEST_CASE(full_corridor_end_to_end)
     mutable_consensus.legacy_final_hash = X;
     mutable_consensus.transition_pow_length = CORRIDOR;
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
     mutable_consensus.min_stake_amount = 1000; // regtest scaffolding
     BOOST_REQUIRE(consensus.test_only_modern_pos_validator == nullptr);
     BOOST_CHECK(WITH_LOCK(cs_main, return chainman.ActiveChainstate().LegacyBoundaryActive()));
@@ -2682,6 +2688,7 @@ BOOST_FIXTURE_TEST_CASE(corridor_restart_and_reindex, TransitionDiskSetup)
     mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
     mutable_consensus.transition_pow_length = 8;
     mutable_consensus.transition_pow_bits = HARD_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
     mutable_consensus.min_stake_amount = 1000;
 
     std::array<unsigned char, 32> validator_key{};
@@ -2844,6 +2851,7 @@ BOOST_AUTO_TEST_CASE(two_node_corridor_sync)
     mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
     mutable_consensus.transition_pow_length = CORRIDOR;
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
     mutable_consensus.min_stake_amount = 1000;
 
     std::array<unsigned char, 32> validator_key{};

@@ -139,6 +139,9 @@ public:
         // Inert until a mainnet H/X boundary is finalized (hard_fork_height
         // and legacy_final_hash stay unset here).
         consensus.transition_pow_length = 1000;
+        // RATIFIED (owner ruling 2026-08-21): the corridor pays fees only --
+        // no subsidy. Stated explicitly because an unset reward fails closed.
+        consensus.transition_pow_reward = 0;
         // Historical live-legacy checkpoint rules, ported verbatim.
         consensus.legacy_checkpoints = legacy::MainnetCheckpoints();
         consensus.legacy_checkpoint_span = legacy::LEGACY_CHECKPOINT_SPAN;

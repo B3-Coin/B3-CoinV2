@@ -166,6 +166,9 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     if (b3_corridor && !b3_consensus.transition_pow_bits) {
         throw std::runtime_error("temporary-PoW corridor difficulty is not configured");
     }
+    if (b3_corridor && !b3_consensus.transition_pow_reward) {
+        throw std::runtime_error("temporary-PoW corridor reward is not configured");
+    }
     // Modern-PoS production (frozen V1 spec §3-§5): fully deterministic —
     // resolve the seed and the validator's weights, find the smallest
     // eligible recovery round, and force the exact round timestamp. The
@@ -248,7 +251,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // (REVISABLE_BEFORE_MAINNET, provisionally 0) modern reward, matching
     // the unconditional consensus cap. Only non-B3 chains use the stock
     // subsidy schedule.
-    const CAmount block_reward{b3_corridor  ? nFees + b3_consensus.transition_pow_reward
+    const CAmount block_reward{b3_corridor  ? nFees + *b3_consensus.transition_pow_reward
                                : b3_modern_pos ? nFees + (b3_consensus.modern_pos
                                                               ? b3_consensus.modern_pos->reward
                                                               : 0)

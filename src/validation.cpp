@@ -3053,7 +3053,14 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         // set precisely).
         if (Consensus::GetConsensusPhase(pindex->nHeight, params.GetConsensus()) ==
             Consensus::ConsensusPhase::TRANSITION_POW) {
-            const CAmount corridor_reward{nFees + params.GetConsensus().transition_pow_reward};
+            // Fail closed while the corridor reward is unstated, exactly like
+            // the corridor difficulty: economics ship by explicit ruling,
+            // never by default (ratified mainnet value: 0, fees only).
+            if (!params.GetConsensus().transition_pow_reward && state.IsValid()) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "no-transition-pow-rules",
+                              "temporary-PoW corridor reward policy is not configured");
+            }
+            const CAmount corridor_reward{nFees + params.GetConsensus().transition_pow_reward.value_or(0)};
             if (block.vtx[0]->GetValueOut() > corridor_reward && state.IsValid()) {
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
                               strprintf("corridor coinbase pays too much (actual=%d vs limit=%d)",

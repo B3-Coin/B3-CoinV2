@@ -292,6 +292,7 @@ struct ModernPosSetup : public ChainTestingSetup {
         mutable_consensus.legacy_final_hash = Tip()->GetBlockHash();
         mutable_consensus.transition_pow_length = SYN_CORRIDOR;
         mutable_consensus.transition_pow_bits = EASY_BITS;
+        mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
         mutable_consensus.min_stake_amount = 1000;
         Consensus::ModernPosParams pos{};
         pos.reorg_horizon = 12; // scaffolding value; D itself is an owner decision
@@ -364,6 +365,15 @@ BOOST_AUTO_TEST_CASE(no_provisional_parameters_on_shipped_networks)
                             "provisional stake minimum set on a shipped network");
         BOOST_CHECK_MESSAGE(!consensus.transition_pow_bits.has_value(),
                             "provisional corridor difficulty set on a shipped network");
+        if (chain == ChainType::MAIN) {
+            // RATIFIED 2026-08-21: mainnet corridor reward is exactly 0
+            // (fees only), stated explicitly rather than defaulted.
+            BOOST_CHECK(consensus.transition_pow_reward.has_value());
+            BOOST_CHECK_EQUAL(consensus.transition_pow_reward.value_or(-1), 0);
+        } else {
+            BOOST_CHECK_MESSAGE(!consensus.transition_pow_reward.has_value(),
+                                "corridor reward set on a non-ratified network");
+        }
     }
 }
 

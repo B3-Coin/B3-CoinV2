@@ -561,6 +561,7 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
     mutable_consensus.legacy_final_hash = X;
     mutable_consensus.transition_pow_length = EVO_CORRIDOR;
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
     mutable_consensus.min_stake_amount = 1000;
     BOOST_REQUIRE(consensus.test_only_modern_pos_validator == nullptr);
     BOOST_CHECK(WITH_LOCK(cs_main, return cm().ActiveChainstate().LegacyBoundaryActive()));
