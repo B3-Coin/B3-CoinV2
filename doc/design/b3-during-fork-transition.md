@@ -191,11 +191,21 @@ by the owner.
 Consequences, accepted with the ruling: corridor wall-clock duration is
 set by real hashrate against the constant target (high hashrate
 compresses it, low hashrate stretches it); there is no adjustment. The
-earlier retarget analysis above is superseded. **Still OPEN: the constant
-value itself** — one compact-bits number, chosen at mainnet H/X pinning
-time (inert before then), balancing "cheap enough that the corridor
-cannot stall" against "expensive enough that its duration gives holders a
-real staking window".
+earlier retarget analysis above is superseded.
+
+**Value policy RULED 2026-08-21: LOW, with stall-safety dominant.** With
+a fixed target the failure modes are asymmetric: too easy is recoverable
+(a fast, noisy corridor — harmless, since staking has no deadline and
+zero reward removes the attack economics), while too hard is the one
+catastrophic case (hashpower below calibration and no retarget to
+rescue it). The constant is therefore calibrated against the WEAKEST
+GUARANTEED PARTICIPANT, not expected participation: one ordinary CPU
+core alone must sustain roughly a block per 30–60 seconds, so any single
+machine can always push the corridor through and a stall is impossible
+by construction; every calibration uncertainty resolves toward EASIER.
+The exact compact-bits number is measured against a reference CPU's real
+scrypt rate at mainnet H/X pinning time (inert before then) and recorded
+with the pin.
 
 ## 7. Corridor security (concrete questions; mitigations OPEN)
 
