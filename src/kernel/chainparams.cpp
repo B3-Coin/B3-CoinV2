@@ -142,6 +142,11 @@ public:
         // RATIFIED (owner ruling 2026-08-21): the corridor pays fees only --
         // no subsidy. Stated explicitly because an unset reward fails closed.
         consensus.transition_pow_reward = 0;
+        // RATIFIED (owner ruling 2026-08-21): minimum STAKE principal is
+        // 333 modern B3 (the kB3 nomination: 1 modern B3 = 1,000 legacy B3
+        // = 1e9 base units), i.e. 333,000 legacy-denomination B3. Inert
+        // until a mainnet H/X boundary is finalized.
+        consensus.min_stake_amount = 333 * CAmount{1'000'000'000};
         // Historical live-legacy checkpoint rules, ported verbatim.
         consensus.legacy_checkpoints = legacy::MainnetCheckpoints();
         consensus.legacy_checkpoint_span = legacy::LEGACY_CHECKPOINT_SPAN;

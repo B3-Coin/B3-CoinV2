@@ -23,11 +23,14 @@ interval 60 s, round length 30 s, f0 = 1, ×2 relaxation, and the STAKE v1
 carrier are all RATIFIED; the corridor reward is ratified fees-only and
 fail-closed; cutoff C and the readiness gate are ruled out of existence):
 
-- The modern reorganization horizon **D** is deliberately unchosen.
 - The sentinel-bits and future-drift values stay provisional (spec §9).
 - The modern reward schedule (with OD-2).
-- The corridor difficulty VALUE (mechanism ruled: fixed constant), at H/X
-  pinning time.
+- The corridor difficulty VALUE (policy ruled: low, stall-safety dominant,
+  calibrated to a single CPU core), measured at H/X pinning time.
+
+Further RATIFIED 2026-08-21: the horizon D = 1440 (one day at the 60 s
+interval) and `min_stake_amount` = 333 modern B3 (kB3; 333e9 base units),
+both stated on mainnet and inert until H/X.
 
 Resolved by the frozen spec (formerly listed as undefined): stake eligibility
 (STAKE policy outputs, aggregated per key, 20-block depth); the selection

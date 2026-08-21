@@ -334,11 +334,13 @@ numbers (frozen V1 spec: 60 s interval, 30 s rounds, f0 = 1, ×2
 relaxation — the VRF/slots/epochs items are superseded; the seed at M
 derives from the corridor-exit block).
 
-**STILL OPEN:** the corridor difficulty VALUE (one compact-bits number at
-H/X pinning); minimum stake amount; the modern reorganization horizon D;
-the modern-PoS sentinel-bits and future-drift values (provisional);
-corridor reorg-depth bounds and other §7 mitigations; X-distribution
-operations (pause vs. precommit); modern reward schedule (OD-2).
+**STILL OPEN:** the corridor difficulty VALUE (policy ruled 2026-08-21 —
+low, stall-safety dominant, single-CPU calibration — measured at H/X
+pinning); the modern-PoS sentinel-bits and future-drift values
+(provisional); corridor reorg-depth bounds and other §7 mitigations;
+X-distribution operations (pause vs. precommit); modern reward schedule
+(OD-2). Ratified 2026-08-21 in addition: minimum stake 333 modern B3
+(kB3) and the modern horizon D = 1440.
 
 ## 13. Destination unchanged
 

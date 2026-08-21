@@ -295,7 +295,7 @@ struct ModernPosSetup : public ChainTestingSetup {
         mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
         mutable_consensus.min_stake_amount = 1000;
         Consensus::ModernPosParams pos{};
-        pos.reorg_horizon = 12; // scaffolding value; D itself is an owner decision
+        pos.reorg_horizon = 12; // small-chain scaffolding override of the ratified 1440
         mutable_consensus.modern_pos = pos;
         {
             // A real node configures its params before any block index
@@ -361,8 +361,14 @@ BOOST_AUTO_TEST_CASE(no_provisional_parameters_on_shipped_networks)
                             "test-only PoS validator set on a shipped network");
         BOOST_CHECK_MESSAGE(!consensus.test_only_asset_policies_active,
                             "test-only asset activation set on a shipped network");
-        BOOST_CHECK_MESSAGE(!consensus.min_stake_amount.has_value(),
-                            "provisional stake minimum set on a shipped network");
+        if (chain == ChainType::MAIN) {
+            // RATIFIED 2026-08-21: minimum STAKE principal is 333 modern B3
+            // (the kB3 nomination) = 333e9 base units.
+            BOOST_CHECK_EQUAL(consensus.min_stake_amount.value_or(-1), 333 * CAmount{1'000'000'000});
+        } else {
+            BOOST_CHECK_MESSAGE(!consensus.min_stake_amount.has_value(),
+                                "stake minimum set on a non-ratified network");
+        }
         BOOST_CHECK_MESSAGE(!consensus.transition_pow_bits.has_value(),
                             "provisional corridor difficulty set on a shipped network");
         if (chain == ChainType::MAIN) {
@@ -382,7 +388,7 @@ BOOST_AUTO_TEST_CASE(provisional_parameter_block_is_structurally_valid)
 {
     Consensus::ModernPosParams pos{};
     BOOST_CHECK(pos.Valid());
-    BOOST_CHECK(!pos.reorg_horizon.has_value()); // D is an owner decision: no default.
+    BOOST_CHECK_EQUAL(pos.reorg_horizon.value_or(-1), 1440); // D RATIFIED 2026-08-21: one day at 60 s.
 
     pos.round_seconds = 0;
     BOOST_CHECK(!pos.Valid());

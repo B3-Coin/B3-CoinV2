@@ -239,11 +239,12 @@ closed (`no-modern-pos-rules`), exactly as before this specification.
 | `sentinel_bits` | 0x207fffff | provisional | enforced constant `nBits` |
 | `max_future_seconds` | 120 | provisional | clock-skew allowance / pacing gate |
 | `reward` | 0 (fees only) | provisional (OD-2) | per-block subsidy under the cap |
-| `reorg_horizon` (D) | **unset** | **owner decision pending** | modern reorg refusal depth |
+| `reorg_horizon` (D) | 1440 | **RATIFIED 2026-08-21** (one day at 60 s) | modern reorg refusal depth |
 
-The ratified rows are the confirmed V1 numbers; the parameter block still
-ships unset on every network until the remaining rows (and D) are settled,
-so nothing activates piecemeal. The STAKE v1 carrier is likewise RATIFIED
+The ratified rows are the confirmed V1 numbers (min stake is likewise
+ratified: 333 modern B3 = 333e9 base units, stated on mainnet, inert until
+H/X); the parameter block still ships unset on every network until the
+remaining provisional rows are settled, so nothing activates piecemeal. The STAKE v1 carrier is likewise RATIFIED
 (2026-08-21) exactly as implemented and tested.
 
 Timing behavior at f0 = 1 (from the accepted analysis): ~63% of blocks in

@@ -59,10 +59,11 @@ struct ModernPosParams {
     //! schedule is an owner economics decision (OD-2).
     int64_t reward{0};
     //! Modern reorganization horizon D: a reorg deeper than this many
-    //! modern-PoS blocks is refused without peer penalty. OWNER DECISION —
-    //! deliberately no default; unset disables the horizon (V1 regtest
-    //! fixtures set a scaffolding value).
-    std::optional<int> reorg_horizon;
+    //! modern-PoS blocks is refused without peer penalty. RATIFIED
+    //! 2026-08-21: 1440 — one day of history at the ratified 60-second
+    //! interval becomes final for online nodes. Fixtures may override with
+    //! small scaffolding values; unset disables the horizon.
+    std::optional<int> reorg_horizon{1440};
 
     //! Structural sanity of a configured block (not economics).
     constexpr bool Valid() const
