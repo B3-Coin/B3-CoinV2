@@ -5,12 +5,14 @@
 #include <index/txospenderindex.h>
 
 #include <common/args.h>
+#include <consensus/block_codec.h>
 #include <crypto/siphash.h>
 #include <dbwrapper.h>
 #include <flatfile.h>
 #include <index/base.h>
 #include <index/disktxpos.h>
 #include <interfaces/chain.h>
+#include <legacy/codec.h>
 #include <logging.h>
 #include <node/blockstorage.h>
 #include <primitives/block.h>
@@ -108,11 +110,16 @@ void TxoSpenderIndex::EraseSpenderInfos(const std::vector<std::pair<COutPoint, C
     m_db->WriteBatch(batch);
 }
 
-static std::vector<std::pair<COutPoint, CDiskTxPos>> BuildSpenderPositions(const interfaces::BlockInfo& block)
+static std::vector<std::pair<COutPoint, CDiskTxPos>> BuildSpenderPositions(const interfaces::BlockInfo& block,
+                                                                           const Consensus::Params& consensus)
 {
     std::vector<std::pair<COutPoint, CDiskTxPos>> items;
     items.reserve(block.data->vtx.size());
 
+    // Offsets must measure the bytes actually on disk: the block's permanent
+    // codec marker selects the transaction codec, as at the storage layer.
+    const bool legacy_codec_block{consensus.legacy_b3coin &&
+                                  !Consensus::HasB3BlockCodecV2(block.data->nVersion)};
     CDiskTxPos pos({block.file_number, block.data_pos}, GetSizeOfCompactSize(block.data->vtx.size()));
     for (const auto& tx : block.data->vtx) {
         if (!tx->IsCoinBase()) {
@@ -120,7 +127,8 @@ static std::vector<std::pair<COutPoint, CDiskTxPos>> BuildSpenderPositions(const
                 items.emplace_back(input.prevout, pos);
             }
         }
-        pos.nTxOffset += ::GetSerializeSize(TX_WITH_WITNESS(*tx));
+        pos.nTxOffset += legacy_codec_block ? ::GetSerializeSize(legacy::TX_LEGACY(*tx))
+                                            : ::GetSerializeSize(TX_WITH_WITNESS(*tx));
     }
 
     return items;
@@ -129,13 +137,13 @@ static std::vector<std::pair<COutPoint, CDiskTxPos>> BuildSpenderPositions(const
 
 bool TxoSpenderIndex::CustomAppend(const interfaces::BlockInfo& block)
 {
-    WriteSpenderInfos(BuildSpenderPositions(block));
+    WriteSpenderInfos(BuildSpenderPositions(block, m_chainstate->m_chainman.GetConsensus()));
     return true;
 }
 
 bool TxoSpenderIndex::CustomRemove(const interfaces::BlockInfo& block)
 {
-    EraseSpenderInfos(BuildSpenderPositions(block));
+    EraseSpenderInfos(BuildSpenderPositions(block, m_chainstate->m_chainman.GetConsensus()));
     return true;
 }
 
@@ -145,15 +153,20 @@ util::Expected<TxoSpender, std::string> TxoSpenderIndex::ReadTransaction(const C
     if (file.IsNull()) {
         return util::Unexpected("cannot open block");
     }
+    const Consensus::Params& consensus{m_chainstate->m_chainman.GetConsensus()};
     CBlockHeader header;
     TxoSpender spender;
     try {
         file >> header;
         file.seek(tx_pos.nTxOffset, SEEK_CUR);
-        file >> TX_WITH_WITNESS(spender.tx);
-        spender.block_hash = m_chainstate->m_chainman.GetConsensus().legacy_b3coin
-            ? header.GetLegacyB3Hash()
-            : header.GetHash();
+        // Marker-selected transaction codec and marker-derived block
+        // identity, mirroring the write path and every other identity site.
+        if (consensus.legacy_b3coin && !Consensus::HasB3BlockCodecV2(header.nVersion)) {
+            file >> legacy::TX_LEGACY(spender.tx);
+        } else {
+            file >> TX_WITH_WITNESS(spender.tx);
+        }
+        spender.block_hash = header.GetMarkerHash(consensus);
         return spender;
     } catch (const std::exception& e) {
         return util::Unexpected(e.what());
