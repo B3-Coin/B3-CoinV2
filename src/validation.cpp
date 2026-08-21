@@ -34,11 +34,13 @@
 #include <legacy/codec.h>
 #include <legacy/consensus.h>
 #include <legacy/replay.h>
+#include <modern/fn.h>
 #include <modern/pos.h>
 #include <modern/pos_v1.h>
 #include <modern/stake.h>
 #include <logging/timer.h>
 #include <node/blockstorage.h>
+#include <node/stake_tracker.h>
 #include <node/utxo_snapshot.h>
 #include <policy/ephemeral_policy.h>
 #include <policy/policy.h>
@@ -1983,7 +1985,20 @@ Chainstate::Chainstate(
       m_blockman(blockman),
       m_chainman(chainman),
       m_assumeutxo(from_snapshot_blockhash ? Assumeutxo::UNVALIDATED : Assumeutxo::VALIDATED),
-      m_from_snapshot_blockhash(from_snapshot_blockhash) {}
+      m_from_snapshot_blockhash(from_snapshot_blockhash),
+      // The candidate comparator carries the chain's params so equal-work
+      // modern-PoS candidates order by the frozen V1 PoS-native rule; on
+      // every other chain the pointer changes nothing.
+      setBlockIndexCandidates(node::CBlockIndexWorkComparator{&chainman.GetConsensus()}) {}
+
+Chainstate::~Chainstate() = default;
+
+node::StakeTracker& Chainstate::ModernStakeTracker()
+{
+    AssertLockHeld(::cs_main);
+    if (!m_stake_tracker) m_stake_tracker = std::make_unique<node::StakeTracker>();
+    return *m_stake_tracker;
+}
 
 fs::path Chainstate::StoragePath() const
 {
@@ -3068,8 +3083,61 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 }
             }
             if (state.IsValid()) {
-                (void)modern::CheckModernStake(block, *pindex->pprev, view, state,
-                                               params.GetConsensus().test_only_modern_pos_validator);
+                const Consensus::Params& consensus{params.GetConsensus()};
+                if (consensus.test_only_modern_pos_validator != nullptr || !consensus.modern_pos) {
+                    // Test-adapter dispatch, or fail-closed: with no V1
+                    // parameter block configured (every shipped network)
+                    // every modern-PoS block is rejected.
+                    (void)modern::CheckModernStake(block, *pindex->pprev, view, state,
+                                                   consensus.test_only_modern_pos_validator);
+                } else if (modern::CheckModernPosCodec(block, state)) {
+                    // Frozen Modern PoS V1 (spec §3-§5): seed chain,
+                    // deterministic stake-weighted eligibility, exact round
+                    // timestamps, BIP340 validator signature. The block's
+                    // own eligibility digest becomes the next height's seed
+                    // and is cached on the index.
+                    const auto domain{modern::ModernChainDomain(
+                        consensus.hashGenesisBlock, consensus.legacy_final_hash.value_or(uint256{}))};
+                    if (!domain) {
+                        state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "no-modern-pos-rules",
+                                      "modern chain domain is not pinned");
+                    } else {
+                        modern::ModernPosContext ctx;
+                        ctx.chain_domain = *domain;
+                        ctx.height = pindex->nHeight;
+                        ctx.parent_time = pindex->pprev->GetBlockTime();
+                        ctx.seed = Consensus::GetConsensusPhase(pindex->pprev->nHeight, consensus) ==
+                                           Consensus::ConsensusPhase::MODERN_POS
+                                       ? pindex->pprev->m_modern_pos_digest
+                                       : modern::ModernPosGenesisSeed(*domain, pindex->pprev->GetBlockHash());
+                        if (ctx.seed.IsNull()) {
+                            // A connected modern-PoS parent always carries its
+                            // digest; a null seed is local index corruption,
+                            // not evidence against the block.
+                            state.Error("modern-PoS seed for the parent is unavailable");
+                        } else {
+                            if (const auto key{modern::ExtractModernPosValidatorKey(
+                                    block.vtx[0]->vin[0].scriptSig)}) {
+                                if (!ModernStakeTracker().Sync(m_chain, m_blockman, consensus,
+                                                               *pindex->pprev)) {
+                                    state.Error("modern-PoS stake registry is unavailable");
+                                } else {
+                                    std::tie(ctx.validator_weight, ctx.total_weight) =
+                                        ModernStakeTracker().ActiveWeight(*key, pindex->nHeight);
+                                }
+                            }
+                            if (state.IsValid()) {
+                                uint256 digest;
+                                if (modern::CheckModernPosBlock(block, ctx, *consensus.modern_pos,
+                                                                /*check_signature=*/!fJustCheck, state,
+                                                                digest) &&
+                                    !fJustCheck) {
+                                    pindex->m_modern_pos_digest = digest;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     } else {
@@ -3493,6 +3561,10 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     m_chain.SetTip(*pindexDelete->pprev);
     m_chainman.UpdateIBDStatus();
 
+    // A disconnect invalidates the incremental modern-PoS stake registry;
+    // it rebuilds from the (now shorter) active chain on next use.
+    if (m_stake_tracker) m_stake_tracker->MarkDirty();
+
     UpdateTip(pindexDelete->pprev);
     // Let wallets know transactions went from 1-confirmed to
     // 0-confirmed or conflicted:
@@ -3598,6 +3670,11 @@ bool Chainstate::ConnectTip(
                  Ticks<SecondsDouble>(m_chainman.time_connect_total),
                  Ticks<MillisecondsDouble>(m_chainman.time_connect_total) / m_chainman.num_blocks_total);
         view.Flush(/*reallocate_cache=*/false); // No need to reallocate since it only has capacity for 1 block
+    }
+    // Keep the modern-PoS stake registry in step with the connected block
+    // (no-op below the boundary; a missed step just marks it for rebuild).
+    if (m_stake_tracker) {
+        m_stake_tracker->BlockConnected(*block_to_connect, *pindexNew, m_chainman.GetConsensus());
     }
     const auto time_4{SteadyClock::now()};
     m_chainman.time_flush += time_4 - time_3;
@@ -4096,7 +4173,7 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
                 if (ReachedTarget()) {
                     break;
                 }
-            } while (!m_chain.Tip() || (starting_tip && CBlockIndexWorkComparator()(m_chain.Tip(), starting_tip)));
+            } while (!m_chain.Tip() || (starting_tip && setBlockIndexCandidates.value_comp()(m_chain.Tip(), starting_tip)));
             if (!blocks_connected) return true;
 
             const CBlockIndex* pindexFork = m_chain.FindFork(starting_tip);
@@ -4242,7 +4319,7 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
             // Instead, consider only non-active-chain blocks that score
             // at least as good with CBlockIndexWorkComparator as the new tip.
             if (!m_chain.Contains(candidate) &&
-                !CBlockIndexWorkComparator()(candidate, pindex->pprev) &&
+                !setBlockIndexCandidates.value_comp()(candidate, pindex->pprev) &&
                 !(candidate->nStatus & BLOCK_FAILED_VALID)) {
                 highpow_outofchain_headers.insert({candidate->nChainWork, candidate});
             }
@@ -4314,7 +4391,7 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
                 candidate_it = highpow_outofchain_headers.erase(candidate_it);
                 continue;
             }
-            if (!CBlockIndexWorkComparator()(candidate, new_tip) &&
+            if (!setBlockIndexCandidates.value_comp()(candidate, new_tip) &&
                 candidate->IsValid(BLOCK_VALID_TRANSACTIONS) &&
                 candidate->HaveNumChainTxs() &&
                 !m_blockman.IsAnchorIneligible(*candidate)) {
@@ -4548,10 +4625,16 @@ static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& st
     // ContextualCheckBlockHeader, where the height is known.
     const bool legacy_header{consensusParams.legacy_b3coin &&
                              !Consensus::HasB3BlockCodecV2(block.nVersion)};
+    // Marker-modern headers defer their proof check to the contextual stage
+    // whenever this function cannot know their phase: with a corridor
+    // configured the height decides scrypt-vs-stock, and with the modern-PoS
+    // V1 rule set configured a PoS header has no proof-of-work at all (the
+    // sentinel nBits and stake eligibility are contextual/connect rules).
     const bool corridor_deferred{consensusParams.legacy_b3coin &&
                                  Consensus::HasB3BlockCodecV2(block.nVersion) &&
                                  consensusParams.hard_fork_height.has_value() &&
-                                 consensusParams.transition_pow_length > 0};
+                                 (consensusParams.transition_pow_length > 0 ||
+                                  consensusParams.modern_pos.has_value())};
     if (fCheckPOW && !legacy_header && !corridor_deferred &&
         !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
@@ -5133,6 +5216,46 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         if (check_pow && !CheckTransitionPowEligibility(block)) {
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash",
                                  "temporary-PoW scrypt eligibility hash exceeds target");
+        }
+    } else if (consensusParams.legacy_b3coin && consensusParams.modern_pos) {
+        // Modern-PoS V1 header rules (frozen spec §3-§4, §6). There is no
+        // difficulty retarget: nBits is a dead field pinned to the sentinel,
+        // nNonce must be zero, and the timestamp must be EXACTLY the parent
+        // time plus the block interval plus a whole number of recovery
+        // rounds — the round is decoded from it, never declared.
+        const Consensus::ModernPosParams& pos{*consensusParams.modern_pos};
+        if (block.nBits != pos.sentinel_bits) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits",
+                                 "modern-PoS nBits must be the sentinel value");
+        }
+        if (block.nNonce != 0) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-pos-nonce",
+                                 "modern-PoS nNonce must be zero");
+        }
+        if (!modern::DecodeModernPosRound(pindexPrev->GetBlockTime(), block.GetBlockTime(), pos)) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-pos-time",
+                                 "modern-PoS timestamp is not an exact round time");
+        }
+        // Exact timestamps make the future-time rule the pacing gate: a
+        // round's block cannot be accepted before its forced timestamp
+        // (minus the clock-skew allowance), so the chain can never run
+        // faster than one block per interval, and rounds advance in real
+        // time during a stall. Held, not marked invalid, like the stock rule.
+        if (block.Time() > NodeClock::now() + std::chrono::seconds{pos.max_future_seconds}) {
+            return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new",
+                                 "modern-PoS block timestamp too far in the future");
+        }
+        // The modern reorganization horizon D (owner parameter): a block
+        // deeper than D below the active tip is refused without penalty —
+        // the V1 long-range bound, modeled on the legacy depth bar. Skipped
+        // while importing/reindexing our own blocks from disk.
+        if (pos.reorg_horizon && !blockman.LoadingBlocks()) {
+            if (const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+                tip && tip->nHeight - nHeight >= *pos.reorg_horizon) {
+                return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "modern-reorg-too-deep",
+                                     strprintf("modern-PoS block at height %d is %d or more blocks below the tip at %d",
+                                               nHeight, *pos.reorg_horizon, tip->nHeight));
+            }
         }
     } else {
         if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
@@ -6455,7 +6578,7 @@ void ChainstateManager::CheckBlockIndex() const
             //   candidate, and this will be asserted below. The only exception
             //   is if pindex itself is an assumeutxo snapshot block. Then it is
             //   also a potential candidate.
-            if (!CBlockIndexWorkComparator()(pindex, c->m_chain.Tip()) && (pindexFirstNeverProcessed == nullptr || pindex == snap_base)) {
+            if (!c->setBlockIndexCandidates.value_comp()(pindex, c->m_chain.Tip()) && (pindexFirstNeverProcessed == nullptr || pindex == snap_base)) {
                 // If pindex was detected as invalid (pindexFirstInvalid is
                 // non-null), or lies off the finalized legacy boundary anchor
                 // (pindexFirstAnchorIneligible is non-null), it is not required
@@ -6526,7 +6649,7 @@ void ChainstateManager::CheckBlockIndex() const
             // So if this block is itself better than any m_chain.Tip() and it wasn't in
             // setBlockIndexCandidates, then it must be in m_blocks_unlinked.
             for (const auto& c : m_chainstates) {
-                if (!CBlockIndexWorkComparator()(pindex, c->m_chain.Tip()) && !c->setBlockIndexCandidates.contains(pindex)) {
+                if (!c->setBlockIndexCandidates.value_comp()(pindex, c->m_chain.Tip()) && !c->setBlockIndexCandidates.contains(pindex)) {
                     if (pindexFirstInvalid == nullptr) {
                         if (!c->TargetBlock() || c->TargetBlock()->GetAncestor(pindex->nHeight) == pindex) {
                             assert(foundInUnlinked);

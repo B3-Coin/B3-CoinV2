@@ -245,6 +245,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/fn_pod.cpp
   node/legacy_fn_issuance.cpp
   node/stake_registry.cpp
+  node/stake_tracker.cpp
   node/utxo_commitment.cpp
   node/utxo_equivalence_check.cpp
   node/utxo_rows.cpp

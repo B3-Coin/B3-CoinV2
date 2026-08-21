@@ -184,6 +184,13 @@ public:
      */
     int64_t m_legacy_money_supply{0};
     int64_t m_legacy_fn_integrated{0};
+    /**
+     * Modern-PoS eligibility digest of this block — the next height's seed
+     * in the frozen V1 seed chain (spec §3). Null outside the modern-PoS
+     * phase and for blocks not yet connected. Persisted with the legacy
+     * index fields so a restart never recomputes seeds from block bodies.
+     */
+    uint256 m_modern_pos_digest{};
 
     //! (memory only) Sequential id assigned to distinguish order in which blocks are received.
     //! Initialized to SEQ_ID_INIT_FROM_DISK{1} when loading blocks from disk, except for blocks
@@ -405,6 +412,7 @@ public:
         READWRITE(obj.m_legacy_hash_proof);
         READWRITE(obj.m_legacy_money_supply);
         READWRITE(obj.m_legacy_fn_integrated);
+        READWRITE(obj.m_modern_pos_digest);
     }
 
     uint256 ConstructBlockHash(const Consensus::Params& consensus_params) const
