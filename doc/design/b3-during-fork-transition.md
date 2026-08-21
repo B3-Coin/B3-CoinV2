@@ -176,20 +176,24 @@ no administrator list, no operator committee, no self-authorizing first PoS
 block. Then M: registry → modern VRF/eligibility → eligible proposer(s) →
 first modern-PoS block.
 
-## 6. Corridor difficulty (analysis; numerics OPEN)
+## 6. Corridor difficulty (MECHANISM RULED 2026-08-21; value OPEN)
 
-Preference: existing PoW primitive + a simple transition-specific policy.
-To analyze before locking: target block interval; the initial P0 target
-(there is no meaningful prior scrypt hashrate to inherit — the last PoW
-observation is from height 500, years stale); retarget frequency and
-response speed (the historical per-block exponential filter is the
-candidate; its 2-hour timespan may be too slow for a 4-day corridor whose
-hashrate can swing by orders of magnitude); minimum/maximum target;
-timestamp interaction; very-low-hashrate behavior (corridor must not stall
-for days on an overshot target) and very-high-hashrate behavior (rented
-scrypt bursts compressing the corridor to minutes). Do not blindly reuse
-the first-500-block schedule; do not invent complexity beyond a simple
-corridor policy.
+**Owner ruling (2026-08-21): NO retarget — one fixed constant difficulty
+for the whole corridor.** The corridor is a transition, not a mining era,
+and must not be complicated to optimize it. This is exactly what the
+implementation enforces (`transition_pow_bits`, compared for equality on
+every corridor header, fail-closed while unset), so the ruling locks the
+shipped mechanism. A retargeting alternative was considered and rejected
+by the owner.
+
+Consequences, accepted with the ruling: corridor wall-clock duration is
+set by real hashrate against the constant target (high hashrate
+compresses it, low hashrate stretches it); there is no adjustment. The
+earlier retarget analysis above is superseded. **Still OPEN: the constant
+value itself** — one compact-bits number, chosen at mainnet H/X pinning
+time (inert before then), balancing "cheap enough that the corridor
+cannot stall" against "expensive enough that its duration gives holders a
+real staking window".
 
 ## 7. Corridor security (concrete questions; mitigations OPEN)
 
