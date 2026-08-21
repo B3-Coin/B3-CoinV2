@@ -4,6 +4,9 @@
 
 #include <core_io.h>
 
+#include <consensus/params.h>
+#include <legacy/codec.h>
+
 #include <addresstype.h>
 #include <coins.h>
 #include <consensus/amount.h>
@@ -260,6 +263,20 @@ bool DecodeHexBlk(CBlock& block, const std::string& strHexBlk)
         return false;
     }
 
+    return true;
+}
+
+bool DecodeHexBlk(CBlock& block, const std::string& strHexBlk, const Consensus::Params& params)
+{
+    if (!params.legacy_b3coin) return DecodeHexBlk(block, strHexBlk);
+    if (!IsHex(strHexBlk)) return false;
+
+    const std::vector<unsigned char> block_data{ParseHex(strHexBlk)};
+    try {
+        SpanReader{block_data} >> legacy::TX_LEGACY(block);
+    } catch (const std::exception&) {
+        return false;
+    }
     return true;
 }
 
