@@ -164,9 +164,9 @@ BOOST_AUTO_TEST_CASE(end_to_end_solvency_against_the_vault_checker)
     vault_prev.asset = AssetX();
     vault_prev.amount = 1000;
     vault_prev.policy_type = static_cast<uint16_t>(modern::PolicyType::DEX_VAULT);
-    vault_prev.policy_version = modern::POLICY_VERSION_V1;
+    vault_prev.policy_version = modern::DEX_VAULT_POLICY_VERSION_V2;
     vault_prev.policy_commitment = VAULT;
-    vault_prev.policy_params = {0x00, 0x00};
+    vault_prev.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_POOL_CHANGE, 0);
 
     modern::ModernOutput payout;
     payout.asset = AssetX();
@@ -177,14 +177,14 @@ BOOST_AUTO_TEST_CASE(end_to_end_solvency_against_the_vault_checker)
 
     modern::ModernOutput change{vault_prev};
     change.amount = 600;
-    change.policy_params = {0x01, 0x00};
+    change.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_POOL_CHANGE, 1);
 
     modern::ModernTransition t;
     t.inputs.resize(1);
     t.inputs[0].prevout = COutPoint{Txid::FromUint256(uint256{"00000000000000000000000000000000000000000000000000000000000000e0"}), 0};
     modern::TransitionProof proof;
     proof.proof_type = static_cast<uint16_t>(modern::PolicyType::DEX_VAULT);
-    proof.proof_version = modern::POLICY_VERSION_V1;
+    proof.proof_version = modern::DEX_VAULT_POLICY_VERSION_V2; // proofs pair with the v2 policy
     VectorWriter writer{proof.payload, 0};
     writer << std::vector<uint256>{receipt->receipt_id};
     t.proofs.push_back(proof);

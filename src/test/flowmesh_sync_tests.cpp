@@ -1844,4 +1844,55 @@ BOOST_AUTO_TEST_CASE(codex_final_blockers)
     }
 }
 
+
+//! Owner ruling 2026-08-22 (certificate finality): a valid threshold
+//! certificate finalizes a sequence; a SECOND valid certificate over a
+//! DIFFERENT microblock for an already-committed sequence is recorded as
+//! evidence and fail-safe halts the node — never silently ignored. A
+//! duplicate of the committed entry stays harmless; an invalid conflicting
+//! certificate is junk, not evidence.
+BOOST_AUTO_TEST_CASE(conflicting_valid_certificate_is_evidence_and_halts)
+{
+    MeshNet net{3, /*f=*/0};
+    const CertifiedEntry e0{net.RunRound({})};
+    const uint64_t s{e0.mb.sequence};
+    for (auto& node : net.nodes) BOOST_CHECK(!node->Halted());
+
+    // A duplicate of the committed entry: harmless, still not halted.
+    BOOST_CHECK(net.nodes[0]->HandleCertified(e0));
+    BOOST_CHECK(!net.nodes[0]->Halted());
+    BOOST_CHECK(net.nodes[0]->ConflictEvidence().empty());
+
+    // A different microblock at the same sequence, certified by the full
+    // seat set: a genuine conflict.
+    CertifiedEntry conflict{e0};
+    conflict.mb.result_commitment = uint256::ONE; // any content difference
+    const uint256 other_hash{conflict.mb.GetHash()};
+    BOOST_REQUIRE(other_hash != e0.mb.GetHash());
+    std::vector<flowmesh::Attestation> atts;
+    for (const CKey& key : net.keys) {
+        const auto a{flowmesh::SignAttestation(key, MESH_DOMAIN, s, other_hash)};
+        BOOST_REQUIRE(a.has_value());
+        atts.push_back(*a);
+    }
+    conflict.cert = flowmesh::AssembleCertificate(other_hash, s, atts);
+
+    // Same conflicting bytes but with a broken certificate: junk, ignored.
+    CertifiedEntry junk{conflict};
+    junk.cert.attestations.clear();
+    BOOST_CHECK(!net.nodes[1]->HandleCertified(junk));
+    BOOST_CHECK(!net.nodes[1]->Halted());
+    BOOST_CHECK(net.nodes[1]->ConflictEvidence().empty());
+
+    // The valid conflict: evidence recorded, fail-safe halt.
+    BOOST_CHECK(!net.nodes[0]->HandleCertified(conflict));
+    BOOST_CHECK(net.nodes[0]->Halted());
+    BOOST_REQUIRE_EQUAL(net.nodes[0]->ConflictEvidence().size(), 1U);
+    BOOST_CHECK_EQUAL(net.nodes[0]->ConflictEvidence()[0].sequence, s);
+    BOOST_CHECK(net.nodes[0]->ConflictEvidence()[0].committed_hash == e0.mb.GetHash());
+    BOOST_CHECK(net.nodes[0]->ConflictEvidence()[0].conflicting.microblock_hash == other_hash);
+    // Halted nodes refuse further work.
+    BOOST_CHECK(!net.nodes[0]->HandleCertified(e0));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

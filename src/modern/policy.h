@@ -15,6 +15,7 @@
 #include <uint256.h>
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace modern {
@@ -102,6 +103,20 @@ enum class PolicyType : uint16_t {
 };
 
 //! DEX_VAULT v1 params: exactly a little-endian 2-byte shard id.
+//! DEX_VAULT v2 params (owner ruling 2026-08-22): {kind u8, shard u16 LE,
+//! [flowmesh_account_id 32]}. Two kinds under ONE keyless vault policy:
+//!   USER_DEPOSIT      — carries the FlowMesh account id; may credit that
+//!                       account exactly once (35 bytes);
+//!   VAULT_POOL_CHANGE — no beneficiary; withdrawal change and pooled
+//!                       custody; can NEVER create a FlowMesh balance (3 bytes).
+//! The v1 shard-only form (2 bytes) is retired: it is no longer an
+//! activated policy version (no output of it ever existed on mainnet).
+inline constexpr uint8_t VAULT_KIND_USER_DEPOSIT{1};
+inline constexpr uint8_t VAULT_KIND_POOL_CHANGE{2};
+inline constexpr size_t VAULT_POOL_CHANGE_PARAMS_SIZE{3};
+inline constexpr size_t VAULT_USER_DEPOSIT_PARAMS_SIZE{35};
+inline constexpr uint16_t DEX_VAULT_POLICY_VERSION_V2{2};
+//! Retired v1 shard-only params size, kept only so old tests/docs read.
 inline constexpr size_t VAULT_SHARD_PARAMS_SIZE{2};
 
 //! STAKE v1 params: the 32-byte validator key plus 2 reserved bytes that
@@ -147,14 +162,19 @@ struct ModernOutput {
 inline bool IsActivatedPolicy(const uint16_t policy_type, const uint16_t policy_version,
                               const bool assets_active = false)
 {
+    // DEX_VAULT lives at v2 (kind/shard/account params, owner ruling
+    // 2026-08-22); its v1 shard-only form is retired. Every other policy is
+    // v1 only.
+    if (policy_type == static_cast<uint16_t>(PolicyType::DEX_VAULT)) {
+        return policy_version == DEX_VAULT_POLICY_VERSION_V2 && assets_active;
+    }
     if (policy_version != POLICY_VERSION_V1) return false;
     if (policy_type == static_cast<uint16_t>(PolicyType::LEGACY_LOCK) ||
         policy_type == static_cast<uint16_t>(PolicyType::OWNER) ||
         policy_type == static_cast<uint16_t>(PolicyType::STAKE)) {
         return true;
     }
-    if (policy_type == static_cast<uint16_t>(PolicyType::BURN) ||
-        policy_type == static_cast<uint16_t>(PolicyType::DEX_VAULT)) {
+    if (policy_type == static_cast<uint16_t>(PolicyType::BURN)) {
         return assets_active;
     }
     return false;
@@ -175,6 +195,50 @@ enum class PolicyOutputCheck {
  * Policy outputs exist only in the modern era; in the legacy era they are
  * invalid outright.
  */
+//! Parsed DEX_VAULT v2 params. `account` is set only for USER_DEPOSIT.
+struct VaultParams {
+    uint8_t kind{0};
+    uint16_t shard{0};
+    std::optional<uint256> account;
+};
+
+//! Strict parse of DEX_VAULT v2 params: exactly {kind, shard LE} for
+//! VAULT_POOL_CHANGE (3 bytes) or {kind, shard LE, account} for
+//! USER_DEPOSIT (35 bytes, non-null account). Anything else is invalid.
+inline std::optional<VaultParams> ParseVaultParams(const std::vector<unsigned char>& params)
+{
+    if (params.size() != VAULT_POOL_CHANGE_PARAMS_SIZE &&
+        params.size() != VAULT_USER_DEPOSIT_PARAMS_SIZE) {
+        return std::nullopt;
+    }
+    VaultParams out;
+    out.kind = params[0];
+    out.shard = static_cast<uint16_t>(params[1] | (params[2] << 8));
+    if (out.kind == VAULT_KIND_POOL_CHANGE) {
+        if (params.size() != VAULT_POOL_CHANGE_PARAMS_SIZE) return std::nullopt;
+        return out;
+    }
+    if (out.kind == VAULT_KIND_USER_DEPOSIT) {
+        if (params.size() != VAULT_USER_DEPOSIT_PARAMS_SIZE) return std::nullopt;
+        uint256 account;
+        std::copy(params.begin() + 3, params.end(), account.begin());
+        if (account.IsNull()) return std::nullopt;
+        out.account = account;
+        return out;
+    }
+    return std::nullopt;
+}
+
+//! Build DEX_VAULT v2 params for either kind.
+inline std::vector<unsigned char> MakeVaultParams(const uint8_t kind, const uint16_t shard,
+                                                  const uint256& account = uint256{})
+{
+    std::vector<unsigned char> params{kind, static_cast<unsigned char>(shard & 0xff),
+                                      static_cast<unsigned char>(shard >> 8)};
+    if (kind == VAULT_KIND_USER_DEPOSIT) params.insert(params.end(), account.begin(), account.end());
+    return params;
+}
+
 inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int height,
                                            const Consensus::Params& params)
 {
@@ -208,11 +272,11 @@ inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int he
         if (!out.policy_commitment.IsNull()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
         break;
     case PolicyType::DEX_VAULT:
-        // The commitment names the approved vault; params carry the shard.
+        // v2: the commitment names the approved vault; params carry
+        // {kind, shard, [account]} — USER_DEPOSIT with a 32-byte FlowMesh
+        // account id, or VAULT_POOL_CHANGE with no beneficiary.
         if (out.policy_commitment.IsNull()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
-        if (out.policy_params.size() != VAULT_SHARD_PARAMS_SIZE) {
-            return PolicyOutputCheck::BAD_POLICY_PARAMS;
-        }
+        if (!ParseVaultParams(out.policy_params)) return PolicyOutputCheck::BAD_POLICY_PARAMS;
         break;
     case PolicyType::STAKE: {
         // Locked NATIVE B3 carrying a validator binding: a POSITIVE

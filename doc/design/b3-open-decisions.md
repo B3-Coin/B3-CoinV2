@@ -164,7 +164,19 @@ state is impossible.
 
 ---
 
-## OD-6 — FlowMesh epoch ↔ B3 finality relationship
+## OD-6 — FlowMesh epoch ↔ B3 finality relationship — **RULED 2026-08-22**
+
+`FLOWMESH_ANCHOR_DEPTH = 30` blocks (~30 min at the 60 s interval) governs
+deposit recognition, anchor acceptance, and receipt redeemability alike;
+distinct from `MODERN_REORG_HORIZON = 1440`. Certificate finality (yes,
+FlowMesh-state only, conflicting certificate = evidence + fail-safe halt),
+the keyless receipt-vault (ratified, redeemability = certified ∧ anchor
+canonical ∧ buried ≥ depth ∧ not consumed), and the DEX_VAULT v2 beneficiary
+binding (USER_DEPOSIT vs VAULT_POOL_CHANGE) are recorded in
+[b3-flowmesh-dex-decisions.md](b3-flowmesh-dex-decisions.md) §3b. The text
+below is the pre-ruling statement of the question.
+
+## OD-6 (original statement)
 
 Contract §39 requires microblocks/epochs to be anchored to B3 rather than forming an
 independent history, but the binding is unspecified: the relationship between a FlowMesh

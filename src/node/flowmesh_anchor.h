@@ -26,6 +26,18 @@ namespace node {
  * FlowMesh consulting this policy can stall when B3 stalls, never the
  * reverse: nothing here is reachable from B3 validation.
  */
+/**
+ * FLOWMESH_ANCHOR_DEPTH — RATIFIED (owner ruling 2026-08-22): 30 blocks,
+ * ~30 minutes at the 60-second Modern-PoS interval. The SAME depth governs
+ * recognizing B3 deposits, accepting microblock anchors, and making
+ * certified withdrawal receipts redeemable on B3. Deliberately distinct
+ * from MODERN_REORG_HORIZON (1440): this depth protects FlowMesh custody
+ * against ordinary recent B3 reorgs; the horizon prevents deep Modern-PoS
+ * chain replacement. Production wiring passes this constant to
+ * ChainAnchorPolicy; fixtures may still pass small scaffolding depths.
+ */
+inline constexpr int FLOWMESH_ANCHOR_DEPTH{30};
+
 class ChainAnchorPolicy final : public flowmesh::AnchorPolicy
 {
 public:

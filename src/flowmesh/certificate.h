@@ -222,6 +222,16 @@ struct AttestationEquivocation {
     Attestation second;
 };
 
+//! Evidence that TWO valid threshold certificates exist for one sequence
+//! over different microblocks — a violation of the honest-lock + quorum
+//! assumption. Owner ruling 2026-08-22: it is recorded and causes a
+//! fail-safe halt; it is never silently ignored.
+struct CertificateConflict {
+    uint64_t sequence{0};
+    uint256 committed_hash;
+    MicroblockCertificate conflicting;
+};
+
 inline std::optional<AttestationEquivocation> DetectEquivocation(
     const uint256& domain, const uint64_t sequence, const uint256& hash_a, const Attestation& a,
     const uint256& hash_b, const Attestation& b)

@@ -162,8 +162,12 @@ inline VaultCheck CheckVaultWithdrawal(const std::vector<ModernOutput>& prev_out
     std::map<std::pair<AssetId, uint256>, CAmount> owner_paid;
     for (const ModernOutput& out : t.outputs) {
         if (out.policy_type == static_cast<uint16_t>(PolicyType::DEX_VAULT)) {
-            // All remainder returns to the approved vault, on any shard.
+            // All remainder returns to the approved vault, on any shard, and
+            // ONLY as VAULT_POOL_CHANGE: withdrawal change must never be
+            // mistakable for a user deposit (owner ruling 2026-08-22).
             if (out.policy_commitment != vault_commitment) return VaultCheck::CHANGE_MISMATCH;
+            const auto vp{ParseVaultParams(out.policy_params)};
+            if (!vp || vp->kind != VAULT_KIND_POOL_CHANGE) return VaultCheck::CHANGE_MISMATCH;
             CAmount& sum{vault_change[out.asset]};
             if (out.amount > MAX_MONEY - sum) return VaultCheck::AMOUNT_OVERFLOW;
             sum += out.amount;

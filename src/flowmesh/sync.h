@@ -230,6 +230,7 @@ enum class MeshHalt : uint8_t {
     PERSIST_FAILED = 2,      // durable record failed; live tip must not advance
     LOCK_JOURNAL_FAILED = 3, // could not journal (or CAS-conflicted) a lock
     ANCHOR_INVALIDATED = 4,  // committed history relies on a non-canonical B3 anchor
+    CERTIFICATE_CONFLICT = 5, // a second VALID certificate exists for a committed sequence
 };
 
 class MeshNode
@@ -329,6 +330,8 @@ public:
     const uint256& LastHash() const { return m_last_hash; }
     ActionPool& Pool() { return m_pool; }
     const std::vector<AttestationEquivocation>& Evidence() const { return m_evidence; }
+    //! Conflicting valid certificates seen for committed sequences (halts).
+    const std::vector<CertificateConflict>& ConflictEvidence() const { return m_conflicts; }
     uint32_t CurrentRound() const { return m_guard.CurrentRound(Sequence()); }
     MeshHalt Halt() const { return m_halt; }
     bool Halted() const { return m_halt != MeshHalt::NONE; }
@@ -527,7 +530,27 @@ public:
     {
         if (Halted()) return false;
         const uint64_t seq{Sequence()};
-        if (entry.mb.sequence < seq) return true;  // stale; already final locally
+        if (entry.mb.sequence < seq) {
+            // Already final locally. A duplicate of what we committed is
+            // harmless; a DIFFERENT microblock under a VALID certificate for
+            // the same sequence is a conflict: record it and fail safe
+            // (owner ruling 2026-08-22 — never silently ignored).
+            const uint256 hash{entry.mb.GetHash()};
+            const uint64_t s{entry.mb.sequence};
+            if (s >= m_history_base && s < m_history_base + m_history.size()) {
+                const CertifiedEntry& committed{m_history[static_cast<size_t>(s - m_history_base)]};
+                if (committed.mb.GetHash() == hash) return true;
+                if (entry.cert.microblock_hash == hash && entry.cert.sequence == s &&
+                    CheckCertificate(entry.cert, m_config.domain, m_config.seats,
+                                     m_config.threshold) == CertificateCheck::OK) {
+                    m_conflicts.push_back(CertificateConflict{s, committed.mb.GetHash(), entry.cert});
+                    m_halt = MeshHalt::CERTIFICATE_CONFLICT;
+                    return false;
+                }
+                return false; // different hash but not a valid certificate: junk
+            }
+            return true; // beyond retained history: cannot adjudicate, treat as stale
+        }
         if (entry.mb.sequence > seq) return false; // missing parents: catch up first
         if (!RecheckCommittedAnchors()) return false; // orphaned base: halt, no execution
         const uint256 hash{entry.mb.GetHash()};
@@ -665,6 +688,7 @@ private:
     //! forget the dependencies needed to detect a later B3 reorg.
     std::map<std::pair<int32_t, uint256>, uint64_t> m_committed_anchors;
     std::vector<AttestationEquivocation> m_evidence;
+    std::vector<CertificateConflict> m_conflicts;
 };
 
 } // namespace flowmesh

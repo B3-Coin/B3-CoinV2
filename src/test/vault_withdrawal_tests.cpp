@@ -85,10 +85,18 @@ modern::ModernOutput VaultOut(const modern::AssetId& asset, const CAmount amount
     out.asset = asset;
     out.amount = amount;
     out.policy_type = static_cast<uint16_t>(modern::PolicyType::DEX_VAULT);
-    out.policy_version = modern::POLICY_VERSION_V1;
+    out.policy_version = modern::DEX_VAULT_POLICY_VERSION_V2;
     out.policy_commitment = commitment;
-    out.policy_params = {static_cast<unsigned char>(shard & 0xff),
-                         static_cast<unsigned char>(shard >> 8)};
+    out.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_POOL_CHANGE, shard);
+    return out;
+}
+
+//! A USER_DEPOSIT-kind vault output (carries a FlowMesh account id).
+modern::ModernOutput UserDepositOut(const modern::AssetId& asset, const CAmount amount,
+                                    const uint256& account, const uint16_t shard = 0)
+{
+    modern::ModernOutput out{VaultOut(asset, amount, shard)};
+    out.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_USER_DEPOSIT, shard, account);
     return out;
 }
 
@@ -122,7 +130,7 @@ modern::TransitionProof VaultProof(std::vector<uint256> ids)
     std::sort(ids.begin(), ids.end());
     modern::TransitionProof proof;
     proof.proof_type = static_cast<uint16_t>(modern::PolicyType::DEX_VAULT);
-    proof.proof_version = modern::POLICY_VERSION_V1;
+    proof.proof_version = modern::DEX_VAULT_POLICY_VERSION_V2; // proofs pair with the v2 policy
     VectorWriter writer{proof.payload, 0};
     writer << ids;
     return proof;
@@ -343,6 +351,35 @@ BOOST_AUTO_TEST_CASE(vault_is_fail_closed_and_burn_is_unspendable)
     BOOST_CHECK(modern::CheckVaultWithdrawal(
                     owner_prevs, Withdrawal(owner_prevs, {ID1}, {OwnerOut(Asset(), 10, DEST_B)}),
                     receipts, MODERN_HEIGHT, active_params) == modern::VaultCheck::NO_VAULT_INPUT);
+}
+
+
+//! Owner ruling 2026-08-22: withdrawal change must return as
+//! VAULT_POOL_CHANGE — never as a USER_DEPOSIT-shaped output that a deposit
+//! verifier could mistake for a fresh deposit. USER_DEPOSIT outputs are
+//! spendable vault INPUTS like any other shard of the same vault.
+BOOST_AUTO_TEST_CASE(change_is_pool_change_never_a_user_deposit)
+{
+    const Consensus::Params params{B3ParamsActive()};
+    const uint256 account{uint256{"00000000000000000000000000000000000000000000000000000000000000a1"}};
+    const uint256 rid{uint256{"00000000000000000000000000000000000000000000000000000000000000c9"}};
+    MockReceipts receipts;
+    receipts.m_finalized[rid] = Receipt(rid, Asset(), 400, DEST_A);
+
+    // One USER_DEPOSIT-kind input (Alice's deposit) and one pool-change
+    // input spend together; change comes back as POOL_CHANGE: OK.
+    const std::vector<modern::ModernOutput> prevs{UserDepositOut(Asset(), 700, account, 1),
+                                                  VaultOut(Asset(), 300, 2)};
+    std::vector<uint256> consumed;
+    BOOST_CHECK(modern::CheckVaultWithdrawal(
+                    prevs, Withdrawal(prevs, {rid}, {OwnerOut(Asset(), 400, DEST_A), VaultOut(Asset(), 600, 5)}),
+                    receipts, MODERN_HEIGHT, params, &consumed) == modern::VaultCheck::OK);
+
+    // The same spend returning change as a USER_DEPOSIT is refused.
+    BOOST_CHECK(modern::CheckVaultWithdrawal(
+                    prevs,
+                    Withdrawal(prevs, {rid}, {OwnerOut(Asset(), 400, DEST_A), UserDepositOut(Asset(), 600, account, 5)}),
+                    receipts, MODERN_HEIGHT, params) == modern::VaultCheck::CHANGE_MISMATCH);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

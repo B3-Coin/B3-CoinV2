@@ -81,9 +81,17 @@ inline constexpr uint64_t LEDGER_SNAPSHOT_MAX_ENTRIES{uint64_t{1} << 22};
  *                             provisional — certificate ==
  *                             irreversible finality is an unresolved
  *                             owner decision);
- *     B3_FINAL / REDEEMABLE — requires the OWNER-DECIDED trustless B3
- *                             vault authorization; NOTHING in this
- *                             codebase reports a request as redeemable;
+ *     B3_FINAL / REDEEMABLE — RULE DECIDED (owner, 2026-08-22): the
+ *                             receipt exists in a certified microblock
+ *                             AND its B3 anchor is still canonical AND
+ *                             that anchor is buried >= FLOWMESH_ANCHOR_DEPTH
+ *                             (30) AND the receipt_id is not yet consumed.
+ *                             On redemption: amount -> user destination,
+ *                             remainder -> DEX_VAULT(VAULT_POOL_CHANGE),
+ *                             receipt_id consumed exactly once. The
+ *                             production FinalizedReceiptView implementing
+ *                             this is wiring still to land; NOTHING in this
+ *                             codebase reports a request as redeemable yet;
  *     CONSUMED              — ConsumeRequest(): the on-chain vault
  *                             spend removed custody and liability
  *                             together (exercised by tests only).
