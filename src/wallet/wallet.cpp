@@ -27,6 +27,7 @@
 #include <key.h>
 #include <key_io.h>
 #include <logging.h>
+#include <modern/stake.h>
 #include <node/types.h>
 #include <outputtype.h>
 #include <policy/feerate.h>
@@ -1642,8 +1643,10 @@ bool CWallet::IsMine(const CScript& script) const
 {
     AssertLockHeld(cs_wallet);
 
+    // B3 STAKE carrier: ownership is decided by the bare owner script.
+    const auto stake_owner{modern::StakeOwnerScript(script)};
     // Search the cache so that IsMine is called only on the relevant SPKMs instead of on everything in m_spk_managers
-    const auto& it = m_cached_spks.find(script);
+    const auto& it = m_cached_spks.find(stake_owner ? *stake_owner : script);
     if (it != m_cached_spks.end()) {
         bool res = false;
         for (const auto& spkm : it->second) {
@@ -3438,7 +3441,9 @@ std::set<ScriptPubKeyMan*> CWallet::GetScriptPubKeyMans(const CScript& script) c
     std::set<ScriptPubKeyMan*> spk_mans;
 
     // Search the cache for relevant SPKMs instead of iterating m_spk_managers
-    const auto& it = m_cached_spks.find(script);
+    // (a B3 STAKE carrier is looked up by its bare owner script).
+    const auto stake_owner{modern::StakeOwnerScript(script)};
+    const auto& it = m_cached_spks.find(stake_owner ? *stake_owner : script);
     if (it != m_cached_spks.end()) {
         spk_mans.insert(it->second.begin(), it->second.end());
     }
@@ -3465,7 +3470,9 @@ std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& scri
 std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& script, SignatureData& sigdata) const
 {
     // Search the cache for relevant SPKMs instead of iterating m_spk_managers
-    const auto& it = m_cached_spks.find(script);
+    // (a B3 STAKE carrier is looked up by its bare owner script).
+    const auto stake_owner{modern::StakeOwnerScript(script)};
+    const auto& it = m_cached_spks.find(stake_owner ? *stake_owner : script);
     if (it != m_cached_spks.end()) {
         // All spkms for a given script must already be able to make a SigningProvider for the script, so just return the first one.
         Assume(it->second.at(0)->CanProvide(script, sigdata));
@@ -3473,6 +3480,65 @@ std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& scri
     }
 
     return nullptr;
+}
+
+std::optional<CPubKey> CWallet::GetValidatorPubKey() const
+{
+    AssertLockHeld(cs_wallet);
+    return m_b3_validator_pubkey;
+}
+
+void CWallet::LoadValidatorPubKey(const CPubKey& pubkey)
+{
+    AssertLockHeld(cs_wallet);
+    m_b3_validator_pubkey = pubkey;
+}
+
+util::Result<CPubKey> CWallet::GetOrCreateValidatorKey()
+{
+    AssertLockHeld(cs_wallet);
+    if (m_b3_validator_pubkey) return *m_b3_validator_pubkey;
+    if (!IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) return util::Error{_("A validator key requires a descriptor wallet")};
+    if (IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) return util::Error{_("This wallet has private keys disabled")};
+    if (IsLocked()) return util::Error{_("The wallet is locked; unlock it to create the validator key")};
+
+    // A fresh key held by the wallet itself through a single-key pk()
+    // descriptor (never activated for addresses): persistence, encryption
+    // and unlocking are the wallet's ordinary machinery. The 33-byte public
+    // key is recorded so the key can be found again; the consensus validator
+    // identity is its x-only form.
+    CKey key;
+    key.MakeNewKey(/*fCompressed=*/true);
+    FlatSigningProvider provider;
+    std::string error;
+    auto descs{Parse("pk(" + EncodeSecret(key) + ")", provider, error, /*require_checksum=*/false)};
+    if (descs.size() != 1) return util::Error{Untranslated(strprintf("validator descriptor: %s", error))};
+    WalletDescriptor w_desc(std::move(descs.at(0)), GetTime(), /*range_start=*/0, /*range_end=*/0, /*next_index=*/0);
+    auto spkm{AddWalletDescriptor(w_desc, provider, "b3-validator", /*internal=*/false)};
+    if (!spkm) return util::Error{util::ErrorString(spkm)};
+
+    const CPubKey pubkey{key.GetPubKey()};
+    WalletBatch batch(GetDatabase());
+    if (!batch.WriteB3ValidatorPubKey(pubkey)) return util::Error{_("Failed to write the validator key record")};
+    m_b3_validator_pubkey = pubkey;
+    WalletLogPrintf("Created B3 validator key %s\n", HexStr(XOnlyPubKey{pubkey}));
+    return pubkey;
+}
+
+util::Result<CKey> CWallet::GetValidatorSecret() const
+{
+    AssertLockHeld(cs_wallet);
+    if (!m_b3_validator_pubkey) return util::Error{_("This wallet has no validator key yet (createstake or startstaking creates one)")};
+    if (IsLocked()) return util::Error{_("The wallet is locked; unlock it to use the validator key")};
+    const CScript script{GetScriptForRawPubKey(*m_b3_validator_pubkey)};
+    for (ScriptPubKeyMan* spkm : GetScriptPubKeyMans(script)) {
+        auto* desc_spkm{dynamic_cast<DescriptorScriptPubKeyMan*>(spkm)};
+        if (!desc_spkm) continue;
+        const auto provider{desc_spkm->GetSigningProviderWithPrivateKeys(script)};
+        CKey key;
+        if (provider && provider->GetKey(m_b3_validator_pubkey->GetID(), key) && key.IsValid()) return key;
+    }
+    return util::Error{_("The validator key's descriptor is missing from this wallet")};
 }
 
 std::vector<WalletDescriptor> CWallet::GetWalletDescriptors(const CScript& script) const

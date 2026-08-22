@@ -434,6 +434,9 @@ private:
     //! Cache of descriptor ScriptPubKeys used for IsMine. Maps ScriptPubKey to set of spkms
     std::unordered_map<CScript, std::vector<ScriptPubKeyMan*>, SaltedSipHasher> m_cached_spks;
 
+    //! B3 validator public key (see GetValidatorPubKey); unset until created.
+    std::optional<CPubKey> m_b3_validator_pubkey GUARDED_BY(cs_wallet);
+
     //! Set of both spent and unspent transaction outputs owned by this wallet
     std::unordered_map<COutPoint, WalletTXO, SaltedOutpointHasher> m_txos GUARDED_BY(cs_wallet);
 
@@ -969,6 +972,23 @@ public:
 
     //! Get the wallet descriptors for a script.
     std::vector<WalletDescriptor> GetWalletDescriptors(const CScript& script) const;
+
+    /**
+     * B3 Modern PoS validator key (release-v1 ruling 2026-08-23: one
+     * wallet-held validator key, nothing more advanced in V1). The key is
+     * held through a non-active single-key pk() descriptor; its public key
+     * is recorded in the wallet database; its x-only form is the consensus
+     * validator identity carried by this wallet's STAKE outputs and used to
+     * sign modern-PoS blocks.
+     */
+    std::optional<CPubKey> GetValidatorPubKey() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! The existing key, or a freshly created one (requires an unlocked
+    //! descriptor wallet with private keys).
+    util::Result<CPubKey> GetOrCreateValidatorKey() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! The secret key (requires an unlocked wallet); used to start staking.
+    util::Result<CKey> GetValidatorSecret() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Database load hook.
+    void LoadValidatorPubKey(const CPubKey& pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Get the LegacyScriptPubKeyMan which is used for all types, internal, and external.
     LegacyDataSPKM* GetLegacyDataSPKM() const;

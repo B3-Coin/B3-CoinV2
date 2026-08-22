@@ -315,6 +315,13 @@ private:
     mutable std::map<int32_t, FlatSigningProvider> m_map_signing_providers;
     // Fetch the SigningProvider for the given script and optionally include private keys
     std::unique_ptr<FlatSigningProvider> GetSigningProvider(const CScript& script, bool include_private = false) const;
+
+public:
+    //! B3: the signing provider WITH private keys for one of this manager's
+    //! scripts (the wallet's validator-key lookup; requires an unlocked
+    //! wallet to actually contain the key).
+    std::unique_ptr<FlatSigningProvider> GetSigningProviderWithPrivateKeys(const CScript& script) const;
+private:
     // Fetch the SigningProvider for a given index and optionally include private keys. Called by the above functions.
     std::unique_ptr<FlatSigningProvider> GetSigningProvider(int32_t index, bool include_private = false) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 

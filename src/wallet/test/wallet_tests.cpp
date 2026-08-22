@@ -3,6 +3,10 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <wallet/wallet.h>
+#include <coins.h>
+#include <script/interpreter.h>
+#include <script/sign.h>
+#include <modern/stake.h>
 
 #include <cstdint>
 #include <future>
@@ -721,6 +725,111 @@ BOOST_FIXTURE_TEST_CASE(RemoveTxs, TestChain100Setup)
     }
 
     TestUnloadWallet(std::move(wallet));
+}
+
+//! B3 validator key + STAKE outputs (release-v1 validator UX): the wallet
+//! creates and persists one validator key; a STAKE carrier whose bare owner
+//! script is ours IS ours (standard, solvable, signable = unstakeable), a
+//! carrier with a witness owner is not; and STAKE outputs are never
+//! auto-selected for ordinary spends.
+BOOST_FIXTURE_TEST_CASE(b3_validator_key_and_stake_outputs, TestChain100Setup)
+{
+    std::unique_ptr<CWallet> wallet;
+    {
+        LOCK(cs_main);
+        wallet = CreateSyncedWallet(*m_node.chain, m_node.chainman->ActiveChain(), coinbaseKey);
+    }
+    const CTxDestination owner{PKHash(coinbaseKey.GetPubKey())};
+    std::array<unsigned char, 32> validator_id{};
+    validator_id.fill(0x42);
+    const CScript stake_script{modern::MakeStakeScript(validator_id, GetScriptForDestination(owner))};
+    const CScript witness_owner_stake{modern::MakeStakeScript(validator_id, GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey())))};
+
+    {
+        LOCK(wallet->cs_wallet);
+        // Validator key: created once, recorded, secret recoverable.
+        BOOST_CHECK(!wallet->GetValidatorPubKey().has_value());
+        const auto created{wallet->GetOrCreateValidatorKey()};
+        BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+        BOOST_CHECK(wallet->GetValidatorPubKey() == *created);
+        const auto again{wallet->GetOrCreateValidatorKey()};
+        BOOST_REQUIRE(again);
+        BOOST_CHECK(*again == *created);
+        const auto secret{wallet->GetValidatorSecret()};
+        BOOST_REQUIRE_MESSAGE(secret, util::ErrorString(secret).original);
+        BOOST_CHECK(secret->GetPubKey() == *created);
+
+        // Ownership and standardness through the carrier.
+        BOOST_CHECK(wallet->IsMine(CTxOut{COIN, stake_script}));
+        BOOST_CHECK(!wallet->IsMine(CTxOut{COIN, witness_owner_stake}));
+        std::vector<std::vector<unsigned char>> solutions;
+        BOOST_CHECK(Solver(stake_script, solutions) == TxoutType::PUBKEYHASH);
+        BOOST_CHECK(Solver(witness_owner_stake, solutions) == TxoutType::NONSTANDARD);
+        TxoutType type;
+        BOOST_CHECK(IsStandard(stake_script, type));
+        CTxDestination dest;
+        BOOST_CHECK(ExtractDestination(stake_script, dest));
+        BOOST_CHECK(dest == owner);
+
+        // Unstake = an ordinary spend the wallet can sign (scriptCode is the full carrier).
+        CMutableTransaction spend;
+        spend.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0});
+        spend.vout.emplace_back(COIN - 1000, GetScriptForDestination(owner));
+        std::map<COutPoint, Coin> coins;
+        coins[spend.vin[0].prevout] = Coin{CTxOut{COIN, stake_script}, /*nHeightIn=*/1, /*fCoinBaseIn=*/false};
+        std::map<int, bilingual_str> input_errors;
+        BOOST_CHECK(wallet->SignTransaction(spend, coins, SIGHASH_ALL, input_errors));
+        BOOST_CHECK(input_errors.empty());
+        BOOST_CHECK(VerifyScript(spend.vin[0].scriptSig, stake_script, nullptr, STANDARD_SCRIPT_VERIFY_FLAGS,
+                                 MutableTransactionSignatureChecker(&spend, 0, COIN, MissingDataBehavior::FAIL)));
+    }
+
+    // A confirmed STAKE output of ours: owned, counted, but never auto-selected.
+    CMutableTransaction stake_tx;
+    stake_tx.vin.emplace_back(COutPoint{m_coinbase_txns[0]->GetHash(), 0});
+    const CAmount in_value{m_coinbase_txns[0]->vout[0].nValue};
+    stake_tx.vout.emplace_back(in_value - 10000, stake_script);
+    {
+        FillableSigningProvider keystore;
+        BOOST_REQUIRE(keystore.AddKey(coinbaseKey));
+        SignatureData sigdata;
+        BOOST_REQUIRE(ProduceSignature(keystore, MutableTransactionSignatureCreator(stake_tx, 0, in_value, SIGHASH_ALL),
+                                       m_coinbase_txns[0]->vout[0].scriptPubKey, sigdata));
+        UpdateInput(stake_tx.vin[0], sigdata);
+    }
+    const CBlock stake_block{CreateAndProcessBlock({stake_tx}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()))};
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE_EQUAL(m_node.chainman->ActiveChain().Height(), COINBASE_MATURITY + 1);
+        BOOST_REQUIRE_EQUAL(m_node.chainman->ActiveChain().Tip()->GetBlockHash().GetHex(), stake_block.GetHash().GetHex());
+        BOOST_REQUIRE_EQUAL(stake_block.vtx.size(), 2U);
+        BOOST_REQUIRE_EQUAL(stake_block.vtx[1]->GetHash().GetHex(), stake_tx.GetHash().GetHex());
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->IsMine(*stake_block.vtx[1]));
+    }
+    {
+        // The wallet is not subscribed to block notifications in this test, so
+        // tell it the chain advanced (a rescan stops at the wallet's own
+        // last-processed height) and rescan from genesis.
+        LOCK2(wallet->cs_wallet, cs_main);
+        wallet->SetLastBlockProcessed(m_node.chainman->ActiveChain().Height(), m_node.chainman->ActiveChain().Tip()->GetBlockHash());
+    }
+    {
+        WalletRescanReserver reserver(*wallet);
+        reserver.reserve();
+        const uint256 genesis{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Genesis()->GetBlockHash())};
+        const CWallet::ScanResult result{wallet->ScanForWalletTransactions(genesis, /*start_height=*/0, /*max_height=*/{}, reserver, /*fUpdate=*/true, /*save_progress=*/false)};
+        BOOST_REQUIRE(result.status == CWallet::ScanResult::SUCCESS);
+    }
+    {
+        LOCK(wallet->cs_wallet);
+        const COutPoint stake_outpoint{stake_tx.GetHash(), 0};
+        BOOST_REQUIRE(wallet->GetWalletTx(stake_outpoint.hash) != nullptr);
+        BOOST_CHECK(!wallet->IsSpent(stake_outpoint));
+        bool listed{false};
+        for (const COutput& coin : AvailableCoins(*wallet).All()) listed |= coin.outpoint == stake_outpoint;
+        BOOST_CHECK(!listed);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

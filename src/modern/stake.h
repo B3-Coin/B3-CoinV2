@@ -172,6 +172,34 @@ inline std::optional<StakeOutputView> ParseStakeOutput(const CTxOut& out, std::s
 }
 
 /**
+ * The OWNER script of a well-formed STAKE carrier whose owner suffix is a
+ * BARE script (neither P2SH nor a witness program), or std::nullopt for
+ * anything else. This is the wallet/policy view of a STAKE output: the
+ * consensus prefix is dropped before the owner script executes, so for
+ * ownership, standardness and signing the output IS its owner script, and
+ * the signature's scriptCode is still the full scriptPubKey (the
+ * interpreter runs the whole thing). Only a bare suffix is solvable this
+ * way -- a P2SH pattern or a witness program inside the carrier is NOT
+ * special-cased by the interpreter and would be anyone-can-spend, so such
+ * claims are deliberately reported as unsolvable (consensus still judges
+ * them as STAKE outputs; this is a wallet/policy predicate only).
+ */
+inline std::optional<CScript> StakeOwnerScript(const CScript& script)
+{
+    if (!ClaimsStakeMagic(script)) return std::nullopt;
+    std::string error;
+    const auto view{ParseStakeOutput(CTxOut{1, script}, error)};
+    if (!view) return std::nullopt;
+    int witness_version{0};
+    std::vector<unsigned char> witness_program;
+    if (view->owner_script.empty() || view->owner_script.IsPayToScriptHash() ||
+        view->owner_script.IsWitnessProgram(witness_version, witness_program)) {
+        return std::nullopt;
+    }
+    return view->owner_script;
+}
+
+/**
  * Modern-era per-transaction STAKE rule: every output claiming the STAKE
  * magic must parse as a valid v1 STAKE output and carry at least the
  * configured minimum principal. While MIN_STAKE_AMOUNT is unconfigured

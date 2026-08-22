@@ -9,6 +9,7 @@
 
 #include <common/system.h>
 #include <key_io.h>
+#include <pubkey.h>
 #include <primitives/transaction_identifier.h>
 #include <protocol.h>
 #include <script/script.h>
@@ -31,6 +32,7 @@ namespace wallet {
 namespace DBKeys {
 const std::string ACENTRY{"acentry"};
 const std::string ACTIVEEXTERNALSPK{"activeexternalspk"};
+const std::string B3_VALIDATOR_PUBKEY{"b3validatorpubkey"};
 const std::string ACTIVEINTERNALSPK{"activeinternalspk"};
 const std::string BESTBLOCK_NOMERKLE{"bestblock_nomerkle"};
 const std::string BESTBLOCK{"bestblock"};
@@ -172,6 +174,11 @@ bool WalletBatch::EraseWatchOnly(const CScript &dest)
         return false;
     }
     return EraseIC(std::make_pair(DBKeys::WATCHS, dest));
+}
+
+bool WalletBatch::WriteB3ValidatorPubKey(const CPubKey& pubkey)
+{
+    return WriteIC(DBKeys::B3_VALIDATOR_PUBKEY, pubkey);
 }
 
 bool WalletBatch::WriteBestBlock(const CBlockLocator& locator)
@@ -1129,6 +1136,15 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
 
         // Load descriptors
         result = std::max(LoadDescriptorWalletRecords(pwallet, *m_batch, last_client), result);
+
+        // B3 validator public key (a public record; its secret is one of the
+        // descriptors just loaded). Absent on wallets that never staked.
+        {
+            CPubKey validator_pubkey;
+            if (m_batch->Read(DBKeys::B3_VALIDATOR_PUBKEY, validator_pubkey) && validator_pubkey.IsFullyValid()) {
+                pwallet->LoadValidatorPubKey(validator_pubkey);
+            }
+        }
         // Early return if there are unknown descriptors. Later loading of ACTIVEINTERNALSPK and ACTIVEEXTERNALEXPK
         // may reference the unknown descriptor's ID which can result in a misleading corruption error
         // when in reality the wallet is simply too new.

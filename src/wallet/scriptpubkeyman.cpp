@@ -5,6 +5,7 @@
 #include <hash.h>
 #include <key_io.h>
 #include <logging.h>
+#include <modern/stake.h>
 #include <node/types.h>
 #include <outputtype.h>
 #include <script/descriptor.h>
@@ -863,6 +864,8 @@ util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestination(const 
 bool DescriptorScriptPubKeyMan::IsMine(const CScript& script) const
 {
     LOCK(cs_desc_man);
+    // B3 STAKE carrier: ownership is decided by the bare owner script.
+    if (const auto owner{modern::StakeOwnerScript(script)}) return m_map_script_pub_keys.contains(*owner);
     return m_map_script_pub_keys.contains(script);
 }
 
@@ -1063,10 +1066,12 @@ bool DescriptorScriptPubKeyMan::TopUpWithDB(WalletBatch& batch, unsigned int siz
     return true;
 }
 
-std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(const CScript& script)
+std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(const CScript& script_in)
 {
     LOCK(cs_desc_man);
     std::vector<WalletDestination> result;
+    // B3 STAKE carrier: the keypool item in use is the bare owner script.
+    const CScript script{modern::StakeOwnerScript(script_in).value_or(script_in)};
     if (IsMine(script)) {
         int32_t index = m_map_script_pub_keys[script];
         if (index >= m_wallet_descriptor.next_index) {
@@ -1203,14 +1208,21 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
 {
     LOCK(cs_desc_man);
 
-    // Find the index of the script
-    auto it = m_map_script_pub_keys.find(script);
+    // Find the index of the script (a B3 STAKE carrier is looked up by its
+    // bare owner script; the signer's scriptCode stays the full script).
+    const auto owner{modern::StakeOwnerScript(script)};
+    auto it = m_map_script_pub_keys.find(owner ? *owner : script);
     if (it == m_map_script_pub_keys.end()) {
         return nullptr;
     }
     int32_t index = it->second;
 
     return GetSigningProvider(index, include_private);
+}
+
+std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProviderWithPrivateKeys(const CScript& script) const
+{
+    return GetSigningProvider(script, /*include_private=*/true);
 }
 
 std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvider(const CPubKey& pubkey) const
