@@ -114,6 +114,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   external_signer.cpp
   init/common.cpp
   kernel/chainparams.cpp
+  legacy/checkpoints.cpp
   key.cpp
   key_io.cpp
   merkleblock.cpp
