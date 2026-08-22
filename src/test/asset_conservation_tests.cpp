@@ -173,6 +173,14 @@ BOOST_AUTO_TEST_CASE(genesis_record_is_bounded_and_strictly_coded)
     modern::AssetGenesisV1 too_big{future};
     too_big.mode_params.assign(modern::MAX_ASSET_MODE_PARAMS + 1, 0xab);
     BOOST_CHECK(!modern::DecodeAssetIssuanceAction(modern::MakeAssetIssuanceAction(too_big), decoded, error));
+    // A tiny payload whose compact-size CLAIMS millions of parameter bytes
+    // is refused by the length bound before any allocation (and before
+    // the reader could even run short of data).
+    modern::CreationAction bomb{action};
+    bomb.payload.assign(action.payload.begin(), action.payload.begin() + 10); // fields, no blob
+    bomb.payload.insert(bomb.payload.end(), {0xfe, 0x40, 0x4b, 0x4c, 0x00}); // compact-size 5,000,000
+    BOOST_CHECK(!modern::DecodeAssetIssuanceAction(bomb, decoded, error));
+    BOOST_CHECK_EQUAL(error, "asset genesis mode parameters exceed the bound");
 
     // The commitment is the tagged hash of exactly the serialized record.
     HashWriter mirror{TaggedHash("B3/ASSET/GENESIS/V1")};

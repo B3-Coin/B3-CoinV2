@@ -176,17 +176,27 @@ inline bool DecodeAssetIssuanceAction(const CreationAction& action, AssetGenesis
     }
     try {
         SpanReader reader{action.payload};
-        reader >> out;
+        // Field by field: the blob's length is bounded BEFORE any
+        // allocation (the generic vector deserializer would otherwise
+        // reserve a multi-megabyte chunk for a claimed huge length).
+        reader >> out.max_supply >> out.decimals >> out.issuance_mode;
+        const uint64_t params_size{ReadCompactSize(reader, /*range_check=*/true)};
+        if (params_size > MAX_ASSET_MODE_PARAMS) {
+            error = "asset genesis mode parameters exceed the bound";
+            return false;
+        }
+        if (params_size > reader.size()) {
+            error = "asset genesis record is malformed";
+            return false;
+        }
+        out.mode_params.resize(params_size);
+        if (params_size > 0) reader.read(MakeWritableByteSpan(out.mode_params));
         if (!reader.empty()) {
             error = "trailing bytes after the asset genesis record";
             return false;
         }
     } catch (const std::exception&) {
         error = "asset genesis record is malformed";
-        return false;
-    }
-    if (out.mode_params.size() > MAX_ASSET_MODE_PARAMS) {
-        error = "asset genesis mode parameters exceed the bound";
         return false;
     }
     return true;
