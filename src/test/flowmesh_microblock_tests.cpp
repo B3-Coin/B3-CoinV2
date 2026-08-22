@@ -11,6 +11,7 @@
 //! round/lock leader-recovery guard.
 
 #include <flowmesh/microblock.h>
+#include <test/util/asset.h>
 
 #include <flowmesh/auth.h>
 #include <flowmesh/batch.h>
@@ -59,7 +60,7 @@ const uint256 MESH_DOMAIN{
     uint256{"00000000000000000000000000000000000000000000000000000000000000dd"}};
 const uint256 MESH_CONFIG{flowmesh::ComputeExecutionConfigId(
     uint256{"00000000000000000000000000000000000000000000000000000000000000f1"},
-    modern::IssuanceAssetId(COutPoint{
+    modern::test_only::SyntheticAssetId(COutPoint{
         Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000011"}),
         0}),
     modern::NativeAsset(), 8)};
@@ -68,7 +69,7 @@ const uint256 OTHER_DOMAIN{
 
 modern::AssetId BaseX()
 {
-    return modern::IssuanceAssetId(COutPoint{
+    return modern::test_only::SyntheticAssetId(COutPoint{
         Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000011"}),
         0});
 }
@@ -734,7 +735,7 @@ BOOST_AUTO_TEST_CASE(authorization_is_bound_to_the_execution_configuration)
     // substitution are impossible — and a foreign configuration's
     // candidate is refused structurally (different state roots).
     Net net; // market A: VAULT / BaseX / native quote
-    const modern::AssetId other_quote{modern::IssuanceAssetId(COutPoint{
+    const modern::AssetId other_quote{modern::test_only::SyntheticAssetId(COutPoint{
         Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000022"}),
         0})};
     const uint256 config_b{flowmesh::ComputeExecutionConfigId(VAULT, BaseX(), other_quote, 8)};

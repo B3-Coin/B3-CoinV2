@@ -11,6 +11,7 @@
 //! recovery, catch-up, and FlowMesh-outage isolation from B3.
 
 #include <flowmesh/sync.h>
+#include <test/util/asset.h>
 
 #include <flowmesh/auth.h>
 #include <flowmesh/certificate.h>
@@ -56,14 +57,14 @@ const uint256 MESH_DOMAIN{
     uint256{"00000000000000000000000000000000000000000000000000000000000000dd"}};
 const uint256 MESH_CONFIG{flowmesh::ComputeExecutionConfigId(
     uint256{"00000000000000000000000000000000000000000000000000000000000000f1"},
-    modern::IssuanceAssetId(COutPoint{
+    modern::test_only::SyntheticAssetId(COutPoint{
         Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000011"}),
         0}),
     modern::NativeAsset(), 8)};
 
 modern::AssetId BaseX()
 {
-    return modern::IssuanceAssetId(COutPoint{
+    return modern::test_only::SyntheticAssetId(COutPoint{
         Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000011"}),
         0});
 }

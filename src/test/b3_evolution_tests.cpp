@@ -717,9 +717,19 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
     {
         const int model_height{tip()->nHeight};
         const COutPoint defining{crossing_txid, 9};
-        const modern::AssetId test_token{modern::IssuanceAssetId(defining)};
-        const modern::AssetId test_usdt{modern::IssuanceAssetId(COutPoint{crossing_txid, 10})};
-        BOOST_CHECK(test_token != test_usdt); // distinct defining outpoints, distinct ids
+        // Simple-v1 asset identity: chain-bound (this evolution chain's real
+        // genesis and X), outpoint-bound, and rule-bound via the genesis
+        // record; the rules are stated once, in the issuance action.
+        const uint256 chain_domain{
+            *modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash)};
+        const modern::AssetGenesisV1 token_genesis{.max_supply = 1'000'000, .decimals = 0};
+        const modern::AssetId test_token{modern::AssetIdV1(
+            chain_domain, defining, modern::AssetGenesisCommitment(token_genesis))};
+        const modern::AssetId test_usdt{modern::AssetIdV1(
+            chain_domain, COutPoint{crossing_txid, 10},
+            modern::AssetGenesisCommitment(
+                modern::AssetGenesisV1{.max_supply = 1'000'000, .decimals = 6}))};
+        BOOST_CHECK(test_token != test_usdt); // distinct outpoints + rules, distinct ids
 
         const auto out{[&](const modern::AssetId& asset, const CAmount amount,
                            const modern::PolicyType type = modern::PolicyType::OWNER) {
@@ -738,8 +748,12 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
             return t;
         }};
 
-        // Issuance: 1,000,000 TEST_TOKEN in two outputs.
-        modern::ModernTransition issue{spend(defining)};
+        // Issuance: the v2 transition declares the genesis record and mints
+        // exactly its 1,000,000 TEST_TOKEN in two outputs.
+        modern::ModernTransitionV2 issue;
+        issue.inputs.resize(1);
+        issue.inputs[0].prevout = defining;
+        issue.creation_actions.push_back(modern::MakeAssetIssuanceAction(token_genesis));
         issue.outputs.push_back(out(test_token, 600'000));
         issue.outputs.push_back(out(test_token, 400'000));
         const std::vector<modern::ModernOutput> native_prev{out(modern::NativeAsset(), 900'000)};

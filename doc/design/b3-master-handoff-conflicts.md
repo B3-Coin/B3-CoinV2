@@ -270,3 +270,15 @@ stateless-proof issuance model**
   reverted uncommitted on the owner's order).
 - C-R1 stands only in what it REJECTED (the marker-spend mechanism);
   its scan-and-claim affirmation is superseded by this entry.
+
+
+## 2026-08-22 — AssetId derivation vs contract §21 (RESOLVED by owner ruling)
+
+Contract §21 specified `AssetId = H("B3/ASSET" ‖ issuance_outpoint ‖
+issuance_policy_commitment)`; the audit found the code derived
+`SHA256d("b3/asset/v1" ‖ outpoint)` — untagged, domain-free, rule-free. The
+owner ruled the unified form `TaggedHash("B3/ASSET/V1") ‖ ModernChainDomain
+‖ issuance_outpoint ‖ H(genesis record)`: it keeps the contract's intent
+(outpoint + rules commitment) and strengthens it with the chain domain and
+genuine tagged hashing, matching the FN asset id. Treat §21 as reading this
+form. No mainnet asset was ever issued, so nothing historical changes.

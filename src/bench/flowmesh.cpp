@@ -29,6 +29,7 @@
 //!    deliberately not excluded.
 
 #include <bench/bench.h>
+#include <test/util/asset.h>
 
 #include <arith_uint256.h>
 #include <cassert>
@@ -57,7 +58,7 @@ flowmesh::AccountId Account(const uint32_t i)
 
 modern::AssetId Base()
 {
-    return modern::IssuanceAssetId(
+    return modern::test_only::SyntheticAssetId(
         COutPoint{Txid::FromUint256(ArithToUint256(arith_uint256{0x11})), 0});
 }
 

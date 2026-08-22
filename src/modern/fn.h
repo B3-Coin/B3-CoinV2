@@ -7,6 +7,7 @@
 
 #include <consensus/amount.h>
 #include <hash.h>
+#include <modern/chain_domain.h>
 #include <modern/creation_action.h>
 #include <modern/policy.h>
 #include <pubkey.h>
@@ -659,20 +660,8 @@ inline bool CheckFnCreationActions(const std::vector<CreationAction>& actions,
 
 // ---- Claim-intent digest (§8.3, revised 2026-08-17) --------------------
 
-//! The contract's immutable anti-replay network identifier:
-//! TaggedHash("B3/MODERN/CHAIN", genesis || X), both as their 32 raw
-//! internal-order (header-serialization) bytes. Pure function of its
-//! arguments — no defaults, no globals; fails closed (nullopt) when
-//! either hash is null, so a call site with an unset X cannot obtain a
-//! domain.
-inline std::optional<uint256> ModernChainDomain(const uint256& genesis_hash,
-                                                const uint256& final_legacy_hash)
-{
-    if (genesis_hash.IsNull() || final_legacy_hash.IsNull()) return std::nullopt;
-    HashWriter writer{TaggedHash("B3/MODERN/CHAIN")};
-    writer << genesis_hash << final_legacy_hash;
-    return writer.GetSHA256();
-}
+// ModernChainDomain lives in modern/chain_domain.h (shared by FN, the
+// colored-asset ids and modern PoS).
 
 /**
  * The claim-intent digest every funding-key authorization signs:

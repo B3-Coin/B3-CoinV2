@@ -430,13 +430,13 @@ BOOST_AUTO_TEST_CASE(v2_envelope_rejections)
         BOOST_CHECK(!modern::DecodeTransitionEnvelope(bytes, decoded, error));
         BOOST_CHECK_EQUAL(error, "trailing bytes after the transition envelope");
     }
-    // Unknown action type / version inside the section (type 3 is
-    // unregistered; types 1 and 2 are the reserved claim action and the
-    // legacy FN issuance action).
+    // Unknown action type / version inside the section (type 4 is
+    // unregistered; types 1-3 are the reserved claim action, the legacy FN
+    // issuance action, and the asset issuance action).
     {
         auto bytes{MustEncode(SampleV2())};
         bytes.back() = 0x01; // count 1
-        const std::vector<unsigned char> frame{0x03, 0x00, 0x01, 0x00, 0x00}; // type 3
+        const std::vector<unsigned char> frame{0x04, 0x00, 0x01, 0x00, 0x00}; // type 4
         bytes.insert(bytes.end(), frame.begin(), frame.end());
         BOOST_CHECK(!modern::DecodeTransitionEnvelope(bytes, decoded, error));
         BOOST_CHECK_EQUAL(error, "unknown creation-action type or version");

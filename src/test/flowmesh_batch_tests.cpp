@@ -10,6 +10,7 @@
 //! microblock/evidence suites.
 
 #include <flowmesh/batch.h>
+#include <test/util/asset.h>
 
 #include <test/util/flowmesh.h>
 
@@ -43,7 +44,7 @@ const uint256 DEST{uint256{"0000000000000000000000000000000000000000000000000000
 
 modern::AssetId BaseX()
 {
-    return modern::IssuanceAssetId(COutPoint{
+    return modern::test_only::SyntheticAssetId(COutPoint{
         Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000011"}), 0});
 }
 const modern::AssetId& Quote() { return modern::NativeAsset(); }

@@ -7,6 +7,7 @@
 //! the impossibility of redirection. Custody only — no matching.
 
 #include <modern/vault.h>
+#include <test/util/asset.h>
 
 #include <modern/asset.h>
 #include <modern/policy.h>
@@ -73,7 +74,7 @@ const uint256 DEST_B{uint256{"00000000000000000000000000000000000000000000000000
 
 modern::AssetId Asset()
 {
-    return modern::IssuanceAssetId(COutPoint{
+    return modern::test_only::SyntheticAssetId(COutPoint{
         Txid::FromUint256(uint256{"00000000000000000000000000000000000000000000000000000000000000b3"}), 0});
 }
 

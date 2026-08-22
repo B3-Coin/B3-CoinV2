@@ -93,6 +93,26 @@ coloured-asset engine.
 
 ---
 
+## Colored assets simple-v1 — RULED 2026-08-22 (formerly audit Decision 11)
+
+Owner rulings: (1) asset identity unified with the FN convention —
+`AssetId = TaggedHash("B3/ASSET/V1") ‖ ModernChainDomain ‖ issuance_outpoint
+‖ H(genesis record)` (chain-bound, rule-bound; supersedes the untagged
+outpoint-only derivation and reconciles contract §21 by strengthening it);
+(2) the v1 asset-wide rule set is exactly `max_supply`, `decimals` and
+`mint_authority = NONE`, stated once in the issuance transaction's creation
+action and never repeated on outputs; (3) the genesis mints exactly
+`max_supply` in one transaction and no later mint exists, so the cap holds
+by construction without a registry. ROOM FOR EXPANSION (owner direction,
+same day): the genesis record carries an `issuance_mode` byte (v1 accepts
+only GENESIS_FIXED; AUTHORITY_MINT, POW_MINED — PoW-minable colored assets
+— and BRIDGE_BACKED are RESERVED numbers) plus a bounded `mode_params`
+blob (empty in v1), so a future mode ships its parameters inside the same
+record layout and the same AssetId preimage with no format change;
+`max_supply` is the hard cap in every mode. Programmable schemes and the
+reserved modes themselves stay V2 research. Implemented in
+`src/modern/asset.h` (test-only activation unchanged).
+
 ## OD-3 — Consensus governance / upgrade mechanism
 
 Contract §43 and §55 require a deterministic activation mechanism and a governed

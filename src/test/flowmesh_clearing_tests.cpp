@@ -9,6 +9,7 @@
 //! adversarial overflow. No floating point; no per-fill UTXO spends.
 
 #include <flowmesh/clearing.h>
+#include <test/util/asset.h>
 
 #include <flowmesh/state.h>
 #include <test/util/flowmesh.h>
@@ -42,7 +43,7 @@ const flowmesh::AccountId ACC_C{uint256{"000000000000000000000000000000000000000
 //! Base asset; quote is native B3.
 modern::AssetId BaseX()
 {
-    return modern::IssuanceAssetId(COutPoint{
+    return modern::test_only::SyntheticAssetId(COutPoint{
         Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000011"}), 0});
 }
 const modern::AssetId& Quote() { return modern::NativeAsset(); }
@@ -59,7 +60,7 @@ std::vector<Breakpoint> Pts(std::vector<std::pair<CAmount, CAmount>> raw)
 // v2 (balance/custody/receipt counts). Filled from the first computed
 // value, frozen since; changes only with a reviewed format bump.
 const std::string EMPTY_BOOK_ROOT_HEX{
-    "7eb9986874b449583f1e9afbb44836b4cdc47ff122d61522b0e8b9deec530b05"};
+    "1345b1674a98777966892548d7fdb38f02be7f60ed831acff3712d6b6480325c"};
 
 
 //! Test funding shortcut over the test-only bridge.

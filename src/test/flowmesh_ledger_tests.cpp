@@ -7,6 +7,7 @@
 //! asset), with adversarial overflow/underflow tests. No matching.
 
 #include <flowmesh/ledger.h>
+#include <test/util/asset.h>
 
 #include <hash.h>
 #include <modern/policy.h>
@@ -29,12 +30,12 @@ const uint256 DEST{uint256{"0000000000000000000000000000000000000000000000000000
 
 modern::AssetId AssetX()
 {
-    return modern::IssuanceAssetId(COutPoint{
+    return modern::test_only::SyntheticAssetId(COutPoint{
         Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000011"}), 0});
 }
 modern::AssetId AssetY()
 {
-    return modern::IssuanceAssetId(COutPoint{
+    return modern::test_only::SyntheticAssetId(COutPoint{
         Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000022"}), 0});
 }
 

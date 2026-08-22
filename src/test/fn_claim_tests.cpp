@@ -144,7 +144,8 @@ BOOST_AUTO_TEST_CASE(policy_identity_pins)
     BOOST_CHECK(IsKnownCreationAction(1, 1));
     BOOST_CHECK(IsKnownCreationAction(2, 1));
     BOOST_CHECK(!IsKnownCreationAction(2, 2));
-    BOOST_CHECK(!IsKnownCreationAction(3, 1));
+    BOOST_CHECK(IsKnownCreationAction(3, 1));  // asset issuance (2026-08-22)
+    BOOST_CHECK(!IsKnownCreationAction(4, 1));
     BOOST_CHECK_EQUAL(MAX_CREATION_ACTION_PAYLOAD, 4000U);
     BOOST_CHECK_EQUAL(MAX_FN_EVER_ISSUED, 5000U); // RATIFIED 2026-08-22 (R = 3,500 historical PoDs)
 
