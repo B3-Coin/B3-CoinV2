@@ -5149,6 +5149,21 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
     const int nHeight = pindexPrev->nHeight + 1;
 
     const Consensus::Params& consensusParams = chainman.GetConsensus();
+    // X-distribution PAUSE (owner ruling 2026-08-23): H configured, X not yet
+    // pinned. Accept through H, refuse EVERYTHING above it — legacy-codec
+    // blocks from old clients extending the dead legacy chain as much as
+    // corridor blocks from a node that wrongly tries to start without X.
+    // A no-penalty refusal (like the legacy depth bar): legacy peers doing
+    // this are not misbehaving, and the header must not be marked invalid,
+    // since the mandatory follow-up release that pins X decides which H+1
+    // is real. Nothing modern is validatable without X anyway: the modern
+    // chain domain, the corridor anchor and the trusted replay derive from it.
+    if (Consensus::LegacyBoundaryHeightOnly(consensusParams) &&
+        nHeight > *Consensus::LegacyFinalHeight(consensusParams)) {
+        return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "legacy-boundary-unpinned",
+                             strprintf("block at height %d is above the final legacy height %d and LEGACY_FINAL_HASH is not pinned",
+                                       nHeight, *Consensus::LegacyFinalHeight(consensusParams)));
+    }
     // The format marker is selected from the fixed-size header before the
     // block body is decoded, but its truth is determined by this known parent
     // height. Do not let a peer select legacy rules or a legacy transaction
@@ -5235,10 +5250,15 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         // proof-of-work eligibility hash against nBits. The corridor
         // difficulty is the constant configured target; while the corridor
         // difficulty policy is unresolved (mainnet), no target is configured
-        // and corridor blocks fail closed here.
-        if (!consensusParams.transition_pow_bits) {
+        // and corridor blocks fail closed here. The constant is compared for
+        // byte equality on every header, so it must be the CANONICAL compact
+        // encoding of its target (ruled 2026-08-23: 0x1f008000, never the
+        // non-canonical 0x20000080 spelling of the same target); a
+        // non-canonical configured value is a misconfiguration and fails
+        // closed exactly like an unset one.
+        if (!consensusParams.transition_pow_bits || !IsCanonicalCompactBits(*consensusParams.transition_pow_bits)) {
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "no-transition-pow-rules",
-                                 "temporary-PoW corridor difficulty policy is not configured");
+                                 "temporary-PoW corridor difficulty policy is not configured (or not canonical compact bits)");
         }
         if (block.nBits != *consensusParams.transition_pow_bits) {
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits",

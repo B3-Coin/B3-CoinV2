@@ -106,6 +106,21 @@ constexpr bool LegacyBoundaryPinned(const Params& params)
 }
 
 /**
+ * The X-distribution PAUSE state (owner ruling 2026-08-23): the final legacy
+ * height H is configured but the exact boundary hash X is not yet pinned.
+ * A node in this state accepts the chain through H and FAILS CLOSED at H+1:
+ * no block above H is admitted and none is produced, because nothing modern
+ * can be validated without X (the modern chain domain, the corridor anchor
+ * and the trusted replay all derive from it). The mandatory follow-up
+ * release pins X and the corridor resumes from it. A blank-X node must
+ * never enter the corridor.
+ */
+constexpr bool LegacyBoundaryHeightOnly(const Params& params)
+{
+    return LegacyFinalHeight(params).has_value() && !params.legacy_final_hash.has_value();
+}
+
+/**
  * The final temporary-PoW corridor height (H + transition_pow_length), when
  * a boundary is configured and the chain has a corridor.
  */

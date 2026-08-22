@@ -14,6 +14,7 @@
 #include <blockfilter.h>
 #include <chain.h>
 #include <chainparams.h>
+#include <consensus/era.h>
 #include <chainparamsbase.h>
 #include <clientversion.h>
 #include <common/args.h>
@@ -45,6 +46,7 @@
 #include <net_processing.h>
 #include <netbase.h>
 #include <netgroup.h>
+#include <node/warnings.h>
 #include <node/blockmanager_args.h>
 #include <node/blockstorage.h>
 #include <node/caches.h>
@@ -1431,6 +1433,16 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 {
     const ArgsManager& args = *Assert(node.args);
     const CChainParams& chainparams = Params();
+
+    // B3 X-distribution PAUSE (owner ruling 2026-08-23): H set, X blank.
+    // Say so loudly: this build accepts the chain through H and refuses
+    // every block above it until the release that pins X.
+    if (Consensus::LegacyBoundaryHeightOnly(chainparams.GetConsensus())) {
+        const int final_height{*Consensus::LegacyFinalHeight(chainparams.GetConsensus())};
+        const bilingual_str msg{strprintf(_("B3: the final legacy height H=%d is configured but the boundary hash X is not pinned. This node accepts blocks through H and REFUSES every block above H until the follow-up release that pins X. It will not produce or enter the transition corridor."), final_height)};
+        LogWarning("%s", msg.original);
+        if (node.warnings) node.warnings->Set(node::Warning::LEGACY_BOUNDARY_UNPINNED, msg);
+    }
 
     auto opt_max_upload = ParseByteUnits(args.GetArg("-maxuploadtarget", DEFAULT_MAX_UPLOAD_TARGET), ByteUnit::M);
     if (!opt_max_upload) {

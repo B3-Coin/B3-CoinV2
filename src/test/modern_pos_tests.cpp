@@ -2,8 +2,10 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
+#include <arith_uint256.h>
 #include <chain.h>
 #include <chainparams.h>
+#include <consensus/era.h>
 #include <consensus/merkle.h>
 #include <consensus/modern_pos_params.h>
 #include <consensus/params.h>
@@ -152,7 +154,8 @@ struct ModernPosSetup : public ChainTestingSetup {
         return block;
     }
 
-    CBlock BuildCorridor(const CBlockIndex* prev, std::vector<CMutableTransaction> txs)
+    CBlock BuildCorridor(const CBlockIndex* prev, std::vector<CMutableTransaction> txs,
+                         const int64_t time_delta = 17, const uint32_t bits = EASY_BITS)
     {
         CMutableTransaction coinbase;
         coinbase.version = 2;
@@ -163,14 +166,40 @@ struct ModernPosSetup : public ChainTestingSetup {
         CBlock block;
         block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
         block.hashPrevBlock = prev->GetBlockHash();
-        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
-        block.nBits = EASY_BITS;
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + time_delta);
+        block.nBits = bits;
         block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
         for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
         block.hashMerkleRoot = BlockMerkleRoot(block);
         block.nNonce = 0;
         while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
         return block;
+    }
+
+    //! Legacy history to SYN_H only (no boundary configured yet).
+    void AdvanceLegacyToH()
+    {
+        for (int height{1}; height <= SYN_H; ++height) {
+            BOOST_REQUIRE(Submit(BuildLegacy(Tip(), {})));
+        }
+        BOOST_REQUIRE_EQUAL(Tip()->nHeight, SYN_H);
+    }
+    //! Configure the corridor with H = SYN_H and the given X (unset = the
+    //! X-distribution pause), then rebuild the candidate set as the fixture
+    //! pattern requires after mutating params mid-run.
+    void ConfigureCorridor(const std::optional<uint256>& x, const uint32_t bits = EASY_BITS)
+    {
+        Consensus::Params& mutable_consensus{MutableConsensus()};
+        mutable_consensus.hard_fork_height = SYN_H + 1;
+        mutable_consensus.legacy_final_hash = x;
+        mutable_consensus.transition_pow_length = SYN_CORRIDOR;
+        mutable_consensus.transition_pow_bits = bits;
+        mutable_consensus.transition_pow_reward = 0;
+        mutable_consensus.min_stake_amount = 1000;
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        chainstate.setBlockIndexCandidates.clear();
+        chainstate.PopulateBlockIndexCandidates();
     }
 
     // ---- Modern-PoS helpers (mirror the frozen V1 rules exactly) ----
@@ -371,6 +400,14 @@ BOOST_AUTO_TEST_CASE(no_provisional_parameters_on_shipped_networks)
         }
         BOOST_CHECK_MESSAGE(!consensus.transition_pow_bits.has_value(),
                             "provisional corridor difficulty set on a shipped network");
+        // Pin gates (owner, 2026-08-23): the RULED activation parameters
+        // (H = 820,000, canonical corridor bits 0x1f008000) are NOT pinned
+        // on any shipped network until the live-sync fix, the T3/final-H
+        // captures, operational seeds and audited reproducible binaries.
+        BOOST_CHECK_MESSAGE(!consensus.hard_fork_height.has_value(),
+                            "hard_fork_height pinned on a shipped network before the pin gates");
+        BOOST_CHECK_MESSAGE(!consensus.legacy_final_hash.has_value(),
+                            "legacy_final_hash pinned on a shipped network before the pin gates");
         if (chain == ChainType::MAIN) {
             // RATIFIED 2026-08-21: mainnet corridor reward is exactly 0
             // (fees only), stated explicitly rather than defaulted.
@@ -398,6 +435,113 @@ BOOST_AUTO_TEST_CASE(provisional_parameter_block_is_structurally_valid)
     pos = Consensus::ModernPosParams{};
     pos.reorg_horizon = 0;
     BOOST_CHECK(!pos.Valid());
+}
+
+//! The RULED mainnet corridor constant (owner, 2026-08-23) is the canonical
+//! compact spelling of the 2^239 target. 0x20000080 encodes the SAME target
+//! non-canonically; the consensus constant compared byte-for-byte on every
+//! corridor header must be the canonical one, and a non-canonical configured
+//! value fails closed like an unset one (the round-trip test the ruling asked
+//! for).
+BOOST_AUTO_TEST_CASE(corridor_bits_ruled_value_is_canonical_compact)
+{
+    constexpr uint32_t RULED_CORRIDOR_BITS{0x1f008000};
+    constexpr uint32_t NONCANONICAL_SAME_TARGET{0x20000080};
+    BOOST_CHECK(IsCanonicalCompactBits(RULED_CORRIDOR_BITS));
+    BOOST_CHECK(!IsCanonicalCompactBits(NONCANONICAL_SAME_TARGET));
+    const arith_uint256 ruled{arith_uint256().SetCompact(RULED_CORRIDOR_BITS)};
+    const arith_uint256 noncanonical{arith_uint256().SetCompact(NONCANONICAL_SAME_TARGET)};
+    BOOST_CHECK(ruled == noncanonical);
+    BOOST_CHECK(ruled == (arith_uint256{1} << 239)); // 2^17 expected hashes per block
+    BOOST_CHECK_EQUAL(ruled.GetCompact(), RULED_CORRIDOR_BITS);
+    BOOST_CHECK_EQUAL(noncanonical.GetCompact(), RULED_CORRIDOR_BITS); // round-trips to the canonical form
+    // The scaffolding constants used by the fixtures are canonical too.
+    BOOST_CHECK(IsCanonicalCompactBits(EASY_BITS));
+    BOOST_CHECK(!IsCanonicalCompactBits(0)); // zero target is never a difficulty
+}
+
+//! X-distribution PAUSE (owner ruling 2026-08-23): H configured, X unset.
+//! The node accepts the chain through H and refuses EVERY block above H --
+//! corridor blocks and legacy blocks alike -- without penalty and without
+//! marking anything invalid; production refuses too. Pinning X resumes the
+//! corridor from exactly that X.
+BOOST_FIXTURE_TEST_CASE(h_without_x_fails_closed, ModernPosSetup)
+{
+    AdvanceLegacyToH();
+    const uint256 real_x{Tip()->GetBlockHash()};
+    ConfigureCorridor(/*x=*/std::nullopt);
+    BOOST_CHECK(Consensus::LegacyBoundaryHeightOnly(m_node.chainman->GetConsensus()));
+    BOOST_CHECK(!Consensus::LegacyBoundaryPinned(m_node.chainman->GetConsensus()));
+
+    // A corridor block at H+1 is refused.
+    const CBlock corridor{BuildCorridor(Tip(), {})};
+    BOOST_CHECK(!Submit(corridor));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H);
+    {
+        LOCK(cs_main);
+        // Refused without an index entry: nothing was marked invalid, so the
+        // follow-up release that pins X can still accept the real H+1.
+        BOOST_CHECK(m_node.chainman->m_blockman.LookupBlockIndex(corridor.GetHash()) == nullptr);
+    }
+    // A legacy block at H+1 (an old client extending the dead legacy chain)
+    // is refused the same way.
+    BOOST_CHECK(!Submit(BuildLegacy(Tip(), {})));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H);
+    // Production refuses to enter the corridor with a blank X.
+    node::BlockAssembler::Options options;
+    options.coinbase_output_script = CScript() << OP_TRUE;
+    BOOST_CHECK_THROW(node::BlockAssembler(m_node.chainman->ActiveChainstate(), nullptr, options).CreateNewBlock(),
+                      std::runtime_error);
+
+    // The follow-up pins X: the very same corridor block is now accepted.
+    ConfigureCorridor(real_x);
+    BOOST_CHECK(Consensus::LegacyBoundaryPinned(m_node.chainman->GetConsensus()));
+    BOOST_REQUIRE(Submit(corridor));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H + 1);
+}
+
+//! A configured non-canonical corridor constant fails closed (treated as
+//! unconfigured); the canonical spelling of the same target works.
+BOOST_FIXTURE_TEST_CASE(corridor_bits_must_be_canonical, ModernPosSetup)
+{
+    constexpr uint32_t CANONICAL{0x20008000};    // 2^247
+    constexpr uint32_t NONCANONICAL{0x21000080}; // the same 2^247, non-canonical
+    BOOST_REQUIRE(IsCanonicalCompactBits(CANONICAL));
+    BOOST_REQUIRE(!IsCanonicalCompactBits(NONCANONICAL));
+    BOOST_REQUIRE(arith_uint256().SetCompact(CANONICAL) == arith_uint256().SetCompact(NONCANONICAL));
+
+    AdvanceLegacyToH();
+    ConfigureCorridor(Tip()->GetBlockHash(), NONCANONICAL);
+    BOOST_CHECK(!Submit(BuildCorridor(Tip(), {}, 17, NONCANONICAL)));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H);
+    ConfigureCorridor(Tip()->GetBlockHash(), CANONICAL);
+    BOOST_REQUIRE(Submit(BuildCorridor(Tip(), {}, 17, CANONICAL)));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H + 1);
+}
+
+//! Owner instruction (2026-08-23): "verify corridor pacing cannot be
+//! compressed unexpectedly by large hashpower; do not assume fixed
+//! difficulty implies fixed elapsed time." VERIFIED: it CAN be compressed.
+//! A corridor header is bound only by median-time-past and the 2 h future
+//! window, so consecutive corridor blocks one second apart are all valid --
+//! a fast miner can burn through the whole corridor in wall-clock seconds.
+//! This test PINS the current (compressible) behaviour so that the pacing
+//! rule, when the owner rules one (corridor doc §6.1), flips a visible
+//! expectation instead of silently changing consensus.
+BOOST_FIXTURE_TEST_CASE(corridor_pacing_is_unbounded, ModernPosSetup)
+{
+    AdvanceLegacyToH();
+    ConfigureCorridor(Tip()->GetBlockHash());
+    const int64_t start_time{Tip()->GetBlockTime()};
+    constexpr int BURST{SYN_CORRIDOR - 1};
+    for (int i{0}; i < BURST; ++i) {
+        BOOST_REQUIRE_MESSAGE(Submit(BuildCorridor(Tip(), {}, /*time_delta=*/1)),
+                              "1-second-spaced corridor block at height " << Tip()->nHeight + 1 << " rejected");
+    }
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H + BURST);
+    // BURST blocks advanced chain time by exactly BURST seconds: no minimum
+    // spacing exists. (Mitigation is an owner decision; see corridor doc §6.1.)
+    BOOST_CHECK_EQUAL(Tip()->GetBlockTime() - start_time, BURST);
 }
 
 //! Scenario 1 — normal operation: deterministic production through the
