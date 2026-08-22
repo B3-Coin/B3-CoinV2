@@ -298,8 +298,38 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
         const auto ok{chainman.ProcessTransaction(MakeTransactionRef(legacy_tx))};
         BOOST_REQUIRE_MESSAGE(ok.m_result_type == MempoolAcceptResult::ResultType::VALID,
                               "legacy mempool admission failed: " << ok.m_state.ToString());
+
+        // REGRESSION (live mainnet sync, 2026-08-21): a child spending an
+        // UNCONFIRMED legacy parent. Coin::nHeight is 30 bits on B3, so a
+        // MEMPOOL_HEIGHT sentinel that did not fit the field truncated, the
+        // parent looked like a coin at height ~1.07e9, and
+        // CalculateLockPointsAtTip asserted. The sentinel now fits (pinned by
+        // static_assert) and the child must simply be admitted.
+        {
+            const CBlockIndex* tip{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
+            CMutableTransaction child;
+            child.version = 1;
+            child.m_legacy_encoding = true;
+            child.nTime = static_cast<uint32_t>(tip->GetBlockTime() + 18);
+            child.vin.resize(1);
+            child.vin[0].prevout = COutPoint{CTransaction{legacy_tx}.GetHash(), 0};
+            child.vin[0].scriptSig = CScript{};
+            child.vout.emplace_back(legacy_tx.vout[0].nValue - 100'000, padded_script);
+            const auto child_ok{chainman.ProcessTransaction(MakeTransactionRef(child))};
+            BOOST_REQUIRE_MESSAGE(child_ok.m_result_type == MempoolAcceptResult::ResultType::VALID,
+                                  "child of unconfirmed legacy parent refused: "
+                                      << child_ok.m_state.ToString());
+            // And the mempool view reports the parent at the sentinel height.
+            {
+                LOCK2(cs_main, pool.cs);
+                const CCoinsViewMemPool view_mempool(&chainman.ActiveChainstate().CoinsTip(), pool);
+                const auto parent_coin{view_mempool.GetCoin(child.vin[0].prevout)};
+                BOOST_REQUIRE(parent_coin.has_value());
+                BOOST_CHECK_EQUAL(parent_coin->nHeight, MEMPOOL_HEIGHT);
+            }
+        }
     }
-    BOOST_CHECK_EQUAL(pool.size(), 2U); // the resurrected spend + the coinbase3 spend
+    BOOST_CHECK_EQUAL(pool.size(), 3U); // the resurrected spend + the coinbase3 spend + its child
 
     // ---- Mempool at the boundary, part 3: persistence round trip pre-H.
     // Provenance survives dump+load: the reloaded entry is the same legacy

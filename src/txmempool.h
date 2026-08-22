@@ -46,8 +46,16 @@ class ValidationSignals;
 
 struct bilingual_str;
 
-/** Fake height value used in Coin to signify they are only in the memory pool (since 0.8) */
-static const uint32_t MEMPOOL_HEIGHT = 0x7FFFFFFF;
+/**
+ * Fake height value used in Coin to signify they are only in the memory pool
+ * (since 0.8). B3: Coin::nHeight is a 30-bit field, so the stock 0x7FFFFFFF
+ * would truncate on storage and never compare equal again -- an unconfirmed
+ * parent then looked like a coin at height ~1.07e9 and CalculateLockPointsAtTip
+ * asserted on every child-of-unconfirmed-parent transaction (observed on the
+ * live mainnet sync). The sentinel must fit the field.
+ */
+static const uint32_t MEMPOOL_HEIGHT = 0x3FFFFFFF;
+static_assert(MEMPOOL_HEIGHT <= Coin::MAX_HEIGHT, "MEMPOOL_HEIGHT must fit Coin::nHeight");
 
 /** How much linearization cost required for TxGraph clusters to have
  * "acceptable" quality, if they cannot be optimally linearized with less cost. */

@@ -49,7 +49,11 @@ public:
     //! whether containing transaction was a legacy proof-of-stake transaction
     unsigned int fCoinStake : 1;
 
-    //! at which height this containing transaction was included in the active block chain
+    //! at which height this containing transaction was included in the active block chain.
+    //! B3 keeps 30 bits here (one bit went to fCoinStake): any SENTINEL stored
+    //! in this field -- notably MEMPOOL_HEIGHT -- must fit in MAX_HEIGHT, or
+    //! it silently truncates and every comparison against it fails.
+    static constexpr uint32_t MAX_HEIGHT{(uint32_t{1} << 30) - 1};
     uint32_t nHeight : 30;
 
     //! legacy transaction timestamp and on-disk offset used by the stake kernel
