@@ -270,3 +270,21 @@ stateless-proof issuance model**
   reverted uncommitted on the owner's order).
 - C-R1 stands only in what it REJECTED (the marker-spend mechanism);
   its scan-and-claim affirmation is superseded by this entry.
+
+
+## 2026-08-22 — AssetId derivation vs contract §21 (RESOLVED by owner ruling)
+
+Contract §21 specified `AssetId = H("B3/ASSET" ‖ issuance_outpoint ‖
+issuance_policy_commitment)`; the audit found the code derived
+`SHA256d("b3/asset/v1" ‖ outpoint)` — untagged, domain-free, rule-free. The
+owner ruled the unified form `TaggedHash("B3/ASSET/V1") ‖ ModernChainDomain
+‖ issuance_outpoint ‖ H(genesis record)`: it keeps the contract's intent
+(outpoint + rules commitment) and strengthens it with the chain domain and
+genuine tagged hashing, matching the FN asset id. Treat §21 as reading this
+form. No mainnet asset was ever issued, so nothing historical changes.
+
+
+## 2026-08-22 — Fee/quote asset: native bUSD vs "USDT-like" / register L-3 (RESOLVED by owner ruling)
+
+Handoff §1.2 names "approved USDC/USDT-like assets" for settlement and fee denomination, §3.5 says "approved stablecoin AssetId", and the DEX register's L-3 (2026-08-19) said "denominated in USDT (a USDT-backed colored coin)". The owner ruled 2026-08-22 that FlowMesh's first real quote/fee asset is the **B3-native overcollateralized (CDP-backed) bUSD** (register L-6) and amended L-3 to "an approved dollar-stable `AssetId`" with bUSD first and bridged USDT/USDC addable later by explicit ruling. Treat §1.2/§3.5 as reading "approved dollar-stable AssetIds, native or bridged"; §3.5's rule that no asset qualifies by ticker and that base-chain liveness never depends on a stablecoin issuer is unchanged and strengthened (no issuer at all for bUSD). Handoff §3.6 (TEST_USDT before real bridges) is unchanged — TEST_USDT remains the regtest/testing quote asset; bUSD is the first *mainnet* one. Design record: [b3-native-stable-proposal.md](b3-native-stable-proposal.md); bridge direction: open-decisions OD-8.
+

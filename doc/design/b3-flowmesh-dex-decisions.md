@@ -9,18 +9,18 @@ authority once the owner has reviewed this commit. Where a ruling contradicts
 an earlier document, the contradiction is listed in §4 for reconciliation
 rather than silently resolved.
 
-**Leverage scope update (2026-08-19, late session):** with the spot
-certified-log foundation landed and green, the owner re-activated the leverage
-track ("we need to have leverage, like 10x"), superseding the production
-brief's §29 exclusion per precedence. The perp design direction discussed and
-presented: same uniform-price curve auction on a second (position-settled)
-book; oracle-free internal index (spot clearing) and mark (perp clearing);
-exact-integer funding with dust swept to the insurance fund; initial margin =
-notional/10; cross + isolated per L-6; liquidation as the Hyperliquid-parity
-cascade (forced order into the next clearing at bankruptcy bound → insurance
-fund takeover with remaining margin → ADL last resort). All numeric thresholds
-REVISABLE provisional constants. Implementation not yet started at the time of
-this commit.
+**Futures scope (CORRECTED per the Codex repair directive, 2026-08-19):** the
+ONLY locked futures requirements are:
+
+    FlowMesh will support futures.
+    Maximum leverage = 10×.
+
+Nothing else is decided. Perpetual vs dated futures, isolated vs cross
+margin, funding, the mark/index source, maintenance margin, liquidation
+mechanics/penalties, an insurance fund, and ADL are ALL OPEN owner
+decisions. The perp/margin/liquidation material discussed in-session
+(including the Hyperliquid-parity cascade) is a PROPOSAL record only and
+must not be read as approved. No futures/leverage code exists.
 
 ---
 
@@ -30,16 +30,16 @@ this commit.
 |---|---|---|
 | L-1 | **Microblocks are FlowMesh's primary execution unit**, with speed comparable to Hyperliquid (sub-second cadence target). | Confirms the protocol brief §13 direction and adds a latency bar. |
 | L-2 | **Only FN Coin holders may produce microblocks** and confirm FlowMesh trading transitions. | Matches brief §11. Whether bare holding suffices or a lock/activate-1-FN seat is required stays OPEN (O-1). |
-| L-3 | **DEX fees are denominated in USDT** (a USDT-backed colored coin) **and collected by FN Coin holders.** | Matches brief §18. Distribution rule OPEN (O-4). |
-| L-4 | **Leverage up to 10x is required.** | Reverses the audit brief's own §15/§23 "no leverage / no liquidations in v1" scoping — see §4. |
-| L-5 | **The leveraged instrument is perpetual futures.** Spot remains fully collateralized; leverage lives only in the perp instrument. | Owner selection 2026-08-19. |
-| L-6 | **Margin modes: cross AND isolated, both from the start** (per-position selectable, Hyperliquid parity). | Owner selection 2026-08-19. |
+| L-3 | **DEX fees are denominated in an approved dollar-stable `AssetId` and collected by FN Coin holders** (AMENDED by owner ruling 2026-08-22; the 2026-08-19 wording was "denominated in USDT (a USDT-backed colored coin)"). The first approved fee asset is the native **bUSD** (L-6). Bridged USDT/USDC may be added to the approved fee-asset set later by explicit ruling; no asset qualifies by name or ticker (handoff §3.5). | Intent of brief §18 kept (dollar-denominated fees to FN holders); the issuer dependency is removed. Distribution rule OPEN (O-4). |
+| L-4 | **FlowMesh will support futures; maximum leverage = 10×.** | The complete locked futures statement. Everything else about futures is OPEN (see the corrected scope note above); the previously recorded "perpetuals" and "cross+isolated" entries are WITHDRAWN as over-claims per the Codex repair directive. |
+| L-5 | **Spot and futures are SEPARATE STATE DOMAINS** (owner ruling 2026-08-22, binding accounting correction). | Spot orders may reserve and consume ONLY spot balances. Futures positions, margin, fees, PnL and liquidations may affect ONLY futures balances. Funds move between the domains only through explicit `SPOT_TO_FUTURES` and `FUTURES_TO_SPOT` actions; the latter requires a margin-safety check. B3 deposits credit spot by default; B3 withdrawals debit spot only. The B3 vault may be pooled physically, but its spot and futures liabilities are accounted separately (each domain carries its own solvency identity). The spot ledger is NOT a universal balance that futures logic can consume automatically: the futures ledger is a separate class. Futures themselves are NOT implemented now (L-4 stays the only other locked futures statement); the two transfer action types are reserved (append-only numbering) and rejected in v1. |
+| L-6 | **FlowMesh's first real quote asset is a B3-native overcollateralized (CDP-backed) stablecoin, bUSD** (owner ruling 2026-08-22). No bridge, federation, or external stablecoin issuer is a dependency of FlowMesh; the fiat path is external B3 markets (buy B3 outside → deposit → lock as collateral or trade; winnings exit as B3). | Design record: [b3-native-stable-proposal.md](b3-native-stable-proposal.md). RULED: the direction, collateral-backed (never seigniorage/algorithmic), FN-certified oracle as the single trust point, formula-sized debt ceiling, collateral custody in the keyless DEX vault, CDP as a third state domain beside spot/futures (extension of L-5), B3-only collateral at launch with BTC added when SPV peg-in exists. OPEN (owner, proposal §7): policy name, every oracle parameter, MCR/CCR/ceiling formula/fees/rewards, bad-debt order, the resequencing of the oracle+liquidation engine ahead of futures. Bridged USDT/USDC become optional extra liquidity, not the base. |
 
 ## 2. Defaults adopted (REVISABLE, not protocol-locked)
 
 | # | Default | Basis |
 |---|---|---|
-| D-1 | ~~Matching mechanism: keep the implemented uniform-price batch-auction engine~~ **SUPERSEDED same day** by the owner's production implementation brief (2026-08-19, §4/§8): v1 matching is a **price-time-priority limit-order book** (`orders[order_id]` with price and remaining quantity; execution order = canonical microblock action order). The curve auction engine (`src/flowmesh/clearing.h`) remains in-tree, unwired, as a possible future order type. | The production brief post-dates the "no preference" answer and specifies the order-book state model explicitly. |
+| D-1 | **THE approved spot matching model is the uniform-price curve auction** (persistent per-account BID/ASK demand curves, canonical (signer, sequence, action_id) execution order, exactly ONE maximum-volume uniform-price clearing pass per microblock, largest-remainder allocation). Price-time priority and a conventional order book are explicitly NOT selected and must not be introduced; BUY/SELL intents map onto degenerate curves preserving these economics exactly. (An intermediate same-day recording that price-time matching had been selected was an error, corrected by the Codex re-audit directive.) | Final settled state per the Codex repair directives, 2026-08-19. |
 | D-2 | **Amount quantization instead of rounding**: order quantities are whole multiples of a provisional lot (`QTY_LOT`); price is quote units per lot, so every fill's quote leg is exact integer arithmetic with **no rounding rule at all**. The only floor division is the taker fee (`floor(quote · fee_ppm / 1e6)`). Lot/tick values per market are OD-7 (owner); the constants are provisional. | Simplest deterministic arithmetic satisfying the brief's "explicit overflow and rounding rules". |
 | D-3 | **Action authorization**: BIP340 x-only Schnorr over a domain-tagged action digest, account id = tagged hash of the pubkey, behind a swappable authenticator seam. | Brief §15 requires reusing existing repo primitives (no BLS); BIP340 is in-tree. Seam keeps it replaceable if the owner rules otherwise. |
 
@@ -58,46 +58,79 @@ Ordered so that the earlier ones unblock the most work.
   (= OD-6 in [b3-open-decisions.md](b3-open-decisions.md)).
 - **O-4 Fee distribution rule** — proposer takes its block's fees vs pro-rata
   across all active seats (affects proposer incentives; decide with O-2).
-- **O-5 Deterministic mark price** for perps — every validator must compute the
+- **O-5 Deterministic mark price** for any future leveraged market — every validator must compute the
   identical price. Either derived purely from internal clearing state, or
   oracle inputs entering as ordered microblock actions (which makes the oracle
-  a privileged actor to be specified). Hardest new decision L-4/L-5 creates.
+  a privileged actor to be specified). Hardest decision any future leveraged market creates.
 - **O-6 Funding-rate rule** — formula, interval, clamps.
 - **O-7 Liquidation mechanics** — trigger rule, who executes (keeper actions vs
   automatic engine step), penalty, and the insolvency backstop (insurance fund
-  vs socialized loss). Cross-margin (L-6) requires whole-account atomic
+  vs socialized loss). Any cross-margin design (undecided) would require whole-account atomic
   evaluation.
 - **O-8 Per-market parameters** — price tick / lot / fee precision (= OD-7),
   per-market leverage caps within the global 10x.
+- **O-9a Cross-round lock release / view-change rule** — permanent split
+  locks may halt FlowMesh indefinitely (safe floor); any unlock rule is
+  a consensus-safety choice reserved to the owner.
+- **O-9b Certificate finality semantics** — whether a threshold
+  certificate is irreversible FlowMesh finality; the current
+  certificate→commit behavior is a provisional implementation model.
+- **O-9c consumed_deposits retention and same-slot deposit/trading
+  semantics** — provisional model state; do not activate or extend.
+- **O-10 bUSD parameters and oracle** — every item in [b3-native-stable-proposal.md](b3-native-stable-proposal.md) §7 (oracle source/median/TWAP/bounded move/staleness/breaker/penalties; MCR, CCR, debt-ceiling formula, fees, stability-pool rewards; bad-debt order; CDP domain confirmation; engine resequencing). The FN-certified oracle ruled for bUSD is the intended answer to O-5 for any later leveraged market — same oracle, decided once.
 - **O-9 Vault mechanism ratification** — the consumed-finalized-receipt keyless
   vault in `src/modern/vault.h` is implemented model-only and was never
   owner-ratified; deposits/withdrawals for the DEX depend on it (or a
   replacement).
 
+## 3b. PROVISIONAL DEFAULTS under the solve-don't-ask mandate (2026-08-20)
+
+**Owner mandate (chat, 2026-08-20): "you should solve issues instead of
+making ?" — pick working answers; the owner will change decisions where
+necessary.** Accordingly the open items above now carry CLAUDE-SELECTED
+PROVISIONAL DEFAULTS. Rules of this section: every default is (a)
+visibly recorded here, never silently embedded; (b) overridable by one
+owner sentence at any time; (c) INVALID FOR MAINNET until the owner
+ratifies it explicitly — staging/testnet only. "Provisional" is not
+"approved."
+
+| Open item | Provisional default | Rationale (two lines) |
+|---|---|---|
+| O-1 seat mechanism | Lock/activate exactly 1 FN → bind one operator key → 1 seat; unlocked FN stays freely transferable. | The brief's own v1 direction; makes the active set explicit state and keeps FN liquid. |
+| O-2 proposer/committee/threshold | Round-robin over the sorted active seats; committee = ALL active seats; fault bound f = floor((k−1)/3); threshold t = MinCertificateThreshold(k, f). | Matches the implemented schedule; classic BFT bound keeps t both safe (2t−k>f) and live (t≤k−f) for every k≥4. |
+| Timeout policy | Round timeout = 4× target cadence (cadence 250 ms → 1 s), doubling per round, capped at 30 s. | Local liveness only — never touches deterministic state; conservative against false timeouts. |
+| O-3 / OD-6 anchor | **RULED 2026-08-22: `FLOWMESH_ANCHOR_DEPTH = 30`** (~30 min at the 60 s Modern-PoS interval). The SAME depth governs recognizing deposits, accepting microblock anchors, and making certified withdrawal receipts redeemable. Distinct from `MODERN_REORG_HORIZON = 1440`: the anchor depth protects FlowMesh custody against ordinary recent B3 reorgs; the horizon prevents deep Modern-PoS chain replacement. Reorg beyond the anchor depth = safe halt (unchanged). | Owner ruling replaces the paper default of 12. |
+| O-4 fee distribution | Proposer takes its block's fees; rate 0 on staging. | Simplest deterministic rule and a direct liveness incentive; trivially replaceable by pro-rata later. |
+| O-9 vault | **RATIFIED 2026-08-22: the keyless receipt-vault.** A withdrawal becomes B3-redeemable only when: the receipt exists in a certified microblock AND its B3 anchor is still canonical AND that anchor is buried ≥ FLOWMESH_ANCHOR_DEPTH AND the receipt_id has not been consumed. On redemption: withdrawal amount → the user destination; remaining value → DEX_VAULT(VAULT_POOL_CHANGE); receipt_id consumed exactly once. No custodian key, no arbitrary change destination, no replay. | Owner ruling; mechanism as implemented, redeemability rule now fixed. |
+| O-9a cross-round unlock | NONE — permanent locks, safe halt. | The conservative floor is itself the decision; any unlock rule would be a new consensus-safety surface. |
+| O-9b certificate finality | **RULED 2026-08-22: YES.** A valid threshold certificate finalizes that microblock and state sequence — no FlowMesh rollback. A CONFLICTING valid certificate must be recorded as evidence and cause a FAIL-SAFE HALT, never silently ignored. This finalizes FlowMesh state only; it does NOT by itself make a withdrawal redeemable on B3 (see O-9). | Owner ruling; the silent `return true` for a conflicting past-sequence certificate is replaced by evidence + halt. |
+| O-9c consumed_deposits | Retained; deposits execute before trading within a slot (current behavior). | Matches the implemented canonical order; nothing activates until deposits exist anyway. |
+| OD-7 precision | QTY_LOT = 1e6, integer price ticks, per-market caps deferred until a second market exists. | The constants already in code, now named as the default rather than left implicit. |
+| Deposit beneficiary binding | **RULED 2026-08-22: Option A, amended — `DEX_VAULT v2`.** `policy_commitment` = the shared vault identity; `policy_params = {kind, shard, flowmesh_account_id}` with two kinds: `USER_DEPOSIT` (carries the FlowMesh account id; may credit that account exactly once) and `VAULT_POOL_CHANGE` (no beneficiary; can NEVER create a FlowMesh balance). Withdrawal change is therefore never mistaken for a user deposit. All outputs still belong to the same keyless vault policy. | Owner ruling. |
+| O-5..O-8 futures mechanics | Explicitly DEFERRED — deferral is the decision; nothing in spot v1 is blocked by them. | Only "supported, max 10×" is locked; mechanics wait for the leverage phase. |
+
 ## 4. Contradictions created (reconcile in reviewed commits)
 
-- **Leverage scope, final state (2026-08-19, two rulings same day):** the chat
-  ruling required 10x leverage (perps, cross+isolated — L-4/L-5/L-6); the
-  owner's subsequent production implementation brief §29 explicitly excludes
-  leverage/liquidations/perpetuals from *this* implementation ("future
-  research"). Read together per precedence (later ruling governs the current
-  scope): **v1 ships spot-only; L-4/L-5/L-6 stand as locked requirements for a
-  later phase**, layered on the same microblock rails. Neither ruling is
-  discarded.
+- **Leverage scope, final state (Codex repair directive, 2026-08-19):** only
+  "futures supported, max 10×" is locked. v1 ships spot-only; every other
+  futures mechanic is an open owner decision and earlier same-day recordings
+  claiming more (perpetuals, cross+isolated margin, liquidation cascade) are
+  corrected as over-claims.
 - L-4 reverses the 2026-08-19 audit brief's §15 ("no leverage initially, no
   liquidation system initially") and §23 (leverage/liquidations listed under
   "do not add yet") — resolved by the sequencing reading above.
 - [b3-implementation-status.md](b3-implementation-status.md) §7 lists
-  positions/margin/PnL as missing-by-scope for FlowMesh; with L-4/L-5 they are
+  positions/margin/PnL as missing-by-scope for FlowMesh; with the locked futures requirement they are
   now required scope (still gated behind the contract's clean-H+1 sequencing
   for any consensus wiring).
-- The master handoff's FlowMesh sections should gain the L-1..L-6 rulings when
+- The master handoff's FlowMesh sections should gain the L-1..L-4 rulings when
   next revised; until then this register is the pointer.
 
 ## 5. Implementation status (2026-08-19, certified-log build-out)
 
-Landed on `claude/b3-clean-architecture` (commits `bd80478..`, all layers
-test-compiled only, nothing wired into B3 consensus):
+Landed on `claude/b3-clean-architecture` (commits `bd80478..`; the FlowMesh
+layer is COMPILED into the node library but ACTIVATION-UNWIRED — no consensus,
+networking or RPC path reaches it):
 
 - **FlowMeshState** value type (ledger + persistent curve book + signer
   sequences + consumed deposits) with a PURE canonical state root;
@@ -153,9 +186,13 @@ DepositVerifier and withdrawal-authorization consensus wiring once O-9
 and base-chain activation land; incremental state root only if scale
 ever demands it (see above).
 
-## 6. Build consequences (original plan, superseded by §5 where they overlap)
+## 6. Build consequences — HISTORICAL SKETCH (non-normative)
 
-Layered so spot determinism lands first and perps reuse the same rails:
+Superseded by §5 where they overlap; retained only as a record of the
+original planning pass. Nothing here is approved futures design — the
+locked futures facts remain "supported" and "max leverage 10×" only.
+The original layering (spot determinism first, later markets reusing
+the same rails):
 
 1. **Microblock object** (`src/flowmesh/`, header-only/test-only): serializable
    `{sequence, parent_microblock_id, b3_anchor, actions, previous_state_root,
@@ -171,12 +208,14 @@ Layered so spot determinism lands first and perps reuse the same rails:
    stream → byte-identical roots.
 5. **Fee hook** — clearing charges a USDT-denominated fee (rate provisional,
    zero acceptable for tests) into per-seat accrual; distribution per O-4.
-6. **Perp layer on the same rails** (after spot determinism): position/margin
-   account state (cross + isolated per L-6), funding accrual (O-6), mark-price
-   rule (O-5), liquidation engine (O-7) — all as new action types and state
-   under the same microblock/certification structure. 10x enforced at margin
-   check (per-market caps per O-8).
+6. **Futures layer on the same rails** (after spot determinism; instrument
+   form, margin modes, funding, mark price, liquidation and backstop are ALL
+   open owner decisions — only "futures, max 10×" is locked). Structured as
+   new action types and state under the same microblock/certification
+   machinery when the decisions land.
 
 Consensus wiring of any of this remains gated behind the contract's clean-H+1
 sequencing and the O-9/OD-6 decisions; everything above is buildable and
 testable header-only first, as the existing FlowMesh layer already is.
+- **L-3 amendment (2026-08-22):** the master handoff §1.2 phrase "approved USDC/USDT-like assets" and §3.5 "approved stablecoin AssetId" now read as including the native bUSD; FINALIZED.md's earlier "DEX fees in USDT (colored)" line is superseded by this register. Recorded in the conflicts register.
+- **bUSD sequencing vs handoff §5.3/§5.11:** a CDP stable needs the deterministic oracle and liquidation engine before futures; the locked rule "leverage only after spot" is kept (bUSD also comes after spot), but "no production oracle economics in the initial spot target" now ends at the spot milestone rather than at the futures milestone. Owner to confirm the order in the proposal §6.2.

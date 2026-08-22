@@ -18,26 +18,20 @@ namespace modern {
 /**
  * Modern-era proof-of-stake boundary (heights > LEGACY_FINAL_HEIGHT).
  *
- * MISSING RULE SET — deliberately not invented here. The following modern
- * PoS semantics are NOT yet defined anywhere in this repository, and this
- * module must not guess them:
+ * The rule set is the frozen Modern PoS V1 specification
+ * (doc/design/b3-modern-pos-spec.md; primitives in modern/pos_v1.h):
+ * deterministic stake-weighted eligibility over a chained seed, exact
+ * timestamps encoding recovery rounds, and BIP340 validator signatures.
+ * Legacy stake modifiers and legacy in-block transaction offsets are NOT
+ * carried into the modern era.
  *
- *  - stake eligibility: which UTXOs may stake, minimum amounts, ages;
- *  - kernel/selection: what replaces the legacy Peercoin-v1 kernel, and
- *    the randomness source backing it (legacy stake modifiers and legacy
- *    in-block transaction offsets are NOT carried into the modern era —
- *    no documented modern rule requires them);
- *  - difficulty/target adjustment for modern stakes;
- *  - reward schedule and fee treatment;
- *  - the structure that marks a modern block as proof-of-stake (the
- *    legacy coinstake shape is not assumed);
- *  - block-signature or attestation scheme;
- *  - validator-set and finality semantics.
- *
- * Until an approved rule set defines these, CheckModernStake() REJECTS
- * every block handed to it: a modern era without rules cannot validate
- * blocks, and failing closed is the only safe default. Tests may install
- * an adapter to exercise the dispatch plumbing.
+ * Dispatch remains fail-closed by configuration: while the chain's
+ * Consensus::Params::modern_pos parameter block is unset — every shipped
+ * network — CheckModernStake() REJECTS every block (`no-modern-pos-rules`).
+ * The V1 rules are applied by validation only when the block is configured
+ * (regtest scaffolding until mainnet numbers are ratified). Tests may still
+ * install a PosValidator adapter to exercise the dispatch plumbing; it is
+ * never set in production (guard-tested).
  */
 class PosValidator
 {
@@ -77,14 +71,10 @@ constexpr StakeRules SelectStakeRules(const int32_t block_version, const Consens
 }
 
 /**
- * Dispatch entry for a MODERN-era B3 block. Enforces that modern PoS
- * consumes only the modern codecs, then defers to the installed rule set.
- * With no rule set installed (the current state of the repository) every
- * block is rejected.
+ * The codec gate every modern-PoS path shares: modern PoS consumes only the
+ * modern block and transaction codecs, never a legacy encoding.
  */
-inline bool CheckModernStake(const CBlock& block, const CBlockIndex& parent,
-                             const CCoinsViewCache& view, BlockValidationState& state,
-                             const PosValidator* validator)
+inline bool CheckModernPosCodec(const CBlock& block, BlockValidationState& state)
 {
     if (SelectStakeRules(block.nVersion, Consensus::B3Era::MODERN) != StakeRules::MODERN) {
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-pos-codec",
@@ -96,6 +86,21 @@ inline bool CheckModernStake(const CBlock& block, const CBlockIndex& parent,
                                  "legacy-encoded transaction cannot enter modern PoS validation");
         }
     }
+    return true;
+}
+
+/**
+ * Dispatch entry for a MODERN-era B3 block on the test-adapter and
+ * fail-closed paths. Enforces the codec gate, then defers to the installed
+ * test rule set; with none installed AND no configured V1 parameter block
+ * (validation routes configured chains to the V1 rules directly) every
+ * block is rejected.
+ */
+inline bool CheckModernStake(const CBlock& block, const CBlockIndex& parent,
+                             const CCoinsViewCache& view, BlockValidationState& state,
+                             const PosValidator* validator)
+{
+    if (!CheckModernPosCodec(block, state)) return false;
     if (validator) {
         return validator->CheckStake(block, parent, view, state);
     }

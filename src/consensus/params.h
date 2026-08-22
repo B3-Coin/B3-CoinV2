@@ -7,6 +7,7 @@
 #ifndef BITCOIN_CONSENSUS_PARAMS_H
 #define BITCOIN_CONSENSUS_PARAMS_H
 
+#include <consensus/modern_pos_params.h>
 #include <script/verify_flags.h>
 #include <uint256.h>
 
@@ -136,10 +137,13 @@ struct Params {
     std::optional<uint32_t> transition_pow_bits;
     /**
      * The subsidy a temporary-PoW corridor coinbase may claim on top of
-     * fees. The mainnet corridor reward model is an OPEN design decision;
-     * 0 (fees only) is the neutral default used by regtest scaffolding.
+     * fees. RATIFIED (owner ruling 2026-08-21): 0 -- fees only -- on
+     * mainnet; corridor miners' incentive is bootstrapping their own
+     * validator position, not issuance. Unset FAILS CLOSED (corridor
+     * blocks are refused), so the reward can never ship as an accidental
+     * default: every network states its value explicitly.
      */
-    int64_t transition_pow_reward{0};
+    std::optional<int64_t> transition_pow_reward;
     /**
      * MIN_STAKE_AMOUNT: the smallest principal a v1 STAKE output may carry.
      * Unset means the stake economics are unresolved and stake creation
@@ -147,6 +151,14 @@ struct Params {
      * scaffolding value.
      */
     std::optional<int64_t> min_stake_amount;
+    /**
+     * Modern PoS V1 parameter block (consensus/modern_pos_params.h). Unset
+     * means modern-PoS rules are unconfigured and every modern-PoS block
+     * FAILS CLOSED (`no-modern-pos-rules`). Real chainparams never set it:
+     * every value inside is REVISABLE_BEFORE_MAINNET scaffolding until the
+     * owner ratifies mainnet numbers (a guard test pins this).
+     */
+    std::optional<ModernPosParams> modern_pos;
     /**
      * TEST-ONLY override of the historical FN disintegration collateral
      * (Proof of Disintegration). Unset everywhere except regtest fixtures:

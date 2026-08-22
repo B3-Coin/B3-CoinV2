@@ -13,6 +13,7 @@
 #include <txmempool.h>
 #include <util/feefrac.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -33,6 +34,8 @@ class ChainstateManager;
 namespace Consensus { struct Params; };
 
 using interfaces::BlockRef;
+
+class CKey;
 
 namespace node {
 class KernelNotifications;
@@ -85,12 +88,31 @@ public:
         // Whether to call TestBlockValidity() at the end of CreateNewBlock().
         bool test_block_validity{true};
         bool print_modified_fee{DEFAULT_PRINT_MODIFIED_FEE};
+        /**
+         * Modern-PoS production (frozen V1 spec §3-§5): the x-only validator
+         * key this node produces for. Required for MODERN_POS-phase heights
+         * on a configured B3 chain; production throws without it. The block
+         * is assembled fully deterministic (exact round timestamp, sentinel
+         * bits, coinbase key declaration) and must be SIGNED by the caller
+         * after the merkle root is finalized (node::SignModernPosBlock).
+         */
+        std::optional<std::array<unsigned char, 32>> modern_pos_validator_key;
     };
 
     explicit BlockAssembler(Chainstate& chainstate, const CTxMemPool* mempool, const Options& options);
 
     /** Construct a new block template */
     std::unique_ptr<CBlockTemplate> CreateNewBlock();
+
+    /**
+     * Sign a fully assembled modern-PoS block with the validator secret key
+     * (frozen V1 spec §5). Must be called AFTER the merkle root is final:
+     * the signature commits to the block hash, which commits to the
+     * coinbase-declared validator key. Returns false if the chain has no
+     * pinned modern domain or signing fails.
+     */
+    static bool SignModernPosBlock(CBlock& block, const CKey& validator_key,
+                                   const Consensus::Params& params);
 
     /** The number of transactions in the last assembled block (excluding coinbase transaction) */
     inline static std::optional<int64_t> m_last_block_num_txs{};

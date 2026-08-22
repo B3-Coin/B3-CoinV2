@@ -12,6 +12,7 @@
 #include <string>
 
 class CBlock;
+namespace Consensus { struct Params; }
 class CBlockHeader;
 class CScript;
 class CTransaction;
@@ -35,6 +36,15 @@ CScript ParseScript(const std::string& s);
 std::string ScriptToAsmStr(const CScript& script, bool fAttemptSighashDecode = false);
 [[nodiscard]] bool DecodeHexTx(CMutableTransaction& tx, const std::string& hex_tx, bool try_no_witness = false, bool try_witness = true);
 [[nodiscard]] bool DecodeHexBlk(CBlock&, const std::string& strHexBlk);
+/**
+ * Chain-aware overload: on a legacy-B3 chain the block codec is
+ * marker-aware (legacy nTime transactions plus the historical trailing
+ * signature, or the modern body plus the modern-PoS trailing signature
+ * vector); other chains keep the stock witness codec. RPC block
+ * submission must use this form on B3 or a modern-PoS block silently
+ * loses its validator signature.
+ */
+[[nodiscard]] bool DecodeHexBlk(CBlock&, const std::string& strHexBlk, const Consensus::Params& params);
 bool DecodeHexBlockHeader(CBlockHeader&, const std::string& hex_header);
 
 [[nodiscard]] util::Result<int> SighashFromStr(const std::string& sighash);

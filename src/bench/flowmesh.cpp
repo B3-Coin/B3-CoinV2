@@ -4,7 +4,7 @@
 
 //! Honest latency benchmark of the FlowMesh deterministic engine: the
 //! COMPLETE slot pipeline — action-set construction, canonicalization,
-//! authentication calls, per-signer sequencing, curve submission with
+//! per-signer sequencing, curve submission with
 //! ledger reservations, uniform-price clearing, internal settlement,
 //! and both commitment roots — measured per slot in steady state.
 //!
@@ -19,15 +19,17 @@
 //!    moves quote one way; funding gives ~10^7 slots of headroom, far
 //!    beyond any measurement horizon, and solvency is asserted after
 //!    the run.
-//!  - The authenticator is a constant-true stub: credential
-//!    cryptography does not exist in this engine yet and is therefore
-//!    EXCLUDED from these numbers; real signature/quorum verification
-//!    will add its own per-action cost on top of everything here.
+//!  - NO AUTHENTICATION is measured anywhere here: execution performs
+//!    no cryptography (credentials are pre-admission evidence, judged
+//!    at pool/proposal level, outside this engine); real signature and
+//!    quorum verification add their own per-action cost on top of
+//!    every number below.
 //!  - Per-slot cost includes hashing the ENTIRE persistent book and
 //!    ledger into the state root — the price of a per-slot commitment,
 //!    deliberately not excluded.
 
 #include <bench/bench.h>
+#include <test/util/asset.h>
 
 #include <arith_uint256.h>
 #include <cassert>
@@ -36,6 +38,7 @@
 #include <flowmesh/clearing.h>
 #include <flowmesh/ledger.h>
 #include <flowmesh/state.h>
+#include <test/util/flowmesh.h>
 #include <modern/asset.h>
 #include <modern/policy.h>
 #include <primitives/transaction.h>
@@ -48,13 +51,6 @@ namespace {
 
 using Breakpoint = flowmesh::ClearingEngine::Breakpoint;
 
-//! Constant-true stub: see the honesty notes above.
-class PassAuth final : public flowmesh::ActionAuthenticator
-{
-public:
-    bool Authenticate(const flowmesh::Action&) const override { return true; }
-};
-
 flowmesh::AccountId Account(const uint32_t i)
 {
     return ArithToUint256(arith_uint256{i} + 1);
@@ -62,14 +58,13 @@ flowmesh::AccountId Account(const uint32_t i)
 
 modern::AssetId Base()
 {
-    return modern::IssuanceAssetId(
+    return modern::test_only::SyntheticAssetId(
         COutPoint{Txid::FromUint256(ArithToUint256(arith_uint256{0x11})), 0});
 }
 
 struct SlotBench {
     flowmesh::FlowMeshState state;
-    flowmesh::Ledger& ledger;
-    PassAuth auth;
+    const flowmesh::Ledger& ledger;
     flowmesh::BatchExecutor exec;
     const size_t n_accounts;
     const size_t k;
@@ -77,16 +72,16 @@ struct SlotBench {
 
     SlotBench(const size_t n, const size_t k_points, const bool cross)
         : state{uint256::ONE, Base(), modern::NativeAsset(), k_points},
-          ledger{state.ledger},
-          exec{state, auth},
+          ledger{state.LedgerView()},
+          exec{state},
           n_accounts{n},
           k{k_points},
           crossing{cross}
     {
         assert(n_accounts % 2 == 0);
         for (uint32_t i{0}; i < n_accounts; ++i) {
-            ledger.Deposit(Account(i), modern::NativeAsset(), CAmount{1} << 40);
-            ledger.Deposit(Account(i), Base(), CAmount{1} << 40);
+            flowmesh::test_only::StateFunding::Fund(state, Account(i), modern::NativeAsset(), CAmount{1} << 40);
+            flowmesh::test_only::StateFunding::Fund(state, Account(i), Base(), CAmount{1} << 40);
         }
     }
 
@@ -143,10 +138,9 @@ struct SlotBench {
             action.type = static_cast<uint8_t>(bid ? flowmesh::ActionType::SUBMIT_BID
                                                    : flowmesh::ActionType::SUBMIT_ASK);
             action.curve = Curve(bid);
-            action.credential = {0x01};
             actions.push_back(std::move(action));
         }
-        return exec.ExecuteSlot(actions);
+        return *exec.ExecuteSlot(actions);
     }
 
     //! Untimed verification that the workload is what it claims.
@@ -189,20 +183,20 @@ void RunRootBench(benchmark::Bench& bench, const size_t n_accounts)
 {
     flowmesh::FlowMeshState state{uint256::ONE, Base(), modern::NativeAsset()};
     for (uint32_t i{0}; i < n_accounts; ++i) {
-        state.ledger.Deposit(Account(i), modern::NativeAsset(), CAmount{1} << 40);
-        state.ledger.Deposit(Account(i), Base(), CAmount{1} << 40);
+        flowmesh::test_only::StateFunding::Fund(state, Account(i), modern::NativeAsset(), CAmount{1} << 40);
+        flowmesh::test_only::StateFunding::Fund(state, Account(i), Base(), CAmount{1} << 40);
         const bool bid{i % 2 == 0};
         const std::vector<Breakpoint> curve{bid
             ? std::vector<Breakpoint>{{100, 50}, {200, 0}}
             : std::vector<Breakpoint>{{299, 0}, {300, 50}}}; // standing, never crossing
-        const bool ok{state.book.SubmitCurve(Account(i),
-                                             bid ? flowmesh::ClearingEngine::Side::BID
-                                                 : flowmesh::ClearingEngine::Side::ASK,
-                                             curve)};
+        const bool ok{state.SubmitCurve(Account(i),
+                                        bid ? flowmesh::ClearingEngine::Side::BID
+                                            : flowmesh::ClearingEngine::Side::ASK,
+                                        curve)};
         assert(ok);
-        state.next_seq[Account(i)] = i + 1;
+        flowmesh::test_only::StateFunding::SetNextSequence(state, Account(i), i + 1);
     }
-    assert(state.ledger.SolvencyHolds());
+    assert(state.LedgerView().SolvencyHolds());
     bench.unit("root").run([&] {
         const uint256 root{state.Root()};
         ankerl::nanobench::doNotOptimizeAway(root);

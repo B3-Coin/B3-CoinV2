@@ -164,8 +164,12 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 //    B3 scrypt eligibility hash against the header's nBits
                 //    (block identity stays the modern SHA256d hash and is
                 //    deliberately NOT what is checked here).
-                //  - MODERN_POS: the stock SHA256d check remains the
-                //    placeholder until the modern PoS header spec.
+                //  - MODERN_POS: with the V1 rule set configured there is
+                //    no proof-of-work at all — nBits is the enforced
+                //    sentinel and validity is stake eligibility, re-judged
+                //    at connect; only the sentinel is re-checked here. With
+                //    no rule set configured the stock SHA256d check remains
+                //    the placeholder.
                 switch (Consensus::GetConsensusPhase(pindexNew->nHeight, consensusParams)) {
                 case Consensus::ConsensusPhase::LEGACY_POS:
                     break;
@@ -184,7 +188,12 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                     break;
                 }
                 case Consensus::ConsensusPhase::MODERN_POS:
-                    if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
+                    if (consensusParams.modern_pos) {
+                        if (pindexNew->nBits != consensusParams.modern_pos->sentinel_bits) {
+                            LogError("%s: modern-PoS sentinel nBits mismatch: %s\n", __func__, pindexNew->ToString());
+                            return false;
+                        }
+                    } else if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
                         LogError("%s: CheckProofOfWork failed: %s\n", __func__, pindexNew->ToString());
                         return false;
                     }
@@ -217,6 +226,35 @@ bool CBlockIndexWorkComparator::operator()(const CBlockIndex* pa, const CBlockIn
     // First sort by most total work, ...
     if (pa->nChainWork > pb->nChainWork) return false;
     if (pa->nChainWork < pb->nChainWork) return true;
+
+    // B3 modern-PoS fork choice (frozen V1 spec section 6), applied within
+    // an equal-chainwork class when the modern-PoS rule set is configured.
+    // Height decides first (rule 1; with the constant sentinel proof,
+    // equal work normally implies equal height — this makes the order total
+    // when it does not). For a same-height modern-PoS pair, the first
+    // divergent blocks decide: the lower recovery round — equivalently the
+    // lower timestamp delta from the shared fork parent, since timestamps
+    // are exact — is the provably rarer eligibility and wins (rule 2);
+    // equal rounds resolve by lower block hash (rule 3, V1 form). All keys
+    // are immutable from header acceptance, so set ordering never mutates.
+    if (m_params && m_params->legacy_b3coin && m_params->modern_pos) {
+        if (pa->nHeight != pb->nHeight) return pa->nHeight < pb->nHeight;
+        if (pa != pb && pa->pprev && pb->pprev &&
+            Consensus::GetConsensusPhase(pa->nHeight, *m_params) ==
+                Consensus::ConsensusPhase::MODERN_POS) {
+            if (const CBlockIndex* fork{LastCommonAncestor(pa, pb)};
+                fork && fork->nHeight < pa->nHeight) {
+                const CBlockIndex* da{pa->GetAncestor(fork->nHeight + 1)};
+                const CBlockIndex* db{pb->GetAncestor(fork->nHeight + 1)};
+                if (da && db && da != db) {
+                    if (da->nTime != db->nTime) return da->nTime > db->nTime;
+                    const uint256 ha{da->GetBlockHash()};
+                    const uint256 hb{db->GetBlockHash()};
+                    if (ha != hb) return hb < ha;
+                }
+            }
+        }
+    }
 
     // ... then by earliest activatable time, ...
     if (pa->nSequenceId < pb->nSequenceId) return false;

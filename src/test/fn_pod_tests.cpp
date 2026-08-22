@@ -476,6 +476,7 @@ BOOST_FIXTURE_TEST_CASE(chain_derivation_and_determinism, PodTestSetup)
     mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
     mutable_consensus.transition_pow_length = 4;
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
 
     // A corridor block at H+1 spends a large legacy coin with a
     // collateral-sized gap: NEVER a PoD record (events after H are

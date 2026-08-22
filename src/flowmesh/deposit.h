@@ -78,7 +78,17 @@ class AnchorPolicy
 {
 public:
     virtual ~AnchorPolicy() = default;
+    //! Acceptable for a NEW proposal (canonical + buried to the
+    //! approved finality depth).
     virtual bool Acceptable(const AnchorRef& anchor) const = 0;
+    //! Still on the canonical B3 chain at all (depth-free): the test a
+    //! COMMITTED anchor must keep passing. An anchor relied on by
+    //! certified FlowMesh history that stops being canonical must halt
+    //! unsafe FlowMesh progression — how deep-reorged history is then
+    //! treated is an OWNER DECISION; halting is the fail-safe floor.
+    //! A null anchor references no B3 state and trivially passes.
+    virtual bool StillCanonical(const AnchorRef& anchor) const = 0;
+    //! The anchor a proposer should use now.
     virtual AnchorRef Current() const = 0;
 };
 

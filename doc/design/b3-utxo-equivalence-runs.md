@@ -51,3 +51,54 @@ from connecting to production B3 nodes. Unblocking options (operator decision):
    capture procedure applies unchanged.
 
 The gate stands: no H/X pin and no startup replay wiring until T1/T2/T3 pass.
+
+
+## Campaign 2026-08-22 — REAL HISTORY, ALL THREE GATES: **PASSED**
+
+Data source: live-network sync (owner-authorized 2026-08-21; peer
+176.31.13.198 plus explorer-listed nodes). The port client synced and fully
+validated the real chain to height 807,709 (live tip at capture time); the
+compiled legacy client (`claude/b3-master-utxo-export` @ 9336752, arm64
+rebuild) validated the identical history offline from a de-XOR bootstrap of
+the port's block files (magic-verified b3 2e 1e e6), freezing at each
+capture height via -exportstopatheight. All exports and comparisons offline.
+
+| T | X_T (old client == explorer, cross-checked) | rows | three-way |
+|---|---|---|---|
+| 95,350 | 095f1cb3cf1f1300ad99f891c2c0bb13cc374d9215781ad988e82cc0086a8e45 | 86,374 | **EQUAL**, commitment 20594665fbd77086add00595ada5c76d22b964130b7a3c2f66dd1f1c6ca321f7 |
+| 110,000 | 2f5eece12025b19f2229b11d8dc06a017264bb7560af9073b5d19c0ff9e3f9c7 | 115,835 | **EQUAL**, commitment 9cf042db50ddcf369dfc1980f0f911e7bc952400bf63bb9fb923ae049c3a11eb |
+| 797,000 | 05a34afe1651642a893dc581b7957564e5d7e9a8856aee6dc7de71dbbc28c741 | 1,235,918 | **EQUAL**, commitment 7402ee2abb7071da75ba574678d2565972a7eebca19e558c4376d85683de62ee |
+
+Mutation-negative (per runbook, once per campaign, on the real T1 rows),
+exit codes captured UNPIPED: a single value edit (+1 base unit) → NOT
+EQUAL naming COutPoint(cf21b7b640, 1), **exit 1**; a naively dropped row →
+"count line says 86374 rows but 86373 were read", **exit 2**. The
+comparator provably distinguishes and its exit contract holds.
+
+Artifacts preserved (owner directive: never delete): full port datadir at
+807,709 (~/development/ON/b3-mainnet-sync-v2), frozen old-client datadirs at
+each T (b3-capture-T{1,2,3}-*), all row files and the 637 MB de-XOR
+bootstrap (b3-eqgate/) — the bootstrap alone suffices to rebuild any node
+offline.
+
+**Consequence: the H/X activation gate of
+[b3-utxo-equivalence.md](b3-utxo-equivalence.md) is SATISFIED.** Remaining
+before a mainnet pin: choose H (owner candidate under discussion: 815,000,
+M = 816,001), capture-and-verify once more AT H when it exists, and the
+X-distribution mechanics (pause vs precommit).
+
+**FN RELEASE GATE FINDING (same run, port-T3 state, equivalence-gated
+-podreport): R = 3,500 qualifying historical PoDs, all 3,500 claimable
+(supported funding scripts + canonical 1-COIN P2PKH markers; tiers 25M/20M/15M
+all represented). R exceeds the ratified MAX_FN_EVER_ISSUED = 1,000.** Per
+the recorded gate rule (commit 0714074): do not pin H/X in an FN-activating
+release, never truncate rights — the cap-vs-R conflict RETURNS TO THE OWNER.
+One sequencing note: the cap only binds an FN-activating release; H/X
+pinning for the base chain is not blocked if FN activation ships behind a
+later height, but the cap must be re-ruled before ANY FN issuance activates.
+
+Incident log (for the record): the port node crashed once mid-sync on a
+relayed unconfirmed legacy transaction (CalculateLockPointsAtTip assertion)
+— worked around with -blocksonly, tracked as a required fix; the 2016
+client's seed infrastructure and the b3nodes.net DNS seeds are dead, so
+peers must come from the explorer list or operator-supplied addnodes.

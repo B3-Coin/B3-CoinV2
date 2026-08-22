@@ -23,36 +23,58 @@ namespace flowmesh {
  * simple and deterministic anyway: canonical storage order, explicit
  * bounds, admit-or-refuse (no fancy eviction).
  *
- * Admission requires canonical shape and bounds only; authentication
- * happens at execution (and a proposer may pre-filter). Batch selection
- * is deterministic: unconsumed deposits in outpoint order, then per
- * signer the contiguous sequence run starting at the state's next
- * sequence — actions a microblock could actually apply.
+ * Signed actions AUTHENTICATE BEFORE they may occupy the authoritative
+ * (signer, sequence) index: a junk-credential submission is refused
+ * outright and can never shadow ("poison") a victim's legitimate
+ * future action at that sequence. Batch selection is deterministic:
+ * unconsumed deposits in outpoint order, then per signer the
+ * contiguous sequence run starting at the state's next sequence.
+ *
+ * THREADING: NOT thread-safe by design — a pool belongs to exactly one
+ * MeshNode and is driven from that node's single execution context.
  */
 class ActionPool
 {
 public:
-    explicit ActionPool(const size_t max_actions = 65536, const size_t max_bytes = 16 << 20)
-        : m_max_actions{max_actions}, m_max_bytes{max_bytes}
+    explicit ActionPool(const ActionAuthenticator* auth = nullptr,
+                        const size_t max_actions = 65536, const size_t max_bytes = 16 << 20)
+        : m_auth{auth}, m_max_actions{max_actions}, m_max_bytes{max_bytes}
     {
     }
 
     size_t Size() const { return m_by_id.size(); }
     size_t Bytes() const { return m_bytes; }
 
-    //! Admit one action. Refuses malformed shapes, duplicates, and
-    //! anything past the bounds. Refusal is not an error state.
+    //! Admit one action. Refuses malformed shapes, unauthenticated
+    //! signed actions, duplicates, per-(signer, sequence) conflicts,
+    //! and anything past the bounds. ATOMIC: every admission
+    //! precondition — authentication included — is checked BEFORE any
+    //! container or byte-count mutation, so Add can never report
+    //! success (or fail) while leaving an unreachable byte-counted
+    //! entry behind, and an invalid credential can never reserve a
+    //! (signer, sequence) slot.
     bool Add(const Action& action)
     {
         if (!action.ShapeIsCanonical()) return false;
+        const bool is_deposit{static_cast<ActionType>(action.type) == ActionType::DEPOSIT};
+        if (!is_deposit) {
+            // AUTHENTICATE FIRST: no index ownership for junk.
+            if (m_auth == nullptr || !m_auth->Authenticate(action)) return false;
+        }
         const uint256 id{action.Id()};
         if (m_by_id.count(id) > 0) return false;
         const size_t sz{static_cast<size_t>(::GetSerializeSize(action))};
         if (m_by_id.size() + 1 > m_max_actions || m_bytes + sz > m_max_bytes) return false;
+        if (is_deposit) {
+            if (m_deposits.count(action.outpoint) > 0) return false;
+        } else {
+            // First-seen-VALID wins per (signer, sequence).
+            if (m_signed.count({action.signer, action.sequence}) > 0) return false;
+        }
 
         m_by_id.emplace(id, action);
         m_bytes += sz;
-        if (static_cast<ActionType>(action.type) == ActionType::DEPOSIT) {
+        if (is_deposit) {
             m_deposits.emplace(action.outpoint, id);
         } else {
             m_signed.emplace(std::make_pair(action.signer, action.sequence), id);
@@ -71,7 +93,7 @@ public:
         std::vector<Action> out;
         for (const auto& [outpoint, id] : m_deposits) {
             if (out.size() >= max_actions) return out;
-            if (state.consumed_deposits.count(outpoint) > 0) continue;
+            if (state.DepositConsumed(outpoint)) continue;
             out.push_back(m_by_id.at(id));
         }
         const AccountId* current_signer{nullptr};
@@ -99,7 +121,7 @@ public:
     void PruneCommitted(const FlowMeshState& state)
     {
         for (auto it{m_deposits.begin()}; it != m_deposits.end();) {
-            if (state.consumed_deposits.count(it->first) > 0) {
+            if (state.DepositConsumed(it->first)) {
                 Drop(it->second);
                 it = m_deposits.erase(it);
             } else {
@@ -126,6 +148,7 @@ private:
         m_by_id.erase(it);
     }
 
+    const ActionAuthenticator* m_auth;
     const size_t m_max_actions;
     const size_t m_max_bytes;
     size_t m_bytes{0};

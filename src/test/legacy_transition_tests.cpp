@@ -298,8 +298,38 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
         const auto ok{chainman.ProcessTransaction(MakeTransactionRef(legacy_tx))};
         BOOST_REQUIRE_MESSAGE(ok.m_result_type == MempoolAcceptResult::ResultType::VALID,
                               "legacy mempool admission failed: " << ok.m_state.ToString());
+
+        // REGRESSION (live mainnet sync, 2026-08-21): a child spending an
+        // UNCONFIRMED legacy parent. Coin::nHeight is 30 bits on B3, so a
+        // MEMPOOL_HEIGHT sentinel that did not fit the field truncated, the
+        // parent looked like a coin at height ~1.07e9, and
+        // CalculateLockPointsAtTip asserted. The sentinel now fits (pinned by
+        // static_assert) and the child must simply be admitted.
+        {
+            const CBlockIndex* tip{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
+            CMutableTransaction child;
+            child.version = 1;
+            child.m_legacy_encoding = true;
+            child.nTime = static_cast<uint32_t>(tip->GetBlockTime() + 18);
+            child.vin.resize(1);
+            child.vin[0].prevout = COutPoint{CTransaction{legacy_tx}.GetHash(), 0};
+            child.vin[0].scriptSig = CScript{};
+            child.vout.emplace_back(legacy_tx.vout[0].nValue - 100'000, padded_script);
+            const auto child_ok{chainman.ProcessTransaction(MakeTransactionRef(child))};
+            BOOST_REQUIRE_MESSAGE(child_ok.m_result_type == MempoolAcceptResult::ResultType::VALID,
+                                  "child of unconfirmed legacy parent refused: "
+                                      << child_ok.m_state.ToString());
+            // And the mempool view reports the parent at the sentinel height.
+            {
+                LOCK2(cs_main, pool.cs);
+                const CCoinsViewMemPool view_mempool(&chainman.ActiveChainstate().CoinsTip(), pool);
+                const auto parent_coin{view_mempool.GetCoin(child.vin[0].prevout)};
+                BOOST_REQUIRE(parent_coin.has_value());
+                BOOST_CHECK_EQUAL(parent_coin->nHeight, MEMPOOL_HEIGHT);
+            }
+        }
     }
-    BOOST_CHECK_EQUAL(pool.size(), 2U); // the resurrected spend + the coinbase3 spend
+    BOOST_CHECK_EQUAL(pool.size(), 3U); // the resurrected spend + the coinbase3 spend + its child
 
     // ---- Mempool at the boundary, part 3: persistence round trip pre-H.
     // Provenance survives dump+load: the reloaded entry is the same legacy
@@ -1776,6 +1806,7 @@ BOOST_AUTO_TEST_CASE(transition_pow_corridor_validation)
     mutable_consensus.legacy_final_hash = X;
     mutable_consensus.transition_pow_length = CORRIDOR;
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
     BOOST_REQUIRE(consensus.test_only_modern_pos_validator == nullptr);
 
     // Corridor block builder: modern codec identity, scrypt-ground nBits.
@@ -1827,6 +1858,7 @@ BOOST_AUTO_TEST_CASE(transition_pow_corridor_validation)
         BOOST_CHECK(!chainman.ProcessNewBlock(CodecRoundTrip(blocked), true, true, &new_block));
         BOOST_CHECK(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(blocked.GetHash())) == nullptr);
         mutable_consensus.transition_pow_bits = EASY_BITS;
+        mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
     }
 
     // The whole corridor connects under temporary PoW — no modern PoS
@@ -1928,6 +1960,7 @@ BOOST_AUTO_TEST_CASE(transition_pow_corridor_production)
         node::BlockAssembler(chainman.ActiveChainstate(), nullptr, options).CreateNewBlock(),
         std::runtime_error);
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
 
     // Produce, grind and submit the whole corridor through the assembler.
     for (int i{0}; i < CORRIDOR; ++i) {
@@ -2033,6 +2066,7 @@ BOOST_AUTO_TEST_CASE(legacy_lock_crossing_spend)
     mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
     mutable_consensus.transition_pow_length = 8;
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
 
     const auto build_corridor{[&](const CBlockIndex* prev, std::vector<CMutableTransaction> txs) {
         CMutableTransaction coinbase;
@@ -2246,6 +2280,7 @@ BOOST_AUTO_TEST_CASE(stake_policy_in_corridor)
     mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
     mutable_consensus.transition_pow_length = 6;
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
     mutable_consensus.min_stake_amount = 1000; // regtest scaffolding
 
     // Corridor block 1: legacy value crosses into a real STAKE output plus
@@ -2445,6 +2480,7 @@ BOOST_AUTO_TEST_CASE(full_corridor_end_to_end)
     mutable_consensus.legacy_final_hash = X;
     mutable_consensus.transition_pow_length = CORRIDOR;
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
     mutable_consensus.min_stake_amount = 1000; // regtest scaffolding
     BOOST_REQUIRE(consensus.test_only_modern_pos_validator == nullptr);
     BOOST_CHECK(WITH_LOCK(cs_main, return chainman.ActiveChainstate().LegacyBoundaryActive()));
@@ -2682,6 +2718,7 @@ BOOST_FIXTURE_TEST_CASE(corridor_restart_and_reindex, TransitionDiskSetup)
     mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
     mutable_consensus.transition_pow_length = 8;
     mutable_consensus.transition_pow_bits = HARD_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
     mutable_consensus.min_stake_amount = 1000;
 
     std::array<unsigned char, 32> validator_key{};
@@ -2844,6 +2881,7 @@ BOOST_AUTO_TEST_CASE(two_node_corridor_sync)
     mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
     mutable_consensus.transition_pow_length = CORRIDOR;
     mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
     mutable_consensus.min_stake_amount = 1000;
 
     std::array<unsigned char, 32> validator_key{};

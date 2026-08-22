@@ -38,12 +38,16 @@ namespace flowmesh {
  *   certificates at one sequence would share an honest attester, and an
  *   honest attester never signs two hashes at one sequence.
  *
- *   LIVENESS.  A split round simply fails to certify; a later round with
- *   a live proposer re-proposes (possibly the same microblock — locked
- *   validators can re-attest the same hash, and attestations for one
- *   hash combine across rounds). Eventual certification needs t honest
- *   live seats whose locks agree or are free — the round mechanism
- *   converges them because each round has a single eligible proposer.
+ *   LIVENESS — HONEST LIMIT.  A split round simply fails to certify; a
+ *   later round's proposer may re-propose a locked candidate (locks
+ *   permit re-attesting the same hash, and attestations for one hash
+ *   combine across rounds). BUT rounds do NOT necessarily converge
+ *   split locks: PERMANENT SPLIT LOCKS MAY HALT FLOWMESH INDEFINITELY
+ *   (e.g. k=4, f=1, t=3 with honest locks split 2/1 and the Byzantine
+ *   seat withholding). Resolving that requires a cross-round
+ *   unlock/view-change rule — an OWNER DECISION deliberately not
+ *   implemented here; permanent locking is the fail-safe default, and
+ *   B3 is unaffected by any FlowMesh stall.
  *
  * OWNER DECISIONS exposed, not hidden: the proposer schedule itself,
  * the fault bound f (hence threshold t), and the timeout policy.
@@ -81,6 +85,23 @@ public:
 
 private:
     std::vector<XOnlyPubKey> m_seats;
+};
+
+/**
+ * Durable write-ahead journal for safety-critical lock state. A
+ * validator MUST persist its lock BEFORE an attestation leaves the
+ * process: a restart may not erase what the validator has signed, or a
+ * conflicting candidate could be signed for the same sequence after
+ * recovery. Storage failure means DO NOT SIGN (non-participation, never
+ * unsafe participation).
+ */
+class LockJournal
+{
+public:
+    virtual ~LockJournal() = default;
+    [[nodiscard]] virtual bool WriteLock(uint64_t sequence, const uint256& microblock_hash) = 0;
+    //! Certification through `sequence` makes its lock obsolete.
+    [[nodiscard]] virtual bool ClearLocksThrough(uint64_t sequence) = 0;
 };
 
 enum class AttestDecision : uint8_t {
@@ -142,6 +163,15 @@ public:
         m_rounds.erase(sequence);
         m_locked.erase(sequence);
     }
+
+    //! Restart restore: import the durably journaled locks so the
+    //! validator cannot sign a conflicting candidate after recovery.
+    void ImportLocks(const std::map<uint64_t, uint256>& locks)
+    {
+        for (const auto& [sequence, hash] : locks) m_locked.emplace(sequence, hash);
+    }
+
+    const std::map<uint64_t, uint256>& Locks() const { return m_locked; }
 
 private:
     std::map<uint64_t, uint32_t> m_rounds;

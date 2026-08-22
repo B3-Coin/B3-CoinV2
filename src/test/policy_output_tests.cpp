@@ -220,4 +220,65 @@ BOOST_AUTO_TEST_CASE(stake_v1_structure_is_enforced)
                 modern::PolicyOutputCheck::BAD_POLICY_PARAMS);
 }
 
+
+//! DEX_VAULT v2 params (owner ruling 2026-08-22): one keyless vault policy,
+//! two kinds — USER_DEPOSIT carries the FlowMesh account id (35 bytes),
+//! VAULT_POOL_CHANGE carries none (3 bytes) and can never credit anyone.
+//! The v1 shard-only form is retired.
+BOOST_AUTO_TEST_CASE(dex_vault_v2_params_distinguish_user_deposit_from_pool_change)
+{
+    Consensus::Params params{};
+    params.legacy_b3coin = true;
+    params.hard_fork_height = 1001;
+    params.test_only_asset_policies_active = true;
+    const uint256 vault{uint256{"00000000000000000000000000000000000000000000000000000000000000f1"}};
+    const uint256 account{uint256{"00000000000000000000000000000000000000000000000000000000000000a1"}};
+
+    modern::ModernOutput out;
+    out.asset = uint256::ONE;
+    out.amount = 500;
+    out.policy_type = static_cast<uint16_t>(modern::PolicyType::DEX_VAULT);
+    out.policy_version = modern::DEX_VAULT_POLICY_VERSION_V2;
+    out.policy_commitment = vault;
+
+    out.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_POOL_CHANGE, 7);
+    BOOST_CHECK(modern::CheckPolicyOutput(out, 1001, params) == modern::PolicyOutputCheck::OK);
+    {
+        const auto vp{modern::ParseVaultParams(out.policy_params)};
+        BOOST_REQUIRE(vp.has_value());
+        BOOST_CHECK_EQUAL(vp->kind, modern::VAULT_KIND_POOL_CHANGE);
+        BOOST_CHECK_EQUAL(vp->shard, 7U);
+        BOOST_CHECK(!vp->account.has_value());
+    }
+    out.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_USER_DEPOSIT, 3, account);
+    BOOST_CHECK(modern::CheckPolicyOutput(out, 1001, params) == modern::PolicyOutputCheck::OK);
+    {
+        const auto vp{modern::ParseVaultParams(out.policy_params)};
+        BOOST_REQUIRE(vp.has_value());
+        BOOST_CHECK_EQUAL(vp->kind, modern::VAULT_KIND_USER_DEPOSIT);
+        BOOST_CHECK_EQUAL(vp->shard, 3U);
+        BOOST_REQUIRE(vp->account.has_value());
+        BOOST_CHECK(*vp->account == account);
+    }
+    // Malformed: a USER_DEPOSIT with a null account, wrong sizes, unknown
+    // kind, and the retired v1 two-byte form.
+    out.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_USER_DEPOSIT, 3, uint256{});
+    BOOST_CHECK(modern::CheckPolicyOutput(out, 1001, params) != modern::PolicyOutputCheck::OK);
+    out.policy_params = {modern::VAULT_KIND_POOL_CHANGE, 0x00}; // too short
+    BOOST_CHECK(modern::CheckPolicyOutput(out, 1001, params) != modern::PolicyOutputCheck::OK);
+    out.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_POOL_CHANGE, 0);
+    out.policy_params.push_back(0x00); // pool change with trailing byte
+    BOOST_CHECK(modern::CheckPolicyOutput(out, 1001, params) != modern::PolicyOutputCheck::OK);
+    out.policy_params = modern::MakeVaultParams(9, 0); // unknown kind
+    BOOST_CHECK(modern::CheckPolicyOutput(out, 1001, params) != modern::PolicyOutputCheck::OK);
+    out.policy_params = {0x00, 0x00}; // retired v1 shard-only
+    BOOST_CHECK(modern::CheckPolicyOutput(out, 1001, params) != modern::PolicyOutputCheck::OK);
+    // And v1 DEX_VAULT is no longer an activated version at all.
+    out.policy_version = modern::POLICY_VERSION_V1;
+    out.policy_params = {0x00, 0x00};
+    BOOST_CHECK(!modern::IsActivatedPolicy(out.policy_type, out.policy_version, /*assets_active=*/true));
+    BOOST_CHECK(modern::IsActivatedPolicy(out.policy_type, modern::DEX_VAULT_POLICY_VERSION_V2, true));
+    BOOST_CHECK(!modern::IsActivatedPolicy(out.policy_type, modern::DEX_VAULT_POLICY_VERSION_V2, false));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

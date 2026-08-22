@@ -64,6 +64,7 @@ struct ChainstateRole;
 } // namespace kernel
 namespace node {
 class SnapshotMetadata;
+class StakeTracker;
 } // namespace node
 namespace Consensus {
 struct Params;
@@ -584,6 +585,9 @@ protected:
 
     std::optional<const char*> m_last_script_check_reason_logged GUARDED_BY(::cs_main){};
 
+    //! Lazily created modern-PoS stake registry tracker; see ModernStakeTracker().
+    std::unique_ptr<node::StakeTracker> m_stake_tracker GUARDED_BY(::cs_main);
+
 public:
     //! Reference to a BlockManager instance which itself is shared across all
     //! Chainstate instances.
@@ -599,6 +603,14 @@ public:
         node::BlockManager& blockman,
         ChainstateManager& chainman,
         std::optional<uint256> from_snapshot_blockhash = std::nullopt);
+    ~Chainstate();
+
+    /**
+     * The modern-PoS stake registry tracker (created lazily; V1 spec §2).
+     * Consulted by modern-PoS block validation and production for the
+     * validator's aggregated ACTIVE weight and the total ACTIVE weight.
+     */
+    node::StakeTracker& ModernStakeTracker() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     //! Return path to chainstate leveldb directory.
     fs::path StoragePath() const;

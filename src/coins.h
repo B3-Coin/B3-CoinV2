@@ -49,7 +49,11 @@ public:
     //! whether containing transaction was a legacy proof-of-stake transaction
     unsigned int fCoinStake : 1;
 
-    //! at which height this containing transaction was included in the active block chain
+    //! at which height this containing transaction was included in the active block chain.
+    //! B3 keeps 30 bits here (one bit went to fCoinStake): any SENTINEL stored
+    //! in this field -- notably MEMPOOL_HEIGHT -- must fit in MAX_HEIGHT, or
+    //! it silently truncates and every comparison against it fails.
+    static constexpr uint32_t MAX_HEIGHT{(uint32_t{1} << 30) - 1};
     uint32_t nHeight : 30;
 
     //! legacy transaction timestamp and on-disk offset used by the stake kernel
@@ -60,11 +64,19 @@ public:
     Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fCoinStakeIn = false,
          uint32_t nTimeIn = 0, uint32_t nTxOffsetIn = 0)
         : out(std::move(outIn)), fCoinBase(fCoinBaseIn), fCoinStake(fCoinStakeIn),
-          nHeight(nHeightIn), nTime(nTimeIn), nTxOffset(nTxOffsetIn) {}
+          nHeight(nHeightIn), nTime(nTimeIn), nTxOffset(nTxOffsetIn)
+    {
+        // The 30-bit field must hold the value exactly: a truncated height or
+        // sentinel would silently break every later comparison.
+        Assume(nHeightIn >= 0 && static_cast<uint32_t>(nHeightIn) <= MAX_HEIGHT);
+    }
     Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fCoinStakeIn = false,
          uint32_t nTimeIn = 0, uint32_t nTxOffsetIn = 0)
         : out(outIn), fCoinBase(fCoinBaseIn), fCoinStake(fCoinStakeIn),
-          nHeight(nHeightIn), nTime(nTimeIn), nTxOffset(nTxOffsetIn) {}
+          nHeight(nHeightIn), nTime(nTimeIn), nTxOffset(nTxOffsetIn)
+    {
+        Assume(nHeightIn >= 0 && static_cast<uint32_t>(nHeightIn) <= MAX_HEIGHT);
+    }
 
     void Clear() {
         out.SetNull();

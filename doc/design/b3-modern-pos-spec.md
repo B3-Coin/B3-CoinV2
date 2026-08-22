@@ -1,231 +1,276 @@
-# B3 Modern PoS — design specification
+# B3 Modern PoS — V1 specification (FROZEN)
 
-**Status: ACCEPTED AS DESIGN BASE — no implementation.** The structure below is
-the agreed base for modern PoS. Every remaining decision carries an explicit
-status: **LOCKED** (binding) or **OPEN** (must be explicitly locked before any
-implementation; never resolved by implementation choice). All numeric protocol
-parameters are OPEN pending simulation — no number in this document is a
-consensus assumption. OD-1 in [b3-open-decisions.md](b3-open-decisions.md)
-stays unresolved until every OPEN item is locked; until then
-`modern::CheckModernStake` keeps failing closed (`no-modern-pos-rules`), and
-that behavior is pinned by `legacy_transition_tests/`
-`non_empty_transition_fails_closed_at_h_plus_one`.
+**Status: V1 FROZEN — implementation authorized (owner rulings, 2026-08-20).**
+This document supersedes the earlier VRF/slot/epoch "design base" revision of
+itself. The owner explicitly replaced that direction (ruling M1) with the
+deterministic stake-weighted design below and authorized a complete V1
+implementation. Everything the earlier revision reserved for simulation-locked
+numerics is carried here as **provisional constants** marked
+`REVISABLE_BEFORE_MAINNET`, kept in one configurable place
+(`src/consensus/modern_pos_params.h`) and never configured on mainnet until
+explicitly ratified. Advanced mechanisms are **V2 research** (§10) and are
+deliberately absent from V1: **no VRF, no epochs, no committees, no slashing,
+no finality gadget, no delegation.**
 
-## 1. Inherited constraints — LOCKED (by the architecture contract)
+Owner rulings incorporated (2026-08-20):
 
-- Modern block header stays Bitcoin-style (80 bytes, SHA256d identity); no
-  redesign for PoS (contract §17); no new hash domain for block identity.
+- **M1** — deterministic stake-weighted hash eligibility plus recovery rounds
+  replaces the VRF/slot/epoch direction; this document is the reconciliation.
+- **M2** — the eligibility seed is a chained digest (§3); the bounded
+  residual grinding surface is recorded in §7; future randomness upgrades
+  remain possible without changing the output format.
+- **M3** — every modern-PoS block carries a BIP340 validator signature over a
+  domain-separated digest of the block hash (§5).
+- **M4** — no unstake cooldown in V1: spending the STAKE output removes the
+  stake; recreated stake re-serves the 20-block activation depth.
+- **M5** — fork choice is PoS-native and explicit (§6); no PoW chainwork
+  semantics and no automatically inherited legacy reorg rule.
+- **M6** — a block reward can never directly create active STAKE: the
+  coinbase may not contain a STAKE-claiming output.
+- Plus: the unconditional modern coinbase cap (§8) sits **outside** the PoS
+  validator design and applies regardless of any future rule set.
+
+## 1. Inherited constraints — unchanged
+
+- Modern block header stays Bitcoin-style (80 bytes, SHA256d identity); no new
+  hash domain for block identity (contract §17).
 - Modern fork choice selects only among descendants of X; reorganizations
-  across H are prohibited; H+1 is intentionally minimal.
-- Value lives in typed Policy Outputs; policy enum values are append-only
-  (`LEGACY_LOCK=0, OWNER=1, BURN=2, DEX_VAULT=3`).
-- `ModernChainDomain = H("B3/MODERN/CHAIN" || genesis || X)` is the
-  anti-replay domain for genuinely new signed structures — never block
-  identity.
-- Validators and FlowMesh FNs are separate roles. Native B3 is never issued
-  through the asset engine. Modern issuance carries an explicit cap.
+  across H are prohibited; the corridor design
+  ([b3-during-fork-transition.md](b3-during-fork-transition.md)) is unchanged:
+  modern PoS begins at M = H + corridor length + 1.
+- Value lives in typed Policy Outputs; STAKE is `PolicyType::STAKE = 4` with
+  the v1 script carrier in `src/modern/stake.h` — **RATIFIED 2026-08-21
+  exactly as implemented and tested** (B3S1 payload, validator key,
+  owner-controlled funds).
+- `ModernChainDomain = TaggedHash("B3/MODERN/CHAIN", genesis || X)` is the
+  anti-replay domain for new signed structures — never block identity.
+- Validators and FlowMesh FNs are separate roles. Modern issuance carries an
+  explicit cap (§8).
 
-## 2. Agreed direction — LOCKED (by the user)
+Carried forward unchanged from the superseded revision (they are compatible
+with M1): STAKE is a Policy Output; independent per-wallet STAKE outputs;
+locked amount is the weight; owner key ≠ validator key; rewards never
+auto-increase weight (now consensus-enforced, M6); no coin-age growth;
+aggregation is per validator key, never per output (splitting confers
+nothing); eligibility is cheaply verifiable from the block plus the parent's
+derived registry.
 
-1. **STAKE is a Policy Output.** Consensus stake exists only as an explicitly
-   typed output; no plain UTXO stakes implicitly.
-2. **Independent per-wallet STAKE outputs**; each is an independent consensus
-   object; no registration authority. (Outputs are independent as *value
-   objects*; eligibility nevertheless aggregates per validator key — §5 —
-   so output-splitting confers no advantage.)
-3. **Locked B3 is the consensus weight** — the amount in an *active* STAKE
-   output, nothing else.
-4. **Owner key ≠ validator key.** The owner commitment controls the funds;
-   a distinct validator key evaluates eligibility and signs blocks; a
-   compromised validator key cannot spend the stake.
-5. **Rewards never auto-increase weight.** Rewards pay to ordinary outputs;
-   consensus rejects a reward paying into any STAKE output; more weight
-   requires an explicit new STAKE output with its own activation delay.
-6. **Stake age does not grow forever.** After activation, weight is constant;
-   nothing resembles legacy coin-age.
-7. **VRF-based eligibility** — publicly verifiable, privately evaluable,
-   non-grindable.
-8. **Multiple eligible proposers per slot with ordered fallbacks**, so an
-   offline primary cannot stall a slot.
-9. **Cheap pre-verification**: eligibility verifiable from block bytes plus
-   the parent's derived registry before any transaction processing.
+## 2. Stake data model
 
-## 3. Data model — DESIGN BASE (structure locked; constants OPEN)
+Exactly the machinery already in the tree:
 
-### 3.1 The STAKE policy output (v1)
+- **Carrier**: `PUSH(38: "B3S1" || validator_key[32] || reserved[2]=0)
+  OP_DROP <owner script>` (`src/modern/stake.h`), enforced per-transaction in
+  consensus (`modern::CheckStakeOutputs`), fail-closed while
+  `min_stake_amount` is unset.
+- **Maturity**: a STAKE output created at height `b` is ACTIVE at height `h`
+  iff `h − b >= STAKE_ACTIVATION_DEPTH (= 20)`.
+- **Registry**: the set of unspent, modern-era, valid STAKE outputs. Per
+  validator key: `w` = sum of ACTIVE principal. `W` = total ACTIVE principal.
+  Derived state, recomputable from the chain; the node maintains it
+  incrementally at tip changes and rebuilds it by walking modern-era blocks
+  after a restart or reorg (`src/node/stake_tracker.{h,cpp}`).
+- **Unstake (M4)**: spending the output removes it; nothing else exists.
 
-New appended policy type `STAKE = 4`, `policy_version = 1`:
+## 3. Seed chain and eligibility
 
-- `asset` — native B3 only.
-- `amount` — the locked amount; the weight once active.
-- `policy_commitment` — 32-byte owner binding (OWNER-v1 commitment scheme).
-- `policy_params` — 32-byte x-only validator public key (key type: PD-2) plus
-  a 2-byte reserved field, within `MAX_POLICY_PARAMS_SIZE`.
+```
+seed_M        = TaggedHash("B3/MODERN/POS/SEED/V0",
+                           ModernChainDomain || parent_marker_hash)
+                (parent = the last pre-modern-PoS block: the corridor-exit
+                 block, or H itself when the corridor length is 0)
 
-Lifecycle (fully derivable from the chain):
+digest_h      = TaggedHash("B3/MODERN/POS/ELIG/V1",
+                           ModernChainDomain || seed_h || height || round
+                           || validator_key)
 
-    created (in block b)
-      → PENDING   until activation delay elapses      (no weight)
-      → ACTIVE    weight = amount                     (eligible)
-      → owner spends into an explicit UNSTAKE intent
-      → COOLDOWN  until unlock delay elapses          (no weight, unspendable)
-      → spendable as ordinary value
+seed_(h+1)    = digest_h            (the accepted block's own digest)
+```
 
-The activation delay makes epoch seeds non-grindable by just-in-time stake
-creation; the unlock cooldown keeps misbehavior attributable before funds
-exit. Both delays are OPEN constants (PD-7).
+Eligibility of validator `v` with aggregated ACTIVE weight `w` at height `h`,
+round `r`:
 
-### 3.2 The derived stake registry
+```
+digest_h  <  MAX256 · f(r) · w / W        with   f(r) = f0 · 2^r
+```
 
-Per connected block, consensus maintains the **active set** — every ACTIVE
-STAKE outpoint with (weight, validator key, activation height) — and total
-active weight `W`. Derived state: recomputable from the UTXO set, maintained
-incrementally at connect/disconnect. It is the input to cheap eligibility
-verification. In-block commitment of the registry: PD-15 (OPEN).
+evaluated in widened integer arithmetic (`digest · W · f0_den` vs
+`2^256 · w · f0_num · 2^r` over 512-bit integers, saturating toward
+"eligible" when the right side overflows — a saturated round admits every
+online validator, which is exactly the recovery intent). `w = 0` is never
+eligible. There is **no difficulty retarget**: the `w / W` normalization is
+the difficulty, adjusted exactly and instantly by the registry itself.
+`nBits` is a fixed enforced sentinel and `nNonce` must be 0.
 
-## 4. Slots, epochs, randomness — DESIGN BASE (mechanism locked; numbers OPEN)
+One attempt exists per validator key per (height, round). Block content —
+transactions, ordering, coinbase bytes, merkle root, signature — has **zero**
+influence on the seed.
 
-Time divides into slots of `SLOT_SECONDS` (OPEN, PD-3); a block's `nTime`
-must lie inside its claimed slot, slots strictly increasing along a chain,
-empty slots skipped. Slots group into epochs of `EPOCH_SLOTS` (OPEN, PD-4).
-The active set and `W` used by an epoch are frozen at the epoch boundary, so
-mid-epoch weight changes cannot re-roll current eligibility. Each epoch has a
-seed whose derivation (PD-4) must deny any proposer a cheap grinding window
-and must be fixed no later than the stake snapshot it applies to.
+## 4. Deterministic timestamps and recovery rounds
 
-## 5. Eligibility and anti-stall — DESIGN BASE (mechanism locked; numbers OPEN)
+```
+nTime = parent.nTime + BLOCK_INTERVAL + round · ROUND_SECONDS     — EXACTLY
+```
 
-For slot `s` in epoch `e`, a validator with active weight `w` computes
+The round is decoded from the timestamp delta; a delta that is not
+`BLOCK_INTERVAL` plus a non-negative exact multiple of `ROUND_SECONDS` is
+invalid (`bad-pos-time`). There is no stored round field and no upper round
+bound: arithmetic saturation (§3) makes very high rounds admit everyone, so a
+stall of any length resolves.
 
-    y, π = VRF_sk(ModernChainDomain || seed_e || s)
+Consequences:
 
-and is eligible iff `y < T(w, W)`, where `w` is the validator's **aggregated**
-weight — `SUM(all qualifying ACTIVE STAKE principal assigned to this
-validator key)` — never per-output. **This aggregation rule is LOCKED**
-(2026-08-16): splitting 100,000 B3 across 10,000 STAKE outputs must confer
-exactly the proposer opportunity of one output; there is one VRF evaluation
-per validator identity per slot, not one lottery ticket per UTXO. `T` is
-calibrated (PD-5) so the expected eligible count per slot is a small
-constant `K`. Eligible validators rank
-by ascending `y`; rank 0 is the primary, higher ranks are fallbacks; rank `r`
-may not timestamp a block before `slot_start + r · RANK_DELAY` (OPEN, PD-5).
-Cheap verification uses only the header, the proposer proof and the parent's
-registry snapshot: membership, VRF proof, threshold, rank/time ladder, block
-signature — no transaction execution.
+- The existing future-time rule (tightened to `max_future_seconds`) is the
+  pacing gate: a round's block cannot be accepted before its forced timestamp,
+  so the chain can never run faster than one block per `BLOCK_INTERVAL`, and
+  rounds advance in real time during a genuine stall — chain time tracks wall
+  time within one round.
+- A lagging node and a stalled network are indistinguishable and behave
+  identically: keep evaluating successive rounds against the best tip.
+- MTP monotonicity is trivially satisfied (each block adds at least
+  `BLOCK_INTERVAL`); the stock MTP check is retained as belt-and-braces.
 
-## 6. Block structure — DESIGN BASE (placement question OPEN as PD-6)
+## 5. Block structure and signature (M3)
 
-The header is untouched, so the PoS declaration lives in the body, split to
-resolve the sign-your-own-hash circularity exactly as the legacy codec did:
+The 80-byte header is untouched. Two body rules:
 
-- **Proposer proof** — inside the merkle-committed data at a fixed early
-  position (PD-6): staked outpoint, slot index, claimed rank, VRF proof `π`.
-- **Block signature** — a trailing modern-codec field outside the committed
-  data: validator-key signature over `ModernChainDomain || block_hash`.
-  Block identity (header SHA256d) is unchanged.
+- **Validator declaration**: the coinbase scriptSig is
+  `BIP34 height push || PUSH32(validator_key)` — the key is merkle-committed
+  through the coinbase. Malformed or missing declaration: `bad-pos-key`.
+- **Block signature**: marker-modern blocks serialize a trailing
+  `vchBlockSig` vector (the legacy codec's own trailing-signature pattern).
+  Corridor blocks must carry it **empty**; a modern-PoS block must carry
+  exactly 64 bytes: a BIP340 signature by `validator_key` over
+  `TaggedHash("B3/MODERN/POS/SIG/V1", ModernChainDomain || block_hash)`.
+  Since the block hash commits to the header, the merkle root, and therefore
+  the coinbase-declared key, the binding is complete and the
+  sign-your-own-hash circularity is resolved exactly as the legacy codec
+  resolved it. Invalid: `bad-pos-signature`.
 
-Modern `nBits`/`nNonce` semantics: PD-9 (OPEN).
+This revises the modern block wire format before any modern block exists
+outside regtest fixtures; it cannot be revised after mainnet H/X.
 
-## 7. Fork choice — DESIGN BASE (mapping OPEN as PD-10)
+## 6. Fork choice (M5) and reorganization horizon
 
-Selection stays "most chain weight" over the existing `nChainWork`
-accumulator among descendants of X. A modern block's weight is a monotone
-function of proposer rank (better rank → more weight), giving primary
-preference, deterministic tie-breaks (ascending `y`), and no withholding
-advantage. The exact mapping and its bounds are OPEN (PD-10); a modern
-reorg-depth bar is OPEN (PD-14).
+PoS-native rule over descendants of X:
 
-## 8. Rewards — DESIGN BASE (economics OPEN)
+1. **Higher valid height wins.** (Implementation note: modern-PoS blocks
+   accumulate a constant per-block increment in the existing `nChainWork`
+   accumulator — the sentinel `nBits` makes `GetBlockProof` a constant — so
+   the existing most-work selection already implements height-first among
+   modern chains. The number is bookkeeping, not work.)
+2. **Equal height** → at the first divergent block, the **lower recovery
+   round** wins (provably rarer eligibility; the claimed round sets the
+   threshold the digest actually beat, and the round is timestamp-derived,
+   not declared).
+3. Equal round → **lower block hash** wins (deterministic, unpredictable).
 
-The reward transaction pays to ordinary (OWNER) outputs; consensus rejects a
-reward directed into any STAKE output (locks direction item 5 at the
-consensus level). Amounts, decay, fee treatment and maturity are OPEN
-(PD-11/PD-12, jointly with OD-2), under the locked issuance-cap invariant.
+**V1 deviation, recorded:** the owner-analyzed rule 3 was "lower normalized
+eligibility score (`digest/weight`, cross-multiplied)". Candidate ordering in
+the node must use only data immutable from the moment a block enters the
+candidate set, and both the digest's seed context and the validator weight
+are connect-time state; mutating comparator keys while an element is in
+`setBlockIndexCandidates` is undefined behavior. V1 therefore resolves the
+double tie by block hash — equally deterministic, unpredictable in advance,
+security-equivalent; the normalized-score refinement is listed in §10 for V2.
+Rule 2 uses the timestamp delta (immutable at acceptance) and is implemented
+exactly.
 
-## 9. Misbehavior — DESIGN BASE (posture OPEN as PD-13)
+**Horizon**: a modern-PoS reorganization deeper than `modern_reorg_horizon`
+(D) blocks is refused without peer penalty (`modern-reorg-too-deep`,
+modeled on — not inherited from — the legacy depth bar; skipped during
+reindex/import). D is an owner parameter, deliberately unchosen; V1 regtest
+uses a scaffolding value. Combined with the timestamp density property —
+a private rebuilder holding stake fraction `a` pays
+`BLOCK_INTERVAL + E[rounds|a] · ROUND_SECONDS` of forced chain time per
+block over the same wall-clock span, so a small-stake attacker cannot reach
+the honest height — this is the complete V1 long-range defense for online
+nodes. **Known accepted residual:** a fresh-sync node's post-M history has
+the classic weak-subjectivity exposure to an attacker holding a majority of
+*historical* stake; X pins everything pre-M; operational checkpoints can
+cover the rest without protocol machinery. No slashing/BFT ships in V1.
 
-Equivocation is at minimum handled by fork choice, with the unlock cooldown
-as the attribution window; whether evidence-based stake burning (via the
-existing BURN policy) ships at H+1 or behind a later activation height is
-OPEN (PD-13).
+## 7. Grinding and attack surface (M2, recorded)
 
-## 10. Initial validator set — RESOLVED BY THE TEMPORARY-PoW CORRIDOR
+- Content grinding (tx selection/ordering, coinbase bytes, merkle, nTime):
+  **eliminated** — the seed excludes block content and nTime is forced.
+- Single-key producer: their digest, and thus the next seed, is fully
+  determined — zero grinding.
+- Multi-key producer: one seed option per simultaneously-eligible own key
+  (~log2(k) bits), stake-bounded.
+- Round-delay grinding: forfeits fork-choice priority (rule 2) to any
+  competitor; costly and visible.
+- JIT stake targeting: dead — the seed is knowable one block ahead; stake
+  needs 20 blocks to activate.
+- Corridor-exit seed (`seed_M`): grindable only at the cost of real scrypt
+  solutions at corridor difficulty; influences one seed. Accepted for V1.
+- Far-future prediction: certainty extends exactly one block ahead (each
+  winner's key re-randomizes the seed); no far-future proposer DoS window.
+- Withholding: ~one-block window; height-first makes it unprofitable.
+- Equivocation: resolved by the deterministic tiebreak; BIP340 signatures
+  leave attributable evidence for a V2 penalty rule; V1 imposes none.
 
-**Superseded twice and now settled in direction** (2026-08-16, authoritative
-user direction): both the post-boundary "self-activating bootstrap" and the
-1,000-block *legacy-PoS declaration window* are SUPERSEDED. The transition
-is a temporary-PoW corridor with modern semantics:
+## 8. Rewards and the unconditional cap
 
-    Genesis…500        historical B3 PoW        (LAST_POW_BLOCK = 500)
-    501…H              legacy B3 PoS            X = hash(H), the anchor
-    H+1 … H+1000       TEMPORARY B3 PoW corridor — modern block/tx format,
-                       Policy Outputs active, real STAKE outputs created
-                       from legacy UTXOs via LEGACY_LOCK and matured
-    M = H+1001 onward  modern B3 PoS
+- **Cap (unconditional, outside the validator):**
+  `coinbase value out ≤ fees + modern_reward(height)`; with the V1 parameter
+  block unset or its reward at 0, the cap is fees-only. Enforced in
+  `ConnectBlock` for every modern-PoS block **before and independently of**
+  any PoS rule set, so no future validator can bypass it (`bad-cb-amount`).
+- **M6:** any coinbase output claiming the STAKE magic is invalid
+  (`bad-cb-stake`); rewards pay ordinary outputs; restaking is an explicit
+  STAKE output plus the activation depth.
+- The reward schedule and all amounts remain owner parameters
+  (`REVISABLE_BEFORE_MAINNET`; V1 provisional: 0 — fees only).
 
-There is no bootstrap circularity and no declaration indirection: during
-the corridor, holders create **actual modern STAKE Policy Outputs**; block
-production is temporary PoW (reusing B3's historically proven scrypt PoW
-primitive), so legacy coinstake churn never conflicts with stake creation.
-At the end of H+1000 every node derives the same initial validator registry
-from qualifying mature STAKE outputs (cutoff height C, OPEN); at M the
-modern eligibility rule selects the first proposer from that registry. The
-authoritative corridor specification is
-[b3-during-fork-transition.md](b3-during-fork-transition.md). The initial
-randomness/VRF seed at M remains OPEN. Every "H+1 = first modern-PoS
-block" statement elsewhere in this document predates the corridor and
-reads as **M = H+1001**; H+1 is the first modern-*format* (temporary-PoW)
-block.
+## 9. Parameters — one place, all provisional
 
-## 11. Pending decisions — ALL OPEN
+All in `src/consensus/modern_pos_params.h`, marked `REVISABLE_BEFORE_MAINNET`,
+configured **only** by test fixtures; mainnet params never set the block, and a
+guard test enforces that. Unset ⇒ modern-PoS validation and production fail
+closed (`no-modern-pos-rules`), exactly as before this specification.
 
-Numeric values that previously appeared as recommendations are **withdrawn as
-consensus assumptions**; where retained below they are explicitly
-*simulation candidates* — starting points for the simulation phase, carrying
-no normative weight. Implementation begins only after every PD is explicitly
-locked by the user.
-
-| PD | Question | Options (⊘ = rejected with rationale) | Status |
+| Parameter | Value | Status | Meaning |
 |---|---|---|---|
-| PD-1 | VRF primitive | (a) ECVRF-SECP256K1-SHA256-TAI (RFC 9381), in-tree over vendored libsecp256k1; (b) BLS VRF — new curve dependency; (c) ⊘ deterministic-signature-as-VRF: verifier cannot prove nonce determinism → grindable | OPEN |
-| PD-2 | Validator key type | (a) BIP340 x-only Schnorr (32 B, in-tree, same key signs blocks); (b) compressed ECDSA (33 B) | OPEN |
-| PD-3 | Slot duration | Simulation question. Candidates 32/64/128 s; constraint: `K_max · RANK_DELAY < SLOT_SECONDS` | OPEN — simulation |
-| PD-4 | Epoch length; seed derivation | Length: simulation question. Seed: (a) fold VRF outputs of an early fraction of the prior epoch with a cutoff (denies end-of-epoch grinding); (b) ⊘ last-block hash: last proposer grinds by withholding; (c) pure chaining from prior seed: ungrindable but far-future-predictable (targeted DoS on future proposers) | OPEN — mechanism + simulation |
-| PD-5 | Threshold function; K; rank ladder | Function over the validator's **aggregated** weight `w` (per-validator evaluation is LOCKED — one VRF attempt per validator key per slot, never per STAKE output): (a) binomial `P(eligible) = 1−(1−K/W_slots)^w`; (b) linear `y < K·w·2^256/W` (equivalent in the small-p regime). K and RANK_DELAY: simulation questions | OPEN — function + simulation |
-| PD-6 | Proposer-proof placement | (a) payload in the reward transaction's first output (front of block, streams early); (b) dedicated proposer transaction at index 1; (c) block-level section before the tx vector (deepest codec change) | OPEN |
-| PD-7 | Lifecycle constants | `MIN_STAKE_AMOUNT` (economics input; registry-size bound), `N_activate`, `N_unlock` (relationship to epoch length and attribution window) | OPEN — economics + simulation |
-| PD-8 | Validator-key re-delegation | (a) static (change = unlock + re-lock, full delays); (b) owner-signed in-place re-delegation (no weight gap; more consensus surface) | OPEN |
-| PD-9 | Modern `nBits`/`nNonce` semantics | (a) fixed sentinels, enforced exactly (threshold is registry-derived; no retarget field needed); (b) `nBits` mirrors epoch calibration for observability (adds a consistency obligation) | OPEN |
-| PD-10 | Fork-choice weight mapping | (a) `weight = BASE · (K − rank)` in `nChainWork` units (bounded rank bonus); (b) constant weight, rank as tie-break only (weaker anti-withholding); (c) ⊘ continuous `1/y`: unbounded outliers | OPEN |
-| PD-11 | Reward schedule (with OD-2) | (a) flat per-block with step-downs under the cap; (b) epoch yield proportional to locked stake, under the cap; (c) fee-only after a short subsidy | OPEN — economics |
-| PD-12 | Fees; reward maturity | Fees: (a) to proposer; (b) burned. Maturity: constant TBD | OPEN — economics + simulation |
-| PD-13 | Equivocation posture at H+1 | (a) fork choice only, penalties behind a later activation height (H+1 minimalism); (b) evidence transactions burning locked stake from launch (evidence rules must ship in v1) | OPEN |
-| PD-14 | Modern reorg depth bar | (a) rolling depth bound, no-penalty refusal (legacy analog); (b) none (long-range exposure); (c) per-epoch hard finality (adds a finality gadget H+1 does not need) | OPEN — mechanism + value by simulation |
-| PD-15 | Registry commitment | (a) derived-only (H+1 minimal); (b) registry root committed at epoch boundaries (light clients; extra obligation) | OPEN |
-| PD-16 | Initial validator set at M | **RESOLVED IN DESIGN DIRECTION — the temporary-PoW corridor** ([b3-during-fork-transition.md](b3-during-fork-transition.md)): 1,000 modern-format PoW blocks H+1…H+1000 in which real STAKE Policy Outputs are created from legacy UTXOs and matured; deterministic registry derivation at the end of H+1000; cutoff C splits initial ACTIVE from PENDING; M = H+1001 is the first modern-PoS block. The earlier self-activating, snapshot, operator-key and legacy-declaration-window options are all superseded. Remaining OPEN sub-items live in the corridor document (§12 OPEN list: corridor difficulty and reward, cutoff C, miner-capture rule, insufficient-stake handling, initial seed at M, X distribution, …) | DIRECTION LOCKED; sub-items OPEN |
-| PD-17 | Timestamp rules | Future-drift bound (slots), MTP retention, exact slot/nTime binding (the binding itself is part of the eligibility mechanism and not optional; the bound value is a simulation question) | OPEN — simulation |
+| `block_interval_seconds` | 60 | **RATIFIED 2026-08-21** | forced spacing floor |
+| `round_seconds` | 30 | **RATIFIED 2026-08-21** | recovery-round length |
+| `f0_num / f0_den` | 1 / 1 | **RATIFIED 2026-08-21** | round-0 expected eligible ≈ f0 · online fraction |
+| relaxation | ×2 per round | **RATIFIED 2026-08-21** (fixed in V1) | eligibility doubling |
+| `sentinel_bits` | 0x207fffff | provisional | enforced constant `nBits` |
+| `max_future_seconds` | 120 | provisional | clock-skew allowance / pacing gate |
+| `reward` | 0 (fees only) | provisional (OD-2) | per-block subsidy under the cap |
+| `reorg_horizon` (D) | 1440 | **RATIFIED 2026-08-21** (one day at 60 s) | modern reorg refusal depth |
 
-### Simulation phase
+The ratified rows are the confirmed V1 numbers (min stake is likewise
+ratified: 333 modern B3 = 333e9 base units, stated on mainnet, inert until
+H/X); the parameter block still ships unset on every network until the
+remaining provisional rows are settled, so nothing activates piecemeal. The STAKE v1 carrier is likewise RATIFIED
+(2026-08-21) exactly as implemented and tested.
 
-Before locking the numeric PDs (PD-3, PD-4 length, PD-5 K/ladder, PD-7
-delays, PD-10 BASE, PD-12 maturity, PD-14 value, PD-17 bound, and the
-transition window's numeric OPEN items — cutoff depth F−C and the readiness
-thresholds), a simulation must characterize, at minimum: slot-fill rate and
-fork rate vs. K and RANK_DELAY under realistic latency; stall probability
-vs. offline fraction; seed-grinding advantage vs. the PD-4 cutoff fraction;
-initial-set liveness and capture share at M vs. declaration-participation
-assumptions; and reorg-depth distributions vs. the PD-14 bar. Simulation
-harness design is out of scope for this document and must not touch
-consensus code.
+Timing behavior at f0 = 1 (from the accepted analysis): ~63% of blocks in
+round 0 at full participation; 95% by round 2/3/4/5/8 at 100/50/25/10/1%
+online stake; even 1% online stake produces a block every few minutes with no
+intervention.
 
-## 12. Sequencing
+## 10. V2 research (explicitly out of V1)
 
-1. Lock the transition window's OPEN items
-   ([b3-during-fork-transition.md](b3-during-fork-transition.md) §15) and
-   the non-numeric mechanism PDs.
-2. Run the simulation phase; lock the numeric PDs from its results.
-3. Only then: implementation as a `modern::PosValidator` behind the existing
-   dispatch, replacing the fail-closed gate in reviewable steps (data model,
-   registry, eligibility verification, connect-time validation, fork choice,
-   production). Until every PD is locked, `no-modern-pos-rules` remains the
-   modern era's correct, tested behavior and no placeholder logic ships.
+Normalized-score tie resolution (§6); VRF or threshold randomness upgrades to
+the seed; epoch snapshots and incremental-registry commitments for light
+clients; equivocation penalties consuming the V1 evidence trail; unstake
+cooldown; validator-key re-delegation; committee/finality gadgets; reward
+schedule economics; fresh-sync weak-subjectivity hardening beyond operational
+checkpoints. None of these may be implemented without a new owner ruling.
+
+## 11. Implementation map (V1)
+
+`consensus/modern_pos_params.h` (parameter block) · `modern/pos.h`
+(deterministic validator replacing the fail-closed stub; the test-only
+injection hook remains for dispatch-plumbing tests and is never set in
+production) · `primitives/block.h` (modern trailing-signature codec) ·
+`chain.h` (per-index cached eligibility digest, persisted; a restart must not
+recompute seeds from block bodies) · `node/stake_tracker.{h,cpp}` (registry
+maintenance) · `validation.cpp` (header rules: sentinel bits, exact time,
+horizon; connect rules: cap, M6, eligibility, signature; comparator rule 2/3)
+· `node/miner.cpp` (deterministic production + signing). Regtest scenarios:
+normal operation, low-online-stake recovery, invalid signature, invalid
+eligibility, invalid reward, restart/reindex.

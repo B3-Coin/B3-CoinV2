@@ -15,7 +15,11 @@
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <deploymentstatus.h>
+#include <key.h>
 #include <logging.h>
+#include <modern/fn.h>
+#include <modern/pos_v1.h>
+#include <node/stake_tracker.h>
 #include <node/context.h>
 #include <node/kernel_notifications.h>
 #include <policy/feerate.h>
@@ -162,6 +166,55 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     if (b3_corridor && !b3_consensus.transition_pow_bits) {
         throw std::runtime_error("temporary-PoW corridor difficulty is not configured");
     }
+    if (b3_corridor && !b3_consensus.transition_pow_reward) {
+        throw std::runtime_error("temporary-PoW corridor reward is not configured");
+    }
+    // Modern-PoS production (frozen V1 spec §3-§5): fully deterministic —
+    // resolve the seed and the validator's weights, find the smallest
+    // eligible recovery round, and force the exact round timestamp. The
+    // caller signs after finalizing the merkle root.
+    const bool b3_modern_pos{b3_modern && !b3_corridor};
+    int64_t pos_round{0};
+    if (b3_modern_pos) {
+        if (!b3_consensus.modern_pos) {
+            throw std::runtime_error("modern-PoS parameters are not configured");
+        }
+        if (!m_options.modern_pos_validator_key) {
+            throw std::runtime_error("modern-PoS production requires a validator key");
+        }
+        const auto domain{modern::ModernChainDomain(b3_consensus.hashGenesisBlock,
+                                                    b3_consensus.legacy_final_hash.value_or(uint256{}))};
+        if (!domain) {
+            throw std::runtime_error("modern chain domain is not pinned");
+        }
+        const uint256 seed{Consensus::GetConsensusPhase(pindexPrev->nHeight, b3_consensus) ==
+                                   Consensus::ConsensusPhase::MODERN_POS
+                               ? pindexPrev->m_modern_pos_digest
+                               : modern::ModernPosGenesisSeed(*domain, pindexPrev->GetBlockHash())};
+        if (seed.IsNull()) {
+            throw std::runtime_error("modern-PoS seed for the parent is unavailable");
+        }
+        node::StakeTracker& tracker{m_chainstate.ModernStakeTracker()};
+        if (!tracker.Sync(m_chainstate.m_chain, m_chainstate.m_blockman, b3_consensus, *pindexPrev)) {
+            throw std::runtime_error("modern-PoS stake registry is unavailable");
+        }
+        const auto [w, W]{tracker.ActiveWeight(*m_options.modern_pos_validator_key, nHeight)};
+        if (w <= 0) {
+            throw std::runtime_error("validator has no active stake");
+        }
+        constexpr int64_t MAX_PRODUCTION_ROUNDS{100'000};
+        bool eligible{false};
+        for (; pos_round < MAX_PRODUCTION_ROUNDS; ++pos_round) {
+            const uint256 digest{modern::ModernPosEligibilityDigest(
+                *domain, seed, static_cast<uint32_t>(nHeight), static_cast<uint32_t>(pos_round),
+                *m_options.modern_pos_validator_key)};
+            if (modern::ModernPosEligible(digest, w, W, pos_round, *b3_consensus.modern_pos)) {
+                eligible = true;
+                break;
+            }
+        }
+        if (!eligible) throw std::runtime_error("no eligible modern-PoS round found");
+    }
 
     pblock->nTime = TicksSinceEpoch<std::chrono::seconds>(NodeClock::now());
     m_lock_time_cutoff = pindexPrev->GetMedianTimePast();
@@ -194,10 +247,15 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     coinbaseTx.vout.resize(1);
     coinbaseTx.vout[0].scriptPubKey = m_options.coinbase_output_script;
     // Block subsidy + fees. Corridor blocks claim fees plus the configured
-    // corridor reward (0, fees only, until the corridor reward model is
-    // decided) instead of the stock subsidy schedule.
-    const CAmount block_reward{b3_corridor ? nFees + b3_consensus.transition_pow_reward
-                                           : nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
+    // corridor reward; modern-PoS blocks claim fees plus the configured
+    // (REVISABLE_BEFORE_MAINNET, provisionally 0) modern reward, matching
+    // the unconditional consensus cap. Only non-B3 chains use the stock
+    // subsidy schedule.
+    const CAmount block_reward{b3_corridor  ? nFees + *b3_consensus.transition_pow_reward
+                               : b3_modern_pos ? nFees + (b3_consensus.modern_pos
+                                                              ? b3_consensus.modern_pos->reward
+                                                              : 0)
+                                               : nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
     coinbaseTx.vout[0].nValue = block_reward;
     coinbase_tx.block_reward_remaining = block_reward;
 
@@ -206,6 +264,14 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // increasing its length would reduce the space they can use and may break
     // existing clients.
     coinbaseTx.vin[0].scriptSig = CScript() << nHeight;
+    if (b3_modern_pos) {
+        // The validator declaration (V1 spec §5): a direct 32-byte push of
+        // the x-only key immediately after the BIP34 height push, merkle-
+        // committed through the coinbase.
+        coinbaseTx.vin[0].scriptSig
+            << std::vector<unsigned char>(m_options.modern_pos_validator_key->begin(),
+                                          m_options.modern_pos_validator_key->end());
+    }
     if (m_options.include_dummy_extranonce) {
         // For blocks at heights <= 16, the BIP34-encoded height alone is only
         // one byte. Consensus requires coinbase scriptSigs to be at least two
@@ -238,9 +304,21 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
 
     // Fill in header
     pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
-    UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
-    pblock->nBits          = b3_corridor ? *b3_consensus.transition_pow_bits
-                                         : GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
+    if (b3_modern_pos) {
+        // Deterministic PoS header: the exact round timestamp, the enforced
+        // sentinel bits, nNonce 0, and a zero placeholder signature so the
+        // template's own validity check (which skips signature cryptography)
+        // passes the contextual size rule; the caller re-signs after the
+        // merkle root is final.
+        pblock->nTime = static_cast<uint32_t>(
+            modern::ModernPosBlockTime(pindexPrev->GetBlockTime(), pos_round, *b3_consensus.modern_pos));
+        pblock->nBits = b3_consensus.modern_pos->sentinel_bits;
+        pblock->vchBlockSig.assign(modern::MODERN_POS_SIG_SIZE, 0x00);
+    } else {
+        UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
+        pblock->nBits = b3_corridor ? *b3_consensus.transition_pow_bits
+                                    : GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
+    }
     pblock->nNonce         = 0;
 
     if (m_options.test_block_validity) {
@@ -545,6 +623,17 @@ std::optional<BlockRef> WaitTipChanged(ChainstateManager& chainman, KernelNotifi
     // Must release m_tip_block_mutex before getTip() locks cs_main, to
     // avoid deadlocks.
     return GetTip(chainman);
+}
+
+bool BlockAssembler::SignModernPosBlock(CBlock& block, const CKey& validator_key,
+                                        const Consensus::Params& params)
+{
+    const auto domain{modern::ModernChainDomain(params.hashGenesisBlock,
+                                                params.legacy_final_hash.value_or(uint256{}))};
+    if (!domain || !validator_key.IsValid()) return false;
+    const uint256 sig_hash{modern::ModernPosSignatureHash(*domain, block.GetHash())};
+    block.vchBlockSig.assign(modern::MODERN_POS_SIG_SIZE, 0x00);
+    return validator_key.SignSchnorr(sig_hash, block.vchBlockSig, /*merkle_root=*/nullptr, uint256{});
 }
 
 } // namespace node

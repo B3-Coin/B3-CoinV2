@@ -146,7 +146,7 @@ insufficient PoD → reject; same PoD reused → reject; FN ownership transfer
 deterministic; restart/reindex → identical FN state; B3 supply permanently
 reduced; FN Coin supply independently accounted.
 
-## 8. Legacy FN claims — NORMATIVE MVP (integrated scan-and-claim)
+## 8. Legacy FN claims — SUPERSEDED scan-and-claim MVP (kept for the surviving definitions; see banner)
 
 > **SUPERSEDED (owner ruling 2026-08-17/18; conflict register C-R4).**
 > The scan-and-claim mechanism of this section — funding-key claim
@@ -173,7 +173,7 @@ reduced; FN Coin supply independently accounted.
 > `UNSUPPORTED_FUNDING_SCRIPT`) no longer gates issuance, because no
 > fresh signature is ever checked; and **FN Coin is ONE global
 > fungible-but-indivisible asset** (`FN_ASSET_ID`, decimals 0, cap
-> `MAX_FN_EVER_ISSUED = 1000`) — no per-PoD FN objects, no PoDId in
+> `MAX_FN_EVER_ISSUED = 5000`, ratified 2026-08-22) — no per-PoD FN objects, no PoDId in
 > ordinary FN outputs, and the §10.2 "same-PoDId successor" transfer
 > lifecycle is superseded with it (transfers move whole units of the
 > one asset; extinguishment reduces live supply, never issuance
@@ -621,7 +621,7 @@ freely transferable market asset; all historical rights reserved before
 modern issuance and never crowded out; scarcity counted on
 total-ever-created; extinguishment never reopens a creation slot.
 
-**LOCKED for the legacy-claim MVP (2026-08-16, integrated scan-and-claim):**
+**LOCKED for the legacy-claim MVP (2026-08-16, integrated scan-and-claim) — MECHANISM SUPERSEDED 2026-08-17 (archival-builder issuance); the qualifying-PoD DEFINITION below survives verbatim:**
 every qualifying historical PoD (gap ≥ tier, through H) → exactly one FN
 eligibility event and at most one indivisible FN Coin; eligibility derived
 during normal sync/reindex/replay from the attested prefix only — no
@@ -647,7 +647,7 @@ starting modern creation cost, tranche size, cost increase per tranche,
 reward amount and schedule, reward ownership cutoff on
 transfer/extinguishment, legacy claim expiry policy (none by default) —
 `MAX_FN_EVER_CREATED` is no longer open: its current owner-selected
-value is 1,000 (D-1), revisable before activation through the reviewed
+value is 5,000 (D-1, ratified 2026-08-22 after the real-history report found R = 3,500; supersedes the 1,000 selection), revisable before activation through the reviewed
 process, gated on the real-chain reservation count;
 final FN ownership serialization beyond the MVP claim form; the modern
 FN-creation transaction form's exact detection/serialization (§10.1); FN
@@ -663,9 +663,11 @@ structure (capped total, tranche curve — values OPEN, §11.5).
 
 **Status: LOCKED.** This section records the owner's hypothetical-output
 ruling in its intended scope: **modern FN-creation accounting only**. It
-does not touch the legacy claim mechanism — §8 remains the governing
-historical funding-key scan-and-claim design, and its claim carrier and
-`claimed[pod_id]` registry are unchanged pending their own later review.
+does not touch the legacy issuance mechanism — which, since the same-day
+ruling recorded in §8's banner, is the **archival-builder / stateless-proof
+model** of b3-legacy-fn-issuance-proposal.md (no funding-key claims, no
+production PodDB, issuance deduplicated per PoDId); §8's scan-and-claim
+carrier and per-node `claimed[pod_id]` flow are superseded, not pending.
 (A same-day proposal that misapplied the hypothetical-output idea to the
 legacy claim anchor — virtual claim outpoints materialized into the UTXO
 set at M — was **rejected in full by the owner and must not be revived**.)
@@ -750,7 +752,7 @@ An FN Coin is a colored, normally spendable B3 output, and it must remain
 ## 11. FN scarcity and market economics — LOCKED direction (owner ruling, 2026-08-17)
 
 **Status: LOCKED direction; numerical parameters OPEN (§11.5) except
-D-1, whose current owner-selected value is `MAX_FN_EVER_CREATED = 1,000`
+D-1, whose current owner-selected value is `MAX_FN_EVER_CREATED = 5,000` (2026-08-22; the 2026-08-17 value of 1,000 was superseded when the real-history -podreport found R = 3,500 qualifying PoDs)
 (2026-08-17, revisable before activation through the reviewed process).**
 FN has **both a limited total supply and a deterministically increasing
 creation cost**. The combination is intentional: FN is to become a
@@ -763,10 +765,10 @@ economic structure above them. No consensus code accompanies it.
 
 A consensus constant **`MAX_FN_EVER_CREATED`** caps FN creation.
 
-**Owner parameter decision (2026-08-17): `MAX_FN_EVER_CREATED = 1,000`.**
+**Owner parameter decision (2026-08-17): `MAX_FN_EVER_CREATED = 1,000`; SUPERSEDED 2026-08-22: `MAX_FN_EVER_CREATED = 5,000`** — the equivalence-verified real-history -podreport found R = 3,500 qualifying historical PoDs (all claimable), and per the never-truncate-rights rule the cap was raised to honor every historical right with headroom for modern issuance.
 The cap includes every qualifying historical FN right, claimed or
 unclaimed, and every modern FN ever created; therefore
-`remaining modern capacity = 1,000 − historical_reserved − modern_created`
+`remaining modern capacity = 5,000 − historical_reserved − modern_created`
 (the `C − R − M` invariant below with `C = 1,000`). Revision rules:
 
 - **Until activation**, the owner may revise the numerical value through
@@ -933,11 +935,11 @@ Every value below awaits explicit owner selection. Implementation must
 not proceed on any of them; the locked structure (§11.1–11.4) is
 independent of the values chosen.
 
-**D-1: `MAX_FN_EVER_CREATED` — SELECTED: 1,000 (owner, 2026-08-17)**
+**D-1: `MAX_FN_EVER_CREATED` — SELECTED: 5,000 (owner, 2026-08-22; supersedes 1,000 of 2026-08-17)**
 
 | Item | Status |
 |---|---|
-| Current owner-selected value | **1,000** — includes every qualifying historical right (claimed or unclaimed) and every modern FN ever created |
+| Current owner-selected value | **5,000** (2026-08-22) — includes every qualifying historical right (real-history R = 3,500, claimed or unclaimed) and every modern FN ever created; headroom 1,500 |
 | Activation gate | pre-activation RELEASE gate (§11.1): the real-chain `-podreport` count `R` is mandatory before H/X are pinned and before an activation-ready release; `R > 1,000` → do not pin H/X, do not enable FN activation, return the decision to the owner — historical rights are never discarded to fit the cap; not a block-validation halt |
 | Revision before activation | permitted, through the reviewed protocol process only |
 | Revision after activation | only by an explicit versioned consensus upgrade at a defined activation height; never node-local or independently configurable |

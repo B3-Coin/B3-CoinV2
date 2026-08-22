@@ -5,11 +5,13 @@
 #include <index/txindex.h>
 
 #include <common/args.h>
+#include <consensus/block_codec.h>
 #include <dbwrapper.h>
 #include <flatfile.h>
 #include <index/base.h>
 #include <index/disktxpos.h>
 #include <interfaces/chain.h>
+#include <legacy/codec.h>
 #include <node/blockstorage.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
@@ -79,11 +81,17 @@ bool TxIndex::CustomAppend(const interfaces::BlockInfo& block)
 
     assert(block.data);
     CDiskTxPos pos({block.file_number, block.data_pos}, GetSizeOfCompactSize(block.data->vtx.size()));
+    // Offsets must measure the bytes actually on disk: a legacy-codec B3
+    // block stores nTime transactions without witness framing, selected by
+    // the block's permanent codec marker exactly as the storage layer does.
+    const bool legacy_codec_block{m_chainstate->m_chainman.GetConsensus().legacy_b3coin &&
+                                  !Consensus::HasB3BlockCodecV2(block.data->nVersion)};
     std::vector<std::pair<Txid, CDiskTxPos>> vPos;
     vPos.reserve(block.data->vtx.size());
     for (const auto& tx : block.data->vtx) {
         vPos.emplace_back(tx->GetHash(), pos);
-        pos.nTxOffset += ::GetSerializeSize(TX_WITH_WITNESS(*tx));
+        pos.nTxOffset += legacy_codec_block ? ::GetSerializeSize(legacy::TX_LEGACY(*tx))
+                                            : ::GetSerializeSize(TX_WITH_WITNESS(*tx));
     }
     m_db->WriteTxs(vPos);
     return true;
@@ -103,11 +111,19 @@ bool TxIndex::FindTx(const Txid& tx_hash, uint256& block_hash, CTransactionRef& 
         LogError("OpenBlockFile failed");
         return false;
     }
+    const Consensus::Params& consensus{m_chainstate->m_chainman.GetConsensus()};
     CBlockHeader header;
     try {
         file >> header;
         file.seek(postx.nTxOffset, SEEK_CUR);
-        file >> TX_WITH_WITNESS(tx);
+        // The header's permanent codec marker selects the transaction codec,
+        // mirroring the write path; provenance makes GetHash() the
+        // historical txid for legacy-decoded transactions.
+        if (consensus.legacy_b3coin && !Consensus::HasB3BlockCodecV2(header.nVersion)) {
+            file >> legacy::TX_LEGACY(tx);
+        } else {
+            file >> TX_WITH_WITNESS(tx);
+        }
     } catch (const std::exception& e) {
         LogError("Deserialize or I/O error - %s", e.what());
         return false;
@@ -116,8 +132,8 @@ bool TxIndex::FindTx(const Txid& tx_hash, uint256& block_hash, CTransactionRef& 
         LogError("txid mismatch");
         return false;
     }
-    block_hash = m_chainstate->m_chainman.GetConsensus().legacy_b3coin
-        ? header.GetLegacyB3Hash()
-        : header.GetHash();
+    // Marker-derived identity, the same rule as every other identity site:
+    // a marker-modern block's hash is SHA256d even on a legacy-B3 chain.
+    block_hash = header.GetMarkerHash(consensus);
     return true;
 }

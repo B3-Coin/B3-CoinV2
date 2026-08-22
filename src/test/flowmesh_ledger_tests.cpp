@@ -7,6 +7,7 @@
 //! asset), with adversarial overflow/underflow tests. No matching.
 
 #include <flowmesh/ledger.h>
+#include <test/util/asset.h>
 
 #include <hash.h>
 #include <modern/policy.h>
@@ -29,12 +30,12 @@ const uint256 DEST{uint256{"0000000000000000000000000000000000000000000000000000
 
 modern::AssetId AssetX()
 {
-    return modern::IssuanceAssetId(COutPoint{
+    return modern::test_only::SyntheticAssetId(COutPoint{
         Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000011"}), 0});
 }
 modern::AssetId AssetY()
 {
-    return modern::IssuanceAssetId(COutPoint{
+    return modern::test_only::SyntheticAssetId(COutPoint{
         Txid::FromUint256(uint256{"0000000000000000000000000000000000000000000000000000000000000022"}), 0});
 }
 
@@ -98,9 +99,10 @@ BOOST_AUTO_TEST_CASE(withdrawal_lifecycle_preserves_the_invariant)
     flowmesh::Ledger ledger{VAULT};
     BOOST_CHECK(ledger.Deposit(ALICE, AssetX(), 1000));
 
-    // Finalize: liability moves from balance to a pending receipt; custody
-    // is untouched, so the invariant still holds.
-    const auto receipt{ledger.FinalizeWithdrawal(ALICE, AssetX(), 400, DEST)};
+    // REQUESTED: liability moves from balance to a pending REQUEST;
+    // custody is untouched, so the invariant still holds. Nothing here
+    // is B3-redeemable — that stage is gated on an owner decision.
+    const auto receipt{ledger.RequestWithdrawal(ALICE, AssetX(), 400, DEST)};
     BOOST_REQUIRE(receipt.has_value());
     BOOST_CHECK_EQUAL(receipt->amount, 400);
     BOOST_CHECK(receipt->vault_commitment == VAULT);
@@ -109,20 +111,21 @@ BOOST_AUTO_TEST_CASE(withdrawal_lifecycle_preserves_the_invariant)
     BOOST_CHECK_EQUAL(ledger.Liabilities(AssetX()), 1000); // 600 + 400 pending
     BOOST_CHECK(ledger.SolvencyHolds());
 
-    // The ledger is the view the vault checker consumes.
-    BOOST_CHECK(ledger.GetFinalized(receipt->receipt_id).has_value());
+    // The pending request is visible as a REQUEST — the ledger exposes
+    // no redeemable/finalized view at all.
+    BOOST_CHECK(ledger.GetRequest(receipt->receipt_id).has_value());
 
     // Consume (the on-chain spend connected): custody and receipt-liability
     // leave together.
-    BOOST_CHECK(ledger.ConsumeReceipt(receipt->receipt_id));
+    BOOST_CHECK(ledger.ConsumeRequest(receipt->receipt_id));
     BOOST_CHECK_EQUAL(ledger.Custody(AssetX()), 600);
     BOOST_CHECK_EQUAL(ledger.Liabilities(AssetX()), 600);
     BOOST_CHECK(ledger.SolvencyHolds());
 
     // A receipt is consumed exactly once, and cannot be over-withdrawn.
-    BOOST_CHECK(!ledger.ConsumeReceipt(receipt->receipt_id));
-    BOOST_CHECK(!ledger.GetFinalized(receipt->receipt_id).has_value());
-    BOOST_CHECK(!ledger.FinalizeWithdrawal(ALICE, AssetX(), 601, DEST).has_value());
+    BOOST_CHECK(!ledger.ConsumeRequest(receipt->receipt_id));
+    BOOST_CHECK(!ledger.GetRequest(receipt->receipt_id).has_value());
+    BOOST_CHECK(!ledger.RequestWithdrawal(ALICE, AssetX(), 601, DEST).has_value());
 }
 
 BOOST_AUTO_TEST_CASE(end_to_end_solvency_against_the_vault_checker)
@@ -134,18 +137,36 @@ BOOST_AUTO_TEST_CASE(end_to_end_solvency_against_the_vault_checker)
 
     flowmesh::Ledger ledger{VAULT};
     BOOST_CHECK(ledger.Deposit(ALICE, AssetX(), 1000));
-    const auto receipt{ledger.FinalizeWithdrawal(ALICE, AssetX(), 400, DEST)};
+    const auto receipt{ledger.RequestWithdrawal(ALICE, AssetX(), 400, DEST)};
     BOOST_REQUIRE(receipt.has_value());
 
-    // Build the authorized withdrawal transition and check it against the
-    // ledger acting as the FinalizedReceiptView.
+    // TEST-ONLY adapter SIMULATING the future owner-approved redeemable
+    // view: it presents pending requests to the vault checker AS IF the
+    // trustless B3 authorization existed. Production deliberately has
+    // no such adapter — the ledger itself no longer implements
+    // FinalizedReceiptView, so FlowMesh certification alone can never
+    // pretend a request is an authorized B3 spend.
+    class SimulatedRedeemableView final : public modern::FinalizedReceiptView
+    {
+    public:
+        explicit SimulatedRedeemableView(const flowmesh::Ledger& ledger) : m_ledger{ledger} {}
+        std::optional<modern::WithdrawalReceipt> GetFinalized(
+            const uint256& receipt_id) const override
+        {
+            return m_ledger.GetRequest(receipt_id);
+        }
+
+    private:
+        const flowmesh::Ledger& m_ledger;
+    };
+    const SimulatedRedeemableView redeemable{ledger};
     modern::ModernOutput vault_prev;
     vault_prev.asset = AssetX();
     vault_prev.amount = 1000;
     vault_prev.policy_type = static_cast<uint16_t>(modern::PolicyType::DEX_VAULT);
-    vault_prev.policy_version = modern::POLICY_VERSION_V1;
+    vault_prev.policy_version = modern::DEX_VAULT_POLICY_VERSION_V2;
     vault_prev.policy_commitment = VAULT;
-    vault_prev.policy_params = {0x00, 0x00};
+    vault_prev.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_POOL_CHANGE, 0);
 
     modern::ModernOutput payout;
     payout.asset = AssetX();
@@ -156,14 +177,14 @@ BOOST_AUTO_TEST_CASE(end_to_end_solvency_against_the_vault_checker)
 
     modern::ModernOutput change{vault_prev};
     change.amount = 600;
-    change.policy_params = {0x01, 0x00};
+    change.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_POOL_CHANGE, 1);
 
     modern::ModernTransition t;
     t.inputs.resize(1);
     t.inputs[0].prevout = COutPoint{Txid::FromUint256(uint256{"00000000000000000000000000000000000000000000000000000000000000e0"}), 0};
     modern::TransitionProof proof;
     proof.proof_type = static_cast<uint16_t>(modern::PolicyType::DEX_VAULT);
-    proof.proof_version = modern::POLICY_VERSION_V1;
+    proof.proof_version = modern::DEX_VAULT_POLICY_VERSION_V2; // proofs pair with the v2 policy
     VectorWriter writer{proof.payload, 0};
     writer << std::vector<uint256>{receipt->receipt_id};
     t.proofs.push_back(proof);
@@ -171,13 +192,13 @@ BOOST_AUTO_TEST_CASE(end_to_end_solvency_against_the_vault_checker)
 
     std::vector<uint256> consumed;
     BOOST_CHECK(modern::CheckVaultWithdrawal(std::vector<modern::ModernOutput>{vault_prev}, t,
-                                             ledger, /*height=*/1001, params, &consumed) ==
+                                             redeemable, /*height=*/1001, params, &consumed) ==
                 modern::VaultCheck::OK);
     BOOST_REQUIRE_EQUAL(consumed.size(), 1U);
 
     // Applying the reported consumption keeps the ledger solvent and in
     // step with on-chain custody.
-    BOOST_CHECK(ledger.ConsumeReceipt(consumed[0]));
+    BOOST_CHECK(ledger.ConsumeRequest(consumed[0]));
     BOOST_CHECK_EQUAL(ledger.Custody(AssetX()), 600);
     BOOST_CHECK(ledger.SolvencyHolds());
 }
@@ -206,14 +227,17 @@ BOOST_AUTO_TEST_CASE(state_root_is_deterministic_and_path_independent)
     b.AdvanceSlot();
     BOOST_CHECK_EQUAL(a.StateRoot().GetHex(), b.StateRoot().GetHex());
 
-    // A fully unwound fee leaves a fee-account entry, so it is NOT the same
-    // state — canonical pruning only removes truly empty entries.
+    // A REJECTED fee (zero amount) is a pure no-op: byte-identical root.
     flowmesh::Ledger c{VAULT};
     c.Deposit(ALICE, AssetX(), 1000);
-    c.ChargeFee(ALICE, AssetX(), 0); // rejected, no-op
+    BOOST_CHECK(!c.ChargeFee(ALICE, AssetX(), 0)); // rejected, no-op
     flowmesh::Ledger d{VAULT};
     d.Deposit(ALICE, AssetX(), 1000);
     BOOST_CHECK_EQUAL(c.StateRoot().GetHex(), d.StateRoot().GetHex());
+    // A REAL fee leaves a persistent fee-account entry: the roots must
+    // differ (canonical pruning removes only truly empty entries).
+    BOOST_CHECK(c.ChargeFee(ALICE, AssetX(), 1));
+    BOOST_CHECK(c.StateRoot() != d.StateRoot());
 }
 
 //! Pass-3 fix: the ledger state root is canonically framed (v2 domain).
@@ -240,7 +264,7 @@ BOOST_AUTO_TEST_CASE(state_root_v2_is_canonically_framed)
     BOOST_REQUIRE(ledger.Deposit(ALICE, AssetX(), 1000));
     BOOST_REQUIRE(ledger.Deposit(BOB, AssetX(), 500));
     BOOST_REQUIRE(ledger.Reserve(ALICE, AssetX(), 200));
-    const auto receipt{ledger.FinalizeWithdrawal(BOB, AssetX(), 100, DEST)};
+    const auto receipt{ledger.RequestWithdrawal(BOB, AssetX(), 100, DEST)};
     BOOST_REQUIRE(receipt.has_value());
 
     // Byte-exact reconstruction of the v2 preimage. Balances iterate in
@@ -282,18 +306,29 @@ BOOST_AUTO_TEST_CASE(adversarial_overflow_and_underflow)
     // present, and cannot withdraw non-positive.
     BOOST_CHECK(!ledger.Release(ALICE, AssetX(), 1));            // nothing reserved
     BOOST_CHECK(!ledger.Reserve(BOB, AssetX(), 1));              // no balance
-    BOOST_CHECK(!ledger.FinalizeWithdrawal(ALICE, AssetX(), MAX_MONEY + 1, DEST).has_value());
-    BOOST_CHECK(!ledger.FinalizeWithdrawal(ALICE, AssetX(), 0, DEST).has_value());
-    BOOST_CHECK(!ledger.FinalizeWithdrawal(ALICE, AssetX(), -1, DEST).has_value());
-    BOOST_CHECK(!ledger.ConsumeReceipt(uint256{"00000000000000000000000000000000000000000000000000000000000000ff"}));
+    BOOST_CHECK(!ledger.RequestWithdrawal(ALICE, AssetX(), MAX_MONEY + 1, DEST).has_value());
+    BOOST_CHECK(!ledger.RequestWithdrawal(ALICE, AssetX(), 0, DEST).has_value());
+    BOOST_CHECK(!ledger.RequestWithdrawal(ALICE, AssetX(), -1, DEST).has_value());
+    BOOST_CHECK(!ledger.ConsumeRequest(uint256{"00000000000000000000000000000000000000000000000000000000000000ff"}));
     BOOST_CHECK_EQUAL(ledger.StateRoot().GetHex(), root.GetHex());
+    BOOST_CHECK(ledger.SolvencyHolds());
+
+    // Rejected deposits of a NEW asset leave every persistent field
+    // unchanged (range refusals; the overflow-before-insert bug class
+    // itself is pinned by the fresh-balance-key custody-overflow case
+    // above, where a rejection genuinely follows the map lookups).
+    BOOST_CHECK(!ledger.Deposit(ALICE, AssetY(), MAX_MONEY + 1)); // out of range
+    BOOST_CHECK(!ledger.Deposit(ALICE, AssetY(), 0));
+    BOOST_CHECK(!ledger.Deposit(ALICE, AssetY(), -1));
+    BOOST_CHECK_EQUAL(ledger.StateRoot().GetHex(), root.GetHex());
+    BOOST_CHECK_EQUAL(ledger.Custody(AssetY()), 0);
     BOOST_CHECK(ledger.SolvencyHolds());
 
     // A maximal withdrawal then consumption drains to exactly zero without
     // wrap-around.
-    const auto receipt{ledger.FinalizeWithdrawal(ALICE, AssetX(), MAX_MONEY, DEST)};
+    const auto receipt{ledger.RequestWithdrawal(ALICE, AssetX(), MAX_MONEY, DEST)};
     BOOST_REQUIRE(receipt.has_value());
-    BOOST_CHECK(ledger.ConsumeReceipt(receipt->receipt_id));
+    BOOST_CHECK(ledger.ConsumeRequest(receipt->receipt_id));
     BOOST_CHECK_EQUAL(ledger.Custody(AssetX()), 0);
     BOOST_CHECK_EQUAL(ledger.Liabilities(AssetX()), 0);
     BOOST_CHECK(ledger.SolvencyHolds());

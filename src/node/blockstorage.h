@@ -135,8 +135,20 @@ static constexpr uint32_t UNDO_DATA_DISK_OVERHEAD{STORAGE_HEADER_BYTES + uint256
 using BlockMap = std::unordered_map<uint256, CBlockIndex, BlockHasher>;
 
 struct CBlockIndexWorkComparator {
+    CBlockIndexWorkComparator() = default;
+    explicit CBlockIndexWorkComparator(const Consensus::Params* params) : m_params{params} {}
     bool operator()(const CBlockIndex* pa, const CBlockIndex* pb) const;
     using is_transparent = void;
+    /**
+     * When set on a B3 chain with the modern-PoS parameter block configured,
+     * equal-chainwork entries order by the frozen V1 PoS-native rule
+     * (spec §6) instead of falling straight to received-order: height first,
+     * then — for same-height modern-PoS pairs — lower recovery round (the
+     * timestamp delta from the first divergent block) and lower block hash.
+     * Every key is immutable from header acceptance, as a std::set comparator
+     * requires. Null (the default everywhere else) keeps stock behavior.
+     */
+    const Consensus::Params* m_params{nullptr};
 };
 
 struct CBlockIndexHeightOnlyComparator {

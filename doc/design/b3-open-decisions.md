@@ -7,30 +7,38 @@ Locked material lives in [b3-architecture-contract.md](b3-architecture-contract.
 
 ---
 
-## OD-1 — Modern PoS consensus specification — **UNRESOLVED (blocking)**
+## OD-1 — Modern PoS consensus specification — **V1 MECHANISM FROZEN (2026-08-20); numerics REVISABLE**
 
-**Status: UNRESOLVED at the protocol-detail level. Do not implement.**
+**Status: the V1 mechanism is FROZEN by explicit owner rulings (M1–M6,
+2026-08-20) and implementation is authorized.**
+[b3-modern-pos-spec.md](b3-modern-pos-spec.md) is the frozen V1 specification:
+deterministic stake-weighted hash eligibility over a chained seed, exact
+deterministic timestamps encoding recovery rounds, BIP340 validator block
+signatures, PoS-native height/round fork choice with a fixed reorganization
+horizon, and an unconditional modern coinbase cap. No VRF, epochs, committees,
+slashing, finality gadget, or delegation in V1 (all V2 research, spec §10).
 
-Modern PoS is the single unbuilt piece on the critical path to H+1, and its protocol
-details have not been specified. `src/modern/pos.h` deliberately **fails closed**:
-`modern::CheckModernStake` rejects every modern-era block with `no-modern-pos-rules`
-unless a test-only validator is installed. That is the correct state until a spec exists.
+What remains OPEN under OD-1 (after the 2026-08-21 ratifications: block
+interval 60 s, round length 30 s, f0 = 1, ×2 relaxation, and the STAKE v1
+carrier are all RATIFIED; the corridor reward is ratified fees-only and
+fail-closed; cutoff C and the readiness gate are ruled out of existence):
 
-Undefined and required before any implementation:
+- The sentinel-bits and future-drift values stay provisional (spec §9).
+- The modern reward schedule (with OD-2).
+- The corridor difficulty VALUE (policy ruled: low, stall-safety dominant,
+  calibrated to a single CPU core), measured at H/X pinning time.
 
-- **Stake eligibility** — which UTXOs may stake; minimum amount; minimum/maximum age;
-  whether policy-typed outputs (e.g. a `STAKE` policy) are required or optional.
-- **Kernel / selection function** — the hash construction, its inputs, and its randomness
-  source. Legacy stake modifiers and legacy in-block transaction offsets are explicitly
-  **not** carried forward.
-- **Difficulty / target retarget** — algorithm and bounds for the modern era.
-- **Reward schedule** — modern B3 monetary policy, including the coinbase/subsidy cap.
-  (Note: today the modern branch has no issuance cap other than the fail-closed hook —
-  see IS-3 in the status document.)
-- **Modern PoS block structure** — how a modern block declares itself proof-of-stake.
-- **Block signature / attestation scheme.**
-- **Validator set and finality** — membership, rotation, and whether finality is
-  committee-certified.
+Further RATIFIED 2026-08-21: the horizon D = 1440 (one day at the 60 s
+interval) and `min_stake_amount` = 333 modern B3 (kB3; 333e9 base units),
+both stated on mainnet and inert until H/X.
+
+Resolved by the frozen spec (formerly listed as undefined): stake eligibility
+(STAKE policy outputs, aggregated per key, 20-block depth); the selection
+function (tagged-hash digest over the seed chain — no separate retarget: the
+`w/W` normalization is the difficulty); reward cap (unconditional, outside the
+validator); PoS block structure (coinbase key declaration + trailing BIP340
+signature); block signature scheme (BIP340); validator set (the derived stake
+registry; no committees; finality is fork-choice-plus-horizon only in V1).
 
 Constraints already locked and not open for reinterpretation:
 
@@ -39,15 +47,11 @@ Constraints already locked and not open for reinterpretation:
 - Modern PoS must be complete before FlowMesh (contract §53).
 - Validators and FlowMesh FNs are separate roles (contract §52).
 
-**Required to unblock:** a written modern PoS consensus specification covering every bullet
-above.
-
-**Design base accepted:** [b3-modern-pos-spec.md](b3-modern-pos-spec.md) is the
-accepted structural base (STAKE policy outputs, locked-amount weight,
-owner/validator key split, no auto-compounding, bounded age, VRF eligibility
-with ranked fallbacks, cheap pre-verification). Every remaining decision is
-tracked there with LOCKED/OPEN status: PD-1..PD-17 are all OPEN and all numeric
-parameters are simulation-gated.
+**Required to unblock mainnet activation:** the horizon D, the remaining
+provisional values (sentinel bits, future drift, modern reward with OD-2),
+the corridor difficulty value, `min_stake_amount`, and the real-history
+equivalence gate, as always. The timing numbers and the STAKE carrier are
+ratified; implementation on regtest is complete.
 
 **The transition model is AUTHORITATIVE design direction (2026-08-16):**
 [b3-during-fork-transition.md](b3-during-fork-transition.md) — the
@@ -66,16 +70,17 @@ length 1,000 is a locked count; per-validator weight aggregation is LOCKED
 preserved design number; after H, legacy PoS never resumes. Operator keys,
 snapshots, committees and self-authorizing blocks remain forbidden.
 
-**OD-1 stays UNRESOLVED and nothing may be implemented until every remaining
-OPEN item is explicitly locked** — the PoS PDs (PD-1..15, 17) plus the
-corridor document's OPEN list (corridor difficulty policy and numerics,
-corridor reward and the miner→validator-capture rule, cutoff C,
-insufficient-stake handling A–D, corridor reorg bounds, STAKE serialization
-and activation mechanics, minimum stake, initial seed at M, X distribution
-pause-vs-precommit); the numeric ones lock only from simulation results.
-The corridor's code/test contradiction register (including the H+1
-fail-closed integration test that will eventually move to H+1001) is in the
-corridor document §11 — recorded, not yet resolved in code.
+**Mainnet activation stays gated** on the corridor document's remaining
+OPEN list — after the 2026-08-21 rulings that list is: the corridor
+difficulty VALUE (mechanism ruled: fixed constant, no retarget), corridor
+reorg-depth bounds and §7 mitigations, minimum stake amount, and
+X-distribution pause-vs-precommit — plus the horizon D and the remaining
+spec-§9 provisional values. Ruled out of existence on 2026-08-21: cutoff C
+(the 20-block activation depth alone governs), the readiness/minimum-stake
+consensus gate (operational, options A+C), and the corridor
+reward/capture question (ratified 0, fees-only, fail-closed). The earlier
+PD-1..17 register is superseded by the frozen V1 spec; the initial seed at
+M is resolved (spec §3).
 
 ---
 
@@ -87,6 +92,26 @@ Overlaps with OD-1's reward schedule. Native B3 must never be issued through the
 coloured-asset engine.
 
 ---
+
+## Colored assets simple-v1 — RULED 2026-08-22 (formerly audit Decision 11)
+
+Owner rulings: (1) asset identity unified with the FN convention —
+`AssetId = TaggedHash("B3/ASSET/V1") ‖ ModernChainDomain ‖ issuance_outpoint
+‖ H(genesis record)` (chain-bound, rule-bound; supersedes the untagged
+outpoint-only derivation and reconciles contract §21 by strengthening it);
+(2) the v1 asset-wide rule set is exactly `max_supply`, `decimals` and
+`mint_authority = NONE`, stated once in the issuance transaction's creation
+action and never repeated on outputs; (3) the genesis mints exactly
+`max_supply` in one transaction and no later mint exists, so the cap holds
+by construction without a registry. ROOM FOR EXPANSION (owner direction,
+same day): the genesis record carries an `issuance_mode` byte (v1 accepts
+only GENESIS_FIXED; AUTHORITY_MINT, POW_MINED — PoW-minable colored assets
+— and BRIDGE_BACKED are RESERVED numbers) plus a bounded `mode_params`
+blob (empty in v1), so a future mode ships its parameters inside the same
+record layout and the same AssetId preimage with no format change;
+`max_supply` is the hard cap in every mode. Programmable schemes and the
+reserved modes themselves stay V2 research. Implemented in
+`src/modern/asset.h` (test-only activation unchanged).
 
 ## OD-3 — Consensus governance / upgrade mechanism
 
@@ -139,7 +164,19 @@ state is impossible.
 
 ---
 
-## OD-6 — FlowMesh epoch ↔ B3 finality relationship
+## OD-6 — FlowMesh epoch ↔ B3 finality relationship — **RULED 2026-08-22**
+
+`FLOWMESH_ANCHOR_DEPTH = 30` blocks (~30 min at the 60 s interval) governs
+deposit recognition, anchor acceptance, and receipt redeemability alike;
+distinct from `MODERN_REORG_HORIZON = 1440`. Certificate finality (yes,
+FlowMesh-state only, conflicting certificate = evidence + fail-safe halt),
+the keyless receipt-vault (ratified, redeemability = certified ∧ anchor
+canonical ∧ buried ≥ depth ∧ not consumed), and the DEX_VAULT v2 beneficiary
+binding (USER_DEPOSIT vs VAULT_POOL_CHANGE) are recorded in
+[b3-flowmesh-dex-decisions.md](b3-flowmesh-dex-decisions.md) §3b. The text
+below is the pre-ruling statement of the question.
+
+## OD-6 (original statement)
 
 Contract §39 requires microblocks/epochs to be anchored to B3 rather than forming an
 independent history, but the binding is unspecified: the relationship between a FlowMesh
@@ -163,6 +200,15 @@ specified.
 Contract §21 requires bridged assets to encode origin domain, and §45 requires bridge
 security to stay explicit, but no bridge verification mechanism, finality assumption, or
 issuer-freeze policy handling is specified. Gated well behind H+1 (activation A3).
+
+**Direction RULED 2026-08-22 (mechanism details still OPEN):**
+
+- No bridge is a dependency of FlowMesh: the first real quote/fee asset is the native CDP-backed bUSD (DEX register L-6); bridged stables are optional extra liquidity added later.
+- Any protocol-level bridge is **light-client / SPV on the mint leg**, never a signer set inside consensus: Ethereum via the sync-committee light client (finalized headers only; the owner ruled the light client as "the solution"), Bitcoin via SPV proofs of the most-work chain. The release leg (B3 → origin) needs the origin chain to verify B3 finality (a B3 Modern-PoS light client there) and until then runs through a rotatable signer set or an optimistic scheme — the one bridged-asset policy carries a rotatable `signer_set` so v1-managed → outsourced → light-client → issuer-native are in-place transitions of the same `AssetId` (`bridge_instance` pinned; signer set is mutable state of the instance).
+- Tron and other non-light-client chains are served **off-consensus** (Chainflip-class swaps into native B3, managed on-ramps); no Tron bridge enters consensus.
+- End state: an issuer taking mint authority in place (native issuance) — a business outcome, not a protocol dependency.
+- Recommended, not yet ruled: Ethereum **L1** (not an L2) as the stable origin — an Arbitrum origin adds a rollup-state proof and ~6.4-day BoLD finality or sequencer trust, and its USDT is USDT0 (LayerZero-backed).
+- Still OPEN: exact light-client verification rules and the `blst`/keccak/RLP/MPT dependency decision, sync-committee participation threshold, mint caps, watcher veto, fork-upgrade procedure, re-bootstrap rule, issuer-freeze handling.
 
 ---
 

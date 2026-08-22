@@ -48,6 +48,11 @@ inline constexpr uint16_t CREATION_ACTION_FN_CLAIM{1}; // RESERVED/SUPERSEDED
 inline constexpr uint16_t FN_CLAIM_ACTION_VERSION_V1{1};
 inline constexpr uint16_t CREATION_ACTION_LEGACY_FN_ISSUANCE{2};
 inline constexpr uint16_t LEGACY_FN_ISSUANCE_ACTION_VERSION_V1{1};
+//! Type 3: colored-asset genesis (issuance) — carries the asset's bounded,
+//! immutable genesis record (modern/asset.h AssetGenesisV1), whose
+//! commitment is bound into the AssetId. Owner ruling 2026-08-22.
+inline constexpr uint16_t CREATION_ACTION_ASSET_ISSUANCE{3};
+inline constexpr uint16_t ASSET_ISSUANCE_ACTION_VERSION_V1{1};
 
 //! Whether a (type, version) pair is a registered creation action.
 //! Registration keeps a pair DECODABLE at the framing layer (so
@@ -59,7 +64,9 @@ inline constexpr bool IsKnownCreationAction(const uint16_t action_type,
     return (action_type == CREATION_ACTION_FN_CLAIM &&
             action_version == FN_CLAIM_ACTION_VERSION_V1) ||
            (action_type == CREATION_ACTION_LEGACY_FN_ISSUANCE &&
-            action_version == LEGACY_FN_ISSUANCE_ACTION_VERSION_V1);
+            action_version == LEGACY_FN_ISSUANCE_ACTION_VERSION_V1) ||
+           (action_type == CREATION_ACTION_ASSET_ISSUANCE &&
+            action_version == ASSET_ISSUANCE_ACTION_VERSION_V1);
 }
 
 /**

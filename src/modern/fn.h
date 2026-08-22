@@ -7,6 +7,7 @@
 
 #include <consensus/amount.h>
 #include <hash.h>
+#include <modern/chain_domain.h>
 #include <modern/creation_action.h>
 #include <modern/policy.h>
 #include <pubkey.h>
@@ -80,7 +81,13 @@ inline constexpr uint16_t FN_POLICY_VERSION_V1{POLICY_VERSION_V1};
 //! doc/design/b3-fn-pod.md §11.1 alias MAX_FN_EVER_CREATED, owner
 //! selection D-1). `issued_total` is monotonic: extinguishment reduces
 //! live supply but NEVER reopens issuance capacity.
-inline constexpr uint32_t MAX_FN_EVER_ISSUED{1000};
+//!
+//! RATIFIED 5,000 (owner ruling 2026-08-22): the real-history -podreport
+//! over the equivalence-verified chain found R = 3,500 qualifying
+//! historical PoDs (all claimable) against the earlier 1,000 selection;
+//! per the never-truncate-rights rule the cap was raised to honor every
+//! historical FN with headroom for modern issuance.
+inline constexpr uint32_t MAX_FN_EVER_ISSUED{5000};
 
 /**
  * The ONE global FN Coin asset identity (owner ruling 2026-08-18):
@@ -653,20 +660,8 @@ inline bool CheckFnCreationActions(const std::vector<CreationAction>& actions,
 
 // ---- Claim-intent digest (§8.3, revised 2026-08-17) --------------------
 
-//! The contract's immutable anti-replay network identifier:
-//! TaggedHash("B3/MODERN/CHAIN", genesis || X), both as their 32 raw
-//! internal-order (header-serialization) bytes. Pure function of its
-//! arguments — no defaults, no globals; fails closed (nullopt) when
-//! either hash is null, so a call site with an unset X cannot obtain a
-//! domain.
-inline std::optional<uint256> ModernChainDomain(const uint256& genesis_hash,
-                                                const uint256& final_legacy_hash)
-{
-    if (genesis_hash.IsNull() || final_legacy_hash.IsNull()) return std::nullopt;
-    HashWriter writer{TaggedHash("B3/MODERN/CHAIN")};
-    writer << genesis_hash << final_legacy_hash;
-    return writer.GetSHA256();
-}
+// ModernChainDomain lives in modern/chain_domain.h (shared by FN, the
+// colored-asset ids and modern PoS).
 
 /**
  * The claim-intent digest every funding-key authorization signs:

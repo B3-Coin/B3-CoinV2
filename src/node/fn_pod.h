@@ -33,11 +33,18 @@ namespace node {
  * persists records only — no claim transaction, no FN minting, no
  * claimed-flag mutation lives here.
  *
- * INTEGRATION STATUS (honest): the sync helper and the offline replay
- * path exist and are tested (unit fixtures + the regtest evolution
- * suite + b3coin-utxo-verify -podreport). Normal production sync and
- * reindex derivation is the REQUIRED FUTURE INTEGRATION — it is not
- * present behavior; that wiring is a later, separately reviewed step.
+ * INTEGRATION STATUS (honest, under the RULED model): the sync helper
+ * and the offline replay path exist and are tested (unit fixtures + the
+ * regtest evolution suite + b3coin-utxo-verify -podreport). Under the
+ * owner's 2026-08-17 FN issuance ruling (doc/design/
+ * b3-legacy-fn-issuance-proposal.md) this module is BUILDER-SIDE AND
+ * AUDIT TOOLING ONLY: historical FN rights are issued by ONE archival
+ * builder as proof-carrying issuance transactions that every node
+ * verifies STATELESSLY against the H/X-sealed chain. Normal production
+ * sync/reindex does NOT derive PodRecords and there is NO production
+ * PodDB by design — the earlier "every node scans and keeps a PodDB;
+ * users claim with funding-key signatures" model (this document's §8
+ * scan-and-claim MVP) is SUPERSEDED, not pending.
  */
 
 //! Why a qualifying PoD is or is not claimable under the MVP.

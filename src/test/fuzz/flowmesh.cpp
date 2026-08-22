@@ -32,12 +32,6 @@ modern::AssetId FuzzBase()
     return id;
 }
 
-class PassAuth final : public flowmesh::ActionAuthenticator
-{
-public:
-    bool Authenticate(const flowmesh::Action&) const override { return true; }
-};
-
 template <typename T>
 std::optional<T> Decode(DataStream& s)
 {
@@ -93,10 +87,9 @@ FUZZ_TARGET(flowmesh_microblock_codec)
     // mutates the state it ran against.
     flowmesh::FlowMeshState state{FUZZ_VAULT, FuzzBase(), modern::NativeAsset()};
     const uint256 before{state.Root()};
-    const PassAuth auth;
     flowmesh::FlowMeshState next{state};
     flowmesh::BatchResult result;
-    (void)flowmesh::ExecuteCandidate(state, FUZZ_DOMAIN, uint256{}, *mb, auth,
+    (void)flowmesh::ExecuteCandidate(state, FUZZ_DOMAIN, uint256{}, *mb,
                                      /*deposits=*/nullptr, next, result);
     assert(state.Root() == before);
 }
@@ -132,5 +125,5 @@ FUZZ_TARGET(flowmesh_state_snapshot)
     // Whatever decoded (before certificate verification would judge it),
     // the state's pure functions are total.
     (void)state.Root();
-    (void)state.ledger.SolvencyHolds();
+    (void)state.LedgerView().SolvencyHolds();
 }
