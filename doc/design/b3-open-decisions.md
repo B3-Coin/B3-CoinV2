@@ -201,6 +201,15 @@ Contract §21 requires bridged assets to encode origin domain, and §45 requires
 security to stay explicit, but no bridge verification mechanism, finality assumption, or
 issuer-freeze policy handling is specified. Gated well behind H+1 (activation A3).
 
+**Direction RULED 2026-08-22 (mechanism details still OPEN):**
+
+- No bridge is a dependency of FlowMesh: the first real quote/fee asset is the native CDP-backed bUSD (DEX register L-6); bridged stables are optional extra liquidity added later.
+- Any protocol-level bridge is **light-client / SPV on the mint leg**, never a signer set inside consensus: Ethereum via the sync-committee light client (finalized headers only; the owner ruled the light client as "the solution"), Bitcoin via SPV proofs of the most-work chain. The release leg (B3 → origin) needs the origin chain to verify B3 finality (a B3 Modern-PoS light client there) and until then runs through a rotatable signer set or an optimistic scheme — the one bridged-asset policy carries a rotatable `signer_set` so v1-managed → outsourced → light-client → issuer-native are in-place transitions of the same `AssetId` (`bridge_instance` pinned; signer set is mutable state of the instance).
+- Tron and other non-light-client chains are served **off-consensus** (Chainflip-class swaps into native B3, managed on-ramps); no Tron bridge enters consensus.
+- End state: an issuer taking mint authority in place (native issuance) — a business outcome, not a protocol dependency.
+- Recommended, not yet ruled: Ethereum **L1** (not an L2) as the stable origin — an Arbitrum origin adds a rollup-state proof and ~6.4-day BoLD finality or sequencer trust, and its USDT is USDT0 (LayerZero-backed).
+- Still OPEN: exact light-client verification rules and the `blst`/keccak/RLP/MPT dependency decision, sync-committee participation threshold, mint caps, watcher veto, fork-upgrade procedure, re-bootstrap rule, issuer-freeze handling.
+
 ---
 
 ## OD-9 — Encrypted order flow
