@@ -64,11 +64,19 @@ public:
     Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fCoinStakeIn = false,
          uint32_t nTimeIn = 0, uint32_t nTxOffsetIn = 0)
         : out(std::move(outIn)), fCoinBase(fCoinBaseIn), fCoinStake(fCoinStakeIn),
-          nHeight(nHeightIn), nTime(nTimeIn), nTxOffset(nTxOffsetIn) {}
+          nHeight(nHeightIn), nTime(nTimeIn), nTxOffset(nTxOffsetIn)
+    {
+        // The 30-bit field must hold the value exactly: a truncated height or
+        // sentinel would silently break every later comparison.
+        Assume(nHeightIn >= 0 && static_cast<uint32_t>(nHeightIn) <= MAX_HEIGHT);
+    }
     Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fCoinStakeIn = false,
          uint32_t nTimeIn = 0, uint32_t nTxOffsetIn = 0)
         : out(outIn), fCoinBase(fCoinBaseIn), fCoinStake(fCoinStakeIn),
-          nHeight(nHeightIn), nTime(nTimeIn), nTxOffset(nTxOffsetIn) {}
+          nHeight(nHeightIn), nTime(nTimeIn), nTxOffset(nTxOffsetIn)
+    {
+        Assume(nHeightIn >= 0 && static_cast<uint32_t>(nHeightIn) <= MAX_HEIGHT);
+    }
 
     void Clear() {
         out.SetNull();
