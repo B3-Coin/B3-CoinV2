@@ -32,6 +32,7 @@ must not be read as approved. No futures/leverage code exists.
 | L-2 | **Only FN Coin holders may produce microblocks** and confirm FlowMesh trading transitions. | Matches brief §11. Whether bare holding suffices or a lock/activate-1-FN seat is required stays OPEN (O-1). |
 | L-3 | **DEX fees are denominated in USDT** (a USDT-backed colored coin) **and collected by FN Coin holders.** | Matches brief §18. Distribution rule OPEN (O-4). |
 | L-4 | **FlowMesh will support futures; maximum leverage = 10×.** | The complete locked futures statement. Everything else about futures is OPEN (see the corrected scope note above); the previously recorded "perpetuals" and "cross+isolated" entries are WITHDRAWN as over-claims per the Codex repair directive. |
+| L-5 | **Spot and futures are SEPARATE: spot market with spot balances, futures market with futures balances** (owner ruling 2026-08-22). | The spot ledger keeps its strict fully-backed identity (`custody == available + reserved + pending`) untouched; futures get their own accounting class/ledger with their own collateral and margin model; moving value between a spot balance and a futures balance is an explicit transfer, never an implicit one. Futures mechanics themselves stay OPEN (L-4); this ruling fixes only the separation. |
 
 ## 2. Defaults adopted (REVISABLE, not protocol-locked)
 
