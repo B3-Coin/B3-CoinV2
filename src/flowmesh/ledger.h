@@ -38,7 +38,21 @@ inline const AccountId& FeeAccount()
 inline constexpr uint64_t LEDGER_SNAPSHOT_MAX_ENTRIES{uint64_t{1} << 22};
 
 /**
- * FlowMesh internal asset ledger (off-consensus; no matching here).
+ * FlowMesh internal asset ledger — the SPOT state domain (off-consensus;
+ * no matching here).
+ *
+ * BINDING ACCOUNTING RULE (owner, 2026-08-22): spot and futures are
+ * SEPARATE state domains. This ledger holds SPOT balances only: spot
+ * orders may reserve and consume only these balances; B3 deposits credit
+ * spot by default and B3 withdrawals debit spot only. Futures positions,
+ * margin, fees, PnL and liquidations will live in their OWN ledger class
+ * and may never touch these balances directly; value crosses the boundary
+ * only through explicit SPOT_TO_FUTURES / FUTURES_TO_SPOT actions (the
+ * latter behind a margin-safety check), both reserved in ActionType and
+ * REJECTED in v1. The B3 vault may be one physical pool, but its spot and
+ * futures liabilities stay separately accounted, so the solvency identity
+ * below is the SPOT identity and a future futures ledger carries its own.
+ * Nothing here is a universal balance that futures logic can consume.
  *
  * Deterministic per-account, per-asset balances with exact integer
  * arithmetic. The ledger upholds the vault solvency invariant at every

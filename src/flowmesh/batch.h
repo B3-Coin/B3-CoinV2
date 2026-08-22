@@ -56,6 +56,13 @@ enum class ActionType : uint8_t {
     CANCEL_ASK = 3,
     WITHDRAW = 4,
     DEPOSIT = 5,
+    //! RESERVED (owner accounting rule 2026-08-22): the ONLY paths by which
+    //! value may cross between the SPOT state domain (this ledger) and the
+    //! future FUTURES state domain. FUTURES_TO_SPOT requires a margin-safety
+    //! check. Both are REJECTED in v1 — futures are not implemented; the
+    //! numbers are fixed now so the registry stays append-only.
+    SPOT_TO_FUTURES = 6,
+    FUTURES_TO_SPOT = 7,
 };
 
 //! Structural bounds, enforced during decode (before allocation) and
@@ -156,6 +163,9 @@ struct Action {
         case ActionType::DEPOSIT:
             return signer.IsNull() && sequence == 0 && curve.empty() && asset.IsNull() &&
                    amount == 0 && destination.IsNull() && !outpoint.IsNull();
+        case ActionType::SPOT_TO_FUTURES:
+        case ActionType::FUTURES_TO_SPOT:
+            return false; // reserved for the futures domain; rejected in v1
         }
         return false;
     }
@@ -379,6 +389,10 @@ public:
             }
             case ActionType::DEPOSIT:
                 break; // unreachable: deposits were split off above
+            case ActionType::SPOT_TO_FUTURES:
+            case ActionType::FUTURES_TO_SPOT:
+                ok = false; // unreachable: shape validation rejects reserved types
+                break;
             }
 
             m_state.AdvanceSequence(action.signer, action.sequence + 1);
