@@ -146,7 +146,7 @@ BOOST_AUTO_TEST_CASE(policy_identity_pins)
     BOOST_CHECK(!IsKnownCreationAction(2, 2));
     BOOST_CHECK(!IsKnownCreationAction(3, 1));
     BOOST_CHECK_EQUAL(MAX_CREATION_ACTION_PAYLOAD, 4000U);
-    BOOST_CHECK_EQUAL(MAX_FN_EVER_ISSUED, 1000U);
+    BOOST_CHECK_EQUAL(MAX_FN_EVER_ISSUED, 5000U); // RATIFIED 2026-08-22 (R = 3,500 historical PoDs)
 
     // FN v1 is INACTIVE on every network: the policy model itself fails
     // closed, with or without the test-only asset activation flag.
@@ -176,19 +176,19 @@ BOOST_AUTO_TEST_CASE(fn_asset_identity)
 //! and whole-unit conservation.
 BOOST_AUTO_TEST_CASE(fn_supply_model)
 {
-    // Cap: 999 → 1000 mints; at the cap, fresh issuance rejects.
-    FnSupplyModel model{.issued_total = 999, .live_supply = 999};
+    // Cap: (cap-1) → cap mints; at the cap, fresh issuance rejects.
+    FnSupplyModel model{.issued_total = MAX_FN_EVER_ISSUED - 1, .live_supply = MAX_FN_EVER_ISSUED - 1};
     BOOST_CHECK(FnAuthorizeIssuance(model));
-    BOOST_CHECK_EQUAL(model.issued_total, 1000U);
-    BOOST_CHECK_EQUAL(model.live_supply, 1000U);
+    BOOST_CHECK_EQUAL(model.issued_total, MAX_FN_EVER_ISSUED);
+    BOOST_CHECK_EQUAL(model.live_supply, MAX_FN_EVER_ISSUED);
     BOOST_CHECK(!FnAuthorizeIssuance(model));
     // Extinguishment reduces live supply, never issued_total, and never
     // reopens capacity.
     BOOST_CHECK(FnExtinguish(model, 50));
-    BOOST_CHECK_EQUAL(model.issued_total, 1000U);
-    BOOST_CHECK_EQUAL(model.live_supply, 950U);
+    BOOST_CHECK_EQUAL(model.issued_total, MAX_FN_EVER_ISSUED);
+    BOOST_CHECK_EQUAL(model.live_supply, MAX_FN_EVER_ISSUED - 50);
     BOOST_CHECK(!FnAuthorizeIssuance(model));
-    BOOST_CHECK(!FnExtinguish(model, 951)); // more than live supply
+    BOOST_CHECK(!FnExtinguish(model, MAX_FN_EVER_ISSUED - 49)); // more than live supply
     // MALFORMED model state is rejected outright, never operated on:
     // live_supply above issued_total, or issued_total above the cap.
     {

@@ -274,7 +274,7 @@ Measurement first; no guessed constant.
    semantics; relay policy for proof-carrying transactions.
 5. **The canonical FN story (owner wording correction 2026-08-18):**
    FN Coin is one global chain-scoped colored asset with decimals = 0
-   and a lifetime issuance cap of 1,000 units. **HISTORICAL FN:** a
+   and a lifetime issuance cap of 5,000 units (ratified 2026-08-22; R = 3,500 historical PoDs). **HISTORICAL FN:** a
    legacy PoD permanently destroyed native B3 historically; a later
    modern historical issuance verifies that sealed event and authorizes
    exactly one FN Coin for the historical beneficiary. **MODERN FN
@@ -296,7 +296,7 @@ Measurement first; no guessed constant.
 6. **FN identity — LOCKED and IMPLEMENTED (owner's corrected
    specification, 2026-08-18):** FN Coin is ONE global, chain-scoped,
    fungible-but-indivisible modern colored asset: `decimals = 0`,
-   `MAX_FN_EVER_ISSUED = 1000`, every unit under the same
+   `MAX_FN_EVER_ISSUED = 5000` (ratified 2026-08-22), every unit under the same
    `FN_ASSET_ID = TaggedHash("B3/FN/ASSET/V1") << ModernChainDomain`
    (derivation pinned on synthetic vectors; the MAINNET id is pinned
    only after mainnet H/X freezes the domain). PoDId is ONLY the

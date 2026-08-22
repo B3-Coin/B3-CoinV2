@@ -173,7 +173,7 @@ reduced; FN Coin supply independently accounted.
 > `UNSUPPORTED_FUNDING_SCRIPT`) no longer gates issuance, because no
 > fresh signature is ever checked; and **FN Coin is ONE global
 > fungible-but-indivisible asset** (`FN_ASSET_ID`, decimals 0, cap
-> `MAX_FN_EVER_ISSUED = 1000`) — no per-PoD FN objects, no PoDId in
+> `MAX_FN_EVER_ISSUED = 5000`, ratified 2026-08-22) — no per-PoD FN objects, no PoDId in
 > ordinary FN outputs, and the §10.2 "same-PoDId successor" transfer
 > lifecycle is superseded with it (transfers move whole units of the
 > one asset; extinguishment reduces live supply, never issuance
@@ -647,7 +647,7 @@ starting modern creation cost, tranche size, cost increase per tranche,
 reward amount and schedule, reward ownership cutoff on
 transfer/extinguishment, legacy claim expiry policy (none by default) —
 `MAX_FN_EVER_CREATED` is no longer open: its current owner-selected
-value is 1,000 (D-1), revisable before activation through the reviewed
+value is 5,000 (D-1, ratified 2026-08-22 after the real-history report found R = 3,500; supersedes the 1,000 selection), revisable before activation through the reviewed
 process, gated on the real-chain reservation count;
 final FN ownership serialization beyond the MVP claim form; the modern
 FN-creation transaction form's exact detection/serialization (§10.1); FN
@@ -750,7 +750,7 @@ An FN Coin is a colored, normally spendable B3 output, and it must remain
 ## 11. FN scarcity and market economics — LOCKED direction (owner ruling, 2026-08-17)
 
 **Status: LOCKED direction; numerical parameters OPEN (§11.5) except
-D-1, whose current owner-selected value is `MAX_FN_EVER_CREATED = 1,000`
+D-1, whose current owner-selected value is `MAX_FN_EVER_CREATED = 5,000` (2026-08-22; the 2026-08-17 value of 1,000 was superseded when the real-history -podreport found R = 3,500 qualifying PoDs)
 (2026-08-17, revisable before activation through the reviewed process).**
 FN has **both a limited total supply and a deterministically increasing
 creation cost**. The combination is intentional: FN is to become a
@@ -763,10 +763,10 @@ economic structure above them. No consensus code accompanies it.
 
 A consensus constant **`MAX_FN_EVER_CREATED`** caps FN creation.
 
-**Owner parameter decision (2026-08-17): `MAX_FN_EVER_CREATED = 1,000`.**
+**Owner parameter decision (2026-08-17): `MAX_FN_EVER_CREATED = 1,000`; SUPERSEDED 2026-08-22: `MAX_FN_EVER_CREATED = 5,000`** — the equivalence-verified real-history -podreport found R = 3,500 qualifying historical PoDs (all claimable), and per the never-truncate-rights rule the cap was raised to honor every historical right with headroom for modern issuance.
 The cap includes every qualifying historical FN right, claimed or
 unclaimed, and every modern FN ever created; therefore
-`remaining modern capacity = 1,000 − historical_reserved − modern_created`
+`remaining modern capacity = 5,000 − historical_reserved − modern_created`
 (the `C − R − M` invariant below with `C = 1,000`). Revision rules:
 
 - **Until activation**, the owner may revise the numerical value through
@@ -933,11 +933,11 @@ Every value below awaits explicit owner selection. Implementation must
 not proceed on any of them; the locked structure (§11.1–11.4) is
 independent of the values chosen.
 
-**D-1: `MAX_FN_EVER_CREATED` — SELECTED: 1,000 (owner, 2026-08-17)**
+**D-1: `MAX_FN_EVER_CREATED` — SELECTED: 5,000 (owner, 2026-08-22; supersedes 1,000 of 2026-08-17)**
 
 | Item | Status |
 |---|---|
-| Current owner-selected value | **1,000** — includes every qualifying historical right (claimed or unclaimed) and every modern FN ever created |
+| Current owner-selected value | **5,000** (2026-08-22) — includes every qualifying historical right (real-history R = 3,500, claimed or unclaimed) and every modern FN ever created; headroom 1,500 |
 | Activation gate | pre-activation RELEASE gate (§11.1): the real-chain `-podreport` count `R` is mandatory before H/X are pinned and before an activation-ready release; `R > 1,000` → do not pin H/X, do not enable FN activation, return the decision to the owner — historical rights are never discarded to fit the cap; not a block-validation halt |
 | Revision before activation | permitted, through the reviewed protocol process only |
 | Revision after activation | only by an explicit versioned consensus upgrade at a defined activation height; never node-local or independently configurable |

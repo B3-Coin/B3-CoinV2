@@ -80,7 +80,13 @@ inline constexpr uint16_t FN_POLICY_VERSION_V1{POLICY_VERSION_V1};
 //! doc/design/b3-fn-pod.md §11.1 alias MAX_FN_EVER_CREATED, owner
 //! selection D-1). `issued_total` is monotonic: extinguishment reduces
 //! live supply but NEVER reopens issuance capacity.
-inline constexpr uint32_t MAX_FN_EVER_ISSUED{1000};
+//!
+//! RATIFIED 5,000 (owner ruling 2026-08-22): the real-history -podreport
+//! over the equivalence-verified chain found R = 3,500 qualifying
+//! historical PoDs (all claimable) against the earlier 1,000 selection;
+//! per the never-truncate-rights rule the cap was raised to honor every
+//! historical FN with headroom for modern issuance.
+inline constexpr uint32_t MAX_FN_EVER_ISSUED{5000};
 
 /**
  * The ONE global FN Coin asset identity (owner ruling 2026-08-18):
