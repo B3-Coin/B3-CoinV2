@@ -69,10 +69,11 @@ capture height via -exportstopatheight. All exports and comparisons offline.
 | 110,000 | 2f5eece12025b19f2229b11d8dc06a017264bb7560af9073b5d19c0ff9e3f9c7 | 115,835 | **EQUAL**, commitment 9cf042db50ddcf369dfc1980f0f911e7bc952400bf63bb9fb923ae049c3a11eb |
 | 797,000 | 05a34afe1651642a893dc581b7957564e5d7e9a8856aee6dc7de71dbbc28c741 | 1,235,918 | **EQUAL**, commitment 7402ee2abb7071da75ba574678d2565972a7eebca19e558c4376d85683de62ee |
 
-Mutation-negative (per runbook, once per campaign, on the real T1 rows):
-a single value edit (+1 base unit) was detected and NAMED
-(COutPoint(cf21b7b640, 1)), verdict NOT EQUAL. The comparator provably
-distinguishes.
+Mutation-negative (per runbook, once per campaign, on the real T1 rows),
+exit codes captured UNPIPED: a single value edit (+1 base unit) → NOT
+EQUAL naming COutPoint(cf21b7b640, 1), **exit 1**; a naively dropped row →
+"count line says 86374 rows but 86373 were read", **exit 2**. The
+comparator provably distinguishes and its exit contract holds.
 
 Artifacts preserved (owner directive: never delete): full port datadir at
 807,709 (~/development/ON/b3-mainnet-sync-v2), frozen old-client datadirs at

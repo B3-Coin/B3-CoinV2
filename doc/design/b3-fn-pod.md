@@ -146,7 +146,7 @@ insufficient PoD → reject; same PoD reused → reject; FN ownership transfer
 deterministic; restart/reindex → identical FN state; B3 supply permanently
 reduced; FN Coin supply independently accounted.
 
-## 8. Legacy FN claims — NORMATIVE MVP (integrated scan-and-claim)
+## 8. Legacy FN claims — SUPERSEDED scan-and-claim MVP (kept for the surviving definitions; see banner)
 
 > **SUPERSEDED (owner ruling 2026-08-17/18; conflict register C-R4).**
 > The scan-and-claim mechanism of this section — funding-key claim
@@ -621,7 +621,7 @@ freely transferable market asset; all historical rights reserved before
 modern issuance and never crowded out; scarcity counted on
 total-ever-created; extinguishment never reopens a creation slot.
 
-**LOCKED for the legacy-claim MVP (2026-08-16, integrated scan-and-claim):**
+**LOCKED for the legacy-claim MVP (2026-08-16, integrated scan-and-claim) — MECHANISM SUPERSEDED 2026-08-17 (archival-builder issuance); the qualifying-PoD DEFINITION below survives verbatim:**
 every qualifying historical PoD (gap ≥ tier, through H) → exactly one FN
 eligibility event and at most one indivisible FN Coin; eligibility derived
 during normal sync/reindex/replay from the attested prefix only — no
@@ -663,9 +663,11 @@ structure (capped total, tranche curve — values OPEN, §11.5).
 
 **Status: LOCKED.** This section records the owner's hypothetical-output
 ruling in its intended scope: **modern FN-creation accounting only**. It
-does not touch the legacy claim mechanism — §8 remains the governing
-historical funding-key scan-and-claim design, and its claim carrier and
-`claimed[pod_id]` registry are unchanged pending their own later review.
+does not touch the legacy issuance mechanism — which, since the same-day
+ruling recorded in §8's banner, is the **archival-builder / stateless-proof
+model** of b3-legacy-fn-issuance-proposal.md (no funding-key claims, no
+production PodDB, issuance deduplicated per PoDId); §8's scan-and-claim
+carrier and per-node `claimed[pod_id]` flow are superseded, not pending.
 (A same-day proposal that misapplied the hypothetical-output idea to the
 legacy claim anchor — virtual claim outpoints materialized into the UTXO
 set at M — was **rejected in full by the owner and must not be revived**.)
