@@ -52,13 +52,34 @@ the recommended rule (minimum corridor spacing plus a tight future bound).
   override flags + first functional tests of the transition;
   `getblocktemplate` corridor support; STAKE-output standardness carve-in
   (relay) (done with the validator UX).
-- Day 2: validator UX — wallet validator key, `createstake`, staking loop,
-  `getstakinginfo` / `startstaking` / `stopstaking` (in progress
-  2026-08-23); disk-format detection and reindex message; version strings
-  ("B3 Hive"); operator runbook for H → corridor → M.
+- Day 2: validator UX — DONE 2026-08-23 as ruled: wallet-held validator
+  key (a non-active single-key `pk()` descriptor; public key recorded as
+  `b3validatorpubkey`), `createstake <amount>` (STAKE carrier with a P2PKH
+  owner of this wallet), `getstakinginfo` (validator key, node loop state,
+  every owned STAKE output as UNCONFIRMED / PENDING / ACTIVE with
+  `active_at_height`, active/total weight), `startstaking` / `stopstaking`
+  (the node's automatic loop behind `interfaces::Chain`; fees to a fresh
+  wallet address), STAKE outputs recognized as their bare owner script for
+  standardness/ownership/signing (the relay carve-in) and never auto-selected
+  for ordinary spends (unstake = explicit spend via `inputs`). Still owed:
+  disk-format detection and reindex message; version strings ("B3 Hive");
+  operator runbook for H → corridor → M; regtest override flags so the
+  staking RPCs get functional tests (today they are unit-tested in-process:
+  `modern_pos_tests/staking_loop_produces_blocks`,
+  `wallet_tests/b3_validator_key_and_stake_outputs`).
 - Day 3: full gate, packaging, release notes, tag. The mainnet pin of
   H/X/corridor bits happens ONLY after the pin gates above; the X-pin
   follow-up release when block H is buried (pause).
+
+## Release-binary note (gate 4)
+
+- FIXED 2026-08-23: `b3coin-tx`, `b3coin-util` and `b3coin-wallet` did not
+  link because `chainparams.cpp` (`bitcoin_common`) referenced
+  `legacy::MainnetCheckpoints()` compiled into `bitcoin_node`; the
+  checkpoint table now lives in `legacy/checkpoints.cpp` inside
+  `bitcoin_common`. All of `b3coind`, `b3coin-cli`, `b3coin-wallet`,
+  `b3coin-tx`, `b3coin-util` and `test_bitcoin` build. Reproducibility and
+  audit of the binaries remain the gate.
 
 ## Already true (no action)
 

@@ -43,6 +43,22 @@ Baseline: commit `a8ad010` (the tip of the completed experimental stack, from wh
 > verifiable by scrypt and could re-enable it). Post-corridor header rules
 > are now the frozen Modern PoS V1 set when configured (see §5).
 
+> **Release-v1 rulings implemented (2026-08-23).** X-distribution PAUSE
+> fails closed: with `hard_fork_height` set and `legacy_final_hash` unset the
+> node accepts through H and refuses every header above H
+> (`legacy-boundary-unpinned`, no-penalty, nothing marked invalid), block
+> production refuses post-H blocks, and startup raises a
+> `LEGACY_BOUNDARY_UNPINNED` warning (`Consensus::LegacyBoundaryHeightOnly`).
+> Corridor bits must be the CANONICAL compact encoding (`IsCanonicalCompactBits`;
+> the ruled mainnet value `0x1f008000` is pinned by test, NOT in chainparams —
+> pin gates in [b3-release-v1.md](b3-release-v1.md)). Corridor pacing VERIFIED
+> compressible (test `corridor_pacing_is_unbounded`; mitigation is an owner
+> decision, corridor doc §6.1). Validator UX v1: wallet validator key,
+> `createstake`, `getstakinginfo`, `startstaking`/`stopstaking`,
+> `node::StakingLoop`, STAKE-carrier standardness/ownership/signing
+> (`modern::StakeOwnerScript`), STAKE outputs excluded from auto coin
+> selection. Seed `176.31.13.198` added. Mainnet H/X/bits remain unset.
+
 **Legend**
 
 | Mark | Meaning |
