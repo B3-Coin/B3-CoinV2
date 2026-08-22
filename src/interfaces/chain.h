@@ -7,11 +7,15 @@
 
 #include <blockfilter.h>
 #include <common/settings.h>
+#include <uint256.h>
+#include <script/script.h>
+#include <key.h>
 #include <kernel/chain.h> // IWYU pragma: export
 #include <node/types.h>
 #include <primitives/transaction.h>
 #include <util/result.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -89,6 +93,33 @@ enum class SettingsAction {
 };
 
 using SettingsUpdate = std::function<std::optional<interfaces::SettingsAction>(common::SettingsValue&)>;
+
+//! B3 Modern PoS staking status (see Chain::stakingStatus).
+struct StakingStatus {
+    //! A staking loop exists in this node.
+    bool available{false};
+    bool running{false};
+    //! Human-readable loop state ("producing", "waiting: ...", "stopped").
+    std::string state;
+    std::string last_error;
+    //! The loop's validator key (x-only), when running.
+    std::optional<std::array<unsigned char, 32>> validator_key;
+    int64_t blocks_produced{0};
+    uint256 last_block_hash;
+    //! The forced timestamp of the next block this validator may produce (0 if unknown).
+    int64_t next_block_time{0};
+    //! Chain facts at the time of the call.
+    int tip_height{-1};
+    //! "legacy" | "corridor" | "modern_pos" for the NEXT block (B3 chains); "modern" otherwise.
+    std::string next_block_phase;
+    //! Modern PoS is configured and the next block is a modern-PoS block.
+    bool modern_pos_active{false};
+    //! Aggregated ACTIVE weight of the selected validator key and the total ACTIVE weight, at the next height.
+    CAmount active_weight{0};
+    CAmount total_active_weight{0};
+    std::optional<CAmount> min_stake_amount;
+    int stake_activation_depth{0};
+};
 
 //! Interface giving clients (wallet processes, maybe other analysis tools in
 //! the future) ability to access to the chain state, receive notifications,
@@ -386,6 +417,16 @@ public:
     //! returns true even after the snapshot is validated, until the next node
     //! restart.
     virtual bool hasAssumedValidChain() = 0;
+
+    //! B3 Modern PoS staking (release-v1 validator UX, owner ruling
+    //! 2026-08-23): start the node's automatic staking loop with the wallet's
+    //! validator secret key and the script that receives block fees.
+    virtual bool startStaking(const CKey& validator_key, const CScript& coinbase_script, std::string& error) = 0;
+    //! Stop the staking loop (no-op if not running).
+    virtual void stopStaking() = 0;
+    //! Staking status; `validator_key` (x-only) selects whose stake weight to
+    //! report when the loop is not running (the loop's own key otherwise).
+    virtual StakingStatus stakingStatus(const std::optional<std::array<unsigned char, 32>>& validator_key) = 0;
 
     //! Get internal node context. Useful for testing, but not
     //! accessible across processes.

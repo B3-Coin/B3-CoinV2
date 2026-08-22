@@ -35,6 +35,7 @@
 #include <node/interface_ui.h>
 #include <node/mini_miner.h>
 #include <node/miner.h>
+#include <node/staking.h>
 #include <node/kernel_notifications.h>
 #include <node/transaction.h>
 #include <node/types.h>
@@ -853,6 +854,27 @@ public:
     {
         LOCK(::cs_main);
         return bool{chainman().CurrentChainstate().m_from_snapshot_blockhash};
+    }
+    bool startStaking(const CKey& validator_key, const CScript& coinbase_script, std::string& error) override
+    {
+        if (!m_node.staking) {
+            error = "staking is not available in this node";
+            return false;
+        }
+        return m_node.staking->Start(validator_key, coinbase_script, error);
+    }
+    void stopStaking() override
+    {
+        if (m_node.staking) m_node.staking->Stop();
+    }
+    interfaces::StakingStatus stakingStatus(const std::optional<std::array<unsigned char, 32>>& validator_key) override
+    {
+        if (!m_node.staking) {
+            interfaces::StakingStatus status;
+            status.state = "unavailable";
+            return status;
+        }
+        return m_node.staking->Status(validator_key);
     }
 
     NodeContext* context() override { return &m_node; }

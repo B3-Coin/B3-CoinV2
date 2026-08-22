@@ -17,6 +17,7 @@
 #include <modern/stake.h>
 #include <node/miner.h>
 #include <node/stake_registry.h>
+#include <node/staking.h>
 #include <pow.h>
 #include <primitives/block.h>
 #include <script/script.h>
@@ -362,6 +363,14 @@ struct ModernPosSetup : public ChainTestingSetup {
     }
 };
 
+//! Variant for the staking-loop scenario: the fixture's mock clock sits
+//! ~27 h past the synthetic chain's block times, which the node would read
+//! as initial block download (and the loop correctly idles during IBD), so
+//! the tip-age bound is widened. Production nodes keep the default.
+struct ModernPosStakingSetup : public ModernPosSetup {
+    ModernPosStakingSetup() : ModernPosSetup{{.extra_args = {"-maxtipage=1000000000"}}} {}
+};
+
 //! Disk-backed variant for the restart/reindex scenario.
 struct ModernPosDiskSetup : public ModernPosSetup {
     ModernPosDiskSetup()
@@ -542,6 +551,66 @@ BOOST_FIXTURE_TEST_CASE(corridor_pacing_is_unbounded, ModernPosSetup)
     // BURST blocks advanced chain time by exactly BURST seconds: no minimum
     // spacing exists. (Mitigation is an owner decision; see corridor doc §6.1.)
     BOOST_CHECK_EQUAL(Tip()->GetBlockTime() - start_time, BURST);
+}
+
+//! The automatic staking loop (release-v1 validator UX): started with
+//! validator A's key it produces signed modern-PoS blocks on its own -- the
+//! fixture's mock clock is far past every forced round time, so the pacing
+//! wait is satisfied at once -- reports its status and the validator's
+//! weights, and stops cleanly.
+BOOST_FIXTURE_TEST_CASE(staking_loop_produces_blocks, ModernPosStakingSetup)
+{
+    AdvanceToModernPos();
+    const int start_height{Tip()->nHeight};
+
+    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr);
+    {
+        const auto idle{loop.Status(m_val_a)};
+        BOOST_CHECK(idle.available);
+        BOOST_CHECK(!idle.running);
+        BOOST_CHECK(idle.modern_pos_active);
+        BOOST_CHECK_EQUAL(idle.next_block_phase, "modern_pos");
+        BOOST_CHECK_EQUAL(idle.active_weight, STAKE_A);
+        BOOST_CHECK_EQUAL(idle.total_active_weight, STAKE_A + STAKE_B);
+        BOOST_CHECK_EQUAL(idle.stake_activation_depth, modern::STAKE_ACTIVATION_DEPTH);
+    }
+    // A node judges "initial block download" by tip age against the clock
+    // and the loop idles during IBD, so bring the mock clock to the tip and
+    // advance it a round per poll: each produced block's forced timestamp is
+    // one interval past its parent, and the loop waits for the clock to
+    // reach it.
+    SetMockTime(Tip()->GetBlockTime() + 1);
+    // The IBD flag is latched only at tip updates; every fixture block was
+    // connected while the clock sat far ahead, so re-evaluate it now that
+    // the tip is "recent" (a real node does this on its next tip update).
+    WITH_LOCK(cs_main, m_node.chainman->UpdateIBDStatus());
+    BOOST_REQUIRE(!m_node.chainman->IsInitialBlockDownload());
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(loop.Start(m_key_a, CScript() << OP_TRUE, error), error);
+    BOOST_CHECK(!loop.Start(m_key_a, CScript() << OP_TRUE, error)); // already running
+
+    for (int i{0}; i < 600 && Tip()->nHeight < start_height + 3; ++i) {
+        UninterruptibleSleep(std::chrono::milliseconds{50});
+        SetMockTime(GetTime() + 60);
+    }
+    const auto running{loop.Status(std::nullopt)};
+    loop.Stop();
+    BOOST_CHECK_MESSAGE(Tip()->nHeight >= start_height + 3,
+                        "loop state: " << running.state << " / last error: " << running.last_error);
+    BOOST_CHECK(running.running);
+    BOOST_CHECK(running.validator_key.has_value());
+    BOOST_CHECK(running.validator_key && *running.validator_key == m_val_a);
+    BOOST_CHECK_GE(running.blocks_produced, 3);
+    BOOST_CHECK(!running.last_block_hash.IsNull());
+    const auto stopped{loop.Status(std::nullopt)};
+    BOOST_CHECK(!stopped.running);
+    BOOST_CHECK_EQUAL(stopped.state, "stopped");
+    // Every produced block is a signed modern-PoS block by validator A.
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip{m_node.chainman->ActiveChain().Tip()};
+        BOOST_CHECK(!tip->m_modern_pos_digest.IsNull());
+    }
 }
 
 //! Scenario 1 — normal operation: deterministic production through the

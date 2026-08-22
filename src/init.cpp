@@ -46,6 +46,7 @@
 #include <net_processing.h>
 #include <netbase.h>
 #include <netgroup.h>
+#include <node/staking.h>
 #include <node/warnings.h>
 #include <node/blockmanager_args.h>
 #include <node/blockstorage.h>
@@ -285,6 +286,7 @@ void Interrupt(NodeContext& node)
     for (auto* index : node.indexes) {
         index->Interrupt();
     }
+    if (node.staking) node.staking->Stop();
 }
 
 void Shutdown(NodeContext& node)
@@ -405,6 +407,7 @@ void Shutdown(NodeContext& node)
     if (node.validation_signals) {
         node.validation_signals->UnregisterAllValidationInterfaces();
     }
+    node.staking.reset();
     node.mempool.reset();
     node.fee_estimator.reset();
     node.chainman.reset();
@@ -1914,6 +1917,10 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     auto& kernel_notifications{*Assert(node.notifications)};
 
     assert(!node.peerman);
+    // B3: the automatic staking loop. Idle until a wallet starts it
+    // (startstaking) and until the next block is a modern-PoS block.
+    node.staking = std::make_unique<node::StakingLoop>(*node.chainman, node.mempool.get());
+
     node.peerman = PeerManager::make(*node.connman, *node.addrman,
                                      node.banman.get(), chainman,
                                      *node.mempool, *node.warnings,
