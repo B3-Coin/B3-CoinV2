@@ -267,6 +267,11 @@ whose `withdrawal_root` includes the burn (§6).
 
 ## 7. ZK seam (structures frozen; only the prover changes)
 
+**Owner ruling 2026-08-23: ZK is deferred ("we will do it later").** v1 ships only
+`BlsCertificateProver`; no circuit, prover infrastructure, or ZK-specific testing is in
+scope. The interface below is kept exactly so the later swap changes only the `prover`
+slot — no B3 rule, layout, or verifier state-machine change.
+
 ```solidity
 interface IB3FinalityProver {
   function verify(bytes32 chainDomain, FinalizedBlock calldata fb,
