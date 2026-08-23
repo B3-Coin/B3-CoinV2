@@ -92,6 +92,7 @@ add_executable(test_bitcoin
   payload_cost_tests.cpp
   validator_set_tests.cpp
   finality_certificate_tests.cpp
+  finality_schedule_tests.cpp
   modern_pos_tests.cpp
   miniminer_tests.cpp
   miniscript_tests.cpp
