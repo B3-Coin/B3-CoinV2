@@ -41,6 +41,7 @@ class SignalInterrupt;
 
 namespace node {
 class KernelNotifications;
+class StakingLoop;
 class Warnings;
 
 //! NodeContext struct containing references to chain state and connection
@@ -79,6 +80,8 @@ struct NodeContext {
     //! Reference to chain client that should used to load or create wallets
     //! opened by the gui.
     std::unique_ptr<interfaces::Mining> mining;
+    //! B3 Modern PoS automatic staking loop (created once the chainstate is loaded).
+    std::unique_ptr<node::StakingLoop> staking;
     interfaces::WalletLoader* wallet_loader{nullptr};
     std::unique_ptr<CScheduler> scheduler;
     std::function<void()> rpc_interruption_point = [] {};

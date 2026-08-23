@@ -3,6 +3,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <modern/stake.h>
 #include <pubkey.h>
 #include <script/interpreter.h>
 #include <script/script.h>
@@ -141,6 +142,15 @@ std::optional<std::pair<int, std::vector<std::span<const unsigned char>>>> Match
 TxoutType Solver(const CScript& scriptPubKey, std::vector<std::vector<unsigned char>>& vSolutionsRet)
 {
     vSolutionsRet.clear();
+
+    // B3 STAKE carrier (release-v1 standardness carve-in): the output is its
+    // bare owner script for solving, standardness and destination purposes;
+    // a malformed claim or a non-bare owner suffix is unsolvable.
+    if (modern::ClaimsStakeMagic(scriptPubKey)) {
+        const auto owner{modern::StakeOwnerScript(scriptPubKey)};
+        if (!owner) return TxoutType::NONSTANDARD;
+        return Solver(*owner, vSolutionsRet);
+    }
 
     // Shortcut for pay-to-script-hash, which are more constrained than the other types:
     // it is always OP_HASH160 20 [20 byte hash] OP_EQUAL

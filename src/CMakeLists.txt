@@ -114,6 +114,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   external_signer.cpp
   init/common.cpp
   kernel/chainparams.cpp
+  legacy/checkpoints.cpp
   key.cpp
   key_io.cpp
   merkleblock.cpp
@@ -246,6 +247,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/legacy_fn_issuance.cpp
   node/stake_registry.cpp
   node/stake_tracker.cpp
+  node/staking.cpp
   node/utxo_commitment.cpp
   node/utxo_equivalence_check.cpp
   node/utxo_rows.cpp

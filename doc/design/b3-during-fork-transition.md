@@ -178,7 +178,7 @@ no administrator list, no operator committee, no self-authorizing first PoS
 block. Then M: registry → modern VRF/eligibility → eligible proposer(s) →
 first modern-PoS block.
 
-## 6. Corridor difficulty (MECHANISM RULED 2026-08-21; value OPEN)
+## 6. Corridor difficulty (MECHANISM RULED 2026-08-21; value RULED 2026-08-23, pin gated)
 
 **Owner ruling (2026-08-21): NO retarget — one fixed constant difficulty
 for the whole corridor.** The corridor is a transition, not a mining era,
@@ -206,6 +206,49 @@ by construction; every calibration uncertainty resolves toward EASIER.
 The exact compact-bits number is measured against a reference CPU's real
 scrypt rate at mainnet H/X pinning time (inert before then) and recorded
 with the pin.
+
+**Value RULED 2026-08-23: canonical compact bits `0x1f008000`** — target
+2^239, i.e. 2^17 expected scrypt hashes per block (the measured single
+core does ~7,466 H/s, so ~18 s per block alone). `0x20000080` encodes the
+SAME target non-canonically (mantissa 0x000080, exponent 0x20); the
+consensus constant is the canonical form that `arith_uint256::GetCompact`
+produces, a canonical round-trip test pins it, and a configured
+non-canonical value fails closed like an unset one. NOT PINNED in mainnet
+chainparams until the release pin gates pass.
+
+### 6.1 Pacing — VERIFIED COMPRESSIBLE by hashpower; RULED 2026-08-23: min spacing 60 s, future bound 120 s
+
+Owner instruction (2026-08-23): do not assume fixed difficulty implies
+fixed elapsed time. Verified: a corridor header is checked for the
+constant bits, the scrypt eligibility, `time > MedianTimePast(prev)` and
+`time <= now + 2 h` — nothing else. Consequences:
+
+- Expected corridor duration at honest low hashrate is ~1000 × 18 s ≈ 5 h
+  per CPU core; more cores/machines divide it.
+- A large scrypt miner (Litecoin-class hardware does GH/s; 2^17 hashes is
+  sub-millisecond) can mine all 1,000 blocks in seconds to minutes,
+  advancing timestamps 1 s per block, all inside the 2 h future window.
+  Operators get no wall-clock time to create STAKE outputs; the 20-block
+  maturity is satisfied inside the burst; the initial ACTIVE set at M is
+  whatever that miner chose to include.
+- Nothing in the corridor's stated purpose survives that case. The
+  "zero-stake-at-M prevented operationally" ruling (§9) assumed hours of
+  corridor, not seconds.
+
+**RULED 2026-08-23 (owner): "add 60 s to 120 s for the corridor, since
+someone with a large miner should not compress that window."** Implemented
+as consensus for every corridor: `transition_pow_min_spacing = 60` — a
+corridor block's timestamp must be ≥ parent time + 60 s
+(`time-too-early-corridor`, invalid) — and `transition_pow_max_future = 120`
+— at most 120 s ahead of the validating node's clock (`time-too-new`, held
+like the modern-PoS rule). Consequence: the corridor takes at least
+1000 × 60 s − 120 s ≈ 16.6 h of real time regardless of hashpower; a lone
+CPU (~18 s per block at the ruled target) is slowed to one block per
+minute, never stalled; a large miner is paced, not empowered. Block
+production sets the template time to max(now, parent + 60 s). Test
+`corridor_pacing_enforced` (1 s and 59 s refused, 60 s accepted, a burst
+advances chain time ≥ 60 s per block, +121 s held / +120 s accepted,
+template ≥ parent + 60 s); the corridor fixtures build at 60 s spacing.
 
 ## 7. Corridor security (concrete questions; mitigations OPEN)
 
@@ -334,11 +377,13 @@ numbers (frozen V1 spec: 60 s interval, 30 s rounds, f0 = 1, ×2
 relaxation — the VRF/slots/epochs items are superseded; the seed at M
 derives from the corridor-exit block).
 
-**STILL OPEN:** the corridor difficulty VALUE (policy ruled 2026-08-21 —
-low, stall-safety dominant, single-CPU calibration — measured at H/X
-pinning); the modern-PoS sentinel-bits and future-drift values
+**RULED 2026-08-23 in addition:** corridor difficulty VALUE = canonical `0x1f008000` (§6, pin gated); H = 820,000 / M = 821,001 and X-distribution = pause-fail-closed (open-decisions OD-10).
+
+**RULED 2026-08-23 in addition:** corridor PACING — minimum spacing 60 s and future bound 120 s (§6.1).
+
+**STILL OPEN:** the modern-PoS sentinel-bits and future-drift values
 (provisional); corridor reorg-depth bounds and other §7 mitigations;
-X-distribution operations (pause vs. precommit); modern reward schedule
+modern reward schedule
 (OD-2). Ratified 2026-08-21 in addition: minimum stake 333 modern B3
 (kB3) and the modern horizon D = 1440.
 

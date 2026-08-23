@@ -9,6 +9,7 @@
 #include <consensus/amount.h>
 #include <consensus/validation.h>
 #include <interfaces/chain.h>
+#include <modern/stake.h>
 #include <node/types.h>
 #include <numeric>
 #include <policy/policy.h>
@@ -440,6 +441,11 @@ CoinsResult AvailableCoins(const CWallet& wallet,
 
         if (wallet.IsSpent(outpoint))
             continue;
+
+        // B3 STAKE outputs are never auto-selected: spending one is an
+        // UNSTAKE and must be an explicit act (select the outpoint through
+        // coin control / `inputs`). getstakinginfo lists them.
+        if (modern::ClaimsStakeMagic(output.scriptPubKey)) continue;
 
         if (!allow_used_addresses && wallet.IsSpentKey(output.scriptPubKey)) {
             continue;

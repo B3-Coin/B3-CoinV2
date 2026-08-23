@@ -2,8 +2,10 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
+#include <arith_uint256.h>
 #include <chain.h>
 #include <chainparams.h>
+#include <consensus/era.h>
 #include <consensus/merkle.h>
 #include <consensus/modern_pos_params.h>
 #include <consensus/params.h>
@@ -15,6 +17,7 @@
 #include <modern/stake.h>
 #include <node/miner.h>
 #include <node/stake_registry.h>
+#include <node/staking.h>
 #include <pow.h>
 #include <primitives/block.h>
 #include <script/script.h>
@@ -152,7 +155,8 @@ struct ModernPosSetup : public ChainTestingSetup {
         return block;
     }
 
-    CBlock BuildCorridor(const CBlockIndex* prev, std::vector<CMutableTransaction> txs)
+    CBlock BuildCorridor(const CBlockIndex* prev, std::vector<CMutableTransaction> txs,
+                         const int64_t time_delta = 60, const uint32_t bits = EASY_BITS)
     {
         CMutableTransaction coinbase;
         coinbase.version = 2;
@@ -163,14 +167,40 @@ struct ModernPosSetup : public ChainTestingSetup {
         CBlock block;
         block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
         block.hashPrevBlock = prev->GetBlockHash();
-        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
-        block.nBits = EASY_BITS;
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + time_delta);
+        block.nBits = bits;
         block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
         for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
         block.hashMerkleRoot = BlockMerkleRoot(block);
         block.nNonce = 0;
         while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
         return block;
+    }
+
+    //! Legacy history to SYN_H only (no boundary configured yet).
+    void AdvanceLegacyToH()
+    {
+        for (int height{1}; height <= SYN_H; ++height) {
+            BOOST_REQUIRE(Submit(BuildLegacy(Tip(), {})));
+        }
+        BOOST_REQUIRE_EQUAL(Tip()->nHeight, SYN_H);
+    }
+    //! Configure the corridor with H = SYN_H and the given X (unset = the
+    //! X-distribution pause), then rebuild the candidate set as the fixture
+    //! pattern requires after mutating params mid-run.
+    void ConfigureCorridor(const std::optional<uint256>& x, const uint32_t bits = EASY_BITS)
+    {
+        Consensus::Params& mutable_consensus{MutableConsensus()};
+        mutable_consensus.hard_fork_height = SYN_H + 1;
+        mutable_consensus.legacy_final_hash = x;
+        mutable_consensus.transition_pow_length = SYN_CORRIDOR;
+        mutable_consensus.transition_pow_bits = bits;
+        mutable_consensus.transition_pow_reward = 0;
+        mutable_consensus.min_stake_amount = 1000;
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        chainstate.setBlockIndexCandidates.clear();
+        chainstate.PopulateBlockIndexCandidates();
     }
 
     // ---- Modern-PoS helpers (mirror the frozen V1 rules exactly) ----
@@ -333,6 +363,14 @@ struct ModernPosSetup : public ChainTestingSetup {
     }
 };
 
+//! Variant for the staking-loop scenario: the fixture's mock clock sits
+//! ~27 h past the synthetic chain's block times, which the node would read
+//! as initial block download (and the loop correctly idles during IBD), so
+//! the tip-age bound is widened. Production nodes keep the default.
+struct ModernPosStakingSetup : public ModernPosSetup {
+    ModernPosStakingSetup() : ModernPosSetup{{.extra_args = {"-maxtipage=1000000000"}}} {}
+};
+
 //! Disk-backed variant for the restart/reindex scenario.
 struct ModernPosDiskSetup : public ModernPosSetup {
     ModernPosDiskSetup()
@@ -371,6 +409,14 @@ BOOST_AUTO_TEST_CASE(no_provisional_parameters_on_shipped_networks)
         }
         BOOST_CHECK_MESSAGE(!consensus.transition_pow_bits.has_value(),
                             "provisional corridor difficulty set on a shipped network");
+        // Pin gates (owner, 2026-08-23): the RULED activation parameters
+        // (H = 820,000, canonical corridor bits 0x1f008000) are NOT pinned
+        // on any shipped network until the live-sync fix, the T3/final-H
+        // captures, operational seeds and audited reproducible binaries.
+        BOOST_CHECK_MESSAGE(!consensus.hard_fork_height.has_value(),
+                            "hard_fork_height pinned on a shipped network before the pin gates");
+        BOOST_CHECK_MESSAGE(!consensus.legacy_final_hash.has_value(),
+                            "legacy_final_hash pinned on a shipped network before the pin gates");
         if (chain == ChainType::MAIN) {
             // RATIFIED 2026-08-21: mainnet corridor reward is exactly 0
             // (fees only), stated explicitly rather than defaulted.
@@ -398,6 +444,200 @@ BOOST_AUTO_TEST_CASE(provisional_parameter_block_is_structurally_valid)
     pos = Consensus::ModernPosParams{};
     pos.reorg_horizon = 0;
     BOOST_CHECK(!pos.Valid());
+}
+
+//! The RULED mainnet corridor constant (owner, 2026-08-23) is the canonical
+//! compact spelling of the 2^239 target. 0x20000080 encodes the SAME target
+//! non-canonically; the consensus constant compared byte-for-byte on every
+//! corridor header must be the canonical one, and a non-canonical configured
+//! value fails closed like an unset one (the round-trip test the ruling asked
+//! for).
+BOOST_AUTO_TEST_CASE(corridor_bits_ruled_value_is_canonical_compact)
+{
+    constexpr uint32_t RULED_CORRIDOR_BITS{0x1f008000};
+    constexpr uint32_t NONCANONICAL_SAME_TARGET{0x20000080};
+    BOOST_CHECK(IsCanonicalCompactBits(RULED_CORRIDOR_BITS));
+    BOOST_CHECK(!IsCanonicalCompactBits(NONCANONICAL_SAME_TARGET));
+    const arith_uint256 ruled{arith_uint256().SetCompact(RULED_CORRIDOR_BITS)};
+    const arith_uint256 noncanonical{arith_uint256().SetCompact(NONCANONICAL_SAME_TARGET)};
+    BOOST_CHECK(ruled == noncanonical);
+    BOOST_CHECK(ruled == (arith_uint256{1} << 239)); // 2^17 expected hashes per block
+    BOOST_CHECK_EQUAL(ruled.GetCompact(), RULED_CORRIDOR_BITS);
+    BOOST_CHECK_EQUAL(noncanonical.GetCompact(), RULED_CORRIDOR_BITS); // round-trips to the canonical form
+    // The scaffolding constants used by the fixtures are canonical too.
+    BOOST_CHECK(IsCanonicalCompactBits(EASY_BITS));
+    BOOST_CHECK(!IsCanonicalCompactBits(0)); // zero target is never a difficulty
+}
+
+//! X-distribution PAUSE (owner ruling 2026-08-23): H configured, X unset.
+//! The node accepts the chain through H and refuses EVERY block above H --
+//! corridor blocks and legacy blocks alike -- without penalty and without
+//! marking anything invalid; production refuses too. Pinning X resumes the
+//! corridor from exactly that X.
+BOOST_FIXTURE_TEST_CASE(h_without_x_fails_closed, ModernPosSetup)
+{
+    AdvanceLegacyToH();
+    const uint256 real_x{Tip()->GetBlockHash()};
+    ConfigureCorridor(/*x=*/std::nullopt);
+    BOOST_CHECK(Consensus::LegacyBoundaryHeightOnly(m_node.chainman->GetConsensus()));
+    BOOST_CHECK(!Consensus::LegacyBoundaryPinned(m_node.chainman->GetConsensus()));
+
+    // A corridor block at H+1 is refused.
+    const CBlock corridor{BuildCorridor(Tip(), {})};
+    BOOST_CHECK(!Submit(corridor));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H);
+    {
+        LOCK(cs_main);
+        // Refused without an index entry: nothing was marked invalid, so the
+        // follow-up release that pins X can still accept the real H+1.
+        BOOST_CHECK(m_node.chainman->m_blockman.LookupBlockIndex(corridor.GetHash()) == nullptr);
+    }
+    // A legacy block at H+1 (an old client extending the dead legacy chain)
+    // is refused the same way.
+    BOOST_CHECK(!Submit(BuildLegacy(Tip(), {})));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H);
+    // Production refuses to enter the corridor with a blank X.
+    node::BlockAssembler::Options options;
+    options.coinbase_output_script = CScript() << OP_TRUE;
+    BOOST_CHECK_THROW(node::BlockAssembler(m_node.chainman->ActiveChainstate(), nullptr, options).CreateNewBlock(),
+                      std::runtime_error);
+
+    // The follow-up pins X: the very same corridor block is now accepted.
+    ConfigureCorridor(real_x);
+    BOOST_CHECK(Consensus::LegacyBoundaryPinned(m_node.chainman->GetConsensus()));
+    BOOST_REQUIRE(Submit(corridor));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H + 1);
+}
+
+//! A configured non-canonical corridor constant fails closed (treated as
+//! unconfigured); the canonical spelling of the same target works.
+BOOST_FIXTURE_TEST_CASE(corridor_bits_must_be_canonical, ModernPosSetup)
+{
+    constexpr uint32_t CANONICAL{0x20008000};    // 2^247
+    constexpr uint32_t NONCANONICAL{0x21000080}; // the same 2^247, non-canonical
+    BOOST_REQUIRE(IsCanonicalCompactBits(CANONICAL));
+    BOOST_REQUIRE(!IsCanonicalCompactBits(NONCANONICAL));
+    BOOST_REQUIRE(arith_uint256().SetCompact(CANONICAL) == arith_uint256().SetCompact(NONCANONICAL));
+
+    AdvanceLegacyToH();
+    ConfigureCorridor(Tip()->GetBlockHash(), NONCANONICAL);
+    BOOST_CHECK(!Submit(BuildCorridor(Tip(), {}, 60, NONCANONICAL)));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H);
+    ConfigureCorridor(Tip()->GetBlockHash(), CANONICAL);
+    BOOST_REQUIRE(Submit(BuildCorridor(Tip(), {}, 60, CANONICAL)));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H + 1);
+}
+
+//! Corridor PACING (owner ruling 2026-08-23, after the verification that a
+//! fixed difficulty alone lets hashpower compress the corridor): a corridor
+//! block must be at least `transition_pow_min_spacing` (60 s) after its
+//! parent and at most `transition_pow_max_future` (120 s) ahead of the
+//! node's clock. So the corridor takes at least ~length * 60 s of real time
+//! no matter how much hashpower shows up, while a lone CPU still proceeds at
+//! its natural pace.
+BOOST_FIXTURE_TEST_CASE(corridor_pacing_enforced, ModernPosSetup)
+{
+    AdvanceLegacyToH();
+    ConfigureCorridor(Tip()->GetBlockHash());
+    const Consensus::Params& consensus{m_node.chainman->GetConsensus()};
+    BOOST_CHECK_EQUAL(consensus.transition_pow_min_spacing, 60);
+    BOOST_CHECK_EQUAL(consensus.transition_pow_max_future, 120);
+
+    // One-second and 59-second spacing are refused; exactly 60 s is accepted.
+    BOOST_CHECK(!Submit(BuildCorridor(Tip(), {}, /*time_delta=*/1)));
+    BOOST_CHECK(!Submit(BuildCorridor(Tip(), {}, /*time_delta=*/59)));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H);
+    BOOST_REQUIRE(Submit(BuildCorridor(Tip(), {}, /*time_delta=*/60)));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H + 1);
+
+    // A burst of blocks advances chain time by at least 60 s each: the
+    // corridor cannot be compressed below length * spacing of chain time.
+    const int64_t burst_start{Tip()->GetBlockTime()};
+    constexpr int BURST{10};
+    for (int i{0}; i < BURST; ++i) BOOST_REQUIRE(Submit(BuildCorridor(Tip(), {}, /*time_delta=*/60)));
+    BOOST_CHECK_EQUAL(Tip()->GetBlockTime() - burst_start, BURST * 60);
+
+    // The future bound paces acceptance in real time: a block dated more than
+    // 120 s past the clock is refused (held, not marked invalid); within the
+    // bound it is accepted.
+    SetMockTime(Tip()->GetBlockTime() + 60);
+    BOOST_CHECK(!Submit(BuildCorridor(Tip(), {}, /*time_delta=*/60 + 121)));
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(m_node.chainman->m_blockman.LookupBlockIndex(BuildCorridor(Tip(), {}, 60 + 121).GetHash()) == nullptr);
+    }
+    BOOST_REQUIRE(Submit(BuildCorridor(Tip(), {}, /*time_delta=*/60 + 120)));
+
+    // Production respects the spacing: the template is never earlier than
+    // parent + 60 s.
+    SetMockTime(Tip()->GetBlockTime() + 1);
+    node::BlockAssembler::Options options;
+    options.coinbase_output_script = CScript() << OP_TRUE;
+    options.include_dummy_extranonce = true;
+    const auto tmpl{node::BlockAssembler(m_node.chainman->ActiveChainstate(), nullptr, options).CreateNewBlock()};
+    BOOST_REQUIRE(tmpl);
+    BOOST_CHECK_GE(tmpl->block.GetBlockTime(), Tip()->GetBlockTime() + 60);
+    SetMockTime(MOCK_NOW);
+}
+
+//! The automatic staking loop (release-v1 validator UX): started with
+//! validator A's key it produces signed modern-PoS blocks on its own -- the
+//! fixture's mock clock is far past every forced round time, so the pacing
+//! wait is satisfied at once -- reports its status and the validator's
+//! weights, and stops cleanly.
+BOOST_FIXTURE_TEST_CASE(staking_loop_produces_blocks, ModernPosStakingSetup)
+{
+    AdvanceToModernPos();
+    const int start_height{Tip()->nHeight};
+
+    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr);
+    {
+        const auto idle{loop.Status(m_val_a)};
+        BOOST_CHECK(idle.available);
+        BOOST_CHECK(!idle.running);
+        BOOST_CHECK(idle.modern_pos_active);
+        BOOST_CHECK_EQUAL(idle.next_block_phase, "modern_pos");
+        BOOST_CHECK_EQUAL(idle.active_weight, STAKE_A);
+        BOOST_CHECK_EQUAL(idle.total_active_weight, STAKE_A + STAKE_B);
+        BOOST_CHECK_EQUAL(idle.stake_activation_depth, modern::STAKE_ACTIVATION_DEPTH);
+    }
+    // A node judges "initial block download" by tip age against the clock
+    // and the loop idles during IBD, so bring the mock clock to the tip and
+    // advance it a round per poll: each produced block's forced timestamp is
+    // one interval past its parent, and the loop waits for the clock to
+    // reach it.
+    SetMockTime(Tip()->GetBlockTime() + 1);
+    // The IBD flag is latched only at tip updates; every fixture block was
+    // connected while the clock sat far ahead, so re-evaluate it now that
+    // the tip is "recent" (a real node does this on its next tip update).
+    WITH_LOCK(cs_main, m_node.chainman->UpdateIBDStatus());
+    BOOST_REQUIRE(!m_node.chainman->IsInitialBlockDownload());
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(loop.Start(m_key_a, CScript() << OP_TRUE, error), error);
+    BOOST_CHECK(!loop.Start(m_key_a, CScript() << OP_TRUE, error)); // already running
+
+    for (int i{0}; i < 600 && Tip()->nHeight < start_height + 3; ++i) {
+        UninterruptibleSleep(std::chrono::milliseconds{50});
+        SetMockTime(GetTime() + 60);
+    }
+    const auto running{loop.Status(std::nullopt)};
+    loop.Stop();
+    BOOST_CHECK_MESSAGE(Tip()->nHeight >= start_height + 3,
+                        "loop state: " << running.state << " / last error: " << running.last_error);
+    BOOST_CHECK(running.running);
+    BOOST_CHECK(running.validator_key.has_value());
+    BOOST_CHECK(running.validator_key && *running.validator_key == m_val_a);
+    BOOST_CHECK_GE(running.blocks_produced, 3);
+    BOOST_CHECK(!running.last_block_hash.IsNull());
+    const auto stopped{loop.Status(std::nullopt)};
+    BOOST_CHECK(!stopped.running);
+    BOOST_CHECK_EQUAL(stopped.state, "stopped");
+    // Every produced block is a signed modern-PoS block by validator A.
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip{m_node.chainman->ActiveChain().Tip()};
+        BOOST_CHECK(!tip->m_modern_pos_digest.IsNull());
+    }
 }
 
 //! Scenario 1 — normal operation: deterministic production through the

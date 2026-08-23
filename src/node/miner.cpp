@@ -11,6 +11,7 @@
 #include <common/args.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/era.h>
 #include <consensus/merkle.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
@@ -160,11 +161,18 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     if (b3_consensus.legacy_b3coin && !b3_modern) {
         throw std::runtime_error("legacy-era B3 block production is not supported");
     }
+    // X-distribution PAUSE (owner ruling 2026-08-23): with H configured and
+    // X unset, no post-H block may be produced -- a blank-X node must never
+    // enter the corridor. Validation refuses such blocks too; this is the
+    // production-side half of the same fail-closed rule.
+    if (b3_modern && Consensus::LegacyBoundaryHeightOnly(b3_consensus)) {
+        throw std::runtime_error("legacy boundary hash X is not pinned; post-H block production is refused");
+    }
     if (b3_modern) {
         pblock->nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
     }
-    if (b3_corridor && !b3_consensus.transition_pow_bits) {
-        throw std::runtime_error("temporary-PoW corridor difficulty is not configured");
+    if (b3_corridor && (!b3_consensus.transition_pow_bits || !IsCanonicalCompactBits(*b3_consensus.transition_pow_bits))) {
+        throw std::runtime_error("temporary-PoW corridor difficulty is not configured (or not canonical compact bits)");
     }
     if (b3_corridor && !b3_consensus.transition_pow_reward) {
         throw std::runtime_error("temporary-PoW corridor reward is not configured");
@@ -316,6 +324,13 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         pblock->vchBlockSig.assign(modern::MODERN_POS_SIG_SIZE, 0x00);
     } else {
         UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
+        if (b3_corridor) {
+            // Corridor pacing: never earlier than parent + minimum spacing
+            // (the network refuses it); the future bound then paces
+            // acceptance in real time.
+            pblock->nTime = static_cast<uint32_t>(std::max<int64_t>(
+                pblock->nTime, pindexPrev->GetBlockTime() + b3_consensus.transition_pow_min_spacing));
+        }
         pblock->nBits = b3_corridor ? *b3_consensus.transition_pow_bits
                                     : GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
     }

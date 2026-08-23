@@ -1820,7 +1820,7 @@ BOOST_AUTO_TEST_CASE(transition_pow_corridor_validation)
         CBlock block;
         block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
         block.hashPrevBlock = prev->GetBlockHash();
-        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 60);
         block.nBits = bits;
         block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
         block.hashMerkleRoot = BlockMerkleRoot(block);
@@ -1964,7 +1964,7 @@ BOOST_AUTO_TEST_CASE(transition_pow_corridor_production)
 
     // Produce, grind and submit the whole corridor through the assembler.
     for (int i{0}; i < CORRIDOR; ++i) {
-        SetMockTime(GetTime<std::chrono::seconds>() + std::chrono::seconds{20});
+        SetMockTime(GetTime<std::chrono::seconds>() + std::chrono::seconds{60}); // corridor pacing: >= 60 s per block
         const auto tmpl{node::BlockAssembler(chainman.ActiveChainstate(), nullptr, options).CreateNewBlock()};
         BOOST_REQUIRE(tmpl);
         CBlock block{tmpl->block};
@@ -2078,7 +2078,7 @@ BOOST_AUTO_TEST_CASE(legacy_lock_crossing_spend)
         CBlock block;
         block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
         block.hashPrevBlock = prev->GetBlockHash();
-        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 60);
         block.nBits = EASY_BITS;
         block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
         for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
@@ -2244,7 +2244,7 @@ BOOST_AUTO_TEST_CASE(stake_policy_in_corridor)
         CBlock block;
         block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
         block.hashPrevBlock = prev->GetBlockHash();
-        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 60);
         block.nBits = EASY_BITS;
         block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
         for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
@@ -2407,7 +2407,7 @@ BOOST_AUTO_TEST_CASE(full_corridor_end_to_end)
         CBlock block;
         block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
         block.hashPrevBlock = prev->GetBlockHash();
-        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 60);
         block.nBits = EASY_BITS;
         block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
         for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
@@ -2682,7 +2682,7 @@ BOOST_FIXTURE_TEST_CASE(corridor_restart_and_reindex, TransitionDiskSetup)
         CBlock block;
         block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
         block.hashPrevBlock = prev->GetBlockHash();
-        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 60);
         block.nBits = HARD_BITS;
         block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
         for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
@@ -2845,7 +2845,7 @@ BOOST_AUTO_TEST_CASE(two_node_corridor_sync)
         CBlock block;
         block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
         block.hashPrevBlock = prev->GetBlockHash();
-        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 60);
         block.nBits = EASY_BITS;
         block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
         for (CMutableTransaction& mtx : txs) block.vtx.push_back(MakeTransactionRef(std::move(mtx)));

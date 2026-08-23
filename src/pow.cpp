@@ -168,6 +168,14 @@ std::optional<arith_uint256> DeriveTarget(unsigned int nBits, const uint256 pow_
     return bnTarget;
 }
 
+bool IsCanonicalCompactBits(const uint32_t nBits)
+{
+    bool negative{false};
+    bool overflow{false};
+    const arith_uint256 target{arith_uint256().SetCompact(nBits, &negative, &overflow)};
+    return !negative && !overflow && target != 0 && target.GetCompact(/*fNegative=*/false) == nBits;
+}
+
 bool CheckProofOfWorkImpl(uint256 hash, unsigned int nBits, const Consensus::Params& params)
 {
     auto bnTarget{DeriveTarget(nBits, params.powLimit)};

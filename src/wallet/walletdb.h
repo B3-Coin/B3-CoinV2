@@ -58,6 +58,7 @@ enum class DBErrors : int
 namespace DBKeys {
 extern const std::string ACENTRY;
 extern const std::string ACTIVEEXTERNALSPK;
+extern const std::string B3_VALIDATOR_PUBKEY;
 extern const std::string ACTIVEINTERNALSPK;
 extern const std::string BESTBLOCK;
 extern const std::string BESTBLOCK_NOMERKLE;
@@ -237,6 +238,8 @@ public:
     bool EraseWatchOnly(const CScript &script);
 
     bool WriteBestBlock(const CBlockLocator& locator);
+    //! B3: the wallet's validator public key (the secret lives in its pk() descriptor).
+    bool WriteB3ValidatorPubKey(const CPubKey& pubkey);
     bool ReadBestBlock(CBlockLocator& locator);
 
     // Returns true if wallet stores encryption keys

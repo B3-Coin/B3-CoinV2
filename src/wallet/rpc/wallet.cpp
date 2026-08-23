@@ -891,6 +891,12 @@ RPCHelpMan signrawtransactionwithwallet();
 // signmessage
 RPCHelpMan signmessage();
 
+// staking (B3 Modern PoS validator UX)
+RPCHelpMan createstake();
+RPCHelpMan getstakinginfo();
+RPCHelpMan startstaking();
+RPCHelpMan stopstaking();
+
 // transactions
 RPCHelpMan listreceivedbyaddress();
 RPCHelpMan listreceivedbylabel();
@@ -910,6 +916,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &backupwallet},
         {"wallet", &bumpfee},
         {"wallet", &psbtbumpfee},
+        {"wallet", &createstake},
         {"wallet", &createwallet},
         {"wallet", &createwalletdescriptor},
         {"wallet", &restorewallet},
@@ -922,6 +929,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &getrawchangeaddress},
         {"wallet", &getreceivedbyaddress},
         {"wallet", &getreceivedbylabel},
+        {"wallet", &getstakinginfo},
         {"wallet", &gettransaction},
         {"wallet", &getbalances},
         {"wallet", &getwalletinfo},
@@ -951,6 +959,8 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &setwalletflag},
         {"wallet", &signmessage},
         {"wallet", &signrawtransactionwithwallet},
+        {"wallet", &startstaking},
+        {"wallet", &stopstaking},
         {"wallet", &simulaterawtransaction},
         {"wallet", &sendall},
         {"wallet", &unloadwallet},

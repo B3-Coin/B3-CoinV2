@@ -24,6 +24,10 @@ enum class Warning {
     CLOCK_OUT_OF_SYNC,
     PRE_RELEASE_TEST_BUILD,
     FATAL_INTERNAL_ERROR,
+    //! B3: the final legacy height H is configured without the boundary hash
+    //! X (X-distribution pause): the node stops accepting blocks after H
+    //! until the follow-up release that pins X.
+    LEGACY_BOUNDARY_UNPINNED,
 };
 
 /**

@@ -226,6 +226,17 @@ release) and requires H/X be known before the enforcing binary activates. The co
 activation mechanism — how nodes agree to begin modern validation once H/X are baked in —
 is not finalized and must not be improvised late.
 
+**RULED 2026-08-23 (owner):** H = 820,000 (corridor 820,001..821,000,
+M = 821,001); X distribution = PAUSE, FAIL CLOSED — a release ships with H
+set and X blank, accepts through H and refuses every block at H+1
+(`legacy-boundary-unpinned`, a no-penalty header refusal, plus a
+production guard), and a mandatory follow-up release pins X and resumes
+the corridor; nodes with blank X never enter the corridor. Corridor bits =
+canonical `0x1f008000`. Seeds: `176.31.13.198` plus at least two further
+independently hosted fixed seeds and an owner-controlled DNS seed before
+final release. **None of these values is pinned in mainnet chainparams
+until the four pin gates in [b3-release-v1.md](b3-release-v1.md) pass.**
+
 ---
 
 ## Ratified deviations (closed — recorded so they are not "fixed" later)

@@ -39,6 +39,17 @@ bool CheckProofOfWork(uint256 hash, unsigned int nBits, const Consensus::Params&
  * hash. Rejects negative/overflowing/zero targets.
  */
 bool CheckTransitionPowEligibility(const CBlockHeader& header);
+
+/**
+ * True iff `nBits` is the canonical compact encoding of its target — the
+ * exact form arith_uint256::GetCompact() produces (no negative flag, no
+ * overflow, non-zero, mantissa normalized). The same target has several
+ * compact spellings (0x20000080 and 0x1f008000 both encode 2^239); a
+ * consensus constant compared byte-for-byte on every header must be the
+ * canonical one, so a configured non-canonical value is treated as
+ * unconfigured and fails closed.
+ */
+bool IsCanonicalCompactBits(uint32_t nBits);
 bool CheckProofOfWorkImpl(uint256 hash, unsigned int nBits, const Consensus::Params&);
 
 /**
