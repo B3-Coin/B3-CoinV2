@@ -264,14 +264,18 @@ BOOST_AUTO_TEST_CASE(registry_and_activation_fail_closed)
     active.test_only_mpa_active = true;
     using modern::PayloadTypeStatus;
     // Statuses
-    for (const uint16_t t : {1, 2, 3, 4}) {
+    for (const uint16_t t : {1, 2, 3}) {
         BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, production) == PayloadTypeStatus::INACTIVE);
-        BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, active) == PayloadTypeStatus::INACTIVE); // 1-3 never silently activate; 4 awaits Commit 10
+        BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, active) == PayloadTypeStatus::INACTIVE); // 1-3 never silently activate
         BOOST_CHECK(modern::GetPayloadTypeStatus(t, 2, active) == PayloadTypeStatus::UNKNOWN);
     }
-    BOOST_CHECK(modern::GetPayloadTypeStatus(5, 1, production) == PayloadTypeStatus::INACTIVE);
-    BOOST_CHECK(modern::GetPayloadTypeStatus(5, 1, active) == PayloadTypeStatus::ACTIVE);
-    BOOST_CHECK(modern::GetPayloadTypeStatus(5, 2, active) == PayloadTypeStatus::UNKNOWN);
+    // 4 (certificate, Commit 12) and 5 (key evidence): production inactive,
+    // test context active.
+    for (const uint16_t t : {4, 5}) {
+        BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, production) == PayloadTypeStatus::INACTIVE);
+        BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, active) == PayloadTypeStatus::ACTIVE);
+        BOOST_CHECK(modern::GetPayloadTypeStatus(t, 2, active) == PayloadTypeStatus::UNKNOWN);
+    }
     for (const uint16_t t : {0, 6, 7, 99, 65535}) BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, active) == PayloadTypeStatus::UNKNOWN);
     std::string err;
     // Production: any MPA is invalid (not active), even a perfectly formed type-5 record.
@@ -283,7 +287,7 @@ BOOST_AUTO_TEST_CASE(registry_and_activation_fail_closed)
         BOOST_CHECK(modern::CheckTransactionMpa(CTransaction{tx}, active, err));
     }
     // Known-but-inactive types rejected under the test context; unknown rejected.
-    for (const uint16_t t : {1, 2, 3, 4}) {
+    for (const uint16_t t : {1, 2, 3}) {
         CMutableTransaction tx{BaseTx()};
         tx.mpa.push_back(Rec(t, 1, {0x00}));
         BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{tx}, active, err));

@@ -76,9 +76,12 @@ inline PayloadTypeStatus GetPayloadTypeStatus(const uint16_t type, const uint16_
     case CREATION_ACTION_FN_CLAIM:
     case CREATION_ACTION_LEGACY_FN_ISSUANCE:
     case CREATION_ACTION_ASSET_ISSUANCE:
-    case MPA_TYPE_FINALITY_CERTIFICATE:
         return PayloadTypeStatus::INACTIVE;
+    case MPA_TYPE_FINALITY_CERTIFICATE:
     case MPA_TYPE_FINALITY_KEY_EVIDENCE:
+        // Verified end to end (binding index / FinalityTracker) but NOT
+        // activated on any real network: production stays fail-closed until
+        // the F = M activation plumbing commit.
         return params.test_only_mpa_active ? PayloadTypeStatus::ACTIVE : PayloadTypeStatus::INACTIVE;
     default:
         return PayloadTypeStatus::UNKNOWN;

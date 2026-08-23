@@ -56,6 +56,11 @@ std::optional<ValidatorSetSnapshot> ValidatorSetSnapshot::Build(const uint64_t e
     snap.m_header.aggregate_pubkey = aggregate->Compressed();
     snap.m_header.members_root = *root;
     snap.m_set_hash = modern::ValidatorSetHash(snap.m_header);
+    snap.m_view.validator_count = snap.m_header.validator_count;
+    snap.m_view.quorum_weight = snap.m_header.quorum_weight;
+    snap.m_view.keys = std::move(keys);
+    snap.m_view.weights.reserve(snap.m_members.size());
+    for (const auto& m : snap.m_members) snap.m_view.weights.push_back(m.weight);
     return snap;
 }
 
@@ -66,19 +71,12 @@ std::optional<ValidatorSetSnapshot> ValidatorSetSnapshot::BuildAt(const uint64_t
     return Build(epoch, stakes.ActiveWeights(height, total), bindings);
 }
 
-modern::ValidatorSetView ValidatorSetSnapshot::View() const
+ValidatorSetSnapshot ValidatorSetSnapshot::WithEpoch(const uint64_t epoch) const
 {
-    modern::ValidatorSetView view;
-    view.validator_count = m_header.validator_count;
-    view.quorum_weight = m_header.quorum_weight;
-    view.keys.reserve(m_members.size());
-    view.weights.reserve(m_members.size());
-    for (const auto& m : m_members) {
-        // Provenance: member keys come from bindings whose PoP passed consensus.
-        view.keys.push_back(bls::VerifiedPublicKey::TrustedFromValidatedChain(*bls::PublicKey::Decode(m.bls_pubkey)));
-        view.weights.push_back(m.weight);
-    }
-    return view;
+    ValidatorSetSnapshot out{*this};
+    out.m_header.epoch = epoch;
+    out.m_set_hash = modern::ValidatorSetHash(out.m_header);
+    return out;
 }
 
 std::optional<uint32_t> ValidatorSetSnapshot::IndexOf(const modern::ValidatorKeyBytes& validator_key) const

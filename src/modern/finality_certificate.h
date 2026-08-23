@@ -47,10 +47,11 @@ namespace modern {
  * Structural binding (MatchFinalityCertificate): exactly one FINALITY_CERT
  * cell <-> one type-4 record in the coinbase, matched by commitment; orphan
  * record, cell without record, duplicates, non-coinbase placement, params
- * mismatch are invalid. NOT wired into block validation here: checkpoint
- * scheduling, epoch rotation, the finality pin, P2P aggregation and activation
- * are later commits (the registry keeps type 4 INACTIVE), so production stays
- * fail-closed and nothing here runs on a real chain yet.
+ * mismatch are invalid. Wired into block validation from plan Commit 12:
+ * node::FinalityTracker judges the certificate against the epoch state
+ * derived from the chain (modern/finality_schedule.h rules) in ConnectBlock.
+ * Type 4 is ACTIVE only under the test MPA context; production stays
+ * fail-closed until the F = M activation plumbing commit.
  */
 
 //! The verifier's view of the signing validator set (built from a snapshot).

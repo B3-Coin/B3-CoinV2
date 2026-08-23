@@ -82,11 +82,11 @@ struct FinalityEpochView {
     //! Highest certified (finalized) height on this chain, if any.
     std::optional<uint64_t> finalized_height;
     //! Set_current and hash(Set_{current+1}) (known for the whole epoch).
-    ValidatorSetView current_set;
+    const ValidatorSetView* current_set{nullptr};
     uint256 current_set_hash{};
     uint256 next_set_hash{};
     //! Set_{current-1}, present once current_epoch >= 1.
-    std::optional<ValidatorSetView> previous_set;
+    const ValidatorSetView* previous_set{nullptr};
 };
 
 enum class CertificatePlacement {
@@ -130,7 +130,9 @@ inline CertificatePlacement CheckCertificatePlacement(const FinalizedBlock& fb, 
                                                       const Consensus::ModernPosParams& pos,
                                                       const std::function<std::optional<uint256>(int)>& hash_at)
 {
-    if (view.epoch_starts.empty() || view.current_set.validator_count == 0) return CertificatePlacement::NO_FINALITY_SET;
+    if (view.epoch_starts.empty() || view.current_set == nullptr || view.current_set->validator_count == 0) {
+        return CertificatePlacement::NO_FINALITY_SET;
+    }
     if (view.lineage_broken) return CertificatePlacement::LINEAGE_BROKEN;
     if (fb.height > static_cast<uint64_t>(including_height)) return CertificatePlacement::INSUFFICIENT_DEPTH;
     const int hc{static_cast<int>(fb.height)};
@@ -173,7 +175,7 @@ inline bool JudgeFinalityCertificate(const uint256& chain_domain, const Finalize
     }
     // Set_{fb.epoch} signs; it attests hash(Set_{fb.epoch+1}).
     const bool delayed{fb.epoch != view.current_epoch};
-    const ValidatorSetView& signing_set{delayed ? *view.previous_set : view.current_set};
+    const ValidatorSetView& signing_set{delayed ? *view.previous_set : *view.current_set};
     const uint256& successor{delayed ? view.current_set_hash : view.next_set_hash};
     const auto check{VerifyFinalityCertificate(chain_domain, fb, cert, signing_set, successor)};
     if (check != CertificateCheck::OK) {

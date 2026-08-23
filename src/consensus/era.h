@@ -132,6 +132,18 @@ constexpr std::optional<int> TransitionPowFinalHeight(const Params& params)
 }
 
 /**
+ * First height of the modern-PoS phase: M = H + 1 + corridor length (the
+ * height at which GetConsensusPhase first returns MODERN_POS). Epoch 0 of
+ * the finality gadget starts here (F = M). nullopt while H is unpinned.
+ */
+constexpr std::optional<int> ModernPosStartHeight(const Params& params)
+{
+    const std::optional<int> final_height{LegacyFinalHeight(params)};
+    if (!final_height) return std::nullopt;
+    return *final_height + 1 + params.transition_pow_length;
+}
+
+/**
  * Return the block-production consensus phase governing the block at
  * `height`. Single source of truth for phase selection; like GetB3Era it
  * must only be consulted where the height is already unambiguous, and never

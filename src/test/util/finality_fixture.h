@@ -22,8 +22,11 @@
 #include <modern/mpa.h>
 #include <modern/payload_root.h>
 #include <node/finality_binding_index.h>
+#include <node/finality_tracker.h>
+#include <node/validator_set.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
+#include <util/time.h>
 #include <validation.h>
 
 #include <test/util/modern_pos_setup.h>
@@ -166,6 +169,203 @@ struct BindingFixture : public ModernPosSetup {
     }
 };
 
+
+/**
+ * A modern-PoS chain with the finality gadget live (plan Commits 12-14):
+ * legacy history to H, corridor with two bound, staked validators (A heavy,
+ * B light; stakes in whole modern B3 so both have snapshot weight), scaled
+ * finality constants, and helpers to produce modern-PoS blocks that may carry
+ * a FINALITY_CERT cell + certificate record in their coinbase.
+ *
+ * Scaffolding constants (fixtures may scale exactly like reorg_horizon):
+ *   E = 30, CHECKPOINT_INTERVAL = 5, CHECKPOINT_DEPTH = 3,
+ *   MAX_EPOCH_EXTENSION = 30, MIN_FINALITY_SET = 1 (two validators).
+ */
+struct FinalityChainFixture : public BindingFixture {
+    static constexpr int SCALED_E{30};
+    static constexpr int SCALED_INTERVAL{5};
+    static constexpr int SCALED_DEPTH{3};
+    static constexpr int SCALED_MAX_EXTENSION{30};
+    static constexpr CAmount STAKE_HEAVY{15 * modern::FINALITY_WEIGHT_UNIT}; // weight 15
+    static constexpr CAmount STAKE_LIGHT{1 * modern::FINALITY_WEIGHT_UNIT};  // weight 1
+
+    int m_M{0};
+    bls::SecretKey m_bls_a{Bls(1)};
+    bls::SecretKey m_bls_b{Bls(2)};
+
+    //! Legacy -> corridor (stakes + bindings in the first corridor block) ->
+    //! last corridor height M-1, with the modern-PoS rule set configured.
+    void PrepareFinalityChain(const int min_finality_set = 1, const int reorg_horizon = 200)
+    {
+        Prepare();
+        Consensus::Params& c{MutableConsensus()};
+        Consensus::ModernPosParams pos{};
+        pos.reorg_horizon = reorg_horizon;
+        pos.finality_epoch_blocks = SCALED_E;
+        pos.checkpoint_interval = SCALED_INTERVAL;
+        pos.checkpoint_depth = SCALED_DEPTH;
+        pos.max_epoch_extension = SCALED_MAX_EXTENSION;
+        pos.min_finality_set = min_finality_set;
+        BOOST_REQUIRE(pos.Valid());
+        c.modern_pos = pos;
+        {
+            LOCK(cs_main);
+            Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+            chainstate.setBlockIndexCandidates.clear();
+            chainstate.PopulateBlockIndexCandidates();
+        }
+        m_M = *Consensus::ModernPosStartHeight(c);
+
+        // Corridor block 1: STAKE outputs and FINALITY_KEY bindings for A and B.
+        CMutableTransaction stake_a{MakeTx(0, {}, {})};
+        stake_a.vout.insert(stake_a.vout.begin(), CTxOut{STAKE_HEAVY, modern::MakeStakeScript(m_vk_a, CScript() << OP_TRUE)});
+        stake_a.vout.back().nValue -= STAKE_HEAVY;
+        CMutableTransaction stake_b{MakeTx(1, {}, {})};
+        stake_b.vout.insert(stake_b.vout.begin(), CTxOut{STAKE_LIGHT, modern::MakeStakeScript(m_vk_b, CScript() << OP_TRUE)});
+        stake_b.vout.back().nValue -= STAKE_LIGHT;
+        const auto bind_a{MakeBinding(m_validator_a, m_vk_a, &m_bls_a, 0)};
+        const auto bind_b{MakeBinding(m_validator_b, m_vk_b, &m_bls_b, 0)};
+        {
+            const CBlock first{BuildCorridorWithRoot({stake_a, stake_b, MakeTx(2, {bind_a.cell}, {bind_a.record}),
+                                                      MakeTx(3, {bind_b.cell}, {bind_b.record})})};
+            BOOST_REQUIRE_MESSAGE(Probe(first).empty(), "first corridor block invalid: " << Probe(first));
+            BOOST_REQUIRE(Submit(first));
+            BOOST_REQUIRE_EQUAL(Tip()->nHeight, SYN_H + 1);
+        }
+        for (int i{1}; i < SYN_CORRIDOR; ++i) BOOST_REQUIRE(SubmitCorridor({}));
+        BOOST_REQUIRE_EQUAL(Tip()->nHeight, m_M - 1);
+    }
+
+    //! Full validity probe of a block on the tip (empty string = valid).
+    std::string Probe(const CBlock& block)
+    {
+        LOCK(cs_main);
+        const BlockValidationState state{TestBlockValidity(m_node.chainman->ActiveChainstate(), block,
+                                                           /*check_pow=*/false, /*check_merkle_root=*/true)};
+        return state.IsValid() ? std::string{} : state.ToString();
+    }
+
+    node::FinalityTracker& Finality()
+    {
+        AssertLockHeld(cs_main);
+        node::FinalityTracker& t{m_node.chainman->ActiveChainstate().ModernFinality()};
+        BOOST_REQUIRE(t.Sync(m_node.chainman->ActiveChain(), m_node.chainman->m_blockman,
+                             m_node.chainman->GetConsensus(), *m_node.chainman->ActiveChain().Tip()));
+        return t;
+    }
+    node::FinalityTracker::State FinalityState()
+    {
+        LOCK(cs_main);
+        return Finality().Current();
+    }
+    //! The epoch state projected for the next block (tip + 1).
+    node::FinalityTracker::State ProjectedNext()
+    {
+        LOCK(cs_main);
+        return Finality().Projected(Tip()->nHeight + 1, m_node.chainman->GetConsensus());
+    }
+
+    struct CertSpec {
+        int checkpoint_height;
+        uint64_t epoch;
+        uint256 successor_hash;
+        //! Which validators sign (default both).
+        bool sign_a{true};
+        bool sign_b{true};
+    };
+    //! Build cell + record for a certificate over `snapshot` (the signing set).
+    std::pair<CScript, CMpaRecord> MakeCertificate(const CertSpec& spec, const node::ValidatorSetSnapshot& signing_set,
+                                                   const std::optional<uint256>& block_hash = std::nullopt)
+    {
+        modern::FinalizedBlock fb;
+        fb.height = static_cast<uint64_t>(spec.checkpoint_height);
+        fb.block_hash = block_hash ? *block_hash
+                                   : WITH_LOCK(cs_main, return m_node.chainman->ActiveChain()[spec.checkpoint_height]->GetBlockHash());
+        fb.withdrawal_root = uint256{};
+        fb.validator_set_hash = spec.successor_hash;
+        fb.epoch = spec.epoch;
+        modern::FinalityCertificate cert;
+        cert.signer_bitmap.assign(modern::SignerBitmapBytes(signing_set.Size()), 0);
+        const uint256 digest{modern::FinalityDigest(m_domain, fb)};
+        std::vector<bls::Signature> sigs;
+        for (uint32_t i = 0; i < signing_set.Size(); ++i) {
+            const auto& pk{signing_set.Members()[i].bls_pubkey};
+            const bls::SecretKey* sk{nullptr};
+            if (pk == m_bls_a.GetPublicKey().Compressed() && spec.sign_a) sk = &m_bls_a;
+            if (pk == m_bls_b.GetPublicKey().Compressed() && spec.sign_b) sk = &m_bls_b;
+            if (!sk) continue;
+            cert.signer_bitmap[i / 8] |= static_cast<unsigned char>(1u << (i % 8));
+            sigs.push_back(sk->Sign(std::span<const unsigned char>(digest.begin(), 32)));
+        }
+        BOOST_REQUIRE(!sigs.empty());
+        cert.aggregate_sig = bls::AggregateSignatures(sigs)->Compressed();
+        const auto [payload, cell] = modern::BuildFinalityCertificate(fb, cert);
+        CMpaRecord rec;
+        rec.payload_type = modern::MPA_TYPE_FINALITY_CERTIFICATE;
+        rec.payload_version = modern::MPA_VERSION_V1;
+        rec.payload = payload;
+        return {cell, rec};
+    }
+
+    //! Eligibility weights by whole-B3 share (scale-invariant for the round search).
+    CAmount WeightOf(const modern::PosValidatorKey& key) const { return key == m_vk_a ? 15 : 1; }
+
+    //! A modern-PoS block by `key` on the tip, with optional extra coinbase
+    //! cells/records (certificate) and extra transactions; the payload-root
+    //! cell is appended automatically when the block carries any MPA.
+    CBlock BuildPosBlock(const modern::PosValidatorKey& key,
+                         const std::vector<std::pair<CScript, CMpaRecord>>& coinbase_payload = {},
+                         std::vector<CMutableTransaction> txs = {}, const int extra = 0)
+    {
+        const CBlockIndex* prev{Tip()};
+        const int64_t round{FindRound(prev, key, WeightOf(key), 16)};
+        CBlock block{BuildPos(prev, key, round, 0, extra, std::move(txs))};
+        CMutableTransaction coinbase{*block.vtx[0]};
+        std::vector<CMpaRecord> records;
+        for (const auto& [cell, rec] : coinbase_payload) {
+            coinbase.vout.emplace_back(0, cell);
+            records.push_back(rec);
+        }
+        std::sort(records.begin(), records.end(), modern::MpaRecordLess);
+        coinbase.mpa = records;
+        block.vtx[0] = MakeTransactionRef(coinbase);
+        if (modern::BlockHasAnyMpa(block)) {
+            const uint256 root{modern::ComputePayloadRoot(block)};
+            CMutableTransaction cb2{*block.vtx[0]};
+            cb2.vout.emplace_back(0, modern::MakePayloadRootCellScript(root));
+            block.vtx[0] = MakeTransactionRef(cb2);
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        Sign(block, key == m_vk_a ? m_validator_a : m_validator_b);
+        return block;
+    }
+    //! Produce and connect one block; returns its hash.
+    uint256 Produce(const modern::PosValidatorKey& key,
+                    const std::vector<std::pair<CScript, CMpaRecord>>& coinbase_payload = {},
+                    std::vector<CMutableTransaction> txs = {})
+    {
+        const int prev_height{Tip()->nHeight};
+        const CBlock block{BuildPosBlock(key, coinbase_payload, std::move(txs))};
+        if (block.GetBlockTime() > GetTime()) SetMockTime(block.GetBlockTime());
+        BOOST_REQUIRE_MESSAGE(Submit(block), "modern-PoS block at height " << prev_height + 1 << " rejected");
+        BOOST_REQUIRE_EQUAL(Tip()->nHeight, prev_height + 1);
+        return block.GetHash();
+    }
+    //! Produce blocks until the tip is at `height`.
+    void ProduceTo(const int height, const modern::PosValidatorKey& key)
+    {
+        while (Tip()->nHeight < height) Produce(key);
+    }
+    //! A block whose connect must fail; returns the reject reason recorded for it.
+    void ProduceExpectConnectFailure(const modern::PosValidatorKey& key,
+                                     const std::vector<std::pair<CScript, CMpaRecord>>& coinbase_payload,
+                                     const int extra = 0)
+    {
+        const CBlock block{BuildPosBlock(key, coinbase_payload, {}, extra)};
+        if (block.GetBlockTime() > GetTime()) SetMockTime(block.GetBlockTime());
+        SubmitExpectConnectFailure(block);
+    }
+};
 
 } // namespace b3test
 

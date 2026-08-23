@@ -77,8 +77,13 @@ public:
     uint64_t QuorumWeight() const { return m_header.quorum_weight; }
     //! Index of a validator in this set, if a member.
     std::optional<uint32_t> IndexOf(const modern::ValidatorKeyBytes& validator_key) const;
-    //! The verifier's view (keys as PoP-verified at binding time, weights, quorum).
-    modern::ValidatorSetView View() const;
+    //! The verifier's view (keys as PoP-verified at binding time, weights,
+    //! quorum), decoded once at build time and cached: certificate checks
+    //! never re-decode 8,192 keys per block.
+    const modern::ValidatorSetView& View() const { return m_view; }
+    //! Carry-over: the same members re-stamped as epoch `epoch` (new header
+    //! and set hash, identical members/leaves/aggregate key).
+    ValidatorSetSnapshot WithEpoch(uint64_t epoch) const;
 
     friend bool operator==(const ValidatorSetSnapshot& a, const ValidatorSetSnapshot& b)
     {
@@ -91,6 +96,7 @@ private:
     std::vector<ValidatorSetMember> m_members;
     std::vector<uint256> m_leaves;
     uint256 m_set_hash{};
+    modern::ValidatorSetView m_view;
 };
 
 } // namespace node

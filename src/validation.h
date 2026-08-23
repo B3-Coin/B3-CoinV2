@@ -66,6 +66,7 @@ namespace node {
 class SnapshotMetadata;
 class StakeTracker;
 class FinalityBindingTracker;
+class FinalityTracker;
 } // namespace node
 namespace Consensus {
 struct Params;
@@ -590,6 +591,8 @@ protected:
     std::unique_ptr<node::StakeTracker> m_stake_tracker GUARDED_BY(::cs_main);
     //! Lazily created FINALITY_KEY binding tracker (derived, rebuildable); see ModernFinalityBindings().
     std::unique_ptr<node::FinalityBindingTracker> m_finality_bindings GUARDED_BY(::cs_main);
+    //! Lazily created finality / epoch state tracker (derived, rebuildable); see ModernFinality().
+    std::unique_ptr<node::FinalityTracker> m_finality_tracker GUARDED_BY(::cs_main);
 
 public:
     //! Reference to a BlockManager instance which itself is shared across all
@@ -615,6 +618,10 @@ public:
      */
     node::StakeTracker& ModernStakeTracker() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     node::FinalityBindingTracker& ModernFinalityBindings() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! The derived finality / epoch state machine of this chainstate (certificate
+    //! verification, gated epoch rotation, finalized tip). Consensus reads it in
+    //! ConnectBlock; it rebuilds from the active chain whenever out of step.
+    node::FinalityTracker& ModernFinality() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     //! Return path to chainstate leveldb directory.
     fs::path StoragePath() const;

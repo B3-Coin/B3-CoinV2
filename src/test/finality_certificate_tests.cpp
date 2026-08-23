@@ -313,16 +313,18 @@ BOOST_AUTO_TEST_CASE(coinbase_cell_record_binding)
     BOOST_CHECK(parsed->commitment == modern::FinalityCertCommitment(payload));
 }
 
-BOOST_AUTO_TEST_CASE(not_activated_anywhere_yet)
+BOOST_AUTO_TEST_CASE(production_fail_closed_test_context_active)
 {
-    // Type 4 stays INACTIVE in production AND under the test MPA context: no
-    // certificate can enter a block until scheduling/epochs/pin land.
+    // Type 4 is verified end to end from Commit 12 (FinalityTracker) and is
+    // therefore ACTIVE under the test MPA context; production stays
+    // fail-closed (no network sets test_only_mpa_active) until the F = M
+    // activation plumbing commit.
     Consensus::Params production{};
     production.legacy_b3coin = true;
     Consensus::Params test_ctx{production};
     test_ctx.test_only_mpa_active = true;
     BOOST_CHECK(modern::GetPayloadTypeStatus(4, 1, production) == modern::PayloadTypeStatus::INACTIVE);
-    BOOST_CHECK(modern::GetPayloadTypeStatus(4, 1, test_ctx) == modern::PayloadTypeStatus::INACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(4, 1, test_ctx) == modern::PayloadTypeStatus::ACTIVE);
     CMutableTransaction m;
     m.version = 2;
     m.vin.resize(1);
@@ -335,8 +337,13 @@ BOOST_AUTO_TEST_CASE(not_activated_anywhere_yet)
     std::string err;
     BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{m}, production, err));
     BOOST_CHECK_EQUAL(err, "mpa-not-active");
+    // Under the test context the frame passes the registry; an oversize
+    // record (> 1,232) still fails the per-type size rule.
+    BOOST_CHECK(modern::CheckTransactionMpa(CTransaction{m}, test_ctx, err));
+    rec.payload.assign(modern::FINALITY_CERTIFICATE_RECORD_MAX + 1, 0);
+    m.mpa = {rec};
     BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{m}, test_ctx, err));
-    BOOST_CHECK_EQUAL(err, "mpa-inactive-type");
+    BOOST_CHECK_EQUAL(err, "mpa-bad-record-size");
     BOOST_CHECK(!modern::IsActivatedPolicy(6, 1));
 }
 

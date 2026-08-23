@@ -20,6 +20,7 @@
 #include <uint256.h>
 #include <validation.h>
 
+#include <test/util/finality_fixture.h>
 #include <test/util/modern_pos_setup.h>
 #include <test/util/setup_common.h>
 
@@ -233,59 +234,40 @@ BOOST_AUTO_TEST_CASE(check_metadata_cell_outputs_rules)
 //! ordinary outputs do; disconnecting restores the exact previous UTXO set;
 //! reconnecting reproduces the exact same state; without activation the
 //! same block is refused.
-BOOST_FIXTURE_TEST_CASE(connect_disconnect_symmetry_and_exclusion, ModernPosSetup)
+BOOST_FIXTURE_TEST_CASE(connect_disconnect_symmetry_and_exclusion, BindingFixture)
 {
-    const Consensus::Params& consensus{m_node.chainman->GetConsensus()};
-    // Legacy prefix, a funding output at H, corridor configured with X = tip.
-    Txid coinbase1{};
-    for (int height{1}; height <= SYN_H - 1; ++height) {
-        const CBlock block{BuildLegacy(Tip(), {})};
-        BOOST_REQUIRE(Submit(block));
-        if (height == 1) coinbase1 = block.vtx[0]->GetHash();
-    }
-    CMutableTransaction fund;
-    fund.version = 1;
-    fund.nTime = static_cast<uint32_t>(Tip()->GetBlockTime() + 17);
-    fund.vin.resize(1);
-    fund.vin[0].prevout = COutPoint{coinbase1, 0};
-    const CAmount fund_value{legacy::GetProofOfWorkReward(0, 1, consensus)};
-    fund.vout.emplace_back(fund_value, CScript() << OP_TRUE);
-    const CBlock block_h{BuildLegacy(Tip(), {fund})};
-    const Txid fund_txid{block_h.vtx[1]->GetHash()};
-    BOOST_REQUIRE(Submit(block_h));
-    BOOST_REQUIRE_EQUAL(Tip()->nHeight, SYN_H);
-    ConfigureCorridor(Tip()->GetBlockHash());
-    BOOST_REQUIRE(Consensus::GetB3Era(SYN_H + 1, consensus) == Consensus::B3Era::MODERN);
-
-    // The spending transaction: ordinary output + metadata cell (type 7, 52-B params).
-    CMutableTransaction spend;
-    spend.version = 2;
-    spend.vin.resize(1);
-    spend.vin[0].prevout = COutPoint{fund_txid, 0};
-    spend.vout.emplace_back(fund_value - 100, CScript() << OP_TRUE);
-    // A FINALITY_CERT-shaped cell (type 6, no type-specific rule until Commit 10):
-    // a FINALITY_KEY cell requires its MPA evidence (Commit 5) and a
-    // MODERN_PAYLOAD_ROOT cell is coinbase-only/MPA-bound (Commit 7) — both are
-    // exercised in their own suites; this test is about the cell mechanics alone.
-    spend.vout.emplace_back(0, Cell(6, 1, 16));
+    // Legacy prefix, funding outputs at H, corridor configured with X = tip
+    // (BindingFixture::Prepare); the cell mechanics are exercised with the one
+    // cell type that is valid in an ordinary transaction: a FINALITY_KEY
+    // binding with its evidence record (FINALITY_CERT is coinbase-only,
+    // MODERN_PAYLOAD_ROOT coinbase-only/MPA-bound). The test flags are
+    // switched off again for step 1.
+    Prepare();
+    MutableConsensus().test_only_metadata_cells_active = false;
+    MutableConsensus().test_only_mpa_active = false;
+    const Txid fund_txid{m_fund_txid};
+    const bls::SecretKey k1{Bls(1)};
+    const auto bind{MakeBinding(m_validator_a, m_vk_a, &k1, 0)};
+    const CMutableTransaction spend{MakeTx(0, {bind.cell}, {bind.record})};
     const Txid spend_txid{CTransaction{spend}.GetHash()};
 
     // 1. Not activated: the claiming output makes the block invalid; tip holds.
     {
         // (different timestamp, so the later activated block is a distinct block)
-        const CBlock refused{BuildCorridor(Tip(), {spend}, /*time_delta=*/61)};
+        const CBlock refused{BuildCorridorWithRoot({spend}, /*time_delta=*/61)};
         BOOST_CHECK(!Submit(refused));
         BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H);
     }
     // 2. Test activation on: snapshot the UTXO set, connect, inspect.
     MutableConsensus().test_only_metadata_cells_active = true;
+    MutableConsensus().test_only_mpa_active = true;
     const auto snapshot_before{[&] {
         LOCK(cs_main);
         m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
         return node::EnumerateUtxos(m_node.chainman->ActiveChainstate().CoinsDB());
     }()};
     const uint256 commit_before{node::UtxoSetCommitment(snapshot_before)};
-    const CBlock cell_block{BuildCorridor(Tip(), {spend})};
+    const CBlock cell_block{BuildCorridorWithRoot({spend})};
     BOOST_REQUIRE(Submit(cell_block));
     BOOST_REQUIRE_EQUAL(Tip()->nHeight, SYN_H + 1);
     {

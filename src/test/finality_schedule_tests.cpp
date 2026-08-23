@@ -121,10 +121,10 @@ struct World {
         view.epoch_starts = {M, M + 100, M + 230};
         view.lineage_broken = false;
         view.finalized_height = M + 200; // the last certified checkpoint (by Set_1, epoch 1)
-        view.current_set = set2.snapshot.View();
+        view.current_set = &set2.snapshot.View();
         view.current_set_hash = set2.snapshot.SetHash();
         view.next_set_hash = set3.snapshot.SetHash();
-        view.previous_set = set1.snapshot.View();
+        view.previous_set = &set1.snapshot.View();
     }
     FinalizedBlock Fb(const int height, const uint64_t epoch, const uint256& successor) const
     {
@@ -307,7 +307,7 @@ BOOST_AUTO_TEST_CASE(epoch_zero_and_fail_closed_states)
     FinalityEpochView view;
     view.current_epoch = 0;
     view.epoch_starts = {M};
-    view.current_set = set0.snapshot.View();
+    view.current_set = &set0.snapshot.View();
     view.current_set_hash = set0.snapshot.SetHash();
     view.next_set_hash = set1.snapshot.SetHash();
     const auto pos{Pos()};

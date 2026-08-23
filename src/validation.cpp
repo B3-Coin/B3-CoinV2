@@ -37,8 +37,10 @@
 #include <modern/fn.h>
 #include <modern/metadata_cell.h>
 #include <modern/mpa.h>
+#include <modern/finality_certificate.h>
 #include <modern/payload_root.h>
 #include <node/finality_binding_index.h>
+#include <node/finality_tracker.h>
 #include <modern/pos.h>
 #include <modern/pos_v1.h>
 #include <modern/stake.h>
@@ -2037,6 +2039,13 @@ node::FinalityBindingTracker& Chainstate::ModernFinalityBindings()
     return *m_finality_bindings;
 }
 
+node::FinalityTracker& Chainstate::ModernFinality()
+{
+    AssertLockHeld(::cs_main);
+    if (!m_finality_tracker) m_finality_tracker = std::make_unique<node::FinalityTracker>();
+    return *m_finality_tracker;
+}
+
 fs::path Chainstate::StoragePath() const
 {
     fs::path path{m_chainman.m_options.datadir / "chainstate"};
@@ -2887,6 +2896,21 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                                                    transitions, bind_error)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-key-evidence", bind_error);
             }
+            // FINALITY_CERTIFICATE (coinbase, <= 1): judged against the epoch
+            // state derived from the chain below this block -- schedule,
+            // depth, window {e, e-1}, relation, ancestry, monotone height,
+            // successor-set hash, Set_{epoch} quorum and aggregate BLS last.
+            // Before M (no set) and on a chain without the bootstrap floor
+            // every certificate is invalid (fail closed).
+            node::FinalityTracker& finality{ModernFinality()};
+            if (!finality.Sync(m_chain, m_blockman, consensus, *pindex->pprev)) {
+                state.Error("finality state is unavailable");
+                return false;
+            }
+            std::string cert_error;
+            if (!finality.CheckBlockCertificate(block, *pindex, consensus, cert_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-cert", cert_error);
+            }
         }
     }
 
@@ -3654,6 +3678,7 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     // The binding index reverts the disconnected block exactly (or marks
     // itself for rebuild when not in step).
     if (m_finality_bindings) m_finality_bindings->BlockDisconnected(*pindexDelete);
+    if (m_finality_tracker) m_finality_tracker->BlockDisconnected(*pindexDelete);
 
     UpdateTip(pindexDelete->pprev);
     // Let wallets know transactions went from 1-confirmed to
@@ -3768,6 +3793,9 @@ bool Chainstate::ConnectTip(
     }
     if (m_finality_bindings) {
         m_finality_bindings->BlockConnected(*block_to_connect, *pindexNew, m_chainman.GetConsensus());
+    }
+    if (m_finality_tracker) {
+        m_finality_tracker->BlockConnected(*block_to_connect, *pindexNew, m_chainman.GetConsensus());
     }
     const auto time_4{SteadyClock::now()};
     m_chainman.time_flush += time_4 - time_3;
@@ -5508,6 +5536,11 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
         // the block hash through exactly one coinbase root cell; no MPA => no cell.
         if (std::string root_error; !modern::CheckBlockPayloadRoot(block, root_error)) {
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-payload-root", root_error);
+        }
+        // FINALITY_CERT cells / certificate records live in the coinbase only
+        // (structural; the certificate itself is judged at connect).
+        if (std::string cert_error; !modern::CheckFinalityCertificatePlacement(block, cert_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-cert-form", cert_error);
         }
         // Phase-exact trailing-signature shape: corridor blocks earned their
         // place by PoW and must carry no signature; with the modern-PoS rule
