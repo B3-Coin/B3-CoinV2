@@ -116,30 +116,27 @@ payload_root         →  MODERN_PAYLOAD_ROOT cell commitment (coinbase)  →  v
 
 ---
 
-## 5. Full-payload transaction identifier (`ptxid`) — no SegWit required
+## 5. Full-payload transaction identifier (`ptxid`) — NORMATIVE (implemented, plan Commit 6)
 
 Two identities per modern transaction:
 
 | Id | Covers | Use |
 |---|---|---|
-| `txid` | version, inputs, outputs, locktime — **evidence-independent** | state identity, outpoints, block merkle tree, indexes |
-| **`ptxid`** | the complete optional-data serialization: marker, flag, inputs, outputs, **MPA**, locktime (and witness if ever present) | relay, deduplication, fetching, compact-block short ids, orphan maps |
+| `txid` | version, inputs, outputs, locktime (legacy: the legacy encoding incl. `nTime`) — **evidence-independent** | state identity: outpoints, UTXO keys, prevouts, transaction Merkle root, sighash, asset ids, finality digests, every legacy path |
+| **`ptxid`** | the **canonical full transaction serialization**: `version ‖ [0x00 ‖ flags, only when optional data exists] ‖ inputs ‖ outputs ‖ [witness stacks per input if flags&1, existing encoding] ‖ [MPA section if flags&2] ‖ locktime` | identifies the exact evidence-bearing bytes (future relay / dedup / fetch plumbing, Commit 15) |
 
-Definition: `ptxid = SHA256d(full serialization with all optional data present)`, and for a
-transaction with no optional data `ptxid == txid`. This is precisely what the existing
-`CTransaction::m_witness_hash` (`GetWitnessHash()`) computes once the MPA is part of the
-optional-data serialization — the field exists and is computed regardless of any
-deployment, so **no SegWit activation is involved**; the `wtxidrelay` plumbing (announce,
-`getdata`, compact-block reconstruction keyed on the full hash) carries MPA-bearing
-transactions unchanged. Docs and RPC name it `ptxid`; the code type remains the existing
-full-hash slot. (Structural alternative, if the owner prefers an identifier independent of
-serialization details: `ptxid' = TaggedHash("B3/MPA/PTXID/V1", txid ‖ section_hash)`; it
-would need its own relay key and is not recommended.)
-
-`ptxid` is **not** used in the Merkle leaves (the coinbase `ptxid` depends on
-`payload_root`; §4 item 1 keeps the leaf free of any transaction identity).
-
----
+Definition: **`ptxid = SHA256d(CanonicalFullTransactionSerialization)`**, defined by bytes, not
+by any implementation detail. Consequences: a transaction with neither witness nor MPA has
+exactly the base serialization, so `ptxid == txid`; a legacy-encoded transaction's canonical
+serialization is its legacy encoding, so `ptxid == txid`; identical base data with different
+MPA ⇒ same `txid`, different `ptxid`; witness-only or witness+MPA ⇒ `ptxid` commits to all of
+it. Canonical means the strict MPA section rules of §1 (minimal CompactSize, strictly
+increasing record order, no trailing bytes) — non-canonical alternatives are not decodable,
+so no second `ptxid` exists for one transaction. `ptxid` is a distinct type (`Ptxid`) and is
+never a replacement for `txid` in any consensus identity. It is **not** used in the payload-root
+leaves (§3/§4): `payload_root` depends only on section bytes, so the coinbase `ptxid` (which
+depends on `payload_root` through the `MODERN_PAYLOAD_ROOT` cell) is outside the commitment
+construction — no circularity.
 
 ## 6. Worst-case validation and storage effects (numbers deliberately not frozen)
 

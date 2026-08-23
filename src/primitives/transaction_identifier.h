@@ -72,6 +72,41 @@ using Txid = transaction_identifier<false>;
 /** Wtxid commits to all transaction fields including the witness. */
 using Wtxid = transaction_identifier<true>;
 
+/**
+ * B3 NORMATIVE full-evidence transaction identifier (plan Commit 6).
+ *
+ *   ptxid = SHA256d( CanonicalFullTransactionSerialization )
+ *
+ * where the canonical full serialization is the B3 Modern full form
+ * (TransactionSerParams TX_MODERN): version || [0x00 marker || flags, only
+ * when optional data exists] || inputs || outputs || [witness stacks per
+ * input, if flags&1, in their existing encoding] || [Modern Payload Area
+ * section, if flags&2] || locktime. A transaction with neither witness nor
+ * MPA has exactly the base serialization, so ptxid == txid; a legacy-encoded
+ * transaction's canonical serialization is its legacy encoding, so ptxid ==
+ * txid there too. ptxid identifies the exact evidence-bearing bytes; it is
+ * NOT a state identity: COutPoint, UTXO keys, prevouts, the transaction
+ * Merkle root, sighash, asset ids, finality digests and every legacy path
+ * keep using txid. Defined by bytes, not by any implementation detail; it is
+ * a distinct C++ type so it can never be confused with Txid or Wtxid.
+ */
+class Ptxid
+{
+    uint256 m_wrapped;
+    explicit Ptxid(const uint256& wrapped) : m_wrapped{wrapped} {}
+
+public:
+    Ptxid() : m_wrapped{} {}
+    static Ptxid FromUint256(const uint256& id) { return Ptxid{id}; }
+    const uint256& ToUint256() const LIFETIMEBOUND { return m_wrapped; }
+    bool operator==(const Ptxid& other) const { return m_wrapped == other.m_wrapped; }
+    std::strong_ordering operator<=>(const Ptxid& other) const { return m_wrapped.Compare(other.m_wrapped) <=> 0; }
+    // Comparisons with Txid / Wtxid / uint256 are deliberately not provided.
+    constexpr bool IsNull() const { return m_wrapped.IsNull(); }
+    std::string GetHex() const { return m_wrapped.GetHex(); }
+    std::string ToString() const { return m_wrapped.ToString(); }
+};
+
 template <typename T>
 concept TxidOrWtxid = std::is_same_v<T, Txid> || std::is_same_v<T, Wtxid>;
 

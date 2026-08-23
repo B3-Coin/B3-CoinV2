@@ -445,9 +445,12 @@ private:
     const bool m_legacy_encoding;
     const Txid hash;
     const Wtxid m_witness_hash;
+    //! B3 normative full-evidence identifier (see Ptxid in transaction_identifier.h).
+    const Ptxid m_ptxid;
 
     Txid ComputeHash() const;
     Wtxid ComputeWitnessHash() const;
+    Ptxid ComputePtxid() const;
 
     bool ComputeHasWitness() const;
 
@@ -474,6 +477,13 @@ public:
 
     const Txid& GetHash() const LIFETIMEBOUND { return hash; }
     const Wtxid& GetWitnessHash() const LIFETIMEBOUND { return m_witness_hash; };
+    /**
+     * ptxid = SHA256d(canonical full serialization incl. witness and MPA);
+     * equals the txid when the transaction carries no optional data. Never a
+     * replacement for GetHash() in any state identity (outpoints, UTXO,
+     * merkle root, sighash, asset ids, finality digests).
+     */
+    const Ptxid& GetPtxid() const LIFETIMEBOUND { return m_ptxid; }
 
     // Return sum of txouts.
     CAmount GetValueOut() const;

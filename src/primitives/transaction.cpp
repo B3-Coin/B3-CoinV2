@@ -100,8 +100,20 @@ Wtxid CTransaction::ComputeWitnessHash() const
     return Wtxid::FromUint256((HashWriter{} << TX_WITH_WITNESS(*this)).GetHash());
 }
 
-CTransaction::CTransaction(const CMutableTransaction& tx) : vin(tx.vin), vout(tx.vout), version{tx.version}, nTime{tx.nTime}, nLockTime{tx.nLockTime}, mpa(tx.mpa), m_has_witness{ComputeHasWitness()}, m_legacy_encoding{tx.m_legacy_encoding}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()} {}
-CTransaction::CTransaction(CMutableTransaction&& tx) : vin(std::move(tx.vin)), vout(std::move(tx.vout)), version{tx.version}, nTime{tx.nTime}, nLockTime{tx.nLockTime}, mpa(std::move(tx.mpa)), m_has_witness{ComputeHasWitness()}, m_legacy_encoding{tx.m_legacy_encoding}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()} {}
+Ptxid CTransaction::ComputePtxid() const
+{
+    // Normative: SHA256d over the canonical full serialization. A legacy-encoded
+    // transaction's canonical serialization is its legacy encoding (no optional
+    // data exists there), and a transaction without witness and MPA serializes
+    // to exactly its base bytes — in both cases ptxid == txid by construction.
+    if (m_legacy_encoding || (!HasWitness() && !HasMpa())) {
+        return Ptxid::FromUint256(hash.ToUint256());
+    }
+    return Ptxid::FromUint256((HashWriter{} << TX_MODERN(*this)).GetHash());
+}
+
+CTransaction::CTransaction(const CMutableTransaction& tx) : vin(tx.vin), vout(tx.vout), version{tx.version}, nTime{tx.nTime}, nLockTime{tx.nLockTime}, mpa(tx.mpa), m_has_witness{ComputeHasWitness()}, m_legacy_encoding{tx.m_legacy_encoding}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()}, m_ptxid{ComputePtxid()} {}
+CTransaction::CTransaction(CMutableTransaction&& tx) : vin(std::move(tx.vin)), vout(std::move(tx.vout)), version{tx.version}, nTime{tx.nTime}, nLockTime{tx.nLockTime}, mpa(std::move(tx.mpa)), m_has_witness{ComputeHasWitness()}, m_legacy_encoding{tx.m_legacy_encoding}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()}, m_ptxid{ComputePtxid()} {}
 
 CAmount CTransaction::GetValueOut() const
 {
