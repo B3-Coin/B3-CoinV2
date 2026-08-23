@@ -40,6 +40,7 @@
 #include <modern/finality_certificate.h>
 #include <modern/payload_root.h>
 #include <node/finality_binding_index.h>
+#include <node/finality_signature.h>
 #include <node/finality_tracker.h>
 #include <modern/pos.h>
 #include <modern/pos_v1.h>
@@ -2044,6 +2045,13 @@ node::FinalityTracker& Chainstate::ModernFinality()
     AssertLockHeld(::cs_main);
     if (!m_finality_tracker) m_finality_tracker = std::make_unique<node::FinalityTracker>();
     return *m_finality_tracker;
+}
+
+node::FinalitySignaturePool& Chainstate::FinalitySignatures()
+{
+    AssertLockHeld(::cs_main);
+    if (!m_finality_sigs) m_finality_sigs = std::make_unique<node::FinalitySignaturePool>();
+    return *m_finality_sigs;
 }
 
 void Chainstate::RefreshFinalityAnchor()

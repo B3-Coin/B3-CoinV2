@@ -264,6 +264,13 @@ inline constexpr const char* WTXIDRELAY{"wtxidrelay"};
  * txreconciliation, as described by BIP 330.
  */
 inline constexpr const char* SENDTXRCNCL{"sendtxrcncl"};
+/**
+ * B3 modern-era finality signature gossip (liveness only, never consensus):
+ * u64 epoch || u64 checkpoint height || u32 signer index || 96-byte BLS
+ * signature (fixed 116 bytes). Relayed once per (epoch, height, index);
+ * see node/finality_signature.h.
+ */
+inline constexpr const char* FINSIG{"finsig"};
 }; // namespace NetMsgType
 
 /** All known message types (see above). Keep this in the same order as the list of messages above. */
@@ -303,6 +310,7 @@ inline const std::array ALL_NET_MESSAGE_TYPES{std::to_array<std::string>({
     NetMsgType::CFCHECKPT,
     NetMsgType::WTXIDRELAY,
     NetMsgType::SENDTXRCNCL,
+    NetMsgType::FINSIG,
 })};
 
 /** nServices flags */

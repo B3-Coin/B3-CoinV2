@@ -67,6 +67,7 @@ class SnapshotMetadata;
 class StakeTracker;
 class FinalityBindingTracker;
 class FinalityTracker;
+class FinalitySignaturePool;
 } // namespace node
 namespace Consensus {
 struct Params;
@@ -593,6 +594,8 @@ protected:
     std::unique_ptr<node::FinalityBindingTracker> m_finality_bindings GUARDED_BY(::cs_main);
     //! Lazily created finality / epoch state tracker (derived, rebuildable); see ModernFinality().
     std::unique_ptr<node::FinalityTracker> m_finality_tracker GUARDED_BY(::cs_main);
+    //! Lazily created finality-signature pool (liveness only); see FinalitySignatures().
+    std::unique_ptr<node::FinalitySignaturePool> m_finality_sigs GUARDED_BY(::cs_main);
 
 public:
     //! Reference to a BlockManager instance which itself is shared across all
@@ -630,6 +633,9 @@ public:
      * unavailable (it is only ever raised).
      */
     void RefreshFinalityAnchor() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! The node-local finality-signature pool (gossip aggregation; plan
+    //! Commit 15). Liveness only: nothing in it affects validation.
+    node::FinalitySignaturePool& FinalitySignatures() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /**
      * The finality pin refuses a reorganization whose fork point lies below
      * the pinned checkpoint (it would disconnect the checkpoint). Reorgs whose

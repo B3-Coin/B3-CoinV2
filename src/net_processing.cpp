@@ -625,6 +625,7 @@ public:
     std::vector<PrivateBroadcast::TxBroadcastInfo> GetPrivateBroadcastInfo() const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     std::vector<CTransactionRef> AbortPrivateBroadcast(const uint256& id) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void SendPings() override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+    void RelayFinalitySignatures(std::span<const node::FinalitySig> sigs) override;
     void InitiateTxBroadcastToAll(const Txid& txid, const Wtxid& wtxid) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void InitiateTxBroadcastPrivate(const CTransactionRef& tx) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void SetBestBlock(int height, std::chrono::seconds time) override
@@ -2460,6 +2461,17 @@ void PeerManagerImpl::BlockChecked(const std::shared_ptr<const CBlock>& block, c
 bool PeerManagerImpl::AlreadyHaveBlock(const uint256& block_hash)
 {
     return m_chainman.m_blockman.LookupBlockIndex(block_hash) != nullptr;
+}
+
+void PeerManagerImpl::RelayFinalitySignatures(std::span<const node::FinalitySig> sigs)
+{
+    if (sigs.empty()) return;
+    m_connman.ForEachNode([&](CNode* pnode) {
+        if (!pnode->fSuccessfullyConnected || pnode->fDisconnect) return;
+        for (const node::FinalitySig& sig : sigs) {
+            MakeAndPushMessage(*pnode, NetMsgType::FINSIG, sig);
+        }
+    });
 }
 
 void PeerManagerImpl::SendPings()
@@ -5786,6 +5798,40 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
 
     if (msg_type == NetMsgType::GETCFCHECKPT) {
         ProcessGetCFCheckPt(pfrom, peer, vRecv);
+        return;
+    }
+
+    if (msg_type == NetMsgType::FINSIG) {
+        // B3 finality-signature gossip (liveness only; consensus acceptance
+        // happens exclusively through certificates in blocks). Fixed-size
+        // message; cheap structural / schedule / set checks run before the
+        // single BLS verification, inside the pool. No peer penalty for
+        // semantically stale or unverifiable signatures: forks and epoch
+        // races make them indistinguishable from honest latecomers.
+        node::FinalitySig finsig;
+        vRecv >> finsig;
+        const Consensus::Params& consensus{m_chainparams.GetConsensus()};
+        if (!consensus.legacy_b3coin || !consensus.modern_pos) return;
+        bool relay{false};
+        {
+            LOCK(cs_main);
+            Chainstate& chainstate{m_chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            if (!tip) return;
+            node::FinalityTracker& tracker{chainstate.ModernFinality()};
+            if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) return;
+            const auto accept{chainstate.FinalitySignatures().Submit(finsig, tracker, chainstate.m_chain, consensus)};
+            LogDebug(BCLog::NET, "finsig epoch=%d height=%d index=%d peer=%d: %s\n", finsig.epoch, finsig.height,
+                     finsig.index, pfrom.GetId(), node::FinalitySignaturePool::AcceptName(accept));
+            relay = accept == node::FinalitySignaturePool::Accept::ACCEPTED;
+        }
+        // Flood once on first acceptance; duplicates terminate the relay.
+        if (relay) {
+            m_connman.ForEachNode([&](CNode* pnode) {
+                if (pnode->GetId() == pfrom.GetId() || !pnode->fSuccessfullyConnected || pnode->fDisconnect) return;
+                MakeAndPushMessage(*pnode, NetMsgType::FINSIG, finsig);
+            });
+        }
         return;
     }
 

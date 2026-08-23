@@ -251,6 +251,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/legacy_fn_issuance.cpp
   node/finality_binding_index.cpp
   node/finality_pin.cpp
+  node/finality_signature.cpp
   node/finality_tracker.cpp
   node/validator_set.cpp
   node/stake_registry.cpp

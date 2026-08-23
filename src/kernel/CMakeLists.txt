@@ -34,6 +34,7 @@ add_library(bitcoinkernel
   ../node/blockstorage.cpp
   ../node/finality_binding_index.cpp
   ../node/finality_pin.cpp
+  ../node/finality_signature.cpp
   ../node/finality_tracker.cpp
   ../node/stake_registry.cpp
   ../node/stake_tracker.cpp
