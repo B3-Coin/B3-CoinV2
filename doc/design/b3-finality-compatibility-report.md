@@ -15,7 +15,7 @@ Findings marked ⚠ require an owner ruling; ✔ = confirmed consistent; ✎ = e
 
 | # | Finding | Consequence |
 |---|---|---|
-| **F-1 ⚠ (revised §7.4)** | The normative spec places the certificate and the BLS binding in "creation actions type 4/5". **The creation-action section has no live consensus carrier in the tree**: `ModernTransition`/`ModernTransitionV2` are models with "NO generic serialization on purpose", used only in tests; `validation.cpp` has no creation-action hook; status row 147 confirms "nothing decodes them from a peer". The only live modern carriers are **script-level** (`B3S1` STAKE push, the M3 coinbase `scriptSig` declaration, `vchBlockSig`). | Pick the v1 carrier now (§1). Recommended: script-level magic carriers in the txid-committed part of the block, mirroring the ratified STAKE pattern; keep creation-action numbers 4/5 RESERVED for the future codec. |
+| **F-1 ⚠ (revised §7.4)** | The normative spec places the certificate and the BLS binding in "creation actions type 4/5". **The creation-action section has no live consensus carrier in the tree**: `ModernTransition`/`ModernTransitionV2` are models with "NO generic serialization on purpose", used only in tests; `validation.cpp` has no creation-action hook; status row 147 confirms "nothing decodes them from a peer". The only live modern carriers are **script-level** (`B3S1` STAKE push, the M3 coinbase `scriptSig` declaration, `vchBlockSig`). | **Revised in §7.4 after the owner's correction (modern era = Policy Outputs):** binding = `STAKE` policy **v2** (params `vk ‖ bls_pk` = 80 B, PoP verified at creation); certificate = new policy type **`FINALITY_CERT = 6`** (coinbase-only, amount 0, commitment = `finality_digest`, type-specific params bound). No OP_RETURN, no scriptSig, no `vchBlockSig`. Creation-action numbers 4/5 stay RESERVED. |
 | **F-2 ⚠** | Spec §4 rotates validator sets on **fixed heights**; the owner's requirement is rotation **only after the current set has produced a valid transition certificate**. As written, a set can take over without `Set_e` ever certifying, which breaks Ethereum's lineage on a one-epoch liveness lapse. | Amend to **handover-gated rotation** (§3). Dissolves the lineage-break case; B3 then matches the verifier's own rule exactly. |
 | **F-3 ✔ (resolves the F decision)** | The v1 binary ships with **H set, X blank and `ModernPosParams` unset**, so it refuses H+1 and can never reach M; the mandatory **X-pin follow-up release** is the binary that runs the corridor and Modern PoS. | **F = M is achievable without putting `blst` into the v1 binary**: the finality rules, `blst`, and the finality parameters ride in the X-pin release together with the PoS parameters. No reservation is needed in v1 at all — v1 processes no modern-era block. Only constraint: the finality implementation must be complete before the X-pin release is cut (days after block H). |
 
@@ -25,14 +25,14 @@ Findings marked ⚠ require an owner ruling; ✔ = confirmed consistent; ✎ = e
 
 | Question | Answer | Status |
 |---|---|---|
-| Where exactly does `FINALITY_CERTIFICATE` live? | **Recommended v1 carrier:** a zero-value output of the **coinbase** with `scriptPubKey = OP_RETURN PUSH("B3F1" ‖ FinalizedBlock(120) ‖ bitmap(⌈n/8⌉) ‖ sig(96))`, minimal push, **at most one such output per coinbase**, in any modern-PoS block. It cannot live in the coinbase `scriptSig` (consensus cap 100 B, `bad-cb-length`, and M3 already defines that field) and must not live in `vchBlockSig` (trailing, **not committed by the block hash**). OP_RETURN data is never executed, so the 520-byte element limit does not apply; size is bounded by the block. | ⚠ ruling (F-1); magic `B3F1` to freeze |
-| Where does the BLS binding live? | Zero-value output `OP_RETURN PUSH("B3B1" ‖ validator_key ‖ bls_pubkey ‖ pop ‖ bip340_sig)` (240 B + magic) in any modern-era transaction from H+1. Recognition by magic + exact length, minimal push, exactly like `B3S1`; malformed claims are invalid, never ignored. | ⚠ ruling (F-1); magic `B3B1` to freeze |
+| Where exactly does `FINALITY_CERTIFICATE` live? | **A `FINALITY_CERT` (type 6) Policy Output in the coinbase** — ≤ 1 per block, `amount = 0`, native asset, commitment = `finality_digest`, params = `FinalizedBlock ‖ bitmap ‖ sig` (type-specific bound ≤ 1,240 B); unspendable cell like `BURN`; v1 wire realization is the policy carrier for unspendable cells, recognized and validated as a typed policy, never as free data. Not the coinbase `scriptSig` (100-byte cap, M3's field), not `vchBlockSig` (not committed by the block hash). See §7.4. | ⚠ ruling (F-1 revised) |
+| Where does the BLS binding live? | **In the STAKE output itself: `STAKE` policy v2**, params `validator_key(32) ‖ bls_pubkey(48)` (80 B), carrier `B3S2`, PoP verified at creation, valid from H+1 like v1. See §7.4. | ⚠ ruling (F-1 revised) |
 | Is it consensus-critical? | Yes from F (= M): certificate quorum + BLS validity ⇒ block validity; binding well-formedness + PoP + BIP340 ⇒ transaction validity. | ✔ |
 | Block hash before or after the certificate? | The certificate signs the **block_hash of an earlier checkpoint**; it is carried in a **later** block whose coinbase txid → merkle root → header hash commits to it, and the M3 block signature covers that hash. No circularity, no malleability of uncommitted data. | ✔ |
 | Can Ethereum reconstruct the signed object? | Yes: `finality_digest = TaggedHash("B3/FINALITY/V1", ModernChainDomain ‖ FinalizedBlock)`; `ModernChainDomain = H("B3/MODERN/CHAIN" ‖ genesis ‖ X)` is a constant stored in the verifier; `FinalizedBlock` is 120 fixed-width bytes; `block_hash` = the modern block index hash (opaque to Ethereum). | ✔ — the modern block hash must be stated as `CBlockIndex::GetBlockHash()` (header hash), ✎ |
 | Fixed-width / canonical? | All protocol fields fixed-width big-endian; bitmap length derived from `n`; minimal-push rule for carriers; no varints anywhere in signed objects. | ✔ (carrier encoding rule to be frozen) |
 | Domain availability | `ModernChainDomain` requires X pinned; bindings from H+1 and certificates from M both occur only in the X-pinned binary. | ✔ |
-| Relay | 240 B / ~1.3 KB OP_RETURN outputs exceed the 80-byte datacarrier **policy**; the binding transaction needs a standardness carve-in (as STAKE got); the coinbase never relays. Policy, not consensus. | ✎ engineering |
+| Relay | STAKE v2 outputs need the same standardness carve-in STAKE v1 got; the coinbase never relays. Policy, not consensus. | ✎ engineering |
 
 ---
 
@@ -41,13 +41,13 @@ Findings marked ⚠ require an owner ruling; ✔ = confirmed consistent; ✎ = e
 | | BIP340 `validator_key` | BLS12-381 `bls_pubkey` |
 |---|---|---|
 | Identity | the validator's consensus identity: carried in every STAKE output (`B3S1`, 32 B opaque, interpreted as x-only by M3 — confirmed `pos_v1.h:173`), aggregated per key | none by itself; always bound **to** a `validator_key` |
-| Ownership / control | **funds** are controlled by the STAKE output's owner-script suffix (spend = unstake); **block production** is controlled by whoever holds the validator secret — these may differ (operator model) | held by the validator operator; binding is authorized by the `validator_key` (BIP340 signature), not by the fund owner |
-| Authorizes | blocks (M3), bindings (`B3/FINALITY/BIND/V1`) | finality digests only (`B3/FINALITY/V1`), its own PoP; later any cross-chain proof of the same certificates |
+| Ownership / control | **funds** are controlled by the STAKE output's owner-script suffix (spend = unstake); **block production** is controlled by whoever holds the validator secret — these may differ (operator model) | declared by the **staker** in the STAKE v2 output, exactly as the validator key is declared in v1 (§7.4); PoP proves the declared key is real |
+| Authorizes | blocks (M3) | finality digests only (`B3/FINALITY/V1`), its own PoP; later any cross-chain proof of the same certificates |
 | Derivation | independent secrets; **never derived from each other** (spec §1) | ✔ |
-| Rotation | re-stake (M4, 20-block maturity) | rebind (latest wins); effective at the **next snapshot** — with snapshot-at-epoch-start (§3) a rebind in epoch `e` joins `Set_{e+2}` (≤ 2 epochs lag) | ✔, lag to document ✎ |
-| Proof of possession | mandatory in the binding (PoP DST); one BLS key bound to one validator at a time | ✔ |
-| Activation timing | binding valid from H+1 (corridor); `Set_0 = Snapshot(M−1)`; STAKE maturity (20) and binding must both hold at the snapshot | ✔ |
-| Note ⚠ | Because binding authority = validator secret (operator), finality voting power follows the block-production operator, not the fund owner — same trust boundary as block production. Confirm this is intended. | ⚠ confirm |
+| Rotation | re-stake (M4, 20-block maturity) | re-stake as v2 with the new key (M4); effective at the **next snapshot** — with snapshot-at-epoch-start (§3) a change in epoch `e` joins `Set_{e+2}` (≤ 2 epochs lag) | ✔, lag to document ✎ |
+| Proof of possession | mandatory in the STAKE v2 carrier (PoP DST), verified at creation; one finality key per validator key by the largest-weight rule (§7.4) | ✔ |
+| Activation timing | STAKE v2 valid from H+1 (corridor); `Set_0 = Snapshot(M−1)` over ACTIVE v2 outputs (20-block maturity) | ✔ |
+| Note | Finality voting power follows the BLS key the **staker** declares, exactly as block production follows the validator key the staker declares — one trust model, no new authority. | ✔ |
 
 ---
 
@@ -137,20 +137,20 @@ model, B3 signing and carriers, verifier state machine. ✔
 
 ### 7.2 Required PoS decisions (before coding)
 
-1. **F-1 carrier ruling**: `B3F1` coinbase OP_RETURN certificate + `B3B1` binding output (recommended) — or wait for the modern codec (not available for v1).
+1. **F-1 carrier ruling (revised §7.4)**: `STAKE` v2 (`vk ‖ bls_pk`, PoP at creation) + new policy type `FINALITY_CERT = 6` (coinbase cell, commitment = digest, type-specific params bound) — or wait for the modern codec (not available for the X-pin release).
 2. **F-2 handover-gated rotation** + `MAX_EPOCH_EXTENSION` (7·E) replacing `MAX_CARRY_OVER`.
 3. **F = M in the X-pin release** (confirm; no `blst` in v1).
 4. Certificate epoch window `{current, current−1}`.
 5. Binding required for block eligibility from F (W_fin = W) — yes/no.
-6. Binding authority = validator secret (operator) — confirm.
-7. Parameters: `E` 1,440; `CHECKPOINT_INTERVAL`/`DEPTH` 60/20; `MIN_FINALITY_SET` 4; `MIN_FINALITY_WEIGHT`; `MAX_EPOCH_LAG` 30 d (Ethereum); standardness carve-in for `B3B1`.
+6. Finality key declared by the staker in STAKE v2 (largest-weight rule on conflict) — confirm.
+7. Parameters: `E` 1,440; `CHECKPOINT_INTERVAL`/`DEPTH` 60/20; `MIN_FINALITY_SET` 4; `MIN_FINALITY_WEIGHT`; `MAX_EPOCH_LAG` 30 d (Ethereum); standardness carve-in for STAKE v2.
 
 ### 7.3 Fields frozen before coding (byte-exact)
 
-Tags `"B3/FINALITY/V1"`, `"B3/FINALITY/BIND/V1"`; carrier magics `B3F1`, `B3B1` + minimal-push
-rule; `ValidatorSetHeader` 126 B; leaf preimage 60 B; `SET_TREE_DEPTH` 13; `FinalizedBlock`
+Tag `"B3/FINALITY/V1"`; policy `STAKE` v2 (carrier `B3S2`, params 80 B) and `FINALITY_CERT = 6`
+(commitment = digest, params bound); `ValidatorSetHeader` 126 B; leaf preimage 60 B; `SET_TREE_DEPTH` 13; `FinalizedBlock`
 120 B; bitmap LSB-first; certificate = `fb ‖ bitmap ‖ sig96`; binding payload 240 B;
-ciphersuite + DSTs; `ModernChainDomain` definition; quorum `floor(2W/3)+1`; weight unit
+binding = STAKE v2 carrier (no separate 240-B action); ciphersuite + DSTs; `ModernChainDomain` definition; quorum `floor(2W/3)+1`; weight unit
 `/10^9`; withdrawal leaf 164 B, depth 32, zero-hash chain; `Set_0 = Snapshot(M−1)`;
 snapshot-at-epoch-start; gated rotation; checkpoint rule; `finality_digest`.
 
