@@ -33,7 +33,8 @@ Owner rulings incorporated (2026-08-20):
   `FinalizedBlock` / `Certificate` layouts, and the finality pin. Cryptographic
   enforcement begins at height **F** (F = M targeted; otherwise pinned by the
   mandatory follow-up release); bridge use is a later flag A3 ≥ F. Full
-  specification: [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md).
+  specification: [b3-cross-chain-finality-v1.md](b3-cross-chain-finality-v1.md)
+  (normative) and [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md) (rationale).
   Block production (M1–M6) is unchanged; §10's "committee/finality gadgets"
   entry is superseded by this ruling.
 - **M6** — a block reward can never directly create active STAKE: the
