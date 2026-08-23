@@ -451,6 +451,24 @@ if(BUILD_BENCH)
   add_subdirectory(bench)
 endif()
 
+if(B3_FINALITY_BENCH)
+  # Benchmark-only (owner ruling 2026-08-23): vendored blst + harness. Not a
+  # dependency of any node, wallet, test or consensus target.
+  include(../cmake/blst.cmake)
+  add_b3_blst()
+  add_executable(b3-finality-bench bench/b3_finality_bench.cpp)
+  target_link_libraries(b3-finality-bench
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+  )
+endif()
+
 if(BUILD_TESTS)
   add_subdirectory(test)
 endif()

@@ -182,6 +182,10 @@ if(BUILD_GUI)
 endif()
 
 option(BUILD_BENCH "Build bench_bitcoin executable." OFF)
+option(B3_FINALITY_BENCH "Build the B3 finality benchmark harness (vendored blst, BENCHMARK-ONLY; never linked into node/wallet/tests)." OFF)
+if(B3_FINALITY_BENCH)
+  enable_language(ASM)
+endif()
 option(BUILD_FUZZ_BINARY "Build fuzz binary." OFF)
 option(BUILD_FOR_FUZZING "Build for fuzzing. Enabling this will disable all other targets and override BUILD_FUZZ_BINARY." OFF)
 
