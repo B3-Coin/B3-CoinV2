@@ -37,6 +37,7 @@
 #include <modern/fn.h>
 #include <modern/metadata_cell.h>
 #include <modern/mpa.h>
+#include <modern/payload_root.h>
 #include <node/finality_binding_index.h>
 #include <modern/pos.h>
 #include <modern/pos_v1.h>
@@ -5497,6 +5498,11 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
                                          strprintf("%s in transaction %s", bind_error, tx->GetHash().ToString()));
                 }
             }
+        }
+        // MODERN_PAYLOAD_ROOT (Path B): every MPA in the block is committed into
+        // the block hash through exactly one coinbase root cell; no MPA => no cell.
+        if (std::string root_error; !modern::CheckBlockPayloadRoot(block, root_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-payload-root", root_error);
         }
         // Phase-exact trailing-signature shape: corridor blocks earned their
         // place by PoW and must carry no signature; with the modern-PoS rule

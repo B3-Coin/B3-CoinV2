@@ -88,6 +88,7 @@ add_executable(test_bitcoin
   finality_key_binding_tests.cpp
   mpa_tests.cpp
   ptxid_tests.cpp
+  payload_root_tests.cpp
   modern_pos_tests.cpp
   miniminer_tests.cpp
   miniscript_tests.cpp

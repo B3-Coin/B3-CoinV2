@@ -19,6 +19,7 @@
 #include <key.h>
 #include <logging.h>
 #include <modern/fn.h>
+#include <modern/payload_root.h>
 #include <modern/pos_v1.h>
 #include <node/stake_tracker.h>
 #include <node/context.h>
@@ -292,6 +293,24 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     coinbaseTx.nLockTime = static_cast<uint32_t>(nHeight - 1);
     coinbase_tx.lock_time = coinbaseTx.nLockTime;
 
+    // MODERN_PAYLOAD_ROOT (plan Commit 7): when the candidate block carries any
+    // Modern Payload Area, the coinbase must commit to all sections with exactly
+    // one root cell. The root depends only on the transactions' MPA sections and
+    // positions (the coinbase's own section is empty here), never on the coinbase
+    // outputs, so it can be computed before the cell is appended. With production
+    // settings no MPA-bearing transaction reaches the mempool, so this is a no-op
+    // and block assembly is unchanged.
+    if (b3_modern) {
+        bool any_mpa{false};
+        for (size_t i = 1; i < pblock->vtx.size(); ++i) {
+            if (pblock->vtx[i] && pblock->vtx[i]->HasMpa()) { any_mpa = true; break; }
+        }
+        if (any_mpa) {
+            CBlock probe{*pblock};
+            probe.vtx[0] = MakeTransactionRef(CTransaction{coinbaseTx});
+            coinbaseTx.vout.emplace_back(0, modern::MakePayloadRootCellScript(modern::ComputePayloadRoot(probe)));
+        }
+    }
     pblock->vtx[0] = MakeTransactionRef(std::move(coinbaseTx));
     m_chainstate.m_chainman.GenerateCoinbaseCommitment(*pblock, pindexPrev);
 

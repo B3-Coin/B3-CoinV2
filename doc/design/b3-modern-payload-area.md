@@ -61,7 +61,7 @@ only, ≤ 1 per block) and type 5 `FINALITY_KEY_EVIDENCE` (bound to the `FINALIT
 for i in 0 .. n−1, n = block.vtx.size(), in block order (i = 0 is the coinbase):
   section_hash_i = TaggedHash("B3/MPA/SECTION/V1", canonical PayloadSection bytes of tx i)   if tx i has an MPA
                  = 0x00…00 (32 zero bytes)                                                   otherwise
-  leaf_i         = TaggedHash("B3/MPA/LEAF/V1", uint32 i (LE, standard serializer) ‖ section_hash_i)
+  leaf_i         = TaggedHash("B3/MPA/LEAF/V1", uint32 i BIG-ENDIAN (4 bytes, explicit; never the host serializer) ‖ section_hash_i)
 
 payload_root = ComputeMerkleRoot([leaf_0, …, leaf_{n−1}])     // exactly the algorithm of hashMerkleRoot
 ```
@@ -76,8 +76,8 @@ Properties:
   needs equal leaves, which is impossible because every leaf embeds a distinct `i`. The
   block's transaction-tree `mutated` check rejects a duplicated tail independently.
 - **Canonical inputs.** The section bytes are canonical (strict codec: one encoding per
-  logical content), the tags are constants, the serializer is the standard one, the order
-  is block order. `payload_root` is a deterministic function of the block's transaction
+  logical content), the tags are constants, the index is an explicit 4-byte big-endian
+  integer (frozen; implemented and vector-pinned in plan Commit 7), the order is block order. `payload_root` is a deterministic function of the block's transaction
   list.
 
 ---

@@ -163,7 +163,8 @@ struct ModernPosSetup : public ChainTestingSetup {
     }
 
     CBlock BuildCorridor(const CBlockIndex* prev, std::vector<CMutableTransaction> txs,
-                         const int64_t time_delta = 60, const uint32_t bits = EASY_BITS)
+                         const int64_t time_delta = 60, const uint32_t bits = EASY_BITS,
+                         std::vector<CTxOut> extra_coinbase_outputs = {})
     {
         CMutableTransaction coinbase;
         coinbase.version = 2;
@@ -171,6 +172,7 @@ struct ModernPosSetup : public ChainTestingSetup {
         coinbase.vin[0].prevout.SetNull();
         coinbase.vin[0].scriptSig = CScript() << CScriptNum{prev->nHeight + 1} << CScriptNum{7};
         coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+        for (CTxOut& out : extra_coinbase_outputs) coinbase.vout.push_back(std::move(out));
         CBlock block;
         block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
         block.hashPrevBlock = prev->GetBlockHash();

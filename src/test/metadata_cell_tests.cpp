@@ -263,10 +263,11 @@ BOOST_FIXTURE_TEST_CASE(connect_disconnect_symmetry_and_exclusion, ModernPosSetu
     spend.vin.resize(1);
     spend.vin[0].prevout = COutPoint{fund_txid, 0};
     spend.vout.emplace_back(fund_value - 100, CScript() << OP_TRUE);
-    // A MODERN_PAYLOAD_ROOT-shaped cell (type 8): a FINALITY_KEY cell would now
-    // also require its MPA evidence (Commit 5), which is exercised in
-    // finality_key_binding_tests; this test is about the cell mechanics alone.
-    spend.vout.emplace_back(0, Cell(8, 1, 0));
+    // A FINALITY_CERT-shaped cell (type 6, no type-specific rule until Commit 10):
+    // a FINALITY_KEY cell requires its MPA evidence (Commit 5) and a
+    // MODERN_PAYLOAD_ROOT cell is coinbase-only/MPA-bound (Commit 7) — both are
+    // exercised in their own suites; this test is about the cell mechanics alone.
+    spend.vout.emplace_back(0, Cell(6, 1, 16));
     const Txid spend_txid{CTransaction{spend}.GetHash()};
 
     // 1. Not activated: the claiming output makes the block invalid; tip holds.
