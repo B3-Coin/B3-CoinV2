@@ -7,8 +7,8 @@ the **Modern Payload Area** ([b3-modern-payload-area.md](b3-modern-payload-area.
 Path B, `MODERN_PAYLOAD_ROOT = 8`); the BLS binding is **identity-authorized** (BIP340 by
 `validator_key` + separate PoP, sequence-controlled); validator-set rotation is
 **handover-gated**; F = M in the X-pin Modern-PoS release. Layouts, hashes, verification
-algorithms and state machines are frozen as `V1`; numeric parameters in §9 carry their own
-status. Rationale and attack analysis: [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md);
+algorithms and state machines are frozen as `V1`; numeric parameters in §9 are **FROZEN by owner ruling 2026-08-23** except the
+Ethereum-side `MAX_EPOCH_LAG` (A3). Rationale and attack analysis: [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md);
 compatibility audit: [b3-finality-compatibility-report.md](b3-finality-compatibility-report.md);
 Modern PoS amendment: ruling M7 in [b3-modern-pos-spec.md](b3-modern-pos-spec.md).
 Deposits and the bridge vault are outside this document. Implementation not yet authorized.**
@@ -343,16 +343,20 @@ state machine (§5.2) are unchanged; `prover` is the single governance-changeabl
 | `WITHDRAWAL_TREE_DEPTH` | 32 | FINAL (layout) |
 | `ruleset_version` 1 quorum | `floor(2W/3) + 1` by weight | FINAL |
 | Weight unit | whole modern B3 (`/10^9`) | FINAL |
-| `E` (epoch blocks) | 1,440 | proposed |
-| `CHECKPOINT_INTERVAL` / `CHECKPOINT_DEPTH` | 60 / 20 | proposed |
-| `MIN_FINALITY_SET` / `MIN_FINALITY_WEIGHT` / `MAX_EPOCH_EXTENSION` | 4 / owner / 7·E | proposed |
+| `E` (epoch blocks) | **1,440** | **FINAL (owner ruling 2026-08-23)** |
+| `CHECKPOINT_INTERVAL` / `CHECKPOINT_DEPTH` | **10 / 12** | **FINAL (owner ruling 2026-08-23)** |
+| `MIN_FINALITY_SET` / `MAX_EPOCH_EXTENSION` | **4 / 7·E = 10,080** | **FINAL** — `MIN_FINALITY_SET = 4` is the Modern PoS chain **bootstrap floor only**; it is NOT a bridge security threshold (bridge validator/economic-security thresholds are an A3 decision) |
+| `MIN_FINALITY_WEIGHT` | none in V1 (the floor is `MIN_FINALITY_SET`; stake economics are the min-stake rule) | FINAL (no separate weight floor) |
+| `FINALITY_CERTIFICATE` `verify_cost` / `FINALITY_KEY_EVIDENCE` `verify_cost` | **2,000 / 700** units | **FINAL** |
+| `MAX_BLOCK_PAYLOAD_COST` / `MAX_TX_PAYLOAD_COST` / `COST_TO_VBYTES` | **120,000 / 12,000 / 1** | **FINAL** |
+| MPA record max / section max / weight factor | **32,768 B / 65,536 B / ×4** | **FINAL** (MPA doc §8–§10) |
 | Certificate epoch window | `{current, current − 1}` with the §4 monotonicity/set-hash/epoch-relation conditions | FINAL |
 | Policy numbers 6 / 7 / 8 | `FINALITY_CERT` / `FINALITY_KEY` / `MODERN_PAYLOAD_ROOT` | **FINAL, never renumbered** |
 | `FINALITY_CERTIFICATE` record max / `FINALITY_KEY_EVIDENCE` size | 1,240 B / 244 B | FINAL (layout) |
-| `MAX_EPOCH_LAG` | 30 days | proposed |
+| `MAX_EPOCH_LAG` (Ethereum verifier) | 30 days | proposed — A3 (bridge) decision, out of scope for Modern PoS V1 |
 | `F` | **= M**, in the X-pin Modern-PoS release | FINAL |
 | Gated rotation; epoch extension on failure | rule of §4 | FINAL |
 | Binding mandatory for block eligibility from F | yes | FINAL |
 | `FINALITY_KEY` semantics (seq-controlled, `0^48` = revoke, one active validator per BLS key) | §1.1 | FINAL |
 | `A3` | later | owner |
-| Binding required for block eligibility from F | yes | proposed |
+| Binding required for block eligibility from F | yes | FINAL |

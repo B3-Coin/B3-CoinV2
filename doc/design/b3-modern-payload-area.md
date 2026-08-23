@@ -5,8 +5,7 @@ accepted; the permanent `policy_params ≤ 80 B` invariant stays; commitment pat
 B3-native **Path B** (`MODERN_PAYLOAD_ROOT` coinbase cell) — **not** the SegWit/witness-
 reserved-value path, and SegWit is **not** a dependency of the MPA (its activation is a
 separate modern-era audit question, untouched here); a full-payload transaction identifier
-is specified without SegWit; the resource numbers are **not frozen** — worst-case effects
-are reported first (§6). Revision 1's Path A text is withdrawn. The protocol amendment
+is specified without SegWit; the resource numbers were measured first (§6) and are now **FROZEN** (§9). Revision 1's Path A text is withdrawn. The protocol amendment
 (§7) is applied only after the non-circularity/determinism proof (§4). No implementation.**
 
 Model lock (owner, 2026-08-23): `policy_params ≤ 80 B` = small typed live/derived state,
@@ -184,8 +183,8 @@ Replaces revision 1 §2 "commitment" and all Path-A text:
 4. **Fail-closed rules:** as revision 1 §4, plus: `MODERN_PAYLOAD_ROOT` presence/uniqueness
    /coinbase-only/root-match checks; a record may not reference its own transaction's
    identity; per-block verification-cost budget checked before cryptography.
-5. **Resource numbers:** OPEN — byte ceilings, MPA weight factor and the verification-cost
-   budget are frozen together (§6).
+5. **Resource numbers:** FROZEN (§9) — byte ceilings, MPA weight factor ×4 and the
+   verification-cost budget.
 6. **Reuse:** unchanged — a cell holds a 32-B commitment (+ ≤ 80-B typed params) and points
    at a bounded, priced record; ZK proofs, light-client updates, bridge/SPV proofs are new
    record types behind existing or new small cells; `MAX_POLICY_PARAMS_SIZE` untouched.
@@ -218,7 +217,7 @@ Replaces revision 1 §2 "commitment" and all Path-A text:
    any implementation; the C++ full-hash machinery may be reused internally.
 5. **Policy numbers frozen:** `6 FINALITY_CERT`, `7 FINALITY_KEY`, `8 MODERN_PAYLOAD_ROOT`.
    Never renumbered or reused (contract §23 list updated).
-6. **Byte ceilings not frozen.** The *framework* is frozen: per-type maximum ≤ global
+6. **Byte ceilings** — framework frozen here; numbers frozen in §9 after the benchmark: per-type maximum ≤ global
    record ceiling; per-tx section cap; per-tx / per-block record counts; per-type per-block
    counts; weight ×4; verification-cost budget. The numeric values of the ceilings, the
    cost budget and per-type costs are chosen only after benchmarking actual worst-case
@@ -226,9 +225,25 @@ Replaces revision 1 §2 "commitment" and all Path-A text:
    `blst`). The finality types' own maxima (1,240 / 244) and the certificate count (≤ 1 per
    block) are layout facts and stand.
 
-## 9. Rulings still needed
+## 9. Constants frozen (owner ruling 2026-08-23, from measured data)
 
-- Numeric limits after benchmark: global record ceiling, section cap, `MAX_TX_PAYLOAD_COST`,
-  `MAX_BLOCK_PAYLOAD_COST`, per-type `verify_cost` values, `COST_TO_VBYTES`.
+| Constant | Value | |
+|---|---|---|
+| `MAX_PAYLOAD_RECORD_SIZE` | **32,768 B** | global ceiling; per-type maxima ≤ this |
+| `MAX_PAYLOAD_SECTION_SIZE` | **65,536 B** | per transaction |
+| `MAX_PAYLOAD_RECORDS_PER_TX` | 64 | ratified earlier |
+| MPA weight factor | **×4** | `weight += 3 × mpa_size` on top of the full-form size |
+| `verify_cost(4 FINALITY_CERTIFICATE, v1)` | **2,000** | 1 unit ≈ 1 µs reference (portable blst, M4 Max) |
+| `verify_cost(5 FINALITY_KEY_EVIDENCE, v1)` | **700** | |
+| `MAX_BLOCK_PAYLOAD_COST` | **120,000** | checked before cryptography |
+| `MAX_TX_PAYLOAD_COST` | **12,000** | checked before cryptography |
+| `COST_TO_VBYTES` | **1** | relay `vsize = max(weight/4, Σ cost × 1)` |
+| `FINALITY_CERTIFICATE` record max / per block | 1,240 B / 1 | layout |
+| `FINALITY_KEY_EVIDENCE` size | 244 B | layout |
 
+Measurement record: [b3-finality-benchmark-2026-08-23.md](b3-finality-benchmark-2026-08-23.md).
+Future `(type, version)` rows declare their own cost from the same unit definition.
 
+## 10. Rulings still needed
+
+- None for the MPA itself. (SegWit activation remains a separate modern-era audit item; it is not an MPA dependency.)

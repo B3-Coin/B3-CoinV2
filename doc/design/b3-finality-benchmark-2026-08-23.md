@@ -134,7 +134,11 @@ valid x); malformed-signature decoding is the representative fast-reject path.
 
 ---
 
-## 4. Remaining owner decisions (unchanged list, now with data)
+## 4. Outcome
+
+**All recommended constants were accepted and FROZEN by owner ruling 2026-08-23** (E = 1,440, I/D = 10/12, MAX_EPOCH_EXTENSION = 7·E, MIN_FINALITY_SET = 4 as chain bootstrap floor only, costs 700 / 2,000, budget 120,000 / 12,000, COST_TO_VBYTES = 1, ceilings 32,768 / 65,536, weight ×4). Historical list below.
+
+### 4.1 (historical) Remaining owner decisions at report time
 
 `CHECKPOINT_INTERVAL` / `CHECKPOINT_DEPTH` (10 / 12 recommended), `E` (1,440),
 `MIN_FINALITY_SET` (4), `MIN_FINALITY_WEIGHT`, `MAX_EPOCH_EXTENSION` (7·E); cost budget

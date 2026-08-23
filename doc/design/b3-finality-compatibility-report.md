@@ -267,6 +267,9 @@ the payload position, and whether `SegwitHeight` is to be pinned for the modern 
 
 ## 7.6 Status after the 2026-08-23 rulings
 
+**Constants frozen 2026-08-23** (E 1,440; I/D 10/12; MAX_EPOCH_EXTENSION 7·E; MIN_FINALITY_SET 4 = bootstrap floor only; cost budget 120,000 / 12,000, costs 2,000 / 700, 1 vbyte per unit; MPA 32,768 / 65,536 / ×4). §7.2 items 1–7 are thereby all resolved except the SegWit audit item (separate). Implementation plan: [b3-modern-pos-v1-implementation-plan.md](b3-modern-pos-v1-implementation-plan.md).
+
+
 F-1 resolved (cells 6/7/8 + MPA Path B, frozen numbers), F-2 adopted in the normative spec as the owner's handover-gated requirement (parameters open), F-3 adopted (F = M in the X-pin release). Weight ×4, cost budget, relay vsize and `ptxid` ruled; byte ceilings open pending benchmark; SegWit activation remains a separate modern-era audit item, not a finality dependency.
 
 ## 8. Verdict
