@@ -5,6 +5,7 @@
 #define B3COIN_NODE_VALIDATOR_SET_H
 
 #include <consensus/amount.h>
+#include <modern/finality_certificate.h>
 #include <modern/finality_key.h>
 #include <modern/finality_types.h>
 #include <node/finality_binding_index.h>
@@ -76,6 +77,8 @@ public:
     uint64_t QuorumWeight() const { return m_header.quorum_weight; }
     //! Index of a validator in this set, if a member.
     std::optional<uint32_t> IndexOf(const modern::ValidatorKeyBytes& validator_key) const;
+    //! The verifier's view (keys as PoP-verified at binding time, weights, quorum).
+    modern::ValidatorSetView View() const;
 
     friend bool operator==(const ValidatorSetSnapshot& a, const ValidatorSetSnapshot& b)
     {

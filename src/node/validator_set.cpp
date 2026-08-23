@@ -66,6 +66,21 @@ std::optional<ValidatorSetSnapshot> ValidatorSetSnapshot::BuildAt(const uint64_t
     return Build(epoch, stakes.ActiveWeights(height, total), bindings);
 }
 
+modern::ValidatorSetView ValidatorSetSnapshot::View() const
+{
+    modern::ValidatorSetView view;
+    view.validator_count = m_header.validator_count;
+    view.quorum_weight = m_header.quorum_weight;
+    view.keys.reserve(m_members.size());
+    view.weights.reserve(m_members.size());
+    for (const auto& m : m_members) {
+        // Provenance: member keys come from bindings whose PoP passed consensus.
+        view.keys.push_back(bls::VerifiedPublicKey::TrustedFromValidatedChain(*bls::PublicKey::Decode(m.bls_pubkey)));
+        view.weights.push_back(m.weight);
+    }
+    return view;
+}
+
 std::optional<uint32_t> ValidatorSetSnapshot::IndexOf(const modern::ValidatorKeyBytes& validator_key) const
 {
     const auto it{std::lower_bound(m_members.begin(), m_members.end(), validator_key,
