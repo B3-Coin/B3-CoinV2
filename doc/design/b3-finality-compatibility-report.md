@@ -25,7 +25,7 @@ Findings marked ⚠ require an owner ruling; ✔ = confirmed consistent; ✎ = e
 
 | Question | Answer | Status |
 |---|---|---|
-| Where exactly does `FINALITY_CERTIFICATE` live? | **A `FINALITY_CERT` (type 6) Policy Output in the coinbase** — ≤ 1 per block, `amount = 0`, native asset, commitment = `finality_digest`, params = `FinalizedBlock ‖ bitmap ‖ sig` (type-specific bound ≤ 1,240 B); unspendable cell like `BURN`; v1 wire realization is the policy carrier for unspendable cells, recognized and validated as a typed policy, never as free data. Not the coinbase `scriptSig` (100-byte cap, M3's field), not `vchBlockSig` (not committed by the block hash). See §7.4. | ⚠ ruling (F-1 revised) |
+| Where exactly does `FINALITY_CERTIFICATE` live? | **A `FINALITY_CERT` (type 6) Policy Output in the coinbase** — ≤ 1 per block, `amount = 0`, native asset, commitment = `finality_digest`, params = `FinalizedBlock ‖ bitmap ‖ sig` (type-specific bound ≤ 1,232 B); unspendable cell like `BURN`; v1 wire realization is the policy carrier for unspendable cells, recognized and validated as a typed policy, never as free data. Not the coinbase `scriptSig` (100-byte cap, M3's field), not `vchBlockSig` (not committed by the block hash). See §7.4. | ⚠ ruling (F-1 revised) |
 | Where does the BLS binding live? | **In the STAKE output itself: `STAKE` policy v2**, params `validator_key(32) ‖ bls_pubkey(48)` (80 B), carrier `B3S2`, PoP verified at creation, valid from H+1 like v1. See §7.4. | ⚠ ruling (F-1 revised) |
 | Is it consensus-critical? | Yes from F (= M): certificate quorum + BLS validity ⇒ block validity; binding well-formedness + PoP + BIP340 ⇒ transaction validity. | ✔ |
 | Block hash before or after the certificate? | The certificate signs the **block_hash of an earlier checkpoint**; it is carried in a **later** block whose coinbase txid → merkle root → header hash commits to it, and the M3 block signature covers that hash. No circularity, no malleability of uncommitted data. | ✔ |
@@ -114,7 +114,7 @@ Confirmations under the amended rule:
 
 `IB3FinalityProver.verify(chainDomain, fb, setHash, set, proof)`; ZK public inputs
 `(chainDomain, keccak(fb), setHash)`, statement = spec §5.3 A–F. Unchanged by a prover
-swap: `FinalizedBlock` (120 B), withdrawal tree (depth 32, leaf, index), asset/bridge
+swap: `FinalizedBlock` (112 B), withdrawal tree (depth 32, leaf, index), asset/bridge
 model, B3 signing and carriers, verifier state machine. ✔
 
 ---
@@ -148,8 +148,8 @@ model, B3 signing and carriers, verifier state machine. ✔
 ### 7.3 Fields frozen before coding (byte-exact)
 
 Tag `"B3/FINALITY/V1"`; policy `STAKE` v2 (carrier `B3S2`, params 80 B) and `FINALITY_CERT = 6`
-(commitment = digest, params bound); `ValidatorSetHeader` 126 B; leaf preimage 60 B; `SET_TREE_DEPTH` 13; `FinalizedBlock`
-120 B; bitmap LSB-first; certificate = `fb ‖ bitmap ‖ sig96`; binding payload 240 B;
+(commitment = digest, params bound); `ValidatorSetHeader` 110 B; leaf preimage 60 B; `SET_TREE_DEPTH` 13; `FinalizedBlock`
+112 B; bitmap LSB-first; certificate = `fb ‖ bitmap ‖ sig96`; binding payload 240 B;
 binding = STAKE v2 carrier (no separate 240-B action); ciphersuite + DSTs; `ModernChainDomain` definition; quorum `floor(2W/3)+1`; weight unit
 `/10^9`; withdrawal leaf 164 B, depth 32, zero-hash chain; `Set_0 = Snapshot(M−1)`;
 snapshot-at-epoch-start; gated rotation; checkpoint rule; `finality_digest`.
@@ -187,7 +187,7 @@ existing policy. Classification decides the carrier:
   proof/creation-action area — not live and not buildable for the X-pin release. Smallest
   new policy type: **`FINALITY_CERT = 6`** (next free number; never renumbered):
   coinbase-only, ≤ 1 per block, `amount = 0`, native asset, **commitment = `finality_digest`**,
-  params = `FinalizedBlock ‖ bitmap ‖ sig` under a type-specific bound (≤ 1,240 B; the
+  params = `FinalizedBlock ‖ bitmap ‖ sig` under a type-specific bound (≤ 1,232 B; the
   generic 80-byte cap is unchanged for all other policies), unspendable by definition like
   `BURN`; activated from F. Precedent for block metadata in a coinbase cell: BIP34 height,
   BIP141 witness commitment. When the codec exists the certificate becomes `FINALITY_CERT v2`
@@ -212,7 +212,7 @@ always on for execution), `ContextualCheckBlock` (the coinbase witness is pinned
 `MAX_POLICY_PARAMS_SIZE = 80` stays global and untouched. The cell is bounded typed state:
 `FINALITY_CERT = 6`, v1, `amount = 0`, native asset, **commitment = `finality_digest`**,
 **params = `epoch u64 ‖ height u64` (16 B)**. The variable certificate bytes
-(`FinalizedBlock ‖ bitmap ‖ sig`, ≤ 1,240 B) are a **creation-authorization payload** —
+(`FinalizedBlock ‖ bitmap ‖ sig`, ≤ 1,232 B) are a **creation-authorization payload** —
 in the model, creation action type 4 (reserved), payload ≤ 4,000 B, bound to the cell by
 `commitment == digest(payload)`. The model-pure segregated home (proof/creation-action area)
 has no outer carrier today, and the only segregated area Core offers — the witness — is

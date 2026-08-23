@@ -52,6 +52,17 @@ inline constexpr uint16_t LEGACY_FN_ISSUANCE_ACTION_VERSION_V1{1};
 //! immutable genesis record (modern/asset.h AssetGenesisV1), whose
 //! commitment is bound into the AssetId. Owner ruling 2026-08-22.
 inline constexpr uint16_t CREATION_ACTION_ASSET_ISSUANCE{3};
+//! RESERVED numbers (owner-frozen 2026-08-23) for the Modern Payload Area
+//! record types of the finality gadget: 4 = FINALITY_CERTIFICATE (the BLS
+//! certificate payload bound to a FINALITY_CERT cell), 5 =
+//! FINALITY_KEY_EVIDENCE (BIP340 binding authorization + BLS proof of
+//! possession bound to a FINALITY_KEY cell). NOT registered here: the
+//! registry below still rejects them, and when the MPA codec learns to
+//! decode them (implementation plan, Commit 5) "known but not activated"
+//! remains INVALID until the activation height — recognition never implies
+//! activation.
+inline constexpr uint16_t CREATION_ACTION_FINALITY_CERTIFICATE{4};
+inline constexpr uint16_t CREATION_ACTION_FINALITY_KEY_EVIDENCE{5};
 inline constexpr uint16_t ASSET_ISSUANCE_ACTION_VERSION_V1{1};
 
 //! Whether a (type, version) pair is a registered creation action.

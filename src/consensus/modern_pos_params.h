@@ -64,13 +64,33 @@ struct ModernPosParams {
     //! interval becomes final for online nodes. Fixtures may override with
     //! small scaffolding values; unset disables the horizon.
     std::optional<int> reorg_horizon{1440};
+    //! RATIFIED 2026-08-23 (ruling M7, frozen constants): BLS finality gadget
+    //! schedule. E = validator-set epoch length in modern-PoS blocks;
+    //! checkpoints every `checkpoint_interval` blocks, signed once
+    //! `checkpoint_depth` deep; a certificate-gated epoch may extend by at
+    //! most `max_epoch_extension` blocks before the finality lineage is
+    //! declared broken; `min_finality_set` is the chain BOOTSTRAP floor
+    //! only (never a bridge security threshold). Fixtures may scale these
+    //! down exactly as they scale reorg_horizon; real chainparams ship
+    //! the whole block unset, so nothing here is live before the X-pin
+    //! release pins it. Declarations only at this stage: no rule in the
+    //! tree reads them yet (implementation plan, Commit 1).
+    int finality_epoch_blocks{1440};
+    int checkpoint_interval{10};
+    int checkpoint_depth{12};
+    int max_epoch_extension{7 * 1440};
+    int min_finality_set{4};
 
     //! Structural sanity of a configured block (not economics).
     constexpr bool Valid() const
     {
         return block_interval_seconds > 0 && round_seconds > 0 && f0_num > 0 && f0_den > 0 &&
                max_future_seconds >= 0 && reward >= 0 &&
-               (!reorg_horizon || *reorg_horizon > 0);
+               (!reorg_horizon || *reorg_horizon > 0) &&
+               finality_epoch_blocks > 0 && checkpoint_interval > 0 &&
+               checkpoint_interval <= finality_epoch_blocks &&
+               checkpoint_depth >= 0 && checkpoint_depth < finality_epoch_blocks &&
+               max_epoch_extension >= finality_epoch_blocks && min_finality_set >= 1;
     }
 };
 

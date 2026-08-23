@@ -239,6 +239,14 @@ inline ProofCheck VerifyTransitionProof(const ModernOutput& prev_output,
         // with the FN lifecycle validation commits.
         if (proof.payload.empty()) return ProofCheck::MALFORMED;
         return ProofCheck::OK;
+    case PolicyType::FINALITY_CERT:
+    case PolicyType::FINALITY_KEY:
+    case PolicyType::MODERN_PAYLOAD_ROOT:
+        // Metadata cells (declared 2026-08-23, not activated): zero-value,
+        // never in the UTXO set, no spend path — there is no proof that can
+        // ever spend one. UNREACHABLE while IsActivatedPolicy fails closed;
+        // explicit so the switch stays exhaustive.
+        return ProofCheck::UNSPENDABLE;
     }
     return ProofCheck::UNKNOWN_POLICY;
 }

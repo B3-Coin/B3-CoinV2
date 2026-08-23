@@ -36,7 +36,7 @@ Ethereum's trust root is the **modern-genesis validator set**, not a mid-chain c
 ## 1. Objects (frozen V1 layouts — keccak where Ethereum recomputes)
 
 ```
-ValidatorSetHeader {                       // 126 bytes, fixed, big-endian
+ValidatorSetHeader {                       // 110 bytes (8+2+4+8+8+48+32), fixed, big-endian
   epoch              u64
   ruleset_version    u16      // quorum rule id (1 = §4); new numbers never change layouts
   validator_count    u32      // n, 1 ≤ n ≤ MAX_FINALITY_SET (8,192 proposed)
@@ -48,7 +48,7 @@ ValidatorSetHeader {                       // 126 bytes, fixed, big-endian
 leaf_i             = keccak( u32 index_i ‖ pk_i(48) ‖ u64 w_i )      // sorted by validator_key
 validator_set_hash = keccak( ValidatorSetHeader )
 
-FinalizedBlock {                           // 120 bytes, fixed
+FinalizedBlock {                           // 112 bytes (8+32+32+32+8), fixed
   height             u64
   block_hash         32 B     // modern block hash
   withdrawal_root    32 B     // §7 accumulator root; all-zero before A3

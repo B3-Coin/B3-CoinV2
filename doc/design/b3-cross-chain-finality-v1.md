@@ -74,7 +74,7 @@ leaf_i   = 0x00…00 (32 zero bytes)                              // for n ≤ i
 node     = keccak( left ‖ right )
 members_root = root of the complete binary tree over the 8,192 leaves
 
-ValidatorSetHeader (126 B):
+ValidatorSetHeader (110 B = 8+2+4+8+8+48+32):
   u64  epoch
   u16  ruleset_version        // 1
   u32  validator_count        // n,  1 ≤ n ≤ 8,192
@@ -97,7 +97,7 @@ relies on the attesting quorum for the rest.
 ## 3. Finalized block, digest, certificate
 
 ```
-FinalizedBlock (120 B):
+FinalizedBlock (112 B = 8+32+32+32+8):
   u64  height
   32 B block_hash              // modern block hash at `height`
   32 B withdrawal_root         // §6; all-zero before bridge activation A3
@@ -121,8 +121,8 @@ Certificate:
 cell:    policy_type = 6, policy_version = 1, amount = 0, asset = native, coinbase only, ≤ 1 per block
          commitment  = TaggedHash("B3/FINALITY/CERT/V1", record payload)   // hash of the full certificate payload
          params      = epoch u64 ‖ height u64 (16 B)                        // the FinalizedBlock's epoch and height, duplicated for cheap lookup
-record:  MPA payload_type 4 `FINALITY_CERTIFICATE`, version 1, payload = FinalizedBlock(120) ‖ signer_bitmap(⌈n/8⌉) ‖ aggregate_sig(96)
-         type-specific maximum: 120 + 1,024 + 96 = 1,240 B (n ≤ 8,192)
+record:  MPA payload_type 4 `FINALITY_CERTIFICATE`, version 1, payload = FinalizedBlock(112) ‖ signer_bitmap(⌈n/8⌉) ‖ aggregate_sig(96)
+         type-specific maximum: 112 + 1,024 + 96 = 1,232 B (n ≤ 8,192)
 ```
 
 The cell is a metadata cell (zero value, never in the UTXO set, no spend path); the record
@@ -352,7 +352,7 @@ state machine (§5.2) are unchanged; `prover` is the single governance-changeabl
 | MPA record max / section max / weight factor | **32,768 B / 65,536 B / ×4** | **FINAL** (MPA doc §8–§10) |
 | Certificate epoch window | `{current, current − 1}` with the §4 monotonicity/set-hash/epoch-relation conditions | FINAL |
 | Policy numbers 6 / 7 / 8 | `FINALITY_CERT` / `FINALITY_KEY` / `MODERN_PAYLOAD_ROOT` | **FINAL, never renumbered** |
-| `FINALITY_CERTIFICATE` record max / `FINALITY_KEY_EVIDENCE` size | 1,240 B / 244 B | FINAL (layout) |
+| `FINALITY_CERTIFICATE` record max / `FINALITY_KEY_EVIDENCE` size | 1,232 B / 244 B | FINAL (layout) |
 | `MAX_EPOCH_LAG` (Ethereum verifier) | 30 days | proposed — A3 (bridge) decision, out of scope for Modern PoS V1 |
 | `F` | **= M**, in the X-pin Modern-PoS release | FINAL |
 | Gated rotation; epoch extension on failure | rule of §4 | FINAL |

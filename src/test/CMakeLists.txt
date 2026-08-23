@@ -81,6 +81,7 @@ add_executable(test_bitcoin
   merkleblock_tests.cpp
   miner_tests.cpp
   modern_stake_tests.cpp
+  finality_types_tests.cpp
   modern_pos_tests.cpp
   miniminer_tests.cpp
   miniscript_tests.cpp

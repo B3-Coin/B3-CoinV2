@@ -84,7 +84,7 @@ verification per block**, ≈ 42 min extra per day of IBD. Hence:
 | `MAX_PAYLOAD_RECORD_SIZE` | **32,768** | parsing/hashing is 1.6 µs/KB — bytes are bounded by ×4 weight, not CPU; 32 KB leaves room for the ≈ 24.6 KB Ethereum sync-committee handover record later |
 | `MAX_PAYLOAD_SECTION_SIZE` | **65,536** | same reasoning; per-tx cap |
 | `MAX_PAYLOAD_RECORDS_PER_TX` | 64 | ratified, unchanged |
-| `FINALITY_CERTIFICATE` max / per block | 1,240 B / 1 | layout facts |
+| `FINALITY_CERTIFICATE` max / per block | 1,232 B / 1 | layout facts |
 
 These are measured-data recommendations; they remain **owner decisions**.
 

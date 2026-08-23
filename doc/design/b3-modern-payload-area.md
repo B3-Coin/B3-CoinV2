@@ -164,7 +164,7 @@ mpa_size` to make it ×4.
 65,536) are *byte* bounds and are safe for disk only if paired with (a) a deliberate MPA
 weight factor and (b) a **verification-cost budget per block and per transaction**. Freeze
 all three together, after the owner picks the weight factor. Until then the finality types'
-own maxima (1,240 / 244) and counts (≤ 1 certificate per block) are the only figures needed
+own maxima (1,232 / 244) and counts (≤ 1 certificate per block) are the only figures needed
 for design.
 
 ---
@@ -222,7 +222,7 @@ Replaces revision 1 §2 "commitment" and all Path-A text:
    counts; weight ×4; verification-cost budget. The numeric values of the ceilings, the
    cost budget and per-type costs are chosen only after benchmarking actual worst-case
    validation cost (BLS pairing / aggregate verify on the reference hardware, portable
-   `blst`). The finality types' own maxima (1,240 / 244) and the certificate count (≤ 1 per
+   `blst`). The finality types' own maxima (1,232 / 244) and the certificate count (≤ 1 per
    block) are layout facts and stand.
 
 ## 9. Constants frozen (owner ruling 2026-08-23, from measured data)
@@ -238,7 +238,7 @@ Replaces revision 1 §2 "commitment" and all Path-A text:
 | `MAX_BLOCK_PAYLOAD_COST` | **120,000** | checked before cryptography |
 | `MAX_TX_PAYLOAD_COST` | **12,000** | checked before cryptography |
 | `COST_TO_VBYTES` | **1** | relay `vsize = max(weight/4, Σ cost × 1)` |
-| `FINALITY_CERTIFICATE` record max / per block | 1,240 B / 1 | layout |
+| `FINALITY_CERTIFICATE` record max / per block | 1,232 B / 1 | layout |
 | `FINALITY_KEY_EVIDENCE` size | 244 B | layout |
 
 Measurement record: [b3-finality-benchmark-2026-08-23.md](b3-finality-benchmark-2026-08-23.md).
