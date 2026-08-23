@@ -26,17 +26,24 @@ Owner rulings incorporated (2026-08-20):
 - **M5** — fork choice is PoS-native and explicit (§6); no PoW chainwork
   semantics and no automatically inherited legacy reorg rule.
 - **M7 (owner ruling 2026-08-23 — amends M1's "no finality gadget")** — the
-  V1 architecture **reserves from M** a BLS12-381 finality gadget and BLS
-  validator keys: creation actions type 4 (`FINALITY_CERTIFICATE`, coinbase
-  only, one per block) and type 5 (`VALIDATOR_BLS_BINDING`), epochs from M,
-  the one-epoch-lookahead set snapshot, the frozen `ValidatorSetHeader` /
-  `FinalizedBlock` / `Certificate` layouts, and the finality pin. Cryptographic
-  enforcement begins at height **F** (F = M targeted; otherwise pinned by the
-  mandatory follow-up release); bridge use is a later flag A3 ≥ F. Full
-  specification: [b3-cross-chain-finality-v1.md](b3-cross-chain-finality-v1.md)
-  (normative) and [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md) (rationale).
-  Block production (M1–M6) is unchanged; §10's "committee/finality gadgets"
-  entry is superseded by this ruling.
+  V1 architecture includes **from M** a BLS12-381 finality gadget and BLS
+  validator keys, realized as Modern policy cells plus Modern Payload Area
+  records: `FINALITY_CERT = 6` (coinbase metadata cell, ≤ 1 per block,
+  commitment = hash of the certificate payload carried as MPA record type 4)
+  and `FINALITY_KEY = 7` (validator-binding metadata cell: `validator_key`
+  commitment, `bls_pubkey ‖ seq` params, identity-authorized by a BIP340
+  signature plus a separate BLS proof-of-possession in MPA record type 5,
+  sequence-controlled rotation/revocation, effective at the next snapshot),
+  with `MODERN_PAYLOAD_ROOT = 8` committing all MPA bytes into the block hash.
+  Epochs from M, one-epoch-lookahead snapshot, handover-gated rotation, the
+  frozen `ValidatorSetHeader` / `FinalizedBlock` / `Certificate` layouts, and
+  the finality pin. **F = M**: these rules ship in the X-pin Modern-PoS
+  release (the first binary that validates any modern-era block); bridge use
+  is a later flag A3 ≥ F. STAKE v1, M1–M6 and the block wire format are
+  unchanged. Specification: [b3-cross-chain-finality-v1.md](b3-cross-chain-finality-v1.md)
+  (normative), [b3-modern-payload-area.md](b3-modern-payload-area.md)
+  (carrier), [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md)
+  (rationale). §10's "committee/finality gadgets" entry is superseded.
 - **M6** — a block reward can never directly create active STAKE: the
   coinbase may not contain a STAKE-claiming output.
 - Plus: the unconditional modern coinbase cap (§8) sits **outside** the PoS

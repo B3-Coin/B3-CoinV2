@@ -1,6 +1,6 @@
 # The Modern Payload Area (MPA) — native carrier for large evidence bytes (design, revision 2)
 
-**Status: design record, revision 2 (2026-08-23). Owner rulings applied: MPA concept
+**Status: design record, revision 2 (2026-08-23; §8 rulings applied the same day — MPA + Path B ACCEPTED). Owner rulings applied: MPA concept
 accepted; the permanent `policy_params ≤ 80 B` invariant stays; commitment path is the
 B3-native **Path B** (`MODERN_PAYLOAD_ROOT` coinbase cell) — **not** the SegWit/witness-
 reserved-value path, and SegWit is **not** a dependency of the MPA (its activation is a
@@ -190,9 +190,45 @@ Replaces revision 1 §2 "commitment" and all Path-A text:
    at a bounded, priced record; ZK proofs, light-client updates, bridge/SPV proofs are new
    record types behind existing or new small cells; `MAX_POLICY_PARAMS_SIZE` untouched.
 
-## 8. Rulings still needed
+## 8. Owner rulings 2026-08-23 (applied; supersede §6/§7 where they differ)
 
-- MPA weight factor (×1 default vs ×4) — decides the byte ceilings.
-- Verification-cost budget shape and per-type costs.
-- `ptxid` definition: full-serialization hash (recommended) vs structural `H(txid ‖ section_hash)`.
-- Policy number `8` for `MODERN_PAYLOAD_ROOT` (6/7/8 assignment to be recorded in the contract's "never renumber" list).
+1. **Weight: MPA bytes count ×4** (full `WITNESS_SCALE_FACTOR`, no implicit witness
+   subsidy). Normative: `weight(tx) = 4 × size(txid-form) + 4 × size(MPA section)` (+ the
+   Core witness term only if a witness is ever present); `GetTransactionWeight` /
+   `GetBlockWeight` gain an explicit `3 × mpa_size` term. MPA is historical chain data and
+   is priced as such.
+2. **Payload verification-cost budget (consensus, sigops-analogue).** The registry row of
+   every `(payload_type, payload_version)` declares a deterministic `verify_cost`
+   (integer units; e.g. BLS pairing-class ≈ 1,500, BIP340 ≈ 60, aggregate certificate ≈
+   10,000 — numbers to be set by benchmark). Consensus checks `Σ verify_cost ≤
+   MAX_TX_PAYLOAD_COST` per transaction and `≤ MAX_BLOCK_PAYLOAD_COST` per block **before
+   any expensive cryptography runs**; exceeding either ⇒ `bad-payload-cost`, tx/block
+   invalid. Costs are per record and fixed by type/version, so the budget is computed
+   from the frame alone.
+3. **Relay/fee accounting.** Effective size for fee-rate and mempool limits:
+   `vsize = max(weight/4, Σ verify_cost × COST_TO_VBYTES)` with `COST_TO_VBYTES` a policy
+   constant (e.g. 1 vbyte per ~4 cost units, so a 244-byte PoP record prices like ≈ 400+
+   vbytes). A CPU-expensive record can never be cheaper to relay than the CPU it costs;
+   invalid evidence is scored as misbehaviour; cheap checks precede crypto at admission.
+4. **`ptxid` normative definition.** `ptxid = SHA256d(canonical full transaction
+   serialization)` where the canonical full serialization is: `version ‖ 0x00 ‖ flag ‖ vin
+   ‖ vout ‖ [witness if flag&1] ‖ [MPA section if flag&2] ‖ lockTime`, with `flag` = the
+   minimal set of bits for the data present and the non-optional form (no marker/flag) used
+   when no optional data exists — in which case `ptxid == txid`. Defined by bytes, not by
+   any implementation; the C++ full-hash machinery may be reused internally.
+5. **Policy numbers frozen:** `6 FINALITY_CERT`, `7 FINALITY_KEY`, `8 MODERN_PAYLOAD_ROOT`.
+   Never renumbered or reused (contract §23 list updated).
+6. **Byte ceilings not frozen.** The *framework* is frozen: per-type maximum ≤ global
+   record ceiling; per-tx section cap; per-tx / per-block record counts; per-type per-block
+   counts; weight ×4; verification-cost budget. The numeric values of the ceilings, the
+   cost budget and per-type costs are chosen only after benchmarking actual worst-case
+   validation cost (BLS pairing / aggregate verify on the reference hardware, portable
+   `blst`). The finality types' own maxima (1,240 / 244) and the certificate count (≤ 1 per
+   block) are layout facts and stand.
+
+## 9. Rulings still needed
+
+- Numeric limits after benchmark: global record ceiling, section cap, `MAX_TX_PAYLOAD_COST`,
+  `MAX_BLOCK_PAYLOAD_COST`, per-type `verify_cost` values, `COST_TO_VBYTES`.
+
+

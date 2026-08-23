@@ -265,6 +265,10 @@ creation payload realized (v1) as a second carrier push; STAKE v1, `MAX_POLICY_P
 the payload position, and whether `SegwitHeight` is to be pinned for the modern era at all
 (a separate, pre-existing gap: with INT_MAX no witness-program output is spendable post-H).
 
+## 7.6 Status after the 2026-08-23 rulings
+
+F-1 resolved (cells 6/7/8 + MPA Path B, frozen numbers), F-2 adopted in the normative spec as the owner's handover-gated requirement (parameters open), F-3 adopted (F = M in the X-pin release). Weight ×4, cost budget, relay vsize and `ptxid` ruled; byte ceilings open pending benchmark; SegWit activation remains a separate modern-era audit item, not a finality dependency.
+
 ## 8. Verdict
 
 With F-1 (carrier), F-2 (gated rotation) and the parameter rows added, Modern PoS V1 is

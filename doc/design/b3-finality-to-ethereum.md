@@ -10,7 +10,7 @@ Revision 1 (a "V2 layer") is superseded. "Do not implement yet" — this is spec
 only; the reconciliation amendment to the frozen PoS V1 spec is recorded as ruling **M7**
 in [b3-modern-pos-spec.md](b3-modern-pos-spec.md).**
 
-**Normative protocol text (FINAL, 2026-08-23): [b3-cross-chain-finality-v1.md](b3-cross-chain-finality-v1.md)** — exact layouts, the fixed-depth validator-set Merkle commitment, and the Ethereum verification algorithms for epoch transition, weights, bitmap, quorum and withdrawal root. This document is the rationale/attack record; where the two differ, the normative document governs (one known refinement: ONE cumulative withdrawal tree whose leaf carries `origin_chain_id`, not one tree per origin chain).
+**Superseded in detail by the 2026-08-23 rulings (cells 6/7/8 + MPA, identity-authorized binding, gated rotation, F = M): see the normative spec rev. 2. Normative protocol text: [b3-cross-chain-finality-v1.md](b3-cross-chain-finality-v1.md)** — exact layouts, the fixed-depth validator-set Merkle commitment, and the Ethereum verification algorithms for epoch transition, weights, bitmap, quorum and withdrawal root. This document is the rationale/attack record; where the two differ, the normative document governs (one known refinement: ONE cumulative withdrawal tree whose leaf carries `origin_chain_id`, not one tree per origin chain).
 
 Deposits (Ethereum → B3 via receipt/state proofs) are unchanged from
 [b3-bridge-bls-proposal.md](b3-bridge-bls-proposal.md) §2.2 and not discussed here.

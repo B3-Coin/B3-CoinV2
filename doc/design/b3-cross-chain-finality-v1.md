@@ -1,14 +1,17 @@
 # B3 Cross-Chain Finality Protocol — v1 (normative)
 
-**Status: FINAL protocol specification (2026-08-23), owner direction accepted. Layouts,
-hashes, verification algorithms and state machines below are frozen as `V1`; the
-numeric parameters in §9 carry their own status. Rationale, attack analysis and
-alternatives live in [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md); the
-Modern PoS amendment is ruling M7 in [b3-modern-pos-spec.md](b3-modern-pos-spec.md).
-Deposits and the bridge vault are outside this document (see
-[b3-bridge-bls-proposal.md](b3-bridge-bls-proposal.md)); this document defines only how
-B3 finality is produced and how Ethereum verifies it. Implementation not yet authorized
-("before implementation").**
+**Status: FINAL protocol specification, amended 2026-08-23 (revision 2) with the owner's
+architectural rulings of the same day: the finality objects are Modern **policy cells**
+(`FINALITY_CERT = 6`, `FINALITY_KEY = 7`, frozen numbers) whose large evidence travels in
+the **Modern Payload Area** ([b3-modern-payload-area.md](b3-modern-payload-area.md),
+Path B, `MODERN_PAYLOAD_ROOT = 8`); the BLS binding is **identity-authorized** (BIP340 by
+`validator_key` + separate PoP, sequence-controlled); validator-set rotation is
+**handover-gated**; F = M in the X-pin Modern-PoS release. Layouts, hashes, verification
+algorithms and state machines are frozen as `V1`; numeric parameters in §9 carry their own
+status. Rationale and attack analysis: [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md);
+compatibility audit: [b3-finality-compatibility-report.md](b3-finality-compatibility-report.md);
+Modern PoS amendment: ruling M7 in [b3-modern-pos-spec.md](b3-modern-pos-spec.md).
+Deposits and the bridge vault are outside this document. Implementation not yet authorized.**
 
 Conventions: all integers are **big-endian, fixed width**; `‖` is byte concatenation;
 `keccak` = Keccak-256; `sha256` = SHA-256; `TaggedHash(tag, m) = sha256(sha256(tag) ‖
@@ -23,31 +26,42 @@ B3 modern chain domain.
 |---|---|---|
 | Algorithm | BIP340 x-only secp256k1, 32 B | BLS12-381 G1 compressed, 48 B |
 | Name in code | `validator_key` | `bls_pubkey` |
-| Lives in | STAKE carrier `B3S1` (ratified v1), coinbase declaration, block signature (M3), binding authorization | `VALIDATOR_BLS_BINDING` action; validator-set leaves |
+| Lives in | STAKE carrier `B3S1` (ratified v1, **unchanged**), coinbase declaration, block signature (M3), binding authorization | `FINALITY_KEY` cell params; validator-set leaves |
 | Signs | blocks (`B3/MODERN/POS/SIG/V1`), bindings (`B3/FINALITY/BIND/V1`) | **only** `B3/FINALITY/V1` digests (and its own PoP) |
-| Rotation | re-stake (M4) | rebind; effective at next snapshot |
+| Rotation | re-stake (M4) | next `seq` in a new `FINALITY_KEY` cell; effective at the next snapshot |
 
 Ciphersuite: `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`; PoP DST
 `BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`; public keys G1 (48 B compressed),
 signatures G2 (96 B compressed); point encodings per the IETF BLS draft (ZCash/Ethereum
 serialization). A BLS key is **never** derived from the identity key and an identity key
-never signs finality. `bls_pubkey` MUST NOT be the point at infinity.
+never signs finality. `bls_pubkey` MUST NOT be the point at infinity. **Stake never elects a
+BLS key**: a validator's finality key exists only through the validator's own signature.
 
-**Binding** — creation action type **5**, version **1**, payload 240 B exactly:
+### 1.1 `FINALITY_KEY` — validator-binding state (policy type 7, frozen)
 
 ```
-validator_key 32 ‖ bls_pubkey 48 ‖ pop 96 ‖ bip340_sig 64
-pop        = BLS_Sign(sk_bls, bls_pubkey)                                  under the PoP DST
-bip340_sig = Schnorr_Sign(sk_identity,
-               TaggedHash("B3/FINALITY/BIND/V1", ModernChainDomain ‖ validator_key ‖ bls_pubkey))
+cell:    policy_type = 7, policy_version = 1, amount = 0, asset = native
+         commitment  = validator_key (32 B)                      // the identity the cell binds
+         params      = bls_pubkey(48) ‖ seq u32 LE   (52 B ≤ 80)  // bls_pubkey = 0^48 means REVOKE
+record:  MPA payload_type 5 `FINALITY_KEY_EVIDENCE`, version 1, 244 B exactly:
+         validator_key(32) ‖ bls_pubkey(48) ‖ seq u32 ‖ bip340_sig(64) ‖ pop(96)
+         bip340_sig = Schnorr_Sign(sk_identity,
+               TaggedHash("B3/FINALITY/BIND/V1", ModernChainDomain ‖ validator_key ‖ bls_pubkey ‖ seq))
+         pop        = BLS_Sign(sk_bls, bls_pubkey) under the PoP DST   (omitted/zero only when bls_pubkey = 0^48)
 ```
 
-Valid in any modern-era block from H+1. Consensus state `binding[validator_key] =
-(bls_pubkey, height)`, latest wins; a `bls_pubkey` may be bound by one `validator_key` at
-a time (a second binding of the same BLS key while the first stands is invalid); undo on
-disconnect; rebuilt on reindex.
-
----
+Rules (consensus from H+1, the corridor included, so `Set_0` can be non-empty at M):
+exactly one record per cell and one cell per record in the same transaction
+(`record.validator_key == cell.commitment`, `record.bls_pubkey ‖ seq == cell.params`);
+`seq` must equal the validator's previous binding `seq + 1` (first binding `seq = 0`); a
+non-zero `bls_pubkey` may be active under **one** `validator_key` at a time; `bip340_sig`
+and `pop` verified at creation; the cell is a **metadata cell**: zero value, never added to
+the UTXO set, no spend path. Derived consensus state `binding[validator_key] = (bls_pubkey,
+seq, height)` (maintained on connect/disconnect, rebuilt on reindex, with its own undo).
+Revocation = a binding with `bls_pubkey = 0^48`. **Effect:** a binding created in block `b`
+is visible to snapshots at heights ≥ `b` (§4); it never changes a set already in force.
+Stake contributes weight to a validator's finality membership **only** by resolving through
+this validator-authorized active binding — never through any property of a STAKE output.
 
 ## 2. Validator set commitment — Merkle root, fixed depth
 
@@ -101,22 +115,40 @@ Certificate:
 
 ---
 
-## 4. B3 rules (normative summary; full text in the design record)
+### 3.1 `FINALITY_CERT` — block-consensus metadata (policy type 6, frozen)
+
+```
+cell:    policy_type = 6, policy_version = 1, amount = 0, asset = native, coinbase only, ≤ 1 per block
+         commitment  = TaggedHash("B3/FINALITY/CERT/V1", record payload)   // hash of the full certificate payload
+         params      = epoch u64 ‖ height u64 (16 B)                        // the FinalizedBlock's epoch and height, duplicated for cheap lookup
+record:  MPA payload_type 4 `FINALITY_CERTIFICATE`, version 1, payload = FinalizedBlock(120) ‖ signer_bitmap(⌈n/8⌉) ‖ aggregate_sig(96)
+         type-specific maximum: 120 + 1,024 + 96 = 1,240 B (n ≤ 8,192)
+```
+
+The cell is a metadata cell (zero value, never in the UTXO set, no spend path); the record
+is bounded, priced historical payload data committed by the cell's commitment and by the
+block through `MODERN_PAYLOAD_ROOT` (MPA §2–§4). A later ZK proof of the same statement is
+a **new record type behind the identical cell** (§7).
+
+## 4. B3 rules (normative)
 
 | Rule | Value |
 |---|---|
-| Epoch `e` | heights `[M + e·E, M + (e+1)·E)`, `E` per §9 |
-| Snapshot | `Set_{e+1} = Snapshot(last block of epoch e−1)` for `e ≥ 1`; `Set_0 = Set_1 = Snapshot(M−1)` |
-| Carry-over | if `n < MIN_FINALITY_SET` or `W < MIN_FINALITY_WEIGHT`: `Set_{e+1} = Set_e` re-stamped with `epoch = e+1`; more than `MAX_CARRY_OVER` consecutive carry-overs ⇒ lineage broken (no certificate valid until a consensus re-bootstrap) |
-| Checkpoints | heights `h` with `(h − M) mod CHECKPOINT_INTERVAL = 0`, plus the last block of every epoch |
-| Signing (validator) | after `tip − h ≥ CHECKPOINT_DEPTH`; one signature per height; strictly increasing heights; only descendants of the latest certified checkpoint known |
-| Certificate carrier | creation action type **4**, version **1**, payload `FinalizedBlock ‖ Certificate`, **coinbase only, ≤ 1 per block**, checkpoint must be an ancestor and `epoch ≤ current epoch` |
-| From M | syntactic validity of the action (placement, lengths, bitmap width, zero high bits) is consensus |
-| From F | `signed_weight ≥ quorum_weight` and `FastAggregateVerify` are consensus; **finality pin**: a reorganization disconnecting the highest certified checkpoint is refused (`modern-finality-violation`) |
+| Heights | **M** = first modern-PoS block, epoch 0 starts; **F = M** — the finality rules ship in the X-pin Modern-PoS release (the first binary that validates any modern-era block; the v1 binary refuses H+1); bridge activation **A3 ≥ F** |
+| Epoch start | `epoch_start[0] = M`; at the first block of epoch `e`, `Set_{e+1} := Snapshot(epoch_start[e] − 1)` (so `Set_1 = Set_0 = Snapshot(M−1)`); `Set_{e+1}` is known for all of epoch `e` and every epoch-`e` certificate carries `hash(Set_{e+1})` |
+| Snapshot(b) | every `validator_key` with ACTIVE STAKE weight `w > 0` at height `b` (STAKE v1, 20-block maturity, aggregation per key — unchanged) **and** a non-revoked `binding[validator_key]` at height `b` → member `(bls_pubkey, w)`; sorted by `validator_key`; `w` in whole modern B3 |
+| **Handover-gated rotation** (owner requirement) | epoch `e+1` begins at the first height `h ≥ epoch_start[e] + E` such that the chain below `h` contains a valid certificate with `epoch = e` (it necessarily carries `hash(Set_{e+1})`). Until then epoch `e` **extends**: checkpoints continue, signed by `Set_e`, all with `epoch = e`. A set never signs before the previous set has attested it on-chain — B3 and the Ethereum verifier follow the identical `e → e+1` rule |
+| Carry-over | if `Snapshot` yields `n < MIN_FINALITY_SET` or `W < MIN_FINALITY_WEIGHT`: `Set_{e+1} = Set_e` re-stamped with `epoch = e+1` |
+| `MAX_EPOCH_EXTENSION` | an epoch extended beyond it (no quorum certificate at all) declares the lineage **broken**: no further certificate is valid until a consensus re-bootstrap pins a new genesis set (rule, not improvisation) |
+| Checkpoints | heights `h` with `(h − M) mod CHECKPOINT_INTERVAL = 0` |
+| Signing (validator behaviour) | after `tip − h ≥ CHECKPOINT_DEPTH`; one signature per height; strictly increasing heights; only descendants of the latest certified checkpoint known |
+| Certificate carrier | `FINALITY_CERT` cell + `FINALITY_CERTIFICATE` record in the **coinbase**, ≤ 1 per block (§3.1); the checkpoint must be an ancestor at that height on this chain; `epoch ∈ {current, current − 1}`; checkpoint height > highest certified height |
+| Validation order | MPA frame/lengths → type activation → cell↔record binding → verification-cost budget and per-block counts → epoch window / ancestry → bitmap rules → quorum by weight → `FastAggregateVerify` last. Failure ⇒ `bad-finality-cert` / `bad-finality-cert-form`, block invalid |
+| Finality pin (from F) | on connect of a block carrying a valid certificate for checkpoint `C`: `finalized_tip = C`; a reorganization that would disconnect `finalized_tip` is refused (`modern-finality-violation`, no peer penalty, skipped during reindex/import). Pins apply on the active chain only |
+| No certificate | the chain continues under V1 (blocks never depend on certificates); the epoch extends; withdrawals wait; beyond `MAX_EPOCH_EXTENSION` → lineage broken (above) |
 | Archive | every node keeps the highest certificate per epoch it has seen (included or not) and serves it by RPC |
 | Transport | `finsig {u64 epoch, u64 height, u32 index, 96 B sig}`; relayed only for indices of `Set_epoch` / `Set_{epoch+1}`, one per (index, height) |
-
----
+| Untouched | M1 eligibility/seed, M3 block signature and wire format, M4, M5 fork choice, reorg horizon, STAKE v1 carrier, `MAX_POLICY_PARAMS_SIZE = 80` |
 
 ## 5. Ethereum — `B3FinalityVerifier` exact verification
 
@@ -313,8 +345,11 @@ state machine (§5.2) are unchanged; `prover` is the single governance-changeabl
 | Weight unit | whole modern B3 (`/10^9`) | FINAL |
 | `E` (epoch blocks) | 1,440 | proposed |
 | `CHECKPOINT_INTERVAL` / `CHECKPOINT_DEPTH` | 60 / 20 | proposed |
-| `MIN_FINALITY_SET` / `MIN_FINALITY_WEIGHT` / `MAX_CARRY_OVER` | 4 / owner / 7 | proposed |
+| `MIN_FINALITY_SET` / `MIN_FINALITY_WEIGHT` / `MAX_EPOCH_EXTENSION` | 4 / owner / 7·E | proposed |
+| Certificate epoch window | `{current, current − 1}` | proposed |
+| Policy numbers 6 / 7 / 8 | `FINALITY_CERT` / `FINALITY_KEY` / `MODERN_PAYLOAD_ROOT` | **FINAL, never renumbered** |
+| `FINALITY_CERTIFICATE` record max / `FINALITY_KEY_EVIDENCE` size | 1,240 B / 244 B | FINAL (layout) |
 | `MAX_EPOCH_LAG` | 30 days | proposed |
-| `F` | M (target) or pinned by the X-pin follow-up release | **owner** |
+| `F` | **= M**, in the X-pin Modern-PoS release (ruling 2026-08-23 via audit F-3) | FINAL |
 | `A3` | later | owner |
 | Binding required for block eligibility from F | yes | proposed |
