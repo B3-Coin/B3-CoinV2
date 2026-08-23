@@ -52,8 +52,9 @@ Baseline: commit `a8ad010` (the tip of the completed experimental stack, from wh
 > Corridor bits must be the CANONICAL compact encoding (`IsCanonicalCompactBits`;
 > the ruled mainnet value `0x1f008000` is pinned by test, NOT in chainparams —
 > pin gates in [b3-release-v1.md](b3-release-v1.md)). Corridor pacing VERIFIED
-> compressible (test `corridor_pacing_is_unbounded`; mitigation is an owner
-> decision, corridor doc §6.1). Validator UX v1: wallet validator key,
+> compressible and then RULED: minimum spacing 60 s + future bound 120 s,
+> consensus for every corridor (test `corridor_pacing_enforced`, corridor
+> doc §6.1). Validator UX v1: wallet validator key,
 > `createstake`, `getstakinginfo`, `startstaking`/`stopstaking`,
 > `node::StakingLoop`, STAKE-carrier standardness/ownership/signing
 > (`modern::StakeOwnerScript`), STAKE outputs excluded from auto coin

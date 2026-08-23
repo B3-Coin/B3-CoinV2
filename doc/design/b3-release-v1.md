@@ -30,7 +30,7 @@ Until then the ruled values live in the documents and tests only;
 mainnet `hard_fork_height`, `legacy_final_hash` and `transition_pow_bits`
 stay unset and the chain stays in live legacy operation.
 
-## Corridor pacing — VERIFIED COMPRESSIBLE (2026-08-23), mitigation OPEN
+## Corridor pacing — VERIFIED COMPRESSIBLE, then RULED (2026-08-23): 60 s spacing, 120 s future bound
 
 Owner instruction: "verify corridor pacing cannot be compressed
 unexpectedly by large hashpower; do not assume fixed difficulty implies
@@ -41,9 +41,11 @@ scrypt farm can therefore produce the whole 1,000-block corridor in
 minutes of wall-clock, carrying timestamps that advance 1 s per block
 (a test pins this behaviour). Stake that needs 20 blocks to mature, and
 operators who need hours to create STAKE outputs, would get neither. The
-mitigation is a consensus rule and therefore an OWNER DECISION — recorded
-in [b3-during-fork-transition.md](b3-during-fork-transition.md) §6.1 with
-the recommended rule (minimum corridor spacing plus a tight future bound).
+owner ruled the same day: corridor blocks must be at least 60 s apart and
+at most 120 s ahead of the clock (`transition_pow_min_spacing` /
+`transition_pow_max_future`, consensus, implemented and tested) — so the
+corridor takes ≥ ~16.6 h of real time no matter the hashpower. Details:
+[b3-during-fork-transition.md](b3-during-fork-transition.md) §6.1.
 
 ## Engineering plan (starts on inputs; "rest we keep improving")
 

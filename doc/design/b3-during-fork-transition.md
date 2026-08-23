@@ -216,7 +216,7 @@ produces, a canonical round-trip test pins it, and a configured
 non-canonical value fails closed like an unset one. NOT PINNED in mainnet
 chainparams until the release pin gates pass.
 
-### 6.1 Pacing — VERIFIED COMPRESSIBLE by hashpower; mitigation OPEN (owner)
+### 6.1 Pacing — VERIFIED COMPRESSIBLE by hashpower; RULED 2026-08-23: min spacing 60 s, future bound 120 s
 
 Owner instruction (2026-08-23): do not assume fixed difficulty implies
 fixed elapsed time. Verified: a corridor header is checked for the
@@ -235,19 +235,20 @@ constant bits, the scrypt eligibility, `time > MedianTimePast(prev)` and
   "zero-stake-at-M prevented operationally" ruling (§9) assumed hours of
   corridor, not seconds.
 
-Recommended mitigation (NOT implemented — a consensus rule needs an owner
-ruling): a **minimum corridor block spacing** (`time >= parent_time +
-CORRIDOR_MIN_SPACING`, e.g. 60 s) together with a **tight corridor future
-bound** (e.g. the modern-PoS 120 s instead of 2 h). Then the corridor
-takes at least ~16.5 h of real time regardless of hashpower, while a lone
-CPU still proceeds at its natural ~18 s pace... capped to the spacing —
-i.e. the corridor becomes ≥ 1000 × spacing of wall-clock, bounded below
-by rule instead of by hope. Alternatives: a time-based corridor end
-(M = first height whose parent time ≥ H_time + T) — more change; or
-accepting compression and relying on operational stake pre-creation —
-contradicts "verify". The spacing constant and bound are owner numbers.
-A test (`corridor_pacing_is_unbounded`) pins the current compressible
-behaviour so the rule, when ruled, flips a visible expectation.
+**RULED 2026-08-23 (owner): "add 60 s to 120 s for the corridor, since
+someone with a large miner should not compress that window."** Implemented
+as consensus for every corridor: `transition_pow_min_spacing = 60` — a
+corridor block's timestamp must be ≥ parent time + 60 s
+(`time-too-early-corridor`, invalid) — and `transition_pow_max_future = 120`
+— at most 120 s ahead of the validating node's clock (`time-too-new`, held
+like the modern-PoS rule). Consequence: the corridor takes at least
+1000 × 60 s − 120 s ≈ 16.6 h of real time regardless of hashpower; a lone
+CPU (~18 s per block at the ruled target) is slowed to one block per
+minute, never stalled; a large miner is paced, not empowered. Block
+production sets the template time to max(now, parent + 60 s). Test
+`corridor_pacing_enforced` (1 s and 59 s refused, 60 s accepted, a burst
+advances chain time ≥ 60 s per block, +121 s held / +120 s accepted,
+template ≥ parent + 60 s); the corridor fixtures build at 60 s spacing.
 
 ## 7. Corridor security (concrete questions; mitigations OPEN)
 
@@ -378,7 +379,9 @@ derives from the corridor-exit block).
 
 **RULED 2026-08-23 in addition:** corridor difficulty VALUE = canonical `0x1f008000` (§6, pin gated); H = 820,000 / M = 821,001 and X-distribution = pause-fail-closed (open-decisions OD-10).
 
-**STILL OPEN:** the corridor PACING rule (§6.1 — compressible today; minimum spacing + tight future bound recommended); the modern-PoS sentinel-bits and future-drift values
+**RULED 2026-08-23 in addition:** corridor PACING — minimum spacing 60 s and future bound 120 s (§6.1).
+
+**STILL OPEN:** the modern-PoS sentinel-bits and future-drift values
 (provisional); corridor reorg-depth bounds and other §7 mitigations;
 modern reward schedule
 (OD-2). Ratified 2026-08-21 in addition: minimum stake 333 modern B3
