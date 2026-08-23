@@ -137,12 +137,12 @@ model, B3 signing and carriers, verifier state machine. ✔
 
 ### 7.2 Required PoS decisions (before coding)
 
-1. **F-1 carrier ruling (revised §7.4)**: `STAKE` v2 (`vk ‖ bls_pk`, PoP at creation) + new policy type `FINALITY_CERT = 6` (coinbase cell, commitment = digest, type-specific params bound) — or wait for the modern codec (not available for the X-pin release).
+1. **F-1 carrier ruling (final form §7.5)**: `FINALITY_CERT = 6` (coinbase metadata cell, commitment = digest, 16-B params, certificate as creation payload — R1 script-carrier push vs R2 witness/annex) + `FINALITY_KEY = 7` (identity-authorized binding log: BIP340 by `validator_key` + PoP, `seq`-ordered); STAKE stays v1; `MAX_POLICY_PARAMS_SIZE` untouched; explicit non-UTXO rule for metadata cells.
 2. **F-2 handover-gated rotation** + `MAX_EPOCH_EXTENSION` (7·E) replacing `MAX_CARRY_OVER`.
 3. **F = M in the X-pin release** (confirm; no `blst` in v1).
 4. Certificate epoch window `{current, current−1}`.
 5. Binding required for block eligibility from F (W_fin = W) — yes/no.
-6. Finality key declared by the staker in STAKE v2 (largest-weight rule on conflict) — confirm.
+6. `FINALITY_KEY` binding semantics (§7.5): identity-authorized (`validator_key` BIP340 + PoP), `seq`-ordered, zero key = revoke, effective at next snapshot — confirm; and whether `SegwitHeight` is pinned for the modern era (pre-existing gap).
 7. Parameters: `E` 1,440; `CHECKPOINT_INTERVAL`/`DEPTH` 60/20; `MIN_FINALITY_SET` 4; `MIN_FINALITY_WEIGHT`; `MAX_EPOCH_LAG` 30 d (Ethereum); standardness carve-in for STAKE v2.
 
 ### 7.3 Fields frozen before coding (byte-exact)
@@ -194,6 +194,76 @@ existing policy. Classification decides the carrier:
   in the proof area; v1 bytes are never reinterpreted. Replaces the §1 "`B3F1` OP_RETURN".
 - Reserve creation-action types 4/5 anyway (never reuse); `scriptSig` and `vchBlockSig`
   remain untouched.
+
+## 7.5 Owner corrections of 2026-08-23 (second round) — tree findings and the smallest architecture
+
+Inputs checked: `modern/policy.h` (`ModernOutput{asset, amount, type u16, version u16,
+commitment 32 B, params ≤ 80 B}`), `modern/proof.h` (`ModernTransition`/`V2`, proof area
+≤ 4,000 B per proof, `ProofAreaCommitmentV2`, "outer transaction codec" explicitly future),
+`coins.cpp` (`AddCoin` skips only `IsUnspendable()` scripts), `validation.cpp` (legacy
+zero-value marker deliberately kept out of the UTXO set in Connect **and** Disconnect —
+precedent for a consensus-defined non-UTXO output), `kernel/chainparams.cpp`
+(**B3 main: `SegwitHeight = INT_MAX`, Taproot `NEVER_ACTIVE`** → any witness byte in a
+mainnet block is `unexpected-witness`; script flags P2SH|WITNESS|TAPROOT are nevertheless
+always on for execution), `ContextualCheckBlock` (the coinbase witness is pinned to one
+32-byte reserved value and is **not** covered by the witness merkle root).
+
+**(1) `FINALITY_CERT` cell + proof payload — invariant preserved, no params change.**
+`MAX_POLICY_PARAMS_SIZE = 80` stays global and untouched. The cell is bounded typed state:
+`FINALITY_CERT = 6`, v1, `amount = 0`, native asset, **commitment = `finality_digest`**,
+**params = `epoch u64 ‖ height u64` (16 B)**. The variable certificate bytes
+(`FinalizedBlock ‖ bitmap ‖ sig`, ≤ 1,240 B) are a **creation-authorization payload** —
+in the model, creation action type 4 (reserved), payload ≤ 4,000 B, bound to the cell by
+`commitment == digest(payload)`. The model-pure segregated home (proof/creation-action area)
+has no outer carrier today, and the only segregated area Core offers — the witness — is
+(a) not activatable without pinning `SegwitHeight` for the modern era (currently INT_MAX on
+main) and (b) **uncommitted for the coinbase** (reserved value only), so a coinbase-carried
+certificate can never live in a witness. Two realizations, both keeping the cell identical:
+- **R1 (recommended, smallest):** the payload rides in the cell's own script carrier as a
+  second push after the typed carrier push — the exact v1 pattern every live policy uses
+  (`B3S1` realizes STAKE's owner proof in script). txid → merkle → block hash commits it;
+  the script is never executed (no 520-byte limit applies); `ModernOutput` sees 16-B params.
+  Not temporary: the cell's model is final; if a V2 outer codec later exists the payload
+  moves to the creation-action section as `FINALITY_CERT v2`; v1 bytes never reinterpreted.
+- **R2 (model-pure, larger):** pin `SegwitHeight = H+1` in the X-pin release, carry the
+  certificate in a **non-coinbase** producer transaction's committed witness (taproot annex
+  `0x50‖cert`, sighash- and wtxid-committed) with the cell in that transaction. Needs the
+  segwit pin, annex semantics, and a per-certificate UTXO spend. Offered, not recommended.
+
+**(2) BLS binding — identity-authorized, never elected by stake.** The "largest stake wins"
+rule is withdrawn. New policy **`FINALITY_KEY = 7`**, v1: **commitment = `validator_key`**
+(the x-only identity is the cell's binding), **params = `bls_pubkey(48) ‖ seq u32` (52 B ≤ 80)**;
+creation payload = **BIP340 signature by `validator_key`** over
+`TaggedHash("B3/FINALITY/BIND/V1", ModernChainDomain ‖ validator_key ‖ bls_pubkey ‖ seq)` **and
+the BLS PoP** (separate; PoP DST). Consensus: `seq` must equal the validator's previous
+binding `seq + 1` (first = 0) — the binding log is an identity-authorized, replay-proof
+state-transition sequence; `bls_pubkey = 0^48` = explicit revocation; a `bls_pubkey` may be
+active under one `validator_key` at a time; valid from H+1. Derived state
+`binding[validator_key] = (bls_pubkey, seq, height)` (connect/disconnect/reindex like the
+stake registry). **Snapshot:** for each `validator_key` with ACTIVE STAKE weight `w`
+(STAKE **v1 unchanged**, weight aggregation per key unchanged), the member is
+`(binding[validator_key].bls_pubkey, w)` iff a non-revoked binding exists at the snapshot
+height; stake contributes only through the validator-authorized active binding; rotation =
+the next `seq`, effective at the next snapshot boundary. (Variant if `SegwitHeight = H+1`
+is pinned anyway: a spendable `FINALITY_KEY` UTXO cell with owner script `OP_1
+<validator_key>`, rotation = key-path spend + recreate; equivalent semantics, larger.)
+
+**(3) Consensus-committed, never in the spendable UTXO set — verified, one rule needed.**
+Today only `IsUnspendable()` (OP_RETURN-led / > 10,000 B) scripts stay out of the UTXO set;
+a typed-carrier script would be added. Since OP_RETURN is rejected as the model, both
+metadata cells need an explicit modern rule `IsMetadataCell(script)` → never added in
+`AddCoins`, skipped in `DisconnectBlock`'s exact-match check — the precedent is the legacy
+zero-value marker (`validation.cpp:2428–2435`). `amount = 0` keeps value accounting
+neutral; relay needs a standardness carve-in for `FINALITY_KEY` transactions (STAKE got
+one); the coinbase `FINALITY_CERT` never relays.
+
+**Smallest architecture (summary):** two new policy types `FINALITY_CERT = 6` and
+`FINALITY_KEY = 7`, both `amount = 0`, both **metadata cells excluded from the UTXO set by
+rule**, both with ≤ 80-B typed params and a 32-B commitment, each with a consensus-verified
+creation payload realized (v1) as a second carrier push; STAKE v1, `MAX_POLICY_PARAMS_SIZE`,
+`ModernOutput`, M3 and the block wire format untouched. **Required ruling:** R1 vs R2 for
+the payload position, and whether `SegwitHeight` is to be pinned for the modern era at all
+(a separate, pre-existing gap: with INT_MAX no witness-program output is spendable post-H).
 
 ## 8. Verdict
 
