@@ -5,13 +5,14 @@ something moves from proposed/open to final. Working development continues on
 `claude/b3-clean-architecture` and, for the legacy reference tooling, on
 `claude/b3-master-utxo-export` (the legacy `master` codebase).
 
-Ledger advanced 2026-08-22 (owner-directed), at working-tree commit `05390ee`.
-Previous advance: 2026-08-19 (`746cc72` + `953c915`).
+Ledger advanced 2026-08-23 (owner-directed), at working-tree commit `923e989`.
+Previous advances: 2026-08-22 (`65b426a` + `b283381`), 2026-08-19
+(`746cc72` + `953c915`).
 
 **Branch accuracy note (2026-08-22):** this branch now CONTAINS the Codex
 repair passes (`ded7024`, `0098aeb`, `8c842ce`, `37e5386`), the adversarial
 self-audit (`66a2d3b`), the Codex follow-up closures (`178e155`, `e9a52e4`)
-and everything after them up to `05390ee`. The earlier note that these were
+and everything after them up to `923e989`. The earlier note that these were
 missing is superseded. FlowMesh code is compiled into the node library and
 remains activation-unwired (no consensus target, no net_processing/RPC).
 The last recorded full B3 gate on the working branch is 222 cases green
@@ -118,6 +119,29 @@ not re-run it.
   managed → outsourced → light-client → issuer-native are in-place
   transitions; Tron and similar served off-consensus; native issuance as
   the end state. (Ethereum L1 as origin is recommended, not ruled.)
+- **Release-v1 rulings (owner, 2026-08-23)** — recorded in
+  `doc/design/b3-release-v1.md`, OD-10 and the corridor document:
+  **H = 820,000**, corridor 820,001..821,000, **M = 821,001**;
+  **X distribution = PAUSE, FAIL CLOSED** — a release ships with H set and
+  X blank, accepts the chain through H and refuses every block above H
+  (no-penalty, nothing marked invalid; production refuses; startup
+  warning), the mandatory follow-up pins X, blank-X nodes never enter the
+  corridor; **corridor bits = canonical compact `0x1f008000`** (same 2^239
+  target as the non-canonical `0x20000080`; non-canonical configured bits
+  fail closed); **corridor pacing = minimum 60 s spacing + 120 s future
+  bound** (ruled after the verification that a fixed difficulty alone lets
+  hashpower compress the corridor; the corridor now takes ≥ ~16.6 h of real
+  time regardless of hashpower); seeds: `176.31.13.198` now, at least two
+  more independently hosted fixed seeds and an owner-controlled DNS seed
+  before the final release, no explorer peers without operator approval;
+  **validator UX v1** = wallet-held validator key, `createstake`, staking
+  status, start/stop staking, PENDING/ACTIVE visibility, automatic staking
+  loop — nothing more advanced. **Pin gates (owner):** no final activation
+  parameter is pinned or published until the live-sync legacy-mempool
+  assertion bug is fixed, the T3 and final-H equivalence captures pass,
+  seed infrastructure is operational, and release binaries are reproducible
+  and audited — mainnet `hard_fork_height` / `legacy_final_hash` /
+  `transition_pow_bits` remain unset (guard-tested).
 - **Product: B3 Hive** (owner, LOCKED 2026-08-22) is the name of the
   release-v1 hard-fork client; FlowMesh remains the DEX engine's name.
   Release v1 = legacy continuity + corridor + Modern PoS V1, with FN,
@@ -185,12 +209,37 @@ not re-run it.
   catch-up; vote-split recovery; equivocating-proposer containment;
   anchor gating and B3-reorg interaction; FlowMesh-outage isolation.
 
+- **Release-v1 implementation (2026-08-23):** `Consensus::LegacyBoundaryHeightOnly`
+  and the `legacy-boundary-unpinned` header refusal + production guard +
+  `LEGACY_BOUNDARY_UNPINNED` warning; `IsCanonicalCompactBits` enforced on
+  the corridor constant (validation and production); the corridor pacing
+  rule (`transition_pow_min_spacing = 60`, `transition_pow_max_future =
+  120`; `time-too-early-corridor` / `time-too-new`; template time
+  `max(now, parent + 60)`); the owner-supplied seed; **validator UX**: the
+  wallet validator key (non-active `pk()` descriptor, `b3validatorpubkey`
+  record), STAKE carrier resolved to its bare owner script for
+  standardness / ownership / signing (`modern::StakeOwnerScript`, the relay
+  carve-in; non-bare owner suffixes unsolvable), STAKE outputs excluded
+  from automatic coin selection, `node::StakingLoop` behind
+  `interfaces::Chain` (start/stop/status), wallet RPCs `createstake`,
+  `getstakinginfo`, `startstaking`, `stopstaking`; the mainnet checkpoint
+  table moved into `bitcoin_common` so `b3coin-tx` / `b3coin-util` /
+  `b3coin-wallet` link. Verified: `modern_pos_tests` 14/14 (X-pause,
+  canonical bits, pacing, staking loop, the V1 scenarios), the corridor
+  transition cases incl. the 1,000-block corridor, restart/reindex and
+  two-node sync, `b3_evolution_tests`, `fn_pod_tests`, `wallet_tests` incl.
+  the validator-key/stake test, wallet/script regression suites; regtest
+  smoke of the RPCs (key persists across reload, loop start/stop).
+
 ## Not finalized (tracked, not on this branch's guarantees)
 
-- **Release v1 owner inputs** (`doc/design/b3-release-v1.md`): H (proposed
-  815,000) and M = H + 1001; X distribution (pause recommended); seed
-  nodes; the corridor difficulty constant (proposed `0x20000080`);
-  validator UX; platforms. Mainnet H/X remain unset until these are filled.
+- **Release v1, still owed** (`doc/design/b3-release-v1.md`): the pin
+  gates themselves (live-sync assertion fix; T3 + final-H captures; two
+  more fixed seeds and the DNS seed; reproducible audited binaries);
+  platforms; regtest override flags + functional tests of the transition
+  and staking RPCs; `getblocktemplate` corridor support; disk-format
+  detection/reindex message; "B3 Hive" version strings; operator runbook.
+  Mainnet H/X/bits remain unset until the gates pass.
 - Modern PoS V1 provisional numerics: sentinel bits, future-drift bound,
   modern reward schedule (OD-2); the parameter block therefore still ships
   unset. V2 research items remain research.
