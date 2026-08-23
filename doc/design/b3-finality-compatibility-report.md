@@ -15,7 +15,7 @@ Findings marked ⚠ require an owner ruling; ✔ = confirmed consistent; ✎ = e
 
 | # | Finding | Consequence |
 |---|---|---|
-| **F-1 ⚠** | The normative spec places the certificate and the BLS binding in "creation actions type 4/5". **The creation-action section has no live consensus carrier in the tree**: `ModernTransition`/`ModernTransitionV2` are models with "NO generic serialization on purpose", used only in tests; `validation.cpp` has no creation-action hook; status row 147 confirms "nothing decodes them from a peer". The only live modern carriers are **script-level** (`B3S1` STAKE push, the M3 coinbase `scriptSig` declaration, `vchBlockSig`). | Pick the v1 carrier now (§1). Recommended: script-level magic carriers in the txid-committed part of the block, mirroring the ratified STAKE pattern; keep creation-action numbers 4/5 RESERVED for the future codec. |
+| **F-1 ⚠ (revised §7.4)** | The normative spec places the certificate and the BLS binding in "creation actions type 4/5". **The creation-action section has no live consensus carrier in the tree**: `ModernTransition`/`ModernTransitionV2` are models with "NO generic serialization on purpose", used only in tests; `validation.cpp` has no creation-action hook; status row 147 confirms "nothing decodes them from a peer". The only live modern carriers are **script-level** (`B3S1` STAKE push, the M3 coinbase `scriptSig` declaration, `vchBlockSig`). | Pick the v1 carrier now (§1). Recommended: script-level magic carriers in the txid-committed part of the block, mirroring the ratified STAKE pattern; keep creation-action numbers 4/5 RESERVED for the future codec. |
 | **F-2 ⚠** | Spec §4 rotates validator sets on **fixed heights**; the owner's requirement is rotation **only after the current set has produced a valid transition certificate**. As written, a set can take over without `Set_e` ever certifying, which breaks Ethereum's lineage on a one-epoch liveness lapse. | Amend to **handover-gated rotation** (§3). Dissolves the lineage-break case; B3 then matches the verifier's own rule exactly. |
 | **F-3 ✔ (resolves the F decision)** | The v1 binary ships with **H set, X blank and `ModernPosParams` unset**, so it refuses H+1 and can never reach M; the mandatory **X-pin follow-up release** is the binary that runs the corridor and Modern PoS. | **F = M is achievable without putting `blst` into the v1 binary**: the finality rules, `blst`, and the finality parameters ride in the X-pin release together with the PoS parameters. No reservation is needed in v1 at all — v1 processes no modern-era block. Only constraint: the finality implementation must be complete before the X-pin release is cut (days after block H). |
 
@@ -155,6 +155,45 @@ ciphersuite + DSTs; `ModernChainDomain` definition; quorum `floor(2W/3)+1`; weig
 snapshot-at-epoch-start; gated rotation; checkpoint rule; `finality_digest`.
 
 ---
+
+## 7.4 F-1 revised after owner correction (2026-08-23): Policy Outputs, not OP_RETURN
+
+The modern era's data model is the Policy Output (`ModernOutput{asset, amount, policy_type,
+policy_version, commitment 32 B, params ≤ 80 B}`, fail-closed on unknown types). The
+§1 "OP_RETURN carrier" wording is withdrawn. Inspection of `src/modern/policy.h`:
+
+| Policy | Unspendable? | Params | Arbitrary data? |
+|---|---|---|---|
+| LEGACY_LOCK 0 / OWNER 1 / DEX_VAULT 3 / FN 5 | no | empty / 3–35 B / empty | no |
+| BURN 2 | yes | **must be empty**, commitment **must be zero** | no |
+| STAKE 4 | no | 34 B (validator_key ‖ reserved) — v1 wire carrier `B3S1 … OP_DROP <owner script>` | no |
+
+**There is no modern equivalent of OP_RETURN** (by design, contract §23). `BURN` is the
+only unspendable cell and carries no bytes; the 80-byte cap excludes a certificate from any
+existing policy. Classification decides the carrier:
+
+- **`VALIDATOR_BLS_BINDING` = validator state → `STAKE` policy version 2.** params =
+  `validator_key(32) ‖ bls_pubkey(48)` = 80 B (fits the cap unchanged); commitment = owner
+  binding as v1; valid from H+1 like v1. The PoP is creation *authorization*, not state: it
+  rides in the v1 carrier (`PUSH(84: "B3S2" ‖ vk ‖ pk) PUSH(96: pop) OP_2DROP <owner script>`)
+  and is verified in `CheckStakeOutputs` at creation, outside the policy model (it moves to
+  the creation-action area when the codec lands). Binding authority = the staker, as for the
+  v1 validator key — no BIP340 binding signature. Finality weight counts only ACTIVE v2
+  outputs; if one validator key's v2 outputs disagree on `bls_pubkey`, the largest-weight key
+  (tie → lexicographically smaller) is the validator's finality key and the rest do not count.
+  Replaces the §2 "`B3B1` output" and the spec's "binding action type 5".
+- **`FINALITY_CERTIFICATE` = block-consensus metadata** (not transaction state, not
+  validator state). The model-pure home is the coinbase transaction's segregated
+  proof/creation-action area — not live and not buildable for the X-pin release. Smallest
+  new policy type: **`FINALITY_CERT = 6`** (next free number; never renumbered):
+  coinbase-only, ≤ 1 per block, `amount = 0`, native asset, **commitment = `finality_digest`**,
+  params = `FinalizedBlock ‖ bitmap ‖ sig` under a type-specific bound (≤ 1,240 B; the
+  generic 80-byte cap is unchanged for all other policies), unspendable by definition like
+  `BURN`; activated from F. Precedent for block metadata in a coinbase cell: BIP34 height,
+  BIP141 witness commitment. When the codec exists the certificate becomes `FINALITY_CERT v2`
+  in the proof area; v1 bytes are never reinterpreted. Replaces the §1 "`B3F1` OP_RETURN".
+- Reserve creation-action types 4/5 anyway (never reuse); `scriptSig` and `vchBlockSig`
+  remain untouched.
 
 ## 8. Verdict
 
