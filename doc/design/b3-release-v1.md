@@ -14,6 +14,7 @@ assets and FlowMesh shipped activation-inert behind later heights.
 | 3 | Seed nodes | **RULED 2026-08-23:** `176.31.13.198` is one fixed seed (added). Final release REQUIRES at least two additional independently hosted fixed seeds and a DNS seed under our control — both still **pending**. Do not hardcode explorer peers without operator approval. |
 | 4 | Corridor difficulty constant (`transition_pow_bits`) | **RULED 2026-08-23: canonical compact `0x1f008000`** (the same target, 2^239, that `0x20000080` encodes non-canonically; 2^17 expected hashes per block). NOT YET PINNED — see gates. A canonical round-trip test pins the form; non-canonical configured bits fail closed. |
 | 5 | Validator UX for v1 | **RULED 2026-08-23: yes** — wallet-held validator key, `createstake`, staking status, start/stop staking, PENDING/ACTIVE visibility, automatic staking loop. Nothing more advanced in V1. |
+| 6a | Finality gadget reservation (PoS ruling M7, 2026-08-23) | **Decision pending: F = M** (creation actions 4/5 + epoch snapshot + pin + `blst` in the v1 binary; ~3 extra days) **vs F pinned by the X-pin follow-up release** (v1 carries only the syntactic reservation and validator signing). Either way Set_0 must be non-empty before M is published — owner validators bind in the corridor. Spec: [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md) §0/§9. |
 | 6 | Name / platforms | name **B3 Hive — LOCKED**; platforms: macOS arm64 here, Linux x86_64 needs a box/CI — **pending** |
 
 ## Pin / publish gates (owner, 2026-08-23)

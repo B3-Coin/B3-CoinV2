@@ -25,6 +25,17 @@ Owner rulings incorporated (2026-08-20):
   stake; recreated stake re-serves the 20-block activation depth.
 - **M5** — fork choice is PoS-native and explicit (§6); no PoW chainwork
   semantics and no automatically inherited legacy reorg rule.
+- **M7 (owner ruling 2026-08-23 — amends M1's "no finality gadget")** — the
+  V1 architecture **reserves from M** a BLS12-381 finality gadget and BLS
+  validator keys: creation actions type 4 (`FINALITY_CERTIFICATE`, coinbase
+  only, one per block) and type 5 (`VALIDATOR_BLS_BINDING`), epochs from M,
+  the one-epoch-lookahead set snapshot, the frozen `ValidatorSetHeader` /
+  `FinalizedBlock` / `Certificate` layouts, and the finality pin. Cryptographic
+  enforcement begins at height **F** (F = M targeted; otherwise pinned by the
+  mandatory follow-up release); bridge use is a later flag A3 ≥ F. Full
+  specification: [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md).
+  Block production (M1–M6) is unchanged; §10's "committee/finality gadgets"
+  entry is superseded by this ruling.
 - **M6** — a block reward can never directly create active STAKE: the
   coinbase may not contain a STAKE-claiming output.
 - Plus: the unconditional modern coinbase cap (§8) sits **outside** the PoS
@@ -257,7 +268,8 @@ intervention.
 Normalized-score tie resolution (§6); VRF or threshold randomness upgrades to
 the seed; epoch snapshots and incremental-registry commitments for light
 clients; equivocation penalties consuming the V1 evidence trail; unstake
-cooldown; validator-key re-delegation; committee/finality gadgets; reward
+cooldown; validator-key re-delegation; ~~committee/finality gadgets~~ (now
+V1-reserved by M7); reward
 schedule economics; fresh-sync weak-subjectivity hardening beyond operational
 checkpoints. None of these may be implemented without a new owner ruling.
 
