@@ -121,9 +121,19 @@ bool VerifyPoP(const PublicKey& pk, const Signature& pop);
 
 /**
  * A public key whose proof of possession HAS BEEN verified — the only kind
- * that may enter an aggregate. Construct via FromPoP (verifies) or, for
- * indexes rebuilt from blocks that consensus already validated, via the
- * loudly named TrustedFromValidatedChain.
+ * that may enter an aggregate. There is no public constructor.
+ *
+ *  - FromPoP(pk, pop): verifies the PoP; the ONLY path for any key that
+ *    arrives from a transaction, a block being validated, a P2P message, an
+ *    RPC/wallet input, or any other external source.
+ *  - TrustedFromValidatedChain(pk) — INVARIANT (owner, 2026-08-23): permitted
+ *    ONLY when reconstructing consensus state from blocks that already passed
+ *    full validation, i.e. for a key whose binding PoP was verified by
+ *    consensus when its block connected (index rebuild after restart/reorg,
+ *    reindex replay of validated blocks). It is NEVER a bypass around
+ *    FromPoP for network or user input; a key that has not passed PoP
+ *    validation in consensus must never be wrapped by it. Reviewers: every
+ *    call site must cite the validated-chain provenance in a comment.
  */
 class VerifiedPublicKey
 {

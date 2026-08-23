@@ -29,6 +29,7 @@
 #include <array>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -53,6 +54,14 @@ std::optional<bls::SecretKey> KeyFromIndex(const unsigned i)
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(bls_tests)
+
+// VerifiedPublicKey has exactly two construction paths (FromPoP, and the
+// validated-chain reconstruction path) and no public constructor: a raw
+// PublicKey can never be promoted implicitly.
+static_assert(!std::is_default_constructible_v<bls::VerifiedPublicKey>);
+static_assert(!std::is_constructible_v<bls::VerifiedPublicKey, const bls::PublicKey&>);
+static_assert(!std::is_constructible_v<bls::VerifiedPublicKey, bls::PublicKey>);
+static_assert(!std::is_convertible_v<bls::PublicKey, bls::VerifiedPublicKey>);
 
 BOOST_AUTO_TEST_CASE(frozen_scheme_parameters)
 {

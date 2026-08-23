@@ -184,8 +184,23 @@ endif()
 option(BUILD_BENCH "Build bench_bitcoin executable." OFF)
 option(B3_FINALITY_BENCH "Build the B3 finality benchmark harness (timing of the consensus BLS wrapper and MPA codecs)." OFF)
 # The vendored blst (src/blst) is a consensus dependency of crypto/bls since
-# plan Commit 2; its assembly needs the ASM language.
-enable_language(ASM)
+# plan Commit 2 (cmake/blst.cmake). Upstream defines exactly two build paths
+# and the processor selects between them (mirroring upstream build.sh):
+#  - x86_64 / aarch64: pre-generated GNU-syntax assembly (build/assembly.S),
+#    assembled by the C compiler driver itself — no separate assembler tool —
+#    with __BLST_PORTABLE__ so no CPU-feature (ADX) dispatch exists;
+#  - every other processor: blst's pure-C implementation (__BLST_NO_ASM__,
+#    32-bit limbs), no assembly file, no ASM language.
+# Both compute identical results; only speed differs. The selection is not a
+# user option because upstream does not support the pure-C path on
+# x86_64/aarch64 (its 64-bit-limb headers assume the assembly).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64|ARM64)$")
+  set(B3_BLST_NO_ASM OFF)
+  enable_language(ASM)
+else()
+  set(B3_BLST_NO_ASM ON)
+  message(STATUS "blst: processor '${CMAKE_SYSTEM_PROCESSOR}' has no vendored assembly; building the pure-C path")
+endif()
 option(BUILD_FUZZ_BINARY "Build fuzz binary." OFF)
 option(BUILD_FOR_FUZZING "Build for fuzzing. Enabling this will disable all other targets and override BUILD_FUZZ_BINARY." OFF)
 
