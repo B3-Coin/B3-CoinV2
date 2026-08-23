@@ -622,6 +622,20 @@ public:
     //! verification, gated epoch rotation, finalized tip). Consensus reads it in
     //! ConnectBlock; it rebuilds from the active chain whenever out of step.
     node::FinalityTracker& ModernFinality() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /**
+     * Bring the finality tracker to the active tip and raise the block
+     * manager's finality anchor to the highest certified checkpoint (the
+     * finality pin, plan Commit 13). Cheap when in step; a rebuild walks the
+     * modern span. Silently leaves the anchor unchanged when the state is
+     * unavailable (it is only ever raised).
+     */
+    void RefreshFinalityAnchor() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /**
+     * The finality pin refuses a reorganization whose fork point lies below
+     * the pinned checkpoint (it would disconnect the checkpoint). Reorgs whose
+     * fork point is at or above the pin remain ordinary reorgs.
+     */
+    bool ReorgFromForkViolatesFinality(int fork_height) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     //! Return path to chainstate leveldb directory.
     fs::path StoragePath() const;
@@ -860,6 +874,9 @@ public:
      * and never treats a block as violating its own legacy rules.
      */
     bool IsAnchorIneligible(const CBlockIndex& block) const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    //! IsAnchorIneligible, recording the classification on the index entry
+    //! (BLOCK_ANCHOR_INELIGIBLE, persisted) when it holds. Returns the result.
+    bool MarkIfAnchorIneligible(CBlockIndex& block) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /**
      * True once the finalized legacy boundary is ACTIVE on this chain: H/X are

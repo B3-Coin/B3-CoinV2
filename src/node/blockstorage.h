@@ -321,6 +321,8 @@ protected:
     /** Dirty block index entries. */
     std::set<CBlockIndex*> m_dirty_blockindex;
 
+    std::optional<std::pair<int, uint256>> m_finality_anchor GUARDED_BY(cs_main);
+
     /** Dirty block file entries. */
     std::set<int> m_dirty_fileinfo;
 
@@ -400,6 +402,22 @@ public:
      * selection without erasing their recorded chain work.
      */
     bool IsAnchorIneligible(const CBlockIndex& block) const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+    /**
+     * The modern finality pin (plan Commit 13; b3-cross-chain-finality-v1.md
+     * section 4 "Finality pin"): the highest checkpoint certified on the
+     * active chain in this process, as (height, hash). A second finalized
+     * anchor with exactly the legacy-boundary semantics above: a block at or
+     * below the pin height that is not the pin or one of its ancestors, or a
+     * block above it that does not descend from it, is anchor-ineligible.
+     * Monotone: only ever raised (RaiseFinalityAnchor), never lowered by a
+     * disconnect -- so a reorganization that merely removes the certificate
+     * carrier can never open the door to a second reorganization below the
+     * checkpoint. Re-derived from the active chain after restart/reindex by
+     * the FinalityTracker; cleared only with the process.
+     */
+    std::optional<std::pair<int, uint256>> FinalityAnchor() const EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return m_finality_anchor; }
+    void RaiseFinalityAnchor(int height, const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /** Get block file info entry for one block file */
     CBlockFileInfo* GetBlockFileInfo(size_t n);

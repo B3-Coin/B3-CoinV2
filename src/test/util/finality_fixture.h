@@ -53,7 +53,7 @@ struct BindingFixture : public ModernPosSetup {
     CKey m_validator_a, m_validator_b;
     modern::ValidatorKeyBytes m_vk_a{}, m_vk_b{};
 
-    BindingFixture()
+    explicit BindingFixture(TestOpts opts = {}) : ModernPosSetup{std::move(opts)}
     {
         m_validator_a = MakeValidatorKey(0x11);
         m_validator_b = MakeValidatorKey(0x22);
@@ -193,6 +193,17 @@ struct FinalityChainFixture : public BindingFixture {
     bls::SecretKey m_bls_a{Bls(1)};
     bls::SecretKey m_bls_b{Bls(2)};
 
+    explicit FinalityChainFixture(TestOpts opts = {}) : BindingFixture{std::move(opts)} {}
+
+    const CBlockIndex* IndexAt(const int height)
+    {
+        LOCK(cs_main);
+        const CBlockIndex* index{m_node.chainman->ActiveChain()[height]};
+        BOOST_REQUIRE(index != nullptr);
+        return index;
+    }
+    uint256 ChainHashAt(const int height) { return IndexAt(height)->GetBlockHash(); }
+
     //! Legacy -> corridor (stakes + bindings in the first corridor block) ->
     //! last corridor height M-1, with the modern-PoS rule set configured.
     void PrepareFinalityChain(const int min_finality_set = 1, const int reorg_horizon = 200)
@@ -310,16 +321,40 @@ struct FinalityChainFixture : public BindingFixture {
     //! Eligibility weights by whole-B3 share (scale-invariant for the round search).
     CAmount WeightOf(const modern::PosValidatorKey& key) const { return key == m_vk_a ? 15 : 1; }
 
-    //! A modern-PoS block by `key` on the tip, with optional extra coinbase
-    //! cells/records (certificate) and extra transactions; the payload-root
-    //! cell is appended automatically when the block carries any MPA.
+    //! A modern-PoS block by `key` on `prev` whose height is governed by
+    //! `seed` (the parent's eligibility digest -- for a side branch whose
+    //! parent was never connected the caller threads it), with optional
+    //! extra coinbase cells/records (certificate) and extra transactions;
+    //! the payload-root cell is appended automatically when the block
+    //! carries any MPA. Returns the block and its own digest (= the next
+    //! height's seed).
+    std::pair<CBlock, uint256> BuildPosBlockOnSeed(const CBlockIndex* prev, const uint256& seed,
+                                                   const modern::PosValidatorKey& key,
+                                                   const std::vector<std::pair<CScript, CMpaRecord>>& coinbase_payload = {},
+                                                   std::vector<CMutableTransaction> txs = {}, const int extra = 0)
+    {
+        const Consensus::ModernPosParams& pos{*m_node.chainman->GetConsensus().modern_pos};
+        int64_t round{-1};
+        uint256 digest;
+        for (int64_t r{0}; r < 100'000 && round < 0; ++r) {
+            const uint256 d{modern::ModernPosEligibilityDigest(Domain(), seed, static_cast<uint32_t>(prev->nHeight + 1),
+                                                               static_cast<uint32_t>(r), key)};
+            if (modern::ModernPosEligible(d, WeightOf(key), 16, r, pos)) { round = r; digest = d; }
+        }
+        BOOST_REQUIRE(round >= 0);
+        return {FinishPosBlock(BuildPos(prev, key, round, 0, extra, std::move(txs)), key, coinbase_payload), digest};
+    }
     CBlock BuildPosBlock(const modern::PosValidatorKey& key,
                          const std::vector<std::pair<CScript, CMpaRecord>>& coinbase_payload = {},
                          std::vector<CMutableTransaction> txs = {}, const int extra = 0)
     {
         const CBlockIndex* prev{Tip()};
-        const int64_t round{FindRound(prev, key, WeightOf(key), 16)};
-        CBlock block{BuildPos(prev, key, round, 0, extra, std::move(txs))};
+        return BuildPosBlockOnSeed(prev, SeedFor(prev), key, coinbase_payload, std::move(txs), extra).first;
+    }
+    //! Append the coinbase payload (+ root cell), recompute the merkle root, sign.
+    CBlock FinishPosBlock(CBlock block, const modern::PosValidatorKey& key,
+                          const std::vector<std::pair<CScript, CMpaRecord>>& coinbase_payload)
+    {
         CMutableTransaction coinbase{*block.vtx[0]};
         std::vector<CMpaRecord> records;
         for (const auto& [cell, rec] : coinbase_payload) {
@@ -365,6 +400,12 @@ struct FinalityChainFixture : public BindingFixture {
         if (block.GetBlockTime() > GetTime()) SetMockTime(block.GetBlockTime());
         SubmitExpectConnectFailure(block);
     }
+};
+
+//! Disk-backed variant for restart / reindex scenarios.
+struct FinalityChainDiskFixture : public FinalityChainFixture {
+    FinalityChainDiskFixture()
+        : FinalityChainFixture{{.coins_db_in_memory = false, .block_tree_db_in_memory = false}} {}
 };
 
 } // namespace b3test

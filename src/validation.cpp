@@ -2046,6 +2046,29 @@ node::FinalityTracker& Chainstate::ModernFinality()
     return *m_finality_tracker;
 }
 
+void Chainstate::RefreshFinalityAnchor()
+{
+    AssertLockHeld(::cs_main);
+    const Consensus::Params& consensus{m_chainman.GetConsensus()};
+    if (!consensus.legacy_b3coin || !consensus.modern_pos || !Consensus::LegacyBoundaryPinned(consensus)) return;
+    const CBlockIndex* tip{m_chain.Tip()};
+    if (!tip) return;
+    const std::optional<int> modern_start{Consensus::ModernPosStartHeight(consensus)};
+    if (!modern_start || tip->nHeight < *modern_start) return;
+    node::FinalityTracker& finality{ModernFinality()};
+    if (!finality.Sync(m_chain, m_blockman, consensus, *tip)) return;
+    if (const auto& fin{finality.Current().finalized}) {
+        m_blockman.RaiseFinalityAnchor(fin->height, fin->block_hash);
+    }
+}
+
+bool Chainstate::ReorgFromForkViolatesFinality(const int fork_height) const
+{
+    AssertLockHeld(::cs_main);
+    const auto anchor{m_blockman.FinalityAnchor()};
+    return anchor.has_value() && fork_height < anchor->first;
+}
+
 fs::path Chainstate::StoragePath() const
 {
     fs::path path{m_chainman.m_options.datadir / "chainstate"};
@@ -3796,6 +3819,13 @@ bool Chainstate::ConnectTip(
     }
     if (m_finality_tracker) {
         m_finality_tracker->BlockConnected(*block_to_connect, *pindexNew, m_chainman.GetConsensus());
+        // The finality pin: a certificate connected on the active chain pins
+        // its checkpoint for the life of the process (monotone).
+        if (m_finality_tracker->Synced(pindexNew->GetBlockHash())) {
+            if (const auto& fin{m_finality_tracker->Current().finalized}) {
+                m_blockman.RaiseFinalityAnchor(fin->height, fin->block_hash);
+            }
+        }
     }
     const auto time_4{SteadyClock::now()};
     m_chainman.time_flush += time_4 - time_3;
@@ -3880,6 +3910,16 @@ bool Chainstate::IsAnchorIneligible(const CBlockIndex& block) const
     return m_blockman.IsAnchorIneligible(block);
 }
 
+bool Chainstate::MarkIfAnchorIneligible(CBlockIndex& block)
+{
+    AssertLockHeld(::cs_main);
+    if (block.nStatus & BLOCK_ANCHOR_INELIGIBLE) return true;
+    if (!IsAnchorIneligible(block)) return false;
+    block.nStatus |= BLOCK_ANCHOR_INELIGIBLE;
+    m_blockman.m_dirty_blockindex.insert(&block);
+    return true;
+}
+
 bool Chainstate::LegacyBoundaryActive() const
 {
     AssertLockHeld(::cs_main);
@@ -3892,6 +3932,9 @@ bool Chainstate::LegacyBoundaryActive() const
 CBlockIndex* Chainstate::FindMostWorkChain()
 {
     AssertLockHeld(::cs_main);
+    // Make the finality pin current before judging candidates: a candidate
+    // off the pinned checkpoint is anchor-ineligible exactly like one off X.
+    RefreshFinalityAnchor();
     do {
         CBlockIndex *pindexNew = nullptr;
 
@@ -4009,6 +4052,18 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
                    __func__, pindexMostWork->GetBlockHash().ToString(), pindexMostWork->nHeight);
         setBlockIndexCandidates.erase(pindexMostWork);
         // Signals the caller to drop its cached candidate and reselect.
+        fInvalidFound = true;
+        return true;
+    }
+    // The modern finality pin, with the same shape: a branch forking below
+    // the pinned checkpoint would disconnect it and can never activate
+    // (modern-finality-violation). FindMostWorkChain() already discards such
+    // candidates; this is the defensive check for one that appeared later.
+    if (m_chain.Tip() != nullptr && m_chain.Tip() != pindexFork &&
+        ReorgFromForkViolatesFinality(pindexFork ? pindexFork->nHeight : -1)) {
+        LogWarning("%s: refusing to activate %s (height %d): modern-finality-violation (would disconnect the finalized checkpoint)\n",
+                   __func__, pindexMostWork->GetBlockHash().ToString(), pindexMostWork->nHeight);
+        setBlockIndexCandidates.erase(pindexMostWork);
         fInvalidFound = true;
         return true;
     }
@@ -4432,6 +4487,15 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
 
     {
         LOCK(cs_main);
+        // The finality pin: invalidating the pinned checkpoint or anything
+        // below it on the active chain would disconnect it -- refused, no
+        // administrative override (b3-cross-chain-finality-v1.md section 4).
+        RefreshFinalityAnchor();
+        if (m_chain.Contains(pindex) && ReorgFromForkViolatesFinality(pindex->nHeight - 1)) {
+            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "modern-finality-violation",
+                          strprintf("block at height %d is at or below the finalized checkpoint", pindex->nHeight));
+            return false;
+        }
         for (auto& entry : m_blockman.m_block_index) {
             CBlockIndex* candidate = &entry.second;
             // We don't need to put anything in our active chain into the
@@ -4512,17 +4576,21 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
                 candidate_it = highpow_outofchain_headers.erase(candidate_it);
                 continue;
             }
+            // An off-anchor candidate (legacy boundary X or the finality pin)
+            // is never a candidate or best header; record the classification
+            // so CheckBlockIndex and later passes see it without re-judging.
+            const bool off_anchor{MarkIfAnchorIneligible(*candidate)};
             if (!setBlockIndexCandidates.value_comp()(candidate, new_tip) &&
                 candidate->IsValid(BLOCK_VALID_TRANSACTIONS) &&
                 candidate->HaveNumChainTxs() &&
-                !m_blockman.IsAnchorIneligible(*candidate)) {
+                !off_anchor) {
                 setBlockIndexCandidates.insert(candidate);
                 // Do not remove candidate from the highpow_outofchain_headers cache, because it might be a descendant of the block being invalidated
                 // which needs to be marked failed later.
             }
             if (best_header_needs_update &&
                 m_chainman.m_best_header->nChainWork < candidate->nChainWork &&
-                !m_blockman.IsAnchorIneligible(*candidate)) {
+                !off_anchor) {
                 m_chainman.m_best_header = candidate;
             }
             ++candidate_it;
@@ -5433,6 +5501,21 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
                 return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "modern-reorg-too-deep",
                                      strprintf("modern-PoS block at height %d is %d or more blocks below the tip at %d",
                                                nHeight, *pos.reorg_horizon, tip->nHeight));
+            }
+        }
+        // The finality pin (from F = M): a header whose branch forks below the
+        // finalized checkpoint would disconnect it -- refused without peer
+        // penalty; skipped while importing/reindexing our own blocks. Forks at
+        // or above the pin remain ordinary reorganizations.
+        // The anchor is kept current by ConnectTip / FindMostWorkChain (every
+        // ActivateBestChain pass), so a header is judged against the pin the
+        // active chain has already established.
+        if (const auto anchor{blockman.FinalityAnchor()}; anchor && !blockman.LoadingBlocks()) {
+            if (const CBlockIndex* fork{chainman.ActiveChain().FindFork(pindexPrev)};
+                fork && fork->nHeight < anchor->first) {
+                return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "modern-finality-violation",
+                                     strprintf("modern-PoS block at height %d forks at height %d, below the finalized checkpoint",
+                                               nHeight, fork->nHeight));
             }
         }
     } else {

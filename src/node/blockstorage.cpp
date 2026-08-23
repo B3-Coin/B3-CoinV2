@@ -300,6 +300,20 @@ const CBlockIndex* BlockManager::LookupBlockIndex(const uint256& hash) const
     return it == m_block_index.end() ? nullptr : &it->second;
 }
 
+namespace {
+//! Off-anchor test shared by the legacy boundary X and the finality pin.
+bool OffAnchor(const CBlockIndex& block, const CBlockIndex& anchor)
+{
+    if (block.nHeight <= anchor.nHeight) {
+        // At or below the anchor a block is eligible only if it is on the
+        // canonical prefix, i.e. it is the anchor itself or one of its ancestors.
+        return anchor.GetAncestor(block.nHeight) != &block;
+    }
+    // Above the anchor a block is eligible only if it descends from it.
+    return block.GetAncestor(anchor.nHeight) != &anchor;
+}
+} // namespace
+
 bool BlockManager::IsAnchorIneligible(const CBlockIndex& block) const
 {
     AssertLockHeld(cs_main);
@@ -308,21 +322,28 @@ bool BlockManager::IsAnchorIneligible(const CBlockIndex& block) const
     const std::optional<int> final_height{Consensus::LegacyFinalHeight(params)};
     // Not classifiable unless both the boundary height H and the finalized
     // hash X are configured: without X there is no anchor to measure against.
-    if (!final_height || !params.legacy_final_hash) return false;
-
-    const CBlockIndex* pindexX{LookupBlockIndex(*params.legacy_final_hash)};
-    // X itself is not in the index yet, so the block's relationship to it is
-    // not yet determined; it will be reclassified once X is known.
-    if (!pindexX) return false;
-
-    const int H{*final_height};
-    if (block.nHeight <= H) {
-        // At or below H a block is eligible only if it is on the canonical
-        // prefix, i.e. it is X itself or one of X's ancestors.
-        return pindexX->GetAncestor(block.nHeight) != &block;
+    if (final_height && params.legacy_final_hash) {
+        // X itself not in the index yet: the block's relationship to it is not
+        // yet determined; it will be reclassified once X is known.
+        if (const CBlockIndex* pindexX{LookupBlockIndex(*params.legacy_final_hash)}) {
+            if (OffAnchor(block, *pindexX)) return true;
+        }
     }
-    // Above H a block is eligible only if it descends from X.
-    return block.GetAncestor(H) != pindexX;
+    // The modern finality pin: the same topological rule against the highest
+    // certified checkpoint of this process (see RaiseFinalityAnchor).
+    if (m_finality_anchor) {
+        if (const CBlockIndex* pin{LookupBlockIndex(m_finality_anchor->second)}) {
+            if (OffAnchor(block, *pin)) return true;
+        }
+    }
+    return false;
+}
+
+void BlockManager::RaiseFinalityAnchor(const int height, const uint256& hash)
+{
+    AssertLockHeld(cs_main);
+    if (m_finality_anchor && m_finality_anchor->first >= height) return;
+    m_finality_anchor = std::make_pair(height, hash);
 }
 
 CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockIndex*& best_header)
