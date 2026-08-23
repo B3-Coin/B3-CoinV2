@@ -84,6 +84,7 @@ add_executable(test_bitcoin
   finality_types_tests.cpp
   bls_tests.cpp
   metadata_cell_tests.cpp
+  finality_key_tests.cpp
   modern_pos_tests.cpp
   miniminer_tests.cpp
   miniscript_tests.cpp
