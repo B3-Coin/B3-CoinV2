@@ -7,6 +7,7 @@
 
 #include <consensus/amount.h>
 #include <consensus/validation.h>
+#include <modern/payload_cost.h>
 #include <core_memusage.h>
 #include <policy/policy.h>
 #include <policy/settings.h>
@@ -79,6 +80,7 @@ private:
     const unsigned int entryHeight; //!< Chain height when entering the mempool
     const bool spendsCoinbase;      //!< keep track of transactions that spend a coinbase
     const int64_t sigOpCost;        //!< Total sigop cost
+    const int64_t m_payload_cost;   //!< B3 payload verification cost (modern/payload_cost.h); priced into vsize
     mutable CAmount m_modified_fee; //!< Used for determining the priority of the transaction for mining in a block
     mutable LockPoints lockPoints;  //!< Track the height and time at which tx was final
 
@@ -97,6 +99,7 @@ public:
           entryHeight{entry_height},
           spendsCoinbase{spends_coinbase},
           sigOpCost{sigops_cost},
+          m_payload_cost{modern::PayloadVerifyCost(*tx)},
           m_modified_fee{nFee},
           lockPoints{lp} {}
 
@@ -109,9 +112,10 @@ public:
     const CAmount& GetFee() const { return nFee; }
     int32_t GetTxSize() const
     {
-        return GetVirtualTransactionSize(nTxWeight, sigOpCost, ::nBytesPerSigOp);
+        return GetVirtualTransactionSize(nTxWeight, sigOpCost, ::nBytesPerSigOp, m_payload_cost);
     }
-    int32_t GetAdjustedWeight() const { return GetSigOpsAdjustedWeight(nTxWeight, sigOpCost, ::nBytesPerSigOp); }
+    int32_t GetAdjustedWeight() const { return GetSigOpsAdjustedWeight(nTxWeight, sigOpCost, ::nBytesPerSigOp, m_payload_cost); }
+    int64_t GetPayloadCost() const { return m_payload_cost; }
     int32_t GetTxWeight() const { return nTxWeight; }
     std::chrono::seconds GetTime() const { return std::chrono::seconds{nTime}; }
     unsigned int GetHeight() const { return entryHeight; }

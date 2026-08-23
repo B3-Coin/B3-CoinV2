@@ -10,6 +10,7 @@
 #include <modern/finality_key.h>
 #include <modern/finality_types.h>
 #include <modern/metadata_cell.h>
+#include <modern/payload_cost.h>
 #include <modern/policy.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
@@ -145,6 +146,9 @@ inline bool CheckTransactionMpa(const CTransaction& tx, const Consensus::Params&
             return false;
         }
     }
+    // Per-transaction verification-cost budget, from the frames alone, before
+    // any cryptography (the block budget is checked at block level).
+    if (!CheckTransactionPayloadCost(tx, error)) return false;
     return true;
 }
 

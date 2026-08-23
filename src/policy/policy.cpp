@@ -7,6 +7,8 @@
 
 #include <policy/policy.h>
 
+#include <modern/payload_cost.h>
+
 #include <coins.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
@@ -373,19 +375,20 @@ bool SpendsNonAnchorWitnessProg(const CTransaction& tx, const CCoinsViewCache& p
     return false;
 }
 
-int64_t GetSigOpsAdjustedWeight(int64_t weight, int64_t sigop_cost, unsigned int bytes_per_sigop)
+int64_t GetSigOpsAdjustedWeight(int64_t weight, int64_t sigop_cost, unsigned int bytes_per_sigop, int64_t payload_cost)
 {
-    return std::max(weight, sigop_cost * bytes_per_sigop);
+    const int64_t payload_weight{payload_cost * PAYLOAD_COST_TO_VBYTES * WITNESS_SCALE_FACTOR};
+    return std::max({weight, sigop_cost * bytes_per_sigop, payload_weight});
 }
 
-int64_t GetVirtualTransactionSize(int64_t nWeight, int64_t nSigOpCost, unsigned int bytes_per_sigop)
+int64_t GetVirtualTransactionSize(int64_t nWeight, int64_t nSigOpCost, unsigned int bytes_per_sigop, int64_t payload_cost)
 {
-    return (GetSigOpsAdjustedWeight(nWeight, nSigOpCost, bytes_per_sigop) + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR;
+    return (GetSigOpsAdjustedWeight(nWeight, nSigOpCost, bytes_per_sigop, payload_cost) + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR;
 }
 
 int64_t GetVirtualTransactionSize(const CTransaction& tx, int64_t nSigOpCost, unsigned int bytes_per_sigop)
 {
-    return GetVirtualTransactionSize(GetTransactionWeight(tx), nSigOpCost, bytes_per_sigop);
+    return GetVirtualTransactionSize(GetTransactionWeight(tx), nSigOpCost, bytes_per_sigop, modern::PayloadVerifyCost(tx));
 }
 
 int64_t GetVirtualTransactionInputSize(const CTxIn& txin, int64_t nSigOpCost, unsigned int bytes_per_sigop)

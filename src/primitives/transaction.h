@@ -289,6 +289,17 @@ void UnserializeMpaSection(Stream& s, std::vector<CMpaRecord>& out)
     }
 }
 
+//! Serialized size of the MPA section exactly as SerializeMpaSection writes
+//! it (0 when there are no records). Used by the weight rule: MPA bytes count
+//! at the full scale factor (no witness discount).
+inline size_t GetMpaSectionSerializedSize(const std::vector<CMpaRecord>& mpa)
+{
+    if (mpa.empty()) return 0;
+    size_t size{GetSizeOfCompactSize(mpa.size())};
+    for (const CMpaRecord& rec : mpa) size += 4 + GetSizeOfCompactSize(rec.payload.size()) + rec.payload.size();
+    return size;
+}
+
 template<typename Stream>
 void SerializeMpaSection(Stream& s, const std::vector<CMpaRecord>& mpa)
 {

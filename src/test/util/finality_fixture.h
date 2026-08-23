@@ -75,7 +75,7 @@ struct BindingFixture : public ModernPosSetup {
         fund.vin[0].prevout = COutPoint{coinbase1, 0};
         m_fund_value = legacy::GetProofOfWorkReward(0, 1, consensus);
         // several spendable outputs for several blocks
-        for (int i = 0; i < 6; ++i) fund.vout.emplace_back(m_fund_value / 8, CScript() << OP_TRUE);
+        for (int i = 0; i < 12; ++i) fund.vout.emplace_back(m_fund_value / 16, CScript() << OP_TRUE);
         const CBlock block_h{BuildLegacy(Tip(), {fund})};
         m_fund_txid = block_h.vtx[1]->GetHash();
         BOOST_REQUIRE(Submit(block_h));
@@ -134,7 +134,7 @@ struct BindingFixture : public ModernPosSetup {
         tx.version = 2;
         tx.vin.resize(1);
         tx.vin[0].prevout = COutPoint{m_fund_txid, n};
-        tx.vout.emplace_back(m_fund_value / 8 - 100, CScript() << OP_TRUE);
+        tx.vout.emplace_back(m_fund_value / 16 - 100, CScript() << OP_TRUE);
         for (const auto& c : cells) tx.vout.emplace_back(0, c);
         std::sort(records.begin(), records.end(), modern::MpaRecordLess); // canonical order
         tx.mpa = std::move(records);

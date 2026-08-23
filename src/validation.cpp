@@ -5499,6 +5499,11 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
                 }
             }
         }
+        // Payload verification-cost budget per block, from the record frames
+        // alone -- before ConnectBlock runs any BLS/BIP340 verification.
+        if (std::string cost_error; !modern::CheckBlockPayloadCost(block, cost_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-block-payload-cost", cost_error);
+        }
         // MODERN_PAYLOAD_ROOT (Path B): every MPA in the block is committed into
         // the block hash through exactly one coinbase root cell; no MPA => no cell.
         if (std::string root_error; !modern::CheckBlockPayloadRoot(block, root_error)) {
