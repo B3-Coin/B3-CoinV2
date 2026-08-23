@@ -52,6 +52,10 @@ target_link_libraries(bitcoin_clientversion
 )
 add_dependencies(bitcoin_clientversion generate_build_info)
 
+# Pinned blst (src/blst, upstream v0.3.17) — consensus dependency of
+# crypto/bls (plan Commit 2). Portable build; narrow wrapper only.
+include(../cmake/blst.cmake)
+add_b3_blst()
 add_subdirectory(crypto)
 add_subdirectory(util)
 if(ENABLE_IPC)
@@ -452,10 +456,7 @@ if(BUILD_BENCH)
 endif()
 
 if(B3_FINALITY_BENCH)
-  # Benchmark-only (owner ruling 2026-08-23): vendored blst + harness. Not a
-  # dependency of any node, wallet, test or consensus target.
-  include(../cmake/blst.cmake)
-  add_b3_blst()
+  # Timing harness over the same vendored blst the consensus wrapper uses.
   add_executable(b3-finality-bench bench/b3_finality_bench.cpp)
   target_link_libraries(b3-finality-bench
     PRIVATE

@@ -54,9 +54,8 @@ inline constexpr size_t FINALITY_KEY_EVIDENCE_SIZE{244};       // 32 + 48 + 4 + 
 inline constexpr int64_t FINALITY_CERTIFICATE_VERIFY_COST{2000};
 inline constexpr int64_t FINALITY_KEY_EVIDENCE_VERIFY_COST{700};
 
-//! Ciphersuite identifiers (the Ethereum BLS variant): pubkeys G1, sigs G2.
-inline constexpr const char* BLS_SIG_DST{"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_"};
-inline constexpr const char* BLS_POP_DST{"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_"};
+//! The BLS scheme (curve, sizes, DSTs, decode and verification rules) is
+//! frozen in crypto/bls.h — the only BLS surface consensus code may use.
 
 //! Tagged-hash domains (BIP340 TaggedHash convention, SHA-256).
 inline constexpr const char* FINALITY_DIGEST_TAG{"B3/FINALITY/V1"};

@@ -2,9 +2,9 @@
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://opensource.org/license/mit/.
 
-# Vendored, pinned blst (src/blst, upstream v0.3.17 @ 54e6e556) —
-# BENCHMARK-ONLY (owner ruling 2026-08-23). Built only when
-# B3_FINALITY_BENCH=ON; never linked into node, wallet, tests or consensus.
+# Vendored, pinned blst (src/blst, upstream v0.3.17 @ 54e6e556).
+# Consensus dependency of crypto/bls (plan Commit 2, owner-approved); reached
+# ONLY through that narrow wrapper — no other target includes blst.h.
 # __BLST_PORTABLE__ keeps the arithmetic path independent of CPU features.
 function(add_b3_blst)
   add_library(b3_blst STATIC EXCLUDE_FROM_ALL

@@ -82,6 +82,7 @@ add_executable(test_bitcoin
   miner_tests.cpp
   modern_stake_tests.cpp
   finality_types_tests.cpp
+  bls_tests.cpp
   modern_pos_tests.cpp
   miniminer_tests.cpp
   miniscript_tests.cpp
@@ -172,6 +173,7 @@ add_executable(test_bitcoin
 include(TargetDataSources)
 target_json_data_sources(test_bitcoin
   data/base58_encode_decode.json
+  data/bls12_381_eth_vectors.json
   data/bip341_wallet_vectors.json
   data/blockfilters.json
   data/key_io_invalid.json
