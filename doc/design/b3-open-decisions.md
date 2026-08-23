@@ -209,6 +209,7 @@ issuer-freeze policy handling is specified. Gated well behind H+1 (activation A3
 - End state: an issuer taking mint authority in place (native issuance) — a business outcome, not a protocol dependency.
 - Recommended, not yet ruled: Ethereum **L1** (not an L2) as the stable origin — an Arbitrum origin adds a rollup-state proof and ~6.4-day BoLD finality or sequencer trust, and its USDT is USDT0 (LayerZero-backed).
 - Still OPEN: exact light-client verification rules and the `blst`/keccak/RLP/MPT dependency decision, sync-committee participation threshold, mint caps, watcher veto, fork-upgrade procedure, re-bootstrap rule, issuer-freeze handling.
+- **2026-08-23 owner direction: "BLS is the key to bridge."** BLS12-381 aggregate signatures are the keystone of BOTH legs — verifying Ethereum's sync committee (mint leg) and, with BLS keys on B3's committee, letting Ethereum verify B3 checkpoints via EIP-2537 (release leg) — so no trusted signer set remains in either consensus. Plan, inventory (blst vendoring, Keccak-256, SSZ/RLP/MPT, `BRIDGE_BACKED` + `LIGHT_CLIENT_UPDATE` + `BRIDGE_MINT`/`BRIDGE_BURN` actions, B3 BLS committee), staged build order and the remaining owner decisions: [b3-bridge-bls-proposal.md](b3-bridge-bls-proposal.md). Still not authorized for consensus wiring before v1 ships and proposal §8 is ruled.
 
 ---
 
