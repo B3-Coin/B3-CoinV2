@@ -5268,6 +5268,19 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash",
                                  "temporary-PoW scrypt eligibility hash exceeds target");
         }
+        // Corridor PACING (owner ruling 2026-08-23): minimum spacing after
+        // the parent plus a tight future bound, so the corridor's wall-clock
+        // duration is bounded below by rule -- a large miner can grind the
+        // fixed target instantly but cannot make the clock run faster.
+        if (block.GetBlockTime() < pindexPrev->GetBlockTime() + consensusParams.transition_pow_min_spacing) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "time-too-early-corridor",
+                                 strprintf("temporary-PoW corridor block is less than %d seconds after its parent",
+                                           consensusParams.transition_pow_min_spacing));
+        }
+        if (block.Time() > NodeClock::now() + std::chrono::seconds{consensusParams.transition_pow_max_future}) {
+            return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new",
+                                 "temporary-PoW corridor block timestamp too far in the future");
+        }
     } else if (consensusParams.legacy_b3coin && consensusParams.modern_pos) {
         // Modern-PoS V1 header rules (frozen spec §3-§4, §6). There is no
         // difficulty retarget: nBits is a dead field pinned to the sentinel,

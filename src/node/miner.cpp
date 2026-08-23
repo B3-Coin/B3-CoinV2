@@ -324,6 +324,13 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         pblock->vchBlockSig.assign(modern::MODERN_POS_SIG_SIZE, 0x00);
     } else {
         UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
+        if (b3_corridor) {
+            // Corridor pacing: never earlier than parent + minimum spacing
+            // (the network refuses it); the future bound then paces
+            // acceptance in real time.
+            pblock->nTime = static_cast<uint32_t>(std::max<int64_t>(
+                pblock->nTime, pindexPrev->GetBlockTime() + b3_consensus.transition_pow_min_spacing));
+        }
         pblock->nBits = b3_corridor ? *b3_consensus.transition_pow_bits
                                     : GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
     }

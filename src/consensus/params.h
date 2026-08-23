@@ -126,6 +126,17 @@ struct Params {
      */
     int transition_pow_length{0};
     /**
+     * Corridor PACING (owner ruling 2026-08-23): a corridor block's timestamp
+     * must be at least this many seconds after its parent's, and at most
+     * `transition_pow_max_future` seconds ahead of the validating node's
+     * clock. Together they bound the corridor's wall-clock duration from
+     * below (>= length * spacing - max_future) regardless of hashpower, so a
+     * large miner cannot compress the window operators need to create and
+     * mature STAKE outputs. Consensus rules for every corridor.
+     */
+    int64_t transition_pow_min_spacing{60};
+    int64_t transition_pow_max_future{120};
+    /**
      * The compact-bits target every temporary-PoW corridor block must carry
      * (constant corridor difficulty). The block's scrypt eligibility hash
      * must not exceed this target. Unset means the corridor difficulty

@@ -156,7 +156,7 @@ struct ModernPosSetup : public ChainTestingSetup {
     }
 
     CBlock BuildCorridor(const CBlockIndex* prev, std::vector<CMutableTransaction> txs,
-                         const int64_t time_delta = 17, const uint32_t bits = EASY_BITS)
+                         const int64_t time_delta = 60, const uint32_t bits = EASY_BITS)
     {
         CMutableTransaction coinbase;
         coinbase.version = 2;
@@ -521,36 +521,63 @@ BOOST_FIXTURE_TEST_CASE(corridor_bits_must_be_canonical, ModernPosSetup)
 
     AdvanceLegacyToH();
     ConfigureCorridor(Tip()->GetBlockHash(), NONCANONICAL);
-    BOOST_CHECK(!Submit(BuildCorridor(Tip(), {}, 17, NONCANONICAL)));
+    BOOST_CHECK(!Submit(BuildCorridor(Tip(), {}, 60, NONCANONICAL)));
     BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H);
     ConfigureCorridor(Tip()->GetBlockHash(), CANONICAL);
-    BOOST_REQUIRE(Submit(BuildCorridor(Tip(), {}, 17, CANONICAL)));
+    BOOST_REQUIRE(Submit(BuildCorridor(Tip(), {}, 60, CANONICAL)));
     BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H + 1);
 }
 
-//! Owner instruction (2026-08-23): "verify corridor pacing cannot be
-//! compressed unexpectedly by large hashpower; do not assume fixed
-//! difficulty implies fixed elapsed time." VERIFIED: it CAN be compressed.
-//! A corridor header is bound only by median-time-past and the 2 h future
-//! window, so consecutive corridor blocks one second apart are all valid --
-//! a fast miner can burn through the whole corridor in wall-clock seconds.
-//! This test PINS the current (compressible) behaviour so that the pacing
-//! rule, when the owner rules one (corridor doc §6.1), flips a visible
-//! expectation instead of silently changing consensus.
-BOOST_FIXTURE_TEST_CASE(corridor_pacing_is_unbounded, ModernPosSetup)
+//! Corridor PACING (owner ruling 2026-08-23, after the verification that a
+//! fixed difficulty alone lets hashpower compress the corridor): a corridor
+//! block must be at least `transition_pow_min_spacing` (60 s) after its
+//! parent and at most `transition_pow_max_future` (120 s) ahead of the
+//! node's clock. So the corridor takes at least ~length * 60 s of real time
+//! no matter how much hashpower shows up, while a lone CPU still proceeds at
+//! its natural pace.
+BOOST_FIXTURE_TEST_CASE(corridor_pacing_enforced, ModernPosSetup)
 {
     AdvanceLegacyToH();
     ConfigureCorridor(Tip()->GetBlockHash());
-    const int64_t start_time{Tip()->GetBlockTime()};
-    constexpr int BURST{SYN_CORRIDOR - 1};
-    for (int i{0}; i < BURST; ++i) {
-        BOOST_REQUIRE_MESSAGE(Submit(BuildCorridor(Tip(), {}, /*time_delta=*/1)),
-                              "1-second-spaced corridor block at height " << Tip()->nHeight + 1 << " rejected");
+    const Consensus::Params& consensus{m_node.chainman->GetConsensus()};
+    BOOST_CHECK_EQUAL(consensus.transition_pow_min_spacing, 60);
+    BOOST_CHECK_EQUAL(consensus.transition_pow_max_future, 120);
+
+    // One-second and 59-second spacing are refused; exactly 60 s is accepted.
+    BOOST_CHECK(!Submit(BuildCorridor(Tip(), {}, /*time_delta=*/1)));
+    BOOST_CHECK(!Submit(BuildCorridor(Tip(), {}, /*time_delta=*/59)));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H);
+    BOOST_REQUIRE(Submit(BuildCorridor(Tip(), {}, /*time_delta=*/60)));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H + 1);
+
+    // A burst of blocks advances chain time by at least 60 s each: the
+    // corridor cannot be compressed below length * spacing of chain time.
+    const int64_t burst_start{Tip()->GetBlockTime()};
+    constexpr int BURST{10};
+    for (int i{0}; i < BURST; ++i) BOOST_REQUIRE(Submit(BuildCorridor(Tip(), {}, /*time_delta=*/60)));
+    BOOST_CHECK_EQUAL(Tip()->GetBlockTime() - burst_start, BURST * 60);
+
+    // The future bound paces acceptance in real time: a block dated more than
+    // 120 s past the clock is refused (held, not marked invalid); within the
+    // bound it is accepted.
+    SetMockTime(Tip()->GetBlockTime() + 60);
+    BOOST_CHECK(!Submit(BuildCorridor(Tip(), {}, /*time_delta=*/60 + 121)));
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(m_node.chainman->m_blockman.LookupBlockIndex(BuildCorridor(Tip(), {}, 60 + 121).GetHash()) == nullptr);
     }
-    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H + BURST);
-    // BURST blocks advanced chain time by exactly BURST seconds: no minimum
-    // spacing exists. (Mitigation is an owner decision; see corridor doc §6.1.)
-    BOOST_CHECK_EQUAL(Tip()->GetBlockTime() - start_time, BURST);
+    BOOST_REQUIRE(Submit(BuildCorridor(Tip(), {}, /*time_delta=*/60 + 120)));
+
+    // Production respects the spacing: the template is never earlier than
+    // parent + 60 s.
+    SetMockTime(Tip()->GetBlockTime() + 1);
+    node::BlockAssembler::Options options;
+    options.coinbase_output_script = CScript() << OP_TRUE;
+    options.include_dummy_extranonce = true;
+    const auto tmpl{node::BlockAssembler(m_node.chainman->ActiveChainstate(), nullptr, options).CreateNewBlock()};
+    BOOST_REQUIRE(tmpl);
+    BOOST_CHECK_GE(tmpl->block.GetBlockTime(), Tip()->GetBlockTime() + 60);
+    SetMockTime(MOCK_NOW);
 }
 
 //! The automatic staking loop (release-v1 validator UX): started with
