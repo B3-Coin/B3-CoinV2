@@ -2069,6 +2069,20 @@ bool Chainstate::ReorgFromForkViolatesFinality(const int fork_height) const
     return anchor.has_value() && fork_height < anchor->first;
 }
 
+std::optional<std::pair<CAmount, CAmount>> Chainstate::ModernEligibilityWeights(
+    const std::array<unsigned char, 32>& validator_key, const CBlockIndex& parent)
+{
+    AssertLockHeld(::cs_main);
+    const Consensus::Params& consensus{m_chainman.GetConsensus()};
+    node::FinalityTracker& finality{ModernFinality()};
+    if (!finality.Sync(m_chain, m_blockman, consensus, parent)) return std::nullopt;
+    const auto set{finality.SetInForceAt(parent.nHeight + 1, consensus)};
+    if (!set) return std::make_pair(CAmount{0}, CAmount{0});
+    const auto index{set->IndexOf(validator_key)};
+    const CAmount w{index ? static_cast<CAmount>(set->Members()[*index].weight) : CAmount{0}};
+    return std::make_pair(w, static_cast<CAmount>(set->TotalWeight()));
+}
+
 fs::path Chainstate::StoragePath() const
 {
     fs::path path{m_chainman.m_options.datadir / "chainstate"};
@@ -3252,12 +3266,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                         } else {
                             if (const auto key{modern::ExtractModernPosValidatorKey(
                                     block.vtx[0]->vin[0].scriptSig)}) {
-                                if (!ModernStakeTracker().Sync(m_chain, m_blockman, consensus,
-                                                               *pindex->pprev)) {
-                                    state.Error("modern-PoS stake registry is unavailable");
+                                // One stake universe (F = M): w and W come from the
+                                // validator set in force at this height -- ACTIVE
+                                // stake joined with a non-revoked FINALITY_KEY
+                                // binding, in whole modern B3 -- the same snapshot
+                                // that defines the finality quorum.
+                                const auto weights{ModernEligibilityWeights(*key, *pindex->pprev)};
+                                if (!weights) {
+                                    state.Error("modern-PoS validator set is unavailable");
                                 } else {
-                                    std::tie(ctx.validator_weight, ctx.total_weight) =
-                                        ModernStakeTracker().ActiveWeight(*key, pindex->nHeight);
+                                    std::tie(ctx.validator_weight, ctx.total_weight) = *weights;
                                 }
                             }
                             if (state.IsValid()) {

@@ -89,48 +89,6 @@ struct BindingFixture : public ModernPosSetup {
         m_domain = Domain();
     }
 
-    static bls::SecretKey Bls(const unsigned i)
-    {
-        std::array<unsigned char, 32> ikm{};
-        ikm[0] = static_cast<unsigned char>(i);
-        ikm[31] = 0x99;
-        return *bls::SecretKey::FromIKM(ikm);
-    }
-
-    struct CellAndEvidence {
-        CScript cell;
-        CMpaRecord record;
-    };
-
-    //! Build a FINALITY_KEY cell and its evidence. bls == nullptr -> revocation.
-    CellAndEvidence MakeBinding(const CKey& identity, const modern::ValidatorKeyBytes& vk, const bls::SecretKey* bls,
-                                const uint32_t seq, const CKey* signer = nullptr, const uint256* domain = nullptr)
-    {
-        FinalityKeyParams params;
-        params.bls_pubkey = bls ? bls->GetPublicKey().Compressed() : modern::BlsPubkeyBytes{};
-        params.seq = seq;
-        uint256 commitment;
-        std::copy(vk.begin(), vk.end(), commitment.begin());
-        const auto script{modern::MakeMetadataCellScript(static_cast<uint16_t>(modern::PolicyType::FINALITY_KEY),
-                                                          modern::POLICY_VERSION_V1, commitment, params.Encode())};
-        BOOST_REQUIRE(script.has_value());
-        FinalityKeyEvidence ev;
-        ev.validator_key = vk;
-        ev.bls_pubkey = params.bls_pubkey;
-        ev.seq = seq;
-        const uint256 digest{modern::FinalityBindDigest(domain ? *domain : m_domain, ev.validator_key, ev.bls_pubkey, seq)};
-        uint256 aux{};
-        BOOST_REQUIRE((signer ? *signer : identity).SignSchnorr(digest, ev.bip340_sig, nullptr, aux));
-        if (bls) ev.pop = bls->SignPoP().Compressed();
-        CMpaRecord rec;
-        rec.payload_type = modern::MPA_TYPE_FINALITY_KEY_EVIDENCE;
-        rec.payload_version = modern::MPA_VERSION_V1;
-        const auto enc{ev.Encode()};
-        rec.payload.assign(enc.begin(), enc.end());
-        return {*script, rec};
-    }
-
-    //! A transaction spending fund output `n`, carrying the given cells and records.
     CMutableTransaction MakeTx(const unsigned n, const std::vector<CScript>& cells, std::vector<CMpaRecord> records)
     {
         CMutableTransaction tx;
@@ -188,10 +146,14 @@ struct FinalityChainFixture : public BindingFixture {
     static constexpr int SCALED_MAX_EXTENSION{30};
     static constexpr CAmount STAKE_HEAVY{15 * modern::FINALITY_WEIGHT_UNIT}; // weight 15
     static constexpr CAmount STAKE_LIGHT{1 * modern::FINALITY_WEIGHT_UNIT};  // weight 1
+    static constexpr CAmount STAKE_C{10 * modern::FINALITY_WEIGHT_UNIT};     // weight 10 (optional third validator)
 
     int m_M{0};
-    bls::SecretKey m_bls_a{Bls(1)};
-    bls::SecretKey m_bls_b{Bls(2)};
+    //! Optional third validator C: staked in the corridor but NOT bound
+    //! (Commit 14 eligibility tests bind it later).
+    CKey m_validator_c{MakeValidatorKey(0x33)};
+    modern::ValidatorKeyBytes m_vk_c{XOnly(m_validator_c)};
+    bls::SecretKey m_bls_c{Bls(3)};
 
     explicit FinalityChainFixture(TestOpts opts = {}) : BindingFixture{std::move(opts)} {}
 
@@ -206,7 +168,8 @@ struct FinalityChainFixture : public BindingFixture {
 
     //! Legacy -> corridor (stakes + bindings in the first corridor block) ->
     //! last corridor height M-1, with the modern-PoS rule set configured.
-    void PrepareFinalityChain(const int min_finality_set = 1, const int reorg_horizon = 200)
+    void PrepareFinalityChain(const int min_finality_set = 1, const int reorg_horizon = 200,
+                              const bool with_unbound_c = false)
     {
         Prepare();
         Consensus::Params& c{MutableConsensus()};
@@ -237,8 +200,15 @@ struct FinalityChainFixture : public BindingFixture {
         const auto bind_a{MakeBinding(m_validator_a, m_vk_a, &m_bls_a, 0)};
         const auto bind_b{MakeBinding(m_validator_b, m_vk_b, &m_bls_b, 0)};
         {
-            const CBlock first{BuildCorridorWithRoot({stake_a, stake_b, MakeTx(2, {bind_a.cell}, {bind_a.record}),
-                                                      MakeTx(3, {bind_b.cell}, {bind_b.record})})};
+            std::vector<CMutableTransaction> txs{stake_a, stake_b, MakeTx(2, {bind_a.cell}, {bind_a.record}),
+                                                 MakeTx(3, {bind_b.cell}, {bind_b.record})};
+            if (with_unbound_c) {
+                CMutableTransaction stake_c{MakeTx(6, {}, {})};
+                stake_c.vout.insert(stake_c.vout.begin(), CTxOut{STAKE_C, modern::MakeStakeScript(m_vk_c, CScript() << OP_TRUE)});
+                stake_c.vout.back().nValue -= STAKE_C;
+                txs.push_back(stake_c);
+            }
+            const CBlock first{BuildCorridorWithRoot(txs)};
             BOOST_REQUIRE_MESSAGE(Probe(first).empty(), "first corridor block invalid: " << Probe(first));
             BOOST_REQUIRE(Submit(first));
             BOOST_REQUIRE_EQUAL(Tip()->nHeight, SYN_H + 1);
@@ -280,9 +250,10 @@ struct FinalityChainFixture : public BindingFixture {
         int checkpoint_height;
         uint64_t epoch;
         uint256 successor_hash;
-        //! Which validators sign (default both).
+        //! Which validators sign (default all members).
         bool sign_a{true};
         bool sign_b{true};
+        bool sign_c{true};
     };
     //! Build cell + record for a certificate over `snapshot` (the signing set).
     std::pair<CScript, CMpaRecord> MakeCertificate(const CertSpec& spec, const node::ValidatorSetSnapshot& signing_set,
@@ -304,6 +275,7 @@ struct FinalityChainFixture : public BindingFixture {
             const bls::SecretKey* sk{nullptr};
             if (pk == m_bls_a.GetPublicKey().Compressed() && spec.sign_a) sk = &m_bls_a;
             if (pk == m_bls_b.GetPublicKey().Compressed() && spec.sign_b) sk = &m_bls_b;
+            if (pk == m_bls_c.GetPublicKey().Compressed() && spec.sign_c) sk = &m_bls_c;
             if (!sk) continue;
             cert.signer_bitmap[i / 8] |= static_cast<unsigned char>(1u << (i % 8));
             sigs.push_back(sk->Sign(std::span<const unsigned char>(digest.begin(), 32)));
@@ -318,8 +290,23 @@ struct FinalityChainFixture : public BindingFixture {
         return {cell, rec};
     }
 
-    //! Eligibility weights by whole-B3 share (scale-invariant for the round search).
-    CAmount WeightOf(const modern::PosValidatorKey& key) const { return key == m_vk_a ? 15 : 1; }
+    //! Static fallback weights (whole B3) for the round search when the
+    //! consensus weights are unavailable (a side-branch parent that was never
+    //! connected): the default two-member set {A: 15, B: 1}.
+    CAmount WeightOf(const modern::PosValidatorKey& key) const { return key == m_vk_a ? 15 : key == m_vk_c ? 10 : 1; }
+    //! The (w, W) the validation rule will apply to the child of `prev`:
+    //! consensus-derived when `prev` is on the active chain, static otherwise.
+    std::pair<CAmount, CAmount> RoundWeights(const CBlockIndex* prev, const modern::PosValidatorKey& key)
+    {
+        LOCK(cs_main);
+        Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        if (cs.m_chain.Contains(prev)) {
+            if (const auto w{cs.ModernEligibilityWeights(key, *prev)}) {
+                if (w->second > 0) return *w;
+            }
+        }
+        return {WeightOf(key), 16};
+    }
 
     //! A modern-PoS block by `key` on `prev` whose height is governed by
     //! `seed` (the parent's eligibility digest -- for a side branch whose
@@ -334,12 +321,16 @@ struct FinalityChainFixture : public BindingFixture {
                                                    std::vector<CMutableTransaction> txs = {}, const int extra = 0)
     {
         const Consensus::ModernPosParams& pos{*m_node.chainman->GetConsensus().modern_pos};
+        // For an ineligible key (w = 0) search as if it had the static weight:
+        // the block is built so the rule can refuse it.
+        auto [w, W] = RoundWeights(prev, key);
+        if (w <= 0) { w = WeightOf(key); W = std::max<CAmount>(W, w + 1); }
         int64_t round{-1};
         uint256 digest;
         for (int64_t r{0}; r < 100'000 && round < 0; ++r) {
             const uint256 d{modern::ModernPosEligibilityDigest(Domain(), seed, static_cast<uint32_t>(prev->nHeight + 1),
                                                                static_cast<uint32_t>(r), key)};
-            if (modern::ModernPosEligible(d, WeightOf(key), 16, r, pos)) { round = r; digest = d; }
+            if (modern::ModernPosEligible(d, w, W, r, pos)) { round = r; digest = d; }
         }
         BOOST_REQUIRE(round >= 0);
         return {FinishPosBlock(BuildPos(prev, key, round, 0, extra, std::move(txs)), key, coinbase_payload), digest};
@@ -371,7 +362,7 @@ struct FinalityChainFixture : public BindingFixture {
             block.vtx[0] = MakeTransactionRef(cb2);
         }
         block.hashMerkleRoot = BlockMerkleRoot(block);
-        Sign(block, key == m_vk_a ? m_validator_a : m_validator_b);
+        Sign(block, key == m_vk_a ? m_validator_a : key == m_vk_c ? m_validator_c : m_validator_b);
         return block;
     }
     //! Produce and connect one block; returns its hash.

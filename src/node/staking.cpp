@@ -123,11 +123,12 @@ void StakingLoop::FillChainFacts(interfaces::StakingStatus& status, const std::o
                                Consensus::LegacyBoundaryPinned(params) &&
                                Consensus::GetConsensusPhase(next_height, params) == Consensus::ConsensusPhase::MODERN_POS;
     if (!key || !params.legacy_b3coin || !Consensus::LegacyBoundaryPinned(params)) return;
-    node::StakeTracker& tracker{chainstate.ModernStakeTracker()};
-    if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, params, *tip)) return;
-    const auto [w, W]{tracker.ActiveWeight(*key, next_height)};
-    status.active_weight = w;
-    status.total_active_weight = W;
+    // One stake universe: the weights the validation rule will apply to the
+    // next block (whole modern B3, bound + ACTIVE stake).
+    const auto weights{chainstate.ModernEligibilityWeights(*key, *tip)};
+    if (!weights) return;
+    status.active_weight = weights->first;
+    status.total_active_weight = weights->second;
 }
 
 interfaces::StakingStatus StakingLoop::Status(const std::optional<std::array<unsigned char, 32>>& validator_key)

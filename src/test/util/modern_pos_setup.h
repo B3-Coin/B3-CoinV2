@@ -13,6 +13,12 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <consensus/era.h>
+#include <crypto/bls.h>
+#include <modern/finality_key.h>
+#include <modern/finality_types.h>
+#include <modern/metadata_cell.h>
+#include <modern/mpa.h>
+#include <modern/payload_root.h>
 #include <consensus/merkle.h>
 #include <consensus/modern_pos_params.h>
 #include <consensus/params.h>
@@ -37,6 +43,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <vector>
@@ -246,17 +253,22 @@ struct ModernPosSetup : public ChainTestingSetup {
         }
         return modern::ModernPosGenesisSeed(Domain(), prev->GetBlockHash());
     }
-    //! Smallest round at which `key` with weight `w` of total `W` is
-    //! eligible for the child of `prev`.
+    //! Smallest round at which `key` with stake `w` of total `W` (base
+    //! units) is eligible for the child of `prev`. One stake universe
+    //! (Commit 14): the rule evaluates whole modern B3 exactly as consensus
+    //! does (floor(base / FINALITY_WEIGHT_UNIT)); the fixture stakes are
+    //! whole multiples, so the conversion is exact.
     int64_t FindRound(const CBlockIndex* prev, const modern::PosValidatorKey& key,
                       const CAmount w, const CAmount W)
     {
         const Consensus::ModernPosParams& pos{*m_node.chainman->GetConsensus().modern_pos};
         const uint256 seed{SeedFor(prev)};
+        const CAmount w_units{w / modern::FINALITY_WEIGHT_UNIT};
+        const CAmount W_units{W / modern::FINALITY_WEIGHT_UNIT};
         for (int64_t r{0}; r < 100'000; ++r) {
             const uint256 digest{modern::ModernPosEligibilityDigest(
                 Domain(), seed, static_cast<uint32_t>(prev->nHeight + 1), static_cast<uint32_t>(r), key)};
-            if (modern::ModernPosEligible(digest, w, W, r, pos)) return r;
+            if (modern::ModernPosEligible(digest, w_units, W_units, r, pos)) return r;
         }
         BOOST_REQUIRE_MESSAGE(false, "no eligible round found");
         return -1;
@@ -294,15 +306,62 @@ struct ModernPosSetup : public ChainTestingSetup {
             block, key, m_node.chainman->GetConsensus()));
     }
 
+    // ---- BLS consensus keys and FINALITY_KEY binding evidence (one stake
+    // universe: from F = M a validator must be bound to be block-eligible).
+    static bls::SecretKey Bls(const unsigned i)
+    {
+        std::array<unsigned char, 32> ikm{};
+        ikm[0] = static_cast<unsigned char>(i);
+        ikm[31] = 0x99;
+        return *bls::SecretKey::FromIKM(ikm);
+    }
+    struct CellAndEvidence {
+        CScript cell;
+        CMpaRecord record;
+    };
+    //! FINALITY_KEY cell + evidence record for (identity, vk, bls, seq); a null
+    //! `bls` builds a revocation (zero key). `signer`/`domain` override the
+    //! BIP340 signer / chain domain for negative tests.
+    CellAndEvidence MakeBinding(const CKey& identity, const modern::ValidatorKeyBytes& vk, const bls::SecretKey* bls,
+                                const uint32_t seq, const CKey* signer = nullptr, const uint256* domain = nullptr)
+    {
+        modern::FinalityKeyParams params;
+        params.bls_pubkey = bls ? bls->GetPublicKey().Compressed() : modern::BlsPubkeyBytes{};
+        params.seq = seq;
+        uint256 commitment;
+        std::copy(vk.begin(), vk.end(), commitment.begin());
+        const auto script{modern::MakeMetadataCellScript(static_cast<uint16_t>(modern::PolicyType::FINALITY_KEY),
+                                                          modern::POLICY_VERSION_V1, commitment, params.Encode())};
+        BOOST_REQUIRE(script.has_value());
+        modern::FinalityKeyEvidence ev;
+        ev.validator_key = vk;
+        ev.bls_pubkey = params.bls_pubkey;
+        ev.seq = seq;
+        const uint256 digest{modern::FinalityBindDigest(domain ? *domain : Domain(), ev.validator_key, ev.bls_pubkey, seq)};
+        uint256 aux{};
+        BOOST_REQUIRE((signer ? *signer : identity).SignSchnorr(digest, ev.bip340_sig, nullptr, aux));
+        if (bls) ev.pop = bls->SignPoP().Compressed();
+        CMpaRecord rec;
+        rec.payload_type = modern::MPA_TYPE_FINALITY_KEY_EVIDENCE;
+        rec.payload_version = modern::MPA_VERSION_V1;
+        const auto enc{ev.Encode()};
+        rec.payload.assign(enc.begin(), enc.end());
+        return {*script, rec};
+    }
+
     // ---- The shared chain: legacy history to H, boundary pinned, corridor
-    // with two STAKE creations (validator A large, validator B small),
-    // ending at the last corridor height M-1.
+    // with two STAKE creations (validator A large, validator B small) and
+    // their FINALITY_KEY bindings, ending at the last corridor height M-1.
+    // Stakes are whole multiples of FINALITY_WEIGHT_UNIT: block-production
+    // weight is the snapshot weight (whole modern B3), so A = 200, B = 1.
     CKey m_key_a;
     CKey m_key_b;
     modern::PosValidatorKey m_val_a{};
     modern::PosValidatorKey m_val_b{};
-    static constexpr CAmount STAKE_A{200'000};
-    static constexpr CAmount STAKE_B{1'000};
+    bls::SecretKey m_bls_a{Bls(1)};
+    bls::SecretKey m_bls_b{Bls(2)};
+    static constexpr CAmount STAKE_A{200 * modern::FINALITY_WEIGHT_UNIT};
+    static constexpr CAmount STAKE_B{1 * modern::FINALITY_WEIGHT_UNIT};
 
     void AdvanceToModernPos()
     {
@@ -333,8 +392,13 @@ struct ModernPosSetup : public ChainTestingSetup {
         mutable_consensus.transition_pow_bits = EASY_BITS;
         mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
         mutable_consensus.min_stake_amount = 1000;
+        // Metadata cells / MPA are test-context activated so the corridor can
+        // carry the FINALITY_KEY bindings (production: fail-closed, unset).
+        mutable_consensus.test_only_metadata_cells_active = true;
+        mutable_consensus.test_only_mpa_active = true;
         Consensus::ModernPosParams pos{};
         pos.reorg_horizon = 12; // small-chain scaffolding override of the ratified 1440
+        pos.min_finality_set = 1; // two validators; the ratified floor of 4 is a mainnet bootstrap value
         mutable_consensus.modern_pos = pos;
         {
             // A real node configures its params before any block index
@@ -360,11 +424,26 @@ struct ModernPosSetup : public ChainTestingSetup {
         stake_tx.vout.emplace_back(STAKE_A, modern::MakeStakeScript(m_val_a, CScript() << OP_TRUE));
         stake_tx.vout.emplace_back(STAKE_B, modern::MakeStakeScript(m_val_b, CScript() << OP_TRUE));
         stake_tx.vout.emplace_back(fund_value - STAKE_A - STAKE_B, CScript() << OP_TRUE);
+        // The same transaction binds both validators' BLS keys (seq 0).
+        const CellAndEvidence bind_a{MakeBinding(m_key_a, m_val_a, &m_bls_a, 0)};
+        const CellAndEvidence bind_b{MakeBinding(m_key_b, m_val_b, &m_bls_b, 0)};
+        stake_tx.vout.emplace_back(0, bind_a.cell);
+        stake_tx.vout.emplace_back(0, bind_b.cell);
+        stake_tx.mpa = {bind_a.record, bind_b.record};
+        std::sort(stake_tx.mpa.begin(), stake_tx.mpa.end(), modern::MpaRecordLess);
 
         for (int i{0}; i < SYN_CORRIDOR; ++i) {
-            const CBlock block{BuildCorridor(
-                Tip(), i == 0 ? std::vector<CMutableTransaction>{stake_tx}
-                              : std::vector<CMutableTransaction>{})};
+            CBlock block;
+            if (i == 0) {
+                // The binding evidence lives in the MPA: the coinbase commits
+                // it through the MODERN_PAYLOAD_ROOT cell (Path B).
+                const CBlock probe{BuildCorridor(Tip(), {stake_tx})};
+                const uint256 root{modern::ComputePayloadRoot(probe)};
+                block = BuildCorridor(Tip(), {stake_tx}, 60, EASY_BITS,
+                                      {CTxOut{0, modern::MakePayloadRootCellScript(root)}});
+            } else {
+                block = BuildCorridor(Tip(), {});
+            }
             BOOST_REQUIRE_MESSAGE(Submit(block), "corridor block at height "
                                                      << Tip()->nHeight + 1 << " rejected");
         }

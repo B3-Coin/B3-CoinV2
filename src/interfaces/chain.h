@@ -114,7 +114,10 @@ struct StakingStatus {
     std::string next_block_phase;
     //! Modern PoS is configured and the next block is a modern-PoS block.
     bool modern_pos_active{false};
-    //! Aggregated ACTIVE weight of the selected validator key and the total ACTIVE weight, at the next height.
+    //! Block-production weight of the selected validator key and the total
+    //! weight of the validator set in force at the next height, in whole
+    //! modern B3 (one stake universe: bound + ACTIVE stake, the same numbers
+    //! that define the finality quorum).
     CAmount active_weight{0};
     CAmount total_active_weight{0};
     std::optional<CAmount> min_stake_amount;

@@ -256,8 +256,9 @@ BOOST_FIXTURE_TEST_CASE(staking_loop_produces_blocks, ModernPosStakingSetup)
         BOOST_CHECK(!idle.running);
         BOOST_CHECK(idle.modern_pos_active);
         BOOST_CHECK_EQUAL(idle.next_block_phase, "modern_pos");
-        BOOST_CHECK_EQUAL(idle.active_weight, STAKE_A);
-        BOOST_CHECK_EQUAL(idle.total_active_weight, STAKE_A + STAKE_B);
+        // One stake universe: weights are the snapshot weights in whole modern B3.
+        BOOST_CHECK_EQUAL(idle.active_weight, STAKE_A / modern::FINALITY_WEIGHT_UNIT);
+        BOOST_CHECK_EQUAL(idle.total_active_weight, (STAKE_A + STAKE_B) / modern::FINALITY_WEIGHT_UNIT);
         BOOST_CHECK_EQUAL(idle.stake_activation_depth, modern::STAKE_ACTIVATION_DEPTH);
     }
     // A node judges "initial block download" by tip age against the clock

@@ -203,13 +203,15 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         if (seed.IsNull()) {
             throw std::runtime_error("modern-PoS seed for the parent is unavailable");
         }
-        node::StakeTracker& tracker{m_chainstate.ModernStakeTracker()};
-        if (!tracker.Sync(m_chainstate.m_chain, m_chainstate.m_blockman, b3_consensus, *pindexPrev)) {
-            throw std::runtime_error("modern-PoS stake registry is unavailable");
+        // One stake universe: the same (w, W) validation will apply, from the
+        // validator set in force at this height (bound + ACTIVE stake).
+        const auto weights{m_chainstate.ModernEligibilityWeights(*m_options.modern_pos_validator_key, *pindexPrev)};
+        if (!weights) {
+            throw std::runtime_error("modern-PoS validator set is unavailable");
         }
-        const auto [w, W]{tracker.ActiveWeight(*m_options.modern_pos_validator_key, nHeight)};
+        const auto [w, W]{*weights};
         if (w <= 0) {
-            throw std::runtime_error("validator has no active stake");
+            throw std::runtime_error("validator is not in the active validator set (no bound, active stake)");
         }
         constexpr int64_t MAX_PRODUCTION_ROUNDS{100'000};
         bool eligible{false};

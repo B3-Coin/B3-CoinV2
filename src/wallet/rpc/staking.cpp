@@ -146,8 +146,8 @@ RPCHelpMan getstakinginfo()
                 {RPCResult::Type::BOOL, "modern_pos_active", "whether the next block is a modern-PoS block with rules configured"},
                 {RPCResult::Type::STR_AMOUNT, "min_stake_amount", /*optional=*/true, "the network's minimum stake"},
                 {RPCResult::Type::NUM, "activation_depth", "blocks after inclusion until a stake is ACTIVE"},
-                {RPCResult::Type::STR_AMOUNT, "active_weight", "this validator's aggregated ACTIVE stake at the next height"},
-                {RPCResult::Type::STR_AMOUNT, "total_active_weight", "the network's total ACTIVE stake at the next height"},
+                {RPCResult::Type::NUM, "active_weight", "this validator's block-production weight at the next height, in whole modern B3 (bound + ACTIVE stake; the finality weight)"},
+                {RPCResult::Type::NUM, "total_active_weight", "the validator set's total weight at the next height, in whole modern B3"},
                 {RPCResult::Type::OBJ, "staking", "the node's staking loop",
                  {
                      {RPCResult::Type::BOOL, "available", "a staking loop exists in this node"},
@@ -197,8 +197,8 @@ RPCHelpMan getstakinginfo()
             obj.pushKV("modern_pos_active", status.modern_pos_active);
             if (status.min_stake_amount) obj.pushKV("min_stake_amount", ValueFromAmount(*status.min_stake_amount));
             obj.pushKV("activation_depth", status.stake_activation_depth);
-            obj.pushKV("active_weight", ValueFromAmount(status.active_weight));
-            obj.pushKV("total_active_weight", ValueFromAmount(status.total_active_weight));
+            obj.pushKV("active_weight", status.active_weight);
+            obj.pushKV("total_active_weight", status.total_active_weight);
             obj.pushKV("staking", StatusToJSON(status));
 
             UniValue stakes(UniValue::VARR);

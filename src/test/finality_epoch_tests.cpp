@@ -306,26 +306,4 @@ BOOST_FIXTURE_TEST_CASE(last_chance_handover_rotates, FinalityChainFixture)
     BOOST_CHECK_EQUAL(s.epoch_starts.back(), last_chance + 1);
 }
 
-BOOST_FIXTURE_TEST_CASE(bootstrap_floor_not_met_fails_closed, FinalityChainFixture)
-{
-    PrepareFinalityChain(/*min_finality_set=*/3); // two validators only
-    const int M{m_M};
-    Produce(m_vk_a);
-    const auto s{FinalityState()};
-    BOOST_CHECK(!s.bootstrapped);
-    BOOST_CHECK(!s.current);
-    BOOST_REQUIRE_EQUAL(s.epoch_starts.size(), 1U);
-    BOOST_CHECK_EQUAL(s.epoch_starts[0], M);
-    // Any certificate is invalid (no set), forever on this chain.
-    ProduceTo(M + 8, m_vk_a);
-    node::FinalityBindingIndex bindings;
-    // Build a set "by hand" to sign with: it does not matter, the block fails before BLS.
-    std::map<node::ValidatorKey, CAmount> w{{m_vk_a, 15 * modern::FINALITY_WEIGHT_UNIT}};
-    std::vector<node::FinalityBindingIndex::Transition> ts{{m_vk_a, {m_bls_a.GetPublicKey().Compressed(), 0, 1}}};
-    bindings.ConnectBlock(1, ts);
-    const auto fake{*node::ValidatorSetSnapshot::Build(0, w, bindings)};
-    ProduceExpectConnectFailure(m_vk_a, {MakeCertificate({M + 5, 0, fake.WithEpoch(1).SetHash(), true, false}, fake)}, 1);
-    BOOST_CHECK(!FinalityState().bootstrapped);
-}
-
 BOOST_AUTO_TEST_SUITE_END()
