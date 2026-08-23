@@ -90,6 +90,7 @@ add_executable(test_bitcoin
   ptxid_tests.cpp
   payload_root_tests.cpp
   payload_cost_tests.cpp
+  validator_set_tests.cpp
   modern_pos_tests.cpp
   miniminer_tests.cpp
   miniscript_tests.cpp

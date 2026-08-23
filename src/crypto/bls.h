@@ -158,6 +158,10 @@ bool FastAggregateVerify(std::span<const VerifiedPublicKey> keys, std::span<cons
 //! Aggregate (sum) signatures. Non-empty; an infinity result is rejected.
 std::optional<Signature> AggregateSignatures(std::span<const Signature> sigs);
 
+//! Aggregate (sum) PoP-verified public keys, e.g. a validator set's
+//! aggregate_pubkey. Non-empty; an infinity result is rejected.
+std::optional<PublicKey> AggregatePublicKeys(std::span<const VerifiedPublicKey> keys);
+
 } // namespace bls
 
 #endif // B3COIN_CRYPTO_BLS_H

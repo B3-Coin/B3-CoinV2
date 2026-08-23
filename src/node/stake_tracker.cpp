@@ -88,6 +88,18 @@ void StakeTracker::BlockConnected(const CBlock& block, const CBlockIndex& index,
     m_synced_height = index.nHeight;
 }
 
+std::map<ValidatorKey, CAmount> StakeTracker::ActiveWeights(const int eval_height, CAmount& total) const
+{
+    std::map<ValidatorKey, CAmount> out;
+    total = 0;
+    for (const auto& [outpoint, entry] : m_stakes) {
+        if (!modern::IsStakeMature(entry.creation_height, eval_height)) continue;
+        out[entry.key] += entry.amount;
+        total += entry.amount;
+    }
+    return out;
+}
+
 std::pair<CAmount, CAmount> StakeTracker::ActiveWeight(const ValidatorKey& key, const int eval_height) const
 {
     CAmount w{0};

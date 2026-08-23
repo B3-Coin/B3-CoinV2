@@ -42,6 +42,10 @@ inline constexpr unsigned FINALITY_SET_TREE_DEPTH{13};
 inline constexpr size_t MAX_FINALITY_SET{1u << FINALITY_SET_TREE_DEPTH};
 //! Quorum ruleset identifier carried in every set header.
 inline constexpr uint16_t FINALITY_RULESET_V1{1};
+//! Weight unit: validator weights are whole modern B3 (1 modern B3 = 1 kB3 =
+//! 1,000 legacy B3 = 10^9 base units, denomination ruling 2026-08-17);
+//! w_i = floor(active_stake_base_units / FINALITY_WEIGHT_UNIT), w_i = 0 dropped.
+inline constexpr int64_t FINALITY_WEIGHT_UNIT{1'000'000'000};
 
 inline constexpr size_t BLS_PUBKEY_SIZE{48};
 inline constexpr size_t BLS_SIGNATURE_SIZE{96};

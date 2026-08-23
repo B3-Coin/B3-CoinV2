@@ -184,6 +184,17 @@ bool FastAggregateVerify(std::span<const VerifiedPublicKey> keys, std::span<cons
     return Impl::CoreVerify(&agg, Impl::P2(sig), digest, SIG_DST);
 }
 
+std::optional<PublicKey> AggregatePublicKeys(std::span<const VerifiedPublicKey> keys)
+{
+    if (keys.empty()) return std::nullopt;
+    std::vector<const blst_p1_affine*> pts;
+    pts.reserve(keys.size());
+    for (const auto& k : keys) pts.push_back(Impl::P1(k.Key()));
+    blst_p1 sum;
+    blst_p1s_add(&sum, pts.data(), pts.size());
+    return Impl::FromP1(sum); // canonical re-decode; infinity rejected
+}
+
 std::optional<Signature> AggregateSignatures(std::span<const Signature> sigs)
 {
     if (sigs.empty()) return std::nullopt;
