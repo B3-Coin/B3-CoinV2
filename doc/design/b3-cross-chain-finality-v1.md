@@ -136,13 +136,13 @@ a **new record type behind the identical cell** (§7).
 |---|---|
 | Heights | **M** = first modern-PoS block, epoch 0 starts; **F = M** — the finality rules ship in the X-pin Modern-PoS release (the first binary that validates any modern-era block; the v1 binary refuses H+1); bridge activation **A3 ≥ F** |
 | Epoch start | `epoch_start[0] = M`; at the first block of epoch `e`, `Set_{e+1} := Snapshot(epoch_start[e] − 1)` (so `Set_1 = Set_0 = Snapshot(M−1)`); `Set_{e+1}` is known for all of epoch `e` and every epoch-`e` certificate carries `hash(Set_{e+1})` |
-| Snapshot(b) | every `validator_key` with ACTIVE STAKE weight `w > 0` at height `b` (STAKE v1, 20-block maturity, aggregation per key — unchanged) **and** a non-revoked `binding[validator_key]` at height `b` → member `(bls_pubkey, w)`; sorted by `validator_key`; `w` in whole modern B3 |
-| **Handover-gated rotation** (owner requirement) | epoch `e+1` begins at the first height `h ≥ epoch_start[e] + E` such that the chain below `h` contains a valid certificate with `epoch = e` (it necessarily carries `hash(Set_{e+1})`). Until then epoch `e` **extends**: checkpoints continue, signed by `Set_e`, all with `epoch = e`. A set never signs before the previous set has attested it on-chain — B3 and the Ethereum verifier follow the identical `e → e+1` rule |
+| Snapshot(b) | every `validator_key` with ACTIVE STAKE weight `w > 0` at height `b` (STAKE v1, 20-block maturity, aggregation per key — unchanged) **and** a non-revoked `binding[validator_key]` at height `b` → member `(bls_pubkey, w)`; sorted by `validator_key`; `w` in whole modern B3. **One stake universe (FINAL, owner ruling 2026-08-23): from F (= M) a validator key without a non-revoked binding is NOT eligible to produce blocks** (M1 eligibility requires the binding), so the block-production weight `W` and the finality weight are the same quantity |
+| **Handover-gated rotation** (**FINAL**, owner ruling 2026-08-23) | epoch `e+1` begins at the first height `h ≥ epoch_start[e] + E` such that the chain below `h` contains a valid certificate with `epoch = e` (it necessarily carries `hash(Set_{e+1})`). Until then epoch `e` **extends**: checkpoints continue, signed by `Set_e`, all with `epoch = e`. A set never signs before the previous set has attested it on-chain — B3 and the Ethereum verifier follow the identical `e → e+1` rule |
 | Carry-over | if `Snapshot` yields `n < MIN_FINALITY_SET` or `W < MIN_FINALITY_WEIGHT`: `Set_{e+1} = Set_e` re-stamped with `epoch = e+1` |
 | `MAX_EPOCH_EXTENSION` | an epoch extended beyond it (no quorum certificate at all) declares the lineage **broken**: no further certificate is valid until a consensus re-bootstrap pins a new genesis set (rule, not improvisation) |
 | Checkpoints | heights `h` with `(h − M) mod CHECKPOINT_INTERVAL = 0` |
 | Signing (validator behaviour) | after `tip − h ≥ CHECKPOINT_DEPTH`; one signature per height; strictly increasing heights; only descendants of the latest certified checkpoint known |
-| Certificate carrier | `FINALITY_CERT` cell + `FINALITY_CERTIFICATE` record in the **coinbase**, ≤ 1 per block (§3.1); the checkpoint must be an ancestor at that height on this chain; `epoch ∈ {current, current − 1}`; checkpoint height > highest certified height |
+| Certificate carrier | `FINALITY_CERT` cell + `FINALITY_CERTIFICATE` record in the **coinbase**, ≤ 1 per block (§3.1); the checkpoint must be an ancestor at that height on this chain; **epoch window `{current, current − 1}` (FINAL)** accepted only with: `FinalizedBlock.height` strictly greater than the highest certified height (monotone — an old-set certificate can never overwrite newer finalized state), the certificate's `validator_set_hash` equal to `hash(Set_{epoch+1})` as derived on this chain, and the epoch relation `epoch(height) == FinalizedBlock.epoch` |
 | Validation order | MPA frame/lengths → type activation → cell↔record binding → verification-cost budget and per-block counts → epoch window / ancestry → bitmap rules → quorum by weight → `FastAggregateVerify` last. Failure ⇒ `bad-finality-cert` / `bad-finality-cert-form`, block invalid |
 | Finality pin (from F) | on connect of a block carrying a valid certificate for checkpoint `C`: `finalized_tip = C`; a reorganization that would disconnect `finalized_tip` is refused (`modern-finality-violation`, no peer penalty, skipped during reindex/import). Pins apply on the active chain only |
 | No certificate | the chain continues under V1 (blocks never depend on certificates); the epoch extends; withdrawals wait; beyond `MAX_EPOCH_EXTENSION` → lineage broken (above) |
@@ -346,10 +346,13 @@ state machine (§5.2) are unchanged; `prover` is the single governance-changeabl
 | `E` (epoch blocks) | 1,440 | proposed |
 | `CHECKPOINT_INTERVAL` / `CHECKPOINT_DEPTH` | 60 / 20 | proposed |
 | `MIN_FINALITY_SET` / `MIN_FINALITY_WEIGHT` / `MAX_EPOCH_EXTENSION` | 4 / owner / 7·E | proposed |
-| Certificate epoch window | `{current, current − 1}` | proposed |
+| Certificate epoch window | `{current, current − 1}` with the §4 monotonicity/set-hash/epoch-relation conditions | FINAL |
 | Policy numbers 6 / 7 / 8 | `FINALITY_CERT` / `FINALITY_KEY` / `MODERN_PAYLOAD_ROOT` | **FINAL, never renumbered** |
 | `FINALITY_CERTIFICATE` record max / `FINALITY_KEY_EVIDENCE` size | 1,240 B / 244 B | FINAL (layout) |
 | `MAX_EPOCH_LAG` | 30 days | proposed |
-| `F` | **= M**, in the X-pin Modern-PoS release (ruling 2026-08-23 via audit F-3) | FINAL |
+| `F` | **= M**, in the X-pin Modern-PoS release | FINAL |
+| Gated rotation; epoch extension on failure | rule of §4 | FINAL |
+| Binding mandatory for block eligibility from F | yes | FINAL |
+| `FINALITY_KEY` semantics (seq-controlled, `0^48` = revoke, one active validator per BLS key) | §1.1 | FINAL |
 | `A3` | later | owner |
 | Binding required for block eligibility from F | yes | proposed |

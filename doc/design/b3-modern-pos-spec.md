@@ -39,8 +39,11 @@ Owner rulings incorporated (2026-08-20):
   frozen `ValidatorSetHeader` / `FinalizedBlock` / `Certificate` layouts, and
   the finality pin. **F = M**: these rules ship in the X-pin Modern-PoS
   release (the first binary that validates any modern-era block); bridge use
-  is a later flag A3 ≥ F. STAKE v1, M1–M6 and the block wire format are
-  unchanged. Specification: [b3-cross-chain-finality-v1.md](b3-cross-chain-finality-v1.md)
+  is a later flag A3 ≥ F. **From F a validator key without a non-revoked
+  `FINALITY_KEY` binding is not eligible to produce blocks** (one stake
+  universe for production and finality — owner ruling 2026-08-23); this is
+  the only change to M1's eligibility predicate. STAKE v1, M2–M6 and the
+  block wire format are unchanged. Specification: [b3-cross-chain-finality-v1.md](b3-cross-chain-finality-v1.md)
   (normative), [b3-modern-payload-area.md](b3-modern-payload-area.md)
   (carrier), [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md)
   (rationale). §10's "committee/finality gadgets" entry is superseded.
