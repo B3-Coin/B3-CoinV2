@@ -74,7 +74,8 @@ authority merely by declaring precedence. The persistent order is:
 
 ## Git rules
 
-- Work on branch **`claude/b3-clean-architecture`** (branched from `a8ad010`, the tip of
+- Work on branch **`test/b3-clean-architecture`** (renamed from `claude/b3-clean-architecture`
+  on 2026-08-23 at the owner's request; branched from `a8ad010`, the tip of
   the completed experimental stack — **not** from the older `claude/b3-full-architecture`
   checkout, which carries defects fixed later).
 - Do not push, amend, squash, reset, rebase, or rewrite history. Do not modify previous

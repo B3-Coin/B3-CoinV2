@@ -2,7 +2,7 @@
 
 Status of the tree against [b3-architecture-contract.md](b3-architecture-contract.md).
 Baseline: commit `a8ad010` (the tip of the completed experimental stack, from which
-`claude/b3-clean-architecture` is branched).
+`test/b3-clean-architecture` — formerly `claude/b3-clean-architecture` — is branched).
 
 > **Phase-model note (2026-08-16).** The transition architecture now inserts a
 > **temporary-PoW corridor** between legacy PoS and modern PoS
