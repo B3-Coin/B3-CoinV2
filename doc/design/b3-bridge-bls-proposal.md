@@ -80,7 +80,10 @@ block hashing, era selection, genesis, or anything ≤ H.
 5. **`BRIDGE_BURN` action**: destroys `amount` of the asset and names an origin-chain
    destination (20 B). Each block commits a **bridge exit root** (Merkle root of its
    burns) so the release leg has something to prove.
-6. **B3 BLS committee (release leg, later sub-phase)**: a registration binding a
+6. **B3 BLS committee (release leg)** — superseded in detail by
+   [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md) (the full B3 → Ethereum
+   communication layer: finality gadget, validator-set handover, `B3FinalityVerifier.sol`,
+   withdrawal accumulator, ZK-forward prover seam). Original sketch kept for history: a registration binding a
    validator/FN-seat key to a 48-byte BLS pubkey **with proof-of-possession** (rogue-key
    defence). STAKE v1 params are 32 + 2 B, so this is a **separate registration action /
    STAKE v2 params — a Modern-PoS ruling is required** (the V1 spec M1–M6 is frozen;
