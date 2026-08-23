@@ -4,12 +4,20 @@
 #ifndef B3COIN_NODE_FINALITY_BINDING_INDEX_H
 #define B3COIN_NODE_FINALITY_BINDING_INDEX_H
 
+#include <consensus/params.h>
 #include <modern/finality_key.h>
+#include <primitives/block.h>
+#include <uint256.h>
 
 #include <cstdint>
+#include <string>
 #include <map>
 #include <optional>
 #include <vector>
+
+class CBlockIndex;
+class CChain;
+namespace node { class BlockManager; }
 
 namespace node {
 
@@ -79,6 +87,48 @@ private:
     std::map<modern::BlsPubkeyBytes, modern::ValidatorKeyBytes> m_owner_of_key;
     std::vector<int> m_heights;                      // connected block heights, in order
     std::vector<std::vector<UndoEntry>> m_undo;      // parallel to m_heights; entries in apply order
+};
+
+/**
+ * Verify every FINALITY_KEY cell+evidence pair of a block (in block / tx /
+ * key order) against `index` plus an in-block overlay, and collect the
+ * resulting transitions. All-or-nothing: on any failure `out` is left empty
+ * and `error` names the first failing rule. The caller applies `out` via
+ * FinalityBindingIndex::ConnectBlock only after the whole block is valid.
+ * Pure with respect to `index` (const).
+ */
+bool VerifyBlockFinalityBindings(const CBlock& block, int height, const uint256& chain_domain,
+                                 const Consensus::Params& params, const FinalityBindingIndex& index,
+                                 std::vector<FinalityBindingIndex::Transition>& out, std::string& error);
+
+/**
+ * Keeps the binding index in step with the active chain — the stake
+ * tracker's discipline, plus exact undo: BlockConnected applies (verifying),
+ * BlockDisconnected reverts the top block exactly, Sync() rebuilds the whole
+ * modern span (re-verifying every pair from disk) when not in step.
+ */
+class FinalityBindingTracker
+{
+public:
+    //! Bring the index to `target` (on `chain`); false if unavailable.
+    bool Sync(const CChain& chain, const BlockManager& blockman, const Consensus::Params& params,
+              const CBlockIndex& target);
+    //! Apply a just-connected block (verifying its pairs); marks dirty when not in step.
+    void BlockConnected(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params);
+    //! Revert a just-disconnected block exactly; marks dirty when not in step.
+    void BlockDisconnected(const CBlockIndex& index);
+    void MarkDirty() { m_dirty = true; }
+    bool Synced(const uint256& tip_hash) const { return !m_dirty && m_synced_tip == tip_hash; }
+    const FinalityBindingIndex& Index() const { return m_index; }
+
+private:
+    //! Verify+apply one block; false (and dirty) on failure.
+    bool ApplyBlock(const CBlock& block, int height, const Consensus::Params& params);
+
+    FinalityBindingIndex m_index;
+    uint256 m_synced_tip{};
+    int m_synced_height{-1};
+    bool m_dirty{true};
 };
 
 } // namespace node

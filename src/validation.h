@@ -65,6 +65,7 @@ struct ChainstateRole;
 namespace node {
 class SnapshotMetadata;
 class StakeTracker;
+class FinalityBindingTracker;
 } // namespace node
 namespace Consensus {
 struct Params;
@@ -587,6 +588,8 @@ protected:
 
     //! Lazily created modern-PoS stake registry tracker; see ModernStakeTracker().
     std::unique_ptr<node::StakeTracker> m_stake_tracker GUARDED_BY(::cs_main);
+    //! Lazily created FINALITY_KEY binding tracker (derived, rebuildable); see ModernFinalityBindings().
+    std::unique_ptr<node::FinalityBindingTracker> m_finality_bindings GUARDED_BY(::cs_main);
 
 public:
     //! Reference to a BlockManager instance which itself is shared across all
@@ -611,6 +614,7 @@ public:
      * validator's aggregated ACTIVE weight and the total ACTIVE weight.
      */
     node::StakeTracker& ModernStakeTracker() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    node::FinalityBindingTracker& ModernFinalityBindings() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     //! Return path to chainstate leveldb directory.
     fs::path StoragePath() const;

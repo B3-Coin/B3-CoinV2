@@ -36,6 +36,8 @@
 #include <legacy/replay.h>
 #include <modern/fn.h>
 #include <modern/metadata_cell.h>
+#include <modern/mpa.h>
+#include <node/finality_binding_index.h>
 #include <modern/pos.h>
 #include <modern/pos_v1.h>
 #include <modern/stake.h>
@@ -870,6 +872,26 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         if (std::string cell_error;
             !modern::CheckMetadataCellOutputs(tx, m_active_chainstate.m_chainman.GetConsensus(), cell_error)) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-metadata-cell", cell_error);
+        }
+        // Modern Payload Area: structural rules and the FINALITY_KEY cell<->evidence
+        // one-to-one binding are consensus (ContextualCheckBlock enforces the same);
+        // the semantic (BIP340/PoP/sequence) check needs chain state and runs in
+        // ConnectBlock. Until the modern relay/mempool integration (plan Commit 15)
+        // an MPA-bearing transaction is additionally refused here as a matter of
+        // policy, so no lossy non-MPA relay form can ever be produced.
+        if (std::string mpa_error;
+            !modern::CheckTransactionMpa(tx, m_active_chainstate.m_chainman.GetConsensus(), mpa_error)) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-mpa", mpa_error);
+        }
+        {
+            std::vector<modern::FinalityKeyPair> pairs;
+            std::string bind_error;
+            if (!modern::MatchFinalityKeyPairs(tx, pairs, bind_error)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-finality-key-binding", bind_error);
+            }
+        }
+        if (tx.HasMpa()) {
+            return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "mpa-mempool-unsupported");
         }
     }
 
@@ -2007,6 +2029,13 @@ node::StakeTracker& Chainstate::ModernStakeTracker()
     return *m_stake_tracker;
 }
 
+node::FinalityBindingTracker& Chainstate::ModernFinalityBindings()
+{
+    AssertLockHeld(::cs_main);
+    if (!m_finality_bindings) m_finality_bindings = std::make_unique<node::FinalityBindingTracker>();
+    return *m_finality_bindings;
+}
+
 fs::path Chainstate::StoragePath() const
 {
     fs::path path{m_chainman.m_options.datadir / "chainstate"};
@@ -2823,6 +2852,43 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         }
     }
 
+    // FINALITY_KEY bindings (modern era): every cell+evidence pair must pass the
+    // semantic checker against the derived binding index as of the parent, with
+    // earlier pairs of this block visible (in-block overlay). All-or-nothing:
+    // the index itself is only advanced by the BlockConnected hook after the
+    // block is fully connected, so an invalid block never mutates it.
+    if (!use_legacy_b3coin && params.GetConsensus().legacy_b3coin) {
+        bool has_bindings{false};
+        for (const auto& tx : block.vtx) {
+            if (!tx->mpa.empty()) { has_bindings = true; break; }
+            for (const auto& out : tx->vout) {
+                if (modern::ClaimsMetadataCell(out.scriptPubKey)) { has_bindings = true; break; }
+            }
+            if (has_bindings) break;
+        }
+        if (has_bindings) {
+            const auto& consensus{params.GetConsensus()};
+            const auto domain{consensus.legacy_final_hash
+                                  ? modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash)
+                                  : std::nullopt};
+            if (!domain) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "finality-key-domain-unpinned",
+                                     "FINALITY_KEY evidence requires the pinned modern chain domain");
+            }
+            node::FinalityBindingTracker& tracker{ModernFinalityBindings()};
+            if (pindex->pprev == nullptr || !tracker.Sync(m_chain, m_blockman, consensus, *pindex->pprev)) {
+                state.Error("finality binding index is unavailable");
+                return false;
+            }
+            std::vector<node::FinalityBindingIndex::Transition> transitions;
+            std::string bind_error;
+            if (!node::VerifyBlockFinalityBindings(block, pindex->nHeight, *domain, consensus, tracker.Index(),
+                                                   transitions, bind_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-key-evidence", bind_error);
+            }
+        }
+    }
+
     const auto time_2{SteadyClock::now()};
     m_chainman.time_forks += time_2 - time_1;
     LogDebug(BCLog::BENCH, "    - Fork checks: %.2fms [%.2fs (%.2fms/blk)]\n",
@@ -3584,6 +3650,9 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     // A disconnect invalidates the incremental modern-PoS stake registry;
     // it rebuilds from the (now shorter) active chain on next use.
     if (m_stake_tracker) m_stake_tracker->MarkDirty();
+    // The binding index reverts the disconnected block exactly (or marks
+    // itself for rebuild when not in step).
+    if (m_finality_bindings) m_finality_bindings->BlockDisconnected(*pindexDelete);
 
     UpdateTip(pindexDelete->pprev);
     // Let wallets know transactions went from 1-confirmed to
@@ -3695,6 +3764,9 @@ bool Chainstate::ConnectTip(
     // (no-op below the boundary; a missed step just marks it for rebuild).
     if (m_stake_tracker) {
         m_stake_tracker->BlockConnected(*block_to_connect, *pindexNew, m_chainman.GetConsensus());
+    }
+    if (m_finality_bindings) {
+        m_finality_bindings->BlockConnected(*block_to_connect, *pindexNew, m_chainman.GetConsensus());
     }
     const auto time_4{SteadyClock::now()};
     m_chainman.time_flush += time_4 - time_3;
@@ -5410,6 +5482,20 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
             if (std::string cell_error; !modern::CheckMetadataCellOutputs(*tx, consensus_params, cell_error)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-metadata-cell",
                                      strprintf("%s in transaction %s", cell_error, tx->GetHash().ToString()));
+            }
+            // Modern Payload Area: activation context, canonical order, registry and
+            // per-type grammar; and the FINALITY_KEY cell<->evidence bijection.
+            if (std::string mpa_error; !modern::CheckTransactionMpa(*tx, consensus_params, mpa_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-mpa",
+                                     strprintf("%s in transaction %s", mpa_error, tx->GetHash().ToString()));
+            }
+            {
+                std::vector<modern::FinalityKeyPair> pairs;
+                std::string bind_error;
+                if (!modern::MatchFinalityKeyPairs(*tx, pairs, bind_error)) {
+                    return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-key-binding",
+                                         strprintf("%s in transaction %s", bind_error, tx->GetHash().ToString()));
+                }
             }
         }
         // Phase-exact trailing-signature shape: corridor blocks earned their

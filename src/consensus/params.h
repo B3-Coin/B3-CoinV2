@@ -226,6 +226,13 @@ struct Params {
     bool test_only_asset_policies_active{false};
     bool test_only_metadata_cells_active{false};
     /**
+     * test_only_mpa_active: activates the Modern Payload Area consensus
+     * context (modern/mpa.h) and, with it, the FINALITY_KEY_EVIDENCE record
+     * type 5, so fixtures can exercise cell<->evidence binding. False in
+     * production: any transaction carrying an MPA stays invalid.
+     */
+    bool test_only_mpa_active{false};
+    /**
      * Hashes of blocks that
      * - are known to be consensus valid, and
      * - buried in the chain, and

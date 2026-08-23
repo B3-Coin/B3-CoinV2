@@ -8,6 +8,7 @@
 
 #include <attributes.h>
 #include <consensus/amount.h>
+#include <consensus/consensus.h>
 #include <primitives/transaction_identifier.h> // IWYU pragma: export
 #include <script/script.h>
 #include <serialize.h>
@@ -173,6 +174,30 @@ public:
 
 struct CMutableTransaction;
 
+/**
+ * One record of the B3 Modern Payload Area (MPA): a typed, versioned,
+ * bounded evidence payload (BLS finality certificates, FINALITY_KEY
+ * evidence, future proofs). Frame = payload_type u16 LE || payload_version
+ * u16 LE || CompactSize-prefixed payload — byte-identical to the modern
+ * creation-action frame. Records are NOT policy state (policy_params stays
+ * <= 80 bytes); the MPA is segregated historical payload data: excluded from
+ * the txid, carried only under a Modern serialization context (see
+ * TransactionSerParams::allow_mpa) and committed into the block by the
+ * MODERN_PAYLOAD_ROOT coinbase cell (plan Commit 7). Registry, activation
+ * and per-type grammar live in modern/mpa.h — parsing a record never implies
+ * consensus activation.
+ */
+struct CMpaRecord {
+    uint16_t payload_type{0};
+    uint16_t payload_version{0};
+    std::vector<unsigned char> payload{};
+
+    friend bool operator==(const CMpaRecord& a, const CMpaRecord& b)
+    {
+        return a.payload_type == b.payload_type && a.payload_version == b.payload_version && a.payload == b.payload;
+    }
+};
+
 struct TransactionSerParams {
     const bool allow_witness;
     /**
@@ -182,12 +207,31 @@ struct TransactionSerParams {
      * params; select it explicitly via legacy::TX_LEGACY (legacy/codec.h).
      */
     const bool legacy_time{false};
+    /**
+     * B3 Modern Payload Area: when true, BIP144 flag bit 0x02 is written for
+     * a transaction that carries MPA records and accepted on read; when
+     * false the MPA is neither written nor accepted (flag 0x02 then fails
+     * closed like any unknown optional-data bit). This is a B3 Modern
+     * serialization extension, NOT SegWit activation: bit 0x01 keeps its
+     * witness meaning, the base (txid) form is unchanged, and only the
+     * Modern decoding contexts (the marker-modern block codec, and future
+     * modern relay/RPC contexts) select it. Never set for legacy_time.
+     */
+    const bool allow_mpa{false};
     SER_PARAMS_OPFUNC
 };
 static constexpr TransactionSerParams TX_WITH_WITNESS{.allow_witness = true};
 static constexpr TransactionSerParams TX_NO_WITNESS{.allow_witness = false};
 /** Canonical legacy-B3 params. Use through legacy::TX_LEGACY, not directly. */
 static constexpr TransactionSerParams TX_LEGACY_B3{.allow_witness = false, .legacy_time = true};
+/**
+ * The B3 Modern full form: witness (if any) AND the Modern Payload Area.
+ * Selected by the marker-modern block codec (primitives/block.h) and, later,
+ * by the modern relay/RPC contexts. TX_WITH_WITNESS deliberately excludes
+ * the MPA (it remains the wtxid form); the normative full-form identifier
+ * (ptxid) arrives in plan Commit 6.
+ */
+static constexpr TransactionSerParams TX_MODERN{.allow_witness = true, .allow_mpa = true};
 
 /**
  * Basic transaction serialization format:
@@ -213,10 +257,55 @@ static constexpr TransactionSerParams TX_LEGACY_B3{.allow_witness = false, .lega
  * - std::vector<CTxOut> vout
  * - uint32_t nLockTime
  */
+/**
+ * Strict Modern Payload Area section codec (flag 0x02):
+ *   count (CompactSize, 1..MAX_PAYLOAD_RECORDS_PER_TX)
+ *   count x { payload_type u16 LE, payload_version u16 LE,
+ *             payload_len CompactSize (<= MAX_PAYLOAD_RECORD_SIZE), payload bytes }
+ * Every CompactSize must be minimal (ReadCompactSize enforces it); lengths
+ * are checked BEFORE bytes are read; the running serialized section size
+ * is bounded by MAX_PAYLOAD_SECTION_SIZE. Any violation throws, so a
+ * transaction with a non-canonical section cannot be decoded at all.
+ */
+template<typename Stream>
+void UnserializeMpaSection(Stream& s, std::vector<CMpaRecord>& out)
+{
+    out.clear();
+    const uint64_t count{ReadCompactSize(s)};
+    if (count == 0) throw std::ios_base::failure("Superfluous MPA record"); // flag 0x02 with no records
+    if (count > MAX_PAYLOAD_RECORDS_PER_TX) throw std::ios_base::failure("MPA record count exceeds limit");
+    size_t section_size{GetSizeOfCompactSize(count)};
+    out.reserve(count);
+    for (uint64_t i = 0; i < count; ++i) {
+        CMpaRecord rec;
+        s >> rec.payload_type >> rec.payload_version;
+        const uint64_t len{ReadCompactSize(s)};
+        if (len > MAX_PAYLOAD_RECORD_SIZE) throw std::ios_base::failure("MPA record exceeds limit");
+        section_size += 4 + GetSizeOfCompactSize(len) + len;
+        if (section_size > MAX_PAYLOAD_SECTION_SIZE) throw std::ios_base::failure("MPA section exceeds limit");
+        rec.payload.resize(len);
+        if (len) s.read(std::as_writable_bytes(std::span{rec.payload}));
+        out.push_back(std::move(rec));
+    }
+}
+
+template<typename Stream>
+void SerializeMpaSection(Stream& s, const std::vector<CMpaRecord>& mpa)
+{
+    WriteCompactSize(s, mpa.size());
+    for (const CMpaRecord& rec : mpa) {
+        s << rec.payload_type << rec.payload_version;
+        WriteCompactSize(s, rec.payload.size());
+        if (!rec.payload.empty()) s.write(std::as_bytes(std::span{rec.payload}));
+    }
+}
+
 template<typename Stream, typename TxType>
 void UnserializeTransaction(TxType& tx, Stream& s, const TransactionSerParams& params)
 {
     const bool fAllowWitness = params.allow_witness;
+    const bool fAllowMpa = params.allow_mpa && !params.legacy_time;
+    const bool fExtended = fAllowWitness || fAllowMpa; // may read the dummy/flags prefix
 
     s >> tx.version;
     if (params.legacy_time) {
@@ -228,9 +317,10 @@ void UnserializeTransaction(TxType& tx, Stream& s, const TransactionSerParams& p
     unsigned char flags = 0;
     tx.vin.clear();
     tx.vout.clear();
+    tx.mpa.clear();
     /* Try to read the vin. In case the dummy is there, this will be read as an empty vector. */
     s >> tx.vin;
-    if (tx.vin.size() == 0 && fAllowWitness) {
+    if (tx.vin.size() == 0 && fExtended) {
         /* We read a dummy or an empty vin. */
         s >> flags;
         if (flags != 0) {
@@ -252,8 +342,13 @@ void UnserializeTransaction(TxType& tx, Stream& s, const TransactionSerParams& p
             throw std::ios_base::failure("Superfluous witness record");
         }
     }
+    if ((flags & 2) && fAllowMpa) {
+        /* The B3 Modern Payload Area is present and this context accepts it. */
+        flags ^= 2;
+        UnserializeMpaSection(s, tx.mpa);
+    }
     if (flags) {
-        /* Unknown flag in the serialization */
+        /* Unknown flag in the serialization (incl. 0x02 outside a Modern context) */
         throw std::ios_base::failure("Unknown transaction optional data");
     }
     s >> tx.nLockTime;
@@ -263,6 +358,7 @@ template<typename Stream, typename TxType>
 void SerializeTransaction(const TxType& tx, Stream& s, const TransactionSerParams& params)
 {
     const bool fAllowWitness = params.allow_witness;
+    const bool fAllowMpa = params.allow_mpa && !params.legacy_time;
 
     s << tx.version;
     if (params.legacy_time) {
@@ -276,8 +372,13 @@ void SerializeTransaction(const TxType& tx, Stream& s, const TransactionSerParam
             flags |= 1;
         }
     }
+    if (fAllowMpa && !tx.mpa.empty()) {
+        /* The Modern Payload Area is serialized only under a Modern context;
+         * the base (txid) and witness (wtxid) forms exclude it. */
+        flags |= 2;
+    }
     if (flags) {
-        /* Use extended format in case witnesses are to be serialized. */
+        /* Use extended format in case witnesses / MPA are to be serialized. */
         std::vector<CTxIn> vinDummy;
         s << vinDummy;
         s << flags;
@@ -288,6 +389,9 @@ void SerializeTransaction(const TxType& tx, Stream& s, const TransactionSerParam
         for (size_t i = 0; i < tx.vin.size(); i++) {
             s << tx.vin[i].scriptWitness.stack;
         }
+    }
+    if (flags & 2) {
+        SerializeMpaSection(s, tx.mpa);
     }
     s << tx.nLockTime;
 }
@@ -323,6 +427,12 @@ public:
      */
     const uint32_t nTime;
     const uint32_t nLockTime;
+    /**
+     * B3 Modern Payload Area records (empty for every legacy transaction and
+     * for modern transactions without evidence). Excluded from the txid and
+     * from the witness hash; serialized only under TX_MODERN.
+     */
+    const std::vector<CMpaRecord> mpa;
 
 private:
     /** Memory only. */
@@ -395,6 +505,7 @@ public:
     std::string ToString() const;
 
     bool HasWitness() const { return m_has_witness; }
+    bool HasMpa() const { return !mpa.empty(); }
     /** True when this transaction's identity is the legacy B3 encoding. */
     bool IsLegacyEncoded() const { return m_legacy_encoding; }
 };
@@ -407,6 +518,8 @@ struct CMutableTransaction
     uint32_t version;
     uint32_t nTime;
     uint32_t nLockTime;
+    //! B3 Modern Payload Area records (see CTransaction::mpa).
+    std::vector<CMpaRecord> mpa;
     /** Memory only; see CTransaction::IsLegacyEncoded(). */
     bool m_legacy_encoding{false};
 
