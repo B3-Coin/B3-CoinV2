@@ -596,8 +596,13 @@ public:
 //! an overwrite.
 // TODO: pass in a boolean to limit these possible overwrites to known
 // (pre-BIP34) cases.
+//! Add the outputs of `tx` as coins. With `exclude_metadata_cells` (set by the
+//! caller exactly when the block is in the B3 modern era) outputs that are
+//! well-formed Modern metadata cells (modern/metadata_cell.h) are NOT added:
+//! they are consensus-committed but never spendable. DisconnectBlock applies
+//! the symmetric skip.
 void AddCoins(CCoinsViewCache& cache, const CTransaction& tx, int nHeight,
-              bool check = false, uint32_t nTxOffset = 0);
+              bool check = false, uint32_t nTxOffset = 0, bool exclude_metadata_cells = false);
 
 //! Utility function to find any unspent output with a given txid.
 //! This function can be quite expensive because in the event of a transaction

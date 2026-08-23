@@ -35,6 +35,7 @@
 #include <legacy/consensus.h>
 #include <legacy/replay.h>
 #include <modern/fn.h>
+#include <modern/metadata_cell.h>
 #include <modern/pos.h>
 #include <modern/pos_v1.h>
 #include <modern/stake.h>
@@ -863,6 +864,12 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         if (std::string stake_error;
             !modern::CheckStakeOutputs(tx, m_active_chainstate.m_chainman.GetConsensus(), stake_error)) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-stake-output", stake_error);
+        }
+        // Likewise a claiming-but-invalid (or not yet activated) metadata
+        // cell can never be mined.
+        if (std::string cell_error;
+            !modern::CheckMetadataCellOutputs(tx, m_active_chainstate.m_chainman.GetConsensus(), cell_error)) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-metadata-cell", cell_error);
         }
     }
 
@@ -2126,7 +2133,7 @@ void Chainstate::InvalidBlockFound(CBlockIndex* pindex, const BlockValidationSta
 }
 
 static void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo& txundo,
-                        const int nHeight, const uint32_t tx_offset)
+                        const int nHeight, const uint32_t tx_offset, const bool modern_era = false)
 {
     // mark inputs spent
     if (!tx.IsCoinBase()) {
@@ -2137,8 +2144,8 @@ static void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo
             assert(is_spent);
         }
     }
-    // add outputs
-    AddCoins(inputs, tx, nHeight, /*check=*/false, tx_offset);
+    // add outputs (modern era: metadata cells are never added)
+    AddCoins(inputs, tx, nHeight, /*check=*/false, tx_offset, /*exclude_metadata_cells=*/modern_era);
 }
 
 // Kept for the existing tests and non-legacy callers. B3Coin's historical
@@ -2394,6 +2401,7 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
     AssertLockHeld(::cs_main);
     bool fClean = true;
     const bool use_legacy_b3coin{Consensus::GetB3Era(pindex->nHeight, m_chainman.GetConsensus()) == Consensus::B3Era::LEGACY};
+    const bool modern_era_block{m_chainman.GetConsensus().legacy_b3coin && !use_legacy_b3coin};
 
     CBlockUndo blockUndo;
     if (!m_blockman.ReadBlockUndo(blockUndo, *pindex)) {
@@ -2432,7 +2440,11 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
             // coin-database corruption.
             const bool legacy_marker{use_legacy_b3coin && tx.vout[o].nValue == 0 &&
                                      tx.vout[o].scriptPubKey.empty()};
-            if (!tx.vout[o].scriptPubKey.IsUnspendable() && !legacy_marker) {
+            // Modern metadata cells were never added by ConnectBlock (AddCoins
+            // skips them in the modern era), so the symmetric skip here keeps
+            // Connect/Disconnect exact (same discipline as the legacy marker).
+            const bool metadata_cell{modern_era_block && modern::IsMetadataCell(tx.vout[o].scriptPubKey)};
+            if (!tx.vout[o].scriptPubKey.IsUnspendable() && !legacy_marker && !metadata_cell) {
                 COutPoint out(hash, o);
                 Coin coin;
                 bool is_spent = view.SpendCoin(out, &coin);
@@ -2983,7 +2995,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             blockundo.vtxundo.emplace_back();
         }
         UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight,
-                    use_legacy_b3coin ? legacy_tx_offset : 0);
+                    use_legacy_b3coin ? legacy_tx_offset : 0,
+                    /*modern_era=*/params.GetConsensus().legacy_b3coin && !use_legacy_b3coin);
         if (use_legacy_b3coin) {
             if (tx.IsCoinStake()) {
                 legacy_stake_reward = tx.GetValueOut() - tx_value_in;
@@ -5392,6 +5405,12 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-stake-output",
                                      strprintf("%s in transaction %s", stake_error, tx->GetHash().ToString()));
             }
+            // Metadata cells (policy 6/7/8 carriers): a claiming output must be
+            // well-formed, zero-valued and activated; never reinterpreted.
+            if (std::string cell_error; !modern::CheckMetadataCellOutputs(*tx, consensus_params, cell_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-metadata-cell",
+                                     strprintf("%s in transaction %s", cell_error, tx->GetHash().ToString()));
+            }
         }
         // Phase-exact trailing-signature shape: corridor blocks earned their
         // place by PoW and must carry no signature; with the modern-PoS rule
@@ -6074,9 +6093,11 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
                 inputs.SpendCoin(txin.prevout);
             }
         }
-        // Pass check = true as every addition may be an overwrite.
+        // Pass check = true as every addition may be an overwrite. Modern
+        // metadata cells are excluded exactly as ConnectBlock excludes them.
         AddCoins(inputs, *tx, pindex->nHeight, true,
-                 use_legacy_b3coin ? legacy_tx_offset : 0);
+                 use_legacy_b3coin ? legacy_tx_offset : 0,
+                 /*exclude_metadata_cells=*/m_chainman.GetConsensus().legacy_b3coin && !use_legacy_b3coin);
         if (use_legacy_b3coin) {
             legacy_tx_offset += static_cast<uint32_t>(GetSerializeSize(legacy::TX_LEGACY(*tx)));
         }

@@ -216,9 +216,15 @@ struct Params {
      * - test_only_asset_policies_active: activates the coloured-asset policy
      *   set (BURN / DEX_VAULT and the conservation rules). False in
      *   production, so those policies stay unactivated and therefore invalid.
+     * - test_only_metadata_cells_active: activates the v1 metadata-cell
+     *   carrier for policy types 6/7/8 (modern/metadata_cell.h) so fixtures
+     *   can exercise UTXO exclusion and undo symmetry. False in production:
+     *   every claiming output stays invalid until the real per-type
+     *   activation rules ship.
      */
     const modern::PosValidator* test_only_modern_pos_validator{nullptr};
     bool test_only_asset_policies_active{false};
+    bool test_only_metadata_cells_active{false};
     /**
      * Hashes of blocks that
      * - are known to be consensus valid, and

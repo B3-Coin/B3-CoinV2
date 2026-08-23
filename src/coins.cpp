@@ -4,6 +4,8 @@
 
 #include <coins.h>
 
+#include <modern/metadata_cell.h>
+
 #include <consensus/consensus.h>
 #include <random.h>
 #include <uint256.h>
@@ -140,7 +142,7 @@ void CCoinsViewCache::EmplaceCoinInternalDANGER(COutPoint&& outpoint, Coin&& coi
 }
 
 void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight,
-              bool check_for_overwrite, uint32_t nTxOffset) {
+              bool check_for_overwrite, uint32_t nTxOffset, bool exclude_metadata_cells) {
     bool fCoinbase = tx.IsCoinBase();
     bool fCoinstake = tx.IsCoinStake();
     const Txid& txid = tx.GetHash();
@@ -148,6 +150,9 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight,
         // Empty outputs are historical B3Coin marker outputs (including the
         // first output of a coinstake transaction), not spendable UTXOs.
         if (tx.vout[i].nValue == 0 && tx.vout[i].scriptPubKey.empty()) continue;
+        // Modern metadata cells (policy 6/7/8 carriers) are consensus-committed
+        // but never spendable: not added in the modern era.
+        if (exclude_metadata_cells && modern::IsMetadataCell(tx.vout[i].scriptPubKey)) continue;
         bool overwrite = check_for_overwrite ? cache.HaveCoin(COutPoint(txid, i)) : fCoinbase;
         // Coinbase transactions can always be overwritten, in order to correctly
         // deal with the pre-BIP30 occurrences of duplicate coinbase transactions.
