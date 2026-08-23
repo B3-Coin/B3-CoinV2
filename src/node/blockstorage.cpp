@@ -4,6 +4,8 @@
 
 #include <node/blockstorage.h>
 
+#include <node/finality_pin.h>
+
 #include <arith_uint256.h>
 #include <chain.h>
 #include <consensus/block_codec.h>
@@ -339,11 +341,23 @@ bool BlockManager::IsAnchorIneligible(const CBlockIndex& block) const
     return false;
 }
 
+fs::path BlockManager::FinalityPinPath() const
+{
+    return m_opts.blocks_dir / fs::u8path(FINALITY_PIN_FILENAME);
+}
+
 void BlockManager::RaiseFinalityAnchor(const int height, const uint256& hash)
 {
     AssertLockHeld(cs_main);
     if (m_finality_anchor && m_finality_anchor->first >= height) return;
     m_finality_anchor = std::make_pair(height, hash);
+    // Persist immediately (atomic, fsync, rename-over): a later allowed reorg
+    // may remove the certificate carrier, and a crash or restart must not
+    // forget the pin. The file itself refuses to go backwards.
+    if (!WriteFinalityPin(FinalityPinPath(), m_opts.chainparams.MessageStart(), FinalityPin{height, hash})) {
+        LogError("finality pin: could not persist checkpoint %d %s -- the pin is held in memory only until the next raise",
+                 height, hash.ToString());
+    }
 }
 
 CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockIndex*& best_header)
@@ -1420,6 +1434,16 @@ BlockManager::BlockManager(const util::SignalInterrupt& interrupt, Options opts)
       m_interrupt{interrupt}
 {
     m_block_tree_db = std::make_unique<BlockTreeDB>(m_opts.block_tree_db_params);
+
+    // The persisted finality pin outlives both databases (it lives beside the
+    // block files) so no reindex or restart can reopen a fork below accepted
+    // finality. Until its hash is present in the index it is a pending pin:
+    // it already bounds RaiseFinalityAnchor (monotone) and starts being
+    // enforced the moment the block is (re)indexed.
+    if (const auto pin{ReadFinalityPin(FinalityPinPath(), m_opts.chainparams.MessageStart())}) {
+        m_finality_anchor = std::make_pair(pin->height, pin->hash);
+        LogInfo("finality pin: loaded checkpoint %d %s", pin->height, pin->hash.ToString());
+    }
 
     if (m_opts.block_tree_db_params.wipe_data) {
         m_block_tree_db->WriteReindexing(true);

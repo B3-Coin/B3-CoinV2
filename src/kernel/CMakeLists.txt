@@ -32,6 +32,12 @@ add_library(bitcoinkernel
   ../hash.cpp
   ../logging.cpp
   ../node/blockstorage.cpp
+  ../node/finality_binding_index.cpp
+  ../node/finality_pin.cpp
+  ../node/finality_tracker.cpp
+  ../node/stake_registry.cpp
+  ../node/stake_tracker.cpp
+  ../node/validator_set.cpp
   ../node/chainstate.cpp
   ../node/utxo_snapshot.cpp
   ../policy/ephemeral_policy.cpp

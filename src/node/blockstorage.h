@@ -413,11 +413,16 @@ public:
      * Monotone: only ever raised (RaiseFinalityAnchor), never lowered by a
      * disconnect -- so a reorganization that merely removes the certificate
      * carrier can never open the door to a second reorganization below the
-     * checkpoint. Re-derived from the active chain after restart/reindex by
-     * the FinalityTracker; cleared only with the process.
+     * checkpoint. PERSISTED (plan Commit 14A, node/finality_pin.h): written
+     * atomically on every raise and loaded in the constructor, so restart,
+     * -reindex and -reindex-chainstate keep it; the FinalityTracker's
+     * chain-derived finalized height can only ever raise it further.
      */
     std::optional<std::pair<int, uint256>> FinalityAnchor() const EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return m_finality_anchor; }
+    //! Raise (never lower) the pin and persist it to FinalityPinPath().
     void RaiseFinalityAnchor(int height, const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    //! `<blocksdir>/finality_pin.dat` (survives -reindex and -reindex-chainstate).
+    fs::path FinalityPinPath() const;
 
     /** Get block file info entry for one block file */
     CBlockFileInfo* GetBlockFileInfo(size_t n);
