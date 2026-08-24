@@ -435,8 +435,14 @@ private:
     //! Cache of descriptor ScriptPubKeys used for IsMine. Maps ScriptPubKey to set of spkms
     std::unordered_map<CScript, std::vector<ScriptPubKeyMan*>, SaltedSipHasher> m_cached_spks;
 
-    //! B3: secp handle of the imported BLS finality secret; unset until imported.
-    std::optional<CPubKey> m_b3_finality_bls_handle GUARDED_BY(cs_wallet);
+    //! B3: the imported BLS finality key record (pubkey + plain-or-crypted
+    //! secret bytes; see ImportFinalityBlsKey). Unset until imported.
+    struct B3BlsKeyRecord {
+        std::array<unsigned char, 48> pubkey{};
+        std::vector<unsigned char> data; //!< 32-byte secret, or its ciphertext
+        bool crypted{false};
+    };
+    std::optional<B3BlsKeyRecord> m_b3_bls_key GUARDED_BY(cs_wallet);
     //! B3 validator public key (see GetValidatorPubKey); unset until created.
     std::optional<CPubKey> m_b3_validator_pubkey GUARDED_BY(cs_wallet);
 
@@ -1003,20 +1009,28 @@ public:
      */
     util::Result<bls::SecretKey> DeriveFinalityBlsKey(uint32_t seq) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /**
-     * B3 finality: an INDEPENDENTLY generated BLS consensus key (production
-     * hardening, 2026-08-24). The 32-byte scalar (0 < sk < r, so always a
-     * valid secp256k1 secret too) is stored as an ordinary single-key pk()
-     * descriptor -- the wallet's existing persistence, encryption, unlock
-     * and backup machinery, no parallel keystore -- and found again through
-     * the recorded secp handle public key. Importing requires an unlocked
-     * wallet; re-importing replaces the handle (the old descriptor stays
-     * inert). The secret never leaves wallet/node memory.
+     * B3 finality: an INDEPENDENTLY generated BLS consensus key, held as
+     * OPAQUE wallet state (release-qualification audit, 2026-08-24). The
+     * scalar deliberately never enters a descriptor, keypool or signing
+     * provider: it cannot become a spendable/IsMine key, cannot be signed
+     * with by any transaction path, and no export RPC (listdescriptors,
+     * backups' descriptor dumps) can emit it. Persistence follows the
+     * wallet's ordinary key/ckey encryption lifecycle: the plain 32-byte
+     * secret on an unencrypted wallet, the vMasterKey AES ciphertext (IV =
+     * SHA256d of the 48-byte BLS public key) once encrypted -- EncryptWallet
+     * converts the record in the same atomic batch as every other key, the
+     * database is rewritten to scrub slack, and use requires an unlocked
+     * wallet. Exactly one storage form exists at a time. Importing requires
+     * an unlocked wallet; re-importing replaces the record. The secret never
+     * leaves wallet/node memory.
      */
     util::Result<bls::PublicKey> ImportFinalityBlsKey(const bls::SecretKey& key) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    //! The imported BLS key, if any (unlocked wallet); nullopt error text otherwise.
+    //! The imported BLS key, if any (unlocked wallet); error text otherwise.
     util::Result<bls::SecretKey> GetImportedFinalityBlsKey() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    bool HasImportedFinalityBlsKey() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { return m_b3_finality_bls_handle.has_value(); }
-    void LoadFinalityBlsHandle(const CPubKey& pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool HasImportedFinalityBlsKey() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { return m_b3_bls_key.has_value(); }
+    //! (walletdb load hook) install the stored record verbatim.
+    void LoadImportedFinalityBlsKey(const std::array<unsigned char, 48>& pubkey, const std::vector<unsigned char>& data,
+                                    bool crypted) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /**
      * The BLS secret this wallet would use for binding sequence `seq` /
      * signing: when `bound_bls_pubkey` is given (an on-chain binding), the

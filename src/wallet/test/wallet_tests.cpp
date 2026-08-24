@@ -815,6 +815,44 @@ BOOST_FIXTURE_TEST_CASE(b3_validator_key_and_stake_outputs, TestChain100Setup)
             BOOST_CHECK(!wallet->ResolveFinalityBlsKey(0, &foreign));
         }
 
+        // ISOLATION (release-qualification audit): the imported scalar is
+        // opaque wallet state -- its secp interpretation is never a
+        // descriptor, never IsMine, never a signing or export path.
+        {
+            CKey shadow;
+            const auto secret_bytes{independent->Bytes()};
+            shadow.Set(secret_bytes.begin(), secret_bytes.end(), /*fCompressedIn=*/true);
+            BOOST_REQUIRE(shadow.IsValid());
+            BOOST_CHECK(!wallet->IsMine(CTxOut{COIN, GetScriptForRawPubKey(shadow.GetPubKey())}));
+            BOOST_CHECK(!wallet->IsMine(CTxOut{COIN, GetScriptForDestination(PKHash(shadow.GetPubKey()))}));
+            BOOST_CHECK(wallet->GetWalletDescriptors(GetScriptForRawPubKey(shadow.GetPubKey())).empty());
+        }
+        // ENCRYPTION LIFECYCLE: EncryptWallet converts the plain record to
+        // ciphertext in the same batch; a locked wallet refuses the key;
+        // unlocking returns the identical scalar; re-import while encrypted
+        // stores ciphertext only.
+        BOOST_REQUIRE(wallet->EncryptWallet("qualification-pass"));
+        BOOST_CHECK(wallet->IsLocked());
+        BOOST_CHECK(!wallet->GetImportedFinalityBlsKey());
+        BOOST_REQUIRE(wallet->Unlock("qualification-pass"));
+        {
+            const auto back{wallet->GetImportedFinalityBlsKey()};
+            BOOST_REQUIRE_MESSAGE(back, util::ErrorString(back).original);
+            BOOST_CHECK(back->Bytes() == independent->Bytes());
+            BOOST_CHECK(back->GetPublicKey().Compressed() == independent->GetPublicKey().Compressed());
+        }
+        {
+            std::array<unsigned char, 32> ikm2{};
+            ikm2.fill(0x6B);
+            const auto second{bls::SecretKey::FromIKM(ikm2)};
+            BOOST_REQUIRE(second);
+            const auto imported2{wallet->ImportFinalityBlsKey(*second)};
+            BOOST_REQUIRE_MESSAGE(imported2, util::ErrorString(imported2).original);
+            const auto back2{wallet->GetImportedFinalityBlsKey()};
+            BOOST_REQUIRE(back2);
+            BOOST_CHECK(back2->Bytes() == second->Bytes());
+        }
+
         // Ownership and standardness through the carrier.
         BOOST_CHECK(wallet->IsMine(CTxOut{COIN, stake_script}));
         BOOST_CHECK(!wallet->IsMine(CTxOut{COIN, witness_owner_stake}));
