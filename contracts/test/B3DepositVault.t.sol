@@ -101,15 +101,17 @@ contract ReentrantToken {
 contract B3DepositVaultTest is Test {
     event Deposit(uint64 indexed depositId, address indexed token, uint256 amount, bytes32 b3Recipient);
     event Released(address indexed token, address indexed to, uint256 amount);
+    event Rescued(address indexed token, address indexed to, uint256 amount);
 
     address authority = address(0xA11CE);
+    address rescuer = address(0x5AFE);
     B3DepositVault vault;
     MockStandardToken std_;
     MockUSDT usdt;
     MockFeeToken fee;
 
     function setUp() public {
-        vault = new B3DepositVault(authority);
+        vault = new B3DepositVault(authority, rescuer);
         std_ = new MockStandardToken();
         usdt = new MockUSDT();
         fee = new MockFeeToken();
@@ -120,7 +122,9 @@ contract B3DepositVaultTest is Test {
 
     function test_ZeroAuthorityReverts() public {
         vm.expectRevert(B3DepositVault.ZeroAuthority.selector);
-        new B3DepositVault(address(0));
+        new B3DepositVault(address(0), rescuer);
+        vm.expectRevert(B3DepositVault.ZeroAuthority.selector);
+        new B3DepositVault(authority, address(0));
     }
 
     function test_DepositETH_SequentialIdsAndEvent() public {
@@ -204,6 +208,53 @@ contract B3DepositVaultTest is Test {
         vm.expectRevert(B3DepositVault.TransferFailed.selector);
         vault.depositToken(address(evil), 1000, bytes32(0));
         assertEq(vault.nextDepositId(), 0); // no event escaped
+    }
+
+    function test_Rescue_OnlySurplus_ETH() public {
+        vault.depositETH{value: 1 ether}(bytes32(0)); // locked = 1 ether
+        vm.deal(address(vault), 1.5 ether);           // 0.5 ether force-sent stray
+        address payable out = payable(address(0xCAFE));
+
+        vm.prank(rescuer);
+        vm.expectEmit(true, true, false, true, address(vault));
+        emit Rescued(address(0), out, 0.5 ether);
+        vault.rescue(address(0), out);
+
+        assertEq(out.balance, 0.5 ether);
+        assertEq(address(vault).balance, 1 ether);    // locked funds untouched
+
+        vm.prank(rescuer);
+        vm.expectRevert(B3DepositVault.NothingToRescue.selector);
+        vault.rescue(address(0), out);                 // nothing left above liabilities
+    }
+
+    function test_Rescue_OnlySurplus_Token() public {
+        std_.approve(address(vault), 500);
+        vault.depositToken(address(std_), 500, bytes32(0)); // locked = 500
+        std_.mint(address(vault), 200);                     // stray airdrop
+        address payable out = payable(address(0xCAFE));
+
+        vm.prank(rescuer);
+        vault.rescue(address(std_), out);
+        assertEq(std_.balanceOf(out), 200);
+        assertEq(std_.balanceOf(address(vault)), 500);
+    }
+
+    function test_Rescue_NotRescuerReverts() public {
+        vm.deal(address(vault), 1 ether);
+        vm.expectRevert(B3DepositVault.NotAuthority.selector);
+        vault.rescue(address(0), payable(address(this)));
+    }
+
+    function test_Release_ReducesLocked_ThenRescueStillBounded() public {
+        vault.depositETH{value: 1 ether}(bytes32(0));
+        vm.prank(authority);
+        vault.release(address(0), payable(address(0xBEEF)), 0.4 ether);
+        assertEq(vault.locked(address(0)), 0.6 ether);
+        // Remaining 0.6 is liability; no surplus exists.
+        vm.prank(rescuer);
+        vm.expectRevert(B3DepositVault.NothingToRescue.selector);
+        vault.rescue(address(0), payable(address(0xCAFE)));
     }
 
     function test_Release_ETH_ToRejectingReceiverReverts() public {

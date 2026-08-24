@@ -11,10 +11,12 @@ import {B3DepositVault} from "../B3DepositVault.sol";
 contract Deploy is Script {
     function run() external {
         address authority = vm.envAddress("RELEASE_AUTHORITY");
+        address rescuer = vm.envOr("RESCUE_AUTHORITY", authority);
         vm.startBroadcast();
-        B3DepositVault vault = new B3DepositVault(authority);
+        B3DepositVault vault = new B3DepositVault(authority, rescuer);
         vm.stopBroadcast();
         console.log("B3DepositVault deployed at", address(vault));
         console.log("releaseAuthority", authority);
+        console.log("rescueAuthority", rescuer);
     }
 }

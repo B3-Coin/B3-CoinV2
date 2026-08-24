@@ -18,6 +18,10 @@ B3 consensus.
   id and token indexed, amount = received balance delta).
 - The vault has no owner, no pause, no upgrade path. Funds leave only via
   `release`, restricted to the release authority (the §5 verifier stack).
+- `rescue` (separate `rescueAuthority`, defaults to the release authority at
+  deploy) can withdraw ONLY the surplus above the per-token `locked`
+  liabilities -- strays, airdrops, force-sent ETH. It is structurally unable
+  to touch deposited funds, so it stays safe even in production.
 - Mainnet deployment waits for the release-leg contracts: the constructor
   refuses a zero release authority so deposits can never be trapped.
 

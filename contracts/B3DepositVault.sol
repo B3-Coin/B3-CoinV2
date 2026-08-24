@@ -30,15 +30,26 @@ contract B3DepositVault {
                   uint256 amount, bytes32 b3Recipient);
 
     event Released(address indexed token, address indexed to, uint256 amount);
+    event Rescued(address indexed token, address indexed to, uint256 amount);
 
     uint64 public nextDepositId;
     address public immutable releaseAuthority;
+    address public immutable rescueAuthority;
+
+    /// Deposit-leg liabilities per token (address(0) = ETH): raised by every
+    /// deposit, lowered by every release. `rescue` can only withdraw what
+    /// sits ABOVE this figure, so even a compromised rescuer can never touch
+    /// legitimately locked funds -- rescue is for strays only (tokens sent
+    /// directly without depositToken, airdrops, force-sent ETH, deposits of
+    /// tokens B3 never registers that the authority refunds off-band).
+    mapping(address => uint256) public locked;
 
     error ZeroAuthority();
     error ZeroAmount();
     error NotAuthority();
     error TransferFailed();
     error Reentrancy();
+    error NothingToRescue();
 
     uint256 private _entered;
 
@@ -54,14 +65,16 @@ contract B3DepositVault {
         _entered = 0;
     }
 
-    constructor(address _releaseAuthority) {
-        if (_releaseAuthority == address(0)) revert ZeroAuthority();
+    constructor(address _releaseAuthority, address _rescueAuthority) {
+        if (_releaseAuthority == address(0) || _rescueAuthority == address(0)) revert ZeroAuthority();
         releaseAuthority = _releaseAuthority;
+        rescueAuthority = _rescueAuthority;
     }
 
     /// Lock native ETH.
     function depositETH(bytes32 b3Recipient) external payable nonReentrant {
         if (msg.value == 0) revert ZeroAmount();
+        locked[address(0)] += msg.value;
         emit Deposit(nextDepositId++, address(0), msg.value, b3Recipient);
     }
 
@@ -73,6 +86,7 @@ contract B3DepositVault {
         _safeTransferFrom(token, msg.sender, address(this), amount);
         uint256 received = _balanceOf(token, address(this)) - before;
         if (received == 0) revert ZeroAmount();
+        locked[token] += received;
         emit Deposit(nextDepositId++, token, received, b3Recipient);
     }
 
@@ -81,6 +95,8 @@ contract B3DepositVault {
     /// finality certificate + withdrawal-tree proof (spec §5.2 + §6).
     function release(address token, address payable to, uint256 amount) external nonReentrant {
         if (msg.sender != releaseAuthority) revert NotAuthority();
+        uint256 l = locked[token];
+        locked[token] = amount >= l ? 0 : l - amount; // saturating: accounting bounds rescue, never the authority
         if (token == address(0)) {
             (bool ok, ) = to.call{value: amount}("");
             if (!ok) revert TransferFailed();
@@ -88,6 +104,23 @@ contract B3DepositVault {
             _safeTransfer(token, to, amount);
         }
         emit Released(token, to, amount);
+    }
+
+    /// Withdraw ONLY the surplus above the deposit-leg liabilities: strays,
+    /// airdrops, force-sent ETH. Structurally unable to touch locked funds.
+    function rescue(address token, address payable to) external nonReentrant {
+        if (msg.sender != rescueAuthority) revert NotAuthority();
+        uint256 balance = token == address(0) ? address(this).balance : _balanceOf(token, address(this));
+        uint256 l = locked[token];
+        if (balance <= l) revert NothingToRescue();
+        uint256 surplus = balance - l;
+        if (token == address(0)) {
+            (bool ok, ) = to.call{value: surplus}("");
+            if (!ok) revert TransferFailed();
+        } else {
+            _safeTransfer(token, to, surplus);
+        }
+        emit Rescued(token, to, surplus);
     }
 
     // --- minimal safe-ERC20 (no library dependencies) ---------------------
