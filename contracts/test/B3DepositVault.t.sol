@@ -75,6 +75,29 @@ contract RejectingReceiver {
     receive() external payable { revert("no"); }
 }
 
+/// Hook-style malicious token: transferFrom reenters depositToken to try
+/// the balance-delta double count.
+contract ReentrantToken {
+    B3DepositVault public vault;
+    uint256 public balance_;
+    bool private attacking;
+
+    function setVault(B3DepositVault v) external { vault = v; }
+    function balanceOf(address) external view returns (uint256) { return balance_; }
+    function approve(address, uint256) external returns (bool) { return true; }
+    function transfer(address, uint256) external returns (bool) { return true; }
+
+    function transferFrom(address, address, uint256 amount) external returns (bool) {
+        balance_ += amount;
+        if (!attacking) {
+            attacking = true;
+            vault.depositToken(address(this), amount / 2, bytes32(0)); // reenter
+            attacking = false;
+        }
+        return true;
+    }
+}
+
 contract B3DepositVaultTest is Test {
     event Deposit(uint64 indexed depositId, address indexed token, uint256 amount, bytes32 b3Recipient);
     event Released(address indexed token, address indexed to, uint256 amount);
@@ -170,6 +193,17 @@ contract B3DepositVaultTest is Test {
         vault.release(address(usdt), payable(address(0xBEEF)), 250_000);
         assertEq(usdt.balanceOf(address(0xBEEF)), 250_000);
         assertEq(usdt.balanceOf(address(vault)), 750_000);
+    }
+
+    function test_DepositToken_ReentrancyBlocked() public {
+        ReentrantToken evil = new ReentrantToken();
+        evil.setVault(vault);
+        // The inner reentrant call reverts with Reentrancy(); the outer
+        // safe-call wrapper surfaces that as TransferFailed. Either way the
+        // double-counted deposit can never happen.
+        vm.expectRevert(B3DepositVault.TransferFailed.selector);
+        vault.depositToken(address(evil), 1000, bytes32(0));
+        assertEq(vault.nextDepositId(), 0); // no event escaped
     }
 
     function test_Release_ETH_ToRejectingReceiverReverts() public {

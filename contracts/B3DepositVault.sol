@@ -38,6 +38,21 @@ contract B3DepositVault {
     error ZeroAmount();
     error NotAuthority();
     error TransferFailed();
+    error Reentrancy();
+
+    uint256 private _entered;
+
+    /// Blocks the balance-delta inflation a token with transfer hooks
+    /// (ERC-777 style) could otherwise achieve by reentering depositToken
+    /// mid-transfer: the inner deposit's delta would be double-counted by
+    /// the outer call. USDT/standard ERC-20/ETH have no hooks, but the
+    /// vault must be safe for ANY token a user throws at it.
+    modifier nonReentrant() {
+        if (_entered != 0) revert Reentrancy();
+        _entered = 1;
+        _;
+        _entered = 0;
+    }
 
     constructor(address _releaseAuthority) {
         if (_releaseAuthority == address(0)) revert ZeroAuthority();
@@ -45,14 +60,14 @@ contract B3DepositVault {
     }
 
     /// Lock native ETH.
-    function depositETH(bytes32 b3Recipient) external payable {
+    function depositETH(bytes32 b3Recipient) external payable nonReentrant {
         if (msg.value == 0) revert ZeroAmount();
         emit Deposit(nextDepositId++, address(0), msg.value, b3Recipient);
     }
 
     /// Lock an ERC-20. Requires prior approve(). Records the balance delta,
     /// not the requested amount.
-    function depositToken(address token, uint256 amount, bytes32 b3Recipient) external {
+    function depositToken(address token, uint256 amount, bytes32 b3Recipient) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
         uint256 before = _balanceOf(token, address(this));
         _safeTransferFrom(token, msg.sender, address(this), amount);
@@ -64,7 +79,7 @@ contract B3DepositVault {
     /// Withdrawal path — only the release authority (the B3 finality
     /// verifier stack), which itself only pays out against an accepted B3
     /// finality certificate + withdrawal-tree proof (spec §5.2 + §6).
-    function release(address token, address payable to, uint256 amount) external {
+    function release(address token, address payable to, uint256 amount) external nonReentrant {
         if (msg.sender != releaseAuthority) revert NotAuthority();
         if (token == address(0)) {
             (bool ok, ) = to.call{value: amount}("");
