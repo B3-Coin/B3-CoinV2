@@ -39,6 +39,7 @@ add_executable(test_bitcoin
   common_url_tests.cpp
   bridge_deposit_tests.cpp
   bridge_eth_light_client_tests.cpp
+  bridge_exec_chain_tests.cpp
   bridge_mpt_tests.cpp
   compress_tests.cpp
   consensus_phase_tests.cpp

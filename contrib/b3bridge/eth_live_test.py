@@ -10,7 +10,12 @@ runs b3-bridge-ethcheck, which performs every verification step in C++:
   checkpoint bootstrap -> period update(s) -> today's finality_update
   -> proven receipts_root -> Merkle-Patricia receipt proof -> receipt decode
 
-Usage: eth_live_test.py <workdir> [--tool PATH] [--beacon URL] [--rpc URL]
+Usage:
+  eth_live_test.py <workdir>                         smoke test (latest block)
+  eth_live_test.py <workdir> --tx 0x.. --vault 0x..  prove a REAL vault deposit
+                                                     (tx must be finalized; the
+                                                     driver builds the exec-header
+                                                     ancestry chain to its block)
 """
 import argparse
 import json
@@ -63,12 +68,37 @@ def _hr(hd):
     return leaves[0]
 
 
+EXEC_HEADER_FIELDS = [
+    ("parentHash", "h"), ("sha3Uncles", "h"), ("miner", "h"), ("stateRoot", "h"),
+    ("transactionsRoot", "h"), ("receiptsRoot", "h"), ("logsBloom", "h"),
+    ("difficulty", "n"), ("number", "n"), ("gasLimit", "n"), ("gasUsed", "n"),
+    ("timestamp", "n"), ("extraData", "h"), ("mixHash", "h"), ("nonce", "h"),
+    ("baseFeePerGas", "n"), ("withdrawalsRoot", "h"), ("blobGasUsed", "n"),
+    ("excessBlobGas", "n"), ("parentBeaconBlockRoot", "h"), ("requestsHash", "h"),
+]
+
+
+def encode_exec_header(hdr):
+    """Re-encode a JSON execution block header to its canonical RLP. Optional
+    trailing fork fields are included only when present. The caller MUST
+    verify keccak(result) == the block hash."""
+    fields = []
+    for name, kind in EXEC_HEADER_FIELDS:
+        if name not in hdr or hdr[name] is None:
+            break  # trailing optional fields stop here
+        v = hdr[name]
+        fields.append(int(v, 16) if kind == "n" else bytes.fromhex(v[2:]))
+    return rec.rlp(fields)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("workdir")
     ap.add_argument("--tool", default="build/bin/b3-bridge-ethcheck")
     ap.add_argument("--beacon", default="https://ethereum-beacon-api.publicnode.com")
     ap.add_argument("--rpc", default="https://ethereum-rpc.publicnode.com")
+    ap.add_argument("--tx", help="transaction hash of a vault deposit to prove")
+    ap.add_argument("--vault", help="B3DepositVault address (checks Deposit extraction)")
     args = ap.parse_args()
     import os
     os.makedirs(args.workdir, exist_ok=True)
@@ -107,31 +137,72 @@ def main():
     save("finality_update.json", finality_update)
 
     fin_exec = finality_update["data"]["finalized_header"]["execution"]
-    block_number = int(fin_exec["block_number"])
-    print(f"== building receipt proof for finalized exec block {block_number} ==")
+    fin_block = int(fin_exec["block_number"])
+
+    exec_chain = None
+    if args.tx:
+        txr = rpc(args.rpc, "eth_getTransactionReceipt", [args.tx])
+        if txr is None:
+            sys.exit(f"transaction {args.tx} not found")
+        if int(txr["status"], 16) != 1:
+            sys.exit(f"transaction {args.tx} FAILED on chain; nothing to prove")
+        block_number = int(txr["blockNumber"], 16)
+        idx = int(txr["transactionIndex"], 16)
+        if block_number > fin_block:
+            sys.exit(f"tx block {block_number} is not yet finalized "
+                     f"(latest proven finalized block {fin_block}); retry in ~15 minutes")
+        depth = fin_block - block_number
+        if depth > 20000:
+            sys.exit(f"tx is {depth} blocks behind finality; rerun soon after the deposit "
+                     f"(the ancestry chain would be excessive)")
+        print(f"== building exec-header ancestry: {depth + 1} headers "
+              f"({fin_block} down to {block_number}) ==")
+        exec_chain = []
+        for n in range(fin_block, block_number - 1, -1):
+            hdr = rpc(args.rpc, "eth_getBlockByNumber", [hex(n), False])
+            enc = encode_exec_header(hdr)
+            assert rec.keccak256(enc) == bytes.fromhex(hdr["hash"][2:]),                 f"header re-encoding mismatch at block {n} (new fork field?)"
+            exec_chain.append("0x" + enc.hex())
+        print(f"   {len(exec_chain)} headers, all keccak-checked against RPC hashes")
+    else:
+        block_number = fin_block
+
+    print(f"== building receipt proof for block {block_number} ==")
     receipts = rpc(args.rpc, "eth_getBlockReceipts", [hex(block_number)])
     items = [(rec.rlp(i), rec.encode_receipt(r)) for i, r in enumerate(receipts)]
     trie = rec.Trie(items)
     root = trie.root()
-    want = bytes.fromhex(fin_exec["receipts_root"][2:])
-    assert root == want, f"local trie {root.hex()} != proven receipts_root {want.hex()}"
+    if block_number == fin_block:
+        want = bytes.fromhex(fin_exec["receipts_root"][2:])
+        assert root == want, f"local trie {root.hex()} != proven receipts_root {want.hex()}"
+    else:
+        want = bytes.fromhex(rpc(args.rpc, "eth_getBlockByNumber",
+                                 [hex(block_number), False])["receiptsRoot"][2:])
+        assert root == want, f"local trie {root.hex()} != header receiptsRoot {want.hex()}"
     print(f"   rebuilt {len(receipts)} receipts; root matches the header: 0x{root.hex()}")
 
-    transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-    idx = len(receipts) - 1
-    for i, r in enumerate(receipts):
-        if any(l["topics"] and l["topics"][0] == transfer_topic for l in r["logs"]):
-            idx = i
-            break
+    if not args.tx:
+        transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+        idx = len(receipts) - 1
+        for i, r in enumerate(receipts):
+            if any(l["topics"] and l["topics"][0] == transfer_topic for l in r["logs"]):
+                idx = i
+                break
     key = rec.rlp(idx)
-    save("receipt_proof.json", {
+    proof_obj = {
         "block_number": block_number,
         "receipts_root": "0x" + want.hex(),
         "index": idx,
         "key": "0x" + key.hex(),
         "value": "0x" + items[idx][1].hex(),
         "proof": ["0x" + n.hex() for n in trie.prove(key)],
-    })
+    }
+    if exec_chain is not None:
+        proof_obj["exec_chain"] = exec_chain
+    if args.vault:
+        proof_obj["vault"] = args.vault
+        proof_obj["expect_deposits"] = 1
+    save("receipt_proof.json", proof_obj)
 
     print(f"== running {args.tool} ==")
     sys.stdout.flush()

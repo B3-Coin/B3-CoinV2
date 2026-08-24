@@ -18,6 +18,7 @@
 // node; test/tooling only (option B3_BRIDGE_TOOLS).
 
 #include <bridge/deposit.h>
+#include <bridge/exec_chain.h>
 #include <bridge/eth_light_client.h>
 #include <bridge/lc_json.h>
 #include <bridge/mpt.h>
@@ -142,9 +143,26 @@ int main(int argc, char** argv)
             rp_probe.close();
             const UniValue rp{LoadJson(dir + "receipt_proof.json")};
             const uint64_t block{lcjson::Num(lcjson::Field(rp, "block_number"), "block_number")};
+            uint256 target_receipts_root{fin.execution.receipts_root};
             if (block != fin.execution.block_number) {
-                throw std::runtime_error("receipt proof is for block " + util::ToString(block) +
-                                         ", store finalized " + util::ToString(fin.execution.block_number));
+                // The deposit block is older than the proven finalized block:
+                // close the gap with the keccak parent-hash ancestry chain.
+                const UniValue& chain_json{rp.find_value("exec_chain")};
+                if (chain_json.isNull()) {
+                    throw std::runtime_error("receipt proof is for block " + util::ToString(block) +
+                                             ", store finalized " + util::ToString(fin.execution.block_number) +
+                                             ", and no exec_chain ancestry was provided");
+                }
+                std::vector<std::vector<unsigned char>> chain;
+                for (size_t i = 0; i < chain_json.size(); ++i) {
+                    chain.push_back(lcjson::HexField(chain_json[i], "exec_chain"));
+                }
+                const auto anc{VerifyExecAncestry(fin.execution.block_hash, block, chain)};
+                if (!anc) throw std::runtime_error("execution ancestry chain failed to verify");
+                target_receipts_root = anc->receipts_root;
+                std::printf("  [ok] ancestry proven: %zu headers from finalized block %llu down to %llu\n",
+                            chain.size(), (unsigned long long)fin.execution.block_number,
+                            (unsigned long long)block);
             }
             const auto key{lcjson::HexField(lcjson::Field(rp, "key"), "key")};
             const auto value{lcjson::HexField(lcjson::Field(rp, "value"), "value")};
@@ -152,7 +170,7 @@ int main(int argc, char** argv)
             std::vector<std::vector<unsigned char>> proof;
             for (size_t i = 0; i < pj.size(); ++i) proof.push_back(lcjson::HexField(pj[i], "proof"));
 
-            const auto got{VerifyMptProof(fin.execution.receipts_root, key, proof)};
+            const auto got{VerifyMptProof(target_receipts_root, key, proof)};
             if (!got) throw std::runtime_error("MPT receipt proof failed");
             if (*got != value) throw std::runtime_error("MPT value mismatch");
             std::printf("  [ok] receipt %llu proven against the receipts_root (%zu proof nodes)\n",
@@ -173,6 +191,30 @@ int main(int argc, char** argv)
             }
             std::printf("  [ok] receipt decoded: type %u, status %u, %zu logs, %zu ERC-20 Transfer(s)\n",
                         receipt->type, unsigned{receipt->status}, receipt->logs.size(), transfers);
+
+            // Vault Deposit extraction, when a vault address is given.
+            const UniValue& vault_json{rp.find_value("vault")};
+            if (!vault_json.isNull()) {
+                const EthAddress vault{lcjson::Bytes<20>(vault_json, "vault")};
+                const auto deposits{ExtractDeposits(*receipt, vault)};
+                for (const auto& d : deposits) {
+                    // Amount prints as decimal wei when it fits 64 bits.
+                    uint64_t small{0};
+                    bool fits{true};
+                    for (int i = 0; i < 24; ++i) fits &= (d.amount[i] == 0);
+                    for (int i = 24; i < 32; ++i) small = (small << 8) | d.amount[i];
+                    std::printf("  [ok] DEPOSIT PROVEN: id %llu, token 0x%s, amount %s, b3_recipient 0x%s\n",
+                                (unsigned long long)d.deposit_id, HexStr(d.token).c_str(),
+                                fits ? (util::ToString(small) + " wei").c_str() : ("0x" + HexStr(d.amount)).c_str(),
+                                HexStr(d.b3_recipient).c_str());
+                }
+                const UniValue& expect{rp.find_value("expect_deposits")};
+                const size_t want_n{expect.isNull() ? size_t{1} : size_t{lcjson::Num(expect, "expect_deposits")}};
+                if (deposits.size() < want_n) {
+                    throw std::runtime_error("expected " + util::ToString(want_n) +
+                                             " vault deposit(s), extracted " + util::ToString(deposits.size()));
+                }
+            }
         }
 
         std::printf("ALL VERIFIED\n");
