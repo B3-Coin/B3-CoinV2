@@ -11,6 +11,7 @@
 #include <consensus/consensus.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
+#include <modern/payload_cost.h>
 #include <policy/policy.h>
 #include <policy/settings.h>
 #include <random.h>
@@ -1014,7 +1015,11 @@ CTxMemPool::ChangeSet::TxHandle CTxMemPool::ChangeSet::StageAddition(const CTran
     CAmount delta{0};
     m_pool->ApplyDelta(tx->GetHash(), delta);
 
-    FeePerWeight feerate(fee, GetSigOpsAdjustedWeight(GetTransactionWeight(*tx), sigops_cost, ::nBytesPerSigOp));
+    // B3: the payload verification cost is part of the adjusted weight (the
+    // same number CTxMemPoolEntry::GetAdjustedWeight reports), so the graph
+    // and the mempool bookkeeping agree for MPA-bearing transactions.
+    FeePerWeight feerate(fee, GetSigOpsAdjustedWeight(GetTransactionWeight(*tx), sigops_cost, ::nBytesPerSigOp,
+                                                      modern::PayloadVerifyCost(*tx)));
     auto newit = m_to_add.emplace(tx, fee, time, entry_height, entry_sequence, spends_coinbase, sigops_cost, lp).first;
     m_pool->m_txgraph->AddTransaction(const_cast<CTxMemPoolEntry&>(*newit), feerate);
     if (delta) {

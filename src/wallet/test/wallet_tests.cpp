@@ -759,6 +759,18 @@ BOOST_FIXTURE_TEST_CASE(b3_validator_key_and_stake_outputs, TestChain100Setup)
         BOOST_REQUIRE_MESSAGE(secret, util::ErrorString(secret).original);
         BOOST_CHECK(secret->GetPubKey() == *created);
 
+        // BLS finality-key derivation (Commit 17): deterministic per (identity,
+        // seq), distinct across sequences, re-derivable after any restore --
+        // nothing but the identity key is ever stored.
+        const auto bls0{wallet->DeriveFinalityBlsKey(0)};
+        BOOST_REQUIRE_MESSAGE(bls0, util::ErrorString(bls0).original);
+        const auto bls0_again{wallet->DeriveFinalityBlsKey(0)};
+        BOOST_REQUIRE(bls0_again);
+        BOOST_CHECK(bls0->GetPublicKey().Compressed() == bls0_again->GetPublicKey().Compressed());
+        const auto bls1{wallet->DeriveFinalityBlsKey(1)};
+        BOOST_REQUIRE(bls1);
+        BOOST_CHECK(bls0->GetPublicKey().Compressed() != bls1->GetPublicKey().Compressed());
+
         // Ownership and standardness through the carrier.
         BOOST_CHECK(wallet->IsMine(CTxOut{COIN, stake_script}));
         BOOST_CHECK(!wallet->IsMine(CTxOut{COIN, witness_owner_stake}));

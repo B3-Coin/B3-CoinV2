@@ -7,6 +7,8 @@
 
 #include <policy/policy.h>
 
+#include <modern/metadata_cell.h>
+
 #include <modern/payload_cost.h>
 
 #include <coins.h>
@@ -41,7 +43,10 @@ CAmount GetDustThreshold(const CTxOut& txout, const CFeeRate& dustRelayFeeIn)
     // so dust is a spendable txout less than
     // 98*dustRelayFee/1000 (in satoshis).
     // 294 satoshis at the default rate of 3000 sat/kvB.
-    if (txout.scriptPubKey.IsUnspendable())
+    // B3 metadata cells are consensus-excluded from the UTXO set (amount 0,
+    // nothing ever spends them): like provably unspendable outputs they have
+    // no dust threshold.
+    if (txout.scriptPubKey.IsUnspendable() || modern::IsMetadataCell(txout.scriptPubKey))
         return 0;
 
     uint64_t nSize{GetSerializeSize(txout)};

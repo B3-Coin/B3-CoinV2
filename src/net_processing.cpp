@@ -2815,7 +2815,7 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
             // encoding.
             const TransactionSerParams& tx_ser{
                 UsesLegacyWireTransactions(peer) ? legacy::TX_LEGACY :
-                inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS};
+                inv.IsMsgTx() ? TX_NO_WITNESS : TX_MODERN};
             MakeAndPushMessage(pfrom, NetMsgType::TX, tx_ser(*tx));
             m_mempool.RemoveUnbroadcastTx(tx->GetHash());
         } else {
@@ -4684,7 +4684,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // that we INVed to the peer earlier.
             if (vInv.size() == 1 && vInv[0].IsMsgTx() && vInv[0].hash == pushed_tx->GetHash().ToUint256()) {
 
-                MakeAndPushMessage(pfrom, NetMsgType::TX, (UsesLegacyWireTransactions(peer) ? legacy::TX_LEGACY : TX_WITH_WITNESS)(*pushed_tx));
+                // Modern peers get the full-payload codec (identical bytes for
+                // MPA-free transactions; the flag appears only when a payload
+                // exists), so binding evidence survives relay.
+                MakeAndPushMessage(pfrom, NetMsgType::TX, (UsesLegacyWireTransactions(peer) ? legacy::TX_LEGACY : TX_MODERN)(*pushed_tx));
 
                 peer.m_ping_queued = true; // Ensure a ping will be sent: mimic a request via RPC.
                 MaybeSendPing(pfrom, peer, GetTime<std::chrono::microseconds>());
@@ -4929,7 +4932,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // historical transaction encoding.
             vRecv >> legacy::TX_LEGACY(ptx);
         } else {
-            vRecv >> TX_WITH_WITNESS(ptx);
+            vRecv >> TX_MODERN(ptx);
         }
 
         // After activation the mempool is modern-only: a legacy-format

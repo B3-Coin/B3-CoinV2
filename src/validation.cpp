@@ -37,6 +37,7 @@
 #include <modern/fn.h>
 #include <modern/metadata_cell.h>
 #include <modern/mpa.h>
+#include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
 #include <modern/payload_root.h>
 #include <node/finality_binding_index.h>
@@ -878,24 +879,57 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-metadata-cell", cell_error);
         }
         // Modern Payload Area: structural rules and the FINALITY_KEY cell<->evidence
-        // one-to-one binding are consensus (ContextualCheckBlock enforces the same);
-        // the semantic (BIP340/PoP/sequence) check needs chain state and runs in
-        // ConnectBlock. Until the modern relay/mempool integration (plan Commit 15)
-        // an MPA-bearing transaction is additionally refused here as a matter of
-        // policy, so no lossy non-MPA relay form can ever be produced.
+        // one-to-one binding are consensus (ContextualCheckBlock enforces the same).
         if (std::string mpa_error;
             !modern::CheckTransactionMpa(tx, m_active_chainstate.m_chainman.GetConsensus(), mpa_error)) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-mpa", mpa_error);
         }
+        std::vector<modern::FinalityKeyPair> pairs;
         {
-            std::vector<modern::FinalityKeyPair> pairs;
             std::string bind_error;
             if (!modern::MatchFinalityKeyPairs(tx, pairs, bind_error)) {
                 return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-finality-key-binding", bind_error);
             }
         }
         if (tx.HasMpa()) {
-            return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "mpa-mempool-unsupported");
+            // Relayable MPA (plan Commit 17): only FINALITY_KEY evidence has a
+            // mempool path -- certificates are coinbase-only, other types have
+            // none. The transaction wire codec preserves the payload
+            // (TX_MODERN), so no lossy relay form can be produced.
+            for (const auto& rec : tx.mpa) {
+                if (rec.payload_type != modern::MPA_TYPE_FINALITY_KEY_EVIDENCE) {
+                    return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "mpa-mempool-unsupported");
+                }
+            }
+            // Semantic pre-check against the current binding index (the exact
+            // rule re-runs at connect): refuse bindings that could never be
+            // mined on the current chain -- wrong sequence, foreign identity,
+            // duplicate BLS owner, bad PoP.
+            const Consensus::Params& consensus{m_active_chainstate.m_chainman.GetConsensus()};
+            const auto domain{consensus.legacy_final_hash
+                                  ? modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash)
+                                  : std::nullopt};
+            if (!domain) {
+                return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "finality-key-domain-unpinned");
+            }
+            node::FinalityBindingTracker& tracker{m_active_chainstate.ModernFinalityBindings()};
+            const CBlockIndex* tip{m_active_chainstate.m_chain.Tip()};
+            if (!tip || !tracker.Sync(m_active_chainstate.m_chain, m_active_chainstate.m_blockman, consensus, *tip)) {
+                return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "finality-binding-state-unavailable");
+            }
+            const node::FinalityBindingIndex& index{tracker.Index()};
+            const modern::BlsKeyOwnerLookup owner_of{
+                [&index](const modern::BlsPubkeyBytes& pk) { return index.OwnerOf(pk); }};
+            for (const auto& pair : pairs) {
+                modern::ValidatorKeyBytes vk;
+                std::copy(pair.commitment.begin(), pair.commitment.end(), vk.begin());
+                const auto check{modern::CheckFinalityKeyTransition(*domain, pair.commitment, pair.params,
+                                                                    pair.evidence, index.Get(vk), owner_of)};
+                if (check != modern::FinalityKeyCheck::OK) {
+                    return state.Invalid(TxValidationResult::TX_NOT_STANDARD,
+                                         std::string{"finality-key-"} + modern::FinalityKeyCheckName(check));
+                }
+            }
         }
     }
 

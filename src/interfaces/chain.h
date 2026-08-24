@@ -7,6 +7,7 @@
 
 #include <blockfilter.h>
 #include <common/settings.h>
+#include <crypto/bls.h>
 #include <uint256.h>
 #include <script/script.h>
 #include <key.h>
@@ -93,6 +94,42 @@ enum class SettingsAction {
 };
 
 using SettingsUpdate = std::function<std::optional<interfaces::SettingsAction>(common::SettingsValue&)>;
+
+//! B3 modern-era finality status (see Chain::finalityStatus): the epoch
+//! state machine, the finalized checkpoint and persisted pin, the local
+//! signature pool, and -- when a validator key is given -- its FINALITY_KEY
+//! binding and set membership. Reusable by RPC, Qt and other clients.
+struct FinalityStatus {
+    //! Modern-PoS rules configured and the legacy boundary pinned.
+    bool configured{false};
+    //! The chain has reached the modern-PoS phase and the state is derivable.
+    bool active{false};
+    uint256 chain_domain{};
+    bool bootstrapped{false};
+    uint64_t epoch{0};
+    int epoch_start{-1};
+    bool handover_certified{false};
+    bool lineage_broken{false};
+    int set_size{0};
+    uint64_t total_weight{0};
+    uint64_t quorum_weight{0};
+    uint256 current_set_hash{};
+    uint256 next_set_hash{};
+    std::optional<int> finalized_height;
+    uint256 finalized_hash{};
+    uint64_t finalized_epoch{0};
+    std::optional<int> pin_height;
+    uint256 pin_hash{};
+    uint64_t pool_checkpoints{0};
+    // ---- per-validator (present when a validator key was given) ----
+    bool bound{false};
+    bool revoked{false};
+    uint32_t binding_seq{0};
+    std::vector<unsigned char> binding_bls_pubkey;
+    int binding_height{-1};
+    bool in_current_set{false};
+    uint64_t member_weight{0};
+};
 
 //! B3 Modern PoS staking status (see Chain::stakingStatus).
 struct StakingStatus {
@@ -434,6 +471,15 @@ public:
     //! Staking status; `validator_key` (x-only) selects whose stake weight to
     //! report when the loop is not running (the loop's own key otherwise).
     virtual StakingStatus stakingStatus(const std::optional<std::array<unsigned char, 32>>& validator_key) = 0;
+
+    //! B3: finality diagnostics (epoch state, finalized checkpoint, pin,
+    //! signature pool; binding/membership of `validator_key` when given).
+    virtual FinalityStatus finalityStatus(const std::optional<std::array<unsigned char, 32>>& validator_key) = 0;
+    //! B3: arm the staking loop's finality signer with a BLS consensus key
+    //! (refused while the loop runs; the key stays in node memory only).
+    virtual bool armFinalitySigner(const bls::SecretKey& key, const std::array<unsigned char, 32>& validator_key, std::string& error) = 0;
+    //! B3: drop the armed finality key (refused while the loop runs).
+    virtual bool disarmFinalitySigner(std::string& error) = 0;
 
     //! Get internal node context. Useful for testing, but not
     //! accessible across processes.

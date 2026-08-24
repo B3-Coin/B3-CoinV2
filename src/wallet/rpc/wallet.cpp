@@ -895,6 +895,9 @@ RPCHelpMan signmessage();
 RPCHelpMan createstake();
 RPCHelpMan getstakinginfo();
 RPCHelpMan startstaking();
+RPCHelpMan bindfinalitykey();
+RPCHelpMan revokefinalitykey();
+RPCHelpMan getfinalityinfo();
 RPCHelpMan stopstaking();
 
 // transactions
@@ -917,6 +920,9 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &bumpfee},
         {"wallet", &psbtbumpfee},
         {"wallet", &createstake},
+        {"wallet", &bindfinalitykey},
+        {"wallet", &revokefinalitykey},
+        {"wallet", &getfinalityinfo},
         {"wallet", &createwallet},
         {"wallet", &createwalletdescriptor},
         {"wallet", &restorewallet},

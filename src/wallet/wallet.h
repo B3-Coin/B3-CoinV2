@@ -8,6 +8,7 @@
 
 #include <addresstype.h>
 #include <consensus/amount.h>
+#include <crypto/bls.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
 #include <kernel/cs_main.h>
@@ -987,6 +988,18 @@ public:
     util::Result<CPubKey> GetOrCreateValidatorKey() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     //! The secret key (requires an unlocked wallet); used to start staking.
     util::Result<CKey> GetValidatorSecret() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /**
+     * B3 finality (plan Commit 17): the validator's BLS consensus key for
+     * binding sequence `seq`, derived deterministically from the validator
+     * IDENTITY key -- sk_bls = FromIKM(TaggedHash("B3/FINALITY/BLSKEY/V1",
+     * identity_secret32 || seq_le32)). Nothing new is stored: the identity
+     * key already lives under the wallet's ordinary descriptor storage and
+     * encryption, rotation is seq+1, and a restored wallet re-derives every
+     * key. Requires an unlocked wallet; the secret never leaves wallet/node
+     * memory (no RPC returns it). Node-local convention, not consensus: the
+     * chain sees only the bound public keys.
+     */
+    util::Result<bls::SecretKey> DeriveFinalityBlsKey(uint32_t seq) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     //! Database load hook.
     void LoadValidatorPubKey(const CPubKey& pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 

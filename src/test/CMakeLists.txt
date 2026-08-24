@@ -99,6 +99,7 @@ add_executable(test_bitcoin
   finality_pin_persist_tests.cpp
   finality_signature_tests.cpp
   finality_production_tests.cpp
+  finality_operations_tests.cpp
   modern_pos_tests.cpp
   miniminer_tests.cpp
   miniscript_tests.cpp

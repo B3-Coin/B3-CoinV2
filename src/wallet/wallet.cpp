@@ -5,6 +5,8 @@
 
 #include <wallet/wallet.h>
 
+#include <crypto/bls.h>
+
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 #include <addresstype.h>
 #include <blockfilter.h>
@@ -3539,6 +3541,20 @@ util::Result<CKey> CWallet::GetValidatorSecret() const
         if (provider && provider->GetKey(m_b3_validator_pubkey->GetID(), key) && key.IsValid()) return key;
     }
     return util::Error{_("The validator key's descriptor is missing from this wallet")};
+}
+
+util::Result<bls::SecretKey> CWallet::DeriveFinalityBlsKey(const uint32_t seq) const
+{
+    AssertLockHeld(cs_wallet);
+    auto identity{GetValidatorSecret()};
+    if (!identity) return util::Error{util::ErrorString(identity)};
+    HashWriter w{TaggedHash("B3/FINALITY/BLSKEY/V1")};
+    const std::span<const std::byte> secret{identity->begin(), identity->end()};
+    w << std::span<const unsigned char>{reinterpret_cast<const unsigned char*>(secret.data()), secret.size()} << seq;
+    const uint256 ikm{w.GetSHA256()};
+    const auto key{bls::SecretKey::FromIKM(std::span<const unsigned char>(ikm.begin(), 32))};
+    if (!key) return util::Error{_("BLS key derivation failed")}; // astronomically unlikely (HKDF retry exhaustion)
+    return *key;
 }
 
 std::vector<WalletDescriptor> CWallet::GetWalletDescriptors(const CScript& script) const
