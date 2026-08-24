@@ -154,6 +154,13 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->m_legacy_hash_proof = diskindex.m_legacy_hash_proof;
                 pindexNew->m_legacy_money_supply = diskindex.m_legacy_money_supply;
                 pindexNew->m_legacy_fn_integrated = diskindex.m_legacy_fn_integrated;
+                // The cached modern-PoS eligibility digest is the NEXT
+                // height's seed: without it a restarted node can neither
+                // produce nor connect further modern blocks ("modern-PoS
+                // seed for the parent is unavailable"). It is persisted by
+                // CDiskBlockIndex and must be restored here (found by the
+                // multi-node finality soak's restart scenario).
+                pindexNew->m_modern_pos_digest = diskindex.m_modern_pos_digest;
                 pindexNew->nStatus        = diskindex.nStatus;
                 pindexNew->nTx            = diskindex.nTx;
 

@@ -711,6 +711,68 @@ public:
         assert(consensus.hashGenesisBlock == uint256{"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"});
         assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
 
+        if (opts.b3_modern) {
+            // Contract-64 regtest activation overrides: a DISTINCT regtest
+            // scaffolding network. H = 0: a deterministic legacy-FORMAT
+            // genesis (the legacy era validates block 0 under legacy rules,
+            // exactly like the unit fixtures' synthetic genesis; the real
+            // B3 mainnet genesis is untouched by construction) is the whole
+            // legacy era and X = its hash, known here, so admission is never
+            // X-blank; the corridor runs from height 1, modern PoS after it.
+            // These pins ARE the F = M activation switch
+            // (Consensus::ModernObjectRulesActive): cells, MPA, BLS
+            // finality, the pin and the one-stake-universe eligibility come
+            // live exactly as on a pinned mainnet, only with scaled
+            // scaffolding constants. Deployment posture mirrors B3 mainnet
+            // and the fixtures: no SegWit, no BIP34/65/66/CSV heights (the
+            // legacy-format genesis predates them; use -addresstype=legacy).
+            const B3ModernRegTestOptions& b3{*opts.b3_modern};
+            {
+                CMutableTransaction coinbase;
+                coinbase.version = 1;
+                coinbase.nTime = 1'400'000'000;
+                coinbase.m_legacy_encoding = true;
+                coinbase.vin.resize(1);
+                coinbase.vin[0].prevout.SetNull();
+                coinbase.vin[0].scriptSig = CScript() << CScriptNum{0} << CScriptNum{42};
+                coinbase.vout.emplace_back(0, CScript{});
+                genesis = CBlock{};
+                genesis.nVersion = 1;
+                genesis.hashPrevBlock.SetNull();
+                genesis.nTime = 1'400'000'000;
+                genesis.nBits = 0x207fffff;
+                genesis.nNonce = 0;
+                genesis.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+                genesis.hashMerkleRoot = BlockMerkleRoot(genesis);
+                consensus.hashGenesisBlock = genesis.GetLegacyB3Hash();
+            }
+            consensus.BIP34Height = std::numeric_limits<int>::max();
+            consensus.BIP34Hash = uint256{};
+            consensus.BIP65Height = std::numeric_limits<int>::max();
+            consensus.BIP66Height = std::numeric_limits<int>::max();
+            consensus.CSVHeight = std::numeric_limits<int>::max();
+            consensus.SegwitHeight = std::numeric_limits<int>::max();
+            consensus.legacy_b3coin = true;
+            consensus.hard_fork_height = 1;
+            consensus.legacy_final_hash = consensus.hashGenesisBlock;
+            consensus.transition_pow_length = b3.corridor_length;
+            consensus.transition_pow_bits = 0x207fffff;
+            consensus.transition_pow_min_spacing = b3.corridor_spacing;
+            consensus.transition_pow_reward = b3.corridor_reward;
+            consensus.min_stake_amount = b3.min_stake_amount;
+            Consensus::ModernPosParams pos{};
+            pos.block_interval_seconds = b3.block_interval;
+            pos.round_seconds = b3.round_seconds;
+            pos.reorg_horizon = b3.reorg_horizon;
+            pos.finality_epoch_blocks = b3.epoch_length;
+            pos.checkpoint_interval = b3.checkpoint_interval;
+            pos.checkpoint_depth = b3.checkpoint_depth;
+            pos.max_epoch_extension = b3.max_epoch_extension;
+            pos.min_finality_set = b3.min_finality_set;
+            assert(pos.Valid());
+            consensus.modern_pos = pos;
+        }
+
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.
         vSeeds.clear();
         vSeeds.emplace_back("dummySeed.invalid.");

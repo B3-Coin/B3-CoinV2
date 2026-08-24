@@ -66,7 +66,12 @@ public:
 
     SERIALIZE_METHODS(BlockTransactions, obj)
     {
-        READWRITE(obj.blockhash, TX_WITH_WITNESS(Using<VectorFormatter<TransactionCompression>>(obj.txn)));
+        // B3: the full-payload codec (TX_MODERN) -- byte-identical to the
+        // witness codec for payload-free transactions, and it preserves the
+        // Modern Payload Area. The witness codec would silently strip MPA
+        // evidence during compact-block reconstruction, making a VALID block
+        // fail consensus on the receiver (found by the multi-node soak).
+        READWRITE(obj.blockhash, TX_MODERN(Using<VectorFormatter<TransactionCompression>>(obj.txn)));
     }
 };
 
@@ -77,7 +82,9 @@ struct PrefilledTransaction {
     uint16_t index;
     CTransactionRef tx;
 
-    SERIALIZE_METHODS(PrefilledTransaction, obj) { READWRITE(COMPACTSIZE(obj.index), TX_WITH_WITNESS(Using<TransactionCompression>(obj.tx))); }
+    // B3: TX_MODERN for the same reason as BlockTransactions above (the
+    // prefilled coinbase may carry a FINALITY_CERTIFICATE record).
+    SERIALIZE_METHODS(PrefilledTransaction, obj) { READWRITE(COMPACTSIZE(obj.index), TX_MODERN(Using<TransactionCompression>(obj.tx))); }
 };
 
 typedef enum ReadStatus_t

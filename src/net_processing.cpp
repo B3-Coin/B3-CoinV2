@@ -2681,21 +2681,21 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
         // Legacy-codec blocks are served in their historical encoding. A
         // marker-modern block keeps stock witness semantics: MSG_BLOCK
         // strips witnesses, MSG_WITNESS_BLOCK carries them.
+        // On a B3 chain, every re-serialized BLOCK message must use the
+        // marker-aware codec (legacy::TX_LEGACY selects the historical or
+        // the modern body from the header marker itself, INCLUDING the
+        // trailing vchBlockSig of marker-modern blocks) -- the receive path
+        // parses with the same codec, and Core's witness codecs would drop
+        // the signature vector and desynchronize the stream (found by the
+        // multi-node finality soak: a compact-block fallback served an
+        // unparseable 215-byte corridor block and the peer stalled).
         const bool legacy_wire{m_chainparams.GetConsensus().legacy_b3coin};
-        const bool legacy_codec_block{legacy_wire &&
-                                      !Consensus::HasB3BlockCodecV2(pblock->nVersion)};
         if (inv.IsMsgBlk()) {
-            if (legacy_codec_block) {
-                MakeAndPushMessage(pfrom, NetMsgType::BLOCK, legacy::TX_LEGACY(*pblock));
-            } else {
-                MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_NO_WITNESS(*pblock));
-            }
+            MakeAndPushMessage(pfrom, NetMsgType::BLOCK,
+                               legacy_wire ? legacy::TX_LEGACY(*pblock) : TX_NO_WITNESS(*pblock));
         } else if (inv.IsMsgWitnessBlk()) {
-            if (legacy_codec_block) {
-                MakeAndPushMessage(pfrom, NetMsgType::BLOCK, legacy::TX_LEGACY(*pblock));
-            } else {
-                MakeAndPushMessage(pfrom, NetMsgType::BLOCK, TX_WITH_WITNESS(*pblock));
-            }
+            MakeAndPushMessage(pfrom, NetMsgType::BLOCK,
+                               legacy_wire ? legacy::TX_LEGACY(*pblock) : TX_WITH_WITNESS(*pblock));
         } else if (inv.IsMsgFilteredBlk()) {
             bool sendMerkleBlock = false;
             CMerkleBlock merkleBlock;
@@ -2715,16 +2715,16 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
                 // Thus, the protocol spec specified allows for us to provide duplicate txn here,
                 // however we MUST always provide at least what the remote peer needs
                 for (const auto& [tx_idx, _] : merkleBlock.vMatchedTxn)
-                    MakeAndPushMessage(pfrom, NetMsgType::TX, (UsesLegacyWireTransactions(peer) ? legacy::TX_LEGACY : TX_NO_WITNESS)(*pblock->vtx[tx_idx]));
+                    MakeAndPushMessage(pfrom, NetMsgType::TX, (UsesLegacyWireTransactions(peer) ? legacy::TX_LEGACY : TX_MODERN)(*pblock->vtx[tx_idx]));
             }
             // else
             // no response
         } else if (inv.IsMsgCmpctBlk()) {
             if (legacy_wire) {
                 // Hybrid legacy headers do not prove whether the block is PoW
-                // or PoS, so BIP152's header-first relay is not safe here.
-                MakeAndPushMessage(pfrom, NetMsgType::BLOCK,
-                                   (legacy_codec_block ? legacy::TX_LEGACY : TX_WITH_WITNESS)(*pblock));
+                // or PoS, so BIP152's header-first relay is not safe here;
+                // serve the full block under the marker-aware codec.
+                MakeAndPushMessage(pfrom, NetMsgType::BLOCK, legacy::TX_LEGACY(*pblock));
             } else {
                 // If a peer is asking for old blocks, we're almost guaranteed
                 // they won't have a useful mempool to match against a compact block,
@@ -4510,7 +4510,15 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
 
         const auto current_time{GetTime<std::chrono::microseconds>()};
         uint256* best_block{nullptr};
-        const bool legacy_chain{m_chainparams.GetConsensus().legacy_b3coin};
+        // The legacy getblocks/inv exchange owns BLOCK inventories only while
+        // the chain is still in its legacy phase, or from a legacy-protocol
+        // peer (whose announcements can never be judged as headers). In the
+        // modern phase, modern peers regain the standard headers-first
+        // reaction to a block inv -- otherwise the >MAX_BLOCKS_TO_ANNOUNCE
+        // inv fallback of a fast-advancing tip would be dropped here and
+        // peers would stall (found by the multi-node finality soak).
+        const bool legacy_chain{m_chainparams.GetConsensus().legacy_b3coin &&
+                                (IsLegacyPhase() || peer.m_legacy_protocol)};
         const bool legacy_sync_peer{legacy_chain && m_legacy_sync_peer == pfrom.GetId()};
         bool legacy_block_inventory{false};
         bool legacy_unknown_block{false};
@@ -5012,6 +5020,36 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
 
     if (msg_type == NetMsgType::CMPCTBLOCK)
     {
+        // B3 chains never reconstruct from compact blocks: the trailing
+        // vchBlockSig (and any coinbase Modern Payload Area) is not part of
+        // the BIP152 header+txids form, so a reconstructed block would fail
+        // consensus and be falsely marked invalid (found by the multi-node
+        // finality soak: reconstructed modern-PoS blocks failed
+        // bad-pos-signature and partitioned the network). Accept the header
+        // and fetch the complete block instead; the serving side already
+        // answers a compact-block getdata with the full marker-aware form.
+        if (m_chainparams.GetConsensus().legacy_b3coin) {
+            CBlockHeaderAndShortTxIDs cmpctblock;
+            vRecv >> cmpctblock;
+            const CBlockIndex* pindex{nullptr};
+            BlockValidationState state;
+            if (!m_chainman.ProcessNewBlockHeaders({{cmpctblock.header}}, /*min_pow_checked=*/true, state, &pindex)) {
+                if (state.IsInvalid()) {
+                    MaybePunishNodeForBlock(pfrom.GetId(), state, /*via_compact_block=*/true, "invalid compact-block header");
+                }
+                return;
+            }
+            if (pindex && !(pindex->nStatus & BLOCK_HAVE_DATA)) {
+                LOCK(cs_main);
+                if (!IsBlockRequested(pindex->GetBlockHash())) {
+                    std::vector<CInv> inv{CInv{MSG_BLOCK, pindex->GetBlockHash()}};
+                    BlockRequested(pfrom.GetId(), *pindex);
+                    MakeAndPushMessage(pfrom, NetMsgType::GETDATA, inv);
+                }
+            }
+            return;
+        }
+
         // Ignore cmpctblock received while importing
         if (m_chainman.m_blockman.LoadingBlocks()) {
             LogDebug(BCLog::NET, "Unexpected cmpctblock message received from peer %d\n", pfrom.GetId());
@@ -6636,7 +6674,13 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                 }
             }
             if (!fRevertToInv && !vHeaders.empty()) {
-                if (vHeaders.size() == 1 && state.m_requested_hb_cmpctblocks) {
+                if (vHeaders.size() == 1 && state.m_requested_hb_cmpctblocks &&
+                    !m_chainparams.GetConsensus().legacy_b3coin) {
+                    // (B3 chains announce via headers only: a BIP152
+                    // reconstruction cannot carry the marker-modern trailing
+                    // block signature or coinbase payload area, so a
+                    // reconstructed block would fail consensus -- the same
+                    // reason the getdata path serves full blocks.)
                     // We only send up to 1 block as header-and-ids, as otherwise
                     // probably means we're doing an initial-ish-sync or they're slow
                     LogDebug(BCLog::NET, "%s sending header-and-ids %s to peer=%d\n", __func__,
