@@ -475,6 +475,23 @@ if(B3_FINALITY_BENCH)
   )
 endif()
 
+if(B3_BRIDGE_TOOLS)
+  # Relayer dry-run harness over the same header-only bridge verification
+  # stack the tests use. Tooling only; never linked into the node.
+  add_executable(b3-bridge-ethcheck bridge/ethcheck.cpp)
+  target_link_libraries(b3-bridge-ethcheck
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+      univalue
+  )
+endif()
+
 if(BUILD_TESTS)
   add_subdirectory(test)
 endif()

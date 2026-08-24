@@ -183,6 +183,7 @@ endif()
 
 option(BUILD_BENCH "Build bench_bitcoin executable." OFF)
 option(B3_FINALITY_BENCH "Build the B3 finality benchmark harness (timing of the consensus BLS wrapper and MPA codecs)." OFF)
+option(B3_BRIDGE_TOOLS "Build the B3 bridge verification harness (b3-bridge-ethcheck relayer dry-run; test/tooling only, never part of the node)." OFF)
 # The vendored blst (src/blst) is a consensus dependency of crypto/bls since
 # plan Commit 2 (cmake/blst.cmake). Upstream defines exactly two build paths
 # and the processor selects between them (mirroring upstream build.sh):
