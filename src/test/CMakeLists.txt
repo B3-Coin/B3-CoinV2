@@ -37,6 +37,7 @@ add_executable(test_bitcoin
   coinstatsindex_tests.cpp
   coinsviewoverlay_tests.cpp
   common_url_tests.cpp
+  bridge_mpt_tests.cpp
   compress_tests.cpp
   consensus_phase_tests.cpp
   crypto_tests.cpp
