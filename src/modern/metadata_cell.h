@@ -4,6 +4,7 @@
 #ifndef B3COIN_MODERN_METADATA_CELL_H
 #define B3COIN_MODERN_METADATA_CELL_H
 
+#include <consensus/era.h>
 #include <consensus/params.h>
 #include <crypto/common.h>
 #include <modern/policy.h>
@@ -52,11 +53,10 @@ namespace modern {
  *     skips it symmetrically). No data-carrier semantics exist: the payload
  *     is a typed policy cell, and its params are bounded typed state; large
  *     evidence travels in the Modern Payload Area, never here.
- *   - NOT ACTIVATED: IsMetadataCellActive() is false on every real network
- *     (test fixtures may set Consensus::Params::test_only_metadata_cells_active),
- *     so every claiming output is invalid today. Type-specific rules for the
- *     commitment/params (FINALITY_KEY binding, FINALITY_CERT, payload root)
- *     arrive in later commits; this layer is carrier + exclusion only.
+ *   - ACTIVATION = the F = M plumbing (Consensus::ModernObjectRulesActive):
+ *     cells are live exactly when H, X and the Modern-PoS rule set are all
+ *     pinned. Every real network today ships without them, so every claiming
+ *     output stays invalid there (fail closed) until the X-pin release.
  *   - The legacy era (height <= H) is untouched: the exclusion is applied
  *     only where Consensus::GetB3Era() == MODERN.
  */
@@ -89,7 +89,7 @@ inline constexpr bool IsMetadataCellPolicyType(const uint16_t policy_type)
 inline bool IsMetadataCellActive(const uint16_t policy_type, const uint16_t policy_version,
                                  const Consensus::Params& params)
 {
-    return params.test_only_metadata_cells_active && IsMetadataCellPolicyType(policy_type) &&
+    return Consensus::ModernObjectRulesActive(params) && IsMetadataCellPolicyType(policy_type) &&
            policy_version == POLICY_VERSION_V1;
 }
 

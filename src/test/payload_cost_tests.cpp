@@ -121,7 +121,9 @@ BOOST_AUTO_TEST_CASE(deterministic_costs_and_budgets)
     {
         Consensus::Params active{};
         active.legacy_b3coin = true;
-        active.test_only_mpa_active = true;
+        active.hard_fork_height = 100;
+        active.legacy_final_hash = uint256::ONE;
+        active.modern_pos = Consensus::ModernPosParams{};
         CMutableTransaction m{Plain()};
         for (int i = 0; i < 18; ++i) m.mpa.push_back(Rec(5, 244, static_cast<unsigned char>(i)));
         BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{m}, active, err));

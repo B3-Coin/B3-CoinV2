@@ -333,7 +333,7 @@ BOOST_AUTO_TEST_CASE(production_remains_fail_closed)
     // reachable from transaction validation.
     Consensus::Params production{};
     production.legacy_b3coin = true;
-    BOOST_CHECK(!production.test_only_metadata_cells_active);
+    BOOST_CHECK(!Consensus::ModernObjectRulesActive(production));
     Validator a{1};
     const auto k1{BlsKey(1)};
     const FinalityKeyParams params{Pk(k1), 0};
@@ -348,7 +348,7 @@ BOOST_AUTO_TEST_CASE(production_remains_fail_closed)
     BOOST_CHECK(err.find("inactive") != std::string::npos);
     BOOST_CHECK(!modern::IsActivatedPolicy(static_cast<uint16_t>(modern::PolicyType::FINALITY_KEY), 1));
     for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::REGTEST}) {
-        BOOST_CHECK(!CreateChainParams(ArgsManager{}, chain)->GetConsensus().test_only_metadata_cells_active);
+        BOOST_CHECK(!Consensus::ModernObjectRulesActive(CreateChainParams(ArgsManager{}, chain)->GetConsensus()));
     }
     // The cell's params decode back to the binding the evidence must match.
     const auto cell{modern::ParseMetadataCell(*script)};

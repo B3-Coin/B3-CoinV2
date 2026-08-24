@@ -242,3 +242,43 @@ Steps 1–4 and 6 are complete on regtest: the chain now produces and
 validates blocks in all three phases. Step 5 (activation plumbing) and the
 Step-2 operator gate remain before any mainnet pinning; the index
 hash-domain defect (Step 4's last item) is still open.
+
+---
+
+## Addendum — BLS finality implementation batch (2026-08-23/24)
+
+The Modern-PoS V1 finality gadget (ruling M7; normative
+[b3-cross-chain-finality-v1.md](b3-cross-chain-finality-v1.md)) is now
+**implemented end to end** on branch `test/b3-clean-architecture`
+(plan commits 1–18 of
+[b3-modern-pos-v1-implementation-plan.md](b3-modern-pos-v1-implementation-plan.md);
+P2P `finsig` was folded into commit 15, block assembly + staking into 16,
+wallet/RPC into 17, activation plumbing into 18, and the persisted pin was
+added as release-blocker 14A):
+
+| Area | Status | Where |
+|---|---|---|
+| Constants/types/codecs, keccak, blst wrapper | DONE | `modern/finality_types.h`, `crypto/{bls,keccak256}` |
+| Metadata cells (6/7/8), UTXO exclusion | DONE | `modern/metadata_cell.h`, coins/validation |
+| FINALITY_KEY binding + derived index | DONE | `modern/finality_key.h`, `node/finality_binding_index` |
+| MPA (flag 0x02, registry, costs, ×4 weight), `ptxid` | DONE | `primitives/transaction`, `modern/{mpa,payload_cost}.h` |
+| `MODERN_PAYLOAD_ROOT` (Path B, BE leaf index) | DONE | `modern/payload_root.h`, miner |
+| Validator-set snapshot (keccak tree, quorum) | DONE | `node/validator_set` |
+| Certificate verification + schedule/window rules | DONE | `modern/{finality_certificate,finality_schedule}.h` |
+| Epoch state machine (gated rotation, extension, carry-over, lineage break) | DONE | `node/finality_tracker` |
+| Finality pin (anchor semantics, header/candidate/InvalidateBlock refusals) | DONE | `node/blockstorage`, `validation` |
+| **Persisted pin** (atomic file, monotone, survives restart/reindex) | DONE | `node/finality_pin`, `<blocksdir>/finality_pin.dat` |
+| One stake universe (W_block == W_finality, binding required from F=M) | DONE | `Chainstate::ModernEligibilityWeights` |
+| Signer / leaderless aggregator / `finsig` gossip (liveness only) | DONE | `node/finality_signature`, `net_processing` |
+| Certificate-bearing block assembly + staking-loop signing | DONE | `node/miner`, `node/staking` |
+| Wallet BLS key derivation, bind/rotate/revoke RPCs, diagnostics | DONE | `wallet`, `wallet/rpc/staking`, `rpc/blockchain` |
+| Binding-tx relay path (cell standardness, dust exemption, TX_MODERN wire, mempool pre-check) | DONE | `script/solver`, `policy`, `net_processing`, `validation` |
+| **F = M activation** (`Consensus::ModernObjectRulesActive`: H + X + Modern-PoS rule set) | DONE | `consensus/era.h`; every shipped network fail-closed (`finality_activation_tests`) |
+
+Still open before the X-pin release: pin the actual X/H/M parameters and the
+three provisional `ModernPosParams` values (`sentinel_bits` — any fixed easy
+target works, tree default `0x207fffff`; `max_future_seconds` — 120 s matches
+the ratified corridor pacing ruling; `reward` — OD-2 economics, owner ruling
+required), seeds/CI, and the Step-2 operator equivalence gate. Canonical unit
+baseline after commit 18: see the batch report (204 registered suites; the
+same 19 known stock-vector/fixture failures as the pre-batch baseline).

@@ -5,6 +5,7 @@
 #define B3COIN_MODERN_MPA_H
 
 #include <consensus/consensus.h>
+#include <consensus/era.h>
 #include <consensus/params.h>
 #include <modern/creation_action.h>
 #include <modern/finality_key.h>
@@ -42,7 +43,7 @@ namespace modern {
  *
  * STRUCTURE (CheckTransactionMpa):
  *   - an MPA may appear only in the Modern activation context
- *     (Consensus::Params::test_only_mpa_active at this stage; production is
+ *     (Consensus::ModernObjectRulesActive -- the X-pin configuration; production is
  *     fail-closed) — parser recognition never implies activation;
  *   - records must be in strictly increasing canonical order
  *     (payload_type, payload_version, payload bytes lexicographically), which
@@ -79,10 +80,9 @@ inline PayloadTypeStatus GetPayloadTypeStatus(const uint16_t type, const uint16_
         return PayloadTypeStatus::INACTIVE;
     case MPA_TYPE_FINALITY_CERTIFICATE:
     case MPA_TYPE_FINALITY_KEY_EVIDENCE:
-        // Verified end to end (binding index / FinalityTracker) but NOT
-        // activated on any real network: production stays fail-closed until
-        // the F = M activation plumbing commit.
-        return params.test_only_mpa_active ? PayloadTypeStatus::ACTIVE : PayloadTypeStatus::INACTIVE;
+        // Live from the X-pin configuration (F = M plumbing); every real
+        // network today ships without it, so production stays fail-closed.
+        return Consensus::ModernObjectRulesActive(params) ? PayloadTypeStatus::ACTIVE : PayloadTypeStatus::INACTIVE;
     default:
         return PayloadTypeStatus::UNKNOWN;
     }
@@ -116,7 +116,7 @@ inline bool MpaRecordLess(const CMpaRecord& a, const CMpaRecord& b)
 inline bool CheckTransactionMpa(const CTransaction& tx, const Consensus::Params& params, std::string& error)
 {
     if (tx.mpa.empty()) return true;
-    if (!params.test_only_mpa_active) {
+    if (!Consensus::ModernObjectRulesActive(params)) {
         error = "mpa-not-active";
         return false;
     }

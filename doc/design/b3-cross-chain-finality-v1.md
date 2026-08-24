@@ -130,6 +130,22 @@ is bounded, priced historical payload data committed by the cell's commitment an
 block through `MODERN_PAYLOAD_ROOT` (MPA §2–§4). A later ZK proof of the same statement is
 a **new record type behind the identical cell** (§7).
 
+> **Implementation note (2026-08-24).** Sections 2–4 are implemented on
+> `test/b3-clean-architecture` (see the addendum in
+> [b3-implementation-status.md](b3-implementation-status.md)). Node-local
+> mechanics chosen by the implementation, not consensus: the finality pin is
+> additionally **persisted** (`<blocksdir>/finality_pin.dat`, atomic and
+> monotone, surviving restart/-reindex — the in-process pin was already
+> sticky across carrier-removing reorgs); wallets derive the BLS consensus
+> key deterministically from the validator identity key and the binding
+> sequence (`TaggedHash("B3/FINALITY/BLSKEY/V1", identity_secret || seq)`),
+> so no second keystore exists; transactions relay under the full-payload
+> codec (`TX_MODERN`) so FINALITY_KEY evidence survives the wire; the
+> signer-bitmap width of a certificate is resolved from the certificate's
+> own epoch. Activation is the single predicate
+> `Consensus::ModernObjectRulesActive` (H + X + Modern-PoS rule set pinned):
+> the F = M rule with no separate switch.
+
 ## 4. B3 rules (normative)
 
 | Rule | Value |

@@ -261,7 +261,9 @@ BOOST_AUTO_TEST_CASE(registry_and_activation_fail_closed)
     Consensus::Params production{};
     production.legacy_b3coin = true;
     Consensus::Params active{production};
-    active.test_only_mpa_active = true;
+    active.hard_fork_height = 100;
+    active.legacy_final_hash = uint256::ONE;
+    active.modern_pos = Consensus::ModernPosParams{};
     using modern::PayloadTypeStatus;
     // Statuses
     for (const uint16_t t : {1, 2, 3}) {
@@ -325,7 +327,7 @@ BOOST_AUTO_TEST_CASE(registry_and_activation_fail_closed)
     }
     // No chainparams enable the context.
     for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::REGTEST}) {
-        BOOST_CHECK(!CreateChainParams(ArgsManager{}, chain)->GetConsensus().test_only_mpa_active);
+        BOOST_CHECK(!Consensus::ModernObjectRulesActive(CreateChainParams(ArgsManager{}, chain)->GetConsensus()));
     }
     // The test-only creation-action registry is unchanged: 1-3 known there, 4/5 not.
     BOOST_CHECK(modern::IsKnownCreationAction(1, 1) && modern::IsKnownCreationAction(2, 1) && modern::IsKnownCreationAction(3, 1));

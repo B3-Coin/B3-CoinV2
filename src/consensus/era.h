@@ -144,6 +144,25 @@ constexpr std::optional<int> ModernPosStartHeight(const Params& params)
 }
 
 /**
+ * F = M activation (plan Commit 18): the modern-era OBJECT rules -- metadata
+ * cells (frozen policies 6 FINALITY_CERT / 7 FINALITY_KEY / 8
+ * MODERN_PAYLOAD_ROOT) and the Modern Payload Area types 4/5 -- are live
+ * exactly when the X-pin release configuration is complete: H set, X pinned,
+ * and the Modern-PoS rule set present. STAKE and FINALITY_KEY begin at H+1
+ * (the corridor) so Set_0 = Snapshot(M-1) exists at M; the era gates in
+ * validation keep every rule out of legacy blocks; certificates additionally
+ * cannot be valid before M (no epoch state exists below it). A shipped
+ * network without the pinned parameters -- today every real network -- is
+ * fail-closed everywhere this predicate is consulted; known-but-inactive MPA
+ * types 1..3 stay invalid regardless.
+ */
+constexpr bool ModernObjectRulesActive(const Params& params)
+{
+    return params.legacy_b3coin && params.hard_fork_height.has_value() &&
+           params.legacy_final_hash.has_value() && params.modern_pos.has_value();
+}
+
+/**
  * Return the block-production consensus phase governing the block at
  * `height`. Single source of truth for phase selection; like GetB3Era it
  * must only be consulted where the height is already unambiguous, and never

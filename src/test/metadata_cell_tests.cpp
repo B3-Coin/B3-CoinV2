@@ -179,7 +179,9 @@ BOOST_AUTO_TEST_CASE(check_metadata_cell_outputs_rules)
     Consensus::Params production{};
     production.legacy_b3coin = true;
     Consensus::Params test_active{production};
-    test_active.test_only_metadata_cells_active = true;
+    test_active.hard_fork_height = 100;
+    test_active.legacy_final_hash = uint256::ONE;
+    test_active.modern_pos = Consensus::ModernPosParams{};
     std::string err;
 
     auto tx_with = [](const CAmount value, const CScript& spk) {
@@ -225,7 +227,7 @@ BOOST_AUTO_TEST_CASE(check_metadata_cell_outputs_rules)
     BOOST_CHECK(!modern::IsActivatedPolicy(6, 1) && !modern::IsActivatedPolicy(7, 1) && !modern::IsActivatedPolicy(8, 1));
     // Real chainparams never set the flag.
     for (const auto& chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::REGTEST}) {
-        BOOST_CHECK(!CreateChainParams(ArgsManager{}, chain)->GetConsensus().test_only_metadata_cells_active);
+        BOOST_CHECK(!Consensus::ModernObjectRulesActive(CreateChainParams(ArgsManager{}, chain)->GetConsensus()));
     }
 }
 
@@ -243,8 +245,8 @@ BOOST_FIXTURE_TEST_CASE(connect_disconnect_symmetry_and_exclusion, BindingFixtur
     // MODERN_PAYLOAD_ROOT coinbase-only/MPA-bound). The test flags are
     // switched off again for step 1.
     Prepare();
-    MutableConsensus().test_only_metadata_cells_active = false;
-    MutableConsensus().test_only_mpa_active = false;
+    const auto saved_pos{MutableConsensus().modern_pos};
+    MutableConsensus().modern_pos.reset();
     const Txid fund_txid{m_fund_txid};
     const bls::SecretKey k1{Bls(1)};
     const auto bind{MakeBinding(m_validator_a, m_vk_a, &k1, 0)};
@@ -258,9 +260,9 @@ BOOST_FIXTURE_TEST_CASE(connect_disconnect_symmetry_and_exclusion, BindingFixtur
         BOOST_CHECK(!Submit(refused));
         BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H);
     }
-    // 2. Test activation on: snapshot the UTXO set, connect, inspect.
-    MutableConsensus().test_only_metadata_cells_active = true;
-    MutableConsensus().test_only_mpa_active = true;
+    // 2. Activation on (the X-pin configuration restored): snapshot the
+    //    UTXO set, connect, inspect.
+    MutableConsensus().modern_pos = saved_pos;
     const auto snapshot_before{[&] {
         LOCK(cs_main);
         m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();

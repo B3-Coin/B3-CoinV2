@@ -392,10 +392,9 @@ struct ModernPosSetup : public ChainTestingSetup {
         mutable_consensus.transition_pow_bits = EASY_BITS;
         mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
         mutable_consensus.min_stake_amount = 1000;
-        // Metadata cells / MPA are test-context activated so the corridor can
-        // carry the FINALITY_KEY bindings (production: fail-closed, unset).
-        mutable_consensus.test_only_metadata_cells_active = true;
-        mutable_consensus.test_only_mpa_active = true;
+        // Configuring H + X + the Modern-PoS rule set below IS the activation
+        // switch for cells and MPA (Consensus::ModernObjectRulesActive): the
+        // corridor can carry the FINALITY_KEY bindings from H+1.
         Consensus::ModernPosParams pos{};
         pos.reorg_horizon = 12; // small-chain scaffolding override of the ratified 1440
         pos.min_finality_set = 1; // two validators; the ratified floor of 4 is a mainnet bootstrap value

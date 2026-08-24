@@ -270,16 +270,17 @@ BOOST_FIXTURE_TEST_CASE(txid_unchanged_and_production_fail_closed, BindingFixtur
     BOOST_CHECK(CTransaction{ta}.GetHash() == CTransaction{tb}.GetHash());
     BOOST_CHECK(CTransaction{ta}.GetWitnessHash() == CTransaction{tb}.GetWitnessHash());
     BOOST_CHECK(!(ta.mpa == tb.mpa));
-    // Production: the same block shape is refused when the test contexts are off.
-    MutableConsensus().test_only_mpa_active = false;
+    // Production: the same block shape is refused while the X-pin
+    // configuration is incomplete (the F = M activation predicate is off).
+    const auto saved_pos{MutableConsensus().modern_pos};
+    MutableConsensus().modern_pos.reset();
     BOOST_CHECK(!SubmitCorridor({ta}));
-    MutableConsensus().test_only_mpa_active = true;
-    MutableConsensus().test_only_metadata_cells_active = false;
     BOOST_CHECK(!SubmitCorridor({ta}, 61));
+    MutableConsensus().modern_pos = saved_pos;
     BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H);
     for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::REGTEST}) {
         const auto& c{CreateChainParams(ArgsManager{}, chain)->GetConsensus()};
-        BOOST_CHECK(!c.test_only_mpa_active && !c.test_only_metadata_cells_active);
+        BOOST_CHECK(!Consensus::ModernObjectRulesActive(c));
     }
     // Legacy era: a legacy block cannot carry an MPA at all (codec), and the
     // binding machinery never runs below H+1 (the era gate in ConnectBlock).

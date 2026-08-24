@@ -84,8 +84,13 @@ struct BindingFixture : public ModernPosSetup {
         BOOST_REQUIRE(Submit(block_h));
         BOOST_REQUIRE_EQUAL(Tip()->nHeight, SYN_H);
         ConfigureCorridor(Tip()->GetBlockHash());
-        MutableConsensus().test_only_metadata_cells_active = true;
-        MutableConsensus().test_only_mpa_active = true;
+        // The X-pin configuration (H + X + Modern-PoS rule set) IS the
+        // activation switch for cells and MPA (F = M plumbing). Scaffolding
+        // values; finality-chain tests override them in PrepareFinalityChain.
+        Consensus::ModernPosParams pos{};
+        pos.reorg_horizon = 200;
+        pos.min_finality_set = 1;
+        MutableConsensus().modern_pos = pos;
         m_domain = Domain();
     }
 

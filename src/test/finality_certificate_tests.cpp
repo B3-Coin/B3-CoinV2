@@ -315,14 +315,15 @@ BOOST_AUTO_TEST_CASE(coinbase_cell_record_binding)
 
 BOOST_AUTO_TEST_CASE(production_fail_closed_test_context_active)
 {
-    // Type 4 is verified end to end from Commit 12 (FinalityTracker) and is
-    // therefore ACTIVE under the test MPA context; production stays
-    // fail-closed (no network sets test_only_mpa_active) until the F = M
-    // activation plumbing commit.
+    // Type 4 is ACTIVE exactly under the X-pin configuration (F = M
+    // plumbing); a production network without the pinned parameters stays
+    // fail-closed.
     Consensus::Params production{};
     production.legacy_b3coin = true;
     Consensus::Params test_ctx{production};
-    test_ctx.test_only_mpa_active = true;
+    test_ctx.hard_fork_height = 100;
+    test_ctx.legacy_final_hash = uint256::ONE;
+    test_ctx.modern_pos = Consensus::ModernPosParams{};
     BOOST_CHECK(modern::GetPayloadTypeStatus(4, 1, production) == modern::PayloadTypeStatus::INACTIVE);
     BOOST_CHECK(modern::GetPayloadTypeStatus(4, 1, test_ctx) == modern::PayloadTypeStatus::ACTIVE);
     CMutableTransaction m;

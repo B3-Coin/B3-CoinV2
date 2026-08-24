@@ -122,7 +122,9 @@ BOOST_AUTO_TEST_CASE(record_order_and_noncanonical)
     BOOST_CHECK(!(ts.GetPtxid() == tw.GetPtxid()));
     Consensus::Params active{};
     active.legacy_b3coin = true;
-    active.test_only_mpa_active = true;
+    active.hard_fork_height = 100;
+    active.legacy_final_hash = uint256::ONE;
+    active.modern_pos = Consensus::ModernPosParams{};
     std::string err;
     BOOST_CHECK(modern::CheckTransactionMpa(ts, active, err));
     BOOST_CHECK(!modern::CheckTransactionMpa(tw, active, err));
