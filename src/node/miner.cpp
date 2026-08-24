@@ -19,8 +19,11 @@
 #include <key.h>
 #include <logging.h>
 #include <modern/fn.h>
+#include <modern/finality_certificate.h>
 #include <modern/payload_root.h>
 #include <modern/pos_v1.h>
+#include <node/finality_signature.h>
+#include <node/finality_tracker.h>
 #include <node/stake_tracker.h>
 #include <node/context.h>
 #include <node/kernel_notifications.h>
@@ -295,17 +298,47 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     coinbaseTx.nLockTime = static_cast<uint32_t>(nHeight - 1);
     coinbase_tx.lock_time = coinbaseTx.nLockTime;
 
+    // FINALITY_CERT inclusion (plan Commit 16): when the local signature pool
+    // holds a quorum certificate for a checkpoint above the finalized height,
+    // include it in the coinbase -- cell + type-4 record, judged first with
+    // the IDENTICAL consensus rule so no invalid certificate is ever emitted.
+    // Without a quorum nothing is included: blocks never depend on
+    // certificates and the epoch simply extends (frozen behaviour).
+    if (b3_modern_pos) {
+        node::FinalityTracker& finality{m_chainstate.ModernFinality()};
+        if (finality.Sync(m_chainstate.m_chain, m_chainstate.m_blockman, b3_consensus, *pindexPrev)) {
+            if (auto best{m_chainstate.FinalitySignatures().BestCertificate(finality, m_chainstate.m_chain,
+                                                                            b3_consensus)}) {
+                std::string cert_error;
+                if (finality.JudgeCandidateCertificate(best->first, best->second, *pindexPrev, b3_consensus,
+                                                       cert_error)) {
+                    const auto [payload, cell] = modern::BuildFinalityCertificate(best->first, best->second);
+                    coinbaseTx.vout.emplace_back(0, cell);
+                    CMpaRecord record;
+                    record.payload_type = modern::MPA_TYPE_FINALITY_CERTIFICATE;
+                    record.payload_version = modern::MPA_VERSION_V1;
+                    record.payload = payload;
+                    coinbaseTx.mpa = {record};
+                    LogInfo("CreateNewBlock(): including finality certificate for checkpoint %d (epoch %d)\n",
+                            best->first.height, best->first.epoch);
+                } else {
+                    LogDebug(BCLog::VALIDATION, "CreateNewBlock(): pooled certificate not includable (%s)\n",
+                             cert_error);
+                }
+            }
+        }
+    }
+
     // MODERN_PAYLOAD_ROOT (plan Commit 7): when the candidate block carries any
-    // Modern Payload Area, the coinbase must commit to all sections with exactly
-    // one root cell. The root depends only on the transactions' MPA sections and
-    // positions (the coinbase's own section is empty here), never on the coinbase
-    // outputs, so it can be computed before the cell is appended. With production
-    // settings no MPA-bearing transaction reaches the mempool, so this is a no-op
-    // and block assembly is unchanged.
+    // Modern Payload Area -- a transaction's or the coinbase's own (finality
+    // certificate) -- the coinbase must commit to all sections with exactly one
+    // root cell. The root depends only on the MPA sections and positions,
+    // never on the coinbase outputs, so it can be computed before the cell is
+    // appended.
     if (b3_modern) {
-        bool any_mpa{false};
-        for (size_t i = 1; i < pblock->vtx.size(); ++i) {
-            if (pblock->vtx[i] && pblock->vtx[i]->HasMpa()) { any_mpa = true; break; }
+        bool any_mpa{!coinbaseTx.mpa.empty()};
+        for (size_t i = 1; !any_mpa && i < pblock->vtx.size(); ++i) {
+            if (pblock->vtx[i] && pblock->vtx[i]->HasMpa()) any_mpa = true;
         }
         if (any_mpa) {
             CBlock probe{*pblock};

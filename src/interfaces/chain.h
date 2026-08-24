@@ -122,6 +122,10 @@ struct StakingStatus {
     CAmount total_active_weight{0};
     std::optional<CAmount> min_stake_amount;
     int stake_activation_depth{0};
+    //! Finality signing (Commit 16): whether a BLS consensus key is armed in
+    //! the staking loop, and the highest checkpoint it has signed.
+    bool finality_signing{false};
+    int last_signed_height{-1};
 };
 
 //! Interface giving clients (wallet processes, maybe other analysis tools in

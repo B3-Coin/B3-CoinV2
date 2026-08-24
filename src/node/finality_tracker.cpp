@@ -178,6 +178,36 @@ bool FinalityTracker::CheckBlockCertificate(const CBlock& block, const CBlockInd
     return JudgeCoinbaseCertificate(block, index, params, projected, pair, error);
 }
 
+bool FinalityTracker::JudgeCandidateCertificate(const modern::FinalizedBlock& fb,
+                                                const modern::FinalityCertificate& cert, const CBlockIndex& parent,
+                                                const Consensus::Params& params, std::string& error) const
+{
+    if (!Synced(parent.GetBlockHash())) {
+        error = "finality-state-unavailable";
+        return false;
+    }
+    if (!params.modern_pos) {
+        error = "no-modern-pos-rules";
+        return false;
+    }
+    const auto domain{params.legacy_final_hash
+                          ? modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)
+                          : std::nullopt};
+    if (!domain) {
+        error = "finality-domain-unpinned";
+        return false;
+    }
+    const State projected{Projected(parent.nHeight + 1, params)};
+    const modern::FinalityEpochView view{projected.View()};
+    const auto hash_at{[&parent](const int h) -> std::optional<uint256> {
+        const CBlockIndex* anc{parent.GetAncestor(h)};
+        if (!anc) return std::nullopt;
+        return anc->GetBlockHash();
+    }};
+    return modern::JudgeFinalityCertificate(*domain, fb, cert, parent.nHeight + 1, view, *params.modern_pos, hash_at,
+                                            error);
+}
+
 bool FinalityTracker::ApplyModern(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params)
 {
     State s{Projected(index.nHeight, params)};

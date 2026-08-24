@@ -134,6 +134,15 @@ public:
      */
     bool CheckBlockCertificate(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params,
                                std::string& error) const;
+    /**
+     * Judge a candidate certificate for the block that would extend `parent`
+     * (block assembly, plan Commit 16): the identical consensus rule, run
+     * before anything is emitted -- no invalid certificate ever leaves the
+     * assembler. The tracker must be synced to `parent`.
+     */
+    bool JudgeCandidateCertificate(const modern::FinalizedBlock& fb, const modern::FinalityCertificate& cert,
+                                   const CBlockIndex& parent, const Consensus::Params& params,
+                                   std::string& error) const;
 
     //! The state as of the synced tip.
     const State& Current() const { return m_state; }
