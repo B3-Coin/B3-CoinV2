@@ -144,9 +144,12 @@ BOOST_AUTO_TEST_CASE(legacy_bootstrap_addresses_are_fixed_seeds)
         endpoints.push_back(std::move(endpoint));
     }
 
-    BOOST_REQUIRE_EQUAL(endpoints.size(), 32U);
+    // 32 historical bootstrap peers plus the owner-supplied release-v1 seed
+    // (ruling 2026-08-23, appended last in 958eeb3).
+    BOOST_REQUIRE_EQUAL(endpoints.size(), 33U);
     BOOST_CHECK_EQUAL(endpoints.front().ToStringAddrPort(), "101.111.89.85:5647");
-    BOOST_CHECK_EQUAL(endpoints.back().ToStringAddrPort(), "98.97.143.14:5647");
+    BOOST_CHECK_EQUAL(endpoints[31].ToStringAddrPort(), "98.97.143.14:5647");
+    BOOST_CHECK_EQUAL(endpoints.back().ToStringAddrPort(), "176.31.13.198:5647");
 }
 
 BOOST_AUTO_TEST_CASE(live_legacy_client_wire_identity)
