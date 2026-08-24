@@ -184,3 +184,21 @@ consensus or the v1 release.
 9. Separate block section + cap for `LIGHT_CLIENT_UPDATE` (proposed ≤ 32 KB, ≤ 1
    handover per block) — confirm.
 10. A3 activation height — after v1, never before a clean H+1.
+
+---
+
+## 9. Execution status addendum (2026-08-24)
+
+Owner ruling 2026-08-24: **deposit legs first — ETH → B3, then BTC → B3**
+(recorded in b3-open-decisions.md OD-8). Against the §3 staged order:
+
+| Stage | Status |
+|---|---|
+| 1 (blst, Keccak-256) | **COMPLETE** — landed earlier by the Modern PoS finality work (`src/blst` v0.3.17, `crypto/bls.{h,cpp}` with the Ethereum ciphersuite DST, `crypto/keccak256.{h,cpp}`) |
+| 2 (RLP/MPT; SSZ) | **EXECUTED 2026-08-24** — `bridge/rlp.h` (canonical-strict), `bridge/mpt.h` (inclusion-only), `bridge/ssz.h`; mainnet-anchored fixtures captured by `contrib/b3bridge/` (receipts trie of block 25811248 rebuilt in full and matched to the header root) |
+| 3 (eth_light_client.h) | **EXECUTED 2026-08-24** — `bridge/eth_light_client.h` (InitStore/VerifyUpdate/ProcessUpdate; finalized-only; supermajority default 342/512; proven execution payload headers; Altair/Electra gindices by fork epoch) verified END TO END on real mainnet data: bootstrap + full 512-member aggregate + committee rotation across periods 1836→1837 (fork Fulu), plus `bridge/deposit.h` (strict receipt decode + vault Deposit extraction) and `contracts/B3DepositVault.sol` (source; compile/deploy = owner/CI). The one-block cross-anchor: the receipts fixture block IS the light-client-proven finalized block, so the tests exercise signature → finality proof → execution proof → receipts_root → MPT proof → receipt → event extraction as one chain. |
+| 4+ (consensus wiring, A3) | **GATED** — awaits the §8 rulings; everything above is header-only/test-only and unreachable from consensus. |
+
+BTC → B3: inbound SPV verification is designable on the same pattern, but the
+BTC **custody** model for a two-way peg (threshold-Schnorr committee vs
+federation) has no ruling yet and nothing was built (OD-8 note of 2026-08-24).
