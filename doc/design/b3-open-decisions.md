@@ -218,6 +218,23 @@ issuer-freeze policy handling is specified. Gated well behind H+1 (activation A3
 - **2026-08-23 rulings applied to the normative documents:** MPA weight ×4; consensus payload verification-cost budget (per-tx and per-block, checked before cryptography, deterministic per `(type, version)`); relay vsize includes verification cost; `ptxid` defined normatively over the canonical full serialization; policy numbers 6/7/8 frozen (contract §23 updated); byte ceilings NOT frozen — framework frozen, numbers after benchmark. Finality spec rev. 2 now carries the cells + MPA records, identity-authorized `FINALITY_KEY`, handover-gated rotation, F = M in the X-pin release. Remaining owner decisions before Modern PoS implementation: see the session report of 2026-08-23 (finality spec §9, MPA §9, PoS spec §9 provisional rows, SegWit audit).
 - **2026-08-23 Tier-1 rulings + benchmark:** gated rotation FINAL; epoch window `{current, current−1}` FINAL under monotone-height / set-hash / epoch-relation conditions; BLS binding mandatory for block eligibility from F = M (one stake universe); `FINALITY_KEY` semantics FINAL. Benchmark-only work authorized and done: pinned `blst` v0.3.17 vendored (`src/blst`, build-off-by-default), harness `b3-finality-bench`; results + recommended constants in [b3-finality-benchmark-2026-08-23.md](b3-finality-benchmark-2026-08-23.md) (PoP verify ≈ 0.6 ms; certificate ≈ 1.1 ms @3,500 / 1.9 ms @8,192; recommend I/D = 10/12, E = 1,440, cost budget 120,000 / 12,000 units, 1 vbyte/unit, ceilings 32,768 / 65,536). Consensus implementation still awaits a separate go-ahead.
 - **2026-08-23 CONSTANTS FROZEN (owner):** E = 1,440; CHECKPOINT_INTERVAL = 10; CHECKPOINT_DEPTH = 12; MAX_EPOCH_EXTENSION = 7·E; MIN_FINALITY_SET = 4 (chain bootstrap floor only — bridge security thresholds are an A3 decision); verify_cost FINALITY_KEY_EVIDENCE 700 / FINALITY_CERTIFICATE 2,000; MAX_BLOCK_PAYLOAD_COST 120,000; MAX_TX_PAYLOAD_COST 12,000; COST_TO_VBYTES 1; MPA record 32,768 B / section 65,536 B / weight ×4. All earlier Modern PoS / finality / MPA rulings remain in force. Implementation plan: [b3-modern-pos-v1-implementation-plan.md](b3-modern-pos-v1-implementation-plan.md) — **implementation awaits explicit plan approval.**
+- **2026-08-24 owner ruling — bridge sequencing: deposit legs first.** "We should have a
+  real working bridge first from ETH, then from BTC." The mint (inbound) legs lead the
+  bridge program: **Ethereum → B3 first, Bitcoin → B3 second**; the release leg
+  (B3 → Ethereum withdrawals, [b3-cross-chain-finality-v1.md](b3-cross-chain-finality-v1.md)
+  §5–§6) remains normative and follows. Consequences reported, not silently resolved:
+  (a) this supersedes the 2026-08-23 chain-of-chains *sequencing* note ("skip the ETH
+  light client in B3 if the hub is coming") — a real working ETH→B3 bridge requires the
+  inbound verifier now, and per the standing "BLS is the key" ruling that verifier is the
+  **sync-committee light client in B3** (finalized headers only, `blst`-verified); a
+  future hub verifier may replace it as a later in-place transition. (b) The BTC leg is
+  inbound-only at this stage: B3 verifies Bitcoin SPV (most-work headers + tx inclusion
+  at depth); the BTC *custody* model for a two-way peg (threshold-Schnorr committee vs
+  federation) is expressly NOT designed yet and needs its own ruling. (c) Bridge
+  proposal stages 1–3 (test-only / header-only: Keccak-256, RLP/MPT, SSZ, pure
+  light-client functions) are in execution per the committed staged order; consensus
+  wiring (stage 4+, A3, `BRIDGE_MINT`, nullifiers, chainstate) still awaits the §8
+  rulings and remains fail-closed everywhere until then.
 
 ---
 
