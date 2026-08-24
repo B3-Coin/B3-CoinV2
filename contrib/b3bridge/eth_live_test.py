@@ -39,10 +39,6 @@ def rpc(url, method, params):
     return resp["result"]
 
 
-def header_root(hd):
-    return rec.keccak256 and __import__("hashlib") and _hr(hd)
-
-
 def _hr(hd):
     import hashlib
 
