@@ -46,6 +46,11 @@ static const int TOOLTIP_WRAP_THRESHOLD = 80;
 /* Number of frames in spinner animation */
 #define SPINNER_FRAMES 36
 
+/* B3 Hive: the desktop application's display name (product-identity ruling
+ * 2026-08-25, doc/design/b3-product-identity.md). The QAPP_* keys below are
+ * QSettings/compat identifiers and deliberately keep their legacy values. */
+#define HIVE_NAME "B3 Hive"
+
 #define QAPP_ORG_NAME "B3Coin"
 #define QAPP_ORG_DOMAIN "b3coin.co"
 #define QAPP_APP_NAME_DEFAULT "B3Coin-Core"

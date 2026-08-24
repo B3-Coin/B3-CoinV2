@@ -5,6 +5,7 @@
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
 #include <qt/splashscreen.h>
+#include <qt/guiconstants.h>
 
 #include <clientversion.h>
 #include <common/system.h>
@@ -63,7 +64,7 @@ SplashScreen::SplashScreen(const NetworkStyle* networkStyle)
     m_mark.setDevicePixelRatio(dpr);
 
     // Set window title
-    setWindowTitle(QString(CLIENT_NAME) + " " + networkStyle->getTitleAddText());
+    setWindowTitle(QString(HIVE_NAME) + " " + networkStyle->getTitleAddText());
 
     // Resize window and move to center of desktop, disallow resizing
     QRect r(QPoint(), kSplashSize);

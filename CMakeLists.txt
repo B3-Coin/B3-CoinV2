@@ -26,7 +26,7 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 #=============================
 # Project / Package metadata
 #=============================
-set(CLIENT_NAME "B3Coin Core")
+set(CLIENT_NAME "B3 FlowMesh client")
 set(CLIENT_VERSION_MAJOR 31)
 set(CLIENT_VERSION_MINOR 1)
 set(CLIENT_VERSION_BUILD 0)
@@ -63,7 +63,8 @@ if(CLIENT_VERSION_RC GREATER 0)
 endif()
 
 set(COPYRIGHT_HOLDERS "The %s developers")
-set(COPYRIGHT_HOLDERS_FINAL "The ${CLIENT_NAME} developers")
+set(COPYRIGHT_SUBSTITUTION_NAME "B3 FlowMesh")
+set(COPYRIGHT_HOLDERS_FINAL "The B3 FlowMesh developers")
 set(CLIENT_BUGREPORT "https://github.com/B3-Coin/B3-CoinV2/issues")
 
 #=============================
