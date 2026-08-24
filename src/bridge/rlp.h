@@ -155,6 +155,26 @@ inline std::vector<unsigned char> RlpEncodeBytes(std::span<const unsigned char> 
     return out;
 }
 
+//! Encode a list from already-encoded child items (test/deposit synthesis).
+inline std::vector<unsigned char> RlpEncodeList(const std::vector<std::vector<unsigned char>>& encoded_children)
+{
+    std::vector<unsigned char> body;
+    for (const auto& c : encoded_children) body.insert(body.end(), c.begin(), c.end());
+    std::vector<unsigned char> out;
+    const size_t n{body.size()};
+    if (n <= 55) {
+        out.push_back(static_cast<unsigned char>(0xc0 + n));
+    } else {
+        std::vector<unsigned char> lenbytes;
+        size_t len{n};
+        while (len) { lenbytes.insert(lenbytes.begin(), static_cast<unsigned char>(len & 0xff)); len >>= 8; }
+        out.push_back(static_cast<unsigned char>(0xf7 + lenbytes.size()));
+        out.insert(out.end(), lenbytes.begin(), lenbytes.end());
+    }
+    out.insert(out.end(), body.begin(), body.end());
+    return out;
+}
+
 //! Canonical RLP of an unsigned integer (big-endian, no leading zeros; 0 = empty string).
 inline std::vector<unsigned char> RlpEncodeUint64(uint64_t v)
 {
