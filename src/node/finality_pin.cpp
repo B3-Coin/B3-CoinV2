@@ -16,52 +16,76 @@
 
 namespace node {
 
-std::optional<FinalityPin> ReadFinalityPin(const fs::path& path, const MessageStartChars& magic)
+FinalityPinFileStatus ReadFinalityPinFile(const fs::path& path, const MessageStartChars& magic, FinalityPin& out,
+                                          std::string& error)
 {
-    if (!fs::exists(path)) return std::nullopt;
+    if (!fs::exists(path)) return FinalityPinFileStatus::ABSENT;
     AutoFile file{fsbridge::fopen(path, "rb")};
     if (file.IsNull()) {
-        LogWarning("finality pin: cannot open %s", fs::PathToString(path));
-        return std::nullopt;
+        error = strprintf("cannot open %s", fs::PathToString(path));
+        return FinalityPinFileStatus::INVALID;
     }
     try {
         HashVerifier verifier{file};
         MessageStartChars file_magic;
         verifier >> file_magic;
         if (file_magic != magic) {
-            LogWarning("finality pin: %s belongs to another network; ignored", fs::PathToString(path));
-            return std::nullopt;
+            error = strprintf("%s belongs to another network", fs::PathToString(path));
+            return FinalityPinFileStatus::INVALID;
         }
         uint8_t version{0};
         verifier >> version;
         if (version != FINALITY_PIN_FILE_VERSION) {
-            LogWarning("finality pin: %s has unknown version %d; ignored", fs::PathToString(path), version);
-            return std::nullopt;
+            error = strprintf("%s has unknown version %d", fs::PathToString(path), version);
+            return FinalityPinFileStatus::INVALID;
         }
         FinalityPin pin;
         verifier >> pin.height >> pin.hash;
         uint256 checksum;
         file >> checksum;
         if (checksum != verifier.GetHash()) {
-            LogWarning("finality pin: %s checksum mismatch; ignored", fs::PathToString(path));
-            return std::nullopt;
+            error = strprintf("%s checksum mismatch (corrupt)", fs::PathToString(path));
+            return FinalityPinFileStatus::INVALID;
         }
         if (pin.height < 0 || pin.hash.IsNull()) {
-            LogWarning("finality pin: %s holds an invalid pin; ignored", fs::PathToString(path));
-            return std::nullopt;
+            error = strprintf("%s holds an invalid pin", fs::PathToString(path));
+            return FinalityPinFileStatus::INVALID;
         }
-        return pin;
+        out = pin;
+        return FinalityPinFileStatus::VALID;
     } catch (const std::exception& e) {
-        LogWarning("finality pin: %s unreadable (%s); ignored", fs::PathToString(path), e.what());
-        return std::nullopt;
+        error = strprintf("%s unreadable (%s)", fs::PathToString(path), e.what());
+        return FinalityPinFileStatus::INVALID;
     }
+}
+
+std::optional<FinalityPin> ReadFinalityPin(const fs::path& path, const MessageStartChars& magic)
+{
+    FinalityPin pin;
+    std::string error;
+    if (ReadFinalityPinFile(path, magic, pin, error) == FinalityPinFileStatus::VALID) return pin;
+    return std::nullopt;
 }
 
 bool WriteFinalityPin(const fs::path& path, const MessageStartChars& magic, const FinalityPin& pin)
 {
     if (pin.height < 0 || pin.hash.IsNull()) return false;
-    // Monotone: never lower a persisted pin.
-    if (const auto existing{ReadFinalityPin(path, magic)}; existing && existing->height >= pin.height) return true;
+    // Monotone, and FAIL CLOSED over an invalid file: an unreadable or
+    // corrupt pin file is never silently replaced -- monotonicity could not
+    // be verified against it, so the operator must intervene.
+    FinalityPin existing;
+    std::string read_error;
+    switch (ReadFinalityPinFile(path, magic, existing, read_error)) {
+    case FinalityPinFileStatus::ABSENT:
+        break;
+    case FinalityPinFileStatus::VALID:
+        if (existing.height >= pin.height) return true;
+        break;
+    case FinalityPinFileStatus::INVALID:
+        LogError("finality pin: refusing to overwrite an invalid pin file (%s); restore or remove it deliberately",
+                 read_error);
+        return false;
+    }
 
     const uint16_t randv{FastRandomContext().rand<uint16_t>()};
     const fs::path tmp{fs::path{path.parent_path()} / fs::u8path(strprintf("%s.%04x", FINALITY_PIN_FILENAME, randv))};

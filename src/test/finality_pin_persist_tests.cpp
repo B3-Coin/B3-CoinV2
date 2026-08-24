@@ -21,6 +21,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <cstdio>
+#include <vector>
 
 using b3test::FinalityChainDiskFixture;
 
@@ -61,7 +62,9 @@ BOOST_FIXTURE_TEST_CASE(pin_file_is_monotone_atomic_and_network_bound, BasicTest
     MessageStartChars other{magic};
     other[0] ^= 0xFF;
     BOOST_CHECK(!node::ReadFinalityPin(path, other).has_value());
-    // Corruption: flip a byte of the stored hash -> checksum mismatch -> ignored.
+    // Corruption: flip a byte of the stored hash -> checksum mismatch. FAIL
+    // CLOSED: the tri-state read reports INVALID with a reason, and no write
+    // ever silently replaces an invalid file.
     {
         FILE* f{fsbridge::fopen(path, "r+b")};
         BOOST_REQUIRE(f != nullptr);
@@ -70,8 +73,22 @@ BOOST_FIXTURE_TEST_CASE(pin_file_is_monotone_atomic_and_network_bound, BasicTest
         BOOST_REQUIRE(std::fwrite(&c, 1, 1, f) == 1);
         std::fclose(f);
     }
+    {
+        node::FinalityPin out;
+        std::string error;
+        BOOST_CHECK(node::ReadFinalityPinFile(path, magic, out, error) == node::FinalityPinFileStatus::INVALID);
+        BOOST_CHECK(!error.empty());
+    }
     BOOST_CHECK(!node::ReadFinalityPin(path, magic).has_value());
-    // A corrupt file does not block a fresh write.
+    BOOST_CHECK(!node::WriteFinalityPin(path, magic, {12, h12}));
+    BOOST_CHECK(!node::WriteFinalityPin(path, magic, {100, h12}));
+    // Only a deliberate operator removal reopens the path.
+    fs::remove(path);
+    {
+        node::FinalityPin out;
+        std::string error;
+        BOOST_CHECK(node::ReadFinalityPinFile(path, magic, out, error) == node::FinalityPinFileStatus::ABSENT);
+    }
     BOOST_CHECK(node::WriteFinalityPin(path, magic, {12, h12}));
     BOOST_CHECK((*node::ReadFinalityPin(path, magic) == node::FinalityPin{12, h12}));
 }
@@ -170,6 +187,44 @@ BOOST_FIXTURE_TEST_CASE(pin_survives_carrier_reorg_restart_and_reindex, Finality
     // synchronously at the raise, so the loaded pin is M+15 regardless of
     // what the databases had flushed.
     restart(/*flush=*/false, /*reindex_chainstate=*/false);
+    BOOST_REQUIRE(Anchor(m_node).has_value());
+    BOOST_CHECK_EQUAL(Anchor(m_node)->first, M + 15);
+
+    // FAIL CLOSED at startup: a corrupt pin file refuses node construction
+    // instead of silently running without the protection it recorded.
+    std::vector<unsigned char> good_bytes;
+    {
+        FILE* f{fsbridge::fopen(pin_path, "rb")};
+        BOOST_REQUIRE(f != nullptr);
+        unsigned char buf[4096];
+        const size_t n{std::fread(buf, 1, sizeof(buf), f)};
+        std::fclose(f);
+        good_bytes.assign(buf, buf + n);
+    }
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
+    }
+    m_node.chainman.reset();
+    {
+        FILE* f{fsbridge::fopen(pin_path, "r+b")};
+        BOOST_REQUIRE(f != nullptr);
+        BOOST_REQUIRE(std::fseek(f, 4 + 1 + 4 + 3, SEEK_SET) == 0);
+        const unsigned char c{0x7f};
+        BOOST_REQUIRE(std::fwrite(&c, 1, 1, f) == 1);
+        std::fclose(f);
+    }
+    BOOST_CHECK_THROW(m_make_chainman(), std::runtime_error);
+    m_node.chainman.reset();
+    // Operator restores the file from backup: startup succeeds and the pin holds.
+    {
+        FILE* f{fsbridge::fopen(pin_path, "wb")};
+        BOOST_REQUIRE(f != nullptr);
+        BOOST_REQUIRE(std::fwrite(good_bytes.data(), 1, good_bytes.size(), f) == good_bytes.size());
+        std::fclose(f);
+    }
+    m_make_chainman();
+    LoadVerifyActivateChainstate();
     BOOST_REQUIRE(Anchor(m_node).has_value());
     BOOST_CHECK_EQUAL(Anchor(m_node)->first, M + 15);
 }

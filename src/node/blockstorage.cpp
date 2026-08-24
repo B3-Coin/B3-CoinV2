@@ -353,10 +353,15 @@ void BlockManager::RaiseFinalityAnchor(const int height, const uint256& hash)
     m_finality_anchor = std::make_pair(height, hash);
     // Persist immediately (atomic, fsync, rename-over): a later allowed reorg
     // may remove the certificate carrier, and a crash or restart must not
-    // forget the pin. The file itself refuses to go backwards.
+    // forget the pin. The file itself refuses to go backwards and refuses to
+    // replace an invalid file. FAIL CLOSED: a node that cannot persist the
+    // pin must not keep running as if it had -- a crash would forget
+    // accepted finality.
     if (!WriteFinalityPin(FinalityPinPath(), m_opts.chainparams.MessageStart(), FinalityPin{height, hash})) {
-        LogError("finality pin: could not persist checkpoint %d %s -- the pin is held in memory only until the next raise",
-                 height, hash.ToString());
+        m_opts.notifications.fatalError(strprintf(
+            _("Failed to persist the finality pin (checkpoint %d %s). See the log; restore or remove an invalid "
+              "%s only after deliberate operator review."),
+            height, hash.ToString(), fs::PathToString(FinalityPinPath())));
     }
 }
 
@@ -1439,10 +1444,25 @@ BlockManager::BlockManager(const util::SignalInterrupt& interrupt, Options opts)
     // block files) so no reindex or restart can reopen a fork below accepted
     // finality. Until its hash is present in the index it is a pending pin:
     // it already bounds RaiseFinalityAnchor (monotone) and starts being
-    // enforced the moment the block is (re)indexed.
-    if (const auto pin{ReadFinalityPin(FinalityPinPath(), m_opts.chainparams.MessageStart())}) {
-        m_finality_anchor = std::make_pair(pin->height, pin->hash);
-        LogInfo("finality pin: loaded checkpoint %d %s", pin->height, pin->hash.ToString());
+    // enforced the moment the block is (re)indexed. FAIL CLOSED: a pin file
+    // that exists but cannot be validated refuses startup -- running without
+    // the protection it was supposed to carry is never the silent default.
+    {
+        FinalityPin pin;
+        std::string pin_error;
+        switch (ReadFinalityPinFile(FinalityPinPath(), m_opts.chainparams.MessageStart(), pin, pin_error)) {
+        case FinalityPinFileStatus::ABSENT:
+            break;
+        case FinalityPinFileStatus::VALID:
+            m_finality_anchor = std::make_pair(pin.height, pin.hash);
+            LogInfo("finality pin: loaded checkpoint %d %s", pin.height, pin.hash.ToString());
+            break;
+        case FinalityPinFileStatus::INVALID:
+            throw std::runtime_error{strprintf(
+                "The finality pin file is invalid: %s. Refusing to start without the finality protection it "
+                "recorded. Restore the file from a backup, or delete it only after deliberate operator review.",
+                pin_error)};
+        }
     }
 
     if (m_opts.block_tree_db_params.wipe_data) {

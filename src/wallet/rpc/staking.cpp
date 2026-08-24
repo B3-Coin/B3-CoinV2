@@ -329,6 +329,44 @@ static FinalityRpcContext FinalityContext(CWallet& wallet) EXCLUSIVE_LOCKS_REQUI
     return ctx;
 }
 
+RPCHelpMan importfinalitykey()
+{
+    return RPCHelpMan{
+        "importfinalitykey",
+        "Import an INDEPENDENTLY generated BLS finality consensus secret key (32-byte big-endian\n"
+        "scalar, 0 < sk < r) into this wallet. The key is stored under the wallet's ordinary\n"
+        "descriptor storage and encryption -- no separate keystore -- and takes precedence over the\n"
+        "deterministic derivation: the next bindfinalitykey binds it, and startstaking arms the signer\n"
+        "with it when it matches the on-chain binding. Requires an unlocked wallet. The secret is\n"
+        "never returned by any RPC.\n",
+        {
+            {"blssecret", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "the 32-byte BLS secret scalar (hex)"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "",
+                  {
+                      {RPCResult::Type::STR_HEX, "bls_pubkey", "the imported key's BLS public key"},
+                      {RPCResult::Type::BOOL, "imported", ""},
+                  }},
+        RPCExamples{HelpExampleCli("importfinalitykey", "\"<hex>\"") + HelpExampleRpc("importfinalitykey", "\"<hex>\"")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+            if (!pwallet) return UniValue::VNULL;
+            LOCK(pwallet->cs_wallet);
+            EnsureWalletIsUnlocked(*pwallet);
+            const auto bytes{ParseHexV(request.params[0], "blssecret")};
+            if (bytes.size() != 32) throw JSONRPCError(RPC_INVALID_PARAMETER, "blssecret must be exactly 32 bytes of hex");
+            const auto key{bls::SecretKey::FromBytes(bytes)};
+            if (!key) throw JSONRPCError(RPC_INVALID_PARAMETER, "invalid BLS secret: must satisfy 0 < sk < r (32 big-endian bytes)");
+            const auto imported{pwallet->ImportFinalityBlsKey(*key)};
+            if (!imported) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(imported).original);
+            UniValue obj(UniValue::VOBJ);
+            obj.pushKV("bls_pubkey", HexStr(imported->Compressed()));
+            obj.pushKV("imported", true);
+            return obj;
+        },
+    };
+}
+
 RPCHelpMan bindfinalitykey()
 {
     return RPCHelpMan{
@@ -365,9 +403,19 @@ RPCHelpMan bindfinalitykey()
             }
             const auto identity{pwallet->GetValidatorSecret()};
             if (!identity) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(identity).original);
-            const auto bls_key{pwallet->DeriveFinalityBlsKey(seq)};
+            // One resolution rule (wallet): an imported independent key takes
+            // precedence over the deterministic derivation for a fresh bind.
+            const auto bls_key{pwallet->ResolveFinalityBlsKey(seq, /*bound_bls_pubkey=*/nullptr)};
             if (!bls_key) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(bls_key).original);
             const std::string action{ctx.status.bound && !ctx.status.revoked ? "rotate" : "bind"};
+            if (action == "rotate") {
+                const auto pk{bls_key->GetPublicKey().Compressed()};
+                if (ctx.status.binding_bls_pubkey == std::vector<unsigned char>(pk.begin(), pk.end())) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                       "the resolved BLS key is already bound; import a different key "
+                                       "(importfinalitykey) before rotating");
+                }
+            }
             return SubmitFinalityKeyTx(*pwallet, *identity, ctx.vk, &*bls_key, seq, ctx.status.chain_domain, action);
         },
     };
@@ -429,7 +477,8 @@ RPCHelpMan getfinalityinfo()
                            {RPCResult::Type::NUM, "seq", /*optional=*/true, "current binding sequence"},
                            {RPCResult::Type::STR_HEX, "bls_pubkey", /*optional=*/true, "the bound BLS public key"},
                            {RPCResult::Type::NUM, "since_height", /*optional=*/true, ""},
-                           {RPCResult::Type::BOOL, "key_is_ours", /*optional=*/true, "the bound key matches this wallet's derivation"},
+                           {RPCResult::Type::BOOL, "key_is_ours", /*optional=*/true, "the bound key matches this wallet's derived or imported key"},
+                           {RPCResult::Type::STR_HEX, "imported_bls_pubkey", /*optional=*/true, "the independently imported BLS key, if any"},
                            {RPCResult::Type::STR_HEX, "next_bls_pubkey", /*optional=*/true, "the key a rotation/bind would bind next"},
                        }},
                       {RPCResult::Type::OBJ, "validator_set", "the set in force",
@@ -488,17 +537,19 @@ RPCHelpMan getfinalityinfo()
                 binding.pushKV("bls_pubkey", HexStr(st.binding_bls_pubkey));
                 binding.pushKV("since_height", st.binding_height);
             }
-            // Derivations need the identity secret: only with an unlocked wallet.
+            // Key material needs the identity secret: only with an unlocked wallet.
             if (!pwallet->IsLocked()) {
                 if (st.bound && !st.revoked) {
-                    if (const auto ours{pwallet->DeriveFinalityBlsKey(st.binding_seq)}) {
-                        const auto pk{ours->GetPublicKey().Compressed()};
-                        binding.pushKV("key_is_ours",
-                                       st.binding_bls_pubkey == std::vector<unsigned char>(pk.begin(), pk.end()));
+                    binding.pushKV("key_is_ours",
+                                   pwallet->ResolveFinalityBlsKey(st.binding_seq, &st.binding_bls_pubkey).has_value());
+                }
+                if (pwallet->HasImportedFinalityBlsKey()) {
+                    if (const auto imported{pwallet->GetImportedFinalityBlsKey()}) {
+                        binding.pushKV("imported_bls_pubkey", HexStr(imported->GetPublicKey().Compressed()));
                     }
                 }
                 const uint32_t next_seq{st.bound ? st.binding_seq + 1 : 0};
-                if (const auto next{pwallet->DeriveFinalityBlsKey(next_seq)}) {
+                if (const auto next{pwallet->ResolveFinalityBlsKey(next_seq, /*bound_bls_pubkey=*/nullptr)}) {
                     binding.pushKV("next_bls_pubkey", HexStr(next->GetPublicKey().Compressed()));
                 }
             }
@@ -586,15 +637,13 @@ RPCHelpMan startstaking()
             {
                 const interfaces::FinalityStatus fstatus{pwallet->chain().finalityStatus(XOnlyBytes(*validator))};
                 if (fstatus.configured && fstatus.bound && !fstatus.revoked) {
-                    if (const auto bls_key{pwallet->DeriveFinalityBlsKey(fstatus.binding_seq)}) {
-                        const auto pk{bls_key->GetPublicKey().Compressed()};
-                        if (fstatus.binding_bls_pubkey == std::vector<unsigned char>(pk.begin(), pk.end())) {
-                            std::string arm_error;
-                            finality_signing = pwallet->chain().armFinalitySigner(*bls_key, XOnlyBytes(*validator), arm_error);
-                            if (!finality_signing) finality_note = arm_error;
-                        } else {
-                            finality_note = "the bound BLS key does not match this wallet's derivation";
-                        }
+                    // Derived or imported: whichever wallet key matches the binding.
+                    if (const auto bls_key{pwallet->ResolveFinalityBlsKey(fstatus.binding_seq, &fstatus.binding_bls_pubkey)}) {
+                        std::string arm_error;
+                        finality_signing = pwallet->chain().armFinalitySigner(*bls_key, XOnlyBytes(*validator), arm_error);
+                        if (!finality_signing) finality_note = arm_error;
+                    } else {
+                        finality_note = util::ErrorString(pwallet->ResolveFinalityBlsKey(fstatus.binding_seq, &fstatus.binding_bls_pubkey)).original;
                     }
                 } else if (fstatus.configured) {
                     finality_note = fstatus.revoked ? "the FINALITY_KEY binding is revoked"

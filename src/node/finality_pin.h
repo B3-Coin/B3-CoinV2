@@ -9,6 +9,7 @@
 #include <util/fs.h>
 
 #include <optional>
+#include <string>
 #include <utility>
 
 namespace node {
@@ -31,9 +32,15 @@ namespace node {
  *   - the stored hash is exactly the hash of the pinned checkpoint.
  *
  * Format: network message-start magic || u8 version (1) || i32 height ||
- * uint256 hash || SHA256d checksum over the preceding bytes. A file for a
- * different network, a corrupt file or an unknown version is ignored.
- * There is no administrative override and no automatic rollback.
+ * uint256 hash || SHA256d checksum over the preceding bytes.
+ *
+ * FAIL CLOSED (production hardening, 2026-08-24): only an ABSENT file is a
+ * fresh start. A file that exists but is unreadable, corrupt, of an unknown
+ * version or for another network is INVALID -- the node refuses to start
+ * rather than silently running without the finality protection the file was
+ * supposed to carry, and no write ever replaces an invalid file (an operator
+ * must restore it from backup or delete it deliberately). There is no
+ * administrative override and no automatic rollback.
  */
 inline constexpr uint8_t FINALITY_PIN_FILE_VERSION{1};
 inline const char* const FINALITY_PIN_FILENAME{"finality_pin.dat"};
@@ -44,14 +51,27 @@ struct FinalityPin {
     friend bool operator==(const FinalityPin& a, const FinalityPin& b) { return a.height == b.height && a.hash == b.hash; }
 };
 
-//! Read the pin file; nullopt when absent, corrupt, for another network or
-//! of an unknown version (each logged).
+enum class FinalityPinFileStatus {
+    ABSENT,  //!< no file: a node that never pinned anything
+    VALID,   //!< `out` holds the persisted pin
+    INVALID, //!< the file exists but is unreadable, corrupt, foreign or unknown -- FAIL CLOSED
+};
+
+//! Read the pin file (tri-state; INVALID carries `error`).
+FinalityPinFileStatus ReadFinalityPinFile(const fs::path& path, const MessageStartChars& magic, FinalityPin& out,
+                                          std::string& error);
+
+//! Convenience: the pin when the file is VALID, nullopt when ABSENT; INVALID
+//! is indistinguishable from ABSENT here, so callers that must fail closed
+//! use ReadFinalityPinFile directly.
 std::optional<FinalityPin> ReadFinalityPin(const fs::path& path, const MessageStartChars& magic);
 
 /**
  * Persist `pin` atomically unless the file already holds a pin at an equal
  * or greater height (monotone; returns true without writing in that case).
- * Returns false only on an I/O failure.
+ * Returns false on an I/O failure AND when the existing file is INVALID --
+ * an invalid file is never silently replaced (fail closed; the caller
+ * escalates).
  */
 bool WriteFinalityPin(const fs::path& path, const MessageStartChars& magic, const FinalityPin& pin);
 

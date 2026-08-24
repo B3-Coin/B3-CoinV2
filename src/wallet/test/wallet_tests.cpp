@@ -771,6 +771,50 @@ BOOST_FIXTURE_TEST_CASE(b3_validator_key_and_stake_outputs, TestChain100Setup)
         BOOST_REQUIRE(bls1);
         BOOST_CHECK(bls0->GetPublicKey().Compressed() != bls1->GetPublicKey().Compressed());
 
+        // Independent (imported) BLS key: stored via the wallet's ordinary
+        // descriptor machinery; one resolution rule covers derived + imported.
+        BOOST_CHECK(!wallet->HasImportedFinalityBlsKey());
+        std::array<unsigned char, 32> ikm{};
+        ikm.fill(0x5A);
+        const auto independent{bls::SecretKey::FromIKM(ikm)};
+        BOOST_REQUIRE(independent);
+        {
+            const auto imported{wallet->ImportFinalityBlsKey(*independent)};
+            BOOST_REQUIRE_MESSAGE(imported, util::ErrorString(imported).original);
+            BOOST_CHECK(imported->Compressed() == independent->GetPublicKey().Compressed());
+        }
+        BOOST_CHECK(wallet->HasImportedFinalityBlsKey());
+        {
+            const auto back{wallet->GetImportedFinalityBlsKey()};
+            BOOST_REQUIRE_MESSAGE(back, util::ErrorString(back).original);
+            BOOST_CHECK(back->GetPublicKey().Compressed() == independent->GetPublicKey().Compressed());
+            BOOST_CHECK(back->Bytes() == independent->Bytes());
+        }
+        // Fresh bind: the imported key takes precedence over the derivation.
+        {
+            const auto fresh{wallet->ResolveFinalityBlsKey(0, nullptr)};
+            BOOST_REQUIRE(fresh);
+            BOOST_CHECK(fresh->GetPublicKey().Compressed() == independent->GetPublicKey().Compressed());
+        }
+        // Existing binding: whichever wallet key matches its public key.
+        const auto to_vec{[](const auto& pk) { return std::vector<unsigned char>(pk.begin(), pk.end()); }};
+        {
+            const auto bound_derived{to_vec(bls0->GetPublicKey().Compressed())};
+            const auto r{wallet->ResolveFinalityBlsKey(0, &bound_derived)};
+            BOOST_REQUIRE(r);
+            BOOST_CHECK(r->GetPublicKey().Compressed() == bls0->GetPublicKey().Compressed());
+        }
+        {
+            const auto bound_imported{to_vec(independent->GetPublicKey().Compressed())};
+            const auto r{wallet->ResolveFinalityBlsKey(7, &bound_imported)};
+            BOOST_REQUIRE(r);
+            BOOST_CHECK(r->GetPublicKey().Compressed() == independent->GetPublicKey().Compressed());
+        }
+        {
+            std::vector<unsigned char> foreign(48, 0xEE);
+            BOOST_CHECK(!wallet->ResolveFinalityBlsKey(0, &foreign));
+        }
+
         // Ownership and standardness through the carrier.
         BOOST_CHECK(wallet->IsMine(CTxOut{COIN, stake_script}));
         BOOST_CHECK(!wallet->IsMine(CTxOut{COIN, witness_owner_stake}));

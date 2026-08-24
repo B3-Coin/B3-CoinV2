@@ -33,6 +33,7 @@ namespace DBKeys {
 const std::string ACENTRY{"acentry"};
 const std::string ACTIVEEXTERNALSPK{"activeexternalspk"};
 const std::string B3_VALIDATOR_PUBKEY{"b3validatorpubkey"};
+const std::string B3_FINALITY_BLS_HANDLE{"b3finalityblshandle"};
 const std::string ACTIVEINTERNALSPK{"activeinternalspk"};
 const std::string BESTBLOCK_NOMERKLE{"bestblock_nomerkle"};
 const std::string BESTBLOCK{"bestblock"};
@@ -179,6 +180,11 @@ bool WalletBatch::EraseWatchOnly(const CScript &dest)
 bool WalletBatch::WriteB3ValidatorPubKey(const CPubKey& pubkey)
 {
     return WriteIC(DBKeys::B3_VALIDATOR_PUBKEY, pubkey);
+}
+
+bool WalletBatch::WriteB3FinalityBlsHandle(const CPubKey& pubkey)
+{
+    return WriteIC(DBKeys::B3_FINALITY_BLS_HANDLE, pubkey);
 }
 
 bool WalletBatch::WriteBestBlock(const CBlockLocator& locator)
@@ -1143,6 +1149,11 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
             CPubKey validator_pubkey;
             if (m_batch->Read(DBKeys::B3_VALIDATOR_PUBKEY, validator_pubkey) && validator_pubkey.IsFullyValid()) {
                 pwallet->LoadValidatorPubKey(validator_pubkey);
+            }
+
+            CPubKey finality_bls_handle;
+            if (m_batch->Read(DBKeys::B3_FINALITY_BLS_HANDLE, finality_bls_handle) && finality_bls_handle.IsFullyValid()) {
+                pwallet->LoadFinalityBlsHandle(finality_bls_handle);
             }
         }
         // Early return if there are unknown descriptors. Later loading of ACTIVEINTERNALSPK and ACTIVEEXTERNALEXPK

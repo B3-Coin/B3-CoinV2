@@ -435,6 +435,8 @@ private:
     //! Cache of descriptor ScriptPubKeys used for IsMine. Maps ScriptPubKey to set of spkms
     std::unordered_map<CScript, std::vector<ScriptPubKeyMan*>, SaltedSipHasher> m_cached_spks;
 
+    //! B3: secp handle of the imported BLS finality secret; unset until imported.
+    std::optional<CPubKey> m_b3_finality_bls_handle GUARDED_BY(cs_wallet);
     //! B3 validator public key (see GetValidatorPubKey); unset until created.
     std::optional<CPubKey> m_b3_validator_pubkey GUARDED_BY(cs_wallet);
 
@@ -1000,6 +1002,30 @@ public:
      * chain sees only the bound public keys.
      */
     util::Result<bls::SecretKey> DeriveFinalityBlsKey(uint32_t seq) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /**
+     * B3 finality: an INDEPENDENTLY generated BLS consensus key (production
+     * hardening, 2026-08-24). The 32-byte scalar (0 < sk < r, so always a
+     * valid secp256k1 secret too) is stored as an ordinary single-key pk()
+     * descriptor -- the wallet's existing persistence, encryption, unlock
+     * and backup machinery, no parallel keystore -- and found again through
+     * the recorded secp handle public key. Importing requires an unlocked
+     * wallet; re-importing replaces the handle (the old descriptor stays
+     * inert). The secret never leaves wallet/node memory.
+     */
+    util::Result<bls::PublicKey> ImportFinalityBlsKey(const bls::SecretKey& key) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! The imported BLS key, if any (unlocked wallet); nullopt error text otherwise.
+    util::Result<bls::SecretKey> GetImportedFinalityBlsKey() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool HasImportedFinalityBlsKey() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { return m_b3_finality_bls_handle.has_value(); }
+    void LoadFinalityBlsHandle(const CPubKey& pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /**
+     * The BLS secret this wallet would use for binding sequence `seq` /
+     * signing: when `bound_bls_pubkey` is given (an on-chain binding), the
+     * key -- derived(seq) or imported -- whose public key matches it, else an
+     * error; when absent (a fresh bind), the imported key if present, else
+     * derived(seq). One resolution rule for bindfinalitykey, startstaking
+     * and diagnostics.
+     */
+    util::Result<bls::SecretKey> ResolveFinalityBlsKey(uint32_t seq, const std::vector<unsigned char>* bound_bls_pubkey) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     //! Database load hook.
     void LoadValidatorPubKey(const CPubKey& pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
