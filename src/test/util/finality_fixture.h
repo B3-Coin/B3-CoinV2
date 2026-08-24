@@ -174,7 +174,7 @@ struct FinalityChainFixture : public BindingFixture {
     //! Legacy -> corridor (stakes + bindings in the first corridor block) ->
     //! last corridor height M-1, with the modern-PoS rule set configured.
     void PrepareFinalityChain(const int min_finality_set = 1, const int reorg_horizon = 200,
-                              const bool with_unbound_c = false)
+                              const bool with_unbound_c = false, const bool with_bound_c = false)
     {
         Prepare();
         Consensus::Params& c{MutableConsensus()};
@@ -207,11 +207,15 @@ struct FinalityChainFixture : public BindingFixture {
         {
             std::vector<CMutableTransaction> txs{stake_a, stake_b, MakeTx(2, {bind_a.cell}, {bind_a.record}),
                                                  MakeTx(3, {bind_b.cell}, {bind_b.record})};
-            if (with_unbound_c) {
+            if (with_unbound_c || with_bound_c) {
                 CMutableTransaction stake_c{MakeTx(6, {}, {})};
                 stake_c.vout.insert(stake_c.vout.begin(), CTxOut{STAKE_C, modern::MakeStakeScript(m_vk_c, CScript() << OP_TRUE)});
                 stake_c.vout.back().nValue -= STAKE_C;
                 txs.push_back(stake_c);
+            }
+            if (with_bound_c) {
+                const auto bind_c{MakeBinding(m_validator_c, m_vk_c, &m_bls_c, 0)};
+                txs.push_back(MakeTx(11, {bind_c.cell}, {bind_c.record}));
             }
             const CBlock first{BuildCorridorWithRoot(txs)};
             BOOST_REQUIRE_MESSAGE(Probe(first).empty(), "first corridor block invalid: " << Probe(first));
