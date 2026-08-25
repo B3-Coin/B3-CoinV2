@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 <rect width="512" height="512" rx="96" fill="#111318"/>
 <path d="M256.00,60.00 L86.26,158.00 L86.26,354.00 L256.00,452.00 L425.74,354.00 L425.74,158.00 Z" fill="#E8C05A"/>
-<text x="218" y="278" font-family="DIN Alternate, Avenir Next, sans-serif" font-weight="500" font-size="196" fill="#111318" text-anchor="middle" dominant-baseline="central">B</text><g transform="translate(292,158) scale(0.55)"><g><path d="M18,36 L156,36 L184,62 L184,92 L150,120 L120,100 L146,84 L146,64 L42,64 L18,58 Z" fill="#111318"/><path d="M120,112 L148,94 L172,114 L140,136 Z" fill="#111318"/><path d="M118,140 L166,146 L196,182 L186,226 L138,254 L74,260 L38,236 L56,208 L92,228 L138,218 L156,190 L142,166 L106,158 Z" fill="#111318"/></g></g>
+<text x="234" y="272" font-family="DIN Alternate, Avenir Next, sans-serif" font-weight="500" font-size="200" fill="#111318" text-anchor="middle" dominant-baseline="central">B</text><text x="330" y="190" font-family="DIN Alternate, Avenir Next, sans-serif" font-weight="500" font-size="118" fill="#111318" text-anchor="middle" dominant-baseline="central">3</text>
 </svg>
