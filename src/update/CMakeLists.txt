@@ -5,6 +5,7 @@
 # FlowMesh and P2P (doc/design/b3-hive-update-system.md).
 add_library(b3_update STATIC EXCLUDE_FROM_ALL
   downloader.cpp
+  manager.cpp
   manifest.cpp
 )
 target_link_libraries(b3_update

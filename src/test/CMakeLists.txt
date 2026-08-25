@@ -42,6 +42,7 @@ add_executable(test_bitcoin
   bridge_exec_chain_tests.cpp
   bridge_mpt_tests.cpp
   update_downloader_tests.cpp
+  update_manager_tests.cpp
   update_manifest_tests.cpp
   compress_tests.cpp
   consensus_phase_tests.cpp
