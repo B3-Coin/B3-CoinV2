@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 <rect width="512" height="512" rx="96" fill="#111318"/>
-<path d="M256.00,56.00 L82.79,156.00 L82.79,356.00 L256.00,456.00 L429.21,356.00 L429.21,156.00 Z" fill="none" stroke="#E8C05A" stroke-width="24" stroke-linejoin="round"/>
-<text x="238" y="270" font-family="DIN Alternate, Avenir Next, sans-serif" font-weight="700" font-size="210" fill="#E8C05A" text-anchor="middle" dominant-baseline="central">B</text><text x="330" y="192" font-family="DIN Alternate, Avenir Next, sans-serif" font-weight="700" font-size="120" fill="#E8C05A" text-anchor="middle" dominant-baseline="central">3</text>
+<path d="M256.00,56.00 L82.79,156.00 L82.79,356.00 L256.00,456.00 L429.21,356.00 L429.21,156.00 Z" fill="none" stroke="#E8C05A" stroke-width="22" stroke-linejoin="round"/>
+<text x="238" y="272" font-family="DIN Alternate, Avenir Next, sans-serif" font-weight="500" font-size="200" fill="#E8C05A" text-anchor="middle" dominant-baseline="central">B</text><text x="330" y="190" font-family="DIN Alternate, Avenir Next, sans-serif" font-weight="500" font-size="120" fill="#E8C05A" text-anchor="middle" dominant-baseline="central">3</text>
 </svg>
