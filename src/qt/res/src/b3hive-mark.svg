@@ -1,5 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+<!-- The "3" uses Luminari (macOS blackletter face) per the owner ruling 2026-08-26; rasters are generated on macOS so shipped icons are font-independent. -->
 <rect width="512" height="512" rx="96" fill="#111318"/>
 <path d="M256.00,56.00 L82.79,156.00 L82.79,356.00 L256.00,456.00 L429.21,356.00 L429.21,156.00 Z" fill="none" stroke="#E8C05A" stroke-width="22" stroke-linejoin="round"/>
-<text x="236" y="270" font-family="Avenir Next, Futura, Helvetica, sans-serif" font-weight="800" font-size="196" fill="#E8C05A" text-anchor="middle" dominant-baseline="central" letter-spacing="-6">B<tspan font-size="128" dy="-40">3</tspan></text>
+<text x="226" y="276" font-family="Avenir Next, Futura, Helvetica, sans-serif" font-weight="800" font-size="196" fill="#E8C05A" text-anchor="middle" dominant-baseline="central" letter-spacing="-6">B</text><text x="352" y="176" font-family="Luminari, fantasy" font-size="150" fill="#E8C05A" text-anchor="middle" dominant-baseline="central">3</text>
 </svg>
