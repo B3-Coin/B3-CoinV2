@@ -12,6 +12,7 @@
 
 #include <QButtonGroup>
 #include <QLabel>
+#include <QPixmap>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -26,6 +27,12 @@ B3NavSidebar::B3NavSidebar(QWidget* parent)
                                  B3Theme::kSpaceMd);
     m_layout->setSpacing(B3Theme::kSpaceXs);
 
+    auto* mark = new QLabel(this);
+    mark->setObjectName("B3SidebarMark");
+    mark->setPixmap(QPixmap(QStringLiteral(":/icons/b3hive_mark"))
+                        .scaled(56, 56, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    mark->setAlignment(Qt::AlignHCenter);
+    m_layout->addWidget(mark);
     auto* brand = new QLabel(tr("B3FlowMesh"), this);
     brand->setObjectName("B3SidebarBrand");
     auto* brandSub = new QLabel(tr("Wallet"), this);
