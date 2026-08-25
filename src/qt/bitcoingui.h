@@ -41,6 +41,7 @@ class HelpMessageDialog;
 class ModalOverlay;
 class B3AssetsPage;
 class B3SettingsPage;
+class UpdateController;
 class B3Shell;
 class B3StakePage;
 enum class B3Page;
@@ -53,6 +54,7 @@ struct BlockAndHeaderTipInfo;
 }
 
 QT_BEGIN_NAMESPACE
+class QPushButton;
 class QAction;
 class QComboBox;
 class QDateTime;
@@ -78,6 +80,9 @@ public:
 
     explicit BitcoinGUI(interfaces::Node& node, const PlatformStyle *platformStyle, const NetworkStyle *networkStyle, QWidget *parent = nullptr);
     ~BitcoinGUI();
+
+    /** The B3 Hive update controller (may be null before UI setup). */
+    UpdateController* updateController() const { return m_update_controller; }
 
     /** Set the client model.
         The client model represents the part of the core that communicates with the P2P network, and is wallet-agnostic.
@@ -128,6 +133,8 @@ private:
     B3AssetsPage* m_assets_page = nullptr;
     B3StakePage* m_stake_page = nullptr;
     B3SettingsPage* m_settings_page = nullptr;
+    UpdateController* m_update_controller = nullptr;
+    QPushButton* m_update_indicator = nullptr;
 
     UnitDisplayStatusBarControl* unitDisplayControl = nullptr;
     GUIUtil::ThemedLabel* labelWalletEncryptionIcon = nullptr;

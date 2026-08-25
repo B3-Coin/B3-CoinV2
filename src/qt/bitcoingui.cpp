@@ -13,6 +13,9 @@
 #include <qt/guiutil.h>
 #include <qt/b3navsidebar.h>
 #include <qt/b3settingspage.h>
+#include <qt/updatecontroller.h>
+#include <QPushButton>
+#include <qt/updatepanel.h>
 #include <qt/b3shell.h>
 #include <qt/b3topstatus.h>
 #include <qt/b3tradepage.h>
@@ -156,6 +159,33 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         m_settings_page = new B3SettingsPage(m_shell);
         m_shell->setSettingsPage(m_settings_page);
         connect(m_settings_page, &B3SettingsPage::openOptionsRequested, this, &BitcoinGUI::openOptionsDialogWithTab);
+
+        // B3 Hive update system: controller + Settings section + a
+        // restrained honey-gold indicator in the top status. Unconfigured
+        // builds stay quiet (the panel shows an honest disabled note).
+        m_update_controller = new UpdateController(this);
+        m_settings_page->setUpdateWidget(new UpdatePanel(m_update_controller, m_settings_page));
+        m_update_indicator = new QPushButton(tr("Update available"), this);
+        m_update_indicator->setObjectName(QStringLiteral("hiveUpdateIndicator"));
+        m_update_indicator->setFlat(true);
+        m_update_indicator->setCursor(Qt::PointingHandCursor);
+        m_update_indicator->setStyleSheet(QStringLiteral(
+            "QPushButton#hiveUpdateIndicator { color: #E8A93C; border: 1px solid #E8A93C;"
+            " border-radius: 9px; padding: 2px 10px; background: transparent; }"
+            "QPushButton#hiveUpdateIndicator:hover { background: rgba(232,169,60,0.12); }"));
+        m_update_indicator->setVisible(false);
+        m_shell->topStatus()->addTrailingWidget(m_update_indicator);
+        connect(m_update_indicator, &QPushButton::clicked, this,
+                [this] { m_shell->showPage(B3Page::Settings); });
+        connect(m_update_controller, &UpdateController::stateChanged, this, [this] {
+            const auto s{m_update_controller->state()};
+            m_update_indicator->setVisible(s == update::UpdateState::UPDATE_AVAILABLE ||
+                                           s == update::UpdateState::READY_TO_INSTALL);
+        });
+        // "Install and restart" performs an ORDERLY quit; the installer only
+        // launches after the node reports shutdown complete (bitcoin.cpp).
+        connect(m_update_controller, &UpdateController::shutdownRequested, this,
+                &BitcoinGUI::quitRequested);
         setCentralWidget(m_shell);
     } else
 #endif // ENABLE_WALLET

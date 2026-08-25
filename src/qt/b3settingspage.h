@@ -33,11 +33,15 @@ public:
     //! button enabled-state mirrors the action's.
     void setWalletActions(const QList<QAction*>& actions);
 
+    //! Install the "B3 Hive update" section (owned by the caller's tree).
+    void setUpdateWidget(QWidget* widget);
+
 Q_SIGNALS:
     //! Ask the window to open the existing options dialog at a tab.
     void openOptionsRequested(OptionsDialog::Tab tab);
 
 private:
+    QVBoxLayout* m_layout{nullptr};
     QVBoxLayout* m_wallet_actions_layout{nullptr};
     QLabel* m_wallet_note{nullptr};
 };

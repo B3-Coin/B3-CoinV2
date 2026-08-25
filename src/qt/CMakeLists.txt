@@ -78,6 +78,8 @@ add_library(bitcoinqt STATIC EXCLUDE_FROM_ALL
   b3placeholderpage.cpp
   b3placeholderpage.h
   b3settingspage.cpp
+  updatecontroller.cpp
+  updatepanel.cpp
   b3settingspage.h
   b3shell.cpp
   b3shell.h
@@ -168,6 +170,7 @@ target_link_libraries(bitcoinqt
     Qt6::Widgets
   PRIVATE
     core_interface
+    b3_update
     bitcoin_cli
     leveldb
     Boost::headers

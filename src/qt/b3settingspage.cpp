@@ -97,7 +97,16 @@ B3SettingsPage::B3SettingsPage(QWidget* parent)
     row->addWidget(walletCard, 1);
 
     layout->addLayout(row);
+    m_layout = layout;
     layout->addStretch();
+}
+
+void B3SettingsPage::setUpdateWidget(QWidget* widget)
+{
+    if (!widget || !m_layout) return;
+    widget->setParent(this);
+    // Insert above the trailing stretch.
+    m_layout->insertWidget(m_layout->count() - 1, widget);
 }
 
 void B3SettingsPage::setWalletActions(const QList<QAction*>& actions)

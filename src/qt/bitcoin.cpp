@@ -23,6 +23,7 @@
 #include <qt/guiconstants.h>
 #include <qt/b3theme.h>
 #include <qt/guiutil.h>
+#include <qt/updatecontroller.h>
 #include <qt/initexecutor.h>
 #include <qt/intro.h>
 #include <qt/networkstyle.h>
@@ -297,7 +298,13 @@ void BitcoinApplication::startThread()
 
     /*  communication to and from thread */
     connect(&m_executor.value(), &InitExecutor::initializeResult, this, &BitcoinApplication::initializeResult);
-    connect(&m_executor.value(), &InitExecutor::shutdownResult, this, [] {
+    connect(&m_executor.value(), &InitExecutor::shutdownResult, this, [this] {
+        // The single point where a pending, explicitly approved B3 Hive
+        // update may hand off to the installer: databases and wallets are
+        // closed. A no-op unless the user armed an install.
+        if (window && window->updateController()) {
+            window->updateController()->onNodeShutdownComplete();
+        }
         QCoreApplication::exit(0);
     });
     connect(&m_executor.value(), &InitExecutor::runawayException, this, &BitcoinApplication::handleRunawayException);
@@ -470,6 +477,10 @@ bool BitcoinApplication::event(QEvent* e)
 
 static void SetupUIArgs(ArgsManager& argsman)
 {
+    argsman.AddArg("-hiveupdateurl=<url>", "B3 Hive update manifest URL (unset = updates disabled, fail-closed)", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
+    argsman.AddArg("-hiveupdatekey=<hex>", "Pinned x-only release public key for B3 Hive updates (may be given multiple times)", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
+    argsman.AddArg("-hiveupdatethreshold=<n>", "Required release signatures for a B3 Hive update manifest (default: 2)", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
+    argsman.AddArg("-hiveupdatehost=<host>", "Approved download host for B3 Hive updates (may be given multiple times; default: the manifest host)", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
     argsman.AddArg("-choosedatadir", strprintf("Choose data directory on startup (default: %u)", DEFAULT_CHOOSE_DATADIR), ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
     argsman.AddArg("-lang=<lang>", "Set language, for example \"de_DE\" (default: system locale)", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
     argsman.AddArg("-min", "Start minimized", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
