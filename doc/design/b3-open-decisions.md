@@ -86,6 +86,15 @@ M is resolved (spec §3).
 
 ## OD-2 — Modern B3 monetary policy
 
+**2026-08-26 owner rulings (partial):** treasury = ONE single wallet/address
+(no multisig, "no complex problems"); asset issuance fees pay to that same
+treasury address (supersedes any burn proposal); FlowMesh trading fees pay
+to the same address under the proposed bps schedule. Reward mechanism
+itself still OPEN — consolidated recommendation (constant tail emission,
+1.5%/yr of measured S_H, 90/10 producer/treasury split) now lives in
+[b3-economics-v1.md](b3-economics-v1.md) awaiting the owner's numbers.
+
+
 Native B3 supply continues from the historical ledger (contract §19), but the modern-era
 issuance curve, staking reward rate, and fee-burn behaviour (if any) are unspecified.
 Overlaps with OD-1's reward schedule. Native B3 must never be issued through the generic
