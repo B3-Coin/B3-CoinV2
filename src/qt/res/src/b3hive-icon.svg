@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-<!-- The "3" uses Luminari (macOS blackletter face) per the owner ruling 2026-08-26; rasters are generated on macOS so shipped icons are font-independent. -->
+<!-- "3" in Luminari (owner ruling 2026-08-26), inset to clear the hexagon edge. Rasters generated on macOS; shipped icons are font-independent. -->
 <rect width="512" height="512" rx="96" fill="#111318"/>
 <path d="M256.00,60.00 L86.26,158.00 L86.26,354.00 L256.00,452.00 L425.74,354.00 L425.74,158.00 Z" fill="#E8C05A"/>
-<text x="226" y="276" font-family="Avenir Next, Futura, Helvetica, sans-serif" font-weight="800" font-size="196" fill="#111318" text-anchor="middle" dominant-baseline="central" letter-spacing="-6">B</text><text x="352" y="176" font-family="Luminari, fantasy" font-size="150" fill="#111318" text-anchor="middle" dominant-baseline="central">3</text>
+<text x="222" y="278" font-family="Avenir Next, Futura, Helvetica, sans-serif" font-weight="800" font-size="188" fill="#111318" text-anchor="middle" dominant-baseline="central" letter-spacing="-6">B</text><text x="326" y="198" font-family="Luminari, fantasy" font-size="118" fill="#111318" text-anchor="middle" dominant-baseline="central">3</text>
 </svg>
