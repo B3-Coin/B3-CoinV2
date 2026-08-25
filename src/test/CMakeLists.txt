@@ -41,6 +41,7 @@ add_executable(test_bitcoin
   bridge_eth_light_client_tests.cpp
   bridge_exec_chain_tests.cpp
   bridge_mpt_tests.cpp
+  update_manifest_tests.cpp
   compress_tests.cpp
   consensus_phase_tests.cpp
   crypto_tests.cpp
@@ -214,6 +215,7 @@ add_windows_application_manifest(test_bitcoin)
 
 target_link_libraries(test_bitcoin
   core_interface
+  b3_update
   test_util
   bitcoin_cli
   bitcoin_node
