@@ -193,3 +193,37 @@ double-signing is a Modern PoS design question (OD), not bridge-specific.
 
 The smoke-test deployment (owner-controlled authorities, 0.001 ETH) is
 exempt from these gates by proportionality; nothing else is.
+
+
+## 5. Stage-4 mint admission rules — OWNER-RATIFIED 2026-08-26
+
+External review of B3DepositVault.sol confirmed: reentrancy guarding and
+fee-on-transfer net-delta crediting are correct; the residual risk is
+token ADMISSION and token SEMANTICS — a finalized receipt proves the
+vault emitted an event, never that a malicious token reported a truthful
+balance. The following are binding requirements on the stage-4 consensus
+design (they refine T8/T10 into normative rules):
+
+1. **Burn = PROPOSED, never approval.** The B3 issuance-fee burn moves a
+   token only into a PROPOSED registry state; it is an anti-spam fee.
+   Activation is a separate, explicit approval act.
+2. **Mint requires an ACTIVE registry entry** binding the full tuple:
+   `(ethereum_chain_id, vault_address, token_address, b3_asset_id,
+   decimals/raw-unit conversion rules, implementation/adapter version,
+   approval block range)`. No tuple, no mint — regardless of proof
+   validity.
+3. **Exactly-once consumption**: the nullifier key is
+   `(chain_id, vault_address, deposit_id)`, consumed once, with the
+   EXACT log-emitting contract address verified against the registry
+   (already enforced at the verification layer: ExtractDeposits filters
+   on the precise vault address).
+4. **Token-semantics gate**: rebasing, reflection, blacklistable,
+   clawback-capable, fee-charging and upgradeable tokens are rejected or
+   admitted only through explicit per-token adapters. A proxy address is
+   not a stable security identity — approval binds implementation/
+   adapter version, and an upgrade voids the entry until re-approved.
+5. **Withdrawals derive the Ethereum token from the approved B3 asset
+   mapping** — never from user-provided token data.
+
+These rules gate any BRIDGE_MINT implementation; a design that cannot
+express them is out of contract.
