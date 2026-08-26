@@ -12,6 +12,9 @@
 
 #include <atomic>
 #include <memory>
+#include <thread>
+
+class QTimer;
 
 /** Qt glue for the B3 Hive update system (doc/design/b3-hive-update-system.md).
  *
@@ -40,6 +43,7 @@ public:
     quint64 downloadSize() const { return m_download_size; }
     QString lastError() const { return m_error; }
     bool busy() const { return m_busy.load(); }
+    bool installSupported() const;
 
     bool autoCheckEnabled() const;
     void setAutoCheckEnabled(bool enabled);
@@ -49,9 +53,8 @@ public Q_SLOTS:
     void checkNow();
     //! Explicit user approval #1.
     void startDownload();
-    //! Explicit user approval #2 ("Install and restart"): arms the install
-    //! and emits shutdownRequested() for the window to perform an ORDERLY
-    //! quit. The installer launches only from onNodeShutdownComplete().
+    //! Explicit user approval #2. This is inert unless the platform provides
+    //! a complete replacement-and-restart implementation.
     void requestInstallAndRestart();
     //! Called by the application ONLY after the node fully shut down.
     void onNodeShutdownComplete();
@@ -69,6 +72,8 @@ private:
     std::unique_ptr<update::UpdateInstaller> m_installer;
     std::unique_ptr<update::SequenceStore> m_sequences;
     std::unique_ptr<update::UpdateManager> m_manager;
+    std::thread m_worker;
+    QTimer* m_auto_timer{nullptr};
     bool m_configured{false};
     std::atomic<bool> m_busy{false};
 

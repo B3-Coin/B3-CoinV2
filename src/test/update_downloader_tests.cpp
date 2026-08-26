@@ -93,6 +93,15 @@ BOOST_AUTO_TEST_CASE(artifact_happy_path)
     size_t files{0};
     for (auto const& e : fs::directory_iterator{dir}) { (void)e; ++files; }
     BOOST_CHECK_EQUAL(files, 1U);
+
+    // Retrying the exact pending artifact replaces the digest-named entry
+    // cleanly on every platform and leaves no temp litter.
+    const auto retry{FetchArtifact(t, Art(body), dir, Policy(), err)};
+    BOOST_REQUIRE_MESSAGE(retry, err);
+    BOOST_CHECK_EQUAL(*retry, *path);
+    files = 0;
+    for (auto const& e : fs::directory_iterator{dir}) { (void)e; ++files; }
+    BOOST_CHECK_EQUAL(files, 1U);
 }
 
 BOOST_AUTO_TEST_CASE(redirect_policy)

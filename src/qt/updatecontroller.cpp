@@ -14,7 +14,6 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
-#include <QProcess>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QTimer>
@@ -24,8 +23,11 @@
 namespace {
 
 constexpr int64_t AUTO_CHECK_BASE_SECONDS{6 * 60 * 60};
+constexpr int NETWORK_TIMEOUT_MS{30 * 1000};
+constexpr int INITIAL_CHECK_DELAY_MS{5 * 1000};
 constexpr const char* SETTING_AUTO_CHECK{"fHiveUpdateAutoCheck"};
 constexpr const char* SETTING_SEQUENCE{"nHiveUpdateSequence"};
+constexpr const char* SETTING_SEQUENCE_RECORD{"strHiveUpdateSequenceState"};
 
 //! Qt transport: NO policy of its own — redirects are surfaced to the core
 //! policy callback before being followed; the body streams through sink.
@@ -45,8 +47,16 @@ public:
             req.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("B3Hive-Update"));
             QEventLoop loop;
             QNetworkReply* reply{net.get(req)};
-            bool aborted{false};
+            QTimer timeout;
+            timeout.setSingleShot(true);
+            bool aborted{false}, timed_out{false};
             QObject::connect(reply, &QNetworkReply::readyRead, [&] {
+                // Redirect response bodies are not part of the requested
+                // artifact and must never be forwarded to the verified sink.
+                if (reply->attribute(QNetworkRequest::RedirectionTargetAttribute).isValid()) {
+                    reply->readAll();
+                    return;
+                }
                 const QByteArray chunk{reply->readAll()};
                 if (!sink(std::string_view{chunk.constData(), static_cast<size_t>(chunk.size())})) {
                     aborted = true;
@@ -54,10 +64,17 @@ public:
                 }
             });
             QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+            QObject::connect(&timeout, &QTimer::timeout, [&] {
+                timed_out = true;
+                reply->abort();
+            });
+            timeout.start(NETWORK_TIMEOUT_MS);
             loop.exec();
+            timeout.stop();
             const QVariant redirect{reply->attribute(QNetworkRequest::RedirectionTargetAttribute)};
             const auto net_error{reply->error()};
             reply->deleteLater();
+            if (timed_out) { error = "update-fetch-timeout"; return false; }
             if (aborted) return false;
             if (redirect.isValid()) {
                 const QString target{QUrl{current}.resolved(redirect.toUrl()).toString()};
@@ -73,61 +90,111 @@ public:
     }
 };
 
-//! Platform installer. v1 implements macOS (verify the platform code
-//! signature, then hand the artifact to the system opener as a detached
-//! process with argv arrays); other platforms refuse cleanly. Never
-//! elevates privileges.
+//! No platform has a complete, audited replacement-and-restart flow yet.
+//! Opening a DMG/package is deliberately not represented as installation.
 class PlatformUpdateInstaller : public update::UpdateInstaller
 {
 public:
+    bool Supported() const override { return false; }
+
     bool Launch(const fs::path& artifact, std::string& error) override
     {
-#ifdef Q_OS_MACOS
-        const QString path{QString::fromStdString(fs::PathToString(artifact))};
-        // Platform code-signature verification before anything runs.
-        if (path.endsWith(QStringLiteral(".pkg"))) {
-            if (QProcess::execute(QStringLiteral("/usr/sbin/spctl"),
-                                  {QStringLiteral("--assess"), QStringLiteral("--type"),
-                                   QStringLiteral("install"), path}) != 0) {
-                error = "update-install-signature";
-                return false;
-            }
-        } else if (QProcess::execute(QStringLiteral("/usr/bin/codesign"),
-                                     {QStringLiteral("--verify"), path}) != 0) {
-            error = "update-install-signature";
-            return false;
-        }
-        if (!QProcess::startDetached(QStringLiteral("/usr/bin/open"), {path})) {
-            error = "update-install-launch";
-            return false;
-        }
-        return true;
-#else
         (void)artifact;
         error = "update-install-unsupported-platform";
         return false;
-#endif
     }
 };
 
 class QSettingsSequenceStore : public update::SequenceStore
 {
 public:
-    uint64_t Load() override
+    bool Load(update::SequenceState& state, std::string& error) override
     {
-        return QSettings{}.value(SETTING_SEQUENCE, 0).toULongLong();
+        error.clear();
+        state = {};
+        QSettings settings;
+        settings.sync();
+        if (settings.status() != QSettings::NoError) {
+            error = "update-sequence-load";
+            return false;
+        }
+
+        if (!settings.contains(SETTING_SEQUENCE_RECORD)) {
+            // One-way compatibility with the original floor-only setting.
+            bool ok{false};
+            const qulonglong floor{settings.value(SETTING_SEQUENCE, qulonglong{0}).toULongLong(&ok)};
+            if (!ok) {
+                error = "update-sequence-load";
+                return false;
+            }
+            state.floor = static_cast<uint64_t>(floor);
+            return true;
+        }
+
+        const QStringList fields{settings.value(SETTING_SEQUENCE_RECORD).toString().split(':')};
+        bool floor_ok{false};
+        if (fields.size() < 3 || fields[0] != QStringLiteral("v1")) {
+            error = "update-sequence-state";
+            return false;
+        }
+        const qulonglong floor{fields[1].toULongLong(&floor_ok)};
+        if (!floor_ok) {
+            error = "update-sequence-state";
+            return false;
+        }
+        state.floor = static_cast<uint64_t>(floor);
+        if (fields.size() == 3 && fields[2] == QStringLiteral("none")) return true;
+        if (fields.size() != 4) {
+            error = "update-sequence-state";
+            return false;
+        }
+        bool pending_ok{false};
+        const qulonglong pending{fields[2].toULongLong(&pending_ok)};
+        const auto hash{uint256::FromHex(fields[3].toStdString())};
+        if (!pending_ok || pending == 0 || pending != floor || !hash) {
+            error = "update-sequence-state";
+            return false;
+        }
+        state.pending = update::PendingOffer{static_cast<uint64_t>(pending), *hash};
+        return true;
     }
-    void Store(uint64_t sequence) override
+
+    bool Store(const update::SequenceState& state, std::string& error) override
     {
-        QSettings{}.setValue(SETTING_SEQUENCE, static_cast<qulonglong>(sequence));
+        error.clear();
+        if (state.pending &&
+            (state.pending->sequence == 0 || state.pending->sequence != state.floor)) {
+            error = "update-sequence-state";
+            return false;
+        }
+        QString record{QStringLiteral("v1:%1:").arg(static_cast<qulonglong>(state.floor))};
+        if (state.pending) {
+            record += QStringLiteral("%1:%2")
+                          .arg(static_cast<qulonglong>(state.pending->sequence))
+                          .arg(QString::fromStdString(state.pending->payload_hash.GetHex()));
+        } else {
+            record += QStringLiteral("none");
+        }
+        QSettings settings;
+        settings.setValue(SETTING_SEQUENCE_RECORD, record);
+        settings.sync();
+        if (settings.status() != QSettings::NoError ||
+            settings.value(SETTING_SEQUENCE_RECORD).toString() != record) {
+            error = "update-sequence-store";
+            return false;
+        }
+        return true;
     }
 };
 
 update::UpdateConfig BuildConfig()
 {
     update::UpdateConfig c;
-    // Production values are explicit release inputs; nothing is invented
-    // here. Unset => the whole system stays quietly disabled.
+    // A release build may trust only keys and an endpoint pinned at compile
+    // time. None exist yet, so release builds remain fail-closed even when
+    // runtime arguments are supplied. Runtime trust is available solely to
+    // non-release developer builds for offline/integration testing.
+#if !CLIENT_VERSION_IS_RELEASE
     c.manifest_url = gArgs.GetArg("-hiveupdateurl", "");
     c.keys.threshold = static_cast<unsigned>(gArgs.GetIntArg("-hiveupdatethreshold", 2));
     for (const std::string& hex : gArgs.GetArgs("-hiveupdatekey")) {
@@ -141,6 +208,7 @@ update::UpdateConfig BuildConfig()
         const std::string h{update::HttpsHost(c.manifest_url)};
         if (!h.empty()) c.allowed_hosts.push_back(h);
     }
+#endif
 #if defined(Q_OS_MACOS)
     c.os = "macos";
     c.format = "dmg";
@@ -174,6 +242,12 @@ update::UpdateConfig BuildConfig()
 
 UpdateController::UpdateController(QObject* parent) : QObject{parent}
 {
+    m_auto_timer = new QTimer(this);
+    m_auto_timer->setSingleShot(true);
+    connect(m_auto_timer, &QTimer::timeout, this, [this] {
+        if (m_configured && autoCheckEnabled() && !m_busy.load()) checkNow();
+        if (m_configured && autoCheckEnabled()) ScheduleAutoCheck();
+    });
     m_transport = std::make_unique<QtUpdateTransport>();
     m_installer = std::make_unique<PlatformUpdateInstaller>();
     m_sequences = std::make_unique<QSettingsSequenceStore>();
@@ -182,15 +256,32 @@ UpdateController::UpdateController(QObject* parent) : QObject{parent}
     if (m_configured) {
         std::error_code ec;
         fs::create_directories(config.download_dir, ec);
+        if (ec) {
+            m_configured = false;
+            config.download_dir.clear();
+        }
     }
     m_manager = std::make_unique<update::UpdateManager>(
         std::move(config), *m_transport, *m_installer, *m_sequences,
         [] { return static_cast<int64_t>(::time(nullptr)); });
     m_state = m_manager->state();
-    if (m_configured && autoCheckEnabled()) ScheduleAutoCheck();
+    m_error = QString::fromStdString(m_manager->last_error());
+    if (m_configured && autoCheckEnabled()) {
+        QTimer::singleShot(INITIAL_CHECK_DELAY_MS, this, [this] {
+            if (m_configured && autoCheckEnabled() && !m_busy.load()) checkNow();
+        });
+        ScheduleAutoCheck();
+    }
 }
 
-UpdateController::~UpdateController() = default;
+UpdateController::~UpdateController()
+{
+    if (m_auto_timer) m_auto_timer->stop();
+    // The worker owns no QObject and is bounded by the network timeout. Join
+    // before members are destroyed so shutdown can never race a detached
+    // fetch against this controller or its manager.
+    if (m_worker.joinable()) m_worker.join();
+}
 
 QString UpdateController::installedVersion() const
 {
@@ -205,20 +296,28 @@ bool UpdateController::autoCheckEnabled() const
     return QSettings{}.value(SETTING_AUTO_CHECK, true).toBool();
 }
 
+bool UpdateController::installSupported() const
+{
+    return m_manager && m_manager->install_supported();
+}
+
 void UpdateController::setAutoCheckEnabled(bool enabled)
 {
     QSettings{}.setValue(SETTING_AUTO_CHECK, enabled);
-    if (enabled && m_configured) ScheduleAutoCheck();
+    if (!m_auto_timer) return;
+    if (enabled && m_configured) {
+        ScheduleAutoCheck();
+    } else {
+        m_auto_timer->stop();
+    }
 }
 
 void UpdateController::ScheduleAutoCheck()
 {
     // Randomized so a fleet never contacts the release host in unison.
     const int64_t delay{update::JitteredCheckInterval(AUTO_CHECK_BASE_SECONDS, FastRandomContext{}.rand64())};
-    QTimer::singleShot(static_cast<int>(delay * 1000 > INT32_MAX ? INT32_MAX : delay * 1000), this, [this] {
-        if (m_configured && autoCheckEnabled() && !m_busy.load()) checkNow();
-        if (m_configured && autoCheckEnabled()) ScheduleAutoCheck();
-    });
+    const int milliseconds{static_cast<int>(delay * 1000 > INT32_MAX ? INT32_MAX : delay * 1000)};
+    m_auto_timer->start(milliseconds);
 }
 
 void UpdateController::SyncSnapshot()
@@ -244,7 +343,10 @@ void UpdateController::RunOnWorker(int op)
 {
     bool expected{false};
     if (!m_busy.compare_exchange_strong(expected, true)) return;
-    std::thread{[this, op] {
+    if (m_worker.joinable()) m_worker.join();
+    m_state = op == 0 ? update::UpdateState::CHECKING : update::UpdateState::DOWNLOADING;
+    Q_EMIT stateChanged();
+    m_worker = std::thread{[this, op] {
         if (op == 0) {
             m_manager->CheckNow();
         } else {
@@ -254,7 +356,7 @@ void UpdateController::RunOnWorker(int op)
             m_busy.store(false);
             SyncSnapshot();
         }, Qt::QueuedConnection);
-    }}.detach();
+    }};
 }
 
 void UpdateController::checkNow()
@@ -265,13 +367,14 @@ void UpdateController::checkNow()
 
 void UpdateController::startDownload()
 {
-    if (m_manager->state() != update::UpdateState::UPDATE_AVAILABLE) return;
+    if (m_state != update::UpdateState::UPDATE_AVAILABLE) return;
     RunOnWorker(1);
 }
 
 void UpdateController::requestInstallAndRestart()
 {
     if (m_busy.load()) return;
+    if (!installSupported()) return;
     if (!m_manager->RequestInstall()) return;
     SyncSnapshot();
     Q_EMIT shutdownRequested();

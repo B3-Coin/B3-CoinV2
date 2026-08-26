@@ -109,6 +109,17 @@ BOOST_AUTO_TEST_CASE(unconfigured_fails_closed)
     // Threshold above available keys is also unconfigured.
     BOOST_CHECK(!ParseAndVerifyManifest(File(Payload(), {&s1}), ReleaseKeys{{s1.pub}, 2}, err));
     BOOST_CHECK_EQUAL(err, "update-keys-unconfigured");
+
+    // Repeating one authority in the configured vector must never turn one
+    // signature into a nominal 2-of-2 threshold.
+    BOOST_CHECK(!ParseAndVerifyManifest(File(Payload(), {&s1}),
+                                        ReleaseKeys{{s1.pub, s1.pub}, 2}, err));
+    BOOST_CHECK_EQUAL(err, "update-keys-unconfigured");
+
+    // Invalid x-only keys are configuration errors, not dormant signers.
+    BOOST_CHECK(!ParseAndVerifyManifest(File(Payload(), {&s1}),
+                                        ReleaseKeys{{XOnlyPubKey{}, s1.pub}, 1}, err));
+    BOOST_CHECK_EQUAL(err, "update-keys-unconfigured");
 }
 
 BOOST_AUTO_TEST_CASE(signature_matrix)

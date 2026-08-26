@@ -47,16 +47,35 @@ class UpdateInstaller
 {
 public:
     virtual ~UpdateInstaller() = default;
+    //! True only when Launch performs a complete, supported replacement and
+    //! restart flow. Merely opening a downloaded package is not support.
+    virtual bool Supported() const = 0;
     virtual bool Launch(const fs::path& verified_artifact, std::string& error) = 0;
 };
 
-//! Persistence for the last ACCEPTED manifest sequence (rollback floor).
+struct PendingOffer {
+    uint64_t sequence{0};
+    uint256 payload_hash{};
+    friend bool operator==(const PendingOffer&, const PendingOffer&) = default;
+};
+
+/** Durable rollback state. `floor` never decreases. `pending` identifies the
+ *  one exact signed manifest at the floor that may be offered again after a
+ *  download failure or process restart. A different manifest reusing the
+ *  sequence is still a rollback and must be rejected. */
+struct SequenceState {
+    uint64_t floor{0};
+    std::optional<PendingOffer> pending;
+    friend bool operator==(const SequenceState&, const SequenceState&) = default;
+};
+
+//! Atomic persistence for the rollback floor and pending-offer identity.
 class SequenceStore
 {
 public:
     virtual ~SequenceStore() = default;
-    virtual uint64_t Load() = 0;
-    virtual void Store(uint64_t sequence) = 0;
+    virtual bool Load(SequenceState& state, std::string& error) = 0;
+    virtual bool Store(const SequenceState& state, std::string& error) = 0;
 };
 
 struct UpdateConfig {
@@ -94,6 +113,7 @@ public:
     //! Release-notes digest of the offered manifest (for signed-notes display).
     std::optional<uint256> notes_digest() const;
     const std::optional<fs::path>& downloaded_path() const { return m_downloaded; }
+    bool install_supported() const { return m_installer.Supported(); }
 
     /** Automatic or "Check now". Quiet no-op when unconfigured. Network
      *  request carries nothing but the manifest URL itself (privacy). */
@@ -122,8 +142,10 @@ private:
     std::optional<Manifest> m_manifest;
     const Artifact* m_offered{nullptr};
     std::optional<fs::path> m_downloaded;
+    SequenceState m_sequences_state;
+    bool m_persistence_ready{false};
 
-    HostPolicy MakeHostPolicy() const;
+    HostPolicy MakeHostPolicy(bool exact_pending) const;
 };
 
 } // namespace update

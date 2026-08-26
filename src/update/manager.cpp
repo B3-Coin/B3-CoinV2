@@ -40,7 +40,24 @@ UpdateManager::UpdateManager(UpdateConfig config, UpdateTransport& transport,
       m_sequences{sequences},
       m_clock{std::move(clock)}
 {
-    m_state = m_config.Configured() ? UpdateState::IDLE : UpdateState::UNCONFIGURED;
+    if (!m_config.Configured()) {
+        m_state = UpdateState::UNCONFIGURED;
+        return;
+    }
+    if (!m_sequences.Load(m_sequences_state, m_error)) {
+        if (m_error.empty()) m_error = "update-sequence-load";
+        m_state = UpdateState::FAILED;
+        return;
+    }
+    if (m_sequences_state.pending &&
+        (m_sequences_state.pending->sequence == 0 ||
+         m_sequences_state.pending->sequence != m_sequences_state.floor)) {
+        m_error = "update-sequence-state";
+        m_state = UpdateState::FAILED;
+        return;
+    }
+    m_persistence_ready = true;
+    m_state = UpdateState::IDLE;
 }
 
 const Artifact* UpdateManager::available() const
@@ -54,7 +71,7 @@ std::optional<uint256> UpdateManager::notes_digest() const
     return m_manifest->notes_sha256;
 }
 
-HostPolicy UpdateManager::MakeHostPolicy() const
+HostPolicy UpdateManager::MakeHostPolicy(bool exact_pending) const
 {
     HostPolicy h;
     h.os = m_config.os;
@@ -62,7 +79,10 @@ HostPolicy UpdateManager::MakeHostPolicy() const
     h.format = m_config.format;
     h.channel = m_config.channel;
     h.installed = m_config.installed;
-    h.last_accepted_sequence = m_sequences.Load();
+    // The one exact pending manifest at the floor may be re-offered. Lower
+    // sequences and different bytes at the same sequence remain rejected.
+    h.last_accepted_sequence = exact_pending ? m_sequences_state.floor - 1
+                                             : m_sequences_state.floor;
     h.now = m_clock();
     h.allowed_hosts = m_config.allowed_hosts;
     h.max_artifact_bytes = m_config.max_artifact_bytes;
@@ -72,6 +92,7 @@ HostPolicy UpdateManager::MakeHostPolicy() const
 bool UpdateManager::CheckNow()
 {
     if (m_state == UpdateState::UNCONFIGURED) return false; // quiet fail-closed
+    if (!m_persistence_ready) return false; // never fetch without rollback state
     if (m_state == UpdateState::DOWNLOADING || m_state == UpdateState::AWAITING_SHUTDOWN ||
         m_state == UpdateState::INSTALLING) {
         return false; // never disturb an in-flight step
@@ -88,7 +109,11 @@ bool UpdateManager::CheckNow()
     auto manifest{ParseAndVerifyManifest(*bytes, m_config.keys, m_error)};
     if (!manifest) { m_state = UpdateState::FAILED; return false; }
     m_manifest = std::move(*manifest);
-    const Artifact* a{SelectArtifact(*m_manifest, MakeHostPolicy(), m_error)};
+    const bool exact_pending{
+        m_sequences_state.pending &&
+        m_manifest->sequence == m_sequences_state.pending->sequence &&
+        m_manifest->payload_hash == m_sequences_state.pending->payload_hash};
+    const Artifact* a{SelectArtifact(*m_manifest, MakeHostPolicy(exact_pending), m_error)};
     if (!a) {
         // "Nothing newer" outcomes are IDLE, not failures.
         const bool benign{m_error == "update-reject-not-newer" ||
@@ -97,9 +122,20 @@ bool UpdateManager::CheckNow()
         m_manifest.reset();
         return false;
     }
-    // Accept: the sequence floor rises NOW, so a replayed or older manifest
-    // can never be offered again even before installation.
-    m_sequences.Store(m_manifest->sequence);
+    if (!exact_pending) {
+        // Persist before publishing the offer. Storage failure is observable
+        // and fail-closed: no UI-visible offer may escape without a durable
+        // rollback floor and exact retry identity.
+        SequenceState next{m_manifest->sequence,
+                           PendingOffer{m_manifest->sequence, m_manifest->payload_hash}};
+        if (!m_sequences.Store(next, m_error)) {
+            if (m_error.empty()) m_error = "update-sequence-store";
+            m_manifest.reset();
+            m_state = UpdateState::FAILED;
+            return false;
+        }
+        m_sequences_state = next;
+    }
     m_offered = a;
     m_state = UpdateState::UPDATE_AVAILABLE;
     return true;
@@ -124,6 +160,10 @@ bool UpdateManager::StartDownload()
 bool UpdateManager::RequestInstall()
 {
     if (m_state != UpdateState::READY_TO_INSTALL || !m_downloaded) return false;
+    if (!m_installer.Supported()) {
+        m_error = "update-install-unsupported-platform";
+        return false;
+    }
     m_state = UpdateState::AWAITING_SHUTDOWN;
     return true;
 }

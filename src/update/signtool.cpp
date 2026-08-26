@@ -20,6 +20,7 @@
 #include <key.h>
 #include <pubkey.h>
 #include <update/manifest.h>
+#include <util/fs_helpers.h>
 #include <util/strencodings.h>
 
 #include <cstdio>
@@ -28,7 +29,14 @@
 #include <sstream>
 #include <string>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
 #include <sys/stat.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -76,15 +84,46 @@ int main(int argc, char** argv)
         CKey key;
         key.MakeNewKey(true);
         const std::string path{argv[2]};
-        {
-            std::ofstream f{path, std::ios::binary | std::ios::trunc};
-            if (!f) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); return 1; }
-            f << HexStr(std::span<const unsigned char>{
-                     reinterpret_cast<const unsigned char*>(key.begin()),
-                     static_cast<size_t>(key.size())})
-              << "\n";
+        const std::string key_text{HexStr(std::span<const unsigned char>{
+            reinterpret_cast<const unsigned char*>(key.begin()),
+            static_cast<size_t>(key.size())}) + "\n"};
+
+        // Create the secret file atomically and exclusively. Never truncate
+        // an existing path or follow a pre-planted symlink.
+#ifdef _WIN32
+        const int fd{::_open(path.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+                             _S_IREAD | _S_IWRITE)};
+#else
+        int flags{O_WRONLY | O_CREAT | O_EXCL};
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+        const int fd{::open(path.c_str(), flags, 0600)};
+#endif
+        if (fd < 0) { std::fprintf(stderr, "cannot create %s (path must not exist)\n", path.c_str()); return 1; }
+#ifdef _WIN32
+        FILE* file{::_fdopen(fd, "wb")};
+#else
+        FILE* file{::fdopen(fd, "wb")};
+#endif
+        if (!file) {
+#ifdef _WIN32
+            ::_close(fd);
+#else
+            ::close(fd);
+#endif
+            std::remove(path.c_str());
+            std::fprintf(stderr, "cannot open %s\n", path.c_str());
+            return 1;
         }
-        ::chmod(path.c_str(), 0600);
+        const bool written{std::fwrite(key_text.data(), 1, key_text.size(), file) == key_text.size() &&
+                           FileCommit(file)};
+        const bool closed{std::fclose(file) == 0};
+        if (!written || !closed) {
+            std::remove(path.c_str());
+            std::fprintf(stderr, "cannot safely write %s\n", path.c_str());
+            return 1;
+        }
         const XOnlyPubKey pub{key.GetPubKey()};
         std::printf("pubkey=%s\nkeyid=%s\n", HexStr(pub).c_str(), update::ReleaseKeyId(pub).c_str());
         return 0;

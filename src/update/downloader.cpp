@@ -7,6 +7,7 @@
 #include <crypto/sha256.h>
 #include <random.h>
 #include <util/fs.h>
+#include <util/fs_helpers.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -35,7 +36,7 @@ std::optional<std::string> FetchManifestBytes(UpdateTransport& transport, const 
     const bool ok{transport.Fetch(
         url,
         [&](std::string_view chunk) {
-            if (out.size() + chunk.size() > MAX_MANIFEST_BYTES) { overflow = true; return false; }
+            if (chunk.size() > MAX_MANIFEST_BYTES - out.size()) { overflow = true; return false; }
             out.append(chunk);
             return true;
         },
@@ -72,7 +73,10 @@ std::optional<fs::path> FetchArtifact(UpdateTransport& transport, const Artifact
     const bool ok{transport.Fetch(
         artifact.url,
         [&](std::string_view chunk) {
-            if (received + chunk.size() > artifact.size) { overflow = true; return false; }
+            if (received > artifact.size || chunk.size() > artifact.size - received) {
+                overflow = true;
+                return false;
+            }
             if (std::fwrite(chunk.data(), 1, chunk.size(), f) != chunk.size()) {
                 write_failed = true;
                 return false;
@@ -88,7 +92,7 @@ std::optional<fs::path> FetchArtifact(UpdateTransport& transport, const Artifact
         error)};
 
     auto fail = [&](const char* token) -> std::optional<fs::path> {
-        std::fclose(f);
+        if (f) std::fclose(f);
         fs::remove(tmp);
         if (error.empty() || token[0] != '\0') error = token;
         return std::nullopt;
@@ -97,16 +101,30 @@ std::optional<fs::path> FetchArtifact(UpdateTransport& transport, const Artifact
     if (write_failed) return fail("update-fetch-write");
     if (!ok) { if (error.empty()) error = "update-fetch-failed"; std::fclose(f); fs::remove(tmp); return std::nullopt; }
     if (received != artifact.size) return fail("update-fetch-truncated");
-    if (std::fflush(f) != 0) return fail("update-fetch-write");
+    if (!FileCommit(f)) return fail("update-fetch-write");
     uint256 got;
     hasher.Finalize(got.begin());
     if (got != artifact.sha256) return fail("update-fetch-digest");
-    std::fclose(f);
+    if (std::fclose(f) != 0) {
+        f = nullptr;
+        fs::remove(tmp);
+        error = "update-fetch-write";
+        return std::nullopt;
+    }
+    f = nullptr;
 
     const fs::path final_path{dir / fs::u8path("hive-update-" + got.GetHex() + "." + artifact.format)};
+    // A prior verified download, a crash residue, or an attacker-planted
+    // symlink may already occupy the digest-derived name. Remove that
+    // directory entry only after the replacement has been fully verified;
+    // this makes exact-offer retries work on platforms whose rename does not
+    // replace an existing destination and never follows a planted symlink.
     std::error_code ec;
+    fs::remove(final_path, ec);
+    if (ec) { fs::remove(tmp); error = "update-fetch-rename"; return std::nullopt; }
     fs::rename(tmp, final_path, ec); // atomic within the directory
     if (ec) { fs::remove(tmp); error = "update-fetch-rename"; return std::nullopt; }
+    DirectoryCommit(dir);
     return final_path;
 }
 

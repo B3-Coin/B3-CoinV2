@@ -72,7 +72,19 @@ struct Manifest {
 struct ReleaseKeys {
     std::vector<XOnlyPubKey> keys;
     unsigned threshold{0};
-    bool Configured() const { return threshold > 0 && keys.size() >= threshold; }
+    bool Configured() const
+    {
+        if (threshold == 0 || keys.size() < threshold) return false;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (!keys[i].IsFullyValid()) return false;
+            for (size_t j = 0; j < i; ++j) {
+                // A threshold counts distinct release authorities, never
+                // repeated vector slots containing the same authority.
+                if (keys[i] == keys[j]) return false;
+            }
+        }
+        return true;
+    }
 };
 
 //! First 4 bytes of the x-only key, lower-case hex — the manifest key id.

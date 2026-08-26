@@ -16,8 +16,8 @@ QT_END_NAMESPACE
 class UpdateController;
 
 /** The "B3 Hive update" section for the Settings page: installed version,
- *  latest verified version, release-notes digest, download size, Check
- *  now / Download update / Install and restart. Wording rule: always a
+ *  latest verified version, release-notes digest, download size and the
+ *  operations actually supported by this build. Wording rule: always a
  *  "B3 Hive update", never a "new wallet". Unconfigured builds show an
  *  honest disabled note and never touch the network. */
 class UpdatePanel : public QWidget
@@ -38,6 +38,7 @@ private:
     QLabel* m_notes{nullptr};
     QLabel* m_size{nullptr};
     QLabel* m_status{nullptr};
+    QLabel* m_install_note{nullptr};
     QPushButton* m_check{nullptr};
     QPushButton* m_download{nullptr};
     QPushButton* m_install{nullptr};

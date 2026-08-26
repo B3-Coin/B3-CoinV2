@@ -13,6 +13,7 @@
 #include <QLabel>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QVBoxLayout>
 
 using update::UpdateState;
@@ -36,7 +37,9 @@ UpdatePanel::UpdatePanel(UpdateController* controller, QWidget* parent)
 
     m_check = new QPushButton{tr("Check now"), this};
     m_download = new QPushButton{tr("Download update"), this};
-    m_install = new QPushButton{tr("Install and restart"), this};
+    m_install = new QPushButton{tr("Automatic install unavailable"), this};
+    m_install_note = new QLabel{this};
+    m_install_note->setWordWrap(true);
     m_auto = new QCheckBox{tr("Check for B3 Hive updates automatically"), this};
 
     auto* buttons{new QHBoxLayout};
@@ -48,6 +51,7 @@ UpdatePanel::UpdatePanel(UpdateController* controller, QWidget* parent)
     auto* v{new QVBoxLayout{box}};
     v->addLayout(form);
     v->addLayout(buttons);
+    v->addWidget(m_install_note);
     v->addWidget(m_auto);
 
     auto* outer{new QVBoxLayout{this}};
@@ -64,6 +68,7 @@ UpdatePanel::UpdatePanel(UpdateController* controller, QWidget* parent)
 
 void UpdatePanel::onInstallClicked()
 {
+    if (!m_controller->installSupported()) return;
     // Explicit warning before anything is interrupted: installing stops
     // synchronization, staking, validation and wallet activity.
     const auto answer{QMessageBox::question(
@@ -78,8 +83,24 @@ void UpdatePanel::onInstallClicked()
 void UpdatePanel::refresh()
 {
     m_installed->setText(m_controller->installedVersion());
+    const QSignalBlocker auto_blocker{m_auto};
     m_auto->setChecked(m_controller->autoCheckEnabled());
     m_auto->setEnabled(m_controller->configured());
+    const bool install_supported{m_controller->installSupported()};
+    m_install->setText(install_supported ? tr("Install and restart")
+                                         : tr("Automatic install unavailable"));
+    if (!m_controller->configured()) {
+        m_install_note->setText(
+            tr("Update checking and downloads are disabled because this build has no pinned "
+               "release channel."));
+    } else if (install_supported) {
+        m_install_note->setText(
+            tr("Installation closes B3 Hive cleanly, replaces the application, and restarts it."));
+    } else {
+        m_install_note->setText(
+            tr("This build can verify and download an update, but it cannot replace or restart "
+               "B3 Hive automatically. No automatic-install claim is made."));
+    }
 
     if (!m_controller->configured()) {
         m_status->setText(tr("Updates are not configured in this build."));
@@ -98,14 +119,18 @@ void UpdatePanel::refresh()
     m_check->setEnabled(!busy && (s == UpdateState::IDLE || s == UpdateState::UPDATE_AVAILABLE ||
                                   s == UpdateState::FAILED || s == UpdateState::READY_TO_INSTALL));
     m_download->setEnabled(!busy && s == UpdateState::UPDATE_AVAILABLE);
-    m_install->setEnabled(!busy && s == UpdateState::READY_TO_INSTALL);
+    m_install->setEnabled(install_supported && !busy && s == UpdateState::READY_TO_INSTALL);
 
     switch (s) {
     case UpdateState::IDLE: m_status->setText(tr("B3 Hive is up to date.")); break;
     case UpdateState::CHECKING: m_status->setText(tr("Checking…")); break;
     case UpdateState::UPDATE_AVAILABLE: m_status->setText(tr("A B3 Hive update is available.")); break;
     case UpdateState::DOWNLOADING: m_status->setText(tr("Downloading…")); break;
-    case UpdateState::READY_TO_INSTALL: m_status->setText(tr("Update downloaded and verified.")); break;
+    case UpdateState::READY_TO_INSTALL:
+        m_status->setText(install_supported
+                              ? tr("Update downloaded and verified; ready to install.")
+                              : tr("Update downloaded and verified. Automatic installation is unavailable."));
+        break;
     case UpdateState::AWAITING_SHUTDOWN: m_status->setText(tr("Waiting for orderly shutdown…")); break;
     case UpdateState::INSTALLING: m_status->setText(tr("Handing off to the installer…")); break;
     case UpdateState::FAILED:

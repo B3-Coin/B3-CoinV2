@@ -50,7 +50,9 @@ class RecordingInstaller : public UpdateInstaller
 public:
     int launches{0};
     bool fail{false};
+    bool supported{true};
     fs::path last_path;
+    bool Supported() const override { return supported; }
     bool Launch(const fs::path& artifact, std::string& error) override
     {
         ++launches;
@@ -63,9 +65,24 @@ public:
 class MemorySequences : public SequenceStore
 {
 public:
-    uint64_t value{0};
-    uint64_t Load() override { return value; }
-    void Store(uint64_t s) override { value = s; }
+    SequenceState value;
+    bool fail_load{false};
+    bool fail_store{false};
+    int stores{0};
+
+    bool Load(SequenceState& out, std::string& error) override
+    {
+        if (fail_load) { error = "test-sequence-load"; return false; }
+        out = value;
+        return true;
+    }
+    bool Store(const SequenceState& in, std::string& error) override
+    {
+        ++stores;
+        if (fail_store) { error = "test-sequence-store"; return false; }
+        value = in;
+        return true;
+    }
 };
 
 struct Rig {
@@ -169,7 +186,9 @@ BOOST_AUTO_TEST_CASE(full_flow_with_explicit_approvals)
     BOOST_REQUIRE(m.available());
     BOOST_CHECK_EQUAL(m.available()->version.ToString(), "31.1.1");
     BOOST_CHECK(m.notes_digest().has_value());
-    BOOST_CHECK_EQUAL(rig.sequences.value, 7U); // rollback floor raised on accept
+    BOOST_CHECK_EQUAL(rig.sequences.value.floor, 7U);
+    BOOST_REQUIRE(rig.sequences.value.pending);
+    BOOST_CHECK_EQUAL(rig.sequences.value.pending->sequence, 7U);
 
     // Install cannot be requested before a download exists.
     BOOST_CHECK(!m.RequestInstall());
@@ -205,22 +224,39 @@ BOOST_AUTO_TEST_CASE(same_or_older_release_is_idle)
     BOOST_CHECK(!m.CheckNow());
     BOOST_CHECK(m.state() == UpdateState::IDLE); // benign, not FAILED
     BOOST_CHECK(!m.available());
-    BOOST_CHECK_EQUAL(rig.sequences.value, 0U); // floor NOT raised on a non-offer
+    BOOST_CHECK_EQUAL(rig.sequences.value.floor, 0U); // floor NOT raised on a non-offer
 }
 
-BOOST_AUTO_TEST_CASE(replayed_sequence_never_offered_again)
+BOOST_AUTO_TEST_CASE(exact_pending_offer_retries_but_sequence_reuse_does_not)
 {
     Rig rig;
     const fs::path dir{m_args.GetDataDirBase() / "hive_updates3"};
     fs::create_directories(dir);
     rig.transport.manifest_bytes = rig.SignedManifest(7, "31.1.1");
     rig.transport.artifact_bytes = rig.artifact_body;
-    auto m{rig.Make(rig.Config(dir))};
-    BOOST_REQUIRE(m.CheckNow());
-    BOOST_CHECK_EQUAL(rig.sequences.value, 7U);
-    // The very same manifest replayed: rejected as rollback, benign IDLE.
-    BOOST_CHECK(!m.CheckNow());
-    BOOST_CHECK(m.state() == UpdateState::IDLE);
+    {
+        auto m{rig.Make(rig.Config(dir))};
+        BOOST_REQUIRE(m.CheckNow());
+        BOOST_CHECK_EQUAL(rig.sequences.value.floor, 7U);
+        BOOST_CHECK_EQUAL(rig.sequences.stores, 1);
+    }
+    // Restart: the exact signed bytes at the pending floor remain offerable,
+    // and do not rewrite the durable record.
+    {
+        auto m{rig.Make(rig.Config(dir))};
+        BOOST_REQUIRE_MESSAGE(m.CheckNow(), m.last_error());
+        BOOST_CHECK(m.state() == UpdateState::UPDATE_AVAILABLE);
+        BOOST_CHECK_EQUAL(rig.sequences.stores, 1);
+    }
+    // Reusing sequence 7 for different valid signed bytes is still rollback.
+    rig.transport.manifest_bytes = rig.SignedManifest(7, "31.1.2");
+    {
+        auto m{rig.Make(rig.Config(dir))};
+        BOOST_CHECK(!m.CheckNow());
+        BOOST_CHECK(m.state() == UpdateState::IDLE);
+        BOOST_CHECK_EQUAL(m.last_error(), "update-reject-rollback");
+        BOOST_CHECK(!m.available());
+    }
 }
 
 BOOST_AUTO_TEST_CASE(bad_signature_is_failed_state)
@@ -235,7 +271,7 @@ BOOST_AUTO_TEST_CASE(bad_signature_is_failed_state)
     BOOST_CHECK(!m.CheckNow());
     BOOST_CHECK(m.state() == UpdateState::FAILED);
     BOOST_CHECK(!m.last_error().empty());
-    BOOST_CHECK_EQUAL(rig.sequences.value, 0U);
+    BOOST_CHECK_EQUAL(rig.sequences.value.floor, 0U);
 }
 
 BOOST_AUTO_TEST_CASE(download_failure_recovers_and_install_failure_preserves)
@@ -246,9 +282,7 @@ BOOST_AUTO_TEST_CASE(download_failure_recovers_and_install_failure_preserves)
     rig.transport.manifest_bytes = rig.SignedManifest(7, "31.1.1");
     rig.transport.artifact_bytes = rig.artifact_body;
     rig.transport.fail_artifact = true;
-    // Sequence floor makes a re-check of the same manifest a rollback, so
-    // model the retry as a fresh manager (fresh floor), as a user reinstall
-    // attempt would be after a failed download of the SAME release.
+    // First process accepts the offer, then its download fails.
     {
         auto m{rig.Make(rig.Config(dir))};
         BOOST_REQUIRE(m.CheckNow());
@@ -257,7 +291,8 @@ BOOST_AUTO_TEST_CASE(download_failure_recovers_and_install_failure_preserves)
         BOOST_CHECK_EQUAL(rig.installer.launches, 0);
     }
     rig.transport.fail_artifact = false;
-    rig.sequences.value = 0;
+    // A fresh process reloads the durable pending identity and retries the
+    // same release without resetting or weakening the rollback floor.
     {
         auto m{rig.Make(rig.Config(dir))};
         BOOST_REQUIRE(m.CheckNow());
@@ -269,6 +304,63 @@ BOOST_AUTO_TEST_CASE(download_failure_recovers_and_install_failure_preserves)
         // The verified artifact is retained for a retry; nothing else changed.
         BOOST_CHECK(fs::exists(*m.downloaded_path()));
     }
+}
+
+BOOST_AUTO_TEST_CASE(sequence_persistence_failures_are_observable_and_fail_closed)
+{
+    Rig rig;
+    const fs::path dir{m_args.GetDataDirBase() / "hive_updates_storage"};
+    fs::create_directories(dir);
+    rig.transport.manifest_bytes = rig.SignedManifest(7, "31.1.1");
+
+    rig.sequences.fail_load = true;
+    {
+        auto m{rig.Make(rig.Config(dir))};
+        BOOST_CHECK(m.state() == UpdateState::FAILED);
+        BOOST_CHECK_EQUAL(m.last_error(), "test-sequence-load");
+        BOOST_CHECK(!m.CheckNow());
+        BOOST_CHECK_EQUAL(rig.transport.fetches, 0);
+    }
+
+    rig.sequences.fail_load = false;
+    rig.sequences.fail_store = true;
+    {
+        auto m{rig.Make(rig.Config(dir))};
+        BOOST_CHECK(m.state() == UpdateState::IDLE);
+        BOOST_CHECK(!m.CheckNow());
+        BOOST_CHECK(m.state() == UpdateState::FAILED);
+        BOOST_CHECK_EQUAL(m.last_error(), "test-sequence-store");
+        BOOST_CHECK(!m.available());
+        BOOST_CHECK_EQUAL(rig.sequences.value.floor, 0U);
+    }
+
+    rig.sequences.fail_store = false;
+    rig.sequences.value = SequenceState{7, PendingOffer{6, uint256{}}};
+    {
+        auto m{rig.Make(rig.Config(dir))};
+        BOOST_CHECK(m.state() == UpdateState::FAILED);
+        BOOST_CHECK_EQUAL(m.last_error(), "update-sequence-state");
+        BOOST_CHECK(!m.CheckNow());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(unsupported_installer_never_requests_shutdown_or_launches)
+{
+    Rig rig;
+    const fs::path dir{m_args.GetDataDirBase() / "hive_updates_unsupported"};
+    fs::create_directories(dir);
+    rig.transport.manifest_bytes = rig.SignedManifest(7, "31.1.1");
+    rig.transport.artifact_bytes = rig.artifact_body;
+    rig.installer.supported = false;
+    auto m{rig.Make(rig.Config(dir))};
+    BOOST_REQUIRE(m.CheckNow());
+    BOOST_REQUIRE(m.StartDownload());
+    BOOST_CHECK(!m.install_supported());
+    BOOST_CHECK(!m.RequestInstall());
+    BOOST_CHECK(m.state() == UpdateState::READY_TO_INSTALL);
+    BOOST_CHECK_EQUAL(m.last_error(), "update-install-unsupported-platform");
+    BOOST_CHECK(!m.OnShutdownComplete());
+    BOOST_CHECK_EQUAL(rig.installer.launches, 0);
 }
 
 BOOST_AUTO_TEST_CASE(jittered_interval_bounds)
