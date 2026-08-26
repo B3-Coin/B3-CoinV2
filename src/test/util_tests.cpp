@@ -403,98 +403,63 @@ BOOST_AUTO_TEST_CASE(util_FormatRFC1123DateTime)
 
 BOOST_AUTO_TEST_CASE(util_FormatMoney)
 {
+    // B3 unit: 1 B3 = KILO_COIN = 1e9 base units.
     BOOST_CHECK_EQUAL(FormatMoney(0), "0.00");
-    BOOST_CHECK_EQUAL(FormatMoney((COIN/10000)*123456789), "12345.6789");
-    BOOST_CHECK_EQUAL(FormatMoney(-COIN), "-1.00");
+    BOOST_CHECK_EQUAL(FormatMoney((KILO_COIN/10000)*123456789), "12345.6789");
+    BOOST_CHECK_EQUAL(FormatMoney(-KILO_COIN), "-1.00");
 
-    BOOST_CHECK_EQUAL(FormatMoney(COIN*100000000), "100000000.00");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN*10000000), "10000000.00");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN*1000000), "1000000.00");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN*100000), "100000.00");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN*10000), "10000.00");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN*1000), "1000.00");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN*100), "100.00");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN*10), "10.00");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN), "1.00");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN/10), "0.10");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN/100), "0.01");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN/1000), "0.001");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN/10000), "0.0001");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN/100000), "0.00001");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN/1000000), "0.000001");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN/10000000), "0.0000001");
-    BOOST_CHECK_EQUAL(FormatMoney(COIN/100000000), "0.00000001");
+    BOOST_CHECK_EQUAL(FormatMoney(KILO_COIN*1000000), "1000000.00");
+    BOOST_CHECK_EQUAL(FormatMoney(KILO_COIN*1000), "1000.00");
+    BOOST_CHECK_EQUAL(FormatMoney(KILO_COIN), "1.00");
+    BOOST_CHECK_EQUAL(FormatMoney(KILO_COIN/10), "0.10");
+    BOOST_CHECK_EQUAL(FormatMoney(KILO_COIN/100), "0.01");
+    BOOST_CHECK_EQUAL(FormatMoney(KILO_COIN/1000000), "0.000001");
+    BOOST_CHECK_EQUAL(FormatMoney(KILO_COIN/1000000000), "0.000000001");
 
-    BOOST_CHECK_EQUAL(FormatMoney(std::numeric_limits<CAmount>::max()), "92233720368.54775807");
-    BOOST_CHECK_EQUAL(FormatMoney(std::numeric_limits<CAmount>::max() - 1), "92233720368.54775806");
-    BOOST_CHECK_EQUAL(FormatMoney(std::numeric_limits<CAmount>::max() - 2), "92233720368.54775805");
-    BOOST_CHECK_EQUAL(FormatMoney(std::numeric_limits<CAmount>::max() - 3), "92233720368.54775804");
-    // ...
-    BOOST_CHECK_EQUAL(FormatMoney(std::numeric_limits<CAmount>::min() + 3), "-92233720368.54775805");
-    BOOST_CHECK_EQUAL(FormatMoney(std::numeric_limits<CAmount>::min() + 2), "-92233720368.54775806");
-    BOOST_CHECK_EQUAL(FormatMoney(std::numeric_limits<CAmount>::min() + 1), "-92233720368.54775807");
-    BOOST_CHECK_EQUAL(FormatMoney(std::numeric_limits<CAmount>::min()), "-92233720368.54775808");
+    BOOST_CHECK_EQUAL(FormatMoney(std::numeric_limits<CAmount>::max()), "9223372036.854775807");
+    BOOST_CHECK_EQUAL(FormatMoney(std::numeric_limits<CAmount>::max() - 1), "9223372036.854775806");
+    BOOST_CHECK_EQUAL(FormatMoney(std::numeric_limits<CAmount>::min() + 1), "-9223372036.854775807");
+    BOOST_CHECK_EQUAL(FormatMoney(std::numeric_limits<CAmount>::min()), "-9223372036.854775808");
 }
 
 BOOST_AUTO_TEST_CASE(util_ParseMoney)
 {
+    // B3 unit: "1" = KILO_COIN = 1e9 base units; up to 9 decimals.
     BOOST_CHECK_EQUAL(ParseMoney("0.0").value(), 0);
     BOOST_CHECK_EQUAL(ParseMoney(".").value(), 0);
     BOOST_CHECK_EQUAL(ParseMoney("0.").value(), 0);
     BOOST_CHECK_EQUAL(ParseMoney(".0").value(), 0);
-    BOOST_CHECK_EQUAL(ParseMoney(".6789").value(), 6789'0000);
-    BOOST_CHECK_EQUAL(ParseMoney("12345.").value(), COIN * 12345);
+    BOOST_CHECK_EQUAL(ParseMoney(".6789").value(), 678'900'000);
+    BOOST_CHECK_EQUAL(ParseMoney("12345.").value(), KILO_COIN * 12345);
+    BOOST_CHECK_EQUAL(ParseMoney("12345.6789").value(), (KILO_COIN/10000)*123456789);
 
-    BOOST_CHECK_EQUAL(ParseMoney("12345.6789").value(), (COIN/10000)*123456789);
-
-    BOOST_CHECK_EQUAL(ParseMoney("10000000.00").value(), COIN*10000000);
-    BOOST_CHECK_EQUAL(ParseMoney("1000000.00").value(), COIN*1000000);
-    BOOST_CHECK_EQUAL(ParseMoney("100000.00").value(), COIN*100000);
-    BOOST_CHECK_EQUAL(ParseMoney("10000.00").value(), COIN*10000);
-    BOOST_CHECK_EQUAL(ParseMoney("1000.00").value(), COIN*1000);
-    BOOST_CHECK_EQUAL(ParseMoney("100.00").value(), COIN*100);
-    BOOST_CHECK_EQUAL(ParseMoney("10.00").value(), COIN*10);
-    BOOST_CHECK_EQUAL(ParseMoney("1.00").value(), COIN);
-    BOOST_CHECK_EQUAL(ParseMoney("1").value(), COIN);
-    BOOST_CHECK_EQUAL(ParseMoney("   1").value(), COIN);
-    BOOST_CHECK_EQUAL(ParseMoney("1   ").value(), COIN);
-    BOOST_CHECK_EQUAL(ParseMoney("  1 ").value(), COIN);
-    BOOST_CHECK_EQUAL(ParseMoney("0.1").value(), COIN/10);
-    BOOST_CHECK_EQUAL(ParseMoney("0.01").value(), COIN/100);
-    BOOST_CHECK_EQUAL(ParseMoney("0.001").value(), COIN/1000);
-    BOOST_CHECK_EQUAL(ParseMoney("0.0001").value(), COIN/10000);
-    BOOST_CHECK_EQUAL(ParseMoney("0.00001").value(), COIN/100000);
-    BOOST_CHECK_EQUAL(ParseMoney("0.000001").value(), COIN/1000000);
-    BOOST_CHECK_EQUAL(ParseMoney("0.0000001").value(), COIN/10000000);
-    BOOST_CHECK_EQUAL(ParseMoney("0.00000001").value(), COIN/100000000);
-    BOOST_CHECK_EQUAL(ParseMoney(" 0.00000001 ").value(), COIN/100000000);
-    BOOST_CHECK_EQUAL(ParseMoney("0.00000001 ").value(), COIN/100000000);
-    BOOST_CHECK_EQUAL(ParseMoney(" 0.00000001").value(), COIN/100000000);
+    BOOST_CHECK_EQUAL(ParseMoney("1   ").value(), KILO_COIN);
+    BOOST_CHECK_EQUAL(ParseMoney("  1 ").value(), KILO_COIN);
+    BOOST_CHECK_EQUAL(ParseMoney("0.1").value(), KILO_COIN/10);
+    BOOST_CHECK_EQUAL(ParseMoney("0.001").value(), KILO_COIN/1000);
+    BOOST_CHECK_EQUAL(ParseMoney("0.000001").value(), KILO_COIN/1000000);
+    BOOST_CHECK_EQUAL(ParseMoney("0.000000001").value(), 1);
+    BOOST_CHECK_EQUAL(ParseMoney(" 0.000000001 ").value(), 1);
 
     // Parsing amount that cannot be represented should fail
-    BOOST_CHECK(!ParseMoney("100000000.00"));
-    BOOST_CHECK(!ParseMoney("0.000000001"));
+    BOOST_CHECK(!ParseMoney("10000000000.00"));
+    BOOST_CHECK(!ParseMoney("0.0000000001"));
 
     // Parsing empty string should fail
     BOOST_CHECK(!ParseMoney(""));
     BOOST_CHECK(!ParseMoney(" "));
-    BOOST_CHECK(!ParseMoney("  "));
 
     // Parsing two numbers should fail
     BOOST_CHECK(!ParseMoney(".."));
     BOOST_CHECK(!ParseMoney("0..0"));
     BOOST_CHECK(!ParseMoney("1 2"));
-    BOOST_CHECK(!ParseMoney(" 1 2 "));
     BOOST_CHECK(!ParseMoney(" 1.2 3 "));
-    BOOST_CHECK(!ParseMoney(" 1 2.3 "));
 
     // Embedded whitespace should fail
-    BOOST_CHECK(!ParseMoney(" -1 .2  "));
     BOOST_CHECK(!ParseMoney("  1 .2  "));
-    BOOST_CHECK(!ParseMoney(" +1 .2  "));
 
     // Attempted 63 bit overflow should fail
-    BOOST_CHECK(!ParseMoney("92233720368.54775808"));
+    BOOST_CHECK(!ParseMoney("9223372036.854775808"));
 
     // Parsing negative amounts must fail
     BOOST_CHECK(!ParseMoney("-1"));

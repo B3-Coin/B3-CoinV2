@@ -139,7 +139,7 @@ fi
 
 if [[ "$CI_OS_NAME" == "macos" && "${GOAL}" = "install deploy" ]]; then
   unzip "${BASE_BUILD_DIR}/b3coin-macos-app.zip" -d "${BASE_BUILD_DIR}/deploy"
-  if ! ( codesign --verify "${BASE_BUILD_DIR}/deploy/B3Coin Core.app" ); then
+  if ! ( codesign --verify "${BASE_BUILD_DIR}/deploy/B3 Hive.app" ); then
     echo "Codesigning failed."
     false
   fi
