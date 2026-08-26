@@ -25,7 +25,29 @@ release.
   (hardware-backed) recommended; the address can be rotated only by
   release.
 
-## Modern PoS reward — mechanism RULED 2026-08-26: HALVING SCHEDULE
+## Modern PoS reward — RULED 2026-08-26 (mechanism AND numbers)
+
+Owner pins (2026-08-26, second ruling of the day):
+
+- **Initial annual rate: 1% of S_H** — `R0 = floor(S_H * 1% / 525,600)`
+  atomic units per block, with `S_H` = the MEASURED total supply at
+  H = 810,000 from the final U==U' capture (never assumed).
+- **Halving interval: 525,600 blocks = one year** at the 60 s target
+  spacing ("halving every year"): `reward(h) = R0 >> floor((h - M)/525,600)`.
+- **Corridor reward: 0 + fees.** The 1,000 PoW corridor blocks carry no
+  subsidy at all — fees only. No new coins exist until Modern PoS begins
+  at M = 811,001.
+- Split: 90% producer / 10% treasury per block (standing proposal,
+  applied unless the owner objects); all tx + payload fees to the
+  producer; treasury share pays to the single ruled treasury address.
+
+Consequences, reported: total lifetime emission converges to ~**2% of
+S_H ever** (1% + 0.5% + 0.25% + ...) — an exceptionally scarce schedule;
+the staking security budget decays quickly (year 1 = 1%, year 3 = 0.25%),
+so transaction + FlowMesh fee flow must become the dominant validator
+income within a few years. This is the accepted trade-off of the ruling.
+
+## (superseded earlier note) mechanism RULED 2026-08-26: HALVING SCHEDULE
 
 The owner ruled a Bitcoin-style halving emission (rejecting the constant
 tail-emission recommendation). Mechanism locked; NUMBERS still PROPOSED:
