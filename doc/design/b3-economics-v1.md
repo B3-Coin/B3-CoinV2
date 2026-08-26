@@ -17,9 +17,14 @@ release.
   implementation; pinned like other release parameters).
 - **Issuance fees pay to the treasury address** (supersedes the earlier
   burn recommendation).
-- **FlowMesh trading fees pay to the same treasury address**, on the
-  proposed 5 bps taker / 2 bps maker schedule (bps numbers themselves
-  still PROPOSED until pinned).
+- **FlowMesh trading fee RULED 2026-08-26: 0.01% (1 basis point) flat**,
+  split **80% to FlowMesh / 20% to the dev treasury address** —
+  superseding the earlier 5/2 bps 70/20/10 proposal. Recipient detail of
+  the 80% FlowMesh share (FN seat operators per the three-role model vs
+  a broader participant pool) to be confirmed when the DEX fee engine is
+  wired; the 20% pays the same single treasury address as everything
+  else. A maker/taker distinction is deliberately absent (one flat bp);
+  refining it later is an owner option, not a requirement.
 - Reported trade-off, accepted by the ruling's simplicity mandate: a
   single key is a single point of compromise/loss; strong key hygiene
   (hardware-backed) recommended; the address can be rotated only by
