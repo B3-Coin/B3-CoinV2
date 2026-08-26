@@ -52,7 +52,7 @@ B3AssetRecord NativeRecord()
     record.confirmed = 2'100'000'000'000'000LL;
     record.pending = 1;
     record.available = 2'100'000'000'000'000LL;
-    record.decimals = 8;
+    record.decimals = 9;
     record.metadata_known = true;
     record.status = B3AssetRecord::Status::Native;
     return record;
@@ -116,11 +116,19 @@ void B3AssetTests::nativeOnlySourceEnablesOnlySupportedActions()
 
     bool mesh_note{false};
     for (const QLabel* label : page.findChildren<QLabel*>()) {
-        if (label->text().contains(QStringLiteral("no FlowMesh")) && label->isVisibleTo(&page)) {
+        if (label->text().contains(QStringLiteral("not active")) && label->isVisibleTo(&page)) {
             mesh_note = true;
         }
     }
     QVERIFY(mesh_note);
+
+    // Data availability is not an approved deposit/withdraw action path.
+    // Even a source advertising FlowMesh data must not make disconnected
+    // controls look executable.
+    source.setMeshAvailable(true);
+    source.set({NativeRecord()});
+    QVERIFY(!deposit->isEnabled());
+    QVERIFY(!withdraw->isEnabled());
 
     // FlowMesh/reserved balances are "Not available", never a fake zero.
     int not_available{0};

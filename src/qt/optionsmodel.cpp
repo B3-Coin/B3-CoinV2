@@ -190,13 +190,10 @@ bool OptionsModel::Init(bilingual_str& error)
     if (!settings.contains("DisplayBitcoinUnit")) {
         settings.setValue("DisplayBitcoinUnit", QVariant::fromValue(BitcoinUnit::BTC));
     }
-    QVariant unit = settings.value("DisplayBitcoinUnit");
-    if (unit.canConvert<BitcoinUnit>()) {
-        m_display_bitcoin_unit = unit.value<BitcoinUnit>();
-    } else {
-        m_display_bitcoin_unit = BitcoinUnit::BTC;
-        settings.setValue("DisplayBitcoinUnit", QVariant::fromValue(m_display_bitcoin_unit));
-    }
+    // B3 has one human-facing unit. Migrate any legacy display preference to
+    // B3 without changing wallet amounts or on-chain base-unit semantics.
+    m_display_bitcoin_unit = BitcoinUnit::BTC;
+    settings.setValue("DisplayBitcoinUnit", QVariant::fromValue(m_display_bitcoin_unit));
 
     if (!settings.contains("strThirdPartyTxUrls"))
         settings.setValue("strThirdPartyTxUrls", "");
@@ -695,8 +692,12 @@ bool OptionsModel::setOption(OptionID option, const QVariant& value, const std::
 
 void OptionsModel::setDisplayUnit(const QVariant& new_unit)
 {
-    if (new_unit.isNull() || new_unit.value<BitcoinUnit>() == m_display_bitcoin_unit) return;
-    m_display_bitcoin_unit = new_unit.value<BitcoinUnit>();
+    if (new_unit.isNull()) return;
+    const BitcoinUnit requested{new_unit.value<BitcoinUnit>()};
+    const BitcoinUnit normalized{BitcoinUnit::BTC};
+    if (normalized == m_display_bitcoin_unit) return;
+    (void)requested;
+    m_display_bitcoin_unit = normalized;
     QSettings settings;
     settings.setValue("DisplayBitcoinUnit", QVariant::fromValue(m_display_bitcoin_unit));
     Q_EMIT displayUnitChanged(m_display_bitcoin_unit);

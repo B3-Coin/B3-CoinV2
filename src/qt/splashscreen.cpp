@@ -327,7 +327,7 @@ void SplashScreen::paintEvent(QPaintEvent *event)
         painter.drawEllipse(nodePos(node), 2.2, 2.2);
     }
 
-    // The B3 mark and the B3FlowMesh wordmark fade in as the mesh
+    // The B3 mark and B3 Hive product name fade in as the mesh
     // converges.
     const qreal mark_alpha = phaseProgress(now, kMarkStartMs, kMarkFadeMs);
     if (mark_alpha > 0.0) {
@@ -343,7 +343,7 @@ void SplashScreen::paintEvent(QPaintEvent *event)
         painter.setFont(brandFont);
         painter.setPen(B3Theme::kTextPrimary);
         painter.drawText(QRectF(0, center.y() + markSize.height() / 2.0 + 6, w, 28),
-                         Qt::AlignHCenter | Qt::AlignTop, QStringLiteral("B3FlowMesh"));
+                         Qt::AlignHCenter | Qt::AlignTop, QStringLiteral("B3 Hive"));
         painter.setOpacity(1.0);
     }
 

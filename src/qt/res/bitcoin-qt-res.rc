@@ -1,7 +1,7 @@
 IDI_ICON1 ICON DISCARDABLE "icons/bitcoin.ico"
-IDI_ICON2 ICON DISCARDABLE "icons/bitcoin_testnet.ico"
-IDI_ICON3 ICON DISCARDABLE "icons/bitcoin_signet.ico"
-IDI_ICON4 ICON DISCARDABLE "icons/bitcoin_testnet.ico" // testnet4
+IDI_ICON2 ICON DISCARDABLE "icons/bitcoin.ico"
+IDI_ICON3 ICON DISCARDABLE "icons/bitcoin.ico"
+IDI_ICON4 ICON DISCARDABLE "icons/bitcoin.ico" // testnet4
 
 #include <windows.h>             // needed for VERSIONINFO
 #include "../../clientversion.h" // holds the needed client version information
@@ -21,14 +21,14 @@ BEGIN
     BEGIN
         BLOCK "040904E4" // U.S. English - multilingual (hex)
         BEGIN
-            VALUE "CompanyName",        CLIENT_NAME " project"
-            VALUE "FileDescription",    CLIENT_NAME " (GUI node for B3Coin)"
+            VALUE "CompanyName",        "B3 FlowMesh project"
+            VALUE "FileDescription",    "B3 Hive desktop client for B3 FlowMesh"
             VALUE "FileVersion",        VER_FILEVERSION_STR
             VALUE "InternalName",       "b3coin-qt"
             VALUE "LegalCopyright",     COPYRIGHT_STR
             VALUE "LegalTrademarks1",   "Distributed under the MIT software license, see the accompanying file COPYING or http://www.opensource.org/licenses/mit-license.php."
             VALUE "OriginalFilename",   "b3coin-qt.exe"
-            VALUE "ProductName",        CLIENT_NAME
+            VALUE "ProductName",        "B3 Hive"
             VALUE "ProductVersion",     VER_PRODUCTVERSION_STR
         END
     END

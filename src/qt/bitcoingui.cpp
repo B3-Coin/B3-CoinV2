@@ -263,7 +263,17 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         frameBlocksLayout->addStretch();
         frameBlocksLayout->addWidget(unitDisplayControl);
         frameBlocksLayout->addStretch();
-        frameBlocksLayout->addWidget(labelWalletEncryptionIcon);
+        if (m_shell) {
+            // Reuse the existing wallet-model-driven encryption indicator in
+            // the B3 Hive topbar. There is one source of truth and no copied
+            // lock state; only its presentation host changes.
+            labelWalletEncryptionIcon->setObjectName(QStringLiteral("B3WalletSecurity"));
+            labelWalletEncryptionIcon->setAlignment(Qt::AlignCenter);
+            labelWalletEncryptionIcon->setFixedSize(36, 36);
+            m_shell->topStatus()->addTrailingWidget(labelWalletEncryptionIcon);
+        } else {
+            frameBlocksLayout->addWidget(labelWalletEncryptionIcon);
+        }
         labelWalletEncryptionIcon->hide();
         frameBlocksLayout->addWidget(labelWalletHDStatusIcon);
         labelWalletHDStatusIcon->hide();
@@ -288,7 +298,7 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
     QString curStyle = QApplication::style()->metaObject()->className();
     if(curStyle == "QWindowsStyle" || curStyle == "QWindowsXPStyle")
     {
-        progressBar->setStyleSheet("QProgressBar { background-color: #e8e8e8; border: 1px solid grey; border-radius: 7px; padding: 1px; text-align: center; } QProgressBar::chunk { background: QLinearGradient(x1: 0, y1: 0, x2: 1, y2: 0, stop: 0 #FF8000, stop: 1 orange); border-radius: 7px; margin: 0px; }");
+        progressBar->setStyleSheet("QProgressBar { background-color:#111210; color:#f3f0e8; border:1px solid #45443b; border-radius:7px; padding:1px; text-align:center; } QProgressBar::chunk { background:QLinearGradient(x1:0, y1:0, x2:1, y2:0, stop:0 #f1bd47, stop:1 #e39b43); border-radius:7px; margin:0px; }");
     }
 
     statusBar()->addWidget(progressBarLabel);
@@ -1593,12 +1603,14 @@ void BitcoinGUI::setEncryptionStatus(int status)
     {
     case WalletModel::NoKeys:
         labelWalletEncryptionIcon->hide();
+        labelWalletEncryptionIcon->setAccessibleName(tr("Watch-only wallet"));
         encryptWalletAction->setChecked(false);
         changePassphraseAction->setEnabled(false);
         encryptWalletAction->setEnabled(false);
         break;
     case WalletModel::Unencrypted:
         labelWalletEncryptionIcon->hide();
+        labelWalletEncryptionIcon->setAccessibleName(tr("Wallet is not encrypted"));
         encryptWalletAction->setChecked(false);
         changePassphraseAction->setEnabled(false);
         encryptWalletAction->setEnabled(true);
@@ -1607,6 +1619,7 @@ void BitcoinGUI::setEncryptionStatus(int status)
         labelWalletEncryptionIcon->show();
         labelWalletEncryptionIcon->setThemedPixmap(QStringLiteral(":/icons/lock_open"), STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE);
         labelWalletEncryptionIcon->setToolTip(tr("Wallet is <b>encrypted</b> and currently <b>unlocked</b>"));
+        labelWalletEncryptionIcon->setAccessibleName(tr("Wallet unlocked"));
         encryptWalletAction->setChecked(true);
         changePassphraseAction->setEnabled(true);
         encryptWalletAction->setEnabled(false);
@@ -1615,6 +1628,7 @@ void BitcoinGUI::setEncryptionStatus(int status)
         labelWalletEncryptionIcon->show();
         labelWalletEncryptionIcon->setThemedPixmap(QStringLiteral(":/icons/lock_closed"), STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE);
         labelWalletEncryptionIcon->setToolTip(tr("Wallet is <b>encrypted</b> and currently <b>locked</b>"));
+        labelWalletEncryptionIcon->setAccessibleName(tr("Wallet locked"));
         encryptWalletAction->setChecked(true);
         changePassphraseAction->setEnabled(true);
         encryptWalletAction->setEnabled(false);

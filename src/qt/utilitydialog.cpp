@@ -57,11 +57,11 @@ HelpMessageDialog::HelpMessageDialog(QWidget *parent, bool about) :
         ui->helpMessage->setVisible(false);
     } else {
         setWindowTitle(tr("Command-line options"));
-        QString header = "The bitcoin-qt application provides a graphical interface for interacting with " HIVE_NAME ".\n\n"
-                         "It combines the core functionalities of bitcoind with a user-friendly interface for wallet management, transaction history, and network statistics.\n\n"
+        QString header = "B3 Hive is the desktop client for B3 FlowMesh.\n\n"
+                         "It combines node operation with wallet management, transaction history, and network status in one interface.\n\n"
                          "It is suitable for users who prefer a graphical over a command-line interface.\n\n"
                          "You can optionally specify a payment [URI], in e.g. the BIP21 URI format.\n\n"
-                         "Usage: bitcoin-qt [options] [URI]\n\n";
+                         "Usage: b3coin-qt [options] [URI]\n\n";
         QTextCursor cursor(ui->helpMessage->document());
         cursor.insertText(version);
         cursor.insertBlock();

@@ -40,7 +40,8 @@ QList<B3AssetRecord> B3NativeAssetSource::assets() const
     native.flowmesh = 0;
     native.reserved_available = false;
     native.flowmesh_available = false;
-    native.decimals = 8;
+    // The locked human-facing B3 denomination is 1 B3 = 1e9 base units.
+    native.decimals = 9;
     native.metadata_known = true;
     native.status = B3AssetRecord::Status::Native;
     return {native};

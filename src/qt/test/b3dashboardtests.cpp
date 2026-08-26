@@ -91,7 +91,7 @@ void B3DashboardTests::balancesRenderLargeValuesAndPrivacy()
     QVERIFY(!found_unmasked);
 }
 
-void B3DashboardTests::immatureRowOnlyWhenNonZero()
+void B3DashboardTests::immatureRowReflectsActualBalance()
 {
     auto style = TestStyle();
     B3DashboardPage page(style.get());
@@ -100,15 +100,17 @@ void B3DashboardTests::immatureRowOnlyWhenNonZero()
     balances.balance = 5 * COIN;
     balances.immature_balance = 0;
     page.setBalance(balances);
-    // The immature row stays hidden when there is nothing immature.
+    // The approved wallet card always carries the row; zero is a real value,
+    // not fabricated data or an unavailable state.
     int visible_immature{0};
     for (const QLabel* label : page.findChildren<QLabel*>()) {
         if (label->text() == QStringLiteral("Immature") && label->isVisibleTo(&page)) ++visible_immature;
     }
-    QCOMPARE(visible_immature, 0);
+    QCOMPARE(visible_immature, 1);
 
     balances.immature_balance = COIN;
     page.setBalance(balances);
+    visible_immature = 0;
     for (const QLabel* label : page.findChildren<QLabel*>()) {
         if (label->text() == QStringLiteral("Immature") && label->isVisibleTo(&page)) ++visible_immature;
     }
@@ -153,7 +155,16 @@ void B3DashboardTests::clientViewSlotsRenderWithoutNode()
     QVERIFY(progress->isVisibleTo(&page));
 
     page.setNumBlocks(400, QDateTime::currentDateTime(), 1.0, SyncType::BLOCK_SYNC, SynchronizationState::POST_INIT);
-    QVERIFY(!progress->isVisibleTo(&page));
+    QVERIFY(progress->isVisibleTo(&page));
+    QCOMPARE(progress->value(), 1000);
+    auto* era_height = page.findChild<QLabel*>(QStringLiteral("dashboardEraHeight"));
+    QVERIFY(era_height != nullptr);
+    const QString connected_height{era_height->text()};
+
+    // A header tip can be far ahead; it must not masquerade as the connected
+    // chain height or change the era card.
+    page.setNumBlocks(900, QDateTime::currentDateTime(), 1.0, SyncType::HEADER_SYNC, SynchronizationState::INIT_DOWNLOAD);
+    QCOMPARE(era_height->text(), connected_height);
 
     page.setNumConnections(0);
     page.setNetworkActive(false);

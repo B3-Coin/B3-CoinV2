@@ -184,9 +184,24 @@ void B3ChartWidget::paintEvent(QPaintEvent*)
 
     const int n = m_series ? m_series->count() : 0;
     if (n == 0) {
+        // Preserve the chart's visual structure without implying that any
+        // market, price, or axis value exists. These lines are decorative.
+        QColor grid{B3Theme::kBorder};
+        grid.setAlpha(120);
+        painter.setPen(grid);
+        constexpr int grid_columns{6};
+        constexpr int grid_rows{4};
+        for (int column = 1; column < grid_columns; ++column) {
+            const int x = width() * column / grid_columns;
+            painter.drawLine(x, 0, x, height());
+        }
+        for (int row = 1; row < grid_rows; ++row) {
+            const int y = height() * row / grid_rows;
+            painter.drawLine(0, y, width(), y);
+        }
         painter.setPen(B3Theme::kTextSecondary);
         painter.drawText(rect(), Qt::AlignCenter,
-                         tr("No market data available.\nCharts activate when a market data backend is connected."));
+                         tr("◇\nNo market data available\nCharts activate only with an approved data backend."));
         return;
     }
 

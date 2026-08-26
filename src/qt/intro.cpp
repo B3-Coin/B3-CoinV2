@@ -195,7 +195,7 @@ void Intro::setStatus(int status, const QString &message, quint64 bytesAvailable
         break;
     case FreespaceChecker::ST_ERROR:
         ui->errorMessage->setText(tr("Error") + ": " + message);
-        ui->errorMessage->setStyleSheet("QLabel { color: #800000 }");
+        ui->errorMessage->setStyleSheet("QLabel { color: #e17072 }");
         break;
     }
     /* Indicate number of bytes available */
@@ -218,10 +218,10 @@ void Intro::UpdateFreeSpaceLabel()
     QString freeString = tr("%n GB of space available", "", m_bytes_available / GB_BYTES);
     if (m_bytes_available < m_required_space_gb * GB_BYTES) {
         freeString += " " + tr("(of %n GB needed)", "", m_required_space_gb);
-        ui->freeSpace->setStyleSheet("QLabel { color: #800000 }");
+        ui->freeSpace->setStyleSheet("QLabel { color: #e17072 }");
     } else if (m_bytes_available / GB_BYTES - m_required_space_gb < 10) {
         freeString += " " + tr("(%n GB needed for full chain)", "", m_required_space_gb);
-        ui->freeSpace->setStyleSheet("QLabel { color: #999900 }");
+        ui->freeSpace->setStyleSheet("QLabel { color: #e39b43 }");
     } else {
         ui->freeSpace->setStyleSheet("");
     }

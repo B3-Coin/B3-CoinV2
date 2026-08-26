@@ -13,8 +13,10 @@ class WalletModel;
 
 QT_BEGIN_NAMESPACE
 class QLabel;
+class QGridLayout;
 class QLineEdit;
 class QPushButton;
+class QResizeEvent;
 class QSortFilterProxyModel;
 class QTableView;
 QT_END_NAMESPACE
@@ -50,6 +52,9 @@ private Q_SLOTS:
     void updateDetails();
 
 private:
+    void resizeEvent(QResizeEvent* event) override;
+    void reflowCards(int width);
+
     B3AssetTableModel* m_model{nullptr};
     QSortFilterProxyModel* m_proxy{nullptr};
     B3AssetSource* m_owned_source{nullptr};
@@ -72,6 +77,11 @@ private:
     QPushButton* m_withdraw{nullptr};
     QLabel* m_backend_note{nullptr};
     QLabel* m_activity_note{nullptr};
+
+    QGridLayout* m_columns{nullptr};
+    QWidget* m_list_card{nullptr};
+    QWidget* m_detail_card{nullptr};
+    int m_layout_columns{0};
 };
 
 #endif // BITCOIN_QT_B3ASSETSPAGE_H

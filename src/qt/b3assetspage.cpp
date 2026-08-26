@@ -13,11 +13,15 @@
 
 #include <QFontMetrics>
 #include <QFrame>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QResizeEvent>
+#include <QScrollArea>
+#include <QSizePolicy>
 #include <QSortFilterProxyModel>
 #include <QTableView>
 #include <QVBoxLayout>
@@ -41,34 +45,64 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
     m_proxy->setFilterCaseSensitivity(Qt::CaseInsensitive);
     m_proxy->setFilterKeyColumn(-1); // search across name and ticker
 
-    auto* layout = new QVBoxLayout(this);
-    layout->setContentsMargins(B3Theme::kSpaceLg, B3Theme::kSpaceLg, B3Theme::kSpaceLg, B3Theme::kSpaceLg);
-    layout->setSpacing(B3Theme::kSpaceMd);
+    auto* outer = new QVBoxLayout(this);
+    outer->setContentsMargins(0, 0, 0, 0);
 
-    auto* heading = new QLabel(tr("Assets"), this);
+    auto* scroll = new QScrollArea(this);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    outer->addWidget(scroll);
+
+    auto* content = new QWidget(scroll);
+    content->setObjectName(QStringLiteral("assetsViewport"));
+    auto* layout = new QVBoxLayout(content);
+    layout->setContentsMargins(B3Theme::kSpaceLg, B3Theme::kSpaceLg,
+                               B3Theme::kSpaceLg, B3Theme::kSpaceXl);
+    layout->setSpacing(B3Theme::kSpaceLg);
+
+    auto* eyebrow = new QLabel(tr("PORTFOLIO"), content);
+    B3Theme::markTextRole(eyebrow, QStringLiteral("eyebrow"));
+    layout->addWidget(eyebrow);
+    auto* heading = new QLabel(tr("Assets"), content);
     B3Theme::markTextRole(heading, QStringLiteral("h1"));
     layout->addWidget(heading);
+    auto* introduction = new QLabel(
+        tr("Native B3 is available now. Additional assets and FlowMesh balances appear only when a verified backend provides them."),
+        content);
+    introduction->setWordWrap(true);
+    B3Theme::markTextRole(introduction, QStringLiteral("secondary"));
+    layout->addWidget(introduction);
 
-    auto* columns = new QHBoxLayout();
-    columns->setSpacing(B3Theme::kSpaceMd);
+    m_columns = new QGridLayout();
+    m_columns->setContentsMargins(0, 0, 0, 0);
+    m_columns->setHorizontalSpacing(B3Theme::kSpaceMd);
+    m_columns->setVerticalSpacing(B3Theme::kSpaceMd);
 
     // Left: searchable asset list.
-    auto* listCard = new QFrame(this);
-    B3Theme::markCard(listCard);
+    m_list_card = new QFrame(content);
+    m_list_card->setObjectName(QStringLiteral("assetsListCard"));
+    B3Theme::markCard(m_list_card);
+    m_list_card->setProperty("b3surface", QStringLiteral("panel"));
+    m_list_card->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     {
-        auto* listLayout = new QVBoxLayout(listCard);
-        listLayout->setContentsMargins(B3Theme::kSpaceMd, B3Theme::kSpaceMd, B3Theme::kSpaceMd, B3Theme::kSpaceMd);
+        auto* listLayout = new QVBoxLayout(m_list_card);
+        listLayout->setContentsMargins(B3Theme::kSpaceLg, B3Theme::kSpaceLg,
+                                       B3Theme::kSpaceLg, B3Theme::kSpaceLg);
         listLayout->setSpacing(B3Theme::kSpaceSm);
 
-        m_search = new QLineEdit(listCard);
+        auto* listTitle = new QLabel(tr("Your assets"), m_list_card);
+        B3Theme::markTextRole(listTitle, QStringLiteral("h3"));
+        listLayout->addWidget(listTitle);
+
+        m_search = new QLineEdit(m_list_card);
         m_search->setObjectName(QStringLiteral("assetSearch"));
-        m_search->setPlaceholderText(tr("Search assets"));
+        m_search->setPlaceholderText(tr("Search by name or ticker"));
         m_search->setClearButtonEnabled(true);
         listLayout->addWidget(m_search);
         connect(m_search, &QLineEdit::textChanged, m_proxy,
                 qOverload<const QString&>(&QSortFilterProxyModel::setFilterFixedString));
 
-        m_list = new QTableView(listCard);
+        m_list = new QTableView(m_list_card);
         m_list->setObjectName(QStringLiteral("assetList"));
         m_list->setModel(m_proxy);
         m_list->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -78,43 +112,57 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
         m_list->horizontalHeader()->setStretchLastSection(true);
         m_list->horizontalHeader()->setSectionResizeMode(B3AssetTableModel::Name, QHeaderView::Stretch);
         m_list->setFrameShape(QFrame::NoFrame);
+        m_list->setAlternatingRowColors(true);
+        m_list->setMinimumHeight(300);
+        m_list->verticalHeader()->setDefaultSectionSize(44);
         listLayout->addWidget(m_list, 1);
 
-        m_empty = new QLabel(tr("No wallet is loaded."), listCard);
+        m_empty = new QLabel(tr("No wallet is loaded."), m_list_card);
         B3Theme::markTextRole(m_empty, QStringLiteral("secondary"));
         m_empty->setWordWrap(true);
+        m_empty->setAlignment(Qt::AlignCenter);
+        m_empty->setMinimumHeight(72);
         listLayout->addWidget(m_empty);
 
         connect(m_list->selectionModel(), &QItemSelectionModel::currentRowChanged,
                 this, &B3AssetsPage::updateDetails);
         connect(m_model, &QAbstractItemModel::modelReset, this, &B3AssetsPage::updateDetails);
     }
-    columns->addWidget(listCard, 2);
 
     // Right: selected-asset details and actions.
-    auto* detailCard = new QFrame(this);
-    B3Theme::markCard(detailCard);
+    m_detail_card = new QFrame(content);
+    m_detail_card->setObjectName(QStringLiteral("assetsDetailCard"));
+    B3Theme::markCard(m_detail_card);
+    m_detail_card->setProperty("b3surface", QStringLiteral("hero"));
+    m_detail_card->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     {
-        auto* detailLayout = new QVBoxLayout(detailCard);
-        detailLayout->setContentsMargins(B3Theme::kSpaceMd, B3Theme::kSpaceMd, B3Theme::kSpaceMd, B3Theme::kSpaceMd);
+        auto* detailLayout = new QVBoxLayout(m_detail_card);
+        detailLayout->setContentsMargins(B3Theme::kSpaceLg, B3Theme::kSpaceLg,
+                                         B3Theme::kSpaceLg, B3Theme::kSpaceLg);
         detailLayout->setSpacing(B3Theme::kSpaceSm);
 
-        m_detail_name = new QLabel(detailCard);
+        auto* detailEyebrow = new QLabel(tr("SELECTED ASSET"), m_detail_card);
+        B3Theme::markTextRole(detailEyebrow, QStringLiteral("eyebrow"));
+        detailLayout->addWidget(detailEyebrow);
+
+        m_detail_name = new QLabel(m_detail_card);
         B3Theme::markTextRole(m_detail_name, QStringLiteral("h2"));
         m_detail_name->setTextInteractionFlags(Qt::TextSelectableByMouse);
         detailLayout->addWidget(m_detail_name);
 
-        m_detail_status = new QLabel(detailCard);
-        B3Theme::markTextRole(m_detail_status, QStringLiteral("secondary"));
+        m_detail_status = new QLabel(m_detail_card);
+        B3Theme::markTextRole(m_detail_status, QStringLiteral("status"));
         detailLayout->addWidget(m_detail_status);
+        detailLayout->addSpacing(B3Theme::kSpaceSm);
 
         auto addBalanceRow = [&](const QString& title, QLabel** value_out) {
             auto* row = new QHBoxLayout();
-            auto* t = new QLabel(title, detailCard);
+            auto* t = new QLabel(title, m_detail_card);
             B3Theme::markTextRole(t, QStringLiteral("secondary"));
             row->addWidget(t);
             row->addStretch();
-            *value_out = makeDetailValue(detailCard);
+            *value_out = makeDetailValue(m_detail_card);
+            B3Theme::markTextRole(*value_out, QStringLiteral("title"));
             row->addWidget(*value_out);
             detailLayout->addLayout(row);
         };
@@ -127,30 +175,33 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
         detailLayout->addSpacing(B3Theme::kSpaceSm);
 
         auto* actionRow = new QHBoxLayout();
-        m_send = new QPushButton(tr("Send"), detailCard);
+        m_send = new QPushButton(tr("Send"), m_detail_card);
         m_send->setObjectName(QStringLiteral("assetSend"));
-        m_receive = new QPushButton(tr("Receive"), detailCard);
+        m_send->setProperty("b3variant", QStringLiteral("primary"));
+        m_receive = new QPushButton(tr("Receive"), m_detail_card);
         m_receive->setObjectName(QStringLiteral("assetReceive"));
         actionRow->addWidget(m_send);
         actionRow->addWidget(m_receive);
+        actionRow->addStretch();
         detailLayout->addLayout(actionRow);
 
         auto* meshRow = new QHBoxLayout();
-        m_deposit = new QPushButton(tr("Deposit to FlowMesh"), detailCard);
+        m_deposit = new QPushButton(tr("Deposit to FlowMesh"), m_detail_card);
         m_deposit->setObjectName(QStringLiteral("assetDeposit"));
-        m_withdraw = new QPushButton(tr("Withdraw from FlowMesh"), detailCard);
+        m_withdraw = new QPushButton(tr("Withdraw from FlowMesh"), m_detail_card);
         m_withdraw->setObjectName(QStringLiteral("assetWithdraw"));
         meshRow->addWidget(m_deposit);
         meshRow->addWidget(m_withdraw);
+        meshRow->addStretch();
         detailLayout->addLayout(meshRow);
 
-        m_backend_note = new QLabel(detailCard);
-        B3Theme::markTextRole(m_backend_note, QStringLiteral("secondary"));
+        m_backend_note = new QLabel(m_detail_card);
+        B3Theme::markTextRole(m_backend_note, QStringLiteral("status"));
         m_backend_note->setWordWrap(true);
         detailLayout->addWidget(m_backend_note);
 
-        m_activity_note = new QLabel(detailCard);
-        B3Theme::markTextRole(m_activity_note, QStringLiteral("secondary"));
+        m_activity_note = new QLabel(m_detail_card);
+        B3Theme::markTextRole(m_activity_note, QStringLiteral("muted"));
         m_activity_note->setWordWrap(true);
         detailLayout->addWidget(m_activity_note);
 
@@ -161,11 +212,40 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
         // Deposit/withdraw stay disconnected as well as disabled: there is
         // no backend to submit to.
     }
-    columns->addWidget(detailCard, 3);
-
-    layout->addLayout(columns, 1);
+    layout->addLayout(m_columns, 1);
+    scroll->setWidget(content);
+    reflowCards(width());
 
     updateDetails();
+}
+
+void B3AssetsPage::resizeEvent(QResizeEvent* event)
+{
+    QWidget::resizeEvent(event);
+    reflowCards(event->size().width());
+}
+
+void B3AssetsPage::reflowCards(int width)
+{
+    if (!m_columns || !m_detail_card) return;
+    const int columns = width < 880 ? 1 : 2;
+    if (columns == m_layout_columns) return;
+    m_layout_columns = columns;
+
+    m_columns->removeWidget(m_list_card);
+    m_columns->removeWidget(m_detail_card);
+    m_columns->setColumnStretch(0, 0);
+    m_columns->setColumnStretch(1, 0);
+    if (columns == 1) {
+        m_columns->addWidget(m_list_card, 0, 0);
+        m_columns->addWidget(m_detail_card, 1, 0);
+        m_columns->setColumnStretch(0, 1);
+    } else {
+        m_columns->addWidget(m_list_card, 0, 0);
+        m_columns->addWidget(m_detail_card, 0, 1);
+        m_columns->setColumnStretch(0, 2);
+        m_columns->setColumnStretch(1, 3);
+    }
 }
 
 void B3AssetsPage::setWalletModel(WalletModel* wallet_model)
@@ -257,12 +337,14 @@ void B3AssetsPage::updateDetails()
     m_send->setEnabled(native && m_have_wallet);
     m_receive->setEnabled(native && m_have_wallet);
 
-    const bool mesh = m_model->source() && m_model->source()->flowMeshAvailable();
-    m_deposit->setEnabled(mesh);
-    m_withdraw->setEnabled(mesh);
-    m_backend_note->setVisible(!mesh);
-    m_backend_note->setText(tr("FlowMesh deposits and withdrawals are disabled: no FlowMesh "
-                               "backend is available in this build."));
+    // The model can expose FlowMesh balances, but this page has no approved
+    // deposit/withdraw submission path yet. Never turn disconnected buttons
+    // into controls that merely look live.
+    m_deposit->setEnabled(false);
+    m_withdraw->setEnabled(false);
+    m_backend_note->setVisible(true);
+    m_backend_note->setText(tr("FlowMesh deposits and withdrawals are not active in this "
+                               "wallet build."));
 
     m_activity_note->setVisible(true);
     m_activity_note->setText(native

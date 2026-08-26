@@ -16,6 +16,8 @@ class WalletModel;
 
 QT_BEGIN_NAMESPACE
 class QLabel;
+class QGridLayout;
+class QResizeEvent;
 class QTableView;
 QT_END_NAMESPACE
 
@@ -45,6 +47,9 @@ private Q_SLOTS:
     void updateLockState();
 
 private:
+    void resizeEvent(QResizeEvent* event) override;
+    void reflowCards(int width);
+
     WalletModel* m_wallet_model{nullptr};
     std::unique_ptr<TransactionFilterProxy> m_rewards_filter;
 
@@ -54,6 +59,12 @@ private:
     QLabel* m_no_wallet{nullptr};
     QTableView* m_rewards{nullptr};
     QLabel* m_rewards_empty{nullptr};
+
+    QGridLayout* m_card_grid{nullptr};
+    QWidget* m_status_card{nullptr};
+    QWidget* m_balance_card{nullptr};
+    QWidget* m_rewards_card{nullptr};
+    int m_layout_columns{0};
 };
 
 #endif // BITCOIN_QT_B3STAKEPAGE_H

@@ -477,10 +477,14 @@ bool BitcoinApplication::event(QEvent* e)
 
 static void SetupUIArgs(ArgsManager& argsman)
 {
+#if !CLIENT_VERSION_IS_RELEASE
+    // Developer/integration builds may inject a test release channel. Release
+    // trust must be compiled in; runtime arguments can never replace it.
     argsman.AddArg("-hiveupdateurl=<url>", "B3 Hive update manifest URL (unset = updates disabled, fail-closed)", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
     argsman.AddArg("-hiveupdatekey=<hex>", "Pinned x-only release public key for B3 Hive updates (may be given multiple times)", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
     argsman.AddArg("-hiveupdatethreshold=<n>", "Required release signatures for a B3 Hive update manifest (default: 2)", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
     argsman.AddArg("-hiveupdatehost=<host>", "Approved download host for B3 Hive updates (may be given multiple times; default: the manifest host)", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
+#endif
     argsman.AddArg("-choosedatadir", strprintf("Choose data directory on startup (default: %u)", DEFAULT_CHOOSE_DATADIR), ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
     argsman.AddArg("-lang=<lang>", "Set language, for example \"de_DE\" (default: system locale)", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
     argsman.AddArg("-min", "Start minimized", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
@@ -515,7 +519,7 @@ int GuiMain(int argc, char* argv[])
 
     BitcoinApplication app;
     GUIUtil::LoadFont(QStringLiteral(":/fonts/monospace"));
-    // Apply the centralized B3FlowMesh visual system (palette + stylesheet).
+    // Apply the centralized B3 Hive visual system (palette + stylesheet).
     B3Theme::apply(app);
 
     /// 2. Parse command-line options. We do this after qt in order to show an error if there are problems parsing these
@@ -552,10 +556,10 @@ int GuiMain(int argc, char* argv[])
             return EXIT_FAILURE;
         }
         if (invalid_token) {
-            InitError(Untranslated(strprintf("Command line contains unexpected token '%s', see bitcoin-qt -h for a list of options.", argv[i])));
+            InitError(Untranslated(strprintf("Command line contains unexpected token '%s', see b3coin-qt -h for a list of options.", argv[i])));
             QMessageBox::critical(nullptr, HIVE_NAME,
                                   // message cannot be translated because translations have not been initialized
-                                  QString::fromStdString("Command line contains unexpected token '%1', see bitcoin-qt -h for a list of options.").arg(QString::fromStdString(argv[i])));
+                                  QString::fromStdString("Command line contains unexpected token '%1', see b3coin-qt -h for a list of options.").arg(QString::fromStdString(argv[i])));
             return EXIT_FAILURE;
         }
     }

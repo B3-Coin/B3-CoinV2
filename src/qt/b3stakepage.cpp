@@ -17,9 +17,12 @@
 #include <qt/walletmodel.h>
 
 #include <QFrame>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
+#include <QResizeEvent>
+#include <QScrollArea>
 #include <QTableView>
 #include <QVBoxLayout>
 
@@ -55,57 +58,82 @@ void AddInfoRow(QVBoxLayout* layout, QWidget* parent, const QString& title, QLab
 B3StakePage::B3StakePage(QWidget* parent)
     : QWidget{parent}
 {
-    auto* layout = new QVBoxLayout(this);
-    layout->setContentsMargins(B3Theme::kSpaceLg, B3Theme::kSpaceLg, B3Theme::kSpaceLg, B3Theme::kSpaceLg);
-    layout->setSpacing(B3Theme::kSpaceMd);
+    auto* outer = new QVBoxLayout(this);
+    outer->setContentsMargins(0, 0, 0, 0);
 
-    auto* heading = new QLabel(tr("Stake"), this);
+    auto* scroll = new QScrollArea(this);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    outer->addWidget(scroll);
+
+    auto* content = new QWidget(scroll);
+    auto* layout = new QVBoxLayout(content);
+    layout->setContentsMargins(B3Theme::kSpaceLg, B3Theme::kSpaceLg,
+                               B3Theme::kSpaceLg, B3Theme::kSpaceXl);
+    layout->setSpacing(B3Theme::kSpaceLg);
+
+    auto* eyebrow = new QLabel(tr("NETWORK PARTICIPATION"), content);
+    B3Theme::markTextRole(eyebrow, QStringLiteral("eyebrow"));
+    layout->addWidget(eyebrow);
+    auto* heading = new QLabel(tr("Stake"), content);
     B3Theme::markTextRole(heading, QStringLiteral("h1"));
     layout->addWidget(heading);
+    auto* introduction = new QLabel(
+        tr("Wallet-generated rewards are shown from real transaction history. Unavailable staking metrics remain explicitly unavailable."),
+        content);
+    introduction->setWordWrap(true);
+    B3Theme::markTextRole(introduction, QStringLiteral("secondary"));
+    layout->addWidget(introduction);
 
-    m_no_wallet = new QLabel(tr("No wallet is loaded."), this);
-    B3Theme::markTextRole(m_no_wallet, QStringLiteral("secondary"));
+    m_no_wallet = new QLabel(tr("No wallet is loaded."), content);
+    B3Theme::markTextRole(m_no_wallet, QStringLiteral("status"));
     layout->addWidget(m_no_wallet);
 
-    auto* row = new QHBoxLayout();
-    row->setSpacing(B3Theme::kSpaceMd);
+    m_card_grid = new QGridLayout();
+    m_card_grid->setContentsMargins(0, 0, 0, 0);
+    m_card_grid->setHorizontalSpacing(B3Theme::kSpaceMd);
+    m_card_grid->setVerticalSpacing(B3Theme::kSpaceMd);
 
     QVBoxLayout* statusLayout{nullptr};
-    QWidget* statusCard = MakeCard(this, tr("Status"), &statusLayout);
+    m_status_card = MakeCard(content, tr("Staking status"), &statusLayout);
+    m_status_card->setObjectName(QStringLiteral("stakeStatusCard"));
+    m_status_card->setProperty("b3surface", QStringLiteral("quiet"));
     {
         m_backend_state = new QLabel(
             tr("No staking backend is exposed to the wallet UI in this "
                "build. Activation, eligible balance, network weight and "
                "expected time will appear here when the wallet provides a "
                "staking model."),
-            statusCard);
+            m_status_card);
         m_backend_state->setWordWrap(true);
         B3Theme::markTextRole(m_backend_state, QStringLiteral("secondary"));
         statusLayout->addWidget(m_backend_state);
-        AddInfoRow(statusLayout, statusCard, tr("Wallet lock state"), &m_lock_state);
+        AddInfoRow(statusLayout, m_status_card, tr("Wallet lock state"), &m_lock_state);
         statusLayout->addStretch();
     }
-    row->addWidget(statusCard, 1);
 
     QVBoxLayout* balanceLayout{nullptr};
-    QWidget* balanceCard = MakeCard(this, tr("Balances"), &balanceLayout);
+    m_balance_card = MakeCard(content, tr("Wallet signals"), &balanceLayout);
+    m_balance_card->setObjectName(QStringLiteral("stakeBalanceCard"));
+    m_balance_card->setProperty("b3surface", QStringLiteral("panel"));
     {
-        AddInfoRow(balanceLayout, balanceCard, tr("Wallet balance"), &m_wallet_balance);
+        AddInfoRow(balanceLayout, m_balance_card, tr("Wallet balance"), &m_wallet_balance);
+        B3Theme::markTextRole(m_wallet_balance, QStringLiteral("title"));
         QLabel* eligible{nullptr};
-        AddInfoRow(balanceLayout, balanceCard, tr("Eligible for staking"), &eligible);
+        AddInfoRow(balanceLayout, m_balance_card, tr("Eligible for staking"), &eligible);
         eligible->setText(tr("Not available"));
         QLabel* weight{nullptr};
-        AddInfoRow(balanceLayout, balanceCard, tr("Network weight"), &weight);
+        AddInfoRow(balanceLayout, m_balance_card, tr("Network weight"), &weight);
         weight->setText(tr("Not available"));
         balanceLayout->addStretch();
     }
-    row->addWidget(balanceCard, 1);
-    layout->addLayout(row);
 
     QVBoxLayout* rewardsLayout{nullptr};
-    QWidget* rewardsCard = MakeCard(this, tr("Recent rewards"), &rewardsLayout);
+    m_rewards_card = MakeCard(content, tr("Recent rewards"), &rewardsLayout);
+    m_rewards_card->setObjectName(QStringLiteral("stakeRewardsCard"));
+    m_rewards_card->setProperty("b3surface", QStringLiteral("panel"));
     {
-        m_rewards = new QTableView(rewardsCard);
+        m_rewards = new QTableView(m_rewards_card);
         m_rewards->setObjectName(QStringLiteral("stakeRewards"));
         m_rewards->setShowGrid(false);
         m_rewards->verticalHeader()->setVisible(false);
@@ -113,19 +141,54 @@ B3StakePage::B3StakePage(QWidget* parent)
         m_rewards->setFrameShape(QFrame::NoFrame);
         m_rewards->setSelectionBehavior(QAbstractItemView::SelectRows);
         m_rewards->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        m_rewards->setAlternatingRowColors(true);
+        m_rewards->verticalHeader()->setDefaultSectionSize(44);
+        m_rewards->setMinimumHeight(220);
         m_rewards->hide();
         rewardsLayout->addWidget(m_rewards, 1);
 
-        m_rewards_empty = new QLabel(tr("No reward transactions yet."), rewardsCard);
+        m_rewards_empty = new QLabel(tr("No reward transactions yet."), m_rewards_card);
         B3Theme::markTextRole(m_rewards_empty, QStringLiteral("secondary"));
+        m_rewards_empty->setAlignment(Qt::AlignCenter);
+        m_rewards_empty->setMinimumHeight(96);
         rewardsLayout->addWidget(m_rewards_empty);
     }
-    layout->addWidget(rewardsCard, 1);
+    layout->addLayout(m_card_grid, 1);
+    scroll->setWidget(content);
+    reflowCards(width());
 
     setWalletModel(nullptr);
 }
 
 B3StakePage::~B3StakePage() = default;
+
+void B3StakePage::resizeEvent(QResizeEvent* event)
+{
+    QWidget::resizeEvent(event);
+    reflowCards(event->size().width());
+}
+
+void B3StakePage::reflowCards(int width)
+{
+    if (!m_card_grid || !m_rewards_card) return;
+    const int columns = width < 820 ? 1 : 2;
+    if (columns == m_layout_columns) return;
+    m_layout_columns = columns;
+    for (QWidget* card : {m_status_card, m_balance_card, m_rewards_card}) {
+        m_card_grid->removeWidget(card);
+    }
+    m_card_grid->setColumnStretch(0, 1);
+    m_card_grid->setColumnStretch(1, columns == 2 ? 1 : 0);
+    if (columns == 1) {
+        m_card_grid->addWidget(m_status_card, 0, 0);
+        m_card_grid->addWidget(m_balance_card, 1, 0);
+        m_card_grid->addWidget(m_rewards_card, 2, 0);
+    } else {
+        m_card_grid->addWidget(m_status_card, 0, 0);
+        m_card_grid->addWidget(m_balance_card, 0, 1);
+        m_card_grid->addWidget(m_rewards_card, 1, 0, 1, 2);
+    }
+}
 
 void B3StakePage::setWalletModel(WalletModel* wallet_model)
 {

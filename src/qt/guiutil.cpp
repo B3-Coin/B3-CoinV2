@@ -641,9 +641,10 @@ bool SetStartOnSystemStartup(bool fAutoStart)
         optionFile << "[Desktop Entry]\n";
         optionFile << "Type=Application\n";
         if (chain == ChainType::MAIN)
-            optionFile << "Name=B3Coin\n";
+            optionFile << "Name=B3 Hive\n";
         else
-            optionFile << strprintf("Name=B3Coin (%s)\n", ChainTypeToString(chain));
+            optionFile << strprintf("Name=B3 Hive (%s)\n", ChainTypeToString(chain));
+        optionFile << "Icon=b3-hive\n";
         optionFile << "Exec=" << pszExePath << strprintf(" -min -chain=%s\n", ChainTypeToString(chain));
         optionFile << "Terminal=false\n";
         optionFile << "Hidden=false\n";

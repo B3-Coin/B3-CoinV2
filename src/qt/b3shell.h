@@ -11,6 +11,7 @@
 
 QT_BEGIN_NAMESPACE
 class QStackedWidget;
+class QResizeEvent;
 QT_END_NAMESPACE
 
 class B3NavSidebar;
@@ -18,7 +19,7 @@ class B3PlaceholderPage;
 class B3TopStatus;
 
 /**
- * The B3FlowMesh application shell: a top status area over a left
+ * The B3 Hive application shell: a top status area over a left
  * navigation sidebar and a stacked content area. The existing wallet UI is
  * hosted verbatim as the wallet content; Trade/Assets/Stake begin as
  * honest placeholder pages. The shell owns no application state — it
@@ -57,8 +58,12 @@ Q_SIGNALS:
     //! A navigation destination was chosen by the user.
     void pageSelected(B3Page page);
 
+protected:
+    void resizeEvent(QResizeEvent* event) override;
+
 private:
     void replacePage(int index, QWidget* page);
+    void updateResponsiveLayout(int width);
 
     B3TopStatus* m_topStatus{nullptr};
     B3NavSidebar* m_sidebar{nullptr};

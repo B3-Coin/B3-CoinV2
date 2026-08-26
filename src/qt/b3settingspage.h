@@ -11,6 +11,8 @@
 
 QT_BEGIN_NAMESPACE
 class QLabel;
+class QGridLayout;
+class QResizeEvent;
 class QVBoxLayout;
 QT_END_NAMESPACE
 
@@ -41,9 +43,18 @@ Q_SIGNALS:
     void openOptionsRequested(OptionsDialog::Tab tab);
 
 private:
+    void resizeEvent(QResizeEvent* event) override;
+    void reflowCards(int width);
+
     QVBoxLayout* m_layout{nullptr};
+    QWidget* m_content{nullptr};
     QVBoxLayout* m_wallet_actions_layout{nullptr};
     QLabel* m_wallet_note{nullptr};
+    QGridLayout* m_card_grid{nullptr};
+    QWidget* m_application_card{nullptr};
+    QWidget* m_network_card{nullptr};
+    QWidget* m_wallet_card{nullptr};
+    int m_layout_columns{0};
 };
 
 #endif // BITCOIN_QT_B3SETTINGSPAGE_H
