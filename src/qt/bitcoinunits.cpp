@@ -53,7 +53,7 @@ QString BitcoinUnits::shortName(Unit unit)
 QString BitcoinUnits::description(Unit unit)
 {
     switch (unit) {
-    case Unit::BTC: return QString("B3Coins");
+    case Unit::BTC: return QString("B3");
     case Unit::mBTC: return QString("Milli-B3Coins (1 / 1" THIN_SP_UTF8 "000)");
     case Unit::uBTC: return QString("Micro-B3Coins (bits) (1 / 1" THIN_SP_UTF8 "000" THIN_SP_UTF8 "000)");
     case Unit::SAT: return QString("Satoshi (sat) (1 / 100" THIN_SP_UTF8 "000" THIN_SP_UTF8 "000)");
@@ -64,7 +64,7 @@ QString BitcoinUnits::description(Unit unit)
 qint64 BitcoinUnits::factor(Unit unit)
 {
     switch (unit) {
-    case Unit::BTC: return 100'000'000;
+    case Unit::BTC: return 1'000'000'000;
     case Unit::mBTC: return 100'000;
     case Unit::uBTC: return 100;
     case Unit::SAT: return 1;
@@ -75,7 +75,7 @@ qint64 BitcoinUnits::factor(Unit unit)
 int BitcoinUnits::decimals(Unit unit)
 {
     switch (unit) {
-    case Unit::BTC: return 8;
+    case Unit::BTC: return 9;
     case Unit::mBTC: return 5;
     case Unit::uBTC: return 2;
     case Unit::SAT: return 0;

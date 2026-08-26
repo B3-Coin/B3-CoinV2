@@ -25,13 +25,13 @@ M = 161
 B3_ARGS = [
     '-b3modernregtest',
     '-b3corridorlength=160',
-    '-fallbackfee=0.001',
+    '-fallbackfee=0.0001',
     '-addresstype=legacy',
     '-changetype=legacy',
     '-debug=validation',
 ]
-# RPC amount-parse units: 10 units = 1 whole modern B3 = one snapshot weight.
-STAKES = [150, 100, 50, 10]  # weights 15 / 10 / 5 / 1 -> W = 31, quorum = 21
+# Amounts are B3 (1 B3 = 1e9 base units = one snapshot weight).
+STAKES = [15, 10, 5, 1]  # weights 15 / 10 / 5 / 1 -> W = 31, quorum = 21
 
 
 class B3FinalitySoakTest(BitcoinTestFramework):
@@ -75,7 +75,7 @@ class B3FinalitySoakTest(BitcoinTestFramework):
 
         self.log.info("Funding the other three validators")
         for i in range(1, 4):
-            n0.sendtoaddress(self.nodes[i].getnewaddress(), STAKES[i] + 50)
+            n0.sendtoaddress(self.nodes[i].getnewaddress(), STAKES[i] + 5)
         self.generatetoaddress(n0, 2, addr0)
 
         self.log.info("STAKE + FINALITY_KEY binding on all four wallets")

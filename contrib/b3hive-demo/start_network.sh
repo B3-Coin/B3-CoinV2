@@ -16,7 +16,7 @@ BIN="$REPO/build/bin"
 [ -x "$BIN/b3coind" ] || { echo "build b3coind first (cmake --build build --target b3coind b3coin-cli)"; exit 1; }
 mkdir -p "$WORK"
 
-ARGS=(-regtest -b3modernregtest -b3corridorlength=160 -fallbackfee=0.001
+ARGS=(-regtest -b3modernregtest -b3corridorlength=160 -fallbackfee=0.0001
       -addresstype=legacy -changetype=legacy -server -listen=0)
 P2P0=19800
 
@@ -50,9 +50,9 @@ echo "[demo] mining corridor funding blocks..."
 mine 135 "$ADDR0"
 
 echo "[demo] funding the other three validators"
-STAKES=(150 100 50 10)
+STAKES=(15 10 5 1)
 for i in 1 2 3; do
-  rpc 0 sendtoaddress "$(rpc $i getnewaddress)" $((STAKES[i+1]+50)) >/dev/null
+  rpc 0 sendtoaddress "$(rpc $i getnewaddress)" $((STAKES[i+1]+5)) >/dev/null
 done
 rpc 0 generatetoaddress 2 "$ADDR0" >/dev/null
 
@@ -97,7 +97,7 @@ cat <<DONE
 
  Attach B3 Hive (observer node with its own wallet):
    $BIN/b3coin-qt -regtest -b3modernregtest -b3corridorlength=160 \\
-     -datadir=$WORK/hive -connect=127.0.0.1:$P2P0 -fallbackfee=0.001 \\
+     -datadir=$WORK/hive -connect=127.0.0.1:$P2P0 -fallbackfee=0.0001 \\
      -addresstype=legacy -changetype=legacy
 
  Stop everything:
