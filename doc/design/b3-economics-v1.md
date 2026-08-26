@@ -25,28 +25,29 @@ release.
   (hardware-backed) recommended; the address can be rotated only by
   release.
 
-## Modern PoS reward — PROPOSED (answering OD-2)
+## Modern PoS reward — mechanism RULED 2026-08-26: HALVING SCHEDULE
 
-**Recommendation: constant tail emission with a consensus-enforced
-treasury share.**
+The owner ruled a Bitcoin-style halving emission (rejecting the constant
+tail-emission recommendation). Mechanism locked; NUMBERS still PROPOSED:
 
-- `block_reward = round(S_H * r / BLOCKS_PER_YEAR)` where `S_H` is the
-  MEASURED total supply at H (taken from the final U==U' capture at H --
-  never an assumed number), `r` = **1.5%/year** (PROPOSED; sane band
-  1-2%), `BLOCKS_PER_YEAR = 525,600` at the 60 s target spacing.
+- `block_reward(height) = R0 >> floor((height - M) / HALVING_INTERVAL)`
+  (integer atomic units; emission ends when the shift reaches zero).
+- PROPOSED `HALVING_INTERVAL` = **2,102,400 blocks** (~4 years at the
+  60 s target spacing).
+- PROPOSED `R0` = sized from the MEASURED supply at H so that first-epoch
+  issuance is ~3%/year of `S_H` (R0 = S_H * 3% / 525,600); total lifetime
+  emission then converges to ~24% of S_H over all halvings. `S_H` comes
+  from the final U==U' capture at H — never an assumed number.
 - Split per block, enforced in the coinbase: **90% block producer /
-  10% treasury address** (PROPOSED). All transaction + payload fees to
-  the producer.
-- Corridor (1,000 PoW blocks): same formula, same split — one rule
-  everywhere (PROPOSED).
-- Properties: predictable security budget from day one (fee-only was
-  rejected: too thin early); no halving cliffs or decay schedules to
-  misimplement ("not perfect but working" — one constant, one split);
-  effective staking APY = r / staked_fraction, which self-balances
-  participation (low participation -> higher APY -> more staking);
-  treasury funding needs no second mechanism — it rides every block plus
-  issuance and FlowMesh fees into the one ruled wallet.
-- Revisitable by future release without touching balances or history.
+  10% treasury address** (PROPOSED, carried over). All transaction +
+  payload fees to the producer.
+- Corridor (1,000 PoW blocks): same R0, same split (PROPOSED).
+- Halving properties, stated honestly: strong scarcity narrative and
+  familiar economics; the security budget decays by design, so fees (and
+  FlowMesh volume feeding the treasury) must grow into the gap across
+  epochs — this is the accepted trade-off of the ruling.
+- Owner pins still needed: R0 (or the 3% sizing rule), HALVING_INTERVAL,
+  the 90/10 split, and the treasury address.
 
 ## Asset issuance fee — RULED destination, PROPOSED size
 - Destination: the treasury address (RULED 2026-08-26).
