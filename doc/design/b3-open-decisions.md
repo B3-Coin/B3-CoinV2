@@ -261,15 +261,6 @@ release) and requires H/X be known before the enforcing binary activates. The co
 activation mechanism — how nodes agree to begin modern validation once H/X are baked in —
 is not finalized and must not be improvised late.
 
-**SUPERSEDED 2026-08-26 (owner): H = 810,000** (corridor 810,001..811,000,
-M = 811,001), replacing the 2026-08-23 H = 820,000. Consequence reported:
-the live legacy chain (~807,7xx on 2026-08-25) reaches 810,000 within
-days, after which block 810,000 is an OBSERVABLE, buried fact — enabling
-the architecture contract's preferred single-release model (§62: choose an
-already-buried block, record X, ship H+X together) instead of the
-pause-and-second-release path. The pause model below remains the fallback
-if a release must ship before the height is buried.
-
 **RULED 2026-08-23 (owner):** H = 820,000 (corridor 820,001..821,000,
 M = 821,001); X distribution = PAUSE, FAIL CLOSED — a release ships with H
 set and X blank, accepts through H and refuses every block at H+1
