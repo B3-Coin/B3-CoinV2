@@ -261,7 +261,19 @@ release) and requires H/X be known before the enforcing binary activates. The co
 activation mechanism — how nodes agree to begin modern validation once H/X are baked in —
 is not finalized and must not be improvised late.
 
-**RULED 2026-08-23 (owner):** H = 820,000 (corridor 820,001..821,000,
+**RE-RULED 2026-08-26 (owner, after explicit timeline review): H = 810,000**
+(corridor 810,001..811,000, M = 811,001), superseding H = 820,000. Basis:
+legacy stake spacing is 360 s (src/legacy/consensus.h STAKE_TARGET_SPACING),
+~240 blocks/day; tip ~807,95x on 2026-08-26, so the chain reaches 810,000
+around 2026-09-03/04 — an ~8.5-day runway the owner judged sufficient for
+their operator coordination. Path: distribute the fail-closed v1 binary
+(H set, X blank) before the height is reached (pause model); if
+distribution slips past the height, block 810,000 is then a buried
+observable fact and the §62 single-release H+X model applies instead.
+Post-H legacy-client activity is abandoned by the modern ledger — the
+cutoff must be announced to all stakers/operators immediately.
+
+**RULED 2026-08-23 (owner, superseded above):** H = 820,000 (corridor 820,001..821,000,
 M = 821,001); X distribution = PAUSE, FAIL CLOSED — a release ships with H
 set and X blank, accepts through H and refuses every block at H+1
 (`legacy-boundary-unpinned`, a no-penalty header refusal, plus a

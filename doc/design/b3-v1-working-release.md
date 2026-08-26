@@ -66,7 +66,7 @@ correct", they are unreachable on real networks.
 
 ## The activation release (NOT this pack) still requires the owner pins
 
-X hash at H=820,000; corridor params final (1,000 blocks, bits 0x1f008000,
+X hash at H=810,000 (re-ruled 2026-08-26; corridor 810,001..811,000, M=811,001; height expected ~2026-09-03); corridor params final (1,000 blocks, bits 0x1f008000,
 60/120 s pacing — ruled); `reward` (OD-2); sentinel_bits; ≥2 more fixed
 seeds + owner DNS seed; final U==U′ capture AT H; x86-64 frozen-vector CI
 run; the four release gates. Nothing in this pack forecloses or presumes
