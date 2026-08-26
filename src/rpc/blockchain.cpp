@@ -16,6 +16,7 @@
 #include <consensus/params.h>
 #include <consensus/validation.h>
 #include <core_io.h>
+#include <legacy/codec.h>
 #include <deploymentinfo.h>
 #include <deploymentstatus.h>
 #include <flatfile.h>
@@ -866,7 +867,14 @@ static RPCHelpMan getblock()
     }
 
     CBlock block{};
-    SpanReader{block_data} >> TX_WITH_WITNESS(block);
+    // B3 chains: the raw bytes are the canonical marker-aware encoding
+    // (legacy body or modern body + MPA payloads); the stock witness codec
+    // cannot parse them (it rejects the MPA optional-data flag).
+    if (chainman.GetConsensus().legacy_b3coin) {
+        SpanReader{block_data} >> legacy::TX_LEGACY(block);
+    } else {
+        SpanReader{block_data} >> TX_WITH_WITNESS(block);
+    }
 
     TxVerbosity tx_verbosity;
     if (verbosity == 1) {
