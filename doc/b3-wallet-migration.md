@@ -1,0 +1,53 @@
+# Migrating from the legacy B3-CoinV2 wallet to B3 Hive
+
+B3 Hive 1.0.0 uses the SAME default data directory as the legacy client
+(`~/Library/Application Support/B3-CoinV2`, `%APPDATA%\B3-CoinV2`,
+`~/.B3-CoinV2`), so the normal path is: close the old wallet, open
+B3 Hive, and migrate in place.
+
+## Healthy wallet (the normal case)
+
+1. Close the legacy client completely.
+2. **Back up `wallet.dat`** (two copies, one off-machine).
+3. Open B3 Hive; it finds the legacy data directory automatically and
+   syncs the chain into its own storage (the old block files are left
+   untouched and are not reused).
+4. Migrate the old wallet:  `b3coin-cli migratewallet wallet.dat`
+   (or the equivalent Hive menu action). This converts the legacy
+   Berkeley-DB wallet into a modern descriptor wallet. Encrypted wallets
+   prompt for the passphrase.
+5. Verify balances after sync completes, then make a FRESH backup of the
+   migrated wallet.
+
+## Wallet misbehaving in the OLD client first?
+
+Symptoms and the right tool — these fix DIFFERENT problems:
+
+| Symptom | Fix (old client) |
+|---|---|
+| Wrong balance, "lost" coins, stuck stake — wallet opens fine | RPC `checkwallet`, then `repairwallet` (fixes spent-state mismatches) |
+| Transactions missing after key import | `-rescan` |
+| "wallet.dat corrupted" / `-salvagewallet` FAILED | see the recovery ladder below |
+
+## Corruption recovery ladder (salvage failed)
+
+Work ONLY on copies; every attempt can worsen the original.
+
+1. **Copy `wallet.dat` (and the `database/` folder) somewhere safe.**
+2. **Fresh-datadir trick:** place a copy of `wallet.dat` in a new, empty
+   data directory and open it with the old client — once WITH the copied
+   `database/` folder beside it, once WITHOUT. Stale BDB environments
+   masquerade as corruption surprisingly often.
+3. **Try B3 Hive's `migratewallet` on the corrupted copy.** Hive reads
+   old wallets through an independent Berkeley reader that needs no BDB
+   environment or log replay — it frequently opens files the old
+   client's salvage cannot.
+4. `db_dump -r wallet.dat > dump.txt && db_load new.dat < dump.txt`
+   (Berkeley DB 4.8 utilities; `-R` for the aggressive variant).
+5. Raw key carving as the last resort: private keys sit in recognizable
+   byte patterns and can be extracted from badly damaged files, then
+   imported into Hive. Ask the maintainers before running third-party
+   carving tools against key material.
+
+After ANY successful recovery: sweep all funds to a freshly created
+wallet and retire the damaged file permanently.

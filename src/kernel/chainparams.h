@@ -147,11 +147,47 @@ public:
     /**
      * RegTestOptions holds configurations for creating a regtest CChainParams.
      */
+    /**
+     * B3 modern-era regtest overrides (architecture contract section 64: the
+     * sanctioned regtest/testnet activation-override facility; REGTEST ONLY,
+     * never a mainnet surface). H = 0: the untouched regtest genesis is the
+     * entire legacy era and X is its hash, so the fail-closed X rule keeps
+     * its shape and no legacy history is fabricated. The corridor runs from
+     * height 1, modern PoS from corridor_length + 1, with scaled scaffolding
+     * constants exactly as the unit fixtures scale them.
+     */
+    struct B3ModernRegTestOptions {
+        int corridor_length{160};
+        //! Corridor pacing (seconds); scaled from the ratified 60 so a
+        //! functional test can mine the corridor in real time.
+        int64_t corridor_spacing{1};
+        //! Corridor coinbase reward (base units) so a fresh chain can fund
+        //! stakes (the ratified corridor is fees-only; scaffolding only).
+        int64_t corridor_reward{2'000'000'000};
+        //! Modern-PoS pacing (seconds); scaled from the ratified 60/30.
+        int64_t block_interval{1};
+        int64_t round_seconds{1};
+        int epoch_length{30};
+        int checkpoint_interval{5};
+        int checkpoint_depth{3};
+        int max_epoch_extension{30};
+        int min_finality_set{1};
+        int reorg_horizon{200};
+        int64_t min_stake_amount{1000};
+        //! OD-2 schedule scaffolding: modern per-block subsidy R0, halving
+        //! interval (blocks), treasury percent and treasury script (hex).
+        int64_t modern_reward{0};
+        int64_t halving_interval{0};
+        int64_t treasury_percent{0};
+        std::vector<unsigned char> treasury_script{};
+    };
+
     struct RegTestOptions {
         std::unordered_map<Consensus::DeploymentPos, VersionBitsParameters> version_bits_parameters{};
         std::unordered_map<Consensus::BuriedDeployment, int> activation_heights{};
         bool fastprune{false};
         bool enforce_bip94{false};
+        std::optional<B3ModernRegTestOptions> b3_modern{};
     };
 
     static std::unique_ptr<const CChainParams> RegTest(const RegTestOptions& options);

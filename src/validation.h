@@ -65,6 +65,9 @@ struct ChainstateRole;
 namespace node {
 class SnapshotMetadata;
 class StakeTracker;
+class FinalityBindingTracker;
+class FinalityTracker;
+class FinalitySignaturePool;
 } // namespace node
 namespace Consensus {
 struct Params;
@@ -587,6 +590,12 @@ protected:
 
     //! Lazily created modern-PoS stake registry tracker; see ModernStakeTracker().
     std::unique_ptr<node::StakeTracker> m_stake_tracker GUARDED_BY(::cs_main);
+    //! Lazily created FINALITY_KEY binding tracker (derived, rebuildable); see ModernFinalityBindings().
+    std::unique_ptr<node::FinalityBindingTracker> m_finality_bindings GUARDED_BY(::cs_main);
+    //! Lazily created finality / epoch state tracker (derived, rebuildable); see ModernFinality().
+    std::unique_ptr<node::FinalityTracker> m_finality_tracker GUARDED_BY(::cs_main);
+    //! Lazily created finality-signature pool (liveness only); see FinalitySignatures().
+    std::unique_ptr<node::FinalitySignaturePool> m_finality_sigs GUARDED_BY(::cs_main);
 
 public:
     //! Reference to a BlockManager instance which itself is shared across all
@@ -611,6 +620,45 @@ public:
      * validator's aggregated ACTIVE weight and the total ACTIVE weight.
      */
     node::StakeTracker& ModernStakeTracker() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    node::FinalityBindingTracker& ModernFinalityBindings() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! The derived finality / epoch state machine of this chainstate (certificate
+    //! verification, gated epoch rotation, finalized tip). Consensus reads it in
+    //! ConnectBlock; it rebuilds from the active chain whenever out of step.
+    node::FinalityTracker& ModernFinality() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /**
+     * Bring the finality tracker to the active tip and raise the block
+     * manager's finality anchor to the highest certified checkpoint (the
+     * finality pin, plan Commit 13). Cheap when in step; a rebuild walks the
+     * modern span. Silently leaves the anchor unchanged when the state is
+     * unavailable (it is only ever raised).
+     */
+    void RefreshFinalityAnchor() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! The node-local finality-signature pool (gossip aggregation; plan
+    //! Commit 15). Liveness only: nothing in it affects validation.
+    node::FinalitySignaturePool& FinalitySignatures() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /**
+     * The finality pin refuses a reorganization whose fork point lies below
+     * the pinned checkpoint (it would disconnect the checkpoint). Reorgs whose
+     * fork point is at or above the pin remain ordinary reorgs.
+     */
+    bool ReorgFromForkViolatesFinality(int fork_height) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /**
+     * ONE STAKE UNIVERSE (plan Commit 14; owner ruling 2026-08-23, F = M):
+     * the block-production weights (w, W) of `validator_key` for the block
+     * that extends `parent`, read from the validator set in force at that
+     * height -- the same epoch snapshot (StakeTracker ACTIVE weights joined
+     * with the non-revoked FINALITY_KEY bindings, whole modern B3) whose
+     * weights define the finality quorum. A validator without a binding, with
+     * a revoked binding, or below one whole B3 has w = 0 and is not
+     * block-eligible; a mid-epoch binding change does not touch the snapshot
+     * in force. Without any set (bootstrap floor not met) W = 0: nobody is
+     * eligible, the chain halts at M (fail closed). nullopt only when the
+     * derived state cannot be built (a block of the span is unreadable).
+     * Validation, block assembly and the staking loop all read here; there
+     * is no other weight path for modern-PoS blocks.
+     */
+    std::optional<std::pair<CAmount, CAmount>> ModernEligibilityWeights(const std::array<unsigned char, 32>& validator_key,
+                                                                        const CBlockIndex& parent) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     //! Return path to chainstate leveldb directory.
     fs::path StoragePath() const;
@@ -849,6 +897,9 @@ public:
      * and never treats a block as violating its own legacy rules.
      */
     bool IsAnchorIneligible(const CBlockIndex& block) const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    //! IsAnchorIneligible, recording the classification on the index entry
+    //! (BLOCK_ANCHOR_INELIGIBLE, persisted) when it holds. Returns the result.
+    bool MarkIfAnchorIneligible(CBlockIndex& block) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /**
      * True once the finalized legacy boundary is ACTIVE on this chain: H/X are

@@ -3,6 +3,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <modern/metadata_cell.h>
 #include <modern/stake.h>
 #include <pubkey.h>
 #include <script/interpreter.h>
@@ -142,6 +143,14 @@ std::optional<std::pair<int, std::vector<std::span<const unsigned char>>>> Match
 TxoutType Solver(const CScript& scriptPubKey, std::vector<std::vector<unsigned char>>& vSolutionsRet)
 {
     vSolutionsRet.clear();
+
+    // B3 metadata cells (policy 6/7/8 carriers): data-carrier-like for
+    // standardness -- well-formed cells are NULL_DATA (no destination, no
+    // spend path; consensus keeps them out of the UTXO set), malformed
+    // claims are nonstandard. Never OP_RETURN.
+    if (modern::ClaimsMetadataCell(scriptPubKey)) {
+        return modern::IsMetadataCell(scriptPubKey) ? TxoutType::NULL_DATA : TxoutType::NONSTANDARD;
+    }
 
     // B3 STAKE carrier (release-v1 standardness carve-in): the output is its
     // bare owner script for solving, standardness and destination purposes;

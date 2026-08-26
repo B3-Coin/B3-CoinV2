@@ -20,14 +20,14 @@ std::string FormatMoney(const CAmount n)
 {
     // Note: not using straight sprintf here because we do NOT want
     // localized number formatting.
-    static_assert(COIN > 1);
-    int64_t quotient = n / COIN;
-    int64_t remainder = n % COIN;
+    static_assert(KILO_COIN > 1);
+    int64_t quotient = n / KILO_COIN;
+    int64_t remainder = n % KILO_COIN;
     if (n < 0) {
         quotient = -quotient;
         remainder = -remainder;
     }
-    std::string str = strprintf("%d.%06d", quotient, remainder);
+    std::string str = strprintf("%d.%09d", quotient, remainder);
 
     // Right-trim excess zeros before the decimal point:
     int nTrim = 0;
@@ -60,7 +60,7 @@ std::optional<CAmount> ParseMoney(const std::string& money_string)
         if (*p == '.')
         {
             p++;
-            int64_t nMult = COIN / 10;
+            int64_t nMult = KILO_COIN / 10;
             while (IsDigit(*p) && (nMult > 0))
             {
                 nUnits += nMult * (*p++ - '0');
@@ -77,12 +77,12 @@ std::optional<CAmount> ParseMoney(const std::string& money_string)
     if (*p) {
         return std::nullopt;
     }
-    if (strWhole.size() > 10) // guard against 63 bit overflow
+    if (strWhole.size() > 9) // guard against 63 bit overflow (9 digits * 1e9 < 2^63)
         return std::nullopt;
-    if (nUnits < 0 || nUnits > COIN)
+    if (nUnits < 0 || nUnits > KILO_COIN)
         return std::nullopt;
     int64_t nWhole = LocaleIndependentAtoi<int64_t>(strWhole);
-    CAmount value = nWhole * COIN + nUnits;
+    CAmount value = nWhole * KILO_COIN + nUnits;
 
     if (!MoneyRange(value)) {
         return std::nullopt;

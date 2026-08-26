@@ -15,7 +15,9 @@
 
 #include <QLabel>
 #include <QLineEdit>
+#include <QComboBox>
 #include <QPushButton>
+#include <QTabWidget>
 #include <QTest>
 
 #include <memory>
@@ -223,12 +225,31 @@ void B3TradeTests::backendUnavailableDisablesSubmission()
     QVERIFY(submit != nullptr);
     QVERIFY(!submit->isEnabled());
 
+    for (const char* name : {"ticketBuy", "ticketSell", "ticketPrice", "ticketQuantity",
+                             "marketSelector", "timeframe_1m", "chartCandles", "chartLine",
+                             "chartReset"}) {
+        auto* control = page.findChild<QWidget*>(QLatin1String(name));
+        QVERIFY2(control != nullptr, name);
+        QVERIFY2(!control->isEnabled(), name);
+    }
+
+    auto* order_type = page.findChild<QComboBox*>(QStringLiteral("orderType"));
+    QVERIFY(order_type != nullptr);
+    QCOMPARE(order_type->count(), 1);
+    QCOMPARE(order_type->itemText(0), QStringLiteral("Limit"));
+
+    auto* tabs = page.findChild<QTabWidget*>();
+    QVERIFY(tabs != nullptr);
+    for (int i = 0; i < tabs->count(); ++i) {
+        QVERIFY(tabs->tabText(i) != QStringLiteral("Positions"));
+    }
+
     auto* note = page.findChild<QLabel*>("ticketNote");
     QVERIFY(note != nullptr);
-    QVERIFY(note->text().contains(QStringLiteral("No trading backend")));
+    QVERIFY(note->text().contains(QStringLiteral("not active")));
 
     auto* availability = page.findChild<QLabel*>("tradeAvailability");
-    QVERIFY(availability->text().contains(QStringLiteral("unavailable")));
+    QCOMPARE(availability->text(), QStringLiteral("Preview only"));
 
     // No fabricated numbers anywhere in the ticket readouts.
     QCOMPARE(page.findChild<QLabel*>("ticketBalance")->text(), QStringLiteral("—"));

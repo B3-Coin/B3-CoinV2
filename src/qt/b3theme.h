@@ -12,28 +12,29 @@ class QApplication;
 class QWidget;
 
 /**
- * Centralized B3FlowMesh visual system. A single source of truth for
+ * Centralized B3 Hive visual system. A single source of truth for
  * colors, spacing, radii, typography and component styling so the UI reads
  * as one premium, calm, dark product rather than scattered stylesheet
  * strings. Everything here is presentation only.
  */
 namespace B3Theme {
 
-// Palette — soft dark neutral, restrained.
-inline const QColor kBackground{0x14, 0x16, 0x1a};
-inline const QColor kSurface{0x1a, 0x1d, 0x24};
-inline const QColor kCard{0x21, 0x25, 0x2e};
-inline const QColor kCardHover{0x27, 0x2c, 0x37};
-inline const QColor kBorder{0x2b, 0x30, 0x3b};
-inline const QColor kTextPrimary{0xe6, 0xe9, 0xef};
-inline const QColor kTextSecondary{0x9a, 0xa3, 0xb2};
-inline const QColor kTextMuted{0x6b, 0x72, 0x80};
-inline const QColor kAccent{0x5a, 0x9c, 0xf8};       // calm blue
-inline const QColor kAccentMuted{0x37, 0x4a, 0x66};
-inline const QColor kPositive{0x4c, 0xc2, 0x8c};
-inline const QColor kNegative{0xe0, 0x6c, 0x75};
-inline const QColor kWarning{0xe0, 0x9a, 0x3a};      // testnet
-inline const QColor kRegtest{0x9a, 0x6c, 0xe0};      // regtest
+// Obsidian and honey-gold palette. These values mirror the approved visual
+// direction and deliberately avoid the blue "generic wallet" appearance.
+inline const QColor kBackground{0x0d, 0x0e, 0x0f};
+inline const QColor kSurface{0x11, 0x12, 0x10};
+inline const QColor kCard{0x14, 0x15, 0x13};
+inline const QColor kCardHover{0x1b, 0x1b, 0x18};
+inline const QColor kBorder{0x29, 0x29, 0x23};
+inline const QColor kTextPrimary{0xf3, 0xf0, 0xe8};
+inline const QColor kTextSecondary{0xaa, 0xa8, 0x9f};
+inline const QColor kTextMuted{0x6f, 0x6e, 0x68};
+inline const QColor kAccent{0xf1, 0xbd, 0x47};
+inline const QColor kAccentMuted{0x28, 0x25, 0x1a};
+inline const QColor kPositive{0x5b, 0xc8, 0x95};
+inline const QColor kNegative{0xe1, 0x70, 0x72};
+inline const QColor kWarning{0xe3, 0x9b, 0x43};      // testnet
+inline const QColor kRegtest{0xa9, 0x7b, 0xe8};      // regtest
 
 // Spacing / geometry scale (device-independent px).
 inline constexpr int kSpaceXs{4};
@@ -48,7 +49,8 @@ inline constexpr int kBorderWidth{1};
 inline constexpr int kIconSm{16};
 inline constexpr int kIconMd{20};
 inline constexpr int kIconLg{28};
-inline constexpr int kSidebarWidth{212};
+inline constexpr int kSidebarWidth{202};
+inline constexpr int kSidebarCompactWidth{70};
 
 //! Whether the user requested reduced motion (env or platform hint). UI
 //! animation must be suppressed when true.

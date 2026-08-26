@@ -37,7 +37,7 @@
   <string>b3coin-qt</string>
 
   <key>CFBundleName</key>
-  <string>B3Coin Core</string>
+  <string>B3 Hive</string>
 
   <key>LSHasLocalizedDisplayName</key>
   <true/>

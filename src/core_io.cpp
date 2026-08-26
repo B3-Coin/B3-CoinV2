@@ -301,15 +301,15 @@ util::Result<int> SighashFromStr(const std::string& sighash)
 
 UniValue ValueFromAmount(const CAmount amount)
 {
-    static_assert(COIN > 1);
-    int64_t quotient = amount / COIN;
-    int64_t remainder = amount % COIN;
+    static_assert(KILO_COIN > 1);
+    int64_t quotient = amount / KILO_COIN;
+    int64_t remainder = amount % KILO_COIN;
     if (amount < 0) {
         quotient = -quotient;
         remainder = -remainder;
     }
     return UniValue(UniValue::VNUM,
-            strprintf("%s%d.%08d", amount < 0 ? "-" : "", quotient, remainder));
+            strprintf("%s%d.%09d", amount < 0 ? "-" : "", quotient, remainder));
 }
 
 std::string FormatScript(const CScript& script)

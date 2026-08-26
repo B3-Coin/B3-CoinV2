@@ -31,7 +31,12 @@
 #include <netbase.h>
 #include <node/blockstorage.h>
 #include <node/coin.h>
+#include <consensus/era.h>
+#include <modern/chain_domain.h>
 #include <node/context.h>
+#include <node/finality_binding_index.h>
+#include <node/finality_signature.h>
+#include <node/finality_tracker.h>
 #include <node/interface_ui.h>
 #include <node/mini_miner.h>
 #include <node/miner.h>
@@ -875,6 +880,84 @@ public:
             return status;
         }
         return m_node.staking->Status(validator_key);
+    }
+    interfaces::FinalityStatus finalityStatus(const std::optional<std::array<unsigned char, 32>>& validator_key) override
+    {
+        interfaces::FinalityStatus out;
+        const Consensus::Params& consensus{chainman().GetConsensus()};
+        out.configured = consensus.legacy_b3coin && consensus.modern_pos.has_value() &&
+                         Consensus::LegacyBoundaryPinned(consensus);
+        if (!out.configured) return out;
+        if (const auto domain{modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash)}) {
+            out.chain_domain = *domain;
+        }
+        LOCK(::cs_main);
+        Chainstate& chainstate{chainman().ActiveChainstate()};
+        const CBlockIndex* tip{chainstate.m_chain.Tip()};
+        if (const auto pin{chainstate.m_blockman.FinalityAnchor()}) {
+            out.pin_height = pin->first;
+            out.pin_hash = pin->second;
+        }
+        out.pool_checkpoints = chainstate.FinalitySignatures().TrackedCheckpoints();
+        if (!tip) return out;
+        // Per-validator binding (independent of the epoch state).
+        if (validator_key) {
+            node::FinalityBindingTracker& bindings{chainstate.ModernFinalityBindings()};
+            if (bindings.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) {
+                if (const auto rec{bindings.Index().Get(*validator_key)}) {
+                    out.bound = true;
+                    out.revoked = rec->IsRevoked();
+                    out.binding_seq = rec->seq;
+                    out.binding_bls_pubkey.assign(rec->bls_pubkey.begin(), rec->bls_pubkey.end());
+                    out.binding_height = rec->height;
+                }
+            }
+        }
+        node::FinalityTracker& tracker{chainstate.ModernFinality()};
+        if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) return out;
+        out.active = true;
+        const node::FinalityTracker::State& state{tracker.Current()};
+        out.bootstrapped = state.bootstrapped;
+        out.epoch = state.epoch;
+        out.epoch_start = state.epoch_starts.empty() ? -1 : state.epoch_starts.back();
+        out.handover_certified = state.handover_certified;
+        out.lineage_broken = state.lineage_broken;
+        if (state.current) {
+            out.set_size = static_cast<int>(state.current->Size());
+            out.total_weight = state.current->TotalWeight();
+            out.quorum_weight = state.current->QuorumWeight();
+            out.current_set_hash = state.current->SetHash();
+            if (validator_key) {
+                if (const auto index{state.current->IndexOf(*validator_key)}) {
+                    out.in_current_set = true;
+                    out.member_weight = state.current->Members()[*index].weight;
+                }
+            }
+        }
+        if (state.next) out.next_set_hash = state.next->SetHash();
+        if (state.finalized) {
+            out.finalized_height = state.finalized->height;
+            out.finalized_hash = state.finalized->block_hash;
+            out.finalized_epoch = state.finalized->epoch;
+        }
+        return out;
+    }
+    bool armFinalitySigner(const bls::SecretKey& key, const std::array<unsigned char, 32>& validator_key,
+                           std::string& error) override
+    {
+        if (!m_node.staking) {
+            error = "staking is not available in this node";
+            return false;
+        }
+        return m_node.staking->SetFinalityKey(key, validator_key, error);
+    }
+    bool disarmFinalitySigner(std::string& error) override
+    {
+        if (!m_node.staking) {
+            error = "staking is not available in this node";
+            return false;
+        }
+        return m_node.staking->ClearFinalityKey(error);
     }
 
     NodeContext* context() override { return &m_node; }

@@ -109,7 +109,7 @@ mkdir -p "$DISTSRC"
             esac
 
             # Apply detached codesignatures (in-place)
-            signapple apply "dist/B3Coin Core.app" "codesignatures/osx/${HOST}/dist/B3Coin Core.app"
+            signapple apply "dist/B3 Hive.app" "codesignatures/osx/${HOST}/dist/B3 Hive.app"
             find "${DISTNAME}" \( -wholename "*/bin/*" -o -wholename "*/libexec/*" \) -type f | while read -r bin
             do
                 signapple apply "${bin}" "codesignatures/osx/${HOST}/${bin}.${ARCH}sign"

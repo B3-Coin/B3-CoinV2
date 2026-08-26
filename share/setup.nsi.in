@@ -1,4 +1,4 @@
-Name "@CLIENT_NAME@"
+Name "B3 Hive"
 
 RequestExecutionLevel highest
 SetCompressor /SOLID lzma
@@ -10,25 +10,22 @@ Unicode true
 #SetDatablockOptimize off
 
 # General Symbol Definitions
-!define REGKEY "SOFTWARE\$(^Name)"
-!define COMPANY "@CLIENT_NAME@ project"
+; Keep the existing registry locations so an upgrade finds prior installs.
+!define REGKEY "SOFTWARE\B3 FlowMesh client"
+!define UNINSTALL_REGKEY "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\B3 FlowMesh client"
+!define COMPANY "B3 FlowMesh project"
 !define URL @CLIENT_URL@
 
 # MUI Symbol Definitions
-!define MUI_ICON "@abs_top_srcdir@/share/pixmaps/bitcoin.ico"
-!define MUI_WELCOMEFINISHPAGE_BITMAP "@abs_top_srcdir@/share/pixmaps/nsis-wizard.bmp"
-!define MUI_HEADERIMAGE
-!define MUI_HEADERIMAGE_RIGHT
-!define MUI_HEADERIMAGE_BITMAP "@abs_top_srcdir@/share/pixmaps/nsis-header.bmp"
+!define MUI_ICON "@abs_top_srcdir@/src/qt/res/icons/bitcoin.ico"
 !define MUI_FINISHPAGE_NOAUTOCLOSE
 !define MUI_STARTMENUPAGE_REGISTRY_ROOT HKLM
 !define MUI_STARTMENUPAGE_REGISTRY_KEY ${REGKEY}
 !define MUI_STARTMENUPAGE_REGISTRY_VALUENAME StartMenuGroup
-!define MUI_STARTMENUPAGE_DEFAULTFOLDER "@CLIENT_NAME@"
+!define MUI_STARTMENUPAGE_DEFAULTFOLDER "B3 Hive"
 !define MUI_FINISHPAGE_RUN "$WINDIR\explorer.exe"
 !define MUI_FINISHPAGE_RUN_PARAMETERS $INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@
 !define MUI_UNICON "${NSISDIR}\Contrib\Graphics\Icons\modern-uninstall.ico"
-!define MUI_UNWELCOMEFINISHPAGE_BITMAP "@abs_top_srcdir@/share/pixmaps/nsis-wizard.bmp"
 !define MUI_UNFINISHPAGE_NOAUTOCLOSE
 
 # Included files
@@ -58,12 +55,12 @@ XPStyle on
 BrandingText " "
 ShowInstDetails show
 VIProductVersion @CLIENT_VERSION_MAJOR@.@CLIENT_VERSION_MINOR@.@CLIENT_VERSION_BUILD@.0
-VIAddVersionKey ProductName "@CLIENT_NAME@"
+VIAddVersionKey ProductName "B3 Hive"
 VIAddVersionKey ProductVersion "@CLIENT_VERSION_STRING@"
 VIAddVersionKey CompanyName "${COMPANY}"
 VIAddVersionKey CompanyWebsite "${URL}"
 VIAddVersionKey FileVersion "@CLIENT_VERSION_STRING@"
-VIAddVersionKey FileDescription "Installer for @CLIENT_NAME@"
+VIAddVersionKey FileDescription "Installer for B3 Hive"
 VIAddVersionKey LegalCopyright "Copyright (C) 2009-@COPYRIGHT_YEAR@ @COPYRIGHT_HOLDERS_FINAL@"
 InstallDirRegKey HKCU "${REGKEY}" Path
 ShowUninstDetails show
@@ -95,19 +92,19 @@ Section -post SEC0001
     !insertmacro MUI_STARTMENU_WRITE_BEGIN Application
     CreateDirectory $SMPROGRAMS\$StartMenuGroup
     CreateShortcut "$SMPROGRAMS\$StartMenuGroup\$(^Name).lnk" $INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@
-    CreateShortcut "$SMPROGRAMS\$StartMenuGroup\@CLIENT_NAME@ (testnet).lnk" "$INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@" "-testnet" "$INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@" 1
-    CreateShortcut "$SMPROGRAMS\$StartMenuGroup\@CLIENT_NAME@ (test signet).lnk" "$INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@" "-signet" "$INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@" 2
-    CreateShortcut "$SMPROGRAMS\$StartMenuGroup\@CLIENT_NAME@ (testnet4).lnk" "$INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@" "-testnet4" "$INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@" 3
+    CreateShortcut "$SMPROGRAMS\$StartMenuGroup\B3 Hive (testnet).lnk" "$INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@" "-testnet" "$INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@" 0
+    CreateShortcut "$SMPROGRAMS\$StartMenuGroup\B3 Hive (test signet).lnk" "$INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@" "-signet" "$INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@" 0
+    CreateShortcut "$SMPROGRAMS\$StartMenuGroup\B3 Hive (testnet4).lnk" "$INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@" "-testnet4" "$INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@" 0
     CreateShortcut "$SMPROGRAMS\$StartMenuGroup\Uninstall $(^Name).lnk" $INSTDIR\uninstall.exe
     !insertmacro MUI_STARTMENU_WRITE_END
-    WriteRegStr HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$(^Name)" DisplayName "$(^Name)"
-    WriteRegStr HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$(^Name)" DisplayVersion "@CLIENT_VERSION_STRING@"
-    WriteRegStr HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$(^Name)" Publisher "${COMPANY}"
-    WriteRegStr HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$(^Name)" URLInfoAbout "${URL}"
-    WriteRegStr HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$(^Name)" DisplayIcon $INSTDIR\b3coin-qt.exe
-    WriteRegStr HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$(^Name)" UninstallString $INSTDIR\uninstall.exe
-    WriteRegDWORD HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$(^Name)" NoModify 1
-    WriteRegDWORD HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$(^Name)" NoRepair 1
+    WriteRegStr HKCU "${UNINSTALL_REGKEY}" DisplayName "$(^Name)"
+    WriteRegStr HKCU "${UNINSTALL_REGKEY}" DisplayVersion "@CLIENT_VERSION_STRING@"
+    WriteRegStr HKCU "${UNINSTALL_REGKEY}" Publisher "${COMPANY}"
+    WriteRegStr HKCU "${UNINSTALL_REGKEY}" URLInfoAbout "${URL}"
+    WriteRegStr HKCU "${UNINSTALL_REGKEY}" DisplayIcon $INSTDIR\b3coin-qt.exe
+    WriteRegStr HKCU "${UNINSTALL_REGKEY}" UninstallString $INSTDIR\uninstall.exe
+    WriteRegDWORD HKCU "${UNINSTALL_REGKEY}" NoModify 1
+    WriteRegDWORD HKCU "${UNINSTALL_REGKEY}" NoRepair 1
     WriteRegStr HKCR "@CLIENT_TARNAME@" "URL Protocol" ""
     WriteRegStr HKCR "@CLIENT_TARNAME@" "" "URL:B3Coin"
     WriteRegStr HKCR "@CLIENT_TARNAME@\DefaultIcon" "" $INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@
@@ -115,9 +112,9 @@ Section -post SEC0001
 
     # Lingering since fb2b05b1259d3e69e6e675adfa30b429424c7625 which removed the suffix
     DeleteRegValue HKCU "${REGKEY} (64-bit)\Components" Main
-    DeleteRegKey HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$(^Name) (64-bit)"
-    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\Uninstall $(^Name) (64-bit).lnk"
-    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\$(^Name) (64-bit).lnk"
+    DeleteRegKey HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\B3 FlowMesh client (64-bit)"
+    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\Uninstall B3 FlowMesh client (64-bit).lnk"
+    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\B3 FlowMesh client (64-bit).lnk"
     DeleteRegValue HKCU "${REGKEY} (64-bit)" StartMenuGroup
     DeleteRegValue HKCU "${REGKEY} (64-bit)" Path
     DeleteRegKey /IfEmpty HKCU "${REGKEY} (64-bit)\Components"
@@ -152,12 +149,17 @@ Section /o -un.Main UNSEC0000
 SectionEnd
 
 Section -un.post UNSEC0001
-    DeleteRegKey HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$(^Name)"
+    DeleteRegKey HKCU "${UNINSTALL_REGKEY}"
     Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\Uninstall $(^Name).lnk"
     Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\$(^Name).lnk"
-    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\@CLIENT_NAME@ (testnet).lnk"
-    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\@CLIENT_NAME@ (testnet4).lnk"
-    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\@CLIENT_NAME@ (test signet).lnk"
+    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\Uninstall B3 FlowMesh client.lnk"
+    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\B3 FlowMesh client.lnk"
+    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\B3 Hive (testnet).lnk"
+    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\B3 Hive (testnet4).lnk"
+    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\B3 Hive (test signet).lnk"
+    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\B3 FlowMesh client (testnet).lnk"
+    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\B3 FlowMesh client (testnet4).lnk"
+    Delete /REBOOTOK "$SMPROGRAMS\$StartMenuGroup\B3 FlowMesh client (test signet).lnk"
     Delete /REBOOTOK "$SMSTARTUP\Bitcoin.lnk"
     Delete /REBOOTOK $INSTDIR\uninstall.exe
     Delete /REBOOTOK $INSTDIR\debug.log

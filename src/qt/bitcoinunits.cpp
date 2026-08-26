@@ -20,12 +20,9 @@ BitcoinUnits::BitcoinUnits(QObject *parent):
 
 QList<BitcoinUnit> BitcoinUnits::availableUnits()
 {
-    QList<BitcoinUnit> unitlist;
-    unitlist.append(Unit::BTC);
-    unitlist.append(Unit::mBTC);
-    unitlist.append(Unit::uBTC);
-    unitlist.append(Unit::SAT);
-    return unitlist;
+    // Product rule: B3 has one human-facing denomination. Legacy enum values
+    // remain serializable for compatibility, but are never offered in the UI.
+    return {Unit::BTC};
 }
 
 QString BitcoinUnits::longName(Unit unit)
@@ -34,7 +31,7 @@ QString BitcoinUnits::longName(Unit unit)
     case Unit::BTC: return QString("B3");
     case Unit::mBTC: return QString("mB3");
     case Unit::uBTC: return QString::fromUtf8("µB3 (bits)");
-    case Unit::SAT: return QString("Satoshi (sat)");
+    case Unit::SAT: return QString("B3 base unit");
     } // no default case, so the compiler can warn about missing cases
     assert(false);
 }
@@ -45,7 +42,7 @@ QString BitcoinUnits::shortName(Unit unit)
     case Unit::BTC: return longName(unit);
     case Unit::mBTC: return longName(unit);
     case Unit::uBTC: return QString("bits");
-    case Unit::SAT: return QString("sat");
+    case Unit::SAT: return QString("base");
     } // no default case, so the compiler can warn about missing cases
     assert(false);
 }
@@ -53,10 +50,10 @@ QString BitcoinUnits::shortName(Unit unit)
 QString BitcoinUnits::description(Unit unit)
 {
     switch (unit) {
-    case Unit::BTC: return QString("B3Coins");
-    case Unit::mBTC: return QString("Milli-B3Coins (1 / 1" THIN_SP_UTF8 "000)");
-    case Unit::uBTC: return QString("Micro-B3Coins (bits) (1 / 1" THIN_SP_UTF8 "000" THIN_SP_UTF8 "000)");
-    case Unit::SAT: return QString("Satoshi (sat) (1 / 100" THIN_SP_UTF8 "000" THIN_SP_UTF8 "000)");
+    case Unit::BTC: return QString("B3");
+    case Unit::mBTC: return QString("Milli-B3 (1 / 1" THIN_SP_UTF8 "000)");
+    case Unit::uBTC: return QString("Micro-B3 (1 / 1" THIN_SP_UTF8 "000" THIN_SP_UTF8 "000)");
+    case Unit::SAT: return QString("B3 base unit (1 / 1" THIN_SP_UTF8 "000" THIN_SP_UTF8 "000" THIN_SP_UTF8 "000)");
     } // no default case, so the compiler can warn about missing cases
     assert(false);
 }
@@ -64,9 +61,9 @@ QString BitcoinUnits::description(Unit unit)
 qint64 BitcoinUnits::factor(Unit unit)
 {
     switch (unit) {
-    case Unit::BTC: return 100'000'000;
-    case Unit::mBTC: return 100'000;
-    case Unit::uBTC: return 100;
+    case Unit::BTC: return 1'000'000'000;
+    case Unit::mBTC: return 1'000'000;
+    case Unit::uBTC: return 1'000;
     case Unit::SAT: return 1;
     } // no default case, so the compiler can warn about missing cases
     assert(false);
@@ -75,9 +72,9 @@ qint64 BitcoinUnits::factor(Unit unit)
 int BitcoinUnits::decimals(Unit unit)
 {
     switch (unit) {
-    case Unit::BTC: return 8;
-    case Unit::mBTC: return 5;
-    case Unit::uBTC: return 2;
+    case Unit::BTC: return 9;
+    case Unit::mBTC: return 6;
+    case Unit::uBTC: return 3;
     case Unit::SAT: return 0;
     } // no default case, so the compiler can warn about missing cases
     assert(false);

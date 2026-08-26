@@ -51,7 +51,7 @@ endfunction()
 
 function(add_macos_deploy_target)
   if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND TARGET b3coin-qt)
-    set(macos_app "B3Coin Core.app")
+    set(macos_app "B3 Hive.app")
     # Populate Contents subdirectory.
     configure_file(${PROJECT_SOURCE_DIR}/share/qt/Info.plist.in ${macos_app}/Contents/Info.plist NO_SOURCE_PERMISSIONS)
     file(CONFIGURE OUTPUT ${macos_app}/Contents/PkgInfo CONTENT "APPL????")
@@ -59,7 +59,7 @@ function(add_macos_deploy_target)
     file(CONFIGURE OUTPUT ${macos_app}/Contents/Resources/empty.lproj CONTENT "")
     configure_file(${PROJECT_SOURCE_DIR}/src/qt/res/icons/bitcoin.icns ${macos_app}/Contents/Resources/b3coin.icns NO_SOURCE_PERMISSIONS COPYONLY)
     file(CONFIGURE OUTPUT ${macos_app}/Contents/Resources/Base.lproj/InfoPlist.strings
-      CONTENT "{ CFBundleDisplayName = \"@CLIENT_NAME@\"; CFBundleName = \"@CLIENT_NAME@\"; }"
+      CONTENT "{ CFBundleDisplayName = \"B3 Hive\"; CFBundleName = \"B3 Hive\"; }"
     )
 
     add_custom_command(

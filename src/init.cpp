@@ -1926,6 +1926,8 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
                                      *node.mempool, *node.warnings,
                                      peerman_opts);
     validation_signals.RegisterValidationInterface(node.peerman.get());
+    // The staking loop relays its finality signatures through the peer manager.
+    if (node.staking) node.staking->SetPeerManager(node.peerman.get());
 
     // ********************************************************* Step 8: start indexers
 

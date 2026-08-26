@@ -67,7 +67,19 @@ Copyright: Stephen Hutchings, Jonas Schnelli
 License: Expat
 Comment: Modifications of Stephen Hutchings' Typicons
 
-Files: src/qt/res/icons/bitcoin.*
+Files: src/qt/res/icons/b3hive_mark.png
+       src/qt/res/icons/bitcoin.icns
+       src/qt/res/icons/bitcoin.ico
+       src/qt/res/icons/bitcoin.png
+       src/qt/res/src/b3hive-icon.svg
+       src/qt/res/src/b3hive-mark.svg
+Copyright: 2026, B3 Coin project contributors
+License: Expat
+Comment: Original B3 Hive identity artwork. The bitcoin.* filenames are
+         retained as internal resource compatibility aliases.
+
+Files: src/qt/res/icons/bitcoin_signet.ico
+       src/qt/res/icons/bitcoin_testnet.ico
        share/pixmaps/bitcoin*
        src/qt/res/src/bitcoin.svg
 Copyright: Bitboy, Jonas Schnelli

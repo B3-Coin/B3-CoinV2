@@ -55,6 +55,12 @@ void B3ShellTests::shellRoutesNavigationAndSwitchesContent()
     shell.showPage(B3Page::Dashboard);
     QVERIFY(wallet->isVisibleTo(&shell) || wallet->parent() != nullptr);
     QCOMPARE(shell.sidebar()->currentPage(), B3Page::Dashboard);
+    auto* title = shell.topStatus()->findChild<QLabel*>("B3TopStatusTitle");
+    QVERIFY(title != nullptr);
+    QCOMPARE(title->text(), QStringLiteral("Overview"));
+
+    shell.showPage(B3Page::Trade);
+    QCOMPARE(title->text(), QStringLiteral("Trade"));
 }
 
 void B3ShellTests::placeholderPagesAreHonest()
@@ -83,7 +89,7 @@ void B3ShellTests::topStatusReflectsNetworkAndPeers()
     status.setNetwork(QStringLiteral("B3Coin"), QString());
     auto* badge = status.findChild<QLabel*>("B3NetBadge");
     QVERIFY(badge != nullptr);
-    QCOMPARE(badge->text(), QStringLiteral("Mainnet"));
+    QCOMPARE(badge->text(), QStringLiteral("MAINNET"));
 
     // Regtest is unmistakable.
     status.setNetwork(QStringLiteral("B3Coin"), QStringLiteral("[regtest]"));
@@ -93,6 +99,15 @@ void B3ShellTests::topStatusReflectsNetworkAndPeers()
     auto* peers = status.findChild<QLabel*>("statusConnections");
     QVERIFY(peers != nullptr);
     QVERIFY(!peers->text().isEmpty());
+    status.setCompact(true);
+    QVERIFY(peers->isHidden());
+    QVERIFY(!badge->isHidden());
+    QLabel wallet_security;
+    wallet_security.setObjectName(QStringLiteral("B3WalletSecurity"));
+    status.addTrailingWidget(&wallet_security);
+    QVERIFY(!wallet_security.isHidden());
+    status.setCompact(false);
+    QVERIFY(!peers->isHidden());
 
     // No staking model: the staking chip stays hidden.
     status.setStakingStatus(QString());

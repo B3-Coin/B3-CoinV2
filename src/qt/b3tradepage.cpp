@@ -96,37 +96,73 @@ B3TradePage::B3TradePage(QWidget* parent)
     layout->setContentsMargins(B3Theme::kSpaceLg, B3Theme::kSpaceLg, B3Theme::kSpaceLg, B3Theme::kSpaceLg);
     layout->setSpacing(B3Theme::kSpaceMd);
 
-    // ── Top bar: market identity + timeframe + availability ──────────
-    auto* topBar = new QHBoxLayout();
-    auto* heading = new QLabel(tr("Trade"), this);
+    // ── Header: honest inactive preview + market identity ────────────
+    // Keep identity, market state and timeframe controls on separate rows.
+    // Besides being calmer visually, this prevents the inactive Trade page
+    // from imposing a desktop-only minimum width on every page in B3Shell's
+    // stacked layout.
+    auto* topBar = new QVBoxLayout();
+    topBar->setSpacing(B3Theme::kSpaceSm);
+    auto* identityRow = new QHBoxLayout();
+    auto* identityCopy = new QVBoxLayout();
+    identityCopy->setContentsMargins(0, 0, 0, 0);
+    identityCopy->setSpacing(B3Theme::kSpaceXs);
+    auto* eyebrow = new QLabel(tr("B3 FLOWMESH"), this);
+    B3Theme::markTextRole(eyebrow, QStringLiteral("eyebrow"));
+    identityCopy->addWidget(eyebrow);
+    auto* heading = new QLabel(tr("Trading workspace"), this);
     B3Theme::markTextRole(heading, QStringLiteral("h1"));
-    topBar->addWidget(heading);
+    identityCopy->addWidget(heading);
+    identityRow->addLayout(identityCopy);
+
+    auto* preview = new QLabel(tr("INACTIVE PREVIEW"), this);
+    preview->setObjectName(QStringLiteral("tradePreviewBadge"));
+    B3Theme::markTextRole(preview, QStringLiteral("accent"));
+    identityRow->addWidget(preview);
 
     m_market_selector = new QComboBox(this);
     m_market_selector->setObjectName(QStringLiteral("marketSelector"));
     m_market_selector->setPlaceholderText(tr("No markets"));
-    topBar->addWidget(m_market_selector);
+    m_market_selector->setProperty("requiresTradingBackend", true);
 
     m_market_label = new QLabel(tr("No market selected"), this);
     B3Theme::markTextRole(m_market_label, QStringLiteral("secondary"));
-    topBar->addWidget(m_market_label);
-    topBar->addStretch();
+    identityRow->addStretch();
+    topBar->addLayout(identityRow);
 
+    auto* controlsRow = new QHBoxLayout();
     auto* timeframes = new QButtonGroup(this);
     for (const QString& tf : {QStringLiteral("1m"), QStringLiteral("15m"), QStringLiteral("1h"), QStringLiteral("1d")}) {
         auto* button = new QPushButton(tf, this);
         button->setCheckable(true);
         button->setObjectName(QStringLiteral("timeframe_") + tf);
+        button->setProperty("requiresTradingBackend", true);
+        button->setProperty("b3variant", QStringLiteral("timeframe"));
         timeframes->addButton(button);
-        topBar->addWidget(button);
+        controlsRow->addWidget(button);
         if (tf == QLatin1String("1h")) button->setChecked(true);
     }
+    controlsRow->addStretch();
 
     m_availability = new QLabel(this);
     m_availability->setObjectName(QStringLiteral("tradeAvailability"));
     B3Theme::markTextRole(m_availability, QStringLiteral("secondary"));
-    topBar->addWidget(m_availability);
+
+    auto* marketRow = new QHBoxLayout();
+    marketRow->addWidget(m_market_selector);
+    marketRow->addWidget(m_market_label);
+    marketRow->addStretch();
+    marketRow->addWidget(m_availability);
+    topBar->addLayout(marketRow);
+    topBar->addLayout(controlsRow);
     layout->addLayout(topBar);
+
+    auto* inactiveMessage = new QLabel(
+        tr("◇  FlowMesh is packaged as inactive infrastructure. No markets, orders, prices, or balances are presented as live."),
+        this);
+    inactiveMessage->setObjectName(QStringLiteral("tradeInactiveMessage"));
+    inactiveMessage->setWordWrap(true);
+    layout->addWidget(inactiveMessage);
 
     // ── Center: chart | order book + trades ──────────────────────────
     auto* center = new QSplitter(Qt::Horizontal, this);
@@ -140,8 +176,13 @@ B3TradePage::B3TradePage(QWidget* parent)
         auto* candlesButton = new QPushButton(tr("Candles"), chartCard);
         auto* lineButton = new QPushButton(tr("Line"), chartCard);
         auto* resetButton = new QPushButton(tr("Reset"), chartCard);
+        candlesButton->setObjectName(QStringLiteral("chartCandles"));
+        lineButton->setObjectName(QStringLiteral("chartLine"));
         resetButton->setObjectName(QStringLiteral("chartReset"));
-        for (auto* b : {candlesButton, lineButton, resetButton}) chartTools->addWidget(b);
+        for (auto* b : {candlesButton, lineButton, resetButton}) {
+            b->setProperty("requiresTradingBackend", true);
+            chartTools->addWidget(b);
+        }
         chartTools->addStretch();
         chartLayout->addLayout(chartTools);
 
@@ -160,7 +201,7 @@ B3TradePage::B3TradePage(QWidget* parent)
     {
         auto* bookLayout = new QVBoxLayout(bookCard);
         bookLayout->setContentsMargins(B3Theme::kSpaceSm, B3Theme::kSpaceSm, B3Theme::kSpaceSm, B3Theme::kSpaceSm);
-        auto* bookTitle = new QLabel(tr("Order book"), bookCard);
+        auto* bookTitle = new QLabel(tr("Liquidity preview"), bookCard);
         B3Theme::markTextRole(bookTitle, QStringLiteral("h3"));
         bookLayout->addWidget(bookTitle);
 
@@ -186,11 +227,12 @@ B3TradePage::B3TradePage(QWidget* parent)
         bookLayout->addWidget(m_trades_view, 1);
     }
     center->addWidget(bookCard);
-    center->setStretchFactor(0, 3);
-    center->setStretchFactor(1, 2);
+    center->setStretchFactor(0, 4);
+    center->setStretchFactor(1, 1);
+    center->setSizes({900, 250});
     layout->addWidget(center, 3);
 
-    // ── Lower area: ticket + orders/positions/fills tabs ─────────────
+    // ── Lower area: inactive limit ticket + spot activity tabs ───────
     auto* lower = new QHBoxLayout();
     lower->setSpacing(B3Theme::kSpaceMd);
 
@@ -209,13 +251,19 @@ B3TradePage::B3TradePage(QWidget* parent)
         m_buy->setCheckable(true);
         m_sell->setCheckable(true);
         m_buy->setChecked(true);
+        m_buy->setProperty("requiresTradingBackend", true);
+        m_sell->setProperty("requiresTradingBackend", true);
         auto* sideGroup = new QButtonGroup(ticketCard);
         sideGroup->addButton(m_buy);
         sideGroup->addButton(m_sell);
         sideRow->addWidget(m_buy);
         sideRow->addWidget(m_sell);
         m_order_type = new QComboBox(ticketCard);
-        m_order_type->addItems({tr("Limit"), tr("Market")});
+        m_order_type->setObjectName(QStringLiteral("orderType"));
+        // FlowMesh v1 is represented honestly: the inactive shell exposes
+        // no market-order or futures surface.
+        m_order_type->addItem(tr("Limit"));
+        m_order_type->setProperty("requiresTradingBackend", true);
         sideRow->addWidget(m_order_type);
         ticket->addLayout(sideRow);
 
@@ -233,6 +281,7 @@ B3TradePage::B3TradePage(QWidget* parent)
             (*field_out)->setValidator(validator);
             (*field_out)->setAlignment(Qt::AlignRight);
             (*field_out)->setMaximumWidth(180);
+            (*field_out)->setProperty("requiresTradingBackend", true);
             row->addWidget(*field_out);
             ticket->addLayout(row);
         };
@@ -256,6 +305,7 @@ B3TradePage::B3TradePage(QWidget* parent)
 
         m_submit = new QPushButton(ticketCard);
         m_submit->setObjectName(QStringLiteral("ticketSubmit"));
+        m_submit->setProperty("requiresTradingBackend", true);
         ticket->addWidget(m_submit);
 
         m_ticket_note = new QLabel(ticketCard);
@@ -281,7 +331,6 @@ B3TradePage::B3TradePage(QWidget* parent)
             m_tabs->addTab(view, title);
         };
         addEmptyTab(tr("Open orders"), {tr("Market"), tr("Side"), tr("Price"), tr("Quantity"), tr("Status")}, "openOrdersView");
-        addEmptyTab(tr("Positions"), {tr("Market"), tr("Size"), tr("Entry"), tr("Value")}, "positionsView");
         addEmptyTab(tr("Fills"), {tr("Time"), tr("Market"), tr("Side"), tr("Price"), tr("Quantity")}, "fillsView");
         addEmptyTab(tr("Balances"), {tr("Asset"), tr("Available"), tr("Reserved")}, "tradeBalancesView");
     }
@@ -310,25 +359,39 @@ void B3TradePage::setBackend(B3TradingBackend* backend)
 
 void B3TradePage::updateAvailability()
 {
-    const bool available = m_backend->available();
+    const bool data_available = m_backend->available();
 
-    m_availability->setText(available ? tr("Backend connected") : tr("Backend unavailable"));
-    m_market_selector->setEnabled(available);
+    m_availability->setText(data_available
+                                ? tr("Preview data connected · trading inactive")
+                                : tr("Preview only"));
 
-    m_submit->setEnabled(available);
-    m_submit->setText(m_buy->isChecked() ? tr("Buy") : tr("Sell"));
-    m_ticket_note->setVisible(!available);
-    m_ticket_note->setText(m_backend->unavailableReason());
+    // The current backend interface can report availability and fee previews,
+    // but it has no approved order-submission path. Keep every action control
+    // inert even if a test or future data source reports itself available.
+    // Tables remain visible as honest read-only previews.
+    for (QWidget* control : findChildren<QWidget*>()) {
+        if (control->property("requiresTradingBackend").toBool()) {
+            control->setEnabled(false);
+        }
+    }
+    m_chart->setEnabled(false);
 
-    if (!available) {
+    m_submit->setEnabled(false);
+    m_submit->setText(tr("Trading unavailable"));
+    m_ticket_note->setVisible(true);
+    m_ticket_note->setText(
+        tr("FlowMesh trading is not active in this wallet build. This preview cannot place "
+           "orders, reserve balances, or create positions."));
+
+    if (!data_available) {
         m_bids->setState(B3OrderBookModel::State::Unavailable);
         m_asks->setState(B3OrderBookModel::State::Unavailable);
         m_book_state->setVisible(true);
-        m_book_state->setText(tr("Order book unavailable: no market data backend."));
+        m_book_state->setText(tr("No live FlowMesh market data is connected. Values shown here are never fabricated."));
         m_balance->setText(QStringLiteral("—"));
     } else {
         m_book_state->setVisible(m_bids->rowCount() == 0 && m_asks->rowCount() == 0);
-        m_book_state->setText(tr("Order book is empty."));
+        m_book_state->setText(tr("Preview order book is empty; trading remains inactive."));
     }
     updateTicketTotal();
 }

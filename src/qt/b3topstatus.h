@@ -13,7 +13,7 @@ class QLabel;
 QT_END_NAMESPACE
 
 /**
- * Top status area of the shell: B3FlowMesh identity, active network, sync
+ * Top status area of the shell: B3 Hive identity, active network, sync
  * state, connection status, wallet status and staking status. It is a
  * pure view — the surrounding window drives it from the existing
  * ClientModel/WalletModel status slots, so no data is ever fabricated
@@ -26,6 +26,9 @@ class B3TopStatus : public QFrame
 
 public:
     explicit B3TopStatus(QWidget* parent = nullptr);
+
+    //! Presentation-only title of the current shell destination.
+    void setSectionTitle(const QString& title);
 
     //! Network identity. `title_add` is the NetworkStyle suffix (empty on
     //! mainnet, e.g. "[testnet]"/"[regtest]" otherwise).
@@ -40,6 +43,11 @@ public:
     //! Host an externally-owned widget (the wallet selector) on the right.
     void addTrailingWidget(QWidget* widget);
 
+    //! Reduce nonessential copy at narrow window widths without changing
+    //! any underlying status or hosted wallet-selector behavior.
+    void setCompact(bool compact);
+    bool isCompact() const { return m_compact; }
+
 private:
     QLabel* makeChip(const QString& objectName);
 
@@ -51,6 +59,7 @@ private:
     QLabel* m_wallet{nullptr};
     QLabel* m_staking{nullptr};
     QHBoxLayout* m_trailing{nullptr};
+    bool m_compact{false};
 };
 
 #endif // BITCOIN_QT_B3TOPSTATUS_H

@@ -20,6 +20,25 @@ static const int COINBASE_MATURITY = 30;
 
 static const int WITNESS_SCALE_FACTOR = 4;
 
+/** B3 Modern Payload Area (MPA) and payload verification-cost budget —
+ *  owner-frozen constants (2026-08-23). Declared ahead of the MPA codec and
+ *  the cost-accounting rules (implementation plan, Commits 5/8); nothing
+ *  consults them yet. The MPA carries large evidence bytes OUTSIDE policy
+ *  state (policy_params stays <= 80 bytes, permanently). */
+/** Hard ceiling for one MPA record payload, bytes (per-type maxima are <= this). */
+static const size_t MAX_PAYLOAD_RECORD_SIZE = 32768;
+/** Maximum serialized MPA section per transaction, bytes. */
+static const size_t MAX_PAYLOAD_SECTION_SIZE = 65536;
+/** Maximum number of MPA records per transaction (ratified 64). */
+static const size_t MAX_PAYLOAD_RECORDS_PER_TX = 64;
+/** MPA bytes count at the full scale factor (x4): historical chain data, no witness discount. */
+static const int MPA_WEIGHT_FACTOR = WITNESS_SCALE_FACTOR;
+/** Sum of declared record verification costs allowed per block / per transaction (1 unit ~ 1 us reference). */
+static const int64_t MAX_BLOCK_PAYLOAD_COST = 120000;
+static const int64_t MAX_TX_PAYLOAD_COST = 12000;
+/** Relay/fee accounting: virtual bytes charged per cost unit (vsize = max(weight/4, cost * this)). */
+static const int64_t PAYLOAD_COST_TO_VBYTES = 1;
+
 static const size_t MIN_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 60; // 60 is the lower bound for the size of a valid serialized CTransaction
 static const size_t MIN_SERIALIZABLE_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 10; // 10 is the lower bound for the size of a serialized CTransaction
 

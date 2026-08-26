@@ -37,6 +37,14 @@ add_executable(test_bitcoin
   coinstatsindex_tests.cpp
   coinsviewoverlay_tests.cpp
   common_url_tests.cpp
+  bridge_deposit_tests.cpp
+  bridge_eth_light_client_tests.cpp
+  bridge_exec_chain_tests.cpp
+  bridge_mpt_tests.cpp
+  update_downloader_tests.cpp
+  update_manager_tests.cpp
+  modern_reward_tests.cpp
+  update_manifest_tests.cpp
   compress_tests.cpp
   consensus_phase_tests.cpp
   crypto_tests.cpp
@@ -81,6 +89,27 @@ add_executable(test_bitcoin
   merkleblock_tests.cpp
   miner_tests.cpp
   modern_stake_tests.cpp
+  finality_types_tests.cpp
+  bls_tests.cpp
+  metadata_cell_tests.cpp
+  finality_key_tests.cpp
+  finality_key_binding_tests.cpp
+  mpa_tests.cpp
+  ptxid_tests.cpp
+  payload_root_tests.cpp
+  payload_cost_tests.cpp
+  validator_set_tests.cpp
+  finality_certificate_tests.cpp
+  finality_schedule_tests.cpp
+  finality_epoch_tests.cpp
+  finality_pin_tests.cpp
+  finality_eligibility_tests.cpp
+  finality_pin_persist_tests.cpp
+  finality_signature_tests.cpp
+  finality_production_tests.cpp
+  finality_operations_tests.cpp
+  finality_activation_tests.cpp
+  finality_qualification_tests.cpp
   modern_pos_tests.cpp
   miniminer_tests.cpp
   miniscript_tests.cpp
@@ -171,6 +200,7 @@ add_executable(test_bitcoin
 include(TargetDataSources)
 target_json_data_sources(test_bitcoin
   data/base58_encode_decode.json
+  data/bls12_381_eth_vectors.json
   data/bip341_wallet_vectors.json
   data/blockfilters.json
   data/key_io_invalid.json
@@ -188,6 +218,7 @@ add_windows_application_manifest(test_bitcoin)
 
 target_link_libraries(test_bitcoin
   core_interface
+  b3_update
   test_util
   bitcoin_cli
   bitcoin_node

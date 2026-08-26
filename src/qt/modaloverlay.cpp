@@ -5,12 +5,15 @@
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
 #include <qt/modaloverlay.h>
+#include <qt/guiconstants.h>
 #include <qt/forms/ui_modaloverlay.h>
 
 #include <chainparams.h>
+#include <qt/b3theme.h>
 #include <qt/guiutil.h>
 
 #include <QEasingCurve>
+#include <QPainter>
 #include <QPropertyAnimation>
 #include <QResizeEvent>
 
@@ -20,6 +23,26 @@ ModalOverlay::ModalOverlay(bool enable_wallet, QWidget* parent)
       bestHeaderDate(QDateTime())
 {
     ui->setupUi(this);
+    ui->contentWidget->setMaximumWidth(760);
+    ui->verticalLayoutMain->setAlignment(ui->contentWidget, Qt::AlignCenter);
+    ui->closeButton->setProperty("b3variant", "primary");
+
+    // The historical warning artwork is monochrome black. Tint it here so
+    // it remains visible on the canonical dark modal surface without
+    // changing any shared icon resource.
+    QPixmap warning{QStringLiteral(":/icons/warning")};
+    if (!warning.isNull()) {
+        warning = warning.scaled(48, 48, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        QPainter painter{&warning};
+        painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+        painter.fillRect(warning.rect(), B3Theme::kWarning);
+        painter.end();
+        ui->warningIcon->setIcon(QIcon{warning});
+    }
+    ui->warningIcon->setEnabled(true);
+    ui->warningIcon->setFocusPolicy(Qt::NoFocus);
+    ui->warningIcon->setAttribute(Qt::WA_TransparentForMouseEvents);
+
     connect(ui->closeButton, &QPushButton::clicked, this, &ModalOverlay::closeClicked);
     if (parent) {
         parent->installEventFilter(this);
@@ -31,13 +54,14 @@ ModalOverlay::ModalOverlay(bool enable_wallet, QWidget* parent)
     setVisible(false);
     if (!enable_wallet) {
         ui->infoText->setVisible(false);
-        ui->infoTextStrong->setText(tr("%1 is currently syncing.  It will download headers and blocks from peers and validate them until reaching the tip of the block chain.").arg(CLIENT_NAME));
+        ui->infoTextStrong->setText(tr("%1 is synchronizing the B3 network. It will download and validate headers and blocks from peers until it reaches the chain tip.").arg(HIVE_NAME));
     }
 
     m_animation.setTargetObject(this);
     m_animation.setPropertyName("pos");
-    m_animation.setDuration(300 /* ms */);
+    m_animation.setDuration(B3Theme::reducedMotion() ? 0 : 220 /* ms */);
     m_animation.setEasingCurve(QEasingCurve::OutQuad);
+    updateVisualLayout(width(), height());
 }
 
 ModalOverlay::~ModalOverlay()
@@ -50,6 +74,7 @@ bool ModalOverlay::eventFilter(QObject * obj, QEvent * ev) {
         if (ev->type() == QEvent::Resize) {
             QResizeEvent * rev = static_cast<QResizeEvent*>(ev);
             resize(rev->size());
+            updateVisualLayout(rev->size().width(), rev->size().height());
             if (!layerIsVisible)
                 setGeometry(0, height(), width(), height());
 
@@ -67,6 +92,16 @@ bool ModalOverlay::eventFilter(QObject * obj, QEvent * ev) {
     }
 
     return QWidget::eventFilter(obj, ev);
+}
+
+void ModalOverlay::updateVisualLayout(int width, int height)
+{
+    const bool narrow = width < 760;
+    const bool short_window = height < 520;
+    const int horizontal_margin = narrow ? 16 : (width < 1050 ? 32 : 60);
+    const int vertical_margin = short_window ? 12 : (height < 720 ? 28 : 52);
+    ui->verticalLayoutMain->setContentsMargins(horizontal_margin, vertical_margin,
+                                               horizontal_margin, vertical_margin);
 }
 
 //! Tracks parent widget changes

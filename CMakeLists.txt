@@ -26,9 +26,12 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 #=============================
 # Project / Package metadata
 #=============================
-set(CLIENT_NAME "B3Coin Core")
-set(CLIENT_VERSION_MAJOR 31)
-set(CLIENT_VERSION_MINOR 1)
+set(CLIENT_NAME "B3 FlowMesh client")
+# B3 Hive product versioning (owner ruling 2026-08-26): the v1 release is
+# "B3 Hive 1.0.0", retiring the inherited Bitcoin Core 31.x numbering.
+# The P2P protocol version is a separate constant and is unaffected.
+set(CLIENT_VERSION_MAJOR 1)
+set(CLIENT_VERSION_MINOR 0)
 set(CLIENT_VERSION_BUILD 0)
 set(CLIENT_VERSION_RC 0)
 set(CLIENT_VERSION_IS_RELEASE "true")
@@ -63,7 +66,8 @@ if(CLIENT_VERSION_RC GREATER 0)
 endif()
 
 set(COPYRIGHT_HOLDERS "The %s developers")
-set(COPYRIGHT_HOLDERS_FINAL "The ${CLIENT_NAME} developers")
+set(COPYRIGHT_SUBSTITUTION_NAME "B3 FlowMesh")
+set(COPYRIGHT_HOLDERS_FINAL "The B3 FlowMesh developers")
 set(CLIENT_BUGREPORT "https://github.com/B3-Coin/B3-CoinV2/issues")
 
 #=============================
@@ -182,6 +186,27 @@ if(BUILD_GUI)
 endif()
 
 option(BUILD_BENCH "Build bench_bitcoin executable." OFF)
+option(B3_FINALITY_BENCH "Build the B3 finality benchmark harness (timing of the consensus BLS wrapper and MPA codecs)." OFF)
+option(B3_BRIDGE_TOOLS "Build the B3 bridge verification harness (b3-bridge-ethcheck relayer dry-run; test/tooling only, never part of the node)." OFF)
+option(B3_UPDATE_TOOLS "Build the offline B3 Hive release-manifest signing tool (b3hive-sign; operator tooling, never part of the node)." OFF)
+# The vendored blst (src/blst) is a consensus dependency of crypto/bls since
+# plan Commit 2 (cmake/blst.cmake). Upstream defines exactly two build paths
+# and the processor selects between them (mirroring upstream build.sh):
+#  - x86_64 / aarch64: pre-generated GNU-syntax assembly (build/assembly.S),
+#    assembled by the C compiler driver itself — no separate assembler tool —
+#    with __BLST_PORTABLE__ so no CPU-feature (ADX) dispatch exists;
+#  - every other processor: blst's pure-C implementation (__BLST_NO_ASM__,
+#    32-bit limbs), no assembly file, no ASM language.
+# Both compute identical results; only speed differs. The selection is not a
+# user option because upstream does not support the pure-C path on
+# x86_64/aarch64 (its 64-bit-limb headers assume the assembly).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64|ARM64)$")
+  set(B3_BLST_NO_ASM OFF)
+  enable_language(ASM)
+else()
+  set(B3_BLST_NO_ASM ON)
+  message(STATUS "blst: processor '${CMAKE_SYSTEM_PROCESSOR}' has no vendored assembly; building the pure-C path")
+endif()
 option(BUILD_FUZZ_BINARY "Build fuzz binary." OFF)
 option(BUILD_FOR_FUZZING "Build for fuzzing. Enabling this will disable all other targets and override BUILD_FUZZ_BINARY." OFF)
 

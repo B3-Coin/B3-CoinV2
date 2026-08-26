@@ -129,13 +129,22 @@ class BlockValidationState : public ValidationState<BlockValidationResult> {};
 // using only serialization with and without witness data. As witness_size
 // is equal to total_size - stripped_size, this formula is identical to:
 // weight = (stripped_size * 3) + total_size.
+/**
+ * Transaction weight. B3 Modern Payload Area bytes (frozen, 2026-08-23) count
+ * at the FULL scale factor -- they are historical chain data with no witness
+ * discount: weight = 3 x base + witness-form + MPA_WEIGHT_FACTOR x section.
+ * (TX_WITH_WITNESS excludes the MPA, so the section is added explicitly.)
+ */
 static inline int32_t GetTransactionWeight(const CTransaction& tx)
 {
-    return ::GetSerializeSize(TX_NO_WITNESS(tx)) * (WITNESS_SCALE_FACTOR - 1) + ::GetSerializeSize(TX_WITH_WITNESS(tx));
+    return ::GetSerializeSize(TX_NO_WITNESS(tx)) * (WITNESS_SCALE_FACTOR - 1) + ::GetSerializeSize(TX_WITH_WITNESS(tx)) +
+           static_cast<int32_t>(MPA_WEIGHT_FACTOR * GetMpaSectionSerializedSize(tx.mpa));
 }
 static inline int64_t GetBlockWeight(const CBlock& block)
 {
-    return ::GetSerializeSize(TX_NO_WITNESS(block)) * (WITNESS_SCALE_FACTOR - 1) + ::GetSerializeSize(TX_WITH_WITNESS(block));
+    int64_t mpa_weight{0};
+    for (const auto& tx : block.vtx) mpa_weight += static_cast<int64_t>(MPA_WEIGHT_FACTOR * GetMpaSectionSerializedSize(tx->mpa));
+    return ::GetSerializeSize(TX_NO_WITNESS(block)) * (WITNESS_SCALE_FACTOR - 1) + ::GetSerializeSize(TX_WITH_WITNESS(block)) + mpa_weight;
 }
 static inline int64_t GetTransactionInputWeight(const CTxIn& txin)
 {

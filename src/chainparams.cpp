@@ -44,6 +44,41 @@ void ReadSigNetArgs(const ArgsManager& args, CChainParams::SigNetOptions& option
 void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& options)
 {
     if (auto value = args.GetBoolArg("-fastprune")) options.fastprune = *value;
+    // B3 modern-era regtest (contract section 64 activation overrides;
+    // REGTEST ONLY). -b3modernregtest enables the pinned H=0/X=genesis
+    // configuration with scaled scaffolding constants; the numeric knobs
+    // refine it and are ignored without the switch.
+    if (args.GetBoolArg("-b3modernregtest", false)) {
+        CChainParams::B3ModernRegTestOptions b3{};
+        const auto read_int{[&](const char* name, auto& field) {
+            if (args.IsArgSet(name)) {
+                const int64_t v{args.GetIntArg(name, field)};
+                if (v <= 0) throw std::runtime_error(strprintf("Invalid value for %s: must be positive", name));
+                field = static_cast<std::decay_t<decltype(field)>>(v);
+            }
+        }};
+        read_int("-b3corridorlength", b3.corridor_length);
+        read_int("-b3corridorspacing", b3.corridor_spacing);
+        read_int("-b3corridorreward", b3.corridor_reward);
+        read_int("-b3blockinterval", b3.block_interval);
+        read_int("-b3roundseconds", b3.round_seconds);
+        read_int("-b3epochlength", b3.epoch_length);
+        read_int("-b3checkpointinterval", b3.checkpoint_interval);
+        read_int("-b3checkpointdepth", b3.checkpoint_depth);
+        read_int("-b3maxepochextension", b3.max_epoch_extension);
+        read_int("-b3minfinalityset", b3.min_finality_set);
+        read_int("-b3reorghorizon", b3.reorg_horizon);
+        read_int("-b3minstake", b3.min_stake_amount);
+        if (args.IsArgSet("-b3modernreward")) read_int("-b3modernreward", b3.modern_reward);
+        if (args.IsArgSet("-b3halvinginterval")) read_int("-b3halvinginterval", b3.halving_interval);
+        if (args.IsArgSet("-b3treasurypercent")) read_int("-b3treasurypercent", b3.treasury_percent);
+        if (const auto hexscript{args.GetArg("-b3treasuryscript")}) {
+            const auto bytes{TryParseHex<unsigned char>(*hexscript)};
+            if (!bytes || bytes->empty()) throw std::runtime_error("Invalid -b3treasuryscript hex");
+            b3.treasury_script = *bytes;
+        }
+        options.b3_modern = b3;
+    }
     if (HasTestOption(args, "bip94")) options.enforce_bip94 = true;
 
     for (const std::string& arg : args.GetArgs("-testactivationheight")) {

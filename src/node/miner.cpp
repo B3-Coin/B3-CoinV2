@@ -19,7 +19,11 @@
 #include <key.h>
 #include <logging.h>
 #include <modern/fn.h>
+#include <modern/finality_certificate.h>
+#include <modern/payload_root.h>
 #include <modern/pos_v1.h>
+#include <node/finality_signature.h>
+#include <node/finality_tracker.h>
 #include <node/stake_tracker.h>
 #include <node/context.h>
 #include <node/kernel_notifications.h>
@@ -202,13 +206,15 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         if (seed.IsNull()) {
             throw std::runtime_error("modern-PoS seed for the parent is unavailable");
         }
-        node::StakeTracker& tracker{m_chainstate.ModernStakeTracker()};
-        if (!tracker.Sync(m_chainstate.m_chain, m_chainstate.m_blockman, b3_consensus, *pindexPrev)) {
-            throw std::runtime_error("modern-PoS stake registry is unavailable");
+        // One stake universe: the same (w, W) validation will apply, from the
+        // validator set in force at this height (bound + ACTIVE stake).
+        const auto weights{m_chainstate.ModernEligibilityWeights(*m_options.modern_pos_validator_key, *pindexPrev)};
+        if (!weights) {
+            throw std::runtime_error("modern-PoS validator set is unavailable");
         }
-        const auto [w, W]{tracker.ActiveWeight(*m_options.modern_pos_validator_key, nHeight)};
+        const auto [w, W]{*weights};
         if (w <= 0) {
-            throw std::runtime_error("validator has no active stake");
+            throw std::runtime_error("validator is not in the active validator set (no bound, active stake)");
         }
         constexpr int64_t MAX_PRODUCTION_ROUNDS{100'000};
         bool eligible{false};
@@ -259,12 +265,25 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // (REVISABLE_BEFORE_MAINNET, provisionally 0) modern reward, matching
     // the unconditional consensus cap. Only non-B3 chains use the stock
     // subsidy schedule.
+    CAmount modern_subsidy{0};
+    CAmount treasury_share{0};
+    if (b3_modern_pos && b3_consensus.modern_pos) {
+        const auto m_height{Consensus::ModernPosStartHeight(b3_consensus)};
+        modern_subsidy = Consensus::ModernBlockSubsidy(nHeight, m_height.value_or(nHeight),
+                                                       *b3_consensus.modern_pos);
+        treasury_share = Consensus::ModernTreasuryShare(modern_subsidy, *b3_consensus.modern_pos);
+    }
     const CAmount block_reward{b3_corridor  ? nFees + *b3_consensus.transition_pow_reward
-                               : b3_modern_pos ? nFees + (b3_consensus.modern_pos
-                                                              ? b3_consensus.modern_pos->reward
-                                                              : 0)
+                               : b3_modern_pos ? nFees + modern_subsidy
                                                : nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
-    coinbaseTx.vout[0].nValue = block_reward;
+    coinbaseTx.vout[0].nValue = block_reward - treasury_share;
+    if (treasury_share > 0) {
+        // OD-2 treasury split: the ruled share of the SUBSIDY pays the
+        // pinned treasury script; the producer keeps the rest plus fees.
+        coinbaseTx.vout.emplace_back(
+            treasury_share, CScript{b3_consensus.modern_pos->treasury_script.begin(),
+                                    b3_consensus.modern_pos->treasury_script.end()});
+    }
     coinbase_tx.block_reward_remaining = block_reward;
 
     // Start the coinbase scriptSig with the block height as required by BIP34.
@@ -292,6 +311,54 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     coinbaseTx.nLockTime = static_cast<uint32_t>(nHeight - 1);
     coinbase_tx.lock_time = coinbaseTx.nLockTime;
 
+    // FINALITY_CERT inclusion (plan Commit 16): when the local signature pool
+    // holds a quorum certificate for a checkpoint above the finalized height,
+    // include it in the coinbase -- cell + type-4 record, judged first with
+    // the IDENTICAL consensus rule so no invalid certificate is ever emitted.
+    // Without a quorum nothing is included: blocks never depend on
+    // certificates and the epoch simply extends (frozen behaviour).
+    if (b3_modern_pos) {
+        node::FinalityTracker& finality{m_chainstate.ModernFinality()};
+        if (finality.Sync(m_chainstate.m_chain, m_chainstate.m_blockman, b3_consensus, *pindexPrev)) {
+            if (auto best{m_chainstate.FinalitySignatures().BestCertificate(finality, m_chainstate.m_chain,
+                                                                            b3_consensus)}) {
+                std::string cert_error;
+                if (finality.JudgeCandidateCertificate(best->first, best->second, *pindexPrev, b3_consensus,
+                                                       cert_error)) {
+                    const auto [payload, cell] = modern::BuildFinalityCertificate(best->first, best->second);
+                    coinbaseTx.vout.emplace_back(0, cell);
+                    CMpaRecord record;
+                    record.payload_type = modern::MPA_TYPE_FINALITY_CERTIFICATE;
+                    record.payload_version = modern::MPA_VERSION_V1;
+                    record.payload = payload;
+                    coinbaseTx.mpa = {record};
+                    LogInfo("CreateNewBlock(): including finality certificate for checkpoint %d (epoch %d)\n",
+                            best->first.height, best->first.epoch);
+                } else {
+                    LogDebug(BCLog::VALIDATION, "CreateNewBlock(): pooled certificate not includable (%s)\n",
+                             cert_error);
+                }
+            }
+        }
+    }
+
+    // MODERN_PAYLOAD_ROOT (plan Commit 7): when the candidate block carries any
+    // Modern Payload Area -- a transaction's or the coinbase's own (finality
+    // certificate) -- the coinbase must commit to all sections with exactly one
+    // root cell. The root depends only on the MPA sections and positions,
+    // never on the coinbase outputs, so it can be computed before the cell is
+    // appended.
+    if (b3_modern) {
+        bool any_mpa{!coinbaseTx.mpa.empty()};
+        for (size_t i = 1; !any_mpa && i < pblock->vtx.size(); ++i) {
+            if (pblock->vtx[i] && pblock->vtx[i]->HasMpa()) any_mpa = true;
+        }
+        if (any_mpa) {
+            CBlock probe{*pblock};
+            probe.vtx[0] = MakeTransactionRef(CTransaction{coinbaseTx});
+            coinbaseTx.vout.emplace_back(0, modern::MakePayloadRootCellScript(modern::ComputePayloadRoot(probe)));
+        }
+    }
     pblock->vtx[0] = MakeTransactionRef(std::move(coinbaseTx));
     m_chainstate.m_chainman.GenerateCoinbaseCommitment(*pblock, pindexPrev);
 

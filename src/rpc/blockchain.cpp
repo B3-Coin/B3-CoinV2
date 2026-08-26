@@ -16,6 +16,7 @@
 #include <consensus/params.h>
 #include <consensus/validation.h>
 #include <core_io.h>
+#include <legacy/codec.h>
 #include <deploymentinfo.h>
 #include <deploymentstatus.h>
 #include <flatfile.h>
@@ -27,6 +28,9 @@
 #include <logging/timer.h>
 #include <net.h>
 #include <net_processing.h>
+#include <node/finality_signature.h>
+#include <node/finality_tracker.h>
+#include <consensus/era.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
 #include <node/transaction.h>
@@ -863,7 +867,14 @@ static RPCHelpMan getblock()
     }
 
     CBlock block{};
-    SpanReader{block_data} >> TX_WITH_WITNESS(block);
+    // B3 chains: the raw bytes are the canonical marker-aware encoding
+    // (legacy body or modern body + MPA payloads); the stock witness codec
+    // cannot parse them (it rejects the MPA optional-data flag).
+    if (chainman.GetConsensus().legacy_b3coin) {
+        SpanReader{block_data} >> legacy::TX_LEGACY(block);
+    } else {
+        SpanReader{block_data} >> TX_WITH_WITNESS(block);
+    }
 
     TxVerbosity tx_verbosity;
     if (verbosity == 1) {
@@ -3500,6 +3511,100 @@ return RPCHelpMan{
 }
 
 
+
+static RPCHelpMan getfinalitystatus()
+{
+    return RPCHelpMan{
+        "getfinalitystatus",
+        "B3 Modern-PoS finality diagnostics (node-level): the epoch state machine, the current\n"
+        "validator set, the latest finalized checkpoint, the persisted finality pin and the local\n"
+        "signature pool. Empty fields mean the modern-PoS rules are not configured or not yet active.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "",
+                  {
+                      {RPCResult::Type::BOOL, "configured", "modern-PoS rules configured and boundary pinned"},
+                      {RPCResult::Type::BOOL, "active", "the finality state machine is derivable at the tip"},
+                      {RPCResult::Type::BOOL, "bootstrapped", /*optional=*/true, ""},
+                      {RPCResult::Type::NUM, "epoch", /*optional=*/true, ""},
+                      {RPCResult::Type::NUM, "epoch_start", /*optional=*/true, ""},
+                      {RPCResult::Type::BOOL, "handover_certified", /*optional=*/true, ""},
+                      {RPCResult::Type::BOOL, "lineage_broken", /*optional=*/true, ""},
+                      {RPCResult::Type::OBJ, "validator_set", /*optional=*/true, "the set in force",
+                       {
+                           {RPCResult::Type::NUM, "size", ""},
+                           {RPCResult::Type::NUM, "total_weight", "whole modern B3"},
+                           {RPCResult::Type::NUM, "quorum_weight", ""},
+                           {RPCResult::Type::STR_HEX, "set_hash", ""},
+                           {RPCResult::Type::STR_HEX, "next_set_hash", ""},
+                       }},
+                      {RPCResult::Type::OBJ, "finalized", /*optional=*/true, "the latest finalized checkpoint",
+                       {
+                           {RPCResult::Type::NUM, "height", ""},
+                           {RPCResult::Type::STR_HEX, "hash", ""},
+                           {RPCResult::Type::NUM, "epoch", ""},
+                       }},
+                      {RPCResult::Type::OBJ, "pin", /*optional=*/true, "the persisted finality pin",
+                       {
+                           {RPCResult::Type::NUM, "height", ""},
+                           {RPCResult::Type::STR_HEX, "hash", ""},
+                       }},
+                      {RPCResult::Type::NUM, "pool_checkpoints", "checkpoints tracked by the local signature pool"},
+                  }},
+        RPCExamples{HelpExampleCli("getfinalitystatus", "") + HelpExampleRpc("getfinalitystatus", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            const NodeContext& node{EnsureAnyNodeContext(request.context)};
+            ChainstateManager& chainman{EnsureChainman(node)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            UniValue obj(UniValue::VOBJ);
+            const bool configured{consensus.legacy_b3coin && consensus.modern_pos.has_value() &&
+                                  Consensus::LegacyBoundaryPinned(consensus)};
+            obj.pushKV("configured", configured);
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            bool active{false};
+            if (configured && tip) {
+                node::FinalityTracker& tracker{chainstate.ModernFinality()};
+                if (tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) {
+                    active = true;
+                    const node::FinalityTracker::State& state{tracker.Current()};
+                    obj.pushKV("active", true);
+                    obj.pushKV("bootstrapped", state.bootstrapped);
+                    obj.pushKV("epoch", state.epoch);
+                    obj.pushKV("epoch_start", state.epoch_starts.empty() ? -1 : state.epoch_starts.back());
+                    obj.pushKV("handover_certified", state.handover_certified);
+                    obj.pushKV("lineage_broken", state.lineage_broken);
+                    if (state.current) {
+                        UniValue set(UniValue::VOBJ);
+                        set.pushKV("size", static_cast<uint64_t>(state.current->Size()));
+                        set.pushKV("total_weight", state.current->TotalWeight());
+                        set.pushKV("quorum_weight", state.current->QuorumWeight());
+                        set.pushKV("set_hash", state.current->SetHash().GetHex());
+                        set.pushKV("next_set_hash", state.next ? state.next->SetHash().GetHex() : "");
+                        obj.pushKV("validator_set", set);
+                    }
+                    if (state.finalized) {
+                        UniValue fin(UniValue::VOBJ);
+                        fin.pushKV("height", state.finalized->height);
+                        fin.pushKV("hash", state.finalized->block_hash.GetHex());
+                        fin.pushKV("epoch", state.finalized->epoch);
+                        obj.pushKV("finalized", fin);
+                    }
+                }
+            }
+            if (!active) obj.pushKV("active", false);
+            if (const auto pin{chainstate.m_blockman.FinalityAnchor()}) {
+                UniValue p(UniValue::VOBJ);
+                p.pushKV("height", pin->first);
+                p.pushKV("hash", pin->second.GetHex());
+                obj.pushKV("pin", p);
+            }
+            obj.pushKV("pool_checkpoints", static_cast<uint64_t>(chainstate.FinalitySignatures().TrackedCheckpoints()));
+            return obj;
+        },
+    };
+}
+
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -3527,6 +3632,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &dumptxoutset},
         {"blockchain", &loadtxoutset},
         {"blockchain", &getchainstates},
+        {"blockchain", &getfinalitystatus},
         {"hidden", &invalidateblock},
         {"hidden", &reconsiderblock},
         {"blockchain", &waitfornewblock},

@@ -10,11 +10,13 @@
 
 QT_BEGIN_NAMESPACE
 class QButtonGroup;
+class QLabel;
 class QToolButton;
 class QVBoxLayout;
+class QWidget;
 QT_END_NAMESPACE
 
-//! Canonical top-level navigation destinations of the B3FlowMesh shell.
+//! Canonical top-level navigation destinations of the B3 Hive shell.
 enum class B3Page {
     Dashboard = 0,
     Trade = 1,
@@ -41,6 +43,11 @@ public:
     void setCurrentPage(B3Page page);
     B3Page currentPage() const { return m_current; }
 
+    //! Collapse to an icon rail for narrow windows. Navigation identities,
+    //! signals and selected state remain unchanged.
+    void setCompact(bool compact);
+    bool isCompact() const { return m_compact; }
+
 Q_SIGNALS:
     void navigated(B3Page page);
 
@@ -49,7 +56,11 @@ private:
 
     QVBoxLayout* m_layout{nullptr};
     QButtonGroup* m_group{nullptr};
+    QLabel* m_mark{nullptr};
+    QWidget* m_brandCopy{nullptr};
+    QLabel* m_platform{nullptr};
     B3Page m_current{B3Page::Dashboard};
+    bool m_compact{false};
 };
 
 #endif // BITCOIN_QT_B3NAVSIDEBAR_H

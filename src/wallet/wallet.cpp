@@ -5,6 +5,8 @@
 
 #include <wallet/wallet.h>
 
+#include <crypto/bls.h>
+
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 #include <addresstype.h>
 #include <blockfilter.h>
@@ -850,6 +852,25 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase)
                 // die and let the user reload the unencrypted wallet.
                 assert(false);
             }
+        }
+
+        // B3: the imported BLS finality key follows the identical lifecycle --
+        // its plain record is converted to ciphertext in the same atomic
+        // batch (the plain form is erased by the write; the full database
+        // rewrite below scrubs slack space).
+        if (m_b3_bls_key && !m_b3_bls_key->crypted) {
+            CKeyingMaterial plain{m_b3_bls_key->data.begin(), m_b3_bls_key->data.end()};
+            std::vector<unsigned char> crypted;
+            if (!EncryptSecret(plain_master_key, plain, Hash(std::span<const unsigned char>{m_b3_bls_key->pubkey}), crypted) ||
+                !encrypted_batch->WriteB3BlsCryptedKey(m_b3_bls_key->pubkey, crypted)) {
+                encrypted_batch->TxnAbort();
+                delete encrypted_batch;
+                encrypted_batch = nullptr;
+                assert(false);
+            }
+            m_b3_bls_key->data = crypted;
+            m_b3_bls_key->crypted = true;
+            memory_cleanse(plain.data(), plain.size());
         }
 
         if (!encrypted_batch->TxnCommit()) {
@@ -3539,6 +3560,112 @@ util::Result<CKey> CWallet::GetValidatorSecret() const
         if (provider && provider->GetKey(m_b3_validator_pubkey->GetID(), key) && key.IsValid()) return key;
     }
     return util::Error{_("The validator key's descriptor is missing from this wallet")};
+}
+
+util::Result<bls::SecretKey> CWallet::DeriveFinalityBlsKey(const uint32_t seq) const
+{
+    AssertLockHeld(cs_wallet);
+    auto identity{GetValidatorSecret()};
+    if (!identity) return util::Error{util::ErrorString(identity)};
+    HashWriter w{TaggedHash("B3/FINALITY/BLSKEY/V1")};
+    const std::span<const std::byte> secret{identity->begin(), identity->end()};
+    w << std::span<const unsigned char>{reinterpret_cast<const unsigned char*>(secret.data()), secret.size()} << seq;
+    const uint256 ikm{w.GetSHA256()};
+    const auto key{bls::SecretKey::FromIKM(std::span<const unsigned char>(ikm.begin(), 32))};
+    if (!key) return util::Error{_("BLS key derivation failed")}; // astronomically unlikely (HKDF retry exhaustion)
+    return *key;
+}
+
+void CWallet::LoadImportedFinalityBlsKey(const std::array<unsigned char, 48>& pubkey,
+                                         const std::vector<unsigned char>& data, const bool crypted)
+{
+    AssertLockHeld(cs_wallet);
+    m_b3_bls_key = B3BlsKeyRecord{pubkey, data, crypted};
+}
+
+namespace {
+//! IV binding the BLS ciphertext to its public key (the key/ckey pattern).
+uint256 BlsKeyIV(const std::array<unsigned char, 48>& pubkey)
+{
+    return Hash(std::span<const unsigned char>{pubkey});
+}
+} // namespace
+
+util::Result<bls::PublicKey> CWallet::ImportFinalityBlsKey(const bls::SecretKey& key)
+{
+    AssertLockHeld(cs_wallet);
+    if (IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) return util::Error{_("This wallet has private keys disabled")};
+    if (IsLocked()) return util::Error{_("The wallet is locked; unlock it to import the BLS key")};
+
+    const bls::PublicKey pubkey{key.GetPublicKey()};
+    const auto secret{key.Bytes()};
+    B3BlsKeyRecord record;
+    record.pubkey = pubkey.Compressed();
+    WalletBatch batch(GetDatabase());
+    if (HasEncryptionKeys()) {
+        // Encrypted wallet: only the ciphertext ever touches the database.
+        CKeyingMaterial plain{secret.begin(), secret.end()};
+        std::vector<unsigned char> crypted;
+        if (!EncryptSecret(vMasterKey, plain, BlsKeyIV(record.pubkey), crypted)) {
+            return util::Error{_("Failed to encrypt the BLS key")};
+        }
+        record.data = crypted;
+        record.crypted = true;
+        if (!batch.WriteB3BlsCryptedKey(record.pubkey, record.data)) return util::Error{_("Failed to write the BLS key record")};
+    } else {
+        record.data.assign(secret.begin(), secret.end());
+        record.crypted = false;
+        if (!batch.WriteB3BlsKey(record.pubkey, record.data)) return util::Error{_("Failed to write the BLS key record")};
+    }
+    m_b3_bls_key = std::move(record);
+    WalletLogPrintf("Imported B3 finality BLS key %s\n", HexStr(pubkey.Compressed()));
+    return pubkey;
+}
+
+util::Result<bls::SecretKey> CWallet::GetImportedFinalityBlsKey() const
+{
+    AssertLockHeld(cs_wallet);
+    if (!m_b3_bls_key) return util::Error{_("This wallet has no imported BLS finality key")};
+    std::optional<bls::SecretKey> key;
+    if (m_b3_bls_key->crypted) {
+        if (IsLocked()) return util::Error{_("The wallet is locked; unlock it to use the BLS key")};
+        CKeyingMaterial plain;
+        if (!DecryptSecret(vMasterKey, m_b3_bls_key->data, BlsKeyIV(m_b3_bls_key->pubkey), plain) ||
+            plain.size() != 32) {
+            return util::Error{_("Failed to decrypt the BLS key")};
+        }
+        key = bls::SecretKey::FromBytes(std::span<const unsigned char>{plain.data(), plain.size()});
+    } else {
+        key = bls::SecretKey::FromBytes(m_b3_bls_key->data);
+    }
+    // Integrity: the stored secret must reproduce the recorded public key.
+    if (!key || key->GetPublicKey().Compressed() != m_b3_bls_key->pubkey) {
+        return util::Error{_("The stored BLS key record is corrupt")};
+    }
+    return *key;
+}
+
+util::Result<bls::SecretKey> CWallet::ResolveFinalityBlsKey(const uint32_t seq,
+                                                            const std::vector<unsigned char>* bound_bls_pubkey) const
+{
+    AssertLockHeld(cs_wallet);
+    if (bound_bls_pubkey) {
+        // Signing / rotating an EXISTING binding: whichever wallet key matches it.
+        if (const auto derived{DeriveFinalityBlsKey(seq)}) {
+            const auto pk{derived->GetPublicKey().Compressed()};
+            if (*bound_bls_pubkey == std::vector<unsigned char>(pk.begin(), pk.end())) return *derived;
+        }
+        if (m_b3_bls_key) {
+            if (const auto imported{GetImportedFinalityBlsKey()}) {
+                const auto pk{imported->GetPublicKey().Compressed()};
+                if (*bound_bls_pubkey == std::vector<unsigned char>(pk.begin(), pk.end())) return *imported;
+            }
+        }
+        return util::Error{_("Neither the derived nor the imported BLS key matches the bound BLS public key")};
+    }
+    // A fresh bind: an imported (independent) key takes precedence.
+    if (m_b3_bls_key) return GetImportedFinalityBlsKey();
+    return DeriveFinalityBlsKey(seq);
 }
 
 std::vector<WalletDescriptor> CWallet::GetWalletDescriptors(const CScript& script) const

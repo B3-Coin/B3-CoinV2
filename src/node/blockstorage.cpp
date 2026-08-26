@@ -4,6 +4,8 @@
 
 #include <node/blockstorage.h>
 
+#include <node/finality_pin.h>
+
 #include <arith_uint256.h>
 #include <chain.h>
 #include <consensus/block_codec.h>
@@ -152,6 +154,13 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->m_legacy_hash_proof = diskindex.m_legacy_hash_proof;
                 pindexNew->m_legacy_money_supply = diskindex.m_legacy_money_supply;
                 pindexNew->m_legacy_fn_integrated = diskindex.m_legacy_fn_integrated;
+                // The cached modern-PoS eligibility digest is the NEXT
+                // height's seed: without it a restarted node can neither
+                // produce nor connect further modern blocks ("modern-PoS
+                // seed for the parent is unavailable"). It is persisted by
+                // CDiskBlockIndex and must be restored here (found by the
+                // multi-node finality soak's restart scenario).
+                pindexNew->m_modern_pos_digest = diskindex.m_modern_pos_digest;
                 pindexNew->nStatus        = diskindex.nStatus;
                 pindexNew->nTx            = diskindex.nTx;
 
@@ -300,6 +309,20 @@ const CBlockIndex* BlockManager::LookupBlockIndex(const uint256& hash) const
     return it == m_block_index.end() ? nullptr : &it->second;
 }
 
+namespace {
+//! Off-anchor test shared by the legacy boundary X and the finality pin.
+bool OffAnchor(const CBlockIndex& block, const CBlockIndex& anchor)
+{
+    if (block.nHeight <= anchor.nHeight) {
+        // At or below the anchor a block is eligible only if it is on the
+        // canonical prefix, i.e. it is the anchor itself or one of its ancestors.
+        return anchor.GetAncestor(block.nHeight) != &block;
+    }
+    // Above the anchor a block is eligible only if it descends from it.
+    return block.GetAncestor(anchor.nHeight) != &anchor;
+}
+} // namespace
+
 bool BlockManager::IsAnchorIneligible(const CBlockIndex& block) const
 {
     AssertLockHeld(cs_main);
@@ -308,21 +331,45 @@ bool BlockManager::IsAnchorIneligible(const CBlockIndex& block) const
     const std::optional<int> final_height{Consensus::LegacyFinalHeight(params)};
     // Not classifiable unless both the boundary height H and the finalized
     // hash X are configured: without X there is no anchor to measure against.
-    if (!final_height || !params.legacy_final_hash) return false;
-
-    const CBlockIndex* pindexX{LookupBlockIndex(*params.legacy_final_hash)};
-    // X itself is not in the index yet, so the block's relationship to it is
-    // not yet determined; it will be reclassified once X is known.
-    if (!pindexX) return false;
-
-    const int H{*final_height};
-    if (block.nHeight <= H) {
-        // At or below H a block is eligible only if it is on the canonical
-        // prefix, i.e. it is X itself or one of X's ancestors.
-        return pindexX->GetAncestor(block.nHeight) != &block;
+    if (final_height && params.legacy_final_hash) {
+        // X itself not in the index yet: the block's relationship to it is not
+        // yet determined; it will be reclassified once X is known.
+        if (const CBlockIndex* pindexX{LookupBlockIndex(*params.legacy_final_hash)}) {
+            if (OffAnchor(block, *pindexX)) return true;
+        }
     }
-    // Above H a block is eligible only if it descends from X.
-    return block.GetAncestor(H) != pindexX;
+    // The modern finality pin: the same topological rule against the highest
+    // certified checkpoint of this process (see RaiseFinalityAnchor).
+    if (m_finality_anchor) {
+        if (const CBlockIndex* pin{LookupBlockIndex(m_finality_anchor->second)}) {
+            if (OffAnchor(block, *pin)) return true;
+        }
+    }
+    return false;
+}
+
+fs::path BlockManager::FinalityPinPath() const
+{
+    return m_opts.blocks_dir / fs::u8path(FINALITY_PIN_FILENAME);
+}
+
+void BlockManager::RaiseFinalityAnchor(const int height, const uint256& hash)
+{
+    AssertLockHeld(cs_main);
+    if (m_finality_anchor && m_finality_anchor->first >= height) return;
+    m_finality_anchor = std::make_pair(height, hash);
+    // Persist immediately (atomic, fsync, rename-over): a later allowed reorg
+    // may remove the certificate carrier, and a crash or restart must not
+    // forget the pin. The file itself refuses to go backwards and refuses to
+    // replace an invalid file. FAIL CLOSED: a node that cannot persist the
+    // pin must not keep running as if it had -- a crash would forget
+    // accepted finality.
+    if (!WriteFinalityPin(FinalityPinPath(), m_opts.chainparams.MessageStart(), FinalityPin{height, hash})) {
+        m_opts.notifications.fatalError(strprintf(
+            _("Failed to persist the finality pin (checkpoint %d %s). See the log; restore or remove an invalid "
+              "%s only after deliberate operator review."),
+            height, hash.ToString(), fs::PathToString(FinalityPinPath())));
+    }
 }
 
 CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockIndex*& best_header)
@@ -1399,6 +1446,31 @@ BlockManager::BlockManager(const util::SignalInterrupt& interrupt, Options opts)
       m_interrupt{interrupt}
 {
     m_block_tree_db = std::make_unique<BlockTreeDB>(m_opts.block_tree_db_params);
+
+    // The persisted finality pin outlives both databases (it lives beside the
+    // block files) so no reindex or restart can reopen a fork below accepted
+    // finality. Until its hash is present in the index it is a pending pin:
+    // it already bounds RaiseFinalityAnchor (monotone) and starts being
+    // enforced the moment the block is (re)indexed. FAIL CLOSED: a pin file
+    // that exists but cannot be validated refuses startup -- running without
+    // the protection it was supposed to carry is never the silent default.
+    {
+        FinalityPin pin;
+        std::string pin_error;
+        switch (ReadFinalityPinFile(FinalityPinPath(), m_opts.chainparams.MessageStart(), pin, pin_error)) {
+        case FinalityPinFileStatus::ABSENT:
+            break;
+        case FinalityPinFileStatus::VALID:
+            m_finality_anchor = std::make_pair(pin.height, pin.hash);
+            LogInfo("finality pin: loaded checkpoint %d %s", pin.height, pin.hash.ToString());
+            break;
+        case FinalityPinFileStatus::INVALID:
+            throw std::runtime_error{strprintf(
+                "The finality pin file is invalid: %s. Refusing to start without the finality protection it "
+                "recorded. Restore the file from a backup, or delete it only after deliberate operator review.",
+                pin_error)};
+        }
+    }
 
     if (m_opts.block_tree_db_params.wipe_data) {
         m_block_tree_db->WriteReindexing(true);

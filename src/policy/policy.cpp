@@ -7,6 +7,10 @@
 
 #include <policy/policy.h>
 
+#include <modern/metadata_cell.h>
+
+#include <modern/payload_cost.h>
+
 #include <coins.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
@@ -39,7 +43,10 @@ CAmount GetDustThreshold(const CTxOut& txout, const CFeeRate& dustRelayFeeIn)
     // so dust is a spendable txout less than
     // 98*dustRelayFee/1000 (in satoshis).
     // 294 satoshis at the default rate of 3000 sat/kvB.
-    if (txout.scriptPubKey.IsUnspendable())
+    // B3 metadata cells are consensus-excluded from the UTXO set (amount 0,
+    // nothing ever spends them): like provably unspendable outputs they have
+    // no dust threshold.
+    if (txout.scriptPubKey.IsUnspendable() || modern::IsMetadataCell(txout.scriptPubKey))
         return 0;
 
     uint64_t nSize{GetSerializeSize(txout)};
@@ -373,19 +380,20 @@ bool SpendsNonAnchorWitnessProg(const CTransaction& tx, const CCoinsViewCache& p
     return false;
 }
 
-int64_t GetSigOpsAdjustedWeight(int64_t weight, int64_t sigop_cost, unsigned int bytes_per_sigop)
+int64_t GetSigOpsAdjustedWeight(int64_t weight, int64_t sigop_cost, unsigned int bytes_per_sigop, int64_t payload_cost)
 {
-    return std::max(weight, sigop_cost * bytes_per_sigop);
+    const int64_t payload_weight{payload_cost * PAYLOAD_COST_TO_VBYTES * WITNESS_SCALE_FACTOR};
+    return std::max({weight, sigop_cost * bytes_per_sigop, payload_weight});
 }
 
-int64_t GetVirtualTransactionSize(int64_t nWeight, int64_t nSigOpCost, unsigned int bytes_per_sigop)
+int64_t GetVirtualTransactionSize(int64_t nWeight, int64_t nSigOpCost, unsigned int bytes_per_sigop, int64_t payload_cost)
 {
-    return (GetSigOpsAdjustedWeight(nWeight, nSigOpCost, bytes_per_sigop) + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR;
+    return (GetSigOpsAdjustedWeight(nWeight, nSigOpCost, bytes_per_sigop, payload_cost) + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR;
 }
 
 int64_t GetVirtualTransactionSize(const CTransaction& tx, int64_t nSigOpCost, unsigned int bytes_per_sigop)
 {
-    return GetVirtualTransactionSize(GetTransactionWeight(tx), nSigOpCost, bytes_per_sigop);
+    return GetVirtualTransactionSize(GetTransactionWeight(tx), nSigOpCost, bytes_per_sigop, modern::PayloadVerifyCost(tx));
 }
 
 int64_t GetVirtualTransactionInputSize(const CTxIn& txin, int64_t nSigOpCost, unsigned int bytes_per_sigop)

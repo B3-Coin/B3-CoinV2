@@ -13,6 +13,9 @@
 #include <qt/guiutil.h>
 #include <qt/b3navsidebar.h>
 #include <qt/b3settingspage.h>
+#include <qt/updatecontroller.h>
+#include <QPushButton>
+#include <qt/updatepanel.h>
 #include <qt/b3shell.h>
 #include <qt/b3topstatus.h>
 #include <qt/b3tradepage.h>
@@ -156,6 +159,33 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         m_settings_page = new B3SettingsPage(m_shell);
         m_shell->setSettingsPage(m_settings_page);
         connect(m_settings_page, &B3SettingsPage::openOptionsRequested, this, &BitcoinGUI::openOptionsDialogWithTab);
+
+        // B3 Hive update system: controller + Settings section + a
+        // restrained honey-gold indicator in the top status. Unconfigured
+        // builds stay quiet (the panel shows an honest disabled note).
+        m_update_controller = new UpdateController(this);
+        m_settings_page->setUpdateWidget(new UpdatePanel(m_update_controller, m_settings_page));
+        m_update_indicator = new QPushButton(tr("Update available"), this);
+        m_update_indicator->setObjectName(QStringLiteral("hiveUpdateIndicator"));
+        m_update_indicator->setFlat(true);
+        m_update_indicator->setCursor(Qt::PointingHandCursor);
+        m_update_indicator->setStyleSheet(QStringLiteral(
+            "QPushButton#hiveUpdateIndicator { color: #E8A93C; border: 1px solid #E8A93C;"
+            " border-radius: 9px; padding: 2px 10px; background: transparent; }"
+            "QPushButton#hiveUpdateIndicator:hover { background: rgba(232,169,60,0.12); }"));
+        m_update_indicator->setVisible(false);
+        m_shell->topStatus()->addTrailingWidget(m_update_indicator);
+        connect(m_update_indicator, &QPushButton::clicked, this,
+                [this] { m_shell->showPage(B3Page::Settings); });
+        connect(m_update_controller, &UpdateController::stateChanged, this, [this] {
+            const auto s{m_update_controller->state()};
+            m_update_indicator->setVisible(s == update::UpdateState::UPDATE_AVAILABLE ||
+                                           s == update::UpdateState::READY_TO_INSTALL);
+        });
+        // "Install and restart" performs an ORDERLY quit; the installer only
+        // launches after the node reports shutdown complete (bitcoin.cpp).
+        connect(m_update_controller, &UpdateController::shutdownRequested, this,
+                &BitcoinGUI::quitRequested);
         setCentralWidget(m_shell);
     } else
 #endif // ENABLE_WALLET
@@ -233,7 +263,17 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         frameBlocksLayout->addStretch();
         frameBlocksLayout->addWidget(unitDisplayControl);
         frameBlocksLayout->addStretch();
-        frameBlocksLayout->addWidget(labelWalletEncryptionIcon);
+        if (m_shell) {
+            // Reuse the existing wallet-model-driven encryption indicator in
+            // the B3 Hive topbar. There is one source of truth and no copied
+            // lock state; only its presentation host changes.
+            labelWalletEncryptionIcon->setObjectName(QStringLiteral("B3WalletSecurity"));
+            labelWalletEncryptionIcon->setAlignment(Qt::AlignCenter);
+            labelWalletEncryptionIcon->setFixedSize(36, 36);
+            m_shell->topStatus()->addTrailingWidget(labelWalletEncryptionIcon);
+        } else {
+            frameBlocksLayout->addWidget(labelWalletEncryptionIcon);
+        }
         labelWalletEncryptionIcon->hide();
         frameBlocksLayout->addWidget(labelWalletHDStatusIcon);
         labelWalletHDStatusIcon->hide();
@@ -258,7 +298,7 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
     QString curStyle = QApplication::style()->metaObject()->className();
     if(curStyle == "QWindowsStyle" || curStyle == "QWindowsXPStyle")
     {
-        progressBar->setStyleSheet("QProgressBar { background-color: #e8e8e8; border: 1px solid grey; border-radius: 7px; padding: 1px; text-align: center; } QProgressBar::chunk { background: QLinearGradient(x1: 0, y1: 0, x2: 1, y2: 0, stop: 0 #FF8000, stop: 1 orange); border-radius: 7px; margin: 0px; }");
+        progressBar->setStyleSheet("QProgressBar { background-color:#111210; color:#f3f0e8; border:1px solid #45443b; border-radius:7px; padding:1px; text-align:center; } QProgressBar::chunk { background:QLinearGradient(x1:0, y1:0, x2:1, y2:0, stop:0 #f1bd47, stop:1 #e39b43); border-radius:7px; margin:0px; }");
     }
 
     statusBar()->addWidget(progressBarLabel);
@@ -355,15 +395,15 @@ void BitcoinGUI::createActions()
     quitAction->setStatusTip(tr("Quit application"));
     quitAction->setShortcut(QKeySequence(tr("Ctrl+Q")));
     quitAction->setMenuRole(QAction::QuitRole);
-    aboutAction = new QAction(tr("&About %1").arg(CLIENT_NAME), this);
-    aboutAction->setStatusTip(tr("Show information about %1").arg(CLIENT_NAME));
+    aboutAction = new QAction(tr("&About %1").arg(HIVE_NAME), this);
+    aboutAction->setStatusTip(tr("Show information about %1").arg(HIVE_NAME));
     aboutAction->setMenuRole(QAction::AboutRole);
     aboutAction->setEnabled(false);
     aboutQtAction = new QAction(tr("About &Qt"), this);
     aboutQtAction->setStatusTip(tr("Show information about Qt"));
     aboutQtAction->setMenuRole(QAction::AboutQtRole);
     optionsAction = new QAction(tr("&Options…"), this);
-    optionsAction->setStatusTip(tr("Modify configuration options for %1").arg(CLIENT_NAME));
+    optionsAction->setStatusTip(tr("Modify configuration options for %1").arg(HIVE_NAME));
     optionsAction->setMenuRole(QAction::PreferencesRole);
     optionsAction->setEnabled(false);
 
@@ -425,7 +465,7 @@ void BitcoinGUI::createActions()
 
     showHelpMessageAction = new QAction(tr("&Command-line options"), this);
     showHelpMessageAction->setMenuRole(QAction::NoRole);
-    showHelpMessageAction->setStatusTip(tr("Show the %1 help message to get a list with possible Bitcoin command-line options").arg(CLIENT_NAME));
+    showHelpMessageAction->setStatusTip(tr("Show the %1 help message to get a list with possible Bitcoin command-line options").arg(HIVE_NAME));
 
     m_mask_values_action = new QAction(tr("&Mask values"), this);
     m_mask_values_action->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_M));
@@ -939,7 +979,7 @@ void BitcoinGUI::createTrayIcon()
 #ifndef Q_OS_MACOS
     if (QSystemTrayIcon::isSystemTrayAvailable()) {
         trayIcon = new QSystemTrayIcon(m_network_style->getTrayAndWindowIcon(), this);
-        QString toolTip = tr("%1 client").arg(CLIENT_NAME) + " " + m_network_style->getTitleAddText();
+        QString toolTip = tr("%1 client").arg(HIVE_NAME) + " " + m_network_style->getTitleAddText();
         trayIcon->setToolTip(toolTip);
     }
 #endif
@@ -1367,7 +1407,7 @@ void BitcoinGUI::createWallet()
 void BitcoinGUI::message(const QString& title, QString message, unsigned int style, bool* ret, const QString& detailed_message)
 {
     // Default title. On macOS, the window title is ignored (as required by the macOS Guidelines).
-    QString strTitle{CLIENT_NAME};
+    QString strTitle{HIVE_NAME};
     // Default to information icon
     int nMBoxIcon = QMessageBox::Information;
     int nNotifyIcon = Notificator::Information;
@@ -1563,12 +1603,14 @@ void BitcoinGUI::setEncryptionStatus(int status)
     {
     case WalletModel::NoKeys:
         labelWalletEncryptionIcon->hide();
+        labelWalletEncryptionIcon->setAccessibleName(tr("Watch-only wallet"));
         encryptWalletAction->setChecked(false);
         changePassphraseAction->setEnabled(false);
         encryptWalletAction->setEnabled(false);
         break;
     case WalletModel::Unencrypted:
         labelWalletEncryptionIcon->hide();
+        labelWalletEncryptionIcon->setAccessibleName(tr("Wallet is not encrypted"));
         encryptWalletAction->setChecked(false);
         changePassphraseAction->setEnabled(false);
         encryptWalletAction->setEnabled(true);
@@ -1577,6 +1619,7 @@ void BitcoinGUI::setEncryptionStatus(int status)
         labelWalletEncryptionIcon->show();
         labelWalletEncryptionIcon->setThemedPixmap(QStringLiteral(":/icons/lock_open"), STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE);
         labelWalletEncryptionIcon->setToolTip(tr("Wallet is <b>encrypted</b> and currently <b>unlocked</b>"));
+        labelWalletEncryptionIcon->setAccessibleName(tr("Wallet unlocked"));
         encryptWalletAction->setChecked(true);
         changePassphraseAction->setEnabled(true);
         encryptWalletAction->setEnabled(false);
@@ -1585,6 +1628,7 @@ void BitcoinGUI::setEncryptionStatus(int status)
         labelWalletEncryptionIcon->show();
         labelWalletEncryptionIcon->setThemedPixmap(QStringLiteral(":/icons/lock_closed"), STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE);
         labelWalletEncryptionIcon->setToolTip(tr("Wallet is <b>encrypted</b> and currently <b>locked</b>"));
+        labelWalletEncryptionIcon->setAccessibleName(tr("Wallet locked"));
         encryptWalletAction->setChecked(true);
         changePassphraseAction->setEnabled(true);
         encryptWalletAction->setEnabled(false);
@@ -1630,7 +1674,7 @@ void BitcoinGUI::updateProxyIcon()
 
 void BitcoinGUI::updateWindowTitle()
 {
-    QString window_title = CLIENT_NAME;
+    QString window_title = HIVE_NAME;
 #ifdef ENABLE_WALLET
     if (walletFrame) {
         WalletModel* const wallet_model = walletFrame->currentWalletModel();

@@ -27,3 +27,4 @@ target/
 /guix-build-*
 
 /ci/scratch/
+dist/

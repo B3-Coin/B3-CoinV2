@@ -372,8 +372,12 @@ Unknown consensus policy types are **invalid** unless an explicit extension mech
 created. Silently ignoring unknown policy semantics is forbidden.
 
 **Existing serialized policy enum numbers must never be renumbered.** Current assignments
-(`LEGACY_LOCK = 0`, `OWNER = 1`, `BURN = 2`, `DEX_VAULT = 3`) are consensus-stable as-is;
-additional types take new numbers.
+(`LEGACY_LOCK = 0`, `OWNER = 1`, `BURN = 2`, `DEX_VAULT = 3`, `STAKE = 4`, `FN = 5`, and —
+owner ruling 2026-08-23 — `FINALITY_CERT = 6`, `FINALITY_KEY = 7`, `MODERN_PAYLOAD_ROOT = 8`)
+are consensus-stable as-is; additional types take new numbers. Types 6–8 are zero-value
+**metadata cells** (never entering the UTXO set) whose large evidence travels in the Modern
+Payload Area ([b3-modern-payload-area.md](b3-modern-payload-area.md)); the `policy_params
+≤ 80 B` bound is permanent and is never raised to carry evidence.
 
 ## 24. Policy versions
 

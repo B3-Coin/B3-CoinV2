@@ -756,11 +756,15 @@ bool HasTestOption(const ArgsManager& args, const std::string& test_option)
 
 fs::path GetDefaultDataDir()
 {
-    // Windows: C:\Users\Username\AppData\Local\B3Coin
-    // macOS: ~/Library/Application Support/B3Coin
-    // Unix-like: ~/.b3coin
+    // The LEGACY B3-CoinV2 client's locations, verbatim (owner requirement
+    // 2026-08-26: users close the old wallet, open B3 Hive, and find their
+    // data dir -- including the old wallet.dat for migratewallet -- with no
+    // hassle). The old client used CSIDL_APPDATA (Roaming) on Windows.
+    // Windows: C:\Users\Username\AppData\Roaming\B3-CoinV2
+    // macOS: ~/Library/Application Support/B3-CoinV2
+    // Unix-like: ~/.B3-CoinV2
 #ifdef WIN32
-    return GetSpecialFolderPath(CSIDL_LOCAL_APPDATA) / "B3Coin";
+    return GetSpecialFolderPath(CSIDL_APPDATA) / "B3-CoinV2";
 #else
     fs::path pathRet;
     char* pszHome = getenv("HOME");
@@ -770,10 +774,10 @@ fs::path GetDefaultDataDir()
         pathRet = fs::path(pszHome);
 #ifdef __APPLE__
     // macOS
-    return pathRet / "Library/Application Support/B3Coin";
+    return pathRet / "Library/Application Support/B3-CoinV2";
 #else
     // Unix-like
-    return pathRet / ".b3coin";
+    return pathRet / ".B3-CoinV2";
 #endif
 #endif
 }

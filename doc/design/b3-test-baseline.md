@@ -130,3 +130,11 @@ expectations* (parameterized by B3's atomic scale and, where display
 strings appear, by the era's display denomination) — is a separate,
 scoped change; it must still leave the vectors, B3's historical constants,
 and all raw atomic values and consensus serialization untouched.
+
+
+> **2026-08-24 update.** `legacy_genesis_tests` is no longer a known failure:
+> the fixed-seed expectations were brought up to the 33-entry list (the 32
+> historical bootstrap peers plus the owner-supplied release-v1 seed appended
+> in 958eeb3), pinning front, the last historical peer, and the release seed.
+> The canonical known-failure set is therefore the 18 stock IDENT/DENOM/
+> FIXTURE suites above.

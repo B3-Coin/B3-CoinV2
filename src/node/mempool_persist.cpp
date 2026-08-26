@@ -110,10 +110,10 @@ bool LoadMempool(CTxMemPool& pool, const fs::path& load_path, Chainstate& active
                 if (legacy_encoded != 0) {
                     file >> legacy::TX_LEGACY(tx);
                 } else {
-                    file >> TX_WITH_WITNESS(tx);
+                    file >> TX_MODERN(tx);
                 }
             } else {
-                file >> TX_WITH_WITNESS(tx);
+                file >> TX_MODERN(tx);
             }
             file >> nTime;
             file >> nFeeDelta;
@@ -230,10 +230,10 @@ bool DumpMempool(const CTxMemPool& pool, const fs::path& dump_path, FopenFn mock
                 if (legacy_encoded) {
                     file << legacy::TX_LEGACY(*(i.tx));
                 } else {
-                    file << TX_WITH_WITNESS(*(i.tx));
+                    file << TX_MODERN(*(i.tx));
                 }
             } else {
-                file << TX_WITH_WITNESS(*(i.tx));
+                file << TX_MODERN(*(i.tx));
             }
             file << int64_t{count_seconds(i.m_time)};
             file << int64_t{i.nFeeDelta};

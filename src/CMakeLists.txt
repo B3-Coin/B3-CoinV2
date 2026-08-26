@@ -19,6 +19,7 @@ include(../cmake/crc32c.cmake)
 include(../cmake/leveldb.cmake)
 include(../cmake/minisketch.cmake)
 add_subdirectory(univalue)
+add_subdirectory(update)
 if (ENABLE_IPC AND NOT WITH_EXTERNAL_LIBMULTIPROCESS)
   include(../cmake/libmultiprocess.cmake)
   add_libmultiprocess(ipc/libmultiprocess)
@@ -52,6 +53,10 @@ target_link_libraries(bitcoin_clientversion
 )
 add_dependencies(bitcoin_clientversion generate_build_info)
 
+# Pinned blst (src/blst, upstream v0.3.17) — consensus dependency of
+# crypto/bls (plan Commit 2). Portable build; narrow wrapper only.
+include(../cmake/blst.cmake)
+add_b3_blst()
 add_subdirectory(crypto)
 add_subdirectory(util)
 if(ENABLE_IPC)
@@ -245,6 +250,11 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/flowmesh_store.cpp
   node/fn_pod.cpp
   node/legacy_fn_issuance.cpp
+  node/finality_binding_index.cpp
+  node/finality_pin.cpp
+  node/finality_signature.cpp
+  node/finality_tracker.cpp
+  node/validator_set.cpp
   node/stake_registry.cpp
   node/stake_tracker.cpp
   node/staking.cpp
@@ -449,6 +459,52 @@ endif()
 add_subdirectory(test/util)
 if(BUILD_BENCH)
   add_subdirectory(bench)
+endif()
+
+if(B3_FINALITY_BENCH)
+  # Timing harness over the same vendored blst the consensus wrapper uses.
+  add_executable(b3-finality-bench bench/b3_finality_bench.cpp)
+  target_link_libraries(b3-finality-bench
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+  )
+endif()
+
+if(B3_UPDATE_TOOLS)
+  # Offline release-manifest signing tool for B3 Hive update operators.
+  add_executable(b3hive-sign update/signtool.cpp)
+  target_link_libraries(b3hive-sign
+    PRIVATE
+      core_interface
+      b3_update
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+  )
+endif()
+
+if(B3_BRIDGE_TOOLS)
+  # Relayer dry-run harness over the same header-only bridge verification
+  # stack the tests use. Tooling only; never linked into the node.
+  add_executable(b3-bridge-ethcheck bridge/ethcheck.cpp)
+  target_link_libraries(b3-bridge-ethcheck
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+      univalue
+  )
 endif()
 
 if(BUILD_TESTS)

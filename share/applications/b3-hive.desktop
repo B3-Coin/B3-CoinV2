@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=B3 Hive
+Comment=Desktop client for B3 FlowMesh
+Exec=b3coin-qt %u
+Icon=b3-hive
+Terminal=false
+Categories=Finance;Network;
+MimeType=x-scheme-handler/b3coin;
+StartupNotify=true

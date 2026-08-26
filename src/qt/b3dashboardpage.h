@@ -19,10 +19,12 @@ class WalletModel;
 
 QT_BEGIN_NAMESPACE
 class QLabel;
+class QGridLayout;
 class QListView;
 class QModelIndex;
 class QProgressBar;
 class QPushButton;
+class QResizeEvent;
 QT_END_NAMESPACE
 
 /**
@@ -73,9 +75,13 @@ private Q_SLOTS:
     void setMonospacedFont(const QFont& font);
 
 private:
+    void resizeEvent(QResizeEvent* event) override;
     void renderBalances();
     void renderWalletState();
-    QWidget* makeCard(const QString& title, QLabel** title_label_out = nullptr);
+    void renderNetworkEra(int height);
+    void renderNodeState();
+    void reflowCards(int width);
+    QWidget* makeCard(const QString& title, QLabel** title_label_out = nullptr, bool hero = false);
 
     ClientModel* m_client_model{nullptr};
     WalletModel* m_wallet_model{nullptr};
@@ -92,10 +98,8 @@ private:
     QLabel* m_pending{nullptr};
     QLabel* m_immature{nullptr};
     QLabel* m_immature_title{nullptr};
-    QLabel* m_total{nullptr};
 
     // Wallet card
-    QLabel* m_wallet_name{nullptr};
     QLabel* m_security{nullptr};
     QPushButton* m_send{nullptr};
     QPushButton* m_receive{nullptr};
@@ -106,14 +110,31 @@ private:
     QLabel* m_sync_blocks{nullptr};
     QLabel* m_sync_time{nullptr};
     QLabel* m_sync_warning{nullptr};
+    QLabel* m_sync_progress_caption{nullptr};
     QProgressBar* m_sync_progress{nullptr};
+    QLabel* m_era_height{nullptr};
     QLabel* m_net_peers{nullptr};
+    QLabel* m_net_network{nullptr};
     QLabel* m_net_state{nullptr};
+    int m_chain_height{-1};
+    bool m_chain_synced{false};
+    bool m_network_active{true};
 
     // Recent activity
     QListView* m_activity{nullptr};
     QLabel* m_activity_empty{nullptr};
     QLabel* m_activity_masked{nullptr};
+
+    // Presentation-only responsive card grid. Reflowing these widgets
+    // never changes their models, signals or actions.
+    QGridLayout* m_card_grid{nullptr};
+    QWidget* m_balance_card{nullptr};
+    QWidget* m_wallet_card{nullptr};
+    QWidget* m_staking_card{nullptr};
+    QWidget* m_sync_card{nullptr};
+    QWidget* m_network_card{nullptr};
+    QWidget* m_activity_card{nullptr};
+    int m_layout_columns{0};
 };
 
 #endif // BITCOIN_QT_B3DASHBOARDPAGE_H

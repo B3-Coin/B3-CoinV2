@@ -86,6 +86,15 @@ M is resolved (spec §3).
 
 ## OD-2 — Modern B3 monetary policy
 
+**2026-08-26 owner rulings (partial):** treasury = ONE single wallet/address
+(no multisig, "no complex problems"); asset issuance fees pay to that same
+treasury address (supersedes any burn proposal); FlowMesh trading fees pay
+to the same address under the proposed bps schedule. Reward mechanism
+itself still OPEN — consolidated recommendation (constant tail emission,
+1.5%/yr of measured S_H, 90/10 producer/treasury split) now lives in
+[b3-economics-v1.md](b3-economics-v1.md) awaiting the owner's numbers.
+
+
 Native B3 supply continues from the historical ledger (contract §19), but the modern-era
 issuance curve, staking reward rate, and fee-burn behaviour (if any) are unspecified.
 Overlaps with OD-1's reward schedule. Native B3 must never be issued through the generic
@@ -209,6 +218,32 @@ issuer-freeze policy handling is specified. Gated well behind H+1 (activation A3
 - End state: an issuer taking mint authority in place (native issuance) — a business outcome, not a protocol dependency.
 - Recommended, not yet ruled: Ethereum **L1** (not an L2) as the stable origin — an Arbitrum origin adds a rollup-state proof and ~6.4-day BoLD finality or sequencer trust, and its USDT is USDT0 (LayerZero-backed).
 - Still OPEN: exact light-client verification rules and the `blst`/keccak/RLP/MPT dependency decision, sync-committee participation threshold, mint caps, watcher veto, fork-upgrade procedure, re-bootstrap rule, issuer-freeze handling.
+- **2026-08-23 owner direction: "BLS is the key to bridge."** BLS12-381 aggregate signatures are the keystone of BOTH legs — verifying Ethereum's sync committee (mint leg) and, with BLS keys on B3's committee, letting Ethereum verify B3 checkpoints via EIP-2537 (release leg) — so no trusted signer set remains in either consensus. Plan, inventory (blst vendoring, Keccak-256, SSZ/RLP/MPT, `BRIDGE_BACKED` + `LIGHT_CLIENT_UPDATE` + `BRIDGE_MINT`/`BRIDGE_BURN` actions, B3 BLS committee), staged build order and the remaining owner decisions: [b3-bridge-bls-proposal.md](b3-bridge-bls-proposal.md). Still not authorized for consensus wiring before v1 ships and proposal §8 is ruled.
+- **2026-08-23 owner brief: the critical problem is B3 → Ethereum (withdrawals), not deposits.** Design record: [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md) — a V2 finality gadget layered on Modern PoS V1 (BLS key binding, one-epoch-lookahead validator-set snapshot committed by keccak header + Merkle members, `FinalizedBlock{height, block_hash, withdrawal_root, validator_set_hash(successor), epoch}` + `Certificate{signer_bitmap, aggregate_sig}` verified on B3 in-block with an absolute finality pin, `B3FinalityVerifier.sol` with set handover + non-signer-subtraction BLS verification via EIP-2537, cumulative withdrawal tree, vault release only on finality ∧ inclusion, `IB3FinalityProver` seam for a future ZK prover with frozen data structures). **Superseded the same day by the owner's correction:** the finality gadget and BLS validator keys are **V1-reserved from M** (PoS spec ruling M7), enforcement at F, bridge at A3 ≥ F; the verifier follows genesis set → epoch certificates → rotation → withdrawal roots. Revision 2 of the same document is the specification (exact gadget, key lifecycle, quorum, epoch transitions, permanent Ethereum state, attack table). Still design only ("do not implement yet"); owner decisions in its §9.
+- **2026-08-23 direction ACCEPTED by owner; protocol FINALIZED:** [b3-cross-chain-finality-v1.md](b3-cross-chain-finality-v1.md) (normative) — BLS finality is part of Modern PoS V1; BIP340 identity key and BLS consensus key strictly separate; Ethereum verifier built on the fixed-depth (13) keccak `members_root` + 126-byte set header, never a member list; exact verification of epoch transition (strict e→e+1 after successor disclosure), weights (absentee leaves + multiproof), bitmap (LSB-first, complement-of-absentees check), quorum (`floor(2W/3)+1`, rule enforced on-chain for ruleset 1), withdrawal root (depth-32 cumulative keccak tree, single tree with `origin_chain_id` in the leaf). Remaining: parameters in its §9 (F, E, intervals, set bounds, lag) and the implementation go-ahead.
+- **2026-08-23 owner: ZK deferred** — BLS certificate prover only for v1; `IB3FinalityProver` seam retained, no ZK work scheduled.
+- **2026-08-23 compatibility audit:** [b3-finality-compatibility-report.md](b3-finality-compatibility-report.md). Three findings need rulings before code: F-1 the creation-action section has no live carrier in the tree → script-level carriers (`B3F1` coinbase OP_RETURN certificate, `B3B1` binding output) recommended; F-2 validator-set rotation must be handover-gated (epoch extends until `Set_e` certifies), not fixed-height; F-3 the v1 binary never reaches M (X blank, PoS params unset) so **F = M lives in the X-pin release** without `blst` in v1. The OD-8 interim 'rotatable signer_set' release-leg fallback is superseded by the finality protocol (strike by ruling).
+- **2026-08-23 owner LOCK (80-byte model):** `policy_params ≤ 80 B` is a permanent invariant for small typed live/derived state; large evidence (BLS certificates, bridge/Merkle/ZK proofs) is bounded, priced payload data committed to by the policy object — never policy state, never an arbitrary-data policy, never solved by raising `MAX_POLICY_PARAMS_SIZE`. `FINALITY_CERT` = small typed metadata (commitment = hash of the full payload, strict type max, ≤ 1 where required); `FINALITY_KEY` = small binding state (BIP340 identity authorizes the BLS key + separate PoP, sequence-controlled rotation/revocation, effective at next snapshot). Native carrier: [b3-modern-payload-area.md](b3-modern-payload-area.md) rev. 2 — MPA **accepted** (BIP144 flag 0x02 + the existing strict creation-action section), commitment **Path B ruled**: coinbase-only zero-value `MODERN_PAYLOAD_ROOT` metadata cell (policy 8, never in UTXO) committing `payload_root = ComputeMerkleRoot(TaggedHash("B3/MPA/LEAF/V1", i ‖ section_hash_i))`; non-circularity proven (leaves carry position + section hash, never a txid); `ptxid` = full-serialization hash for relay (no SegWit dependency; SegWit activation stays a separate audit question); resource numbers NOT frozen — worst case shows a per-block verification-cost budget is required (PoP spam ≈ 18 s/block at 4 MB) and the MPA weight factor must be chosen first.
+- **2026-08-23 rulings applied to the normative documents:** MPA weight ×4; consensus payload verification-cost budget (per-tx and per-block, checked before cryptography, deterministic per `(type, version)`); relay vsize includes verification cost; `ptxid` defined normatively over the canonical full serialization; policy numbers 6/7/8 frozen (contract §23 updated); byte ceilings NOT frozen — framework frozen, numbers after benchmark. Finality spec rev. 2 now carries the cells + MPA records, identity-authorized `FINALITY_KEY`, handover-gated rotation, F = M in the X-pin release. Remaining owner decisions before Modern PoS implementation: see the session report of 2026-08-23 (finality spec §9, MPA §9, PoS spec §9 provisional rows, SegWit audit).
+- **2026-08-23 Tier-1 rulings + benchmark:** gated rotation FINAL; epoch window `{current, current−1}` FINAL under monotone-height / set-hash / epoch-relation conditions; BLS binding mandatory for block eligibility from F = M (one stake universe); `FINALITY_KEY` semantics FINAL. Benchmark-only work authorized and done: pinned `blst` v0.3.17 vendored (`src/blst`, build-off-by-default), harness `b3-finality-bench`; results + recommended constants in [b3-finality-benchmark-2026-08-23.md](b3-finality-benchmark-2026-08-23.md) (PoP verify ≈ 0.6 ms; certificate ≈ 1.1 ms @3,500 / 1.9 ms @8,192; recommend I/D = 10/12, E = 1,440, cost budget 120,000 / 12,000 units, 1 vbyte/unit, ceilings 32,768 / 65,536). Consensus implementation still awaits a separate go-ahead.
+- **2026-08-23 CONSTANTS FROZEN (owner):** E = 1,440; CHECKPOINT_INTERVAL = 10; CHECKPOINT_DEPTH = 12; MAX_EPOCH_EXTENSION = 7·E; MIN_FINALITY_SET = 4 (chain bootstrap floor only — bridge security thresholds are an A3 decision); verify_cost FINALITY_KEY_EVIDENCE 700 / FINALITY_CERTIFICATE 2,000; MAX_BLOCK_PAYLOAD_COST 120,000; MAX_TX_PAYLOAD_COST 12,000; COST_TO_VBYTES 1; MPA record 32,768 B / section 65,536 B / weight ×4. All earlier Modern PoS / finality / MPA rulings remain in force. Implementation plan: [b3-modern-pos-v1-implementation-plan.md](b3-modern-pos-v1-implementation-plan.md) — **implementation awaits explicit plan approval.**
+- **2026-08-24 owner ruling — bridge sequencing: deposit legs first.** "We should have a
+  real working bridge first from ETH, then from BTC." The mint (inbound) legs lead the
+  bridge program: **Ethereum → B3 first, Bitcoin → B3 second**; the release leg
+  (B3 → Ethereum withdrawals, [b3-cross-chain-finality-v1.md](b3-cross-chain-finality-v1.md)
+  §5–§6) remains normative and follows. Consequences reported, not silently resolved:
+  (a) this supersedes the 2026-08-23 chain-of-chains *sequencing* note ("skip the ETH
+  light client in B3 if the hub is coming") — a real working ETH→B3 bridge requires the
+  inbound verifier now, and per the standing "BLS is the key" ruling that verifier is the
+  **sync-committee light client in B3** (finalized headers only, `blst`-verified); a
+  future hub verifier may replace it as a later in-place transition. (b) The BTC leg is
+  inbound-only at this stage: B3 verifies Bitcoin SPV (most-work headers + tx inclusion
+  at depth); the BTC *custody* model for a two-way peg (threshold-Schnorr committee vs
+  federation) is expressly NOT designed yet and needs its own ruling. (c) Bridge
+  proposal stages 1–3 (test-only / header-only: Keccak-256, RLP/MPT, SSZ, pure
+  light-client functions) are in execution per the committed staged order; consensus
+  wiring (stage 4+, A3, `BRIDGE_MINT`, nullifiers, chainstate) still awaits the §8
+  rulings and remains fail-closed everywhere until then.
 
 ---
 
@@ -226,7 +261,19 @@ release) and requires H/X be known before the enforcing binary activates. The co
 activation mechanism — how nodes agree to begin modern validation once H/X are baked in —
 is not finalized and must not be improvised late.
 
-**RULED 2026-08-23 (owner):** H = 820,000 (corridor 820,001..821,000,
+**RE-RULED 2026-08-26 (owner, after explicit timeline review): H = 810,000**
+(corridor 810,001..811,000, M = 811,001), superseding H = 820,000. Basis:
+legacy stake spacing is 360 s (src/legacy/consensus.h STAKE_TARGET_SPACING),
+~240 blocks/day; tip ~807,95x on 2026-08-26, so the chain reaches 810,000
+around 2026-09-03/04 — an ~8.5-day runway the owner judged sufficient for
+their operator coordination. Path: distribute the fail-closed v1 binary
+(H set, X blank) before the height is reached (pause model); if
+distribution slips past the height, block 810,000 is then a buried
+observable fact and the §62 single-release H+X model applies instead.
+Post-H legacy-client activity is abandoned by the modern ledger — the
+cutoff must be announced to all stakers/operators immediately.
+
+**RULED 2026-08-23 (owner, superseded above):** H = 820,000 (corridor 820,001..821,000,
 M = 821,001); X distribution = PAUSE, FAIL CLOSED — a release ships with H
 set and X blank, accepts through H and refuses every block at H+1
 (`legacy-boundary-unpinned`, a no-penalty header refusal, plus a

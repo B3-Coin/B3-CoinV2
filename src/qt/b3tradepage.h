@@ -21,11 +21,12 @@ class QTabWidget;
 QT_END_NAMESPACE
 
 /**
- * The B3FlowMesh trading workspace shell: market header, native chart,
- * order book, recent trades, trade ticket and orders/positions/fills
- * tabs. Entirely model-driven; with the null backend of this build
- * every surface shows an honest unavailable/empty state, the ticket's
- * primary action stays disabled, and nothing can be submitted.
+ * Inactive B3 FlowMesh trading preview: market header, native chart,
+ * liquidity view, recent trades, limit ticket and spot activity tabs.
+ * Entirely model-driven; with the null backend of this build every
+ * market control is disabled, every surface reports the unavailable state,
+ * and nothing can be submitted. Futures and market orders are deliberately
+ * absent until their protocol and production backend exist.
  */
 class B3TradePage : public QWidget
 {

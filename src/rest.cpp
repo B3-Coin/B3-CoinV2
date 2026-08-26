@@ -9,6 +9,7 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <core_io.h>
+#include <legacy/codec.h>
 #include <flatfile.h>
 #include <httpserver.h>
 #include <index/blockfilterindex.h>
@@ -451,7 +452,11 @@ static bool rest_block(const std::any& context,
     case RESTResponseFormat::JSON: {
         if (tx_verbosity) {
             CBlock block{};
-            SpanReader{*block_data} >> TX_WITH_WITNESS(block);
+            if (chainman.GetConsensus().legacy_b3coin) {
+                SpanReader{*block_data} >> legacy::TX_LEGACY(block);
+            } else {
+                SpanReader{*block_data} >> TX_WITH_WITNESS(block);
+            }
             UniValue objBlock = blockToJSON(chainman.m_blockman, block, *tip, *pblockindex, *tx_verbosity, chainman.GetConsensus().powLimit);
             std::string strJSON = objBlock.write() + "\n";
             req->WriteHeader("Content-Type", "application/json");

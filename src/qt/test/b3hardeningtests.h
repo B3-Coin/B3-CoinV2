@@ -14,12 +14,16 @@ class B3HardeningTests : public QObject
 private Q_SLOTS:
     void sidebarKeyboardNavigationAndAccessibility();
     void themeContrastIsReadable();
+    void synchronizationOverlayUsesOneDarkTheme();
+    void oneHumanFacingB3Unit();
     void topStatusNetworkIdentitiesAreUnmistakable();
     void shellSurvivesWalletWidgetReplacementAndPageCycling();
+    void shellHonorsNarrowDesktopWidth();
     void tradeBackendReplacementFallsBackToNull();
     void chartRendersExtremeValues();
     void dashboardSurvivesModelChurn();
     void assetAndStakePagesSurviveWalletChurn();
+    void visualRegressionFrames();
 };
 
 #endif // BITCOIN_QT_TEST_B3HARDENINGTESTS_H

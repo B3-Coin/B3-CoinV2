@@ -759,6 +759,100 @@ BOOST_FIXTURE_TEST_CASE(b3_validator_key_and_stake_outputs, TestChain100Setup)
         BOOST_REQUIRE_MESSAGE(secret, util::ErrorString(secret).original);
         BOOST_CHECK(secret->GetPubKey() == *created);
 
+        // BLS finality-key derivation (Commit 17): deterministic per (identity,
+        // seq), distinct across sequences, re-derivable after any restore --
+        // nothing but the identity key is ever stored.
+        const auto bls0{wallet->DeriveFinalityBlsKey(0)};
+        BOOST_REQUIRE_MESSAGE(bls0, util::ErrorString(bls0).original);
+        const auto bls0_again{wallet->DeriveFinalityBlsKey(0)};
+        BOOST_REQUIRE(bls0_again);
+        BOOST_CHECK(bls0->GetPublicKey().Compressed() == bls0_again->GetPublicKey().Compressed());
+        const auto bls1{wallet->DeriveFinalityBlsKey(1)};
+        BOOST_REQUIRE(bls1);
+        BOOST_CHECK(bls0->GetPublicKey().Compressed() != bls1->GetPublicKey().Compressed());
+
+        // Independent (imported) BLS key: stored via the wallet's ordinary
+        // descriptor machinery; one resolution rule covers derived + imported.
+        BOOST_CHECK(!wallet->HasImportedFinalityBlsKey());
+        std::array<unsigned char, 32> ikm{};
+        ikm.fill(0x5A);
+        const auto independent{bls::SecretKey::FromIKM(ikm)};
+        BOOST_REQUIRE(independent);
+        {
+            const auto imported{wallet->ImportFinalityBlsKey(*independent)};
+            BOOST_REQUIRE_MESSAGE(imported, util::ErrorString(imported).original);
+            BOOST_CHECK(imported->Compressed() == independent->GetPublicKey().Compressed());
+        }
+        BOOST_CHECK(wallet->HasImportedFinalityBlsKey());
+        {
+            const auto back{wallet->GetImportedFinalityBlsKey()};
+            BOOST_REQUIRE_MESSAGE(back, util::ErrorString(back).original);
+            BOOST_CHECK(back->GetPublicKey().Compressed() == independent->GetPublicKey().Compressed());
+            BOOST_CHECK(back->Bytes() == independent->Bytes());
+        }
+        // Fresh bind: the imported key takes precedence over the derivation.
+        {
+            const auto fresh{wallet->ResolveFinalityBlsKey(0, nullptr)};
+            BOOST_REQUIRE(fresh);
+            BOOST_CHECK(fresh->GetPublicKey().Compressed() == independent->GetPublicKey().Compressed());
+        }
+        // Existing binding: whichever wallet key matches its public key.
+        const auto to_vec{[](const auto& pk) { return std::vector<unsigned char>(pk.begin(), pk.end()); }};
+        {
+            const auto bound_derived{to_vec(bls0->GetPublicKey().Compressed())};
+            const auto r{wallet->ResolveFinalityBlsKey(0, &bound_derived)};
+            BOOST_REQUIRE(r);
+            BOOST_CHECK(r->GetPublicKey().Compressed() == bls0->GetPublicKey().Compressed());
+        }
+        {
+            const auto bound_imported{to_vec(independent->GetPublicKey().Compressed())};
+            const auto r{wallet->ResolveFinalityBlsKey(7, &bound_imported)};
+            BOOST_REQUIRE(r);
+            BOOST_CHECK(r->GetPublicKey().Compressed() == independent->GetPublicKey().Compressed());
+        }
+        {
+            std::vector<unsigned char> foreign(48, 0xEE);
+            BOOST_CHECK(!wallet->ResolveFinalityBlsKey(0, &foreign));
+        }
+
+        // ISOLATION (release-qualification audit): the imported scalar is
+        // opaque wallet state -- its secp interpretation is never a
+        // descriptor, never IsMine, never a signing or export path.
+        {
+            CKey shadow;
+            const auto secret_bytes{independent->Bytes()};
+            shadow.Set(secret_bytes.begin(), secret_bytes.end(), /*fCompressedIn=*/true);
+            BOOST_REQUIRE(shadow.IsValid());
+            BOOST_CHECK(!wallet->IsMine(CTxOut{COIN, GetScriptForRawPubKey(shadow.GetPubKey())}));
+            BOOST_CHECK(!wallet->IsMine(CTxOut{COIN, GetScriptForDestination(PKHash(shadow.GetPubKey()))}));
+            BOOST_CHECK(wallet->GetWalletDescriptors(GetScriptForRawPubKey(shadow.GetPubKey())).empty());
+        }
+        // ENCRYPTION LIFECYCLE: EncryptWallet converts the plain record to
+        // ciphertext in the same batch; a locked wallet refuses the key;
+        // unlocking returns the identical scalar; re-import while encrypted
+        // stores ciphertext only.
+        BOOST_REQUIRE(wallet->EncryptWallet("qualification-pass"));
+        BOOST_CHECK(wallet->IsLocked());
+        BOOST_CHECK(!wallet->GetImportedFinalityBlsKey());
+        BOOST_REQUIRE(wallet->Unlock("qualification-pass"));
+        {
+            const auto back{wallet->GetImportedFinalityBlsKey()};
+            BOOST_REQUIRE_MESSAGE(back, util::ErrorString(back).original);
+            BOOST_CHECK(back->Bytes() == independent->Bytes());
+            BOOST_CHECK(back->GetPublicKey().Compressed() == independent->GetPublicKey().Compressed());
+        }
+        {
+            std::array<unsigned char, 32> ikm2{};
+            ikm2.fill(0x6B);
+            const auto second{bls::SecretKey::FromIKM(ikm2)};
+            BOOST_REQUIRE(second);
+            const auto imported2{wallet->ImportFinalityBlsKey(*second)};
+            BOOST_REQUIRE_MESSAGE(imported2, util::ErrorString(imported2).original);
+            const auto back2{wallet->GetImportedFinalityBlsKey()};
+            BOOST_REQUIRE(back2);
+            BOOST_CHECK(back2->Bytes() == second->Bytes());
+        }
+
         // Ownership and standardness through the carrier.
         BOOST_CHECK(wallet->IsMine(CTxOut{COIN, stake_script}));
         BOOST_CHECK(!wallet->IsMine(CTxOut{COIN, witness_owner_stake}));

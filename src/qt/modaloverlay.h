@@ -51,6 +51,7 @@ private:
     bool layerIsVisible{false};
     bool userClosed{false};
     QPropertyAnimation m_animation;
+    void updateVisualLayout(int width, int height);
     void UpdateHeaderSyncLabel();
     void UpdateHeaderPresyncLabel(int height, const QDateTime& blockDate);
 };

@@ -14,7 +14,7 @@ class B3DashboardTests : public QObject
 private Q_SLOTS:
     void noWalletShowsHonestEmptyState();
     void balancesRenderLargeValuesAndPrivacy();
-    void immatureRowOnlyWhenNonZero();
+    void immatureRowReflectsActualBalance();
     void privacyMasksActivity();
     void clientViewSlotsRenderWithoutNode();
 };

@@ -33,6 +33,8 @@ namespace DBKeys {
 const std::string ACENTRY{"acentry"};
 const std::string ACTIVEEXTERNALSPK{"activeexternalspk"};
 const std::string B3_VALIDATOR_PUBKEY{"b3validatorpubkey"};
+const std::string B3_BLS_KEY{"b3blskey"};
+const std::string B3_BLS_CRYPTED_KEY{"b3cblskey"};
 const std::string ACTIVEINTERNALSPK{"activeinternalspk"};
 const std::string BESTBLOCK_NOMERKLE{"bestblock_nomerkle"};
 const std::string BESTBLOCK{"bestblock"};
@@ -179,6 +181,19 @@ bool WalletBatch::EraseWatchOnly(const CScript &dest)
 bool WalletBatch::WriteB3ValidatorPubKey(const CPubKey& pubkey)
 {
     return WriteIC(DBKeys::B3_VALIDATOR_PUBKEY, pubkey);
+}
+
+bool WalletBatch::WriteB3BlsKey(const std::array<unsigned char, 48>& pubkey, const std::vector<unsigned char>& secret)
+{
+    if (!EraseIC(DBKeys::B3_BLS_CRYPTED_KEY) && m_batch->Exists(DBKeys::B3_BLS_CRYPTED_KEY)) return false;
+    return WriteIC(DBKeys::B3_BLS_KEY, std::make_pair(pubkey, secret));
+}
+
+bool WalletBatch::WriteB3BlsCryptedKey(const std::array<unsigned char, 48>& pubkey,
+                                       const std::vector<unsigned char>& crypted_secret)
+{
+    if (!EraseIC(DBKeys::B3_BLS_KEY) && m_batch->Exists(DBKeys::B3_BLS_KEY)) return false;
+    return WriteIC(DBKeys::B3_BLS_CRYPTED_KEY, std::make_pair(pubkey, crypted_secret));
 }
 
 bool WalletBatch::WriteBestBlock(const CBlockLocator& locator)
@@ -1143,6 +1158,17 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
             CPubKey validator_pubkey;
             if (m_batch->Read(DBKeys::B3_VALIDATOR_PUBKEY, validator_pubkey) && validator_pubkey.IsFullyValid()) {
                 pwallet->LoadValidatorPubKey(validator_pubkey);
+            }
+
+            // B3 imported BLS finality key: an OPAQUE record, deliberately
+            // outside every descriptor / signing-provider / export path
+            // (plain form on unencrypted wallets, ciphertext otherwise --
+            // the ordinary key/ckey lifecycle).
+            std::pair<std::array<unsigned char, 48>, std::vector<unsigned char>> bls_record;
+            if (m_batch->Read(DBKeys::B3_BLS_KEY, bls_record)) {
+                pwallet->LoadImportedFinalityBlsKey(bls_record.first, bls_record.second, /*crypted=*/false);
+            } else if (m_batch->Read(DBKeys::B3_BLS_CRYPTED_KEY, bls_record)) {
+                pwallet->LoadImportedFinalityBlsKey(bls_record.first, bls_record.second, /*crypted=*/true);
             }
         }
         // Early return if there are unknown descriptors. Later loading of ACTIVEINTERNALSPK and ACTIVEEXTERNALEXPK

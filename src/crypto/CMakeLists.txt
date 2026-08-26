@@ -17,6 +17,8 @@ add_library(bitcoin_crypto STATIC EXCLUDE_FROM_ALL
   sha256.cpp
   sha256_sse4.cpp
   sha3.cpp
+  keccak256.cpp
+  bls.cpp
   sha512.cpp
   siphash.cpp
   ../support/cleanse.cpp
@@ -25,6 +27,7 @@ add_library(bitcoin_crypto STATIC EXCLUDE_FROM_ALL
 target_link_libraries(bitcoin_crypto
   PRIVATE
     core_interface
+    b3_blst
 )
 
 if(HAVE_SSE41)

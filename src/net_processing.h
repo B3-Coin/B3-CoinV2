@@ -8,6 +8,7 @@
 
 #include <consensus/amount.h>
 #include <net.h>
+#include <node/finality_signature.h>
 #include <node/txorphanage.h>
 #include <private_broadcast.h>
 #include <protocol.h>
@@ -151,6 +152,10 @@ public:
 
     /** Send ping message to all peers */
     virtual void SendPings() = 0;
+
+    /** Broadcast locally produced B3 finality signatures (`finsig`) to all
+     * fully connected peers (liveness gossip; plan Commit 15). */
+    virtual void RelayFinalitySignatures(std::span<const node::FinalitySig> sigs) = 0;
 
     /** Set the height of the best block and its time (seconds since epoch). */
     virtual void SetBestBlock(int height, std::chrono::seconds time) = 0;

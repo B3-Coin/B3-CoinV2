@@ -25,6 +25,28 @@ Owner rulings incorporated (2026-08-20):
   stake; recreated stake re-serves the 20-block activation depth.
 - **M5** — fork choice is PoS-native and explicit (§6); no PoW chainwork
   semantics and no automatically inherited legacy reorg rule.
+- **M7 (owner ruling 2026-08-23 — amends M1's "no finality gadget")** — the
+  V1 architecture includes **from M** a BLS12-381 finality gadget and BLS
+  validator keys, realized as Modern policy cells plus Modern Payload Area
+  records: `FINALITY_CERT = 6` (coinbase metadata cell, ≤ 1 per block,
+  commitment = hash of the certificate payload carried as MPA record type 4)
+  and `FINALITY_KEY = 7` (validator-binding metadata cell: `validator_key`
+  commitment, `bls_pubkey ‖ seq` params, identity-authorized by a BIP340
+  signature plus a separate BLS proof-of-possession in MPA record type 5,
+  sequence-controlled rotation/revocation, effective at the next snapshot),
+  with `MODERN_PAYLOAD_ROOT = 8` committing all MPA bytes into the block hash.
+  Epochs from M, one-epoch-lookahead snapshot, handover-gated rotation, the
+  frozen `ValidatorSetHeader` / `FinalizedBlock` / `Certificate` layouts, and
+  the finality pin. **F = M**: these rules ship in the X-pin Modern-PoS
+  release (the first binary that validates any modern-era block); bridge use
+  is a later flag A3 ≥ F. **From F a validator key without a non-revoked
+  `FINALITY_KEY` binding is not eligible to produce blocks** (one stake
+  universe for production and finality — owner ruling 2026-08-23); this is
+  the only change to M1's eligibility predicate. STAKE v1, M2–M6 and the
+  block wire format are unchanged. Specification: [b3-cross-chain-finality-v1.md](b3-cross-chain-finality-v1.md)
+  (normative), [b3-modern-payload-area.md](b3-modern-payload-area.md)
+  (carrier), [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md)
+  (rationale). §10's "committee/finality gadgets" entry is superseded.
 - **M6** — a block reward can never directly create active STAKE: the
   coinbase may not contain a STAKE-claiming output.
 - Plus: the unconditional modern coinbase cap (§8) sits **outside** the PoS
@@ -240,8 +262,15 @@ closed (`no-modern-pos-rules`), exactly as before this specification.
 | `max_future_seconds` | 120 | provisional | clock-skew allowance / pacing gate |
 | `reward` | 0 (fees only) | provisional (OD-2) | per-block subsidy under the cap |
 | `reorg_horizon` (D) | 1440 | **RATIFIED 2026-08-21** (one day at 60 s) | modern reorg refusal depth |
+| `finality_epoch_blocks` (E) | 1440 | **RATIFIED 2026-08-23** (M7) | validator-set epoch length |
+| `checkpoint_interval` / `checkpoint_depth` | 10 / 12 | **RATIFIED 2026-08-23** | finality checkpoint cadence / signing depth |
+| `max_epoch_extension` | 7·E = 10080 | **RATIFIED 2026-08-23** | certificate-gated epoch may extend this far before the lineage is declared broken |
+| `min_finality_set` | 4 | **RATIFIED 2026-08-23** | chain bootstrap floor only — not a bridge security threshold |
+| payload cost budget | 120000 / block, 12000 / tx; cert 2000, key-evidence 700; 1 vbyte per unit | **RATIFIED 2026-08-23** | MPA verification-cost accounting (checked before cryptography) |
+| MPA limits | record 32768 B, section 65536 B, weight ×4 | **RATIFIED 2026-08-23** | Modern Payload Area |
 
-The ratified rows are the confirmed V1 numbers (min stake is likewise
+The ratified rows are the confirmed V1 numbers; `sentinel_bits`, `max_future_seconds`
+and `reward` remain the only provisional rows (min stake is likewise
 ratified: 333 modern B3 = 333e9 base units, stated on mainnet, inert until
 H/X); the parameter block still ships unset on every network until the
 remaining provisional rows are settled, so nothing activates piecemeal. The STAKE v1 carrier is likewise RATIFIED
@@ -257,7 +286,8 @@ intervention.
 Normalized-score tie resolution (§6); VRF or threshold randomness upgrades to
 the seed; epoch snapshots and incremental-registry commitments for light
 clients; equivocation penalties consuming the V1 evidence trail; unstake
-cooldown; validator-key re-delegation; committee/finality gadgets; reward
+cooldown; validator-key re-delegation; ~~committee/finality gadgets~~ (now
+V1-reserved by M7); reward
 schedule economics; fresh-sync weak-subjectivity hardening beyond operational
 checkpoints. None of these may be implemented without a new owner ruling.
 

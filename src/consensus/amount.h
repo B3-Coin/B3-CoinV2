@@ -13,6 +13,11 @@ typedef int64_t CAmount;
 
 /** The amount of atomic units in one B3Coin. */
 static constexpr CAmount COIN = 1000000;
+/** The MODERN display unit (locked denomination model): 1 B3 = 1,000 legacy
+ *  COIN = 1e9 base units. All human-facing amounts (RPC, GUI, config args)
+ *  read and write B3; consensus stays in base units. Matches the finality
+ *  weight unit (one whole B3 = one snapshot weight). */
+static constexpr CAmount KILO_COIN = 1000000000;
 
 /** No amount larger than this (in satoshi) is valid.
  *

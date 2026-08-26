@@ -10,6 +10,9 @@
 #include <consensus/params.h>
 #include <logging.h>
 #include <modern/stake.h>
+#include <net_processing.h>
+#include <node/finality_signature.h>
+#include <node/finality_tracker.h>
 #include <node/miner.h>
 #include <node/stake_tracker.h>
 #include <primitives/block.h>
@@ -39,6 +42,30 @@ std::string PhaseName(const Consensus::Params& params, const int height)
 
 StakingLoop::StakingLoop(ChainstateManager& chainman, CTxMemPool* mempool)
     : m_chainman{chainman}, m_mempool{mempool} {}
+
+bool StakingLoop::SetFinalityKey(const bls::SecretKey& key, const std::array<unsigned char, 32>& validator_key,
+                                 std::string& error)
+{
+    LOCK(m_mutex);
+    if (m_running) {
+        error = "cannot change the finality key while the staking loop is running";
+        return false;
+    }
+    m_bls_key = key;
+    m_validator = validator_key;
+    return true;
+}
+
+bool StakingLoop::ClearFinalityKey(std::string& error)
+{
+    LOCK(m_mutex);
+    if (m_running) {
+        error = "cannot change the finality key while the staking loop is running";
+        return false;
+    }
+    m_bls_key.reset();
+    return true;
+}
 
 StakingLoop::~StakingLoop()
 {
@@ -123,11 +150,12 @@ void StakingLoop::FillChainFacts(interfaces::StakingStatus& status, const std::o
                                Consensus::LegacyBoundaryPinned(params) &&
                                Consensus::GetConsensusPhase(next_height, params) == Consensus::ConsensusPhase::MODERN_POS;
     if (!key || !params.legacy_b3coin || !Consensus::LegacyBoundaryPinned(params)) return;
-    node::StakeTracker& tracker{chainstate.ModernStakeTracker()};
-    if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, params, *tip)) return;
-    const auto [w, W]{tracker.ActiveWeight(*key, next_height)};
-    status.active_weight = w;
-    status.total_active_weight = W;
+    // One stake universe: the weights the validation rule will apply to the
+    // next block (whole modern B3, bound + ACTIVE stake).
+    const auto weights{chainstate.ModernEligibilityWeights(*key, *tip)};
+    if (!weights) return;
+    status.active_weight = weights->first;
+    status.total_active_weight = weights->second;
 }
 
 interfaces::StakingStatus StakingLoop::Status(const std::optional<std::array<unsigned char, 32>>& validator_key)
@@ -143,6 +171,8 @@ interfaces::StakingStatus StakingLoop::Status(const std::optional<std::array<uns
         status.blocks_produced = m_blocks_produced;
         status.last_block_hash = m_last_block_hash;
         status.next_block_time = m_next_block_time;
+        status.finality_signing = m_bls_key.has_value();
+        status.last_signed_height = m_last_signed_height;
         if (m_running) {
             status.validator_key = m_validator;
             if (!key) key = m_validator;
@@ -157,11 +187,13 @@ void StakingLoop::ThreadLoop()
     CKey key;
     std::array<unsigned char, 32> validator{};
     CScript coinbase_script;
+    FinalitySigner signer;
     {
         LOCK(m_mutex);
         key = m_key;
         validator = m_validator;
         coinbase_script = m_coinbase_script;
+        if (m_bls_key) signer.SetKey(*m_bls_key, validator);
     }
     const Consensus::Params& params{m_chainman.GetConsensus()};
 
@@ -185,6 +217,29 @@ void StakingLoop::ThreadLoop()
             }
             tip_hash = tip->GetBlockHash();
             next_height = tip->nHeight + 1;
+        }
+
+        // Finality signing (liveness): sign every scheduled checkpoint we
+        // are eligible for at the current tip, self-aggregate, relay. The
+        // signer refuses everything the spec forbids (wrong key, repeat,
+        // shallow, below the finalized checkpoint), so this is idempotent.
+        if (signer.HasKey()) {
+            std::vector<FinalitySig> sigs;
+            {
+                LOCK(::cs_main);
+                Chainstate& chainstate{m_chainman.ActiveChainstate()};
+                const CBlockIndex* tip{chainstate.m_chain.Tip()};
+                FinalityTracker& tracker{chainstate.ModernFinality()};
+                if (tip && tracker.Sync(chainstate.m_chain, chainstate.m_blockman, params, *tip)) {
+                    sigs = signer.MaybeSign(tracker, chainstate.m_chain, params, chainstate.FinalitySignatures());
+                }
+            }
+            if (!sigs.empty()) {
+                WITH_LOCK(m_mutex, m_last_signed_height = signer.LastSignedHeight());
+                LogInfo("staking: signed %d finality checkpoint(s) up to height %d\n", sigs.size(),
+                        signer.LastSignedHeight());
+                if (m_peerman) m_peerman->RelayFinalitySignatures(sigs);
+            }
         }
         if (!params.legacy_b3coin || !params.modern_pos || !Consensus::LegacyBoundaryPinned(params) ||
             Consensus::GetConsensusPhase(next_height, params) != Consensus::ConsensusPhase::MODERN_POS) {

@@ -35,6 +35,14 @@
 #include <legacy/consensus.h>
 #include <legacy/replay.h>
 #include <modern/fn.h>
+#include <modern/metadata_cell.h>
+#include <modern/mpa.h>
+#include <modern/chain_domain.h>
+#include <modern/finality_certificate.h>
+#include <modern/payload_root.h>
+#include <node/finality_binding_index.h>
+#include <node/finality_signature.h>
+#include <node/finality_tracker.h>
 #include <modern/pos.h>
 #include <modern/pos_v1.h>
 #include <modern/stake.h>
@@ -863,6 +871,65 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         if (std::string stake_error;
             !modern::CheckStakeOutputs(tx, m_active_chainstate.m_chainman.GetConsensus(), stake_error)) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-stake-output", stake_error);
+        }
+        // Likewise a claiming-but-invalid (or not yet activated) metadata
+        // cell can never be mined.
+        if (std::string cell_error;
+            !modern::CheckMetadataCellOutputs(tx, m_active_chainstate.m_chainman.GetConsensus(), cell_error)) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-metadata-cell", cell_error);
+        }
+        // Modern Payload Area: structural rules and the FINALITY_KEY cell<->evidence
+        // one-to-one binding are consensus (ContextualCheckBlock enforces the same).
+        if (std::string mpa_error;
+            !modern::CheckTransactionMpa(tx, m_active_chainstate.m_chainman.GetConsensus(), mpa_error)) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-mpa", mpa_error);
+        }
+        std::vector<modern::FinalityKeyPair> pairs;
+        {
+            std::string bind_error;
+            if (!modern::MatchFinalityKeyPairs(tx, pairs, bind_error)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-finality-key-binding", bind_error);
+            }
+        }
+        if (tx.HasMpa()) {
+            // Relayable MPA (plan Commit 17): only FINALITY_KEY evidence has a
+            // mempool path -- certificates are coinbase-only, other types have
+            // none. The transaction wire codec preserves the payload
+            // (TX_MODERN), so no lossy relay form can be produced.
+            for (const auto& rec : tx.mpa) {
+                if (rec.payload_type != modern::MPA_TYPE_FINALITY_KEY_EVIDENCE) {
+                    return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "mpa-mempool-unsupported");
+                }
+            }
+            // Semantic pre-check against the current binding index (the exact
+            // rule re-runs at connect): refuse bindings that could never be
+            // mined on the current chain -- wrong sequence, foreign identity,
+            // duplicate BLS owner, bad PoP.
+            const Consensus::Params& consensus{m_active_chainstate.m_chainman.GetConsensus()};
+            const auto domain{consensus.legacy_final_hash
+                                  ? modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash)
+                                  : std::nullopt};
+            if (!domain) {
+                return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "finality-key-domain-unpinned");
+            }
+            node::FinalityBindingTracker& tracker{m_active_chainstate.ModernFinalityBindings()};
+            const CBlockIndex* tip{m_active_chainstate.m_chain.Tip()};
+            if (!tip || !tracker.Sync(m_active_chainstate.m_chain, m_active_chainstate.m_blockman, consensus, *tip)) {
+                return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "finality-binding-state-unavailable");
+            }
+            const node::FinalityBindingIndex& index{tracker.Index()};
+            const modern::BlsKeyOwnerLookup owner_of{
+                [&index](const modern::BlsPubkeyBytes& pk) { return index.OwnerOf(pk); }};
+            for (const auto& pair : pairs) {
+                modern::ValidatorKeyBytes vk;
+                std::copy(pair.commitment.begin(), pair.commitment.end(), vk.begin());
+                const auto check{modern::CheckFinalityKeyTransition(*domain, pair.commitment, pair.params,
+                                                                    pair.evidence, index.Get(vk), owner_of)};
+                if (check != modern::FinalityKeyCheck::OK) {
+                    return state.Invalid(TxValidationResult::TX_NOT_STANDARD,
+                                         std::string{"finality-key-"} + modern::FinalityKeyCheckName(check));
+                }
+            }
         }
     }
 
@@ -2000,6 +2067,64 @@ node::StakeTracker& Chainstate::ModernStakeTracker()
     return *m_stake_tracker;
 }
 
+node::FinalityBindingTracker& Chainstate::ModernFinalityBindings()
+{
+    AssertLockHeld(::cs_main);
+    if (!m_finality_bindings) m_finality_bindings = std::make_unique<node::FinalityBindingTracker>();
+    return *m_finality_bindings;
+}
+
+node::FinalityTracker& Chainstate::ModernFinality()
+{
+    AssertLockHeld(::cs_main);
+    if (!m_finality_tracker) m_finality_tracker = std::make_unique<node::FinalityTracker>();
+    return *m_finality_tracker;
+}
+
+node::FinalitySignaturePool& Chainstate::FinalitySignatures()
+{
+    AssertLockHeld(::cs_main);
+    if (!m_finality_sigs) m_finality_sigs = std::make_unique<node::FinalitySignaturePool>();
+    return *m_finality_sigs;
+}
+
+void Chainstate::RefreshFinalityAnchor()
+{
+    AssertLockHeld(::cs_main);
+    const Consensus::Params& consensus{m_chainman.GetConsensus()};
+    if (!consensus.legacy_b3coin || !consensus.modern_pos || !Consensus::LegacyBoundaryPinned(consensus)) return;
+    const CBlockIndex* tip{m_chain.Tip()};
+    if (!tip) return;
+    const std::optional<int> modern_start{Consensus::ModernPosStartHeight(consensus)};
+    if (!modern_start || tip->nHeight < *modern_start) return;
+    node::FinalityTracker& finality{ModernFinality()};
+    if (!finality.Sync(m_chain, m_blockman, consensus, *tip)) return;
+    if (const auto& fin{finality.Current().finalized}) {
+        m_blockman.RaiseFinalityAnchor(fin->height, fin->block_hash);
+    }
+}
+
+bool Chainstate::ReorgFromForkViolatesFinality(const int fork_height) const
+{
+    AssertLockHeld(::cs_main);
+    const auto anchor{m_blockman.FinalityAnchor()};
+    return anchor.has_value() && fork_height < anchor->first;
+}
+
+std::optional<std::pair<CAmount, CAmount>> Chainstate::ModernEligibilityWeights(
+    const std::array<unsigned char, 32>& validator_key, const CBlockIndex& parent)
+{
+    AssertLockHeld(::cs_main);
+    const Consensus::Params& consensus{m_chainman.GetConsensus()};
+    node::FinalityTracker& finality{ModernFinality()};
+    if (!finality.Sync(m_chain, m_blockman, consensus, parent)) return std::nullopt;
+    const auto set{finality.SetInForceAt(parent.nHeight + 1, consensus)};
+    if (!set) return std::make_pair(CAmount{0}, CAmount{0});
+    const auto index{set->IndexOf(validator_key)};
+    const CAmount w{index ? static_cast<CAmount>(set->Members()[*index].weight) : CAmount{0}};
+    return std::make_pair(w, static_cast<CAmount>(set->TotalWeight()));
+}
+
 fs::path Chainstate::StoragePath() const
 {
     fs::path path{m_chainman.m_options.datadir / "chainstate"};
@@ -2126,7 +2251,7 @@ void Chainstate::InvalidBlockFound(CBlockIndex* pindex, const BlockValidationSta
 }
 
 static void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo& txundo,
-                        const int nHeight, const uint32_t tx_offset)
+                        const int nHeight, const uint32_t tx_offset, const bool modern_era = false)
 {
     // mark inputs spent
     if (!tx.IsCoinBase()) {
@@ -2137,8 +2262,8 @@ static void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo
             assert(is_spent);
         }
     }
-    // add outputs
-    AddCoins(inputs, tx, nHeight, /*check=*/false, tx_offset);
+    // add outputs (modern era: metadata cells are never added)
+    AddCoins(inputs, tx, nHeight, /*check=*/false, tx_offset, /*exclude_metadata_cells=*/modern_era);
 }
 
 // Kept for the existing tests and non-legacy callers. B3Coin's historical
@@ -2394,6 +2519,7 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
     AssertLockHeld(::cs_main);
     bool fClean = true;
     const bool use_legacy_b3coin{Consensus::GetB3Era(pindex->nHeight, m_chainman.GetConsensus()) == Consensus::B3Era::LEGACY};
+    const bool modern_era_block{m_chainman.GetConsensus().legacy_b3coin && !use_legacy_b3coin};
 
     CBlockUndo blockUndo;
     if (!m_blockman.ReadBlockUndo(blockUndo, *pindex)) {
@@ -2432,7 +2558,11 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
             // coin-database corruption.
             const bool legacy_marker{use_legacy_b3coin && tx.vout[o].nValue == 0 &&
                                      tx.vout[o].scriptPubKey.empty()};
-            if (!tx.vout[o].scriptPubKey.IsUnspendable() && !legacy_marker) {
+            // Modern metadata cells were never added by ConnectBlock (AddCoins
+            // skips them in the modern era), so the symmetric skip here keeps
+            // Connect/Disconnect exact (same discipline as the legacy marker).
+            const bool metadata_cell{modern_era_block && modern::IsMetadataCell(tx.vout[o].scriptPubKey)};
+            if (!tx.vout[o].scriptPubKey.IsUnspendable() && !legacy_marker && !metadata_cell) {
                 COutPoint out(hash, o);
                 Coin coin;
                 bool is_spent = view.SpendCoin(out, &coin);
@@ -2811,6 +2941,58 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         }
     }
 
+    // FINALITY_KEY bindings (modern era): every cell+evidence pair must pass the
+    // semantic checker against the derived binding index as of the parent, with
+    // earlier pairs of this block visible (in-block overlay). All-or-nothing:
+    // the index itself is only advanced by the BlockConnected hook after the
+    // block is fully connected, so an invalid block never mutates it.
+    if (!use_legacy_b3coin && params.GetConsensus().legacy_b3coin) {
+        bool has_bindings{false};
+        for (const auto& tx : block.vtx) {
+            if (!tx->mpa.empty()) { has_bindings = true; break; }
+            for (const auto& out : tx->vout) {
+                if (modern::ClaimsMetadataCell(out.scriptPubKey)) { has_bindings = true; break; }
+            }
+            if (has_bindings) break;
+        }
+        if (has_bindings) {
+            const auto& consensus{params.GetConsensus()};
+            const auto domain{consensus.legacy_final_hash
+                                  ? modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash)
+                                  : std::nullopt};
+            if (!domain) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "finality-key-domain-unpinned",
+                                     "FINALITY_KEY evidence requires the pinned modern chain domain");
+            }
+            node::FinalityBindingTracker& tracker{ModernFinalityBindings()};
+            if (pindex->pprev == nullptr || !tracker.Sync(m_chain, m_blockman, consensus, *pindex->pprev)) {
+                state.Error("finality binding index is unavailable");
+                return false;
+            }
+            std::vector<node::FinalityBindingIndex::Transition> transitions;
+            std::string bind_error;
+            if (!node::VerifyBlockFinalityBindings(block, pindex->nHeight, *domain, consensus, tracker.Index(),
+                                                   transitions, bind_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-key-evidence", bind_error);
+            }
+            // FINALITY_CERTIFICATE (coinbase, <= 1): judged against the epoch
+            // state derived from the chain below this block -- schedule,
+            // depth, window {e, e-1}, relation, ancestry, monotone height,
+            // successor-set hash, Set_{epoch} quorum and aggregate BLS last.
+            // Before M (no set) and on a chain without the bootstrap floor
+            // every certificate is invalid (fail closed).
+            node::FinalityTracker& finality{ModernFinality()};
+            if (!finality.Sync(m_chain, m_blockman, consensus, *pindex->pprev)) {
+                state.Error("finality state is unavailable");
+                return false;
+            }
+            std::string cert_error;
+            if (!finality.CheckBlockCertificate(block, *pindex, consensus, cert_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-cert", cert_error);
+            }
+        }
+    }
+
     const auto time_2{SteadyClock::now()};
     m_chainman.time_forks += time_2 - time_1;
     LogDebug(BCLog::BENCH, "    - Fork checks: %.2fms [%.2fs (%.2fms/blk)]\n",
@@ -2983,7 +3165,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             blockundo.vtxundo.emplace_back();
         }
         UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight,
-                    use_legacy_b3coin ? legacy_tx_offset : 0);
+                    use_legacy_b3coin ? legacy_tx_offset : 0,
+                    /*modern_era=*/params.GetConsensus().legacy_b3coin && !use_legacy_b3coin);
         if (use_legacy_b3coin) {
             if (tx.IsCoinStake()) {
                 legacy_stake_reward = tx.GetValueOut() - tx_value_in;
@@ -3072,13 +3255,38 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             // present or future, can bypass it. With no modern-PoS parameter
             // block configured the cap is fees-only, so nothing can mint by
             // omission.
-            const CAmount modern_reward{params.GetConsensus().modern_pos
-                                            ? params.GetConsensus().modern_pos->reward
-                                            : 0};
+            // OD-2 (ruled 2026-08-26): subsidy(h) = R0 halved every
+            // halving_interval blocks from M; fees ride on top. The
+            // treasury share of the SUBSIDY must pay to the pinned script.
+            CAmount modern_reward{0};
+            CAmount treasury_share{0};
+            if (params.GetConsensus().modern_pos) {
+                const auto m_height{Consensus::ModernPosStartHeight(params.GetConsensus())};
+                modern_reward = Consensus::ModernBlockSubsidy(
+                    pindex->nHeight, m_height.value_or(pindex->nHeight),
+                    *params.GetConsensus().modern_pos);
+                treasury_share =
+                    Consensus::ModernTreasuryShare(modern_reward, *params.GetConsensus().modern_pos);
+            }
             if (block.vtx[0]->GetValueOut() > nFees + modern_reward) {
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
                               strprintf("modern coinbase pays too much (actual=%d vs limit=%d)",
                                         block.vtx[0]->GetValueOut(), nFees + modern_reward));
+            }
+            if (state.IsValid() && treasury_share > 0) {
+                const std::vector<unsigned char>& ts{params.GetConsensus().modern_pos->treasury_script};
+                CAmount paid{0};
+                for (const CTxOut& cb_out : block.vtx[0]->vout) {
+                    if (cb_out.scriptPubKey.size() == ts.size() &&
+                        std::equal(ts.begin(), ts.end(), cb_out.scriptPubKey.begin())) {
+                        paid += cb_out.nValue;
+                    }
+                }
+                if (paid < treasury_share) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-treasury",
+                                  strprintf("modern coinbase pays %d to the treasury script, %d required",
+                                            paid, treasury_share));
+                }
             }
             // M6: a block reward can never directly create active STAKE. The
             // reward pays ordinary outputs; restaking is an explicit STAKE
@@ -3125,12 +3333,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                         } else {
                             if (const auto key{modern::ExtractModernPosValidatorKey(
                                     block.vtx[0]->vin[0].scriptSig)}) {
-                                if (!ModernStakeTracker().Sync(m_chain, m_blockman, consensus,
-                                                               *pindex->pprev)) {
-                                    state.Error("modern-PoS stake registry is unavailable");
+                                // One stake universe (F = M): w and W come from the
+                                // validator set in force at this height -- ACTIVE
+                                // stake joined with a non-revoked FINALITY_KEY
+                                // binding, in whole modern B3 -- the same snapshot
+                                // that defines the finality quorum.
+                                const auto weights{ModernEligibilityWeights(*key, *pindex->pprev)};
+                                if (!weights) {
+                                    state.Error("modern-PoS validator set is unavailable");
                                 } else {
-                                    std::tie(ctx.validator_weight, ctx.total_weight) =
-                                        ModernStakeTracker().ActiveWeight(*key, pindex->nHeight);
+                                    std::tie(ctx.validator_weight, ctx.total_weight) = *weights;
                                 }
                             }
                             if (state.IsValid()) {
@@ -3571,6 +3783,10 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     // A disconnect invalidates the incremental modern-PoS stake registry;
     // it rebuilds from the (now shorter) active chain on next use.
     if (m_stake_tracker) m_stake_tracker->MarkDirty();
+    // The binding index reverts the disconnected block exactly (or marks
+    // itself for rebuild when not in step).
+    if (m_finality_bindings) m_finality_bindings->BlockDisconnected(*pindexDelete);
+    if (m_finality_tracker) m_finality_tracker->BlockDisconnected(*pindexDelete);
 
     UpdateTip(pindexDelete->pprev);
     // Let wallets know transactions went from 1-confirmed to
@@ -3683,6 +3899,19 @@ bool Chainstate::ConnectTip(
     if (m_stake_tracker) {
         m_stake_tracker->BlockConnected(*block_to_connect, *pindexNew, m_chainman.GetConsensus());
     }
+    if (m_finality_bindings) {
+        m_finality_bindings->BlockConnected(*block_to_connect, *pindexNew, m_chainman.GetConsensus());
+    }
+    if (m_finality_tracker) {
+        m_finality_tracker->BlockConnected(*block_to_connect, *pindexNew, m_chainman.GetConsensus());
+        // The finality pin: a certificate connected on the active chain pins
+        // its checkpoint for the life of the process (monotone).
+        if (m_finality_tracker->Synced(pindexNew->GetBlockHash())) {
+            if (const auto& fin{m_finality_tracker->Current().finalized}) {
+                m_blockman.RaiseFinalityAnchor(fin->height, fin->block_hash);
+            }
+        }
+    }
     const auto time_4{SteadyClock::now()};
     m_chainman.time_flush += time_4 - time_3;
     LogDebug(BCLog::BENCH, "  - Flush: %.2fms [%.2fs (%.2fms/blk)]\n",
@@ -3766,6 +3995,16 @@ bool Chainstate::IsAnchorIneligible(const CBlockIndex& block) const
     return m_blockman.IsAnchorIneligible(block);
 }
 
+bool Chainstate::MarkIfAnchorIneligible(CBlockIndex& block)
+{
+    AssertLockHeld(::cs_main);
+    if (block.nStatus & BLOCK_ANCHOR_INELIGIBLE) return true;
+    if (!IsAnchorIneligible(block)) return false;
+    block.nStatus |= BLOCK_ANCHOR_INELIGIBLE;
+    m_blockman.m_dirty_blockindex.insert(&block);
+    return true;
+}
+
 bool Chainstate::LegacyBoundaryActive() const
 {
     AssertLockHeld(::cs_main);
@@ -3778,6 +4017,9 @@ bool Chainstate::LegacyBoundaryActive() const
 CBlockIndex* Chainstate::FindMostWorkChain()
 {
     AssertLockHeld(::cs_main);
+    // Make the finality pin current before judging candidates: a candidate
+    // off the pinned checkpoint is anchor-ineligible exactly like one off X.
+    RefreshFinalityAnchor();
     do {
         CBlockIndex *pindexNew = nullptr;
 
@@ -3895,6 +4137,18 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
                    __func__, pindexMostWork->GetBlockHash().ToString(), pindexMostWork->nHeight);
         setBlockIndexCandidates.erase(pindexMostWork);
         // Signals the caller to drop its cached candidate and reselect.
+        fInvalidFound = true;
+        return true;
+    }
+    // The modern finality pin, with the same shape: a branch forking below
+    // the pinned checkpoint would disconnect it and can never activate
+    // (modern-finality-violation). FindMostWorkChain() already discards such
+    // candidates; this is the defensive check for one that appeared later.
+    if (m_chain.Tip() != nullptr && m_chain.Tip() != pindexFork &&
+        ReorgFromForkViolatesFinality(pindexFork ? pindexFork->nHeight : -1)) {
+        LogWarning("%s: refusing to activate %s (height %d): modern-finality-violation (would disconnect the finalized checkpoint)\n",
+                   __func__, pindexMostWork->GetBlockHash().ToString(), pindexMostWork->nHeight);
+        setBlockIndexCandidates.erase(pindexMostWork);
         fInvalidFound = true;
         return true;
     }
@@ -4318,6 +4572,15 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
 
     {
         LOCK(cs_main);
+        // The finality pin: invalidating the pinned checkpoint or anything
+        // below it on the active chain would disconnect it -- refused, no
+        // administrative override (b3-cross-chain-finality-v1.md section 4).
+        RefreshFinalityAnchor();
+        if (m_chain.Contains(pindex) && ReorgFromForkViolatesFinality(pindex->nHeight - 1)) {
+            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "modern-finality-violation",
+                          strprintf("block at height %d is at or below the finalized checkpoint", pindex->nHeight));
+            return false;
+        }
         for (auto& entry : m_blockman.m_block_index) {
             CBlockIndex* candidate = &entry.second;
             // We don't need to put anything in our active chain into the
@@ -4398,17 +4661,21 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
                 candidate_it = highpow_outofchain_headers.erase(candidate_it);
                 continue;
             }
+            // An off-anchor candidate (legacy boundary X or the finality pin)
+            // is never a candidate or best header; record the classification
+            // so CheckBlockIndex and later passes see it without re-judging.
+            const bool off_anchor{MarkIfAnchorIneligible(*candidate)};
             if (!setBlockIndexCandidates.value_comp()(candidate, new_tip) &&
                 candidate->IsValid(BLOCK_VALID_TRANSACTIONS) &&
                 candidate->HaveNumChainTxs() &&
-                !m_blockman.IsAnchorIneligible(*candidate)) {
+                !off_anchor) {
                 setBlockIndexCandidates.insert(candidate);
                 // Do not remove candidate from the highpow_outofchain_headers cache, because it might be a descendant of the block being invalidated
                 // which needs to be marked failed later.
             }
             if (best_header_needs_update &&
                 m_chainman.m_best_header->nChainWork < candidate->nChainWork &&
-                !m_blockman.IsAnchorIneligible(*candidate)) {
+                !off_anchor) {
                 m_chainman.m_best_header = candidate;
             }
             ++candidate_it;
@@ -5321,6 +5588,21 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
                                                nHeight, *pos.reorg_horizon, tip->nHeight));
             }
         }
+        // The finality pin (from F = M): a header whose branch forks below the
+        // finalized checkpoint would disconnect it -- refused without peer
+        // penalty; skipped while importing/reindexing our own blocks. Forks at
+        // or above the pin remain ordinary reorganizations.
+        // The anchor is kept current by ConnectTip / FindMostWorkChain (every
+        // ActivateBestChain pass), so a header is judged against the pin the
+        // active chain has already established.
+        if (const auto anchor{blockman.FinalityAnchor()}; anchor && !blockman.LoadingBlocks()) {
+            if (const CBlockIndex* fork{chainman.ActiveChain().FindFork(pindexPrev)};
+                fork && fork->nHeight < anchor->first) {
+                return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "modern-finality-violation",
+                                     strprintf("modern-PoS block at height %d forks at height %d, below the finalized checkpoint",
+                                               nHeight, fork->nHeight));
+            }
+        }
     } else {
         if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits", "incorrect proof of work");
@@ -5392,6 +5674,41 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-stake-output",
                                      strprintf("%s in transaction %s", stake_error, tx->GetHash().ToString()));
             }
+            // Metadata cells (policy 6/7/8 carriers): a claiming output must be
+            // well-formed, zero-valued and activated; never reinterpreted.
+            if (std::string cell_error; !modern::CheckMetadataCellOutputs(*tx, consensus_params, cell_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-metadata-cell",
+                                     strprintf("%s in transaction %s", cell_error, tx->GetHash().ToString()));
+            }
+            // Modern Payload Area: activation context, canonical order, registry and
+            // per-type grammar; and the FINALITY_KEY cell<->evidence bijection.
+            if (std::string mpa_error; !modern::CheckTransactionMpa(*tx, consensus_params, mpa_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-mpa",
+                                     strprintf("%s in transaction %s", mpa_error, tx->GetHash().ToString()));
+            }
+            {
+                std::vector<modern::FinalityKeyPair> pairs;
+                std::string bind_error;
+                if (!modern::MatchFinalityKeyPairs(*tx, pairs, bind_error)) {
+                    return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-key-binding",
+                                         strprintf("%s in transaction %s", bind_error, tx->GetHash().ToString()));
+                }
+            }
+        }
+        // Payload verification-cost budget per block, from the record frames
+        // alone -- before ConnectBlock runs any BLS/BIP340 verification.
+        if (std::string cost_error; !modern::CheckBlockPayloadCost(block, cost_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-block-payload-cost", cost_error);
+        }
+        // MODERN_PAYLOAD_ROOT (Path B): every MPA in the block is committed into
+        // the block hash through exactly one coinbase root cell; no MPA => no cell.
+        if (std::string root_error; !modern::CheckBlockPayloadRoot(block, root_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-payload-root", root_error);
+        }
+        // FINALITY_CERT cells / certificate records live in the coinbase only
+        // (structural; the certificate itself is judged at connect).
+        if (std::string cert_error; !modern::CheckFinalityCertificatePlacement(block, cert_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-cert-form", cert_error);
         }
         // Phase-exact trailing-signature shape: corridor blocks earned their
         // place by PoW and must carry no signature; with the modern-PoS rule
@@ -6074,9 +6391,11 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
                 inputs.SpendCoin(txin.prevout);
             }
         }
-        // Pass check = true as every addition may be an overwrite.
+        // Pass check = true as every addition may be an overwrite. Modern
+        // metadata cells are excluded exactly as ConnectBlock excludes them.
         AddCoins(inputs, *tx, pindex->nHeight, true,
-                 use_legacy_b3coin ? legacy_tx_offset : 0);
+                 use_legacy_b3coin ? legacy_tx_offset : 0,
+                 /*exclude_metadata_cells=*/m_chainman.GetConsensus().legacy_b3coin && !use_legacy_b3coin);
         if (use_legacy_b3coin) {
             legacy_tx_offset += static_cast<uint32_t>(GetSerializeSize(legacy::TX_LEGACY(*tx)));
         }

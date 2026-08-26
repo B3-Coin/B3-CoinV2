@@ -13,6 +13,7 @@
 #include <wallet/walletutil.h>
 
 #include <cstdint>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,8 @@ namespace DBKeys {
 extern const std::string ACENTRY;
 extern const std::string ACTIVEEXTERNALSPK;
 extern const std::string B3_VALIDATOR_PUBKEY;
+extern const std::string B3_BLS_KEY;
+extern const std::string B3_BLS_CRYPTED_KEY;
 extern const std::string ACTIVEINTERNALSPK;
 extern const std::string BESTBLOCK;
 extern const std::string BESTBLOCK_NOMERKLE;
@@ -240,6 +243,13 @@ public:
     bool WriteBestBlock(const CBlockLocator& locator);
     //! B3: the wallet's validator public key (the secret lives in its pk() descriptor).
     bool WriteB3ValidatorPubKey(const CPubKey& pubkey);
+    //! B3: the imported BLS finality key as OPAQUE wallet state (never a
+    //! descriptor, never in a signing provider, never exported). Exactly one
+    //! form exists at a time: plain secret on an unencrypted wallet, or the
+    //! vMasterKey ciphertext on an encrypted one (writing either erases the
+    //! other in the same transaction). See CWallet::ImportFinalityBlsKey.
+    bool WriteB3BlsKey(const std::array<unsigned char, 48>& pubkey, const std::vector<unsigned char>& secret);
+    bool WriteB3BlsCryptedKey(const std::array<unsigned char, 48>& pubkey, const std::vector<unsigned char>& crypted_secret);
     bool ReadBestBlock(CBlockLocator& locator);
 
     // Returns true if wallet stores encryption keys

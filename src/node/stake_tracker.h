@@ -73,6 +73,11 @@ public:
     //! weight, both evaluated at `eval_height` (the height of the block being
     //! judged or produced).
     std::pair<CAmount, CAmount> ActiveWeight(const ValidatorKey& key, int eval_height) const;
+    //! Every validator key with ACTIVE (mature) stake at `eval_height` and its
+    //! aggregated weight (base units), plus the total. The single source the
+    //! validator-set snapshot enumerates from (the same registry block
+    //! eligibility uses).
+    std::map<ValidatorKey, CAmount> ActiveWeights(int eval_height, CAmount& total) const;
 
     size_t TrackedOutputs() const { return m_stakes.size(); }
 

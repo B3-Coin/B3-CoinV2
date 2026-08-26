@@ -139,7 +139,9 @@ public:
                 // untouched. Consensus pins its content by phase — empty in
                 // the temporary-PoW corridor, a 64-byte BIP340 validator
                 // signature in the modern-PoS phase (frozen V1 spec §5).
-                READWRITE(TX_WITH_WITNESS(obj.vtx), obj.vchBlockSig);
+                // Marker-modern transactions use the B3 Modern full form:
+                // witness plus the Modern Payload Area (flag 0x02).
+                READWRITE(TX_MODERN(obj.vtx), obj.vchBlockSig);
             } else {
                 READWRITE(obj.vtx, obj.vchBlockSig);
             }

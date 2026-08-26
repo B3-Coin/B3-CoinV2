@@ -216,9 +216,14 @@ struct Params {
      * - test_only_asset_policies_active: activates the coloured-asset policy
      *   set (BURN / DEX_VAULT and the conservation rules). False in
      *   production, so those policies stay unactivated and therefore invalid.
+     *
+     * (The former metadata-cell / MPA test switches are gone: those rules
+     * activate through the real F = M predicate,
+     * Consensus::ModernObjectRulesActive -- H + X + the Modern-PoS rule set.)
      */
     const modern::PosValidator* test_only_modern_pos_validator{nullptr};
     bool test_only_asset_policies_active{false};
+
     /**
      * Hashes of blocks that
      * - are known to be consensus valid, and

@@ -78,6 +78,8 @@ add_library(bitcoinqt STATIC EXCLUDE_FROM_ALL
   b3placeholderpage.cpp
   b3placeholderpage.h
   b3settingspage.cpp
+  updatecontroller.cpp
+  updatepanel.cpp
   b3settingspage.h
   b3shell.cpp
   b3shell.h
@@ -168,6 +170,7 @@ target_link_libraries(bitcoinqt
     Qt6::Widgets
   PRIVATE
     core_interface
+    b3_update
     bitcoin_cli
     leveldb
     Boost::headers
@@ -299,6 +302,18 @@ target_link_libraries(b3coin-qt
 
 import_plugins(b3coin-qt)
 install_binary_component(b3coin-qt HAS_MANPAGE)
+if(UNIX AND NOT APPLE)
+  include(GNUInstallDirs)
+  install(FILES ${PROJECT_SOURCE_DIR}/share/applications/b3-hive.desktop
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/applications
+    COMPONENT b3coin-qt
+  )
+  install(FILES res/icons/bitcoin.png
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/pixmaps
+    RENAME b3-hive.png
+    COMPONENT b3coin-qt
+  )
+endif()
 if(WIN32)
   set_target_properties(b3coin-qt PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()
