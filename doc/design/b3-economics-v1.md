@@ -40,6 +40,14 @@ Owner pins (2026-08-26, second ruling of the day):
 - Split: 90% producer / 10% treasury per block (standing proposal,
   applied unless the owner objects); all tx + payload fees to the
   producer; treasury share pays to the single ruled treasury address.
+- **Treasury address PINNED (owner, 2026-08-26):**
+  `SNyANHiUkuqPSfbeKHDXzVD86LC2ZUUjLX` (mainnet version 63, checksum
+  verified; hash160 `12602418ffc74640e37f1a73d0cdc255d2a07c35`; enforced
+  coinbase script `76a91412602418ffc74640e37f1a73d0cdc255d2a07c3588ac`).
+  Generated offline by the owner with
+  contrib/b3hive-release/make_treasury_wallet.py; the key never left the
+  owner's machine. Issuance fees and FlowMesh fees pay the same address
+  per the earlier ruling.
 
 Consequences, reported: total lifetime emission converges to ~**2% of
 S_H ever** (1% + 0.5% + 0.25% + ...) — an exceptionally scarce schedule;

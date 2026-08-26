@@ -3255,13 +3255,38 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             // present or future, can bypass it. With no modern-PoS parameter
             // block configured the cap is fees-only, so nothing can mint by
             // omission.
-            const CAmount modern_reward{params.GetConsensus().modern_pos
-                                            ? params.GetConsensus().modern_pos->reward
-                                            : 0};
+            // OD-2 (ruled 2026-08-26): subsidy(h) = R0 halved every
+            // halving_interval blocks from M; fees ride on top. The
+            // treasury share of the SUBSIDY must pay to the pinned script.
+            CAmount modern_reward{0};
+            CAmount treasury_share{0};
+            if (params.GetConsensus().modern_pos) {
+                const auto m_height{Consensus::ModernPosStartHeight(params.GetConsensus())};
+                modern_reward = Consensus::ModernBlockSubsidy(
+                    pindex->nHeight, m_height.value_or(pindex->nHeight),
+                    *params.GetConsensus().modern_pos);
+                treasury_share =
+                    Consensus::ModernTreasuryShare(modern_reward, *params.GetConsensus().modern_pos);
+            }
             if (block.vtx[0]->GetValueOut() > nFees + modern_reward) {
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
                               strprintf("modern coinbase pays too much (actual=%d vs limit=%d)",
                                         block.vtx[0]->GetValueOut(), nFees + modern_reward));
+            }
+            if (state.IsValid() && treasury_share > 0) {
+                const std::vector<unsigned char>& ts{params.GetConsensus().modern_pos->treasury_script};
+                CAmount paid{0};
+                for (const CTxOut& cb_out : block.vtx[0]->vout) {
+                    if (cb_out.scriptPubKey.size() == ts.size() &&
+                        std::equal(ts.begin(), ts.end(), cb_out.scriptPubKey.begin())) {
+                        paid += cb_out.nValue;
+                    }
+                }
+                if (paid < treasury_share) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-treasury",
+                                  strprintf("modern coinbase pays %d to the treasury script, %d required",
+                                            paid, treasury_share));
+                }
             }
             // M6: a block reward can never directly create active STAKE. The
             // reward pays ordinary outputs; restaking is an explicit STAKE

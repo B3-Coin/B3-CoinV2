@@ -174,6 +174,12 @@ public:
         int min_finality_set{1};
         int reorg_horizon{200};
         int64_t min_stake_amount{1000};
+        //! OD-2 schedule scaffolding: modern per-block subsidy R0, halving
+        //! interval (blocks), treasury percent and treasury script (hex).
+        int64_t modern_reward{0};
+        int64_t halving_interval{0};
+        int64_t treasury_percent{0};
+        std::vector<unsigned char> treasury_script{};
     };
 
     struct RegTestOptions {

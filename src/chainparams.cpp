@@ -69,6 +69,14 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
         read_int("-b3minfinalityset", b3.min_finality_set);
         read_int("-b3reorghorizon", b3.reorg_horizon);
         read_int("-b3minstake", b3.min_stake_amount);
+        if (args.IsArgSet("-b3modernreward")) read_int("-b3modernreward", b3.modern_reward);
+        if (args.IsArgSet("-b3halvinginterval")) read_int("-b3halvinginterval", b3.halving_interval);
+        if (args.IsArgSet("-b3treasurypercent")) read_int("-b3treasurypercent", b3.treasury_percent);
+        if (const auto hexscript{args.GetArg("-b3treasuryscript")}) {
+            const auto bytes{TryParseHex<unsigned char>(*hexscript)};
+            if (!bytes || bytes->empty()) throw std::runtime_error("Invalid -b3treasuryscript hex");
+            b3.treasury_script = *bytes;
+        }
         options.b3_modern = b3;
     }
     if (HasTestOption(args, "bip94")) options.enforce_bip94 = true;

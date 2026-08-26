@@ -769,6 +769,10 @@ public:
             pos.checkpoint_depth = b3.checkpoint_depth;
             pos.max_epoch_extension = b3.max_epoch_extension;
             pos.min_finality_set = b3.min_finality_set;
+            pos.reward = b3.modern_reward;
+            pos.halving_interval = b3.halving_interval;
+            pos.treasury_percent = static_cast<uint32_t>(b3.treasury_percent);
+            pos.treasury_script = b3.treasury_script;
             assert(pos.Valid());
             consensus.modern_pos = pos;
         }

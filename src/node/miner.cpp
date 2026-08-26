@@ -265,12 +265,25 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // (REVISABLE_BEFORE_MAINNET, provisionally 0) modern reward, matching
     // the unconditional consensus cap. Only non-B3 chains use the stock
     // subsidy schedule.
+    CAmount modern_subsidy{0};
+    CAmount treasury_share{0};
+    if (b3_modern_pos && b3_consensus.modern_pos) {
+        const auto m_height{Consensus::ModernPosStartHeight(b3_consensus)};
+        modern_subsidy = Consensus::ModernBlockSubsidy(nHeight, m_height.value_or(nHeight),
+                                                       *b3_consensus.modern_pos);
+        treasury_share = Consensus::ModernTreasuryShare(modern_subsidy, *b3_consensus.modern_pos);
+    }
     const CAmount block_reward{b3_corridor  ? nFees + *b3_consensus.transition_pow_reward
-                               : b3_modern_pos ? nFees + (b3_consensus.modern_pos
-                                                              ? b3_consensus.modern_pos->reward
-                                                              : 0)
+                               : b3_modern_pos ? nFees + modern_subsidy
                                                : nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus())};
-    coinbaseTx.vout[0].nValue = block_reward;
+    coinbaseTx.vout[0].nValue = block_reward - treasury_share;
+    if (treasury_share > 0) {
+        // OD-2 treasury split: the ruled share of the SUBSIDY pays the
+        // pinned treasury script; the producer keeps the rest plus fees.
+        coinbaseTx.vout.emplace_back(
+            treasury_share, CScript{b3_consensus.modern_pos->treasury_script.begin(),
+                                    b3_consensus.modern_pos->treasury_script.end()});
+    }
     coinbase_tx.block_reward_remaining = block_reward;
 
     // Start the coinbase scriptSig with the block height as required by BIP34.
