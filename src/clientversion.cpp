@@ -33,7 +33,7 @@ const std::string UA_NAME("B3CoinCore");
 
 // git will expand the next line to "#define GIT_COMMIT_ID ..." inside archives:
 //
-#define GIT_COMMIT_ID "9be056a8a72b624dae9623b2f7bded92c2a21c91"
+#define GIT_COMMIT_ID "$Format:%H$"
 
 #ifdef BUILD_GIT_TAG
     #define BUILD_DESC BUILD_GIT_TAG
@@ -86,7 +86,7 @@ std::string CopyrightHolders(const std::string& strPrefix)
 
 std::string LicenseInfo()
 {
-    const std::string URL_SOURCE_CODE = "<https://github.com/bitcoin/bitcoin>";
+    const std::string URL_SOURCE_CODE = "<https://github.com/B3-Coin/B3-CoinV2>";
 
     return CopyrightHolders(strprintf(_("Copyright (C) %i-%i"), 2009, COPYRIGHT_YEAR).translated + " ") + "\n" +
            "\n" +

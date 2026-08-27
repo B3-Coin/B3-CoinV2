@@ -1,15 +1,51 @@
-# B3 Hive release builds: Linux x86-64 (+ tests & frozen vectors -- the
-# x86-64 release gate) and the Windows cross-compile. Runs on demand
-# ("Run workflow" button) and on pushes to release branches.
+# B3 Hive unsigned release-candidate builds for Linux x86-64, Windows
+# x86-64, and macOS arm64. Runs on demand ("Run workflow" button), on
+# pushes to release branches, and on matching version tags.
 name: release-build
 
 on:
   workflow_dispatch:
   push:
     branches: [ "release/*" ]
+    tags: [ "v*" ]
 
 jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.source_version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Derive and validate source version
+        id: source_version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake_version_part() {
+            sed -nE "s/^set\\($1[[:space:]]+([0-9]+)\\).*$/\\1/p" CMakeLists.txt
+          }
+          major=$(cmake_version_part CLIENT_VERSION_MAJOR)
+          minor=$(cmake_version_part CLIENT_VERSION_MINOR)
+          build=$(cmake_version_part CLIENT_VERSION_BUILD)
+          rc=$(cmake_version_part CLIENT_VERSION_RC)
+          for part in "$major" "$minor" "$build" "$rc"; do
+            [[ "$part" =~ ^[0-9]+$ ]] || {
+              echo "Could not derive one numeric source-version component" >&2
+              exit 1
+            }
+          done
+          version="$major.$minor.$build"
+          if (( rc > 0 )); then
+            version="${version}rc${rc}"
+          fi
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "Release tag $GITHUB_REF_NAME does not match source version v$version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   linux-x86_64:
+    needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -18,9 +54,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake pkgconf python3 \
-            libevent-dev libboost-dev libsqlite3-dev
+            libevent-dev libboost-dev libsqlite3-dev capnproto libcapnp-dev \
+            qt6-base-dev qt6-tools-dev qt6-l10n-tools libqrencode-dev
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: >-
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_GUI=ON
+          -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
       - name: Build
         # Build EVERYTHING so the broad ctest gate has every registered test
         # executable (util tests, secp, univalue etc.), not just test_bitcoin.
@@ -30,11 +70,13 @@ jobs:
           # Everything must pass EXCEPT the enumerated known-stock
           # IDENT/DENOM/FIXTURE suites (doc/design/b3-test-baseline.md).
           # A failure in ANY other suite stops the release build.
-          cd build && ctest --output-on-failure -j2             -E "(validation_tests|compress_tests|util_tests|rpc_tests|key_tests|key_io_tests|bip324_tests|bloom_tests|script_standard_tests|net_peer_connection_tests|miner_tests|validation_chainstatemanager_tests|txpackage_tests|validation_chainstate_tests|blockchain_tests|descriptor_tests|interfaces_tests|disconnected_transactions|mock_process)$"
+          cd build && ctest --output-on-failure -j2 \
+            -E "^(validation_tests|compress_tests|util_tests|rpc_tests|key_tests|key_io_tests|bip324_tests|bloom_tests|script_standard_tests|net_peer_connection_tests|miner_tests|validation_chainstatemanager_tests|txpackage_tests|validation_chainstate_tests|blockchain_tests|descriptor_tests|interfaces_tests|disconnected_transactions)$"
       - name: Known-stock set (report-only, drift visibility)
         continue-on-error: true
         run: |
-          cd build && ctest --output-on-failure -j2             -R "(validation_tests|compress_tests|util_tests|rpc_tests|key_tests|key_io_tests|bip324_tests|bloom_tests|script_standard_tests|net_peer_connection_tests|miner_tests|validation_chainstatemanager_tests|txpackage_tests|validation_chainstate_tests|blockchain_tests|descriptor_tests|interfaces_tests|disconnected_transactions|mock_process)$"
+          cd build && ctest --output-on-failure -j2 \
+            -R "^(validation_tests|compress_tests|util_tests|rpc_tests|key_tests|key_io_tests|bip324_tests|bloom_tests|script_standard_tests|net_peer_connection_tests|miner_tests|validation_chainstatemanager_tests|txpackage_tests|validation_chainstate_tests|blockchain_tests|descriptor_tests|interfaces_tests|disconnected_transactions)$"
       - name: Frozen-vector suites (hard gate)
         run: |
           ./build/bin/test_bitcoin --run_test=finality_types_tests
@@ -64,17 +106,33 @@ jobs:
           ./build/bin/test_bitcoin --run_test=finality_operations_tests
           ./build/bin/test_bitcoin --run_test=finality_production_tests
           ./build/bin/test_bitcoin --run_test=finality_qualification_tests
+          ./build/bin/test_bitcoin --run_test=rpc_tests/rpc_parse_monetary_values
+      - name: B3 networking and finality functional gates
+        run: >-
+          ./build/test/functional/test_runner.py
+          p2p_private_broadcast.py
+          p2p_private_broadcast_retry_v1.py
+          feature_b3_finality_soak.py
+          --jobs=2 --timeout-factor=3
       - name: Package
         run: |
-          mkdir -p out && tar -C build/bin -czf out/b3-hive-1.0.0-linux-x86_64.tar.gz \
-            b3coind b3coin-cli b3coin-tx b3coin-wallet
-          shasum -a 256 out/*.tar.gz > out/SHA256SUMS.linux
+          mkdir -p out
+          name=b3-hive-v${{ needs.version.outputs.version }}-unsigned-rc-linux-x86_64
+          stage=$(mktemp -d)
+          mkdir -p "$stage/$name/bin"
+          cp build/bin/b3coin-qt build/bin/b3coind build/bin/b3coin-cli \
+            build/bin/b3coin-tx build/bin/b3coin-util build/bin/b3coin-wallet \
+            "$stage/$name/bin/"
+          cp README.md COPYING "$stage/$name/"
+          tar -C "$stage" -czf "out/$name.tar.gz" "$name"
+          (cd out && sha256sum *.tar.gz > SHA256SUMS.linux)
       - uses: actions/upload-artifact@v4
         with:
           name: b3-hive-linux-x86_64
           path: out/
 
   windows-cross:
+    needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
@@ -91,39 +149,65 @@ jobs:
       - name: Configure + build
         run: |
           cmake -B build --toolchain depends/x86_64-w64-mingw32/toolchain.cmake \
-            -DBUILD_GUI=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)" --target b3coind b3coin-cli b3coin-qt
+            -DBUILD_GUI=ON -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+          cmake --build build -j"$(nproc)" --target deploy
       - name: Package
         run: |
           mkdir -p out
-          zip -j out/b3-hive-1.0.0-win64.zip \
-            build/bin/b3coind.exe build/bin/b3coin-cli.exe build/bin/b3coin-qt.exe
-          sha256sum out/*.zip > out/SHA256SUMS.win64
+          cp build/b3coin-win64-setup.exe \
+            out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-rc-win64-setup.exe
+          zip -j out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-rc-win64.zip \
+            build/release/b3coin-qt.exe build/release/b3coind.exe \
+            build/release/b3coin-cli.exe build/release/b3coin-tx.exe \
+            build/release/b3coin-util.exe build/release/b3coin-wallet.exe \
+            README.md COPYING
+          (cd out && sha256sum *.exe *.zip > SHA256SUMS.win64)
       - uses: actions/upload-artifact@v4
         with:
           name: b3-hive-win64
           path: out/
 
   macos-arm64:
+    needs: version
     runs-on: macos-14
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
-        run: brew install cmake boost libevent sqlite
+        run: brew install cmake boost libevent sqlite capnp qt@6 qrencode
       - name: Configure + build
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j4 --target b3coind b3coin-cli b3coin-tx b3coin-wallet test_bitcoin
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=ON \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+          cmake --build build -j4 --target deploy b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet test_bitcoin
       - name: Frozen-vector spot gate
         run: |
           ./build/bin/test_bitcoin --run_test=finality_types_tests
           ./build/bin/test_bitcoin --run_test=modern_pos_tests
           ./build/bin/test_bitcoin --run_test=legacy_wallet_send_tests
+          ./build/bin/test_bitcoin --run_test=walletdb_tests
+      - name: Verify unsigned app bundle
+        run: |
+          unzip -q build/b3coin-macos-app.zip -d build/app-check
+          test "$(plutil -extract CFBundleDisplayName raw 'build/app-check/B3 Hive.app/Contents/Info.plist')" = "B3 Hive"
+          test "$(plutil -extract CFBundleIdentifier raw 'build/app-check/B3 Hive.app/Contents/Info.plist')" = "co.b3coin.B3Hive"
+          file 'build/app-check/B3 Hive.app/Contents/MacOS/b3coin-qt' | grep -q arm64
+          codesign --verify --deep --strict 'build/app-check/B3 Hive.app'
       - name: Package
         run: |
-          mkdir -p out && tar -C build/bin -czf out/b3-hive-1.0.0-macos-arm64.tar.gz             b3coind b3coin-cli b3coin-tx b3coin-wallet
-          shasum -a 256 out/*.tar.gz > out/SHA256SUMS.macos-arm64
+          mkdir -p out
+          cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-rc-macos-arm64.zip
+          name=b3-hive-v${{ needs.version.outputs.version }}-unsigned-rc-macos-arm64-cli
+          stage=$(mktemp -d)
+          mkdir -p "$stage/$name/bin"
+          cp build/bin/b3coind build/bin/b3coin-cli build/bin/b3coin-tx \
+            build/bin/b3coin-util build/bin/b3coin-wallet "$stage/$name/bin/"
+          cp README.md COPYING "$stage/$name/"
+          tar -C "$stage" -czf "out/$name.tar.gz" "$name"
+          (cd out && shasum -a 256 *.zip *.tar.gz > SHA256SUMS.macos-arm64)
       - uses: actions/upload-artifact@v4
         with:
           name: b3-hive-macos-arm64
