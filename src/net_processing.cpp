@@ -5039,9 +5039,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                 }
                 return;
             }
-            if (pindex && !(pindex->nStatus & BLOCK_HAVE_DATA)) {
-                LOCK(cs_main);
-                if (!IsBlockRequested(pindex->GetBlockHash())) {
+            if (pindex) {
+                LOCK(cs_main); // nStatus is guarded by cs_main
+                if (!(pindex->nStatus & BLOCK_HAVE_DATA) &&
+                    !IsBlockRequested(pindex->GetBlockHash())) {
                     std::vector<CInv> inv{CInv{MSG_BLOCK, pindex->GetBlockHash()}};
                     BlockRequested(pfrom.GetId(), *pindex);
                     MakeAndPushMessage(pfrom, NetMsgType::GETDATA, inv);

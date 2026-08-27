@@ -22,7 +22,9 @@ jobs:
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build build -j"$(nproc)" --target b3coind b3coin-cli b3coin-tx b3coin-wallet test_bitcoin
+        # Build EVERYTHING so the broad ctest gate has every registered test
+        # executable (util tests, secp, univalue etc.), not just test_bitcoin.
+        run: cmake --build build -j"$(nproc)"
       - name: HARD gate -- every suite except the documented stock set
         run: |
           # Everything must pass EXCEPT the enumerated known-stock
@@ -100,4 +102,29 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: b3-hive-win64
+          path: out/
+
+  macos-arm64:
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: brew install cmake boost libevent sqlite
+      - name: Configure + build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j4 --target b3coind b3coin-cli b3coin-tx b3coin-wallet test_bitcoin
+      - name: Frozen-vector spot gate
+        run: |
+          ./build/bin/test_bitcoin --run_test=finality_types_tests
+          ./build/bin/test_bitcoin --run_test=modern_pos_tests
+          ./build/bin/test_bitcoin --run_test=legacy_wallet_send_tests
+      - name: Package
+        run: |
+          mkdir -p out && tar -C build/bin -czf out/b3-hive-1.0.0-macos-arm64.tar.gz             b3coind b3coin-cli b3coin-tx b3coin-wallet
+          shasum -a 256 out/*.tar.gz > out/SHA256SUMS.macos-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: b3-hive-macos-arm64
           path: out/

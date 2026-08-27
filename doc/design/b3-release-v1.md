@@ -12,14 +12,14 @@ assets and FlowMesh shipped activation-inert behind later heights.
 | 1 | H (final legacy height); corridor; M | **RULED 2026-08-26 (superseding 820,000): H = 810,000; corridor = 810,001..811,000; M = 811,001.** PINNED in mainnet chainparams for v1 (hard_fork_height = 810,001, i.e. final legacy height H = 810,000; corridor bits 0x1f008000; X blank = OD-10 pause-fail-closed, verified by finality_activation_tests). |
 | 2 | X distribution | **RULED 2026-08-23: PAUSE, fail closed.** With H set and X unset the node accepts through H and refuses H+1; the mandatory follow-up release pins X and resumes the corridor. Nodes with blank X must never enter the corridor (consensus-enforced, see `legacy-boundary-unpinned`). |
 | 3 | Seed nodes | **RULED 2026-08-23:** `176.31.13.198` is one fixed seed (added). Final release REQUIRES at least two additional independently hosted fixed seeds and a DNS seed under our control — both still **pending**. Do not hardcode explorer peers without operator approval. |
-| 4 | Corridor difficulty constant (`transition_pow_bits`) | **RULED 2026-08-23: canonical compact `0x1f008000`** (the same target, 2^239, that `0x20000080` encodes non-canonically; 2^17 expected hashes per block). NOT YET PINNED — see gates. A canonical round-trip test pins the form; non-canonical configured bits fail closed. |
+| 4 | Corridor difficulty constant (`transition_pow_bits`) | **RULED 2026-08-23: canonical compact `0x1f008000`** (the same target, 2^239, that `0x20000080` encodes non-canonically; 2^17 expected hashes per block). PINNED in mainnet chainparams together with H (2026-08-27). A canonical round-trip test pins the form; non-canonical configured bits fail closed. |
 | 5 | Validator UX for v1 | **RULED 2026-08-23: yes** — wallet-held validator key, `createstake`, staking status, start/stop staking, PENDING/ACTIVE visibility, automatic staking loop. Nothing more advanced in V1. |
 | 6a | Finality gadget (PoS ruling M7, 2026-08-23) | **RULED: F = M, shipped in the X-pin Modern-PoS release — nothing finality-related enters the v1 binary** (v1 refuses H+1 with X blank, so it never validates a modern-era block). The X-pin release must carry: policy cells 6/7/8, the Modern Payload Area + `MODERN_PAYLOAD_ROOT`, `blst`, the finality rules and parameters. Set_0 must be non-empty before M: owner validators stake (STAKE v1) and publish `FINALITY_KEY` bindings during the corridor. Constants FROZEN 2026-08-23 (E 1,440; I/D 10/12; 7·E; MIN_FINALITY_SET 4; cost budget 120,000/12,000; MPA 32,768/65,536/×4). Specs: [b3-cross-chain-finality-v1.md](b3-cross-chain-finality-v1.md), [b3-modern-payload-area.md](b3-modern-payload-area.md); plan: [b3-modern-pos-v1-implementation-plan.md](b3-modern-pos-v1-implementation-plan.md). |
 | 6 | Name / platforms | name **B3 Hive — LOCKED**; platforms: macOS arm64 here, Linux x86_64 needs a box/CI — **pending** |
 
 ## Pin / publish gates (owner, 2026-08-23)
 
-**Do not pin or publish final activation parameters** (H/X, corridor
+**[SUPERSEDED 2026-08-27: H and corridor bits ARE now pinned on mainnet per the owner's release instruction; only X remains unpinned until observed at the pause.]** ~~Do not pin or publish final activation parameters~~ (H/X, corridor
 bits, M) until ALL of:
 
 1. the live-sync legacy-mempool assertion bug is fixed;
