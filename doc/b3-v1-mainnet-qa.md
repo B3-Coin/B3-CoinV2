@@ -32,5 +32,15 @@ amounts before distributing v1 to operators.
 Every step behaves as stated. Any deviation is a release stopper --
 report the exact step and output.
 
-Executed record:
-- [ ] date/operator/txid: ____________________
+Executed record — PASSED 2026-08-27 (operator: project owner):
+- funding (old client -> Hive receive): 3b69b78cba2a06c6b0c4f7b04ae9f5255baacca1da9499241221a64eeaa84c15
+  (0.001 B3; denomination display verified; confirmed in a legacy block)
+- send (Hive -> old network): 0bab19787521918c046971c49173df85645f6babf6629a33d09eb1a8556d4c8c
+  (0.000809 B3 + 0.000191 fee; nTime-signed legacy encoding; CONFIRMED in
+  legacy block b62539433bc06eab03e7dbce9c59a0492bb714547ec8aedcbaa9f7deb4477bf4
+  at height 809,011)
+- raw round-trip: verified via decoderawtransaction (nTime preserved)
+- negative checks: witness address types refused; receive offers S-type only
+- live findings fixed during QA: legacy wallet-tx persistence crash
+  (ca6a72c), legacy fee floor + fallback default (a22583b), -maxtxfee
+  denomination (ede6862) -- each now regression-tested
