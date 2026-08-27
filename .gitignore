@@ -28,3 +28,5 @@ target/
 
 /ci/scratch/
 dist/
+.DS_Store
+**/.DS_Store

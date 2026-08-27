@@ -4,6 +4,8 @@
 
 #include <core_io.h>
 
+#include <chainparams.h>
+
 #include <consensus/params.h>
 #include <legacy/codec.h>
 
@@ -193,6 +195,31 @@ static bool DecodeTx(CMutableTransaction& tx, const std::vector<unsigned char>& 
         return true;
     }
 
+    // B3: mainnet transactions before H use the HISTORICAL encoding with an
+    // nTime field after the version. Try it before the stock legacy form so
+    // decoderawtransaction / signrawtransaction* round-trip real chain
+    // transactions. (A modern tx cannot mis-decode here: its input count
+    // lands where nTime would be and the read runs off the buffer.)
+    CMutableTransaction tx_b3;
+    bool ok_b3 = false;
+    // On a B3 chain the historical encoding is ALWAYS a candidate,
+    // independent of the caller's witness-strategy flags: default callers
+    // (sendrawtransaction, both signing RPCs) pass try_no_witness=false
+    // and must still round-trip real legacy-era transactions.
+    if (Params().GetConsensus().legacy_b3coin) {
+        SpanReader ssData{tx_data};
+        try {
+            ssData >> TX_LEGACY_B3(tx_b3);
+            if (ssData.empty()) ok_b3 = true;
+        } catch (const std::exception&) {
+            // Fall through.
+        }
+    }
+    if (ok_b3 && CheckTxScriptsSanity(tx_b3)) {
+        tx = std::move(tx_b3);
+        return true;
+    }
+
     // Try decoding with legacy serialization, and remember if the result successfully consumes the entire input.
     if (try_no_witness) {
         SpanReader ssData{tx_data};
@@ -211,6 +238,11 @@ static bool DecodeTx(CMutableTransaction& tx, const std::vector<unsigned char>& 
         return true;
     }
 
+    // Sanity passed for neither: prefer the B3 historical form on B3.
+    if (ok_b3) {
+        tx = std::move(tx_b3);
+        return true;
+    }
     // If extended decoding succeeded, and neither decoding passes sanity, return the extended one.
     if (ok_extended) {
         tx = std::move(tx_extended);
@@ -419,7 +451,13 @@ std::string ScriptToAsmStr(const CScript& script, const bool fAttemptSighashDeco
 std::string EncodeHexTx(const CTransaction& tx)
 {
     DataStream ssTx;
-    ssTx << TX_WITH_WITNESS(tx);
+    // Legacy-encoded B3 transactions round-trip in their historical nTime
+    // format; anything else uses the modern extended serialization.
+    if (tx.IsLegacyEncoded()) {
+        ssTx << TX_LEGACY_B3(tx);
+    } else {
+        ssTx << TX_WITH_WITNESS(tx);
+    }
     return HexStr(ssTx);
 }
 

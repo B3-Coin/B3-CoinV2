@@ -141,9 +141,22 @@ public:
         consensus.legacy_last_pow_block = 500;
         // The locked transition design: 1,000 temporary-PoW corridor blocks
         // between the final legacy block H and the first modern-PoS block.
-        // Inert until a mainnet H/X boundary is finalized (hard_fork_height
-        // and legacy_final_hash stay unset here).
+        //
+        // H PINNED for the v1 release (owner rulings 2026-08-26/27): the
+        // final legacy height H is 810,000 (corridor 810,001..811,000,
+        // M = 811,001). NAMING TRAP: this field is the FIRST NON-LEGACY
+        // height (LEGACY_FINAL_HEIGHT = hard_fork_height - 1, see
+        // consensus/params.h), so H = 810,000 pins as 810,001 here.
+        // X (legacy_final_hash) DELIBERATELY stays unset -- the OD-10
+        // pause-fail-closed shape (Consensus::LegacyBoundaryHeightOnly):
+        // this binary accepts the legacy chain through H and refuses every
+        // block at H+1. The X-pin release adds the observed hash and the
+        // Modern-PoS parameter block; nothing modern can activate from this
+        // release.
+        consensus.hard_fork_height = 810'001;
         consensus.transition_pow_length = 1000;
+        // RULED 2026-08-23: the canonical corridor difficulty value.
+        consensus.transition_pow_bits = 0x1f008000;
         // RATIFIED (owner ruling 2026-08-21): the corridor pays fees only --
         // no subsidy. Stated explicitly because an unset reward fails closed.
         consensus.transition_pow_reward = 0;

@@ -23,12 +23,14 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build -j"$(nproc)" --target b3coind b3coin-cli b3coin-tx b3coin-wallet test_bitcoin
-      - name: Unit tests (canonical suites, one process each)
+      - name: Unit tests (report-only; known-stock failures documented)
+        continue-on-error: true
         run: |
-          cd build && ctest --output-on-failure -j2 || true
-          # The known-stock IDENT/DENOM/FIXTURE failures are documented in
-          # doc/design/b3-test-baseline.md; the step above reports, the
-          # gates below are hard requirements:
+          # REPORT-ONLY by design: the documented known-stock IDENT/DENOM/
+          # FIXTURE suites (doc/design/b3-test-baseline.md) fail on B3
+          # params. This step surfaces the full picture without masking a
+          # regression silently -- the HARD gates are the next step.
+          cd build && ctest --output-on-failure -j2
       - name: Frozen-vector suites (hard gate)
         run: |
           ./build/bin/test_bitcoin --run_test=finality_types_tests
@@ -41,6 +43,8 @@ jobs:
           ./build/bin/test_bitcoin --run_test=update_downloader_tests
           ./build/bin/test_bitcoin --run_test=update_manager_tests
           ./build/bin/test_bitcoin --run_test=legacy_genesis_tests
+          ./build/bin/test_bitcoin --run_test=legacy_wallet_send_tests
+          ./build/bin/test_bitcoin --run_test=consensus_phase_tests
       - name: Package
         run: |
           mkdir -p out && tar -C build/bin -czf out/b3-hive-1.0.0-linux-x86_64.tar.gz \
