@@ -13,9 +13,12 @@ doc/design/b3-open-decisions.md.
   wallet.dat migrates in place (doc/b3-wallet-migration.md).
 
 ## Chain
-- One chain: legacy ≤ H, PoW corridor, Modern PoS from M. **H = 810,000**
-  (corridor 810,001..811,000, **M = 811,001**), expected ~2026-09-01; X
-  pinned from the observed block per §62.
+- One chain: legacy ≤ H, PoW corridor, Modern PoS from M. **H = 810,000
+  PINNED in mainnet chainparams** (hard_fork_height = 810,001 per the
+  field's first-non-legacy semantics; corridor 810,001..811,000 at bits
+  0x1f008000; **M = 811,001**), expected ~2026-09-01. X deliberately
+  blank: the OD-10 pause-fail-closed v1 shape, verified by
+  finality_activation_tests; the X-pin release adds the observed hash.
 - Modern PoS V1 + BLS finality: implemented, multi-node soak-qualified,
   persisted fail-closed pin; F = M. Full mainnet replay from genesis
   against live peers PASSED (height 808,751, zero errors); real-history
@@ -42,6 +45,14 @@ doc/design/b3-open-decisions.md.
   `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6` (DEPOSIT PROVEN).
   Verification-only in v1: no consensus reach; stage-4 mint admission
   rules ratified (threat model §5); b3Recipient encoding proposed.
+
+## Legacy-era wallet safety (release reviews, closed)
+- Send + receive is the ruled legacy-era scope. Receive: legacy P2PKH
+  only -- witness address types refused at the handout choke point and in
+  every RPC/GUI path (SegWit inactive = anyone-can-spend). Send:
+  historical nTime identity end to end (era judged at the active tip,
+  fail-closed if unavailable), witness recipients AND explicit witness
+  change refused, raw-tx RPCs round-trip the legacy encoding.
 
 ## Application
 - B3 Hive 1.0.0: redesigned shell (Codex pass, reconciled), secure
