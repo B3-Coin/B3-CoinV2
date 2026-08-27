@@ -377,7 +377,7 @@ numbers (frozen V1 spec: 60 s interval, 30 s rounds, f0 = 1, ×2
 relaxation — the VRF/slots/epochs items are superseded; the seed at M
 derives from the corridor-exit block).
 
-**RULED 2026-08-23 in addition:** corridor difficulty VALUE = canonical `0x1f008000` (§6, pin gated); H = 820,000 / M = 821,001 and X-distribution = pause-fail-closed (open-decisions OD-10).
+**RULED 2026-08-23 in addition:** corridor difficulty VALUE = canonical `0x1f008000` (§6, pin gated); H = 810,000 / M = 811,001 (re-ruled 2026-08-26, superseding 820,000) and X-distribution = pause-fail-closed (open-decisions OD-10).
 
 **RULED 2026-08-23 in addition:** corridor PACING — minimum spacing 60 s and future bound 120 s (§6.1).
 
