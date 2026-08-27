@@ -52,7 +52,10 @@ BOOST_FIXTURE_TEST_SUITE(wallet_tests, WalletTestingSetup)
 static CMutableTransaction TestSimpleSpend(const CTransaction& from, uint32_t index, const CKey& key, const CScript& pubkey)
 {
     CMutableTransaction mtx;
-    mtx.vout.emplace_back(from.vout[index].nValue - DEFAULT_TRANSACTION_MAXFEE, pubkey);
+    // A plain fee, NOT DEFAULT_TRANSACTION_MAXFEE: with B3's corrected max
+    // (0.1 B3 = 1e8 base) the stock expression exceeds a regtest coinbase
+    // and produces a negative output.
+    mtx.vout.emplace_back(from.vout[index].nValue - 100'000, pubkey);
     mtx.vin.push_back({CTxIn{from.GetHash(), index}});
     FillableSigningProvider keystore;
     keystore.AddKey(key);
