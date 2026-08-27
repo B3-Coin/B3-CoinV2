@@ -1223,6 +1223,18 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     // Get the fee rate to use effective values in coin selection
     FeeCalculation feeCalc;
     coin_selection_params.m_effective_feerate = GetMinimumFeeRate(wallet, coin_control, &feeCalc);
+    // B3 legacy era: the historical network enforces a FLAT minimum fee of
+    // 0.1 legacy B3 (100,000 base units) per started KB at relay
+    // (master: MIN_RELAY_TX_FEE) -- below it, old peers never relay and
+    // miners never mine. Floor the feerate at 600,000 base/kvB so every
+    // realistic transaction size (>= ~170 vB) clears the flat floor; a
+    // higher user/estimator rate still wins. Live-QA finding 2026-08-27.
+    if (txNew.m_legacy_encoding) {
+        const CFeeRate legacy_floor{600'000};
+        if (coin_selection_params.m_effective_feerate < legacy_floor) {
+            coin_selection_params.m_effective_feerate = legacy_floor;
+        }
+    }
     // Do not, ever, assume that it's fine to change the fee rate if the user has explicitly
     // provided one
     if (coin_control.m_feerate && coin_selection_params.m_effective_feerate > *coin_control.m_feerate) {

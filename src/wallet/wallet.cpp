@@ -1181,6 +1181,10 @@ bool CWallet::LoadToWallet(const Txid& hash, const UpdateWalletTxFn& fill_wtx)
     const auto& ins = mapWallet.emplace(std::piecewise_construct, std::forward_as_tuple(hash), std::forward_as_tuple(nullptr, TxStateInactive{}));
     CWalletTx& wtx = ins.first->second;
     if (!fill_wtx(wtx, ins.second)) {
+        // A failed database decode must not leave a partially populated entry.
+        // NEED_RESCAN relies on AddToWallet being able to insert the canonical
+        // chain or mempool transaction under this key.
+        if (ins.second) mapWallet.erase(ins.first);
         return false;
     }
     // If wallet doesn't have a chain (e.g when using bitcoin-wallet tool),
@@ -3055,6 +3059,14 @@ bool CWallet::LoadWalletArgs(std::shared_ptr<CWallet> wallet, const WalletContex
                                _("This is the transaction fee you may pay when fee estimates are not available."));
         }
         wallet->m_fallback_fee = CFeeRate{fallback_fee.value()};
+    }
+
+    // B3: the legacy chain has no fee market for the estimator to learn
+    // from, which surfaces as "fee estimation failed" in the GUI. Default
+    // the fallback rate to the legacy relay floor so sends work out of the
+    // box; an explicit -fallbackfee still overrides (live-QA 2026-08-27).
+    if (!args.IsArgSet("-fallbackfee") && Params().GetConsensus().legacy_b3coin) {
+        wallet->m_fallback_fee = CFeeRate{600'000};
     }
 
     // Disable fallback fee in case value was set to 0, enable if non-null value
