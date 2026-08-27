@@ -288,7 +288,7 @@ int main(int argc, char* argv[])
             key_file >> key_bytes;
         }
         const Obfuscation obfuscation{key_bytes};
-        const auto read_block{[&](const int height) -> std::optional<CBlock> {
+        const auto read_block{[&](const int height) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) -> std::optional<CBlock> {
             AssertLockHeld(::cs_main);
             const CBlockIndex* pindex{chain[static_cast<size_t>(height)]};
             AutoFile file{fsbridge::fopen(blocks_dir / fs::u8path(strprintf("blk%05u.dat", pindex->nFile)), "rb")};

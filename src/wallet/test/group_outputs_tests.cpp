@@ -15,6 +15,7 @@ namespace wallet {
 BOOST_FIXTURE_TEST_SUITE(group_outputs_tests, TestingSetup)
 
 static int nextLockTime = 0;
+static constexpr OutputType TEST_OUTPUT_TYPE{OutputType::LEGACY};
 
 static std::shared_ptr<CWallet> NewWallet(const node::NodeContext& m_node)
 {
@@ -119,12 +120,12 @@ BOOST_AUTO_TEST_CASE(outputs_grouping_tests)
     // #################################################################################
 
     unsigned long GROUP_SIZE = 10;
-    const CTxDestination dest = *Assert(wallet->GetNewDestination(OutputType::BECH32, ""));
+    const CTxDestination dest = *Assert(wallet->GetNewDestination(TEST_OUTPUT_TYPE, ""));
     for (unsigned long i = 0; i < GROUP_SIZE; i++) {
         addCoin(group_verifier.coins_pool, *wallet, dest, 10 * COIN, /*is_from_me=*/true);
     }
 
-    group_verifier.GroupAndVerify(OutputType::BECH32,
+    group_verifier.GroupAndVerify(TEST_OUTPUT_TYPE,
                                   BASIC_FILTER,
                                   /*expected_with_partial_spends_size=*/ GROUP_SIZE,
                                   /*expected_without_partial_spends_size=*/ 1,
@@ -135,12 +136,12 @@ BOOST_AUTO_TEST_CASE(outputs_grouping_tests)
     //    group for avoid partial spends and 10 different output groups for partial spends
     // ####################################################################################
 
-    const CTxDestination dest2 = *Assert(wallet->GetNewDestination(OutputType::BECH32, ""));
+    const CTxDestination dest2 = *Assert(wallet->GetNewDestination(TEST_OUTPUT_TYPE, ""));
     for (unsigned long i = 0; i < GROUP_SIZE; i++) {
         addCoin(group_verifier.coins_pool, *wallet, dest2, 5 * COIN, /*is_from_me=*/true);
     }
 
-    group_verifier.GroupAndVerify(OutputType::BECH32,
+    group_verifier.GroupAndVerify(TEST_OUTPUT_TYPE,
             BASIC_FILTER,
             /*expected_with_partial_spends_size=*/ GROUP_SIZE * 2,
             /*expected_without_partial_spends_size=*/ 2,
@@ -150,19 +151,19 @@ BOOST_AUTO_TEST_CASE(outputs_grouping_tests)
     // 4) Now add a negative output --> which will be skipped if "positive_only" is set
     // ################################################################################
 
-    const CTxDestination dest3 = *Assert(wallet->GetNewDestination(OutputType::BECH32, ""));
+    const CTxDestination dest3 = *Assert(wallet->GetNewDestination(TEST_OUTPUT_TYPE, ""));
     addCoin(group_verifier.coins_pool, *wallet, dest3, 1, true, CFeeRate(100));
-    BOOST_CHECK(group_verifier.coins_pool.coins[OutputType::BECH32].back().GetEffectiveValue() <= 0);
+    BOOST_CHECK(group_verifier.coins_pool.coins[TEST_OUTPUT_TYPE].back().GetEffectiveValue() <= 0);
 
     // First expect no changes with "positive_only" enabled
-    group_verifier.GroupAndVerify(OutputType::BECH32,
+    group_verifier.GroupAndVerify(TEST_OUTPUT_TYPE,
             BASIC_FILTER,
             /*expected_with_partial_spends_size=*/ GROUP_SIZE * 2,
             /*expected_without_partial_spends_size=*/ 2,
             /*positive_only=*/ true);
 
     // Then expect changes with "positive_only" disabled
-    group_verifier.GroupAndVerify(OutputType::BECH32,
+    group_verifier.GroupAndVerify(TEST_OUTPUT_TYPE,
             BASIC_FILTER,
             /*expected_with_partial_spends_size=*/ GROUP_SIZE * 2 + 1,
             /*expected_without_partial_spends_size=*/ 3,
@@ -174,12 +175,12 @@ BOOST_AUTO_TEST_CASE(outputs_grouping_tests)
     //    "not mine" UTXOs) --> it must not be added to any group
     // ##############################################################################
 
-    const CTxDestination dest4 = *Assert(wallet->GetNewDestination(OutputType::BECH32, ""));
+    const CTxDestination dest4 = *Assert(wallet->GetNewDestination(TEST_OUTPUT_TYPE, ""));
     addCoin(group_verifier.coins_pool, *wallet, dest4, 6 * COIN,
             /*is_from_me=*/false, CFeeRate(0), /*depth=*/5);
 
     // Expect no changes from this round and the previous one (point 4)
-    group_verifier.GroupAndVerify(OutputType::BECH32,
+    group_verifier.GroupAndVerify(TEST_OUTPUT_TYPE,
             BASIC_FILTER,
             /*expected_with_partial_spends_size=*/ GROUP_SIZE * 2 + 1,
             /*expected_without_partial_spends_size=*/ 3,
@@ -191,12 +192,12 @@ BOOST_AUTO_TEST_CASE(outputs_grouping_tests)
     //    "mine" UTXOs) --> it must not be added to any group
     // ##############################################################################
 
-    const CTxDestination dest5 = *Assert(wallet->GetNewDestination(OutputType::BECH32, ""));
+    const CTxDestination dest5 = *Assert(wallet->GetNewDestination(TEST_OUTPUT_TYPE, ""));
     addCoin(group_verifier.coins_pool, *wallet, dest5, 6 * COIN,
             /*is_from_me=*/true, CFeeRate(0), /*depth=*/0);
 
     // Expect no changes from this round and the previous one (point 5)
-    group_verifier.GroupAndVerify(OutputType::BECH32,
+    group_verifier.GroupAndVerify(TEST_OUTPUT_TYPE,
             BASIC_FILTER,
             /*expected_with_partial_spends_size=*/ GROUP_SIZE * 2 + 1,
             /*expected_without_partial_spends_size=*/ 3,
@@ -206,7 +207,7 @@ BOOST_AUTO_TEST_CASE(outputs_grouping_tests)
     // 7) Surpass the OUTPUT_GROUP_MAX_ENTRIES and verify that a second partial group gets created
     // ###########################################################################################
 
-    const CTxDestination dest7 = *Assert(wallet->GetNewDestination(OutputType::BECH32, ""));
+    const CTxDestination dest7 = *Assert(wallet->GetNewDestination(TEST_OUTPUT_TYPE, ""));
     uint16_t NUM_SINGLE_ENTRIES = 101;
     for (unsigned long i = 0; i < NUM_SINGLE_ENTRIES; i++) { // OUTPUT_GROUP_MAX_ENTRIES{100}
         addCoin(group_verifier.coins_pool, *wallet, dest7, 9 * COIN, /*is_from_me=*/true);
@@ -214,7 +215,7 @@ BOOST_AUTO_TEST_CASE(outputs_grouping_tests)
 
     // Exclude partial groups only adds one more group to the previous test case (point 6)
     int PREVIOUS_ROUND_COUNT = GROUP_SIZE * 2 + 1;
-    group_verifier.GroupAndVerify(OutputType::BECH32,
+    group_verifier.GroupAndVerify(TEST_OUTPUT_TYPE,
             BASIC_FILTER,
             /*expected_with_partial_spends_size=*/ PREVIOUS_ROUND_COUNT + NUM_SINGLE_ENTRIES,
             /*expected_without_partial_spends_size=*/ 4,
@@ -222,7 +223,7 @@ BOOST_AUTO_TEST_CASE(outputs_grouping_tests)
 
     // Include partial groups should add one more group inside the "avoid partial spends" count
     const CoinEligibilityFilter& avoid_partial_groups_filter{1, 6, 0, 0, /*include_partial=*/ true};
-    group_verifier.GroupAndVerify(OutputType::BECH32,
+    group_verifier.GroupAndVerify(TEST_OUTPUT_TYPE,
             avoid_partial_groups_filter,
             /*expected_with_partial_spends_size=*/ PREVIOUS_ROUND_COUNT + NUM_SINGLE_ENTRIES,
             /*expected_without_partial_spends_size=*/ 5,

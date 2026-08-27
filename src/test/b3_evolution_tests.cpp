@@ -626,7 +626,6 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
     // Single 100k for A; the SAME total as 30k/30k/40k for B.
     const CMutableTransaction stake_a{stake_from(0, {{key_a, 100'000}})};
     const CMutableTransaction stake_b{stake_from(1, {{key_b, 30'000}, {key_b, 30'000}, {key_b, 40'000}})};
-    const Txid stake_a_txid{CTransaction{stake_a}.GetHash()};
     const int stake_height{tip()->nHeight + 1};
     submit_corridor({stake_a, stake_b});
 

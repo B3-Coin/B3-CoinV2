@@ -879,6 +879,8 @@ BOOST_FIXTURE_TEST_CASE(pinned_h_rewind_and_fail_closed_sync, PodTestSetup)
         // ---- Transactional -podreport: records accumulate privately and
         // publish only after the complete anchored replay succeeds.
         {
+            CCoinsViewDB* const live_view{WITH_LOCK(
+                cs_main, return &cm().ActiveChainstate().CoinsDB())};
             const auto read_block{[&](const int height) -> std::optional<CBlock> {
                 CBlock block;
                 const CBlockIndex* pindex{WITH_LOCK(cs_main, return cm().ActiveChain()[height])};
@@ -894,7 +896,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_h_rewind_and_fail_closed_sync, PodTestSetup)
                                               .memory_only = true},
                                      {}};
                 const node::ReplayEquivalenceResult late{node::VerifyReplayEquivalence(
-                    consensus, cm().ActiveChainstate().CoinsDB(), read_block_failing_late,
+                    consensus, *live_view, read_block_failing_late,
                     scratch,
                     {.final_height = 36, .final_hash = chain_hash(36),
                      .derive_pod_report = true})};
@@ -907,7 +909,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_h_rewind_and_fail_closed_sync, PodTestSetup)
                                               .memory_only = true},
                                      {}};
                 const node::ReplayEquivalenceResult ok{node::VerifyReplayEquivalence(
-                    consensus, cm().ActiveChainstate().CoinsDB(), read_block, scratch,
+                    consensus, *live_view, read_block, scratch,
                     {.final_height = 36, .final_hash = chain_hash(36),
                      .derive_pod_report = true})};
                 BOOST_REQUIRE_MESSAGE(ok.errors.empty(),

@@ -302,7 +302,7 @@ BOOST_AUTO_TEST_CASE(exhausted_peer_repolls_after_its_retry_bar_expires)
                       /*relay_txs=*/true);
     BOOST_REQUIRE(!node->fDisconnect);
 
-    const auto exhaust{[&] {
+    const auto exhaust{[&]() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
         BOOST_REQUIRE(connman.ReceiveMsgFrom(*node, NetMsg::Make(NetMsgType::INV, std::vector<CInv>{})));
         node->fPauseSend = false;
         connman.ProcessMessagesOnce(*node);

@@ -96,7 +96,7 @@ public:
          * bits, coinbase key declaration) and must be SIGNED by the caller
          * after the merkle root is finalized (node::SignModernPosBlock).
          */
-        std::optional<std::array<unsigned char, 32>> modern_pos_validator_key;
+        std::optional<std::array<unsigned char, 32>> modern_pos_validator_key{};
     };
 
     explicit BlockAssembler(Chainstate& chainstate, const CTxMemPool* mempool, const Options& options);

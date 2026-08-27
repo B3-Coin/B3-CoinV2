@@ -926,7 +926,8 @@ public:
      * error.
      */
     bool AbandonOffAnchorTip(BlockValidationState& state)
-        EXCLUSIVE_LOCKS_REQUIRED(m_chainstate_mutex, !::cs_main);
+        EXCLUSIVE_LOCKS_REQUIRED(m_chainstate_mutex)
+        LOCKS_EXCLUDED(::cs_main);
 
     void PruneBlockIndexCandidates();
 

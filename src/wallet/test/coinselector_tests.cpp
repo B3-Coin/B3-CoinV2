@@ -34,6 +34,10 @@ BOOST_FIXTURE_TEST_SUITE(coinselector_tests, WalletTestingSetup)
 static const CoinEligibilityFilter filter_standard(1, 6, 0);
 static const CoinEligibilityFilter filter_confirmed(1, 1, 0);
 static const CoinEligibilityFilter filter_standard_extra(6, 6, 0);
+static constexpr OutputType TEST_OUTPUT_TYPE{OutputType::LEGACY};
+// Coin-selection weight scenarios use this synthetic lightweight input size
+// independently of the wallet's permitted destination type.
+static constexpr int TEST_SPENDABLE_INPUT_BYTES{68};
 static int nextLockTime = 0;
 
 static void add_coin(const CAmount& nValue, int nInput, SelectionResult& result)
@@ -68,7 +72,7 @@ static void add_coin(CoinsResult& available_coins, CWallet& wallet, const CAmoun
     tx.vout.resize(nInput + 1);
     tx.vout[nInput].nValue = nValue;
     if (spendable) {
-        tx.vout[nInput].scriptPubKey = GetScriptForDestination(*Assert(wallet.GetNewDestination(OutputType::BECH32, "")));
+        tx.vout[nInput].scriptPubKey = GetScriptForDestination(*Assert(wallet.GetNewDestination(TEST_OUTPUT_TYPE, "")));
     }
     Txid txid = tx.GetHash();
 
@@ -77,7 +81,9 @@ static void add_coin(CoinsResult& available_coins, CWallet& wallet, const CAmoun
     assert(ret.second);
     CWalletTx& wtx = (*ret.first).second;
     const auto& txout = wtx.tx->vout.at(nInput);
-    available_coins.Add(OutputType::BECH32, {COutPoint(wtx.GetHash(), nInput), txout, nAge, custom_size == 0 ? CalculateMaximumSignedInputSize(txout, &wallet, /*coin_control=*/nullptr) : custom_size, /*solvable=*/true, /*safe=*/true, wtx.GetTxTime(), fIsFromMe, feerate});
+    const int input_bytes{custom_size != 0 ? custom_size :
+        (spendable ? TEST_SPENDABLE_INPUT_BYTES : CalculateMaximumSignedInputSize(txout, &wallet, /*coin_control=*/nullptr))};
+    available_coins.Add(TEST_OUTPUT_TYPE, {COutPoint(wtx.GetHash(), nInput), txout, nAge, input_bytes, /*solvable=*/true, /*safe=*/true, wtx.GetTxTime(), fIsFromMe, feerate});
 }
 
 // Helpers
@@ -224,8 +230,8 @@ BOOST_AUTO_TEST_CASE(bnb_search_test)
         COutput select_coin = available_coins.All().at(0);
         coin_control.Select(select_coin.outpoint);
         CoinsResult selected_input;
-        selected_input.Add(OutputType::BECH32, select_coin);
-        available_coins.Erase({available_coins.coins[OutputType::BECH32].begin()->outpoint});
+        selected_input.Add(TEST_OUTPUT_TYPE, select_coin);
+        available_coins.Erase({available_coins.coins[TEST_OUTPUT_TYPE].begin()->outpoint});
 
         LOCK(wallet->cs_wallet);
         const auto result10 = SelectCoins(*wallet, available_coins, selected_input, 10 * CENT, coin_control, coin_selection_params_bnb);
@@ -242,7 +248,7 @@ BOOST_AUTO_TEST_CASE(bnb_search_test)
         coin_selection_params_bnb.m_long_term_feerate = CFeeRate(3000);
 
         // Add selectable outputs, increasing their raw amounts by their input fee to make the effective value equal to the raw amount
-        CAmount input_fee = coin_selection_params_bnb.m_effective_feerate.GetFee(/*virtual_bytes=*/68); // bech32 input size (default test output type)
+        CAmount input_fee = coin_selection_params_bnb.m_effective_feerate.GetFee(TEST_SPENDABLE_INPUT_BYTES);
         add_coin(available_coins, *wallet, 10 * CENT + input_fee, coin_selection_params_bnb.m_effective_feerate, 6 * 24, false, 0, true);
         add_coin(available_coins, *wallet, 9 * CENT + input_fee, coin_selection_params_bnb.m_effective_feerate, 6 * 24, false, 0, true);
         add_coin(available_coins, *wallet, 1 * CENT + input_fee, coin_selection_params_bnb.m_effective_feerate, 6 * 24, false, 0, true);
@@ -255,8 +261,8 @@ BOOST_AUTO_TEST_CASE(bnb_search_test)
         COutput select_coin = available_coins.All().at(1); // pre select 9 coin
         coin_control.Select(select_coin.outpoint);
         CoinsResult selected_input;
-        selected_input.Add(OutputType::BECH32, select_coin);
-        available_coins.Erase({(++available_coins.coins[OutputType::BECH32].begin())->outpoint});
+        selected_input.Add(TEST_OUTPUT_TYPE, select_coin);
+        available_coins.Erase({(++available_coins.coins[TEST_OUTPUT_TYPE].begin())->outpoint});
         const auto result13 = SelectCoins(*wallet, available_coins, selected_input, 10 * CENT, coin_control, coin_selection_params_bnb);
         BOOST_CHECK(EquivalentResult(expected_result, *result13));
     }
@@ -1427,7 +1433,7 @@ BOOST_AUTO_TEST_CASE(SelectCoins_effective_value_test)
 
     LOCK(wallet->cs_wallet);
     const auto preset_inputs = *Assert(FetchSelectedInputs(*wallet, cc, cs_params));
-    available_coins.Erase({available_coins.coins[OutputType::BECH32].begin()->outpoint});
+    available_coins.Erase({available_coins.coins[TEST_OUTPUT_TYPE].begin()->outpoint});
 
     const auto result = SelectCoins(*wallet, available_coins, preset_inputs, target, cc, cs_params);
     BOOST_CHECK(!result);

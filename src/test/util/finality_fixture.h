@@ -235,7 +235,7 @@ struct FinalityChainFixture : public BindingFixture {
         return state.IsValid() ? std::string{} : state.ToString();
     }
 
-    node::FinalityTracker& Finality()
+    node::FinalityTracker& Finality() EXCLUSIVE_LOCKS_REQUIRED(cs_main)
     {
         AssertLockHeld(cs_main);
         node::FinalityTracker& t{m_node.chainman->ActiveChainstate().ModernFinality()};

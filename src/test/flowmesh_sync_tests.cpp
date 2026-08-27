@@ -876,12 +876,14 @@ BOOST_AUTO_TEST_CASE(anchors_are_rechecked_before_signing_and_before_commit)
 
     // Chain-backed policy sanity over the regtest fixture chain.
     const node::ChainAnchorPolicy policy{*Assert(m_node.chainman), /*min_depth=*/6};
-    const int tip_height{m_node.chainman->ActiveChain().Height()};
+    const auto [tip_height, tip_hash]{WITH_LOCK(cs_main, return (std::pair{
+        m_node.chainman->ActiveChain().Height(),
+        m_node.chainman->ActiveChain().Tip()->GetBlockHash()}))};
     const AnchorRef current{policy.Current()};
     BOOST_CHECK_EQUAL(current.height, tip_height - 6);
     BOOST_CHECK(policy.Acceptable(current));
     BOOST_CHECK(policy.StillCanonical(current));
-    const AnchorRef tip{tip_height, m_node.chainman->ActiveChain().Tip()->GetBlockHash()};
+    const AnchorRef tip{tip_height, tip_hash};
     BOOST_CHECK(!policy.Acceptable(tip));
     BOOST_CHECK(policy.StillCanonical(tip));
     BOOST_CHECK(!policy.StillCanonical(AnchorRef{current.height, uint256::ONE}));
@@ -941,9 +943,9 @@ BOOST_AUTO_TEST_CASE(flowmesh_outage_never_stalls_b3)
     BOOST_CHECK(!net.nodes[p0]->HandleAttestation(*own_att).has_value());
     BOOST_CHECK_EQUAL(net.nodes[p0]->Sequence(), 0U);
 
-    const int height_before{m_node.chainman->ActiveChain().Height()};
+    const int height_before{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height())};
     CreateAndProcessBlock({}, CScript{} << OP_TRUE);
-    BOOST_CHECK_EQUAL(m_node.chainman->ActiveChain().Height(), height_before + 1);
+    BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height()), height_before + 1);
     BOOST_CHECK_EQUAL(net.nodes[p0]->Sequence(), 0U);
     BOOST_CHECK(net.nodes[p0]->State().LedgerView().SolvencyHolds());
 }
@@ -1127,7 +1129,6 @@ BOOST_AUTO_TEST_CASE(known_split_lock_case_safely_does_not_finalize)
     // unlock rule exists — resolving this is an OWNER DECISION.
     MeshNet net{4, 1}; // t = 3
     const size_t p0{net.ProposerIndex(0, 0)};
-    const size_t p1{net.ProposerIndex(0, 1)};
     std::vector<size_t> honest;
     for (size_t i{0}; i < net.nodes.size(); ++i) {
         if (i != p0) honest.push_back(i); // p0 plays the withholding Byzantine seat
@@ -1179,9 +1180,9 @@ BOOST_AUTO_TEST_CASE(known_split_lock_case_safely_does_not_finalize)
         BOOST_CHECK(net.nodes[i]->Evidence().empty()); // honest split != equivocation
     }
     // B3 continues regardless.
-    const int height_before{m_node.chainman->ActiveChain().Height()};
+    const int height_before{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height())};
     CreateAndProcessBlock({}, CScript{} << OP_TRUE);
-    BOOST_CHECK_EQUAL(m_node.chainman->ActiveChain().Height(), height_before + 1);
+    BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height()), height_before + 1);
 }
 
 BOOST_AUTO_TEST_CASE(authenticator_binding_is_verified_by_construction)
