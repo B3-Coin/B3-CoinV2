@@ -43,6 +43,7 @@ add_executable(test_bitcoin
   bridge_mpt_tests.cpp
   update_downloader_tests.cpp
   update_manager_tests.cpp
+  legacy_wallet_send_tests.cpp
   modern_reward_tests.cpp
   update_manifest_tests.cpp
   compress_tests.cpp

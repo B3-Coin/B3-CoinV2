@@ -27,6 +27,8 @@
 #include <wallet/coincontrol.h>
 #include <wallet/fees.h>
 #include <wallet/receive.h>
+#include <chainparams.h>
+#include <consensus/era.h>
 #include <wallet/spend.h>
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
@@ -1079,6 +1081,21 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     CMutableTransaction txNew; // The resulting transaction that we make
 
     txNew.version = coin_control.m_version;
+
+    // B3: a transaction feeding a LEGACY-era next block must carry the
+    // historical identity end to end -- nTime after the version, version 1,
+    // the legacy sighash preimage (the flag routes it) and the legacy wire
+    // codec (provenance-driven). Without this the era gate in mempool
+    // admission rejects every wallet send before H
+    // ("modern-txn-in-legacy-era").
+    if (Params().GetConsensus().legacy_b3coin) {
+        const int next_height{static_cast<int>(wallet.GetLastBlockHeight()) + 1};
+        if (Consensus::GetB3Era(next_height, Params().GetConsensus()) == Consensus::B3Era::LEGACY) {
+            txNew.m_legacy_encoding = true;
+            txNew.nTime = static_cast<uint32_t>(GetTime());
+            txNew.version = 1;
+        }
+    }
 
     CoinSelectionParams coin_selection_params{rng_fast}; // Parameters for coin selection, init with dummy
     coin_selection_params.m_avoid_partial_spends = coin_control.m_avoid_partial_spends;
