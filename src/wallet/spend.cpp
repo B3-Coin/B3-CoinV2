@@ -1142,7 +1142,15 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     coin_selection_params.tx_noinputs_size = 10 + GetSizeOfCompactSize(vecSend.size()); // bytes for output count
 
     CAmount recipients_sum = 0;
-    const OutputType change_type = wallet.TransactionChangeType(coin_control.m_change_type ? *coin_control.m_change_type : wallet.m_default_change_type, vecSend);
+    OutputType change_type = wallet.TransactionChangeType(coin_control.m_change_type ? *coin_control.m_change_type : wallet.m_default_change_type, vecSend);
+    // B3 legacy era: an EXPLICIT change_type reaches ReserveDestination
+    // without passing the address-handout guard. A witness change output
+    // would be anyone-can-spend under legacy consensus -- refuse it here,
+    // at the last resolution point before reservation.
+    if (txNew.m_legacy_encoding && change_type != OutputType::LEGACY) {
+        return util::Error{_("Refusing a SegWit/Taproot change type: witness outputs are "
+                             "unprotected (anyone-can-spend) under the legacy B3 consensus rules.")};
+    }
     ReserveDestination reservedest(&wallet, change_type);
     unsigned int outputs_to_subtract_fee_from = 0; // The number of outputs which we are subtracting the fee from
     for (const auto& recipient : vecSend) {
