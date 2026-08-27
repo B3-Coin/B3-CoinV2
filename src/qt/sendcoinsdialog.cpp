@@ -5,6 +5,8 @@
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
 #include <qt/sendcoinsdialog.h>
+
+#include <consensus/era.h>
 #include <qt/guiconstants.h>
 #include <qt/forms/ui_sendcoinsdialog.h>
 
@@ -195,6 +197,18 @@ void SendCoinsDialog::setModel(WalletModel *_model)
         ui->customFee->setSingleStep(requiredFee);
         updateFeeSectionControls();
         updateSmartFeeLabel();
+
+        // B3 legacy era (owner ruling 2026-08-27): the legacy chain has no
+        // fee market, so smart-fee estimation is meaningless before H --
+        // hide the whole fee-selection UI and let the wallet's fixed
+        // legacy-era feerate apply automatically. Smart fees activate with
+        // the modern era.
+        if (Params().GetConsensus().legacy_b3coin &&
+            Consensus::GetB3Era(model->clientModel().getNumBlocks() + 1,
+                                Params().GetConsensus()) == Consensus::B3Era::LEGACY) {
+            ui->frameFee->hide();
+            m_coin_control->m_feerate.reset(); // fixed legacy fee, never custom
+        }
 
         // set default rbf checkbox state
         ui->optInRBF->setCheckState(Qt::Checked);
@@ -974,7 +988,7 @@ void SendCoinsDialog::coinControlChangeEdited(const QString& text)
         }
         else if (!IsValidDestination(dest)) // Invalid address
         {
-            ui->labelCoinControlChangeLabel->setText(tr("Warning: Invalid B3Coin address"));
+            ui->labelCoinControlChangeLabel->setText(tr("Warning: Invalid B3 address"));
         }
         else // Valid address
         {
