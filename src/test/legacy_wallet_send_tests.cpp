@@ -16,6 +16,7 @@
 #include <script/sign.h>
 #include <script/signingprovider.h>
 #include <test/util/setup_common.h>
+#include <core_io.h>
 #include <test/util/transaction_utils.h>
 
 #include <boost/test/unit_test.hpp>
@@ -85,6 +86,47 @@ BOOST_AUTO_TEST_CASE(legacy_encoded_send_signs_and_verifies)
         BOOST_REQUIRE(SignSignature(keystore, prev_tx, modern, 0, SIGHASH_ALL, modern_sigdata));
         BOOST_CHECK(verify(CTransaction{modern}));
     }
+}
+
+BOOST_AUTO_TEST_CASE(legacy_raw_rpc_round_trip)
+{
+    // The raw-RPC surface for legacy transactions: EncodeHexTx must emit
+    // the historical nTime encoding and DecodeHexTx (with DEFAULT flags,
+    // as sendrawtransaction and both signing RPCs call it) must recover
+    // the identical transaction -- id, provenance, nTime and all.
+    CKey key;
+    key.MakeNewKey(true);
+    const CScript p2pkh{GetScriptForDestination(PKHash{key.GetPubKey()})};
+
+    CMutableTransaction m;
+    m.m_legacy_encoding = true;
+    m.version = 1;
+    m.nTime = 1'711'111'111;
+    m.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 3});
+    m.vin[0].scriptSig = CScript() << std::vector<unsigned char>(71, 0x01)
+                                   << std::vector<unsigned char>(33, 0x02);
+    m.vout.emplace_back(12'345'678, p2pkh);
+    const CTransaction tx{m};
+
+    const std::string hex{EncodeHexTx(tx)};
+    CMutableTransaction decoded;
+    BOOST_REQUIRE(DecodeHexTx(decoded, hex)); // DEFAULT flags: the RPC path
+    const CTransaction round{decoded};
+    BOOST_CHECK(round.IsLegacyEncoded());
+    BOOST_CHECK_EQUAL(round.nTime, tx.nTime);
+    BOOST_CHECK(round.GetHash() == tx.GetHash());
+    BOOST_CHECK_EQUAL(EncodeHexTx(round), hex); // stable round trip
+
+    // A modern transaction still round-trips through the same surface.
+    CMutableTransaction mod;
+    mod.version = 2;
+    mod.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0});
+    mod.vout.emplace_back(1'000, p2pkh);
+    const CTransaction mtx{mod};
+    CMutableTransaction mdecoded;
+    BOOST_REQUIRE(DecodeHexTx(mdecoded, EncodeHexTx(mtx)));
+    BOOST_CHECK(!CTransaction{mdecoded}.IsLegacyEncoded());
+    BOOST_CHECK(CTransaction{mdecoded}.GetHash() == mtx.GetHash());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -1116,12 +1116,18 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
                 }
             }
             if (!std::holds_alternative<CNoDestination>(coin_control.destChange)) {
-                int wver{0};
-                std::vector<unsigned char> wprog;
-                if (GetScriptForDestination(coin_control.destChange).IsWitnessProgram(wver, wprog)) {
-                    return util::Error{_("Refusing a SegWit/Taproot change address: witness "
-                                         "outputs are unprotected (anyone-can-spend) under the "
-                                         "legacy B3 consensus rules.")};
+                // FAIL CLOSED: only a plain P2PKH change destination is
+                // acceptable in the legacy era. A bare witness program is
+                // anyone-can-spend, and a P2SH address is OPAQUE -- it may
+                // wrap a witness script (P2SH-SegWit), which becomes
+                // anyone-can-spend the moment its redeem script is revealed.
+                // Change belongs to this wallet; restricting an explicit
+                // override to the one provably safe type costs nothing.
+                if (!std::holds_alternative<PKHash>(coin_control.destChange)) {
+                    return util::Error{_("Refusing this change address: only a legacy (P2PKH) "
+                                         "change destination is safe under the legacy B3 "
+                                         "consensus rules (witness and P2SH-wrapped outputs "
+                                         "are unprotected).")};
                 }
             }
         }

@@ -45,6 +45,15 @@ jobs:
           ./build/bin/test_bitcoin --run_test=legacy_genesis_tests
           ./build/bin/test_bitcoin --run_test=legacy_wallet_send_tests
           ./build/bin/test_bitcoin --run_test=consensus_phase_tests
+          ./build/bin/test_bitcoin --run_test=finality_activation_tests
+          ./build/bin/test_bitcoin --run_test=finality_epoch_tests
+          ./build/bin/test_bitcoin --run_test=finality_pin_tests
+          ./build/bin/test_bitcoin --run_test=finality_pin_persist_tests
+          ./build/bin/test_bitcoin --run_test=finality_eligibility_tests
+          ./build/bin/test_bitcoin --run_test=finality_key_tests
+          ./build/bin/test_bitcoin --run_test=finality_key_binding_tests
+          ./build/bin/test_bitcoin --run_test=bridge_deposit_tests
+          ./build/bin/test_bitcoin --run_test=modern_pos_tests
       - name: Package
         run: |
           mkdir -p out && tar -C build/bin -czf out/b3-hive-1.0.0-linux-x86_64.tar.gz \
