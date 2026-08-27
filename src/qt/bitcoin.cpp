@@ -573,6 +573,10 @@ int GuiMain(int argc, char* argv[])
     QApplication::setOrganizationName(QAPP_ORG_NAME);
     QApplication::setOrganizationDomain(QAPP_ORG_DOMAIN);
     QApplication::setApplicationName(QAPP_APP_NAME_DEFAULT);
+    // User-visible identity everywhere the platform shows an app name
+    // (notifications, some window managers) without touching the QSettings
+    // compat key above.
+    QGuiApplication::setApplicationDisplayName(QStringLiteral("B3 Hive"));
 
     /// 4. Initialization of translations, so that intro dialog is in user's language
     // Now that QSettings are accessible, initialize translations

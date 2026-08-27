@@ -237,7 +237,10 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
     if (QSystemTrayIcon::isSystemTrayAvailable()) {
         createTrayIcon();
     }
-    notificator = new Notificator(QApplication::applicationName(), trayIcon, this);
+    // Notifications carry the PRODUCT name, not the compat QSettings key
+    // (QApplication::applicationName stays "B3Coin-Core" so existing user
+    // settings keep loading; it must never be user-visible).
+    notificator = new Notificator(QStringLiteral(HIVE_NAME), trayIcon, this);
 
     // Create status bar
     statusBar();
