@@ -17,6 +17,8 @@
 #include <script/signingprovider.h>
 #include <test/util/setup_common.h>
 #include <core_io.h>
+#include <streams.h>
+#include <wallet/transaction.h>
 #include <test/util/transaction_utils.h>
 
 #include <boost/test/unit_test.hpp>
@@ -85,6 +87,59 @@ BOOST_AUTO_TEST_CASE(legacy_encoded_send_signs_and_verifies)
         SignatureData modern_sigdata;
         BOOST_REQUIRE(SignSignature(keystore, prev_tx, modern, 0, SIGHASH_ALL, modern_sigdata));
         BOOST_CHECK(verify(CTransaction{modern}));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(legacy_wallet_tx_disk_round_trip)
+{
+    // The QA crash root cause: a wallet stored a legacy-encoded (nTime)
+    // transaction with the modern codec, so on reload the recomputed txid
+    // did not match its key. Prove the CWalletTx codec now round-trips a
+    // legacy transaction through the wallet DB serialization, id-stable.
+    CKey key;
+    key.MakeNewKey(true);
+    const CScript p2pkh{GetScriptForDestination(PKHash{key.GetPubKey()})};
+    CMutableTransaction m;
+    m.m_legacy_encoding = true;
+    m.version = 1;
+    m.nTime = 1'722'222'222;
+    m.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0});
+    m.vout.emplace_back(500'000, p2pkh);
+    CTransactionRef txref{MakeTransactionRef(std::move(m))};
+    BOOST_REQUIRE(txref->IsLegacyEncoded());
+
+    wallet::CWalletTx wtx{txref, wallet::TxStateInactive{}};
+    wtx.nTimeReceived = 1'722'222'333;
+
+    DataStream ss;
+    ss << wtx; // write side selects the legacy codec by provenance
+
+    // Modern read (default) must FAIL to reconstruct the legacy tx -- the
+    // nTime bytes misalign the modern codec (throw) or yield a wrong txid.
+    {
+        DataStream copy{ss};
+        wallet::g_wallet_tx_read_legacy_b3 = false;
+        wallet::CWalletTx bad{txref, wallet::TxStateInactive{}};
+        bool reproduced_id{false};
+        try {
+            copy >> bad;
+            reproduced_id = (bad.GetHash() == txref->GetHash());
+        } catch (const std::exception&) {
+            reproduced_id = false;
+        }
+        BOOST_CHECK(!reproduced_id); // the old crash path never reconstructs it
+    }
+    // Legacy read (what ReadKeyValue retries with) recovers the exact tx.
+    {
+        DataStream copy{ss};
+        wallet::g_wallet_tx_read_legacy_b3 = true;
+        wallet::CWalletTx good{txref, wallet::TxStateInactive{}};
+        copy >> good;
+        wallet::g_wallet_tx_read_legacy_b3 = false;
+        BOOST_CHECK(good.tx->IsLegacyEncoded());
+        BOOST_CHECK_EQUAL(good.tx->nTime, txref->nTime);
+        BOOST_CHECK(good.GetHash() == txref->GetHash()); // id-stable round trip
+        BOOST_CHECK_EQUAL(good.nTimeReceived, 1'722'222'333U);
     }
 }
 

@@ -3363,10 +3363,17 @@ int CWallet::GetTxDepthInMainChain(const CWalletTx& wtx) const
 {
     AssertLockHeld(cs_wallet);
     if (auto* conf = wtx.state<TxStateConfirmed>()) {
-        assert(conf->confirmed_block_height >= 0);
+        // Never abort the whole node over one record with an out-of-range
+        // height (e.g. a transiently bad entry mid-rescan): treat it as not
+        // yet confirmed until the rescan repairs it.
+        if (conf->confirmed_block_height < 0) {
+            WalletLogPrintf("warning: transaction %s has an invalid confirmed height %d; treating as unconfirmed\n",
+                            wtx.GetHash().ToString(), conf->confirmed_block_height);
+            return 0;
+        }
         return GetLastBlockHeight() - conf->confirmed_block_height + 1;
     } else if (auto* conf = wtx.state<TxStateBlockConflicted>()) {
-        assert(conf->conflicting_block_height >= 0);
+        if (conf->conflicting_block_height < 0) return 0;
         return -1 * (GetLastBlockHeight() - conf->conflicting_block_height + 1);
     } else {
         return 0;

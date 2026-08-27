@@ -191,6 +191,13 @@ public:
  * A transaction with a bunch of additional info that only the owner cares about.
  * It includes any unrecorded transactions needed to link it back to the block chain.
  */
+// B3: the wallet DB stores a transaction's identity in its own encoding.
+// A legacy-era (nTime) transaction must round-trip through the legacy codec
+// or its recomputed txid would not match its stored key. Write side selects
+// by provenance; read side is told which to try by ReadKeyValue via this
+// inline flag (wallet load is single-threaded per wallet).
+inline thread_local bool g_wallet_tx_read_legacy_b3{false};
+
 class CWalletTx
 {
 public:
@@ -300,7 +307,12 @@ public:
         uint32_t dummy_int = 0; // Used to be fTimeReceivedIsTxTime
         uint256 serializedHash = TxStateSerializedBlockHash(m_state);
         int serializedIndex = TxStateSerializedIndex(m_state);
-        s << TX_WITH_WITNESS(tx) << serializedHash << dummy_vector1 << serializedIndex << dummy_vector2 << mapValueCopy << vOrderForm << dummy_int << nTimeReceived << dummy_bool << dummy_bool;
+        if (tx && tx->IsLegacyEncoded()) {
+            s << TX_LEGACY_B3(tx);
+        } else {
+            s << TX_WITH_WITNESS(tx);
+        }
+        s << serializedHash << dummy_vector1 << serializedIndex << dummy_vector2 << mapValueCopy << vOrderForm << dummy_int << nTimeReceived << dummy_bool << dummy_bool;
     }
 
     template<typename Stream>
@@ -314,7 +326,12 @@ public:
         uint32_t dummy_int; // Used to be fTimeReceivedIsTxTime
         uint256 serialized_block_hash;
         int serializedIndex;
-        s >> TX_WITH_WITNESS(tx) >> serialized_block_hash >> dummy_vector1 >> serializedIndex >> dummy_vector2 >> mapValue >> vOrderForm >> dummy_int >> nTimeReceived >> dummy_bool >> dummy_bool;
+        if (g_wallet_tx_read_legacy_b3) {
+            s >> TX_LEGACY_B3(tx);
+        } else {
+            s >> TX_WITH_WITNESS(tx);
+        }
+        s >> serialized_block_hash >> dummy_vector1 >> serializedIndex >> dummy_vector2 >> mapValue >> vOrderForm >> dummy_int >> nTimeReceived >> dummy_bool >> dummy_bool;
 
         m_state = TxStateInterpretSerialized({serialized_block_hash, serializedIndex});
 
