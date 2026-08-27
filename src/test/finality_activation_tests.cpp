@@ -32,12 +32,25 @@ BOOST_AUTO_TEST_CASE(mainnet_and_all_shipped_networks_fail_closed)
     for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::REGTEST, ChainType::SIGNET}) {
         const auto params{CreateChainParams(ArgsManager{}, chain)};
         const Consensus::Params& c{params->GetConsensus()};
-        // The X / M parameters are deliberately NOT pinned anywhere yet.
-        BOOST_CHECK(!c.hard_fork_height.has_value());
-        BOOST_CHECK(!c.legacy_final_hash.has_value());
+        if (chain == ChainType::MAIN) {
+            // v1 release shape (owner rulings 2026-08-26/27): H = 810,000 is
+            // PINNED and the node is in the OD-10 pause-fail-closed state --
+            // X and the Modern-PoS parameters remain unset, so it accepts
+            // the legacy chain through H and refuses every block above it.
+            BOOST_CHECK_EQUAL(c.hard_fork_height.value_or(0), 810'001); // first non-legacy height
+            BOOST_CHECK_EQUAL(Consensus::LegacyFinalHeight(c).value_or(0), 810'000); // H
+            BOOST_CHECK(!c.legacy_final_hash.has_value());
+            BOOST_CHECK(Consensus::LegacyBoundaryHeightOnly(c)); // the PAUSE state
+            BOOST_CHECK(!Consensus::LegacyBoundaryPinned(c));
+            BOOST_CHECK_EQUAL(Consensus::ModernPosStartHeight(c).value_or(0), 811'001); // M
+        } else {
+            // Every OTHER shipped network stays fully unpinned.
+            BOOST_CHECK(!c.hard_fork_height.has_value());
+            BOOST_CHECK(!c.legacy_final_hash.has_value());
+            BOOST_CHECK(!Consensus::ModernPosStartHeight(c).has_value());
+        }
         BOOST_CHECK(!c.modern_pos.has_value());
         BOOST_CHECK(!Consensus::ModernObjectRulesActive(c));
-        BOOST_CHECK(!Consensus::ModernPosStartHeight(c).has_value());
         // Cells: every policy type inactive.
         for (const uint16_t t : {6, 7, 8}) BOOST_CHECK(!modern::IsMetadataCellActive(t, modern::POLICY_VERSION_V1, c));
         // MPA: every type inactive or unknown; an MPA-bearing tx is invalid.
