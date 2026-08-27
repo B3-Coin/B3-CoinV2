@@ -3,6 +3,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <chainparams.h>
 #include <wallet/wallet.h>
 
 #include <crypto/bls.h>
@@ -2625,6 +2626,16 @@ bool CWallet::TopUpKeyPool(unsigned int kpSize)
 util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType type, const std::string& label)
 {
     LOCK(cs_wallet);
+    // B3: SegWit is not active under the legacy consensus, so witness
+    // outputs are anyone-can-spend. Refuse witness address types at the
+    // single handout choke point -- this covers every RPC and GUI path,
+    // including explicit address_type/change_type parameters.
+    if (Params().GetConsensus().legacy_b3coin && type != OutputType::LEGACY) {
+        return util::Error{strprintf(
+            _("Address type '%s' is not available on B3: SegWit outputs are "
+              "unprotected (anyone-can-spend) under the legacy consensus rules."),
+            FormatOutputType(type))};
+    }
     auto spk_man = GetScriptPubKeyMan(type, /*internal=*/false);
     if (!spk_man) {
         return util::Error{strprintf(_("Error: No %s addresses available."), FormatOutputType(type))};
@@ -2640,6 +2651,16 @@ util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType type, c
 
 util::Result<CTxDestination> CWallet::GetNewChangeDestination(const OutputType type)
 {
+    // B3: SegWit is not active under the legacy consensus, so witness
+    // outputs are anyone-can-spend. Refuse witness address types at the
+    // single handout choke point -- this covers every RPC and GUI path,
+    // including explicit address_type/change_type parameters.
+    if (Params().GetConsensus().legacy_b3coin && type != OutputType::LEGACY) {
+        return util::Error{strprintf(
+            _("Address type '%s' is not available on B3: SegWit outputs are "
+              "unprotected (anyone-can-spend) under the legacy consensus rules."),
+            FormatOutputType(type))};
+    }
     LOCK(cs_wallet);
 
     ReserveDestination reservedest(this, type);

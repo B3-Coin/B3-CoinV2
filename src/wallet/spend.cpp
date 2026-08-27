@@ -1089,11 +1089,24 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     // admission rejects every wallet send before H
     // ("modern-txn-in-legacy-era").
     if (Params().GetConsensus().legacy_b3coin) {
-        const int next_height{static_cast<int>(wallet.GetLastBlockHeight()) + 1};
+        // Era of the block this transaction will confirm in: judged from the
+        // ACTIVE CHAIN TIP, not the wallet's possibly-lagging view.
+        const int next_height{wallet.chain().getHeight().value_or(static_cast<int>(wallet.GetLastBlockHeight())) + 1};
         if (Consensus::GetB3Era(next_height, Params().GetConsensus()) == Consensus::B3Era::LEGACY) {
             txNew.m_legacy_encoding = true;
             txNew.nTime = static_cast<uint32_t>(GetTime());
             txNew.version = 1;
+            // Paying a witness program in the legacy era would hand the
+            // recipient an anyone-can-spend output. Refuse outright.
+            for (const auto& recipient : vecSend) {
+                int wver{0};
+                std::vector<unsigned char> wprog;
+                if (GetScriptForDestination(recipient.dest).IsWitnessProgram(wver, wprog)) {
+                    return util::Error{_("Refusing to pay a SegWit/Taproot address: witness "
+                                         "outputs are unprotected (anyone-can-spend) under the "
+                                         "legacy B3 consensus rules.")};
+                }
+            }
         }
     }
 

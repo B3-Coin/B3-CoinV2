@@ -447,7 +447,13 @@ std::string ScriptToAsmStr(const CScript& script, const bool fAttemptSighashDeco
 std::string EncodeHexTx(const CTransaction& tx)
 {
     DataStream ssTx;
-    ssTx << TX_WITH_WITNESS(tx);
+    // Legacy-encoded B3 transactions round-trip in their historical nTime
+    // format; anything else uses the modern extended serialization.
+    if (tx.IsLegacyEncoded()) {
+        ssTx << TX_LEGACY_B3(tx);
+    } else {
+        ssTx << TX_WITH_WITNESS(tx);
+    }
     return HexStr(ssTx);
 }
 
