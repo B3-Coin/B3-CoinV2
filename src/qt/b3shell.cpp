@@ -15,6 +15,7 @@
 
 #include <QHBoxLayout>
 #include <QResizeEvent>
+#include <QSizePolicy>
 #include <QStackedWidget>
 #include <QVBoxLayout>
 
@@ -43,6 +44,10 @@ B3Shell::B3Shell(QWidget* parent)
 
     m_content = new QStackedWidget(main);
     m_content->setObjectName("B3Content");
+    // Hidden pages must not force their desktop-width size hints onto the
+    // shell. The active page still lays out normally within the available
+    // space, while the window remains genuinely resizable on small screens.
+    m_content->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
     mainLayout->addWidget(m_content, 1);
     outer->addWidget(main, 1);
 

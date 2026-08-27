@@ -19,7 +19,7 @@ function(setup_split_debug_script)
 endfunction()
 
 function(add_windows_deploy_target)
-  if(MINGW AND TARGET b3coin-qt AND TARGET b3coind AND TARGET b3coin-cli AND TARGET b3coin-tx AND TARGET b3coin-wallet AND TARGET b3coin-util AND TARGET test_bitcoin)
+  if(MINGW AND TARGET b3coin-qt AND TARGET b3coind AND TARGET b3coin-cli AND TARGET b3coin-tx AND TARGET b3coin-wallet AND TARGET b3coin-util)
     find_program(MAKENSIS_EXECUTABLE makensis)
     if(NOT MAKENSIS_EXECUTABLE)
       add_custom_target(deploy
@@ -41,7 +41,6 @@ function(add_windows_deploy_target)
       COMMAND ${CMAKE_STRIP} $<TARGET_FILE:b3coin-tx> -o ${PROJECT_BINARY_DIR}/release/$<TARGET_FILE_NAME:b3coin-tx>
       COMMAND ${CMAKE_STRIP} $<TARGET_FILE:b3coin-wallet> -o ${PROJECT_BINARY_DIR}/release/$<TARGET_FILE_NAME:b3coin-wallet>
       COMMAND ${CMAKE_STRIP} $<TARGET_FILE:b3coin-util> -o ${PROJECT_BINARY_DIR}/release/$<TARGET_FILE_NAME:b3coin-util>
-      COMMAND ${CMAKE_STRIP} $<TARGET_FILE:test_bitcoin> -o ${PROJECT_BINARY_DIR}/release/$<TARGET_FILE_NAME:test_bitcoin>
       COMMAND ${MAKENSIS_EXECUTABLE} -V2 ${PROJECT_BINARY_DIR}/b3coin-win64-setup.nsi
       VERBATIM
     )
@@ -57,7 +56,10 @@ function(add_macos_deploy_target)
     file(CONFIGURE OUTPUT ${macos_app}/Contents/PkgInfo CONTENT "APPL????")
     # Populate Contents/Resources subdirectory.
     file(CONFIGURE OUTPUT ${macos_app}/Contents/Resources/empty.lproj CONTENT "")
-    configure_file(${PROJECT_SOURCE_DIR}/src/qt/res/icons/bitcoin.icns ${macos_app}/Contents/Resources/b3coin.icns NO_SOURCE_PERMISSIONS COPYONLY)
+    # An incremental build may still contain the pre-Hive icon filename.
+    file(REMOVE ${PROJECT_BINARY_DIR}/${macos_app}/Contents/Resources/b3coin.icns)
+    configure_file(${PROJECT_SOURCE_DIR}/src/qt/res/icons/bitcoin.icns ${macos_app}/Contents/Resources/b3-hive.icns NO_SOURCE_PERMISSIONS COPYONLY)
+    configure_file(${PROJECT_SOURCE_DIR}/COPYING ${macos_app}/Contents/Resources/COPYING.txt NO_SOURCE_PERMISSIONS COPYONLY)
     file(CONFIGURE OUTPUT ${macos_app}/Contents/Resources/Base.lproj/InfoPlist.strings
       CONTENT "{ CFBundleDisplayName = \"B3 Hive\"; CFBundleName = \"B3 Hive\"; }"
     )
@@ -68,6 +70,10 @@ function(add_macos_deploy_target)
       COMMAND ${CMAKE_COMMAND} -E rename ${macos_app}/Contents/MacOS/bin/$<TARGET_FILE_NAME:b3coin-qt> ${macos_app}/Contents/MacOS/b3coin-qt
       COMMAND ${CMAKE_COMMAND} -E rm -rf ${macos_app}/Contents/MacOS/bin
       COMMAND ${CMAKE_COMMAND} -E rm -rf ${macos_app}/Contents/MacOS/share
+      DEPENDS b3coin-qt
+              ${PROJECT_BINARY_DIR}/${macos_app}/Contents/Info.plist
+              ${PROJECT_BINARY_DIR}/${macos_app}/Contents/Resources/b3-hive.icns
+              ${PROJECT_BINARY_DIR}/${macos_app}/Contents/Resources/COPYING.txt
       VERBATIM
     )
 
