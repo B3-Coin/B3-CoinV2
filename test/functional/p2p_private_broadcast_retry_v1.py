@@ -180,7 +180,9 @@ class P2PPrivateBroadcastRetryV1(BitcoinTestFramework):
         self.log.info("Starting private broadcast connections")
         wallet = MiniWallet(node0)
         tx = wallet.create_self_transfer()
-        node0.sendrawtransaction(hexstring=tx["hex"])
+        # Fee policy is not under test here. Disable the client-side fee cap
+        # so the synthetic MiniWallet transaction cannot mask relay behavior.
+        node0.sendrawtransaction(hexstring=tx["hex"], maxfeerate=0)
 
         self.log.info("Tor proxy: waiting for connection to an IPv4 address")
         self.wait_until(lambda: self.ipv4_via_tor_proxy_addr_port is not None)

@@ -109,8 +109,8 @@ class MempoolAcceptanceTest(BitcoinTestFramework):
         txid_in_block = self.wallet.sendrawtransaction(from_node=node, tx_hex=raw_tx_in_block)
         self.generate(node, 1)
         self.mempool_size = 0
-        # Also check feerate. 1BTC/kvB fails
-        assert_raises_rpc_error(-8, "Fee rates larger than or equal to 1BTC/kvB are not accepted", lambda: self.check_mempool_result(
+        # Also check feerate. 1 B3/kvB fails.
+        assert_raises_rpc_error(-8, "Fee rates larger than or equal to 1 B3/kvB are not accepted", lambda: self.check_mempool_result(
             result_expected=None,
             rawtxs=[raw_tx_in_block],
             maxfeerate=1,

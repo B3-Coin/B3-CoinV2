@@ -231,7 +231,9 @@ class P2PPrivateBroadcast(BitcoinTestFramework):
         self.log.info(f"Created txid={txs[0]['txid']}: for basic test")
         self.log.info(f"Created txid={txs[1]['txid']}: for broadcast with dependency in mempool + rebroadcast")
         self.log.info(f"Created txid={txs[2]['txid']}: for broadcast with dependency not in mempool")
-        tx_originator.sendrawtransaction(hexstring=txs[0]["hex"], maxfeerate=0.1)
+        # This test exercises private relay, not the client-side fee cap. Its
+        # synthetic MiniWallet values use retained upstream denominations.
+        tx_originator.sendrawtransaction(hexstring=txs[0]["hex"], maxfeerate=0)
 
         self.log.info("First private broadcast: waiting for the transaction to reach the recipient")
         self.wait_until(lambda: len(tx_receiver.getrawmempool()) > 0)
@@ -252,7 +254,7 @@ class P2PPrivateBroadcast(BitcoinTestFramework):
         assert_raises_rpc_error(-26, "mempool-script-verify-flag-failed",
                                 tx_originator.sendrawtransaction,
                                 hexstring=malleated_invalid.serialize_with_witness().hex(),
-                                maxfeerate=0.1)
+                                maxfeerate=0)
 
         self.log.info("Checking that the transaction is not in the originator node's mempool")
         assert_equal(len(tx_originator.getrawmempool()), 0)
@@ -309,13 +311,13 @@ class P2PPrivateBroadcast(BitcoinTestFramework):
 
         self.log.info("Sending a transaction with a dependency in the mempool")
         skip_destinations = len(self.destinations)
-        tx_originator.sendrawtransaction(hexstring=txs[1]["hex"], maxfeerate=0.1)
+        tx_originator.sendrawtransaction(hexstring=txs[1]["hex"], maxfeerate=0)
         self.check_broadcasts("Dependency in mempool", txs[1], NUM_PRIVATE_BROADCAST_PER_TX, skip_destinations)
 
         self.log.info("Sending a transaction with a dependency not in the mempool (should be rejected)")
         assert_equal(len(tx_originator.getrawmempool()), 1)
         assert_raises_rpc_error(-25, "bad-txns-inputs-missingorspent",
-                                tx_originator.sendrawtransaction, hexstring=txs[2]["hex"], maxfeerate=0.1)
+                                tx_originator.sendrawtransaction, hexstring=txs[2]["hex"], maxfeerate=0)
         assert_raises_rpc_error(-25, "bad-txns-inputs-missingorspent",
                                 tx_originator.sendrawtransaction, hexstring=txs[2]["hex"], maxfeerate=0)
 
@@ -349,14 +351,14 @@ class P2PPrivateBroadcast(BitcoinTestFramework):
         tx_returner.send_without_ping(msg_tx(siblings_parent))
         self.wait_until(lambda: len(tx_originator.getrawmempool()) > 1)
         self.log.info("  - siblings' parent added to the mempool")
-        tx_originator.sendrawtransaction(hexstring=sibling1.serialize_with_witness().hex(), maxfeerate=0.1)
+        tx_originator.sendrawtransaction(hexstring=sibling1.serialize_with_witness().hex(), maxfeerate=0)
         self.log.info("  - sent sibling1: ok")
-        tx_originator.sendrawtransaction(hexstring=sibling2.serialize_with_witness().hex(), maxfeerate=0.1)
+        tx_originator.sendrawtransaction(hexstring=sibling2.serialize_with_witness().hex(), maxfeerate=0)
         self.log.info("  - sent sibling2: ok")
 
         self.log.info("Checking abortprivatebroadcast removes a pending private-broadcast transaction")
         tx_abort = wallet.create_self_transfer()
-        tx_originator.sendrawtransaction(hexstring=tx_abort["hex"], maxfeerate=0.1)
+        tx_originator.sendrawtransaction(hexstring=tx_abort["hex"], maxfeerate=0)
         assert any(t["wtxid"] == tx_abort["wtxid"] for t in tx_originator.getprivatebroadcastinfo()["transactions"])
         abort_res = tx_originator.abortprivatebroadcast(tx_abort["txid"])
         assert_equal(len(abort_res["removed_transactions"]), 1)
@@ -390,7 +392,7 @@ class P2PPrivateBroadcast(BitcoinTestFramework):
             "-listenonion",
         ])
         assert_raises_rpc_error(-1, "none of the Tor or I2P networks is reachable",
-                                tx_originator.sendrawtransaction, hexstring=txs[0]["hex"], maxfeerate=0.1)
+                                tx_originator.sendrawtransaction, hexstring=txs[0]["hex"], maxfeerate=0)
 
 
 if __name__ == "__main__":
