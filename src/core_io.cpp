@@ -202,7 +202,11 @@ static bool DecodeTx(CMutableTransaction& tx, const std::vector<unsigned char>& 
     // lands where nTime would be and the read runs off the buffer.)
     CMutableTransaction tx_b3;
     bool ok_b3 = false;
-    if (try_no_witness && Params().GetConsensus().legacy_b3coin) {
+    // On a B3 chain the historical encoding is ALWAYS a candidate,
+    // independent of the caller's witness-strategy flags: default callers
+    // (sendrawtransaction, both signing RPCs) pass try_no_witness=false
+    // and must still round-trip real legacy-era transactions.
+    if (Params().GetConsensus().legacy_b3coin) {
         SpanReader ssData{tx_data};
         try {
             ssData >> TX_LEGACY_B3(tx_b3);

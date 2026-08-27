@@ -1090,19 +1090,36 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     // ("modern-txn-in-legacy-era").
     if (Params().GetConsensus().legacy_b3coin) {
         // Era of the block this transaction will confirm in: judged from the
-        // ACTIVE CHAIN TIP, not the wallet's possibly-lagging view.
-        const int next_height{wallet.chain().getHeight().value_or(static_cast<int>(wallet.GetLastBlockHeight())) + 1};
+        // ACTIVE CHAIN TIP. FAIL CLOSED: if the tip height is unavailable we
+        // refuse to construct rather than guess from a stale wallet view --
+        // a wrong-era transaction is at best rejected and at worst unsafe.
+        const auto tip_height{wallet.chain().getHeight()};
+        if (!tip_height) {
+            return util::Error{_("Cannot determine the active chain height; refusing to construct a transaction.")};
+        }
+        const int next_height{*tip_height + 1};
         if (Consensus::GetB3Era(next_height, Params().GetConsensus()) == Consensus::B3Era::LEGACY) {
             txNew.m_legacy_encoding = true;
             txNew.nTime = static_cast<uint32_t>(GetTime());
             txNew.version = 1;
             // Paying a witness program in the legacy era would hand the
-            // recipient an anyone-can-spend output. Refuse outright.
+            // recipient an anyone-can-spend output. Refuse outright -- and
+            // apply the same rule to an EXPLICIT change destination
+            // (coin_control.destChange bypasses the address-handout guard).
             for (const auto& recipient : vecSend) {
                 int wver{0};
                 std::vector<unsigned char> wprog;
                 if (GetScriptForDestination(recipient.dest).IsWitnessProgram(wver, wprog)) {
                     return util::Error{_("Refusing to pay a SegWit/Taproot address: witness "
+                                         "outputs are unprotected (anyone-can-spend) under the "
+                                         "legacy B3 consensus rules.")};
+                }
+            }
+            if (!std::holds_alternative<CNoDestination>(coin_control.destChange)) {
+                int wver{0};
+                std::vector<unsigned char> wprog;
+                if (GetScriptForDestination(coin_control.destChange).IsWitnessProgram(wver, wprog)) {
+                    return util::Error{_("Refusing a SegWit/Taproot change address: witness "
                                          "outputs are unprotected (anyone-can-spend) under the "
                                          "legacy B3 consensus rules.")};
                 }

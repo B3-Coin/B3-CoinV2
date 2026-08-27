@@ -9,7 +9,7 @@ assets and FlowMesh shipped activation-inert behind later heights.
 
 | # | Item | Status |
 |---|---|---|
-| 1 | H (final legacy height); corridor; M | **RULED 2026-08-26 (superseding 820,000): H = 810,000; corridor = 810,001..811,000; M = 811,001.** Pinned in mainnet chainparams with X blank (pause-fail-closed) for the v1 release. |
+| 1 | H (final legacy height); corridor; M | **RULED 2026-08-26 (superseding 820,000): H = 810,000; corridor = 810,001..811,000; M = 811,001.** NOT YET pinned in mainnet chainparams -- the pin edit awaits the owner's explicit go (pause-fail-closed shape: H set, X blank). |
 | 2 | X distribution | **RULED 2026-08-23: PAUSE, fail closed.** With H set and X unset the node accepts through H and refuses H+1; the mandatory follow-up release pins X and resumes the corridor. Nodes with blank X must never enter the corridor (consensus-enforced, see `legacy-boundary-unpinned`). |
 | 3 | Seed nodes | **RULED 2026-08-23:** `176.31.13.198` is one fixed seed (added). Final release REQUIRES at least two additional independently hosted fixed seeds and a DNS seed under our control — both still **pending**. Do not hardcode explorer peers without operator approval. |
 | 4 | Corridor difficulty constant (`transition_pow_bits`) | **RULED 2026-08-23: canonical compact `0x1f008000`** (the same target, 2^239, that `0x20000080` encodes non-canonically; 2^17 expected hashes per block). NOT YET PINNED — see gates. A canonical round-trip test pins the form; non-canonical configured bits fail closed. |
