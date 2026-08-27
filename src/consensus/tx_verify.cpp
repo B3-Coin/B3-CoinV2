@@ -183,7 +183,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
             // legacy maturity rides with the coin, and covers coinstake
             // outputs, which the stock rule below does not know about.
             if ((coin.IsCoinBase() || coin.IsCoinStake()) &&
-                nSpendHeight - coin.nHeight < legacy::COINBASE_MATURITY) {
+                nSpendHeight - static_cast<int>(coin.nHeight) < static_cast<int>(legacy::COINBASE_MATURITY)) {
                 return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-legacy-coin",
                     strprintf("tried to spend legacy %s at depth %d", coin.IsCoinBase() ? "coinbase" : "coinstake",
                               nSpendHeight - coin.nHeight));

@@ -23,14 +23,16 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build -j"$(nproc)" --target b3coind b3coin-cli b3coin-tx b3coin-wallet test_bitcoin
-      - name: Unit tests (report-only; known-stock failures documented)
+      - name: HARD gate -- every suite except the documented stock set
+        run: |
+          # Everything must pass EXCEPT the enumerated known-stock
+          # IDENT/DENOM/FIXTURE suites (doc/design/b3-test-baseline.md).
+          # A failure in ANY other suite stops the release build.
+          cd build && ctest --output-on-failure -j2             -E "(validation_tests|compress_tests|util_tests|rpc_tests|key_tests|key_io_tests|bip324_tests|bloom_tests|script_standard_tests|net_peer_connection_tests|miner_tests|validation_chainstatemanager_tests|txpackage_tests|validation_chainstate_tests|blockchain_tests|descriptor_tests|interfaces_tests|disconnected_transactions|mock_process)$"
+      - name: Known-stock set (report-only, drift visibility)
         continue-on-error: true
         run: |
-          # REPORT-ONLY by design: the documented known-stock IDENT/DENOM/
-          # FIXTURE suites (doc/design/b3-test-baseline.md) fail on B3
-          # params. This step surfaces the full picture without masking a
-          # regression silently -- the HARD gates are the next step.
-          cd build && ctest --output-on-failure -j2
+          cd build && ctest --output-on-failure -j2             -R "(validation_tests|compress_tests|util_tests|rpc_tests|key_tests|key_io_tests|bip324_tests|bloom_tests|script_standard_tests|net_peer_connection_tests|miner_tests|validation_chainstatemanager_tests|txpackage_tests|validation_chainstate_tests|blockchain_tests|descriptor_tests|interfaces_tests|disconnected_transactions|mock_process)$"
       - name: Frozen-vector suites (hard gate)
         run: |
           ./build/bin/test_bitcoin --run_test=finality_types_tests
@@ -54,6 +56,12 @@ jobs:
           ./build/bin/test_bitcoin --run_test=finality_key_binding_tests
           ./build/bin/test_bitcoin --run_test=bridge_deposit_tests
           ./build/bin/test_bitcoin --run_test=modern_pos_tests
+          ./build/bin/test_bitcoin --run_test=script_tests
+          ./build/bin/test_bitcoin --run_test=transaction_tests
+          ./build/bin/test_bitcoin --run_test=sighash_tests
+          ./build/bin/test_bitcoin --run_test=finality_operations_tests
+          ./build/bin/test_bitcoin --run_test=finality_production_tests
+          ./build/bin/test_bitcoin --run_test=finality_qualification_tests
       - name: Package
         run: |
           mkdir -p out && tar -C build/bin -czf out/b3-hive-1.0.0-linux-x86_64.tar.gz \

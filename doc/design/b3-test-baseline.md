@@ -138,3 +138,15 @@ and all raw atomic values and consensus serialization untouched.
 > in 958eeb3), pinning front, the last historical peer, and the release seed.
 > The canonical known-failure set is therefore the 18 stock IDENT/DENOM/
 > FIXTURE suites above.
+
+
+> **2026-08-27 update.** The `script_tests` REGRESSION (1,494 failures) is
+> fixed: the B3 denomination change had altered `AmountFromValue`/
+> `ValueFromAmount` defaults, silently re-scaling the stock witness-vector
+> amounts inside the test harness -- BIP143 sighash commits to amounts, so
+> every witness vector failed. The harness now reads and emits the corpus
+> in its native Bitcoin 8-decimal unit; `script_tests` is fully green and
+> remains REQUIRED. Additionally, the `util_tests`/`rpc_tests` MONETARY
+> rows above are resolved (vectors rewritten for the ruled B3 unit); their
+> remaining failures are the IDENT cases only (message_verify,
+> rpc_rawsign).

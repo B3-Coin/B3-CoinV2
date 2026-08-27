@@ -396,7 +396,13 @@ public:
             for (unsigned i = 0; i < scriptWitness.stack.size(); i++) {
                 wit.push_back(HexStr(scriptWitness.stack[i]));
             }
-            wit.push_back(ValueFromAmount(nValue));
+            // Emit in the corpus's native BITCOIN 8-decimal unit so the
+            // auto-generated entries byte-match the stored vectors.
+            {
+                const int64_t q{nValue / BITCOIN_COIN};
+                const int64_t r{nValue % BITCOIN_COIN};
+                wit.push_back(UniValue{UniValue::VNUM, strprintf("%d.%08d", q, r)});
+            }
             array.push_back(std::move(wit));
         }
         array.push_back(FormatScript(spendTx.vin[0].scriptSig));
@@ -977,7 +983,10 @@ BOOST_AUTO_TEST_CASE(script_json_test)
                     witness.stack.push_back(witness_value.value());
                 }
             }
-            nValue = AmountFromValue(test[pos][i]);
+            // The stock vector corpus encodes amounts in BITCOIN units
+            // (8 decimals); parse it in its own unit, independent of the
+            // B3 product denomination.
+            nValue = AmountFromValue(test[pos][i], /*decimals=*/8);
             pos++;
         }
         if (test.size() < 4 + pos) // Allow size > 3; extra stuff ignored (useful for comments)
