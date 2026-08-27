@@ -4,6 +4,7 @@
 
 #include <wallet/wallet.h>
 
+#include <chainparams.h>
 #include <qt/receivecoinsdialog.h>
 #include <qt/forms/ui_receivecoinsdialog.h>
 
@@ -93,11 +94,19 @@ void ReceiveCoinsDialog::setModel(WalletModel *_model)
             ui->addressType->setItemData(index, tooltip, Qt::ToolTipRole);
             if (model->wallet().getDefaultAddressType() == type) ui->addressType->setCurrentIndex(index);
         };
-        add_address_type(OutputType::LEGACY, tr("Base58 (Legacy)"), tr("Not recommended due to higher fees and less protection against typos."));
-        add_address_type(OutputType::P2SH_SEGWIT, tr("Base58 (P2SH-SegWit)"), tr("Generates an address compatible with older wallets."));
-        add_address_type(OutputType::BECH32, tr("Bech32 (SegWit)"), tr("Generates a native segwit address (BIP-173). Some old wallets don't support it."));
-        if (model->wallet().taprootEnabled()) {
-            add_address_type(OutputType::BECH32M, tr("Bech32m (Taproot)"), tr("Bech32m (BIP-350) is an upgrade to Bech32, wallet support is still limited."));
+        if (Params().GetConsensus().legacy_b3coin) {
+            // B3: SegWit is not active under the legacy consensus, so
+            // witness outputs are unprotected (anyone-can-spend). Offer
+            // ONLY the safe standard address type.
+            add_address_type(OutputType::LEGACY, tr("B3 address"), tr("The standard B3 address type."));
+            ui->addressType->setVisible(ui->addressType->count() > 1);
+        } else {
+            add_address_type(OutputType::LEGACY, tr("Base58 (Legacy)"), tr("Not recommended due to higher fees and less protection against typos."));
+            add_address_type(OutputType::P2SH_SEGWIT, tr("Base58 (P2SH-SegWit)"), tr("Generates an address compatible with older wallets."));
+            add_address_type(OutputType::BECH32, tr("Bech32 (SegWit)"), tr("Generates a native segwit address (BIP-173). Some old wallets don't support it."));
+            if (model->wallet().taprootEnabled()) {
+                add_address_type(OutputType::BECH32M, tr("Bech32m (Taproot)"), tr("Bech32m (BIP-350) is an upgrade to Bech32, wallet support is still limited."));
+            }
         }
 
         // Set the button to be enabled or disabled based on whether the wallet can give out new addresses.

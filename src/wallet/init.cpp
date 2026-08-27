@@ -5,6 +5,7 @@
 
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
+#include <chainparams.h>
 #include <common/args.h>
 #include <init.h>
 #include <interfaces/chain.h>
@@ -94,6 +95,27 @@ bool WalletInit::ParameterInteraction() const
 
     if (gArgs.GetBoolArg("-blocksonly", DEFAULT_BLOCKSONLY) && gArgs.SoftSetBoolArg("-walletbroadcast", false)) {
         LogInfo("Parameter interaction: -blocksonly=1 -> setting -walletbroadcast=0");
+    }
+
+    // B3: SegWit is NOT active on the legacy chain, so a witness-program
+    // output (bech32/bech32m) is anyone-can-spend under today's consensus.
+    // Until the segwit activation question is settled post-H, the wallet
+    // both DEFAULTS to legacy P2PKH addresses and REFUSES an explicit
+    // witness address type -- receiving to one would put funds at risk.
+    if (Params().GetConsensus().legacy_b3coin) {
+        for (const char* opt : {"-addresstype", "-changetype"}) {
+            const std::string val{gArgs.GetArg(opt, "")};
+            if (val.empty()) {
+                gArgs.SoftSetArg(opt, "legacy");
+                LogInfo("Parameter interaction: B3 legacy consensus -> setting %s=legacy", opt);
+            } else if (val != "legacy") {
+                return InitError(strprintf(
+                    _("%s=%s is not available on B3: SegWit outputs are unprotected "
+                      "(anyone-can-spend) under the legacy consensus rules. Use "
+                      "%s=legacy."),
+                    opt, val, opt));
+            }
+        }
     }
 
     return true;
