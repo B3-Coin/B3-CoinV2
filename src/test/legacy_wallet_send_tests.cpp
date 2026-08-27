@@ -118,7 +118,6 @@ BOOST_AUTO_TEST_CASE(legacy_wallet_tx_disk_round_trip)
     // nTime bytes misalign the modern codec (throw) or yield a wrong txid.
     {
         DataStream copy{ss};
-        wallet::g_wallet_tx_read_legacy_b3 = false;
         wallet::CWalletTx bad{txref, wallet::TxStateInactive{}};
         bool reproduced_id{false};
         try {
@@ -132,10 +131,8 @@ BOOST_AUTO_TEST_CASE(legacy_wallet_tx_disk_round_trip)
     // Legacy read (what ReadKeyValue retries with) recovers the exact tx.
     {
         DataStream copy{ss};
-        wallet::g_wallet_tx_read_legacy_b3 = true;
         wallet::CWalletTx good{txref, wallet::TxStateInactive{}};
-        copy >> good;
-        wallet::g_wallet_tx_read_legacy_b3 = false;
+        good.UnserializeLegacyB3(copy);
         BOOST_CHECK(good.tx->IsLegacyEncoded());
         BOOST_CHECK_EQUAL(good.tx->nTime, txref->nTime);
         BOOST_CHECK(good.GetHash() == txref->GetHash()); // id-stable round trip

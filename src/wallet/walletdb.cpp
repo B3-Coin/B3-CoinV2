@@ -1036,7 +1036,6 @@ static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, bool& any_
             // snapshot with the legacy codec (see wallet/transaction.h). Both
             // attempts fill the same wtx object, so no copy/assignment of the
             // move-only CWalletTx is needed.
-            g_wallet_tx_read_legacy_b3 = false;
             bool modern_ok{true};
             try {
                 value >> wtx;
@@ -1045,14 +1044,11 @@ static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, bool& any_
             }
             if ((!modern_ok || wtx.GetHash() != hash) && Params().GetConsensus().legacy_b3coin) {
                 DataStream retry{value_snapshot};
-                g_wallet_tx_read_legacy_b3 = true;
                 try {
-                    retry >> wtx;
+                    wtx.UnserializeLegacyB3(retry);
                 } catch (const std::exception&) {
-                    g_wallet_tx_read_legacy_b3 = false;
                     return false;
                 }
-                g_wallet_tx_read_legacy_b3 = false;
             } else if (!modern_ok) {
                 return false;
             }
