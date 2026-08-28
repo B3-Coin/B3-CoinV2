@@ -245,10 +245,9 @@ struct ValidatorRuntime {
 //! internally (chain-derived initialization does not exist yet and
 //! deposit ingestion stays fail-closed) — fabricated caller-built
 //! balances/custody/nonces cannot enter production startup.
-bool StartValidator(FlowMeshStore& store, flowmesh::MeshNode::Config config,
-                    const uint256& vault_commitment, const uint256& base_asset,
-                    const uint256& quote_asset, size_t max_k, ValidatorRuntime& out,
-                    std::string& error);
+//! The prototype itself lives in flowmesh/sync.h (included above), where
+//! it must precede the signing factory's friend grant; redeclaring it
+//! here trips -Werror=redundant-decls on the release builders.
 
 } // namespace node
 
