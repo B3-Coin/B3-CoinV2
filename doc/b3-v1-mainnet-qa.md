@@ -44,3 +44,8 @@ Executed record — PASSED 2026-08-27 (operator: project owner):
 - live findings fixed during QA: legacy wallet-tx persistence crash
   (ca6a72c), legacy fee floor + fallback default (a22583b), -maxtxfee
   denomination (ede6862) -- each now regression-tested
+- GUI send-form retest after the fee-UI simplification (3699feb): SKIPPED
+  by owner decision 2026-08-28 -- the wallet engine is proven on-chain via
+  the confirmed send above, and the legacy-era fee controls that failed
+  were REMOVED rather than adjusted, so the failing surface no longer
+  exists. First-run GUI send remains a watch item for operator feedback.
