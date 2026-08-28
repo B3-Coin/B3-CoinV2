@@ -81,11 +81,11 @@ each T (b3-capture-T{1,2,3}-*), all row files and the 637 MB de-XOR
 bootstrap (b3-eqgate/) — the bootstrap alone suffices to rebuild any node
 offline.
 
-**Consequence: the H/X activation gate of
-[b3-utxo-equivalence.md](b3-utxo-equivalence.md) is SATISFIED.** Remaining
-before a mainnet pin: choose H (owner candidate under discussion: 815,000,
-M = 816,001), capture-and-verify once more AT H when it exists, and the
-X-distribution mechanics (pause vs precommit).
+**Consequence: the T3 H/X equivalence gate of
+[b3-utxo-equivalence.md](b3-utxo-equivalence.md) is SATISFIED.** The owner
+subsequently pinned H = 810,000 with X blank (pause-fail-closed). Remaining
+for the X-pin release: capture and verify once more AT H, then pin the
+observed X.
 
 **FN RELEASE GATE FINDING (same run, port-T3 state, equivalence-gated
 -podreport): R = 3,500 qualifying historical PoDs, all 3,500 claimable
@@ -97,8 +97,17 @@ One sequencing note: the cap only binds an FN-activating release; H/X
 pinning for the base chain is not blocked if FN activation ships behind a
 later height, but the cap must be re-ruled before ANY FN issuance activates.
 
+**SUPERSEDED/RESOLVED IN PART (owner rulings 2026-08-22 and 2026-08-28):**
+the lifetime cap is now 5,000 and the modern price table is pinned. This
+run's `R = 3,500` was measured at height 807,709, so it is a reservation
+floor, not the final through-H count. The mandatory report at H fixes final
+R before FN activation. All final historical rights are reserved; reachable
+modern capacity is at most 1,500 and may be smaller. If final `R > 5,000`,
+FN activation returns to the owner and no historical right is truncated.
+
 Incident log (for the record): the port node crashed once mid-sync on a
 relayed unconfirmed legacy transaction (CalculateLockPointsAtTip assertion)
-— worked around with -blocksonly, tracked as a required fix; the 2016
+— worked around with -blocksonly during this campaign and subsequently
+fixed by commit `e2c2d36`; the 2016
 client's seed infrastructure and the b3nodes.net DNS seeds are dead, so
 peers must come from the explorer list or operator-supplied addnodes.

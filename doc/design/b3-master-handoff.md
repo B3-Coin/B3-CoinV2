@@ -534,7 +534,7 @@ This avoids making `100 FN Coins` automatically equal one node with `100x` vote 
 
 FN Coin does not silently add B3 PoS weight.
 
-### 4.8 FN economics — DIRECTION LOCKED (2026-08-17) / NUMERICAL PARAMETERS OPEN
+### 4.8 FN economics — DIRECTION LOCKED / CREATION CURVE PINNED (2026-08-28)
 
 ```text
 demand for FlowMesh capacity
@@ -545,23 +545,20 @@ demand for FlowMesh capacity
     -> operator may earn approved stablecoin trading fees
 ```
 
-**Locked direction (owner ruling 2026-08-17; full normative text in
-[b3-fn-pod.md](b3-fn-pod.md) §11):** FN has both a **limited total
-supply** (`MAX_FN_EVER_CREATED`, consensus constant — **current
-owner-selected value 1,000**, covering every historical right claimed or
-unclaimed plus every modern creation; revisable before activation through
-the reviewed process only; after activation only by a versioned consensus
-upgrade at a defined height, never node-local; the real-chain
-`-podreport` is a **pre-activation release gate**: it must run before
-H/X are pinned, and if the historical reservation count exceeds 1,000
-the release process stops — H/X are not pinned, FN activation is not
-enabled, and the decision returns to the owner; historical rights are
-never discarded, and this is not a block-validation rule that halts a
-running chain at M) and a **deterministically increasing creation cost**
-(`RequiredDisintegration(M)` over the modern-creations-ever counter,
-nondecreasing, integer atomic-unit arithmetic, numbers OPEN; supply
-invariants `0 <= H <= R`, `R + M <= C`, `H + M = A + X`, remaining
-modern capacity `= C − R − M` — [b3-fn-pod.md](b3-fn-pod.md) §11.1).
+**Locked direction (owner rulings 2026-08-17 through 2026-08-28; full
+normative text in [b3-fn-pod.md](b3-fn-pod.md) §11):** FN has both a
+**limited total supply** (`MAX_FN_EVER_CREATED = 5,000`) and a
+**deterministically increasing creation cost**. The equivalence-gated
+report at height 807,709 established a floor of 3,500 historical rights;
+the mandatory through-H report fixes final R before FN activation, and
+every final right is reserved perpetually. The price table allows at most
+1,500 modern slots: 15,000 B3 for slots 1–500, 30,000 B3 for 501–1,000
+and 60,000 B3 for 1,001–1,500. Additional final-H rights reduce the
+reachable modern suffix one-for-one. Evaluation is nondecreasing integer
+base-unit arithmetic; historical issuance does not advance M, and
+extinguishment never reopens capacity. Supply invariants remain
+`0 <= H <= R`, `R + M <= C`, `H + M = A + X`, remaining modern capacity
+`= C − R − M` — [b3-fn-pod.md](b3-fn-pod.md) §11.1.
 The combination is intentional: FN
 is a scarce, freely transferable market asset whose future creation
 becomes progressively more expensive. Legacy rights come first: every
@@ -575,9 +572,9 @@ supply only and never reopens a creation slot.
 
 Exact fee distribution remains OPEN. Possible destinations include active
 FNs, insurance, treasury, or another approved allocation. B3 PoS
-validators do not automatically receive the FlowMesh fee pool. The other
-OPEN numerical decisions (cap value, starting cost, tranche size,
-progression, reward amount/schedule, reward cutoff) carry decision tables
+validators do not automatically receive the FlowMesh fee pool. The
+remaining OPEN numerical decisions (reward amount/schedule and reward
+cutoff) carry decision tables
 in [b3-fn-pod.md](b3-fn-pod.md) §11.5.
 
 ## 5. FlowMesh DEX

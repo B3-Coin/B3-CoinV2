@@ -133,20 +133,25 @@ encoded.
 
 ## OD-4 — FN supply economics
 
-Contract §51 explicitly leaves the issuance curve outside consensus. The old
-"every 25 FN → price doubles" scheme is **rejected** (cartel/oligopoly failure mode). The
-conceptual direction is license scarcity + bond + performance-based revenue + B3 burn for
-new entry, but no curve, bond size, or revenue split is locked. The policy interface may
-exist; the economics may not be implemented.
+Contract §51 originally left the issuance curve outside consensus. The old
+"every 25 FN → price doubles" scheme remains **rejected**. Owner rulings
+through 2026-08-28 now pin the lifetime cap at 5,000 and the modern price
+table to 15,000 / 30,000 / 60,000 B3 per 500-slot tier, with at most 1,500
+modern slots. The height-807,709 report proves at least 3,500 historical
+rights; the mandatory through-H report fixes final R and can only reduce
+reachable modern capacity. The helper ships activation-inert; production
+modern-PoD validation is still future reviewed work. Bond size, reward
+policy and revenue split remain OPEN.
 
 **Creation mechanism locked (2026-08-16, [b3-fn-pod.md](b3-fn-pod.md)):** modern
 FN creation preserves the historical **Proof of Disintegration** — implicit
 destruction through the transaction accounting gap, never claimable as a fee,
 never a generic BURN output — modernized with an explicit on-chain FN
 ownership (FN Coin) output. FN Coin is a separate asset/state from B3; one
-PoD event creates at most one FN. OPEN here: the modern PoD amount, FN Coin
-issuance rate/quantity, excess-gap treatment, ownership serialization,
-transfer rules and reward economics.
+PoD event creates at most one FN. The modern PoD amount and maximum issuance
+quantity are now selected by the pinned table. Remaining OPEN items are the
+production activation path, bond/reward policy and revenue distribution;
+later owner rulings govern ownership, transfer and excess-gap treatment.
 
 ---
 

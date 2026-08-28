@@ -289,18 +289,22 @@ Measurement first; no guessed constant.
    replace, refund, denominate, or recreate the destroyed B3. PoDId is
    only the one-time issuance receipt/nullifier and never travels with
    ordinary FN Coin. Structural amount bounds are NOT mint authority:
-   `ParseFnOutput`'s `1..1000` range means representable, never
+   `ParseFnOutput`'s `1..5000` range means representable, never
    creatable — minting is exclusively +1 per validated issuance under
    the conservation equation.
 
 5a. **Modern creation cost curve — PINNED (owner ruling 2026-08-28,
    before the v1 release: "we need solid numbers first and these will
    be fixed forever"):** `RequiredDisintegration(modern_creations_ever)`
-   is now implemented in `src/modern/fn.h` as pinned consensus
-   constants, closing the "numbers OPEN" item of b3-fn-pod.md §11.1.
-   The 5,000 cap splits as `FN_HISTORICAL_RESERVED = 3,500` (reserved
-   perpetually, free of modern cost, never advancing the curve) plus
-   `MAX_FN_MODERN_CREATED = 1,500` modern slots priced by count:
+   is now implemented in `src/modern/fn.h` as an owner-locked,
+   activation-inert future-consensus commitment, closing the price
+   values previously marked OPEN in b3-fn-pod.md §11. The
+   height-807,709 report proves a reservation floor of 3,500 historical
+   rights (free of modern cost and never advancing the curve), so the
+   5,000 cap leaves a ceiling of 1,500 modern slots priced by count. The
+   mandatory final-H report fixes the exact reservation; additional
+   historical rights reduce reachable modern capacity and are never
+   truncated:
 
    | modern slot | cost per FN | tier total |
    |---|---|---|
@@ -313,11 +317,12 @@ Measurement first; no guessed constant.
    (15M old-B3 = 15,000 B3); a full sellout destroys 52.5M B3, bounded
    by the low estimate of historical destruction (3,500 × 15,000..25,000
    = 52.5M..87.5M B3). Nondecreasing over the modern-creations-ever
-   counter, integer base-unit arithmetic, exhausted permanently at slot
-   1,500 (extinguishment never reopens a slot). Boundary values are
+   counter and integer base-unit arithmetic. The price table is exhausted
+   permanently at slot 1,500, while final-H supply enforcement may make a
+   smaller suffix unreachable (extinguishment never reopens a slot). Boundary values are
    static_assert-pinned in the header and swept by
    `fn_claim_tests/required_disintegration_curve`. Ships in v1 as a
-   public consensus commitment; the modern-PoD *transaction* validation
+   public future-consensus commitment; the modern-PoD *transaction* validation
    that charges this price remains future work gated on FN activation.
 
 6. **FN identity — LOCKED and IMPLEMENTED (owner's corrected
@@ -401,7 +406,7 @@ same uncommitted diff — all inactive, wired into nothing): §8.5's locked
 model implemented. `modern/fn.h`: `FnAssetId` (+ pinned synthetic
 vectors), `MAX_FN_EVER_ISSUED`, corrected `FnOutputView` /
 `MakeFnOutput` / `ParseFnOutput` (global asset, whole units in
-[1, 1000] — zero FN balance is represented by NO output, never a
+[1, 5000] — zero FN balance is represented by NO output, never a
 zero-amount output — EMPTY canonical v1 params, enforced, no opaque
 bytes),
 `FnSupplyModel` / `CheckFnUnitConservation` (pure cap/extinguishment/
@@ -421,7 +426,7 @@ asset rejection, exactly-one-unit, policy shape, index, beneficiary,
 duplicate-predicate, superseded-action rejection, no-PoDId-in-output).
 
 Second surgical pass (2026-08-18, owner inspection findings, same
-uncommitted diff): live FN amounts corrected to [1, 1000] (zero balance
+uncommitted diff): live FN amounts corrected to [1, 5000] (zero balance
 = no output); `CheckFnCreationActions` now SEMANTICALLY REJECTS every
 type-1 action — generic framing still decodes the reserved bytes, no FN
 checker accepts them (envelope test proves decode-then-reject); the

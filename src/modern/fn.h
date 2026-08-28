@@ -89,15 +89,19 @@ inline constexpr uint16_t FN_POLICY_VERSION_V1{POLICY_VERSION_V1};
 //! historical FN with headroom for modern issuance.
 inline constexpr uint32_t MAX_FN_EVER_ISSUED{5000};
 
-//! Historical FN rights reserved ahead of all modern creation: the
-//! real-chain -podreport count R. Reserved perpetually — modern issuance
-//! can never consume one of these slots, and historical minting never
-//! advances the modern cost curve.
-inline constexpr uint32_t FN_HISTORICAL_RESERVED{3500};
+//! Historical FN rights already proven by the equivalence-gated real-chain
+//! report at height 807,709. This is a reservation FLOOR, not the final R:
+//! the final-H report may add rights before H = 810,000. No historical right
+//! may be truncated. Production activation must use the final through-H R.
+inline constexpr uint32_t FN_HISTORICAL_RESERVED_FLOOR{3500};
 
-//! Modern creation slots = everything the historical reservation leaves.
-inline constexpr uint32_t MAX_FN_MODERN_CREATED{MAX_FN_EVER_ISSUED - FN_HISTORICAL_RESERVED};
-static_assert(MAX_FN_MODERN_CREATED == 1500);
+//! Maximum possible modern slots given the reservation floor. The final
+//! activation limit is MAX_FN_EVER_ISSUED - final_through_h_R and may be
+//! smaller. RequiredDisintegration defines prices across this whole ceiling;
+//! supply validation must independently enforce the final total cap.
+inline constexpr uint32_t MAX_FN_MODERN_CREATED_CEILING{
+    MAX_FN_EVER_ISSUED - FN_HISTORICAL_RESERVED_FLOOR};
+static_assert(MAX_FN_MODERN_CREATED_CEILING == 1500);
 
 /**
  * RequiredDisintegration — the modern-era FN creation cost curve
@@ -111,7 +115,9 @@ static_assert(MAX_FN_MODERN_CREATED == 1500);
  * historical claims do not advance the counter; extinguishment never
  * rolls it back. Returns the native B3 that the modern PoD must destroy
  * (in base units, 1 B3 = KILO_COIN), or nullopt once all
- * MAX_FN_MODERN_CREATED slots are consumed — permanently.
+ * MAX_FN_MODERN_CREATED_CEILING slots are consumed — permanently. The
+ * production activation path must additionally enforce the possibly-lower
+ * limit derived from the final through-H historical reservation.
  *
  * The schedule mirrors the historical three-tier style but rises with
  * consumed scarcity instead of falling with height, anchored so that
@@ -129,14 +135,14 @@ static_assert(MAX_FN_MODERN_CREATED == 1500);
  */
 inline constexpr std::optional<CAmount> RequiredDisintegration(uint32_t modern_creations_ever)
 {
-    if (modern_creations_ever >= MAX_FN_MODERN_CREATED) return std::nullopt;
+    if (modern_creations_ever >= MAX_FN_MODERN_CREATED_CEILING) return std::nullopt;
     if (modern_creations_ever >= 1000) return 60'000 * KILO_COIN;
     if (modern_creations_ever >= 500) return 30'000 * KILO_COIN;
     return 15'000 * KILO_COIN;
 }
 
-// The curve's boundary values are consensus history from the moment v1
-// ships; pin every edge so no refactor can move them silently.
+// Owner-locked future-consensus commitment (activation-inert in v1). Pin
+// every price edge so no refactor can move the selected curve silently.
 static_assert(*RequiredDisintegration(0) == 15'000 * KILO_COIN);
 static_assert(*RequiredDisintegration(499) == 15'000 * KILO_COIN);
 static_assert(*RequiredDisintegration(500) == 30'000 * KILO_COIN);

@@ -153,6 +153,12 @@ Baseline: commit `a8ad010` (the tip of the completed experimental stack, from wh
 
 Per contract §53, none of these may be wired into consensus before a clean H+1.
 
+**FN economics update (owner ruling 2026-08-28):**
+`RequiredDisintegration` now pins the activation-inert 15,000 / 30,000 /
+60,000 B3 price tiers across a 1,500-slot ceiling. The measured 3,500
+historical count is a height-807,709 floor; the mandatory through-H report
+reduces reachable modern capacity for any additional historical rights.
+
 | Item | Status | Notes |
 |---|---|---|
 | FlowMesh ledger / clearing / batch | PARTIAL (compiled, activation-unwired) | `src/flowmesh/*.h`, header-only, compiled only by unit tests; not referenced by CMake targets or validation. Account-model boundary and no-UTXO settlement are correct. Missing: positions/margin/PnL, deposit identity and idempotence, epoch↔finality binding (OD-6), per-market precision (OD-7), stablecoin fee denomination, fee-asset registry. |

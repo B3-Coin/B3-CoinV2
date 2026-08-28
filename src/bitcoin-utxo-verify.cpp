@@ -93,8 +93,9 @@ void Usage()
                 "FN Proof-of-Disintegration report (doc/design/b3-fn-pod.md):\n"
                 "  -podreport             derive every qualifying historical PoD during the\n"
                 "                         replay pass and print the report. The QUALIFYING\n"
-                "                         COUNT (R vs the 1,000 cap) is the pre-activation\n"
-                "                         gate; the payload figures are a SUPERSEDED type-1\n"
+                "                         COUNT (R vs the 5,000 lifetime cap) is an FN-activation\n"
+                "                         gate; pre-H results are a floor and the through-H\n"
+                "                         count is final. Payload figures are a SUPERSEDED type-1\n"
                 "                         diagnostic, NOT the type-2 issuance capacity gate\n"
                 "                         (real type-2 proof sizes = future measurement)\n");
 }

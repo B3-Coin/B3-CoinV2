@@ -35,8 +35,11 @@ doc/design/b3-open-decisions.md.
   pay the same address.
 - Denomination: 1 B3 = 1e9 base units, the ONLY human-facing unit
   (RPC, GUI, config); typed amount = staking weight.
-- FN Coin: lifetime cap 5,000 (ratified); PoD burn; nondecreasing modern
-  creation curve (numbers open).
+- FN Coin: lifetime cap 5,000 (ratified); at least 3,500 historical rights
+  reserved from the height-807,709 report, with the exact final reservation
+  set by the mandatory through-H report; PoD burn; modern creation cost
+  pinned by slot to 15,000 / 30,000 / 60,000 B3 per 500-slot tier. The
+  helper ships activation-inert until the reviewed FN activation path exists.
 
 ## Bridge
 - Deposit legs first (ETH → B3, then BTC → B3). Verification stack

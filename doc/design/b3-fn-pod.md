@@ -1,8 +1,10 @@
 # Proof of Disintegration — the B3 Fundamental Node creation mechanism
 
 **Status: DESIGN DIRECTION (2026-08-16).** Historical mechanism authoritative
-(traced from `master`); modern direction locked at the level below, with the
-economics OPEN. This document supersedes any earlier description of FN
+(traced from `master`); modern direction locked at the level below. The
+modern creation-cost curve was pinned by owner ruling 2026-08-28; reward and
+remaining FlowMesh economics stay OPEN. This document supersedes any earlier
+description of FN
 creation as a burn output. No modern FN economics, governance, rewards or
 FlowMesh coupling are implemented; Modern PoS and the transition corridor
 are unchanged by this design.
@@ -119,7 +121,7 @@ state.
                                        hypothetical disintegration output
                                        (§10.1)
     historical collateral schedule     RequiredDisintegration curve
-                                       (§11.2; numbers OPEN)
+                                       (§11.2; values PINNED 2026-08-28)
     historical marker + P2P binding    explicit on-chain FN ownership
     aggregate-only chain accounting    FN Coin / FN policy object
                                        deterministic replay protection
@@ -496,9 +498,10 @@ A claim is a MODERN transition (height ≥ M) carrying:
    RESERVED/SUPERSEDED frozen record, consensus-inactive (codec +
    vectors only, unreachable from validation/mempool/wallet/RPC/mining;
    FN v1 unactivated everywhere; no FN semantic checker accepts it).
-   The real-chain `-podreport` QUALIFYING COUNT (`R` vs the 1,000 cap,
-   §11.1) remains the mandatory pre-activation release gate; the
-   payload figures do not gate anything. H/X remain unset.
+   The real-chain `-podreport` QUALIFYING COUNT (`R` vs the 5,000 cap,
+   §11.1) remains the mandatory pre-activation gate; the height-807,709
+   result of 3,500 is a floor and the through-H result is final. The
+   payload figures do not gate anything. H is pinned; X remains blank.
 
 3. Ordinary inputs paying fees and any ordinary outputs. The claim spends
    NO historical outpoint; the marker, if it still exists, is untouched
@@ -615,8 +618,8 @@ ordinary-spend extinguishment — is LOCKED (§10.2); modern FN ownership is
 explicit and on-chain; FN Coin is separate from B3 supply; one PoD event
 creates at most one FN; mainnet historical collateral rules unchanged;
 **FN economic direction LOCKED (2026-08-17, §11):** limited total supply
-(`MAX_FN_EVER_CREATED`, value OPEN) plus a deterministically nondecreasing
-creation cost (`RequiredDisintegration`, numbers OPEN) — FN as a scarce,
+(`MAX_FN_EVER_CREATED = 5,000`) plus a deterministically nondecreasing
+creation cost (`RequiredDisintegration`, values PINNED 2026-08-28) — FN as a scarce,
 freely transferable market asset; all historical rights reserved before
 modern issuance and never crowded out; scarcity counted on
 total-ever-created; extinguishment never reopens a creation slot.
@@ -642,9 +645,8 @@ same-PoDId successor rule preserves the FN; no split/merge; per the
 permanently extinguishes the FN, §10.2); no administrator list or
 off-chain ownership anywhere in consensus.
 
-**OPEN (after the 2026-08-17 locks):** the numerical values of §11.5 —
-starting modern creation cost, tranche size, cost increase per tranche,
-reward amount and schedule, reward ownership cutoff on
+**OPEN (after the 2026-08-28 cost-curve ruling):** reward amount and
+schedule, reward ownership cutoff on
 transfer/extinguishment, legacy claim expiry policy (none by default) —
 `MAX_FN_EVER_CREATED` is no longer open: its current owner-selected
 value is 5,000 (D-1, ratified 2026-08-22 after the real-history report found R = 3,500; supersedes the 1,000 selection), revisable before activation through the reviewed
@@ -657,7 +659,7 @@ treatment and modern ordinary-fee calculation (`fee = I − O − D`, excess
 is ordinary fee — §10.1); FN lifecycle beyond transfer (ordinary-spend
 extinguishment defined, §10.2; still no split/merge); dynamic-vs-fixed
 pricing (deterministic nondecreasing curve, §11.2); FN issuance-rate
-structure (capped total, tranche curve — values OPEN, §11.5).
+structure (capped total and the pinned tranche curve, §11.5).
 
 ## 10. Modern FN accounting and lifecycle — LOCKED (owner ruling, 2026-08-17)
 
@@ -751,15 +753,17 @@ An FN Coin is a colored, normally spendable B3 output, and it must remain
 
 ## 11. FN scarcity and market economics — LOCKED direction (owner ruling, 2026-08-17)
 
-**Status: LOCKED direction; numerical parameters OPEN (§11.5) except
-D-1, whose current owner-selected value is `MAX_FN_EVER_CREATED = 5,000` (2026-08-22; the 2026-08-17 value of 1,000 was superseded when the real-history -podreport found R = 3,500 qualifying PoDs)
-(2026-08-17, revisable before activation through the reviewed process).**
+**Status: LOCKED direction. D-1 is `MAX_FN_EVER_CREATED = 5,000`
+(2026-08-22), and D-2 through D-4 were pinned on 2026-08-28 as the
+15,000 / 30,000 / 60,000 B3 three-tier curve. Reward parameters remain
+OPEN (§11.5).**
 FN has **both a limited total supply and a deterministically increasing
 creation cost**. The combination is intentional: FN is to become a
 scarce, transferable market asset whose future creation becomes
 progressively more expensive. The accounting mechanics (§10.1) and the
 lifecycle rules (§10.2) are already locked; this section locks the
-economic structure above them. No consensus code accompanies it.
+economic structure above them. The pure price helper is implemented but
+no activated consensus path calls it.
 
 ### 11.1 Limited supply — `MAX_FN_EVER_CREATED`
 
@@ -769,7 +773,7 @@ A consensus constant **`MAX_FN_EVER_CREATED`** caps FN creation.
 The cap includes every qualifying historical FN right, claimed or
 unclaimed, and every modern FN ever created; therefore
 `remaining modern capacity = 5,000 − historical_reserved − modern_created`
-(the `C − R − M` invariant below with `C = 1,000`). Revision rules:
+(the `C − R − M` invariant below with `C = 5,000`). Revision rules:
 
 - **Until activation**, the owner may revise the numerical value through
   the reviewed protocol process (a reviewed documentation commit, as
@@ -790,15 +794,16 @@ Supply rules, all consensus-enforced:
 - **Historical-count activation gate — a PRE-ACTIVATION release gate,
   not a block-validation rule.** The real-chain `-podreport` run through
   H (§8.4 capacity gate, counting every qualifying PoD including rights
-  whose script form is not yet supported) is mandatory **before H/X are
-  pinned and before an activation-ready mainnet release is produced**.
-  If it establishes `R > 1,000`: do not pin H/X, do not enable FN
-  activation, and return the decision to the owner. Historical rights
-  are never truncated, discarded or reprioritized to force them under
-  the cap. This gate is **not** an ordinary block-validation rule that
-  unexpectedly halts an otherwise-running chain at M — once H/X are
-  pinned, the reviewed report must already have established
-  `R <= 1,000`. A defensive implementation MAY fail node initialization
+  whose script form is not yet supported) is mandatory **before any
+  FN-activating mainnet release is produced**.
+  The height-807,709 report established a floor of `R = 3,500`; the
+  mandatory through-H report fixes final R. Every final historical right
+  is reserved under the 5,000 cap before FN activation, so reachable
+  modern capacity is at most 1,500 and may be smaller. If final `R > 5,000`,
+  FN activation cannot proceed under the current cap and returns to the
+  owner. Historical rights are never truncated, discarded or reprioritized. This gate is **not**
+  an ordinary block-validation rule that unexpectedly halts an
+  otherwise-running chain at M. A defensive implementation MAY fail node initialization
   loudly if committed activation parameters contradict the derived
   historical count, but that is protection against an invalid release,
   not the normal activation mechanism.
@@ -864,10 +869,20 @@ ever created, §11.1):
 
     D = RequiredDisintegration(M) -> CAmount
 
-The exact starting cost, tranche size and progression are OPEN (§11.5).
-The possible (owner-suggested) form: deterministic supply **tranches**,
-every tranche carrying a higher B3 disintegration requirement than the
-previous one.
+The owner pinned an explicit three-tier table on 2026-08-28. The input is
+the number of modern creations ever completed before the candidate:
+
+| `M` before creation | modern slot | required disintegration |
+|---:|---:|---:|
+| 0..499 | 1..500 | 15,000 B3 |
+| 500..999 | 501..1,000 | 30,000 B3 |
+| 1,000..1,499 | 1,001..1,500 | 60,000 B3 |
+| 1,500+ | none | creation refused permanently |
+
+The table uses integer base-unit arithmetic. Historical issuance never
+advances `M`, and extinguishment never reduces it or reopens capacity.
+The final through-H reservation can make a suffix of the 1,500-slot price
+table unreachable under the independent 5,000-unit lifetime cap.
 
 Locked properties of the function and its evaluation:
 
@@ -929,45 +944,24 @@ Recorded accurately, with no stronger claims than the mechanism supports:
   owner later establishes an explicit expiry policy (OPEN, §11.5 D-7 —
   nothing expires by default).
 
-### 11.5 OPEN numerical decisions — decision tables
+### 11.5 Numerical decisions — selected and open
 
-Every value below awaits explicit owner selection. Implementation must
-not proceed on any of them; the locked structure (§11.1–11.4) is
-independent of the values chosen.
+D-1 through D-4 are selected. D-5 through D-7 remain OPEN.
 
 **D-1: `MAX_FN_EVER_CREATED` — SELECTED: 5,000 (owner, 2026-08-22; supersedes 1,000 of 2026-08-17)**
 
 | Item | Status |
 |---|---|
-| Current owner-selected value | **5,000** (2026-08-22) — includes every qualifying historical right (real-history R = 3,500, claimed or unclaimed) and every modern FN ever created; headroom 1,500 |
-| Activation gate | pre-activation RELEASE gate (§11.1): the real-chain `-podreport` count `R` is mandatory before H/X are pinned and before an activation-ready release; `R > 1,000` → do not pin H/X, do not enable FN activation, return the decision to the owner — historical rights are never discarded to fit the cap; not a block-validation halt |
+| Current owner-selected value | **5,000** (2026-08-22) — includes every qualifying historical right (measured floor R = 3,500 at height 807,709) and every modern FN ever created; modern headroom ceiling 1,500, finalized by the through-H report |
+| Activation gate | height-807,709 report proves `R >= 3,500`; the mandatory through-H report fixes final R before FN activation; all final rights are reserved, so modern capacity is at most 1,500 and may be smaller; `R > 5,000` returns the cap decision to the owner; not a block-validation halt |
 | Revision before activation | permitted, through the reviewed protocol process only |
 | Revision after activation | only by an explicit versioned consensus upgrade at a defined activation height; never node-local or independently configurable |
-| FlowMesh sizing | conditional: under the current handoff §4.7 DESIGN DIRECTION ("one active FN Coin -> one microblock seat"; seat details OPEN there), 1,000 would bound the maximum seat pool — binding only if that direction is locked |
+| FlowMesh sizing | separate from issuance capacity; the seat lifecycle remains governed by the FlowMesh decision record |
 
-**D-2: starting modern creation cost — `RequiredDisintegration(0)`**
-
-| Consideration | Constraint / note |
-|---|---|
-| Unit discipline | atomic units, integer; display in modern B3 (kB3) per the denomination model |
-| Historical anchor | historical tiers were 25M/20M/15M legacy B3 (= 25,000/20,000/15,000 kB3) — a reference point, not a constraint |
-| Accessibility vs scarcity | low start widens early participation; high start prices the first tranche as already-scarce |
-
-**D-3: tranche size**
-
-| Consideration | Constraint / note |
-|---|---|
-| Granularity | small tranches → smooth curve, frequent boundary crossings; large tranches → step function, long price plateaus |
-| Divisibility | tranche boundaries must divide the modern capacity cleanly or define the final partial tranche explicitly |
-| In-block dynamics | boundary crossings inside one block are well-defined (canonical order, counter advances per creation — §11.2) but small tranches make them common |
-
-**D-4: cost increase per tranche**
-
-| Consideration | Constraint / note |
-|---|---|
-| Form | fixed increment (linear), fixed multiplier (geometric — integer arithmetic required, e.g. rational multiplier with an explicit rounding rule), or an explicit table |
-| Rounding | if not an explicit table, the rounding rule is consensus-critical and must be specified with the value |
-| Monotonicity | whatever the form, nondecreasing is locked |
+**D-2 through D-4 — SELECTED (owner, 2026-08-28):** explicit 500-slot
+tiers costing 15,000, 30,000 and 60,000 B3 respectively, exactly as
+§11.2 and `modern::RequiredDisintegration` define. There is no rounding
+rule or floating-point evaluation.
 
 **D-5: reward amount and schedule**
 
@@ -994,14 +988,12 @@ matrix:
 
 | Case | Expected |
 |---|---|
-| Historical reservation `R < 1,000` | activation proceeds; modern capacity = `1,000 − R` |
-| At `R + M = 999` | one additional modern creation succeeds (`R + M` reaches 1,000) |
-| At `R + M = 1,000` | every further modern creation is rejected |
-| `R = 1,000` | modern capacity is zero; every modern creation rejected |
-| `R > 1,000` | the **activation-ready release gate fails before H/X are pinned** (§11.1); no historical right discarded; not a running-chain halt |
+| Historical reservation | final through-H `R` is enforced; modern capacity = `5,000 − R` and is at most 1,500 |
+| At modern counter `M = 1,499` when `R = 3,500` | one additional modern creation succeeds (`M` reaches 1,500) |
+| At modern counter `M = 1,500` | every further modern creation is rejected permanently |
+| Additional through-H rights | reduce reachable modern slots one-for-one; no historical right is discarded |
 | Extinguishment | does not decrease `R + M`; at the cap, capacity remains 0 — no slot reopens |
 | Reorganization | reverses canonical-chain modern creations and restores capacity exactly; re-connection reproduces the counters identically |
 
-(The special case "modern creation number 1,001 is rejected" holds only
-when `R = 0`; the general invariant is `R + M <= 1,000`, tested through
-the exact-arithmetic rows above.)
+The general invariant is `R + M <= 5,000`; the pinned price table is also
+bounded by `M <= 1,500`.
