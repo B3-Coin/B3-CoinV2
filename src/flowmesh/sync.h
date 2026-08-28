@@ -724,7 +724,12 @@ private:
                                                       restored_anchors}};
     }
 
-    friend bool ::node::StartValidator(::node::FlowMeshStore& store, MeshNode::Config config,
+    // Every parameter type FULLY QUALIFIED: GCC resolves names in a
+    // qualified friend declaration differently from Clang, and an
+    // unqualified MeshNode here breaks the signature match (and with it
+    // the factory's access grant) on the Linux release builders.
+    friend bool ::node::StartValidator(::node::FlowMeshStore& store,
+                                       ::flowmesh::MeshNode::Config config,
                                        const uint256& vault_commitment,
                                        const uint256& base_asset, const uint256& quote_asset,
                                        size_t max_k, ::node::ValidatorRuntime& out,
