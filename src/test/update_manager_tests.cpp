@@ -366,7 +366,8 @@ BOOST_AUTO_TEST_CASE(unsupported_installer_never_requests_shutdown_or_launches)
 BOOST_AUTO_TEST_CASE(jittered_interval_bounds)
 {
     const int64_t base{6 * 60 * 60};
-    for (uint64_t e : {0ull, 1ull, 999ull, 123456789ull, UINT64_MAX}) {
+    for (uint64_t e : {uint64_t{0}, uint64_t{1}, uint64_t{999},
+                       uint64_t{123456789}, uint64_t{UINT64_MAX}}) {
         const int64_t v{JitteredCheckInterval(base, e)};
         BOOST_CHECK(v >= base - base / 4);
         BOOST_CHECK(v <= base + base / 4);
