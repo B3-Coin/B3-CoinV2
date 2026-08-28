@@ -179,7 +179,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Select supported Xcode
-        run: sudo xcode-select --switch /Applications/Xcode_16.2.app
+        run: sudo xcode-select --switch /Applications/Xcode_16.4.app
       - name: Install toolchain
         run: brew install cmake boost libevent sqlite capnp qt@6 qrencode
       - name: Configure + build
