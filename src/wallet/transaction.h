@@ -172,6 +172,7 @@ typedef std::map<std::string, std::string> mapValue_t;
  * but old wallet.dat files may still contain vtxPrev vectors of CMerkleTxs.
  * These need to get deserialized for field alignment when deserializing
  * a CWalletTx, but the deserialized values are discarded.**/
+template <bool LegacyB3>
 class CMerkleTx
 {
 public:
@@ -183,7 +184,12 @@ public:
         std::vector<uint256> vMerkleBranch;
         int nIndex;
 
-        s >> TX_WITH_WITNESS(tx) >> hashBlock >> vMerkleBranch >> nIndex;
+        if constexpr (LegacyB3) {
+            s >> TX_LEGACY_B3(tx);
+        } else {
+            s >> TX_MODERN(tx);
+        }
+        s >> hashBlock >> vMerkleBranch >> nIndex;
     }
 };
 
@@ -300,21 +306,31 @@ public:
         uint32_t dummy_int = 0; // Used to be fTimeReceivedIsTxTime
         uint256 serializedHash = TxStateSerializedBlockHash(m_state);
         int serializedIndex = TxStateSerializedIndex(m_state);
-        s << TX_WITH_WITNESS(tx) << serializedHash << dummy_vector1 << serializedIndex << dummy_vector2 << mapValueCopy << vOrderForm << dummy_int << nTimeReceived << dummy_bool << dummy_bool;
+        if (tx && tx->IsLegacyEncoded()) {
+            s << TX_LEGACY_B3(tx);
+        } else {
+            s << TX_MODERN(tx);
+        }
+        s << serializedHash << dummy_vector1 << serializedIndex << dummy_vector2 << mapValueCopy << vOrderForm << dummy_int << nTimeReceived << dummy_bool << dummy_bool;
     }
 
-    template<typename Stream>
-    void Unserialize(Stream& s)
+    template<bool LegacyB3, typename Stream>
+    void UnserializeImpl(Stream& s)
     {
         Init();
 
         std::vector<uint256> dummy_vector1; //!< Used to be vMerkleBranch
-        std::vector<CMerkleTx> dummy_vector2; //!< Used to be vtxPrev
+        std::vector<CMerkleTx<LegacyB3>> dummy_vector2; //!< Used to be vtxPrev
         bool dummy_bool; //! Used to be fFromMe, and fSpent
         uint32_t dummy_int; // Used to be fTimeReceivedIsTxTime
         uint256 serialized_block_hash;
         int serializedIndex;
-        s >> TX_WITH_WITNESS(tx) >> serialized_block_hash >> dummy_vector1 >> serializedIndex >> dummy_vector2 >> mapValue >> vOrderForm >> dummy_int >> nTimeReceived >> dummy_bool >> dummy_bool;
+        if constexpr (LegacyB3) {
+            s >> TX_LEGACY_B3(tx);
+        } else {
+            s >> TX_MODERN(tx);
+        }
+        s >> serialized_block_hash >> dummy_vector1 >> serializedIndex >> dummy_vector2 >> mapValue >> vOrderForm >> dummy_int >> nTimeReceived >> dummy_bool >> dummy_bool;
 
         m_state = TxStateInterpretSerialized({serialized_block_hash, serializedIndex});
 
@@ -327,6 +343,19 @@ public:
         mapValue.erase("spent");
         mapValue.erase("n");
         mapValue.erase("timesmart");
+    }
+
+    template<typename Stream>
+    void Unserialize(Stream& s)
+    {
+        UnserializeImpl</*LegacyB3=*/false>(s);
+    }
+
+    /** Decode a historical B3 wallet record, including its discarded vtxPrev. */
+    template<typename Stream>
+    void UnserializeLegacyB3(Stream& s)
+    {
+        UnserializeImpl</*LegacyB3=*/true>(s);
     }
 
     void SetTx(CTransactionRef arg)

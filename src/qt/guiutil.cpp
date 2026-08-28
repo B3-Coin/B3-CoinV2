@@ -135,7 +135,7 @@ void setupAddressWidget(QValidatedLineEdit *widget, QWidget *parent)
     widget->setFont(fixedPitchFont());
     // We don't want translators to use own addresses in translations
     // and this is the only place, where this address is supplied.
-    widget->setPlaceholderText(QObject::tr("Enter a B3Coin address (e.g. %1)").arg(
+    widget->setPlaceholderText(QObject::tr("Enter a B3 address (e.g. %1)").arg(
         QString::fromStdString(DummyAddress(Params()))));
     widget->setValidator(new BitcoinAddressEntryValidator(parent));
     widget->setCheckValidator(new BitcoinAddressCheckValidator(parent));
@@ -508,26 +508,28 @@ bool LabelOutOfFocusEventFilter::eventFilter(QObject* watched, QEvent* event)
 }
 
 #ifdef WIN32
-fs::path static StartupShortcutPath()
+fs::path static StartupShortcutPath(const bool legacy_name = false)
 {
+    const char* const app_name{legacy_name ? "B3Coin" : "B3 Hive"};
     ChainType chain = gArgs.GetChainType();
     if (chain == ChainType::MAIN)
-        return GetSpecialFolderPath(CSIDL_STARTUP) / "B3Coin.lnk";
+        return GetSpecialFolderPath(CSIDL_STARTUP) / fs::u8path(strprintf("%s.lnk", app_name));
     if (chain == ChainType::TESTNET) // Remove this special case when testnet CBaseChainParams::DataDir() is incremented to "testnet4"
-        return GetSpecialFolderPath(CSIDL_STARTUP) / "B3Coin (testnet).lnk";
-    return GetSpecialFolderPath(CSIDL_STARTUP) / fs::u8path(strprintf("B3Coin (%s).lnk", ChainTypeToString(chain)));
+        return GetSpecialFolderPath(CSIDL_STARTUP) / fs::u8path(strprintf("%s (testnet).lnk", app_name));
+    return GetSpecialFolderPath(CSIDL_STARTUP) / fs::u8path(strprintf("%s (%s).lnk", app_name, ChainTypeToString(chain)));
 }
 
 bool GetStartOnSystemStartup()
 {
-    // check for Bitcoin*.lnk
-    return fs::exists(StartupShortcutPath());
+    return fs::exists(StartupShortcutPath()) || fs::exists(StartupShortcutPath(/*legacy_name=*/true));
 }
 
 bool SetStartOnSystemStartup(bool fAutoStart)
 {
     // If the shortcut exists already, remove it for updating
     fs::remove(StartupShortcutPath());
+    // Remove a shortcut created by an earlier B3Coin-branded release.
+    fs::remove(StartupShortcutPath(/*legacy_name=*/true));
 
     if (fAutoStart)
     {

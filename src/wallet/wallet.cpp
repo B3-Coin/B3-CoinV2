@@ -1181,6 +1181,10 @@ bool CWallet::LoadToWallet(const Txid& hash, const UpdateWalletTxFn& fill_wtx)
     const auto& ins = mapWallet.emplace(std::piecewise_construct, std::forward_as_tuple(hash), std::forward_as_tuple(nullptr, TxStateInactive{}));
     CWalletTx& wtx = ins.first->second;
     if (!fill_wtx(wtx, ins.second)) {
+        // A failed database decode must not leave a partially populated entry.
+        // NEED_RESCAN relies on AddToWallet being able to insert the canonical
+        // chain or mempool transaction under this key.
+        if (ins.second) mapWallet.erase(ins.first);
         return false;
     }
     // If wallet doesn't have a chain (e.g when using bitcoin-wallet tool),
@@ -3057,6 +3061,14 @@ bool CWallet::LoadWalletArgs(std::shared_ptr<CWallet> wallet, const WalletContex
         wallet->m_fallback_fee = CFeeRate{fallback_fee.value()};
     }
 
+    // B3: the legacy chain has no fee market for the estimator to learn
+    // from, which surfaces as "fee estimation failed" in the GUI. Default
+    // the fallback rate to the legacy relay floor so sends work out of the
+    // box; an explicit -fallbackfee still overrides (live-QA 2026-08-27).
+    if (!args.IsArgSet("-fallbackfee") && Params().GetConsensus().legacy_b3coin) {
+        wallet->m_fallback_fee = CFeeRate{600'000};
+    }
+
     // Disable fallback fee in case value was set to 0, enable if non-null value
     wallet->m_allow_fallback_fee = wallet->m_fallback_fee.GetFeePerK() != 0;
 
@@ -3363,10 +3375,17 @@ int CWallet::GetTxDepthInMainChain(const CWalletTx& wtx) const
 {
     AssertLockHeld(cs_wallet);
     if (auto* conf = wtx.state<TxStateConfirmed>()) {
-        assert(conf->confirmed_block_height >= 0);
+        // Never abort the whole node over one record with an out-of-range
+        // height (e.g. a transiently bad entry mid-rescan): treat it as not
+        // yet confirmed until the rescan repairs it.
+        if (conf->confirmed_block_height < 0) {
+            WalletLogPrintf("warning: transaction %s has an invalid confirmed height %d; treating as unconfirmed\n",
+                            wtx.GetHash().ToString(), conf->confirmed_block_height);
+            return 0;
+        }
         return GetLastBlockHeight() - conf->confirmed_block_height + 1;
     } else if (auto* conf = wtx.state<TxStateBlockConflicted>()) {
-        assert(conf->conflicting_block_height >= 0);
+        if (conf->conflicting_block_height < 0) return 0;
         return -1 * (GetLastBlockHeight() - conf->conflicting_block_height + 1);
     } else {
         return 0;

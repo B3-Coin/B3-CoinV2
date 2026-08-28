@@ -24,7 +24,7 @@ Unicode true
 !define MUI_STARTMENUPAGE_REGISTRY_VALUENAME StartMenuGroup
 !define MUI_STARTMENUPAGE_DEFAULTFOLDER "B3 Hive"
 !define MUI_FINISHPAGE_RUN "$WINDIR\explorer.exe"
-!define MUI_FINISHPAGE_RUN_PARAMETERS $INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@
+!define MUI_FINISHPAGE_RUN_PARAMETERS '"$INSTDIR\@BITCOIN_GUI_NAME@@EXEEXT@"'
 !define MUI_UNICON "${NSISDIR}\Contrib\Graphics\Icons\modern-uninstall.ico"
 !define MUI_UNFINISHPAGE_NOAUTOCLOSE
 
@@ -49,7 +49,7 @@ Var StartMenuGroup
 !insertmacro MUI_LANGUAGE English
 
 # Installer attributes
-InstallDir $PROGRAMFILES64\B3CoinCore
+InstallDir "$PROGRAMFILES64\B3 Hive"
 CRCCheck force
 XPStyle on
 BrandingText " "
@@ -79,8 +79,8 @@ Section -Main SEC0000
     File @abs_top_builddir@/release/@BITCOIN_DAEMON_NAME@@EXEEXT@
     File @abs_top_builddir@/release/@BITCOIN_CLI_NAME@@EXEEXT@
     File @abs_top_builddir@/release/@BITCOIN_TX_NAME@@EXEEXT@
+    File @abs_top_builddir@/release/@BITCOIN_UTIL_NAME@@EXEEXT@
     File @abs_top_builddir@/release/@BITCOIN_WALLET_TOOL_NAME@@EXEEXT@
-    File @abs_top_builddir@/release/@BITCOIN_TEST_NAME@@EXEEXT@
     SetOutPath $INSTDIR
     WriteRegStr HKCU "${REGKEY}\Components" Main 1
 SectionEnd
@@ -102,7 +102,7 @@ Section -post SEC0001
     WriteRegStr HKCU "${UNINSTALL_REGKEY}" Publisher "${COMPANY}"
     WriteRegStr HKCU "${UNINSTALL_REGKEY}" URLInfoAbout "${URL}"
     WriteRegStr HKCU "${UNINSTALL_REGKEY}" DisplayIcon $INSTDIR\b3coin-qt.exe
-    WriteRegStr HKCU "${UNINSTALL_REGKEY}" UninstallString $INSTDIR\uninstall.exe
+    WriteRegStr HKCU "${UNINSTALL_REGKEY}" UninstallString '"$INSTDIR\uninstall.exe"'
     WriteRegDWORD HKCU "${UNINSTALL_REGKEY}" NoModify 1
     WriteRegDWORD HKCU "${UNINSTALL_REGKEY}" NoRepair 1
     WriteRegStr HKCR "@CLIENT_TARNAME@" "URL Protocol" ""

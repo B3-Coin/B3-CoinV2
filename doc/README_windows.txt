@@ -1,23 +1,20 @@
-Bitcoin Core
-=============
+B3 Hive
+-------
 
 Intro
 -----
-Bitcoin is a free open source peer-to-peer electronic cash system that is
-completely decentralized, without the need for a central server or trusted
-parties.  Users hold the crypto keys to their own money and transact directly
-with each other, with the help of a P2P network to check for double-spending.
+B3 Hive is the desktop wallet and full node for the B3 FlowMesh network.
+Users hold the keys to their own funds and validate the B3 chain directly.
 
 
 Setup
 -----
-Unpack the files into a directory and run bitcoin-qt.exe.
+Run the B3 Hive installer, then launch b3coin-qt.exe from the Start menu.
 
-Bitcoin Core is the original Bitcoin client and it builds the backbone of the network.
-However, it downloads and stores the entire history of Bitcoin transactions;
-depending on the speed of your computer and network connection, the synchronization
-process can take anywhere from a few hours to a day or more.
+B3 Hive downloads and validates the B3 chain. Initial synchronization can take
+several hours depending on the computer, storage, peers, and network connection.
+Do not attempt to spend funds until the wallet reports that synchronization is
+complete.
 
-See the bitcoin wiki at:
-  https://en.bitcoin.it/wiki/Main_Page
-for more help and information.
+Source code and issue tracker:
+  https://github.com/B3-Coin/B3-CoinV2

@@ -195,8 +195,14 @@ void Notificator::notifyDBus(Class cls, const QString &title, const QString &tex
 }
 #endif
 
-void Notificator::notifySystray(Class cls, const QString &title, const QString &text, int millisTimeout)
+void Notificator::notifySystray(Class cls, const QString &title, const QString &text,
+                                const QIcon &icon, int millisTimeout)
 {
+    if (!icon.isNull()) {
+        trayIcon->showMessage(title, text, icon, millisTimeout);
+        return;
+    }
+
     QSystemTrayIcon::MessageIcon sicon = QSystemTrayIcon::NoIcon;
     switch(cls) // Set icon based on class
     {
@@ -225,7 +231,7 @@ void Notificator::notify(Class cls, const QString &title, const QString &text, c
         break;
 #endif
     case QSystemTray:
-        notifySystray(cls, title, text, millisTimeout);
+        notifySystray(cls, title, text, icon, millisTimeout);
         break;
 #ifdef Q_OS_MACOS
     case UserNotificationCenter:

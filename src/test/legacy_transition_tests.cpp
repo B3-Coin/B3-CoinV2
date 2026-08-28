@@ -290,12 +290,12 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
         modern_tx.vin.resize(1);
         modern_tx.vin[0].prevout = COutPoint{pre_h_txid, 0};
         modern_tx.vout.emplace_back(1 * COIN, CScript() << OP_TRUE);
-        const auto res{chainman.ProcessTransaction(MakeTransactionRef(modern_tx))};
+        const auto res{WITH_LOCK(cs_main, return chainman.ProcessTransaction(MakeTransactionRef(modern_tx)))};
         BOOST_REQUIRE(res.m_result_type != MempoolAcceptResult::ResultType::VALID);
         BOOST_CHECK_EQUAL(res.m_state.GetRejectReason(), "modern-txn-in-legacy-era");
 
         CMutableTransaction legacy_tx{legacy_spend_of(coinbase3, /*fee=*/100'000)};
-        const auto ok{chainman.ProcessTransaction(MakeTransactionRef(legacy_tx))};
+        const auto ok{WITH_LOCK(cs_main, return chainman.ProcessTransaction(MakeTransactionRef(legacy_tx)))};
         BOOST_REQUIRE_MESSAGE(ok.m_result_type == MempoolAcceptResult::ResultType::VALID,
                               "legacy mempool admission failed: " << ok.m_state.ToString());
 
@@ -315,7 +315,7 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
             child.vin[0].prevout = COutPoint{CTransaction{legacy_tx}.GetHash(), 0};
             child.vin[0].scriptSig = CScript{};
             child.vout.emplace_back(legacy_tx.vout[0].nValue - 100'000, padded_script);
-            const auto child_ok{chainman.ProcessTransaction(MakeTransactionRef(child))};
+            const auto child_ok{WITH_LOCK(cs_main, return chainman.ProcessTransaction(MakeTransactionRef(child)))};
             BOOST_REQUIRE_MESSAGE(child_ok.m_result_type == MempoolAcceptResult::ResultType::VALID,
                                   "child of unconfirmed legacy parent refused: "
                                       << child_ok.m_state.ToString());
@@ -385,7 +385,7 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
     Txid modern_mempool_txid{};
     {
         CMutableTransaction stale_legacy{legacy_spend_of(coinbase4, /*fee=*/100'000)};
-        const auto res{chainman.ProcessTransaction(MakeTransactionRef(stale_legacy))};
+        const auto res{WITH_LOCK(cs_main, return chainman.ProcessTransaction(MakeTransactionRef(stale_legacy)))};
         BOOST_REQUIRE(res.m_result_type != MempoolAcceptResult::ResultType::VALID);
         BOOST_CHECK_EQUAL(res.m_state.GetRejectReason(), "legacy-txn-in-modern-era");
 
@@ -395,7 +395,7 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
         modern_tx.vin[0].prevout = COutPoint{pre_h_txid, 0};
         modern_tx.vout.emplace_back(legacy::GetProofOfWorkReward(0, 2, consensus) - 100'000,
                                     padded_script);
-        const auto ok{chainman.ProcessTransaction(MakeTransactionRef(modern_tx))};
+        const auto ok{WITH_LOCK(cs_main, return chainman.ProcessTransaction(MakeTransactionRef(modern_tx)))};
         BOOST_REQUIRE_MESSAGE(ok.m_result_type == MempoolAcceptResult::ResultType::VALID,
                               "modern mempool admission failed: " << ok.m_state.ToString());
         modern_mempool_txid = CTransaction{modern_tx}.GetHash();
@@ -1164,7 +1164,7 @@ BOOST_AUTO_TEST_CASE(pinned_boundary_blocks_connect_through_replay)
         const CBlockIndex* pindex{WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(
                                       bad11->GetLegacyB3Hash()))};
         BOOST_REQUIRE(pindex != nullptr);
-        BOOST_CHECK(pindex->nStatus & BLOCK_FAILED_VALID);
+        BOOST_CHECK(WITH_LOCK(cs_main, return static_cast<bool>(pindex->nStatus & BLOCK_FAILED_VALID)));
         BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->nHeight), LIVE_TIP);
     }
 
@@ -1399,7 +1399,7 @@ BOOST_AUTO_TEST_CASE(pinned_admission_stops_re_judging_live_rules)
         BOOST_CHECK(new_block);
         const CBlockIndex* pindex{WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(deep_hash))};
         BOOST_REQUIRE(pindex != nullptr);
-        BOOST_CHECK(pindex->nStatus & BLOCK_ANCHOR_INELIGIBLE);
+        BOOST_CHECK(WITH_LOCK(cs_main, return static_cast<bool>(pindex->nStatus & BLOCK_ANCHOR_INELIGIBLE)));
         BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->GetBlockHash().GetHex()), X.GetHex());
     }
 
@@ -2506,11 +2506,10 @@ BOOST_AUTO_TEST_CASE(full_corridor_end_to_end)
     stake_a.vin[0].scriptSig = CScript{};
     stake_a.vout.emplace_back(stake_total, modern::MakeStakeScript(key_a, owner));
     stake_a.vout.emplace_back(fund_total / 2 - stake_total - 1000, CScript() << OP_TRUE);
-    const Txid stake_a_txid{CTransaction{stake_a}.GetHash()};
     {
         // H+1 through the full production path: mempool admission of the
         // crossing STAKE transaction, template creation, grind, submit.
-        const auto res{chainman.ProcessTransaction(MakeTransactionRef(stake_a))};
+        const auto res{WITH_LOCK(cs_main, return chainman.ProcessTransaction(MakeTransactionRef(stake_a)))};
         BOOST_REQUIRE_MESSAGE(res.m_result_type == MempoolAcceptResult::ResultType::VALID,
                               "stake_a mempool admission failed: " << res.m_state.ToString());
         assemble_and_submit(/*expected_fees=*/1000);

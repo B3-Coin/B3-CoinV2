@@ -66,16 +66,22 @@ BOOST_AUTO_TEST_CASE(no_provisional_parameters_on_shipped_networks)
             BOOST_CHECK_MESSAGE(!consensus.min_stake_amount.has_value(),
                                 "stake minimum set on a non-ratified network");
         }
-        BOOST_CHECK_MESSAGE(!consensus.transition_pow_bits.has_value(),
-                            "provisional corridor difficulty set on a shipped network");
-        // Pin gates (owner, 2026-08-23): the RULED activation parameters
-        // (H = 820,000, canonical corridor bits 0x1f008000) are NOT pinned
-        // on any shipped network until the live-sync fix, the T3/final-H
-        // captures, operational seeds and audited reproducible binaries.
-        BOOST_CHECK_MESSAGE(!consensus.hard_fork_height.has_value(),
-                            "hard_fork_height pinned on a shipped network before the pin gates");
+        // v1 release shape (owner rulings 2026-08-26/27, superseding the
+        // 2026-08-23 pin gates for H): mainnet pins H = 810,000
+        // (hard_fork_height = 810,001, first non-legacy height) and the
+        // canonical corridor bits, while X stays blank -- the OD-10
+        // pause-fail-closed state. Other shipped networks stay unpinned.
+        if (chain == ChainType::MAIN) {
+            BOOST_CHECK_EQUAL(consensus.hard_fork_height.value_or(0), 810'001);
+            BOOST_CHECK_EQUAL(consensus.transition_pow_bits.value_or(0), 0x1f008000U);
+        } else {
+            BOOST_CHECK_MESSAGE(!consensus.transition_pow_bits.has_value(),
+                                "provisional corridor difficulty set on a shipped network");
+            BOOST_CHECK_MESSAGE(!consensus.hard_fork_height.has_value(),
+                                "hard_fork_height pinned on a shipped network before the pin gates");
+        }
         BOOST_CHECK_MESSAGE(!consensus.legacy_final_hash.has_value(),
-                            "legacy_final_hash pinned on a shipped network before the pin gates");
+                            "legacy_final_hash pinned on a shipped network before the X-pin release");
         if (chain == ChainType::MAIN) {
             // RATIFIED 2026-08-21: mainnet corridor reward is exactly 0
             // (fees only), stated explicitly rather than defaulted.

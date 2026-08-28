@@ -1116,12 +1116,18 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
                 }
             }
             if (!std::holds_alternative<CNoDestination>(coin_control.destChange)) {
-                int wver{0};
-                std::vector<unsigned char> wprog;
-                if (GetScriptForDestination(coin_control.destChange).IsWitnessProgram(wver, wprog)) {
-                    return util::Error{_("Refusing a SegWit/Taproot change address: witness "
-                                         "outputs are unprotected (anyone-can-spend) under the "
-                                         "legacy B3 consensus rules.")};
+                // FAIL CLOSED: only a plain P2PKH change destination is
+                // acceptable in the legacy era. A bare witness program is
+                // anyone-can-spend, and a P2SH address is OPAQUE -- it may
+                // wrap a witness script (P2SH-SegWit), which becomes
+                // anyone-can-spend the moment its redeem script is revealed.
+                // Change belongs to this wallet; restricting an explicit
+                // override to the one provably safe type costs nothing.
+                if (!std::holds_alternative<PKHash>(coin_control.destChange)) {
+                    return util::Error{_("Refusing this change address: only a legacy (P2PKH) "
+                                         "change destination is safe under the legacy B3 "
+                                         "consensus rules (witness and P2SH-wrapped outputs "
+                                         "are unprotected).")};
                 }
             }
         }
@@ -1142,7 +1148,15 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     coin_selection_params.tx_noinputs_size = 10 + GetSizeOfCompactSize(vecSend.size()); // bytes for output count
 
     CAmount recipients_sum = 0;
-    const OutputType change_type = wallet.TransactionChangeType(coin_control.m_change_type ? *coin_control.m_change_type : wallet.m_default_change_type, vecSend);
+    OutputType change_type = wallet.TransactionChangeType(coin_control.m_change_type ? *coin_control.m_change_type : wallet.m_default_change_type, vecSend);
+    // B3 legacy era: an EXPLICIT change_type reaches ReserveDestination
+    // without passing the address-handout guard. A witness change output
+    // would be anyone-can-spend under legacy consensus -- refuse it here,
+    // at the last resolution point before reservation.
+    if (txNew.m_legacy_encoding && change_type != OutputType::LEGACY) {
+        return util::Error{_("Refusing a SegWit/Taproot change type: witness outputs are "
+                             "unprotected (anyone-can-spend) under the legacy B3 consensus rules.")};
+    }
     ReserveDestination reservedest(&wallet, change_type);
     unsigned int outputs_to_subtract_fee_from = 0; // The number of outputs which we are subtracting the fee from
     for (const auto& recipient : vecSend) {
@@ -1209,6 +1223,18 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     // Get the fee rate to use effective values in coin selection
     FeeCalculation feeCalc;
     coin_selection_params.m_effective_feerate = GetMinimumFeeRate(wallet, coin_control, &feeCalc);
+    // B3 legacy era: the historical network enforces a FLAT minimum fee of
+    // 0.1 legacy B3 (100,000 base units) per started KB at relay
+    // (master: MIN_RELAY_TX_FEE) -- below it, old peers never relay and
+    // miners never mine. Floor the feerate at 600,000 base/kvB so every
+    // realistic transaction size (>= ~170 vB) clears the flat floor; a
+    // higher user/estimator rate still wins. Live-QA finding 2026-08-27.
+    if (txNew.m_legacy_encoding) {
+        const CFeeRate legacy_floor{600'000};
+        if (coin_selection_params.m_effective_feerate < legacy_floor) {
+            coin_selection_params.m_effective_feerate = legacy_floor;
+        }
+    }
     // Do not, ever, assume that it's fine to change the fee rate if the user has explicitly
     // provided one
     if (coin_control.m_feerate && coin_selection_params.m_effective_feerate > *coin_control.m_feerate) {

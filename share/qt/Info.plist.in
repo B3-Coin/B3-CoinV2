@@ -5,13 +5,8 @@
   <key>LSMinimumSystemVersion</key>
   <string>14</string>
 
-  <key>LSArchitecturePriority</key>
-  <array>
-    <string>x86_64</string>
-  </array>
-
   <key>CFBundleIconFile</key>
-  <string>b3coin.icns</string>
+  <string>b3-hive.icns</string>
 
   <key>CFBundlePackageType</key>
   <string>APPL</string>
@@ -39,11 +34,14 @@
   <key>CFBundleName</key>
   <string>B3 Hive</string>
 
+  <key>CFBundleDisplayName</key>
+  <string>B3 Hive</string>
+
   <key>LSHasLocalizedDisplayName</key>
   <true/>
 
   <key>CFBundleIdentifier</key>
-  <string>co.b3coin.B3CoinCore</string>
+  <string>co.b3coin.B3Hive</string>
 
   <key>CFBundleURLTypes</key>
   <array>

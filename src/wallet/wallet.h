@@ -134,8 +134,11 @@ static const bool DEFAULT_WALLET_RBF = true;
 static const bool DEFAULT_WALLETBROADCAST = true;
 static const bool DEFAULT_DISABLE_WALLET = false;
 static const bool DEFAULT_WALLETCROSSCHAIN = false;
-//! -maxtxfee default
-constexpr CAmount DEFAULT_TRANSACTION_MAXFEE{COIN / 10};
+//! -maxtxfee default: 0.1 B3 in the MODERN display unit (KILO_COIN).
+//! The stock COIN/10 became 0.0001 B3 under the B3 denomination -- exactly
+//! AT the legacy network's relay floor, so every acceptable legacy-era fee
+//! was refused as "too high" (live-QA finding 2026-08-27).
+constexpr CAmount DEFAULT_TRANSACTION_MAXFEE{KILO_COIN / 10};
 //! Discourage users to set fees higher than this amount (in satoshis) per kB
 constexpr CAmount HIGH_TX_FEE_PER_KB{COIN / 100};
 //! -maxtxfee will warn if called with a higher fee than this amount (in satoshis)

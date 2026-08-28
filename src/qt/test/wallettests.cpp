@@ -6,6 +6,7 @@
 #include <qt/test/util.h>
 
 #include <wallet/coincontrol.h>
+#include <consensus/consensus.h>
 #include <interfaces/chain.h>
 #include <interfaces/node.h>
 #include <key_io.h>
@@ -32,6 +33,7 @@
 
 #include <chrono>
 #include <memory>
+#include <utility>
 
 #include <QAbstractButton>
 #include <QAction>
@@ -217,7 +219,10 @@ std::shared_ptr<CWallet> SetupDescriptorsWallet(interfaces::Node& node, TestChai
     Assert(wallet->AddWalletDescriptor(w_desc, provider, "", false));
     const PKHash dest{test.coinbaseKey.GetPubKey()};
     wallet->SetAddressBook(dest, "", wallet::AddressPurpose::RECEIVE);
-    wallet->SetLastBlockProcessed(105, WITH_LOCK(node.context()->chainman->GetMutex(), return node.context()->chainman->ActiveChain().Tip()->GetBlockHash()));
+    const auto tip{WITH_LOCK(node.context()->chainman->GetMutex(), return std::make_pair(
+        node.context()->chainman->ActiveChain().Height(),
+        node.context()->chainman->ActiveChain().Tip()->GetBlockHash()))};
+    wallet->SetLastBlockProcessed(tip.first, tip.second);
     SyncUpWallet(wallet, node);
     wallet->SetBroadcastTransactions(true);
     return wallet;
@@ -282,12 +287,12 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
 
     // Send two transactions, and verify they are added to transaction list.
     TransactionTableModel* transactionTableModel = walletModel.getTransactionTableModel();
-    QCOMPARE(transactionTableModel->rowCount({}), 105);
+    QCOMPARE(transactionTableModel->rowCount({}), COINBASE_MATURITY + 5);
     Txid txid1 = SendCoins(*wallet.get(), sendCoinsDialog, PKHash(), 5 * COIN, /*rbf=*/false);
     Txid txid2 = SendCoins(*wallet.get(), sendCoinsDialog, PKHash(), 10 * COIN, /*rbf=*/true);
     // Transaction table model updates on a QueuedConnection, so process events to ensure it's updated.
     qApp->processEvents();
-    QCOMPARE(transactionTableModel->rowCount({}), 107);
+    QCOMPARE(transactionTableModel->rowCount({}), COINBASE_MATURITY + 7);
     QVERIFY(FindTx(*transactionTableModel, txid1).isValid());
     QVERIFY(FindTx(*transactionTableModel, txid2).isValid());
 

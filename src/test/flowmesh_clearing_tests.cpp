@@ -75,8 +75,6 @@ inline bool Fund(flowmesh::FlowMeshState& state, const flowmesh::AccountId& acco
 BOOST_AUTO_TEST_CASE(curve_validity_bounds_and_monotonicity)
 {
     flowmesh::FlowMeshState st{VAULT, BaseX(), Quote(), /*max_k=*/3};
-    const flowmesh::Ledger& ledger{st.LedgerView()};
-
     // Valid bid (non-increasing, terminates at zero) and ask (non-decreasing).
     BOOST_CHECK(st.CurveIsValid(Side::BID, Pts({{10, 100}, {20, 40}, {30, 0}})));
     BOOST_CHECK(st.CurveIsValid(Side::ASK, Pts({{10, 20}, {20, 80}})));
@@ -214,7 +212,6 @@ BOOST_AUTO_TEST_CASE(clearing_is_order_independent)
 {
     const auto run{[](bool ask_first) {
         flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
-        const flowmesh::Ledger& ledger{st.LedgerView()};
         Fund(st, ALICE, Quote(), 2400);
         Fund(st, BOB, BaseX(), 80);
         if (ask_first) {
@@ -498,7 +495,6 @@ BOOST_AUTO_TEST_CASE(state_root_is_canonically_framed)
     // Pinned empty-book vector (clearing v2 embedding ledger v2).
     {
         flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
-        const flowmesh::Ledger& ledger{st.LedgerView()};
         BOOST_CHECK_EQUAL(st.BookRoot().GetHex(), EMPTY_BOOK_ROOT_HEX);
     }
 

@@ -5,6 +5,7 @@
 
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
+#include <chainparams.h>
 #include <wallet/walletdb.h>
 
 #include <common/system.h>
@@ -1017,6 +1018,11 @@ static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, bool& any_
         key >> hash;
         // LoadToWallet call below creates a new CWalletTx that fill_wtx
         // callback fills with transaction metadata.
+        // Snapshot the value bytes so we can retry with the legacy B3 tx
+        // codec if the modern decode's txid does not match the stored key
+        // (a legacy-era nTime transaction round-trips only through
+        // TX_LEGACY_B3; see wallet/transaction.h).
+        const DataStream value_snapshot{value};
         auto fill_wtx = [&](CWalletTx& wtx, bool new_tx) {
             if(!new_tx) {
                 // There's some corruption here since the tx we just tried to load was already in the wallet.
@@ -1024,7 +1030,28 @@ static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, bool& any_
                 result = DBErrors::CORRUPT;
                 return false;
             }
-            value >> wtx;
+            // First attempt: the modern codec. On a B3 chain, if the txid
+            // does not match the stored key, the record is a legacy-encoded
+            // (nTime) transaction; decode it into THIS wtx from the untouched
+            // snapshot with the legacy codec (see wallet/transaction.h). Both
+            // attempts fill the same wtx object, so no copy/assignment of the
+            // move-only CWalletTx is needed.
+            bool modern_ok{true};
+            try {
+                value >> wtx;
+            } catch (const std::exception&) {
+                modern_ok = false; // legacy bytes misalign the modern codec
+            }
+            if ((!modern_ok || wtx.GetHash() != hash) && Params().GetConsensus().legacy_b3coin) {
+                DataStream retry{value_snapshot};
+                try {
+                    wtx.UnserializeLegacyB3(retry);
+                } catch (const std::exception&) {
+                    return false;
+                }
+            } else if (!modern_ok) {
+                return false;
+            }
             if (wtx.GetHash() != hash)
                 return false;
 

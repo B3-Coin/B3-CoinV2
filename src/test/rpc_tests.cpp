@@ -292,6 +292,12 @@ BOOST_AUTO_TEST_CASE(rpc_parse_monetary_values)
     BOOST_CHECK_THROW(AmountFromValue(ValueFromString("1e+10")), UniValue); //overflow error
     BOOST_CHECK_THROW(AmountFromValue(ValueFromString("1e10")), UniValue); //overflow error signless
     BOOST_CHECK_THROW(AmountFromValue(ValueFromString("93e+8")), UniValue); //overflow error
+
+    // Fee-rate RPCs use the same nine-decimal B3 display denomination.
+    BOOST_CHECK_EQUAL(ParseFeeRate(ValueFromString("0.1")).GetFeePerK(), KILO_COIN / 10);
+    BOOST_CHECK_EQUAL(ParseFeeRate(ValueFromString("0.999999999")).GetFeePerK(), KILO_COIN - 1);
+    BOOST_CHECK_EXCEPTION(ParseFeeRate(ValueFromString("1")), UniValue,
+                          HasJSON(R"({"code":-8,"message":"Fee rates larger than or equal to 1 B3/kvB are not accepted"})"));
 }
 
 BOOST_AUTO_TEST_CASE(rpc_ban)

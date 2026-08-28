@@ -72,8 +72,6 @@ struct SetUnderTest {
         bindings.ConnectBlock(1, ts);
         return *ValidatorSetSnapshot::Build(epoch, w, bindings);
     }
-    //! Index of the key derived from seed i+1 inside the snapshot (members are sorted by validator_key).
-    uint32_t IndexOfSeed(const unsigned i) const { return *snapshot.IndexOf(VK(i + 1)); }
 };
 
 FinalizedBlock Fb(const uint64_t height, const uint64_t epoch, const uint256& successor = SUCCESSOR)

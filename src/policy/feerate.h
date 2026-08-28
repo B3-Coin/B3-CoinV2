@@ -16,12 +16,12 @@
 #include <string>
 #include <type_traits>
 
-const std::string CURRENCY_UNIT = "BTC"; // One formatted unit
-const std::string CURRENCY_ATOM = "sat"; // One indivisible minimum value unit
+const std::string CURRENCY_UNIT = "B3"; // One formatted unit
+const std::string CURRENCY_ATOM = "base unit"; // One indivisible minimum value unit
 
 enum class FeeRateFormat {
-    BTC_KVB, //!< Use BTC/kvB fee rate unit
-    SAT_VB,  //!< Use sat/vB fee rate unit
+    BTC_KVB, //!< Use the B3/kvB fee rate display (name retained for source compatibility)
+    SAT_VB,  //!< Use the base-unit/vB fee rate display (name retained for source compatibility)
 };
 
 /**

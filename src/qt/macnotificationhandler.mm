@@ -13,7 +13,7 @@
 - (NSString *)__bundleIdentifier
 {
     if (self == [NSBundle mainBundle]) {
-        return @"co.b3coin.B3CoinCore";
+        return @"co.b3coin.B3Hive";
     } else {
         return [self __bundleIdentifier];
     }

@@ -16,6 +16,9 @@
 #include <script/sign.h>
 #include <script/signingprovider.h>
 #include <test/util/setup_common.h>
+#include <core_io.h>
+#include <streams.h>
+#include <wallet/transaction.h>
 #include <test/util/transaction_utils.h>
 
 #include <boost/test/unit_test.hpp>
@@ -85,6 +88,97 @@ BOOST_AUTO_TEST_CASE(legacy_encoded_send_signs_and_verifies)
         BOOST_REQUIRE(SignSignature(keystore, prev_tx, modern, 0, SIGHASH_ALL, modern_sigdata));
         BOOST_CHECK(verify(CTransaction{modern}));
     }
+}
+
+BOOST_AUTO_TEST_CASE(legacy_wallet_tx_disk_round_trip)
+{
+    // The QA crash root cause: a wallet stored a legacy-encoded (nTime)
+    // transaction with the modern codec, so on reload the recomputed txid
+    // did not match its key. Prove the CWalletTx codec now round-trips a
+    // legacy transaction through the wallet DB serialization, id-stable.
+    CKey key;
+    key.MakeNewKey(true);
+    const CScript p2pkh{GetScriptForDestination(PKHash{key.GetPubKey()})};
+    CMutableTransaction m;
+    m.m_legacy_encoding = true;
+    m.version = 1;
+    m.nTime = 1'722'222'222;
+    m.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0});
+    m.vout.emplace_back(500'000, p2pkh);
+    CTransactionRef txref{MakeTransactionRef(std::move(m))};
+    BOOST_REQUIRE(txref->IsLegacyEncoded());
+
+    wallet::CWalletTx wtx{txref, wallet::TxStateInactive{}};
+    wtx.nTimeReceived = 1'722'222'333;
+
+    DataStream ss;
+    ss << wtx; // write side selects the legacy codec by provenance
+
+    // Modern read (default) must FAIL to reconstruct the legacy tx -- the
+    // nTime bytes misalign the modern codec (throw) or yield a wrong txid.
+    {
+        DataStream copy{ss};
+        wallet::CWalletTx bad{txref, wallet::TxStateInactive{}};
+        bool reproduced_id{false};
+        try {
+            copy >> bad;
+            reproduced_id = (bad.GetHash() == txref->GetHash());
+        } catch (const std::exception&) {
+            reproduced_id = false;
+        }
+        BOOST_CHECK(!reproduced_id); // the old crash path never reconstructs it
+    }
+    // Legacy read (what ReadKeyValue retries with) recovers the exact tx.
+    {
+        DataStream copy{ss};
+        wallet::CWalletTx good{txref, wallet::TxStateInactive{}};
+        good.UnserializeLegacyB3(copy);
+        BOOST_CHECK(good.tx->IsLegacyEncoded());
+        BOOST_CHECK_EQUAL(good.tx->nTime, txref->nTime);
+        BOOST_CHECK(good.GetHash() == txref->GetHash()); // id-stable round trip
+        BOOST_CHECK_EQUAL(good.nTimeReceived, 1'722'222'333U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(legacy_raw_rpc_round_trip)
+{
+    // The raw-RPC surface for legacy transactions: EncodeHexTx must emit
+    // the historical nTime encoding and DecodeHexTx (with DEFAULT flags,
+    // as sendrawtransaction and both signing RPCs call it) must recover
+    // the identical transaction -- id, provenance, nTime and all.
+    CKey key;
+    key.MakeNewKey(true);
+    const CScript p2pkh{GetScriptForDestination(PKHash{key.GetPubKey()})};
+
+    CMutableTransaction m;
+    m.m_legacy_encoding = true;
+    m.version = 1;
+    m.nTime = 1'711'111'111;
+    m.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 3});
+    m.vin[0].scriptSig = CScript() << std::vector<unsigned char>(71, 0x01)
+                                   << std::vector<unsigned char>(33, 0x02);
+    m.vout.emplace_back(12'345'678, p2pkh);
+    const CTransaction tx{m};
+
+    const std::string hex{EncodeHexTx(tx)};
+    CMutableTransaction decoded;
+    BOOST_REQUIRE(DecodeHexTx(decoded, hex)); // DEFAULT flags: the RPC path
+    const CTransaction round{decoded};
+    BOOST_CHECK(round.IsLegacyEncoded());
+    BOOST_CHECK_EQUAL(round.nTime, tx.nTime);
+    BOOST_CHECK(round.GetHash() == tx.GetHash());
+    BOOST_CHECK_EQUAL(EncodeHexTx(round), hex); // stable round trip
+
+    // A modern transaction still round-trips through the same surface.
+    CMutableTransaction mod;
+    mod.version = 2;
+    mod.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0});
+    mod.vout.emplace_back(1'000, p2pkh);
+    const CTransaction mtx{mod};
+    CMutableTransaction mdecoded;
+    BOOST_REQUIRE(DecodeHexTx(mdecoded, EncodeHexTx(mtx)));
+    BOOST_CHECK(!CTransaction{mdecoded}.IsLegacyEncoded());
+    BOOST_CHECK(CTransaction{mdecoded}.GetHash() == mtx.GetHash());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

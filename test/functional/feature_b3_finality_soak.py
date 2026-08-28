@@ -25,7 +25,11 @@ M = 161
 B3_ARGS = [
     '-b3modernregtest',
     '-b3corridorlength=160',
-    '-fallbackfee=0.0001',
+    '-fallbackfee=0.00001',
+    # The soak deliberately consolidates fragmented corridor rewards. Give
+    # those large synthetic transactions a test-local total-fee ceiling;
+    # production wallet defaults are not under test here.
+    '-maxtxfee=0.001',
     '-addresstype=legacy',
     '-changetype=legacy',
     '-debug=validation',
