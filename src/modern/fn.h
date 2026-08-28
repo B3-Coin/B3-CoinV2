@@ -89,6 +89,63 @@ inline constexpr uint16_t FN_POLICY_VERSION_V1{POLICY_VERSION_V1};
 //! historical FN with headroom for modern issuance.
 inline constexpr uint32_t MAX_FN_EVER_ISSUED{5000};
 
+//! Historical FN rights reserved ahead of all modern creation: the
+//! real-chain -podreport count R. Reserved perpetually — modern issuance
+//! can never consume one of these slots, and historical minting never
+//! advances the modern cost curve.
+inline constexpr uint32_t FN_HISTORICAL_RESERVED{3500};
+
+//! Modern creation slots = everything the historical reservation leaves.
+inline constexpr uint32_t MAX_FN_MODERN_CREATED{MAX_FN_EVER_ISSUED - FN_HISTORICAL_RESERVED};
+static_assert(MAX_FN_MODERN_CREATED == 1500);
+
+/**
+ * RequiredDisintegration — the modern-era FN creation cost curve
+ * (owner ruling 2026-08-28: pinned BEFORE the v1 release; these numbers
+ * are consensus-fixed forever, revisable only by a versioned consensus
+ * upgrade at a defined height, never node-local).
+ *
+ * Input is `modern_creations_ever` — how many modern FN have EVER been
+ * created before this one (NOT the block height, by locked design:
+ * b3-master-handoff.md §4.7 / b3-fn-pod.md §11.1). Nondecreasing;
+ * historical claims do not advance the counter; extinguishment never
+ * rolls it back. Returns the native B3 that the modern PoD must destroy
+ * (in base units, 1 B3 = KILO_COIN), or nullopt once all
+ * MAX_FN_MODERN_CREATED slots are consumed — permanently.
+ *
+ * The schedule mirrors the historical three-tier style but rises with
+ * consumed scarcity instead of falling with height, anchored so that
+ * modern FN #1 costs exactly the CHEAPEST historical tier (15,000 B3 =
+ * the 15M old-B3 collateral of legacy::GetFNCollateral above height
+ * 105,000) — no modern buyer ever pays less than a founder did:
+ *
+ *     slots    1..500   : 15,000 B3 each  ( 7.5M B3 tier total)
+ *     slots  501..1000  : 30,000 B3 each  (15.0M B3 tier total)
+ *     slots 1001..1500  : 60,000 B3 each  (30.0M B3 tier total)
+ *
+ * Full sellout destroys 52.5M B3 — bounded by the low estimate of what
+ * the 3,500 historical PoDs already destroyed (52.5M..87.5M B3): the
+ * modern era can never out-destroy the founders.
+ */
+inline constexpr std::optional<CAmount> RequiredDisintegration(uint32_t modern_creations_ever)
+{
+    if (modern_creations_ever >= MAX_FN_MODERN_CREATED) return std::nullopt;
+    if (modern_creations_ever >= 1000) return 60'000 * KILO_COIN;
+    if (modern_creations_ever >= 500) return 30'000 * KILO_COIN;
+    return 15'000 * KILO_COIN;
+}
+
+// The curve's boundary values are consensus history from the moment v1
+// ships; pin every edge so no refactor can move them silently.
+static_assert(*RequiredDisintegration(0) == 15'000 * KILO_COIN);
+static_assert(*RequiredDisintegration(499) == 15'000 * KILO_COIN);
+static_assert(*RequiredDisintegration(500) == 30'000 * KILO_COIN);
+static_assert(*RequiredDisintegration(999) == 30'000 * KILO_COIN);
+static_assert(*RequiredDisintegration(1000) == 60'000 * KILO_COIN);
+static_assert(*RequiredDisintegration(1499) == 60'000 * KILO_COIN);
+static_assert(!RequiredDisintegration(1500).has_value());
+static_assert(!RequiredDisintegration(UINT32_MAX).has_value());
+
 /**
  * The ONE global FN Coin asset identity (owner ruling 2026-08-18):
  *

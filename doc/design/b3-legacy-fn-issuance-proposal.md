@@ -293,6 +293,33 @@ Measurement first; no guessed constant.
    creatable — minting is exclusively +1 per validated issuance under
    the conservation equation.
 
+5a. **Modern creation cost curve — PINNED (owner ruling 2026-08-28,
+   before the v1 release: "we need solid numbers first and these will
+   be fixed forever"):** `RequiredDisintegration(modern_creations_ever)`
+   is now implemented in `src/modern/fn.h` as pinned consensus
+   constants, closing the "numbers OPEN" item of b3-fn-pod.md §11.1.
+   The 5,000 cap splits as `FN_HISTORICAL_RESERVED = 3,500` (reserved
+   perpetually, free of modern cost, never advancing the curve) plus
+   `MAX_FN_MODERN_CREATED = 1,500` modern slots priced by count:
+
+   | modern slot | cost per FN | tier total |
+   |---|---|---|
+   | 1..500 | 15,000 B3 | 7.5M B3 |
+   | 501..1000 | 30,000 B3 | 15M B3 |
+   | 1001..1500 | 60,000 B3 | 30M B3 |
+   | 1501+ | no slot, forever | — |
+
+   Anchored so modern FN #1 costs exactly the cheapest historical tier
+   (15M old-B3 = 15,000 B3); a full sellout destroys 52.5M B3, bounded
+   by the low estimate of historical destruction (3,500 × 15,000..25,000
+   = 52.5M..87.5M B3). Nondecreasing over the modern-creations-ever
+   counter, integer base-unit arithmetic, exhausted permanently at slot
+   1,500 (extinguishment never reopens a slot). Boundary values are
+   static_assert-pinned in the header and swept by
+   `fn_claim_tests/required_disintegration_curve`. Ships in v1 as a
+   public consensus commitment; the modern-PoD *transaction* validation
+   that charges this price remains future work gated on FN activation.
+
 6. **FN identity — LOCKED and IMPLEMENTED (owner's corrected
    specification, 2026-08-18):** FN Coin is ONE global, chain-scoped,
    fungible-but-indivisible modern colored asset: `decimals = 0`,

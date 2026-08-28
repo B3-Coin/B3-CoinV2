@@ -808,4 +808,26 @@ BOOST_AUTO_TEST_CASE(capacity_arithmetic)
     BOOST_CHECK_GT(WorstCaseFnClaimActionPayload(40), MAX_CREATION_ACTION_PAYLOAD);
 }
 
+//! The pinned modern creation cost curve (owner ruling 2026-08-28):
+//! nondecreasing across every consumed slot, never below the cheapest
+//! historical tier, exhausted permanently at MAX_FN_MODERN_CREATED, and
+//! a full sellout destroys exactly 52.5M B3.
+BOOST_AUTO_TEST_CASE(required_disintegration_curve)
+{
+    constexpr CAmount CHEAPEST_HISTORICAL_TIER{15'000 * KILO_COIN};
+    CAmount previous{0};
+    CAmount total_destroyed{0};
+    for (uint32_t created{0}; created < MAX_FN_MODERN_CREATED; ++created) {
+        const auto cost{RequiredDisintegration(created)};
+        BOOST_REQUIRE(cost.has_value());
+        BOOST_CHECK_GE(*cost, CHEAPEST_HISTORICAL_TIER);
+        BOOST_CHECK_GE(*cost, previous);
+        previous = *cost;
+        total_destroyed += *cost;
+    }
+    BOOST_CHECK_EQUAL(total_destroyed, 52'500'000 * KILO_COIN);
+    BOOST_CHECK(!RequiredDisintegration(MAX_FN_MODERN_CREATED).has_value());
+    BOOST_CHECK(!RequiredDisintegration(MAX_FN_EVER_ISSUED).has_value());
+}
+
 BOOST_AUTO_TEST_SUITE_END()
