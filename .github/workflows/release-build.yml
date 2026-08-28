@@ -170,10 +170,12 @@ jobs:
 
   macos-arm64:
     needs: version
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+      - name: Select supported Xcode
+        run: sudo xcode-select --switch /Applications/Xcode_16.2.app
       - name: Install toolchain
         run: brew install cmake boost libevent sqlite capnp qt@6 qrencode
       - name: Configure + build
