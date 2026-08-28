@@ -202,9 +202,9 @@ inline std::optional<CScript> StakeOwnerScript(const CScript& script)
 /**
  * Modern-era per-transaction STAKE rule: every output claiming the STAKE
  * magic must parse as a valid v1 STAKE output and carry at least the
- * configured minimum principal. While MIN_STAKE_AMOUNT is unconfigured
- * (mainnet: an OPEN economics decision), stake creation FAILS CLOSED,
- * matching the corridor-difficulty policy. Returns false with `error` set
+ * configured minimum principal. While MIN_STAKE_AMOUNT is unconfigured,
+ * stake creation FAILS CLOSED, matching the corridor-difficulty policy
+ * (mainnet states the RATIFIED 333 modern B3; see consensus/params.h). Returns false with `error` set
  * on the first invalid claiming output.
  */
 inline bool CheckStakeOutputs(const CTransaction& tx, const Consensus::Params& params,

@@ -158,8 +158,9 @@ struct Params {
     /**
      * MIN_STAKE_AMOUNT: the smallest principal a v1 STAKE output may carry.
      * Unset means the stake economics are unresolved and stake creation
-     * FAILS CLOSED (mainnet: OPEN decision); regtest fixtures set a small
-     * scaffolding value.
+     * FAILS CLOSED. RATIFIED for mainnet (owner ruling 2026-08-21): 333
+     * modern B3 = 333e9 base units, stated in chainparams and pinned by
+     * modern_pos_tests; regtest fixtures set a small scaffolding value.
      */
     std::optional<int64_t> min_stake_amount;
     /**

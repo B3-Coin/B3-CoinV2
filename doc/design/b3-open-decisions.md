@@ -23,10 +23,15 @@ interval 60 s, round length 30 s, f0 = 1, ×2 relaxation, and the STAKE v1
 carrier are all RATIFIED; the corridor reward is ratified fees-only and
 fail-closed; cutoff C and the readiness gate are ruled out of existence):
 
-- The sentinel-bits and future-drift values stay provisional (spec §9).
-- The modern reward schedule (with OD-2).
-- The corridor difficulty VALUE (policy ruled: low, stall-safety dominant,
-  calibrated to a single CPU core), measured at H/X pinning time.
+- The sentinel-bits and future-drift values stay provisional (spec §9);
+  they carry shipped values (0x207fffff / 120 s) revisable until the
+  X-pin ratification of the whole ModernPosParams block.
+- The modern reward schedule: mechanism RULED 2026-08-26 (halving, OD-2);
+  only the numeric R0 remains, computed from S_H measured at H and
+  pinned in the X-pin release.
+- The corridor difficulty VALUE: PINNED 2026-08-23 — mainnet
+  `transition_pow_bits = 0x1f008000` (policy: low, stall-safety
+  dominant, calibrated to a single CPU core).
 
 Further RATIFIED 2026-08-21: the horizon D = 1440 (one day at the 60 s
 interval) and `min_stake_amount` = 333 modern B3 (kB3; 333e9 base units),
@@ -71,11 +76,15 @@ preserved design number; after H, legacy PoS never resumes. Operator keys,
 snapshots, committees and self-authorizing blocks remain forbidden.
 
 **Mainnet activation stays gated** on the corridor document's remaining
-OPEN list — after the 2026-08-21 rulings that list is: the corridor
-difficulty VALUE (mechanism ruled: fixed constant, no retarget), corridor
-reorg-depth bounds and §7 mitigations, minimum stake amount, and
-X-distribution pause-vs-precommit — plus the horizon D and the remaining
-spec-§9 provisional values. Ruled out of existence on 2026-08-21: cutoff C
+OPEN list — updated 2026-08-29 (the earlier version of this paragraph
+went stale and contradicted the ratifications recorded above): the
+corridor difficulty VALUE is PINNED (0x1f008000, 2026-08-23), the
+minimum stake amount and horizon D are RATIFIED (333 modern B3 / 1440,
+2026-08-21, stated on mainnet and guard-tested), and X-distribution is
+RULED (PAUSE, fail closed, 2026-08-23). Actually still open: the
+corridor reorg-depth bounds and §7 mitigations, the spec-§9 provisional
+values (sentinel bits, future drift — shipped but revisable until the
+X-pin ratification), and the numeric R0 (measured at H). Ruled out of existence on 2026-08-21: cutoff C
 (the 20-block activation depth alone governs), the readiness/minimum-stake
 consensus gate (operational, options A+C), and the corridor
 reward/capture question (ratified 0, fees-only, fail-closed). The earlier
