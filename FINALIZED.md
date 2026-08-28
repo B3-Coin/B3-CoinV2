@@ -63,6 +63,20 @@ doc/design/b3-open-decisions.md.
   generator (node-verified derivation), demo network scripts, v1
   packaging, GitHub Actions release builds (linux gate + windows cross).
 
+## v1.0.0 RELEASE CANDIDATE (2026-08-28)
+Live mainnet QA PASSED: old-client funding received, displayed and
+persisted by Hive; a Hive-built nTime-signed legacy send CONFIRMED in
+legacy block b62539433b… at height 809,011. Four production bugs found
+by QA and fixed with regression tests (wallet legacy-tx persistence, fee
+floor, fallback default, -maxtxfee denomination); legacy-era fee UI
+simplified to a fixed fee by owner ruling (smart fees activate at H).
+External audit closed: Werror-clean build, script_tests regression fixed
+(fully green), true CI hard gate, unsigned Linux/Windows/macOS release
+candidates produced by CI. Remaining before publication: owner signing
+keys + manifest URL (updater ships disabled without them), artifact
+signing/notarization, push + Actions run, operator distribution before
+H = 810,000 (~Sep 1); then the X-pin release.
+
 ## Remaining before the X-pin release (not blockers of THIS ledger state)
 X + S_H at 810,000 (~Sep 1); seeds list; owner release signing keys;
 GitHub Actions first run (linux vectors + windows); operator
