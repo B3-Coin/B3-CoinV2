@@ -101,11 +101,11 @@ def check_manifests(ci_type):
         return
 
     release_dir = Path.cwd() / "build" / "bin" / "Release"
-    manifest_path = release_dir / "bitcoind.manifest"
+    manifest_path = release_dir / "b3coind.manifest"
     cmd_bitcoind_manifest = [
         "mt.exe",
         "-nologo",
-        f"-inputresource:{release_dir / 'bitcoind.exe'}",
+        f"-inputresource:{release_dir / 'b3coind.exe'}",
         f"-out:{manifest_path}",
     ]
     run(cmd_bitcoind_manifest)
@@ -115,7 +115,7 @@ def check_manifests(ci_type):
         "fuzz.exe",
         "bench_bitcoin.exe",
         "test_bitcoin-qt.exe",
-        "bitcoin-chainstate.exe",
+        "b3coin-chainstate.exe",
     }
     for entry in release_dir.iterdir():
         if entry.suffix.lower() != ".exe":
@@ -162,14 +162,14 @@ def run_tests(ci_type):
     if ci_type == "standard":
         os.environ["DIR_UNIT_TEST_DATA"] = str(workspace / "unit_test_data")
         test_envs = {
-            "BITCOIN_BIN": "bitcoin.exe",
-            "BITCOIND": "bitcoind.exe",
-            "BITCOINCLI": "bitcoin-cli.exe",
+            "BITCOIN_BIN": "b3coin.exe",
+            "BITCOIND": "b3coind.exe",
+            "BITCOINCLI": "b3coin-cli.exe",
             "BITCOIN_BENCH": "bench_bitcoin.exe",
-            "BITCOINTX": "bitcoin-tx.exe",
-            "BITCOINUTIL": "bitcoin-util.exe",
-            "BITCOINWALLET": "bitcoin-wallet.exe",
-            "BITCOINCHAINSTATE": "bitcoin-chainstate.exe",
+            "BITCOINTX": "b3coin-tx.exe",
+            "BITCOINUTIL": "b3coin-util.exe",
+            "BITCOINWALLET": "b3coin-wallet.exe",
+            "BITCOINCHAINSTATE": "b3coin-chainstate.exe",
         }
         for var, exe in test_envs.items():
             os.environ[var] = str(release_bin / exe)

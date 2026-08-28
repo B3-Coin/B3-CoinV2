@@ -24,18 +24,18 @@ def run(cmd, **kwargs):
 
 
 def print_version():
-    bitcoind = Path.cwd() / "bin" / "bitcoind.exe"
-    run([str(bitcoind), "-version"])
+    b3coind = Path.cwd() / "bin" / "b3coind.exe"
+    run([str(b3coind), "-version"])
 
 
 def check_manifests():
     release_dir = Path.cwd() / "bin"
-    manifest_path = release_dir / "bitcoind.manifest"
+    manifest_path = release_dir / "b3coind.manifest"
 
     cmd_bitcoind_manifest = [
         "mt.exe",
         "-nologo",
-        f"-inputresource:{release_dir / 'bitcoind.exe'}",
+        f"-inputresource:{release_dir / 'b3coind.exe'}",
         f"-out:{manifest_path}",
     ]
     run(cmd_bitcoind_manifest)
