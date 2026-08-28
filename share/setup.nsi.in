@@ -1,4 +1,5 @@
 Name "B3 Hive"
+OutFile "@abs_top_builddir@/b3coin-win64-setup.exe"
 
 RequestExecutionLevel highest
 SetCompressor /SOLID lzma
