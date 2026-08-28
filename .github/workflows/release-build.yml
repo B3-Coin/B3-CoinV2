@@ -9,6 +9,12 @@ on:
     branches: [ "release/*" ]
     tags: [ "v*" ]
 
+# A release branch is a moving candidate until it passes. Do not spend all
+# hosted runners finishing candidates that a newer push has superseded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   version:
     runs-on: ubuntu-24.04
