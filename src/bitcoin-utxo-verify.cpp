@@ -43,6 +43,7 @@
 #include <util/obfuscation.h>
 #include <util/signalinterrupt.h>
 #include <util/strencodings.h>
+#include <util/translation.h>
 
 #include <array>
 #include <cstdio>
@@ -55,6 +56,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+// Every binary that links node code must supply the translation hook;
+// this operator tool is English-only.
+const TranslateFn G_TRANSLATION_FUN{nullptr};
 
 namespace {
 
