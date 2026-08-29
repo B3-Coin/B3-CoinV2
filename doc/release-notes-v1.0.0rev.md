@@ -11,6 +11,9 @@ from the original release.
   clean one is created instead of preventing the wallet from starting.
 - Correct the Windows File, Settings, Window, and Help popup menus so their
   actions remain visible with the B3 Hive dark theme.
+- Render the connection and synchronization status icons with the B3 theme
+  foreground on Windows instead of leaving their legacy black source pixels
+  invisible against the dark status bar.
 
 ## Important network boundary
 

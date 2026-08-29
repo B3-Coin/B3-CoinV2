@@ -116,6 +116,11 @@ QIcon PlatformStyle::SingleColorIcon(const QIcon& icon) const
     return ColorizeIcon(icon, SingleColor());
 }
 
+QIcon PlatformStyle::TextColorIcon(const QString& filename) const
+{
+    return ColorizeIcon(filename, TextColor());
+}
+
 QIcon PlatformStyle::TextColorIcon(const QIcon& icon) const
 {
     return ColorizeIcon(icon, TextColor());
@@ -134,4 +139,3 @@ const PlatformStyle *PlatformStyle::instantiate(const QString &platformId)
     }
     return nullptr;
 }
-

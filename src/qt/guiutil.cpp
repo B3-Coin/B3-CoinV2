@@ -869,7 +869,12 @@ void ThemedLabel::changeEvent(QEvent* e)
 
 void ThemedLabel::updateThemedPixmap()
 {
-    setPixmap(m_platform_style->SingleColorIcon(m_image_filename).pixmap(m_pixmap_width, m_pixmap_height));
+    // Status icons sit on the B3 dark surface on every platform. Windows
+    // deliberately disables PlatformStyle's general-purpose icon
+    // colorization, so SingleColorIcon() would leave these legacy black PNGs
+    // invisible. Recolor this status-label-only path to the palette text
+    // color explicitly; this keeps unrelated Windows action icons untouched.
+    setPixmap(m_platform_style->TextColorIcon(m_image_filename).pixmap(m_pixmap_width, m_pixmap_height));
 }
 
 ClickableLabel::ClickableLabel(const PlatformStyle* platform_style, QWidget* parent)

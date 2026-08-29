@@ -33,6 +33,9 @@ public:
     /** Colorize an icon (given object) with the icon color */
     QIcon SingleColorIcon(const QIcon& icon) const;
 
+    /** Colorize an icon (given filename) with the text color */
+    QIcon TextColorIcon(const QString& filename) const;
+
     /** Colorize an icon (given object) with the text color */
     QIcon TextColorIcon(const QIcon& icon) const;
 
@@ -46,4 +49,3 @@ private:
 };
 
 #endif // BITCOIN_QT_PLATFORMSTYLE_H
-

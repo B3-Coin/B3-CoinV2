@@ -20,6 +20,7 @@
 #include <qt/b3topstatus.h>
 #include <qt/b3tradepage.h>
 #include <qt/bitcoinunits.h>
+#include <qt/guiutil.h>
 #include <qt/modaloverlay.h>
 #include <qt/platformstyle.h>
 
@@ -30,6 +31,7 @@
 #include <QDir>
 #include <QLabel>
 #include <QPushButton>
+#include <QStringList>
 #include <QTest>
 #include <QToolButton>
 
@@ -114,6 +116,53 @@ void B3HardeningTests::popupMenusHaveExplicitDarkSurface()
     QVERIFY(theme.contains(menu_colors));
     QVERIFY(theme.contains(QStringLiteral("QMenu::item:disabled")));
     QVERIFY(theme.contains(QStringLiteral("QMenu::separator")));
+}
+
+void B3HardeningTests::statusIconsUseThemeForegroundOnWindows()
+{
+    const QPalette saved_palette{qApp->palette()};
+    const QString saved_style{qApp->styleSheet()};
+    B3Theme::apply(*qApp);
+
+    std::unique_ptr<const PlatformStyle> windows_style{PlatformStyle::instantiate("windows")};
+    QVERIFY(windows_style != nullptr);
+    QCOMPARE(windows_style->TextColor(), B3Theme::kTextPrimary);
+
+    QStringList assets{QStringLiteral(":/icons/connect_0"), QStringLiteral(":/icons/connect_1"),
+                       QStringLiteral(":/icons/connect_2"), QStringLiteral(":/icons/connect_3"),
+                       QStringLiteral(":/icons/connect_4"), QStringLiteral(":/icons/network_disabled"),
+                       QStringLiteral(":/icons/synced")};
+    for (int frame = 0; frame < 36; ++frame) {
+        assets.push_back(QStringLiteral(":/animation/spinner-%1").arg(frame, 3, 10, QChar{'0'}));
+    }
+
+    for (const QString& asset : assets) {
+        GUIUtil::ThemedLabel label{windows_style.get()};
+        label.setThemedPixmap(asset, 24, 24);
+        const QImage image{label.pixmap(Qt::ReturnByValue).toImage().convertToFormat(QImage::Format_ARGB32)};
+        QVERIFY2(!image.isNull(), qPrintable(asset));
+
+        QColor strongest_pixel;
+        int strongest_alpha{-1};
+        for (int y = 0; y < image.height(); ++y) {
+            for (int x = 0; x < image.width(); ++x) {
+                const QColor pixel{image.pixelColor(x, y)};
+                if (pixel.alpha() > strongest_alpha) {
+                    strongest_pixel = pixel;
+                    strongest_alpha = pixel.alpha();
+                }
+            }
+        }
+        QVERIFY2(strongest_alpha > 0, qPrintable(asset));
+        // Scaling can leave irrelevant RGB values in nearly transparent edge
+        // pixels. The most opaque glyph pixel must carry the theme foreground.
+        QCOMPARE(strongest_pixel.red(), B3Theme::kTextPrimary.red());
+        QCOMPARE(strongest_pixel.green(), B3Theme::kTextPrimary.green());
+        QCOMPARE(strongest_pixel.blue(), B3Theme::kTextPrimary.blue());
+    }
+
+    qApp->setPalette(saved_palette);
+    qApp->setStyleSheet(saved_style);
 }
 
 void B3HardeningTests::synchronizationOverlayUsesOneDarkTheme()

@@ -15,6 +15,7 @@ private Q_SLOTS:
     void sidebarKeyboardNavigationAndAccessibility();
     void themeContrastIsReadable();
     void popupMenusHaveExplicitDarkSurface();
+    void statusIconsUseThemeForegroundOnWindows();
     void synchronizationOverlayUsesOneDarkTheme();
     void oneHumanFacingB3Unit();
     void topStatusNetworkIdentitiesAreUnmistakable();
