@@ -21,7 +21,7 @@ using util::Join;
  * for both bitcoind and bitcoin-qt, to make it harder for attackers to
  * target servers or GUI users specifically.
  */
-const std::string UA_NAME("B3CoinCore");
+const std::string UA_NAME("B3Hive");
 
 
 #include <bitcoin-build-info.h>
