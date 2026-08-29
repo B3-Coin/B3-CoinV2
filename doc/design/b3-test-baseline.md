@@ -122,7 +122,7 @@ PoS chain.
 | `miner_tests`, `validation_chainstatemanager_tests` | FIXTURE | generic PoW-chain fixtures run on `MAIN`; the miner emits modern-version blocks the legacy path rejects (`bad-version`) | `MAIN` is a legacy PoS chain |
 | `txpackage_tests` | FIXTURE | SEGV inside `TestChain100Setup::CreateValidMempoolTransaction` (lldb: `EXC_BAD_ACCESS` in `COutPoint` ctor) — downstream of the broken 100-block fixture | same broken fixture |
 | `validation_chainstate_tests` | FIXTURE | `CreateAndActivateUTXOSnapshot` fixture fails on `MAIN` | same fixture class |
-| `blockchain_tests`, `descriptor_tests`, `interfaces_tests`, `disconnected_transactions`, `mock_process` | IDENT/FIXTURE | address/amount/chain identity; stock expectations on `MAIN` (not yet individually diagnosed) | stock expectations on `MAIN` |
+| `descriptor_tests`, `interfaces_tests`, `disconnected_transactions`, `mock_process` | IDENT/FIXTURE | address/amount/chain identity; stock expectations on `MAIN` (not yet individually diagnosed) | stock expectations on `MAIN` |
 
 The correct remedy — running the affected stock-vector suites under an
 explicit stock-parameter context, and giving the DENOM rows *era-aware
@@ -136,7 +136,7 @@ and all raw atomic values and consensus serialization untouched.
 > the fixed-seed expectations were brought up to the 33-entry list (the 32
 > historical bootstrap peers plus the owner-supplied release-v1 seed appended
 > in 958eeb3), pinning front, the last historical peer, and the release seed.
-> The canonical known-failure set is therefore the 18 stock IDENT/DENOM/
+> The canonical known-failure set is therefore the 17 stock IDENT/DENOM/
 > FIXTURE suites above.
 
 
@@ -150,3 +150,12 @@ and all raw atomic values and consensus serialization untouched.
 > rows above are resolved (vectors rewritten for the ruled B3 unit); their
 > remaining failures are the IDENT cases only (message_verify,
 > rpc_rawsign).
+
+
+> **2026-08-29 update.** `blockchain_tests/get_prune_height` is resolved.
+> The inherited fixture mines `COINBASE_MATURITY` blocks; B3's historical
+> maturity is 30 instead of Bitcoin's 100, while the test still requested
+> heights 99 and 100. The test now derives its last-pruned boundaries from
+> the fixture tip, preserving the same pruning coverage without changing
+> pruning or consensus behavior. `blockchain_tests` is now a hard release
+> gate, leaving 17 documented stock suites.

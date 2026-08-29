@@ -101,13 +101,19 @@ BOOST_FIXTURE_TEST_CASE(get_prune_height, TestChain100Setup)
     const auto& chain = m_node.chainman->ActiveChain();
     const auto& blockman = m_node.chainman->m_blockman;
 
-    // Fresh chain of 100 blocks without any pruned blocks, so std::nullopt should be returned
+    // TestChain100Setup mines COINBASE_MATURITY blocks. B3's historical
+    // maturity is 30 rather than Bitcoin's 100, so derive the boundary from
+    // the fixture instead of embedding the upstream height.
+    const int tip_height{chain.Height()};
+    BOOST_REQUIRE_GT(tip_height, 1);
+
+    // Fresh fixture chain without any pruned blocks, so std::nullopt should be returned
     BOOST_CHECK(!GetPruneHeight(blockman, chain).has_value());
 
     // Start pruning
     CheckGetPruneHeight(blockman, chain, 1);
-    CheckGetPruneHeight(blockman, chain, 99);
-    CheckGetPruneHeight(blockman, chain, 100);
+    CheckGetPruneHeight(blockman, chain, tip_height - 1);
+    CheckGetPruneHeight(blockman, chain, tip_height);
 }
 
 BOOST_AUTO_TEST_CASE(num_chain_tx_max)

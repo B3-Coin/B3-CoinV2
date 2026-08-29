@@ -76,12 +76,12 @@ jobs:
           # IDENT/DENOM/FIXTURE suites (doc/design/b3-test-baseline.md).
           # A failure in ANY other suite stops the release build.
           cd build && ctest --output-on-failure -j2 \
-            -E "^(validation_tests|compress_tests|util_tests|rpc_tests|key_tests|key_io_tests|bip324_tests|bloom_tests|script_standard_tests|net_peer_connection_tests|miner_tests|validation_chainstatemanager_tests|txpackage_tests|validation_chainstate_tests|blockchain_tests|descriptor_tests|interfaces_tests|disconnected_transactions)$"
+            -E "^(validation_tests|compress_tests|util_tests|rpc_tests|key_tests|key_io_tests|bip324_tests|bloom_tests|script_standard_tests|net_peer_connection_tests|miner_tests|validation_chainstatemanager_tests|txpackage_tests|validation_chainstate_tests|descriptor_tests|interfaces_tests|disconnected_transactions)$"
       - name: Known-stock set (report-only, drift visibility)
         continue-on-error: true
         run: |
           cd build && ctest --output-on-failure -j2 \
-            -R "^(validation_tests|compress_tests|util_tests|rpc_tests|key_tests|key_io_tests|bip324_tests|bloom_tests|script_standard_tests|net_peer_connection_tests|miner_tests|validation_chainstatemanager_tests|txpackage_tests|validation_chainstate_tests|blockchain_tests|descriptor_tests|interfaces_tests|disconnected_transactions)$"
+            -R "^(validation_tests|compress_tests|util_tests|rpc_tests|key_tests|key_io_tests|bip324_tests|bloom_tests|script_standard_tests|net_peer_connection_tests|miner_tests|validation_chainstatemanager_tests|txpackage_tests|validation_chainstate_tests|descriptor_tests|interfaces_tests|disconnected_transactions)$"
       - name: Frozen-vector suites (hard gate)
         run: |
           ./build/bin/test_bitcoin --run_test=finality_types_tests
