@@ -14,6 +14,9 @@ from the original release.
 - Render the connection and synchronization status icons with the B3 theme
   foreground on Windows instead of leaving their legacy black source pixels
   invisible against the dark status bar.
+- Provide a native Intel Mac (`x86_64`) application package alongside the
+  existing Apple Silicon (`arm64`) application package. Both macOS packages
+  require macOS 15 or newer.
 
 ## Important network boundary
 

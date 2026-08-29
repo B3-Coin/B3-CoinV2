@@ -1,5 +1,5 @@
-# B3 Hive unsigned release builds for Linux x86-64, Windows
-# x86-64, and macOS arm64. Runs on demand ("Run workflow" button) and on
+# B3 Hive unsigned release builds for Linux x86-64, Windows x86-64,
+# macOS arm64, and macOS x86-64. Runs on demand ("Run workflow" button) and on
 # matching version tags. Release-branch pushes do not duplicate tag builds.
 name: release-build
 
@@ -150,7 +150,7 @@ jobs:
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=ON \
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)" \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
           cmake --build build -j4 --target deploy b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet test_bitcoin
       - name: Frozen-vector spot gate
         run: |
@@ -160,31 +160,150 @@ jobs:
           ./build/bin/test_bitcoin --run_test=walletdb_tests
       - name: Verify unsigned app bundle
         run: |
+          set -euo pipefail
           unzip -q build/b3coin-macos-app.zip -d build/app-check
-          test "$(plutil -extract CFBundleDisplayName raw 'build/app-check/B3 Hive.app/Contents/Info.plist')" = "B3 Hive"
-          test "$(plutil -extract CFBundleIdentifier raw 'build/app-check/B3 Hive.app/Contents/Info.plist')" = "co.b3coin.B3Hive"
-          file 'build/app-check/B3 Hive.app/Contents/MacOS/b3coin-qt' | grep -q arm64
-          codesign --verify --deep --strict 'build/app-check/B3 Hive.app'
+          app='build/app-check/B3 Hive.app'
+          deployment_target=15.0
+          expected_arch=arm64
+          test "$(plutil -extract CFBundleDisplayName raw "$app/Contents/Info.plist")" = "B3 Hive"
+          test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = "co.b3coin.B3Hive"
+          test "$(plutil -extract LSMinimumSystemVersion raw "$app/Contents/Info.plist")" = "$deployment_target"
+          version_le() {
+            /usr/bin/awk -v actual="$1" -v limit="$2" 'BEGIN {
+              na = split(actual, a, "."); nl = split(limit, l, ".");
+              for (i = 1; i <= 4; ++i) {
+                av = (i <= na ? a[i] + 0 : 0); lv = (i <= nl ? l[i] + 0 : 0);
+                if (av < lv) exit 0;
+                if (av > lv) exit 1;
+              }
+              exit 0;
+            }'
+          }
+          mach_o_count=0
+          while IFS= read -r -d '' candidate; do
+            if [[ "$(file -b "$candidate")" == *Mach-O* ]]; then
+              test "$(lipo -archs "$candidate")" = "$expected_arch"
+              if otool -L "$candidate" | /usr/bin/awk '
+                  NR > 1 && $1 ~ /^\/(opt\/homebrew|usr\/local)\// {found = 1}
+                  END {exit !found}
+                '; then
+                echo "Unbundled Homebrew dependency in $candidate" >&2
+                exit 1
+              fi
+              minos_values=$(otool -l "$candidate" | /usr/bin/awk '
+                $1 == "cmd" {build = ($2 == "LC_BUILD_VERSION"); legacy = ($2 == "LC_VERSION_MIN_MACOSX"); next}
+                build && $1 == "minos" {print $2; build = 0}
+                legacy && $1 == "version" {print $2; legacy = 0}
+              ')
+              test -n "$minos_values"
+              while IFS= read -r minos; do
+                version_le "$minos" "$deployment_target" || {
+                  echo "$candidate requires macOS $minos, newer than $deployment_target" >&2
+                  exit 1
+                }
+              done < <(printf '%s\n' "$minos_values")
+              mach_o_count=$((mach_o_count + 1))
+            fi
+          done < <(find "$app" -type f -print0)
+          test "$mach_o_count" -gt 0
+          codesign --verify --deep --strict "$app"
+          "$app/Contents/MacOS/b3coin-qt" -version >/dev/null
       - name: Package
         run: |
           mkdir -p out
           cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-arm64.zip
-          name=b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-arm64-cli
-          stage=$(mktemp -d)
-          mkdir -p "$stage/$name/bin"
-          cp build/bin/b3coind build/bin/b3coin-cli build/bin/b3coin-tx \
-            build/bin/b3coin-util build/bin/b3coin-wallet "$stage/$name/bin/"
-          cp README.md COPYING "$stage/$name/"
-          tar -C "$stage" -czf "out/$name.tar.gz" "$name"
-          (cd out && shasum -a 256 *.zip *.tar.gz > SHA256SUMS.macos-arm64)
+          (cd out && shasum -a 256 *.zip > SHA256SUMS.macos-arm64)
       - uses: actions/upload-artifact@v4
         with:
           name: b3-hive-macos-arm64
           path: out/
 
+  macos-x86_64:
+    needs: version
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select supported Xcode
+        run: sudo xcode-select --switch /Applications/Xcode_16.4.app
+      - name: Install toolchain
+        run: brew install cmake boost libevent sqlite capnp qt@6 qrencode
+      - name: Configure + build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=ON \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)" \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
+          cmake --build build -j4 --target deploy b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet test_bitcoin
+      - name: Frozen-vector spot gate
+        run: |
+          ./build/bin/test_bitcoin --run_test=finality_types_tests
+          ./build/bin/test_bitcoin --run_test=modern_pos_tests
+          ./build/bin/test_bitcoin --run_test=legacy_wallet_send_tests
+          ./build/bin/test_bitcoin --run_test=walletdb_tests
+      - name: Verify unsigned app bundle
+        run: |
+          set -euo pipefail
+          unzip -q build/b3coin-macos-app.zip -d build/app-check
+          app='build/app-check/B3 Hive.app'
+          deployment_target=15.0
+          expected_arch=x86_64
+          test "$(plutil -extract CFBundleDisplayName raw "$app/Contents/Info.plist")" = "B3 Hive"
+          test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = "co.b3coin.B3Hive"
+          test "$(plutil -extract LSMinimumSystemVersion raw "$app/Contents/Info.plist")" = "$deployment_target"
+          version_le() {
+            /usr/bin/awk -v actual="$1" -v limit="$2" 'BEGIN {
+              na = split(actual, a, "."); nl = split(limit, l, ".");
+              for (i = 1; i <= 4; ++i) {
+                av = (i <= na ? a[i] + 0 : 0); lv = (i <= nl ? l[i] + 0 : 0);
+                if (av < lv) exit 0;
+                if (av > lv) exit 1;
+              }
+              exit 0;
+            }'
+          }
+          mach_o_count=0
+          while IFS= read -r -d '' candidate; do
+            if [[ "$(file -b "$candidate")" == *Mach-O* ]]; then
+              test "$(lipo -archs "$candidate")" = "$expected_arch"
+              if otool -L "$candidate" | /usr/bin/awk '
+                  NR > 1 && $1 ~ /^\/(opt\/homebrew|usr\/local)\// {found = 1}
+                  END {exit !found}
+                '; then
+                echo "Unbundled Homebrew dependency in $candidate" >&2
+                exit 1
+              fi
+              minos_values=$(otool -l "$candidate" | /usr/bin/awk '
+                $1 == "cmd" {build = ($2 == "LC_BUILD_VERSION"); legacy = ($2 == "LC_VERSION_MIN_MACOSX"); next}
+                build && $1 == "minos" {print $2; build = 0}
+                legacy && $1 == "version" {print $2; legacy = 0}
+              ')
+              test -n "$minos_values"
+              while IFS= read -r minos; do
+                version_le "$minos" "$deployment_target" || {
+                  echo "$candidate requires macOS $minos, newer than $deployment_target" >&2
+                  exit 1
+                }
+              done < <(printf '%s\n' "$minos_values")
+              mach_o_count=$((mach_o_count + 1))
+            fi
+          done < <(find "$app" -type f -print0)
+          test "$mach_o_count" -gt 0
+          codesign --verify --deep --strict "$app"
+          "$app/Contents/MacOS/b3coin-qt" -version >/dev/null
+      - name: Package
+        run: |
+          mkdir -p out
+          cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-x86_64.zip
+          (cd out && shasum -a 256 *.zip > SHA256SUMS.macos-x86_64)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: b3-hive-macos-x86_64
+          path: out/
+
   publish:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [version, linux-x86_64, windows-cross, macos-arm64]
+    needs: [version, linux-x86_64, windows-cross, macos-arm64, macos-x86_64]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -202,7 +321,9 @@ jobs:
           sha256sum --check SHA256SUMS.linux
           sha256sum --check SHA256SUMS.win64
           sha256sum --check SHA256SUMS.macos-arm64
+          sha256sum --check SHA256SUMS.macos-x86_64
           cat SHA256SUMS.linux SHA256SUMS.win64 SHA256SUMS.macos-arm64 \
+            SHA256SUMS.macos-x86_64 \
             | sort -k2 > SHA256SUMS
       - name: Publish final GitHub release
         env:
