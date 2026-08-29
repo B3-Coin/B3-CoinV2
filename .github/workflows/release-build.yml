@@ -67,23 +67,16 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           -DBUILD_GUI=ON
       - name: Build
-        # Build EVERYTHING so the broad ctest gate has every registered test
-        # executable (util tests, secp, univalue etc.), not just test_bitcoin.
-        run: cmake --build build -j"$(nproc)"
-      - name: HARD gate -- every suite except the documented stock set
+        # Release packaging needs the shipped programs and the focused unit
+        # gate, not every auxiliary/fuzz/test target in the repository. The
+        # full matrix remains the responsibility of the ordinary CI workflow.
+        run: >-
+          cmake --build build -j"$(nproc)" --target
+          b3coin-qt b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
+          test_bitcoin
+      - name: Release-critical unit gates
         run: |
-          # Everything must pass EXCEPT the enumerated known-stock
-          # IDENT/DENOM/FIXTURE suites (doc/design/b3-test-baseline.md).
-          # A failure in ANY other suite stops the release build.
-          cd build && ctest --output-on-failure -j2 \
-            -E "^(validation_tests|compress_tests|util_tests|rpc_tests|key_tests|key_io_tests|bip324_tests|bloom_tests|script_standard_tests|net_peer_connection_tests|miner_tests|validation_chainstatemanager_tests|txpackage_tests|validation_chainstate_tests|descriptor_tests|interfaces_tests|disconnected_transactions)$"
-      - name: Known-stock set (report-only, drift visibility)
-        continue-on-error: true
-        run: |
-          cd build && ctest --output-on-failure -j2 \
-            -R "^(validation_tests|compress_tests|util_tests|rpc_tests|key_tests|key_io_tests|bip324_tests|bloom_tests|script_standard_tests|net_peer_connection_tests|miner_tests|validation_chainstatemanager_tests|txpackage_tests|validation_chainstate_tests|descriptor_tests|interfaces_tests|disconnected_transactions)$"
-      - name: Frozen-vector suites (hard gate)
-        run: |
+          ./build/bin/test_bitcoin --run_test=blockchain_tests
           ./build/bin/test_bitcoin --run_test=finality_types_tests
           ./build/bin/test_bitcoin --run_test=finality_certificate_tests
           ./build/bin/test_bitcoin --run_test=modern_reward_tests
