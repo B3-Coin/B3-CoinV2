@@ -1,12 +1,11 @@
 # B3 Hive unsigned release-candidate builds for Linux x86-64, Windows
-# x86-64, and macOS arm64. Runs on demand ("Run workflow" button), on
-# pushes to release branches, and on matching version tags.
+# x86-64, and macOS arm64. Runs on demand ("Run workflow" button) and on
+# matching version tags. Release-branch pushes do not duplicate tag builds.
 name: release-build
 
 on:
   workflow_dispatch:
   push:
-    branches: [ "release/*" ]
     tags: [ "v*" ]
 
 # A release branch is a moving candidate until it passes. Do not spend all
