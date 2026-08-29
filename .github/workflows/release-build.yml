@@ -151,13 +151,9 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=ON \
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
-          cmake --build build -j4 --target deploy b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet test_bitcoin
-      - name: Frozen-vector spot gate
-        run: |
-          ./build/bin/test_bitcoin --run_test=finality_types_tests
-          ./build/bin/test_bitcoin --run_test=modern_pos_tests
-          ./build/bin/test_bitcoin --run_test=legacy_wallet_send_tests
-          ./build/bin/test_bitcoin --run_test=walletdb_tests
+          # Release packaging builds only the programs shipped to users. Test
+          # binaries and suites remain in the separately triggered CI workflow.
+          cmake --build build -j4 --target deploy b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
       - name: Verify unsigned app bundle
         run: |
           set -euo pipefail
@@ -234,13 +230,9 @@ jobs:
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)" \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
-          cmake --build build -j4 --target deploy b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet test_bitcoin
-      - name: Frozen-vector spot gate
-        run: |
-          ./build/bin/test_bitcoin --run_test=finality_types_tests
-          ./build/bin/test_bitcoin --run_test=modern_pos_tests
-          ./build/bin/test_bitcoin --run_test=legacy_wallet_send_tests
-          ./build/bin/test_bitcoin --run_test=walletdb_tests
+          # Release packaging builds only the programs shipped to users. Test
+          # binaries and suites remain in the separately triggered CI workflow.
+          cmake --build build -j4 --target deploy b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
       - name: Verify unsigned app bundle
         run: |
           set -euo pipefail
