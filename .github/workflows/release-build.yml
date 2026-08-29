@@ -1,4 +1,4 @@
-# B3 Hive unsigned release-candidate builds for Linux x86-64, Windows
+# B3 Hive unsigned release builds for Linux x86-64, Windows
 # x86-64, and macOS arm64. Runs on demand ("Run workflow" button) and on
 # matching version tags. Release-branch pushes do not duplicate tag builds.
 name: release-build
@@ -8,8 +8,10 @@ on:
   push:
     tags: [ "v*" ]
 
-# A release branch is a moving candidate until it passes. Do not spend all
-# hosted runners finishing candidates that a newer push has superseded.
+permissions:
+  contents: read
+
+# Avoid duplicate work when the same tag build is restarted or superseded.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -114,7 +116,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p out
-          name=b3-hive-v${{ needs.version.outputs.version }}-unsigned-rc-linux-x86_64
+          name=b3-hive-v${{ needs.version.outputs.version }}-unsigned-linux-x86_64
           stage=$(mktemp -d)
           mkdir -p "$stage/$name/bin"
           cp build/bin/b3coin-qt build/bin/b3coind build/bin/b3coin-cli \
@@ -152,8 +154,8 @@ jobs:
         run: |
           mkdir -p out
           cp build/b3coin-win64-setup.exe \
-            out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-rc-win64-setup.exe
-          zip -j out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-rc-win64.zip \
+            out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64-setup.exe
+          zip -j out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64.zip \
             build/release/b3coin-qt.exe build/release/b3coind.exe \
             build/release/b3coin-cli.exe build/release/b3coin-tx.exe \
             build/release/b3coin-util.exe build/release/b3coin-wallet.exe \
@@ -196,8 +198,8 @@ jobs:
       - name: Package
         run: |
           mkdir -p out
-          cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-rc-macos-arm64.zip
-          name=b3-hive-v${{ needs.version.outputs.version }}-unsigned-rc-macos-arm64-cli
+          cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-arm64.zip
+          name=b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-arm64-cli
           stage=$(mktemp -d)
           mkdir -p "$stage/$name/bin"
           cp build/bin/b3coind build/bin/b3coin-cli build/bin/b3coin-tx \
@@ -209,3 +211,70 @@ jobs:
         with:
           name: b3-hive-macos-arm64
           path: out/
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [version, linux-x86_64, windows-cross, macos-arm64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: b3-hive-*
+          merge-multiple: true
+      - name: Verify packaged checksums
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          sha256sum --check SHA256SUMS.linux
+          sha256sum --check SHA256SUMS.win64
+          sha256sum --check SHA256SUMS.macos-arm64
+          cat SHA256SUMS.linux SHA256SUMS.win64 SHA256SUMS.macos-arm64 \
+            | sort -k2 > SHA256SUMS
+      - name: Publish final GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes_file="doc/release-notes-${GITHUB_REF_NAME}.md"
+          test -f "$notes_file"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft --jq .isDraft)
+            asset_count=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets | length')
+            if (( asset_count != 0 )); then
+              echo "Refusing to overwrite a release that already has uploaded assets" >&2
+              exit 1
+            fi
+            # v1.0.0 already exists as the published, assetless release-candidate
+            # page. Permit that one migration; all later published tags are immutable.
+            if [[ "$is_draft" != "true" && "$GITHUB_REF_NAME" != "v1.0.0" ]]; then
+              echo "Refusing to overwrite an existing published release" >&2
+              exit 1
+            fi
+            if [[ "$is_draft" != "true" ]]; then
+              # Hide the assetless candidate while the complete final asset set
+              # uploads. Any failure leaves a draft, never a partial public release.
+              gh release edit "$GITHUB_REF_NAME" \
+                --repo "$GITHUB_REPOSITORY" --verify-tag --draft=true
+            fi
+            gh release upload "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY"
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "B3 Hive $GITHUB_REF_NAME" \
+              --notes-file "$notes_file" \
+              --draft=false --prerelease=false --latest
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "B3 Hive $GITHUB_REF_NAME" \
+              --notes-file "$notes_file" \
+              --latest
+          fi
