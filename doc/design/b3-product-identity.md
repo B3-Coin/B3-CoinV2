@@ -1,4 +1,4 @@
-# B3 product identity — LOCKED (owner ruling 2026-08-25)
+# B3 product identity — LOCKED (owner rulings 2026-08-25 and 2026-08-29)
 
 | Thing | Name |
 |---|---|
@@ -22,8 +22,12 @@ The application may display: `B3 HIVE`, `B3 FLOWMESH CLIENT`.
     messages, `-version` output, copyright line = "The B3 FlowMesh developers").
   - Qt displays `B3 Hive` (`HIVE_NAME` in `src/qt/guiconstants.h`): window
     title, About, tray, splash, overlays, dialogs.
+  - **2026-08-29 owner supersession:** the BIP14 P2P user agent is
+    `/B3Hive:<version>/` (`UA_NAME = B3Hive`), matching the product identity
+    without changing the P2P message format or consensus behavior. External
+    monitoring that filters the old identifier must allow the new one.
 - **Preserved for compatibility (internal, not presented as product):**
   - `b3coin-*` binary names, the `b3coin:` URI scheme, datadir names,
-    `QAPP_*` QSettings keys (`B3Coin`, `B3Coin-Core*`), the P2P user agent
-    (`UA_NAME`), source-file copyright headers, and network magic/ports.
+    `QAPP_*` QSettings keys (`B3Coin`, `B3Coin-Core*`), source-file copyright
+    headers, and network magic/ports.
   - These migrate, if ever, as separate owner-ruled compatibility work.
