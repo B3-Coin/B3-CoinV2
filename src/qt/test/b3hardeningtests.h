@@ -14,6 +14,7 @@ class B3HardeningTests : public QObject
 private Q_SLOTS:
     void sidebarKeyboardNavigationAndAccessibility();
     void themeContrastIsReadable();
+    void popupMenusHaveExplicitDarkSurface();
     void synchronizationOverlayUsesOneDarkTheme();
     void oneHumanFacingB3Unit();
     void topStatusNetworkIdentitiesAreUnmistakable();

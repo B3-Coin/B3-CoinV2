@@ -101,6 +101,21 @@ void B3HardeningTests::themeContrastIsReadable()
     QVERIFY(Contrast(B3Theme::kNegative, B3Theme::kBackground) >= 3.0);
 }
 
+void B3HardeningTests::popupMenusHaveExplicitDarkSurface()
+{
+    // Windows can retain its native light popup background even while the
+    // application palette supplies light text. Keep the popup surface
+    // explicit so actions never become invisible on a white panel.
+    const QString theme{B3Theme::styleSheet()};
+    const QString menu_colors{QStringLiteral("background: %1; color: %2;")
+                                  .arg(B3Theme::kCard.name(QColor::HexRgb),
+                                       B3Theme::kTextPrimary.name(QColor::HexRgb))};
+    QVERIFY(theme.contains(QStringLiteral("QMenu {")));
+    QVERIFY(theme.contains(menu_colors));
+    QVERIFY(theme.contains(QStringLiteral("QMenu::item:disabled")));
+    QVERIFY(theme.contains(QStringLiteral("QMenu::separator")));
+}
+
 void B3HardeningTests::synchronizationOverlayUsesOneDarkTheme()
 {
     const QString theme{B3Theme::styleSheet()};

@@ -144,6 +144,20 @@ QLabel[b3role="balanceUnit"] { color: %TEXT2%; font-size: 15px; font-weight: 600
 
 QToolTip { background: %CARD%; color: %TEXT%; border: %BW%px solid %BORDER%; }
 
+/* Menus need an explicit surface on Windows. Without this, the native light
+   popup background can be combined with the application's light foreground,
+   making every action look like a large blank white panel. */
+QMenu {
+    background: %CARD%; color: %TEXT%;
+    border: %BW%px solid %BORDER%; border-radius: %RSM%px; padding: 5px;
+}
+QMenu::item { background: transparent; padding: 7px 28px 7px 10px; }
+QMenu::item:selected { background: %ACCENTMUTED%; color: %TEXT%; }
+QMenu::item:disabled { color: %MUTED%; }
+QMenu::separator {
+    height: %BW%px; background: %BORDER%; margin: 5px 8px;
+}
+
 /* Buttons */
 QPushButton {
     background: %CARD%; color: %TEXT%;
