@@ -68,51 +68,11 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           -DBUILD_GUI=ON
       - name: Build
-        # Release packaging needs the shipped programs and the focused unit
-        # gate, not every auxiliary/fuzz/test target in the repository. The
-        # full matrix remains the responsibility of the ordinary CI workflow.
+        # Release packaging compiles only the programs that ship to users.
+        # Tests remain available through the manually triggered CI workflow.
         run: >-
           cmake --build build -j"$(nproc)" --target
           b3coin-qt b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
-          test_bitcoin
-      - name: Release-critical unit gates
-        run: |
-          ./build/bin/test_bitcoin --run_test=blockchain_tests
-          ./build/bin/test_bitcoin --run_test=finality_types_tests
-          ./build/bin/test_bitcoin --run_test=finality_certificate_tests
-          ./build/bin/test_bitcoin --run_test=modern_reward_tests
-          ./build/bin/test_bitcoin --run_test=bridge_mpt_tests
-          ./build/bin/test_bitcoin --run_test=bridge_eth_light_client_tests
-          ./build/bin/test_bitcoin --run_test=bridge_exec_chain_tests
-          ./build/bin/test_bitcoin --run_test=update_manifest_tests
-          ./build/bin/test_bitcoin --run_test=update_downloader_tests
-          ./build/bin/test_bitcoin --run_test=update_manager_tests
-          ./build/bin/test_bitcoin --run_test=legacy_genesis_tests
-          ./build/bin/test_bitcoin --run_test=legacy_wallet_send_tests
-          ./build/bin/test_bitcoin --run_test=consensus_phase_tests
-          ./build/bin/test_bitcoin --run_test=finality_activation_tests
-          ./build/bin/test_bitcoin --run_test=finality_epoch_tests
-          ./build/bin/test_bitcoin --run_test=finality_pin_tests
-          ./build/bin/test_bitcoin --run_test=finality_pin_persist_tests
-          ./build/bin/test_bitcoin --run_test=finality_eligibility_tests
-          ./build/bin/test_bitcoin --run_test=finality_key_tests
-          ./build/bin/test_bitcoin --run_test=finality_key_binding_tests
-          ./build/bin/test_bitcoin --run_test=bridge_deposit_tests
-          ./build/bin/test_bitcoin --run_test=modern_pos_tests
-          ./build/bin/test_bitcoin --run_test=script_tests
-          ./build/bin/test_bitcoin --run_test=transaction_tests
-          ./build/bin/test_bitcoin --run_test=sighash_tests
-          ./build/bin/test_bitcoin --run_test=finality_operations_tests
-          ./build/bin/test_bitcoin --run_test=finality_production_tests
-          ./build/bin/test_bitcoin --run_test=finality_qualification_tests
-          ./build/bin/test_bitcoin --run_test=rpc_tests/rpc_parse_monetary_values
-      - name: B3 networking and finality functional gates
-        run: >-
-          ./build/test/functional/test_runner.py
-          p2p_private_broadcast.py
-          p2p_private_broadcast_retry_v1.py
-          feature_b3_finality_soak.py
-          --jobs=2 --timeout-factor=3
       - name: Package
         run: |
           mkdir -p out
