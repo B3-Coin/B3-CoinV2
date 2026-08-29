@@ -41,13 +41,23 @@ jobs:
               exit 1
             }
           done
-          version="$major.$minor.$build"
+          source_version="$major.$minor.$build"
           if (( rc > 0 )); then
-            version="${version}rc${rc}"
+            source_version="${source_version}rc${rc}"
           fi
-          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "Release tag $GITHUB_REF_NAME does not match source version v$version" >&2
-            exit 1
+          version="$source_version"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            if [[ "$GITHUB_REF_NAME" == "v$source_version" ]]; then
+              : # Normal source-version release.
+            elif [[ "$source_version" == "1.0.0" && "$GITHUB_REF_NAME" == "v1.0.0rev" ]]; then
+              # Owner-selected packaging revision: the client/protocol version
+              # remains 1.0.0, while filenames and the release page remain
+              # distinguishable from the original v1.0.0 artifacts.
+              version="1.0.0rev"
+            else
+              echo "Release tag $GITHUB_REF_NAME does not match source version v$source_version" >&2
+              exit 1
+            fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
