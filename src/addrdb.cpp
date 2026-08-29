@@ -219,8 +219,18 @@ util::Result<std::unique_ptr<AddrMan>> LoadAddrman(const NetGroupManager& netgro
         LogWarning("Creating new peers.dat because the file version was not compatible (%s). Original backed up to peers.dat.bak", fs::quoted(fs::PathToString(path_addr)));
         DumpPeerAddresses(args, *addrman);
     } catch (const std::exception& e) {
-        return util::Error{strprintf(_("Invalid or corrupt peers.dat (%s). If you believe this is a bug, please report it to %s. As a workaround, you can move the file (%s) out of the way (rename, move, or delete) to have a new one created on the next start."),
-                                     e.what(), CLIENT_BUGREPORT, fs::quoted(fs::PathToString(path_addr)))};
+        // A peers.dat this code cannot read is expected on this chain: every
+        // operator upgrading in place carries the legacy B3Coin client's
+        // 0.8-era file in the shared datadir. Address gossip is regenerable,
+        // so back the file up and bootstrap fresh instead of refusing to
+        // start.
+        if (!RenameOver(path_addr, (fs::path)path_addr + ".bak")) {
+            return util::Error{strprintf(_("Invalid or corrupt peers.dat (%s), and it could not be renamed aside. Please move or delete the file (%s) and try again."),
+                                         e.what(), fs::quoted(fs::PathToString(path_addr)))};
+        }
+        addrman = std::make_unique<AddrMan>(netgroupman, deterministic, /*consistency_check_ratio=*/check_addrman);
+        LogWarning("Creating new peers.dat because the existing file could not be read (%s: %s) - expected for a legacy B3Coin client datadir. Original backed up to peers.dat.bak", fs::quoted(fs::PathToString(path_addr)), e.what());
+        DumpPeerAddresses(args, *addrman);
     }
     return addrman;
 }
