@@ -22,10 +22,14 @@
 #include <util/time.h>
 #include <util/translation.h>
 #include <wallet/rpc/util.h>
+#include <wallet/legacy_wallet_dump.h>
+#include <wallet/scriptpubkeyman.h>
 #include <wallet/wallet.h>
 
 #include <cstdint>
+#include <algorithm>
 #include <fstream>
+#include <memory>
 #include <tuple>
 #include <string>
 
@@ -463,6 +467,150 @@ RPCHelpMan importdescriptors()
     }
 
     return response;
+},
+    };
+}
+
+RPCHelpMan importlegacywalletdump()
+{
+    return RPCHelpMan{
+        "importlegacywalletdump",
+        "Imports every private key from a human-readable dump created by the legacy B3 dumpwallet RPC.\n"
+        "The complete file is validated before any wallet key is changed. Imported keys are stored as inactive combo descriptors, preserving both legacy P2PKH and bare-P2PK ownership, then the complete blockchain is rescanned.\n"
+        "Use this only as a recovery path into a clean descriptor wallet. Transaction metadata, HD derivation, watch-only scripts, multisig scripts, locked coins, and legacy keypool state are not present in the dump and cannot be restored.\n"
+        "The node must be unpruned, and an encrypted wallet must be unlocked for the duration of the import.\n",
+        {
+            {"filename", RPCArg::Type::STR, RPCArg::Optional::NO, "Server-side path to the dump created by the legacy dumpwallet RPC"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM, "keys_imported", "Number of previously absent private keys imported"},
+                {RPCResult::Type::NUM, "keys_already_present", "Number of private keys already present in this wallet"},
+                {RPCResult::Type::NUM_TIME, "earliest_timestamp", "Earliest key timestamp recorded in the dump"},
+                {RPCResult::Type::BOOL, "rescan_complete", "Whether the full-chain rescan completed"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("importlegacywalletdump", "\"/safe/path/legacy-wallet.dump\"") +
+            HelpExampleRpc("importlegacywalletdump", "\"/safe/path/legacy-wallet.dump\"")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return UniValue::VNULL;
+
+    if (!pwallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Legacy dump recovery requires a descriptor wallet");
+    }
+    if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Cannot import private keys into a wallet with private keys disabled");
+    }
+    if (pwallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Cannot import private keys into an external-signer wallet");
+    }
+    if (pwallet->chain().havePruned()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Legacy dump recovery requires an unpruned node so the complete chain can be rescanned");
+    }
+    if (pwallet->chain().hasAssumedValidChain()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Wait for background chain validation to finish before importing a legacy dump");
+    }
+
+    const fs::path dump_path{fs::PathFromString(request.params[0].get_str())};
+    std::ifstream file{dump_path.std_path()};
+    if (!file.is_open()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot open legacy wallet dump file");
+    }
+    auto parsed{ParseLegacyWalletDump(file)};
+    if (!parsed) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, util::ErrorString(parsed).original);
+    }
+
+    struct PreparedDescriptor {
+        WalletDescriptor descriptor;
+        FlatSigningProvider keys;
+        CKeyID key_id;
+        LegacyWalletDumpRole role;
+        std::optional<std::string> label;
+    };
+    std::vector<PreparedDescriptor> prepared;
+    prepared.reserve(parsed->entries.size());
+    for (const auto& entry : parsed->entries) {
+        const CPubKey pubkey{entry.key.GetPubKey()};
+        const CKeyID key_id{pubkey.GetID()};
+        KeyOriginInfo origin;
+        std::copy_n(key_id.begin(), sizeof(origin.fingerprint), origin.fingerprint);
+        const std::string descriptor_string{
+            "combo([" + HexStr(origin.fingerprint) + "]" + HexStr(pubkey) + ")"};
+        FlatSigningProvider keys;
+        std::string error;
+        auto descriptors{Parse(descriptor_string, keys, error, /*require_checksum=*/false)};
+        if (descriptors.size() != 1) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Could not construct a recovery descriptor");
+        }
+        keys.keys.emplace(key_id, entry.key);
+        keys.origins[key_id] = std::make_pair(pubkey, origin);
+        prepared.push_back({
+            WalletDescriptor{std::move(descriptors.front()), static_cast<uint64_t>(entry.timestamp), 0, 0, 0},
+            std::move(keys),
+            key_id,
+            entry.role,
+            entry.label,
+        });
+    }
+
+    pwallet->BlockUntilSyncedToCurrentChain();
+    WalletRescanReserver reserver(*pwallet);
+    if (!reserver.reserve(/*with_passphrase=*/true)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Wallet is currently rescanning. Abort the existing rescan or wait.");
+    }
+
+    LOCK(pwallet->m_relock_mutex);
+    size_t imported{0};
+    size_t already_present{0};
+    {
+        LOCK(pwallet->cs_wallet);
+        EnsureWalletIsUnlocked(*pwallet);
+
+        for (auto& item : prepared) {
+            const bool had_key{pwallet->GetKey(item.key_id).has_value()};
+            if (auto* existing{pwallet->GetDescriptorScriptPubKeyMan(item.descriptor)}) {
+                LOCK(existing->cs_desc_man);
+                const WalletDescriptor current{existing->GetWalletDescriptor()};
+                item.descriptor.creation_time = std::min(item.descriptor.creation_time, current.creation_time);
+            }
+
+            auto spk_manager{pwallet->AddWalletDescriptor(item.descriptor, item.keys, /*label=*/"", /*internal=*/true)};
+            if (!spk_manager) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Could not store a legacy recovery key: " + util::ErrorString(spk_manager).original);
+            }
+            if (item.role == LegacyWalletDumpRole::LABEL) {
+                if (!pwallet->SetAddressBook(PKHash{item.key_id}, item.label.value_or(""), AddressPurpose::RECEIVE)) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "Could not store a recovered address label");
+                }
+            }
+            had_key ? ++already_present : ++imported;
+        }
+        pwallet->ConnectScriptPubKeyManNotifiers();
+        pwallet->RefreshAllTXOs();
+    }
+
+    constexpr int64_t FULL_CHAIN_TIMESTAMP{1};
+    const int64_t scanned_time{pwallet->RescanFromTime(FULL_CHAIN_TIMESTAMP, reserver, /*update=*/true)};
+    pwallet->ResubmitWalletTransactions(node::TxBroadcast::MEMPOOL_NO_BROADCAST, /*force=*/true);
+    if (pwallet->IsAbortingRescan()) {
+        throw JSONRPCError(RPC_MISC_ERROR, "Legacy keys were imported, but the full-chain rescan was aborted");
+    }
+    if (scanned_time > FULL_CHAIN_TIMESTAMP) {
+        throw JSONRPCError(RPC_MISC_ERROR, "Legacy keys were imported, but the complete blockchain could not be rescanned");
+    }
+
+    UniValue result{UniValue::VOBJ};
+    result.pushKV("keys_imported", imported);
+    result.pushKV("keys_already_present", already_present);
+    result.pushKV("earliest_timestamp", parsed->earliest_timestamp);
+    result.pushKV("rescan_complete", true);
+    return result;
 },
     };
 }

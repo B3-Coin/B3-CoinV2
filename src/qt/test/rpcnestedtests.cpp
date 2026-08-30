@@ -92,6 +92,14 @@ void RPCNestedTests::rpcNestedTests()
     QVERIFY(filtered == "createwalletdescriptor(…)");
     RPCConsole::RPCParseCommandLine(nullptr, result, "migratewallet abc abc", false, &filtered);
     QVERIFY(filtered == "migratewallet(…)");
+    RPCConsole::RPCParseCommandLine(nullptr, result, "getdescriptorinfo combo(secret)", false, &filtered);
+    QVERIFY(filtered == "getdescriptorinfo(…)");
+    RPCConsole::RPCParseCommandLine(nullptr, result, "importdescriptors private", false, &filtered);
+    QVERIFY(filtered == "importdescriptors(…)");
+    RPCConsole::RPCParseCommandLine(nullptr, result, "importfinalitykey secret", false, &filtered);
+    QVERIFY(filtered == "importfinalitykey(…)");
+    RPCConsole::RPCParseCommandLine(nullptr, result, "importlegacywalletdump /secret/path", false, &filtered);
+    QVERIFY(filtered == "importlegacywalletdump(…)");
     RPCConsole::RPCParseCommandLine(nullptr, result, "signmessagewithprivkey abc", false, &filtered);
     QVERIFY(filtered == "signmessagewithprivkey(…)");
     RPCConsole::RPCParseCommandLine(nullptr, result, "signmessagewithprivkey abc,def", false, &filtered);

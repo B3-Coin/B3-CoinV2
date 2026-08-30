@@ -123,6 +123,7 @@ BASE_SCRIPTS = [
     'wallet_bumpfee.py',
     'wallet_v3_txs.py',
     'wallet_backup.py',
+    'wallet_importlegacywalletdump.py',
     'feature_segwit.py --v2transport',
     'feature_segwit.py --v1transport',
     'p2p_tx_download.py',
