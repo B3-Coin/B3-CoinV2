@@ -92,9 +92,15 @@ spacing — but do not aim for the deadline:
 
 ## Checklist
 
-1. **Before block 810,000:** upgrade to B3 Hive v1 (mandatory — old
-   clients will keep building a dead branch past H). Decide how much
-   you will stake; keep it in your wallet, confirmed.
+1. **Before block 810,000:** if you do NOT stake with the old client,
+   upgrade to B3 Hive v1 now. If you DO stake with the old client,
+   **keep it staking until block 810,000 is produced** — B3 Hive
+   validates legacy blocks but cannot produce them
+   (src/node/miner.cpp), so the old clients must carry the chain to
+   the boundary — and upgrade during the pause instead (there will be
+   days). Either way, decide how much you will stake and keep it in
+   your wallet, confirmed. Old clients left running past 810,000 build
+   a dead branch the network ignores; harmless, but pointless.
 2. **At the pause:** wait. Do not panic; the chain stopping AT 810,000
    is the designed behavior, not an outage. Watch the official channels
    for the X-pin release.
