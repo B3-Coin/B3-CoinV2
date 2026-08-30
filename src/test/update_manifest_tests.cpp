@@ -45,7 +45,9 @@ struct Signer {
 std::string Payload(const std::string& channel = "stable", uint64_t sequence = 5,
                     int64_t published = 1'000'000, int64_t expires = 2'000'000,
                     const std::string& version = "31.1.1",
-                    const std::string& url = "https://releases.b3flowmesh.example/hive.dmg")
+                    const std::string& url = "https://releases.b3flowmesh.example/hive.dmg",
+                    const std::string& os = "macos", const std::string& arch = "arm64",
+                    const std::string& format = "dmg")
 {
     return std::string{MANIFEST_MAGIC} + "\n" +
            "channel=" + channel + "\n" +
@@ -53,9 +55,9 @@ std::string Payload(const std::string& channel = "stable", uint64_t sequence = 5
            "published=" + std::to_string(published) + "\n" +
            "expires=" + std::to_string(expires) + "\n" +
            "notes_sha256=" + std::string(64, 'a') + "\n" +
-           "artifact.os=macos\n"
-           "artifact.arch=arm64\n"
-           "artifact.format=dmg\n"
+           "artifact.os=" + os + "\n" +
+           "artifact.arch=" + arch + "\n" +
+           "artifact.format=" + format + "\n" +
            "artifact.version=" + version + "\n" +
            "artifact.size=1000\n"
            "artifact.sha256=" + std::string(64, 'b') + "\n" +
@@ -98,6 +100,36 @@ BOOST_AUTO_TEST_CASE(valid_newer_release_accepted)
     BOOST_REQUIRE_MESSAGE(a, err);
     BOOST_CHECK_EQUAL(a->version.ToString(), "31.1.1");
     BOOST_CHECK_EQUAL(a->size, 1000U);
+}
+
+BOOST_AUTO_TEST_CASE(windows_x86_artifact_is_signed_parsed_and_selected_exactly)
+{
+    Signer s1, s2;
+    const ReleaseKeys keys{{s1.pub, s2.pub}, 2};
+    const std::string payload{Payload(
+        "stable", 5, 1'000'000, 2'000'000, "31.1.1",
+        "https://releases.b3flowmesh.example/b3-hive-win32-setup.exe",
+        "windows", "x86", "exe")};
+    std::string err;
+    const auto manifest{ParseAndVerifyManifest(File(payload, {&s1, &s2}), keys, err)};
+    BOOST_REQUIRE_MESSAGE(manifest, err);
+
+    HostPolicy host;
+    host.os = "windows";
+    host.arch = "x86";
+    host.format = "exe";
+    host.installed = *ParseVersion("31.1.0");
+    host.last_accepted_sequence = 4;
+    host.now = 1'500'000;
+    host.allowed_hosts = {"releases.b3flowmesh.example"};
+    const Artifact* artifact{SelectArtifact(*manifest, host, err)};
+    BOOST_REQUIRE_MESSAGE(artifact, err);
+    BOOST_CHECK_EQUAL(artifact->arch, "x86");
+    BOOST_CHECK_EQUAL(artifact->format, "exe");
+
+    host.arch = "x86_64";
+    BOOST_CHECK(!SelectArtifact(*manifest, host, err));
+    BOOST_CHECK_EQUAL(err, "update-reject-platform");
 }
 
 BOOST_AUTO_TEST_CASE(unconfigured_fails_closed)

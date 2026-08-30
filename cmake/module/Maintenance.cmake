@@ -31,9 +31,9 @@ function(add_windows_deploy_target)
     # TODO: Consider replacing this code with the CPack NSIS Generator.
     #       See https://cmake.org/cmake/help/latest/cpack_gen/nsis.html
     include(GenerateSetupNsi)
-    generate_setup_nsi()
+    generate_setup_nsi(windows_setup_exe)
     add_custom_command(
-      OUTPUT ${PROJECT_BINARY_DIR}/b3coin-win64-setup.exe
+      OUTPUT ${windows_setup_exe}
       COMMAND ${CMAKE_COMMAND} -E make_directory ${PROJECT_BINARY_DIR}/release
       COMMAND ${CMAKE_STRIP} $<TARGET_FILE:b3coin-qt> -o ${PROJECT_BINARY_DIR}/release/$<TARGET_FILE_NAME:b3coin-qt>
       COMMAND ${CMAKE_STRIP} $<TARGET_FILE:b3coind> -o ${PROJECT_BINARY_DIR}/release/$<TARGET_FILE_NAME:b3coind>
@@ -41,10 +41,10 @@ function(add_windows_deploy_target)
       COMMAND ${CMAKE_STRIP} $<TARGET_FILE:b3coin-tx> -o ${PROJECT_BINARY_DIR}/release/$<TARGET_FILE_NAME:b3coin-tx>
       COMMAND ${CMAKE_STRIP} $<TARGET_FILE:b3coin-wallet> -o ${PROJECT_BINARY_DIR}/release/$<TARGET_FILE_NAME:b3coin-wallet>
       COMMAND ${CMAKE_STRIP} $<TARGET_FILE:b3coin-util> -o ${PROJECT_BINARY_DIR}/release/$<TARGET_FILE_NAME:b3coin-util>
-      COMMAND ${MAKENSIS_EXECUTABLE} -V2 ${PROJECT_BINARY_DIR}/b3coin-win64-setup.nsi
+      COMMAND ${MAKENSIS_EXECUTABLE} -V2 ${PROJECT_BINARY_DIR}/b3coin-${WINDOWS_ARCH_TAG}-setup.nsi
       VERBATIM
     )
-    add_custom_target(deploy DEPENDS ${PROJECT_BINARY_DIR}/b3coin-win64-setup.exe)
+    add_custom_target(deploy DEPENDS ${windows_setup_exe})
   endif()
 endfunction()
 

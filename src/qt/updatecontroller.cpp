@@ -221,6 +221,8 @@ update::UpdateConfig BuildConfig()
 #endif
 #if defined(__aarch64__) || defined(_M_ARM64)
     c.arch = "arm64";
+#elif defined(__i386__) || defined(_M_IX86)
+    c.arch = "x86";
 #else
     c.arch = "x86_64";
 #endif

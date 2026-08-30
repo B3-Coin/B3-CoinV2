@@ -1,5 +1,7 @@
 Name "B3 Hive"
-OutFile "@abs_top_builddir@/b3coin-win64-setup.exe"
+OutFile "@abs_top_builddir@/@WINDOWS_SETUP_BASENAME@.exe"
+
+@NSIS_ARCH_DEFINE@
 
 RequestExecutionLevel highest
 SetCompressor /SOLID lzma
@@ -50,7 +52,11 @@ Var StartMenuGroup
 !insertmacro MUI_LANGUAGE English
 
 # Installer attributes
+!ifdef B3_INSTALL_WIN64
 InstallDir "$PROGRAMFILES64\B3 Hive"
+!else
+InstallDir "$PROGRAMFILES32\B3 Hive"
+!endif
 CRCCheck force
 XPStyle on
 BrandingText " "
@@ -182,6 +188,7 @@ SectionEnd
 # Installer functions
 Function .onInit
     InitPluginsDir
+!ifdef B3_INSTALL_WIN64
     ${If} ${RunningX64}
       ; disable registry redirection (enable access to 64-bit portion of registry)
       SetRegView 64
@@ -189,10 +196,19 @@ Function .onInit
       MessageBox MB_OK|MB_ICONSTOP "Cannot install 64-bit version on a 32-bit system."
       Abort
     ${EndIf}
+!else
+    ; Keep the 32-bit installer in the 32-bit registry view on all systems.
+    SetRegView 32
+!endif
 FunctionEnd
 
 # Uninstaller functions
 Function un.onInit
+!ifdef B3_INSTALL_WIN64
+    SetRegView 64
+!else
+    SetRegView 32
+!endif
     ReadRegStr $INSTDIR HKCU "${REGKEY}" Path
     !insertmacro MUI_STARTMENU_GETFOLDER Application $StartMenuGroup
     !insertmacro SELECT_UNSECTION Main ${UNSEC0000}

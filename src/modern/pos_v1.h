@@ -15,6 +15,7 @@
 #include <pubkey.h>
 #include <script/script.h>
 #include <uint256.h>
+#include <util/int128.h>
 
 #include <array>
 #include <cstdint>
@@ -109,7 +110,7 @@ inline bool ModernPosEligible(const uint256& digest, const CAmount w, const CAmo
                               const int64_t round, const Consensus::ModernPosParams& pos)
 {
     if (w <= 0 || W <= 0 || w > W || round < 0) return false;
-    using u128 = unsigned __int128;
+    using u128 = util::Unsigned128;
     const u128 num{static_cast<u128>(w) * pos.f0_num};
     const u128 den{static_cast<u128>(W) * pos.f0_den};
     if (num == 0 || den == 0) return false;

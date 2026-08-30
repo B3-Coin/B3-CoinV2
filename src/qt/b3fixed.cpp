@@ -4,6 +4,8 @@
 
 #include <qt/b3fixed.h>
 
+#include <util/int128.h>
+
 #include <QChar>
 
 namespace B3Fixed {
@@ -29,10 +31,11 @@ QString format(int64_t amount, int decimals)
 
 std::optional<int64_t> mulScaled(int64_t a, int64_t b, int b_decimals)
 {
-    __int128 scale = 1;
+    util::Signed128 scale = 1;
     for (int i = 0; i < b_decimals; ++i) scale *= 10;
     if (scale == 0) return std::nullopt;
-    const __int128 product = static_cast<__int128>(a) * static_cast<__int128>(b) / scale;
+    const util::Signed128 product = static_cast<util::Signed128>(a) *
+                                    static_cast<util::Signed128>(b) / scale;
     if (product > INT64_MAX || product < INT64_MIN) return std::nullopt;
     return static_cast<int64_t>(product);
 }

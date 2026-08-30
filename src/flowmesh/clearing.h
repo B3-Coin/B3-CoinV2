@@ -10,6 +10,7 @@
 #include <hash.h>
 #include <modern/policy.h>
 #include <uint256.h>
+#include <util/int128.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -233,21 +234,22 @@ private:
         // is bounded by the reserved supply side (<= per-asset custody
         // <= MAX_MONEY); a violation of that bound is a fatal internal
         // inconsistency, not a clamp.
-        __int128 best_imbalance{0};
+        util::Signed128 best_imbalance{0};
         for (const CAmount p : candidates) {
-            const __int128 demand{SideTotal128(Side::BID, p)};
-            const __int128 supply{SideTotal128(Side::ASK, p)};
-            const __int128 volume{demand < supply ? demand : supply};
+            const util::Signed128 demand{SideTotal128(Side::BID, p)};
+            const util::Signed128 supply{SideTotal128(Side::ASK, p)};
+            const util::Signed128 volume{demand < supply ? demand : supply};
             if (volume <= 0) continue;
-            const __int128 imbalance{demand > supply ? demand - supply : supply - demand};
-            if (!result.cleared || volume > static_cast<__int128>(result.volume) ||
-                (volume == static_cast<__int128>(result.volume) &&
+            const util::Signed128 imbalance{
+                demand > supply ? demand - supply : supply - demand};
+            if (!result.cleared || volume > static_cast<util::Signed128>(result.volume) ||
+                (volume == static_cast<util::Signed128>(result.volume) &&
                  imbalance < best_imbalance)) {
-                if (volume > static_cast<__int128>(MAX_MONEY)) return std::nullopt; // fatal
+                if (volume > static_cast<util::Signed128>(MAX_MONEY)) return std::nullopt; // fatal
                 result.cleared = true;
                 result.price = p;
                 result.volume = static_cast<CAmount>(volume);
-                result.imbalance = imbalance > static_cast<__int128>(MAX_MONEY)
+                result.imbalance = imbalance > static_cast<util::Signed128>(MAX_MONEY)
                                        ? MAX_MONEY
                                        : static_cast<CAmount>(imbalance); // tie-break only
                 best_imbalance = imbalance;
@@ -438,9 +440,9 @@ private:
         // points with a pre-allocation bound against m_max_k.
     };
 
-    static CAmount FloorDiv128(const __int128 a, const __int128 b) // b > 0
+    static CAmount FloorDiv128(const util::Signed128 a, const util::Signed128 b) // b > 0
     {
-        __int128 q{a / b};
+        util::Signed128 q{a / b};
         if (a % b != 0 && a < 0) --q;
         // Callers only pass interpolants whose result lies between two
         // validated quantities, so the cast is in range.
@@ -452,9 +454,9 @@ private:
     static std::optional<CAmount> Quote(const CAmount qty, const CAmount price)
     {
         if (qty < 0 || price < 0) return std::nullopt;
-        const unsigned __int128 product{static_cast<unsigned __int128>(qty) *
-                                        static_cast<unsigned __int128>(price)};
-        if (product > static_cast<unsigned __int128>(MAX_MONEY)) return std::nullopt;
+        const util::Unsigned128 product{static_cast<util::Unsigned128>(qty) *
+                                        static_cast<util::Unsigned128>(price)};
+        if (product > static_cast<util::Unsigned128>(MAX_MONEY)) return std::nullopt;
         return static_cast<CAmount>(product);
     }
 
@@ -482,10 +484,13 @@ private:
                 if (b.price <= a.price) return a.qty; // garbage guard (see above)
                 // Floor of the exact linear interpolant keeps
                 // monotonicity; exact in 128-bit throughout.
-                const __int128 num{(static_cast<__int128>(b.qty) - static_cast<__int128>(a.qty)) *
-                                   (static_cast<__int128>(price) - static_cast<__int128>(a.price))};
-                const __int128 den{static_cast<__int128>(b.price) -
-                                   static_cast<__int128>(a.price)};
+                const util::Signed128 num{
+                    (static_cast<util::Signed128>(b.qty) -
+                     static_cast<util::Signed128>(a.qty)) *
+                    (static_cast<util::Signed128>(price) -
+                     static_cast<util::Signed128>(a.price))};
+                const util::Signed128 den{static_cast<util::Signed128>(b.price) -
+                                          static_cast<util::Signed128>(a.price)};
                 return a.qty + FloorDiv128(num, den);
             }
         }
@@ -505,16 +510,16 @@ private:
                                                     const CAmount filled)
     {
         if (filled < 0) return std::nullopt;
-        __int128 spend{0};
+        util::Signed128 spend{0};
         CAmount remaining{filled};
         for (size_t i{points.size()}; i-- > 1 && remaining > 0;) {
             const CAmount width{points[i - 1].qty - points[i].qty};
             const CAmount take{std::min(remaining, width)};
-            spend += static_cast<__int128>(take) * (points[i].price - 1);
+            spend += static_cast<util::Signed128>(take) * (points[i].price - 1);
             remaining -= take;
         }
         if (remaining > 0) return std::nullopt; // filled exceeds the curve: impossible
-        if (spend > static_cast<__int128>(MAX_MONEY)) return MAX_MONEY;
+        if (spend > static_cast<util::Signed128>(MAX_MONEY)) return MAX_MONEY;
         return static_cast<CAmount>(spend);
     }
 
@@ -571,13 +576,13 @@ private:
     //! Exact widened side total: never saturates (curve count and
     //! per-curve quantities are bounded, so the 128-bit sum cannot
     //! overflow).
-    __int128 SideTotal128(Side side, const CAmount price) const
+    util::Signed128 SideTotal128(Side side, const CAmount price) const
     {
-        __int128 total{0};
+        util::Signed128 total{0};
         for (const auto& [key, curve] : m_curves) {
             if (key.first != side) continue;
             const CAmount q{std::max<CAmount>(0, EvalCurve(curve.points, price) - curve.filled)};
-            total += static_cast<__int128>(q);
+            total += static_cast<util::Signed128>(q);
         }
         return total;
     }
@@ -587,28 +592,28 @@ private:
     std::map<AccountId, CAmount> Allocate(Side side, const CAmount price, const CAmount volume)
     {
         std::map<AccountId, CAmount> desired;
-        unsigned __int128 total{0}; // exact: an intermediate sum may exceed MAX_MONEY
+        util::Unsigned128 total{0}; // exact: an intermediate sum may exceed MAX_MONEY
         for (const auto& [key, curve] : m_curves) {
             if (key.first != side) continue;
             const CAmount q{std::max<CAmount>(0, EvalCurve(curve.points, price) - curve.filled)};
             if (q > 0) {
                 desired[key.second] = q;
-                total += static_cast<unsigned __int128>(q);
+                total += static_cast<util::Unsigned128>(q);
             }
         }
         std::map<AccountId, CAmount> alloc;
-        if (total <= static_cast<unsigned __int128>(volume)) { // short side: fully filled
+        if (total <= static_cast<util::Unsigned128>(volume)) { // short side: fully filled
             return desired;
         }
         // Long side: largest-remainder rationing in account order, with
         // every product/total widened — an aggregate overflow can never
         // hand back an un-rationed map.
-        struct Rem { AccountId account; unsigned __int128 rem; };
+        struct Rem { AccountId account; util::Unsigned128 rem; };
         std::vector<Rem> remainders;
         CAmount handed{0};
         for (const auto& [account, q] : desired) {
-            const unsigned __int128 num{static_cast<unsigned __int128>(q) *
-                                        static_cast<unsigned __int128>(volume)};
+            const util::Unsigned128 num{static_cast<util::Unsigned128>(q) *
+                                        static_cast<util::Unsigned128>(volume)};
             const CAmount base{static_cast<CAmount>(num / total)};
             alloc[account] = base;
             handed += base;
@@ -643,17 +648,17 @@ private:
         // violation is a fatal execution failure — never settle a
         // mis-rationed allocation.
         {
-            unsigned __int128 bid_sum{0}, ask_sum{0};
+            util::Unsigned128 bid_sum{0}, ask_sum{0};
             for (const auto& [account, fill] : result.bid_fill) {
                 if (fill < 0) return false;
-                bid_sum += static_cast<unsigned __int128>(fill);
+                bid_sum += static_cast<util::Unsigned128>(fill);
             }
             for (const auto& [account, fill] : result.ask_fill) {
                 if (fill < 0) return false;
-                ask_sum += static_cast<unsigned __int128>(fill);
+                ask_sum += static_cast<util::Unsigned128>(fill);
             }
-            if (bid_sum != static_cast<unsigned __int128>(result.volume) ||
-                ask_sum != static_cast<unsigned __int128>(result.volume)) {
+            if (bid_sum != static_cast<util::Unsigned128>(result.volume) ||
+                ask_sum != static_cast<util::Unsigned128>(result.volume)) {
                 return false;
             }
         }
