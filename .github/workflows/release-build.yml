@@ -442,10 +442,18 @@ jobs:
               --notes-file "$notes_file" \
               --draft=false --prerelease=false --latest
           else
-            gh release create "$GITHUB_REF_NAME" release-assets/* \
+            # Keep a new release private until every asset is present. A
+            # cancelled upload must never expose a partial public release.
+            gh release create "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --title "B3 Hive $GITHUB_REF_NAME" \
               --notes-file "$notes_file" \
-              --latest
+              --draft
+            gh release upload "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY"
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft=false --prerelease=false --latest
           fi
