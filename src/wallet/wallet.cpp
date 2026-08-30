@@ -4256,8 +4256,15 @@ util::Result<void> CWallet::ApplyMigrationData(WalletBatch& local_wallet_batch, 
             }
         }
         if (!is_mine) {
-            // Both not ours and not in the watchonly wallet
-            return util::Error{strprintf(_("Error: Transaction %s in wallet cannot be identified to belong to migrated wallets"), wtx->GetHash().GetHex())};
+            // Both not ours and not in the watchonly wallet. Upstream aborts
+            // the whole migration here; a 2017-era B3 wallet.dat routinely
+            // carries stray transaction records no migrated key claims
+            // (removed keys, old FN tooling, bit rot), and one such record
+            // must not strand the wallet on an unmigratable file. The record
+            // is history, not funds - keys decide funds - so drop it LOUDLY
+            // and let the migration finish.
+            LogWarning("Migration: dropping transaction %s - no migrated wallet claims it", wtx->GetHash().GetHex());
+            txids_to_delete.push_back(wtx->GetHash());
         }
     }
 
