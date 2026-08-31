@@ -127,15 +127,17 @@ Copy the synced real-chain datadir; run 2–3 clients under a dev flag
 that swaps network magic + port (physically cannot reach production),
 localhost-only, with overridable H just above the copied tip and
 trivial difficulty. Rehearse on real history: seal → corridor mining →
-modern era → asset activation at its height → FN Genesis at A1.
-Mandatory before the transition release ships.
+modern era → asset activation at its height → FN Genesis in the
+810,001 coinbase → transfer unlock. Mandatory before the transition
+release ships.
 
 ## 8. Open items (small, non-blocking)
 
 - Height spacing (proposal: FN transfer unlock ~2 weeks after M,
   assets ~2 weeks; owner blesses the numbers when the code is ready;
   FN Genesis itself is fixed at 810,001).
-- A1 block-size handling: one block vs deterministic spread.
+- 810,001 block-size handling: one coinbase vs deterministic spread
+  over the first corridor blocks.
 - Canonical serialization of the rights-list entries (fixed before the
   dry run so the root is stable).
 - Community messaging update: the pause runs weeks, not days.
