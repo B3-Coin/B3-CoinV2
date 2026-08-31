@@ -1,5 +1,21 @@
 # B3Coin Core — Repository Context
 
+## Branch and scope lock (owner ruling 2026-08-31)
+
+- The only authorized Claude workspace is
+  `/Users/josh/development/ON/B3-FlowMesh`, checked out on branch
+  **`FlowMesh`**. Before any write or commit, verify both the canonical
+  repository root and current branch. If either differs, stop and report it.
+- Do not create, enter, or use another Git worktree or development branch.
+  Never modify `release/v1.0.0final` from this workspace.
+- This branch is for completing and testing FlowMesh in isolated development
+  and regtest environments. Do not activate FlowMesh on mainnet, change H/X or
+  Modern PoS transition parameters, alter release versioning/updater behavior,
+  or publish anything without a later explicit owner instruction.
+- The regtest-only `-b3flowmeshdev` validator spike is an integration starting
+  point, not production activation. Keep production paths fail-closed while
+  implementing small, reviewed, test-backed increments.
+
 B3Coin is **one continuous blockchain**. This tree is a Bitcoin Core 31.1 fork that
 carries the original B3 chain through a two-era design: a **legacy era** (the existing
 B3Coin PoS chain, preserved exactly) and a **modern era** (clean Core-31.1-style
@@ -61,11 +77,11 @@ authority merely by declaring precedence. The persistent order is:
 1. **Do not silently alter the locked architecture to solve an implementation problem.**
    If code contradicts the contract, **report the contradiction** — do not choose a new
    protocol.
-2. **Sequencing (do not skip):** reach a clean, produced-and-validated **H+1** before
-   wiring any of FlowMesh, FN, bridges, or advanced/coloured assets into consensus.
-   Those are Phase-3 features gated behind later activation heights (A1/A2/A3).
-3. **Modern PoS:** not implemented until its consensus spec is supplied
-   (see open-decisions). It currently fails closed by design.
+2. **FlowMesh scope:** implementation and isolated regtest wiring may proceed on
+   this branch, but mainnet consensus/network activation remains forbidden until
+   the transition is complete and its later activation rules are owner-approved.
+3. **Transition isolation:** Modern PoS and its mainnet boundary parameters are
+   outside this branch's scope. Preserve their current fail-closed release state.
 4. **Genesis is permanent.** Never regenerate it, change its bytes/nonce/bits/time/merkle/
    hash, apply the modern marker to it, or reinterpret historical blocks with the modern
    codec. If a task appears to require any of these, stop and report.
@@ -74,12 +90,12 @@ authority merely by declaring precedence. The persistent order is:
 
 ## Git rules
 
-- Work on branch **`test/b3-clean-architecture`** (renamed from `claude/b3-clean-architecture`
-  on 2026-08-23 at the owner's request; branched from `a8ad010`, the tip of
-  the completed experimental stack — **not** from the older `claude/b3-full-architecture`
-  checkout, which carries defects fixed later).
-- Do not push, amend, squash, reset, rebase, or rewrite history. Do not modify previous
-  commits.
+- Work only on branch **`FlowMesh`** in the canonical worktree named above.
+  Do not switch branches, create worktrees, or move work to an automatically
+  generated Claude branch.
+- Do not push, merge, amend, squash, reset, rebase, or rewrite history. Do not
+  modify previous commits. Make one new, independently reviewable commit per
+  logical change after its focused tests pass.
 - **Never** add AI/assistant attribution to commits (no "Claude", "Anthropic",
   "Generated-By", "Co-Authored-By", etc.). Use the repository Git identity only.
 
