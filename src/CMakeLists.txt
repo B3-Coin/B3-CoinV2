@@ -247,6 +247,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/txorphanage.cpp
   node/txreconciliation.cpp
   node/flowmesh_anchor.cpp
+  node/flowmesh_dev.cpp
   node/flowmesh_store.cpp
   node/fn_pod.cpp
   node/legacy_fn_issuance.cpp

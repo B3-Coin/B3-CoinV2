@@ -43,6 +43,7 @@ namespace node {
 class KernelNotifications;
 class StakingLoop;
 class Warnings;
+struct FlowMeshDevRuntime;
 
 //! NodeContext struct containing references to chain state and connection
 //! state.
@@ -82,6 +83,9 @@ struct NodeContext {
     std::unique_ptr<interfaces::Mining> mining;
     //! B3 Modern PoS automatic staking loop (created once the chainstate is loaded).
     std::unique_ptr<node::StakingLoop> staking;
+    //! REGTEST-ONLY FlowMesh dev validator runtime (-b3flowmeshdev spike).
+    //! Never populated on any other chain; destroyed before chainman.
+    std::unique_ptr<node::FlowMeshDevRuntime> flowmesh_dev;
     interfaces::WalletLoader* wallet_loader{nullptr};
     std::unique_ptr<CScheduler> scheduler;
     std::function<void()> rpc_interruption_point = [] {};

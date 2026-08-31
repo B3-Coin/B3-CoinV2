@@ -13,6 +13,7 @@
 #include <net.h>
 #include <net_processing.h>
 #include <netgroup.h>
+#include <node/flowmesh_dev.h>
 #include <node/kernel_notifications.h>
 #include <node/staking.h>
 #include <node/warnings.h>
