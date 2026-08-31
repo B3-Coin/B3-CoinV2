@@ -84,12 +84,14 @@ tail-emission recommendation). Mechanism locked; NUMBERS still PROPOSED:
 - Owner pins still needed: R0 (or the 3% sizing rule), HALVING_INTERVAL,
   the 90/10 split, and the treasury address.
 
-## Asset issuance fee — RULED destination, PROPOSED size
+## Asset issuance fee — RULED (destination 2026-08-26, size 2026-09-01)
 - Destination: the treasury address (RULED 2026-08-26).
-- Size: PROPOSED flat 10 B3 per ASSET_ISSUANCE (anti-spam scale, not a
-  gate for serious issuers) + the standard MPA payload costs. Activates
-  with the asset phase; the consensus check is "coinbase-independent
-  output of >= fee to the treasury script in the issuing transaction".
+- Size: RULED flat 1,000 B3 per ASSET_ISSUANCE (owner ruling 2026-09-01;
+  supersedes the 10 B3 proposal — strong spam economics: fake-token
+  floods pay the treasury, serious issuers pay once) + the standard MPA
+  payload costs. Activates with the asset phase; the consensus check is
+  "coinbase-independent output of >= fee to the treasury script in the
+  issuing transaction".
 - User protection remains layered as designed: unforgeable AssetIdV1,
   registered-vs-permissionless tiers, FlowMesh listing gate against
   approved quote assets, wallet unknown-asset flagging.
@@ -102,5 +104,5 @@ natural shape; interacts with mint caps (threat model T1). Not designed.
 1. `S_H`-derived block reward + r + split (this proposal's numbers).
 2. FlowMesh bps numbers.
 3. The treasury address itself.
-4. Issuance fee amount.
+4. ~~Issuance fee amount~~ — RULED 1,000 B3 (2026-09-01).
 5. Bridge fee (stage 4).
