@@ -16,6 +16,7 @@
 #include <addresstype.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
+#include <legacy/consensus.h>
 #include <node/blockstorage.h>
 #include <node/types.h>
 #include <policy/policy.h>
@@ -927,6 +928,58 @@ BOOST_FIXTURE_TEST_CASE(b3_validator_key_and_stake_outputs, TestChain100Setup)
         for (const COutput& coin : AvailableCoins(*wallet).All()) listed |= coin.outpoint == stake_outpoint;
         BOOST_CHECK(!listed);
     }
+}
+
+BOOST_AUTO_TEST_CASE(legacy_coinstake_maturity_depth_and_conflict)
+{
+    const auto make_coinstake = [](bool legacy_encoding) {
+        CMutableTransaction tx;
+        tx.m_legacy_encoding = legacy_encoding;
+        tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0});
+        tx.vout.emplace_back(0, CScript{});
+        tx.vout.emplace_back(COIN, CScript() << OP_TRUE);
+        return MakeTransactionRef(std::move(tx));
+    };
+
+    const uint256 block_hash{GetRandHash()};
+    CWalletTx coinstake{make_coinstake(/*legacy_encoding=*/true),
+                        TxStateConfirmed{block_hash, /*height=*/100, /*index=*/1}};
+
+    LOCK(m_wallet.cs_wallet);
+    BOOST_REQUIRE(coinstake.IsCoinStake());
+
+    // At depth 1, 30 more blocks are required by the conservative wallet
+    // maturity calculation.
+    m_wallet.SetLastBlockProcessed(/*block_height=*/100, block_hash);
+    BOOST_CHECK_EQUAL(m_wallet.GetTxDepthInMainChain(coinstake), 1);
+    BOOST_CHECK_EQUAL(m_wallet.GetTxBlocksToMaturity(coinstake), legacy::COINBASE_MATURITY);
+
+    // Depth 30 is still one block short; depth 31 is mature.
+    m_wallet.SetLastBlockProcessed(/*block_height=*/129, block_hash);
+    BOOST_CHECK_EQUAL(m_wallet.GetTxDepthInMainChain(coinstake), 30);
+    BOOST_CHECK_EQUAL(m_wallet.GetTxBlocksToMaturity(coinstake), 1);
+    m_wallet.SetLastBlockProcessed(/*block_height=*/130, block_hash);
+    BOOST_CHECK_EQUAL(m_wallet.GetTxDepthInMainChain(coinstake), 31);
+    BOOST_CHECK_EQUAL(m_wallet.GetTxBlocksToMaturity(coinstake), 0);
+
+    // An inactive coinstake is maximally immature.
+    coinstake.m_state = TxStateInactive{};
+    BOOST_CHECK_EQUAL(m_wallet.GetTxDepthInMainChain(coinstake), 0);
+    BOOST_CHECK_EQUAL(m_wallet.GetTxBlocksToMaturity(coinstake), legacy::COINBASE_MATURITY + 1);
+
+    // A reorged coinstake has negative depth. It must not hit the coinbase
+    // assertion, and its outputs remain maximally immature.
+    coinstake.m_state = TxStateBlockConflicted{GetRandHash(), /*height=*/120};
+    BOOST_CHECK_EQUAL(m_wallet.GetTxDepthInMainChain(coinstake), -11);
+    BOOST_CHECK_EQUAL(m_wallet.GetTxBlocksToMaturity(coinstake), legacy::COINBASE_MATURITY + 1);
+
+    // IsCoinStake() recognizes a transaction shape, so the wallet wrapper
+    // must also require historical encoding before applying legacy maturity.
+    CWalletTx modern_shaped{make_coinstake(/*legacy_encoding=*/false),
+                            TxStateConfirmed{block_hash, /*height=*/100, /*index=*/1}};
+    BOOST_REQUIRE(modern_shaped.tx->IsCoinStake());
+    BOOST_CHECK(!modern_shaped.IsCoinStake());
+    BOOST_CHECK_EQUAL(m_wallet.GetTxBlocksToMaturity(modern_shaped), 0);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

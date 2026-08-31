@@ -29,6 +29,7 @@
 #include <kernel/types.h>
 #include <key.h>
 #include <key_io.h>
+#include <legacy/consensus.h>
 #include <logging.h>
 #include <modern/stake.h>
 #include <node/types.h>
@@ -3396,10 +3397,20 @@ int CWallet::GetTxBlocksToMaturity(const CWalletTx& wtx) const
 {
     AssertLockHeld(cs_wallet);
 
-    if (!wtx.IsCoinBase()) {
+    const bool coinstake{wtx.IsCoinStake()};
+    if (!wtx.IsCoinBase() && !coinstake) {
         return 0;
     }
     int chain_depth = GetTxDepthInMainChain(wtx);
+    if (coinstake) {
+        // Legacy coinstakes mature exactly like coinbases (consensus
+        // refuses earlier spends in validation), so a migrated staker's
+        // fresh stakes must not be offered for spending. Unlike a
+        // coinbase, a coinstake reorged off the best chain is routinely
+        // conflicted: treat it as maximally immature instead of asserting.
+        chain_depth = std::max(chain_depth, 0);
+        return std::max(0, static_cast<int>(legacy::COINBASE_MATURITY + 1) - chain_depth);
+    }
     assert(chain_depth >= 0); // coinbase tx should not be conflicted
     return std::max(0, (COINBASE_MATURITY+1) - chain_depth);
 }
@@ -3408,7 +3419,8 @@ bool CWallet::IsTxImmatureCoinBase(const CWalletTx& wtx) const
 {
     AssertLockHeld(cs_wallet);
 
-    // note GetBlocksToMaturity is 0 for non-coinbase tx
+    // GetTxBlocksToMaturity is 0 for transactions that are neither coinbase
+    // nor legacy coinstake.
     return GetTxBlocksToMaturity(wtx) > 0;
 }
 
