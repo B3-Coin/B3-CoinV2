@@ -87,12 +87,13 @@ exist.**
   (~300 KB; one block).
 - Any miner produces the identical required set or the block is
   invalid. Every node validates equality against the pinned list.
-- **Mint early, unlock later (safety split):** the coins exist and are
-  wallet-visible from 810,001, but the FN transfer rule (§3) activates
-  at a height weeks after M — the one-shot deterministic genesis runs
-  at the boundary, while the forever-running spend-validation code
-  still gets its modern-era soak. Messaging: "your FN is minted and
-  yours; transfers unlock at height X".
+- **No transfer lock (owner ruling 2026-09-01: "why increase
+  complicacy").** FN Coins are spendable as soon as they mature — and
+  because they sit in a coinbase, the standard ~30-block coinbase
+  maturity applies automatically: a natural breather enforced by the
+  oldest rules in the tree, with zero new lock code. The transfer rule
+  (§3) is simply active from the transition release onward; its safety
+  budget is exhaustive tests plus the §7 rehearsal, not a padlock.
 - Holder experience: nothing to do, ever. Migrate the old wallet
   whenever; the FN Coin is already at the address that earned it in
   2017. No claims, no deadlines; dormant holders keep their rights
@@ -128,14 +129,14 @@ that swaps network magic + port (physically cannot reach production),
 localhost-only, with overridable H just above the copied tip and
 trivial difficulty. Rehearse on real history: seal → corridor mining →
 modern era → asset activation at its height → FN Genesis in the
-810,001 coinbase → transfer unlock. Mandatory before the transition
+810,001 coinbase → FN transfers after maturity. Mandatory before the transition
 release ships.
 
 ## 8. Open items (small, non-blocking)
 
-- Height spacing (proposal: FN transfer unlock ~2 weeks after M,
-  assets ~2 weeks; owner blesses the numbers when the code is ready;
-  FN Genesis itself is fixed at 810,001).
+- Height spacing: assets activation ~2 weeks after M (owner blesses
+  the number when the code is ready); FN Genesis fixed at 810,001,
+  transfers live at coinbase maturity (no separate height).
 - 810,001 block-size handling: one coinbase vs deterministic spread
   over the first corridor blocks.
 - Canonical serialization of the rights-list entries (fixed before the
