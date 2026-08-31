@@ -69,7 +69,13 @@ public:
 
 /** Txid commits to all transaction fields except the witness. */
 using Txid = transaction_identifier<false>;
-/** Wtxid commits to all transaction fields including the witness. */
+/**
+ * Identifier type used by the existing witness-aware relay/mempool slot.
+ * Upstream transactions hash the witness serialization. B3 Modern reuses
+ * this shaped slot for the canonical full serialization when an MPA is
+ * present, so its bytes then equal Ptxid (witness + MPA). The distinct C++
+ * type remains useful and is not interchangeable with Ptxid in APIs.
+ */
 using Wtxid = transaction_identifier<true>;
 
 /**

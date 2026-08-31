@@ -33,25 +33,19 @@ namespace node {
  * persists records only — no claim transaction, no FN minting, no
  * claimed-flag mutation lives here.
  *
- * INTEGRATION STATUS (honest, under the RULED model): the sync helper
- * and the offline replay path exist and are tested (unit fixtures + the
- * regtest evolution suite + b3coin-utxo-verify -podreport). Under the
- * owner's 2026-08-17 FN issuance ruling (doc/design/
- * b3-legacy-fn-issuance-proposal.md) this module is BUILDER-SIDE AND
- * AUDIT TOOLING ONLY: historical FN rights are issued by ONE archival
- * builder as proof-carrying issuance transactions that every node
- * verifies STATELESSLY against the H/X-sealed chain. Normal production
- * sync/reindex does NOT derive PodRecords and there is NO production
- * PodDB by design — the earlier "every node scans and keeps a PodDB;
- * users claim with funding-key signatures" model (this document's §8
- * scan-and-claim MVP) is SUPERSEDED, not pending.
+ * The sync helper and offline replay path are builder-side audit tooling.
+ * After H is sealed, `BuildLegacyFnGenesisManifest` derives these records
+ * from complete block/undo history and resolves each qualifying event against
+ * its exact historical designation. The resulting canonical rows are pinned
+ * into the transition release and materialized together at H+1. Normal nodes
+ * do not maintain PodDB state, and there is no holder claim or proof path.
  */
 
-//! Why a qualifying PoD is or is not claimable under the MVP.
+//! Legacy funding-form classification retained as deterministic audit
+//! metadata in PodRecord format v1. It has no FN Genesis authority.
 enum class PodClaimability : uint8_t {
     SUPPORTED = 0,
-    //! At least one distinct funding script is not an MVP-supported
-    //! key form (P2PKH / P2PK). Recorded, never claimable, no fallback.
+    //! At least one distinct funding script is not P2PKH or P2PK.
     UNSUPPORTED_FUNDING_SCRIPT = 1,
 };
 
@@ -69,14 +63,16 @@ struct PodRecord {
     //! GetFNCollateral(height) at the event's height.
     CAmount tier{0};
     //! DISTINCT raw funding-input scriptPubKeys, deduplicated and sorted
-    //! canonically (lexicographic by script bytes). Beneficiary authority
-    //! derives from these and nothing else.
+    //! canonically (lexicographic by script bytes). Retained for historical
+    //! audit output only; funding scripts confer no FN Genesis authority.
     std::vector<std::vector<unsigned char>> funding_scripts;
+    //! Legacy funding-form audit classification. The manifest builder ignores
+    //! this field and resolves the recipient from the original PoD outputs.
     bool claimable{false};
     PodClaimability reason{PodClaimability::UNSUPPORTED_FUNDING_SCRIPT};
-    //! AUDIT METADATA ONLY: output indices carrying exactly 1 B3. Marker
-    //! presence, destination and spent status never affect eligibility or
-    //! beneficiary selection.
+    //! AUDIT METADATA ONLY: output indices carrying exactly 1 old-B3. The
+    //! manifest builder does not trust this abbreviated list; it re-reads the
+    //! sealed transaction and applies the exact P2PKH designation rule.
     std::vector<uint32_t> marker_vouts;
 
     SERIALIZE_METHODS(PodRecord, obj)
@@ -213,39 +209,14 @@ private:
  */
 bool SyncPodRecords(ChainstateManager& chainman, PodDB& db, std::string& error);
 
-//! Offline PoD report over a set of records. The qualifying-PoD counts
-//! (the R counter against MAX_FN_EVER_ISSUED) remain the meaningful
-//! pre-activation gate; the payload arithmetic below is a SUPERSEDED
-//! type-1 diagnostic (see the PodCapacityReport banner) — NOT the
-//! type-2 issuance activation capacity gate. Offline measurement,
-//! never validation.
-/**
- * SUPERSEDED MEASUREMENT — NON-AUTHORITATIVE FOR ACTIVATION (owner
- * correction 2026-08-18). This report's payload arithmetic measures
- * `WorstCaseFnClaimActionPayload`, the worst case of the ABANDONED
- * type-1 funding-signature claim encoding (`FnClaimActionV1`). It is
- * NOT the capacity gate for the live type-2 issuance carrier
- * (`LegacyFnIssuanceActionV1`), whose real encoded sizes over actual
- * mainnet history REMAIN UNMEASURED — that measurement is recorded
- * future work, and FN activation stays blocked until it exists or a
- * reviewed versioned carrier is selected. The qualifying-PoD counts
- * (the R counter against MAX_FN_EVER_ISSUED) remain meaningful.
- */
+//! Offline audit summary over derived historical PoD records. The FN Genesis
+//! builder independently applies the exact legacy designation rule and emits
+//! the canonical rights manifest; no claim/proof carrier sizing is involved.
 struct PodCapacityReport {
     size_t total_qualifying{0};
     size_t claimable{0};
     std::map<uint8_t, size_t> by_reason;
     size_t max_distinct_funding_scripts{0};
-    //! SUPERSEDED: worst-case serialized payload of the ABANDONED
-    //! FnClaimActionV1 (every record P2PKH, uncompressed key, 72-byte
-    //! DER) — kept as the historical measurement record only.
-    size_t max_action_payload{0};
-    //! SUPERSEDED: fit of the abandoned type-1 payload against the
-    //! 4,000-byte bound. Says nothing about the type-2 issuance proof.
-    size_t within_native_bound{0};
-    size_t exceeding_native_bound{0};
-    //! SUPERSEDED verdict over the abandoned encoding.
-    bool fits_native_action{true};
 };
 
 PodCapacityReport BuildPodCapacityReport(const std::vector<PodRecord>& records);

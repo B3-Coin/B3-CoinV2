@@ -214,8 +214,8 @@ struct TransactionSerParams {
      * closed like any unknown optional-data bit). This is a B3 Modern
      * serialization extension, NOT SegWit activation: bit 0x01 keeps its
      * witness meaning, the base (txid) form is unchanged, and only the
-     * Modern decoding contexts (the marker-modern block codec, and future
-     * modern relay/RPC contexts) select it. Never set for legacy_time.
+     * Modern decoding contexts (marker-modern blocks, relay, RPC and indexes)
+     * select it. Never set for legacy_time.
      */
     const bool allow_mpa{false};
     SER_PARAMS_OPFUNC
@@ -226,10 +226,10 @@ static constexpr TransactionSerParams TX_NO_WITNESS{.allow_witness = false};
 static constexpr TransactionSerParams TX_LEGACY_B3{.allow_witness = false, .legacy_time = true};
 /**
  * The B3 Modern full form: witness (if any) AND the Modern Payload Area.
- * Selected by the marker-modern block codec (primitives/block.h) and, later,
- * by the modern relay/RPC contexts. TX_WITH_WITNESS deliberately excludes
- * the MPA (it remains the wtxid form); the normative full-form identifier
- * (ptxid) arrives in plan Commit 6.
+ * Selected by the marker-modern block codec and modern relay/RPC/index
+ * contexts. TX_WITH_WITNESS remains the upstream witness-only wire form;
+ * B3's GetWitnessHash relay slot and the typed Ptxid both hash TX_MODERN when
+ * an MPA is present.
  */
 static constexpr TransactionSerParams TX_MODERN{.allow_witness = true, .allow_mpa = true};
 
@@ -440,8 +440,9 @@ public:
     const uint32_t nLockTime;
     /**
      * B3 Modern Payload Area records (empty for every legacy transaction and
-     * for modern transactions without evidence). Excluded from the txid and
-     * from the witness hash; serialized only under TX_MODERN.
+     * for modern transactions without evidence). Excluded from the state
+     * txid, included in Ptxid and B3's wtxid-shaped full relay hash, and
+     * serialized only under TX_MODERN.
      */
     const std::vector<CMpaRecord> mpa;
 
@@ -487,6 +488,12 @@ public:
     }
 
     const Txid& GetHash() const LIFETIMEBOUND { return hash; }
+    /**
+     * Full optional-data identity used by the existing wtxid-shaped relay,
+     * mempool, orphan and compact-block plumbing. For B3 Modern transactions
+     * this is the ptxid bytes (witness + MPA); for payload-free transactions
+     * it retains the ordinary wtxid/txid behavior.
+     */
     const Wtxid& GetWitnessHash() const LIFETIMEBOUND { return m_witness_hash; };
     /**
      * ptxid = SHA256d(canonical full serialization incl. witness and MPA);
@@ -500,8 +507,8 @@ public:
     CAmount GetValueOut() const;
 
     /**
-     * Calculate the total transaction size in bytes, including witness data.
-     * "Total Size" defined in BIP141 and BIP144.
+     * Calculate total B3 Modern transaction size in bytes, including witness
+     * and MPA optional data.
      * @return Total transaction size in bytes
      */
     unsigned int ComputeTotalSize() const;
@@ -527,6 +534,7 @@ public:
 
     bool HasWitness() const { return m_has_witness; }
     bool HasMpa() const { return !mpa.empty(); }
+    bool HasOptionalData() const { return HasWitness() || HasMpa(); }
     /** True when this transaction's identity is the legacy B3 encoding. */
     bool IsLegacyEncoded() const { return m_legacy_encoding; }
 };

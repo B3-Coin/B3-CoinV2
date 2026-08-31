@@ -15,11 +15,11 @@ pragma solidity ^0.8.24;
 ///                 uint256 amount, bytes32 b3Recipient);
 ///
 /// Funds can leave only through `release`, callable exclusively by the
-/// release authority — the B3 finality verifier / bridge contract of
-/// doc/design/b3-cross-chain-finality-v1.md §5-§6 (B3 -> ETH withdrawals).
-/// Deploy the vault together with (or after) that verifier; a vault with a
-/// zero release authority would trap funds forever and the constructor
-/// refuses it.
+/// release authority. The transition-v1 deployment deliberately uses a
+/// managed owner authority; a future deployment may instead use the B3
+/// finality verifier / bridge contract of
+/// doc/design/b3-cross-chain-finality-v1.md §5-§6. A zero authority would
+/// trap funds forever and the constructor refuses it.
 contract B3DepositVault {
     /// Emitted once per lock. `token == address(0)` means native ETH.
     /// `amount` is the amount the vault ACTUALLY received (balance delta),
@@ -90,9 +90,9 @@ contract B3DepositVault {
         emit Deposit(nextDepositId++, token, received, b3Recipient);
     }
 
-    /// Withdrawal path — only the release authority (the B3 finality
-    /// verifier stack), which itself only pays out against an accepted B3
-    /// finality certificate + withdrawal-tree proof (spec §5.2 + §6).
+    /// Withdrawal path — only the immutable release authority. Transition v1
+    /// uses a disclosed managed authority; a future vault may bind this role
+    /// to the B3 finality verifier stack (spec §5.2 + §6).
     function release(address token, address payable to, uint256 amount) external nonReentrant {
         if (msg.sender != releaseAuthority) revert NotAuthority();
         uint256 l = locked[token];

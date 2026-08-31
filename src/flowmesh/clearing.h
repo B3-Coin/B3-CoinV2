@@ -6,6 +6,7 @@
 #define B3COIN_FLOWMESH_CLEARING_H
 
 #include <consensus/amount.h>
+#include <flowmesh/fee_allocation.h>
 #include <flowmesh/ledger.h>
 #include <hash.h>
 #include <modern/policy.h>
@@ -88,6 +89,7 @@ public:
         CAmount imbalance{0}; // |demand - supply| at the clearing price (tie-break)
         std::map<AccountId, CAmount> bid_fill; // base lots bought
         std::map<AccountId, CAmount> ask_fill; // base lots sold
+        FlowMeshFeeAllocation fees;
     };
 
     ClearingEngine(const AssetId& base, const AssetId& quote, size_t max_k = 8)
@@ -222,7 +224,8 @@ private:
      * trigger unless the preflight itself is wrong, and the caller must
      * discard the candidate state either way.
      */
-    std::optional<ClearingResult> ClearSlot(Ledger& ledger)
+    std::optional<ClearingResult> ClearSlot(Ledger& ledger,
+                                            const FlowMeshFeeContext* fee_context = nullptr)
     {
         ClearingResult result;
         const std::vector<CAmount> candidates{CandidatePrices()};
@@ -260,7 +263,15 @@ private:
             const CAmount p{result.price};
             result.bid_fill = Allocate(Side::BID, p, result.volume);
             result.ask_fill = Allocate(Side::ASK, p, result.volume);
-            if (!SettleAndConsume(ledger, result)) return std::nullopt;
+            // Settlement is staged so a fee-recipient or accounting failure
+            // cannot expose a half-mutated direct ClearSlot() call.
+            Ledger staged_ledger{ledger};
+            ClearingEngine staged_book{*this};
+            if (!staged_book.SettleAndConsume(staged_ledger, result, fee_context)) {
+                return std::nullopt;
+            }
+            ledger = std::move(staged_ledger);
+            *this = std::move(staged_book);
         }
         ledger.AdvanceSlot();
         return result;
@@ -641,7 +652,8 @@ private:
      * the candidate state, so no partially settled state can ever be
      * committed.
      */
-    [[nodiscard]] bool SettleAndConsume(Ledger& ledger, const ClearingResult& result)
+    [[nodiscard]] bool SettleAndConsume(Ledger& ledger, ClearingResult& result,
+                                        const FlowMeshFeeContext* fee_context)
     {
         // ---- Allocation invariant, before ANY mutation: both advertised
         // fill maps must sum exactly to the clearing volume. Any
@@ -711,6 +723,57 @@ private:
             }
             b_rem -= fill;
             a_rem -= fill;
+        }
+
+        // The production epoch context is mandatory for a non-zero fee. The
+        // helper allocates once from sellers' gross B3 proceeds, never from
+        // buyers and never once per pairwise fill.
+        if (fee_context != nullptr) {
+            if (m_quote != modern::NativeAsset() ||
+                !FlowMeshFeeContextIsCanonical(*fee_context)) {
+                return false;
+            }
+            std::vector<SellerQuoteProceeds> seller_proceeds;
+            seller_proceeds.reserve(result.ask_fill.size());
+            for (const auto& [account, fill] : result.ask_fill) {
+                if (fill <= 0) continue;
+                const std::optional<CAmount> gross{Quote(fill, result.price)};
+                if (!gross) return false;
+                if (*gross > 0) seller_proceeds.push_back({account, *gross});
+            }
+            const std::optional<CAmount> matched{Quote(result.volume, result.price)};
+            if (!matched) return false;
+            std::vector<SeatId> seats;
+            seats.reserve(fee_context->seats.size());
+            for (const FlowMeshFeeSeat& seat : fee_context->seats) seats.push_back(seat.seat_id);
+            FeeAllocationCheck fee_check;
+            const auto allocation{
+                AllocateFlowMeshFees(*matched, seller_proceeds, seats, fee_check)};
+            if (!allocation || fee_check != FeeAllocationCheck::OK) return false;
+            result.fees = *allocation;
+
+            for (const SellerFeeShare& seller : allocation->seller_fees) {
+                if (seller.fee > 0 &&
+                    !ledger.ChargeFee(seller.account, m_quote, seller.fee)) {
+                    return false;
+                }
+            }
+            if (allocation->treasury_fee > 0 &&
+                !ledger.MoveAvailableToAvailable(
+                    FeeAccount(), FlowMeshTreasuryFeeAccount(*fee_context), m_quote,
+                    allocation->treasury_fee)) {
+                return false;
+            }
+            for (size_t i{0}; i < allocation->seat_rewards.size(); ++i) {
+                const CAmount reward{allocation->seat_rewards[i].reward};
+                if (reward > 0 &&
+                    !ledger.MoveAvailableToAvailable(
+                        FeeAccount(), FlowMeshSeatRewardAccount(*fee_context,
+                                                               fee_context->seats[i]),
+                        m_quote, reward)) {
+                    return false;
+                }
+            }
         }
 
         // Deduct fills from the persistent curves; exhausted curves

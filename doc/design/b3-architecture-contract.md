@@ -381,17 +381,21 @@ Payload Area ([b3-modern-payload-area.md](b3-modern-payload-area.md)); the `poli
 
 ## 24. Policy versions
 
-Each policy type carries its own explicit version (`OWNER v1`, `DEX_VAULT v1`, `STAKE v1`,
+Each policy type carries its own explicit version (`OWNER v1`, `DEX_VAULT v2`, `STAKE v1`,
 …). An unknown version is **invalid** unless that policy specifies forward-compatible
 semantics. This prevents a new client from giving old nodes a different interpretation of
 the same output.
 
 ## 25. Commitment semantics
 
-The 32-byte commitment is not an arbitrary opaque hash. Each policy defines a canonical
-preimage encoding, e.g. conceptually
+The parsed 32-byte commitment is not arbitrary. Each policy defines one
+canonical derivation. For DEX_VAULT v2, the exact B3A1 policy-parameter bytes
+begin with the 32-byte `VaultId`, followed by kind, shard, and optional account;
+the parser exposes that leading `VaultId` as the policy commitment. It is not a
+separately serialized field or a v1 vault-state hash.
 
-    commitment = H("B3/POLICY/DEX_VAULT/V1" || CanonicalEncode(vault_state))
+    policy_params = VaultId || kind || shard || optional_account
+    parsed commitment = VaultId
 
 Canonical encoding means exactly one byte representation per logical state: no JSON, no
 platform-dependent integers, no unordered containers, no native struct serialization.
@@ -416,11 +420,11 @@ version, operation, input state commitment, new state commitment, asset, amount 
 applicable, and anti-replay data. Otherwise cross-policy or cross-asset replay becomes
 possible.
 
-## 28. Modern PoS — *(open)*
+## 28. Modern PoS — implemented, mainnet pins pending
 
-Modern PoS is **UNRESOLVED at the protocol-detail level** and must not be implemented
-until its consensus specification is supplied. It currently fails closed. See
-[b3-open-decisions.md](b3-open-decisions.md).
+The reviewed Modern-PoS v1 specification and implementation are present. Mainnet
+remains fail-closed until the seal-derived constants and release gates are
+pinned; this is a deployment gate, not an unresolved protocol design.
 
 ## 29. FlowMesh stays account-model
 
@@ -455,7 +459,19 @@ The DEX vault transition proves: the receipt is valid, finalized, belongs to thi
 vault/shard, has not previously been consumed, the output pays the exact
 destination/amount, and the remainder returns to the correct vault.
 
+Withdrawal admission is also custody-capacity bounded. At the entry anchor,
+existing pending obligations for one market/asset plus a new request may not
+exceed the sum of the largest 64 live pool-change UTXOs. Missing capacity fails
+closed. Payout construction orders those UTXOs by amount descending and then
+outpoint ascending, and takes the shortest covering prefix. The publisher sends
+one withdrawal, waits for confirmation, refreshes the vault/capacity view,
+rebuilds, and only then publishes the next.
+
 ## 32. Vault must remain keyless
+
+This section governs the B3-side DEX_VAULT custody pool. It does not describe
+the Ethereum reserve vault, whose transition-v1 withdrawal leg has the
+separately disclosed immutable managed authority in §45.
 
 There must be **no private key** capable of arbitrarily withdrawing the DEX custody pool —
 no multisig treasury. Instead:
@@ -534,33 +550,38 @@ canonical action set, deterministic batch clearing, account reservations, microb
 certification, withdrawal receipts. Threshold cryptography must not become a dependency of
 H+1 unless required for core safety.
 
-## 42. Stablecoin-denominated FlowMesh fees
+## 42. FlowMesh v1 fees are native B3
 
-Markets may charge fees in the quote/collateral stable asset (B3/USDC → USDC; BTC/USDT →
-USDT). "USDC" means the explicitly approved B3 `AssetId`, never an arbitrary asset sharing
-that ticker.
+The trading fee is 100 ppm of matched native-B3 notional, charged once, split
+80% equally across active FN seats and 20% to treasury. Base-chain transaction
+fees are also native B3. No ticker or external stable asset can satisfy either
+fee merely by name.
 
-## 43. Fee assets need a governed registry
+## 43. Treasury flush is capacity-bounded
 
-A consensus-recognized `AcceptedFeeAssets` set with bridge/issuer identity pinned
-(initially e.g. `USDC_ETH_BRIDGED`, `USDT_ETH_BRIDGED`). Otherwise someone issues
-`FakeUSDC` and pays system fees with it. Adding/removing fee assets follows the modern
-governance/consensus-upgrade mechanism *(open)*.
+After every ordinary slot, the deterministic treasury request is the lesser of
+accrued treasury available and anchored native capacity remaining after existing
+pending native withdrawals, when positive. Partial flushes are required; zero
+capacity creates no request and never blocks trading.
 
-## 44. Base-chain fees stay native
+## 44. Market assets still use exact identities
 
-    B3 blockchain transaction fee -> native B3
-    FlowMesh trading fee          -> approved trading/settlement asset
-
-Core consensus liveness must not depend on an external stablecoin issuer. This is a safety
-boundary.
+The market registry accepts base assets by exact `AssetId`, never ticker.
+Bridge-backed bUSD may trade only when its independently gated registry and
+proof/readiness state are active. Core consensus liveness never depends on an
+external stablecoin issuer.
 
 ## 45. Stablecoin bridge risk stays explicit
 
-A bridged USDC asset is a different security domain from B3; its solvency depends on the
-origin chain, origin token, bridge verification, finality assumptions, and issuer
-freeze/blacklist policy. It must not be described as protocol-native dollars without
-qualification.
+Canonical bUSD is the six-decimal `BRIDGE_BACKED` representation of Ethereum-mainnet
+USDT locked in managed-v1 vault
+`0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`. It is a different security domain
+from B3: solvency depends on Ethereum, canonical USDT, bridge verification and
+finality, the issuer's freeze/blacklist policy, and the managed withdrawal authority.
+Mainnet minting stays fail-closed until every proof/readiness pin is present. It must
+never be described as protocol-native dollars without those qualifications. Replacing
+managed v1 with decentralized verification requires a new audited vault and a
+controlled migration; the immutable authority cannot be silently changed in place.
 
 ## 46. Independent PoW-issued coloured assets
 
@@ -578,38 +599,41 @@ No arbitrary unmetered VM code in issuance policies. First implementation uses t
 policy modules: `FIXED_SUPPLY`, `MINT_AUTHORITY`, `BRIDGE_BACKED`, `POW_ISSUED`,
 `ALGORITHMIC`. General smart contracts are a separate future problem.
 
-## 48. FN: three separate concepts
+## 48. FN: ownership and later service are separate concepts
 
     FN recognition   |   FN license/right   |   FN economic bond
 
-A historical FundamentalNode entitlement does **not** automatically imply perpetual modern
-operational power. Legacy owners may receive a modern claim/recognition asset derived from
-historical proof-of-integration state, but modern participation still requires modern
-activation/bond/performance conditions.
+A historical FundamentalNode right receives an FN Coin in the mandatory
+810,001 genesis coinbase. Ownership alone does **not** activate a FlowMesh
+seat: the owner must create the authenticated FN-v2 seat binding. Seat
+pre-binding begins at A2 and working spot trading begins at A3 in the
+transition release after the mandatory 30-block runway.
 
-## 49. FN claims come from a deterministic snapshot
+## 49. FN Genesis comes from a deterministic sealed manifest
 
-Because there is no balance migration, FN recognition is generated from historical
-on-chain facts. At X, construct a deterministic claim set (legacy FN identity, historical
-proof-of-integration burn/outpoint, eligible beneficiary, claim amount). Claims are then
-exercised permissionlessly. **No manual distribution. No administrator CSV.** The claim
-root/state must be reproducible from legacy history.
+At X, independently reproduce the complete canonical rights manifest from
+historical on-chain facts and pin its bytes, count, and Merkle root. Block
+810,001 coinbase creates one amount-1 FN output per row directly to the exact
+historical P2PKH owner commitment. **No manual distribution, administrator CSV,
+or later claim exists.**
 
-## 50. FN claim is not a new genesis
+## 50. FN historical issuance is one explicit genesis event
 
-    Genesis balance migration                          -> NO
-    Consensus-recognized post-H claim from pre-H facts -> YES
+    Native B3 balance migration                         -> NO
+    FN rights manifest from sealed pre-H facts          -> YES
+    Mandatory FN outputs in the 810,001 coinbase        -> YES
+    Later holder claim/proof transaction                -> NO
 
-A modern transaction creates the FN asset only when the historical entitlement is
-proven/claimed. This preserves the one-chain architecture.
+The event creates a separate FN asset and neither recreates nor moves native B3.
 
-## 51. FN supply economics remain unlocked — *(open)*
+## 51. FN supply economics — ruled; rewards remain open
 
-Do **not** implement the old "every 25 FN → price doubles" scheme; its cartel/oligopoly
-failure mode is identified. Keep the policy interface available and leave the issuance
-curve outside consensus until economics is finalized. Current conceptual direction:
-license scarcity + bond + performance-based revenue + B3 burn for new entry — rather than
-forcing monetary deflation through token issuance.
+The old "every 25 FN → price doubles" scheme remains rejected. Lifetime cap
+is 5,000; final modern capacity is `5,000 - R`; modern creation destroys
+15,000 / 30,000 / 60,000 B3 over successive 500-unit tiers. Extinguishment
+never reopens capacity. FlowMesh v1 charges 100 ppm of matched native-B3
+notional and splits it 80/20 between active FN seats and treasury. Later bond,
+slashing, and expanded-service policy remains outside this release.
 
 ## 52. Validators and FlowMesh FNs are separate roles
 
@@ -631,23 +655,36 @@ belong to B3 consensus economics; FlowMesh rewards to FlowMesh service economics
         -> bridge
         -> advanced issuance
 
-**Do not wire FlowMesh, FN economics, bridge logic, experimental issuance or advanced
-asset policies into consensus until the legacy→modern transition and modern PoS can
-independently produce and validate a clean H+1 chain.**
+**2026-09-01 owner supersession:** the first clean H+1 corridor block is now
+itself the mandatory historical FN Genesis coinbase. That narrow exception is
+fully specified by `b3-fn-assets-activation-design.md`. FlowMesh remains off at
+H+1 but ships behind A2/A3 gates in the same transition release. Bridge-backed
+bUSD is a separate fail-closed policy path and activates only when all of its
+production pins are present.
 
 ## 54. H+1 is intentionally boring
 
-The first modern block requires only the minimum capable modern consensus: modern block
-codec, modern chain identity, modern PoS, native B3, legacy UTXO spending, basic modern
-outputs, basic fees. Large subsystems activate later behind explicit activation
-heights/version gates:
+The first post-legacy block remains deliberately narrow. It is the first
+transition-PoW corridor block and must contain the one-shot historical FN
+Genesis sequence in its coinbase. It does not activate colored-asset issuance,
+FlowMesh, or bridge logic:
 
-    H+1  modern consensus
-    A1   typed assets
-    A2   FlowMesh
-    A3   bridge
+    H+1 = 810,001  corridor begins; mandatory FN Genesis coinbase
+    H+31 = 810,031   genesis FN can first be spent at 30-block maturity
+    M = 811,001      Modern PoS begins
+    A1 > M            modern FN PoD creation activates after the soak
+    A2 >= A1          simple-v1 assets + FN seat pre-binding activate
+    A3 >= A2 + 30     FlowMesh spot trading and vault effects activate
 
-This substantially reduces migration risk.
+There is no separate FN transfer activation lock. The transition release pins
+FlowMesh A3. Ethereum-USDT bridge minting is independently fail-closed until
+its exact bootstrap, caps, adapter and activation parameters are pinned; it is
+never enabled merely because A3 is reached.
+
+For each market, epoch zero uses one consensus-unique anchor: the earliest
+canonical block at or after `market.created_height` whose post-block FN-v2 set
+contains at least four seats. Sequence zero may start only at or after A3 and
+once that exact anchor is 30 blocks deep.
 
 ## 55. Consensus activation is deterministic
 

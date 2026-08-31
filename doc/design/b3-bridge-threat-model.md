@@ -1,5 +1,23 @@
 # B3 FlowMesh bridge — threat model (deposit leg v1, release leg as specified)
 
+**2026-09-01 transition-v1 supersession:** the owner promoted the published
+smoke vault and accepted its immutable owner-controlled `releaseAuthority` for
+the first bUSD release. Sections below describing a verifier-only withdrawal
+path and "no custodian" are the intended future replacement, not the trust
+model of transition v1. In transition v1, inbound minting remains Ethereum
+light-client/proof verified, while withdrawals are managed by that authority.
+Compromise can drain locked reserves and key loss can freeze withdrawals;
+authority address, runtime code hash, mint caps, and withdrawal rules must be
+pinned and publicly disclosed before activation. Moving to the decentralized
+verifier requires a new vault and explicit migration.
+
+The live facts were checked through two independent Ethereum RPC providers at
+block 25,877,643: release and rescue authority are the same EOA,
+`0x76c7a245d0D2e4CF92403aF0144825df1cC614f1`; the vault runtime code hash is
+`0x1be220c18efa4e4cda0bb1c912c7c41346f5c04d49a36ec2c68f6ddcc5586233`.
+The vault held no USDT then. These facts close identity inspection only; they
+do not close proof, cap, audit, operating-rule, or reserve-funding gates.
+
 Written 2026-08-25, the day after the first real mainnet deposit was proven
 (vault `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`, deposit id 0). Purpose:
 an honest adversarial inventory for the owner. Nothing here is marketing;
@@ -8,7 +26,7 @@ smoke test. Companion documents: b3-bridge-bls-proposal.md §5 (original
 threat notes), b3-cross-chain-finality-v1.md (release-leg protocol),
 b3-product-identity.md.
 
-## 0. Trust model, stated exactly
+## 0. Future decentralized trust model (not transition v1)
 
 A deposit mints on B3 iff ALL of:
 1. one bootstrap checkpoint (a human/release trust decision, made once),
@@ -18,13 +36,15 @@ A deposit mints on B3 iff ALL of:
    (finality branch, execution branch, ancestry chain, receipts MPT), and
 4. (stage 4) B3 consensus accepts the proof and applies mint rules.
 
-A withdrawal releases on Ethereum iff a quorum (floor(2W/3)+1 by stake
+A future decentralized withdrawal releases on Ethereum iff a quorum (floor(2W/3)+1 by stake
 weight) of B3's Modern-PoS validator set signed the finality certificate,
 with set handovers proven back to the genesis set pinned in the verifier
 contract, and the burn proves into the withdrawal tree.
 
-There is NO custodian, multisig, oracle, or upgrade admin in either leg.
-Consequently every threat below is either (a) an attack on one of the two
+That future verifier design has no custodian, multisig, oracle, or upgrade
+admin. Transition v1 is different: its withdrawal leg is explicitly managed by
+the immutable authority identified above. Consequently every threat below is
+either (a) an attack on one of the two
 consensus systems, (b) an attack on the two pinned trust roots, or (c) a
 defect in our code. There is no "operator risk" category — by design.
 
@@ -38,7 +58,7 @@ supermajority of seats requires roughly a supermajority of all staked ETH
 (tens of billions of dollars) or a catastrophic randomness failure; signing
 a conflicting finalized checkpoint is also slashable equivocation.
 Mitigations in code: finalized-only (never attestation-weight headers),
-supermajority threshold (342, config-pinned at A3).
+supermajority threshold (342, pinned by the independent bridge-readiness gate).
 Mitigations still REQUIRED at stage 4 (owner rulings): per-block/per-epoch
 mint caps so even a total committee compromise has bounded damage before
 humans react; optional watcher veto delay. **Do not ship minting without a
@@ -48,7 +68,8 @@ cap.**
 Everything chains from the pinned checkpoint root. A wrong/poisoned pin in
 a release = attacker-controlled Ethereum view for every B3 node. This is a
 process threat, not a code threat.
-Required rule: the A3 checkpoint is pinned in a reviewed release commit,
+Required rule: the Ethereum bootstrap checkpoint is pinned in a reviewed
+bridge-activation release commit,
 cross-checked against multiple independent beacon sources; the same "four
 release gates" discipline as H/X pinning.
 
@@ -92,13 +113,15 @@ nodes serve historical periods). Denial = delay, not loss.
 Current state: 16/16 foundry tests; reentrancy guard added after the
 author's own review found a real hook-token inflation vector (fixed,
 attack-tested); balance-delta accounting against fee-on-transfer
-over-mint; surplus-only rescue (cannot touch `locked`); no owner, no
-upgrade, immutable authorities; USDT's non-standard returns handled.
+over-mint; surplus-only rescue (cannot touch `locked`); no mutable owner or
+upgrade path; immutable authorities; USDT's non-standard returns handled.
 Residual: single-author review only. **A third-party audit is a hard gate
-before non-trivial TVL** (belongs on the A3 gate list). Known accepted
-properties: authority key loss strands funds (production authority = the
-verifier contract); issuer blacklisting (USDT can freeze the vault) makes
-the B3 asset trade against a frozen reserve — OD-8 policy question, open.
+before non-trivial TVL** (part of independent bridge readiness, not A3).
+Known transition-v1 properties: compromise of the managed release-authority
+EOA can drain reserves, authority-key loss can strand funds, and issuer
+blacklisting (USDT can freeze the vault) can leave bUSD backed by frozen
+reserves. The future verifier uses a new audited vault after controlled
+migration; it cannot replace this authority in place.
 
 ### T8. Malicious/weird tokens — CONTAINED by design
 Anyone can deposit any token and emit true-but-worthless events; the vault
@@ -130,14 +153,15 @@ by the sync-lag rule of T3; committees fixed 512). Stage-4 verification
 costs must be priced through the existing MPA verify-cost budget so a
 block full of proofs cannot stall validation.
 
-## 2. Release leg (B3 -> ETH) — specified, not yet built
+## 2. Future decentralized release leg (B3 -> ETH) — specified, not transition v1
 
 ### T12. Small early validator set — THE key activation threat
 MIN_FINALITY_SET = 4 is a chain-bootstrap floor, NOT bridge security. If
 the Ethereum verifier is activated while B3's staked set is small/cheap,
 buying 2/3 of B3 weight is cheap and the vault's ENTIRE reserve is the
 prize (sign a fake certificate + withdrawal root, drain via §6 proofs).
-**Bridge activation (A3) must be gated on an explicit economic-security
+**Future decentralized-verifier activation must use its own separately pinned
+gate and an explicit economic-security
 threshold of the B3 set — an owner ruling, already flagged in the spec's
 §9 and OD-8. This is the largest open design decision in the system.**
 
@@ -191,8 +215,10 @@ double-signing is a Modern PoS design question (OD), not bridge-specific.
 6. Checkpoint-pinning release process, same rigor as H/X (T2).
 7. Reserve to supply watcher tooling (§3 Monitoring).
 
-The smoke-test deployment (owner-controlled authorities, 0.001 ETH) is
-exempt from these gates by proportionality; nothing else is.
+The historical 0.001-ETH smoke transaction was exempt from these gates by
+proportionality. Production use of the same promoted vault is not exempt and
+remains fail-closed until every applicable proof, cap, audit, authority,
+runtime-code, and operating-rule gate passes.
 
 
 ## 5. Stage-4 mint admission rules — OWNER-RATIFIED 2026-08-26

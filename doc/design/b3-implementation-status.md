@@ -10,31 +10,24 @@ Baseline: commit `a8ad010` (the tip of the completed experimental stack, from wh
 > are modern-format PoW blocks (Policy Outputs active, STAKE outputs created
 > and matured); modern PoS begins at M = H+1001. Everything below that says
 > "modern" for heights immediately after H refers to the modern *format*;
-> the modern *PoS* rows now bind at M. Current code and tests still encode
-> the two-phase model (H+1 = modern PoS) — the exact contradiction register
-> is corridor doc §11 and is deliberately unresolved until the corridor
-> design is approved for implementation. In particular the H+1 fail-closed
-> integration expectation (`no-modern-pos-rules`) will eventually move to
-> the first attempted M-block, and a future `ConsensusPhase`
-> {LEGACY_POS, TRANSITION_POW, MODERN_POS} abstraction will replace boolean
-> era checks for block production. Step 3 of the critical path acquires a
-> corridor-validation stage (scrypt work check + corridor difficulty on
-> modern-format blocks) before modern PoS.
+> the modern *PoS* rows bind at M. The tree and tests now dispatch the three
+> phases through `ConsensusPhase` {LEGACY_POS, TRANSITION_POW, MODERN_POS}; the
+> former two-phase/H+1-modern-PoS note is obsolete.
 >
 > **Corridor implementation status (2026-08-16, regtest-complete).** The
 > approved staged build-out landed: `ConsensusPhase` dispatch
-> (`consensus/era.h`, `transition_pow_length` on params, mainnet 1000 inert);
+> (`consensus/era.h`, `transition_pow_length` on params, mainnet 1000);
 > corridor validation by scrypt eligibility (`CheckTransitionPowEligibility`,
 > constant `transition_pow_bits`, fail-closed `no-transition-pow-rules` when
 > unset); phase-aware production (assembler + regtest generate);
 > LEGACY_LOCK crossing spends under the frozen legacy rule set with frozen
-> legacy maturity; `STAKE = 4` with the v1 script carrier (**a proposal
-> embodied in code — ratify before any mainnet H/X pin**);
+> legacy maturity; `STAKE = 4` with the owner-ratified v1 script carrier;
 > `STAKE_ACTIVATION_DEPTH = 20` (`h − b ≥ 20`); per-validator-key weight
 > aggregation (`node/stake_registry`); and the full 1,000-block regtest
 > corridor test ending at the fail-closed modern gate at the first
-> post-corridor height. Mainnet corridor difficulty, rewards, cutoff C and
-> readiness thresholds remain OPEN and unset (mainnet H/X unset). The
+> post-corridor height. Mainnet H = 810,000, corridor bits `0x1f008000`,
+> fees-only reward, minimum stake, and the absence of cutoff/readiness gates
+> are pinned; X and the seal-derived Modern-PoS values remain unset. The
 > earlier H+1-fail-closed test expectation has moved to H+1001 as the
 > corridor design requires. Known follow-up: `HasValidProofOfWork` returns
 > true **chain-wide** for any `legacy_b3coin` chain (corridor headers are
@@ -50,15 +43,38 @@ Baseline: commit `a8ad010` (the tip of the completed experimental stack, from wh
 > production refuses post-H blocks, and startup raises a
 > `LEGACY_BOUNDARY_UNPINNED` warning (`Consensus::LegacyBoundaryHeightOnly`).
 > Corridor bits must be the CANONICAL compact encoding (`IsCanonicalCompactBits`;
-> the ruled mainnet value `0x1f008000` is pinned by test, NOT in chainparams —
-> pin gates in [b3-release-v1.md](b3-release-v1.md)). Corridor pacing VERIFIED
+> the ruled mainnet value `0x1f008000` is pinned in chainparams and by test;
+> remaining pin gates are in [b3-release-v1.md](b3-release-v1.md)). Corridor
+> pacing VERIFIED
 > compressible and then RULED: minimum spacing 60 s + future bound 120 s,
 > consensus for every corridor (test `corridor_pacing_enforced`, corridor
 > doc §6.1). Validator UX v1: wallet validator key,
 > `createstake`, `getstakinginfo`, `startstaking`/`stopstaking`,
 > `node::StakingLoop`, STAKE-carrier standardness/ownership/signing
 > (`modern::StakeOwnerScript`), STAKE outputs excluded from auto coin
-> selection. Seed `176.31.13.198` added. Mainnet H/X/bits remain unset.
+> selection. Seed `176.31.13.198` added. Mainnet H and corridor bits are pinned;
+> X and the Modern-PoS parameter block remain unset.
+
+> **FN/asset/FlowMesh activation ruling (through 2026-09-01; current governing target).**
+> [b3-fn-assets-activation-design.md](b3-fn-assets-activation-design.md)
+> supersedes every proof-carrying or post-M historical-FN activation statement
+> below. The transition release must pin the full canonical FN manifest, count,
+> and Merkle root; block 810,001 coinbase must create one amount-1 FN output per
+> manifest row; ordinary 30-block coinbase maturity is the only transfer delay;
+> old action types 1 and 2 remain reserved/dead; modern capacity is
+> `5,000 - R`; modern PoD and simple-v1 assets activate at separate post-M
+> heights A1/A2; asset issuance pays a 1,000 B3 treasury fee; A2 also opens
+> FN-seat binding and vault preparation; and A3 activates FlowMesh spot after
+> a preparation runway of at least 30 blocks.
+> The transition branch now implements the production manifest builder and
+> root, exact FN Genesis coinbase validation/production, ordinary owner-script
+> authorization, proof-free modern PoD type 6 with branch-local persistent
+> counters and non-reclaimable accounting-gap destruction, plus A2 asset
+> activation and its 1,000 B3 treasury fee. `getassetstate` reports the
+> fail-closed schedule and branch-local FN issuance state. Remaining release
+> gates are the seal-derived mainnet pins, independent reproduction,
+> complete release-level
+> tests/review, and the real-history shadow-fork rehearsal.
 
 **Legend**
 
@@ -111,29 +127,29 @@ Baseline: commit `a8ad010` (the tip of the completed experimental stack, from wh
 
 | Item | Status | Evidence / gap |
 |---|---|---|
-| `LEGACY_LOCK` view of a legacy prevout | PARTIAL | `modern::ViewLegacyCoin` is exactly the required projection and is proven non-mutating, but is **not wired** into any modern spend path. |
+| `LEGACY_LOCK` view of a legacy prevout | IMPLEMENTED | `modern::ViewLegacyCoin` is the required non-mutating projection; the modern spend path selects frozen legacy script semantics for authenticated pre-H coins at block connect and both mempool script checks. |
 | Native B3 reserved asset id | IMPLEMENTED | `modern::NativeAsset()` (all-zero), never issued via the generic engine. |
 | Modern output model | IMPLEMENTED | `modern::ModernOutput` matches the contract, plus the ratified `policy_params` field. |
 | Policy type coverage | PARTIAL | `LEGACY_LOCK=0, OWNER=1, BURN=2, DEX_VAULT=3, STAKE=4, FN=5` exist (the earlier "STAKE/FN missing" wording was stale). `BRIDGE`, `ASSET_ISSUER` and `EXPERIMENTAL` remain absent (deferred; asset issuance is a creation ACTION, not a policy type). Unknown types are correctly invalid. **Existing numbers must not be renumbered.** |
 | Policy versions; unknown version invalid | IMPLEMENTED | v1 only; unknown rejected. |
 | Canonical commitment preimage per policy | MISSING | Commitment is an opaque `uint256`; canonical per-policy encoding not defined (contract §25). |
 | Witness-style transition id separation | IMPLEMENTED | `modern::TransitionId` excludes proofs; `FullTransitionId` commits everything. |
-| Authorization binds the full transition | MISSING | Proof verification is **structural only**: `OWNER v1` accepts any non-empty payload and `LEGACY_LOCK v1` checks a publicly known preimage — both forgeable. Safe today only because nothing calls the verifier in production. These two policies are also unconditionally "activated", unlike `BURN`/`DEX_VAULT`. Must be re-gated before any wiring. Tracked as **D6**. |
+| B3A1 owner authorization | IMPLEMENTED | Contextual validation recognizes a canonical B3A1 carrier only with authenticated post-H Coin provenance, then evaluates its carried owner suffix with the ordinary P2PKH, P2SH, witness, taproot, or multisig rules. Signing follows the same provenance rule and signs the modern transaction normally. The structurally weak historical type-1/type-2 `TransitionProof` helpers are dead and never authorize FN or asset creation. |
 | Asset registry | MISSING by design (v1) | No consensus registry: with `mint_authority = NONE` the genesis mints the whole supply once and conservation forbids any later surplus, so the cap holds by construction. Wallets/DEX read an asset's rules from its issuance transaction via a derived (non-consensus) index — follow-up engineering. |
-| Deterministic AssetId | **IMPLEMENTED (simple v1, owner rulings 2026-08-22)** | `modern::AssetIdV1 = TaggedHash("B3/ASSET/V1") ‖ ModernChainDomain ‖ issuance_outpoint ‖ H(genesis record)` — unified with the FN convention: genuine tagged hash, chain-bound (no id exists before H/X), and rule-bound. The immutable genesis record `AssetGenesisV1 {max_supply (hard cap in every mode), decimals ≤ 18, issuance_mode = GENESIS_FIXED, mode_params = empty}` — with AUTHORITY_MINT / POW_MINED (PoW-minable assets) / BRIDGE_BACKED RESERVED and a bounded `mode_params` blob as the expansion room — travels once in creation action type 3 (`CREATION_ACTION_ASSET_ISSUANCE`); `CheckAssetConservation` permits a surplus only as that transition's declared genesis and only for exactly `max_supply`; v1-envelope transitions can never issue. The earlier untagged, domain-free, rule-free `IssuanceAssetId(outpoint)` is removed (it never left the test-only layer). Tests: `asset_conservation_tests` (genesis bounds/codec/commitment, chain+rule binding with byte-exact preimage reconstruction, exact-supply issuance, under/over/zero-mint, double declaration, wrong id, invalid records, reissuance impossibility, unpinned-chain fail-closed) + the evolution scenario's asset phase. Bridged origin-domain encoding remains future (bridge scope deferred). |
+| Deterministic AssetId / simple-v1 genesis | **IMPLEMENTED; A2 pin/verification pending** | `modern::AssetIdV1`, immutable `AssetGenesisV1`, B3A1 output parsing, exact fixed-supply genesis, conservation, and the no-remint rule are enforced by the production mempool/block path. `asset_activation_height` is a real post-M consensus parameter, both A1/A2 pins are required for a valid schedule, pre-A2 issuance fails closed, and genesis must pay 1,000 B3 to the configured treasury. Native fees remain separate. `issueasset`, `sendasset`, and `burnasset` construct the wallet transactions; burns are B3A1 `PolicyType::BURN` outputs, never `OP_RETURN` carriers. Exact mainnet A2 and release verification remain. |
 | Trade by AssetId, never ticker | IMPLEMENTED | Consensus keys on `uint256`; tickers are UI only. |
 
 ## 5. Modern era core (contract §17, §28, §54)
 
 | Item | Status | Evidence / gap |
 |---|---|---|
-| Modern PoS | **IMPLEMENTED (frozen V1, regtest scaffolding; 2026-08-21)** | The owner-frozen V1 rule set ([b3-modern-pos-spec.md](b3-modern-pos-spec.md)) is live behind `Consensus::Params::modern_pos`: seed-chained deterministic stake-weighted eligibility (`modern/pos_v1.h`), exact round timestamps, sentinel `nBits`/zero `nNonce` (no retarget — `w/W` normalization is the difficulty), BIP340 validator block signatures (trailing `vchBlockSig`, outside identity), height→round→hash PoS-native fork choice (params-aware candidate comparator), reorganization horizon D (no-penalty refusal), incremental `node::StakeTracker`, per-index persisted eligibility digests, and deterministic production + signing in the assembler. **Every shipped network leaves the parameter block unset and fails closed (`no-modern-pos-rules`), guard-tested.** Covered by `modern_pos_tests` (8 cases: guard, params sanity, normal operation, low-online-stake recovery incl. fork choice + horizon, invalid signature/eligibility/reward, restart+reindex). Mainnet gates: number ratification (spec §9), horizon D, STAKE carrier ratification, and the real-history equivalence gate — unchanged. |
+| Modern PoS | **IMPLEMENTED (frozen V1, regtest scaffolding; 2026-08-21)** | The owner-frozen V1 rule set ([b3-modern-pos-spec.md](b3-modern-pos-spec.md)) is live behind `Consensus::Params::modern_pos`: seed-chained deterministic stake-weighted eligibility (`modern/pos_v1.h`), exact round timestamps, sentinel `nBits`/zero `nNonce` (no retarget — `w/W` normalization is the difficulty), BIP340 validator block signatures (trailing `vchBlockSig`, outside identity), height→round→hash PoS-native fork choice (params-aware candidate comparator), reorganization horizon D (no-penalty refusal), incremental `node::StakeTracker`, per-index persisted eligibility digests, and deterministic production + signing in the assembler. **Mainnet leaves the parameter block unset and fails closed (`no-modern-pos-rules`), guard-tested.** Covered by `modern_pos_tests` (8 cases: guard, params sanity, normal operation, low-online-stake recovery incl. fork choice + horizon, invalid signature/eligibility/reward, restart+reindex). Mainnet gates are the final X/R0/`ModernPosParams` pin, final-H equivalence, release review, and rehearsal; the horizon and STAKE carrier are already ratified. |
 | Modern block validation | PARTIAL | The V1 header/connect rules above ARE modern-PoS validation; the `modern::BlockValidator` interface skeleton remains unimplemented/unwired (its reorg contract is enforced by `Consensus::ReorgFromForkCrossesLegacyBoundary` + the horizon instead). |
 | Modern coinbase/issuance cap | **DONE (unconditional)** | `ConnectBlock`'s modern-PoS branch enforces `coinbase ≤ fees + modern_reward` OUTSIDE the validator dispatch (fees-only when unconfigured — nothing mints by omission) and rejects any coinbase output claiming the STAKE magic (`bad-cb-stake`, ruling M6). The reward schedule itself stays an owner parameter (OD-2). |
 | Modern era still uses stock PoW headers | RESOLVED when configured | With `modern_pos` set, marker-modern PoS headers are judged by the V1 rules (sentinel bits, exact time, horizon) and never by stock PoW/retarget; with it unset the stock placeholder remains (and every shipped network is unset). Load-time and context-free header paths defer accordingly. |
 | Modern chain domain (anti-replay) | IMPLEMENTED | `modern::ModernChainDomain` (`modern/fn.h`), fail-closed on an unpinned boundary; the domain for FN identity and now the modern-PoS seed/eligibility/signature tags. (This row was stale — the constant landed 2026-08-17.) |
-| Block production (miner/`submitblock`) | PARTIAL | `BlockAssembler` is fully phase-aware: refuses legacy-era production, produces corridor templates, and produces deterministic signed modern-PoS blocks (`modern_pos_validator_key` + `SignModernPosBlock`). Remaining: RPC/wallet production wiring, and `DecodeHexBlk` still hard-codes witness serialization (legacy-codec RPC submission gap). |
-| Activation-height framework (A1/A2/A3) | MISSING | Contract §54/§55 require deterministic staged activation; none exists. |
+| Block production (miner/`submitblock`) | PARTIAL | `BlockAssembler` is fully phase-aware: refuses legacy-era production, produces corridor templates, and produces deterministic signed modern-PoS blocks (`modern_pos_validator_key` + `SignModernPosBlock`). `submitblock` and GBT proposal decoding are chain-aware: B3's explicit header marker selects `TX_MODERN`/MPA while unmarked historical blocks retain the exact legacy codec. Remaining: RPC/wallet production wiring. |
+| FN/asset/FlowMesh activation framework | **IMPLEMENTED; mainnet pins pending** | The production schedule enforces the mandatory 810,001 genesis and ordered post-M gates A1/A2/A3, including `A3 >= A2 + 30`. A2 permits FN-seat binding and vault preparation; A3 permits FlowMesh spot trading and vault effects. Missing or contradictory pins fail the gated feature closed. Exact X/manifest/A1/A2/A3 values, release review, and rehearsal remain. |
 
 ## 6. Security and anti-DoS (contract §58–60)
 
@@ -147,17 +163,38 @@ Baseline: commit `a8ad010` (the tip of the completed experimental stack, from wh
 | Structural bounds before cryptography | PARTIAL | Modern `MAX_*` limits are post-decode checks rather than bounded reads (`TransitionProof::payload`, `ModernOutput::policy_params`, vault receipt lists). Harmless while nothing decodes them from a peer; a DoS vector the moment a codec appears. |
 | Test hooks excluded from production | DONE | **D7**: both process-global mutable statics are removed. The modern-PoS validator and the asset-policy activation flag are now per-instance `Consensus::Params` fields (`test_only_modern_pos_validator` null, `test_only_asset_policies_active` false), never set by real chainparams; `CheckModernStake` and the proof helpers take them as arguments. Consensus derives from the chain instance's (post-init-immutable) params, not process state — fail-closed in production, thread-safe by construction. |
 | Cross-era reorg test matrix | PARTIAL | Most rows of contract §60 are covered by `legacy_boundary_tests`, `legacy_identity_tests` and `legacy_transition_tests`. The D1 fork-point predicate is covered directly; `IsAnchorIneligible` classification (off-anchor side branch ineligible and never a candidate; canonical prefix, X, and modern descendants eligible) is covered in the transition fixture, with the D2 header-only rejection, **and the `BLOCK_ANCHOR_INELIGIBLE` marking path is now exercised** by the adversarial full-block case (a signed PoS block with fake-hard `nBits` and a bogus kernel, chainwork exceeding the tip, marked ineligible and kept out of fork choice with the tip unmoved -- no `FatalError`). |
-| Index hash-domain selection | **WRONG** | `src/index/txindex.cpp` and `src/index/txospenderindex.cpp` choose the hash domain from the global chain flag, so a marker-modern block after H yields a scrypt hash present in no block index (contract §7/§67). |
+| Index hash-domain selection / serialization | **DONE** | `txindex` and `txospenderindex` derive block identity with marker-aware `GetMarkerHash` and select legacy or `TX_MODERN` transaction serialization from the actual block codec. Modern witness/MPA data and historical txids therefore survive index write/read without a global-era hash assumption. |
 
-## 7. Deferred subsystems (contract §29–52) — correctly unwired
+## 7. FN, assets, FlowMesh, and bridge (contract §29–52)
 
-Per contract §53, none of these may be wired into consensus before a clean H+1.
+The current transition-release target includes FN Genesis, modern PoD,
+simple-v1 assets, and working FlowMesh spot. A2 enables FN-seat binding and
+vault preparation; A3 enables trading and vault effects after at least 30
+blocks. Each market's epoch-0 anchor is the earliest canonical block at or
+after `market.created_height` whose post-block FN-v2 seat set has at least four
+members; sequence zero waits until that exact anchor is 30 blocks deep.
+Bridge-backed bUSD minting has a separate fail-closed readiness gate and is not
+made safe merely by reaching A3.
 
-**FN economics update (owner ruling 2026-08-28):**
-`RequiredDisintegration` now pins the activation-inert 15,000 / 30,000 /
-60,000 B3 price tiers across a 1,500-slot ceiling. The measured 3,500
-historical count is a height-807,709 floor; the mandatory through-H report
-reduces reachable modern capacity for any additional historical rights.
+**Current implementation summary (2026-09-01):**
+
+| Item | Status | Current state |
+|---|---|---|
+| FlowMesh production path | **IMPLEMENTED; release pins/rehearsal pending** | Spot ledger, deterministic clearing, authenticated certified-log runtime, P2P/service lifecycle, production store, checkpoint/vault plumbing, wallet/RPC surfaces, and A2/A3 gates are wired. A later release is expansion only. |
+| DEX vault and withdrawals | **IMPLEMENTED; release pins/rehearsal pending** | Modern B3A1/MPA policy paths use no `OP_RETURN`; keyless vault custody, receipt nullifiers, forced change, and destination binding are enforced. Pending obligations are capped by deterministic top-64 live pool-UTXO capacity; payout chooses amount descending then outpoint ascending. The publisher sends one withdrawal, waits for confirmation, refreshes state/capacity, rebuilds, then sends the next. |
+| FlowMesh treasury settlement | **IMPLEMENTED; release verification pending** | After each ordinary slot, the deterministic maximal partial flush is `min(accrued treasury available, anchored native capacity - existing pending native withdrawals)` when positive. It never waits for the full balance; zero capacity never blocks trading. |
+| Bridge-backed bUSD | **IMPLEMENTED but consensus fail-closed pending independent gates** | Canonical Ethereum-mainnet USDT (6 decimals) is locked in managed-v1 vault `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`. Minting remains off until all proof, bootstrap, cap, code/authority, adapter, persistence, and activation pins pass review. Later decentralization requires a new audited vault and controlled migration. |
+
+The detailed table below is a **historical implementation snapshot through
+2026-08-31 and is superseded by the current summary above**. Its present-tense
+phrasing must not be read as current release state.
+
+**FN economics update (owner rulings through 2026-08-31):**
+`RequiredDisintegration` pins 15,000 / 30,000 / 60,000 B3 price tiers.
+The measured 3,500 historical count is a height-807,709 floor; final modern
+capacity is exactly `5,000 - R`, where R is the final pinned manifest count.
+Production modern-PoD validation uses those exact tiers and excludes the
+required destruction from producer-claimable fees.
 
 | Item | Status | Notes |
 |---|---|---|
@@ -165,7 +202,7 @@ reduces reachable modern capacity for any additional historical rights.
 | FlowMesh determinism defects | **FIXED (2026-08-19, pass 3 verified; compiled, activation-unwired)** | **D5 all fixed with regression tests** (`flowmesh_batch_tests`, `flowmesh_clearing_tests`): (1) batch dedup is credential-aware — one action id with several credentials authenticates iff ANY does, arrival-order independent (pinned by permuted-input root equality); (2) authentication now precedes equivocation grouping, so a forged action cannot manufacture an equivocation against an honest signer; (3) curve evaluation is a total function (empty/garbage input degrades deterministically, never UB); (4) interpolation is exact in 128-bit where the 64-bit product overflowed; (5) settlement decrements each curve's recorded reservation by exactly what it consumed, so cancel/exhaustion release the exact remainder — nothing strands invisibly. **(6) NEW, found in adversarial self-review beyond the catalogue:** the bid worst-case reservation was a per-segment max-rectangle, but a PERSISTENT curve filled across slots at descending prices can spend up to the staircase SUM `Σ (q_i − q_{i+1})·price_{i+1}` — exceeding the old bound and silently breaking settlement (also protecting the settlement `*Quote` dereference). Reservation corrected to the staircase bound; the adversarial multi-slot sequence (spend 601 > old bound 600) is a pinned test. Pass 2 (owner corrections, verified): SubmitCurve atomic via reservation-delta accounting (no ghost curves; failed first submission/replacement leaves state root byte-identical); zero-demand curves rejected (no free book entries/candidate prices); EvaluateCurve genuinely total (MoneyRange-validated points, 128-bit-widened subtraction, INT64_MIN/MAX safe, UBSan-clean on the real header); no silent masking (CancelCurve keeps the curve on release failure, settlement preflights quotes and per-curve reservation sufficiency, every ledger move checked, exact subtraction — impossible states assert visibly); credential variants canonicalized (sorted, deduplicated, counting-authenticator test pins identical call order across arrival permutations); book commitment canonically framed (v2 domain, curve+breakpoint counts, pinned empty-book vector, layout-mutation distinctness test). Pass 3 (final review corrections, verified): (a) ZERO-PRICE SETTLEMENT — a zero uniform clearing price is a valid outcome (curve validity deliberately permits price-0 breakpoints; banning them would be a market-economics decision, not a bug fix). Previously the zero-amount quote move was rejected by the ledger after the base move succeeded and the engine asserted only after partial mutation. Now the quote leg is an explicit successful no-op while the base leg settles in full; ledger source reservations are preflighted per side/account BEFORE the first settlement mutation; the first leg is checked before the second leg executes; and the invariant asserts are documented honestly as fail-fast aborts, not transactional recovery. Pinned test: 10 lots clear at price 0, zero quote moves, 10 base moves seller→buyer, both curves/reservations unwind exactly, solvency holds, no assertion/partial-failure path (also UBSan-verified). (b) LEDGER ROOT CANONICALLY FRAMED — `Ledger::StateRoot` domain bumped `b3/flowmesh/state/v1` → `v2`; balance, custody and pending-receipt counts now precede each variable-length collection. Empty-ledger v2 root pinned; the framed preimage is reconstructed byte-exactly in a test (and shown NOT to match without the counts); the clearing empty-book root was repinned over the v2 ledger root, so the full engine commitment is framed end to end. (c) The curve-framing test was repaired to genuinely isolate the framing claim: both compared engines hold byte-identical ledger state (equal ledger roots asserted) with the same flattened breakpoint stream split differently across curves, plus a byte-exact framed-preimage reconstruction. Layer remains header-only/test-only and unwired into consensus. |
 | FlowMesh certified-log layer (microblocks) | PARTIAL (compiled, activation-unwired; **owner-accepted direction 2026-08-19; Codex repair pass applied same day**) | The accepted certified-deterministic-execution-log architecture is implemented and tested (commits `bd80478`, `03ef8cb`, `6532f52`, `cc9b10b`, `a23244c`, `49a0852`; decision register [b3-flowmesh-dex-decisions.md](b3-flowmesh-dex-decisions.md)): copyable `FlowMeshState` with a PURE canonical root + separate execution-result commitment (MB-0 atomic candidate execution); `MicroblockCoreV1` with certificate-separate identity; BIP340 attestation certificates with the fault-model threshold relation explicit (`MinCertificateThreshold`, 2t−k>f / t≤k−f); minimal round/lock leader recovery behind interfaces (round-robin provisional); DEPOSIT actions carrying only an outpoint judged by a `DepositVerifier` at an explicit `AnchorRef` (fail-closed; production verifier deliberately unavailable until vault activation); BUY/SELL limit intents as degenerate curves on the unchanged clearing economics; bounded action pool; transport-agnostic `MeshNode` (propose/re-execute/attest/certify/commit, catch-up, equivocation evidence); durable `FlowMeshStore` log (atomic entry+marker appends, re-verifying replay) with certificate-authenticated snapshots; `ChainAnchorPolicy` (OD-6 mechanics, depth = owner input); Schnorr action credentials; fuzz targets for all codecs. B3 gate green (29 suites; 212 cases MEASURED after the four-blocker closure, commit e9a52e4: reachable BID residual band, anchors rechecked after the durable lock write and before proposal signing, store-neutral startup, futures text de-normativized; atop the follow-up pass 178e155: non-copyable signing nodes, executor-only raw state transitions, complete strict store namespace validation with a hard [1,4096] journal bound, exact ask residuals and exhausted-curve rejection at snapshot decode, committed-anchor recheck before execution/cache, marker-free invalid startup; atop the self-audit pass 66a2d3b: vault-checked snapshot decode, serialized store appends + one-validator-per-store, full beyond-tip probe, validated anchor depth, base!=quote guard, de-vacuized Byzantine tests) incl. three-node convergence, restart via the gated StartValidator lifecycle, snapshot full-prefix authentication (chain+certificates+evidence+anchors) with corruption fallback, catch-up with anchor revalidation, vote-split recovery, the k=4/f=1/t=3 split-lock SAFE-non-finalization case (cross-round unlocking: OWNER DECISION), equivocation containment, anchors rechecked immediately before signing and commit, market/execution-config-bound authorization (cross-market replay dead), observer-only public construction (signing only via node::StartValidator), serialized compare-and-set lock journal, store error-vs-missing discipline and fresh-namespace detection, outage isolation. Root cost measured (128 µs @1k / 1.3 ms @10k accounts) — incremental commitment deliberately deferred. Remaining engineering: net_processing/RPC wiring (parked until the FN seat lifecycle exists), production deposit/withdrawal verifiers (base-chain gated). Open owner decisions listed in the register §3. Compiled into the node library; wired into no consensus/networking/RPC path; B3 consensus untouched. Codex repair passes (three, 2026-08-19/20): canonical proposer- AND credential-free semantic microblock identity with admission evidence outside identity, assert-free fallible clearing/settlement, insert-free ledger rejections, exact integer-price bid reservation, ledger-binding removed from the engine (methods take the owning ledger), write-ahead durable lock journal + persist-before-live commit ordering with fail-stop halts, anchor canonicality revalidation of certified history/replay/snapshots, withdrawal lifecycle renamed to REQUESTED (no redeemable view exists), bounded strict decoders throughout, quorum shape validation. |
 | DEX vault | PARTIAL | Keyless custody, forced change, destination binding and sharding implemented; `finalized_slot` unchecked; **one-time receipt consumption has no consensus implementation** (double-consume possible across transactions in a block); does not call `VerifyTransitionProofs` or check proof type. |
-| FN (recognition / license / bond) | PARTIAL (corrected issuance model + libraries; activation-inert) | **Corrected FN model (owner specification 2026-08-18):** FN Coin is ONE global chain-scoped fungible-but-indivisible colored asset — decimals 0, `MAX_FN_EVER_ISSUED = 5000` (ratified 2026-08-22 — the real-history `-podreport` found R = 3,500 qualifying PoDs, all claimable, against the earlier 1,000; raised per the never-truncate-rights rule), every unit under the same `FnAssetId` (TaggedHash("B3/FN/ASSET/V1") ‖ ModernChainDomain; synthetic vectors pinned, mainnet id awaits H/X). PoDId = issuance receipt/nullifier only (`issued[pod_id]`, future state; "claim" terminology retired); FN v1 outputs = {FN_ASSET_ID, whole units, PolicyType::FN v1, ownership commitment, EMPTY params} — no per-PoD objects, no PoDId in outputs, no NativeAsset FN. Historical beneficiary → ownership commitment = SHA256(canonical P2PKH script) (existing script-hash ownership form; no pubkey needed at issuance). `LegacyFnIssuanceActionV1` (creation-action type 2) carries proof + fn_output_index; `VerifyLegacyFnIssuanceAction` returns a pure `LegacyFnMintAuthorization`; `FnSupplyModel`/`CheckFnUnitConservation` model the cap/conservation rules unwired (invariant-checked, overflow-guarded). `FnClaimActionV1` (type 1) = RESERVED/SUPERSEDED frozen bytes — generic framing decodes them, NO FN semantic checker accepts them. Live FN amounts are [1, 5000] (zero balance = no output); the issuance verifier derives the FN asset internally from the chain domain (fail-closed; no caller-nominated asset). **Pre-activation gates recorded, not waived:** (a) type-2 carrier coverage over real history is UNPROVEN against the provisional 4,000-byte bound — activation blocked until the archival builder confirms fit or a reviewed versioned carrier lands; (b) FN/OWNER signature + threshold AUTHORIZATION is not implemented (`VerifyTransitionProof` requires only a nonempty payload) — the beneficiary commitment is a representation, not operational ownership. **Underlying issuance architecture (owner ruling 2026-08-17,** [b3-legacy-fn-issuance-proposal.md](b3-legacy-fn-issuance-proposal.md)**):** legacy PoDs stay plain confirmed legacy transactions; ONE archival builder constructs canonical **proof-carrying FN issuance transactions** (held privately, broadcast at the modern activation height M), and every node verifies them **statelessly** against the H/X-sealed chain — no production PodDB, no every-node legacy rescan, no funding-key claim signatures, no user claim process (the committed-inactive `FnClaimActionV1` signature flow is superseded and awaits retirement in a reviewed commit). Implemented and tested (activation-inert, wired into nothing): `ComputeMerkleRootFromPath` (consensus/merkle), `modern/legacy_fn_issuance.h` (strict proof codec; eligibility = non-coinbase/non-coinstake, gap ≥ tier, **and** a 1-COIN byte-exact-P2PKH output — the historical client's own FN identity rule, verified against `master` `signhelper_mn.h`/`fn-activity.cpp`; canonical recipient = lowest-index such output, no fallback — PoDs without it are IGNORED; stateless verifier that trusts a chain view's merkle roots only after confirming the view's block at H is exactly X; canonical merkle-position rules closing the known proof malleabilities, with deduplication explicitly per PoDId, never by bytes; evidence transactions bounded by the frozen legacy 5,000,000-byte `MAX_BLOCK_SIZE`; pure self-verifying builder), `node/legacy_fn_issuance.{h,cpp}` (archival sweep), `legacy_fn_issuance_tests` (fold/canonicality/codec/recipient units, offline end-to-end with a full sabotage suite incl. wrong-X and position-malleability rejections, chain-backed sweep with independent re-verification and determinism). Still MISSING (activation-phase, height-M spec) — the accurate remaining work: production transition integration (wiring the issuance action into real transaction validation), persistent `issued[pod_id]` and the supply counters (`fn_issued_total` / `fn_live_supply`), transaction-level exactly-one-issuance/output enforcement, conservation wiring into the asset checker, activation itself, and mempool/wallet wiring; plus transfer/extinguishment rules and rewards. (Amount = 1 per historical issuance and the per-output shape checks are already implemented in the inactive verifier.) PodDB/`fn_pod` remain builder-side tooling only. The real `U_master == U_port == U_replay` gate before H/X pinning is unaffected. |
+| FN — current 2026-08-31 activation target | **IMPLEMENTED; release pins/rehearsal pending** | The worktree contains the canonical `{pod_id, recipient_key_hash}` manifest/export, raw-PoD sorting, chain/height/version/count-bound root, exact 810,001 coinbase event, B3A1 owner/FN outputs, ordinary script authorization, conservation, separate A1/A2 gates, and type-6 modern PoD. The modern count is cumulative per branch, persisted in a backward-compatible block-index sidecar, advanced in transaction order, and used for the exact `5,000 - R` cap and 15k/30k/60k tiers. Mempool/miner accounting removes disintegration from fees; reindex/restart paths restore the branch-local count, and `getassetstate` exposes the configured schedule and next slot/tier. Still required before tagging: independent final-H reproduction, X/R0/manifest/A1/A2 pins, full review, and shadow-fork rehearsal. The old proof-fit gate and `issued[pod_id]` state are not work items. |
 | Bridges, PoW-issued assets, advanced issuance | MISSING | Deferred (OD-8, contract §46–47). |
 | Qt / FlowMesh UI | IMPLEMENTED (UI only) | `src/qt/b3*` renders real wallet data or explicit "not available" placeholders; fabricates nothing, calls no FlowMesh or consensus code. |
 
@@ -173,11 +210,11 @@ reduces reachable modern capacity for any additional historical rights.
 
 | Item | Status | Evidence / gap |
 |---|---|---|
-| Modern capability negotiation | PARTIAL | Legacy capability split implemented (`Peer::m_legacy_protocol`, relaxed service bits, protocol caps). `NODE_B3_*` modern capability bits missing. |
+| Modern capability negotiation | IMPLEMENTED | Legacy capability split and modern feature advertisement, including `NODE_B3_FLOWMESH`, are wired. Capability bits describe peer support only; they never override activation or validation gates. |
 | Historical block serving from modern nodes | PARTIAL | Marker-aware serving exists; archival-both-eras story incomplete. |
-| Wallet migration / backup compatibility | PARTIAL | Identity preservation makes both possible, and a modern spend of a pre-H UTXO is exercised in `legacy_transition_tests`. Wallet-level support and tests are not built. |
-| RPC era field / asset_id | MISSING | `getblockchaininfo` gained `moneysupply`/`fn_integrated`; no `"era"` field and no asset metadata RPC. |
-| Indexers preserve historical txids | PARTIAL | Identity is preserved in principle; the index hash-domain defect above must be fixed. |
+| Wallet migration / backup compatibility | PARTIAL | Historical tx identity is preserved. Trusted post-H provenance lets both descriptor and legacy/imported-key wallets recognize and sign the B3A1 owner suffix, while pre-H lookalikes retain their old full-script semantics; focused wallet tests cover the imported-key case. `getwalletassets` inventories exact integer balances/UTXOs, and the write RPCs use native B3 funding/change. Complete backup/migration functional coverage remains. |
+| RPC activation / asset state | **IMPLEMENTED; release verification pending** | `getassetstate` reports next-block FN/asset configuration, heights, FN id/count/capacity/next tier, fee, and treasury. `getwalletassets` reports wallet asset balances and UTXOs. `issueasset`, `sendasset`, `burnasset`, and `createfncoin` construct, fund, sign, and optionally broadcast the four production actions. |
+| Indexers preserve historical txids and modern payloads | DONE | Marker-aware block identity plus codec-aware legacy/witness/`TX_MODERN` transaction serialization are wired in both `txindex` and `txospenderindex`. |
 
 ## 9. Other known defects
 
@@ -221,17 +258,23 @@ captures). H/X must not be pinned and no further replay wiring may be added unti
 passes.
 
 **Step 3 — Modern block validation.**
-Implement `modern::BlockValidator` (context-free, contextual, and reorg prohibition).
-*Modern PoS is blocked on OD-1 and is not part of this step.*
+**DONE through the production validation paths.** The original
+`modern::BlockValidator` interface skeleton is not the dispatch point; the
+context-free, contextual, boundary, corridor, Modern-PoS, and reorg rules are
+enforced by the phase-aware validation code described above.
 
 **Step 4 — Legacy→modern spend and block production.**
-Wire `ViewLegacyCoin` plus a frozen `FINAL_LEGACY_RULESET` into the modern spend path; make
-the miner and `submitblock` marker-aware so the node can produce a modern block; fix the
-index hash-domain defect.
+**CODE COMPLETE; RELEASE REHEARSAL PENDING.** The frozen legacy spend context, phase-aware miner, marker-aware
+block identity, codec-aware index serialization, and chain-aware
+`DecodeHexBlk`/submission path are wired. Raw B3 block provenance comes from
+the explicit header marker; the decoder never guesses from height or payload.
 
 **Step 5 — Activation plumbing.**
-H/X as mainnet consensus constants with no runtime override (regtest/testnet override
-facility per contract §64); the staged activation-height framework for A1/A2/A3.
+**CODE COMPLETE; SEAL PINS PENDING.** H is fixed and the fail-closed production
+framework covers X, the full FN manifest/count/root, mandatory 810,001 genesis
+coinbase, and the ordered post-M A1 modern-PoD, A2 asset/seat/vault-preparation,
+and A3 FlowMesh-spot gates. The seal-derived X/R0/manifest and owner-selected
+A1/A2/A3 values still require pinning.
 
 **Step 6 — Modern PoS.** ~~Blocked on OD-1~~ **DONE as the frozen V1**
 (2026-08-21): eligibility, seed chain, exact-timestamp rounds, the
@@ -239,15 +282,16 @@ unconditional issuance cap, the coinbase key declaration + trailing BIP340
 block signature, PoS-native fork choice with the horizon, tracker, and
 deterministic production — implemented, regtest-exercised end to end
 (`modern_pos_tests`), and fail-closed on every shipped network until the
-spec-§9 numbers, the horizon D, and the STAKE carrier are ratified (after
-the Step-2 equivalence gate, as always). Gate MEASURED at this commit: the
-29 established B3 suites plus `modern_pos_tests` — 30 suites, 217 cases,
-green.
+seal-derived X/R0 and full ModernPosParams block are pinned (after the Step-2
+equivalence gate, as always). The §9 numbers, horizon D, and STAKE carrier are
+ratified. Current verification counts are recorded in the release runbook and
+CI rather than frozen in this status document.
 
-Steps 1–4 and 6 are complete on regtest: the chain now produces and
-validates blocks in all three phases. Step 5 (activation plumbing) and the
-Step-2 operator gate remain before any mainnet pinning; the index
-hash-domain defect (Step 4's last item) is still open.
+The transition/FN/asset/FlowMesh paths produce and validate all three phases
+on regtest, including FN Genesis and the later A1/A2/A3 feature gates. Before the
+tag, finish Step 2's final-H operator gate,
+exact X/R0/manifest/A1/A2/A3 pins, full release verification (including the new
+wallet RPC surface), and the shadow-fork rehearsal.
 
 ---
 
@@ -281,10 +325,11 @@ added as release-blocker 14A):
 | Binding-tx relay path (cell standardness, dust exemption, TX_MODERN wire, mempool pre-check) | DONE | `script/solver`, `policy`, `net_processing`, `validation` |
 | **F = M activation** (`Consensus::ModernObjectRulesActive`: H + X + Modern-PoS rule set) | DONE | `consensus/era.h`; every shipped network fail-closed (`finality_activation_tests`) |
 
-Still open before the X-pin release: pin the actual X/H/M parameters and the
-three provisional `ModernPosParams` values (`sentinel_bits` — any fixed easy
-target works, tree default `0x207fffff`; `max_future_seconds` — 120 s matches
-the ratified corridor pacing ruling; `reward` — OD-2 economics, owner ruling
-required), seeds/CI, and the Step-2 operator equivalence gate. Canonical unit
-baseline after commit 18: see the batch report (204 registered suites; the
-same 19 known stock-vector/fixture failures as the pre-batch baseline).
+Still open before the transition release: final X/S_H/R0; the final-H
+three-way equivalence gate; independent byte-identical FN manifest/count/root
+production; exact owner-pinned A1/A2/A3 heights; real-history shadow-fork
+rehearsal; and the release signing/CI gates. The old proof-carrier size
+measurement is no longer an
+activation gate. Canonical unit baseline after commit 18: see the batch report
+(204 registered suites; the same 19 known stock-vector/fixture failures as the
+pre-batch baseline).

@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <string_view>
 
 /** Message header.
  * (4) message start.
@@ -264,6 +265,20 @@ inline constexpr const char* WTXIDRELAY{"wtxidrelay"};
  * txreconciliation, as described by BIP 330.
  */
 inline constexpr const char* SENDTXRCNCL{"sendtxrcncl"};
+/** FlowMesh v1 capability/market summary after the B3 version handshake. */
+inline constexpr const char* FMHELLO{"fmhello"};
+/** One bounded, authenticated user/deposit action. */
+inline constexpr const char* FMACTION{"fmaction"};
+/** One bounded production proposal envelope. */
+inline constexpr const char* FMPROP{"fmprop"};
+/** One BLS seat attestation. */
+inline constexpr const char* FMATTEST{"fmattest"};
+/** One certified production entry or epoch handoff. */
+inline constexpr const char* FMCERT{"fmcert"};
+/** One bounded FlowMesh catch-up request. */
+inline constexpr const char* FMGET{"fmget"};
+/** One solicited, bounded FlowMesh catch-up response. */
+inline constexpr const char* FMENTRIES{"fmentries"};
 /**
  * B3 modern-era finality signature gossip (liveness only, never consensus):
  * u64 epoch || u64 checkpoint height || u32 signer index || 96-byte BLS
@@ -272,6 +287,29 @@ inline constexpr const char* SENDTXRCNCL{"sendtxrcncl"};
  */
 inline constexpr const char* FINSIG{"finsig"};
 }; // namespace NetMsgType
+
+/** FlowMesh traffic is always lower scheduling priority than ordinary B3. */
+inline constexpr bool IsFlowMeshMessageType(const std::string_view type)
+{
+    return type == NetMsgType::FMHELLO || type == NetMsgType::FMACTION ||
+           type == NetMsgType::FMPROP || type == NetMsgType::FMATTEST ||
+           type == NetMsgType::FMCERT || type == NetMsgType::FMGET ||
+           type == NetMsgType::FMENTRIES;
+}
+
+/**
+ * Total queue rank: ordinary B3 first, then cert/attest, proposal, action,
+ * catch-up. A lower number is served first. This ranking is used on both the
+ * completed receive queue and the not-yet-handed-to-transport send queue.
+ */
+inline constexpr unsigned NetMessageQueueRank(const std::string_view type)
+{
+    if (!IsFlowMeshMessageType(type)) return 0;
+    if (type == NetMsgType::FMCERT || type == NetMsgType::FMATTEST) return 1;
+    if (type == NetMsgType::FMPROP) return 2;
+    if (type == NetMsgType::FMACTION) return 3;
+    return 4;
+}
 
 /** All known message types (see above). Keep this in the same order as the list of messages above. */
 inline const std::array ALL_NET_MESSAGE_TYPES{std::to_array<std::string>({
@@ -310,6 +348,13 @@ inline const std::array ALL_NET_MESSAGE_TYPES{std::to_array<std::string>({
     NetMsgType::CFCHECKPT,
     NetMsgType::WTXIDRELAY,
     NetMsgType::SENDTXRCNCL,
+    NetMsgType::FMHELLO,
+    NetMsgType::FMACTION,
+    NetMsgType::FMPROP,
+    NetMsgType::FMATTEST,
+    NetMsgType::FMCERT,
+    NetMsgType::FMGET,
+    NetMsgType::FMENTRIES,
     NetMsgType::FINSIG,
 })};
 
@@ -336,6 +381,11 @@ enum ServiceFlags : uint64_t {
 
     // NODE_P2P_V2 means the node supports BIP324 transport
     NODE_P2P_V2 = (1 << 11),
+
+    // B3 FlowMesh v1 messages over the existing B3 P2P connection. This is a
+    // capability advertisement only; it never changes block validity and no
+    // separate listener/port is opened.
+    NODE_B3_FLOWMESH = (1 << 24),
 
     // Bits 24-31 are reserved for temporary experiments. Just pick a bit that
     // isn't getting used, or one not being used much, and notify the

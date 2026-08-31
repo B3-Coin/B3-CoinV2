@@ -30,8 +30,9 @@ authority merely by declaring precedence. The persistent order is:
 
 - **[doc/design/b3-master-handoff.md](doc/design/b3-master-handoff.md)** — the **top
   authority**. The complete project concept: one chain, three economic roles (B3+STAKE
-  secures the base chain, FN Coin operates FlowMesh, approved stablecoins denominate
-  trading), the transition corridor, colored assets, FN Coin / Proof of Disintegration,
+  secures the base chain, FN Coin operates FlowMesh, registered assets trade against
+  native B3 and FlowMesh fees are native B3), the transition corridor, colored assets,
+  FN Coin / Proof of Disintegration,
   the FlowMesh DEX, microblocks, the 12-step build order, and Claude's operating
   contract. Where it disagrees with any other document here, **it governs** — subject
   only to its own §0 precedence order (the owner's later explicit corrections outrank
@@ -48,6 +49,11 @@ authority merely by declaring precedence. The persistent order is:
 - **[doc/design/b3-implementation-status.md](doc/design/b3-implementation-status.md)** —
   the implementation-status / gap matrix: what is LOCKED / IMPLEMENTED / PARTIAL / WRONG /
   MISSING / SECURITY-BLOCKER, and the minimal critical path to a clean H+1.
+- **[doc/design/b3-fn-assets-activation-design.md](doc/design/b3-fn-assets-activation-design.md)**
+  and **[doc/design/b3-flowmesh-v1-production.md](doc/design/b3-flowmesh-v1-production.md)** —
+  the current transition-release contracts for FN Genesis, simple assets and production
+  FlowMesh. These implement later explicit owner rulings and therefore supersede older
+  documents that defer those features to another release.
 - [doc/design/b3-legacy-fork-choice.md](doc/design/b3-legacy-fork-choice.md) — how a
   legacy PoS block earns chain weight, traced from the historical `master` client. The
   reference for legacy-era anti-DoS work.
@@ -61,23 +67,34 @@ authority merely by declaring precedence. The persistent order is:
 1. **Do not silently alter the locked architecture to solve an implementation problem.**
    If code contradicts the contract, **report the contradiction** — do not choose a new
    protocol.
-2. **Sequencing (do not skip):** reach a clean, produced-and-validated **H+1** before
-   wiring any of FlowMesh, FN, bridges, or advanced/coloured assets into consensus.
-   Those are Phase-3 features gated behind later activation heights (A1/A2/A3).
-3. **Modern PoS:** not implemented until its consensus spec is supplied
-   (see open-decisions). It currently fails closed by design.
+2. **Sequencing (do not skip):** preserve the implemented H/X transition and Modern-PoS
+   rules. FN PoD, assets and FlowMesh remain separately height-gated at A1/A2/A3; an
+   incomplete mainnet schedule must fail closed.
+3. **Modern PoS:** the reviewed V1 implementation is present. Do not replace or redesign
+   it while implementing later activation-gated features.
 4. **Genesis is permanent.** Never regenerate it, change its bytes/nonce/bits/time/merkle/
    hash, apply the modern marker to it, or reinterpret historical blocks with the modern
    codec. If a task appears to require any of these, stop and report.
-5. **Small, buildable commits.** One logical change per commit; each must build and be
+5. **Bridge-backed bUSD (latest owner ruling):** bUSD is the B3 representation of USDT
+   locked through the Ethereum bridge, not the earlier CDP proposal and not an
+   unrestricted fixed-supply token. The managed-v1 vault is exactly
+   `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`, with Ethereum-mainnet
+   canonical USDT `0xdAC17F958D2ee523a2206206994597C13D831ec7` and exact six-decimal
+   conversion. Authority, runtime code, bootstrap, caps, adapter, persistence,
+   and activation pins must all pass independent review before mainnet minting.
+6. **Managed withdrawal leg for transition v1 (owner ruling 2026-09-01):** the
+   already-deployed vault's immutable owner authority is intentionally used for
+   withdrawals in this release. Label it honestly; do not describe the release
+   leg as decentralized. Pin the authority and runtime code from independent
+   mainnet observations before activation. A future verifier requires a new
+   vault and explicit reserve migration because this authority is immutable.
+7. **Small, buildable commits.** One logical change per commit; each must build and be
    independently reviewable.
 
 ## Git rules
 
-- Work on branch **`test/b3-clean-architecture`** (renamed from `claude/b3-clean-architecture`
-  on 2026-08-23 at the owner's request; branched from `a8ad010`, the tip of
-  the completed experimental stack — **not** from the older `claude/b3-full-architecture`
-  checkout, which carries defects fixed later).
+- Work only on the already checked-out branch **`release/transition`**. Do not switch,
+  recreate or merge another FlowMesh/Claude branch into it.
 - Do not push, amend, squash, reset, rebase, or rewrite history. Do not modify previous
   commits.
 - **Never** add AI/assistant attribution to commits (no "Claude", "Anthropic",
@@ -98,9 +115,9 @@ authority merely by declaring precedence. The persistent order is:
   transition boundary (`boundary.h`). Wired and live.
 - `src/legacy/` — legacy consensus (PoS kernel, stake modifier, rewards, difficulty, FN
   collateral), legacy codec, and `TrustedReplay` (historical UTXO reconstruction).
-- `src/modern/` — modern data models (policy outputs, transition proofs, assets, vault,
-  PoS dispatch). Header-only; only `modern/pos.h` is reachable from validation, and it
-  fails closed.
-- `src/flowmesh/` — DEX execution models (ledger, clearing, batch). Header-only,
-  test-only. **Not** wired into consensus.
+- `src/modern/` — modern data models and the live, activation-gated FN/assets/FlowMesh
+  carrier and validation rules.
+- `src/flowmesh/` and `src/node/flowmesh_*` — production execution, BLS-certified log,
+  persistence, chain indexes, P2P runtime and service. FlowMesh uses existing B3 P2P and
+  must remain fail-independent from base-chain liveness.
 - `src/qt/` — B3/FlowMesh UI shell. Renders no fabricated data; does not touch consensus.

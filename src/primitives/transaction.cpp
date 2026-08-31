@@ -93,11 +93,15 @@ Txid CTransaction::ComputeHash() const
 
 Wtxid CTransaction::ComputeWitnessHash() const
 {
-    if (!HasWitness()) {
+    // B3 reuses the existing wtxid-shaped mempool/relay slot for the
+    // normative full-payload identity. This keeps every exact-byte identity
+    // map keyed by witness + MPA rather than allowing distinct evidence
+    // variants to alias under one relay identifier.
+    if (!HasOptionalData()) {
         return Wtxid::FromUint256(hash.ToUint256());
     }
 
-    return Wtxid::FromUint256((HashWriter{} << TX_WITH_WITNESS(*this)).GetHash());
+    return Wtxid::FromUint256((HashWriter{} << TX_MODERN(*this)).GetHash());
 }
 
 Ptxid CTransaction::ComputePtxid() const
@@ -129,7 +133,7 @@ CAmount CTransaction::GetValueOut() const
 
 unsigned int CTransaction::ComputeTotalSize() const
 {
-    return ::GetSerializeSize(TX_WITH_WITNESS(*this));
+    return ::GetSerializeSize(TX_MODERN(*this));
 }
 
 std::string CTransaction::ToString() const

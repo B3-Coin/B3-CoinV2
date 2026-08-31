@@ -26,6 +26,8 @@
 #include <interfaces/mining.h>
 #include <kernel/coinstats.h>
 #include <logging/timer.h>
+#include <modern/asset_validation.h>
+#include <modern/fn_pod.h>
 #include <net.h>
 #include <net_processing.h>
 #include <node/finality_signature.h>
@@ -3605,6 +3607,100 @@ static RPCHelpMan getfinalitystatus()
     };
 }
 
+static RPCHelpMan getassetstate()
+{
+    return RPCHelpMan{
+        "getassetstate",
+        "Return the activation and branch-local issuance state for FN Coin and simple-v1 assets.\n"
+        "Heights and the FN PoD slot are evaluated for the next block.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::NUM, "next_height", "Height for which activation is evaluated"},
+            {RPCResult::Type::OBJ, "fn", "FN Coin state", {
+                {RPCResult::Type::BOOL, "configured", "Whether the sealed FN Genesis configuration is complete"},
+                {RPCResult::Type::BOOL, "active", "Whether FN ownership and transfer rules are active at next_height"},
+                {RPCResult::Type::STR_HEX, "asset_id", /*optional=*/true, "Chain-scoped FN asset id"},
+                {RPCResult::Type::NUM, "genesis_height", /*optional=*/true, "Mandatory historical FN Genesis height"},
+                {RPCResult::Type::NUM, "historical_issued", "Number of historical FN units in the sealed manifest"},
+                {RPCResult::Type::NUM, "pod_activation_height", /*optional=*/true, "First modern FN PoD height"},
+                {RPCResult::Type::BOOL, "pod_active", "Whether modern FN PoD is active at next_height"},
+                {RPCResult::Type::BOOL, "counter_known", "Whether the branch-local modern issuance counter is available"},
+                {RPCResult::Type::NUM, "modern_issued", /*optional=*/true, "Modern FN units created through the active tip"},
+                {RPCResult::Type::NUM, "modern_capacity", /*optional=*/true, "Maximum modern FN units allowed by the historical manifest"},
+                {RPCResult::Type::NUM, "next_slot", /*optional=*/true, "Slot the next modern FN PoD must declare"},
+                {RPCResult::Type::NUM, "tier", /*optional=*/true, "Disintegration tier for next_slot (1, 2, or 3)"},
+                {RPCResult::Type::STR_AMOUNT, "required_disintegration", /*optional=*/true, "Native B3 destroyed by the next modern FN PoD"},
+            }},
+            {RPCResult::Type::OBJ, "colored", "Simple-v1 colored-asset state", {
+                {RPCResult::Type::BOOL, "configured", "Whether the production activation schedule is complete"},
+                {RPCResult::Type::NUM, "activation_height", /*optional=*/true, "First simple-v1 asset height"},
+                {RPCResult::Type::BOOL, "active", "Whether simple-v1 assets are active at next_height"},
+                {RPCResult::Type::STR_AMOUNT, "issuance_fee", "Native B3 treasury payment required for issuance"},
+                {RPCResult::Type::STR_HEX, "treasury_script", /*optional=*/true, "Consensus treasury script receiving issuance fees"},
+            }},
+        }},
+        RPCExamples{HelpExampleCli("getassetstate", "") + HelpExampleRpc("getassetstate", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+
+            LOCK(cs_main);
+            const CBlockIndex* tip{chainman.ActiveChainstate().m_chain.Tip()};
+            const int next_height{tip ? tip->nHeight + 1 : 0};
+            const std::optional<uint32_t> issued{
+                GetFnPodIssuedThrough(tip, consensus)};
+            const std::optional<uint32_t> capacity{
+                modern::ModernFnCapacity(consensus)};
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("next_height", next_height);
+
+            UniValue fn{UniValue::VOBJ};
+            fn.pushKV("configured", Consensus::FnGenesisConfigured(consensus));
+            fn.pushKV("active", Consensus::FnRulesActive(next_height, consensus));
+            if (const auto asset_id{modern::ConfiguredFnAssetId(consensus)}) {
+                fn.pushKV("asset_id", asset_id->GetHex());
+            }
+            if (consensus.hard_fork_height) {
+                fn.pushKV("genesis_height", *consensus.hard_fork_height);
+            }
+            fn.pushKV("historical_issued",
+                      static_cast<uint64_t>(consensus.fn_genesis_manifest.size()));
+            if (consensus.fn_pod_activation_height) {
+                fn.pushKV("pod_activation_height", *consensus.fn_pod_activation_height);
+            }
+            fn.pushKV("pod_active", Consensus::FnPodRulesActive(next_height, consensus));
+            fn.pushKV("counter_known", issued.has_value());
+            if (issued) fn.pushKV("modern_issued", *issued);
+            if (capacity) fn.pushKV("modern_capacity", *capacity);
+            if (issued && capacity && *issued < *capacity) {
+                fn.pushKV("next_slot", *issued);
+                const int tier{*issued < 500 ? 1 : (*issued < 1'000 ? 2 : 3)};
+                fn.pushKV("tier", tier);
+                fn.pushKV("required_disintegration",
+                          ValueFromAmount(modern::RequiredFnPodDisintegration(*issued)));
+            }
+            result.pushKV("fn", std::move(fn));
+
+            UniValue colored{UniValue::VOBJ};
+            colored.pushKV("configured",
+                           Consensus::FnAssetActivationScheduleConfigured(consensus));
+            if (consensus.asset_activation_height) {
+                colored.pushKV("activation_height", *consensus.asset_activation_height);
+            }
+            colored.pushKV("active", Consensus::AssetRulesActive(next_height, consensus));
+            colored.pushKV("issuance_fee",
+                           ValueFromAmount(modern::ASSET_ISSUANCE_TREASURY_FEE));
+            if (consensus.modern_pos && !consensus.modern_pos->treasury_script.empty()) {
+                colored.pushKV("treasury_script",
+                               HexStr(consensus.modern_pos->treasury_script));
+            }
+            result.pushKV("colored", std::move(colored));
+            return result;
+        },
+    };
+}
+
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -3633,6 +3729,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &loadtxoutset},
         {"blockchain", &getchainstates},
         {"blockchain", &getfinalitystatus},
+        {"blockchain", &getassetstate},
         {"hidden", &invalidateblock},
         {"hidden", &reconsiderblock},
         {"blockchain", &waitfornewblock},

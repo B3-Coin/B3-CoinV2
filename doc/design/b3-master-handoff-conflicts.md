@@ -291,6 +291,25 @@ revenue-distribution economics remain OPEN. Contract §51 continues to
 govern those unresolved subjects.
 
 
+## C-R6 — proof-carrying historical FN issuance — **SUPERSEDED (owner ruling 2026-09-01)**
+
+C-R4's archival-builder/type-2 proof architecture is no longer the activation
+design. The transition release independently reproduces and pins the complete
+canonical rights manifest, count R, and Merkle root. Block 810,001 coinbase
+creates one amount-1 FN output per manifest row in canonical order, directly to
+the exact historical P2PKH owner commitment. There are no holder claims,
+issuance transactions, historical proof payloads, deadlines, or fees. Ordinary
+30-block coinbase maturity is the only transfer delay.
+
+Action types 1 and 2 keep their identifiers but are dead and semantically
+rejected. The 4,000-byte fit gate and `issued[pod_id]` state are removed from
+the work queue. Final modern capacity is `5,000 - R`; the price table remains
+15,000 / 30,000 / 60,000 B3 over successive 500-unit tiers, activated at
+post-M A1; simple-v1 assets activate at A2. This entry supersedes C-R4's
+positive direction and C-R5's separate 1,500-slot ceiling; their historical
+descriptions remain useful only for understanding inactive code.
+
+
 ## 2026-08-22 — AssetId derivation vs contract §21 (RESOLVED by owner ruling)
 
 Contract §21 specified `AssetId = H("B3/ASSET" ‖ issuance_outpoint ‖
@@ -303,6 +322,32 @@ genuine tagged hashing, matching the FN asset id. Treat §21 as reading this
 form. No mainnet asset was ever issued, so nothing historical changes.
 
 
-## 2026-08-22 — Fee/quote asset: native bUSD vs "USDT-like" / register L-3 (RESOLVED by owner ruling)
+## 2026-08-22 — Fee/quote asset: native bUSD vs "USDT-like" / register L-3 (HISTORICAL; SUPERSEDED 2026-09-01)
+
+The paragraph below records the 2026-08-22 ruling only. It is not the current
+FlowMesh fee or bUSD specification; the 2026-09-01 supersession immediately
+following it governs.
 
 Handoff §1.2 names "approved USDC/USDT-like assets" for settlement and fee denomination, §3.5 says "approved stablecoin AssetId", and the DEX register's L-3 (2026-08-19) said "denominated in USDT (a USDT-backed colored coin)". The owner ruled 2026-08-22 that FlowMesh's first real quote/fee asset is the **B3-native overcollateralized (CDP-backed) bUSD** (register L-6) and amended L-3 to "an approved dollar-stable `AssetId`" with bUSD first and bridged USDT/USDC addable later by explicit ruling. Treat §1.2/§3.5 as reading "approved dollar-stable AssetIds, native or bridged"; §3.5's rule that no asset qualifies by ticker and that base-chain liveness never depends on a stablecoin issuer is unchanged and strengthened (no issuer at all for bUSD). Handoff §3.6 (TEST_USDT before real bridges) is unchanged — TEST_USDT remains the regtest/testing quote asset; bUSD is the first *mainnet* one. Design record: [b3-native-stable-proposal.md](b3-native-stable-proposal.md); bridge direction: open-decisions OD-8.
+
+
+## 2026-09-01 — bUSD identity and FlowMesh release placement (RESOLVED by owner supersession)
+
+The owner superseded the 2026-08-22 native-CDP ruling: production bUSD is the
+`BRIDGE_BACKED` asset minted 1:1 from canonical Ethereum-mainnet USDT locked in
+vault `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`. The full pinned tuple also
+includes chain id 1, token `0xdAC17F958D2ee523a2206206994597C13D831ec7`,
+and 6-decimal exact conversion. The native-CDP proposal remains history only.
+
+The owner also moved working spot FlowMesh into the transition release: A2
+pre-binds seats; A3 activates trading after at least 30 blocks. Fees are 100
+ppm of matched native-B3 notional, split 80/20 between active seats and
+treasury. Bridge minting remains independently fail-closed until every
+security, bootstrap, cap, adapter and activation pin is present.
+
+The owner further ruled that transition v1 deliberately uses this deployed
+vault's immutable owner-controlled release authority. Withdrawals are managed
+in v1 and must be disclosed as such; proof verification still governs inbound
+minting. The exact authority and runtime code hash remain activation pins. A
+future decentralized verifier cannot replace this authority in place and
+therefore requires a new approved vault plus an explicit reserve migration.

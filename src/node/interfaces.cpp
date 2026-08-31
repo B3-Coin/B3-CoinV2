@@ -33,10 +33,13 @@
 #include <node/coin.h>
 #include <consensus/era.h>
 #include <modern/chain_domain.h>
+#include <modern/fn_pod.h>
 #include <node/context.h>
 #include <node/finality_binding_index.h>
 #include <node/finality_signature.h>
 #include <node/finality_tracker.h>
+#include <node/flowmesh_service.h>
+#include <node/flowmesh_vault_index.h>
 #include <node/interface_ui.h>
 #include <node/mini_miner.h>
 #include <node/miner.h>
@@ -855,6 +858,43 @@ public:
             notifications.transactionAddedToMempool(entry.GetSharedTx());
         }
     }
+    std::optional<interfaces::ModernCreationSnapshot> modernCreationSnapshot(
+        const bool inspect_fn_pool, std::string& error) override
+    {
+        if (!m_node.mempool) {
+            error = "Mempool disabled or instance not found";
+            return std::nullopt;
+        }
+        LOCK2(::cs_main, m_node.mempool->cs);
+        const CBlockIndex* tip{chainman().ActiveChain().Tip()};
+        if (!tip) {
+            error = "Active chain has no tip";
+            return std::nullopt;
+        }
+        interfaces::ModernCreationSnapshot snapshot;
+        snapshot.tip_hash = tip->GetBlockHash();
+        snapshot.next_height = tip->nHeight + 1;
+        if (!inspect_fn_pool) {
+            error.clear();
+            return snapshot;
+        }
+
+        const Consensus::Params& params{chainman().GetConsensus()};
+        if (!params.fn_pod_activation_height ||
+            tip->nHeight < *params.fn_pod_activation_height) {
+            snapshot.fn_issued_before = uint32_t{0};
+        } else if (tip->m_fn_pod_issued_total_known) {
+            snapshot.fn_issued_before = tip->m_fn_pod_issued_total;
+        }
+        for (const CTxMemPoolEntry& entry : m_node.mempool->entryAll()) {
+            if (modern::HasModernFnPodDeclaration(entry.GetTx())) {
+                snapshot.pending_fn_pod = true;
+                break;
+            }
+        }
+        error.clear();
+        return snapshot;
+    }
     bool hasAssumedValidChain() override
     {
         LOCK(::cs_main);
@@ -958,6 +998,183 @@ public:
             return false;
         }
         return m_node.staking->ClearFinalityKey(error);
+    }
+    std::vector<interfaces::FlowMeshMarketStatus> flowMeshMarkets(
+        const std::optional<uint256>& account_id) override
+    {
+        if (!m_node.flowmesh) return {};
+        std::vector<interfaces::FlowMeshMarketStatus> out;
+        const auto markets{m_node.flowmesh->Markets()};
+        out.reserve(markets.size());
+        for (const auto& market : markets) {
+            const auto status{flowMeshMarketStatus(market.market_id,
+                                                   account_id)};
+            if (status) out.push_back(*status);
+        }
+        return out;
+    }
+    std::optional<interfaces::FlowMeshMarketStatus> flowMeshMarketStatus(
+        const uint256& market_id,
+        const std::optional<uint256>& account_id) override
+    {
+        if (!m_node.flowmesh) return std::nullopt;
+        const auto market{m_node.flowmesh->Market(market_id)};
+        if (!market) return std::nullopt;
+        interfaces::FlowMeshMarketStatus out;
+        out.available = m_node.flowmesh->Enabled();
+        out.running = m_node.flowmesh->Running();
+        out.domain = market->domain;
+        out.market_id = market->market_id;
+        out.vault_id = market->vault_id;
+        out.base_asset = market->base_asset;
+        out.quote_asset = market->quote_asset;
+        out.execution_config_id = market->execution_config_id;
+        if (const auto runtime{m_node.flowmesh->MarketStatus(market_id)}) {
+            out.epoch = runtime->epoch;
+            out.next_microblock_sequence = runtime->next_sequence;
+            out.next_effect_index = runtime->next_effect_index;
+            out.round = runtime->round;
+            out.last_microblock_hash = runtime->last_microblock_hash;
+            out.state_root = runtime->state_root;
+            out.pending_actions = runtime->pending_actions;
+            out.observer_only = runtime->observer_only;
+            out.paused = runtime->paused;
+            out.pending_handoff = runtime->pending_handoff;
+            out.halt = node::FlowMeshRuntimeHaltName(runtime->halt);
+            out.error = runtime->error;
+        }
+        std::string checkpoint_error;
+        if (const auto checkpoint{m_node.flowmesh->NextCheckpointMpa(
+                market_id, checkpoint_error)}) {
+            out.checkpoint_pending = true;
+            out.pending_checkpoint_id = checkpoint->checkpoint_id;
+            out.pending_checkpoint_sequence = checkpoint->sequence;
+            out.pending_checkpoint_effect_count = checkpoint->effect_count;
+        }
+        if (account_id) {
+            out.account_id = *account_id;
+            if (const auto state{m_node.flowmesh->StateSnapshot(market_id)}) {
+                out.next_account_sequence = state->NextSequence(*account_id);
+                out.slot = state->Slot();
+                out.base_available = state->LedgerView().Available(
+                    *account_id, market->base_asset);
+                out.base_reserved = state->LedgerView().Reserved(
+                    *account_id, market->base_asset);
+                out.b3_available = state->LedgerView().Available(
+                    *account_id, modern::NativeAsset());
+                out.b3_reserved = state->LedgerView().Reserved(
+                    *account_id, modern::NativeAsset());
+            }
+        }
+        return out;
+    }
+    bool flowMeshMarketEstablished(const uint256& market_id) override
+    {
+        LOCK(::cs_main);
+        Chainstate& chainstate{chainman().ActiveChainstate()};
+        const CBlockIndex* tip{chainstate.m_chain.Tip()};
+        if (!tip) return false;
+        node::FlowMeshVaultTracker& tracker{chainstate.ModernFlowMeshVaults()};
+        if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman,
+                          chainman().GetConsensus(), *tip)) {
+            return false;
+        }
+        return tracker.Index().Market(market_id).has_value();
+    }
+    bool submitFlowMeshAction(const uint256& market_id,
+                              const flowmesh::Action& action,
+                              std::string& error) override
+    {
+        if (!m_node.flowmesh) {
+            error = "FlowMesh service is not available in this node";
+            return false;
+        }
+        return m_node.flowmesh->SubmitLocalAction(market_id, action, error);
+    }
+    bool armFlowMeshSeatKeys(const std::vector<bls::SecretKey>& keys,
+                             std::string& error) override
+    {
+        if (!m_node.flowmesh) {
+            error = "FlowMesh service is not available in this node";
+            return false;
+        }
+        return m_node.flowmesh->ArmSeatKeys(keys, error);
+    }
+    bool disarmFlowMeshSeatKeys(std::string& error) override
+    {
+        if (!m_node.flowmesh) {
+            error = "FlowMesh service is not available in this node";
+            return false;
+        }
+        m_node.flowmesh->DisarmSeatKeys();
+        return true;
+    }
+    std::optional<interfaces::FlowMeshPendingCheckpoint>
+    nextFlowMeshCheckpoint(const uint256& market_id,
+                           std::string& error) override
+    {
+        if (!m_node.flowmesh) {
+            error = "FlowMesh service is not available in this node";
+            return std::nullopt;
+        }
+        const auto pending{m_node.flowmesh->NextCheckpointMpa(market_id,
+                                                              error)};
+        if (!pending) return std::nullopt;
+        return interfaces::FlowMeshPendingCheckpoint{
+            pending->record, pending->checkpoint_id, pending->sequence,
+            pending->effect_count};
+    }
+    std::optional<interfaces::FlowMeshVaultOperation>
+    flowMeshVaultOperation(const uint256& effect_id,
+                           std::string& error) override
+    {
+        if (!m_node.flowmesh) {
+            error = "FlowMesh service is not available in this node";
+            return std::nullopt;
+        }
+        const auto operation{m_node.flowmesh->VaultOperation(effect_id,
+                                                              error)};
+        if (!operation) return std::nullopt;
+        interfaces::FlowMeshVaultOperation out;
+        out.market_id = operation->market_id;
+        out.checkpoint_id = operation->checkpoint_id;
+        out.record = operation->record;
+        out.effect = operation->effect;
+        out.inputs.reserve(operation->inputs.size());
+        for (const auto& input : operation->inputs) {
+            out.inputs.push_back(
+                interfaces::FlowMeshVaultInput{input.record.outpoint,
+                                               input.txout});
+        }
+        return out;
+    }
+    std::vector<interfaces::FlowMeshVaultOperation>
+    flowMeshVaultOperations(const std::optional<uint256>& market_id,
+                            std::string& error) override
+    {
+        if (!m_node.flowmesh) {
+            error = "FlowMesh service is not available in this node";
+            return {};
+        }
+        const auto operations{
+            m_node.flowmesh->VaultOperations(market_id, error)};
+        std::vector<interfaces::FlowMeshVaultOperation> out;
+        out.reserve(operations.size());
+        for (const auto& operation : operations) {
+            interfaces::FlowMeshVaultOperation item;
+            item.market_id = operation.market_id;
+            item.checkpoint_id = operation.checkpoint_id;
+            item.record = operation.record;
+            item.effect = operation.effect;
+            item.inputs.reserve(operation.inputs.size());
+            for (const auto& input : operation.inputs) {
+                item.inputs.push_back(
+                    interfaces::FlowMeshVaultInput{input.record.outpoint,
+                                                   input.txout});
+            }
+            out.push_back(std::move(item));
+        }
+        return out;
     }
 
     NodeContext* context() override { return &m_node; }

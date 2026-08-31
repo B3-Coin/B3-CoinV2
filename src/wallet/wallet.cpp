@@ -20,6 +20,7 @@
 #include <common/system.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/era.h>
 #include <consensus/validation.h>
 #include <external_signer.h>
 #include <interfaces/chain.h>
@@ -31,6 +32,7 @@
 #include <key_io.h>
 #include <legacy/consensus.h>
 #include <logging.h>
+#include <modern/asset_output.h>
 #include <modern/stake.h>
 #include <node/types.h>
 #include <outputtype.h>
@@ -55,6 +57,7 @@
 #include <support/cleanse.h>
 #include <sync.h>
 #include <tinyformat.h>
+#include <txmempool.h>
 #include <uint256.h>
 #include <univalue.h>
 #include <util/check.h>
@@ -97,6 +100,62 @@ using util::ReplaceAll;
 using util::ToString;
 
 namespace wallet {
+
+AssetSigningContext AssetSigningContextForWalletTransaction(const CWalletTx& wtx)
+{
+    const auto H{Consensus::LegacyFinalHeight(Params().GetConsensus())};
+    if (!H) return AssetSigningContext::FULL_SCRIPT;
+    if (const auto* confirmed{wtx.state<TxStateConfirmed>()}) {
+        return confirmed->confirmed_block_height > *H
+                   ? AssetSigningContext::OWNER_SUFFIX
+                   : AssetSigningContext::FULL_SCRIPT;
+    }
+    return wtx.InMempool() && !wtx.tx->IsLegacyEncoded()
+               ? AssetSigningContext::OWNER_SUFFIX
+               : AssetSigningContext::FULL_SCRIPT;
+}
+
+static AssetSigningContext AssetContextForSyncTransaction(
+    const CTransaction& tx, const SyncTxState& state)
+{
+    const auto H{Consensus::LegacyFinalHeight(Params().GetConsensus())};
+    if (!H) return AssetSigningContext::FULL_SCRIPT;
+    if (const auto* confirmed{std::get_if<TxStateConfirmed>(&state)}) {
+        return confirmed->confirmed_block_height > *H
+                   ? AssetSigningContext::OWNER_SUFFIX
+                   : AssetSigningContext::FULL_SCRIPT;
+    }
+    return std::holds_alternative<TxStateInMempool>(state) &&
+                   !tx.IsLegacyEncoded()
+               ? AssetSigningContext::OWNER_SUFFIX
+               : AssetSigningContext::FULL_SCRIPT;
+}
+
+static CScript WalletAuthorizationScript(const CScript& script,
+                                         const AssetSigningContext context)
+{
+    if (const auto owner{modern::StakeOwnerScript(script)}) return *owner;
+    if (context == AssetSigningContext::OWNER_SUFFIX) {
+        if (const auto owner{modern::AssetOwnerScript(script)}) return *owner;
+    }
+    return script;
+}
+
+//! IV binding opaque BLS ciphertext to its public key (key/ckey pattern).
+static uint256 BlsKeyIV(const std::array<unsigned char, 48>& pubkey)
+{
+    return Hash(std::span<const unsigned char>{pubkey});
+}
+
+//! FlowMesh and finality keys have separate ciphertext domains even when an
+//! operator deliberately imports the same scalar into both roles.
+static uint256 FlowMeshBlsKeyIV(
+    const std::array<unsigned char, 48>& pubkey)
+{
+    HashWriter writer{TaggedHash("B3/FLOWMESH/WALLET-BLS-IV/V1")};
+    writer << pubkey;
+    return writer.GetSHA256();
+}
 
 bool AddWalletSetting(interfaces::Chain& chain, const std::string& wallet_name)
 {
@@ -875,6 +934,27 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase)
             memory_cleanse(plain.data(), plain.size());
         }
 
+        // A wallet may own many FlowMesh FN seats. Convert every independent
+        // seat key in this same atomic encryption transaction; the public-key
+        // keyed plain record is erased by each crypted write.
+        for (auto& [pubkey, record] : m_b3_flowmesh_bls_keys) {
+            if (record.crypted) continue;
+            CKeyingMaterial plain{record.data.begin(), record.data.end()};
+            std::vector<unsigned char> crypted;
+            if (!EncryptSecret(plain_master_key, plain,
+                               FlowMeshBlsKeyIV(pubkey), crypted) ||
+                !encrypted_batch->WriteB3FlowMeshBlsCryptedKey(pubkey,
+                                                                crypted)) {
+                encrypted_batch->TxnAbort();
+                delete encrypted_batch;
+                encrypted_batch = nullptr;
+                assert(false);
+            }
+            record.data = std::move(crypted);
+            record.crypted = true;
+            memory_cleanse(plain.data(), plain.size());
+        }
+
         if (!encrypted_batch->TxnCommit()) {
             delete encrypted_batch;
             encrypted_batch = nullptr;
@@ -1046,6 +1126,25 @@ bool CWallet::IsSpentKey(const CScript& scriptPubKey) const
     return false;
 }
 
+static bool IsStrictOptionalDataEnrichment(const CTransaction& current,
+                                           const CTransaction& incoming)
+{
+    const bool same_witness{
+        current.vin.size() == incoming.vin.size() &&
+        std::equal(current.vin.begin(), current.vin.end(), incoming.vin.begin(),
+                   [](const CTxIn& a, const CTxIn& b) {
+                       return a.scriptWitness.stack == b.scriptWitness.stack;
+                   })};
+    const bool preserves_witness{
+        !current.HasWitness() || (incoming.HasWitness() && same_witness)};
+    const bool preserves_mpa{
+        !current.HasMpa() || (incoming.HasMpa() && incoming.mpa == current.mpa)};
+    const bool adds_component{
+        (!current.HasWitness() && incoming.HasWitness()) ||
+        (!current.HasMpa() && incoming.HasMpa())};
+    return preserves_witness && preserves_mpa && adds_component;
+}
+
 CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const UpdateWalletTxFn& update_wtx, bool rescanning_old_block)
 {
     LOCK(cs_wallet);
@@ -1091,12 +1190,12 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
             assert(TxStateSerializedIndex(wtx.m_state) == TxStateSerializedIndex(state));
             assert(TxStateSerializedBlockHash(wtx.m_state) == TxStateSerializedBlockHash(state));
         }
-        // If we have a witness-stripped version of this transaction, and we
-        // see a new version with a witness, then we must be upgrading a pre-segwit
-        // wallet.  Store the new version of the transaction with the witness,
-        // as the stripped-version must be invalid.
+        // Replace only with a strict optional-data enrichment. A same-txid
+        // variant may add the missing witness and/or MPA component, but may
+        // never drop or mutate a component already retained by the wallet.
         // TODO: Store all versions of the transaction, instead of just one.
-        if (tx->HasWitness() && !wtx.tx->HasWitness()) {
+        if (tx->GetWitnessHash() != wtx.tx->GetWitnessHash() &&
+            IsStrictOptionalDataEnrichment(*wtx.tx, *tx)) {
             wtx.SetTx(tx);
             fUpdated = true;
         }
@@ -1218,6 +1317,8 @@ bool CWallet::LoadToWallet(const Txid& hash, const UpdateWalletTxFn& fill_wtx)
 bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxState& state, bool fUpdate, bool rescanning_old_block)
 {
     const CTransaction& tx = *ptx;
+    const AssetSigningContext asset_context{
+        AssetContextForSyncTransaction(tx, state)};
     {
         AssertLockHeld(cs_wallet);
 
@@ -1236,7 +1337,7 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
 
         bool fExisted = mapWallet.contains(tx.GetHash());
         if (fExisted && !fUpdate) return false;
-        if (fExisted || IsMine(tx) || IsFromMe(tx))
+        if (fExisted || IsMine(tx, asset_context) || IsFromMe(tx))
         {
             /* Check if any keys in the wallet keypool that were supposed to be unused
              * have appeared in a new transaction. If so, remove those keys from the keypool.
@@ -1246,8 +1347,11 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
 
             // loop though all outputs
             for (const CTxOut& txout: tx.vout) {
-                for (const auto& spk_man : GetScriptPubKeyMans(txout.scriptPubKey)) {
-                    for (auto &dest : spk_man->MarkUnusedAddresses(txout.scriptPubKey)) {
+                const CScript authorization_script{
+                    WalletAuthorizationScript(txout.scriptPubKey,
+                                              asset_context)};
+                for (const auto& spk_man : GetScriptPubKeyMans(authorization_script)) {
+                    for (auto &dest : spk_man->MarkUnusedAddresses(authorization_script)) {
                         // If internal flag is not defined try to infer it from the ScriptPubKeyMan
                         if (!dest.internal.has_value()) {
                             dest.internal = IsInternalScriptPubKeyMan(spk_man);
@@ -1657,7 +1761,14 @@ CAmount CWallet::GetDebit(const CTxIn &txin) const
 bool CWallet::IsMine(const CTxOut& txout) const
 {
     AssertLockHeld(cs_wallet);
-    return IsMine(txout.scriptPubKey);
+    return IsMine(txout, AssetSigningContext::FULL_SCRIPT);
+}
+
+bool CWallet::IsMine(const CTxOut& txout,
+                     const AssetSigningContext asset_context) const
+{
+    AssertLockHeld(cs_wallet);
+    return IsMine(txout.scriptPubKey, asset_context);
 }
 
 bool CWallet::IsMine(const CTxDestination& dest) const
@@ -1669,15 +1780,22 @@ bool CWallet::IsMine(const CTxDestination& dest) const
 bool CWallet::IsMine(const CScript& script) const
 {
     AssertLockHeld(cs_wallet);
+    return IsMine(script, AssetSigningContext::FULL_SCRIPT);
+}
 
-    // B3 STAKE carrier: ownership is decided by the bare owner script.
-    const auto stake_owner{modern::StakeOwnerScript(script)};
+bool CWallet::IsMine(const CScript& script,
+                     const AssetSigningContext asset_context) const
+{
+    AssertLockHeld(cs_wallet);
+
+    const CScript authorization_script{
+        WalletAuthorizationScript(script, asset_context)};
     // Search the cache so that IsMine is called only on the relevant SPKMs instead of on everything in m_spk_managers
-    const auto& it = m_cached_spks.find(stake_owner ? *stake_owner : script);
+    const auto& it = m_cached_spks.find(authorization_script);
     if (it != m_cached_spks.end()) {
         bool res = false;
         for (const auto& spkm : it->second) {
-            res = res || spkm->IsMine(script);
+            res = res || spkm->IsMine(authorization_script);
         }
         Assume(res);
         return res;
@@ -1689,8 +1807,15 @@ bool CWallet::IsMine(const CScript& script) const
 bool CWallet::IsMine(const CTransaction& tx) const
 {
     AssertLockHeld(cs_wallet);
+    return IsMine(tx, AssetSigningContext::FULL_SCRIPT);
+}
+
+bool CWallet::IsMine(const CTransaction& tx,
+                     const AssetSigningContext asset_context) const
+{
+    AssertLockHeld(cs_wallet);
     for (const CTxOut& txout : tx.vout)
-        if (IsMine(txout))
+        if (IsMine(txout, asset_context))
             return true;
     return false;
 }
@@ -1705,7 +1830,8 @@ bool CWallet::IsMine(const COutPoint& outpoint) const
     if (outpoint.n >= wtx->tx->vout.size()) {
         return false;
     }
-    return IsMine(wtx->tx->vout[outpoint.n]);
+    return IsMine(wtx->tx->vout[outpoint.n],
+                  AssetSigningContextForWalletTransaction(*wtx));
 }
 
 bool CWallet::IsFromMe(const CTransaction& tx) const
@@ -2191,7 +2317,14 @@ bool CWallet::SignTransaction(CMutableTransaction& tx) const
             return false;
         }
         const CWalletTx& wtx = mi->second;
-        int prev_height = wtx.state<TxStateConfirmed>() ? wtx.state<TxStateConfirmed>()->confirmed_block_height : 0;
+        int prev_height{0};
+        if (const auto* confirmed{wtx.state<TxStateConfirmed>()}) {
+            prev_height = confirmed->confirmed_block_height;
+        } else if (wtx.InMempool() && !wtx.tx->IsLegacyEncoded()) {
+            // A mempool parent is locally known to have been admitted for a
+            // future block, and MEMPOOL_HEIGHT remains strictly above H.
+            prev_height = MEMPOOL_HEIGHT;
+        }
         coins[input.prevout] = Coin(wtx.tx->vout[input.prevout.n], prev_height, wtx.IsCoinBase());
     }
     std::map<int, bilingual_str> input_errors;
@@ -2219,10 +2352,34 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
         *n_signed = 0;
     }
     LOCK(cs_wallet);
+    psbtx.ResetInputAssetSigningContexts();
+    const std::optional<int> legacy_final_height{
+        Consensus::LegacyFinalHeight(Params().GetConsensus())};
     // Get all of the previous transactions
     for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
         const CTxIn& txin = psbtx.tx->vin[i];
         PSBTInput& input = psbtx.inputs.at(i);
+
+        // A PSBT itself carries no trustworthy creation height. Opt into the
+        // B3A1 owner suffix only when this wallet independently knows the
+        // prevout was confirmed after H or is in the local mempool.
+        if (legacy_final_height) {
+            const auto wallet_tx{mapWallet.find(txin.prevout.hash)};
+            if (wallet_tx != mapWallet.end() &&
+                txin.prevout.n < wallet_tx->second.tx->vout.size()) {
+                const CWalletTx& wtx{wallet_tx->second};
+                const auto* confirmed{wtx.state<TxStateConfirmed>()};
+                const bool post_h{
+                    (confirmed && confirmed->confirmed_block_height >
+                                      *legacy_final_height) ||
+                    (wtx.InMempool() && !wtx.tx->IsLegacyEncoded())};
+                if (post_h && modern::AssetOwnerScript(
+                                  wtx.tx->vout[txin.prevout.n]).has_value()) {
+                    psbtx.SetInputAssetSigningContext(
+                        i, AssetSigningContext::OWNER_SUFFIX);
+                }
+            }
+        }
 
         if (PSBTInputSigned(input)) {
             continue;
@@ -2363,7 +2520,12 @@ void CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
 
     // Notify that old coins are spent
     for (const CTxIn& txin : tx->vin) {
-        CWalletTx &coin = mapWallet.at(txin.prevout.hash);
+        // Transactions such as FlowMesh vault sweeps intentionally combine
+        // a keyless custody input with wallet-owned fee inputs. The external
+        // parent is not required to be in this wallet's history.
+        const auto parent{mapWallet.find(txin.prevout.hash)};
+        if (parent == mapWallet.end()) continue;
+        CWalletTx& coin = parent->second;
         coin.MarkDirty();
         NotifyTransactionChanged(coin.GetHash(), CT_UPDATED);
     }
@@ -3513,10 +3675,10 @@ std::set<ScriptPubKeyMan*> CWallet::GetScriptPubKeyMans(const CScript& script) c
 {
     std::set<ScriptPubKeyMan*> spk_mans;
 
-    // Search the cache for relevant SPKMs instead of iterating m_spk_managers
-    // (a B3 STAKE carrier is looked up by its bare owner script).
-    const auto stake_owner{modern::StakeOwnerScript(script)};
-    const auto& it = m_cached_spks.find(stake_owner ? *stake_owner : script);
+    // Asset carriers require per-Coin provenance and are resolved by the
+    // contextual wallet paths, never this context-free lookup.
+    auto owner{modern::StakeOwnerScript(script)};
+    const auto& it = m_cached_spks.find(owner ? *owner : script);
     if (it != m_cached_spks.end()) {
         spk_mans.insert(it->second.begin(), it->second.end());
     }
@@ -3542,10 +3704,9 @@ std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& scri
 
 std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& script, SignatureData& sigdata) const
 {
-    // Search the cache for relevant SPKMs instead of iterating m_spk_managers
-    // (a B3 STAKE carrier is looked up by its bare owner script).
-    const auto stake_owner{modern::StakeOwnerScript(script)};
-    const auto& it = m_cached_spks.find(stake_owner ? *stake_owner : script);
+    // Context-free asset unwrapping would reclassify sealed-era lookalikes.
+    auto owner{modern::StakeOwnerScript(script)};
+    const auto& it = m_cached_spks.find(owner ? *owner : script);
     if (it != m_cached_spks.end()) {
         // All spkms for a given script must already be able to make a SigningProvider for the script, so just return the first one.
         Assume(it->second.at(0)->CanProvide(script, sigdata));
@@ -3614,6 +3775,87 @@ util::Result<CKey> CWallet::GetValidatorSecret() const
     return util::Error{_("The validator key's descriptor is missing from this wallet")};
 }
 
+std::optional<CPubKey> CWallet::GetFlowMeshAccountPubKey() const
+{
+    AssertLockHeld(cs_wallet);
+    return m_b3_flowmesh_account_pubkey;
+}
+
+void CWallet::LoadFlowMeshAccountPubKey(const CPubKey& pubkey)
+{
+    AssertLockHeld(cs_wallet);
+    m_b3_flowmesh_account_pubkey = pubkey;
+}
+
+util::Result<CPubKey> CWallet::GetOrCreateFlowMeshAccountKey()
+{
+    AssertLockHeld(cs_wallet);
+    if (m_b3_flowmesh_account_pubkey) return *m_b3_flowmesh_account_pubkey;
+    if (!IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
+        return util::Error{_("A FlowMesh account key requires a descriptor wallet")};
+    }
+    if (IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+        return util::Error{_("This wallet has private keys disabled")};
+    }
+    if (IsLocked()) {
+        return util::Error{_("The wallet is locked; unlock it to create the FlowMesh account key")};
+    }
+
+    CKey key;
+    key.MakeNewKey(/*fCompressed=*/true);
+    FlatSigningProvider provider;
+    std::string error;
+    auto descriptors{Parse("pk(" + EncodeSecret(key) + ")", provider, error,
+                           /*require_checksum=*/false)};
+    if (descriptors.size() != 1) {
+        return util::Error{Untranslated(
+            strprintf("FlowMesh account descriptor: %s", error))};
+    }
+    WalletDescriptor descriptor(std::move(descriptors.at(0)), GetTime(),
+                                /*range_start=*/0, /*range_end=*/0,
+                                /*next_index=*/0);
+    auto spkm{AddWalletDescriptor(descriptor, provider,
+                                  "b3-flowmesh-account",
+                                  /*internal=*/false)};
+    if (!spkm) return util::Error{util::ErrorString(spkm)};
+
+    const CPubKey pubkey{key.GetPubKey()};
+    WalletBatch batch(GetDatabase());
+    if (!batch.WriteB3FlowMeshAccountPubKey(pubkey)) {
+        return util::Error{_("Failed to write the FlowMesh account key record")};
+    }
+    m_b3_flowmesh_account_pubkey = pubkey;
+    WalletLogPrintf("Created FlowMesh account key %s\n",
+                    HexStr(XOnlyPubKey{pubkey}));
+    return pubkey;
+}
+
+util::Result<CKey> CWallet::GetFlowMeshAccountSecret() const
+{
+    AssertLockHeld(cs_wallet);
+    if (!m_b3_flowmesh_account_pubkey) {
+        return util::Error{_("This wallet has no FlowMesh account key yet")};
+    }
+    if (IsLocked()) {
+        return util::Error{_("The wallet is locked; unlock it to use the FlowMesh account key")};
+    }
+    const CScript script{GetScriptForRawPubKey(*m_b3_flowmesh_account_pubkey)};
+    for (ScriptPubKeyMan* spkm : GetScriptPubKeyMans(script)) {
+        auto* descriptor_spkm{
+            dynamic_cast<DescriptorScriptPubKeyMan*>(spkm)};
+        if (!descriptor_spkm) continue;
+        const auto provider{
+            descriptor_spkm->GetSigningProviderWithPrivateKeys(script)};
+        CKey key;
+        if (provider &&
+            provider->GetKey(m_b3_flowmesh_account_pubkey->GetID(), key) &&
+            key.IsValid()) {
+            return key;
+        }
+    }
+    return util::Error{_("The FlowMesh account key's descriptor is missing from this wallet")};
+}
+
 util::Result<bls::SecretKey> CWallet::DeriveFinalityBlsKey(const uint32_t seq) const
 {
     AssertLockHeld(cs_wallet);
@@ -3634,14 +3876,6 @@ void CWallet::LoadImportedFinalityBlsKey(const std::array<unsigned char, 48>& pu
     AssertLockHeld(cs_wallet);
     m_b3_bls_key = B3BlsKeyRecord{pubkey, data, crypted};
 }
-
-namespace {
-//! IV binding the BLS ciphertext to its public key (the key/ckey pattern).
-uint256 BlsKeyIV(const std::array<unsigned char, 48>& pubkey)
-{
-    return Hash(std::span<const unsigned char>{pubkey});
-}
-} // namespace
 
 util::Result<bls::PublicKey> CWallet::ImportFinalityBlsKey(const bls::SecretKey& key)
 {
@@ -3718,6 +3952,120 @@ util::Result<bls::SecretKey> CWallet::ResolveFinalityBlsKey(const uint32_t seq,
     // A fresh bind: an imported (independent) key takes precedence.
     if (m_b3_bls_key) return GetImportedFinalityBlsKey();
     return DeriveFinalityBlsKey(seq);
+}
+
+bool CWallet::LoadFlowMeshBlsKey(
+    const std::array<unsigned char, 48>& pubkey,
+    const std::vector<unsigned char>& data, const bool crypted)
+{
+    AssertLockHeld(cs_wallet);
+    if (!bls::PublicKey::Decode(pubkey) || data.empty() ||
+        m_b3_flowmesh_bls_keys.contains(pubkey)) {
+        return false;
+    }
+    if (!crypted) {
+        if (data.size() != 32) return false;
+        const auto key{bls::SecretKey::FromBytes(data)};
+        if (!key || key->GetPublicKey().Compressed() != pubkey) return false;
+    }
+    m_b3_flowmesh_bls_keys.emplace(
+        pubkey, B3BlsKeyRecord{pubkey, data, crypted});
+    return true;
+}
+
+util::Result<bls::PublicKey> CWallet::ImportFlowMeshBlsKey(
+    const bls::SecretKey& key)
+{
+    AssertLockHeld(cs_wallet);
+    if (IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+        return util::Error{_("This wallet has private keys disabled")};
+    }
+    if (IsLocked()) {
+        return util::Error{_("The wallet is locked; unlock it to import the FlowMesh BLS key")};
+    }
+
+    const bls::PublicKey public_key{key.GetPublicKey()};
+    const auto pubkey{public_key.Compressed()};
+    if (m_b3_flowmesh_bls_keys.contains(pubkey)) {
+        const auto existing{GetFlowMeshBlsKey(pubkey)};
+        if (!existing || existing->Bytes() != key.Bytes()) {
+            return util::Error{_("The stored FlowMesh BLS key record is corrupt")};
+        }
+        return public_key;
+    }
+
+    const auto secret{key.Bytes()};
+    B3BlsKeyRecord record;
+    record.pubkey = pubkey;
+    WalletBatch batch(GetDatabase());
+    if (HasEncryptionKeys()) {
+        CKeyingMaterial plain{secret.begin(), secret.end()};
+        std::vector<unsigned char> crypted;
+        if (!EncryptSecret(vMasterKey, plain, FlowMeshBlsKeyIV(pubkey),
+                           crypted)) {
+            memory_cleanse(plain.data(), plain.size());
+            return util::Error{_("Failed to encrypt the FlowMesh BLS key")};
+        }
+        memory_cleanse(plain.data(), plain.size());
+        record.data = std::move(crypted);
+        record.crypted = true;
+        if (!batch.WriteB3FlowMeshBlsCryptedKey(pubkey, record.data)) {
+            return util::Error{_("Failed to write the FlowMesh BLS key record")};
+        }
+    } else {
+        record.data.assign(secret.begin(), secret.end());
+        if (!batch.WriteB3FlowMeshBlsKey(pubkey, record.data)) {
+            return util::Error{_("Failed to write the FlowMesh BLS key record")};
+        }
+    }
+    m_b3_flowmesh_bls_keys.emplace(pubkey, std::move(record));
+    WalletLogPrintf("Imported FlowMesh BLS seat key %s\n", HexStr(pubkey));
+    return public_key;
+}
+
+util::Result<bls::SecretKey> CWallet::GetFlowMeshBlsKey(
+    const std::array<unsigned char, 48>& pubkey) const
+{
+    AssertLockHeld(cs_wallet);
+    const auto it{m_b3_flowmesh_bls_keys.find(pubkey)};
+    if (it == m_b3_flowmesh_bls_keys.end()) {
+        return util::Error{_("This wallet has no matching FlowMesh BLS key")};
+    }
+    const B3BlsKeyRecord& record{it->second};
+    std::optional<bls::SecretKey> key;
+    if (record.crypted) {
+        if (IsLocked()) {
+            return util::Error{_("The wallet is locked; unlock it to use the FlowMesh BLS key")};
+        }
+        CKeyingMaterial plain;
+        if (!DecryptSecret(vMasterKey, record.data,
+                           FlowMeshBlsKeyIV(pubkey), plain) ||
+            plain.size() != 32) {
+            memory_cleanse(plain.data(), plain.size());
+            return util::Error{_("Failed to decrypt the FlowMesh BLS key")};
+        }
+        key = bls::SecretKey::FromBytes(
+            std::span<const unsigned char>{plain.data(), plain.size()});
+        memory_cleanse(plain.data(), plain.size());
+    } else {
+        key = bls::SecretKey::FromBytes(record.data);
+    }
+    if (!key || key->GetPublicKey().Compressed() != pubkey) {
+        return util::Error{_("The stored FlowMesh BLS key record is corrupt")};
+    }
+    return *key;
+}
+
+std::vector<std::array<unsigned char, 48>>
+CWallet::ListFlowMeshBlsPubkeys() const
+{
+    AssertLockHeld(cs_wallet);
+    std::vector<std::array<unsigned char, 48>> out;
+    out.reserve(m_b3_flowmesh_bls_keys.size());
+    for (const auto& [pubkey, record] : m_b3_flowmesh_bls_keys) {
+        out.push_back(pubkey);
+    }
+    return out;
 }
 
 std::vector<WalletDescriptor> CWallet::GetWalletDescriptors(const CScript& script) const
@@ -4244,10 +4592,12 @@ util::Result<void> CWallet::ApplyMigrationData(WalletBatch& local_wallet_batch, 
     for (const auto& [_pos, wtx] : wtxOrdered) {
         // Check it is the watchonly wallet's
         // solvable_wallet doesn't need to be checked because transactions for those scripts weren't being watched for
-        bool is_mine = IsMine(*wtx->tx) || IsFromMe(*wtx->tx);
+        const AssetSigningContext asset_context{
+            AssetSigningContextForWalletTransaction(*wtx)};
+        bool is_mine = IsMine(*wtx->tx, asset_context) || IsFromMe(*wtx->tx);
         if (data.watchonly_wallet) {
             LOCK(data.watchonly_wallet->cs_wallet);
-            if (data.watchonly_wallet->IsMine(*wtx->tx) || data.watchonly_wallet->IsFromMe(*wtx->tx)) {
+            if (data.watchonly_wallet->IsMine(*wtx->tx, asset_context) || data.watchonly_wallet->IsFromMe(*wtx->tx)) {
                 // Add to watchonly wallet
                 const Txid& hash = wtx->GetHash();
                 const CWalletTx& to_copy_wtx = *wtx;
@@ -4794,9 +5144,11 @@ void CWallet::WriteBestBlock() const
 void CWallet::RefreshTXOsFromTx(const CWalletTx& wtx)
 {
     AssertLockHeld(cs_wallet);
+    const AssetSigningContext asset_context{
+        AssetSigningContextForWalletTransaction(wtx)};
     for (uint32_t i = 0; i < wtx.tx->vout.size(); ++i) {
         const CTxOut& txout = wtx.tx->vout.at(i);
-        if (!IsMine(txout)) continue;
+        if (!IsMine(txout, asset_context)) continue;
         COutPoint outpoint(wtx.GetHash(), i);
         if (m_txos.contains(outpoint)) {
         } else {

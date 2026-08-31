@@ -4,9 +4,11 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <base58.h>
+#include <chainparams.h>
 #include <chain.h>
 #include <coins.h>
 #include <consensus/amount.h>
+#include <consensus/era.h>
 #include <consensus/validation.h>
 #include <core_io.h>
 #include <index/txindex.h>
@@ -612,6 +614,10 @@ static RPCHelpMan combinerawtransaction()
         if (!DecodeHexTx(txVariants[idx], txs[idx].get_str())) {
             throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf("TX decode failed for tx %d. Make sure the tx has at least one input.", idx));
         }
+        if (idx > 0 && txVariants[idx].mpa != txVariants[0].mpa) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               "Transactions have different Modern Payload Areas");
+        }
     }
 
     if (txVariants.empty()) {
@@ -644,6 +650,8 @@ static RPCHelpMan combinerawtransaction()
     // Use CTransaction for the constant parts of the
     // transaction to avoid rehashing.
     const CTransaction txConst(mergedTx);
+    const std::optional<int> legacy_final_height{
+        Consensus::LegacyFinalHeight(Params().GetConsensus())};
     // Sign what we can:
     for (unsigned int i = 0; i < mergedTx.vin.size(); i++) {
         CTxIn& txin = mergedTx.vin[i];
@@ -651,15 +659,21 @@ static RPCHelpMan combinerawtransaction()
         if (coin.IsSpent()) {
             throw JSONRPCError(RPC_VERIFY_ERROR, "Input not found or already spent");
         }
+        const AssetSigningContext asset_context{
+            AssetSigningContextForCoin(coin, legacy_final_height)};
         SignatureData sigdata;
 
         // ... and merge in other signatures:
         for (const CMutableTransaction& txv : txVariants) {
             if (txv.vin.size() > i) {
-                sigdata.MergeSignatureData(DataFromTransaction(txv, i, coin.out));
+                sigdata.MergeSignatureData(
+                    DataFromTransaction(txv, i, coin.out, asset_context));
             }
         }
-        ProduceSignature(DUMMY_SIGNING_PROVIDER, MutableTransactionSignatureCreator(mergedTx, i, coin.out.nValue, 1), coin.out.scriptPubKey, sigdata);
+        ProduceSignature(DUMMY_SIGNING_PROVIDER,
+                         MutableTransactionSignatureCreator(
+                             mergedTx, i, coin.out.nValue, 1),
+                         coin.out.scriptPubKey, sigdata, asset_context);
 
         UpdateInput(txin, sigdata);
     }
@@ -1604,8 +1618,7 @@ static RPCHelpMan finalizepsbt()
     std::string result_str;
 
     if (complete && extract) {
-        ssTx << TX_WITH_WITNESS(mtx);
-        result_str = HexStr(ssTx);
+        result_str = EncodeHexTx(CTransaction{mtx});
         result.pushKV("hex", result_str);
     } else {
         ssTx << psbtx;
@@ -2065,9 +2078,7 @@ RPCHelpMan descriptorprocesspsbt()
         CMutableTransaction mtx;
         PartiallySignedTransaction psbtx_copy = psbtx;
         CHECK_NONFATAL(FinalizeAndExtractPSBT(psbtx_copy, mtx));
-        DataStream ssTx_final;
-        ssTx_final << TX_WITH_WITNESS(mtx);
-        result.pushKV("hex", HexStr(ssTx_final));
+        result.pushKV("hex", EncodeHexTx(CTransaction{mtx}));
     }
     return result;
 },

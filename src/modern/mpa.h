@@ -10,6 +10,10 @@
 #include <modern/creation_action.h>
 #include <modern/finality_key.h>
 #include <modern/finality_types.h>
+#include <modern/flowmesh_checkpoint.h>
+#include <modern/flowmesh_seat.h>
+#include <modern/flowmesh_vault_proof.h>
+#include <modern/fn_pod.h>
 #include <modern/metadata_cell.h>
 #include <modern/payload_cost.h>
 #include <modern/policy.h>
@@ -18,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -33,10 +38,13 @@ namespace modern {
  * REGISTRY (typed, versioned, frozen numbers; never renumbered):
  *   1  FN claim (RESERVED/SUPERSEDED)      known, NOT activated
  *   2  legacy FN issuance                  known, NOT activated
- *   3  asset issuance                      known, NOT activated
- *   4  FINALITY_CERTIFICATE                known, NOT activated (Commit 10)
- *   5  FINALITY_KEY_EVIDENCE               known; activated only under the
- *                                          test-only MPA context for now
+ *   3  asset issuance                      known; height-gated
+ *   4  FINALITY_CERTIFICATE                known; X-pin-gated
+ *   5  FINALITY_KEY_EVIDENCE               known; X-pin-gated
+ *   6  modern FN PoD creation              known; height-gated
+ *   7  FlowMesh FN-seat pre-binding        known; A2 height-gated
+ *   8  FlowMesh checkpoint                 known; A3 height-gated
+ *   9  FlowMesh vault effect proof         known; A3 height-gated
  * Every other (type, version) is UNKNOWN. Unknown -> invalid; known but not
  * activated -> invalid; known and activated -> parsed with that type's exact
  * grammar. There is no generic/user-data record type.
@@ -61,23 +69,45 @@ namespace modern {
  * against the derived binding index plus an in-block overlay.
  */
 
-//! Frozen record type numbers (see creation_action.h for 1-5).
+//! Frozen record type numbers (see creation_action.h for 1-9).
 inline constexpr uint16_t MPA_TYPE_FINALITY_CERTIFICATE{CREATION_ACTION_FINALITY_CERTIFICATE};
 inline constexpr uint16_t MPA_TYPE_FINALITY_KEY_EVIDENCE{CREATION_ACTION_FINALITY_KEY_EVIDENCE};
+inline constexpr uint16_t MPA_TYPE_FLOWMESH_CHECKPOINT{CREATION_ACTION_FLOWMESH_CHECKPOINT};
+inline constexpr uint16_t MPA_TYPE_FLOWMESH_VAULT_PROOF{CREATION_ACTION_FLOWMESH_VAULT_PROOF};
 inline constexpr uint16_t MPA_VERSION_V1{1};
 
 enum class PayloadTypeStatus { UNKNOWN, INACTIVE, ACTIVE };
 
-//! Registry lookup. INACTIVE for types 1-4 (and 5 outside the test context).
+//! Registry lookup. Historical types 1/2 are permanently inactive; the live
+//! creation declarations are independently height-gated.
 inline PayloadTypeStatus GetPayloadTypeStatus(const uint16_t type, const uint16_t version,
-                                              const Consensus::Params& params)
+                                              const Consensus::Params& params,
+                                              const std::optional<int> height = std::nullopt)
 {
     if (version != MPA_VERSION_V1) return PayloadTypeStatus::UNKNOWN;
     switch (type) {
     case CREATION_ACTION_FN_CLAIM:
     case CREATION_ACTION_LEGACY_FN_ISSUANCE:
-    case CREATION_ACTION_ASSET_ISSUANCE:
+        // Permanently reserved/superseded. Recognition never gives these
+        // proof-carrying historical claim formats a production path.
         return PayloadTypeStatus::INACTIVE;
+    case CREATION_ACTION_ASSET_ISSUANCE:
+        return height && Consensus::AssetRulesActive(*height, params)
+                   ? PayloadTypeStatus::ACTIVE
+                   : PayloadTypeStatus::INACTIVE;
+    case CREATION_ACTION_MODERN_FN_POD:
+        return height && Consensus::FnPodRulesActive(*height, params)
+                   ? PayloadTypeStatus::ACTIVE
+                   : PayloadTypeStatus::INACTIVE;
+    case CREATION_ACTION_FLOWMESH_SEAT_BINDING:
+        return height && Consensus::FlowMeshSeatBindingRulesActive(*height, params)
+                   ? PayloadTypeStatus::ACTIVE
+                   : PayloadTypeStatus::INACTIVE;
+    case MPA_TYPE_FLOWMESH_CHECKPOINT:
+    case MPA_TYPE_FLOWMESH_VAULT_PROOF:
+        return height && Consensus::FlowMeshRulesActive(*height, params)
+                   ? PayloadTypeStatus::ACTIVE
+                   : PayloadTypeStatus::INACTIVE;
     case MPA_TYPE_FINALITY_CERTIFICATE:
     case MPA_TYPE_FINALITY_KEY_EVIDENCE:
         // Live from the X-pin configuration (F = M plumbing); every real
@@ -100,6 +130,16 @@ inline bool PayloadSizeAllowed(const uint16_t type, const size_t size)
         return size <= FINALITY_CERTIFICATE_RECORD_MAX;
     case MPA_TYPE_FINALITY_KEY_EVIDENCE:
         return size == FINALITY_KEY_EVIDENCE_SIZE;
+    case CREATION_ACTION_MODERN_FN_POD:
+        return size == MODERN_FN_POD_ACTION_V1_SIZE;
+    case CREATION_ACTION_FLOWMESH_SEAT_BINDING:
+        return size == FLOWMESH_SEAT_BINDING_ACTION_V1_SIZE;
+    case MPA_TYPE_FLOWMESH_CHECKPOINT:
+        return size >= FLOWMESH_CHECKPOINT_RECORD_MIN_SIZE &&
+               size <= FLOWMESH_CHECKPOINT_RECORD_MAX_SIZE;
+    case MPA_TYPE_FLOWMESH_VAULT_PROOF:
+        return size >= FLOWMESH_VAULT_PROOF_V1_WIRE_MIN_SIZE &&
+               size <= FLOWMESH_VAULT_PROOF_RECORD_MAX_SIZE;
     default:
         return false;
     }
@@ -113,9 +153,16 @@ inline bool MpaRecordLess(const CMpaRecord& a, const CMpaRecord& b)
 
 //! Does the transaction's MPA satisfy activation, canonical order, registry and
 //! per-type size rules? (Structural only; binding semantics are separate.)
-inline bool CheckTransactionMpa(const CTransaction& tx, const Consensus::Params& params, std::string& error)
+inline bool CheckTransactionMpa(const CTransaction& tx, const Consensus::Params& params,
+                                const std::optional<int> height, std::string& error)
 {
-    if (tx.mpa.empty()) return true;
+    if (tx.mpa.empty()) {
+        // FN-v2 without its mandatory type-7 record must still fail. A caller
+        // without a height can never activate the A2 pre-binding gate and
+        // therefore fails closed.
+        return CheckFlowMeshSeatBindings(tx, height.value_or(std::numeric_limits<int>::min()),
+                                         params, error);
+    }
     if (!Consensus::ModernObjectRulesActive(params)) {
         error = "mpa-not-active";
         return false;
@@ -124,6 +171,7 @@ inline bool CheckTransactionMpa(const CTransaction& tx, const Consensus::Params&
         error = "mpa-too-many-records";
         return false;
     }
+    bool saw_flowmesh_vault_proof{false};
     for (size_t i = 0; i < tx.mpa.size(); ++i) {
         const CMpaRecord& rec{tx.mpa[i]};
         if (i > 0 && !MpaRecordLess(tx.mpa[i - 1], rec)) {
@@ -134,7 +182,7 @@ inline bool CheckTransactionMpa(const CTransaction& tx, const Consensus::Params&
             error = "mpa-record-too-large";
             return false;
         }
-        switch (GetPayloadTypeStatus(rec.payload_type, rec.payload_version, params)) {
+        switch (GetPayloadTypeStatus(rec.payload_type, rec.payload_version, params, height)) {
         case PayloadTypeStatus::UNKNOWN:
             error = "mpa-unknown-type";
             return false;
@@ -148,11 +196,43 @@ inline bool CheckTransactionMpa(const CTransaction& tx, const Consensus::Params&
             error = "mpa-bad-record-size";
             return false;
         }
+        if (rec.payload_type == MPA_TYPE_FLOWMESH_VAULT_PROOF) {
+            if (saw_flowmesh_vault_proof) {
+                error = "mpa-multiple-flowmesh-vault-proofs";
+                return false;
+            }
+            saw_flowmesh_vault_proof = true;
+        }
     }
-    // Per-transaction verification-cost budget, from the frames alone, before
-    // any cryptography (the block budget is checked at block level).
+    // Frame-derived cost is enforced after every cheap outer shape/gate and
+    // before any type-specific hash, signature, or proof work.
     if (!CheckTransactionPayloadCost(tx, error)) return false;
-    return true;
+    for (const CMpaRecord& rec : tx.mpa) {
+        // Type 8/9 have self-delimiting, frozen inner grammars. Parse them
+        // after all outer count/size/activation/cost gates, before any BLS or
+        // chain-index work. Type 8's exact bitmap width/high bits are checked
+        // later against the anchored active-seat count.
+        if (rec.payload_type == MPA_TYPE_FLOWMESH_CHECKPOINT &&
+            !DecodeFlowMeshCheckpointEnvelopeV1(rec.payload)) {
+            error = "mpa-malformed-flowmesh-checkpoint";
+            return false;
+        }
+        if (rec.payload_type == MPA_TYPE_FLOWMESH_VAULT_PROOF &&
+            !DecodeFlowMeshVaultProofV1(rec.payload)) {
+            error = "mpa-malformed-flowmesh-vault-proof";
+            return false;
+        }
+    }
+    return CheckFlowMeshSeatBindings(tx, height.value_or(std::numeric_limits<int>::min()),
+                                     params, error);
+}
+
+//! Compatibility wrapper for context-free callers and existing model tests.
+//! Height-gated issuance stays inactive unless the caller supplies a height.
+inline bool CheckTransactionMpa(const CTransaction& tx, const Consensus::Params& params,
+                                std::string& error)
+{
+    return CheckTransactionMpa(tx, params, std::nullopt, error);
 }
 
 //! One matched FINALITY_KEY cell + evidence record.

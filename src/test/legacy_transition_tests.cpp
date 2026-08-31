@@ -16,9 +16,11 @@
 #include <consensus/block_codec.h>
 #include <consensus/boundary.h>
 #include <consensus/era.h>
+#include <consensus/fn_params.h>
 #include <consensus/merkle.h>
 #include <consensus/validation.h>
 #include <dbwrapper.h>
+#include <crypto/common.h>
 #include <key.h>
 #include <legacy/codec.h>
 #include <legacy/consensus.h>
@@ -29,6 +31,8 @@
 #include <node/utxo_rows.h>
 #include <kernel/mempool_removal_reason.h>
 #include <modern/pos.h>
+#include <modern/chain_domain.h>
+#include <modern/fn_genesis_validation.h>
 #include <modern/stake.h>
 #include <node/mempool_persist.h>
 #include <node/miner.h>
@@ -1954,6 +1958,25 @@ BOOST_AUTO_TEST_CASE(transition_pow_corridor_production)
     mutable_consensus.hard_fork_height = H + 1;
     mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
     mutable_consensus.transition_pow_length = CORRIDOR;
+    mutable_consensus.fn_genesis_required = true;
+    mutable_consensus.fn_genesis_manifest.clear();
+    mutable_consensus.fn_genesis_manifest.reserve(
+        Consensus::HISTORICAL_FN_PROVEN_FLOOR);
+    for (uint32_t i{0}; i < Consensus::HISTORICAL_FN_PROVEN_FLOOR; ++i) {
+        Consensus::FnGenesisRight right;
+        WriteBE32(right.pod_id.begin(), i + 1);
+        right.recipient_key_hash.fill(static_cast<unsigned char>(i & 0xff));
+        mutable_consensus.fn_genesis_manifest.push_back(right);
+    }
+    const auto fn_domain{modern::ModernChainDomain(
+        mutable_consensus.hashGenesisBlock,
+        *mutable_consensus.legacy_final_hash)};
+    BOOST_REQUIRE(fn_domain.has_value());
+    mutable_consensus.fn_genesis_rights_root =
+        modern::ComputeFnGenesisManifestRootV1(
+            *fn_domain, static_cast<uint32_t>(*mutable_consensus.hard_fork_height),
+            mutable_consensus.fn_genesis_manifest);
+    BOOST_REQUIRE(mutable_consensus.fn_genesis_rights_root.has_value());
 
     // Unset corridor difficulty refuses production (fail closed).
     BOOST_CHECK_THROW(
@@ -1961,6 +1984,39 @@ BOOST_AUTO_TEST_CASE(transition_pow_corridor_production)
         std::runtime_error);
     mutable_consensus.transition_pow_bits = EASY_BITS;
     mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
+
+    std::string fn_error;
+    const auto expected_fn_outputs{
+        modern::ExpectedFnGenesisOutputs(mutable_consensus, fn_error)};
+    BOOST_REQUIRE_MESSAGE(expected_fn_outputs.has_value(), fn_error);
+    const uint64_t fn_weight{
+        static_cast<uint64_t>(GetSerializeSize(*expected_fn_outputs)) *
+        WITNESS_SCALE_FACTOR};
+    uint64_t fn_sigops_cost{0};
+    for (const CTxOut& out : *expected_fn_outputs) {
+        fn_sigops_cost += static_cast<uint64_t>(
+            out.scriptPubKey.GetSigOpCount(/*fAccurate=*/false)) *
+            WITNESS_SCALE_FACTOR;
+    }
+    BOOST_REQUIRE_LT(fn_sigops_cost, static_cast<uint64_t>(MAX_BLOCK_SIGOPS_COST));
+
+    // Both resources are reserved before mempool selection. A template whose
+    // remaining allowance is one unit short must fail instead of producing a
+    // block that can crowd out the mandatory allocation.
+    node::BlockAssembler::Options weight_tight{options};
+    weight_tight.block_reserved_weight = 2'000;
+    weight_tight.nBlockMaxWeight = 2'000 + fn_weight - 1;
+    BOOST_CHECK_THROW(
+        node::BlockAssembler(chainman.ActiveChainstate(), nullptr, weight_tight)
+            .CreateNewBlock(),
+        std::runtime_error);
+    node::BlockAssembler::Options sigops_tight{options};
+    sigops_tight.coinbase_output_max_additional_sigops =
+        MAX_BLOCK_SIGOPS_COST - fn_sigops_cost + 1;
+    BOOST_CHECK_THROW(
+        node::BlockAssembler(chainman.ActiveChainstate(), nullptr, sigops_tight)
+            .CreateNewBlock(),
+        std::runtime_error);
 
     // Produce, grind and submit the whole corridor through the assembler.
     for (int i{0}; i < CORRIDOR; ++i) {
@@ -1971,6 +2027,24 @@ BOOST_AUTO_TEST_CASE(transition_pow_corridor_production)
         BOOST_CHECK(Consensus::HasB3BlockCodecV2(block.nVersion));
         BOOST_CHECK_EQUAL(block.nBits, EASY_BITS);
         BOOST_CHECK_EQUAL(block.vtx[0]->GetValueOut(), 0); // fees only, reward param 0
+        const int witness_index{GetWitnessCommitmentIndex(block)};
+        BOOST_REQUIRE(witness_index != NO_WITNESS_COMMITMENT);
+        const CTxOut& witness_output{
+            block.vtx[0]->vout.at(static_cast<size_t>(witness_index))};
+        if (i == 0) {
+            BOOST_CHECK_EQUAL(tmpl->m_coinbase_tx.required_outputs.size(),
+                              expected_fn_outputs->size() + 1);
+            for (size_t output_index{0};
+                 output_index < expected_fn_outputs->size(); ++output_index) {
+                BOOST_CHECK(tmpl->m_coinbase_tx.required_outputs[output_index] ==
+                            (*expected_fn_outputs)[output_index]);
+            }
+            BOOST_CHECK(tmpl->m_coinbase_tx.required_outputs.back() ==
+                        witness_output);
+        } else {
+            BOOST_REQUIRE_EQUAL(tmpl->m_coinbase_tx.required_outputs.size(), 1U);
+            BOOST_CHECK(tmpl->m_coinbase_tx.required_outputs[0] == witness_output);
+        }
         block.hashMerkleRoot = BlockMerkleRoot(block);
         block.nNonce = 0;
         while (!CheckTransitionPowEligibility(block)) ++block.nNonce;

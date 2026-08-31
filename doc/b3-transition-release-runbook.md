@@ -1,116 +1,348 @@
-# B3 Transition Release Runbook (the X-pin release)
+# B3 Transition Release Runbook
 
-The complete, ordered procedure for turning the sealed values of block
-810,000 into the public transition release. Complete every operational
-precondition in advance; on seal day only the two MEASURED VALUES change.
+The ordered procedure for turning the sealed block-810,000 history into the
+transition release. The release pins X, R0, and the complete FN rights
+manifest/count/root; requires FN Genesis in the first corridor coinbase; and
+carries modern FN PoD, simple-v1 colored assets, and FlowMesh v1 fail-closed
+until their later post-M heights A1, A2, and A3.
 
-## 0. Preconditions (before the seal)
+Expect an honest 2–4 week seal pause for final measurement, pinning, independent
+review, packaging, and real-history shadow-fork rehearsal. Do not describe it
+as a days-long automatic update.
 
-- `finalized` pushed and the release workflow green for all five package
-  variants: Linux x86_64, Windows x86_64, Windows x86, macOS arm64 and
-  macOS x86_64.
-- A fully synced B3 Hive node and the independent legacy-client snapshot
-  required by the three-way equivalence protocol, ready to freeze at H.
-- Update installation remains manual. Do not call the updater enabled unless
-  the tagged source contains a reviewed compile-time manifest URL and
-  threshold public keys, and each shipped format has working, tested installer
-  support. Keep private signing keys offline; do not use placeholder keys or
-  URLs.
+Implementation state (2026-09-01): the transition branch contains the FN
+manifest/genesis, B3A1 authorization, modern-FN PoD, simple-v1 asset, A1/A2
+gating, FlowMesh A2 preparation/A3 trading gates, dedicated authenticated
+microblock transport, persistent checkpoint/vault state, serialization, index,
+miner, mempool, wallet-signing, RPC, and four-node release-test paths. The exact
+X, R0, manifest/count/root, A1, A2, and A3 values are deliberately unset until
+the seal and owner pinning. The branch therefore remains fail-closed for
+mainnet transition activation.
 
-## 1. Read the seal (at block 810,000)
+## 0. Preconditions before the seal
 
-On the port node frozen exactly at H (do not measure from an advanced tip):
+- The release workflow is green for Linux x86_64, Windows x86_64, Windows x86,
+  macOS arm64, and macOS x86_64.
+- A fully synced B3 Hive node and the independent legacy-client snapshot needed
+  by the three-way equivalence protocol are ready to freeze exactly at H.
+- The canonical FN manifest codec, row predicate, Merkle construction, report
+  command, and test vectors are implemented and dry-run on a copied datadir
+  through a recent tip. Do not design the format after the seal measurement.
+- The isolated shadow-fork harness uses different network magic and ports,
+  localhost-only peers, overridable test H, and trivial corridor difficulty. It
+  must be physically unable to contact mainnet.
+- Update installation remains manual unless the tagged source contains reviewed
+  manifest URLs and threshold public keys and every package has tested installer
+  support. Private release keys remain offline.
 
-    b3coin-cli getblockcount                   -> 810000
-    b3coin-cli getblockhash 810000             -> X (the seal)
-    b3coin-cli gettxoutsetinfo                 -> bestblock = X, total_amount = S_H
+## 1. Read the seal at block 810,000
 
-Cross-verification is the whole point: X printed by the port node must match
-`getblockhash 810000` from at least one independent old client before it is
-pinned.
+Freeze the port node exactly at H; do not measure from an advanced tip:
+
+```
+b3coin-cli getblockcount        -> 810000
+b3coin-cli getblockhash 810000  -> X
+b3coin-cli gettxoutsetinfo      -> bestblock = X, total_amount = S_H
+```
+
+X must match `getblockhash 810000` from at least one independently run old
+client before it is pinned.
 
 ### Mandatory final-H equivalence gate
 
-Before any mainnet pin, follow `doc/design/b3-utxo-equivalence.md` at
-T = (810,000, X) and capture `master-H.rows`, `port-H.rows` and
-`replay-H.rows`. Preserve the row files, SHA-256 hashes, row counts,
-commitments, command logs and the comparator's direct (unpiped) exit status.
-The mandatory result is exit 0 and byte-identical canonical rows:
+Follow [b3-utxo-equivalence.md](design/b3-utxo-equivalence.md) at
+`T = (810,000, X)` and preserve `master-H.rows`, `port-H.rows`, and
+`replay-H.rows`, their SHA-256 checksums, row counts, commitments, commands,
+logs, and direct process exit statuses. The required result is:
 
-    U_master(H, X) == U_port(H, X) == U_replay(H, X)
+```
+U_master(H, X) == U_port(H, X) == U_replay(H, X)
+```
 
-Any row, commitment, height or hash mismatch stops the pin and release tag.
+Any mismatch in a row, commitment, height, X, or exit status stops the release.
 
-## 2. Compute the two derived numbers
+## 2. Measure the sealed constants during the pause
 
-    R0 = floor(S_H_base_units * 1% / 525,600)
-       = floor(S_H_base_units / 52,560,000)     # S_H in base units (1 B3 = 1e9)
+Compute R0 with integer arithmetic only:
 
-Treasury script (ruled 2026-08-26, address SNyANHiUkuqPSfbeKHDXzVD86LC2ZUUjLX):
+```
+R0 = floor(S_H_base_units * 1% / 525,600)
+   = floor(S_H_base_units / 52,560,000)
+```
 
-    76a91412602418ffc74640e37f1a73d0cdc255d2a07c3588ac
+Build the final historical FN manifest according to
+[b3-legacy-fn-issuance-proposal.md](design/b3-legacy-fn-issuance-proposal.md).
+On each independent, clean `(H, X)` view, run the equivalence verifier with
+the manifest export enabled (the output target must not already exist):
 
-Seal packet checklist — every item is required before editing chainparams:
+```
+./build/bin/b3coin-utxo-verify \
+  -datadir=<clean-stopped-datadir-a> \
+  -workdir=<fresh-scratch-a> \
+  -height=810000 -hash=<X> -podreport \
+  -masterrows=<seal-packet>/master-H.rows \
+  -fnmanifest=<seal-packet>/fn-genesis-a.bin
+```
 
-- [ ] Every capture source reports H = 810,000 and the same 64-hex X; the raw
-      `gettxoutsetinfo` output reports `bestblock = X`.
-- [ ] S_H, its exact integer base-unit conversion and the R0 calculation are
-      recorded without floating-point arithmetic.
-- [ ] The preserved final-H artifacts prove
-      `U_master == U_port == U_replay`, including exit 0 and artifact hashes.
-- [ ] Every other Modern PoS field has a recorded owner ruling; a missing,
-      provisional or inferred activation value stops the release.
+Repeat as producer B with separate datadir, scratch, log, and output paths.
+Capture the command's direct exit status. Exit 0 is required. The tool refuses
+to export unless replay/equivalence and manifest construction succeed, refuses
+to overwrite an existing artifact, and prints:
 
-## 3. Pin into CMainParams (src/kernel/chainparams.cpp)
+```
+FN Genesis eligible: R
+FN Genesis version:  1
+FN Genesis height:   810001
+FN chain domain:     <CHAIN_DOMAIN>
+FN rights root:      <FN_RIGHTS_ROOT>
+three-way result:   EQUAL (U_master == U_port == U_replay)
+FN manifest file:    <path>
+FN manifest bytes:   <91 + 52 * R, printed as a decimal integer>
+FN manifest SHA256:  <64 lowercase hex>
+```
 
-    consensus.legacy_final_hash = uint256{"<X>"};
-    consensus.modern_pos = Consensus::ModernPosParams{};        // ratified block:
-    //   block_interval_seconds = 60, round_seconds = 30, f0 = 1/1   (2026-08-21)
-    //   sentinel_bits = 0x207fffff, max_future_seconds = 120        (must be ratified before pin)
-    //   reward = <R0>, halving_interval = 525'600                   (OD-2, 2026-08-26)
-    //   treasury_percent = 10, treasury_script = <hex above>        (OD-2, 2026-08-26)
-    //   reorg_horizon = 1440; finality block per ruling M7           (2026-08-21/23)
+The checksum is ordinary SHA-256 in standard byte order and must equal an
+external `sha256sum` (or `shasum -a 256`) of the file. The canonical binary
+layout is:
 
-Use only the measured X/R0 from the seal packet and recorded owner-ratified
-values. Do not infer a missing value at seal time.
+```
+ASCII "b3-fn-genesis/v1\n" (17 bytes)
+chain_domain                 (32 raw serialization bytes)
+fn_genesis_height            (u32 big-endian)
+manifest_version             (u16 big-endian)
+row_count                    (u32 big-endian)
+rights_root                  (32 raw serialization bytes)
+for each row in raw pod_id order:
+    pod_id                   (32 raw serialization bytes)
+    recipient_key_hash       (20 bytes)
+```
 
-min_stake_amount (333 B3) and transition_pow_bits (0x1f008000) are
-already pinned and need no change.
+The exporter recomputes the consensus rights root from this exact context and
+row sequence and stops on any mismatch. Compare the two independent artifacts
+directly, preserve both direct exit statuses, and require:
 
-## 4. Code, tests and release notes that MUST change in the same commit
+```
+cmp -s <seal-packet>/fn-genesis-a.bin <seal-packet>/fn-genesis-b.bin
+sha256sum <seal-packet>/fn-genesis-a.bin <seal-packet>/fn-genesis-b.bin
+```
 
-- Bump `CLIENT_VERSION_MINOR` in `CMakeLists.txt` so the source version is
-  1.1.0, and add `doc/release-notes-v1.1.0.md`. Do not tag until the workflow's
-  source-version check and release-notes path both match `v1.1.0`.
+On a host without `sha256sum`, use `shasum -a 256`. The required result is:
 
-- The guard test asserting "real chainparams never configure Modern PoS"
-  (modern_pos_tests / finality_activation_tests pause-shape assertions):
-  flip to assert the FULL pinned configuration, value by value,
-  including X itself.
-- Add an assertion pinning R0's exact value so no rebuild can drift it.
-- The release notes must say installation is manual unless the updater
-  precondition in section 0 was actually completed and tested.
+```
+manifest_a bytes == manifest_b bytes
+count_a = count_b = R
+root_a  = root_b  = FN_RIGHTS_ROOT
+R <= 5,000
+```
 
-## 5. Ship
+The transition release pins all three FN artifacts: the complete manifest
+bytes, R, and the root. A root alone is insufficient. Publish the manifest,
+file checksum, count, root, commands, logs, chain identity, and exit statuses in
+the seal packet.
 
-1. Commit on the working branch; merge to `finalized`.
-2. Full local build + unit suites (minimum: modern_pos_tests,
-   finality_activation_tests, fn_claim_tests, stake suites, era tests).
-3. Tag `v1.1.0` (transition release), push finalized + tag, refresh
-   `release/*` branch; CI packages all five variants listed in section 0.
-4. Attach binaries + SHA-256 to the GitHub release. Release notes MUST
-   print X prominently with the one-line self-verification instruction:
-   `getblockhash 810000` on any old client.
-5. Only if the updater precondition in section 0 is satisfied, publish and
-   sign the update manifest. Otherwise publish manual download links and
-   checksums and state plainly that update installation remains manual.
-6. Announce that the X-pin transition release is live and the corridor has
-   opened (Discord + YouTube pinned comments), with the seal value in the
-   message.
+Treasury script for `SNyANHiUkuqPSfbeKHDXzVD86LC2ZUUjLX`:
 
-## 6. After adoption
+```
+76a91412602418ffc74640e37f1a73d0cdc255d2a07c3588ac
+```
 
-The corridor opens with the first mined block on X. Stakers deposit
-during the corridor (doc/b3-staking-guide.md). At 811,001 the modern
-era begins on the ratified parameters. The through-H FN report is run
-against the sealed chain to fix final R (doc/design/b3-fn-pod.md).
+### Seal packet checklist
+
+- [ ] Every capture source reports H = 810,000 and identical 64-hex X.
+- [ ] `gettxoutsetinfo` reports `bestblock = X`.
+- [ ] S_H, its exact base-unit conversion, and R0 are recorded without floating
+      point.
+- [ ] Final-H artifacts prove three-way UTXO equivalence with direct exit 0.
+- [ ] Independent FN manifest runs are byte-identical and reproduce R and root.
+- [ ] The published full manifest, checksum, R, and root are archived.
+- [ ] Every manifest row satisfies the historical predicate and exact P2PKH
+      recipient rule; no rows are aggregated.
+- [ ] R is at most 5,000.
+- [ ] Every other mainnet consensus field, including exact post-M heights A1
+      (modern FN PoD), A2 (simple-v1 assets plus FlowMesh preparation), and A3
+      (FlowMesh trading/settlement), has an owner ruling. A3 is at least 30
+      blocks after A2. Missing values stop the tag.
+- [ ] If bUSD is to activate in this release, every bridge readiness pin and
+      proof/state implementation gate is independently reviewed and complete.
+      The managed-v1 vault is exactly
+      `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`; otherwise bUSD remains
+      explicitly fail-closed at tag time.
+
+## 3. Pin the transition release
+
+In mainnet consensus parameters, confirm the already-fixed height and pin the
+seal-derived or owner-selected values:
+
+```
+legacy_final_hash       = X
+modern_pos.reward       = R0
+fn_genesis_manifest_version = 1
+fn_genesis_manifest     = exact canonical right rows (count = R)
+fn_genesis_rights_root  = FN_RIGHTS_ROOT
+hard_fork_height        = 810001 (also the fixed FN Genesis height)
+fn_pod_activation_height = A1, owner-ratified and post-M
+asset_activation_height  = A2, owner-ratified and post-M
+flowmesh_activation_height = A3, owner-ratified and A3 >= A2 + 30
+asset_issuance_fee      = 1,000 B3
+```
+
+The FN manifest sequence is mandatory in the coinbase of block 810,001. FN
+transfers have no separate height lock; ordinary 30-block coinbase maturity is
+the only initial delay. Modern FN PoD creation remains invalid before A1,
+asset issuance and FlowMesh preparation remain invalid before A2, and full
+FlowMesh processing remains invalid before A3.
+
+After pinning, `getassetstate` must report the schedule as configured, the exact
+FN asset id and historical count, the selected A1/A2/A3 heights, and the
+correct next-slot disintegration tier. Preserve its output in the release
+packet.
+`getwalletassets` must find historical FN outputs after rescan/import, while
+`issueasset`, `sendasset`, `burnasset`, and `createfncoin` must construct, fund,
+sign, and optionally broadcast their respective actions without treating asset
+units as native B3.
+
+Construct the entire Modern PoS block explicitly; never rely on its
+fees-only/empty-treasury defaults:
+
+```
+block_interval_seconds = 60
+round_seconds          = 30
+f0_num                  = 1
+f0_den                  = 1
+sentinel_bits           = 0x207fffff
+max_future_seconds      = 120
+reward                 = R0
+halving_interval       = 525,600
+treasury_percent       = 10
+treasury_script        = script above
+reorg_horizon          = 1,440
+finality_epoch_blocks  = 1,440
+checkpoint_interval    = 10
+checkpoint_depth       = 12
+max_epoch_extension    = 10,080
+min_finality_set       = 4
+```
+
+Immediately assert `modern_pos.Valid()` and add value-by-value mainnet tests
+for every field above. A default-constructed or partially initialized block is
+a release failure even when it happens to pass structural validation.
+
+`min_stake_amount = 333 B3`, corridor bits `0x1f008000`, H, M, and the
+corridor length are already pinned. Never infer a missing value during release
+construction.
+
+## 4. Implemented release surface and required verification
+
+The branch contains the production wiring below. Before tagging, review it and
+require passing tests for:
+
+- exact manifest parsing, count/root recomputation, and source-byte pinning;
+- mandatory block-810,001 coinbase FN outputs in manifest order;
+- rejection of omitted, inserted, reordered, aggregated, or redirected FN
+  genesis outputs and rejection of genesis at any other height;
+- ordinary coinbase maturity with no additional FN transfer lock;
+- actual owner-script signature authorization over the complete modern spend;
+- FN conservation, modern capacity `5,000 - R`, and 15k/30k/60k modern PoD
+  tiers with destroyed B3 excluded from producer fees and fail-closed before A1;
+- permanent semantic rejection of retired FN action types 1 and 2;
+- simple-v1 fixed genesis, no re-mint path, deterministic chain-bound AssetId,
+  1,000 B3 treasury fee, and fail-closed before A2;
+- canonical B3A1 `PolicyType::BURN` outputs, with no asset/FN `OP_RETURN`
+  carrier and no reopening of issuance capacity;
+- activation, mempool, block-template, connect/disconnect, reorg, restart,
+  reindex, replay, wallet rescan, and late legacy-key import behavior; and
+- `getassetstate`, `getwalletassets`, `issueasset`, `sendasset`, `burnasset`,
+  and `createfncoin`, including non-broadcast construction and native
+  fee/change accounting; and
+- A2 seat binding and vault preparation; at or after A3, sequence-zero
+  bootstrap from each market's unique earliest canonical block at or after
+  `market.created_height` whose post-block FN set first has at least four
+  seats, once that anchor is 30 blocks deep; dedicated authenticated
+  microblock relay, exact spot clearing/fee allocation, typed checkpoint and
+  vault-proof publication, custody conservation, seat handoff, shallow reorg
+  recovery, restart convergence, and fail-safe market pause;
+- withdrawal admission that keeps pending obligations within the deterministic
+  largest-64 live pool-UTXO capacity, payout input selection by amount
+  descending then outpoint, and the sequential publisher rule: publish one,
+  confirm it, refresh capacity, rebuild, then publish the next;
+- after every ordinary slot, a deterministic maximal partial treasury flush of
+  `min(accrued treasury available, anchored native capacity minus existing
+  pending native withdrawals)` when positive; zero capacity never blocks
+  trading;
+- the four-node FlowMesh release test from A2 through deposits, trading,
+  treasury/user withdrawals, mixed-boundary settlement, and restart with
+  identical state roots and balances; and
+- all existing boundary, replay, corridor, staking, Modern PoS, and finality
+  suites.
+
+The old 4,000-byte historical proof-size measurement is not a release gate.
+Its claim/proof builders and verifiers have been removed. Only the numeric
+type/version registry entries 1 and 2 remain permanently inactive and rejected,
+so previously assigned bytes can never acquire a new meaning.
+
+Confirm `CLIENT_VERSION_MAJOR/MINOR/BUILD` remains `1/1/0` and
+`doc/release-notes-v1.1.0.md` is present and accurate. Flip the guard tests from
+the fail-closed pre-pin shape to exact value-by-value assertions for X, R0,
+manifest checksum/count/root, FN genesis height, A1, A2, A3, fee, and every
+Modern PoS parameter.
+
+## 5. Mandatory shadow-fork rehearsal
+
+Using the isolated harness and a copied real-history datadir, run 2–3 clients
+through:
+
+1. the test seal and independent manifest reproduction;
+2. first-corridor-block mining with the exact FN Genesis coinbase;
+3. rejection of mutated genesis coinbases;
+4. rejection of FN spends before coinbase maturity and acceptance at maturity;
+5. modern PoD rejection before A1 and price/cap/fee accounting at A1;
+6. the corridor-to-Modern-PoS boundary;
+7. simple-v1 asset rejection before A2, then activation and the 1,000 B3
+   treasury fee at A2;
+8. FlowMesh seat/deposit preparation at A2, rejection of trading before A3,
+   then sequence-zero bootstrap from the unique earliest eligible market
+   anchor once 30-deep, spot trade, checkpoint, vault sweeps and handoff;
+9. top-64 withdrawal admission, amount-descending/outpoint payout selection,
+   sequential publish-confirm-refresh/rebuild, and maximal partial treasury
+   flush without blocking trading at zero capacity;
+10. exact custody/supply/state-root agreement across all nodes after restart;
+   and
+11. restart, reindex, disconnect/reconnect, and wallet rescan.
+
+Preserve configs, commands, logs, block hashes, artifact hashes, and test exit
+statuses. Any unexplained divergence stops the release.
+
+## 6. Tag and ship
+
+1. Commit and review the measured pins and production wiring.
+2. Complete the full local build, mandatory suites, and shadow-fork gate.
+3. Tag `v1.1.0`, push the release branch and tag, and let CI build all five
+   package variants.
+4. Attach binaries and SHA-256 checksums to the release. Publish X prominently
+   with the old-client verification command `getblockhash 810000`.
+5. Publish the full FN manifest, checksum, R, and rights root beside the release
+   so anyone can independently reproduce them.
+6. Publish and sign an update manifest only if §0's updater prerequisites are
+   actually met. Otherwise give manual download links and say installation is
+   manual.
+7. Announce the honest pause duration, required upgrade, FN Genesis in block
+   810,001, 30-block maturity, and the later A1/A2/A3 feature heights.
+
+## 7. After adoption
+
+The first valid block on X is corridor block 810,001 and must contain FN
+Genesis. Stakers deposit during corridor blocks 810,001..811,000. Modern PoS
+begins at M = 811,001. After the pinned soak interval, modern FN PoD creation
+activates at A1. Simple-v1 colored assets and FlowMesh seat/vault preparation
+activate at A2. Full FlowMesh spot trading and settlement activate at A3, with
+at least the required 30-block preparation runway. Each market nevertheless
+waits for its own unique earliest canonical block at or after
+`market.created_height` whose post-block FN set has at least four seats, and
+sequence zero starts only once that block is 30-deep. No post-adoption FN
+rights scan or list selection exists; those were completed and pinned before
+the tag.
+
+Do not announce bUSD as active merely because its canonical Ethereum-USDT
+identity and managed-v1 vault facts are present. Bridge minting stays
+fail-closed until the proof adapter/light-client inputs, caps, activation and
+all withdrawal operating-rule pins pass the bridge readiness gate.

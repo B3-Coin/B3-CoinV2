@@ -27,11 +27,12 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 # Project / Package metadata
 #=============================
 set(CLIENT_NAME "B3 FlowMesh client")
-# B3 Hive product versioning (owner ruling 2026-08-26): the v1 release is
-# "B3 Hive 1.0.0", retiring the inherited Bitcoin Core 31.x numbering.
+# B3 Hive product versioning (owner ruling 2026-08-26). The transition
+# release follows B3 Hive 1.0.0 as v1.1.0; P2P protocol versioning remains
+# independent.
 # The P2P protocol version is a separate constant and is unaffected.
 set(CLIENT_VERSION_MAJOR 1)
-set(CLIENT_VERSION_MINOR 0)
+set(CLIENT_VERSION_MINOR 1)
 set(CLIENT_VERSION_BUILD 0)
 set(CLIENT_VERSION_RC 0)
 set(CLIENT_VERSION_IS_RELEASE "true")

@@ -5,8 +5,10 @@
 #ifndef BITCOIN_CONSENSUS_ERA_H
 #define BITCOIN_CONSENSUS_ERA_H
 
+#include <consensus/flowmesh_params.h>
 #include <consensus/params.h>
 
+#include <limits>
 #include <optional>
 
 namespace Consensus {
@@ -160,6 +162,101 @@ constexpr bool ModernObjectRulesActive(const Params& params)
 {
     return params.legacy_b3coin && params.hard_fork_height.has_value() &&
            params.legacy_final_hash.has_value() && params.modern_pos.has_value();
+}
+
+/**
+ * Whether the transition release carries a complete historical FN Genesis
+ * configuration. This is a cheap shape predicate only; the manifest/root
+ * equality is checked by the FN Genesis validation layer before any block can
+ * use it.
+ */
+constexpr bool FnGenesisConfigured(const Params& params)
+{
+    return LegacyBoundaryPinned(params) && params.hard_fork_height.has_value() &&
+           params.fn_genesis_rights_root.has_value() &&
+           !params.fn_genesis_manifest.empty();
+}
+
+/** FN owner outputs and transfers exist from their mandatory H+1 genesis. */
+constexpr bool FnRulesActive(const int height, const Params& params)
+{
+    return FnGenesisConfigured(params) && height >= *params.hard_fork_height;
+}
+
+/**
+ * Whether the two post-M feature heights form the one release schedule that
+ * was ratified for FN PoD and simple-v1 assets. Both pins are required, FN PoD
+ * starts strictly after modern PoS has begun, and colored assets cannot start
+ * before FN PoD. An incomplete or contradictory schedule fails closed for
+ * both features.
+ */
+constexpr bool FnAssetActivationScheduleConfigured(const Params& params)
+{
+    const std::optional<int> modern_start{ModernPosStartHeight(params)};
+    return ModernObjectRulesActive(params) && modern_start.has_value() &&
+           params.fn_pod_activation_height.has_value() &&
+           params.asset_activation_height.has_value() &&
+           *params.fn_pod_activation_height > *modern_start &&
+           *params.asset_activation_height >= *params.fn_pod_activation_height;
+}
+
+/** Permissionless post-genesis PoD creation has its own explicit height. */
+constexpr bool FnPodRulesActive(const int height, const Params& params)
+{
+    return FnRulesActive(height, params) &&
+           FnAssetActivationScheduleConfigured(params) &&
+           height >= *params.fn_pod_activation_height;
+}
+
+/** Simple-v1 colored assets activate only at their separately pinned height. */
+constexpr bool AssetRulesActive(const int height, const Params& params)
+{
+    if (params.test_only_asset_policies_active) return true;
+    return FnAssetActivationScheduleConfigured(params) &&
+           height >= *params.asset_activation_height;
+}
+
+/**
+ * Whether the transition release contains a complete A1/A2/A3 FlowMesh
+ * schedule. Seat pre-binding opens at A2, while full FlowMesh service starts
+ * at A3 after at least one anchor-depth runway. Leaving A3 unset or pinning an
+ * insufficient runway fails both gates closed without changing A1/A2 asset
+ * semantics.
+ */
+constexpr bool FlowMeshSeatBindingScheduleConfigured(const Params& params)
+{
+    return FnAssetActivationScheduleConfigured(params) &&
+           params.flowmesh_activation_height.has_value() &&
+           *params.asset_activation_height <=
+               std::numeric_limits<int>::max() - FLOWMESH_ANCHOR_DEPTH &&
+           *params.flowmesh_activation_height >=
+               *params.asset_activation_height + FLOWMESH_ANCHOR_DEPTH;
+}
+
+/** FN-v2 seat outputs and type-7 evidence pre-bind from A2. */
+constexpr bool FlowMeshSeatBindingRulesActive(const int height, const Params& params)
+{
+    return FlowMeshSeatBindingScheduleConfigured(params) &&
+           height >= *params.asset_activation_height;
+}
+
+/**
+ * Keyless market bootstrap deposits share the A2 preparation runway. They
+ * cannot be swept, traded, checkpointed or withdrawn until full A3 rules,
+ * but allowing the first colored deposit here makes its market identity 30
+ * blocks deep when A3 opens.
+ */
+constexpr bool FlowMeshVaultPreparationRulesActive(const int height,
+                                                   const Params& params)
+{
+    return FlowMeshSeatBindingRulesActive(height, params);
+}
+
+/** Trading, vault spends and checkpoint rules remain inactive until A3. */
+constexpr bool FlowMeshRulesActive(const int height, const Params& params)
+{
+    return FlowMeshSeatBindingScheduleConfigured(params) &&
+           height >= *params.flowmesh_activation_height;
 }
 
 /**

@@ -8,6 +8,7 @@
 #include <crypto/ripemd160.h>
 #include <crypto/sha1.h>
 #include <crypto/sha256.h>
+#include <modern/asset_output.h>
 #include <pubkey.h>
 #include <script/script.h>
 #include <tinyformat.h>
@@ -1422,8 +1423,18 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
     bool uses_bip341_taproot = force;
     for (size_t inpos = 0; inpos < txTo.vin.size() && !(uses_bip143_segwit && uses_bip341_taproot); ++inpos) {
         if (!txTo.vin[inpos].scriptWitness.IsNull()) {
-            if (m_spent_outputs_ready && m_spent_outputs[inpos].scriptPubKey.size() == 2 + WITNESS_V1_TAPROOT_SIZE &&
-                m_spent_outputs[inpos].scriptPubKey[0] == OP_1) {
+            std::optional<CScript> asset_owner;
+            const CScript* authorization_script{nullptr};
+            if (m_spent_outputs_ready) {
+                asset_owner = modern::AssetOwnerScript(
+                    m_spent_outputs[inpos].scriptPubKey);
+                authorization_script = asset_owner
+                                           ? &*asset_owner
+                                           : &m_spent_outputs[inpos].scriptPubKey;
+            }
+            if (authorization_script &&
+                authorization_script->size() == 2 + WITNESS_V1_TAPROOT_SIZE &&
+                (*authorization_script)[0] == OP_1) {
                 // Treat every witness-bearing spend with 34-byte scriptPubKey that starts with OP_1 as a Taproot
                 // spend. This only works if spent_outputs was provided as well, but if it wasn't, actual validation
                 // will fail anyway. Note that this branch may trigger for scriptPubKeys that aren't actually segwit
@@ -2006,7 +2017,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
     // There is intentionally no return statement here, to be able to use "control reaches end of non-void function" warnings to detect gaps in the logic above.
 }
 
-bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror)
+bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror, const bool enable_asset_owner)
 {
     static const CScriptWitness emptyWitness;
     if (witness == nullptr) {
@@ -2015,6 +2026,14 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
     bool hadWitness = false;
 
     set_error(serror, SCRIPT_ERR_UNKNOWN_ERROR);
+
+    // A canonical B3A1 output authorizes its owner suffix exactly as an
+    // ordinary output of that script. Asset identity/amount/policy are checked
+    // separately by contextual consensus; script authorization must retain
+    // the normal P2PKH, P2SH, witness, taproot and bare-multisig semantics.
+    const std::optional<CScript> asset_owner{
+        enable_asset_owner ? modern::AssetOwnerScript(scriptPubKey) : std::nullopt};
+    const CScript& authorization_script{asset_owner ? *asset_owner : scriptPubKey};
 
     if ((flags & SCRIPT_VERIFY_SIGPUSHONLY) != 0 && !scriptSig.IsPushOnly()) {
         return set_error(serror, SCRIPT_ERR_SIG_PUSHONLY);
@@ -2028,7 +2047,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
         return false;
     if (flags & SCRIPT_VERIFY_P2SH)
         stackCopy = stack;
-    if (!EvalScript(stack, scriptPubKey, flags, checker, SigVersion::BASE, serror))
+    if (!EvalScript(stack, authorization_script, flags, checker, SigVersion::BASE, serror))
         // serror is set
         return false;
     if (stack.empty())
@@ -2040,7 +2059,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
     int witnessversion;
     std::vector<unsigned char> witnessprogram;
     if (flags & SCRIPT_VERIFY_WITNESS) {
-        if (scriptPubKey.IsWitnessProgram(witnessversion, witnessprogram)) {
+        if (authorization_script.IsWitnessProgram(witnessversion, witnessprogram)) {
             hadWitness = true;
             if (scriptSig.size() != 0) {
                 // The scriptSig must be _exactly_ CScript(), otherwise we reintroduce malleability.
@@ -2056,7 +2075,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
     }
 
     // Additional validation for spend-to-script-hash transactions:
-    if ((flags & SCRIPT_VERIFY_P2SH) && scriptPubKey.IsPayToScriptHash())
+    if ((flags & SCRIPT_VERIFY_P2SH) && authorization_script.IsPayToScriptHash())
     {
         // scriptSig must be literals-only or validation fails
         if (!scriptSig.IsPushOnly())
@@ -2143,20 +2162,24 @@ size_t static WitnessSigOps(int witversion, const std::vector<unsigned char>& wi
     return 0;
 }
 
-size_t CountWitnessSigOps(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness& witness, script_verify_flags flags)
+size_t CountWitnessSigOps(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness& witness, script_verify_flags flags, const bool enable_asset_owner)
 {
     if ((flags & SCRIPT_VERIFY_WITNESS) == 0) {
         return 0;
     }
     assert((flags & SCRIPT_VERIFY_P2SH) != 0);
 
+    const std::optional<CScript> asset_owner{
+        enable_asset_owner ? modern::AssetOwnerScript(scriptPubKey) : std::nullopt};
+    const CScript& authorization_script{asset_owner ? *asset_owner : scriptPubKey};
+
     int witnessversion;
     std::vector<unsigned char> witnessprogram;
-    if (scriptPubKey.IsWitnessProgram(witnessversion, witnessprogram)) {
+    if (authorization_script.IsWitnessProgram(witnessversion, witnessprogram)) {
         return WitnessSigOps(witnessversion, witnessprogram, witness);
     }
 
-    if (scriptPubKey.IsPayToScriptHash() && scriptSig.IsPushOnly()) {
+    if (authorization_script.IsPayToScriptHash() && scriptSig.IsPushOnly()) {
         CScript::const_iterator pc = scriptSig.begin();
         std::vector<unsigned char> data;
         while (pc < scriptSig.end()) {

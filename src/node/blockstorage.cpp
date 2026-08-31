@@ -66,9 +66,50 @@ static constexpr uint8_t DB_BLOCK_INDEX{'b'};
 static constexpr uint8_t DB_FLAG{'F'};
 static constexpr uint8_t DB_REINDEX_FLAG{'R'};
 static constexpr uint8_t DB_LAST_BLOCK{'l'};
+// Versioned sidecar for the branch-local cumulative modern FN issuance count.
+// Kept outside CDiskBlockIndex so existing block-index records remain readable.
+static constexpr uint8_t DB_FN_POD_ISSUED_TOTAL{'N'};
 // Keys used in previous version that might still be found in the DB:
 // BlockTreeDB::DB_TXINDEX_BLOCK{'T'};
 // BlockTreeDB::DB_TXINDEX{'t'}
+
+namespace {
+
+struct FnPodIssuedTotalKey {
+    uint32_t height{0};
+    uint256 block_hash{};
+
+    FnPodIssuedTotalKey() = default;
+    explicit FnPodIssuedTotalKey(const CBlockIndex& index)
+        : height{static_cast<uint32_t>(index.nHeight)}, block_hash{index.GetBlockHash()}
+    {
+        assert(index.nHeight >= 0);
+    }
+
+    SERIALIZE_METHODS(FnPodIssuedTotalKey, obj)
+    {
+        uint8_t prefix{DB_FN_POD_ISSUED_TOTAL};
+        READWRITE(prefix);
+        if (prefix != DB_FN_POD_ISSUED_TOTAL) {
+            throw std::ios_base::failure("invalid modern FN issuance sidecar key prefix");
+        }
+        READWRITE(obj.height, obj.block_hash);
+    }
+};
+
+struct FnPodIssuedTotalDisk {
+    static constexpr uint8_t FORMAT_VERSION{1};
+
+    uint8_t version{FORMAT_VERSION};
+    uint32_t issued_total{0};
+
+    SERIALIZE_METHODS(FnPodIssuedTotalDisk, obj)
+    {
+        READWRITE(obj.version, obj.issued_total);
+    }
+};
+
+} // namespace
 // BlockTreeDB::ReadFlag("txindex")
 
 bool BlockTreeDB::ReadBlockFileInfo(int nFile, CBlockFileInfo& info)
@@ -104,6 +145,10 @@ void BlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFi
     batch.Write(DB_LAST_BLOCK, nLastFile);
     for (const CBlockIndex* bi : blockinfo) {
         batch.Write(std::make_pair(DB_BLOCK_INDEX, bi->GetBlockHash()), CDiskBlockIndex{bi});
+        if (bi->m_fn_pod_issued_total_known) {
+            batch.Write(FnPodIssuedTotalKey{*bi},
+                        FnPodIssuedTotalDisk{.issued_total = bi->m_fn_pod_issued_total});
+        }
     }
     WriteBatch(batch, true);
 }
@@ -217,6 +262,60 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
         } else {
             break;
         }
+    }
+
+    // Load the optional FN issuance sidecars only after every regular block
+    // index entry has been materialized. Calling insertBlockIndex now therefore
+    // returns the existing branch entry. Including the height in the sidecar
+    // key lets us reject an orphan/stale record instead of accidentally
+    // accepting a newly inserted default CBlockIndex.
+    pcursor->Seek(DB_FN_POD_ISSUED_TOTAL);
+    while (pcursor->Valid()) {
+        if (interrupt) return false;
+
+        uint8_t prefix{0};
+        if (!pcursor->GetKey(prefix)) {
+            LogError("%s: failed to read modern FN issuance sidecar key prefix\n", __func__);
+            return false;
+        }
+        if (prefix != DB_FN_POD_ISSUED_TOTAL) break;
+
+        FnPodIssuedTotalKey key;
+        FnPodIssuedTotalDisk value;
+        if (!pcursor->GetKey(key)) {
+            LogError("%s: failed to read modern FN issuance sidecar key\n", __func__);
+            return false;
+        }
+        if (!pcursor->GetValue(value)) {
+            LogError("%s: failed to read modern FN issuance sidecar value for %s\n",
+                     __func__, key.block_hash.ToString());
+            return false;
+        }
+        if (value.version != FnPodIssuedTotalDisk::FORMAT_VERSION) {
+            LogError("%s: unsupported modern FN issuance sidecar version %u for %s\n",
+                     __func__, value.version, key.block_hash.ToString());
+            return false;
+        }
+
+        CBlockIndex* pindex{insertBlockIndex(key.block_hash)};
+        const bool is_loaded_genesis{
+            key.height == 0 && key.block_hash == consensusParams.hashGenesisBlock};
+        if (!pindex || pindex->nHeight < 0 ||
+            static_cast<uint32_t>(pindex->nHeight) != key.height ||
+            (key.height == 0 && !is_loaded_genesis)) {
+            LogError("%s: modern FN issuance sidecar has no matching block-index entry: height=%u hash=%s\n",
+                     __func__, key.height, key.block_hash.ToString());
+            return false;
+        }
+        if (pindex->m_fn_pod_issued_total_known &&
+            pindex->m_fn_pod_issued_total != value.issued_total) {
+            LogError("%s: conflicting modern FN issuance sidecar for %s\n",
+                     __func__, key.block_hash.ToString());
+            return false;
+        }
+        pindex->m_fn_pod_issued_total = value.issued_total;
+        pindex->m_fn_pod_issued_total_known = true;
+        pcursor->Next();
     }
 
     return true;
@@ -609,6 +708,21 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
             return false;
         }
         const AssumeutxoData& au_data = *Assert(maybe_au_data);
+        const Consensus::Params& consensus{GetConsensus()};
+        const bool skips_fn_genesis{
+            consensus.fn_genesis_required && consensus.hard_fork_height &&
+            au_data.height >= *consensus.hard_fork_height};
+        const bool skips_fn_pod{
+            consensus.fn_pod_activation_height &&
+            au_data.height >= *consensus.fn_pod_activation_height};
+        if (consensus.legacy_b3coin && (skips_fn_genesis || skips_fn_pod)) {
+            m_opts.notifications.fatalError(Untranslated(
+                "B3 AssumeUTXO snapshots at or after mandatory FN Genesis or "
+                "modern FN PoD activation are unsupported because FN "
+                "configuration and issuance state are not committed by the "
+                "snapshot metadata."));
+            return false;
+        }
         m_snapshot_height = au_data.height;
         CBlockIndex* base{LookupBlockIndex(*snapshot_blockhash)};
 

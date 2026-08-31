@@ -82,8 +82,8 @@ struct TransitionProof {
  *
  * v1 wire form is FROZEN as-is and carries no creation actions. The
  * versioned v2 envelope defined at the end of this header carries the
- * creation-action collection (the generic frame lives in
- * modern/creation_action.h; the FN payload rules in modern/fn.h).
+ * creation-action collection (the generic registry and bounds live in
+ * modern/creation_action.h).
  * No production outer transaction/block codec selects either form yet;
  * FN cannot activate until an outer context selects the v2 envelope
  * through its own reviewed change.
@@ -178,9 +178,15 @@ inline std::optional<std::vector<uint256>> ParseVaultReceiptIds(
  */
 inline ProofCheck VerifyTransitionProof(const ModernOutput& prev_output,
                                         const TransitionProof& proof,
-                                        const bool assets_active = false)
+                                        const bool assets_active = false,
+                                        const bool dex_vault_active = false)
 {
-    if (!IsActivatedPolicy(prev_output.policy_type, prev_output.policy_version, assets_active)) {
+    // This legacy proof helper is exercised only by the explicitly test-only
+    // vault suite. Production colored-asset activation must not activate the
+    // dormant DEX policy.
+    if (!IsActivatedPolicy(prev_output.policy_type, prev_output.policy_version,
+                           assets_active, /*fn_active=*/false,
+                           dex_vault_active)) {
         return ProofCheck::UNKNOWN_POLICY;
     }
     if (proof.proof_type != prev_output.policy_type ||
@@ -259,14 +265,16 @@ inline ProofCheck VerifyTransitionProof(const ModernOutput& prev_output,
  */
 inline ProofCheck VerifyTransitionProofs(const std::vector<ModernOutput>& prev_outputs,
                                          const ModernTransition& t,
-                                         const bool assets_active = false)
+                                         const bool assets_active = false,
+                                         const bool dex_vault_active = false)
 {
     if (t.proofs.size() != t.inputs.size() || prev_outputs.size() != t.inputs.size()) {
         return ProofCheck::PROOF_COUNT_MISMATCH;
     }
     for (size_t i{0}; i < t.inputs.size(); ++i) {
         if (t.inputs[i].proof_index != i) return ProofCheck::PROOF_REF_NONCANONICAL;
-        const ProofCheck result{VerifyTransitionProof(prev_outputs[i], t.proofs[i], assets_active)};
+        const ProofCheck result{VerifyTransitionProof(prev_outputs[i], t.proofs[i],
+                                                      assets_active, dex_vault_active)};
         if (result != ProofCheck::OK) return result;
     }
     return ProofCheck::OK;
@@ -367,8 +375,8 @@ inline std::optional<std::vector<unsigned char>> EncodeTransitionEnvelope(
 }
 
 /**
- * Strict, fully bounded envelope decode — STRUCTURAL only (FN semantic
- * validation is modern/fn.h's separate concern). Enforces, all BEFORE
+ * Strict, fully bounded envelope decode — STRUCTURAL only; each active
+ * creation type has its own contextual semantic validation. Enforces, BEFORE
  * the corresponding allocation: the envelope ceiling (before any
  * parsing); version exactly 2 (a wrong-endian 2 reads as 512 and
  * rejects as unknown); canonical compact sizes everywhere; count

@@ -143,18 +143,28 @@ struct CoinbaseTx {
     /**
      * Block subsidy plus fees, minus any non-zero required_outputs.
      *
-     * Currently there are no non-zero required_outputs, so block_reward_remaining
-     * is the entire block reward. See also required_outputs.
+     * This is the exact amount available to miner-controlled payout outputs.
+     * In particular, the mandatory treasury output is already subtracted.
      */
     CAmount block_reward_remaining;
     /*
      * To be included as the last outputs in the coinbase transaction.
-     * Currently this is only the witness commitment OP_RETURN, but future
-     * softforks or a custom mining patch could add more.
+     * This includes the treasury split, mandatory zero-native FN Genesis
+     * outputs in the first corridor block, finality/payload-root cells, and
+     * the witness commitment when present. Order is consensus-significant and
+     * matches the assembled coinbase after its miner-controlled payout.
      *
      * The dummy output that spends the full reward is excluded.
      */
     std::vector<CTxOut> required_outputs;
+    /**
+     * Exact serialized Modern Payload Area section for the coinbase
+     * (CompactSize record count followed by records), excluding transaction
+     * marker/flag bytes. Empty for a coinbase without MPA. A reconstruction
+     * client must preserve this section; payload-root required_outputs commit
+     * to it and to every non-coinbase MPA section in the template.
+     */
+    std::vector<unsigned char> mpa_section;
     uint32_t lock_time;
 };
 

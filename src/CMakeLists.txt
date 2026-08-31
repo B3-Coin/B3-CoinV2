@@ -117,6 +117,10 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   core_io.cpp
   deploymentinfo.cpp
   external_signer.cpp
+  flowmesh/bls_certificate.cpp
+  flowmesh/p2p.cpp
+  flowmesh/production_engine.cpp
+  flowmesh/production_wire.cpp
   init/common.cpp
   kernel/chainparams.cpp
   legacy/checkpoints.cpp
@@ -247,8 +251,14 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/txorphanage.cpp
   node/txreconciliation.cpp
   node/flowmesh_anchor.cpp
+  node/flowmesh_production_store.cpp
+  node/flowmesh_runtime.cpp
+  node/flowmesh_service.cpp
   node/flowmesh_store.cpp
+  node/flowmesh_vault_index.cpp
+  node/flowmesh_checkpoint_index.cpp
   node/fn_pod.cpp
+  node/fn_seat_index.cpp
   node/legacy_fn_issuance.cpp
   node/finality_binding_index.cpp
   node/finality_pin.cpp

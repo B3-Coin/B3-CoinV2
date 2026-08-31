@@ -250,19 +250,22 @@ BOOST_AUTO_TEST_CASE(dex_vault_v2_params_distinguish_user_deposit_from_pool_chan
         BOOST_CHECK_EQUAL(vp->shard, 7U);
         BOOST_CHECK(!vp->account.has_value());
     }
-    out.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_USER_DEPOSIT, 3, account);
+    const uint16_t deposit_shard{modern::FlowMeshUserDepositShard(vault, account)};
+    out.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_USER_DEPOSIT,
+                                                deposit_shard, account);
     BOOST_CHECK(modern::CheckPolicyOutput(out, 1001, params) == modern::PolicyOutputCheck::OK);
     {
         const auto vp{modern::ParseVaultParams(out.policy_params)};
         BOOST_REQUIRE(vp.has_value());
         BOOST_CHECK_EQUAL(vp->kind, modern::VAULT_KIND_USER_DEPOSIT);
-        BOOST_CHECK_EQUAL(vp->shard, 3U);
+        BOOST_CHECK_EQUAL(vp->shard, deposit_shard);
         BOOST_REQUIRE(vp->account.has_value());
         BOOST_CHECK(*vp->account == account);
     }
     // Malformed: a USER_DEPOSIT with a null account, wrong sizes, unknown
     // kind, and the retired v1 two-byte form.
-    out.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_USER_DEPOSIT, 3, uint256{});
+    out.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_USER_DEPOSIT,
+                                                deposit_shard, uint256{});
     BOOST_CHECK(modern::CheckPolicyOutput(out, 1001, params) != modern::PolicyOutputCheck::OK);
     out.policy_params = {modern::VAULT_KIND_POOL_CHANGE, 0x00}; // too short
     BOOST_CHECK(modern::CheckPolicyOutput(out, 1001, params) != modern::PolicyOutputCheck::OK);
@@ -277,8 +280,32 @@ BOOST_AUTO_TEST_CASE(dex_vault_v2_params_distinguish_user_deposit_from_pool_chan
     out.policy_version = modern::POLICY_VERSION_V1;
     out.policy_params = {0x00, 0x00};
     BOOST_CHECK(!modern::IsActivatedPolicy(out.policy_type, out.policy_version, /*assets_active=*/true));
-    BOOST_CHECK(modern::IsActivatedPolicy(out.policy_type, modern::DEX_VAULT_POLICY_VERSION_V2, true));
-    BOOST_CHECK(!modern::IsActivatedPolicy(out.policy_type, modern::DEX_VAULT_POLICY_VERSION_V2, false));
+    BOOST_CHECK(modern::IsActivatedPolicy(out.policy_type,
+                                           modern::DEX_VAULT_POLICY_VERSION_V2,
+                                           /*assets_active=*/false,
+                                           /*fn_active=*/false,
+                                           /*dex_vault_active=*/true));
+    BOOST_CHECK(!modern::IsActivatedPolicy(out.policy_type,
+                                            modern::DEX_VAULT_POLICY_VERSION_V2,
+                                            /*assets_active=*/true,
+                                            /*fn_active=*/false,
+                                            /*dex_vault_active=*/false));
+
+    // A complete same-release schedule opens keyless vault preparation with
+    // colored assets at A2; their proof-authorized spends still wait for A3.
+    params.test_only_asset_policies_active = false;
+    params.legacy_final_hash = uint256::ONE;
+    params.modern_pos.emplace();
+    params.fn_pod_activation_height = 1010;
+    params.asset_activation_height = 1020;
+    params.flowmesh_activation_height = 1020 + Consensus::FLOWMESH_ANCHOR_DEPTH;
+    out.policy_version = modern::DEX_VAULT_POLICY_VERSION_V2;
+    out.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_POOL_CHANGE, 7);
+    BOOST_REQUIRE(Consensus::AssetRulesActive(1020, params));
+    BOOST_CHECK(modern::CheckPolicyOutput(out, 1019, params) ==
+                modern::PolicyOutputCheck::UNKNOWN_POLICY);
+    BOOST_CHECK(modern::CheckPolicyOutput(out, 1020, params) ==
+                modern::PolicyOutputCheck::OK);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

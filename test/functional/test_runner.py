@@ -115,10 +115,12 @@ BASE_SCRIPTS = [
     'feature_maxuploadtarget.py',
     'feature_assumeutxo.py',
     'feature_b3_finality_soak.py',
+    'feature_flowmesh_release.py',
     'mempool_updatefromblock.py',
     'mempool_persist.py',
     # vv Tests less than 60s vv
     'rpc_psbt.py',
+    'wallet_mpa_funding.py',
     'wallet_fundrawtransaction.py',
     'wallet_bumpfee.py',
     'wallet_v3_txs.py',

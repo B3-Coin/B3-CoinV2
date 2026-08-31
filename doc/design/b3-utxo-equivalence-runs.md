@@ -105,6 +105,13 @@ R before FN activation. All final historical rights are reserved; reachable
 modern capacity is at most 1,500 and may be smaller. If final `R > 5,000`,
 FN activation returns to the owner and no historical right is truncated.
 
+**LATEST SUPERSESSION (owner ruling 2026-09-01):** FN no longer activates
+behind a later historical-claim height. Block 810,001 coinbase is mandatory FN
+Genesis, so the final through-H manifest/count/root reproduction is a gate for
+the X-pin transition release itself and must finish during the seal pause before
+tagging. The 3,500 result remains a floor; final modern capacity is exactly
+`5,000 - R`. No holder claim or proof-carrier measurement remains.
+
 Incident log (for the record): the port node crashed once mid-sync on a
 relayed unconfirmed legacy transaction (CalculateLockPointsAtTip assertion)
 — worked around with -blocksonly during this campaign and subsequently

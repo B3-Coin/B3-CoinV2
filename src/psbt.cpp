@@ -5,6 +5,7 @@
 #include <psbt.h>
 
 #include <common/types.h>
+#include <modern/asset_output.h>
 #include <node/types.h>
 #include <policy/policy.h>
 #include <script/signingprovider.h>
@@ -17,6 +18,7 @@ PartiallySignedTransaction::PartiallySignedTransaction(const CMutableTransaction
 {
     inputs.resize(tx.vin.size());
     outputs.resize(tx.vout.size());
+    ResetInputAssetSigningContexts();
 }
 
 bool PartiallySignedTransaction::IsNull() const
@@ -26,8 +28,10 @@ bool PartiallySignedTransaction::IsNull() const
 
 bool PartiallySignedTransaction::Merge(const PartiallySignedTransaction& psbt)
 {
-    // Prohibited to merge two PSBTs over different transactions
-    if (tx->GetHash() != psbt.tx->GetHash()) {
+    // Prohibited to merge two PSBTs over different exact unsigned
+    // transactions. B3 MPA is excluded from txid, so comparing txid alone
+    // would silently combine signatures for different evidence variants.
+    if (CTransaction{*tx}.GetPtxid() != CTransaction{*psbt.tx}.GetPtxid()) {
         return false;
     }
 
@@ -59,6 +63,7 @@ bool PartiallySignedTransaction::AddInput(const CTxIn& txin, PSBTInput& psbtin)
     psbtin.final_script_sig.clear();
     psbtin.final_script_witness.SetNull();
     inputs.push_back(psbtin);
+    m_input_asset_contexts.push_back(AssetSigningContext::FULL_SCRIPT);
     return true;
 }
 
@@ -344,10 +349,27 @@ bool PSBTInputSignedAndVerified(const PartiallySignedTransaction& psbt, unsigned
         return false;
     }
 
+    // A serialized PSBT has no trusted creation height. Only a caller that
+    // repopulated this runtime context from local chain state may authorize
+    // owner-suffix verification; deserialized/contextless PSBTs remain on the
+    // complete stored script.
+    const bool enable_asset_owner{
+        psbt.GetInputAssetSigningContext(input_index) ==
+        AssetSigningContext::OWNER_SUFFIX};
     if (txdata) {
-        return VerifyScript(input.final_script_sig, utxo.scriptPubKey, &input.final_script_witness, STANDARD_SCRIPT_VERIFY_FLAGS, MutableTransactionSignatureChecker{&(*psbt.tx), input_index, utxo.nValue, *txdata, MissingDataBehavior::FAIL});
+        return VerifyScript(input.final_script_sig, utxo.scriptPubKey, &input.final_script_witness,
+                            STANDARD_SCRIPT_VERIFY_FLAGS,
+                            MutableTransactionSignatureChecker{&(*psbt.tx), input_index,
+                                                               utxo.nValue, *txdata,
+                                                               MissingDataBehavior::FAIL},
+                            nullptr, enable_asset_owner);
     } else {
-        return VerifyScript(input.final_script_sig, utxo.scriptPubKey, &input.final_script_witness, STANDARD_SCRIPT_VERIFY_FLAGS, MutableTransactionSignatureChecker{&(*psbt.tx), input_index, utxo.nValue, MissingDataBehavior::FAIL});
+        return VerifyScript(input.final_script_sig, utxo.scriptPubKey, &input.final_script_witness,
+                            STANDARD_SCRIPT_VERIFY_FLAGS,
+                            MutableTransactionSignatureChecker{&(*psbt.tx), input_index,
+                                                               utxo.nValue,
+                                                               MissingDataBehavior::FAIL},
+                            nullptr, enable_asset_owner);
     }
 }
 
@@ -403,9 +425,18 @@ PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransact
 {
     PSBTInput& input = psbt.inputs.at(index);
     const CMutableTransaction& tx = *psbt.tx;
+    const AssetSigningContext asset_context{
+        psbt.GetInputAssetSigningContext(index)};
 
     if (PSBTInputSignedAndVerified(psbt, index, txdata)) {
         return PSBTError::OK;
+    }
+    // Final fields are authoritative only after verification in the selected
+    // provenance context. Do not let FillSignatureData's syntactic
+    // `complete` bit turn an invalid or context-mismatched final script back
+    // into a successful result.
+    if (PSBTInputSigned(input)) {
+        return PSBTError::INCOMPLETE;
     }
 
     // Fill SignatureData with input info
@@ -479,10 +510,13 @@ PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransact
     sigdata.witness = false;
     bool sig_complete;
     if (txdata == nullptr) {
-        sig_complete = ProduceSignature(provider, DUMMY_SIGNATURE_CREATOR, utxo.scriptPubKey, sigdata);
+        sig_complete = ProduceSignature(provider, DUMMY_SIGNATURE_CREATOR,
+                                        utxo.scriptPubKey, sigdata,
+                                        asset_context);
     } else {
         MutableTransactionSignatureCreator creator(tx, index, utxo.nValue, txdata, *sighash);
-        sig_complete = ProduceSignature(provider, creator, utxo.scriptPubKey, sigdata);
+        sig_complete = ProduceSignature(provider, creator, utxo.scriptPubKey,
+                                        sigdata, asset_context);
     }
     // Verify that a witness signature was produced in case one was required.
     if (require_witness_sig && !sigdata.witness) return PSBTError::INCOMPLETE;

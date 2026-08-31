@@ -64,4 +64,5 @@ struct CoinbaseTx $Proxy.wrap("node::CoinbaseTx") {
     blockRewardRemaining @4 :Int64 $Proxy.name("block_reward_remaining");
     requiredOutputs @5 :List(Data) $Proxy.name("required_outputs");
     lockTime @6 :UInt32 $Proxy.name("lock_time");
+    mpaSection @7 :Data $Proxy.name("mpa_section");
 }

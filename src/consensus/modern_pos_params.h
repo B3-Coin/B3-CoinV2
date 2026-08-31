@@ -15,12 +15,10 @@ namespace Consensus {
  * Modern PoS V1 parameter block — THE single configurable home of every
  * modern-PoS number (doc/design/b3-modern-pos-spec.md §9).
  *
- * Ratification state (owner rulings 2026-08-21): the timing values —
- * block interval, round length, f0, and the fixed x2 relaxation — are
- * RATIFIED as the V1 numbers. The remaining fields stay
- * REVISABLE_BEFORE_MAINNET provisionals, and the reorganization horizon D
- * is an owner decision with deliberately no default. Real chainparams
- * still never construct this block — while
+ * Ratification state (owner rulings through 2026-08-26): every V1 mechanism
+ * value in this block is fixed. R0 alone is derived from the measured sealed
+ * supply and therefore cannot be filled before H. Real chainparams still do
+ * not construct this block — while
  * Params::modern_pos is unset, modern-PoS validation and production FAIL
  * CLOSED (`no-modern-pos-rules`), exactly like the corridor's unset
  * difficulty. A guard test pins that no shipped network configures it.
@@ -46,12 +44,12 @@ struct ModernPosParams {
     //! validators in round 0 ~= f0 * (online stake fraction).
     uint32_t f0_num{1};
     uint32_t f0_den{1};
-    //! REVISABLE_BEFORE_MAINNET: the constant nBits every modern-PoS block
+    //! RATIFIED: the constant nBits every modern-PoS block
     //! must carry. A dead field kept only for header-layout compatibility;
     //! its GetBlockProof() constant makes nChainWork a height counter for
     //! modern chains (bookkeeping, not work).
     uint32_t sentinel_bits{0x207fffff};
-    //! REVISABLE_BEFORE_MAINNET: clock-skew allowance. Because timestamps
+    //! RATIFIED: clock-skew allowance. Because timestamps
     //! are exact, this doubles as the pacing gate: a round's block cannot be
     //! accepted before its forced timestamp minus this bound.
     int64_t max_future_seconds{120};
@@ -86,8 +84,8 @@ struct ModernPosParams {
     //! only (never a bridge security threshold). Fixtures may scale these
     //! down exactly as they scale reorg_horizon; real chainparams ship
     //! the whole block unset, so nothing here is live before the X-pin
-    //! release pins it. Declarations only at this stage: no rule in the
-    //! tree reads them yet (implementation plan, Commit 1).
+    //! release pins it. Consensus validation, production, persistence and
+    //! RPC status all consume these fields.
     int finality_epoch_blocks{1440};
     int checkpoint_interval{10};
     int checkpoint_depth{12};

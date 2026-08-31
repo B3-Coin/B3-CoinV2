@@ -71,6 +71,10 @@ class IPCMiningTest(BitcoinTestFramework):
         self.log.debug("Build coinbase transaction using getCoinbaseTx()")
         assert template is not None
         coinbase_res = await mining_get_coinbase_tx(template, ctx)
+        # This generic Bitcoin regtest template has no Modern Payload Area.
+        # B3 reconstruction clients must preserve a non-empty mpaSection
+        # under transaction optional-data flag 0x02.
+        assert_equal(coinbase_res.mpaSection, b"")
         coinbase_tx = CTransaction()
         coinbase_tx.version = coinbase_res.version
         coinbase_tx.vin = [CTxIn()]

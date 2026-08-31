@@ -20,10 +20,14 @@
 #include <node/finality_tracker.h>
 #include <node/miner.h>
 #include <node/staking.h>
+#include <streams.h>
 #include <test/util/finality_fixture.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
+
+#include <span>
+#include <stdexcept>
 
 using b3test::FinalityChainFixture;
 
@@ -35,6 +39,36 @@ struct FinalityStakingFixture : public FinalityChainFixture {
     FinalityStakingFixture() : FinalityChainFixture{{.extra_args = {"-maxtipage=1000000000"}}} {}
 };
 
+//! Rebuild the exact assembler coinbase from the fields exposed through the
+//! mining interface. The payout script is the one miner-controlled field in
+//! this test; all mandatory outputs and the MPA section come from CoinbaseTx.
+CTransaction ReconstructCoinbase(const node::CoinbaseTx& fields,
+                                 const CScript& payout_script)
+{
+    CMutableTransaction tx;
+    tx.version = static_cast<int32_t>(fields.version);
+    tx.vin.resize(1);
+    tx.vin[0].prevout.SetNull();
+    tx.vin[0].nSequence = fields.sequence;
+    tx.vin[0].scriptSig = fields.script_sig_prefix;
+    if (fields.witness) {
+        tx.vin[0].scriptWitness.stack.emplace_back(fields.witness->begin(),
+                                                    fields.witness->end());
+    }
+    tx.vout.emplace_back(fields.block_reward_remaining, payout_script);
+    tx.vout.insert(tx.vout.end(), fields.required_outputs.begin(),
+                   fields.required_outputs.end());
+    tx.nLockTime = fields.lock_time;
+    if (!fields.mpa_section.empty()) {
+        DataStream section{std::span<const uint8_t>{fields.mpa_section}};
+        UnserializeMpaSection(section, tx.mpa);
+        if (!section.empty()) {
+            throw std::runtime_error("trailing bytes in coinbase MPA section");
+        }
+    }
+    return CTransaction{std::move(tx)};
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(finality_production_tests)
@@ -44,6 +78,16 @@ BOOST_FIXTURE_TEST_CASE(assembler_includes_judged_certificate_and_root, Finality
     PrepareFinalityChain();
     const int M{m_M};
     ProduceTo(M + 8, m_vk_a);
+
+    // Turn on a distinct reward split only for the template under test.
+    // The fixture's hand-built preparation blocks intentionally use its
+    // default zero-reward coinbase and therefore must be produced first.
+    Consensus::ModernPosParams& pos{*MutableConsensus().modern_pos};
+    pos.reward = 1'000;
+    pos.treasury_percent = 10;
+    const CScript treasury_script{CScript() << OP_2};
+    pos.treasury_script.assign(treasury_script.begin(), treasury_script.end());
+    BOOST_REQUIRE(pos.Valid());
     const Consensus::Params& params{m_node.chainman->GetConsensus()};
     ChainstateManager& chainman{*m_node.chainman};
 
@@ -58,6 +102,11 @@ BOOST_FIXTURE_TEST_CASE(assembler_includes_judged_certificate_and_root, Finality
         const auto tmpl{node::BlockAssembler(chainman.ActiveChainstate(), nullptr, options).CreateNewBlock()};
         BOOST_REQUIRE(tmpl);
         BOOST_CHECK(!tmpl->block.vtx[0]->HasMpa());
+        BOOST_CHECK_EQUAL(tmpl->m_coinbase_tx.block_reward_remaining, 900);
+        BOOST_REQUIRE_EQUAL(tmpl->m_coinbase_tx.required_outputs.size(), 1U);
+        BOOST_CHECK(tmpl->m_coinbase_tx.required_outputs[0] ==
+                    CTxOut(100, treasury_script));
+        BOOST_CHECK(tmpl->m_coinbase_tx.mpa_section.empty());
         std::optional<modern::FinalityCertificatePair> pair;
         std::string err;
         BOOST_REQUIRE(modern::MatchFinalityCertificate(*tmpl->block.vtx[0], 2, pair, err));
@@ -98,6 +147,20 @@ BOOST_FIXTURE_TEST_CASE(assembler_includes_judged_certificate_and_root, Finality
             if (cell && cell->policy_type == static_cast<uint16_t>(modern::PolicyType::MODERN_PAYLOAD_ROOT)) ++root_cells;
         }
         BOOST_CHECK_EQUAL(root_cells, 1);
+
+        // Every non-miner-controlled field needed by GBT/IPC reconstruction
+        // is present: treasury, certificate cell, payload root, and the exact
+        // serialized coinbase MPA. The normative full-form id must match.
+        const node::CoinbaseTx& fields{tmpl->m_coinbase_tx};
+        BOOST_CHECK_EQUAL(fields.block_reward_remaining, 900);
+        BOOST_REQUIRE_EQUAL(fields.required_outputs.size(), 3U);
+        BOOST_CHECK(fields.required_outputs[0] == CTxOut(100, treasury_script));
+        BOOST_CHECK(fields.required_outputs[1] == cb.vout[2]);
+        BOOST_CHECK(fields.required_outputs[2] == cb.vout[3]);
+        BOOST_CHECK(!fields.mpa_section.empty());
+        const CTransaction rebuilt{ReconstructCoinbase(fields, CScript() << OP_TRUE)};
+        BOOST_CHECK(rebuilt.GetPtxid() == cb.GetPtxid());
+        BOOST_CHECK(rebuilt.mpa == cb.mpa);
     }
     // Sign and submit: consensus accepts the produced block and finalizes.
     block.hashMerkleRoot = BlockMerkleRoot(block);

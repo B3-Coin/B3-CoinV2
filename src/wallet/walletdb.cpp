@@ -28,14 +28,18 @@
 #include <atomic>
 #include <optional>
 #include <string>
+#include <tuple>
 
 namespace wallet {
 namespace DBKeys {
 const std::string ACENTRY{"acentry"};
 const std::string ACTIVEEXTERNALSPK{"activeexternalspk"};
 const std::string B3_VALIDATOR_PUBKEY{"b3validatorpubkey"};
+const std::string B3_FLOWMESH_ACCOUNT_PUBKEY{"b3flowmeshaccountpubkey"};
 const std::string B3_BLS_KEY{"b3blskey"};
 const std::string B3_BLS_CRYPTED_KEY{"b3cblskey"};
+const std::string B3_FLOWMESH_BLS_KEY{"b3flowmeshblskey"};
+const std::string B3_FLOWMESH_BLS_CRYPTED_KEY{"b3flowmeshcblskey"};
 const std::string ACTIVEINTERNALSPK{"activeinternalspk"};
 const std::string BESTBLOCK_NOMERKLE{"bestblock_nomerkle"};
 const std::string BESTBLOCK{"bestblock"};
@@ -184,6 +188,11 @@ bool WalletBatch::WriteB3ValidatorPubKey(const CPubKey& pubkey)
     return WriteIC(DBKeys::B3_VALIDATOR_PUBKEY, pubkey);
 }
 
+bool WalletBatch::WriteB3FlowMeshAccountPubKey(const CPubKey& pubkey)
+{
+    return WriteIC(DBKeys::B3_FLOWMESH_ACCOUNT_PUBKEY, pubkey);
+}
+
 bool WalletBatch::WriteB3BlsKey(const std::array<unsigned char, 48>& pubkey, const std::vector<unsigned char>& secret)
 {
     if (!EraseIC(DBKeys::B3_BLS_CRYPTED_KEY) && m_batch->Exists(DBKeys::B3_BLS_CRYPTED_KEY)) return false;
@@ -195,6 +204,28 @@ bool WalletBatch::WriteB3BlsCryptedKey(const std::array<unsigned char, 48>& pubk
 {
     if (!EraseIC(DBKeys::B3_BLS_KEY) && m_batch->Exists(DBKeys::B3_BLS_KEY)) return false;
     return WriteIC(DBKeys::B3_BLS_CRYPTED_KEY, std::make_pair(pubkey, crypted_secret));
+}
+
+bool WalletBatch::WriteB3FlowMeshBlsKey(
+    const std::array<unsigned char, 48>& pubkey,
+    const std::vector<unsigned char>& secret)
+{
+    const auto crypted_key{
+        std::make_pair(DBKeys::B3_FLOWMESH_BLS_CRYPTED_KEY, pubkey)};
+    if (!EraseIC(crypted_key) && m_batch->Exists(crypted_key)) return false;
+    return WriteIC(std::make_pair(DBKeys::B3_FLOWMESH_BLS_KEY, pubkey), secret);
+}
+
+bool WalletBatch::WriteB3FlowMeshBlsCryptedKey(
+    const std::array<unsigned char, 48>& pubkey,
+    const std::vector<unsigned char>& crypted_secret)
+{
+    const auto plain_key{
+        std::make_pair(DBKeys::B3_FLOWMESH_BLS_KEY, pubkey)};
+    if (!EraseIC(plain_key) && m_batch->Exists(plain_key)) return false;
+    return WriteIC(
+        std::make_pair(DBKeys::B3_FLOWMESH_BLS_CRYPTED_KEY, pubkey),
+        crypted_secret);
 }
 
 bool WalletBatch::WriteBestBlock(const CBlockLocator& locator)
@@ -1186,6 +1217,12 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
             if (m_batch->Read(DBKeys::B3_VALIDATOR_PUBKEY, validator_pubkey) && validator_pubkey.IsFullyValid()) {
                 pwallet->LoadValidatorPubKey(validator_pubkey);
             }
+            CPubKey flowmesh_account_pubkey;
+            if (m_batch->Read(DBKeys::B3_FLOWMESH_ACCOUNT_PUBKEY,
+                              flowmesh_account_pubkey) &&
+                flowmesh_account_pubkey.IsFullyValid()) {
+                pwallet->LoadFlowMeshAccountPubKey(flowmesh_account_pubkey);
+            }
 
             // B3 imported BLS finality key: an OPAQUE record, deliberately
             // outside every descriptor / signing-provider / export path
@@ -1196,6 +1233,47 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
                 pwallet->LoadImportedFinalityBlsKey(bls_record.first, bls_record.second, /*crypted=*/false);
             } else if (m_batch->Read(DBKeys::B3_BLS_CRYPTED_KEY, bls_record)) {
                 pwallet->LoadImportedFinalityBlsKey(bls_record.first, bls_record.second, /*crypted=*/true);
+            }
+
+            std::vector<std::tuple<std::array<unsigned char, 48>,
+                                   std::vector<unsigned char>, bool>>
+                flowmesh_records;
+            const auto read_flowmesh_keys = [&](const std::string& type,
+                                                const bool crypted) {
+                return LoadRecords(
+                    pwallet, *m_batch, type,
+                    [crypted, &flowmesh_records](CWallet*, DataStream& key,
+                                                DataStream& value,
+                                                std::string& error) -> DBErrors {
+                        std::array<unsigned char, 48> pubkey{};
+                        std::vector<unsigned char> data;
+                        key >> pubkey;
+                        value >> data;
+                        if (!key.empty() || !value.empty()) {
+                            error = "Malformed FlowMesh BLS wallet-key record";
+                            return DBErrors::CORRUPT;
+                        }
+                        flowmesh_records.emplace_back(pubkey, std::move(data),
+                                                      crypted);
+                        return DBErrors::LOAD_OK;
+                    });
+            };
+            result = std::max(
+                result,
+                read_flowmesh_keys(DBKeys::B3_FLOWMESH_BLS_KEY,
+                                   /*crypted=*/false)
+                    .m_result);
+            result = std::max(
+                result,
+                read_flowmesh_keys(DBKeys::B3_FLOWMESH_BLS_CRYPTED_KEY,
+                                   /*crypted=*/true)
+                    .m_result);
+            for (const auto& [pubkey, data, crypted] : flowmesh_records) {
+                if (!pwallet->LoadFlowMeshBlsKey(pubkey, data, crypted)) {
+                    pwallet->WalletLogPrintf(
+                        "Invalid or duplicate FlowMesh BLS wallet-key record\n");
+                    result = std::max(result, DBErrors::CORRUPT);
+                }
             }
         }
         // Early return if there are unknown descriptors. Later loading of ACTIVEINTERNALSPK and ACTIVEEXTERNALEXPK

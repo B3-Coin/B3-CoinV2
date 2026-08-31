@@ -7,7 +7,9 @@
 #ifndef BITCOIN_CONSENSUS_PARAMS_H
 #define BITCOIN_CONSENSUS_PARAMS_H
 
+#include <consensus/bridge_params.h>
 #include <consensus/modern_pos_params.h>
+#include <consensus/fn_params.h>
 #include <script/verify_flags.h>
 #include <uint256.h>
 
@@ -172,6 +174,62 @@ struct Params {
      */
     std::optional<ModernPosParams> modern_pos;
     /**
+     * Historical FN Genesis manifest measured from the sealed legacy chain.
+     * When populated, every row and the matching commitment are pinned by the
+     * transition release. The mandatory FN Genesis event is the first
+     * corridor block (hard_fork_height, H+1); there is no claim transaction
+     * and no proof carried by an individual holder.
+     *
+     * The three fields are one fail-closed configuration: an empty manifest,
+     * a missing root, or a root that does not commit to these exact rows makes
+     * FN Genesis unavailable. Mainnet deliberately leaves them unset until
+     * the final through-H scan has completed during the seal pause.
+     */
+    uint16_t fn_genesis_manifest_version{1};
+    std::optional<uint256> fn_genesis_rights_root;
+    std::vector<FnGenesisRight> fn_genesis_manifest;
+    /**
+     * Make the one-time historical FN Genesis event mandatory at H+1 even
+     * while its sealed manifest/root are not yet populated. Mainnet sets this
+     * before the seal so an X-pin release can never accidentally enter the
+     * corridor without the historical allocation. Synthetic B3 test chains
+     * may leave it false unless they explicitly exercise FN Genesis.
+     */
+    bool fn_genesis_required{false};
+    /**
+     * First height at which post-genesis PoD transactions may create the
+     * remaining FN supply. Kept separate from FN Genesis and transfers:
+     * historical FN outputs exist at H+1 and ordinary coinbase maturity is
+     * their only delay. Unset means modern FN creation fails closed.
+     */
+    std::optional<int> fn_pod_activation_height;
+    /**
+     * First height at which simple-v1 colored-asset issuance, transfer and
+     * burn rules are active. Unset means they fail closed. This height is
+     * pinned only after the modern chain's soak interval is approved.
+     */
+    std::optional<int> asset_activation_height;
+    /**
+     * First height of full FlowMesh trading/vault/checkpoint rules (A3).
+     * FN-v2 seat pre-binding opens at A2 only when this pin completes a valid
+     * schedule with at least FLOWMESH_ANCHOR_DEPTH blocks between A2 and A3.
+     * Unset or an insufficient runway makes both seat binding and FlowMesh
+     * service fail closed.
+     */
+    std::optional<int> flowmesh_activation_height;
+    /**
+     * The first bridge-backed asset is bUSD backed 1:1 by Ethereum-mainnet
+     * USDT in the owner-ratified vault. Mainnet may carry its immutable
+     * origin identity before activation, but BridgeMintParamsReady remains
+     * false until the checkpoint, fork/lag rules, caps, adapter/version,
+     * recipient codec, activation height, and withdrawal-security pins have
+     * all been explicitly populated. No partial configuration authorizes a
+     * mint. Transition v1 explicitly selects managed withdrawals through the
+     * deployed vault's immutable authority; its address, vault code hash and
+     * versioned rules commitment must still be read and pinned exactly.
+     */
+    std::optional<BridgeAssetParams> busd_bridge;
+    /**
      * TEST-ONLY override of the historical FN disintegration collateral
      * (Proof of Disintegration). Unset everywhere except regtest fixtures:
      * the mainnet historical collateral schedule (25M/20M/15M B3 by height)
@@ -214,9 +272,11 @@ struct Params {
      * - test_only_modern_pos_validator: an installed modern proof-of-stake
      *   rule set. Null in production, so modern PoS stays fail-closed
      *   (CheckModernStake rejects every block) until a real rule set ships.
-     * - test_only_asset_policies_active: activates the coloured-asset policy
-     *   set (BURN / DEX_VAULT and the conservation rules). False in
-     *   production, so those policies stay unactivated and therefore invalid.
+     * - test_only_asset_policies_active: test-fixture override for simple-v1
+     *   asset rules and the otherwise dormant DEX_VAULT policy. Production
+     *   simple-v1 assets use asset_activation_height; that real A2 gate never
+     *   activates DEX_VAULT or full FlowMesh service. FN-v2 pre-binding has
+     *   its own complete-schedule requirement.
      *
      * (The former metadata-cell / MPA test switches are gone: those rules
      * activate through the real F = M predicate,

@@ -31,9 +31,10 @@ File references point at the source for readers who want to verify.
    staking window.** The corridor exists so that stake deposits can
    confirm and mature *before* the first PoS block needs a validator
    set.
-4. **Block 811,001 (M)** — modern proof of stake begins. The validators
-   of the very first PoS block are whoever holds an ACTIVE stake in the
-   snapshot at block 811,000.
+4. **Block 811,001 (M)** — modern proof of stake begins. A validator belongs
+   to the first usable set only when its stake is ACTIVE **and** its confirmed,
+   non-revoked `FINALITY_KEY` binding is present in the snapshot at block
+   811,000. Mainnet bootstrap requires at least four such validators.
 
 ## What a stake is
 
@@ -66,11 +67,23 @@ Create the stake with RPC / command line:
 
     b3coin-cli createstake 1000
 
+Bind the validator identity to its finality key in a second transaction:
+
+    b3coin-cli bindfinalitykey
+
 The reply shows the transaction id, your validator key, the owner
-address that holds the principal, and the activation depth. Check
-progress any time with:
+address that holds the principal, and the activation depth. Wait for both
+transactions to confirm. Check stake and finality progress with:
 
     b3coin-cli getstakinginfo
+    b3coin-cli getfinalityinfo
+
+Before M, explicitly start the producer and finality signer:
+
+    b3coin-cli startstaking
+
+The result must show `running: true` and `finality_signing: true`. Merely
+leaving the node open does not start staking.
 
 ## Confirmations: UNCONFIRMED → PENDING → ACTIVE
 
@@ -82,7 +95,9 @@ spacing — but do not aim for the deadline:
 - To be in the FIRST validator set (the snapshot at block 811,000),
   your stake must be **included in a block no later than 810,980**.
 - **Recommendation: stake in the first half of the corridor** (blocks
-  810,001–810,500). The corridor lasts 17+ hours at minimum; staking
+  810,001–810,500). Its 1,000 required 60-second timestamp steps span about
+  16 hours 40 minutes of chain time (the future-time allowance can make
+  observed wall time slightly shorter); staking
   early leaves hundreds of blocks of margin for anything — a slow
   corridor, a missed transaction, a wallet issue.
 - A stake that misses the first snapshot is not lost: it activates 20
@@ -105,11 +120,14 @@ spacing — but do not aim for the deadline:
    is the designed behavior, not an outage. Watch the official channels
    for the X-pin release.
 3. **Install the X-pin release** when announced.
-4. **When the corridor starts:** run `createstake` for 333 B3 or more,
-   early in the corridor.
-5. **Verify:** use `getstakinginfo` as the authoritative status and wait for
-   it to show your stake ACTIVE. Once it is, you are in the set at M — leave
-   the node running and it stakes.
+4. **When the corridor starts:** run `createstake` for 333 B3 or more, then
+   `bindfinalitykey`, early in the corridor. Wait for both transactions to
+   confirm.
+5. **Verify:** `getstakinginfo` must show the stake ACTIVE;
+   `getfinalityinfo` must show a live binding and set membership. Operators
+   must coordinate at least four independent bound validators before M.
+6. **Start:** run `startstaking` and require `running: true` and
+   `finality_signing: true`. Keep the node running after that.
 
 ## Questions people will ask
 

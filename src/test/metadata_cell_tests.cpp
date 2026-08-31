@@ -163,14 +163,14 @@ BOOST_AUTO_TEST_CASE(ordinary_outputs_are_never_metadata)
     mtx.vout.emplace_back(0, Cell(7, 1, 52));
     mtx.vout.emplace_back(500, CScript() << OP_TRUE);
     const CTransaction tx{mtx};
-    AddCoins(view, tx, 100, /*check=*/false, /*nTxOffset=*/0, /*exclude_metadata_cells=*/true);
+    AddCoins(view, tx, 100, /*check=*/false, /*nTxOffset=*/0, /*exclude_modern_cells=*/true);
     BOOST_CHECK(view.HaveCoin(COutPoint{tx.GetHash(), 0}));  // zero-value ordinary: present
     BOOST_CHECK(!view.HaveCoin(COutPoint{tx.GetHash(), 1})); // metadata cell: never a coin
     BOOST_CHECK(view.HaveCoin(COutPoint{tx.GetHash(), 2}));
     // Legacy-era semantics (flag false): the same script IS an ordinary coin.
     CCoinsView base2;
     CCoinsViewCache view2{&base2};
-    AddCoins(view2, tx, 100, false, 0, /*exclude_metadata_cells=*/false);
+    AddCoins(view2, tx, 100, false, 0, /*exclude_modern_cells=*/false);
     BOOST_CHECK(view2.HaveCoin(COutPoint{tx.GetHash(), 1}));
 }
 

@@ -1,6 +1,13 @@
-# bUSD — B3-native overcollateralized stablecoin (proposal)
+# bUSD — B3-native overcollateralized stablecoin (superseded proposal)
 
-**Status: committed design record (2026-08-22). The DIRECTION is RULED by the owner — DEX register L-6 ([b3-flowmesh-dex-decisions.md](b3-flowmesh-dex-decisions.md)): B3-native CDP-backed bUSD as FlowMesh's first real quote asset, no bridge as a dependency, L-3 amended to "approved dollar-stable AssetId". Every PARAMETER and the mechanism details in §7 remain OPEN owner decisions. No code authorized until §7 is ruled.**
+**Status: SUPERSEDED by the owner's 2026-09-01 ruling. Production bUSD is
+the `BRIDGE_BACKED` B3 asset minted 1:1 from proven canonical-USDT deposits
+through the explicitly pinned Ethereum-mainnet vault. This file is retained
+only as design history; none of its CDP, oracle, collateral, liquidation, or
+parameter choices are release requirements or authorization to implement a
+second asset named bUSD. Current rulings live in
+[b3-flowmesh-dex-decisions.md](b3-flowmesh-dex-decisions.md) L-3/L-6 and the
+bridge threat model.**
 
 Written 2026-08-22 from the owner's direction in conversation: "a B3-native
 overcollateralized stablecoin so FlowMesh needs no outside permission; people who hold

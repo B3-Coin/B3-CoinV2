@@ -95,7 +95,8 @@ BOOST_AUTO_TEST_CASE(deterministic_costs_and_budgets)
     BOOST_CHECK_EQUAL(modern::PayloadRecordVerifyCost(4, 1), 2000);
     BOOST_CHECK_EQUAL(modern::PayloadRecordVerifyCost(1, 1), 0);
     BOOST_CHECK_EQUAL(modern::PayloadRecordVerifyCost(5, 2), 0);
-    BOOST_CHECK_EQUAL(modern::PayloadRecordVerifyCost(9, 1), 0);
+    BOOST_CHECK_EQUAL(modern::PayloadRecordVerifyCost(8, 1), 6000);
+    BOOST_CHECK_EQUAL(modern::PayloadRecordVerifyCost(9, 1), 500);
     BOOST_CHECK_EQUAL(MAX_TX_PAYLOAD_COST, 12000);
     BOOST_CHECK_EQUAL(MAX_BLOCK_PAYLOAD_COST, 120000);
     BOOST_CHECK_EQUAL(PAYLOAD_COST_TO_VBYTES, 1);

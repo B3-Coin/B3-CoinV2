@@ -4059,7 +4059,19 @@ void CNode::MarkReceivedMsgsForProcessing()
     }
 
     LOCK(m_msg_process_queue_mutex);
-    m_msg_process_queue.splice(m_msg_process_queue.end(), vRecvMsg);
+    // Keep ordinary B3 ahead of every FlowMesh item and preserve the frozen
+    // FlowMesh priority order. The expensive FlowMesh work is performed only
+    // after ProcessMessage has moved the bounded frame to its own worker; a
+    // proposal/catch-up flood therefore cannot sit in front of a block.
+    while (!vRecvMsg.empty()) {
+        const unsigned rank{NetMessageQueueRank(vRecvMsg.front().m_type)};
+        const auto insert_at{std::find_if(
+            m_msg_process_queue.begin(), m_msg_process_queue.end(),
+            [&](const CNetMessage& queued) {
+                return NetMessageQueueRank(queued.m_type) > rank;
+            })};
+        m_msg_process_queue.splice(insert_at, vRecvMsg, vRecvMsg.begin());
+    }
     m_msg_process_queue_size += nSizeAdded;
     fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
 }
@@ -4137,8 +4149,17 @@ void CConnman::PushMessage(CNode* pnode, CSerializedNetMsg&& msg)
         // Update memory usage of send buffer.
         pnode->m_send_memusage += msg.GetMemoryUsage();
         if (pnode->m_send_memusage + pnode->m_transport->GetSendMemoryUsage() > nSendBufferMaxSize) pnode->fPauseSend = true;
-        // Move message to vSendMsg queue.
-        pnode->vSendMsg.push_back(std::move(msg));
+        // Ordinary B3 always stays ahead of queued FlowMesh traffic. Within
+        // FlowMesh, votes/certificates precede proposals, then actions, then
+        // catch-up. A message already handed to TCP cannot be preempted, but
+        // no unsent bulky FlowMesh object can head-of-line block later B3.
+        const unsigned rank{NetMessageQueueRank(msg.m_type)};
+        const auto insert_at{std::find_if(
+            pnode->vSendMsg.begin(), pnode->vSendMsg.end(),
+            [&](const CSerializedNetMsg& queued) {
+                return NetMessageQueueRank(queued.m_type) > rank;
+            })};
+        pnode->vSendMsg.insert(insert_at, std::move(msg));
 
         // If there was nothing to send before, and there is now (predicted by the "more" value
         // returned by the GetBytesToSend call above), attempt "optimistic write":

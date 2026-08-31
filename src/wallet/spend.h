@@ -30,6 +30,17 @@ struct TxSize {
     int64_t weight{-1};
 };
 
+/**
+ * Narrow B3 extension used by wallet-created transition transactions.
+ * `native_disintegration` is an intentional native input/output gap which is
+ * destroyed by consensus (modern FN PoD), not a relay/miner fee. Ordinary
+ * callers use the empty/default value and retain the upstream wallet path.
+ */
+struct ModernTransactionOptions {
+    std::vector<CMpaRecord> mpa{};
+    CAmount native_disintegration{0};
+};
+
 /** Calculate the size of the transaction using CoinControl to determine
  * whether to expect signature grinding when calculating the size of the input spend. */
 TxSize CalculateMaximumSignedTxSize(const CTransaction& tx, const CWallet* wallet, const std::vector<CTxOut>& txouts, const CCoinControl* coin_control = nullptr);
@@ -199,6 +210,7 @@ void DiscourageFeeSniping(CMutableTransaction& tx, FastRandomContext& rng_fast, 
  * @note passing change_pos as std::nullopt will result in setting a random position
  */
 util::Result<CreatedTransactionResult> CreateTransaction(CWallet& wallet, const std::vector<CRecipient>& vecSend, std::optional<unsigned int> change_pos, const CCoinControl& coin_control, bool sign = true);
+util::Result<CreatedTransactionResult> CreateTransaction(CWallet& wallet, const std::vector<CRecipient>& vecSend, std::optional<unsigned int> change_pos, const CCoinControl& coin_control, bool sign, const ModernTransactionOptions& modern_options);
 
 /**
  * Insert additional inputs into the transaction by

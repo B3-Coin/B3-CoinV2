@@ -74,11 +74,13 @@ BOOST_AUTO_TEST_CASE(no_provisional_parameters_on_shipped_networks)
         if (chain == ChainType::MAIN) {
             BOOST_CHECK_EQUAL(consensus.hard_fork_height.value_or(0), 810'001);
             BOOST_CHECK_EQUAL(consensus.transition_pow_bits.value_or(0), 0x1f008000U);
+            BOOST_CHECK(consensus.fn_genesis_required);
         } else {
             BOOST_CHECK_MESSAGE(!consensus.transition_pow_bits.has_value(),
                                 "provisional corridor difficulty set on a shipped network");
             BOOST_CHECK_MESSAGE(!consensus.hard_fork_height.has_value(),
                                 "hard_fork_height pinned on a shipped network before the pin gates");
+            BOOST_CHECK(!consensus.fn_genesis_required);
         }
         BOOST_CHECK_MESSAGE(!consensus.legacy_final_hash.has_value(),
                             "legacy_final_hash pinned on a shipped network before the X-pin release");

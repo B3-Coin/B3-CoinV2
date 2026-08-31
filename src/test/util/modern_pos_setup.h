@@ -25,7 +25,7 @@
 #include <key.h>
 #include <legacy/codec.h>
 #include <legacy/consensus.h>
-#include <modern/fn.h>
+#include <modern/chain_domain.h>
 #include <modern/pos_v1.h>
 #include <modern/stake.h>
 #include <node/miner.h>

@@ -106,12 +106,12 @@ public:
         return consumed_deposits.count(outpoint) > 0;
     }
 
-    std::optional<modern::WithdrawalReceipt> RequestWithdrawal(const AccountId& account,
-                                                               const AssetId& asset,
-                                                               const CAmount amount,
-                                                               const uint256& destination)
+    std::optional<modern::WithdrawalReceipt> RequestWithdrawal(
+        const AccountId& account, const AssetId& asset, const CAmount amount,
+        const uint256& destination, const CAmount withdrawal_capacity)
     {
-        return ledger.RequestWithdrawal(account, asset, amount, destination);
+        return ledger.RequestWithdrawal(account, asset, amount, destination,
+                                        withdrawal_capacity);
     }
 
     // ---- The ONLY book-mutation surface: always this state's ledger. ----
@@ -125,9 +125,10 @@ public:
     {
         return book.CancelCurve(ledger, account, side);
     }
-    [[nodiscard]] std::optional<ClearingEngine::ClearingResult> ClearSlot()
+    [[nodiscard]] std::optional<ClearingEngine::ClearingResult> ClearSlot(
+        const FlowMeshFeeContext* fee_context = nullptr)
     {
-        return book.ClearSlot(ledger);
+        return book.ClearSlot(ledger, fee_context);
     }
 
     // ---- Read-only book views. ----
@@ -246,6 +247,12 @@ private:
         if (!ledger.Deposit(account, asset, amount)) return false;
         consumed_deposits.insert(outpoint);
         return true;
+    }
+
+    bool ConsumeWithdrawalSettlement(
+        const WithdrawalSettlementFactV1& settlement)
+    {
+        return ledger.ConsumeRequest(settlement);
     }
 
     //! Per-signer next expected sequence (nonce) for signed actions.

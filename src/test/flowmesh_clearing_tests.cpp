@@ -22,6 +22,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <array>
 #include <limits>
 #include <map>
 #include <vector>
@@ -53,6 +54,15 @@ std::vector<Breakpoint> Pts(std::vector<std::pair<CAmount, CAmount>> raw)
     std::vector<Breakpoint> out;
     for (const auto& [p, q] : raw) out.push_back({p, q});
     return out;
+}
+
+std::array<unsigned char, bls::PUBKEY_SIZE> BlsKey(const unsigned char id)
+{
+    std::array<unsigned char, 32> ikm{};
+    for (size_t i{0}; i < ikm.size(); ++i) ikm[i] = id + i + 1;
+    const auto secret{bls::SecretKey::FromIKM(ikm)};
+    BOOST_REQUIRE(secret.has_value());
+    return secret->GetPublicKey().Compressed();
 }
 
 // Pinned empty-book commitment (VAULT ledger, slot 0) under the fully
@@ -156,6 +166,75 @@ BOOST_AUTO_TEST_CASE(maximum_volume_clearing_golden_and_differential)
     BOOST_CHECK_EQUAL(ledger.Custody(Quote()), 2400);
     BOOST_CHECK_EQUAL(ledger.Custody(BaseX()), 80);
     BOOST_CHECK(ledger.SolvencyHolds());
+}
+
+BOOST_AUTO_TEST_CASE(production_fee_is_withheld_once_from_seller_and_split_80_20)
+{
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+    const flowmesh::Ledger& ledger{st.LedgerView()};
+
+    BOOST_REQUIRE(Fund(st, ALICE, Quote(), 100'000));
+    BOOST_REQUIRE(Fund(st, BOB, BaseX(), 100));
+    BOOST_REQUIRE(st.SubmitCurve(ALICE, Side::BID, Pts({{1'000, 100}, {1'001, 0}})));
+    BOOST_REQUIRE(st.SubmitCurve(BOB, Side::ASK, Pts({{1'000, 100}})));
+
+    flowmesh::FlowMeshFeeContext fees;
+    fees.market_id = uint256::ONE;
+    fees.epoch = 7;
+    fees.treasury_owner_commitment =
+        uint256{"00000000000000000000000000000000000000000000000000000000000000cc"};
+    for (unsigned char i{1}; i <= 4; ++i) {
+        flowmesh::FlowMeshFeeSeat seat;
+        seat.seat_id = uint256{i};
+        seat.bls_pubkey = BlsKey(i);
+        fees.seats.push_back(seat);
+    }
+
+    const auto result{st.ClearSlot(&fees)};
+    BOOST_REQUIRE(result);
+    BOOST_REQUIRE(result->cleared);
+    BOOST_CHECK_EQUAL(result->fees.matched_b3_quote_notional, 100'000);
+    BOOST_CHECK_EQUAL(result->fees.fee_total, 10);
+    BOOST_CHECK_EQUAL(result->fees.treasury_fee, 2);
+    BOOST_CHECK_EQUAL(result->fees.seat_fee, 8);
+    BOOST_REQUIRE_EQUAL(result->fees.seller_fees.size(), 1U);
+    BOOST_CHECK(result->fees.seller_fees[0].account == BOB);
+    BOOST_CHECK_EQUAL(result->fees.seller_fees[0].gross_quote_proceeds, 100'000);
+    BOOST_CHECK_EQUAL(result->fees.seller_fees[0].fee, 10);
+    BOOST_CHECK_EQUAL(result->fees.seller_fees[0].net_quote_proceeds, 99'990);
+
+    BOOST_CHECK_EQUAL(ledger.Available(BOB, Quote()), 99'990);
+    BOOST_CHECK_EQUAL(
+        ledger.Available(flowmesh::FlowMeshTreasuryFeeAccount(fees), Quote()), 2);
+    for (const flowmesh::FlowMeshFeeSeat& seat : fees.seats) {
+        BOOST_CHECK_EQUAL(
+            ledger.Available(flowmesh::FlowMeshSeatRewardAccount(fees, seat), Quote()), 2);
+    }
+    BOOST_CHECK_EQUAL(ledger.Available(flowmesh::FeeAccount(), Quote()), 0);
+    BOOST_CHECK(ledger.SolvencyHolds());
+}
+
+BOOST_AUTO_TEST_CASE(noncanonical_fee_epoch_rejects_atomically)
+{
+    flowmesh::FlowMeshState st{VAULT, BaseX(), Quote()};
+    BOOST_REQUIRE(Fund(st, ALICE, Quote(), 100'000));
+    BOOST_REQUIRE(Fund(st, BOB, BaseX(), 100));
+    BOOST_REQUIRE(st.SubmitCurve(ALICE, Side::BID, Pts({{1'000, 100}, {1'001, 0}})));
+    BOOST_REQUIRE(st.SubmitCurve(BOB, Side::ASK, Pts({{1'000, 100}})));
+    const uint256 before{st.Root()};
+
+    flowmesh::FlowMeshFeeContext bad;
+    bad.market_id = uint256::ONE;
+    bad.treasury_owner_commitment = uint256::ONE;
+    // Three seats cannot be an active FlowMesh epoch.
+    for (unsigned char i{1}; i <= 3; ++i) {
+        flowmesh::FlowMeshFeeSeat seat;
+        seat.seat_id = uint256{i};
+        seat.bls_pubkey = BlsKey(i);
+        bad.seats.push_back(seat);
+    }
+    BOOST_CHECK(!st.ClearSlot(&bad));
+    BOOST_CHECK(st.Root() == before);
 }
 
 BOOST_AUTO_TEST_CASE(largest_remainder_allocation_is_deterministic)

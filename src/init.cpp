@@ -46,6 +46,7 @@
 #include <net_processing.h>
 #include <netbase.h>
 #include <netgroup.h>
+#include <node/flowmesh_service.h>
 #include <node/staking.h>
 #include <node/warnings.h>
 #include <node/blockmanager_args.h>
@@ -318,6 +319,15 @@ void Shutdown(NodeContext& node)
     }
     StopMapPort();
 
+    // FlowMesh owns a worker and references both PeerManager and chainstate.
+    // Stop it while both dependencies are still alive. The stopped P2P sink
+    // remains present until PeerManager itself is destroyed and fails closed.
+    if (node.flowmesh && node.validation_signals) {
+        node.validation_signals->UnregisterValidationInterface(
+            node.flowmesh.get());
+    }
+    if (node.flowmesh) node.flowmesh->Stop();
+
     // Because these depend on each-other, we make sure that neither can be
     // using the other before destroying them.
     if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
@@ -334,6 +344,7 @@ void Shutdown(NodeContext& node)
     // After the threads that potentially access these pointers have been stopped,
     // destruct and reset all to nullptr.
     node.peerman.reset();
+    node.flowmesh.reset();
     node.connman.reset();
     node.banman.reset();
     node.addrman.reset();
@@ -865,7 +876,8 @@ namespace { // Variables internal to initialization process only
 
 int nMaxConnections;
 int available_fds;
-ServiceFlags g_local_services = ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS);
+ServiceFlags g_local_services =
+    ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS);
 int64_t peer_connect_timeout;
 std::set<BlockFilterType> g_enabled_filter_types;
 
@@ -1017,6 +1029,16 @@ bool AppInitParameterInteraction(const ArgsManager& args)
             return InitError(_("Prune mode is incompatible with -txindex."));
         if (args.GetBoolArg("-txospenderindex", DEFAULT_TXOSPENDERINDEX))
             return InitError(_("Prune mode is incompatible with -txospenderindex."));
+        // The transition release rebuilds its FN-seat, FlowMesh market and
+        // checkpoint indexes from the activation history. Until those
+        // indexes gain their own durable snapshots, accepting pruning could
+        // make a node permanently unable to validate or serve trading after
+        // restart. Refuse that unsafe combination explicitly.
+        if (Consensus::FlowMeshSeatBindingScheduleConfigured(
+                chainparams.GetConsensus())) {
+            return InitError(_(
+                "Prune mode is incompatible with an active FlowMesh schedule in this release."));
+        }
         if (args.GetBoolArg("-reindex-chainstate", false)) {
             return InitError(_("Prune mode is incompatible with -reindex-chainstate. Use full -reindex instead."));
         }
@@ -1921,10 +1943,28 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     // (startstaking) and until the next block is a modern-PoS block.
     node.staking = std::make_unique<node::StakingLoop>(*node.chainman, node.mempool.get());
 
+    // Every node owns the production service object. It remains dormant and
+    // does not advertise the capability unless the complete A2/A3 schedule
+    // is pinned. P2P hands framed messages directly to its bounded worker;
+    // FlowMesh never opens a second port or blocks the B3 validation path.
+    node.flowmesh = std::make_unique<node::FlowMeshService>(
+        chainman, args.GetDataDirNet() / "flowmesh");
+    peerman_opts.flowmesh_sink = node.flowmesh.get();
     node.peerman = PeerManager::make(*node.connman, *node.addrman,
                                      node.banman.get(), chainman,
                                      *node.mempool, *node.warnings,
                                      peerman_opts);
+    std::string flowmesh_error;
+    if (!node.flowmesh->Start(*node.peerman, flowmesh_error)) {
+        return InitError(Untranslated(strprintf(
+            "FlowMesh production service failed to start: %s",
+            flowmesh_error)));
+    }
+    if (node.flowmesh->Enabled()) {
+        g_local_services =
+            ServiceFlags(g_local_services | NODE_B3_FLOWMESH);
+        validation_signals.RegisterValidationInterface(node.flowmesh.get());
+    }
     validation_signals.RegisterValidationInterface(node.peerman.get());
     // The staking loop relays its finality signatures through the peer manager.
     if (node.staking) node.staking->SetPeerManager(node.peerman.get());

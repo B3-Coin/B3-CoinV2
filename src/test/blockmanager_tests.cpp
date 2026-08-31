@@ -21,6 +21,7 @@
 #include <test/util/setup_common.h>
 
 using kernel::CBlockFileInfo;
+using kernel::BlockTreeDB;
 using node::STORAGE_HEADER_BYTES;
 using node::BlockManager;
 using node::KernelNotifications;
@@ -28,6 +29,78 @@ using node::MAX_BLOCKFILE_SIZE;
 
 // use BasicTestingSetup here for the data directory configuration, setup, and cleanup
 BOOST_FIXTURE_TEST_SUITE(blockmanager_tests, BasicTestingSetup)
+
+BOOST_AUTO_TEST_CASE(fn_pod_issued_total_sidecar_roundtrip)
+{
+    const CChainParams& params{Params()};
+    const Consensus::Params& consensus{params.GetConsensus()};
+    BlockTreeDB db{DBParams{
+        .path = "",
+        .cache_bytes = 1 << 20,
+        .memory_only = true,
+    }};
+
+    const CBlock& genesis_block{params.GenesisBlock()};
+    const uint256 genesis_hash{consensus.hashGenesisBlock};
+    CBlockIndex stored{genesis_block};
+    stored.phashBlock = &genesis_hash;
+    stored.nHeight = 0;
+    stored.m_fn_pod_issued_total = 37;
+    stored.m_fn_pod_issued_total_known = true;
+    db.WriteBatchSync({}, /*nLastFile=*/0, {&stored});
+
+    node::BlockMap loaded;
+    const auto insert{[&](const uint256& hash) -> CBlockIndex* {
+        if (hash.IsNull()) return nullptr;
+        const auto [it, inserted]{loaded.try_emplace(hash)};
+        if (inserted) it->second.phashBlock = &it->first;
+        return &it->second;
+    }};
+    BOOST_REQUIRE(WITH_LOCK(cs_main, return db.LoadBlockIndexGuts(consensus, insert, m_interrupt)));
+
+    const auto it{loaded.find(genesis_hash)};
+    BOOST_REQUIRE(it != loaded.end());
+    BOOST_CHECK(it->second.m_fn_pod_issued_total_known);
+    BOOST_CHECK_EQUAL(it->second.m_fn_pod_issued_total, 37U);
+
+    // A known zero remains distinct from a missing/unknown sidecar.
+    stored.m_fn_pod_issued_total = 0;
+    db.WriteBatchSync({}, /*nLastFile=*/0, {&stored});
+    node::BlockMap zero_loaded;
+    const auto zero_insert{[&](const uint256& hash) -> CBlockIndex* {
+        if (hash.IsNull()) return nullptr;
+        const auto [zero_it, inserted]{zero_loaded.try_emplace(hash)};
+        if (inserted) zero_it->second.phashBlock = &zero_it->first;
+        return &zero_it->second;
+    }};
+    BOOST_REQUIRE(WITH_LOCK(cs_main, return db.LoadBlockIndexGuts(consensus, zero_insert, m_interrupt)));
+    const auto zero_it{zero_loaded.find(genesis_hash)};
+    BOOST_REQUIRE(zero_it != zero_loaded.end());
+    BOOST_CHECK(zero_it->second.m_fn_pod_issued_total_known);
+    BOOST_CHECK_EQUAL(zero_it->second.m_fn_pod_issued_total, 0U);
+
+    // An old database without the sidecar remains readable.
+    BlockTreeDB old_db{DBParams{
+        .path = "",
+        .cache_bytes = 1 << 20,
+        .memory_only = true,
+    }};
+    stored.m_fn_pod_issued_total = 0;
+    stored.m_fn_pod_issued_total_known = false;
+    old_db.WriteBatchSync({}, /*nLastFile=*/0, {&stored});
+    node::BlockMap old_loaded;
+    const auto old_insert{[&](const uint256& hash) -> CBlockIndex* {
+        if (hash.IsNull()) return nullptr;
+        const auto [old_it, inserted]{old_loaded.try_emplace(hash)};
+        if (inserted) old_it->second.phashBlock = &old_it->first;
+        return &old_it->second;
+    }};
+    BOOST_REQUIRE(WITH_LOCK(cs_main, return old_db.LoadBlockIndexGuts(consensus, old_insert, m_interrupt)));
+    const auto old_it{old_loaded.find(genesis_hash)};
+    BOOST_REQUIRE(old_it != old_loaded.end());
+    BOOST_CHECK(!old_it->second.m_fn_pod_issued_total_known);
+    BOOST_CHECK_EQUAL(old_it->second.m_fn_pod_issued_total, 0U);
+}
 
 BOOST_AUTO_TEST_CASE(blockmanager_find_block_pos)
 {

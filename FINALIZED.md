@@ -1,9 +1,9 @@
 # FINALIZED — the owner's ledger of final state
 
-Advanced 2026-08-27 on the owner's instruction, folding in the 94 commits
-of the release push (Modern PoS qualification through the Codex
-reconciliation). This branch records what is FINAL; open items live in
-doc/design/b3-open-decisions.md.
+Advanced through the owner's 2026-09-01 FN/asset/FlowMesh activation rulings. This
+branch records what is FINAL; open items live in
+doc/design/b3-open-decisions.md. Earlier FN claim/proof designs remain history,
+not competing activation specifications.
 
 ## Product
 - Identity LOCKED: **B3 FlowMesh** (platform) / **B3 Hive** (desktop app,
@@ -25,29 +25,93 @@ doc/design/b3-open-decisions.md.
   U==U′ campaign PASSED.
 - Fail-closed everywhere until the X-pin release: mainnet today validates
   the legacy chain only.
+- Transition release contract: pin X, measured S_H-derived R0, and the complete
+  independently reproduced FN rights manifest/count/Merkle root during the
+  seal pause. Block 810,001 is mandatory FN Genesis: its corridor coinbase
+  creates one amount-1 FN output per manifest row in canonical order. The
+  outputs use ordinary 30-block coinbase maturity and no extra transfer lock.
 
 ## Economics (OD-2 CLOSED 2026-08-26)
 - Emission: R0 = floor(S_H × 1% / 525,600) at M, halving every 525,600
   blocks (one year); corridor = 0 + fees; split 90% producer / 10%
   treasury enforced in the coinbase; verified live on a rehearsal chain.
-- Treasury: ONE wallet, `SNyANHiUkuqPSfbeKHDXzVD86LC2ZUUjLX` (pinned);
-  issuance fees and FlowMesh fees (0.01% flat, 80/20 FlowMesh/treasury)
-  pay the same address.
+- Treasury: ONE wallet, `SNyANHiUkuqPSfbeKHDXzVD86LC2ZUUjLX` (pinned).
+  Simple-v1 colored-asset issuance pays a flat 1,000 B3 to it. FlowMesh's
+  spot fee is 0.01% of matched native-B3 notional, split 80/20 between the
+  active FN seats and treasury. After each ordinary slot, treasury settlement
+  flushes the deterministic maximum currently supportable amount:
+  `min(accrued treasury available, anchored native capacity - existing pending
+  native withdrawals)`, but only when positive. It never waits for the full
+  balance, and zero capacity never blocks trading.
 - Denomination: 1 B3 = 1e9 base units, the ONLY human-facing unit
   (RPC, GUI, config); typed amount = staking weight.
-- FN Coin: lifetime cap 5,000 (ratified); at least 3,500 historical rights
-  reserved from the height-807,709 report, with the exact final reservation
-  set by the mandatory through-H report; PoD burn; modern creation cost
-  pinned by slot to 15,000 / 30,000 / 60,000 B3 per 500-slot tier. The
-  helper ships activation-inert until the reviewed FN activation path exists.
+- FN Coin: one global zero-decimal asset, lifetime cap 5,000. The final
+  through-H manifest count R is measured and independently reproduced before
+  the transition tag; all R units are issued directly to their historical
+  legacy P2PKH owners in the 810,001 coinbase, with no claim, holder proof,
+  deadline, or fee. Modern capacity is exactly `5,000 - R`; modern PoD cost is
+  15,000 / 30,000 / 60,000 B3 across successive 500-unit tiers. Owner-script
+  signatures authorize transfers after ordinary coinbase maturity; native B3
+  pays their network fees. Permissionless modern PoD creation remains
+  fail-closed until the separately pinned post-M height A1.
+- Colored assets: simple-v1 only — one genesis mints the full fixed supply,
+  no later mint path, chain-bound AssetId, and 1,000 B3 issuance fee to the
+  treasury. The transition release pins post-M height A2 and remains
+  fail-closed before it.
+
+## Planned feature releases (owner cap: two)
+- **Transition release:** complete FN + simple-v1 asset consensus paths, final
+  seal pins, mandatory real-history shadow-fork rehearsal, FN Genesis at
+  810,001, ordinary-maturity FN transfers, later A1 modern PoD creation, A2
+  colored assets and FN-seat pre-binding, then A3 FlowMesh spot trading after
+  at least the 30-block preparation runway. For each market, the unique epoch-0
+  anchor is the earliest canonical block at or after `market.created_height`
+  whose post-block FN-v2 seat set has at least four members; sequence zero may
+  begin only when that exact anchor is 30 blocks deep. The first approved
+  dollar market, once all independent bridge gates pass, is the explicitly
+  registered bridge-backed bUSD asset against native B3. Public pause estimate:
+  approximately 2–4 weeks.
+- **Second feature release:** reserved for later FlowMesh expansion after a
+  dedicated testnet with real FN holders and an honest speed benchmark; the
+  working spot FlowMesh product itself ships in the transition release.
+  Emergency security/correctness releases remain possible and are not
+  feature-plan expansion.
 
 ## Bridge
-- Deposit legs first (ETH → B3, then BTC → B3). Verification stack
-  (RLP/MPT/SSZ/light client/ancestry/receipt-decode) mainnet-proven end
-  to end, including a REAL 0.001 ETH deposit through the deployed vault
-  `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6` (DEPOSIT PROVEN).
-  Verification-only in v1: no consensus reach; stage-4 mint admission
-  rules ratified (threat model §5); b3Recipient encoding proposed.
+- Deposit legs first (Ethereum USDT → B3 bUSD, then later assets). The first
+  production registry tuple is Ethereum mainnet chain id 1, vault
+  `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`, canonical USDT
+  `0xdAC17F958D2ee523a2206206994597C13D831ec7`, and exact 6-decimal
+  conversion into the bridge-backed bUSD `AssetId`. This exact vault was
+  explicitly promoted by the owner on 2026-09-01 despite its earlier
+  smoke-deployment label.
+- **Transition-v1 withdrawal trust:** the owner accepted that vault's existing
+  immutable owner-controlled `releaseAuthority` for the first release. B3
+  withdrawals are therefore managed in v1 and must be described that way;
+  deposits and minting remain proof-verified. The code must pin the observed
+  authority and vault runtime-code hash before activation. This authority
+  cannot be replaced in-place by the later decentralized verifier, so that
+  upgrade requires a separately approved vault/migration rather than a silent
+  change to this bUSD reserve identity.
+- Independent reads through two Ethereum RPC providers at block 25,877,643
+  pinned both immutable authorities to
+  `0x76c7a245d0D2e4CF92403aF0144825df1cC614f1` (an EOA) and the 3,135-byte
+  vault runtime code hash to
+  `0x1be220c18efa4e4cda0bb1c912c7c41346f5c04d49a36ec2c68f6ddcc5586233`.
+  The generic vault had zero USDT locked at that observation; the B3 registry,
+  not the vault, must enforce the canonical USDT address.
+- The RLP/MPT/SSZ light-client verification stack is mainnet-proven end to
+  end. Minting remains consensus fail-closed until its reviewed Ethereum
+  bootstrap, activation height, mint caps, adapter commitment, durable
+  light-client/nullifier state, proof carrier, and managed-withdrawal authority
+  and code commitments are all pinned. Documentation or a ticker can never
+  activate the bridge by itself.
+- Withdrawal admission is bounded per market/asset by the capacity of the
+  deterministic top 64 live pool UTXOs after existing pending obligations.
+  Payout selection orders candidates by amount descending, then outpoint
+  ascending, and uses the shortest covering prefix. The publisher must publish
+  one withdrawal, wait for confirmation, refresh the index/capacity, rebuild
+  the next transaction, and only then publish it.
 
 ## Legacy-era wallet safety (release reviews, closed)
 - Send + receive is the ruled legacy-era scope. Receive: legacy P2PKH
@@ -80,7 +144,13 @@ keys + manifest URL (updater ships disabled without them), artifact
 signing/notarization, push + Actions run, operator distribution before
 H = 810,000 (~Sep 1); then the X-pin release.
 
-## Remaining before the X-pin release (not blockers of THIS ledger state)
-X + S_H at 810,000 (~Sep 1); seeds list; owner release signing keys;
-GitHub Actions first run (linux vectors + windows); operator
-distribution before H.
+## Remaining before the transition release
+Final X and S_H at H; exact integer R0; byte-identical independent production
+of the full FN manifest/count/root; the owner-pinned post-M activation heights
+A1/A2/A3 and bridge security pins; final-H three-way equivalence; the isolated real-history shadow-fork
+rehearsal; release signing keys; and a green five-platform Actions release.
+FN Genesis, owner-script authorization, modern PoD, simple-v1 asset issuance,
+the treasury fee, FlowMesh spot engine/custody/P2P/wallet paths, and activation
+gates are implemented and remain fail-closed until those release pins are
+supplied. Bridge-backed bUSD minting is not release-ready until the separate
+bridge gates listed above are closed.

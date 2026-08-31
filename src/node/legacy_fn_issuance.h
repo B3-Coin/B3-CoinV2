@@ -5,42 +5,74 @@
 #ifndef B3COIN_NODE_LEGACY_FN_ISSUANCE_H
 #define B3COIN_NODE_LEGACY_FN_ISSUANCE_H
 
-#include <modern/legacy_fn_issuance.h>
+#include <consensus/fn_params.h>
+#include <uint256.h>
 
+#include <cstdint>
+#include <functional>
+#include <span>
 #include <string>
 #include <vector>
 
+class CBlock;
 class ChainstateManager;
+
+namespace Consensus {
+struct Params;
+}
 
 namespace node {
 
-//! One buildable legacy FN issuance: the canonical proof plus the facts
-//! it establishes (already self-verified by the pure builder).
-struct LegacyFnIssuanceCandidate {
-    modern::LegacyFnIssuanceProofV1 proof;
-    modern::LegacyFnIssuanceFacts facts;
-};
+struct PodRecord;
 
 /**
- * The archival builder sweep (owner ruling 2026-08-17;
- * doc/design/b3-legacy-fn-issuance-proposal.md): scan the sealed legacy
- * prefix [1, H] for qualifying disintegrations that carry the 1-coin
- * P2PKH designation (those without it are IGNORED), locate their funding
- * transactions, and build one canonical self-verified issuance proof
- * per PoD. Runs on the ONE node that chooses to build the deferred
- * issuance queue — it needs full block and undo data through H (a
- * reindexed archival node); no other node ever runs this.
- *
- * Requires the boundary pinned and the active chain to carry X at H.
- * Deterministic: candidates ascend by (height, position) and are
- * byte-identical on every node that runs the sweep — the builder confers
- * no authority. Fails closed with `error` set (missing block/undo data
- * reports that a reindex/redownload is required); on failure `out` is
- * left empty.
+ * The complete proof-free historical FN Genesis artifact pinned by the
+ * transition release. `rights` is in canonical raw-PoD-id order and `root`
+ * commits to these exact rows under `chain_domain`, `genesis_height` (H+1),
+ * and `manifest_version`.
  */
-bool BuildAllLegacyFnIssuances(ChainstateManager& chainman,
-                               std::vector<LegacyFnIssuanceCandidate>& out,
-                               std::string& error);
+struct LegacyFnGenesisManifest {
+    uint256 chain_domain{};
+    uint32_t genesis_height{0};
+    uint16_t manifest_version{0};
+    std::vector<Consensus::FnGenesisRight> rights;
+    uint256 root{};
+
+    friend bool operator==(const LegacyFnGenesisManifest&,
+                           const LegacyFnGenesisManifest&) = default;
+};
+
+using LegacyFnBlockAt = std::function<bool(int height, CBlock& block)>;
+
+/**
+ * Assemble the canonical FN Genesis manifest from PoD records already
+ * derived by `DerivePodRecords`. Each qualifying PoD is resolved back to its
+ * sealed transaction; only the lowest-index exact 1-old-B3 byte-exact P2PKH
+ * designation is a right. Funding-script claimability is deliberately
+ * irrelevant. The full artifact is published only on success.
+ *
+ * `final_height`/`final_hash` are the operator-verified H/X pair. The block
+ * source must carry X at H, and a configured hard-fork height must equal H+1.
+ */
+bool BuildLegacyFnGenesisManifestFromRecords(
+    const Consensus::Params& params,
+    int final_height,
+    const uint256& final_hash,
+    std::span<const PodRecord> records,
+    const LegacyFnBlockAt& block_at,
+    LegacyFnGenesisManifest& out,
+    std::string& error);
+
+/**
+ * Archival sealed-chain sweep for the transition release. Requires the
+ * consensus H/X boundary pinned on the active chain and complete block/undo
+ * data through H. It derives PoDs with `DerivePodRecords`, then builds the
+ * proof-free manifest above. No holder claim, proof, or legacy funding-key
+ * authorization is constructed.
+ */
+bool BuildLegacyFnGenesisManifest(ChainstateManager& chainman,
+                                  LegacyFnGenesisManifest& out,
+                                  std::string& error);
 
 } // namespace node
 

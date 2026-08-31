@@ -22,6 +22,7 @@
 #include <crypto/siphash.h>
 #include <deploymentstatus.h>
 #include <flatfile.h>
+#include <flowmesh/p2p.h>
 #include <headerssync.h>
 #include <index/blockfilterindex.h>
 #include <kernel/types.h>
@@ -495,6 +496,10 @@ struct Peer {
     /** Whether this peer wants invs or headers (when possible) for block announcements */
     bool m_prefers_headers GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
 
+    /** Repeated malformed/oversized FlowMesh frames are a disconnect. */
+    uint8_t m_flowmesh_framing_strikes
+        GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0};
+
     /** Time offset computed during the version handshake based on the
      * timestamp the peer sent in the version message. */
     std::atomic<std::chrono::seconds> m_time_offset{0s};
@@ -626,6 +631,11 @@ public:
     std::vector<CTransactionRef> AbortPrivateBroadcast(const uint256& id) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void SendPings() override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void RelayFinalitySignatures(std::span<const node::FinalitySig> sigs) override;
+    void RelayFlowMeshMessage(
+        const flowmesh::WireMessage& message,
+        std::optional<NodeId> peer = std::nullopt,
+        std::optional<NodeId> exclude_peer = std::nullopt) override
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void InitiateTxBroadcastToAll(const Txid& txid, const Wtxid& wtxid) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void InitiateTxBroadcastPrivate(const CTransactionRef& tx) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void SetBestBlock(int height, std::chrono::seconds time) override
@@ -1932,6 +1942,9 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
         WITH_LOCK(m_tx_download_mutex, m_txdownloadman.CheckIsEmpty());
     }
     } // cs_main
+    if (m_opts.flowmesh_sink) {
+        m_opts.flowmesh_sink->FlowMeshPeerDisconnected(nodeid);
+    }
     if (node.fSuccessfullyConnected &&
         !node.IsBlockOnlyConn() && !node.IsPrivateBroadcastConn() && !node.IsInboundConn()) {
         // Only change visible addrman state for full outbound peers.  We don't
@@ -2472,6 +2485,49 @@ void PeerManagerImpl::RelayFinalitySignatures(std::span<const node::FinalitySig>
             MakeAndPushMessage(*pnode, NetMsgType::FINSIG, sig);
         }
     });
+}
+
+void PeerManagerImpl::RelayFlowMeshMessage(
+    const flowmesh::WireMessage& message, std::optional<NodeId> target_peer,
+    std::optional<NodeId> exclude_peer)
+{
+    flowmesh::WireCheck check;
+    const auto encoded{flowmesh::EncodeWireMessage(message, check)};
+    if (!encoded) {
+        LogDebug(BCLog::NET, "refusing malformed local FlowMesh frame: %s\n",
+                 flowmesh::WireCheckName(check));
+        return;
+    }
+
+    std::vector<NodeId> eligible;
+    {
+        LOCK(m_peer_mutex);
+        if (target_peer) {
+            const auto it{m_peer_map.find(*target_peer)};
+            if (it != m_peer_map.end() &&
+                (it->second->m_our_services & NODE_B3_FLOWMESH) &&
+                (it->second->m_their_services.load() & NODE_B3_FLOWMESH)) {
+                eligible.push_back(*target_peer);
+            }
+        } else {
+            eligible.reserve(m_peer_map.size());
+            for (const auto& [id, peer] : m_peer_map) {
+                if (exclude_peer && id == *exclude_peer) continue;
+                if ((peer->m_our_services & NODE_B3_FLOWMESH) &&
+                    (peer->m_their_services.load() & NODE_B3_FLOWMESH)) {
+                    eligible.push_back(id);
+                }
+            }
+        }
+    }
+    for (const NodeId id : eligible) {
+        m_connman.ForNode(id, [&](CNode* node) {
+            if (!node->fSuccessfullyConnected || node->fDisconnect) return false;
+            MakeAndPushMessage(*node, std::string{flowmesh::WireCommand(message.kind)},
+                               std::span{*encoded});
+            return true;
+        });
+    }
 }
 
 void PeerManagerImpl::SendPings()
@@ -3918,7 +3974,7 @@ void PeerManagerImpl::PushPrivateBroadcastTx(CNode& node)
     const CTransactionRef& tx{*opt_tx};
 
     LogDebug(BCLog::PRIVBROADCAST, "P2P handshake completed, sending INV for txid=%s%s, peer=%d%s",
-             tx->GetHash().ToString(), tx->HasWitness() ? strprintf(", wtxid=%s", tx->GetWitnessHash().ToString()) : "",
+             tx->GetHash().ToString(), tx->HasOptionalData() ? strprintf(", ptxid=%s", tx->GetWitnessHash().ToString()) : "",
              node.GetId(), node.LogIP(fLogIPs));
 
     MakeAndPushMessage(node, NetMsgType::INV, std::vector<CInv>{{CInv{MSG_TX, tx->GetHash().ToUint256()}}});
@@ -4269,6 +4325,39 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         }
 
         pfrom.fSuccessfullyConnected = true;
+        return;
+    }
+
+    if (const auto kind{flowmesh::WireKindForCommand(msg_type)}) {
+        // FlowMesh is negotiated solely as a service on this existing B3
+        // connection. No message is accepted before VERACK or from a peer
+        // that did not advertise the capability.
+        if (!pfrom.fSuccessfullyConnected ||
+            !(peer.m_our_services & NODE_B3_FLOWMESH) ||
+            !(peer.m_their_services.load() & NODE_B3_FLOWMESH)) {
+            if (++peer.m_flowmesh_framing_strikes >= 2) pfrom.fDisconnect = true;
+            return;
+        }
+
+        flowmesh::WireCheck check;
+        auto decoded{flowmesh::DecodeWireMessage(*kind, MakeUCharSpan(vRecv), check)};
+        if (!decoded) {
+            LogDebug(BCLog::NET,
+                     "dropping malformed FlowMesh %s frame (%s), peer=%d\n",
+                     msg_type, flowmesh::WireCheckName(check), pfrom.GetId());
+            if (++peer.m_flowmesh_framing_strikes >= 2) pfrom.fDisconnect = true;
+            return;
+        }
+
+        // A disabled or not-yet-started local worker changes only local relay
+        // behavior, never block validity. Framing still completes cheaply.
+        if (!m_opts.flowmesh_sink) return;
+        const auto result{m_opts.flowmesh_sink->EnqueueWireMessage(
+            pfrom.GetId(), std::move(*decoded))};
+        if (result == flowmesh::QueueResult::MALFORMED &&
+            ++peer.m_flowmesh_framing_strikes >= 2) {
+            pfrom.fDisconnect = true;
+        }
         return;
     }
 

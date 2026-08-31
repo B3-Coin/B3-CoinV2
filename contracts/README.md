@@ -1,29 +1,39 @@
 # B3 bridge contracts (Ethereum side)
 
-Authored in-repo; **compiled and deployed by CI / the owner** — the B3 build
-never depends on a Solidity toolchain, and none of this is reachable from
-B3 consensus.
+Authored in-repo. The published transition-v1 deployment has been independently
+observed on Ethereum; reproducible compilation, contract tests, and byte-for-byte
+source/runtime matching remain release evidence. The B3 build never depends on
+a Solidity toolchain.
 
 ## Contents
 
 | Contract | Leg | Status |
 |---|---|---|
-| `B3DepositVault.sol` | ETH -> B3 deposits (owner ruling 2026-08-24: this leg first) | source complete; compile/test/deploy pending toolchain |
-| `B3FinalityVerifier.sol` + `BlsCertificateProver.sol` + release wiring | B3 -> ETH withdrawals | specified normatively in `doc/design/b3-cross-chain-finality-v1.md` §5–§7; to be authored when the release leg starts |
+| `B3DepositVault.sol` | ETH -> B3 deposits (owner ruling 2026-08-24: this leg first) | source complete; managed-v1 vault `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6` observed; reproducible source/runtime match remains a gate |
+| `B3FinalityVerifier.sol` + `BlsCertificateProver.sol` + release wiring | future decentralized B3 -> ETH withdrawals | specified normatively in `doc/design/b3-cross-chain-finality-v1.md` §5–§7; requires a new audited vault and controlled reserve migration |
 
 ## Invariants
 
 - The `Deposit` event shape is consensus-relevant on the B3 side and must
   byte-match `src/bridge/deposit.h` (`Deposit(uint64,address,uint256,bytes32)`,
   id and token indexed, amount = received balance delta).
-- The vault has no owner, no pause, no upgrade path. Funds leave only via
-  `release`, restricted to the release authority (the §5 verifier stack).
+- The vault has no mutable owner slot, proxy, pause, or upgrade path. Funds
+  leave only via `release`, restricted to its immutable release authority. The deployed
+  transition-v1 vault uses an owner-controlled managed authority; it is not
+  the later §5 verifier stack.
 - `rescue` (separate `rescueAuthority`, defaults to the release authority at
   deploy) can withdraw ONLY the surplus above the per-token `locked`
-  liabilities -- strays, airdrops, force-sent ETH. It is structurally unable
-  to touch deposited funds, so it stays safe even in production.
-- Mainnet deployment waits for the release-leg contracts: the constructor
-  refuses a zero release authority so deposits can never be trapped.
+  liabilities -- strays, airdrops, force-sent ETH. `rescue` cannot spend
+  tracked liabilities; this does not mitigate compromise of `releaseAuthority`
+  and is not a production-readiness claim.
+- The published mainnet smoke vault was promoted for transition v1 by owner
+  ruling on 2026-09-01. Its managed authority cannot be changed in place. A
+  later verifier therefore needs a new vault and explicit reserve migration.
+- Verified at Ethereum block 25,877,643: both immutable authorities are the
+  EOA `0x76c7a245d0D2e4CF92403aF0144825df1cC614f1`; the runtime code hash is
+  `0x1be220c18efa4e4cda0bb1c912c7c41346f5c04d49a36ec2c68f6ddcc5586233`.
+  The vault is generic and held zero USDT at that observation, so B3 consensus
+  must still enforce canonical USDT and every mint-security gate.
 
 ## Toolchain (owner/CI)
 
@@ -34,13 +44,15 @@ forge create contracts/B3DepositVault.sol:B3DepositVault --constructor-args <rel
 ```
 
 Order of operations per the staged build plan: Sepolia/Holesky with test
-tokens first; mainnet only after the four release gates analogue for A3.
+tokens first; mainnet minting only after every independently reviewed bridge
+proof/readiness pin. FlowMesh A3 does not activate the bridge.
 
-## Mainnet smoke-test runbook (owner-executed)
+## Historical mainnet smoke-test runbook (owner-executed; not activation)
 
-The assistant cannot sign transactions or handle keys; every step below runs
-on the owner's machine with the owner's wallet. Recommended: tiny amounts,
-and an owner-controlled `releaseAuthority` (interim, funds recoverable).
+The assistant cannot sign transactions or handle keys; every step below ran on
+the owner's machine with tiny amounts and an owner-controlled authority. It is
+retained to reproduce the historical smoke test, not to select or activate a
+new production vault.
 
 ```
 # one-time

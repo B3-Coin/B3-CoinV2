@@ -33,6 +33,10 @@ class CBlockIndex;
 class CScheduler;
 class DataStream;
 class uint256;
+namespace flowmesh {
+class WireMessageSink;
+struct WireMessage;
+} // namespace flowmesh
 
 namespace node {
 class Warnings;
@@ -95,6 +99,9 @@ public:
         uint32_t max_headers_result{MAX_HEADERS_RESULTS};
         //! Whether private broadcast is used for sending transactions.
         bool private_broadcast{DEFAULT_PRIVATE_BROADCAST};
+        //! Optional production FlowMesh worker. The B3 message thread only
+        //! performs bounded framing and transfers ownership to this sink.
+        flowmesh::WireMessageSink* flowmesh_sink{nullptr};
     };
 
     static std::unique_ptr<PeerManager> make(CConnman& connman, AddrMan& addrman,
@@ -156,6 +163,16 @@ public:
     /** Broadcast locally produced B3 finality signatures (`finsig`) to all
      * fully connected peers (liveness gossip; plan Commit 15). */
     virtual void RelayFinalitySignatures(std::span<const node::FinalitySig> sigs) = 0;
+
+    /**
+     * Send a locally produced, already validated FlowMesh frame. `peer`
+     * selects one direct reply (catch-up/control); otherwise the frame is
+     * broadcast to capable peers except `exclude_peer` (gossip fanout).
+     */
+    virtual void RelayFlowMeshMessage(
+        const flowmesh::WireMessage& message,
+        std::optional<NodeId> peer = std::nullopt,
+        std::optional<NodeId> exclude_peer = std::nullopt) = 0;
 
     /** Set the height of the best block and its time (seconds since epoch). */
     virtual void SetBestBlock(int height, std::chrono::seconds time) = 0;

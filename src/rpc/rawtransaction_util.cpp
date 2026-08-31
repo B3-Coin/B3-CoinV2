@@ -5,8 +5,10 @@
 
 #include <rpc/rawtransaction_util.h>
 
+#include <chainparams.h>
 #include <coins.h>
 #include <consensus/amount.h>
+#include <consensus/era.h>
 #include <core_io.h>
 #include <key_io.h>
 #include <policy/policy.h>
@@ -226,12 +228,27 @@ void ParsePrevouts(const UniValue& prevTxsUnival, FlatSigningProvider* keystore,
                     throw JSONRPCError(RPC_DESERIALIZATION_ERROR, err);
                 }
                 Coin newcoin;
+                if (coin != coins.end() && !coin->second.IsSpent()) {
+                    // A user-supplied prevout may add an amount or solving
+                    // script, but it must not erase locally derived creation
+                    // height/provenance for the same UTXO.
+                    newcoin.nHeight = coin->second.nHeight;
+                    newcoin.fCoinBase = coin->second.fCoinBase;
+                    newcoin.fCoinStake = coin->second.fCoinStake;
+                    newcoin.nTime = coin->second.nTime;
+                    newcoin.nTxOffset = coin->second.nTxOffset;
+                }
                 newcoin.out.scriptPubKey = scriptPubKey;
                 newcoin.out.nValue = MAX_MONEY;
                 if (prevOut.exists("amount")) {
                     newcoin.out.nValue = AmountFromValue(prevOut.find_value("amount"));
                 }
-                newcoin.nHeight = 1;
+                if (coin == coins.end() || coin->second.IsSpent()) {
+                    // No authenticated height was found locally. Height 1 is
+                    // intentionally conservative and keeps B3A1-looking bytes
+                    // on their complete stored script.
+                    newcoin.nHeight = 1;
+                }
                 coins[out] = std::move(newcoin);
             }
 
@@ -318,7 +335,9 @@ void SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
     // Script verification errors
     std::map<int, bilingual_str> input_errors;
 
-    bool complete = SignTransaction(mtx, keystore, coins, *nHashType, input_errors);
+    bool complete = SignTransaction(
+        mtx, keystore, coins, *nHashType, input_errors,
+        Consensus::LegacyFinalHeight(Params().GetConsensus()));
     SignTransactionResultToJSON(mtx, complete, coins, input_errors, result);
 }
 
@@ -348,12 +367,22 @@ std::vector<RPCResult> DecodeTxDoc(const std::string& txid_field_doc, bool walle
 {
     return {
         {RPCResult::Type::STR_HEX, "txid", txid_field_doc},
-        {RPCResult::Type::STR_HEX, "hash", "The transaction hash (differs from txid for witness transactions)"},
+        {RPCResult::Type::STR_HEX, "hash", "The full transaction hash (differs from txid for witness or B3 Modern Payload Area data)"},
+        {RPCResult::Type::STR_HEX, "ptxid", "The B3 full-payload transaction id (witness and Modern Payload Area included)"},
         {RPCResult::Type::NUM, "size", "The serialized transaction size"},
         {RPCResult::Type::NUM, "vsize", "The virtual transaction size (differs from size for witness transactions)"},
         {RPCResult::Type::NUM, "weight", "The transaction's weight (between vsize*4-3 and vsize*4)"},
         {RPCResult::Type::NUM, "version", "The version"},
         {RPCResult::Type::NUM_TIME, "locktime", "The lock time"},
+        {RPCResult::Type::ARR, "mpa", /*optional=*/true, "B3 Modern Payload Area records",
+        {
+            {RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM, "type", "Payload type"},
+                {RPCResult::Type::NUM, "version", "Payload version"},
+                {RPCResult::Type::STR_HEX, "payload", "Canonical payload bytes"},
+            }},
+        }},
         {RPCResult::Type::ARR, "vin", "",
         {
             {RPCResult::Type::OBJ, "", "",

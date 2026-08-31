@@ -1,106 +1,146 @@
-# B3 FlowMesh economics v1 — consolidated (RULED vs PROPOSED)
+# B3 economics v1 — consolidated owner rulings
 
-Single source of truth for economic parameters, superseding scattered
-notes. Owner rulings of 2026-08-26 incorporated. Anything marked PROPOSED
-awaits an explicit owner ruling; nothing PROPOSED may be pinned into a
-release.
+This is the economic source of truth for the transition release. Values marked
+RULED may be implemented; OPEN values require a later explicit decision.
 
-## Supply — RULED
-- Legacy B3 supply carried 1:1 across H; no premine, no re-issuance ever.
-- Display unit kB3 (1 B3 shown = 1e9 base units); FN marker = 1 old COIN.
-- FN Coin: lifetime cap 5,000 units (RATIFIED 2026-08-22); 3,500 issuable
-  against historical PoD proof; Proof-of-Disintegration burns B3 -> FN.
+## Supply and denomination — RULED
 
-## Treasury — RULED 2026-08-26
-- **One single treasury wallet/address. No multisig, no complexity.**
-  The address itself is an owner release input (never invented by the
-  implementation; pinned like other release parameters).
-- **Issuance fees pay to the treasury address** (supersedes the earlier
-  burn recommendation).
-- **FlowMesh trading fee RULED 2026-08-26: 0.01% (1 basis point) flat**,
-  split **80% to FlowMesh / 20% to the dev treasury address** —
-  superseding the earlier 5/2 bps 70/20/10 proposal. Recipient detail of
-  the 80% FlowMesh share (FN seat operators per the three-role model vs
-  a broader participant pool) to be confirmed when the DEX fee engine is
-  wired; the 20% pays the same single treasury address as everything
-  else. A maker/taker distinction is deliberately absent (one flat bp);
-  refining it later is an owner option, not a requirement.
-- Reported trade-off, accepted by the ruling's simplicity mandate: a
-  single key is a single point of compromise/loss; strong key hygiene
-  (hardware-backed) recommended; the address can be rotated only by
-  release.
+- Legacy B3 UTXO value carries across H one-for-one. There is no premine or
+  replacement issuance.
+- The human-facing unit is B3 and one displayed B3 equals `1e9` base units.
+- Native B3 and non-native colored assets are separate conservation domains.
+- FN is a global non-native whole-unit asset with lifetime cap 5,000.
 
-## Modern PoS reward — RULED 2026-08-26 (mechanism AND numbers)
+## Modern PoS emission — RULED 2026-08-26
 
-Owner pins (2026-08-26, second ruling of the day):
+At the measured seal supply `S_H`:
 
-- **Initial annual rate: 1% of S_H** — `R0 = floor(S_H * 1% / 525,600)`
-  atomic units per block, with `S_H` = the MEASURED total supply at
-  H = 810,000 from the final U==U' capture (never assumed).
-- **Halving interval: 525,600 blocks = one year** at the 60 s target
-  spacing ("halving every year"): `reward(h) = R0 >> floor((h - M)/525,600)`.
-- **Corridor reward: 0 + fees.** The 1,000 PoW corridor blocks carry no
-  subsidy at all — fees only. No new coins exist until Modern PoS begins
-  at M = 811,001.
-- Split: 90% producer / 10% treasury per block (standing proposal,
-  applied unless the owner objects); all tx + payload fees to the
-  producer; treasury share pays to the single ruled treasury address.
-- **Treasury address PINNED (owner, 2026-08-26):**
-  `SNyANHiUkuqPSfbeKHDXzVD86LC2ZUUjLX` (mainnet version 63, checksum
-  verified; hash160 `12602418ffc74640e37f1a73d0cdc255d2a07c35`; enforced
-  coinbase script `76a91412602418ffc74640e37f1a73d0cdc255d2a07c3588ac`).
-  Generated offline by the owner with
-  contrib/b3hive-release/make_treasury_wallet.py; the key never left the
-  owner's machine. Issuance fees and FlowMesh fees pay the same address
-  per the earlier ruling.
+```
+R0 = floor(S_H_base_units * 1% / 525,600)
+reward(h) = R0 >> floor((h - M) / 525,600)
+```
 
-Consequences, reported: total lifetime emission converges to ~**2% of
-S_H ever** (1% + 0.5% + 0.25% + ...) — an exceptionally scarce schedule;
-the staking security budget decays quickly (year 1 = 1%, year 3 = 0.25%),
-so transaction + FlowMesh fee flow must become the dominant validator
-income within a few years. This is the accepted trade-off of the ruling.
+- H = 810,000 and M = 811,001.
+- Corridor blocks 810,001..811,000 have zero subsidy and may claim fees only.
+- Modern reward split is 90% producer / 10% treasury.
+- Halving interval is 525,600 blocks, approximately one year at the 60-second
+  target.
+- Total scheduled lifetime emission approaches 2% of S_H.
 
-## (superseded earlier note) mechanism RULED 2026-08-26: HALVING SCHEDULE
+## Treasury — RULED
 
-The owner ruled a Bitcoin-style halving emission (rejecting the constant
-tail-emission recommendation). Mechanism locked; NUMBERS still PROPOSED:
+The single pinned treasury address is:
 
-- `block_reward(height) = R0 >> floor((height - M) / HALVING_INTERVAL)`
-  (integer atomic units; emission ends when the shift reaches zero).
-- PROPOSED `HALVING_INTERVAL` = **2,102,400 blocks** (~4 years at the
-  60 s target spacing).
-- PROPOSED `R0` = sized from the MEASURED supply at H so that first-epoch
-  issuance is ~3%/year of `S_H` (R0 = S_H * 3% / 525,600); total lifetime
-  emission then converges to ~24% of S_H over all halvings. `S_H` comes
-  from the final U==U' capture at H — never an assumed number.
-- Split per block, enforced in the coinbase: **90% block producer /
-  10% treasury address** (PROPOSED, carried over). All transaction +
-  payload fees to the producer.
-- Corridor (1,000 PoW blocks): same R0, same split (PROPOSED).
-- Halving properties, stated honestly: strong scarcity narrative and
-  familiar economics; the security budget decays by design, so fees (and
-  FlowMesh volume feeding the treasury) must grow into the gap across
-  epochs — this is the accepted trade-off of the ruling.
-- Owner pins still needed: R0 (or the 3% sizing rule), HALVING_INTERVAL,
-  the 90/10 split, and the treasury address.
+```
+SNyANHiUkuqPSfbeKHDXzVD86LC2ZUUjLX
+```
 
-## Asset issuance fee — RULED destination, PROPOSED size
-- Destination: the treasury address (RULED 2026-08-26).
-- Size: PROPOSED flat 10 B3 per ASSET_ISSUANCE (anti-spam scale, not a
-  gate for serious issuers) + the standard MPA payload costs. Activates
-  with the asset phase; the consensus check is "coinbase-independent
-  output of >= fee to the treasury script in the issuing transaction".
-- User protection remains layered as designed: unforgeable AssetIdV1,
-  registered-vs-permissionless tiers, FlowMesh listing gate against
-  approved quote assets, wallet unknown-asset flagging.
+Its mainnet script is:
 
-## Bridge fees — OPEN
-Stage-4 decision; a small bps on mint/withdraw to the treasury is the
-natural shape; interacts with mint caps (threat model T1). Not designed.
+```
+76a91412602418ffc74640e37f1a73d0cdc255d2a07c3588ac
+```
 
-## Still requiring owner pins before the relevant release
-1. `S_H`-derived block reward + r + split (this proposal's numbers).
-2. FlowMesh bps numbers.
-3. The treasury address itself.
-4. Issuance fee amount.
-5. Bridge fee (stage 4).
+The single-key risk is accepted by the simplicity ruling. Release operators
+must protect the key with strong offline or hardware-backed custody. Rotation
+requires a reviewed release.
+
+## Simple-v1 colored assets — RULED 2026-08-22/09-01
+
+- One genesis transaction creates exactly the full declared fixed supply.
+- No later mint authority or mint button exists.
+- Asset identity is deterministic, chain-bound, and commits to the immutable
+  genesis rules.
+- Issuance fee is a flat **1,000 B3** paid to the pinned treasury script in a
+  coinbase-independent output of the issuing transaction.
+- The issuer also pays the ordinary native B3 network fee.
+- Colored-asset outputs do not need native B3 attached; later transfers pay
+  network fees using separate native B3 inputs.
+- Asset issuance activates only at the post-M height pinned in the transition
+  release (A2).
+
+## Historical FN Genesis — RULED 2026-09-01
+
+- The full canonical historical-rights manifest, count R, and Merkle root are
+  measured and independently reproduced during the seal pause.
+- Block 810,001 coinbase creates one amount-1 FN output per manifest row,
+  directly to the exact historical legacy P2PKH owner commitment.
+- Historical issuance has no holder claim, proof, deadline, disintegration
+  payment, colored-asset issuance fee, or separate network fee.
+- The outputs use ordinary 30-block coinbase maturity and no additional FN
+  transfer lock.
+
+Historical B3 destruction already occurred in 2017. FN Genesis recognizes the
+result; it does not destroy or recreate native B3 at height 810,001.
+
+## Modern FN creation — RULED 2026-08-28/09-01
+
+Final modern capacity is:
+
+```
+5,000 - R
+```
+
+It is not a separately fixed 1,500. The prior through-height-807,709 run found
+at least 3,500 historical rights, so the final capacity is expected to be no
+more than 1,500.
+
+Each modern PoD transaction creates exactly one FN and removes D from native B3
+through the accounting gap:
+
+```
+native_input - native_output = D + ordinary_network_fee
+```
+
+D is never an output, treasury payment, or producer fee. Price depends on the
+number M of modern FN already created:
+
+| M before creation | Required destruction |
+|---:|---:|
+| 0..499 | 15,000 B3 |
+| 500..999 | 30,000 B3 |
+| 1,000 and above while `R + M < 5,000` | 60,000 B3 |
+
+Retiring or extinguishing FN never reopens a lifetime slot. Historical FN does
+not advance the modern price counter. Permissionless modern creation is
+fail-closed before the separately pinned post-M height A1.
+
+## FN transfers — RULED 2026-09-01
+
+- Owner-script authorization is required over the complete spending
+  transaction.
+- Whole FN units are conserved across ordinary transfer.
+- FN is indivisible in the decimal sense; whole units may be combined or split.
+- Native B3 pays the ordinary transaction fee.
+- Historical proof data and PoDIds never travel with transferred units.
+
+## FlowMesh economics — RULED FOR THE TRANSITION RELEASE
+
+FlowMesh v1 spot trading activates at A3 in the transition release. The fee is
+100 ppm (0.01%) of matched native-B3 notional, charged once and split 80% equally
+across every active FN seat and 20% to the same treasury address. Any indivisible
+seat remainder is assigned in canonical SeatId order.
+
+After every ordinary slot, the engine requests the deterministic maximal partial
+treasury flush: the lesser of accrued treasury available and anchored native
+withdrawal capacity remaining after existing pending native withdrawals, when
+positive. It never waits for the full balance, and zero capacity never blocks
+trading.
+
+## Superseded economic notes
+
+The following remain history only and must not be implemented:
+
+- 10 B3 colored-asset issuance fee;
+- burning the colored-asset issuance fee;
+- 3% initial annual emission or four-year halvings;
+- corridor subsidy;
+- a hard-coded 1,500 modern-FN capacity independent of final R;
+- a 4,000-byte proof fee or carrier gate for historical FN; and
+- charging historical FN holders at Genesis.
+
+## OPEN for later scope
+
+- FN/FlowMesh reward amount and ownership cutoff, if rewards are adopted.
+- Final allocation of the 80% FlowMesh fee share.
+- Bridge mint/withdraw fee policy.

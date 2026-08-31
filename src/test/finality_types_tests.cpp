@@ -96,11 +96,11 @@ BOOST_AUTO_TEST_CASE(guardrails_nothing_activated)
     BOOST_CHECK(modern::IsActivatedPolicy(static_cast<uint16_t>(PolicyType::STAKE), modern::POLICY_VERSION_V1));
     BOOST_CHECK(modern::IsActivatedPolicy(static_cast<uint16_t>(PolicyType::OWNER), modern::POLICY_VERSION_V1));
     BOOST_CHECK(!modern::IsActivatedPolicy(static_cast<uint16_t>(PolicyType::FN), modern::POLICY_VERSION_V1));
-    // Creation-action numbers 4/5 are reserved, NOT registered: the strict
-    // registry rejects them exactly like any unknown type.
+    // Finality numbers 4/5 are MPA-only and not registered in the standalone
+    // creation-action codec. Type 6 is the registered modern FN PoD action.
     BOOST_CHECK(!modern::IsKnownCreationAction(modern::CREATION_ACTION_FINALITY_CERTIFICATE, 1));
     BOOST_CHECK(!modern::IsKnownCreationAction(modern::CREATION_ACTION_FINALITY_KEY_EVIDENCE, 1));
-    BOOST_CHECK(!modern::IsKnownCreationAction(6, 1));
+    BOOST_CHECK(modern::IsKnownCreationAction(modern::CREATION_ACTION_MODERN_FN_POD, 1));
     // And the decoder still refuses a section naming them.
     modern::CreationAction a;
     a.action_type = modern::CREATION_ACTION_FINALITY_CERTIFICATE;

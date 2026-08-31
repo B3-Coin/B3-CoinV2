@@ -129,6 +129,20 @@ public:
         if (it == entries.end()) return std::nullopt;
         return it->second;
     }
+
+    std::optional<CAmount> GetWithdrawalCapacity(
+        const modern::AssetId&, const AnchorRef&) const override
+    {
+        return MAX_MONEY;
+    }
+
+
+    std::optional<std::vector<flowmesh::WithdrawalSettlementFactV1>>
+    GetWithdrawalSettlements(const std::optional<AnchorRef>&,
+                             const AnchorRef&) const override
+    {
+        return std::vector<flowmesh::WithdrawalSettlementFactV1>{};
+    }
 };
 
 //! Ephemeral in-memory journal implementing the compare-and-set

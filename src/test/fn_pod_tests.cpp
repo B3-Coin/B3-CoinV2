@@ -5,10 +5,9 @@
 //! Deterministic PodRecord derivation (doc/design/b3-fn-pod.md §8.2):
 //! the single classifier, the persisted PodDB, and the sync path across
 //! restart, reindex, trusted-replay-mode sync and legacy-era rollback.
-//! Includes one chain-level derivation over a GENUINELY SIGNED P2PK
-//! funding input, so the production path is proven for records that can
-//! actually be claimed. No claim transactions, no minting, no claimed[]
-//! state — derivation only.
+//! Includes one chain-level derivation over a GENUINELY SIGNED P2PK funding
+//! input so the historical audit metadata is covered. FN Genesis eligibility
+//! comes from the separate designation rule; this suite derives records only.
 
 #include <chainparams.h>
 #include <consensus/merkle.h>
@@ -17,7 +16,6 @@
 #include <key.h>
 #include <legacy/codec.h>
 #include <legacy/consensus.h>
-#include <modern/fn.h>
 #include <node/blockstorage.h>
 #include <node/chainstate.h>
 #include <node/fn_pod.h>
@@ -457,19 +455,12 @@ BOOST_FIXTURE_TEST_CASE(chain_derivation_and_determinism, PodTestSetup)
         BOOST_CHECK(!records[2].claimable);
         BOOST_CHECK(records[2].reason == PodClaimability::UNSUPPORTED_FUNDING_SCRIPT);
 
-        // The report's PAYLOAD figures are the SUPERSEDED type-1
-        // arithmetic (non-authoritative for activation; the type-2
-        // issuance carrier is measured separately as future work) — the
-        // qualifying counts remain meaningful.
+        // The audit report retains scan facts only. FN Genesis eligibility is
+        // resolved separately from each PoD's exact historical designation.
         const auto report{node::BuildPodCapacityReport(records)};
         BOOST_CHECK_EQUAL(report.total_qualifying, 3U);
         BOOST_CHECK_EQUAL(report.claimable, 1U);
         BOOST_CHECK_EQUAL(report.max_distinct_funding_scripts, 1U);
-        BOOST_CHECK_EQUAL(report.max_action_payload,
-                          modern::WorstCaseFnClaimActionPayload(1));
-        BOOST_CHECK_EQUAL(report.within_native_bound, 1U);
-        BOOST_CHECK_EQUAL(report.exceeding_native_bound, 0U);
-        BOOST_CHECK(report.fits_native_action);
     }
 
     mutable_consensus.hard_fork_height = 41;

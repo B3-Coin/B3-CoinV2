@@ -86,6 +86,14 @@ struct bilingual_str;
 namespace wallet {
 struct WalletContext;
 
+/**
+ * Derive the asset-signing context for a transaction whose provenance is
+ * independently known by this wallet. Confirmed outputs may use the B3A1
+ * owner suffix only when their creating block is above H; an unconfirmed
+ * output may do so only while its modern transaction is in the local mempool.
+ */
+AssetSigningContext AssetSigningContextForWalletTransaction(const CWalletTx& wtx);
+
 //! Explicitly delete the wallet.
 //! Blocks the current thread until the wallet is destructed.
 void WaitForDeleteWallet(std::shared_ptr<CWallet>&& wallet);
@@ -446,8 +454,15 @@ private:
         bool crypted{false};
     };
     std::optional<B3BlsKeyRecord> m_b3_bls_key GUARDED_BY(cs_wallet);
+    //! Independent FlowMesh seat-signing keys. Unlike the single finality
+    //! key, a wallet may operate many FN seats and must retain historical
+    //! keys so already-earned rewards remain claimable after rotation.
+    std::map<std::array<unsigned char, 48>, B3BlsKeyRecord>
+        m_b3_flowmesh_bls_keys GUARDED_BY(cs_wallet);
     //! B3 validator public key (see GetValidatorPubKey); unset until created.
     std::optional<CPubKey> m_b3_validator_pubkey GUARDED_BY(cs_wallet);
+    //! Independent BIP340 key for the wallet's FlowMesh trading account.
+    std::optional<CPubKey> m_b3_flowmesh_account_pubkey GUARDED_BY(cs_wallet);
 
     //! Set of both spent and unspent transaction outputs owned by this wallet
     std::unordered_map<COutPoint, WalletTXO, SaltedOutpointHasher> m_txos GUARDED_BY(cs_wallet);
@@ -800,10 +815,13 @@ public:
 
     bool IsMine(const CTxDestination& dest) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool IsMine(const CScript& script) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool IsMine(const CScript& script, AssetSigningContext asset_context) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Returns amount of debit, i.e. the amount leaving this wallet due to this input */
     CAmount GetDebit(const CTxIn& txin) const;
     bool IsMine(const CTxOut& txout) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool IsMine(const CTxOut& txout, AssetSigningContext asset_context) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool IsMine(const CTransaction& tx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool IsMine(const CTransaction& tx, AssetSigningContext asset_context) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool IsMine(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** should probably be renamed to IsRelevantToMe */
     bool IsFromMe(const CTransaction& tx) const;
@@ -1043,6 +1061,37 @@ public:
      * and diagnostics.
      */
     util::Result<bls::SecretKey> ResolveFinalityBlsKey(uint32_t seq, const std::vector<unsigned char>* bound_bls_pubkey) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** One wallet-held FlowMesh BIP340 account key, deliberately independent
+     * from B3 payment, validator, finality, and FN-seat BLS keys. */
+    std::optional<CPubKey> GetFlowMeshAccountPubKey() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    util::Result<CPubKey> GetOrCreateFlowMeshAccountKey()
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    util::Result<CKey> GetFlowMeshAccountSecret() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void LoadFlowMeshAccountPubKey(const CPubKey& pubkey)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /**
+     * Import one independent FlowMesh FN-seat BLS key. Records are opaque,
+     * encrypted with the wallet master key, and intentionally never enter a
+     * descriptor/signing provider. Multiple keys are retained by public key.
+     */
+    util::Result<bls::PublicKey> ImportFlowMeshBlsKey(
+        const bls::SecretKey& key) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    util::Result<bls::SecretKey> GetFlowMeshBlsKey(
+        const std::array<unsigned char, 48>& pubkey) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::vector<std::array<unsigned char, 48>> ListFlowMeshBlsPubkeys() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool HasFlowMeshBlsKey(const std::array<unsigned char, 48>& pubkey) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_b3_flowmesh_bls_keys.contains(pubkey);
+    }
+    //! Wallet database load hook; false rejects duplicates/corrupt records.
+    bool LoadFlowMeshBlsKey(const std::array<unsigned char, 48>& pubkey,
+                            const std::vector<unsigned char>& data,
+                            bool crypted) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     //! Database load hook.
     void LoadValidatorPubKey(const CPubKey& pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 

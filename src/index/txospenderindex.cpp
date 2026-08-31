@@ -128,7 +128,7 @@ static std::vector<std::pair<COutPoint, CDiskTxPos>> BuildSpenderPositions(const
             }
         }
         pos.nTxOffset += legacy_codec_block ? ::GetSerializeSize(legacy::TX_LEGACY(*tx))
-                                            : ::GetSerializeSize(TX_WITH_WITNESS(*tx));
+                                            : ::GetSerializeSize(TX_MODERN(*tx));
     }
 
     return items;
@@ -164,7 +164,7 @@ util::Expected<TxoSpender, std::string> TxoSpenderIndex::ReadTransaction(const C
         if (consensus.legacy_b3coin && !Consensus::HasB3BlockCodecV2(header.nVersion)) {
             file >> legacy::TX_LEGACY(spender.tx);
         } else {
-            file >> TX_WITH_WITNESS(spender.tx);
+            file >> TX_MODERN(spender.tx);
         }
         spender.block_hash = header.GetMarkerHash(consensus);
         return spender;

@@ -6,6 +6,7 @@
 #define B3COIN_FLOWMESH_LEDGER_H
 
 #include <consensus/amount.h>
+#include <flowmesh/settlement.h>
 #include <hash.h>
 #include <modern/policy.h>
 #include <modern/vault.h>
@@ -67,38 +68,27 @@ inline constexpr uint64_t LEDGER_SNAPSHOT_MAX_ENTRIES{uint64_t{1} << 22};
  * completely untouched: no lookup here ever inserts before all checks
  * pass (a rejected deposit must not even leave a zero-valued entry).
  *
- * WITHDRAWAL LIFECYCLE (accurate names; the stages beyond the first two
- * are NOT reachable yet):
+ * WITHDRAWAL LIFECYCLE:
  *
  *     REQUESTED             — RequestWithdrawal() debited the balance
  *                             and recorded the pending request (this is
  *                             the only transition the ledger performs
  *                             for a user action);
- *     MICROBLOCK_CERTIFIED  — the request sits in a state committed
- *                             under a microblock certificate (derived
- *                             from log position, not stored; the
- *                             certificate-commit model itself is
- *                             provisional — certificate ==
- *                             irreversible finality is an unresolved
- *                             owner decision);
- *     B3_FINAL / REDEEMABLE — RULE DECIDED (owner, 2026-08-22): the
- *                             receipt exists in a certified microblock
- *                             AND its B3 anchor is still canonical AND
- *                             that anchor is buried >= FLOWMESH_ANCHOR_DEPTH
- *                             (30) AND the receipt_id is not yet consumed.
- *                             On redemption: amount -> user destination,
- *                             remainder -> DEX_VAULT(VAULT_POOL_CHANGE),
- *                             receipt_id consumed exactly once. The
- *                             production FinalizedReceiptView implementing
- *                             this is wiring still to land; NOTHING in this
- *                             codebase reports a request as redeemable yet;
- *     CONSUMED              — ConsumeRequest(): the on-chain vault
- *                             spend removed custody and liability
- *                             together (exercised by tests only).
+ *     MICROBLOCK_CERTIFIED  — the request sits in a state committed under
+ *                             a BLS microblock certificate;
+ *     B3_AUTHORIZED         — a connected type-8 checkpoint commits the
+ *                             request, and a valid type-9 inclusion proof
+ *                             may spend matching pool-change inputs, pay the
+ *                             exact destination, and return exact change;
+ *     B3_SETTLED            — the type-9 transaction connected and its
+ *                             nullifier prevents a second spend;
+ *     CONSUMED              — a dedicated anchor-derived settlement entry
+ *                             calls ConsumeRequest(), removing custody and
+ *                             the pending liability together.
  *
- * The ledger deliberately does NOT implement the modern
- * FinalizedReceiptView: FlowMesh certification alone must never present
- * a request as an authorized B3 spend.
+ * The ledger deliberately does not validate checkpoint proofs itself. The
+ * chain checkpoint index authorizes and nullifies type-9 spends; production
+ * then imports the resulting canonical settlement fact into this ledger.
  */
 class Ledger final
 {
@@ -193,6 +183,23 @@ public:
         return true;
     }
 
+    /** Internal available-to-available liability move. */
+    bool MoveAvailableToAvailable(const AccountId& from, const AccountId& to,
+                                  const AssetId& asset, const CAmount amount)
+    {
+        if (amount <= 0 || from == to) return false;
+        const auto src_it{m_balances.find({from, asset})};
+        if (src_it == m_balances.end() || src_it->second.available < amount) return false;
+        const auto dst_it{m_balances.find({to, asset})};
+        const CAmount dst_available{dst_it == m_balances.end() ? 0 : dst_it->second.available};
+        if (amount > MAX_MONEY - dst_available) return false;
+
+        src_it->second.available -= amount;
+        m_balances[{to, asset}].available = dst_available + amount;
+        Prune(from, asset);
+        return true;
+    }
+
     // ---- Protocol fees --------------------------------------------------
 
     //! Charge a fee: an internal transfer to the protocol fee account.
@@ -216,21 +223,36 @@ public:
 
     /**
      * REQUESTED: debit the account and record a pending withdrawal
-     * request. This is a provisional intent — it does NOT authorize any
-     * B3 vault spend, and nothing here (or anywhere in FlowMesh) can
-     * promote it to redeemable; that authorization is an unresolved
-     * owner decision. The request id derives deterministically from the
-     * ledger's slot and sequence, so identical histories yield identical
-     * requests.
+     * request. The request alone does not authorize a B3 vault spend; that
+     * requires its connected type-8 checkpoint and a valid type-9 inclusion
+     * proof. The request id derives deterministically from the ledger's slot
+     * and sequence, so identical histories yield identical requests.
      */
-    std::optional<modern::WithdrawalReceipt> RequestWithdrawal(const AccountId& account,
-                                                               const AssetId& asset,
-                                                               const CAmount amount,
-                                                               const uint256& destination)
+    CAmount PendingWithdrawals(const AssetId& asset) const
     {
-        if (amount <= 0) return std::nullopt;
+        CAmount pending{0};
+        for (const auto& [id, request] : m_requests) {
+            (void)id;
+            if (request.asset == asset) pending += request.amount;
+        }
+        return pending;
+    }
+
+    std::optional<modern::WithdrawalReceipt> RequestWithdrawal(
+        const AccountId& account, const AssetId& asset, const CAmount amount,
+        const uint256& destination, const CAmount withdrawal_capacity)
+    {
+        if (amount <= 0 || withdrawal_capacity < 0 ||
+            withdrawal_capacity > MAX_MONEY) {
+            return std::nullopt;
+        }
         const auto it{m_balances.find({account, asset})};
         if (it == m_balances.end() || it->second.available < amount) return std::nullopt;
+        const CAmount pending{PendingWithdrawals(asset)};
+        if (pending > withdrawal_capacity ||
+            amount > withdrawal_capacity - pending) {
+            return std::nullopt;
+        }
 
         modern::WithdrawalReceipt request;
         request.asset = asset;
@@ -262,10 +284,10 @@ public:
         return it->second;
     }
 
-    //! CONSUMED: the on-chain withdrawal connected; custody and
-    //! request-liability leave together. A request can be consumed
-    //! exactly once. (Reachable only through the future owner-approved
-    //! B3 authorization; tests exercise the accounting.)
+    //! CONSUMED: retire the request after its on-chain withdrawal connects;
+    //! custody and request-liability leave together. Production reaches this
+    //! through the checked anchor-derived settlement overload below. A
+    //! request can be consumed exactly once.
     bool ConsumeRequest(const uint256& request_id)
     {
         const auto it{m_requests.find(request_id)};
@@ -276,6 +298,29 @@ public:
         if (custody->second == 0) m_custody.erase(custody);
         m_requests.erase(it);
         return true;
+    }
+
+    /**
+     * Retire a request only when the anchor-derived B3 settlement repeats the
+     * exact certified value facts. The receipt id already commits the account
+     * and finalized slot; the remaining fields are compared explicitly so an
+     * index or wiring error cannot retire a different liability.
+     */
+    bool ConsumeRequest(const WithdrawalSettlementFactV1& settlement)
+    {
+        if (!WithdrawalSettlementFactIsCanonical(settlement)) return false;
+        const auto it{m_requests.find(settlement.receipt.receipt_id)};
+        if (it == m_requests.end()) return false;
+        const modern::WithdrawalReceipt& request{it->second};
+        if (request.receipt_id != settlement.receipt.receipt_id ||
+            request.asset != settlement.receipt.asset ||
+            request.amount != settlement.receipt.amount ||
+            request.destination !=
+                settlement.receipt.destination_owner_commitment ||
+            request.vault_commitment != settlement.receipt.vault_id) {
+            return false;
+        }
+        return ConsumeRequest(request.receipt_id);
     }
 
     // ---- Solvency invariant ---------------------------------------------
@@ -302,9 +347,7 @@ public:
             if (key.second != asset) continue;
             total += balance.available + balance.reserved; // bounded by custody
         }
-        for (const auto& [id, request] : m_requests) {
-            if (request.asset == asset) total += request.amount;
-        }
+        total += PendingWithdrawals(asset);
         return total;
     }
 

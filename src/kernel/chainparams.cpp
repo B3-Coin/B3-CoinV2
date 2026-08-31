@@ -14,6 +14,8 @@
 #include <kernel/messagestartchars.h>
 #include <legacy/consensus.h>
 #include <legacy/primitives.h>
+#include <modern/chain_domain.h>
+#include <modern/fn_genesis.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
@@ -160,6 +162,35 @@ public:
         // RATIFIED (owner ruling 2026-08-21): the corridor pays fees only --
         // no subsidy. Stated explicitly because an unset reward fails closed.
         consensus.transition_pow_reward = 0;
+        // Historical FN Genesis is mandatory in the first corridor block.
+        // The manifest/root remain blank until the sealed through-H scan, so
+        // this independent switch keeps a future X-only build fail-closed.
+        consensus.fn_genesis_required = true;
+        // Owner-ratified bridge-backed bUSD identity (2026-09-01): Ethereum
+        // mainnet USDT locked in the published vault, represented 1:1 at six
+        // decimals. The owner selected managed withdrawals for transition v1,
+        // but identity and mode alone cannot mint. Every concrete stage-4
+        // security value intentionally remains unset, so mainnet is
+        // fail-closed until the bootstrap, caps, adapter/version, activation,
+        // immutable authority, vault-code hash and withdrawal-rules commitment
+        // are approved in a reviewed pinning commit before activation.
+        Consensus::BridgeAssetParams busd;
+        busd.asset = Consensus::ETHEREUM_MAINNET_BUSD_IDENTITY;
+        busd.withdrawal_mode = Consensus::BridgeWithdrawalMode::MANAGED_V1;
+        Consensus::BridgeManagedWithdrawalPins managed;
+        managed.authority_address =
+            Consensus::BUSD_ETHEREUM_MANAGED_AUTHORITY;
+        managed.vault_runtime_code_hash =
+            Consensus::BUSD_ETHEREUM_VAULT_RUNTIME_CODE_HASH;
+        managed.withdrawal_rules_version =
+            Consensus::MANAGED_WITHDRAWAL_RULES_VERSION_V1;
+        // The versioned operating rules are not yet ratified/committed. This
+        // deliberate null keeps BridgeMintParamsReady false even though the
+        // independently observed immutable deployment facts are now pinned.
+        busd.managed_withdrawal = managed;
+        consensus.busd_bridge = busd;
+        assert(Consensus::BridgeAssetIdentityValid(consensus.busd_bridge->asset));
+        assert(!Consensus::BridgeMintParamsReady(*consensus.busd_bridge));
         // RATIFIED (owner ruling 2026-08-21): minimum STAKE principal is
         // 333 modern B3 (the kB3 nomination: 1 modern B3 = 1,000 legacy B3
         // = 1e9 base units), i.e. 333,000 legacy-denomination B3. Inert
@@ -786,8 +817,108 @@ public:
             pos.halving_interval = b3.halving_interval;
             pos.treasury_percent = static_cast<uint32_t>(b3.treasury_percent);
             pos.treasury_script = b3.treasury_script;
+            if (b3.flowmesh_test && pos.treasury_script.empty()) {
+                // Deterministic functional-test wallet #0 legacy P2PKH. The
+                // value is test scaffolding only; callers may still override
+                // it explicitly with -b3treasuryscript.
+                pos.treasury_script = {
+                    OP_DUP, OP_HASH160, 0x14,
+                    0x2b, 0x45, 0x69, 0x20, 0x36, 0x94, 0xfc, 0x99,
+                    0x7e, 0x13, 0xf2, 0xc0, 0xa1, 0x38, 0x3b, 0x9e,
+                    0x16, 0xc7, 0x7a, 0x0d,
+                    OP_EQUALVERIFY, OP_CHECKSIG,
+                };
+            }
             assert(pos.Valid());
             consensus.modern_pos = pos;
+
+            if (b3.flowmesh_test) {
+                // Four deterministic functional-test wallets share the
+                // synthetic historical population. Every right is unique and
+                // raw-byte sorted, exactly like a sealed mainnet manifest.
+                static constexpr std::array<std::array<unsigned char, 20>, 4>
+                    TEST_RECIPIENTS{{
+                        {0x2b, 0x45, 0x69, 0x20, 0x36, 0x94, 0xfc, 0x99,
+                         0x7e, 0x13, 0xf2, 0xc0, 0xa1, 0x38, 0x3b, 0x9e,
+                         0x16, 0xc7, 0x7a, 0x0d},
+                        {0x83, 0xa8, 0x8d, 0x66, 0xf7, 0xac, 0x4a, 0xce,
+                         0x0d, 0x24, 0xbb, 0x6e, 0x58, 0xb7, 0x5a, 0xbb,
+                         0x9f, 0x64, 0x95, 0xe7},
+                        {0x4f, 0xf7, 0x85, 0xb8, 0x22, 0x1d, 0xc2, 0x06,
+                         0x31, 0x4c, 0xa1, 0x2e, 0x65, 0x77, 0x3a, 0x87,
+                         0x6d, 0xff, 0x30, 0xff},
+                        {0x6b, 0x6a, 0x33, 0x90, 0xff, 0xbd, 0xdf, 0x97,
+                         0xcb, 0x36, 0xf7, 0x10, 0x7c, 0x07, 0x39, 0xb1,
+                         0xe3, 0xe5, 0x50, 0xda},
+                    }};
+
+                consensus.fn_genesis_required = true;
+                consensus.fn_genesis_manifest.reserve(
+                    Consensus::HISTORICAL_FN_PROVEN_FLOOR);
+                for (uint32_t i{0};
+                     i < Consensus::HISTORICAL_FN_PROVEN_FLOOR; ++i) {
+                    Consensus::FnGenesisRight right;
+                    WriteBE32(right.pod_id.begin(), i + 1);
+                    right.recipient_key_hash =
+                        TEST_RECIPIENTS[i % TEST_RECIPIENTS.size()];
+                    consensus.fn_genesis_manifest.push_back(right);
+                }
+                const auto domain{modern::ModernChainDomain(
+                    consensus.hashGenesisBlock, *consensus.legacy_final_hash)};
+                assert(domain.has_value());
+                consensus.fn_genesis_rights_root =
+                    modern::ComputeFnGenesisManifestRootV1(
+                        *domain,
+                        static_cast<uint32_t>(*consensus.hard_fork_height),
+                        consensus.fn_genesis_manifest);
+                assert(consensus.fn_genesis_rights_root.has_value());
+
+                const int modern_start{
+                    *consensus.hard_fork_height + b3.corridor_length};
+                consensus.fn_pod_activation_height = modern_start + 1;
+                consensus.asset_activation_height = modern_start + 2;
+                consensus.flowmesh_activation_height =
+                    *consensus.asset_activation_height +
+                    Consensus::FLOWMESH_ANCHOR_DEPTH;
+
+                // Explicitly complete TEST-ONLY bridge configuration. It
+                // exercises the same fail-closed parameter shape while the
+                // chain domain ensures this regtest bUSD AssetId cannot equal
+                // mainnet's. No value below is a production recommendation.
+                Consensus::BridgeAssetParams busd;
+                busd.asset = Consensus::ETHEREUM_MAINNET_BUSD_IDENTITY;
+                busd.implementation_or_adapter = uint256{uint8_t{1}};
+                busd.adapter_version = 1;
+                busd.recipient_encoding_version =
+                    Consensus::BRIDGE_RECIPIENT_VERSION_P2PKH_V1;
+                busd.activation_height = consensus.flowmesh_activation_height;
+                busd.mint_caps = Consensus::BridgeMintCaps{
+                    .max_per_block = 1'000'000'000,
+                    .max_per_epoch = 10'000'000'000,
+                    .epoch_length_blocks = static_cast<uint32_t>(b3.epoch_length),
+                };
+                Consensus::EthereumLightClientPins light_client;
+                light_client.trusted_checkpoint_root = uint256{uint8_t{2}};
+                light_client.trusted_checkpoint_slot = 1;
+                light_client.genesis_validators_root = uint256{uint8_t{3}};
+                light_client.fork_schedule = {{0, {0, 0, 0, 0}}};
+                light_client.fork_schedule_valid_through_epoch = 1'000'000;
+                light_client.min_sync_committee_participants =
+                    Consensus::ETHEREUM_SYNC_COMMITTEE_SUPERMAJORITY;
+                light_client.max_sync_lag_slots = 8'192;
+                busd.light_client = std::move(light_client);
+                busd.withdrawal_mode =
+                    Consensus::BridgeWithdrawalMode::MANAGED_V1;
+                Consensus::BridgeManagedWithdrawalPins withdrawal;
+                withdrawal.authority_address.fill(0x42);
+                withdrawal.vault_runtime_code_hash = uint256{uint8_t{4}};
+                withdrawal.withdrawal_rules_version =
+                    Consensus::MANAGED_WITHDRAWAL_RULES_VERSION_V1;
+                withdrawal.withdrawal_rules_commitment = uint256{uint8_t{5}};
+                busd.managed_withdrawal = withdrawal;
+                assert(Consensus::BridgeMintParamsReady(busd));
+                consensus.busd_bridge = std::move(busd);
+            }
         }
 
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.

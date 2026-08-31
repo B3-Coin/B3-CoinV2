@@ -103,9 +103,10 @@ BOOST_AUTO_TEST_CASE(mpa_changes_ptxid_not_txid)
     a2.mpa[0].payload[100] ^= 0x01;
     BOOST_CHECK(!(CTransaction{a2}.GetPtxid() == ta.GetPtxid()));
     BOOST_CHECK(CTransaction{a2}.GetHash() == ta.GetHash());
-    // wtxid (existing witness hash) is not affected by MPA either — ptxid is the
-    // only identifier that commits to the MPA.
-    BOOST_CHECK(ta.GetWitnessHash() == tb.GetWitnessHash());
+    // The existing wtxid-shaped relay slot is the ptxid mechanism on B3, so
+    // exact MPA variants cannot alias in mempool/orphan/reject maps.
+    BOOST_CHECK(ta.GetWitnessHash() != tb.GetWitnessHash());
+    BOOST_CHECK(ta.GetWitnessHash().ToUint256() == ta.GetPtxid().ToUint256());
 }
 
 BOOST_AUTO_TEST_CASE(record_order_and_noncanonical)
@@ -161,8 +162,9 @@ BOOST_AUTO_TEST_CASE(witness_and_witness_plus_mpa)
     wm.mpa.push_back(Rec(5, Ev(0x33)));
     const CTransaction twm{wm};
     BOOST_CHECK(twm.GetHash() == tw.GetHash());
-    BOOST_CHECK(twm.GetWitnessHash() == tw.GetWitnessHash()); // wtxid ignores MPA
-    BOOST_CHECK(!(twm.GetPtxid() == tw.GetPtxid()));            // ptxid commits to it
+    BOOST_CHECK(twm.GetWitnessHash() != tw.GetWitnessHash()); // full relay id commits to MPA
+    BOOST_CHECK(twm.GetWitnessHash().ToUint256() == twm.GetPtxid().ToUint256());
+    BOOST_CHECK(!(twm.GetPtxid() == tw.GetPtxid()));
     CMutableTransaction wm2{wm};
     wm2.vin[0].scriptWitness.stack[0][0] ^= 0x01;               // witness change also changes ptxid
     BOOST_CHECK(!(CTransaction{wm2}.GetPtxid() == twm.GetPtxid()));
@@ -203,7 +205,7 @@ BOOST_AUTO_TEST_CASE(state_identity_stays_txid)
     // Outpoints / UTXO keys use txid.
     CCoinsView base;
     CCoinsViewCache view{&base};
-    AddCoins(view, t, 100, /*check=*/false, 0, /*exclude_metadata_cells=*/true);
+    AddCoins(view, t, 100, /*check=*/false, 0, /*exclude_modern_cells=*/true);
     BOOST_CHECK(view.HaveCoin(COutPoint{t.GetHash(), 0}));
     BOOST_CHECK(!view.HaveCoin(COutPoint{Txid::FromUint256(t.GetPtxid().ToUint256()), 0}));
     // Transaction merkle root uses txid.

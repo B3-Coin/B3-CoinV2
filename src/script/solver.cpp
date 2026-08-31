@@ -3,6 +3,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <modern/asset_output.h>
 #include <modern/metadata_cell.h>
 #include <modern/stake.h>
 #include <pubkey.h>
@@ -140,7 +141,9 @@ std::optional<std::pair<int, std::vector<std::span<const unsigned char>>>> Match
     return std::pair{*threshold, std::move(keyspans)};
 }
 
-TxoutType Solver(const CScript& scriptPubKey, std::vector<std::vector<unsigned char>>& vSolutionsRet)
+TxoutType Solver(const CScript& scriptPubKey,
+                 std::vector<std::vector<unsigned char>>& vSolutionsRet,
+                 const bool enable_asset_owner)
 {
     vSolutionsRet.clear();
 
@@ -159,6 +162,25 @@ TxoutType Solver(const CScript& scriptPubKey, std::vector<std::vector<unsigned c
         const auto owner{modern::StakeOwnerScript(scriptPubKey)};
         if (!owner) return TxoutType::NONSTANDARD;
         return Solver(*owner, vSolutionsRet);
+    }
+
+    // B3A1 asset carrier: spendable OWNER/FN outputs solve exactly as their
+    // ordinary owner suffix (the signature commits to the full spending
+    // transaction; asset fields are bound by the spent outpoint and asset
+    // conservation). Canonical BURN and keyless DEX_VAULT outputs use the
+    // Modern cell shape PUSH(payload) DROP FALSE (never OP_RETURN); NULL_DATA
+    // is only the internal no-destination standardness classification. Unlike
+    // BURN, a vault remains a typed UTXO. Malformed namespace claims are never
+    // reinterpreted as some other standard script.
+    if (enable_asset_owner && modern::ClaimsAssetOutput(scriptPubKey)) {
+        if (const auto owner{modern::AssetOwnerScript(scriptPubKey)}) {
+            return Solver(*owner, vSolutionsRet);
+        }
+        if (modern::IsAssetBurnOutput(CTxOut{0, scriptPubKey}) ||
+            modern::IsDexVaultScript(scriptPubKey)) {
+            return TxoutType::NULL_DATA;
+        }
+        return TxoutType::NONSTANDARD;
     }
 
     // Shortcut for pay-to-script-hash, which are more constrained than the other types:
