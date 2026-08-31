@@ -1075,6 +1075,10 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         const CCoinControl& coin_control,
         bool sign) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
+    // B3 staking-only unlock: keys are usable for block signing only.
+    if (wallet.m_unlock_staking_only) {
+        return util::Error{_("Wallet is unlocked for staking only; unlock it fully to send funds")};
+    }
     AssertLockHeld(wallet.cs_wallet);
 
     FastRandomContext rng_fast;

@@ -318,7 +318,7 @@ WalletModel::EncryptionStatus WalletModel::getEncryptionStatus() const
     }
     else
     {
-        return Unlocked;
+        return m_wallet->unlockStakingOnly() ? UnlockedStakingOnly : Unlocked;
     }
 }
 
@@ -327,7 +327,7 @@ bool WalletModel::setWalletEncrypted(const SecureString& passphrase)
     return m_wallet->encryptWallet(passphrase);
 }
 
-bool WalletModel::setWalletLocked(bool locked, const SecureString &passPhrase)
+bool WalletModel::setWalletLocked(bool locked, const SecureString &passPhrase, bool staking_only)
 {
     if(locked)
     {
@@ -336,8 +336,8 @@ bool WalletModel::setWalletLocked(bool locked, const SecureString &passPhrase)
     }
     else
     {
-        // Unlock
-        return m_wallet->unlock(passPhrase);
+        // Unlock (optionally for staking only)
+        return m_wallet->unlock(passPhrase, staking_only);
     }
 }
 

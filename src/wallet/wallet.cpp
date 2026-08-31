@@ -622,7 +622,7 @@ static bool DecryptMasterKey(const SecureString& wallet_passphrase, const CMaste
     return true;
 }
 
-bool CWallet::Unlock(const SecureString& strWalletPassphrase)
+bool CWallet::Unlock(const SecureString& strWalletPassphrase, const bool staking_only)
 {
     CKeyingMaterial plain_master_key;
 
@@ -636,6 +636,8 @@ bool CWallet::Unlock(const SecureString& strWalletPassphrase)
             if (Unlock(plain_master_key)) {
                 // Now that we've unlocked, upgrade the descriptor cache
                 UpgradeDescriptorCache();
+                // A full unlock clears a previous staking-only state.
+                m_unlock_staking_only = staking_only;
                 return true;
             }
         }
@@ -3446,6 +3448,7 @@ bool CWallet::Lock()
         }
     }
 
+    m_unlock_staking_only = false;
     NotifyStatusChanged(this);
     return true;
 }

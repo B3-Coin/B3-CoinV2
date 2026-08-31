@@ -258,6 +258,12 @@ void WalletView::changePassphrase()
     GUIUtil::ShowModalDialogAsynchronously(dlg);
 }
 
+void WalletView::lockWallet()
+{
+    if (!walletModel) return;
+    walletModel->setWalletLocked(true);
+}
+
 void WalletView::unlockWallet()
 {
     // Unlock wallet when requested by wallet model

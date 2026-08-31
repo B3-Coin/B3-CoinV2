@@ -505,6 +505,15 @@ public:
     bool IsLocked() const override;
     bool Lock();
 
+    /**
+     * Staking-only unlock (B3): the crypter is open so block signing and
+     * the validator key work, but every transaction-creating or signing
+     * surface refuses until a FULL unlock. Reset by Lock(). Guarded at
+     * the two spend choke points: CreateTransactionInternal and
+     * EnsureWalletIsUnlocked.
+     */
+    std::atomic<bool> m_unlock_staking_only{false};
+
     /** Interface to assert chain access */
     bool HaveChain() const { return m_chain ? true : false; }
 
@@ -611,7 +620,7 @@ public:
     // Used to prevent deleting the passphrase from memory when it is still in use.
     RecursiveMutex m_relock_mutex;
 
-    bool Unlock(const SecureString& strWalletPassphrase);
+    bool Unlock(const SecureString& strWalletPassphrase, bool staking_only = false);
     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
     bool EncryptWallet(const SecureString& strWalletPassphrase);
 

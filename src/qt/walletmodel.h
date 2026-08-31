@@ -69,7 +69,8 @@ public:
         NoKeys,       // wallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)
         Unencrypted,  // !wallet->HasEncryptionKeys()
         Locked,       // wallet->HasEncryptionKeys() && wallet->IsLocked()
-        Unlocked      // wallet->HasEncryptionKeys() && !wallet->IsLocked()
+        Unlocked,     // wallet->HasEncryptionKeys() && !wallet->IsLocked()
+        UnlockedStakingOnly // unlocked, but only block signing is permitted
     };
 
     OptionsModel* getOptionsModel() const;
@@ -103,7 +104,7 @@ public:
     // Wallet encryption
     bool setWalletEncrypted(const SecureString& passphrase);
     // Passphrase only needed when unlocking
-    bool setWalletLocked(bool locked, const SecureString &passPhrase=SecureString());
+    bool setWalletLocked(bool locked, const SecureString &passPhrase=SecureString(), bool staking_only=false);
     bool changePassphrase(const SecureString &oldPass, const SecureString &newPass);
 
     // RAII object for unlocking wallet, returned by requestUnlock()
