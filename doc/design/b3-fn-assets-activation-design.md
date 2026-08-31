@@ -72,18 +72,27 @@ to the recipient's address.**
   remains possible until block 810,000 at the 15M-old-B3 tier; only
   the through-H run is final.
 
-## 5. Historical issuance: FN GENESIS at height A1 (owner design)
+## 5. Historical issuance: FN GENESIS in the corridor (owner design,
+## refined 2026-09-01: "use the PoW corridor's empty coinbase space")
 
-**At the FN activation height A1, the protocol itself creates all
-historical FN Coins — no issuance transactions exist.**
+**Block 810,001 — the corridor's first block — is FN Genesis. Its
+coinbase creates all historical FN Coins; no issuance transactions
+exist.**
 
-- The A1 block (or a deterministic spread over the first few blocks,
-  e.g. 500 outputs per block) MUST carry the FN genesis outputs,
-  derived byte-for-byte from the pinned rights list:
-  `3,500 × [FN output: 1 FN, owner commitment = legacy address #n]`.
-- The block producer cannot choose, omit, or redirect any of them; a
-  block with the wrong set is invalid. Every node validates equality
-  against the pinned list.
+- Corridor blocks are PoW with a plain, subsidy-free coinbase and
+  near-zero traffic — ample room. The 810,001 coinbase MUST carry,
+  in addition to its fees-only rule, the FN genesis outputs derived
+  byte-for-byte from the pinned rights list:
+  `3,500 × [FN output: 1 FN, owner commitment = legacy address #n]`
+  (~300 KB; one block).
+- Any miner produces the identical required set or the block is
+  invalid. Every node validates equality against the pinned list.
+- **Mint early, unlock later (safety split):** the coins exist and are
+  wallet-visible from 810,001, but the FN transfer rule (§3) activates
+  at a height weeks after M — the one-shot deterministic genesis runs
+  at the boundary, while the forever-running spend-validation code
+  still gets its modern-era soak. Messaging: "your FN is minted and
+  yours; transfers unlock at height X".
 - Holder experience: nothing to do, ever. Migrate the old wallet
   whenever; the FN Coin is already at the address that earned it in
   2017. No claims, no deadlines; dormant holders keep their rights
@@ -123,9 +132,9 @@ Mandatory before the transition release ships.
 
 ## 8. Open items (small, non-blocking)
 
-- Activation height spacing (proposal: FN Genesis ~1 week into the
-  modern era, assets ~2 weeks; owner blesses the numbers when the code
-  is ready).
+- Height spacing (proposal: FN transfer unlock ~2 weeks after M,
+  assets ~2 weeks; owner blesses the numbers when the code is ready;
+  FN Genesis itself is fixed at 810,001).
 - A1 block-size handling: one block vs deterministic spread.
 - Canonical serialization of the rights-list entries (fixed before the
   dry run so the root is stable).
