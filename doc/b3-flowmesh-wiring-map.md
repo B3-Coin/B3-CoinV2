@@ -293,4 +293,41 @@ work — that part is done and tested.
 
 ## 6. Spike results
 
-*(filled in after build + smoke test; see the commits on this branch)*
+Environment: macOS (Darwin 25.5), `cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo`,
+`cmake --build build -j 10`. Branch `experiment/flowmesh-consensus-wiring`
+(base `27a6456`).
+
+**Build**: clean before and after the slice (exit 0, no new warnings).
+
+**Unit tests**:
+
+    build/bin/test_bitcoin --run_test=flowmesh_sync_tests,flowmesh_ledger_tests,flowmesh_batch_tests
+    Running 40 test cases...  *** No errors detected
+
+**Manual smoke (fresh regtest datadir)**:
+
+1. `b3coind -regtest -b3flowmeshdev -listen=0 -connect=0` — starts;
+   `debug.log`: "FlowMesh dev validator started (REGTEST spike):
+   store=<datadir>/regtest/flowmesh-dev sequence=0".
+2. `b3coin-cli -regtest getflowmeshinfo` — `running: true`, `halt: "none"`,
+   `threshold: 1`, `sequence: 0`, all-zero `last_hash`, non-trivial
+   `state_root` (the canonical empty market state), derived
+   `execution_config_id`, `current_anchor: {height: -1, hash: 0x0}` (chain
+   shorter than `FLOWMESH_ANCHOR_DEPTH`).
+3. After `generatetoaddress 40 ...`: `current_anchor` reported
+   `{height: 10, hash: <block 10>}` — tip 40 minus the ratified depth 30;
+   the real `ChainAnchorPolicy` tracks the live chainstate.
+4. `b3coin-cli stop` — clean shutdown ("Shutdown done"), runtime destroyed
+   before chainman.
+5. Restart with the same datadir — `StartValidator` reopened the existing
+   store (marker/domain/quorum revalidated, empty log replayed):
+   `running: true`, `halt: "none"`, `sequence: 0`.
+6. Negative gate: `b3coind -testnet -b3flowmeshdev -networkactive=0
+   -listen=0 -connect=0` refused init:
+   "Error: -b3flowmeshdev is a regtest-only development option and must
+   never run on this chain." (checked in `AppInitParameterInteraction`,
+   before any subsystem starts).
+
+What the slice deliberately does NOT do: no proposing/attesting/committing
+(no transport drives the MeshNode), no deposits (fail-closed verifier), no
+block validation, mempool, or consensus involvement of any kind.
