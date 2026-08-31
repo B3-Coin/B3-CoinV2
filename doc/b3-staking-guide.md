@@ -56,13 +56,13 @@ duties** — if you change your mind before M, spend the output and the
 stake is removed. Slashing and validator duties belong to the modern
 era, after M.
 
-## How to stake (both are the same operation)
+## How to stake
 
-**Qt (B3 Hive app):** open the **Stake** page, enter an amount of
-333 B3 or more, confirm. The page shows the stake's status as it
-confirms and matures.
+The current Qt **Stake** page is monitoring-only. It shows wallet state and
+reward history, but its staking controls have no backend in this release and
+cannot create a stake.
 
-**RPC / command line:**
+Create the stake with RPC / command line:
 
     b3coin-cli createstake 1000
 
@@ -105,11 +105,11 @@ spacing — but do not aim for the deadline:
    is the designed behavior, not an outage. Watch the official channels
    for the X-pin release.
 3. **Install the X-pin release** when announced.
-4. **When the corridor starts:** open the Stake page (or run
-   `createstake`), stake 333 B3 or more, early in the corridor.
-5. **Verify:** `getstakinginfo` (or the Stake page) shows your stake
-   ACTIVE. Once it is, you are in the set at M — leave the node
-   running and it stakes.
+4. **When the corridor starts:** run `createstake` for 333 B3 or more,
+   early in the corridor.
+5. **Verify:** use `getstakinginfo` as the authoritative status and wait for
+   it to show your stake ACTIVE. Once it is, you are in the set at M — leave
+   the node running and it stakes.
 
 ## Questions people will ask
 
