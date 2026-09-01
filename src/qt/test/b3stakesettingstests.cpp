@@ -59,24 +59,41 @@ void B3StakeSettingsTests::settingsPageMirrorsWalletActions()
 {
     B3SettingsPage page;
     QAction encrypt(QStringLiteral("Encrypt Wallet…"), &page);
+    QAction unlock(QStringLiteral("Unlock Wallet…"), &page);
+    QAction lock(QStringLiteral("Lock Wallet"), &page);
     encrypt.setEnabled(false);
-    page.setWalletActions({&encrypt, nullptr});
+    lock.setEnabled(false);
+    page.setWalletActions({&encrypt, &unlock, &lock, nullptr});
 
-    QPushButton* button{nullptr};
+    QPushButton* encrypt_button{nullptr};
+    QPushButton* unlock_button{nullptr};
+    QPushButton* lock_button{nullptr};
     for (QPushButton* candidate : page.findChildren<QPushButton*>()) {
-        if (candidate->text() == encrypt.text()) button = candidate;
+        if (candidate->text() == encrypt.text()) encrypt_button = candidate;
+        if (candidate->text() == unlock.text()) unlock_button = candidate;
+        if (candidate->text() == lock.text()) lock_button = candidate;
     }
-    QVERIFY(button != nullptr);
-    QVERIFY(!button->isEnabled());
+    QVERIFY(encrypt_button != nullptr);
+    QVERIFY(unlock_button != nullptr);
+    QVERIFY(lock_button != nullptr);
+    QVERIFY(!encrypt_button->isEnabled());
+    QVERIFY(unlock_button->isEnabled());
+    QVERIFY(!lock_button->isEnabled());
 
     // Enabled state follows the existing action.
     encrypt.setEnabled(true);
-    QVERIFY(button->isEnabled());
+    QVERIFY(encrypt_button->isEnabled());
 
     // Clicking triggers the existing action — behavior stays with it.
-    QSignalSpy trigger_spy(&encrypt, &QAction::triggered);
-    button->click();
-    QCOMPARE(trigger_spy.count(), 1);
+    QSignalSpy unlock_spy(&unlock, &QAction::triggered);
+    unlock_button->click();
+    QCOMPARE(unlock_spy.count(), 1);
+
+    // The same button surface can switch safely from unlock to relock.
+    unlock.setEnabled(false);
+    lock.setEnabled(true);
+    QVERIFY(!unlock_button->isEnabled());
+    QVERIFY(lock_button->isEnabled());
 }
 
 void B3StakeSettingsTests::shellShowsInstalledSettingsPage()
