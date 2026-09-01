@@ -56,20 +56,31 @@ SOURCE_MAJOR=$(cmake_version_part CLIENT_VERSION_MAJOR)
 SOURCE_MINOR=$(cmake_version_part CLIENT_VERSION_MINOR)
 SOURCE_BUILD=$(cmake_version_part CLIENT_VERSION_BUILD)
 SOURCE_RC=$(cmake_version_part CLIENT_VERSION_RC)
+SOURCE_PRERELEASE=$(sed -nE 's/^set\(CLIENT_VERSION_PRERELEASE[[:space:]]+"([^"]*)"\).*$/\1/p' "$REPO/CMakeLists.txt")
 for part in "$SOURCE_MAJOR" "$SOURCE_MINOR" "$SOURCE_BUILD" "$SOURCE_RC"; do
   if [[ ! "$part" =~ '^[0-9]+$' ]]; then
     print -u2 -- "error: could not derive one numeric version value from CMakeLists.txt"
     exit 1
   fi
 done
+if [[ -n "$SOURCE_PRERELEASE" && ! "$SOURCE_PRERELEASE" =~ '^[0-9A-Za-z]+([.-][0-9A-Za-z]+)*$' ]]; then
+  print -u2 -- "error: invalid source prerelease identifier: $SOURCE_PRERELEASE"
+  exit 1
+fi
+if (( SOURCE_RC > 0 )) && [[ -n "$SOURCE_PRERELEASE" ]]; then
+  print -u2 -- "error: CLIENT_VERSION_RC and CLIENT_VERSION_PRERELEASE are mutually exclusive"
+  exit 1
+fi
 SOURCE_VERSION="$SOURCE_MAJOR.$SOURCE_MINOR.$SOURCE_BUILD"
 if (( SOURCE_RC > 0 )); then
   SOURCE_VERSION="${SOURCE_VERSION}rc${SOURCE_RC}"
+elif [[ -n "$SOURCE_PRERELEASE" ]]; then
+  SOURCE_VERSION="${SOURCE_VERSION}-${SOURCE_PRERELEASE}"
 fi
 
 VERSION_LINE=$("$BIN/b3coind" -nosettings -version 2>/dev/null | sed -n '1p')
-BINARY_VERSION=$(print -r -- "$VERSION_LINE" | sed -nE 's/^.* version v([0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?)([[:space:]].*)?$/\1/p')
-if [[ ! "$BINARY_VERSION" =~ '^[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$' ]]; then
+BINARY_VERSION=$(print -r -- "$VERSION_LINE" | sed -nE 's/^.* version v([0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+|-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?)([[:space:]].*)?$/\1/p')
+if [[ ! "$BINARY_VERSION" =~ '^[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+|-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$' ]]; then
   print -u2 -- "error: could not derive a valid version from b3coind: ${VERSION_LINE:-<no output>}"
   exit 1
 fi
@@ -81,7 +92,7 @@ fi
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd -P)
 ARCH="$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')"
-NAME="b3-hive-v${BINARY_VERSION}-unsigned-rc-${ARCH}"
+NAME="b3-hive-v${BINARY_VERSION}-unsigned-${ARCH}"
 ARCHIVE="$OUT/$NAME.tar.gz"
 CHECKSUM="$ARCHIVE.sha256"
 if [[ -e "$ARCHIVE" || -e "$CHECKSUM" ]]; then
@@ -113,9 +124,9 @@ for script in "$STAGE"/demo/*.sh; do
 done
 
 {
-  print -- "B3 Hive v${BINARY_VERSION} — UNSIGNED RELEASE CANDIDATE"
+  print -- "B3 Hive v${BINARY_VERSION} — UNSIGNED PRERELEASE"
   print -- ""
-  print -- "This archive is for release-candidate testing only."
+  print -- "This archive is for beta and release-candidate testing only."
   print -- "It is not code-signed, notarized, or an authenticated public release."
   print -- "Verify the separately published SHA-256 checksum and obtain the final"
   print -- "signed release through the official B3 distribution channel."

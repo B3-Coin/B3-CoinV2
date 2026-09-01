@@ -103,9 +103,13 @@ BOOST_FIXTURE_TEST_CASE(assembler_includes_judged_certificate_and_root, Finality
         BOOST_REQUIRE(tmpl);
         BOOST_CHECK(!tmpl->block.vtx[0]->HasMpa());
         BOOST_CHECK_EQUAL(tmpl->m_coinbase_tx.block_reward_remaining, 900);
-        BOOST_REQUIRE_EQUAL(tmpl->m_coinbase_tx.required_outputs.size(), 1U);
+        const int witness_index{GetWitnessCommitmentIndex(tmpl->block)};
+        BOOST_REQUIRE(witness_index != NO_WITNESS_COMMITMENT);
+        BOOST_REQUIRE_EQUAL(tmpl->m_coinbase_tx.required_outputs.size(), 2U);
         BOOST_CHECK(tmpl->m_coinbase_tx.required_outputs[0] ==
                     CTxOut(100, treasury_script));
+        BOOST_CHECK(tmpl->m_coinbase_tx.required_outputs[1] ==
+                    tmpl->block.vtx[0]->vout.at(static_cast<size_t>(witness_index)));
         BOOST_CHECK(tmpl->m_coinbase_tx.mpa_section.empty());
         std::optional<modern::FinalityCertificatePair> pair;
         std::string err;
@@ -153,10 +157,14 @@ BOOST_FIXTURE_TEST_CASE(assembler_includes_judged_certificate_and_root, Finality
         // serialized coinbase MPA. The normative full-form id must match.
         const node::CoinbaseTx& fields{tmpl->m_coinbase_tx};
         BOOST_CHECK_EQUAL(fields.block_reward_remaining, 900);
-        BOOST_REQUIRE_EQUAL(fields.required_outputs.size(), 3U);
+        const int witness_index{GetWitnessCommitmentIndex(block)};
+        BOOST_REQUIRE(witness_index != NO_WITNESS_COMMITMENT);
+        BOOST_REQUIRE_EQUAL(fields.required_outputs.size(), 4U);
         BOOST_CHECK(fields.required_outputs[0] == CTxOut(100, treasury_script));
         BOOST_CHECK(fields.required_outputs[1] == cb.vout[2]);
         BOOST_CHECK(fields.required_outputs[2] == cb.vout[3]);
+        BOOST_CHECK(fields.required_outputs[3] ==
+                    cb.vout.at(static_cast<size_t>(witness_index)));
         BOOST_CHECK(!fields.mpa_section.empty());
         const CTransaction rebuilt{ReconstructCoinbase(fields, CScript() << OP_TRUE)};
         BOOST_CHECK(rebuilt.GetPtxid() == cb.GetPtxid());

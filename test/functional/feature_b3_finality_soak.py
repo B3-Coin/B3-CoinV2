@@ -15,6 +15,7 @@ partition reorg that respects finality.
 """
 
 import time
+from decimal import Decimal
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_greater_than_or_equal, assert_raises_rpc_error
@@ -26,6 +27,10 @@ B3_ARGS = [
     '-b3modernregtest',
     '-b3corridorlength=160',
     '-fallbackfee=0.00001',
+    # FINALITY_KEY evidence has a 700-vbyte verification-cost floor. Keep the
+    # relay floor high enough that a wallet which prices only the base bytes
+    # would be rejected; bindfinalitykey must fund the complete MPA-aware fee.
+    '-minrelaytxfee=0.00001',
     # The soak deliberately consolidates fragmented corridor rewards. Give
     # those large synthetic transactions a test-local total-fee ceiling;
     # production wallet defaults are not under test here.
@@ -89,6 +94,10 @@ class B3FinalitySoakTest(BitcoinTestFramework):
             binds.append(n.bindfinalitykey())
             assert_equal(binds[i]['seq'], 0)
             assert_equal(binds[i]['action'], 'bind')
+            assert binds[i]['txid'] in n.getrawmempool()
+            entry = n.getmempoolentry(binds[i]['txid'])
+            assert_equal(entry['vsize'], 700)
+            assert_greater_than_or_equal(entry['fees']['base'], Decimal('0.000007'))
         self.sync_mempools(timeout=120)  # bindings + stakes relay to the miner
         self.generatetoaddress(n0, 3, addr0)  # include stake + binding txs
         for n in self.nodes:

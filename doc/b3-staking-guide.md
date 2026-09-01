@@ -34,7 +34,9 @@ File references point at the source for readers who want to verify.
 4. **Block 811,001 (M)** — modern proof of stake begins. A validator belongs
    to the first usable set only when its stake is ACTIVE **and** its confirmed,
    non-revoked `FINALITY_KEY` binding is present in the snapshot at block
-   811,000. Mainnet bootstrap requires at least four such validators.
+   811,000. Mainnet chain bootstrap requires at least two such validators.
+   FlowMesh markets separately require at least four active FN seats, and the
+   decentralized Ethereum bridge has its own stricter four-staker gate.
 
 ## What a stake is
 
@@ -71,12 +73,22 @@ Bind the validator identity to its finality key in a second transaction:
 
     b3coin-cli bindfinalitykey
 
+Binding does not require an existing stake. After the transition client is
+synced to the pinned block 810,000, an operator may broadcast
+`bindfinalitykey` before block 810,001 is assembled; the next-block mempool
+rules accept the modern transaction for inclusion in that first corridor
+block. Do not broadcast it from an earlier legacy tip.
+
 The reply shows the transaction id, your validator key, the owner
 address that holds the principal, and the activation depth. Wait for both
 transactions to confirm. Check stake and finality progress with:
 
     b3coin-cli getstakinginfo
     b3coin-cli getfinalityinfo
+
+Create a fresh full-wallet backup after the validator key is first created.
+Share only the returned public `validator_key`, public `bls_pubkey`, and
+transaction id. Never share the BLS secret, wallet file, or seed phrase.
 
 Before M, explicitly start the producer and finality signer:
 
@@ -125,7 +137,7 @@ spacing — but do not aim for the deadline:
    confirm.
 5. **Verify:** `getstakinginfo` must show the stake ACTIVE;
    `getfinalityinfo` must show a live binding and set membership. Operators
-   must coordinate at least four independent bound validators before M.
+   must coordinate at least two independent bound validators before M.
 6. **Start:** run `startstaking` and require `running: true` and
    `finality_signing: true`. Keep the node running after that.
 

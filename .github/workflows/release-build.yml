@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.source_version.outputs.version }}
+      prerelease: ${{ steps.source_version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
       - name: Derive and validate source version
@@ -35,15 +36,26 @@ jobs:
           minor=$(cmake_version_part CLIENT_VERSION_MINOR)
           build=$(cmake_version_part CLIENT_VERSION_BUILD)
           rc=$(cmake_version_part CLIENT_VERSION_RC)
+          prerelease=$(sed -nE 's/^set\(CLIENT_VERSION_PRERELEASE[[:space:]]+"([^"]*)"\).*$/\1/p' CMakeLists.txt)
           for part in "$major" "$minor" "$build" "$rc"; do
             [[ "$part" =~ ^[0-9]+$ ]] || {
               echo "Could not derive one numeric source-version component" >&2
               exit 1
             }
           done
+          if [[ -n "$prerelease" && ! "$prerelease" =~ ^[0-9A-Za-z]+([.-][0-9A-Za-z]+)*$ ]]; then
+            echo "Invalid source prerelease identifier: $prerelease" >&2
+            exit 1
+          fi
+          if (( rc > 0 )) && [[ -n "$prerelease" ]]; then
+            echo "CLIENT_VERSION_RC and CLIENT_VERSION_PRERELEASE are mutually exclusive" >&2
+            exit 1
+          fi
           source_version="$major.$minor.$build"
           if (( rc > 0 )); then
             source_version="${source_version}rc${rc}"
+          elif [[ -n "$prerelease" ]]; then
+            source_version="${source_version}-${prerelease}"
           fi
           version="$source_version"
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
@@ -60,6 +72,11 @@ jobs:
             fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          if (( rc > 0 )) || [[ -n "$prerelease" ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
   linux-x86_64:
     needs: version
@@ -405,13 +422,17 @@ jobs:
           cat SHA256SUMS.linux SHA256SUMS.win64 SHA256SUMS.win32 SHA256SUMS.macos-arm64 \
             SHA256SUMS.macos-x86_64 \
             | sort -k2 > SHA256SUMS
-      - name: Publish final GitHub release
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           notes_file="doc/release-notes-${GITHUB_REF_NAME}.md"
           test -f "$notes_file"
+          release_flags=(--prerelease=false --latest)
+          if [[ "${{ needs.version.outputs.prerelease }}" == "true" ]]; then
+            release_flags=(--prerelease=true --latest=false)
+          fi
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             is_draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
               --json isDraft --jq .isDraft)
@@ -440,7 +461,7 @@ jobs:
               --verify-tag \
               --title "B3 Hive $GITHUB_REF_NAME" \
               --notes-file "$notes_file" \
-              --draft=false --prerelease=false --latest
+              --draft=false "${release_flags[@]}"
           else
             # Keep a new release private until every asset is present. A
             # cancelled upload must never expose a partial public release.
@@ -455,5 +476,5 @@ jobs:
             gh release edit "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
-              --draft=false --prerelease=false --latest
+              --draft=false "${release_flags[@]}"
           fi

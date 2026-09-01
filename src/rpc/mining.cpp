@@ -482,7 +482,7 @@ static RPCHelpMan getmininginfo()
     if (BlockAssembler::m_last_block_num_txs) obj.pushKV("currentblocktx", *BlockAssembler::m_last_block_num_txs);
     obj.pushKV("bits", strprintf("%08x", tip.nBits));
     obj.pushKV("difficulty", GetDifficulty(tip));
-    obj.pushKV("target", GetTarget(tip, chainman.GetConsensus().powLimit).GetHex());
+    obj.pushKV("target", GetTarget(tip, chainman.GetConsensus()).GetHex());
     obj.pushKV("networkhashps",    getnetworkhashps().HandleRequest(request));
     obj.pushKV("pooledtx", mempool.size());
     BlockAssembler::Options assembler_options;
@@ -497,7 +497,7 @@ static RPCHelpMan getmininginfo()
     next.pushKV("height", next_index.nHeight);
     next.pushKV("bits", strprintf("%08x", next_index.nBits));
     next.pushKV("difficulty", GetDifficulty(next_index));
-    next.pushKV("target", GetTarget(next_index, chainman.GetConsensus().powLimit).GetHex());
+    next.pushKV("target", GetTarget(next_index, chainman.GetConsensus()).GetHex());
     obj.pushKV("next", next);
 
     if (chainman.GetParams().GetChainType() == ChainType::SIGNET) {

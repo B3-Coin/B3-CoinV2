@@ -156,12 +156,14 @@ bool IsStandardTx(const CTransaction& tx,
             return false;
         }
 
-        // BURN and DEX_VAULT are typed Modern outputs, not OP_RETURN/data
-        // carriers. Solver classifies their deliberately keyless script shape
-        // as NULL_DATA for policy plumbing, but neither consumes the unrelated
-        // -datacarriersize budget. DEX_VAULT nevertheless remains in the UTXO
-        // set; only typed BURN is excluded there.
+        // Metadata cells, BURN and DEX_VAULT are typed Modern outputs, not
+        // OP_RETURN/data carriers. Solver classifies their deliberately
+        // keyless script shapes as NULL_DATA for policy plumbing, but none
+        // consumes the unrelated -datacarriersize budget. DEX_VAULT
+        // nevertheless remains in the UTXO set; metadata cells and typed BURN
+        // are excluded there by their own Modern rules.
         if (whichType == TxoutType::NULL_DATA &&
+            !modern::IsMetadataCell(txout.scriptPubKey) &&
             !modern::IsAssetBurnOutput(txout) &&
             !modern::IsDexVaultOutput(txout)) {
             unsigned int size = txout.scriptPubKey.size();

@@ -253,10 +253,11 @@ RPCHelpMan getstakinginfo()
 }
 
 
-//! Build, fund, sign, attach the FINALITY_KEY evidence and commit a binding
-//! transaction (bind, rotate or revoke). The MPA evidence lives outside the
-//! transaction's signed identity (txid excludes it), so it is attached after
-//! funding; its own BIP340 + PoP authenticate it.
+//! Build, fund, sign and commit a FINALITY_KEY binding transaction (bind,
+//! rotate or revoke). The MPA evidence lives outside the transaction's signed
+//! identity (txid excludes it), but it must be present during funding so the
+//! wallet prices its verification-cost vsize. Its own BIP340 + PoP
+//! authenticate it.
 static UniValue SubmitFinalityKeyTx(CWallet& wallet, const CKey& identity, const std::array<unsigned char, 32>& vk,
                                     const bls::SecretKey* bls_key, const uint32_t seq, const uint256& domain,
                                     const std::string& action) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
@@ -280,19 +281,21 @@ static UniValue SubmitFinalityKeyTx(CWallet& wallet, const CKey& identity, const
     }
     if (bls_key) ev.pop = bls_key->SignPoP().Compressed();
 
-    std::vector<CRecipient> recipients{{CNoDestination{*cell}, 0, /*fSubtractFeeFromAmount=*/false}};
-    CCoinControl coin_control;
-    auto res{CreateTransaction(wallet, recipients, /*change_pos=*/std::nullopt, coin_control, /*sign=*/true)};
-    if (!res) throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, util::ErrorString(res).original);
-    // Attach the evidence record: outside txid/signatures by design.
-    CMutableTransaction mtx{*res->tx};
     CMpaRecord record;
     record.payload_type = modern::MPA_TYPE_FINALITY_KEY_EVIDENCE;
     record.payload_version = modern::MPA_VERSION_V1;
     const auto enc{ev.Encode()};
     record.payload.assign(enc.begin(), enc.end());
-    mtx.mpa = {record};
-    const CTransactionRef tx{MakeTransactionRef(std::move(mtx))};
+
+    std::vector<CRecipient> recipients{{CNoDestination{*cell}, 0, /*fSubtractFeeFromAmount=*/false}};
+    CCoinControl coin_control;
+    const ModernTransactionOptions modern_options{
+        .mpa = {record},
+        .native_disintegration = 0};
+    auto res{CreateTransaction(wallet, recipients, /*change_pos=*/std::nullopt,
+                               coin_control, /*sign=*/true, modern_options)};
+    if (!res) throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, util::ErrorString(res).original);
+    const CTransactionRef tx{res->tx};
     wallet.CommitTransaction(tx, {{"b3", "finality-key-" + action}}, /*orderForm=*/{});
 
     UniValue obj(UniValue::VOBJ);

@@ -321,8 +321,11 @@ Its claim/proof builders and verifiers have been removed. Only the numeric
 type/version registry entries 1 and 2 remain permanently inactive and rejected,
 so previously assigned bytes can never acquire a new meaning.
 
-Confirm `CLIENT_VERSION_MAJOR/MINOR/BUILD` remains `1/1/0` and
-`doc/release-notes-v1.1.0.md` is present and accurate. Flip the guard tests from
+Confirm `CLIENT_VERSION_MAJOR/MINOR/BUILD` remains `1/1/0`. For the operator
+beta, `CLIENT_VERSION_PRERELEASE` must be `beta` and
+`doc/release-notes-v1.1.0-beta.md` must be present. Before the final release,
+clear `CLIENT_VERSION_PRERELEASE` and confirm
+`doc/release-notes-v1.1.0.md` remains present and accurate. Flip the guard tests from
 the fail-closed pre-pin shape to exact value-by-value assertions for X, R0,
 manifest checksum/count/root, FN genesis height, A1, A2, A3, fee, and every
 Modern PoS parameter.
@@ -361,16 +364,20 @@ statuses. Any unexplained divergence stops the release.
 
 1. Commit and review the measured pins and production wiring.
 2. Complete the full local build, mandatory suites, and shadow-fork gate.
-3. Tag `v1.1.0`, push the release branch and tag, and let CI build all five
-   package variants.
-4. Attach binaries and SHA-256 checksums to the release. Publish X prominently
+3. To publish the operator beta, tag `v1.1.0-beta`, push the release branch and
+   tag, and let CI build all five package variants. CI must mark this release as
+   a prerelease and must not make it the latest stable release.
+4. After every release gate passes, clear `CLIENT_VERSION_PRERELEASE`, rebuild
+   and reverify the packages, then tag `v1.1.0`. Push the final tag and let CI
+   publish it as the latest stable release.
+5. Attach binaries and SHA-256 checksums to each release. Publish X prominently
    with the old-client verification command `getblockhash 810000`.
-5. Publish the full FN manifest, checksum, R, and rights root beside the release
+6. Publish the full FN manifest, checksum, R, and rights root beside the release
    so anyone can independently reproduce them.
-6. Publish and sign an update manifest only if §0's updater prerequisites are
+7. Publish and sign an update manifest only if §0's updater prerequisites are
    actually met. Otherwise give manual download links and say installation is
    manual.
-7. Announce the honest pause duration, required upgrade, FN Genesis in block
+8. Announce the honest pause duration, required upgrade, FN Genesis in block
    810,001, 30-block maturity, and the later A1/A2/A3 feature heights.
 
 ## 7. After adoption

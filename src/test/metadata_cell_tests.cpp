@@ -17,6 +17,7 @@
 #include <modern/policy.h>
 #include <modern/stake.h>
 #include <node/utxo_commitment.h>
+#include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
 #include <script/script.h>
@@ -115,6 +116,18 @@ BOOST_AUTO_TEST_CASE(carrier_grammar_round_trip_and_claims)
     BOOST_CHECK_EQUAL(spk.size(), 2u + 92u + 2u); // PUSHDATA1 + len + 92 payload + OP_DROP + OP_0
     const CScript small{Cell(8, 1, 0)};
     BOOST_CHECK_EQUAL(small.size(), 1u + 40u + 2u); // direct push opcode
+}
+
+BOOST_AUTO_TEST_CASE(typed_cells_do_not_depend_on_op_return_relay_policy)
+{
+    CMutableTransaction tx;
+    tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0});
+    tx.vout.emplace_back(0, Cell(7, 1, 52));
+    std::string error;
+    BOOST_CHECK(IsStandardTx(CTransaction{tx}, /*max_datacarrier_bytes=*/0,
+                             /*permit_bare_multisig=*/true,
+                             CFeeRate{DUST_RELAY_TX_FEE}, error,
+                             /*enable_asset_owner=*/true));
 }
 
 BOOST_AUTO_TEST_CASE(claims_that_are_malformed_are_claims_but_not_cells)
