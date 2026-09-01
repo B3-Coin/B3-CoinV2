@@ -9,7 +9,9 @@ schedule.
 Beta.1 repairs the Linux release link boundary caught by the beta build: the
 offline `b3coin-wallet` utility no longer pulls full-node bridge symbols into
 its executable. The bridge validation behavior and all consensus rules are
-unchanged.
+unchanged. Beta.1 also uses the project's portable wide-integer type for
+FlowMesh vault accounting, preserving the same checks on the genuine 32-bit
+Windows build.
 
 The release now also includes a fully static x86-64 Linux operator package
 built against musl. It contains `b3coind`, `b3coin-cli`, `b3coin-tx`,

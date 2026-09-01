@@ -19,6 +19,7 @@
 #include <node/fn_seat_index.h>
 #include <script/script.h>
 #include <sync.h>
+#include <util/int128.h>
 #include <util/thread.h>
 #include <validation.h>
 
@@ -1700,7 +1701,7 @@ std::optional<FlowMeshVaultOperation> FlowMeshService::VaultOperation(
                 error = "FlowMesh withdrawal capacity index is unavailable";
                 return std::nullopt;
             }
-            __int128 selected{0};
+            util::Signed128 selected{0};
             for (const FlowMeshVaultRecord& record : *candidates) {
                 if (!AppendLiveVaultInput(chainstate, record, inputs)) {
                     error = "FlowMesh selected vault input is not live";

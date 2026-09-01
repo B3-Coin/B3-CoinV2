@@ -17,6 +17,7 @@
 #include <node/flowmesh_vault_index.h>
 #include <node/fn_seat_index.h>
 #include <script/script.h>
+#include <util/int128.h>
 
 #include <algorithm>
 #include <map>
@@ -573,7 +574,7 @@ bool CheckFlowMeshVaultTransaction(
         modern::VaultParams params;
     };
     std::vector<VaultCoin> vault_inputs;
-    __int128 owner_native_inputs{0};
+    util::Signed128 owner_native_inputs{0};
     bool has_non_native_fee_input{false};
     for (size_t i{0}; i < tx.vin.size(); ++i) {
         std::string view_error;
@@ -684,7 +685,7 @@ bool CheckFlowMeshVaultTransaction(
         outputs.push_back(ViewedOutput{i, *view, vault_params});
     }
 
-    __int128 owner_native_outputs{0};
+    util::Signed128 owner_native_outputs{0};
     if (proof->kind == modern::FlowMeshVaultProofKind::DEPOSIT_SWEEP) {
         const auto* effect{
             std::get_if<modern::FlowMeshDepositAcceptanceV1>(&proof->effect)};
@@ -740,7 +741,7 @@ bool CheckFlowMeshVaultTransaction(
             error = "FlowMesh withdrawal must spend between one and 64 vault inputs";
             return false;
         }
-        std::map<modern::AssetId, __int128> vault_in;
+        std::map<modern::AssetId, util::Signed128> vault_in;
         for (const VaultCoin& input : vault_inputs) {
             if (input.params.kind != modern::VAULT_KIND_POOL_CHANGE ||
                 input.params.account ||
@@ -751,7 +752,7 @@ bool CheckFlowMeshVaultTransaction(
             vault_in[input.output.asset] += input.output.amount;
         }
 
-        std::map<modern::AssetId, __int128> vault_change;
+        std::map<modern::AssetId, util::Signed128> vault_change;
         std::set<modern::AssetId> change_assets;
         size_t payout_count{0};
         for (const ViewedOutput& output : outputs) {
@@ -804,10 +805,11 @@ bool CheckFlowMeshVaultTransaction(
         }
 
         for (const auto& [asset, amount_in] : vault_in) {
-            const __int128 payout{
-                asset == receipt->asset ? static_cast<__int128>(receipt->amount)
-                                        : 0};
-            const __int128 change{vault_change[asset]};
+            const util::Signed128 payout{
+                asset == receipt->asset
+                    ? static_cast<util::Signed128>(receipt->amount)
+                    : 0};
+            const util::Signed128 change{vault_change[asset]};
             if (amount_in != payout + change) {
                 error = "FlowMesh withdrawal vault inputs do not equal payout plus change";
                 return false;
@@ -830,7 +832,7 @@ bool CheckFlowMeshVaultTransaction(
 
     if (owner_native_inputs < owner_native_outputs ||
         owner_native_inputs - owner_native_outputs !=
-            static_cast<__int128>(tx_fee)) {
+            static_cast<util::Signed128>(tx_fee)) {
         error = "FlowMesh vault miner fee is not funded only by owner-native value";
         return false;
     }
