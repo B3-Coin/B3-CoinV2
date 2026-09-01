@@ -1,5 +1,15 @@
 # B3 Hive v1.1.0-beta.2 — Transition Beta
 
+The beta.2 binaries were rebuilt in place with two transition-blocker fixes.
+Block assembly now skips a competing stale `FINALITY_KEY` transaction instead
+of failing `generatetoaddress` with `finality-key-bad-seq` (or
+`finality-key-bls-key-in-use`). Legacy dump recovery into a blank descriptor
+wallet now also creates fresh active receiving/change descriptor chains, so
+the recovered wallet can fund `bindfinalitykey` and other modern transactions
+without first running `migratewallet`. Operators who downloaded an earlier
+beta.2 build should replace it and verify it against the newly published
+checksums.
+
 This prerelease keeps the consensus and sealed-history commitments from
 v1.1.0-beta.1: legacy height 810,000 and its hash, the deterministic 3,592-row
 historical FN Genesis manifest, the temporary proof-of-work corridor, Modern
