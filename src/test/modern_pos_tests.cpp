@@ -23,6 +23,7 @@
 #include <script/script.h>
 #include <uint256.h>
 #include <util/chaintype.h>
+#include <util/strencodings.h>
 #include <util/time.h>
 #include <validation.h>
 
@@ -40,64 +41,91 @@ using namespace b3test;
 
 BOOST_FIXTURE_TEST_SUITE(modern_pos_tests, BasicTestingSetup)
 
-//! The provisional-parameter guard demanded by the frozen V1 spec (§9):
-//! no shipped network may configure the REVISABLE_BEFORE_MAINNET modern-PoS
-//! block, and no shipped network may carry a test-only injection point.
-//! While modern_pos is unset, modern-PoS validation and production fail
-//! closed, so a forgotten ratification cannot silently activate scaffolding
-//! numbers on a real chain.
-BOOST_AUTO_TEST_CASE(no_provisional_parameters_on_shipped_networks)
+//! Mainnet's sealed transition pins every modern-PoS value explicitly. Other
+//! shipped networks remain unconfigured, and no production chain may carry a
+//! test-only injection point.
+BOOST_AUTO_TEST_CASE(mainnet_release_parameters_are_exact)
 {
-    for (const ChainType chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4,
+    const auto params{CreateChainParams(*m_node.args, ChainType::MAIN)};
+    const Consensus::Params& consensus{params->GetConsensus()};
+
+    BOOST_CHECK_EQUAL(consensus.hard_fork_height.value_or(0), 810'001);
+    BOOST_CHECK(consensus.legacy_final_hash == uint256{
+        "2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6"});
+    BOOST_CHECK_EQUAL(consensus.transition_pow_length, 1'000);
+    BOOST_CHECK_EQUAL(consensus.transition_pow_min_spacing, 60);
+    BOOST_CHECK_EQUAL(consensus.transition_pow_max_future, 120);
+    BOOST_CHECK_EQUAL(consensus.transition_pow_bits.value_or(0), 0x1f008000U);
+    BOOST_CHECK_EQUAL(consensus.transition_pow_reward.value_or(-1), 0);
+    BOOST_CHECK_EQUAL(consensus.min_stake_amount.value_or(-1),
+                      333 * CAmount{1'000'000'000});
+    BOOST_CHECK(consensus.fn_genesis_required);
+    BOOST_CHECK_EQUAL(consensus.fn_genesis_manifest_version, 1);
+    BOOST_CHECK_EQUAL(consensus.fn_genesis_manifest.size(), 3'592U);
+    BOOST_CHECK(consensus.fn_genesis_rights_root == uint256{
+        "e8f282a7dcaa9a8fbcfcc5c22ba4f456e5b50968fcf899aaacdaca65bef898ec"});
+
+    BOOST_REQUIRE(consensus.modern_pos.has_value());
+    const Consensus::ModernPosParams& pos{*consensus.modern_pos};
+    BOOST_CHECK(pos.Valid());
+    BOOST_CHECK_EQUAL(pos.block_interval_seconds, 60);
+    BOOST_CHECK_EQUAL(pos.round_seconds, 30);
+    BOOST_CHECK_EQUAL(pos.f0_num, 1U);
+    BOOST_CHECK_EQUAL(pos.f0_den, 1U);
+    BOOST_CHECK_EQUAL(pos.sentinel_bits, 0x207fffffU);
+    BOOST_CHECK_EQUAL(pos.max_future_seconds, 120);
+    BOOST_CHECK_EQUAL(pos.reward, 19'836'712'254);
+    BOOST_CHECK_EQUAL(pos.halving_interval, 525'600);
+    BOOST_CHECK_EQUAL(pos.treasury_percent, 10U);
+    BOOST_CHECK(pos.treasury_script == ParseHex(
+        "76a91412602418ffc74640e37f1a73d0cdc255d2a07c3588ac"));
+    BOOST_REQUIRE(pos.reorg_horizon.has_value());
+    BOOST_CHECK_EQUAL(*pos.reorg_horizon, 1'440);
+    BOOST_CHECK_EQUAL(pos.finality_epoch_blocks, 1'440);
+    BOOST_CHECK_EQUAL(pos.checkpoint_interval, 10);
+    BOOST_CHECK_EQUAL(pos.checkpoint_depth, 12);
+    BOOST_CHECK_EQUAL(pos.max_epoch_extension, 10'080);
+    BOOST_CHECK_EQUAL(pos.min_finality_set, 4);
+
+    BOOST_CHECK(consensus.test_only_modern_pos_validator == nullptr);
+    BOOST_CHECK(!consensus.test_only_asset_policies_active);
+    BOOST_REQUIRE(consensus.fn_pod_activation_height.has_value());
+    BOOST_REQUIRE(consensus.asset_activation_height.has_value());
+    BOOST_REQUIRE(consensus.flowmesh_activation_height.has_value());
+    BOOST_CHECK_EQUAL(*consensus.fn_pod_activation_height, 812'000);
+    BOOST_CHECK_EQUAL(*consensus.asset_activation_height, 813'000);
+    BOOST_CHECK_EQUAL(*consensus.flowmesh_activation_height, 815'000);
+    BOOST_CHECK(Consensus::FnAssetActivationScheduleConfigured(consensus));
+    BOOST_CHECK(Consensus::FlowMeshSeatBindingScheduleConfigured(consensus));
+    BOOST_CHECK_EQUAL(*consensus.flowmesh_activation_height -
+                          *consensus.asset_activation_height,
+                      2'000);
+    BOOST_CHECK(!Consensus::FlowMeshRulesActive(814'999, consensus));
+    BOOST_CHECK(Consensus::FlowMeshRulesActive(815'000, consensus));
+    BOOST_REQUIRE(consensus.busd_bridge.has_value());
+    BOOST_CHECK(!consensus.busd_bridge->activation_height.has_value());
+}
+
+BOOST_AUTO_TEST_CASE(other_shipped_networks_have_no_transition_parameters)
+{
+    for (const ChainType chain : {ChainType::TESTNET, ChainType::TESTNET4,
                                   ChainType::SIGNET, ChainType::REGTEST}) {
         const auto params{CreateChainParams(*m_node.args, chain)};
         const Consensus::Params& consensus{params->GetConsensus()};
-        BOOST_CHECK_MESSAGE(!consensus.modern_pos.has_value(),
-                            "modern_pos configured on a shipped network");
-        BOOST_CHECK_MESSAGE(consensus.test_only_modern_pos_validator == nullptr,
-                            "test-only PoS validator set on a shipped network");
-        BOOST_CHECK_MESSAGE(!consensus.test_only_asset_policies_active,
-                            "test-only asset activation set on a shipped network");
-        if (chain == ChainType::MAIN) {
-            // RATIFIED 2026-08-21: minimum STAKE principal is 333 modern B3
-            // (the kB3 nomination) = 333e9 base units.
-            BOOST_CHECK_EQUAL(consensus.min_stake_amount.value_or(-1), 333 * CAmount{1'000'000'000});
-        } else {
-            BOOST_CHECK_MESSAGE(!consensus.min_stake_amount.has_value(),
-                                "stake minimum set on a non-ratified network");
-        }
-        // v1 release shape (owner rulings 2026-08-26/27, superseding the
-        // 2026-08-23 pin gates for H): mainnet pins H = 810,000
-        // (hard_fork_height = 810,001, first non-legacy height) and the
-        // canonical corridor bits, while X stays blank -- the OD-10
-        // pause-fail-closed state. Other shipped networks stay unpinned.
-        if (chain == ChainType::MAIN) {
-            BOOST_CHECK_EQUAL(consensus.hard_fork_height.value_or(0), 810'001);
-            BOOST_CHECK_EQUAL(consensus.transition_pow_bits.value_or(0), 0x1f008000U);
-            BOOST_CHECK(consensus.fn_genesis_required);
-        } else {
-            BOOST_CHECK_MESSAGE(!consensus.transition_pow_bits.has_value(),
-                                "provisional corridor difficulty set on a shipped network");
-            BOOST_CHECK_MESSAGE(!consensus.hard_fork_height.has_value(),
-                                "hard_fork_height pinned on a shipped network before the pin gates");
-            BOOST_CHECK(!consensus.fn_genesis_required);
-        }
-        BOOST_CHECK_MESSAGE(!consensus.legacy_final_hash.has_value(),
-                            "legacy_final_hash pinned on a shipped network before the X-pin release");
-        if (chain == ChainType::MAIN) {
-            // RATIFIED 2026-08-21: mainnet corridor reward is exactly 0
-            // (fees only), stated explicitly rather than defaulted.
-            BOOST_CHECK(consensus.transition_pow_reward.has_value());
-            BOOST_CHECK_EQUAL(consensus.transition_pow_reward.value_or(-1), 0);
-        } else {
-            BOOST_CHECK_MESSAGE(!consensus.transition_pow_reward.has_value(),
-                                "corridor reward set on a non-ratified network");
-        }
+        BOOST_CHECK(!consensus.modern_pos.has_value());
+        BOOST_CHECK(consensus.test_only_modern_pos_validator == nullptr);
+        BOOST_CHECK(!consensus.test_only_asset_policies_active);
+        BOOST_CHECK(!consensus.min_stake_amount.has_value());
+        BOOST_CHECK(!consensus.transition_pow_bits.has_value());
+        BOOST_CHECK(!consensus.transition_pow_reward.has_value());
+        BOOST_CHECK(!consensus.hard_fork_height.has_value());
+        BOOST_CHECK(!consensus.legacy_final_hash.has_value());
+        BOOST_CHECK(!consensus.fn_genesis_required);
     }
 }
 
-//! Structural sanity of the provisional defaults themselves.
-BOOST_AUTO_TEST_CASE(provisional_parameter_block_is_structurally_valid)
+//! Structural sanity of the parameter type's safe fixture defaults.
+BOOST_AUTO_TEST_CASE(parameter_block_is_structurally_valid)
 {
     Consensus::ModernPosParams pos{};
     BOOST_CHECK(pos.Valid());

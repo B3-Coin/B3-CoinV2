@@ -5,7 +5,12 @@
 // OD-2 reward schedule (owner rulings 2026-08-26): R0 with yearly halving
 // from M, treasury share of the subsidy only, corridor carries no subsidy.
 
+#include <chainparams.h>
+#include <common/args.h>
+#include <consensus/era.h>
 #include <consensus/modern_pos_params.h>
+#include <kernel/chainparams.h>
+#include <util/chaintype.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -14,6 +19,32 @@ using Consensus::ModernPosParams;
 using Consensus::ModernTreasuryShare;
 
 BOOST_AUTO_TEST_SUITE(modern_reward_tests)
+
+BOOST_AUTO_TEST_CASE(mainnet_uses_the_sealed_supply_reward)
+{
+    constexpr int64_t SEALED_SUPPLY{1'042'617'596'101'695'152};
+    constexpr int64_t R0{19'836'712'254};
+    static_assert(SEALED_SUPPLY / 52'560'000 == R0);
+
+    const auto chain_params{
+        CreateChainParams(ArgsManager{}, ChainType::MAIN)};
+    const Consensus::Params& consensus{chain_params->GetConsensus()};
+    BOOST_REQUIRE(consensus.modern_pos.has_value());
+    BOOST_REQUIRE(Consensus::ModernPosStartHeight(consensus).has_value());
+    const ModernPosParams& p{*consensus.modern_pos};
+    const int M{*Consensus::ModernPosStartHeight(consensus)};
+
+    BOOST_CHECK_EQUAL(M, 811'001);
+    BOOST_CHECK_EQUAL(p.reward, R0);
+    BOOST_CHECK_EQUAL(p.halving_interval, 525'600);
+    BOOST_CHECK_EQUAL(p.treasury_percent, 10U);
+    BOOST_CHECK_EQUAL(ModernBlockSubsidy(M - 1, M, p), 0);
+    BOOST_CHECK_EQUAL(ModernBlockSubsidy(M, M, p), R0);
+    BOOST_CHECK_EQUAL(ModernBlockSubsidy(M + 525'599, M, p), R0);
+    BOOST_CHECK_EQUAL(ModernBlockSubsidy(M + 525'600, M, p), R0 >> 1);
+    BOOST_CHECK_EQUAL(ModernTreasuryShare(R0, p), 1'983'671'225);
+    BOOST_CHECK_EQUAL(ModernTreasuryShare(R0 >> 1, p), 991'835'612);
+}
 
 BOOST_AUTO_TEST_CASE(halving_schedule)
 {
@@ -30,7 +61,7 @@ BOOST_AUTO_TEST_CASE(halving_schedule)
     BOOST_CHECK_EQUAL(ModernBlockSubsidy(M + 63 * 525'600, M, p), 0);   // shift saturates
     // Below M (the corridor) there is never a subsidy.
     BOOST_CHECK_EQUAL(ModernBlockSubsidy(M - 1, M, p), 0);
-    // Zero R0 = fees only forever (the shipped fail-closed default).
+    // Zero R0 = fees only forever (the safe unconfigured default).
     p.reward = 0;
     BOOST_CHECK_EQUAL(ModernBlockSubsidy(M, M, p), 0);
     // No halving interval = flat reward.
@@ -62,7 +93,7 @@ BOOST_AUTO_TEST_CASE(treasury_share)
 BOOST_AUTO_TEST_CASE(params_validity)
 {
     ModernPosParams p{};
-    BOOST_CHECK(p.Valid()); // defaults ship fail-closed and valid
+    BOOST_CHECK(p.Valid()); // safe fixture defaults are structurally valid
     p.treasury_percent = 101;
     BOOST_CHECK(!p.Valid());
     p.treasury_percent = 10;

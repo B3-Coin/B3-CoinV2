@@ -21,6 +21,24 @@ than choosing a new protocol.
 > committed architecture contract / master handoff; (3) reviewed subordinate
 > design documents; (4) implementation assumptions.
 
+> **Current mainnet transition pins (2026-09-01; superseding the pre-seal
+> deployment statements retained below).** The transition release now pins
+> H = 810,000, X =
+> `2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6`,
+> M = 811,001, sealed supply
+> S_H = 1,042,617,596,101,695,152 base units, and
+> R0 = 19,836,712,254 base units. Its embedded FN Genesis artifact contains
+> 3,592 rights, has SHA-256
+> `c80470eec785600f33fa2e69c520ff331c2b354ebf6e0a9bf8cae7d1eb5f9dca`,
+> and commits to rights root
+> `e8f282a7dcaa9a8fbcfcc5c22ba4f456e5b50968fcf899aaacdaca65bef898ec`.
+> The ratified post-M heights are A1 = 812,000, A2 = 813,000, and
+> A3 = 815,000. Any statement below that mainnet H/X, Modern-PoS parameters,
+> the FN artifact, or A1/A2/A3 are unset or pending describes the earlier
+> pre-seal release state, not the current transition release. Bridge-backed
+> bUSD remains independently fail-closed until its complete security and
+> activation envelope is pinned.
+
 Items marked *(open)* are deliberately unresolved and are tracked in
 [b3-open-decisions.md](b3-open-decisions.md).
 
@@ -422,11 +440,12 @@ version, operation, input state commitment, new state commitment, asset, amount 
 applicable, and anti-replay data. Otherwise cross-policy or cross-asset replay becomes
 possible.
 
-## 28. Modern PoS — implemented, mainnet pins pending
+## 28. Modern PoS — implemented and mainnet pins sealed
 
-The reviewed Modern-PoS v1 specification and implementation are present. Mainnet
-remains fail-closed until the seal-derived constants and release gates are
-pinned; this is a deployment gate, not an unresolved protocol design.
+The reviewed Modern-PoS v1 specification and implementation are present.
+Mainnet pins H/X, the complete parameter block, R0, and the transition feature
+schedule in the sealed transition release. Remaining rehearsal and publication
+work is a release-qualification gate, not an unresolved protocol design.
 
 ## 29. FlowMesh stays account-model
 

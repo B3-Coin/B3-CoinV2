@@ -114,7 +114,7 @@ ProvenBridgeDeposit MatchingDeposit(const Consensus::BridgeAssetParams& params,
 
 } // namespace
 
-BOOST_AUTO_TEST_CASE(mainnet_pins_only_the_owner_ratified_identity)
+BOOST_AUTO_TEST_CASE(mainnet_pins_identity_but_bridge_remains_fail_closed)
 {
     const auto chain{CChainParams::Main()};
     const Consensus::Params& params{chain->GetConsensus()};
@@ -150,12 +150,21 @@ BOOST_AUTO_TEST_CASE(mainnet_pins_only_the_owner_ratified_identity)
     BOOST_CHECK(busd.managed_withdrawal->withdrawal_rules_commitment.IsNull());
     BOOST_CHECK(!busd.decentralized_withdrawal);
 
-    // X and every operational/security pin remain deliberately absent.
-    BOOST_CHECK(!params.legacy_final_hash);
+    // X and the A1/A2/A3 feature schedule are pinned, so the stable bUSD
+    // AssetId is now derivable. None of that completes or activates the
+    // independently gated bridge registry.
+    BOOST_REQUIRE(params.legacy_final_hash);
+    BOOST_REQUIRE(params.flowmesh_activation_height);
+    BOOST_CHECK_EQUAL(*params.flowmesh_activation_height, 815'000);
+    BOOST_CHECK(!busd.activation_height);
     BOOST_CHECK(!Consensus::BridgeMintParamsReady(busd));
-    BOOST_CHECK(!modern::ConfiguredBridgeAssetId(params));
+    const auto asset{modern::ConfiguredBridgeAssetId(params)};
+    BOOST_REQUIRE(asset);
+    BOOST_CHECK(!asset->IsNull());
     BOOST_CHECK(!modern::ConfiguredBridgeRegistryId(params));
     BOOST_CHECK(!ConfiguredBridgeRegistryEntry(params));
+    BOOST_CHECK(!Consensus::BridgeRulesActive(815'000, params));
+    BOOST_CHECK(!Consensus::BridgeRulesActive(2'000'000'000, params));
 
     BridgeMintAuthorization mint;
     BOOST_CHECK(AdmitConfiguredDeposit(params, MatchingDeposit(busd, 1'000'000),

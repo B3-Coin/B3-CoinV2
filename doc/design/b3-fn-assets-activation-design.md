@@ -10,8 +10,9 @@ serialization, index, and wallet-signing paths implement this design behind
 fail-closed parameters. `getassetstate` reports the next-block activation and
 branch-local modern-FN counter; `getwalletassets`, `issueasset`, `sendasset`,
 `burnasset`, and `createfncoin` provide the transition-release wallet surface.
-The seal-derived X, R0, manifest/count/root, exact A1/A2/A3 heights, final
-release review, and real-history shadow-fork rehearsal remain release gates.
+The seal-derived X, R0, manifest/count/root, and exact schedule are now pinned:
+A1 = 812,000, A2 = 813,000, and A3 = 815,000. Final release review and the
+real-history shadow-fork rehearsal remain release gates.
 
 ## 1. Release plan (at most two planned feature releases)
 
@@ -48,8 +49,8 @@ release.
   Asset and FN carriers never use `OP_RETURN`; policy alone gives the burn its
   semantics, and destroyed units never reopen issuance capacity.
 - Issuance and non-FN colored outputs fail closed before the exact asset
-  activation height A2 pinned by the transition release. A1 and A2 are later
-  than M, after the intended modern-era soak, with A1 no later than A2.
+  activation height A2 = 813,000. A1 = 812,000 and A2 are later than M, with
+  A1 no later than A2.
 
 ## 3. FN ownership and transfers
 

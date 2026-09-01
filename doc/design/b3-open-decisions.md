@@ -5,9 +5,24 @@ If work appears to require settling one of these, **stop and request the decisio
 
 Locked material lives in [b3-architecture-contract.md](b3-architecture-contract.md).
 
+> **Current closure notice (2026-09-01).** The seal-derived and activation
+> inputs formerly listed as open in this historical register are now pinned:
+> H = 810,000; X =
+> `2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6`;
+> M = 811,001; S_H = 1,042,617,596,101,695,152 base units;
+> R0 = 19,836,712,254 base units; FN count = 3,592; FN rights root =
+> `e8f282a7dcaa9a8fbcfcc5c22ba4f456e5b50968fcf899aaacdaca65bef898ec`;
+> FN artifact SHA-256 =
+> `c80470eec785600f33fa2e69c520ff331c2b354ebf6e0a9bf8cae7d1eb5f9dca`;
+> and A1/A2/A3 = 812,000/813,000/815,000. References below to those exact
+> values being pending are retained only as the pre-seal decision history and
+> do not reopen them. Shadow-fork rehearsal and release verification remain
+> qualification work, not owner decisions. The separate bUSD bridge security
+> envelope remains incomplete and fail-closed.
+
 ---
 
-## OD-1 — Modern PoS consensus specification — **V1 MECHANISM FROZEN (2026-08-20); numerics REVISABLE**
+## OD-1 — Modern PoS consensus specification — **CLOSED AND PINNED**
 
 **Status: the V1 mechanism is FROZEN by explicit owner rulings (M1–M6,
 2026-08-20) and implementation is authorized.**
@@ -21,12 +36,12 @@ slashing, finality gadget, or delegation in V1 (all V2 research, spec §10).
 The V1 numerics are ratified: block interval 60 s, round length 30 s, f0 = 1,
 ×2 relaxation, sentinel bits 0x207fffff, future drift 120 s, horizon D = 1440,
 minimum stake 333 modern B3, and the STAKE v1 carrier. Corridor subsidy is
-fees-only and `transition_pow_bits = 0x1f008000`. The only monetary value that
-cannot be known before the seal is integer R0, derived from S_H under OD-2.
+fees-only and `transition_pow_bits = 0x1f008000`. The seal fixed integer R0 at
+19,836,712,254 base units from S_H under OD-2.
 
 Further RATIFIED 2026-08-21: the horizon D = 1440 (one day at the 60 s
 interval) and `min_stake_amount` = 333 modern B3 (kB3; 333e9 base units),
-both stated on mainnet and inert until H/X.
+both stated on mainnet and pinned with H/X.
 
 Resolved by the frozen spec (formerly listed as undefined): stake eligibility
 (STAKE policy outputs, aggregated per key, 20-block depth); the selection
@@ -43,11 +58,10 @@ Constraints already locked and not open for reinterpretation:
 - Modern PoS must be complete before FlowMesh (contract §53).
 - Validators and FlowMesh FNs are separate roles (contract §52).
 
-**Required to unblock mainnet activation:** observe and pin X/S_H/R0; reproduce
-and pin the exact FN manifest/count/root; pin the ruled post-M A1/A2 activation
-heights; pass the final-H equivalence, shadow-fork rehearsal, and release
-verification gates. The consensus mechanism and remaining numeric policies are
-closed.
+**Seal inputs closed:** X/S_H/R0, the exact FN manifest/count/root, and the
+post-M A1/A2/A3 heights are pinned, and final-H equivalence passed. The
+shadow-fork rehearsal and release verification remain qualification work, not
+open consensus decisions.
 
 **The transition model is AUTHORITATIVE design direction (2026-08-16):**
 [b3-during-fork-transition.md](b3-during-fork-transition.md) — the
@@ -66,8 +80,8 @@ length 1,000 is a locked count; per-validator weight aggregation is LOCKED
 preserved design number; after H, legacy PoS never resumes. Operator keys,
 snapshots, committees and self-authorizing blocks remain forbidden.
 
-**Mainnet activation stays gated** on the corridor document's remaining
-OPEN list — updated 2026-08-29 (the earlier version of this paragraph
+**Historical pre-seal status (superseded by the closure notice above):** the
+corridor document's OPEN list was updated 2026-08-29 (the earlier version of this paragraph
 went stale and contradicted the ratifications recorded above): the
 corridor difficulty VALUE is PINNED (0x1f008000, 2026-08-23), the
 minimum stake amount and horizon D are RATIFIED (333 modern B3 / 1440,
@@ -89,8 +103,8 @@ M is resolved (spec §3).
 Treasury = ONE single wallet/address (no multisig). At M, the native block
 subsidy is `R0 = floor(S_H × 1% / 525,600)`, halves every 525,600 blocks, and
 is split 90/10 between producer and treasury. The PoW corridor has zero
-subsidy and pays native transaction fees only. The exact integer R0 remains a
-seal-derived release pin, not an open policy choice. Simple-v1 asset issuance
+subsidy and pays native transaction fees only. The exact integer R0 is the
+sealed value 19,836,712,254 base units, not an open policy choice. Simple-v1 asset issuance
 pays 1,000 native B3 to the same treasury. FlowMesh charges 100 ppm of matched
 native-B3 notional and routes 20% to the treasury. Native B3 is never issued by
 the colored-asset engine.
@@ -121,7 +135,7 @@ cannot be selected by a ticker or generic mode parameters. Implemented in
 fixed-supply conservation, A2 fail-closed activation, and the 1,000 B3 treasury
 payment are wired. The 2026-08-31 owner correction requires explicit burns to
 be B3A1 `PolicyType::BURN` outputs; no asset/FN carrier uses `OP_RETURN`.
-Exact A2 remains a transition-release pin.
+Mainnet A2 is pinned at 813,000.
 
 ## OD-3 — Consensus governance / upgrade mechanism
 
@@ -130,10 +144,9 @@ Contract §43 and §55 require a deterministic activation mechanism and a govern
 propose and ratify later registry changes. The transition schedule itself is
 ruled: FN Genesis at 810,001 with ordinary coinbase maturity, modern FN PoD at
 post-M A1, simple-v1 assets plus FN seat pre-binding at A2, and working
-FlowMesh spot trading at A3 after at least a 30-block runway. The exact
-A1/A2/A3 heights remain pending owner pins for the sealed transition release;
-the production height-gating framework fails closed while any value is absent
-or contradictory.
+FlowMesh spot trading at A3 after at least a 30-block runway. Mainnet pins
+A1/A2/A3 at 812,000/813,000/815,000; the production height-gating framework
+fails closed on networks where any value is absent or contradictory.
 
 ---
 
@@ -146,8 +159,8 @@ through 2026-08-31 pin the lifetime cap at 5,000, final modern capacity at
 over successive 500-unit tiers. The height-807,709 report proves at least
 3,500 historical rights; the seal-pause run fixes R. Production type-6
 modern-PoD validation, branch-local counting, capacity enforcement, tiered
-destruction, and fee separation are implemented; the exact A1 pin remains
-pending. Bond size and any reward/revenue policy beyond the ruled spot-fee
+destruction, and fee separation are implemented; mainnet A1 is pinned at
+812,000. Bond size and any reward/revenue policy beyond the ruled spot-fee
 allocation remain OPEN. Spot-v1 revenue is closed: 100 ppm
 of matched native-B3 notional, split 80% equally across active FN seats and
 20% to treasury.
@@ -158,10 +171,10 @@ destruction through the transaction accounting gap, never claimable as a fee,
 never a generic BURN output — modernized with an explicit on-chain FN
 ownership (FN Coin) output. FN Coin is a separate asset/state from B3; one
 PoD event creates at most one FN. The modern PoD amount and maximum issuance
-quantity are now selected by the pinned table. Remaining OPEN items are the
-exact A1 height, bond/reward policy, and revenue distribution. Ownership,
-transfer authorization, and excess-gap treatment are implemented from the
-later owner rulings.
+quantity are now selected by the pinned table. Remaining OPEN items are only
+future bond/reward policy beyond spot-v1. Ownership, transfer authorization,
+excess-gap treatment, A1, and spot-v1 revenue distribution are closed by later
+owner rulings.
 
 ---
 
@@ -315,9 +328,10 @@ whether it is ever adopted; it must not become a dependency of H+1.
 ## OD-10 — Operational H/X coordination
 
 Contract §62 states the preferred model (choose an already-buried block, record X, ship the
-release) and requires H/X be known before the enforcing binary activates. The concrete
-activation mechanism — how nodes agree to begin modern validation once H/X are baked in —
-is not finalized and must not be improvised late.
+release) and requires H/X be known before the enforcing binary activates. This
+is now finalized: H = 810,000 and X =
+`2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6`
+are compiled into the transition release; the corridor begins at 810,001.
 
 **RE-RULED 2026-08-26 (owner, after explicit timeline review): H = 810,000**
 (corridor 810,001..811,000, M = 811,001), superseding H = 820,000. Basis:

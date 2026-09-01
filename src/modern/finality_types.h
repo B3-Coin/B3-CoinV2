@@ -24,12 +24,12 @@ namespace modern {
  * B3 Cross-Chain Finality Protocol V1 — frozen types, layouts and digests
  * (doc/design/b3-cross-chain-finality-v1.md, owner rulings 2026-08-23).
  *
- * This header is the CODEC/TYPE layer only (implementation plan, Commit 1):
+ * This header is the CODEC/TYPE layer (implementation plan, Commit 1):
  * fixed-width big-endian encodings, the tagged-hash digests Ethereum must be
  * able to recompute, the Keccak validator-set commitment, and the frozen
- * numeric constants. It performs NO BLS cryptography, no validation, no
- * activation. Everything that consumes these types arrives in later commits
- * and fails closed until then.
+ * numeric constants. It performs no BLS cryptography, validation, or
+ * activation itself; the implemented finality tracker, certificate verifier,
+ * and F = M gates consume these types elsewhere.
  *
  * Layout rule: every integer is big-endian fixed width; no varints; one byte
  * representation per logical value (decoders reject any other length).

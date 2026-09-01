@@ -48,6 +48,7 @@
 #include <test/util/setup_common.h>
 #include <txmempool.h>
 #include <uint256.h>
+#include <util/fs.h>
 #include <util/time.h>
 #include <validation.h>
 
@@ -155,6 +156,71 @@ std::shared_ptr<CBlock> CodecRoundTrip(const CBlock& block)
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(legacy_transition_tests, TransitionSetup)
+
+BOOST_AUTO_TEST_CASE(load_external_block_file_uses_legacy_codec)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    const CBlockIndex* prev{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
+    BOOST_REQUIRE(prev);
+    BOOST_REQUIRE_EQUAL(prev->nHeight, 0);
+
+    CMutableTransaction coinbase;
+    coinbase.version = 1;
+    coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+    coinbase.m_legacy_encoding = true;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig = CScript() << 1 << CScriptNum{7};
+    coinbase.vout.emplace_back(
+        legacy::GetProofOfWorkReward(/*fees=*/0, /*height=*/1, consensus),
+        CScript() << OP_TRUE);
+
+    CBlock block;
+    block.nVersion = 4;
+    block.hashPrevBlock = prev->GetBlockHash();
+    block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+    block.nBits = legacy::GetNextTargetRequired(
+        prev, /*proof_of_stake=*/false, consensus);
+    block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+    while (UintToArith256(block.GetLegacyB3Hash()) > target) {
+        ++block.nNonce;
+        BOOST_REQUIRE(block.nNonce < 10'000'000);
+    }
+
+    const fs::path bootstrap{m_path_root / "legacy-loadblock.dat"};
+    {
+        AutoFile file{fsbridge::fopen(bootstrap, "wb")};
+        BOOST_REQUIRE(!file.IsNull());
+        const uint32_t size{static_cast<uint32_t>(
+            GetSerializeSize(legacy::TX_LEGACY(block)))};
+        file << chainman.GetParams().MessageStart() << size
+             << legacy::TX_LEGACY(block);
+    }
+    {
+        AutoFile file{fsbridge::fopen(bootstrap, "rb")};
+        BOOST_REQUIRE(!file.IsNull());
+        chainman.LoadExternalBlockFile(file);
+    }
+    BOOST_REQUIRE(chainman.ActivateBestChains());
+    BOOST_REQUIRE_EQUAL(
+        WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->nHeight), 1);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(cs_main,
+                  return chainman.ActiveChain().Tip()->GetBlockHash().GetHex()),
+        block.GetLegacyB3Hash().GetHex());
+
+    CBlock decoded;
+    const CBlockIndex* imported{WITH_LOCK(
+        cs_main, return chainman.m_blockman.LookupBlockIndex(block.GetLegacyB3Hash()))};
+    BOOST_REQUIRE(imported);
+    BOOST_REQUIRE(chainman.m_blockman.ReadBlock(decoded, *imported));
+    BOOST_REQUIRE_EQUAL(decoded.vtx.size(), 1U);
+    BOOST_CHECK(decoded.vtx[0]->IsLegacyEncoded());
+    BOOST_CHECK_EQUAL(decoded.vtx[0]->nTime, block.vtx[0]->nTime);
+}
 
 BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
 {

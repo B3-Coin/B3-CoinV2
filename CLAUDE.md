@@ -44,8 +44,10 @@ authority merely by declaring precedence. The persistent order is:
   the locked architecture contract. Authoritative over all earlier design notes, and
   still binding in every area the master handoff does not contradict.
 - **[doc/design/b3-open-decisions.md](doc/design/b3-open-decisions.md)** — decisions
-  that are **not yet locked**. Notably, **modern PoS is UNRESOLVED at the protocol-detail
-  level** and must not be implemented until its consensus specification is supplied.
+  that are **not yet locked**, plus an explicitly marked historical register
+  of items closed by later owner rulings. Modern PoS V1 and the sealed
+  transition/A1/A2/A3 parameters are implemented and pinned; do not reopen or
+  redesign them while working on the genuinely open items.
 - **[doc/design/b3-implementation-status.md](doc/design/b3-implementation-status.md)** —
   the implementation-status / gap matrix: what is LOCKED / IMPLEMENTED / PARTIAL / WRONG /
   MISSING / SECURITY-BLOCKER, and the minimal critical path to a clean H+1.

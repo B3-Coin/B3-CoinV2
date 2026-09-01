@@ -3990,8 +3990,9 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 const Consensus::Params& consensus{params.GetConsensus()};
                 if (consensus.test_only_modern_pos_validator != nullptr || !consensus.modern_pos) {
                     // Test-adapter dispatch, or fail-closed: with no V1
-                    // parameter block configured (every shipped network)
-                    // every modern-PoS block is rejected.
+                    // parameter block configured, every modern-PoS block is
+                    // rejected. Mainnet's transition release takes the
+                    // production branch below.
                     (void)modern::CheckModernStake(block, *pindex->pprev, view, state,
                                                    consensus.test_only_modern_pos_validator);
                 } else if (modern::CheckModernPosCodec(block, state)) {
@@ -7454,7 +7455,18 @@ void ChainstateManager::LoadExternalBlockFile(
                         // This block can be processed immediately; rewind to its start, read and deserialize it.
                         blkdat.SetPos(nBlockPos);
                         pblock = std::make_shared<CBlock>();
-                        blkdat >> TX_WITH_WITNESS(*pblock);
+                        // Full reindex/loadblock has no block-index height yet,
+                        // so select the same marker-aware storage codec used by
+                        // BlockManager::ReadBlock. Historical B3 transactions
+                        // carry nTime and the block carries a trailing signature;
+                        // TX_WITH_WITNESS cannot decode those bytes. TX_LEGACY
+                        // reads that historical form and, for marker-v2 blocks,
+                        // automatically selects the modern body format.
+                        if (params.GetConsensus().legacy_b3coin) {
+                            blkdat >> legacy::TX_LEGACY(*pblock);
+                        } else {
+                            blkdat >> TX_WITH_WITNESS(*pblock);
+                        }
                         nRewind = blkdat.GetPos();
 
                         BlockValidationState state;

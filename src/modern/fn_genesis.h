@@ -310,6 +310,115 @@ inline std::optional<std::vector<unsigned char>> EncodeFnGenesisManifestFileV1(
     return bytes;
 }
 
+/** Strictly decoded canonical v1 FN Genesis release artifact. */
+struct DecodedFnGenesisManifestFileV1 {
+    uint256 chain_domain{};
+    uint32_t fn_genesis_height{0};
+    uint16_t manifest_version{0};
+    uint256 rights_root{};
+    std::vector<Consensus::FnGenesisRight> manifest;
+};
+
+/**
+ * Decode and fully validate a canonical v1 FN Genesis release artifact.
+ *
+ * Hash fields are copied in their serialized raw byte order. The decoder
+ * rejects non-v1 envelopes, non-exact sizes, invalid manifest cardinality,
+ * null commitments, noncanonical rows, and an embedded root that does not
+ * recompute from the decoded context and rows.
+ */
+inline std::optional<DecodedFnGenesisManifestFileV1>
+DecodeFnGenesisManifestFileV1(
+    const std::span<const unsigned char> bytes,
+    std::string* error = nullptr)
+{
+    const auto fail{[error](const std::string& reason)
+        -> std::optional<DecodedFnGenesisManifestFileV1> {
+        if (error) *error = reason;
+        return std::nullopt;
+    }};
+    constexpr size_t ROW_SIZE{32 + 20};
+    constexpr size_t FIXED_SIZE{
+        FN_GENESIS_MANIFEST_FILE_MAGIC.size() +
+        fn_genesis_detail::CONTEXT_SIZE + 32};
+
+    if (bytes.size() < FN_GENESIS_MANIFEST_FILE_MAGIC.size()) {
+        return fail("fn-genesis-manifest-file-truncated");
+    }
+    if (!std::equal(FN_GENESIS_MANIFEST_FILE_MAGIC.begin(),
+                    FN_GENESIS_MANIFEST_FILE_MAGIC.end(), bytes.begin())) {
+        return fail("fn-genesis-manifest-file-bad-magic");
+    }
+    if (bytes.size() < FIXED_SIZE) {
+        return fail("fn-genesis-manifest-file-truncated");
+    }
+
+    DecodedFnGenesisManifestFileV1 decoded;
+    size_t offset{FN_GENESIS_MANIFEST_FILE_MAGIC.size()};
+    std::copy(bytes.begin() + offset, bytes.begin() + offset + 32,
+              decoded.chain_domain.begin());
+    offset += 32;
+    decoded.fn_genesis_height = ReadBE32(bytes.data() + offset);
+    offset += 4;
+    decoded.manifest_version = ReadBE16(bytes.data() + offset);
+    offset += 2;
+    const uint32_t row_count{ReadBE32(bytes.data() + offset)};
+    offset += 4;
+    std::copy(bytes.begin() + offset, bytes.begin() + offset + 32,
+              decoded.rights_root.begin());
+    offset += 32;
+
+    if (decoded.manifest_version != FN_GENESIS_MANIFEST_VERSION_V1) {
+        return fail("fn-genesis-manifest-file-unsupported-version");
+    }
+    if (row_count == 0) {
+        return fail("fn-genesis-manifest-empty");
+    }
+    if (row_count > Consensus::MAX_FN_EVER_ISSUED) {
+        return fail("fn-genesis-manifest-too-large");
+    }
+    const size_t expected_size{FIXED_SIZE + ROW_SIZE * row_count};
+    if (bytes.size() < expected_size) {
+        return fail("fn-genesis-manifest-file-truncated");
+    }
+    if (bytes.size() > expected_size) {
+        return fail("fn-genesis-manifest-file-trailing-data");
+    }
+    if (decoded.chain_domain.IsNull()) {
+        return fail("fn-genesis-manifest-file-null-chain-domain");
+    }
+    if (decoded.rights_root.IsNull()) {
+        return fail("fn-genesis-manifest-file-null-root");
+    }
+
+    decoded.manifest.reserve(row_count);
+    for (uint32_t i{0}; i < row_count; ++i) {
+        Consensus::FnGenesisRight row;
+        std::copy(bytes.begin() + offset, bytes.begin() + offset + 32,
+                  row.pod_id.begin());
+        offset += 32;
+        std::copy(bytes.begin() + offset, bytes.begin() + offset + 20,
+                  row.recipient_key_hash.begin());
+        offset += 20;
+        decoded.manifest.push_back(row);
+    }
+
+    std::string validation_error;
+    if (!ValidateFnGenesisManifest(decoded.manifest, validation_error)) {
+        return fail(validation_error);
+    }
+    const auto computed_root{ComputeFnGenesisManifestRootV1(
+        decoded.chain_domain, decoded.fn_genesis_height, decoded.manifest,
+        &validation_error)};
+    if (!computed_root) return fail(validation_error);
+    if (*computed_root != decoded.rights_root) {
+        return fail("fn-genesis-manifest-file-root-mismatch");
+    }
+
+    if (error) error->clear();
+    return decoded;
+}
+
 //! Standard (non-reversed) SHA-256 digest bytes for publication/sha256sum.
 inline std::array<unsigned char, CSHA256::OUTPUT_SIZE>
 FnGenesisManifestFileSha256(const std::span<const unsigned char> bytes)

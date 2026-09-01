@@ -10,18 +10,20 @@ are present.
 ## Important activation sequence
 
 - Legacy B3 ends at height 810,000. The release pins that block's exact hash
-  and the supply-derived Modern PoS reward.
+  (`2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6`)
+  and the supply-derived Modern PoS initial reward (19,836,712,254 base
+  units).
 - Block 810,001 starts the 1,000-block modern-format PoW corridor and must
   include the complete historical FN Genesis manifest in its coinbase.
 - Historical FN units go directly to their legacy P2PKH owner scripts. There
   is no claim transaction, proof, deadline, or issuance fee. Ordinary
   30-block coinbase maturity applies.
 - Modern PoS starts at height 811,001.
-- Permissionless modern FN PoD activates at A1.
+- Permissionless modern FN PoD activates at A1 = 812,000.
 - Simple-v1 colored-asset issuance and FlowMesh seat/vault preparation activate
-  at A2.
-- FlowMesh trading, checkpoints, and vault settlement activate at A3, at least
-  30 blocks after A2. Each market's epoch-zero anchor is the earliest canonical
+  at A2 = 813,000.
+- FlowMesh trading, checkpoints, and vault settlement activate at A3 = 815,000,
+  after a 2,000-block preparation runway. Each market's epoch-zero anchor is the earliest canonical
   block at or after `market.created_height` whose post-block FN seat set has at
   least four seats; sequence zero waits until that exact block is 30-deep.
 
@@ -116,9 +118,11 @@ Back up `wallet.dat` and shut down the old client cleanly before upgrading.
 The release uses the existing B3 datadir and supports legacy wallet import and
 rescan. Verify every downloaded package against the published SHA-256 sums.
 
-This release must not be tagged or distributed until the seal packet contains
-the independently verified X, R0, full FN manifest bytes/checksum/count/root,
-A1/A2/A3 heights, final-H three-way equivalence result, and successful isolated
-shadow-fork rehearsal. Any bridge activation additionally requires every bUSD
-security pin named above. Builds with any required mainnet pin absent fail
-closed.
+The seal packet now contains independently verified X and R0, the byte-identical
+3,592-row FN manifest (root
+`e8f282a7dcaa9a8fbcfcc5c22ba4f456e5b50968fcf899aaacdaca65bef898ec`,
+SHA-256 `c80470eec785600f33fa2e69c520ff331c2b354ebf6e0a9bf8cae7d1eb5f9dca`),
+the A1/A2/A3 heights, and the final-H three-way equivalence result. The release
+must not be tagged or distributed until the isolated shadow-fork rehearsal also
+passes. Any bridge activation additionally requires every bUSD security pin
+named above; bUSD remains fail-closed independently of native/colored FlowMesh.

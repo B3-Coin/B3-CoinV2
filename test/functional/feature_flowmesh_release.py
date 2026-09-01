@@ -380,6 +380,39 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
         assert_equal(genesis_checkpoint["sequence"], 0)
         assert_equal(genesis_checkpoint["effect_count"], 0)
 
+        self.log.info("FlowMesh pauses if a reorg crosses back below A3")
+        active_height = n0.getblockcount()
+        invalidated = []
+        for node in self.nodes:
+            node_invalidated = []
+            while node.getblockcount() >= A3:
+                # Modern PoS may leave a valid competing A3 block in the
+                # local index. Invalidate every candidate selected at A3 so
+                # this test crosses the activation boundary deterministically.
+                a3_hash = node.getblockhash(A3)
+                assert a3_hash not in node_invalidated
+                node_invalidated.append(a3_hash)
+                assert len(node_invalidated) <= 16
+                node.invalidateblock(a3_hash)
+            invalidated.append(node_invalidated)
+            node.syncwithvalidationinterfacequeue()
+            assert_equal(node.getblockcount(), A3 - 1)
+            status = self.market_status(node, market_id)
+            assert status is not None
+            assert_equal(status["paused"], True)
+            assert_equal(
+                status["error"],
+                "FlowMesh service is below its activation height",
+            )
+        for node, node_invalidated in zip(self.nodes, invalidated):
+            for block_hash in node_invalidated:
+                node.reconsiderblock(block_hash)
+        self.sync_blocks(timeout=120)
+        for node in self.nodes:
+            node.syncwithvalidationinterfacequeue()
+            assert_equal(node.getblockcount(), active_height)
+        self.wait_for_market_convergence(market_id)
+
         self.log.info("Both 30-deep deposits are certified and checkpointed")
         deposit_sequence = self.market_status(
             n0, market_id,

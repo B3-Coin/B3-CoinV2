@@ -1465,9 +1465,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     const ArgsManager& args = *Assert(node.args);
     const CChainParams& chainparams = Params();
 
-    // B3 X-distribution PAUSE (owner ruling 2026-08-23): H set, X blank.
-    // Say so loudly: this build accepts the chain through H and refuses
-    // every block above it until the release that pins X.
+    // B3 X-distribution PAUSE safety: if any configuration sets H but leaves
+    // X blank, say so loudly and refuse every post-H block. Mainnet's
+    // transition release pins X and does not enter this branch.
     if (Consensus::LegacyBoundaryHeightOnly(chainparams.GetConsensus())) {
         const int final_height{*Consensus::LegacyFinalHeight(chainparams.GetConsensus())};
         const bilingual_str msg{strprintf(_("B3: the final legacy height H=%d is configured but the boundary hash X is not pinned. This node accepts blocks through H and REFUSES every block above H until the follow-up release that pins X. It will not produce or enter the transition corridor."), final_height)};

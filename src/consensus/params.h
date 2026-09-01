@@ -142,10 +142,9 @@ struct Params {
      * The compact-bits target every temporary-PoW corridor block must carry
      * (constant corridor difficulty). The block's scrypt eligibility hash
      * must not exceed this target. Unset means the corridor difficulty
-     * policy is unresolved and corridor blocks FAIL CLOSED: regtest fixtures
-     * set a trivially easy value as test scaffolding; the mainnet corridor
-     * difficulty policy is an OPEN design decision and must not be chosen
-     * here silently.
+     * is unconfigured and corridor blocks FAIL CLOSED. Mainnet pins
+     * 0x1f008000; regtest fixtures may set a trivially easy value as test
+     * scaffolding.
      */
     std::optional<uint32_t> transition_pow_bits;
     /**
@@ -168,9 +167,9 @@ struct Params {
     /**
      * Modern PoS V1 parameter block (consensus/modern_pos_params.h). Unset
      * means modern-PoS rules are unconfigured and every modern-PoS block
-     * FAILS CLOSED (`no-modern-pos-rules`). Real chainparams never set it:
-     * every value inside is REVISABLE_BEFORE_MAINNET scaffolding until the
-     * owner ratifies mainnet numbers (a guard test pins this).
+     * FAILS CLOSED (`no-modern-pos-rules`). Mainnet's sealed transition
+     * release assigns every value explicitly; other shipped networks leave
+     * the block unset.
      */
     std::optional<ModernPosParams> modern_pos;
     /**
@@ -182,18 +181,18 @@ struct Params {
      *
      * The three fields are one fail-closed configuration: an empty manifest,
      * a missing root, or a root that does not commit to these exact rows makes
-     * FN Genesis unavailable. Mainnet deliberately leaves them unset until
-     * the final through-H scan has completed during the seal pause.
+     * FN Genesis unavailable. Mainnet embeds the canonical artifact produced
+     * by the final through-H scan and verifies its published size, SHA256,
+     * chain domain, height, version, count and root at startup.
      */
     uint16_t fn_genesis_manifest_version{1};
     std::optional<uint256> fn_genesis_rights_root;
     std::vector<FnGenesisRight> fn_genesis_manifest;
     /**
-     * Make the one-time historical FN Genesis event mandatory at H+1 even
-     * while its sealed manifest/root are not yet populated. Mainnet sets this
-     * before the seal so an X-pin release can never accidentally enter the
-     * corridor without the historical allocation. Synthetic B3 test chains
-     * may leave it false unless they explicitly exercise FN Genesis.
+     * Make the one-time historical FN Genesis event mandatory at H+1. This is
+     * an independent belt-and-suspenders guard: mainnet cannot enter the
+     * corridor without the complete historical allocation. Synthetic B3 test
+     * chains may leave it false unless they explicitly exercise FN Genesis.
      */
     bool fn_genesis_required{false};
     /**
@@ -205,8 +204,8 @@ struct Params {
     std::optional<int> fn_pod_activation_height;
     /**
      * First height at which simple-v1 colored-asset issuance, transfer and
-     * burn rules are active. Unset means they fail closed. This height is
-     * pinned only after the modern chain's soak interval is approved.
+     * burn rules are active. Unset means they fail closed; mainnet pins this
+     * as A2 after its ratified post-M soak interval.
      */
     std::optional<int> asset_activation_height;
     /**
@@ -270,13 +269,14 @@ struct Params {
      * code holding a mutable Params -- which production never does after init.
      *
      * - test_only_modern_pos_validator: an installed modern proof-of-stake
-     *   rule set. Null in production, so modern PoS stays fail-closed
-     *   (CheckModernStake rejects every block) until a real rule set ships.
+     *   adapter used only by synthetic fixtures. It remains null in
+     *   production, where a configured `modern_pos` block selects the real
+     *   validator; an absent production block still fails closed.
      * - test_only_asset_policies_active: test-fixture override for simple-v1
-     *   asset rules and the otherwise dormant DEX_VAULT policy. Production
-     *   simple-v1 assets use asset_activation_height; that real A2 gate never
-     *   activates DEX_VAULT or full FlowMesh service. FN-v2 pre-binding has
-     *   its own complete-schedule requirement.
+     *   asset rules and DEX_VAULT policy. Production simple-v1 assets, seat
+     *   binding and vault preparation use the real A2 gate; full FlowMesh
+     *   trading/service uses A3. FN-v2 pre-binding requires the complete
+     *   schedule.
      *
      * (The former metadata-cell / MPA test switches are gone: those rules
      * activate through the real F = M predicate,

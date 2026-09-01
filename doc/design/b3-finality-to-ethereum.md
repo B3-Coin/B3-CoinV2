@@ -29,7 +29,7 @@ Deposits (Ethereum → B3 via receipt/state proofs) are unchanged from
 
 | Symbol | Meaning | Status |
 |---|---|---|
-| **M** | first modern-PoS block (821,001 under the 2026-08-23 H ruling). **Epoch 0 begins here.** Binding actions are valid from H+1 (the corridor), certificates from M. | ruled |
+| **M** | first modern-PoS block (**811,001** under the sealed transition schedule). **Epoch 0 begins here.** Binding actions are valid from H+1 (the corridor), certificates from M. | ruled |
 | **F** | finality-enforcement height: from F, certificate cryptography and the finality pin are consensus rules. **F = M is the target**; if the v1 binary cannot carry `blst`, F is pinned by the mandatory X-pin follow-up release (same pattern as X). | owner (§9) |
 | **B** | separate bridge activation (`BRIDGE_BACKED`, `BRIDGE_BURN`, withdrawal tree, Ethereum contracts live). **B ≥ F.** | owner, later |
 

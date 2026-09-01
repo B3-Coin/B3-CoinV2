@@ -126,6 +126,39 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         return chainman.ActiveChain().Height();
     }
 
+    bool RulesActiveAtTip() const
+    {
+        LOCK(::cs_main);
+        const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+        return tip != nullptr && Consensus::FlowMeshRulesActive(
+                                     tip->nHeight, chainman.GetConsensus());
+    }
+
+    bool ReconciledTipMatches(const uint256& expected_tip) const
+    {
+        if (expected_tip.IsNull()) return false;
+        {
+            std::lock_guard<std::mutex> lock{reconciled_tip_mutex};
+            if (reconciled_tip != expected_tip) return false;
+        }
+        LOCK(::cs_main);
+        const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+        return tip != nullptr && tip->GetBlockHash() == expected_tip &&
+               Consensus::FlowMeshRulesActive(tip->nHeight,
+                                               chainman.GetConsensus());
+    }
+
+    bool ReconciledAtTip() const
+    {
+        if (chain_reconciling.load(std::memory_order_acquire)) return false;
+        uint256 expected_tip;
+        {
+            std::lock_guard<std::mutex> lock{reconciled_tip_mutex};
+            expected_tip = reconciled_tip;
+        }
+        return ReconciledTipMatches(expected_tip);
+    }
+
     bool Acceptable(const flowmesh::AnchorRef& anchor) const override
     {
         if (chain_reconciling.load(std::memory_order_acquire) ||
@@ -141,7 +174,12 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         LOCK(::cs_main);
         const CChain& active{chainman.ActiveChain()};
         const CBlockIndex* tip{active.Tip()};
-        if (tip == nullptr || tip->GetBlockHash() != expected_tip) return false;
+        if (tip == nullptr ||
+            !Consensus::FlowMeshRulesActive(tip->nHeight,
+                                            chainman.GetConsensus()) ||
+            tip->GetBlockHash() != expected_tip) {
+            return false;
+        }
         const CBlockIndex* index{
             chainman.m_blockman.LookupBlockIndex(anchor.hash)};
         return index != nullptr && index->nHeight == anchor.height &&
@@ -423,7 +461,7 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         const uint256& domain, const flowmesh::MarketId& market_id,
         const flowmesh::ActiveFnBlsSeatSet& current) const override
     {
-        if (chain_reconciling.load(std::memory_order_acquire)) {
+        if (!ReconciledAtTip()) {
             return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt};
         }
         const auto expected_domain{ChainDomain()};
@@ -539,7 +577,7 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         const flowmesh::MarketId&,
         const flowmesh::ActiveFnBlsSeatSet&) const override
     {
-        if (chain_reconciling.load(std::memory_order_acquire)) return {};
+        if (!ReconciledAtTip()) return {};
         std::lock_guard<std::mutex> lock{mutex};
         return local_keys;
     }
@@ -701,6 +739,7 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
 
     void Relay(FlowMeshRuntimeRelay relay) const
     {
+        if (!ReconciledAtTip()) return;
         PeerManager* target{nullptr};
         {
             std::lock_guard<std::mutex> lock{mutex};
@@ -712,7 +751,7 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
                                      relay.exclude_peer);
     }
 
-    bool RefreshMarkets(std::string& error);
+    bool RefreshMarkets(uint256& sampled_tip, std::string& error);
     bool InstallMarket(const FlowMeshMarketRecord& record,
                        std::string& error);
     bool ReconcileConnectedCheckpoints(std::string& error);
@@ -731,7 +770,7 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
             if (stopping) break;
             std::shared_ptr<FlowMeshRuntime> active{runtime};
             lock.unlock();
-            if (active && !chain_reconciling.load(std::memory_order_acquire)) {
+            if (active && ReconciledAtTip()) {
                 active->NotifyTick();
             }
             lock.lock();
@@ -991,19 +1030,23 @@ bool FlowMeshService::Impl::InstallMarket(
         resources->store = std::move(store);
     }
     if (!active || !active->AddMarket(std::move(config), error)) return false;
+    bool observer{true};
     {
         std::lock_guard<std::mutex> lock{mutex};
         resources->installed = true;
         resources->ready = true;
+        observer = local_keys.empty();
     }
     LogInfo("FlowMesh market %s started (%s/B3, epoch=%d, observer=%d)\n",
             record.market_id.GetHex(), record.base_asset.GetHex(),
-            active_seats->epoch, local_keys.empty());
+            active_seats->epoch, observer);
     return true;
 }
 
-bool FlowMeshService::Impl::RefreshMarkets(std::string& error)
+bool FlowMeshService::Impl::RefreshMarkets(uint256& sampled_tip,
+                                           std::string& error)
 {
+    sampled_tip.SetNull();
     std::lock_guard<std::mutex> refresh_lock{refresh_mutex};
     {
         std::lock_guard<std::mutex> lock{mutex};
@@ -1022,6 +1065,7 @@ bool FlowMeshService::Impl::RefreshMarkets(std::string& error)
                                                                params)) {
             return true;
         }
+        sampled_tip = tip->GetBlockHash();
         if (!SyncIndexesLocked(chainstate, *tip, error)) return false;
         const int anchor_height{tip->nHeight - FLOWMESH_ANCHOR_DEPTH};
         const CBlockIndex* anchor{
@@ -1031,8 +1075,31 @@ bool FlowMeshService::Impl::RefreshMarkets(std::string& error)
         discovered =
             chainstate.ModernFlowMeshVaults().Index().MarketsAt(*anchor);
     }
+    std::map<flowmesh::MarketId, FlowMeshMarketRecord> canonical;
+    for (const FlowMeshMarketRecord& record : discovered) {
+        canonical.emplace(record.market_id, record);
+    }
+    {
+        std::lock_guard<std::mutex> lock{mutex};
+        for (const auto& [id, resources] : markets) {
+            const auto it{canonical.find(id)};
+            if (it == canonical.end() ||
+                !(resources->chain_record == it->second)) {
+                error = "installed FlowMesh market is absent from the canonical anchor";
+                return false;
+            }
+        }
+    }
     for (const FlowMeshMarketRecord& record : discovered) {
         if (!InstallMarket(record, error)) return false;
+    }
+    {
+        LOCK(::cs_main);
+        const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+        if (tip == nullptr || tip->GetBlockHash() != sampled_tip) {
+            error = "B3 tip changed while FlowMesh markets were refreshing";
+            return false;
+        }
     }
     return true;
 }
@@ -1191,7 +1258,8 @@ bool FlowMeshService::Start(PeerManager& peerman, std::string& error)
         m_impl->ticker =
             std::thread{&FlowMeshService::Impl::TickerLoop, m_impl.get()};
     }
-    if (!m_impl->RefreshMarkets(error)) {
+    uint256 market_tip;
+    if (!m_impl->RefreshMarkets(market_tip, error)) {
         Stop();
         return false;
     }
@@ -1206,7 +1274,22 @@ bool FlowMeshService::Start(PeerManager& peerman, std::string& error)
         Stop();
         return false;
     }
+    if (!m_impl->RulesActiveAtTip()) {
+        error.clear();
+        LogInfo("FlowMesh production service waiting for its A3 activation height\n");
+        return true;
+    }
+    if (!m_impl->ReconciledTipMatches(market_tip)) {
+        error.clear();
+        LogInfo("FlowMesh production service waiting for a stable reconciled B3 tip\n");
+        return true;
+    }
     m_impl->chain_reconciling.store(false, std::memory_order_release);
+    if (!m_impl->ReconciledAtTip()) {
+        m_impl->chain_reconciling.store(true, std::memory_order_release);
+        LogInfo("FlowMesh production service waiting: B3 tip changed before startup completed\n");
+        return true;
+    }
     runtime->NotifyTick();
     LogInfo("FlowMesh production service started on the existing B3 P2P network\n");
     return true;
@@ -1274,7 +1357,16 @@ std::optional<FlowMeshRuntimeMarketStatus> FlowMeshService::MarketStatus(
         std::lock_guard<std::mutex> lock{m_impl->mutex};
         runtime = m_impl->runtime;
     }
-    return runtime ? runtime->MarketStatus(market_id) : std::nullopt;
+    auto status{runtime ? runtime->MarketStatus(market_id) : std::nullopt};
+    if (!status) return std::nullopt;
+    if (!m_impl->RulesActiveAtTip()) {
+        status->paused = true;
+        status->error = "FlowMesh service is below its activation height";
+    } else if (!m_impl->ReconciledAtTip()) {
+        status->paused = true;
+        status->error = "FlowMesh service is reconciling the B3 tip";
+    }
+    return status;
 }
 
 std::optional<flowmesh::FlowMeshState> FlowMeshService::StateSnapshot(
@@ -1292,6 +1384,14 @@ bool FlowMeshService::SubmitLocalAction(const flowmesh::MarketId& market_id,
                                         const flowmesh::Action& action,
                                         std::string& error)
 {
+    if (!m_impl->RulesActiveAtTip()) {
+        error = "FlowMesh service is below its activation height";
+        return false;
+    }
+    if (!m_impl->ReconciledAtTip()) {
+        error = "FlowMesh service is reconciling the B3 tip";
+        return false;
+    }
     std::shared_ptr<FlowMeshRuntime> runtime;
     {
         std::lock_guard<std::mutex> lock{m_impl->mutex};
@@ -1360,8 +1460,7 @@ bool FlowMeshService::ArmSeatKeys(std::vector<bls::SecretKey> keys,
         m_impl->local_keys = std::move(keys);
         runtime = m_impl->runtime;
     }
-    if (runtime &&
-        !m_impl->chain_reconciling.load(std::memory_order_acquire)) {
+    if (runtime && m_impl->ReconciledAtTip()) {
         runtime->NotifyTick();
     }
     return true;
@@ -1376,6 +1475,10 @@ void FlowMeshService::DisarmSeatKeys()
 std::optional<FlowMeshPendingCheckpoint> FlowMeshService::NextCheckpointMpa(
     const flowmesh::MarketId& market_id, std::string& error) const
 {
+    if (!m_impl->ReconciledAtTip()) {
+        error = "FlowMesh service is not active at the current B3 tip";
+        return std::nullopt;
+    }
     FlowMeshProductionStore* store{nullptr};
     {
         std::lock_guard<std::mutex> lock{m_impl->mutex};
@@ -1429,6 +1532,10 @@ std::optional<FlowMeshPendingCheckpoint> FlowMeshService::NextCheckpointMpa(
 std::optional<FlowMeshVaultOperation> FlowMeshService::VaultOperation(
     const uint256& effect_id, std::string& error) const
 {
+    if (!m_impl->ReconciledAtTip()) {
+        error = "FlowMesh service is not active at the current B3 tip";
+        return std::nullopt;
+    }
     if (effect_id.IsNull()) {
         error = "FlowMesh effect id is null";
         return std::nullopt;
@@ -1620,6 +1727,10 @@ std::vector<FlowMeshVaultOperation> FlowMeshService::VaultOperations(
     const std::optional<flowmesh::MarketId> market_id,
     std::string& error) const
 {
+    if (!m_impl->ReconciledAtTip()) {
+        error = "FlowMesh service is not active at the current B3 tip";
+        return {};
+    }
     if (market_id && market_id->IsNull()) {
         error = "FlowMesh market id is null";
         return {};
@@ -1730,6 +1841,9 @@ std::vector<FlowMeshVaultOperation> FlowMeshService::VaultOperations(
 flowmesh::QueueResult FlowMeshService::EnqueueWireMessage(
     const flowmesh::WirePeerId peer, flowmesh::WireMessage message)
 {
+    if (!m_impl->ReconciledAtTip()) {
+        return flowmesh::QueueResult::GLOBAL_LIMIT;
+    }
     std::shared_ptr<FlowMeshRuntime> runtime;
     {
         std::lock_guard<std::mutex> lock{m_impl->mutex};
@@ -1763,12 +1877,18 @@ void FlowMeshService::BlockDisconnected(
     m_impl->chain_reconciling.store(true, std::memory_order_release);
 }
 
-void FlowMeshService::UpdatedBlockTip(const CBlockIndex*, const CBlockIndex*,
+void FlowMeshService::UpdatedBlockTip(const CBlockIndex* new_tip,
+                                      const CBlockIndex*,
                                       const bool initial_download)
 {
     if (!Running()) return;
     m_impl->chain_reconciling.store(true, std::memory_order_release);
     if (initial_download) return;
+    const uint256 callback_tip{new_tip ? new_tip->GetBlockHash() : uint256{}};
+    if (!m_impl->RulesActiveAtTip()) {
+        LogInfo("FlowMesh remains paused below its A3 activation height\n");
+        return;
+    }
 
     std::shared_ptr<FlowMeshRuntime> runtime;
     {
@@ -1787,7 +1907,8 @@ void FlowMeshService::UpdatedBlockTip(const CBlockIndex*, const CBlockIndex*,
         return;
     }
     error.clear();
-    if (!m_impl->RefreshMarkets(error)) {
+    uint256 market_tip;
+    if (!m_impl->RefreshMarkets(market_tip, error)) {
         LogWarning("FlowMesh market refresh failed: %s\n", error);
         return;
     }
@@ -1803,7 +1924,17 @@ void FlowMeshService::UpdatedBlockTip(const CBlockIndex*, const CBlockIndex*,
                    error);
         return;
     }
+    if (market_tip != callback_tip ||
+        !m_impl->ReconciledTipMatches(callback_tip)) {
+        LogInfo("FlowMesh remains paused: B3 tip changed during reconciliation\n");
+        return;
+    }
     m_impl->chain_reconciling.store(false, std::memory_order_release);
+    if (!m_impl->ReconciledAtTip()) {
+        m_impl->chain_reconciling.store(true, std::memory_order_release);
+        LogInfo("FlowMesh remains paused: B3 tip changed before reconciliation completed\n");
+        return;
+    }
     if (runtime) runtime->NotifyTick();
 }
 

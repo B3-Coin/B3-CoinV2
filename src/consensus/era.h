@@ -154,8 +154,9 @@ constexpr std::optional<int> ModernPosStartHeight(const Params& params)
  * (the corridor) so Set_0 = Snapshot(M-1) exists at M; the era gates in
  * validation keep every rule out of legacy blocks; certificates additionally
  * cannot be valid before M (no epoch state exists below it). A shipped
- * network without the pinned parameters -- today every real network -- is
- * fail-closed everywhere this predicate is consulted; known-but-inactive MPA
+ * network without the pinned parameters is fail-closed everywhere this
+ * predicate is consulted; mainnet pins them in the transition release while
+ * the other shipped networks remain unconfigured. Known-but-inactive MPA
  * types 1..3 stay invalid regardless.
  */
 constexpr bool ModernObjectRulesActive(const Params& params)

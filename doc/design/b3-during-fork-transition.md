@@ -5,11 +5,24 @@ supersedes BOTH earlier transition models: the post-boundary
 "self-activating bootstrap" and the **1,000-block legacy-PoS declaration
 window (SUPERSEDED)** — the corridor is no longer legacy blocks carrying
 declarations; it is temporary PoW with modern semantics. The corridor and
-modern consensus paths are implemented. Mainnet remains fail-closed until the
-seal-derived X/R0/FN-manifest pins and the ruled A1/A2/A3 activation heights are
-set and the transition-release gates in the runbook are complete. Later
-sections retain historical investigation where useful; `FINALIZED.md` and the
-FN/assets and FlowMesh production designs govern any conflict.
+modern consensus paths are implemented. At the pre-pin checkpoint, mainnet
+remained fail-closed until the seal-derived X/R0/FN-manifest pins and the ruled
+A1/A2/A3 activation heights were set and the transition-release gates in the
+runbook were complete.
+
+> **Current pin supersession (2026-09-01).** Those consensus pins are now set:
+> H/X = 810,000/
+> `2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6`,
+> M = 811,001, R0 = 19,836,712,254 base units, the 3,592-row FN artifact has
+> SHA-256
+> `c80470eec785600f33fa2e69c520ff331c2b354ebf6e0a9bf8cae7d1eb5f9dca`,
+> and A1/A2/A3 = 812,000/813,000/815,000. The preceding sentence records the
+> pre-pin gate; it no longer describes the current transition binary. Release
+> rehearsal/verification remain required, and bUSD remains independently
+> fail-closed.
+
+Later sections retain historical investigation where useful; `FINALIZED.md`
+and the FN/assets and FlowMesh production designs govern any conflict.
 
 ## 1. Timeline
 

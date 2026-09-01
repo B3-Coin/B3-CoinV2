@@ -642,8 +642,8 @@ exist.
    across
    `b3-architecture-contract.md`, `b3-flowmesh-dex-decisions.md`, the FN/asset
    activation design, transition runbook, release notes, and RPC help. The
-   absolute A3 height remains a release pin required before producing release
-   artifacts.
+   absolute mainnet schedule is pinned at A1/A2/A3 =
+   812,000/813,000/815,000.
 
 ## 13. Required tests and release gates
 
@@ -701,14 +701,18 @@ genesis, and a release-candidate soak spanning at least one real seat rotation.
 
 There is no unresolved cryptographic design decision: FlowMesh seat
 certification is BLS aggregate plus a canonical bitmap and PoP-bound FN-v2
-keys. The following are hard blockers to tagging v1.1:
+keys. X/R0/FN-manifest and A1/A2/A3 are pinned. The remaining hard blockers to
+tagging v1.1 are:
 
-1. the absolute mainnet A1/A2/A3 heights are not yet pinned;
-2. the sealed X/R0/FN-manifest constants and final shadow-fork rehearsal are
-   still release gates;
-3. the four-seat end-to-end release rehearsal, reorg rollback checks, and
-   focused custody/funds-safety suites must all be green on the final tree;
-4. bridge-backed bUSD needs independent review of the implemented type-10
+1. the final real-history shadow-fork rehearsal;
+2. the four-seat end-to-end release rehearsal, reorg rollback checks, and
+   focused custody/funds-safety suites green on the final tree; and
+3. reconciliation of every stale document/comment that says FlowMesh ships
+   later or native-CDP bUSD is current.
+
+Bridge-backed bUSD is a separate activation envelope, not a blocker to tagging
+native/colored FlowMesh while bridge activation remains unset. Activating bUSD
+requires independent review of the implemented type-10
    mint/burn state machine and replay/undo path; an origin-enforced USDT
    adapter; the production Ethereum checkpoint/fork schedule, separate
    activation, approval range and per-block/per-epoch caps; reproducible
@@ -718,9 +722,7 @@ keys. The following are hard blockers to tagging v1.1:
    finalized B3 burn request binding canonical bUSD, exact raw amount,
    Ethereum recipient and unique request id; the still-unimplemented operator
    service must wait finality, release exactly once, durably consume the id,
-   and reconcile reserves against supply. No burn means no release; and
-5. every stale document/comment that says FlowMesh ships later or native-CDP
-   bUSD is current must be superseded.
+   and reconcile reserves against supply. No burn means no release.
 
 Until the relevant gates pass, FlowMesh and bridge minting remain independently
 fail-closed on production networks. A green FlowMesh rehearsal never activates

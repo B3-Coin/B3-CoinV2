@@ -6,9 +6,9 @@
 // The modern object rules (metadata-cell policies 6/7/8, MPA types 4/5)
 // activate through ONE predicate -- Consensus::ModernObjectRulesActive: the
 // legacy boundary H set, X pinned, and the Modern-PoS rule set present (the
-// X-pin release configuration). Every real network ships without them and
-// is fail-closed; nothing activates early; known-but-inactive types stay
-// invalid regardless.
+// X-pin release configuration). Mainnet now carries that exact sealed
+// configuration and its independently pinned FN PoD/assets/FlowMesh heights;
+// the still-incomplete bUSD security envelope remains fail-closed.
 
 #include <chainparams.h>
 #include <common/args.h>
@@ -30,34 +30,115 @@
 
 BOOST_FIXTURE_TEST_SUITE(finality_activation_tests, BasicTestingSetup)
 
-BOOST_AUTO_TEST_CASE(mainnet_and_all_shipped_networks_fail_closed)
+BOOST_AUTO_TEST_CASE(mainnet_sealed_transition_pins_are_complete)
 {
-    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::REGTEST, ChainType::SIGNET}) {
+    const auto params{CreateChainParams(ArgsManager{}, ChainType::MAIN)};
+    const Consensus::Params& c{params->GetConsensus()};
+
+    BOOST_CHECK_EQUAL(c.hard_fork_height.value_or(0), 810'001);
+    BOOST_CHECK_EQUAL(Consensus::LegacyFinalHeight(c).value_or(0), 810'000);
+    BOOST_CHECK(c.legacy_final_hash == uint256{
+        "2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6"});
+    BOOST_CHECK(Consensus::LegacyBoundaryPinned(c));
+    BOOST_CHECK(!Consensus::LegacyBoundaryHeightOnly(c));
+    BOOST_CHECK_EQUAL(Consensus::ModernPosStartHeight(c).value_or(0), 811'001);
+
+    BOOST_CHECK(c.fn_genesis_required);
+    BOOST_CHECK_EQUAL(c.fn_genesis_manifest_version, 1);
+    BOOST_CHECK_EQUAL(c.fn_genesis_manifest.size(), 3'592U);
+    BOOST_CHECK(c.fn_genesis_rights_root == uint256{
+        "e8f282a7dcaa9a8fbcfcc5c22ba4f456e5b50968fcf899aaacdaca65bef898ec"});
+    std::string manifest_error;
+    BOOST_CHECK_MESSAGE(modern::CheckFnGenesisConfiguration(c, manifest_error),
+                        manifest_error);
+    BOOST_CHECK(!Consensus::FnRulesActive(810'000, c));
+    BOOST_CHECK(Consensus::FnRulesActive(810'001, c));
+
+    BOOST_REQUIRE(c.modern_pos.has_value());
+    BOOST_CHECK(c.modern_pos->Valid());
+    BOOST_CHECK(Consensus::ModernObjectRulesActive(c));
+    for (const uint16_t t : {6, 7, 8}) {
+        BOOST_CHECK(modern::IsMetadataCellActive(
+            t, modern::POLICY_VERSION_V1, c));
+    }
+    for (const uint16_t t : {4, 5}) {
+        BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, c) ==
+                    modern::PayloadTypeStatus::ACTIVE);
+    }
+
+    // The independently ratified feature schedule is exact: A1 turns on FN
+    // PoD, A2 turns on assets plus seat/vault preparation, and A3 turns on
+    // FlowMesh after a 2,000-block (well above 30-block) anchor runway.
+    BOOST_REQUIRE(c.fn_pod_activation_height.has_value());
+    BOOST_REQUIRE(c.asset_activation_height.has_value());
+    BOOST_REQUIRE(c.flowmesh_activation_height.has_value());
+    BOOST_CHECK_EQUAL(*c.fn_pod_activation_height, 812'000);
+    BOOST_CHECK_EQUAL(*c.asset_activation_height, 813'000);
+    BOOST_CHECK_EQUAL(*c.flowmesh_activation_height, 815'000);
+    BOOST_CHECK_EQUAL(*c.flowmesh_activation_height -
+                          *c.asset_activation_height,
+                      2'000);
+    BOOST_CHECK_GE(*c.flowmesh_activation_height -
+                       *c.asset_activation_height,
+                   Consensus::FLOWMESH_ANCHOR_DEPTH);
+    BOOST_CHECK(Consensus::FnAssetActivationScheduleConfigured(c));
+    BOOST_CHECK(!Consensus::FnPodRulesActive(811'999, c));
+    BOOST_CHECK(Consensus::FnPodRulesActive(812'000, c));
+    BOOST_CHECK(!Consensus::AssetRulesActive(812'999, c));
+    BOOST_CHECK(Consensus::AssetRulesActive(813'000, c));
+    BOOST_CHECK(!Consensus::FlowMeshSeatBindingRulesActive(812'999, c));
+    BOOST_CHECK(Consensus::FlowMeshSeatBindingRulesActive(813'000, c));
+    BOOST_CHECK(Consensus::FlowMeshVaultPreparationRulesActive(813'000, c));
+    BOOST_CHECK(!Consensus::FlowMeshRulesActive(814'999, c));
+    BOOST_CHECK(Consensus::FlowMeshRulesActive(815'000, c));
+    BOOST_CHECK(modern::GetPayloadTypeStatus(3, 1, c, 812'999) ==
+                modern::PayloadTypeStatus::INACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(3, 1, c, 813'000) ==
+                modern::PayloadTypeStatus::ACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(6, 1, c, 811'999) ==
+                modern::PayloadTypeStatus::INACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(6, 1, c, 812'000) ==
+                modern::PayloadTypeStatus::ACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(7, 1, c, 812'999) ==
+                modern::PayloadTypeStatus::INACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(7, 1, c, 813'000) ==
+                modern::PayloadTypeStatus::ACTIVE);
+    for (const uint16_t t : {8, 9}) {
+        BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, c, 814'999) ==
+                    modern::PayloadTypeStatus::INACTIVE);
+        BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, c, 815'000) ==
+                    modern::PayloadTypeStatus::ACTIVE);
+    }
+
+    // FlowMesh activation cannot activate bUSD minting by implication. The
+    // bridge keeps its independent activation/security envelope unset.
+    BOOST_REQUIRE(c.busd_bridge.has_value());
+    BOOST_CHECK(!c.busd_bridge->activation_height.has_value());
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(*c.busd_bridge));
+    BOOST_CHECK(!Consensus::BridgeRulesActive(815'000, c));
+    BOOST_CHECK(!modern::IsMetadataCellActive(
+        static_cast<uint16_t>(modern::PolicyType::BRIDGE_RECORD),
+        modern::POLICY_VERSION_V1, c, 815'000));
+    BOOST_CHECK(modern::GetPayloadTypeStatus(10, 1, c, 815'000) ==
+                modern::PayloadTypeStatus::INACTIVE);
+    for (const uint16_t t : {1, 2}) {
+        BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, c, 815'000) ==
+                    modern::PayloadTypeStatus::INACTIVE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(other_shipped_networks_remain_fail_closed)
+{
+    for (const auto chain : {ChainType::TESTNET, ChainType::TESTNET4,
+                             ChainType::REGTEST, ChainType::SIGNET}) {
         const auto params{CreateChainParams(ArgsManager{}, chain)};
         const Consensus::Params& c{params->GetConsensus()};
-        if (chain == ChainType::MAIN) {
-            // v1 release shape (owner rulings 2026-08-26/27): H = 810,000 is
-            // PINNED and the node is in the OD-10 pause-fail-closed state --
-            // X and the Modern-PoS parameters remain unset, so it accepts
-            // the legacy chain through H and refuses every block above it.
-            BOOST_CHECK_EQUAL(c.hard_fork_height.value_or(0), 810'001); // first non-legacy height
-            BOOST_CHECK_EQUAL(Consensus::LegacyFinalHeight(c).value_or(0), 810'000); // H
-            BOOST_CHECK(!c.legacy_final_hash.has_value());
-            BOOST_CHECK(c.fn_genesis_required);
-            BOOST_CHECK(!c.fn_genesis_rights_root.has_value());
-            BOOST_CHECK(c.fn_genesis_manifest.empty());
-            BOOST_CHECK(Consensus::LegacyBoundaryHeightOnly(c)); // the PAUSE state
-            BOOST_CHECK(!Consensus::LegacyBoundaryPinned(c));
-            BOOST_CHECK_EQUAL(Consensus::ModernPosStartHeight(c).value_or(0), 811'001); // M
-        } else {
-            // Every OTHER shipped network stays fully unpinned.
-            BOOST_CHECK(!c.hard_fork_height.has_value());
-            BOOST_CHECK(!c.legacy_final_hash.has_value());
-            BOOST_CHECK(!Consensus::ModernPosStartHeight(c).has_value());
-            BOOST_CHECK(!c.fn_genesis_required);
-            BOOST_CHECK(!c.fn_genesis_rights_root.has_value());
-            BOOST_CHECK(c.fn_genesis_manifest.empty());
-        }
+        BOOST_CHECK(!c.hard_fork_height.has_value());
+        BOOST_CHECK(!c.legacy_final_hash.has_value());
+        BOOST_CHECK(!Consensus::ModernPosStartHeight(c).has_value());
+        BOOST_CHECK(!c.fn_genesis_required);
+        BOOST_CHECK(!c.fn_genesis_rights_root.has_value());
+        BOOST_CHECK(c.fn_genesis_manifest.empty());
         BOOST_CHECK(!c.modern_pos.has_value());
         BOOST_CHECK(!c.flowmesh_activation_height.has_value());
         BOOST_CHECK(!Consensus::ModernObjectRulesActive(c));

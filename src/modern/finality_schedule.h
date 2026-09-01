@@ -30,7 +30,7 @@ namespace modern {
  *   checkpoint   (h_c - M) mod CHECKPOINT_INTERVAL == 0, h_c >= M
  *   depth        h_b - h_c >= CHECKPOINT_DEPTH   (h_b = height of the including block)
  *   ancestry     FinalizedBlock.block_hash == hash of the block at h_c on THIS chain
- *   withdrawal   FinalizedBlock.withdrawal_root == 0 before bridge activation (A3 not in V1)
+ *   withdrawal   FinalizedBlock.withdrawal_root == 0 before the separately pinned bridge activation
  *   window       FinalizedBlock.epoch in {current, current - 1}
  *   relation     epoch(h_c) == FinalizedBlock.epoch   (epoch in force at the checkpoint)
  *   monotone     FinalizedBlock.height > highest certified height on this chain

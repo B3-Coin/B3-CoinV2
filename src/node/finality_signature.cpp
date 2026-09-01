@@ -65,7 +65,7 @@ std::optional<modern::FinalizedBlock> FinalitySignaturePool::ExpectedFinalizedBl
     modern::FinalizedBlock fb;
     fb.height = height;
     fb.block_hash = index->GetBlockHash();
-    fb.withdrawal_root = uint256{}; // all-zero before bridge activation A3
+    fb.withdrawal_root = uint256{}; // all-zero before separately pinned bridge activation
     fb.validator_set_hash = *successor;
     fb.epoch = epoch;
     return fb;

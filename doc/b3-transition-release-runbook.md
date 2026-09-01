@@ -14,10 +14,22 @@ Implementation state (2026-09-01): the transition branch contains the FN
 manifest/genesis, B3A1 authorization, modern-FN PoD, simple-v1 asset, A1/A2
 gating, FlowMesh A2 preparation/A3 trading gates, dedicated authenticated
 microblock transport, persistent checkpoint/vault state, serialization, index,
-miner, mempool, wallet-signing, RPC, and four-node release-test paths. The exact
-X, R0, manifest/count/root, A1, A2, and A3 values are deliberately unset until
-the seal and owner pinning. The branch therefore remains fail-closed for
-mainnet transition activation.
+miner, mempool, wallet-signing, RPC, and four-node release-test paths. The seal
+and owner pinning are now complete:
+
+```
+X                     = 2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6
+S_H (base units)      = 1042617596101695152
+R0 (base units)       = 19836712254
+FN rights count       = 3592
+FN rights root        = e8f282a7dcaa9a8fbcfcc5c22ba4f456e5b50968fcf899aaacdaca65bef898ec
+FN artifact SHA-256   = c80470eec785600f33fa2e69c520ff331c2b354ebf6e0a9bf8cae7d1eb5f9dca
+A1 / A2 / A3          = 812000 / 813000 / 815000
+```
+
+The old client, port client, and fresh replay produced equal final-H UTXO
+sets, and two independent manifest runs produced byte-identical artifacts.
+Bridge-backed bUSD remains separately fail-closed pending its security pins.
 
 ## 0. Preconditions before the seal
 
@@ -148,17 +160,17 @@ Treasury script for `SNyANHiUkuqPSfbeKHDXzVD86LC2ZUUjLX`:
 
 ### Seal packet checklist
 
-- [ ] Every capture source reports H = 810,000 and identical 64-hex X.
-- [ ] `gettxoutsetinfo` reports `bestblock = X`.
-- [ ] S_H, its exact base-unit conversion, and R0 are recorded without floating
+- [x] Every capture source reports H = 810,000 and identical 64-hex X.
+- [x] `gettxoutsetinfo` reports `bestblock = X`.
+- [x] S_H, its exact base-unit conversion, and R0 are recorded without floating
       point.
-- [ ] Final-H artifacts prove three-way UTXO equivalence with direct exit 0.
-- [ ] Independent FN manifest runs are byte-identical and reproduce R and root.
-- [ ] The published full manifest, checksum, R, and root are archived.
-- [ ] Every manifest row satisfies the historical predicate and exact P2PKH
+- [x] Final-H artifacts prove three-way UTXO equivalence with direct exit 0.
+- [x] Independent FN manifest runs are byte-identical and reproduce R and root.
+- [x] The canonical manifest, checksum, R, and root are embedded and pinned.
+- [x] Every manifest row satisfies the historical predicate and exact P2PKH
       recipient rule; no rows are aggregated.
-- [ ] R is at most 5,000.
-- [ ] Every other mainnet consensus field, including exact post-M heights A1
+- [x] R is at most 5,000.
+- [x] Every other mainnet consensus field, including exact post-M heights A1
       (modern FN PoD), A2 (simple-v1 assets plus FlowMesh preparation), and A3
       (FlowMesh trading/settlement), has an owner ruling. A3 is at least 30
       blocks after A2. Missing values stop the tag.
@@ -203,15 +215,15 @@ In mainnet consensus parameters, confirm the already-fixed height and pin the
 seal-derived or owner-selected values:
 
 ```
-legacy_final_hash       = X
-modern_pos.reward       = R0
+legacy_final_hash       = 2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6
+modern_pos.reward       = 19836712254 base units
 fn_genesis_manifest_version = 1
-fn_genesis_manifest     = exact canonical right rows (count = R)
-fn_genesis_rights_root  = FN_RIGHTS_ROOT
+fn_genesis_manifest     = embedded canonical artifact (count = 3592)
+fn_genesis_rights_root  = e8f282a7dcaa9a8fbcfcc5c22ba4f456e5b50968fcf899aaacdaca65bef898ec
 hard_fork_height        = 810001 (also the fixed FN Genesis height)
-fn_pod_activation_height = A1, owner-ratified and post-M
-asset_activation_height  = A2, owner-ratified and post-M
-flowmesh_activation_height = A3, owner-ratified and A3 >= A2 + 30
+fn_pod_activation_height = 812000 (A1)
+asset_activation_height  = 813000 (A2)
+flowmesh_activation_height = 815000 (A3; 2,000-block preparation runway)
 asset_issuance_fee      = 1,000 B3
 ```
 
@@ -361,10 +373,10 @@ statuses. Any unexplained divergence stops the release.
 
 The first valid block on X is corridor block 810,001 and must contain FN
 Genesis. Stakers deposit during corridor blocks 810,001..811,000. Modern PoS
-begins at M = 811,001. After the pinned soak interval, modern FN PoD creation
-activates at A1. Simple-v1 colored assets and FlowMesh seat/vault preparation
-activate at A2. Full FlowMesh spot trading and settlement activate at A3, with
-at least the required 30-block preparation runway. Each market nevertheless
+begins at M = 811,001. Modern FN PoD creation activates at A1 = 812,000.
+Simple-v1 colored assets and FlowMesh seat/vault preparation activate at
+A2 = 813,000. Full FlowMesh spot trading and settlement activate at
+A3 = 815,000, after a 2,000-block preparation runway. Each market nevertheless
 waits for its own unique earliest canonical block at or after
 `market.created_height` whose post-block FN set has at least four seats, and
 sequence zero starts only once that block is 30-deep. No post-adoption FN

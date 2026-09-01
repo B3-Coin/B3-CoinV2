@@ -50,8 +50,8 @@ namespace modern {
  * mismatch are invalid. Wired into block validation from plan Commit 12:
  * node::FinalityTracker judges the certificate against the epoch state
  * derived from the chain (modern/finality_schedule.h rules) in ConnectBlock.
- * Type 4 is ACTIVE only under the test MPA context; production stays
- * fail-closed until the F = M activation plumbing commit.
+ * Type 4 is active when the complete Modern PoS object rules are configured;
+ * mainnet pins F = M, while unconfigured networks remain fail-closed.
  */
 
 //! The verifier's view of the signing validator set (built from a snapshot).

@@ -118,8 +118,9 @@ inline PayloadTypeStatus GetPayloadTypeStatus(const uint16_t type, const uint16_
                    : PayloadTypeStatus::INACTIVE;
     case MPA_TYPE_FINALITY_CERTIFICATE:
     case MPA_TYPE_FINALITY_KEY_EVIDENCE:
-        // Live from the X-pin configuration (F = M plumbing); every real
-        // network today ships without it, so production stays fail-closed.
+        // Live from the X-pin configuration (F = M plumbing). Mainnet pins
+        // that configuration in the transition release; unconfigured
+        // networks remain fail-closed.
         return Consensus::ModernObjectRulesActive(params) ? PayloadTypeStatus::ACTIVE : PayloadTypeStatus::INACTIVE;
     default:
         return PayloadTypeStatus::UNKNOWN;

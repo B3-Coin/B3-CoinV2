@@ -16,15 +16,19 @@ not competing activation specifications.
 - One chain: legacy ≤ H, PoW corridor, Modern PoS from M. **H = 810,000
   PINNED in mainnet chainparams** (hard_fork_height = 810,001 per the
   field's first-non-legacy semantics; corridor 810,001..811,000 at bits
-  0x1f008000; **M = 811,001**), expected ~2026-09-01. X deliberately
-  blank: the OD-10 pause-fail-closed v1 shape, verified by
-  finality_activation_tests; the X-pin release adds the observed hash.
+  0x1f008000; **M = 811,001**). **X =
+  2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6**
+  is pinned. The sealed UTXO set has 1,241,032 outputs; its RPC
+  `hash_serialized_3` is
+  `9873ede9664a588594e0befdabc8e9cc9267159cfeda5439205a25436d577764`,
+  while the independent three-way canonical-row commitment is
+  `5e7011beee57f403be78ce66c983218e1ee5c934d60dc4b43503d2d6a70760c7`.
 - Modern PoS V1 + BLS finality: implemented, multi-node soak-qualified,
   persisted fail-closed pin; F = M. Full mainnet replay from genesis
   against live peers PASSED (height 808,751, zero errors); real-history
   U==U′ campaign PASSED.
-- Fail-closed everywhere until the X-pin release: mainnet today validates
-  the legacy chain only.
+- The transition consensus pins are present on this release branch. The
+  separately gated bUSD bridge remains fail-closed on mainnet.
 - Transition release contract: pin X, measured S_H-derived R0, and the complete
   independently reproduced FN rights manifest/count/Merkle root during the
   seal pause. Block 810,001 is mandatory FN Genesis: its corridor coinbase
@@ -144,13 +148,13 @@ keys + manifest URL (updater ships disabled without them), artifact
 signing/notarization, push + Actions run, operator distribution before
 H = 810,000 (~Sep 1); then the X-pin release.
 
-## Remaining before the transition release
-Final X and S_H at H; exact integer R0; byte-identical independent production
-of the full FN manifest/count/root; the owner-pinned post-M activation heights
-A1/A2/A3 and bridge security pins; final-H three-way equivalence; the isolated real-history shadow-fork
-rehearsal; release signing keys; and a green five-platform Actions release.
-FN Genesis, owner-script authorization, modern PoD, simple-v1 asset issuance,
-the treasury fee, FlowMesh spot engine/custody/P2P/wallet paths, and activation
-gates are implemented and remain fail-closed until those release pins are
-supplied. Bridge-backed bUSD minting is not release-ready until the separate
-bridge gates listed above are closed.
+## Remaining before publication
+X, S_H, integer R0, the independently reproduced FN manifest/count/root,
+A1 = 812,000, A2 = 813,000, A3 = 815,000, and final-H three-way equivalence
+are pinned on this branch. Remaining release operations are the isolated
+real-history shadow-fork rehearsal through the activation schedule, release
+signing keys, and a green five-platform Actions release. FN Genesis,
+owner-script authorization, modern PoD, simple-v1 asset issuance, the treasury
+fee, and FlowMesh spot engine/custody/P2P/wallet paths are implemented behind
+those exact heights. Bridge-backed bUSD minting remains fail-closed until its
+separate bridge gates are closed.

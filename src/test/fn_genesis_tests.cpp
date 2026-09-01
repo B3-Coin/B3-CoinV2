@@ -2,9 +2,14 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
+#include <chainparams.h>
+#include <common/args.h>
+#include <consensus/consensus.h>
+#include <consensus/era.h>
 #include <consensus/fn_params.h>
 #include <consensus/params.h>
 #include <crypto/common.h>
+#include <kernel/chainparams.h>
 #include <modern/fn.h>
 #include <modern/fn_genesis.h>
 #include <modern/fn_genesis_validation.h>
@@ -14,6 +19,7 @@
 #include <script/script.h>
 #include <span.h>
 #include <uint256.h>
+#include <util/chaintype.h>
 #include <util/strencodings.h>
 
 #include <boost/test/unit_test.hpp>
@@ -285,6 +291,195 @@ BOOST_AUTO_TEST_CASE(synthetic_commitment_vector_is_pinned)
     BOOST_CHECK(!modern::EncodeFnGenesisManifestFileV1(
         domain, 0x01020304, 1, rows, uint256::ONE, &error));
     BOOST_CHECK_EQUAL(error, "fn-genesis-manifest-file-root-mismatch");
+}
+
+BOOST_AUTO_TEST_CASE(manifest_file_v1_encode_decode_roundtrip)
+{
+    uint256 domain;
+    std::iota(domain.begin(), domain.end(), 0x40);
+    const std::vector<Right> rows{Manifest(3)};
+    std::string error;
+    const auto root{modern::ComputeFnGenesisManifestRootV1(
+        domain, 0x01020304, rows, &error)};
+    BOOST_REQUIRE_MESSAGE(root.has_value(), error);
+    const auto encoded{modern::EncodeFnGenesisManifestFileV1(
+        domain, 0x01020304, modern::FN_GENESIS_MANIFEST_VERSION_V1,
+        rows, *root, &error)};
+    BOOST_REQUIRE_MESSAGE(encoded.has_value(), error);
+
+    error = "stale";
+    const auto decoded{modern::DecodeFnGenesisManifestFileV1(*encoded, &error)};
+    BOOST_REQUIRE_MESSAGE(decoded.has_value(), error);
+    BOOST_CHECK(error.empty());
+    BOOST_CHECK(decoded->chain_domain == domain);
+    BOOST_CHECK_EQUAL(decoded->fn_genesis_height, 0x01020304U);
+    BOOST_CHECK_EQUAL(decoded->manifest_version,
+                      modern::FN_GENESIS_MANIFEST_VERSION_V1);
+    BOOST_CHECK(decoded->rights_root == *root);
+    BOOST_CHECK(decoded->manifest == rows);
+    BOOST_CHECK(std::equal(decoded->chain_domain.begin(),
+                           decoded->chain_domain.end(), domain.begin()));
+    BOOST_CHECK(std::equal(decoded->manifest[1].pod_id.begin(),
+                           decoded->manifest[1].pod_id.end(),
+                           rows[1].pod_id.begin()));
+
+    const auto reencoded{modern::EncodeFnGenesisManifestFileV1(
+        decoded->chain_domain, decoded->fn_genesis_height,
+        decoded->manifest_version, decoded->manifest,
+        decoded->rights_root, &error)};
+    BOOST_REQUIRE_MESSAGE(reencoded.has_value(), error);
+    BOOST_CHECK(*reencoded == *encoded);
+}
+
+BOOST_AUTO_TEST_CASE(manifest_file_v1_decoder_rejects_corruption)
+{
+    constexpr size_t MAGIC_SIZE{17};
+    constexpr size_t DOMAIN_OFFSET{MAGIC_SIZE};
+    constexpr size_t VERSION_OFFSET{DOMAIN_OFFSET + 32 + 4};
+    constexpr size_t COUNT_OFFSET{VERSION_OFFSET + 2};
+    constexpr size_t ROOT_OFFSET{COUNT_OFFSET + 4};
+    constexpr size_t ROWS_OFFSET{ROOT_OFFSET + 32};
+    constexpr size_t ROW_SIZE{32 + 20};
+
+    const uint256 domain{Domain()};
+    const std::vector<Right> rows{Row(1, 0x11), Row(2, 0x22)};
+    std::string error;
+    const auto root{modern::ComputeFnGenesisManifestRootV1(
+        domain, 810'001, rows, &error)};
+    BOOST_REQUIRE_MESSAGE(root.has_value(), error);
+    const auto encoded{modern::EncodeFnGenesisManifestFileV1(
+        domain, 810'001, modern::FN_GENESIS_MANIFEST_VERSION_V1,
+        rows, *root, &error)};
+    BOOST_REQUIRE_MESSAGE(encoded.has_value(), error);
+    BOOST_REQUIRE_EQUAL(encoded->size(), ROWS_OFFSET + 2 * ROW_SIZE);
+
+    const auto reject{[&](std::vector<unsigned char> bytes,
+                          const char* expected_error) {
+        error = "stale";
+        const auto decoded{
+            modern::DecodeFnGenesisManifestFileV1(bytes, &error)};
+        BOOST_CHECK(!decoded.has_value());
+        BOOST_CHECK_EQUAL(error, expected_error);
+    }};
+
+    auto corrupted{*encoded};
+    corrupted[0] ^= 0x01;
+    reject(corrupted, "fn-genesis-manifest-file-bad-magic");
+
+    corrupted = *encoded;
+    corrupted.resize(MAGIC_SIZE - 1);
+    reject(corrupted, "fn-genesis-manifest-file-truncated");
+
+    corrupted = *encoded;
+    corrupted.resize(ROWS_OFFSET - 1);
+    reject(corrupted, "fn-genesis-manifest-file-truncated");
+
+    corrupted = *encoded;
+    corrupted.pop_back();
+    reject(corrupted, "fn-genesis-manifest-file-truncated");
+
+    corrupted = *encoded;
+    corrupted.push_back(0x00);
+    reject(corrupted, "fn-genesis-manifest-file-trailing-data");
+
+    corrupted = *encoded;
+    WriteBE32(corrupted.data() + COUNT_OFFSET, 1);
+    reject(corrupted, "fn-genesis-manifest-file-trailing-data");
+
+    corrupted = *encoded;
+    WriteBE32(corrupted.data() + COUNT_OFFSET, 3);
+    reject(corrupted, "fn-genesis-manifest-file-truncated");
+
+    corrupted = *encoded;
+    WriteBE32(corrupted.data() + COUNT_OFFSET, 0);
+    reject(corrupted, "fn-genesis-manifest-empty");
+
+    corrupted = *encoded;
+    WriteBE32(corrupted.data() + COUNT_OFFSET,
+              Consensus::MAX_FN_EVER_ISSUED + 1);
+    reject(corrupted, "fn-genesis-manifest-too-large");
+
+    corrupted = *encoded;
+    WriteBE16(corrupted.data() + VERSION_OFFSET, 2);
+    reject(corrupted, "fn-genesis-manifest-file-unsupported-version");
+
+    corrupted = *encoded;
+    std::fill(corrupted.begin() + DOMAIN_OFFSET,
+              corrupted.begin() + DOMAIN_OFFSET + 32, 0x00);
+    reject(corrupted, "fn-genesis-manifest-file-null-chain-domain");
+
+    corrupted = *encoded;
+    std::fill(corrupted.begin() + ROOT_OFFSET,
+              corrupted.begin() + ROOT_OFFSET + 32, 0x00);
+    reject(corrupted, "fn-genesis-manifest-file-null-root");
+
+    corrupted = *encoded;
+    std::rotate(corrupted.begin() + ROWS_OFFSET,
+                corrupted.begin() + ROWS_OFFSET + ROW_SIZE,
+                corrupted.end());
+    reject(corrupted, "fn-genesis-manifest-not-raw-sorted");
+
+    corrupted = *encoded;
+    std::copy_n(corrupted.begin() + ROWS_OFFSET, ROW_SIZE,
+                corrupted.begin() + ROWS_OFFSET + ROW_SIZE);
+    reject(corrupted, "fn-genesis-manifest-duplicate-pod");
+
+    corrupted = *encoded;
+    corrupted[ROWS_OFFSET + 32] ^= 0x01;
+    reject(corrupted, "fn-genesis-manifest-file-root-mismatch");
+}
+
+BOOST_AUTO_TEST_CASE(mainnet_sealed_manifest_is_exact)
+{
+    const auto chain_params{
+        CreateChainParams(ArgsManager{}, ChainType::MAIN)};
+    const Consensus::Params& params{chain_params->GetConsensus()};
+
+    BOOST_REQUIRE(params.hard_fork_height.has_value());
+    BOOST_CHECK_EQUAL(*params.hard_fork_height, 810'001);
+    BOOST_REQUIRE(params.legacy_final_hash.has_value());
+    BOOST_CHECK(*params.legacy_final_hash == uint256{
+        "2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6"});
+    const auto domain{modern::ModernChainDomain(
+        params.hashGenesisBlock, *params.legacy_final_hash)};
+    BOOST_REQUIRE(domain.has_value());
+    BOOST_CHECK(*domain == uint256{
+        "6a48d15d8da05571e0e7afe5d49bfae0ca7cd71305297f04461603e92a2651a6"});
+
+    BOOST_CHECK_EQUAL(params.fn_genesis_manifest_version, 1);
+    BOOST_CHECK_EQUAL(params.fn_genesis_manifest.size(), 3'592U);
+    BOOST_REQUIRE(params.fn_genesis_rights_root.has_value());
+    BOOST_CHECK(*params.fn_genesis_rights_root == uint256{
+        "e8f282a7dcaa9a8fbcfcc5c22ba4f456e5b50968fcf899aaacdaca65bef898ec"});
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(
+        modern::CheckFnGenesisConfiguration(params, error), error);
+
+    const auto encoded{modern::EncodeFnGenesisManifestFileV1(
+        *domain, static_cast<uint32_t>(*params.hard_fork_height),
+        params.fn_genesis_manifest_version, params.fn_genesis_manifest,
+        *params.fn_genesis_rights_root, &error)};
+    BOOST_REQUIRE_MESSAGE(encoded.has_value(), error);
+    BOOST_CHECK_EQUAL(encoded->size(), 186'875U);
+    BOOST_CHECK_EQUAL(
+        HexStr(modern::FnGenesisManifestFileSha256(*encoded)),
+        "c80470eec785600f33fa2e69c520ff331c2b354ebf6e0a9bf8cae7d1eb5f9dca");
+
+    const auto outputs{modern::ExpectedFnGenesisOutputs(params, error)};
+    BOOST_REQUIRE_MESSAGE(outputs.has_value(), error);
+    BOOST_CHECK_EQUAL(outputs->size(), 3'592U);
+    const uint64_t output_weight{
+        static_cast<uint64_t>(GetSerializeSize(*outputs)) *
+        WITNESS_SCALE_FACTOR};
+    uint64_t sigops_cost{0};
+    for (const CTxOut& output : *outputs) {
+        sigops_cost += static_cast<uint64_t>(
+            output.scriptPubKey.GetSigOpCount(/*fAccurate=*/false)) *
+            WITNESS_SCALE_FACTOR;
+    }
+    BOOST_CHECK_LT(output_weight, static_cast<uint64_t>(MAX_BLOCK_WEIGHT));
+    BOOST_CHECK_LT(sigops_cost,
+                   static_cast<uint64_t>(MAX_BLOCK_SIGOPS_COST));
 }
 
 BOOST_AUTO_TEST_CASE(historical_and_hard_cap_bounds)

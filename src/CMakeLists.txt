@@ -149,6 +149,10 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   script/signingprovider.cpp
   script/solver.cpp
 )
+include(TargetDataSources)
+target_raw_data_sources(bitcoin_common NAMESPACE kernel::data
+  kernel/data/mainnet_fn_genesis_v1.bin
+)
 target_link_libraries(bitcoin_common
   PRIVATE
     core_interface

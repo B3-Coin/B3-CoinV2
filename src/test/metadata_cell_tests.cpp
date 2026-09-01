@@ -292,9 +292,18 @@ BOOST_AUTO_TEST_CASE(check_metadata_cell_outputs_rules)
                 !modern::IsActivatedPolicy(7, 1) &&
                 !modern::IsActivatedPolicy(8, 1) &&
                 !modern::IsActivatedPolicy(9, 1));
-    // Real chainparams never set the flag.
-    for (const auto& chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::REGTEST}) {
-        BOOST_CHECK(!Consensus::ModernObjectRulesActive(CreateChainParams(ArgsManager{}, chain)->GetConsensus()));
+    // Real chainparams never use the test override. Mainnet's sealed H/X/PoS
+    // pins now activate the production modern-object context; other ordinary
+    // shipped networks remain fail closed.
+    for (const auto& chain : {ChainType::MAIN, ChainType::TESTNET,
+                              ChainType::TESTNET4, ChainType::SIGNET,
+                              ChainType::REGTEST}) {
+        const auto chain_params{CreateChainParams(ArgsManager{}, chain)};
+        const Consensus::Params& params{
+            chain_params->GetConsensus()};
+        BOOST_CHECK(!params.test_only_asset_policies_active);
+        BOOST_CHECK_EQUAL(Consensus::ModernObjectRulesActive(params),
+                          chain == ChainType::MAIN);
     }
 }
 

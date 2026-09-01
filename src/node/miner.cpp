@@ -385,9 +385,8 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     coinbaseTx.vout[0].scriptPubKey = m_options.coinbase_output_script;
     // Block subsidy + fees. Corridor blocks claim fees plus the configured
     // corridor reward; modern-PoS blocks claim fees plus the configured
-    // (REVISABLE_BEFORE_MAINNET, provisionally 0) modern reward, matching
-    // the unconditional consensus cap. Only non-B3 chains use the stock
-    // subsidy schedule.
+    // sealed-supply-derived modern reward, matching the unconditional
+    // consensus cap. Only non-B3 chains use the stock subsidy schedule.
     CAmount modern_subsidy{0};
     CAmount treasury_share{0};
     if (b3_modern_pos && b3_consensus.modern_pos) {

@@ -37,11 +37,11 @@ namespace modern {
  * byte-identical on disk and in history, and are merely *viewed* through
  * this model when spent after the boundary.
  *
- * Each non-base policy has an explicit feature gate. A2 alone does not
- * activate the DEX vault or FlowMesh: FN-v2 pre-binding opens at A2 only when
- * a complete, anchor-depth-separated A3 schedule is pinned, and full
- * FlowMesh rules still wait for A3. No generic VM is added; unknown or
- * unactivated (type, version) pairs are invalid.
+ * Each non-base policy has an explicit feature gate. With a complete,
+ * anchor-depth-separated A3 schedule, FN-v2 pre-binding and DEX_VAULT-v2
+ * creation/preparation open at A2; vault spending and full FlowMesh rules
+ * wait for A3. No generic VM is added; unknown or unactivated (type, version)
+ * pairs are invalid.
  */
 
 //! Stable 32-byte asset identifier.
@@ -74,8 +74,8 @@ inline constexpr size_t MAX_POLICY_PARAMS_SIZE{80};
  *  - DEX_VAULT: FlowMesh custody. v2: the commitment is the non-null VaultId
  *    and semantic params are {kind, shard, [account]}. A vault has no private
  *    key. The B3A1 wire carrier prefixes VaultId to those semantic params and
- *    activates only with full FlowMesh at A3; A2 seat pre-binding does not
- *    activate it. Spending authorization is specified separately.
+ *    may be created for preparation at A2. Spending authorization and
+ *    trading/checkpoint effects activate separately at A3.
  *  - STAKE: locked native B3 carrying a validator binding (modern/stake.h
  *    defines the v1 on-chain carrier). v1: the commitment is the owner
  *    binding (SHA256 of the owner script suffix, the OWNER scheme) and

@@ -326,11 +326,10 @@ BOOST_AUTO_TEST_CASE(index_connect_disconnect_rebuild)
     BOOST_CHECK(!incremental.OwnerOf(Pk(k2)).has_value()); // b moved off k2
 }
 
-BOOST_AUTO_TEST_CASE(production_remains_fail_closed)
+BOOST_AUTO_TEST_CASE(incomplete_configuration_remains_fail_closed)
 {
-    // No carrier exists for the evidence yet; a FINALITY_KEY cell is invalid in
-    // production regardless of any semantics above, and the checker is not
-    // reachable from transaction validation.
+    // A FINALITY_KEY cell remains invalid when the H/X/PoS activation envelope
+    // is incomplete, regardless of otherwise well-formed evidence.
     Consensus::Params production{};
     production.legacy_b3coin = true;
     BOOST_CHECK(!Consensus::ModernObjectRulesActive(production));
@@ -347,8 +346,12 @@ BOOST_AUTO_TEST_CASE(production_remains_fail_closed)
     BOOST_CHECK(!modern::CheckMetadataCellOutputs(CTransaction{mtx}, production, err));
     BOOST_CHECK(err.find("inactive") != std::string::npos);
     BOOST_CHECK(!modern::IsActivatedPolicy(static_cast<uint16_t>(modern::PolicyType::FINALITY_KEY), 1));
-    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::REGTEST}) {
-        BOOST_CHECK(!Consensus::ModernObjectRulesActive(CreateChainParams(ArgsManager{}, chain)->GetConsensus()));
+    BOOST_CHECK(Consensus::ModernObjectRulesActive(
+        CreateChainParams(ArgsManager{}, ChainType::MAIN)->GetConsensus()));
+    for (const auto chain : {ChainType::TESTNET, ChainType::TESTNET4,
+                             ChainType::SIGNET, ChainType::REGTEST}) {
+        BOOST_CHECK(!Consensus::ModernObjectRulesActive(
+            CreateChainParams(ArgsManager{}, chain)->GetConsensus()));
     }
     // The cell's params decode back to the binding the evidence must match.
     const auto cell{modern::ParseMetadataCell(*script)};

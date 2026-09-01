@@ -340,9 +340,15 @@ BOOST_AUTO_TEST_CASE(registry_and_activation_fail_closed)
         BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{tx}, active, err));
         BOOST_CHECK_EQUAL(err, "mpa-record-order");
     }
-    // No chainparams enable the context.
-    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::REGTEST}) {
-        BOOST_CHECK(!Consensus::ModernObjectRulesActive(CreateChainParams(ArgsManager{}, chain)->GetConsensus()));
+    // The sealed mainnet transition enables the modern-object context. Other
+    // ordinary shipped networks remain unpinned and fail closed; the complete
+    // FlowMesh regtest exists only behind explicit test options.
+    BOOST_CHECK(Consensus::ModernObjectRulesActive(
+        CreateChainParams(ArgsManager{}, ChainType::MAIN)->GetConsensus()));
+    for (const auto chain : {ChainType::TESTNET, ChainType::TESTNET4,
+                             ChainType::SIGNET, ChainType::REGTEST}) {
+        BOOST_CHECK(!Consensus::ModernObjectRulesActive(
+            CreateChainParams(ArgsManager{}, chain)->GetConsensus()));
     }
     // Standalone creation actions know 1-3 and proof-free modern FN type 6;
     // finality records 4/5 and FlowMesh records 7/8/9 remain MPA-only.
