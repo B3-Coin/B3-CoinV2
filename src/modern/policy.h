@@ -116,13 +116,16 @@ enum class PolicyType : uint16_t {
     //!   FINALITY_KEY         validator BLS-binding cell (commitment =
     //!                        validator_key, params = bls_pubkey || seq),
     //!   MODERN_PAYLOAD_ROOT  coinbase-only commitment to the block's MPA
-    //!                        sections (commitment = payload_root, no params).
-    //! DECLARED, NOT ACTIVATED: IsActivatedPolicy fails closed for all three
-    //! until their carriers and rules land (implementation plan, Commits
-    //! 3-7); a claiming output is invalid, never reinterpreted.
+    //!                        sections (commitment = payload_root, no params),
+    //!   BRIDGE_RECORD        transaction-signature binding for one exact
+    //!                        type-10 MPA record (commitment = tagged hash of
+    //!                        its canonical frame, no params).
+    //! These numbers are append-only. Activation remains contextual and
+    //! fail-closed; a claiming output is invalid, never reinterpreted.
     FINALITY_CERT = 6,
     FINALITY_KEY = 7,
     MODERN_PAYLOAD_ROOT = 8,
+    BRIDGE_RECORD = 9,
 };
 
 //! DEX_VAULT v1 params: exactly a little-endian 2-byte shard id.
@@ -408,9 +411,10 @@ inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int he
     case PolicyType::FINALITY_CERT:
     case PolicyType::FINALITY_KEY:
     case PolicyType::MODERN_PAYLOAD_ROOT:
-        // UNREACHABLE: declared numbers without activated rules (the
-        // IsActivatedPolicy gate above fails closed). Kept explicit so the
-        // switch stays exhaustive and no future default can accept them.
+    case PolicyType::BRIDGE_RECORD:
+        // Metadata cells never use the spendable B3A1 carrier handled here.
+        // Kept explicit so the switch stays exhaustive and no future default
+        // can accidentally accept them.
         return PolicyOutputCheck::UNKNOWN_POLICY;
     }
     return PolicyOutputCheck::OK;

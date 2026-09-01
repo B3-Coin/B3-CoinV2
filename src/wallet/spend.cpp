@@ -34,6 +34,7 @@
 #include <wallet/wallet.h>
 
 #include <modern/asset_output.h>
+#include <modern/metadata_cell.h>
 #include <modern/payload_cost.h>
 
 #include <cmath>
@@ -1137,12 +1138,13 @@ bool IsDust(const CRecipient& recipient, const CFeeRate& dustRelayFee)
 {
     const CTxOut output{recipient.nAmount,
                         GetScriptForDestination(recipient.dest)};
-    // A canonical B3A1 output carries its value in integer asset units and
-    // deliberately has zero native value. Only the strict carrier parser may
-    // bypass native-B3 dust policy; a malformed B3A1 namespace claim remains
-    // dust and is rejected by the ordinary wallet path.
+    // Canonical B3A1 outputs and typed metadata cells deliberately have zero
+    // native value. Only their strict carrier parsers may bypass native-B3
+    // dust policy; malformed namespace claims remain dust and are rejected by
+    // the ordinary wallet path.
     std::string asset_error;
     if (modern::ParseAssetOutput(output, asset_error)) return false;
+    if (output.nValue == 0 && modern::IsMetadataCell(output.scriptPubKey)) return false;
     return ::IsDust(output, dustRelayFee);
 }
 

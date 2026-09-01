@@ -24,7 +24,16 @@ B3-fail-independent spot DEX:
 Futures, leverage, native CDP/oracle bUSD, generic bridges, asset/asset
 markets, governance, slashing, and a generic policy VM are not v1. The
 production exception is the exact Ethereum-mainnet USDT vault registration
-that mints bridge-backed bUSD 1:1 after its independent bridge gates pass. The reserved
+that may mint bridge-backed bUSD 1:1 only after its independent bridge gates
+pass. The bounded type-10 bootstrap/update/mint/backfill/managed-withdrawal
+carrier, exact OWNER mint, exact bUSD BURN request, nullifier/caps,
+undo/reindex replay, and mempool/miner/asset integration are implemented.
+Every type-10 record has one exact zero-value policy-9 `BRIDGE_RECORD`
+metadata output, so standard `SIGHASH_ALL` binds its canonical bytes through
+ordinary outputs without `OP_RETURN` or a custom sighash. Bridge state is
+rebuilt in memory from activation and configured bridge nodes refuse pruning
+because no durable sidecar exists. The origin-enforced USDT adapter and
+operator release/consumption service are not implemented. The reserved
 `SPOT_TO_FUTURES` and `FUTURES_TO_SPOT` action numbers remain rejected.
 
 FlowMesh may pause or permanently safe-halt without stopping block download,
@@ -62,9 +71,13 @@ Use semantic consensus fields, not overloaded ordinal names:
 fn_pod_activation_height         // A1: post-genesis modern FN PoD
 asset_activation_height          // A2: assets + FN-v2 seats + vault preparation
 flowmesh_activation_height       // A3: trading, checkpoints, and vault effects
-bridge_deposit_activation_height // separately pinned, >= A3; unset fails closed
-bridge_withdrawal_activation_height // separately pinned; unset fails closed
+busd_bridge.activation_height    // separate bridge gate, >= A3; unset fails closed
+busd_bridge.withdrawal_mode      // MANAGED_V1 only when explicitly pinned
 ```
+
+Both bridge fields participate in the complete fail-closed bridge parameter
+envelope. Reaching the height is insufficient unless every required identity,
+light-client, fork, cap, adapter, authority, runtime, and rules pin is present.
 
 The former document convention `A2 = FlowMesh, A3 = bridge` is superseded.
 Bridge-gating comments and checks must name the explicit bridge activation
@@ -695,13 +708,27 @@ keys. The following are hard blockers to tagging v1.1:
    still release gates;
 3. the four-seat end-to-end release rehearsal, reorg rollback checks, and
    focused custody/funds-safety suites must all be green on the final tree;
-4. bridge-backed bUSD needs the reviewed Ethereum bootstrap, activation,
-   per-block/per-epoch mint caps, USDT adapter commitment, durable light-client
-   and deposit-nullifier state, consensus proof carrier, plus the independently
-   verified managed release-authority/runtime-code/rules pins; and
+4. bridge-backed bUSD needs independent review of the implemented type-10
+   mint/burn state machine and replay/undo path; an origin-enforced USDT
+   adapter; the production Ethereum checkpoint/fork schedule, separate
+   activation, approval range and per-block/per-epoch caps; reproducible
+   runtime evidence and audits; and every authority/rules/X-dependent pin.
+   The current state is rebuilt from activation and pruning stays refused until
+   an atomic durable sidecar exists. Managed rules require the implemented
+   finalized B3 burn request binding canonical bUSD, exact raw amount,
+   Ethereum recipient and unique request id; the still-unimplemented operator
+   service must wait finality, release exactly once, durably consume the id,
+   and reconcile reserves against supply. No burn means no release; and
 5. every stale document/comment that says FlowMesh ships later or native-CDP
    bUSD is current must be superseded.
 
 Until the relevant gates pass, FlowMesh and bridge minting remain independently
 fail-closed on production networks. A green FlowMesh rehearsal never activates
 an incompletely pinned bridge.
+
+A later decentralized verifier cannot replace the managed authority in this
+vault. A new vault changes the current vault-bound `AssetId`, so migration must
+explicitly retire the old registry, stop presenting deposits, handle/refund
+late deposits to the still-callable old vault, burn/swap/reissue old bUSD, move
+reserves without creating a second mint claim, and pin the new identity and
+contracts.

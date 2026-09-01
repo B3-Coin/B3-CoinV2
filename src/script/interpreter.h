@@ -152,6 +152,13 @@ enum class script_verify_flag_name : uint8_t {
     // pre-hard-fork chain.
     SCRIPT_VERIFY_LEGACY_B3_STRICTENC,
 
+    // A managed bridge withdrawal authorizes an external reserve release.
+    // Every evaluated signature must therefore commit the complete
+    // transaction: ECDSA SIGHASH_ALL, or Schnorr DEFAULT/ALL. This flag is
+    // selected transaction-by-transaction by modern validation, never as a
+    // blanket rule for ordinary spends.
+    SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL,
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER

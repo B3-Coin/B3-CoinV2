@@ -260,6 +260,26 @@ constexpr bool FlowMeshRulesActive(const int height, const Params& params)
 }
 
 /**
+ * Bridge records have their own independently complete activation envelope.
+ * FlowMesh A3 never turns the bridge on by itself: every proof, cap,
+ * withdrawal-mode and origin-chain pin must be present, and the bridge's
+ * explicit activation may not precede A3.  An approval_last_height limits
+ * new mints in the bridge admission layer; it deliberately does not disable
+ * light-client maintenance or already-backed withdrawal requests.
+ */
+inline bool BridgeRulesActive(const int height, const Params& params)
+{
+    if (!FlowMeshRulesActive(height, params) || !params.busd_bridge ||
+        !BridgeMintParamsReady(*params.busd_bridge) ||
+        !params.busd_bridge->activation_height) {
+        return false;
+    }
+    return *params.busd_bridge->activation_height >=
+               *params.flowmesh_activation_height &&
+           height >= *params.busd_bridge->activation_height;
+}
+
+/**
  * Return the block-production consensus phase governing the block at
  * `height`. Single source of truth for phase selection; like GetB3Era it
  * must only be consulted where the height is already unambiguous, and never

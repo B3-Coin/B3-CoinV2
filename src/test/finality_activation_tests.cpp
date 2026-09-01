@@ -15,6 +15,7 @@
 #include <consensus/era.h>
 #include <consensus/params.h>
 #include <kernel/chainparams.h>
+#include <modern/bridge_binding.h>
 #include <modern/fn_genesis_validation.h>
 #include <modern/metadata_cell.h>
 #include <modern/mpa.h>
@@ -61,9 +62,9 @@ BOOST_AUTO_TEST_CASE(mainnet_and_all_shipped_networks_fail_closed)
         BOOST_CHECK(!c.flowmesh_activation_height.has_value());
         BOOST_CHECK(!Consensus::ModernObjectRulesActive(c));
         // Cells: every policy type inactive.
-        for (const uint16_t t : {6, 7, 8}) BOOST_CHECK(!modern::IsMetadataCellActive(t, modern::POLICY_VERSION_V1, c));
+        for (const uint16_t t : {6, 7, 8, 9}) BOOST_CHECK(!modern::IsMetadataCellActive(t, modern::POLICY_VERSION_V1, c));
         // MPA: every type inactive or unknown; an MPA-bearing tx is invalid.
-        for (const uint16_t t : {1, 2, 3, 4, 5, 6, 7}) {
+        for (const uint16_t t : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
             BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, c) != modern::PayloadTypeStatus::ACTIVE);
         }
         CMutableTransaction m;
@@ -100,13 +101,17 @@ BOOST_AUTO_TEST_CASE(activation_is_exactly_the_x_pin_configuration)
 
     // Active exactly where specified: policies 6/7/8 (version 1 only), MPA
     // types 4/5 (version 1 only). Types 1..3 and the separately scheduled
-    // FlowMesh type 9 stay known-but-inactive here; unknown stays unknown;
-    // the 80-byte policy-state bound is untouched.
+    // FlowMesh type 9 and bridge type 10 stay known-but-inactive here; the
+    // bridge binding policy 9 also remains height-gated; unknown stays
+    // unknown; the 80-byte policy-state bound is untouched.
     for (const uint16_t t : {6, 7, 8}) {
         BOOST_CHECK(modern::IsMetadataCellActive(t, modern::POLICY_VERSION_V1, c));
         BOOST_CHECK(!modern::IsMetadataCellActive(t, 2, c));
     }
     BOOST_CHECK(!modern::IsMetadataCellActive(5, modern::POLICY_VERSION_V1, c));
+    BOOST_CHECK(!modern::IsMetadataCellActive(
+        static_cast<uint16_t>(modern::PolicyType::BRIDGE_RECORD),
+        modern::POLICY_VERSION_V1, c));
     for (const uint16_t t : {4, 5}) {
         BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, c) == modern::PayloadTypeStatus::ACTIVE);
         BOOST_CHECK(modern::GetPayloadTypeStatus(t, 2, c) == modern::PayloadTypeStatus::UNKNOWN);
@@ -115,6 +120,7 @@ BOOST_AUTO_TEST_CASE(activation_is_exactly_the_x_pin_configuration)
         BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, c) == modern::PayloadTypeStatus::INACTIVE);
     }
     BOOST_CHECK(modern::GetPayloadTypeStatus(9, 1, c) == modern::PayloadTypeStatus::INACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(10, 1, c) == modern::PayloadTypeStatus::INACTIVE);
     BOOST_CHECK_EQUAL(modern::MAX_POLICY_PARAMS_SIZE, 80U);
     // The modern-PoS start (F = M) derives from the same pins.
     BOOST_CHECK_EQUAL(*Consensus::ModernPosStartHeight(c), 99 + 1 + c.transition_pow_length);
@@ -180,6 +186,37 @@ BOOST_AUTO_TEST_CASE(flowmesh_release_regtest_schedule_is_complete_and_isolated)
         *c.flowmesh_activation_height - 1, c));
     BOOST_CHECK(Consensus::FlowMeshRulesActive(
         *c.flowmesh_activation_height, c));
+    BOOST_REQUIRE(c.busd_bridge);
+    BOOST_REQUIRE(c.busd_bridge->activation_height);
+    const int bridge_activation{*c.busd_bridge->activation_height};
+    BOOST_CHECK_EQUAL(bridge_activation, *c.flowmesh_activation_height);
+    BOOST_CHECK(Consensus::BridgeMintParamsReady(*c.busd_bridge));
+    BOOST_CHECK(!Consensus::BridgeRulesActive(bridge_activation - 1, c));
+    BOOST_CHECK(Consensus::BridgeRulesActive(bridge_activation, c));
+    BOOST_CHECK(modern::GetPayloadTypeStatus(
+                    modern::CREATION_ACTION_BRIDGE, modern::MPA_VERSION_V1,
+                    c, bridge_activation - 1) ==
+                modern::PayloadTypeStatus::INACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(
+                    modern::CREATION_ACTION_BRIDGE, modern::MPA_VERSION_V1,
+                    c, bridge_activation) ==
+                modern::PayloadTypeStatus::ACTIVE);
+
+    CMpaRecord bridge_record;
+    bridge_record.payload_type = modern::CREATION_ACTION_BRIDGE;
+    bridge_record.payload_version = modern::MPA_VERSION_V1;
+    bridge_record.payload = {0x01};
+    const auto bridge_binding{
+        modern::MakeBridgeBindingOutput(bridge_record)};
+    BOOST_REQUIRE(bridge_binding);
+    CMutableTransaction bridge_tx;
+    bridge_tx.vout.push_back(*bridge_binding);
+    std::string bridge_error;
+    BOOST_CHECK(!modern::CheckMetadataCellOutputs(
+        CTransaction{bridge_tx}, c, bridge_activation - 1, bridge_error));
+    BOOST_CHECK(bridge_error.find("inactive") != std::string::npos);
+    BOOST_CHECK(modern::CheckMetadataCellOutputs(
+        CTransaction{bridge_tx}, c, bridge_activation, bridge_error));
     BOOST_CHECK(!c.modern_pos->treasury_script.empty());
 
     // The ordinary modern-regtest configuration remains untouched and has no

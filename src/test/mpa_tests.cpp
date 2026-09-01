@@ -8,11 +8,14 @@
 // activation fail-closed behaviour, and the transaction-identity guardrail
 // (txid excludes the MPA; ptxid and the wtxid-shaped relay slot commit to it).
 
+#include <bridge/proof.h>
 #include <chainparams.h>
 #include <consensus/consensus.h>
 #include <consensus/params.h>
 #include <hash.h>
+#include <kernel/chainparams.h>
 #include <legacy/codec.h>
+#include <modern/bridge_binding.h>
 #include <modern/creation_action.h>
 #include <modern/finality_types.h>
 #include <modern/mpa.h>
@@ -284,7 +287,9 @@ BOOST_AUTO_TEST_CASE(registry_and_activation_fail_closed)
     BOOST_CHECK(modern::GetPayloadTypeStatus(7, 2, active) == PayloadTypeStatus::UNKNOWN);
     BOOST_CHECK(modern::GetPayloadTypeStatus(8, 1, active) == PayloadTypeStatus::INACTIVE);
     BOOST_CHECK(modern::GetPayloadTypeStatus(9, 1, active) == PayloadTypeStatus::INACTIVE);
-    for (const uint16_t t : {0, 10, 99, 65535}) BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, active) == PayloadTypeStatus::UNKNOWN);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(10, 1, active) == PayloadTypeStatus::INACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(10, 2, active) == PayloadTypeStatus::UNKNOWN);
+    for (const uint16_t t : {0, 99, 65535}) BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, active) == PayloadTypeStatus::UNKNOWN);
     std::string err;
     // Production: any MPA is invalid (not active), even a perfectly formed type-5 record.
     {
@@ -304,8 +309,12 @@ BOOST_AUTO_TEST_CASE(registry_and_activation_fail_closed)
     {
         CMutableTransaction tx{BaseTx()};
         tx.mpa.push_back(Rec(10, 1, {0x00}));
+        const auto binding{modern::MakeBridgeBindingOutput(tx.mpa.front())};
+        BOOST_REQUIRE(binding);
+        tx.vout.push_back(*binding);
         BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{tx}, active, err));
-        BOOST_CHECK_EQUAL(err, "mpa-unknown-type");
+        BOOST_CHECK_EQUAL(err, "mpa-inactive-type");
+        tx.vout.pop_back();
         tx.mpa[0] = Rec(5, 2, Evidence244());
         BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{tx}, active, err));
         BOOST_CHECK_EQUAL(err, "mpa-unknown-type");
@@ -344,6 +353,78 @@ BOOST_AUTO_TEST_CASE(registry_and_activation_fail_closed)
                 !modern::IsKnownCreationAction(7, 1) &&
                 !modern::IsKnownCreationAction(8, 1) &&
                 !modern::IsKnownCreationAction(9, 1));
+}
+
+BOOST_AUTO_TEST_CASE(bridge_record_is_independently_gated_and_strictly_decoded)
+{
+    CChainParams::RegTestOptions options;
+    CChainParams::B3ModernRegTestOptions b3;
+    b3.flowmesh_test = true;
+    options.b3_modern = b3;
+    const auto chain{CChainParams::RegTest(options)};
+    const Consensus::Params& params{chain->GetConsensus()};
+    BOOST_REQUIRE(params.busd_bridge);
+    BOOST_REQUIRE(params.busd_bridge->activation_height);
+    const int activation{*params.busd_bridge->activation_height};
+
+    bridge::BridgeManagedWithdrawalV1 withdrawal;
+    withdrawal.registry_id = uint256{uint8_t{1}};
+    withdrawal.raw_amount = 1;
+    withdrawal.ethereum_recipient.fill(0x22);
+    const auto record{bridge::MakeBridgeMpaRecord(
+        bridge::BridgeRecordV1{bridge::BridgeRecordKindV1::MANAGED_WITHDRAWAL,
+                               withdrawal})};
+    BOOST_REQUIRE(record);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+
+    CMutableTransaction tx{BaseTx()};
+    tx.mpa = {*record};
+    tx.vout.push_back(*binding);
+    std::string error;
+    BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{tx}, params,
+                                              activation - 1, error));
+    BOOST_CHECK_EQUAL(error, "mpa-inactive-type");
+    BOOST_CHECK(modern::CheckTransactionMpa(CTransaction{tx}, params,
+                                             activation, error));
+
+    CMutableTransaction missing{tx};
+    missing.vout.pop_back();
+    BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{missing}, params,
+                                              activation, error));
+    BOOST_CHECK_EQUAL(error, "bridge-binding-missing");
+
+    CMutableTransaction mismatch{tx};
+    mismatch.mpa[0].payload.back() ^= 0x01;
+    BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{mismatch}, params,
+                                              activation, error));
+    BOOST_CHECK_EQUAL(error, "bridge-binding-mismatch");
+
+    CMutableTransaction duplicate{tx};
+    duplicate.vout.push_back(*binding);
+    BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{duplicate}, params,
+                                              activation, error));
+    BOOST_CHECK_EQUAL(error, "bridge-binding-multiple");
+
+    CMutableTransaction orphan{BaseTx()};
+    orphan.vout.push_back(*binding);
+    BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{orphan}, params,
+                                              activation, error));
+    BOOST_CHECK_EQUAL(error, "mpa-orphan-bridge-binding");
+
+    tx.mpa.insert(tx.mpa.begin(), Rec(3, 1, {0x00}));
+    BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{tx}, params,
+                                              activation, error));
+    BOOST_CHECK_EQUAL(error, "mpa-bridge-record-not-exclusive");
+    tx.mpa.erase(tx.mpa.begin());
+
+    tx.mpa[0].payload[1] = 1; // reserved byte must remain zero
+    const auto malformed_binding{modern::MakeBridgeBindingOutput(tx.mpa[0])};
+    BOOST_REQUIRE(malformed_binding);
+    tx.vout.back() = *malformed_binding;
+    BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{tx}, params,
+                                              activation, error));
+    BOOST_CHECK_EQUAL(error, "mpa-malformed-bridge-record");
 }
 
 BOOST_AUTO_TEST_CASE(txid_unchanged_by_mpa_full_relay_id_changes)

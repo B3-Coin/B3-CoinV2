@@ -69,6 +69,7 @@ class FinalityBindingTracker;
 class FnSeatTracker;
 class FlowMeshCheckpointTracker;
 class FlowMeshVaultTracker;
+class BridgeStateTracker;
 class FinalityTracker;
 class FinalitySignaturePool;
 } // namespace node
@@ -610,6 +611,8 @@ protected:
     std::unique_ptr<node::FlowMeshCheckpointTracker> m_flowmesh_checkpoints GUARDED_BY(::cs_main);
     //! Lazily created A3+ DEX_VAULT history; see ModernFlowMeshVaults().
     std::unique_ptr<node::FlowMeshVaultTracker> m_flowmesh_vaults GUARDED_BY(::cs_main);
+    //! Lazily created, replayable type-10 bridge light-client/nullifier state.
+    std::unique_ptr<node::BridgeStateTracker> m_bridge_state GUARDED_BY(::cs_main);
     //! Lazily created finality / epoch state tracker (derived, rebuildable); see ModernFinality().
     std::unique_ptr<node::FinalityTracker> m_finality_tracker GUARDED_BY(::cs_main);
     //! Lazily created finality-signature pool (liveness only); see FinalitySignatures().
@@ -645,6 +648,8 @@ public:
     node::FlowMeshCheckpointTracker& ModernFlowMeshCheckpoints() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     //! Derived, rebuildable DEX_VAULT creation/spend history by anchor.
     node::FlowMeshVaultTracker& ModernFlowMeshVaults() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! Derived Ethereum light-client, execution-anchor, mint and withdrawal state.
+    node::BridgeStateTracker& ModernBridgeState() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     //! The derived finality / epoch state machine of this chainstate (certificate
     //! verification, gated epoch rotation, finalized tip). Consensus reads it in
     //! ConnectBlock; it rebuilds from the active chain whenever out of step.

@@ -9,8 +9,8 @@ a Solidity toolchain.
 
 | Contract | Leg | Status |
 |---|---|---|
-| `B3DepositVault.sol` | ETH -> B3 deposits (owner ruling 2026-08-24: this leg first) | source complete; managed-v1 vault `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6` observed; reproducible source/runtime match remains a gate |
-| `B3FinalityVerifier.sol` + `BlsCertificateProver.sol` + release wiring | future decentralized B3 -> ETH withdrawals | specified normatively in `doc/design/b3-cross-chain-finality-v1.md` §5–§7; requires a new audited vault and controlled reserve migration |
+| `B3DepositVault.sol` | ETH -> B3 deposits (owner ruling 2026-08-24: this leg first) | source complete; managed-v1 vault `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6` observed; the bounded type-10 B3 mint path is implemented, while reproducible source/runtime matching, adapter enforcement, audits, and production pins remain gates |
+| `B3FinalityVerifier.sol` + `BlsCertificateProver.sol` + release wiring | future decentralized B3 -> ETH withdrawals | specified normatively in `doc/design/b3-cross-chain-finality-v1.md` §5–§7; not implemented here and requires a new audited vault plus an explicit asset/reserve migration |
 
 ## Invariants
 
@@ -28,7 +28,11 @@ a Solidity toolchain.
   and is not a production-readiness claim.
 - The published mainnet smoke vault was promoted for transition v1 by owner
   ruling on 2026-09-01. Its managed authority cannot be changed in place. A
-  later verifier therefore needs a new vault and explicit reserve migration.
+  later verifier therefore needs a new vault. Under the current B3 identity
+  formula the vault address is part of `AssetId`, so the new vault creates a
+  new asset identity: migration requires an explicit burn/swap/reissue of old
+  bUSD, reserve migration, an old-vault cutoff, and handling/refunds for late
+  deposits. It is not an in-place contract upgrade.
 - Verified at Ethereum block 25,877,643: both immutable authorities are the
   EOA `0x76c7a245d0D2e4CF92403aF0144825df1cC614f1`; the runtime code hash is
   `0x1be220c18efa4e4cda0bb1c912c7c41346f5c04d49a36ec2c68f6ddcc5586233`.
@@ -40,12 +44,31 @@ a Solidity toolchain.
 ```
 forge build
 forge test
-forge create contracts/B3DepositVault.sol:B3DepositVault --constructor-args <releaseAuthority>
+forge create contracts/B3DepositVault.sol:B3DepositVault --constructor-args <releaseAuthority> <rescueAuthority>
 ```
+
+The production evidence must pin the exact Solidity compiler version, EVM and
+metadata settings, source commit, both constructor arguments, fetched runtime
+bytes, and the byte-for-byte comparison that yields the published runtime
+hash. The broad source pragma and an unversioned local Forge install are not a
+reproducibility record.
 
 Order of operations per the staged build plan: Sepolia/Holesky with test
 tokens first; mainnet minting only after every independently reviewed bridge
 proof/readiness pin. FlowMesh A3 does not activate the bridge.
+
+## Managed-v1 withdrawal minimum
+
+Managed v1 does not make an arbitrary authority payment a valid redemption.
+The B3 consensus path now requires one exact bUSD `BURN` output and a type-10
+managed-withdrawal record binding its raw six-decimal amount and Ethereum
+recipient; the resulting request is replayed and undone with the active chain.
+The operator must wait the pinned B3 finality depth, call `release` exactly
+once, durably consume the request id, and reconcile released reserves against
+burned supply. **No confirmed burn means no release.** The operator-side
+release automation and durable request-consumption database are not implemented
+in this repository. The authority remains trusted because the vault itself
+enforces only caller, token, recipient, and amount.
 
 ## Historical mainnet smoke-test runbook (owner-executed; not activation)
 

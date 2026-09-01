@@ -248,6 +248,7 @@ inline ProofCheck VerifyTransitionProof(const ModernOutput& prev_output,
     case PolicyType::FINALITY_CERT:
     case PolicyType::FINALITY_KEY:
     case PolicyType::MODERN_PAYLOAD_ROOT:
+    case PolicyType::BRIDGE_RECORD:
         // Metadata cells (declared 2026-08-23, not activated): zero-value,
         // never in the UTXO set, no spend path — there is no proof that can
         // ever spend one. UNREACHABLE while IsActivatedPolicy fails closed;

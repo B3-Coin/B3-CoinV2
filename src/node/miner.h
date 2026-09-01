@@ -38,6 +38,7 @@ using interfaces::BlockRef;
 class CKey;
 
 namespace node {
+class BridgeBlockPreview;
 class KernelNotifications;
 
 static const bool DEFAULT_PRINT_MODIFIED_FEE = false;
@@ -136,7 +137,8 @@ private:
       *
       * @pre BlockAssembler::m_mempool must not be nullptr
     */
-    void addChunks() EXCLUSIVE_LOCKS_REQUIRED(::cs_main, m_mempool->cs);
+    void addChunks(BridgeBlockPreview* bridge_preview)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, m_mempool->cs);
 
     // helper functions for addChunks()
     /** Test if a new chunk would "fit" in the block */

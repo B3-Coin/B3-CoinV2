@@ -27,7 +27,8 @@ namespace modern {
  * set (owner rulings 2026-08-23; implementation plan Commit 3).
  *
  * Applies to exactly the frozen metadata policy types:
- *   6 FINALITY_CERT, 7 FINALITY_KEY, 8 MODERN_PAYLOAD_ROOT.
+ *   6 FINALITY_CERT, 7 FINALITY_KEY, 8 MODERN_PAYLOAD_ROOT,
+ *   9 BRIDGE_RECORD.
  *
  * Carrier (one byte representation per logical cell):
  *
@@ -42,7 +43,7 @@ namespace modern {
  * carrier's discipline). A well-formed cell:
  *   - the push is the minimal encoding of a 40..120-byte payload,
  *   - the script is exactly that push, OP_DROP, OP_FALSE — nothing else,
- *   - policy_type is one of 6/7/8, params <= 80 bytes (the permanent
+ *   - policy_type is one of 6/7/8/9, params <= 80 bytes (the permanent
  *     ModernOutput bound; the cell IS a ModernOutput on the wire),
  *   - the output value is exactly 0.
  *
@@ -53,10 +54,10 @@ namespace modern {
  *     skips it symmetrically). No data-carrier semantics exist: the payload
  *     is a typed policy cell, and its params are bounded typed state; large
  *     evidence travels in the Modern Payload Area, never here.
- *   - ACTIVATION = the F = M plumbing (Consensus::ModernObjectRulesActive):
- *     cells are live exactly when H, X and the Modern-PoS rule set are all
- *     pinned. Every real network today ships without them, so every claiming
- *     output stays invalid there (fail closed) until the X-pin release.
+ *   - ACTIVATION: finality policies 6/7/8 use the F = M plumbing
+ *     (Consensus::ModernObjectRulesActive). BRIDGE_RECORD policy 9 is stricter:
+ *     it activates only at the separately complete bridge height at/after A3.
+ *     Every incomplete production configuration remains fail closed.
  *   - The legacy era (height <= H) is untouched: the exclusion is applied
  *     only where Consensus::GetB3Era() == MODERN.
  */
@@ -79,18 +80,22 @@ inline constexpr bool IsMetadataCellPolicyType(const uint16_t policy_type)
 {
     return policy_type == static_cast<uint16_t>(PolicyType::FINALITY_CERT) ||
            policy_type == static_cast<uint16_t>(PolicyType::FINALITY_KEY) ||
-           policy_type == static_cast<uint16_t>(PolicyType::MODERN_PAYLOAD_ROOT);
+           policy_type == static_cast<uint16_t>(PolicyType::MODERN_PAYLOAD_ROOT) ||
+           policy_type == static_cast<uint16_t>(PolicyType::BRIDGE_RECORD);
 }
 
-//! Activation of the metadata carrier for (type, version). FALSE on every
-//! real network at this stage; fixtures may switch it on to exercise the
-//! UTXO-exclusion and undo machinery. Later commits replace this with the
-//! real per-type activation rules.
+//! Activation of the metadata carrier for (type, version). Finality cells use
+//! the Modern-object gate; the bridge binding additionally requires its exact
+//! height and complete independently pinned bridge envelope.
 inline bool IsMetadataCellActive(const uint16_t policy_type, const uint16_t policy_version,
-                                 const Consensus::Params& params)
+                                 const Consensus::Params& params,
+                                 const std::optional<int> height = std::nullopt)
 {
-    return Consensus::ModernObjectRulesActive(params) && IsMetadataCellPolicyType(policy_type) &&
-           policy_version == POLICY_VERSION_V1;
+    if (policy_version != POLICY_VERSION_V1 || !IsMetadataCellPolicyType(policy_type)) return false;
+    if (policy_type == static_cast<uint16_t>(PolicyType::BRIDGE_RECORD)) {
+        return height && Consensus::BridgeRulesActive(*height, params);
+    }
+    return Consensus::ModernObjectRulesActive(params);
 }
 
 //! Canonical carrier for a cell; params must be <= MAX_POLICY_PARAMS_SIZE.
@@ -167,7 +172,8 @@ inline bool IsMetadataCell(const CScript& script)
  * policy type, and of an ACTIVATED (type, version); otherwise the
  * transaction is invalid. Outputs that do not claim are untouched.
  */
-inline bool CheckMetadataCellOutputs(const CTransaction& tx, const Consensus::Params& params, std::string& error)
+inline bool CheckMetadataCellOutputs(const CTransaction& tx, const Consensus::Params& params,
+                                     const std::optional<int> height, std::string& error)
 {
     for (size_t i = 0; i < tx.vout.size(); ++i) {
         const CTxOut& out{tx.vout[i]};
@@ -181,13 +187,20 @@ inline bool CheckMetadataCellOutputs(const CTransaction& tx, const Consensus::Pa
             error = "metadata cell must be zero-valued at output " + std::to_string(i);
             return false;
         }
-        if (!IsMetadataCellActive(cell->policy_type, cell->policy_version, params)) {
+        if (!IsMetadataCellActive(cell->policy_type, cell->policy_version, params, height)) {
             error = "inactive metadata policy " + std::to_string(cell->policy_type) + " v" +
                     std::to_string(cell->policy_version) + " at output " + std::to_string(i);
             return false;
         }
     }
     return true;
+}
+
+//! Context-free compatibility wrapper. Height-gated metadata remains inactive.
+inline bool CheckMetadataCellOutputs(const CTransaction& tx, const Consensus::Params& params,
+                                     std::string& error)
+{
+    return CheckMetadataCellOutputs(tx, params, std::nullopt, error);
 }
 
 } // namespace modern

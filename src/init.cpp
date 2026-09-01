@@ -1029,13 +1029,19 @@ bool AppInitParameterInteraction(const ArgsManager& args)
             return InitError(_("Prune mode is incompatible with -txindex."));
         if (args.GetBoolArg("-txospenderindex", DEFAULT_TXOSPENDERINDEX))
             return InitError(_("Prune mode is incompatible with -txospenderindex."));
+        const Consensus::Params& consensus{chainparams.GetConsensus()};
+        if (consensus.busd_bridge &&
+            Consensus::BridgeMintParamsReady(*consensus.busd_bridge)) {
+            return InitError(_(
+                "Prune mode is incompatible with the configured B3 bridge in this release; restart without -prune."));
+        }
         // The transition release rebuilds its FN-seat, FlowMesh market and
         // checkpoint indexes from the activation history. Until those
         // indexes gain their own durable snapshots, accepting pruning could
         // make a node permanently unable to validate or serve trading after
         // restart. Refuse that unsafe combination explicitly.
         if (Consensus::FlowMeshSeatBindingScheduleConfigured(
-                chainparams.GetConsensus())) {
+                consensus)) {
             return InitError(_(
                 "Prune mode is incompatible with an active FlowMesh schedule in this release."));
         }

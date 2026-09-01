@@ -3,13 +3,16 @@
 // file COPYING or https://opensource.org/license/mit/.
 //
 // Commit 3 of the Modern PoS V1 finality plan: metadata cells (policy
-// types 6/7/8 carriers) — recognition grammar, zero-value rule, exclusion
+// types 6/7/8/9 carriers) — recognition grammar, zero-value rule, exclusion
 // from the spendable UTXO set, exact ConnectBlock/DisconnectBlock symmetry,
 // no OP_RETURN semantics, no activation, legacy era untouched.
 
+#include <chainparams.h>
 #include <coins.h>
 #include <consensus/era.h>
 #include <consensus/params.h>
+#include <kernel/chainparams.h>
+#include <modern/bridge_binding.h>
 #include <modern/metadata_cell.h>
 #include <modern/policy.h>
 #include <modern/stake.h>
@@ -42,6 +45,22 @@ CScript Cell(const uint16_t type, const uint16_t version, const size_t params_le
     return *script;
 }
 
+CMpaRecord TestBridgeRecord()
+{
+    CMpaRecord record;
+    record.payload_type = modern::CREATION_ACTION_BRIDGE;
+    record.payload_version = modern::POLICY_VERSION_V1;
+    record.payload = {0x01, 0x02, 0x03};
+    return record;
+}
+
+CTxOut BridgeBinding()
+{
+    const auto output{modern::MakeBridgeBindingOutput(TestBridgeRecord())};
+    BOOST_REQUIRE(output);
+    return *output;
+}
+
 bool ScriptSpendable(const CScript& spk)
 {
     ScriptError err;
@@ -71,6 +90,24 @@ BOOST_AUTO_TEST_CASE(carrier_grammar_round_trip_and_claims)
             BOOST_CHECK(!ScriptSpendable(spk));
         }
     }
+    const CMpaRecord bridge_record{TestBridgeRecord()};
+    const auto bridge_commitment{
+        modern::BridgeRecordCommitmentV1(bridge_record)};
+    const CTxOut bridge_binding{BridgeBinding()};
+    const auto bridge_cell{
+        modern::ParseMetadataCell(bridge_binding.scriptPubKey)};
+    BOOST_REQUIRE(bridge_commitment);
+    BOOST_REQUIRE(bridge_cell);
+    BOOST_CHECK_EQUAL(bridge_binding.nValue, 0);
+    BOOST_CHECK_EQUAL(
+        bridge_cell->policy_type,
+        static_cast<uint16_t>(modern::PolicyType::BRIDGE_RECORD));
+    BOOST_CHECK_EQUAL(bridge_cell->policy_version, modern::POLICY_VERSION_V1);
+    BOOST_CHECK(bridge_cell->commitment == *bridge_commitment);
+    BOOST_CHECK(bridge_cell->params.empty());
+    BOOST_CHECK(!bridge_binding.scriptPubKey.IsUnspendable());
+    BOOST_CHECK(!ScriptSpendable(bridge_binding.scriptPubKey));
+
     // params above the permanent bound cannot even be built
     BOOST_CHECK(!modern::MakeMetadataCellScript(7, 1, COMMIT, std::vector<unsigned char>(81, 0)).has_value());
     // Layout: PUSH(payload) OP_DROP OP_FALSE; payload header 40 B
@@ -122,13 +159,14 @@ BOOST_AUTO_TEST_CASE(claims_that_are_malformed_are_claims_but_not_cells)
     std::vector<unsigned char> longp(payload.begin(), payload.begin() + 40);
     longp.insert(longp.end(), 81, 0x22);
     BOOST_CHECK(!modern::IsMetadataCell(CScript() << longp << OP_DROP << OP_FALSE));
-    // non-metadata policy type with the magic (5 = FN, 9 = unknown): claim, not a cell
+    // Non-metadata policy types with the magic (5 = FN, 10 = unknown):
+    // claim, but not a cell. Type 9 is the reserved bridge binding cell.
     std::vector<unsigned char> fnp{payload};
     fnp[5] = 0x05;
     BOOST_CHECK(modern::ClaimsMetadataCell(CScript() << fnp << OP_DROP << OP_FALSE));
     BOOST_CHECK(!modern::IsMetadataCell(CScript() << fnp << OP_DROP << OP_FALSE));
     std::vector<unsigned char> unk{payload};
-    unk[5] = 0x09;
+    unk[5] = 0x0a;
     BOOST_CHECK(!modern::IsMetadataCell(CScript() << unk << OP_DROP << OP_FALSE));
 }
 
@@ -161,17 +199,20 @@ BOOST_AUTO_TEST_CASE(ordinary_outputs_are_never_metadata)
     mtx.vin[0].prevout = COutPoint{Txid::FromUint256(uint256{"1111111111111111111111111111111111111111111111111111111111111111"}), 0};
     mtx.vout.emplace_back(0, CScript() << OP_TRUE);
     mtx.vout.emplace_back(0, Cell(7, 1, 52));
+    mtx.vout.push_back(BridgeBinding());
     mtx.vout.emplace_back(500, CScript() << OP_TRUE);
     const CTransaction tx{mtx};
     AddCoins(view, tx, 100, /*check=*/false, /*nTxOffset=*/0, /*exclude_modern_cells=*/true);
     BOOST_CHECK(view.HaveCoin(COutPoint{tx.GetHash(), 0}));  // zero-value ordinary: present
     BOOST_CHECK(!view.HaveCoin(COutPoint{tx.GetHash(), 1})); // metadata cell: never a coin
-    BOOST_CHECK(view.HaveCoin(COutPoint{tx.GetHash(), 2}));
+    BOOST_CHECK(!view.HaveCoin(COutPoint{tx.GetHash(), 2})); // bridge binding: never a coin
+    BOOST_CHECK(view.HaveCoin(COutPoint{tx.GetHash(), 3}));
     // Legacy-era semantics (flag false): the same script IS an ordinary coin.
     CCoinsView base2;
     CCoinsViewCache view2{&base2};
     AddCoins(view2, tx, 100, false, 0, /*exclude_modern_cells=*/false);
     BOOST_CHECK(view2.HaveCoin(COutPoint{tx.GetHash(), 1}));
+    BOOST_CHECK(view2.HaveCoin(COutPoint{tx.GetHash(), 2}));
 }
 
 BOOST_AUTO_TEST_CASE(check_metadata_cell_outputs_rules)
@@ -198,10 +239,33 @@ BOOST_AUTO_TEST_CASE(check_metadata_cell_outputs_rules)
         BOOST_CHECK(!modern::CheckMetadataCellOutputs(tx_with(0, Cell(t, 1, 16)), production, err));
         BOOST_CHECK(err.find("inactive") != std::string::npos);
     }
+    BOOST_CHECK(!modern::CheckMetadataCellOutputs(
+        tx_with(0, BridgeBinding().scriptPubKey), production, err));
+    BOOST_CHECK(err.find("inactive") != std::string::npos);
     // Test activation: zero-valued well-formed v1 cells pass the carrier layer.
     for (const uint16_t t : {6, 7, 8}) {
         BOOST_CHECK(modern::CheckMetadataCellOutputs(tx_with(0, Cell(t, 1, 16)), test_active, err));
     }
+    BOOST_CHECK(!modern::CheckMetadataCellOutputs(
+        tx_with(0, BridgeBinding().scriptPubKey), test_active, err));
+    BOOST_CHECK(err.find("inactive") != std::string::npos);
+
+    CChainParams::RegTestOptions options;
+    CChainParams::B3ModernRegTestOptions b3;
+    b3.flowmesh_test = true;
+    options.b3_modern = b3;
+    const auto bridge_chain{CChainParams::RegTest(options)};
+    const Consensus::Params& bridge_params{bridge_chain->GetConsensus()};
+    BOOST_REQUIRE(bridge_params.busd_bridge);
+    BOOST_REQUIRE(bridge_params.busd_bridge->activation_height);
+    const int bridge_activation{*bridge_params.busd_bridge->activation_height};
+    const CTransaction bridge_tx{
+        tx_with(0, BridgeBinding().scriptPubKey)};
+    BOOST_CHECK(!modern::CheckMetadataCellOutputs(
+        bridge_tx, bridge_params, bridge_activation - 1, err));
+    BOOST_CHECK(err.find("inactive") != std::string::npos);
+    BOOST_CHECK(modern::CheckMetadataCellOutputs(
+        bridge_tx, bridge_params, bridge_activation, err));
     // amount != 0 is invalid even when active
     BOOST_CHECK(!modern::CheckMetadataCellOutputs(tx_with(1, Cell(7, 1, 16)), test_active, err));
     BOOST_CHECK(err.find("zero-valued") != std::string::npos);
@@ -210,7 +274,7 @@ BOOST_AUTO_TEST_CASE(check_metadata_cell_outputs_rules)
     // unknown / non-metadata type with the magic: malformed claim
     std::vector<unsigned char> payload(40, 0);
     std::copy(modern::METADATA_CELL_MAGIC.begin(), modern::METADATA_CELL_MAGIC.end(), payload.begin());
-    payload[5] = 0x09; payload[7] = 0x01;
+    payload[5] = 0x0a; payload[7] = 0x01;
     BOOST_CHECK(!modern::CheckMetadataCellOutputs(tx_with(0, CScript() << payload << OP_DROP << OP_FALSE), test_active, err));
     BOOST_CHECK(err.find("malformed") != std::string::npos);
     payload[5] = 0x04; // STAKE number with the metadata magic: not a metadata type
@@ -224,7 +288,10 @@ BOOST_AUTO_TEST_CASE(check_metadata_cell_outputs_rules)
     nonmin << OP_DROP << OP_FALSE;
     BOOST_CHECK(!modern::CheckMetadataCellOutputs(tx_with(0, nonmin), test_active, err));
     // The test flag never activates the model-layer policies (IsActivatedPolicy)
-    BOOST_CHECK(!modern::IsActivatedPolicy(6, 1) && !modern::IsActivatedPolicy(7, 1) && !modern::IsActivatedPolicy(8, 1));
+    BOOST_CHECK(!modern::IsActivatedPolicy(6, 1) &&
+                !modern::IsActivatedPolicy(7, 1) &&
+                !modern::IsActivatedPolicy(8, 1) &&
+                !modern::IsActivatedPolicy(9, 1));
     // Real chainparams never set the flag.
     for (const auto& chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::REGTEST}) {
         BOOST_CHECK(!Consensus::ModernObjectRulesActive(CreateChainParams(ArgsManager{}, chain)->GetConsensus()));

@@ -4,10 +4,12 @@
 #ifndef B3COIN_MODERN_MPA_H
 #define B3COIN_MODERN_MPA_H
 
+#include <bridge/proof.h>
 #include <consensus/consensus.h>
 #include <consensus/era.h>
 #include <consensus/params.h>
 #include <modern/creation_action.h>
+#include <modern/bridge_binding.h>
 #include <modern/finality_key.h>
 #include <modern/finality_types.h>
 #include <modern/flowmesh_checkpoint.h>
@@ -45,6 +47,7 @@ namespace modern {
  *   7  FlowMesh FN-seat pre-binding        known; A2 height-gated
  *   8  FlowMesh checkpoint                 known; A3 height-gated
  *   9  FlowMesh vault effect proof         known; A3 height-gated
+ *  10  Ethereum bridge record              known; bridge-height-gated
  * Every other (type, version) is UNKNOWN. Unknown -> invalid; known but not
  * activated -> invalid; known and activated -> parsed with that type's exact
  * grammar. There is no generic/user-data record type.
@@ -69,11 +72,12 @@ namespace modern {
  * against the derived binding index plus an in-block overlay.
  */
 
-//! Frozen record type numbers (see creation_action.h for 1-9).
+//! Frozen record type numbers (see creation_action.h for 1-10).
 inline constexpr uint16_t MPA_TYPE_FINALITY_CERTIFICATE{CREATION_ACTION_FINALITY_CERTIFICATE};
 inline constexpr uint16_t MPA_TYPE_FINALITY_KEY_EVIDENCE{CREATION_ACTION_FINALITY_KEY_EVIDENCE};
 inline constexpr uint16_t MPA_TYPE_FLOWMESH_CHECKPOINT{CREATION_ACTION_FLOWMESH_CHECKPOINT};
 inline constexpr uint16_t MPA_TYPE_FLOWMESH_VAULT_PROOF{CREATION_ACTION_FLOWMESH_VAULT_PROOF};
+inline constexpr uint16_t MPA_TYPE_BRIDGE{CREATION_ACTION_BRIDGE};
 inline constexpr uint16_t MPA_VERSION_V1{1};
 
 enum class PayloadTypeStatus { UNKNOWN, INACTIVE, ACTIVE };
@@ -108,6 +112,10 @@ inline PayloadTypeStatus GetPayloadTypeStatus(const uint16_t type, const uint16_
         return height && Consensus::FlowMeshRulesActive(*height, params)
                    ? PayloadTypeStatus::ACTIVE
                    : PayloadTypeStatus::INACTIVE;
+    case MPA_TYPE_BRIDGE:
+        return height && Consensus::BridgeRulesActive(*height, params)
+                   ? PayloadTypeStatus::ACTIVE
+                   : PayloadTypeStatus::INACTIVE;
     case MPA_TYPE_FINALITY_CERTIFICATE:
     case MPA_TYPE_FINALITY_KEY_EVIDENCE:
         // Live from the X-pin configuration (F = M plumbing); every real
@@ -140,6 +148,8 @@ inline bool PayloadSizeAllowed(const uint16_t type, const size_t size)
     case MPA_TYPE_FLOWMESH_VAULT_PROOF:
         return size >= FLOWMESH_VAULT_PROOF_V1_WIRE_MIN_SIZE &&
                size <= FLOWMESH_VAULT_PROOF_RECORD_MAX_SIZE;
+    case MPA_TYPE_BRIDGE:
+        return size >= 2 && size <= bridge::MAX_BRIDGE_RECORD_SIZE;
     default:
         return false;
     }
@@ -156,7 +166,12 @@ inline bool MpaRecordLess(const CMpaRecord& a, const CMpaRecord& b)
 inline bool CheckTransactionMpa(const CTransaction& tx, const Consensus::Params& params,
                                 const std::optional<int> height, std::string& error)
 {
+    const size_t bridge_bindings{BridgeBindingOutputCount(tx)};
     if (tx.mpa.empty()) {
+        if (bridge_bindings != 0) {
+            error = "mpa-orphan-bridge-binding";
+            return false;
+        }
         // FN-v2 without its mandatory type-7 record must still fail. A caller
         // without a height can never activate the A2 pre-binding gate and
         // therefore fails closed.
@@ -172,6 +187,7 @@ inline bool CheckTransactionMpa(const CTransaction& tx, const Consensus::Params&
         return false;
     }
     bool saw_flowmesh_vault_proof{false};
+    bool saw_bridge_record{false};
     for (size_t i = 0; i < tx.mpa.size(); ++i) {
         const CMpaRecord& rec{tx.mpa[i]};
         if (i > 0 && !MpaRecordLess(tx.mpa[i - 1], rec)) {
@@ -203,6 +219,29 @@ inline bool CheckTransactionMpa(const CTransaction& tx, const Consensus::Params&
             }
             saw_flowmesh_vault_proof = true;
         }
+        if (rec.payload_type == MPA_TYPE_BRIDGE) {
+            if (saw_bridge_record) {
+                error = "mpa-multiple-bridge-records";
+                return false;
+            }
+            saw_bridge_record = true;
+        }
+    }
+    // Type 10 consumes the full per-transaction verification budget and its
+    // state transition is intentionally self-contained. Keeping it as the
+    // sole MPA record prevents zero-cost creation declarations from being
+    // coupled to a bridge proof in one consensus object.
+    if (saw_bridge_record && tx.mpa.size() != 1) {
+        error = "mpa-bridge-record-not-exclusive";
+        return false;
+    }
+    if (!saw_bridge_record && bridge_bindings != 0) {
+        error = "mpa-orphan-bridge-binding";
+        return false;
+    }
+    if (saw_bridge_record &&
+        !CheckBridgeRecordBinding(tx, tx.mpa.front(), error)) {
+        return false;
     }
     // Frame-derived cost is enforced after every cheap outer shape/gate and
     // before any type-specific hash, signature, or proof work.
@@ -220,6 +259,11 @@ inline bool CheckTransactionMpa(const CTransaction& tx, const Consensus::Params&
         if (rec.payload_type == MPA_TYPE_FLOWMESH_VAULT_PROOF &&
             !DecodeFlowMeshVaultProofV1(rec.payload)) {
             error = "mpa-malformed-flowmesh-vault-proof";
+            return false;
+        }
+        if (rec.payload_type == MPA_TYPE_BRIDGE &&
+            !bridge::DecodeBridgeMpaRecordV1(rec)) {
+            error = "mpa-malformed-bridge-record";
             return false;
         }
     }

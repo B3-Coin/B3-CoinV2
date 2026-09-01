@@ -24,7 +24,7 @@
 #include <vector>
 
 /**
- * Activation-inert stage-4 bridge admission primitives.
+ * Consensus bridge admission primitives.
  *
  * These types encode only owner-ratified semantic rules from
  * doc/design/b3-bridge-threat-model.md section 5:
@@ -36,11 +36,10 @@
  *  - origin raw units convert exactly, never by rounded arithmetic; and
  *  - proposed registrations never authorize minting.
  *
- * Nothing in this header is connected to the MPA registry, transaction
- * validation, chainstate, or chain parameters. In particular it does not
- * choose a payload type, activation height, mint cap, Ethereum checkpoint,
- * USDT address, vault address, or adapter identity. Those production values
- * remain fail-closed until they are explicitly pinned.
+ * The rules are reached only through the independently gated type-10 bridge
+ * state machine. This header itself chooses no activation height, mint cap,
+ * Ethereum checkpoint, token/vault address, or adapter identity; chainparams
+ * must pin every production value before BridgeMintParamsReady can activate.
  */
 namespace bridge {
 
@@ -55,7 +54,7 @@ struct RecipientV1 {
     friend bool operator==(const RecipientV1&, const RecipientV1&) = default;
 };
 
-/** Proposed RECIPIENT_V1 codec. Keeping it here does not activate it. */
+/** Frozen RECIPIENT_V1 codec. Its presence alone never activates the bridge. */
 inline std::optional<RecipientV1> DecodeRecipientV1(
     const std::array<unsigned char, 32>& encoded)
 {
@@ -219,9 +218,8 @@ enum class BridgeAdmissionResult {
 
 /**
  * Apply the frozen tuple-matching rules to an event whose receipt/finality
- * proof has already been verified. Exactly-once state and mint caps are
- * intentionally caller responsibilities until their consensus stores and
- * parameters are specified.
+ * proof has already been verified. Exactly-once state and mint caps remain
+ * caller responsibilities; the consensus BridgeStateIndex supplies them.
  */
 inline BridgeAdmissionResult AdmitProvenDeposit(
     const BridgeAssetRegistryEntry& registry, const ProvenBridgeDeposit& deposit,
@@ -323,9 +321,11 @@ inline BridgeAdmissionResult AdmitConfiguredDeposit(
 }
 
 /**
- * Atomic in-memory model of the ratified exactly-once rule. The production
- * chainstate index still needs durable serialization, block extraction,
- * reindex, and database undo wiring before activation.
+ * Small atomic model used by focused admission tests. Production consensus
+ * uses node::BridgeStateIndex, which derives the same nullifier rule from
+ * active block history with deterministic replay and block undo. A durable
+ * sidecar remains a performance/persistence gate before production pruning,
+ * not a substitute for the consensus rule.
  */
 struct BridgeNullifierUndo {
     std::vector<BridgeDepositKey> inserted{};

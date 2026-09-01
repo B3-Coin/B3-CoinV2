@@ -4,6 +4,7 @@
 
 #include <chain.h>
 #include <chainparams.h>
+#include <bridge/proof.h>
 #include <common/messages.h>
 #include <consensus/era.h>
 #include <core_io.h>
@@ -14,10 +15,13 @@
 #include <modern/asset.h>
 #include <modern/asset_output.h>
 #include <modern/asset_validation.h>
+#include <modern/bridge_asset.h>
+#include <modern/bridge_binding.h>
 #include <modern/chain_domain.h>
 #include <modern/fn_pod.h>
 #include <modern/flowmesh_seat.h>
 #include <random.h>
+#include <node/bridge_state.h>
 #include <rpc/protocol.h>
 #include <rpc/request.h>
 #include <rpc/server_util.h>
@@ -26,6 +30,7 @@
 #include <txmempool.h>
 #include <util/moneystr.h>
 #include <util/strencodings.h>
+#include <util/time.h>
 #include <support/cleanse.h>
 #include <validation.h>
 #include <wallet/coincontrol.h>
@@ -66,10 +71,80 @@ struct ChainSnapshot {
     bool pending_fn_pod{false};
 };
 
+struct ParsedBridgePayload {
+    bridge::BridgeRecordV1 decoded{};
+    CMpaRecord record{};
+};
+
 struct WalletAssetCoin {
     COutPoint outpoint{};
     modern::ModernOutput output{};
 };
+
+static const char* BridgeRecordKindName(
+    const bridge::BridgeRecordKindV1 kind)
+{
+    switch (kind) {
+    case bridge::BridgeRecordKindV1::BOOTSTRAP:
+        return "bootstrap";
+    case bridge::BridgeRecordKindV1::UPDATE:
+        return "update";
+    case bridge::BridgeRecordKindV1::MINT:
+        return "mint";
+    case bridge::BridgeRecordKindV1::EXECUTION_BACKFILL:
+        return "execution-backfill";
+    case bridge::BridgeRecordKindV1::MANAGED_WITHDRAWAL:
+        return "managed-withdrawal";
+    }
+    return "unknown";
+}
+
+static ParsedBridgePayload ParseCanonicalBridgePayload(const UniValue& value)
+{
+    const std::vector<unsigned char> payload{
+        ParseHexV(value, "bridge_payload")};
+    const auto decoded{bridge::DecodeBridgeRecordV1(payload)};
+    if (!decoded) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "bridge_payload is not a canonical type-10 v1 payload");
+    }
+    const auto canonical{bridge::EncodeBridgeRecordV1(*decoded)};
+    if (!canonical || *canonical != payload) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "bridge_payload has a non-canonical encoding");
+    }
+    const auto record{bridge::MakeBridgeMpaRecord(*decoded)};
+    if (!record) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "bridge_payload cannot be encoded as type-10 v1");
+    }
+    return ParsedBridgePayload{*decoded, *record};
+}
+
+static bridge::EthAddress ParseEthereumRecipient(const UniValue& value)
+{
+    if (!value.isStr()) {
+        throw JSONRPCError(RPC_TYPE_ERROR,
+                           "ethereum_recipient must be a hex address");
+    }
+    std::string encoded{value.get_str()};
+    if (encoded.starts_with("0x") || encoded.starts_with("0X")) {
+        encoded.erase(0, 2);
+    }
+    if (encoded.size() != 40 || !IsHex(encoded)) {
+        throw JSONRPCError(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "ethereum_recipient must be exactly 20 bytes of hexadecimal");
+    }
+    const std::vector<unsigned char> bytes{ParseHex(encoded)};
+    bridge::EthAddress address{};
+    std::copy(bytes.begin(), bytes.end(), address.begin());
+    if (bridge::EthAddressIsNull(address)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                           "ethereum_recipient cannot be the zero address");
+    }
+    return address;
+}
 
 static CAmount AssetUnitsFromValue(const UniValue& value, const std::string& name)
 {
@@ -271,6 +346,49 @@ static void RecheckChainSnapshot(CWallet& wallet,
         throw JSONRPCError(RPC_VERIFY_REJECTED,
                            "A modern FN creation for the current slot is already pending");
     }
+}
+
+static node::BridgeTxAuthorization PrevalidateBridgeTransaction(
+    const JSONRPCRequest& request, const CTransaction& tx,
+    const ChainSnapshot& snapshot)
+{
+    ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+
+    LOCK(cs_main);
+    Chainstate& chainstate{chainman.ActiveChainstate()};
+    const CBlockIndex* tip{chainstate.m_chain.Tip()};
+    if (tip == nullptr || tip->GetBlockHash() != snapshot.tip_hash ||
+        tip->nHeight + 1 != snapshot.next_height) {
+        throw JSONRPCError(
+            RPC_VERIFY_REJECTED,
+            "The chain tip changed while the bridge transaction was being built; retry");
+    }
+    if (!Consensus::BridgeRulesActive(snapshot.next_height, consensus)) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            "The fully configured bridge is not active for the next block");
+    }
+
+    node::BridgeStateTracker& tracker{chainstate.ModernBridgeState()};
+    if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus,
+                      *tip)) {
+        throw JSONRPCError(RPC_DATABASE_ERROR,
+                           "The bridge state index is unavailable at the active tip");
+    }
+
+    node::BridgeTxAuthorization authorization;
+    std::string error;
+    const int64_t candidate_time{
+        std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1)};
+    if (!tracker.Index().VerifyTransaction(
+            tx, snapshot.next_height, candidate_time, consensus,
+            authorization, error)) {
+        throw JSONRPCError(
+            RPC_VERIFY_REJECTED,
+            error.empty() ? "Bridge transaction prevalidation failed" : error);
+    }
+    return authorization;
 }
 
 static std::vector<WalletAssetCoin> AvailableWalletAssetCoins(
@@ -555,6 +673,51 @@ static uint16_t AssetOwnerPolicy(const modern::AssetId& asset,
                            "Colored assets are not active for the next block");
     }
     return static_cast<uint16_t>(modern::PolicyType::OWNER);
+}
+
+static const Consensus::BridgeAssetParams& RequireBridgeForNextBlock(
+    const int next_height)
+{
+    const Consensus::Params& params{Params().GetConsensus()};
+    if (!params.busd_bridge ||
+        !Consensus::BridgeMintParamsReady(*params.busd_bridge)) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            "The bridge is disabled because its production safety pins are incomplete");
+    }
+    if (!Consensus::BridgeRulesActive(next_height, params)) {
+        throw JSONRPCError(RPC_MISC_ERROR,
+                           "Bridge rules are not active for the next block");
+    }
+    return *params.busd_bridge;
+}
+
+static CRecipient BridgeBindingRecipient(const CMpaRecord& record)
+{
+    const auto output{modern::MakeBridgeBindingOutput(record)};
+    if (!output) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Unable to construct the signed bridge-record binding cell");
+    }
+    return AssetRecipient(*output);
+}
+
+static CRecipient BridgeSelfPayment(CWallet& wallet,
+                                    const std::string& label)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    const auto destination{
+        wallet.GetNewDestination(wallet.m_default_address_type, label)};
+    if (!destination) {
+        throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT,
+                           util::ErrorString(destination).original);
+    }
+    const CScript script{GetScriptForDestination(*destination)};
+    const CAmount amount{std::max<CAmount>(
+        1, GetDustThreshold(CTxOut{0, script},
+                            wallet.chain().relayDustFee()))};
+    return CRecipient{*destination, amount,
+                      /*fSubtractFeeFromAmount=*/false};
 }
 
 } // namespace
@@ -1352,6 +1515,394 @@ RPCHelpMan flowmeshdeposit()
             result.pushKV("shard", shard);
             result.pushKV("anchor_confirmations_required",
                           Consensus::FLOWMESH_ANCHOR_DEPTH);
+            return result;
+        }};
+}
+
+RPCHelpMan submitbridgecarrier()
+{
+    return RPCHelpMan{
+        "submitbridgecarrier",
+        "Fund, sign, and optionally broadcast one canonical bridge bootstrap, "
+        "Ethereum light-client update, or execution-backfill type-10 record. "
+        "The payload must be produced by an external bridge proof builder. "
+        "Mint and managed-withdrawal records are rejected by this command. "
+        "A mandatory zero-valued B3MC policy-9 output binds the exact MPA "
+        "payload to the wallet signature; no OP_RETURN is used.\n" +
+            HELP_REQUIRING_PASSPHRASE,
+        {
+            {"bridge_payload", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Canonical type-10 v1 payload bytes, without the outer MPA frame"},
+            {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED,
+             "Transaction options", {
+                 {"broadcast", RPCArg::Type::BOOL, RPCArg::Default{true},
+                  "Broadcast and add to this wallet"},
+                 {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED,
+                  "Fee rate in atomic units per vB"},
+                 {"replaceable", RPCArg::Type::BOOL, RPCArg::Optional::OMITTED,
+                  "Signal BIP125 replaceability"},
+                 {"minconf", RPCArg::Type::NUM, RPCArg::Default{1},
+                  "Minimum confirmations for selected native inputs"},
+                 {"include_unsafe", RPCArg::Type::BOOL, RPCArg::Default{false},
+                  "Allow unsafe wallet inputs"},
+             }},
+        },
+        AssetTransactionResult("Created bridge carrier transaction", {
+            {RPCResult::Type::STR, "record_kind", "bootstrap, update, or execution-backfill"},
+            {RPCResult::Type::NUM, "binding_vout", "Signed B3MC bridge binding output index"},
+        }),
+        RPCExamples{HelpExampleCli(
+            "submitbridgecarrier", "\"<canonical_payload_hex>\"")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const ParsedBridgePayload parsed{
+                ParseCanonicalBridgePayload(request.params[0])};
+            if (parsed.decoded.kind !=
+                    bridge::BridgeRecordKindV1::BOOTSTRAP &&
+                parsed.decoded.kind != bridge::BridgeRecordKindV1::UPDATE &&
+                parsed.decoded.kind !=
+                    bridge::BridgeRecordKindV1::EXECUTION_BACKFILL) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    "submitbridgecarrier accepts only bootstrap, update, or execution-backfill records");
+            }
+
+            const std::shared_ptr<CWallet> wallet{
+                GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            wallet->BlockUntilSyncedToCurrentChain();
+            const AssetRpcOptions options{
+                ParseAssetRpcOptions(request.params[1])};
+            const ChainSnapshot snapshot{SnapshotChainState(*wallet, false)};
+            (void)RequireBridgeForNextBlock(snapshot.next_height);
+
+            CreatedTransactionResult created{nullptr, 0, std::nullopt, {}};
+            {
+                LOCK(wallet->cs_wallet);
+                EnsureSigningWallet(*wallet);
+                std::vector<CRecipient> recipients;
+                recipients.push_back(BridgeSelfPayment(
+                    *wallet, "b3-bridge-carrier"));
+                recipients.push_back(BridgeBindingRecipient(parsed.record));
+                const ModernTransactionOptions modern_options{
+                    .mpa = {parsed.record}};
+                auto result{CreateTransaction(
+                    *wallet, recipients,
+                    /*change_pos=*/static_cast<unsigned int>(recipients.size()),
+                    options.coin_control, /*sign=*/true, modern_options)};
+                if (!result) {
+                    throw JSONRPCError(
+                        RPC_WALLET_INSUFFICIENT_FUNDS,
+                        util::ErrorString(result).original);
+                }
+                created = std::move(*result);
+            }
+
+            const node::BridgeTxAuthorization authorization{
+                PrevalidateBridgeTransaction(request, *created.tx, snapshot)};
+            if (authorization.mint || authorization.withdrawal) {
+                throw JSONRPCError(
+                    RPC_INTERNAL_ERROR,
+                    "A bridge carrier unexpectedly produced an asset authorization");
+            }
+            UniValue result{FinishAssetTransaction(
+                request, *wallet, created, options, snapshot, false,
+                /*disintegration=*/0, "bridge-carrier")};
+            result.pushKV("record_kind",
+                          BridgeRecordKindName(parsed.decoded.kind));
+            result.pushKV("binding_vout", 1);
+            return result;
+        }};
+}
+
+RPCHelpMan claimbridgedeposit()
+{
+    return RPCHelpMan{
+        "claimbridgedeposit",
+        "Create the exact bUSD OWNER output authorized by one canonical "
+        "type-10 Ethereum deposit proof. The external proof builder must set "
+        "output_index to zero and supply the canonical payload. The amount is "
+        "an integer number of raw six-decimal bUSD units. This command checks "
+        "the proof, finalized bridge state, replay nullifier, recipient, amount, "
+        "and mint caps before broadcast. A signed B3MC policy-9 cell binds the "
+        "MPA payload; no OP_RETURN is used.\n" +
+            HELP_REQUIRING_PASSPHRASE,
+        {
+            {"bridge_payload", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Canonical type-10 v1 MINT payload bytes"},
+            {"amount", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "Exact integer bUSD units authorized by the Ethereum deposit"},
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO,
+             "Exact B3 P2PKH recipient encoded in the Ethereum deposit"},
+            {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED,
+             "Transaction options", {
+                 {"broadcast", RPCArg::Type::BOOL, RPCArg::Default{true},
+                  "Broadcast and add to this wallet"},
+                 {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED,
+                  "Fee rate in atomic units per vB"},
+                 {"replaceable", RPCArg::Type::BOOL, RPCArg::Optional::OMITTED,
+                  "Signal BIP125 replaceability"},
+                 {"minconf", RPCArg::Type::NUM, RPCArg::Default{1},
+                  "Minimum confirmations for selected native inputs"},
+                 {"include_unsafe", RPCArg::Type::BOOL, RPCArg::Default{false},
+                  "Allow unsafe wallet inputs"},
+             }},
+        },
+        AssetTransactionResult("Created bridge deposit-mint transaction", {
+            {RPCResult::Type::STR_HEX, "asset_id", "Configured chain-bound bUSD asset id"},
+            {RPCResult::Type::NUM, "amount", "Integer bUSD units minted"},
+            {RPCResult::Type::STR, "owner_address", "Authorized B3 recipient"},
+            {RPCResult::Type::NUM, "mint_vout", "Authorized bUSD output index (zero)"},
+            {RPCResult::Type::NUM, "binding_vout", "Signed B3MC bridge binding output index"},
+        }),
+        RPCExamples{HelpExampleCli(
+            "claimbridgedeposit",
+            "\"<canonical_mint_payload_hex>\" 1000000 \"<b3_address>\"")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const ParsedBridgePayload parsed{
+                ParseCanonicalBridgePayload(request.params[0])};
+            if (parsed.decoded.kind != bridge::BridgeRecordKindV1::MINT) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "bridge_payload is not a MINT record");
+            }
+            const auto* mint{
+                std::get_if<bridge::BridgeMintV1>(&parsed.decoded.payload)};
+            if (mint == nullptr || mint->output_index != 0) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    "The wallet mint path requires bridge output_index zero");
+            }
+            const CAmount amount{
+                AssetUnitsFromValue(request.params[1], "amount")};
+
+            const std::shared_ptr<CWallet> wallet{
+                GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            wallet->BlockUntilSyncedToCurrentChain();
+            const AssetRpcOptions options{
+                ParseAssetRpcOptions(request.params[3])};
+            const ChainSnapshot snapshot{SnapshotChainState(*wallet, false)};
+            const Consensus::BridgeAssetParams& bridge_params{
+                RequireBridgeForNextBlock(snapshot.next_height)};
+            if (bridge_params.approval_last_height &&
+                snapshot.next_height > *bridge_params.approval_last_height) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "New bridge mints are no longer approved");
+            }
+            const Consensus::Params& params{Params().GetConsensus()};
+            const auto asset{modern::ConfiguredBridgeAssetId(params)};
+            const auto registry{modern::ConfiguredBridgeRegistryId(params)};
+            if (!asset || !registry || mint->registry_id != *registry) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    "The MINT payload does not name the active bridge registry");
+            }
+
+            CreatedTransactionResult created{nullptr, 0, std::nullopt, {}};
+            std::string owner_address;
+            CScript owner_script;
+            {
+                LOCK(wallet->cs_wallet);
+                EnsureSigningWallet(*wallet);
+                owner_script = GetOwnerScript(
+                    *wallet, request.params[2], "b3-busd-bridge-receive",
+                    owner_address);
+                const auto minted{modern::MakeAssetOwnerOutput(
+                    *asset, amount, modern::PolicyType::OWNER, owner_script)};
+                if (!minted) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                       "Unable to encode the bUSD owner output");
+                }
+                const std::vector<CRecipient> recipients{
+                    AssetRecipient(*minted),
+                    BridgeBindingRecipient(parsed.record),
+                };
+                const ModernTransactionOptions modern_options{
+                    .mpa = {parsed.record}};
+                auto result{CreateTransaction(
+                    *wallet, recipients,
+                    /*change_pos=*/static_cast<unsigned int>(recipients.size()),
+                    options.coin_control, /*sign=*/true, modern_options)};
+                if (!result) {
+                    throw JSONRPCError(
+                        RPC_WALLET_INSUFFICIENT_FUNDS,
+                        util::ErrorString(result).original);
+                }
+                created = std::move(*result);
+            }
+
+            const node::BridgeTxAuthorization authorization{
+                PrevalidateBridgeTransaction(request, *created.tx, snapshot)};
+            if (!authorization.mint || authorization.withdrawal ||
+                authorization.mint->output_index != 0 ||
+                authorization.mint->authorization.asset != *asset ||
+                authorization.mint->authorization.amount != amount ||
+                authorization.mint->authorization.recipient_script !=
+                    owner_script) {
+                throw JSONRPCError(
+                    RPC_VERIFY_REJECTED,
+                    "Bridge prevalidation did not authorize the exact requested bUSD output");
+            }
+            UniValue result{FinishAssetTransaction(
+                request, *wallet, created, options, snapshot, false,
+                /*disintegration=*/0, "bridge-deposit-mint")};
+            result.pushKV("asset_id", asset->GetHex());
+            result.pushKV("amount", amount);
+            result.pushKV("owner_address", owner_address);
+            result.pushKV("mint_vout", 0);
+            result.pushKV("binding_vout", 1);
+            return result;
+        }};
+}
+
+RPCHelpMan bridgewithdraw()
+{
+    return RPCHelpMan{
+        "bridgewithdraw",
+        "Burn exact integer bUSD units and create a managed-v1 Ethereum USDT "
+        "release request for one nonzero 20-byte Ethereum recipient. The burn "
+        "and recipient are bound together by the canonical type-10 record and "
+        "its signed B3MC policy-9 output. The operator may release reserves only "
+        "after this request is confirmed under the published managed-v1 rules. "
+        "No OP_RETURN is used.\n" +
+            HELP_REQUIRING_PASSPHRASE,
+        {
+            {"amount", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "Integer raw bUSD units to burn (six decimal places)"},
+            {"ethereum_recipient", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Exact 20-byte Ethereum recipient, with optional 0x prefix"},
+            {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED,
+             "Transaction options", {
+                 {"broadcast", RPCArg::Type::BOOL, RPCArg::Default{true},
+                  "Broadcast and add to this wallet"},
+                 {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED,
+                  "Fee rate in atomic units per vB"},
+                 {"replaceable", RPCArg::Type::BOOL, RPCArg::Optional::OMITTED,
+                  "Signal BIP125 replaceability"},
+                 {"minconf", RPCArg::Type::NUM, RPCArg::Default{1},
+                  "Minimum confirmations for selected inputs"},
+                 {"include_unsafe", RPCArg::Type::BOOL, RPCArg::Default{false},
+                  "Allow unsafe wallet inputs"},
+             }},
+        },
+        AssetTransactionResult("Created managed bridge withdrawal request", {
+            {RPCResult::Type::STR_HEX, "asset_id", "Configured chain-bound bUSD asset id"},
+            {RPCResult::Type::NUM, "amount", "Integer bUSD units burned"},
+            {RPCResult::Type::NUM, "asset_change", "Integer bUSD units returned to this wallet"},
+            {RPCResult::Type::STR_HEX, "ethereum_recipient", "Bound Ethereum recipient"},
+            {RPCResult::Type::NUM, "burn_vout", "Exact bUSD BURN output index"},
+            {RPCResult::Type::NUM, "binding_vout", "Signed B3MC bridge binding output index"},
+            {RPCResult::Type::STR, "withdrawal_mode", "managed-v1"},
+        }),
+        RPCExamples{HelpExampleCli(
+            "bridgewithdraw", "1000000 \"0x00112233445566778899aabbccddeeff00112233\"")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const CAmount amount{
+                AssetUnitsFromValue(request.params[0], "amount")};
+            const bridge::EthAddress ethereum_recipient{
+                ParseEthereumRecipient(request.params[1])};
+            const std::shared_ptr<CWallet> wallet{
+                GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            wallet->BlockUntilSyncedToCurrentChain();
+            const AssetRpcOptions options{
+                ParseAssetRpcOptions(request.params[2])};
+            const ChainSnapshot snapshot{SnapshotChainState(*wallet, false)};
+            const Consensus::BridgeAssetParams& bridge_params{
+                RequireBridgeForNextBlock(snapshot.next_height)};
+            if (*bridge_params.withdrawal_mode !=
+                Consensus::BridgeWithdrawalMode::MANAGED_V1) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "Managed-v1 bridge withdrawals are not enabled");
+            }
+            const Consensus::Params& params{Params().GetConsensus()};
+            const auto asset{modern::ConfiguredBridgeAssetId(params)};
+            const auto registry{modern::ConfiguredBridgeRegistryId(params)};
+            if (!asset || !registry) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "The active bridge identity is unavailable");
+            }
+            const bridge::BridgeManagedWithdrawalV1 withdrawal{
+                *registry, /*burn_output_index=*/0,
+                static_cast<uint64_t>(amount), ethereum_recipient};
+            const auto record{bridge::MakeBridgeMpaRecord(
+                bridge::BridgeRecordV1{
+                    bridge::BridgeRecordKindV1::MANAGED_WITHDRAWAL,
+                    withdrawal})};
+            if (!record) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                   "Unable to encode the withdrawal record");
+            }
+
+            CreatedTransactionResult created{nullptr, 0, std::nullopt, {}};
+            CAmount asset_change{0};
+            {
+                LOCK(wallet->cs_wallet);
+                EnsureSigningWallet(*wallet);
+                CCoinControl coin_control{options.coin_control};
+                const CAmount selected{SelectAssetInputs(
+                    *wallet, *asset,
+                    static_cast<uint16_t>(modern::PolicyType::OWNER),
+                    amount, coin_control)};
+                asset_change = selected - amount;
+                const auto burned{modern::MakeAssetBurnOutput(*asset, amount)};
+                if (!burned) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                       "Unable to encode the bUSD BURN output");
+                }
+                std::vector<CRecipient> recipients{
+                    AssetRecipient(*burned), BridgeBindingRecipient(*record)};
+                if (asset_change > 0) {
+                    std::string unused;
+                    const CScript change_owner{GetOwnerScript(
+                        *wallet, UniValue{}, "b3-busd-withdrawal-change",
+                        unused)};
+                    const auto change{modern::MakeAssetOwnerOutput(
+                        *asset, asset_change, modern::PolicyType::OWNER,
+                        change_owner)};
+                    if (!change) {
+                        throw JSONRPCError(
+                            RPC_INTERNAL_ERROR,
+                            "Unable to encode the bUSD withdrawal change output");
+                    }
+                    recipients.push_back(AssetRecipient(*change));
+                }
+                const ModernTransactionOptions modern_options{
+                    .mpa = {*record}};
+                auto result{CreateTransaction(
+                    *wallet, recipients,
+                    /*change_pos=*/static_cast<unsigned int>(recipients.size()),
+                    coin_control, /*sign=*/true, modern_options)};
+                if (!result) {
+                    throw JSONRPCError(
+                        RPC_WALLET_INSUFFICIENT_FUNDS,
+                        util::ErrorString(result).original);
+                }
+                created = std::move(*result);
+            }
+
+            const node::BridgeTxAuthorization authorization{
+                PrevalidateBridgeTransaction(request, *created.tx, snapshot)};
+            if (authorization.mint || !authorization.withdrawal ||
+                authorization.withdrawal->burn_output_index != 0 ||
+                authorization.withdrawal->asset != *asset ||
+                authorization.withdrawal->amount != amount ||
+                authorization.withdrawal->ethereum_recipient !=
+                    ethereum_recipient) {
+                throw JSONRPCError(
+                    RPC_VERIFY_REJECTED,
+                    "Bridge prevalidation did not authorize the exact withdrawal burn and recipient");
+            }
+            UniValue result{FinishAssetTransaction(
+                request, *wallet, created, options, snapshot, false,
+                /*disintegration=*/0, "bridge-managed-withdrawal")};
+            result.pushKV("asset_id", asset->GetHex());
+            result.pushKV("amount", amount);
+            result.pushKV("asset_change", asset_change);
+            result.pushKV("ethereum_recipient", HexStr(ethereum_recipient));
+            result.pushKV("burn_vout", 0);
+            result.pushKV("binding_vout", 1);
+            result.pushKV("withdrawal_mode", "managed-v1");
             return result;
         }};
 }

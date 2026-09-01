@@ -373,11 +373,13 @@ created. Silently ignoring unknown policy semantics is forbidden.
 
 **Existing serialized policy enum numbers must never be renumbered.** Current assignments
 (`LEGACY_LOCK = 0`, `OWNER = 1`, `BURN = 2`, `DEX_VAULT = 3`, `STAKE = 4`, `FN = 5`, and —
-owner ruling 2026-08-23 — `FINALITY_CERT = 6`, `FINALITY_KEY = 7`, `MODERN_PAYLOAD_ROOT = 8`)
-are consensus-stable as-is; additional types take new numbers. Types 6–8 are zero-value
+owner ruling 2026-08-23 — `FINALITY_CERT = 6`, `FINALITY_KEY = 7`,
+`MODERN_PAYLOAD_ROOT = 8`, followed by `BRIDGE_RECORD = 9`)
+are consensus-stable as-is; additional types take new numbers. Types 6–9 are zero-value
 **metadata cells** (never entering the UTXO set) whose large evidence travels in the Modern
 Payload Area ([b3-modern-payload-area.md](b3-modern-payload-area.md)); the `policy_params
-≤ 80 B` bound is permanent and is never raised to carry evidence.
+≤ 80 B` bound is permanent and is never raised to carry evidence. Type 9 binds one exact
+type-10 bridge record into ordinary transaction outputs; it is not arbitrary data.
 
 ## 24. Policy versions
 
@@ -579,9 +581,32 @@ USDT locked in managed-v1 vault
 from B3: solvency depends on Ethereum, canonical USDT, bridge verification and
 finality, the issuer's freeze/blacklist policy, and the managed withdrawal authority.
 Mainnet minting stays fail-closed until every proof/readiness pin is present. It must
-never be described as protocol-native dollars without those qualifications. Replacing
-managed v1 with decentralized verification requires a new audited vault and a
-controlled migration; the immutable authority cannot be silently changed in place.
+never be described as protocol-native dollars without those qualifications. The
+transition tree implements a bounded type-10 proof/command carrier, exact OWNER mint and
+bUSD BURN transitions, light-client/anchor/nullifier/cap tracking, undo/reindex replay,
+and mempool/miner/asset validation. Every type-10 transaction must also contain exactly
+one zero-value Modern metadata cell of policy type 9 (`BRIDGE_RECORD`) whose
+`B3/BRIDGE/RECORD/V1` tagged hash commits the exact canonical record frame. Duplicate,
+mismatched, missing, or orphan bindings are invalid. Because that cell is an ordinary
+transaction output, standard `SIGHASH_ALL` input signatures cover the bridge commitment;
+there is no `OP_RETURN` and no bridge-specific or custom sighash. That state is rebuilt
+in memory from bridge activation; there is no durable sidecar, so a configured bridge
+refuses pruning and any snapshot that skips its history. Adapter enforcement and
+production pins remain gates.
+
+Managed-v1 redemption begins with the implemented consensus-checked B3 burn request
+binding canonical bUSD, the exact raw amount, Ethereum recipient, and unique request id.
+The operator waits the pinned B3 finality depth, releases the registry-derived USDT
+exactly once, durably marks the id consumed, and reconciles reserves against supply. No
+confirmed burn means no release. The external Ethereum release automation and durable
+request-consumption database are separate release work and are not implemented by the
+B3 node.
+
+Replacing managed v1 with decentralized verification requires a new audited vault; the
+immutable authority cannot be silently changed in place. Because the current bridge
+`AssetId` includes `vault_address`, the new vault is a new asset identity. Migration must
+therefore specify old-registry cutoff and late-deposit refunds, burn/swap/reissue of old
+bUSD, reserve movement without double minting, and all new vault/verifier/identity pins.
 
 ## 46. Independent PoW-issued coloured assets
 
@@ -678,8 +703,10 @@ FlowMesh, or bridge logic:
 
 There is no separate FN transfer activation lock. The transition release pins
 FlowMesh A3. Ethereum-USDT bridge minting is independently fail-closed until
-its exact bootstrap, caps, adapter and activation parameters are pinned; it is
-never enabled merely because A3 is reached.
+its implemented type-10 mint/burn state machine passes review and its exact
+bootstrap, forks, caps, enforced adapter, managed-redemption rules, runtime,
+activation, and X-dependent parameters are pinned; it is never enabled merely
+because A3 is reached.
 
 For each market, epoch zero uses one consensus-unique anchor: the earliest
 canonical block at or after `market.created_height` whose post-block FN-v2 set

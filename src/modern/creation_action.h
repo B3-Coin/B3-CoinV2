@@ -78,6 +78,12 @@ inline constexpr uint16_t CREATION_ACTION_FLOWMESH_CHECKPOINT{8};
 inline constexpr uint16_t FLOWMESH_CHECKPOINT_ACTION_VERSION_V1{1};
 inline constexpr uint16_t CREATION_ACTION_FLOWMESH_VAULT_PROOF{9};
 inline constexpr uint16_t FLOWMESH_VAULT_PROOF_ACTION_VERSION_V1{1};
+//! Type 10 is the independently gated Ethereum bridge record. It is an MPA
+//! record (never a standalone CreationAction) whose strict inner kind carries
+//! light-client bootstrap/update evidence, bounded execution backfill,
+//! deposit-mint proofs, or a managed-v1 burn/release request.
+inline constexpr uint16_t CREATION_ACTION_BRIDGE{10};
+inline constexpr uint16_t BRIDGE_ACTION_VERSION_V1{1};
 
 //! Whether a (type, version) pair is a registered creation action.
 //! Registration keeps a pair DECODABLE at the framing layer (so

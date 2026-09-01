@@ -205,6 +205,10 @@ bool CheckSignatureEncoding(const std::vector<unsigned char> &vchSig, script_ver
     if (vchSig.size() == 0) {
         return true;
     }
+    if ((flags & SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL) != 0 &&
+        vchSig.back() != SIGHASH_ALL) {
+        return set_error(serror, SCRIPT_ERR_SIG_HASHTYPE);
+    }
     if ((flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC | SCRIPT_VERIFY_LEGACY_B3_STRICTENC)) != 0 && !IsValidSignatureEncoding(vchSig)) {
         return set_error(serror, SCRIPT_ERR_SIG_DER);
     } else if ((flags & (SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_LEGACY_B3_STRICTENC)) != 0 && !IsLowDERSignature(vchSig, serror)) {
@@ -213,6 +217,23 @@ bool CheckSignatureEncoding(const std::vector<unsigned char> &vchSig, script_ver
     } else if ((flags & SCRIPT_VERIFY_STRICTENC) != 0 && !IsDefinedHashtypeSignature(vchSig)) {
         return set_error(serror, SCRIPT_ERR_SIG_HASHTYPE);
     }
+    return true;
+}
+
+static bool CheckBridgeSchnorrSighash(const std::span<const unsigned char> sig,
+                                      const script_verify_flags flags,
+                                      ScriptError* serror)
+{
+    if ((flags & SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL) == 0 ||
+        sig.size() == 64) {
+        // A 64-byte Schnorr signature uses SIGHASH_DEFAULT, which is
+        // equivalent to SIGHASH_ALL and commits every input and output.
+        return true;
+    }
+    if (sig.size() == 65 && sig.back() != SIGHASH_ALL) {
+        return set_error(serror, SCRIPT_ERR_SCHNORR_SIG_HASHTYPE);
+    }
+    // Preserve the ordinary size error for malformed signatures.
     return true;
 }
 
@@ -357,6 +378,9 @@ static bool EvalChecksigTapscript(const valtype& sig, const valtype& pubkey, Scr
      */
     success = !sig.empty();
     if (success) {
+        if (!CheckBridgeSchnorrSighash(sig, flags, serror)) {
+            return false;
+        }
         // Implement the sigops/witnesssize ratio test.
         // Passing with an upgradable public key version is also counted.
         assert(execdata.m_validation_weight_left_init);
@@ -1977,6 +2001,9 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
         execdata.m_annex_init = true;
         if (stack.size() == 1) {
             // Key path spending (stack size is 1 after removing optional annex)
+            if (!CheckBridgeSchnorrSighash(stack.front(), flags, serror)) {
+                return false;
+            }
             if (!checker.CheckSchnorrSignature(stack.front(), program, SigVersion::TAPROOT, execdata, serror)) {
                 return false; // serror is set
             }
@@ -2220,6 +2247,7 @@ const std::map<std::string, script_verify_flag_name>& ScriptFlagNamesToEnum()
         FLAG_NAME(DISCOURAGE_UPGRADABLE_PUBKEYTYPE),
         FLAG_NAME(DISCOURAGE_OP_SUCCESS),
         FLAG_NAME(DISCOURAGE_UPGRADABLE_TAPROOT_VERSION),
+        FLAG_NAME(BRIDGE_SIGHASH_ALL),
     };
 #undef FLAG_NAME
     return g_names_to_enum;

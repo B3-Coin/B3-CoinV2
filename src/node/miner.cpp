@@ -24,6 +24,7 @@
 #include <modern/finality_certificate.h>
 #include <modern/payload_root.h>
 #include <modern/pos_v1.h>
+#include <node/bridge_state.h>
 #include <node/finality_signature.h>
 #include <node/finality_tracker.h>
 #include <node/flowmesh_checkpoint_index.h>
@@ -169,6 +170,8 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     const bool b3_corridor{b3_consensus.legacy_b3coin &&
                            Consensus::GetConsensusPhase(nHeight, b3_consensus) ==
                                Consensus::ConsensusPhase::TRANSITION_POW};
+    const bool b3_bridge_active{
+        b3_modern && Consensus::BridgeRulesActive(nHeight, b3_consensus)};
     if (b3_consensus.legacy_b3coin && !b3_modern) {
         throw std::runtime_error("legacy-era B3 block production is not supported");
     }
@@ -222,6 +225,14 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
                               seats.Index(), vaults.Index(), *pindexPrev)) {
             throw std::runtime_error(
                 "FlowMesh checkpoint index is unavailable for block assembly");
+        }
+    }
+    if (b3_bridge_active) {
+        node::BridgeStateTracker& bridge{m_chainstate.ModernBridgeState()};
+        if (!bridge.Sync(m_chainstate.m_chain, m_chainstate.m_blockman,
+                         b3_consensus, *pindexPrev)) {
+            throw std::runtime_error(
+                "bridge state is unavailable for block assembly");
         }
     }
 
@@ -305,13 +316,50 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         if (!eligible) throw std::runtime_error("no eligible modern-PoS round found");
     }
 
-    pblock->nTime = TicksSinceEpoch<std::chrono::seconds>(NodeClock::now());
+    // The bridge freshness rule commits to the candidate block time. Modern
+    // PoS time is already known from the selected recovery round, so expose
+    // that exact value during chunk selection rather than a wall-clock value
+    // that would be replaced after selection.
+    pblock->nTime = b3_modern_pos
+                        ? static_cast<uint32_t>(modern::ModernPosBlockTime(
+                              pindexPrev->GetBlockTime(), pos_round,
+                              *b3_consensus.modern_pos))
+                        : TicksSinceEpoch<std::chrono::seconds>(NodeClock::now());
+    if (!b3_modern_pos && b3_bridge_active) {
+        // Freeze the exact transition-PoW time before bridge selection. A
+        // later wall-clock refresh could otherwise make a mint cross the
+        // light-client freshness boundary after it had been admitted.
+        UpdateTime(pblock, b3_consensus, pindexPrev);
+        if (b3_corridor) {
+            pblock->nTime = static_cast<uint32_t>(std::max<int64_t>(
+                pblock->nTime,
+                pindexPrev->GetBlockTime() +
+                    b3_consensus.transition_pow_min_spacing));
+        }
+    }
     m_lock_time_cutoff = pindexPrev->GetMedianTimePast();
+
+    std::unique_ptr<BridgeBlockPreview> bridge_preview;
+    if (m_mempool && b3_bridge_active) {
+        uint256 preview_block_id;
+        preview_block_id.begin()[0] = 1; // scratch identity; never persisted
+        std::string error;
+        bridge_preview = m_chainstate.ModernBridgeState()
+                             .Index()
+                             .BeginBlockPreview(
+                                 nHeight, pblock->GetBlockTime(),
+                                 preview_block_id, b3_consensus, error);
+        if (!bridge_preview) {
+            throw std::runtime_error(
+                "bridge preview is unavailable for block assembly: " +
+                error);
+        }
+    }
 
     if (m_mempool) {
         LOCK(m_mempool->cs);
         m_mempool->StartBlockBuilding();
-        addChunks();
+        addChunks(bridge_preview.get());
         m_mempool->StopBlockBuilding();
     }
 
@@ -485,7 +533,11 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         pblock->nBits = b3_consensus.modern_pos->sentinel_bits;
         pblock->vchBlockSig.assign(modern::MODERN_POS_SIG_SIZE, 0x00);
     } else {
-        UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
+        // Bridge-active block assembly already froze the exact preview time
+        // above. Preserve it through final validation.
+        if (!b3_bridge_active) {
+            UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
+        }
         if (b3_corridor) {
             // Corridor pacing: never earlier than parent + minimum spacing
             // (the network refuses it); the future bound then paces
@@ -605,7 +657,7 @@ void BlockAssembler::AddToBlock(const CTxMemPoolEntry& entry)
     }
 }
 
-void BlockAssembler::addChunks()
+void BlockAssembler::addChunks(BridgeBlockPreview* const bridge_preview)
 {
     // Limit the number of attempts to add transactions to the block when it is
     // close to full; this is just a simple heuristic to finish quickly if the
@@ -634,10 +686,26 @@ void BlockAssembler::addChunks()
             chunk_sig_ops += tx.get().GetSigOpCost();
         }
 
-        // Check to see if this chunk will fit.
+        // Check to see if this chunk will fit. Bridge preview is deliberately
+        // last: a successful atomic append is followed immediately by
+        // inclusion, while a rejected chunk leaves the accepted preview
+        // prefix unchanged.
         std::optional<uint32_t> resulting_fn_pod_total;
-        if (!TestChunkBlockLimits(chunk_feerate, chunk_sig_ops) ||
-            !TestChunkTransactions(selected_transactions, resulting_fn_pod_total)) {
+        bool chunk_accepted{
+            TestChunkBlockLimits(chunk_feerate, chunk_sig_ops) &&
+            TestChunkTransactions(selected_transactions,
+                                  resulting_fn_pod_total)};
+        if (chunk_accepted && bridge_preview != nullptr) {
+            std::vector<CTransactionRef> bridge_transactions;
+            bridge_transactions.reserve(selected_transactions.size());
+            for (const auto& entry : selected_transactions) {
+                bridge_transactions.push_back(entry.get().GetSharedTx());
+            }
+            std::string error;
+            chunk_accepted = bridge_preview->TryAppend(bridge_transactions,
+                                                       error);
+        }
+        if (!chunk_accepted) {
             // This chunk won't fit, so we skip it and will try the next best one.
             m_mempool->SkipBuilderChunk();
             ++nConsecutiveFailed;

@@ -15,7 +15,7 @@
 #include <vector>
 
 /** Minimal SSZ hash-tree-root machinery for the Ethereum beacon light client
- *  (bridge proposal stages 2-3; header-only, not reachable from consensus).
+ *  used by the independently gated type-10 consensus bridge.
  *
  *  Only what the sync-committee light client needs is implemented:
  *  fixed-size containers, Bytes48/Bytes4/uint64/uint256 leaves, the two
@@ -69,6 +69,10 @@ inline uint256 LeafUint64(uint64_t v)
 //! Bytes up to 32, left-aligned zero-padded chunk.
 inline uint256 LeafBytes(std::span<const unsigned char> b)
 {
+    // This helper is used at the bottom of consensus-facing SSZ hash trees.
+    // Never let a malformed variable-size field turn an ordinary validation
+    // failure into an out-of-bounds write.
+    if (b.size() > 32) return uint256{};
     uint256 out{};
     std::copy(b.begin(), b.end(), out.begin());
     return out;
@@ -101,6 +105,7 @@ inline uint256 MixInLength(const uint256& root, uint64_t len)
 //! ByteList[max<=32] (extra_data): one chunk limit, length mixed in.
 inline uint256 RootByteList32(std::span<const unsigned char> data)
 {
+    if (data.size() > 32) return uint256{};
     return MixInLength(data.empty() ? uint256{} : LeafBytes(data), data.size());
 }
 
@@ -153,6 +158,9 @@ struct BeaconBlockHeader {
         return RootContainer({LeafUint64(slot), LeafUint64(proposer_index),
                               parent_root, state_root, body_root});
     }
+
+    friend bool operator==(const BeaconBlockHeader&,
+                           const BeaconBlockHeader&) = default;
 };
 
 //! ExecutionPayloadHeader (Deneb/Electra shape: 17 fields).
@@ -175,8 +183,11 @@ struct ExecutionPayloadHeader {
     uint64_t blob_gas_used{0};
     uint64_t excess_blob_gas{0};
 
+    bool ValidForHashTreeRoot() const { return extra_data.size() <= 32; }
+
     uint256 HashTreeRoot() const
     {
+        if (!ValidForHashTreeRoot()) return uint256{};
         return RootContainer({parent_hash,
                               LeafBytes(fee_recipient),
                               state_root,
@@ -195,6 +206,9 @@ struct ExecutionPayloadHeader {
                               LeafUint64(blob_gas_used),
                               LeafUint64(excess_blob_gas)});
     }
+
+    friend bool operator==(const ExecutionPayloadHeader&,
+                           const ExecutionPayloadHeader&) = default;
 };
 
 static constexpr size_t SYNC_COMMITTEE_SIZE{512};
@@ -207,6 +221,8 @@ struct SyncCommittee {
     {
         return RootContainer({RootPubkeyVector(pubkeys, 9), RootBytes48(aggregate_pubkey)});
     }
+
+    friend bool operator==(const SyncCommittee&, const SyncCommittee&) = default;
 };
 
 //! compute_domain + compute_signing_root (DOMAIN_SYNC_COMMITTEE = 0x07000000).

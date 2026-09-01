@@ -5,11 +5,13 @@
 #include <modern/asset_output.h>
 
 #include <addresstype.h>
+#include <bridge/proof.h>
 #include <coins.h>
 #include <consensus/consensus.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <key.h>
+#include <modern/bridge_binding.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
@@ -26,6 +28,8 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
+#include <utility>
 #include <vector>
 
 bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
@@ -34,7 +38,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        PrecomputedTransactionData& txdata,
                        ValidationCache& validation_cache,
                        std::vector<CScriptCheck>* pvChecks,
-                       const std::optional<LegacyLockSpendContext>& legacy_lock)
+                       const std::optional<LegacyLockSpendContext>& legacy_lock,
+                       bool require_bridge_sighash_all = false)
     EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 namespace {
@@ -86,18 +91,74 @@ bool VerifyAgainst(const CMutableTransaction& spend, const CTxOut& previous,
 }
 
 bool SignSpend(const FillableSigningProvider& provider, const CTransaction& funding,
-               CMutableTransaction& spend)
+               CMutableTransaction& spend,
+               const int hash_type = SIGHASH_ALL)
 {
     SignatureData signature_data;
     const CTxOut& previous{funding.vout.at(spend.vin.at(0).prevout.n)};
     MutableTransactionSignatureCreator creator{spend, 0, previous.nValue,
-                                               SIGHASH_ALL};
+                                               hash_type};
     const bool complete{ProduceSignature(provider, creator,
                                          previous.scriptPubKey,
                                          signature_data,
                                          AssetSigningContext::OWNER_SUFFIX)};
     UpdateInput(spend.vin.at(0), signature_data);
     return complete;
+}
+
+CMutableTransaction ManagedWithdrawalTransaction(
+    const CTransaction& funding, const modern::AssetId& asset,
+    const unsigned char recipient_tag = 0x22)
+{
+    bridge::BridgeManagedWithdrawalV1 withdrawal;
+    withdrawal.registry_id = uint256::ONE;
+    withdrawal.burn_output_index = 0;
+    withdrawal.raw_amount = 1;
+    withdrawal.ethereum_recipient.fill(recipient_tag);
+    const auto record{bridge::MakeBridgeMpaRecord(bridge::BridgeRecordV1{
+        bridge::BridgeRecordKindV1::MANAGED_WITHDRAWAL, withdrawal})};
+    const auto burn{modern::MakeAssetBurnOutput(asset, 1)};
+    BOOST_REQUIRE(record);
+    BOOST_REQUIRE(burn);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+
+    CMutableTransaction spend;
+    spend.version = 2;
+    spend.vin.emplace_back(COutPoint{funding.GetHash(), 0});
+    spend.vout = {*burn, *binding};
+    spend.mpa = {*record};
+    return spend;
+}
+
+class AcceptingSchnorrChecker final : public BaseSignatureChecker
+{
+public:
+    bool CheckSchnorrSignature(std::span<const unsigned char>,
+                               std::span<const unsigned char>, SigVersion,
+                               ScriptExecutionData&,
+                               ScriptError*) const override
+    {
+        return true;
+    }
+};
+
+bool CheckWithdrawalScripts(const CMutableTransaction& spend,
+                            const CCoinsViewCache& inputs,
+                            const script_verify_flags flags,
+                            ValidationCache& validation_cache,
+                            const LegacyLockSpendContext& lock_context,
+                            const bool require_all)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    const CTransaction tx{spend};
+    PrecomputedTransactionData txdata;
+    TxValidationState state;
+    return CheckInputScripts(
+        tx, state, inputs, flags, /*cacheSigStore=*/true,
+        /*cacheFullScriptStore=*/true, txdata, validation_cache,
+        /*pvChecks=*/nullptr, lock_context,
+        /*require_bridge_sighash_all=*/require_all);
 }
 
 CScript TwoOfThree(const CKey& first, const CKey& second, const CKey& third)
@@ -280,6 +341,125 @@ BOOST_AUTO_TEST_CASE(p2sh_two_of_three_multisig_authorizes_owner)
     CMutableTransaction insufficient{SpendingTransaction(funding)};
     BOOST_CHECK(!SignSpend(one_key_provider, funding, insufficient));
     BOOST_CHECK(!VerifyAgainst(insufficient, previous, previous.scriptPubKey));
+}
+
+BOOST_AUTO_TEST_CASE(managed_bridge_withdrawal_requires_full_transaction_sighash)
+{
+    constexpr int LEGACY_FINAL_HEIGHT{100};
+    constexpr unsigned char ASSET_TAG{0x57};
+    CKey key;
+    key.MakeNewKey(true);
+    FillableSigningProvider provider;
+    BOOST_REQUIRE(provider.AddKey(key));
+    const CScript owner{GetScriptForDestination(PKHash{key.GetPubKey()})};
+    const CTxOut previous{
+        AssetOutput(owner, modern::PolicyType::OWNER, ASSET_TAG)};
+    const CTransaction funding{FundingTransaction(previous)};
+    const modern::AssetId asset{TestAsset(ASSET_TAG)};
+
+    CCoinsView base;
+    CCoinsViewCache inputs{&base};
+    inputs.AddCoin(COutPoint{funding.GetHash(), 0},
+                   Coin{previous, LEGACY_FINAL_HEIGHT + 1,
+                        /*coinbase=*/false},
+                   /*possible_overwrite=*/false);
+    constexpr script_verify_flags flags{STANDARD_SCRIPT_VERIFY_FLAGS};
+    const LegacyLockSpendContext lock_context{LEGACY_FINAL_HEIGHT, flags};
+    ValidationCache validation_cache{1U << 20, 1U << 20};
+    LOCK(cs_main);
+
+    // SIGHASH_NONE is an otherwise-valid owner signature that commits no
+    // outputs. First cache its ordinary-script approval, then prove the
+    // withdrawal mode has a distinct cache key and still rejects it.
+    CMutableTransaction none{
+        ManagedWithdrawalTransaction(funding, asset)};
+    BOOST_REQUIRE(SignSpend(provider, funding, none, SIGHASH_NONE));
+    BOOST_REQUIRE(VerifyAgainst(none, previous, previous.scriptPubKey));
+    BOOST_REQUIRE(CheckWithdrawalScripts(none, inputs, flags, validation_cache,
+                                         lock_context,
+                                         /*require_all=*/false));
+    BOOST_CHECK(!CheckWithdrawalScripts(none, inputs, flags, validation_cache,
+                                        lock_context,
+                                        /*require_all=*/true));
+
+    // Input zero's SIGHASH_SINGLE signs only burn output zero. The policy-9
+    // binding at output one (and therefore the Ethereum recipient) remains
+    // mutable under ordinary script rules, so managed-withdrawal consensus
+    // must reject the otherwise-valid signature.
+    CMutableTransaction single{
+        ManagedWithdrawalTransaction(funding, asset)};
+    BOOST_REQUIRE(SignSpend(provider, funding, single, SIGHASH_SINGLE));
+    BOOST_REQUIRE(VerifyAgainst(single, previous, previous.scriptPubKey));
+    BOOST_CHECK(!CheckWithdrawalScripts(single, inputs, flags,
+                                        validation_cache, lock_context,
+                                        /*require_all=*/true));
+    CMutableTransaction redirected{
+        ManagedWithdrawalTransaction(funding, asset, 0x33)};
+    redirected.vin[0].scriptSig = single.vin[0].scriptSig;
+    redirected.vin[0].scriptWitness = single.vin[0].scriptWitness;
+    BOOST_CHECK(VerifyAgainst(redirected, previous, previous.scriptPubKey));
+
+    // ANYONECANPAY would leave the request transaction's complete input set
+    // unsigned, so even its ALL-output form is deliberately excluded.
+    CMutableTransaction anyone{
+        ManagedWithdrawalTransaction(funding, asset)};
+    BOOST_REQUIRE(SignSpend(provider, funding, anyone,
+                            SIGHASH_ALL | SIGHASH_ANYONECANPAY));
+    BOOST_REQUIRE(VerifyAgainst(anyone, previous, previous.scriptPubKey));
+    BOOST_CHECK(!CheckWithdrawalScripts(anyone, inputs, flags,
+                                        validation_cache, lock_context,
+                                        /*require_all=*/true));
+
+    CMutableTransaction all{
+        ManagedWithdrawalTransaction(funding, asset)};
+    BOOST_REQUIRE(SignSpend(provider, funding, all, SIGHASH_ALL));
+    BOOST_REQUIRE(VerifyAgainst(all, previous, previous.scriptPubKey));
+    BOOST_CHECK(CheckWithdrawalScripts(all, inputs, flags, validation_cache,
+                                       lock_context,
+                                       /*require_all=*/true));
+    CMutableTransaction all_redirected{
+        ManagedWithdrawalTransaction(funding, asset, 0x44)};
+    all_redirected.vin[0].scriptSig = all.vin[0].scriptSig;
+    all_redirected.vin[0].scriptWitness = all.vin[0].scriptWitness;
+    BOOST_CHECK(!VerifyAgainst(all_redirected, previous,
+                               previous.scriptPubKey));
+}
+
+BOOST_AUTO_TEST_CASE(bridge_sighash_flag_accepts_only_full_schnorr_modes)
+{
+    const CScript taproot{
+        CScript{} << OP_1 << std::vector<unsigned char>(32, 0x42)};
+    const script_verify_flags flags{SCRIPT_VERIFY_P2SH |
+                                    SCRIPT_VERIFY_WITNESS |
+                                    SCRIPT_VERIFY_TAPROOT |
+                                    SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL};
+    const AcceptingSchnorrChecker checker;
+    const auto verify = [&](const std::vector<unsigned char>& signature) {
+        CScriptWitness witness;
+        witness.stack = {signature};
+        ScriptError error{SCRIPT_ERR_UNKNOWN_ERROR};
+        const bool ok{VerifyScript(CScript{}, taproot, &witness, flags,
+                                   checker, &error)};
+        return std::pair{ok, error};
+    };
+
+    // A 64-byte Schnorr signature is SIGHASH_DEFAULT, exactly equivalent to
+    // ALL. Explicit ALL is valid as well.
+    BOOST_CHECK(verify(std::vector<unsigned char>(64, 0x31)).first);
+    std::vector<unsigned char> explicit_all(65, 0x32);
+    explicit_all.back() = SIGHASH_ALL;
+    BOOST_CHECK(verify(explicit_all).first);
+
+    for (const unsigned char rejected : {
+             static_cast<unsigned char>(SIGHASH_NONE),
+             static_cast<unsigned char>(SIGHASH_SINGLE),
+             static_cast<unsigned char>(SIGHASH_ALL | SIGHASH_ANYONECANPAY)}) {
+        std::vector<unsigned char> signature(65, 0x33);
+        signature.back() = rejected;
+        const auto [ok, error]{verify(signature)};
+        BOOST_CHECK(!ok);
+        BOOST_CHECK_EQUAL(error, SCRIPT_ERR_SCHNORR_SIG_HASHTYPE);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(provenance_gate_separates_p2sh_multisig_and_sigop_rules)

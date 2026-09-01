@@ -382,6 +382,85 @@ private:
     std::array<bool, 4> m_online{};
 };
 
+/**
+ * Three-node star used to prove proposal retry recovers one lost vote.
+ * Voter attestations travel only to node 0, so neither voter can assemble a
+ * certificate on the side. Node 2's first broadcast vote is deliberately
+ * dropped; its later targeted reply must be the exact cached payload.
+ */
+class RetryAttestationNetwork
+{
+public:
+    void Set(const size_t id, node::FlowMeshRuntime* runtime)
+    {
+        std::lock_guard<std::mutex> lock{m_mutex};
+        m_nodes.at(id) = runtime;
+    }
+
+    void Relay(const size_t from, node::FlowMeshRuntimeRelay relay)
+    {
+        std::vector<std::pair<size_t, node::FlowMeshRuntime*>> targets;
+        {
+            std::lock_guard<std::mutex> lock{m_mutex};
+            if (relay.message.kind ==
+                    flowmesh::WireMessageKind::ATTESTATION &&
+                from != 0) {
+                // New votes retain normal broadcast semantics at the runtime
+                // boundary, but this star has only the proposer as a peer.
+                const size_t target{
+                    relay.peer ? static_cast<size_t>(*relay.peer) : 0};
+                if (target != 0 || m_nodes[0] == nullptr) return;
+                if (from == 2 && !m_dropped_first) {
+                    m_dropped_first = relay.message.payload;
+                    return;
+                }
+                if (from == 2 && relay.peer) {
+                    m_targeted_retry = relay.message.payload;
+                }
+                targets.emplace_back(0, m_nodes[0]);
+            } else if (relay.peer) {
+                const size_t target{static_cast<size_t>(*relay.peer)};
+                if (target < m_nodes.size() && m_nodes[target] != nullptr) {
+                    targets.emplace_back(target, m_nodes[target]);
+                }
+            } else {
+                for (size_t i{0}; i < m_nodes.size(); ++i) {
+                    if (i == from || m_nodes[i] == nullptr ||
+                        (relay.exclude_peer &&
+                         *relay.exclude_peer == static_cast<int64_t>(i))) {
+                        continue;
+                    }
+                    targets.emplace_back(i, m_nodes[i]);
+                }
+            }
+        }
+        for (const auto& [id, runtime] : targets) {
+            (void)id;
+            runtime->EnqueueWireMessage(static_cast<int64_t>(from),
+                                        relay.message);
+        }
+    }
+
+    bool DroppedFirstAttestation() const
+    {
+        std::lock_guard<std::mutex> lock{m_mutex};
+        return m_dropped_first.has_value();
+    }
+
+    bool RetriedExactCachedAttestation() const
+    {
+        std::lock_guard<std::mutex> lock{m_mutex};
+        return m_dropped_first && m_targeted_retry &&
+               *m_dropped_first == *m_targeted_retry;
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    std::array<node::FlowMeshRuntime*, 3> m_nodes{};
+    std::optional<std::vector<unsigned char>> m_dropped_first;
+    std::optional<std::vector<unsigned char>> m_targeted_retry;
+};
+
 bool WaitUntil(const std::function<bool()>& predicate)
 {
     for (size_t i{0}; i < 500; ++i) {
@@ -412,6 +491,93 @@ node::FlowMeshRuntimeMarketConfig MarketConfig(
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_runtime_tests, BasicTestingSetup)
+
+BOOST_AUTO_TEST_CASE(repeated_proposal_replays_cached_attestation)
+{
+    const uint256 domain{Filled(0x19)};
+    const modern::AssetId asset{Filled(0x39)};
+    const flowmesh::MarketId market{
+        *flowmesh::ComputeFlowMeshMarketId(domain, asset)};
+    const flowmesh::VaultId vault{
+        *flowmesh::ComputeFlowMeshVaultId(domain, market)};
+    const uint256 treasury{Filled(0x59)};
+    const SeatFixture seats{
+        Seats(domain, market, 4, 7, 100, Filled(0x71), 121)};
+
+    RuntimeChain chain;
+    chain.m_domain = domain;
+    chain.Add(seats.seats);
+    FixedClock clock;
+    flowmesh::FlowMeshState initial{
+        vault, asset, modern::NativeAsset(),
+        flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+
+    std::array<std::unique_ptr<node::FlowMeshProductionStore>, 3> stores;
+    std::array<RuntimeKeys, 3> keys;
+    std::string error;
+    for (size_t i{0}; i < stores.size(); ++i) {
+        stores[i] = std::make_unique<node::FlowMeshProductionStore>(DBParams{
+            .path = m_args.GetDataDirBase() / fs::PathFromString(
+                        "flowmesh_runtime_attestation_retry_" +
+                        std::to_string(i)),
+            .cache_bytes = size_t{1} << 20, .wipe_data = true});
+        BOOST_REQUIRE_MESSAGE(stores[i]->OpenForMarket(
+                                  domain, market, seats.seats,
+                                  initial.Root(), error),
+                              error);
+        keys[i].m_keys[market] = {seats.secrets[i]};
+    }
+
+    RetryAttestationNetwork network;
+    std::array<std::unique_ptr<node::FlowMeshRuntime>, 3> runtimes;
+    for (size_t i{0}; i < runtimes.size(); ++i) {
+        node::FlowMeshRuntimeConfig config;
+        config.chain = &chain;
+        config.keys = &keys[i];
+        config.clock = &clock;
+        config.round_timeout = std::chrono::hours{1};
+        config.relay = [&network, i](node::FlowMeshRuntimeRelay relay) {
+            network.Relay(i, std::move(relay));
+        };
+        runtimes[i] = std::make_unique<node::FlowMeshRuntime>(
+            std::move(config),
+            std::vector<node::FlowMeshRuntimeMarketConfig>{MarketConfig(
+                domain, market, treasury, seats.seats, initial,
+                *stores[i], nullptr)});
+        network.Set(i, runtimes[i].get());
+        BOOST_REQUIRE_MESSAGE(runtimes[i]->Start(error), error);
+    }
+
+    // Node 0 is the sequence-zero proposer. Its own vote and node 1's vote
+    // are insufficient for the 3-of-4 threshold after node 2's first vote is
+    // dropped.
+    runtimes[0]->NotifyTick();
+    BOOST_REQUIRE(WaitUntil([&] {
+        return network.DroppedFirstAttestation();
+    }));
+    for (const auto& runtime : runtimes) {
+        BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+        BOOST_REQUIRE_EQUAL(runtime->MarketStatus(market)->next_sequence, 0U);
+    }
+
+    // Retrying the permanently locked proposal must not sign again. Each
+    // voter returns its cached vote directly to node 0; the previously lost
+    // node-2 payload is byte-identical and restores certification liveness.
+    runtimes[0]->NotifyTick();
+    BOOST_REQUIRE(WaitUntil([&] {
+        if (!network.RetriedExactCachedAttestation()) return false;
+        for (const auto& runtime : runtimes) {
+            const auto status{runtime->MarketStatus(market)};
+            if (!status || status->next_sequence != 1 ||
+                status->halt != node::FlowMeshRuntimeHalt::NONE) {
+                return false;
+            }
+        }
+        return true;
+    }));
+
+    for (auto& runtime : runtimes) runtime->Stop();
+}
 
 BOOST_AUTO_TEST_CASE(four_node_commit_pause_dynamic_catchup_and_isolated_halt)
 {

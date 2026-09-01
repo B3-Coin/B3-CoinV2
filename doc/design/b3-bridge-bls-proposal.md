@@ -1,12 +1,15 @@
 # B3 bridges — BLS as the keystone (design proposal)
 
-**Status: committed design record (2026-08-23). The DIRECTION is an owner statement
-("BLS is the key to bridge"); this document turns it into a concrete plan. Nothing here
-is consensus-active, nothing is authorized for `src/consensus` / `src/modern` wiring
-until (a) the v1 release (clean H+1) has shipped and (b) the OPEN items in §8 are ruled.
-Governed by OD-8 ([b3-open-decisions.md](b3-open-decisions.md)), contract §21/§45/§47,
-handoff §3.4–3.6. Where this conflicts with any of those, they govern and the conflict
-is reported, not resolved here.**
+**Status: historical design record (2026-08-23), superseded for transition-v1
+custody and exact mint admission by OD-8 and the bridge threat model. The
+direction ("BLS is the key to bridge") remains the future decentralized goal.
+Stages 1–4 now exist in the transition tree: bounded type-10 records drive the
+Ethereum light client, exact deposit minting, execution backfill, and managed
+withdrawal burns through consensus. The state is replayed in memory from
+activation (with pruning refused), not stored in a durable sidecar. Mainnet is
+still fail-closed, and no operator Ethereum-release service or decentralized
+withdrawal verifier exists. A3 is FlowMesh activation and never activates this
+bridge.**
 
 ## 1. Why BLS is the keystone (the one-paragraph version)
 
@@ -44,7 +47,7 @@ Bitcoin stays SPV (most-work headers + merkle proof); no BLS needed there.
 
 No other new cryptography. No zk circuits in v1 of the bridge (see §7 alternatives).
 
-### 2.2 Consensus objects (modern era, activation **A3**)
+### 2.2 Consensus objects (modern era, separate bridge activation)
 
 All of these are new **ACTIONs / policy state**, never `CTxOut` fields, never a change to
 block hashing, era selection, genesis, or anything ≤ H.
@@ -59,7 +62,7 @@ block hashing, era selection, genesis, or anything ≤ H.
 2. **Light-client state** in chainstate (rebuildable, undo on disconnect, like the
    asset registry): per `light_client_id` — `{current_committee (512×48 B + root),
    next_committee?, finalized_header, period, fork_version_table}`. Bootstrapped from a
-   **hard-coded trusted checkpoint** in chainparams at A3 (block root + committee root),
+   **hard-coded trusted checkpoint** in chainparams at bridge activation (block root + committee root),
    exactly as every Ethereum light client does. Re-bootstrap rule = OPEN.
 3. **`LIGHT_CLIENT_UPDATE` action** carrying an Ethereum `LightClientUpdate`
    (attested header, sync aggregate, finalized header + branch, next committee + branch
@@ -70,16 +73,22 @@ block hashing, era selection, genesis, or anything ≤ H.
    block section with its own cap** (e.g. ≤ 1 handover per block, ≤ 32 KB), not the
    creation-action section. Anyone may relay (permissionless); a valid update is not a
    privilege.
-4. **`BRIDGE_MINT` action**: `{asset_id, light_client_id, slot ≤ finalized_slot,
-   SSZ branch beacon_block → execution_payload_header.receipts_root, MPT proof of the
-   receipt, log_index}`. The node decodes the `Lock(recipient, amount, nonce)` log,
-   checks `origin_contract` matches the asset's genesis, mints **exactly** `amount`
-   (decimals-normalized) to `recipient` (a B3 policy output the log names), and records
-   the nullifier `H(origin_chain_id ‖ tx_hash ‖ log_index)` in chainstate. Double mint is
-   a consensus failure. Caps/watcher veto = OPEN.
-5. **`BRIDGE_BURN` action**: destroys `amount` of the asset and names an origin-chain
-   destination (20 B). Each block commits a **bridge exit root** (Merkle root of its
-   burns) so the release leg has something to prove.
+4. **`BRIDGE_MINT` action** (implemented as type-10 `MINT`): the proof binds a finalized
+   Ethereum execution header to the receipt trie, the canonical receipt key,
+   and one exact log index. The node decodes the deployed vault event
+   `Deposit(uint64 indexed depositId, address indexed token, uint256 amount,
+   bytes32 b3Recipient)`, requires the exact approved vault and token, converts
+   raw units exactly, and records the replay key
+   `(origin_chain_id, vault_address, deposit_id)`. The older
+   `H(origin_chain_id ‖ tx_hash ‖ log_index)` sketch is superseded.
+5. **Managed withdrawal burn** (implemented as type-10
+   `MANAGED_WITHDRAWAL`): one exact canonical bUSD BURN output binds the raw
+   amount and Ethereum destination. Its unique request id is the full
+   evidence-bearing transaction id plus burn-output index, tracked with
+   connect/undo/reindex replay. Transition-v1 managed release uses the
+   normative workflow in the threat model; the operator-side finality wait,
+   Ethereum call, durable consumption database, and reconciliation service are
+   not implemented here.
 6. **B3 BLS committee (release leg)** — superseded in detail by
    [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md) (the full B3 → Ethereum
    communication layer: finality gadget, validator-set handover, `B3FinalityVerifier.sol`,
@@ -105,9 +114,11 @@ block hashing, era selection, genesis, or anything ≤ H.
   verified checkpoint)` pays out, nullifiers by burn id. Gas estimate: two pairings +
   up to 512 G1 adds ≈ 0.3–0.5 M gas per checkpoint — acceptable at one checkpoint per B3
   epoch; can be reduced later by proving the aggregate in a SNARK (out of scope).
-- **Until the B3 committee exists**: the OD-8 interim (rotatable `signer_set` in the
-  bridged asset's mutable state) remains the release-leg fallback; the `AssetId` does not
-  change when the leg upgrades.
+- **Transition-v1 supersession**: the published vault's immutable EOA is the
+  disclosed managed release authority. It is not rotatable in the vault and
+  cannot become the future verifier in place. Moving to a verifier means a new
+  vault and, under the current identity formula, a new `AssetId` plus explicit
+  burn/swap/reissue and reserve migration.
 
 ## 3. How we do it — staged build order
 
@@ -121,9 +132,9 @@ consensus or the v1 release.
 | 1 | Vendor `blst` (pinned), `Keccak256`, CMake `WITH_BRIDGE` (OFF by default); unit tests against Ethereum **consensus-spec-tests** BLS vectors (sign/verify/aggregate/fast-aggregate-verify, PoP) and Keccak KATs | `ctest` green, release build unchanged |
 | 2 | `modern/ssz.h`, `bridge/mpt.h`, `bridge/rlp.h`; tests with captured mainnet fixtures (one finalized block: header, receipts-root branch, a USDT `Transfer`/`Lock` receipt proof) — captured **offline**, checked in as hex | tests only |
 | 3 | `bridge/eth_light_client.h` (pure functions: `ProcessUpdate`, `VerifyFinality`, `VerifyCommitteeHandover`) + fixture-driven tests across one period boundary and one fork-version boundary | tests only |
-| 4 | Consensus objects of §2.2 items 1–5 behind `A3`, chainstate for light-client state + nullifiers, undo/reindex, activation regtest functional tests with a **mock origin** (fixture updates fed through RPC) | after v1 release; gate script green |
+| 4 | Consensus objects of §2.2 items 1–5 behind a separate bridge activation, light-client/anchor/nullifier/cap/withdrawal-request state, undo/reindex, and mempool/miner/asset integration | **implemented in the transition tree**; state is rebuilt in memory from activation, pruning is refused, and production pins/review remain gates |
 | 5 | BLS committee registration (needs PoS ruling), checkpoint signing in the staking loop, `B3LightClient.sol` + `B3Bridge.sol`, Sepolia/Holesky end-to-end with TEST tokens | owner ruling + testnet only |
-| 6 | Mainnet A3 pin, trusted bootstrap checkpoint in chainparams, first bridged asset registration (USDT-ETH-L1 recommended) | four release gates analogue |
+| 6 | Separate mainnet bridge activation pin, trusted bootstrap checkpoint in chainparams, first bridged asset registration (canonical USDT-ETH-L1) | all bridge readiness, audit, and managed-redemption gates green |
 
 ## 4. What this changes, and what it does not
 
@@ -168,7 +179,7 @@ consensus or the v1 release.
 - **Arbitrum / L2 origin** — adds rollup-state proof + BoLD delay or sequencer trust;
   OD-8 already recommends L1.
 
-## 8. OPEN — owner decisions needed before code beyond stage 3
+## 8. Historical open list — current status is governed by OD-8
 
 1. Vendor `blst` (portable default) — yes/no.
 2. Origin chain for the first bridged stablecoin: Ethereum L1 (recommended) — confirm.
@@ -183,7 +194,7 @@ consensus or the v1 release.
 8. Issuer-freeze handling (contract §45).
 9. Separate block section + cap for `LIGHT_CLIENT_UPDATE` (proposed ≤ 32 KB, ≤ 1
    handover per block) — confirm.
-10. A3 activation height — after v1, never before a clean H+1.
+10. Separate bridge activation height — never implied by FlowMesh A3.
 
 ---
 
@@ -197,7 +208,7 @@ Owner ruling 2026-08-24: **deposit legs first — ETH → B3, then BTC → B3**
 | 1 (blst, Keccak-256) | **COMPLETE** — landed earlier by the Modern PoS finality work (`src/blst` v0.3.17, `crypto/bls.{h,cpp}` with the Ethereum ciphersuite DST, `crypto/keccak256.{h,cpp}`) |
 | 2 (RLP/MPT; SSZ) | **EXECUTED 2026-08-24** — `bridge/rlp.h` (canonical-strict), `bridge/mpt.h` (inclusion-only), `bridge/ssz.h`; mainnet-anchored fixtures captured by `contrib/b3bridge/` (receipts trie of block 25811248 rebuilt in full and matched to the header root) |
 | 3 (eth_light_client.h) | **EXECUTED 2026-08-24** — `bridge/eth_light_client.h` (InitStore/VerifyUpdate/ProcessUpdate; finalized-only; supermajority default 342/512; proven execution payload headers; Altair/Electra gindices by fork epoch) verified END TO END on real mainnet data: bootstrap + full 512-member aggregate + committee rotation across periods 1836→1837 (fork Fulu), plus `bridge/deposit.h` (strict receipt decode + vault Deposit extraction) and `contracts/B3DepositVault.sol` (source; compile/deploy = owner/CI). The one-block cross-anchor: the receipts fixture block IS the light-client-proven finalized block, so the tests exercise signature → finality proof → execution proof → receipts_root → MPT proof → receipt → event extraction as one chain. |
-| 4+ (consensus wiring, A3) | **GATED** — awaits the §8 rulings; everything above is header-only/test-only and unreachable from consensus. |
+| 4 (consensus wiring, separate bridge activation) | **IMPLEMENTED / MAINNET GATED** — canonical bounded type-10 bootstrap, update, mint, execution-backfill, and managed-withdrawal records feed consensus validation; each has one exact zero-value policy-9 `BRIDGE_RECORD` metadata output so standard `SIGHASH_ALL` binds the canonical record without `OP_RETURN` or a custom sighash. Exact OWNER mint, nullifier/caps, exact bUSD BURN request, undo/reindex replay, mempool, miner, and asset conservation are wired. State is in-memory and rebuilt from activation; configured bridge nodes refuse pruning because no durable sidecar exists. Adapter enforcement, operator release automation/request-consumption storage, audits, and all production checkpoint/fork/cap/activation/rules/X pins remain gates. |
 
 BTC → B3: inbound SPV verification is designable on the same pattern, but the
 BTC **custody** model for a two-way peg (threshold-Schnorr committee vs

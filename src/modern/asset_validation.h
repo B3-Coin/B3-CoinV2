@@ -159,6 +159,14 @@ struct AssetTransactionContext {
     std::optional<uint32_t> fn_pod_issued_before{};
     //! Native input/output gap already checked by CheckTxInputs.
     CAmount native_input_output_gap{0};
+    /**
+     * Exact non-native surplus authorized by an independently verified
+     * bridge deposit.  The bridge state machine is responsible for proof,
+     * recipient, registry, replay and cap checks before populating this
+     * field; asset conservation merely enforces that the transaction creates
+     * this amount and no other surplus.
+     */
+    std::optional<AuthorizedAssetMint> bridge_mint{};
 };
 
 struct AssetTransactionEffects {
@@ -205,7 +213,8 @@ inline bool CheckAssetTransaction(const CTransaction& tx,
     }
 
     const size_t fn_pod_declarations{CountModernFnPodDeclarations(tx)};
-    bool has_asset{HasAssetCreationAction(tx) || fn_pod_declarations != 0};
+    bool has_asset{HasAssetCreationAction(tx) || fn_pod_declarations != 0 ||
+                   context.bridge_mint.has_value()};
     std::vector<ModernOutput> prev_outputs;
     std::vector<ModernOutput> outputs;
     std::vector<ModernInput> inputs;
@@ -238,6 +247,10 @@ inline bool CheckAssetTransaction(const CTransaction& tx,
 
     if (!has_asset) return true;
     const std::vector<CreationAction> actions{AssetCreationActions(tx)};
+    if (context.bridge_mint && !actions.empty()) {
+        error = "a transaction cannot combine asset genesis and bridge minting";
+        return false;
+    }
     if (!actions.empty()) {
         if (!Consensus::AssetRulesActive(height, params)) {
             error = "asset issuance is not active";
@@ -249,8 +262,12 @@ inline bool CheckAssetTransaction(const CTransaction& tx,
         }
     }
 
-    std::optional<AuthorizedAssetMint> authorized_mint;
+    std::optional<AuthorizedAssetMint> authorized_mint{context.bridge_mint};
     if (fn_pod_declarations != 0) {
+        if (authorized_mint) {
+            error = "a transaction cannot combine FN PoD and bridge minting";
+            return false;
+        }
         if (fn_pod_declarations != 1) {
             error = "modern FN PoD transaction must have exactly one declaration";
             return false;
@@ -351,7 +368,8 @@ inline bool CheckAssetTransaction(const CTransaction& tx,
     AssetTransactionEffects ignored;
     return CheckAssetTransaction(tx, prev_coins, height, params,
                                  AssetTransactionContext{std::nullopt,
-                                                         input_value - output_value},
+                                                         input_value - output_value,
+                                                         std::nullopt},
                                  ignored, error);
 }
 

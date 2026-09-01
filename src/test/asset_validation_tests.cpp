@@ -267,6 +267,49 @@ BOOST_AUTO_TEST_CASE(mint_without_a_type_three_action_is_unauthorized)
     BOOST_CHECK_EQUAL(error, ConservationError(modern::AssetCheck::UNAUTHORIZED_MINT));
 }
 
+BOOST_AUTO_TEST_CASE(bridge_authorization_opens_only_its_exact_surplus)
+{
+    const Consensus::Params params{TestParams()};
+    const modern::AssetId asset{TestAsset()};
+    CMutableTransaction tx{Spend({Prevout(51)})};
+    tx.vout.push_back(AssetOwnerOutput(asset, 25));
+    const std::vector<Coin> coins{NativeCoin()};
+    std::string error;
+    modern::AssetTransactionEffects effects;
+
+    BOOST_CHECK(modern::CheckAssetTransaction(
+        CTransaction{tx}, coins, ASSET_ACTIVATION_HEIGHT, params,
+        modern::AssetTransactionContext{
+            std::nullopt, NATIVE_INPUT_VALUE,
+            modern::AuthorizedAssetMint{asset, 25}},
+        effects, error));
+
+    BOOST_CHECK(!modern::CheckAssetTransaction(
+        CTransaction{tx}, coins, ASSET_ACTIVATION_HEIGHT, params,
+        modern::AssetTransactionContext{
+            std::nullopt, NATIVE_INPUT_VALUE,
+            modern::AuthorizedAssetMint{asset, 24}},
+        effects, error));
+    BOOST_CHECK_EQUAL(error,
+                      ConservationError(modern::AssetCheck::UNAUTHORIZED_MINT));
+
+    const modern::AssetGenesisV1 genesis{
+        .max_supply = 25,
+        .decimals = 0,
+        .issuance_mode = modern::ASSET_ISSUANCE_MODE_GENESIS_FIXED,
+    };
+    CMutableTransaction mixed{IssuanceTransaction(
+        params, Prevout(51), genesis, genesis.max_supply)};
+    BOOST_CHECK(!modern::CheckAssetTransaction(
+        CTransaction{mixed}, coins, ASSET_ACTIVATION_HEIGHT, params,
+        modern::AssetTransactionContext{
+            std::nullopt, NATIVE_INPUT_VALUE,
+            modern::AuthorizedAssetMint{asset, 25}},
+        effects, error));
+    BOOST_CHECK_EQUAL(error,
+                      "a transaction cannot combine asset genesis and bridge minting");
+}
+
 BOOST_AUTO_TEST_CASE(legacy_b3a1_lookalike_never_becomes_an_asset_input)
 {
     const Consensus::Params params{TestParams()};

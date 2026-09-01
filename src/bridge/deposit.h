@@ -9,15 +9,15 @@
 #include <crypto/keccak256.h>
 #include <uint256.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <vector>
 
-/** Ethereum receipt decoding and B3DepositVault event extraction — the last
- *  pure-verification piece of the ETH -> B3 deposit leg (header-only, not
- *  reachable from consensus; stage 2-3 of the bridge staged build order).
+/** Ethereum receipt decoding and B3DepositVault event extraction for the
+ *  consensus-verified ETH -> B3 deposit leg.
  *
  *  Trust chain: eth_light_client.h proves the finalized receipts_root;
  *  mpt.h proves a receipt against it; this file decodes that receipt and
@@ -28,9 +28,8 @@
  *                  uint256 amount, bytes32 b3Recipient);
  *
  *  Everything is strict: canonical RLP integers only, exact topic/data
- *  shapes, exact padding. What a mint of the proven deposit MEANS on B3
- *  (asset policy, recipient semantics) is consensus stage 4 and stays
- *  gated on the owner's A3 rulings.
+ *  shapes, exact padding. Asset identity, recipient semantics, replay and
+ *  caps are enforced separately by the gated bridge state machine.
  */
 namespace bridge {
 
@@ -140,6 +139,54 @@ inline const uint256& DepositTopic()
     return topic;
 }
 
+namespace deposit_detail {
+
+inline std::optional<DepositEvent> DecodeDepositLog(const EthLog& log,
+                                                    const EthAddress& vault)
+{
+    if (log.address != vault || log.topics.size() != 3 ||
+        log.topics[0] != DepositTopic() || log.data.size() != 64) {
+        return std::nullopt;
+    }
+
+    DepositEvent ev;
+    // topics[1] = uint64 depositId, left-padded to 32 bytes.
+    const unsigned char* t1{log.topics[1].begin()};
+    if (std::any_of(t1, t1 + 24,
+                    [](const unsigned char byte) { return byte != 0; })) {
+        return std::nullopt;
+    }
+    for (int i = 24; i < 32; ++i) {
+        ev.deposit_id = (ev.deposit_id << 8) | t1[i];
+    }
+
+    // topics[2] = address token, left-padded to 32 bytes.
+    const unsigned char* t2{log.topics[2].begin()};
+    if (std::any_of(t2, t2 + 12,
+                    [](const unsigned char byte) { return byte != 0; })) {
+        return std::nullopt;
+    }
+    std::copy(t2 + 12, t2 + 32, ev.token.begin());
+    std::copy(log.data.begin(), log.data.begin() + 32, ev.amount.begin());
+    std::copy(log.data.begin() + 32, log.data.end(), ev.b3_recipient.begin());
+    return ev;
+}
+
+} // namespace deposit_detail
+
+/**
+ * Extract the Deposit event at one exact absolute receipt-log index. This is
+ * the consensus-facing form: a proof names one log and cannot be redirected
+ * to another otherwise-well-formed Deposit event in the same receipt.
+ */
+inline std::optional<DepositEvent> ExtractDepositAt(const EthReceipt& receipt,
+                                                    const EthAddress& vault,
+                                                    const size_t log_index)
+{
+    if (!receipt.status || log_index >= receipt.logs.size()) return std::nullopt;
+    return deposit_detail::DecodeDepositLog(receipt.logs[log_index], vault);
+}
+
 /** Extract every well-formed vault Deposit event from a decoded receipt.
  *  Only logs emitted by `vault` count; the receipt must be a success.
  *  Malformed pseudo-deposits (bad padding, wrong shapes) are skipped, not
@@ -148,25 +195,10 @@ inline std::vector<DepositEvent> ExtractDeposits(const EthReceipt& receipt, cons
 {
     std::vector<DepositEvent> out;
     if (!receipt.status) return out;
-    for (const EthLog& log : receipt.logs) {
-        if (log.address != vault) continue;
-        if (log.topics.size() != 3 || log.topics[0] != DepositTopic()) continue;
-        if (log.data.size() != 64) continue;
-        DepositEvent ev;
-        // topics[1] = uint64 depositId, left-padded to 32 bytes.
-        const unsigned char* t1{log.topics[1].begin()};
-        bool pad_ok{true};
-        for (int i = 0; i < 24; ++i) pad_ok &= (t1[i] == 0);
-        if (!pad_ok) continue;
-        for (int i = 24; i < 32; ++i) ev.deposit_id = (ev.deposit_id << 8) | t1[i];
-        // topics[2] = address token, left-padded to 32 bytes.
-        const unsigned char* t2{log.topics[2].begin()};
-        for (int i = 0; i < 12; ++i) pad_ok &= (t2[i] == 0);
-        if (!pad_ok) continue;
-        std::copy(t2 + 12, t2 + 32, ev.token.begin());
-        std::copy(log.data.begin(), log.data.begin() + 32, ev.amount.begin());
-        std::copy(log.data.begin() + 32, log.data.end(), ev.b3_recipient.begin());
-        out.push_back(ev);
+    for (size_t i{0}; i < receipt.logs.size(); ++i) {
+        if (auto event{ExtractDepositAt(receipt, vault, i)}) {
+            out.push_back(std::move(*event));
+        }
     }
     return out;
 }

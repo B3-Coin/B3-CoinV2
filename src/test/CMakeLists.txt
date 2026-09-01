@@ -46,6 +46,8 @@ add_executable(test_bitcoin
   bridge_eth_light_client_tests.cpp
   bridge_exec_chain_tests.cpp
   bridge_mpt_tests.cpp
+  bridge_proof_tests.cpp
+  bridge_state_tests.cpp
   update_downloader_tests.cpp
   update_manager_tests.cpp
   legacy_wallet_send_tests.cpp

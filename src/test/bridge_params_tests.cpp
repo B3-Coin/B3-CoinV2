@@ -4,6 +4,7 @@
 
 #include <bridge/admission.h>
 #include <consensus/bridge_params.h>
+#include <consensus/era.h>
 #include <kernel/chainparams.h>
 #include <modern/bridge_asset.h>
 #include <util/strencodings.h>
@@ -327,6 +328,10 @@ BOOST_AUTO_TEST_CASE(flowmesh_regtest_has_complete_test_only_bridge_params)
     BOOST_REQUIRE(params.flowmesh_activation_height);
     BOOST_CHECK(params.busd_bridge->activation_height ==
                 params.flowmesh_activation_height);
+    BOOST_CHECK(!Consensus::BridgeRulesActive(
+        *params.flowmesh_activation_height - 1, params));
+    BOOST_CHECK(Consensus::BridgeRulesActive(
+        *params.flowmesh_activation_height, params));
     BOOST_CHECK(modern::ConfiguredBridgeAssetId(params).has_value());
     BOOST_CHECK(modern::ConfiguredBridgeRegistryId(params).has_value());
     BOOST_CHECK(ConfiguredBridgeRegistryEntry(params).has_value());

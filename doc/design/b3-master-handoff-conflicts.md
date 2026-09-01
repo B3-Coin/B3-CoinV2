@@ -348,6 +348,20 @@ security, bootstrap, cap, adapter and activation pin is present.
 The owner further ruled that transition v1 deliberately uses this deployed
 vault's immutable owner-controlled release authority. Withdrawals are managed
 in v1 and must be disclosed as such; proof verification still governs inbound
-minting. The exact authority and runtime code hash remain activation pins. A
-future decentralized verifier cannot replace this authority in place and
-therefore requires a new approved vault plus an explicit reserve migration.
+minting. The exact authority and runtime code hash remain activation pins.
+Managed release requires a finalized B3 burn request that binds canonical
+bUSD, exact raw amount, Ethereum recipient and a unique request id; the
+operator waits the pinned finality depth, releases exactly once, durably
+consumes the id, and reconciles reserve against supply. No burn means no
+release. The B3 type-10 mint path and exact burn-request path are now
+consensus-integrated with nullifier/cap accounting, undo/reindex replay,
+mempool, miner, and asset validation. Bridge state is rebuilt in memory from
+activation; pruning is refused because there is no durable sidecar. The
+operator Ethereum-release automation and durable request-consumption database
+remain unimplemented, as does origin adapter enforcement.
+
+A future decentralized verifier cannot replace this authority in place and
+therefore requires a new approved vault. Because the current `AssetId` binds
+the vault address, this also creates a new asset identity and requires an
+explicit old-registry cutoff, late-deposit refund policy, burn/swap/reissue,
+reserve migration without double minting, and new activation/code pins.

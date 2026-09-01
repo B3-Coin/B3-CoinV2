@@ -4,14 +4,17 @@
 
 #include <interfaces/chain.h>
 #include <rpc/request.h>
+#include <rpc/server.h>
 #include <test/util/setup_common.h>
 #include <univalue.h>
 #include <wallet/rpc/flowmesh.h>
 #include <wallet/rpc/util.h>
+#include <wallet/rpc/wallet.h>
 
 #include <boost/test/unit_test.hpp>
 
 #include <optional>
+#include <set>
 #include <string>
 
 namespace wallet {
@@ -84,6 +87,19 @@ BOOST_AUTO_TEST_CASE(flowmesh_vault_operation_discovery_json)
                       deposit.deposit_outpoint.hash.GetHex());
     BOOST_CHECK_EQUAL(json.find_value("deposit_vout").getInt<int>(), 7);
     BOOST_CHECK_EQUAL(json.find_value("vault_inputs").getInt<int>(), 1);
+}
+
+BOOST_AUTO_TEST_CASE(bridge_transaction_commands_are_registered)
+{
+    std::set<std::string> found;
+    for (const CRPCCommand& command : GetWalletRPCCommands()) {
+        if (command.name == "submitbridgecarrier" ||
+            command.name == "claimbridgedeposit" ||
+            command.name == "bridgewithdraw") {
+            found.insert(command.name);
+        }
+    }
+    BOOST_CHECK_EQUAL(found.size(), 3U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

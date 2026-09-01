@@ -88,7 +88,15 @@ Scope: B3 transition context, modern colored assets, FN Coin/Proof of Disintegra
 > vault `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`, not a fee asset or a
 > native CDP. All claim/proof and stablecoin-fee text below that conflicts with
 > this reconciliation is **SUPERSEDED historical design** and must not be
-> implemented.
+> implemented. The bounded type-10 proof/command carrier, exact OWNER mint,
+> exact bUSD BURN request, nullifier/caps, undo/reindex replay, and
+> mempool/miner/asset integration are implemented. Each type-10 record requires
+> one zero-value policy-9 `BRIDGE_RECORD` metadata output committing the exact
+> canonical frame; standard `SIGHASH_ALL` binds it without `OP_RETURN` or a
+> custom sighash. Bridge state is rebuilt in memory from activation and pruning
+> is refused because no durable sidecar exists. Adapter enforcement and the
+> operator Ethereum-release/consumption service are not implemented;
+> production pins and audits remain open, so mainnet remains fail-closed.
 
 ## 0. How this document must be used
 
@@ -999,7 +1007,9 @@ The reconciled execution order is:
 4. Activate simple assets plus FlowMesh seat/vault preparation at A2.
 5. Activate FlowMesh v1 spot at A3; each market still waits for its unique
    earliest eligible epoch-zero anchor to become 30-deep.
-6. Activate bridge-backed bUSD only after its separate proof/readiness pins.
+6. Activate bridge-backed bUSD only after independent review of its implemented
+   consensus mint/burn, proof-carrier and replay state, plus adapter,
+   operator-redemption, audit, and production readiness-pin gates.
 7. Test and ship later FlowMesh expansion; futures follow spot and retain the
    locked 10× maximum while every other mechanic remains undecided.
 ```

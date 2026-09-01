@@ -4,12 +4,13 @@
 //
 // Commit 1 of the Modern PoS V1 finality plan: frozen constants, fixed-width
 // codecs, digests, the Keccak validator-set commitment, and the guardrails
-// that nothing new is activated (policy 6/7/8 fail closed; creation-action
-// numbers 4/5 are not registered).
+// that nothing new is activated (policy 6/7/8/9 fail closed; creation-action
+// numbers 4/5/10 are not registered).
 
 #include <consensus/consensus.h>
 #include <consensus/modern_pos_params.h>
 #include <crypto/keccak256.h>
+#include <modern/bridge_binding.h>
 #include <modern/creation_action.h>
 #include <modern/finality_types.h>
 #include <modern/policy.h>
@@ -56,9 +57,30 @@ BOOST_AUTO_TEST_CASE(frozen_constants)
     BOOST_CHECK_EQUAL(static_cast<uint16_t>(modern::PolicyType::FINALITY_CERT), 6);
     BOOST_CHECK_EQUAL(static_cast<uint16_t>(modern::PolicyType::FINALITY_KEY), 7);
     BOOST_CHECK_EQUAL(static_cast<uint16_t>(modern::PolicyType::MODERN_PAYLOAD_ROOT), 8);
+    BOOST_CHECK_EQUAL(static_cast<uint16_t>(modern::PolicyType::BRIDGE_RECORD), 9);
     // Reserved MPA record numbers
     BOOST_CHECK_EQUAL(modern::CREATION_ACTION_FINALITY_CERTIFICATE, 4);
     BOOST_CHECK_EQUAL(modern::CREATION_ACTION_FINALITY_KEY_EVIDENCE, 5);
+    BOOST_CHECK_EQUAL(modern::CREATION_ACTION_BRIDGE, 10);
+
+    CMpaRecord bridge_record;
+    bridge_record.payload_type = modern::CREATION_ACTION_BRIDGE;
+    bridge_record.payload_version = modern::POLICY_VERSION_V1;
+    bridge_record.payload = {0x01, 0x02, 0x03};
+    const auto bridge_commitment{
+        modern::BridgeRecordCommitmentV1(bridge_record)};
+    const auto bridge_binding{
+        modern::MakeBridgeBindingOutput(bridge_record)};
+    BOOST_REQUIRE(bridge_commitment);
+    BOOST_REQUIRE(bridge_binding);
+    const auto bridge_cell{
+        modern::ParseMetadataCell(bridge_binding->scriptPubKey)};
+    BOOST_REQUIRE(bridge_cell);
+    BOOST_CHECK_EQUAL(bridge_binding->nValue, 0);
+    BOOST_CHECK_EQUAL(bridge_cell->policy_type, 9);
+    BOOST_CHECK_EQUAL(bridge_cell->policy_version, 1);
+    BOOST_CHECK(bridge_cell->commitment == *bridge_commitment);
+    BOOST_CHECK(bridge_cell->params.empty());
     // The permanent policy-state bound is untouched.
     BOOST_CHECK_EQUAL(modern::MAX_POLICY_PARAMS_SIZE, 80u);
     BOOST_CHECK_LE(modern::FinalityKeyParams::SIZE, modern::MAX_POLICY_PARAMS_SIZE);
@@ -85,8 +107,11 @@ BOOST_AUTO_TEST_CASE(modern_pos_params_finality_defaults_and_validity)
 BOOST_AUTO_TEST_CASE(guardrails_nothing_activated)
 {
     using modern::PolicyType;
-    // Policy 6/7/8: never activated, with or without the test-only asset switch.
-    for (const auto t : {PolicyType::FINALITY_CERT, PolicyType::FINALITY_KEY, PolicyType::MODERN_PAYLOAD_ROOT}) {
+    // Metadata policies 6/7/8/9 never enter the spendable-policy model, with
+    // or without the test-only asset switch.
+    for (const auto t : {PolicyType::FINALITY_CERT, PolicyType::FINALITY_KEY,
+                         PolicyType::MODERN_PAYLOAD_ROOT,
+                         PolicyType::BRIDGE_RECORD}) {
         for (const bool assets_active : {false, true}) {
             BOOST_CHECK(!modern::IsActivatedPolicy(static_cast<uint16_t>(t), modern::POLICY_VERSION_V1, assets_active));
             BOOST_CHECK(!modern::IsActivatedPolicy(static_cast<uint16_t>(t), 2, assets_active));
@@ -100,6 +125,7 @@ BOOST_AUTO_TEST_CASE(guardrails_nothing_activated)
     // creation-action codec. Type 6 is the registered modern FN PoD action.
     BOOST_CHECK(!modern::IsKnownCreationAction(modern::CREATION_ACTION_FINALITY_CERTIFICATE, 1));
     BOOST_CHECK(!modern::IsKnownCreationAction(modern::CREATION_ACTION_FINALITY_KEY_EVIDENCE, 1));
+    BOOST_CHECK(!modern::IsKnownCreationAction(modern::CREATION_ACTION_BRIDGE, 1));
     BOOST_CHECK(modern::IsKnownCreationAction(modern::CREATION_ACTION_MODERN_FN_POD, 1));
     // And the decoder still refuses a section naming them.
     modern::CreationAction a;

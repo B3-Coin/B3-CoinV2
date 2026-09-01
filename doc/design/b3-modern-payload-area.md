@@ -6,7 +6,19 @@ B3-native **Path B** (`MODERN_PAYLOAD_ROOT` coinbase cell) — **not** the SegWi
 reserved-value path, and SegWit is **not** a dependency of the MPA (its activation is a
 separate modern-era audit question, untouched here); a full-payload transaction identifier
 is specified without SegWit; the resource numbers were measured first (§6) and are now **FROZEN** (§9). Revision 1's Path A text is withdrawn. The protocol amendment
-(§7) is applied only after the non-circularity/determinism proof (§4). No implementation.**
+(§7) is applied only after the non-circularity/determinism proof (§4).
+At publication this was design-only; the later implementation status and
+bridge-specific amendment are recorded immediately below.**
+
+**Transition bridge-binding amendment (2026-09-01):** the MPA framework is
+implemented. A type-10 v1 bridge record must be the transaction's sole MPA
+record and must have exactly one zero-value policy-9 `BRIDGE_RECORD` metadata
+output. Its commitment is the `B3/BRIDGE/RECORD/V1` tagged hash of
+`type u16 BE || version u16 BE || canonical payload`. Missing, duplicate,
+mismatched, and orphan type-9 cells are invalid. The cell is in ordinary
+`vout`, so standard `SIGHASH_ALL` covers every bridge field transitively,
+including a managed withdrawal's Ethereum recipient. This uses no `OP_RETURN`
+and defines no custom sighash. The cell never enters the UTXO set.**
 
 Model lock (owner, 2026-08-23): `policy_params ≤ 80 B` = small typed live/derived state,
 permanent; large evidence (BLS certificates, bridge / Merkle / ZK proofs) is bounded,
@@ -37,7 +49,9 @@ one policy cell in the same transaction per its type's grammar (and every payloa
 cell to exactly one record). Finality records: type 4 `FINALITY_CERTIFICATE` (bound to the
 `FINALITY_CERT` cell by `commitment == TaggedHash("B3/FINALITY/CERT/V1", payload)`, coinbase
 only, ≤ 1 per block) and type 5 `FINALITY_KEY_EVIDENCE` (bound to the `FINALITY_KEY` cell by
-`commitment == validator_key`, `params == bls_pubkey ‖ seq`).
+`commitment == validator_key`, `params == bls_pubkey ‖ seq`). Bridge type 10
+v1 is bound to exactly one policy-9 `BRIDGE_RECORD` cell by the amendment
+above and is exclusive within its transaction.
 
 ---
 
@@ -88,7 +102,7 @@ Define the dependency relation "A → B" = "B's bytes are a function of A's byte
 
 ```
 record bytes (tx i)  →  section_hash_i  →  leaf_i  →  payload_root
-record bytes (tx i)  →  cell.commitment (policy 6/7 cell of tx i)  →  vout_i  →  txid_i  →  hashMerkleRoot
+record bytes (tx i)  →  cell.commitment (policy 6/7/9 cell of tx i)  →  vout_i  →  txid_i  →  hashMerkleRoot
 payload_root         →  MODERN_PAYLOAD_ROOT cell commitment (coinbase)  →  vout_0  →  txid_0  →  hashMerkleRoot  →  header  →  block hash
 ```
 
@@ -96,10 +110,13 @@ payload_root         →  MODERN_PAYLOAD_ROOT cell commitment (coinbase)  →  v
    no output, no commitment enters a leaf. So the coinbase's own `txid_0` — which depends on
    `payload_root` through the `MODERN_PAYLOAD_ROOT` cell — is not an input to `payload_root`.
 2. **A section never depends on its own transaction's identity.** Record grammars are
-   forbidden from referencing the containing transaction's txid/ptxid/outputs (consensus
-   rule; they could not do so consistently anyway, since every payload-backed cell's
-   commitment is a function of the record). The finality records reference only past
-   data (an earlier checkpoint; validator/BLS keys and a counter).
+   forbidden from referencing the containing transaction's txid/ptxid or bytes derived
+   from those identities. A grammar may name an output by a fixed integer index when the
+   index itself is independent of the output bytes: bridge type 10 does this for its
+   exact OWNER mint or BURN output. Its policy-9 binding cell is a function of the record,
+   while the record never hashes the cell or transaction, so no cycle results. Finality
+   records reference only past data (an earlier checkpoint; validator/BLS keys and a
+   counter).
 3. **Non-coinbase transactions do not depend on the coinbase.** Their sections, cells and
    txids are fixed before the block is assembled; `payload_root` is computed from them.
 4. Therefore the relation is a DAG: records → sections → leaves → root → coinbase cell →
@@ -122,7 +139,7 @@ Two identities per modern transaction:
 
 | Id | Covers | Use |
 |---|---|---|
-| `txid` | version, inputs, outputs, locktime (legacy: the legacy encoding incl. `nTime`) — **evidence-independent** | state identity: outpoints, UTXO keys, prevouts, transaction Merkle root, sighash, asset ids, finality digests, every legacy path |
+| `txid` | version, inputs, outputs, locktime (legacy: the legacy encoding incl. `nTime`). It does not directly serialize MPA; for type-10 bridge transactions the required policy-9 output makes it transitively commit to the exact record. | state identity: outpoints, UTXO keys, prevouts, transaction Merkle root, sighash, asset ids, finality digests, every legacy path |
 | **`ptxid`** | the **canonical full transaction serialization**: `version ‖ [0x00 ‖ flags, only when optional data exists] ‖ inputs ‖ outputs ‖ [witness stacks per input if flags&1, existing encoding] ‖ [MPA section if flags&2] ‖ locktime` | identifies the exact evidence-bearing bytes (future relay / dedup / fetch plumbing, Commit 15) |
 
 Definition: **`ptxid = SHA256d(CanonicalFullTransactionSerialization)`**, defined by bytes, not
@@ -130,7 +147,9 @@ by any implementation detail. Consequences: a transaction with neither witness n
 exactly the base serialization, so `ptxid == txid`; a legacy-encoded transaction's canonical
 serialization is its legacy encoding, so `ptxid == txid`; identical base data with different
 MPA ⇒ same `txid`, different `ptxid`; witness-only or witness+MPA ⇒ `ptxid` commits to all of
-it. Canonical means the strict MPA section rules of §1 (minimal CompactSize, strictly
+it. For type 10, an alternate MPA beside identical base outputs is invalid because its
+policy-9 commitment no longer matches; changing a valid bridge record therefore also
+changes the binding output and `txid`. Canonical means the strict MPA section rules of §1 (minimal CompactSize, strictly
 increasing record order, no trailing bytes) — non-canonical alternatives are not decodable,
 so no second `ptxid` exists for one transaction. `ptxid` is a distinct type (`Ptxid`) and is
 never a replacement for `txid` in any consensus identity. It is **not** used in the payload-root
@@ -212,8 +231,9 @@ Replaces revision 1 §2 "commitment" and all Path-A text:
    minimal set of bits for the data present and the non-optional form (no marker/flag) used
    when no optional data exists — in which case `ptxid == txid`. Defined by bytes, not by
    any implementation; the C++ full-hash machinery may be reused internally.
-5. **Policy numbers frozen:** `6 FINALITY_CERT`, `7 FINALITY_KEY`, `8 MODERN_PAYLOAD_ROOT`.
-   Never renumbered or reused (contract §23 list updated).
+5. **Policy numbers frozen:** `6 FINALITY_CERT`, `7 FINALITY_KEY`,
+   `8 MODERN_PAYLOAD_ROOT`, `9 BRIDGE_RECORD`. Never renumbered or reused
+   (contract §23 list updated).
 6. **Byte ceilings** — framework frozen here; numbers frozen in §9 after the benchmark: per-type maximum ≤ global
    record ceiling; per-tx section cap; per-tx / per-block record counts; per-type per-block
    counts; weight ×4; verification-cost budget. The numeric values of the ceilings, the
@@ -232,11 +252,13 @@ Replaces revision 1 §2 "commitment" and all Path-A text:
 | MPA weight factor | **×4** | `weight += 3 × mpa_size` on top of the full-form size |
 | `verify_cost(4 FINALITY_CERTIFICATE, v1)` | **2,000** | 1 unit ≈ 1 µs reference (portable blst, M4 Max) |
 | `verify_cost(5 FINALITY_KEY_EVIDENCE, v1)` | **700** | |
+| `verify_cost(10 BRIDGE_RECORD, v1)` | **12,000** | consumes the full per-transaction budget; at most one and exclusive in its transaction |
 | `MAX_BLOCK_PAYLOAD_COST` | **120,000** | checked before cryptography |
 | `MAX_TX_PAYLOAD_COST` | **12,000** | checked before cryptography |
 | `COST_TO_VBYTES` | **1** | relay `vsize = max(weight/4, Σ cost × 1)` |
 | `FINALITY_CERTIFICATE` record max / per block | 1,232 B / 1 | layout |
 | `FINALITY_KEY_EVIDENCE` size | 244 B | layout |
+| `BRIDGE_RECORD` payload max | 32,768 B | canonical bounded inner grammar; one exact policy-9 binding output |
 
 Measurement record: [b3-finality-benchmark-2026-08-23.md](b3-finality-benchmark-2026-08-23.md).
 Future `(type, version)` rows declare their own cost from the same unit definition.

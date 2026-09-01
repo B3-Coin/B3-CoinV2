@@ -1561,7 +1561,30 @@ void FlowMeshRuntime::HandleProposal(
     }
     flowmesh::ProductionSigningGuard guard{*market.store};
     for (const auto& [seat_index, key] : local_keys) {
-        if (market.attestations[hash].count(seat_index) != 0) continue;
+        auto& attestations{market.attestations[hash]};
+        const auto cached{attestations.find(seat_index)};
+        if (cached != attestations.end()) {
+            // Proposals are retried across recovery rounds, while a seat may
+            // sign this candidate only once. If the original attestation was
+            // lost while the peer was starting or reconciling its B3 tip,
+            // return the exact cached signature to the authenticated
+            // proposer. Never re-sign, never target the synthetic local peer,
+            // and leave the initial broadcast behavior below unchanged.
+            if (peer != LOCAL_ACTION_PEER) {
+                const auto payload{
+                    flowmesh::EncodeProductionAttestationPayload(
+                        cached->second)};
+                if (payload) {
+                    flowmesh::WireMessage wire;
+                    wire.kind = flowmesh::WireMessageKind::ATTESTATION;
+                    wire.header = HeaderFor(candidate_it->second.entry);
+                    wire.payload = *payload;
+                    RelayMessage(market, std::move(wire), peer,
+                                 std::nullopt);
+                }
+            }
+            continue;
+        }
         flowmesh::ProductionLockResult lock;
         const auto attestation{flowmesh::SignProductionEntryAttestation(
             key, seat_index, candidate_it->second.entry, market.seats, guard,
@@ -1576,7 +1599,7 @@ void FlowMeshRuntime::HandleProposal(
             }
             return;
         }
-        market.attestations[hash].emplace(seat_index, *attestation);
+        attestations.emplace(seat_index, *attestation);
         market.attested_hash_by_seat.emplace(seat_index, hash);
         const auto payload{
             flowmesh::EncodeProductionAttestationPayload(*attestation)};

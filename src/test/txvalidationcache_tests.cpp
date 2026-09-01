@@ -25,7 +25,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
                        ValidationCache& validation_cache,
                        std::vector<CScriptCheck>* pvChecks = nullptr,
-                       const std::optional<LegacyLockSpendContext>& legacy_lock = std::nullopt) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+                       const std::optional<LegacyLockSpendContext>& legacy_lock = std::nullopt,
+                       bool require_bridge_sighash_all = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 BOOST_AUTO_TEST_SUITE(txvalidationcache_tests)
 

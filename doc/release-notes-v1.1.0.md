@@ -80,11 +80,35 @@ The canonical bUSD identity is Ethereum-mainnet USDT
 `0xdAC17F958D2ee523a2206206994597C13D831ec7` held by managed-v1 vault
 `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`, represented 1:1 in raw
 six-decimal units. Managed-v1 withdrawals use the vault's immutable release
-authority. bUSD minting remains disabled unless the reviewed Ethereum proof
-adapter, checkpoint/fork schedule, caps, activation, code hash, authority, and
-operating-rules commitment are all pinned. The deployed vault is immutable; a
-later decentralized withdrawal design requires a new audited vault and an
-announced reserve/token migration.
+authority, but no arbitrary authority payment is a valid redemption. A
+confirmed B3 burn request must bind canonical bUSD, the exact raw amount,
+Ethereum recipient and unique request id. The exact B3 BURN/request record and
+reorg/reindex tracking are implemented; the operator waits the pinned B3
+finality depth, releases exactly once, durably consumes the id, and reconciles
+reserves against supply. The operator release automation and durable
+request-consumption database are not implemented. No confirmed burn means no
+release.
+
+bUSD minting remains disabled on mainnet. The current tree has a strict bounded
+type-10 bootstrap/update/mint/backfill/managed-withdrawal carrier, exact OWNER
+mint and bUSD BURN transitions, light-client/anchor/nullifier/cap state,
+undo/reindex replay, and mempool/miner/asset integration. Each record requires
+one zero-value policy-9 `BRIDGE_RECORD` metadata output committing its exact
+canonical bytes. Managed-withdrawal consensus allows only exact ECDSA
+`SIGHASH_ALL` or Schnorr `SIGHASH_DEFAULT`/`SIGHASH_ALL` on every input, so the
+withdrawal-recipient commitment is signed without `OP_RETURN` or a custom
+sighash; `NONE`, `SINGLE`, and `ANYONECANPAY` are rejected.
+State is rebuilt in memory from bridge activation; configured bridge nodes
+refuse pruning and snapshots that skip history because no durable sidecar
+exists. Activation still requires adapter enforcement, independent
+review/audits, reproducible runtime evidence, the operator withdrawal service,
+and production checkpoint/fork/cap/approval/activation/rules/X pins.
+
+The deployed vault is immutable. A later decentralized withdrawal design
+requires a new audited vault, and the current identity formula makes that a
+new `AssetId`. The announced migration must include old-registry cutoff,
+late-deposit handling/refunds, burn/swap/reissue of old bUSD, reserve movement
+without a duplicate mint claim, and the new vault/verifier/identity pins.
 
 ## Upgrade safety
 

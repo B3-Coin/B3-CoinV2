@@ -696,6 +696,23 @@ CBlockIndex* BlockManager::InsertBlockIndex(const uint256& hash)
 
 bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockhash)
 {
+    // Bridge v1 deliberately rebuilds its Ethereum light-client, execution
+    // anchors, nullifiers, epoch caps and withdrawal requests from the active
+    // block history. Until that state has an atomic durable sidecar, pruning
+    // any bridge-active block would make a later restart unable to validate.
+    // Fail at startup instead of accepting a configuration that can strand
+    // the node. Production mainnet is unaffected while its bridge envelope is
+    // incomplete and therefore fail-closed.
+    const Consensus::Params& consensus{GetConsensus()};
+    if (IsPruneMode() && consensus.busd_bridge &&
+        Consensus::BridgeMintParamsReady(*consensus.busd_bridge)) {
+        m_opts.notifications.fatalError(Untranslated(
+            "The configured B3 bridge requires complete, unpruned block "
+            "history. Restart without -prune; bridge prune support requires "
+            "a durable bridge-state sidecar."));
+        return false;
+    }
+
     if (!m_block_tree_db->LoadBlockIndexGuts(
             GetConsensus(), [this](const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return this->InsertBlockIndex(hash); }, m_interrupt)) {
         return false;
@@ -708,19 +725,22 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
             return false;
         }
         const AssumeutxoData& au_data = *Assert(maybe_au_data);
-        const Consensus::Params& consensus{GetConsensus()};
         const bool skips_fn_genesis{
             consensus.fn_genesis_required && consensus.hard_fork_height &&
             au_data.height >= *consensus.hard_fork_height};
         const bool skips_fn_pod{
             consensus.fn_pod_activation_height &&
             au_data.height >= *consensus.fn_pod_activation_height};
-        if (consensus.legacy_b3coin && (skips_fn_genesis || skips_fn_pod)) {
+        const bool skips_bridge_history{
+            Consensus::BridgeRulesActive(au_data.height, consensus)};
+        if (consensus.legacy_b3coin &&
+            (skips_fn_genesis || skips_fn_pod || skips_bridge_history)) {
             m_opts.notifications.fatalError(Untranslated(
                 "B3 AssumeUTXO snapshots at or after mandatory FN Genesis or "
-                "modern FN PoD activation are unsupported because FN "
-                "configuration and issuance state are not committed by the "
-                "snapshot metadata."));
+                "modern FN PoD/bridge activation are unsupported because FN "
+                "configuration, issuance state, and bridge light-client/"
+                "nullifier/mint-cap state are not committed by the snapshot "
+                "metadata."));
             return false;
         }
         m_snapshot_height = au_data.height;

@@ -893,6 +893,9 @@ RPCHelpMan issueasset();
 RPCHelpMan sendasset();
 RPCHelpMan burnasset();
 RPCHelpMan createfncoin();
+RPCHelpMan submitbridgecarrier();
+RPCHelpMan claimbridgedeposit();
+RPCHelpMan bridgewithdraw();
 RPCHelpMan importflowmeshkey();
 RPCHelpMan bindflowmeshseat();
 RPCHelpMan flowmeshdeposit();
@@ -938,6 +941,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &abandontransaction},
         {"wallet", &abortrescan},
         {"wallet", &backupwallet},
+        {"wallet", &bridgewithdraw},
         {"wallet", &burnasset},
         {"wallet", &bumpfee},
         {"wallet", &psbtbumpfee},
@@ -953,6 +957,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &getfinalityinfo},
         {"wallet", &createwallet},
         {"wallet", &createwalletdescriptor},
+        {"wallet", &claimbridgedeposit},
         {"wallet", &createfncoin},
         {"wallet", &restorewallet},
         {"wallet", &encryptwallet},
@@ -1007,6 +1012,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &startflowmeshvalidator},
         {"wallet", &stopstaking},
         {"wallet", &stopflowmeshvalidator},
+        {"wallet", &submitbridgecarrier},
         {"wallet", &submitflowmeshdeposit},
         {"wallet", &submitflowmeshorder},
         {"wallet", &simulaterawtransaction},

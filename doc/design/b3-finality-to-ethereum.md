@@ -10,6 +10,14 @@ Revision 1 (a "V2 layer") is superseded. "Do not implement yet" — this is spec
 only; the reconciliation amendment to the frozen PoS V1 spec is recorded as ruling **M7**
 in [b3-modern-pos-spec.md](b3-modern-pos-spec.md).**
 
+**Naming/status supersession (2026-09-01):** `A3` now names FlowMesh
+activation. This historical bridge specification uses `B` below for a
+separately pinned bridge activation. Its withdrawal-verifier design is not
+implemented. Transition-v1 instead uses the explicitly managed workflow in the
+bridge threat model: the exact B3 burn/request record is implemented, while the
+operator Ethereum-release automation and durable request-consumption database
+are not. No text here activates minting or redemption.
+
 **Constants in this record (E/60/20/MAX_CARRY_OVER etc.) are historical proposals — the frozen values are E = 1,440, CHECKPOINT 10/12, MAX_EPOCH_EXTENSION 7·E, MIN_FINALITY_SET 4 (normative spec §9). Superseded in detail by the 2026-08-23 rulings (cells 6/7/8 + MPA, identity-authorized binding, gated rotation, F = M): see the normative spec rev. 2. Normative protocol text: [b3-cross-chain-finality-v1.md](b3-cross-chain-finality-v1.md)** — exact layouts, the fixed-depth validator-set Merkle commitment, and the Ethereum verification algorithms for epoch transition, weights, bitmap, quorum and withdrawal root. This document is the rationale/attack record; where the two differ, the normative document governs (one known refinement: ONE cumulative withdrawal tree whose leaf carries `origin_chain_id`, not one tree per origin chain).
 
 Deposits (Ethereum → B3 via receipt/state proofs) are unchanged from
@@ -23,11 +31,11 @@ Deposits (Ethereum → B3 via receipt/state proofs) are unchanged from
 |---|---|---|
 | **M** | first modern-PoS block (821,001 under the 2026-08-23 H ruling). **Epoch 0 begins here.** Binding actions are valid from H+1 (the corridor), certificates from M. | ruled |
 | **F** | finality-enforcement height: from F, certificate cryptography and the finality pin are consensus rules. **F = M is the target**; if the v1 binary cannot carry `blst`, F is pinned by the mandatory X-pin follow-up release (same pattern as X). | owner (§9) |
-| **A3** | bridge activation (`BRIDGE_BACKED`, `BRIDGE_BURN`, withdrawal tree, Ethereum contracts live). **A3 ≥ F.** | owner, later |
+| **B** | separate bridge activation (`BRIDGE_BACKED`, `BRIDGE_BURN`, withdrawal tree, Ethereum contracts live). **B ≥ F.** | owner, later |
 
 What is **reserved from M regardless of F**: the two creation-action types, the epoch
 arithmetic, the set snapshot rule, the set-header/leaf encodings, the `FinalizedBlock`
-layout with `withdrawal_root = 0x00…00` until A3, the signing digest, the coinbase
+layout with `withdrawal_root = 0x00…00` until B, the signing digest, the coinbase
 certificate slot. The lineage of validator sets therefore starts at **Set_0 at M** and
 Ethereum's trust root is the **modern-genesis validator set**, not a mid-chain checkpoint.
 
@@ -51,7 +59,7 @@ validator_set_hash = keccak( ValidatorSetHeader )
 FinalizedBlock {                           // 112 bytes (8+32+32+32+8), fixed
   height             u64
   block_hash         32 B     // modern block hash
-  withdrawal_root    32 B     // §7 accumulator root; all-zero before A3
+  withdrawal_root    32 B     // §7 accumulator root; all-zero before B
   validator_set_hash 32 B     // keccak(header of the SUCCESSOR set, Set_{epoch+1})
   epoch              u64      // epoch of the SIGNING set, Set_epoch
 }
@@ -142,7 +150,7 @@ UNBOUND ──bind──► BOUND ──(stake ACTIVE ≥ 20 blocks, w > 0)─�
   checkpoints that are **descendants of the latest certified checkpoint it knows**. The
   signing set for height h is `Set_{epoch(h)}`; `FinalizedBlock.epoch = epoch(h)`,
   `validator_set_hash = hash(Set_{epoch(h)+1})`, `withdrawal_root` = accumulator root at h
-  (zero before A3).
+  (zero before B).
 - Message: `finsig {epoch u64, height u64, index u32, sig 96}` on P2P; relay only for
   bound indices of the named set, one per (index, height), bounded queue; anyone
   aggregates (G2 addition; bitmap OR). No leader, no round, no timeout — a checkpoint
@@ -285,13 +293,13 @@ Not stored: certificates, bitmaps, non-signer data (events only); full member li
 
 ---
 
-## 7. Withdrawal roots and release (from A3)
+## 7. Withdrawal roots and release (from B)
 
 - `BRIDGE_BURN` appends `leaf = keccak(u64 withdrawal_id ‖ bytes32 asset_id ‖ address
   origin_token ‖ address recipient ‖ u256 amount ‖ u64 b3_height)` to a **cumulative
   depth-32 keccak incremental tree per origin chain** (deposit-contract construction;
   append-only; undo on disconnect). Root at height h = `withdrawal_root` of every
-  `FinalizedBlock` at h. Before A3 the root is all-zero and the vault does not exist.
+  `FinalizedBlock` at h. Before B the root is all-zero and the vault does not exist.
 - `B3Bridge.release(Withdrawal w, bytes32[32] path)`: `!released[w.id]`; leaf(w) at index
   `w.id` under `verifier.latest().withdrawalRoot`; `tokenOf[w.asset_id] == w.origin_token`;
   mark; transfer. Cumulative root ⇒ old burns prove against newer roots; Ethereum keeps
@@ -311,7 +319,7 @@ Not stored: certificates, bitmaps, non-signer data (events only); full member li
 | A4 | Set-jump: a 2/3 set attests a successor of one key | permanent takeover | = A2. Optional overlap rule (successor must share ≥ W/3 weight with current) — owner option; rejected by default because it blocks legitimate mass rotation |
 | A5 | Equivocation by < W/3 | nothing certifies twice (§3.3 overlap) | evidence stored; V2 slashing |
 | A6 | Honest validator on a 20+-deep minority fork signs a checkpoint there, chain reorgs | it never signs the same height again (§3.2 i); its signature on the dead fork is useless | no conflicting certificate possible without Byzantine ≥ W/3 |
-| A7 | Reorg past a certified checkpoint on B3 | refused from F (pin); before F: possible, but A3 ≥ F so no funds at risk | horizon (1,440) bounds it anyway |
+| A7 | Reorg past a certified checkpoint on B3 | refused from F (pin); before F: possible, but B ≥ F so no funds at risk | horizon (1,440) bounds it anyway |
 | A8 | Rogue-key aggregation | attacker binds `pk_attacker = pk* − Σ honest` to forge aggregate | PoP at binding; Ethereum trusts the consensus-computed `aggregate_pubkey` inside a signed header |
 | A9 | Cross-chain / cross-set replay of a certificate | — | `chainDomain` in every digest; `epoch` in `FinalizedBlock`; bitmap width bound to the epoch's `n`; Ethereum requires epoch ∈ {current, current+1} |
 | A10 | Relayer censorship / nobody relays | verifier lags; eventually `MAX_EPOCH_LAG` | permissionless relaying; any user with a pending withdrawal is motivated; B3 nodes archive certificates forever |
@@ -337,7 +345,7 @@ Not stored: certificates, bitmaps, non-signer data (events only); full member li
 | 7 | Successor-overlap rule (A4) | off |
 | 8 | Ethereum governance model (validator-set-signed only vs timelocked multisig bootstrap) | owner |
 | 9 | Vault caps / delay | owner |
-| 10 | A3 height | later |
+| 10 | Separate bridge activation height B | later |
 
 ## 10. Unchanged
 

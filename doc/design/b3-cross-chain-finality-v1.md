@@ -8,10 +8,21 @@ Path B, `MODERN_PAYLOAD_ROOT = 8`); the BLS binding is **identity-authorized** (
 `validator_key` + separate PoP, sequence-controlled); validator-set rotation is
 **handover-gated**; F = M in the X-pin Modern-PoS release. Layouts, hashes, verification
 algorithms and state machines are frozen as `V1`; numeric parameters in §9 are **FROZEN by owner ruling 2026-08-23** except the
-Ethereum-side `MAX_EPOCH_LAG` (A3). Rationale and attack analysis: [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md);
+Ethereum-side `MAX_EPOCH_LAG` (separate bridge activation B). Rationale and attack analysis: [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md);
 compatibility audit: [b3-finality-compatibility-report.md](b3-finality-compatibility-report.md);
 Modern PoS amendment: ruling M7 in [b3-modern-pos-spec.md](b3-modern-pos-spec.md).
 Deposits and the bridge vault are outside this document. Implementation not yet authorized.**
+
+**Naming/status supersession (2026-09-01):** `A3` now names FlowMesh
+activation; this document uses `B` for any separately pinned bridge activation.
+The decentralized Ethereum verifier and withdrawal-root protocol in this
+document remain unimplemented. Transition-v1 instead has an implemented B3
+type-10 managed-withdrawal record that requires an exact bUSD BURN and records
+the Ethereum recipient with reorg/reindex replay. Its operator release
+automation and durable request-consumption database remain unimplemented and
+follow the workflow in the bridge threat model; they are not authorized by
+this document. The proof-verified type-10 deposit mint path is also implemented
+separately and remains mainnet-fail-closed pending production gates.
 
 Conventions: all integers are **big-endian, fixed width**; `‖` is byte concatenation;
 `keccak` = Keccak-256; `sha256` = SHA-256; `TaggedHash(tag, m) = sha256(sha256(tag) ‖
@@ -100,7 +111,7 @@ relies on the attesting quorum for the rest.
 FinalizedBlock (112 B = 8+32+32+32+8):
   u64  height
   32 B block_hash              // modern block hash at `height`
-  32 B withdrawal_root         // §6; all-zero before bridge activation A3
+  32 B withdrawal_root         // §6; all-zero before bridge activation B
   32 B validator_set_hash      // keccak(header of Set_{epoch+1})  — the successor set, always
   u64  epoch                   // epoch of the signing set Set_epoch
 
@@ -150,7 +161,7 @@ a **new record type behind the identical cell** (§7).
 
 | Rule | Value |
 |---|---|
-| Heights | **M** = first modern-PoS block, epoch 0 starts; **F = M** — the finality rules ship in the X-pin Modern-PoS release (the first binary that validates any modern-era block; the v1 binary refuses H+1); bridge activation **A3 ≥ F** |
+| Heights | **M** = first modern-PoS block, epoch 0 starts; **F = M** — the finality rules ship in the X-pin Modern-PoS release (the first binary that validates any modern-era block; the v1 binary refuses H+1); separate bridge activation **B ≥ F** |
 | Epoch start | `epoch_start[0] = M`; at the first block of epoch `e`, `Set_{e+1} := Snapshot(epoch_start[e] − 1)` (so `Set_1 = Set_0 = Snapshot(M−1)`); `Set_{e+1}` is known for all of epoch `e` and every epoch-`e` certificate carries `hash(Set_{e+1})` |
 | Snapshot(b) | every `validator_key` with ACTIVE STAKE weight `w > 0` at height `b` (STAKE v1, 20-block maturity, aggregation per key — unchanged) **and** a non-revoked `binding[validator_key]` at height `b` → member `(bls_pubkey, w)`; sorted by `validator_key`; `w` in whole modern B3. **One stake universe (FINAL, owner ruling 2026-08-23): from F (= M) a validator key without a non-revoked binding is NOT eligible to produce blocks** (M1 eligibility requires the binding), so the block-production weight `W` and the finality weight are the same quantity |
 | **Handover-gated rotation** (**FINAL**, owner ruling 2026-08-23) | epoch `e+1` begins at the first height `h ≥ epoch_start[e] + E` such that the chain below `h` contains a valid certificate with `epoch = e` (it necessarily carries `hash(Set_{e+1})`). Until then epoch `e` **extends**: checkpoints continue, signed by `Set_e`, all with `epoch = e`. A set never signs before the previous set has attested it on-chain — B3 and the Ethereum verifier follow the identical `e → e+1` rule |
@@ -284,7 +295,7 @@ only `latest.withdrawalRoot`).
 
 ## 6. Withdrawal root — exact
 
-One cumulative tree for all `BRIDGE_BURN` records on B3 (from A3):
+One cumulative tree for all `BRIDGE_BURN` records on B3 (from B):
 
 ```
 WITHDRAWAL_TREE_DEPTH = 32
@@ -361,7 +372,7 @@ state machine (§5.2) are unchanged; `prover` is the single governance-changeabl
 | Weight unit | whole modern B3 (`/10^9`) | FINAL |
 | `E` (epoch blocks) | **1,440** | **FINAL (owner ruling 2026-08-23)** |
 | `CHECKPOINT_INTERVAL` / `CHECKPOINT_DEPTH` | **10 / 12** | **FINAL (owner ruling 2026-08-23)** |
-| `MIN_FINALITY_SET` / `MAX_EPOCH_EXTENSION` | **4 / 7·E = 10,080** | **FINAL** — `MIN_FINALITY_SET = 4` is the Modern PoS chain **bootstrap floor only**; it is NOT a bridge security threshold (bridge validator/economic-security thresholds are an A3 decision) |
+| `MIN_FINALITY_SET` / `MAX_EPOCH_EXTENSION` | **4 / 7·E = 10,080** | **FINAL** — `MIN_FINALITY_SET = 4` is the Modern PoS chain **bootstrap floor only**; it is NOT a bridge security threshold (bridge validator/economic-security thresholds are a separate bridge-activation decision) |
 | `MIN_FINALITY_WEIGHT` | none in V1 (the floor is `MIN_FINALITY_SET`; stake economics are the min-stake rule) | FINAL (no separate weight floor) |
 | `FINALITY_CERTIFICATE` `verify_cost` / `FINALITY_KEY_EVIDENCE` `verify_cost` | **2,000 / 700** units | **FINAL** |
 | `MAX_BLOCK_PAYLOAD_COST` / `MAX_TX_PAYLOAD_COST` / `COST_TO_VBYTES` | **120,000 / 12,000 / 1** | **FINAL** |
@@ -369,10 +380,10 @@ state machine (§5.2) are unchanged; `prover` is the single governance-changeabl
 | Certificate epoch window | `{current, current − 1}` with the §4 monotonicity/set-hash/epoch-relation conditions | FINAL |
 | Policy numbers 6 / 7 / 8 | `FINALITY_CERT` / `FINALITY_KEY` / `MODERN_PAYLOAD_ROOT` | **FINAL, never renumbered** |
 | `FINALITY_CERTIFICATE` record max / `FINALITY_KEY_EVIDENCE` size | 1,232 B / 244 B | FINAL (layout) |
-| `MAX_EPOCH_LAG` (Ethereum verifier) | 30 days | proposed — A3 (bridge) decision, out of scope for Modern PoS V1 |
+| `MAX_EPOCH_LAG` (Ethereum verifier) | 30 days | proposed — bridge activation B decision, out of scope for Modern PoS V1 |
 | `F` | **= M**, in the X-pin Modern-PoS release | FINAL |
 | Gated rotation; epoch extension on failure | rule of §4 | FINAL |
 | Binding mandatory for block eligibility from F | yes | FINAL |
 | `FINALITY_KEY` semantics (seq-controlled, `0^48` = revoke, one active validator per BLS key) | §1.1 | FINAL |
-| `A3` | later | owner |
+| `B` (separate bridge activation) | later | owner |
 | Binding required for block eligibility from F | yes | FINAL |

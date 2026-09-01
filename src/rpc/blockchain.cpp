@@ -27,6 +27,7 @@
 #include <kernel/coinstats.h>
 #include <logging/timer.h>
 #include <modern/asset_validation.h>
+#include <modern/bridge_asset.h>
 #include <modern/fn_pod.h>
 #include <net.h>
 #include <net_processing.h>
@@ -34,6 +35,7 @@
 #include <node/finality_tracker.h>
 #include <consensus/era.h>
 #include <node/blockstorage.h>
+#include <node/bridge_state.h>
 #include <node/context.h>
 #include <node/transaction.h>
 #include <node/utxo_snapshot.h>
@@ -3701,6 +3703,163 @@ static RPCHelpMan getassetstate()
     };
 }
 
+static RPCHelpMan getbridgeinfo()
+{
+    return RPCHelpMan{
+        "getbridgeinfo",
+        "Return the fail-closed configuration and active-chain state of the "
+        "Ethereum USDT to bUSD bridge. No private or managed-authority key "
+        "material is returned.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "Bridge status", {
+            {RPCResult::Type::STR, "status", "unconfigured | incomplete | waiting | active | state-unavailable"},
+            {RPCResult::Type::BOOL, "configured", "Whether an origin asset identity is configured"},
+            {RPCResult::Type::BOOL, "ready", "Whether every consensus safety pin is populated"},
+            {RPCResult::Type::BOOL, "active", "Whether type-10 rules are active for the next block"},
+            {RPCResult::Type::BOOL, "mint_approval_open", "Whether the registry's mint-height interval is open for the next block"},
+            {RPCResult::Type::NUM, "next_height", "Height evaluated by active and mint_approval_open"},
+            {RPCResult::Type::NUM, "activation_height", /*optional=*/true, "First bridge height"},
+            {RPCResult::Type::NUM, "approval_last_height", /*optional=*/true, "Last mint-admission height"},
+            {RPCResult::Type::STR_HEX, "asset_id", /*optional=*/true, "Chain-bound bUSD asset id"},
+            {RPCResult::Type::STR_HEX, "registry_id", /*optional=*/true, "Approved bridge registry interval id"},
+            {RPCResult::Type::STR_HEX, "vault", /*optional=*/true, "Ethereum vault address"},
+            {RPCResult::Type::STR_HEX, "token", /*optional=*/true, "Ethereum token address"},
+            {RPCResult::Type::STR, "withdrawal_mode", /*optional=*/true, "managed-v1 or decentralized-verifier-v1"},
+            {RPCResult::Type::STR_HEX, "managed_authority", /*optional=*/true, "Pinned public managed withdrawal authority"},
+            {RPCResult::Type::BOOL, "state_available", "Whether the bridge index is synced to the active tip"},
+            {RPCResult::Type::BOOL, "light_client_bootstrapped", "Whether a trusted Ethereum light client is connected"},
+            {RPCResult::Type::NUM, "finalized_beacon_slot", /*optional=*/true, "Latest finalized Ethereum beacon slot"},
+            {RPCResult::Type::NUM, "finalized_execution_block", /*optional=*/true, "Latest finalized Ethereum execution block"},
+            {RPCResult::Type::STR_HEX, "finalized_execution_hash", /*optional=*/true, "Latest finalized execution hash"},
+            {RPCResult::Type::NUM, "anchors", "Retained finalized/backfilled execution anchors"},
+            {RPCResult::Type::NUM, "nullifiers", "Deposits already minted"},
+            {RPCResult::Type::NUM, "managed_withdrawals", "Confirmed bUSD burn requests"},
+            {RPCResult::Type::NUM, "mint_epoch", /*optional=*/true, "Current B3 bridge mint-cap epoch"},
+            {RPCResult::Type::NUM, "minted_this_epoch", /*optional=*/true, "Raw bUSD units minted in the current epoch"},
+            {RPCResult::Type::NUM, "max_per_block", /*optional=*/true, "Raw bUSD mint cap per block"},
+            {RPCResult::Type::NUM, "max_per_epoch", /*optional=*/true, "Raw bUSD mint cap per epoch"},
+        }},
+        RPCExamples{HelpExampleCli("getbridgeinfo", "") +
+                    HelpExampleRpc("getbridgeinfo", "")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            const auto& configured{consensus.busd_bridge};
+            const bool has_identity{
+                configured &&
+                Consensus::BridgeAssetIdentityValid(configured->asset)};
+            const bool ready{configured &&
+                             Consensus::BridgeMintParamsReady(*configured)};
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("configured", has_identity);
+            result.pushKV("ready", ready);
+            if (has_identity) {
+                result.pushKV("vault", HexStr(configured->asset.vault_address));
+                result.pushKV("token", HexStr(configured->asset.token_address));
+                if (const auto asset{modern::ConfiguredBridgeAssetId(consensus)}) {
+                    result.pushKV("asset_id", asset->GetHex());
+                }
+            }
+            if (ready) {
+                if (const auto registry{
+                        modern::ConfiguredBridgeRegistryId(consensus)}) {
+                    result.pushKV("registry_id", registry->GetHex());
+                }
+                result.pushKV("activation_height", *configured->activation_height);
+                if (configured->approval_last_height) {
+                    result.pushKV("approval_last_height",
+                                  *configured->approval_last_height);
+                }
+                result.pushKV(
+                    "withdrawal_mode",
+                    *configured->withdrawal_mode ==
+                            Consensus::BridgeWithdrawalMode::MANAGED_V1
+                        ? "managed-v1"
+                        : "decentralized-verifier-v1");
+                if (configured->managed_withdrawal) {
+                    result.pushKV(
+                        "managed_authority",
+                        HexStr(configured->managed_withdrawal->authority_address));
+                }
+                result.pushKV("max_per_block",
+                              configured->mint_caps->max_per_block);
+                result.pushKV("max_per_epoch",
+                              configured->mint_caps->max_per_epoch);
+            }
+
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            const int next_height{tip ? tip->nHeight + 1 : 0};
+            const bool active{
+                ready && Consensus::BridgeRulesActive(next_height, consensus)};
+            const bool approval_open{
+                active && next_height >= *configured->activation_height &&
+                (!configured->approval_last_height ||
+                 next_height <= *configured->approval_last_height)};
+            result.pushKV("active", active);
+            result.pushKV("mint_approval_open", approval_open);
+            result.pushKV("next_height", next_height);
+
+            bool state_available{false};
+            const node::BridgeStateIndex* index{nullptr};
+            if (ready && tip != nullptr) {
+                node::BridgeStateTracker& tracker{
+                    chainstate.ModernBridgeState()};
+                state_available = tracker.Sync(
+                    chainstate.m_chain, chainstate.m_blockman, consensus,
+                    *tip);
+                if (state_available) index = &tracker.Index();
+            }
+            result.pushKV("state_available", state_available);
+            result.pushKV("light_client_bootstrapped",
+                          index && index->LightClient().has_value());
+            result.pushKV("anchors",
+                          index ? static_cast<uint64_t>(index->AnchorCount()) : 0);
+            result.pushKV("nullifiers",
+                          index ? static_cast<uint64_t>(index->NullifierCount()) : 0);
+            result.pushKV(
+                "managed_withdrawals",
+                index ? static_cast<uint64_t>(index->WithdrawalCount()) : 0);
+            if (index && index->LightClient()) {
+                const bridge::LightClientHeader& finalized{
+                    index->LightClient()->finalized_header};
+                result.pushKV("finalized_beacon_slot", finalized.beacon.slot);
+                result.pushKV("finalized_execution_block",
+                              finalized.execution.block_number);
+                result.pushKV("finalized_execution_hash",
+                              finalized.execution.block_hash.GetHex());
+            }
+            if (index && active) {
+                const auto asset{modern::ConfiguredBridgeAssetId(consensus)};
+                const uint64_t epoch{
+                    static_cast<uint64_t>(next_height -
+                                          *configured->activation_height) /
+                    configured->mint_caps->epoch_length_blocks};
+                result.pushKV("mint_epoch", epoch);
+                if (asset) {
+                    result.pushKV("minted_this_epoch",
+                                  index->EpochMinted(*asset, epoch));
+                }
+            }
+
+            if (!has_identity) {
+                result.pushKV("status", "unconfigured");
+            } else if (!ready) {
+                result.pushKV("status", "incomplete");
+            } else if (!active) {
+                result.pushKV("status", "waiting");
+            } else if (!state_available) {
+                result.pushKV("status", "state-unavailable");
+            } else {
+                result.pushKV("status", "active");
+            }
+            return result;
+        },
+    };
+}
+
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -3730,6 +3889,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getchainstates},
         {"blockchain", &getfinalitystatus},
         {"blockchain", &getassetstate},
+        {"blockchain", &getbridgeinfo},
         {"hidden", &invalidateblock},
         {"hidden", &reconsiderblock},
         {"blockchain", &waitfornewblock},

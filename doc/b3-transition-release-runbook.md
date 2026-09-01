@@ -163,10 +163,39 @@ Treasury script for `SNyANHiUkuqPSfbeKHDXzVD86LC2ZUUjLX`:
       (FlowMesh trading/settlement), has an owner ruling. A3 is at least 30
       blocks after A2. Missing values stop the tag.
 - [ ] If bUSD is to activate in this release, every bridge readiness pin and
-      proof/state implementation gate is independently reviewed and complete.
+      implementation gate is independently reviewed and complete. The tree now
+      has a bounded type-10 bootstrap/update/mint/backfill/managed-withdrawal
+      carrier, exact `BRIDGE_BACKED` OWNER mint and bUSD BURN transitions,
+      nullifier/cap accounting, undo, reindex replay, and mempool/miner/asset
+      wiring. Every type-10 transaction has exactly one zero-value policy-9
+      `BRIDGE_RECORD` metadata cell committing the
+      `B3/BRIDGE/RECORD/V1` tagged hash of the canonical frame; tests reject
+      missing, duplicate, mismatched, and orphan cells. Managed-withdrawal
+      consensus requires exact ECDSA `SIGHASH_ALL` or Schnorr
+      `SIGHASH_DEFAULT`/`SIGHASH_ALL` on every input, rejecting `NONE`,
+      `SINGLE`, and `ANYONECANPAY`; this covers the binding without
+      `OP_RETURN` or a custom sighash. Its bridge index is rebuilt in memory
+      from activation and has
+      no durable sidecar, so a configured bridge must continue to refuse
+      pruning and any snapshot that skips bridge history.
       The managed-v1 vault is exactly
       `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`; otherwise bUSD remains
       explicitly fail-closed at tag time.
+- [ ] Managed-v1 operating rules commit to one workflow: a confirmed B3 burn
+      request binds canonical bUSD, exact raw amount, Ethereum recipient and a
+      unique request id; after the pinned finality depth the operator releases
+      registry-derived USDT exactly once, durably consumes the id, and
+      reconciles reserve against supply. No confirmed burn means no release.
+- [ ] The operator-side Ethereum release service and durable request-consumption
+      database implement that workflow, including crash-safe retry/recovery.
+      The B3 node records the canonical burn request but does not call the vault
+      or record an Ethereum release.
+- [ ] The USDT adapter commitment has a reviewed preimage and consensus-enforced
+      applicability/upgrade rule; a nonzero parameter alone is not enforcement.
+- [ ] Reproducible evidence byte-matches the deployed vault runtime to the
+      reviewed source with exact compiler/settings/constructor immutables, and
+      the contract plus bridge verification stack have passed the required
+      independent audits/fuzz gates.
 
 ## 3. Pin the transition release
 
@@ -344,5 +373,15 @@ the tag.
 
 Do not announce bUSD as active merely because its canonical Ethereum-USDT
 identity and managed-v1 vault facts are present. Bridge minting stays
-fail-closed until the proof adapter/light-client inputs, caps, activation and
-all withdrawal operating-rule pins pass the bridge readiness gate.
+fail-closed even though the consensus carrier, mint/burn checks, and replay
+state are implemented. The USDT adapter still must be enforced; the production
+checkpoint, fork schedule, caps, activation, rules commitment, X-dependent
+parameters, authority/runtime evidence, audits, and operator withdrawal service
+must all pass the bridge readiness gate.
+
+Do not describe a future verifier as an in-place upgrade. The managed vault is
+immutable and remains callable after retirement. Under the current identity
+formula a new vault has a new `AssetId`; migration therefore needs a pinned old
+registry cutoff, finality drain window, late-deposit refund/handling process,
+burn/swap/reissue of old bUSD, reserve movement without double minting, and all
+new vault/verifier/identity pins.
