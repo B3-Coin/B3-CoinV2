@@ -477,6 +477,7 @@ RPCHelpMan importlegacywalletdump()
         "importlegacywalletdump",
         "Imports every private key from a human-readable dump created by the legacy B3 dumpwallet RPC.\n"
         "The complete file is validated before any wallet key is changed. Imported keys are stored as inactive combo descriptors, preserving both legacy P2PKH and bare-P2PK ownership, then the complete blockchain is rescanned.\n"
+        "When the target is a blank descriptor wallet, fresh active receiving and change descriptors are created so the recovered wallet can use modern wallet and validator RPCs without a separate migration.\n"
         "Use this only as a recovery path into a clean descriptor wallet. Transaction metadata, HD derivation, watch-only scripts, multisig scripts, locked coins, and legacy keypool state are not present in the dump and cannot be restored.\n"
         "The node must be unpruned, and an encrypted wallet must be unlocked for the duration of the import.\n",
         {
@@ -571,6 +572,17 @@ RPCHelpMan importlegacywalletdump()
     {
         LOCK(pwallet->cs_wallet);
         EnsureWalletIsUnlocked(*pwallet);
+
+        // A blank descriptor wallet is the natural recovery target, but the
+        // imported combo() descriptors are deliberately inactive and
+        // non-ranged. Without an active receive/change chain the recovered
+        // coins can be signed for, yet any transaction that needs change
+        // (including bindfinalitykey) fails during funding. Give an otherwise
+        // blank target its own fresh modern descriptor chains; never replace
+        // an existing active descriptor configuration.
+        if (pwallet->GetActiveScriptPubKeyMans().empty()) {
+            pwallet->SetupDescriptorScriptPubKeyMans();
+        }
 
         for (auto& item : prepared) {
             const bool had_key{pwallet->GetKey(item.key_id).has_value()};
