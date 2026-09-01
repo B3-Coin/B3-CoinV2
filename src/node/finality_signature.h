@@ -21,6 +21,8 @@ class CChain;
 
 namespace node {
 
+class BridgeStateIndex;
+
 /**
  * BLS finality message path (plan Commit 15; b3-cross-chain-finality-v1.md
  * section 4 "Signing", "Transport"). LIVENESS ONLY: nothing here mutates
@@ -85,7 +87,8 @@ public:
      * active tip of `chain`. Cheap checks precede the BLS verification.
      */
     Accept Submit(const FinalitySig& sig, const FinalityTracker& tracker, const CChain& chain,
-                  const Consensus::Params& params);
+                  const Consensus::Params& params,
+                  const BridgeStateIndex* bridge_index = nullptr);
 
     /**
      * The highest tracked checkpoint whose collected weight meets the quorum
@@ -95,7 +98,9 @@ public:
      * quorum.
      */
     std::optional<std::pair<modern::FinalizedBlock, modern::FinalityCertificate>>
-    BestCertificate(const FinalityTracker& tracker, const CChain& chain, const Consensus::Params& params) const;
+    BestCertificate(const FinalityTracker& tracker, const CChain& chain,
+                    const Consensus::Params& params,
+                    const BridgeStateIndex* bridge_index = nullptr) const;
 
     //! Drop every slot at or below `finalized_height`.
     void Prune(int finalized_height);
@@ -106,7 +111,9 @@ public:
     //! nullopt when the slot is not derivable from the current state.
     static std::optional<modern::FinalizedBlock> ExpectedFinalizedBlock(uint64_t epoch, uint64_t height,
                                                                         const FinalityTracker::State& state,
-                                                                        const CChain& chain);
+                                                                        const CChain& chain,
+                                                                        const Consensus::Params& params,
+                                                                        const BridgeStateIndex* bridge_index = nullptr);
 
 private:
     struct Slot {
@@ -140,7 +147,9 @@ public:
      * returned for network relay. `tracker` must be synced to the tip.
      */
     std::vector<FinalitySig> MaybeSign(const FinalityTracker& tracker, const CChain& chain,
-                                       const Consensus::Params& params, FinalitySignaturePool& pool);
+                                       const Consensus::Params& params,
+                                       FinalitySignaturePool& pool,
+                                       const BridgeStateIndex* bridge_index = nullptr);
 
 private:
     std::optional<bls::SecretKey> m_key;

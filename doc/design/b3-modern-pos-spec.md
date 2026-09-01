@@ -268,7 +268,7 @@ Unset still means modern-PoS validation and production fail closed
 | `finality_epoch_blocks` (E) | 1440 | **RATIFIED 2026-08-23** (M7) | validator-set epoch length |
 | `checkpoint_interval` / `checkpoint_depth` | 10 / 12 | **RATIFIED 2026-08-23** | finality checkpoint cadence / signing depth |
 | `max_epoch_extension` | 7·E = 10080 | **RATIFIED 2026-08-23** | certificate-gated epoch may extend this far before the lineage is declared broken |
-| `min_finality_set` | 4 | **RATIFIED 2026-08-23** | chain bootstrap floor only — not a bridge security threshold |
+| `min_finality_set` | 2 | **UPDATED/PINNED 2026-09-01** | permits the ruled two-staker chain bootstrap; not a bridge security threshold |
 | payload cost budget | 120000 / block, 12000 / tx; cert 2000, key-evidence 700; 1 vbyte per unit | **RATIFIED 2026-08-23** | MPA verification-cost accounting (checked before cryptography) |
 | MPA limits | record 32768 B, section 65536 B, weight ×4 | **RATIFIED 2026-08-23** | Modern Payload Area |
 

@@ -10,6 +10,7 @@
 #include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
 #include <node/blockstorage.h>
+#include <node/bridge_state.h>
 #include <util/check.h>
 
 namespace node {
@@ -140,7 +141,9 @@ namespace {
 
 bool JudgeCoinbaseCertificate(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params,
                               const FinalityTracker::State& projected,
-                              std::optional<modern::FinalityCertificatePair>& pair, std::string& error)
+                              std::optional<modern::FinalityCertificatePair>& pair,
+                              std::string& error,
+                              const BridgeStateIndex* bridge_index)
 {
     pair.reset();
     if (block.vtx.empty()) { error = "finality-cert-no-coinbase"; return false; }
@@ -160,14 +163,21 @@ bool JudgeCoinbaseCertificate(const CBlock& block, const CBlockIndex& index, con
         if (!anc) return std::nullopt;
         return anc->GetBlockHash();
     }};
+    const auto withdrawal_root_at{
+        [&params, bridge_index](const int h) -> std::optional<uint256> {
+            return FinalityWithdrawalRoot(h, params, bridge_index);
+        }};
     return modern::JudgeFinalityCertificate(*domain, pair->finalized_block, pair->certificate, index.nHeight, view,
-                                            *params.modern_pos, hash_at, error);
+                                            *params.modern_pos, hash_at, error,
+                                            withdrawal_root_at);
 }
 
 } // namespace
 
 bool FinalityTracker::CheckBlockCertificate(const CBlock& block, const CBlockIndex& index,
-                                            const Consensus::Params& params, std::string& error) const
+                                            const Consensus::Params& params,
+                                            std::string& error,
+                                            const BridgeStateIndex* bridge_index) const
 {
     if (!index.pprev || !Synced(index.pprev->GetBlockHash())) {
         error = "finality-state-unavailable";
@@ -175,12 +185,15 @@ bool FinalityTracker::CheckBlockCertificate(const CBlock& block, const CBlockInd
     }
     const State projected{Projected(index.nHeight, params)};
     std::optional<modern::FinalityCertificatePair> pair;
-    return JudgeCoinbaseCertificate(block, index, params, projected, pair, error);
+    return JudgeCoinbaseCertificate(block, index, params, projected, pair,
+                                    error, bridge_index);
 }
 
 bool FinalityTracker::JudgeCandidateCertificate(const modern::FinalizedBlock& fb,
                                                 const modern::FinalityCertificate& cert, const CBlockIndex& parent,
-                                                const Consensus::Params& params, std::string& error) const
+                                                const Consensus::Params& params,
+                                                std::string& error,
+                                                const BridgeStateIndex* bridge_index) const
 {
     if (!Synced(parent.GetBlockHash())) {
         error = "finality-state-unavailable";
@@ -204,16 +217,23 @@ bool FinalityTracker::JudgeCandidateCertificate(const modern::FinalizedBlock& fb
         if (!anc) return std::nullopt;
         return anc->GetBlockHash();
     }};
+    const auto withdrawal_root_at{
+        [&params, bridge_index](const int h) -> std::optional<uint256> {
+            return FinalityWithdrawalRoot(h, params, bridge_index);
+        }};
     return modern::JudgeFinalityCertificate(*domain, fb, cert, parent.nHeight + 1, view, *params.modern_pos, hash_at,
-                                            error);
+                                            error, withdrawal_root_at);
 }
 
-bool FinalityTracker::ApplyModern(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params)
+bool FinalityTracker::ApplyModern(const CBlock& block, const CBlockIndex& index,
+                                  const Consensus::Params& params,
+                                  const BridgeStateIndex* bridge_index)
 {
     State s{Projected(index.nHeight, params)};
     std::optional<modern::FinalityCertificatePair> pair;
     std::string error;
-    if (!JudgeCoinbaseCertificate(block, index, params, s, pair, error)) {
+    if (!JudgeCoinbaseCertificate(block, index, params, s, pair, error,
+                                  bridge_index)) {
         LogWarning("FinalityTracker: connected block %s (height %d) carries an invalid certificate (%s)",
                    index.GetBlockHash().ToString(), index.nHeight, error);
         return false;
@@ -246,7 +266,8 @@ bool FinalityTracker::StepTrackers(const CBlock& block, const CBlockIndex& index
 }
 
 bool FinalityTracker::Sync(const CChain& chain, const BlockManager& blockman, const Consensus::Params& params,
-                           const CBlockIndex& target)
+                           const CBlockIndex& target,
+                           const BridgeStateIndex* bridge_index)
 {
     if (Synced(target.GetBlockHash())) return true;
     if (chain[target.nHeight] != &target) return false; // Target must lie on the chain.
@@ -274,7 +295,8 @@ bool FinalityTracker::Sync(const CChain& chain, const BlockManager& blockman, co
             Reset();
             return false;
         }
-        if (modern_start && height >= *modern_start && !ApplyModern(block, *pindex, params)) {
+        if (modern_start && height >= *modern_start &&
+            !ApplyModern(block, *pindex, params, bridge_index)) {
             Reset();
             return false;
         }
@@ -292,7 +314,10 @@ bool FinalityTracker::Sync(const CChain& chain, const BlockManager& blockman, co
     return true;
 }
 
-void FinalityTracker::BlockConnected(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params)
+void FinalityTracker::BlockConnected(const CBlock& block,
+                                     const CBlockIndex& index,
+                                     const Consensus::Params& params,
+                                     const BridgeStateIndex* bridge_index)
 {
     if (Consensus::GetB3Era(index.nHeight, params) != Consensus::B3Era::MODERN) return;
     if (m_dirty || index.pprev == nullptr || m_synced_tip != index.pprev->GetBlockHash()) {
@@ -300,7 +325,8 @@ void FinalityTracker::BlockConnected(const CBlock& block, const CBlockIndex& ind
         return;
     }
     const std::optional<int> modern_start{Consensus::ModernPosStartHeight(params)};
-    if (modern_start && index.nHeight >= *modern_start && !ApplyModern(block, index, params)) {
+    if (modern_start && index.nHeight >= *modern_start &&
+        !ApplyModern(block, index, params, bridge_index)) {
         m_dirty = true;
         return;
     }

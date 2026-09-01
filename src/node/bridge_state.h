@@ -8,6 +8,7 @@
 #include <bridge/admission.h>
 #include <bridge/eth_light_client.h>
 #include <consensus/params.h>
+#include <modern/withdrawal_tree.h>
 #include <primitives/block.h>
 #include <primitives/transaction_identifier.h>
 #include <uint256.h>
@@ -86,6 +87,23 @@ struct BridgeManagedWithdrawalRequest {
                            const BridgeManagedWithdrawalRequest&) = default;
 };
 
+/**
+ * One consensus-derived BRIDGE_BURN leaf. The record supplies only the
+ * recipient and names the exact burn; every other Ethereum-facing field is
+ * derived from pinned bridge parameters and active-chain position.
+ */
+struct BridgeDecentralizedWithdrawalRequest {
+    Txid transaction_id{};
+    uint32_t burn_output_index{0};
+    modern::BridgeWithdrawalV1 withdrawal{};
+    uint256 leaf{};
+    int connected_height{-1};
+    uint256 connected_block{};
+
+    friend bool operator==(const BridgeDecentralizedWithdrawalRequest&,
+                           const BridgeDecentralizedWithdrawalRequest&) = default;
+};
+
 struct BridgeWithdrawalId {
     Txid transaction_id{};
     uint32_t burn_output_index{0};
@@ -106,6 +124,14 @@ struct BridgeWithdrawalId {
 struct BridgeTxAuthorization {
     std::optional<BridgeTxMintAuthorization> mint{};
     std::optional<BridgeManagedWithdrawalRequest> withdrawal{};
+    std::optional<BridgeDecentralizedWithdrawalRequest>
+        decentralized_withdrawal{};
+
+    bool HasWithdrawal() const
+    {
+        return withdrawal.has_value() ||
+               decentralized_withdrawal.has_value();
+    }
 };
 
 /** Exact before/after accounting for one configured asset epoch. */
@@ -137,6 +163,10 @@ struct BridgeBlockDelta {
     std::vector<bridge::BridgeDepositKey> nullifiers_added{};
     std::vector<BridgeEpochMintChange> epoch_mint_changes{};
     std::vector<BridgeManagedWithdrawalRequest> withdrawals_added{};
+    std::vector<BridgeDecentralizedWithdrawalRequest>
+        decentralized_withdrawals_added{};
+    modern::WithdrawalTreeState withdrawal_tree_before{};
+    modern::WithdrawalTreeState withdrawal_tree_after{};
 };
 
 /**
@@ -209,6 +239,13 @@ public:
         const uint256& block_hash) const;
     std::optional<BridgeManagedWithdrawalRequest> Withdrawal(
         const BridgeWithdrawalId& id) const;
+    std::optional<BridgeDecentralizedWithdrawalRequest>
+    DecentralizedWithdrawal(uint64_t withdrawal_id) const;
+    std::optional<uint256> WithdrawalRootAtHeight(int height) const;
+    const modern::WithdrawalTreeState& WithdrawalTree() const
+    {
+        return m_withdrawal_tree;
+    }
     const std::optional<bridge::LightClientStore>& LightClient() const
     {
         return m_light_client;
@@ -219,6 +256,10 @@ public:
     size_t NullifierCount() const { return m_nullifiers.size(); }
     size_t AnchorCount() const { return m_anchors.size(); }
     size_t WithdrawalCount() const { return m_withdrawals.size(); }
+    size_t DecentralizedWithdrawalCount() const
+    {
+        return m_decentralized_withdrawals.size();
+    }
     const std::deque<BridgeBlockDelta>& History() const { return m_history; }
 
 private:
@@ -228,10 +269,24 @@ private:
     std::set<bridge::BridgeDepositKey> m_nullifiers{};
     std::map<std::pair<modern::AssetId, uint64_t>, CAmount> m_epoch_minted{};
     std::map<BridgeWithdrawalId, BridgeManagedWithdrawalRequest> m_withdrawals{};
+    std::map<uint64_t, BridgeDecentralizedWithdrawalRequest>
+        m_decentralized_withdrawals{};
+    std::map<BridgeWithdrawalId, uint64_t> m_decentralized_withdrawal_sources{};
+    modern::WithdrawalTreeState m_withdrawal_tree{};
+    std::map<int, uint256> m_withdrawal_roots{};
     int m_connected_height{-1};
     uint256 m_connected_hash{};
     std::deque<BridgeBlockDelta> m_history{};
 };
+
+/**
+ * Exact withdrawal root a finality certificate must carry at `height`.
+ * Managed/pre-activation bridge epochs use zero. A decentralized active
+ * height requires an index containing that exact active-chain block.
+ */
+std::optional<uint256> FinalityWithdrawalRoot(
+    int height, const Consensus::Params& params,
+    const BridgeStateIndex* bridge_index);
 
 /**
  * Active-chain replay/undo driver. Restart and reindex correctness comes from

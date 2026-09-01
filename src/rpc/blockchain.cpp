@@ -3568,8 +3568,18 @@ static RPCHelpMan getfinalitystatus()
             const CBlockIndex* tip{chainstate.m_chain.Tip()};
             bool active{false};
             if (configured && tip) {
+                const node::BridgeStateIndex* bridge_index{nullptr};
+                if (Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
+                    node::BridgeStateTracker& bridge{
+                        chainstate.ModernBridgeState()};
+                    if (bridge.Sync(chainstate.m_chain,
+                                    chainstate.m_blockman, consensus, *tip)) {
+                        bridge_index = &bridge.Index();
+                    }
+                }
                 node::FinalityTracker& tracker{chainstate.ModernFinality()};
-                if (tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) {
+                if (tracker.Sync(chainstate.m_chain, chainstate.m_blockman,
+                                 consensus, *tip, bridge_index)) {
                     active = true;
                     const node::FinalityTracker::State& state{tracker.Current()};
                     obj.pushKV("active", true);

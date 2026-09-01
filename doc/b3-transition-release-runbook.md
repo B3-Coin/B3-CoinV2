@@ -261,7 +261,7 @@ finality_epoch_blocks  = 1,440
 checkpoint_interval    = 10
 checkpoint_depth       = 12
 max_epoch_extension    = 10,080
-min_finality_set       = 4
+min_finality_set       = 2
 ```
 
 Immediately assert `modern_pos.Valid()` and add value-by-value mainnet tests
@@ -337,18 +337,22 @@ through:
 3. rejection of mutated genesis coinbases;
 4. rejection of FN spends before coinbase maturity and acceptance at maturity;
 5. modern PoD rejection before A1 and price/cap/fee accounting at A1;
-6. the corridor-to-Modern-PoS boundary;
-7. simple-v1 asset rejection before A2, then activation and the 1,000 B3
+6. before block 811,000, prove that its exact post-block snapshot contains at
+   least two mature native-B3 stakes, each with a valid validator-authorized
+   BLS binding and nonzero finality weight; do not approach M without this
+   preflight, because there is no safe late bootstrap;
+7. the corridor-to-Modern-PoS boundary;
+8. simple-v1 asset rejection before A2, then activation and the 1,000 B3
    treasury fee at A2;
-8. FlowMesh seat/deposit preparation at A2, rejection of trading before A3,
+9. FlowMesh seat/deposit preparation at A2, rejection of trading before A3,
    then sequence-zero bootstrap from the unique earliest eligible market
    anchor once 30-deep, spot trade, checkpoint, vault sweeps and handoff;
-9. top-64 withdrawal admission, amount-descending/outpoint payout selection,
+10. top-64 withdrawal admission, amount-descending/outpoint payout selection,
    sequential publish-confirm-refresh/rebuild, and maximal partial treasury
    flush without blocking trading at zero capacity;
-10. exact custody/supply/state-root agreement across all nodes after restart;
+11. exact custody/supply/state-root agreement across all nodes after restart;
    and
-11. restart, reindex, disconnect/reconnect, and wallet rescan.
+12. restart, reindex, disconnect/reconnect, and wallet rescan.
 
 Preserve configs, commands, logs, block hashes, artifact hashes, and test exit
 statuses. Any unexplained divergence stops the release.
@@ -372,7 +376,10 @@ statuses. Any unexplained divergence stops the release.
 ## 7. After adoption
 
 The first valid block on X is corridor block 810,001 and must contain FN
-Genesis. Stakers deposit during corridor blocks 810,001..811,000. Modern PoS
+Genesis. Native-B3 STAKE outputs and validator-authorized public BLS bindings
+may be included in that same block and throughout corridor blocks
+810,001..811,000. Set0 is the exact snapshot after block 811,000 and must have
+at least two qualified members; otherwise Modern PoS cannot start. Modern PoS
 begins at M = 811,001. Modern FN PoD creation activates at A1 = 812,000.
 Simple-v1 colored assets and FlowMesh seat/vault preparation activate at
 A2 = 813,000. Full FlowMesh spot trading and settlement activate at

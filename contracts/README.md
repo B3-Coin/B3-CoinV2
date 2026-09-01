@@ -10,7 +10,9 @@ a Solidity toolchain.
 | Contract | Leg | Status |
 |---|---|---|
 | `B3DepositVault.sol` | ETH -> B3 deposits (owner ruling 2026-08-24: this leg first) | source complete; managed-v1 vault `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6` observed; the bounded type-10 B3 mint path is implemented, while reproducible source/runtime matching, adapter enforcement, audits, and production pins remain gates |
-| `B3FinalityVerifier.sol` + `BlsCertificateProver.sol` + release wiring | future decentralized B3 -> ETH withdrawals | specified normatively in `doc/design/b3-cross-chain-finality-v1.md` §5–§7; not implemented here and requires a new audited vault plus an explicit asset/reserve migration |
+| `src/B3FinalityVerifier.sol` | future decentralized B3 -> ETH finality | staker-only scaffold with fail-closed public bootstrap and bridge thresholds; mock-prover tests pass; **not deployable until canonical Set_0 and real prover vectors are available** |
+| `src/BlsCertificateProver.sol` | B3 certificate proof | EIP-2537 scaffold with ordered validator paths and the pinned negative generator; **not production-approved without target-fork cross-language vectors and an external cryptography audit** |
+| `src/B3StakerBridge.sol` | future decentralized USDT release | keyless single-token/AssetId vault scaffold; mock-prover release tests pass; **not wired into deployment and must not be deployed yet** |
 
 ## Invariants
 
@@ -38,6 +40,44 @@ a Solidity toolchain.
   `0x1be220c18efa4e4cda0bb1c912c7c41346f5c04d49a36ec2c68f6ddcc5586233`.
   The vault is generic and held zero USDT at that observation, so B3 consensus
   must still enforce canonical USDT and every mint-security gate.
+
+## Staker-verifier scaffold (not a deployment artifact)
+
+The decentralized scaffold follows the stake-weighted Modern-PoS
+`FINALITY_KEY` lineage. It is not controlled by FlowMesh FN seats and embeds no
+real validator count, stake weight, BLS key, or private material. Those public
+facts become knowable only from the canonical corridor snapshot at `M - 1`.
+
+A small early set (including two validators) may be followed for chain-lineage
+continuity, but it cannot open the bridge. Ethereum requires every accepted
+certificate to carry both the B3 >2/3 stake-weight quorum and a >2/3 validator
+headcount quorum, so a two-member bootstrap is 2-of-2 and one high-weight
+validator cannot act alone. Deposits and releases remain closed until the
+current signing set meets the separately configured minimum bridge validator
+count and total stake, and that qualifying set has signed a post-activation
+certificate. The stale-lineage timer begins with the first accepted
+certificate, applies to current-epoch certificates as well as rotations, and
+closes bridge readiness when it expires.
+
+The verifier may be deployed after the public snapshot is known; no Ethereum
+transaction is required at the exact B3 `M` block. Before any real deployment,
+the canonical snapshot/root, threshold values, runtimes, bridge height, token,
+AssetId, migration plan, and audit evidence must all be reviewed and pinned.
+The BLS hash-to-curve/pairing path still requires real target-fork vectors. The
+withdrawal leaf's literal fields encode to 128 bytes
+(`8+8+32+20+20+32+8`); the older “164-byte” label was arithmetic, not padding.
+
+The scaffold is intentionally **not** a migration implementation. The existing
+bUSD AssetId commits the managed vault address, while a new staker vault has a
+different address; deposits to the new vault therefore cannot mint the existing
+bUSD. Directly moving old reserves also does not initialize the new vault's
+`locked` liabilities. Before deployment, the protocol needs an explicit old
+registry cutoff plus either a burn/swap/reissue migration or a versioned
+asset/registry design, including reserve and withdrawal-id genesis. B3 must
+also gate `BRIDGE_BURN` on live bridge-qualified finality so users cannot burn
+while Ethereum is closed or stale. Finally, a managed-to-decentralized mode
+change must be height-versioned so restart/reindex never reinterprets old
+blocks. These are release blockers, not values to guess from a validator list.
 
 ## Toolchain (owner/CI)
 
@@ -78,9 +118,10 @@ retained to reproduce the historical smoke test, not to select or activate a
 new production vault.
 
 ```
-# one-time
+# one-time: install Foundry itself (the repository has no Solidity library
+# downloads)
 curl -L https://foundry.paradigm.xyz | bash && foundryup
-cd contracts && forge install foundry-rs/forge-std --no-git
+cd contracts
 
 # 1. prove the contract behaves (mock USDT incl. the no-return-value quirk,
 #    fee-on-transfer, release authority, rejecting receivers)

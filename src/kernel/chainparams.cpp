@@ -234,7 +234,11 @@ public:
         modern_pos.checkpoint_interval = 10;
         modern_pos.checkpoint_depth = 12;
         modern_pos.max_epoch_extension = 10'080;
-        modern_pos.min_finality_set = 4;
+        // Owner ruling 2026-09-01: two real corridor stakers may bootstrap
+        // B3 finality. This is deliberately separate from the Ethereum
+        // bridge gate, which remains at four validators plus minimum weight
+        // and a >2/3 signer-headcount requirement.
+        modern_pos.min_finality_set = 2;
         if (!modern_pos.Valid()) {
             throw std::runtime_error("invalid sealed mainnet Modern PoS parameters");
         }

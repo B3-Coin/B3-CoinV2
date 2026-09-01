@@ -10,6 +10,7 @@
 #include <bridge/proof.h>
 #include <bridge/rlp.h>
 #include <chain.h>
+#include <consensus/era.h>
 #include <logging.h>
 #include <modern/asset_output.h>
 #include <modern/bridge_asset.h>
@@ -35,6 +36,10 @@ using EpochMintMap =
     std::map<std::pair<modern::AssetId, uint64_t>, CAmount>;
 using WithdrawalMap =
     std::map<BridgeWithdrawalId, BridgeManagedWithdrawalRequest>;
+using DecentralizedWithdrawalMap =
+    std::map<uint64_t, BridgeDecentralizedWithdrawalRequest>;
+using DecentralizedWithdrawalSourceMap =
+    std::map<BridgeWithdrawalId, uint64_t>;
 
 bool SameBeaconHeader(const bridge::ssz::BeaconBlockHeader& a,
                       const bridge::ssz::BeaconBlockHeader& b)
@@ -199,13 +204,19 @@ struct ScratchState {
         const std::optional<bridge::LightClientStore>& light_client,
         const AnchorMap& anchors, const AnchorHeightMap& anchor_by_height,
         const NullifierSet& nullifiers, const EpochMintMap& epoch_minted,
-        const WithdrawalMap& withdrawals)
+        const WithdrawalMap& withdrawals,
+        const DecentralizedWithdrawalMap& decentralized_withdrawals,
+        const DecentralizedWithdrawalSourceMap& decentralized_sources,
+        const modern::WithdrawalTreeState& withdrawal_tree)
         : light_client_base{light_client},
           anchors_base{anchors},
           anchor_by_height_base{anchor_by_height},
           nullifiers_base{nullifiers},
           epoch_minted_base{epoch_minted},
-          withdrawals_base{withdrawals}
+          withdrawals_base{withdrawals},
+          decentralized_withdrawals_base{decentralized_withdrawals},
+          decentralized_sources_base{decentralized_sources},
+          withdrawal_tree{withdrawal_tree}
     {
     }
 
@@ -284,12 +295,35 @@ struct ScratchState {
         return withdrawals_overlay.insert(id).second;
     }
 
+    bool AddDecentralizedWithdrawal(
+        const BridgeWithdrawalId& source,
+        const modern::BridgeWithdrawalV1& withdrawal, uint256& leaf)
+    {
+        if (decentralized_sources_base.contains(source) ||
+            decentralized_sources_overlay.contains(source) ||
+            decentralized_withdrawals_base.contains(
+                withdrawal.withdrawal_id) ||
+            decentralized_withdrawals_overlay.contains(
+                withdrawal.withdrawal_id)) {
+            return false;
+        }
+        const auto appended{modern::AppendBridgeWithdrawal(
+            withdrawal_tree, withdrawal)};
+        if (!appended) return false;
+        leaf = *appended;
+        decentralized_sources_overlay.insert(source);
+        decentralized_withdrawals_overlay.insert(withdrawal.withdrawal_id);
+        return true;
+    }
+
     const std::optional<bridge::LightClientStore>& light_client_base;
     const AnchorMap& anchors_base;
     const AnchorHeightMap& anchor_by_height_base;
     const NullifierSet& nullifiers_base;
     const EpochMintMap& epoch_minted_base;
     const WithdrawalMap& withdrawals_base;
+    const DecentralizedWithdrawalMap& decentralized_withdrawals_base;
+    const DecentralizedWithdrawalSourceMap& decentralized_sources_base;
 
     std::optional<bridge::LightClientStore> light_client_overlay{};
     bool light_client_changed{false};
@@ -298,6 +332,9 @@ struct ScratchState {
     NullifierSet nullifiers_overlay{};
     EpochMintMap epoch_minted_overlay{};
     std::set<BridgeWithdrawalId> withdrawals_overlay{};
+    std::set<uint64_t> decentralized_withdrawals_overlay{};
+    std::set<BridgeWithdrawalId> decentralized_sources_overlay{};
+    modern::WithdrawalTreeState withdrawal_tree{};
     CAmount minted_this_block{0};
 };
 
@@ -614,6 +651,73 @@ bool VerifyWithdrawal(
     return true;
 }
 
+bool VerifyBridgeBurn(
+    const CTransaction& tx, const bridge::BridgeBurnV1& record,
+    const int height, const uint256& block_hash,
+    const Consensus::Params& params, ScratchState& state,
+    BridgeBlockDelta& delta, BridgeTxAuthorization& tx_result,
+    std::string& error)
+{
+    const Consensus::BridgeAssetParams& configured{*params.busd_bridge};
+    if (*configured.withdrawal_mode !=
+        Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1) {
+        error = "decentralized bridge burn is disabled";
+        return false;
+    }
+    const auto registry_id{modern::ConfiguredBridgeRegistryId(params)};
+    const auto asset{modern::ConfiguredBridgeAssetId(params)};
+    if (!registry_id || !asset || record.registry_id != *registry_id) {
+        error = "decentralized bridge burn registry id does not match";
+        return false;
+    }
+    if (bridge::EthAddressIsNull(record.ethereum_recipient)) {
+        error = "decentralized bridge burn Ethereum recipient is null";
+        return false;
+    }
+    if (record.raw_amount == 0 ||
+        record.raw_amount > static_cast<uint64_t>(MAX_MONEY)) {
+        error = "decentralized bridge burn amount is invalid";
+        return false;
+    }
+    const CAmount amount{static_cast<CAmount>(record.raw_amount)};
+    if (record.burn_output_index >= tx.vout.size()) {
+        error = "decentralized bridge burn output index is out of range";
+        return false;
+    }
+    const auto expected{modern::MakeAssetBurnOutput(*asset, amount)};
+    if (!expected || tx.vout[record.burn_output_index] != *expected) {
+        error = "decentralized bridge record does not name the exact bUSD BURN output";
+        return false;
+    }
+    if (height < 0) {
+        error = "decentralized bridge burn height is invalid";
+        return false;
+    }
+
+    modern::BridgeWithdrawalV1 withdrawal;
+    withdrawal.withdrawal_id = state.withdrawal_tree.count;
+    withdrawal.origin_chain_id = configured.asset.origin_chain_id;
+    withdrawal.asset_id = *asset;
+    withdrawal.origin_token = configured.asset.token_address;
+    withdrawal.recipient = record.ethereum_recipient;
+    withdrawal.amount = amount;
+    withdrawal.b3_height = static_cast<uint64_t>(height);
+
+    uint256 leaf;
+    const BridgeWithdrawalId source{tx.GetHash(), record.burn_output_index};
+    if (!state.AddDecentralizedWithdrawal(source, withdrawal, leaf)) {
+        error = "decentralized bridge withdrawal id or burn source is duplicated";
+        return false;
+    }
+    delta.withdrawal_tree_after = state.withdrawal_tree;
+    BridgeDecentralizedWithdrawalRequest request{
+        tx.GetHash(), record.burn_output_index, withdrawal, leaf, height,
+        block_hash};
+    delta.decentralized_withdrawals_added.push_back(request);
+    tx_result.decentralized_withdrawal = std::move(request);
+    return true;
+}
+
 bool VerifyBridgeTransaction(
     const CTransaction& tx, const int height, const int64_t candidate_time,
     const uint256& block_hash, const Consensus::Params& params,
@@ -621,6 +725,10 @@ bool VerifyBridgeTransaction(
     BridgeTxAuthorization& tx_result, std::string& error)
 {
     tx_result = {};
+    if (!params.busd_bridge || !params.busd_bridge->light_client) {
+        error = "bridge consensus parameters are incomplete";
+        return false;
+    }
     const Consensus::EthereumLightClientPins& pins{
         *params.busd_bridge->light_client};
     const CMpaRecord* bridge_record{nullptr};
@@ -674,6 +782,11 @@ bool VerifyBridgeTransaction(
                 return VerifyWithdrawal(tx, payload, height, block_hash,
                                         params, state, delta, tx_result,
                                         error);
+            } else if constexpr (
+                std::is_same_v<T, bridge::BridgeBurnV1>) {
+                return VerifyBridgeBurn(tx, payload, height, block_hash,
+                                        params, state, delta, tx_result,
+                                        error);
             }
             error = "bridge record kind is unsupported";
             return false;
@@ -689,20 +802,26 @@ struct BridgeBlockPreview::Impl {
          const std::optional<bridge::LightClientStore>& light_client,
          const AnchorMap& anchors, const AnchorHeightMap& anchor_by_height,
          const NullifierSet& nullifiers, const EpochMintMap& epoch_minted,
-         const WithdrawalMap& withdrawals, const int connected_height,
-         const uint256& connected_hash)
+         const WithdrawalMap& withdrawals,
+         const DecentralizedWithdrawalMap& decentralized_withdrawals,
+         const DecentralizedWithdrawalSourceMap& decentralized_sources,
+         const modern::WithdrawalTreeState& withdrawal_tree,
+         const int connected_height, const uint256& connected_hash)
         : height{candidate_height},
           time{candidate_time},
           block_id{preview_block_id},
           consensus{params},
           state{std::make_unique<ScratchState>(
               light_client, anchors, anchor_by_height, nullifiers,
-              epoch_minted, withdrawals)}
+              epoch_minted, withdrawals, decentralized_withdrawals,
+              decentralized_sources, withdrawal_tree)}
     {
         delta.height = height;
         delta.block_hash = block_id;
         delta.previous_height = connected_height;
         delta.previous_block_hash = connected_hash;
+        delta.withdrawal_tree_before = withdrawal_tree;
+        delta.withdrawal_tree_after = withdrawal_tree;
     }
 
     const int height;
@@ -781,6 +900,40 @@ std::optional<BridgeManagedWithdrawalRequest> BridgeStateIndex::Withdrawal(
                : std::optional<BridgeManagedWithdrawalRequest>{it->second};
 }
 
+std::optional<BridgeDecentralizedWithdrawalRequest>
+BridgeStateIndex::DecentralizedWithdrawal(
+    const uint64_t withdrawal_id) const
+{
+    const auto it{m_decentralized_withdrawals.find(withdrawal_id)};
+    return it == m_decentralized_withdrawals.end()
+               ? std::nullopt
+               : std::optional<BridgeDecentralizedWithdrawalRequest>{
+                     it->second};
+}
+
+std::optional<uint256> BridgeStateIndex::WithdrawalRootAtHeight(
+    const int height) const
+{
+    const auto it{m_withdrawal_roots.find(height)};
+    return it == m_withdrawal_roots.end()
+               ? std::nullopt
+               : std::optional<uint256>{it->second};
+}
+
+std::optional<uint256> FinalityWithdrawalRoot(
+    const int height, const Consensus::Params& params,
+    const BridgeStateIndex* bridge_index)
+{
+    if (!Consensus::BridgeRulesActive(height, params) ||
+        !params.busd_bridge || !params.busd_bridge->withdrawal_mode ||
+        *params.busd_bridge->withdrawal_mode !=
+            Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1) {
+        return uint256{};
+    }
+    if (bridge_index == nullptr) return std::nullopt;
+    return bridge_index->WithdrawalRootAtHeight(height);
+}
+
 CAmount BridgeStateIndex::EpochMinted(const modern::AssetId& asset,
                                       const uint64_t epoch) const
 {
@@ -810,8 +963,9 @@ std::unique_ptr<BridgeBlockPreview> BridgeStateIndex::BeginBlockPreview(
     auto impl{std::make_unique<BridgeBlockPreview::Impl>(
         candidate_height, candidate_time, preview_block_id, params,
         m_light_client, m_anchors, m_anchor_by_height, m_nullifiers,
-        m_epoch_minted, m_withdrawals, m_connected_height,
-        m_connected_hash)};
+        m_epoch_minted, m_withdrawals, m_decentralized_withdrawals,
+        m_decentralized_withdrawal_sources, m_withdrawal_tree,
+        m_connected_height, m_connected_hash)};
     return std::unique_ptr<BridgeBlockPreview>{
         new BridgeBlockPreview{std::move(impl)}};
 }
@@ -831,9 +985,14 @@ bool BridgeStateIndex::VerifyBlock(
     out.block_hash = block_hash;
     out.previous_height = m_connected_height;
     out.previous_block_hash = m_connected_hash;
+    out.withdrawal_tree_before = m_withdrawal_tree;
+    out.withdrawal_tree_after = m_withdrawal_tree;
 
     ScratchState state{m_light_client, m_anchors, m_anchor_by_height,
-                       m_nullifiers, m_epoch_minted, m_withdrawals};
+                       m_nullifiers, m_epoch_minted, m_withdrawals,
+                       m_decentralized_withdrawals,
+                       m_decentralized_withdrawal_sources,
+                       m_withdrawal_tree};
     for (const CTransactionRef& tx : block.vtx) {
         BridgeTxAuthorization ignored;
         if (!VerifyBridgeTransaction(*tx, height, block.GetBlockTime(),
@@ -853,6 +1012,7 @@ bool BridgeStateIndex::VerifyBlock(
         out.epoch_mint_changes.push_back(
             BridgeEpochMintChange{key.first, key.second, before, after});
     }
+    out.withdrawal_tree_after = state.withdrawal_tree;
     return true;
 }
 
@@ -890,6 +1050,14 @@ bool BridgeStateIndex::VerifyTransaction(
             return false;
         }
         out.withdrawal = delta.withdrawals_added.front();
+    }
+    if (!delta.decentralized_withdrawals_added.empty()) {
+        if (delta.decentralized_withdrawals_added.size() != 1) {
+            error = "bridge candidate transaction produced multiple decentralized withdrawals";
+            return false;
+        }
+        out.decentralized_withdrawal =
+            delta.decentralized_withdrawals_added.front();
     }
     return true;
 }
@@ -1010,6 +1178,44 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
         }
     }
 
+    if (!(delta.withdrawal_tree_before == m_withdrawal_tree)) {
+        error = "bridge delta withdrawal-tree before-state does not match";
+        return false;
+    }
+    modern::WithdrawalTreeState expected_tree{m_withdrawal_tree};
+    std::set<BridgeWithdrawalId> decentralized_sources;
+    for (const BridgeDecentralizedWithdrawalRequest& request :
+         delta.decentralized_withdrawals_added) {
+        const BridgeWithdrawalId source{request.transaction_id,
+                                        request.burn_output_index};
+        const auto expected_leaf{
+            modern::BridgeWithdrawalLeafV1(request.withdrawal)};
+        if (request.transaction_id.IsNull() ||
+            request.withdrawal.withdrawal_id != expected_tree.count ||
+            request.withdrawal.b3_height !=
+                static_cast<uint64_t>(delta.height) ||
+            request.connected_height != delta.height ||
+            request.connected_block != delta.block_hash || !expected_leaf ||
+            *expected_leaf != request.leaf ||
+            !withdrawal_transactions.insert(request.transaction_id).second ||
+            !decentralized_sources.insert(source).second ||
+            m_decentralized_withdrawal_sources.contains(source) ||
+            m_decentralized_withdrawals.contains(
+                request.withdrawal.withdrawal_id) ||
+            !modern::AppendWithdrawalLeaf(expected_tree, request.leaf)) {
+            error = "bridge delta contains an invalid decentralized withdrawal";
+            return false;
+        }
+    }
+    if (!(delta.withdrawal_tree_after == expected_tree)) {
+        error = "bridge delta withdrawal-tree after-state does not match";
+        return false;
+    }
+    if (m_withdrawal_roots.contains(delta.height)) {
+        error = "bridge delta duplicates a withdrawal-root height";
+        return false;
+    }
+
     if (light_client_changed) {
         m_light_client = delta.light_client_after;
     }
@@ -1031,6 +1237,17 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
                                request.burn_output_index},
             request);
     }
+    for (const BridgeDecentralizedWithdrawalRequest& request :
+         delta.decentralized_withdrawals_added) {
+        m_decentralized_withdrawals.emplace(
+            request.withdrawal.withdrawal_id, request);
+        m_decentralized_withdrawal_sources.emplace(
+            BridgeWithdrawalId{request.transaction_id,
+                               request.burn_output_index},
+            request.withdrawal.withdrawal_id);
+    }
+    m_withdrawal_tree = delta.withdrawal_tree_after;
+    m_withdrawal_roots.emplace(delta.height, m_withdrawal_tree.root);
     m_connected_height = delta.height;
     m_connected_hash = delta.block_hash;
     m_history.push_back(delta);
@@ -1061,6 +1278,29 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
 
     // Validate the complete undo against live state before removing or
     // rewriting anything. A failed deep or corrupt undo leaves state intact.
+    const auto root_at_height{m_withdrawal_roots.find(height)};
+    if (!(m_withdrawal_tree == delta.withdrawal_tree_after) ||
+        root_at_height == m_withdrawal_roots.end() ||
+        root_at_height->second != delta.withdrawal_tree_after.root) {
+        error = "bridge undo withdrawal-tree after-state does not match";
+        return false;
+    }
+    for (auto it{delta.decentralized_withdrawals_added.rbegin()};
+         it != delta.decentralized_withdrawals_added.rend(); ++it) {
+        const auto found{m_decentralized_withdrawals.find(
+            it->withdrawal.withdrawal_id)};
+        const BridgeWithdrawalId source{it->transaction_id,
+                                        it->burn_output_index};
+        const auto source_found{
+            m_decentralized_withdrawal_sources.find(source)};
+        if (found == m_decentralized_withdrawals.end() ||
+            !(found->second == *it) ||
+            source_found == m_decentralized_withdrawal_sources.end() ||
+            source_found->second != it->withdrawal.withdrawal_id) {
+            error = "bridge undo cannot remove its decentralized withdrawal";
+            return false;
+        }
+    }
     for (auto it{delta.withdrawals_added.rbegin()};
          it != delta.withdrawals_added.rend(); ++it) {
         const BridgeWithdrawalId id{it->transaction_id,
@@ -1115,6 +1355,16 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
             BridgeWithdrawalId{it->transaction_id,
                                it->burn_output_index});
     }
+    for (auto it{delta.decentralized_withdrawals_added.rbegin()};
+         it != delta.decentralized_withdrawals_added.rend(); ++it) {
+        m_decentralized_withdrawals.erase(
+            it->withdrawal.withdrawal_id);
+        m_decentralized_withdrawal_sources.erase(
+            BridgeWithdrawalId{it->transaction_id,
+                               it->burn_output_index});
+    }
+    m_withdrawal_roots.erase(height);
+    m_withdrawal_tree = delta.withdrawal_tree_before;
     for (auto it{delta.epoch_mint_changes.rbegin()};
          it != delta.epoch_mint_changes.rend(); ++it) {
         const auto key{std::make_pair(it->asset, it->epoch)};
@@ -1150,6 +1400,10 @@ void BridgeStateIndex::Clear()
     m_nullifiers.clear();
     m_epoch_minted.clear();
     m_withdrawals.clear();
+    m_decentralized_withdrawals.clear();
+    m_decentralized_withdrawal_sources.clear();
+    m_withdrawal_tree = modern::WithdrawalTreeState{};
+    m_withdrawal_roots.clear();
     m_connected_height = -1;
     m_connected_hash.SetNull();
     m_history.clear();

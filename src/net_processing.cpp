@@ -36,6 +36,7 @@
 #include <netbase.h>
 #include <netmessagemaker.h>
 #include <node/blockstorage.h>
+#include <node/bridge_state.h>
 #include <node/connection_types.h>
 #include <node/legacy_orphanage.h>
 #include <node/protocol_version.h>
@@ -5949,9 +5950,20 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             Chainstate& chainstate{m_chainman.ActiveChainstate()};
             const CBlockIndex* tip{chainstate.m_chain.Tip()};
             if (!tip) return;
+            const node::BridgeStateIndex* bridge_index{nullptr};
+            if (Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
+                node::BridgeStateTracker& bridge{
+                    chainstate.ModernBridgeState()};
+                if (!bridge.Sync(chainstate.m_chain, chainstate.m_blockman,
+                                 consensus, *tip)) return;
+                bridge_index = &bridge.Index();
+            }
             node::FinalityTracker& tracker{chainstate.ModernFinality()};
-            if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) return;
-            const auto accept{chainstate.FinalitySignatures().Submit(finsig, tracker, chainstate.m_chain, consensus)};
+            if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman,
+                              consensus, *tip, bridge_index)) return;
+            const auto accept{chainstate.FinalitySignatures().Submit(
+                finsig, tracker, chainstate.m_chain, consensus,
+                bridge_index)};
             LogDebug(BCLog::NET, "finsig epoch=%d height=%d index=%d peer=%d: %s\n", finsig.epoch, finsig.height,
                      finsig.index, pfrom.GetId(), node::FinalitySignaturePool::AcceptName(accept));
             relay = accept == node::FinalitySignaturePool::Accept::ACCEPTED;

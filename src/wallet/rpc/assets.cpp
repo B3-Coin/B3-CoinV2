@@ -95,6 +95,8 @@ static const char* BridgeRecordKindName(
         return "execution-backfill";
     case bridge::BridgeRecordKindV1::MANAGED_WITHDRAWAL:
         return "managed-withdrawal";
+    case bridge::BridgeRecordKindV1::BRIDGE_BURN:
+        return "bridge-burn";
     }
     return "unknown";
 }

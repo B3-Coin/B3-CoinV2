@@ -9,6 +9,7 @@
 #include <logging.h>
 #include <modern/chain_domain.h>
 #include <modern/finality_schedule.h>
+#include <node/bridge_state.h>
 #include <node/validator_set.h>
 
 #include <algorithm>
@@ -55,7 +56,9 @@ std::optional<uint256> SuccessorHashForEpoch(const FinalityTracker::State& state
 std::optional<modern::FinalizedBlock> FinalitySignaturePool::ExpectedFinalizedBlock(const uint64_t epoch,
                                                                                     const uint64_t height,
                                                                                     const FinalityTracker::State& state,
-                                                                                    const CChain& chain)
+                                                                                    const CChain& chain,
+                                                                                    const Consensus::Params& params,
+                                                                                    const BridgeStateIndex* bridge_index)
 {
     const auto successor{SuccessorHashForEpoch(state, epoch)};
     const CBlockIndex* index{height <= static_cast<uint64_t>(std::numeric_limits<int>::max())
@@ -65,14 +68,18 @@ std::optional<modern::FinalizedBlock> FinalitySignaturePool::ExpectedFinalizedBl
     modern::FinalizedBlock fb;
     fb.height = height;
     fb.block_hash = index->GetBlockHash();
-    fb.withdrawal_root = uint256{}; // all-zero before separately pinned bridge activation
+    const auto withdrawal_root{FinalityWithdrawalRoot(
+        static_cast<int>(height), params, bridge_index)};
+    if (!withdrawal_root) return std::nullopt;
+    fb.withdrawal_root = *withdrawal_root;
     fb.validator_set_hash = *successor;
     fb.epoch = epoch;
     return fb;
 }
 
 FinalitySignaturePool::Accept FinalitySignaturePool::Submit(const FinalitySig& sig, const FinalityTracker& tracker,
-                                                            const CChain& chain, const Consensus::Params& params)
+                                                            const CChain& chain, const Consensus::Params& params,
+                                                            const BridgeStateIndex* bridge_index)
 {
     // Cheap, state-free checks first.
     if (!params.legacy_b3coin || !params.modern_pos) return Accept::STALE;
@@ -103,7 +110,8 @@ FinalitySignaturePool::Accept FinalitySignaturePool::Submit(const FinalitySig& s
     if (slot_it == m_slots.end() && m_slots.size() >= MAX_TRACKED_CHECKPOINTS) return Accept::POOL_FULL;
 
     // Expensive part last: reconstruct the digest and verify one signature.
-    const auto fb{ExpectedFinalizedBlock(sig.epoch, sig.height, state, chain)};
+    const auto fb{ExpectedFinalizedBlock(sig.epoch, sig.height, state, chain,
+                                         params, bridge_index)};
     const auto domain{params.legacy_final_hash
                           ? modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)
                           : std::nullopt};
@@ -122,7 +130,8 @@ FinalitySignaturePool::Accept FinalitySignaturePool::Submit(const FinalitySig& s
 
 std::optional<std::pair<modern::FinalizedBlock, modern::FinalityCertificate>>
 FinalitySignaturePool::BestCertificate(const FinalityTracker& tracker, const CChain& chain,
-                                       const Consensus::Params& params) const
+                                       const Consensus::Params& params,
+                                       const BridgeStateIndex* bridge_index) const
 {
     const FinalityTracker::State& state{tracker.Current()};
     // Highest height first; prefer the newest epoch at equal height.
@@ -136,7 +145,8 @@ FinalitySignaturePool::BestCertificate(const FinalityTracker& tracker, const CCh
             if (index < set->Size()) weight += set->Members()[index].weight;
         }
         if (weight < set->QuorumWeight()) continue;
-        const auto fb{ExpectedFinalizedBlock(epoch, height, state, chain)};
+        const auto fb{ExpectedFinalizedBlock(epoch, height, state, chain,
+                                             params, bridge_index)};
         if (!fb) continue;
         modern::FinalityCertificate cert;
         cert.signer_bitmap.assign(modern::SignerBitmapBytes(set->Size()), 0);
@@ -174,7 +184,8 @@ size_t FinalitySignaturePool::SignatureCount(const uint64_t epoch, const uint64_
 }
 
 std::vector<FinalitySig> FinalitySigner::MaybeSign(const FinalityTracker& tracker, const CChain& chain,
-                                                   const Consensus::Params& params, FinalitySignaturePool& pool)
+                                                   const Consensus::Params& params, FinalitySignaturePool& pool,
+                                                   const BridgeStateIndex* bridge_index)
 {
     std::vector<FinalitySig> out;
     if (!m_key || !params.legacy_b3coin || !params.modern_pos) return out;
@@ -204,7 +215,9 @@ std::vector<FinalitySig> FinalitySigner::MaybeSign(const FinalityTracker& tracke
         // Not a member of the set in force, or the snapshot records a
         // different (pre-rotation) BLS key than ours: do not sign.
         if (!index || set->Members()[*index].bls_pubkey != pk) continue;
-        const auto fb{FinalitySignaturePool::ExpectedFinalizedBlock(*epoch, static_cast<uint64_t>(h), state, chain)};
+        const auto fb{FinalitySignaturePool::ExpectedFinalizedBlock(
+            *epoch, static_cast<uint64_t>(h), state, chain, params,
+            bridge_index)};
         const auto domain{params.legacy_final_hash
                               ? modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)
                               : std::nullopt};
@@ -217,7 +230,7 @@ std::vector<FinalitySig> FinalitySigner::MaybeSign(const FinalityTracker& tracke
         sig.signature = m_key->Sign(std::span<const unsigned char>(digest.begin(), 32)).Compressed();
         // One signature per checkpoint, strictly increasing heights.
         m_last_signed = h;
-        pool.Submit(sig, tracker, chain, params);
+        pool.Submit(sig, tracker, chain, params, bridge_index);
         out.push_back(std::move(sig));
     }
     return out;

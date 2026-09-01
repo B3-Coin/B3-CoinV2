@@ -235,14 +235,13 @@ required before production activation.
 ## 2. Future decentralized release leg (B3 -> ETH) — specified, not transition v1
 
 ### T12. Small early validator set — THE key activation threat
-MIN_FINALITY_SET = 4 is a chain-bootstrap floor, NOT bridge security. If
+MIN_FINALITY_SET = 2 is a chain-bootstrap floor, NOT bridge security. If
 the Ethereum verifier is activated while B3's staked set is small/cheap,
 buying 2/3 of B3 weight is cheap and the vault's ENTIRE reserve is the
 prize (sign a fake certificate + withdrawal root, drain via §6 proofs).
-**Future decentralized-verifier activation must use its own separately pinned
-gate and an explicit economic-security
-threshold of the B3 set — an owner ruling, already flagged in the spec's
-§9 and OD-8. This is the largest open design decision in the system.**
+The decentralized verifier therefore remains closed below its separately
+pinned four-validator and total-stake floors, and also requires a >2/3 signer
+headcount in addition to B3's >2/3 stake-weight quorum.
 
 ### T13. Verifier-contract correctness — HIGH until audited
 B3FinalityVerifier + BlsCertificateProver (EIP-2537 pairing path,

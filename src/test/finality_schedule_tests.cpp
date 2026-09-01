@@ -232,6 +232,33 @@ BOOST_AUTO_TEST_CASE(current_epoch_certificates)
         BOOST_CHECK(!w.Judge(fb, w.set2.Sign(fb), M + 260, err));
         BOOST_CHECK_EQUAL(err, "withdrawal-root-nonzero");
     }
+    // Once the bridge supplies a cumulative root for the checkpoint, the
+    // certificate must sign that exact root and validation fails closed when
+    // the root index is absent.
+    {
+        auto fb{w.Fb(M + 240, 2, w.set3.snapshot.SetHash())};
+        const uint256 expected_root{uint8_t{0x44}};
+        fb.withdrawal_root = expected_root;
+        const auto root_at = [&](const int height) -> std::optional<uint256> {
+            return height == M + 240
+                       ? std::optional<uint256>{expected_root}
+                       : std::nullopt;
+        };
+        BOOST_CHECK(modern::JudgeFinalityCertificate(
+            CHAIN_DOMAIN, fb, w.set2.Sign(fb), M + 260, w.view, Pos(),
+            ChainHashAt, err, root_at));
+        auto wrong{fb};
+        wrong.withdrawal_root.begin()[0] ^= 1;
+        BOOST_CHECK(!modern::JudgeFinalityCertificate(
+            CHAIN_DOMAIN, wrong, w.set2.Sign(wrong), M + 260, w.view,
+            Pos(), ChainHashAt, err, root_at));
+        BOOST_CHECK_EQUAL(err, "withdrawal-root-mismatch");
+        BOOST_CHECK(!modern::JudgeFinalityCertificate(
+            CHAIN_DOMAIN, fb, w.set2.Sign(fb), M + 260, w.view, Pos(),
+            ChainHashAt, err,
+            [](int) { return std::optional<uint256>{}; }));
+        BOOST_CHECK_EQUAL(err, "withdrawal-root-unavailable");
+    }
     // Epoch relation: an epoch-2 object for a checkpoint inside epoch 1's span.
     {
         const auto fb{w.Fb(M + 220, 2, w.set3.snapshot.SetHash())};

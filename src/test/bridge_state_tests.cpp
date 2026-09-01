@@ -12,6 +12,7 @@
 #include <modern/bridge_asset.h>
 #include <modern/bridge_binding.h>
 #include <primitives/transaction.h>
+#include <util/strencodings.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -74,6 +75,43 @@ Consensus::Params BridgeParams()
     busd.managed_withdrawal = managed;
     BOOST_REQUIRE(Consensus::BridgeMintParamsReady(busd));
     params.busd_bridge = std::move(busd);
+    return params;
+}
+
+Consensus::Params DecentralizedBridgeParams()
+{
+    Consensus::Params params{BridgeParams()};
+    Consensus::BridgeAssetParams& busd{*params.busd_bridge};
+    busd.withdrawal_mode =
+        Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1;
+    busd.managed_withdrawal.reset();
+    Consensus::BridgeDecentralizedWithdrawalPins decentralized;
+    decentralized.ethereum_verifier_address.fill(0x33);
+    decentralized.ethereum_verifier_code_hash = TestHash(31);
+    decentralized.b3_genesis_validator_set_root = TestHash(32);
+    decentralized.withdrawal_rules_version =
+        Consensus::DECENTRALIZED_WITHDRAWAL_RULES_VERSION_V1;
+    decentralized.withdrawal_rules_commitment = TestHash(33);
+    decentralized.min_b3_validator_stake = 1;
+    decentralized.max_epoch_lag = 10;
+    busd.decentralized_withdrawal = decentralized;
+    BOOST_REQUIRE(Consensus::BridgeMintParamsReady(busd));
+    return params;
+}
+
+Consensus::Params FullyActiveBridgeParams(const bool decentralized)
+{
+    Consensus::Params params{
+        decentralized ? DecentralizedBridgeParams() : BridgeParams()};
+    params.legacy_b3coin = true;
+    params.hard_fork_height = 10; // H=9
+    params.transition_pow_length = 10; // M=20
+    params.modern_pos.emplace();
+    params.fn_pod_activation_height = 21; // A1 > M
+    params.asset_activation_height = 30; // A2
+    params.flowmesh_activation_height =
+        30 + Consensus::FLOWMESH_ANCHOR_DEPTH; // A3
+    BOOST_REQUIRE(Consensus::BridgeRulesActive(BRIDGE_HEIGHT, params));
     return params;
 }
 
@@ -354,6 +392,155 @@ BOOST_AUTO_TEST_CASE(managed_withdrawal_requires_the_exact_named_burn)
         BRIDGE_HEIGHT, TestHash(11), params, ignored, error));
     BOOST_CHECK(error.find("more than one bridge record") !=
                 std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(incomplete_bridge_parameters_fail_without_dereference)
+{
+    Consensus::Params params;
+    params.busd_bridge.emplace();
+    node::BridgeStateIndex index;
+    node::BridgeTxAuthorization authorization;
+    std::string error;
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    tx.vin[0].prevout = COutPoint{Txid::FromUint256(TestHash(90)), 0};
+    const CTransactionRef candidate{MakeTransactionRef(std::move(tx))};
+    BOOST_CHECK(!index.VerifyTransaction(*candidate, BRIDGE_HEIGHT, 1'000,
+                                         params, authorization, error));
+    BOOST_CHECK_EQUAL(error, "bridge consensus parameters are incomplete");
+}
+
+BOOST_AUTO_TEST_CASE(decentralized_burn_ids_roots_and_undo_are_deterministic)
+{
+    // Cross-language vector independently checked with Foundry `cast keccak`.
+    modern::BridgeWithdrawalV1 vector;
+    vector.origin_chain_id = 1;
+    for (size_t i{0}; i < 32; ++i) {
+        vector.asset_id.begin()[i] = static_cast<unsigned char>(i);
+    }
+    for (size_t i{0}; i < 20; ++i) {
+        vector.origin_token[i] = static_cast<unsigned char>(0x20 + i);
+        vector.recipient[i] = static_cast<unsigned char>(0x40 + i);
+    }
+    vector.amount = 1'000'000;
+    vector.b3_height = 815'000;
+    const auto vector_preimage{modern::EncodeBridgeWithdrawalV1(vector)};
+    const auto vector_leaf{modern::BridgeWithdrawalLeafV1(vector)};
+    BOOST_REQUIRE(vector_preimage);
+    BOOST_REQUIRE(vector_leaf);
+    BOOST_CHECK_EQUAL(vector_preimage->size(), 128U);
+    BOOST_CHECK_EQUAL(
+        HexStr(*vector_leaf),
+        "f96ee37321b191d9ba3e573fd7739ab8a163033824a1c534045bd168c3c88b44");
+
+    const Consensus::Params params{FullyActiveBridgeParams(true)};
+    const auto asset{modern::ConfiguredBridgeAssetId(params)};
+    const auto registry{modern::ConfiguredBridgeRegistryId(params)};
+    BOOST_REQUIRE(asset);
+    BOOST_REQUIRE(registry);
+
+    const auto make_burn = [&](const uint8_t source_tag,
+                               const CAmount amount,
+                               const uint8_t recipient_tag) {
+        bridge::BridgeBurnV1 burn_record;
+        burn_record.registry_id = *registry;
+        burn_record.burn_output_index = 0;
+        burn_record.raw_amount = static_cast<uint64_t>(amount);
+        burn_record.ethereum_recipient.fill(recipient_tag);
+        const auto record{bridge::MakeBridgeMpaRecord(bridge::BridgeRecordV1{
+            bridge::BridgeRecordKindV1::BRIDGE_BURN, burn_record})};
+        const auto burn{modern::MakeAssetBurnOutput(*asset, amount)};
+        BOOST_REQUIRE(record);
+        BOOST_REQUIRE(burn);
+        const auto binding{modern::MakeBridgeBindingOutput(*record)};
+        BOOST_REQUIRE(binding);
+        CMutableTransaction tx;
+        tx.vin.resize(1);
+        tx.vin[0].prevout =
+            COutPoint{Txid::FromUint256(TestHash(source_tag)), 0};
+        tx.vout = {*burn, *binding};
+        tx.mpa = {*record};
+        return MakeTransactionRef(std::move(tx));
+    };
+
+    const CTransactionRef first{make_burn(40, 11, 0x41)};
+    const CTransactionRef second{make_burn(41, 22, 0x42)};
+    const uint256 block_hash{TestHash(42)};
+    node::BridgeStateIndex index;
+    node::BridgeBlockDelta delta;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(index.VerifyBlock(
+                              Block(1'000, {first, second}), BRIDGE_HEIGHT,
+                              block_hash, params, delta, error),
+                          error);
+    BOOST_REQUIRE_EQUAL(delta.decentralized_withdrawals_added.size(), 2U);
+    BOOST_CHECK_EQUAL(
+        delta.decentralized_withdrawals_added[0].withdrawal.withdrawal_id,
+        0U);
+    BOOST_CHECK_EQUAL(
+        delta.decentralized_withdrawals_added[1].withdrawal.withdrawal_id,
+        1U);
+    BOOST_CHECK_EQUAL(
+        modern::EncodeBridgeWithdrawalV1(
+            delta.decentralized_withdrawals_added[0].withdrawal)
+            ->size(),
+        128U);
+    modern::WithdrawalTreeState expected;
+    BOOST_REQUIRE(modern::AppendBridgeWithdrawal(
+        expected, delta.decentralized_withdrawals_added[0].withdrawal));
+    BOOST_REQUIRE(modern::AppendBridgeWithdrawal(
+        expected, delta.decentralized_withdrawals_added[1].withdrawal));
+    BOOST_CHECK(delta.withdrawal_tree_after == expected);
+
+    BOOST_REQUIRE_MESSAGE(index.ConnectBlock(delta, error), error);
+    BOOST_CHECK_EQUAL(index.DecentralizedWithdrawalCount(), 2U);
+    BOOST_CHECK(index.DecentralizedWithdrawal(0).has_value());
+    BOOST_CHECK(index.WithdrawalRootAtHeight(BRIDGE_HEIGHT) ==
+                std::optional<uint256>{expected.root});
+
+    // The finality field is zero before bridge activation and in managed
+    // mode. Once decentralized withdrawals are active it must come from the
+    // exact active-chain index; an unavailable index fails closed.
+    BOOST_CHECK(node::FinalityWithdrawalRoot(BRIDGE_HEIGHT - 1, params,
+                                              nullptr) ==
+                std::optional<uint256>{uint256{}});
+    BOOST_CHECK(node::FinalityWithdrawalRoot(BRIDGE_HEIGHT, params, &index) ==
+                std::optional<uint256>{expected.root});
+    BOOST_CHECK(!node::FinalityWithdrawalRoot(BRIDGE_HEIGHT, params, nullptr));
+    const Consensus::Params managed_params{FullyActiveBridgeParams(false)};
+    BOOST_CHECK(node::FinalityWithdrawalRoot(BRIDGE_HEIGHT, managed_params,
+                                              nullptr) ==
+                std::optional<uint256>{uint256{}});
+
+    node::BridgeBlockDelta empty_delta;
+    const uint256 empty_hash{TestHash(43)};
+    BOOST_REQUIRE_MESSAGE(index.VerifyBlock(
+                              Block(1'001, {}), BRIDGE_HEIGHT + 1,
+                              empty_hash, params, empty_delta, error),
+                          error);
+    BOOST_REQUIRE_MESSAGE(index.ConnectBlock(empty_delta, error), error);
+    BOOST_CHECK(empty_delta.withdrawal_tree_before ==
+                empty_delta.withdrawal_tree_after);
+    BOOST_CHECK(index.WithdrawalRootAtHeight(BRIDGE_HEIGHT + 1) ==
+                std::optional<uint256>{expected.root});
+    BOOST_REQUIRE_MESSAGE(index.DisconnectBlock(BRIDGE_HEIGHT + 1,
+                                                empty_hash, error),
+                          error);
+    BOOST_REQUIRE_MESSAGE(index.DisconnectBlock(BRIDGE_HEIGHT, block_hash,
+                                                error),
+                          error);
+    BOOST_CHECK_EQUAL(index.DecentralizedWithdrawalCount(), 0U);
+    BOOST_CHECK_EQUAL(index.WithdrawalTree().count, 0U);
+    BOOST_CHECK(index.WithdrawalTree().root ==
+                modern::WithdrawalZeroHashes()[modern::WITHDRAWAL_TREE_DEPTH]);
+    BOOST_CHECK(!index.WithdrawalRootAtHeight(BRIDGE_HEIGHT));
+
+    node::BridgeBlockDelta replay;
+    BOOST_REQUIRE_MESSAGE(index.VerifyBlock(
+                              Block(1'000, {first, second}), BRIDGE_HEIGHT,
+                              block_hash, params, replay, error),
+                          error);
+    BOOST_CHECK(replay.withdrawal_tree_after == delta.withdrawal_tree_after);
 }
 
 BOOST_AUTO_TEST_CASE(mint_checks_nullifier_caps_exact_output_and_reorg)

@@ -1206,6 +1206,10 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         if (has_bridge_record) {
             const Consensus::Params& consensus{
                 m_active_chainstate.m_chainman.GetConsensus()};
+            if (!Consensus::BridgeRulesActive(next_block_height, consensus)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                     "bridge-rules-inactive");
+            }
             const CBlockIndex* tip{m_active_chainstate.m_chain.Tip()};
             node::BridgeStateTracker& tracker{
                 m_active_chainstate.ModernBridgeState()};
@@ -1232,7 +1236,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                     authorization.mint->authorization.asset,
                     authorization.mint->authorization.amount};
             }
-            ws.m_bridge_withdrawal = authorization.withdrawal.has_value();
+            ws.m_bridge_withdrawal = authorization.HasWithdrawal();
         }
         std::optional<uint32_t> fn_pod_issued;
         if (modern::HasModernFnPodDeclaration(tx)) {
@@ -2456,8 +2460,15 @@ void Chainstate::RefreshFinalityAnchor()
     if (!tip) return;
     const std::optional<int> modern_start{Consensus::ModernPosStartHeight(consensus)};
     if (!modern_start || tip->nHeight < *modern_start) return;
+    const node::BridgeStateIndex* bridge_index{nullptr};
+    if (Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
+        node::BridgeStateTracker& bridge{ModernBridgeState()};
+        if (!bridge.Sync(m_chain, m_blockman, consensus, *tip)) return;
+        bridge_index = &bridge.Index();
+    }
     node::FinalityTracker& finality{ModernFinality()};
-    if (!finality.Sync(m_chain, m_blockman, consensus, *tip)) return;
+    if (!finality.Sync(m_chain, m_blockman, consensus, *tip,
+                       bridge_index)) return;
     if (const auto& fin{finality.Current().finalized}) {
         m_blockman.RaiseFinalityAnchor(fin->height, fin->block_hash);
     }
@@ -2475,8 +2486,17 @@ std::optional<std::pair<CAmount, CAmount>> Chainstate::ModernEligibilityWeights(
 {
     AssertLockHeld(::cs_main);
     const Consensus::Params& consensus{m_chainman.GetConsensus()};
+    const node::BridgeStateIndex* bridge_index{nullptr};
+    if (Consensus::BridgeRulesActive(parent.nHeight, consensus)) {
+        node::BridgeStateTracker& bridge{ModernBridgeState()};
+        if (!bridge.Sync(m_chain, m_blockman, consensus, parent)) {
+            return std::nullopt;
+        }
+        bridge_index = &bridge.Index();
+    }
     node::FinalityTracker& finality{ModernFinality()};
-    if (!finality.Sync(m_chain, m_blockman, consensus, parent)) return std::nullopt;
+    if (!finality.Sync(m_chain, m_blockman, consensus, parent,
+                       bridge_index)) return std::nullopt;
     const auto set{finality.SetInForceAt(parent.nHeight + 1, consensus)};
     if (!set) return std::make_pair(CAmount{0}, CAmount{0});
     const auto index{set->IndexOf(validator_key)};
@@ -3423,6 +3443,10 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
              bridge_delta.withdrawals_added) {
             bridge_withdrawal_transactions.insert(withdrawal.transaction_id);
         }
+        for (const node::BridgeDecentralizedWithdrawalRequest& withdrawal :
+             bridge_delta.decentralized_withdrawals_added) {
+            bridge_withdrawal_transactions.insert(withdrawal.transaction_id);
+        }
     }
 
     // A2 FN-seat ownership is global UTXO-derived consensus state. Verify the
@@ -3580,12 +3604,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             // Before M (no set) and on a chain without the bootstrap floor
             // every certificate is invalid (fail closed).
             node::FinalityTracker& finality{ModernFinality()};
-            if (!finality.Sync(m_chain, m_blockman, consensus, *pindex->pprev)) {
+            const node::BridgeStateIndex* bridge_index{
+                &ModernBridgeState().Index()};
+            if (!finality.Sync(m_chain, m_blockman, consensus,
+                               *pindex->pprev, bridge_index)) {
                 state.Error("finality state is unavailable");
                 return false;
             }
             std::string cert_error;
-            if (!finality.CheckBlockCertificate(block, *pindex, consensus, cert_error)) {
+            if (!finality.CheckBlockCertificate(
+                    block, *pindex, consensus, cert_error, bridge_index)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-cert", cert_error);
             }
         }
@@ -4642,7 +4670,9 @@ bool Chainstate::ConnectTip(
                                        m_chainman.GetConsensus());
     }
     if (m_finality_tracker) {
-        m_finality_tracker->BlockConnected(*block_to_connect, *pindexNew, m_chainman.GetConsensus());
+        m_finality_tracker->BlockConnected(
+            *block_to_connect, *pindexNew, m_chainman.GetConsensus(),
+            m_bridge_state ? &m_bridge_state->Index() : nullptr);
         // The finality pin: a certificate connected on the active chain pins
         // its checkpoint for the life of the process (monotone).
         if (m_finality_tracker->Synced(pindexNew->GetBlockHash())) {

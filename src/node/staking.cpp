@@ -11,6 +11,7 @@
 #include <logging.h>
 #include <modern/stake.h>
 #include <net_processing.h>
+#include <node/bridge_state.h>
 #include <node/finality_signature.h>
 #include <node/finality_tracker.h>
 #include <node/miner.h>
@@ -230,8 +231,21 @@ void StakingLoop::ThreadLoop()
                 Chainstate& chainstate{m_chainman.ActiveChainstate()};
                 const CBlockIndex* tip{chainstate.m_chain.Tip()};
                 FinalityTracker& tracker{chainstate.ModernFinality()};
-                if (tip && tracker.Sync(chainstate.m_chain, chainstate.m_blockman, params, *tip)) {
-                    sigs = signer.MaybeSign(tracker, chainstate.m_chain, params, chainstate.FinalitySignatures());
+                const BridgeStateIndex* bridge_index{nullptr};
+                if (tip && Consensus::BridgeRulesActive(tip->nHeight,
+                                                        params)) {
+                    BridgeStateTracker& bridge{chainstate.ModernBridgeState()};
+                    if (bridge.Sync(chainstate.m_chain, chainstate.m_blockman,
+                                    params, *tip)) {
+                        bridge_index = &bridge.Index();
+                    }
+                }
+                if (tip && tracker.Sync(chainstate.m_chain,
+                                        chainstate.m_blockman, params, *tip,
+                                        bridge_index)) {
+                    sigs = signer.MaybeSign(
+                        tracker, chainstate.m_chain, params,
+                        chainstate.FinalitySignatures(), bridge_index);
                 }
             }
             if (!sigs.empty()) {

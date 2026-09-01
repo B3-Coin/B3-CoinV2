@@ -300,7 +300,7 @@ One cumulative tree for all `BRIDGE_BURN` records on B3 (from B):
 ```
 WITHDRAWAL_TREE_DEPTH = 32
 leaf(w) = keccak( u64 withdrawal_id ‖ u64 origin_chain_id ‖ 32 B asset_id ‖ 20 B origin_token
-                 ‖ 20 B recipient ‖ u256 amount ‖ u64 b3_height )          // 164-byte preimage
+                 ‖ 20 B recipient ‖ u256 amount ‖ u64 b3_height )          // 128-byte preimage
 index   = withdrawal_id  (0-based, strictly sequential per burn in block/tx order)
 Z_0 = 0x00…00;  Z_{k+1} = keccak(Z_k ‖ Z_k)                                  // zero hashes
 incremental (deposit-contract) insertion; root after the last burn at height h
@@ -372,7 +372,8 @@ state machine (§5.2) are unchanged; `prover` is the single governance-changeabl
 | Weight unit | whole modern B3 (`/10^9`) | FINAL |
 | `E` (epoch blocks) | **1,440** | **FINAL (owner ruling 2026-08-23)** |
 | `CHECKPOINT_INTERVAL` / `CHECKPOINT_DEPTH` | **10 / 12** | **FINAL (owner ruling 2026-08-23)** |
-| `MIN_FINALITY_SET` / `MAX_EPOCH_EXTENSION` | **4 / 7·E = 10,080** | **FINAL** — `MIN_FINALITY_SET = 4` is the Modern PoS chain **bootstrap floor only**; it is NOT a bridge security threshold (bridge validator/economic-security thresholds are a separate bridge-activation decision) |
+| `MIN_FINALITY_SET` / `MAX_EPOCH_EXTENSION` | **2 / 7·E = 10,080** | **UPDATED 2026-09-01** — two real corridor stakers may bootstrap the chain; this is NOT a bridge security threshold |
+| Ethereum bridge signer quorum | `floor(2n/3) + 1` by headcount, in addition to B3's weight quorum | **FINAL 2026-09-01** — 2 members require 2 signatures; 4 require 3; one high-weight validator cannot release alone |
 | `MIN_FINALITY_WEIGHT` | none in V1 (the floor is `MIN_FINALITY_SET`; stake economics are the min-stake rule) | FINAL (no separate weight floor) |
 | `FINALITY_CERTIFICATE` `verify_cost` / `FINALITY_KEY_EVIDENCE` `verify_cost` | **2,000 / 700** units | **FINAL** |
 | `MAX_BLOCK_PAYLOAD_COST` / `MAX_TX_PAYLOAD_COST` / `COST_TO_VBYTES` | **120,000 / 12,000 / 1** | **FINAL** |

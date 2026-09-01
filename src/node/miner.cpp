@@ -450,12 +450,22 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // certificates and the epoch simply extends (frozen behaviour).
     if (b3_modern_pos) {
         node::FinalityTracker& finality{m_chainstate.ModernFinality()};
-        if (finality.Sync(m_chainstate.m_chain, m_chainstate.m_blockman, b3_consensus, *pindexPrev)) {
+        const node::BridgeStateIndex* bridge_index{nullptr};
+        if (Consensus::BridgeRulesActive(pindexPrev->nHeight, b3_consensus)) {
+            node::BridgeStateTracker& bridge{
+                m_chainstate.ModernBridgeState()};
+            if (bridge.Sync(m_chainstate.m_chain, m_chainstate.m_blockman,
+                            b3_consensus, *pindexPrev)) {
+                bridge_index = &bridge.Index();
+            }
+        }
+        if (finality.Sync(m_chainstate.m_chain, m_chainstate.m_blockman,
+                          b3_consensus, *pindexPrev, bridge_index)) {
             if (auto best{m_chainstate.FinalitySignatures().BestCertificate(finality, m_chainstate.m_chain,
-                                                                            b3_consensus)}) {
+                                                                            b3_consensus, bridge_index)}) {
                 std::string cert_error;
                 if (finality.JudgeCandidateCertificate(best->first, best->second, *pindexPrev, b3_consensus,
-                                                       cert_error)) {
+                                                       cert_error, bridge_index)) {
                     const auto [payload, cell] = modern::BuildFinalityCertificate(best->first, best->second);
                     const CTxOut certificate_output{0, cell};
                     coinbaseTx.vout.push_back(certificate_output);

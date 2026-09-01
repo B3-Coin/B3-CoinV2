@@ -30,6 +30,7 @@
 #include <netaddress.h>
 #include <netbase.h>
 #include <node/blockstorage.h>
+#include <node/bridge_state.h>
 #include <node/coin.h>
 #include <consensus/era.h>
 #include <modern/chain_domain.h>
@@ -954,7 +955,15 @@ public:
             }
         }
         node::FinalityTracker& tracker{chainstate.ModernFinality()};
-        if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) return out;
+        const node::BridgeStateIndex* bridge_index{nullptr};
+        if (Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
+            node::BridgeStateTracker& bridge{chainstate.ModernBridgeState()};
+            if (!bridge.Sync(chainstate.m_chain, chainstate.m_blockman,
+                             consensus, *tip)) return out;
+            bridge_index = &bridge.Index();
+        }
+        if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman,
+                          consensus, *tip, bridge_index)) return out;
         out.active = true;
         const node::FinalityTracker::State& state{tracker.Current()};
         out.bootstrapped = state.bootstrapped;

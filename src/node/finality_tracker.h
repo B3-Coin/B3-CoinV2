@@ -25,6 +25,7 @@ class CChain;
 namespace node {
 
 class BlockManager;
+class BridgeStateIndex;
 
 //! The highest certified checkpoint on the chain (consensus state).
 struct FinalizedCheckpoint {
@@ -43,7 +44,7 @@ struct FinalizedCheckpoint {
  * Derived finality / epoch state of the active chain (plan Commit 12;
  * normative b3-cross-chain-finality-v1.md section 4, owner rulings
  * 2026-08-23: handover-gated rotation FINAL, E = 1440, MAX_EPOCH_EXTENSION =
- * 7 E, MIN_FINALITY_SET = 4 bootstrap floor).
+ * 7 E, MIN_FINALITY_SET = 2 bootstrap floor as updated 2026-09-01).
  *
  * State machine (all heights are modern-PoS heights; M = first modern-PoS
  * height = ModernPosStartHeight):
@@ -117,9 +118,12 @@ public:
     //! Bring the tracker to `target` (on `chain`); false if a block of the
     //! span cannot be read or a connected block fails re-verification.
     bool Sync(const CChain& chain, const BlockManager& blockman, const Consensus::Params& params,
-              const CBlockIndex& target);
+              const CBlockIndex& target,
+              const BridgeStateIndex* bridge_index = nullptr);
     //! Apply a just-connected block when in step with its parent; otherwise dirty.
-    void BlockConnected(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params);
+    void BlockConnected(const CBlock& block, const CBlockIndex& index,
+                        const Consensus::Params& params,
+                        const BridgeStateIndex* bridge_index = nullptr);
     void BlockDisconnected(const CBlockIndex& index) { MarkDirty(); }
     void MarkDirty() { m_dirty = true; }
     bool Synced(const uint256& tip_hash) const { return !m_dirty && m_synced_tip == tip_hash; }
@@ -133,7 +137,8 @@ public:
      * mutate the tracker. False with a stable reason on failure.
      */
     bool CheckBlockCertificate(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params,
-                               std::string& error) const;
+                               std::string& error,
+                               const BridgeStateIndex* bridge_index = nullptr) const;
     /**
      * Judge a candidate certificate for the block that would extend `parent`
      * (block assembly, plan Commit 16): the identical consensus rule, run
@@ -142,7 +147,8 @@ public:
      */
     bool JudgeCandidateCertificate(const modern::FinalizedBlock& fb, const modern::FinalityCertificate& cert,
                                    const CBlockIndex& parent, const Consensus::Params& params,
-                                   std::string& error) const;
+                                   std::string& error,
+                                   const BridgeStateIndex* bridge_index = nullptr) const;
 
     //! The state as of the synced tip.
     const State& Current() const { return m_state; }
@@ -157,7 +163,9 @@ public:
 private:
     //! Advance the state with one modern-PoS block (h >= M); false on a
     //! certificate that fails (a connected block cannot carry one: corruption).
-    bool ApplyModern(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params);
+    bool ApplyModern(const CBlock& block, const CBlockIndex& index,
+                     const Consensus::Params& params,
+                     const BridgeStateIndex* bridge_index);
     //! Step the private stake / binding trackers with one modern-era block.
     bool StepTrackers(const CBlock& block, const CBlockIndex& index, const CChain* chain, const BlockManager* blockman,
                       const Consensus::Params& params);

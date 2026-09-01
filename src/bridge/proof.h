@@ -75,6 +75,7 @@ enum class BridgeRecordKindV1 : uint8_t {
     MINT = 3,
     EXECUTION_BACKFILL = 4,
     MANAGED_WITHDRAWAL = 5,
+    BRIDGE_BURN = 6,
 };
 
 struct BridgeBootstrapV1 {
@@ -126,9 +127,25 @@ struct BridgeManagedWithdrawalV1 {
                            const BridgeManagedWithdrawalV1&) = default;
 };
 
+/**
+ * Decentralized reserve release request. The sequential withdrawal id, B3
+ * height, origin chain/token and chain-bound asset id are deliberately absent:
+ * consensus derives them while connecting the exact named burn. A relayer
+ * therefore cannot choose any field of the Ethereum withdrawal leaf.
+ */
+struct BridgeBurnV1 {
+    uint256 registry_id{};
+    uint32_t burn_output_index{0};
+    uint64_t raw_amount{0};
+    EthAddress ethereum_recipient{};
+
+    friend bool operator==(const BridgeBurnV1&, const BridgeBurnV1&) = default;
+};
+
 using BridgeRecordPayloadV1 =
     std::variant<BridgeBootstrapV1, BridgeUpdateV1, BridgeMintV1,
-                 BridgeExecutionBackfillV1, BridgeManagedWithdrawalV1>;
+                 BridgeExecutionBackfillV1, BridgeManagedWithdrawalV1,
+                 BridgeBurnV1>;
 
 struct BridgeRecordV1 {
     BridgeRecordKindV1 kind{BridgeRecordKindV1::BOOTSTRAP};
@@ -618,6 +635,19 @@ inline std::optional<std::vector<unsigned char>> EncodeBridgeRecordV1(
             valid = true;
         }
         break;
+    case BridgeRecordKindV1::BRIDGE_BURN:
+        if (const auto* value{std::get_if<BridgeBurnV1>(&record.payload)}) {
+            if (value->registry_id.IsNull() || value->raw_amount == 0 ||
+                !AddressNonzero(value->ethereum_recipient)) {
+                break;
+            }
+            writer.Root(value->registry_id);
+            writer.U32(value->burn_output_index);
+            writer.U64(value->raw_amount);
+            writer.Bytes(value->ethereum_recipient);
+            valid = true;
+        }
+        break;
     }
 
     if (!valid) return std::nullopt;
@@ -697,6 +727,17 @@ inline std::optional<BridgeRecordV1> DecodeBridgeRecordV1(
     }
     case BridgeRecordKindV1::MANAGED_WITHDRAWAL: {
         BridgeManagedWithdrawalV1 value;
+        if (!reader.Root(value.registry_id) || value.registry_id.IsNull() ||
+            !reader.U32(value.burn_output_index) ||
+            !reader.U64(value.raw_amount) || value.raw_amount == 0 ||
+            !reader.Bytes(value.ethereum_recipient) ||
+            !AddressNonzero(value.ethereum_recipient) || !reader.Empty()) {
+            return std::nullopt;
+        }
+        return BridgeRecordV1{kind, std::move(value)};
+    }
+    case BridgeRecordKindV1::BRIDGE_BURN: {
+        BridgeBurnV1 value;
         if (!reader.Root(value.registry_id) || value.registry_id.IsNull() ||
             !reader.U32(value.burn_output_index) ||
             !reader.U64(value.raw_amount) || value.raw_amount == 0 ||

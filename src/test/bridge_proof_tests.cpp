@@ -193,6 +193,9 @@ BOOST_AUTO_TEST_CASE(all_kinds_and_components_round_trip)
     CheckRoundTrip(BridgeRecordV1{
         BridgeRecordKindV1::MANAGED_WITHDRAWAL,
         BridgeManagedWithdrawalV1{Hash(7), 2, 1'000'000, recipient}});
+    CheckRoundTrip(BridgeRecordV1{
+        BridgeRecordKindV1::BRIDGE_BURN,
+        BridgeBurnV1{Hash(8), 3, 2'000'000, recipient}});
 }
 
 BOOST_AUTO_TEST_CASE(rejects_truncation_trailing_and_noncanonical_envelopes)

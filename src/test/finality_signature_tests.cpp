@@ -34,7 +34,9 @@ FinalitySig Sig(const node::FinalityTracker::State& state, const CChain& chain, 
     sig.epoch = epoch;
     sig.height = height;
     sig.index = index;
-    if (const auto fb{FinalitySignaturePool::ExpectedFinalizedBlock(epoch, height, state, chain)}) {
+    const Consensus::Params bridge_inactive{};
+    if (const auto fb{FinalitySignaturePool::ExpectedFinalizedBlock(
+            epoch, height, state, chain, bridge_inactive)}) {
         const uint256 digest{modern::FinalityDigest(domain, *fb)};
         sig.signature = sk.Sign(std::span<const unsigned char>(digest.begin(), 32)).Compressed();
     }

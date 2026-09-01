@@ -85,7 +85,7 @@ BOOST_AUTO_TEST_CASE(mainnet_release_parameters_are_exact)
     BOOST_CHECK_EQUAL(pos.checkpoint_interval, 10);
     BOOST_CHECK_EQUAL(pos.checkpoint_depth, 12);
     BOOST_CHECK_EQUAL(pos.max_epoch_extension, 10'080);
-    BOOST_CHECK_EQUAL(pos.min_finality_set, 4);
+    BOOST_CHECK_EQUAL(pos.min_finality_set, 2);
 
     BOOST_CHECK(consensus.test_only_modern_pos_validator == nullptr);
     BOOST_CHECK(!consensus.test_only_asset_policies_active);

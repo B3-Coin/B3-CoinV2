@@ -99,6 +99,8 @@ enum class CertificatePlacement {
     EPOCH_RELATION,          //!< epoch(checkpoint height) != FinalizedBlock.epoch
     WRONG_BLOCK_HASH,        //!< checkpoint is not the block at that height on this chain
     WITHDRAWAL_ROOT_NONZERO, //!< bridge not active: withdrawal_root must be all-zero
+    WITHDRAWAL_ROOT_UNAVAILABLE, //!< active bridge root is not available for this checkpoint
+    WITHDRAWAL_ROOT_MISMATCH, //!< certificate does not carry the derived cumulative root
     FINALITY_REGRESSION,     //!< height not strictly above the highest certified height
 };
 
@@ -114,6 +116,8 @@ inline const char* CertificatePlacementName(const CertificatePlacement p)
     case CertificatePlacement::EPOCH_RELATION: return "epoch-relation";
     case CertificatePlacement::WRONG_BLOCK_HASH: return "wrong-block-hash";
     case CertificatePlacement::WITHDRAWAL_ROOT_NONZERO: return "withdrawal-root-nonzero";
+    case CertificatePlacement::WITHDRAWAL_ROOT_UNAVAILABLE: return "withdrawal-root-unavailable";
+    case CertificatePlacement::WITHDRAWAL_ROOT_MISMATCH: return "withdrawal-root-mismatch";
     case CertificatePlacement::FINALITY_REGRESSION: return "finality-regression";
     }
     return "unknown";
@@ -128,7 +132,8 @@ inline const char* CertificatePlacementName(const CertificatePlacement p)
 inline CertificatePlacement CheckCertificatePlacement(const FinalizedBlock& fb, const int including_height,
                                                       const FinalityEpochView& view,
                                                       const Consensus::ModernPosParams& pos,
-                                                      const std::function<std::optional<uint256>(int)>& hash_at)
+                                                      const std::function<std::optional<uint256>(int)>& hash_at,
+                                                      const std::function<std::optional<uint256>(int)>& withdrawal_root_at = {})
 {
     if (view.epoch_starts.empty() || view.current_set == nullptr || view.current_set->validator_count == 0) {
         return CertificatePlacement::NO_FINALITY_SET;
@@ -151,7 +156,17 @@ inline CertificatePlacement CheckCertificatePlacement(const FinalizedBlock& fb, 
     if (!epoch_of_hc || *epoch_of_hc != fb.epoch) return CertificatePlacement::EPOCH_RELATION;
     const auto expected_hash{hash_at(hc)};
     if (!expected_hash || *expected_hash != fb.block_hash) return CertificatePlacement::WRONG_BLOCK_HASH;
-    if (!fb.withdrawal_root.IsNull()) return CertificatePlacement::WITHDRAWAL_ROOT_NONZERO;
+    const std::optional<uint256> expected_withdrawal_root{
+        withdrawal_root_at ? withdrawal_root_at(hc)
+                           : std::optional<uint256>{uint256{}}};
+    if (!expected_withdrawal_root) {
+        return CertificatePlacement::WITHDRAWAL_ROOT_UNAVAILABLE;
+    }
+    if (fb.withdrawal_root != *expected_withdrawal_root) {
+        return expected_withdrawal_root->IsNull()
+                   ? CertificatePlacement::WITHDRAWAL_ROOT_NONZERO
+                   : CertificatePlacement::WITHDRAWAL_ROOT_MISMATCH;
+    }
     if (view.finalized_height && fb.height <= *view.finalized_height) return CertificatePlacement::FINALITY_REGRESSION;
     return CertificatePlacement::OK;
 }
@@ -166,9 +181,11 @@ inline bool JudgeFinalityCertificate(const uint256& chain_domain, const Finalize
                                      const FinalityCertificate& cert, const int including_height,
                                      const FinalityEpochView& view, const Consensus::ModernPosParams& pos,
                                      const std::function<std::optional<uint256>(int)>& hash_at,
-                                     std::string& error)
+                                     std::string& error,
+                                     const std::function<std::optional<uint256>(int)>& withdrawal_root_at = {})
 {
-    const auto placement{CheckCertificatePlacement(fb, including_height, view, pos, hash_at)};
+    const auto placement{CheckCertificatePlacement(
+        fb, including_height, view, pos, hash_at, withdrawal_root_at)};
     if (placement != CertificatePlacement::OK) {
         error = CertificatePlacementName(placement);
         return false;
