@@ -25,6 +25,7 @@
 #include <modern/payload_root.h>
 #include <modern/pos_v1.h>
 #include <node/bridge_state.h>
+#include <node/finality_binding_index.h>
 #include <node/finality_signature.h>
 #include <node/finality_tracker.h>
 #include <node/flowmesh_checkpoint_index.h>
@@ -356,10 +357,35 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         }
     }
 
+    // A binding can be valid by itself against the confirmed tip yet conflict
+    // with another unconfirmed binding selected earlier for this block (same
+    // validator sequence or reused BLS key). Keep the exact consensus state
+    // machine as a candidate-local preview so one toxic mempool entry cannot
+    // make every block template fail final validation.
+    std::optional<FinalityBindingOverlay> finality_binding_preview;
+    if (m_mempool && b3_modern) {
+        const auto domain{modern::ModernChainDomain(
+            b3_consensus.hashGenesisBlock,
+            b3_consensus.legacy_final_hash.value_or(uint256{}))};
+        if (!domain) {
+            throw std::runtime_error(
+                "modern chain domain is unavailable for finality-key block assembly");
+        }
+        node::FinalityBindingTracker& bindings{
+            m_chainstate.ModernFinalityBindings()};
+        if (!bindings.Sync(m_chainstate.m_chain, m_chainstate.m_blockman,
+                           b3_consensus, *pindexPrev)) {
+            throw std::runtime_error(
+                "finality-key binding index is unavailable for block assembly");
+        }
+        finality_binding_preview.emplace(bindings.Index(), nHeight, *domain);
+    }
+
     if (m_mempool) {
         LOCK(m_mempool->cs);
         m_mempool->StartBlockBuilding();
-        addChunks(bridge_preview.get());
+        addChunks(bridge_preview.get(),
+                  finality_binding_preview ? &*finality_binding_preview : nullptr);
         m_mempool->StopBlockBuilding();
     }
 
@@ -590,14 +616,38 @@ bool BlockAssembler::TestChunkBlockLimits(FeePerWeight chunk_feerate, int64_t ch
 // - transaction finality (locktime)
 bool BlockAssembler::TestChunkTransactions(
     const std::vector<CTxMemPoolEntryRef>& txs,
-    std::optional<uint32_t>& resulting_fn_pod_total) const
+    std::optional<uint32_t>& resulting_fn_pod_total,
+    const FinalityBindingOverlay* const finality_binding_preview,
+    std::optional<FinalityBindingOverlay>& resulting_finality_binding_preview) const
 {
     resulting_fn_pod_total = m_fn_pod_issued_total;
+    resulting_finality_binding_preview.reset();
     for (const auto tx : txs) {
         if (!IsFinalTx(tx.get().GetTx(), nHeight, m_lock_time_cutoff)) {
             return false;
         }
         const CTransaction& transaction{tx.get().GetTx()};
+        const bool has_finality_key_evidence{std::any_of(
+            transaction.mpa.begin(), transaction.mpa.end(),
+            [](const CMpaRecord& record) {
+                return record.payload_type ==
+                       modern::MPA_TYPE_FINALITY_KEY_EVIDENCE;
+            })};
+        if (finality_binding_preview != nullptr && has_finality_key_evidence) {
+            if (!resulting_finality_binding_preview) {
+                resulting_finality_binding_preview.emplace(
+                    *finality_binding_preview);
+            }
+            std::vector<FinalityBindingIndex::Transition> transitions;
+            std::string error;
+            if (!resulting_finality_binding_preview->ApplyTransaction(
+                    transaction, transitions, error)) {
+                LogDebug(BCLog::VALIDATION,
+                         "CreateNewBlock(): skipping FINALITY_KEY conflict in %s (%s)\n",
+                         transaction.GetHash().ToString(), error);
+                return false;
+            }
+        }
         const size_t declarations{modern::CountModernFnPodDeclarations(transaction)};
         if (declarations == 0) continue;
         if (declarations != 1 || !resulting_fn_pod_total) return false;
@@ -666,7 +716,9 @@ void BlockAssembler::AddToBlock(const CTxMemPoolEntry& entry)
     }
 }
 
-void BlockAssembler::addChunks(BridgeBlockPreview* const bridge_preview)
+void BlockAssembler::addChunks(
+    BridgeBlockPreview* const bridge_preview,
+    FinalityBindingOverlay* const finality_binding_preview)
 {
     // Limit the number of attempts to add transactions to the block when it is
     // close to full; this is just a simple heuristic to finish quickly if the
@@ -700,10 +752,13 @@ void BlockAssembler::addChunks(BridgeBlockPreview* const bridge_preview)
         // inclusion, while a rejected chunk leaves the accepted preview
         // prefix unchanged.
         std::optional<uint32_t> resulting_fn_pod_total;
+        std::optional<FinalityBindingOverlay> resulting_finality_binding_preview;
         bool chunk_accepted{
             TestChunkBlockLimits(chunk_feerate, chunk_sig_ops) &&
             TestChunkTransactions(selected_transactions,
-                                  resulting_fn_pod_total)};
+                                  resulting_fn_pod_total,
+                                  finality_binding_preview,
+                                  resulting_finality_binding_preview)};
         if (chunk_accepted && bridge_preview != nullptr) {
             std::vector<CTransactionRef> bridge_transactions;
             bridge_transactions.reserve(selected_transactions.size());
@@ -727,6 +782,11 @@ void BlockAssembler::addChunks(BridgeBlockPreview* const bridge_preview)
         } else {
             m_mempool->IncludeBuilderChunk();
             m_fn_pod_issued_total = resulting_fn_pod_total;
+            if (finality_binding_preview != nullptr &&
+                resulting_finality_binding_preview) {
+                *finality_binding_preview =
+                    std::move(*resulting_finality_binding_preview);
+            }
 
             // This chunk will fit, so add it to the block.
             nConsecutiveFailed = 0;

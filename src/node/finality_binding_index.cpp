@@ -103,55 +103,81 @@ std::map<modern::ValidatorKeyBytes, modern::BindingRecord> FinalityBindingIndex:
     return out;
 }
 
+bool FinalityBindingOverlay::ApplyTransaction(
+    const CTransaction& tx,
+    std::vector<FinalityBindingIndex::Transition>& out,
+    std::string& error)
+{
+    out.clear();
+    std::vector<modern::FinalityKeyPair> pairs;
+    if (!modern::MatchFinalityKeyPairs(tx, pairs, error)) return false;
+
+    const auto previous_of = [&](const modern::ValidatorKeyBytes& vk)
+        -> std::optional<modern::BindingRecord> {
+        if (const auto it{m_pending.find(vk)}; it != m_pending.end()) return it->second;
+        return m_base->Get(vk);
+    };
+    const modern::BlsKeyOwnerLookup owner_of = [&](const modern::BlsPubkeyBytes& pk)
+        -> std::optional<modern::ValidatorKeyBytes> {
+        if (const auto it{m_pending_owner.find(pk)}; it != m_pending_owner.end()) return it->second;
+        const auto owner{m_base->OwnerOf(pk)};
+        if (!owner) return std::nullopt;
+        // The confirmed owner may have moved off this key earlier in the
+        // candidate block.
+        if (const auto pending{m_pending.find(*owner)};
+            pending != m_pending.end() && pending->second.bls_pubkey != pk) {
+            return std::nullopt;
+        }
+        return owner;
+    };
+
+    std::vector<FinalityBindingIndex::Transition> collected;
+    collected.reserve(pairs.size());
+    for (const auto& pair : pairs) {
+        modern::ValidatorKeyBytes vk;
+        std::copy(pair.commitment.begin(), pair.commitment.end(), vk.begin());
+        const auto previous{previous_of(vk)};
+        const auto check{modern::CheckFinalityKeyTransition(
+            m_chain_domain, pair.commitment, pair.params, pair.evidence,
+            previous, owner_of)};
+        if (check != modern::FinalityKeyCheck::OK) {
+            error = std::string{"finality-key-"} + modern::FinalityKeyCheckName(check);
+            return false;
+        }
+
+        modern::BindingRecord record;
+        record.bls_pubkey = pair.params.bls_pubkey;
+        record.seq = pair.params.seq;
+        record.height = m_height;
+        // Release the validator's previous candidate/confirmed key, then
+        // claim its new nonzero key in the candidate overlay.
+        if (previous && !previous->IsRevoked()) {
+            if (const auto owner{m_pending_owner.find(previous->bls_pubkey)};
+                owner != m_pending_owner.end() && owner->second == vk) {
+                m_pending_owner.erase(owner);
+            }
+        }
+        m_pending[vk] = record;
+        if (!record.IsRevoked()) m_pending_owner[record.bls_pubkey] = vk;
+        collected.push_back(FinalityBindingIndex::Transition{vk, record});
+    }
+    out = std::move(collected);
+    return true;
+}
+
 
 bool VerifyBlockFinalityBindings(const CBlock& block, const int height, const uint256& chain_domain,
                                  const Consensus::Params& params, const FinalityBindingIndex& index,
                                  std::vector<FinalityBindingIndex::Transition>& out, std::string& error)
 {
     out.clear();
-    // In-block overlay: transitions accepted earlier in this block.
-    std::map<modern::ValidatorKeyBytes, modern::BindingRecord> pending;
-    std::map<modern::BlsPubkeyBytes, modern::ValidatorKeyBytes> pending_owner;
-    const auto previous_of = [&](const modern::ValidatorKeyBytes& vk) -> std::optional<modern::BindingRecord> {
-        if (const auto it{pending.find(vk)}; it != pending.end()) return it->second;
-        return index.Get(vk);
-    };
-    const modern::BlsKeyOwnerLookup owner_of = [&](const modern::BlsPubkeyBytes& pk) -> std::optional<modern::ValidatorKeyBytes> {
-        if (const auto it{pending_owner.find(pk)}; it != pending_owner.end()) return it->second;
-        const auto owner{index.OwnerOf(pk)};
-        if (!owner) return std::nullopt;
-        // The index owner may have moved off this key earlier in this block.
-        if (const auto p{pending.find(*owner)}; p != pending.end() && p->second.bls_pubkey != pk) return std::nullopt;
-        return owner;
-    };
+    (void)params;
+    FinalityBindingOverlay overlay{index, height, chain_domain};
     std::vector<FinalityBindingIndex::Transition> collected;
     for (const CTransactionRef& tx : block.vtx) {
-        std::vector<modern::FinalityKeyPair> pairs;
-        if (!modern::MatchFinalityKeyPairs(*tx, pairs, error)) return false;
-        for (const auto& pair : pairs) {
-            modern::ValidatorKeyBytes vk;
-            std::copy(pair.commitment.begin(), pair.commitment.end(), vk.begin());
-            const auto prev{previous_of(vk)};
-            const auto check{modern::CheckFinalityKeyTransition(chain_domain, pair.commitment, pair.params, pair.evidence,
-                                                                prev, owner_of)};
-            if (check != modern::FinalityKeyCheck::OK) {
-                error = std::string{"finality-key-"} + modern::FinalityKeyCheckName(check);
-                return false;
-            }
-            modern::BindingRecord rec;
-            rec.bls_pubkey = pair.params.bls_pubkey;
-            rec.seq = pair.params.seq;
-            rec.height = height;
-            // Update the overlay (release the validator's previous pending/index key).
-            if (prev && !prev->IsRevoked()) {
-                if (const auto po{pending_owner.find(prev->bls_pubkey)}; po != pending_owner.end() && po->second == vk) {
-                    pending_owner.erase(po);
-                }
-            }
-            pending[vk] = rec;
-            if (!rec.IsRevoked()) pending_owner[rec.bls_pubkey] = vk;
-            collected.push_back(FinalityBindingIndex::Transition{vk, rec});
-        }
+        std::vector<FinalityBindingIndex::Transition> tx_transitions;
+        if (!overlay.ApplyTransaction(*tx, tx_transitions, error)) return false;
+        collected.insert(collected.end(), tx_transitions.begin(), tx_transitions.end());
     }
     out = std::move(collected);
     return true;

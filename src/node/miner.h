@@ -7,6 +7,7 @@
 #define BITCOIN_NODE_MINER_H
 
 #include <interfaces/types.h>
+#include <node/finality_binding_index.h>
 #include <node/types.h>
 #include <policy/policy.h>
 #include <primitives/block.h>
@@ -137,7 +138,8 @@ private:
       *
       * @pre BlockAssembler::m_mempool must not be nullptr
     */
-    void addChunks(BridgeBlockPreview* bridge_preview)
+    void addChunks(BridgeBlockPreview* bridge_preview,
+                   FinalityBindingOverlay* finality_binding_preview)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, m_mempool->cs);
 
     // helper functions for addChunks()
@@ -147,7 +149,9 @@ private:
       * This check should always succeed, and is here
       * only as an extra check in case of a bug */
     bool TestChunkTransactions(const std::vector<CTxMemPoolEntryRef>& txs,
-                               std::optional<uint32_t>& resulting_fn_pod_total) const
+                               std::optional<uint32_t>& resulting_fn_pod_total,
+                               const FinalityBindingOverlay* finality_binding_preview,
+                               std::optional<FinalityBindingOverlay>& resulting_finality_binding_preview) const
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, m_mempool->cs);
 };
 

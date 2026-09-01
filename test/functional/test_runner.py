@@ -115,6 +115,7 @@ BASE_SCRIPTS = [
     'feature_maxuploadtarget.py',
     'feature_assumeutxo.py',
     'feature_b3_finality_soak.py',
+    'feature_b3_finality_mempool.py',
     'feature_flowmesh_release.py',
     'mempool_updatefromblock.py',
     'mempool_persist.py',
