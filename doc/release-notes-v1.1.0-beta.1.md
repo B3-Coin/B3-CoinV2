@@ -10,13 +10,18 @@ Beta.1 repairs the Linux release link boundary caught by the beta build: the
 offline `b3coin-wallet` utility no longer pulls full-node bridge symbols into
 its executable. The bridge validation behavior and all consensus rules are
 unchanged. Beta.1 also uses the project's portable wide-integer type for
-FlowMesh vault accounting, preserving the same checks on the genuine 32-bit
-Windows build.
+FlowMesh vault accounting. The automated release targets preserve the same
+wide-value checks and consensus behavior.
 
 The release now also includes a fully static x86-64 Linux operator package
 built against musl. It contains `b3coind`, `b3coin-cli`, `b3coin-tx`,
 `b3coin-util`, and `b3coin-wallet`; it intentionally does not contain the Qt
 GUI. The regular Linux package continues to include the Qt wallet.
+
+This beta publishes Windows x86-64 only. The automated 32-bit Windows package
+is deferred; any later Win32 upload must be built from this exact tag with its
+portable wide-integer dependency, pass a separate architecture and runtime
+review, and include its own SHA-256 checksum.
 
 Block 810,001 must contain the deterministic FN Genesis coinbase. Public BLS
 validator bindings and native-B3 stakes are ordinary on-chain corridor data;

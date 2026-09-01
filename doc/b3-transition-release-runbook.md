@@ -365,9 +365,11 @@ statuses. Any unexplained divergence stops the release.
 1. Commit and review the measured pins and production wiring.
 2. Complete the full local build, mandatory suites, and shadow-fork gate.
 3. To publish the operator beta, tag `v1.1.0-beta.1`, push the release branch
-   and tag, and let CI build all six package variants, including the static
-   headless Linux operator package. CI must mark this release as a prerelease
-   and must not make it the latest stable release.
+   and tag, and let CI build all five package variants, including the static
+   headless Linux operator package and Windows x86-64. Win32 is deferred from
+   this automated release; any later upload must be built from the exact tag,
+   independently architecture/runtime checked, and checksummed. CI must mark
+   this release as a prerelease and must not make it the latest stable release.
 4. After every release gate passes, clear `CLIENT_VERSION_PRERELEASE`, rebuild
    and reverify the packages, then tag `v1.1.0`. Push the final tag and let CI
    publish it as the latest stable release.
