@@ -52,6 +52,8 @@ UniValue StatusToJSON(const interfaces::StakingStatus& status)
     obj.pushKV("state", status.state);
     if (!status.last_error.empty()) obj.pushKV("last_error", status.last_error);
     if (status.validator_key) obj.pushKV("validator_key", HexStr(*status.validator_key));
+    obj.pushKV("finality_signing", status.finality_signing);
+    obj.pushKV("last_signed_height", status.last_signed_height);
     obj.pushKV("blocks_produced", status.blocks_produced);
     if (!status.last_block_hash.IsNull()) obj.pushKV("last_block_hash", status.last_block_hash.GetHex());
     if (status.next_block_time > 0) obj.pushKV("next_block_time", status.next_block_time);
@@ -162,6 +164,8 @@ RPCHelpMan getstakinginfo()
                      {RPCResult::Type::STR, "state", "human-readable loop state"},
                      {RPCResult::Type::STR, "last_error", /*optional=*/true, "the last error the loop hit"},
                      {RPCResult::Type::STR_HEX, "validator_key", /*optional=*/true, "the key the loop stakes with"},
+                     {RPCResult::Type::BOOL, "finality_signing", "whether the node-global loop currently holds a BLS signing key"},
+                     {RPCResult::Type::NUM, "last_signed_height", "the latest height signed by the node-global finality signer, or -1"},
                      {RPCResult::Type::NUM, "blocks_produced", "blocks produced since the loop started"},
                      {RPCResult::Type::STR_HEX, "last_block_hash", /*optional=*/true, "the last block produced"},
                      {RPCResult::Type::NUM_TIME, "next_block_time", /*optional=*/true, "forced timestamp of the next block this validator may produce"},
@@ -309,6 +313,47 @@ static UniValue SubmitFinalityKeyTx(CWallet& wallet, const CKey& identity, const
     return obj;
 }
 
+struct PendingFinalityKeyTx {
+    Txid txid;
+    uint32_t seq{0};
+};
+
+//! Find this validator's wallet-owned transition which has not confirmed (or
+//! been abandoned/conflicted) yet. Wallet transactions retain their MPA across
+//! restart, so this also closes the restart-before-confirmation duplicate-bind
+//! case which chain-only status cannot see.
+static std::optional<PendingFinalityKeyTx> FindPendingFinalityKeyTx(
+    const CWallet& wallet,
+    const std::array<unsigned char, 32>& validator_key) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    for (const auto& [txid, wtx] : wallet.mapWallet) {
+        if (!wtx.isUnconfirmed() || !wtx.tx->HasMpa()) continue;
+        std::vector<modern::FinalityKeyPair> pairs;
+        std::string error;
+        if (!modern::MatchFinalityKeyPairs(*wtx.tx, pairs, error)) continue;
+        for (const auto& pair : pairs) {
+            if (pair.evidence.validator_key == validator_key) {
+                return PendingFinalityKeyTx{txid, pair.params.seq};
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+static void RejectPendingFinalityKeyTx(const CWallet& wallet,
+                                       const std::array<unsigned char, 32>& validator_key)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    const auto pending{FindPendingFinalityKeyTx(wallet, validator_key)};
+    if (!pending) return;
+    throw JSONRPCError(
+        RPC_WALLET_ERROR,
+        strprintf("A FINALITY_KEY transaction for this validator is already unconfirmed "
+                  "(txid %s, sequence %u); wait for confirmation, rebroadcast it, or "
+                  "abandon it before creating another",
+                  pending->txid.ToString(), pending->seq));
+}
+
 //! Common preamble: unlocked wallet, validator key, chain finality status.
 struct FinalityRpcContext {
     CPubKey validator_pubkey;
@@ -400,6 +445,7 @@ RPCHelpMan bindfinalitykey()
             LOCK(pwallet->cs_wallet);
             EnsureWalletIsUnlocked(*pwallet);
             const FinalityRpcContext ctx{FinalityContext(*pwallet)};
+            RejectPendingFinalityKeyTx(*pwallet, ctx.vk);
             const uint32_t seq{ctx.status.bound ? ctx.status.binding_seq + 1 : 0};
             if (ctx.status.bound && ctx.status.binding_seq == std::numeric_limits<uint32_t>::max()) {
                 throw JSONRPCError(RPC_MISC_ERROR, "The binding sequence is exhausted");
@@ -450,6 +496,7 @@ RPCHelpMan revokefinalitykey()
             LOCK(pwallet->cs_wallet);
             EnsureWalletIsUnlocked(*pwallet);
             const FinalityRpcContext ctx{FinalityContext(*pwallet)};
+            RejectPendingFinalityKeyTx(*pwallet, ctx.vk);
             if (!ctx.status.bound || ctx.status.revoked) {
                 throw JSONRPCError(RPC_MISC_ERROR, "This validator has no active FINALITY_KEY binding to revoke");
             }
@@ -631,22 +678,20 @@ RPCHelpMan startstaking()
             const auto rewards{pwallet->GetNewDestination(pwallet->m_default_address_type, "b3-staking-rewards")};
             if (!rewards) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(rewards).original);
 
-            // Arm the finality signer (Commit 17): when this validator has a
-            // live FINALITY_KEY binding whose key matches our deterministic
-            // derivation, hand the derived BLS secret to the loop (memory
-            // only) so it signs scheduled checkpoints while staking.
-            bool finality_signing{false};
+            // Resolve the optional finality key before entering the node. The
+            // node installs it atomically with this validator key so concurrent
+            // calls from different wallets cannot cross their signing keys.
+            std::optional<bls::SecretKey> finality_key;
             std::string finality_note;
             {
                 const interfaces::FinalityStatus fstatus{pwallet->chain().finalityStatus(XOnlyBytes(*validator))};
                 if (fstatus.configured && fstatus.bound && !fstatus.revoked) {
                     // Derived or imported: whichever wallet key matches the binding.
-                    if (const auto bls_key{pwallet->ResolveFinalityBlsKey(fstatus.binding_seq, &fstatus.binding_bls_pubkey)}) {
-                        std::string arm_error;
-                        finality_signing = pwallet->chain().armFinalitySigner(*bls_key, XOnlyBytes(*validator), arm_error);
-                        if (!finality_signing) finality_note = arm_error;
+                    const auto bls_key{pwallet->ResolveFinalityBlsKey(fstatus.binding_seq, &fstatus.binding_bls_pubkey)};
+                    if (bls_key) {
+                        finality_key = *bls_key;
                     } else {
-                        finality_note = util::ErrorString(pwallet->ResolveFinalityBlsKey(fstatus.binding_seq, &fstatus.binding_bls_pubkey)).original;
+                        finality_note = util::ErrorString(bls_key).original;
                     }
                 } else if (fstatus.configured) {
                     finality_note = fstatus.revoked ? "the FINALITY_KEY binding is revoked"
@@ -655,14 +700,15 @@ RPCHelpMan startstaking()
             }
 
             std::string error;
-            if (!pwallet->chain().startStaking(*secret, GetScriptForDestination(*rewards), error)) {
+            if (!pwallet->chain().startStaking(*secret, GetScriptForDestination(*rewards),
+                                               finality_key, error)) {
                 throw JSONRPCError(RPC_MISC_ERROR, error);
             }
             UniValue obj(UniValue::VOBJ);
             obj.pushKV("running", true);
             obj.pushKV("validator_key", HexStr(XOnlyBytes(*validator)));
             obj.pushKV("rewards_address", EncodeDestination(*rewards));
-            obj.pushKV("finality_signing", finality_signing);
+            obj.pushKV("finality_signing", finality_key.has_value());
             if (!finality_note.empty()) obj.pushKV("finality_note", finality_note);
             return obj;
         },

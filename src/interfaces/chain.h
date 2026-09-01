@@ -569,7 +569,9 @@ public:
     //! B3 Modern PoS staking (release-v1 validator UX, owner ruling
     //! 2026-08-23): start the node's automatic staking loop with the wallet's
     //! validator secret key and the script that receives block fees.
-    virtual bool startStaking(const CKey& validator_key, const CScript& coinbase_script, std::string& error) = 0;
+    virtual bool startStaking(const CKey& validator_key, const CScript& coinbase_script,
+                              const std::optional<bls::SecretKey>& finality_key,
+                              std::string& error) = 0;
     //! Stop the staking loop (no-op if not running).
     virtual void stopStaking() = 0;
     //! Staking status; `validator_key` (x-only) selects whose stake weight to

@@ -98,6 +98,8 @@ class B3FinalitySoakTest(BitcoinTestFramework):
             entry = n.getmempoolentry(binds[i]['txid'])
             assert_equal(entry['vsize'], 700)
             assert_greater_than_or_equal(entry['fees']['base'], Decimal('0.000007'))
+        assert_raises_rpc_error(
+            -4, 'already unconfirmed', self.nodes[0].bindfinalitykey)
         self.sync_mempools(timeout=120)  # bindings + stakes relay to the miner
         self.generatetoaddress(n0, 3, addr0)  # include stake + binding txs
         for n in self.nodes:

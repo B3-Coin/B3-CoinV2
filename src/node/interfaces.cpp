@@ -942,13 +942,16 @@ public:
         LOCK(::cs_main);
         return bool{chainman().CurrentChainstate().m_from_snapshot_blockhash};
     }
-    bool startStaking(const CKey& validator_key, const CScript& coinbase_script, std::string& error) override
+    bool startStaking(const CKey& validator_key, const CScript& coinbase_script,
+                      const std::optional<bls::SecretKey>& finality_key,
+                      std::string& error) override
     {
         if (!m_node.staking) {
             error = "staking is not available in this node";
             return false;
         }
-        return m_node.staking->Start(validator_key, coinbase_script, error);
+        return m_node.staking->StartWithFinalityKey(validator_key, coinbase_script,
+                                                    finality_key, error);
     }
     void stopStaking() override
     {

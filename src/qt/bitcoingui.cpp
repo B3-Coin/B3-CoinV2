@@ -151,10 +151,15 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         // The trading workspace ships with the null backend only: every
         // surface reports honestly unavailable and nothing can submit.
         m_shell->setTradePage(new B3TradePage(m_shell));
-        // Stake shows real wallet state and reward history only; the
-        // staking backend itself is honestly unavailable.
+        // Validator operations reuse the wallet's production staking/finality
+        // backends. Secret material remains behind the normal wallet unlock
+        // boundary; the page exposes public status and explicit controls only.
         m_stake_page = new B3StakePage(m_shell);
         m_shell->setStakePage(m_stake_page);
+        connect(m_stake_page, &B3StakePage::backupRequested,
+                walletFrame, &WalletFrame::backupWallet);
+        connect(m_stake_page, &B3StakePage::stakingSummaryChanged,
+                m_shell->topStatus(), &B3TopStatus::setStakingStatus);
         // Settings organizes the existing dialogs; nothing changes meaning.
         m_settings_page = new B3SettingsPage(m_shell);
         m_shell->setSettingsPage(m_settings_page);

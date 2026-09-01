@@ -61,20 +61,34 @@ public:
      * depth) and relays the signatures. Refused while running.
      */
     bool SetFinalityKey(const bls::SecretKey& key, const std::array<unsigned char, 32>& validator_key,
-                        std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    bool ClearFinalityKey(std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+                        std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_lifecycle_mutex, !m_mutex);
+    bool ClearFinalityKey(std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_lifecycle_mutex, !m_mutex);
     bool HasFinalityKey() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) { LOCK(m_mutex); return m_bls_key.has_value(); }
 
     //! Start staking with `validator_key`; block fees pay `coinbase_script`.
     //! Returns false (with `error`) if already running or the key is unusable.
-    bool Start(const CKey& validator_key, const CScript& coinbase_script, std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool Start(const CKey& validator_key, const CScript& coinbase_script,
+               std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_lifecycle_mutex, !m_mutex);
+    /**
+     * Start staking and atomically replace the optional finality key.
+     *
+     * Wallet RPC uses this boundary so a second wallet cannot interleave a
+     * separate SetFinalityKey() call with Start() and make the loop combine
+     * one wallet's validator key with another wallet's BLS secret.
+     */
+    bool StartWithFinalityKey(const CKey& validator_key, const CScript& coinbase_script,
+                              const std::optional<bls::SecretKey>& finality_key,
+                              std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_lifecycle_mutex, !m_mutex);
     //! Stop and join the loop (idempotent).
-    void Stop() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    void Stop() EXCLUSIVE_LOCKS_REQUIRED(!m_lifecycle_mutex, !m_mutex);
     //! Current status; stake weights are reported for `validator_key` (x-only)
     //! if given, else for the loop's own key.
     interfaces::StakingStatus Status(const std::optional<std::array<unsigned char, 32>>& validator_key) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
 private:
+    bool StartImpl(const CKey& validator_key, const CScript& coinbase_script,
+                   const std::optional<bls::SecretKey>* finality_key,
+                   std::string& error) EXCLUSIVE_LOCKS_REQUIRED(m_lifecycle_mutex, !m_mutex);
     void ThreadLoop() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     //! Sleep up to `d` unless stopped; returns false when stop was requested.
     bool SleepUnlessStopped(std::chrono::milliseconds d) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
@@ -86,6 +100,9 @@ private:
     CTxMemPool* const m_mempool;
     PeerManager* m_peerman{nullptr};
 
+    // Serialize complete start/stop/key-replacement operations. m_mutex alone
+    // protects snapshots, but cannot be held while joining the worker thread.
+    Mutex m_lifecycle_mutex;
     Mutex m_mutex;
     std::condition_variable_any m_cv;
     std::thread m_thread;

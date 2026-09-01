@@ -33,8 +33,9 @@ Bridge-backed bUSD remains separately fail-closed pending its security pins.
 
 ## 0. Preconditions before the seal
 
-- The release workflow is green for Linux x86_64, Windows x86_64, Windows x86,
-  macOS arm64, and macOS x86_64.
+- The release workflow is green for Linux x86_64 (Qt and static headless),
+  Windows x86_64, macOS arm64, and macOS x86_64. Automated Win32 publication
+  is deferred for this release.
 - A fully synced B3 Hive node and the independent legacy-client snapshot needed
   by the three-way equivalence protocol are ready to freeze exactly at H.
 - The canonical FN manifest codec, row predicate, Merkle construction, report
@@ -321,9 +322,10 @@ Its claim/proof builders and verifiers have been removed. Only the numeric
 type/version registry entries 1 and 2 remain permanently inactive and rejected,
 so previously assigned bytes can never acquire a new meaning.
 
-Confirm `CLIENT_VERSION_MAJOR/MINOR/BUILD` remains `1/1/0`. For the operator
-beta, `CLIENT_VERSION_PRERELEASE` must be `beta.1` and
-`doc/release-notes-v1.1.0-beta.1.md` must be present. Before the final release,
+Confirm `CLIENT_VERSION_MAJOR/MINOR/BUILD` remains `1/1/0`. For the current
+operator beta, `CLIENT_VERSION_PRERELEASE` must be `beta.2` and
+`doc/release-notes-v1.1.0-beta.2.md` must be present. Preserve the beta.1 notes
+as the historical record of that release. Before the final release,
 clear `CLIENT_VERSION_PRERELEASE` and confirm
 `doc/release-notes-v1.1.0.md` remains present and accurate. Flip the guard tests from
 the fail-closed pre-pin shape to exact value-by-value assertions for X, R0,
@@ -364,12 +366,15 @@ statuses. Any unexplained divergence stops the release.
 
 1. Commit and review the measured pins and production wiring.
 2. Complete the full local build, mandatory suites, and shadow-fork gate.
-3. To publish the operator beta, tag `v1.1.0-beta.1`, push the release branch
+3. To publish the current operator beta, tag `v1.1.0-beta.2`, push the release branch
    and tag, and let CI build all five package variants, including the static
    headless Linux operator package and Windows x86-64. Win32 is deferred from
    this automated release; any later upload must be built from the exact tag,
    independently architecture/runtime checked, and checksummed. CI must mark
    this release as a prerelease and must not make it the latest stable release.
+   A manual **Run workflow** build produces downloadable Actions artifacts for
+   testing only; it does not create or update a GitHub Release. The publish job
+   runs only for a pushed tag that exactly matches the source version.
 4. After every release gate passes, clear `CLIENT_VERSION_PRERELEASE`, rebuild
    and reverify the packages, then tag `v1.1.0`. Push the final tag and let CI
    publish it as the latest stable release.

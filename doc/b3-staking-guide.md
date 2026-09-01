@@ -61,41 +61,55 @@ era, after M.
 
 ## How to stake
 
-The current Qt **Stake** page is monitoring-only. It shows wallet state and
-reward history, but its staking controls have no backend in this release and
-cannot create a stake.
+### Recommended: B3 Hive beta.2
 
-Create the stake with RPC / command line:
+1. Open the wallet that will own the validator, then open **Stake**.
+2. Select **Generate & bind BLS key** and unlock the wallet when asked.
+   Binding needs a small transaction fee but does not require an existing
+   stake. Wait until the page shows the binding as confirmed.
+3. Copy the displayed public `validator_key`, public `bls_pubkey`, and binding
+   transaction id for coordination. Select **Back up wallet** immediately and
+   store the backup offline. Never share the BLS secret, wallet file, password,
+   or seed phrase.
+4. Enter at least **333 B3** and select **Create stake**. The principal remains
+   in a special wallet-owned output, but it is excluded from ordinary spending
+   while staked. Beta.2 does not provide a simple GUI unstake button.
+5. Wait for the Stake page to show the deposit as **ACTIVE** and the binding as
+   confirmed. Then select **Start staking**. The page must show that staking is
+   running for this wallet and that the finality signer is armed.
 
-    b3coin-cli createstake 1000
-
-Bind the validator identity to its finality key in a second transaction:
-
-    b3coin-cli bindfinalitykey
+During the corridor, **Start corridor mining** is an optional separate action.
+It uses one CPU thread, makes bounded attempts, pays transaction fees only, and
+stops automatically when Modern PoS begins. Starting B3 Hive never starts
+mining or staking by itself.
 
 Binding does not require an existing stake. After the transition client is
-synced to the pinned block 810,000, an operator may broadcast
-`bindfinalitykey` before block 810,001 is assembled; the next-block mempool
-rules accept the modern transaction for inclusion in that first corridor
-block. Do not broadcast it from an earlier legacy tip.
+synced to the pinned block 810,000, an operator may broadcast the binding and
+stake transactions for inclusion from block 810,001 onward. Do not broadcast
+them from an earlier legacy tip.
 
-The reply shows the transaction id, your validator key, the owner
-address that holds the principal, and the activation depth. Wait for both
-transactions to confirm. Check stake and finality progress with:
+### Console fallback
 
-    b3coin-cli getstakinginfo
-    b3coin-cli getfinalityinfo
+The same workflow remains available in the debug console or with
+`b3coin-cli`:
 
-Create a fresh full-wallet backup after the validator key is first created.
-Share only the returned public `validator_key`, public `bls_pubkey`, and
-transaction id. Never share the BLS secret, wallet file, or seed phrase.
+    walletpassphrase "YOUR_WALLET_PASSWORD" 120
+    bindfinalitykey
+    createstake 333
+    getstakinginfo
+    getfinalityinfo
+    startstaking
+    walletlock
 
-Before M, explicitly start the producer and finality signer:
+For an unencrypted wallet, omit `walletpassphrase` and `walletlock`. Never paste
+the wallet password anywhere except your own local debug console.
 
-    b3coin-cli startstaking
-
-The result must show `running: true` and `finality_signing: true`. Merely
-leaving the node open does not start staking.
+Use a larger amount in `createstake` if desired. Wait for the binding and stake
+transactions to confirm and for the stake to become active before relying on
+the validator at M. `startstaking` must return `running: true` and
+`finality_signing: true`. The producer keeps an in-memory copy of the required
+keys when the wallet is re-locked; select **Stop staking**, run `stopstaking`,
+or shut down B3 Hive to stop it and clear those copies.
 
 ## Confirmations: UNCONFIRMED → PENDING → ACTIVE
 
@@ -132,14 +146,15 @@ spacing — but do not aim for the deadline:
    is the designed behavior, not an outage. Watch the official channels
    for the X-pin release.
 3. **Install the X-pin release** when announced.
-4. **When the corridor starts:** run `createstake` for 333 B3 or more, then
-   `bindfinalitykey`, early in the corridor. Wait for both transactions to
-   confirm.
+4. **When the corridor starts:** use the beta.2 **Stake** page to bind the BLS
+   key and create a stake of 333 B3 or more, early in the corridor. Back up the
+   wallet, then wait for both transactions to confirm. The console commands
+   above remain available as a fallback.
 5. **Verify:** `getstakinginfo` must show the stake ACTIVE;
    `getfinalityinfo` must show a live binding and set membership. Operators
    must coordinate at least two independent bound validators before M.
-6. **Start:** run `startstaking` and require `running: true` and
-   `finality_signing: true`. Keep the node running after that.
+6. **Start:** select **Start staking** (or run `startstaking`) and require both
+   staking and finality signing to be active. Keep the node running after that.
 
 ## Questions people will ask
 

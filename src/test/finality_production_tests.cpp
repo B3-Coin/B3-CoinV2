@@ -227,4 +227,54 @@ BOOST_FIXTURE_TEST_CASE(staking_loop_signs_aggregates_and_finalizes, FinalitySta
     BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.FinalityAnchor()).has_value());
 }
 
+BOOST_FIXTURE_TEST_CASE(staking_stop_forgets_finality_key_before_another_wallet_starts, FinalityStakingFixture)
+{
+    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr);
+    std::string error;
+
+    // Wallet A arms finality and starts the node-global loop.
+    BOOST_REQUIRE_MESSAGE(loop.SetFinalityKey(m_bls_a, m_vk_a, error), error);
+    BOOST_REQUIRE_MESSAGE(loop.Start(m_validator_a, CScript() << OP_TRUE, error), error);
+    {
+        const auto running_a{loop.Status(std::nullopt)};
+        BOOST_REQUIRE(running_a.validator_key.has_value());
+        BOOST_CHECK(*running_a.validator_key == m_vk_a);
+        BOOST_CHECK(running_a.finality_signing);
+    }
+
+    // Stopping is the authorization boundary: no copied finality key remains.
+    loop.Stop();
+    BOOST_CHECK(!loop.HasFinalityKey());
+    BOOST_CHECK(!loop.Status(std::nullopt).finality_signing);
+
+    // Wallet B starts without arming a key. It must not inherit wallet A's
+    // BLS secret merely because both wallets share the same node loop.
+    BOOST_REQUIRE_MESSAGE(loop.Start(m_validator_b, CScript() << OP_2, error), error);
+    {
+        const auto running_b{loop.Status(std::nullopt)};
+        BOOST_REQUIRE(running_b.validator_key.has_value());
+        BOOST_CHECK(*running_b.validator_key == m_vk_b);
+        BOOST_CHECK(!running_b.finality_signing);
+    }
+    loop.Stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(staking_atomic_start_replaces_a_stale_same_validator_finality_key, FinalityStakingFixture)
+{
+    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr);
+    std::string error;
+
+    // Simulate a key armed by an earlier attempt for the same validator. A
+    // fresh wallet/RPC decision that has no usable live binding must replace
+    // it with no signer, rather than silently retaining the stale secret.
+    BOOST_REQUIRE_MESSAGE(loop.SetFinalityKey(m_bls_a, m_vk_a, error), error);
+    BOOST_REQUIRE(loop.HasFinalityKey());
+    BOOST_REQUIRE_MESSAGE(
+        loop.StartWithFinalityKey(m_validator_a, CScript() << OP_TRUE,
+                                  /*finality_key=*/std::nullopt, error),
+        error);
+    BOOST_CHECK(!loop.Status(std::nullopt).finality_signing);
+    loop.Stop();
+}
+
 BOOST_AUTO_TEST_SUITE_END()

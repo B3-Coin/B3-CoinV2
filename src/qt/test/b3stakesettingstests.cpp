@@ -18,24 +18,28 @@
 #include <QSignalSpy>
 #include <QTest>
 
-void B3StakeSettingsTests::stakePageIsHonestWithoutWallet()
+void B3StakeSettingsTests::stakePageDisablesActionsWithoutWallet()
 {
     B3StakePage page;
 
-    // No wallet: the page states so and fabricates nothing.
-    bool no_wallet{false};
-    bool backend_note{false};
-    int not_available{0};
-    for (const QLabel* label : page.findChildren<QLabel*>()) {
-        if (!label->isVisibleTo(&page)) continue;
-        if (label->text().contains(QStringLiteral("No wallet"))) no_wallet = true;
-        if (label->text().contains(QStringLiteral("No staking backend"))) backend_note = true;
-        if (label->text() == QStringLiteral("Not available")) ++not_available;
+    // No wallet: the page says what is missing and exposes no executable
+    // validator, staking, mining, backup, or copy action.
+    const auto* no_wallet = page.findChild<QLabel*>(QStringLiteral("stakeNoWallet"));
+    QVERIFY(no_wallet != nullptr);
+    QVERIFY(no_wallet->text().contains(QStringLiteral("wallet"), Qt::CaseInsensitive));
+    QVERIFY(!no_wallet->isHidden());
+
+    for (const char* name : {"stakeBindFinality", "stakeCreate", "stakeStartStop",
+                             "stakeCorridorMining", "stakeBackupWallet"}) {
+        const auto* button = page.findChild<QPushButton*>(QLatin1String(name));
+        QVERIFY2(button != nullptr, name);
+        QVERIFY2(!button->isEnabled(), name);
     }
-    QVERIFY(no_wallet);
-    QVERIFY(backend_note);
-    // Eligible-for-staking and network weight both refuse to invent data.
-    QCOMPARE(not_available, 2);
+    for (const char* name : {"stakeCopyValidator", "stakeCopyBls"}) {
+        const auto* button = page.findChild<QPushButton*>(QLatin1String(name));
+        QVERIFY2(button != nullptr, name);
+        QVERIFY2(!button->isEnabled(), name);
+    }
 
     // Detaching again is a no-op, not a crash.
     page.setWalletModel(nullptr);
