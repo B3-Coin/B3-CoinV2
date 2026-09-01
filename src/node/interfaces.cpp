@@ -68,12 +68,14 @@
 #include <util/result.h>
 #include <util/signalinterrupt.h>
 #include <util/string.h>
+#include <util/time.h>
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
 
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
+#include <algorithm>
 #include <any>
 #include <memory>
 #include <optional>
@@ -895,6 +897,45 @@ public:
         }
         error.clear();
         return snapshot;
+    }
+    interfaces::BridgePrevalidationResult prevalidateBridgeTransaction(
+        const CTransaction& tx, const uint256& expected_tip_hash,
+        const int expected_next_height,
+        node::BridgeTxAuthorization& authorization,
+        std::string& error) override
+    {
+        const Consensus::Params& consensus{chainman().GetConsensus()};
+
+        LOCK(::cs_main);
+        Chainstate& chainstate{chainman().ActiveChainstate()};
+        const CBlockIndex* tip{chainstate.m_chain.Tip()};
+        if (tip == nullptr || tip->GetBlockHash() != expected_tip_hash ||
+            tip->nHeight + 1 != expected_next_height) {
+            error = "The chain tip changed while the bridge transaction was being built; retry";
+            return interfaces::BridgePrevalidationResult::TIP_CHANGED;
+        }
+        if (!Consensus::BridgeRulesActive(expected_next_height, consensus)) {
+            error = "The fully configured bridge is not active for the next block";
+            return interfaces::BridgePrevalidationResult::RULES_INACTIVE;
+        }
+
+        node::BridgeStateTracker& tracker{chainstate.ModernBridgeState()};
+        if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus,
+                          *tip)) {
+            error = "The bridge state index is unavailable at the active tip";
+            return interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE;
+        }
+
+        const int64_t candidate_time{
+            std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1)};
+        if (!tracker.Index().VerifyTransaction(
+                tx, expected_next_height, candidate_time, consensus,
+                authorization, error)) {
+            if (error.empty()) error = "Bridge transaction prevalidation failed";
+            return interfaces::BridgePrevalidationResult::REJECTED;
+        }
+        error.clear();
+        return interfaces::BridgePrevalidationResult::VALID;
     }
     bool hasAssumedValidChain() override
     {

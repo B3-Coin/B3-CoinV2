@@ -2,7 +2,6 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
-#include <chain.h>
 #include <chainparams.h>
 #include <bridge/proof.h>
 #include <common/messages.h>
@@ -24,15 +23,12 @@
 #include <node/bridge_state.h>
 #include <rpc/protocol.h>
 #include <rpc/request.h>
-#include <rpc/server_util.h>
 #include <rpc/util.h>
 #include <sync.h>
-#include <txmempool.h>
+#include <util/check.h>
 #include <util/moneystr.h>
 #include <util/strencodings.h>
-#include <util/time.h>
 #include <support/cleanse.h>
-#include <validation.h>
 #include <wallet/coincontrol.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/util.h>
@@ -351,46 +347,25 @@ static void RecheckChainSnapshot(CWallet& wallet,
 }
 
 static node::BridgeTxAuthorization PrevalidateBridgeTransaction(
-    const JSONRPCRequest& request, const CTransaction& tx,
-    const ChainSnapshot& snapshot)
+    CWallet& wallet, const CTransaction& tx, const ChainSnapshot& snapshot)
 {
-    ChainstateManager& chainman{EnsureAnyChainman(request.context)};
-    const Consensus::Params& consensus{chainman.GetConsensus()};
-
-    LOCK(cs_main);
-    Chainstate& chainstate{chainman.ActiveChainstate()};
-    const CBlockIndex* tip{chainstate.m_chain.Tip()};
-    if (tip == nullptr || tip->GetBlockHash() != snapshot.tip_hash ||
-        tip->nHeight + 1 != snapshot.next_height) {
-        throw JSONRPCError(
-            RPC_VERIFY_REJECTED,
-            "The chain tip changed while the bridge transaction was being built; retry");
-    }
-    if (!Consensus::BridgeRulesActive(snapshot.next_height, consensus)) {
-        throw JSONRPCError(
-            RPC_MISC_ERROR,
-            "The fully configured bridge is not active for the next block");
-    }
-
-    node::BridgeStateTracker& tracker{chainstate.ModernBridgeState()};
-    if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus,
-                      *tip)) {
-        throw JSONRPCError(RPC_DATABASE_ERROR,
-                           "The bridge state index is unavailable at the active tip");
-    }
-
     node::BridgeTxAuthorization authorization;
     std::string error;
-    const int64_t candidate_time{
-        std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1)};
-    if (!tracker.Index().VerifyTransaction(
-            tx, snapshot.next_height, candidate_time, consensus,
-            authorization, error)) {
-        throw JSONRPCError(
-            RPC_VERIFY_REJECTED,
-            error.empty() ? "Bridge transaction prevalidation failed" : error);
+    const interfaces::BridgePrevalidationResult result{
+        wallet.chain().prevalidateBridgeTransaction(
+            tx, snapshot.tip_hash, snapshot.next_height, authorization, error)};
+    switch (result) {
+    case interfaces::BridgePrevalidationResult::VALID:
+        return authorization;
+    case interfaces::BridgePrevalidationResult::TIP_CHANGED:
+    case interfaces::BridgePrevalidationResult::REJECTED:
+        throw JSONRPCError(RPC_VERIFY_REJECTED, error);
+    case interfaces::BridgePrevalidationResult::RULES_INACTIVE:
+        throw JSONRPCError(RPC_MISC_ERROR, error);
+    case interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE:
+        throw JSONRPCError(RPC_DATABASE_ERROR, error);
     }
-    return authorization;
+    NONFATAL_UNREACHABLE();
 }
 
 static std::vector<WalletAssetCoin> AvailableWalletAssetCoins(
@@ -1600,7 +1575,7 @@ RPCHelpMan submitbridgecarrier()
             }
 
             const node::BridgeTxAuthorization authorization{
-                PrevalidateBridgeTransaction(request, *created.tx, snapshot)};
+                PrevalidateBridgeTransaction(*wallet, *created.tx, snapshot)};
             if (authorization.mint || authorization.withdrawal) {
                 throw JSONRPCError(
                     RPC_INTERNAL_ERROR,
@@ -1733,7 +1708,7 @@ RPCHelpMan claimbridgedeposit()
             }
 
             const node::BridgeTxAuthorization authorization{
-                PrevalidateBridgeTransaction(request, *created.tx, snapshot)};
+                PrevalidateBridgeTransaction(*wallet, *created.tx, snapshot)};
             if (!authorization.mint || authorization.withdrawal ||
                 authorization.mint->output_index != 0 ||
                 authorization.mint->authorization.asset != *asset ||
@@ -1884,7 +1859,7 @@ RPCHelpMan bridgewithdraw()
             }
 
             const node::BridgeTxAuthorization authorization{
-                PrevalidateBridgeTransaction(request, *created.tx, snapshot)};
+                PrevalidateBridgeTransaction(*wallet, *created.tx, snapshot)};
             if (authorization.mint || !authorization.withdrawal ||
                 authorization.withdrawal->burn_output_index != 0 ||
                 authorization.withdrawal->asset != *asset ||

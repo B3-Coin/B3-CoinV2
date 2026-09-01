@@ -45,6 +45,7 @@ namespace kernel {
 struct ChainstateRole;
 } // namespace kernel
 namespace node {
+struct BridgeTxAuthorization;
 struct NodeContext;
 } // namespace node
 
@@ -241,6 +242,17 @@ struct ModernCreationSnapshot {
     int next_height{0};
     std::optional<uint32_t> fn_issued_before{};
     bool pending_fn_pod{false};
+};
+
+//! Result category for node-owned bridge transaction prevalidation. Wallet
+//! clients use this to preserve the RPC error class without reaching through
+//! the Chain interface into validation and bridge-index internals.
+enum class BridgePrevalidationResult {
+    VALID,
+    TIP_CHANGED,
+    RULES_INACTIVE,
+    STATE_UNAVAILABLE,
+    REJECTED,
 };
 
 //! Interface giving clients (wallet processes, maybe other analysis tools in
@@ -540,6 +552,14 @@ public:
     //! intentionally omitted.
     virtual std::optional<ModernCreationSnapshot> modernCreationSnapshot(
         bool inspect_fn_pool, std::string& error) = 0;
+
+    //! Validate one candidate bridge transaction against the exact active tip
+    //! used to construct it. The full node owns bridge-index synchronization;
+    //! wallet code receives only the semantic authorization and result class.
+    virtual BridgePrevalidationResult prevalidateBridgeTransaction(
+        const CTransaction& tx, const uint256& expected_tip_hash,
+        int expected_next_height, node::BridgeTxAuthorization& authorization,
+        std::string& error) = 0;
 
     //! Return true if an assumed-valid snapshot is in use. Note that this
     //! returns true even after the snapshot is validated, until the next node

@@ -118,6 +118,103 @@ jobs:
           name: b3-hive-linux-x86_64
           path: out/
 
+  linux-x86_64-static:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and verify fully static operator binaries
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            mirror.gcr.io/alpine:3.23 \
+            sh -euxc '
+              apk add --no-cache \
+                bash binutils bison build-base cmake curl file git linux-headers \
+                make ninja patch pkgconf python3 xz
+              git config --global --add safe.directory /src
+              host="$(./depends/config.guess)"
+              test "$host" = x86_64-pc-linux-musl
+              make -C depends HOST="$host" NO_QT=1 NO_QR=1 NO_ZMQ=1 \
+                NO_USDT=1 NO_IPC=1 -j"$(nproc)"
+              cmake -S . -B build-static \
+                --toolchain "depends/$host/toolchain.cmake" \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DAPPEND_LDFLAGS=-static-pie \
+                -DCMAKE_SKIP_RPATH=TRUE \
+                -DREDUCE_EXPORTS=ON \
+                -DBUILD_GUI=OFF \
+                -DBUILD_TESTS=OFF \
+                -DBUILD_GUI_TESTS=OFF \
+                -DENABLE_IPC=OFF \
+                -DWITH_ZMQ=OFF \
+                -DWITH_USDT=OFF \
+                -DBUILD_TX=ON \
+                -DBUILD_UTIL=ON \
+                -DBUILD_WALLET_TOOL=ON
+              cmake --build build-static -j"$(nproc)" --target \
+                b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
+              for binary in b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet; do
+                file "build-static/bin/$binary" | grep -Eq "static-pie linked|statically linked"
+                ! readelf -l "build-static/bin/$binary" | grep -q "Requesting program interpreter"
+                ! readelf -d "build-static/bin/$binary" 2>&1 | grep -q NEEDED
+                if test "$binary" = b3coind; then
+                  "build-static/bin/$binary" -nosettings -version >/dev/null
+                else
+                  "build-static/bin/$binary" -version >/dev/null
+                fi
+              done
+
+              smoke_dir="$(mktemp -d)"
+              rpc_port=18455
+              build-static/bin/b3coind -regtest -datadir="$smoke_dir" \
+                -server -daemonwait -networkactive=0 -listen=0 -discover=0 \
+                -dnsseed=0 -listenonion=0 -natpmp=0 -nosettings \
+                -rpcport="$rpc_port"
+              build-static/bin/b3coin-cli -regtest -datadir="$smoke_dir" \
+                -rpcport="$rpc_port" getblockchaininfo >/dev/null
+              build-static/bin/b3coin-cli -regtest -datadir="$smoke_dir" \
+                -rpcport="$rpc_port" createwallet static-smoke >/dev/null
+              build-static/bin/b3coin-cli -regtest -datadir="$smoke_dir" \
+                -rpcport="$rpc_port" -rpcwallet=static-smoke \
+                getwalletinfo >/dev/null
+              build-static/bin/b3coin-cli -regtest -datadir="$smoke_dir" \
+                -rpcport="$rpc_port" stop
+              for attempt in $(seq 1 300); do
+                test ! -f "$smoke_dir/regtest/b3coind.pid" && break
+                sleep 0.1
+              done
+              test ! -f "$smoke_dir/regtest/b3coind.pid"
+              rm -rf "$smoke_dir"
+            '
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          name=b3-hive-v${{ needs.version.outputs.version }}-unsigned-linux-x86_64-static-headless
+          stage=$(mktemp -d)
+          mkdir -p "$stage/$name/bin"
+          cp build-static/bin/b3coind build-static/bin/b3coin-cli \
+            build-static/bin/b3coin-tx build-static/bin/b3coin-util \
+            build-static/bin/b3coin-wallet "$stage/$name/bin/"
+          cp README.md COPYING "$stage/$name/"
+          cat > "$stage/$name/STATIC-LINUX-README.txt" <<'EOF'
+          This is the fully static x86-64 Linux operator package built against
+          musl. It contains the daemon, RPC client, transaction utility, general
+          utility, and wallet utility. It intentionally does not contain Qt.
+          IPC, ZeroMQ, and USDT tracepoints are also disabled in this package.
+          Every executable passed static-ELF checks, version checks, and an
+          isolated regtest daemon/RPC startup-and-shutdown smoke test.
+          EOF
+          tar -C "$stage" -czf "out/$name.tar.gz" "$name"
+          (cd out && sha256sum *.tar.gz > SHA256SUMS.linux-static)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: b3-hive-linux-x86_64-static
+          path: out/
+
   windows-cross:
     needs: version
     runs-on: ubuntu-24.04
@@ -399,7 +496,7 @@ jobs:
 
   publish:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [version, linux-x86_64, windows-cross, windows-win32, windows-win32-smoke, macos-arm64, macos-x86_64]
+    needs: [version, linux-x86_64, linux-x86_64-static, windows-cross, windows-win32, windows-win32-smoke, macos-arm64, macos-x86_64]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -415,11 +512,12 @@ jobs:
         run: |
           set -euo pipefail
           sha256sum --check SHA256SUMS.linux
+          sha256sum --check SHA256SUMS.linux-static
           sha256sum --check SHA256SUMS.win64
           sha256sum --check SHA256SUMS.win32
           sha256sum --check SHA256SUMS.macos-arm64
           sha256sum --check SHA256SUMS.macos-x86_64
-          cat SHA256SUMS.linux SHA256SUMS.win64 SHA256SUMS.win32 SHA256SUMS.macos-arm64 \
+          cat SHA256SUMS.linux SHA256SUMS.linux-static SHA256SUMS.win64 SHA256SUMS.win32 SHA256SUMS.macos-arm64 \
             SHA256SUMS.macos-x86_64 \
             | sort -k2 > SHA256SUMS
       - name: Publish GitHub release

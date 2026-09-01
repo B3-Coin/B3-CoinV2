@@ -322,8 +322,8 @@ type/version registry entries 1 and 2 remain permanently inactive and rejected,
 so previously assigned bytes can never acquire a new meaning.
 
 Confirm `CLIENT_VERSION_MAJOR/MINOR/BUILD` remains `1/1/0`. For the operator
-beta, `CLIENT_VERSION_PRERELEASE` must be `beta` and
-`doc/release-notes-v1.1.0-beta.md` must be present. Before the final release,
+beta, `CLIENT_VERSION_PRERELEASE` must be `beta.1` and
+`doc/release-notes-v1.1.0-beta.1.md` must be present. Before the final release,
 clear `CLIENT_VERSION_PRERELEASE` and confirm
 `doc/release-notes-v1.1.0.md` remains present and accurate. Flip the guard tests from
 the fail-closed pre-pin shape to exact value-by-value assertions for X, R0,
@@ -364,9 +364,10 @@ statuses. Any unexplained divergence stops the release.
 
 1. Commit and review the measured pins and production wiring.
 2. Complete the full local build, mandatory suites, and shadow-fork gate.
-3. To publish the operator beta, tag `v1.1.0-beta`, push the release branch and
-   tag, and let CI build all five package variants. CI must mark this release as
-   a prerelease and must not make it the latest stable release.
+3. To publish the operator beta, tag `v1.1.0-beta.1`, push the release branch
+   and tag, and let CI build all six package variants, including the static
+   headless Linux operator package. CI must mark this release as a prerelease
+   and must not make it the latest stable release.
 4. After every release gate passes, clear `CLIENT_VERSION_PRERELEASE`, rebuild
    and reverify the packages, then tag `v1.1.0`. Push the final tag and let CI
    publish it as the latest stable release.
