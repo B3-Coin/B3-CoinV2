@@ -462,12 +462,33 @@ jobs:
             asset_count=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
               --json assets --jq '.assets | length')
             if (( asset_count != 0 )); then
-              echo "Refusing to overwrite a release that already has uploaded assets" >&2
-              exit 1
+              if [[ "$GITHUB_REF_NAME" != "v1.1.0-beta.2" ]]; then
+                echo "Refusing to overwrite a release that already has uploaded assets" >&2
+                exit 1
+              fi
+              # Owner-authorized beta.2 transition hotfix rebuild. Keep the
+              # old complete release available until every replacement job has
+              # succeeded, then remove only this tag's old assets immediately
+              # before the new complete set is uploaded.
+              if [[ "$is_draft" != "true" ]]; then
+                gh release edit "$GITHUB_REF_NAME" \
+                  --repo "$GITHUB_REPOSITORY" --verify-tag --draft=true
+                is_draft=true
+              fi
+              mapfile -t existing_assets < <(
+                gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                  --json assets --jq '.assets[].name'
+              )
+              for asset in "${existing_assets[@]}"; do
+                gh release delete-asset "$GITHUB_REF_NAME" "$asset" \
+                  --repo "$GITHUB_REPOSITORY" --yes
+              done
             fi
             # v1.0.0 already exists as the published, assetless release-candidate
-            # page. Permit that one migration; all later published tags are immutable.
-            if [[ "$is_draft" != "true" && "$GITHUB_REF_NAME" != "v1.0.0" ]]; then
+            # page. Beta.2 has one owner-authorized in-place hotfix rebuild;
+            # every other published tag remains immutable.
+            if [[ "$is_draft" != "true" && "$GITHUB_REF_NAME" != "v1.0.0" && \
+                  "$GITHUB_REF_NAME" != "v1.1.0-beta.2" ]]; then
               echo "Refusing to overwrite an existing published release" >&2
               exit 1
             fi
