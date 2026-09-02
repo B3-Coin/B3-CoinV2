@@ -90,23 +90,22 @@ UniValue RPCTestingSetup::CallRPC(std::string args)
 
 BOOST_FIXTURE_TEST_SUITE(rpc_tests, RPCTestingSetup)
 
-BOOST_AUTO_TEST_CASE(getassetstate_reports_fail_closed_defaults)
+BOOST_AUTO_TEST_CASE(getassetstate_reports_production_schedule)
 {
     const UniValue result{CallRPC("getassetstate")};
     BOOST_CHECK_EQUAL(result.find_value("next_height").getInt<int>(), 1);
 
     const UniValue& fn{result.find_value("fn")};
-    BOOST_CHECK(!fn.find_value("configured").get_bool());
+    BOOST_CHECK(fn.find_value("configured").get_bool());
     BOOST_CHECK(!fn.find_value("active").get_bool());
     BOOST_CHECK(!fn.find_value("pod_active").get_bool());
     BOOST_CHECK(fn.find_value("counter_known").get_bool());
-    BOOST_CHECK_EQUAL(fn.find_value("historical_issued").getInt<int>(), 0);
+    BOOST_CHECK_EQUAL(fn.find_value("historical_issued").getInt<int>(), 3'592);
     BOOST_CHECK_EQUAL(fn.find_value("modern_issued").getInt<int>(), 0);
-    BOOST_CHECK_EQUAL(fn.find_value("modern_capacity").getInt<int>(),
-                      Consensus::MAX_FN_EVER_ISSUED);
+    BOOST_CHECK_EQUAL(fn.find_value("modern_capacity").getInt<int>(), 1'408);
 
     const UniValue& colored{result.find_value("colored")};
-    BOOST_CHECK(!colored.find_value("configured").get_bool());
+    BOOST_CHECK(colored.find_value("configured").get_bool());
     BOOST_CHECK(!colored.find_value("active").get_bool());
 }
 
