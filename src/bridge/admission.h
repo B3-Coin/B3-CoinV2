@@ -69,6 +69,13 @@ inline std::optional<RecipientV1> DecodeRecipientV1(
     RecipientV1 out;
     std::copy(encoded.begin() + RECIPIENT_V1_PADDING_SIZE + 1, encoded.end(),
               out.pubkey_hash.begin());
+    // A versioned all-zero P2PKH hash is syntactically shaped but has no
+    // practical owner. Reject it before Ethereum custody can become a
+    // permanently unspendable B3 output.
+    if (std::all_of(out.pubkey_hash.begin(), out.pubkey_hash.end(),
+                    [](const unsigned char byte) { return byte == 0; })) {
+        return std::nullopt;
+    }
     return out;
 }
 
@@ -137,11 +144,14 @@ enum class BridgeRegistryState : uint8_t {
 /** Full mint-admission tuple required by threat-model section 5. */
 struct BridgeAssetRegistryEntry {
     uint64_t origin_chain_id{0};
+    uint64_t origin_deployment_block{0};
     EthAddress vault_address{};
     EthAddress token_address{};
     modern::AssetId b3_asset_id{};
     uint8_t origin_decimals{0};
     uint8_t asset_decimals{0};
+    /** Exact runtime hash of the approved immutable deposit vault. */
+    uint256 vault_runtime_code_hash{};
     /** Commitment to the approved token implementation or explicit adapter. */
     uint256 implementation_or_adapter{};
     uint32_t adapter_version{0};
@@ -158,10 +168,16 @@ inline bool EthAddressIsNull(const EthAddress& address)
 
 inline bool BridgeAssetRegistryEntryValid(const BridgeAssetRegistryEntry& entry)
 {
-    return entry.origin_chain_id != 0 && !EthAddressIsNull(entry.vault_address) &&
+    return entry.origin_chain_id != 0 && entry.origin_deployment_block > 0 &&
+           !EthAddressIsNull(entry.vault_address) &&
+           !EthAddressIsNull(entry.token_address) &&
+           entry.vault_address != entry.token_address &&
            !entry.b3_asset_id.IsNull() &&
            entry.origin_decimals <= 18 && entry.asset_decimals <= 18 &&
-           !entry.implementation_or_adapter.IsNull() && entry.adapter_version != 0 &&
+           !entry.vault_runtime_code_hash.IsNull() &&
+           !entry.implementation_or_adapter.IsNull() &&
+           entry.adapter_version ==
+               Consensus::BRIDGE_ADAPTER_VERSION_DIRECT_TOKEN_V1 &&
            entry.approval_first_height >= 0 &&
            (!entry.approval_last_height ||
             *entry.approval_last_height >= entry.approval_first_height);
@@ -192,6 +208,7 @@ struct BridgeDepositKey {
 
 struct ProvenBridgeDeposit {
     uint64_t origin_chain_id{0};
+    uint64_t execution_block_number{0};
     EthAddress vault_address{};
     DepositEvent event{};
 };
@@ -207,6 +224,7 @@ enum class BridgeAdmissionResult {
     OK,
     CONFIGURATION_INCOMPLETE,
     REGISTRY_INACTIVE,
+    BEFORE_DEPLOYMENT,
     ORIGIN_MISMATCH,
     VAULT_MISMATCH,
     TOKEN_MISMATCH,
@@ -228,6 +246,9 @@ inline BridgeAdmissionResult AdmitProvenDeposit(
     out = {};
     if (!BridgeAssetRegistryEntryActiveAt(registry, b3_height)) {
         return BridgeAdmissionResult::REGISTRY_INACTIVE;
+    }
+    if (deposit.execution_block_number < registry.origin_deployment_block) {
+        return BridgeAdmissionResult::BEFORE_DEPLOYMENT;
     }
     if (deposit.origin_chain_id != registry.origin_chain_id) {
         return BridgeAdmissionResult::ORIGIN_MISMATCH;
@@ -269,11 +290,13 @@ inline std::optional<BridgeAssetRegistryEntry> ConfiguredBridgeRegistryEntry(
     const Consensus::BridgeAssetParams& configured{*params.busd_bridge};
     BridgeAssetRegistryEntry entry;
     entry.origin_chain_id = configured.asset.origin_chain_id;
+    entry.origin_deployment_block = *configured.origin_deployment_block;
     entry.vault_address = configured.asset.vault_address;
     entry.token_address = configured.asset.token_address;
     entry.b3_asset_id = *asset;
     entry.origin_decimals = configured.asset.origin_decimals;
     entry.asset_decimals = configured.asset.asset_decimals;
+    entry.vault_runtime_code_hash = *configured.vault_runtime_code_hash;
     entry.implementation_or_adapter = *configured.implementation_or_adapter;
     entry.adapter_version = *configured.adapter_version;
     entry.approval_first_height = *configured.activation_height;

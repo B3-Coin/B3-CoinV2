@@ -135,6 +135,19 @@ BOOST_AUTO_TEST_CASE(valid_certificates_and_quorum_boundaries)
     // a single validator set: its own signature is the quorum
     SetUnderTest one{{5}};
     BOOST_CHECK(modern::VerifyFinalityCertificate(CHAIN_DOMAIN, fb, Sign(one, fb, {0}), one.view, SUCCESSOR) == CertificateCheck::OK);
+
+    // Stake weight alone is not enough: every B3-valid certificate must also
+    // meet the same >2/3 signer-count rule as the immutable Ethereum prover.
+    SetUnderTest concentrated{{4, 4, 1, 1}};
+    std::vector<uint32_t> weight_four;
+    for (uint32_t i = 0; i < concentrated.view.validator_count; ++i) {
+        if (concentrated.view.weights[i] == 4) weight_four.push_back(i);
+    }
+    BOOST_REQUIRE_EQUAL(weight_four.size(), 2U);
+    BOOST_CHECK(modern::VerifyFinalityCertificate(
+                    CHAIN_DOMAIN, fb, Sign(concentrated, fb, weight_four),
+                    concentrated.view, SUCCESSOR) ==
+                CertificateCheck::INSUFFICIENT_HEADCOUNT);
 }
 
 BOOST_AUTO_TEST_CASE(rejections)

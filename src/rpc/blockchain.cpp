@@ -6,6 +6,8 @@
 #include <rpc/blockchain.h>
 
 #include <blockfilter.h>
+#include <bridge/ethereum_calldata.h>
+#include <bridge/lc_json.h>
 #include <chain.h>
 #include <chainparams.h>
 #include <chainparamsbase.h>
@@ -28,6 +30,8 @@
 #include <logging/timer.h>
 #include <modern/asset_validation.h>
 #include <modern/bridge_asset.h>
+#include <modern/chain_domain.h>
+#include <modern/finality_certificate.h>
 #include <modern/fn_pod.h>
 #include <net.h>
 #include <net_processing.h>
@@ -66,9 +70,11 @@
 
 #include <condition_variable>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -3657,6 +3663,181 @@ static RPCHelpMan getfinalitystatus()
     };
 }
 
+static RPCHelpMan getfinalityset()
+{
+    return RPCHelpMan{
+        "getfinalityset",
+        "Export one reproducible B3 finality validator-set snapshot for an "
+        "Ethereum bridge relayer. With no epoch, returns Set_0 at M-1 or the "
+        "current set after M. The immutable M-1 Set_0 remains available for "
+        "the Ethereum bootstrap; other epochs are limited to current, previous, "
+        "or next. Use offset/count to page the public member list.\n",
+        {
+            {"epoch", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
+             "Set epoch (default: Set_0 preview at M-1, otherwise current)"},
+            {"offset", RPCArg::Type::NUM, RPCArg::Default{0},
+             "First member index"},
+            {"count", RPCArg::Type::NUM, RPCArg::Default{256},
+             "Maximum members to return (1..1024)"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Canonical validator set",
+                  {
+                      {RPCResult::Type::STR_HEX, "chain_domain", "B3 modern chain domain in Ethereum/wire byte order"},
+                      {RPCResult::Type::STR_HEX, "set_hash", "Keccak hash of encoded header in Ethereum/wire byte order"},
+                      {RPCResult::Type::STR_HEX, "encoded_header", "Canonical 110-byte EVM header"},
+                      {RPCResult::Type::NUM, "epoch", "Set epoch"},
+                      {RPCResult::Type::NUM, "ruleset_version", "Finality ruleset"},
+                      {RPCResult::Type::NUM, "validator_count", "Total member count"},
+                      {RPCResult::Type::NUM, "total_weight", "Whole modern B3"},
+                      {RPCResult::Type::NUM, "quorum_weight", "Required signed weight"},
+                      {RPCResult::Type::STR_HEX, "aggregate_pubkey", "Compressed aggregate BLS public key"},
+                      {RPCResult::Type::STR_HEX, "members_root", "Depth-13 ordered member-tree root in Ethereum/wire byte order"},
+                      {RPCResult::Type::NUM, "snapshot_height", /*optional=*/true, "M-1 for Set_0"},
+                      {RPCResult::Type::STR_HEX, "snapshot_block_hash", /*optional=*/true, "Active-chain hash bytes at M-1 in the order used by the Ethereum FinalizedBlock"},
+                      {RPCResult::Type::STR_HEX, "snapshot_block_hash_b3", /*optional=*/true, "Active-chain hash at M-1 in ordinary B3 display order"},
+                      {RPCResult::Type::NUM, "offset", "First returned index"},
+                      {RPCResult::Type::NUM, "next_offset", /*optional=*/true, "Next page offset"},
+                      {RPCResult::Type::ARR, "members", "Public ordered members",
+                       {{RPCResult::Type::OBJ, "", "Member",
+                         {
+                             {RPCResult::Type::NUM, "index", "Ordered member index"},
+                             {RPCResult::Type::STR_HEX, "validator_key", "B3 x-only validator key"},
+                             {RPCResult::Type::STR_HEX, "bls_pubkey", "Compressed BLS public key"},
+                             {RPCResult::Type::NUM, "weight", "Whole modern B3"},
+                             {RPCResult::Type::STR_HEX, "leaf", "Keccak member leaf in Ethereum/wire byte order"},
+                         }}}},
+                  }},
+        RPCExamples{HelpExampleCli("getfinalityset", "") +
+                    HelpExampleCli("getfinalityset", "0 0 256")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const std::optional<uint64_t> requested_epoch{
+                request.params[0].isNull()
+                    ? std::nullopt
+                    : std::optional<uint64_t>{
+                          request.params[0].getInt<uint64_t>()}};
+            const int64_t raw_offset{request.params[1].isNull()
+                                         ? 0
+                                         : request.params[1].getInt<int64_t>()};
+            const int64_t raw_count{request.params[2].isNull()
+                                        ? 256
+                                        : request.params[2].getInt<int64_t>()};
+            if (raw_offset < 0 || raw_count < 1 || raw_count > 1024) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "offset must be nonnegative and count must be 1..1024");
+            }
+
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            const auto domain{consensus.legacy_final_hash
+                                  ? modern::ModernChainDomain(
+                                        consensus.hashGenesisBlock,
+                                        *consensus.legacy_final_hash)
+                                  : std::nullopt};
+            const auto modern_start{Consensus::ModernPosStartHeight(consensus)};
+            if (!domain || !modern_start || !consensus.modern_pos) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Modern-PoS finality is not fully configured");
+            }
+
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            if (!tip || tip->nHeight < *modern_start - 1) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Set_0 is not available before block M-1");
+            }
+            node::FinalityTracker& tracker{chainstate.ModernFinality()};
+            const node::BridgeStateIndex* bridge_index{nullptr};
+            if (Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
+                node::BridgeStateTracker& bridge{
+                    chainstate.ModernBridgeState()};
+                if (!bridge.Sync(chainstate.m_chain,
+                                 chainstate.m_blockman, consensus, *tip)) {
+                    throw JSONRPCError(RPC_MISC_ERROR,
+                                       "Bridge state is unavailable at the active tip");
+                }
+                bridge_index = &bridge.Index();
+            }
+            if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman,
+                              consensus, *tip, bridge_index)) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Finality state is unavailable at the active tip");
+            }
+
+            const node::FinalityTracker::State& state{tracker.Current()};
+            std::shared_ptr<const node::ValidatorSetSnapshot> set;
+            if (tip->nHeight == *modern_start - 1 &&
+                (!requested_epoch || *requested_epoch == 0)) {
+                set = tracker.SetInForceAt(*modern_start, consensus);
+            } else {
+                const uint64_t epoch{requested_epoch.value_or(state.epoch)};
+                if (epoch == 0 && state.bootstrap) {
+                    set = state.bootstrap;
+                } else if (state.current && state.current->Epoch() == epoch) {
+                    set = state.current;
+                } else if (state.previous && state.previous->Epoch() == epoch) {
+                    set = state.previous;
+                } else if (state.next && state.next->Epoch() == epoch) {
+                    set = state.next;
+                }
+            }
+            if (!set) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    "Requested validator set is not retained in the current finality window");
+            }
+
+            const size_t offset{static_cast<size_t>(raw_offset)};
+            const size_t count{static_cast<size_t>(raw_count)};
+            const size_t end{std::min(set->Size(),
+                                      offset > set->Size()
+                                          ? set->Size()
+                                          : offset + std::min(count, set->Size() - offset))};
+            const modern::ValidatorSetHeader& header{set->Header()};
+            const auto encoded_header{header.Encode()};
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("chain_domain", HexStr(*domain));
+            result.pushKV("set_hash", HexStr(set->SetHash()));
+            result.pushKV("encoded_header", HexStr(encoded_header));
+            result.pushKV("epoch", header.epoch);
+            result.pushKV("ruleset_version", header.ruleset_version);
+            result.pushKV("validator_count", header.validator_count);
+            result.pushKV("total_weight", header.total_weight);
+            result.pushKV("quorum_weight", header.quorum_weight);
+            result.pushKV("aggregate_pubkey", HexStr(header.aggregate_pubkey));
+            result.pushKV("members_root", HexStr(header.members_root));
+            if (header.epoch == 0) {
+                const int snapshot_height{*modern_start - 1};
+                if (const CBlockIndex* snapshot{
+                        chainstate.m_chain[snapshot_height]}) {
+                    result.pushKV("snapshot_height", snapshot_height);
+                    result.pushKV("snapshot_block_hash",
+                                  HexStr(snapshot->GetBlockHash()));
+                    result.pushKV("snapshot_block_hash_b3",
+                                  snapshot->GetBlockHash().GetHex());
+                }
+            }
+            result.pushKV("offset", static_cast<uint64_t>(offset));
+            if (end < set->Size()) {
+                result.pushKV("next_offset", static_cast<uint64_t>(end));
+            }
+            UniValue members{UniValue::VARR};
+            for (size_t i{offset}; i < end; ++i) {
+                const node::ValidatorSetMember& member{set->Members()[i]};
+                UniValue entry{UniValue::VOBJ};
+                entry.pushKV("index", static_cast<uint64_t>(i));
+                entry.pushKV("validator_key", HexStr(member.validator_key));
+                entry.pushKV("bls_pubkey", HexStr(member.bls_pubkey));
+                entry.pushKV("weight", member.weight);
+                entry.pushKV("leaf", HexStr(set->Leaves()[i]));
+                members.push_back(std::move(entry));
+            }
+            result.pushKV("members", std::move(members));
+            return result;
+        },
+    };
+}
+
 static RPCHelpMan getassetstate()
 {
     return RPCHelpMan{
@@ -3751,6 +3932,124 @@ static RPCHelpMan getassetstate()
     };
 }
 
+namespace {
+
+std::string EvmHex(const std::span<const unsigned char> bytes)
+{
+    return "0x" + HexStr(bytes);
+}
+
+std::string EvmHex(const uint256& value)
+{
+    return EvmHex(std::span<const unsigned char>{value.begin(), 32});
+}
+
+struct BridgeCertificateContext {
+    bridge::FinalityRelayArtifacts artifacts;
+    int inclusion_height{-1};
+    uint256 inclusion_hash{};
+};
+
+/** Reconstruct the exact parent-derived epoch state for a historical block. */
+std::optional<BridgeCertificateContext> BuildBridgeCertificateContext(
+    Chainstate& chainstate, const Consensus::Params& consensus,
+    const CBlockIndex& inclusion, std::string& error)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    auto fail{[&](std::string message)
+                  -> std::optional<BridgeCertificateContext> {
+        error = std::move(message);
+        return std::nullopt;
+    }};
+    if (!consensus.busd_bridge ||
+        !Consensus::BridgeMintParamsReady(*consensus.busd_bridge) ||
+        !consensus.busd_bridge->withdrawal_mode ||
+        *consensus.busd_bridge->withdrawal_mode !=
+            Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 ||
+        !consensus.busd_bridge->decentralized_withdrawal) {
+        return fail("decentralized bridge consensus pins are incomplete");
+    }
+    if (!inclusion.pprev ||
+        chainstate.m_chain[inclusion.nHeight] != &inclusion) {
+        return fail("certificate block is not on the active chain");
+    }
+    const auto modern_start{Consensus::ModernPosStartHeight(consensus)};
+    const auto chain_domain{
+        consensus.legacy_final_hash
+            ? modern::ModernChainDomain(consensus.hashGenesisBlock,
+                                        *consensus.legacy_final_hash)
+            : std::nullopt};
+    if (!modern_start || !chain_domain || inclusion.nHeight < *modern_start) {
+        return fail("certificate block is before configured B3 finality");
+    }
+
+    CBlock block;
+    if (!chainstate.m_blockman.ReadBlock(block, inclusion)) {
+        return fail("certificate block data is unavailable (possibly pruned)");
+    }
+    if (block.vtx.empty()) return fail("certificate block has no coinbase");
+
+    // Replaying the public indexes to the inclusion parent makes old
+    // certificates reproducible even after their sets leave today's retained
+    // previous/current/next window. It also rejects a block from another fork.
+    node::BridgeStateTracker bridge_history;
+    if (!bridge_history.Sync(chainstate.m_chain, chainstate.m_blockman,
+                             consensus, *inclusion.pprev)) {
+        return fail("historical bridge state is unavailable at certificate parent");
+    }
+    const node::BridgeStateIndex& bridge_index{bridge_history.Index()};
+    node::FinalityTracker finality_history;
+    if (!finality_history.Sync(chainstate.m_chain, chainstate.m_blockman,
+                               consensus, *inclusion.pprev, &bridge_index)) {
+        return fail("historical finality state is unavailable at certificate parent");
+    }
+    const node::FinalityTracker::State projected{
+        finality_history.Projected(inclusion.nHeight, consensus)};
+    std::optional<modern::FinalityCertificatePair> pair;
+    if (!modern::MatchFinalityCertificateForEpoch(
+            *block.vtx.at(0),
+            [&](const uint64_t epoch) { return projected.SetSize(epoch); },
+            pair, error)) {
+        return std::nullopt;
+    }
+    if (!pair) return fail("selected block contains no finality certificate");
+    if (!finality_history.CheckBlockCertificate(
+            block, inclusion, consensus, error, &bridge_index)) {
+        return std::nullopt;
+    }
+
+    std::shared_ptr<const node::ValidatorSetSnapshot> signing;
+    std::shared_ptr<const node::ValidatorSetSnapshot> successor;
+    if (projected.current &&
+        projected.current->Epoch() == pair->finalized_block.epoch) {
+        signing = projected.current;
+        successor = projected.next;
+    } else if (projected.previous &&
+               projected.previous->Epoch() == pair->finalized_block.epoch) {
+        signing = projected.previous;
+        successor = projected.current;
+    }
+    if (!signing || !successor) {
+        return fail("certificate signing or successor set is unavailable");
+    }
+
+    const Consensus::BridgeDecentralizedWithdrawalPins& pins{
+        *consensus.busd_bridge->decentralized_withdrawal};
+    auto artifacts{bridge::BuildFinalityRelayArtifacts(
+        *chain_domain, pair->finalized_block, pair->certificate, *signing,
+        *successor, pins.max_bridge_validators, error)};
+    if (!artifacts) return std::nullopt;
+
+    BridgeCertificateContext out;
+    out.artifacts = std::move(*artifacts);
+    out.inclusion_height = inclusion.nHeight;
+    out.inclusion_hash = inclusion.GetBlockHash();
+    error.clear();
+    return out;
+}
+
+} // namespace
+
 static RPCHelpMan getbridgeinfo()
 {
     return RPCHelpMan{
@@ -3762,21 +4061,61 @@ static RPCHelpMan getbridgeinfo()
         RPCResult{RPCResult::Type::OBJ, "", "Bridge status", {
             {RPCResult::Type::STR, "status", "unconfigured | incomplete | waiting | active | state-unavailable"},
             {RPCResult::Type::BOOL, "configured", "Whether an origin asset identity is configured"},
-            {RPCResult::Type::BOOL, "ready", "Whether every consensus safety pin is populated"},
-            {RPCResult::Type::BOOL, "active", "Whether type-10 rules are active for the next block"},
+            {RPCResult::Type::BOOL, "ready", "Whether every shared inbound/contract safety pin is populated"},
+            {RPCResult::Type::BOOL, "active", "Whether inbound light-client and deposit-mint rules are active for the next block"},
+            {RPCResult::Type::BOOL, "withdrawal_active", "Whether the separately pinned irreversible burn rules are active for the next block"},
             {RPCResult::Type::BOOL, "mint_approval_open", "Whether the registry's mint-height interval is open for the next block"},
             {RPCResult::Type::NUM, "next_height", "Height evaluated by active and mint_approval_open"},
-            {RPCResult::Type::NUM, "activation_height", /*optional=*/true, "First bridge height"},
+            {RPCResult::Type::NUM, "activation_height", /*optional=*/true, "First inbound bridge height"},
+            {RPCResult::Type::NUM, "withdrawal_activation_height", /*optional=*/true, "First irreversible bridge-burn height"},
             {RPCResult::Type::NUM, "approval_last_height", /*optional=*/true, "Last mint-admission height"},
             {RPCResult::Type::STR_HEX, "asset_id", /*optional=*/true, "Chain-bound bUSD asset id"},
+            {RPCResult::Type::STR_HEX, "asset_id_evm", /*optional=*/true, "Raw AssetId bytes used by Solidity bytes32"},
             {RPCResult::Type::STR_HEX, "registry_id", /*optional=*/true, "Approved bridge registry interval id"},
+            {RPCResult::Type::STR_HEX, "registry_id_evm", /*optional=*/true, "Raw registry-id bytes used by bridge wire records"},
+            {RPCResult::Type::NUM, "ethereum_chain_id", /*optional=*/true, "Pinned Ethereum origin chain id"},
+            {RPCResult::Type::NUM, "origin_deployment_block", /*optional=*/true, "First Ethereum block relayers must scan for the pinned vault"},
             {RPCResult::Type::STR_HEX, "vault", /*optional=*/true, "Ethereum vault address"},
+            {RPCResult::Type::STR_HEX, "vault_runtime_code_hash", /*optional=*/true, "Pinned extcodehash of the immutable Ethereum vault"},
             {RPCResult::Type::STR_HEX, "token", /*optional=*/true, "Ethereum token address"},
+            {RPCResult::Type::STR_HEX, "implementation_or_adapter", /*optional=*/true, "Pinned origin-token implementation or deposit-adapter commitment"},
+            {RPCResult::Type::NUM, "adapter_version", /*optional=*/true, "Pinned deposit-adapter rules version"},
+            {RPCResult::Type::NUM, "recipient_encoding_version", /*optional=*/true, "Pinned B3 recipient encoding version"},
+            {RPCResult::Type::NUM, "origin_decimals", /*optional=*/true, "Pinned origin-token decimals"},
+            {RPCResult::Type::NUM, "asset_decimals", /*optional=*/true, "Pinned B3 asset decimals"},
+            {RPCResult::Type::STR_HEX, "trusted_checkpoint_root", /*optional=*/true, "Release-pinned Ethereum beacon checkpoint root"},
+            {RPCResult::Type::NUM, "trusted_checkpoint_slot", /*optional=*/true, "Release-pinned Ethereum beacon checkpoint slot"},
+            {RPCResult::Type::STR_HEX, "genesis_validators_root", /*optional=*/true, "Pinned Ethereum genesis validators root"},
+            {RPCResult::Type::ARR, "ethereum_fork_schedule", /*optional=*/true, "Pinned Ethereum fork versions",
+             {{RPCResult::Type::OBJ, "", "Fork pin",
+               {
+                   {RPCResult::Type::NUM, "activation_epoch", "First epoch using this fork version"},
+                   {RPCResult::Type::STR_HEX, "fork_version", "Four-byte Ethereum fork version"},
+               }}}},
+            {RPCResult::Type::NUM, "fork_schedule_valid_through_epoch", /*optional=*/true, "Last Ethereum epoch covered by the pinned fork schedule"},
+            {RPCResult::Type::NUM, "electra_epoch", /*optional=*/true, "Pinned first Electra epoch"},
+            {RPCResult::Type::NUM, "min_sync_committee_participants", /*optional=*/true, "Required Ethereum sync-committee participation"},
+            {RPCResult::Type::NUM, "max_sync_lag_slots", /*optional=*/true, "Maximum accepted Ethereum finality lag in slots"},
             {RPCResult::Type::STR, "withdrawal_mode", /*optional=*/true, "managed-v1 or decentralized-verifier-v1"},
             {RPCResult::Type::STR_HEX, "managed_authority", /*optional=*/true, "Pinned public managed withdrawal authority"},
+            {RPCResult::Type::STR_HEX, "decentralized_verifier", /*optional=*/true, "Pinned Ethereum B3 finality verifier address"},
+            {RPCResult::Type::STR_HEX, "decentralized_verifier_code_hash", /*optional=*/true, "Pinned verifier runtime-code hash"},
+            {RPCResult::Type::STR_HEX, "bootstrap_validator_set_hash", /*optional=*/true, "Pinned four-key deployment bootstrap set hash"},
+            {RPCResult::Type::NUM, "withdrawal_rules_version", /*optional=*/true, "Pinned decentralized withdrawal-rules version"},
+            {RPCResult::Type::STR_HEX, "withdrawal_rules_commitment", /*optional=*/true, "Pinned decentralized withdrawal-rules commitment"},
+            {RPCResult::Type::NUM, "min_bridge_validators", /*optional=*/true, "Minimum bridge-authorizing validator count"},
+            {RPCResult::Type::NUM, "max_bridge_validators", /*optional=*/true, "Maximum gas-benchmarked bridge-authorizing validator count"},
+            {RPCResult::Type::NUM, "min_bridge_total_weight", /*optional=*/true, "Minimum bridge-authorizing validator weight in whole modern B3"},
+            {RPCResult::Type::NUM, "max_epoch_lag", /*optional=*/true, "Maximum verifier epoch lag in seconds"},
             {RPCResult::Type::BOOL, "state_available", "Whether the bridge index is synced to the active tip"},
             {RPCResult::Type::BOOL, "light_client_bootstrapped", "Whether a trusted Ethereum light client is connected"},
+            {RPCResult::Type::NUM, "light_client_period", /*optional=*/true, "Current Ethereum sync-committee period"},
+            {RPCResult::Type::STR_HEX, "current_sync_committee_root", /*optional=*/true, "SSZ root of the current sync committee"},
+            {RPCResult::Type::STR_HEX, "next_sync_committee_root", /*optional=*/true, "SSZ root of the known next sync committee"},
+            {RPCResult::Type::NUM, "light_client_connected_height", /*optional=*/true, "B3 height of the latest light-client state change"},
+            {RPCResult::Type::STR_HEX, "light_client_connected_block", /*optional=*/true, "B3 block of the latest light-client state change"},
             {RPCResult::Type::NUM, "finalized_beacon_slot", /*optional=*/true, "Latest finalized Ethereum beacon slot"},
+            {RPCResult::Type::STR_HEX, "finalized_beacon_root", /*optional=*/true, "SSZ root of the latest finalized beacon header"},
             {RPCResult::Type::NUM, "finalized_execution_block", /*optional=*/true, "Latest finalized Ethereum execution block"},
             {RPCResult::Type::STR_HEX, "finalized_execution_hash", /*optional=*/true, "Latest finalized execution hash"},
             {RPCResult::Type::NUM, "anchors", "Retained finalized/backfilled execution anchors"},
@@ -3786,6 +4125,7 @@ static RPCHelpMan getbridgeinfo()
             {RPCResult::Type::NUM, "minted_this_epoch", /*optional=*/true, "Raw bUSD units minted in the current epoch"},
             {RPCResult::Type::NUM, "max_per_block", /*optional=*/true, "Raw bUSD mint cap per block"},
             {RPCResult::Type::NUM, "max_per_epoch", /*optional=*/true, "Raw bUSD mint cap per epoch"},
+            {RPCResult::Type::NUM, "mint_epoch_length_blocks", /*optional=*/true, "Number of B3 blocks in one bridge mint-cap epoch"},
         }},
         RPCExamples{HelpExampleCli("getbridgeinfo", "") +
                     HelpExampleRpc("getbridgeinfo", "")},
@@ -3803,18 +4143,51 @@ static RPCHelpMan getbridgeinfo()
             result.pushKV("configured", has_identity);
             result.pushKV("ready", ready);
             if (has_identity) {
+                result.pushKV("ethereum_chain_id",
+                              configured->asset.origin_chain_id);
+                if (configured->origin_deployment_block) {
+                    result.pushKV("origin_deployment_block",
+                                  *configured->origin_deployment_block);
+                }
                 result.pushKV("vault", HexStr(configured->asset.vault_address));
+                if (configured->vault_runtime_code_hash) {
+                    result.pushKV("vault_runtime_code_hash",
+                                  HexStr(*configured->vault_runtime_code_hash));
+                }
                 result.pushKV("token", HexStr(configured->asset.token_address));
+                if (configured->implementation_or_adapter) {
+                    result.pushKV("implementation_or_adapter",
+                                  HexStr(*configured->implementation_or_adapter));
+                }
+                if (configured->adapter_version) {
+                    result.pushKV("adapter_version",
+                                  *configured->adapter_version);
+                }
+                if (configured->recipient_encoding_version) {
+                    result.pushKV("recipient_encoding_version",
+                                  *configured->recipient_encoding_version);
+                }
+                result.pushKV("origin_decimals",
+                              configured->asset.origin_decimals);
+                result.pushKV("asset_decimals",
+                              configured->asset.asset_decimals);
                 if (const auto asset{modern::ConfiguredBridgeAssetId(consensus)}) {
                     result.pushKV("asset_id", asset->GetHex());
+                    result.pushKV("asset_id_evm", EvmHex(*asset));
                 }
             }
             if (ready) {
                 if (const auto registry{
                         modern::ConfiguredBridgeRegistryId(consensus)}) {
                     result.pushKV("registry_id", registry->GetHex());
+                    result.pushKV("registry_id_evm", EvmHex(*registry));
                 }
                 result.pushKV("activation_height", *configured->activation_height);
+                if (consensus.bridge_withdrawal_activation_height) {
+                    result.pushKV(
+                        "withdrawal_activation_height",
+                        *consensus.bridge_withdrawal_activation_height);
+                }
                 if (configured->approval_last_height) {
                     result.pushKV("approval_last_height",
                                   *configured->approval_last_height);
@@ -3829,11 +4202,75 @@ static RPCHelpMan getbridgeinfo()
                     result.pushKV(
                         "managed_authority",
                         HexStr(configured->managed_withdrawal->authority_address));
+                    result.pushKV(
+                        "withdrawal_rules_version",
+                        configured->managed_withdrawal->withdrawal_rules_version);
+                    result.pushKV(
+                        "withdrawal_rules_commitment",
+                        HexStr(configured->managed_withdrawal
+                                   ->withdrawal_rules_commitment));
                 }
+                if (configured->decentralized_withdrawal) {
+                    const auto& withdrawal{
+                        *configured->decentralized_withdrawal};
+                    result.pushKV(
+                        "decentralized_verifier",
+                        HexStr(withdrawal.ethereum_verifier_address));
+                    result.pushKV(
+                        "decentralized_verifier_code_hash",
+                        HexStr(withdrawal.ethereum_verifier_code_hash));
+                    result.pushKV(
+                        "bootstrap_validator_set_hash",
+                        HexStr(withdrawal.bootstrap_validator_set_hash));
+                    result.pushKV("withdrawal_rules_version",
+                                  withdrawal.withdrawal_rules_version);
+                    result.pushKV(
+                        "withdrawal_rules_commitment",
+                        HexStr(withdrawal.withdrawal_rules_commitment));
+                    result.pushKV("min_bridge_validators",
+                                  withdrawal.min_bridge_validators);
+                    result.pushKV("max_bridge_validators",
+                                  withdrawal.max_bridge_validators);
+                    result.pushKV("min_bridge_total_weight",
+                                  withdrawal.min_bridge_total_weight);
+                    result.pushKV("max_epoch_lag",
+                                  withdrawal.max_epoch_lag);
+                }
+                result.pushKV(
+                    "trusted_checkpoint_root",
+                    HexStr(configured->light_client->trusted_checkpoint_root));
+                result.pushKV("trusted_checkpoint_slot",
+                              configured->light_client->trusted_checkpoint_slot);
+                result.pushKV(
+                    "genesis_validators_root",
+                    HexStr(configured->light_client->genesis_validators_root));
+                UniValue forks{UniValue::VARR};
+                for (const auto& fork :
+                     configured->light_client->fork_schedule) {
+                    UniValue entry{UniValue::VOBJ};
+                    entry.pushKV("activation_epoch",
+                                 fork.activation_epoch);
+                    entry.pushKV("fork_version",
+                                 HexStr(fork.fork_version));
+                    forks.push_back(std::move(entry));
+                }
+                result.pushKV("ethereum_fork_schedule", std::move(forks));
+                result.pushKV(
+                    "fork_schedule_valid_through_epoch",
+                    configured->light_client->fork_schedule_valid_through_epoch);
+                result.pushKV("electra_epoch",
+                              configured->light_client->electra_epoch);
+                result.pushKV(
+                    "min_sync_committee_participants",
+                    configured->light_client->min_sync_committee_participants);
+                result.pushKV("max_sync_lag_slots",
+                              configured->light_client->max_sync_lag_slots);
                 result.pushKV("max_per_block",
                               configured->mint_caps->max_per_block);
                 result.pushKV("max_per_epoch",
                               configured->mint_caps->max_per_epoch);
+                result.pushKV("mint_epoch_length_blocks",
+                              configured->mint_caps->epoch_length_blocks);
             }
 
             LOCK(cs_main);
@@ -3842,11 +4279,15 @@ static RPCHelpMan getbridgeinfo()
             const int next_height{tip ? tip->nHeight + 1 : 0};
             const bool active{
                 ready && Consensus::BridgeRulesActive(next_height, consensus)};
+            const bool withdrawal_active{
+                ready && Consensus::BridgeWithdrawalRulesActive(next_height,
+                                                                consensus)};
             const bool approval_open{
                 active && next_height >= *configured->activation_height &&
                 (!configured->approval_last_height ||
                  next_height <= *configured->approval_last_height)};
             result.pushKV("active", active);
+            result.pushKV("withdrawal_active", withdrawal_active);
             result.pushKV("mint_approval_open", approval_open);
             result.pushKV("next_height", next_height);
 
@@ -3871,13 +4312,30 @@ static RPCHelpMan getbridgeinfo()
                 "managed_withdrawals",
                 index ? static_cast<uint64_t>(index->WithdrawalCount()) : 0);
             if (index && index->LightClient()) {
+                const bridge::LightClientStore& store{*index->LightClient()};
                 const bridge::LightClientHeader& finalized{
-                    index->LightClient()->finalized_header};
+                    store.finalized_header};
+                result.pushKV("light_client_period", store.period);
+                result.pushKV("current_sync_committee_root",
+                              HexStr(store.current.HashTreeRoot()));
+                if (store.next) {
+                    result.pushKV("next_sync_committee_root",
+                                  HexStr(store.next->HashTreeRoot()));
+                }
+                if (const auto& connection{
+                        index->LightClientLastConnected()}) {
+                    result.pushKV("light_client_connected_height",
+                                  connection->height);
+                    result.pushKV("light_client_connected_block",
+                                  connection->block_hash.GetHex());
+                }
                 result.pushKV("finalized_beacon_slot", finalized.beacon.slot);
+                result.pushKV("finalized_beacon_root",
+                              HexStr(finalized.beacon.HashTreeRoot()));
                 result.pushKV("finalized_execution_block",
                               finalized.execution.block_number);
                 result.pushKV("finalized_execution_hash",
-                              finalized.execution.block_hash.GetHex());
+                              HexStr(finalized.execution.block_hash));
             }
             if (index && active) {
                 const auto asset{modern::ConfiguredBridgeAssetId(consensus)};
@@ -3903,6 +4361,742 @@ static RPCHelpMan getbridgeinfo()
             } else {
                 result.pushKV("status", "active");
             }
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan getbridgelightclientstore()
+{
+    return RPCHelpMan{
+        "getbridgelightclientstore",
+        "Export the newest retained exact Ethereum LightClientStore whose B3 "
+        "connection is covered by B3 finality. The result can be saved directly as "
+        "store.json for b3-bridge-ethcheck. This RPC fails closed while the "
+        "store, its active-chain connection, or B3 finality is unavailable.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "Finalized light-client store snapshot",
+                  {
+                      {RPCResult::Type::NUM, "version", "Snapshot format version"},
+                      {RPCResult::Type::OBJ, "connection", "B3 block containing the latest store change",
+                       {
+                           {RPCResult::Type::NUM, "height", "Active-chain B3 height"},
+                           {RPCResult::Type::STR_HEX, "block_hash", "B3 block hash in ordinary display order"},
+                       }},
+                      {RPCResult::Type::OBJ, "b3_finalized", "B3 checkpoint proving the connection is final",
+                       {
+                           {RPCResult::Type::NUM, "height", "Finalized B3 height"},
+                           {RPCResult::Type::STR_HEX, "block_hash", "Finalized B3 block hash in ordinary display order"},
+                       }},
+                      {RPCResult::Type::OBJ, "store", "Exact Ethereum light-client store",
+                       {
+                           {RPCResult::Type::OBJ, "finalized_header", "Beacon header, execution header, and execution branch"},
+                           {RPCResult::Type::NUM, "period", "Current Ethereum sync-committee period"},
+                           {RPCResult::Type::OBJ, "current_sync_committee", "All 512 current public keys and aggregate key"},
+                           {RPCResult::Type::OBJ, "next_sync_committee", /*optional=*/true, "All 512 next public keys and aggregate key"},
+                       }},
+                  }},
+        RPCExamples{HelpExampleCli("getbridgelightclientstore", "") +
+                    HelpExampleRpc("getbridgelightclientstore", "")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            if (!consensus.busd_bridge ||
+                !Consensus::BridgeMintParamsReady(*consensus.busd_bridge)) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "Bridge consensus pins are incomplete");
+            }
+
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            if (!tip) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Active chain has no tip");
+            }
+            node::BridgeStateTracker& bridge_tracker{
+                chainstate.ModernBridgeState()};
+            if (!bridge_tracker.Sync(chainstate.m_chain,
+                                     chainstate.m_blockman, consensus, *tip)) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Bridge state is unavailable at the active tip");
+            }
+            const node::BridgeStateIndex& index{bridge_tracker.Index()};
+            if (!index.LightClient() || !index.LightClientLastConnected()) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Ethereum light client is not connected on B3");
+            }
+
+            node::FinalityTracker& finality_tracker{
+                chainstate.ModernFinality()};
+            if (!finality_tracker.Sync(chainstate.m_chain,
+                                       chainstate.m_blockman, consensus, *tip,
+                                       &index)) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "B3 finality state is unavailable at the active tip");
+            }
+            const auto& finalized{finality_tracker.Current().finalized};
+            if (!finalized) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "B3 has not finalized the light-client connection");
+            }
+            const auto snapshot{index.FinalizedLightClientSnapshot(
+                finalized->height)};
+            if (!snapshot) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "No retained light-client connection is yet B3-finalized");
+            }
+            const node::BridgeStateConnection& connection{
+                snapshot->connection};
+            const CBlockIndex* connection_index{
+                chainstate.m_chain[connection.height]};
+            const CBlockIndex* finalized_index{
+                chainstate.m_chain[finalized->height]};
+            if (!connection_index ||
+                connection_index->GetBlockHash() != connection.block_hash ||
+                !finalized_index ||
+                finalized_index->GetBlockHash() != finalized->block_hash) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "Light-client snapshot is not tied to the active finalized chain");
+            }
+
+            return bridge::lcjson::StoreSnapshotJson(
+                snapshot->store,
+                static_cast<uint64_t>(connection.height),
+                connection.block_hash,
+                static_cast<uint64_t>(finalized->height),
+                finalized->block_hash);
+        },
+    };
+}
+
+static RPCHelpMan getbridgeanchorforblock()
+{
+    return RPCHelpMan{
+        "getbridgeanchorforblock",
+        "Find the nearest retained Ethereum execution anchor at or after a "
+        "target block that is usable from B3-finalized bridge state. The "
+        "anchor can start a bounded historical ancestry proof, allowing a "
+        "fresh relayer to recover older deposits without trusting its local "
+        "cursor. Ethereum hashes use ordinary Ethereum byte order. This RPC "
+        "fails closed unless bridge state and B3 finality are both available.\n",
+        {
+            {"target_block", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "Ethereum execution block that the ancestry proof must reach"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Historical bridge anchor selection",
+                  {
+                      {RPCResult::Type::NUM, "target_block", "Requested Ethereum execution block"},
+                      {RPCResult::Type::BOOL, "found", "Whether a suitable retained anchor exists"},
+                      {RPCResult::Type::NUM, "b3_finalized_height", "B3 height covering the selection"},
+                      {RPCResult::Type::STR_HEX, "b3_finalized_block", "Active finalized B3 block hash"},
+                      {RPCResult::Type::NUM, "block_number", /*optional=*/true, "Selected Ethereum execution block number"},
+                      {RPCResult::Type::STR_HEX, "block_hash", /*optional=*/true, "Selected Ethereum execution block hash"},
+                      {RPCResult::Type::STR_HEX, "receipts_root", /*optional=*/true, "Selected Ethereum receipts root"},
+                      {RPCResult::Type::NUM, "source_finalized_beacon_slot", /*optional=*/true, "Finalized beacon slot from which this anchor descends"},
+                      {RPCResult::Type::NUM, "source_finalized_execution_block", /*optional=*/true, "Directly finalized Ethereum execution origin"},
+                      {RPCResult::Type::NUM, "execution_timestamp", /*optional=*/true, "Selected Ethereum execution timestamp"},
+                      {RPCResult::Type::NUM, "connected_height", /*optional=*/true, "B3 height that retained this anchor"},
+                      {RPCResult::Type::STR_HEX, "connected_block", /*optional=*/true, "Active B3 block that retained this anchor"},
+                  }},
+        RPCExamples{HelpExampleCli("getbridgeanchorforblock", "19000000") +
+                    HelpExampleRpc("getbridgeanchorforblock", "19000000")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const uint64_t target_block{
+                request.params[0].getInt<uint64_t>()};
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            if (!consensus.busd_bridge ||
+                !Consensus::BridgeMintParamsReady(*consensus.busd_bridge)) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Bridge consensus pins are incomplete");
+            }
+
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            if (!tip) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Active chain has no tip");
+            }
+
+            node::BridgeStateTracker& bridge_tracker{
+                chainstate.ModernBridgeState()};
+            if (!bridge_tracker.Sync(chainstate.m_chain,
+                                     chainstate.m_blockman, consensus, *tip)) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "Bridge state is unavailable at the active tip");
+            }
+            const node::BridgeStateIndex& index{bridge_tracker.Index()};
+
+            node::FinalityTracker& finality_tracker{
+                chainstate.ModernFinality()};
+            if (!finality_tracker.Sync(chainstate.m_chain,
+                                       chainstate.m_blockman, consensus, *tip,
+                                       &index)) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "B3 finality state is unavailable at the active tip");
+            }
+            const auto& finalized{finality_tracker.Current().finalized};
+            if (!finalized) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "B3 has not finalized a bridge execution anchor");
+            }
+            const CBlockIndex* finalized_index{
+                chainstate.m_chain[finalized->height]};
+            if (!finalized_index ||
+                finalized_index->GetBlockHash() != finalized->block_hash) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "B3 finality checkpoint is not on the active chain");
+            }
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("target_block", target_block);
+            result.pushKV("b3_finalized_height", finalized->height);
+            result.pushKV("b3_finalized_block",
+                          finalized->block_hash.GetHex());
+            const auto anchor{
+                index.AnchorForTarget(target_block, finalized->height)};
+            result.pushKV("found", anchor.has_value());
+            if (!anchor) return result;
+
+            const CBlockIndex* connection_index{
+                anchor->connected_height < 0
+                    ? nullptr
+                    : chainstate.m_chain[anchor->connected_height]};
+            if (!connection_index ||
+                connection_index->GetBlockHash() != anchor->connected_block ||
+                anchor->connected_height > finalized->height) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "Selected bridge anchor is not tied to the active finalized chain");
+            }
+
+            result.pushKV("block_number", anchor->block_number);
+            result.pushKV("block_hash", HexStr(anchor->block_hash));
+            result.pushKV("receipts_root", HexStr(anchor->receipts_root));
+            result.pushKV("source_finalized_beacon_slot",
+                          anchor->source_finalized_beacon_slot);
+            result.pushKV("source_finalized_execution_block",
+                          anchor->source_finalized_execution_block);
+            result.pushKV("execution_timestamp", anchor->execution_timestamp);
+            result.pushKV("connected_height", anchor->connected_height);
+            result.pushKV("connected_block", anchor->connected_block.GetHex());
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan getbridgeproofstatus()
+{
+    return RPCHelpMan{
+        "getbridgeproofstatus",
+        "Query the active-chain bridge state needed for safe relayer crash "
+        "recovery. Ethereum hashes use their ordinary byte order (the same "
+        "order returned by Ethereum JSON-RPC). A query never changes bridge "
+        "state and exposes no wallet data.\n",
+        {
+            {"execution_hash", RPCArg::Type::STR_HEX,
+             RPCArg::Optional::OMITTED,
+             "Ethereum execution block hash to look up (optional 0x prefix)"},
+            {"deposit_id", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
+             "Configured vault deposit id to check for an existing mint"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Bridge proof status",
+                  {
+                      {RPCResult::Type::BOOL, "state_available", "Whether the bridge index is synced to the active tip"},
+                      {RPCResult::Type::OBJ, "anchor", /*optional=*/true, "Requested execution anchor",
+                       {
+                           {RPCResult::Type::STR_HEX, "hash", "Requested Ethereum execution hash"},
+                           {RPCResult::Type::BOOL, "known", "Whether the anchor is retained"},
+                           {RPCResult::Type::NUM, "block_number", /*optional=*/true, "Ethereum execution block number"},
+                           {RPCResult::Type::STR_HEX, "receipts_root", /*optional=*/true, "Ethereum receipts root"},
+                           {RPCResult::Type::NUM, "source_finalized_beacon_slot", /*optional=*/true, "Finalized beacon slot from which this anchor descends"},
+                           {RPCResult::Type::NUM, "execution_timestamp", /*optional=*/true, "Ethereum execution timestamp"},
+                           {RPCResult::Type::NUM, "connected_height", /*optional=*/true, "B3 height that retained the anchor"},
+                           {RPCResult::Type::STR_HEX, "connected_block", /*optional=*/true, "B3 block that retained the anchor"},
+                       }},
+                      {RPCResult::Type::OBJ, "deposit", /*optional=*/true, "Requested configured-vault deposit",
+                       {
+                           {RPCResult::Type::NUM, "deposit_id", "Ethereum vault deposit id"},
+                           {RPCResult::Type::BOOL, "claimed", "Whether B3 has already minted this deposit"},
+                           {RPCResult::Type::NUM, "claimed_height", /*optional=*/true, "B3 height that claimed the deposit"},
+                           {RPCResult::Type::STR_HEX, "claimed_block", /*optional=*/true, "B3 block that claimed the deposit"},
+                       }},
+                  }},
+        RPCExamples{HelpExampleCli(
+            "getbridgeproofstatus",
+            "\"<ethereum_execution_hash>\" 42")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            std::optional<uint256> requested_hash;
+            if (!request.params[0].isNull()) {
+                if (!request.params[0].isStr()) {
+                    throw JSONRPCError(RPC_TYPE_ERROR,
+                                       "execution_hash must be a hexadecimal string");
+                }
+                std::string hex{request.params[0].get_str()};
+                if (hex.starts_with("0x") || hex.starts_with("0X")) {
+                    hex.erase(0, 2);
+                }
+                if (hex.size() != 64 || !IsHex(hex)) {
+                    throw JSONRPCError(
+                        RPC_INVALID_PARAMETER,
+                        "execution_hash must contain exactly 32 hexadecimal bytes");
+                }
+                const std::vector<unsigned char> bytes{ParseHex(hex)};
+                requested_hash.emplace(
+                    std::span<const unsigned char>{bytes.data(), bytes.size()});
+            }
+            const std::optional<uint64_t> deposit_id{
+                request.params[1].isNull()
+                    ? std::nullopt
+                    : std::optional<uint64_t>{
+                          request.params[1].getInt<uint64_t>()}};
+            if (!requested_hash && !deposit_id) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    "provide execution_hash, deposit_id, or both");
+            }
+
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            UniValue result{UniValue::VOBJ};
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            const bool ready{
+                consensus.busd_bridge &&
+                Consensus::BridgeMintParamsReady(*consensus.busd_bridge)};
+            const node::BridgeStateIndex* index{nullptr};
+            bool state_available{false};
+            if (ready && tip) {
+                node::BridgeStateTracker& tracker{
+                    chainstate.ModernBridgeState()};
+                state_available = tracker.Sync(
+                    chainstate.m_chain, chainstate.m_blockman, consensus,
+                    *tip);
+                if (state_available) index = &tracker.Index();
+            }
+            result.pushKV("state_available", state_available);
+
+            if (requested_hash) {
+                UniValue anchor_json{UniValue::VOBJ};
+                anchor_json.pushKV("hash", HexStr(*requested_hash));
+                const auto anchor{
+                    index ? index->Anchor(*requested_hash) : std::nullopt};
+                anchor_json.pushKV("known", anchor.has_value());
+                if (anchor) {
+                    anchor_json.pushKV("block_number", anchor->block_number);
+                    anchor_json.pushKV("receipts_root",
+                                       HexStr(anchor->receipts_root));
+                    anchor_json.pushKV("source_finalized_beacon_slot",
+                                       anchor->source_finalized_beacon_slot);
+                    anchor_json.pushKV("execution_timestamp",
+                                       anchor->execution_timestamp);
+                    anchor_json.pushKV("connected_height",
+                                       anchor->connected_height);
+                    anchor_json.pushKV("connected_block",
+                                       anchor->connected_block.GetHex());
+                }
+                result.pushKV("anchor", std::move(anchor_json));
+            }
+            if (deposit_id) {
+                UniValue deposit_json{UniValue::VOBJ};
+                deposit_json.pushKV("deposit_id", *deposit_id);
+                const bridge::BridgeDepositKey key{
+                    consensus.busd_bridge
+                        ? consensus.busd_bridge->asset.origin_chain_id
+                        : 0,
+                    consensus.busd_bridge
+                        ? consensus.busd_bridge->asset.vault_address
+                        : bridge::EthAddress{},
+                    *deposit_id};
+                const bool claimed{
+                    index && consensus.busd_bridge && index->IsNullified(key)};
+                deposit_json.pushKV("claimed", claimed);
+                if (claimed) {
+                    if (const auto connection{
+                            index->NullifierConnection(key)}) {
+                        deposit_json.pushKV("claimed_height",
+                                            connection->height);
+                        deposit_json.pushKV("claimed_block",
+                                            connection->block_hash.GetHex());
+                    }
+                }
+                result.pushKV("deposit", std::move(deposit_json));
+            }
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan getbridgefinalityproof()
+{
+    return RPCHelpMan{
+        "getbridgefinalityproof",
+        "Build the exact permissionless Ethereum calldata for the B3 finality "
+        "certificate carried by an active-chain block. Historical state is "
+        "reconstructed from validated block data; pruned, non-active, "
+        "malformed, or mismatched certificates fail closed. "
+        "This RPC handles no Ethereum private key. The account that submits "
+        "the returned calldata pays Ethereum gas.\n",
+        {
+            {"hash_or_height", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "Active-chain block containing the certificate",
+             RPCArgOptions{.skip_type_check = true,
+                           .type_str = {"", "string or numeric"}}},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Ethereum finality relay artifacts",
+                  {
+                      {RPCResult::Type::NUM, "inclusion_height", "B3 certificate inclusion height"},
+                      {RPCResult::Type::STR_HEX, "inclusion_block", "B3 display-order inclusion hash"},
+                      {RPCResult::Type::STR_HEX, "inclusion_block_evm", "Raw inclusion hash bytes"},
+                      {RPCResult::Type::NUM, "finalized_height", "Certified B3 height"},
+                      {RPCResult::Type::STR_HEX, "finalized_block", "B3 display-order certified hash"},
+                      {RPCResult::Type::STR_HEX, "finalized_block_evm", "Raw certified hash bytes used by Solidity"},
+                      {RPCResult::Type::STR_HEX, "withdrawal_root", "Certified withdrawal root"},
+                      {RPCResult::Type::NUM, "epoch", "Signing-set epoch"},
+                      {RPCResult::Type::STR_HEX, "signing_set_hash", "Signing-set hash"},
+                      {RPCResult::Type::STR_HEX, "successor_set_hash", "Committed successor-set hash"},
+                      {RPCResult::Type::NUM, "validator_count", "Signing-set member count"},
+                      {RPCResult::Type::NUM, "signer_count", "Bitmap signer count"},
+                      {RPCResult::Type::NUM, "signed_weight", "Signed weight in whole modern B3"},
+                      {RPCResult::Type::STR_HEX, "signer_bitmap", "LSB-first signer bitmap"},
+                      {RPCResult::Type::ARR, "absent_indices", "Non-signer indices represented by ordered membership witnesses",
+                       {{RPCResult::Type::NUM, "", "Absent validator index"}}},
+                      {RPCResult::Type::STR_HEX, "proof", "ABI-encoded BlsCertificateProver proof"},
+                      {RPCResult::Type::NUM, "ethereum_chain_id", "Pinned destination chain id"},
+                      {RPCResult::Type::STR_HEX, "contract", "Pinned B3FinalityVerifier address"},
+                      {RPCResult::Type::STR_HEX, "calldata", "Exact B3FinalityVerifier.submitCertificate calldata"},
+                      {RPCResult::Type::BOOL, "private_key_required_by_rpc", "Always false"},
+                      {RPCResult::Type::STR, "gas_payer", "Who pays Ethereum transaction gas"},
+                  }},
+        RPCExamples{HelpExampleCli("getbridgefinalityproof", "811002")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const CBlockIndex* inclusion{
+                ParseHashOrHeight(request.params[0], chainman)};
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            if (!inclusion ||
+                chainstate.m_chain[inclusion->nHeight] != inclusion) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                                   "Certificate block is not on the active chain");
+            }
+            std::string error;
+            auto context{BuildBridgeCertificateContext(
+                chainstate, chainman.GetConsensus(), *inclusion, error)};
+            if (!context) throw JSONRPCError(RPC_MISC_ERROR, error);
+            const bridge::FinalityRelayArtifacts& artifacts{
+                context->artifacts};
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("inclusion_height", context->inclusion_height);
+            result.pushKV("inclusion_block", context->inclusion_hash.GetHex());
+            result.pushKV("inclusion_block_evm", EvmHex(context->inclusion_hash));
+            result.pushKV("finalized_height", artifacts.finalized_block.height);
+            result.pushKV("finalized_block",
+                          artifacts.finalized_block.block_hash.GetHex());
+            result.pushKV("finalized_block_evm",
+                          EvmHex(artifacts.finalized_block.block_hash));
+            result.pushKV("withdrawal_root",
+                          EvmHex(artifacts.finalized_block.withdrawal_root));
+            result.pushKV("epoch", artifacts.finalized_block.epoch);
+            result.pushKV("signing_set_hash",
+                          EvmHex(modern::ValidatorSetHash(
+                              artifacts.signing_set)));
+            result.pushKV("successor_set_hash",
+                          EvmHex(modern::ValidatorSetHash(
+                              artifacts.successor_set)));
+            result.pushKV("validator_count",
+                          artifacts.signing_set.validator_count);
+            result.pushKV("signer_count", artifacts.signer_count);
+            result.pushKV("signed_weight", artifacts.signed_weight);
+            result.pushKV("signer_bitmap", EvmHex(artifacts.signer_bitmap));
+            UniValue absent{UniValue::VARR};
+            for (const bridge::BootstrapAbsentWitness& witness :
+                 artifacts.absent) {
+                absent.push_back(witness.index);
+            }
+            result.pushKV("absent_indices", std::move(absent));
+            result.pushKV("proof", EvmHex(artifacts.proof_abi));
+            const auto& bridge_params{*chainman.GetConsensus().busd_bridge};
+            result.pushKV("ethereum_chain_id",
+                          bridge_params.asset.origin_chain_id);
+            result.pushKV(
+                "contract",
+                EvmHex(bridge_params.decentralized_withdrawal
+                           ->ethereum_verifier_address));
+            result.pushKV("calldata", EvmHex(artifacts.submit_calldata));
+            result.pushKV("private_key_required_by_rpc", false);
+            result.pushKV("gas_payer", "permissionless Ethereum submitter");
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan getbridgewithdrawalproof()
+{
+    return RPCHelpMan{
+        "getbridgewithdrawalproof",
+        "Build the exact ordered depth-32 proof and permissionless Ethereum "
+        "calldata for a confirmed decentralized bUSD burn, identified by its "
+        "stable transaction id and BURN output. The consensus withdrawal id "
+        "and leaf are resolved only from active-chain state; an unconfirmed or "
+        "reorganized burn fails closed. By default the latest active-chain B3 "
+        "certificate is used; certificate_block may select an older active-"
+        "chain certificate that already includes the withdrawal. "
+        "Its root must still be current in the Ethereum verifier. "
+        "Every request field, active-chain connection, leaf, prefix, and "
+        "finalized root is recomputed. This RPC handles no Ethereum private "
+        "key. The account that submits the returned calldata pays gas.\n",
+        {
+            {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Confirmed B3 bridge-burn transaction id"},
+            {"burn_vout", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "Exact bUSD BURN output index returned by bridgewithdraw"},
+            {"certificate_block", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
+             "Active-chain certificate inclusion hash or height (default: latest)",
+             RPCArgOptions{.skip_type_check = true,
+                           .type_str = {"", "string or numeric"}}},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Ethereum release artifacts",
+                  {
+                      {RPCResult::Type::NUM, "withdrawal_id", "Withdrawal id"},
+                      {RPCResult::Type::STR_HEX, "source_txid", "B3 burn transaction id"},
+                      {RPCResult::Type::NUM, "burn_output_index", "Exact bUSD BURN output"},
+                      {RPCResult::Type::NUM, "b3_height", "B3 burn height"},
+                      {RPCResult::Type::STR_HEX, "b3_block", "Active-chain burn block"},
+                      {RPCResult::Type::STR_HEX, "asset_id", "B3 display-order AssetId"},
+                      {RPCResult::Type::STR_HEX, "asset_id_evm", "Raw AssetId bytes committed by Solidity"},
+                      {RPCResult::Type::STR_HEX, "origin_token", "Pinned Ethereum token"},
+                      {RPCResult::Type::STR_HEX, "recipient", "Ethereum recipient"},
+                      {RPCResult::Type::NUM, "amount_raw", "Raw six-decimal token amount"},
+                      {RPCResult::Type::NUM, "finalized_height", "B3 height whose root is proven"},
+                      {RPCResult::Type::STR_HEX, "finalized_block", "B3 display-order finalized hash"},
+                      {RPCResult::Type::STR_HEX, "finalized_block_evm", "Raw finalized hash bytes"},
+                      {RPCResult::Type::STR_HEX, "withdrawal_leaf", "Recomputed withdrawal leaf"},
+                      {RPCResult::Type::STR_HEX, "withdrawal_root", "Recomputed certified root"},
+                      {RPCResult::Type::ARR_FIXED, "path", "32 ordered siblings, leaf level first",
+                       {{RPCResult::Type::STR_HEX, "", "Sibling hash"}}},
+                      {RPCResult::Type::STR_HEX, "vault", "Pinned B3StakerBridge address"},
+                      {RPCResult::Type::NUM, "ethereum_chain_id", "Pinned destination chain id"},
+                      {RPCResult::Type::STR_HEX, "calldata", "Exact B3StakerBridge.release calldata"},
+                      {RPCResult::Type::BOOL, "private_key_required_by_rpc", "Always false"},
+                      {RPCResult::Type::STR, "gas_payer", "Who pays Ethereum transaction gas"},
+                  }},
+        RPCExamples{HelpExampleCli(
+            "getbridgewithdrawalproof",
+            "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\" 0")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const Txid source_txid{Txid::FromUint256(
+                ParseHashV(request.params[0], "txid"))};
+            const uint64_t raw_burn_output_index{
+                request.params[1].getInt<uint64_t>()};
+            if (raw_burn_output_index >
+                std::numeric_limits<uint32_t>::max()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "burn_vout exceeds uint32");
+            }
+            const uint32_t burn_output_index{
+                static_cast<uint32_t>(raw_burn_output_index)};
+            ChainstateManager& chainman{EnsureAnyChainman(request.context)};
+            const CBlockIndex* selected_inclusion{nullptr};
+            if (!request.params[2].isNull()) {
+                selected_inclusion =
+                    ParseHashOrHeight(request.params[2], chainman);
+            }
+
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            const CBlockIndex* tip{chainstate.m_chain.Tip()};
+            if (!tip || !consensus.busd_bridge ||
+                !Consensus::BridgeMintParamsReady(*consensus.busd_bridge) ||
+                !consensus.busd_bridge->withdrawal_mode ||
+                *consensus.busd_bridge->withdrawal_mode !=
+                    Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "Decentralized bridge consensus pins are incomplete");
+            }
+
+            node::BridgeStateTracker& bridge_tracker{
+                chainstate.ModernBridgeState()};
+            if (!bridge_tracker.Sync(chainstate.m_chain,
+                                     chainstate.m_blockman, consensus, *tip)) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Bridge state is unavailable at the active tip");
+            }
+            const node::BridgeStateIndex& index{bridge_tracker.Index()};
+            const auto confirmed_withdrawal{index.DecentralizedWithdrawal(
+                node::BridgeWithdrawalId{source_txid,
+                                         burn_output_index})};
+            if (!confirmed_withdrawal) {
+                throw JSONRPCError(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "Burn source is not a confirmed decentralized withdrawal on the active chain");
+            }
+            const uint64_t withdrawal_id{
+                confirmed_withdrawal->withdrawal.withdrawal_id};
+            node::FinalityTracker& finality_tracker{
+                chainstate.ModernFinality()};
+            if (!finality_tracker.Sync(chainstate.m_chain,
+                                       chainstate.m_blockman, consensus, *tip,
+                                       &index)) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Finality state is unavailable at the active tip");
+            }
+            if (!selected_inclusion) {
+                const auto& finalized{finality_tracker.Current().finalized};
+                if (!finalized || finalized->certified_at < 0) {
+                    throw JSONRPCError(
+                        RPC_MISC_ERROR,
+                        "B3 has no certificate covering bridge withdrawals");
+                }
+                selected_inclusion =
+                    chainstate.m_chain[finalized->certified_at];
+            }
+            if (!selected_inclusion ||
+                chainstate.m_chain[selected_inclusion->nHeight] !=
+                    selected_inclusion) {
+                throw JSONRPCError(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "Certificate block is not on the active chain");
+            }
+
+            std::string error;
+            const auto certificate{BuildBridgeCertificateContext(
+                chainstate, consensus, *selected_inclusion, error)};
+            if (!certificate) throw JSONRPCError(RPC_MISC_ERROR, error);
+            const modern::FinalizedBlock& finalized{
+                certificate->artifacts.finalized_block};
+            const auto& withdrawal_pins{
+                *consensus.busd_bridge->decentralized_withdrawal};
+            const modern::ValidatorSetHeader& signing_set{
+                certificate->artifacts.signing_set};
+            if (signing_set.validator_count <
+                    withdrawal_pins.min_bridge_validators ||
+                signing_set.validator_count >
+                    withdrawal_pins.max_bridge_validators ||
+                signing_set.total_weight <
+                    withdrawal_pins.min_bridge_total_weight) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "Selected certificate cannot authorize an Ethereum bridge root");
+            }
+            if (finalized.height > static_cast<uint64_t>(tip->nHeight)) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Certificate finalizes beyond the active tip");
+            }
+            const CBlockIndex* finalized_index{
+                chainstate.m_chain[static_cast<int>(finalized.height)]};
+            if (!finalized_index ||
+                finalized_index->GetBlockHash() != finalized.block_hash) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "Certificate finalized block is not on the active chain");
+            }
+            const auto expected_root{index.WithdrawalRootAtHeight(
+                static_cast<int>(finalized.height))};
+            if (!expected_root || *expected_root != finalized.withdrawal_root) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "Certificate withdrawal root disagrees with active bridge state");
+            }
+            const auto requests{index.DecentralizedWithdrawalsThrough(
+                static_cast<int>(finalized.height))};
+            if (!requests || withdrawal_id >= requests->size()) {
+                throw JSONRPCError(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "Withdrawal is not present in the selected finalized root");
+            }
+            if (!(requests->at(withdrawal_id) == *confirmed_withdrawal)) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "Confirmed burn source does not match the finalized withdrawal prefix");
+            }
+
+            const auto configured_asset{modern::ConfiguredBridgeAssetId(
+                consensus)};
+            if (!configured_asset) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Configured bridge AssetId is unavailable");
+            }
+            std::vector<modern::BridgeWithdrawalV1> withdrawals;
+            withdrawals.reserve(requests->size());
+            for (const node::BridgeDecentralizedWithdrawalRequest& request :
+                 *requests) {
+                const auto leaf{
+                    modern::BridgeWithdrawalLeafV1(request.withdrawal)};
+                const CBlockIndex* connected{
+                    request.connected_height < 0
+                        ? nullptr
+                        : chainstate.m_chain[request.connected_height]};
+                if (!leaf || *leaf != request.leaf || !connected ||
+                    connected->GetBlockHash() != request.connected_block ||
+                    request.withdrawal.origin_chain_id !=
+                        consensus.busd_bridge->asset.origin_chain_id ||
+                    request.withdrawal.asset_id != *configured_asset ||
+                    request.withdrawal.origin_token !=
+                        consensus.busd_bridge->asset.token_address) {
+                    throw JSONRPCError(
+                        RPC_MISC_ERROR,
+                        "Withdrawal prefix contains mismatched active-chain or asset data");
+                }
+                withdrawals.push_back(request.withdrawal);
+            }
+            auto proof{bridge::BuildWithdrawalRelayArtifacts(
+                withdrawals, withdrawal_id, *expected_root, error)};
+            if (!proof) throw JSONRPCError(RPC_MISC_ERROR, error);
+            const node::BridgeDecentralizedWithdrawalRequest& withdrawal_request{
+                requests->at(withdrawal_id)};
+            const CBlockIndex* burn_block{
+                chainstate.m_chain[withdrawal_request.connected_height]};
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("withdrawal_id", withdrawal_id);
+            result.pushKV("source_txid",
+                          withdrawal_request.transaction_id.GetHex());
+            result.pushKV("burn_output_index",
+                          withdrawal_request.burn_output_index);
+            result.pushKV("b3_height",
+                          withdrawal_request.withdrawal.b3_height);
+            result.pushKV("b3_block", burn_block->GetBlockHash().GetHex());
+            result.pushKV("asset_id", configured_asset->GetHex());
+            result.pushKV("asset_id_evm", EvmHex(*configured_asset));
+            result.pushKV("origin_token",
+                          EvmHex(withdrawal_request.withdrawal.origin_token));
+            result.pushKV(
+                "recipient", EvmHex(withdrawal_request.withdrawal.recipient));
+            result.pushKV("amount_raw",
+                          withdrawal_request.withdrawal.amount);
+            result.pushKV("finalized_height", finalized.height);
+            result.pushKV("finalized_block", finalized.block_hash.GetHex());
+            result.pushKV("finalized_block_evm",
+                          EvmHex(finalized.block_hash));
+            result.pushKV("withdrawal_leaf", EvmHex(proof->leaf));
+            result.pushKV("withdrawal_root", EvmHex(proof->root));
+            UniValue path{UniValue::VARR};
+            for (const uint256& sibling : proof->path) {
+                path.push_back(EvmHex(sibling));
+            }
+            result.pushKV("path", std::move(path));
+            result.pushKV("vault",
+                          EvmHex(consensus.busd_bridge->asset.vault_address));
+            result.pushKV("ethereum_chain_id",
+                          consensus.busd_bridge->asset.origin_chain_id);
+            result.pushKV("calldata", EvmHex(proof->release_calldata));
+            result.pushKV("private_key_required_by_rpc", false);
+            result.pushKV("gas_payer", "permissionless Ethereum submitter");
             return result;
         },
     };
@@ -3936,8 +5130,14 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &loadtxoutset},
         {"blockchain", &getchainstates},
         {"blockchain", &getfinalitystatus},
+        {"blockchain", &getfinalityset},
         {"blockchain", &getassetstate},
         {"blockchain", &getbridgeinfo},
+        {"blockchain", &getbridgelightclientstore},
+        {"blockchain", &getbridgeanchorforblock},
+        {"blockchain", &getbridgeproofstatus},
+        {"blockchain", &getbridgefinalityproof},
+        {"blockchain", &getbridgewithdrawalproof},
         {"hidden", &invalidateblock},
         {"hidden", &reconsiderblock},
         {"blockchain", &waitfornewblock},

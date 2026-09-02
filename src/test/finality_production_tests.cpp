@@ -12,20 +12,24 @@
 
 #include <chain.h>
 #include <consensus/merkle.h>
+#include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
 #include <modern/metadata_cell.h>
 #include <modern/mpa.h>
 #include <modern/policy.h>
 #include <node/finality_signature.h>
+#include <node/finality_signer_store.h>
 #include <node/finality_tracker.h>
 #include <node/miner.h>
 #include <node/staking.h>
 #include <streams.h>
 #include <test/util/finality_fixture.h>
+#include <util/fs_helpers.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <fstream>
 #include <span>
 #include <stdexcept>
 
@@ -193,7 +197,8 @@ BOOST_FIXTURE_TEST_CASE(staking_loop_signs_aggregates_and_finalizes, FinalitySta
     const int M{m_M};
     Produce(m_vk_a); // tip = M so the loop starts inside the modern phase
 
-    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr);
+    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr,
+                           m_path_root / "finality_signer");
     std::string error;
     BOOST_REQUIRE_MESSAGE(loop.SetFinalityKey(m_bls_a, m_vk_a, error), error);
     {
@@ -207,11 +212,31 @@ BOOST_FIXTURE_TEST_CASE(staking_loop_signs_aggregates_and_finalizes, FinalitySta
     BOOST_REQUIRE_MESSAGE(loop.Start(m_validator_a, CScript() << OP_TRUE, error), error);
     BOOST_CHECK(!loop.SetFinalityKey(m_bls_a, m_vk_a, error)); // refused while running
 
-    // Run until the chain reaches M+10 (checkpoint M+5 becomes signable at
-    // M+8 and includable immediately: A alone is 15 of 16 >= quorum 11).
-    for (int i{0}; i < 1200 && Tip()->nHeight < M + 10; ++i) {
+    // Checkpoint M+5 becomes signable at M+8. A carries 15 of 16 stake, but
+    // the current rule deliberately also requires a validator-headcount
+    // quorum, so feed the independent B signature into the same node-local
+    // pool once the checkpoint is deep enough. The staking loop contributes
+    // A's signature and then includes the aggregate in a later block.
+    node::FinalitySigner peer_signer;
+    peer_signer.SetKey(m_bls_b, m_vk_b);
+    bool peer_signed{false};
+    for (int i{0}; i < 1200; ++i) {
         UninterruptibleSleep(std::chrono::milliseconds{25});
         SetMockTime(GetTime() + 30);
+        if (!peer_signed && Tip()->nHeight >= M + 8) {
+            LOCK(cs_main);
+            Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+            node::FinalityTracker& tracker{Finality()};
+            peer_signed = !peer_signer
+                               .MaybeSign(tracker, chainstate.m_chain,
+                                          m_node.chainman->GetConsensus(),
+                                          chainstate.FinalitySignatures())
+                               .empty();
+        }
+        if (Tip()->nHeight >= M + 10 &&
+            FinalityState().finalized.has_value()) {
+            break;
+        }
     }
     const auto running{loop.Status(std::nullopt)};
     loop.Stop();
@@ -219,6 +244,7 @@ BOOST_FIXTURE_TEST_CASE(staking_loop_signs_aggregates_and_finalizes, FinalitySta
                           "loop state: " << running.state << " / last error: " << running.last_error);
     BOOST_CHECK(running.finality_signing);
     BOOST_CHECK_GE(running.last_signed_height, M + 5);
+    BOOST_REQUIRE(peer_signed);
     // The loop's assembler included the aggregated certificate: finalized.
     const auto s{FinalityState()};
     BOOST_REQUIRE(s.finalized.has_value());
@@ -229,7 +255,9 @@ BOOST_FIXTURE_TEST_CASE(staking_loop_signs_aggregates_and_finalizes, FinalitySta
 
 BOOST_FIXTURE_TEST_CASE(staking_stop_forgets_finality_key_before_another_wallet_starts, FinalityStakingFixture)
 {
-    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr);
+    PrepareFinalityChain();
+    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr,
+                           m_path_root / "finality_signer");
     std::string error;
 
     // Wallet A arms finality and starts the node-global loop.
@@ -261,7 +289,9 @@ BOOST_FIXTURE_TEST_CASE(staking_stop_forgets_finality_key_before_another_wallet_
 
 BOOST_FIXTURE_TEST_CASE(staking_atomic_start_replaces_a_stale_same_validator_finality_key, FinalityStakingFixture)
 {
-    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr);
+    PrepareFinalityChain();
+    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr,
+                           m_path_root / "finality_signer");
     std::string error;
 
     // Simulate a key armed by an earlier attempt for the same validator. A
@@ -275,6 +305,51 @@ BOOST_FIXTURE_TEST_CASE(staking_atomic_start_replaces_a_stale_same_validator_fin
         error);
     BOOST_CHECK(!loop.Status(std::nullopt).finality_signing);
     loop.Stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(staking_reports_corrupt_finality_journal_as_disabled, FinalityStakingFixture)
+{
+    PrepareFinalityChain();
+    const Consensus::Params& params{m_node.chainman->GetConsensus()};
+    BOOST_REQUIRE(params.legacy_final_hash.has_value());
+    const auto domain{modern::ModernChainDomain(
+        params.hashGenesisBlock, *params.legacy_final_hash)};
+    BOOST_REQUIRE(domain.has_value());
+    const fs::path signer_dir{m_path_root / "corrupt_finality_signer"};
+    BOOST_REQUIRE(TryCreateDirectories(signer_dir));
+    {
+        std::ofstream corrupt{
+            node::FinalitySignerStore::StatePath(signer_dir, *domain, m_vk_a)
+                .std_path(),
+            std::ios::binary | std::ios::trunc};
+        BOOST_REQUIRE(corrupt.is_open());
+        corrupt << "not a finality signer journal";
+        corrupt.close();
+        BOOST_REQUIRE(corrupt.good());
+    }
+
+    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr,
+                           signer_dir);
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(loop.SetFinalityKey(m_bls_a, m_vk_a, error), error);
+    BOOST_REQUIRE_MESSAGE(loop.Start(m_validator_a, CScript() << OP_TRUE,
+                                     error),
+                          error);
+
+    interfaces::StakingStatus status;
+    for (int i{0}; i < 200; ++i) {
+        status = loop.Status(std::nullopt);
+        if (!status.finality_signing &&
+            status.last_error.find("finality signing disabled safely") !=
+                std::string::npos) {
+            break;
+        }
+        UninterruptibleSleep(std::chrono::milliseconds{5});
+    }
+    loop.Stop();
+    BOOST_CHECK(!status.finality_signing);
+    BOOST_CHECK(status.last_error.find("unsafe finality signer state") !=
+                std::string::npos);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

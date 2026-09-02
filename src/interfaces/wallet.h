@@ -72,6 +72,7 @@ struct WalletAssetBalance
     CAmount spendable{0};
     CAmount immature{0};
     bool is_fn{false};
+    bool is_bridge{false};
 
     friend bool operator==(const WalletAssetBalance&,
                            const WalletAssetBalance&) = default;

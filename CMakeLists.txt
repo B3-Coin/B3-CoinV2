@@ -27,15 +27,14 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 # Project / Package metadata
 #=============================
 set(CLIENT_NAME "B3 FlowMesh client")
-# B3 Hive product versioning (owner ruling 2026-08-26). The transition
-# release follows B3 Hive 1.0.0 as v1.1.0; P2P protocol versioning remains
-# independent.
+# B3 Hive product versioning. v1.1.1 is the audited transition follow-up to
+# the already-tagged v1.1.0; P2P protocol versioning remains independent.
 # The P2P protocol version is a separate constant and is unaffected.
 set(CLIENT_VERSION_MAJOR 1)
 set(CLIENT_VERSION_MINOR 1)
-set(CLIENT_VERSION_BUILD 0)
+set(CLIENT_VERSION_BUILD 1)
 set(CLIENT_VERSION_RC 0)
-# Stable transition release. Keep this empty for the final v1.1.0 tag.
+# Stable transition release. Keep this empty for the final v1.1.1 tag.
 set(CLIENT_VERSION_PRERELEASE "")
 set(CLIENT_VERSION_IS_RELEASE "true")
 set(COPYRIGHT_YEAR "2026")
@@ -197,7 +196,7 @@ endif()
 
 option(BUILD_BENCH "Build bench_bitcoin executable." OFF)
 option(B3_FINALITY_BENCH "Build the B3 finality benchmark harness (timing of the consensus BLS wrapper and MPA codecs)." OFF)
-option(B3_BRIDGE_TOOLS "Build the B3 bridge verification harness (b3-bridge-ethcheck relayer dry-run; test/tooling only, never part of the node)." OFF)
+option(B3_BRIDGE_TOOLS "Build the B3 bridge proof/payload verifier and bootstrap-calldata tools (operator/test tooling only, never part of the node)." OFF)
 option(B3_UPDATE_TOOLS "Build the offline B3 Hive release-manifest signing tool (b3hive-sign; operator tooling, never part of the node)." OFF)
 # The vendored blst (src/blst) is a consensus dependency of crypto/bls since
 # plan Commit 2 (cmake/blst.cmake). Upstream defines exactly two build paths

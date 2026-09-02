@@ -9,6 +9,7 @@
 #include <consensus/merkle.h>
 #include <consensus/params.h>
 #include <logging.h>
+#include <modern/chain_domain.h>
 #include <modern/stake.h>
 #include <net_processing.h>
 #include <node/bridge_state.h>
@@ -42,8 +43,10 @@ std::string PhaseName(const Consensus::Params& params, const int height)
 }
 } // namespace
 
-StakingLoop::StakingLoop(ChainstateManager& chainman, CTxMemPool* mempool)
-    : m_chainman{chainman}, m_mempool{mempool} {}
+StakingLoop::StakingLoop(ChainstateManager& chainman, CTxMemPool* mempool,
+                         fs::path finality_signer_dir)
+    : m_chainman{chainman}, m_mempool{mempool},
+      m_finality_signer_dir{std::move(finality_signer_dir)} {}
 
 bool StakingLoop::SetFinalityKey(const bls::SecretKey& key, const std::array<unsigned char, 32>& validator_key,
                                  std::string& error)
@@ -56,6 +59,7 @@ bool StakingLoop::SetFinalityKey(const bls::SecretKey& key, const std::array<uns
     }
     m_bls_key = key;
     m_validator = validator_key;
+    m_finality_signing_failed = false;
     return true;
 }
 
@@ -134,6 +138,8 @@ bool StakingLoop::StartImpl(const CKey& validator_key, const CScript& coinbase_s
         m_stop = false;
         m_state = "starting";
         m_last_error.clear();
+        m_last_signed_height = -1;
+        m_finality_signing_failed = false;
         m_next_block_time = 0;
         try {
             m_thread = std::thread(&util::TraceThread, "b3staking", [this] { ThreadLoop(); });
@@ -231,7 +237,8 @@ interfaces::StakingStatus StakingLoop::Status(const std::optional<std::array<uns
         status.blocks_produced = m_blocks_produced;
         status.last_block_hash = m_last_block_hash;
         status.next_block_time = m_next_block_time;
-        status.finality_signing = m_bls_key.has_value();
+        status.finality_signing =
+            m_bls_key.has_value() && !m_finality_signing_failed;
         status.last_signed_height = m_last_signed_height;
         if (m_running) {
             status.validator_key = m_validator;
@@ -253,7 +260,27 @@ void StakingLoop::ThreadLoop()
         key = m_key;
         validator = m_validator;
         coinbase_script = m_coinbase_script;
-        if (m_bls_key) signer.SetKey(*m_bls_key, validator);
+        if (m_bls_key) {
+            const Consensus::Params& params{m_chainman.GetConsensus()};
+            const auto domain{
+                params.legacy_final_hash
+                    ? modern::ModernChainDomain(
+                          params.hashGenesisBlock,
+                          *params.legacy_final_hash)
+                    : std::nullopt};
+            std::string error;
+            if (!domain || !signer.SetKeyPersistent(
+                               *m_bls_key, validator,
+                               domain.value_or(uint256{}),
+                               m_finality_signer_dir, error)) {
+                if (error.empty()) error = "chain domain is not configured";
+                m_finality_signing_failed = true;
+                m_last_error = strprintf(
+                    "finality signing disabled safely: %s", error);
+            } else {
+                m_last_signed_height = signer.LastSignedHeight();
+            }
+        }
     }
     const Consensus::Params& params{m_chainman.GetConsensus()};
 
@@ -307,8 +334,31 @@ void StakingLoop::ThreadLoop()
                         chainstate.FinalitySignatures(), bridge_index);
                 }
             }
+            // This is the local anti-repeat watermark, not merely the last
+            // signature selected for relay. A valid old checkpoint can be
+            // deliberately discarded by the bounded pool while still
+            // advancing the signer, and RPC status must reflect that.
+            WITH_LOCK(m_mutex,
+                      m_last_signed_height = signer.LastSignedHeight());
+            {
+                LOCK(m_mutex);
+                if (!signer.LastError().empty()) {
+                    m_finality_signing_failed = true;
+                    m_last_error = strprintf(
+                        "finality signing disabled safely: %s",
+                        signer.LastError());
+                } else if (m_finality_signing_failed) {
+                    // A branch-lock wait is recoverable only when a newer
+                    // included quorum certificate supplies the lock-change
+                    // proof. The signer rechecks that proof every loop.
+                    m_finality_signing_failed = false;
+                    if (m_last_error.starts_with(
+                            "finality signing disabled safely:")) {
+                        m_last_error.clear();
+                    }
+                }
+            }
             if (!sigs.empty()) {
-                WITH_LOCK(m_mutex, m_last_signed_height = signer.LastSignedHeight());
                 LogInfo("staking: signed %d finality checkpoint(s) up to height %d\n", sigs.size(),
                         signer.LastSignedHeight());
                 if (m_peerman) m_peerman->RelayFinalitySignatures(sigs);

@@ -11,6 +11,7 @@
 #include <interfaces/handler.h>
 #include <modern/asset_output.h>
 #include <modern/asset_validation.h>
+#include <modern/bridge_asset.h>
 #include <node/types.h>
 #include <policy/fees/block_policy_estimator.h>
 #include <primitives/transaction.h>
@@ -149,6 +150,8 @@ std::vector<WalletAssetBalance> GetWalletAssetBalances(const CWallet& wallet)
 {
     const std::optional<modern::AssetId> fn_asset{
         modern::ConfiguredFnAssetId(Params().GetConsensus())};
+    const std::optional<modern::AssetId> bridge_asset{
+        modern::ConfiguredDecentralizedBridgeAssetId(Params().GetConsensus())};
     std::map<modern::AssetId, WalletAssetBalance> balances;
     std::set<Txid> trusted_parents;
 
@@ -178,9 +181,12 @@ std::vector<WalletAssetBalance> GetWalletAssetBalances(const CWallet& wallet)
         if (!parsed || !owner_script) continue;
 
         const bool is_fn{fn_asset && parsed->asset == *fn_asset};
+        const bool is_bridge{bridge_asset && parsed->asset == *bridge_asset};
         WalletAssetBalance& balance{balances.try_emplace(
             parsed->asset,
-            WalletAssetBalance{.asset_id = parsed->asset, .is_fn = is_fn})
+            WalletAssetBalance{.asset_id = parsed->asset,
+                               .is_fn = is_fn,
+                               .is_bridge = is_bridge})
                                          .first->second};
 
         const bool mature{!wallet.IsTxImmatureCoinBase(wtx)};

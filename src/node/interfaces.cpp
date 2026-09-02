@@ -926,6 +926,36 @@ public:
             return interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE;
         }
 
+        if (HasDecentralizedBridgeBurn(tx) &&
+            !Consensus::BridgeWithdrawalRulesActive(expected_next_height,
+                                                     consensus)) {
+            error = "Bridge withdrawals are disabled for the next block";
+            return interfaces::BridgePrevalidationResult::RULES_INACTIVE;
+        }
+        if (HasDecentralizedBridgeBurn(tx) &&
+            consensus.busd_bridge->withdrawal_mode ==
+                Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
+            consensus.busd_bridge->decentralized_withdrawal) {
+            FinalityTracker& finality{chainstate.ModernFinality()};
+            if (!finality.Sync(chainstate.m_chain, chainstate.m_blockman,
+                               consensus, *tip, &tracker.Index())) {
+                error =
+                    "Bridge withdrawal readiness is unavailable at the active tip";
+                return interfaces::BridgePrevalidationResult::STATE_UNAVAILABLE;
+            }
+            const FinalityTracker::State projected{
+                finality.Projected(expected_next_height, consensus)};
+            const BridgeBurnReadiness readiness{
+                BridgeWithdrawalValidatorSetsReady(
+                    projected,
+                    *consensus.busd_bridge->decentralized_withdrawal)
+                    ? BridgeBurnReadiness::READY
+                    : BridgeBurnReadiness::NOT_READY};
+            if (!CheckBridgeBurnReadiness(tx, readiness, error)) {
+                return interfaces::BridgePrevalidationResult::REJECTED;
+            }
+        }
+
         const int64_t candidate_time{
             std::max<int64_t>(GetTime(), tip->GetMedianTimePast() + 1)};
         if (!tracker.Index().VerifyTransaction(
@@ -1033,6 +1063,29 @@ public:
             }
         }
         if (state.next) out.next_set_hash = state.next->SetHash();
+
+        // Preserve the exact one-time Set_0 handoff object independently of
+        // the rolling {current, previous} certificate window. The contract's
+        // deadline is wall-clock based and this public data is safe to retain.
+        if (modern_start) {
+            const int snapshot_height{*modern_start - 1};
+            std::shared_ptr<const node::ValidatorSetSnapshot> set0;
+            if (tip->nHeight == snapshot_height) {
+                set0 = tracker.SetInForceAt(*modern_start, consensus);
+            } else if (tip->nHeight >= *modern_start) {
+                set0 = state.bootstrap;
+            }
+            const CBlockIndex* snapshot_index{
+                snapshot_height >= 0 ? chainstate.m_chain[snapshot_height]
+                                     : nullptr};
+            if (set0 && snapshot_index && set0->Epoch() == 0) {
+                out.bootstrap_snapshot_height = snapshot_height;
+                out.bootstrap_snapshot_hash = snapshot_index->GetBlockHash();
+                out.bootstrap_set_hash = set0->SetHash();
+                const auto encoded{set0->Header().Encode()};
+                out.bootstrap_set_header.assign(encoded.begin(), encoded.end());
+            }
+        }
         if (state.finalized) {
             out.finalized_height = state.finalized->height;
             out.finalized_hash = state.finalized->block_hash;

@@ -94,6 +94,13 @@ public:
     /** Idempotent; joins all owned workers before returning. */
     void Stop();
 
+    /**
+     * Reconcile the current tip after block import caused initial download to
+     * finish without a final non-IBD UpdatedBlockTip notification. The caller
+     * must first wait for the import's validation-interface callbacks.
+     */
+    void ReconcileAfterInitialBlockDownload();
+
     bool Enabled() const;
     bool Running() const;
 

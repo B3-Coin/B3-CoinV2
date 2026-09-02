@@ -1225,6 +1225,12 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                 return state.Invalid(TxValidationResult::TX_CONSENSUS,
                                      "bridge-rules-inactive");
             }
+            if (node::HasDecentralizedBridgeBurn(tx) &&
+                !Consensus::BridgeWithdrawalRulesActive(next_block_height,
+                                                        consensus)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                     "bridge-withdrawal-rules-inactive");
+            }
             const CBlockIndex* tip{m_active_chainstate.m_chain.Tip()};
             node::BridgeStateTracker& tracker{
                 m_active_chainstate.ModernBridgeState()};
@@ -1234,6 +1240,42 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                               *tip)) {
                 return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
                                      "bridge-state-unavailable");
+            }
+            node::BridgeBurnReadiness burn_readiness{
+                node::BridgeBurnReadiness::READY};
+            if (node::HasDecentralizedBridgeBurn(tx) &&
+                consensus.busd_bridge->withdrawal_mode ==
+                    Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
+                consensus.busd_bridge->decentralized_withdrawal) {
+                burn_readiness = node::BridgeBurnReadiness::UNAVAILABLE;
+                node::FinalityTracker& finality{
+                    m_active_chainstate.ModernFinality()};
+                if (finality.Sync(m_active_chainstate.m_chain,
+                                  m_active_chainstate.m_blockman, consensus,
+                                  *tip, &tracker.Index())) {
+                    const node::FinalityTracker::State projected{
+                        finality.Projected(next_block_height, consensus)};
+                    burn_readiness =
+                        node::BridgeWithdrawalValidatorSetsReady(
+                            projected,
+                            *consensus.busd_bridge->decentralized_withdrawal)
+                            ? node::BridgeBurnReadiness::READY
+                            : node::BridgeBurnReadiness::NOT_READY;
+                }
+                std::string readiness_error;
+                if (!node::CheckBridgeBurnReadiness(
+                        tx, burn_readiness, readiness_error)) {
+                    return state.Invalid(
+                        burn_readiness ==
+                                node::BridgeBurnReadiness::UNAVAILABLE
+                            ? TxValidationResult::TX_MEMPOOL_POLICY
+                            : TxValidationResult::TX_CONSENSUS,
+                        burn_readiness ==
+                                node::BridgeBurnReadiness::UNAVAILABLE
+                            ? "bridge-withdrawal-readiness-unavailable"
+                            : "bridge-withdrawal-not-ready",
+                        readiness_error);
+                }
             }
             node::BridgeTxAuthorization authorization;
             std::string bridge_error;
@@ -3154,6 +3196,17 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         return false;
     }
 
+    // Recheck hardened post-legacy identities here as well as during header
+    // admission: -reindex-chainstate deliberately skips the contextual
+    // header path and must still reject a previously indexed mismatch.
+    if (!Consensus::ModernCheckpointAllows(params.GetConsensus(),
+                                           pindex->nHeight, block_hash)) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                             "bad-modern-checkpoint",
+                             strprintf("post-legacy block at height %d does not match its hardened checkpoint",
+                                       pindex->nHeight));
+    }
+
     // B3 transition rules were introduced after some block-index databases
     // could already have been written. `-reindex-chainstate` deliberately
     // skips ContextualCheckBlockHeader(), so repeat every deterministic
@@ -3175,7 +3228,6 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                                  "bad-legacy-final-parent",
                                  "first modern block does not reference LEGACY_FINAL_HASH");
         }
-
         const Consensus::ConsensusPhase phase{
             Consensus::GetConsensusPhase(pindex->nHeight, consensus)};
         if (phase == Consensus::ConsensusPhase::TRANSITION_POW) {
@@ -3551,6 +3603,40 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             !tracker.Sync(m_chain, m_blockman, params.GetConsensus(),
                           *pindex->pprev)) {
             return state.Error("bridge state is unavailable");
+        }
+        if (node::HasDecentralizedBridgeBurn(block) &&
+            !Consensus::BridgeWithdrawalRulesActive(
+                pindex->nHeight, params.GetConsensus())) {
+            return state.Invalid(
+                BlockValidationResult::BLOCK_CONSENSUS,
+                "bridge-withdrawal-rules-inactive");
+        }
+        if (node::HasDecentralizedBridgeBurn(block) &&
+            params.GetConsensus().busd_bridge->withdrawal_mode ==
+                Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
+            params.GetConsensus().busd_bridge->decentralized_withdrawal) {
+            node::FinalityTracker& finality{ModernFinality()};
+            if (!finality.Sync(m_chain, m_blockman, params.GetConsensus(),
+                               *pindex->pprev, &tracker.Index())) {
+                return state.Error(
+                    "bridge withdrawal readiness is unavailable");
+            }
+            const node::FinalityTracker::State projected{
+                finality.Projected(pindex->nHeight, params.GetConsensus())};
+            const node::BridgeBurnReadiness readiness{
+                node::BridgeWithdrawalValidatorSetsReady(
+                    projected,
+                    *params.GetConsensus()
+                         .busd_bridge->decentralized_withdrawal)
+                    ? node::BridgeBurnReadiness::READY
+                    : node::BridgeBurnReadiness::NOT_READY};
+            std::string readiness_error;
+            if (!node::CheckBridgeBurnReadiness(
+                    block, readiness, readiness_error)) {
+                return state.Invalid(
+                    BlockValidationResult::BLOCK_CONSENSUS,
+                    "bridge-withdrawal-not-ready", readiness_error);
+            }
         }
         node::BridgeBlockDelta bridge_delta;
         std::string bridge_error;
@@ -4369,6 +4455,26 @@ bool Chainstate::FlushStateToDisk(
                 last_prune = std::max(1, std::min(last_prune, lock_height));
                 if (last_prune == lock_height) {
                     limiting_lock = prune_lock.first;
+                }
+            }
+
+            // BridgeStateTracker currently reconstructs its exact consensus
+            // index by replaying active bridge blocks. Until the documented
+            // atomic disk sidecar replaces that replay, pruning any block at
+            // or after bridge activation would make a later restart unable to
+            // validate mints/nullifiers safely. Keep that suffix even when a
+            // user selected prune mode; failing to meet the prune target is
+            // preferable to silently creating an unrecoverable node state.
+            const Consensus::Params& consensus{m_chainman.GetConsensus()};
+            if (consensus.busd_bridge &&
+                Consensus::BridgeMintParamsReady(*consensus.busd_bridge) &&
+                m_chain.Height() >=
+                    *consensus.busd_bridge->activation_height) {
+                const int bridge_last_prune{std::max(
+                    1, *consensus.busd_bridge->activation_height - 1)};
+                if (bridge_last_prune < last_prune) {
+                    last_prune = bridge_last_prune;
+                    limiting_lock = "bridge-state-replay";
                 }
             }
 
@@ -6376,6 +6482,14 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
     case Consensus::BoundaryCheck::WRONG_FINAL_PARENT:
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-legacy-final-parent",
                              "first modern block does not reference LEGACY_FINAL_HASH");
+    }
+    if (!Consensus::ModernCheckpointAllows(
+            consensusParams, nHeight,
+            block.GetHash(consensusParams, nHeight))) {
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER,
+                             "bad-modern-checkpoint",
+                             strprintf("post-legacy block at height %d does not match its hardened checkpoint",
+                                       nHeight));
     }
 
     // Check proof of work

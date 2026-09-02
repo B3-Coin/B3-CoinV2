@@ -81,6 +81,12 @@ jobs:
           fi
 
   release-tests:
+    # Extended qualification is the default. For an emergency packaging-only
+    # tag after the same revision has been qualified locally, a repository
+    # administrator may set B3_SKIP_EXTENDED_RELEASE_TESTS_SHA to the exact
+    # release commit. A persistent boolean is deliberately insufficient: an
+    # old exception must never bypass tests for a later tag.
+    if: vars.B3_SKIP_EXTENDED_RELEASE_TESTS_SHA != github.sha
     needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 240
@@ -97,10 +103,12 @@ jobs:
           cmake -B build-test -DCMAKE_BUILD_TYPE=Release
           -DBUILD_GUI=ON -DBUILD_TESTS=ON -DBUILD_GUI_TESTS=ON
           -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF
+          -DB3_BRIDGE_TOOLS=ON
       - name: Build test and functional-test programs
         run: >-
           cmake --build build-test -j"$(nproc)" --target
           test_bitcoin test_bitcoin-qt b3coind b3coin-cli
+          b3-bridge-ethcheck b3-bridge-bootstrap-proof
       - name: Verify tested source version
         run: >-
           build-test/bin/b3coind -nosettings -version |
@@ -113,6 +121,8 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: build-test/bin/test_bitcoin-qt
+      - name: Run automatic bridge-relayer recovery suite
+        run: python3 contrib/b3bridge/test_b3_bridge_relayer.py
       - name: Run transition functional gate
         run: >-
           python3 build-test/test/functional/test_runner.py
@@ -123,6 +133,45 @@ jobs:
           feature_b3_finality_mempool.py
           feature_b3_finality_soak.py
           feature_flowmesh_release.py
+
+  release-test-policy:
+    if: always()
+    needs: [version, release-tests]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Enforce or explicitly record extended-test policy
+        env:
+          VERSION_RESULT: ${{ needs.version.result }}
+          TEST_RESULT: ${{ needs['release-tests'].result }}
+          SKIP_SHA: ${{ vars.B3_SKIP_EXTENDED_RELEASE_TESTS_SHA }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$VERSION_RESULT" = success
+          if test "$TEST_RESULT" = success; then
+            echo "Extended GitHub release qualification passed."
+          elif test "$TEST_RESULT" = skipped && test "$SKIP_SHA" = "$RELEASE_SHA"; then
+            echo "::warning::Extended GitHub release qualification was explicitly skipped for exact commit $RELEASE_SHA. The tagging operator is responsible for preserving qualification logs for this commit."
+          else
+            echo "Extended release qualification failed or was skipped without the explicit repository opt-out." >&2
+            exit 1
+          fi
+
+  contract-tests:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+      - name: Build and test decentralized bridge contracts
+        working-directory: contracts
+        run: forge test
+      - name: Enforce EIP-170 on deployed runtimes only
+        working-directory: contracts
+        run: script/check-deployable-sizes.sh
 
   linux-x86_64:
     needs: version
@@ -141,21 +190,31 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           -DBUILD_GUI=ON -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF
           -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON
+          -DB3_BRIDGE_TOOLS=ON
       - name: Build
         # Release packaging compiles only the programs that ship to users.
         # The release-tests job qualifies the exact same source revision.
         run: >-
           cmake --build build -j"$(nproc)" --target
           b3coin-qt b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
+          b3-bridge-ethcheck b3-bridge-bootstrap-proof
       - name: Package
         run: |
           mkdir -p out
           name=b3-hive-v${{ needs.version.outputs.version }}-unsigned-linux-x86_64
           stage=$(mktemp -d)
-          mkdir -p "$stage/$name/bin"
+          mkdir -p "$stage/$name/bin" "$stage/$name/contrib/b3bridge"
           cp build/bin/b3coin-qt build/bin/b3coind build/bin/b3coin-cli \
             build/bin/b3coin-tx build/bin/b3coin-util build/bin/b3coin-wallet \
+            build/bin/b3-bridge-ethcheck build/bin/b3-bridge-bootstrap-proof \
             "$stage/$name/bin/"
+          cp contrib/b3bridge/README.md \
+            contrib/b3bridge/b3_bridge_relayer.py \
+            contrib/b3bridge/capture_eth_lc_fixture.py \
+            contrib/b3bridge/capture_eth_receipts_fixture.py \
+            contrib/b3bridge/eth_live_test.py \
+            contrib/b3bridge/test_b3_bridge_relayer.py \
+            "$stage/$name/contrib/b3bridge/"
           cp README.md COPYING "$stage/$name/"
           tar -C "$stage" -czf "out/$name.tar.gz" "$name"
           (cd out && sha256sum *.tar.gz > SHA256SUMS.linux)
@@ -199,9 +258,11 @@ jobs:
                 -DWITH_USDT=OFF \
                 -DBUILD_TX=ON \
                 -DBUILD_UTIL=ON \
-                -DBUILD_WALLET_TOOL=ON
+                -DBUILD_WALLET_TOOL=ON \
+                -DB3_BRIDGE_TOOLS=ON
               cmake --build build-static -j"$(nproc)" --target \
-                b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
+                b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet \
+                b3-bridge-ethcheck b3-bridge-bootstrap-proof
               for binary in b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet; do
                 file "build-static/bin/$binary" | grep -Eq "static-pie linked|statically linked"
                 ! readelf -l "build-static/bin/$binary" | grep -q "Requesting program interpreter"
@@ -211,6 +272,11 @@ jobs:
                 else
                   "build-static/bin/$binary" -version >/dev/null
                 fi
+              done
+              for binary in b3-bridge-ethcheck b3-bridge-bootstrap-proof; do
+                file "build-static/bin/$binary" | grep -Eq "static-pie linked|statically linked"
+                ! readelf -l "build-static/bin/$binary" | grep -q "Requesting program interpreter"
+                ! readelf -d "build-static/bin/$binary" 2>&1 | grep -q NEEDED
               done
 
               smoke_dir="$(mktemp -d)"
@@ -241,18 +307,31 @@ jobs:
           mkdir -p out
           name=b3-hive-v${{ needs.version.outputs.version }}-unsigned-linux-x86_64-static-headless
           stage=$(mktemp -d)
-          mkdir -p "$stage/$name/bin"
+          mkdir -p "$stage/$name/bin" "$stage/$name/contrib/b3bridge"
           cp build-static/bin/b3coind build-static/bin/b3coin-cli \
             build-static/bin/b3coin-tx build-static/bin/b3coin-util \
-            build-static/bin/b3coin-wallet "$stage/$name/bin/"
+            build-static/bin/b3coin-wallet \
+            build-static/bin/b3-bridge-ethcheck \
+            build-static/bin/b3-bridge-bootstrap-proof \
+            "$stage/$name/bin/"
+          cp contrib/b3bridge/README.md \
+            contrib/b3bridge/b3_bridge_relayer.py \
+            contrib/b3bridge/capture_eth_lc_fixture.py \
+            contrib/b3bridge/capture_eth_receipts_fixture.py \
+            contrib/b3bridge/eth_live_test.py \
+            contrib/b3bridge/test_b3_bridge_relayer.py \
+            "$stage/$name/contrib/b3bridge/"
           cp README.md COPYING "$stage/$name/"
           cat > "$stage/$name/STATIC-LINUX-README.txt" <<'EOF'
           This is the fully static x86-64 Linux operator package built against
           musl. It contains the daemon, RPC client, transaction utility, general
-          utility, and wallet utility. It intentionally does not contain Qt.
+          utility, wallet utility, and optional bridge proof/relayer tools. The
+          Python relayer requires Python 3 on the operator host. It intentionally
+          does not contain Qt.
           IPC, ZeroMQ, and USDT tracepoints are also disabled in this package.
-          Every executable passed static-ELF checks, version checks, and an
-          isolated regtest daemon/RPC startup-and-shutdown smoke test.
+          Every executable passed static-ELF checks. The daemon and standard
+          CLI utilities also passed version checks, and the daemon/RPC pair
+          passed an isolated regtest startup-and-shutdown smoke test.
           EOF
           tar -C "$stage" -czf "out/$name.tar.gz" "$name"
           (cd out && sha256sum *.tar.gz > SHA256SUMS.linux-static)
@@ -474,7 +553,7 @@ jobs:
 
   publish:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [version, release-tests, linux-x86_64, linux-x86_64-static, windows-cross, macos-arm64, macos-x86_64]
+    needs: [version, release-test-policy, contract-tests, linux-x86_64, linux-x86_64-static, windows-cross, macos-arm64, macos-x86_64]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

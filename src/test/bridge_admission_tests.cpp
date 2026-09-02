@@ -48,11 +48,13 @@ BridgeAssetRegistryEntry ActiveRegistry()
 {
     BridgeAssetRegistryEntry entry;
     entry.origin_chain_id = 1;
+    entry.origin_deployment_block = 1'000;
     entry.vault_address = Address(0x10);
     entry.token_address = Address(0x40);
     entry.b3_asset_id = uint256::ONE;
     entry.origin_decimals = 6;
     entry.asset_decimals = 6;
+    entry.vault_runtime_code_hash = uint256::ONE;
     entry.implementation_or_adapter = uint256::ONE;
     entry.adapter_version = 1;
     entry.approval_first_height = 100;
@@ -65,6 +67,7 @@ ProvenBridgeDeposit MatchingDeposit(const BridgeAssetRegistryEntry& registry)
 {
     ProvenBridgeDeposit deposit;
     deposit.origin_chain_id = registry.origin_chain_id;
+    deposit.execution_block_number = registry.origin_deployment_block;
     deposit.vault_address = registry.vault_address;
     deposit.event.deposit_id = 17;
     deposit.event.token = registry.token_address;
@@ -99,6 +102,10 @@ BOOST_AUTO_TEST_CASE(recipient_v1_is_exact_and_fail_closed)
     bad_version[RECIPIENT_V1_PADDING_SIZE] = RECIPIENT_V1_P2PKH + 1;
     BOOST_CHECK(!DecodeRecipientV1(bad_version));
     BOOST_CHECK(!DecodeRecipientV1(std::array<unsigned char, 32>{}));
+
+    std::array<unsigned char, 32> zero_hash{};
+    zero_hash[RECIPIENT_V1_PADDING_SIZE] = RECIPIENT_V1_P2PKH;
+    BOOST_CHECK(!DecodeRecipientV1(zero_hash));
 }
 
 BOOST_AUTO_TEST_CASE(raw_unit_conversion_is_exact_and_bounded)
@@ -118,6 +125,22 @@ BOOST_AUTO_TEST_CASE(raw_unit_conversion_is_exact_and_bounded)
     BOOST_CHECK(!ConvertRawUnitsExact(too_large, 6, 6));
 }
 
+BOOST_AUTO_TEST_CASE(registry_entry_rejects_impossible_origin_coordinates)
+{
+    const BridgeAssetRegistryEntry valid{ActiveRegistry()};
+    BOOST_REQUIRE(BridgeAssetRegistryEntryValid(valid));
+
+    auto invalid{valid};
+    invalid.origin_deployment_block = 0;
+    BOOST_CHECK(!BridgeAssetRegistryEntryValid(invalid));
+    invalid = valid;
+    invalid.token_address = {};
+    BOOST_CHECK(!BridgeAssetRegistryEntryValid(invalid));
+    invalid = valid;
+    invalid.token_address = invalid.vault_address;
+    BOOST_CHECK(!BridgeAssetRegistryEntryValid(invalid));
+}
+
 BOOST_AUTO_TEST_CASE(active_full_tuple_authorizes_only_the_exact_deposit)
 {
     const BridgeAssetRegistryEntry registry{ActiveRegistry()};
@@ -134,6 +157,10 @@ BOOST_AUTO_TEST_CASE(active_full_tuple_authorizes_only_the_exact_deposit)
     changed.origin_chain_id = 2;
     BOOST_CHECK(AdmitProvenDeposit(registry, changed, 150, mint) ==
                 BridgeAdmissionResult::ORIGIN_MISMATCH);
+    changed = deposit;
+    --changed.execution_block_number;
+    BOOST_CHECK(AdmitProvenDeposit(registry, changed, 150, mint) ==
+                BridgeAdmissionResult::BEFORE_DEPLOYMENT);
     changed = deposit;
     changed.vault_address[0] ^= 1;
     BOOST_CHECK(AdmitProvenDeposit(registry, changed, 150, mint) ==
@@ -169,6 +196,10 @@ BOOST_AUTO_TEST_CASE(proposed_expired_or_incomplete_registry_never_mints)
                 BridgeAdmissionResult::REGISTRY_INACTIVE);
 
     registry = ActiveRegistry();
+    registry.vault_runtime_code_hash = {};
+    BOOST_CHECK(AdmitProvenDeposit(registry, deposit, 150, mint) ==
+                BridgeAdmissionResult::REGISTRY_INACTIVE);
+    registry = ActiveRegistry();
     registry.implementation_or_adapter = {};
     BOOST_CHECK(AdmitProvenDeposit(registry, deposit, 150, mint) ==
                 BridgeAdmissionResult::REGISTRY_INACTIVE);
@@ -178,6 +209,10 @@ BOOST_AUTO_TEST_CASE(proposed_expired_or_incomplete_registry_never_mints)
                 BridgeAdmissionResult::REGISTRY_INACTIVE);
     registry = ActiveRegistry();
     registry.adapter_version = 0;
+    BOOST_CHECK(AdmitProvenDeposit(registry, deposit, 150, mint) ==
+                BridgeAdmissionResult::REGISTRY_INACTIVE);
+    registry = ActiveRegistry();
+    registry.adapter_version = 2;
     BOOST_CHECK(AdmitProvenDeposit(registry, deposit, 150, mint) ==
                 BridgeAdmissionResult::REGISTRY_INACTIVE);
 }

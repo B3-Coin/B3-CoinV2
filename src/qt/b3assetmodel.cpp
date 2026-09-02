@@ -74,12 +74,21 @@ QList<B3AssetRecord> B3NativeAssetSource::recordsForBalances(
         asset.reserved_available = false;
         asset.flowmesh_available = false;
         asset.is_fn = balance.is_fn;
+        asset.is_bridge = balance.is_bridge;
         asset.status = B3AssetRecord::Status::Active;
 
         if (asset.is_fn) {
             asset.ticker = QStringLiteral("FN");
             asset.display_name = tr("FN Coin");
             asset.decimals = 0;
+            asset.metadata_known = true;
+        } else if (asset.is_bridge) {
+            // The bridge identity is consensus-configured metadata. Showing
+            // its ticker/precision does not imply that bridge admission is
+            // active; it only renders wallet-owned raw units correctly.
+            asset.ticker = QStringLiteral("bUSD");
+            asset.display_name = tr("Bridged USD");
+            asset.decimals = 6;
             asset.metadata_known = true;
         } else {
             // Simple-v1 outputs do not repeat their genesis metadata. Until

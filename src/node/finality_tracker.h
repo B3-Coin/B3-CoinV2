@@ -103,6 +103,11 @@ public:
         //! epoch_starts[e] for every e <= epoch; [0] == M. Filled from M on
         //! even when not bootstrapped (the schedule is height-defined).
         std::vector<int> epoch_starts;
+        //! Immutable Set_0 snapshot retained for the public Ethereum bridge
+        //! handoff. Keeping it is harmless (all data is public) and avoids
+        //! coupling the contract's deployment deadline to B3's two-set
+        //! certificate-verification window.
+        std::shared_ptr<const ValidatorSetSnapshot> bootstrap; // Set_0
         std::shared_ptr<const ValidatorSetSnapshot> previous; // Set_{e-1}
         std::shared_ptr<const ValidatorSetSnapshot> current;  // Set_e
         std::shared_ptr<const ValidatorSetSnapshot> next;     // Set_{e+1}
@@ -183,6 +188,18 @@ private:
     int m_synced_height{-1};
     bool m_dirty{true};
 };
+
+/**
+ * Whether the parent-derived epoch state projected for a candidate block can
+ * produce withdrawal roots accepted by the deployment-pinned Ethereum
+ * verifier. Both the signing set and its already committed successor must
+ * meet the exact count/weight bounds; a broken lineage can never recover in
+ * V1. This deliberately uses no candidate-block certificate or withdrawal
+ * root, avoiding a consensus dependency cycle with BridgeStateIndex.
+ */
+bool BridgeWithdrawalValidatorSetsReady(
+    const FinalityTracker::State& projected,
+    const Consensus::BridgeDecentralizedWithdrawalPins& pins);
 
 } // namespace node
 

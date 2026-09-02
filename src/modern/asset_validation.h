@@ -11,6 +11,7 @@
 #include <consensus/params.h>
 #include <modern/asset.h>
 #include <modern/asset_output.h>
+#include <modern/bridge_asset.h>
 #include <modern/chain_domain.h>
 #include <modern/fn.h>
 #include <modern/fn_pod.h>
@@ -62,6 +63,10 @@ inline std::optional<ModernOutput> ViewAssetAwareOutput(const CTxOut& out,
     if (!parsed) return std::nullopt;
     const auto fn_asset{ConfiguredFnAssetId(params)};
     const bool fn_id{fn_asset && parsed->asset == *fn_asset};
+    const auto bridge_asset{ConfiguredBridgeAssetId(params)};
+    const bool active_bridge_id{
+        bridge_asset && parsed->asset == *bridge_asset &&
+        Consensus::BridgeRulesActive(height, params)};
     const auto policy{static_cast<PolicyType>(parsed->policy_type)};
 
     switch (policy) {
@@ -76,7 +81,8 @@ inline std::optional<ModernOutput> ViewAssetAwareOutput(const CTxOut& out,
         }
         break;
     case PolicyType::OWNER:
-        if (!Consensus::AssetRulesActive(height, params)) {
+        if (!Consensus::AssetRulesActive(height, params) &&
+            !active_bridge_id) {
             error = "colored-asset owner output is not active";
             return std::nullopt;
         }
@@ -91,7 +97,8 @@ inline std::optional<ModernOutput> ViewAssetAwareOutput(const CTxOut& out,
                 error = "FN extinguishment is not active";
                 return std::nullopt;
             }
-        } else if (!Consensus::AssetRulesActive(height, params)) {
+        } else if (!Consensus::AssetRulesActive(height, params) &&
+                   !active_bridge_id) {
             error = "colored-asset burn is not active";
             return std::nullopt;
         }
@@ -111,7 +118,8 @@ inline std::optional<ModernOutput> ViewAssetAwareOutput(const CTxOut& out,
         return std::nullopt;
     }
 
-    if (CheckPolicyOutput(*parsed, height, params) != PolicyOutputCheck::OK) {
+    if (CheckPolicyOutput(*parsed, height, params, active_bridge_id) !=
+        PolicyOutputCheck::OK) {
         error = "asset policy output failed contextual validation";
         return std::nullopt;
     }

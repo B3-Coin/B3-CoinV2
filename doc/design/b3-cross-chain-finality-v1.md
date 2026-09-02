@@ -11,18 +11,24 @@ algorithms and state machines are frozen as `V1`; numeric parameters in §9 are 
 Ethereum-side `MAX_EPOCH_LAG` (separate bridge activation B). Rationale and attack analysis: [b3-finality-to-ethereum.md](b3-finality-to-ethereum.md);
 compatibility audit: [b3-finality-compatibility-report.md](b3-finality-compatibility-report.md);
 Modern PoS amendment: ruling M7 in [b3-modern-pos-spec.md](b3-modern-pos-spec.md).
-Deposits and the bridge vault are outside this document. Implementation not yet authorized.**
+Deposits and the bridge vault are outside this document. The V1 implementation
+exists, but Ethereum deployment and mainnet bridge activation are not approved
+until the production pins, gas bounds, and independent reviews are complete.**
 
-**Naming/status supersession (2026-09-01):** `A3` now names FlowMesh
-activation; this document uses `B` for any separately pinned bridge activation.
-The decentralized Ethereum verifier and withdrawal-root protocol in this
-document remain unimplemented. Transition-v1 instead has an implemented B3
-type-10 managed-withdrawal record that requires an exact bUSD BURN and records
-the Ethereum recipient with reorg/reindex replay. Its operator release
-automation and durable request-consumption database remain unimplemented and
-follow the workflow in the bridge threat model; they are not authorized by
-this document. The proof-verified type-10 deposit mint path is also implemented
-separately and remains mainnet-fail-closed pending production gates.
+**Pre-M deployment amendment (2026-09-02):** `A3` names FlowMesh activation
+only. Inbound bridge activation `B` is a separate later-build B3-chainparams input,
+selected only after the complete audited deployment tuple and all safety gates
+are reviewed. No Solidity contract hardcodes that release choice.
+Because canonical Set_0 is unknowable until block 811,000, the immutable
+Ethereum contracts may be deployed earlier with a synthetic four-member BLS
+bootstrap header (equal weights, quorum three) and an immutable deadline. At
+M-1, any three bootstrap identities attest exactly
+`FinalizedBlock{811000, block_hash, 0, hash(Set_0), 0}` using the ordinary V1
+digest and proof ABI. `initialize` accepts that handoff once, installs Set_0,
+and permanently removes the bootstrap path; all later authority is the normal
+B3 stake/finality lineage. The B3 decentralized burn/withdrawal-root path is
+implemented but remains fail-closed on mainnet until its release pins are
+complete.
 
 Conventions: all integers are **big-endian, fixed width**; `‖` is byte concatenation;
 `keccak` = Keccak-256; `sha256` = SHA-256; `TaggedHash(tag, m) = sha256(sha256(tag) ‖
@@ -111,7 +117,7 @@ relies on the attesting quorum for the rest.
 FinalizedBlock (112 B = 8+32+32+32+8):
   u64  height
   32 B block_hash              // modern block hash at `height`
-  32 B withdrawal_root         // §6; all-zero before bridge activation B
+  32 B withdrawal_root         // §6; all-zero before inbound bridge height B
   32 B validator_set_hash      // keccak(header of Set_{epoch+1})  — the successor set, always
   u64  epoch                   // epoch of the signing set Set_epoch
 
@@ -161,7 +167,7 @@ a **new record type behind the identical cell** (§7).
 
 | Rule | Value |
 |---|---|
-| Heights | **M** = first modern-PoS block, epoch 0 starts; **F = M** — the finality rules ship in the X-pin Modern-PoS release (the first binary that validates any modern-era block; the v1 binary refuses H+1); separate bridge activation **B ≥ F** |
+| Heights | **M** = first modern-PoS block, epoch 0 starts; **F = M** — the finality rules ship in the X-pin Modern-PoS release; inbound bridge activation **B ≥ F**; irreversible burn activation **W ≥ B** and fail-closed while unset |
 | Epoch start | `epoch_start[0] = M`; at the first block of epoch `e`, `Set_{e+1} := Snapshot(epoch_start[e] − 1)` (so `Set_1 = Set_0 = Snapshot(M−1)`); `Set_{e+1}` is known for all of epoch `e` and every epoch-`e` certificate carries `hash(Set_{e+1})` |
 | Snapshot(b) | every `validator_key` with ACTIVE STAKE weight `w > 0` at height `b` (STAKE v1, 20-block maturity, aggregation per key — unchanged) **and** a non-revoked `binding[validator_key]` at height `b` → member `(bls_pubkey, w)`; sorted by `validator_key`; `w` in whole modern B3. **One stake universe (FINAL, owner ruling 2026-08-23): from F (= M) a validator key without a non-revoked binding is NOT eligible to produce blocks** (M1 eligibility requires the binding), so the block-production weight `W` and the finality weight are the same quantity |
 | **Handover-gated rotation** (**FINAL**, owner ruling 2026-08-23) | epoch `e+1` begins at the first height `h ≥ epoch_start[e] + E` such that the chain below `h` contains a valid certificate with `epoch = e` (it necessarily carries `hash(Set_{e+1})`). Until then epoch `e` **extends**: checkpoints continue, signed by `Set_e`, all with `epoch = e`. A set never signs before the previous set has attested it on-chain — B3 and the Ethereum verifier follow the identical `e → e+1` rule |
@@ -170,7 +176,7 @@ a **new record type behind the identical cell** (§7).
 | Checkpoints | heights `h` with `(h − M) mod CHECKPOINT_INTERVAL = 0` |
 | Signing (validator behaviour) | after `tip − h ≥ CHECKPOINT_DEPTH`; one signature per height; strictly increasing heights; only descendants of the latest certified checkpoint known |
 | Certificate carrier | `FINALITY_CERT` cell + `FINALITY_CERTIFICATE` record in the **coinbase**, ≤ 1 per block (§3.1); the checkpoint must be an ancestor at that height on this chain; **epoch window `{current, current − 1}` (FINAL)** accepted only with: `FinalizedBlock.height` strictly greater than the highest certified height (monotone — an old-set certificate can never overwrite newer finalized state), the certificate's `validator_set_hash` equal to `hash(Set_{epoch+1})` as derived on this chain, and the epoch relation `epoch(height) == FinalizedBlock.epoch` |
-| Validation order | MPA frame/lengths → type activation → cell↔record binding → verification-cost budget and per-block counts → epoch window / ancestry → bitmap rules → quorum by weight → `FastAggregateVerify` last. Failure ⇒ `bad-finality-cert` / `bad-finality-cert-form`, block invalid |
+| Validation order | MPA frame/lengths → type activation → cell↔record binding → verification-cost budget and per-block counts → epoch window / ancestry → bitmap rules → quorum by weight **and headcount** → `FastAggregateVerify` last. Failure ⇒ `bad-finality-cert` / `bad-finality-cert-form`, block invalid |
 | Finality pin (from F) | on connect of a block carrying a valid certificate for checkpoint `C`: `finalized_tip = C`; a reorganization that would disconnect `finalized_tip` is refused (`modern-finality-violation`, no peer penalty, skipped during reindex/import). Pins apply on the active chain only |
 | No certificate | the chain continues under V1 (blocks never depend on certificates); the epoch extends; withdrawals wait; beyond `MAX_EPOCH_EXTENSION` → lineage broken (above) |
 | Archive | every node keeps the highest certificate per epoch it has seen (included or not) and serves it by RPC |
@@ -183,54 +189,102 @@ a **new record type behind the identical cell** (§7).
 
 ```solidity
 bytes32 immutable CHAIN_DOMAIN;
-bytes32 immutable GENESIS_SET_HASH;  SetHeader GENESIS_SET;  uint64 immutable GENESIS_EPOCH; // = 0
+bytes32 immutable BOOTSTRAP_SET_HASH; SetHeader BOOTSTRAP_SET; uint256 immutable BOOTSTRAP_DEADLINE;
+bool initialized; uint256 GENESIS_TIME; bytes32 GENESIS_SET_HASH;
 uint64  currentEpoch;     bytes32 currentSetHash;   SetHeader currentSet;
 bytes32 nextSetHash;      SetHeader nextSet;         // zero until learned
 mapping(uint64 => bytes32) setHashByEpoch;            // append-only
 FinalizedBlock latest;                                 // height strictly increasing
+uint256 lastCertificateTime;                           // live-finality signal; never set lifetime
 uint256 lastRotationTime;
+uint32 immutable MIN_BRIDGE_VALIDATORS; uint32 immutable MAX_BRIDGE_VALIDATORS;
+uint256 immutable MIN_EPOCH_DURATION; uint256 immutable MAX_EPOCH_LAG;
+uint256 immutable MAX_CERTIFICATE_AGE;
+uint256 immutable MIN_DEPOSIT_EXIT_WINDOW;
 IB3FinalityProver prover;
 ```
 
-Constructor: `CHAIN_DOMAIN`, `GENESIS_SET = header of Set_0` (must have `epoch == 0`,
-`ruleset_version == 1`, pass §5.4 header rules), `currentEpoch = 0`,
-`currentSetHash = setHashByEpoch[0] = keccak(GENESIS_SET)`, `latest = {M−1, 0, 0, 0, 0}`,
-`lastRotationTime = block.timestamp`, `prover = BlsCertificateProver`.
+Constructor: `CHAIN_DOMAIN`, the exact synthetic four-key `BOOTSTRAP_SET`
+(`epoch=0`, `n=4`, `W=4`, `quorum=3`), its hash, proof runtime/hash, B/M and
+security windows. It leaves `currentSetHash = 0`, `initialized = false` and
+`lastRotationTime = 0`. `BOOTSTRAP_DEADLINE` must be after deployment but no
+more than `MAX_EPOCH_LAG` later.
+
+`initialize(snapshot, genesisSet, proof)` requires: not initialized; deadline
+not passed; `snapshot = {M−1, nonzero block_hash, 0,
+keccak(genesisSet), epoch 0}`; a structurally valid epoch-zero Set_0; and
+`prover.verify(CHAIN_DOMAIN, snapshot, BOOTSTRAP_SET_HASH, BOOTSTRAP_SET,
+proof)`. The pinned equal-weight/header-count rules make this exactly 3-of-4.
+Success installs Set_0, records its hash, sets `latest=snapshot`, starts
+`GENESIS_TIME=lastRotationTime=block.timestamp`, and irreversibly closes
+`initialize`.
 
 ### 5.2 `submitCertificate(FinalizedBlock fb, SetHeader successor, bytes proof)`
 
 ```
 1  require fb.epoch == currentEpoch
         || (fb.epoch == currentEpoch + 1 && nextSetHash != 0)            // EPOCH TRANSITION
-2  if fb.epoch == currentEpoch + 1:
-        currentSet = nextSet; currentSetHash = nextSetHash; currentEpoch += 1
-        nextSet = ∅; nextSetHash = 0
-        setHashByEpoch[currentEpoch] = currentSetHash
-        require block.timestamp − lastRotationTime ≤ MAX_EPOCH_LAG;  lastRotationTime = block.timestamp
-3  require fb.height > latest.height                                       // monotone finality
-4  require successor.epoch == fb.epoch + 1
+2  require block.timestamp − lastRotationTime ≤ MAX_EPOCH_LAG
+3  require GENESIS_TIME + fb.epoch * MIN_EPOCH_DURATION ≤ block.timestamp
+        ≤ GENESIS_TIME + (fb.epoch + 1) * MAX_EPOCH_LAG
+   if transition: require block.timestamp − lastRotationTime ≥ MIN_EPOCH_DURATION
+4  select signingSet = currentSet, or precommitted nextSet for a transition
+5  require fb.height > latest.height                                       // monotone finality
+6  require successor.epoch == fb.epoch + 1
         && checkHeaderRules(successor)                                    // §5.4
         && keccak(encode(successor)) == fb.validatorSetHash
-5  require prover.verify(CHAIN_DOMAIN, fb, currentSetHash, currentSet, proof)   // §5.3
-6  if nextSetHash == 0: nextSet = successor; nextSetHash = fb.validatorSetHash
+7  require prover.verify(CHAIN_DOMAIN, fb, signingSetHash, signingSet, proof)   // §5.3
+8  if transition, install the verified precommitted nextSet as currentSet,
+       increment currentEpoch, clear nextSet, and record setHashByEpoch
+9  if nextSetHash == 0: nextSet = successor; nextSetHash = fb.validatorSetHash
    else require nextSetHash == fb.validatorSetHash                          // one successor per epoch
-7  latest = fb;  emit Finalized(fb.epoch, fb.height, fb.blockHash, fb.withdrawalRoot)
+10 latest = fb; lastCertificateTime = block.timestamp
+   if transition: lastRotationTime = block.timestamp
+   emit Finalized(fb.epoch, fb.height, fb.blockHash, fb.withdrawalRoot)
 ```
 
 **Epoch transition, exactly:** the verifier accepts certificates only from `Set_currentEpoch`
 (step 1, first clause) or — once some certificate of `currentEpoch` has disclosed the
-successor header (step 6) — from `Set_{currentEpoch+1}`, which performs the rotation
-(step 2) *before* signature verification, so the certificate is checked against the set
-that actually signed it. Epochs can never be skipped: a certificate of epoch `e+2` is
+successor header (step 8) — from `Set_{currentEpoch+1}`, which performs the rotation
+only *after* signature verification against that precommitted set. Epochs can never be
+skipped: a certificate of epoch `e+2` is
 rejected until one of `e+1` has rotated the verifier. Within an epoch any number of
 checkpoints may be skipped. A carry-over epoch is an ordinary rotation (same members,
 new `epoch` in the header, different hash).
 
+The absolute window prevents an epoch from appearing before B3 could have
+reached it and expires old epoch numbers. The relative minimum is independently
+required: after a relay outage, several absolute lower bounds may already be
+in the past, so without per-handover spacing a withheld lineage could batch-walk
+them and repeatedly renew `lastRotationTime`. Honest catch-up consequently
+takes one real minimum epoch per missed rotation. These wall-clock bounds fail
+closed but do not eliminate PoS weak subjectivity if compromised historical
+keys keep a competing lineage current in real time; live honest relaying and a
+reviewed deployment checkpoint remain security assumptions.
+
+`bridgeReady()` reports live finality only: both `currentSet` and the known,
+attested `nextSet` meet the minimum stake/headcount thresholds and the immutable
+`MAX_BRIDGE_VALIDATORS` ceiling, the newest certificate is no older than
+`MAX_CERTIFICATE_AGE`, and more than `MIN_DEPOSIT_EXIT_WINDOW` remains before
+`MAX_EPOCH_LAG`. The immutable vault uses this readiness for inbound deposits:
+before initialization, without a fresh valid certificate, or while either set
+is unqualified, deposits fail closed. Deployment before M creates no
+corridor-deposit window. Irreversible burns use the separate B3 consensus
+height `W >= B`. If B is enabled while W is unset, verified deposits can mint
+bUSD after readiness but every withdrawal record is rejected; this custodial
+waiting period must be disclosed. An accepted root alone is not outbound
+activation.
+
 ### 5.3 `BlsCertificateProver.verify(domain, fb, setHash, set, proof)` — today's prover
 
 ```
-proof = abi.encode(bytes bitmap, bytes sig /*96*/, Absent[] absent, bytes32[] multiproof, bool[] flags)
-Absent = { uint32 index; bytes pubkey /*48*/; uint64 weight; }
+proof = abi.encode(bytes bitmap,
+                   bytes signature /*256-byte EIP-2537 G2*/,
+                   bytes aggregatePubkey /*128-byte EIP-2537 G1*/,
+                   Absent[] absent)
+Absent = { uint32 index; bytes pubkey /*48-byte compressed G1*/;
+           uint64 weight; bytes uncompressedPubkey /*128-byte EIP-2537 G1*/;
+           bytes32[13] siblings /*leaf level first*/; }
 
 A  SIGNER BITMAP
    n = set.validatorCount
@@ -238,13 +292,17 @@ A  SIGNER BITMAP
    require (n % 8 == 0) || (bitmap[n/8] >> (n % 8)) == 0          // high bits zero
    require absent indices strictly increasing, each < n, each with bit == 0
    require popcount(bitmap) + absent.length == n                    // bitmap ≡ complement(absent)
+   require popcount(bitmap) >= floor(2n/3) + 1                       // bridge headcount quorum
 
-B  VALIDATOR WEIGHTS (membership + weights via the Merkle root; no member list stored)
-   leaves[k] = keccak(abi.encodePacked(absent[k].index, absent[k].pubkey, absent[k].weight))
-   require MultiProofVerify(multiproof, flags, set.membersRoot, leaves)   // OpenZeppelin multiProofVerify
-                                                                             // semantics, leaves in
-                                                                             // ascending index order,
-                                                                             // depth SET_TREE_DEPTH
+B  VALIDATOR WEIGHTS (ordered membership paths; no member list stored)
+   for each absent[k]:
+       require compressed/uncompressed public-key encodings describe the same G1 point
+       node = keccak(abi.encodePacked(absent[k].index, absent[k].pubkey, absent[k].weight))
+       for level in 0..12:
+           node = ((absent[k].index >> level) & 1) == 0
+                ? keccak(node ‖ absent[k].siblings[level])
+                : keccak(absent[k].siblings[level] ‖ node)
+       require node == set.membersRoot
    absentWeight = Σ absent[k].weight                                   // u64 arithmetic in u256
    require absentWeight <= set.totalWeight
 
@@ -253,8 +311,10 @@ C  QUORUM
    require signedWeight >= set.quorumWeight                            // quorumWeight validated by §5.4
 
 D  AGGREGATE PUBLIC KEY (subtraction over the committed aggregate)
-   aggPk = set.aggregatePubkey
-   for each absent[k]: aggPk = G1ADD(aggPk, NEG(absent[k].pubkey))       // EIP-2537 BLS12_G1ADD
+   require compressed/uncompressed aggregatePubkey encodings describe the same point
+   require compressed(aggregatePubkey) == set.aggregatePubkey
+   aggPk = aggregatePubkey
+   for each absent[k]: aggPk = G1ADD(aggPk, NEG(absent[k].uncompressedPubkey)) // EIP-2537 G1ADD
    require aggPk != INFINITY
 
 E  MESSAGE
@@ -263,15 +323,22 @@ E  MESSAGE
 
 F  SIGNATURE
    require BLS12_PAIRING_CHECK([ (aggPk, Hm), (NEG(G1_GENERATOR), sig) ]) == 1
-   // precompile performs on-curve and subgroup checks on every input point; sig decoded
-   // from 96-byte compressed G2 in-contract (decompression) or supplied uncompressed
-   // with an equality check against the compressed bytes — implementation choice,
-   // the compressed 96 bytes are the canonical Certificate field
+   // the precompile performs on-curve/subgroup checks; B3's certificate carries
+   // a canonical 96-byte compressed signature, while this Ethereum witness
+   // supplies the equivalent 256-byte EIP-2537 point
    return true
 ```
 
 Signer identities are fully public: `bitmap` is emitted in the `Finalized` event data for
-accountability; the contract never learns or stores member lists.
+accountability; the contract never learns or stores member lists. Verification cost and
+calldata grow linearly with the number of absent validators, so a target-chain gas bound
+is a production activation gate rather than an assumption hidden in the relayer. V1 pins
+`MAX_BRIDGE_VALIDATORS=64`. Its post-Fusaka Osaka vector uses 64 distinct PoP-verified keys,
+43 signers and 21 absent paths: 18,144 proof bytes, 18,724 submit calldata bytes,
+5,513,351 measured gas for the complete successful verifier call, and a
+6,283,311 conservative total after charging all calldata at 40 gas/byte. This is below
+EIP-7825's 16,777,216 per-transaction cap. Larger sets remain structurally valid
+lineage headers but cannot make `bridgeReady()` true in this deployment.
 
 ### 5.4 `checkHeaderRules(h)` — enforced on every successor header and on genesis
 
@@ -295,7 +362,21 @@ only `latest.withdrawalRoot`).
 
 ## 6. Withdrawal root — exact
 
-One cumulative tree for all `BRIDGE_BURN` records on B3 (from B):
+This section freezes the implemented data path; it does not enable it.
+Withdrawals and B3 burns remain disabled while outbound height W is unset. W
+may be pinned only after round-trip canonicality and liveness safety is solved,
+audited, rehearsed, and explicitly enabled by a later B3 build.
+
+Once enabled, one cumulative tree covers all `BRIDGE_BURN` records on B3:
+
+Before admitting a burn, B3 projects finality from the parent state to the
+candidate height. Both projected current and next validator sets must exist,
+have validator counts within the deployment-pinned inclusive minimum/maximum,
+meet the deployment-pinned minimum total weight, and have an unbroken finality
+lineage. Candidate-block stake changes and the withdrawal root produced by the
+burn cannot satisfy this gate; they take effect only through later projected
+state. Ethereum wall-clock freshness remains an additional wallet/relayer
+preflight because it is not a deterministic B3 consensus input.
 
 ```
 WITHDRAWAL_TREE_DEPTH = 32
@@ -342,7 +423,9 @@ interface IB3FinalityProver {
 `ZkFinalityProver.verify` accepts `proof` = a SNARK/STARK whose public inputs are
 `(chainDomain, keccak(encode(fb)), setHash)` and whose statement is exactly §5.3 A–F
 against the set committed by `setHash`. B3 signing, headers, bitmaps and the verifier
-state machine (§5.2) are unchanged; `prover` is the single governance-changeable slot.
+state machine (§5.2) are unchanged. The deployed verifier pins its prover and runtime
+hash immutably, so adopting a ZK backend requires a separately reviewed verifier/vault
+deployment and explicit asset migration; it is not an in-place governance swap.
 
 ---
 
@@ -352,13 +435,22 @@ state machine (§5.2) are unchanged; `prover` is the single governance-changeabl
    PoP) — `blst` in-tree and the Solidity `hash_to_curve_G2` + pairing path.
 2. `finality_digest` for a fixed `FinalizedBlock` and domain (hex preimage + digest).
 3. `ValidatorSetHeader` hash and `members_root` for n ∈ {1, 4, 5, 8,192}, including
-   zero-leaf padding and a multiproof for absentees at indices {0, n−1, middle}.
+   zero-leaf padding and ordered depth-13 paths for absentees at indices
+   {0, n−1, middle}; reversing any left/right step must fail.
 4. Bitmap cases: n mod 8 ∈ {0, 1, 7}; high-bit violation; popcount mismatch.
 5. Quorum boundary: `signedWeight = quorumWeight` (accept) and `−1` (reject).
 6. Epoch transition: e→e+1 accept, e→e+2 reject, successor-hash mismatch reject,
    carry-over header accept, `MAX_EPOCH_LAG` exceeded reject.
 7. Withdrawal tree: first leaf, leaf 2^32−1 boundary proof, stale-but-valid proof against
    a newer root (accept), double release (reject), wrong chain id (reject).
+8. Bootstrap handoff: four PoP-verified identities, canonical validator-key ordering,
+   bitmap `0x0b` (members 0, 1 and 3 sign), one ordered absent-member path, aggregate
+   signature/public-key witnesses, exact proof ABI, and full `initialize` calldata must
+   byte-match between C++ and Solidity.
+9. Maximum bridge gas: 64 distinct PoP-verified members, exactly 43 signers,
+   21 ordered absent paths, fixture checksum, exact submit calldata size,
+   post-Fusaka Osaka prover gas, and a conservative total below the EIP-7825 transaction
+   cap.
 
 ---
 
@@ -373,7 +465,7 @@ state machine (§5.2) are unchanged; `prover` is the single governance-changeabl
 | `E` (epoch blocks) | **1,440** | **FINAL (owner ruling 2026-08-23)** |
 | `CHECKPOINT_INTERVAL` / `CHECKPOINT_DEPTH` | **10 / 12** | **FINAL (owner ruling 2026-08-23)** |
 | `MIN_FINALITY_SET` / `MAX_EPOCH_EXTENSION` | **2 / 7·E = 10,080** | **UPDATED 2026-09-01** — two real corridor stakers may bootstrap the chain; this is NOT a bridge security threshold |
-| Ethereum bridge signer quorum | `floor(2n/3) + 1` by headcount, in addition to B3's weight quorum | **FINAL 2026-09-01** — 2 members require 2 signatures; 4 require 3; one high-weight validator cannot release alone |
+| Finality signer quorum on B3 and Ethereum | `floor(2W/3) + 1` by weight **and** `floor(2n/3) + 1` by headcount | **ALIGNED 2026-09-02** — both consensus layers enforce the identical dual quorum; 2 members require 2 signatures, 4 require 3, and one high-weight validator cannot certify or release alone |
 | `MIN_FINALITY_WEIGHT` | none in V1 (the floor is `MIN_FINALITY_SET`; stake economics are the min-stake rule) | FINAL (no separate weight floor) |
 | `FINALITY_CERTIFICATE` `verify_cost` / `FINALITY_KEY_EVIDENCE` `verify_cost` | **2,000 / 700** units | **FINAL** |
 | `MAX_BLOCK_PAYLOAD_COST` / `MAX_TX_PAYLOAD_COST` / `COST_TO_VBYTES` | **120,000 / 12,000 / 1** | **FINAL** |
@@ -382,9 +474,13 @@ state machine (§5.2) are unchanged; `prover` is the single governance-changeabl
 | Policy numbers 6 / 7 / 8 | `FINALITY_CERT` / `FINALITY_KEY` / `MODERN_PAYLOAD_ROOT` | **FINAL, never renumbered** |
 | `FINALITY_CERTIFICATE` record max / `FINALITY_KEY_EVIDENCE` size | 1,232 B / 244 B | FINAL (layout) |
 | `MAX_EPOCH_LAG` (Ethereum verifier) | 30 days | proposed — bridge activation B decision, out of scope for Modern PoS V1 |
+| `MIN_EPOCH_DURATION` (Ethereum verifier) | 86,400 seconds | deployment pin matching the 1,440 one-minute-block epoch; absolute epoch window plus minimum spacing between accepted rotations |
+| `MAX_BRIDGE_VALIDATORS` (Ethereum release authority) | 64 | Post-Fusaka Osaka benchmark cap; larger current/successor sets close `bridgeReady`, without changing B3's 8,192 consensus layout cap |
+| `MAX_CERTIFICATE_AGE` / `MIN_DEPOSIT_EXIT_WINDOW` | 1 day / 7 days | proposed deployment pins for live-finality readiness; deposits fail closed when readiness is absent |
 | `F` | **= M**, in the X-pin Modern-PoS release | FINAL |
 | Gated rotation; epoch extension on failure | rule of §4 | FINAL |
 | Binding mandatory for block eligibility from F | yes | FINAL |
 | `FINALITY_KEY` semantics (seq-controlled, `0^48` = revoke, one active validator per BLS key) | §1.1 | FINAL |
-| `B` (separate bridge activation) | later | owner |
+| `B` (inbound bridge activation) | later B3 build only | pending complete audited deployment pins and inbound safety review; never implied by A3 |
+| `W` (irreversible B3 burn activation) | unset | later reviewed release only after canonicality/liveness safety; must be at least B |
 | Binding required for block eligibility from F | yes | FINAL |

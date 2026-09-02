@@ -98,6 +98,30 @@ Scope: B3 transition context, modern colored assets, FN Coin/Proof of Disintegra
 > operator Ethereum-release/consumption service are not implemented;
 > production pins and audits remain open, so mainnet remains fail-closed.
 
+> **Owner reconciliation (2026-09-02, decentralized bridge supersession).**
+> The managed-v1 bridge statements in the 2026-09-01 reconciliation above are
+> now **SUPERSEDED before activation**. The current production target is a new
+> immutable single-USDT `B3StakerBridge` controlled only by the immutable
+> `B3FinalityVerifier`: no owner, rescue key, proxy, pause, or arbitrary token
+> selector. A deadline-bound one-time 3-of-4 attestation by the four published
+> bootstrap BLS identities installs canonical Set_0; after initialization the
+> bootstrap path is unreachable and ordinary B3 staker-finality certificates
+> and set handovers are the only withdrawal authority. Anyone may relay the
+> certificate and withdrawal proof and pays Ethereum gas; B3 never holds an
+> Ethereum private key. The bridge has inbound height B selected only by a
+> later B3 build after the complete audited deployment tuple is collected,
+> reviewed, and pinned. A3 remains FlowMesh only. The vault may be deployed
+> before M, but deposits remain disabled until initialization and a fresh valid
+> certificate prove qualified current and successor sets. Irreversible burns
+> use a separate height W that remains unset until canonicality and liveness
+> safety is solved and explicitly enabled; B before W is a disclosed custodial
+> waiting period. The historical managed smoke
+> vault and its AssetId are excluded from the production registry, subject to
+> rechecking that it still has no USDT liability and that no consensus bUSD was
+> activated; otherwise an explicit migration is required. Production remains
+> fail-closed pending all contract, checkpoint, cap, adapter, audit, bootstrap,
+> and rehearsal gates.
+
 ## 0. How this document must be used
 
 This document is the canonical context for future Claude sessions. It is not an instruction to implement every section at once.

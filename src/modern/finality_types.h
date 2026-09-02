@@ -73,7 +73,7 @@ struct FinalizedBlock {
     static constexpr size_t SIZE{8 + 32 + 32 + 32 + 8};
     uint64_t height{0};
     uint256 block_hash{};
-    uint256 withdrawal_root{};     // all-zero before bridge activation
+    uint256 withdrawal_root{};     // all-zero before inbound bridge height B
     uint256 validator_set_hash{};  // keccak(header of the SUCCESSOR set)
     uint64_t epoch{0};             // epoch of the signing set
 

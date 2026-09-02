@@ -28,9 +28,26 @@ bool SameState(const FinalityTracker::State& a, const FinalityTracker::State& b)
 {
     auto hash_of{[](const std::shared_ptr<const node::ValidatorSetSnapshot>& s) { return s ? s->SetHash() : uint256{}; }};
     return a.bootstrapped == b.bootstrapped && a.epoch == b.epoch && a.epoch_starts == b.epoch_starts &&
+           hash_of(a.bootstrap) == hash_of(b.bootstrap) &&
            hash_of(a.previous) == hash_of(b.previous) && hash_of(a.current) == hash_of(b.current) &&
            hash_of(a.next) == hash_of(b.next) && a.handover_certified == b.handover_certified &&
            a.lineage_broken == b.lineage_broken && a.finalized == b.finalized;
+}
+
+Consensus::BridgeDecentralizedWithdrawalPins BridgePins()
+{
+    Consensus::BridgeDecentralizedWithdrawalPins pins;
+    pins.ethereum_verifier_address.fill(0x11);
+    pins.ethereum_verifier_code_hash = uint256::ONE;
+    pins.bootstrap_validator_set_hash = uint256{uint8_t{2}};
+    pins.withdrawal_rules_version =
+        Consensus::DECENTRALIZED_WITHDRAWAL_RULES_VERSION_V1;
+    pins.withdrawal_rules_commitment = uint256{uint8_t{3}};
+    pins.min_bridge_validators = 4;
+    pins.max_bridge_validators = 4;
+    pins.min_bridge_total_weight = 34;
+    pins.max_epoch_lag = 1;
+    return pins;
 }
 
 } // namespace
@@ -51,7 +68,9 @@ BOOST_FIXTURE_TEST_CASE(bootstrap_and_certificates_on_chain, FinalityChainFixtur
         BOOST_CHECK_EQUAL(s.epoch, 0U);
         BOOST_REQUIRE_EQUAL(s.epoch_starts.size(), 1U);
         BOOST_CHECK_EQUAL(s.epoch_starts[0], M);
-        BOOST_REQUIRE(s.current && s.next && !s.previous);
+        BOOST_REQUIRE(s.bootstrap && s.current && s.next && !s.previous);
+        BOOST_CHECK_EQUAL(s.bootstrap->SetHash().GetHex(),
+                          s.current->SetHash().GetHex());
         BOOST_CHECK_EQUAL(s.current->Size(), 2U);
         BOOST_CHECK_EQUAL(s.current->Epoch(), 0U);
         BOOST_CHECK_EQUAL(s.next->Epoch(), 1U);
@@ -89,8 +108,17 @@ BOOST_FIXTURE_TEST_CASE(bootstrap_and_certificates_on_chain, FinalityChainFixtur
     Produce(m_vk_a); // M+9
     ProduceTo(M + 12, m_vk_a);
     ProduceExpectConnectFailure(m_vk_a, {MakeCertificate({M + 10, 0, next_hash, /*a=*/false, /*b=*/true}, set0)}, 7);
-    // The heavy validator alone (15 of 16 >= quorum 11) certifies M+10 at M+13.
-    Produce(m_vk_a, {MakeCertificate({M + 10, 0, next_hash, /*a=*/true, /*b=*/false}, set0)});
+    // Weight alone is insufficient: A has 15 of 16 stake, but only one of
+    // two validator identities. The independent headcount quorum requires
+    // both signers. Reject the weight-only certificate, then accept 2-of-2.
+    ProduceExpectConnectFailure(
+        m_vk_a,
+        {MakeCertificate({M + 10, 0, next_hash, /*a=*/true,
+                          /*b=*/false},
+                         set0)},
+        7);
+    Produce(m_vk_a,
+            {MakeCertificate({M + 10, 0, next_hash}, set0)});
     BOOST_CHECK_EQUAL(FinalityState().finalized->height, M + 10);
     // A missed checkpoint (M+15) is simply skipped: M+20 certifies at M+23.
     ProduceTo(M + 22, m_vk_a);
@@ -225,6 +253,9 @@ BOOST_FIXTURE_TEST_CASE(gated_rotation_extension_delayed_and_carry_over, Finalit
         BOOST_CHECK_EQUAL(s.previous->SetHash().GetHex(), set1.SetHash().GetHex());
         BOOST_CHECK_EQUAL(s.current->SetHash().GetHex(), set2.SetHash().GetHex());
         BOOST_CHECK_EQUAL(s.next->Epoch(), 3U);
+        BOOST_REQUIRE(s.bootstrap);
+        BOOST_CHECK_EQUAL(s.bootstrap->SetHash().GetHex(),
+                          set0.SetHash().GetHex());
         bool saw_new{false};
         for (const auto& m : s.next->Members()) {
             if (m.validator_key == m_vk_b) saw_new = (m.bls_pubkey == bls_b2.GetPublicKey().Compressed());
@@ -304,6 +335,66 @@ BOOST_FIXTURE_TEST_CASE(last_chance_handover_rotates, FinalityChainFixture)
     BOOST_CHECK_EQUAL(s.epoch, 1U);
     BOOST_CHECK(!s.lineage_broken);
     BOOST_CHECK_EQUAL(s.epoch_starts.back(), last_chance + 1);
+}
+
+BOOST_FIXTURE_TEST_CASE(bridge_readiness_rebuild_and_reorg_are_exact,
+                        FinalityChainFixture)
+{
+    PrepareFinalityChain(/*min_finality_set=*/4,
+                         /*reorg_horizon=*/200,
+                         /*with_unbound_c=*/false,
+                         /*with_bound_c=*/true,
+                         /*with_bound_d=*/true);
+    const int M{m_M};
+    Produce(m_vk_a);
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, M);
+    const uint256 modern_tip{Tip()->GetBlockHash()};
+    const auto pins{BridgePins()};
+    BOOST_REQUIRE(pins.Valid());
+    BOOST_CHECK(node::BridgeWithdrawalValidatorSetsReady(
+        FinalityState(), pins));
+
+    // A full tracker replay derives the same readiness bit.
+    WITH_LOCK(cs_main,
+              m_node.chainman->ActiveChainstate().ModernFinality().MarkDirty());
+    BOOST_CHECK(node::BridgeWithdrawalValidatorSetsReady(
+        FinalityState(), pins));
+
+    // Disconnecting the Modern-PoS bootstrap block removes the sets and
+    // closes burns. Reconsidering the identical block reconstructs them and
+    // reopens the gate without any persisted readiness flag.
+    {
+        BlockValidationState state;
+        CBlockIndex* index{WITH_LOCK(
+            cs_main,
+            return m_node.chainman->m_blockman.LookupBlockIndex(modern_tip))};
+        BOOST_REQUIRE(index != nullptr);
+        BOOST_REQUIRE(
+            m_node.chainman->ActiveChainstate().InvalidateBlock(state, index));
+        BOOST_REQUIRE(
+            m_node.chainman->ActiveChainstate().ActivateBestChain(state));
+    }
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, M - 1);
+    BOOST_CHECK(!node::BridgeWithdrawalValidatorSetsReady(
+        FinalityState(), pins));
+
+    {
+        CBlockIndex* index{WITH_LOCK(
+            cs_main,
+            return m_node.chainman->m_blockman.LookupBlockIndex(modern_tip))};
+        BOOST_REQUIRE(index != nullptr);
+        {
+            LOCK(cs_main);
+            m_node.chainman->ActiveChainstate().ResetBlockFailureFlags(index);
+            m_node.chainman->RecalculateBestHeader();
+        }
+        BlockValidationState state;
+        BOOST_REQUIRE(
+            m_node.chainman->ActiveChainstate().ActivateBestChain(state));
+    }
+    BOOST_REQUIRE(Tip()->GetBlockHash() == modern_tip);
+    BOOST_CHECK(node::BridgeWithdrawalValidatorSetsReady(
+        FinalityState(), pins));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

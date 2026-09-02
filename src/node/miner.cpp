@@ -173,6 +173,9 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
                                Consensus::ConsensusPhase::TRANSITION_POW};
     const bool b3_bridge_active{
         b3_modern && Consensus::BridgeRulesActive(nHeight, b3_consensus)};
+    const bool b3_bridge_withdrawals_active{
+        b3_modern &&
+        Consensus::BridgeWithdrawalRulesActive(nHeight, b3_consensus)};
     if (b3_consensus.legacy_b3coin && !b3_modern) {
         throw std::runtime_error("legacy-era B3 block production is not supported");
     }
@@ -228,12 +231,35 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
                 "FlowMesh checkpoint index is unavailable for block assembly");
         }
     }
+    BridgeBurnReadiness bridge_burn_readiness{
+        b3_bridge_withdrawals_active ? BridgeBurnReadiness::READY
+                                     : BridgeBurnReadiness::UNAVAILABLE};
     if (b3_bridge_active) {
         node::BridgeStateTracker& bridge{m_chainstate.ModernBridgeState()};
         if (!bridge.Sync(m_chainstate.m_chain, m_chainstate.m_blockman,
                          b3_consensus, *pindexPrev)) {
             throw std::runtime_error(
                 "bridge state is unavailable for block assembly");
+        }
+        if (b3_bridge_withdrawals_active &&
+            b3_consensus.busd_bridge->withdrawal_mode ==
+                Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
+            b3_consensus.busd_bridge->decentralized_withdrawal) {
+            bridge_burn_readiness = BridgeBurnReadiness::UNAVAILABLE;
+            node::FinalityTracker& finality{m_chainstate.ModernFinality()};
+            if (finality.Sync(m_chainstate.m_chain,
+                              m_chainstate.m_blockman, b3_consensus,
+                              *pindexPrev, &bridge.Index())) {
+                const node::FinalityTracker::State projected{
+                    finality.Projected(nHeight, b3_consensus)};
+                bridge_burn_readiness =
+                    node::BridgeWithdrawalValidatorSetsReady(
+                        projected,
+                        *b3_consensus.busd_bridge
+                             ->decentralized_withdrawal)
+                        ? BridgeBurnReadiness::READY
+                        : BridgeBurnReadiness::NOT_READY;
+            }
         }
     }
 
@@ -384,7 +410,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     if (m_mempool) {
         LOCK(m_mempool->cs);
         m_mempool->StartBlockBuilding();
-        addChunks(bridge_preview.get(),
+        addChunks(bridge_preview.get(), bridge_burn_readiness,
                   finality_binding_preview ? &*finality_binding_preview : nullptr);
         m_mempool->StopBlockBuilding();
     }
@@ -728,6 +754,7 @@ void BlockAssembler::AddToBlock(const CTxMemPoolEntry& entry)
 
 void BlockAssembler::addChunks(
     BridgeBlockPreview* const bridge_preview,
+    const BridgeBurnReadiness bridge_burn_readiness,
     FinalityBindingOverlay* const finality_binding_preview)
 {
     // Limit the number of attempts to add transactions to the block when it is
@@ -776,8 +803,16 @@ void BlockAssembler::addChunks(
                 bridge_transactions.push_back(entry.get().GetSharedTx());
             }
             std::string error;
-            chunk_accepted = bridge_preview->TryAppend(bridge_transactions,
-                                                       error);
+            chunk_accepted = std::all_of(
+                bridge_transactions.begin(), bridge_transactions.end(),
+                [&](const CTransactionRef& tx) {
+                    return CheckBridgeBurnReadiness(
+                        *tx, bridge_burn_readiness, error);
+                });
+            if (chunk_accepted) {
+                chunk_accepted = bridge_preview->TryAppend(
+                    bridge_transactions, error);
+            }
         }
         if (!chunk_accepted) {
             // This chunk won't fit, so we skip it and will try the next best one.

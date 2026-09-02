@@ -187,14 +187,13 @@ public:
         // Its complete sealed-history manifest is decoded and verified below
         // after the chain genesis hash is assigned.
         consensus.fn_genesis_required = true;
-        // Owner-ratified bridge-backed bUSD identity (2026-09-01): Ethereum
-        // mainnet USDT locked in the published vault, represented 1:1 at six
-        // decimals. The owner selected managed withdrawals for transition v1,
-        // but identity and mode alone cannot mint. Every concrete stage-4
-        // security value intentionally remains unset, so mainnet is
-        // fail-closed until the bootstrap, caps, adapter/version, activation,
-        // immutable authority, vault-code hash and withdrawal-rules commitment
-        // are approved in a reviewed pinning commit before activation.
+        // Historical managed-v1 identity retained as a fail-closed audit
+        // record. It is not the 2026-09-02 decentralized production target and
+        // must be replaced, not completed in place. The reviewed production
+        // commit must pin the newly deployed keyless vault, its derived
+        // AssetId, decentralized verifier envelope, light-client/cap/adapter
+        // values, and independent activation B. Until then mainnet cannot mint
+        // bridge-backed bUSD or accept a bridge burn.
         Consensus::BridgeAssetParams busd;
         busd.asset = Consensus::ETHEREUM_MAINNET_BUSD_IDENTITY;
         busd.withdrawal_mode = Consensus::BridgeWithdrawalMode::MANAGED_V1;
@@ -205,13 +204,17 @@ public:
             Consensus::BUSD_ETHEREUM_VAULT_RUNTIME_CODE_HASH;
         managed.withdrawal_rules_version =
             Consensus::MANAGED_WITHDRAWAL_RULES_VERSION_V1;
-        // The versioned operating rules are not yet ratified/committed. This
-        // deliberate null keeps BridgeMintParamsReady false even though the
-        // independently observed immutable deployment facts are now pinned.
+        // Deliberately incomplete: this keeps BridgeMintParamsReady false and
+        // prevents the historical vault from becoming active accidentally.
         busd.managed_withdrawal = managed;
         consensus.busd_bridge = busd;
         assert(Consensus::BridgeAssetIdentityValid(consensus.busd_bridge->asset));
         assert(!Consensus::BridgeMintParamsReady(*consensus.busd_bridge));
+        // If a later reviewed pinning commit completes this mainnet envelope,
+        // it must never silently point B3 mainnet at an Ethereum test chain.
+        assert(!Consensus::BridgeMintParamsReady(*consensus.busd_bridge) ||
+               consensus.busd_bridge->asset.origin_chain_id ==
+                   Consensus::BUSD_ETHEREUM_CHAIN_ID);
         // RATIFIED (owner ruling 2026-08-21): minimum STAKE principal is
         // 333 modern B3 (the kB3 nomination: 1 modern B3 = 1,000 legacy B3
         // = 1e9 base units), i.e. 333,000 legacy-denomination B3.
@@ -259,6 +262,12 @@ public:
         // Historical live-legacy checkpoint rules, ported verbatim.
         consensus.legacy_checkpoints = legacy::MainnetCheckpoints();
         consensus.legacy_checkpoint_span = legacy::LEGACY_CHECKPOINT_SPAN;
+        // Separately pin the first post-legacy corridor block, which also
+        // carries deterministic historical FN Genesis. This is its modern
+        // SHA256d block identity, not a legacy replay checkpoint.
+        consensus.modern_checkpoints = {
+            {810'001, uint256{"913fb38c75e0f12d8d5e6ea65a0ffce33a22a6908392a94661eab7c8506f6014"}},
+        };
         // The historical one-off superblock (chainparams nSuperBlockHeight /
         // vSuperBlockPubKey in the final client, hex verbatim).
         consensus.legacy_superblock_height = 107'488;
@@ -1006,11 +1015,21 @@ public:
                 // mainnet's. No value below is a production recommendation.
                 Consensus::BridgeAssetParams busd;
                 busd.asset = Consensus::ETHEREUM_MAINNET_BUSD_IDENTITY;
+                busd.asset.origin_chain_id = 31'337;
+                // Synthetic but nonzero: zero is reserved for an incomplete
+                // deployment manifest on every network, including regtest.
+                busd.origin_deployment_block = 1;
+                busd.vault_runtime_code_hash = uint256{uint8_t{6}};
                 busd.implementation_or_adapter = uint256{uint8_t{1}};
                 busd.adapter_version = 1;
                 busd.recipient_encoding_version =
                     Consensus::BRIDGE_RECIPIENT_VERSION_P2PKH_V1;
                 busd.activation_height = consensus.flowmesh_activation_height;
+                // Test-only chains exercise the complete round trip at the
+                // inbound height. Mainnet deliberately leaves the independent
+                // outbound gate unset until a later reviewed release.
+                consensus.bridge_withdrawal_activation_height =
+                    busd.activation_height;
                 busd.mint_caps = Consensus::BridgeMintCaps{
                     .max_per_block = 1'000'000'000,
                     .max_per_epoch = 10'000'000'000,
@@ -1030,7 +1049,8 @@ public:
                     Consensus::BridgeWithdrawalMode::MANAGED_V1;
                 Consensus::BridgeManagedWithdrawalPins withdrawal;
                 withdrawal.authority_address.fill(0x42);
-                withdrawal.vault_runtime_code_hash = uint256{uint8_t{4}};
+                withdrawal.vault_runtime_code_hash =
+                    *busd.vault_runtime_code_hash;
                 withdrawal.withdrawal_rules_version =
                     Consensus::MANAGED_WITHDRAWAL_RULES_VERSION_V1;
                 withdrawal.withdrawal_rules_commitment = uint256{uint8_t{5}};

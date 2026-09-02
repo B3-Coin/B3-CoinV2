@@ -30,6 +30,7 @@
 #include <legacy/consensus.h>
 #include <logging.h>
 #include <merkleblock.h>
+#include <modern/finality_types.h>
 #include <net.h>
 #include <net_permissions.h>
 #include <netaddress.h>
@@ -228,6 +229,22 @@ static constexpr double MAX_ADDR_RATE_PER_SECOND{0.1};
  *  based increments won't go above this, but the MAX_ADDR_TO_SEND increment following GETADDR
  *  is exempt from this limit). */
 static constexpr size_t MAX_ADDR_PROCESSING_TOKEN_BUCKET{MAX_ADDR_TO_SEND};
+/**
+ * Finality signatures each require an expensive BLS verification. Bound that
+ * work before entering cs_main without penalizing honest peers whose
+ * signatures became stale across a reorg or epoch race. A one-shot gossip
+ * protocol cannot retry messages dropped from a small burst, so the per-peer
+ * bucket admits one complete maximum-size validator set and the global bucket
+ * admits two such bursts for duplicate-path overlap. The much smaller refill
+ * rates still bound sustained hostile verification work.
+ */
+static constexpr double MAX_FINALITY_SIG_RATE_PER_SECOND{32.0};
+static constexpr size_t MAX_FINALITY_SIG_TOKEN_BUCKET{
+    modern::MAX_FINALITY_SET};
+static constexpr double MAX_GLOBAL_FINALITY_SIG_RATE_PER_SECOND{128.0};
+static constexpr size_t MAX_GLOBAL_FINALITY_SIG_TOKEN_BUCKET{
+    2 * modern::MAX_FINALITY_SET};
+static_assert(MAX_FINALITY_SIG_TOKEN_BUCKET >= modern::MAX_FINALITY_SET);
 /** The compactblocks version we support. See BIP 152. */
 static constexpr uint64_t CMPCTBLOCKS_VERSION{2};
 /** For private broadcast, send a transaction to this many peers. */
@@ -421,6 +438,11 @@ struct Peer {
     std::atomic<uint64_t> m_addr_rate_limited{0};
     /** Total number of addresses that were processed (excludes rate-limited ones). */
     std::atomic<uint64_t> m_addr_processed{0};
+
+    /** Expensive finality-signature verifications allowed from this peer. */
+    double m_finality_sig_token_bucket GUARDED_BY(NetEventsInterface::g_msgproc_mutex){MAX_FINALITY_SIG_TOKEN_BUCKET};
+    /** When m_finality_sig_token_bucket was last updated. */
+    std::chrono::microseconds m_finality_sig_token_timestamp GUARDED_BY(NetEventsInterface::g_msgproc_mutex){GetTime<std::chrono::microseconds>()};
 
     /** Whether we've sent this peer a getheaders in response to an inv prior to initial-headers-sync completing */
     bool m_inv_triggered_getheaders_before_sync GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
@@ -982,6 +1004,11 @@ private:
     std::atomic<int> m_best_height{-1};
     /** The time of the best chain tip block */
     std::atomic<std::chrono::seconds> m_best_block_time{0s};
+
+    /** Whole-node BLS verification budget for finality-signature gossip. */
+    double m_finality_sig_global_token_bucket GUARDED_BY(g_msgproc_mutex){MAX_GLOBAL_FINALITY_SIG_TOKEN_BUCKET};
+    /** When m_finality_sig_global_token_bucket was last updated. */
+    std::chrono::microseconds m_finality_sig_global_token_timestamp GUARDED_BY(g_msgproc_mutex){GetTime<std::chrono::microseconds>()};
 
     /** Next time to check for stale tip */
     std::chrono::seconds m_stale_tip_check_time GUARDED_BY(cs_main){0s};
@@ -6034,13 +6061,42 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         // B3 finality-signature gossip (liveness only; consensus acceptance
         // happens exclusively through certificates in blocks). Fixed-size
         // message; cheap structural / schedule / set checks run before the
-        // single BLS verification, inside the pool. No peer penalty for
-        // semantically stale or unverifiable signatures: forks and epoch
-        // races make them indistinguishable from honest latecomers.
-        node::FinalitySig finsig;
-        vRecv >> finsig;
+        // single BLS verification, inside the pool. Per-peer and global token
+        // buckets bound that expensive work before cs_main. There is no peer
+        // penalty for semantically stale or unverifiable signatures: forks
+        // and epoch races make them indistinguishable from honest latecomers.
         const Consensus::Params& consensus{m_chainparams.GetConsensus()};
         if (!consensus.legacy_b3coin || !consensus.modern_pos) return;
+
+        const auto now{GetTime<std::chrono::microseconds>()};
+        const auto refill_bucket = [&](double& bucket,
+                                       std::chrono::microseconds& updated,
+                                       const double rate,
+                                       const size_t capacity) {
+            if (bucket < capacity) {
+                const auto elapsed{std::max(now - updated, 0us)};
+                bucket = std::min<double>(
+                    bucket + Ticks<SecondsDouble>(elapsed) * rate, capacity);
+            }
+            updated = now;
+        };
+        refill_bucket(peer.m_finality_sig_token_bucket,
+                      peer.m_finality_sig_token_timestamp,
+                      MAX_FINALITY_SIG_RATE_PER_SECOND,
+                      MAX_FINALITY_SIG_TOKEN_BUCKET);
+        refill_bucket(m_finality_sig_global_token_bucket,
+                      m_finality_sig_global_token_timestamp,
+                      MAX_GLOBAL_FINALITY_SIG_RATE_PER_SECOND,
+                      MAX_GLOBAL_FINALITY_SIG_TOKEN_BUCKET);
+        if (peer.m_finality_sig_token_bucket < 1.0 ||
+            m_finality_sig_global_token_bucket < 1.0) {
+            return;
+        }
+        peer.m_finality_sig_token_bucket -= 1.0;
+        m_finality_sig_global_token_bucket -= 1.0;
+
+        node::FinalitySig finsig;
+        vRecv >> finsig;
         bool relay{false};
         {
             LOCK(cs_main);

@@ -12,6 +12,7 @@
 #include <util/strencodings.h>
 
 #include <array>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -188,6 +189,193 @@ inline LightClientConfig ParseConfig(const UniValue& v)
         cfg.min_participants = static_cast<unsigned>(Num(v.find_value("min_participants"), "min_participants"));
     }
     return cfg;
+}
+
+inline std::string EthereumHex(const uint256& value)
+{
+    return "0x" + HexStr(value);
+}
+
+template <size_t N>
+inline std::string EthereumHex(const std::array<unsigned char, N>& value)
+{
+    return "0x" + HexStr(value);
+}
+
+//! Convert the SSZ uint256 chunk's little-endian bytes to the decimal form
+//! used by the beacon API for base_fee_per_gas.
+inline std::string Uint256LEToDecimal(const uint256& value)
+{
+    std::array<unsigned char, 32> number{};
+    std::copy(value.begin(), value.end(), number.begin());
+    std::string reversed;
+    do {
+        unsigned remainder{0};
+        bool nonzero{false};
+        for (size_t i{number.size()}; i-- > 0;) {
+            const unsigned dividend{remainder * 256U + number[i]};
+            number[i] = static_cast<unsigned char>(dividend / 10U);
+            remainder = dividend % 10U;
+            nonzero |= number[i] != 0;
+        }
+        reversed.push_back(static_cast<char>('0' + remainder));
+        if (!nonzero) break;
+    } while (true);
+    return {reversed.rbegin(), reversed.rend()};
+}
+
+inline UniValue BeaconJson(const ssz::BeaconBlockHeader& header)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("slot", header.slot);
+    out.pushKV("proposer_index", header.proposer_index);
+    out.pushKV("parent_root", EthereumHex(header.parent_root));
+    out.pushKV("state_root", EthereumHex(header.state_root));
+    out.pushKV("body_root", EthereumHex(header.body_root));
+    return out;
+}
+
+inline UniValue ExecutionJson(const ssz::ExecutionPayloadHeader& header)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("parent_hash", EthereumHex(header.parent_hash));
+    out.pushKV("fee_recipient", EthereumHex(header.fee_recipient));
+    out.pushKV("state_root", EthereumHex(header.state_root));
+    out.pushKV("receipts_root", EthereumHex(header.receipts_root));
+    out.pushKV("logs_bloom", EthereumHex(header.logs_bloom));
+    out.pushKV("prev_randao", EthereumHex(header.prev_randao));
+    out.pushKV("block_number", header.block_number);
+    out.pushKV("gas_limit", header.gas_limit);
+    out.pushKV("gas_used", header.gas_used);
+    out.pushKV("timestamp", header.timestamp);
+    out.pushKV("extra_data", "0x" + HexStr(header.extra_data));
+    out.pushKV("base_fee_per_gas", Uint256LEToDecimal(header.base_fee_per_gas));
+    out.pushKV("block_hash", EthereumHex(header.block_hash));
+    out.pushKV("transactions_root", EthereumHex(header.transactions_root));
+    out.pushKV("withdrawals_root", EthereumHex(header.withdrawals_root));
+    out.pushKV("blob_gas_used", header.blob_gas_used);
+    out.pushKV("excess_blob_gas", header.excess_blob_gas);
+    return out;
+}
+
+inline UniValue HeaderJson(const LightClientHeader& header)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("beacon", BeaconJson(header.beacon));
+    out.pushKV("execution", ExecutionJson(header.execution));
+    UniValue branch{UniValue::VARR};
+    for (const uint256& node : header.execution_branch) {
+        branch.push_back(EthereumHex(node));
+    }
+    out.pushKV("execution_branch", std::move(branch));
+    return out;
+}
+
+inline UniValue CommitteeJson(const ssz::SyncCommittee& committee)
+{
+    UniValue out{UniValue::VOBJ};
+    UniValue pubkeys{UniValue::VARR};
+    for (const auto& pubkey : committee.pubkeys) {
+        pubkeys.push_back(EthereumHex(pubkey));
+    }
+    out.pushKV("pubkeys", std::move(pubkeys));
+    out.pushKV("aggregate_pubkey", EthereumHex(committee.aggregate_pubkey));
+    return out;
+}
+
+inline UniValue StoreJson(const LightClientStore& store)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("finalized_header", HeaderJson(store.finalized_header));
+    out.pushKV("period", store.period);
+    out.pushKV("current_sync_committee", CommitteeJson(store.current));
+    if (store.next) {
+        out.pushKV("next_sync_committee", CommitteeJson(*store.next));
+    }
+    return out;
+}
+
+/** Parse a complete store exported by B3. Unlike a beacon bootstrap, this is
+ * trusted because its enclosing B3 connection is finalized. Still reject
+ * malformed structure, an unproven execution header, or a forged period so a
+ * corrupt/stale operator file cannot silently alter update verification. */
+inline LightClientStore ParseStore(const UniValue& v)
+{
+    if (!v.isObject()) throw std::runtime_error("light-client store is not an object");
+    LightClientStore store;
+    store.finalized_header = ParseHeader(Field(v, "finalized_header"));
+    store.period = Num(Field(v, "period"), "period");
+    store.current = ParseCommittee(Field(v, "current_sync_committee"));
+    const UniValue& next{v.find_value("next_sync_committee")};
+    if (!next.isNull()) store.next = ParseCommittee(next);
+    if (store.period != PeriodAtSlot(store.finalized_header.beacon.slot)) {
+        throw std::runtime_error("store period does not match finalized beacon slot");
+    }
+    if (!store.finalized_header.VerifyExecution()) {
+        throw std::runtime_error("store finalized execution proof is invalid");
+    }
+    return store;
+}
+
+inline uint256 B3DisplayHash(const UniValue& v, const std::string& name)
+{
+    if (!v.isStr()) throw std::runtime_error("field not a string: " + name);
+    std::string hex{v.get_str()};
+    if (hex.rfind("0x", 0) == 0 || hex.rfind("0X", 0) == 0) hex.erase(0, 2);
+    const auto hash{uint256::FromHex(hex)};
+    if (!hash || hash->IsNull()) throw std::runtime_error("bad B3 hash: " + name);
+    return *hash;
+}
+
+struct LightClientStoreSnapshot {
+    LightClientStore store{};
+    uint64_t connection_height{0};
+    uint256 connection_block_hash{};
+    uint64_t b3_finalized_height{0};
+    uint256 b3_finalized_block_hash{};
+};
+
+inline UniValue StoreSnapshotJson(const LightClientStore& store,
+                                  uint64_t connection_height,
+                                  const uint256& connection_block_hash,
+                                  uint64_t b3_finalized_height,
+                                  const uint256& b3_finalized_block_hash)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("version", 1);
+    UniValue connection{UniValue::VOBJ};
+    connection.pushKV("height", connection_height);
+    connection.pushKV("block_hash", connection_block_hash.GetHex());
+    out.pushKV("connection", std::move(connection));
+    UniValue finalized{UniValue::VOBJ};
+    finalized.pushKV("height", b3_finalized_height);
+    finalized.pushKV("block_hash", b3_finalized_block_hash.GetHex());
+    out.pushKV("b3_finalized", std::move(finalized));
+    out.pushKV("store", StoreJson(store));
+    return out;
+}
+
+inline LightClientStoreSnapshot ParseStoreSnapshot(const UniValue& v)
+{
+    if (!v.isObject()) throw std::runtime_error("store snapshot is not an object");
+    if (Num(Field(v, "version"), "version") != 1) {
+        throw std::runtime_error("unsupported store snapshot version");
+    }
+    const UniValue& connection{Field(v, "connection")};
+    const UniValue& finalized{Field(v, "b3_finalized")};
+    LightClientStoreSnapshot out;
+    out.connection_height = Num(Field(connection, "height"), "connection.height");
+    out.connection_block_hash = B3DisplayHash(
+        Field(connection, "block_hash"), "connection.block_hash");
+    out.b3_finalized_height = Num(
+        Field(finalized, "height"), "b3_finalized.height");
+    out.b3_finalized_block_hash = B3DisplayHash(
+        Field(finalized, "block_hash"), "b3_finalized.block_hash");
+    if (out.connection_height > out.b3_finalized_height) {
+        throw std::runtime_error("light-client connection is not B3-finalized");
+    }
+    out.store = ParseStore(Field(v, "store"));
+    return out;
 }
 
 } // namespace lcjson

@@ -82,40 +82,36 @@ not competing activation specifications.
   feature-plan expansion.
 
 ## Bridge
-- Deposit legs first (Ethereum USDT → B3 bUSD, then later assets). The first
-  production registry tuple is Ethereum mainnet chain id 1, vault
-  `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`, canonical USDT
-  `0xdAC17F958D2ee523a2206206994597C13D831ec7`, and exact 6-decimal
-  conversion into the bridge-backed bUSD `AssetId`. This exact vault was
-  explicitly promoted by the owner on 2026-09-01 despite its earlier
-  smoke-deployment label.
-- **Transition-v1 withdrawal trust:** the owner accepted that vault's existing
-  immutable owner-controlled `releaseAuthority` for the first release. B3
-  withdrawals are therefore managed in v1 and must be described that way;
-  deposits and minting remain proof-verified. The code must pin the observed
-  authority and vault runtime-code hash before activation. This authority
-  cannot be replaced in-place by the later decentralized verifier, so that
-  upgrade requires a separately approved vault/migration rather than a silent
-  change to this bUSD reserve identity.
-- Independent reads through two Ethereum RPC providers at block 25,877,643
-  pinned both immutable authorities to
-  `0x76c7a245d0D2e4CF92403aF0144825df1cC614f1` (an EOA) and the 3,135-byte
-  vault runtime code hash to
-  `0x1be220c18efa4e4cda0bb1c912c7c41346f5c04d49a36ec2c68f6ddcc5586233`.
-  The generic vault had zero USDT locked at that observation; the B3 registry,
-  not the vault, must enforce the canonical USDT address.
-- The RLP/MPT/SSZ light-client verification stack is mainnet-proven end to
-  end. Minting remains consensus fail-closed until its reviewed Ethereum
-  bootstrap, activation height, mint caps, adapter commitment, durable
-  light-client/nullifier state, proof carrier, and managed-withdrawal authority
-  and code commitments are all pinned. Documentation or a ticker can never
-  activate the bridge by itself.
-- Withdrawal admission is bounded per market/asset by the capacity of the
-  deterministic top 64 live pool UTXOs after existing pending obligations.
-  Payout selection orders candidates by amount descending, then outpoint
-  ascending, and uses the shortest covering prefix. The publisher must publish
-  one withdrawal, wait for confirmation, refresh the index/capacity, rebuild
-  the next transaction, and only then publish it.
+- The production flow is deploy-then-pin. Deploy the exact independently
+  audited finality verifier and immutable USDT vault, then collect from the
+  mined deployment: Ethereum chain ID; verifier and vault addresses; both
+  runtime code hashes; the vault deployment block; canonical USDT token
+  address; and the vault-derived B3 `AssetId`. A later reviewed B3 build must
+  pin that complete tuple. No address, ticker, document, deployment, or partial
+  parameter set activates the bridge.
+- The bridge fails closed until every pin is present and matches the audited
+  deployment and the remaining checkpoint, fork, cap, adapter, rules, proof,
+  and operating gates. The vault may be deployed before M, but deposits remain
+  disabled until the verifier has been initialized and a fresh valid
+  certificate demonstrates qualified current and successor validator sets.
+  There are no corridor deposits and no pre-readiness custody window.
+- Inbound bridge activation `B` and irreversible-burn activation `W` are
+  separate consensus pins. `W` must be at least `B`; unset `W` rejects every
+  managed or decentralized withdrawal record without changing the bridge
+  AssetId or registry id. From `B`, finality certificates still commit the
+  canonical nonzero empty/current withdrawal-tree root so Ethereum readiness
+  and verified deposits can operate.
+- If `B` is enabled while `W` is unset, depositors receive bUSD but knowingly
+  enter a custodial waiting period: they cannot burn it for Ethereum release.
+  Ethereum withdrawals and B3 bridge burns remain disabled unless and until
+  canonicality and liveness safety for the complete round trip are actually
+  solved, independently reviewed, rehearsed, and explicitly enabled in a later
+  B3 build by pinning `W`. A deployed verifier or a fresh certificate is not by itself
+  authority to burn bUSD or release USDT.
+- The historical managed smoke vault
+  `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6` and its owner-controlled
+  release path are excluded from the production registry. Its observations
+  remain historical evidence only and are not production bridge pins.
 
 ## Legacy-era wallet safety (release reviews, closed)
 - Send + receive is the ruled legacy-era scope. Receive: legacy P2PKH

@@ -31,6 +31,7 @@
 
 #include <array>
 #include <optional>
+#include <span>
 
 namespace wallet {
 
@@ -420,8 +421,9 @@ RPCHelpMan bindfinalitykey()
     return RPCHelpMan{
         "bindfinalitykey",
         "Bind (or rotate to) this wallet's BLS finality consensus key (Modern PoS V1, FINALITY_KEY policy).\n"
-        "The BLS key is derived deterministically from the wallet's validator identity key and the binding\n"
-        "sequence, so nothing new is stored and a restored wallet re-derives it. The transaction carries the\n"
+        "By default the BLS key is derived deterministically from the wallet's validator identity key and the\n"
+        "binding sequence, so a restored wallet re-derives it. An independently imported finality key takes\n"
+        "precedence for the next bind or rotation. The transaction carries the\n"
         "FINALITY_KEY cell plus the BIP340 identity authorization and BLS proof-of-possession as Modern\n"
         "Payload Area evidence. The first binding uses sequence 0; an existing binding is rotated to the next\n"
         "sequence with a fresh BLS key. Takes effect at the next epoch snapshot boundary. Requires an\n"
@@ -446,10 +448,10 @@ RPCHelpMan bindfinalitykey()
             EnsureWalletIsUnlocked(*pwallet);
             const FinalityRpcContext ctx{FinalityContext(*pwallet)};
             RejectPendingFinalityKeyTx(*pwallet, ctx.vk);
-            const uint32_t seq{ctx.status.bound ? ctx.status.binding_seq + 1 : 0};
             if (ctx.status.bound && ctx.status.binding_seq == std::numeric_limits<uint32_t>::max()) {
                 throw JSONRPCError(RPC_MISC_ERROR, "The binding sequence is exhausted");
             }
+            const uint32_t seq{ctx.status.bound ? ctx.status.binding_seq + 1 : 0};
             const auto identity{pwallet->GetValidatorSecret()};
             if (!identity) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(identity).original);
             // One resolution rule (wallet): an imported independent key takes
@@ -499,6 +501,9 @@ RPCHelpMan revokefinalitykey()
             RejectPendingFinalityKeyTx(*pwallet, ctx.vk);
             if (!ctx.status.bound || ctx.status.revoked) {
                 throw JSONRPCError(RPC_MISC_ERROR, "This validator has no active FINALITY_KEY binding to revoke");
+            }
+            if (ctx.status.binding_seq == std::numeric_limits<uint32_t>::max()) {
+                throw JSONRPCError(RPC_MISC_ERROR, "The binding sequence is exhausted");
             }
             const auto identity{pwallet->GetValidatorSecret()};
             if (!identity) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(identity).original);
@@ -598,9 +603,13 @@ RPCHelpMan getfinalityinfo()
                         binding.pushKV("imported_bls_pubkey", HexStr(imported->GetPublicKey().Compressed()));
                     }
                 }
-                const uint32_t next_seq{st.bound ? st.binding_seq + 1 : 0};
-                if (const auto next{pwallet->ResolveFinalityBlsKey(next_seq, /*bound_bls_pubkey=*/nullptr)}) {
-                    binding.pushKV("next_bls_pubkey", HexStr(next->GetPublicKey().Compressed()));
+                if (!st.bound || st.binding_seq < std::numeric_limits<uint32_t>::max()) {
+                    const uint32_t next_seq{st.bound ? st.binding_seq + 1 : 0};
+                    if (const auto next{pwallet->ResolveFinalityBlsKey(
+                            next_seq, /*bound_bls_pubkey=*/nullptr)}) {
+                        binding.pushKV("next_bls_pubkey",
+                                       HexStr(next->GetPublicKey().Compressed()));
+                    }
                 }
             }
             obj.pushKV("binding", binding);
@@ -641,6 +650,261 @@ RPCHelpMan getfinalityinfo()
             signing.pushKV("pool_checkpoints", st.pool_checkpoints);
             obj.pushKV("signing", signing);
             return obj;
+        },
+    };
+}
+
+RPCHelpMan exportbridgebootstrapidentity()
+{
+    return RPCHelpMan{
+        "exportbridgebootstrapidentity",
+        "Export the public proof package needed to place this wallet's "
+        "confirmed FINALITY_KEY identity in the immutable four-member "
+        "Ethereum bridge bootstrap manifest. This command can be used before "
+        "Modern PoS starts. It returns a BLS proof of possession and a fresh "
+        "BIP340 proof of the already-confirmed validator-to-BLS binding; no "
+        "private key is returned. Requires an unlocked wallet.\n" +
+            HELP_REQUIRING_PASSPHRASE,
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "Public bootstrap identity package",
+                  {
+                      {RPCResult::Type::STR_HEX, "validator_key", "Wallet's x-only validator identity"},
+                      {RPCResult::Type::STR_HEX, "bls_pubkey", "Confirmed compressed BLS public key"},
+                      {RPCResult::Type::STR_HEX, "proof_of_possession", "Public 96-byte BLS proof of possession"},
+                      {RPCResult::Type::NUM, "binding_seq", "Confirmed FINALITY_KEY binding sequence"},
+                      {RPCResult::Type::NUM, "binding_height", "Height at which the binding became active"},
+                      {RPCResult::Type::STR_HEX, "binding_bip340_sig", "Public BIP340 proof binding validator_key, BLS key and sequence to this chain"},
+                      {RPCResult::Type::STR_HEX, "chain_domain", "B3 modern chain domain in Ethereum/wire byte order"},
+                  }},
+        RPCExamples{HelpExampleCli("exportbridgebootstrapidentity", "") +
+                    HelpExampleRpc("exportbridgebootstrapidentity", "")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const std::shared_ptr<CWallet> wallet{
+                GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            wallet->BlockUntilSyncedToCurrentChain();
+
+            LOCK(wallet->cs_wallet);
+            EnsureWalletIsUnlocked(*wallet);
+            const FinalityRpcContext ctx{FinalityContext(*wallet)};
+            const interfaces::FinalityStatus& status{ctx.status};
+            if (!status.bound || status.revoked || status.binding_height < 0) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    status.revoked
+                        ? "This validator's FINALITY_KEY binding is revoked"
+                        : "This validator has no confirmed FINALITY_KEY binding");
+            }
+            const auto key{wallet->ResolveFinalityBlsKey(
+                status.binding_seq, &status.binding_bls_pubkey)};
+            if (!key) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                                   util::ErrorString(key).original);
+            }
+            const auto identity{wallet->GetValidatorSecret()};
+            if (!identity) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                                   util::ErrorString(identity).original);
+            }
+
+            const uint256 binding_digest{modern::FinalityBindDigest(
+                status.chain_domain, ctx.vk, key->GetPublicKey().Compressed(),
+                status.binding_seq)};
+            std::array<unsigned char, modern::BIP340_SIG_SIZE>
+                binding_signature{};
+            const uint256 binding_aux{GetRandHash()};
+            if (!identity->SignSchnorr(binding_digest, binding_signature,
+                                       nullptr, binding_aux)) {
+                throw JSONRPCError(
+                    RPC_WALLET_ERROR,
+                    "BIP340 bootstrap-manifest binding proof failed");
+            }
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("validator_key", HexStr(ctx.vk));
+            result.pushKV("bls_pubkey",
+                          HexStr(key->GetPublicKey().Compressed()));
+            result.pushKV("proof_of_possession",
+                          HexStr(key->SignPoP().Compressed()));
+            result.pushKV("binding_seq",
+                          static_cast<uint64_t>(status.binding_seq));
+            result.pushKV("binding_height", status.binding_height);
+            result.pushKV("binding_bip340_sig",
+                          HexStr(binding_signature));
+            result.pushKV("chain_domain", HexStr(status.chain_domain));
+            return result;
+        },
+    };
+}
+
+RPCHelpMan signbridgebootstrap()
+{
+    return RPCHelpMan{
+        "signbridgebootstrap",
+        "Sign the one-time Ethereum bridge handoff from the published four-key "
+        "bootstrap committee to B3's exact Set_0 snapshot. The message is "
+        "derived entirely from the active chain: block M-1, zero withdrawal "
+        "root, the canonical Set_0 hash, and epoch zero. No caller-supplied "
+        "digest is accepted and no BLS private key is returned. The command "
+        "is available only while the node can reproduce Set_0 and requires "
+        "this wallet's exact confirmed, non-revoked FINALITY_KEY binding named "
+        "in the immutable four-key deployment manifest.\n" +
+            HELP_REQUIRING_PASSPHRASE,
+        {
+            {"bls_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Exact 48-byte compressed BLS key from the deployed bootstrap manifest"},
+            {"binding_seq", RPCArg::Type::NUM, RPCArg::Optional::NO,
+             "Exact confirmed FINALITY_KEY binding sequence from that manifest"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Exact bootstrap signature package",
+                  {
+                      {RPCResult::Type::STR_HEX, "validator_key", "Wallet's x-only validator identity"},
+                      {RPCResult::Type::STR_HEX, "bls_pubkey", "Bound compressed BLS public key"},
+                      {RPCResult::Type::STR_HEX, "proof_of_possession", "Public 96-byte BLS proof of possession for the manifest"},
+                      {RPCResult::Type::NUM, "binding_seq", "Exact binding sequence used"},
+                      {RPCResult::Type::NUM, "binding_height", "Height at which the binding became active"},
+                      {RPCResult::Type::STR_HEX, "binding_bip340_sig", "Fresh public BIP340 proof binding validator_key, BLS key and sequence to this chain"},
+                      {RPCResult::Type::STR_HEX, "chain_domain", "B3 modern chain domain in Ethereum/wire byte order"},
+                      {RPCResult::Type::NUM, "snapshot_height", "Exact B3 snapshot height M-1"},
+                      {RPCResult::Type::STR_HEX, "snapshot_block_hash", "Active-chain block-hash bytes at M-1 in the order used by the Ethereum FinalizedBlock"},
+                      {RPCResult::Type::STR_HEX, "snapshot_block_hash_b3", "Active-chain block hash at M-1 in ordinary B3 display order"},
+                      {RPCResult::Type::STR_HEX, "set0_hash", "Keccak commitment to the canonical Set_0 header in Ethereum/wire byte order"},
+                      {RPCResult::Type::STR_HEX, "set0_header", "Canonical 110-byte Set_0 header"},
+                      {RPCResult::Type::STR_HEX, "finalized_block", "Canonical 112-byte bootstrap FinalizedBlock"},
+                      {RPCResult::Type::STR_HEX, "digest", "B3/FINALITY/V1 digest bytes that were signed"},
+                      {RPCResult::Type::STR_HEX, "signature", "Compressed 96-byte BLS signature"},
+                      {RPCResult::Type::NUM, "finality_pin_height", "Finalized descendant height that made the M-1 snapshot safe to sign"},
+                      {RPCResult::Type::STR_HEX, "finality_pin_hash", "Finality-pin hash bytes in Ethereum/wire order"},
+                      {RPCResult::Type::STR_HEX, "finality_pin_hash_b3", "Finality-pin hash in ordinary B3 display order"},
+                  }},
+        RPCExamples{HelpExampleCli("signbridgebootstrap", "\"<manifest_bls_pubkey>\" 0") +
+                    HelpExampleRpc("signbridgebootstrap", "\"<manifest_bls_pubkey>\", 0")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const std::shared_ptr<CWallet> wallet{
+                GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            wallet->BlockUntilSyncedToCurrentChain();
+
+            LOCK(wallet->cs_wallet);
+            EnsureWalletIsUnlocked(*wallet);
+            const FinalityRpcContext ctx{FinalityContext(*wallet)};
+            const interfaces::FinalityStatus& status{ctx.status};
+            if (!status.bootstrap_snapshot_height ||
+                status.bootstrap_snapshot_hash.IsNull() ||
+                status.bootstrap_set_hash.IsNull()) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "The exact Set_0 bridge snapshot is not available yet");
+            }
+            if (!status.pin_height ||
+                *status.pin_height <= *status.bootstrap_snapshot_height) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "Set_0 is not safe to sign until B3 finality has pinned a descendant of block M-1");
+            }
+            const auto set0{modern::ValidatorSetHeader::Decode(
+                status.bootstrap_set_header)};
+            if (!set0 || set0->epoch != 0 ||
+                modern::ValidatorSetHash(*set0) != status.bootstrap_set_hash) {
+                throw JSONRPCError(
+                    RPC_INTERNAL_ERROR,
+                    "The node returned an inconsistent Set_0 bridge snapshot");
+            }
+            if (!status.bound || status.revoked) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    status.revoked
+                        ? "This validator's FINALITY_KEY binding is revoked"
+                        : "This validator has no confirmed FINALITY_KEY binding");
+            }
+            const std::vector<unsigned char> expected_pubkey{
+                ParseHexV(request.params[0], "bls_pubkey")};
+            if (expected_pubkey.size() != modern::BLS_PUBKEY_SIZE ||
+                !bls::PublicKey::Decode(expected_pubkey)) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    "bls_pubkey must be one valid 48-byte compressed BLS public key");
+            }
+            const uint32_t binding_seq{
+                request.params[1].getInt<uint32_t>()};
+            if (binding_seq != status.binding_seq ||
+                expected_pubkey != status.binding_bls_pubkey) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    "The requested bootstrap key and sequence do not match this validator's current confirmed binding");
+            }
+            if (status.binding_height < 0 ||
+                status.binding_height > *status.bootstrap_snapshot_height) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "The requested bootstrap key was not bound by the M-1 snapshot");
+            }
+            const auto key{wallet->ResolveFinalityBlsKey(
+                binding_seq, &expected_pubkey)};
+            if (!key) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                                   util::ErrorString(key).original);
+            }
+            const auto identity{wallet->GetValidatorSecret()};
+            if (!identity) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                                   util::ErrorString(identity).original);
+            }
+
+            const uint256 binding_digest{modern::FinalityBindDigest(
+                status.chain_domain, ctx.vk, key->GetPublicKey().Compressed(),
+                binding_seq)};
+            std::array<unsigned char, modern::BIP340_SIG_SIZE>
+                binding_signature{};
+            const uint256 binding_aux{GetRandHash()};
+            if (!identity->SignSchnorr(binding_digest, binding_signature,
+                                       nullptr, binding_aux)) {
+                throw JSONRPCError(
+                    RPC_WALLET_ERROR,
+                    "BIP340 bootstrap-manifest binding proof failed");
+            }
+
+            modern::FinalizedBlock snapshot;
+            snapshot.height =
+                static_cast<uint64_t>(*status.bootstrap_snapshot_height);
+            snapshot.block_hash = status.bootstrap_snapshot_hash;
+            snapshot.withdrawal_root = uint256{};
+            snapshot.validator_set_hash = status.bootstrap_set_hash;
+            snapshot.epoch = 0;
+            const uint256 digest{
+                modern::FinalityDigest(status.chain_domain, snapshot)};
+            const auto signature{
+                key->Sign(std::span<const unsigned char>{digest.begin(), 32})
+                    .Compressed()};
+            const auto snapshot_bytes{snapshot.Encode()};
+
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("validator_key", HexStr(ctx.vk));
+            result.pushKV("bls_pubkey",
+                          HexStr(key->GetPublicKey().Compressed()));
+            result.pushKV("proof_of_possession",
+                          HexStr(key->SignPoP().Compressed()));
+            result.pushKV("binding_seq", static_cast<uint64_t>(binding_seq));
+            result.pushKV("binding_height", status.binding_height);
+            result.pushKV("binding_bip340_sig",
+                          HexStr(binding_signature));
+            result.pushKV("chain_domain", HexStr(status.chain_domain));
+            result.pushKV("snapshot_height",
+                          *status.bootstrap_snapshot_height);
+            result.pushKV("snapshot_block_hash",
+                          HexStr(status.bootstrap_snapshot_hash));
+            result.pushKV("snapshot_block_hash_b3",
+                          status.bootstrap_snapshot_hash.GetHex());
+            result.pushKV("set0_hash", HexStr(status.bootstrap_set_hash));
+            result.pushKV("set0_header",
+                          HexStr(status.bootstrap_set_header));
+            result.pushKV("finalized_block", HexStr(snapshot_bytes));
+            result.pushKV("digest", HexStr(digest));
+            result.pushKV("signature", HexStr(signature));
+            result.pushKV("finality_pin_height", *status.pin_height);
+            result.pushKV("finality_pin_hash", HexStr(status.pin_hash));
+            result.pushKV("finality_pin_hash_b3", status.pin_hash.GetHex());
+            return result;
         },
     };
 }

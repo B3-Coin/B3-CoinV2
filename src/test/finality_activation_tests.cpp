@@ -12,6 +12,7 @@
 
 #include <chainparams.h>
 #include <common/args.h>
+#include <consensus/boundary.h>
 #include <consensus/era.h>
 #include <consensus/params.h>
 #include <kernel/chainparams.h>
@@ -42,6 +43,11 @@ BOOST_AUTO_TEST_CASE(mainnet_sealed_transition_pins_are_complete)
     BOOST_CHECK(Consensus::LegacyBoundaryPinned(c));
     BOOST_CHECK(!Consensus::LegacyBoundaryHeightOnly(c));
     BOOST_CHECK_EQUAL(Consensus::ModernPosStartHeight(c).value_or(0), 811'001);
+    BOOST_CHECK_EQUAL(c.legacy_checkpoints.count(810'001), 0U);
+    BOOST_REQUIRE_EQUAL(c.modern_checkpoints.size(), 1U);
+    BOOST_REQUIRE_EQUAL(c.modern_checkpoints.count(810'001), 1U);
+    BOOST_CHECK(c.modern_checkpoints.at(810'001) == uint256{
+        "913fb38c75e0f12d8d5e6ea65a0ffce33a22a6908392a94661eab7c8506f6014"});
 
     BOOST_CHECK(c.fn_genesis_required);
     BOOST_CHECK_EQUAL(c.fn_genesis_manifest_version, 1);
@@ -127,6 +133,23 @@ BOOST_AUTO_TEST_CASE(mainnet_sealed_transition_pins_are_complete)
     }
 }
 
+BOOST_AUTO_TEST_CASE(mainnet_first_corridor_checkpoint_accepts_only_exact_hash)
+{
+    const auto params{CreateChainParams(ArgsManager{}, ChainType::MAIN)};
+    const Consensus::Params& c{params->GetConsensus()};
+    const uint256 exact{
+        "913fb38c75e0f12d8d5e6ea65a0ffce33a22a6908392a94661eab7c8506f6014"};
+    const uint256 wrong{
+        "913fb38c75e0f12d8d5e6ea65a0ffce33a22a6908392a94661eab7c8506f6015"};
+
+    BOOST_CHECK(Consensus::ModernCheckpointAllows(c, 810'001, exact));
+    BOOST_CHECK(!Consensus::ModernCheckpointAllows(c, 810'001, wrong));
+    // Unpinned modern heights remain unconstrained, and this modern-only
+    // table cannot accidentally override attested legacy history.
+    BOOST_CHECK(Consensus::ModernCheckpointAllows(c, 810'002, wrong));
+    BOOST_CHECK(Consensus::ModernCheckpointAllows(c, 810'000, wrong));
+}
+
 BOOST_AUTO_TEST_CASE(other_shipped_networks_remain_fail_closed)
 {
     for (const auto chain : {ChainType::TESTNET, ChainType::TESTNET4,
@@ -139,6 +162,7 @@ BOOST_AUTO_TEST_CASE(other_shipped_networks_remain_fail_closed)
         BOOST_CHECK(!c.fn_genesis_required);
         BOOST_CHECK(!c.fn_genesis_rights_root.has_value());
         BOOST_CHECK(c.fn_genesis_manifest.empty());
+        BOOST_CHECK(c.modern_checkpoints.empty());
         BOOST_CHECK(!c.modern_pos.has_value());
         BOOST_CHECK(!c.flowmesh_activation_height.has_value());
         BOOST_CHECK(!Consensus::ModernObjectRulesActive(c));
@@ -274,6 +298,12 @@ BOOST_AUTO_TEST_CASE(flowmesh_release_regtest_schedule_is_complete_and_isolated)
     BOOST_CHECK(Consensus::BridgeMintParamsReady(*c.busd_bridge));
     BOOST_CHECK(!Consensus::BridgeRulesActive(bridge_activation - 1, c));
     BOOST_CHECK(Consensus::BridgeRulesActive(bridge_activation, c));
+    BOOST_REQUIRE(c.bridge_withdrawal_activation_height);
+    BOOST_CHECK_EQUAL(*c.bridge_withdrawal_activation_height,
+                      bridge_activation);
+    BOOST_CHECK(!Consensus::BridgeWithdrawalRulesActive(
+        bridge_activation - 1, c));
+    BOOST_CHECK(Consensus::BridgeWithdrawalRulesActive(bridge_activation, c));
     BOOST_CHECK(modern::GetPayloadTypeStatus(
                     modern::CREATION_ACTION_BRIDGE, modern::MPA_VERSION_V1,
                     c, bridge_activation - 1) ==
@@ -313,6 +343,49 @@ BOOST_AUTO_TEST_CASE(flowmesh_release_regtest_schedule_is_complete_and_isolated)
     BOOST_CHECK(!plain.flowmesh_activation_height.has_value());
     BOOST_REQUIRE(plain.modern_pos.has_value());
     BOOST_CHECK(plain.modern_pos->treasury_script.empty());
+}
+
+BOOST_AUTO_TEST_CASE(bridge_activation_is_independent_of_flowmesh_a3)
+{
+    CChainParams::RegTestOptions options;
+    CChainParams::B3ModernRegTestOptions b3;
+    b3.flowmesh_test = true;
+    options.b3_modern = b3;
+    auto params{CChainParams::RegTest(options)};
+    auto& c{const_cast<Consensus::Params&>(params->GetConsensus())};
+
+    const int modern_start{*Consensus::ModernPosStartHeight(c)};
+    const int flowmesh_start{*c.flowmesh_activation_height};
+    BOOST_REQUIRE_LT(modern_start, flowmesh_start);
+    BOOST_REQUIRE(c.busd_bridge);
+    BOOST_REQUIRE(Consensus::BridgeMintParamsReady(*c.busd_bridge));
+
+    c.busd_bridge->activation_height = modern_start;
+    BOOST_CHECK(!Consensus::BridgeRulesActive(modern_start - 1, c));
+    BOOST_CHECK(Consensus::BridgeRulesActive(modern_start, c));
+    // Inbound proofs/mints can start at B while irreversible burns remain
+    // closed until the separately pinned W height.
+    BOOST_CHECK(!Consensus::BridgeWithdrawalRulesActive(modern_start, c));
+    BOOST_CHECK(!Consensus::FlowMeshRulesActive(modern_start, c));
+    BOOST_CHECK(Consensus::BridgeRulesActive(flowmesh_start - 1, c));
+    BOOST_CHECK(!Consensus::BridgeWithdrawalRulesActive(
+        flowmesh_start - 1, c));
+    BOOST_CHECK(Consensus::FlowMeshRulesActive(flowmesh_start, c));
+    BOOST_CHECK(Consensus::BridgeRulesActive(flowmesh_start, c));
+    BOOST_CHECK(Consensus::BridgeWithdrawalRulesActive(flowmesh_start, c));
+
+    c.bridge_withdrawal_activation_height.reset();
+    BOOST_CHECK(Consensus::BridgeRulesActive(flowmesh_start, c));
+    BOOST_CHECK(!Consensus::BridgeWithdrawalRulesActive(flowmesh_start, c));
+    c.bridge_withdrawal_activation_height = modern_start - 1;
+    BOOST_CHECK(!Consensus::BridgeWithdrawalRulesActive(flowmesh_start, c));
+    c.bridge_withdrawal_activation_height = modern_start;
+    BOOST_CHECK(Consensus::BridgeWithdrawalRulesActive(modern_start, c));
+
+    // A complete bridge envelope cannot opt into the PoW corridor.
+    c.busd_bridge->activation_height = modern_start - 1;
+    BOOST_CHECK(!Consensus::BridgeRulesActive(modern_start - 1, c));
+    BOOST_CHECK(!Consensus::BridgeRulesActive(flowmesh_start, c));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

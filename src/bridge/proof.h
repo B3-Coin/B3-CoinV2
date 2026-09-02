@@ -39,6 +39,8 @@ inline constexpr size_t MAX_BRIDGE_LIGHT_CLIENT_HEADER_SIZE{1'024};
 inline constexpr size_t BRIDGE_EXECUTION_BRANCH_NODES{4};
 inline constexpr size_t MAX_BRIDGE_MERKLE_BRANCH_NODES{8};
 inline constexpr size_t MAX_BRIDGE_EXECUTION_ANCESTRY_HEADERS{32};
+/** Maximum distance from an anchor's directly finalized execution origin. */
+inline constexpr uint64_t MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS{20'000};
 inline constexpr size_t MAX_BRIDGE_MPT_NODES{64};
 inline constexpr size_t MAX_BRIDGE_RLP_ITEM_SIZE{1'024};
 inline constexpr size_t MAX_BRIDGE_EXECUTION_ANCESTRY_BYTES{20 * 1'024};

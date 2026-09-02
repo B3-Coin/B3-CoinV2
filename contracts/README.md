@@ -1,91 +1,189 @@
 # B3 bridge contracts (Ethereum side)
 
-Authored in-repo. The published transition-v1 deployment has been independently
-observed on Ethereum; reproducible compilation, contract tests, and byte-for-byte
-source/runtime matching remain release evidence. The B3 build never depends on
-a Solidity toolchain.
+Authored in-repo. Only the historical managed smoke vault has previously been
+observed on Ethereum. The new decentralized prover/verifier/vault stack is not
+a production deployment until its reviewed bytecode is mined, finalized, and
+later pinned by exact address and runtime hash in B3. Reproducible compilation,
+contract tests, and byte-for-byte source/runtime matching remain release
+evidence. The B3 build never depends on a Solidity toolchain.
 
 ## Contents
 
 | Contract | Leg | Status |
 |---|---|---|
-| `B3DepositVault.sol` | ETH -> B3 deposits (owner ruling 2026-08-24: this leg first) | source complete; managed-v1 vault `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6` observed; the bounded type-10 B3 mint path is implemented, while reproducible source/runtime matching, adapter enforcement, audits, and production pins remain gates |
-| `src/B3FinalityVerifier.sol` | future decentralized B3 -> ETH finality | staker-only scaffold with fail-closed public bootstrap and bridge thresholds; mock-prover tests pass; **not deployable until canonical Set_0 and real prover vectors are available** |
-| `src/BlsCertificateProver.sol` | B3 certificate proof | EIP-2537 scaffold with ordered validator paths and the pinned negative generator; **not production-approved without target-fork cross-language vectors and an external cryptography audit** |
-| `src/B3StakerBridge.sol` | future decentralized USDT release | keyless single-token/AssetId vault scaffold; mock-prover release tests pass; **not wired into deployment and must not be deployed yet** |
+| `B3DepositVault.sol` | historical managed ETH -> B3 prototype | retained only to reproduce/audit managed-v1 vault `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`; it is not the current deployment target |
+| `src/B3FinalityVerifier.sol` | decentralized B3 -> ETH finality | deploy-before-M implementation with a time-bounded one-time 3-of-4 BLS handoff to canonical Set_0; no owner/admin path |
+| `src/BlsCertificateProver.sol` | B3 certificate proof | EIP-2537 implementation with ordered validator paths, pinned negative generator, C++-generated certificate/bootstrap vectors, and a post-Fusaka Osaka gas bound at the immutable 64-validator bridge cap; **not production-approved without an external cryptography and contract audit** |
+| `src/B3StakerBridge.sol` | current decentralized USDT deposit/release target | keyless single-token/AssetId vault; deposits fail closed until verifier initialization plus a fresh valid certificate and qualified current/successor sets; production pins and audit still required |
 
 ## Invariants
 
 - The `Deposit` event shape is consensus-relevant on the B3 side and must
   byte-match `src/bridge/deposit.h` (`Deposit(uint64,address,uint256,bytes32)`,
   id and token indexed, amount = received balance delta).
-- The vault has no mutable owner slot, proxy, pause, or upgrade path. Funds
-  leave only via `release`, restricted to its immutable release authority. The deployed
-  transition-v1 vault uses an owner-controlled managed authority; it is not
-  the later §5 verifier stack.
-- `rescue` (separate `rescueAuthority`, defaults to the release authority at
-  deploy) can withdraw ONLY the surplus above the per-token `locked`
-  liabilities -- strays, airdrops, force-sent ETH. `rescue` cannot spend
-  tracked liabilities; this does not mitigate compromise of `releaseAuthority`
-  and is not a production-readiness claim.
-- The published mainnet smoke vault was promoted for transition v1 by owner
-  ruling on 2026-09-01. Its managed authority cannot be changed in place. A
-  later verifier therefore needs a new vault. Under the current B3 identity
-  formula the vault address is part of `AssetId`, so the new vault creates a
-  new asset identity: migration requires an explicit burn/swap/reissue of old
-  bUSD, reserve migration, an old-vault cutoff, and handling/refunds for late
-  deposits. It is not an in-place contract upgrade.
+- The current production target has no mutable owner slot, release/rescue key,
+  proxy, pause, or upgrade path. Funds leave only through a withdrawal proof
+  under a bridge-qualified B3 staker-finality root.
+- The published managed smoke vault is historical and cannot change its
+  authority in place. Because it held zero USDT at the recorded observation and
+  B3 bridge minting has not activated, the current new vault is a pre-activation
+  replacement, not a user-balance migration. Recheck those facts and exclude the
+  old vault/AssetId before activation; any discovered liability requires the
+  explicit migration process described below.
 - Verified at Ethereum block 25,877,643: both immutable authorities are the
   EOA `0x76c7a245d0D2e4CF92403aF0144825df1cC614f1`; the runtime code hash is
   `0x1be220c18efa4e4cda0bb1c912c7c41346f5c04d49a36ec2c68f6ddcc5586233`.
   The vault is generic and held zero USDT at that observation, so B3 consensus
   must still enforce canonical USDT and every mint-security gate.
 
-## Staker-verifier scaffold (not a deployment artifact)
+## Adding assets later
 
-The decentralized scaffold follows the stake-weighted Modern-PoS
-`FINALITY_KEY` lineage. It is not controlled by FlowMesh FN seats and embeds no
-real validator count, stake weight, BLS key, or private material. Those public
-facts become knowable only from the canonical corridor snapshot at `M - 1`.
+The finality verifier is reusable, while each vault is deliberately
+single-token and immutable. The current V1 vault and AssetId are specifically
+the six-origin-decimal to six-B3-decimal, one-raw-unit-to-one-raw-unit profile.
+A separate six-decimal ERC-20 vault (for example USDC, after its own token and
+adapter review) can reuse the same verifier without changing the USDT vault.
+The shared-verifier test proves that the two vaults keep custody, AssetIds, and
+withdrawal proofs isolated.
 
-A small early set (including two validators) may be followed for chain-lineage
-continuity, but it cannot open the bridge. Ethereum requires every accepted
-certificate to carry both the B3 >2/3 stake-weight quorum and a >2/3 validator
-headcount quorum, so a two-member bootstrap is 2-of-2 and one high-weight
-validator cannot act alone. Deposits and releases remain closed until the
-current signing set meets the separately configured minimum bridge validator
-count and total stake, and that qualifying set has signed a post-activation
-certificate. The stale-lineage timer begins with the first accepted
-certificate, applies to current-epoch certificates as well as rotations, and
-closes bridge readiness when it expires.
+That does **not** make canonical WETH (18 decimals) or common wrapped-BTC
+tokens (typically 8 decimals) drop-in V1 assets. They need a later converted-
+vault version that immutably pins both decimal counts, rejects deposits that
+cannot be represented exactly on B3, and converts withdrawals back to exact
+origin-token units. They also need separately reviewed caps and adapter/token
+commitments. The current B3 release has one `busd_bridge` entry, so every
+additional asset—including a second six-decimal vault—also requires a later B3
+registry activation before deposits are offered to users. Native ETH and
+native Bitcoin require different deposit-proof paths and are never silently
+treated as ERC-20 tokens.
 
-The verifier may be deployed after the public snapshot is known; no Ethereum
-transaction is required at the exact B3 `M` block. Before any real deployment,
-the canonical snapshot/root, threshold values, runtimes, bridge height, token,
-AssetId, migration plan, and audit evidence must all be reviewed and pinned.
-The BLS hash-to-curve/pairing path still requires real target-fork vectors. The
+B3 uses two heights for the first vault. Inbound `B` starts light-client and
+verified deposit-mint rules. Outbound `W` starts irreversible `BRIDGE_BURN`
+withdrawal leaves and must be at least `B`. Mainnet may deliberately pin `B`
+while leaving `W` unset. In that state deposits can mint bUSD once
+`bridgeReady()` is true, but bUSD cannot yet be burned for Ethereum release;
+this custodial waiting period must be disclosed to users. The Ethereum
+contract cannot observe the later B3-only `W` pin.
+
+## Staker-verifier delayed bootstrap
+
+The decentralized implementation follows the stake-weighted Modern-PoS
+`FINALITY_KEY` lineage. It is not controlled by FlowMesh FN seats. Deployment
+pins a synthetic header containing the four already-confirmed bootstrap BLS
+identities with equal weight and quorum three. The real validator count,
+weights and canonical Set_0 become knowable only at `M - 1`.
+
+A small early set (including two validators) may start and finalize B3 and may
+initialize the Ethereum verifier for chain-lineage continuity, but it cannot
+authorize bridge withdrawals. B3 consensus and the Ethereum
+verifier both require every accepted certificate to carry >2/3 stake weight
+and >2/3 validator headcount, so a two-member bootstrap is 2-of-2 and one
+high-weight validator cannot act alone. The four-key bootstrap may authorize exactly one
+statement: the real block-M-1 hash and canonical Set_0 header. The same BLS
+prover verifies that 3-of-4 statement. Initialization then permanently disables
+the bootstrap path and starts the Set_0 weak-subjectivity clock; only normal B3
+finality certificates and verified set handovers have authority afterward.
+Bridge authorization stays closed until both the current and successor
+canonical sets have at least four members, meet the pinned minimum total
+weight, and satisfy the verifier's freshness requirements.
+The initialization transaction must land before its immutable deadline.
+Initialization also pins `GENESIS_TIME`. Every epoch certificate must fall
+inside the deployment-pinned absolute window
+`GENESIS_TIME + epoch * MIN_EPOCH_DURATION <= now <= GENESIS_TIME +
+(epoch + 1) * MAX_EPOCH_LAG`, in addition to the per-handover lag checks. This
+is paired with a relative rule requiring at least `MIN_EPOCH_DURATION` between
+accepted handovers; absolute lower bounds already in the past do not by
+themselves stop batch epoch-walking. Catch-up after missed relays therefore
+takes one real interval per rotation. A genuinely stalled chain that misses
+the maximum window freezes
+fail-safe and requires a new reviewed deployment; wall-clock bounds do not
+remove the normal PoS weak-subjectivity assumption or replace live relaying.
+
+The contracts may be deployed before M, but USDT deposits remain disabled until
+the verifier is initialized and a fresh valid certificate proves qualified
+current and successor validator sets. A certificate/readiness gap closes
+deposits. There is no corridor-deposit or pre-readiness custody phase. The later
+B3 build must also pin and match the complete reviewed deployment tuple before
+any deposit is presented as mintable.
+
+Ethereum withdrawals and B3 burns are a separate, stronger gate. They remain
+disabled unless the full round trip's canonicality and liveness safety has been
+solved, independently audited, rehearsed, and explicitly enabled. The presence
+of release code, a verifier initialization, or a fresh certificate is not an
+activation claim.
+
+Each deposit is also bounded by immutable `MAX_DEPOSIT_RAW`, checked against
+the token balance actually received. The reviewed deployment value must be no
+greater than B3's pinned `max_per_block`, because one deposit event is one
+indivisible B3 mint/nullifier and cannot be split across blocks. Both caps must
+also be no greater than B3 consensus `MAX_MONEY`; with the fixed six-to-six
+decimal mapping, this is the same raw-unit boundary. RECIPIENT_V1 also rejects
+an all-zero P2PKH key hash so custody cannot be directed to an effectively
+unspendable B3 output.
+
+The prover, delayed verifier and vault may be deployed before Set_0 is known so
+their exact addresses and runtime hashes can be collected for a later B3 build.
+At M-1, three bootstrap operators sign the ordinary `FinalizedBlock` digest
+whose successor hash is Set_0, and anyone relays it to `initialize`. Before any
+real-fund use, the later build must pin the reviewed Ethereum chain ID,
+verifier/vault addresses and runtime hashes, vault deployment block, canonical
+USDT address, derived AssetId, bootstrap manifest, threshold values, bridge
+height, and audit evidence, and every value must match live code/state. The
+deployment candidate commits every config/artifact field plus exact public
+bootstrap-manifest and source/build-provenance SHA-256 values; the finalizer
+requires that independently approved candidate commitment before it can mark
+deployment inputs complete. `production_approved` remains false.
+The C++-generated vectors exercise the target-fork EIP-2537 hash-to-curve,
+pairing, 3-of-4 aggregation, ordered absent-member path, proof ABI, and full
+`initialize` calldata. The largest bridge-authorizing set is immutably capped
+at 64 members. Its post-Fusaka Osaka benchmark uses 64 distinct PoP-verified keys, the
+minimum 43 signers, and all 21 absent-member paths: 18,144 proof bytes, 18,724
+`submitCertificate` calldata bytes, and 5,513,351 measured gas for the complete
+successful verifier call (checks, prover, storage, and event). Charging every
+calldata byte at the conservative EIP-7623 40-gas nonzero rate gives a
+6,283,311-gas transaction bound,
+below EIP-7825's 16,777,216 per-transaction cap. The fixture and executable
+assertion are `test/vectors/bls64_proof.bin` and
+`test/BlsCertificateGasBound.t.sol`. Production still requires independent
+cryptography and contract review. The
 withdrawal leaf's literal fields encode to 128 bytes
 (`8+8+32+20+20+32+8`); the older “164-byte” label was arithmetic, not padding.
 
-The scaffold is intentionally **not** a migration implementation. The existing
-bUSD AssetId commits the managed vault address, while a new staker vault has a
-different address; deposits to the new vault therefore cannot mint the existing
-bUSD. Directly moving old reserves also does not initialize the new vault's
-`locked` liabilities. Before deployment, the protocol needs an explicit old
-registry cutoff plus either a burn/swap/reissue migration or a versioned
-asset/registry design, including reserve and withdrawal-id genesis. B3 must
-also gate `BRIDGE_BURN` on live bridge-qualified finality so users cannot burn
-while Ethereum is closed or stale. Finally, a managed-to-decentralized mode
-change must be height-versioned so restart/reindex never reinterprets old
-blocks. These are release blockers, not values to guess from a validator list.
+The new vault has a new address and therefore a new B3 AssetId. In the current
+pre-activation case this is a replacement, not a user-balance migration: the
+managed smoke vault held zero USDT at the recorded observation and B3 has not
+activated consensus bridge minting, so no consensus bUSD balance exists to
+move. The release must recheck those zero-state facts, pin only the new
+vault/AssetId before first activation, and permanently exclude the smoke vault
+from the production registry. If a managed vault were ever activated or gained
+liabilities first, replacement would no longer be safe: it would require an
+explicit cutoff, reserve/liability reconciliation, and burn/swap/reissue or a
+versioned asset migration. The implemented B3 path gates `BRIDGE_BURN` on the projected
+current and next bridge-qualified validator sets and an intact finality
+lineage, but that is not sufficient for activation. Burns and withdrawals stay
+disabled by an unset B3 outbound height `W` until the unobservable Ethereum
+canonicality/liveness risks are solved, audited, rehearsed, and explicitly
+enabled in a later B3 build.
 
 ## Toolchain (owner/CI)
 
 ```
 forge build
 forge test
-forge create contracts/B3DepositVault.sol:B3DepositVault --constructor-args <releaseAuthority> <rescueAuthority>
+script/check-deployable-sizes.sh
+forge script script/Deploy.s.sol:Deploy --rpc-url "$ETH_RPC_URL"
 ```
+
+Do not use raw `forge build --sizes` as the release verdict: Foundry includes
+the local deployment script runtime in that report even though it is never
+deployed. The checked size gate inspects the three actual Ethereum runtimes and
+enforces EIP-170 on each one.
+
+The default script is now the immutable prover -> verifier -> staker-vault
+stack. Its mandatory inputs, post-broadcast block proof, and machine-readable
+manifest flow are documented in [`DEPLOYMENT.md`](DEPLOYMENT.md). The managed
+vault helper is retained only as `DeployManagedVault.s.sol` for reproducing the
+historical deployment.
 
 The production evidence must pin the exact Solidity compiler version, EVM and
 metadata settings, source commit, both constructor arguments, fetched runtime
@@ -93,13 +191,24 @@ bytes, and the byte-for-byte comparison that yields the published runtime
 hash. The broad source pragma and an unversioned local Forge install are not a
 reproducibility record.
 
+`B3BridgeAssetId.sol` is the byte-for-byte Solidity mirror of
+`modern::BridgeAssetIdV1`. The deliberately non-symmetric fixture in
+`test/BridgeAssetIdVector.t.sol` and `src/test/bridge_asset_vector_tests.cpp`
+pins the uint64 byte order and both AssetId presentations. Ethereum manifests
+use raw/EVM bytes32 order; B3 wallet asset lookup retains B3's conventional
+reverse `uint256` display. Do not substitute one spelling for the other.
+
 Order of operations per the staged build plan: Sepolia/Holesky with test
 tokens first; mainnet minting only after every independently reviewed bridge
 proof/readiness pin. FlowMesh A3 does not activate the bridge.
+`BRIDGE_ACTIVATION_HEIGHT` remains an explicit later-build chainparams input;
+the contracts do not hardcode or infer that release choice from M.
 
-## Managed-v1 withdrawal minimum
+## Historical managed-v1 withdrawal minimum
 
-Managed v1 does not make an arbitrary authority payment a valid redemption.
+This section records the safety minimum for the historical managed vault; it is
+not the current decentralized activation path. Managed v1 does not make an
+arbitrary authority payment a valid redemption.
 The B3 consensus path now requires one exact bUSD `BURN` output and a type-10
 managed-withdrawal record binding its raw six-decimal amount and Ethereum
 recipient; the resulting request is replayed and undone with the active chain.
@@ -129,7 +238,8 @@ forge test -vv
 
 # 2. deploy (RELEASE_AUTHORITY = an address you control, for the interim)
 export RELEASE_AUTHORITY=0xYourRecoveryAddress
-forge script script/Deploy.s.sol --rpc-url $ETH_RPC --broadcast --interactive
+forge script script/DeployManagedVault.s.sol:DeployManagedVault \
+    --rpc-url $ETH_RPC --broadcast --interactive
 
 # 3. deposit a tiny amount of real ETH (cast asks for the key interactively)
 cast send <VAULT> "depositETH(bytes32)" 0x<32-byte-b3-recipient>     --value 0.001ether --rpc-url $ETH_RPC --interactive

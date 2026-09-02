@@ -11,6 +11,7 @@
 #include <script/script.h>
 #include <sync.h>
 #include <uint256.h>
+#include <util/fs.h>
 
 #include <array>
 #include <chrono>
@@ -49,7 +50,8 @@ namespace node {
 class StakingLoop
 {
 public:
-    StakingLoop(ChainstateManager& chainman, CTxMemPool* mempool);
+    StakingLoop(ChainstateManager& chainman, CTxMemPool* mempool,
+                fs::path finality_signer_dir);
     ~StakingLoop();
 
     //! Wire the peer manager for finality-signature relay (after net setup).
@@ -98,6 +100,7 @@ private:
 
     ChainstateManager& m_chainman;
     CTxMemPool* const m_mempool;
+    const fs::path m_finality_signer_dir;
     PeerManager* m_peerman{nullptr};
 
     // Serialize complete start/stop/key-replacement operations. m_mutex alone
@@ -118,6 +121,7 @@ private:
     uint256 m_last_block_hash GUARDED_BY(m_mutex);
     int64_t m_next_block_time GUARDED_BY(m_mutex){0};
     int m_last_signed_height GUARDED_BY(m_mutex){-1};
+    bool m_finality_signing_failed GUARDED_BY(m_mutex){false};
 };
 
 } // namespace node

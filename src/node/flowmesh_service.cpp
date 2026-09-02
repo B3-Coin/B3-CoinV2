@@ -1878,6 +1878,18 @@ void FlowMeshService::BlockDisconnected(
     m_impl->chain_reconciling.store(true, std::memory_order_release);
 }
 
+void FlowMeshService::ReconcileAfterInitialBlockDownload()
+{
+    if (!Running() || m_impl->chainman.IsInitialBlockDownload()) return;
+
+    const CBlockIndex* tip;
+    {
+        LOCK(::cs_main);
+        tip = m_impl->chainman.ActiveChain().Tip();
+    }
+    UpdatedBlockTip(tip, nullptr, /*initial_download=*/false);
+}
+
 void FlowMeshService::UpdatedBlockTip(const CBlockIndex* new_tip,
                                       const CBlockIndex*,
                                       const bool initial_download)

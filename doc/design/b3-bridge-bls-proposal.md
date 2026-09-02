@@ -1,15 +1,14 @@
 # B3 bridges — BLS as the keystone (design proposal)
 
-**Status: historical design record (2026-08-23), superseded for transition-v1
-custody and exact mint admission by OD-8 and the bridge threat model. The
-direction ("BLS is the key to bridge") remains the future decentralized goal.
-Stages 1–4 now exist in the transition tree: bounded type-10 records drive the
-Ethereum light client, exact deposit minting, execution backfill, and managed
-withdrawal burns through consensus. The state is replayed in memory from
-activation (with pruning refused), not stored in a durable sidecar. Mainnet is
-still fail-closed, and no operator Ethereum-release service or decentralized
-withdrawal verifier exists. A3 is FlowMesh activation and never activates this
-bridge.**
+**Status: historical design record (2026-08-23). Sections 1–8 preserve the
+original proposal and are not current operating instructions. The BLS direction
+is now implemented as the keyless `BlsCertificateProver` /
+`B3FinalityVerifier` / `B3StakerBridge` stack, with a one-time 3-of-4 handoff to
+canonical Set0, normal certificate/withdrawal proof-calldata RPCs, and B3's
+Ethereum light-client deposit path. Mainnet remains fail-closed pending the
+new deployment manifest, later-build chainparams pins, independent audits, and
+rehearsal. The independent bridge height is selected only after those gates;
+A3 is FlowMesh activation and never activates this bridge.**
 
 ## 1. Why BLS is the keystone (the one-paragraph version)
 
@@ -199,6 +198,11 @@ consensus or the v1 release.
 ---
 
 ## 9. Execution status addendum (2026-08-24)
+
+This 2026-08-24 table is itself historical. The current decentralized
+supersession is summarized in the status notice above and in
+`b3-finality-to-ethereum.md`; managed-v1 statements below record the path that
+was reviewed at that date rather than the current production target.
 
 Owner ruling 2026-08-24: **deposit legs first — ETH → B3, then BTC → B3**
 (recorded in b3-open-decisions.md OD-8). Against the §3 staged order:

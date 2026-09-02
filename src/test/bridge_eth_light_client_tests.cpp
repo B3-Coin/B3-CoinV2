@@ -10,6 +10,7 @@
 // src/test/data/eth_lc_fixture.h (captured by contrib/b3bridge).
 
 #include <bridge/eth_light_client.h>
+#include <bridge/lc_json.h>
 #include <bridge/ssz.h>
 #include <test/data/eth_lc_fixture.h>
 #include <uint256.h>
@@ -237,6 +238,71 @@ BOOST_AUTO_TEST_CASE(mainnet_rejections)
         bad.signature_slot = bad.attested.beacon.slot;
         BOOST_CHECK(VerifyUpdate(store, cfg, bad) == LcResult::MONOTONICITY);
     }
+}
+
+BOOST_AUTO_TEST_CASE(finalized_store_snapshot_json_roundtrip)
+{
+    const auto cfg{Config()};
+    auto store{Bootstrapped(cfg)};
+    const auto without_next{lcjson::ParseStore(lcjson::StoreJson(store))};
+    BOOST_CHECK(without_next == store);
+    BOOST_CHECK(!without_next.next.has_value());
+
+    BOOST_REQUIRE(ProcessUpdate(store, cfg, Update1()) == LcResult::OK);
+    BOOST_REQUIRE(store.next.has_value());
+
+    const uint256 connection_hash{uint256::FromHex(
+        "0000000000000000000000000000000000000000000000000000000000000011").value()};
+    const uint256 finalized_hash{uint256::FromHex(
+        "0000000000000000000000000000000000000000000000000000000000000022").value()};
+    const UniValue json{lcjson::StoreSnapshotJson(
+        store, 100, connection_hash, 120, finalized_hash)};
+    const auto parsed{lcjson::ParseStoreSnapshot(json)};
+    BOOST_CHECK(parsed.store == store);
+    BOOST_CHECK_EQUAL(parsed.connection_height, 100U);
+    BOOST_CHECK(parsed.connection_block_hash == connection_hash);
+    BOOST_CHECK_EQUAL(parsed.b3_finalized_height, 120U);
+    BOOST_CHECK(parsed.b3_finalized_block_hash == finalized_hash);
+
+    // The decimal-only beacon representation of uint256 base fee is exact.
+    BOOST_CHECK(parsed.store.finalized_header.execution.base_fee_per_gas ==
+                store.finalized_header.execution.base_fee_per_gas);
+}
+
+BOOST_AUTO_TEST_CASE(finalized_store_snapshot_rejects_untrusted_shapes)
+{
+    const auto cfg{Config()};
+    const auto good{Bootstrapped(cfg)};
+    const uint256 connection_hash{uint256::FromHex(
+        "0000000000000000000000000000000000000000000000000000000000000011").value()};
+    const uint256 finalized_hash{uint256::FromHex(
+        "0000000000000000000000000000000000000000000000000000000000000022").value()};
+
+    auto bad_period{good};
+    ++bad_period.period;
+    BOOST_CHECK_THROW(
+        lcjson::ParseStoreSnapshot(lcjson::StoreSnapshotJson(
+            bad_period, 100, connection_hash, 120, finalized_hash)),
+        std::runtime_error);
+
+    auto bad_execution{good};
+    bad_execution.finalized_header.execution_branch.pop_back();
+    BOOST_CHECK_THROW(
+        lcjson::ParseStoreSnapshot(lcjson::StoreSnapshotJson(
+            bad_execution, 100, connection_hash, 120, finalized_hash)),
+        std::runtime_error);
+
+    auto bad_committee{good};
+    bad_committee.current.pubkeys.pop_back();
+    BOOST_CHECK_THROW(
+        lcjson::ParseStoreSnapshot(lcjson::StoreSnapshotJson(
+            bad_committee, 100, connection_hash, 120, finalized_hash)),
+        std::runtime_error);
+
+    BOOST_CHECK_THROW(
+        lcjson::ParseStoreSnapshot(lcjson::StoreSnapshotJson(
+            good, 121, connection_hash, 120, finalized_hash)),
+        std::runtime_error);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

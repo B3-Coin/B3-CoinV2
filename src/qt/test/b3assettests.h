@@ -16,6 +16,7 @@ private Q_SLOTS:
     void amountFormattingIsIntegerExact();
     void walletAssetRecordsExposeFnAndColoredAssets();
     void assetIdSearchSelectsOwnedAsset();
+    void bridgeAssetDetailsUseBusdMetadata();
     void refreshPreservesSelectedAsset();
     void nativeOnlySourceEnablesOnlySupportedActions();
     void unknownMetadataAndLongNamesRenderSafely();

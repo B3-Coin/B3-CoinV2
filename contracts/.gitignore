@@ -2,3 +2,7 @@ lib/
 out/
 cache/
 broadcast/
+deployments/local-*.json
+.env
+.env.*
+!.env.example

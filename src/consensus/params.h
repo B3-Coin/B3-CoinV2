@@ -217,15 +217,22 @@ struct Params {
      */
     std::optional<int> flowmesh_activation_height;
     /**
+     * First height at which bridge-backed asset burns may create Ethereum
+     * withdrawal leaves. This is deliberately independent from the inbound
+     * bridge activation in BridgeAssetParams: a release may enable verified
+     * deposits while irreversible B3 burns remain fail-closed. Unset means
+     * every managed or decentralized withdrawal record is invalid.
+     */
+    std::optional<int> bridge_withdrawal_activation_height;
+    /**
      * The first bridge-backed asset is bUSD backed 1:1 by Ethereum-mainnet
-     * USDT in the owner-ratified vault. Mainnet may carry its immutable
+     * USDT in an exact release-pinned vault. Mainnet may carry its immutable
      * origin identity before activation, but BridgeMintParamsReady remains
      * false until the checkpoint, fork/lag rules, caps, adapter/version,
      * recipient codec, activation height, and withdrawal-security pins have
      * all been explicitly populated. No partial configuration authorizes a
-     * mint. Transition v1 explicitly selects managed withdrawals through the
-     * deployed vault's immutable authority; its address, vault code hash and
-     * versioned rules commitment must still be read and pinned exactly.
+     * mint. Completing those pins does not activate burns: the separate
+     * bridge_withdrawal_activation_height must also be ratified and pinned.
      */
     std::optional<BridgeAssetParams> busd_bridge;
     /**
@@ -243,6 +250,14 @@ struct Params {
      * post-X trusted replay (which verifies its own configured checkpoints).
      */
     std::map<int, uint256> legacy_checkpoints;
+    /**
+     * Hardened checkpoints for the post-legacy B3 chain (height -> exact
+     * modern block identity). These are enforced independently of the
+     * historical legacy checkpoint table, including while rebuilding the
+     * chainstate from an existing block index. Heights in the legacy era are
+     * deliberately ignored.
+     */
+    std::map<int, uint256> modern_checkpoints;
     /**
      * Rolling maximum reorg depth for the live legacy chain (the historical
      * client's nCheckpointSpan). A legacy block whose height is at least this

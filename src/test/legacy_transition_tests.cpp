@@ -191,6 +191,78 @@ BOOST_AUTO_TEST_CASE(validation_schema_pre_h_state_marks_without_reindex)
     }
 }
 
+BOOST_AUTO_TEST_CASE(startup_rejects_checkpoint_mismatch_despite_schema_marker)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    auto& consensus{const_cast<Consensus::Params&>(chainman.GetConsensus())};
+    const CBlockIndex* genesis{
+        WITH_LOCK(cs_main, return chainman.ActiveChain().Tip())};
+    BOOST_REQUIRE(genesis != nullptr);
+    BOOST_REQUIRE_EQUAL(genesis->nHeight, 0);
+
+    // Admit one valid corridor block before the checkpoint is configured,
+    // then model a database marker written by that older release.
+    constexpr uint32_t EASY_BITS{0x207fffff};
+    consensus.hard_fork_height = 1;
+    consensus.legacy_final_hash = genesis->GetBlockHash();
+    consensus.transition_pow_length = 2;
+    consensus.transition_pow_bits = EASY_BITS;
+    consensus.transition_pow_reward = 0;
+
+    CMutableTransaction coinbase;
+    coinbase.version = 2;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig =
+        CScript() << CScriptNum{1} << CScriptNum{7};
+    coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+
+    CBlock corridor;
+    corridor.nVersion =
+        static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+    corridor.hashPrevBlock = genesis->GetBlockHash();
+    corridor.nTime = static_cast<uint32_t>(genesis->GetBlockTime() + 60);
+    corridor.nBits = EASY_BITS;
+    corridor.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+    corridor.hashMerkleRoot = BlockMerkleRoot(corridor);
+    while (!CheckTransitionPowEligibility(corridor)) ++corridor.nNonce;
+
+    bool new_block{false};
+    BOOST_REQUIRE(chainman.ProcessNewBlock(
+        std::make_shared<const CBlock>(corridor),
+        /*force_processing=*/true, /*min_pow_checked=*/true, &new_block));
+    BOOST_REQUIRE(new_block);
+    BOOST_REQUIRE_EQUAL(
+        WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->nHeight), 1);
+
+    {
+        LOCK(cs_main);
+        chainman.ActiveChainstate().ForceFlushStateToDisk();
+        BOOST_REQUIRE(chainman.ActiveChainstate().CoinsDB()
+                          .MarkB3ValidationSchemaV1Current());
+        BOOST_REQUIRE(chainman.ActiveChainstate().CoinsDB()
+                          .B3ValidationSchemaV1Current());
+    }
+
+    uint256 wrong_checkpoint{corridor.GetHash()};
+    wrong_checkpoint.begin()[0] ^= 1;
+    consensus.modern_checkpoints = {{1, wrong_checkpoint}};
+
+    node::ChainstateLoadOptions options;
+    options.mempool = Assert(m_node.mempool.get());
+    options.coins_db_in_memory = m_coins_db_in_memory;
+    options.prune = chainman.m_blockman.IsPruneMode();
+    const auto [status, error]{
+        node::VerifyLoadedChainstate(chainman, options)};
+    BOOST_CHECK(status == node::ChainstateLoadStatus::FAILURE);
+    BOOST_CHECK(error.original.find("hardened modern checkpoint at height 1") !=
+                std::string::npos);
+    BOOST_CHECK(WITH_LOCK(
+        cs_main,
+        return chainman.ActiveChainstate().CoinsDB()
+            .B3ValidationSchemaV1Current()));
+}
+
 BOOST_AUTO_TEST_CASE(load_external_block_file_uses_legacy_codec)
 {
     ChainstateManager& chainman{*m_node.chainman};
@@ -1964,6 +2036,35 @@ BOOST_AUTO_TEST_CASE(transition_pow_corridor_validation)
         }
         return block;
     }};
+
+    // A post-legacy checkpoint is enforced by the real validation path. The
+    // exact block passes both the contextual header check and ConnectBlock's
+    // deterministic recheck; changing only the configured identity produces
+    // the dedicated checkpoint rejection before anything is connected.
+    {
+        const CBlock exact{build_corridor(tip(), EASY_BITS, /*grind_scrypt=*/true)};
+        mutable_consensus.modern_checkpoints = {
+            {H + 1, exact.GetHash(consensus, H + 1)},
+        };
+        {
+            LOCK(cs_main);
+            const BlockValidationState state{TestBlockValidity(
+                chainman.ActiveChainstate(), exact, /*check_pow=*/true,
+                /*check_merkle_root=*/true)};
+            BOOST_REQUIRE_MESSAGE(state.IsValid(), state.ToString());
+        }
+
+        mutable_consensus.modern_checkpoints = {{H + 1, uint256::ONE}};
+        {
+            LOCK(cs_main);
+            const BlockValidationState state{TestBlockValidity(
+                chainman.ActiveChainstate(), exact, /*check_pow=*/true,
+                /*check_merkle_root=*/true)};
+            BOOST_REQUIRE(state.IsInvalid());
+            BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-modern-checkpoint");
+        }
+        mutable_consensus.modern_checkpoints.clear();
+    }
 
     // Wrong corridor difficulty is refused at the header.
     {

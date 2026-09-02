@@ -6,11 +6,17 @@ pragma solidity ^0.8.24;
 /// Every integer is encoded big-endian by abi.encodePacked. The resulting
 /// byte layouts are the 112-byte FinalizedBlock and 110-byte SetHeader from
 /// doc/design/b3-cross-chain-finality-v1.md. No private validator material is
-/// embedded here: the genesis header is supplied only after B3 derives the
-/// canonical Set_0 snapshot from public corridor state.
+/// embedded here. A deployment may pin a four-key bootstrap header first and
+/// install the canonical Set_0 header only after B3 derives it from public
+/// corridor state.
 library B3Types {
     uint16 internal constant RULESET_V1 = 1;
     uint32 internal constant MAX_VALIDATORS = 8_192;
+    uint256 internal constant MIN_PROVEN_EPOCH_DURATION = 1 days;
+    // Largest bridge-authorizing set exercised by the V1 target-fork gas
+    // benchmark. Larger B3 sets remain valid chain-lineage objects, but they
+    // deliberately cannot authorize new bridge roots in this deployment.
+    uint32 internal constant MAX_PROVEN_BRIDGE_VALIDATORS = 64;
 
     struct FinalizedBlock {
         uint64 height;
@@ -30,11 +36,7 @@ library B3Types {
         bytes32 membersRoot;
     }
 
-    function encodeSetHeader(SetHeader memory header)
-        internal
-        pure
-        returns (bytes memory)
-    {
+    function encodeSetHeader(SetHeader memory header) internal pure returns (bytes memory) {
         return abi.encodePacked(
             header.epoch,
             header.rulesetVersion,
@@ -46,11 +48,7 @@ library B3Types {
         );
     }
 
-    function hashSetHeader(SetHeader memory header)
-        internal
-        pure
-        returns (bytes32)
-    {
+    function hashSetHeader(SetHeader memory header) internal pure returns (bytes32) {
         return keccak256(encodeSetHeader(header));
     }
 
@@ -61,19 +59,11 @@ library B3Types {
     /// Structural rules that Ethereum can verify without knowing the member
     /// list. Point validity is enforced by the BLS precompiles when a
     /// certificate is submitted.
-    function headerShapeValid(SetHeader memory header)
-        internal
-        pure
-        returns (bool)
-    {
+    function headerShapeValid(SetHeader memory header) internal pure returns (bool) {
         if (
-            header.rulesetVersion != RULESET_V1 ||
-            header.validatorCount == 0 ||
-            header.validatorCount > MAX_VALIDATORS ||
-            header.totalWeight == 0 ||
-            uint256(header.quorumWeight) != quorumWeight(header.totalWeight) ||
-            header.aggregatePubkey.length != 48 ||
-            header.membersRoot == bytes32(0)
+            header.rulesetVersion != RULESET_V1 || header.validatorCount == 0 || header.validatorCount > MAX_VALIDATORS
+                || header.totalWeight == 0 || uint256(header.quorumWeight) != quorumWeight(header.totalWeight)
+                || header.aggregatePubkey.length != 48 || header.membersRoot == bytes32(0)
         ) return false;
 
         // IETF compressed G1: compression bit set, infinity bit clear.

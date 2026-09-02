@@ -13,6 +13,8 @@
 #include <node/bridge_state.h>
 #include <util/check.h>
 
+#include <limits>
+
 namespace node {
 
 // ----------------------------------------------------------------- State
@@ -39,6 +41,25 @@ std::optional<uint32_t> FinalityTracker::State::SetSize(const uint64_t e) const
     if (e == epoch && current) return static_cast<uint32_t>(current->Size());
     if (epoch >= 1 && e == epoch - 1 && previous) return static_cast<uint32_t>(previous->Size());
     return std::nullopt;
+}
+
+bool BridgeWithdrawalValidatorSetsReady(
+    const FinalityTracker::State& projected,
+    const Consensus::BridgeDecentralizedWithdrawalPins& pins)
+{
+    if (!pins.Valid() || !projected.bootstrapped ||
+        projected.lineage_broken || !projected.current || !projected.next ||
+        projected.current->Epoch() != projected.epoch ||
+        projected.epoch == std::numeric_limits<uint64_t>::max() ||
+        projected.next->Epoch() != projected.epoch + 1) {
+        return false;
+    }
+    const auto eligible{[&pins](const ValidatorSetSnapshot& set) {
+        return set.Size() >= pins.min_bridge_validators &&
+               set.Size() <= pins.max_bridge_validators &&
+               set.TotalWeight() >= pins.min_bridge_total_weight;
+    }};
+    return eligible(*projected.current) && eligible(*projected.next);
 }
 
 // --------------------------------------------------------------- helpers
@@ -91,6 +112,7 @@ FinalityTracker::State FinalityTracker::Projected(const int height, const Consen
         const auto snap{SnapshotAt(0, height - 1)};
         if (snap && snap->Size() >= static_cast<size_t>(pos.min_finality_set)) {
             s.current = std::make_shared<const ValidatorSetSnapshot>(*snap);
+            s.bootstrap = s.current;
             s.next = std::make_shared<const ValidatorSetSnapshot>(snap->WithEpoch(1));
             s.bootstrapped = true;
         }

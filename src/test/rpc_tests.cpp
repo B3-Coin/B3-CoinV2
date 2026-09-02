@@ -117,9 +117,12 @@ BOOST_AUTO_TEST_CASE(getbridgeinfo_reports_incomplete_mainnet_pins)
     BOOST_CHECK(!result.find_value("ready").get_bool());
     BOOST_CHECK(!result.find_value("active").get_bool());
     BOOST_CHECK(!result.find_value("mint_approval_open").get_bool());
+    BOOST_CHECK(!result.find_value("asset_id").isNull());
+    BOOST_CHECK(!result.find_value("asset_id_evm").isNull());
     BOOST_CHECK(result.find_value("registry_id").isNull());
     BOOST_CHECK_EQUAL(result.find_value("vault").get_str(),
                       "143f207e23e6aebd7e974be90ac6d434f4c7bfb6");
+    BOOST_CHECK(result.find_value("vault_runtime_code_hash").isNull());
     BOOST_CHECK_EQUAL(result.find_value("token").get_str(),
                       "dac17f958d2ee523a2206206994597c13d831ec7");
     BOOST_CHECK(!result.find_value("state_available").get_bool());
@@ -127,6 +130,85 @@ BOOST_AUTO_TEST_CASE(getbridgeinfo_reports_incomplete_mainnet_pins)
     BOOST_CHECK_EQUAL(result.find_value("anchors").getInt<int>(), 0);
     BOOST_CHECK_EQUAL(result.find_value("nullifiers").getInt<int>(), 0);
     BOOST_CHECK_EQUAL(result.find_value("managed_withdrawals").getInt<int>(), 0);
+    BOOST_CHECK_THROW(CallRPC("getbridgelightclientstore"), std::runtime_error);
+    BOOST_CHECK_THROW(CallRPC("getbridgeanchorforblock 19000000"),
+                      std::runtime_error);
+    BOOST_CHECK_THROW(CallRPC("getbridgefinalityproof 0"),
+                      std::runtime_error);
+    BOOST_CHECK_THROW(
+        CallRPC("getbridgewithdrawalproof " + std::string(64, '0') + " 0"),
+        std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(getbridgeproofstatus_is_fail_closed_and_uses_ethereum_hash_order)
+{
+    const std::string eth_hash{
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"};
+    const UniValue result{
+        CallRPC("getbridgeproofstatus " + eth_hash + " 42")};
+    BOOST_CHECK(!result.find_value("state_available").get_bool());
+
+    const UniValue& anchor{result.find_value("anchor")};
+    BOOST_CHECK_EQUAL(anchor.find_value("hash").get_str(), eth_hash);
+    BOOST_CHECK(!anchor.find_value("known").get_bool());
+
+    const UniValue& deposit{result.find_value("deposit")};
+    BOOST_CHECK_EQUAL(deposit.find_value("deposit_id").getInt<int>(), 42);
+    BOOST_CHECK(!deposit.find_value("claimed").get_bool());
+}
+
+BOOST_AUTO_TEST_CASE(getbridgeanchorforblock_converts_target_to_number)
+{
+    const UniValue converted{
+        RPCConvertValues("getbridgeanchorforblock", {"19000000"})};
+    BOOST_REQUIRE_EQUAL(converted.size(), 1U);
+    BOOST_CHECK(converted[0].isNum());
+    BOOST_CHECK_EQUAL(converted[0].getInt<uint64_t>(), 19'000'000U);
+}
+
+BOOST_AUTO_TEST_CASE(outbound_bridge_rpc_converts_hashes_or_heights)
+{
+    const std::string hash{
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"};
+    UniValue converted{
+        RPCConvertValues("getbridgefinalityproof", {"811002"})};
+    BOOST_REQUIRE_EQUAL(converted.size(), 1U);
+    BOOST_CHECK(converted[0].isNum());
+    BOOST_CHECK_EQUAL(converted[0].getInt<uint64_t>(), 811002U);
+    converted = RPCConvertValues("getbridgefinalityproof", {hash});
+    BOOST_CHECK(converted[0].isStr());
+    BOOST_CHECK_EQUAL(converted[0].get_str(), hash);
+
+    converted = RPCConvertValues(
+        "getbridgewithdrawalproof", {hash, "7", "812442"});
+    BOOST_REQUIRE_EQUAL(converted.size(), 3U);
+    BOOST_CHECK(converted[0].isStr());
+    BOOST_CHECK_EQUAL(converted[0].get_str(), hash);
+    BOOST_CHECK(converted[1].isNum());
+    BOOST_CHECK(converted[2].isNum());
+    BOOST_CHECK_EQUAL(converted[1].getInt<uint64_t>(), 7U);
+    BOOST_CHECK_EQUAL(converted[2].getInt<uint64_t>(), 812442U);
+    converted = RPCConvertValues(
+        "getbridgewithdrawalproof", {hash, "7", hash});
+    BOOST_CHECK(converted[2].isStr());
+    BOOST_CHECK_EQUAL(converted[2].get_str(), hash);
+}
+
+BOOST_AUTO_TEST_CASE(outbound_bridge_rpc_rejects_malformed_burn_sources)
+{
+    const std::string txid(64, '1');
+    BOOST_CHECK_THROW(CallRPC("getbridgewithdrawalproof not-a-txid 0"),
+                      std::runtime_error);
+    BOOST_CHECK_THROW(CallRPC("getbridgewithdrawalproof " + txid),
+                      std::runtime_error);
+    BOOST_CHECK_THROW(CallRPC("getbridgewithdrawalproof " + txid + " -1"),
+                      std::runtime_error);
+    BOOST_CHECK_THROW(
+        CallRPC("getbridgewithdrawalproof " + txid + " 4294967296"),
+        std::runtime_error);
+    BOOST_CHECK_THROW(
+        CallRPC("getbridgewithdrawalproof " + txid + " 0 bad-block"),
+        std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(rpc_namedparams)

@@ -177,38 +177,58 @@ Treasury script for `SNyANHiUkuqPSfbeKHDXzVD86LC2ZUUjLX`:
       blocks after A2. Missing values stop the tag.
 - [ ] If bUSD is to activate in this release, every bridge readiness pin and
       implementation gate is independently reviewed and complete. The tree now
-      has a bounded type-10 bootstrap/update/mint/backfill/managed-withdrawal
+      has a bounded type-10 bootstrap/update/mint/backfill/decentralized-burn
       carrier, exact `BRIDGE_BACKED` OWNER mint and bUSD BURN transitions,
       nullifier/cap accounting, undo, reindex replay, and mempool/miner/asset
       wiring. Every type-10 transaction has exactly one zero-value policy-9
       `BRIDGE_RECORD` metadata cell committing the
       `B3/BRIDGE/RECORD/V1` tagged hash of the canonical frame; tests reject
-      missing, duplicate, mismatched, and orphan cells. Managed-withdrawal
-      consensus requires exact ECDSA `SIGHASH_ALL` or Schnorr
+      missing, duplicate, mismatched, and orphan cells. Withdrawal consensus
+      requires exact ECDSA `SIGHASH_ALL` or Schnorr
       `SIGHASH_DEFAULT`/`SIGHASH_ALL` on every input, rejecting `NONE`,
       `SINGLE`, and `ANYONECANPAY`; this covers the binding without
       `OP_RETURN` or a custom sighash. Its bridge index is rebuilt in memory
       from activation and has
       no durable sidecar, so a configured bridge must continue to refuse
       pruning and any snapshot that skips bridge history.
-      The managed-v1 vault is exactly
-      `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`; otherwise bUSD remains
-      explicitly fail-closed at tag time.
-- [ ] Managed-v1 operating rules commit to one workflow: a confirmed B3 burn
-      request binds canonical bUSD, exact raw amount, Ethereum recipient and a
-      unique request id; after the pinned finality depth the operator releases
-      registry-derived USDT exactly once, durably consumes the id, and
-      reconciles reserve against supply. No confirmed burn means no release.
-- [ ] The operator-side Ethereum release service and durable request-consumption
-      database implement that workflow, including crash-safe retry/recovery.
-      The B3 node records the canonical burn request but does not call the vault
-      or record an Ethereum release.
+      The historical managed-v1 vault is not a valid production pin.
+- [ ] The immutable decentralized stack is deployed in the order prover,
+      verifier, then keyless vault. The final mined manifest proves all three
+      runtime hashes and constructor pins, the new vault's first-code block,
+      canonical USDT, deposit cap, bootstrap set hash, and exact derived
+      AssetId. Recheck that the historical managed vault has zero liabilities
+      and that no bUSD was activated against it; otherwise stop for migration.
+- [ ] A later reviewed B3 build pins the complete audited deployment tuple:
+      Ethereum chain ID, verifier/vault addresses and runtime code hashes,
+      vault deployment block, canonical USDT address, and derived B3 AssetId.
+      Missing or mismatching fields keep the bridge fail-closed.
+      The manifest's `vault_runtime_code_hash` maps exactly to
+      `BridgeAssetParams::vault_runtime_code_hash`; `getbridgeinfo` must expose
+      the same value and it must match the live Ethereum `extcodehash`.
+- [ ] The four public bootstrap identities reproduce one synthetic equal-weight
+      header, and at least three sign the exact M-1/Set0 handoff. The one-time
+      initialization calldata reproduces independently and lands before the
+      immutable deadline. No bootstrap private key enters a deployment file.
+- [ ] The normal outbound workflow is rehearsed: a finalized B3 certificate's
+      bitmap/aggregate/absent-member paths reproduce `submitCertificate`
+      calldata; `getbridgewithdrawalproof <confirmed_txid> <burn_vout>
+      [certificate_block]` resolves only the confirmed active-chain burn and
+      its cumulative depth-32 path into `release` calldata. The wallet never
+      exposes a provisional withdrawal id/leaf before confirmation. Duplicate
+      release is rejected. The permissionless Ethereum submitter pays gas and
+      holds its own key outside the B3 node.
 - [ ] The USDT adapter commitment has a reviewed preimage and consensus-enforced
       applicability/upgrade rule; a nonzero parameter alone is not enforcement.
 - [ ] Reproducible evidence byte-matches the deployed vault runtime to the
       reviewed source with exact compiler/settings/constructor immutables, and
       the contract plus bridge verification stack have passed the required
       independent audits/fuzz gates.
+- [ ] Deposits remain disabled until initialization and a fresh valid
+      certificate prove qualified current and successor sets. If inbound B is
+      enabled before outbound W, publish the custodial-waiting warning: bUSD
+      can be minted but cannot yet be burned for Ethereum release. W remains
+      unset unless canonicality and liveness safety for the complete round trip
+      is solved, independently reviewed, rehearsed, and explicitly enabled.
 
 ## 3. Pin the transition release
 
@@ -225,6 +245,8 @@ hard_fork_height        = 810001 (also the fixed FN Genesis height)
 fn_pod_activation_height = 812000 (A1)
 asset_activation_height  = 813000 (A2)
 flowmesh_activation_height = 815000 (A3; 2,000-block preparation runway)
+busd_bridge.activation_height = B (inbound; only after the final manifest/pins)
+bridge_withdrawal_activation_height = unset (W; later reviewed release, W >= B)
 asset_issuance_fee      = 1,000 B3
 ```
 
@@ -469,13 +491,14 @@ Its claim/proof builders and verifiers have been removed. Only the numeric
 type/version registry entries 1 and 2 remain permanently inactive and rejected,
 so previously assigned bytes can never acquire a new meaning.
 
-Confirm `CLIENT_VERSION_MAJOR/MINOR/BUILD` remains `1/1/0`. For the current
-stable release, `CLIENT_VERSION_PRERELEASE` must be empty and
-`doc/release-notes-v1.1.0.md` must be present and accurate. Preserve the beta.1,
-beta.2, and beta.3 notes as historical records of those releases. Confirm the
-guard tests use exact value-by-value assertions for X, R0, manifest
-checksum/count/root, FN genesis height, A1, A2, A3, fee, and every Modern PoS
-parameter.
+The published baseline remains `v1.1.0`; its tag, version, notes, and artifacts
+are immutable and `doc/release-notes-v1.1.0.md` stays a historical record of
+that exact source. This bridge/consensus candidate now uses source version
+`v1.1.1` and the matching release-notes filename, but that exact version and
+commit still need owner approval before tagging. Preserve the beta.1,
+beta.2, beta.3, and v1.1.0 notes unchanged. Confirm the guard tests use exact
+value-by-value assertions for X, R0, manifest checksum/count/root, FN genesis
+height, A1, A2, A3, fee, and every Modern PoS parameter.
 
 ## 5. Mandatory shadow-fork rehearsal
 
@@ -491,6 +514,11 @@ through:
    least two mature native-B3 stakes, each with a valid validator-authorized
    BLS binding and nonzero finality weight; do not approach M without this
    preflight, because there is no safe late bootstrap;
+   arm each initial validator's finality signer before its first checkpoint is
+   signable, preserve `<network-datadir>/finality_signer` with the wallet, and
+   never operate the same validator/BLS key from two independent datadirs or
+   machines; a wallet backup without its live signer journal is not a safe
+   active-validator migration;
 7. the corridor-to-Modern-PoS boundary;
 8. simple-v1 asset rejection before A2, then activation and the 1,000 B3
    treasury fee at A2;
@@ -511,15 +539,27 @@ statuses. Any unexplained divergence stops the release.
 
 1. Commit and review the measured pins and production wiring.
 2. Complete the full local build, mandatory suites, and shadow-fork gate.
-3. With `CLIENT_VERSION_PRERELEASE` empty, tag the exact reviewed commit
-   `v1.1.0`, push the release branch and tag, and let CI build all five package
-   variants, including the static headless Linux operator package and Windows
-   x86-64. Win32 is deferred from this automated release; any later upload must
-   be built from the exact tag, independently architecture/runtime checked, and
-   checksummed. CI must publish v1.1.0 as the latest stable release. A manual
+3. The `v1.1.0` tag and release are already published and immutable. These
+   post-v1.1.0 consensus/contract changes use the owner-proposed `v1.1.1`; do
+   not move, recreate, or upload replacement assets to v1.1.0. After the owner
+   approves the exact v1.1.1 commit, tag it, push
+   the release branch and tag, and let CI build all five package variants,
+   including the static headless Linux operator package and Windows x86-64.
+   Win32 is deferred from this automated release; any later upload must be built
+   from the exact tag, independently architecture/runtime checked, and
+   checksummed. A manual
    **Run workflow** build produces downloadable Actions artifacts for testing
    only; it does not create or update a GitHub Release. The publish job runs
    only for a pushed tag that exactly matches the source version.
+   Extended GitHub qualification is the default. If the exact tagged commit has
+   already completed the full local unit, Qt, functional, Solidity, relayer,
+   and packaging qualification and GitHub time is the only constraint, a
+   repository administrator may explicitly set the Actions variable
+   `B3_SKIP_EXTENDED_RELEASE_TESTS_SHA` to that tag's exact 40-character commit
+   id. The workflow emits a visible warning and still requires every platform
+   build/checksum job. Save the local command logs and unset the variable
+   immediately afterward; the SHA binding prevents this exception from
+   silently carrying over to a later source revision.
 4. Attach binaries and SHA-256 checksums to each release. Publish X prominently
    with the old-client verification command `getblockhash 810000`.
 5. Publish the full FN manifest, checksum, R, and rights root beside the release
@@ -537,7 +577,11 @@ Genesis. Native-B3 STAKE outputs and validator-authorized public BLS bindings
 may be included in that same block and throughout corridor blocks
 810,001..811,000. Set0 is the exact snapshot after block 811,000 and must have
 at least two qualified members; otherwise Modern PoS cannot start. Modern PoS
-begins at M = 811,001. Modern FN PoD creation activates at A1 = 812,000.
+begins at M = 811,001. A two- or three-member Set0 can finalize B3 and initialize
+the Ethereum verifier, but cannot authorize bridge withdrawals: both the
+current and successor canonical sets must have at least four members, meet the
+pinned minimum total weight, and satisfy the verifier's freshness rules.
+Modern FN PoD creation activates at A1 = 812,000.
 Simple-v1 colored assets and FlowMesh seat/vault preparation activate at
 A2 = 813,000. Full FlowMesh spot trading and settlement activate at
 A3 = 815,000, after a 2,000-block preparation runway. Each market nevertheless
@@ -547,17 +591,24 @@ sequence zero starts only once that block is 30-deep. No post-adoption FN
 rights scan or list selection exists; those were completed and pinned before
 the tag.
 
-Do not announce bUSD as active merely because its canonical Ethereum-USDT
-identity and managed-v1 vault facts are present. Bridge minting stays
-fail-closed even though the consensus carrier, mint/burn checks, and replay
-state are implemented. The USDT adapter still must be enforced; the production
-checkpoint, fork schedule, caps, activation, rules commitment, X-dependent
-parameters, authority/runtime evidence, audits, and operator withdrawal service
-must all pass the bridge readiness gate.
+Do not announce bUSD as active merely because the Ethereum contracts are
+deployed. The vault may be deployed before M, but deposits remain disabled
+until initialization and a fresh valid certificate prove qualified current
+and successor sets, and until the later B3 build's complete deployment pins
+match. There are no corridor deposits. A3 = 815,000 activates FlowMesh trading
+and never activates the bridge. The production checkpoint,
+fork schedule, caps, approval interval, adapter/rules commitments, deployment
+manifest, verifier/vault runtime evidence, bootstrap handoff, audits, and
+outbound calldata rehearsal must all pass.
 
-Do not describe a future verifier as an in-place upgrade. The managed vault is
-immutable and remains callable after retirement. Under the current identity
-formula a new vault has a new `AssetId`; migration therefore needs a pinned old
-registry cutoff, finality drain window, late-deposit refund/handling process,
-burn/swap/reissue of old bUSD, reserve movement without double minting, and all
-new vault/verifier/identity pins.
+If that later pin enables inbound B while outbound W remains unset, Ethereum
+deposits may mint bUSD after contract readiness, but every B3 withdrawal record
+is consensus-invalid. This intentional waiting period must be disclosed; do
+not describe the bridge as two-way until W is pinned and active.
+
+The historical managed vault is immutable and remains callable, but it is not
+the production registry. Because it had no observed liability and B3 bridge
+minting never activated, the planned new vault is a pre-activation replacement.
+Recheck that statement immediately before pinning. If it is false, apply the
+full old-registry cutoff, late-deposit handling, reserve/liability reconciliation,
+and burn/swap/reissue migration instead.

@@ -1947,7 +1947,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     assert(!node.peerman);
     // B3: the automatic staking loop. Idle until a wallet starts it
     // (startstaking) and until the next block is a modern-PoS block.
-    node.staking = std::make_unique<node::StakingLoop>(*node.chainman, node.mempool.get());
+    node.staking = std::make_unique<node::StakingLoop>(
+        *node.chainman, node.mempool.get(),
+        args.GetDataDirNet() / "finality_signer");
 
     // Every node owns the production service object. It remains dormant and
     // does not advertise the capability unless the complete A2/A3 schedule
@@ -2103,13 +2105,30 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         ScheduleBatchPriority();
         // Import blocks and ActivateBestChain()
         ImportBlocks(chainman, vImportFiles);
-        WITH_LOCK(::cs_main, chainman.UpdateIBDStatus());
+        bool initial_download_completed{false};
+        {
+            LOCK(::cs_main);
+            const bool was_initial_download{
+                chainman.IsInitialBlockDownload()};
+            chainman.UpdateIBDStatus();
+            initial_download_completed =
+                was_initial_download && !chainman.IsInitialBlockDownload();
+        }
         if (args.GetBoolArg("-stopafterblockimport", DEFAULT_STOPAFTERBLOCKIMPORT)) {
             LogInfo("Stopping after block import");
             if (!(Assert(node.shutdown_request))()) {
                 LogError("Failed to send shutdown signal after finishing block import\n");
             }
             return;
+        }
+        if (initial_download_completed && node.flowmesh &&
+            node.validation_signals) {
+            // ImportBlocks marks every tip callback as IBD. Drain those
+            // callbacks, then reconcile while this background thread still
+            // guarantees the service object's lifetime. A completed reindex
+            // is immediately usable without waiting for a new block.
+            node.validation_signals->SyncWithValidationInterfaceQueue();
+            node.flowmesh->ReconcileAfterInitialBlockDownload();
         }
 
         // Start indexes initial sync

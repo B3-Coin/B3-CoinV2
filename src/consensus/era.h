@@ -262,22 +262,43 @@ constexpr bool FlowMeshRulesActive(const int height, const Params& params)
 
 /**
  * Bridge records have their own independently complete activation envelope.
- * FlowMesh A3 never turns the bridge on by itself: every proof, cap,
+ * FlowMesh A3 neither turns the bridge on nor delays it: every proof, cap,
  * withdrawal-mode and origin-chain pin must be present, and the bridge's
- * explicit activation may not precede A3.  An approval_last_height limits
- * new mints in the bridge admission layer; it deliberately does not disable
- * light-client maintenance or already-backed withdrawal requests.
+ * explicit activation may begin at Modern PoS (M), but never before it. An
+ * approval_last_height limits new mints in the bridge admission layer; it
+ * deliberately does not disable light-client maintenance or already-backed
+ * withdrawal requests.
  */
 inline bool BridgeRulesActive(const int height, const Params& params)
 {
-    if (!FlowMeshRulesActive(height, params) || !params.busd_bridge ||
+    const std::optional<int> modern_start{ModernPosStartHeight(params)};
+    if (!ModernObjectRulesActive(params) || !modern_start ||
+        !params.busd_bridge ||
         !BridgeMintParamsReady(*params.busd_bridge) ||
         !params.busd_bridge->activation_height) {
         return false;
     }
     return *params.busd_bridge->activation_height >=
-               *params.flowmesh_activation_height &&
+               *modern_start &&
            height >= *params.busd_bridge->activation_height;
+}
+
+/**
+ * Irreversible bridge burns are a separate release gate. Keeping this unset
+ * permits the Ethereum light client and proven deposit mints to operate while
+ * outbound withdrawal leaves remain impossible to create on B3.
+ */
+inline bool BridgeWithdrawalRulesActive(const int height,
+                                        const Params& params)
+{
+    if (!BridgeRulesActive(height, params) ||
+        !params.bridge_withdrawal_activation_height ||
+        !params.busd_bridge || !params.busd_bridge->activation_height) {
+        return false;
+    }
+    return *params.bridge_withdrawal_activation_height >=
+               *params.busd_bridge->activation_height &&
+           height >= *params.bridge_withdrawal_activation_height;
 }
 
 /**

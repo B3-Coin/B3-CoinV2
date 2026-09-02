@@ -25,15 +25,17 @@ Futures, leverage, native CDP/oracle bUSD, generic bridges, asset/asset
 markets, governance, slashing, and a generic policy VM are not v1. The
 production exception is the exact Ethereum-mainnet USDT vault registration
 that may mint bridge-backed bUSD 1:1 only after its independent bridge gates
-pass. The bounded type-10 bootstrap/update/mint/backfill/managed-withdrawal
+pass. The bounded type-10 bootstrap/update/mint/backfill/decentralized-burn
 carrier, exact OWNER mint, exact bUSD BURN request, nullifier/caps,
 undo/reindex replay, and mempool/miner/asset integration are implemented.
 Every type-10 record has one exact zero-value policy-9 `BRIDGE_RECORD`
 metadata output, so standard `SIGHASH_ALL` binds its canonical bytes through
 ordinary outputs without `OP_RETURN` or a custom sighash. Bridge state is
 rebuilt in memory from activation and configured bridge nodes refuse pruning
-because no durable sidecar exists. The origin-enforced USDT adapter and
-operator release/consumption service are not implemented. The reserved
+because no durable sidecar exists. The keyless Ethereum vault releases only
+against a B3-finalized cumulative withdrawal root; permissionless RPC proof
+and calldata builders cover the normal certificate and withdrawal paths. The
+reserved
 `SPOT_TO_FUTURES` and `FUTURES_TO_SPOT` action numbers remain rejected.
 
 FlowMesh may pause or permanently safe-halt without stopping block download,
@@ -71,13 +73,13 @@ Use semantic consensus fields, not overloaded ordinal names:
 fn_pod_activation_height         // A1: post-genesis modern FN PoD
 asset_activation_height          // A2: assets + FN-v2 seats + vault preparation
 flowmesh_activation_height       // A3: trading, checkpoints, and vault effects
-busd_bridge.activation_height    // separate bridge gate, >= A3; unset fails closed
-busd_bridge.withdrawal_mode      // MANAGED_V1 only when explicitly pinned
+busd_bridge.activation_height    // separate later-build bridge gate, independent of A3; unset fails closed
+busd_bridge.withdrawal_mode      // DECENTRALIZED_VERIFIER_V1 for the current production target
 ```
 
 Both bridge fields participate in the complete fail-closed bridge parameter
 envelope. Reaching the height is insufficient unless every required identity,
-light-client, fork, cap, adapter, authority, runtime, and rules pin is present.
+light-client, fork, cap, adapter, verifier, runtime, and rules pin is present.
 
 The former document convention `A2 = FlowMesh, A3 = bridge` is superseded.
 Bridge-gating comments and checks must name the explicit bridge activation
@@ -253,10 +255,12 @@ VaultId  = TaggedHash("B3/FLOWMESH/VAULT/V1",
 
 The base must resolve at the microblock anchor either to an activated
 simple-v1 genesis-fixed asset or to the exact production bUSD `AssetId` bound
-to Ethereum chain id 1, vault
-`0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`, canonical USDT
-`0xdAC17F958D2ee523a2206206994597C13D831ec7`, and 6-decimal exact
-conversion. The quote must be native B3. FN, BURN, a second native asset,
+to Ethereum chain id 1, the newly deployed and release-pinned immutable
+`B3StakerBridge` vault, canonical USDT
+`0xdAC17F958D2ee523a2206206994597C13D831ec7`, exact runtime hashes, and
+6-decimal exact conversion. The historical managed vault
+`0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6` is explicitly excluded. The
+quote must be native B3. FN, BURN, a second native asset,
 unknown modes, asset/asset pairs, ticker-selected assets, and every unregistered
 bridge asset are rejected. A B3 balance deposited to one market cannot be
 spent in another market.
@@ -460,8 +464,8 @@ vault value can never leak into fees. Connect records the receipt nullifier and
 Disconnect removes it. Anyone may construct or relay a sweep/withdrawal because
 the B3 DEX vault has no custodian key, but no relayer can change destination,
 amount, asset, vault, or change policy. This statement is limited to B3 vault
-custody; the Ethereum managed-v1 reserve vault has a separate immutable
-withdrawal authority.
+custody. The current Ethereum reserve target is likewise keyless: it releases
+only when the exact withdrawal leaf is included under a B3-finalized root.
 
 At each entry anchor, a withdrawal request is admitted only when the existing
 pending obligations for that market/asset plus the new amount do not exceed
@@ -716,21 +720,23 @@ requires independent review of the implemented type-10
    mint/burn state machine and replay/undo path; an origin-enforced USDT
    adapter; the production Ethereum checkpoint/fork schedule, separate
    activation, approval range and per-block/per-epoch caps; reproducible
-   runtime evidence and audits; and every authority/rules/X-dependent pin.
+   runtime evidence and audits; and every verifier/rules/X-dependent pin.
    The current state is rebuilt from activation and pruning stays refused until
-   an atomic durable sidecar exists. Managed rules require the implemented
+   an atomic durable sidecar exists. Decentralized rules require the implemented
    finalized B3 burn request binding canonical bUSD, exact raw amount,
-   Ethereum recipient and unique request id; the still-unimplemented operator
-   service must wait finality, release exactly once, durably consume the id,
-   and reconcile reserves against supply. No burn means no release.
+   Ethereum recipient and unique request id. Normal-certificate and withdrawal
+   RPCs emit the exact Ethereum calldata; any funded Ethereum account may relay
+   it, and the contract consumes each withdrawal id exactly once. No burn and
+   no finalized inclusion proof means no release.
 
 Until the relevant gates pass, FlowMesh and bridge minting remain independently
 fail-closed on production networks. A green FlowMesh rehearsal never activates
 an incompletely pinned bridge.
 
-A later decentralized verifier cannot replace the managed authority in this
-vault. A new vault changes the current vault-bound `AssetId`, so migration must
-explicitly retire the old registry, stop presenting deposits, handle/refund
-late deposits to the still-callable old vault, burn/swap/reissue old bUSD, move
-reserves without creating a second mint claim, and pin the new identity and
-contracts.
+The managed smoke vault is a historical deployment, not the current target.
+Because it held zero observed USDT and B3 minting never activated against it,
+the new verifier/vault is a pre-activation replacement. Those facts must be
+rechecked before pinning. If either becomes false, the new vault changes the
+vault-bound `AssetId` and therefore requires an explicit registry cutoff,
+late-deposit handling, reserve/liability reconciliation, burn/swap/reissue,
+and new identity/contract pins.

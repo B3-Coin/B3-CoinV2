@@ -45,8 +45,10 @@ Consensus::Params BridgeParams()
 
     Consensus::BridgeAssetParams busd;
     busd.asset = Consensus::ETHEREUM_MAINNET_BUSD_IDENTITY;
+    busd.vault_runtime_code_hash = TestHash(6);
     busd.implementation_or_adapter = TestHash(3);
     busd.adapter_version = 1;
+    busd.origin_deployment_block = 1;
     busd.recipient_encoding_version =
         Consensus::BRIDGE_RECIPIENT_VERSION_P2PKH_V1;
     busd.activation_height = BRIDGE_HEIGHT;
@@ -58,7 +60,8 @@ Consensus::Params BridgeParams()
     Consensus::EthereumLightClientPins light;
     light.trusted_checkpoint_root = TestHash(4);
     light.trusted_checkpoint_slot = 32;
-    light.genesis_validators_root = TestHash(5);
+    light.genesis_validators_root =
+        Consensus::ETHEREUM_MAINNET_GENESIS_VALIDATORS_ROOT;
     light.fork_schedule = {{0, {0, 0, 0, 0}}};
     light.fork_schedule_valid_through_epoch = 100;
     light.min_sync_committee_participants =
@@ -68,7 +71,7 @@ Consensus::Params BridgeParams()
     busd.withdrawal_mode = Consensus::BridgeWithdrawalMode::MANAGED_V1;
     Consensus::BridgeManagedWithdrawalPins managed;
     managed.authority_address.fill(0x11);
-    managed.vault_runtime_code_hash = TestHash(6);
+    managed.vault_runtime_code_hash = *busd.vault_runtime_code_hash;
     managed.withdrawal_rules_version =
         Consensus::MANAGED_WITHDRAWAL_RULES_VERSION_V1;
     managed.withdrawal_rules_commitment = TestHash(7);
@@ -88,11 +91,13 @@ Consensus::Params DecentralizedBridgeParams()
     Consensus::BridgeDecentralizedWithdrawalPins decentralized;
     decentralized.ethereum_verifier_address.fill(0x33);
     decentralized.ethereum_verifier_code_hash = TestHash(31);
-    decentralized.b3_genesis_validator_set_root = TestHash(32);
+    decentralized.bootstrap_validator_set_hash = TestHash(32);
     decentralized.withdrawal_rules_version =
         Consensus::DECENTRALIZED_WITHDRAWAL_RULES_VERSION_V1;
     decentralized.withdrawal_rules_commitment = TestHash(33);
-    decentralized.min_b3_validator_stake = 1;
+    decentralized.min_bridge_validators = 4;
+    decentralized.max_bridge_validators = 64;
+    decentralized.min_bridge_total_weight = 1;
     decentralized.max_epoch_lag = 10;
     busd.decentralized_withdrawal = decentralized;
     BOOST_REQUIRE(Consensus::BridgeMintParamsReady(busd));
@@ -111,7 +116,10 @@ Consensus::Params FullyActiveBridgeParams(const bool decentralized)
     params.asset_activation_height = 30; // A2
     params.flowmesh_activation_height =
         30 + Consensus::FLOWMESH_ANCHOR_DEPTH; // A3
+    params.bridge_withdrawal_activation_height = BRIDGE_HEIGHT;
     BOOST_REQUIRE(Consensus::BridgeRulesActive(BRIDGE_HEIGHT, params));
+    BOOST_REQUIRE(
+        Consensus::BridgeWithdrawalRulesActive(BRIDGE_HEIGHT, params));
     return params;
 }
 
@@ -126,6 +134,23 @@ std::vector<unsigned char> EncodedBytes(
     const std::span<const unsigned char> bytes)
 {
     return bridge::RlpEncodeBytes(bytes);
+}
+
+std::vector<unsigned char> ExecutionHeader(const uint256& parent,
+                                           const uint64_t number,
+                                           const uint256& receipts_root,
+                                           const uint64_t timestamp)
+{
+    const std::vector<unsigned char> empty{
+        bridge::RlpEncodeBytes(std::span<const unsigned char>{})};
+    std::vector<std::vector<unsigned char>> fields(16, empty);
+    fields[0] = EncodedBytes(
+        std::span<const unsigned char>{parent.begin(), 32});
+    fields[5] = EncodedBytes(
+        std::span<const unsigned char>{receipts_root.begin(), 32});
+    fields[8] = bridge::RlpEncodeUint64(number);
+    fields[11] = bridge::RlpEncodeUint64(timestamp);
+    return bridge::RlpEncodeList(fields);
 }
 
 struct DepositSpec {
@@ -227,9 +252,12 @@ void SeedVerifiedAnchor(node::BridgeStateIndex& index,
     seed.height = BRIDGE_HEIGHT - 1;
     seed.block_hash = TestHash(8);
     seed.light_client_after = store;
+    seed.light_client_connection_after =
+        node::BridgeStateConnection{seed.height, seed.block_hash};
     seed.anchors_added.push_back(node::BridgeExecutionAnchor{
         fixture.block_number, fixture.block_hash, fixture.receipts_root,
-        beacon_slot, fixture.timestamp, seed.height, seed.block_hash});
+        beacon_slot, fixture.block_number, fixture.timestamp, seed.height,
+        seed.block_hash});
     std::string error;
     BOOST_REQUIRE_MESSAGE(index.ConnectBlock(seed, error), error);
 }
@@ -243,6 +271,7 @@ CTransactionRef MintTransactionWithAmount(
     const auto registry{modern::ConfiguredBridgeRegistryId(params)};
     BOOST_REQUIRE(asset);
     BOOST_REQUIRE(registry);
+
     BOOST_REQUIRE(log_index < fixture.recipient_scripts.size());
     const CScript& recipient{recipient_override.empty()
                                  ? fixture.recipient_scripts[log_index]
@@ -264,6 +293,52 @@ CTransactionRef MintTransactionWithAmount(
     return MakeTransactionRef(std::move(tx));
 }
 
+CTransactionRef MintTransactionWithAncestry(
+    const Consensus::Params& params, const ReceiptFixture& fixture,
+    const uint256& source_anchor_hash,
+    std::vector<std::vector<unsigned char>> ancestry_headers)
+{
+    const auto asset{modern::ConfiguredBridgeAssetId(params)};
+    const auto registry{modern::ConfiguredBridgeRegistryId(params)};
+    BOOST_REQUIRE(asset);
+    BOOST_REQUIRE(registry);
+    BOOST_REQUIRE(!fixture.recipient_scripts.empty());
+    bridge::BridgeMintV1 mint{
+        *registry, 0, source_anchor_hash, fixture.block_number, 0, 0,
+        std::move(ancestry_headers), {fixture.mpt_node}};
+    const auto record{bridge::MakeBridgeMpaRecord(
+        bridge::BridgeRecordV1{bridge::BridgeRecordKindV1::MINT, mint})};
+    const auto owner{modern::MakeAssetOwnerOutput(
+        *asset, 60, fixture.recipient_scripts.front())};
+    BOOST_REQUIRE(record);
+    BOOST_REQUIRE(owner);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+    CMutableTransaction tx;
+    tx.vout = {*owner, *binding};
+    tx.mpa = {*record};
+    return MakeTransactionRef(std::move(tx));
+}
+
+CTransactionRef BackfillTransaction(
+    const uint256& source_anchor_hash, const uint64_t target_block_number,
+    std::vector<std::vector<unsigned char>> ancestry_headers)
+{
+    bridge::BridgeExecutionBackfillV1 backfill{
+        source_anchor_hash, target_block_number,
+        std::move(ancestry_headers)};
+    const auto record{bridge::MakeBridgeMpaRecord(bridge::BridgeRecordV1{
+        bridge::BridgeRecordKindV1::EXECUTION_BACKFILL,
+        std::move(backfill)})};
+    BOOST_REQUIRE(record);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+    CMutableTransaction tx;
+    tx.vout = {*binding};
+    tx.mpa = {*record};
+    return MakeTransactionRef(std::move(tx));
+}
+
 CBlock Block(const uint32_t time,
              std::vector<CTransactionRef> transactions)
 {
@@ -279,7 +354,8 @@ BOOST_AUTO_TEST_SUITE(bridge_state_tests)
 
 BOOST_AUTO_TEST_CASE(managed_withdrawal_requires_the_exact_named_burn)
 {
-    const Consensus::Params params{BridgeParams()};
+    Consensus::Params params{FullyActiveBridgeParams(false)};
+    params.bridge_withdrawal_activation_height.reset();
     const auto asset{modern::ConfiguredBridgeAssetId(params)};
     const auto registry{modern::ConfiguredBridgeRegistryId(params)};
     BOOST_REQUIRE(asset);
@@ -313,6 +389,19 @@ BOOST_AUTO_TEST_CASE(managed_withdrawal_requires_the_exact_named_burn)
     BOOST_CHECK(!index.VerifyBlock(block, BRIDGE_HEIGHT - 1, TestHash(8),
                                    params, delta, error));
     BOOST_CHECK(error.find("not active") != std::string::npos);
+    error.clear();
+    BOOST_CHECK(!index.VerifyBlock(block, BRIDGE_HEIGHT, TestHash(9), params,
+                                   delta, error));
+    BOOST_CHECK(error.find("withdrawal rules are not active") !=
+                std::string::npos);
+    BOOST_CHECK(Consensus::BridgeMintParamsReady(*params.busd_bridge));
+    BOOST_CHECK(!params.bridge_withdrawal_activation_height);
+    const auto registry_before_activation{
+        modern::ConfiguredBridgeRegistryId(params)};
+    params.bridge_withdrawal_activation_height = BRIDGE_HEIGHT;
+    BOOST_CHECK(modern::ConfiguredBridgeRegistryId(params) ==
+                registry_before_activation);
+    delta = {};
     error.clear();
     BOOST_REQUIRE_MESSAGE(index.VerifyBlock(block, BRIDGE_HEIGHT, TestHash(9),
                                             params, delta, error),
@@ -439,6 +528,28 @@ BOOST_AUTO_TEST_CASE(decentralized_burn_ids_roots_and_undo_are_deterministic)
     BOOST_REQUIRE(asset);
     BOOST_REQUIRE(registry);
 
+    // B starts the canonical cumulative root even when W is unset. Ethereum
+    // requires a nonzero root in post-B certificates before it will accept
+    // deposits; the empty root is safe because no withdrawal leaf exists.
+    Consensus::Params inbound_only{params};
+    inbound_only.bridge_withdrawal_activation_height.reset();
+    node::BridgeStateIndex inbound_index;
+    node::BridgeBlockDelta inbound_delta;
+    std::string inbound_error;
+    BOOST_REQUIRE_MESSAGE(inbound_index.VerifyBlock(
+                              Block(1'000, {}), BRIDGE_HEIGHT, TestHash(39),
+                              inbound_only, inbound_delta, inbound_error),
+                          inbound_error);
+    BOOST_REQUIRE_MESSAGE(inbound_index.ConnectBlock(inbound_delta,
+                                                     inbound_error),
+                          inbound_error);
+    const uint256 canonical_empty_root{
+        modern::WithdrawalZeroHashes()[modern::WITHDRAWAL_TREE_DEPTH]};
+    BOOST_CHECK(!canonical_empty_root.IsNull());
+    BOOST_CHECK(node::FinalityWithdrawalRoot(
+                    BRIDGE_HEIGHT, inbound_only, &inbound_index) ==
+                std::optional<uint256>{canonical_empty_root});
+
     const auto make_burn = [&](const uint8_t source_tag,
                                const CAmount amount,
                                const uint8_t recipient_tag) {
@@ -469,6 +580,36 @@ BOOST_AUTO_TEST_CASE(decentralized_burn_ids_roots_and_undo_are_deterministic)
     node::BridgeStateIndex index;
     node::BridgeBlockDelta delta;
     std::string error;
+    BOOST_CHECK(node::HasDecentralizedBridgeBurn(*first));
+    BOOST_CHECK(node::HasDecentralizedBridgeBurn(
+        Block(1'000, {first})));
+    BOOST_CHECK(!node::CheckBridgeBurnReadiness(
+        *first, node::BridgeBurnReadiness::NOT_READY, error));
+    BOOST_CHECK(error.find("current and next validator sets") !=
+                std::string::npos);
+    error.clear();
+    BOOST_CHECK(!node::CheckBridgeBurnReadiness(
+        Block(1'000, {first}),
+        node::BridgeBurnReadiness::UNAVAILABLE, error));
+    BOOST_CHECK(error.find("unavailable") != std::string::npos);
+    error.clear();
+    BOOST_CHECK(node::CheckBridgeBurnReadiness(
+        *first, node::BridgeBurnReadiness::READY, error));
+    CMutableTransaction ordinary;
+    ordinary.vout.emplace_back(1, CScript{} << OP_TRUE);
+    BOOST_CHECK(node::CheckBridgeBurnReadiness(
+        CTransaction{ordinary}, node::BridgeBurnReadiness::NOT_READY,
+        error));
+    inbound_only = params;
+    inbound_only.bridge_withdrawal_activation_height.reset();
+    node::BridgeBlockDelta disabled_delta;
+    error.clear();
+    BOOST_CHECK(!index.VerifyBlock(
+        Block(1'000, {first}), BRIDGE_HEIGHT, block_hash, inbound_only,
+        disabled_delta, error));
+    BOOST_CHECK(error.find("withdrawal rules are not active") !=
+                std::string::npos);
+    error.clear();
     BOOST_REQUIRE_MESSAGE(index.VerifyBlock(
                               Block(1'000, {first, second}), BRIDGE_HEIGHT,
                               block_hash, params, delta, error),
@@ -495,12 +636,33 @@ BOOST_AUTO_TEST_CASE(decentralized_burn_ids_roots_and_undo_are_deterministic)
     BOOST_REQUIRE_MESSAGE(index.ConnectBlock(delta, error), error);
     BOOST_CHECK_EQUAL(index.DecentralizedWithdrawalCount(), 2U);
     BOOST_CHECK(index.DecentralizedWithdrawal(0).has_value());
+    const node::BridgeWithdrawalId first_source{first->GetHash(), 0};
+    const node::BridgeWithdrawalId second_source{second->GetHash(), 0};
+    const auto first_by_source{
+        index.DecentralizedWithdrawal(first_source)};
+    BOOST_REQUIRE(first_by_source);
+    BOOST_CHECK_EQUAL(first_by_source->withdrawal.withdrawal_id, 0U);
+    BOOST_CHECK(first_by_source->leaf ==
+                delta.decentralized_withdrawals_added[0].leaf);
+    const auto second_by_source{
+        index.DecentralizedWithdrawal(second_source)};
+    BOOST_REQUIRE(second_by_source);
+    BOOST_CHECK_EQUAL(second_by_source->withdrawal.withdrawal_id, 1U);
+    BOOST_CHECK(!index.DecentralizedWithdrawal(
+        node::BridgeWithdrawalId{first->GetHash(), 1}));
     BOOST_CHECK(index.WithdrawalRootAtHeight(BRIDGE_HEIGHT) ==
                 std::optional<uint256>{expected.root});
+    const auto finalized_prefix{
+        index.DecentralizedWithdrawalsThrough(BRIDGE_HEIGHT)};
+    BOOST_REQUIRE(finalized_prefix);
+    BOOST_REQUIRE_EQUAL(finalized_prefix->size(), 2U);
+    BOOST_CHECK(finalized_prefix->at(0) ==
+                delta.decentralized_withdrawals_added[0]);
+    BOOST_CHECK(!index.DecentralizedWithdrawalsThrough(BRIDGE_HEIGHT + 1));
 
-    // The finality field is zero before bridge activation and in managed
-    // mode. Once decentralized withdrawals are active it must come from the
-    // exact active-chain index; an unavailable index fails closed.
+    // The finality field is zero before inbound bridge activation and in
+    // managed mode. From B onward, even before W, it comes from the exact
+    // active-chain index; an unavailable index fails closed.
     BOOST_CHECK(node::FinalityWithdrawalRoot(BRIDGE_HEIGHT - 1, params,
                                               nullptr) ==
                 std::optional<uint256>{uint256{}});
@@ -523,6 +685,10 @@ BOOST_AUTO_TEST_CASE(decentralized_burn_ids_roots_and_undo_are_deterministic)
                 empty_delta.withdrawal_tree_after);
     BOOST_CHECK(index.WithdrawalRootAtHeight(BRIDGE_HEIGHT + 1) ==
                 std::optional<uint256>{expected.root});
+    BOOST_REQUIRE(index.DecentralizedWithdrawalsThrough(BRIDGE_HEIGHT + 1));
+    BOOST_CHECK_EQUAL(
+        index.DecentralizedWithdrawalsThrough(BRIDGE_HEIGHT + 1)->size(),
+        2U);
     BOOST_REQUIRE_MESSAGE(index.DisconnectBlock(BRIDGE_HEIGHT + 1,
                                                 empty_hash, error),
                           error);
@@ -530,6 +696,8 @@ BOOST_AUTO_TEST_CASE(decentralized_burn_ids_roots_and_undo_are_deterministic)
                                                 error),
                           error);
     BOOST_CHECK_EQUAL(index.DecentralizedWithdrawalCount(), 0U);
+    BOOST_CHECK(!index.DecentralizedWithdrawal(first_source));
+    BOOST_CHECK(!index.DecentralizedWithdrawal(second_source));
     BOOST_CHECK_EQUAL(index.WithdrawalTree().count, 0U);
     BOOST_CHECK(index.WithdrawalTree().root ==
                 modern::WithdrawalZeroHashes()[modern::WITHDRAWAL_TREE_DEPTH]);
@@ -560,8 +728,13 @@ BOOST_AUTO_TEST_CASE(mint_checks_nullifier_caps_exact_output_and_reorg)
                           error);
     BOOST_REQUIRE_EQUAL(delta.mint_authorizations.size(), 1U);
     BOOST_REQUIRE_MESSAGE(index.ConnectBlock(delta, error), error);
-    BOOST_CHECK(index.IsNullified(
-        delta.mint_authorizations.front().authorization.nullifier));
+    const auto& nullifier{
+        delta.mint_authorizations.front().authorization.nullifier};
+    BOOST_CHECK(index.IsNullified(nullifier));
+    const auto first_connection{index.NullifierConnection(nullifier)};
+    BOOST_REQUIRE(first_connection);
+    BOOST_CHECK_EQUAL(first_connection->height, BRIDGE_HEIGHT);
+    BOOST_CHECK(first_connection->block_hash == TestHash(10));
     const auto asset{modern::ConfiguredBridgeAssetId(params)};
     BOOST_REQUIRE(asset);
     BOOST_CHECK_EQUAL(index.EpochMinted(*asset, 0), 60);
@@ -574,11 +747,15 @@ BOOST_AUTO_TEST_CASE(mint_checks_nullifier_caps_exact_output_and_reorg)
 
     BOOST_REQUIRE_MESSAGE(index.DisconnectBlock(BRIDGE_HEIGHT, TestHash(10), error),
                           error);
-    BOOST_CHECK(!index.IsNullified(
-        delta.mint_authorizations.front().authorization.nullifier));
+    BOOST_CHECK(!index.IsNullified(nullifier));
+    BOOST_CHECK(!index.NullifierConnection(nullifier));
     BOOST_CHECK_EQUAL(index.EpochMinted(*asset, 0), 0);
     BOOST_REQUIRE_MESSAGE(index.ConnectBlock(delta, error), error);
     BOOST_CHECK_EQUAL(index.EpochMinted(*asset, 0), 60);
+    const auto reconnected{index.NullifierConnection(nullifier)};
+    BOOST_REQUIRE(reconnected);
+    BOOST_CHECK_EQUAL(reconnected->height, BRIDGE_HEIGHT);
+    BOOST_CHECK(reconnected->block_hash == TestHash(10));
 
     const CScript wrong_recipient{CScript{} << OP_TRUE};
     const CTransactionRef redirected{MintTransactionWithAmount(
@@ -625,7 +802,7 @@ BOOST_AUTO_TEST_CASE(mint_checks_nullifier_caps_exact_output_and_reorg)
 
 BOOST_AUTO_TEST_CASE(block_preview_keeps_prefix_and_rolls_back_rejected_chunk)
 {
-    const Consensus::Params params{BridgeParams()};
+    const Consensus::Params params{FullyActiveBridgeParams(false)};
     const ReceiptFixture fixture{MakeReceiptFixture(
         params, {{1, 60, 0x61}, {2, 60, 0x62}})};
     node::BridgeStateIndex index;
@@ -715,6 +892,26 @@ BOOST_AUTO_TEST_CASE(mint_rejects_stale_and_unknown_fork_heads)
     BOOST_CHECK(error.find("fork schedule") != std::string::npos);
 }
 
+BOOST_AUTO_TEST_CASE(mint_rejects_predeployment_execution_target)
+{
+    Consensus::Params params{BridgeParams()};
+    params.busd_bridge->origin_deployment_block = 701;
+    BOOST_REQUIRE(Consensus::BridgeMintParamsReady(*params.busd_bridge));
+    const ReceiptFixture fixture{
+        MakeReceiptFixture(params, {{10, 60, 0x45}})};
+    BOOST_REQUIRE_EQUAL(fixture.block_number + 1,
+                        *params.busd_bridge->origin_deployment_block);
+    node::BridgeStateIndex index;
+    SeedVerifiedAnchor(index, fixture);
+    const CTransactionRef mint{
+        MintTransactionWithAmount(params, fixture, 0, 60)};
+    node::BridgeBlockDelta ignored;
+    std::string error;
+    BOOST_CHECK(!index.VerifyBlock(Block(1'001, {mint}), BRIDGE_HEIGHT,
+                                   TestHash(65), params, ignored, error));
+    BOOST_CHECK(error.find("deployment") != std::string::npos);
+}
+
 BOOST_AUTO_TEST_CASE(light_client_operations_require_order_and_non_coinbase)
 {
     const Consensus::Params params{BridgeParams()};
@@ -779,6 +976,374 @@ BOOST_AUTO_TEST_CASE(light_client_operations_require_order_and_non_coinbase)
     BOOST_CHECK(error.find("coinbase") != std::string::npos);
 }
 
+BOOST_AUTO_TEST_CASE(light_client_connection_metadata_tracks_store_changes_and_undo)
+{
+    const Consensus::Params params{BridgeParams()};
+    const ReceiptFixture fixture{
+        MakeReceiptFixture(params, {{21, 60, 0x56}})};
+    node::BridgeStateIndex index;
+    SeedVerifiedAnchor(index, fixture);
+    const auto original_connection{index.LightClientLastConnected()};
+    BOOST_REQUIRE(original_connection);
+    BOOST_CHECK_EQUAL(original_connection->height, BRIDGE_HEIGHT - 1);
+    BOOST_CHECK(original_connection->block_hash == TestHash(8));
+    BOOST_REQUIRE(index.LightClient());
+    BOOST_CHECK(!index.FinalizedLightClientSnapshot(BRIDGE_HEIGHT - 2));
+    const auto original_snapshot{
+        index.FinalizedLightClientSnapshot(BRIDGE_HEIGHT - 1)};
+    BOOST_REQUIRE(original_snapshot);
+    BOOST_CHECK(original_snapshot->connection == *original_connection);
+    BOOST_CHECK(!original_snapshot->store.next);
+
+    // This represents an accepted next-committee-only update: the finalized
+    // head is unchanged, but the persistent light-client store changed.
+    bridge::LightClientStore before{*index.LightClient()};
+    bridge::LightClientStore after{before};
+    after.next = after.current;
+    const uint256 update_block{TestHash(57)};
+    node::BridgeBlockDelta update;
+    update.height = BRIDGE_HEIGHT;
+    update.block_hash = update_block;
+    update.previous_height = index.ConnectedHeight();
+    update.previous_block_hash = index.ConnectedHash();
+    update.light_client_before = before;
+    update.light_client_after = after;
+
+    std::string error;
+    BOOST_CHECK(!index.ConnectBlock(update, error));
+    BOOST_CHECK(error.find("connection metadata") != std::string::npos);
+    BOOST_CHECK(index.LightClientLastConnected() == original_connection);
+    BOOST_REQUIRE(index.LightClient());
+    BOOST_CHECK(!index.LightClient()->next);
+
+    update.light_client_connection_before = original_connection;
+    update.light_client_connection_after =
+        node::BridgeStateConnection{update.height, update.block_hash};
+    BOOST_REQUIRE_MESSAGE(index.ConnectBlock(update, error), error);
+    const auto connected{index.LightClientLastConnected()};
+    BOOST_REQUIRE(connected);
+    BOOST_CHECK_EQUAL(connected->height, BRIDGE_HEIGHT);
+    BOOST_CHECK(connected->block_hash == update_block);
+    BOOST_REQUIRE(index.LightClient());
+    BOOST_REQUIRE(index.LightClient()->next);
+    BOOST_CHECK(index.LightClient()->finalized_header ==
+                before.finalized_header);
+
+    // The latest update is not yet covered at H-1, but the previous exact
+    // store remains exportable instead of making the RPC unavailable.
+    const auto finalized_before_update{
+        index.FinalizedLightClientSnapshot(BRIDGE_HEIGHT - 1)};
+    BOOST_REQUIRE(finalized_before_update);
+    BOOST_CHECK(finalized_before_update->connection == *original_connection);
+    BOOST_CHECK(!finalized_before_update->store.next);
+    const auto finalized_through_update{
+        index.FinalizedLightClientSnapshot(BRIDGE_HEIGHT)};
+    BOOST_REQUIRE(finalized_through_update);
+    BOOST_CHECK(finalized_through_update->connection == *connected);
+    BOOST_REQUIRE(finalized_through_update->store.next);
+
+    BOOST_REQUIRE_MESSAGE(
+        index.DisconnectBlock(update.height, update.block_hash, error), error);
+    BOOST_CHECK(index.LightClientLastConnected() == original_connection);
+    BOOST_REQUIRE(index.LightClient());
+    BOOST_CHECK(!index.LightClient()->next);
+    const auto after_undo{
+        index.FinalizedLightClientSnapshot(BRIDGE_HEIGHT)};
+    BOOST_REQUIRE(after_undo);
+    BOOST_CHECK(after_undo->connection == *original_connection);
+    BOOST_CHECK(!after_undo->store.next);
+}
+
+BOOST_AUTO_TEST_CASE(finalized_light_client_snapshot_survives_continuous_updates)
+{
+    const Consensus::Params params{BridgeParams()};
+    const ReceiptFixture fixture{
+        MakeReceiptFixture(params, {{22, 60, 0x57}})};
+    node::BridgeStateIndex index;
+    SeedVerifiedAnchor(index, fixture);
+
+    std::string error;
+    const int update_count{
+        static_cast<int>(node::BRIDGE_STATE_UNDO_BLOCKS) + 8};
+    for (int i{0}; i < update_count; ++i) {
+        BOOST_REQUIRE(index.LightClient());
+        BOOST_REQUIRE(index.LightClientLastConnected());
+        bridge::LightClientStore before{*index.LightClient()};
+        bridge::LightClientStore after{before};
+        if (!after.next) {
+            after.next = after.current;
+        } else {
+            after.next->aggregate_pubkey[0] =
+                static_cast<unsigned char>(i);
+        }
+
+        node::BridgeBlockDelta delta;
+        delta.height = index.ConnectedHeight() + 1;
+        delta.block_hash = TestBlockHash(
+            static_cast<uint32_t>(10'000 + delta.height));
+        delta.previous_height = index.ConnectedHeight();
+        delta.previous_block_hash = index.ConnectedHash();
+        delta.light_client_before = std::move(before);
+        delta.light_client_after = std::move(after);
+        delta.light_client_connection_before =
+            index.LightClientLastConnected();
+        delta.light_client_connection_after =
+            node::BridgeStateConnection{delta.height, delta.block_hash};
+        BOOST_REQUIRE_MESSAGE(index.ConnectBlock(delta, error), error);
+    }
+
+    BOOST_CHECK_EQUAL(index.History().size(),
+                      node::BRIDGE_STATE_UNDO_BLOCKS);
+    // Every recent update is newer than this finalized height. The retained
+    // floor still yields the exact first store, so continuous updates cannot
+    // starve snapshot export after bounded undo history rolls over.
+    const auto floor{
+        index.FinalizedLightClientSnapshot(BRIDGE_HEIGHT - 1)};
+    BOOST_REQUIRE(floor);
+    BOOST_CHECK_EQUAL(floor->connection.height, BRIDGE_HEIGHT - 1);
+    BOOST_CHECK(floor->connection.block_hash == TestHash(8));
+    BOOST_CHECK(!floor->store.next);
+
+    const int recent_finalized{index.ConnectedHeight() - 5};
+    const auto recent{
+        index.FinalizedLightClientSnapshot(recent_finalized)};
+    BOOST_REQUIRE(recent);
+    BOOST_CHECK_EQUAL(recent->connection.height, recent_finalized);
+
+    const int disconnected_height{index.ConnectedHeight()};
+    const uint256 disconnected_hash{index.ConnectedHash()};
+    BOOST_REQUIRE_MESSAGE(index.DisconnectBlock(
+                              disconnected_height, disconnected_hash, error),
+                          error);
+    const auto after_undo{
+        index.FinalizedLightClientSnapshot(disconnected_height)};
+    BOOST_REQUIRE(after_undo);
+    BOOST_CHECK_EQUAL(after_undo->connection.height,
+                      disconnected_height - 1);
+
+    // Full replay starts from Clear() and deterministically recreates the
+    // floor when the bootstrap block is connected again.
+    index.Clear();
+    BOOST_CHECK(!index.FinalizedLightClientSnapshot(BRIDGE_HEIGHT - 1));
+    SeedVerifiedAnchor(index, fixture);
+    const auto replayed{
+        index.FinalizedLightClientSnapshot(BRIDGE_HEIGHT - 1)};
+    BOOST_REQUIRE(replayed);
+    BOOST_CHECK(replayed->connection.block_hash == TestHash(8));
+    BOOST_REQUIRE_MESSAGE(index.DisconnectBlock(
+                              BRIDGE_HEIGHT - 1, TestHash(8), error),
+                          error);
+    BOOST_CHECK(!index.LightClient());
+    BOOST_CHECK(!index.LightClientLastConnected());
+    BOOST_CHECK(!index.FinalizedLightClientSnapshot(BRIDGE_HEIGHT - 1));
+}
+
+BOOST_AUTO_TEST_CASE(light_client_execution_jump_cannot_strand_deposits)
+{
+    const Consensus::Params params{BridgeParams()};
+    const ReceiptFixture fixture{
+        MakeReceiptFixture(params, {{23, 60, 0x58}})};
+    node::BridgeStateIndex index;
+    SeedVerifiedAnchor(index, fixture);
+    BOOST_REQUIRE(index.LightClient());
+    BOOST_REQUIRE(index.LightClientLastConnected());
+
+    bridge::LightClientStore before{*index.LightClient()};
+    bridge::LightClientStore after{before};
+    after.finalized_header.beacon.slot += 1;
+    after.finalized_header.execution.block_number +=
+        bridge::MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS + 1;
+    after.finalized_header.execution.block_hash = TestHash(66);
+
+    node::BridgeBlockDelta jump;
+    jump.height = BRIDGE_HEIGHT;
+    jump.block_hash = TestHash(67);
+    jump.previous_height = index.ConnectedHeight();
+    jump.previous_block_hash = index.ConnectedHash();
+    jump.light_client_before = before;
+    jump.light_client_after = after;
+    jump.light_client_connection_before = index.LightClientLastConnected();
+    jump.light_client_connection_after =
+        node::BridgeStateConnection{jump.height, jump.block_hash};
+
+    std::string error;
+    BOOST_CHECK(!index.ConnectBlock(jump, error));
+    BOOST_CHECK(error.find("backfill window") != std::string::npos);
+    BOOST_REQUIRE(index.LightClient());
+    BOOST_CHECK(index.LightClient()->finalized_header ==
+                before.finalized_header);
+}
+
+BOOST_AUTO_TEST_CASE(cumulative_backfill_limit_blocks_serial_step_bypass)
+{
+    const Consensus::Params params{BridgeParams()};
+    const uint256 receipts_698{TestBlockHash(698)};
+    const uint256 receipts_699{TestBlockHash(699)};
+    const uint256 receipts_700{TestBlockHash(700)};
+    const std::vector<unsigned char> header_698{
+        ExecutionHeader(uint256{}, 698, receipts_698, 1'698)};
+    const uint256 hash_698{Keccak(header_698)};
+    const std::vector<unsigned char> header_699{
+        ExecutionHeader(hash_698, 699, receipts_699, 1'699)};
+    const uint256 hash_699{Keccak(header_699)};
+    const std::vector<unsigned char> header_700{
+        ExecutionHeader(hash_699, 700, receipts_700, 1'700)};
+    const uint256 hash_700{Keccak(header_700)};
+
+    node::BridgeStateIndex index;
+    node::BridgeBlockDelta seed;
+    seed.height = BRIDGE_HEIGHT - 1;
+    seed.block_hash = TestHash(58);
+    seed.anchors_added.push_back(node::BridgeExecutionAnchor{
+        700, hash_700, receipts_700, 32,
+        699 + bridge::MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS, 1'700,
+        seed.height, seed.block_hash});
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(index.ConnectBlock(seed, error), error);
+
+    // The first one-block step lands exactly 20,000 blocks behind the
+    // directly finalized origin and remains valid.
+    const CTransactionRef boundary{BackfillTransaction(
+        hash_700, 699, {header_700, header_699})};
+    node::BridgeBlockDelta boundary_delta;
+    const uint256 boundary_block{TestHash(59)};
+    BOOST_REQUIRE_MESSAGE(index.VerifyBlock(
+                              Block(1'700, {boundary}), BRIDGE_HEIGHT,
+                              boundary_block, params, boundary_delta, error),
+                          error);
+    BOOST_REQUIRE_EQUAL(boundary_delta.anchors_added.size(), 1U);
+    BOOST_CHECK_EQUAL(
+        boundary_delta.anchors_added.front()
+            .source_finalized_execution_block,
+        699 + bridge::MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS);
+    BOOST_REQUIRE_MESSAGE(index.ConnectBlock(boundary_delta, error), error);
+    const auto boundary_anchor{index.Anchor(hash_699)};
+    BOOST_REQUIRE(boundary_anchor);
+    BOOST_CHECK_EQUAL(
+        boundary_anchor->source_finalized_execution_block,
+        699 + bridge::MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS);
+
+    // A second individually-small step would cross the cumulative floor.
+    const CTransactionRef bypass{BackfillTransaction(
+        hash_699, 698, {header_699, header_698})};
+    node::BridgeBlockDelta bypass_delta;
+    error.clear();
+    BOOST_CHECK(!index.VerifyBlock(
+        Block(1'701, {bypass}), BRIDGE_HEIGHT + 1, TestHash(60), params,
+        bypass_delta, error));
+    BOOST_CHECK(error.find("cumulative backfill limit") != std::string::npos);
+    BOOST_CHECK(!index.Anchor(hash_698));
+
+    BOOST_REQUIRE_MESSAGE(
+        index.DisconnectBlock(BRIDGE_HEIGHT, boundary_block, error), error);
+    BOOST_CHECK(!index.Anchor(hash_699));
+    BOOST_CHECK(index.Anchor(hash_700).has_value());
+
+    node::BridgeStateIndex malformed_index;
+    node::BridgeBlockDelta malformed;
+    malformed.height = BRIDGE_HEIGHT;
+    malformed.block_hash = TestHash(61);
+    malformed.anchors_added.push_back(node::BridgeExecutionAnchor{
+        700, hash_700, receipts_700, 32,
+        700 + bridge::MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS + 1, 1'700,
+        malformed.height, malformed.block_hash});
+    error.clear();
+    BOOST_CHECK(!malformed_index.ConnectBlock(malformed, error));
+    BOOST_CHECK(error.find("execution anchor") != std::string::npos);
+    BOOST_CHECK_EQUAL(malformed_index.AnchorCount(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(anchor_for_target_selects_nearest_b3_finalized_origin)
+{
+    node::BridgeStateIndex index;
+    node::BridgeBlockDelta first;
+    first.height = BRIDGE_HEIGHT;
+    first.block_hash = TestHash(68);
+    first.anchors_added = {
+        // This is a valid anchor in isolation, but its directly-finalized
+        // origin is one block too far from target 100.
+        node::BridgeExecutionAnchor{
+            101, TestBlockHash(101), TestBlockHash(201), 32,
+            101 + bridge::MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS, 1'101,
+            first.height, first.block_hash},
+        node::BridgeExecutionAnchor{
+            102, TestBlockHash(102), TestBlockHash(202), 33, 102, 1'102,
+            first.height, first.block_hash},
+    };
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(index.ConnectBlock(first, error), error);
+
+    node::BridgeBlockDelta second;
+    second.height = BRIDGE_HEIGHT + 1;
+    second.block_hash = TestHash(69);
+    second.previous_height = index.ConnectedHeight();
+    second.previous_block_hash = index.ConnectedHash();
+    second.anchors_added.push_back(node::BridgeExecutionAnchor{
+        100, TestBlockHash(100), TestBlockHash(200), 34, 100, 1'100,
+        second.height, second.block_hash});
+    BOOST_REQUIRE_MESSAGE(index.ConnectBlock(second, error), error);
+
+    BOOST_CHECK(!index.AnchorForTarget(100, -1));
+    BOOST_CHECK(!index.AnchorForTarget(100, BRIDGE_HEIGHT - 1));
+
+    // The numerically nearest anchor is not B3-finalized and the next one
+    // crosses the cumulative origin window, so selection continues to 102.
+    const auto fallback{index.AnchorForTarget(100, BRIDGE_HEIGHT)};
+    BOOST_REQUIRE(fallback);
+    BOOST_CHECK_EQUAL(fallback->block_number, 102U);
+    BOOST_CHECK_EQUAL(fallback->source_finalized_beacon_slot, 33U);
+    BOOST_CHECK_EQUAL(fallback->connected_height, BRIDGE_HEIGHT);
+
+    // Once the later B3 connection is finalized, block 100 is nearest.
+    const auto nearest{index.AnchorForTarget(100, BRIDGE_HEIGHT + 1)};
+    BOOST_REQUIRE(nearest);
+    BOOST_CHECK_EQUAL(nearest->block_number, 100U);
+    BOOST_CHECK(nearest->connected_block == second.block_hash);
+
+    // Exactly 20,000 blocks from the finalized Ethereum origin is allowed.
+    const auto boundary{index.AnchorForTarget(101, BRIDGE_HEIGHT)};
+    BOOST_REQUIRE(boundary);
+    BOOST_CHECK_EQUAL(boundary->block_number, 101U);
+    BOOST_CHECK(!index.AnchorForTarget(103, BRIDGE_HEIGHT + 1));
+}
+
+BOOST_AUTO_TEST_CASE(mint_cannot_cross_cumulative_backfill_limit)
+{
+    const Consensus::Params params{BridgeParams()};
+    const ReceiptFixture fixture{
+        MakeReceiptFixture(params, {{22, 60, 0x57}})};
+    node::BridgeStateIndex index;
+    SeedVerifiedAnchor(index, fixture);
+
+    const uint256 source_receipts{TestHash(62)};
+    const std::vector<unsigned char> source_header{ExecutionHeader(
+        fixture.block_hash, fixture.block_number + 1, source_receipts,
+        fixture.timestamp + 1)};
+    const uint256 source_hash{Keccak(source_header)};
+    node::BridgeBlockDelta source_delta;
+    source_delta.height = BRIDGE_HEIGHT;
+    source_delta.block_hash = TestHash(63);
+    source_delta.previous_height = index.ConnectedHeight();
+    source_delta.previous_block_hash = index.ConnectedHash();
+    source_delta.anchors_added.push_back(node::BridgeExecutionAnchor{
+        fixture.block_number + 1, source_hash, source_receipts, 32,
+        fixture.block_number + 1 +
+            bridge::MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS,
+        fixture.timestamp + 1, source_delta.height, source_delta.block_hash});
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(index.ConnectBlock(source_delta, error), error);
+
+    const CTransactionRef mint{MintTransactionWithAncestry(
+        params, fixture, source_hash, {source_header, fixture.header})};
+    node::BridgeBlockDelta ignored;
+    error.clear();
+    BOOST_CHECK(!index.VerifyBlock(
+        Block(1'060, {mint}), BRIDGE_HEIGHT + 1, TestHash(64), params,
+        ignored, error));
+    BOOST_CHECK(error.find("cumulative backfill limit") != std::string::npos);
+    BOOST_CHECK_EQUAL(index.NullifierCount(), 0U);
+}
+
 BOOST_AUTO_TEST_CASE(connect_is_atomic_and_recent_undo_is_bounded)
 {
     node::BridgeStateIndex index;
@@ -786,7 +1351,7 @@ BOOST_AUTO_TEST_CASE(connect_is_atomic_and_recent_undo_is_bounded)
     malformed.height = BRIDGE_HEIGHT;
     malformed.block_hash = TestBlockHash(BRIDGE_HEIGHT);
     malformed.anchors_added.push_back(node::BridgeExecutionAnchor{
-        700, TestBlockHash(700), TestBlockHash(701), 32, 1'000,
+        700, TestBlockHash(700), TestBlockHash(701), 32, 700, 1'000,
         malformed.height, malformed.block_hash});
     bridge::BridgeDepositKey unmatched_nullifier;
     unmatched_nullifier.origin_chain_id = 1;

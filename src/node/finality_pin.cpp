@@ -121,6 +121,10 @@ bool WriteFinalityPin(const fs::path& path, const MessageStartChars& magic, cons
         LogError("finality pin: rename into place failed for %s", fs::PathToString(path));
         return false;
     }
+    // Make the rename itself durable, not only the temporary file contents.
+    // Without committing the containing directory, a sudden power loss can
+    // lose the filename update even though AutoFile::Commit() succeeded.
+    DirectoryCommit(path.parent_path());
     LogInfo("finality pin: persisted checkpoint %d %s", pin.height, pin.hash.ToString());
     return true;
 }

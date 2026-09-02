@@ -365,3 +365,19 @@ therefore requires a new approved vault. Because the current `AssetId` binds
 the vault address, this also creates a new asset identity and requires an
 explicit old-registry cutoff, late-deposit refund policy, burn/swap/reissue,
 reserve migration without double minting, and new activation/code pins.
+
+## 2026-09-02 — managed bridge replaced before activation (RESOLVED)
+
+The managed-v1 choice recorded immediately above was superseded before bridge
+activation. The current release candidate targets a new immutable,
+single-token `B3StakerBridge` and `B3FinalityVerifier`; no owner or rescue key
+can release its USDT. A deadline-bound one-time 3-of-4 bootstrap attestation
+installs canonical Set_0, then ordinary B3 staker-finality set rotation is the
+only authority. Certificate and withdrawal-proof submission is permissionless.
+
+This is a pre-activation replacement only if the historical smoke vault still
+has no USDT liability and no consensus bUSD was activated against its AssetId.
+Both facts must be rechecked. Otherwise the migration obligations recorded
+above apply. Bridge activation is an independent B selected only by a later B3
+build after the complete audited deployment tuple and all safety gates are
+reviewed; FlowMesh A3 does not activate it.

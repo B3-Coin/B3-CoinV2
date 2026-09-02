@@ -40,6 +40,7 @@ class CKey;
 
 namespace node {
 class BridgeBlockPreview;
+enum class BridgeBurnReadiness;
 class KernelNotifications;
 
 static const bool DEFAULT_PRINT_MODIFIED_FEE = false;
@@ -139,6 +140,7 @@ private:
       * @pre BlockAssembler::m_mempool must not be nullptr
     */
     void addChunks(BridgeBlockPreview* bridge_preview,
+                   BridgeBurnReadiness bridge_burn_readiness,
                    FinalityBindingOverlay* finality_binding_preview)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, m_mempool->cs);
 

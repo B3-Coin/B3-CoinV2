@@ -267,6 +267,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/legacy_fn_issuance.cpp
   node/finality_binding_index.cpp
   node/finality_pin.cpp
+  node/finality_signer_store.cpp
   node/finality_signature.cpp
   node/finality_tracker.cpp
   node/validator_set.cpp
@@ -506,10 +507,26 @@ if(B3_UPDATE_TOOLS)
 endif()
 
 if(B3_BRIDGE_TOOLS)
-  # Relayer dry-run harness over the same header-only bridge verification
-  # stack the tests use. Tooling only; never linked into the node.
+  # Relayer verifier and canonical payload emitter over the same header-only
+  # bridge codec/verification stack the tests use. Tooling only; never linked
+  # into the node.
   add_executable(b3-bridge-ethcheck bridge/ethcheck.cpp)
   target_link_libraries(b3-bridge-ethcheck
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+      univalue
+  )
+
+  # Offline, deterministic 3-of-4 BLS bootstrap proof/calldata builder for
+  # B3FinalityVerifier.initialize. Public manifests and signatures only.
+  add_executable(b3-bridge-bootstrap-proof bridge/bootstrap_proof.cpp)
+  target_link_libraries(b3-bridge-bootstrap-proof
     PRIVATE
       core_interface
       b3_blst

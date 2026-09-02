@@ -88,6 +88,34 @@ struct Impl {
 std::optional<PublicKey> PublicKey::Decode(std::span<const unsigned char> bytes) { return Impl::DecodeP1(bytes); }
 std::optional<Signature> Signature::Decode(std::span<const unsigned char> bytes) { return Impl::DecodeP2(bytes); }
 
+std::array<unsigned char, 128> PublicKey::Eip2537Uncompressed() const
+{
+    // blst serializes x || y as two canonical 48-byte big-endian field
+    // elements. EIP-2537 places each element in a 64-byte slot.
+    std::array<unsigned char, 96> serialized{};
+    blst_p1_affine_serialize(serialized.data(), Impl::P1(*this));
+    std::array<unsigned char, 128> out{};
+    std::copy_n(serialized.begin(), 48, out.begin() + 16);
+    std::copy_n(serialized.begin() + 48, 48, out.begin() + 80);
+    return out;
+}
+
+std::array<unsigned char, 256> Signature::Eip2537Uncompressed() const
+{
+    // blst serializes Fp2 as x.c1 || x.c0 || y.c1 || y.c0. EIP-2537's
+    // precompile input is x.c0 || x.c1 || y.c0 || y.c1, with every field
+    // element left-padded to 64 bytes.
+    std::array<unsigned char, 192> serialized{};
+    blst_p2_affine_serialize(serialized.data(), Impl::P2(*this));
+    std::array<unsigned char, 256> out{};
+    static constexpr std::array<size_t, 4> EIP_ORDER{1, 0, 3, 2};
+    for (size_t limb{0}; limb < EIP_ORDER.size(); ++limb) {
+        std::copy_n(serialized.begin() + EIP_ORDER[limb] * 48, 48,
+                    out.begin() + limb * 64 + 16);
+    }
+    return out;
+}
+
 SecretKey::~SecretKey() { memory_cleanse(m_bytes.data(), m_bytes.size()); }
 
 std::optional<SecretKey> SecretKey::FromIKM(std::span<const unsigned char> ikm)

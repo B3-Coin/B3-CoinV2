@@ -285,7 +285,8 @@ BOOST_FIXTURE_TEST_CASE(staking_loop_produces_blocks, ModernPosStakingSetup)
     AdvanceToModernPos();
     const int start_height{Tip()->nHeight};
 
-    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr);
+    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr,
+                           m_path_root / "finality_signer");
     {
         const auto idle{loop.Status(m_val_a)};
         BOOST_CHECK(idle.available);

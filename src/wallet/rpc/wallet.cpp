@@ -922,6 +922,8 @@ RPCHelpMan bindfinalitykey();
 RPCHelpMan importfinalitykey();
 RPCHelpMan revokefinalitykey();
 RPCHelpMan getfinalityinfo();
+RPCHelpMan exportbridgebootstrapidentity();
+RPCHelpMan signbridgebootstrap();
 RPCHelpMan stopstaking();
 
 // transactions
@@ -955,6 +957,8 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &importflowmeshkey},
         {"wallet", &revokefinalitykey},
         {"wallet", &getfinalityinfo},
+        {"wallet", &exportbridgebootstrapidentity},
+        {"wallet", &signbridgebootstrap},
         {"wallet", &createwallet},
         {"wallet", &createwalletdescriptor},
         {"wallet", &claimbridgedeposit},

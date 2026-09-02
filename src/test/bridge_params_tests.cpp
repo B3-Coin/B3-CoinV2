@@ -6,6 +6,7 @@
 #include <consensus/bridge_params.h>
 #include <consensus/era.h>
 #include <kernel/chainparams.h>
+#include <modern/asset_validation.h>
 #include <modern/bridge_asset.h>
 #include <util/strencodings.h>
 
@@ -26,8 +27,11 @@ Consensus::BridgeAssetParams CompleteBridgeParams()
 {
     Consensus::BridgeAssetParams out;
     out.asset = Consensus::ETHEREUM_MAINNET_BUSD_IDENTITY;
+    out.origin_deployment_block = 123;
+    out.vault_runtime_code_hash = Hash(6);
     out.implementation_or_adapter = Hash(7);
-    out.adapter_version = 3;
+    out.adapter_version =
+        Consensus::BRIDGE_ADAPTER_VERSION_DIRECT_TOKEN_V1;
     out.recipient_encoding_version =
         Consensus::BRIDGE_RECIPIENT_VERSION_P2PKH_V1;
     out.activation_height = 500;
@@ -41,12 +45,13 @@ Consensus::BridgeAssetParams CompleteBridgeParams()
     Consensus::EthereumLightClientPins light;
     light.trusted_checkpoint_root = Hash(8);
     light.trusted_checkpoint_slot = 8'192;
-    light.genesis_validators_root = Hash(9);
+    light.genesis_validators_root =
+        Consensus::ETHEREUM_MAINNET_GENESIS_VALIDATORS_ROOT;
     light.fork_schedule = {
         {0, {0x00, 0x00, 0x00, 0x00}},
         {10, {0x01, 0x02, 0x03, 0x04}},
     };
-    light.fork_schedule_valid_through_epoch = 20;
+    light.fork_schedule_valid_through_epoch = 256;
     light.electra_epoch = 10;
     light.min_sync_committee_participants =
         Consensus::ETHEREUM_SYNC_COMMITTEE_SUPERMAJORITY;
@@ -56,7 +61,7 @@ Consensus::BridgeAssetParams CompleteBridgeParams()
     out.withdrawal_mode = Consensus::BridgeWithdrawalMode::MANAGED_V1;
     Consensus::BridgeManagedWithdrawalPins withdrawal;
     withdrawal.authority_address.fill(0x55);
-    withdrawal.vault_runtime_code_hash = Hash(10);
+    withdrawal.vault_runtime_code_hash = *out.vault_runtime_code_hash;
     withdrawal.withdrawal_rules_version =
         Consensus::MANAGED_WITHDRAWAL_RULES_VERSION_V1;
     withdrawal.withdrawal_rules_commitment = Hash(11);
@@ -69,11 +74,13 @@ Consensus::BridgeDecentralizedWithdrawalPins DecentralizedWithdrawalPins()
     Consensus::BridgeDecentralizedWithdrawalPins out;
     out.ethereum_verifier_address.fill(0x66);
     out.ethereum_verifier_code_hash = Hash(12);
-    out.b3_genesis_validator_set_root = Hash(13);
+    out.bootstrap_validator_set_hash = Hash(13);
     out.withdrawal_rules_version =
         Consensus::DECENTRALIZED_WITHDRAWAL_RULES_VERSION_V1;
     out.withdrawal_rules_commitment = Hash(14);
-    out.min_b3_validator_stake = 1'000'000;
+    out.min_bridge_validators = 4;
+    out.max_bridge_validators = 64;
+    out.min_bridge_total_weight = 1'000'000;
     out.max_epoch_lag = 8;
     return out;
 }
@@ -84,6 +91,7 @@ Consensus::Params CompleteConsensusParams()
     out.hashGenesisBlock = Hash(1);
     out.legacy_final_hash = Hash(2);
     out.busd_bridge = CompleteBridgeParams();
+    out.bridge_withdrawal_activation_height = 500;
     return out;
 }
 
@@ -102,6 +110,7 @@ ProvenBridgeDeposit MatchingDeposit(const Consensus::BridgeAssetParams& params,
 {
     ProvenBridgeDeposit deposit;
     deposit.origin_chain_id = params.asset.origin_chain_id;
+    deposit.execution_block_number = *params.origin_deployment_block;
     deposit.vault_address = params.asset.vault_address;
     deposit.event.deposit_id = 42;
     deposit.event.token = params.asset.token_address;
@@ -158,9 +167,13 @@ BOOST_AUTO_TEST_CASE(mainnet_pins_identity_but_bridge_remains_fail_closed)
     BOOST_CHECK_EQUAL(*params.flowmesh_activation_height, 815'000);
     BOOST_CHECK(!busd.activation_height);
     BOOST_CHECK(!Consensus::BridgeMintParamsReady(busd));
+    BOOST_CHECK(!params.bridge_withdrawal_activation_height);
     const auto asset{modern::ConfiguredBridgeAssetId(params)};
     BOOST_REQUIRE(asset);
     BOOST_CHECK(!asset->IsNull());
+    // The historical managed identity remains inspectable, but wallet/GUI
+    // metadata must not present it as the current decentralized bUSD.
+    BOOST_CHECK(!modern::ConfiguredDecentralizedBridgeAssetId(params));
     BOOST_CHECK(!modern::ConfiguredBridgeRegistryId(params));
     BOOST_CHECK(!ConfiguredBridgeRegistryEntry(params));
     BOOST_CHECK(!Consensus::BridgeRulesActive(815'000, params));
@@ -184,13 +197,57 @@ BOOST_AUTO_TEST_CASE(asset_and_registry_ids_are_deterministic_and_domain_bound)
     BOOST_CHECK_EQUAL(asset->GetHex(),
                       "92f9192bf9a9d2b14798cd51368a4022776113f1337fb59ddd18da551d95238d");
     BOOST_CHECK_EQUAL(registry->GetHex(),
-                      "99a2f46f9f2984997766db581aca43780ef7aef4d9509947f4b5467e671ee299");
+                      "d165599bed752722d110c39eddaca4a95ccc42966e77d12719821a53a52da29b");
 
-    // An adapter approval is a new registry identity, not a new bUSD asset.
+    // An unknown adapter version cannot borrow direct-token-v1 consensus.
     Consensus::Params upgraded{first};
-    upgraded.busd_bridge->adapter_version = 4;
+    upgraded.busd_bridge->adapter_version = 2;
     BOOST_CHECK(modern::ConfiguredBridgeAssetId(upgraded) == asset);
-    BOOST_CHECK(modern::ConfiguredBridgeRegistryId(upgraded) != registry);
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(*upgraded.busd_bridge));
+    BOOST_CHECK(!modern::ConfiguredBridgeRegistryId(upgraded));
+
+    // The first admissible Ethereum block is part of an approval interval,
+    // not the stable bUSD balance namespace.
+    Consensus::Params later_deployment{first};
+    ++*later_deployment.busd_bridge->origin_deployment_block;
+    BOOST_CHECK(modern::ConfiguredBridgeAssetId(later_deployment) == asset);
+    BOOST_CHECK(modern::ConfiguredBridgeRegistryId(later_deployment) != registry);
+
+    // The same address with different runtime bytecode is a different
+    // approval interval and can never reuse the reviewed registry id.
+    Consensus::Params different_vault_code{first};
+    *different_vault_code.busd_bridge->vault_runtime_code_hash = Hash(15);
+    different_vault_code.busd_bridge->managed_withdrawal->vault_runtime_code_hash =
+        *different_vault_code.busd_bridge->vault_runtime_code_hash;
+    BOOST_CHECK(modern::ConfiguredBridgeAssetId(different_vault_code) == asset);
+    BOOST_CHECK(modern::ConfiguredBridgeRegistryId(different_vault_code) != registry);
+
+    // Caps, the Ethereum trust anchor, and withdrawal authorization are all
+    // part of the full approval fingerprint as well.
+    Consensus::Params different_caps{first};
+    ++different_caps.busd_bridge->mint_caps->max_per_epoch;
+    BOOST_CHECK(modern::ConfiguredBridgeRegistryId(different_caps) != registry);
+
+    Consensus::Params different_light_client{first};
+    different_light_client.busd_bridge->light_client->trusted_checkpoint_root =
+        Hash(16);
+    BOOST_CHECK(modern::ConfiguredBridgeRegistryId(different_light_client) !=
+                registry);
+
+    Consensus::Params different_withdrawal_rules{first};
+    different_withdrawal_rules.busd_bridge->managed_withdrawal
+        ->withdrawal_rules_commitment = Hash(17);
+    BOOST_CHECK(modern::ConfiguredBridgeRegistryId(different_withdrawal_rules) !=
+                registry);
+
+    Consensus::Params decentralized{first};
+    decentralized.busd_bridge->withdrawal_mode =
+        Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1;
+    decentralized.busd_bridge->managed_withdrawal.reset();
+    decentralized.busd_bridge->decentralized_withdrawal =
+        DecentralizedWithdrawalPins();
+    BOOST_REQUIRE(Consensus::BridgeMintParamsReady(*decentralized.busd_bridge));
+    BOOST_CHECK(modern::ConfiguredBridgeRegistryId(decentralized) != registry);
 
     // A different sealed B3 chain/fork has a different identity namespace.
     Consensus::Params other_domain{first};
@@ -210,10 +267,25 @@ BOOST_AUTO_TEST_CASE(every_security_category_is_a_fail_closed_gate)
     BOOST_REQUIRE(Consensus::BridgeMintParamsReady(complete));
 
     auto missing{complete};
+    missing.origin_deployment_block.reset();
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
+    missing = complete;
+    missing.origin_deployment_block = 0;
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
+    missing = complete;
+    missing.vault_runtime_code_hash.reset();
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
+    missing = complete;
+    missing.vault_runtime_code_hash = {};
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
+    missing = complete;
     missing.implementation_or_adapter.reset();
     BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
     missing = complete;
     missing.adapter_version.reset();
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
+    missing = complete;
+    missing.adapter_version = 2;
     BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
     missing = complete;
     missing.recipient_encoding_version.reset();
@@ -226,6 +298,18 @@ BOOST_AUTO_TEST_CASE(every_security_category_is_a_fail_closed_gate)
     BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
     missing = complete;
     missing.light_client.reset();
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
+    missing = complete;
+    missing.asset.origin_decimals = 18;
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
+    missing = complete;
+    missing.asset.asset_decimals = 18;
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
+    missing = complete;
+    missing.asset.token_address[0] ^= 1;
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
+    missing = complete;
+    missing.light_client->genesis_validators_root = Hash(18);
     BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
     missing = complete;
     missing.withdrawal_mode.reset();
@@ -241,6 +325,16 @@ BOOST_AUTO_TEST_CASE(every_security_category_is_a_fail_closed_gate)
     missing.light_client->fork_schedule_valid_through_epoch = 9;
     BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
     missing = complete;
+    missing.light_client->trusted_checkpoint_slot =
+        (missing.light_client->fork_schedule_valid_through_epoch + 1) *
+            Consensus::ETHEREUM_SLOTS_PER_EPOCH -
+        1;
+    BOOST_CHECK(Consensus::BridgeMintParamsReady(missing));
+    // The first slot of the next unknown epoch fails closed. The all-zero
+    // genesis fork version in CompleteBridgeParams remains valid.
+    ++missing.light_client->trusted_checkpoint_slot;
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
+    missing = complete;
     missing.mint_caps->max_per_epoch = missing.mint_caps->max_per_block - 1;
     BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
     missing = complete;
@@ -248,6 +342,9 @@ BOOST_AUTO_TEST_CASE(every_security_category_is_a_fail_closed_gate)
     BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
     missing = complete;
     missing.managed_withdrawal->vault_runtime_code_hash = {};
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
+    missing = complete;
+    missing.managed_withdrawal->vault_runtime_code_hash = Hash(10);
     BOOST_CHECK(!Consensus::BridgeMintParamsReady(missing));
     missing = complete;
     missing.managed_withdrawal->withdrawal_rules_version = 0;
@@ -273,6 +370,11 @@ BOOST_AUTO_TEST_CASE(withdrawal_modes_are_explicit_exclusive_and_versioned)
     decentralized.decentralized_withdrawal = DecentralizedWithdrawalPins();
     BOOST_REQUIRE(Consensus::BridgeMintParamsReady(decentralized));
 
+    auto decentralized_params{CompleteConsensusParams()};
+    decentralized_params.busd_bridge = decentralized;
+    BOOST_CHECK(
+        modern::ConfiguredDecentralizedBridgeAssetId(decentralized_params));
+
     auto incomplete{decentralized};
     incomplete.decentralized_withdrawal->withdrawal_rules_version = 0;
     BOOST_CHECK(!Consensus::BridgeMintParamsReady(incomplete));
@@ -280,7 +382,27 @@ BOOST_AUTO_TEST_CASE(withdrawal_modes_are_explicit_exclusive_and_versioned)
     incomplete.decentralized_withdrawal->ethereum_verifier_code_hash = {};
     BOOST_CHECK(!Consensus::BridgeMintParamsReady(incomplete));
     incomplete = decentralized;
-    incomplete.decentralized_withdrawal->min_b3_validator_stake = 0;
+    incomplete.decentralized_withdrawal->bootstrap_validator_set_hash = {};
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(incomplete));
+    incomplete = decentralized;
+    incomplete.decentralized_withdrawal->min_bridge_total_weight = 0;
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(incomplete));
+    incomplete = decentralized;
+    incomplete.decentralized_withdrawal->min_bridge_validators = 3;
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(incomplete));
+    incomplete = decentralized;
+    incomplete.decentralized_withdrawal->max_bridge_validators = 3;
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(incomplete));
+    incomplete = decentralized;
+    incomplete.decentralized_withdrawal->max_bridge_validators = 65;
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(incomplete));
+    incomplete = decentralized;
+    incomplete.decentralized_withdrawal->ethereum_verifier_address =
+        incomplete.asset.vault_address;
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(incomplete));
+    incomplete = decentralized;
+    incomplete.decentralized_withdrawal->ethereum_verifier_address =
+        incomplete.asset.token_address;
     BOOST_CHECK(!Consensus::BridgeMintParamsReady(incomplete));
 }
 
@@ -325,8 +447,15 @@ BOOST_AUTO_TEST_CASE(flowmesh_regtest_has_complete_test_only_bridge_params)
     const Consensus::Params& params{chain->GetConsensus()};
 
     BOOST_REQUIRE(params.busd_bridge);
-    BOOST_CHECK(params.busd_bridge->asset ==
-                Consensus::ETHEREUM_MAINNET_BUSD_IDENTITY);
+    BOOST_CHECK_EQUAL(params.busd_bridge->asset.origin_chain_id, 31'337U);
+    BOOST_CHECK(params.busd_bridge->asset.vault_address ==
+                Consensus::BUSD_ETHEREUM_VAULT);
+    BOOST_CHECK(params.busd_bridge->asset.token_address ==
+                Consensus::BUSD_ETHEREUM_USDT);
+    BOOST_REQUIRE(params.busd_bridge->origin_deployment_block);
+    BOOST_CHECK_EQUAL(*params.busd_bridge->origin_deployment_block, 1U);
+    BOOST_REQUIRE(params.busd_bridge->vault_runtime_code_hash);
+    BOOST_CHECK(!params.busd_bridge->vault_runtime_code_hash->IsNull());
     BOOST_CHECK(Consensus::BridgeMintParamsReady(*params.busd_bridge));
     BOOST_REQUIRE(params.busd_bridge->withdrawal_mode);
     BOOST_CHECK(*params.busd_bridge->withdrawal_mode ==
@@ -341,9 +470,75 @@ BOOST_AUTO_TEST_CASE(flowmesh_regtest_has_complete_test_only_bridge_params)
         *params.flowmesh_activation_height - 1, params));
     BOOST_CHECK(Consensus::BridgeRulesActive(
         *params.flowmesh_activation_height, params));
+    BOOST_REQUIRE(params.bridge_withdrawal_activation_height);
+    BOOST_CHECK_EQUAL(*params.bridge_withdrawal_activation_height,
+                      *params.flowmesh_activation_height);
+    BOOST_CHECK(Consensus::BridgeWithdrawalRulesActive(
+        *params.flowmesh_activation_height, params));
     BOOST_CHECK(modern::ConfiguredBridgeAssetId(params).has_value());
+    BOOST_CHECK(!modern::ConfiguredDecentralizedBridgeAssetId(params));
     BOOST_CHECK(modern::ConfiguredBridgeRegistryId(params).has_value());
     BOOST_CHECK(ConfiguredBridgeRegistryEntry(params).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(bridge_asset_outputs_activate_at_m_without_colored_assets)
+{
+    CChainParams::RegTestOptions options;
+    CChainParams::B3ModernRegTestOptions b3;
+    b3.flowmesh_test = true;
+    options.b3_modern = b3;
+    auto chain{CChainParams::RegTest(options)};
+    auto& params{const_cast<Consensus::Params&>(chain->GetConsensus())};
+
+    const int modern_start{*Consensus::ModernPosStartHeight(params)};
+    const int asset_start{*params.asset_activation_height};
+    BOOST_REQUIRE_LT(modern_start, asset_start);
+    BOOST_REQUIRE(params.busd_bridge);
+    params.busd_bridge->activation_height = modern_start;
+    BOOST_REQUIRE(Consensus::BridgeRulesActive(modern_start, params));
+    BOOST_REQUIRE(!Consensus::AssetRulesActive(modern_start, params));
+
+    const auto bridge_asset{modern::ConfiguredBridgeAssetId(params)};
+    BOOST_REQUIRE(bridge_asset);
+    const CScript owner_script{CScript() << OP_TRUE};
+    const auto bridge_owner{
+        modern::MakeAssetOwnerOutput(*bridge_asset, 1'000'000, owner_script)};
+    const auto bridge_burn{
+        modern::MakeAssetBurnOutput(*bridge_asset, 1'000'000)};
+    BOOST_REQUIRE(bridge_owner);
+    BOOST_REQUIRE(bridge_burn);
+
+    std::string error;
+    BOOST_CHECK(modern::ViewAssetAwareOutput(
+                    *bridge_owner, modern_start, params, error)
+                    .has_value());
+    BOOST_CHECK(modern::ViewAssetAwareOutput(
+                    *bridge_burn, modern_start, params, error)
+                    .has_value());
+    // Parsing the configured bridge output does not change or recursively
+    // depend on the activation result.
+    BOOST_CHECK(Consensus::BridgeRulesActive(modern_start, params));
+
+    modern::AssetId generic_asset{uint256{uint8_t{0x7a}}};
+    BOOST_REQUIRE(generic_asset != *bridge_asset);
+    const auto generic_owner{
+        modern::MakeAssetOwnerOutput(generic_asset, 1'000'000, owner_script)};
+    const auto generic_burn{
+        modern::MakeAssetBurnOutput(generic_asset, 1'000'000)};
+    BOOST_REQUIRE(generic_owner);
+    BOOST_REQUIRE(generic_burn);
+    BOOST_CHECK(!modern::ViewAssetAwareOutput(
+                     *generic_owner, modern_start, params, error)
+                     .has_value());
+    BOOST_CHECK(!modern::ViewAssetAwareOutput(
+                     *generic_burn, modern_start, params, error)
+                     .has_value());
+    BOOST_CHECK(modern::ViewAssetAwareOutput(
+                    *generic_owner, asset_start, params, error)
+                    .has_value());
+    BOOST_CHECK(modern::ViewAssetAwareOutput(
+                    *generic_burn, asset_start, params, error)
+                    .has_value());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

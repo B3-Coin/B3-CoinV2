@@ -46,6 +46,7 @@ struct B3AssetRecord {
     int decimals{8};
     bool metadata_known{false};
     bool is_fn{false};
+    bool is_bridge{false};
     Status status{Status::Unavailable};
 };
 

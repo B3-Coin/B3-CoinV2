@@ -33,6 +33,30 @@ namespace node {
 class BlockManager;
 class BridgeStateIndex;
 
+/** Parent-derived ability of B3's current and next validator sets to produce
+ * a withdrawal root accepted by the pinned Ethereum verifier. UNAVAILABLE is
+ * operational (the parent finality state could not be reconstructed), while
+ * NOT_READY is a deterministic consensus condition. */
+enum class BridgeBurnReadiness {
+    UNAVAILABLE,
+    NOT_READY,
+    READY,
+};
+
+//! True only for a syntactically decoded decentralized BRIDGE_BURN record.
+bool HasDecentralizedBridgeBurn(const CTransaction& tx);
+bool HasDecentralizedBridgeBurn(const CBlock& block);
+
+/** Fail closed for a decoded BRIDGE_BURN unless parent/projected finality is
+ * READY. Malformed type-10 records remain the bridge verifier's responsibility
+ * and cannot pass it. */
+bool CheckBridgeBurnReadiness(const CTransaction& tx,
+                              BridgeBurnReadiness readiness,
+                              std::string& error);
+bool CheckBridgeBurnReadiness(const CBlock& block,
+                              BridgeBurnReadiness readiness,
+                              std::string& error);
+
 /** Recent active-chain blocks whose bridge effects can be undone in memory. */
 inline constexpr size_t BRIDGE_STATE_UNDO_BLOCKS{288};
 
@@ -42,12 +66,33 @@ struct BridgeExecutionAnchor {
     uint256 block_hash{};
     uint256 receipts_root{};
     uint64_t source_finalized_beacon_slot{0};
+    uint64_t source_finalized_execution_block{0};
     uint64_t execution_timestamp{0};
     int connected_height{-1};
     uint256 connected_block{};
 
     friend bool operator==(const BridgeExecutionAnchor&,
                            const BridgeExecutionAnchor&) = default;
+};
+
+/** Active B3 block that connected one persistent bridge-state fact. */
+struct BridgeStateConnection {
+    int height{-1};
+    uint256 block_hash{};
+
+    friend bool operator==(const BridgeStateConnection&,
+                           const BridgeStateConnection&) = default;
+};
+
+/**
+ * One exact Ethereum light-client store and the active B3 block that made it
+ * current. The bridge index retains one old floor snapshot in addition to its
+ * bounded undo history so a stream of newer, not-yet-B3-finalized updates
+ * cannot make every exportable snapshot disappear.
+ */
+struct BridgeLightClientSnapshot {
+    bridge::LightClientStore store{};
+    BridgeStateConnection connection{};
 };
 
 /** A type-10 MINT authorization bound to the full evidence-bearing tx bytes. */
@@ -158,6 +203,8 @@ struct BridgeBlockDelta {
     uint256 previous_block_hash{};
     std::optional<bridge::LightClientStore> light_client_before{};
     std::optional<bridge::LightClientStore> light_client_after{};
+    std::optional<BridgeStateConnection> light_client_connection_before{};
+    std::optional<BridgeStateConnection> light_client_connection_after{};
     std::vector<BridgeExecutionAnchor> anchors_added{};
     std::vector<BridgeTxMintAuthorization> mint_authorizations{};
     std::vector<bridge::BridgeDepositKey> nullifiers_added{};
@@ -235,12 +282,36 @@ public:
     {
         return m_nullifiers.contains(key);
     }
+    std::optional<BridgeStateConnection> NullifierConnection(
+        const bridge::BridgeDepositKey& key) const;
     std::optional<BridgeExecutionAnchor> Anchor(
         const uint256& block_hash) const;
+    /**
+     * Nearest retained execution anchor at or after `target_block_number`
+     * whose B3 connection is covered by `finalized_b3_height` and whose
+     * directly-finalized Ethereum origin can still reach the target within
+     * the cumulative backfill limit.
+     *
+     * The index contains active-chain state only. Callers exposing this
+     * across a trust boundary must additionally match connected_block to the
+     * active B3 chain at connected_height.
+     */
+    std::optional<BridgeExecutionAnchor> AnchorForTarget(
+        uint64_t target_block_number, int finalized_b3_height) const;
     std::optional<BridgeManagedWithdrawalRequest> Withdrawal(
         const BridgeWithdrawalId& id) const;
     std::optional<BridgeDecentralizedWithdrawalRequest>
     DecentralizedWithdrawal(uint64_t withdrawal_id) const;
+    /**
+     * Resolve a confirmed active-chain burn source to its consensus-assigned
+     * withdrawal. Unlike a mempool preview, this identity survives unrelated
+     * transaction ordering and disappears automatically on active-chain undo.
+     */
+    std::optional<BridgeDecentralizedWithdrawalRequest>
+    DecentralizedWithdrawal(const BridgeWithdrawalId& source) const;
+    /** Exact consecutive withdrawal prefix connected through `height`. */
+    std::optional<std::vector<BridgeDecentralizedWithdrawalRequest>>
+    DecentralizedWithdrawalsThrough(int height) const;
     std::optional<uint256> WithdrawalRootAtHeight(int height) const;
     const modern::WithdrawalTreeState& WithdrawalTree() const
     {
@@ -250,6 +321,19 @@ public:
     {
         return m_light_client;
     }
+    const std::optional<BridgeStateConnection>&
+    LightClientLastConnected() const
+    {
+        return m_light_client_connection;
+    }
+    /**
+     * Newest retained store whose connection height is covered by B3
+     * finality. Recent candidates come from the bounded undo history; the
+     * first active-chain store is retained as a starvation-proof floor.
+     * Callers must still verify connection.block_hash against the active chain.
+     */
+    std::optional<BridgeLightClientSnapshot>
+    FinalizedLightClientSnapshot(int finalized_b3_height) const;
     CAmount EpochMinted(const modern::AssetId& asset, uint64_t epoch) const;
     int ConnectedHeight() const { return m_connected_height; }
     uint256 ConnectedHash() const { return m_connected_hash; }
@@ -264,9 +348,13 @@ public:
 
 private:
     std::optional<bridge::LightClientStore> m_light_client{};
+    std::optional<BridgeStateConnection> m_light_client_connection{};
+    std::optional<BridgeLightClientSnapshot> m_light_client_floor{};
     std::map<uint256, BridgeExecutionAnchor> m_anchors{};
     std::map<uint64_t, uint256> m_anchor_by_height{};
     std::set<bridge::BridgeDepositKey> m_nullifiers{};
+    std::map<bridge::BridgeDepositKey, BridgeStateConnection>
+        m_nullifier_connections{};
     std::map<std::pair<modern::AssetId, uint64_t>, CAmount> m_epoch_minted{};
     std::map<BridgeWithdrawalId, BridgeManagedWithdrawalRequest> m_withdrawals{};
     std::map<uint64_t, BridgeDecentralizedWithdrawalRequest>
@@ -281,8 +369,10 @@ private:
 
 /**
  * Exact withdrawal root a finality certificate must carry at `height`.
- * Managed/pre-activation bridge epochs use zero. A decentralized active
- * height requires an index containing that exact active-chain block.
+ * Managed or pre-inbound-B epochs use zero. From inbound B onward a
+ * decentralized bridge requires the indexed canonical cumulative root even
+ * while the separate irreversible-burn height W remains unset; the empty
+ * depth-32 tree root is nonzero. An unavailable index fails closed.
  */
 std::optional<uint256> FinalityWithdrawalRoot(
     int height, const Consensus::Params& params,

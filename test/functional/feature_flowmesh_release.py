@@ -450,8 +450,11 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
         assert_equal(native_deposit["market_id"], market_id)
         assert_equal(native_deposit["vault_id"], vault_id)
         self.synchronize_mempools()
-        self.mine_pos_blocks(1)
-        self.mine_pos_blocks(30)
+        # Four live producers can legitimately finish an additional slot
+        # before the harness stops them. We are past every exact activation
+        # boundary here, and only require the deposit to become 30-deep.
+        self.mine_pos_blocks(1, allow_overshoot=True)
+        self.mine_pos_blocks(30, allow_overshoot=True)
         self.wait_for_market_convergence(market_id)
 
         self.log.info("Both 30-deep deposits are certified and checkpointed")
@@ -663,6 +666,30 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
             assert_equal(status["state_root"], final_state_root)
         assert_equal(n0.getflowmeshbalance(market_id)["account"], final_seller)
         assert_equal(n1.getflowmeshbalance(market_id)["account"], final_buyer)
+        assert_equal(n0.listflowmeshvaultoperations(market_id), [])
+        assert_equal(self.custody(custody_records, asset_id, vault_id),
+                     TEST_ASSET_DEPOSIT - WITHDRAW_ASSET)
+
+        reindex_height = n0.getblockcount()
+        reindex_tip = n0.getbestblockhash()
+        self.log.info("Clean reindex restores FlowMesh without a new block")
+        self.restart_node(0, extra_args=[*B3_ARGS, "-reindex=1"])
+        n0.setmocktime(self.mock_time)
+        started = n0.startflowmeshvalidator()
+        assert_equal(started["running"], True)
+        assert_equal(started["armed_keys"], 1)
+        n0.syncwithvalidationinterfacequeue()
+        assert_equal(n0.getblockcount(), reindex_height)
+        assert_equal(n0.getbestblockhash(), reindex_tip)
+        status = self.market_status(n0, market_id)
+        assert status is not None
+        assert_equal(status["running"], True)
+        assert_equal(status["observer_only"], False)
+        assert_equal(status["paused"], False)
+        assert_equal(status["halt"], "none")
+        assert_equal(status["next_microblock_sequence"], final_sequence)
+        assert_equal(status["state_root"], final_state_root)
+        assert_equal(n0.getflowmeshbalance(market_id)["account"], final_seller)
         assert_equal(n0.listflowmeshvaultoperations(market_id), [])
         assert_equal(self.custody(custody_records, asset_id, vault_id),
                      TEST_ASSET_DEPOSIT - WITHDRAW_ASSET)

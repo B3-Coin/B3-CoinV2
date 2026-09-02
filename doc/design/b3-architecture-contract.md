@@ -491,8 +491,9 @@ rebuilds, and only then publishes the next.
 ## 32. Vault must remain keyless
 
 This section governs the B3-side DEX_VAULT custody pool. It does not describe
-the Ethereum reserve vault, whose transition-v1 withdrawal leg has the
-separately disclosed immutable managed authority in §45.
+the Ethereum reserve vault. The current Ethereum production target is also
+keyless, but it is governed separately by the staker-finality and proof rules
+in §45.
 
 There must be **no private key** capable of arbitrarily withdrawing the DEX custody pool —
 no multisig treasury. Instead:
@@ -595,37 +596,53 @@ external stablecoin issuer.
 ## 45. Stablecoin bridge risk stays explicit
 
 Canonical bUSD is the six-decimal `BRIDGE_BACKED` representation of Ethereum-mainnet
-USDT locked in managed-v1 vault
-`0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`. It is a different security domain
-from B3: solvency depends on Ethereum, canonical USDT, bridge verification and
-finality, the issuer's freeze/blacklist policy, and the managed withdrawal authority.
-Mainnet minting stays fail-closed until every proof/readiness pin is present. It must
-never be described as protocol-native dollars without those qualifications. The
-transition tree implements a bounded type-10 proof/command carrier, exact OWNER mint and
-bUSD BURN transitions, light-client/anchor/nullifier/cap tracking, undo/reindex replay,
-and mempool/miner/asset validation. Every type-10 transaction must also contain exactly
-one zero-value Modern metadata cell of policy type 9 (`BRIDGE_RECORD`) whose
-`B3/BRIDGE/RECORD/V1` tagged hash commits the exact canonical record frame. Duplicate,
-mismatched, missing, or orphan bindings are invalid. Because that cell is an ordinary
-transaction output, standard `SIGHASH_ALL` input signatures cover the bridge commitment;
-there is no `OP_RETURN` and no bridge-specific or custom sighash. That state is rebuilt
-in memory from bridge activation; there is no durable sidecar, so a configured bridge
-refuses pruning and any snapshot that skips its history. Adapter enforcement and
-production pins remain gates.
+USDT locked in the release-pinned immutable `B3StakerBridge`. It is a different
+security domain from B3: solvency depends on Ethereum, canonical USDT, bridge
+verification and finality, the issuer's freeze/blacklist policy, and the
+correctness and liveness of both chains and the immutable contracts. It must
+never be described as protocol-native dollars without those qualifications.
 
-Managed-v1 redemption begins with the implemented consensus-checked B3 burn request
-binding canonical bUSD, the exact raw amount, Ethereum recipient, and unique request id.
-The operator waits the pinned B3 finality depth, releases the registry-derived USDT
-exactly once, durably marks the id consumed, and reconciles reserves against supply. No
-confirmed burn means no release. The external Ethereum release automation and durable
-request-consumption database are separate release work and are not implemented by the
-B3 node.
+The current vault has no owner, rescue key, proxy, pause, or arbitrary token
+selector. Anyone may relay a finalized withdrawal and pay its Ethereum gas,
+but USDT moves only when the immutable verifier accepts the B3 staker-finality
+lineage and the exact withdrawal leaf is included in the accepted cumulative
+root. A one-time, deadline-bound 3-of-4 bootstrap attestation installs the
+canonical Set_0; after initialization that bootstrap path is unreachable and
+ordinary B3 stake-finality set rotation is the only authority.
 
-Replacing managed v1 with decentralized verification requires a new audited vault; the
-immutable authority cannot be silently changed in place. Because the current bridge
-`AssetId` includes `vault_address`, the new vault is a new asset identity. Migration must
-therefore specify old-registry cutoff and late-deposit refunds, burn/swap/reissue of old
-bUSD, reserve movement without double minting, and all new vault/verifier/identity pins.
+The vault may be deployed before M, but deposits remain disabled until the
+verifier is initialized and a fresh valid certificate proves qualified current
+and successor sets. A later reviewed B3 build must pin the Ethereum chain ID,
+verifier/vault addresses and runtime hashes, vault deployment block, canonical
+USDT address, and derived B3 AssetId. Missing or mismatching fields fail closed;
+there is no corridor-deposit or pre-readiness custody phase.
+
+Inbound bridge height B may be pinned after deployment and readiness review.
+Irreversible withdrawal records remain disabled while the independent height W
+is unset; W requires round-trip canonicality/liveness review and must satisfy
+W >= B. Enabling B first creates a disclosed custodial waiting period.
+
+The transition tree implements the bounded type-10 proof/command carrier,
+exact OWNER mint and bUSD BURN transitions, light-client/anchor/nullifier/cap
+tracking, undo/reindex replay, and mempool/miner/asset validation. Every
+type-10 transaction must also contain exactly one zero-value Modern metadata
+cell of policy type 9 (`BRIDGE_RECORD`) whose `B3/BRIDGE/RECORD/V1` tagged hash
+commits the exact canonical record frame. Duplicate, mismatched, missing, or
+orphan bindings are invalid. Because that cell is an ordinary transaction
+output, standard input signatures cover the bridge commitment; there is no
+`OP_RETURN` and no custom bridge sighash. Bridge state is rebuilt in memory
+from activation; there is no durable sidecar, so a configured bridge refuses
+pruning and any snapshot that skips its history.
+
+Mainnet use remains fail-closed until the exact deployment manifest, runtime
+hashes, new vault-derived AssetId, Ethereum checkpoint and fork schedule,
+caps, approval/lag bounds, adapter/rules commitments, bootstrap handoff,
+chainparams activation, independent audits, and rehearsal are reviewed and
+pinned. The historical managed smoke vault
+`0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6` is not the production target and
+must be excluded from the active registry. Its observed zero-USDT and
+zero-consensus-bUSD state must be rechecked before replacement; any discovered
+liability requires an explicit cutoff and reserve/asset migration instead.
 
 ## 46. Independent PoW-issued coloured assets
 
@@ -723,9 +740,11 @@ FlowMesh, or bridge logic:
 There is no separate FN transfer activation lock. The transition release pins
 FlowMesh A3. Ethereum-USDT bridge minting is independently fail-closed until
 its implemented type-10 mint/burn state machine passes review and its exact
-bootstrap, forks, caps, enforced adapter, managed-redemption rules, runtime,
-activation, and X-dependent parameters are pinned; it is never enabled merely
-because A3 is reached.
+bootstrap, forks, caps, enforced adapter, staker-verifier/vault runtimes,
+activation, and X-dependent parameters are pinned. Its inbound activation B is
+selected only by a later B3 build after the complete audited deployment tuple
+and inbound gates are reviewed; its irreversible-burn height W remains unset
+until the round trip is safe. Neither is enabled merely because A3 is reached.
 
 For each market, epoch zero uses one consensus-unique anchor: the earliest
 canonical block at or after `market.created_height` whose post-block FN-v2 set

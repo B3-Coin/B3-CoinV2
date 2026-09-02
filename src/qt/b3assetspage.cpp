@@ -382,6 +382,8 @@ void B3AssetsPage::updateDetails()
             m_detail_status->setText(record.immature > 0
                 ? tr("FN Coin · confirmed, waiting for maturity")
                 : tr("FN Coin"));
+        } else if (record.is_bridge) {
+            m_detail_status->setText(tr("Bridged USD · exact six-decimal units"));
         } else {
             m_detail_status->setText(tr("Coloured asset · exact raw units"));
         }

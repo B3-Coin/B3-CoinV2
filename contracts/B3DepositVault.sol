@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/// @title B3DepositVault — the Ethereum side of the ETH -> B3 deposit leg.
+/// @title B3DepositVault — historical managed bridge prototype.
 ///
 /// Deliberately minimal and trust-minimized: no owner, no pause, no upgrade.
 /// Users lock ETH or ERC-20 tokens; the vault emits one canonical Deposit
@@ -15,19 +15,17 @@ pragma solidity ^0.8.24;
 ///                 uint256 amount, bytes32 b3Recipient);
 ///
 /// Funds can leave only through `release`, callable exclusively by the
-/// release authority. The transition-v1 deployment deliberately uses a
-/// managed owner authority; a future deployment may instead use the B3
-/// finality verifier / bridge contract of
-/// doc/design/b3-cross-chain-finality-v1.md §5-§6. A zero authority would
-/// trap funds forever and the constructor refuses it.
+/// release authority. This source is retained to reproduce the published
+/// managed smoke vault; the current transition release targets the keyless
+/// B3StakerBridge/B3FinalityVerifier stack instead. A zero authority would trap
+/// funds forever and the constructor refuses it.
 contract B3DepositVault {
     /// Emitted once per lock. `token == address(0)` means native ETH.
     /// `amount` is the amount the vault ACTUALLY received (balance delta),
     /// so fee-on-transfer tokens cannot cause B3 to mint more than the
     /// vault holds. `b3Recipient` is opaque here; its semantics are defined
-    /// by B3 consensus at the A3 activation.
-    event Deposit(uint64 indexed depositId, address indexed token,
-                  uint256 amount, bytes32 b3Recipient);
+    /// by B3 consensus at the separately pinned bridge activation.
+    event Deposit(uint64 indexed depositId, address indexed token, uint256 amount, bytes32 b3Recipient);
 
     event Released(address indexed token, address indexed to, uint256 amount);
     event Rescued(address indexed token, address indexed to, uint256 amount);
@@ -90,15 +88,14 @@ contract B3DepositVault {
         emit Deposit(nextDepositId++, token, received, b3Recipient);
     }
 
-    /// Withdrawal path — only the immutable release authority. Transition v1
-    /// uses a disclosed managed authority; a future vault may bind this role
-    /// to the B3 finality verifier stack (spec §5.2 + §6).
+    /// Historical managed withdrawal path — only the immutable release
+    /// authority. This is not the current decentralized production path.
     function release(address token, address payable to, uint256 amount) external nonReentrant {
         if (msg.sender != releaseAuthority) revert NotAuthority();
         uint256 l = locked[token];
         locked[token] = amount >= l ? 0 : l - amount; // saturating: accounting bounds rescue, never the authority
         if (token == address(0)) {
-            (bool ok, ) = to.call{value: amount}("");
+            (bool ok,) = to.call{value: amount}("");
             if (!ok) revert TransferFailed();
         } else {
             _safeTransfer(token, to, amount);
@@ -115,7 +112,7 @@ contract B3DepositVault {
         if (balance <= l) revert NothingToRescue();
         uint256 surplus = balance - l;
         if (token == address(0)) {
-            (bool ok, ) = to.call{value: surplus}("");
+            (bool ok,) = to.call{value: surplus}("");
             if (!ok) revert TransferFailed();
         } else {
             _safeTransfer(token, to, surplus);
@@ -126,21 +123,19 @@ contract B3DepositVault {
     // --- minimal safe-ERC20 (no library dependencies) ---------------------
 
     function _balanceOf(address token, address who) private view returns (uint256) {
-        (bool ok, bytes memory data) =
-            token.staticcall(abi.encodeWithSignature("balanceOf(address)", who));
+        (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSignature("balanceOf(address)", who));
         if (!ok || data.length < 32) revert TransferFailed();
         return abi.decode(data, (uint256));
     }
 
     function _safeTransferFrom(address token, address from, address to, uint256 amount) private {
-        (bool ok, bytes memory data) = token.call(
-            abi.encodeWithSignature("transferFrom(address,address,uint256)", from, to, amount));
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSignature("transferFrom(address,address,uint256)", from, to, amount));
         if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) revert TransferFailed();
     }
 
     function _safeTransfer(address token, address to, uint256 amount) private {
-        (bool ok, bytes memory data) = token.call(
-            abi.encodeWithSignature("transfer(address,uint256)", to, amount));
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSignature("transfer(address,uint256)", to, amount));
         if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) revert TransferFailed();
     }
 }

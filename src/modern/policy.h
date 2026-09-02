@@ -337,8 +337,14 @@ inline std::vector<unsigned char> MakeVaultParams(const uint8_t kind, const uint
     return params;
 }
 
-inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int height,
-                                           const Consensus::Params& params)
+//! `configured_bridge_asset_active` may be set only after the contextual asset
+//! layer has matched the output's exact chain-bound bridge AssetId and its
+//! complete independent bridge activation envelope. It opens OWNER/BURN for
+//! that asset without opening generic colored-asset issuance before A2.
+inline PolicyOutputCheck CheckPolicyOutput(
+    const ModernOutput& out, const int height,
+    const Consensus::Params& params,
+    const bool configured_bridge_asset_active = false)
 {
     if (Consensus::GetB3Era(height, params) != Consensus::B3Era::MODERN) {
         return PolicyOutputCheck::NOT_MODERN_ERA;
@@ -347,7 +353,8 @@ inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int he
         params.test_only_asset_policies_active ||
         Consensus::FlowMeshVaultPreparationRulesActive(height, params)};
     if (!IsActivatedPolicy(out.policy_type, out.policy_version,
-                           Consensus::AssetRulesActive(height, params),
+                           Consensus::AssetRulesActive(height, params) ||
+                               configured_bridge_asset_active,
                            Consensus::FnRulesActive(height, params),
                            dex_vault_active,
                            Consensus::FlowMeshSeatBindingRulesActive(height, params))) {

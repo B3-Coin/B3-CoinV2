@@ -161,10 +161,40 @@ BridgeExecutionAnchor FinalizedAnchor(
         header.execution.block_hash,
         header.execution.receipts_root,
         header.beacon.slot,
+        header.execution.block_number,
         header.execution.timestamp,
         height,
         block_hash,
     };
+}
+
+bool HasValidBackfillOrigin(const BridgeExecutionAnchor& anchor)
+{
+    return anchor.source_finalized_execution_block >= anchor.block_number &&
+           anchor.source_finalized_execution_block - anchor.block_number <=
+               bridge::MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS;
+}
+
+bool ExecutionRangeReachable(const uint64_t newer_block,
+                             const uint64_t older_block)
+{
+    return newer_block >= older_block &&
+           newer_block - older_block <=
+               bridge::MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS;
+}
+
+bool CheckCumulativeBackfillTarget(const BridgeExecutionAnchor& source,
+                                   const uint64_t target_block_number,
+                                   std::string& error)
+{
+    if (!HasValidBackfillOrigin(source) ||
+        target_block_number > source.source_finalized_execution_block ||
+        source.source_finalized_execution_block - target_block_number >
+            bridge::MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS) {
+        error = "bridge execution proof exceeds the cumulative backfill limit";
+        return false;
+    }
+    return true;
 }
 
 std::optional<uint64_t> ExecutionHeaderTimestamp(
@@ -343,7 +373,8 @@ bool AddAnchor(const BridgeExecutionAnchor& anchor, ScratchState& state,
                std::string& error)
 {
     if (anchor.block_hash.IsNull() || anchor.receipts_root.IsNull() ||
-        anchor.connected_height < 0 || anchor.connected_block.IsNull()) {
+        anchor.connected_height < 0 || anchor.connected_block.IsNull() ||
+        !HasValidBackfillOrigin(anchor)) {
         error = "bridge execution anchor is malformed";
         return false;
     }
@@ -368,10 +399,11 @@ bool AddAnchor(const BridgeExecutionAnchor& anchor, ScratchState& state,
 
 bool VerifyBootstrap(const bridge::BridgeBootstrapV1& bootstrap,
                      const int height, const uint256& block_hash,
-                     const Consensus::EthereumLightClientPins& pins,
+                     const Consensus::BridgeAssetParams& configured,
                      ScratchState& state, BridgeBlockDelta& delta,
                      std::string& error)
 {
+    const Consensus::EthereumLightClientPins& pins{*configured.light_client};
     if (state.LightClient()) {
         error = "bridge light client is already bootstrapped";
         return false;
@@ -383,6 +415,13 @@ bool VerifyBootstrap(const bridge::BridgeBootstrapV1& bootstrap,
     }
     if (!SlotUsesKnownFork(bootstrap.header.beacon.slot, pins)) {
         error = "bridge bootstrap is beyond the pinned Ethereum fork schedule";
+        return false;
+    }
+    if (!ExecutionRangeReachable(
+            bootstrap.header.execution.block_number,
+            *configured.origin_deployment_block)) {
+        error =
+            "bridge bootstrap cannot reach the configured vault deployment block";
         return false;
     }
     bridge::LightClientStore store;
@@ -436,6 +475,14 @@ bool VerifyUpdate(const bridge::BridgeUpdateV1& record, const int height,
     const bool finalized_changed{
         !SameLightClientHeader(next.finalized_header,
                                current->finalized_header)};
+    if (finalized_changed &&
+        !ExecutionRangeReachable(
+            next.finalized_header.execution.block_number,
+            current->finalized_header.execution.block_number)) {
+        error =
+            "bridge light-client update exceeds the execution backfill window";
+        return false;
+    }
     state.SetLightClient(std::move(next));
     if (!finalized_changed) return true;
     return AddAnchor(FinalizedAnchor(state.LightClient()->finalized_header,
@@ -461,14 +508,20 @@ bool VerifyBackfill(const bridge::BridgeExecutionBackfillV1& proof,
         error = "bridge execution backfill ancestry is invalid";
         return false;
     }
-    const auto timestamp{ExecutionHeaderTimestamp(proof.ancestry_headers.back())};
+    if (!CheckCumulativeBackfillTarget(*source, target->block_number,
+                                       error)) {
+        return false;
+    }
+    const auto timestamp{
+        ExecutionHeaderTimestamp(proof.ancestry_headers.back())};
     if (!timestamp) {
         error = "bridge execution backfill target timestamp is invalid";
         return false;
     }
     const BridgeExecutionAnchor anchor{
         target->block_number, target->block_hash, target->receipts_root,
-        source->source_finalized_beacon_slot, *timestamp, height,
+        source->source_finalized_beacon_slot,
+        source->source_finalized_execution_block, *timestamp, height,
         block_hash};
     const size_t before{delta.anchors_added.size()};
     if (!AddAnchor(anchor, state, delta.anchors_added, error)) {
@@ -491,6 +544,11 @@ bool VerifyMint(const CTransaction& tx, const bridge::BridgeMintV1& proof,
     const auto registry_id{modern::ConfiguredBridgeRegistryId(params)};
     if (!registry_id || proof.registry_id != *registry_id) {
         error = "bridge mint registry id does not match the configured registry";
+        return false;
+    }
+    if (proof.target_block_number < *configured.origin_deployment_block) {
+        error =
+            "bridge mint target precedes the configured origin deployment block";
         return false;
     }
     const bridge::LightClientStore* light_client{state.LightClient()};
@@ -519,6 +577,10 @@ bool VerifyMint(const CTransaction& tx, const bridge::BridgeMintV1& proof,
         proof.ancestry_headers)};
     if (!target) {
         error = "bridge mint execution ancestry is invalid";
+        return false;
+    }
+    if (!CheckCumulativeBackfillTarget(*anchor, target->block_number,
+                                       error)) {
         return false;
     }
     const std::vector<unsigned char> trie_key{
@@ -554,6 +616,7 @@ bool VerifyMint(const CTransaction& tx, const bridge::BridgeMintV1& proof,
         bridge::AdmitConfiguredDeposit(
             params,
             bridge::ProvenBridgeDeposit{configured.asset.origin_chain_id,
+                                        proof.target_block_number,
                                         configured.asset.vault_address, *event},
             height,
             bridge::BridgeMintBudget{state.minted_this_block, epoch_used},
@@ -607,6 +670,10 @@ bool VerifyWithdrawal(
     ScratchState& state, BridgeBlockDelta& delta,
     BridgeTxAuthorization& tx_result, std::string& error)
 {
+    if (!Consensus::BridgeWithdrawalRulesActive(height, params)) {
+        error = "bridge withdrawal rules are not active";
+        return false;
+    }
     const Consensus::BridgeAssetParams& configured{*params.busd_bridge};
     if (*configured.withdrawal_mode !=
         Consensus::BridgeWithdrawalMode::MANAGED_V1) {
@@ -658,6 +725,10 @@ bool VerifyBridgeBurn(
     BridgeBlockDelta& delta, BridgeTxAuthorization& tx_result,
     std::string& error)
 {
+    if (!Consensus::BridgeWithdrawalRulesActive(height, params)) {
+        error = "bridge withdrawal rules are not active";
+        return false;
+    }
     const Consensus::BridgeAssetParams& configured{*params.busd_bridge};
     if (*configured.withdrawal_mode !=
         Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1) {
@@ -764,7 +835,8 @@ bool VerifyBridgeTransaction(
         [&](const auto& payload) -> bool {
             using T = std::decay_t<decltype(payload)>;
             if constexpr (std::is_same_v<T, bridge::BridgeBootstrapV1>) {
-                return VerifyBootstrap(payload, height, block_hash, pins,
+                return VerifyBootstrap(payload, height, block_hash,
+                                       *params.busd_bridge,
                                        state, delta, error);
             } else if constexpr (std::is_same_v<T, bridge::BridgeUpdateV1>) {
                 return VerifyUpdate(payload, height, block_hash, pins, state,
@@ -795,6 +867,55 @@ bool VerifyBridgeTransaction(
 }
 
 } // namespace
+
+bool HasDecentralizedBridgeBurn(const CTransaction& tx)
+{
+    for (const CMpaRecord& record : tx.mpa) {
+        if (record.payload_type != bridge::BRIDGE_MPA_TYPE) continue;
+        const auto decoded{bridge::DecodeBridgeMpaRecordV1(record)};
+        if (decoded &&
+            std::holds_alternative<bridge::BridgeBurnV1>(decoded->payload)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool HasDecentralizedBridgeBurn(const CBlock& block)
+{
+    return std::any_of(
+        block.vtx.begin(), block.vtx.end(), [](const CTransactionRef& tx) {
+            return tx && HasDecentralizedBridgeBurn(*tx);
+        });
+}
+
+bool CheckBridgeBurnReadiness(const CTransaction& tx,
+                              const BridgeBurnReadiness readiness,
+                              std::string& error)
+{
+    if (!HasDecentralizedBridgeBurn(tx) ||
+        readiness == BridgeBurnReadiness::READY) {
+        return true;
+    }
+    error = readiness == BridgeBurnReadiness::UNAVAILABLE
+                ? "decentralized bridge burn readiness is unavailable"
+                : "decentralized bridge burn requires bridge-ready current and next validator sets";
+    return false;
+}
+
+bool CheckBridgeBurnReadiness(const CBlock& block,
+                              const BridgeBurnReadiness readiness,
+                              std::string& error)
+{
+    if (!HasDecentralizedBridgeBurn(block) ||
+        readiness == BridgeBurnReadiness::READY) {
+        return true;
+    }
+    error = readiness == BridgeBurnReadiness::UNAVAILABLE
+                ? "decentralized bridge burn readiness is unavailable"
+                : "decentralized bridge burn requires bridge-ready current and next validator sets";
+    return false;
+}
 
 struct BridgeBlockPreview::Impl {
     Impl(const int candidate_height, const int64_t candidate_time,
@@ -891,6 +1012,83 @@ std::optional<BridgeExecutionAnchor> BridgeStateIndex::Anchor(
                : std::optional<BridgeExecutionAnchor>{it->second};
 }
 
+std::optional<BridgeExecutionAnchor> BridgeStateIndex::AnchorForTarget(
+    const uint64_t target_block_number, const int finalized_b3_height) const
+{
+    if (finalized_b3_height < 0) return std::nullopt;
+
+    for (auto it{m_anchor_by_height.lower_bound(target_block_number)};
+         it != m_anchor_by_height.end(); ++it) {
+        const auto anchor_it{m_anchors.find(it->second)};
+        if (anchor_it == m_anchors.end()) continue;
+        const BridgeExecutionAnchor& anchor{anchor_it->second};
+        if (anchor.block_number != it->first ||
+            anchor.connected_height < 0 ||
+            anchor.connected_height > finalized_b3_height ||
+            anchor.source_finalized_execution_block < target_block_number ||
+            anchor.source_finalized_execution_block - target_block_number >
+                bridge::MAX_BRIDGE_CUMULATIVE_BACKFILL_BLOCKS) {
+            continue;
+        }
+        return anchor;
+    }
+    return std::nullopt;
+}
+
+std::optional<BridgeStateConnection> BridgeStateIndex::NullifierConnection(
+    const bridge::BridgeDepositKey& key) const
+{
+    const auto it{m_nullifier_connections.find(key)};
+    return it == m_nullifier_connections.end()
+               ? std::nullopt
+               : std::optional<BridgeStateConnection>{it->second};
+}
+
+std::optional<BridgeLightClientSnapshot>
+BridgeStateIndex::FinalizedLightClientSnapshot(
+    const int finalized_b3_height) const
+{
+    if (finalized_b3_height < 0) return std::nullopt;
+
+    const auto eligible{[finalized_b3_height](
+                            const std::optional<bridge::LightClientStore>& store,
+                            const std::optional<BridgeStateConnection>& connection)
+                            -> std::optional<BridgeLightClientSnapshot> {
+        if (!store || !connection || connection->height < 0 ||
+            connection->height > finalized_b3_height) {
+            return std::nullopt;
+        }
+        return BridgeLightClientSnapshot{*store, *connection};
+    }};
+
+    // If the current store is final, it is necessarily the newest candidate.
+    if (const auto current{eligible(m_light_client,
+                                    m_light_client_connection)}) {
+        return current;
+    }
+
+    // Every retained changing delta carries both sides of the transition.
+    // Checking newest-to-oldest therefore also recovers the exact store just
+    // before the oldest retained update without keeping another large copy.
+    for (auto it{m_history.rbegin()}; it != m_history.rend(); ++it) {
+        if (const auto after{eligible(it->light_client_after,
+                                     it->light_client_connection_after)}) {
+            return after;
+        }
+        if (const auto before{eligible(it->light_client_before,
+                                      it->light_client_connection_before)}) {
+            return before;
+        }
+    }
+
+    if (m_light_client_floor &&
+        m_light_client_floor->connection.height >= 0 &&
+        m_light_client_floor->connection.height <= finalized_b3_height) {
+        return m_light_client_floor;
+    }
+    return std::nullopt;
+}
+
 std::optional<BridgeManagedWithdrawalRequest> BridgeStateIndex::Withdrawal(
     const BridgeWithdrawalId& id) const
 {
@@ -909,6 +1107,47 @@ BridgeStateIndex::DecentralizedWithdrawal(
                ? std::nullopt
                : std::optional<BridgeDecentralizedWithdrawalRequest>{
                      it->second};
+}
+
+std::optional<BridgeDecentralizedWithdrawalRequest>
+BridgeStateIndex::DecentralizedWithdrawal(
+    const BridgeWithdrawalId& source) const
+{
+    const auto source_it{m_decentralized_withdrawal_sources.find(source)};
+    if (source_it == m_decentralized_withdrawal_sources.end()) {
+        return std::nullopt;
+    }
+    const auto withdrawal_it{
+        m_decentralized_withdrawals.find(source_it->second)};
+    if (withdrawal_it == m_decentralized_withdrawals.end() ||
+        withdrawal_it->second.transaction_id != source.transaction_id ||
+        withdrawal_it->second.burn_output_index !=
+            source.burn_output_index ||
+        withdrawal_it->second.withdrawal.withdrawal_id !=
+            source_it->second) {
+        return std::nullopt;
+    }
+    return withdrawal_it->second;
+}
+
+std::optional<std::vector<BridgeDecentralizedWithdrawalRequest>>
+BridgeStateIndex::DecentralizedWithdrawalsThrough(const int height) const
+{
+    if (height < 0 || height > m_connected_height ||
+        !m_withdrawal_roots.contains(height)) {
+        return std::nullopt;
+    }
+    std::vector<BridgeDecentralizedWithdrawalRequest> out;
+    for (const auto& [id, request] : m_decentralized_withdrawals) {
+        if (request.connected_height > height) break;
+        if (id != out.size() || request.withdrawal.withdrawal_id != id ||
+            request.withdrawal.b3_height !=
+                static_cast<uint64_t>(request.connected_height)) {
+            return std::nullopt;
+        }
+        out.push_back(request);
+    }
+    return out;
 }
 
 std::optional<uint256> BridgeStateIndex::WithdrawalRootAtHeight(
@@ -1004,6 +1243,9 @@ bool BridgeStateIndex::VerifyBlock(
     if (state.light_client_changed) {
         out.light_client_before = m_light_client;
         out.light_client_after = state.LightClientState();
+        out.light_client_connection_before = m_light_client_connection;
+        out.light_client_connection_after =
+            BridgeStateConnection{height, block_hash};
     }
     for (const auto& [key, after] : state.epoch_minted_overlay) {
         const auto prior{m_epoch_minted.find(key)};
@@ -1082,10 +1324,35 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
     const bool light_client_changed{
         delta.light_client_before.has_value() ||
         delta.light_client_after.has_value()};
+    const bool light_client_connection_changed{
+        delta.light_client_connection_before.has_value() ||
+        delta.light_client_connection_after.has_value()};
+    if (light_client_changed != light_client_connection_changed) {
+        error =
+            "bridge delta light-client connection metadata does not match store change";
+        return false;
+    }
     if (light_client_changed) {
+        const BridgeStateConnection expected{delta.height, delta.block_hash};
         if (!delta.light_client_after ||
-            !SameOptionalStore(m_light_client, delta.light_client_before)) {
+            !SameOptionalStore(m_light_client, delta.light_client_before) ||
+            SameOptionalStore(delta.light_client_before,
+                              delta.light_client_after) ||
+            delta.light_client_connection_before !=
+                m_light_client_connection ||
+            delta.light_client_connection_after != expected) {
             error = "bridge delta light-client before-state does not match";
+            return false;
+        }
+        if (delta.light_client_before &&
+            !SameLightClientHeader(
+                delta.light_client_before->finalized_header,
+                delta.light_client_after->finalized_header) &&
+            !ExecutionRangeReachable(
+                delta.light_client_after->finalized_header.execution.block_number,
+                delta.light_client_before->finalized_header.execution.block_number)) {
+            error =
+                "bridge delta light-client execution advance exceeds the backfill window";
             return false;
         }
     }
@@ -1094,6 +1361,7 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
     std::set<uint64_t> added_anchor_heights;
     for (const BridgeExecutionAnchor& anchor : delta.anchors_added) {
         if (anchor.block_hash.IsNull() || anchor.receipts_root.IsNull() ||
+            !HasValidBackfillOrigin(anchor) ||
             anchor.connected_height != delta.height ||
             anchor.connected_block != delta.block_hash ||
             m_anchors.contains(anchor.block_hash) ||
@@ -1130,7 +1398,8 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
     for (const bridge::BridgeDepositKey& nullifier :
          delta.nullifiers_added) {
         if (!listed_nullifiers.insert(nullifier).second ||
-            m_nullifiers.contains(nullifier)) {
+            m_nullifiers.contains(nullifier) ||
+            m_nullifier_connections.contains(nullifier)) {
             error = "bridge delta duplicates a deposit nullifier";
             return false;
         }
@@ -1218,6 +1487,13 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
 
     if (light_client_changed) {
         m_light_client = delta.light_client_after;
+        m_light_client_connection =
+            delta.light_client_connection_after;
+        if (!m_light_client_floor) {
+            m_light_client_floor = BridgeLightClientSnapshot{
+                *delta.light_client_after,
+                *delta.light_client_connection_after};
+        }
     }
     for (const BridgeExecutionAnchor& anchor : delta.anchors_added) {
         m_anchors.emplace(anchor.block_hash, anchor);
@@ -1226,6 +1502,9 @@ bool BridgeStateIndex::ConnectBlock(const BridgeBlockDelta& delta,
     for (const bridge::BridgeDepositKey& nullifier :
          delta.nullifiers_added) {
         m_nullifiers.insert(nullifier);
+        m_nullifier_connections.emplace(
+            nullifier,
+            BridgeStateConnection{delta.height, delta.block_hash});
     }
     for (const BridgeEpochMintChange& change : delta.epoch_mint_changes) {
         m_epoch_minted[{change.asset, change.epoch}] = change.after;
@@ -1322,7 +1601,10 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
     }
     for (auto it{delta.nullifiers_added.rbegin()};
          it != delta.nullifiers_added.rend(); ++it) {
-        if (!m_nullifiers.contains(*it)) {
+        const auto connection{m_nullifier_connections.find(*it)};
+        if (!m_nullifiers.contains(*it) ||
+            connection == m_nullifier_connections.end() ||
+            connection->second != BridgeStateConnection{height, block_hash}) {
             error = "bridge undo cannot remove its deposit nullifier";
             return false;
         }
@@ -1343,7 +1625,10 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
         delta.light_client_after.has_value()};
     if (light_client_changed) {
         if (!delta.light_client_after ||
-            !SameOptionalStore(m_light_client, delta.light_client_after)) {
+            !delta.light_client_connection_after ||
+            !SameOptionalStore(m_light_client, delta.light_client_after) ||
+            m_light_client_connection !=
+                delta.light_client_connection_after) {
             error = "bridge undo light-client after-state does not match";
             return false;
         }
@@ -1377,6 +1662,7 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
     for (auto it{delta.nullifiers_added.rbegin()};
          it != delta.nullifiers_added.rend(); ++it) {
         m_nullifiers.erase(*it);
+        m_nullifier_connections.erase(*it);
     }
     for (auto it{delta.anchors_added.rbegin()};
          it != delta.anchors_added.rend(); ++it) {
@@ -1384,7 +1670,14 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
         m_anchor_by_height.erase(it->block_number);
     }
     if (light_client_changed) {
+        if (m_light_client_floor &&
+            m_light_client_floor->connection ==
+                *delta.light_client_connection_after) {
+            m_light_client_floor.reset();
+        }
         m_light_client = delta.light_client_before;
+        m_light_client_connection =
+            delta.light_client_connection_before;
     }
     m_connected_height = delta.previous_height;
     m_connected_hash = delta.previous_block_hash;
@@ -1395,9 +1688,12 @@ bool BridgeStateIndex::DisconnectBlock(const int height,
 void BridgeStateIndex::Clear()
 {
     m_light_client.reset();
+    m_light_client_connection.reset();
+    m_light_client_floor.reset();
     m_anchors.clear();
     m_anchor_by_height.clear();
     m_nullifiers.clear();
+    m_nullifier_connections.clear();
     m_epoch_minted.clear();
     m_withdrawals.clear();
     m_decentralized_withdrawals.clear();

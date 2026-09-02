@@ -122,9 +122,15 @@ void B3AssetTests::walletAssetRecordsExposeFnAndColoredAssets()
     colored.unconfirmed = 5;
     colored.spendable = 12'000;
 
+    interfaces::WalletAssetBalance bridge;
+    bridge.asset_id = uint256::FromHex(std::string(64, '2')).value();
+    bridge.confirmed = 1'250'000;
+    bridge.spendable = 1'250'000;
+    bridge.is_bridge = true;
+
     const QList<B3AssetRecord> records{
-        B3NativeAssetSource::recordsForBalances(native, {fn, colored})};
-    QCOMPARE(records.size(), 3);
+        B3NativeAssetSource::recordsForBalances(native, {fn, colored, bridge})};
+    QCOMPARE(records.size(), 4);
     QCOMPARE(records.at(0).immature, 7'000'000'000);
     QCOMPARE(records.at(1).asset_id, asset_id);
     QCOMPARE(records.at(1).display_name, QStringLiteral("FN Coin"));
@@ -143,6 +149,13 @@ void B3AssetTests::walletAssetRecordsExposeFnAndColoredAssets()
     QCOMPARE(records.at(2).decimals, 0);
     QVERIFY(!records.at(2).metadata_known);
     QVERIFY(!records.at(2).is_fn);
+
+    QCOMPARE(records.at(3).ticker, QStringLiteral("bUSD"));
+    QCOMPARE(records.at(3).display_name, QStringLiteral("Bridged USD"));
+    QCOMPARE(records.at(3).decimals, 6);
+    QCOMPARE(records.at(3).available, 1'250'000);
+    QVERIFY(records.at(3).metadata_known);
+    QVERIFY(records.at(3).is_bridge);
 }
 
 void B3AssetTests::assetIdSearchSelectsOwnedAsset()
@@ -174,6 +187,31 @@ void B3AssetTests::assetIdSearchSelectsOwnedAsset()
     QCOMPARE(list->currentIndex().data(B3AssetTableModel::AssetIdRole).toString(), fn.asset_id);
     QCOMPARE(page.findChild<QLabel*>("assetId")->text(), QStringLiteral("Asset ID: %1").arg(fn.asset_id));
     QVERIFY(page.findChild<QLabel*>("assetStatus")->text().contains(QStringLiteral("waiting for maturity")));
+
+    page.setSource(nullptr);
+}
+
+void B3AssetTests::bridgeAssetDetailsUseBusdMetadata()
+{
+    B3AssetsPage page;
+    TestAssetSource source;
+
+    B3AssetRecord bridge;
+    bridge.asset_id = QString(64, QLatin1Char('b'));
+    bridge.ticker = QStringLiteral("bUSD");
+    bridge.display_name = QStringLiteral("Bridged USD");
+    bridge.confirmed = 1'250'000;
+    bridge.available = 1'250'000;
+    bridge.decimals = 6;
+    bridge.metadata_known = true;
+    bridge.is_bridge = true;
+    bridge.status = B3AssetRecord::Status::Active;
+    source.set({bridge});
+    page.setSource(&source);
+
+    QCOMPARE(page.model()->rowCount(), 1);
+    QVERIFY(page.findChild<QLabel*>("assetStatus")->text().contains(
+        QStringLiteral("Bridged USD")));
 
     page.setSource(nullptr);
 }

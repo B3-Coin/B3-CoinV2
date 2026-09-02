@@ -31,6 +31,7 @@
 #include <support/cleanse.h>
 #include <wallet/coincontrol.h>
 #include <wallet/receive.h>
+#include <wallet/rpc/assets.h>
 #include <wallet/rpc/flowmesh.h>
 #include <wallet/rpc/util.h>
 #include <wallet/spend.h>
@@ -48,6 +49,27 @@
 #include <vector>
 
 namespace wallet {
+
+std::optional<CMpaRecord> BuildBridgeWithdrawalMpaRecord(
+    const Consensus::BridgeWithdrawalMode mode, const uint256& registry_id,
+    const uint32_t burn_output_index, const uint64_t raw_amount,
+    const bridge::EthAddress& ethereum_recipient)
+{
+    switch (mode) {
+    case Consensus::BridgeWithdrawalMode::MANAGED_V1:
+        return bridge::MakeBridgeMpaRecord(bridge::BridgeRecordV1{
+            bridge::BridgeRecordKindV1::MANAGED_WITHDRAWAL,
+            bridge::BridgeManagedWithdrawalV1{
+                registry_id, burn_output_index, raw_amount,
+                ethereum_recipient}});
+    case Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1:
+        return bridge::MakeBridgeMpaRecord(bridge::BridgeRecordV1{
+            bridge::BridgeRecordKindV1::BRIDGE_BURN,
+            bridge::BridgeBurnV1{registry_id, burn_output_index, raw_amount,
+                                 ethereum_recipient}});
+    }
+    return std::nullopt;
+}
 
 FlowMeshDepositAdmission CheckFlowMeshDepositAdmission(
     const bool market_bootstrap, const bool flowmesh_rules_active,
@@ -698,9 +720,11 @@ static CAmount FlowMeshDepositAmount(const UniValue& value,
     return AssetUnitsFromValue(value, "amount");
 }
 
-static uint16_t AssetOwnerPolicy(const modern::AssetId& asset,
-                                 const Consensus::Params& params,
-                                 const int next_height)
+} // namespace
+
+uint16_t AssetOwnerPolicy(const modern::AssetId& asset,
+                          const Consensus::Params& params,
+                          const int next_height)
 {
     const auto fn_asset{modern::ConfiguredFnAssetId(params)};
     if (fn_asset && asset == *fn_asset) {
@@ -710,12 +734,23 @@ static uint16_t AssetOwnerPolicy(const modern::AssetId& asset,
         }
         return static_cast<uint16_t>(modern::PolicyType::FN);
     }
+    const auto bridge_asset{modern::ConfiguredBridgeAssetId(params)};
+    if (bridge_asset && asset == *bridge_asset) {
+        if (!Consensus::BridgeRulesActive(next_height, params)) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "Bridge asset transfers are not active for the next block");
+        }
+        return static_cast<uint16_t>(modern::PolicyType::OWNER);
+    }
     if (!Consensus::AssetRulesActive(next_height, params)) {
         throw JSONRPCError(RPC_MISC_ERROR,
                            "Colored assets are not active for the next block");
     }
     return static_cast<uint16_t>(modern::PolicyType::OWNER);
 }
+
+namespace {
 
 static const Consensus::BridgeAssetParams& RequireBridgeForNextBlock(
     const int next_height)
@@ -1855,12 +1890,17 @@ RPCHelpMan bridgewithdraw()
 {
     return RPCHelpMan{
         "bridgewithdraw",
-        "Burn exact integer bUSD units and create a managed-v1 Ethereum USDT "
-        "release request for one nonzero 20-byte Ethereum recipient. The burn "
-        "and recipient are bound together by the canonical type-10 record and "
-        "its signed B3MC policy-9 output. The operator may release reserves only "
-        "after this request is confirmed under the published managed-v1 rules. "
-        "No OP_RETURN is used.\n" +
+        "Burn exact integer bUSD units and create the Ethereum USDT release "
+        "request selected by the pinned bridge mode. In decentralized mode the "
+        "request is a BRIDGE_BURN leaf and consensus first requires the current "
+        "and next B3 validator sets to meet the Ethereum verifier thresholds. "
+        "Its final withdrawal id and leaf are assigned only when a block "
+        "confirms it. Use the returned proof RPC command after confirmation; "
+        "it resolves the stable transaction id and burn output against the "
+        "active chain. "
+        "In managed mode it remains a managed-v1 operator request. The burn and "
+        "recipient are bound together by the canonical type-10 record and its "
+        "signed B3MC policy-9 output. No OP_RETURN is used.\n" +
             HELP_REQUIRING_PASSPHRASE,
         {
             {"amount", RPCArg::Type::NUM, RPCArg::Optional::NO,
@@ -1881,14 +1921,16 @@ RPCHelpMan bridgewithdraw()
                   "Allow unsafe wallet inputs"},
              }},
         },
-        AssetTransactionResult("Created managed bridge withdrawal request", {
+        AssetTransactionResult("Created bridge withdrawal request", {
             {RPCResult::Type::STR_HEX, "asset_id", "Configured chain-bound bUSD asset id"},
             {RPCResult::Type::NUM, "amount", "Integer bUSD units burned"},
             {RPCResult::Type::NUM, "asset_change", "Integer bUSD units returned to this wallet"},
             {RPCResult::Type::STR_HEX, "ethereum_recipient", "Bound Ethereum recipient"},
             {RPCResult::Type::NUM, "burn_vout", "Exact bUSD BURN output index"},
             {RPCResult::Type::NUM, "binding_vout", "Signed B3MC bridge binding output index"},
-            {RPCResult::Type::STR, "withdrawal_mode", "managed-v1"},
+            {RPCResult::Type::STR, "withdrawal_mode", "managed-v1 or decentralized-verifier-v1"},
+            {RPCResult::Type::STR, "withdrawal_status", /*optional=*/true, "pending-confirmation for a new decentralized burn"},
+            {RPCResult::Type::STR, "proof_rpc_after_confirmation", /*optional=*/true, "Copyable authoritative proof lookup using txid and burn_vout"},
         }),
         RPCExamples{HelpExampleCli(
             "bridgewithdraw", "1000000 \"0x00112233445566778899aabbccddeeff00112233\"")},
@@ -1906,26 +1948,24 @@ RPCHelpMan bridgewithdraw()
             const ChainSnapshot snapshot{SnapshotChainState(*wallet, false)};
             const Consensus::BridgeAssetParams& bridge_params{
                 RequireBridgeForNextBlock(snapshot.next_height)};
-            if (*bridge_params.withdrawal_mode !=
-                Consensus::BridgeWithdrawalMode::MANAGED_V1) {
+            const Consensus::BridgeWithdrawalMode withdrawal_mode{
+                *bridge_params.withdrawal_mode};
+            const Consensus::Params& params{Params().GetConsensus()};
+            if (!Consensus::BridgeWithdrawalRulesActive(snapshot.next_height,
+                                                        params)) {
                 throw JSONRPCError(
                     RPC_MISC_ERROR,
-                    "Managed-v1 bridge withdrawals are not enabled");
+                    "Bridge withdrawals are disabled for the next block");
             }
-            const Consensus::Params& params{Params().GetConsensus()};
             const auto asset{modern::ConfiguredBridgeAssetId(params)};
             const auto registry{modern::ConfiguredBridgeRegistryId(params)};
             if (!asset || !registry) {
                 throw JSONRPCError(RPC_MISC_ERROR,
                                    "The active bridge identity is unavailable");
             }
-            const bridge::BridgeManagedWithdrawalV1 withdrawal{
-                *registry, /*burn_output_index=*/0,
-                static_cast<uint64_t>(amount), ethereum_recipient};
-            const auto record{bridge::MakeBridgeMpaRecord(
-                bridge::BridgeRecordV1{
-                    bridge::BridgeRecordKindV1::MANAGED_WITHDRAWAL,
-                    withdrawal})};
+            const auto record{BuildBridgeWithdrawalMpaRecord(
+                withdrawal_mode, *registry, /*burn_output_index=*/0,
+                static_cast<uint64_t>(amount), ethereum_recipient)};
             if (!record) {
                 throw JSONRPCError(RPC_INTERNAL_ERROR,
                                    "Unable to encode the withdrawal record");
@@ -1980,26 +2020,75 @@ RPCHelpMan bridgewithdraw()
 
             const node::BridgeTxAuthorization authorization{
                 PrevalidateBridgeTransaction(*wallet, *created.tx, snapshot)};
-            if (authorization.mint || !authorization.withdrawal ||
-                authorization.withdrawal->burn_output_index != 0 ||
-                authorization.withdrawal->asset != *asset ||
-                authorization.withdrawal->amount != amount ||
-                authorization.withdrawal->ethereum_recipient !=
-                    ethereum_recipient) {
+            const bool decentralized{
+                withdrawal_mode == Consensus::BridgeWithdrawalMode::
+                                       DECENTRALIZED_VERIFIER_V1};
+            const auto decentralized_leaf{
+                authorization.decentralized_withdrawal
+                    ? modern::BridgeWithdrawalLeafV1(
+                          authorization.decentralized_withdrawal->withdrawal)
+                    : std::nullopt};
+            if (authorization.mint ||
+                (decentralized &&
+                 (authorization.withdrawal ||
+                  !authorization.decentralized_withdrawal ||
+                  authorization.decentralized_withdrawal->burn_output_index !=
+                      0 ||
+                  authorization.decentralized_withdrawal->withdrawal.asset_id !=
+                      *asset ||
+                  authorization.decentralized_withdrawal->withdrawal
+                          .origin_chain_id !=
+                      bridge_params.asset.origin_chain_id ||
+                  authorization.decentralized_withdrawal->withdrawal
+                          .origin_token !=
+                      bridge_params.asset.token_address ||
+                  authorization.decentralized_withdrawal->withdrawal.amount !=
+                      amount ||
+                  authorization.decentralized_withdrawal->withdrawal.recipient !=
+                      ethereum_recipient ||
+                  authorization.decentralized_withdrawal->withdrawal.b3_height !=
+                      static_cast<uint64_t>(snapshot.next_height) ||
+                  authorization.decentralized_withdrawal->transaction_id !=
+                      created.tx->GetHash() ||
+                  !decentralized_leaf ||
+                  *decentralized_leaf !=
+                      authorization.decentralized_withdrawal->leaf)) ||
+                (!decentralized &&
+                 (authorization.decentralized_withdrawal ||
+                  !authorization.withdrawal ||
+                  authorization.withdrawal->burn_output_index != 0 ||
+                  authorization.withdrawal->asset != *asset ||
+                  authorization.withdrawal->amount != amount ||
+                  authorization.withdrawal->ethereum_recipient !=
+                      ethereum_recipient))) {
                 throw JSONRPCError(
                     RPC_VERIFY_REJECTED,
                     "Bridge prevalidation did not authorize the exact withdrawal burn and recipient");
             }
             UniValue result{FinishAssetTransaction(
                 request, *wallet, created, options, snapshot, false,
-                /*disintegration=*/0, "bridge-managed-withdrawal")};
+                /*disintegration=*/0,
+                decentralized ? "bridge-decentralized-withdrawal"
+                              : "bridge-managed-withdrawal")};
             result.pushKV("asset_id", asset->GetHex());
             result.pushKV("amount", amount);
             result.pushKV("asset_change", asset_change);
             result.pushKV("ethereum_recipient", HexStr(ethereum_recipient));
             result.pushKV("burn_vout", 0);
             result.pushKV("binding_vout", 1);
-            result.pushKV("withdrawal_mode", "managed-v1");
+            result.pushKV("withdrawal_mode",
+                          decentralized ? "decentralized-verifier-v1"
+                                        : "managed-v1");
+            if (authorization.decentralized_withdrawal) {
+                result.pushKV("withdrawal_status", "pending-confirmation");
+                result.pushKV(
+                    "proof_rpc_after_confirmation",
+                    "getbridgewithdrawalproof " +
+                        created.tx->GetHash().GetHex() + " " +
+                        std::to_string(authorization
+                                           .decentralized_withdrawal
+                                           ->burn_output_index));
+            }
             return result;
         }};
 }

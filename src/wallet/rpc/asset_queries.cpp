@@ -8,6 +8,7 @@
 #include <key_io.h>
 #include <modern/asset_output.h>
 #include <modern/asset_validation.h>
+#include <modern/bridge_asset.h>
 #include <modern/policy.h>
 #include <rpc/util.h>
 #include <script/script.h>
@@ -30,6 +31,7 @@ namespace {
 struct WalletAssetBucket {
     modern::AssetId asset_id;
     bool is_fn{false};
+    bool is_bridge{false};
     CAmount confirmed{0};
     CAmount unconfirmed{0};
     CAmount spendable{0};
@@ -42,8 +44,8 @@ RPCHelpMan getwalletassets()
 {
     return RPCHelpMan{
         "getwalletassets",
-        "Return this wallet's unspent, trusted post-transition FN Coin and simple-v1 asset outputs.\n"
-        "Asset amounts are exact integer base units; FN Coin has zero decimals.\n",
+        "Return this wallet's unspent, trusted post-transition FN Coin, simple-v1, and configured bridge-asset outputs.\n"
+        "Asset amounts are exact integer base units; FN Coin has zero decimals and bUSD has six.\n",
         {
             {"asset_id", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Only return this 32-byte asset id"},
             {"minconf", RPCArg::Type::NUM, RPCArg::Default{0}, "Minimum confirmations"},
@@ -53,7 +55,9 @@ RPCHelpMan getwalletassets()
             {RPCResult::Type::ARR, "assets", "Wallet asset balances and UTXOs", {
                 {RPCResult::Type::OBJ, "", "", {
                     {RPCResult::Type::STR_HEX, "asset_id", "Asset identifier"},
-                    {RPCResult::Type::STR, "kind", "fn or colored"},
+                    {RPCResult::Type::STR, "kind", "fn, bridge, or colored"},
+                    {RPCResult::Type::STR, "ticker", "Known ticker, or empty when metadata is unavailable"},
+                    {RPCResult::Type::NUM, "decimals", "Configured display decimals; zero when metadata is unavailable"},
                     {RPCResult::Type::NUM, "confirmed", "Confirmed unspent amount"},
                     {RPCResult::Type::NUM, "unconfirmed", "Unconfirmed unspent amount"},
                     {RPCResult::Type::NUM, "spendable", "Amount currently mature, safe, unlocked, and signable by this wallet"},
@@ -109,6 +113,8 @@ RPCHelpMan getwalletassets()
             const Consensus::Params& consensus{Params().GetConsensus()};
             const std::optional<modern::AssetId> fn_asset{
                 modern::ConfiguredFnAssetId(consensus)};
+            const std::optional<modern::AssetId> bridge_asset{
+                modern::ConfiguredDecentralizedBridgeAssetId(consensus)};
             std::map<modern::AssetId, WalletAssetBucket> buckets;
             std::set<Txid> trusted_parents;
 
@@ -143,9 +149,12 @@ RPCHelpMan getwalletassets()
                 if (filter && parsed->asset != *filter) continue;
 
                 const bool is_fn{fn_asset && parsed->asset == *fn_asset};
+                const bool is_bridge{
+                    bridge_asset && parsed->asset == *bridge_asset};
                 WalletAssetBucket& bucket{buckets.try_emplace(
                     parsed->asset,
-                    WalletAssetBucket{parsed->asset, is_fn, 0, 0, 0, {}})
+                    WalletAssetBucket{parsed->asset, is_fn, is_bridge,
+                                      0, 0, 0, {}})
                                                 .first->second};
 
                 const bool mature{!wallet->IsTxImmatureCoinBase(wtx)};
@@ -186,7 +195,14 @@ RPCHelpMan getwalletassets()
             for (auto& [asset_id, bucket] : buckets) {
                 UniValue entry{UniValue::VOBJ};
                 entry.pushKV("asset_id", asset_id.GetHex());
-                entry.pushKV("kind", bucket.is_fn ? "fn" : "colored");
+                entry.pushKV("kind", bucket.is_fn
+                                         ? "fn"
+                                         : (bucket.is_bridge ? "bridge"
+                                                             : "colored"));
+                entry.pushKV("ticker", bucket.is_fn
+                                           ? "FN"
+                                           : (bucket.is_bridge ? "bUSD" : ""));
+                entry.pushKV("decimals", bucket.is_bridge ? 6 : 0);
                 entry.pushKV("confirmed", bucket.confirmed);
                 entry.pushKV("unconfirmed", bucket.unconfirmed);
                 entry.pushKV("spendable", bucket.spendable);

@@ -12,7 +12,8 @@ runs b3-bridge-ethcheck, which performs every verification step in C++:
 
 Usage:
   eth_live_test.py <workdir>                         smoke test (latest block)
-  eth_live_test.py <workdir> --tx 0x.. --vault 0x..  prove a REAL vault deposit
+  eth_live_test.py <workdir> --tx 0x.. --vault 0x.. --token 0x..
+                                                     prove a REAL vault deposit
                                                      (tx must be finalized; the
                                                      driver builds the exec-header
                                                      ancestry chain to its block)
@@ -99,7 +100,10 @@ def main():
     ap.add_argument("--rpc", default="https://ethereum-rpc.publicnode.com")
     ap.add_argument("--tx", help="transaction hash of a vault deposit to prove")
     ap.add_argument("--vault", help="B3DepositVault address (checks Deposit extraction)")
+    ap.add_argument("--token", help="exact configured ERC-20 token address")
     args = ap.parse_args()
+    if bool(args.vault) != bool(args.token):
+        ap.error("--vault and --token must be supplied together")
     import os
     os.makedirs(args.workdir, exist_ok=True)
 
@@ -201,6 +205,7 @@ def main():
         proof_obj["exec_chain"] = exec_chain
     if args.vault:
         proof_obj["vault"] = args.vault
+        proof_obj["token"] = args.token
         proof_obj["expect_deposits"] = 1
     save("receipt_proof.json", proof_obj)
 

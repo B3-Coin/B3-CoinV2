@@ -124,6 +124,13 @@ struct FinalityStatus {
     std::optional<int> pin_height;
     uint256 pin_hash{};
     uint64_t pool_checkpoints{0};
+    // ---- one-time Ethereum bridge bootstrap handoff --------------------
+    // Retained after M because this is public consensus data and the
+    // Ethereum deployment window need not match B3's certificate window.
+    std::optional<int> bootstrap_snapshot_height;
+    uint256 bootstrap_snapshot_hash{};
+    uint256 bootstrap_set_hash{};
+    std::vector<unsigned char> bootstrap_set_header;
     // ---- per-validator (present when a validator key was given) ----
     bool bound{false};
     bool revoked{false};

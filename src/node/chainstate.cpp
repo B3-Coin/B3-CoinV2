@@ -270,10 +270,42 @@ ChainstateLoadResult VerifyLoadedChainstate(ChainstateManager& chainman, const C
     // remains and every future connection uses this implementation.
     const std::optional<int> legacy_final_height{
         Consensus::LegacyFinalHeight(chainman.GetConsensus())};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
     std::vector<CCoinsViewDB*> schema_dbs_to_mark;
 
     for (auto& chainstate : chainman.m_chainstates) {
         const CBlockIndex* tip{chainstate->m_chain.Tip()};
+
+        // Check every configured modern checkpoint against the loaded active
+        // chain on every startup. This is deliberately independent of the
+        // validation-schema marker: that marker can have been written by a
+        // release which predates a newly hardened checkpoint, so it cannot
+        // attest the identity of an already-connected ancestor.
+        if (tip) {
+            for (const auto& [checkpoint_height, checkpoint_hash] :
+                 consensus.modern_checkpoints) {
+                if (checkpoint_height < 0) {
+                    return {ChainstateLoadStatus::FAILURE,
+                            strprintf(_("The B3 release contains an invalid hardened modern checkpoint height %d. Startup stopped before using the chainstate; install a corrected release before continuing."),
+                                      checkpoint_height)};
+                }
+                if (checkpoint_height > tip->nHeight) break;
+                if (Consensus::GetB3Era(checkpoint_height, consensus) !=
+                    Consensus::B3Era::MODERN) {
+                    continue;
+                }
+
+                const CBlockIndex* active_checkpoint{
+                    chainstate->m_chain[checkpoint_height]};
+                if (!active_checkpoint ||
+                    active_checkpoint->GetBlockHash() != checkpoint_hash) {
+                    return {ChainstateLoadStatus::FAILURE,
+                            strprintf(_("The active B3 chain does not match the hardened modern checkpoint at height %d. Startup stopped before using this chainstate. Restart with -reindex-chainstate to rebuild against the pinned chain; if the canonical block is not available locally, restart with -reindex to rebuild and download the block history."),
+                                      checkpoint_height)};
+                }
+            }
+        }
+
         const bool off_anchor_tip{
             tip && chainman.m_blockman.IsAnchorIneligible(*tip)};
         bool needs_schema_check{
