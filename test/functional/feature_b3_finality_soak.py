@@ -80,7 +80,9 @@ class B3FinalitySoakTest(BitcoinTestFramework):
         assert_equal(n0.getblockcount(), 135)
         for st in (self.finality(n) for n in self.nodes):
             assert_equal(st['configured'], True)
+            assert_equal(st['active'], False)
             assert_equal(st['bootstrapped'], False)
+            assert 'set0_preview' not in st
 
         self.log.info("Funding the other three validators")
         for i in range(1, 4):
@@ -110,6 +112,25 @@ class B3FinalitySoakTest(BitcoinTestFramework):
         self.log.info("Corridor to M-1; stakes mature 20 blocks after creation")
         self.mine_corridor(160 - n0.getblockcount(), addr0)
         assert_equal(n0.getblockcount(), 160)
+        set0_hash = None
+        for n in self.nodes:
+            st = self.finality(n)
+            assert_equal(st['active'], False)
+            assert_equal(st['bootstrapped'], False)
+            preview = st['set0_preview']
+            assert_equal(preview['snapshot_height'], M - 1)
+            assert_equal(preview['activation_height'], M)
+            assert_equal(preview['ready'], True)
+            # The scaled modern-regtest profile deliberately uses a floor of
+            # one; mainnet's separately pinned floor is two.
+            assert_equal(preview['minimum_size'], 1)
+            assert_equal(preview['size'], 4)
+            assert_equal(preview['total_weight'], 31)
+            assert_equal(preview['quorum_weight'], 21)
+            if set0_hash is None:
+                set0_hash = preview['set_hash']
+            else:
+                assert_equal(preview['set_hash'], set0_hash)
 
         self.log.info("startstaking on all nodes: finality signers armed")
         for n in self.nodes:
@@ -128,9 +149,12 @@ class B3FinalitySoakTest(BitcoinTestFramework):
             return True
         self.wait_until(lambda: finalized_at_least(M + 5), timeout=240)
         st = self.finality(n0)
+        assert_equal(st['active'], True)
+        assert 'set0_preview' not in st
         assert_equal(st['validator_set']['size'], 4)
         assert_equal(st['validator_set']['total_weight'], 31)
         assert_equal(st['validator_set']['quorum_weight'], 21)  # > any single validator (max 15)
+        assert_equal(st['validator_set']['set_hash'], set0_hash)
         assert_greater_than_or_equal(st['pin']['height'], M + 5)
 
         self.log.info("Epoch rotation with a certified handover (E = 30)")

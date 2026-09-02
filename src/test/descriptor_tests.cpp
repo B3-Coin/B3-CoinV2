@@ -2,9 +2,11 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <chainparams.h>
 #include <pubkey.h>
 #include <script/descriptor.h>
 #include <script/sign.h>
+#include <test/util/key_io.h>
 #include <test/util/setup_common.h>
 #include <util/check.h>
 #include <util/strencodings.h>
@@ -26,11 +28,14 @@ void CheckUnparsable(const std::string& prv, const std::string& pub, const std::
 {
     FlatSigningProvider keys_priv, keys_pub;
     std::string error;
-    auto parse_priv = Parse(prv, keys_priv, error);
-    auto parse_pub = Parse(pub, keys_pub, error);
-    BOOST_CHECK_MESSAGE(parse_priv.empty(), prv);
-    BOOST_CHECK_MESSAGE(parse_pub.empty(), pub);
-    BOOST_CHECK_EQUAL(error, expected_error);
+    const std::string translated_prv{test::TranslateBitcoinMainWIFs(prv, Params())};
+    const std::string translated_pub{test::TranslateBitcoinMainWIFs(pub, Params())};
+    const std::string translated_error{test::TranslateBitcoinMainWIFs(expected_error, Params())};
+    auto parse_priv = Parse(translated_prv, keys_priv, error);
+    auto parse_pub = Parse(translated_pub, keys_pub, error);
+    BOOST_CHECK_MESSAGE(parse_priv.empty(), translated_prv);
+    BOOST_CHECK_MESSAGE(parse_pub.empty(), translated_pub);
+    BOOST_CHECK_EQUAL(error, translated_error);
 }
 
 /** Check that the script is inferred as non-standard */
@@ -175,6 +180,11 @@ void DoCheck(std::string prv, std::string pub, const std::string& norm_pub, int 
              std::map<std::vector<uint8_t>, std::vector<uint8_t>> preimages={},
              std::optional<std::string> expected_prv = std::nullopt, std::optional<std::string> expected_pub = std::nullopt, int desc_index = 0)
 {
+    prv = test::TranslateBitcoinMainWIFs(std::move(prv), Params());
+    pub = test::TranslateBitcoinMainWIFs(std::move(pub), Params());
+    if (expected_prv) {
+        expected_prv = test::TranslateBitcoinMainWIFs(std::move(*expected_prv), Params());
+    }
     FlatSigningProvider keys_priv, keys_pub;
     std::set<std::vector<uint32_t>> left_paths = paths;
     std::string error;
@@ -579,10 +589,15 @@ void CheckInferDescriptor(const std::string& script_hex, const std::string& expe
         }
     }
 
-    std::string checksum{GetDescriptorChecksum(expected_desc)};
+    std::string translated_expected{expected_desc};
+    if (translated_expected.starts_with("addr(") && translated_expected.ends_with(')')) {
+        const std::string encoded{translated_expected.substr(5, translated_expected.size() - 6)};
+        translated_expected = "addr(" + test::TranslateBitcoinMainKeyIO(encoded, Params()) + ")";
+    }
+    std::string checksum{GetDescriptorChecksum(translated_expected)};
 
     std::unique_ptr<Descriptor> desc = InferDescriptor(script, provider);
-    BOOST_CHECK_EQUAL(desc->ToString(), expected_desc + "#" + checksum);
+    BOOST_CHECK_EQUAL(desc->ToString(), translated_expected + "#" + checksum);
 }
 
 }

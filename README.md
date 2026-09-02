@@ -24,7 +24,8 @@ derives.
 ## Development process
 
 Development branches are built and tested regularly, but are not guaranteed to
-be stable. Release branches and signed tags identify reviewed releases.
+be stable. Release branches and version tags identify reviewed releases. Check
+each release's notes for its exact signature and checksum guarantees.
 
 The contribution workflow is described in
 [CONTRIBUTING.md](CONTRIBUTING.md), and useful guidance is available in

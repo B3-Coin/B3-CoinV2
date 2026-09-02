@@ -19,7 +19,7 @@ import time
 from decimal import Decimal
 
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
 CORRIDOR_END = 130
@@ -331,19 +331,30 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
         assert_equal(n0.getblockcount(), A2 - 1)
         assert_equal(A1, A2 - 1)
 
-        self.log.info("A2: bind four FN seats and bootstrap TEST_ASSET first")
+        self.log.info("A2: bind four FN seats and explicitly bootstrap TEST_ASSET")
         issued = n0.issueasset(TEST_ASSET_SUPPLY, 2)
         asset_id = issued["asset_id"]
         seats = [node.bindflowmeshseat() for node in self.nodes]
         assert_equal(len({seat["seat_id"] for seat in seats}), 4)
         assert_equal(len({seat["bls_pubkey"] for seat in seats}), 4)
 
-        asset_deposit = n0.flowmeshdeposit(
+        assert_raises_rpc_error(
+            -1,
+            "FlowMesh user deposits are not active",
+            n0.flowmeshdeposit,
             asset_id,
             asset_id,
             TEST_ASSET_DEPOSIT,
             {"minconf": 0, "include_unsafe": True},
         )
+        asset_deposit = n0.flowmeshdeposit(
+            asset_id,
+            asset_id,
+            TEST_ASSET_DEPOSIT,
+            {"minconf": 0, "include_unsafe": True,
+             "market_bootstrap": True},
+        )
+        assert_equal(asset_deposit["market_bootstrap"], True)
         market_id = asset_deposit["market_id"]
         vault_id = asset_deposit["vault_id"]
         self.synchronize_mempools()
@@ -352,17 +363,29 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
         assert_equal(self.wallet_asset(n0, asset_id)["confirmed"],
                      TEST_ASSET_SUPPLY - TEST_ASSET_DEPOSIT)
 
+        assert_raises_rpc_error(
+            -8,
+            "already established",
+            n0.flowmeshdeposit,
+            asset_id,
+            asset_id,
+            1,
+            {"market_bootstrap": True},
+        )
+
         for node in self.nodes:
             started = node.startflowmeshvalidator()
             assert_equal(started["running"], True)
             assert_equal(started["armed_keys"], 1)
 
-        self.log.info("Native B3 joins only after the colored-first market fact")
-        native_deposit = n1.flowmeshdeposit(asset_id, "B3", B3_DEPOSIT)
-        assert_equal(native_deposit["market_id"], market_id)
-        assert_equal(native_deposit["vault_id"], vault_id)
-        self.synchronize_mempools()
-        self.mine_pos_blocks(1)
+        assert_raises_rpc_error(
+            -1,
+            "FlowMesh user deposits are not active",
+            n1.flowmeshdeposit,
+            asset_id,
+            "B3",
+            B3_DEPOSIT,
+        )
 
         self.log.info("A3: four-seat P2P quorum certifies and anchors sequence zero")
         self.mine_pos_blocks(A3 - n0.getblockcount())
@@ -404,6 +427,14 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
                 status["error"],
                 "FlowMesh service is below its activation height",
             )
+        assert_raises_rpc_error(
+            -1,
+            "FlowMesh market is paused; user deposits are refused",
+            n1.flowmeshdeposit,
+            asset_id,
+            "B3",
+            B3_DEPOSIT,
+        )
         for node, node_invalidated in zip(self.nodes, invalidated):
             for block_hash in node_invalidated:
                 node.reconsiderblock(block_hash)
@@ -411,6 +442,16 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
         for node in self.nodes:
             node.syncwithvalidationinterfacequeue()
             assert_equal(node.getblockcount(), active_height)
+        self.wait_for_market_convergence(market_id)
+
+        self.log.info("Unpaused A3 runtime admits B3, then anchors it 30 deep")
+        native_deposit = n1.flowmeshdeposit(asset_id, "B3", B3_DEPOSIT)
+        assert_equal(native_deposit["market_bootstrap"], False)
+        assert_equal(native_deposit["market_id"], market_id)
+        assert_equal(native_deposit["vault_id"], vault_id)
+        self.synchronize_mempools()
+        self.mine_pos_blocks(1)
+        self.mine_pos_blocks(30)
         self.wait_for_market_convergence(market_id)
 
         self.log.info("Both 30-deep deposits are certified and checkpointed")

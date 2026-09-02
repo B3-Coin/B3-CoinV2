@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.source_version.outputs.version }}
+      source_version: ${{ steps.source_version.outputs.source_version }}
       prerelease: ${{ steps.source_version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
@@ -72,11 +73,56 @@ jobs:
             fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_version=$source_version" >> "$GITHUB_OUTPUT"
           if (( rc > 0 )) || [[ -n "$prerelease" ]]; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
           else
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
+
+  release-tests:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkgconf python3 \
+            libevent-dev libboost-dev libsqlite3-dev capnproto libcapnp-dev \
+            qt6-base-dev qt6-tools-dev qt6-l10n-tools libqrencode-dev
+      - name: Configure exact-source release tests
+        run: >-
+          cmake -B build-test -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_GUI=ON -DBUILD_TESTS=ON -DBUILD_GUI_TESTS=ON
+          -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF
+      - name: Build test and functional-test programs
+        run: >-
+          cmake --build build-test -j"$(nproc)" --target
+          test_bitcoin test_bitcoin-qt b3coind b3coin-cli
+      - name: Verify tested source version
+        run: >-
+          build-test/bin/b3coind -nosettings -version |
+          grep -F "version v${{ needs.version.outputs.source_version }}"
+      - name: Run complete node and wallet unit suite
+        run: >-
+          build-test/bin/test_bitcoin
+          --log_level=error --report_level=detailed
+      - name: Run full Qt suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: build-test/bin/test_bitcoin-qt
+      - name: Run transition functional gate
+        run: >-
+          python3 build-test/test/functional/test_runner.py
+          --jobs=2 --failfast --combinedlogslen=1000
+          wallet_fn_genesis_rescan.py
+          wallet_importlegacywalletdump.py
+          wallet_importprunedfunds.py
+          feature_b3_finality_mempool.py
+          feature_b3_finality_soak.py
+          feature_flowmesh_release.py
 
   linux-x86_64:
     needs: version
@@ -97,7 +143,7 @@ jobs:
           -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON
       - name: Build
         # Release packaging compiles only the programs that ship to users.
-        # Tests remain available through the manually triggered CI workflow.
+        # The release-tests job qualifies the exact same source revision.
         run: >-
           cmake --build build -j"$(nproc)" --target
           b3coin-qt b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
@@ -276,8 +322,9 @@ jobs:
             -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON \
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
-          # Release packaging builds only the programs shipped to users. Test
-          # binaries and suites remain in the separately triggered CI workflow.
+          # deploy creates the dependency-bundled GUI app. The raw CLI targets
+          # are compile checks only: Homebrew-linked binaries are not portable
+          # release artifacts.
           cmake --build build -j4 --target deploy b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
       - name: Verify unsigned app bundle
         run: |
@@ -332,6 +379,8 @@ jobs:
       - name: Package
         run: |
           mkdir -p out
+          # The macOS release is the bundled GUI app only and requires macOS
+          # 15.0 or newer, as verified from every Mach-O file above.
           cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-arm64.zip
           (cd out && shasum -a 256 *.zip > SHA256SUMS.macos-arm64)
       - uses: actions/upload-artifact@v4
@@ -357,8 +406,9 @@ jobs:
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)" \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
-          # Release packaging builds only the programs shipped to users. Test
-          # binaries and suites remain in the separately triggered CI workflow.
+          # deploy creates the dependency-bundled GUI app. The raw CLI targets
+          # are compile checks only: Homebrew-linked binaries are not portable
+          # release artifacts.
           cmake --build build -j4 --target deploy b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
       - name: Verify unsigned app bundle
         run: |
@@ -413,6 +463,8 @@ jobs:
       - name: Package
         run: |
           mkdir -p out
+          # The macOS release is the bundled GUI app only and requires macOS
+          # 15.0 or newer, as verified from every Mach-O file above.
           cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-x86_64.zip
           (cd out && shasum -a 256 *.zip > SHA256SUMS.macos-x86_64)
       - uses: actions/upload-artifact@v4
@@ -422,7 +474,7 @@ jobs:
 
   publish:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [version, linux-x86_64, linux-x86_64-static, windows-cross, macos-arm64, macos-x86_64]
+    needs: [version, release-tests, linux-x86_64, linux-x86_64-static, windows-cross, macos-arm64, macos-x86_64]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -461,20 +513,14 @@ jobs:
               --json isDraft --jq .isDraft)
             asset_count=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
               --json assets --jq '.assets | length')
+            if [[ "$is_draft" != "true" ]]; then
+              echo "Refusing to overwrite an existing published release" >&2
+              exit 1
+            fi
             if (( asset_count != 0 )); then
-              if [[ "$GITHUB_REF_NAME" != "v1.1.0-beta.2" ]]; then
-                echo "Refusing to overwrite a release that already has uploaded assets" >&2
-                exit 1
-              fi
-              # Owner-authorized beta.2 transition hotfix rebuild. Keep the
-              # old complete release available until every replacement job has
-              # succeeded, then remove only this tag's old assets immediately
-              # before the new complete set is uploaded.
-              if [[ "$is_draft" != "true" ]]; then
-                gh release edit "$GITHUB_REF_NAME" \
-                  --repo "$GITHUB_REPOSITORY" --verify-tag --draft=true
-                is_draft=true
-              fi
+              # A cancelled upload can leave a private draft with a partial
+              # asset set. Delete only that draft's assets and retry the whole
+              # upload; published releases remain immutable.
               mapfile -t existing_assets < <(
                 gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
                   --json assets --jq '.assets[].name'
@@ -483,20 +529,6 @@ jobs:
                 gh release delete-asset "$GITHUB_REF_NAME" "$asset" \
                   --repo "$GITHUB_REPOSITORY" --yes
               done
-            fi
-            # v1.0.0 already exists as the published, assetless release-candidate
-            # page. Beta.2 has one owner-authorized in-place hotfix rebuild;
-            # every other published tag remains immutable.
-            if [[ "$is_draft" != "true" && "$GITHUB_REF_NAME" != "v1.0.0" && \
-                  "$GITHUB_REF_NAME" != "v1.1.0-beta.2" ]]; then
-              echo "Refusing to overwrite an existing published release" >&2
-              exit 1
-            fi
-            if [[ "$is_draft" != "true" ]]; then
-              # Hide the assetless candidate while the complete final asset set
-              # uploads. Any failure leaves a draft, never a partial public release.
-              gh release edit "$GITHUB_REF_NAME" \
-                --repo "$GITHUB_REPOSITORY" --verify-tag --draft=true
             fi
             gh release upload "$GITHUB_REF_NAME" release-assets/* \
               --repo "$GITHUB_REPOSITORY"

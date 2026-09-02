@@ -275,6 +275,152 @@ construction.
 
 ## 4. Implemented release surface and required verification
 
+### Mandatory data-directory migration
+
+`CDiskBlockIndex` contains appended, unversioned B3 transition fields. A node
+whose data directory was written by the legacy client or an incompatible
+pre-transition build must perform one full `-reindex` on first transition-line
+startup. Current transition-beta indexes already use this layout and must not
+be needlessly rebuilt during the short corridor. Full reindex reuses the raw
+block files and rebuilds both the block index and chainstate;
+`-reindex-chainstate` is not sufficient for an incompatible index. Release
+notes, operator checks, and the startup error must give this exact distinction.
+
+The repaired release has a separate one-time chainstate safety gate. If the
+current transition-beta block index and coins database already contain blocks
+after H, startup must level-4 disconnect/reconnect every block H+1 through the
+coins tip under the current `ConnectBlock` rules and synchronously write a
+versioned marker into that coins database only after all pass. The marker value
+must equal the exact `DB_BEST_BLOCK`; patched `BatchWrite` advances both in one
+atomic database batch. It must fail closed on missing/pruned data, insufficient
+cache, interruption, validation failure, or marker-write failure. A
+fresh/pre-H database, or a chainstate that this same patched binary has just
+wiped for rebuild, may be marked immediately because no old post-H state
+remains. This check must never be described as requiring a full reindex of a
+compatible transition-beta database. If an older binary advances or replaces
+the chainstate, its marker is absent/stale on return and the check runs again.
+One migration exception is an old active tip which is now provably off the
+pinned X branch. Startup first revokes any pre-pin marker, verifies that the
+block and undo data are readable, and uses the existing undo records to unwind
+it to the anchor before selecting the canonical branch. Canonical blocks
+connected by that recovery pass use the repaired `ConnectBlock` rules; the next
+startup (or an explicit verification pass) then performs the full post-H
+reconnect and writes a new marker. An on-anchor invalid tip is never given this
+exception and must stop startup.
+Mainnet publishes no AssumeUTXO snapshot. Any future post-H snapshot support
+must carry an explicit B3 validation commitment; until then such a snapshot is
+unsupported rather than eligible to inherit this marker.
+
+After the rebuild, a wallet owning a historical FN recipient key must discover
+the block-810,001 output. Test both an ordinary rescan and a BASIC-filter-index
+rescan; post-H B3A1 carrier blocks may not be skipped using only the embedded
+owner suffix. The operator fallback is `rescanblockchain 810001`.
+
+### Mandatory live STAKE/asset-owner scan
+
+Beta.3 makes P2SH, witness, and nested B3-policy owner suffixes invalid in a
+B3S1 STAKE carrier. B3A1 asset owners also reject any nested B3 policy carrier.
+P2SH and witness are special only when they are the complete authorization
+script; an extra carrier layer can prevent their intended key check from
+running. The built-in Stake page and `createstake` use safe legacy P2PKH, and
+FN Genesis uses ruled P2PKH owners, but the corridor was already live when this
+audit fix was made. Before tagging, run the following against a fully
+synchronized node and require `unsafe=0`. Any unsafe result means an
+already-confirmed block would disagree with beta.3 and the release must stop
+for an explicit compatibility decision.
+
+```python
+import json
+import subprocess
+
+def cli(*args):
+    raw = subprocess.check_output(["b3coin-cli", *map(str, args)], text=True)
+    return json.loads(raw)
+
+def first_push(raw):
+    if not raw:
+        return None
+    opcode = raw[0]
+    cursor = 1
+    if opcode <= 75:
+        size = opcode
+    elif opcode == 76 and len(raw) >= 2:
+        size, cursor = raw[1], 2
+    elif opcode == 77 and len(raw) >= 3:
+        size, cursor = int.from_bytes(raw[1:3], "little"), 3
+    elif opcode == 78 and len(raw) >= 5:
+        size, cursor = int.from_bytes(raw[1:5], "little"), 5
+    else:
+        return None
+    end = cursor + size
+    if end > len(raw):
+        return None
+    return raw[cursor:end], end
+
+def carrier(raw):
+    pushed = first_push(raw)
+    if pushed is None:
+        return None
+    payload, end = pushed
+    if end >= len(raw) or raw[end] != 0x75:  # OP_DROP
+        return None
+    return payload, raw[end + 1:]
+
+MAGICS = (b"B3A1", b"B3S1", b"B3MC")
+
+def claims_b3_carrier(raw):
+    pushed = first_push(raw)
+    return pushed is not None and pushed[0][:4] in MAGICS
+
+def claims_asset_carrier(raw):
+    if claims_b3_carrier(raw) and first_push(raw)[0][:4] == b"B3A1":
+        return True
+    return raw[:1] == b"\x6a" and claims_b3_carrier(raw[1:]) \
+        and first_push(raw[1:])[0][:4] == b"B3A1"
+
+tip = cli("getblockcount")
+stake_count = 0
+asset_count = 0
+unsafe = []
+for height in range(810001, tip + 1):
+    block = cli("getblock", cli("getblockhash", height), 2)
+    for tx in block["tx"]:
+        for output in tx["vout"]:
+            raw = bytes.fromhex(output["scriptPubKey"]["hex"])
+            parsed = carrier(raw)
+            if parsed is None:
+                continue
+            payload, owner = parsed
+            if payload[:4] == b"B3S1" and len(payload) == 38:
+                stake_count += 1
+                p2sh = len(owner) == 23 and owner[:2] == b"\xa9\x14" and owner[-1] == 0x87
+                witness = (
+                    4 <= len(owner) <= 42
+                    and (owner[0] == 0 or 0x51 <= owner[0] <= 0x60)
+                    and 2 <= owner[1] <= 40
+                    and len(owner) == owner[1] + 2
+                )
+                if p2sh or witness or claims_b3_carrier(owner):
+                    unsafe.append((height, tx["txid"], output["n"], "stake", owner.hex()))
+            elif payload[:4] == b"B3A1":
+                asset_count += 1
+                # OP_FALSE is the exact keyless BURN/vault terminator (and is
+                # harmless as a bare owner). Direct P2SH/witness asset owners
+                # are safe because B3A1 explicitly unwraps one owner layer.
+                if owner != b"\x00" and (
+                    claims_b3_carrier(owner) or claims_asset_carrier(owner)
+                ):
+                    unsafe.append((height, tx["txid"], output["n"], "asset", owner.hex()))
+
+print(
+    f"tip={tip} stake_outputs={stake_count} asset_outputs={asset_count} "
+    f"unsafe={len(unsafe)}"
+)
+for item in unsafe:
+    print(item)
+raise SystemExit(bool(unsafe))
+```
+
 The branch contains the production wiring below. Before tagging, review it and
 require passing tests for:
 
@@ -323,9 +469,9 @@ type/version registry entries 1 and 2 remain permanently inactive and rejected,
 so previously assigned bytes can never acquire a new meaning.
 
 Confirm `CLIENT_VERSION_MAJOR/MINOR/BUILD` remains `1/1/0`. For the current
-operator beta, `CLIENT_VERSION_PRERELEASE` must be `beta.2` and
-`doc/release-notes-v1.1.0-beta.2.md` must be present. Preserve the beta.1 notes
-as the historical record of that release. Before the final release,
+operator beta, `CLIENT_VERSION_PRERELEASE` must be `beta.3` and
+`doc/release-notes-v1.1.0-beta.3.md` must be present. Preserve the beta.1 and
+beta.2 notes as historical records of those releases. Before the final release,
 clear `CLIENT_VERSION_PRERELEASE` and confirm
 `doc/release-notes-v1.1.0.md` remains present and accurate. Flip the guard tests from
 the fail-closed pre-pin shape to exact value-by-value assertions for X, R0,
@@ -366,7 +512,7 @@ statuses. Any unexplained divergence stops the release.
 
 1. Commit and review the measured pins and production wiring.
 2. Complete the full local build, mandatory suites, and shadow-fork gate.
-3. To publish the current operator beta, tag `v1.1.0-beta.2`, push the release branch
+3. To publish the current operator beta, tag `v1.1.0-beta.3`, push the release branch
    and tag, and let CI build all five package variants, including the static
    headless Linux operator package and Windows x86-64. Win32 is deferred from
    this automated release; any later upload must be built from the exact tag,

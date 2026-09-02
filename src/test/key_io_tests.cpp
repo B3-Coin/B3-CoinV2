@@ -9,6 +9,7 @@
 #include <key_io.h>
 #include <script/script.h>
 #include <test/util/json.h>
+#include <test/util/key_io.h>
 #include <test/util/setup_common.h>
 #include <univalue.h>
 #include <util/chaintype.h>
@@ -39,7 +40,11 @@ BOOST_AUTO_TEST_CASE(key_io_valid_parse)
         const std::vector<std::byte> exp_payload{ParseHex<std::byte>(test[1].get_str())};
         const UniValue &metadata = test[2].get_obj();
         bool isPrivkey = metadata.find_value("isPrivkey").get_bool();
-        SelectParams(ChainTypeFromString(metadata.find_value("chain").get_str()).value());
+        const ChainType chain{ChainTypeFromString(metadata.find_value("chain").get_str()).value()};
+        SelectParams(chain);
+        if (chain == ChainType::MAIN) {
+            exp_base58string = ::test::TranslateBitcoinMainKeyIO(exp_base58string, Params());
+        }
         bool try_case_flip = metadata.find_value("tryCaseFlip").isNull() ? false : metadata.find_value("tryCaseFlip").get_bool();
         if (isPrivkey) {
             bool isCompressed = metadata.find_value("isCompressed").get_bool();
@@ -98,7 +103,11 @@ BOOST_AUTO_TEST_CASE(key_io_valid_gen)
         std::vector<unsigned char> exp_payload = ParseHex(test[1].get_str());
         const UniValue &metadata = test[2].get_obj();
         bool isPrivkey = metadata.find_value("isPrivkey").get_bool();
-        SelectParams(ChainTypeFromString(metadata.find_value("chain").get_str()).value());
+        const ChainType chain{ChainTypeFromString(metadata.find_value("chain").get_str()).value()};
+        SelectParams(chain);
+        if (chain == ChainType::MAIN) {
+            exp_base58string = ::test::TranslateBitcoinMainKeyIO(exp_base58string, Params());
+        }
         if (isPrivkey) {
             bool isCompressed = metadata.find_value("isCompressed").get_bool();
             CKey key;

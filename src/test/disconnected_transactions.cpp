@@ -16,7 +16,10 @@ BOOST_AUTO_TEST_CASE(disconnectpool_memory_limits)
     // transactions would realistically be in a block together, they just need distinct txids and
     // uniform size for this test to work.
     std::vector<CTransactionRef> block_vtx(m_coinbase_txns);
-    BOOST_CHECK_EQUAL(block_vtx.size(), 100);
+    // B3 coinbase maturity is 30 blocks (rather than Bitcoin's 100), so this
+    // fixture contains 30 distinct, uniform transactions. The memory-limit
+    // behavior under test does not depend on that consensus constant.
+    BOOST_REQUIRE_GT(block_vtx.size(), 1);
 
     // Roughly estimate sizes to sanity check that DisconnectedBlockTransactions::DynamicMemoryUsage
     // is within an expected range.
@@ -25,8 +28,8 @@ BOOST_AUTO_TEST_CASE(disconnectpool_memory_limits)
     std::unordered_map<Txid, CTransaction*, SaltedTxidHasher> temp_map;
     temp_map.reserve(1);
     const size_t MAP_1{memusage::DynamicUsage(temp_map)};
-    temp_map.reserve(100);
-    const size_t MAP_100{memusage::DynamicUsage(temp_map)};
+    temp_map.reserve(block_vtx.size());
+    const size_t MAP_ALL{memusage::DynamicUsage(temp_map)};
 
     const size_t TX_USAGE{RecursiveDynamicUsage(block_vtx.front())};
     for (const auto& tx : block_vtx)
@@ -63,11 +66,11 @@ BOOST_AUTO_TEST_CASE(disconnectpool_memory_limits)
     // Record usage so we can check size limiting in the next test.
     size_t usage_full{0};
     {
-        const size_t USAGE_100_OVERESTIMATE{MAP_100 + ENTRY_USAGE_ESTIMATE * 100};
-        DisconnectedBlockTransactions disconnectpool{USAGE_100_OVERESTIMATE};
+        const size_t USAGE_ALL_OVERESTIMATE{MAP_ALL + ENTRY_USAGE_ESTIMATE * block_vtx.size()};
+        DisconnectedBlockTransactions disconnectpool{USAGE_ALL_OVERESTIMATE};
         auto evicted_txns{disconnectpool.AddTransactionsFromBlock(block_vtx)};
         BOOST_CHECK_EQUAL(evicted_txns.size(), 0);
-        BOOST_CHECK(disconnectpool.DynamicMemoryUsage() <= USAGE_100_OVERESTIMATE);
+        BOOST_CHECK(disconnectpool.DynamicMemoryUsage() <= USAGE_ALL_OVERESTIMATE);
 
         usage_full = disconnectpool.DynamicMemoryUsage();
 

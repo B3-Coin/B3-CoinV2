@@ -46,6 +46,10 @@ Wallet RPCs include `getassetstate`, `getwalletassets`, `issueasset`,
 - FN holders bind seats during the A2 preparation window. At least four active
   seats are required for a market; otherwise that market pauses safely without
   stopping the B3 chain.
+- Ordinary user deposits are refused before A3 and whenever the matching
+  market runtime is unavailable or paused. At A2, only an explicit
+  `market_bootstrap` request may create the first colored deposit needed to
+  establish a new market; B3 cannot use this bootstrap exception.
 - A changed seat set takes control only after the outgoing set's exact handoff
   checkpoint is itself 30 blocks deep. A shallow reorg can therefore republish
   the handoff without stranding either committee.
@@ -114,9 +118,46 @@ without a duplicate mint claim, and the new vault/verifier/identity pins.
 
 ## Upgrade safety
 
+Four confirmed BLS bindings do not bootstrap Modern PoS by themselves. At
+least two independently controlled bound validators must each have an unspent
+stake of at least 333 B3 included by height 810,980, so it is active in the
+block-811,000 Set0 snapshot. At height 811,000,
+`getfinalitystatus.set0_preview.ready` must be true before block 811,001 is
+attempted. Bootstrap operators must not spend or revoke these stakes until a
+qualifying successor set is in force.
+
 Back up `wallet.dat` and shut down the old client cleanly before upgrading.
 The release uses the existing B3 datadir and supports legacy wallet import and
-rescan. Verify every downloaded package against the published SHA-256 sums.
+rescan. A data directory written by the legacy client or an incompatible
+pre-transition build needs one full **`-reindex`** (`b3coind -reindex` or
+`b3coin-qt -reindex`). Do not substitute `-reindex-chainstate`: the transition
+release must rebuild the unversioned block index as well as chainstate. Current
+transition-beta indexes do not need a reindex solely for this update. Existing
+block files are reused, but the rebuild can take time.
+
+For an existing transition-beta chainstate already past height 810,000, first
+startup performs a mandatory one-time level-4 reconnect of only blocks
+810,001 through the current tip under the repaired consensus checks. It writes
+its versioned marker only after success; this is not a full reindex. Startup
+fails safely if those blocks are pruned/missing, the cache cannot complete the
+pass, or a block fails the repaired rules. The marker is tied to each coins
+database's exact best block and advances atomically with patched writes; an
+older beta advancing or rebuilding that database makes it stale, so returning
+to this release safely repeats the check.
+
+If an old transition-beta database is actively following a branch now proven
+to be off pinned X, the first startup with this release revokes any old pre-pin
+marker and safely unwinds that branch using its stored undo data. The canonical
+branch is connected under the repaired rules; restart once more to complete the
+full post-H pass and write a new marker. This narrow recovery does not apply to
+an invalid tip on the pinned-X branch, which stops startup.
+
+The Qt Assets page lists wallet-owned FN and colored assets and allows lookup
+by a pasted asset id. A historical FN Coin is initially shown as confirmed but
+immature because it was created in the block-810,001 coinbase. If a legacy key
+was imported but its FN output is absent after the upgrade is fully synced, run
+`rescanblockchain 810001` once in that wallet. Verify every downloaded package
+against the published SHA-256 sums.
 
 The seal packet now contains independently verified X and R0, the byte-identical
 3,592-row FN manifest (root
