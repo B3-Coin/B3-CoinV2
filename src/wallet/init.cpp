@@ -97,11 +97,11 @@ bool WalletInit::ParameterInteraction() const
         LogInfo("Parameter interaction: -blocksonly=1 -> setting -walletbroadcast=0");
     }
 
-    // B3: SegWit is NOT active on the legacy chain, so a witness-program
-    // output (bech32/bech32m) is anyone-can-spend under today's consensus.
-    // Until the segwit activation question is settled post-H, the wallet
-    // both DEFAULTS to legacy P2PKH addresses and REFUSES an explicit
-    // witness address type -- receiving to one would put funds at risk.
+    // B3 does not currently activate SegWit. Modern script verification
+    // recognizes witness programs, but a proper witness-bearing spend cannot
+    // be included while block witness commitments remain disabled. Default to
+    // legacy P2PKH and refuse an explicit witness address type so the wallet
+    // does not create funds it cannot safely spend in a valid block.
     if (Params().GetConsensus().legacy_b3coin) {
         for (const char* opt : {"-addresstype", "-changetype"}) {
             const std::string val{gArgs.GetArg(opt, "")};
@@ -110,9 +110,8 @@ bool WalletInit::ParameterInteraction() const
                 LogInfo("Parameter interaction: B3 legacy consensus -> setting %s=legacy", opt);
             } else if (val != "legacy") {
                 return InitError(strprintf(
-                    _("%s=%s is not available on B3: SegWit outputs are unprotected "
-                      "(anyone-can-spend) under the legacy consensus rules. Use "
-                      "%s=legacy."),
+                    _("%s=%s is not available: B3 witness addresses are not "
+                      "active in this release. Use %s=legacy."),
                     opt, val, opt));
             }
         }

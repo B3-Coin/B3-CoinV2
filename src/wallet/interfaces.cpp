@@ -4,10 +4,13 @@
 
 #include <interfaces/wallet.h>
 
+#include <chainparams.h>
 #include <common/args.h>
 #include <consensus/amount.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
+#include <modern/asset_output.h>
+#include <modern/asset_validation.h>
 #include <node/types.h>
 #include <policy/fees/block_policy_estimator.h>
 #include <primitives/transaction.h>
@@ -26,10 +29,13 @@
 #include <wallet/load.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/wallet.h>
+#include <wallet/scriptpubkeyman.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
 
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,6 +47,7 @@ using interfaces::Handler;
 using interfaces::MakeSignalHandler;
 using interfaces::Wallet;
 using interfaces::WalletAddress;
+using interfaces::WalletAssetBalance;
 using interfaces::WalletBalances;
 using interfaces::WalletLoader;
 using interfaces::WalletMigrationResult;
@@ -58,6 +65,8 @@ namespace {
 WalletTx MakeWalletTx(CWallet& wallet, const CWalletTx& wtx)
 {
     LOCK(wallet.cs_wallet);
+    const AssetSigningContext asset_context{
+        AssetSigningContextForWalletTransaction(wtx)};
     WalletTx result;
     result.tx = wtx.tx;
     result.txin_is_mine.reserve(wtx.tx->vin.size());
@@ -68,10 +77,14 @@ WalletTx MakeWalletTx(CWallet& wallet, const CWalletTx& wtx)
     result.txout_address.reserve(wtx.tx->vout.size());
     result.txout_address_is_mine.reserve(wtx.tx->vout.size());
     for (const auto& txout : wtx.tx->vout) {
-        result.txout_is_mine.emplace_back(wallet.IsMine(txout));
-        result.txout_is_change.push_back(OutputIsChange(wallet, txout));
+        const CScript reporting_script{
+            OutputScriptForWalletContext(txout, asset_context)};
+        result.txout_is_mine.emplace_back(
+            wallet.IsMine(txout, asset_context));
+        result.txout_is_change.push_back(
+            ScriptIsChange(wallet, reporting_script));
         result.txout_address.emplace_back();
-        result.txout_address_is_mine.emplace_back(ExtractDestination(txout.scriptPubKey, result.txout_address.back()) ?
+        result.txout_address_is_mine.emplace_back(ExtractDestination(reporting_script, result.txout_address.back()) ?
                                                       wallet.IsMine(result.txout_address.back()) :
                                                       false);
     }
@@ -128,6 +141,66 @@ WalletTxOut MakeWalletTxOut(const CWallet& wallet,
     result.time = output.time;
     result.depth_in_main_chain = output.depth;
     result.is_spent = wallet.IsSpent(output.outpoint);
+    return result;
+}
+
+std::vector<WalletAssetBalance> GetWalletAssetBalances(const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    const std::optional<modern::AssetId> fn_asset{
+        modern::ConfiguredFnAssetId(Params().GetConsensus())};
+    std::map<modern::AssetId, WalletAssetBalance> balances;
+    std::set<Txid> trusted_parents;
+
+    for (const auto& [outpoint, txo] : wallet.GetTXOs()) {
+        const CWalletTx& wtx{txo.GetWalletTx()};
+        if (wallet.IsSpent(outpoint)) continue;
+
+        const int depth{wallet.GetTxDepthInMainChain(wtx)};
+        if (depth < 0 || (depth == 0 && !wtx.InMempool())) continue;
+
+        bool safe{CachedTxIsTrusted(wallet, wtx, trusted_parents)};
+        if (depth == 0 &&
+            (wtx.mapValue.contains("replaces_txid") ||
+             wtx.mapValue.contains("replaced_by_txid"))) {
+            safe = false;
+        }
+        if (!safe || AssetSigningContextForWalletTransaction(wtx) !=
+                         AssetSigningContext::OWNER_SUFFIX) {
+            continue;
+        }
+
+        const CTxOut& output{txo.GetTxOut()};
+        const std::optional<modern::ModernOutput> parsed{
+            modern::ParseAssetOutput(output)};
+        const std::optional<CScript> owner_script{
+            modern::AssetOwnerScript(output)};
+        if (!parsed || !owner_script) continue;
+
+        const bool is_fn{fn_asset && parsed->asset == *fn_asset};
+        WalletAssetBalance& balance{balances.try_emplace(
+            parsed->asset,
+            WalletAssetBalance{.asset_id = parsed->asset, .is_fn = is_fn})
+                                         .first->second};
+
+        const bool mature{!wallet.IsTxImmatureCoinBase(wtx)};
+        const bool spendable{mature && !wallet.IsLockedCoin(outpoint) &&
+                             WalletCanSpendScriptNow(wallet, *owner_script)};
+
+        if (depth > 0) {
+            balance.confirmed += parsed->amount;
+            if (!mature) balance.immature += parsed->amount;
+        } else {
+            balance.unconfirmed += parsed->amount;
+        }
+        if (spendable) balance.spendable += parsed->amount;
+    }
+
+    std::vector<WalletAssetBalance> result;
+    result.reserve(balances.size());
+    for (auto& item : balances) {
+        result.push_back(std::move(item.second));
+    }
     return result;
 }
 
@@ -381,6 +454,18 @@ public:
         result.unconfirmed_balance = bal.m_mine_untrusted_pending;
         result.immature_balance = bal.m_mine_immature;
         return result;
+    }
+    std::vector<WalletAssetBalance> getAssetBalances() override
+    {
+        LOCK(m_wallet->cs_wallet);
+        return GetWalletAssetBalances(*m_wallet);
+    }
+    bool tryGetAssetBalances(std::vector<WalletAssetBalance>& balances) override
+    {
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet) return false;
+        balances = GetWalletAssetBalances(*m_wallet);
+        return true;
     }
     bool tryGetBalances(WalletBalances& balances, uint256& block_hash) override
     {

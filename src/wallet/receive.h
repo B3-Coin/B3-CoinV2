@@ -19,6 +19,39 @@ bool AllInputsMine(const CWallet& wallet, const CTransaction& tx);
 CAmount OutputGetCredit(const CWallet& wallet, const CTxOut& txout);
 CAmount TxGetCredit(const CWallet& wallet, const CTransaction& tx);
 
+/**
+ * Return the script whose key/address owns an output in a provenance-aware
+ * wallet context. B3A1 asset carriers unwrap only where consensus provenance
+ * allows it, so pre-H B3A1 lookalikes remain full scripts. A well-formed B3S1
+ * STAKE carrier always unwraps: even under legacy Script rules its leading
+ * payload is dropped before the owner suffix executes.
+ */
+CScript OutputScriptForWalletContext(const CTxOut& txout,
+                                     AssetSigningContext asset_context);
+
+/**
+ * Return whether this wallet can presently satisfy an exact authorization
+ * script. Unlike ScriptPubKeyMan::HavePrivateKeys(), this checks the keys
+ * needed by this particular script and therefore handles watch-only and
+ * threshold descriptors correctly. Encrypted wallets must be unlocked.
+ */
+bool WalletCanSignScript(const CWallet& wallet, const CScript& script)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/**
+ * Return whether spending this authorization script requires witness data
+ * which current B3 consensus cannot include. The provider-aware check also
+ * detects P2SH-wrapped witness programs.
+ */
+bool ScriptRequiresInactiveB3Witness(const CWallet& wallet,
+                                     const CScript& authorization_script)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/** Return whether the wallet can sign and currently confirm this script. */
+bool WalletCanSpendScriptNow(const CWallet& wallet,
+                             const CScript& authorization_script)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
 bool ScriptIsChange(const CWallet& wallet, const CScript& script) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 bool OutputIsChange(const CWallet& wallet, const CTxOut& txout) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 CAmount OutputGetChange(const CWallet& wallet, const CTxOut& txout) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);

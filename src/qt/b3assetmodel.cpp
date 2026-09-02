@@ -18,15 +18,32 @@ B3NativeAssetSource::B3NativeAssetSource(WalletModel* wallet_model, QObject* par
       m_wallet_model{wallet_model}
 {
     if (m_wallet_model) {
-        connect(m_wallet_model, &WalletModel::balanceChanged, this, &B3AssetSource::assetsChanged);
+        connect(m_wallet_model, &WalletModel::balanceChanged,
+                this, &B3AssetSource::assetsChanged);
+        connect(m_wallet_model, &WalletModel::assetBalancesChanged,
+                this, &B3AssetSource::assetsChanged);
+        connect(m_wallet_model, &QObject::destroyed, this, [this] {
+            m_wallet_model = nullptr;
+            Q_EMIT assetsChanged();
+        });
     }
 }
 
 QList<B3AssetRecord> B3NativeAssetSource::assets() const
 {
-    if (!m_wallet_model) return {};
+    WalletModel* const wallet_model{m_wallet_model.data()};
+    if (!wallet_model) return {};
 
-    const interfaces::WalletBalances balances = m_wallet_model->getCachedBalance();
+    return recordsForBalances(wallet_model->getCachedBalance(),
+                              wallet_model->getCachedAssetBalances());
+}
+
+QList<B3AssetRecord> B3NativeAssetSource::recordsForBalances(
+    const interfaces::WalletBalances& balances,
+    const std::vector<interfaces::WalletAssetBalance>& asset_balances)
+{
+    QList<B3AssetRecord> records;
+
     B3AssetRecord native;
     native.asset_id = QStringLiteral("native");
     native.ticker = QStringLiteral("B3");
@@ -34,6 +51,7 @@ QList<B3AssetRecord> B3NativeAssetSource::assets() const
     native.confirmed = balances.balance;
     native.pending = balances.unconfirmed_balance;
     native.available = balances.balance;
+    native.immature = balances.immature_balance;
     // No FlowMesh or reservation backend exists in this build; the flags
     // make the UI say so instead of showing a made-up zero.
     native.reserved = 0;
@@ -44,7 +62,38 @@ QList<B3AssetRecord> B3NativeAssetSource::assets() const
     native.decimals = 9;
     native.metadata_known = true;
     native.status = B3AssetRecord::Status::Native;
-    return {native};
+    records.push_back(native);
+
+    for (const interfaces::WalletAssetBalance& balance : asset_balances) {
+        B3AssetRecord asset;
+        asset.asset_id = QString::fromStdString(balance.asset_id.GetHex());
+        asset.confirmed = balance.confirmed;
+        asset.pending = balance.unconfirmed;
+        asset.available = balance.spendable;
+        asset.immature = balance.immature;
+        asset.reserved_available = false;
+        asset.flowmesh_available = false;
+        asset.is_fn = balance.is_fn;
+        asset.status = B3AssetRecord::Status::Active;
+
+        if (asset.is_fn) {
+            asset.ticker = QStringLiteral("FN");
+            asset.display_name = tr("FN Coin");
+            asset.decimals = 0;
+            asset.metadata_known = true;
+        } else {
+            // Simple-v1 outputs do not repeat their genesis metadata. Until
+            // a metadata registry is available, show exact raw units and a
+            // short id rather than inventing a ticker or precision.
+            asset.ticker = asset.asset_id.left(8).toUpper();
+            asset.display_name = tr("Unknown asset");
+            asset.decimals = 0;
+            asset.metadata_known = false;
+        }
+        records.push_back(std::move(asset));
+    }
+
+    return records;
 }
 
 B3AssetTableModel::B3AssetTableModel(QObject* parent)
@@ -104,6 +153,12 @@ QVariant B3AssetTableModel::data(const QModelIndex& index, int role) const
             return formatAmount(record.available, record.decimals);
         }
     }
+    if (role == SearchRole) {
+        const QString name{record.metadata_known ? record.display_name : tr("Unknown asset")};
+        return QString{name + QLatin1Char(' ') + record.ticker + QLatin1Char(' ') +
+                       record.asset_id};
+    }
+    if (role == AssetIdRole) return record.asset_id;
     if (role == Qt::TextAlignmentRole && index.column() == Available) {
         return QVariant{Qt::AlignRight | Qt::AlignVCenter};
     }

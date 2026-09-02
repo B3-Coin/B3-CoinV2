@@ -36,16 +36,6 @@ struct WalletAssetBucket {
     std::vector<UniValue> utxos;
 };
 
-bool WalletCanSignScript(const CWallet& wallet, const CScript& script)
-    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
-{
-    if (wallet.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) return true;
-    for (const ScriptPubKeyMan* spk_man : wallet.GetScriptPubKeyMans(script)) {
-        if (spk_man->HavePrivateKeys()) return true;
-    }
-    return false;
-}
-
 } // namespace
 
 RPCHelpMan getwalletassets()
@@ -160,8 +150,10 @@ RPCHelpMan getwalletassets()
 
                 const bool mature{!wallet->IsTxImmatureCoinBase(wtx)};
                 const bool locked{wallet->IsLockedCoin(outpoint)};
-                const bool signable{WalletCanSignScript(*wallet, *owner_script)};
-                const bool spendable{safe && mature && !locked && signable};
+                const bool currently_spendable{
+                    WalletCanSpendScriptNow(*wallet, *owner_script)};
+                const bool spendable{
+                    safe && mature && !locked && currently_spendable};
 
                 if (depth > 0) {
                     bucket.confirmed += parsed->amount;

@@ -4,6 +4,7 @@
 
 #include <chain.h>
 #include <clientversion.h>
+#include <consensus/era.h>
 #include <core_io.h>
 #include <hash.h>
 #include <interfaces/chain.h>
@@ -91,7 +92,13 @@ RPCHelpMan importprunedfunds()
     unsigned int txnIndex = vIndex[it - vMatch.begin()];
 
     CTransactionRef tx_ref = MakeTransactionRef(tx);
-    if (pwallet->IsMine(*tx_ref)) {
+    const std::optional<int> legacy_final_height{
+        Consensus::LegacyFinalHeight(Params().GetConsensus())};
+    const AssetSigningContext asset_context{
+        legacy_final_height && height > *legacy_final_height
+            ? AssetSigningContext::OWNER_SUFFIX
+            : AssetSigningContext::FULL_SCRIPT};
+    if (pwallet->IsMine(*tx_ref, asset_context)) {
         pwallet->AddToWallet(std::move(tx_ref), TxStateConfirmed{block_hash, height, static_cast<int>(txnIndex)});
         return UniValue::VNULL;
     }

@@ -17,6 +17,7 @@
 #include <primitives/transaction.h>
 #include <primitives/transaction_identifier.h>
 #include <script/script.h>
+#include <script/sign.h>
 #include <script/signingprovider.h>
 #include <script/solver.h>
 #include <util/check.h>
@@ -361,6 +362,22 @@ util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoin
             }
 
             txout = *out;
+        }
+
+        const CScript authorization_script{
+            WalletInputAuthorizationScript(&wallet, outpoint, txout)};
+        const bool external_witness{
+            Params().GetConsensus().legacy_b3coin &&
+            IsSegWitOutput(coin_control.m_external_provider,
+                           authorization_script,
+                           AssetSigningContext::FULL_SCRIPT)};
+        if (ScriptRequiresInactiveB3Witness(wallet,
+                                            authorization_script) ||
+            external_witness) {
+            return util::Error{strprintf(
+                _("Cannot spend pre-selected input %s: B3 witness addresses are "
+                  "not active in this release. Select a legacy-owned input."),
+                outpoint.ToString())};
         }
 
         if (input_bytes == -1) {
@@ -1185,6 +1202,32 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
             return util::Error{_("Cannot determine the active chain height; refusing to construct a transaction.")};
         }
         const int next_height{*tip_height + 1};
+
+        // A direct witness destination cannot be spent safely by this B3
+        // release. Post-H script checks require its witness authorization,
+        // while block validation still rejects witness-bearing blocks because
+        // the SegWit deployment is inactive. Apply this to every B3 era.
+        for (const auto& recipient : vecSend) {
+            int witness_version{0};
+            std::vector<unsigned char> witness_program;
+            if (GetScriptForDestination(recipient.dest)
+                    .IsWitnessProgram(witness_version, witness_program)) {
+                return util::Error{_(
+                    "B3 witness addresses are not active in this release. "
+                    "Use a legacy recipient address.")};
+            }
+        }
+        if (!std::holds_alternative<CNoDestination>(coin_control.destChange)) {
+            int witness_version{0};
+            std::vector<unsigned char> witness_program;
+            if (GetScriptForDestination(coin_control.destChange)
+                    .IsWitnessProgram(witness_version, witness_program)) {
+                return util::Error{_(
+                    "B3 witness addresses are not active in this release. "
+                    "Use a legacy change address.")};
+            }
+        }
+
         if (Consensus::GetB3Era(next_height, Params().GetConsensus()) == Consensus::B3Era::LEGACY) {
             if (!modern_options.mpa.empty() ||
                 modern_options.native_disintegration != 0) {
@@ -1193,32 +1236,15 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
             txNew.m_legacy_encoding = true;
             txNew.nTime = static_cast<uint32_t>(GetTime());
             txNew.version = 1;
-            // Paying a witness program in the legacy era would hand the
-            // recipient an anyone-can-spend output. Refuse outright -- and
-            // apply the same rule to an EXPLICIT change destination
-            // (coin_control.destChange bypasses the address-handout guard).
-            for (const auto& recipient : vecSend) {
-                int wver{0};
-                std::vector<unsigned char> wprog;
-                if (GetScriptForDestination(recipient.dest).IsWitnessProgram(wver, wprog)) {
-                    return util::Error{_("Refusing to pay a SegWit/Taproot address: witness "
-                                         "outputs are unprotected (anyone-can-spend) under the "
-                                         "legacy B3 consensus rules.")};
-                }
-            }
             if (!std::holds_alternative<CNoDestination>(coin_control.destChange)) {
                 // FAIL CLOSED: only a plain P2PKH change destination is
-                // acceptable in the legacy era. A bare witness program is
-                // anyone-can-spend, and a P2SH address is OPAQUE -- it may
-                // wrap a witness script (P2SH-SegWit), which becomes
-                // anyone-can-spend the moment its redeem script is revealed.
-                // Change belongs to this wallet; restricting an explicit
-                // override to the one provably safe type costs nothing.
+                // acceptable in the legacy era. A P2SH address is opaque and
+                // may wrap a witness program whose authorization is not active
+                // there. Change belongs to this wallet, so restricting an
+                // explicit override to the provably safe type costs nothing.
                 if (!std::holds_alternative<PKHash>(coin_control.destChange)) {
                     return util::Error{_("Refusing this change address: only a legacy (P2PKH) "
-                                         "change destination is safe under the legacy B3 "
-                                         "consensus rules (witness and P2SH-wrapped outputs "
-                                         "are unprotected).")};
+                                         "change destination is safe in the legacy B3 era.")};
                 }
             }
         }
@@ -1245,13 +1271,13 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
 
     CAmount recipients_sum = 0;
     OutputType change_type = wallet.TransactionChangeType(coin_control.m_change_type ? *coin_control.m_change_type : wallet.m_default_change_type, vecSend);
-    // B3 legacy era: an EXPLICIT change_type reaches ReserveDestination
-    // without passing the address-handout guard. A witness change output
-    // would be anyone-can-spend under legacy consensus -- refuse it here,
-    // at the last resolution point before reservation.
-    if (txNew.m_legacy_encoding && change_type != OutputType::LEGACY) {
-        return util::Error{_("Refusing a SegWit/Taproot change type: witness outputs are "
-                             "unprotected (anyone-can-spend) under the legacy B3 consensus rules.")};
+    // An explicit change_type reaches ReserveDestination without passing the
+    // address-handout guard. Enforce the B3 policy at the last resolution
+    // point before a key is reserved.
+    if (Params().GetConsensus().legacy_b3coin &&
+        change_type != OutputType::LEGACY) {
+        return util::Error{_("B3 witness addresses are not active in this "
+                             "release. Use a legacy change type.")};
     }
     ReserveDestination reservedest(&wallet, change_type);
     unsigned int outputs_to_subtract_fee_from = 0; // The number of outputs which we are subtracting the fee from
@@ -1400,8 +1426,29 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     // Fetch wallet available coins if "other inputs" are
     // allowed (coins automatically selected by the wallet)
     CoinsResult available_coins;
+    CAmount unavailable_witness_amount{0};
     if (coin_control.m_allow_other_inputs) {
         available_coins = AvailableCoins(wallet, &coin_control, coin_selection_params.m_effective_feerate);
+
+        // Keep old witness-owned outputs visible in wallet history and coin
+        // control, but never choose them automatically while this B3 release
+        // cannot confirm their witness authorization. Users who explicitly
+        // select one receive the precise FetchSelectedInputs error above.
+        if (Params().GetConsensus().legacy_b3coin) {
+            std::unordered_set<COutPoint, SaltedOutpointHasher> unavailable;
+            for (const COutput& coin : available_coins.All()) {
+                const CScript authorization_script{
+                    WalletInputAuthorizationScript(
+                        &wallet, coin.outpoint, coin.txout)};
+                if (!ScriptRequiresInactiveB3Witness(
+                        wallet, authorization_script)) {
+                    continue;
+                }
+                unavailable.insert(coin.outpoint);
+                unavailable_witness_amount += coin.txout.nValue;
+            }
+            available_coins.Erase(unavailable);
+        }
     }
 
     // Choose coins to use
@@ -1413,6 +1460,14 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
 
         // Check if we have enough balance but cannot cover the fees
         CAmount available_balance = preset_inputs.GetTotalAmount() + available_coins.GetTotalAmount();
+        if (unavailable_witness_amount > 0 &&
+            available_balance < selection_target &&
+            unavailable_witness_amount >= selection_target - available_balance) {
+            return util::Error{_(
+                "The wallet has enough value only in witness-owned outputs. "
+                "B3 witness addresses are not active in this release; select "
+                "a legacy-owned input.")};
+        }
         // Note: if SelectCoins() fails when SFFO is enabled (recipients_sum = selection_target with SFFO),
         // then recipients_sum > available_balance and we wouldn't enter into the if condition below.
         if (available_balance >= recipients_sum) {

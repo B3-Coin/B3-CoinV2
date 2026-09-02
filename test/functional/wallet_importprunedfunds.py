@@ -134,16 +134,21 @@ class ImportPrunedFundsTest(BitcoinTestFramework):
         node = self.nodes[0]
 
         # Create a transaction
-        utxo = node.listunspent()[0]
+        # The B3 wallet may return one of the small self-payment outputs first;
+        # select a coin that can deterministically fund the conflict test.
+        utxo = max(node.listunspent(), key=lambda coin: coin["amount"])
         addr = node.getnewaddress()
-        tx1_id = node.send(outputs=[{addr: 1}], inputs=[utxo])["txid"]
+        tx1_id = node.send(outputs=[{addr: Decimal("0.01")}], inputs=[utxo])["txid"]
         tx1_fee = node.gettransaction(tx1_id)["fee"]
 
         # Create a conflicting tx with a larger fee (tx1_fee is negative)
         output_value = utxo["amount"] + tx1_fee - Decimal("0.00001")
         raw_tx2 = node.createrawtransaction(inputs=[utxo], outputs=[{addr: output_value}])
         signed_tx2 = node.signrawtransactionwithwallet(raw_tx2)
-        tx2_id = node.sendrawtransaction(signed_tx2["hex"])
+        # This deliberately higher-fee replacement can exceed the default RPC
+        # safety cap for a very small selected input; mempool policy is what
+        # this test is exercising, so disable only the client-side cap.
+        tx2_id = node.sendrawtransaction(signed_tx2["hex"], 0)
         assert_not_equal(tx2_id, tx1_id)
 
         # Both txs should be in the wallet, tx2 replaced tx1 in mempool

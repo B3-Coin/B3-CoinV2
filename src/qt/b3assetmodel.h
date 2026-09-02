@@ -9,21 +9,26 @@
 
 #include <QAbstractTableModel>
 #include <QList>
+#include <QPointer>
 #include <QString>
 
+#include <vector>
+
 class WalletModel;
+namespace interfaces {
+struct WalletAssetBalance;
+struct WalletBalances;
+} // namespace interfaces
 
 /**
- * The Qt-side representation of one wallet asset. Today only native B3
- * exists; the shape is designed so a future coloured-asset backend can
- * populate it without UI redesign. Fields whose backing subsystem does
- * not exist yet carry an explicit availability flag — the UI renders
- * "not available" rather than a fabricated zero.
+ * The Qt-side representation of one wallet asset. Fields whose backing
+ * subsystem does not exist carry an explicit availability flag — the UI
+ * renders "not available" rather than a fabricated zero.
  */
 struct B3AssetRecord {
     enum class Status {
         Native,      //!< The chain's native coin, backed by real wallet data.
-        Active,      //!< A coloured asset from a real backend (future).
+        Active,      //!< An FN or coloured asset from the real wallet backend.
         Unavailable, //!< Known to exist but the backend cannot serve it.
     };
 
@@ -33,12 +38,14 @@ struct B3AssetRecord {
     CAmount confirmed{0};
     CAmount pending{0};
     CAmount available{0};
+    CAmount immature{0};
     CAmount reserved{0};
     CAmount flowmesh{0};
     bool reserved_available{false};
     bool flowmesh_available{false};
     int decimals{8};
     bool metadata_known{false};
+    bool is_fn{false};
     Status status{Status::Unavailable};
 };
 
@@ -64,7 +71,7 @@ Q_SIGNALS:
     void assetsChanged();
 };
 
-/** The only source that exists today: native B3 from the real wallet. */
+/** Native B3 plus real wallet-owned FN and coloured-asset outputs. */
 class B3NativeAssetSource : public B3AssetSource
 {
     Q_OBJECT
@@ -73,11 +80,16 @@ public:
     explicit B3NativeAssetSource(WalletModel* wallet_model, QObject* parent = nullptr);
 
     QList<B3AssetRecord> assets() const override;
-    bool coloredAssetsAvailable() const override { return false; }
+    bool coloredAssetsAvailable() const override { return true; }
     bool flowMeshAvailable() const override { return false; }
 
+    //! Pure mapping kept public for focused model tests.
+    static QList<B3AssetRecord> recordsForBalances(
+        const interfaces::WalletBalances& native_balances,
+        const std::vector<interfaces::WalletAssetBalance>& asset_balances);
+
 private:
-    WalletModel* m_wallet_model;
+    QPointer<WalletModel> m_wallet_model;
 };
 
 /** Table model over a B3AssetSource for the searchable asset list. */
@@ -87,6 +99,7 @@ class B3AssetTableModel : public QAbstractTableModel
 
 public:
     enum Column { Name = 0, Ticker = 1, Available = 2, ColumnCount = 3 };
+    enum Role { SearchRole = Qt::UserRole, AssetIdRole };
 
     explicit B3AssetTableModel(QObject* parent = nullptr);
 

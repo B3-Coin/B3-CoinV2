@@ -151,6 +151,9 @@ public:
     // Retrieve the cached wallet balance
     interfaces::WalletBalances getCachedBalance() const;
 
+    // Retrieve the last nonblocking policy-asset snapshot.
+    const std::vector<interfaces::WalletAssetBalance>& getCachedAssetBalances() const;
+
     // If coin control has selected outputs, searches the total amount inside the wallet.
     // Otherwise, uses the wallet's cached available balance.
     CAmount getAvailableBalance(const wallet::CCoinControl* control);
@@ -178,6 +181,8 @@ private:
 
     // Cache some values to be able to detect changes
     interfaces::WalletBalances m_cached_balances;
+    std::vector<interfaces::WalletAssetBalance> m_cached_asset_balances;
+    bool m_force_asset_balance_refresh{false};
     EncryptionStatus cachedEncryptionStatus{Unencrypted};
     QTimer* timer;
 
@@ -191,6 +196,9 @@ private:
 Q_SIGNALS:
     // Signal that balance in wallet changed
     void balanceChanged(const interfaces::WalletBalances& balances);
+
+    // Signal that policy-asset balances or maturity may have changed.
+    void assetBalancesChanged();
 
     // Encryption status of wallet changed
     void encryptionStatusChanged();

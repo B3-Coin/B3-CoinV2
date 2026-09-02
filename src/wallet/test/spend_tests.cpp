@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <chainparams.h>
 #include <consensus/amount.h>
 #include <key.h>
 #include <modern/asset_output.h>
@@ -15,6 +16,8 @@
 #include <wallet/test/wallet_test_fixture.h>
 
 #include <boost/test/unit_test.hpp>
+
+#include <array>
 
 namespace wallet {
 BOOST_FIXTURE_TEST_SUITE(spend_tests, WalletTestingSetup)
@@ -33,6 +36,49 @@ BOOST_AUTO_TEST_CASE(max_signed_input_size_uses_external_outpoint)
     const int low_r{CalculateMaximumSignedInputSize(txout, COutPoint{}, &provider, /*can_grind_r=*/true, &coin_control)};
     const int high_r{CalculateMaximumSignedInputSize(txout, outpoint, &provider, /*can_grind_r=*/true, &coin_control)};
     BOOST_CHECK_EQUAL(high_r, low_r + 1);
+}
+
+BOOST_AUTO_TEST_CASE(b3_explicit_witness_inputs_fail_clearly)
+{
+    BOOST_REQUIRE(Params().GetConsensus().legacy_b3coin);
+
+    const CKey key{GenerateRandomKey()};
+    const CPubKey pubkey{key.GetPubKey()};
+    const CScript witness_redeem{
+        GetScriptForDestination(WitnessV0KeyHash{pubkey})};
+    const std::array<CTxOut, 3> outputs{
+        CTxOut{COIN, witness_redeem},
+        CTxOut{COIN, GetScriptForDestination(ScriptHash{witness_redeem})},
+        CTxOut{COIN, GetScriptForDestination(PKHash{pubkey})},
+    };
+
+    LOCK(m_wallet.cs_wallet);
+    for (size_t i{0}; i < outputs.size(); ++i) {
+        CCoinControl coin_control;
+        coin_control.m_external_provider.keys.emplace(pubkey.GetID(), key);
+        coin_control.m_external_provider.pubkeys.emplace(pubkey.GetID(),
+                                                         pubkey);
+        coin_control.m_external_provider.scripts.emplace(
+            CScriptID{witness_redeem}, witness_redeem);
+        const COutPoint outpoint{
+            Txid::FromUint256(
+                uint256{static_cast<uint8_t>(i + 1)}), 0};
+        coin_control.Select(outpoint).SetTxOut(outputs[i]);
+
+        FastRandomContext rng{/*fDeterministic=*/true};
+        CoinSelectionParams params{rng};
+        const auto selected{
+            FetchSelectedInputs(m_wallet, coin_control, params)};
+        if (i < 2) {
+            BOOST_CHECK(!selected);
+            BOOST_CHECK(util::ErrorString(selected).original.find(
+                            "witness addresses are not active") != std::string::npos);
+        } else {
+            BOOST_REQUIRE_MESSAGE(selected,
+                                  util::ErrorString(selected).original);
+            BOOST_CHECK_EQUAL(selected->Size(), 1U);
+        }
+    }
 }
 
 BOOST_FIXTURE_TEST_CASE(SubtractFee, TestChain100Setup)

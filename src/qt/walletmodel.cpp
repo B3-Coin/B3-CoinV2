@@ -84,7 +84,14 @@ void WalletModel::updateStatus()
 {
     EncryptionStatus newEncryptionStatus = getEncryptionStatus();
 
+    // Wallet status notifications also cover manual coin locks, which change
+    // an asset output's Available amount without changing the chain tip.
+    fForceCheckBalanceChanged = true;
+    m_force_asset_balance_refresh = true;
+
     if(cachedEncryptionStatus != newEncryptionStatus) {
+        cachedEncryptionStatus = newEncryptionStatus;
+        // Encryption lock/unlock also changes exact signing capability.
         Q_EMIT encryptionStatusChanged();
     }
 }
@@ -100,18 +107,28 @@ void WalletModel::pollBalanceChanged()
     // holding the locks for a longer time - for example, during a wallet
     // rescan.
     interfaces::WalletBalances new_balances;
+    std::vector<interfaces::WalletAssetBalance> new_asset_balances;
     uint256 block_hash;
     if (!m_wallet->tryGetBalances(new_balances, block_hash)) {
         return;
     }
+    if (!m_wallet->tryGetAssetBalances(new_asset_balances)) {
+        return;
+    }
 
     if (fForceCheckBalanceChanged || block_hash != m_cached_last_update_tip) {
+        const bool asset_balances_changed{
+            m_force_asset_balance_refresh ||
+            new_asset_balances != m_cached_asset_balances};
         fForceCheckBalanceChanged = false;
+        m_force_asset_balance_refresh = false;
 
         // Balance and number of transactions might have changed
         m_cached_last_update_tip = block_hash;
+        m_cached_asset_balances = std::move(new_asset_balances);
 
         checkBalanceChanged(new_balances);
+        if (asset_balances_changed) Q_EMIT assetBalancesChanged();
         if(transactionTableModel)
             transactionTableModel->updateConfirmations();
     }
@@ -128,6 +145,11 @@ void WalletModel::checkBalanceChanged(const interfaces::WalletBalances& new_bala
 interfaces::WalletBalances WalletModel::getCachedBalance() const
 {
     return m_cached_balances;
+}
+
+const std::vector<interfaces::WalletAssetBalance>& WalletModel::getCachedAssetBalances() const
+{
+    return m_cached_asset_balances;
 }
 
 void WalletModel::updateTransaction()

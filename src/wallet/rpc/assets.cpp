@@ -31,6 +31,7 @@
 #include <support/cleanse.h>
 #include <wallet/coincontrol.h>
 #include <wallet/receive.h>
+#include <wallet/rpc/flowmesh.h>
 #include <wallet/rpc/util.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
@@ -47,10 +48,41 @@
 #include <vector>
 
 namespace wallet {
+
+FlowMeshDepositAdmission CheckFlowMeshDepositAdmission(
+    const bool market_bootstrap, const bool flowmesh_rules_active,
+    const bool market_established, const bool base_asset_deposit,
+    const bool runtime_ready, const bool runtime_paused)
+{
+    if (market_bootstrap) {
+        if (market_established) {
+            return FlowMeshDepositAdmission::BOOTSTRAP_MARKET_ALREADY_ESTABLISHED;
+        }
+        if (!base_asset_deposit) {
+            return FlowMeshDepositAdmission::BOOTSTRAP_REQUIRES_BASE_ASSET;
+        }
+        return FlowMeshDepositAdmission::MARKET_BOOTSTRAP;
+    }
+    if (!flowmesh_rules_active) {
+        return FlowMeshDepositAdmission::RULES_INACTIVE;
+    }
+    if (!market_established) {
+        return FlowMeshDepositAdmission::MARKET_NOT_ESTABLISHED;
+    }
+    if (!runtime_ready) {
+        return FlowMeshDepositAdmission::RUNTIME_UNAVAILABLE;
+    }
+    if (runtime_paused) {
+        return FlowMeshDepositAdmission::MARKET_PAUSED;
+    }
+    return FlowMeshDepositAdmission::USER_DEPOSIT;
+}
+
 namespace {
 
 struct AssetRpcOptions {
     bool broadcast{true};
+    bool market_bootstrap{false};
     CCoinControl coin_control{};
 };
 
@@ -182,7 +214,8 @@ static uint8_t AssetDecimalsFromValue(const UniValue& value)
 }
 
 static AssetRpcOptions ParseAssetRpcOptions(const UniValue& value,
-                                            const bool flowmesh_seat = false)
+                                            const bool flowmesh_seat = false,
+                                            const bool flowmesh_deposit = false)
 {
     AssetRpcOptions parsed;
     // Asset and FN inputs are confirmed by default. A caller may explicitly
@@ -201,6 +234,7 @@ static AssetRpcOptions ParseAssetRpcOptions(const UniValue& value,
         allowed.insert("fn_vout");
         allowed.insert("bls_pubkey");
     }
+    if (flowmesh_deposit) allowed.insert("market_bootstrap");
     for (const std::string& key : value.getKeys()) {
         if (!allowed.contains(key)) {
             throw JSONRPCError(RPC_INVALID_PARAMETER,
@@ -209,6 +243,9 @@ static AssetRpcOptions ParseAssetRpcOptions(const UniValue& value,
     }
 
     if (value.exists("broadcast")) parsed.broadcast = value["broadcast"].get_bool();
+    if (value.exists("market_bootstrap")) {
+        parsed.market_bootstrap = value["market_bootstrap"].get_bool();
+    }
     if (value.exists("replaceable")) {
         parsed.coin_control.m_signal_bip125_rbf = value["replaceable"].get_bool();
     }
@@ -296,7 +333,13 @@ static CScript GetOwnerScript(CWallet& wallet, const UniValue& address,
         }
     }
     encoded = EncodeDestination(destination);
-    return GetScriptForDestination(destination);
+    const CScript owner_script{GetScriptForDestination(destination)};
+    if (ScriptRequiresInactiveB3Witness(wallet, owner_script)) {
+        throw JSONRPCError(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "B3 witness addresses are not active in this release; use a legacy owner address");
+    }
+    return owner_script;
 }
 
 static ChainSnapshot SnapshotChainState(CWallet& wallet,
@@ -370,7 +413,8 @@ static node::BridgeTxAuthorization PrevalidateBridgeTransaction(
 
 static std::vector<WalletAssetCoin> AvailableWalletAssetCoins(
     const CWallet& wallet, const modern::AssetId& asset,
-    const uint16_t required_policy, const CCoinControl& coin_control)
+    const uint16_t required_policy, const CCoinControl& coin_control,
+    CAmount* unavailable_witness_amount = nullptr)
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     std::vector<WalletAssetCoin> result;
@@ -404,6 +448,21 @@ static std::vector<WalletAssetCoin> AvailableWalletAssetCoins(
             continue;
         }
         if (!wallet.IsMine(txout, AssetSigningContext::OWNER_SUFFIX)) continue;
+        const std::optional<CScript> owner_script{
+            modern::AssetOwnerScript(txout)};
+        if (!owner_script) continue;
+        if (ScriptRequiresInactiveB3Witness(wallet, *owner_script)) {
+            if (unavailable_witness_amount) {
+                if (*unavailable_witness_amount >
+                    MAX_MONEY - parsed->amount) {
+                    throw JSONRPCError(
+                        RPC_WALLET_ERROR,
+                        "Wallet asset balance exceeds the supported range");
+                }
+                *unavailable_witness_amount += parsed->amount;
+            }
+            continue;
+        }
         result.push_back(WalletAssetCoin{outpoint, *parsed});
     }
 
@@ -421,8 +480,9 @@ static CAmount SelectAssetInputs(CWallet& wallet, const modern::AssetId& asset,
                                  CCoinControl& coin_control)
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
-    const auto coins{
-        AvailableWalletAssetCoins(wallet, asset, policy, coin_control)};
+    CAmount unavailable_witness_amount{0};
+    const auto coins{AvailableWalletAssetCoins(
+        wallet, asset, policy, coin_control, &unavailable_witness_amount)};
 
     // Prefer the smallest single UTXO which covers the send, otherwise use
     // the largest values first to minimize input count.
@@ -443,6 +503,11 @@ static CAmount SelectAssetInputs(CWallet& wallet, const modern::AssetId& asset,
         selected += it->output.amount;
     }
     if (selected < target) {
+        if (unavailable_witness_amount >= target - selected) {
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "The wallet has enough asset units only in witness-owned outputs. B3 witness addresses are not active in this release; use legacy-owned asset outputs");
+        }
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS,
                            "Insufficient confirmed asset balance");
     }
@@ -1335,6 +1400,8 @@ RPCHelpMan flowmeshdeposit()
                   "Minimum confirmations for selected inputs"},
                  {"include_unsafe", RPCArg::Type::BOOL, RPCArg::Default{false},
                   "Allow unsafe wallet inputs"},
+                 {"market_bootstrap", RPCArg::Type::BOOL, RPCArg::Default{false},
+                  "Explicitly create this market's first colored deposit while its runtime is unavailable or paused. The output is keyless and cannot be recovered until a qualifying FlowMesh seat quorum activates the market"},
              }},
         },
         AssetTransactionResult("Created vault-deposit transaction", {
@@ -1347,6 +1414,7 @@ RPCHelpMan flowmeshdeposit()
             {RPCResult::Type::NUM, "amount", "Deposited amount (B3 decimal amount or exact colored-asset units)"},
             {RPCResult::Type::NUM, "asset_change", "Colored-asset units returned to this wallet, or zero for B3"},
             {RPCResult::Type::NUM, "shard", "Deterministic vault shard"},
+            {RPCResult::Type::BOOL, "market_bootstrap", "Whether this is the explicit first colored deposit that establishes the market"},
             {RPCResult::Type::NUM, "anchor_confirmations_required", "Required FlowMesh anchor depth"},
         }),
         RPCExamples{HelpExampleCli(
@@ -1370,7 +1438,9 @@ RPCHelpMan flowmeshdeposit()
             const CAmount amount{
                 FlowMeshDepositAmount(request.params[2], deposit_asset)};
             const AssetRpcOptions options{
-                ParseAssetRpcOptions(request.params[3])};
+                ParseAssetRpcOptions(request.params[3],
+                                     /*flowmesh_seat=*/false,
+                                     /*flowmesh_deposit=*/true)};
             const ChainSnapshot snapshot{SnapshotChainState(*wallet, false)};
             const Consensus::Params& params{Params().GetConsensus()};
             if (!Consensus::FlowMeshVaultPreparationRulesActive(
@@ -1400,15 +1470,58 @@ RPCHelpMan flowmeshdeposit()
                 throw JSONRPCError(RPC_INVALID_PARAMETER,
                                    "Unable to derive this FlowMesh market");
             }
-            // A VaultId is one-way: the first on-chain deposit must carry the
-            // colored base so every node can establish VaultId -> market.
-            // Native B3 may enter only after that registry fact is connected.
-            if (deposit_asset == modern::NativeAsset() &&
-                !wallet->chain().flowMeshMarketEstablished(*market)) {
-                throw JSONRPCError(
-                    RPC_INVALID_PARAMETER,
-                    "This market is not established yet; make and confirm its colored-asset deposit before depositing B3");
-            }
+
+            auto require_deposit_admission = [&] {
+                const bool established{
+                    wallet->chain().flowMeshMarketEstablished(*market)};
+                const auto status{wallet->chain().flowMeshMarketStatus(
+                    *market, /*account_id=*/std::nullopt)};
+                const bool runtime_ready{
+                    status && status->available && status->running &&
+                    status->halt == "none" && !status->domain.IsNull() &&
+                    status->market_id == *market &&
+                    status->vault_id == *vault &&
+                    status->base_asset == base &&
+                    status->quote_asset == modern::NativeAsset()};
+                const FlowMeshDepositAdmission admission{
+                    CheckFlowMeshDepositAdmission(
+                        options.market_bootstrap,
+                        Consensus::FlowMeshRulesActive(snapshot.next_height,
+                                                       params),
+                        established, deposit_asset == base, runtime_ready,
+                        status && status->paused)};
+                switch (admission) {
+                case FlowMeshDepositAdmission::USER_DEPOSIT:
+                case FlowMeshDepositAdmission::MARKET_BOOTSTRAP:
+                    return;
+                case FlowMeshDepositAdmission::RULES_INACTIVE:
+                    throw JSONRPCError(
+                        RPC_MISC_ERROR,
+                        "FlowMesh user deposits are not active for the next block");
+                case FlowMeshDepositAdmission::MARKET_NOT_ESTABLISHED:
+                    throw JSONRPCError(
+                        RPC_INVALID_PARAMETER,
+                        "This market is not established; use market_bootstrap=true to explicitly create its first keyless colored deposit");
+                case FlowMeshDepositAdmission::RUNTIME_UNAVAILABLE:
+                    throw JSONRPCError(
+                        RPC_MISC_ERROR,
+                        "FlowMesh market runtime is not ready in this node");
+                case FlowMeshDepositAdmission::MARKET_PAUSED:
+                    throw JSONRPCError(
+                        RPC_MISC_ERROR,
+                        "FlowMesh market is paused; user deposits are refused until at least four active seats are available");
+                case FlowMeshDepositAdmission::BOOTSTRAP_REQUIRES_BASE_ASSET:
+                    throw JSONRPCError(
+                        RPC_INVALID_PARAMETER,
+                        "market_bootstrap can only create the market's first colored-asset deposit");
+                case FlowMeshDepositAdmission::BOOTSTRAP_MARKET_ALREADY_ESTABLISHED:
+                    throw JSONRPCError(
+                        RPC_INVALID_PARAMETER,
+                        "This FlowMesh market is already established; remove market_bootstrap and wait until its runtime is unpaused");
+                }
+                NONFATAL_UNREACHABLE();
+            };
+            require_deposit_admission();
 
             CreatedTransactionResult created{nullptr, 0, std::nullopt, {}};
             flowmesh::AccountId account;
@@ -1473,6 +1586,12 @@ RPCHelpMan flowmeshdeposit()
                 created = std::move(*result);
             }
 
+            // Runtime readiness can change independently of wallet
+            // construction. Recheck immediately before the common
+            // finish/broadcast path so the RPC never knowingly publishes
+            // into a paused market.
+            require_deposit_admission();
+
             UniValue result{FinishAssetTransaction(
                 request, *wallet, created, options, snapshot, false,
                 /*disintegration=*/0, "flowmesh-deposit")};
@@ -1490,6 +1609,7 @@ RPCHelpMan flowmeshdeposit()
             }
             result.pushKV("asset_change", asset_change);
             result.pushKV("shard", shard);
+            result.pushKV("market_bootstrap", options.market_bootstrap);
             result.pushKV("anchor_confirmations_required",
                           Consensus::FLOWMESH_ANCHOR_DEPTH);
             return result;

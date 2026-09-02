@@ -4,20 +4,100 @@
 
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <chainparams.h>
+#include <key.h>
+#include <modern/asset_output.h>
+#include <modern/stake.h>
+#include <script/sign.h>
 #include <util/check.h>
 #include <wallet/receive.h>
+#include <wallet/scriptpubkeyman.h>
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
 
 namespace wallet {
+namespace {
+
+/**
+ * A dry-run signature creator which succeeds only when the exact private key
+ * is present, while producing no real signatures or MuSig2 nonce state.
+ */
+class KeyPresenceSignatureCreator final : public BaseSignatureCreator
+{
+public:
+    const BaseSignatureChecker& Checker() const override { return DUMMY_CHECKER; }
+
+    bool CreateSig(const SigningProvider& provider, std::vector<unsigned char>& signature,
+                   const CKeyID& key_id, const CScript& script_code,
+                   const SigVersion sigversion) const override
+    {
+        CKey key;
+        if (!provider.GetKey(key_id, key) || !key.IsValid()) return false;
+        if (sigversion == SigVersion::WITNESS_V0 && !key.IsCompressed()) {
+            return false;
+        }
+        return DUMMY_SIGNATURE_CREATOR.CreateSig(
+            provider, signature, key_id, script_code, sigversion);
+    }
+
+    bool CreateSchnorrSig(const SigningProvider& provider,
+                          std::vector<unsigned char>& signature,
+                          const XOnlyPubKey& pubkey, const uint256* leaf_hash,
+                          const uint256* merkle_root,
+                          const SigVersion sigversion) const override
+    {
+        CKey key;
+        if (!provider.GetKeyByXOnly(pubkey, key) || !key.IsValid()) return false;
+        return DUMMY_SIGNATURE_CREATOR.CreateSchnorrSig(
+            provider, signature, pubkey, leaf_hash, merkle_root, sigversion);
+    }
+
+    std::vector<uint8_t> CreateMuSig2Nonce(
+        const SigningProvider&, const CPubKey&, const CPubKey&, const CPubKey&,
+        const uint256*, const uint256*, SigVersion,
+        const SignatureData&) const override
+    {
+        return {};
+    }
+
+    bool CreateMuSig2PartialSig(
+        const SigningProvider&, uint256&, const CPubKey&, const CPubKey&,
+        const CPubKey&, const uint256*,
+        const std::vector<std::pair<uint256, bool>>&, SigVersion,
+        const SignatureData&) const override
+    {
+        return false;
+    }
+
+    bool CreateMuSig2AggregateSig(
+        const std::vector<CPubKey>&, std::vector<uint8_t>&, const CPubKey&,
+        const CPubKey&, const uint256*,
+        const std::vector<std::pair<uint256, bool>>&, SigVersion,
+        const SignatureData&) const override
+    {
+        return false;
+    }
+};
+
+const KeyPresenceSignatureCreator KEY_PRESENCE_SIGNATURE_CREATOR;
+
+bool ProviderCanSignScript(const SigningProvider& provider,
+                           const CScript& script)
+{
+    SignatureData signature_data;
+    return ProduceSignature(provider, KEY_PRESENCE_SIGNATURE_CREATOR, script,
+                            signature_data);
+}
+
+} // namespace
+
 bool InputIsMine(const CWallet& wallet, const CTxIn& txin)
 {
     AssertLockHeld(wallet.cs_wallet);
-    const CWalletTx* prev = wallet.GetWalletTx(txin.prevout.hash);
-    if (prev && txin.prevout.n < prev->tx->vout.size()) {
-        return wallet.IsMine(prev->tx->vout[txin.prevout.n]);
-    }
-    return false;
+    // Ownership of a B3A1 owner suffix depends on the parent transaction's
+    // confirmed/mempool provenance. The outpoint-aware overload derives that
+    // context and also validates the output index.
+    return wallet.IsMine(txin.prevout);
 }
 
 bool AllInputsMine(const CWallet& wallet, const CTransaction& tx)
@@ -47,6 +127,77 @@ CAmount TxGetCredit(const CWallet& wallet, const CTransaction& tx)
             throw std::runtime_error(std::string(__func__) + ": value out of range");
     }
     return nCredit;
+}
+
+CScript OutputScriptForWalletContext(
+    const CTxOut& txout, const AssetSigningContext asset_context)
+{
+    // Unlike B3A1, B3S1 needs no era gate for ownership. Its push/drop prefix
+    // has the same legacy and modern Script semantics, so the suffix is the
+    // actual authorization script even for a pre-H ordinary output.
+    if (const auto owner{modern::StakeOwnerScript(txout.scriptPubKey)}) {
+        return *owner;
+    }
+    if (asset_context == AssetSigningContext::OWNER_SUFFIX) {
+        if (const auto owner{modern::AssetOwnerScript(txout)}) return *owner;
+    }
+    return txout.scriptPubKey;
+}
+
+bool WalletCanSignScript(const CWallet& wallet, const CScript& script)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    const std::set<ScriptPubKeyMan*> managers{
+        wallet.GetScriptPubKeyMans(script)};
+    if (managers.empty()) return false;
+
+    // An external signer wallet deliberately has no local secrets. Exact
+    // manager ownership is the strongest capability assertion available
+    // without prompting the device; foreign scripts were rejected above.
+    if (wallet.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) return true;
+
+    for (const ScriptPubKeyMan* manager : managers) {
+        if (const auto* descriptor{
+                dynamic_cast<const DescriptorScriptPubKeyMan*>(manager)}) {
+            const auto provider{
+                descriptor->GetSigningProviderWithPrivateKeys(script)};
+            if (provider && ProviderCanSignScript(*provider, script)) return true;
+            continue;
+        }
+        if (const auto* legacy{dynamic_cast<const LegacyDataSPKM*>(manager)};
+            legacy && ProviderCanSignScript(*legacy, script)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ScriptRequiresInactiveB3Witness(
+    const CWallet& wallet, const CScript& authorization_script)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    if (!Params().GetConsensus().legacy_b3coin) return false;
+
+    int witness_version{0};
+    std::vector<unsigned char> witness_program;
+    if (authorization_script.IsWitnessProgram(witness_version,
+                                              witness_program)) {
+        return true;
+    }
+
+    const std::unique_ptr<SigningProvider> provider{
+        wallet.GetSolvingProvider(authorization_script)};
+    return provider &&
+           IsSegWitOutput(*provider, authorization_script,
+                          AssetSigningContext::FULL_SCRIPT);
+}
+
+bool WalletCanSpendScriptNow(const CWallet& wallet,
+                             const CScript& authorization_script)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    return WalletCanSignScript(wallet, authorization_script) &&
+           !ScriptRequiresInactiveB3Witness(wallet, authorization_script);
 }
 
 bool ScriptIsChange(const CWallet& wallet, const CScript& script)
@@ -154,17 +305,21 @@ void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
     }
 
     LOCK(wallet.cs_wallet);
+    const AssetSigningContext asset_context{
+        AssetSigningContextForWalletTransaction(wtx)};
     // Sent/received.
     for (unsigned int i = 0; i < wtx.tx->vout.size(); ++i)
     {
         const CTxOut& txout = wtx.tx->vout[i];
-        bool ismine = wallet.IsMine(txout);
+        const CScript reporting_script{
+            OutputScriptForWalletContext(txout, asset_context)};
+        bool ismine = wallet.IsMine(txout, asset_context);
         // Only need to handle txouts if AT LEAST one of these is true:
         //   1) they debit from us (sent)
         //   2) the output is to us (received)
         if (nDebit > 0)
         {
-            if (!include_change && OutputIsChange(wallet, txout))
+            if (!include_change && ScriptIsChange(wallet, reporting_script))
                 continue;
         }
         else if (!ismine)
@@ -173,7 +328,7 @@ void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
         // In either case, we need to get the destination address
         CTxDestination address;
 
-        if (!ExtractDestination(txout.scriptPubKey, address) && !txout.scriptPubKey.IsUnspendable())
+        if (!ExtractDestination(reporting_script, address) && !txout.scriptPubKey.IsUnspendable())
         {
             wallet.WalletLogPrintf("CWalletTx::GetAmounts: Unknown transaction type found, txid %s\n",
                                     wtx.GetHash().ToString());
@@ -223,9 +378,8 @@ bool CachedTxIsTrusted(const CWallet& wallet, const CWalletTx& wtx, std::set<Txi
         // Transactions not sent by us: not trusted
         const CWalletTx* parent = wallet.GetWalletTx(txin.prevout.hash);
         if (parent == nullptr) return false;
-        const CTxOut& parentOut = parent->tx->vout[txin.prevout.n];
         // Check that this specific input being spent is trusted
-        if (!wallet.IsMine(parentOut)) return false;
+        if (!wallet.IsMine(txin.prevout)) return false;
         // If we've already trusted this parent, continue
         if (trusted_parents.contains(parent->GetHash())) continue;
         // Recurse to check that the parent is also trusted
@@ -290,8 +444,12 @@ std::map<CTxDestination, CAmount> GetAddressBalances(const CWallet& wallet)
             if (nDepth < (CachedTxIsFromMe(wallet, wtx) ? 0 : 1)) continue;
 
             CTxDestination addr;
-            Assume(wallet.IsMine(txo.GetTxOut()));
-            if(!ExtractDestination(txo.GetTxOut().scriptPubKey, addr)) continue;
+            const AssetSigningContext asset_context{
+                AssetSigningContextForWalletTransaction(wtx)};
+            if (!wallet.IsMine(txo.GetTxOut(), asset_context)) continue;
+            const CScript reporting_script{
+                OutputScriptForWalletContext(txo.GetTxOut(), asset_context)};
+            if(!ExtractDestination(reporting_script, addr)) continue;
 
             CAmount n = wallet.IsSpent(outpoint) ? 0 : txo.GetTxOut().nValue;
             balances[addr] += n;
@@ -310,6 +468,8 @@ std::set< std::set<CTxDestination> > GetAddressGroupings(const CWallet& wallet)
     for (const auto& walletEntry : wallet.mapWallet)
     {
         const CWalletTx& wtx = walletEntry.second;
+        const AssetSigningContext asset_context{
+            AssetSigningContextForWalletTransaction(wtx)};
 
         if (wtx.tx->vin.size() > 0)
         {
@@ -320,7 +480,14 @@ std::set< std::set<CTxDestination> > GetAddressGroupings(const CWallet& wallet)
                 CTxDestination address;
                 if(!InputIsMine(wallet, txin)) /* If this input isn't mine, ignore it */
                     continue;
-                if(!ExtractDestination(wallet.mapWallet.at(txin.prevout.hash).tx->vout[txin.prevout.n].scriptPubKey, address))
+                const CWalletTx& parent{
+                    wallet.mapWallet.at(txin.prevout.hash)};
+                const CTxOut& parent_output{
+                    parent.tx->vout.at(txin.prevout.n)};
+                const CScript parent_script{OutputScriptForWalletContext(
+                    parent_output,
+                    AssetSigningContextForWalletTransaction(parent))};
+                if(!ExtractDestination(parent_script, address))
                     continue;
                 grouping.insert(address);
                 any_mine = true;
@@ -329,14 +496,17 @@ std::set< std::set<CTxDestination> > GetAddressGroupings(const CWallet& wallet)
             // group change with input addresses
             if (any_mine)
             {
-               for (const CTxOut& txout : wtx.tx->vout)
-                   if (OutputIsChange(wallet, txout))
+               for (const CTxOut& txout : wtx.tx->vout) {
+                   const CScript reporting_script{
+                       OutputScriptForWalletContext(txout, asset_context)};
+                   if (ScriptIsChange(wallet, reporting_script))
                    {
                        CTxDestination txoutAddr;
-                       if(!ExtractDestination(txout.scriptPubKey, txoutAddr))
+                       if(!ExtractDestination(reporting_script, txoutAddr))
                            continue;
                        grouping.insert(txoutAddr);
                    }
+               }
             }
             if (grouping.size() > 0)
             {
@@ -347,10 +517,12 @@ std::set< std::set<CTxDestination> > GetAddressGroupings(const CWallet& wallet)
 
         // group lone addrs by themselves
         for (const auto& txout : wtx.tx->vout)
-            if (wallet.IsMine(txout))
+            if (wallet.IsMine(txout, asset_context))
             {
                 CTxDestination address;
-                if(!ExtractDestination(txout.scriptPubKey, address))
+                const CScript reporting_script{
+                    OutputScriptForWalletContext(txout, asset_context)};
+                if(!ExtractDestination(reporting_script, address))
                     continue;
                 grouping.insert(address);
                 groupings.insert(grouping);

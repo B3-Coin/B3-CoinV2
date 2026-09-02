@@ -5,6 +5,8 @@
 #include <common/system.h>
 #include <consensus/validation.h>
 #include <interfaces/chain.h>
+#include <modern/asset_output.h>
+#include <modern/stake.h>
 #include <policy/fees/block_policy_estimator.h>
 #include <policy/policy.h>
 #include <util/moneystr.h>
@@ -22,6 +24,26 @@ namespace wallet {
 //! mined, or conflicts with a mined transaction. Return a feebumper::Result.
 static feebumper::Result PreconditionChecks(const CWallet& wallet, const CWalletTx& wtx, bool require_mine, std::vector<bilingual_str>& errors) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
+    // The generic fee-bump path reconstructs recipients from destinations and
+    // does not preserve B3A1 carrier scripts or Modern Payload Area evidence.
+    // Context-aware input ownership must not accidentally make an asset
+    // transaction eligible for this lossy path.
+    bool has_modern_asset_data{wtx.tx->HasMpa()};
+    for (const CTxOut& txout : wtx.tx->vout) {
+        has_modern_asset_data |= modern::ClaimsAssetOutput(txout);
+        has_modern_asset_data |= modern::ClaimsStakeMagic(txout.scriptPubKey);
+    }
+    for (const CTxIn& txin : wtx.tx->vin) {
+        const std::optional<WalletTXO> txo{wallet.GetTXO(txin.prevout)};
+        has_modern_asset_data |= txo &&
+            (modern::ClaimsAssetOutput(txo->GetTxOut()) ||
+             modern::ClaimsStakeMagic(txo->GetTxOut().scriptPubKey));
+    }
+    if (has_modern_asset_data) {
+        errors.emplace_back(Untranslated("Fee bumping transactions with B3 policy data is not supported"));
+        return feebumper::Result::WALLET_ERROR;
+    }
+
     if (wallet.HasWalletSpend(wtx.tx)) {
         errors.emplace_back(Untranslated("Transaction has descendants in the wallet"));
         return feebumper::Result::INVALID_PARAMETER;

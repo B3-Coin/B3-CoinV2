@@ -203,13 +203,17 @@ static void UpdateWalletSetting(interfaces::Chain& chain,
  * immediately knows the transaction's status: Whether it can be considered
  * trusted and is eligible to be abandoned ...
  */
-static void RefreshMempoolStatus(CWalletTx& tx, interfaces::Chain& chain)
+static bool RefreshMempoolStatus(CWalletTx& tx, interfaces::Chain& chain)
 {
     if (chain.isInMempool(tx.GetHash())) {
+        if (tx.state<TxStateInMempool>()) return false;
         tx.m_state = TxStateInMempool();
+        return true;
     } else if (tx.state<TxStateInMempool>()) {
         tx.m_state = TxStateInactive();
+        return true;
     }
+    return false;
 }
 
 bool AddWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
@@ -1079,7 +1083,9 @@ bool CWallet::MarkReplaced(const Txid& originalHash, const Txid& newHash)
     wtx.mapValue["replaced_by_txid"] = newHash.ToString();
 
     // Refresh mempool status without waiting for transactionRemovedFromMempool or transactionAddedToMempool
-    RefreshMempoolStatus(wtx, chain());
+    if (RefreshMempoolStatus(wtx, chain())) {
+        RefreshTXOsFromTx(wtx);
+    }
 
     WalletBatch batch(GetDatabase());
 
@@ -1211,6 +1217,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
             CWalletTx* desc_tx = txs.back();
             txs.pop_back();
             desc_tx->m_state = inactive_state;
+            RefreshTXOsFromTx(*desc_tx);
             // Break caches since we have changed the state
             desc_tx->MarkDirty();
             batch.WriteTx(*desc_tx);
@@ -1509,6 +1516,7 @@ void CWallet::RecursiveUpdateTxState(WalletBatch* batch, const Txid& tx_hash, co
         TxUpdate update_state = try_updating_state(wtx);
         if (update_state != TxUpdate::UNCHANGED) {
             wtx.MarkDirty();
+            RefreshTXOsFromTx(wtx);
             if (batch) batch->WriteTx(wtx);
             // Iterate over all its outputs, and update those tx states as well (if applicable)
             for (unsigned int i = 0; i < wtx.tx->vout.size(); ++i) {
@@ -1549,7 +1557,9 @@ void CWallet::transactionAddedToMempool(const CTransactionRef& tx) {
 
     auto it = mapWallet.find(tx->GetHash());
     if (it != mapWallet.end()) {
-        RefreshMempoolStatus(it->second, chain());
+        if (RefreshMempoolStatus(it->second, chain())) {
+            RefreshTXOsFromTx(it->second);
+        }
     }
 
     const Txid& txid = tx->GetHash();
@@ -1590,7 +1600,9 @@ void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRe
     LOCK(cs_wallet);
     auto it = mapWallet.find(tx->GetHash());
     if (it != mapWallet.end()) {
-        RefreshMempoolStatus(it->second, chain());
+        if (RefreshMempoolStatus(it->second, chain())) {
+            RefreshTXOsFromTx(it->second);
+        }
     }
     // Handle transactions that were removed from the mempool because they
     // conflict with transactions in a newly connected block.
@@ -2023,6 +2035,8 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
 
     std::unique_ptr<FastWalletRescanFilter> fast_rescan_filter;
     if (chain().hasBlockFilterIndex(BlockFilterType::BASIC)) fast_rescan_filter = std::make_unique<FastWalletRescanFilter>(*this);
+    const std::optional<int> legacy_final_height{
+        Consensus::LegacyFinalHeight(Params().GetConsensus())};
 
     WalletLogPrintf("Rescan started from block %s... (%s)\n", start_block.ToString(),
                     fast_rescan_filter ? "fast variant using block filters" : "slow variant inspecting all blocks");
@@ -2053,7 +2067,15 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
         }
 
         bool fetch_block{true};
-        if (fast_rescan_filter) {
+        // BASIC filters commit to complete output scripts. Modern B3 asset
+        // carriers instead embed the wallet authorization script as a suffix
+        // of their B3A1 scriptPubKey, so an existing filter index cannot match
+        // that suffix against the descriptor script alone. Keep the fast path
+        // for sealed legacy history, but inspect every post-H block so FN
+        // Genesis and externally-created asset outputs cannot be missed.
+        const bool filter_can_skip_block{
+            !legacy_final_height || block_height <= *legacy_final_height};
+        if (fast_rescan_filter && filter_can_skip_block) {
             fast_rescan_filter->UpdateIfNeeded();
             auto matches_block{fast_rescan_filter->MatchesBlock(block_hash)};
             if (matches_block.has_value()) {
@@ -2067,6 +2089,8 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
             } else {
                 LogDebug(BCLog::SCAN, "Fast rescan: inspect block %d [%s] (WARNING: block filter not found!)\n", block_height, block_hash.ToString());
             }
+        } else if (fast_rescan_filter) {
+            LogDebug(BCLog::SCAN, "Fast rescan: inspect post-transition block %d [%s] (owner scripts may be embedded in modern carriers)\n", block_height, block_hash.ToString());
         }
 
         // Find next block separately from reading data above, because reading
@@ -2163,7 +2187,7 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
 
 bool CWallet::SubmitTxMemoryPoolAndRelay(CWalletTx& wtx,
                                          std::string& err_string,
-                                         node::TxBroadcast broadcast_method) const
+                                         node::TxBroadcast broadcast_method)
 {
     AssertLockHeld(cs_wallet);
 
@@ -2200,7 +2224,10 @@ bool CWallet::SubmitTxMemoryPoolAndRelay(CWalletTx& wtx,
     // If transaction was previously in the mempool, it should be updated when
     // TransactionRemovedFromMempool fires.
     bool ret = chain().broadcastTransaction(wtx.tx, m_default_max_tx_fee, broadcast_method, err_string);
-    if (ret) wtx.m_state = TxStateInMempool{};
+    if (ret) {
+        wtx.m_state = TxStateInMempool{};
+        RefreshTXOsFromTx(wtx);
+    }
     return ret;
 }
 
@@ -2793,14 +2820,15 @@ bool CWallet::TopUpKeyPool(unsigned int kpSize)
 util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType type, const std::string& label)
 {
     LOCK(cs_wallet);
-    // B3: SegWit is not active under the legacy consensus, so witness
-    // outputs are anyone-can-spend. Refuse witness address types at the
-    // single handout choke point -- this covers every RPC and GUI path,
-    // including explicit address_type/change_type parameters.
+    // Mainnet B3 does not activate SegWit. In modern blocks witness programs
+    // are recognized by script verification, but witness-bearing blocks are
+    // still rejected while the buried deployment is inactive. Refuse these
+    // address types so the wallet cannot hand out an address whose funds it
+    // cannot safely confirm a spend from.
     if (Params().GetConsensus().legacy_b3coin && type != OutputType::LEGACY) {
         return util::Error{strprintf(
-            _("Address type '%s' is not available on B3: SegWit outputs are "
-              "unprotected (anyone-can-spend) under the legacy consensus rules."),
+            _("Address type '%s' is not available: B3 witness addresses are not "
+              "active in this release. Use a legacy address."),
             FormatOutputType(type))};
     }
     auto spk_man = GetScriptPubKeyMan(type, /*internal=*/false);
@@ -2818,14 +2846,12 @@ util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType type, c
 
 util::Result<CTxDestination> CWallet::GetNewChangeDestination(const OutputType type)
 {
-    // B3: SegWit is not active under the legacy consensus, so witness
-    // outputs are anyone-can-spend. Refuse witness address types at the
-    // single handout choke point -- this covers every RPC and GUI path,
-    // including explicit address_type/change_type parameters.
+    // Keep the same safety policy as receiving addresses. In particular,
+    // never create change that this release cannot later spend in a block.
     if (Params().GetConsensus().legacy_b3coin && type != OutputType::LEGACY) {
         return util::Error{strprintf(
-            _("Address type '%s' is not available on B3: SegWit outputs are "
-              "unprotected (anyone-can-spend) under the legacy consensus rules."),
+            _("Address type '%s' is not available: B3 witness addresses are not "
+              "active in this release. Use a legacy address."),
             FormatOutputType(type))};
     }
     LOCK(cs_wallet);
@@ -2949,38 +2975,50 @@ void CWallet::LoadLockedCoin(const COutPoint& coin, bool persistent)
 bool CWallet::LockCoin(const COutPoint& output, bool persist)
 {
     AssertLockHeld(cs_wallet);
+    const bool changed{!m_locked_coins.contains(output)};
     LoadLockedCoin(output, persist);
+    bool success{true};
     if (persist) {
         WalletBatch batch(GetDatabase());
-        return batch.WriteLockedUTXO(output);
+        success = batch.WriteLockedUTXO(output);
     }
-    return true;
+    // Coin locks change policy-asset spendability without changing the tip or
+    // transaction set. Reuse the wallet status notification so GUI caches can
+    // refresh immediately; duplicate locks do not create spurious work.
+    if (changed) NotifyStatusChanged(this);
+    return success;
 }
 
 bool CWallet::UnlockCoin(const COutPoint& output)
 {
     AssertLockHeld(cs_wallet);
+    bool changed{false};
+    bool success{true};
     auto locked_coin_it = m_locked_coins.find(output);
     if (locked_coin_it != m_locked_coins.end()) {
         bool persisted = locked_coin_it->second;
         m_locked_coins.erase(locked_coin_it);
+        changed = true;
         if (persisted) {
             WalletBatch batch(GetDatabase());
-            return batch.EraseLockedUTXO(output);
+            success = batch.EraseLockedUTXO(output);
         }
     }
-    return true;
+    if (changed) NotifyStatusChanged(this);
+    return success;
 }
 
 bool CWallet::UnlockAllCoins()
 {
     AssertLockHeld(cs_wallet);
+    const bool changed{!m_locked_coins.empty()};
     bool success = true;
     WalletBatch batch(GetDatabase());
     for (const auto& [coin, persistent] : m_locked_coins) {
         if (persistent) success = success && batch.EraseLockedUTXO(coin);
     }
     m_locked_coins.clear();
+    if (changed) NotifyStatusChanged(this);
     return success;
 }
 
@@ -3164,6 +3202,7 @@ bool CWallet::LoadWalletArgs(std::shared_ptr<CWallet> wallet, const WalletContex
 {
     interfaces::Chain* chain = context.chain;
     const ArgsManager& args = *Assert(context.args);
+    const bool b3_witness_inactive{Params().GetConsensus().legacy_b3coin};
 
     if (!args.GetArg("-addresstype", "").empty()) {
         std::optional<OutputType> parsed = ParseOutputType(args.GetArg("-addresstype", ""));
@@ -3171,7 +3210,19 @@ bool CWallet::LoadWalletArgs(std::shared_ptr<CWallet> wallet, const WalletContex
             error = strprintf(_("Unknown address type '%s'"), args.GetArg("-addresstype", ""));
             return false;
         }
+        if (b3_witness_inactive && *parsed != OutputType::LEGACY) {
+            error = strprintf(
+                _("Address type '%s' is not available: B3 witness addresses are not active in this release. Use -addresstype=legacy."),
+                args.GetArg("-addresstype", ""));
+            return false;
+        }
         wallet->m_default_address_type = parsed.value();
+    } else if (b3_witness_inactive) {
+        // WalletInit normally supplies this default. Repeat the safety
+        // invariant here because migration, recovery and offline-style wallet
+        // loaders may call LoadWalletArgs with a context which did not run the
+        // node-wide parameter interaction.
+        wallet->m_default_address_type = OutputType::LEGACY;
     }
 
     if (!args.GetArg("-changetype", "").empty()) {
@@ -3180,7 +3231,15 @@ bool CWallet::LoadWalletArgs(std::shared_ptr<CWallet> wallet, const WalletContex
             error = strprintf(_("Unknown change type '%s'"), args.GetArg("-changetype", ""));
             return false;
         }
+        if (b3_witness_inactive && *parsed != OutputType::LEGACY) {
+            error = strprintf(
+                _("Change type '%s' is not available: B3 witness addresses are not active in this release. Use -changetype=legacy."),
+                args.GetArg("-changetype", ""));
+            return false;
+        }
         wallet->m_default_change_type = parsed.value();
+    } else if (b3_witness_inactive) {
+        wallet->m_default_change_type = OutputType::LEGACY;
     }
 
     if (const auto arg{args.GetArg("-mintxfee")}) {
@@ -5147,13 +5206,15 @@ void CWallet::RefreshTXOsFromTx(const CWalletTx& wtx)
     const AssetSigningContext asset_context{
         AssetSigningContextForWalletTransaction(wtx)};
     for (uint32_t i = 0; i < wtx.tx->vout.size(); ++i) {
+        COutPoint outpoint(wtx.GetHash(), i);
+        // Refresh is also used when transaction provenance changes (for
+        // example mempool -> inactive). Remove the old contextual ownership
+        // decision before recomputing it, and rebind the cache to the current
+        // transaction object after optional-data enrichment.
+        m_txos.erase(outpoint);
         const CTxOut& txout = wtx.tx->vout.at(i);
         if (!IsMine(txout, asset_context)) continue;
-        COutPoint outpoint(wtx.GetHash(), i);
-        if (m_txos.contains(outpoint)) {
-        } else {
-            m_txos.emplace(outpoint, WalletTXO{wtx, txout});
-        }
+        m_txos.emplace(outpoint, WalletTXO{wtx, i});
     }
 }
 

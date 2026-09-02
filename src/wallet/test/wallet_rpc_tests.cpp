@@ -89,6 +89,38 @@ BOOST_AUTO_TEST_CASE(flowmesh_vault_operation_discovery_json)
     BOOST_CHECK_EQUAL(json.find_value("vault_inputs").getInt<int>(), 1);
 }
 
+BOOST_AUTO_TEST_CASE(flowmesh_deposit_admission_fails_closed)
+{
+    using Admission = FlowMeshDepositAdmission;
+    const auto check = [](const bool bootstrap, const bool rules_active,
+                          const bool established, const bool base_asset,
+                          const bool runtime_ready, const bool paused) {
+        return CheckFlowMeshDepositAdmission(
+            bootstrap, rules_active, established, base_asset,
+            runtime_ready, paused);
+    };
+
+    BOOST_CHECK(check(false, false, false, true, false, true) ==
+                Admission::RULES_INACTIVE);
+    BOOST_CHECK(check(false, true, false, true, false, false) ==
+                Admission::MARKET_NOT_ESTABLISHED);
+    BOOST_CHECK(check(false, true, true, true, false, false) ==
+                Admission::RUNTIME_UNAVAILABLE);
+    BOOST_CHECK(check(false, true, true, true, true, true) ==
+                Admission::MARKET_PAUSED);
+    BOOST_CHECK(check(false, true, true, true, true, false) ==
+                Admission::USER_DEPOSIT);
+
+    // The only pre-runtime exception is explicit and can only establish the
+    // first colored side of a new market. It cannot bypass a pause later.
+    BOOST_CHECK(check(true, false, false, true, false, true) ==
+                Admission::MARKET_BOOTSTRAP);
+    BOOST_CHECK(check(true, true, false, false, false, true) ==
+                Admission::BOOTSTRAP_REQUIRES_BASE_ASSET);
+    BOOST_CHECK(check(true, true, true, true, false, true) ==
+                Admission::BOOTSTRAP_MARKET_ALREADY_ESTABLISHED);
+}
+
 BOOST_AUTO_TEST_CASE(bridge_transaction_commands_are_registered)
 {
     std::set<std::string> found;
