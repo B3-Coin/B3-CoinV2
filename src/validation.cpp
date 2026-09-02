@@ -974,6 +974,21 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         return state.Invalid(TxValidationResult::TX_CONSENSUS,
                              next_block_legacy ? "modern-txn-in-legacy-era" : "legacy-txn-in-modern-era");
     }
+    // B3 keeps witness commitments inactive until a separately specified
+    // activation. Modern script verification deliberately recognizes witness
+    // programs so they cannot degrade into anyone-can-spend outputs, while
+    // ContextualCheckBlock rejects witness-bearing blocks until that
+    // activation. Keep the mempool aligned with the block it feeds: accepting
+    // witness data here would let an otherwise valid transaction make every
+    // template that selected it fail with "unexpected-witness".
+    if (m_active_chainstate.m_chainman.GetConsensus().legacy_b3coin &&
+        tx.HasWitness() &&
+        !DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(),
+                               m_active_chainstate.m_chainman,
+                               Consensus::DEPLOYMENT_SEGWIT)) {
+        return state.Invalid(TxValidationResult::TX_NOT_STANDARD,
+                             "witness-not-active");
+    }
     if (!next_block_legacy) {
         // Modern-era admission: a malformed STAKE-claiming output can never
         // be mined (ContextualCheckBlock enforces the same rule), so refuse
@@ -3139,6 +3154,78 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         return false;
     }
 
+    // B3 transition rules were introduced after some block-index databases
+    // could already have been written. `-reindex-chainstate` deliberately
+    // skips ContextualCheckBlockHeader(), so repeat every deterministic
+    // boundary/phase header rule here (but not the wall-clock future bound).
+    // The proof hash is skipped only for a miner's unsigned fJustCheck
+    // template; every disk/network connection path rechecks it.
+    if (params.GetConsensus().legacy_b3coin) {
+        const Consensus::Params& consensus{params.GetConsensus()};
+        switch (Consensus::CheckLegacyBoundaryHeader(block, pindex->nHeight,
+                                                      consensus)) {
+        case Consensus::BoundaryCheck::OK:
+            break;
+        case Consensus::BoundaryCheck::WRONG_FINAL_HASH:
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-legacy-final-hash",
+                                 "block at the finalized legacy boundary does not match LEGACY_FINAL_HASH");
+        case Consensus::BoundaryCheck::WRONG_FINAL_PARENT:
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-legacy-final-parent",
+                                 "first modern block does not reference LEGACY_FINAL_HASH");
+        }
+
+        const Consensus::ConsensusPhase phase{
+            Consensus::GetConsensusPhase(pindex->nHeight, consensus)};
+        if (phase == Consensus::ConsensusPhase::TRANSITION_POW) {
+            if (!consensus.transition_pow_bits ||
+                !IsCanonicalCompactBits(*consensus.transition_pow_bits)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "no-transition-pow-rules",
+                                     "temporary-PoW corridor difficulty is not configured canonically");
+            }
+            if (block.nBits != *consensus.transition_pow_bits) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-diffbits",
+                                     "incorrect temporary-PoW corridor difficulty");
+            }
+            if (!fJustCheck && !CheckTransitionPowEligibility(block)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "high-hash",
+                                     "temporary-PoW scrypt eligibility hash exceeds target");
+            }
+            if (pindex->pprev == nullptr ||
+                block.GetBlockTime() <
+                    pindex->pprev->GetBlockTime() +
+                        consensus.transition_pow_min_spacing) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "time-too-early-corridor",
+                                     "temporary-PoW corridor block is too early");
+            }
+        } else if (phase == Consensus::ConsensusPhase::MODERN_POS &&
+                   consensus.modern_pos) {
+            const Consensus::ModernPosParams& pos{*consensus.modern_pos};
+            if (block.nBits != pos.sentinel_bits) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-diffbits",
+                                     "modern-PoS nBits must be the sentinel value");
+            }
+            if (block.nNonce != 0) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-pos-nonce",
+                                     "modern-PoS nNonce must be zero");
+            }
+            if (pindex->pprev == nullptr ||
+                !modern::DecodeModernPosRound(pindex->pprev->GetBlockTime(),
+                                              block.GetBlockTime(), pos)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-pos-time",
+                                     "modern-PoS timestamp is not an exact round time");
+            }
+        }
+    }
+
     // The normal Core flow deliberately does not repeat contextual header and
     // block checks here. The legacy B3Coin target depends on whether a full
     // block is PoW or PoS, so it must be checked at connection time after all
@@ -3378,6 +3465,14 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                                      strprintf("%s in transaction %s", asset_error,
                                                tx->GetHash().ToString()));
             }
+            if (std::string stake_error;
+                !modern::CheckStakeOutputs(*tx, params.GetConsensus(),
+                                           stake_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-stake-output",
+                                     strprintf("%s in transaction %s", stake_error,
+                                               tx->GetHash().ToString()));
+            }
             if (std::string cell_error;
                 !modern::CheckMetadataCellOutputs(*tx, params.GetConsensus(),
                                                   pindex->nHeight, cell_error)) {
@@ -3392,12 +3487,50 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                                      "bad-mpa", mpa_error);
             }
+            std::vector<modern::FinalityKeyPair> pairs;
+            std::string bind_error;
+            if (!modern::MatchFinalityKeyPairs(*tx, pairs, bind_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-finality-key-binding",
+                                     strprintf("%s in transaction %s", bind_error,
+                                               tx->GetHash().ToString()));
+            }
         }
         if (std::string fn_error;
             !modern::CheckFnGenesisBlock(block, pindex->nHeight, params.GetConsensus(),
                                          fn_error)) {
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                                  "bad-fn-genesis", fn_error);
+        }
+        if (std::string cost_error;
+            !modern::CheckBlockPayloadCost(block, cost_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-block-payload-cost", cost_error);
+        }
+        if (std::string root_error;
+            !modern::CheckBlockPayloadRoot(block, root_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-payload-root", root_error);
+        }
+        if (std::string cert_error;
+            !modern::CheckFinalityCertificatePlacement(block, cert_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-finality-cert-form", cert_error);
+        }
+        const Consensus::ConsensusPhase phase{Consensus::GetConsensusPhase(
+            pindex->nHeight, params.GetConsensus())};
+        if (phase == Consensus::ConsensusPhase::TRANSITION_POW &&
+            !block.vchBlockSig.empty()) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-corridor-sig",
+                                 "temporary-PoW corridor block carries a block signature");
+        }
+        if (phase == Consensus::ConsensusPhase::MODERN_POS &&
+            params.GetConsensus().modern_pos &&
+            block.vchBlockSig.size() != modern::MODERN_POS_SIG_SIZE) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-pos-signature",
+                                 "modern-PoS block does not carry a 64-byte validator signature");
         }
     }
 
@@ -3951,6 +4084,19 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         // rule either. Until an approved modern rule set is installed that
         // path rejects every block (modern/pos.h documents the missing rule
         // set precisely).
+        //
+        // M6 applies to the whole modern era, not only to its PoS production
+        // phase: a coinbase can never create an active STAKE output. Corridor
+        // miners may include an ordinary transaction which creates STAKE, but
+        // their fee-paying coinbase must remain an ordinary output.
+        for (const CTxOut& cb_out : block.vtx[0]->vout) {
+            if (state.IsValid() && modern::ClaimsStakeMagic(cb_out.scriptPubKey)) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                              "bad-cb-stake",
+                              "modern-era coinbase output claims the STAKE magic");
+            }
+        }
+
         if (Consensus::GetConsensusPhase(pindex->nHeight, params.GetConsensus()) ==
             Consensus::ConsensusPhase::TRANSITION_POW) {
             // Fail closed while the corridor reward is unstated, exactly like
@@ -4003,15 +4149,6 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                     state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-treasury",
                                   strprintf("modern coinbase pays %d to the treasury script, %d required",
                                             paid, treasury_share));
-                }
-            }
-            // M6: a block reward can never directly create active STAKE. The
-            // reward pays ordinary outputs; restaking is an explicit STAKE
-            // output subject to the activation depth.
-            for (const CTxOut& cb_out : block.vtx[0]->vout) {
-                if (state.IsValid() && modern::ClaimsStakeMagic(cb_out.scriptPubKey)) {
-                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-stake",
-                                  "coinbase output claims the STAKE magic");
                 }
             }
             if (state.IsValid()) {
@@ -6976,14 +7113,23 @@ bool Chainstate::LoadChainTip()
     assert(!coins_cache.GetBestBlock().IsNull()); // Never called when the coins view is empty
     CBlockIndex* tip = m_chain.Tip();
 
-    if (tip && tip->GetBlockHash() == coins_cache.GetBestBlock()) {
-        return true;
-    }
-
     // Load pointer to end of best chain
     CBlockIndex* pindex = m_blockman.LookupBlockIndex(coins_cache.GetBestBlock());
     if (!pindex) {
         return false;
+    }
+    // A restart migration may quarantine a formerly accepted side branch
+    // after loading the block-index tree. It is safe to retain such an
+    // irrelevant branch, but never to trust a coins database whose own tip
+    // depends on it. Descendants inherit BLOCK_FAILED_VALID during index load,
+    // so checking the tip covers the complete active ancestry.
+    if (pindex->nStatus & BLOCK_FAILED_VALID) {
+        LogError("%s: coins database tip %s at height %d is now consensus-invalid\n",
+                 __func__, pindex->GetBlockHash().ToString(), pindex->nHeight);
+        return false;
+    }
+    if (tip == pindex) {
+        return true;
     }
     m_chain.SetTip(*pindex);
     m_chainman.UpdateIBDStatus();

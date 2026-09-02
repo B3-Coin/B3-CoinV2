@@ -1008,7 +1008,12 @@ public:
         }
         if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman,
                           consensus, *tip, bridge_index)) return out;
-        out.active = true;
+        // The derived tracker can synchronize through the corridor because it
+        // must collect stakes and FINALITY_KEY bindings for Set_0.  That does
+        // not mean the epoch state machine is active yet: epoch 0 begins only
+        // when the chain actually reaches the first Modern-PoS block M.
+        const auto modern_start{Consensus::ModernPosStartHeight(consensus)};
+        out.active = modern_start && tip->nHeight >= *modern_start;
         const node::FinalityTracker::State& state{tracker.Current()};
         out.bootstrapped = state.bootstrapped;
         out.epoch = state.epoch;

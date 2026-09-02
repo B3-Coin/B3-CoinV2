@@ -42,6 +42,8 @@ protected:
     Mutex m_db_mutex;
     std::unique_ptr<CDBWrapper> m_db;
     std::shared_future<void> m_compaction;
+    //! Maintain the versioned B3 validation marker atomically with DB_BEST_BLOCK.
+    bool m_b3_validation_schema_v1_enabled{false};
 public:
     explicit CCoinsViewDB(DBParams db_params, CoinsViewOptions options);
     ~CCoinsViewDB() override;
@@ -55,6 +57,26 @@ public:
 
     //! Whether an unsupported database format is used.
     bool NeedsUpgrade();
+
+    /**
+     * Whether this coins database was verified under B3 post-H validation
+     * schema v1 at exactly its current best block. A missing/stale marker also
+     * disables automatic marker advancement until Mark...() succeeds.
+     */
+    bool B3ValidationSchemaV1Current() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+    /**
+     * Synchronously mark the current best block as schema-v1 verified and
+     * enable atomic marker advancement in subsequent BatchWrite calls.
+     */
+    bool MarkB3ValidationSchemaV1Current() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+    /**
+     * Synchronously revoke schema-v1 trust. Subsequent BatchWrite calls must
+     * not carry the marker to another tip until Mark...() succeeds again.
+     */
+    bool ClearB3ValidationSchemaV1() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
     size_t EstimateSize() const override;
 
     //! Dynamically alter the underlying leveldb cache size.

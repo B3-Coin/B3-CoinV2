@@ -27,6 +27,12 @@
 static constexpr uint8_t DB_COIN{'C'};
 static constexpr uint8_t DB_BEST_BLOCK{'B'};
 static constexpr uint8_t DB_HEAD_BLOCKS{'H'};
+// Value: the exact DB_BEST_BLOCK verified under the named schema. An older
+// binary does not update this key, so advancing/rebuilding the coins DB makes
+// it stale and forces the next patched startup to verify again.
+// Keep this prefix below legacy DB_COINS ('c'): NeedsUpgrade() seeks at 'c'
+// and historically treats any key at or above it as the removed old format.
+static constexpr uint8_t DB_B3_VALIDATION_SCHEMA_V1{'V'};
 // Keys used in previous version that might still be found in the DB:
 static constexpr uint8_t DB_COINS{'c'};
 
@@ -57,7 +63,13 @@ struct CoinEntry {
 CCoinsViewDB::CCoinsViewDB(DBParams db_params, CoinsViewOptions options) :
     m_db_params{std::move(db_params)},
     m_options{std::move(options)},
-    m_db{std::make_unique<CDBWrapper>(m_db_params)} { }
+    m_db{std::make_unique<CDBWrapper>(m_db_params)}
+{
+    uint256 schema_tip;
+    m_b3_validation_schema_v1_enabled =
+        m_db->Read(DB_B3_VALIDATION_SCHEMA_V1, schema_tip) &&
+        schema_tip == GetBestBlock();
+}
 
 CCoinsViewDB::~CCoinsViewDB()
 {
@@ -102,6 +114,40 @@ uint256 CCoinsViewDB::GetBestBlock() const {
     if (!m_db->Read(DB_BEST_BLOCK, hashBestChain))
         return uint256();
     return hashBestChain;
+}
+
+bool CCoinsViewDB::B3ValidationSchemaV1Current()
+{
+    AssertLockHeld(cs_main);
+    uint256 schema_tip;
+    m_b3_validation_schema_v1_enabled =
+        m_db->Read(DB_B3_VALIDATION_SCHEMA_V1, schema_tip) &&
+        schema_tip == GetBestBlock();
+    return m_b3_validation_schema_v1_enabled;
+}
+
+bool CCoinsViewDB::MarkB3ValidationSchemaV1Current()
+{
+    AssertLockHeld(cs_main);
+    const uint256 best_block{GetBestBlock()};
+    m_db->Write(DB_B3_VALIDATION_SCHEMA_V1, best_block, /*fSync=*/true);
+    uint256 stored_tip;
+    m_b3_validation_schema_v1_enabled =
+        m_db->Read(DB_B3_VALIDATION_SCHEMA_V1, stored_tip) &&
+        stored_tip == best_block;
+    return m_b3_validation_schema_v1_enabled;
+}
+
+bool CCoinsViewDB::ClearB3ValidationSchemaV1()
+{
+    AssertLockHeld(cs_main);
+    // Disable propagation before touching disk. If the erase throws or the
+    // process stops, this process cannot advance trust, and the next startup
+    // will retry the synchronous erase before recovering an off-anchor tip.
+    m_b3_validation_schema_v1_enabled = false;
+    m_db->Erase(DB_B3_VALIDATION_SCHEMA_V1, /*fSync=*/true);
+    uint256 stored_tip;
+    return !m_db->Read(DB_B3_VALIDATION_SCHEMA_V1, stored_tip);
 }
 
 std::vector<uint256> CCoinsViewDB::GetHeadBlocks() const {
@@ -172,6 +218,13 @@ void CCoinsViewDB::BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashB
     // In the last batch, mark the database as consistent with hashBlock again.
     batch.Erase(DB_HEAD_BLOCKS);
     batch.Write(DB_BEST_BLOCK, hashBlock);
+    if (m_b3_validation_schema_v1_enabled) {
+        // Keep the validation marker and coins tip inseparable. A crash sees
+        // either the previous matching pair or the new matching pair; an old
+        // binary advances only DB_BEST_BLOCK and therefore makes this marker
+        // stale instead of silently inheriting trust.
+        batch.Write(DB_B3_VALIDATION_SCHEMA_V1, hashBlock);
+    }
 
     LogDebug(BCLog::COINDB, "Writing final batch of %.2f MiB\n", batch.ApproximateSize() * (1.0 / 1048576.0));
     m_db->WriteBatch(batch);

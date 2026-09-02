@@ -9,6 +9,7 @@
 #include <arith_uint256.h>
 #include <chain.h>
 #include <consensus/block_codec.h>
+#include <consensus/boundary.h>
 #include <consensus/era.h>
 #include <consensus/params.h>
 #include <legacy/codec.h>
@@ -22,6 +23,8 @@
 #include <kernel/notifications_interface.h>
 #include <kernel/types.h>
 #include <legacy/consensus.h>
+#include <modern/pos.h>
+#include <modern/pos_v1.h>
 #include <pow.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
@@ -208,51 +211,6 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->m_modern_pos_digest = diskindex.m_modern_pos_digest;
                 pindexNew->nStatus        = diskindex.nStatus;
                 pindexNew->nTx            = diskindex.nTx;
-
-                // Proof validation at load is selected by the block's
-                // consensus PHASE, never by a two-state era assumption:
-                //  - LEGACY_POS: a stored legacy header can be header-only,
-                //    so its PoW/PoS type is not knowable after restart; full
-                //    PoW blocks and PoS kernels are revalidated on connect.
-                //  - TRANSITION_POW: the corridor's proof is the historical
-                //    B3 scrypt eligibility hash against the header's nBits
-                //    (block identity stays the modern SHA256d hash and is
-                //    deliberately NOT what is checked here).
-                //  - MODERN_POS: with the V1 rule set configured there is
-                //    no proof-of-work at all — nBits is the enforced
-                //    sentinel and validity is stake eligibility, re-judged
-                //    at connect; only the sentinel is re-checked here. With
-                //    no rule set configured the stock SHA256d check remains
-                //    the placeholder.
-                switch (Consensus::GetConsensusPhase(pindexNew->nHeight, consensusParams)) {
-                case Consensus::ConsensusPhase::LEGACY_POS:
-                    break;
-                case Consensus::ConsensusPhase::TRANSITION_POW: {
-                    CBlockHeader header;
-                    header.nVersion = diskindex.nVersion;
-                    header.hashPrevBlock = diskindex.hashPrev;
-                    header.hashMerkleRoot = diskindex.hashMerkleRoot;
-                    header.nTime = diskindex.nTime;
-                    header.nBits = diskindex.nBits;
-                    header.nNonce = diskindex.nNonce;
-                    if (!CheckTransitionPowEligibility(header)) {
-                        LogError("%s: transition scrypt eligibility failed: %s\n", __func__, pindexNew->ToString());
-                        return false;
-                    }
-                    break;
-                }
-                case Consensus::ConsensusPhase::MODERN_POS:
-                    if (consensusParams.modern_pos) {
-                        if (pindexNew->nBits != consensusParams.modern_pos->sentinel_bits) {
-                            LogError("%s: modern-PoS sentinel nBits mismatch: %s\n", __func__, pindexNew->ToString());
-                            return false;
-                        }
-                    } else if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
-                        LogError("%s: CheckProofOfWork failed: %s\n", __func__, pindexNew->ToString());
-                        return false;
-                    }
-                    break;
-                }
 
                 pcursor->Next();
             } else {
@@ -773,6 +731,138 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
             return false;
         }
         previous_index = pindex;
+
+        // Parent-dependent deterministic transition rules cannot be checked
+        // while LevelDB entries are read in hash order. Validate them now that
+        // every entry is materialized and the index is sorted by height.
+        //
+        // A block-index database is a tree, not just the active chain. Old
+        // pre-pin databases can legitimately contain a competing block at H,
+        // and failed side branches can contain headers rejected by a newer
+        // beta. Those records must not make the whole node unstartable. The
+        // finalized-X topology already gives them the persistent
+        // BLOCK_ANCHOR_INELIGIBLE classification; other newly-invalid stored
+        // headers are quarantined with BLOCK_FAILED_VALID. Descendants inherit
+        // that status below and neither class can enter best-header or
+        // chain-candidate selection. An active coins tip which depends on a
+        // newly failed entry is rejected separately by LoadChainTip().
+        if (consensus.legacy_b3coin && pindex->nHeight > 0) {
+            if (pindex->pprev == nullptr ||
+                pindex->pprev->nHeight != pindex->nHeight - 1) {
+                LogError("%s: B3 block index has an invalid parent height: %s\n",
+                         __func__, pindex->ToString());
+                return false;
+            }
+        }
+
+        if (pindex->nStatus & BLOCK_FAILED_CHILD) {
+            // BLOCK_FAILED_CHILD is deprecated, but may still exist on disk.
+            pindex->nStatus =
+                (pindex->nStatus & ~BLOCK_FAILED_CHILD) | BLOCK_FAILED_VALID;
+            m_dirty_blockindex.insert(pindex);
+        }
+        if (!(pindex->nStatus & BLOCK_FAILED_VALID) && pindex->pprev &&
+            (pindex->pprev->nStatus & BLOCK_FAILED_VALID)) {
+            // All descendants of invalid blocks are invalid too.
+            pindex->nStatus |= BLOCK_FAILED_VALID;
+            m_dirty_blockindex.insert(pindex);
+        }
+
+        if (!(pindex->nStatus & BLOCK_ANCHOR_INELIGIBLE) &&
+            IsAnchorIneligible(*pindex)) {
+            // Competing pre-pin history is retained and serveable, but can
+            // never influence fork choice after X is pinned.
+            pindex->nStatus |= BLOCK_ANCHOR_INELIGIBLE;
+            m_dirty_blockindex.insert(pindex);
+        }
+
+        const bool eligible_for_selection{
+            !(pindex->nStatus &
+              (BLOCK_FAILED_VALID | BLOCK_ANCHOR_INELIGIBLE))};
+        // Non-B3 networks retain the ordinary stored-header proof check from
+        // LoadBlockIndexGuts(). B3 defers proof selection until this
+        // height-sorted pass because its legacy, transition-PoW, and modern
+        // PoS phases require different rules and, in two phases, the parent.
+        // A corrupt non-B3 block-index record must still make startup fail
+        // closed rather than becoming selectable without valid proof of work.
+        if (!consensus.legacy_b3coin &&
+            !CheckProofOfWork(pindex->GetBlockHash(), pindex->nBits,
+                              consensus)) {
+            LogError("%s: CheckProofOfWork failed: %s\n", __func__,
+                     pindex->ToString());
+            return false;
+        }
+        if (consensus.legacy_b3coin && eligible_for_selection) {
+            const CBlockHeader header{pindex->GetBlockHeader()};
+            std::string invalid_reason;
+
+            if (!Consensus::HasExpectedB3BlockCodec(
+                    header.nVersion, pindex->nHeight, consensus)) {
+                invalid_reason = "B3 block codec does not match stored height";
+            } else if (Consensus::CheckLegacyBoundaryHeader(
+                           header, pindex->nHeight, consensus) !=
+                       Consensus::BoundaryCheck::OK) {
+                invalid_reason = "block violates the pinned legacy boundary";
+            } else {
+                // Proof validation is selected by consensus phase. The
+                // physical future-clock bound is intentionally not repeated
+                // at restart: only deterministic rules belong here.
+                const Consensus::ConsensusPhase phase{
+                    Consensus::GetConsensusPhase(pindex->nHeight, consensus)};
+                if (phase == Consensus::ConsensusPhase::TRANSITION_POW) {
+                    if (!consensus.transition_pow_bits ||
+                        !IsCanonicalCompactBits(
+                            *consensus.transition_pow_bits)) {
+                        LogError("%s: transition corridor rules are not configured canonically\n",
+                                 __func__);
+                        return false;
+                    }
+                    if (header.nBits != *consensus.transition_pow_bits) {
+                        invalid_reason = "transition corridor nBits mismatch";
+                    } else if (!CheckTransitionPowEligibility(header)) {
+                        invalid_reason =
+                            "transition corridor scrypt eligibility failed";
+                    } else if (pindex->pprev == nullptr ||
+                               header.GetBlockTime() <
+                                   pindex->pprev->GetBlockTime() +
+                                       consensus.transition_pow_min_spacing) {
+                        invalid_reason =
+                            "transition corridor timestamp is too early";
+                    }
+                } else if (phase ==
+                           Consensus::ConsensusPhase::MODERN_POS) {
+                    if (consensus.modern_pos) {
+                        if (header.nBits !=
+                            consensus.modern_pos->sentinel_bits) {
+                            invalid_reason =
+                                "modern-PoS sentinel nBits mismatch";
+                        } else if (header.nNonce != 0) {
+                            invalid_reason = "modern-PoS nNonce is not zero";
+                        } else if (pindex->pprev == nullptr ||
+                                   !modern::DecodeModernPosRound(
+                                       pindex->pprev->GetBlockTime(),
+                                       header.GetBlockTime(),
+                                       *consensus.modern_pos)) {
+                            invalid_reason =
+                                "modern-PoS timestamp is not an exact round";
+                        }
+                    } else if (!CheckProofOfWork(
+                                   pindex->GetBlockHash(), pindex->nBits,
+                                   consensus)) {
+                        invalid_reason = "proof of work failed";
+                    }
+                }
+            }
+
+            if (!invalid_reason.empty()) {
+                LogWarning("%s: quarantining stored B3 side branch at height %d hash=%s: %s\n",
+                           __func__, pindex->nHeight,
+                           pindex->GetBlockHash().ToString(), invalid_reason);
+                pindex->nStatus |= BLOCK_FAILED_VALID;
+                m_dirty_blockindex.insert(pindex);
+            }
+        }
+
         pindex->nChainWork = (pindex->pprev ? pindex->pprev->nChainWork : 0) + GetBlockProof(*pindex);
         pindex->nTimeMax = (pindex->pprev ? std::max(pindex->pprev->nTimeMax, pindex->nTime) : pindex->nTime);
 
@@ -795,17 +885,6 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
             } else {
                 pindex->m_chain_tx_count = pindex->nTx;
             }
-        }
-
-        if (pindex->nStatus & BLOCK_FAILED_CHILD) {
-            // BLOCK_FAILED_CHILD is deprecated, but may still exist on disk. Replace it with BLOCK_FAILED_VALID.
-            pindex->nStatus = (pindex->nStatus & ~BLOCK_FAILED_CHILD) | BLOCK_FAILED_VALID;
-            m_dirty_blockindex.insert(pindex);
-        }
-        if (!(pindex->nStatus & BLOCK_FAILED_VALID) && pindex->pprev && (pindex->pprev->nStatus & BLOCK_FAILED_VALID)) {
-            // All descendants of invalid blocks are invalid too.
-            pindex->nStatus |= BLOCK_FAILED_VALID;
-            m_dirty_blockindex.insert(pindex);
         }
 
         if (pindex->pprev) {
@@ -1420,7 +1499,17 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
 bool BlockManager::ReadBlock(CBlock& block, const CBlockIndex& index) const
 {
     const FlatFilePos block_pos{WITH_LOCK(cs_main, return index.GetBlockPos())};
-    return ReadBlock(block, block_pos, index.GetBlockHash(), index.nHeight);
+    const std::optional<int> expected_height{WITH_LOCK(
+        cs_main, return index.nStatus & BLOCK_ANCHOR_INELIGIBLE
+                            ? std::optional<int>{}
+                            : std::optional<int>{index.nHeight})};
+    // An old active branch may extend past the boundary before X was pinned.
+    // Its stored H+1 block legitimately uses the legacy codec and therefore
+    // the legacy identity domain, even though H+1 is modern under the newly
+    // installed rules. It is read only so the undo-backed off-anchor recovery
+    // can discard it. Use the block's immutable codec marker for that stored
+    // side history; canonical blocks keep the height-selected identity check.
+    return ReadBlock(block, block_pos, index.GetBlockHash(), expected_height);
 }
 
 BlockManager::ReadRawBlockResult BlockManager::ReadRawBlock(const FlatFilePos& pos, std::optional<std::pair<size_t, size_t>> block_part) const

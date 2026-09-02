@@ -101,8 +101,14 @@ struct TransitionSetup : public ChainTestingSetup {
         opts.extra_args.push_back("-acceptnonstdtxn=1");
         return opts;
     }
-    explicit TransitionSetup(TestOpts opts = {}) : ChainTestingSetup{ChainType::REGTEST, WithDefaults(std::move(opts))}
+    explicit TransitionSetup(TestOpts opts = {}) : ChainTestingSetup{ChainType::REGTEST, WithDefaults(opts)}
     {
+        // ChainTestingSetup does not copy these two TestOpts fields (the
+        // higher-level TestingSetup normally does). This fixture invokes
+        // LoadVerifyActivateChainstate directly, so preserve them here; the
+        // disk-backed restart test must actually retain its coins database.
+        m_coins_db_in_memory = opts.coins_db_in_memory;
+        m_block_tree_db_in_memory = opts.block_tree_db_in_memory;
         SetMockTime(MOCK_NOW);
         auto& consensus{const_cast<Consensus::Params&>(m_node.chainman->GetConsensus())};
         consensus.legacy_b3coin = true;
@@ -156,6 +162,34 @@ std::shared_ptr<CBlock> CodecRoundTrip(const CBlock& block)
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(legacy_transition_tests, TransitionSetup)
+
+BOOST_AUTO_TEST_CASE(validation_schema_pre_h_state_marks_without_reindex)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    auto& consensus{const_cast<Consensus::Params&>(chainman.GetConsensus())};
+    consensus.hard_fork_height = 11; // H=10; the loaded tip is genesis.
+
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!chainman.ActiveChainstate().CoinsDB()
+                         .B3ValidationSchemaV1Current());
+    }
+
+    node::ChainstateLoadOptions options;
+    options.mempool = Assert(m_node.mempool.get());
+    options.coins_db_in_memory = m_coins_db_in_memory;
+    options.prune = chainman.m_blockman.IsPruneMode();
+    auto [status, error]{node::VerifyLoadedChainstate(chainman, options)};
+    BOOST_REQUIRE_MESSAGE(status == node::ChainstateLoadStatus::SUCCESS,
+                          error.original);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(chainman.ActiveChainstate().CoinsDB()
+                        .B3ValidationSchemaV1Current());
+        BOOST_CHECK(!chainman.ActiveChainstate().CoinsDB().NeedsUpgrade());
+        BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->nHeight, 0);
+    }
+}
 
 BOOST_AUTO_TEST_CASE(load_external_block_file_uses_legacy_codec)
 {
@@ -450,14 +484,40 @@ BOOST_AUTO_TEST_CASE(full_legacy_to_modern_transition)
 
     // ---- Mempool at the boundary, part 5: post-H admission (tip = H, the
     // next block is modern). A legacy-encoded transaction is refused; a
-    // modern-encoded spend of the pre-H UTXO is admitted; and the pre-H
-    // mempool.dat does not repopulate the pool.
+    // witness-bearing transaction that the next block cannot commit to is
+    // refused; a modern-encoded spend of the pre-H UTXO is admitted; and the
+    // pre-H mempool.dat does not repopulate the pool.
     Txid modern_mempool_txid{};
     {
         CMutableTransaction stale_legacy{legacy_spend_of(coinbase4, /*fee=*/100'000)};
         const auto res{WITH_LOCK(cs_main, return chainman.ProcessTransaction(MakeTransactionRef(stale_legacy)))};
         BOOST_REQUIRE(res.m_result_type != MempoolAcceptResult::ResultType::VALID);
         BOOST_CHECK_EQUAL(res.m_state.GetRejectReason(), "legacy-txn-in-modern-era");
+
+        // Mainnet deliberately has no witness activation yet. Modern script
+        // flags recognize witness programs (so they never become
+        // anyone-can-spend), but a block containing witness data is rejected
+        // as unexpected until commitment rules activate. The mempool must not
+        // accept such a transaction and poison block template creation. Use a
+        // mature legacy OP_TRUE coin so the otherwise-unused witness is the
+        // only reason for rejection.
+        CMutableTransaction witness_poison;
+        witness_poison.version = 2;
+        witness_poison.vin.resize(1);
+        witness_poison.vin[0].prevout = COutPoint{coinbase4, 0};
+        witness_poison.vin[0].scriptWitness.stack.push_back({0x01});
+        witness_poison.vout.emplace_back(
+            legacy::GetProofOfWorkReward(0, 4, consensus) - 100'000,
+            padded_script);
+        const auto witness_result{WITH_LOCK(
+            cs_main,
+            return chainman.ProcessTransaction(
+                MakeTransactionRef(witness_poison)))};
+        BOOST_REQUIRE(witness_result.m_result_type !=
+                      MempoolAcceptResult::ResultType::VALID);
+        BOOST_CHECK_EQUAL(witness_result.m_state.GetRejectReason(),
+                          "witness-not-active");
+        BOOST_CHECK(!pool.exists(CTransaction{witness_poison}.GetHash()));
 
         CMutableTransaction modern_tx;
         modern_tx.version = 2;
@@ -2429,14 +2489,15 @@ BOOST_AUTO_TEST_CASE(stake_policy_in_corridor)
     validator_key.fill(0x42);
     const CScript owner{CScript() << OP_TRUE};
     const CAmount principal{legacy::GetProofOfWorkReward(0, 1, consensus) / 2};
+    const CAmount stake_change{
+        legacy::GetProofOfWorkReward(0, 1, consensus) - principal - 1000};
     CMutableTransaction stake_tx;
     stake_tx.version = 2;
     stake_tx.vin.resize(1);
     stake_tx.vin[0].prevout = COutPoint{fund_txid, 0};
     stake_tx.vin[0].scriptSig = CScript{};
     stake_tx.vout.emplace_back(principal, modern::MakeStakeScript(validator_key, owner));
-    stake_tx.vout.emplace_back(legacy::GetProofOfWorkReward(0, 1, consensus) - principal - 1000,
-                               CScript() << OP_TRUE);
+    stake_tx.vout.emplace_back(stake_change, CScript() << OP_TRUE);
     const Txid stake_txid{CTransaction{stake_tx}.GetHash()};
     {
         CBlock block{build_corridor(tip(), {stake_tx})};
@@ -2456,6 +2517,37 @@ BOOST_AUTO_TEST_CASE(stake_policy_in_corridor)
         BOOST_CHECK_EQUAL(view->amount, principal);
         BOOST_CHECK(view->validator_key == validator_key);
         BOOST_CHECK(view->owner_script == owner);
+    }
+
+    // M6 covers every post-H coinbase, including the PoW corridor. Give this
+    // candidate an ordinary transaction paying exactly the STAKE-valued
+    // coinbase fee so `bad-cb-stake` — not the coinbase amount cap — is the
+    // reason it fails. The accepted block above is the positive control:
+    // the same corridor still permits STAKE creation by a normal transaction.
+    {
+        CMutableTransaction fee_tx;
+        fee_tx.version = 2;
+        fee_tx.vin.resize(1);
+        fee_tx.vin[0].prevout = COutPoint{stake_txid, 1};
+        fee_tx.vin[0].scriptSig = CScript{};
+        fee_tx.vout.emplace_back(stake_change - 1000,
+                                 CScript() << OP_TRUE);
+
+        CBlock block{build_corridor(tip(), {fee_tx})};
+        CMutableTransaction coinbase{*block.vtx[0]};
+        coinbase.vout[0] = CTxOut{
+            1000, modern::MakeStakeScript(validator_key, owner)};
+        block.vtx[0] = MakeTransactionRef(std::move(coinbase));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.nNonce = 0;
+        while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
+
+        LOCK(cs_main);
+        const BlockValidationState state{TestBlockValidity(
+            chainman.ActiveChainstate(), block, /*check_pow=*/true,
+            /*check_merkle_root=*/true)};
+        BOOST_REQUIRE(state.IsInvalid());
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-cb-stake");
     }
 
     // A malformed STAKE claim (zero validator key) is a block failure.
@@ -2770,6 +2862,275 @@ BOOST_AUTO_TEST_CASE(full_corridor_end_to_end)
 //! the chain continues after the restart, and a chainstate rebuild
 //! reconnects the whole legacy+corridor history to the same tip and
 //! registry.
+BOOST_FIXTURE_TEST_CASE(off_anchor_disk_tip_unwinds_before_schema_trust,
+                        TransitionDiskSetup)
+{
+    ChainstateManager& initial_chainman{*m_node.chainman};
+    auto& consensus{
+        const_cast<Consensus::Params&>(initial_chainman.GetConsensus())};
+    consensus.hard_fork_height.reset();
+    consensus.legacy_final_hash.reset();
+
+    constexpr int H{8};
+    constexpr uint32_t TRANSITION_BITS{0x207fffff};
+    const COutPoint recovery_funding{
+        Txid::FromUint256(uint256::ONE), 0};
+    {
+        LOCK(cs_main);
+        initial_chainman.ActiveChainstate().CoinsTip().AddCoin(
+            recovery_funding,
+            Coin{CTxOut{2 * COIN, CScript() << OP_TRUE},
+                 /*nHeightIn=*/1, /*fCoinBaseIn=*/false},
+            /*possible_overwrite=*/false);
+    }
+    const auto build_legacy_pow{[&](const CBlockIndex* prev,
+                                    const int64_t tag) {
+        const int height{prev->nHeight + 1};
+        const uint32_t time{static_cast<uint32_t>(prev->GetBlockTime() + 17)};
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = time;
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig =
+            CScript() << height << CScriptNum{tag};
+        coinbase.vout.emplace_back(
+            legacy::GetProofOfWorkReward(/*fees=*/0, height, consensus),
+            CScript() << OP_TRUE);
+
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = time;
+        block.nBits =
+            legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false,
+                                          consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) {
+            ++block.nNonce;
+        }
+        return block;
+    }};
+
+    // Build a valid legacy branch one block longer than the future sealed
+    // branch, then store the future X branch as side history. This is the
+    // exact shape an old pre-pin database can have: its coins tip is H+1 on
+    // the old branch, while the genuine X at H is present in the index.
+    const CBlockIndex* fake_prev{
+        WITH_LOCK(cs_main, return initial_chainman.ActiveChain().Genesis())};
+    Txid abandoned_txid;
+    for (int height{1}; height <= H + 1; ++height) {
+        CBlock raw_block{build_legacy_pow(fake_prev, 1)};
+        if (height == H + 1) {
+            CMutableTransaction abandoned;
+            abandoned.version = 1;
+            abandoned.nTime = raw_block.nTime;
+            abandoned.m_legacy_encoding = true;
+            abandoned.vin.emplace_back(recovery_funding);
+            abandoned.vout.emplace_back(2 * COIN - 1000,
+                                         CScript() << OP_TRUE);
+            abandoned_txid = abandoned.GetHash();
+            raw_block.vtx.push_back(
+                MakeTransactionRef(std::move(abandoned)));
+            raw_block.hashMerkleRoot = BlockMerkleRoot(raw_block);
+            raw_block.nNonce = 0;
+            const arith_uint256 target{
+                arith_uint256().SetCompact(raw_block.nBits)};
+            while (UintToArith256(raw_block.GetLegacyB3Hash()) > target) {
+                ++raw_block.nNonce;
+            }
+        }
+        const auto block{CodecRoundTrip(raw_block)};
+        bool new_block{false};
+        BOOST_REQUIRE(initial_chainman.ProcessNewBlock(
+            block, /*force_processing=*/true, /*min_pow_checked=*/true,
+            &new_block));
+        BOOST_REQUIRE(new_block);
+        fake_prev = WITH_LOCK(
+            cs_main,
+            return initial_chainman.m_blockman.LookupBlockIndex(
+                block->GetLegacyB3Hash()));
+        BOOST_REQUIRE(fake_prev != nullptr);
+    }
+    const uint256 fake_tip_hash{fake_prev->GetBlockHash()};
+
+    const CBlockIndex* genuine_prev{
+        WITH_LOCK(cs_main, return initial_chainman.ActiveChain().Genesis())};
+    for (int height{1}; height <= H; ++height) {
+        const auto block{CodecRoundTrip(build_legacy_pow(genuine_prev, 2))};
+        bool new_block{false};
+        BOOST_REQUIRE(initial_chainman.ProcessNewBlock(
+            block, /*force_processing=*/true, /*min_pow_checked=*/true,
+            &new_block));
+        BOOST_REQUIRE(new_block);
+        genuine_prev = WITH_LOCK(
+            cs_main,
+            return initial_chainman.m_blockman.LookupBlockIndex(
+                block->GetLegacyB3Hash()));
+        BOOST_REQUIRE(genuine_prev != nullptr);
+    }
+    const uint256 X{genuine_prev->GetBlockHash()};
+    BOOST_REQUIRE_EQUAL(
+        WITH_LOCK(cs_main, return initial_chainman.ActiveChain().Tip()->GetBlockHash()).GetHex(),
+        fake_tip_hash.GetHex());
+
+    // Model a marker which was valid before X was known. The upgrade must
+    // revoke it before unwinding; otherwise atomic tip advancement would
+    // incorrectly carry trust from the old branch onto the canonical one.
+    {
+        LOCK(cs_main);
+        initial_chainman.ActiveChainstate().ForceFlushStateToDisk();
+        BOOST_REQUIRE(initial_chainman.ActiveChainstate().CoinsDB()
+                          .MarkB3ValidationSchemaV1Current());
+        BOOST_CHECK(initial_chainman.ActiveChainstate().CoinsDB()
+                        .B3ValidationSchemaV1Current());
+    }
+
+    // Pin only after both branches are on disk, without another activation
+    // pass. The restart must classify the old active branch, load enough state
+    // to undo it, and reach X rather than rejecting the whole database.
+    consensus.hard_fork_height = H + 1;
+    consensus.legacy_final_hash = X;
+    consensus.transition_pow_length = 2;
+    consensus.transition_pow_bits = TRANSITION_BITS;
+    consensus.transition_pow_reward = 0;
+
+    // Store, but do not activate, the canonical first corridor block. After
+    // restart the recovery must not merely stop at X: it must activate this
+    // descendant and level-4 verify it before granting schema trust.
+    CMutableTransaction corridor_coinbase;
+    corridor_coinbase.version = 2;
+    corridor_coinbase.vin.resize(1);
+    corridor_coinbase.vin[0].prevout.SetNull();
+    corridor_coinbase.vin[0].scriptSig =
+        CScript() << CScriptNum{H + 1} << CScriptNum{7};
+    corridor_coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+    CBlock canonical_corridor;
+    canonical_corridor.nVersion = static_cast<int32_t>(
+        Consensus::B3_BLOCK_CODEC_V2_VERSION);
+    canonical_corridor.hashPrevBlock = X;
+    canonical_corridor.nTime =
+        static_cast<uint32_t>(genuine_prev->GetBlockTime() + 60);
+    canonical_corridor.nBits = TRANSITION_BITS;
+    canonical_corridor.vtx.push_back(
+        MakeTransactionRef(std::move(corridor_coinbase)));
+    canonical_corridor.hashMerkleRoot = BlockMerkleRoot(canonical_corridor);
+    while (!CheckTransitionPowEligibility(canonical_corridor)) {
+        ++canonical_corridor.nNonce;
+    }
+    const uint256 canonical_tip_hash{canonical_corridor.GetHash()};
+    {
+        LOCK(cs_main);
+        BlockValidationState accept_state;
+        CBlockIndex* accepted_index{nullptr};
+        bool new_block{false};
+        BOOST_REQUIRE_MESSAGE(
+            initial_chainman.AcceptBlock(
+                std::make_shared<const CBlock>(canonical_corridor),
+                accept_state, &accepted_index, /*fRequested=*/true,
+                /*dbp=*/nullptr, &new_block, /*min_pow_checked=*/true),
+            accept_state.ToString());
+        BOOST_REQUIRE(new_block);
+        BOOST_REQUIRE(accepted_index != nullptr);
+        BOOST_REQUIRE_EQUAL(accepted_index->GetBlockHash().GetHex(),
+                            canonical_tip_hash.GetHex());
+        BOOST_REQUIRE_EQUAL(initial_chainman.ActiveChain().Tip()
+                                ->GetBlockHash()
+                                .GetHex(),
+                            fake_tip_hash.GetHex());
+    }
+    {
+        LOCK(cs_main);
+        initial_chainman.ActiveChainstate().ForceFlushStateToDisk();
+        BOOST_CHECK(initial_chainman.ActiveChainstate().CoinsDB()
+                        .B3ValidationSchemaV1Current());
+    }
+
+    m_node.chainman.reset();
+    m_make_chainman();
+    ChainstateManager& chainman{*m_node.chainman};
+    node::ChainstateLoadOptions options;
+    options.mempool = Assert(m_node.mempool.get());
+    options.coins_db_in_memory = m_coins_db_in_memory;
+    options.prune = chainman.m_blockman.IsPruneMode();
+    options.check_blocks = DEFAULT_CHECKBLOCKS;
+    options.check_level = DEFAULT_CHECKLEVEL;
+
+    auto [status, error]{
+        node::LoadChainstate(chainman, m_kernel_cache_sizes, options)};
+    BOOST_REQUIRE_MESSAGE(status == node::ChainstateLoadStatus::SUCCESS,
+                          error.original);
+    CBlockIndex* loaded_fake_tip{nullptr};
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE_EQUAL(chainman.ActiveChain().Tip()->GetBlockHash().GetHex(),
+                            fake_tip_hash.GetHex());
+        BOOST_CHECK(chainman.m_blockman.IsAnchorIneligible(
+            *chainman.ActiveChain().Tip()));
+        loaded_fake_tip = chainman.ActiveChain().Tip();
+        loaded_fake_tip->nStatus &= ~BLOCK_ANCHOR_INELIGIBLE;
+    }
+
+    // Height-selected identity rejects this legacy-codec H+1 block. Exactly
+    // the anchor-ineligible classification permits marker-selected identity
+    // so the stored block can be read for undo recovery.
+    CBlock stored_fake;
+    BOOST_CHECK(!chainman.m_blockman.ReadBlock(stored_fake,
+                                               *loaded_fake_tip));
+    {
+        LOCK(cs_main);
+        loaded_fake_tip->nStatus |= BLOCK_ANCHOR_INELIGIBLE;
+    }
+    BOOST_REQUIRE(
+        chainman.m_blockman.ReadBlock(stored_fake, *loaded_fake_tip));
+
+    std::tie(status, error) = node::VerifyLoadedChainstate(chainman, options);
+    BOOST_REQUIRE_MESSAGE(status == node::ChainstateLoadStatus::SUCCESS,
+                          error.original);
+    {
+        LOCK(cs_main);
+        // The off-anchor state was allowed to reach the recovery path, but it
+        // was explicitly not granted the repaired validation-schema marker.
+        BOOST_CHECK(!chainman.ActiveChainstate().CoinsDB()
+                         .B3ValidationSchemaV1Current());
+    }
+
+    BlockValidationState activation_state;
+    BOOST_REQUIRE_MESSAGE(
+        chainman.ActiveChainstate().ActivateBestChain(activation_state),
+        activation_state.ToString());
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE_EQUAL(chainman.ActiveChain().Tip()->nHeight, H + 1);
+        BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->GetBlockHash().GetHex(),
+                          canonical_tip_hash.GetHex());
+        BOOST_CHECK(!chainman.m_blockman.IsAnchorIneligible(
+            *chainman.ActiveChain().Tip()));
+        BOOST_CHECK(!chainman.ActiveChainstate().CoinsDB()
+                         .B3ValidationSchemaV1Current());
+        // Persist the recovered canonical coins tip while the schema marker is
+        // still deliberately absent. The mandatory verification below reads
+        // its base view from CoinsDB(), not the unflushed CoinsTip cache.
+        chainman.ActiveChainstate().ForceFlushStateToDisk();
+        BOOST_CHECK(!chainman.ActiveChainstate().CoinsDB()
+                         .B3ValidationSchemaV1Current());
+    }
+    BOOST_CHECK(!m_node.mempool->exists(abandoned_txid));
+
+    // Only the now-canonical state may receive schema trust. The neighboring
+    // corridor restart test independently proves that a body-invalid on-X
+    // chain fails this pass and leaves the marker absent.
+    std::tie(status, error) = node::VerifyLoadedChainstate(chainman, options);
+    BOOST_REQUIRE_MESSAGE(status == node::ChainstateLoadStatus::SUCCESS,
+                          error.original);
+    BOOST_CHECK(WITH_LOCK(
+        cs_main, return chainman.ActiveChainstate().CoinsDB()
+                            .B3ValidationSchemaV1Current()));
+}
+
 BOOST_FIXTURE_TEST_CASE(corridor_restart_and_reindex, TransitionDiskSetup)
 {
     const Consensus::Params& consensus{m_node.chainman->GetConsensus()};
@@ -2886,10 +3247,80 @@ BOOST_FIXTURE_TEST_CASE(corridor_restart_and_reindex, TransitionDiskSetup)
     {
         LOCK(cs_main);
         m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
+        // This models an official beta.2 coins DB: it is populated but has no
+        // schema-tip marker because the initial fixture load occurred before
+        // the synthetic transition was configured.
+        BOOST_CHECK(!m_node.chainman->ActiveChainstate().CoinsDB()
+                         .B3ValidationSchemaV1Current());
     }
     m_node.chainman.reset();
     m_make_chainman();
-    LoadVerifyActivateChainstate();
+
+    node::ChainstateLoadOptions load_options;
+    load_options.mempool = Assert(m_node.mempool.get());
+    load_options.coins_db_in_memory = m_coins_db_in_memory;
+    load_options.prune = m_node.chainman->m_blockman.IsPruneMode();
+    load_options.check_blocks = DEFAULT_CHECKBLOCKS;
+    load_options.check_level = DEFAULT_CHECKLEVEL;
+    load_options.require_full_verification = false;
+    auto [load_status, load_error]{node::LoadChainstate(
+        *m_node.chainman, m_kernel_cache_sizes, load_options)};
+    BOOST_REQUIRE_MESSAGE(load_status == node::ChainstateLoadStatus::SUCCESS,
+                          load_error.original);
+
+    // A pruned/missing post-H block must stop before reconnect and must not
+    // write the marker, even when ordinary startup can still read its test
+    // file. Restore the status bit afterward for the valid-path check below.
+    CBlockIndex* first_post_h{nullptr};
+    {
+        LOCK(cs_main);
+        first_post_h = m_node.chainman->ActiveChain()[H + 1];
+        BOOST_REQUIRE(first_post_h != nullptr);
+        BOOST_REQUIRE(first_post_h->nStatus & BLOCK_HAVE_DATA);
+        first_post_h->nStatus &= ~BLOCK_HAVE_DATA;
+    }
+    std::tie(load_status, load_error) =
+        node::VerifyLoadedChainstate(*m_node.chainman, load_options);
+    BOOST_REQUIRE(load_status == node::ChainstateLoadStatus::FAILURE);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!m_node.chainman->ActiveChainstate().CoinsDB()
+                         .B3ValidationSchemaV1Current());
+        first_post_h->nStatus |= BLOCK_HAVE_DATA;
+    }
+
+    // Make the already-populated post-H state invalid under a deterministic
+    // body rule that only the mandatory level-4 reconnect can see. This
+    // models an old -reindex-chainstate omission: ordinary startup would
+    // trust BLOCK_VALID_SCRIPTS, while the schema pass must fail closed and
+    // leave its marker false.
+    mutable_consensus.min_stake_amount = 300'000;
+    std::tie(load_status, load_error) =
+        node::VerifyLoadedChainstate(*m_node.chainman, load_options);
+    BOOST_REQUIRE(load_status == node::ChainstateLoadStatus::FAILURE);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!m_node.chainman->ActiveChainstate().CoinsDB()
+                         .B3ValidationSchemaV1Current());
+    }
+
+    // Restore the rule used to create the chain. The same mandatory pass now
+    // reconnects every post-H block successfully and only then writes the
+    // durable marker. No full block-index reindex is involved.
+    mutable_consensus.min_stake_amount = 1000;
+    std::tie(load_status, load_error) =
+        node::VerifyLoadedChainstate(*m_node.chainman, load_options);
+    BOOST_REQUIRE_MESSAGE(load_status == node::ChainstateLoadStatus::SUCCESS,
+                          load_error.original);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(m_node.chainman->ActiveChainstate().CoinsDB()
+                        .B3ValidationSchemaV1Current());
+    }
+    BlockValidationState activation_state;
+    BOOST_REQUIRE_MESSAGE(
+        m_node.chainman->ActiveChainstate().ActivateBestChain(activation_state),
+        activation_state.ToString());
     BOOST_REQUIRE_EQUAL(tip()->nHeight, pre_restart_height);
     BOOST_CHECK_EQUAL(tip()->GetBlockHash().GetHex(), pre_restart_hash.GetHex());
 
@@ -2899,6 +3330,12 @@ BOOST_FIXTURE_TEST_CASE(corridor_restart_and_reindex, TransitionDiskSetup)
         CBlock block{build_corridor(tip(), {})};
         BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(std::make_shared<const CBlock>(block), true, true, &new_block));
         BOOST_REQUIRE_EQUAL(tip()->nHeight, pre_restart_height + 1);
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
+        // Patched writes advance the schema tip in the same batch as the
+        // coins best block, so ordinary growth does not trigger another scan.
+        BOOST_CHECK(m_node.chainman->ActiveChainstate().CoinsDB()
+                        .B3ValidationSchemaV1Current());
     }
 
     // ---- Chainstate reindex: wipe the chainstate database and rebuild it
@@ -2916,6 +3353,8 @@ BOOST_FIXTURE_TEST_CASE(corridor_restart_and_reindex, TransitionDiskSetup)
     BOOST_REQUIRE_EQUAL(tip()->nHeight, pre_restart_height + 1);
     {
         LOCK(cs_main);
+        BOOST_CHECK(m_node.chainman->ActiveChainstate().CoinsDB()
+                        .B3ValidationSchemaV1Current());
         m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
         const node::StakeRegistry registry{node::DeriveStakeRegistry(
             m_node.chainman->ActiveChainstate().CoinsDB(), tip()->nHeight, consensus)};

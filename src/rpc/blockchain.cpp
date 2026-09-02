@@ -3522,17 +3522,30 @@ static RPCHelpMan getfinalitystatus()
         "getfinalitystatus",
         "B3 Modern-PoS finality diagnostics (node-level): the epoch state machine, the current\n"
         "validator set, the latest finalized checkpoint, the persisted finality pin and the local\n"
-        "signature pool. Empty fields mean the modern-PoS rules are not configured or not yet active.\n",
+        "signature pool. During the corridor, derived preparation fields may be present while active\n"
+        "is false; the exact Set0 preview appears at M-1.\n",
         {},
         RPCResult{RPCResult::Type::OBJ, "", "",
                   {
                       {RPCResult::Type::BOOL, "configured", "modern-PoS rules configured and boundary pinned"},
-                      {RPCResult::Type::BOOL, "active", "the finality state machine is derivable at the tip"},
+                      {RPCResult::Type::BOOL, "active", "true once the chain tip has reached the first modern-PoS block"},
                       {RPCResult::Type::BOOL, "bootstrapped", /*optional=*/true, ""},
                       {RPCResult::Type::NUM, "epoch", /*optional=*/true, ""},
                       {RPCResult::Type::NUM, "epoch_start", /*optional=*/true, ""},
                       {RPCResult::Type::BOOL, "handover_certified", /*optional=*/true, ""},
                       {RPCResult::Type::BOOL, "lineage_broken", /*optional=*/true, ""},
+                      {RPCResult::Type::OBJ, "set0_preview", /*optional=*/true,
+                       "the exact bootstrap set projected for M, present only when the tip is M-1",
+                       {
+                           {RPCResult::Type::NUM, "snapshot_height", "the Set0 snapshot height M-1"},
+                           {RPCResult::Type::NUM, "activation_height", "the first modern-PoS height M"},
+                           {RPCResult::Type::BOOL, "ready", "whether the snapshot meets the bootstrap floor"},
+                           {RPCResult::Type::NUM, "minimum_size", "minimum validator count required to bootstrap"},
+                           {RPCResult::Type::NUM, "size", /*optional=*/true, "validator count"},
+                           {RPCResult::Type::NUM, "total_weight", /*optional=*/true, "whole modern B3"},
+                           {RPCResult::Type::NUM, "quorum_weight", /*optional=*/true, ""},
+                           {RPCResult::Type::STR_HEX, "set_hash", /*optional=*/true, ""},
+                       }},
                       {RPCResult::Type::OBJ, "validator_set", /*optional=*/true, "the set in force",
                        {
                            {RPCResult::Type::NUM, "size", ""},
@@ -3566,7 +3579,11 @@ static RPCHelpMan getfinalitystatus()
             LOCK(cs_main);
             Chainstate& chainstate{chainman.ActiveChainstate()};
             const CBlockIndex* tip{chainstate.m_chain.Tip()};
-            bool active{false};
+            const std::optional<int> modern_start{
+                Consensus::ModernPosStartHeight(consensus)};
+            const bool active{configured && tip && modern_start &&
+                              tip->nHeight >= *modern_start};
+            obj.pushKV("active", active);
             if (configured && tip) {
                 const node::BridgeStateIndex* bridge_index{nullptr};
                 if (Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
@@ -3580,14 +3597,36 @@ static RPCHelpMan getfinalitystatus()
                 node::FinalityTracker& tracker{chainstate.ModernFinality()};
                 if (tracker.Sync(chainstate.m_chain, chainstate.m_blockman,
                                  consensus, *tip, bridge_index)) {
-                    active = true;
                     const node::FinalityTracker::State& state{tracker.Current()};
-                    obj.pushKV("active", true);
                     obj.pushKV("bootstrapped", state.bootstrapped);
                     obj.pushKV("epoch", state.epoch);
                     obj.pushKV("epoch_start", state.epoch_starts.empty() ? -1 : state.epoch_starts.back());
                     obj.pushKV("handover_certified", state.handover_certified);
                     obj.pushKV("lineage_broken", state.lineage_broken);
+                    if (modern_start && consensus.modern_pos &&
+                        tip->nHeight == *modern_start - 1) {
+                        const auto set0{
+                            tracker.SetInForceAt(*modern_start, consensus)};
+                        UniValue preview(UniValue::VOBJ);
+                        preview.pushKV("snapshot_height", *modern_start - 1);
+                        preview.pushKV("activation_height", *modern_start);
+                        preview.pushKV("ready", set0 != nullptr);
+                        preview.pushKV(
+                            "minimum_size",
+                            consensus.modern_pos->min_finality_set);
+                        if (set0) {
+                            preview.pushKV(
+                                "size",
+                                static_cast<uint64_t>(set0->Size()));
+                            preview.pushKV("total_weight",
+                                           set0->TotalWeight());
+                            preview.pushKV("quorum_weight",
+                                           set0->QuorumWeight());
+                            preview.pushKV("set_hash",
+                                           set0->SetHash().GetHex());
+                        }
+                        obj.pushKV("set0_preview", preview);
+                    }
                     if (state.current) {
                         UniValue set(UniValue::VOBJ);
                         set.pushKV("size", static_cast<uint64_t>(state.current->Size()));
@@ -3606,7 +3645,6 @@ static RPCHelpMan getfinalitystatus()
                     }
                 }
             }
-            if (!active) obj.pushKV("active", false);
             if (const auto pin{chainstate.m_blockman.FinalityAnchor()}) {
                 UniValue p(UniValue::VOBJ);
                 p.pushKV("height", pin->first);

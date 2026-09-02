@@ -7,8 +7,9 @@
 #include <coins.h>
 #include <consensus/amount.h>
 #include <crypto/common.h>
-#include <modern/policy.h>
 #include <modern/asset_validation.h>
+#include <modern/policy.h>
+#include <modern/stake.h>
 #include <policy/feerate.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
@@ -17,6 +18,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -222,9 +224,10 @@ BOOST_AUTO_TEST_CASE(owner_suffix_is_any_nonempty_script)
     BOOST_CHECK(!modern::MakeAssetOwnerOutput(
         TestAsset(), 1, modern::PolicyType::BURN, TestOwner()));
 
-    // One carrier cannot be hidden inside another carrier.  Keeping the
+    // One carrier cannot be hidden inside another carrier. Keeping the
     // envelope single-layer makes parsing, signing and script execution use
-    // exactly the same owner script.
+    // exactly the same owner script, regardless of which B3 namespace the
+    // nested carrier claims.
     const auto inner{modern::MakeAssetOwnerOutput(TestAsset(), 1, TestOwner())};
     BOOST_REQUIRE(inner.has_value());
     BOOST_CHECK(!modern::MakeAssetOwnerOutput(
@@ -235,7 +238,26 @@ BOOST_AUTO_TEST_CASE(owner_suffix_is_any_nonempty_script)
     BOOST_CHECK(modern::ClaimsAssetOutput(outer));
     BOOST_CHECK(!modern::ParseAssetOutput(outer, nested_error));
     BOOST_CHECK_EQUAL(nested_error,
-                      "asset owner suffix cannot be another asset carrier");
+                      "asset owner suffix cannot be another B3 policy carrier");
+
+    std::array<unsigned char, modern::STAKE_VALIDATOR_KEY_SIZE> validator_key{};
+    validator_key.fill(0x33);
+    const CScript nested_stake{
+        modern::MakeStakeScript(validator_key, TestOwner())};
+    BOOST_CHECK(modern::ClaimsB3PolicyCarrier(nested_stake));
+    BOOST_CHECK(!modern::MakeAssetOwnerOutput(
+        TestAsset(), 1, modern::PolicyType::OWNER, nested_stake));
+    BOOST_CHECK(!modern::ParseAssetOutput(
+        OwnerFromPayload(Payload(*inner), nested_stake), nested_error));
+    BOOST_CHECK_EQUAL(nested_error,
+                      "asset owner suffix cannot be another B3 policy carrier");
+
+    std::vector<unsigned char> metadata_payload{'B', '3', 'M', 'C', 0x00};
+    const CScript nested_metadata{CScript() << metadata_payload << OP_DROP << OP_FALSE};
+    BOOST_CHECK(modern::ClaimsB3PolicyCarrier(nested_metadata));
+    BOOST_CHECK(!modern::MakeAssetOwnerOutput(
+        TestAsset(), 1, modern::PolicyType::OWNER, nested_metadata));
+    BOOST_CHECK(!modern::ClaimsB3PolicyCarrier(CScript() << OP_TRUE));
 }
 
 BOOST_AUTO_TEST_CASE(explicit_burn_roundtrip_and_form_separation)

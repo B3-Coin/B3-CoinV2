@@ -18,12 +18,40 @@
 #include <serialize.h>
 #include <uint256.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <vector>
 
 namespace modern {
+
+/**
+ * Whether the script starts by claiming one of B3's policy-carrier
+ * namespaces. This intentionally recognizes a magic prefix rather than a
+ * fully valid carrier: an owner suffix must never hide a second policy layer,
+ * including a malformed one that another consumer could interpret
+ * differently. OP_RETURN-first legacy B3A1 claims remain covered by the
+ * asset-specific ClaimsAssetOutput() check.
+ */
+inline bool ClaimsB3PolicyCarrier(const CScript& script)
+{
+    CScript::const_iterator pc{script.begin()};
+    opcodetype opcode;
+    std::vector<unsigned char> data;
+    if (!script.GetOp(pc, opcode, data) || opcode > OP_PUSHDATA4 || data.size() < 4) {
+        return false;
+    }
+    static constexpr std::array<std::array<unsigned char, 4>, 3> magics{{
+        {{'B', '3', 'A', '1'}},
+        {{'B', '3', 'S', '1'}},
+        {{'B', '3', 'M', 'C'}},
+    }};
+    return std::any_of(magics.begin(), magics.end(), [&](const auto& magic) {
+        return std::equal(magic.begin(), magic.end(), data.begin());
+    });
+}
 
 /**
  * Versioned B3 Policy Output primitives (modern era only).

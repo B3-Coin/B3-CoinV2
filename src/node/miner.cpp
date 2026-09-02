@@ -622,11 +622,21 @@ bool BlockAssembler::TestChunkTransactions(
 {
     resulting_fn_pod_total = m_fn_pod_issued_total;
     resulting_finality_binding_preview.reset();
+    const bool witness_active{DeploymentActiveAfter(
+        m_chainstate.m_chain.Tip(), m_chainstate.m_chainman,
+        Consensus::DEPLOYMENT_SEGWIT)};
     for (const auto tx : txs) {
         if (!IsFinalTx(tx.get().GetTx(), nHeight, m_lock_time_cutoff)) {
             return false;
         }
         const CTransaction& transaction{tx.get().GetTx()};
+        // The mempool rejects these while witness commitments are inactive,
+        // but retain a production-side guard for entries restored by an older
+        // binary or injected through test/debug code. One stale entry must not
+        // poison every block template.
+        if (!witness_active && transaction.HasWitness()) {
+            return false;
+        }
         const bool has_finality_key_evidence{std::any_of(
             transaction.mpa.begin(), transaction.mpa.end(),
             [](const CMpaRecord& record) {

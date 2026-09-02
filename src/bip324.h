@@ -12,6 +12,7 @@
 #include <crypto/chacha20.h>
 #include <crypto/chacha20poly1305.h>
 #include <key.h>
+#include <kernel/messagestartchars.h>
 #include <pubkey.h>
 #include <span.h>
 
@@ -40,6 +41,10 @@ private:
     std::array<std::byte, GARBAGE_TERMINATOR_LEN> m_send_garbage_terminator;
     std::array<std::byte, GARBAGE_TERMINATOR_LEN> m_recv_garbage_terminator;
 
+    void InitializeWithMagic(const EllSwiftPubKey& their_pubkey, bool initiator,
+                             bool self_decrypt,
+                             const MessageStartChars& message_start) noexcept;
+
 public:
     /** No default constructor; keys must be provided to create a BIP324Cipher. */
     BIP324Cipher() = delete;
@@ -60,6 +65,12 @@ public:
      * and decryption can be tested without knowing the other side's private key.
      */
     void Initialize(const EllSwiftPubKey& their_pubkey, bool initiator, bool self_decrypt = false) noexcept;
+
+    /** Initialize with explicit network magic for published interoperability
+     * test vectors. Production callers must use Initialize(). */
+    void InitializeForTesting(const EllSwiftPubKey& their_pubkey, bool initiator,
+                              const MessageStartChars& message_start,
+                              bool self_decrypt = false) noexcept;
 
     /** Determine whether this cipher is fully initialized. */
     explicit operator bool() const noexcept { return m_send_l_cipher.has_value(); }

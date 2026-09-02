@@ -352,8 +352,8 @@ inline std::optional<ModernOutput> ParseAssetOutput(const CTxOut& txout, std::st
     // from being redundant, nesting would make different consumers disagree
     // about whether one or several prefixes should be removed before script
     // execution.
-    if (ClaimsAssetOutput(owner_script)) {
-        error = "asset owner suffix cannot be another asset carrier";
+    if (ClaimsAssetOutput(owner_script) || ClaimsB3PolicyCarrier(owner_script)) {
+        error = "asset owner suffix cannot be another B3 policy carrier";
         return std::nullopt;
     }
     out.policy_commitment = AssetOwnerCommitment(owner_script);
@@ -375,7 +375,7 @@ inline std::optional<CTxOut> MakeAssetOwnerOutput(const ModernOutput& out,
     if (out.asset == NativeAsset() || out.amount < 1 || out.amount > MAX_MONEY ||
         !IsAssetOwnerPolicyShape(out.policy_type, out.policy_version, out.policy_params) ||
         owner_script.empty() ||
-        ClaimsAssetOutput(owner_script) ||
+        ClaimsAssetOutput(owner_script) || ClaimsB3PolicyCarrier(owner_script) ||
         out.policy_commitment != AssetOwnerCommitment(owner_script)) {
         return std::nullopt;
     }

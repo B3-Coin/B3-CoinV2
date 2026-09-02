@@ -31,6 +31,19 @@ BOOST_FIXTURE_TEST_CASE(binding_tx_standard_relayable_and_minable, FinalityChain
 {
     PrepareFinalityChain();
     const int M{m_M};
+
+    // The finality tracker deliberately scans the corridor to prepare Set_0,
+    // but the public epoch status must remain inactive until block M itself
+    // has connected. Binding diagnostics are already available independently.
+    {
+        const auto pre_m{m_node.chain->finalityStatus(m_vk_a)};
+        BOOST_CHECK(pre_m.configured);
+        BOOST_CHECK(!pre_m.active);
+        BOOST_CHECK(pre_m.bound);
+        BOOST_CHECK(!pre_m.bootstrapped);
+        BOOST_CHECK_EQUAL(Tip()->nHeight, M - 1);
+    }
+
     ProduceTo(M + 2, m_vk_a);
     ChainstateManager& chainman{*m_node.chainman};
 

@@ -6,6 +6,8 @@
 //! capabilities. All peers are in-process mocks; no live peers are
 //! contacted.
 
+#include <consensus/era.h>
+#include <chain.h>
 #include <crypto/common.h>
 #include <legacy/consensus.h>
 #include <net.h>
@@ -16,6 +18,7 @@
 #include <streams.h>
 #include <test/util/net.h>
 #include <test/util/setup_common.h>
+#include <validationinterface.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -35,7 +38,9 @@ CService ip(uint32_t i)
     return CService(CNetAddr(s), Params().GetDefaultPort());
 }
 
-std::unique_ptr<CNode> MakeNode(NodeId id)
+std::unique_ptr<CNode> MakeNode(
+    NodeId id,
+    ConnectionType connection_type = ConnectionType::OUTBOUND_FULL_RELAY)
 {
     return std::make_unique<CNode>(id,
                                    /*sock=*/nullptr,
@@ -44,7 +49,7 @@ std::unique_ptr<CNode> MakeNode(NodeId id)
                                    /*nLocalHostNonceIn=*/0,
                                    CAddress{},
                                    /*addrNameIn=*/"",
-                                   ConnectionType::OUTBOUND_FULL_RELAY,
+                                   connection_type,
                                    /*inbound_onion=*/false,
                                    /*network_key=*/0);
 }
@@ -358,16 +363,18 @@ BOOST_AUTO_TEST_CASE(legacy_peer_services_are_outbound_eligible)
     BOOST_CHECK(peerman.HasAllDesirableServiceFlags(ServiceFlags(NODE_NETWORK | NODE_WITNESS)));
 }
 
-BOOST_AUTO_TEST_CASE(modern_capability_peer_does_not_own_the_legacy_window)
+BOOST_AUTO_TEST_CASE(modern_archival_peer_owns_legacy_window_and_renegotiates_at_h)
 {
     LOCK(NetEventsInterface::g_msgproc_mutex);
     ConnmanTestMsg& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
     connman.SetPeerConnectTimeout(99999s);
     PeerManager& peerman = *m_node.peerman;
 
-    // A peer with a Core-line version is modern-capable: normal feature
-    // negotiation, and it is never handed the historical download window.
-    auto modern{MakeNode(0)};
+    // A fresh pre-H node may have only a post-H upgraded archival peer. The
+    // local 80008 banner makes this mixed connection use the legacy common
+    // mode, and the archival peer must still be allowed to provide ordered
+    // full-block history through getblocks/inv/getdata.
+    CNode* modern{MakeNode(0).release()};
     connman.Handshake(*modern,
                       /*successfully_connected=*/true,
                       /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
@@ -375,24 +382,112 @@ BOOST_AUTO_TEST_CASE(modern_capability_peer_does_not_own_the_legacy_window)
                       /*version=*/PROTOCOL_VERSION,
                       /*relay_txs=*/true);
     BOOST_REQUIRE(!modern->fDisconnect);
-    BOOST_CHECK_EQUAL(modern->GetCommonVersion(), PROTOCOL_VERSION);
+    BOOST_CHECK_EQUAL(modern->GetCommonVersion(),
+                      legacy::P2P_COMPATIBILITY_VERSION);
+    connman.AddTestNode(*modern);
     BOOST_CHECK(peerman.SendMessages(*modern));
-    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*modern), NetMsgType::GETBLOCKS), 0U);
+    BOOST_CHECK_EQUAL(
+        CountType(DrainSentMessages(*modern), NetMsgType::GETBLOCKS), 1U);
 
-    // A legacy-capable peer arriving afterwards claims the window.
-    auto old_client{MakeNode(1)};
-    connman.Handshake(*old_client,
-                      /*successfully_connected=*/true,
-                      /*remote_services=*/ServiceFlags(NODE_NETWORK),
-                      /*local_services=*/ServiceFlags(NODE_NETWORK),
-                      /*version=*/legacy::P2P_PROTOCOL_VERSION,
-                      /*relay_txs=*/true);
-    BOOST_REQUIRE(!old_client->fDisconnect);
-    BOOST_CHECK(peerman.SendMessages(*old_client));
-    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*old_client), NetMsgType::GETBLOCKS), 1U);
+    // A block inventory from that mixed-version peer follows the historical
+    // ordered full-block path rather than being discarded as a modern headers
+    // announcement.
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(
+        *modern, NetMsg::Make(NetMsgType::INV,
+                              std::vector<CInv>{{MSG_BLOCK, uint256::ONE}})));
+    modern->fPauseSend = false;
+    connman.ProcessMessagesOnce(*modern);
+    BOOST_CHECK_EQUAL(
+        CountType(DrainSentMessages(*modern), NetMsgType::GETDATA), 1U);
+
+    // Also cover the connection-thread race: this outbound socket has sent
+    // 80008 but has not completed VERSION/VERACK, so ForEachNode will not see
+    // it during the tip callback. Its next message pass must still close it.
+    auto pending{MakeNode(1)};
+    peerman.InitializeNode(*pending, ServiceFlags(NODE_NETWORK));
+    BOOST_CHECK(peerman.SendMessages(*pending));
+    BOOST_CHECK_EQUAL(
+        CountType(DrainSentMessages(*pending), NetMsgType::VERSION), 1U);
+    BOOST_CHECK(!pending->fSuccessfullyConnected);
+
+    // VERSION cannot change on an open socket. Once our tip reaches H, every
+    // connection on which we sent 80008 is closed without punishment so the
+    // upgraded pair immediately renegotiates the modern protocol.
+    m_node.validation_signals->RegisterValidationInterface(&peerman);
+    CBlockIndex boundary;
+    uint256 boundary_hash{uint256::ONE};
+    boundary.phashBlock = &boundary_hash;
+    boundary.nHeight = *Consensus::LegacyFinalHeight(Params().GetConsensus());
+    m_node.validation_signals->ActiveTipChange(boundary, /*is_ibd=*/false);
+    m_node.validation_signals->UnregisterValidationInterface(&peerman);
+    BOOST_CHECK(modern->fDisconnect);
+    BOOST_CHECK(peerman.SendMessages(*pending));
+    BOOST_CHECK(pending->fDisconnect);
+    peerman.FinalizeNode(*pending);
+
+    auto renegotiated{MakeNode(2)};
+    peerman.InitializeNode(*renegotiated, ServiceFlags(NODE_NETWORK | NODE_WITNESS));
+    BOOST_CHECK(peerman.SendMessages(*renegotiated));
+    bool found_modern_version{false};
+    for (const SentMsg& msg : DrainSentMessages(*renegotiated)) {
+        if (msg.type != NetMsgType::VERSION) continue;
+        SpanReader reader{std::as_bytes(std::span{msg.payload})};
+        int32_t advertised{0};
+        reader >> advertised;
+        BOOST_CHECK_EQUAL(advertised, PROTOCOL_VERSION);
+        found_modern_version = true;
+    }
+    BOOST_CHECK(found_modern_version);
+    peerman.FinalizeNode(*renegotiated);
+
+    // A lagging historical node now initiates an inbound connection to this
+    // post-H archival node. The old client rejects any VERSION below 80006,
+    // so replying with our normal 70016 banner would make archival bootstrap
+    // impossible despite all later getblocks compatibility code.
+    auto historical_inbound{MakeNode(3, ConnectionType::INBOUND)};
+    peerman.InitializeNode(*historical_inbound,
+                           ServiceFlags(NODE_NETWORK | NODE_WITNESS));
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(
+        *historical_inbound,
+        NetMsg::Make(NetMsgType::VERSION,
+                     int32_t{legacy::P2P_PROTOCOL_VERSION},
+                     Using<CustomUintFormatter<8>>(
+                         ServiceFlags{NODE_NETWORK}),
+                     int64_t{}, int64_t{}, CNetAddr::V1(CService{}),
+                     int64_t{}, CNetAddr::V1(CService{}), uint64_t{1},
+                     std::string{}, int32_t{}, true)));
+    historical_inbound->fPauseSend = false;
+    connman.ProcessMessagesOnce(*historical_inbound);
+
+    bool found_legacy_reply{false};
+    for (const SentMsg& msg : DrainSentMessages(*historical_inbound)) {
+        if (msg.type != NetMsgType::VERSION) continue;
+        SpanReader reader{std::as_bytes(std::span{msg.payload})};
+        int32_t advertised{0};
+        reader >> advertised;
+        BOOST_CHECK_GE(advertised, 80'006);
+        BOOST_CHECK_EQUAL(advertised, legacy::P2P_PROTOCOL_VERSION);
+        found_legacy_reply = true;
+    }
+    BOOST_CHECK(found_legacy_reply);
+    BOOST_CHECK_EQUAL(historical_inbound->GetCommonVersion(),
+                      legacy::P2P_COMPATIBILITY_VERSION);
+
+    // This 80008 was a post-H compatibility reply, not a stale pre-H banner:
+    // the boundary-renegotiation guard must keep it open through VERACK.
+    BOOST_CHECK(peerman.SendMessages(*historical_inbound));
+    BOOST_CHECK(!historical_inbound->fDisconnect);
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(
+        *historical_inbound, NetMsg::Make(NetMsgType::VERACK)));
+    historical_inbound->fPauseSend = false;
+    connman.ProcessMessagesOnce(*historical_inbound);
+    BOOST_CHECK(peerman.SendMessages(*historical_inbound));
+    BOOST_CHECK(historical_inbound->fSuccessfullyConnected);
+    BOOST_CHECK(!historical_inbound->fDisconnect);
+    peerman.FinalizeNode(*historical_inbound);
 
     peerman.FinalizeNode(*modern);
-    peerman.FinalizeNode(*old_client);
+    connman.ClearTestNodes();
 }
 
 BOOST_AUTO_TEST_SUITE_END()
