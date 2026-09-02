@@ -5,7 +5,7 @@ begins. It covers what happens at the boundary, when and how to deposit
 your stake, and how to confirm you are in the first validator set.
 
 The chain and staking rules described here are enforced by consensus code.
-The Ethereum bridge is deliberately disabled in beta.3 and is mentioned only
+The Ethereum bridge is deliberately disabled in v1.1.0 and is mentioned only
 to distinguish its future gate from B3 staking. File references point at the
 source for readers who want to verify.
 
@@ -19,7 +19,7 @@ source for readers who want to verify.
 
 1. **Block 810,000 (H)** — the final legacy block, already confirmed.
 2. **The pause** — the project observed X, measured the supply, and shipped
-   the X-pin transition beta. Nothing held by users changed.
+   the X-pin transition release. Nothing held by users changed.
 3. **The corridor (blocks 810,001–811,000)** — now live. It consists of temporary
    proof-of-work blocks at a trivial fixed difficulty, paying no subsidy
    (fees only, so there is nothing to profit-mine). **This is the
@@ -31,7 +31,7 @@ source for readers who want to verify.
    non-revoked `FINALITY_KEY` binding is present in the snapshot at block
    811,000. Mainnet chain bootstrap requires at least two such validators.
    FlowMesh markets separately require at least four active FN seats. The
-   decentralized Ethereum bridge is disabled in beta.3; a later activation
+   decentralized Ethereum bridge is disabled in v1.1.0; a later activation
    would have its own stricter four-staker gate.
 
 ## What a stake is
@@ -58,7 +58,7 @@ release does not confiscate its principal.
 
 ## How to stake
 
-### Recommended: B3 Hive beta.3
+### Recommended: B3 Hive v1.1.0
 
 1. Open the wallet that will own the validator, then open **Stake**.
 2. Select **Generate & bind BLS key** and unlock the wallet when asked.
@@ -70,7 +70,7 @@ release does not confiscate its principal.
    or seed phrase.
 4. Enter at least **333 B3** and select **Create stake**. The principal remains
    in a special wallet-owned output, but it is excluded from ordinary spending
-   while staked. Beta.3 does not provide a simple GUI unstake button.
+   while staked. B3 Hive v1.1.0 does not provide a simple GUI unstake button.
 5. Wait for the Stake page to show the deposit as **ACTIVE** and the binding as
    confirmed. Then select **Start staking**. The page must show that staking is
    running for this wallet and that the finality signer is armed.
@@ -80,8 +80,8 @@ It uses one CPU thread, makes bounded attempts, pays transaction fees only, and
 stops automatically when Modern PoS begins. Starting B3 Hive never starts
 mining or staking by itself.
 
-Binding does not require an existing stake. Sync beta.3 to the current live
-corridor tip, then broadcast both the binding and stake transactions now.
+Binding does not require an existing stake. Sync B3 Hive v1.1.0 to the current
+live corridor tip, then broadcast both the binding and stake transactions now.
 
 ### Console fallback
 
@@ -141,8 +141,8 @@ which remains disabled in this release.
 
 ## Checklist
 
-1. **Install beta.3** and let it sync to the live corridor tip.
-2. Use the beta.3 **Stake** page to bind the BLS key and create a stake of
+1. **Install v1.1.0** and let it sync to the live corridor tip.
+2. Use the B3 Hive v1.1.0 **Stake** page to bind the BLS key and create a stake of
    333 B3 or more now. Back up the wallet, then wait for both transactions to
    confirm. The console commands above remain available as a fallback.
 3. **Verify before M:** `getstakinginfo` must show the stake ACTIVE and

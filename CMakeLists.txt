@@ -35,8 +35,8 @@ set(CLIENT_VERSION_MAJOR 1)
 set(CLIENT_VERSION_MINOR 1)
 set(CLIENT_VERSION_BUILD 0)
 set(CLIENT_VERSION_RC 0)
-# Public transition beta. Clear this string for the final v1.1.0 tag.
-set(CLIENT_VERSION_PRERELEASE "beta.3")
+# Stable transition release. Keep this empty for the final v1.1.0 tag.
+set(CLIENT_VERSION_PRERELEASE "")
 set(CLIENT_VERSION_IS_RELEASE "true")
 set(COPYRIGHT_YEAR "2026")
 

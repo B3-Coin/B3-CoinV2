@@ -5,7 +5,9 @@ the consensus rules for the temporary PoW corridor, Modern PoS, historical FN
 Genesis, permissionless modern FN creation, simple-v1 colored assets, and
 FlowMesh v1 spot trading. Every post-transition feature remains fail-closed
 until its separately pinned activation height and required mainnet constants
-are present.
+are present. This stable release includes every transition-hardening fix from
+the beta.3 audit; beta.1, beta.2, and beta.3 remain separate historical
+prereleases and are not replaced in place.
 
 ## Important activation sequence
 
@@ -41,11 +43,68 @@ are present.
 Wallet RPCs include `getassetstate`, `getwalletassets`, `issueasset`,
 `sendasset`, `burnasset`, and `createfncoin`.
 
+## Wallet and asset safety
+
+- The Qt **Assets** page reads wallet-owned FN and colored outputs, includes
+  immature FN Genesis units, displays the full asset id, and lets an owner
+  paste an asset id to filter the wallet's assets. Closing a wallet safely
+  detaches its Assets data source, and refreshes preserve the selected asset.
+- RPC and Qt use the same exact spendability result across wallet locks,
+  locked coins, rescans, conflicts, and policy-output provenance. Watch-only
+  keys, locked private keys, incomplete multisig, unsupported MuSig, and
+  unrelated scripts are not presented as spendable merely because the wallet
+  recognizes part of an owner script.
+- B3 witness addresses are not active in v1.1.0. Default receive and change
+  addresses remain legacy P2PKH, including after legacy-dump recovery or wallet
+  migration, and explicit bech32/bech32m recipients are rejected clearly.
+  Existing direct or P2SH-wrapped witness-owned native, colored, and FN outputs
+  remain visible but are excluded from spendable balances and selection.
+  Ordinary legacy P2SH remains valid; use an explicit legacy P2PKH address for
+  new payments and asset ownership.
+- Ordinary and BASIC-filter rescans discover post-810,000 B3A1 policy outputs
+  by their embedded owner script. Pruned-fund imports use the proved block
+  height, and fee bumping refuses asset, stake, and MPA transactions rather
+  than rebuilding them without their policy meaning.
+
+Historical FN Genesis outputs are coinbase outputs. They appear confirmed but
+immature first and become wallet-selectable at depth 31. After importing a
+historical key, the manual recovery fallback is `rescanblockchain 810001` once
+the node is fully synchronized.
+
+## Transition and network hardening
+
+- Pre-boundary 80008 peer connections are recycled at H so upgraded peers use
+  the modern protocol. A lagging legacy node can still initiate a connection to
+  an upgraded archival peer and download the sealed history.
+- Restart and reconnect repeat the deterministic boundary, codec, target,
+  nonce, timing, FN Genesis, stake, payload, and finality-form checks. Ordinary
+  non-B3 test/regtest networks retain their stored-header proof-of-work check.
+  The atomic post-H validation marker and off-X recovery behavior are described
+  under **Upgrade safety** below.
+- Post-H coinbases cannot create STAKE outputs, including in the temporary PoW
+  corridor. Ordinary corridor transactions can create the stakes needed for
+  Set0.
+- STAKE owner suffixes may not be P2SH, witness programs, or another B3 policy
+  carrier. Asset owners likewise cannot nest a STAKE or metadata carrier,
+  because an extra carrier layer could prevent the intended key authorization
+  from running. The built-in Stake page and `createstake` use safe legacy P2PKH.
+  Because the corridor was already live when this audit fix was made, every
+  confirmed post-H STAKE and asset creation must pass the owner-shape scan in
+  the release runbook before v1.1.0 is tagged.
+- Witness-bearing transactions are refused before entering B3's mempool while
+  witness commitments remain inactive. Block assembly repeats this guard so a
+  stale entry restored from an older build cannot poison mining templates.
+- `getfinalitystatus.active` means Modern PoS is actually active. At height
+  811,000 it exposes the exact Set0 preview that will govern block 811,001.
+
 ## FlowMesh v1
 
 - FN holders bind seats during the A2 preparation window. At least four active
   seats are required for a market; otherwise that market pauses safely without
-  stopping the B3 chain.
+  stopping the B3 chain. At least three seat operators must arm their FlowMesh
+  validators. For immediate A3 operation, the first colored-market deposit and
+  four seats must be present by height 814,970 so their anchor is 30 blocks
+  deep.
 - Ordinary user deposits are refused before A3 and whenever the matching
   market runtime is unavailable or paused. At A2, only an explicit
   `market_bootstrap` request may create the first colored deposit needed to
@@ -81,6 +140,14 @@ Wallet RPCs include `getassetstate`, `getwalletassets`, `issueasset`,
 - v1 deliberately uses permanent per-sequence signing locks and has no
   view-change protocol. A malicious proposer that splits honest seats can halt
   that FlowMesh market, but cannot create two valid B3 checkpoints or fork B3.
+
+## Known operational limitation
+
+Normal relay accepts only the next confirmed modern FN PoD slot. Until a future
+mempool state overlay safely tracks consecutive pending slots, only one FN PoD
+issuance can wait in the public mempool at a time; another creator must retry
+after that issuance confirms. Block consensus still enforces the complete
+sequence, disintegration curve, and 5,000-FN cap.
 
 The canonical bUSD identity is Ethereum-mainnet USDT
 `0xdAC17F958D2ee523a2206206994597C13D831ec7` held by managed-v1 vault
@@ -124,7 +191,9 @@ stake of at least 333 B3 included by height 810,980, so it is active in the
 block-811,000 Set0 snapshot. At height 811,000,
 `getfinalitystatus.set0_preview.ready` must be true before block 811,001 is
 attempted. Bootstrap operators must not spend or revoke these stakes until a
-qualifying successor set is in force.
+qualifying successor set is in force. With exactly two validators, both are
+required only while their weights remain balanced; a validator above two-thirds
+of total weight can finalize alone.
 
 Back up `wallet.dat` and shut down the old client cleanly before upgrading.
 The release uses the existing B3 datadir and supports legacy wallet import and
@@ -167,3 +236,25 @@ the A1/A2/A3 heights, and the final-H three-way equivalence result. The release
 must not be tagged or distributed until the isolated shadow-fork rehearsal also
 passes. Any bridge activation additionally requires every bUSD security pin
 named above; bUSD remains fail-closed independently of native/colored FlowMesh.
+
+## Release integrity
+
+The v1.1.0 tag, package filenames, release notes, and displayed client version
+must all carry the exact stable `v1.1.0` version with no prerelease suffix. The
+release workflow refuses to overwrite a published release, safely retries a
+partial private draft, and gates publication on the complete unit suite, Qt
+suite, FN restore/import, finality, and four-node FlowMesh tests.
+
+The macOS arm64 and Intel downloads are GUI-app packages and require macOS 15
+or newer. Command-line operator binaries are provided in the Linux and Windows
+packages; the fully static Linux package is headless.
+
+All v1.1.0 packages are unsigned. The published SHA-256 list detects a damaged
+or substituted download only when users obtain that list through a trusted
+project channel; it is not a developer signature and cannot by itself prove
+the GitHub release account was uncompromised.
+
+Do not tag or publish v1.1.0 until the live post-810,001 owner-shape scan, exact
+tag build, Set0 stake deadline, and mandatory real-history shadow-fork rehearsal
+all pass. Back up `wallet.dat`, shut down cleanly, and verify every download
+against its published SHA-256 checksum.

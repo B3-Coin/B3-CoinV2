@@ -1,6 +1,6 @@
 # Migrating from the legacy B3-CoinV2 wallet to B3 Hive
 
-B3 Hive 1.1.0-beta.3 uses the SAME default data directory as the legacy client
+B3 Hive 1.1.0 uses the SAME default data directory as the legacy client
 (`~/Library/Application Support/B3-CoinV2`, `%APPDATA%\B3-CoinV2`,
 `~/.B3-CoinV2`), so the normal path is: close the old wallet, open
 B3 Hive, and migrate in place.

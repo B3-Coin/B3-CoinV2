@@ -318,15 +318,16 @@ owner suffix. The operator fallback is `rescanblockchain 810001`.
 
 ### Mandatory live STAKE/asset-owner scan
 
-Beta.3 makes P2SH, witness, and nested B3-policy owner suffixes invalid in a
-B3S1 STAKE carrier. B3A1 asset owners also reject any nested B3 policy carrier.
+The v1.1.0 rules make P2SH, witness, and nested B3-policy owner suffixes
+invalid in a B3S1 STAKE carrier. B3A1 asset owners also reject any nested B3
+policy carrier.
 P2SH and witness are special only when they are the complete authorization
 script; an extra carrier layer can prevent their intended key check from
 running. The built-in Stake page and `createstake` use safe legacy P2PKH, and
 FN Genesis uses ruled P2PKH owners, but the corridor was already live when this
 audit fix was made. Before tagging, run the following against a fully
 synchronized node and require `unsafe=0`. Any unsafe result means an
-already-confirmed block would disagree with beta.3 and the release must stop
+already-confirmed block would disagree with v1.1.0 and the release must stop
 for an explicit compatibility decision.
 
 ```python
@@ -469,14 +470,12 @@ type/version registry entries 1 and 2 remain permanently inactive and rejected,
 so previously assigned bytes can never acquire a new meaning.
 
 Confirm `CLIENT_VERSION_MAJOR/MINOR/BUILD` remains `1/1/0`. For the current
-operator beta, `CLIENT_VERSION_PRERELEASE` must be `beta.3` and
-`doc/release-notes-v1.1.0-beta.3.md` must be present. Preserve the beta.1 and
-beta.2 notes as historical records of those releases. Before the final release,
-clear `CLIENT_VERSION_PRERELEASE` and confirm
-`doc/release-notes-v1.1.0.md` remains present and accurate. Flip the guard tests from
-the fail-closed pre-pin shape to exact value-by-value assertions for X, R0,
-manifest checksum/count/root, FN genesis height, A1, A2, A3, fee, and every
-Modern PoS parameter.
+stable release, `CLIENT_VERSION_PRERELEASE` must be empty and
+`doc/release-notes-v1.1.0.md` must be present and accurate. Preserve the beta.1,
+beta.2, and beta.3 notes as historical records of those releases. Confirm the
+guard tests use exact value-by-value assertions for X, R0, manifest
+checksum/count/root, FN genesis height, A1, A2, A3, fee, and every Modern PoS
+parameter.
 
 ## 5. Mandatory shadow-fork rehearsal
 
@@ -512,26 +511,23 @@ statuses. Any unexplained divergence stops the release.
 
 1. Commit and review the measured pins and production wiring.
 2. Complete the full local build, mandatory suites, and shadow-fork gate.
-3. To publish the current operator beta, tag `v1.1.0-beta.3`, push the release branch
-   and tag, and let CI build all five package variants, including the static
-   headless Linux operator package and Windows x86-64. Win32 is deferred from
-   this automated release; any later upload must be built from the exact tag,
-   independently architecture/runtime checked, and checksummed. CI must mark
-   this release as a prerelease and must not make it the latest stable release.
-   A manual **Run workflow** build produces downloadable Actions artifacts for
-   testing only; it does not create or update a GitHub Release. The publish job
-   runs only for a pushed tag that exactly matches the source version.
-4. After every release gate passes, clear `CLIENT_VERSION_PRERELEASE`, rebuild
-   and reverify the packages, then tag `v1.1.0`. Push the final tag and let CI
-   publish it as the latest stable release.
-5. Attach binaries and SHA-256 checksums to each release. Publish X prominently
+3. With `CLIENT_VERSION_PRERELEASE` empty, tag the exact reviewed commit
+   `v1.1.0`, push the release branch and tag, and let CI build all five package
+   variants, including the static headless Linux operator package and Windows
+   x86-64. Win32 is deferred from this automated release; any later upload must
+   be built from the exact tag, independently architecture/runtime checked, and
+   checksummed. CI must publish v1.1.0 as the latest stable release. A manual
+   **Run workflow** build produces downloadable Actions artifacts for testing
+   only; it does not create or update a GitHub Release. The publish job runs
+   only for a pushed tag that exactly matches the source version.
+4. Attach binaries and SHA-256 checksums to each release. Publish X prominently
    with the old-client verification command `getblockhash 810000`.
-6. Publish the full FN manifest, checksum, R, and rights root beside the release
+5. Publish the full FN manifest, checksum, R, and rights root beside the release
    so anyone can independently reproduce them.
-7. Publish and sign an update manifest only if §0's updater prerequisites are
+6. Publish and sign an update manifest only if §0's updater prerequisites are
    actually met. Otherwise give manual download links and say installation is
    manual.
-8. Announce the honest pause duration, required upgrade, FN Genesis in block
+7. Announce the honest pause duration, required upgrade, FN Genesis in block
    810,001, 30-block maturity, and the later A1/A2/A3 feature heights.
 
 ## 7. After adoption
