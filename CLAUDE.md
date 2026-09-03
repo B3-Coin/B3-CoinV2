@@ -1,5 +1,17 @@
 # B3Coin Core — Repository Context
 
+## Branch and audit scope lock (owner ruling 2026-09-03)
+
+- The authorized Claude workspace is `/Users/josh/development/ON/B3-FlowMesh`,
+  checked out on branch **`FlowMesh`**. Verify both before any write or commit;
+  if either differs, stop and report it.
+- This branch carries the complete v1.1.1-beta.2 transition and FlowMesh code
+  for independent audit. Review the current implementation as one integrated
+  system and report findings against the exact checked-out revision.
+- Do not switch branches, create another worktree, merge another branch, push,
+  or rewrite history. Do not change consensus or release parameters unless the
+  project owner explicitly asks for that change after reviewing the audit.
+
 B3Coin is **one continuous blockchain**. This tree is a Bitcoin Core 31.1 fork that
 carries the original B3 chain through a two-era design: a **legacy era** (the existing
 B3Coin PoS chain, preserved exactly) and a **modern era** (clean Core-31.1-style
@@ -95,8 +107,9 @@ authority merely by declaring precedence. The persistent order is:
 
 ## Git rules
 
-- Work only on the already checked-out branch **`release/transition`**. Do not switch,
-  recreate or merge another FlowMesh/Claude branch into it.
+- Work only in `/Users/josh/development/ON/B3-FlowMesh` on the already checked-out
+  branch **`FlowMesh`**. Do not switch branches, create worktrees, or merge another
+  branch into it.
 - Do not push, amend, squash, reset, rebase, or rewrite history. Do not modify previous
   commits.
 - **Never** add AI/assistant attribution to commits (no "Claude", "Anthropic",
