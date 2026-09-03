@@ -16,6 +16,7 @@ import test_framework.messages
 from test_framework.p2p import (
     P2PInterface,
     P2P_SERVICES,
+    P2P_VERSION,
 )
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
@@ -210,6 +211,9 @@ class NetTest(BitcoinTestFramework):
     def test_getnetworkinfo(self):
         self.log.info("Test getnetworkinfo")
         info = self.nodes[0].getnetworkinfo()
+        # Non-B3 test networks retain the inherited Core capability/wire
+        # version. Only B3 mainnet uses the post-transition 80009 identity.
+        assert_equal(info['protocolversion'], P2P_VERSION)
         assert_equal(info['networkactive'], True)
         assert_equal(info['connections'], 2)
         assert_equal(info['connections_in'], 1)

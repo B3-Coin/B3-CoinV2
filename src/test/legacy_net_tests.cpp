@@ -29,6 +29,15 @@
 
 BOOST_FIXTURE_TEST_SUITE(legacy_net_tests, TestingSetup)
 
+BOOST_AUTO_TEST_CASE(b3_protocol_version_namespaces_are_pinned)
+{
+    BOOST_CHECK_EQUAL(PROTOCOL_VERSION, 70'016);
+    BOOST_CHECK_EQUAL(legacy::P2P_PROTOCOL_VERSION, 80'008);
+    BOOST_CHECK_EQUAL(B3_MODERN_PROTOCOL_VERSION, 80'009);
+    BOOST_CHECK_GT(B3_MODERN_PROTOCOL_VERSION,
+                   legacy::P2P_PROTOCOL_VERSION);
+}
+
 namespace {
 
 CService ip(uint32_t i)
@@ -434,11 +443,40 @@ BOOST_AUTO_TEST_CASE(modern_archival_peer_owns_legacy_window_and_renegotiates_at
         SpanReader reader{std::as_bytes(std::span{msg.payload})};
         int32_t advertised{0};
         reader >> advertised;
-        BOOST_CHECK_EQUAL(advertised, PROTOCOL_VERSION);
+        BOOST_CHECK_EQUAL(advertised, B3_MODERN_PROTOCOL_VERSION);
         found_modern_version = true;
     }
     BOOST_CHECK(found_modern_version);
     peerman.FinalizeNode(*renegotiated);
+
+    // 80009 is B3's modern wire identity, not a claim that Core has features
+    // beyond 70016. Two modern B3 peers therefore cap their effective feature
+    // version at the inherited Core capability ceiling.
+    auto modern_handshake{MakeNode(4)};
+    connman.Handshake(*modern_handshake,
+                      /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/B3_MODERN_PROTOCOL_VERSION,
+                      /*relay_txs=*/true);
+    BOOST_REQUIRE(!modern_handshake->fDisconnect);
+    BOOST_CHECK_EQUAL(modern_handshake->GetCommonVersion(), PROTOCOL_VERSION);
+    peerman.FinalizeNode(*modern_handshake);
+
+    // A post-H outbound 80009 connection can also accept an old node's 80008
+    // reply and safely downgrade only that socket to the legacy capability
+    // mode used for serving sealed history.
+    auto historical_outbound{MakeNode(5)};
+    connman.Handshake(*historical_outbound,
+                      /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/legacy::P2P_PROTOCOL_VERSION,
+                      /*relay_txs=*/true);
+    BOOST_REQUIRE(!historical_outbound->fDisconnect);
+    BOOST_CHECK_EQUAL(historical_outbound->GetCommonVersion(),
+                      legacy::P2P_COMPATIBILITY_VERSION);
+    peerman.FinalizeNode(*historical_outbound);
 
     // A lagging historical node now initiates an inbound connection to this
     // post-H archival node. The old client rejects any VERSION below 80006,

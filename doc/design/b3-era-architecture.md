@@ -78,8 +78,10 @@ global `CTransaction` serialization height-aware.
 their call sites:
 
 - P2P identity and capability pinning: legacy protocol version 80008 /
-  compatibility cap 70011, headers-first sync disabled, witness service bits
-  and v2 transport disabled (`net_processing.cpp`, `init.cpp`).
+  compatibility cap 70011, modern B3 wire identity 80009 / Core capability
+  cap 70016, headers-first sync disabled, witness service bits and v2
+  transport disabled where the legacy connection mode requires it
+  (`net_processing.cpp`, `init.cpp`).
 - Hash selection for lookups on a legacy chain (`index/txindex.cpp`,
   `index/txospenderindex.cpp`, `rpc/txoutproof.cpp`).
 - Header PoW exemptions for hybrid PoW/PoS headers

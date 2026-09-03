@@ -8,6 +8,7 @@
 #include <key.h>
 #include <key_io.h>
 #include <node/context.h>
+#include <node/protocol_version.h>
 #include <rpc/blockchain.h>
 #include <rpc/client.h>
 #include <rpc/server.h>
@@ -300,6 +301,9 @@ BOOST_AUTO_TEST_CASE(rpc_togglenetwork)
     UniValue r;
 
     r = CallRPC("getnetworkinfo");
+    BOOST_CHECK_EQUAL(
+        r.get_obj().find_value("protocolversion").getInt<int>(),
+        B3_MODERN_PROTOCOL_VERSION);
     bool netState = r.get_obj().find_value("networkactive").get_bool();
     BOOST_CHECK_EQUAL(netState, true);
 

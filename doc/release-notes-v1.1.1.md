@@ -91,6 +91,14 @@ conventional reverse `uint256` display; Ethereum manifests/calldata use raw EVM
 `bytes32` order. RPC output labels the EVM form explicitly, and a shared
 C++/Solidity vector pins both forms.
 
+## P2P compatibility
+
+- Post-boundary B3 peers advertise protocol `80009`, the monotone successor to
+  historical B3 protocol `80008`. Pre-boundary connections and explicit
+  historical-peer replies remain exactly `80008`. The new number is a B3 wire
+  identity only: Core feature negotiation remains capped at `70016`, and
+  non-B3 networks continue to advertise `70016`.
+
 ## Wallet, GUI, and operator packages
 
 - Finality-key binding and revocation now stop cleanly when their 32-bit

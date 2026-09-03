@@ -646,7 +646,7 @@ static RPCHelpMan getnetworkinfo()
                     {
                         {RPCResult::Type::NUM, "version", "the server version"},
                         {RPCResult::Type::STR, "subversion", "the server subversion string"},
-                        {RPCResult::Type::NUM, "protocolversion", "the protocol version"},
+                        {RPCResult::Type::NUM, "protocolversion", "the highest P2P protocol version supported on the selected network"},
                         {RPCResult::Type::STR_HEX, "localservices", "the services we offer to the network"},
                         {RPCResult::Type::ARR, "localservicesnames", "the services we offer to the network, in human-readable form",
                         {
@@ -700,7 +700,10 @@ static RPCHelpMan getnetworkinfo()
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("version",       CLIENT_VERSION);
     obj.pushKV("subversion",    strSubVersion);
-    obj.pushKV("protocolversion",PROTOCOL_VERSION);
+    obj.pushKV("protocolversion",
+               Params().GetConsensus().legacy_b3coin
+                   ? B3_MODERN_PROTOCOL_VERSION
+                   : PROTOCOL_VERSION);
     NodeContext& node = EnsureAnyNodeContext(request.context);
     if (node.connman) {
         ServiceFlags services = node.connman->GetLocalServices();
