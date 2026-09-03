@@ -391,6 +391,13 @@ BOOST_FIXTURE_TEST_CASE(block_index_restart_retains_pre_pin_competing_boundary,
         CBlockIndex* loaded_early{loaded(early_index)};
         CBlockIndex* loaded_early_child{loaded(early_child_index)};
 
+        // Restart must rebuild the whole skip list before anchor topology is
+        // classified. Otherwise querying the not-yet-visited boundary anchor
+        // once per historical entry degenerates into quadratic parent walks.
+        for (const auto& [_, index] : chainman.m_blockman.m_block_index) {
+            if (index.pprev) BOOST_CHECK(index.pskip != nullptr);
+        }
+
         BOOST_CHECK(!(loaded_canonical->nStatus &
                       (BLOCK_FAILED_VALID | BLOCK_ANCHOR_INELIGIBLE)));
         BOOST_CHECK(loaded_competing_h->nStatus &

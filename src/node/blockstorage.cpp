@@ -718,7 +718,12 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
 
     Assert(m_snapshot_height.has_value() == snapshot_blockhash.has_value());
 
-    // Calculate nChainWork
+    // Rebuild skip pointers in height order before performing any ancestry
+    // queries below. In particular, IsAnchorIneligible() asks the legacy
+    // boundary anchor for an ancestor at every historical height. Leaving the
+    // anchor's skip pointers empty until its own turn in the loop makes those
+    // queries walk back from the anchor one block at a time, turning startup
+    // into quadratic work on a long pinned history.
     std::vector<CBlockIndex*> vSortedByHeight{GetAllBlockIndices()};
     std::sort(vSortedByHeight.begin(), vSortedByHeight.end(),
               CBlockIndexHeightOnlyComparator());
@@ -731,6 +736,24 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
             return false;
         }
         previous_index = pindex;
+
+        if (consensus.legacy_b3coin && pindex->nHeight > 0 &&
+            (pindex->pprev == nullptr ||
+             pindex->pprev->nHeight != pindex->nHeight - 1)) {
+            LogError("%s: B3 block index has an invalid parent height: %s\n",
+                     __func__, pindex->ToString());
+            return false;
+        }
+
+        if (pindex->pprev) pindex->BuildSkip();
+    }
+
+    // Calculate nChainWork and restore the remaining derived index state.
+    for (CBlockIndex* pindex : vSortedByHeight) {
+        if (m_interrupt) return false;
+        if (consensus.legacy_b3coin && pindex->nHeight > 0) {
+            Assert(pindex->pskip);
+        }
 
         // Parent-dependent deterministic transition rules cannot be checked
         // while LevelDB entries are read in hash order. Validate them now that
@@ -746,15 +769,6 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
         // that status below and neither class can enter best-header or
         // chain-candidate selection. An active coins tip which depends on a
         // newly failed entry is rejected separately by LoadChainTip().
-        if (consensus.legacy_b3coin && pindex->nHeight > 0) {
-            if (pindex->pprev == nullptr ||
-                pindex->pprev->nHeight != pindex->nHeight - 1) {
-                LogError("%s: B3 block index has an invalid parent height: %s\n",
-                         __func__, pindex->ToString());
-                return false;
-            }
-        }
-
         if (pindex->nStatus & BLOCK_FAILED_CHILD) {
             // BLOCK_FAILED_CHILD is deprecated, but may still exist on disk.
             pindex->nStatus =
@@ -885,10 +899,6 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
             } else {
                 pindex->m_chain_tx_count = pindex->nTx;
             }
-        }
-
-        if (pindex->pprev) {
-            pindex->BuildSkip();
         }
     }
 

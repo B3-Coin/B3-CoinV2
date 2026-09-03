@@ -7,6 +7,11 @@ manifest/pins are complete, and the candidate passes the release runbook.
 
 ## Consensus and upgrade safety
 
+- Restarts now rebuild the block index's existing ancestry shortcuts before
+  applying the fixed transition anchors. This removes a quadratic startup loop
+  which could leave a fully synced wallet at `Loading block index` for an
+  impractical time. It does not change the checkpoint, accepted chain, or disk
+  format.
 - The block-810,001 checkpoint is verified independently at startup even when
   an older transition validation marker exists, closing an inherited-database
   path that could otherwise skip the new checkpoint check.
