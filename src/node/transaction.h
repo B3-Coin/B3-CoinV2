@@ -24,8 +24,12 @@ struct NodeContext;
  * Also used by the GUI when broadcasting a completed PSBT.
  * By default, a transaction with a fee rate higher than this will be rejected
  * by these RPCs and the GUI. This can be overridden with the maxfeerate argument.
+ *
+ * B3's human-facing unit is KILO_COIN. Keeping the inherited COIN/10 value
+ * makes this guard 1,000 times smaller than the documented 0.1 B3/kvB and
+ * rejects wallet-built FINALITY_KEY transactions at the normal fee floor.
  */
-static const CFeeRate DEFAULT_MAX_RAW_TX_FEE_RATE{COIN / 10};
+static const CFeeRate DEFAULT_MAX_RAW_TX_FEE_RATE{KILO_COIN / 10};
 
 /** Maximum burn value for sendrawtransaction, submitpackage, and testmempoolaccept RPC calls.
  * By default, a transaction with a burn value higher than this will be rejected

@@ -9,6 +9,7 @@
 #include <key_io.h>
 #include <node/context.h>
 #include <node/protocol_version.h>
+#include <node/transaction.h>
 #include <rpc/blockchain.h>
 #include <rpc/client.h>
 #include <rpc/server.h>
@@ -90,6 +91,12 @@ UniValue RPCTestingSetup::CallRPC(std::string args)
 
 
 BOOST_FIXTURE_TEST_SUITE(rpc_tests, RPCTestingSetup)
+
+BOOST_AUTO_TEST_CASE(b3_raw_transaction_fee_guard_uses_modern_unit)
+{
+    BOOST_CHECK_EQUAL(node::DEFAULT_MAX_RAW_TX_FEE_RATE.GetFeePerK(),
+                      KILO_COIN / 10);
+}
 
 BOOST_AUTO_TEST_CASE(getassetstate_reports_production_schedule)
 {

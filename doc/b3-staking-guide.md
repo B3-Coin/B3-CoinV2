@@ -133,11 +133,12 @@ epoch has started. Keep both in place until `getfinalitystatus` shows a
 qualifying successor set in force. The V1 set is fixed for an epoch and can be
 carried forward when a replacement has fewer than two validators.
 
-Finality is stake-weighted. Two equal 333 B3 validators require both signatures;
-if one validator later holds more than two-thirds of total weight, that validator
-can finalize alone. Operators who require both original validators to agree
-must keep their weights balanced. This does not enable the Ethereum bridge,
-which remains disabled in this release.
+Finality requires both more than two-thirds of stake weight and more than
+two-thirds of validator headcount. Two validators require both signatures;
+three validators require all three; four validators require three. A validator
+with more than two-thirds of the stake cannot finalize alone after the set has
+more than one member. This does not enable the Ethereum bridge, which has its
+own four-validator readiness floor.
 
 ## Checklist
 

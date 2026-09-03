@@ -101,6 +101,10 @@ C++/Solidity vector pins both forms.
 
 ## Wallet, GUI, and operator packages
 
+- The default `sendrawtransaction`/`testmempoolaccept` fee-rate guard now uses
+  B3's modern display unit. The inherited legacy-unit value was 1,000 times
+  smaller than its documented 0.1 B3/kvB limit and could reject a correctly
+  signed wallet-built finality-key transaction during manual rebroadcast.
 - Finality-key binding and revocation now stop cleanly when their 32-bit
   sequence is exhausted instead of wrapping, and the staking status reports
   the actual last handled signing height even when bounded old gossip is not
