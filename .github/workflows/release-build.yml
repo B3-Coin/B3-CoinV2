@@ -81,12 +81,13 @@ jobs:
           fi
 
   release-tests:
-    # This corrected validator-bootstrap beta retains every platform build,
-    # checksum, and contract gate below, but does not duplicate the recorded
-    # local extended qualification. No later beta/RC inherits this exception.
+    # These time-critical validator-transition betas retain every platform
+    # build, checksum, and contract gate below, but do not duplicate their
+    # recorded local focused qualification. No later beta/RC inherits this
+    # exception.
     # Other builds run the complete suite unless an administrator binds the
     # emergency opt-out to their exact commit SHA.
-    if: github.ref != 'refs/tags/v1.1.1-beta.2' && vars.B3_SKIP_EXTENDED_RELEASE_TESTS_SHA != github.sha
+    if: github.ref != 'refs/tags/v1.1.1-beta.2' && github.ref != 'refs/tags/v1.1.1-beta.3' && vars.B3_SKIP_EXTENDED_RELEASE_TESTS_SHA != github.sha
     needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 240
@@ -152,8 +153,8 @@ jobs:
           test "$VERSION_RESULT" = success
           if test "$TEST_RESULT" = success; then
             echo "Extended GitHub release qualification passed."
-          elif test "$TEST_RESULT" = skipped && test "$PRERELEASE" = true && test "$RELEASE_REF" = refs/tags/v1.1.1-beta.2; then
-            echo "::warning::Extended GitHub qualification was skipped for the corrected validator-bootstrap beta; platform builds, checksums, and contract gates remain mandatory."
+          elif test "$TEST_RESULT" = skipped && test "$PRERELEASE" = true && { test "$RELEASE_REF" = refs/tags/v1.1.1-beta.2 || test "$RELEASE_REF" = refs/tags/v1.1.1-beta.3; }; then
+            echo "::warning::Extended GitHub qualification was skipped for the time-critical validator-transition beta; platform builds, checksums, and contract gates remain mandatory."
           elif test "$TEST_RESULT" = skipped && test "$SKIP_SHA" = "$RELEASE_SHA"; then
             echo "::warning::Extended GitHub release qualification was explicitly skipped for exact commit $RELEASE_SHA. The tagging operator is responsible for preserving qualification logs for this commit."
           else
