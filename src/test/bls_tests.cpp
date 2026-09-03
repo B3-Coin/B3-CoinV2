@@ -74,6 +74,29 @@ BOOST_AUTO_TEST_CASE(frozen_scheme_parameters)
     BOOST_CHECK(bls::SIG_DST != bls::POP_DST);
 }
 
+BOOST_AUTO_TEST_CASE(eip2537_uncompressed_cross_language_vector)
+{
+    // The same point/signature pair is exercised by
+    // contracts/test/BlsCertificateVector.t.sol. This pins limb order as well
+    // as the mandatory 16-byte left padding used by EIP-2537.
+    const auto public_key{bls::PublicKey::Decode(HexBytes(
+        "aa3b6ee8aadb63c8e064dafdc3d0ae794ded037af26e60829da1592db0a237dc42684307339f176c31d97714fd78aed2"))};
+    const auto signature{bls::Signature::Decode(HexBytes(
+        "8f9775cab5513e55c48bb1bf625ca72be82529a074b01e461a020b0fe84b5a53eec6875b317f56febab3f84db1cc624b18f90a30ac5823ea45032e3e173bcc0e7d76d8aa4d59aff19492f15bae98a0d7adb1cd895adc4b804718a4138cee4c15"))};
+    BOOST_REQUIRE(public_key);
+    BOOST_REQUIRE(signature);
+    BOOST_CHECK_EQUAL(
+        HexStr(public_key->Eip2537Uncompressed()),
+        "000000000000000000000000000000000a3b6ee8aadb63c8e064dafdc3d0ae794ded037af26e60829da1592db0a237dc42684307339f176c31d97714fd78aed2"
+        "000000000000000000000000000000000d4611741ecb196805e3694d993b438dc6375d97e16430a57bf908c38482d9370a598e77552632acda8dec2033a7e4fc");
+    BOOST_CHECK_EQUAL(
+        HexStr(signature->Eip2537Uncompressed()),
+        "0000000000000000000000000000000018f90a30ac5823ea45032e3e173bcc0e7d76d8aa4d59aff19492f15bae98a0d7adb1cd895adc4b804718a4138cee4c15"
+        "000000000000000000000000000000000f9775cab5513e55c48bb1bf625ca72be82529a074b01e461a020b0fe84b5a53eec6875b317f56febab3f84db1cc624b"
+        "0000000000000000000000000000000004bca93e2a4de8c020d0a072e5ac55ede7e96da6c323d00b818a58196d9e33961a6e9a4508d5030c6b74f0fa02c69fcc"
+        "0000000000000000000000000000000002758dc377d43dfe212ef15f1c18df6a8b3e87d34de3cbcd3375c8e52ee86bafe46757bf51018d349a44ce7eac8d528f");
+}
+
 BOOST_AUTO_TEST_CASE(eth_vectors_sign)
 {
     const UniValue doc = read_json(json_tests::bls12_381_eth_vectors);

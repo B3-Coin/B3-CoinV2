@@ -15,15 +15,12 @@ namespace Consensus {
  * Modern PoS V1 parameter block — THE single configurable home of every
  * modern-PoS number (doc/design/b3-modern-pos-spec.md §9).
  *
- * Ratification state (owner rulings 2026-08-21): the timing values —
- * block interval, round length, f0, and the fixed x2 relaxation — are
- * RATIFIED as the V1 numbers. The remaining fields stay
- * REVISABLE_BEFORE_MAINNET provisionals, and the reorganization horizon D
- * is an owner decision with deliberately no default. Real chainparams
- * still never construct this block — while
- * Params::modern_pos is unset, modern-PoS validation and production FAIL
- * CLOSED (`no-modern-pos-rules`), exactly like the corridor's unset
- * difficulty. A guard test pins that no shipped network configures it.
+ * Ratification state: mainnet's transition release constructs this complete
+ * block from the frozen V1 mechanism values and R0 derived from the measured
+ * sealed supply. Other shipped networks leave Params::modern_pos unset, so
+ * modern-PoS validation and production there FAIL CLOSED
+ * (`no-modern-pos-rules`). The member initializers remain safe test-fixture
+ * scaffolding; production chainparams assigns every mainnet value explicitly.
  *
  * The V1 mechanism these numbers feed (frozen, not revisable here):
  *
@@ -46,12 +43,12 @@ struct ModernPosParams {
     //! validators in round 0 ~= f0 * (online stake fraction).
     uint32_t f0_num{1};
     uint32_t f0_den{1};
-    //! REVISABLE_BEFORE_MAINNET: the constant nBits every modern-PoS block
+    //! RATIFIED: the constant nBits every modern-PoS block
     //! must carry. A dead field kept only for header-layout compatibility;
     //! its GetBlockProof() constant makes nChainWork a height counter for
     //! modern chains (bookkeeping, not work).
     uint32_t sentinel_bits{0x207fffff};
-    //! REVISABLE_BEFORE_MAINNET: clock-skew allowance. Because timestamps
+    //! RATIFIED: clock-skew allowance. Because timestamps
     //! are exact, this doubles as the pacing gate: a round's block cannot be
     //! accepted before its forced timestamp minus this bound.
     int64_t max_future_seconds{120};
@@ -59,7 +56,7 @@ struct ModernPosParams {
     //! (fees ride on top), halving every `halving_interval` blocks from M:
     //!   subsidy(h) = reward >> ((h - M) / halving_interval)
     //! R0 itself = floor(S_H * 1% / 525,600) with S_H measured at H — it is
-    //! pinned in the X-pin release; 0 (the shipped default) = fees only,
+    //! pinned in the X-pin release; 0 (the unconfigured default) = fees only,
     //! so nothing mints by omission.
     int64_t reward{0};
     //! Halving interval in modern-PoS blocks. RULED: 525,600 (one year at
@@ -84,10 +81,10 @@ struct ModernPosParams {
     //! most `max_epoch_extension` blocks before the finality lineage is
     //! declared broken; `min_finality_set` is the chain BOOTSTRAP floor
     //! only (never a bridge security threshold). Fixtures may scale these
-    //! down exactly as they scale reorg_horizon; real chainparams ship
-    //! the whole block unset, so nothing here is live before the X-pin
-    //! release pins it. Declarations only at this stage: no rule in the
-    //! tree reads them yet (implementation plan, Commit 1).
+    //! down exactly as they scale reorg_horizon; mainnet pins the whole block
+    //! in its X-pin release while other shipped networks leave it unset.
+    //! Consensus validation, production, persistence and RPC status all
+    //! consume these fields.
     int finality_epoch_blocks{1440};
     int checkpoint_interval{10};
     int checkpoint_depth{12};

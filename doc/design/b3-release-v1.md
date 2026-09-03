@@ -1,9 +1,18 @@
 # B3 Hive — Release v1 checklist (the hard-fork client)
 
 **Product name: B3 Hive** (owner, LOCKED 2026-08-22). FlowMesh remains the
-name of the DEX engine inside it. Release v1 = the hard-fork client: legacy
-continuity + temporary-PoW corridor + Modern PoS V1, with FN, colored
-assets and FlowMesh shipped activation-inert behind later heights.
+name of the DEX engine inside it. Release v1 = the pre-seal hard-fork client:
+legacy continuity plus the fail-closed H/X pause. The transition follow-up
+release resumes the corridor, requires FN Genesis in block 810,001, carries
+modern FN PoD and simple-v1 colored assets behind later post-M heights A1/A2,
+enables FlowMesh seat/vault preparation at A2, and enables FlowMesh v1 spot
+trading at A3. The later FlowMesh feature release is expansion only.
+
+> **2026-09-01 supersession:** FN is not activation-inert behind a later
+> height. The transition release pins the full rights manifest/count/root and
+> block 810,001 coinbase creates every historical FN output. Ordinary 30-block
+> coinbase maturity is the only transfer delay. See
+> [b3-fn-assets-activation-design.md](b3-fn-assets-activation-design.md).
 
 ## Owner inputs (one line each; the release is cut when all are filled)
 
@@ -27,9 +36,10 @@ bits, M) until ALL of:
 3. seed infrastructure is operational (the seeds in item 3 above);
 4. release binaries are reproducible and audited.
 
-Until then the ruled values live in the documents and tests only;
-mainnet `hard_fork_height`, `legacy_final_hash` and `transition_pow_bits`
-stay unset and the chain stays in live legacy operation.
+H and `transition_pow_bits` are now pinned in mainnet chainparams.
+`legacy_final_hash` X intentionally stays unset in the pre-seal binary, so the
+chain stops after H until the transition release supplies the seal-derived
+pins and passes the gates above.
 
 ## Corridor pacing — VERIFIED COMPRESSIBLE, then RULED (2026-08-23): 60 s spacing, 120 s future bound
 

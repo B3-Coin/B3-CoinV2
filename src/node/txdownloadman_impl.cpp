@@ -101,7 +101,7 @@ void TxDownloadManagerImpl::BlockConnected(const std::shared_ptr<const CBlock>& 
 
     for (const auto& ptx : pblock->vtx) {
         RecentConfirmedTransactionsFilter().insert(ptx->GetHash().ToUint256());
-        if (ptx->HasWitness()) {
+        if (ptx->HasOptionalData()) {
             RecentConfirmedTransactionsFilter().insert(ptx->GetWitnessHash().ToUint256());
         }
         m_txrequest.ForgetTxHash(ptx->GetHash().ToUint256());
@@ -404,10 +404,11 @@ node::RejectedTxTodo TxDownloadManagerImpl::MempoolRejectedTx(const CTransaction
                 // that if a peer is overloading us with invs and orphans, they will eventually not be
                 // able to add any more transactions to the orphanage.
                 //
-                // Search by txid and, if the tx has a witness, wtxid
+                // Search by txid and, if the tx has witness or MPA, its
+                // full optional-data relay identity.
                 std::vector<NodeId> orphan_resolution_candidates{nodeid};
                 m_txrequest.GetCandidatePeers(ptx->GetHash().ToUint256(), orphan_resolution_candidates);
-                if (ptx->HasWitness()) m_txrequest.GetCandidatePeers(ptx->GetWitnessHash().ToUint256(), orphan_resolution_candidates);
+                if (ptx->HasOptionalData()) m_txrequest.GetCandidatePeers(ptx->GetWitnessHash().ToUint256(), orphan_resolution_candidates);
 
                 for (const auto& nodeid : orphan_resolution_candidates) {
                     if (MaybeAddOrphanResolutionCandidate(unique_parents, ptx->GetWitnessHash(), nodeid, now)) {
@@ -478,7 +479,7 @@ node::RejectedTxTodo TxDownloadManagerImpl::MempoolRejectedTx(const CTransaction
         // parent-fetching by txid via the orphan-handling logic).
         // We only add the txid if it differs from the wtxid, to avoid wasting entries in the
         // rolling bloom filter.
-        if (state.GetResult() == TxValidationResult::TX_INPUTS_NOT_STANDARD && ptx->HasWitness()) {
+        if (state.GetResult() == TxValidationResult::TX_INPUTS_NOT_STANDARD && ptx->HasOptionalData()) {
             RecentRejectsFilter().insert(ptx->GetHash().ToUint256());
             m_txrequest.ForgetTxHash(ptx->GetHash().ToUint256());
         }
@@ -509,7 +510,7 @@ std::pair<bool, std::optional<PackageToValidate>> TxDownloadManagerImpl::Receive
 
     // Mark that we have received a response
     m_txrequest.ReceivedResponse(nodeid, txid.ToUint256());
-    if (ptx->HasWitness()) m_txrequest.ReceivedResponse(nodeid, wtxid.ToUint256());
+    if (ptx->HasOptionalData()) m_txrequest.ReceivedResponse(nodeid, wtxid.ToUint256());
 
     // First check if we should drop this tx.
     // We do the AlreadyHaveTx() check using wtxid, rather than txid - in the

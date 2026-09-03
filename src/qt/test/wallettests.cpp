@@ -11,6 +11,7 @@
 #include <interfaces/node.h>
 #include <key_io.h>
 #include <qt/bitcoinamountfield.h>
+#include <qt/b3assetmodel.h>
 #include <qt/bitcoinunits.h>
 #include <qt/clientmodel.h>
 #include <qt/optionsmodel.h>
@@ -42,6 +43,7 @@
 #include <QClipboard>
 #include <QObject>
 #include <QPushButton>
+#include <QSignalSpy>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QTextEdit>
@@ -391,6 +393,59 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
 
     // Check removal from wallet
     QCOMPARE(walletModel.wallet().getAddressReceiveRequests().size(), size_t{0});
+
+    // Encryption status changes exact asset signability at the same chain
+    // tip. Each lock/unlock transition must therefore force a fresh policy-
+    // asset snapshot instead of leaving the GUI's Available value stale.
+    QSignalSpy asset_balance_spy{
+        &walletModel, &WalletModel::assetBalancesChanged};
+    QVERIFY(wallet->EncryptWallet("gui-asset-status-pass"));
+    qApp->processEvents();
+    QCOMPARE(walletModel.getEncryptionStatus(), WalletModel::Locked);
+    walletModel.pollBalanceChanged();
+    QCOMPARE(asset_balance_spy.count(), 1);
+
+    QVERIFY(wallet->Unlock("gui-asset-status-pass"));
+    qApp->processEvents();
+    QCOMPARE(walletModel.getEncryptionStatus(), WalletModel::Unlocked);
+    walletModel.pollBalanceChanged();
+    QCOMPARE(asset_balance_spy.count(), 2);
+
+    // RPC/coin-control locks do not alter the tip or wallet transactions, but
+    // they do alter an asset UTXO's Available amount. Exercise the complete
+    // CWallet status signal -> queued WalletModel refresh path.
+    const COutPoint lock_probe{
+        Txid::FromUint256(uint256::ONE), /*n=*/0};
+    QVERIFY(walletModel.wallet().lockCoin(lock_probe, /*write_to_db=*/false));
+    qApp->processEvents();
+    walletModel.pollBalanceChanged();
+    QCOMPARE(asset_balance_spy.count(), 3);
+
+    // Repeating the same state is a no-op and must not churn the asset model.
+    QVERIFY(walletModel.wallet().lockCoin(lock_probe, /*write_to_db=*/false));
+    qApp->processEvents();
+    walletModel.pollBalanceChanged();
+    QCOMPARE(asset_balance_spy.count(), 3);
+
+    QVERIFY(walletModel.wallet().unlockCoin(lock_probe));
+    qApp->processEvents();
+    walletModel.pollBalanceChanged();
+    QCOMPARE(asset_balance_spy.count(), 4);
+
+    // The application destroys WalletModel objects before the main window on
+    // shutdown. Asset sources must detach and clear instead of retaining a raw
+    // pointer into the deleted wallet model.
+    WalletContext& context = *node.walletLoader().context();
+    auto transient_model = std::make_unique<WalletModel>(
+        interfaces::MakeWallet(context, wallet), *mini_gui.clientModel,
+        platformStyle.get());
+    B3NativeAssetSource transient_source{transient_model.get()};
+    QSignalSpy source_changed_spy{
+        &transient_source, &B3AssetSource::assetsChanged};
+    QCOMPARE(transient_source.assets().size(), 1);
+    transient_model.reset();
+    QCOMPARE(source_changed_spy.count(), 1);
+    QVERIFY(transient_source.assets().isEmpty());
 }
 
 void TestGUIWatchOnly(interfaces::Node& node, TestChain100Setup& test)

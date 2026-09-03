@@ -26,12 +26,12 @@ namespace modern {
  * carried into the modern era.
  *
  * Dispatch remains fail-closed by configuration: while the chain's
- * Consensus::Params::modern_pos parameter block is unset — every shipped
- * network — CheckModernStake() REJECTS every block (`no-modern-pos-rules`).
- * The V1 rules are applied by validation only when the block is configured
- * (regtest scaffolding until mainnet numbers are ratified). Tests may still
- * install a PosValidator adapter to exercise the dispatch plumbing; it is
- * never set in production (guard-tested).
+ * Consensus::Params::modern_pos parameter block is unset,
+ * CheckModernStake() REJECTS every block (`no-modern-pos-rules`). Mainnet's
+ * transition release pins the complete V1 block; other shipped networks
+ * remain unconfigured. Tests may still install a PosValidator adapter to
+ * exercise the dispatch plumbing; it is never set in production
+ * (guard-tested).
  */
 class PosValidator
 {

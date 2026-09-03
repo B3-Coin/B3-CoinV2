@@ -192,6 +192,22 @@ public:
      */
     uint256 m_modern_pos_digest{};
 
+    /**
+     * Cumulative number of modern-era FN Coins issued by proof of
+     * disintegration through this block. This cache is branch-local: each
+     * index entry records the total for its own ancestry, so competing tips
+     * and reorganizations do not share mutable global state.
+     *
+     * These fields deliberately are not part of CDiskBlockIndex. Known values
+     * are persisted in a versioned block-tree sidecar instead, preserving the
+     * existing block-index serialization byte-for-byte. A missing sidecar is
+     * distinguishable from the valid total zero so activation-aware validation
+     * can fail closed where the value is required while old databases remain
+     * loadable.
+     */
+    uint32_t m_fn_pod_issued_total{0};
+    bool m_fn_pod_issued_total_known{false};
+
     //! (memory only) Sequential id assigned to distinguish order in which blocks are received.
     //! Initialized to SEQ_ID_INIT_FROM_DISK{1} when loading blocks from disk, except for blocks
     //! belonging to the best chain which overwrite it to SEQ_ID_BEST_CHAIN_FROM_DISK{0}.

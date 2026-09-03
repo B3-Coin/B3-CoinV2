@@ -7,13 +7,18 @@
 
 #include <chainparamsseeds.h>
 #include <consensus/amount.h>
+#include <consensus/era.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
 #include <crypto/hex_base.h>
 #include <hash.h>
+#include <kernel/data/mainnet_fn_genesis_v1.bin.h>
 #include <kernel/messagestartchars.h>
 #include <legacy/consensus.h>
 #include <legacy/primitives.h>
+#include <modern/chain_domain.h>
+#include <modern/fn_genesis.h>
+#include <modern/fn_genesis_validation.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
@@ -26,12 +31,15 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
 #include <limits>
 #include <map>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 using namespace util::hex_literals;
@@ -81,6 +89,20 @@ constexpr std::array<uint8_t, 33 * 8> B3COIN_FIXED_SEEDS{
     // without operator approval.
     0x01, 0x04, 0xb0, 0x1f, 0x0d, 0xc6, 0x16, 0x0f, // 176.31.13.198
 };
+
+// Sealed mainnet transition constants. S_H is the exact spendable supply at
+// legacy height H. R0 = floor(S_H * 1% / 525,600) is equivalently the single
+// integer division below; the remainder is deliberately discarded.
+constexpr CAmount MAINNET_SEALED_SUPPLY{1'042'617'596'101'695'152};
+constexpr CAmount MAINNET_MODERN_R0{19'836'712'254};
+constexpr CAmount MAINNET_R0_DIVISOR{52'560'000};
+static_assert(MAINNET_SEALED_SUPPLY / MAINNET_R0_DIVISOR ==
+              MAINNET_MODERN_R0);
+
+constexpr size_t MAINNET_FN_MANIFEST_SIZE{186'875};
+constexpr size_t MAINNET_FN_MANIFEST_COUNT{3'592};
+constexpr uint32_t MAINNET_FN_GENESIS_HEIGHT{810'001};
+constexpr uint16_t MAINNET_FN_MANIFEST_VERSION{1};
 
 } // namespace
 
@@ -147,27 +169,105 @@ public:
         // M = 811,001). NAMING TRAP: this field is the FIRST NON-LEGACY
         // height (LEGACY_FINAL_HEIGHT = hard_fork_height - 1, see
         // consensus/params.h), so H = 810,000 pins as 810,001 here.
-        // X (legacy_final_hash) DELIBERATELY stays unset -- the OD-10
-        // pause-fail-closed shape (Consensus::LegacyBoundaryHeightOnly):
-        // this binary accepts the legacy chain through H and refuses every
-        // block at H+1. The X-pin release adds the observed hash and the
-        // Modern-PoS parameter block; nothing modern can activate from this
-        // release.
+        // X is the observed and independently verified hash at sealed height
+        // H. Together H/X permanently anchor the legacy history used by the
+        // transition corridor and the modern chain domain.
         consensus.hard_fork_height = 810'001;
+        consensus.legacy_final_hash = uint256{
+            "2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6"};
         consensus.transition_pow_length = 1000;
+        consensus.transition_pow_min_spacing = 60;
+        consensus.transition_pow_max_future = 120;
         // RULED 2026-08-23: the canonical corridor difficulty value.
         consensus.transition_pow_bits = 0x1f008000;
         // RATIFIED (owner ruling 2026-08-21): the corridor pays fees only --
         // no subsidy. Stated explicitly because an unset reward fails closed.
         consensus.transition_pow_reward = 0;
+        // Historical FN Genesis is mandatory in the first corridor block.
+        // Its complete sealed-history manifest is decoded and verified below
+        // after the chain genesis hash is assigned.
+        consensus.fn_genesis_required = true;
+        // Historical managed-v1 identity retained as a fail-closed audit
+        // record. It is not the 2026-09-02 decentralized production target and
+        // must be replaced, not completed in place. The reviewed production
+        // commit must pin the newly deployed keyless vault, its derived
+        // AssetId, decentralized verifier envelope, light-client/cap/adapter
+        // values, and independent activation B. Until then mainnet cannot mint
+        // bridge-backed bUSD or accept a bridge burn.
+        Consensus::BridgeAssetParams busd;
+        busd.asset = Consensus::ETHEREUM_MAINNET_BUSD_IDENTITY;
+        busd.withdrawal_mode = Consensus::BridgeWithdrawalMode::MANAGED_V1;
+        Consensus::BridgeManagedWithdrawalPins managed;
+        managed.authority_address =
+            Consensus::BUSD_ETHEREUM_MANAGED_AUTHORITY;
+        managed.vault_runtime_code_hash =
+            Consensus::BUSD_ETHEREUM_VAULT_RUNTIME_CODE_HASH;
+        managed.withdrawal_rules_version =
+            Consensus::MANAGED_WITHDRAWAL_RULES_VERSION_V1;
+        // Deliberately incomplete: this keeps BridgeMintParamsReady false and
+        // prevents the historical vault from becoming active accidentally.
+        busd.managed_withdrawal = managed;
+        consensus.busd_bridge = busd;
+        assert(Consensus::BridgeAssetIdentityValid(consensus.busd_bridge->asset));
+        assert(!Consensus::BridgeMintParamsReady(*consensus.busd_bridge));
+        // If a later reviewed pinning commit completes this mainnet envelope,
+        // it must never silently point B3 mainnet at an Ethereum test chain.
+        assert(!Consensus::BridgeMintParamsReady(*consensus.busd_bridge) ||
+               consensus.busd_bridge->asset.origin_chain_id ==
+                   Consensus::BUSD_ETHEREUM_CHAIN_ID);
         // RATIFIED (owner ruling 2026-08-21): minimum STAKE principal is
         // 333 modern B3 (the kB3 nomination: 1 modern B3 = 1,000 legacy B3
-        // = 1e9 base units), i.e. 333,000 legacy-denomination B3. Inert
-        // until a mainnet H/X boundary is finalized.
+        // = 1e9 base units), i.e. 333,000 legacy-denomination B3.
         consensus.min_stake_amount = 333 * CAmount{1'000'000'000};
+
+        Consensus::ModernPosParams modern_pos;
+        modern_pos.block_interval_seconds = 60;
+        modern_pos.round_seconds = 30;
+        modern_pos.f0_num = 1;
+        modern_pos.f0_den = 1;
+        modern_pos.sentinel_bits = 0x207fffff;
+        modern_pos.max_future_seconds = 120;
+        modern_pos.reward = MAINNET_MODERN_R0;
+        modern_pos.halving_interval = 525'600;
+        modern_pos.treasury_percent = 10;
+        modern_pos.treasury_script = ParseHex(
+            "76a91412602418ffc74640e37f1a73d0cdc255d2a07c3588ac");
+        modern_pos.reorg_horizon = 1'440;
+        modern_pos.finality_epoch_blocks = 1'440;
+        modern_pos.checkpoint_interval = 10;
+        modern_pos.checkpoint_depth = 12;
+        modern_pos.max_epoch_extension = 10'080;
+        // Owner ruling 2026-09-01: two real corridor stakers may bootstrap
+        // B3 finality. This is deliberately separate from the Ethereum
+        // bridge gate, which remains at four validators plus minimum weight
+        // and a >2/3 signer-headcount requirement.
+        modern_pos.min_finality_set = 2;
+        if (!modern_pos.Valid()) {
+            throw std::runtime_error("invalid sealed mainnet Modern PoS parameters");
+        }
+        consensus.modern_pos = std::move(modern_pos);
+
+        // Ratified post-M activation schedule: permissionless FN PoD at A1,
+        // simple-v1 assets and FlowMesh seat/vault preparation at A2, then
+        // full FlowMesh trading after a 2,000-block anchor runway at A3.
+        consensus.fn_pod_activation_height = 812'000;
+        consensus.asset_activation_height = 813'000;
+        consensus.flowmesh_activation_height = 815'000;
+        if (!Consensus::FnAssetActivationScheduleConfigured(consensus) ||
+            !Consensus::FlowMeshSeatBindingScheduleConfigured(consensus) ||
+            Consensus::FlowMeshRulesActive(814'999, consensus) ||
+            !Consensus::FlowMeshRulesActive(815'000, consensus)) {
+            throw std::runtime_error("invalid mainnet feature activation schedule");
+        }
         // Historical live-legacy checkpoint rules, ported verbatim.
         consensus.legacy_checkpoints = legacy::MainnetCheckpoints();
         consensus.legacy_checkpoint_span = legacy::LEGACY_CHECKPOINT_SPAN;
+        // Separately pin the first post-legacy corridor block, which also
+        // carries deterministic historical FN Genesis. This is its modern
+        // SHA256d block identity, not a legacy replay checkpoint.
+        consensus.modern_checkpoints = {
+            {810'001, uint256{"913fb38c75e0f12d8d5e6ea65a0ffce33a22a6908392a94661eab7c8506f6014"}},
+        };
         // The historical one-off superblock (chainparams nSuperBlockHeight /
         // vSuperBlockPubKey in the final client, hex verbatim).
         consensus.legacy_superblock_height = 107'488;
@@ -227,6 +327,65 @@ public:
         consensus.hashGenesisBlock = genesis.GetHash(consensus, /*height=*/0);
         assert(consensus.hashGenesisBlock == uint256{"4b0d7f133c5267d715d4d8992635a5490d1edd6b7072cce3f8fe116aba983b6a"});
         assert(genesis.hashMerkleRoot == uint256{"4243fd570d4cb2e2930767f5bf18b2f65f1b7c4e16a392552d1efadeec00753d"});
+
+        // The canonical FN Genesis artifact is compiled into the binary, then
+        // checked against independently published release pins before any row
+        // is installed in consensus parameters. These are runtime checks, not
+        // assertions, so a malformed or stale release build cannot start.
+        const std::span<const std::byte> embedded_manifest{
+            kernel::data::mainnet_fn_genesis_v1};
+        if (embedded_manifest.size() != MAINNET_FN_MANIFEST_SIZE) {
+            throw std::runtime_error("mainnet FN Genesis artifact size mismatch");
+        }
+        const std::span<const unsigned char> manifest_bytes{
+            reinterpret_cast<const unsigned char*>(embedded_manifest.data()),
+            embedded_manifest.size()};
+        if (HexStr(modern::FnGenesisManifestFileSha256(manifest_bytes)) !=
+            "c80470eec785600f33fa2e69c520ff331c2b354ebf6e0a9bf8cae7d1eb5f9dca") {
+            throw std::runtime_error("mainnet FN Genesis artifact SHA256 mismatch");
+        }
+
+        std::string manifest_error;
+        auto decoded{modern::DecodeFnGenesisManifestFileV1(
+            manifest_bytes, &manifest_error)};
+        if (!decoded) {
+            throw std::runtime_error(
+                "invalid mainnet FN Genesis artifact: " + manifest_error);
+        }
+        const uint256 pinned_domain{
+            "6a48d15d8da05571e0e7afe5d49bfae0ca7cd71305297f04461603e92a2651a6"};
+        const uint256 pinned_root{
+            "e8f282a7dcaa9a8fbcfcc5c22ba4f456e5b50968fcf899aaacdaca65bef898ec"};
+        const auto configured_domain{modern::ModernChainDomain(
+            consensus.hashGenesisBlock, *consensus.legacy_final_hash)};
+        if (!configured_domain || *configured_domain != pinned_domain ||
+            decoded->chain_domain != pinned_domain) {
+            throw std::runtime_error("mainnet FN Genesis chain-domain mismatch");
+        }
+        if (decoded->fn_genesis_height != MAINNET_FN_GENESIS_HEIGHT ||
+            decoded->fn_genesis_height !=
+                static_cast<uint32_t>(*consensus.hard_fork_height)) {
+            throw std::runtime_error("mainnet FN Genesis height mismatch");
+        }
+        if (decoded->manifest_version != MAINNET_FN_MANIFEST_VERSION ||
+            decoded->manifest_version !=
+                modern::FN_GENESIS_MANIFEST_VERSION_V1) {
+            throw std::runtime_error("mainnet FN Genesis version mismatch");
+        }
+        if (decoded->manifest.size() != MAINNET_FN_MANIFEST_COUNT) {
+            throw std::runtime_error("mainnet FN Genesis row-count mismatch");
+        }
+        if (decoded->rights_root != pinned_root) {
+            throw std::runtime_error("mainnet FN Genesis rights-root mismatch");
+        }
+
+        consensus.fn_genesis_manifest_version = decoded->manifest_version;
+        consensus.fn_genesis_rights_root = pinned_root;
+        consensus.fn_genesis_manifest = std::move(decoded->manifest);
+        if (!modern::CheckFnGenesisConfiguration(consensus, manifest_error)) {
+            throw std::runtime_error(
+                "invalid mainnet FN Genesis configuration: " + manifest_error);
+        }
 
         // Core treats vSeeds as DNS hostnames. These legacy values are literal
         // IPv4 endpoints, so feed them through its fixed-seed path instead.
@@ -786,8 +945,119 @@ public:
             pos.halving_interval = b3.halving_interval;
             pos.treasury_percent = static_cast<uint32_t>(b3.treasury_percent);
             pos.treasury_script = b3.treasury_script;
+            if (b3.flowmesh_test && pos.treasury_script.empty()) {
+                // Deterministic functional-test wallet #0 legacy P2PKH. The
+                // value is test scaffolding only; callers may still override
+                // it explicitly with -b3treasuryscript.
+                pos.treasury_script = {
+                    OP_DUP, OP_HASH160, 0x14,
+                    0x2b, 0x45, 0x69, 0x20, 0x36, 0x94, 0xfc, 0x99,
+                    0x7e, 0x13, 0xf2, 0xc0, 0xa1, 0x38, 0x3b, 0x9e,
+                    0x16, 0xc7, 0x7a, 0x0d,
+                    OP_EQUALVERIFY, OP_CHECKSIG,
+                };
+            }
             assert(pos.Valid());
             consensus.modern_pos = pos;
+
+            if (b3.flowmesh_test) {
+                // Four deterministic functional-test wallets share the
+                // synthetic historical population. Every right is unique and
+                // raw-byte sorted, exactly like a sealed mainnet manifest.
+                static constexpr std::array<std::array<unsigned char, 20>, 4>
+                    TEST_RECIPIENTS{{
+                        {0x2b, 0x45, 0x69, 0x20, 0x36, 0x94, 0xfc, 0x99,
+                         0x7e, 0x13, 0xf2, 0xc0, 0xa1, 0x38, 0x3b, 0x9e,
+                         0x16, 0xc7, 0x7a, 0x0d},
+                        {0x83, 0xa8, 0x8d, 0x66, 0xf7, 0xac, 0x4a, 0xce,
+                         0x0d, 0x24, 0xbb, 0x6e, 0x58, 0xb7, 0x5a, 0xbb,
+                         0x9f, 0x64, 0x95, 0xe7},
+                        {0x4f, 0xf7, 0x85, 0xb8, 0x22, 0x1d, 0xc2, 0x06,
+                         0x31, 0x4c, 0xa1, 0x2e, 0x65, 0x77, 0x3a, 0x87,
+                         0x6d, 0xff, 0x30, 0xff},
+                        {0x6b, 0x6a, 0x33, 0x90, 0xff, 0xbd, 0xdf, 0x97,
+                         0xcb, 0x36, 0xf7, 0x10, 0x7c, 0x07, 0x39, 0xb1,
+                         0xe3, 0xe5, 0x50, 0xda},
+                    }};
+
+                consensus.fn_genesis_required = true;
+                consensus.fn_genesis_manifest.reserve(
+                    Consensus::HISTORICAL_FN_PROVEN_FLOOR);
+                for (uint32_t i{0};
+                     i < Consensus::HISTORICAL_FN_PROVEN_FLOOR; ++i) {
+                    Consensus::FnGenesisRight right;
+                    WriteBE32(right.pod_id.begin(), i + 1);
+                    right.recipient_key_hash =
+                        TEST_RECIPIENTS[i % TEST_RECIPIENTS.size()];
+                    consensus.fn_genesis_manifest.push_back(right);
+                }
+                const auto domain{modern::ModernChainDomain(
+                    consensus.hashGenesisBlock, *consensus.legacy_final_hash)};
+                assert(domain.has_value());
+                consensus.fn_genesis_rights_root =
+                    modern::ComputeFnGenesisManifestRootV1(
+                        *domain,
+                        static_cast<uint32_t>(*consensus.hard_fork_height),
+                        consensus.fn_genesis_manifest);
+                assert(consensus.fn_genesis_rights_root.has_value());
+
+                const int modern_start{
+                    *consensus.hard_fork_height + b3.corridor_length};
+                consensus.fn_pod_activation_height = modern_start + 1;
+                consensus.asset_activation_height = modern_start + 2;
+                consensus.flowmesh_activation_height =
+                    *consensus.asset_activation_height +
+                    Consensus::FLOWMESH_ANCHOR_DEPTH;
+
+                // Explicitly complete TEST-ONLY bridge configuration. It
+                // exercises the same fail-closed parameter shape while the
+                // chain domain ensures this regtest bUSD AssetId cannot equal
+                // mainnet's. No value below is a production recommendation.
+                Consensus::BridgeAssetParams busd;
+                busd.asset = Consensus::ETHEREUM_MAINNET_BUSD_IDENTITY;
+                busd.asset.origin_chain_id = 31'337;
+                // Synthetic but nonzero: zero is reserved for an incomplete
+                // deployment manifest on every network, including regtest.
+                busd.origin_deployment_block = 1;
+                busd.vault_runtime_code_hash = uint256{uint8_t{6}};
+                busd.implementation_or_adapter = uint256{uint8_t{1}};
+                busd.adapter_version = 1;
+                busd.recipient_encoding_version =
+                    Consensus::BRIDGE_RECIPIENT_VERSION_P2PKH_V1;
+                busd.activation_height = consensus.flowmesh_activation_height;
+                // Test-only chains exercise the complete round trip at the
+                // inbound height. Mainnet deliberately leaves the independent
+                // outbound gate unset until a later reviewed release.
+                consensus.bridge_withdrawal_activation_height =
+                    busd.activation_height;
+                busd.mint_caps = Consensus::BridgeMintCaps{
+                    .max_per_block = 1'000'000'000,
+                    .max_per_epoch = 10'000'000'000,
+                    .epoch_length_blocks = static_cast<uint32_t>(b3.epoch_length),
+                };
+                Consensus::EthereumLightClientPins light_client;
+                light_client.trusted_checkpoint_root = uint256{uint8_t{2}};
+                light_client.trusted_checkpoint_slot = 1;
+                light_client.genesis_validators_root = uint256{uint8_t{3}};
+                light_client.fork_schedule = {{0, {0, 0, 0, 0}}};
+                light_client.fork_schedule_valid_through_epoch = 1'000'000;
+                light_client.min_sync_committee_participants =
+                    Consensus::ETHEREUM_SYNC_COMMITTEE_SUPERMAJORITY;
+                light_client.max_sync_lag_slots = 8'192;
+                busd.light_client = std::move(light_client);
+                busd.withdrawal_mode =
+                    Consensus::BridgeWithdrawalMode::MANAGED_V1;
+                Consensus::BridgeManagedWithdrawalPins withdrawal;
+                withdrawal.authority_address.fill(0x42);
+                withdrawal.vault_runtime_code_hash =
+                    *busd.vault_runtime_code_hash;
+                withdrawal.withdrawal_rules_version =
+                    Consensus::MANAGED_WITHDRAWAL_RULES_VERSION_V1;
+                withdrawal.withdrawal_rules_commitment = uint256{uint8_t{5}};
+                busd.managed_withdrawal = withdrawal;
+                assert(Consensus::BridgeMintParamsReady(busd));
+                consensus.busd_bridge = std::move(busd);
+            }
         }
 
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.

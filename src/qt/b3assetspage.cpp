@@ -43,6 +43,7 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
     m_proxy = new QSortFilterProxyModel(this);
     m_proxy->setSourceModel(m_model);
     m_proxy->setFilterCaseSensitivity(Qt::CaseInsensitive);
+    m_proxy->setFilterRole(B3AssetTableModel::SearchRole);
     m_proxy->setFilterKeyColumn(-1); // search across name and ticker
 
     auto* outer = new QVBoxLayout(this);
@@ -67,7 +68,7 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
     B3Theme::markTextRole(heading, QStringLiteral("h1"));
     layout->addWidget(heading);
     auto* introduction = new QLabel(
-        tr("Native B3 is available now. Additional assets and FlowMesh balances appear only when a verified backend provides them."),
+        tr("Wallet-owned B3, FN Coins, and coloured assets appear here. FlowMesh balances appear when its wallet interface is active."),
         content);
     introduction->setWordWrap(true);
     B3Theme::markTextRole(introduction, QStringLiteral("secondary"));
@@ -96,11 +97,13 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
 
         m_search = new QLineEdit(m_list_card);
         m_search->setObjectName(QStringLiteral("assetSearch"));
-        m_search->setPlaceholderText(tr("Search by name or ticker"));
+        m_search->setPlaceholderText(tr("Search name, ticker, or paste an asset ID"));
         m_search->setClearButtonEnabled(true);
         listLayout->addWidget(m_search);
-        connect(m_search, &QLineEdit::textChanged, m_proxy,
-                qOverload<const QString&>(&QSortFilterProxyModel::setFilterFixedString));
+        connect(m_search, &QLineEdit::textChanged, this, [this](const QString& text) {
+            m_proxy->setFilterFixedString(text.trimmed());
+            updateDetails();
+        });
 
         m_list = new QTableView(m_list_card);
         m_list->setObjectName(QStringLiteral("assetList"));
@@ -125,8 +128,30 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
         listLayout->addWidget(m_empty);
 
         connect(m_list->selectionModel(), &QItemSelectionModel::currentRowChanged,
-                this, &B3AssetsPage::updateDetails);
-        connect(m_model, &QAbstractItemModel::modelReset, this, &B3AssetsPage::updateDetails);
+                this, [this](const QModelIndex& current) {
+                    // A reset temporarily moves the view to its first row. Do
+                    // not mistake that model-driven move for a user choice.
+                    if (m_model_resetting) return;
+                    if (current.isValid()) {
+                        m_selected_asset_id = current.data(
+                            B3AssetTableModel::AssetIdRole).toString();
+                    }
+                    updateDetails();
+                });
+        connect(m_model, &QAbstractItemModel::modelAboutToBeReset, this, [this] {
+            const QModelIndex current{m_list->currentIndex()};
+            if (current.isValid()) {
+                m_selected_asset_id = current.data(
+                    B3AssetTableModel::AssetIdRole).toString();
+            }
+            m_model_resetting = true;
+        });
+        // Wait for the proxy reset, not merely the source reset: only then are
+        // proxy rows and their stable asset ids ready to select again.
+        connect(m_proxy, &QAbstractItemModel::modelReset, this, [this] {
+            m_model_resetting = false;
+            updateDetails();
+        });
     }
 
     // Right: selected-asset details and actions.
@@ -151,8 +176,16 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
         detailLayout->addWidget(m_detail_name);
 
         m_detail_status = new QLabel(m_detail_card);
+        m_detail_status->setObjectName(QStringLiteral("assetStatus"));
         B3Theme::markTextRole(m_detail_status, QStringLiteral("status"));
         detailLayout->addWidget(m_detail_status);
+
+        m_detail_id = new QLabel(m_detail_card);
+        m_detail_id->setObjectName(QStringLiteral("assetId"));
+        m_detail_id->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        m_detail_id->setWordWrap(true);
+        B3Theme::markTextRole(m_detail_id, QStringLiteral("muted"));
+        detailLayout->addWidget(m_detail_id);
         detailLayout->addSpacing(B3Theme::kSpaceSm);
 
         auto addBalanceRow = [&](const QString& title, QLabel** value_out) {
@@ -169,6 +202,7 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
         addBalanceRow(tr("Confirmed"), &m_detail_confirmed);
         addBalanceRow(tr("Pending"), &m_detail_pending);
         addBalanceRow(tr("Available"), &m_detail_available);
+        addBalanceRow(tr("Immature"), &m_detail_immature);
         addBalanceRow(tr("Reserved"), &m_detail_reserved);
         addBalanceRow(tr("In FlowMesh"), &m_detail_flowmesh);
 
@@ -259,6 +293,7 @@ void B3AssetsPage::setWalletModel(WalletModel* wallet_model)
         m_owned_source = nullptr;
         m_model->setSource(nullptr);
     }
+    m_selected_asset_id.clear();
     delete old;
     updateDetails();
 }
@@ -269,6 +304,7 @@ void B3AssetsPage::setSource(B3AssetSource* source)
     m_owned_source = nullptr;
     m_have_wallet = source != nullptr;
     m_model->setSource(source);
+    m_selected_asset_id.clear();
     delete old;
     updateDetails();
 }
@@ -279,9 +315,30 @@ void B3AssetsPage::updateDetails()
     m_empty->setVisible(rows == 0);
     m_empty->setText(m_have_wallet ? tr("No assets to show.") : tr("No wallet is loaded."));
 
-    // Ensure something is selected whenever rows exist.
-    if (rows > 0 && !m_list->currentIndex().isValid()) {
-        m_list->setCurrentIndex(m_proxy->index(0, 0));
+    // Model resets invalidate the view's QModelIndex. Restore the user's
+    // selection by stable asset id instead of jumping back to native B3 on
+    // every balance refresh.
+    if (rows > 0) {
+        QModelIndex selected;
+        if (!m_selected_asset_id.isEmpty()) {
+            for (int row{0}; row < rows; ++row) {
+                const QModelIndex candidate{m_proxy->index(row, 0)};
+                if (candidate.data(B3AssetTableModel::AssetIdRole).toString() ==
+                    m_selected_asset_id) {
+                    selected = candidate;
+                    break;
+                }
+            }
+        }
+        const QModelIndex current{m_list->currentIndex()};
+        if (selected.isValid() &&
+            (!current.isValid() ||
+             current.data(B3AssetTableModel::AssetIdRole).toString() !=
+                 m_selected_asset_id)) {
+            m_list->setCurrentIndex(selected);
+        } else if (!current.isValid()) {
+            m_list->setCurrentIndex(m_proxy->index(0, 0));
+        }
     }
 
     B3AssetRecord record;
@@ -290,13 +347,17 @@ void B3AssetsPage::updateDetails()
     if (current.isValid()) {
         record = m_model->recordAt(m_proxy->mapToSource(current).row());
         have_selection = !record.asset_id.isEmpty();
+        if (have_selection && !m_model_resetting) {
+            m_selected_asset_id = record.asset_id;
+        }
     }
 
     if (!have_selection) {
         m_detail_name->setText(tr("No asset selected"));
         m_detail_status->clear();
+        m_detail_id->clear();
         for (QLabel* value : {m_detail_confirmed, m_detail_pending, m_detail_available,
-                              m_detail_reserved, m_detail_flowmesh}) {
+                              m_detail_immature, m_detail_reserved, m_detail_flowmesh}) {
             value->setText(QStringLiteral("—"));
         }
         m_send->setEnabled(false);
@@ -317,17 +378,29 @@ void B3AssetsPage::updateDetails()
         m_detail_status->setText(tr("Native coin · real wallet balance"));
         break;
     case B3AssetRecord::Status::Active:
-        m_detail_status->setText(tr("Coloured asset"));
+        if (record.is_fn) {
+            m_detail_status->setText(record.immature > 0
+                ? tr("FN Coin · confirmed, waiting for maturity")
+                : tr("FN Coin"));
+        } else if (record.is_bridge) {
+            m_detail_status->setText(tr("Bridged USD · exact six-decimal units"));
+        } else {
+            m_detail_status->setText(tr("Coloured asset · exact raw units"));
+        }
         break;
     case B3AssetRecord::Status::Unavailable:
         m_detail_status->setText(tr("Backend unavailable"));
         break;
     }
+    m_detail_id->setText(record.status == B3AssetRecord::Status::Native
+        ? tr("Native B3")
+        : tr("Asset ID: %1").arg(record.asset_id));
 
     const auto amount = [&](CAmount value) { return B3AssetTableModel::formatAmount(value, record.decimals); };
     m_detail_confirmed->setText(amount(record.confirmed));
     m_detail_pending->setText(amount(record.pending));
     m_detail_available->setText(amount(record.available));
+    m_detail_immature->setText(amount(record.immature));
     m_detail_reserved->setText(record.reserved_available ? amount(record.reserved) : tr("Not available"));
     m_detail_flowmesh->setText(record.flowmesh_available ? amount(record.flowmesh) : tr("Not available"));
 
@@ -343,12 +416,13 @@ void B3AssetsPage::updateDetails()
     m_deposit->setEnabled(false);
     m_withdraw->setEnabled(false);
     m_backend_note->setVisible(true);
-    m_backend_note->setText(tr("FlowMesh deposits and withdrawals are not active in this "
-                               "wallet build."));
+    m_backend_note->setText(tr("FlowMesh deposit and withdrawal controls are not available "
+                               "on this page in this beta. Use the console after the "
+                               "configured activation height."));
 
     m_activity_note->setVisible(true);
     m_activity_note->setText(native
         ? tr("Native B3 transactions are listed on the Activity page.")
-        : tr("Asset activity requires a coloured-asset backend, which is not "
-             "available in this build."));
+        : tr("This balance comes directly from wallet-owned asset outputs. "
+             "Asset transfer controls remain available through the console in this beta."));
 }

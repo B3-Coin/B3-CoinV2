@@ -5,6 +5,7 @@
 #ifndef B3COIN_NODE_FLOWMESH_ANCHOR_H
 #define B3COIN_NODE_FLOWMESH_ANCHOR_H
 
+#include <consensus/flowmesh_params.h>
 #include <flowmesh/deposit.h>
 
 #include <optional>
@@ -36,7 +37,8 @@ namespace node {
  * chain replacement. Production wiring passes this constant to
  * ChainAnchorPolicy; fixtures may still pass small scaffolding depths.
  */
-inline constexpr int FLOWMESH_ANCHOR_DEPTH{30};
+inline constexpr int FLOWMESH_ANCHOR_DEPTH{Consensus::FLOWMESH_ANCHOR_DEPTH};
+static_assert(FLOWMESH_ANCHOR_DEPTH == 30);
 
 class ChainAnchorPolicy final : public flowmesh::AnchorPolicy
 {
@@ -66,6 +68,20 @@ public:
                                                     const flowmesh::AnchorRef&) const override
     {
         return std::nullopt;
+    }
+
+    std::optional<CAmount> GetWithdrawalCapacity(
+        const modern::AssetId&, const flowmesh::AnchorRef&) const override
+    {
+        return std::nullopt;
+    }
+
+    std::optional<std::vector<flowmesh::WithdrawalSettlementFactV1>>
+    GetWithdrawalSettlements(
+        const std::optional<flowmesh::AnchorRef>&,
+        const flowmesh::AnchorRef&) const override
+    {
+        return std::vector<flowmesh::WithdrawalSettlementFactV1>{};
     }
 };
 

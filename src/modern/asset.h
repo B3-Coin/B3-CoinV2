@@ -25,8 +25,8 @@
 namespace modern {
 
 /**
- * Native coloured-asset model — simple v1 (owner rulings 2026-08-22;
- * test-only activation until the asset activation height).
+ * Native coloured-asset model — simple v1 (owner rulings 2026-08-22),
+ * production-gated by the separately pinned asset activation height A2.
  *
  *     issue once  →  AssetId  →  immutable genesis record  →  ordinary
  *     outputs carry only AssetId + amount + per-output Policy
@@ -215,18 +215,30 @@ enum class AssetCheck {
     ISSUANCE_INVALID,
 };
 
+/** A transaction-context rule may authorize one exact non-native surplus.
+ * Simple-v1 asset genesis is still authorized by its own creation record;
+ * this narrow hook is used only by proof-free modern FN PoD validation. */
+struct AuthorizedAssetMint {
+    AssetId asset{};
+    CAmount amount{0};
+};
+
 /**
  * Core conservation check over explicit inputs/outputs/actions.
  * `prev_outputs[i]` is the coin spent by `inputs[i]`. Fail-closed:
- * NOT_ACTIVE until the asset rules are activated (test-only for now).
+ * NOT_ACTIVE until either the FN rules or colored-asset rules are active.
  */
 inline AssetCheck CheckAssetConservation(const std::vector<ModernOutput>& prev_outputs,
                                          const std::vector<ModernInput>& inputs,
                                          const std::vector<ModernOutput>& outputs,
                                          const std::vector<CreationAction>& actions,
-                                         const int height, const Consensus::Params& params)
+                                         const int height, const Consensus::Params& params,
+                                         const std::optional<AuthorizedAssetMint>& authorized_mint =
+                                             std::nullopt)
 {
-    if (!params.test_only_asset_policies_active) return AssetCheck::NOT_ACTIVE;
+    const bool assets_active{Consensus::AssetRulesActive(height, params)};
+    const bool fn_active{Consensus::FnRulesActive(height, params)};
+    if (!assets_active && !fn_active) return AssetCheck::NOT_ACTIVE;
     if (inputs.empty() || prev_outputs.size() != inputs.size()) {
         return AssetCheck::STRUCTURE_INVALID;
     }
@@ -237,6 +249,7 @@ inline AssetCheck CheckAssetConservation(const std::vector<ModernOutput>& prev_o
     uint64_t declared_supply{0};
     for (const CreationAction& action : actions) {
         if (action.action_type != CREATION_ACTION_ASSET_ISSUANCE) continue;
+        if (!assets_active) return AssetCheck::NOT_ACTIVE;
         if (issuance_id) return AssetCheck::ISSUANCE_INVALID;
         AssetGenesisV1 genesis;
         std::string error;
@@ -249,6 +262,12 @@ inline AssetCheck CheckAssetConservation(const std::vector<ModernOutput>& prev_o
         issuance_id = AssetIdV1(*domain, inputs[0].prevout, AssetGenesisCommitment(genesis));
         if (*issuance_id == NativeAsset()) return AssetCheck::ISSUANCE_INVALID;
         declared_supply = genesis.max_supply;
+    }
+    if (authorized_mint &&
+        (authorized_mint->asset == NativeAsset() || authorized_mint->amount <= 0 ||
+         authorized_mint->amount > MAX_MONEY ||
+         (issuance_id && *issuance_id == authorized_mint->asset))) {
+        return AssetCheck::ISSUANCE_INVALID;
     }
 
     // Overflow-safe per-asset accumulation. Every individual amount has
@@ -285,8 +304,10 @@ inline AssetCheck CheckAssetConservation(const std::vector<ModernOutput>& prev_o
     for (const auto& [asset, sum] : in_sums) all_assets.try_emplace(asset, 0);
     for (const auto& [asset, sum] : live_sums) all_assets.try_emplace(asset, 0);
     for (const auto& [asset, sum] : burn_sums) all_assets.try_emplace(asset, 0);
+    if (authorized_mint) all_assets.try_emplace(authorized_mint->asset, 0);
 
     bool genesis_minted{false};
+    bool authorized_minted{false};
     for (const auto& [asset, unused] : all_assets) {
         const CAmount in{in_sums.count(asset) ? in_sums.at(asset) : 0};
         const CAmount live{live_sums.count(asset) ? live_sums.at(asset) : 0};
@@ -302,6 +323,13 @@ inline AssetCheck CheckAssetConservation(const std::vector<ModernOutput>& prev_o
         }
         if (out_total == in) continue; // exact transfer/burn conservation
         if (out_total > in) {
+            if (authorized_mint && asset == authorized_mint->asset) {
+                if (out_total - in != authorized_mint->amount) {
+                    return AssetCheck::UNAUTHORIZED_MINT;
+                }
+                authorized_minted = true;
+                continue;
+            }
             // A mint: authorized only as THIS transition's declared genesis,
             // and only for exactly the declared supply.
             if (!issuance_id || asset != *issuance_id) return AssetCheck::UNAUTHORIZED_MINT;
@@ -316,6 +344,7 @@ inline AssetCheck CheckAssetConservation(const std::vector<ModernOutput>& prev_o
     }
     // A declared genesis must actually mint its supply.
     if (issuance_id && !genesis_minted) return AssetCheck::ISSUANCE_INVALID;
+    if (authorized_mint && !authorized_minted) return AssetCheck::ISSUANCE_INVALID;
     return AssetCheck::OK;
 }
 

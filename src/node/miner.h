@@ -7,6 +7,7 @@
 #define BITCOIN_NODE_MINER_H
 
 #include <interfaces/types.h>
+#include <node/finality_binding_index.h>
 #include <node/types.h>
 #include <policy/policy.h>
 #include <primitives/block.h>
@@ -38,6 +39,8 @@ using interfaces::BlockRef;
 class CKey;
 
 namespace node {
+class BridgeBlockPreview;
+enum class BridgeBurnReadiness;
 class KernelNotifications;
 
 static const bool DEFAULT_PRINT_MODIFIED_FEE = false;
@@ -71,6 +74,9 @@ private:
     uint64_t nBlockTx;
     uint64_t nBlockSigOpsCost;
     CAmount nFees;
+    //! Candidate-local cumulative modern FN PoD count. Engaged from A1;
+    //! advanced in exact transaction order as chunks are selected.
+    std::optional<uint32_t> m_fn_pod_issued_total;
 
     // Chain context for the block
     int nHeight;
@@ -133,7 +139,10 @@ private:
       *
       * @pre BlockAssembler::m_mempool must not be nullptr
     */
-    void addChunks() EXCLUSIVE_LOCKS_REQUIRED(m_mempool->cs);
+    void addChunks(BridgeBlockPreview* bridge_preview,
+                   BridgeBurnReadiness bridge_burn_readiness,
+                   FinalityBindingOverlay* finality_binding_preview)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, m_mempool->cs);
 
     // helper functions for addChunks()
     /** Test if a new chunk would "fit" in the block */
@@ -141,7 +150,11 @@ private:
     /** Perform locktime checks on each transaction in a chunk:
       * This check should always succeed, and is here
       * only as an extra check in case of a bug */
-    bool TestChunkTransactions(const std::vector<CTxMemPoolEntryRef>& txs) const;
+    bool TestChunkTransactions(const std::vector<CTxMemPoolEntryRef>& txs,
+                               std::optional<uint32_t>& resulting_fn_pod_total,
+                               const FinalityBindingOverlay* finality_binding_preview,
+                               std::optional<FinalityBindingOverlay>& resulting_finality_binding_preview) const
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, m_mempool->cs);
 };
 
 /**

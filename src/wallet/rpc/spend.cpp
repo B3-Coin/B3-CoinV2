@@ -713,6 +713,8 @@ RPCHelpMan fundrawtransaction()
                 "Note that inputs which were signed may need to be resigned after completion since in/outputs have been added.\n"
                 "The inputs added will not be signed, use signrawtransactionwithkey\n"
                 "or signrawtransactionwithwallet for that.\n"
+                "Transactions carrying Modern Payload Area records are rejected; use a feature-specific\n"
+                "builder because generic funding cannot safely preserve their consensus meaning.\n"
                 "All existing inputs must either have their previous output transaction be in the wallet\n"
                 "or be in the UTXO set. Solving data must be provided for non-wallet inputs.\n"
                 "Note that all inputs selected must be of standard form and P2SH scripts must be\n"
@@ -807,6 +809,11 @@ RPCHelpMan fundrawtransaction()
     bool try_no_witness = request.params[2].isNull() ? true : !request.params[2].get_bool();
     if (!DecodeHexTx(tx, request.params[0].get_str(), try_no_witness, try_witness)) {
         throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed");
+    }
+    if (!tx.mpa.empty()) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "fundrawtransaction does not support transactions with Modern Payload Area records");
     }
     UniValue options = request.params[1];
     std::vector<std::pair<CTxDestination, CAmount>> destinations;
@@ -1644,9 +1651,7 @@ RPCHelpMan walletprocesspsbt()
         CMutableTransaction mtx;
         // Returns true if complete, which we already think it is.
         CHECK_NONFATAL(FinalizeAndExtractPSBT(psbtx, mtx));
-        DataStream ssTx_final;
-        ssTx_final << TX_WITH_WITNESS(mtx);
-        result.pushKV("hex", HexStr(ssTx_final));
+        result.pushKV("hex", EncodeHexTx(CTransaction{mtx}));
     }
 
     return result;

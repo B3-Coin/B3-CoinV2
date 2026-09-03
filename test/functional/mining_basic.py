@@ -405,6 +405,12 @@ class MiningTest(BitcoinTestFramework):
         # Check that default_witness_commitment is present.
         assert 'default_witness_commitment' in tmpl
         witness_commitment = tmpl['default_witness_commitment']
+        assert_equal(tmpl['coinbasevalue_remaining'], tmpl['coinbasevalue'])
+        assert 'coinbase_mpa' not in tmpl
+        assert_equal(tmpl['coinbase_required_outputs'][-1], {
+            'value': 0,
+            'scriptPubKey': witness_commitment,
+        })
 
         # Check that default_witness_commitment is correct.
         witness_root = CBlock.get_merkle_root([ser_uint256(0),

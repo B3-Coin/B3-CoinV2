@@ -8,17 +8,50 @@
 #include <coins.h>
 #include <consensus/amount.h>
 #include <consensus/era.h>
+#include <consensus/fn_params.h>
 #include <consensus/params.h>
+#include <crypto/bls.h>
+#include <crypto/common.h>
 #include <crypto/sha256.h>
+#include <hash.h>
 #include <script/script.h>
 #include <serialize.h>
 #include <uint256.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace modern {
+
+/**
+ * Whether the script starts by claiming one of B3's policy-carrier
+ * namespaces. This intentionally recognizes a magic prefix rather than a
+ * fully valid carrier: an owner suffix must never hide a second policy layer,
+ * including a malformed one that another consumer could interpret
+ * differently. OP_RETURN-first legacy B3A1 claims remain covered by the
+ * asset-specific ClaimsAssetOutput() check.
+ */
+inline bool ClaimsB3PolicyCarrier(const CScript& script)
+{
+    CScript::const_iterator pc{script.begin()};
+    opcodetype opcode;
+    std::vector<unsigned char> data;
+    if (!script.GetOp(pc, opcode, data) || opcode > OP_PUSHDATA4 || data.size() < 4) {
+        return false;
+    }
+    static constexpr std::array<std::array<unsigned char, 4>, 3> magics{{
+        {{'B', '3', 'A', '1'}},
+        {{'B', '3', 'S', '1'}},
+        {{'B', '3', 'M', 'C'}},
+    }};
+    return std::any_of(magics.begin(), magics.end(), [&](const auto& magic) {
+        return std::equal(magic.begin(), magic.end(), data.begin());
+    });
+}
 
 /**
  * Versioned B3 Policy Output primitives (modern era only).
@@ -32,10 +65,11 @@ namespace modern {
  * byte-identical on disk and in history, and are merely *viewed* through
  * this model when spent after the boundary.
  *
- * Only two policies exist at this stage; everything else — DEX vault,
- * staking, bridge, asset issuance — arrives strictly through explicit
- * later activation, and no generic VM will ever be added. Unknown or
- * unactivated (type, version) pairs are invalid, never ignored.
+ * Each non-base policy has an explicit feature gate. With a complete,
+ * anchor-depth-separated A3 schedule, FN-v2 pre-binding and DEX_VAULT-v2
+ * creation/preparation open at A2; vault spending and full FlowMesh rules
+ * wait for A3. No generic VM is added; unknown or unactivated (type, version)
+ * pairs are invalid.
  */
 
 //! Stable 32-byte asset identifier.
@@ -63,13 +97,13 @@ inline constexpr size_t MAX_POLICY_PARAMS_SIZE{80};
  *  - BURN: value explicitly and provably destroyed. v1: params empty,
  *    commitment must be all-zero; a burn output is unspendable by
  *    definition and exists so supply reduction is visible and exactly
- *    accounted (modern/asset.h). Part of the coloured-asset policy set,
- *    activated for tests only until the asset rules ship.
- *  - DEX_VAULT: DEX custody (modern/vault.h). v1: the commitment is the
- *    approved vault identity (non-zero) and params are exactly a 2-byte
- *    shard id, so custody spreads over many parallel UTXOs. A vault has
- *    no private key: spending is authorized only by finalized withdrawal
- *    receipts. Same test-only activation as the asset policy set.
+ *    accounted (modern/asset.h). Active contextually for FN from H+1 and for
+ *    generic colored assets from A2.
+ *  - DEX_VAULT: FlowMesh custody. v2: the commitment is the non-null VaultId
+ *    and semantic params are {kind, shard, [account]}. A vault has no private
+ *    key. The B3A1 wire carrier prefixes VaultId to those semantic params and
+ *    may be created for preparation at A2. Spending authorization and
+ *    trading/checkpoint effects activate separately at A3.
  *  - STAKE: locked native B3 carrying a validator binding (modern/stake.h
  *    defines the v1 on-chain carrier). v1: the commitment is the owner
  *    binding (SHA256 of the owner script suffix, the OWNER scheme) and
@@ -85,13 +119,14 @@ inline constexpr size_t MAX_POLICY_PARAMS_SIZE{80};
  *    FnAssetId, enforced by the FN layers — this layer can only pin
  *    non-native), a whole-unit amount in [1, MAX_FN_EVER_ISSUED], the
  *    modern ownership-policy commitment as the commitment (one party,
- *    a threshold group or an organization alike), and canonically
- *    EMPTY params. The PoDId lives ONLY in issuance evidence and the
- *    future issued[pod_id] nullifier state — never in FN outputs.
- *    FN v1 is NOT activated on
- *    any network yet: creation, transfer and extinguishment rules arrive
- *    with the FN validation commits, and until an explicit activation
- *    every FN output is invalid like any other unactivated policy.
+ *    a threshold group or an organization alike). v1 has canonically EMPTY
+ *    params and is an ordinary FN owner output. v2 is an active FlowMesh seat:
+ *    amount exactly 1 and params exactly one canonical, non-infinity 48-byte
+ *    BLS public key. Historical units are created by the H+1 FN Genesis event;
+ *    modern PoD issuance uses the branch-local A1 counter. No PoDId lives in
+ *    an FN output. FN transfer/extinguishment is gated by the complete sealed
+ *    Genesis configuration and the H+1 boundary; v2 pre-binding opens at A2
+ *    only when the complete A3 runway is pinned.
  */
 enum class PolicyType : uint16_t {
     LEGACY_LOCK = 0,
@@ -109,13 +144,16 @@ enum class PolicyType : uint16_t {
     //!   FINALITY_KEY         validator BLS-binding cell (commitment =
     //!                        validator_key, params = bls_pubkey || seq),
     //!   MODERN_PAYLOAD_ROOT  coinbase-only commitment to the block's MPA
-    //!                        sections (commitment = payload_root, no params).
-    //! DECLARED, NOT ACTIVATED: IsActivatedPolicy fails closed for all three
-    //! until their carriers and rules land (implementation plan, Commits
-    //! 3-7); a claiming output is invalid, never reinterpreted.
+    //!                        sections (commitment = payload_root, no params),
+    //!   BRIDGE_RECORD        transaction-signature binding for one exact
+    //!                        type-10 MPA record (commitment = tagged hash of
+    //!                        its canonical frame, no params).
+    //! These numbers are append-only. Activation remains contextual and
+    //! fail-closed; a claiming output is invalid, never reinterpreted.
     FINALITY_CERT = 6,
     FINALITY_KEY = 7,
     MODERN_PAYLOAD_ROOT = 8,
+    BRIDGE_RECORD = 9,
 };
 
 //! DEX_VAULT v1 params: exactly a little-endian 2-byte shard id.
@@ -132,6 +170,7 @@ inline constexpr uint8_t VAULT_KIND_POOL_CHANGE{2};
 inline constexpr size_t VAULT_POOL_CHANGE_PARAMS_SIZE{3};
 inline constexpr size_t VAULT_USER_DEPOSIT_PARAMS_SIZE{35};
 inline constexpr uint16_t DEX_VAULT_POLICY_VERSION_V2{2};
+inline constexpr const char* FLOWMESH_VAULT_SHARD_TAG{"B3/FLOWMESH/SHARD/V1"};
 //! Retired v1 shard-only params size, kept only so old tests/docs read.
 inline constexpr size_t VAULT_SHARD_PARAMS_SIZE{2};
 
@@ -143,6 +182,9 @@ inline constexpr size_t STAKE_PARAMS_SIZE{34};
 
 //! First and, at this stage, only version of either policy.
 inline constexpr uint16_t POLICY_VERSION_V1{1};
+//! FN policy v2 is the FlowMesh active-seat form.
+inline constexpr uint16_t FN_SEAT_POLICY_VERSION_V2{2};
+inline constexpr size_t FN_SEAT_POLICY_PARAMS_SIZE{bls::PUBKEY_SIZE};
 
 struct ModernOutput {
     AssetId asset{};
@@ -168,21 +210,27 @@ struct ModernOutput {
 
 /**
  * Whether a (type, version) pair is an activated policy. LEGACY_LOCK v1
- * and OWNER v1 are always active; BURN v1 and DEX_VAULT v1 only when the
- * coloured-asset policy set is active (assets_active). Anything else —
- * including future versions of these types — is unactivated and therefore
- * invalid. assets_active is sourced from Params::test_only_asset_policies_active
- * and is false in production, so the asset policies stay invalid until they
- * ship.
+ * and OWNER v1 are always active; BURN v1 follows the colored-asset/FN
+ * feature gates. DEX_VAULT v2 has a separate A2 preparation gate (with an
+ * isolated test hook for the policy model): outputs may bootstrap and mature
+ * before A3, while every keyless spend remains proof-gated by full FlowMesh
+ * activation. Anything else — including future versions — is invalid.
  */
 inline bool IsActivatedPolicy(const uint16_t policy_type, const uint16_t policy_version,
-                              const bool assets_active = false)
+                              const bool assets_active = false,
+                              const bool fn_active = false,
+                              const bool dex_vault_active = false,
+                              const bool flowmesh_active = false)
 {
     // DEX_VAULT lives at v2 (kind/shard/account params, owner ruling
     // 2026-08-22); its v1 shard-only form is retired. Every other policy is
     // v1 only.
     if (policy_type == static_cast<uint16_t>(PolicyType::DEX_VAULT)) {
-        return policy_version == DEX_VAULT_POLICY_VERSION_V2 && assets_active;
+        return policy_version == DEX_VAULT_POLICY_VERSION_V2 && dex_vault_active;
+    }
+    if (policy_type == static_cast<uint16_t>(PolicyType::FN) &&
+        policy_version == FN_SEAT_POLICY_VERSION_V2) {
+        return fn_active && flowmesh_active;
     }
     if (policy_version != POLICY_VERSION_V1) return false;
     if (policy_type == static_cast<uint16_t>(PolicyType::LEGACY_LOCK) ||
@@ -191,7 +239,14 @@ inline bool IsActivatedPolicy(const uint16_t policy_type, const uint16_t policy_
         return true;
     }
     if (policy_type == static_cast<uint16_t>(PolicyType::BURN)) {
-        return assets_active;
+        // FN extinguishment is valid as soon as FN itself is live; generic
+        // colored-asset burns wait for the colored-asset activation height.
+        // The contextual asset layer restricts a pre-asset-activation BURN
+        // to the one chain-scoped FN asset id.
+        return assets_active || fn_active;
+    }
+    if (policy_type == static_cast<uint16_t>(PolicyType::FN)) {
+        return fn_active;
     }
     return false;
 }
@@ -230,6 +285,7 @@ inline std::optional<VaultParams> ParseVaultParams(const std::vector<unsigned ch
     VaultParams out;
     out.kind = params[0];
     out.shard = static_cast<uint16_t>(params[1] | (params[2] << 8));
+    if (out.shard >= 256) return std::nullopt;
     if (out.kind == VAULT_KIND_POOL_CHANGE) {
         if (params.size() != VAULT_POOL_CHANGE_PARAMS_SIZE) return std::nullopt;
         return out;
@@ -245,6 +301,32 @@ inline std::optional<VaultParams> ParseVaultParams(const std::vector<unsigned ch
     return std::nullopt;
 }
 
+//! Deterministic USER_DEPOSIT shard. The hash input is the exact raw
+//! VaultId followed by the exact raw account id; uint256 serialization is
+//! deliberately avoided so no length or type prefix can enter the digest.
+inline uint16_t FlowMeshUserDepositShard(const uint256& vault_id, const uint256& account)
+{
+    HashWriter writer{TaggedHash(FLOWMESH_VAULT_SHARD_TAG)};
+    writer << std::span<const unsigned char>{vault_id.begin(), vault_id.size()}
+           << std::span<const unsigned char>{account.begin(), account.size()};
+    const uint256 digest{writer.GetSHA256()};
+    return ReadLE16(digest.begin()) % 256;
+}
+
+//! Validate both the exact semantic v2 grammar and the owner-ratified shard
+//! binding. Pool change may name any of the 256 shards; a user deposit has
+//! exactly one valid shard for its (VaultId, account) pair.
+inline bool CheckVaultParams(const uint256& vault_id,
+                             const std::vector<unsigned char>& params)
+{
+    if (vault_id.IsNull()) return false;
+    const auto parsed{ParseVaultParams(params)};
+    if (!parsed) return false;
+    if (parsed->kind != VAULT_KIND_USER_DEPOSIT) return true;
+    return parsed->account &&
+           parsed->shard == FlowMeshUserDepositShard(vault_id, *parsed->account);
+}
+
 //! Build DEX_VAULT v2 params for either kind.
 inline std::vector<unsigned char> MakeVaultParams(const uint8_t kind, const uint16_t shard,
                                                   const uint256& account = uint256{})
@@ -255,13 +337,27 @@ inline std::vector<unsigned char> MakeVaultParams(const uint8_t kind, const uint
     return params;
 }
 
-inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int height,
-                                           const Consensus::Params& params)
+//! `configured_bridge_asset_active` may be set only after the contextual asset
+//! layer has matched the output's exact chain-bound bridge AssetId and its
+//! complete independent bridge activation envelope. It opens OWNER/BURN for
+//! that asset without opening generic colored-asset issuance before A2.
+inline PolicyOutputCheck CheckPolicyOutput(
+    const ModernOutput& out, const int height,
+    const Consensus::Params& params,
+    const bool configured_bridge_asset_active = false)
 {
     if (Consensus::GetB3Era(height, params) != Consensus::B3Era::MODERN) {
         return PolicyOutputCheck::NOT_MODERN_ERA;
     }
-    if (!IsActivatedPolicy(out.policy_type, out.policy_version, params.test_only_asset_policies_active)) {
+    const bool dex_vault_active{
+        params.test_only_asset_policies_active ||
+        Consensus::FlowMeshVaultPreparationRulesActive(height, params)};
+    if (!IsActivatedPolicy(out.policy_type, out.policy_version,
+                           Consensus::AssetRulesActive(height, params) ||
+                               configured_bridge_asset_active,
+                           Consensus::FnRulesActive(height, params),
+                           dex_vault_active,
+                           Consensus::FlowMeshSeatBindingRulesActive(height, params))) {
         return PolicyOutputCheck::UNKNOWN_POLICY;
     }
     // Per-asset supply rules arrive with issuance; until then every amount
@@ -291,8 +387,9 @@ inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int he
         // v2: the commitment names the approved vault; params carry
         // {kind, shard, [account]} — USER_DEPOSIT with a 32-byte FlowMesh
         // account id, or VAULT_POOL_CHANGE with no beneficiary.
-        if (out.policy_commitment.IsNull()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
-        if (!ParseVaultParams(out.policy_params)) return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        if (!CheckVaultParams(out.policy_commitment, out.policy_params)) {
+            return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        }
         break;
     case PolicyType::STAKE: {
         // Locked NATIVE B3 carrying a validator binding: a POSITIVE
@@ -321,9 +418,8 @@ inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int he
         break;
     }
     case PolicyType::FN:
-        // UNREACHABLE until FN v1 is activated (IsActivatedPolicy above
-        // fails closed). The v1 structural rules, ready for that day
-        // (owner ruling 2026-08-18): FN Coin is the ONE global
+        // Contextually active only after the complete sealed FN configuration
+        // and its height gate. FN Coin is the ONE global
         // chain-scoped colored asset — never the native asset (the exact
         // FnAssetId needs the chain domain and is enforced by the FN
         // layers, modern/fn.h) — with whole-unit amounts, the modern
@@ -331,15 +427,29 @@ inline PolicyOutputCheck CheckPolicyOutput(const ModernOutput& out, const int he
         // PoDId is an issuance nullifier, never output identity, and no
         // opaque future-reinterpretable bytes are accepted.
         if (out.asset == NativeAsset()) return PolicyOutputCheck::BAD_ASSET;
+        if (out.policy_version == FN_SEAT_POLICY_VERSION_V2) {
+            if (out.amount != 1) return PolicyOutputCheck::BAD_AMOUNT;
+        } else if (out.amount < 1 || out.amount > Consensus::MAX_FN_EVER_ISSUED) {
+            return PolicyOutputCheck::BAD_AMOUNT;
+        }
         if (out.policy_commitment.IsNull()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
-        if (!out.policy_params.empty()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        if (out.policy_version == POLICY_VERSION_V1) {
+            if (!out.policy_params.empty()) return PolicyOutputCheck::BAD_POLICY_PARAMS;
+        } else {
+            if (out.policy_version != FN_SEAT_POLICY_VERSION_V2 ||
+                out.policy_params.size() != FN_SEAT_POLICY_PARAMS_SIZE ||
+                !bls::PublicKey::Decode(out.policy_params)) {
+                return PolicyOutputCheck::BAD_POLICY_PARAMS;
+            }
+        }
         break;
     case PolicyType::FINALITY_CERT:
     case PolicyType::FINALITY_KEY:
     case PolicyType::MODERN_PAYLOAD_ROOT:
-        // UNREACHABLE: declared numbers without activated rules (the
-        // IsActivatedPolicy gate above fails closed). Kept explicit so the
-        // switch stays exhaustive and no future default can accept them.
+    case PolicyType::BRIDGE_RECORD:
+        // Metadata cells never use the spendable B3A1 carrier handled here.
+        // Kept explicit so the switch stays exhaustive and no future default
+        // can accidentally accept them.
         return PolicyOutputCheck::UNKNOWN_POLICY;
     }
     return PolicyOutputCheck::OK;

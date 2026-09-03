@@ -58,14 +58,23 @@ void ConnmanTestMsg::Handshake(CNode& node,
     FlushSendBuffer(node); // Drop the verack message added by SendMessages.
     if (node.fDisconnect) return;
     assert(node.nVersion == version);
-    // A peer speaking the historical B3Coin protocol family negotiates the
-    // legacy compatibility cap instead of Core's feature range.
-    const bool b3_legacy_peer{Params().GetConsensus().legacy_b3coin &&
-                              version >= 80'000 && version <= legacy::P2P_PROTOCOL_VERSION};
-    const int expected_common_version{b3_legacy_peer
-                                          ? std::min(version, legacy::P2P_COMPATIBILITY_VERSION)
-                                          : std::min(version, PROTOCOL_VERSION)};
-    assert(node.GetCommonVersion() == expected_common_version);
+    // On B3 the effective mode is legacy when either endpoint advertised
+    // 80000..80008. This helper knows the remote version but deliberately does
+    // not duplicate PeerManager's active-tip choice for our VERSION banner, so
+    // accept either internally valid cap and let focused tests assert which
+    // one the concrete phase must negotiate.
+    const bool remote_legacy{Params().GetConsensus().legacy_b3coin &&
+                             version >= 80'000 &&
+                             version <= legacy::P2P_PROTOCOL_VERSION};
+    const int modern_common{std::min(version, PROTOCOL_VERSION)};
+    const int legacy_common{
+        std::min(version, legacy::P2P_COMPATIBILITY_VERSION)};
+    if (remote_legacy) {
+        assert(node.GetCommonVersion() == legacy_common);
+    } else {
+        assert(node.GetCommonVersion() == modern_common ||
+               node.GetCommonVersion() == legacy_common);
+    }
     CNodeStateStats statestats;
     assert(peerman.GetNodeStateStats(node.GetId(), statestats));
     assert(statestats.m_relay_txs == (relay_txs && !node.IsBlockOnlyConn()));

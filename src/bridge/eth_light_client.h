@@ -15,8 +15,8 @@
 #include <optional>
 #include <vector>
 
-/** Ethereum sync-committee light client — pure verification functions
- *  (bridge proposal stage 3; header-only, NOT reachable from consensus).
+/** Ethereum sync-committee light client — pure verification functions used by
+ *  the independently gated type-10 consensus bridge.
  *
  *  This is the inbound (ETH -> B3 deposit) verifier the owner ordered first
  *  on 2026-08-24: finalized-headers-only, supermajority participation by
@@ -93,9 +93,13 @@ struct LightClientHeader {
 
     bool VerifyExecution() const
     {
+        if (!execution.ValidForHashTreeRoot()) return false;
         return ssz::VerifyBranch(execution.HashTreeRoot(), execution_branch,
                                  EXECUTION_PAYLOAD_GINDEX, beacon.body_root);
     }
+
+    friend bool operator==(const LightClientHeader&,
+                           const LightClientHeader&) = default;
 };
 
 struct SyncAggregate {
@@ -109,6 +113,8 @@ struct SyncAggregate {
         return n;
     }
     bool Participant(size_t i) const { return (bits[i / 8] >> (i % 8)) & 1; }
+
+    friend bool operator==(const SyncAggregate&, const SyncAggregate&) = default;
 };
 
 struct LightClientUpdate {
@@ -120,6 +126,9 @@ struct LightClientUpdate {
     std::vector<uint256> next_branch{};
     SyncAggregate sync_aggregate{};
     uint64_t signature_slot{0};
+
+    friend bool operator==(const LightClientUpdate&,
+                           const LightClientUpdate&) = default;
 };
 
 struct LightClientStore {
@@ -127,6 +136,9 @@ struct LightClientStore {
     uint64_t period{0};
     ssz::SyncCommittee current{};
     std::optional<ssz::SyncCommittee> next{};
+
+    friend bool operator==(const LightClientStore&,
+                           const LightClientStore&) = default;
 };
 
 enum class LcResult {
@@ -175,8 +187,17 @@ inline LcResult VerifyUpdate(const LightClientStore& store, const LightClientCon
     if (!(u.signature_slot > u.attested.beacon.slot)) return LcResult::MONOTONICITY;
     if (!(u.attested.beacon.slot >= u.finalized.beacon.slot)) return LcResult::MONOTONICITY;
     if (u.finalized.beacon.slot < store.finalized_header.beacon.slot) return LcResult::MONOTONICITY;
-
     const uint64_t attested_epoch{EpochAtSlot(u.attested.beacon.slot)};
+    const uint64_t attested_period{PeriodAtSlot(u.attested.beacon.slot)};
+
+    // Once a next committee has been proven for the store's current period,
+    // another update may repeat it but may not overwrite it. A next committee
+    // proven while rotating from period P to P+1 targets P+2, so it is compared
+    // only after the old P+1 committee has become current in ProcessUpdate.
+    if (u.has_next && store.next && attested_period == store.period &&
+        u.next_committee.HashTreeRoot() != store.next->HashTreeRoot()) {
+        return LcResult::NEXT_PROOF;
+    }
 
     // Finalized header proven under the attested state.
     if (!ssz::VerifyBranch(u.finalized.beacon.HashTreeRoot(), u.finality_branch,
@@ -187,11 +208,20 @@ inline LcResult VerifyUpdate(const LightClientStore& store, const LightClientCon
     if (!u.attested.VerifyExecution() || !u.finalized.VerifyExecution()) {
         return LcResult::EXECUTION_PROOF;
     }
+    // A slot identifies exactly one finalized beacon header on the accepted
+    // light-client history. Check this after the Merkle proofs so malformed
+    // candidates retain their precise proof errors, but before any state can
+    // be updated or an equal-slot fork can replace the stored root.
+    if (u.finalized.beacon.slot == store.finalized_header.beacon.slot &&
+        u.finalized.beacon.HashTreeRoot() !=
+            store.finalized_header.beacon.HashTreeRoot()) {
+        return LcResult::MONOTONICITY;
+    }
     // Next committee, when present, proven under the attested state and only
     // for the store's own period (one-period-lookahead discipline).
     const uint64_t sig_period{PeriodAtSlot(u.signature_slot)};
     if (u.has_next) {
-        if (PeriodAtSlot(u.attested.beacon.slot) != sig_period) return LcResult::PERIOD;
+        if (attested_period != sig_period) return LcResult::PERIOD;
         if (!ssz::VerifyBranch(u.next_committee.HashTreeRoot(), u.next_branch,
                                cfg.NextCommitteeGindex(attested_epoch),
                                u.attested.beacon.state_root)) {

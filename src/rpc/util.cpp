@@ -7,6 +7,7 @@
 #include <common/messages.h>
 #include <common/types.h>
 #include <consensus/amount.h>
+#include <consensus/era.h>
 #include <core_io.h>
 #include <key_io.h>
 #include <node/types.h>
@@ -1398,8 +1399,20 @@ std::vector<RPCResult> ScriptPubKeyDoc() {
          };
 }
 
-uint256 GetTarget(const CBlockIndex& blockindex, const uint256 pow_limit)
+uint256 GetTarget(const CBlockIndex& blockindex, const Consensus::Params& consensus)
 {
-    arith_uint256 target{*CHECK_NONFATAL(DeriveTarget(blockindex.nBits, pow_limit))};
+    std::optional<arith_uint256> derived{DeriveTarget(blockindex.nBits, consensus.powLimit)};
+    if (!derived && consensus.legacy_b3coin &&
+        Consensus::GetB3Era(blockindex.nHeight, consensus) == Consensus::B3Era::MODERN) {
+        // Corridor nBits and the later Modern-PoS sentinel deliberately live
+        // outside the legacy B3 PoW limit. Their phase rules enforce the
+        // exact values; RPC only decodes the already-validated compact field.
+        bool negative{false};
+        bool overflow{false};
+        arith_uint256 modern_target;
+        modern_target.SetCompact(blockindex.nBits, &negative, &overflow);
+        if (!negative && !overflow && modern_target != 0) derived = modern_target;
+    }
+    arith_uint256 target{*CHECK_NONFATAL(derived)};
     return ArithToUint256(target);
 }

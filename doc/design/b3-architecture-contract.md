@@ -21,6 +21,24 @@ than choosing a new protocol.
 > committed architecture contract / master handoff; (3) reviewed subordinate
 > design documents; (4) implementation assumptions.
 
+> **Current mainnet transition pins (2026-09-01; superseding the pre-seal
+> deployment statements retained below).** The transition release now pins
+> H = 810,000, X =
+> `2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6`,
+> M = 811,001, sealed supply
+> S_H = 1,042,617,596,101,695,152 base units, and
+> R0 = 19,836,712,254 base units. Its embedded FN Genesis artifact contains
+> 3,592 rights, has SHA-256
+> `c80470eec785600f33fa2e69c520ff331c2b354ebf6e0a9bf8cae7d1eb5f9dca`,
+> and commits to rights root
+> `e8f282a7dcaa9a8fbcfcc5c22ba4f456e5b50968fcf899aaacdaca65bef898ec`.
+> The ratified post-M heights are A1 = 812,000, A2 = 813,000, and
+> A3 = 815,000. Any statement below that mainnet H/X, Modern-PoS parameters,
+> the FN artifact, or A1/A2/A3 are unset or pending describes the earlier
+> pre-seal release state, not the current transition release. Bridge-backed
+> bUSD remains independently fail-closed until its complete security and
+> activation envelope is pinned.
+
 Items marked *(open)* are deliberately unresolved and are tracked in
 [b3-open-decisions.md](b3-open-decisions.md).
 
@@ -373,25 +391,31 @@ created. Silently ignoring unknown policy semantics is forbidden.
 
 **Existing serialized policy enum numbers must never be renumbered.** Current assignments
 (`LEGACY_LOCK = 0`, `OWNER = 1`, `BURN = 2`, `DEX_VAULT = 3`, `STAKE = 4`, `FN = 5`, and —
-owner ruling 2026-08-23 — `FINALITY_CERT = 6`, `FINALITY_KEY = 7`, `MODERN_PAYLOAD_ROOT = 8`)
-are consensus-stable as-is; additional types take new numbers. Types 6–8 are zero-value
+owner ruling 2026-08-23 — `FINALITY_CERT = 6`, `FINALITY_KEY = 7`,
+`MODERN_PAYLOAD_ROOT = 8`, followed by `BRIDGE_RECORD = 9`)
+are consensus-stable as-is; additional types take new numbers. Types 6–9 are zero-value
 **metadata cells** (never entering the UTXO set) whose large evidence travels in the Modern
 Payload Area ([b3-modern-payload-area.md](b3-modern-payload-area.md)); the `policy_params
-≤ 80 B` bound is permanent and is never raised to carry evidence.
+≤ 80 B` bound is permanent and is never raised to carry evidence. Type 9 binds one exact
+type-10 bridge record into ordinary transaction outputs; it is not arbitrary data.
 
 ## 24. Policy versions
 
-Each policy type carries its own explicit version (`OWNER v1`, `DEX_VAULT v1`, `STAKE v1`,
+Each policy type carries its own explicit version (`OWNER v1`, `DEX_VAULT v2`, `STAKE v1`,
 …). An unknown version is **invalid** unless that policy specifies forward-compatible
 semantics. This prevents a new client from giving old nodes a different interpretation of
 the same output.
 
 ## 25. Commitment semantics
 
-The 32-byte commitment is not an arbitrary opaque hash. Each policy defines a canonical
-preimage encoding, e.g. conceptually
+The parsed 32-byte commitment is not arbitrary. Each policy defines one
+canonical derivation. For DEX_VAULT v2, the exact B3A1 policy-parameter bytes
+begin with the 32-byte `VaultId`, followed by kind, shard, and optional account;
+the parser exposes that leading `VaultId` as the policy commitment. It is not a
+separately serialized field or a v1 vault-state hash.
 
-    commitment = H("B3/POLICY/DEX_VAULT/V1" || CanonicalEncode(vault_state))
+    policy_params = VaultId || kind || shard || optional_account
+    parsed commitment = VaultId
 
 Canonical encoding means exactly one byte representation per logical state: no JSON, no
 platform-dependent integers, no unordered containers, no native struct serialization.
@@ -416,11 +440,12 @@ version, operation, input state commitment, new state commitment, asset, amount 
 applicable, and anti-replay data. Otherwise cross-policy or cross-asset replay becomes
 possible.
 
-## 28. Modern PoS — *(open)*
+## 28. Modern PoS — implemented and mainnet pins sealed
 
-Modern PoS is **UNRESOLVED at the protocol-detail level** and must not be implemented
-until its consensus specification is supplied. It currently fails closed. See
-[b3-open-decisions.md](b3-open-decisions.md).
+The reviewed Modern-PoS v1 specification and implementation are present.
+Mainnet pins H/X, the complete parameter block, R0, and the transition feature
+schedule in the sealed transition release. Remaining rehearsal and publication
+work is a release-qualification gate, not an unresolved protocol design.
 
 ## 29. FlowMesh stays account-model
 
@@ -455,7 +480,20 @@ The DEX vault transition proves: the receipt is valid, finalized, belongs to thi
 vault/shard, has not previously been consumed, the output pays the exact
 destination/amount, and the remainder returns to the correct vault.
 
+Withdrawal admission is also custody-capacity bounded. At the entry anchor,
+existing pending obligations for one market/asset plus a new request may not
+exceed the sum of the largest 64 live pool-change UTXOs. Missing capacity fails
+closed. Payout construction orders those UTXOs by amount descending and then
+outpoint ascending, and takes the shortest covering prefix. The publisher sends
+one withdrawal, waits for confirmation, refreshes the vault/capacity view,
+rebuilds, and only then publishes the next.
+
 ## 32. Vault must remain keyless
+
+This section governs the B3-side DEX_VAULT custody pool. It does not describe
+the Ethereum reserve vault. The current Ethereum production target is also
+keyless, but it is governed separately by the staker-finality and proof rules
+in §45.
 
 There must be **no private key** capable of arbitrarily withdrawing the DEX custody pool —
 no multisig treasury. Instead:
@@ -534,33 +572,77 @@ canonical action set, deterministic batch clearing, account reservations, microb
 certification, withdrawal receipts. Threshold cryptography must not become a dependency of
 H+1 unless required for core safety.
 
-## 42. Stablecoin-denominated FlowMesh fees
+## 42. FlowMesh v1 fees are native B3
 
-Markets may charge fees in the quote/collateral stable asset (B3/USDC → USDC; BTC/USDT →
-USDT). "USDC" means the explicitly approved B3 `AssetId`, never an arbitrary asset sharing
-that ticker.
+The trading fee is 100 ppm of matched native-B3 notional, charged once, split
+80% equally across active FN seats and 20% to treasury. Base-chain transaction
+fees are also native B3. No ticker or external stable asset can satisfy either
+fee merely by name.
 
-## 43. Fee assets need a governed registry
+## 43. Treasury flush is capacity-bounded
 
-A consensus-recognized `AcceptedFeeAssets` set with bridge/issuer identity pinned
-(initially e.g. `USDC_ETH_BRIDGED`, `USDT_ETH_BRIDGED`). Otherwise someone issues
-`FakeUSDC` and pays system fees with it. Adding/removing fee assets follows the modern
-governance/consensus-upgrade mechanism *(open)*.
+After every ordinary slot, the deterministic treasury request is the lesser of
+accrued treasury available and anchored native capacity remaining after existing
+pending native withdrawals, when positive. Partial flushes are required; zero
+capacity creates no request and never blocks trading.
 
-## 44. Base-chain fees stay native
+## 44. Market assets still use exact identities
 
-    B3 blockchain transaction fee -> native B3
-    FlowMesh trading fee          -> approved trading/settlement asset
-
-Core consensus liveness must not depend on an external stablecoin issuer. This is a safety
-boundary.
+The market registry accepts base assets by exact `AssetId`, never ticker.
+Bridge-backed bUSD may trade only when its independently gated registry and
+proof/readiness state are active. Core consensus liveness never depends on an
+external stablecoin issuer.
 
 ## 45. Stablecoin bridge risk stays explicit
 
-A bridged USDC asset is a different security domain from B3; its solvency depends on the
-origin chain, origin token, bridge verification, finality assumptions, and issuer
-freeze/blacklist policy. It must not be described as protocol-native dollars without
-qualification.
+Canonical bUSD is the six-decimal `BRIDGE_BACKED` representation of Ethereum-mainnet
+USDT locked in the release-pinned immutable `B3StakerBridge`. It is a different
+security domain from B3: solvency depends on Ethereum, canonical USDT, bridge
+verification and finality, the issuer's freeze/blacklist policy, and the
+correctness and liveness of both chains and the immutable contracts. It must
+never be described as protocol-native dollars without those qualifications.
+
+The current vault has no owner, rescue key, proxy, pause, or arbitrary token
+selector. Anyone may relay a finalized withdrawal and pay its Ethereum gas,
+but USDT moves only when the immutable verifier accepts the B3 staker-finality
+lineage and the exact withdrawal leaf is included in the accepted cumulative
+root. A one-time, deadline-bound 3-of-4 bootstrap attestation installs the
+canonical Set_0; after initialization that bootstrap path is unreachable and
+ordinary B3 stake-finality set rotation is the only authority.
+
+The vault may be deployed before M, but deposits remain disabled until the
+verifier is initialized and a fresh valid certificate proves qualified current
+and successor sets. A later reviewed B3 build must pin the Ethereum chain ID,
+verifier/vault addresses and runtime hashes, vault deployment block, canonical
+USDT address, and derived B3 AssetId. Missing or mismatching fields fail closed;
+there is no corridor-deposit or pre-readiness custody phase.
+
+Inbound bridge height B may be pinned after deployment and readiness review.
+Irreversible withdrawal records remain disabled while the independent height W
+is unset; W requires round-trip canonicality/liveness review and must satisfy
+W >= B. Enabling B first creates a disclosed custodial waiting period.
+
+The transition tree implements the bounded type-10 proof/command carrier,
+exact OWNER mint and bUSD BURN transitions, light-client/anchor/nullifier/cap
+tracking, undo/reindex replay, and mempool/miner/asset validation. Every
+type-10 transaction must also contain exactly one zero-value Modern metadata
+cell of policy type 9 (`BRIDGE_RECORD`) whose `B3/BRIDGE/RECORD/V1` tagged hash
+commits the exact canonical record frame. Duplicate, mismatched, missing, or
+orphan bindings are invalid. Because that cell is an ordinary transaction
+output, standard input signatures cover the bridge commitment; there is no
+`OP_RETURN` and no custom bridge sighash. Bridge state is rebuilt in memory
+from activation; there is no durable sidecar, so a configured bridge refuses
+pruning and any snapshot that skips its history.
+
+Mainnet use remains fail-closed until the exact deployment manifest, runtime
+hashes, new vault-derived AssetId, Ethereum checkpoint and fork schedule,
+caps, approval/lag bounds, adapter/rules commitments, bootstrap handoff,
+chainparams activation, independent audits, and rehearsal are reviewed and
+pinned. The historical managed smoke vault
+`0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6` is not the production target and
+must be excluded from the active registry. Its observed zero-USDT and
+zero-consensus-bUSD state must be rechecked before replacement; any discovered
+liability requires an explicit cutoff and reserve/asset migration instead.
 
 ## 46. Independent PoW-issued coloured assets
 
@@ -578,38 +660,41 @@ No arbitrary unmetered VM code in issuance policies. First implementation uses t
 policy modules: `FIXED_SUPPLY`, `MINT_AUTHORITY`, `BRIDGE_BACKED`, `POW_ISSUED`,
 `ALGORITHMIC`. General smart contracts are a separate future problem.
 
-## 48. FN: three separate concepts
+## 48. FN: ownership and later service are separate concepts
 
     FN recognition   |   FN license/right   |   FN economic bond
 
-A historical FundamentalNode entitlement does **not** automatically imply perpetual modern
-operational power. Legacy owners may receive a modern claim/recognition asset derived from
-historical proof-of-integration state, but modern participation still requires modern
-activation/bond/performance conditions.
+A historical FundamentalNode right receives an FN Coin in the mandatory
+810,001 genesis coinbase. Ownership alone does **not** activate a FlowMesh
+seat: the owner must create the authenticated FN-v2 seat binding. Seat
+pre-binding begins at A2 and working spot trading begins at A3 in the
+transition release after the mandatory 30-block runway.
 
-## 49. FN claims come from a deterministic snapshot
+## 49. FN Genesis comes from a deterministic sealed manifest
 
-Because there is no balance migration, FN recognition is generated from historical
-on-chain facts. At X, construct a deterministic claim set (legacy FN identity, historical
-proof-of-integration burn/outpoint, eligible beneficiary, claim amount). Claims are then
-exercised permissionlessly. **No manual distribution. No administrator CSV.** The claim
-root/state must be reproducible from legacy history.
+At X, independently reproduce the complete canonical rights manifest from
+historical on-chain facts and pin its bytes, count, and Merkle root. Block
+810,001 coinbase creates one amount-1 FN output per row directly to the exact
+historical P2PKH owner commitment. **No manual distribution, administrator CSV,
+or later claim exists.**
 
-## 50. FN claim is not a new genesis
+## 50. FN historical issuance is one explicit genesis event
 
-    Genesis balance migration                          -> NO
-    Consensus-recognized post-H claim from pre-H facts -> YES
+    Native B3 balance migration                         -> NO
+    FN rights manifest from sealed pre-H facts          -> YES
+    Mandatory FN outputs in the 810,001 coinbase        -> YES
+    Later holder claim/proof transaction                -> NO
 
-A modern transaction creates the FN asset only when the historical entitlement is
-proven/claimed. This preserves the one-chain architecture.
+The event creates a separate FN asset and neither recreates nor moves native B3.
 
-## 51. FN supply economics remain unlocked — *(open)*
+## 51. FN supply economics — ruled; rewards remain open
 
-Do **not** implement the old "every 25 FN → price doubles" scheme; its cartel/oligopoly
-failure mode is identified. Keep the policy interface available and leave the issuance
-curve outside consensus until economics is finalized. Current conceptual direction:
-license scarcity + bond + performance-based revenue + B3 burn for new entry — rather than
-forcing monetary deflation through token issuance.
+The old "every 25 FN → price doubles" scheme remains rejected. Lifetime cap
+is 5,000; final modern capacity is `5,000 - R`; modern creation destroys
+15,000 / 30,000 / 60,000 B3 over successive 500-unit tiers. Extinguishment
+never reopens capacity. FlowMesh v1 charges 100 ppm of matched native-B3
+notional and splits it 80/20 between active FN seats and treasury. Later bond,
+slashing, and expanded-service policy remains outside this release.
 
 ## 52. Validators and FlowMesh FNs are separate roles
 
@@ -631,23 +716,40 @@ belong to B3 consensus economics; FlowMesh rewards to FlowMesh service economics
         -> bridge
         -> advanced issuance
 
-**Do not wire FlowMesh, FN economics, bridge logic, experimental issuance or advanced
-asset policies into consensus until the legacy→modern transition and modern PoS can
-independently produce and validate a clean H+1 chain.**
+**2026-09-01 owner supersession:** the first clean H+1 corridor block is now
+itself the mandatory historical FN Genesis coinbase. That narrow exception is
+fully specified by `b3-fn-assets-activation-design.md`. FlowMesh remains off at
+H+1 but ships behind A2/A3 gates in the same transition release. Bridge-backed
+bUSD is a separate fail-closed policy path and activates only when all of its
+production pins are present.
 
 ## 54. H+1 is intentionally boring
 
-The first modern block requires only the minimum capable modern consensus: modern block
-codec, modern chain identity, modern PoS, native B3, legacy UTXO spending, basic modern
-outputs, basic fees. Large subsystems activate later behind explicit activation
-heights/version gates:
+The first post-legacy block remains deliberately narrow. It is the first
+transition-PoW corridor block and must contain the one-shot historical FN
+Genesis sequence in its coinbase. It does not activate colored-asset issuance,
+FlowMesh, or bridge logic:
 
-    H+1  modern consensus
-    A1   typed assets
-    A2   FlowMesh
-    A3   bridge
+    H+1 = 810,001  corridor begins; mandatory FN Genesis coinbase
+    H+31 = 810,031   genesis FN can first be spent at 30-block maturity
+    M = 811,001      Modern PoS begins
+    A1 > M            modern FN PoD creation activates after the soak
+    A2 >= A1          simple-v1 assets + FN seat pre-binding activate
+    A3 >= A2 + 30     FlowMesh spot trading and vault effects activate
 
-This substantially reduces migration risk.
+There is no separate FN transfer activation lock. The transition release pins
+FlowMesh A3. Ethereum-USDT bridge minting is independently fail-closed until
+its implemented type-10 mint/burn state machine passes review and its exact
+bootstrap, forks, caps, enforced adapter, staker-verifier/vault runtimes,
+activation, and X-dependent parameters are pinned. Its inbound activation B is
+selected only by a later B3 build after the complete audited deployment tuple
+and inbound gates are reviewed; its irreversible-burn height W remains unset
+until the round trip is safe. Neither is enabled merely because A3 is reached.
+
+For each market, epoch zero uses one consensus-unique anchor: the earliest
+canonical block at or after `market.created_height` whose post-block FN-v2 set
+contains at least four seats. Sequence zero may start only at or after A3 and
+once that exact anchor is 30 blocks deep.
 
 ## 55. Consensus activation is deterministic
 

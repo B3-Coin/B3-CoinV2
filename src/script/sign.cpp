@@ -7,6 +7,7 @@
 
 #include <consensus/amount.h>
 #include <key.h>
+#include <modern/asset_output.h>
 #include <musig.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
@@ -726,13 +727,25 @@ static CScript PushAll(const std::vector<valtype>& values)
     return result;
 }
 
-bool ProduceSignature(const SigningProvider& provider, const BaseSignatureCreator& creator, const CScript& fromPubKey, SignatureData& sigdata)
+bool ProduceSignature(const SigningProvider& provider, const BaseSignatureCreator& creator,
+                      const CScript& fromPubKey, SignatureData& sigdata,
+                      const AssetSigningContext asset_context)
 {
     if (sigdata.complete) return true;
 
+    // Only trusted, per-input post-H provenance may opt into the asset owner
+    // suffix. Contextless callers deliberately solve the complete stored
+    // script so sealed-era B3A1 lookalikes keep their historical semantics.
+    const std::optional<CScript> asset_owner{
+        asset_context == AssetSigningContext::OWNER_SUFFIX
+            ? modern::AssetOwnerScript(fromPubKey)
+            : std::nullopt};
+    const CScript& authorization_script{asset_owner ? *asset_owner : fromPubKey};
+
     std::vector<valtype> result;
     TxoutType whichType;
-    bool solved = SignStep(provider, creator, fromPubKey, result, whichType, SigVersion::BASE, sigdata);
+    bool solved = SignStep(provider, creator, authorization_script, result, whichType,
+                           SigVersion::BASE, sigdata);
     bool P2SH = false;
     CScript subscript;
 
@@ -796,7 +809,11 @@ bool ProduceSignature(const SigningProvider& provider, const BaseSignatureCreato
     sigdata.scriptSig = PushAll(result);
 
     // Test solution
-    sigdata.complete = solved && VerifyScript(sigdata.scriptSig, fromPubKey, &sigdata.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, creator.Checker());
+    sigdata.complete = solved && VerifyScript(sigdata.scriptSig, fromPubKey,
+                                              &sigdata.scriptWitness,
+                                              STANDARD_SCRIPT_VERIFY_FLAGS,
+                                              creator.Checker(), nullptr,
+                                              asset_owner.has_value());
     return sigdata.complete;
 }
 
@@ -834,7 +851,9 @@ struct Stacks
 }
 
 // Extracts signatures and scripts from incomplete scriptSigs. Please do not extend this, use PSBT instead
-SignatureData DataFromTransaction(const CMutableTransaction& tx, unsigned int nIn, const CTxOut& txout)
+SignatureData DataFromTransaction(const CMutableTransaction& tx, unsigned int nIn,
+                                  const CTxOut& txout,
+                                  const AssetSigningContext asset_context)
 {
     SignatureData data;
     assert(tx.vin.size() > nIn);
@@ -845,16 +864,23 @@ SignatureData DataFromTransaction(const CMutableTransaction& tx, unsigned int nI
     // Get signatures
     MutableTransactionSignatureChecker tx_checker(&tx, nIn, txout.nValue, MissingDataBehavior::FAIL);
     SignatureExtractorChecker extractor_checker(data, tx_checker);
-    if (VerifyScript(data.scriptSig, txout.scriptPubKey, &data.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, extractor_checker)) {
+    const std::optional<CScript> asset_owner{
+        asset_context == AssetSigningContext::OWNER_SUFFIX
+            ? modern::AssetOwnerScript(txout)
+            : std::nullopt};
+    if (VerifyScript(data.scriptSig, txout.scriptPubKey, &data.scriptWitness,
+                     STANDARD_SCRIPT_VERIFY_FLAGS, extractor_checker, nullptr,
+                     asset_owner.has_value())) {
         data.complete = true;
         return data;
     }
 
     // Get scripts
     std::vector<std::vector<unsigned char>> solutions;
-    TxoutType script_type = Solver(txout.scriptPubKey, solutions);
+    const CScript& authorization_script{asset_owner ? *asset_owner : txout.scriptPubKey};
+    TxoutType script_type = Solver(authorization_script, solutions);
     SigVersion sigversion = SigVersion::BASE;
-    CScript next_script = txout.scriptPubKey;
+    CScript next_script{authorization_script};
 
     if (script_type == TxoutType::SCRIPTHASH && !stack.script.empty() && !stack.script.back().empty()) {
         // Get the redeemScript
@@ -987,14 +1013,20 @@ public:
 const BaseSignatureCreator& DUMMY_SIGNATURE_CREATOR = DummySignatureCreator(32, 32);
 const BaseSignatureCreator& DUMMY_MAXIMUM_SIGNATURE_CREATOR = DummySignatureCreator(33, 32);
 
-bool IsSegWitOutput(const SigningProvider& provider, const CScript& script)
+bool IsSegWitOutput(const SigningProvider& provider, const CScript& script,
+                    const AssetSigningContext asset_context)
 {
+    const std::optional<CScript> asset_owner{
+        asset_context == AssetSigningContext::OWNER_SUFFIX
+            ? modern::AssetOwnerScript(script)
+            : std::nullopt};
+    const CScript& authorization_script{asset_owner ? *asset_owner : script};
     int version;
     valtype program;
-    if (script.IsWitnessProgram(version, program)) return true;
-    if (script.IsPayToScriptHash()) {
+    if (authorization_script.IsWitnessProgram(version, program)) return true;
+    if (authorization_script.IsPayToScriptHash()) {
         std::vector<valtype> solutions;
-        auto whichtype = Solver(script, solutions);
+        auto whichtype = Solver(authorization_script, solutions);
         if (whichtype == TxoutType::SCRIPTHASH) {
             auto h160 = uint160(solutions[0]);
             CScript subscript;
@@ -1006,7 +1038,10 @@ bool IsSegWitOutput(const SigningProvider& provider, const CScript& script)
     return false;
 }
 
-bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, const std::map<COutPoint, Coin>& coins, int nHashType, std::map<int, bilingual_str>& input_errors)
+bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore,
+                     const std::map<COutPoint, Coin>& coins, int nHashType,
+                     std::map<int, bilingual_str>& input_errors,
+                     const std::optional<int> legacy_final_height)
 {
     bool fHashSingle = ((nHashType & ~SIGHASH_ANYONECANPAY) == SIGHASH_SINGLE);
 
@@ -1040,11 +1075,17 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
         }
         const CScript& prevPubKey = coin->second.out.scriptPubKey;
         const CAmount& amount = coin->second.out.nValue;
+        const AssetSigningContext asset_context{
+            AssetSigningContextForCoin(coin->second, legacy_final_height)};
 
-        SignatureData sigdata = DataFromTransaction(mtx, i, coin->second.out);
+        SignatureData sigdata = DataFromTransaction(mtx, i, coin->second.out,
+                                                    asset_context);
         // Only sign SIGHASH_SINGLE if there's a corresponding output:
         if (!fHashSingle || (i < mtx.vout.size())) {
-            ProduceSignature(*keystore, MutableTransactionSignatureCreator(mtx, i, amount, &txdata, nHashType), prevPubKey, sigdata);
+            ProduceSignature(*keystore,
+                             MutableTransactionSignatureCreator(mtx, i, amount,
+                                                                &txdata, nHashType),
+                             prevPubKey, sigdata, asset_context);
         }
 
         UpdateInput(txin, sigdata);
@@ -1056,7 +1097,12 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
         }
 
         ScriptError serror = SCRIPT_ERR_OK;
-        if (!sigdata.complete && !VerifyScript(txin.scriptSig, prevPubKey, &txin.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, TransactionSignatureChecker(&txConst, i, amount, txdata, MissingDataBehavior::FAIL), &serror)) {
+        if (!sigdata.complete && !VerifyScript(txin.scriptSig, prevPubKey,
+                                              &txin.scriptWitness,
+                                              STANDARD_SCRIPT_VERIFY_FLAGS,
+                                              TransactionSignatureChecker(&txConst, i, amount, txdata, MissingDataBehavior::FAIL),
+                                              &serror,
+                                              asset_context == AssetSigningContext::OWNER_SUFFIX)) {
             if (serror == SCRIPT_ERR_INVALID_STACK_OPERATION) {
                 // Unable to sign input and verification failed (possible attempt to partially sign).
                 input_errors[i] = Untranslated("Unable to sign input, invalid stack size (possibly missing key)");

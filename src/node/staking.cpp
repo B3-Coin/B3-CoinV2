@@ -9,14 +9,17 @@
 #include <consensus/merkle.h>
 #include <consensus/params.h>
 #include <logging.h>
+#include <modern/chain_domain.h>
 #include <modern/stake.h>
 #include <net_processing.h>
+#include <node/bridge_state.h>
 #include <node/finality_signature.h>
 #include <node/finality_tracker.h>
 #include <node/miner.h>
 #include <node/stake_tracker.h>
 #include <primitives/block.h>
 #include <pubkey.h>
+#include <support/cleanse.h>
 #include <util/strencodings.h>
 #include <util/thread.h>
 #include <util/time.h>
@@ -40,12 +43,15 @@ std::string PhaseName(const Consensus::Params& params, const int height)
 }
 } // namespace
 
-StakingLoop::StakingLoop(ChainstateManager& chainman, CTxMemPool* mempool)
-    : m_chainman{chainman}, m_mempool{mempool} {}
+StakingLoop::StakingLoop(ChainstateManager& chainman, CTxMemPool* mempool,
+                         fs::path finality_signer_dir)
+    : m_chainman{chainman}, m_mempool{mempool},
+      m_finality_signer_dir{std::move(finality_signer_dir)} {}
 
 bool StakingLoop::SetFinalityKey(const bls::SecretKey& key, const std::array<unsigned char, 32>& validator_key,
                                  std::string& error)
 {
+    LOCK(m_lifecycle_mutex);
     LOCK(m_mutex);
     if (m_running) {
         error = "cannot change the finality key while the staking loop is running";
@@ -53,11 +59,13 @@ bool StakingLoop::SetFinalityKey(const bls::SecretKey& key, const std::array<uns
     }
     m_bls_key = key;
     m_validator = validator_key;
+    m_finality_signing_failed = false;
     return true;
 }
 
 bool StakingLoop::ClearFinalityKey(std::string& error)
 {
+    LOCK(m_lifecycle_mutex);
     LOCK(m_mutex);
     if (m_running) {
         error = "cannot change the finality key while the staking loop is running";
@@ -74,6 +82,22 @@ StakingLoop::~StakingLoop()
 
 bool StakingLoop::Start(const CKey& validator_key, const CScript& coinbase_script, std::string& error)
 {
+    LOCK(m_lifecycle_mutex);
+    return StartImpl(validator_key, coinbase_script, /*finality_key=*/nullptr, error);
+}
+
+bool StakingLoop::StartWithFinalityKey(const CKey& validator_key, const CScript& coinbase_script,
+                                       const std::optional<bls::SecretKey>& finality_key,
+                                       std::string& error)
+{
+    LOCK(m_lifecycle_mutex);
+    return StartImpl(validator_key, coinbase_script, &finality_key, error);
+}
+
+bool StakingLoop::StartImpl(const CKey& validator_key, const CScript& coinbase_script,
+                            const std::optional<bls::SecretKey>* finality_key,
+                            std::string& error)
+{
     if (!validator_key.IsValid()) {
         error = "invalid validator key";
         return false;
@@ -89,26 +113,56 @@ bool StakingLoop::Start(const CKey& validator_key, const CScript& coinbase_scrip
             return false;
         }
     }
+
     // Join a finished thread from a previous run before reusing the object.
     if (m_thread.joinable()) m_thread.join();
     {
         LOCK(m_mutex);
-        m_key = validator_key;
         const XOnlyPubKey xonly{validator_key.GetPubKey()};
-        std::copy(xonly.begin(), xonly.end(), m_validator.begin());
+        std::array<unsigned char, 32> validator{};
+        std::copy(xonly.begin(), xonly.end(), validator.begin());
+
+        if (finality_key != nullptr) {
+            // This is an explicit replacement, including nullopt when the
+            // current wallet has no usable live binding.
+            m_bls_key = *finality_key;
+        } else if (m_bls_key && m_validator != validator) {
+            // Preserve the old arm-then-start API only for the validator it
+            // was armed for. Never carry a BLS secret across identities.
+            m_bls_key.reset();
+        }
+        m_key = validator_key;
+        m_validator = validator;
         m_coinbase_script = coinbase_script;
         m_running = true;
         m_stop = false;
         m_state = "starting";
         m_last_error.clear();
+        m_last_signed_height = -1;
+        m_finality_signing_failed = false;
         m_next_block_time = 0;
+        try {
+            m_thread = std::thread(&util::TraceThread, "b3staking", [this] { ThreadLoop(); });
+        } catch (const std::exception& e) {
+            m_running = false;
+            m_state = "stopped";
+            m_key = CKey{};
+            m_bls_key.reset();
+            memory_cleanse(m_validator.data(), m_validator.size());
+            if (!m_coinbase_script.empty()) {
+                memory_cleanse(m_coinbase_script.data(), m_coinbase_script.size());
+            }
+            m_coinbase_script.clear();
+            error = std::string{"unable to start staking thread: "} + e.what();
+            return false;
+        }
     }
-    m_thread = std::thread(&util::TraceThread, "b3staking", [this] { ThreadLoop(); });
     return true;
 }
 
 void StakingLoop::Stop()
 {
+    LOCK(m_lifecycle_mutex);
     {
         LOCK(m_mutex);
         m_stop = true;
@@ -118,6 +172,18 @@ void StakingLoop::Stop()
     LOCK(m_mutex);
     m_running = false;
     m_state = "stopped";
+    // Start() copies signing material into the node so staking can continue
+    // after the wallet is re-locked. Stop() is the end of that authorization:
+    // forget every copied key and its associated public routing data before a
+    // different wallet can start this node-global loop.
+    m_key = CKey{};
+    m_bls_key.reset();
+    memory_cleanse(m_validator.data(), m_validator.size());
+    if (!m_coinbase_script.empty()) {
+        memory_cleanse(m_coinbase_script.data(), m_coinbase_script.size());
+    }
+    m_coinbase_script.clear();
+    m_next_block_time = 0;
 }
 
 bool StakingLoop::SleepUnlessStopped(const std::chrono::milliseconds d)
@@ -171,7 +237,8 @@ interfaces::StakingStatus StakingLoop::Status(const std::optional<std::array<uns
         status.blocks_produced = m_blocks_produced;
         status.last_block_hash = m_last_block_hash;
         status.next_block_time = m_next_block_time;
-        status.finality_signing = m_bls_key.has_value();
+        status.finality_signing =
+            m_bls_key.has_value() && !m_finality_signing_failed;
         status.last_signed_height = m_last_signed_height;
         if (m_running) {
             status.validator_key = m_validator;
@@ -193,7 +260,27 @@ void StakingLoop::ThreadLoop()
         key = m_key;
         validator = m_validator;
         coinbase_script = m_coinbase_script;
-        if (m_bls_key) signer.SetKey(*m_bls_key, validator);
+        if (m_bls_key) {
+            const Consensus::Params& params{m_chainman.GetConsensus()};
+            const auto domain{
+                params.legacy_final_hash
+                    ? modern::ModernChainDomain(
+                          params.hashGenesisBlock,
+                          *params.legacy_final_hash)
+                    : std::nullopt};
+            std::string error;
+            if (!domain || !signer.SetKeyPersistent(
+                               *m_bls_key, validator,
+                               domain.value_or(uint256{}),
+                               m_finality_signer_dir, error)) {
+                if (error.empty()) error = "chain domain is not configured";
+                m_finality_signing_failed = true;
+                m_last_error = strprintf(
+                    "finality signing disabled safely: %s", error);
+            } else {
+                m_last_signed_height = signer.LastSignedHeight();
+            }
+        }
     }
     const Consensus::Params& params{m_chainman.GetConsensus()};
 
@@ -230,12 +317,48 @@ void StakingLoop::ThreadLoop()
                 Chainstate& chainstate{m_chainman.ActiveChainstate()};
                 const CBlockIndex* tip{chainstate.m_chain.Tip()};
                 FinalityTracker& tracker{chainstate.ModernFinality()};
-                if (tip && tracker.Sync(chainstate.m_chain, chainstate.m_blockman, params, *tip)) {
-                    sigs = signer.MaybeSign(tracker, chainstate.m_chain, params, chainstate.FinalitySignatures());
+                const BridgeStateIndex* bridge_index{nullptr};
+                if (tip && Consensus::BridgeRulesActive(tip->nHeight,
+                                                        params)) {
+                    BridgeStateTracker& bridge{chainstate.ModernBridgeState()};
+                    if (bridge.Sync(chainstate.m_chain, chainstate.m_blockman,
+                                    params, *tip)) {
+                        bridge_index = &bridge.Index();
+                    }
+                }
+                if (tip && tracker.Sync(chainstate.m_chain,
+                                        chainstate.m_blockman, params, *tip,
+                                        bridge_index)) {
+                    sigs = signer.MaybeSign(
+                        tracker, chainstate.m_chain, params,
+                        chainstate.FinalitySignatures(), bridge_index);
+                }
+            }
+            // This is the local anti-repeat watermark, not merely the last
+            // signature selected for relay. A valid old checkpoint can be
+            // deliberately discarded by the bounded pool while still
+            // advancing the signer, and RPC status must reflect that.
+            WITH_LOCK(m_mutex,
+                      m_last_signed_height = signer.LastSignedHeight());
+            {
+                LOCK(m_mutex);
+                if (!signer.LastError().empty()) {
+                    m_finality_signing_failed = true;
+                    m_last_error = strprintf(
+                        "finality signing disabled safely: %s",
+                        signer.LastError());
+                } else if (m_finality_signing_failed) {
+                    // A branch-lock wait is recoverable only when a newer
+                    // included quorum certificate supplies the lock-change
+                    // proof. The signer rechecks that proof every loop.
+                    m_finality_signing_failed = false;
+                    if (m_last_error.starts_with(
+                            "finality signing disabled safely:")) {
+                        m_last_error.clear();
+                    }
                 }
             }
             if (!sigs.empty()) {
-                WITH_LOCK(m_mutex, m_last_signed_height = signer.LastSignedHeight());
                 LogInfo("staking: signed %d finality checkpoint(s) up to height %d\n", sigs.size(),
                         signer.LastSignedHeight());
                 if (m_peerman) m_peerman->RelayFinalitySignatures(sigs);

@@ -152,6 +152,7 @@ struct FinalityChainFixture : public BindingFixture {
     static constexpr CAmount STAKE_HEAVY{15 * modern::FINALITY_WEIGHT_UNIT}; // weight 15
     static constexpr CAmount STAKE_LIGHT{1 * modern::FINALITY_WEIGHT_UNIT};  // weight 1
     static constexpr CAmount STAKE_C{10 * modern::FINALITY_WEIGHT_UNIT};     // weight 10 (optional third validator)
+    static constexpr CAmount STAKE_D{8 * modern::FINALITY_WEIGHT_UNIT};      // weight 8 (optional fourth validator)
 
     int m_M{0};
     //! Optional third validator C: staked in the corridor but NOT bound
@@ -159,6 +160,9 @@ struct FinalityChainFixture : public BindingFixture {
     CKey m_validator_c{MakeValidatorKey(0x33)};
     modern::ValidatorKeyBytes m_vk_c{XOnly(m_validator_c)};
     bls::SecretKey m_bls_c{Bls(3)};
+    CKey m_validator_d{MakeValidatorKey(0x44)};
+    modern::ValidatorKeyBytes m_vk_d{XOnly(m_validator_d)};
+    bls::SecretKey m_bls_d{Bls(4)};
 
     explicit FinalityChainFixture(TestOpts opts = {}) : BindingFixture{std::move(opts)} {}
 
@@ -174,7 +178,8 @@ struct FinalityChainFixture : public BindingFixture {
     //! Legacy -> corridor (stakes + bindings in the first corridor block) ->
     //! last corridor height M-1, with the modern-PoS rule set configured.
     void PrepareFinalityChain(const int min_finality_set = 1, const int reorg_horizon = 200,
-                              const bool with_unbound_c = false, const bool with_bound_c = false)
+                              const bool with_unbound_c = false, const bool with_bound_c = false,
+                              const bool with_bound_d = false)
     {
         Prepare();
         Consensus::Params& c{MutableConsensus()};
@@ -216,6 +221,17 @@ struct FinalityChainFixture : public BindingFixture {
             if (with_bound_c) {
                 const auto bind_c{MakeBinding(m_validator_c, m_vk_c, &m_bls_c, 0)};
                 txs.push_back(MakeTx(11, {bind_c.cell}, {bind_c.record}));
+            }
+            if (with_bound_d) {
+                CMutableTransaction stake_d{MakeTx(7, {}, {})};
+                stake_d.vout.insert(stake_d.vout.begin(), CTxOut{
+                    STAKE_D,
+                    modern::MakeStakeScript(m_vk_d, CScript() << OP_TRUE)});
+                stake_d.vout.back().nValue -= STAKE_D;
+                txs.push_back(stake_d);
+                const auto bind_d{
+                    MakeBinding(m_validator_d, m_vk_d, &m_bls_d, 0)};
+                txs.push_back(MakeTx(10, {bind_d.cell}, {bind_d.record}));
             }
             const CBlock first{BuildCorridorWithRoot(txs)};
             BOOST_REQUIRE_MESSAGE(Probe(first).empty(), "first corridor block invalid: " << Probe(first));
@@ -302,7 +318,10 @@ struct FinalityChainFixture : public BindingFixture {
     //! Static fallback weights (whole B3) for the round search when the
     //! consensus weights are unavailable (a side-branch parent that was never
     //! connected): the default two-member set {A: 15, B: 1}.
-    CAmount WeightOf(const modern::PosValidatorKey& key) const { return key == m_vk_a ? 15 : key == m_vk_c ? 10 : 1; }
+    CAmount WeightOf(const modern::PosValidatorKey& key) const
+    {
+        return key == m_vk_a ? 15 : key == m_vk_c ? 10 : key == m_vk_d ? 8 : 1;
+    }
     //! The (w, W) the validation rule will apply to the child of `prev`:
     //! consensus-derived when `prev` is on the active chain, static otherwise.
     std::pair<CAmount, CAmount> RoundWeights(const CBlockIndex* prev, const modern::PosValidatorKey& key)

@@ -25,7 +25,7 @@
 #include <key.h>
 #include <legacy/codec.h>
 #include <legacy/consensus.h>
-#include <modern/fn.h>
+#include <modern/chain_domain.h>
 #include <modern/pos_v1.h>
 #include <modern/stake.h>
 #include <node/miner.h>
@@ -397,7 +397,7 @@ struct ModernPosSetup : public ChainTestingSetup {
         // corridor can carry the FINALITY_KEY bindings from H+1.
         Consensus::ModernPosParams pos{};
         pos.reorg_horizon = 12; // small-chain scaffolding override of the ratified 1440
-        pos.min_finality_set = 1; // two validators; the ratified floor of 4 is a mainnet bootstrap value
+        pos.min_finality_set = 1; // fixture override; mainnet requires two members
         mutable_consensus.modern_pos = pos;
         {
             // A real node configures its params before any block index

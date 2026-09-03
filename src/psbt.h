@@ -33,6 +33,14 @@ static constexpr uint8_t PSBT_GLOBAL_XPUB = 0x01;
 static constexpr uint8_t PSBT_GLOBAL_VERSION = 0xFB;
 static constexpr uint8_t PSBT_GLOBAL_PROPRIETARY = 0xFC;
 
+// B3 PSBT proprietary global key:
+//   type 0xfc || identifier "b3coin" || subtype 0
+// Its value is the exact canonical MPA section (record count + records),
+// without transaction marker/flag bytes. Keeping it separate preserves the
+// standard BIP174 non-witness unsigned-transaction field for other tools.
+static constexpr uint8_t PSBT_B3_IDENTIFIER[] = {'b', '3', 'c', 'o', 'i', 'n'};
+static constexpr uint64_t PSBT_B3_GLOBAL_MPA = 0;
+
 // Input types
 static constexpr uint8_t PSBT_IN_NON_WITNESS_UTXO = 0x00;
 static constexpr uint8_t PSBT_IN_WITNESS_UTXO = 0x01;
@@ -1147,6 +1155,18 @@ struct PartiallySignedTransaction
     std::optional<uint32_t> m_version;
     std::set<PSBTProprietary> m_proprietary;
 
+    /**
+     * Trusted, runtime-only input provenance used by local signers.
+     *
+     * This vector is deliberately NOT serialized. A bare PSBT proves the
+     * previous transaction bytes but not the height at which its output was
+     * created, so accepting a serialized "modern" assertion would let an
+     * untrusted PSBT reinterpret a sealed-era B3A1 lookalike. Deserialization
+     * therefore defaults every input to FULL_SCRIPT. A wallet may repopulate
+     * the vector from its own chain state before signing/finalizing.
+     */
+    std::vector<AssetSigningContext> m_input_asset_contexts;
+
     bool IsNull() const;
     uint32_t GetVersion() const;
 
@@ -1157,6 +1177,29 @@ struct PartiallySignedTransaction
     bool AddOutput(const CTxOut& txout, const PSBTOutput& psbtout);
     PartiallySignedTransaction() = default;
     explicit PartiallySignedTransaction(const CMutableTransaction& tx);
+
+    AssetSigningContext GetInputAssetSigningContext(size_t input_index) const
+    {
+        return input_index < m_input_asset_contexts.size()
+                   ? m_input_asset_contexts[input_index]
+                   : AssetSigningContext::FULL_SCRIPT;
+    }
+
+    void SetInputAssetSigningContext(size_t input_index,
+                                     AssetSigningContext context)
+    {
+        if (m_input_asset_contexts.size() < inputs.size()) {
+            m_input_asset_contexts.resize(inputs.size(),
+                                          AssetSigningContext::FULL_SCRIPT);
+        }
+        m_input_asset_contexts.at(input_index) = context;
+    }
+
+    void ResetInputAssetSigningContexts()
+    {
+        m_input_asset_contexts.assign(inputs.size(),
+                                      AssetSigningContext::FULL_SCRIPT);
+    }
     /**
      * Finds the UTXO for a given input index
      *
@@ -1196,6 +1239,21 @@ struct PartiallySignedTransaction
             SerializeToVector(s, *m_version);
         }
 
+        // The BIP174 unsigned transaction is deliberately serialized without
+        // optional data. Preserve B3's MPA in a proprietary global field so
+        // signing/finalization round-trips the exact evidence-bearing tx.
+        if (!tx->mpa.empty()) {
+            const std::vector<unsigned char> identifier{
+                std::begin(PSBT_B3_IDENTIFIER), std::end(PSBT_B3_IDENTIFIER)};
+            SerializeToVector(s, CompactSizeWriter(PSBT_GLOBAL_PROPRIETARY),
+                              identifier, CompactSizeWriter(PSBT_B3_GLOBAL_MPA));
+            DataStream section;
+            SerializeMpaSection(section, tx->mpa);
+            const std::vector<unsigned char> value{
+                UCharCast(section.data()), UCharCast(section.data()) + section.size()};
+            s << value;
+        }
+
         // Write proprietary things
         for (const auto& entry : m_proprietary) {
             s << entry.key;
@@ -1224,6 +1282,9 @@ struct PartiallySignedTransaction
 
     template <typename Stream>
     inline void Unserialize(Stream& s) {
+        // Runtime provenance is local state, never data supplied by a PSBT.
+        m_input_asset_contexts.clear();
+
         // Read the magic bytes
         uint8_t magic[5];
         s >> magic;
@@ -1236,6 +1297,11 @@ struct PartiallySignedTransaction
 
         // Track the global xpubs we have already seen. Just for sanity checking
         std::set<CExtPubKey> global_xpubs;
+
+        // Recognized B3 MPA data is materialized directly into the unsigned
+        // transaction after the global map has been read (global key order is
+        // not significant, so it may precede the unsigned tx key).
+        std::optional<std::vector<CMpaRecord>> b3_mpa;
 
         // Read global data
         bool found_sep = false;
@@ -1330,12 +1396,30 @@ struct PartiallySignedTransaction
                     skey >> this_prop.identifier;
                     this_prop.subtype = ReadCompactSize(skey);
                     this_prop.key = key;
-
-                    if (m_proprietary.contains(this_prop)) {
-                        throw std::ios_base::failure("Duplicate Key, proprietary key already found");
-                    }
                     s >> this_prop.value;
-                    m_proprietary.insert(this_prop);
+                    const bool is_b3_mpa{
+                        skey.empty() &&
+                        this_prop.subtype == PSBT_B3_GLOBAL_MPA &&
+                        this_prop.identifier.size() == std::size(PSBT_B3_IDENTIFIER) &&
+                        std::equal(this_prop.identifier.begin(), this_prop.identifier.end(),
+                                   std::begin(PSBT_B3_IDENTIFIER))};
+                    if (is_b3_mpa) {
+                        if (b3_mpa) {
+                            throw std::ios_base::failure("Duplicate Key, B3 MPA already provided");
+                        }
+                        SpanReader section{this_prop.value};
+                        std::vector<CMpaRecord> records;
+                        UnserializeMpaSection(section, records);
+                        if (!section.empty()) {
+                            throw std::ios_base::failure("Trailing data in B3 MPA PSBT value");
+                        }
+                        b3_mpa = std::move(records);
+                    } else {
+                        if (m_proprietary.contains(this_prop)) {
+                            throw std::ios_base::failure("Duplicate Key, proprietary key already found");
+                        }
+                        m_proprietary.insert(std::move(this_prop));
+                    }
                     break;
                 }
                 // Unknown stuff
@@ -1358,6 +1442,9 @@ struct PartiallySignedTransaction
         // Make sure that we got an unsigned tx
         if (!tx) {
             throw std::ios_base::failure("No unsigned transaction was provided");
+        }
+        if (b3_mpa) {
+            tx->mpa = std::move(*b3_mpa);
         }
 
         // Read input data

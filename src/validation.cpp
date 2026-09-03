@@ -8,6 +8,7 @@
 #include <validation.h>
 
 #include <arith_uint256.h>
+#include <bridge/proof.h>
 #include <chain.h>
 #include <checkqueue.h>
 #include <clientversion.h>
@@ -34,13 +35,20 @@
 #include <legacy/codec.h>
 #include <legacy/consensus.h>
 #include <legacy/replay.h>
+#include <modern/asset_output.h>
+#include <modern/asset_validation.h>
 #include <modern/fn.h>
+#include <modern/fn_pod.h>
+#include <modern/fn_genesis_validation.h>
 #include <modern/metadata_cell.h>
 #include <modern/mpa.h>
 #include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
 #include <modern/payload_root.h>
 #include <node/finality_binding_index.h>
+#include <node/flowmesh_vault_index.h>
+#include <node/flowmesh_checkpoint_index.h>
+#include <node/fn_seat_index.h>
 #include <node/finality_signature.h>
 #include <node/finality_tracker.h>
 #include <modern/pos.h>
@@ -48,6 +56,7 @@
 #include <modern/stake.h>
 #include <logging/timer.h>
 #include <node/blockstorage.h>
+#include <node/bridge_state.h>
 #include <node/stake_tracker.h>
 #include <node/utxo_snapshot.h>
 #include <policy/ephemeral_policy.h>
@@ -87,6 +96,7 @@
 #include <cassert>
 #include <chrono>
 #include <deque>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <ranges>
@@ -169,8 +179,20 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
                        ValidationCache& validation_cache,
                        std::vector<CScriptCheck>* pvChecks = nullptr,
-                       const std::optional<LegacyLockSpendContext>& legacy_lock = std::nullopt)
+                       const std::optional<LegacyLockSpendContext>& legacy_lock = std::nullopt,
+                       bool require_bridge_sighash_all = false)
                        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+static bool CheckInputScriptsWithFlowMeshVaults(
+    const CTransaction& tx, TxValidationState& state,
+    const CCoinsViewCache& inputs, script_verify_flags flags,
+    bool cacheSigStore, bool cacheFullScriptStore,
+    PrecomputedTransactionData& txdata, ValidationCache& validation_cache,
+    std::vector<CScriptCheck>* pvChecks,
+    const std::optional<LegacyLockSpendContext>& legacy_lock,
+    const std::vector<bool>* flowmesh_vault_authorized,
+    bool require_bridge_sighash_all)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 bool CheckFinalTxAtTip(const CBlockIndex& active_chain_tip, const CTransaction& tx)
 {
@@ -319,6 +341,9 @@ static bool IsCurrentForFeeEstimation(Chainstate& active_chainstate) EXCLUSIVE_L
     return true;
 }
 
+static bool HasStaleFnPodSlot(const CTransaction& tx,
+                             std::optional<uint32_t> issued_before);
+
 void Chainstate::MaybeUpdateMempoolForReorg(
     DisconnectedBlockTransactions& disconnectpool,
     bool fAddToMempool)
@@ -366,11 +391,17 @@ void Chainstate::MaybeUpdateMempoolForReorg(
     // If true, the tx would be invalid in the next block; remove this entry and all of its descendants.
     // Note that TRUC rules are not applied here, so reorgs may cause violations of TRUC inheritance or
     // topology restrictions.
+    const auto fn_pod_issued{GetFnPodIssuedThrough(m_chain.Tip(), m_chainman.GetConsensus())};
     const auto filter_final_and_mature = [&](CTxMemPool::txiter it)
         EXCLUSIVE_LOCKS_REQUIRED(m_mempool->cs, ::cs_main) {
         AssertLockHeld(m_mempool->cs);
         AssertLockHeld(::cs_main);
         const CTransaction& tx = it->GetTx();
+
+        // A reorg can move the confirmed lifetime counter in either
+        // direction. A type-6 transaction is valid only for the branch's
+        // current next slot; remove a stale declaration and its descendants.
+        if (HasStaleFnPodSlot(tx, fn_pod_issued)) return true;
 
         // The transaction must be final.
         if (!CheckFinalTxAtTip(*Assert(m_chain.Tip()), tx)) return true;
@@ -397,16 +428,24 @@ void Chainstate::MaybeUpdateMempoolForReorg(
         // Legacy-era coinstake outputs carry the same maturity rule, matching
         // the legacy admission checks.
         if (it->GetSpendsCoinbase()) {
-            const bool next_block_legacy{
-                Consensus::GetB3Era(m_chain.Tip()->nHeight + 1, m_chainman.GetConsensus()) ==
-                Consensus::B3Era::LEGACY};
+            const std::optional<int> legacy_final_height{
+                Consensus::LegacyFinalHeight(m_chainman.GetConsensus())};
             for (const CTxIn& txin : tx.vin) {
                 if (m_mempool->exists(txin.prevout.hash)) continue;
                 const Coin& coin{CoinsTip().AccessCoin(txin.prevout)};
                 assert(!coin.IsSpent());
                 const auto mempool_spend_height{m_chain.Tip()->nHeight + 1};
-                if ((coin.IsCoinBase() || (next_block_legacy && coin.IsCoinStake())) &&
-                    mempool_spend_height - coin.nHeight < COINBASE_MATURITY) {
+                const bool legacy_maturity_bound{
+                    legacy_final_height &&
+                    coin.nHeight <= static_cast<uint32_t>(*legacy_final_height) &&
+                    (coin.IsCoinBase() || coin.IsCoinStake())};
+                const bool modern_coinbase_maturity{
+                    coin.IsCoinBase() && !legacy_maturity_bound};
+                const int maturity{legacy_maturity_bound
+                                       ? static_cast<int>(legacy::COINBASE_MATURITY)
+                                       : COINBASE_MATURITY};
+                if ((legacy_maturity_bound || modern_coinbase_maturity) &&
+                    mempool_spend_height - static_cast<int>(coin.nHeight) < maturity) {
                     return true;
                 }
             }
@@ -430,7 +469,9 @@ static bool CheckInputsFromMempoolAndCache(const CTransaction& tx, TxValidationS
                 const CCoinsViewCache& view, const CTxMemPool& pool,
                 script_verify_flags flags, PrecomputedTransactionData& txdata, CCoinsViewCache& coins_tip,
                 ValidationCache& validation_cache,
-                const std::optional<LegacyLockSpendContext>& legacy_lock = std::nullopt)
+                const std::optional<LegacyLockSpendContext>& legacy_lock = std::nullopt,
+                const std::vector<bool>* flowmesh_vault_authorized = nullptr,
+                bool require_bridge_sighash_all = false)
                 EXCLUSIVE_LOCKS_REQUIRED(cs_main, pool.cs)
 {
     AssertLockHeld(cs_main);
@@ -462,8 +503,11 @@ static bool CheckInputsFromMempoolAndCache(const CTransaction& tx, TxValidationS
     }
 
     // Call CheckInputScripts() to cache signature and script validity against current tip consensus rules.
-    return CheckInputScripts(tx, state, view, flags, /* cacheSigStore= */ true, /* cacheFullScriptStore= */ true, txdata, validation_cache,
-                             nullptr, legacy_lock);
+    return CheckInputScriptsWithFlowMeshVaults(
+        tx, state, view, flags, /* cacheSigStore= */ true,
+        /* cacheFullScriptStore= */ true, txdata, validation_cache, nullptr,
+        legacy_lock, flowmesh_vault_authorized,
+        require_bridge_sighash_all);
 }
 
 // Legacy-era input rules (maturity for coinbase and coinstake, input-time
@@ -479,6 +523,66 @@ static bool CheckLegacyTxInputs(const CTransaction& tx, TxValidationState& state
 static constexpr script_verify_flags LEGACY_BLOCK_SCRIPT_FLAGS{
     SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_NULLDUMMY |
     SCRIPT_VERIFY_LEGACY_B3_STRICTENC | SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY};
+
+/** Branch-local modern FN creations through `index`. Before A1 the only
+ * possible value is zero, so an old block-index DB needs no sidecar. From A1
+ * onward a missing sidecar is local state corruption and must fail closed. */
+std::optional<uint32_t> GetFnPodIssuedThrough(const CBlockIndex* index,
+                                              const Consensus::Params& params)
+{
+    if (!index || !params.fn_pod_activation_height ||
+        index->nHeight < *params.fn_pod_activation_height) {
+        return uint32_t{0};
+    }
+    if (!index->m_fn_pod_issued_total_known) return std::nullopt;
+    const auto capacity{modern::ModernFnCapacity(params)};
+    if (!capacity || index->m_fn_pod_issued_total > *capacity) {
+        return std::nullopt;
+    }
+    return index->m_fn_pod_issued_total;
+}
+
+/** Whether a mempool FN PoD names a slot other than the confirmed branch's
+ * next slot. Malformed or duplicate type-6 declarations fail closed here;
+ * admission already rejects them, but a tip change must not rely on that
+ * historical assumption. */
+static bool HasStaleFnPodSlot(const CTransaction& tx,
+                              const std::optional<uint32_t> issued_before)
+{
+    const size_t declarations{modern::CountModernFnPodDeclarations(tx)};
+    if (declarations == 0) return false;
+    if (declarations != 1 || !issued_before) return true;
+
+    for (const CMpaRecord& record : tx.mpa) {
+        if (record.payload_type != modern::CREATION_ACTION_MODERN_FN_POD) continue;
+        modern::ModernFnPodActionV1 action;
+        std::string error;
+        return !modern::DecodeModernFnPodRecord(record, action, error) ||
+               action.created_before != *issued_before;
+    }
+    return true;
+}
+
+/** Remove stale FN PoD roots and every in-mempool descendant. The copied
+ * transaction refs stay alive as recursive removal mutates the pool. */
+static size_t RemoveStaleFnPodMempoolEntries(CTxMemPool& pool,
+                                             const std::optional<uint32_t> issued_before,
+                                             const MemPoolRemovalReason reason)
+    EXCLUSIVE_LOCKS_REQUIRED(pool.cs)
+{
+    AssertLockHeld(pool.cs);
+    size_t roots_removed{0};
+    const auto entries{pool.infoAll()};
+    for (const TxMempoolInfo& entry : entries) {
+        if (!entry.tx || !pool.GetEntry(entry.tx->GetHash()) ||
+            !HasStaleFnPodSlot(*entry.tx, issued_before)) {
+            continue;
+        }
+        ++roots_removed;
+        pool.removeRecursive(*entry.tx, reason);
+    }
+    return roots_removed;
+}
 
 //! The modern (deployment-derived) branch of GetBlockScriptFlags.
 static script_verify_flags GetModernBlockScriptFlags(const CBlockIndex& block_index, const ChainstateManager& chainman);
@@ -695,7 +799,8 @@ private:
         /** Virtual size of the transaction as used by the mempool, calculated using serialized size
          * of the transaction and sigops. */
         int64_t m_vsize;
-        /** Fees paid by this transaction: total input amounts subtracted by total output amounts. */
+        /** Producer-claimable fee. For a modern FN PoD this excludes the
+         * consensus-required native-B3 disintegration from the total gap. */
         CAmount m_base_fees;
         /** Base fees + any fee delta set by the user with prioritisetransaction. */
         CAmount m_modified_fees;
@@ -712,6 +817,11 @@ private:
         /** A temporary cache containing serialized transaction data for signature verification.
          * Reused across PolicyScriptChecks and ConsensusScriptChecks. */
         PrecomputedTransactionData m_precomputed_txdata;
+        /** Inputs whose exact type-9 proof replaces the keyless vault's
+         * deliberately-false script. Empty for ordinary transactions. */
+        std::vector<bool> m_flowmesh_vault_authorized;
+        /** Exact managed-v1 bridge authorization was established in PreChecks. */
+        bool m_bridge_withdrawal{false};
     };
 
     // Run the policy checks on a given transaction, excluding any script checks.
@@ -864,6 +974,21 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         return state.Invalid(TxValidationResult::TX_CONSENSUS,
                              next_block_legacy ? "modern-txn-in-legacy-era" : "legacy-txn-in-modern-era");
     }
+    // B3 keeps witness commitments inactive until a separately specified
+    // activation. Modern script verification deliberately recognizes witness
+    // programs so they cannot degrade into anyone-can-spend outputs, while
+    // ContextualCheckBlock rejects witness-bearing blocks until that
+    // activation. Keep the mempool aligned with the block it feeds: accepting
+    // witness data here would let an otherwise valid transaction make every
+    // template that selected it fail with "unexpected-witness".
+    if (m_active_chainstate.m_chainman.GetConsensus().legacy_b3coin &&
+        tx.HasWitness() &&
+        !DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(),
+                               m_active_chainstate.m_chainman,
+                               Consensus::DEPLOYMENT_SEGWIT)) {
+        return state.Invalid(TxValidationResult::TX_NOT_STANDARD,
+                             "witness-not-active");
+    }
     if (!next_block_legacy) {
         // Modern-era admission: a malformed STAKE-claiming output can never
         // be mined (ContextualCheckBlock enforces the same rule), so refuse
@@ -875,13 +1000,15 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         // Likewise a claiming-but-invalid (or not yet activated) metadata
         // cell can never be mined.
         if (std::string cell_error;
-            !modern::CheckMetadataCellOutputs(tx, m_active_chainstate.m_chainman.GetConsensus(), cell_error)) {
+            !modern::CheckMetadataCellOutputs(tx, m_active_chainstate.m_chainman.GetConsensus(),
+                                              next_block_height, cell_error)) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-metadata-cell", cell_error);
         }
         // Modern Payload Area: structural rules and the FINALITY_KEY cell<->evidence
         // one-to-one binding are consensus (ContextualCheckBlock enforces the same).
         if (std::string mpa_error;
-            !modern::CheckTransactionMpa(tx, m_active_chainstate.m_chainman.GetConsensus(), mpa_error)) {
+            !modern::CheckTransactionMpa(tx, m_active_chainstate.m_chainman.GetConsensus(),
+                                         next_block_height, mpa_error)) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-mpa", mpa_error);
         }
         std::vector<modern::FinalityKeyPair> pairs;
@@ -892,42 +1019,66 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
             }
         }
         if (tx.HasMpa()) {
-            // Relayable MPA (plan Commit 17): only FINALITY_KEY evidence has a
-            // mempool path -- certificates are coinbase-only, other types have
-            // none. The transaction wire codec preserves the payload
+            // Relayable MPA: FINALITY_KEY evidence, activated asset/FN
+            // declarations, and activated FlowMesh seat bindings have a
+            // mempool path; certificates are coinbase-only. The transaction
+            // wire codec preserves the payload
             // (TX_MODERN), so no lossy relay form can be produced.
             for (const auto& rec : tx.mpa) {
-                if (rec.payload_type != modern::MPA_TYPE_FINALITY_KEY_EVIDENCE) {
+                if (rec.payload_type != modern::MPA_TYPE_FINALITY_KEY_EVIDENCE &&
+                    !(rec.payload_type == modern::CREATION_ACTION_ASSET_ISSUANCE &&
+                      Consensus::AssetRulesActive(next_block_height,
+                                                  m_active_chainstate.m_chainman.GetConsensus())) &&
+                    !(rec.payload_type == modern::CREATION_ACTION_MODERN_FN_POD &&
+                      Consensus::FnPodRulesActive(next_block_height,
+                                                  m_active_chainstate.m_chainman.GetConsensus())) &&
+                    !(rec.payload_type == modern::CREATION_ACTION_FLOWMESH_SEAT_BINDING &&
+                      Consensus::FlowMeshSeatBindingRulesActive(
+                          next_block_height,
+                          m_active_chainstate.m_chainman.GetConsensus())) &&
+                    !(rec.payload_type == modern::MPA_TYPE_FLOWMESH_CHECKPOINT &&
+                      Consensus::FlowMeshRulesActive(
+                          next_block_height,
+                          m_active_chainstate.m_chainman.GetConsensus())) &&
+                    !(rec.payload_type == modern::MPA_TYPE_FLOWMESH_VAULT_PROOF &&
+                      Consensus::FlowMeshRulesActive(
+                          next_block_height,
+                          m_active_chainstate.m_chainman.GetConsensus())) &&
+                    !(rec.payload_type == bridge::BRIDGE_MPA_TYPE &&
+                      Consensus::BridgeRulesActive(
+                          next_block_height,
+                          m_active_chainstate.m_chainman.GetConsensus()))) {
                     return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "mpa-mempool-unsupported");
                 }
             }
-            // Semantic pre-check against the current binding index (the exact
-            // rule re-runs at connect): refuse bindings that could never be
-            // mined on the current chain -- wrong sequence, foreign identity,
-            // duplicate BLS owner, bad PoP.
-            const Consensus::Params& consensus{m_active_chainstate.m_chainman.GetConsensus()};
-            const auto domain{consensus.legacy_final_hash
-                                  ? modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash)
-                                  : std::nullopt};
-            if (!domain) {
-                return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "finality-key-domain-unpinned");
-            }
-            node::FinalityBindingTracker& tracker{m_active_chainstate.ModernFinalityBindings()};
-            const CBlockIndex* tip{m_active_chainstate.m_chain.Tip()};
-            if (!tip || !tracker.Sync(m_active_chainstate.m_chain, m_active_chainstate.m_blockman, consensus, *tip)) {
-                return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "finality-binding-state-unavailable");
-            }
-            const node::FinalityBindingIndex& index{tracker.Index()};
-            const modern::BlsKeyOwnerLookup owner_of{
-                [&index](const modern::BlsPubkeyBytes& pk) { return index.OwnerOf(pk); }};
-            for (const auto& pair : pairs) {
-                modern::ValidatorKeyBytes vk;
-                std::copy(pair.commitment.begin(), pair.commitment.end(), vk.begin());
-                const auto check{modern::CheckFinalityKeyTransition(*domain, pair.commitment, pair.params,
-                                                                    pair.evidence, index.Get(vk), owner_of)};
-                if (check != modern::FinalityKeyCheck::OK) {
-                    return state.Invalid(TxValidationResult::TX_NOT_STANDARD,
-                                         std::string{"finality-key-"} + modern::FinalityKeyCheckName(check));
+            if (!pairs.empty()) {
+                // Semantic pre-check against the current binding index (the
+                // exact rule re-runs at connect). Asset-issuance MPA records
+                // do not need or touch the finality binding index.
+                const Consensus::Params& consensus{m_active_chainstate.m_chainman.GetConsensus()};
+                const auto domain{consensus.legacy_final_hash
+                                      ? modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash)
+                                      : std::nullopt};
+                if (!domain) {
+                    return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "finality-key-domain-unpinned");
+                }
+                node::FinalityBindingTracker& tracker{m_active_chainstate.ModernFinalityBindings()};
+                const CBlockIndex* tip{m_active_chainstate.m_chain.Tip()};
+                if (!tip || !tracker.Sync(m_active_chainstate.m_chain, m_active_chainstate.m_blockman, consensus, *tip)) {
+                    return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "finality-binding-state-unavailable");
+                }
+                const node::FinalityBindingIndex& index{tracker.Index()};
+                const modern::BlsKeyOwnerLookup owner_of{
+                    [&index](const modern::BlsPubkeyBytes& pk) { return index.OwnerOf(pk); }};
+                for (const auto& pair : pairs) {
+                    modern::ValidatorKeyBytes vk;
+                    std::copy(pair.commitment.begin(), pair.commitment.end(), vk.begin());
+                    const auto check{modern::CheckFinalityKeyTransition(*domain, pair.commitment, pair.params,
+                                                                        pair.evidence, index.Get(vk), owner_of)};
+                    if (check != modern::FinalityKeyCheck::OK) {
+                        return state.Invalid(TxValidationResult::TX_NOT_STANDARD,
+                                             std::string{"finality-key-"} + modern::FinalityKeyCheckName(check));
+                    }
                 }
             }
         }
@@ -949,7 +1100,11 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
 
     // Rather not work on nonstandard transactions (unless -testnet/-regtest)
     std::string reason;
-    if (m_pool.m_opts.require_standard && !IsStandardTx(tx, m_pool.m_opts.max_datacarrier_bytes, m_pool.m_opts.permit_bare_multisig, m_pool.m_opts.dust_relay_feerate, reason)) {
+    if (m_pool.m_opts.require_standard &&
+        !IsStandardTx(tx, m_pool.m_opts.max_datacarrier_bytes,
+                      m_pool.m_opts.permit_bare_multisig,
+                      m_pool.m_opts.dust_relay_feerate, reason,
+                      /*enable_asset_owner=*/!next_block_legacy)) {
         return state.Invalid(TxValidationResult::TX_NOT_STANDARD, reason);
     }
 
@@ -1042,29 +1197,243 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                                  m_active_chainstate.m_chainman.GetConsensus())) {
             return false; // state filled in by CheckLegacyTxInputs
         }
-    } else if (!Consensus::CheckTxInputs(tx, state, m_view, next_block_height, ws.m_base_fees)) {
+    } else if (!Consensus::CheckTxInputs(
+                   tx, state, m_view, next_block_height, ws.m_base_fees,
+                   Consensus::LegacyFinalHeight(
+                       m_active_chainstate.m_chainman.GetConsensus()))) {
         return false; // state filled in by CheckTxInputs
     }
 
-    if (m_pool.m_opts.require_standard && !AreInputsStandard(tx, m_view)) {
+    std::vector<Coin> modern_prevs;
+    if (!next_block_legacy) {
+        std::vector<Coin>& asset_prevs{modern_prevs};
+        asset_prevs.reserve(tx.vin.size());
+        for (const CTxIn& input : tx.vin) asset_prevs.push_back(m_view.AccessCoin(input.prevout));
+
+        // Type-10 can authorize exactly one non-native surplus, but only
+        // after the Ethereum proof, pinned registry, replay key and mint caps
+        // have passed against bridge state synced to the active parent.
+        std::optional<modern::AuthorizedAssetMint> bridge_mint;
+        const bool has_bridge_record{std::any_of(
+            tx.mpa.begin(), tx.mpa.end(), [](const CMpaRecord& record) {
+                return record.payload_type == bridge::BRIDGE_MPA_TYPE;
+            })};
+        if (has_bridge_record) {
+            const Consensus::Params& consensus{
+                m_active_chainstate.m_chainman.GetConsensus()};
+            if (!Consensus::BridgeRulesActive(next_block_height, consensus)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                     "bridge-rules-inactive");
+            }
+            if (node::HasDecentralizedBridgeBurn(tx) &&
+                !Consensus::BridgeWithdrawalRulesActive(next_block_height,
+                                                        consensus)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                     "bridge-withdrawal-rules-inactive");
+            }
+            const CBlockIndex* tip{m_active_chainstate.m_chain.Tip()};
+            node::BridgeStateTracker& tracker{
+                m_active_chainstate.ModernBridgeState()};
+            if (tip == nullptr ||
+                !tracker.Sync(m_active_chainstate.m_chain,
+                              m_active_chainstate.m_blockman, consensus,
+                              *tip)) {
+                return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
+                                     "bridge-state-unavailable");
+            }
+            node::BridgeBurnReadiness burn_readiness{
+                node::BridgeBurnReadiness::READY};
+            if (node::HasDecentralizedBridgeBurn(tx) &&
+                consensus.busd_bridge->withdrawal_mode ==
+                    Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
+                consensus.busd_bridge->decentralized_withdrawal) {
+                burn_readiness = node::BridgeBurnReadiness::UNAVAILABLE;
+                node::FinalityTracker& finality{
+                    m_active_chainstate.ModernFinality()};
+                if (finality.Sync(m_active_chainstate.m_chain,
+                                  m_active_chainstate.m_blockman, consensus,
+                                  *tip, &tracker.Index())) {
+                    const node::FinalityTracker::State projected{
+                        finality.Projected(next_block_height, consensus)};
+                    burn_readiness =
+                        node::BridgeWithdrawalValidatorSetsReady(
+                            projected,
+                            *consensus.busd_bridge->decentralized_withdrawal)
+                            ? node::BridgeBurnReadiness::READY
+                            : node::BridgeBurnReadiness::NOT_READY;
+                }
+                std::string readiness_error;
+                if (!node::CheckBridgeBurnReadiness(
+                        tx, burn_readiness, readiness_error)) {
+                    return state.Invalid(
+                        burn_readiness ==
+                                node::BridgeBurnReadiness::UNAVAILABLE
+                            ? TxValidationResult::TX_MEMPOOL_POLICY
+                            : TxValidationResult::TX_CONSENSUS,
+                        burn_readiness ==
+                                node::BridgeBurnReadiness::UNAVAILABLE
+                            ? "bridge-withdrawal-readiness-unavailable"
+                            : "bridge-withdrawal-not-ready",
+                        readiness_error);
+                }
+            }
+            node::BridgeTxAuthorization authorization;
+            std::string bridge_error;
+            const int64_t candidate_time{std::max<int64_t>(
+                args.m_accept_time, tip->GetMedianTimePast() + 1)};
+            if (!tracker.Index().VerifyTransaction(
+                    tx, next_block_height, candidate_time, consensus,
+                    authorization, bridge_error)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                     "bad-bridge-authorization",
+                                     bridge_error);
+            }
+            if (authorization.mint) {
+                bridge_mint = modern::AuthorizedAssetMint{
+                    authorization.mint->authorization.asset,
+                    authorization.mint->authorization.amount};
+            }
+            ws.m_bridge_withdrawal = authorization.HasWithdrawal();
+        }
+        std::optional<uint32_t> fn_pod_issued;
+        if (modern::HasModernFnPodDeclaration(tx)) {
+            fn_pod_issued = GetFnPodIssuedThrough(m_active_chainstate.m_chain.Tip(),
+                                                  m_active_chainstate.m_chainman.GetConsensus());
+            if (!fn_pod_issued) {
+                return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
+                                     "fn-pod-state-unavailable");
+            }
+        }
+        modern::AssetTransactionEffects asset_effects;
+        std::string asset_error;
+        if (!modern::CheckAssetTransaction(tx, asset_prevs, next_block_height,
+                                           m_active_chainstate.m_chainman.GetConsensus(),
+                                           modern::AssetTransactionContext{fn_pod_issued,
+                                                                           ws.m_base_fees,
+                                                                           bridge_mint},
+                                           asset_effects,
+                                           asset_error)) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-asset-transition",
+                                 asset_error);
+        }
+        if (asset_effects.fn_pod_disintegration > ws.m_base_fees) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                 "bad-fn-pod-accounting");
+        }
+        // The PoD amount is destroyed at the ledger gap. Only the remainder
+        // is a relay/miner fee; treating the full gap as a fee would let the
+        // producer reclaim the disintegration in its coinbase.
+        ws.m_base_fees -= asset_effects.fn_pod_disintegration;
+
+        const bool has_flowmesh_record{std::any_of(
+            tx.mpa.begin(), tx.mpa.end(), [](const CMpaRecord& record) {
+                return record.payload_type ==
+                           modern::MPA_TYPE_FLOWMESH_CHECKPOINT ||
+                       record.payload_type ==
+                           modern::MPA_TYPE_FLOWMESH_VAULT_PROOF;
+            })};
+        if (has_flowmesh_record) {
+            const Consensus::Params& consensus{
+                m_active_chainstate.m_chainman.GetConsensus()};
+            const CBlockIndex* tip{m_active_chainstate.m_chain.Tip()};
+            node::FnSeatTracker& seat_tracker{
+                m_active_chainstate.ModernFnSeats()};
+            if (tip == nullptr ||
+                !seat_tracker.Sync(m_active_chainstate.m_chain,
+                                   m_active_chainstate.m_blockman, consensus,
+                                   *tip)) {
+                return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
+                                     "flowmesh-seat-state-unavailable");
+            }
+            node::FlowMeshVaultTracker& vault_tracker{
+                m_active_chainstate.ModernFlowMeshVaults()};
+            if (!vault_tracker.Sync(m_active_chainstate.m_chain,
+                                    m_active_chainstate.m_blockman, consensus,
+                                    *tip)) {
+                return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
+                                     "flowmesh-vault-state-unavailable");
+            }
+            node::FlowMeshCheckpointTracker& checkpoint_tracker{
+                m_active_chainstate.ModernFlowMeshCheckpoints()};
+            if (!checkpoint_tracker.Sync(
+                    m_active_chainstate.m_chain,
+                    m_active_chainstate.m_blockman, consensus,
+                    seat_tracker.Index(), vault_tracker.Index(), *tip)) {
+                return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
+                                     "flowmesh-checkpoint-state-unavailable");
+            }
+            std::string checkpoint_error;
+            if (!checkpoint_tracker.Index().VerifyTransaction(
+                    tx, next_block_height, m_active_chainstate.m_chain,
+                    consensus, seat_tracker.Index(), vault_tracker.Index(),
+                    checkpoint_error)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                     "bad-flowmesh-authorization",
+                                     checkpoint_error);
+            }
+
+            node::FlowMeshVaultAuthorization vault_authorization;
+            std::string vault_error;
+            if (!node::CheckFlowMeshVaultTransaction(
+                    tx, modern_prevs, ws.m_base_fees, next_block_height,
+                    consensus, checkpoint_tracker.Index(),
+                    vault_authorization, vault_error)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                     "bad-flowmesh-vault-transaction",
+                                     vault_error);
+            }
+            ws.m_flowmesh_vault_authorized =
+                std::move(vault_authorization.authorized_inputs);
+        } else {
+            // Even without type 9, explicitly reject any keyless vault input
+            // here rather than relying only on its OP_FALSE script failure.
+            node::FlowMeshVaultAuthorization vault_authorization;
+            std::string vault_error;
+            // A default index is sufficient: without a proof the checker
+            // never consults connected checkpoint state.
+            node::FlowMeshCheckpointIndex no_checkpoints;
+            if (!node::CheckFlowMeshVaultTransaction(
+                    tx, modern_prevs, ws.m_base_fees, next_block_height,
+                    m_active_chainstate.m_chainman.GetConsensus(),
+                    no_checkpoints, vault_authorization, vault_error)) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                     "bad-flowmesh-vault-transaction",
+                                     vault_error);
+            }
+        }
+    }
+
+    const std::optional<int> asset_namespace_boundary{
+        next_block_legacy ? std::nullopt
+                          : Consensus::LegacyFinalHeight(
+                                m_active_chainstate.m_chainman.GetConsensus())};
+
+    if (m_pool.m_opts.require_standard &&
+        !AreInputsStandard(tx, m_view, asset_namespace_boundary)) {
         return state.Invalid(TxValidationResult::TX_INPUTS_NOT_STANDARD, "bad-txns-nonstandard-inputs");
     }
 
     // Check for non-standard witnesses.
-    if (tx.HasWitness() && m_pool.m_opts.require_standard && !IsWitnessStandard(tx, m_view)) {
+    if (tx.HasWitness() && m_pool.m_opts.require_standard &&
+        !IsWitnessStandard(tx, m_view, asset_namespace_boundary)) {
         return state.Invalid(TxValidationResult::TX_WITNESS_MUTATED, "bad-witness-nonstandard");
     }
 
-    int64_t nSigOpsCost = GetTransactionSigOpCost(tx, m_view, STANDARD_SCRIPT_VERIFY_FLAGS);
+    int64_t nSigOpsCost = GetTransactionSigOpCost(
+        tx, m_view, STANDARD_SCRIPT_VERIFY_FLAGS, asset_namespace_boundary);
 
     // Keep track of transactions that spend a coinbase, which we re-scan
     // during reorgs to ensure COINBASE_MATURITY is still met. In the legacy
     // era coinstake outputs carry the same maturity rule, so their spends are
     // flagged for the same re-scan.
     bool fSpendsCoinbase = false;
+    const std::optional<int> legacy_final_height{
+        Consensus::LegacyFinalHeight(m_active_chainstate.m_chainman.GetConsensus())};
     for (const CTxIn &txin : tx.vin) {
         const Coin &coin = m_view.AccessCoin(txin.prevout);
-        if (coin.IsCoinBase() || (next_block_legacy && coin.IsCoinStake())) {
+        if (coin.IsCoinBase() ||
+            (coin.IsCoinStake() && legacy_final_height &&
+             coin.nHeight <= static_cast<uint32_t>(*legacy_final_height))) {
             fSpendsCoinbase = true;
             break;
         }
@@ -1310,9 +1679,21 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
 
     // Check input scripts and signatures.
     // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache(), nullptr, legacy_lock_context)) {
+    if (!CheckInputScriptsWithFlowMeshVaults(
+            tx, state, m_view, scriptVerifyFlags, true, false,
+            ws.m_precomputed_txdata, GetValidationCache(), nullptr,
+            legacy_lock_context,
+            ws.m_flowmesh_vault_authorized.empty()
+                ? nullptr
+                : &ws.m_flowmesh_vault_authorized,
+            ws.m_bridge_withdrawal)) {
         // Detect a failure due to a missing witness so that p2p code can handle rejection caching appropriately.
-        if (!tx.HasWitness() && SpendsNonAnchorWitnessProg(tx, m_view)) {
+        if (!tx.HasWitness() &&
+            SpendsNonAnchorWitnessProg(
+                tx, m_view,
+                legacy_lock_context
+                    ? std::optional<int>{legacy_lock_context->final_height}
+                    : std::nullopt)) {
             state.Invalid(TxValidationResult::TX_WITNESS_STRIPPED,
                     state.GetRejectReason(), state.GetDebugMessage());
         }
@@ -1363,7 +1744,11 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     }
     if (!CheckInputsFromMempoolAndCache(tx, state, m_view, m_pool, currentBlockScriptVerifyFlags,
                                         ws.m_precomputed_txdata, m_active_chainstate.CoinsTip(), GetValidationCache(),
-                                        legacy_lock_context)) {
+                                        legacy_lock_context,
+                                        ws.m_flowmesh_vault_authorized.empty()
+                                            ? nullptr
+                                            : &ws.m_flowmesh_vault_authorized,
+                                        ws.m_bridge_withdrawal)) {
         LogError("BUG! PLEASE REPORT THIS! CheckInputScripts failed against latest-block but not STANDARD flags %s, %s", hash.ToString(), state.ToString());
         return Assume(false);
     }
@@ -2074,6 +2459,41 @@ node::FinalityBindingTracker& Chainstate::ModernFinalityBindings()
     return *m_finality_bindings;
 }
 
+node::FnSeatTracker& Chainstate::ModernFnSeats()
+{
+    AssertLockHeld(::cs_main);
+    if (!m_fn_seats) m_fn_seats = std::make_unique<node::FnSeatTracker>();
+    return *m_fn_seats;
+}
+
+node::FlowMeshCheckpointTracker& Chainstate::ModernFlowMeshCheckpoints()
+{
+    AssertLockHeld(::cs_main);
+    if (!m_flowmesh_checkpoints) {
+        m_flowmesh_checkpoints =
+            std::make_unique<node::FlowMeshCheckpointTracker>();
+    }
+    return *m_flowmesh_checkpoints;
+}
+
+node::FlowMeshVaultTracker& Chainstate::ModernFlowMeshVaults()
+{
+    AssertLockHeld(::cs_main);
+    if (!m_flowmesh_vaults) {
+        m_flowmesh_vaults = std::make_unique<node::FlowMeshVaultTracker>();
+    }
+    return *m_flowmesh_vaults;
+}
+
+node::BridgeStateTracker& Chainstate::ModernBridgeState()
+{
+    AssertLockHeld(::cs_main);
+    if (!m_bridge_state) {
+        m_bridge_state = std::make_unique<node::BridgeStateTracker>();
+    }
+    return *m_bridge_state;
+}
+
 node::FinalityTracker& Chainstate::ModernFinality()
 {
     AssertLockHeld(::cs_main);
@@ -2097,8 +2517,15 @@ void Chainstate::RefreshFinalityAnchor()
     if (!tip) return;
     const std::optional<int> modern_start{Consensus::ModernPosStartHeight(consensus)};
     if (!modern_start || tip->nHeight < *modern_start) return;
+    const node::BridgeStateIndex* bridge_index{nullptr};
+    if (Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
+        node::BridgeStateTracker& bridge{ModernBridgeState()};
+        if (!bridge.Sync(m_chain, m_blockman, consensus, *tip)) return;
+        bridge_index = &bridge.Index();
+    }
     node::FinalityTracker& finality{ModernFinality()};
-    if (!finality.Sync(m_chain, m_blockman, consensus, *tip)) return;
+    if (!finality.Sync(m_chain, m_blockman, consensus, *tip,
+                       bridge_index)) return;
     if (const auto& fin{finality.Current().finalized}) {
         m_blockman.RaiseFinalityAnchor(fin->height, fin->block_hash);
     }
@@ -2116,8 +2543,17 @@ std::optional<std::pair<CAmount, CAmount>> Chainstate::ModernEligibilityWeights(
 {
     AssertLockHeld(::cs_main);
     const Consensus::Params& consensus{m_chainman.GetConsensus()};
+    const node::BridgeStateIndex* bridge_index{nullptr};
+    if (Consensus::BridgeRulesActive(parent.nHeight, consensus)) {
+        node::BridgeStateTracker& bridge{ModernBridgeState()};
+        if (!bridge.Sync(m_chain, m_blockman, consensus, parent)) {
+            return std::nullopt;
+        }
+        bridge_index = &bridge.Index();
+    }
     node::FinalityTracker& finality{ModernFinality()};
-    if (!finality.Sync(m_chain, m_blockman, consensus, parent)) return std::nullopt;
+    if (!finality.Sync(m_chain, m_blockman, consensus, parent,
+                       bridge_index)) return std::nullopt;
     const auto set{finality.SetInForceAt(parent.nHeight + 1, consensus)};
     if (!set) return std::make_pair(CAmount{0}, CAmount{0});
     const auto index{set->IndexOf(validator_key)};
@@ -2262,8 +2698,10 @@ static void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo
             assert(is_spent);
         }
     }
-    // add outputs (modern era: metadata cells are never added)
-    AddCoins(inputs, tx, nHeight, /*check=*/false, tx_offset, /*exclude_metadata_cells=*/modern_era);
+    // Add spendable outputs. Modern metadata cells and BURN-policy asset
+    // outputs are consensus-committed but never enter the UTXO set.
+    AddCoins(inputs, tx, nHeight, /*check=*/false, tx_offset,
+             /*exclude_modern_cells=*/modern_era);
 }
 
 // Kept for the existing tests and non-legacy callers. B3Coin's historical
@@ -2325,7 +2763,7 @@ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
     const CScript &scriptSig = ptxTo->vin[nIn].scriptSig;
     const CScriptWitness *witness = &ptxTo->vin[nIn].scriptWitness;
     ScriptError error{SCRIPT_ERR_UNKNOWN_ERROR};
-    if (VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, m_flags, CachingTransactionSignatureChecker(ptxTo, nIn, m_tx_out.nValue, cacheStore, *m_signature_cache, *txdata), &error)) {
+    if (VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, m_flags, CachingTransactionSignatureChecker(ptxTo, nIn, m_tx_out.nValue, cacheStore, *m_signature_cache, *txdata), &error, m_enable_asset_owner)) {
         return std::nullopt;
     } else {
         auto debug_str = strprintf("input %i of %s (wtxid %s), spending %s:%i", nIn, ptxTo->GetHash().ToString(), ptxTo->GetWitnessHash().ToString(), ptxTo->vin[nIn].prevout.hash.ToString(), ptxTo->vin[nIn].prevout.n);
@@ -2368,14 +2806,28 @@ ValidationCache::ValidationCache(const size_t script_execution_cache_bytes, cons
  *
  * Non-static (and redeclared) in src/test/txvalidationcache_tests.cpp
  */
-bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
-                       const CCoinsViewCache& inputs, script_verify_flags flags, bool cacheSigStore,
-                       bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
-                       ValidationCache& validation_cache,
-                       std::vector<CScriptCheck>* pvChecks,
-                       const std::optional<LegacyLockSpendContext>& legacy_lock)
+static bool CheckInputScriptsWithFlowMeshVaults(
+    const CTransaction& tx, TxValidationState& state,
+    const CCoinsViewCache& inputs, script_verify_flags flags,
+    bool cacheSigStore, bool cacheFullScriptStore,
+    PrecomputedTransactionData& txdata, ValidationCache& validation_cache,
+    std::vector<CScriptCheck>* pvChecks,
+    const std::optional<LegacyLockSpendContext>& legacy_lock,
+    const std::vector<bool>* flowmesh_vault_authorized,
+    const bool require_bridge_sighash_all)
 {
     if (tx.IsCoinBase()) return true;
+    if (require_bridge_sighash_all) {
+        // This marker participates in the full-script cache key below. The
+        // transaction-specific bridge rule can therefore never reuse an
+        // ordinary-spend cache approval for the same witness transaction.
+        flags |= SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL;
+    }
+    if (flowmesh_vault_authorized != nullptr &&
+        flowmesh_vault_authorized->size() != tx.vin.size()) {
+        return state.Invalid(TxValidationResult::TX_CONSENSUS,
+                             "bad-flowmesh-vault-authorization-size");
+    }
 
     if (pvChecks) {
         pvChecks->reserve(tx.vin.size());
@@ -2392,7 +2844,6 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
             legacy_input[i] = coin.nHeight <= legacy_lock->final_height;
         }
     }
-
     // First check if script executions have been cached with the same
     // flags. Note that this assumes that the inputs provided are
     // correct (ie that the transaction hash which is in tx's prevouts
@@ -2410,6 +2861,18 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         for (unsigned int i = 0; i < legacy_input.size(); i++) {
             const unsigned char b{legacy_input[i] ? uint8_t{1} : uint8_t{0}};
             hasher.Write(&b, 1);
+        }
+    }
+    // A script-cache approval produced by a type-9 keyless-vault exemption
+    // must never be reusable by a caller that did not perform that contextual
+    // authorization. Commit both the presence marker and every input bit.
+    const unsigned char vault_marker{
+        flowmesh_vault_authorized != nullptr ? uint8_t{1} : uint8_t{0}};
+    hasher.Write(&vault_marker, 1);
+    if (flowmesh_vault_authorized != nullptr) {
+        for (const bool authorized : *flowmesh_vault_authorized) {
+            const unsigned char bit{authorized ? uint8_t{1} : uint8_t{0}};
+            hasher.Write(&bit, 1);
         }
     }
     hasher.Finalize(hashCacheEntry.begin());
@@ -2434,6 +2897,14 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
 
     for (unsigned int i = 0; i < tx.vin.size(); i++) {
 
+        if (flowmesh_vault_authorized != nullptr &&
+            (*flowmesh_vault_authorized)[i]) {
+            // The contextual FlowMesh checker has already required this coin
+            // to be the exact matching DEX_VAULT-v2 input and required empty
+            // scriptSig/witness. No other OP_FALSE input can set this bit.
+            continue;
+        }
+
         // We very carefully only pass in things to CScriptCheck which
         // are clearly committed to by tx' witness hash. This provides
         // a sanity check that our caching is not introducing consensus
@@ -2442,9 +2913,18 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
 
         // Verify signature; a frozen legacy-lock input takes the legacy
         // rule set, every other input the caller's flags.
-        const script_verify_flags input_flags{
+        script_verify_flags input_flags{
             (legacy_lock && legacy_input[i]) ? legacy_lock->legacy_flags : flags};
-        CScriptCheck check(txdata.m_spent_outputs[i], tx, validation_cache.m_signature_cache, i, input_flags, cacheSigStore, &txdata);
+        if (require_bridge_sighash_all) {
+            // A managed withdrawal may also use a sealed-era native input for
+            // fees. Keep its frozen script rules, but never let that selection
+            // remove the withdrawal's full-transaction signature binding.
+            input_flags |= SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL;
+        }
+        // B3A1 did not exist in the sealed era.  Only a coin created after H
+        // may execute the owner suffix instead of its complete stored script.
+        const bool enable_asset_owner{legacy_lock && !legacy_input[i]};
+        CScriptCheck check(txdata.m_spent_outputs[i], tx, validation_cache.m_signature_cache, i, input_flags, cacheSigStore, &txdata, enable_asset_owner);
         if (pvChecks) {
             pvChecks->emplace_back(std::move(check));
         } else if (auto result = check(); result.has_value()) {
@@ -2469,6 +2949,23 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
     }
 
     return true;
+}
+
+bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
+                       const CCoinsViewCache& inputs,
+                       const script_verify_flags flags,
+                       const bool cacheSigStore,
+                       const bool cacheFullScriptStore,
+                       PrecomputedTransactionData& txdata,
+                       ValidationCache& validation_cache,
+                       std::vector<CScriptCheck>* pvChecks,
+                       const std::optional<LegacyLockSpendContext>& legacy_lock,
+                       const bool require_bridge_sighash_all)
+{
+    return CheckInputScriptsWithFlowMeshVaults(
+        tx, state, inputs, flags, cacheSigStore, cacheFullScriptStore, txdata,
+        validation_cache, pvChecks, legacy_lock, nullptr,
+        require_bridge_sighash_all);
 }
 
 bool FatalError(Notifications& notifications, BlockValidationState& state, const bilingual_str& message)
@@ -2558,11 +3055,13 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
             // coin-database corruption.
             const bool legacy_marker{use_legacy_b3coin && tx.vout[o].nValue == 0 &&
                                      tx.vout[o].scriptPubKey.empty()};
-            // Modern metadata cells were never added by ConnectBlock (AddCoins
-            // skips them in the modern era), so the symmetric skip here keeps
+            // Modern metadata cells and asset BURN-policy outputs were never
+            // added by ConnectBlock, so the symmetric skip here keeps
             // Connect/Disconnect exact (same discipline as the legacy marker).
             const bool metadata_cell{modern_era_block && modern::IsMetadataCell(tx.vout[o].scriptPubKey)};
-            if (!tx.vout[o].scriptPubKey.IsUnspendable() && !legacy_marker && !metadata_cell) {
+            const bool asset_burn{modern_era_block && modern::IsAssetBurnOutput(tx.vout[o])};
+            if (!tx.vout[o].scriptPubKey.IsUnspendable() && !legacy_marker &&
+                !metadata_cell && !asset_burn) {
                 COutPoint out(hash, o);
                 Coin coin;
                 bool is_spent = view.SpendCoin(out, &coin);
@@ -2695,6 +3194,88 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         }
         LogError("%s: Consensus::CheckBlock: %s\n", __func__, state.ToString());
         return false;
+    }
+
+    // Recheck hardened post-legacy identities here as well as during header
+    // admission: -reindex-chainstate deliberately skips the contextual
+    // header path and must still reject a previously indexed mismatch.
+    if (!Consensus::ModernCheckpointAllows(params.GetConsensus(),
+                                           pindex->nHeight, block_hash)) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                             "bad-modern-checkpoint",
+                             strprintf("post-legacy block at height %d does not match its hardened checkpoint",
+                                       pindex->nHeight));
+    }
+
+    // B3 transition rules were introduced after some block-index databases
+    // could already have been written. `-reindex-chainstate` deliberately
+    // skips ContextualCheckBlockHeader(), so repeat every deterministic
+    // boundary/phase header rule here (but not the wall-clock future bound).
+    // The proof hash is skipped only for a miner's unsigned fJustCheck
+    // template; every disk/network connection path rechecks it.
+    if (params.GetConsensus().legacy_b3coin) {
+        const Consensus::Params& consensus{params.GetConsensus()};
+        switch (Consensus::CheckLegacyBoundaryHeader(block, pindex->nHeight,
+                                                      consensus)) {
+        case Consensus::BoundaryCheck::OK:
+            break;
+        case Consensus::BoundaryCheck::WRONG_FINAL_HASH:
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-legacy-final-hash",
+                                 "block at the finalized legacy boundary does not match LEGACY_FINAL_HASH");
+        case Consensus::BoundaryCheck::WRONG_FINAL_PARENT:
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-legacy-final-parent",
+                                 "first modern block does not reference LEGACY_FINAL_HASH");
+        }
+        const Consensus::ConsensusPhase phase{
+            Consensus::GetConsensusPhase(pindex->nHeight, consensus)};
+        if (phase == Consensus::ConsensusPhase::TRANSITION_POW) {
+            if (!consensus.transition_pow_bits ||
+                !IsCanonicalCompactBits(*consensus.transition_pow_bits)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "no-transition-pow-rules",
+                                     "temporary-PoW corridor difficulty is not configured canonically");
+            }
+            if (block.nBits != *consensus.transition_pow_bits) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-diffbits",
+                                     "incorrect temporary-PoW corridor difficulty");
+            }
+            if (!fJustCheck && !CheckTransitionPowEligibility(block)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "high-hash",
+                                     "temporary-PoW scrypt eligibility hash exceeds target");
+            }
+            if (pindex->pprev == nullptr ||
+                block.GetBlockTime() <
+                    pindex->pprev->GetBlockTime() +
+                        consensus.transition_pow_min_spacing) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "time-too-early-corridor",
+                                     "temporary-PoW corridor block is too early");
+            }
+        } else if (phase == Consensus::ConsensusPhase::MODERN_POS &&
+                   consensus.modern_pos) {
+            const Consensus::ModernPosParams& pos{*consensus.modern_pos};
+            if (block.nBits != pos.sentinel_bits) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-diffbits",
+                                     "modern-PoS nBits must be the sentinel value");
+            }
+            if (block.nNonce != 0) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-pos-nonce",
+                                     "modern-PoS nNonce must be zero");
+            }
+            if (pindex->pprev == nullptr ||
+                !modern::DecodeModernPosRound(pindex->pprev->GetBlockTime(),
+                                              block.GetBlockTime(), pos)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-pos-time",
+                                     "modern-PoS timestamp is not an exact round time");
+            }
+        }
     }
 
     // The normal Core flow deliberately does not repeat contextual header and
@@ -2923,6 +3504,266 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         }
     }
 
+    std::map<Ptxid, modern::AuthorizedAssetMint>
+        bridge_mint_authorizations;
+    std::set<Txid> bridge_withdrawal_transactions;
+    if (!use_legacy_b3coin && params.GetConsensus().legacy_b3coin) {
+        // Repeated here (not only ContextualCheckBlock), because
+        // -reindex-chainstate connects blocks without invoking that function.
+        for (const auto& tx : block.vtx) {
+            if (std::string asset_error; !modern::CheckAssetOutputs(*tx, asset_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-asset-output",
+                                     strprintf("%s in transaction %s", asset_error,
+                                               tx->GetHash().ToString()));
+            }
+            if (std::string stake_error;
+                !modern::CheckStakeOutputs(*tx, params.GetConsensus(),
+                                           stake_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-stake-output",
+                                     strprintf("%s in transaction %s", stake_error,
+                                               tx->GetHash().ToString()));
+            }
+            if (std::string cell_error;
+                !modern::CheckMetadataCellOutputs(*tx, params.GetConsensus(),
+                                                  pindex->nHeight, cell_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-metadata-cell",
+                                     strprintf("%s in transaction %s", cell_error,
+                                               tx->GetHash().ToString()));
+            }
+            if (std::string mpa_error;
+                !modern::CheckTransactionMpa(*tx, params.GetConsensus(), pindex->nHeight,
+                                             mpa_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-mpa", mpa_error);
+            }
+            std::vector<modern::FinalityKeyPair> pairs;
+            std::string bind_error;
+            if (!modern::MatchFinalityKeyPairs(*tx, pairs, bind_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-finality-key-binding",
+                                     strprintf("%s in transaction %s", bind_error,
+                                               tx->GetHash().ToString()));
+            }
+        }
+        if (std::string fn_error;
+            !modern::CheckFnGenesisBlock(block, pindex->nHeight, params.GetConsensus(),
+                                         fn_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-fn-genesis", fn_error);
+        }
+        if (std::string cost_error;
+            !modern::CheckBlockPayloadCost(block, cost_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-block-payload-cost", cost_error);
+        }
+        if (std::string root_error;
+            !modern::CheckBlockPayloadRoot(block, root_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-payload-root", root_error);
+        }
+        if (std::string cert_error;
+            !modern::CheckFinalityCertificatePlacement(block, cert_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-finality-cert-form", cert_error);
+        }
+        const Consensus::ConsensusPhase phase{Consensus::GetConsensusPhase(
+            pindex->nHeight, params.GetConsensus())};
+        if (phase == Consensus::ConsensusPhase::TRANSITION_POW &&
+            !block.vchBlockSig.empty()) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-corridor-sig",
+                                 "temporary-PoW corridor block carries a block signature");
+        }
+        if (phase == Consensus::ConsensusPhase::MODERN_POS &&
+            params.GetConsensus().modern_pos &&
+            block.vchBlockSig.size() != modern::MODERN_POS_SIG_SIZE) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-pos-signature",
+                                 "modern-PoS block does not carry a 64-byte validator signature");
+        }
+    }
+
+    // Type-10 state is consensus-derived but not represented in the UTXO
+    // snapshot. Verify the whole candidate against the exact active parent
+    // before any coin mutation, retaining only the resulting per-transaction
+    // mint authorizations for asset conservation below. The live tracker is
+    // advanced only by the successful ConnectTip hook.
+    if (!use_legacy_b3coin && params.GetConsensus().legacy_b3coin &&
+        Consensus::BridgeRulesActive(pindex->nHeight,
+                                     params.GetConsensus())) {
+        if (m_assumeutxo != Assumeutxo::VALIDATED) {
+            return state.Error(
+                "bridge state is unavailable until AssumeUTXO background validation completes");
+        }
+        node::BridgeStateTracker& tracker{ModernBridgeState()};
+        if (pindex->pprev == nullptr ||
+            !tracker.Sync(m_chain, m_blockman, params.GetConsensus(),
+                          *pindex->pprev)) {
+            return state.Error("bridge state is unavailable");
+        }
+        if (node::HasDecentralizedBridgeBurn(block) &&
+            !Consensus::BridgeWithdrawalRulesActive(
+                pindex->nHeight, params.GetConsensus())) {
+            return state.Invalid(
+                BlockValidationResult::BLOCK_CONSENSUS,
+                "bridge-withdrawal-rules-inactive");
+        }
+        if (node::HasDecentralizedBridgeBurn(block) &&
+            params.GetConsensus().busd_bridge->withdrawal_mode ==
+                Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
+            params.GetConsensus().busd_bridge->decentralized_withdrawal) {
+            node::FinalityTracker& finality{ModernFinality()};
+            if (!finality.Sync(m_chain, m_blockman, params.GetConsensus(),
+                               *pindex->pprev, &tracker.Index())) {
+                return state.Error(
+                    "bridge withdrawal readiness is unavailable");
+            }
+            const node::FinalityTracker::State projected{
+                finality.Projected(pindex->nHeight, params.GetConsensus())};
+            const node::BridgeBurnReadiness readiness{
+                node::BridgeWithdrawalValidatorSetsReady(
+                    projected,
+                    *params.GetConsensus()
+                         .busd_bridge->decentralized_withdrawal)
+                    ? node::BridgeBurnReadiness::READY
+                    : node::BridgeBurnReadiness::NOT_READY};
+            std::string readiness_error;
+            if (!node::CheckBridgeBurnReadiness(
+                    block, readiness, readiness_error)) {
+                return state.Invalid(
+                    BlockValidationResult::BLOCK_CONSENSUS,
+                    "bridge-withdrawal-not-ready", readiness_error);
+            }
+        }
+        node::BridgeBlockDelta bridge_delta;
+        std::string bridge_error;
+        if (!tracker.Index().VerifyBlock(
+                block, pindex->nHeight, block_hash, params.GetConsensus(),
+                bridge_delta, bridge_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-bridge-state", bridge_error);
+        }
+        for (const node::BridgeTxMintAuthorization& authorization :
+             bridge_delta.mint_authorizations) {
+            if (!bridge_mint_authorizations
+                     .emplace(authorization.transaction_id,
+                              modern::AuthorizedAssetMint{
+                                  authorization.authorization.asset,
+                                  authorization.authorization.amount})
+                     .second) {
+                return state.Error(
+                    "bridge verifier returned duplicate transaction authorizations");
+            }
+        }
+        for (const node::BridgeManagedWithdrawalRequest& withdrawal :
+             bridge_delta.withdrawals_added) {
+            bridge_withdrawal_transactions.insert(withdrawal.transaction_id);
+        }
+        for (const node::BridgeDecentralizedWithdrawalRequest& withdrawal :
+             bridge_delta.decentralized_withdrawals_added) {
+            bridge_withdrawal_transactions.insert(withdrawal.transaction_id);
+        }
+    }
+
+    // A2 FN-seat ownership is global UTXO-derived consensus state. Verify the
+    // candidate against an index synced exactly to its active-chain parent,
+    // using a scratch delta so fJustCheck and failed candidates cannot mutate
+    // live state. Replay rechecks the type-7 PoP rather than trusting carrier
+    // bytes from disk. AssumeUTXO does not commit that PoP provenance, so it
+    // remains fail-closed until background validation completes.
+    if (!use_legacy_b3coin && params.GetConsensus().legacy_b3coin &&
+        Consensus::FlowMeshSeatBindingRulesActive(pindex->nHeight,
+                                                  params.GetConsensus())) {
+        if (m_assumeutxo != Assumeutxo::VALIDATED) {
+            return state.Error(
+                "FlowMesh FN-seat index is unavailable until AssumeUTXO background validation completes");
+        }
+        node::FnSeatTracker& tracker{ModernFnSeats()};
+        if (pindex->pprev == nullptr ||
+            !tracker.Sync(m_chain, m_blockman, params.GetConsensus(),
+                          *pindex->pprev)) {
+            return state.Error("FlowMesh FN-seat index is unavailable");
+        }
+        node::FnSeatBlockDelta seat_delta;
+        std::string seat_error;
+        if (!tracker.Index().VerifyBlock(block, pindex->nHeight, block_hash,
+                                         params.GetConsensus(), seat_delta,
+                                         seat_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-flowmesh-fn-seat", seat_error);
+        }
+    }
+
+    // A2 DEX_VAULT preparation history is block-order consensus-derived state. Verify a
+    // candidate against the active parent's exact history without mutating
+    // the live tracker; the successful ConnectTip hook applies it later.
+    // AssumeUTXO does not commit historical vault creation/spend provenance,
+    // so this path remains fail-closed until background validation completes.
+    if (!use_legacy_b3coin && params.GetConsensus().legacy_b3coin &&
+        Consensus::FlowMeshVaultPreparationRulesActive(
+            pindex->nHeight, params.GetConsensus())) {
+        if (m_assumeutxo != Assumeutxo::VALIDATED) {
+            return state.Error(
+                "FlowMesh vault history is unavailable until AssumeUTXO background validation completes");
+        }
+        node::FlowMeshVaultTracker& tracker{ModernFlowMeshVaults()};
+        if (pindex->pprev == nullptr ||
+            !tracker.Sync(m_chain, m_blockman, params.GetConsensus(),
+                          *pindex->pprev)) {
+            return state.Error("FlowMesh vault history is unavailable");
+        }
+        node::FlowMeshVaultBlockDelta vault_delta;
+        std::string vault_error;
+        if (!tracker.Index().VerifyBlock(block, pindex->nHeight, block_hash,
+                                         params.GetConsensus(), vault_delta,
+                                         vault_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-flowmesh-vault-history", vault_error);
+        }
+    }
+
+    // Type-8 checkpoint heads and type-9 effect nullifiers are independent,
+    // replayable consensus-derived state. Re-verify every anchored all-seat
+    // snapshot and BLS certificate against the active parent before any UTXO
+    // mutation; the successful-tip hook applies the exact same block delta.
+    if (!use_legacy_b3coin && params.GetConsensus().legacy_b3coin &&
+        Consensus::FlowMeshRulesActive(pindex->nHeight,
+                                       params.GetConsensus())) {
+        if (m_assumeutxo != Assumeutxo::VALIDATED) {
+            return state.Error(
+                "FlowMesh checkpoint state is unavailable until AssumeUTXO background validation completes");
+        }
+        if (pindex->pprev == nullptr) {
+            return state.Error("FlowMesh checkpoint parent is unavailable");
+        }
+        node::FnSeatTracker& seat_tracker{ModernFnSeats()};
+        if (!seat_tracker.Sync(m_chain, m_blockman, params.GetConsensus(),
+                               *pindex->pprev)) {
+            return state.Error("FlowMesh FN-seat index is unavailable");
+        }
+        node::FlowMeshCheckpointTracker& tracker{
+            ModernFlowMeshCheckpoints()};
+        node::FlowMeshVaultTracker& vault_tracker{ModernFlowMeshVaults()};
+        if (!tracker.Sync(m_chain, m_blockman, params.GetConsensus(),
+                          seat_tracker.Index(), vault_tracker.Index(),
+                          *pindex->pprev)) {
+            return state.Error("FlowMesh checkpoint index is unavailable");
+        }
+        node::FlowMeshCheckpointBlockDelta checkpoint_delta;
+        std::string checkpoint_error;
+        if (!tracker.Index().VerifyBlock(
+                block, pindex->nHeight, block_hash, m_chain,
+                params.GetConsensus(), seat_tracker.Index(),
+                vault_tracker.Index(), checkpoint_delta, checkpoint_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-flowmesh-checkpoint",
+                                 checkpoint_error);
+        }
+    }
+
     // Enforce BIP68 (sequence locks)
     int nLockTimeFlags = 0;
     if (DeploymentActiveAt(*pindex, m_chainman, Consensus::DEPLOYMENT_CSV)) {
@@ -2982,12 +3823,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             // Before M (no set) and on a chain without the bootstrap floor
             // every certificate is invalid (fail closed).
             node::FinalityTracker& finality{ModernFinality()};
-            if (!finality.Sync(m_chain, m_blockman, consensus, *pindex->pprev)) {
+            const node::BridgeStateIndex* bridge_index{
+                &ModernBridgeState().Index()};
+            if (!finality.Sync(m_chain, m_blockman, consensus,
+                               *pindex->pprev, bridge_index)) {
                 state.Error("finality state is unavailable");
                 return false;
             }
             std::string cert_error;
-            if (!finality.CheckBlockCertificate(block, *pindex, consensus, cert_error)) {
+            if (!finality.CheckBlockCertificate(
+                    block, *pindex, consensus, cert_error, bridge_index)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-finality-cert", cert_error);
             }
         }
@@ -3026,6 +3871,14 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
     std::vector<int> prevheights;
     CAmount nFees = 0;
+    std::optional<uint32_t> fn_pod_issued_total;
+    if (!use_legacy_b3coin && params.GetConsensus().legacy_b3coin &&
+        Consensus::FnPodRulesActive(pindex->nHeight, params.GetConsensus())) {
+        fn_pod_issued_total = GetFnPodIssuedThrough(pindex->pprev, params.GetConsensus());
+        if (!fn_pod_issued_total) {
+            return state.Error("modern FN PoD counter for the parent is unavailable");
+        }
+    }
     CAmount legacy_stake_reward = 0;
     // Legacy supply bookkeeping, mirroring the historical client: per-block
     // value totals feed the cumulative money supply, and Fundamental Node
@@ -3044,6 +3897,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     {
         if (!state.IsValid()) break;
         const CTransaction &tx = *(block.vtx[i]);
+        std::vector<bool> flowmesh_vault_authorized;
 
         nInputs += tx.vin.size();
 
@@ -3071,6 +3925,72 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                               tx_state.GetRejectReason(),
                               tx_state.GetDebugMessage() + " in transaction " + tx.GetHash().ToString());
                 break;
+            }
+
+            if (!use_legacy_b3coin && params.GetConsensus().legacy_b3coin) {
+                std::vector<Coin> asset_prevs;
+                asset_prevs.reserve(tx.vin.size());
+                for (const CTxIn& input : tx.vin) {
+                    asset_prevs.push_back(view.AccessCoin(input.prevout));
+                }
+                std::optional<modern::AuthorizedAssetMint> bridge_mint;
+                if (const auto authorization{
+                        bridge_mint_authorizations.find(tx.GetPtxid())};
+                    authorization != bridge_mint_authorizations.end()) {
+                    bridge_mint = authorization->second;
+                }
+                modern::AssetTransactionEffects asset_effects;
+                std::string asset_error;
+                if (!modern::CheckAssetTransaction(tx, asset_prevs, pindex->nHeight,
+                                                   params.GetConsensus(),
+                                                   modern::AssetTransactionContext{
+                                                       fn_pod_issued_total, txfee,
+                                                       bridge_mint},
+                                                   asset_effects, asset_error)) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                  "bad-asset-transition",
+                                  asset_error + " in transaction " + tx.GetHash().ToString());
+                    break;
+                }
+                if (asset_effects.fn_pod_disintegration > txfee ||
+                    (asset_effects.fn_pod_creations != 0 && !fn_pod_issued_total)) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                  "bad-fn-pod-accounting",
+                                  "FN PoD disintegration/counter state is inconsistent");
+                    break;
+                }
+                txfee -= asset_effects.fn_pod_disintegration;
+                if (asset_effects.fn_pod_creations != 0) {
+                    if (*fn_pod_issued_total >
+                        std::numeric_limits<uint32_t>::max() -
+                            asset_effects.fn_pod_creations) {
+                        state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                      "bad-fn-pod-counter-overflow");
+                        break;
+                    }
+                    *fn_pod_issued_total += asset_effects.fn_pod_creations;
+                }
+
+                if (Consensus::FlowMeshRulesActive(
+                        pindex->nHeight, params.GetConsensus())) {
+                    node::FlowMeshCheckpointTracker& checkpoint_tracker{
+                        ModernFlowMeshCheckpoints()};
+                    node::FlowMeshVaultAuthorization vault_authorization;
+                    std::string vault_error;
+                    if (!node::CheckFlowMeshVaultTransaction(
+                            tx, asset_prevs, txfee, pindex->nHeight,
+                            params.GetConsensus(), checkpoint_tracker.Index(),
+                            vault_authorization, vault_error)) {
+                        state.Invalid(
+                            BlockValidationResult::BLOCK_CONSENSUS,
+                            "bad-flowmesh-vault-transaction",
+                            vault_error + " in transaction " +
+                                tx.GetHash().ToString());
+                        break;
+                    }
+                    flowmesh_vault_authorized =
+                        std::move(vault_authorization.authorized_inputs);
+                }
             }
 
             if (use_legacy_b3coin) {
@@ -3131,7 +4051,9 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             // * legacy (always)
             // * p2sh (when P2SH enabled in flags and excludes coinbase)
             // * witness (when witness enabled in flags and excludes coinbase)
-            nSigOpsCost += GetTransactionSigOpCost(tx, view, flags);
+            nSigOpsCost += GetTransactionSigOpCost(
+                tx, view, flags,
+                Consensus::LegacyFinalHeight(params.GetConsensus()));
             if (nSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", "too many sigops");
                 break;
@@ -3147,10 +4069,24 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             // they need to be added to control which runs them asynchronously. Otherwise, CheckInputScripts runs the checks before returning.
             if (control) {
                 std::vector<CScriptCheck> vChecks;
-                tx_ok = CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], m_chainman.m_validation_cache, &vChecks, legacy_lock_context);
+                tx_ok = CheckInputScriptsWithFlowMeshVaults(
+                    tx, tx_state, view, flags, fCacheResults, fCacheResults,
+                    txsdata[i], m_chainman.m_validation_cache, &vChecks,
+                    legacy_lock_context,
+                    flowmesh_vault_authorized.empty()
+                        ? nullptr
+                        : &flowmesh_vault_authorized,
+                    bridge_withdrawal_transactions.contains(tx.GetHash()));
                 if (tx_ok) control->Add(std::move(vChecks));
             } else {
-                tx_ok = CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], m_chainman.m_validation_cache);
+                tx_ok = CheckInputScriptsWithFlowMeshVaults(
+                    tx, tx_state, view, flags, fCacheResults, fCacheResults,
+                    txsdata[i], m_chainman.m_validation_cache, nullptr,
+                    legacy_lock_context,
+                    flowmesh_vault_authorized.empty()
+                        ? nullptr
+                        : &flowmesh_vault_authorized,
+                    bridge_withdrawal_transactions.contains(tx.GetHash()));
             }
             if (!tx_ok) {
                 // Any transaction validation failure in ConnectBlock is a block consensus failure
@@ -3234,6 +4170,19 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         // rule either. Until an approved modern rule set is installed that
         // path rejects every block (modern/pos.h documents the missing rule
         // set precisely).
+        //
+        // M6 applies to the whole modern era, not only to its PoS production
+        // phase: a coinbase can never create an active STAKE output. Corridor
+        // miners may include an ordinary transaction which creates STAKE, but
+        // their fee-paying coinbase must remain an ordinary output.
+        for (const CTxOut& cb_out : block.vtx[0]->vout) {
+            if (state.IsValid() && modern::ClaimsStakeMagic(cb_out.scriptPubKey)) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                              "bad-cb-stake",
+                              "modern-era coinbase output claims the STAKE magic");
+            }
+        }
+
         if (Consensus::GetConsensusPhase(pindex->nHeight, params.GetConsensus()) ==
             Consensus::ConsensusPhase::TRANSITION_POW) {
             // Fail closed while the corridor reward is unstated, exactly like
@@ -3288,21 +4237,13 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                                             paid, treasury_share));
                 }
             }
-            // M6: a block reward can never directly create active STAKE. The
-            // reward pays ordinary outputs; restaking is an explicit STAKE
-            // output subject to the activation depth.
-            for (const CTxOut& cb_out : block.vtx[0]->vout) {
-                if (state.IsValid() && modern::ClaimsStakeMagic(cb_out.scriptPubKey)) {
-                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-stake",
-                                  "coinbase output claims the STAKE magic");
-                }
-            }
             if (state.IsValid()) {
                 const Consensus::Params& consensus{params.GetConsensus()};
                 if (consensus.test_only_modern_pos_validator != nullptr || !consensus.modern_pos) {
                     // Test-adapter dispatch, or fail-closed: with no V1
-                    // parameter block configured (every shipped network)
-                    // every modern-PoS block is rejected.
+                    // parameter block configured, every modern-PoS block is
+                    // rejected. Mainnet's transition release takes the
+                    // production branch below.
                     (void)modern::CheckModernStake(block, *pindex->pprev, view, state,
                                                    consensus.test_only_modern_pos_validator);
                 } else if (modern::CheckModernPosCodec(block, state)) {
@@ -3415,6 +4356,12 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         return false;
     }
 
+    if (fn_pod_issued_total) {
+        pindex->m_fn_pod_issued_total = *fn_pod_issued_total;
+        pindex->m_fn_pod_issued_total_known = true;
+        m_blockman.m_dirty_blockindex.insert(pindex);
+    }
+
     const auto time_5{SteadyClock::now()};
     m_chainman.time_undo += time_5 - time_4;
     LogDebug(BCLog::BENCH, "    - Write undo data: %.2fms [%.2fs (%.2fms/blk)]\n",
@@ -3508,6 +4455,26 @@ bool Chainstate::FlushStateToDisk(
                 last_prune = std::max(1, std::min(last_prune, lock_height));
                 if (last_prune == lock_height) {
                     limiting_lock = prune_lock.first;
+                }
+            }
+
+            // BridgeStateTracker currently reconstructs its exact consensus
+            // index by replaying active bridge blocks. Until the documented
+            // atomic disk sidecar replaces that replay, pruning any block at
+            // or after bridge activation would make a later restart unable to
+            // validate mints/nullifiers safely. Keep that suffix even when a
+            // user selected prune mode; failing to meet the prune target is
+            // preferable to silently creating an unrecoverable node state.
+            const Consensus::Params& consensus{m_chainman.GetConsensus()};
+            if (consensus.busd_bridge &&
+                Consensus::BridgeMintParamsReady(*consensus.busd_bridge) &&
+                m_chain.Height() >=
+                    *consensus.busd_bridge->activation_height) {
+                const int bridge_last_prune{std::max(
+                    1, *consensus.busd_bridge->activation_height - 1)};
+                if (bridge_last_prune < last_prune) {
+                    last_prune = bridge_last_prune;
+                    limiting_lock = "bridge-state-replay";
                 }
             }
 
@@ -3786,6 +4753,22 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     // The binding index reverts the disconnected block exactly (or marks
     // itself for rebuild when not in step).
     if (m_finality_bindings) m_finality_bindings->BlockDisconnected(*pindexDelete);
+    if (m_fn_seats) {
+        m_fn_seats->BlockDisconnected(*pindexDelete,
+                                      m_chainman.GetConsensus());
+    }
+    if (m_flowmesh_checkpoints) {
+        m_flowmesh_checkpoints->BlockDisconnected(
+            *pindexDelete, m_chainman.GetConsensus());
+    }
+    if (m_flowmesh_vaults) {
+        m_flowmesh_vaults->BlockDisconnected(*pindexDelete,
+                                             m_chainman.GetConsensus());
+    }
+    if (m_bridge_state) {
+        m_bridge_state->BlockDisconnected(*pindexDelete,
+                                          m_chainman.GetConsensus());
+    }
     if (m_finality_tracker) m_finality_tracker->BlockDisconnected(*pindexDelete);
 
     UpdateTip(pindexDelete->pprev);
@@ -3902,8 +4885,37 @@ bool Chainstate::ConnectTip(
     if (m_finality_bindings) {
         m_finality_bindings->BlockConnected(*block_to_connect, *pindexNew, m_chainman.GetConsensus());
     }
+    if (m_fn_seats) {
+        // Empty A2+ blocks advance the tracker too, keeping anchor depth and
+        // exact disconnect aligned with the active chain.
+        m_fn_seats->BlockConnected(*block_to_connect, *pindexNew,
+                                   m_chainman.GetConsensus());
+    }
+    if (m_flowmesh_checkpoints) {
+        // Candidate validation already proved this delta against the parent.
+        // The seat tracker advances first so historical snapshot lookup stays
+        // available while the checkpoint tracker applies the same block.
+        m_flowmesh_checkpoints->BlockConnected(
+            *block_to_connect, *pindexNew, m_chain,
+            m_chainman.GetConsensus(), ModernFnSeats().Index(),
+            ModernFlowMeshVaults().Index());
+    }
+    if (m_flowmesh_vaults) {
+        // Empty A2+ blocks are retained so as-of-anchor answers and exact
+        // disconnect remain aligned with the active chain.
+        m_flowmesh_vaults->BlockConnected(*block_to_connect, *pindexNew,
+                                          m_chainman.GetConsensus());
+    }
+    if (m_bridge_state) {
+        // Candidate validation already proved the exact block delta against
+        // the parent; empty active blocks are retained for exact undo.
+        m_bridge_state->BlockConnected(*block_to_connect, *pindexNew,
+                                       m_chainman.GetConsensus());
+    }
     if (m_finality_tracker) {
-        m_finality_tracker->BlockConnected(*block_to_connect, *pindexNew, m_chainman.GetConsensus());
+        m_finality_tracker->BlockConnected(
+            *block_to_connect, *pindexNew, m_chainman.GetConsensus(),
+            m_bridge_state ? &m_bridge_state->Index() : nullptr);
         // The finality pin: a certificate connected on the active chain pins
         // its checkpoint for the life of the process (monotone).
         if (m_finality_tracker->Synced(pindexNew->GetBlockHash())) {
@@ -3932,6 +4944,25 @@ bool Chainstate::ConnectTip(
     if (m_mempool) {
         m_mempool->removeForBlock(block_to_connect->vtx, pindexNew->nHeight);
         disconnectpool.removeForBlock(block_to_connect->vtx);
+
+        // A confirmed PoD advances the branch-local lifetime counter. Any
+        // competing type-6 transaction that named the old next slot is now
+        // consensus-stale; remove it and all descendants before exposing the
+        // new tip to further mempool admission. Missing post-activation
+        // counter state fails closed by removing every type-6 declaration.
+        // REORG is the existing "tip-context invalidated" callback reason;
+        // CONFLICT would falsely tell wallets an input was spent in-block.
+        const auto fn_pod_issued{
+            GetFnPodIssuedThrough(pindexNew, m_chainman.GetConsensus())};
+        const size_t stale_fn_roots{RemoveStaleFnPodMempoolEntries(
+            *m_mempool, fn_pod_issued, MemPoolRemovalReason::REORG)};
+        if (stale_fn_roots != 0) {
+            LogInfo("Removed %zu stale FN PoD mempool root(s) after connecting %s at height %d (confirmed count: %s)\n",
+                    stale_fn_roots, pindexNew->GetBlockHash().ToString(),
+                    pindexNew->nHeight,
+                    fn_pod_issued ? strprintf("%u", *fn_pod_issued) : "unavailable");
+        }
+
         // B3: connecting the final legacy block H flips the next-block era to
         // modern. Every remaining entry is legacy-encoded (admission allowed
         // nothing else while the next block was legacy) and can never be mined
@@ -5452,6 +6483,14 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-legacy-final-parent",
                              "first modern block does not reference LEGACY_FINAL_HASH");
     }
+    if (!Consensus::ModernCheckpointAllows(
+            consensusParams, nHeight,
+            block.GetHash(consensusParams, nHeight))) {
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER,
+                             "bad-modern-checkpoint",
+                             strprintf("post-legacy block at height %d does not match its hardened checkpoint",
+                                       nHeight));
+    }
 
     // Check proof of work
     if (Consensus::GetB3Era(nHeight, consensusParams) == Consensus::B3Era::LEGACY) {
@@ -5670,19 +6709,29 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
     // silent reinterpretation as an ordinary output.
     if (consensus_params.legacy_b3coin) {
         for (const auto& tx : block.vtx) {
+            // B3A1 is a reserved, fail-closed output namespace. Semantic
+            // conservation is UTXO-dependent and runs in ConnectBlock.
+            if (std::string asset_error; !modern::CheckAssetOutputs(*tx, asset_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-asset-output",
+                                     strprintf("%s in transaction %s", asset_error,
+                                               tx->GetHash().ToString()));
+            }
             if (std::string stake_error; !modern::CheckStakeOutputs(*tx, consensus_params, stake_error)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-stake-output",
                                      strprintf("%s in transaction %s", stake_error, tx->GetHash().ToString()));
             }
-            // Metadata cells (policy 6/7/8 carriers): a claiming output must be
+            // Metadata cells (policy 6/7/8/9 carriers): a claiming output must be
             // well-formed, zero-valued and activated; never reinterpreted.
-            if (std::string cell_error; !modern::CheckMetadataCellOutputs(*tx, consensus_params, cell_error)) {
+            if (std::string cell_error;
+                !modern::CheckMetadataCellOutputs(*tx, consensus_params, nHeight, cell_error)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-metadata-cell",
                                      strprintf("%s in transaction %s", cell_error, tx->GetHash().ToString()));
             }
             // Modern Payload Area: activation context, canonical order, registry and
             // per-type grammar; and the FINALITY_KEY cell<->evidence bijection.
-            if (std::string mpa_error; !modern::CheckTransactionMpa(*tx, consensus_params, mpa_error)) {
+            if (std::string mpa_error;
+                !modern::CheckTransactionMpa(*tx, consensus_params, nHeight, mpa_error)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-mpa",
                                      strprintf("%s in transaction %s", mpa_error, tx->GetHash().ToString()));
             }
@@ -5694,6 +6743,11 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
                                          strprintf("%s in transaction %s", bind_error, tx->GetHash().ToString()));
                 }
             }
+        }
+        if (std::string fn_error;
+            !modern::CheckFnGenesisBlock(block, nHeight, consensus_params, fn_error)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-fn-genesis", fn_error);
         }
         // Payload verification-cost budget per block, from the record frames
         // alone -- before ConnectBlock runs any BLS/BIP340 verification.
@@ -6173,14 +7227,23 @@ bool Chainstate::LoadChainTip()
     assert(!coins_cache.GetBestBlock().IsNull()); // Never called when the coins view is empty
     CBlockIndex* tip = m_chain.Tip();
 
-    if (tip && tip->GetBlockHash() == coins_cache.GetBestBlock()) {
-        return true;
-    }
-
     // Load pointer to end of best chain
     CBlockIndex* pindex = m_blockman.LookupBlockIndex(coins_cache.GetBestBlock());
     if (!pindex) {
         return false;
+    }
+    // A restart migration may quarantine a formerly accepted side branch
+    // after loading the block-index tree. It is safe to retain such an
+    // irrelevant branch, but never to trust a coins database whose own tip
+    // depends on it. Descendants inherit BLOCK_FAILED_VALID during index load,
+    // so checking the tip covers the complete active ancestry.
+    if (pindex->nStatus & BLOCK_FAILED_VALID) {
+        LogError("%s: coins database tip %s at height %d is now consensus-invalid\n",
+                 __func__, pindex->GetBlockHash().ToString(), pindex->nHeight);
+        return false;
+    }
+    if (tip == pindex) {
+        return true;
     }
     m_chain.SetTip(*pindex);
     m_chainman.UpdateIBDStatus();
@@ -6392,10 +7455,11 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
             }
         }
         // Pass check = true as every addition may be an overwrite. Modern
-        // metadata cells are excluded exactly as ConnectBlock excludes them.
+        // metadata cells and BURN-policy asset outputs are excluded exactly as
+        // ConnectBlock excludes them.
         AddCoins(inputs, *tx, pindex->nHeight, true,
                  use_legacy_b3coin ? legacy_tx_offset : 0,
-                 /*exclude_metadata_cells=*/m_chainman.GetConsensus().legacy_b3coin && !use_legacy_b3coin);
+                 /*exclude_modern_cells=*/m_chainman.GetConsensus().legacy_b3coin && !use_legacy_b3coin);
         if (use_legacy_b3coin) {
             legacy_tx_offset += static_cast<uint32_t>(GetSerializeSize(legacy::TX_LEGACY(*tx)));
         }
@@ -6681,7 +7745,18 @@ void ChainstateManager::LoadExternalBlockFile(
                         // This block can be processed immediately; rewind to its start, read and deserialize it.
                         blkdat.SetPos(nBlockPos);
                         pblock = std::make_shared<CBlock>();
-                        blkdat >> TX_WITH_WITNESS(*pblock);
+                        // Full reindex/loadblock has no block-index height yet,
+                        // so select the same marker-aware storage codec used by
+                        // BlockManager::ReadBlock. Historical B3 transactions
+                        // carry nTime and the block carries a trailing signature;
+                        // TX_WITH_WITNESS cannot decode those bytes. TX_LEGACY
+                        // reads that historical form and, for marker-v2 blocks,
+                        // automatically selects the modern body format.
+                        if (params.GetConsensus().legacy_b3coin) {
+                            blkdat >> legacy::TX_LEGACY(*pblock);
+                        } else {
+                            blkdat >> TX_WITH_WITNESS(*pblock);
+                        }
                         nRewind = blkdat.GetPos();
 
                         BlockValidationState state;
@@ -7427,6 +8502,37 @@ util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
     }
 
     const AssumeutxoData& au_data = *maybe_au_data;
+
+    const Consensus::Params& consensus{GetConsensus()};
+    const bool skips_fn_genesis{
+        consensus.fn_genesis_required && consensus.hard_fork_height &&
+        base_height >= *consensus.hard_fork_height};
+    const bool skips_fn_pod{
+        consensus.fn_pod_activation_height &&
+        base_height >= *consensus.fn_pod_activation_height};
+    const bool skips_fn_seats{
+        Consensus::FlowMeshSeatBindingScheduleConfigured(consensus) &&
+        base_height >= *consensus.asset_activation_height};
+    const bool skips_flowmesh_vault_history{
+        Consensus::FlowMeshSeatBindingScheduleConfigured(consensus) &&
+        base_height >= *consensus.asset_activation_height};
+    const bool skips_flowmesh_checkpoint_history{
+        Consensus::FlowMeshSeatBindingScheduleConfigured(consensus) &&
+        base_height >= *consensus.flowmesh_activation_height};
+    const bool skips_bridge_history{
+        Consensus::BridgeRulesActive(base_height, consensus)};
+    if (consensus.legacy_b3coin &&
+        (skips_fn_genesis || skips_fn_pod || skips_fn_seats ||
+         skips_flowmesh_vault_history ||
+         skips_flowmesh_checkpoint_history || skips_bridge_history)) {
+        return util::Error{Untranslated(
+            "B3 AssumeUTXO snapshots at or after mandatory FN Genesis or modern "
+            "FN PoD/FlowMesh activation are unsupported because FN "
+            "configuration, issuance state, PoP-verified seat provenance, "
+            "vault history, checkpoint heads, FlowMesh nullifiers, and bridge "
+            "light-client/nullifier/mint-cap state are not "
+            "committed by the snapshot metadata.")};
+    }
 
     // This work comparison is a duplicate check with the one performed later in
     // ActivateSnapshot(), but is done so that we avoid doing the long work of staging

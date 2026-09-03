@@ -67,6 +67,61 @@ Scope: B3 transition context, modern colored assets, FN Coin/Proof of Disintegra
 > 2026-08-16 note above is superseded to that extent — its rejection of
 > the §4.5 marker-spend mechanism stands.
 
+> **Owner reconciliation (2026-09-01, final historical-FN supersession).**
+> The archival-builder/stateless-proof model above is now itself
+> **SUPERSEDED**. The governing design is
+> [b3-fn-assets-activation-design.md](b3-fn-assets-activation-design.md):
+> during the seal pause independently reproduce and pin the complete canonical
+> FN rights manifest, count R, and Merkle root; the coinbase of block 810,001
+> creates one amount-1 FN output per manifest row directly to the exact legacy
+> P2PKH owner commitment. No claim, holder proof, deadline, or issuance fee
+> exists. Ordinary 30-block coinbase maturity is the only transfer delay.
+> Action types 1 and 2 remain reserved/dead; the 4,000-byte proof-fit gate is
+> removed. Modern capacity is `5,000 - R`; modern PoD prices remain
+> 15,000/30,000/60,000 B3. Modern PoD and simple-v1 assets activate at
+> separately pinned post-M heights A1 and A2; asset issuance pays a 1,000 B3
+> treasury fee. FlowMesh seat/vault preparation starts at A2 and working spot
+> trading starts at A3 in the same transition release; the later feature
+> release is expansion only. FlowMesh fees are 100 ppm of matched native-B3
+> notional, split 80% across active FN seats and 20% to treasury. Production
+> bUSD is the separately gated six-decimal Ethereum-USDT asset for managed-v1
+> vault `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`, not a fee asset or a
+> native CDP. All claim/proof and stablecoin-fee text below that conflicts with
+> this reconciliation is **SUPERSEDED historical design** and must not be
+> implemented. The bounded type-10 proof/command carrier, exact OWNER mint,
+> exact bUSD BURN request, nullifier/caps, undo/reindex replay, and
+> mempool/miner/asset integration are implemented. Each type-10 record requires
+> one zero-value policy-9 `BRIDGE_RECORD` metadata output committing the exact
+> canonical frame; standard `SIGHASH_ALL` binds it without `OP_RETURN` or a
+> custom sighash. Bridge state is rebuilt in memory from activation and pruning
+> is refused because no durable sidecar exists. Adapter enforcement and the
+> operator Ethereum-release/consumption service are not implemented;
+> production pins and audits remain open, so mainnet remains fail-closed.
+
+> **Owner reconciliation (2026-09-02, decentralized bridge supersession).**
+> The managed-v1 bridge statements in the 2026-09-01 reconciliation above are
+> now **SUPERSEDED before activation**. The current production target is a new
+> immutable single-USDT `B3StakerBridge` controlled only by the immutable
+> `B3FinalityVerifier`: no owner, rescue key, proxy, pause, or arbitrary token
+> selector. A deadline-bound one-time 3-of-4 attestation by the four published
+> bootstrap BLS identities installs canonical Set_0; after initialization the
+> bootstrap path is unreachable and ordinary B3 staker-finality certificates
+> and set handovers are the only withdrawal authority. Anyone may relay the
+> certificate and withdrawal proof and pays Ethereum gas; B3 never holds an
+> Ethereum private key. The bridge has inbound height B selected only by a
+> later B3 build after the complete audited deployment tuple is collected,
+> reviewed, and pinned. A3 remains FlowMesh only. The vault may be deployed
+> before M, but deposits remain disabled until initialization and a fresh valid
+> certificate prove qualified current and successor sets. Irreversible burns
+> use a separate height W that remains unset until canonicality and liveness
+> safety is solved and explicitly enabled; B before W is a disclosed custodial
+> waiting period. The historical managed smoke
+> vault and its AssetId are excluded from the production registry, subject to
+> rechecking that it still has no USDT liability and that no consensus bUSD was
+> activated; otherwise an explicit migration is required. Production remains
+> fail-closed pending all contract, checkpoint, cap, adapter, audit, bootstrap,
+> and rehearsal gates.
+
 ## 0. How this document must be used
 
 This document is the canonical context for future Claude sessions. It is not an instruction to implement every section at once.
@@ -112,8 +167,11 @@ B3 Coin + STAKE outputs
 FN Coin + active FundamentalNodes
     -> operate/certify the FlowMesh microblock layer
 
-Approved USDC/USDT-like assets
-    -> trading settlement, accounting, and FlowMesh fee denomination
+Registered colored assets, including bridge-backed bUSD when independently active
+    -> FlowMesh spot-market base assets and accounting
+
+Native B3
+    -> FlowMesh quote asset and trading-fee denomination
 ```
 
 The B3 base chain and FlowMesh are not competing chains.
@@ -314,14 +372,17 @@ Examples:
 
 FN Coin is not an ordinary "enter a name and supply in a wizard" token.
 
-### 3.5 Fees — LOCKED separation
+### 3.5 Fees — LOCKED separation, reconciled 2026-09-01
 
 ```text
 normal B3 base-chain transaction fee -> native B3
-FlowMesh trading fee                 -> approved stablecoin AssetId
+FlowMesh trading fee                 -> native B3, 100 ppm of matched notional
 ```
 
-The FlowMesh whitelist must identify exact approved `AssetId` values. A fake asset with the symbol `USDC` or `USDT` must never qualify merely because its display metadata matches.
+The fee is charged once, split 80% across active FN seats and 20% to treasury.
+The FlowMesh market registry must still identify exact approved base `AssetId`
+values. A fake asset with the symbol `USDC` or `USDT` never qualifies merely
+because its display metadata matches.
 
 Base-chain liveness must not depend on Circle, Tether, a bridge, or any stablecoin issuer.
 
@@ -511,7 +572,7 @@ because the gap is consensus-validated, not hidden.
 Generic `BURN` and FN-specific `PoD` remain semantically distinct; the
 locked encoding does not reuse the BURN primitive.
 
-### 4.7 FN Coin's FlowMesh role — DESIGN DIRECTION
+### 4.7 FN Coin's FlowMesh role — LOCKED FOR SPOT V1
 
 FN Coin is intended to grant the right to operate/certify FlowMesh microblocks.
 
@@ -524,13 +585,19 @@ An active FundamentalNode may perform:
 - data-availability service/certification;
 - withdrawal-receipt certification.
 
-Current simple direction:
+Current v1 rule:
 
 ```text
-one active FN Coin -> one microblock seat
+one PoP-verified active FN-v2 output -> one microblock seat
 ```
 
-This avoids making `100 FN Coins` automatically equal one node with `100x` vote weight. Whether an operator may run multiple seats, how seats are sampled, committee size, certification threshold, rotation, liveness penalties, and activation/exit rules are **OPEN**.
+Every active seat participates in the canonically ordered committee; proposer
+selection is round-robin and quorum is `floor(2*k/3)+1`, with `k >= 4`.
+Sequence locks are permanent and a conflict causes a safe halt. Each market's
+epoch-zero anchor is its unique earliest eligible canonical block as specified
+in [b3-flowmesh-v1-production.md](b3-flowmesh-v1-production.md); later seat
+changes use certified, 30-deep handoffs. One seat has one vote—holding more FN
+does not increase the weight of an individual seat.
 
 FN Coin does not silently add B3 PoS weight.
 
@@ -542,7 +609,7 @@ demand for FlowMesh capacity
     -> B3 is destroyed
     -> FN is activated
     -> operator serves microblocks
-    -> operator may earn approved stablecoin trading fees
+    -> operator may earn its ruled share of native-B3 trading fees
 ```
 
 **Locked direction (owner rulings 2026-08-17 through 2026-08-28; full
@@ -570,12 +637,11 @@ not advance the modern cost curve. Scarcity counts total-ever-created;
 extinguishment (§4.6 lifecycle, b3-fn-pod.md §10.2) reduces active
 supply only and never reopens a creation slot.
 
-Exact fee distribution remains OPEN. Possible destinations include active
-FNs, insurance, treasury, or another approved allocation. B3 PoS
-validators do not automatically receive the FlowMesh fee pool. The
-remaining OPEN numerical decisions (reward amount/schedule and reward
-cutoff) carry decision tables
-in [b3-fn-pod.md](b3-fn-pod.md) §11.5.
+FlowMesh spot charges 100 ppm of matched native-B3 notional. Eighty percent
+is divided equally across the active FN seats and 20% accrues to treasury;
+B3 PoS validators do not automatically receive this fee pool. Any reward
+mechanism beyond that ruled spot-fee allocation is future scope, not a
+transition-release blocker.
 
 ## 5. FlowMesh DEX
 
@@ -617,16 +683,18 @@ Initial production target:
 
 - deposits;
 - internal balances;
-- one spot market such as B3/TEST_USDT;
+- one registered colored-asset/B3 spot market, using a test asset on regtest;
 - submit/update/cancel intent;
 - deterministic matching/clearing;
 - partial fills;
-- trading fees in TEST_USDT;
+- trading fees in native B3;
 - settlement;
 - withdrawal receipts;
 - UTXO withdrawal.
 
-Do not start with cross margin, perpetual funding, ADL, portfolio margin, real bridge assets, or production oracle economics.
+Do not start with cross margin, perpetual funding, ADL, portfolio margin, or
+production oracle economics. Do not activate a real bridge asset before its
+independent proof/readiness gates pass.
 
 ### 5.4 Demand functions and deterministic clearing — DESIGN DIRECTION
 
@@ -638,7 +706,9 @@ d_i(p) = desired holding of trader i at price p
 
 The engine clears a canonical intent set deterministically, using integer/fixed-point arithmetic and explicit tie-breaking/rounding.
 
-UI actions such as buy, sell, update, and cancel may compile into this canonical intent model. The exact production choice between a demand-curve-native wire format and a more conventional order interface is **OPEN**. Claude must not build two incompatible matching engines accidentally.
+Production uses the uniform-price curve auction. BUY/SELL limit actions are
+degenerate curves on that single matching engine; there is no second
+price-time-priority book.
 
 For superseding intent such as a demand curve, the newest valid version for the same account/market may replace older versions. Additive, consumptive, and sequential actions may require different normalization rules. Those action-semantics rules must be specified before they become consensus.
 
@@ -740,17 +810,22 @@ Consensus must prove/check:
 
 One-time consumption cannot remain an in-memory caller convention.
 
-### 5.9 Vault sharding — LOCKED direction
+### 5.9 Vault sharding — LOCKED FOR SPOT V1
 
 Do not force the entire DEX through one globally contended vault UTXO.
 
-Shard custody deterministically, potentially by asset, shard number, and epoch rotation. The user cannot choose a convenient shard to bypass rules. Exact sharding and aggregation rules are OPEN.
+DEX_VAULT-v2 parameters begin with the 32-byte `VaultId`, followed by kind,
+shard, and the optional account for a user deposit. Pool-change shards and
+withdrawal change are derived deterministically; the user cannot choose a
+convenient shard to bypass rules. The exact aggregation, forced-change, and
+top-64 payout rules are normative in
+[b3-flowmesh-v1-production.md](b3-flowmesh-v1-production.md).
 
-### 5.10 FlowMesh fee assets — LOCKED direction
+### 5.10 FlowMesh fee asset — LOCKED, reconciled 2026-09-01
 
-FlowMesh trading fees are charged in the approved quote/settlement stable asset, initially TEST_USDT in regtest. The fee asset and exact `AssetId` are part of market configuration/consensus state.
-
-Maker/taker schedules, insurance allocations, rebates, and FN distributions remain OPEN.
+FlowMesh v1 trading fees are charged in native B3: 100 ppm of matched B3
+notional, once per match, split 80% across active FN seats and 20% to treasury.
+There is no maker/taker schedule or stablecoin fee whitelist in v1.
 
 ### 5.11 Leverage follows spot — LOCKED sequencing
 
@@ -790,8 +865,9 @@ Earlier code audits reported:
 - receipt finality not actually checked;
 - receipt consumption not persisted/consensus-atomic;
 - bare slot counter not anchored to B3;
-- FlowMesh fees hardcoded to native B3;
-- no stablecoin whitelist.
+- a fee path that did not match the then-current provisional stablecoin rule
+  (that provisional rule is now itself superseded by native-B3 fees);
+- no exact base-asset registry.
 
 These reports are not substitutes for a fresh audit of the current checkout.
 
@@ -872,9 +948,19 @@ trader actions
     -> periodic commitment/finality on B3
 ```
 
-The exact producer selection, number of active seats, committee sampling, certification threshold, failure recovery, leader rotation, view change, data-availability certificate, and penalty rules are OPEN.
+For spot v1, all active FN-v2 seats form the committee, proposer selection is
+round-robin, and quorum is `floor(2*k/3)+1` for `k >= 4`. The authenticated
+certified-log, bounded recovery, permanent lock, catch-up, checkpoint, and
+handoff rules are normative in
+[b3-flowmesh-v1-production.md](b3-flowmesh-v1-production.md). Penalty or
+slashing economics beyond safe halt are future scope.
 
-### 6.5 Minimum microblock commitments — OPEN SPECIFICATION
+### 6.5 Minimum microblock commitments — HISTORICAL OPEN LIST, SUPERSEDED
+
+The list below records the questions that preceded the production microblock
+codec. Current commitments are defined by
+[b3-flowmesh-v1-production.md](b3-flowmesh-v1-production.md) and the decision
+register; this list is not an open release gate.
 
 Before implementation, specify whether a microblock commits to:
 
@@ -934,44 +1020,30 @@ Do not start v1 by inventing threshold encryption, speculative BFT, new signatur
 
 Public actions and deterministic certification are acceptable for the first functional version. Encryption/commit-reveal may later be required for market fairness after a concrete last-look/MEV analysis, but it must be introduced as its own reviewed protocol upgrade.
 
-## 7. Current build order
+## 7. Current release order
 
-The present execution order is:
+The reconciled execution order is:
 
 ```text
-1. Freeze the accepted transition corridor except for critical bugs.
-
-2. Complete minimal usable Modern PoS v1.
-
-3. Production-activate typed Asset Policies and conservation.
-
-4. Finalize historical PoD -> FN claim specification and implementation.
-
-5. Lock modern FN PoD encoding and implement modern on-chain FN ownership.
-
-6. Build the active FN registry/seat lifecycle needed by microblocks.
-
-7. Build and adversarially test a standalone deterministic FlowMesh spot harness
-   with TEST_USDT.
-
-8. Integrate deposits and keyless DEX_VAULT withdrawals with the B3 UTXO layer.
-
-9. Specify and implement FN-produced/certified microblocks and B3 anchoring.
-
-10. Enable TEST_USDT fee accounting/distribution under explicit test rules.
-
-11. Add futures support within the locked 10× maximum (every mechanic —
-    margin mode, PnL treatment, mark price, liquidation — is an OPEN
-    owner decision to be made before this step).
-
-12. Design/activate real stablecoin bridges and approved real fee AssetIds later.
+1. Seal H; independently reproduce and pin X, R0, and the FN manifest.
+2. Rehearse and ship the transition release with fail-closed A1/A2/A3 gates.
+3. Activate modern FN PoD at A1.
+4. Activate simple assets plus FlowMesh seat/vault preparation at A2.
+5. Activate FlowMesh v1 spot at A3; each market still waits for its unique
+   earliest eligible epoch-zero anchor to become 30-deep.
+6. Activate bridge-backed bUSD only after independent review of its implemented
+   consensus mint/burn, proof-carrier and replay state, plus adapter,
+   operator-redemption, audit, and production readiness-pin gates.
+7. Test and ship later FlowMesh expansion; futures follow spot and retain the
+   locked 10× maximum while every other mechanic remains undecided.
 ```
 
-This order provides the full end-state as context while giving Claude only one current implementation task at a time.
+This order keeps bridge readiness independent from A3 and does not defer the
+working spot product to the expansion release.
 
-## 8. Reported implementation state — verify before relying on it
+## 8. Historical implementation snapshot — superseded; verify current status
 
-Reported milestones from earlier project sessions include:
+The following is a historical snapshot from earlier project sessions:
 
 - legacy consensus port and transition machinery;
 - modern block identity/codec separation;
@@ -982,7 +1054,7 @@ Reported milestones from earlier project sessions include:
 - restart, reindex, and independent-node equality for that synthetic scenario;
 - asset models and tests behind test-only activation;
 - corrected authentic historical PoD testing;
-- FlowMesh ledger/curve/batch/vault models, not fully wired to production validation.
+- FlowMesh ledger/curve/batch/vault models before production wiring.
 
 Reported reference commits included `a8ad010` for an earlier integrated stack and `5de6b75` for the full evolution scenario. These references may be stale. The current branch, HEAD, later commits, working tree, build, and test status must be audited from the repository before new work.
 
@@ -999,9 +1071,9 @@ The following are superseded or explicitly rejected:
 - FN Coin automatically adding B3 PoS weight.
 - Making every DEX trade a UTXO transaction.
 - A private key or committee multisig controlling the DEX vault.
-- FlowMesh trading fees silently paid in native B3.
+- FlowMesh trading fees paid in an asset other than native B3.
 - Accepting an asset as USDC/USDT by display name or ticker alone.
-- Starting with real USDT/USDC before TEST_USDT and deterministic asset rules.
+- Activating real bridge-backed assets before their proof/readiness gates.
 - Starting leverage before spot trading works.
 - Starting with cross margin, funding, ADL, or portfolio margin.
 - Choosing `last_trade_price` or clearing price as the production mark oracle without a protocol decision.
@@ -1013,9 +1085,12 @@ The following are superseded or explicitly rejected:
 - A pre-H mixed-transaction/declaration bootstrap model; it was superseded by the 1,000-block modern-format transition-PoW corridor.
 - Calling the first valid H+1001 block the whole of Modern PoS v1 while omitting liveness recovery.
 
-## 10. Open decision register
+## 10. Historical open-decision register — superseded where later rulings exist
 
-Claude must keep these visible and unresolved until the project owner approves exact answers:
+This section records the questions in the original handoff. It is historical,
+not a current blocker list. Use `b3-open-decisions.md`,
+`b3-fn-assets-activation-design.md`, and `b3-flowmesh-v1-production.md` for the
+current resolved/open state.
 
 ### FN / PoD
 
@@ -1123,7 +1198,7 @@ report with these sections:
    - active FN registry;
    - FlowMesh ledger/clearing/vault;
    - microblocks and B3 anchoring;
-   - TEST_USDT fees;
+   - native-B3 FlowMesh fees;
    - leverage.
 5. Every older implementation or document that reflects a SUPERSEDED idea.
 6. Every OPEN decision that currently blocks safe implementation.

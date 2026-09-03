@@ -9,6 +9,7 @@
 #include <arith_uint256.h>
 #include <chain.h>
 #include <consensus/block_codec.h>
+#include <consensus/boundary.h>
 #include <consensus/era.h>
 #include <consensus/params.h>
 #include <legacy/codec.h>
@@ -22,6 +23,8 @@
 #include <kernel/notifications_interface.h>
 #include <kernel/types.h>
 #include <legacy/consensus.h>
+#include <modern/pos.h>
+#include <modern/pos_v1.h>
 #include <pow.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
@@ -66,9 +69,50 @@ static constexpr uint8_t DB_BLOCK_INDEX{'b'};
 static constexpr uint8_t DB_FLAG{'F'};
 static constexpr uint8_t DB_REINDEX_FLAG{'R'};
 static constexpr uint8_t DB_LAST_BLOCK{'l'};
+// Versioned sidecar for the branch-local cumulative modern FN issuance count.
+// Kept outside CDiskBlockIndex so existing block-index records remain readable.
+static constexpr uint8_t DB_FN_POD_ISSUED_TOTAL{'N'};
 // Keys used in previous version that might still be found in the DB:
 // BlockTreeDB::DB_TXINDEX_BLOCK{'T'};
 // BlockTreeDB::DB_TXINDEX{'t'}
+
+namespace {
+
+struct FnPodIssuedTotalKey {
+    uint32_t height{0};
+    uint256 block_hash{};
+
+    FnPodIssuedTotalKey() = default;
+    explicit FnPodIssuedTotalKey(const CBlockIndex& index)
+        : height{static_cast<uint32_t>(index.nHeight)}, block_hash{index.GetBlockHash()}
+    {
+        assert(index.nHeight >= 0);
+    }
+
+    SERIALIZE_METHODS(FnPodIssuedTotalKey, obj)
+    {
+        uint8_t prefix{DB_FN_POD_ISSUED_TOTAL};
+        READWRITE(prefix);
+        if (prefix != DB_FN_POD_ISSUED_TOTAL) {
+            throw std::ios_base::failure("invalid modern FN issuance sidecar key prefix");
+        }
+        READWRITE(obj.height, obj.block_hash);
+    }
+};
+
+struct FnPodIssuedTotalDisk {
+    static constexpr uint8_t FORMAT_VERSION{1};
+
+    uint8_t version{FORMAT_VERSION};
+    uint32_t issued_total{0};
+
+    SERIALIZE_METHODS(FnPodIssuedTotalDisk, obj)
+    {
+        READWRITE(obj.version, obj.issued_total);
+    }
+};
+
+} // namespace
 // BlockTreeDB::ReadFlag("txindex")
 
 bool BlockTreeDB::ReadBlockFileInfo(int nFile, CBlockFileInfo& info)
@@ -104,6 +148,10 @@ void BlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFi
     batch.Write(DB_LAST_BLOCK, nLastFile);
     for (const CBlockIndex* bi : blockinfo) {
         batch.Write(std::make_pair(DB_BLOCK_INDEX, bi->GetBlockHash()), CDiskBlockIndex{bi});
+        if (bi->m_fn_pod_issued_total_known) {
+            batch.Write(FnPodIssuedTotalKey{*bi},
+                        FnPodIssuedTotalDisk{.issued_total = bi->m_fn_pod_issued_total});
+        }
     }
     WriteBatch(batch, true);
 }
@@ -164,51 +212,6 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->nStatus        = diskindex.nStatus;
                 pindexNew->nTx            = diskindex.nTx;
 
-                // Proof validation at load is selected by the block's
-                // consensus PHASE, never by a two-state era assumption:
-                //  - LEGACY_POS: a stored legacy header can be header-only,
-                //    so its PoW/PoS type is not knowable after restart; full
-                //    PoW blocks and PoS kernels are revalidated on connect.
-                //  - TRANSITION_POW: the corridor's proof is the historical
-                //    B3 scrypt eligibility hash against the header's nBits
-                //    (block identity stays the modern SHA256d hash and is
-                //    deliberately NOT what is checked here).
-                //  - MODERN_POS: with the V1 rule set configured there is
-                //    no proof-of-work at all — nBits is the enforced
-                //    sentinel and validity is stake eligibility, re-judged
-                //    at connect; only the sentinel is re-checked here. With
-                //    no rule set configured the stock SHA256d check remains
-                //    the placeholder.
-                switch (Consensus::GetConsensusPhase(pindexNew->nHeight, consensusParams)) {
-                case Consensus::ConsensusPhase::LEGACY_POS:
-                    break;
-                case Consensus::ConsensusPhase::TRANSITION_POW: {
-                    CBlockHeader header;
-                    header.nVersion = diskindex.nVersion;
-                    header.hashPrevBlock = diskindex.hashPrev;
-                    header.hashMerkleRoot = diskindex.hashMerkleRoot;
-                    header.nTime = diskindex.nTime;
-                    header.nBits = diskindex.nBits;
-                    header.nNonce = diskindex.nNonce;
-                    if (!CheckTransitionPowEligibility(header)) {
-                        LogError("%s: transition scrypt eligibility failed: %s\n", __func__, pindexNew->ToString());
-                        return false;
-                    }
-                    break;
-                }
-                case Consensus::ConsensusPhase::MODERN_POS:
-                    if (consensusParams.modern_pos) {
-                        if (pindexNew->nBits != consensusParams.modern_pos->sentinel_bits) {
-                            LogError("%s: modern-PoS sentinel nBits mismatch: %s\n", __func__, pindexNew->ToString());
-                            return false;
-                        }
-                    } else if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
-                        LogError("%s: CheckProofOfWork failed: %s\n", __func__, pindexNew->ToString());
-                        return false;
-                    }
-                    break;
-                }
-
                 pcursor->Next();
             } else {
                 LogError("%s: failed to read value\n", __func__);
@@ -217,6 +220,60 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
         } else {
             break;
         }
+    }
+
+    // Load the optional FN issuance sidecars only after every regular block
+    // index entry has been materialized. Calling insertBlockIndex now therefore
+    // returns the existing branch entry. Including the height in the sidecar
+    // key lets us reject an orphan/stale record instead of accidentally
+    // accepting a newly inserted default CBlockIndex.
+    pcursor->Seek(DB_FN_POD_ISSUED_TOTAL);
+    while (pcursor->Valid()) {
+        if (interrupt) return false;
+
+        uint8_t prefix{0};
+        if (!pcursor->GetKey(prefix)) {
+            LogError("%s: failed to read modern FN issuance sidecar key prefix\n", __func__);
+            return false;
+        }
+        if (prefix != DB_FN_POD_ISSUED_TOTAL) break;
+
+        FnPodIssuedTotalKey key;
+        FnPodIssuedTotalDisk value;
+        if (!pcursor->GetKey(key)) {
+            LogError("%s: failed to read modern FN issuance sidecar key\n", __func__);
+            return false;
+        }
+        if (!pcursor->GetValue(value)) {
+            LogError("%s: failed to read modern FN issuance sidecar value for %s\n",
+                     __func__, key.block_hash.ToString());
+            return false;
+        }
+        if (value.version != FnPodIssuedTotalDisk::FORMAT_VERSION) {
+            LogError("%s: unsupported modern FN issuance sidecar version %u for %s\n",
+                     __func__, value.version, key.block_hash.ToString());
+            return false;
+        }
+
+        CBlockIndex* pindex{insertBlockIndex(key.block_hash)};
+        const bool is_loaded_genesis{
+            key.height == 0 && key.block_hash == consensusParams.hashGenesisBlock};
+        if (!pindex || pindex->nHeight < 0 ||
+            static_cast<uint32_t>(pindex->nHeight) != key.height ||
+            (key.height == 0 && !is_loaded_genesis)) {
+            LogError("%s: modern FN issuance sidecar has no matching block-index entry: height=%u hash=%s\n",
+                     __func__, key.height, key.block_hash.ToString());
+            return false;
+        }
+        if (pindex->m_fn_pod_issued_total_known &&
+            pindex->m_fn_pod_issued_total != value.issued_total) {
+            LogError("%s: conflicting modern FN issuance sidecar for %s\n",
+                     __func__, key.block_hash.ToString());
+            return false;
+        }
+        pindex->m_fn_pod_issued_total = value.issued_total;
+        pindex->m_fn_pod_issued_total_known = true;
+        pcursor->Next();
     }
 
     return true;
@@ -597,6 +654,23 @@ CBlockIndex* BlockManager::InsertBlockIndex(const uint256& hash)
 
 bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockhash)
 {
+    // Bridge v1 deliberately rebuilds its Ethereum light-client, execution
+    // anchors, nullifiers, epoch caps and withdrawal requests from the active
+    // block history. Until that state has an atomic durable sidecar, pruning
+    // any bridge-active block would make a later restart unable to validate.
+    // Fail at startup instead of accepting a configuration that can strand
+    // the node. Production mainnet is unaffected while its bridge envelope is
+    // incomplete and therefore fail-closed.
+    const Consensus::Params& consensus{GetConsensus()};
+    if (IsPruneMode() && consensus.busd_bridge &&
+        Consensus::BridgeMintParamsReady(*consensus.busd_bridge)) {
+        m_opts.notifications.fatalError(Untranslated(
+            "The configured B3 bridge requires complete, unpruned block "
+            "history. Restart without -prune; bridge prune support requires "
+            "a durable bridge-state sidecar."));
+        return false;
+    }
+
     if (!m_block_tree_db->LoadBlockIndexGuts(
             GetConsensus(), [this](const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return this->InsertBlockIndex(hash); }, m_interrupt)) {
         return false;
@@ -609,6 +683,24 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
             return false;
         }
         const AssumeutxoData& au_data = *Assert(maybe_au_data);
+        const bool skips_fn_genesis{
+            consensus.fn_genesis_required && consensus.hard_fork_height &&
+            au_data.height >= *consensus.hard_fork_height};
+        const bool skips_fn_pod{
+            consensus.fn_pod_activation_height &&
+            au_data.height >= *consensus.fn_pod_activation_height};
+        const bool skips_bridge_history{
+            Consensus::BridgeRulesActive(au_data.height, consensus)};
+        if (consensus.legacy_b3coin &&
+            (skips_fn_genesis || skips_fn_pod || skips_bridge_history)) {
+            m_opts.notifications.fatalError(Untranslated(
+                "B3 AssumeUTXO snapshots at or after mandatory FN Genesis or "
+                "modern FN PoD/bridge activation are unsupported because FN "
+                "configuration, issuance state, and bridge light-client/"
+                "nullifier/mint-cap state are not committed by the snapshot "
+                "metadata."));
+            return false;
+        }
         m_snapshot_height = au_data.height;
         CBlockIndex* base{LookupBlockIndex(*snapshot_blockhash)};
 
@@ -626,7 +718,12 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
 
     Assert(m_snapshot_height.has_value() == snapshot_blockhash.has_value());
 
-    // Calculate nChainWork
+    // Rebuild skip pointers in height order before performing any ancestry
+    // queries below. In particular, IsAnchorIneligible() asks the legacy
+    // boundary anchor for an ancestor at every historical height. Leaving the
+    // anchor's skip pointers empty until its own turn in the loop makes those
+    // queries walk back from the anchor one block at a time, turning startup
+    // into quadratic work on a long pinned history.
     std::vector<CBlockIndex*> vSortedByHeight{GetAllBlockIndices()};
     std::sort(vSortedByHeight.begin(), vSortedByHeight.end(),
               CBlockIndexHeightOnlyComparator());
@@ -639,6 +736,147 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
             return false;
         }
         previous_index = pindex;
+
+        if (consensus.legacy_b3coin && pindex->nHeight > 0 &&
+            (pindex->pprev == nullptr ||
+             pindex->pprev->nHeight != pindex->nHeight - 1)) {
+            LogError("%s: B3 block index has an invalid parent height: %s\n",
+                     __func__, pindex->ToString());
+            return false;
+        }
+
+        if (pindex->pprev) pindex->BuildSkip();
+    }
+
+    // Calculate nChainWork and restore the remaining derived index state.
+    for (CBlockIndex* pindex : vSortedByHeight) {
+        if (m_interrupt) return false;
+        if (consensus.legacy_b3coin && pindex->nHeight > 0) {
+            Assert(pindex->pskip);
+        }
+
+        // Parent-dependent deterministic transition rules cannot be checked
+        // while LevelDB entries are read in hash order. Validate them now that
+        // every entry is materialized and the index is sorted by height.
+        //
+        // A block-index database is a tree, not just the active chain. Old
+        // pre-pin databases can legitimately contain a competing block at H,
+        // and failed side branches can contain headers rejected by a newer
+        // beta. Those records must not make the whole node unstartable. The
+        // finalized-X topology already gives them the persistent
+        // BLOCK_ANCHOR_INELIGIBLE classification; other newly-invalid stored
+        // headers are quarantined with BLOCK_FAILED_VALID. Descendants inherit
+        // that status below and neither class can enter best-header or
+        // chain-candidate selection. An active coins tip which depends on a
+        // newly failed entry is rejected separately by LoadChainTip().
+        if (pindex->nStatus & BLOCK_FAILED_CHILD) {
+            // BLOCK_FAILED_CHILD is deprecated, but may still exist on disk.
+            pindex->nStatus =
+                (pindex->nStatus & ~BLOCK_FAILED_CHILD) | BLOCK_FAILED_VALID;
+            m_dirty_blockindex.insert(pindex);
+        }
+        if (!(pindex->nStatus & BLOCK_FAILED_VALID) && pindex->pprev &&
+            (pindex->pprev->nStatus & BLOCK_FAILED_VALID)) {
+            // All descendants of invalid blocks are invalid too.
+            pindex->nStatus |= BLOCK_FAILED_VALID;
+            m_dirty_blockindex.insert(pindex);
+        }
+
+        if (!(pindex->nStatus & BLOCK_ANCHOR_INELIGIBLE) &&
+            IsAnchorIneligible(*pindex)) {
+            // Competing pre-pin history is retained and serveable, but can
+            // never influence fork choice after X is pinned.
+            pindex->nStatus |= BLOCK_ANCHOR_INELIGIBLE;
+            m_dirty_blockindex.insert(pindex);
+        }
+
+        const bool eligible_for_selection{
+            !(pindex->nStatus &
+              (BLOCK_FAILED_VALID | BLOCK_ANCHOR_INELIGIBLE))};
+        // Non-B3 networks retain the ordinary stored-header proof check from
+        // LoadBlockIndexGuts(). B3 defers proof selection until this
+        // height-sorted pass because its legacy, transition-PoW, and modern
+        // PoS phases require different rules and, in two phases, the parent.
+        // A corrupt non-B3 block-index record must still make startup fail
+        // closed rather than becoming selectable without valid proof of work.
+        if (!consensus.legacy_b3coin &&
+            !CheckProofOfWork(pindex->GetBlockHash(), pindex->nBits,
+                              consensus)) {
+            LogError("%s: CheckProofOfWork failed: %s\n", __func__,
+                     pindex->ToString());
+            return false;
+        }
+        if (consensus.legacy_b3coin && eligible_for_selection) {
+            const CBlockHeader header{pindex->GetBlockHeader()};
+            std::string invalid_reason;
+
+            if (!Consensus::HasExpectedB3BlockCodec(
+                    header.nVersion, pindex->nHeight, consensus)) {
+                invalid_reason = "B3 block codec does not match stored height";
+            } else if (Consensus::CheckLegacyBoundaryHeader(
+                           header, pindex->nHeight, consensus) !=
+                       Consensus::BoundaryCheck::OK) {
+                invalid_reason = "block violates the pinned legacy boundary";
+            } else {
+                // Proof validation is selected by consensus phase. The
+                // physical future-clock bound is intentionally not repeated
+                // at restart: only deterministic rules belong here.
+                const Consensus::ConsensusPhase phase{
+                    Consensus::GetConsensusPhase(pindex->nHeight, consensus)};
+                if (phase == Consensus::ConsensusPhase::TRANSITION_POW) {
+                    if (!consensus.transition_pow_bits ||
+                        !IsCanonicalCompactBits(
+                            *consensus.transition_pow_bits)) {
+                        LogError("%s: transition corridor rules are not configured canonically\n",
+                                 __func__);
+                        return false;
+                    }
+                    if (header.nBits != *consensus.transition_pow_bits) {
+                        invalid_reason = "transition corridor nBits mismatch";
+                    } else if (!CheckTransitionPowEligibility(header)) {
+                        invalid_reason =
+                            "transition corridor scrypt eligibility failed";
+                    } else if (pindex->pprev == nullptr ||
+                               header.GetBlockTime() <
+                                   pindex->pprev->GetBlockTime() +
+                                       consensus.transition_pow_min_spacing) {
+                        invalid_reason =
+                            "transition corridor timestamp is too early";
+                    }
+                } else if (phase ==
+                           Consensus::ConsensusPhase::MODERN_POS) {
+                    if (consensus.modern_pos) {
+                        if (header.nBits !=
+                            consensus.modern_pos->sentinel_bits) {
+                            invalid_reason =
+                                "modern-PoS sentinel nBits mismatch";
+                        } else if (header.nNonce != 0) {
+                            invalid_reason = "modern-PoS nNonce is not zero";
+                        } else if (pindex->pprev == nullptr ||
+                                   !modern::DecodeModernPosRound(
+                                       pindex->pprev->GetBlockTime(),
+                                       header.GetBlockTime(),
+                                       *consensus.modern_pos)) {
+                            invalid_reason =
+                                "modern-PoS timestamp is not an exact round";
+                        }
+                    } else if (!CheckProofOfWork(
+                                   pindex->GetBlockHash(), pindex->nBits,
+                                   consensus)) {
+                        invalid_reason = "proof of work failed";
+                    }
+                }
+            }
+
+            if (!invalid_reason.empty()) {
+                LogWarning("%s: quarantining stored B3 side branch at height %d hash=%s: %s\n",
+                           __func__, pindex->nHeight,
+                           pindex->GetBlockHash().ToString(), invalid_reason);
+                pindex->nStatus |= BLOCK_FAILED_VALID;
+                m_dirty_blockindex.insert(pindex);
+            }
+        }
+
         pindex->nChainWork = (pindex->pprev ? pindex->pprev->nChainWork : 0) + GetBlockProof(*pindex);
         pindex->nTimeMax = (pindex->pprev ? std::max(pindex->pprev->nTimeMax, pindex->nTime) : pindex->nTime);
 
@@ -661,21 +899,6 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
             } else {
                 pindex->m_chain_tx_count = pindex->nTx;
             }
-        }
-
-        if (pindex->nStatus & BLOCK_FAILED_CHILD) {
-            // BLOCK_FAILED_CHILD is deprecated, but may still exist on disk. Replace it with BLOCK_FAILED_VALID.
-            pindex->nStatus = (pindex->nStatus & ~BLOCK_FAILED_CHILD) | BLOCK_FAILED_VALID;
-            m_dirty_blockindex.insert(pindex);
-        }
-        if (!(pindex->nStatus & BLOCK_FAILED_VALID) && pindex->pprev && (pindex->pprev->nStatus & BLOCK_FAILED_VALID)) {
-            // All descendants of invalid blocks are invalid too.
-            pindex->nStatus |= BLOCK_FAILED_VALID;
-            m_dirty_blockindex.insert(pindex);
-        }
-
-        if (pindex->pprev) {
-            pindex->BuildSkip();
         }
     }
 
@@ -1286,7 +1509,17 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
 bool BlockManager::ReadBlock(CBlock& block, const CBlockIndex& index) const
 {
     const FlatFilePos block_pos{WITH_LOCK(cs_main, return index.GetBlockPos())};
-    return ReadBlock(block, block_pos, index.GetBlockHash(), index.nHeight);
+    const std::optional<int> expected_height{WITH_LOCK(
+        cs_main, return index.nStatus & BLOCK_ANCHOR_INELIGIBLE
+                            ? std::optional<int>{}
+                            : std::optional<int>{index.nHeight})};
+    // An old active branch may extend past the boundary before X was pinned.
+    // Its stored H+1 block legitimately uses the legacy codec and therefore
+    // the legacy identity domain, even though H+1 is modern under the newly
+    // installed rules. It is read only so the undo-backed off-anchor recovery
+    // can discard it. Use the block's immutable codec marker for that stored
+    // side history; canonical blocks keep the height-selected identity check.
+    return ReadBlock(block, block_pos, index.GetBlockHash(), expected_height);
 }
 
 BlockManager::ReadRawBlockResult BlockManager::ReadRawBlock(const FlatFilePos& pos, std::optional<std::pair<size_t, size_t>> block_part) const

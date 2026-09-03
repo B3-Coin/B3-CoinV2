@@ -18,7 +18,6 @@
 #include <kernel/cs_main.h>
 #include <logging.h>
 #include <node/context.h>
-#include <node/flowmesh_dev.h>
 #include <rpc/server.h>
 #include <rpc/server_util.h>
 #include <rpc/util.h>
@@ -27,7 +26,6 @@
 #include <univalue.h>
 #include <util/any.h>
 #include <util/check.h>
-#include <util/strencodings.h>
 #include <util/time.h>
 
 #include <cstdint>
@@ -413,86 +411,6 @@ static RPCHelpMan getindexinfo()
     };
 }
 
-static std::string FlowMeshHaltToString(const flowmesh::MeshHalt halt)
-{
-    switch (halt) {
-    case flowmesh::MeshHalt::NONE: return "none";
-    case flowmesh::MeshHalt::INVALID_CONFIG: return "invalid_config";
-    case flowmesh::MeshHalt::PERSIST_FAILED: return "persist_failed";
-    case flowmesh::MeshHalt::LOCK_JOURNAL_FAILED: return "lock_journal_failed";
-    case flowmesh::MeshHalt::ANCHOR_INVALIDATED: return "anchor_invalidated";
-    case flowmesh::MeshHalt::CERTIFICATE_CONFLICT: return "certificate_conflict";
-    }
-    return "unknown";
-}
-
-static RPCHelpMan getflowmeshinfo()
-{
-    return RPCHelpMan{
-        "getflowmeshinfo",
-        "Report the state of the REGTEST-ONLY FlowMesh dev validator spike (-b3flowmeshdev).\n"
-        "Hidden development RPC; fails unless the dev validator is running.\n",
-        {},
-        RPCResult{
-            RPCResult::Type::OBJ, "", "", {
-                {RPCResult::Type::BOOL, "running", "Whether the dev validator runtime exists"},
-                {RPCResult::Type::STR, "halt", "MeshNode halt state (none = healthy)"},
-                {RPCResult::Type::STR_HEX, "domain", "FlowMesh domain id"},
-                {RPCResult::Type::STR_HEX, "vault_commitment", "Synthetic dev vault commitment"},
-                {RPCResult::Type::STR_HEX, "base_asset", "Synthetic dev base asset id"},
-                {RPCResult::Type::STR_HEX, "quote_asset", "Quote asset id (native)"},
-                {RPCResult::Type::STR_HEX, "execution_config_id", "Derived market/execution configuration id"},
-                {RPCResult::Type::STR_HEX, "seat", "The single dev seat's x-only public key"},
-                {RPCResult::Type::NUM, "threshold", "Certificate threshold"},
-                {RPCResult::Type::NUM, "sequence", "Next microblock sequence (committed log length)"},
-                {RPCResult::Type::STR_HEX, "last_hash", "Last committed microblock hash (all-zero before the first)"},
-                {RPCResult::Type::STR_HEX, "state_root", "Current FlowMesh state root"},
-                {RPCResult::Type::NUM, "committed_anchors", "Number of B3 anchors committed history relies on"},
-                {RPCResult::Type::OBJ, "current_anchor", "The anchor a proposer would use now (null ref if the chain is shorter than the anchor depth)", {
-                    {RPCResult::Type::NUM, "height", "Anchor height (-1 for the null anchor)"},
-                    {RPCResult::Type::STR_HEX, "hash", "Anchor block hash"},
-                }},
-                {RPCResult::Type::STR, "store_path", "Durable certified-log store directory"},
-            },
-        },
-        RPCExamples{HelpExampleCli("getflowmeshinfo", "")},
-        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
-{
-    const NodeContext& node_context{EnsureAnyNodeContext(request.context)};
-    node::FlowMeshDevRuntime* dev{node_context.flowmesh_dev.get()};
-    if (dev == nullptr) {
-        throw JSONRPCError(RPC_MISC_ERROR,
-                           "FlowMesh dev validator is not running (regtest-only; start with -b3flowmeshdev)");
-    }
-    UniValue result(UniValue::VOBJ);
-    result.pushKV("running", true);
-    {
-        LOCK(dev->mutex);
-        const flowmesh::MeshNode& mesh{*Assert(dev->runtime.mesh_node)};
-        result.pushKV("halt", FlowMeshHaltToString(mesh.Halt()));
-        result.pushKV("domain", dev->domain.GetHex());
-        result.pushKV("vault_commitment", dev->vault_commitment.GetHex());
-        result.pushKV("base_asset", dev->base_asset.GetHex());
-        result.pushKV("quote_asset", dev->quote_asset.GetHex());
-        result.pushKV("execution_config_id", dev->config_id.GetHex());
-        result.pushKV("seat", HexStr(dev->seat));
-        result.pushKV("threshold", static_cast<uint64_t>(dev->threshold));
-        result.pushKV("sequence", mesh.Sequence());
-        result.pushKV("last_hash", mesh.LastHash().GetHex());
-        result.pushKV("state_root", mesh.State().Root().GetHex());
-        result.pushKV("committed_anchors", static_cast<uint64_t>(mesh.CommittedAnchors().size()));
-    }
-    const flowmesh::AnchorRef anchor{dev->anchors->Current()};
-    UniValue anchor_obj(UniValue::VOBJ);
-    anchor_obj.pushKV("height", anchor.height);
-    anchor_obj.pushKV("hash", anchor.hash.GetHex());
-    result.pushKV("current_anchor", std::move(anchor_obj));
-    result.pushKV("store_path", fs::PathToString(dev->store_path));
-    return result;
-},
-    };
-}
-
 void RegisterNodeRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -504,7 +422,6 @@ void RegisterNodeRPCCommands(CRPCTable& t)
         {"hidden", &echo},
         {"hidden", &echojson},
         {"hidden", &echoipc},
-        {"hidden", &getflowmeshinfo},
     };
     for (const auto& c : commands) {
         t.appendCommand(c.name, &c);

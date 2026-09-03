@@ -60,6 +60,8 @@ public:
     //! Canonical decode of exactly 48 compressed bytes (see header comment).
     static std::optional<PublicKey> Decode(std::span<const unsigned char> bytes);
     const std::array<unsigned char, PUBKEY_SIZE>& Compressed() const { return m_bytes; }
+    //! EIP-2537 G1 encoding: two 64-byte, zero-left-padded field elements.
+    std::array<unsigned char, 128> Eip2537Uncompressed() const;
     friend bool operator==(const PublicKey& a, const PublicKey& b) { return a.m_bytes == b.m_bytes; }
     friend bool operator<(const PublicKey& a, const PublicKey& b) { return a.m_bytes < b.m_bytes; }
 
@@ -78,6 +80,8 @@ class Signature
 public:
     static std::optional<Signature> Decode(std::span<const unsigned char> bytes);
     const std::array<unsigned char, SIGNATURE_SIZE>& Compressed() const { return m_bytes; }
+    //! EIP-2537 G2 encoding: four 64-byte, zero-left-padded field elements.
+    std::array<unsigned char, 256> Eip2537Uncompressed() const;
     friend bool operator==(const Signature& a, const Signature& b) { return a.m_bytes == b.m_bytes; }
 
 private:

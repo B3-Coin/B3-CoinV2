@@ -420,19 +420,22 @@ class WalletTXO
 {
 private:
     const CWalletTx& m_wtx;
-    const CTxOut& m_output;
+    uint32_t m_output_index;
 
 public:
-    WalletTXO(const CWalletTx& wtx, const CTxOut& output)
+    WalletTXO(const CWalletTx& wtx, uint32_t output_index)
     : m_wtx(wtx),
-    m_output(output)
+    m_output_index(output_index)
     {
-        Assume(std::ranges::find(wtx.tx->vout, output) != wtx.tx->vout.end());
+        Assume(output_index < wtx.tx->vout.size());
     }
 
     const CWalletTx& GetWalletTx() const { return m_wtx; }
 
-    const CTxOut& GetTxOut() const { return m_output; }
+    // Resolve through the wallet transaction on every access. A same-txid
+    // update may replace wtx.tx with a witness/MPA-enriched transaction; a
+    // reference into the previous vout vector would then dangle.
+    const CTxOut& GetTxOut() const { return m_wtx.tx->vout.at(m_output_index); }
 };
 } // namespace wallet
 

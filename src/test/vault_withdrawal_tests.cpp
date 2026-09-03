@@ -93,10 +93,12 @@ modern::ModernOutput VaultOut(const modern::AssetId& asset, const CAmount amount
 
 //! A USER_DEPOSIT-kind vault output (carries a FlowMesh account id).
 modern::ModernOutput UserDepositOut(const modern::AssetId& asset, const CAmount amount,
-                                    const uint256& account, const uint16_t shard = 0)
+                                    const uint256& account)
 {
+    const uint16_t shard{modern::FlowMeshUserDepositShard(VAULT, account)};
     modern::ModernOutput out{VaultOut(asset, amount, shard)};
-    out.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_USER_DEPOSIT, shard, account);
+    out.policy_params = modern::MakeVaultParams(modern::VAULT_KIND_USER_DEPOSIT,
+                                                shard, account);
     return out;
 }
 
@@ -179,8 +181,14 @@ BOOST_AUTO_TEST_CASE(keyless_receipt_authorized_partial_withdrawal)
         prevs, {ID1}, {OwnerOut(Asset(), 400, DEST_A), VaultOut(Asset(), 600, /*shard=*/1)})};
 
     // The vault spend carries no key material: its proof is only the
-    // receipt list, structurally valid under the generic dispatcher.
-    BOOST_CHECK(modern::VerifyTransitionProofs(prevs, t, /*assets_active=*/true) == modern::ProofCheck::OK);
+    // receipt list. Colored-asset activation alone must never activate the
+    // dormant DEX policy; this test-only suite opts into the vault gate
+    // independently.
+    BOOST_CHECK(modern::VerifyTransitionProofs(prevs, t, /*assets_active=*/true) ==
+                modern::ProofCheck::UNKNOWN_POLICY);
+    BOOST_CHECK(modern::VerifyTransitionProofs(prevs, t, /*assets_active=*/true,
+                                               /*dex_vault_active=*/true) ==
+                modern::ProofCheck::OK);
 
     std::vector<uint256> consumed;
     BOOST_CHECK(modern::CheckVaultWithdrawal(prevs, t, receipts, MODERN_HEIGHT, params,
@@ -368,7 +376,7 @@ BOOST_AUTO_TEST_CASE(change_is_pool_change_never_a_user_deposit)
 
     // One USER_DEPOSIT-kind input (Alice's deposit) and one pool-change
     // input spend together; change comes back as POOL_CHANGE: OK.
-    const std::vector<modern::ModernOutput> prevs{UserDepositOut(Asset(), 700, account, 1),
+    const std::vector<modern::ModernOutput> prevs{UserDepositOut(Asset(), 700, account),
                                                   VaultOut(Asset(), 300, 2)};
     std::vector<uint256> consumed;
     BOOST_CHECK(modern::CheckVaultWithdrawal(
@@ -378,7 +386,7 @@ BOOST_AUTO_TEST_CASE(change_is_pool_change_never_a_user_deposit)
     // The same spend returning change as a USER_DEPOSIT is refused.
     BOOST_CHECK(modern::CheckVaultWithdrawal(
                     prevs,
-                    Withdrawal(prevs, {rid}, {OwnerOut(Asset(), 400, DEST_A), UserDepositOut(Asset(), 600, account, 5)}),
+                    Withdrawal(prevs, {rid}, {OwnerOut(Asset(), 400, DEST_A), UserDepositOut(Asset(), 600, account)}),
                     receipts, MODERN_HEIGHT, params) == modern::VaultCheck::CHANGE_MISMATCH);
 }
 

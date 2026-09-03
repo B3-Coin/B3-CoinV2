@@ -22,11 +22,9 @@ class QTableView;
 QT_END_NAMESPACE
 
 /**
- * The multi-asset wallet page. Backed today by B3NativeAssetSource (real
- * native-B3 wallet data only); every action or balance a future
- * coloured-asset/FlowMesh backend would provide is shown as an honest
- * disabled/unavailable state. Swapping in a real B3AssetSource is the
- * only change a future backend needs.
+ * The multi-asset wallet page. B3NativeAssetSource provides real native B3,
+ * FN Coin, and coloured-asset wallet balances. Actions without an approved
+ * submission path remain honestly disabled.
  */
 class B3AssetsPage : public QWidget
 {
@@ -59,6 +57,8 @@ private:
     QSortFilterProxyModel* m_proxy{nullptr};
     B3AssetSource* m_owned_source{nullptr};
     bool m_have_wallet{false};
+    bool m_model_resetting{false};
+    QString m_selected_asset_id;
 
     QLineEdit* m_search{nullptr};
     QTableView* m_list{nullptr};
@@ -66,9 +66,11 @@ private:
 
     QLabel* m_detail_name{nullptr};
     QLabel* m_detail_status{nullptr};
+    QLabel* m_detail_id{nullptr};
     QLabel* m_detail_confirmed{nullptr};
     QLabel* m_detail_pending{nullptr};
     QLabel* m_detail_available{nullptr};
+    QLabel* m_detail_immature{nullptr};
     QLabel* m_detail_reserved{nullptr};
     QLabel* m_detail_flowmesh{nullptr};
     QPushButton* m_send{nullptr};

@@ -56,7 +56,9 @@ static bool g_bare_multi{DEFAULT_PERMIT_BAREMULTISIG};
 // flag space. Historical B3Coin's encoding profile is exercised separately
 // and is selected only by the legacy chain-validation path.
 static const auto GENERIC_SCRIPT_VERIFY_FLAGS = script_verify_flags::from_int(
-    MAX_SCRIPT_VERIFY_FLAGS & ~script_verify_flags{SCRIPT_VERIFY_LEGACY_B3_STRICTENC}.as_int());
+    MAX_SCRIPT_VERIFY_FLAGS &
+    ~script_verify_flags{SCRIPT_VERIFY_LEGACY_B3_STRICTENC}.as_int() &
+    ~script_verify_flags{SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL}.as_int());
 
 static const std::map<std::string, script_verify_flag_name>& mapFlagNames = ScriptFlagNamesToEnum();
 

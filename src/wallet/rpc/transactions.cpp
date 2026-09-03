@@ -405,6 +405,9 @@ static std::vector<RPCResult> TransactionDescriptionString()
            {RPCResult::Type::NUM_TIME, "time", "The transaction time expressed in " + UNIX_EPOCH_TIME + "."},
            {RPCResult::Type::NUM_TIME, "timereceived", "The time received expressed in " + UNIX_EPOCH_TIME + "."},
            {RPCResult::Type::STR, "comment", /*optional=*/true, "If a comment is associated with the transaction, only present if not empty."},
+           {RPCResult::Type::STR, "b3", /*optional=*/true, "B3 transaction purpose recorded by the wallet when the transaction was created."},
+           {RPCResult::Type::STR, "b3_network_fee", /*optional=*/true, "Native B3 network fee, encoded as a decimal string, recorded by the wallet when the transaction was created."},
+           {RPCResult::Type::STR, "b3_disintegration", /*optional=*/true, "Native B3 disintegration amount, encoded as a decimal string, recorded by the wallet when the transaction was created."},
            {RPCResult::Type::STR, "bip125-replaceable", "(\"yes|no|unknown\") Whether this transaction signals BIP125 replaceability or has an unconfirmed ancestor signaling BIP125 replaceability.\n"
                "May be unknown for unconfirmed transactions not in the mempool because their unconfirmed ancestors are unknown."},
            {RPCResult::Type::ARR, "parent_descs", /*optional=*/true, "Only if 'category' is 'received'. List of parent descriptors for the output script of this coin.", {

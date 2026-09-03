@@ -7,8 +7,6 @@
 
 #include <QDialog>
 
-class QCheckBox;
-
 #include <support/allocators/secure.h>
 
 class WalletModel;
@@ -40,7 +38,6 @@ public:
 
 private:
     Ui::AskPassphraseDialog *ui;
-    QCheckBox* m_staking_only_checkbox{nullptr};
     Mode mode;
     WalletModel* model{nullptr};
     bool fCapsLock{false};

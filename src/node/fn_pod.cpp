@@ -8,7 +8,6 @@
 #include <compat/endian.h>
 #include <consensus/era.h>
 #include <legacy/consensus.h>
-#include <modern/fn.h>
 #include <node/blockstorage.h>
 #include <primitives/block.h>
 #include <script/script.h>
@@ -486,18 +485,7 @@ PodCapacityReport BuildPodCapacityReport(const std::vector<PodRecord>& records)
         ++report.claimable;
         report.max_distinct_funding_scripts =
             std::max(report.max_distinct_funding_scripts, record.funding_scripts.size());
-        // The native carrier: the worst-case serialized FnClaimActionV1
-        // payload (modern/fn.h, the single source of truth) against the
-        // segregated proof-area bound. Measurement only — no validation.
-        const size_t payload{modern::WorstCaseFnClaimActionPayload(record.funding_scripts.size())};
-        report.max_action_payload = std::max(report.max_action_payload, payload);
-        if (payload <= modern::MAX_CREATION_ACTION_PAYLOAD) {
-            ++report.within_native_bound;
-        } else {
-            ++report.exceeding_native_bound;
-        }
     }
-    report.fits_native_action = report.exceeding_native_bound == 0;
     return report;
 }
 

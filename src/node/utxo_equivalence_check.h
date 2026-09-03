@@ -33,10 +33,8 @@ struct ReplayEquivalenceOptions {
     size_t max_mismatch_sample{20}; //!< bound on retained per-outpoint diagnostics
     //! Also derive the historical PoD report during the replay pass:
     //! every qualifying PoD through H, classified with the same single
-    //! interpretation as the node. The qualifying COUNT is the
-    //! meaningful pre-activation gate; the report's payload arithmetic
-    //! is a SUPERSEDED type-1 diagnostic (node/fn_pod.h
-    //! PodCapacityReport banner), not the type-2 activation gate.
+    //! interpretation as the node. The resulting records feed the
+    //! deterministic FN Genesis manifest builder after equivalence passes.
     bool derive_pod_report{false};
 };
 

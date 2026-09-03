@@ -31,6 +31,7 @@
 #include <variant>
 #include <vector>
 
+class CBlockIndex;
 class JSONRPCRequest;
 enum ServiceFlags : uint64_t;
 enum class OutputType;
@@ -39,6 +40,9 @@ struct bilingual_str;
 namespace common {
 enum class PSBTError;
 } // namespace common
+namespace Consensus {
+struct Params;
+} // namespace Consensus
 namespace node {
 enum class TransactionError;
 } // namespace node
@@ -523,10 +527,11 @@ std::vector<RPCResult> ScriptPubKeyDoc();
  * Get the target for a given block index.
  *
  * @param[in] blockindex    the block
- * @param[in] pow_limit     PoW limit (consensus parameter)
+ * @param[in] consensus     Consensus parameters selecting the legacy PoW
+ *                         limit or B3's modern nBits target/sentinel domain.
  *
  * @return  the target
  */
-uint256 GetTarget(const CBlockIndex& blockindex, uint256 pow_limit);
+uint256 GetTarget(const CBlockIndex& blockindex, const Consensus::Params& consensus);
 
 #endif // BITCOIN_RPC_UTIL_H

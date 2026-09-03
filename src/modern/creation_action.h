@@ -21,11 +21,12 @@ namespace modern {
  * (owner ruling 2026-08-17). Input proofs authorize spending a previous
  * output; a creation action authorizes CREATING one of the transition's
  * own outputs. This header carries only the generic frame and the
- * bounded collection codec. The LIVE FN issuance semantics (action type
- * 2) live in modern/legacy_fn_issuance.h; modern/fn.h carries the FN
- * data model plus the RESERVED superseded type-1 codec record. Both
- * depend on this header — never the reverse — and modern/proof.h
- * depends only on this neutral layer.
+ * bounded collection codec. Historical action types 1 and 2 are permanently
+ * reserved/superseded. Their numeric type/version pairs remain registered so
+ * they can never acquire new meaning, but their abandoned payload codecs and
+ * proof builders are not part of the live tree. The proof-free modern FN PoD
+ * declaration is type 6. Semantic layers depend on this header — never the
+ * reverse — and modern/proof.h depends only on this neutral layer.
  *
  * Registry of (action_type, action_version). Unknown pairs are INVALID,
  * never ignored — the strict section decoder rejects them outright, and
@@ -36,13 +37,13 @@ namespace modern {
  *
  *  - Type 1: the FN claim of the abandoned funding-signature design —
  *    RESERVED/SUPERSEDED (owner ruling 2026-08-17/18, conflict register
- *    C-R4). Its bytes and codec are preserved (modern/fn.h) so old
- *    bytes never acquire new meaning; it is UNSUPPORTED for FN issuance
- *    and the issuance path rejects it. Never reuse or reinterpret.
- *  - Type 2: the legacy FN issuance action — the one-time
- *    archival/historical issuance proof carrier (payload rules in
- *    modern/legacy_fn_issuance.h). Carries no funding-key signatures,
- *    no user claim authorization, no administrator authorization.
+ *    C-R4). Its numeric pair is reserved and permanently inactive. Never
+ *    reuse or reinterpret it.
+ *  - Type 2: the abandoned legacy FN proof carrier. RESERVED/SUPERSEDED;
+ *    historical FN units are created deterministically by the H+1 coinbase.
+ *  - Type 6: proof-free modern FN PoD creation. Its exact eight-byte payload
+ *    binds the priced modern slot and the amount-1 FN output it creates; the
+ *    native B3 accounting gap supplies the disintegration.
  */
 inline constexpr uint16_t CREATION_ACTION_FN_CLAIM{1}; // RESERVED/SUPERSEDED
 inline constexpr uint16_t FN_CLAIM_ACTION_VERSION_V1{1};
@@ -64,6 +65,25 @@ inline constexpr uint16_t CREATION_ACTION_ASSET_ISSUANCE{3};
 inline constexpr uint16_t CREATION_ACTION_FINALITY_CERTIFICATE{4};
 inline constexpr uint16_t CREATION_ACTION_FINALITY_KEY_EVIDENCE{5};
 inline constexpr uint16_t ASSET_ISSUANCE_ACTION_VERSION_V1{1};
+inline constexpr uint16_t CREATION_ACTION_MODERN_FN_POD{6};
+inline constexpr uint16_t MODERN_FN_POD_ACTION_VERSION_V1{1};
+//! Type 7 is a FlowMesh FN-seat binding record in the Modern Payload Area.
+//! Like finality types 4/5 it is not a standalone CreationAction.
+inline constexpr uint16_t CREATION_ACTION_FLOWMESH_SEAT_BINDING{7};
+inline constexpr uint16_t FLOWMESH_SEAT_BINDING_ACTION_VERSION_V1{1};
+//! Types 8/9 are FlowMesh chain-authorization records in the MPA, not
+//! standalone CreationActions: 8 commits a certified checkpoint and 9 proves
+//! one checkpointed vault effect. Their numbers are frozen and append-only.
+inline constexpr uint16_t CREATION_ACTION_FLOWMESH_CHECKPOINT{8};
+inline constexpr uint16_t FLOWMESH_CHECKPOINT_ACTION_VERSION_V1{1};
+inline constexpr uint16_t CREATION_ACTION_FLOWMESH_VAULT_PROOF{9};
+inline constexpr uint16_t FLOWMESH_VAULT_PROOF_ACTION_VERSION_V1{1};
+//! Type 10 is the independently gated Ethereum bridge record. It is an MPA
+//! record (never a standalone CreationAction) whose strict inner kind carries
+//! light-client bootstrap/update evidence, bounded execution backfill,
+//! deposit-mint proofs, or a managed-v1 burn/release request.
+inline constexpr uint16_t CREATION_ACTION_BRIDGE{10};
+inline constexpr uint16_t BRIDGE_ACTION_VERSION_V1{1};
 
 //! Whether a (type, version) pair is a registered creation action.
 //! Registration keeps a pair DECODABLE at the framing layer (so
@@ -77,7 +97,9 @@ inline constexpr bool IsKnownCreationAction(const uint16_t action_type,
            (action_type == CREATION_ACTION_LEGACY_FN_ISSUANCE &&
             action_version == LEGACY_FN_ISSUANCE_ACTION_VERSION_V1) ||
            (action_type == CREATION_ACTION_ASSET_ISSUANCE &&
-            action_version == ASSET_ISSUANCE_ACTION_VERSION_V1);
+            action_version == ASSET_ISSUANCE_ACTION_VERSION_V1) ||
+           (action_type == CREATION_ACTION_MODERN_FN_POD &&
+            action_version == MODERN_FN_POD_ACTION_VERSION_V1);
 }
 
 /**
@@ -93,8 +115,7 @@ inline constexpr bool IsKnownCreationAction(const uint16_t action_type,
  *  - MAX_CREATION_ACTION_SECTION_SIZE: 20,000 serialized bytes for the
  *    whole action section — owner-ratified (2026-08-17). After framing
  *    (count byte + 7 bytes per max-size frame) this permits FOUR
- *    maximum-size 4,000-byte actions, or many small ones — generous
- *    for any realistic claim batch, tight against allocation abuse.
+ *    maximum-size 4,000-byte actions, or many small ones.
  */
 inline constexpr size_t MAX_CREATION_ACTION_PAYLOAD{4000};
 inline constexpr size_t MAX_CREATION_ACTIONS_PER_TRANSITION{64};

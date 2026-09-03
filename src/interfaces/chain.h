@@ -8,10 +8,12 @@
 #include <blockfilter.h>
 #include <common/settings.h>
 #include <crypto/bls.h>
+#include <flowmesh/batch.h>
 #include <uint256.h>
 #include <script/script.h>
 #include <key.h>
 #include <kernel/chain.h> // IWYU pragma: export
+#include <modern/flowmesh_checkpoint.h>
 #include <node/types.h>
 #include <primitives/transaction.h>
 #include <util/result.h>
@@ -43,6 +45,7 @@ namespace kernel {
 struct ChainstateRole;
 } // namespace kernel
 namespace node {
+struct BridgeTxAuthorization;
 struct NodeContext;
 } // namespace node
 
@@ -121,6 +124,13 @@ struct FinalityStatus {
     std::optional<int> pin_height;
     uint256 pin_hash{};
     uint64_t pool_checkpoints{0};
+    // ---- one-time Ethereum bridge bootstrap handoff --------------------
+    // Retained after M because this is public consensus data and the
+    // Ethereum deployment window need not match B3's certificate window.
+    std::optional<int> bootstrap_snapshot_height;
+    uint256 bootstrap_snapshot_hash{};
+    uint256 bootstrap_set_hash{};
+    std::vector<unsigned char> bootstrap_set_header;
     // ---- per-validator (present when a validator key was given) ----
     bool bound{false};
     bool revoked{false};
@@ -163,6 +173,93 @@ struct StakingStatus {
     //! the staking loop, and the highest checkpoint it has signed.
     bool finality_signing{false};
     int last_signed_height{-1};
+};
+
+//! One production FlowMesh market plus an optional wallet-account view.
+//! The node owns the authoritative runtime/state; this value is a bounded
+//! copy for wallet RPC and GUI clients.
+struct FlowMeshMarketStatus {
+    bool available{false};
+    bool running{false};
+    uint256 domain{};
+    uint256 market_id{};
+    uint256 vault_id{};
+    uint256 base_asset{};
+    uint256 quote_asset{};
+    uint256 execution_config_id{};
+    uint64_t epoch{0};
+    uint64_t next_microblock_sequence{0};
+    uint64_t next_effect_index{0};
+    uint32_t round{0};
+    uint256 last_microblock_hash{};
+    uint256 state_root{};
+    size_t pending_actions{0};
+    bool observer_only{true};
+    bool paused{false};
+    bool pending_handoff{false};
+    bool checkpoint_pending{false};
+    uint256 pending_checkpoint_id{};
+    uint64_t pending_checkpoint_sequence{0};
+    uint32_t pending_checkpoint_effect_count{0};
+    std::string halt{"unavailable"};
+    std::string error;
+    std::optional<uint256> account_id;
+    uint64_t next_account_sequence{0};
+    uint64_t slot{0};
+    CAmount base_available{0};
+    CAmount base_reserved{0};
+    CAmount b3_available{0};
+    CAmount b3_reserved{0};
+};
+
+//! Fully encoded, service-selected type-8 record. Bitmap sizing and the
+//! historical seat-set lookup stay inside the node service.
+struct FlowMeshPendingCheckpoint {
+    CMpaRecord record;
+    uint256 checkpoint_id{};
+    uint64_t sequence{0};
+    uint32_t effect_count{0};
+};
+
+//! One exact live keyless vault input selected by the node service for a
+//! certified type-9 operation. The wallet must preserve this outpoint/output
+//! pair and leave its scriptSig and witness empty.
+struct FlowMeshVaultInput {
+    COutPoint outpoint;
+    CTxOut txout;
+};
+
+//! Wallet-ready certified vault operation. The service resolves the connected
+//! checkpoint proof and deterministic custody inputs; the wallet contributes
+//! only the exact payout/change outputs and a separately signed native fee
+//! input.
+struct FlowMeshVaultOperation {
+    uint256 market_id{};
+    uint256 checkpoint_id{};
+    CMpaRecord record;
+    modern::FlowMeshEffectV1 effect;
+    std::vector<FlowMeshVaultInput> inputs;
+};
+
+//! Atomic node snapshot used while wallet RPCs construct modern creation
+//! transactions. Keeping this behind Chain avoids treating a wallet RPC's
+//! WalletContext as a NodeContext.
+struct ModernCreationSnapshot {
+    uint256 tip_hash{};
+    int next_height{0};
+    std::optional<uint32_t> fn_issued_before{};
+    bool pending_fn_pod{false};
+};
+
+//! Result category for node-owned bridge transaction prevalidation. Wallet
+//! clients use this to preserve the RPC error class without reaching through
+//! the Chain interface into validation and bridge-index internals.
+enum class BridgePrevalidationResult {
+    VALID,
+    TIP_CHANGED,
+    RULES_INACTIVE,
+    STATE_UNAVAILABLE,
+    REJECTED,
 };
 
 //! Interface giving clients (wallet processes, maybe other analysis tools in
@@ -457,6 +554,20 @@ public:
     //! removed transactions and already added new transactions.
     virtual void requestMempoolTransactions(Notifications& notifications) = 0;
 
+    //! Return one chain+mempool-consistent snapshot for asset/FN/FlowMesh
+    //! wallet construction. When inspect_fn_pool is false the FN fields are
+    //! intentionally omitted.
+    virtual std::optional<ModernCreationSnapshot> modernCreationSnapshot(
+        bool inspect_fn_pool, std::string& error) = 0;
+
+    //! Validate one candidate bridge transaction against the exact active tip
+    //! used to construct it. The full node owns bridge-index synchronization;
+    //! wallet code receives only the semantic authorization and result class.
+    virtual BridgePrevalidationResult prevalidateBridgeTransaction(
+        const CTransaction& tx, const uint256& expected_tip_hash,
+        int expected_next_height, node::BridgeTxAuthorization& authorization,
+        std::string& error) = 0;
+
     //! Return true if an assumed-valid snapshot is in use. Note that this
     //! returns true even after the snapshot is validated, until the next node
     //! restart.
@@ -465,7 +576,9 @@ public:
     //! B3 Modern PoS staking (release-v1 validator UX, owner ruling
     //! 2026-08-23): start the node's automatic staking loop with the wallet's
     //! validator secret key and the script that receives block fees.
-    virtual bool startStaking(const CKey& validator_key, const CScript& coinbase_script, std::string& error) = 0;
+    virtual bool startStaking(const CKey& validator_key, const CScript& coinbase_script,
+                              const std::optional<bls::SecretKey>& finality_key,
+                              std::string& error) = 0;
     //! Stop the staking loop (no-op if not running).
     virtual void stopStaking() = 0;
     //! Staking status; `validator_key` (x-only) selects whose stake weight to
@@ -480,6 +593,27 @@ public:
     virtual bool armFinalitySigner(const bls::SecretKey& key, const std::array<unsigned char, 32>& validator_key, std::string& error) = 0;
     //! B3: drop the armed finality key (refused while the loop runs).
     virtual bool disarmFinalitySigner(std::string& error) = 0;
+
+    //! B3 FlowMesh production runtime and wallet-action boundary.
+    virtual std::vector<FlowMeshMarketStatus> flowMeshMarkets(
+        const std::optional<uint256>& account_id) = 0;
+    virtual std::optional<FlowMeshMarketStatus> flowMeshMarketStatus(
+        const uint256& market_id,
+        const std::optional<uint256>& account_id) = 0;
+    //! Current active-chain registry fact (not the 30-deep runtime view).
+    virtual bool flowMeshMarketEstablished(const uint256& market_id) = 0;
+    virtual bool submitFlowMeshAction(const uint256& market_id,
+                                      const flowmesh::Action& action,
+                                      std::string& error) = 0;
+    virtual bool armFlowMeshSeatKeys(const std::vector<bls::SecretKey>& keys,
+                                     std::string& error) = 0;
+    virtual bool disarmFlowMeshSeatKeys(std::string& error) = 0;
+    virtual std::optional<FlowMeshPendingCheckpoint> nextFlowMeshCheckpoint(
+        const uint256& market_id, std::string& error) = 0;
+    virtual std::optional<FlowMeshVaultOperation> flowMeshVaultOperation(
+        const uint256& effect_id, std::string& error) = 0;
+    virtual std::vector<FlowMeshVaultOperation> flowMeshVaultOperations(
+        const std::optional<uint256>& market_id, std::string& error) = 0;
 
     //! Get internal node context. Useful for testing, but not
     //! accessible across processes.

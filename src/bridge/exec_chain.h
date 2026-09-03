@@ -14,8 +14,8 @@
 #include <span>
 #include <vector>
 
-/** Execution-header ancestry proofs (header-only, not reachable from
- *  consensus). The sync-committee light client proves ONE finalized
+/** Execution-header ancestry proofs used by the type-10 consensus bridge.
+ *  The sync-committee light client proves ONE finalized
  *  execution header; a deposit usually sits in an EARLIER block. The gap is
  *  closed by the keccak parent-hash chain: full RLP execution block
  *  headers, newest first, where
@@ -25,8 +25,8 @@
  *
  *  walking down to the deposit block, whose receiptsRoot then anchors the
  *  Merkle-Patricia receipt proof. Every link is a keccak preimage — nothing
- *  in the chain is trusted. This is the same object a stage-4 consensus
- *  deposit proof will carry.
+ *  in the chain is trusted. This is the exact object a type-10 mint or
+ *  execution-backfill record carries.
  */
 namespace bridge {
 

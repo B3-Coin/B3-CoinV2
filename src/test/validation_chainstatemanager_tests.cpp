@@ -116,6 +116,29 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager, TestChain100Setup)
     m_node.validation_signals->SyncWithValidationInterfaceQueue();
 }
 
+//! A snapshot must never let a production B3 node jump over the mandatory
+//! H+1 historical FN allocation. Snapshot metadata does not independently
+//! commit to the pinned FN manifest/configuration.
+BOOST_FIXTURE_TEST_CASE(b3_fn_genesis_refuses_assumeutxo_bypass, TestChain100Setup)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const int current_height{
+        WITH_LOCK(chainman.GetMutex(), return chainman.ActiveHeight())};
+    BOOST_REQUIRE_LT(current_height, 110);
+    mineBlocks(110 - current_height);
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(chainman.GetMutex(), return chainman.ActiveHeight()), 110);
+
+    Consensus::Params& consensus{
+        const_cast<Consensus::Params&>(chainman.GetConsensus())};
+    consensus.legacy_b3coin = true;
+    consensus.fn_genesis_required = true;
+    consensus.hard_fork_height = 110;
+    consensus.fn_pod_activation_height.reset();
+
+    BOOST_CHECK(!CreateAndActivateUTXOSnapshot(this));
+    BOOST_CHECK(!chainman.ActiveChainstate().m_from_snapshot_blockhash);
+}
+
 //! Test rebalancing the caches associated with each chainstate.
 BOOST_FIXTURE_TEST_CASE(chainstatemanager_rebalance_caches, TestChain100Setup)
 {

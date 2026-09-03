@@ -10,7 +10,10 @@
 #include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
 #include <node/blockstorage.h>
+#include <node/bridge_state.h>
 #include <util/check.h>
+
+#include <limits>
 
 namespace node {
 
@@ -38,6 +41,25 @@ std::optional<uint32_t> FinalityTracker::State::SetSize(const uint64_t e) const
     if (e == epoch && current) return static_cast<uint32_t>(current->Size());
     if (epoch >= 1 && e == epoch - 1 && previous) return static_cast<uint32_t>(previous->Size());
     return std::nullopt;
+}
+
+bool BridgeWithdrawalValidatorSetsReady(
+    const FinalityTracker::State& projected,
+    const Consensus::BridgeDecentralizedWithdrawalPins& pins)
+{
+    if (!pins.Valid() || !projected.bootstrapped ||
+        projected.lineage_broken || !projected.current || !projected.next ||
+        projected.current->Epoch() != projected.epoch ||
+        projected.epoch == std::numeric_limits<uint64_t>::max() ||
+        projected.next->Epoch() != projected.epoch + 1) {
+        return false;
+    }
+    const auto eligible{[&pins](const ValidatorSetSnapshot& set) {
+        return set.Size() >= pins.min_bridge_validators &&
+               set.Size() <= pins.max_bridge_validators &&
+               set.TotalWeight() >= pins.min_bridge_total_weight;
+    }};
+    return eligible(*projected.current) && eligible(*projected.next);
 }
 
 // --------------------------------------------------------------- helpers
@@ -90,6 +112,7 @@ FinalityTracker::State FinalityTracker::Projected(const int height, const Consen
         const auto snap{SnapshotAt(0, height - 1)};
         if (snap && snap->Size() >= static_cast<size_t>(pos.min_finality_set)) {
             s.current = std::make_shared<const ValidatorSetSnapshot>(*snap);
+            s.bootstrap = s.current;
             s.next = std::make_shared<const ValidatorSetSnapshot>(snap->WithEpoch(1));
             s.bootstrapped = true;
         }
@@ -140,7 +163,9 @@ namespace {
 
 bool JudgeCoinbaseCertificate(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params,
                               const FinalityTracker::State& projected,
-                              std::optional<modern::FinalityCertificatePair>& pair, std::string& error)
+                              std::optional<modern::FinalityCertificatePair>& pair,
+                              std::string& error,
+                              const BridgeStateIndex* bridge_index)
 {
     pair.reset();
     if (block.vtx.empty()) { error = "finality-cert-no-coinbase"; return false; }
@@ -160,14 +185,21 @@ bool JudgeCoinbaseCertificate(const CBlock& block, const CBlockIndex& index, con
         if (!anc) return std::nullopt;
         return anc->GetBlockHash();
     }};
+    const auto withdrawal_root_at{
+        [&params, bridge_index](const int h) -> std::optional<uint256> {
+            return FinalityWithdrawalRoot(h, params, bridge_index);
+        }};
     return modern::JudgeFinalityCertificate(*domain, pair->finalized_block, pair->certificate, index.nHeight, view,
-                                            *params.modern_pos, hash_at, error);
+                                            *params.modern_pos, hash_at, error,
+                                            withdrawal_root_at);
 }
 
 } // namespace
 
 bool FinalityTracker::CheckBlockCertificate(const CBlock& block, const CBlockIndex& index,
-                                            const Consensus::Params& params, std::string& error) const
+                                            const Consensus::Params& params,
+                                            std::string& error,
+                                            const BridgeStateIndex* bridge_index) const
 {
     if (!index.pprev || !Synced(index.pprev->GetBlockHash())) {
         error = "finality-state-unavailable";
@@ -175,12 +207,15 @@ bool FinalityTracker::CheckBlockCertificate(const CBlock& block, const CBlockInd
     }
     const State projected{Projected(index.nHeight, params)};
     std::optional<modern::FinalityCertificatePair> pair;
-    return JudgeCoinbaseCertificate(block, index, params, projected, pair, error);
+    return JudgeCoinbaseCertificate(block, index, params, projected, pair,
+                                    error, bridge_index);
 }
 
 bool FinalityTracker::JudgeCandidateCertificate(const modern::FinalizedBlock& fb,
                                                 const modern::FinalityCertificate& cert, const CBlockIndex& parent,
-                                                const Consensus::Params& params, std::string& error) const
+                                                const Consensus::Params& params,
+                                                std::string& error,
+                                                const BridgeStateIndex* bridge_index) const
 {
     if (!Synced(parent.GetBlockHash())) {
         error = "finality-state-unavailable";
@@ -204,16 +239,23 @@ bool FinalityTracker::JudgeCandidateCertificate(const modern::FinalizedBlock& fb
         if (!anc) return std::nullopt;
         return anc->GetBlockHash();
     }};
+    const auto withdrawal_root_at{
+        [&params, bridge_index](const int h) -> std::optional<uint256> {
+            return FinalityWithdrawalRoot(h, params, bridge_index);
+        }};
     return modern::JudgeFinalityCertificate(*domain, fb, cert, parent.nHeight + 1, view, *params.modern_pos, hash_at,
-                                            error);
+                                            error, withdrawal_root_at);
 }
 
-bool FinalityTracker::ApplyModern(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params)
+bool FinalityTracker::ApplyModern(const CBlock& block, const CBlockIndex& index,
+                                  const Consensus::Params& params,
+                                  const BridgeStateIndex* bridge_index)
 {
     State s{Projected(index.nHeight, params)};
     std::optional<modern::FinalityCertificatePair> pair;
     std::string error;
-    if (!JudgeCoinbaseCertificate(block, index, params, s, pair, error)) {
+    if (!JudgeCoinbaseCertificate(block, index, params, s, pair, error,
+                                  bridge_index)) {
         LogWarning("FinalityTracker: connected block %s (height %d) carries an invalid certificate (%s)",
                    index.GetBlockHash().ToString(), index.nHeight, error);
         return false;
@@ -246,7 +288,8 @@ bool FinalityTracker::StepTrackers(const CBlock& block, const CBlockIndex& index
 }
 
 bool FinalityTracker::Sync(const CChain& chain, const BlockManager& blockman, const Consensus::Params& params,
-                           const CBlockIndex& target)
+                           const CBlockIndex& target,
+                           const BridgeStateIndex* bridge_index)
 {
     if (Synced(target.GetBlockHash())) return true;
     if (chain[target.nHeight] != &target) return false; // Target must lie on the chain.
@@ -274,7 +317,8 @@ bool FinalityTracker::Sync(const CChain& chain, const BlockManager& blockman, co
             Reset();
             return false;
         }
-        if (modern_start && height >= *modern_start && !ApplyModern(block, *pindex, params)) {
+        if (modern_start && height >= *modern_start &&
+            !ApplyModern(block, *pindex, params, bridge_index)) {
             Reset();
             return false;
         }
@@ -292,7 +336,10 @@ bool FinalityTracker::Sync(const CChain& chain, const BlockManager& blockman, co
     return true;
 }
 
-void FinalityTracker::BlockConnected(const CBlock& block, const CBlockIndex& index, const Consensus::Params& params)
+void FinalityTracker::BlockConnected(const CBlock& block,
+                                     const CBlockIndex& index,
+                                     const Consensus::Params& params,
+                                     const BridgeStateIndex* bridge_index)
 {
     if (Consensus::GetB3Era(index.nHeight, params) != Consensus::B3Era::MODERN) return;
     if (m_dirty || index.pprev == nullptr || m_synced_tip != index.pprev->GetBlockHash()) {
@@ -300,7 +347,8 @@ void FinalityTracker::BlockConnected(const CBlock& block, const CBlockIndex& ind
         return;
     }
     const std::optional<int> modern_start{Consensus::ModernPosStartHeight(params)};
-    if (modern_start && index.nHeight >= *modern_start && !ApplyModern(block, index, params)) {
+    if (modern_start && index.nHeight >= *modern_start &&
+        !ApplyModern(block, index, params, bridge_index)) {
         m_dirty = true;
         return;
     }

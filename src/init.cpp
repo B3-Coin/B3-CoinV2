@@ -46,7 +46,7 @@
 #include <net_processing.h>
 #include <netbase.h>
 #include <netgroup.h>
-#include <node/flowmesh_dev.h>
+#include <node/flowmesh_service.h>
 #include <node/staking.h>
 #include <node/warnings.h>
 #include <node/blockmanager_args.h>
@@ -319,6 +319,15 @@ void Shutdown(NodeContext& node)
     }
     StopMapPort();
 
+    // FlowMesh owns a worker and references both PeerManager and chainstate.
+    // Stop it while both dependencies are still alive. The stopped P2P sink
+    // remains present until PeerManager itself is destroyed and fails closed.
+    if (node.flowmesh && node.validation_signals) {
+        node.validation_signals->UnregisterValidationInterface(
+            node.flowmesh.get());
+    }
+    if (node.flowmesh) node.flowmesh->Stop();
+
     // Because these depend on each-other, we make sure that neither can be
     // using the other before destroying them.
     if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
@@ -335,6 +344,7 @@ void Shutdown(NodeContext& node)
     // After the threads that potentially access these pointers have been stopped,
     // destruct and reset all to nullptr.
     node.peerman.reset();
+    node.flowmesh.reset();
     node.connman.reset();
     node.banman.reset();
     node.addrman.reset();
@@ -409,9 +419,6 @@ void Shutdown(NodeContext& node)
         node.validation_signals->UnregisterAllValidationInterfaces();
     }
     node.staking.reset();
-    // The dev FlowMesh runtime's anchor policy references the
-    // ChainstateManager: destroy it strictly before chainman.
-    node.flowmesh_dev.reset();
     node.mempool.reset();
     node.fee_estimator.reset();
     node.chainman.reset();
@@ -682,7 +689,6 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-incrementalrelayfee=<amt>", strprintf("Fee rate (in %s/kvB) used to define cost of relay, used for mempool limiting and replacement policy. (default: %s)", CURRENCY_UNIT, FormatMoney(DEFAULT_INCREMENTAL_RELAY_FEE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-dustrelayfee=<amt>", strprintf("Fee rate (in %s/kvB) used to define dust, the value of an output such that it will cost more than its value in fees at this fee rate to spend it. (default: %s)", CURRENCY_UNIT, FormatMoney(DUST_RELAY_TX_FEE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-acceptstalefeeestimates", strprintf("Read fee estimates even if they are stale (%sdefault: %u) fee estimates are considered stale if they are %s hours old", "regtest only; ", DEFAULT_ACCEPT_STALE_FEE_ESTIMATES, Ticks<std::chrono::hours>(MAX_FILE_AGE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-b3flowmeshdev", "Start the FlowMesh dev validator spike at init (regtest only; refused with an init error on every other chain; default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-bytespersigop", strprintf("Equivalent bytes per sigop in transactions for relay and mining (default: %u)", DEFAULT_BYTES_PER_SIGOP), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-datacarrier", strprintf("Relay and mine data carrier transactions (default: %u)", DEFAULT_ACCEPT_DATACARRIER), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-datacarriersize",
@@ -870,7 +876,8 @@ namespace { // Variables internal to initialization process only
 
 int nMaxConnections;
 int available_fds;
-ServiceFlags g_local_services = ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS);
+ServiceFlags g_local_services =
+    ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS);
 int64_t peer_connect_timeout;
 std::set<BlockFilterType> g_enabled_filter_types;
 
@@ -948,11 +955,6 @@ bool AppInitParameterInteraction(const ArgsManager& args)
     // specified in default section of config file, but not overridden
     // on the command line or in this chain's section of the config file.
     ChainType chain = args.GetChainType();
-    // The FlowMesh dev validator spike is a REGTEST-ONLY exploration:
-    // refuse it outright anywhere else (ChainType::MAIN is B3 production).
-    if (args.GetBoolArg("-b3flowmeshdev", false) && chain != ChainType::REGTEST) {
-        return InitError(_("-b3flowmeshdev is a regtest-only development option and must never run on this chain."));
-    }
     if (chain == ChainType::SIGNET) {
         LogInfo("Signet derived magic (message start): %s", HexStr(chainparams.MessageStart()));
     }
@@ -1027,6 +1029,22 @@ bool AppInitParameterInteraction(const ArgsManager& args)
             return InitError(_("Prune mode is incompatible with -txindex."));
         if (args.GetBoolArg("-txospenderindex", DEFAULT_TXOSPENDERINDEX))
             return InitError(_("Prune mode is incompatible with -txospenderindex."));
+        const Consensus::Params& consensus{chainparams.GetConsensus()};
+        if (consensus.busd_bridge &&
+            Consensus::BridgeMintParamsReady(*consensus.busd_bridge)) {
+            return InitError(_(
+                "Prune mode is incompatible with the configured B3 bridge in this release; restart without -prune."));
+        }
+        // The transition release rebuilds its FN-seat, FlowMesh market and
+        // checkpoint indexes from the activation history. Until those
+        // indexes gain their own durable snapshots, accepting pruning could
+        // make a node permanently unable to validate or serve trading after
+        // restart. Refuse that unsafe combination explicitly.
+        if (Consensus::FlowMeshSeatBindingScheduleConfigured(
+                consensus)) {
+            return InitError(_(
+                "Prune mode is incompatible with an active FlowMesh schedule in this release."));
+        }
         if (args.GetBoolArg("-reindex-chainstate", false)) {
             return InitError(_("Prune mode is incompatible with -reindex-chainstate. Use full -reindex instead."));
         }
@@ -1447,9 +1465,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     const ArgsManager& args = *Assert(node.args);
     const CChainParams& chainparams = Params();
 
-    // B3 X-distribution PAUSE (owner ruling 2026-08-23): H set, X blank.
-    // Say so loudly: this build accepts the chain through H and refuses
-    // every block above it until the release that pins X.
+    // B3 X-distribution PAUSE safety: if any configuration sets H but leaves
+    // X blank, say so loudly and refuse every post-H block. Mainnet's
+    // transition release pins X and does not enter this branch.
     if (Consensus::LegacyBoundaryHeightOnly(chainparams.GetConsensus())) {
         const int final_height{*Consensus::LegacyFinalHeight(chainparams.GetConsensus())};
         const bilingual_str msg{strprintf(_("B3: the final legacy height H=%d is configured but the boundary hash X is not pinned. This node accepts blocks through H and REFUSES every block above H until the follow-up release that pins X. It will not produce or enter the transition corridor."), final_height)};
@@ -1929,25 +1947,32 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     assert(!node.peerman);
     // B3: the automatic staking loop. Idle until a wallet starts it
     // (startstaking) and until the next block is a modern-PoS block.
-    node.staking = std::make_unique<node::StakingLoop>(*node.chainman, node.mempool.get());
+    node.staking = std::make_unique<node::StakingLoop>(
+        *node.chainman, node.mempool.get(),
+        args.GetDataDirNet() / "finality_signer");
 
-    // B3 FlowMesh dev validator spike (REGTEST ONLY — refused for every
-    // other chain in AppInitParameterInteraction). Node-lifecycle only:
-    // no validation, mempool, or consensus path is touched.
-    if (args.GetBoolArg("-b3flowmeshdev", false)) {
-        Assert(chainman.GetParams().GetChainType() == ChainType::REGTEST);
-        std::string fm_error;
-        node.flowmesh_dev = node::StartFlowMeshDev(
-            chainman, args.GetDataDirNet() / "flowmesh-dev", fm_error);
-        if (!node.flowmesh_dev) {
-            return InitError(Untranslated(strprintf("FlowMesh dev validator failed to start: %s", fm_error)));
-        }
-    }
-
+    // Every node owns the production service object. It remains dormant and
+    // does not advertise the capability unless the complete A2/A3 schedule
+    // is pinned. P2P hands framed messages directly to its bounded worker;
+    // FlowMesh never opens a second port or blocks the B3 validation path.
+    node.flowmesh = std::make_unique<node::FlowMeshService>(
+        chainman, args.GetDataDirNet() / "flowmesh");
+    peerman_opts.flowmesh_sink = node.flowmesh.get();
     node.peerman = PeerManager::make(*node.connman, *node.addrman,
                                      node.banman.get(), chainman,
                                      *node.mempool, *node.warnings,
                                      peerman_opts);
+    std::string flowmesh_error;
+    if (!node.flowmesh->Start(*node.peerman, flowmesh_error)) {
+        return InitError(Untranslated(strprintf(
+            "FlowMesh production service failed to start: %s",
+            flowmesh_error)));
+    }
+    if (node.flowmesh->Enabled()) {
+        g_local_services =
+            ServiceFlags(g_local_services | NODE_B3_FLOWMESH);
+        validation_signals.RegisterValidationInterface(node.flowmesh.get());
+    }
     validation_signals.RegisterValidationInterface(node.peerman.get());
     // The staking loop relays its finality signatures through the peer manager.
     if (node.staking) node.staking->SetPeerManager(node.peerman.get());
@@ -2080,13 +2105,30 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         ScheduleBatchPriority();
         // Import blocks and ActivateBestChain()
         ImportBlocks(chainman, vImportFiles);
-        WITH_LOCK(::cs_main, chainman.UpdateIBDStatus());
+        bool initial_download_completed{false};
+        {
+            LOCK(::cs_main);
+            const bool was_initial_download{
+                chainman.IsInitialBlockDownload()};
+            chainman.UpdateIBDStatus();
+            initial_download_completed =
+                was_initial_download && !chainman.IsInitialBlockDownload();
+        }
         if (args.GetBoolArg("-stopafterblockimport", DEFAULT_STOPAFTERBLOCKIMPORT)) {
             LogInfo("Stopping after block import");
             if (!(Assert(node.shutdown_request))()) {
                 LogError("Failed to send shutdown signal after finishing block import\n");
             }
             return;
+        }
+        if (initial_download_completed && node.flowmesh &&
+            node.validation_signals) {
+            // ImportBlocks marks every tip callback as IBD. Drain those
+            // callbacks, then reconcile while this background thread still
+            // guarantees the service object's lifetime. A completed reindex
+            // is immediately usable without waiting for a new block.
+            node.validation_signals->SyncWithValidationInterfaceQueue();
+            node.flowmesh->ReconcileAfterInitialBlockDownload();
         }
 
         // Start indexes initial sync

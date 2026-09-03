@@ -44,12 +44,17 @@ void ReadSigNetArgs(const ArgsManager& args, CChainParams::SigNetOptions& option
 void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& options)
 {
     if (auto value = args.GetBoolArg("-fastprune")) options.fastprune = *value;
+    if (args.GetBoolArg("-b3flowmeshtest", false) &&
+        !args.GetBoolArg("-b3modernregtest", false)) {
+        throw std::runtime_error("-b3flowmeshtest requires -b3modernregtest");
+    }
     // B3 modern-era regtest (contract section 64 activation overrides;
     // REGTEST ONLY). -b3modernregtest enables the pinned H=0/X=genesis
     // configuration with scaled scaffolding constants; the numeric knobs
     // refine it and are ignored without the switch.
     if (args.GetBoolArg("-b3modernregtest", false)) {
         CChainParams::B3ModernRegTestOptions b3{};
+        b3.flowmesh_test = args.GetBoolArg("-b3flowmeshtest", false);
         const auto read_int{[&](const char* name, auto& field) {
             if (args.IsArgSet(name)) {
                 const int64_t v{args.GetIntArg(name, field)};

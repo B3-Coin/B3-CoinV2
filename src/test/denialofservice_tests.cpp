@@ -42,7 +42,11 @@ BOOST_FIXTURE_TEST_SUITE(denialofservice_tests, TestingSetup)
 // this logic; this test takes advantage of that protection only
 // being applied to nodes which send headers with sufficient
 // work.
-BOOST_AUTO_TEST_CASE(outbound_slow_chain_eviction)
+// The main B3 fixture starts below H and therefore uses the historical
+// getblocks/inventory sync lease. Exercise the modern getheaders eviction
+// mechanism on a natively modern chain; legacy lease reassignment has its own
+// coverage in legacy_net_tests.
+BOOST_FIXTURE_TEST_CASE(outbound_slow_chain_eviction, Testnet4Setup)
 {
     LOCK(NetEventsInterface::g_msgproc_mutex);
 

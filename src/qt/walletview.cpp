@@ -258,12 +258,6 @@ void WalletView::changePassphrase()
     GUIUtil::ShowModalDialogAsynchronously(dlg);
 }
 
-void WalletView::lockWallet()
-{
-    if (!walletModel) return;
-    walletModel->setWalletLocked(true);
-}
-
 void WalletView::unlockWallet()
 {
     // Unlock wallet when requested by wallet model
@@ -273,6 +267,15 @@ void WalletView::unlockWallet()
         // A modal dialog must be synchronous here as expected
         // in the WalletModel::requestUnlock() function.
         dlg.exec();
+        Q_EMIT encryptionStatusChanged();
+    }
+}
+
+void WalletView::lockWallet()
+{
+    if (walletModel->getEncryptionStatus() == WalletModel::Unlocked &&
+        walletModel->setWalletLocked(true)) {
+        Q_EMIT encryptionStatusChanged();
     }
 }
 

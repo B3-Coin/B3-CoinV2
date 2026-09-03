@@ -213,6 +213,15 @@ public:
     bool CheckDecryptionKey(const CKeyingMaterial& master_key) override;
     std::unordered_set<CScript, SaltedSipHasher> GetScriptPubKeys() const override;
     std::unique_ptr<SigningProvider> GetSolvingProvider(const CScript& script) const override;
+    bool SignTransaction(CMutableTransaction& tx,
+                         const std::map<COutPoint, Coin>& coins, int sighash,
+                         std::map<int, bilingual_str>& input_errors) const override;
+    std::optional<common::PSBTError> FillPSBT(
+        PartiallySignedTransaction& psbt,
+        const PrecomputedTransactionData& txdata,
+        std::optional<int> sighash_type = std::nullopt, bool sign = true,
+        bool bip32derivs = false, int* n_signed = nullptr,
+        bool finalize = true) const override;
     uint256 GetID() const override { return uint256::ONE; }
 
     // FillableSigningProvider overrides

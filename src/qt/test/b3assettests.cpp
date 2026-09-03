@@ -11,11 +11,16 @@
 #include <qt/b3assetmodel.h>
 #include <qt/b3assetspage.h>
 
+#include <interfaces/wallet.h>
+
 #include <QLabel>
+#include <QLineEdit>
 #include <QPushButton>
 #include <QSignalSpy>
+#include <QTableView>
 #include <QTest>
 
+#include <string>
 #include <utility>
 
 namespace {
@@ -96,6 +101,152 @@ void B3AssetTests::amountFormattingIsIntegerExact()
     QCOMPARE(B3AssetTableModel::formatAmount(123456, 3), QStringLiteral("123.456"));
 }
 
+void B3AssetTests::walletAssetRecordsExposeFnAndColoredAssets()
+{
+    const QString asset_id{
+        QStringLiteral("2856d73456bec1845fc36234f247daa5816a1dfdd0bd8522c4a56db7389c4e76")};
+    interfaces::WalletBalances native;
+    native.balance = 42'000'000'000;
+    native.immature_balance = 7'000'000'000;
+
+    interfaces::WalletAssetBalance fn;
+    fn.asset_id = uint256::FromHex(asset_id.toStdString()).value();
+    fn.confirmed = 1;
+    fn.spendable = 0;
+    fn.immature = 1;
+    fn.is_fn = true;
+
+    interfaces::WalletAssetBalance colored;
+    colored.asset_id = uint256::FromHex(std::string(64, '1')).value();
+    colored.confirmed = 12'345;
+    colored.unconfirmed = 5;
+    colored.spendable = 12'000;
+
+    interfaces::WalletAssetBalance bridge;
+    bridge.asset_id = uint256::FromHex(std::string(64, '2')).value();
+    bridge.confirmed = 1'250'000;
+    bridge.spendable = 1'250'000;
+    bridge.is_bridge = true;
+
+    const QList<B3AssetRecord> records{
+        B3NativeAssetSource::recordsForBalances(native, {fn, colored, bridge})};
+    QCOMPARE(records.size(), 4);
+    QCOMPARE(records.at(0).immature, 7'000'000'000);
+    QCOMPARE(records.at(1).asset_id, asset_id);
+    QCOMPARE(records.at(1).display_name, QStringLiteral("FN Coin"));
+    QCOMPARE(records.at(1).ticker, QStringLiteral("FN"));
+    QCOMPARE(records.at(1).confirmed, 1);
+    QCOMPARE(records.at(1).available, 0);
+    QCOMPARE(records.at(1).immature, 1);
+    QCOMPARE(records.at(1).decimals, 0);
+    QVERIFY(records.at(1).is_fn);
+
+    QCOMPARE(records.at(2).asset_id, QString(64, QLatin1Char('1')));
+    QCOMPARE(records.at(2).ticker, QStringLiteral("11111111"));
+    QCOMPARE(records.at(2).confirmed, 12'345);
+    QCOMPARE(records.at(2).pending, 5);
+    QCOMPARE(records.at(2).available, 12'000);
+    QCOMPARE(records.at(2).decimals, 0);
+    QVERIFY(!records.at(2).metadata_known);
+    QVERIFY(!records.at(2).is_fn);
+
+    QCOMPARE(records.at(3).ticker, QStringLiteral("bUSD"));
+    QCOMPARE(records.at(3).display_name, QStringLiteral("Bridged USD"));
+    QCOMPARE(records.at(3).decimals, 6);
+    QCOMPARE(records.at(3).available, 1'250'000);
+    QVERIFY(records.at(3).metadata_known);
+    QVERIFY(records.at(3).is_bridge);
+}
+
+void B3AssetTests::assetIdSearchSelectsOwnedAsset()
+{
+    B3AssetsPage page;
+    TestAssetSource source;
+
+    B3AssetRecord fn;
+    fn.asset_id = QStringLiteral(
+        "2856d73456bec1845fc36234f247daa5816a1dfdd0bd8522c4a56db7389c4e76");
+    fn.ticker = QStringLiteral("FN");
+    fn.display_name = QStringLiteral("FN Coin");
+    fn.confirmed = 1;
+    fn.immature = 1;
+    fn.decimals = 0;
+    fn.metadata_known = true;
+    fn.is_fn = true;
+    fn.status = B3AssetRecord::Status::Active;
+    source.set({NativeRecord(), fn});
+    page.setSource(&source);
+
+    auto* search = page.findChild<QLineEdit*>("assetSearch");
+    auto* list = page.findChild<QTableView*>("assetList");
+    QVERIFY(search != nullptr);
+    QVERIFY(list != nullptr);
+
+    search->setText(fn.asset_id);
+    QCOMPARE(list->model()->rowCount(), 1);
+    QCOMPARE(list->currentIndex().data(B3AssetTableModel::AssetIdRole).toString(), fn.asset_id);
+    QCOMPARE(page.findChild<QLabel*>("assetId")->text(), QStringLiteral("Asset ID: %1").arg(fn.asset_id));
+    QVERIFY(page.findChild<QLabel*>("assetStatus")->text().contains(QStringLiteral("waiting for maturity")));
+
+    page.setSource(nullptr);
+}
+
+void B3AssetTests::bridgeAssetDetailsUseBusdMetadata()
+{
+    B3AssetsPage page;
+    TestAssetSource source;
+
+    B3AssetRecord bridge;
+    bridge.asset_id = QString(64, QLatin1Char('b'));
+    bridge.ticker = QStringLiteral("bUSD");
+    bridge.display_name = QStringLiteral("Bridged USD");
+    bridge.confirmed = 1'250'000;
+    bridge.available = 1'250'000;
+    bridge.decimals = 6;
+    bridge.metadata_known = true;
+    bridge.is_bridge = true;
+    bridge.status = B3AssetRecord::Status::Active;
+    source.set({bridge});
+    page.setSource(&source);
+
+    QCOMPARE(page.model()->rowCount(), 1);
+    QVERIFY(page.findChild<QLabel*>("assetStatus")->text().contains(
+        QStringLiteral("Bridged USD")));
+
+    page.setSource(nullptr);
+}
+
+void B3AssetTests::refreshPreservesSelectedAsset()
+{
+    B3AssetsPage page;
+    TestAssetSource source;
+
+    B3AssetRecord colored;
+    colored.asset_id = QString(64, QLatin1Char('2'));
+    colored.ticker = QStringLiteral("22222222");
+    colored.display_name = QStringLiteral("Unknown asset");
+    colored.available = 7;
+    colored.decimals = 0;
+    colored.status = B3AssetRecord::Status::Active;
+    source.set({NativeRecord(), colored});
+    page.setSource(&source);
+
+    auto* list = page.findChild<QTableView*>("assetList");
+    QVERIFY(list != nullptr);
+    list->setCurrentIndex(list->model()->index(1, 0));
+    QCOMPARE(list->currentIndex().data(B3AssetTableModel::AssetIdRole).toString(),
+             colored.asset_id);
+
+    // A wallet balance update resets the source model. The selected asset is
+    // a stable user choice and must not silently jump back to native B3.
+    colored.available = 8;
+    source.set({NativeRecord(), colored});
+    QCOMPARE(list->currentIndex().data(B3AssetTableModel::AssetIdRole).toString(),
+             colored.asset_id);
+
+    page.setSource(nullptr);
+}
+
 void B3AssetTests::nativeOnlySourceEnablesOnlySupportedActions()
 {
     B3AssetsPage page;
@@ -116,7 +267,8 @@ void B3AssetTests::nativeOnlySourceEnablesOnlySupportedActions()
 
     bool mesh_note{false};
     for (const QLabel* label : page.findChildren<QLabel*>()) {
-        if (label->text().contains(QStringLiteral("not active")) && label->isVisibleTo(&page)) {
+        if (label->text().contains(QStringLiteral("not available on this page")) &&
+            label->isVisibleTo(&page)) {
             mesh_note = true;
         }
     }

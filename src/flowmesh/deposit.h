@@ -7,12 +7,14 @@
 
 #include <consensus/amount.h>
 #include <flowmesh/ledger.h>
+#include <flowmesh/settlement.h>
 #include <primitives/transaction.h>
 #include <serialize.h>
 #include <uint256.h>
 
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace flowmesh {
 
@@ -45,6 +47,16 @@ struct DepositInfo {
 };
 
 /**
+ * One bounded chain-settlement step. `anchor` is the furthest canonical
+ * block boundary that can be retired by one production entry and `count` is
+ * the exact number of market withdrawals in that interval.
+ */
+struct WithdrawalSettlementPlan {
+    AnchorRef anchor;
+    size_t count{0};
+};
+
+/**
  * Custody-side verifier for deposits. Implementations answer from
  * canonical B3 chain data as of `anchor`: the outpoint must exist, be a
  * DEX_VAULT deposit output for this domain's vault, and satisfy the
@@ -62,6 +74,53 @@ public:
     virtual ~DepositVerifier() = default;
     virtual std::optional<DepositInfo> GetDeposit(const COutPoint& outpoint,
                                                   const AnchorRef& anchor) const = 0;
+
+    /**
+     * Spendable withdrawal capacity for `asset` at this exact B3 anchor:
+     * the sum of the largest 64 live pool-change outputs. A null value means
+     * the chain fact is unavailable and withdrawal admission must fail
+     * closed. Implementations used by tests must opt into a capacity
+     * explicitly; the safe default never invents liquidity.
+     */
+    virtual std::optional<CAmount> GetWithdrawalCapacity(
+        const AssetId& asset, const AnchorRef& anchor) const
+    {
+        return std::nullopt;
+    }
+
+    /**
+     * Exact, market-bound type-9 withdrawals connected after the previous
+     * production anchor and through the proposed anchor, sorted strictly by
+     * receipt id. A null result means the chain fact is unavailable and must
+     * fail production closed; an empty vector is a proved empty interval.
+     */
+    virtual std::optional<std::vector<WithdrawalSettlementFactV1>>
+    GetWithdrawalSettlements(
+        const std::optional<AnchorRef>& after_exclusive,
+        const AnchorRef& through_inclusive) const = 0;
+
+    /**
+     * Select a deterministic, bounded settlement anchor no later than
+     * `through_inclusive`. Production implementations override this with a
+     * count-only history scan so an offline backlog cannot force allocation
+     * of every pending receipt. The default keeps lightweight test verifiers
+     * source-compatible while enforcing the same per-entry bound.
+     */
+    virtual std::optional<WithdrawalSettlementPlan>
+    PlanWithdrawalSettlements(
+        const std::optional<AnchorRef>& after_exclusive,
+        const AnchorRef& through_inclusive) const
+    {
+        const auto settlements{
+            GetWithdrawalSettlements(after_exclusive, through_inclusive)};
+        if (!settlements ||
+            settlements->size() >
+                FLOWMESH_MAX_WITHDRAWAL_SETTLEMENTS_PER_ENTRY) {
+            return std::nullopt;
+        }
+        return WithdrawalSettlementPlan{through_inclusive,
+                                        settlements->size()};
+    }
 };
 
 /**

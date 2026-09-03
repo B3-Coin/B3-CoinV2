@@ -91,7 +91,7 @@ bool TxIndex::CustomAppend(const interfaces::BlockInfo& block)
     for (const auto& tx : block.data->vtx) {
         vPos.emplace_back(tx->GetHash(), pos);
         pos.nTxOffset += legacy_codec_block ? ::GetSerializeSize(legacy::TX_LEGACY(*tx))
-                                            : ::GetSerializeSize(TX_WITH_WITNESS(*tx));
+                                            : ::GetSerializeSize(TX_MODERN(*tx));
     }
     m_db->WriteTxs(vPos);
     return true;
@@ -122,7 +122,10 @@ bool TxIndex::FindTx(const Txid& tx_hash, uint256& block_hash, CTransactionRef& 
         if (consensus.legacy_b3coin && !Consensus::HasB3BlockCodecV2(header.nVersion)) {
             file >> legacy::TX_LEGACY(tx);
         } else {
-            file >> TX_WITH_WITNESS(tx);
+            // Marker-modern blocks store the full payload form. Reading with
+            // the witness-only codec rejects flag 0x02 and offsets every
+            // later transaction after an MPA-bearing one.
+            file >> TX_MODERN(tx);
         }
     } catch (const std::exception& e) {
         LogError("Deserialize or I/O error - %s", e.what());

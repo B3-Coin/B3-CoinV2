@@ -7,7 +7,9 @@
 #ifndef BITCOIN_CONSENSUS_PARAMS_H
 #define BITCOIN_CONSENSUS_PARAMS_H
 
+#include <consensus/bridge_params.h>
 #include <consensus/modern_pos_params.h>
+#include <consensus/fn_params.h>
 #include <script/verify_flags.h>
 #include <uint256.h>
 
@@ -140,10 +142,9 @@ struct Params {
      * The compact-bits target every temporary-PoW corridor block must carry
      * (constant corridor difficulty). The block's scrypt eligibility hash
      * must not exceed this target. Unset means the corridor difficulty
-     * policy is unresolved and corridor blocks FAIL CLOSED: regtest fixtures
-     * set a trivially easy value as test scaffolding; the mainnet corridor
-     * difficulty policy is an OPEN design decision and must not be chosen
-     * here silently.
+     * is unconfigured and corridor blocks FAIL CLOSED. Mainnet pins
+     * 0x1f008000; regtest fixtures may set a trivially easy value as test
+     * scaffolding.
      */
     std::optional<uint32_t> transition_pow_bits;
     /**
@@ -166,11 +167,74 @@ struct Params {
     /**
      * Modern PoS V1 parameter block (consensus/modern_pos_params.h). Unset
      * means modern-PoS rules are unconfigured and every modern-PoS block
-     * FAILS CLOSED (`no-modern-pos-rules`). Real chainparams never set it:
-     * every value inside is REVISABLE_BEFORE_MAINNET scaffolding until the
-     * owner ratifies mainnet numbers (a guard test pins this).
+     * FAILS CLOSED (`no-modern-pos-rules`). Mainnet's sealed transition
+     * release assigns every value explicitly; other shipped networks leave
+     * the block unset.
      */
     std::optional<ModernPosParams> modern_pos;
+    /**
+     * Historical FN Genesis manifest measured from the sealed legacy chain.
+     * When populated, every row and the matching commitment are pinned by the
+     * transition release. The mandatory FN Genesis event is the first
+     * corridor block (hard_fork_height, H+1); there is no claim transaction
+     * and no proof carried by an individual holder.
+     *
+     * The three fields are one fail-closed configuration: an empty manifest,
+     * a missing root, or a root that does not commit to these exact rows makes
+     * FN Genesis unavailable. Mainnet embeds the canonical artifact produced
+     * by the final through-H scan and verifies its published size, SHA256,
+     * chain domain, height, version, count and root at startup.
+     */
+    uint16_t fn_genesis_manifest_version{1};
+    std::optional<uint256> fn_genesis_rights_root;
+    std::vector<FnGenesisRight> fn_genesis_manifest;
+    /**
+     * Make the one-time historical FN Genesis event mandatory at H+1. This is
+     * an independent belt-and-suspenders guard: mainnet cannot enter the
+     * corridor without the complete historical allocation. Synthetic B3 test
+     * chains may leave it false unless they explicitly exercise FN Genesis.
+     */
+    bool fn_genesis_required{false};
+    /**
+     * First height at which post-genesis PoD transactions may create the
+     * remaining FN supply. Kept separate from FN Genesis and transfers:
+     * historical FN outputs exist at H+1 and ordinary coinbase maturity is
+     * their only delay. Unset means modern FN creation fails closed.
+     */
+    std::optional<int> fn_pod_activation_height;
+    /**
+     * First height at which simple-v1 colored-asset issuance, transfer and
+     * burn rules are active. Unset means they fail closed; mainnet pins this
+     * as A2 after its ratified post-M soak interval.
+     */
+    std::optional<int> asset_activation_height;
+    /**
+     * First height of full FlowMesh trading/vault/checkpoint rules (A3).
+     * FN-v2 seat pre-binding opens at A2 only when this pin completes a valid
+     * schedule with at least FLOWMESH_ANCHOR_DEPTH blocks between A2 and A3.
+     * Unset or an insufficient runway makes both seat binding and FlowMesh
+     * service fail closed.
+     */
+    std::optional<int> flowmesh_activation_height;
+    /**
+     * First height at which bridge-backed asset burns may create Ethereum
+     * withdrawal leaves. This is deliberately independent from the inbound
+     * bridge activation in BridgeAssetParams: a release may enable verified
+     * deposits while irreversible B3 burns remain fail-closed. Unset means
+     * every managed or decentralized withdrawal record is invalid.
+     */
+    std::optional<int> bridge_withdrawal_activation_height;
+    /**
+     * The first bridge-backed asset is bUSD backed 1:1 by Ethereum-mainnet
+     * USDT in an exact release-pinned vault. Mainnet may carry its immutable
+     * origin identity before activation, but BridgeMintParamsReady remains
+     * false until the checkpoint, fork/lag rules, caps, adapter/version,
+     * recipient codec, activation height, and withdrawal-security pins have
+     * all been explicitly populated. No partial configuration authorizes a
+     * mint. Completing those pins does not activate burns: the separate
+     * bridge_withdrawal_activation_height must also be ratified and pinned.
+     */
+    std::optional<BridgeAssetParams> busd_bridge;
     /**
      * TEST-ONLY override of the historical FN disintegration collateral
      * (Proof of Disintegration). Unset everywhere except regtest fixtures:
@@ -186,6 +250,14 @@ struct Params {
      * post-X trusted replay (which verifies its own configured checkpoints).
      */
     std::map<int, uint256> legacy_checkpoints;
+    /**
+     * Hardened checkpoints for the post-legacy B3 chain (height -> exact
+     * modern block identity). These are enforced independently of the
+     * historical legacy checkpoint table, including while rebuilding the
+     * chainstate from an existing block index. Heights in the legacy era are
+     * deliberately ignored.
+     */
+    std::map<int, uint256> modern_checkpoints;
     /**
      * Rolling maximum reorg depth for the live legacy chain (the historical
      * client's nCheckpointSpan). A legacy block whose height is at least this
@@ -212,11 +284,14 @@ struct Params {
      * code holding a mutable Params -- which production never does after init.
      *
      * - test_only_modern_pos_validator: an installed modern proof-of-stake
-     *   rule set. Null in production, so modern PoS stays fail-closed
-     *   (CheckModernStake rejects every block) until a real rule set ships.
-     * - test_only_asset_policies_active: activates the coloured-asset policy
-     *   set (BURN / DEX_VAULT and the conservation rules). False in
-     *   production, so those policies stay unactivated and therefore invalid.
+     *   adapter used only by synthetic fixtures. It remains null in
+     *   production, where a configured `modern_pos` block selects the real
+     *   validator; an absent production block still fails closed.
+     * - test_only_asset_policies_active: test-fixture override for simple-v1
+     *   asset rules and DEX_VAULT policy. Production simple-v1 assets, seat
+     *   binding and vault preparation use the real A2 gate; full FlowMesh
+     *   trading/service uses A3. FN-v2 pre-binding requires the complete
+     *   schedule.
      *
      * (The former metadata-cell / MPA test switches are gone: those rules
      * activate through the real F = M predicate,

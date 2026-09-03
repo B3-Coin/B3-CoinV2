@@ -157,6 +157,13 @@ public:
      * constants exactly as the unit fixtures scale them.
      */
     struct B3ModernRegTestOptions {
+        /**
+         * Enable the complete FN/assets/FlowMesh release-test schedule.
+         * This is deliberately nested under the B3 modern regtest options so
+         * no synthetic manifest, treasury destination, or activation height
+         * can leak into a real network configuration.
+         */
+        bool flowmesh_test{false};
         int corridor_length{160};
         //! Corridor pacing (seconds); scaled from the ratified 60 so a
         //! functional test can mine the corridor in real time.

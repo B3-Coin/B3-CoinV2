@@ -14,8 +14,8 @@
 #include <span>
 #include <vector>
 
-/** Ethereum Merkle-Patricia trie INCLUSION proof verification (bridge
- *  proposal stage 2; header-only, not reachable from consensus).
+/** Ethereum Merkle-Patricia trie INCLUSION proof verification for the gated
+ *  type-10 consensus bridge.
  *
  *  Target use: proving one receipt against a finalized execution header's
  *  receiptsRoot (key = rlp(tx_index)). The verifier is deliberately

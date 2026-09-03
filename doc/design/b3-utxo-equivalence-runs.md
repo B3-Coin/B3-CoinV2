@@ -105,6 +105,45 @@ R before FN activation. All final historical rights are reserved; reachable
 modern capacity is at most 1,500 and may be smaller. If final `R > 5,000`,
 FN activation returns to the owner and no historical right is truncated.
 
+**LATEST SUPERSESSION (owner ruling 2026-09-01):** FN no longer activates
+behind a later historical-claim height. Block 810,001 coinbase is mandatory FN
+Genesis, so the final through-H manifest/count/root reproduction is a gate for
+the X-pin transition release itself and must finish during the seal pause before
+tagging. The 3,500 result remains a floor; final modern capacity is exactly
+`5,000 - R`. No holder claim or proof-carrier measurement remains.
+
+## Final seal 2026-09-01 — H=810,000: **PASSED**
+
+The cleanly stopped legacy client, current port chainstate, and an independent
+trusted replay all resolved height 810,000 to
+`2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6`.
+Each state contained 1,241,032 UTXOs and produced commitment
+`5e7011beee57f403be78ce66c983218e1ee5c934d60dc4b43503d2d6a70760c7`.
+All three canonical row files were byte-identical with SHA-256
+`f1746c935ce4445841b179633d35387c0cbf81ede139ea8f4f6b6e2b88b55f89`;
+the verifier exited 0 with `U_master == U_port == U_replay`.
+
+The sealed spendable supply was 1,042,617,596.101695152 B3 in modern display
+units, or 1,042,617,596,101,695,152 base units. Independent manifest producers
+then derived the same 3,592 eligible historical FN rights (3,596 qualifying,
+four ignored), modern capacity 1,408, chain domain
+`6a48d15d8da05571e0e7afe5d49bfae0ca7cd71305297f04461603e92a2651a6`,
+and rights root
+`e8f282a7dcaa9a8fbcfcc5c22ba4f456e5b50968fcf899aaacdaca65bef898ec`.
+Their 186,875-byte canonical artifacts were byte-identical with SHA-256
+`c80470eec785600f33fa2e69c520ff331c2b354ebf6e0a9bf8cae7d1eb5f9dca`.
+This closes the final-H X and FN-manifest gates without truncating any right.
+
+Release-candidate database reconstruction also passed. A fresh
+`-reindex-chainstate` replay reached H/X with 1,241,032 UTXOs and shut down
+cleanly. A separate full `-reindex` imported all five raw block files
+(119,938 + 118,284 + 205,696 + 214,487 + 151,596 = 810,001 blocks), then
+connected and validated the chain through H = 810,000 at the exact X above,
+again with 1,241,032 UTXOs and a clean shutdown. The full reindex exposed and
+closed a legacy raw-block import codec bug; an in-process regression now loads
+a framed historical block through `LoadExternalBlockFile` and verifies its
+legacy transaction encoding.
+
 Incident log (for the record): the port node crashed once mid-sync on a
 relayed unconfirmed legacy transaction (CalculateLockPointsAtTip assertion)
 — worked around with -blocksonly during this campaign and subsequently

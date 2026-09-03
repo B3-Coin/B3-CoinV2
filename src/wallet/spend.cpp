@@ -17,6 +17,7 @@
 #include <primitives/transaction.h>
 #include <primitives/transaction_identifier.h>
 #include <script/script.h>
+#include <script/sign.h>
 #include <script/signingprovider.h>
 #include <script/solver.h>
 #include <util/check.h>
@@ -32,6 +33,10 @@
 #include <wallet/spend.h>
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
+
+#include <modern/asset_output.h>
+#include <modern/metadata_cell.h>
+#include <modern/payload_cost.h>
 
 #include <cmath>
 
@@ -111,6 +116,41 @@ int CalculateMaximumSignedInputSize(const CTxOut& txout, const CWallet* wallet, 
     return CalculateMaximumSignedInputSize(txout, COutPoint(), provider.get(), wallet->CanGrindR(), coin_control);
 }
 
+/**
+ * Return the script whose satisfaction authorizes this locally known wallet
+ * input. A B3A1 prefix is stripped only after the wallet has independently
+ * authenticated the creating transaction as post-H. Merely supplying an
+ * asset-looking CTxOut through coin control is intentionally insufficient.
+ */
+static CScript WalletInputAuthorizationScript(const CWallet* wallet,
+                                              const COutPoint& outpoint,
+                                              const CTxOut& txout)
+{
+    LOCK(wallet->cs_wallet);
+    const auto it{wallet->mapWallet.find(outpoint.hash)};
+    if (it == wallet->mapWallet.end() || outpoint.n >= it->second.tx->vout.size() ||
+        it->second.tx->vout[outpoint.n] != txout ||
+        AssetSigningContextForWalletTransaction(it->second) !=
+            AssetSigningContext::OWNER_SUFFIX) {
+        return txout.scriptPubKey;
+    }
+    return modern::AssetOwnerScript(txout).value_or(txout.scriptPubKey);
+}
+
+static int CalculateMaximumSignedWalletInputSize(const CTxOut& txout,
+                                                 const COutPoint& outpoint,
+                                                 const CWallet* wallet,
+                                                 const CCoinControl* coin_control)
+{
+    const CScript authorization_script{
+        WalletInputAuthorizationScript(wallet, outpoint, txout)};
+    const std::unique_ptr<SigningProvider> provider{
+        wallet->GetSolvingProvider(authorization_script)};
+    return CalculateMaximumSignedInputSize(
+        CTxOut{txout.nValue, authorization_script}, outpoint, provider.get(),
+        wallet->CanGrindR(), coin_control);
+}
+
 /** Infer a descriptor for the given output script. */
 static std::unique_ptr<Descriptor> GetDescriptor(const CWallet* wallet, const CCoinControl* coin_control,
                                                  const CScript script_pubkey)
@@ -137,7 +177,10 @@ static std::optional<int64_t> GetSignedTxinWeight(const CWallet* wallet, const C
     }
 
     // Otherwise, use the maximum satisfaction size provided by the descriptor.
-    std::unique_ptr<Descriptor> desc{GetDescriptor(wallet, coin_control, txo.scriptPubKey)};
+    const CScript authorization_script{
+        WalletInputAuthorizationScript(wallet, txin.prevout, txo)};
+    std::unique_ptr<Descriptor> desc{
+        GetDescriptor(wallet, coin_control, authorization_script)};
     if (desc) return MaxInputWeight(*desc, {txin}, coin_control, tx_is_segwit, can_grind_r);
 
     return {};
@@ -148,13 +191,25 @@ TxSize CalculateMaximumSignedTxSize(const CTransaction &tx, const CWallet *walle
 {
     // version + nLockTime + input count + output count
     int64_t weight = (4 + 4 + GetSizeOfCompactSize(tx.vin.size()) + GetSizeOfCompactSize(tx.vout.size())) * WITNESS_SCALE_FACTOR;
+    // The MPA is excluded from the ordinary witness/base serializations and
+    // charged separately at full weight by GetTransactionWeight. Mirror that
+    // rule here so fee selection cannot underfund an MPA-bearing transaction.
+    weight += static_cast<int64_t>(MPA_WEIGHT_FACTOR) *
+              GetMpaSectionSerializedSize(tx.mpa);
     // Whether any input spends a witness program. Necessary to run before the next loop over the
     // inputs in order to accurately compute the compactSize length for the witness data per input.
-    bool is_segwit = std::any_of(txouts.begin(), txouts.end(), [&](const CTxOut& txo) {
-        std::unique_ptr<Descriptor> desc{GetDescriptor(wallet, coin_control, txo.scriptPubKey)};
-        if (desc) return IsSegwit(*desc);
-        return false;
-    });
+    bool is_segwit{false};
+    for (size_t index{0}; index < txouts.size(); ++index) {
+        const CTxOut& txo{txouts[index]};
+        const CScript authorization_script{WalletInputAuthorizationScript(
+            wallet, tx.vin[index].prevout, txo)};
+        std::unique_ptr<Descriptor> desc{
+            GetDescriptor(wallet, coin_control, authorization_script)};
+        if (desc && IsSegwit(*desc)) {
+            is_segwit = true;
+            break;
+        }
+    }
     // Segwit marker and flag
     if (is_segwit) weight += 2;
 
@@ -169,8 +224,12 @@ TxSize CalculateMaximumSignedTxSize(const CTransaction &tx, const CWallet *walle
         weight += *txin_weight;
     }
 
-    // It's ok to use 0 as the number of sigops since we never create any pathological transaction.
-    return TxSize{GetVirtualTransactionSize(weight, 0, 0), weight};
+    // It's ok to use 0 as the number of sigops since we never create any
+    // pathological transaction. Payload verification cost still participates
+    // in relay vsize for the record types which declare a non-zero cost.
+    return TxSize{GetVirtualTransactionSize(
+                      weight, 0, 0, modern::PayloadVerifyCost(tx)),
+                  weight};
 }
 
 TxSize CalculateMaximumSignedTxSize(const CTransaction &tx, const CWallet *wallet, const CCoinControl* coin_control)
@@ -284,7 +343,8 @@ util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoin
         if (auto txo = wallet.GetTXO(outpoint)) {
             txout = txo->GetTxOut();
             if (input_bytes == -1) {
-                input_bytes = CalculateMaximumSignedInputSize(txout, &wallet, &coin_control);
+                input_bytes = CalculateMaximumSignedWalletInputSize(
+                    txout, outpoint, &wallet, &coin_control);
             }
             const CWalletTx& parent_tx = txo->GetWalletTx();
             if (wallet.GetTxDepthInMainChain(parent_tx) == 0) {
@@ -302,6 +362,22 @@ util::Result<CoinsResult> FetchSelectedInputs(const CWallet& wallet, const CCoin
             }
 
             txout = *out;
+        }
+
+        const CScript authorization_script{
+            WalletInputAuthorizationScript(&wallet, outpoint, txout)};
+        const bool external_witness{
+            Params().GetConsensus().legacy_b3coin &&
+            IsSegWitOutput(coin_control.m_external_provider,
+                           authorization_script,
+                           AssetSigningContext::FULL_SCRIPT)};
+        if (ScriptRequiresInactiveB3Witness(wallet,
+                                            authorization_script) ||
+            external_witness) {
+            return util::Error{strprintf(
+                _("Cannot spend pre-selected input %s: B3 witness addresses are "
+                  "not active in this release. Select a legacy-owned input."),
+                outpoint.ToString())};
         }
 
         if (input_bytes == -1) {
@@ -343,6 +419,8 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     std::set<Txid> trusted_parents;
     // Cache for whether each tx passes the tx level checks (first bool), and whether the transaction is "safe" (second bool)
     std::unordered_map<Txid, std::pair<bool, bool>, SaltedTxidHasher> tx_safe_cache;
+    const std::optional<int> legacy_final_height{
+        Consensus::LegacyFinalHeight(Params().GetConsensus())};
     for (const auto& [outpoint, txo] : wallet.GetTXOs()) {
         const CWalletTx& wtx = txo.GetWalletTx();
         const CTxOut& output = txo.GetTxOut();
@@ -448,6 +526,16 @@ CoinsResult AvailableCoins(const CWallet& wallet,
         // UNSTAKE and must be an explicit act (select the outpoint through
         // coin control / `inputs`). getstakinginfo lists them.
         if (modern::ClaimsStakeMagic(output.scriptPubKey)) continue;
+        // Only post-H B3A1 outputs belong to the asset namespace. Identical
+        // bytes sealed at or below H remain ordinary native scripts and must
+        // not disappear from normal coin selection.
+        const auto* confirmed{wtx.state<TxStateConfirmed>()};
+        const bool post_h{
+            legacy_final_height &&
+            ((confirmed && confirmed->confirmed_block_height >
+                               *legacy_final_height) ||
+             (wtx.InMempool() && !wtx.tx->IsLegacyEncoded()))};
+        if (post_h && modern::ClaimsAssetOutput(output)) continue;
 
         if (!allow_used_addresses && wallet.IsSpentKey(output.scriptPubKey)) {
             continue;
@@ -1065,7 +1153,16 @@ uint64_t GetSerializeSizeForRecipient(const CRecipient& recipient)
 
 bool IsDust(const CRecipient& recipient, const CFeeRate& dustRelayFee)
 {
-    return ::IsDust(CTxOut(recipient.nAmount, GetScriptForDestination(recipient.dest)), dustRelayFee);
+    const CTxOut output{recipient.nAmount,
+                        GetScriptForDestination(recipient.dest)};
+    // Canonical B3A1 outputs and typed metadata cells deliberately have zero
+    // native value. Only their strict carrier parsers may bypass native-B3
+    // dust policy; malformed namespace claims remain dust and are rejected by
+    // the ordinary wallet path.
+    std::string asset_error;
+    if (modern::ParseAssetOutput(output, asset_error)) return false;
+    if (output.nValue == 0 && modern::IsMetadataCell(output.scriptPubKey)) return false;
+    return ::IsDust(output, dustRelayFee);
 }
 
 static util::Result<CreatedTransactionResult> CreateTransactionInternal(
@@ -1073,18 +1170,21 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         const std::vector<CRecipient>& vecSend,
         std::optional<unsigned int> change_pos,
         const CCoinControl& coin_control,
-        bool sign) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+        bool sign,
+        const ModernTransactionOptions& modern_options) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
-    // B3 staking-only unlock: keys are usable for block signing only.
-    if (wallet.m_unlock_staking_only) {
-        return util::Error{_("Wallet is unlocked for staking only; unlock it fully to send funds")};
-    }
     AssertLockHeld(wallet.cs_wallet);
 
     FastRandomContext rng_fast;
     CMutableTransaction txNew; // The resulting transaction that we make
 
     txNew.version = coin_control.m_version;
+    txNew.mpa = modern_options.mpa;
+
+    if (modern_options.native_disintegration < 0 ||
+        modern_options.native_disintegration > MAX_MONEY) {
+        return util::Error{_("Native disintegration amount is out of range")};
+    }
 
     // B3: a transaction feeding a LEGACY-era next block must carry the
     // historical identity end to end -- nTime after the version, version 1,
@@ -1102,36 +1202,49 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
             return util::Error{_("Cannot determine the active chain height; refusing to construct a transaction.")};
         }
         const int next_height{*tip_height + 1};
+
+        // A direct witness destination cannot be spent safely by this B3
+        // release. Post-H script checks require its witness authorization,
+        // while block validation still rejects witness-bearing blocks because
+        // the SegWit deployment is inactive. Apply this to every B3 era.
+        for (const auto& recipient : vecSend) {
+            int witness_version{0};
+            std::vector<unsigned char> witness_program;
+            if (GetScriptForDestination(recipient.dest)
+                    .IsWitnessProgram(witness_version, witness_program)) {
+                return util::Error{_(
+                    "B3 witness addresses are not active in this release. "
+                    "Use a legacy recipient address.")};
+            }
+        }
+        if (!std::holds_alternative<CNoDestination>(coin_control.destChange)) {
+            int witness_version{0};
+            std::vector<unsigned char> witness_program;
+            if (GetScriptForDestination(coin_control.destChange)
+                    .IsWitnessProgram(witness_version, witness_program)) {
+                return util::Error{_(
+                    "B3 witness addresses are not active in this release. "
+                    "Use a legacy change address.")};
+            }
+        }
+
         if (Consensus::GetB3Era(next_height, Params().GetConsensus()) == Consensus::B3Era::LEGACY) {
+            if (!modern_options.mpa.empty() ||
+                modern_options.native_disintegration != 0) {
+                return util::Error{_("Modern payloads and disintegration cannot be created in the legacy era")};
+            }
             txNew.m_legacy_encoding = true;
             txNew.nTime = static_cast<uint32_t>(GetTime());
             txNew.version = 1;
-            // Paying a witness program in the legacy era would hand the
-            // recipient an anyone-can-spend output. Refuse outright -- and
-            // apply the same rule to an EXPLICIT change destination
-            // (coin_control.destChange bypasses the address-handout guard).
-            for (const auto& recipient : vecSend) {
-                int wver{0};
-                std::vector<unsigned char> wprog;
-                if (GetScriptForDestination(recipient.dest).IsWitnessProgram(wver, wprog)) {
-                    return util::Error{_("Refusing to pay a SegWit/Taproot address: witness "
-                                         "outputs are unprotected (anyone-can-spend) under the "
-                                         "legacy B3 consensus rules.")};
-                }
-            }
             if (!std::holds_alternative<CNoDestination>(coin_control.destChange)) {
                 // FAIL CLOSED: only a plain P2PKH change destination is
-                // acceptable in the legacy era. A bare witness program is
-                // anyone-can-spend, and a P2SH address is OPAQUE -- it may
-                // wrap a witness script (P2SH-SegWit), which becomes
-                // anyone-can-spend the moment its redeem script is revealed.
-                // Change belongs to this wallet; restricting an explicit
-                // override to the one provably safe type costs nothing.
+                // acceptable in the legacy era. A P2SH address is opaque and
+                // may wrap a witness program whose authorization is not active
+                // there. Change belongs to this wallet, so restricting an
+                // explicit override to the provably safe type costs nothing.
                 if (!std::holds_alternative<PKHash>(coin_control.destChange)) {
                     return util::Error{_("Refusing this change address: only a legacy (P2PKH) "
-                                         "change destination is safe under the legacy B3 "
-                                         "consensus rules (witness and P2SH-wrapped outputs "
-                                         "are unprotected).")};
+                                         "change destination is safe in the legacy B3 era.")};
                 }
             }
         }
@@ -1150,16 +1263,21 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     coin_selection_params.m_long_term_feerate = wallet.m_consolidate_feerate;
     // Static vsize overhead + outputs vsize. 4 nVersion, 4 nLocktime, 1 input count, 1 witness overhead (dummy, flag, stack size)
     coin_selection_params.tx_noinputs_size = 10 + GetSizeOfCompactSize(vecSend.size()); // bytes for output count
+    // MPA bytes carry full weight. Count them before selection; relying only
+    // on the final signed-size pass can leave an exact/no-change selection
+    // short of its requested feerate.
+    coin_selection_params.tx_noinputs_size +=
+        GetMpaSectionSerializedSize(modern_options.mpa);
 
     CAmount recipients_sum = 0;
     OutputType change_type = wallet.TransactionChangeType(coin_control.m_change_type ? *coin_control.m_change_type : wallet.m_default_change_type, vecSend);
-    // B3 legacy era: an EXPLICIT change_type reaches ReserveDestination
-    // without passing the address-handout guard. A witness change output
-    // would be anyone-can-spend under legacy consensus -- refuse it here,
-    // at the last resolution point before reservation.
-    if (txNew.m_legacy_encoding && change_type != OutputType::LEGACY) {
-        return util::Error{_("Refusing a SegWit/Taproot change type: witness outputs are "
-                             "unprotected (anyone-can-spend) under the legacy B3 consensus rules.")};
+    // An explicit change_type reaches ReserveDestination without passing the
+    // address-handout guard. Enforce the B3 policy at the last resolution
+    // point before a key is reserved.
+    if (Params().GetConsensus().legacy_b3coin &&
+        change_type != OutputType::LEGACY) {
+        return util::Error{_("B3 witness addresses are not active in this "
+                             "release. Use a legacy change type.")};
     }
     ReserveDestination reservedest(&wallet, change_type);
     unsigned int outputs_to_subtract_fee_from = 0; // The number of outputs which we are subtracting the fee from
@@ -1173,10 +1291,24 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         recipients_sum += recipient.nAmount;
 
         if (recipient.fSubtractFeeFromAmount) {
+            if (modern_options.native_disintegration != 0) {
+                return util::Error{_("Cannot subtract fees from recipients in a disintegration transaction")};
+            }
             outputs_to_subtract_fee_from++;
             coin_selection_params.m_subtract_fee_outputs = true;
         }
     }
+
+    // Relay vsize is the maximum of physical vsize and declared payload
+    // verification cost. Coin selection otherwise sees only the physical MPA
+    // bytes and can choose a target which the final size check proves is
+    // underfunded (notably for the 700-unit FlowMesh seat binding). Using the
+    // payload floor as the no-input baseline is conservative while inputs are
+    // still unknown; the ordinary final change adjustment returns any excess
+    // and leaves the exact required fee.
+    coin_selection_params.tx_noinputs_size = std::max(
+        coin_selection_params.tx_noinputs_size,
+        static_cast<int>(modern::PayloadVerifyCost(CTransaction{txNew})));
 
     // Create change script that will be used if we need change
     CScript scriptChange;
@@ -1268,7 +1400,14 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
 
     // Include the fees for things that aren't inputs, excluding the change output
     const CAmount not_input_fees = coin_selection_params.m_effective_feerate.GetFee(coin_selection_params.m_subtract_fee_outputs ? 0 : coin_selection_params.tx_noinputs_size);
-    CAmount selection_target = recipients_sum + not_input_fees;
+    if (recipients_sum > MAX_MONEY - modern_options.native_disintegration ||
+        recipients_sum + modern_options.native_disintegration >
+            MAX_MONEY - not_input_fees) {
+        return util::Error{_("Transaction target amount is out of range")};
+    }
+    CAmount selection_target = recipients_sum +
+                               modern_options.native_disintegration +
+                               not_input_fees;
 
     // This can only happen if feerate is 0, and requested destinations are value of 0 (e.g. OP_RETURN)
     // and no pre-selected inputs. This will result in 0-input transaction, which is consensus-invalid anyways
@@ -1287,8 +1426,29 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     // Fetch wallet available coins if "other inputs" are
     // allowed (coins automatically selected by the wallet)
     CoinsResult available_coins;
+    CAmount unavailable_witness_amount{0};
     if (coin_control.m_allow_other_inputs) {
         available_coins = AvailableCoins(wallet, &coin_control, coin_selection_params.m_effective_feerate);
+
+        // Keep old witness-owned outputs visible in wallet history and coin
+        // control, but never choose them automatically while this B3 release
+        // cannot confirm their witness authorization. Users who explicitly
+        // select one receive the precise FetchSelectedInputs error above.
+        if (Params().GetConsensus().legacy_b3coin) {
+            std::unordered_set<COutPoint, SaltedOutpointHasher> unavailable;
+            for (const COutput& coin : available_coins.All()) {
+                const CScript authorization_script{
+                    WalletInputAuthorizationScript(
+                        &wallet, coin.outpoint, coin.txout)};
+                if (!ScriptRequiresInactiveB3Witness(
+                        wallet, authorization_script)) {
+                    continue;
+                }
+                unavailable.insert(coin.outpoint);
+                unavailable_witness_amount += coin.txout.nValue;
+            }
+            available_coins.Erase(unavailable);
+        }
     }
 
     // Choose coins to use
@@ -1300,6 +1460,14 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
 
         // Check if we have enough balance but cannot cover the fees
         CAmount available_balance = preset_inputs.GetTotalAmount() + available_coins.GetTotalAmount();
+        if (unavailable_witness_amount > 0 &&
+            available_balance < selection_target &&
+            unavailable_witness_amount >= selection_target - available_balance) {
+            return util::Error{_(
+                "The wallet has enough value only in witness-owned outputs. "
+                "B3 witness addresses are not active in this release; select "
+                "a legacy-owned input.")};
+        }
         // Note: if SelectCoins() fails when SFFO is enabled (recipients_sum = selection_target with SFFO),
         // then recipients_sum > available_balance and we wouldn't enter into the if condition below.
         if (available_balance >= recipients_sum) {
@@ -1411,18 +1579,26 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     CAmount fee_needed = coin_selection_params.m_effective_feerate.GetFee(nBytes) + result.GetTotalBumpFees();
     const CAmount output_value = CalculateOutputValue(txNew);
     Assume(recipients_sum + change_amount == output_value);
-    CAmount current_fee = result.GetSelectedValue() - output_value;
+    CAmount current_gap = result.GetSelectedValue() - output_value;
 
-    // Sanity check that the fee cannot be negative as that means we have more output value than input value
-    if (current_fee < 0) {
-        return util::Error{Untranslated(STR_INTERNAL_BUG("Fee paid < 0"))};
+    // The native gap consists of an intentional consensus destruction plus
+    // the ordinary network fee. Keep the two values separate throughout the
+    // wallet path: only the latter is paid to a producer or compared against
+    // -maxtxfee.
+    if (current_gap < modern_options.native_disintegration) {
+        return util::Error{Untranslated(STR_INTERNAL_BUG("Native gap below disintegration"))};
     }
+    CAmount current_fee{current_gap - modern_options.native_disintegration};
 
     // If there is a change output and we overpay the fees then increase the change to match the fee needed
     if (change_pos && fee_needed < current_fee) {
         auto& change = txNew.vout.at(*change_pos);
         change.nValue += current_fee - fee_needed;
-        current_fee = result.GetSelectedValue() - CalculateOutputValue(txNew);
+        current_gap = result.GetSelectedValue() - CalculateOutputValue(txNew);
+        if (current_gap < modern_options.native_disintegration) {
+            return util::Error{Untranslated(STR_INTERNAL_BUG("Change adjustment consumed disintegration"))};
+        }
+        current_fee = current_gap - modern_options.native_disintegration;
         if (fee_needed != current_fee) {
             return util::Error{Untranslated(STR_INTERNAL_BUG("Change adjustment: Fee needed != fee paid"))};
         }
@@ -1461,7 +1637,8 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
             }
             ++i;
         }
-        current_fee = result.GetSelectedValue() - CalculateOutputValue(txNew);
+        current_gap = result.GetSelectedValue() - CalculateOutputValue(txNew);
+        current_fee = current_gap;
         if (fee_needed != current_fee) {
             return util::Error{Untranslated(STR_INTERNAL_BUG("SFFO: Fee needed != fee paid"))};
         }
@@ -1509,8 +1686,8 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     reservedest.KeepDestination();
 
     wallet.WalletLogPrintf("Coin Selection: Algorithm:%s, Waste Metric Score:%d\n", GetAlgorithmName(result.GetAlgo()), result.GetWaste());
-    wallet.WalletLogPrintf("Fee Calculation: Fee:%d Bytes:%u Tgt:%d (requested %d) Reason:\"%s\" Decay %.5f: Estimation: (%g - %g) %.2f%% %.1f/(%.1f %d mem %.1f out) Fail: (%g - %g) %.2f%% %.1f/(%.1f %d mem %.1f out)\n",
-              current_fee, nBytes, feeCalc.returnedTarget, feeCalc.desiredTarget, StringForFeeReason(feeCalc.reason), feeCalc.est.decay,
+    wallet.WalletLogPrintf("Fee Calculation: Fee:%d Disintegration:%d Bytes:%u Tgt:%d (requested %d) Reason:\"%s\" Decay %.5f: Estimation: (%g - %g) %.2f%% %.1f/(%.1f %d mem %.1f out) Fail: (%g - %g) %.2f%% %.1f/(%.1f %d mem %.1f out)\n",
+              current_fee, modern_options.native_disintegration, nBytes, feeCalc.returnedTarget, feeCalc.desiredTarget, StringForFeeReason(feeCalc.reason), feeCalc.est.decay,
               feeCalc.est.pass.start, feeCalc.est.pass.end,
               (feeCalc.est.pass.totalConfirmed + feeCalc.est.pass.inMempool + feeCalc.est.pass.leftMempool) > 0.0 ? 100 * feeCalc.est.pass.withinTarget / (feeCalc.est.pass.totalConfirmed + feeCalc.est.pass.inMempool + feeCalc.est.pass.leftMempool) : 0.0,
               feeCalc.est.pass.withinTarget, feeCalc.est.pass.totalConfirmed, feeCalc.est.pass.inMempool, feeCalc.est.pass.leftMempool,
@@ -1527,6 +1704,18 @@ util::Result<CreatedTransactionResult> CreateTransaction(
         const CCoinControl& coin_control,
         bool sign)
 {
+    return CreateTransaction(wallet, vecSend, change_pos, coin_control, sign,
+                             ModernTransactionOptions{});
+}
+
+util::Result<CreatedTransactionResult> CreateTransaction(
+        CWallet& wallet,
+        const std::vector<CRecipient>& vecSend,
+        std::optional<unsigned int> change_pos,
+        const CCoinControl& coin_control,
+        bool sign,
+        const ModernTransactionOptions& modern_options)
+{
     if (vecSend.empty()) {
         return util::Error{_("Transaction must have at least one recipient")};
     }
@@ -1537,7 +1726,8 @@ util::Result<CreatedTransactionResult> CreateTransaction(
 
     LOCK(wallet.cs_wallet);
 
-    auto res = CreateTransactionInternal(wallet, vecSend, change_pos, coin_control, sign);
+    auto res = CreateTransactionInternal(wallet, vecSend, change_pos, coin_control,
+                                         sign, modern_options);
     TRACEPOINT(coin_selection, normal_create_tx_internal,
            wallet.GetName().c_str(),
            bool(res),
@@ -1546,7 +1736,8 @@ util::Result<CreatedTransactionResult> CreateTransaction(
     if (!res) return res;
     const auto& txr_ungrouped = *res;
     // try with avoidpartialspends unless it's enabled already
-    if (txr_ungrouped.fee > 0 /* 0 means non-functional fee rate estimation */ && wallet.m_max_aps_fee > -1 && !coin_control.m_avoid_partial_spends) {
+    if (modern_options.native_disintegration == 0 &&
+        txr_ungrouped.fee > 0 /* 0 means non-functional fee rate estimation */ && wallet.m_max_aps_fee > -1 && !coin_control.m_avoid_partial_spends) {
         TRACEPOINT(coin_selection, attempting_aps_create_tx, wallet.GetName().c_str());
         CCoinControl tmp_cc = coin_control;
         tmp_cc.m_avoid_partial_spends = true;
@@ -1556,7 +1747,8 @@ util::Result<CreatedTransactionResult> CreateTransaction(
             ExtractDestination(txr_ungrouped.tx->vout[*txr_ungrouped.change_pos].scriptPubKey, tmp_cc.destChange);
         }
 
-        auto txr_grouped = CreateTransactionInternal(wallet, vecSend, change_pos, tmp_cc, sign);
+        auto txr_grouped = CreateTransactionInternal(wallet, vecSend, change_pos,
+                                                     tmp_cc, sign, modern_options);
         // if fee of this alternative one is within the range of the max fee, we use this one
         const bool use_aps{txr_grouped.has_value() ? (txr_grouped->fee <= txr_ungrouped.fee + wallet.m_max_aps_fee) : false};
         TRACEPOINT(coin_selection, aps_create_tx_internal,

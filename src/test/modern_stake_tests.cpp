@@ -2,12 +2,15 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
+#include <addresstype.h>
 #include <consensus/params.h>
 #include <crypto/sha256.h>
+#include <modern/asset_output.h>
 #include <modern/policy.h>
 #include <modern/stake.h>
 #include <node/stake_registry.h>
 #include <primitives/transaction.h>
+#include <script/interpreter.h>
 #include <script/script.h>
 
 #include <boost/test/unit_test.hpp>
@@ -152,6 +155,103 @@ BOOST_AUTO_TEST_CASE(claiming_but_malformed_outputs_are_invalid)
     tx.vout.pop_back();
     tx.vout.emplace_back(0, MakeStakeScript(TestKey(), owner)); // zero principal
     BOOST_CHECK(!modern::CheckStakeOutputs(CTransaction{tx}, params, error));
+}
+
+BOOST_AUTO_TEST_CASE(stake_rejects_nested_special_owner_scripts)
+{
+    constexpr script_verify_flags modern_flags{
+        SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT};
+    Consensus::Params params;
+    params.min_stake_amount = 500;
+    std::string error;
+    ScriptError script_error;
+
+    // P2SH is special only when it is the complete scriptPubKey. Behind the
+    // B3S1 prefix, merely revealing the redeem-script preimage satisfies the
+    // hash equality; the redeem script itself is not executed. OP_FALSE makes
+    // that distinction explicit here.
+    const CScript redeem_script{CScript() << OP_FALSE};
+    const CScript p2sh_owner{
+        GetScriptForDestination(ScriptHash{redeem_script})};
+    const CScript p2sh_stake{MakeStakeScript(TestKey(), p2sh_owner)};
+    CScript p2sh_unlock;
+    p2sh_unlock << std::vector<unsigned char>{redeem_script.begin(),
+                                               redeem_script.end()};
+    BOOST_REQUIRE(VerifyScript(p2sh_unlock, p2sh_stake, nullptr,
+                               modern_flags, BaseSignatureChecker{},
+                               &script_error));
+    BOOST_CHECK(!ParseStakeOutput(CTxOut{500, p2sh_stake}, error));
+    BOOST_CHECK_EQUAL(error, "stake owner script cannot be P2SH");
+
+    CMutableTransaction p2sh_tx;
+    p2sh_tx.vout.emplace_back(500, p2sh_stake);
+    BOOST_CHECK(!modern::CheckStakeOutputs(CTransaction{p2sh_tx}, params,
+                                           error));
+    BOOST_CHECK_EQUAL(error, "stake owner script cannot be P2SH");
+
+    // A witness program has the same problem: because the carrier prefix
+    // means the whole script is not a witness program, consensus executes the
+    // version/program pushes as ordinary opcodes and no witness key is checked.
+    const CScript witness_owner{
+        CScript() << OP_0 << std::vector<unsigned char>(20, 0x22)};
+    const CScript witness_stake{MakeStakeScript(TestKey(), witness_owner)};
+    BOOST_REQUIRE(VerifyScript(CScript{}, witness_stake, nullptr,
+                               modern_flags, BaseSignatureChecker{},
+                               &script_error));
+    BOOST_CHECK(!ParseStakeOutput(CTxOut{500, witness_stake}, error));
+    BOOST_CHECK_EQUAL(error,
+                      "stake owner script cannot be a witness program");
+
+    CMutableTransaction witness_tx;
+    witness_tx.vout.emplace_back(500, witness_stake);
+    BOOST_CHECK(!modern::CheckStakeOutputs(CTransaction{witness_tx}, params,
+                                           error));
+    BOOST_CHECK_EQUAL(error,
+                      "stake owner script cannot be a witness program");
+
+    // Ordinary bare suffixes really are executed after OP_DROP.
+    const CScript bare_false_stake{
+        MakeStakeScript(TestKey(), CScript() << OP_FALSE)};
+    BOOST_CHECK(ParseStakeOutput(CTxOut{500, bare_false_stake}, error));
+    BOOST_CHECK(!VerifyScript(CScript{}, bare_false_stake, nullptr,
+                              modern_flags, BaseSignatureChecker{},
+                              &script_error));
+
+    // Nesting a B3A1 asset carrier under B3S1 used to hide the same P2SH
+    // suffix one layer deeper. The raw script could pass without executing
+    // the redeem script, so the STAKE parser must reject the inner namespace.
+    const auto inner_asset{modern::MakeAssetOwnerOutput(
+        uint256::ONE, 1, modern::PolicyType::OWNER, p2sh_owner)};
+    BOOST_REQUIRE(inner_asset.has_value());
+    const CScript stake_with_asset{
+        MakeStakeScript(TestKey(), inner_asset->scriptPubKey)};
+    BOOST_REQUIRE(VerifyScript(p2sh_unlock, stake_with_asset, nullptr,
+                               modern_flags, BaseSignatureChecker{},
+                               &script_error));
+    BOOST_CHECK(!ParseStakeOutput(CTxOut{500, stake_with_asset}, error));
+    BOOST_CHECK_EQUAL(error,
+                      "stake owner script cannot be another B3 policy carrier");
+
+    // The reverse nesting was equally unsafe: B3A1 removes only its own
+    // envelope, leaving B3S1 plus P2SH to execute as ordinary opcodes.
+    const CScript inner_stake{MakeStakeScript(TestKey(0x44), p2sh_owner)};
+    const auto asset_template{modern::MakeAssetOwnerOutput(
+        uint256::ONE, 1, modern::PolicyType::OWNER, CScript() << OP_TRUE)};
+    BOOST_REQUIRE(asset_template.has_value());
+    CScript::const_iterator pc{asset_template->scriptPubKey.begin()};
+    opcodetype opcode;
+    std::vector<unsigned char> asset_payload;
+    BOOST_REQUIRE(asset_template->scriptPubKey.GetOp(pc, opcode, asset_payload));
+    CScript asset_with_stake;
+    asset_with_stake << asset_payload << OP_DROP;
+    asset_with_stake.insert(asset_with_stake.end(), inner_stake.begin(),
+                            inner_stake.end());
+    BOOST_REQUIRE(VerifyScript(p2sh_unlock, asset_with_stake, nullptr,
+                               modern_flags, BaseSignatureChecker{},
+                               &script_error, /*enable_asset_owner=*/true));
+    BOOST_CHECK(!modern::ParseAssetOutput(CTxOut{0, asset_with_stake}, error));
+    BOOST_CHECK_EQUAL(error,
+                      "asset owner suffix cannot be another B3 policy carrier");
 }
 
 BOOST_AUTO_TEST_CASE(stake_activation_depth_exact_boundary)

@@ -27,13 +27,15 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 # Project / Package metadata
 #=============================
 set(CLIENT_NAME "B3 FlowMesh client")
-# B3 Hive product versioning (owner ruling 2026-08-26): the v1 release is
-# "B3 Hive 1.0.0", retiring the inherited Bitcoin Core 31.x numbering.
+# B3 Hive product versioning. v1.1.1 is the audited transition follow-up to
+# the already-tagged v1.1.0; P2P protocol versioning remains independent.
 # The P2P protocol version is a separate constant and is unaffected.
 set(CLIENT_VERSION_MAJOR 1)
-set(CLIENT_VERSION_MINOR 0)
-set(CLIENT_VERSION_BUILD 0)
+set(CLIENT_VERSION_MINOR 1)
+set(CLIENT_VERSION_BUILD 1)
 set(CLIENT_VERSION_RC 0)
+# Public validator-bootstrap beta. Clear this for the final v1.1.1 tag.
+set(CLIENT_VERSION_PRERELEASE "beta.2")
 set(CLIENT_VERSION_IS_RELEASE "true")
 set(COPYRIGHT_YEAR "2026")
 
@@ -61,8 +63,15 @@ project(B3CoinCore
 )
 
 set(CLIENT_VERSION_STRING ${PROJECT_VERSION})
-if(CLIENT_VERSION_RC GREATER 0)
+if(NOT CLIENT_VERSION_PRERELEASE STREQUAL "" AND
+   NOT CLIENT_VERSION_PRERELEASE MATCHES "^[0-9A-Za-z]+([.-][0-9A-Za-z]+)*$")
+  message(FATAL_ERROR "Invalid CLIENT_VERSION_PRERELEASE: ${CLIENT_VERSION_PRERELEASE}")
+elseif(CLIENT_VERSION_RC GREATER 0 AND NOT CLIENT_VERSION_PRERELEASE STREQUAL "")
+  message(FATAL_ERROR "CLIENT_VERSION_RC and CLIENT_VERSION_PRERELEASE are mutually exclusive")
+elseif(CLIENT_VERSION_RC GREATER 0)
   string(APPEND CLIENT_VERSION_STRING "rc${CLIENT_VERSION_RC}")
+elseif(NOT CLIENT_VERSION_PRERELEASE STREQUAL "")
+  string(APPEND CLIENT_VERSION_STRING "-${CLIENT_VERSION_PRERELEASE}")
 endif()
 
 set(COPYRIGHT_HOLDERS "The %s developers")
@@ -187,7 +196,7 @@ endif()
 
 option(BUILD_BENCH "Build bench_bitcoin executable." OFF)
 option(B3_FINALITY_BENCH "Build the B3 finality benchmark harness (timing of the consensus BLS wrapper and MPA codecs)." OFF)
-option(B3_BRIDGE_TOOLS "Build the B3 bridge verification harness (b3-bridge-ethcheck relayer dry-run; test/tooling only, never part of the node)." OFF)
+option(B3_BRIDGE_TOOLS "Build the B3 bridge proof/payload verifier and bootstrap-calldata tools (operator/test tooling only, never part of the node)." OFF)
 option(B3_UPDATE_TOOLS "Build the offline B3 Hive release-manifest signing tool (b3hive-sign; operator tooling, never part of the node)." OFF)
 # The vendored blst (src/blst) is a consensus dependency of crypto/bls since
 # plan Commit 2 (cmake/blst.cmake). Upstream defines exactly two build paths

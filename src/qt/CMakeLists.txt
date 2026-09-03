@@ -196,6 +196,8 @@ if(ENABLE_WALLET)
       b3dashboardpage.h
       b3stakepage.cpp
       b3stakepage.h
+      b3validatorcontroller.cpp
+      b3validatorcontroller.h
       coincontroldialog.cpp
       coincontroldialog.h
       coincontroltreewidget.cpp

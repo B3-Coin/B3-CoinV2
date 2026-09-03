@@ -6,8 +6,11 @@
 OD-8 in [b3-open-decisions.md](b3-open-decisions.md), and the consensus rules in the tree
 (`src/modern/*`, `src/consensus/*`, `src/validation.cpp`, `src/node/stake_tracker.*`).
 Goal: B3 consensus born compatible with BLS finality and future Ethereum verification.
-No code, no implementation; the bridge is not redesigned and no bridge mechanism is added.
-Findings marked ⚠ require an owner ruling; ✔ = confirmed consistent; ✎ = editorial.**
+This is a historical 2026-08-23 audit. The 2026-09-02 implementation amendment
+replaces its OpenZeppelin multiproof realization with index-sensitive ordered
+depth-13 paths and performs epoch rotation only after successor-set signature
+verification. Findings marked ⚠ require an owner ruling; ✔ = confirmed
+consistent as of the original audit; ✎ = editorial.**
 
 ---
 
@@ -78,7 +81,7 @@ Confirmations under the amended rule:
 | Old set authorizes next set | On Ethereum: always (only certificates of `Set_e` disclose `Set_{e+1}`). On B3: `Set_{e+1}` is *derived* from chain state by V1 consensus and *attested* by `Set_e`'s certificate; it can never become the signing set before that attestation exists on-chain. ✔ |
 | No set appears without previous authority | Ethereum side: structurally impossible (`fb.epoch == current+1` requires `nextSetHash != 0`). B3 side: gated rotation gives the same property. ✔ after F-2 |
 | Rotation only AFTER a valid transition certificate | ✔ after F-2 (was ✘ in the fixed-height text) |
-| Long-range | Ethereum: `MAX_EPOCH_LAG` on rotation; B3: `MAX_EPOCH_EXTENSION`, finality pin, reorg horizon 1,440; snapshot block is an ancestor of the certified checkpoint, so the set definition is itself finalized by the certificate. ✔ Residual (A2/A3 in the design record): > 2/3 weight or a stale verifier beyond the lag bound — the assumption, not a gap. |
+| Long-range | Ethereum: absolute `GENESIS_TIME` epoch windows, `MAX_EPOCH_LAG`, and at least `MIN_EPOCH_DURATION` between accepted rotations; B3: `MAX_EPOCH_EXTENSION`, finality pin, reorg horizon 1,440; snapshot block is an ancestor of the certified checkpoint, so the set definition is itself finalized by the certificate. Rapid backlog epoch-walking is blocked, but honest catch-up takes one interval per rotation. Residual (A2/A3): > 2/3 weight or historical keys maintaining a competing lineage in real time remains the ordinary weak-subjectivity assumption. ✔ amended 2026-09-02 |
 | Ethereum follows the same chain of transitions | Identical rule on both sides: `e → e+1` strictly, any checkpoint inside an epoch, successor disclosed by the first certificate of `e`. ✔ |
 
 ---
@@ -88,9 +91,9 @@ Confirmations under the amended rule:
 | Rule | Specification |
 |---|---|
 | Finalized object | `FinalizedBlock{height, block_hash, withdrawal_root, validator_set_hash(successor), epoch}` of a checkpoint block (`(h−M) mod CHECKPOINT_INTERVAL = 0`, depth ≥ `CHECKPOINT_DEPTH`; plus every block that ends an epoch under §3). |
-| Quorum | `signed_weight ≥ floor(2W/3) + 1` (ruleset 1); `W` and all `w_i` in whole modern B3 (`/10^9`), u64; min stake 333 ⇒ `w_i ≥ 333`. ✔ |
-| Stake weighting | `w_i` = ACTIVE principal per `validator_key` at the snapshot height (`StakeTracker::ActiveWeight` semantics; 20-block maturity); `w_i = 0` excluded; head-count irrelevant. ✔ (engineering: the tracker exposes per-key weight; a **full-set enumeration at a height** is required for `Snapshot` — not a protocol change) |
-| Certificate validation order | 1 carrier syntax (coinbase, ≤ 1, magic, minimal push, exact length for the epoch's `n`) → 2 `epoch ∈ {current, current−1}` and checkpoint height inside that epoch's range and `> finalized_tip.height` → 3 checkpoint `block_hash` is the ancestor at that height on this chain (block index, cheap) → 4 bitmap rules → 5 quorum by weight → 6 `FastAggregateVerify` (`blst`, last, expensive) → 7 on connect: `finalized_tip = checkpoint`. Failures: `bad-finality-cert-form` / `bad-finality-cert`; block invalid; no peer penalty beyond the usual invalid-block handling. ⚠ (the `{current, current−1}` window is new — needed so a higher epoch-`e` checkpoint can still be certified in the first blocks of `e+1`) |
+| Quorum | `signed_weight ≥ floor(2W/3) + 1` **and** `signed_count ≥ floor(2n/3) + 1` (ruleset 1); `W` and all `w_i` are whole modern B3 (`/10^9`), u64; min stake 333 ⇒ `w_i ≥ 333`. ✔ amended 2026-09-02 |
+| Stake weighting | `w_i` = ACTIVE principal per `validator_key` at the snapshot height (`StakeTracker::ActiveWeight` semantics; 20-block maturity); `w_i = 0` excluded. Stake weight and validator headcount are independent quorum gates; neither substitutes for the other. ✔ amended 2026-09-02 (engineering: the tracker exposes per-key weight; a **full-set enumeration at a height** is required for `Snapshot` — not a protocol change) |
+| Certificate validation order | 1 carrier syntax (coinbase, ≤ 1, magic, minimal push, exact length for the epoch's `n`) → 2 `epoch ∈ {current, current−1}` and checkpoint height inside that epoch's range and `> finalized_tip.height` → 3 checkpoint `block_hash` is the ancestor at that height on this chain (block index, cheap) → 4 bitmap rules → 5 quorum by weight and headcount → 6 `FastAggregateVerify` (`blst`, last, expensive) → 7 on connect: `finalized_tip = checkpoint`. Failures: `bad-finality-cert-form` / `bad-finality-cert`; block invalid; no peer penalty beyond the usual invalid-block handling. ⚠ (the `{current, current−1}` window is new — needed so a higher epoch-`e` checkpoint can still be certified in the first blocks of `e+1`) |
 | Reorg after finality | From F: a reorganization that would disconnect `finalized_tip` is refused (`modern-finality-violation`), no peer penalty, skipped during reindex/import; horizon (1,440) and `AbandonOffAnchorTip` semantics unchanged. Pins apply only on the active chain at connect time; side-chain certificates are validated in their own chain context but never pin. ✔ |
 | Validators fail to certify | Chain continues under V1 (blocks do not depend on certificates); epoch extends (§3); withdrawals wait; past `MAX_EPOCH_EXTENSION` the lineage is broken → consensus re-bootstrap release. No loss, no halt of B3. ✔ |
 | Signing discipline (node) | one signature per height, increasing heights, descendants of the latest certified checkpoint only; `finsig` relay bounded. ✔ |
@@ -101,12 +104,13 @@ Confirmations under the amended rule:
 
 | Stores | genesis `SetHeader` + hash (contains the genesis `members_root`), `setHashByEpoch[e]` (epoch headers by hash), `currentSetHash` + header, `nextSetHash` + header, `latest{height, hash, withdrawalRoot}`, `lastRotationTime`, `prover`. **No member list.** ✔ |
 |---|---|
-| `members_root` proof model | fixed depth 13 (8,192), leaf `keccak(u32 i ‖ pk48 ‖ u64 w)`, zero-leaf padding; absentees proven by OZ-style multiproof; membership + weights come only from proofs + the signed header. ✔ |
+| `members_root` proof model | fixed depth 13 (8,192), leaf `keccak(u32 i ‖ pk48 ‖ u64 w)`, zero-leaf padding; the current implementation proves each absentee with an ordered 13-sibling path because node hashing is index-sensitive; membership + weights come only from proofs + the signed header. ✔ amended 2026-09-02 |
 | Signer bitmap | `⌈n/8⌉` bytes, LSB-first, high bits zero, absentee bits zero, `popcount + |absent| = n`. ✔ |
 | Aggregate BLS | `aggPk = aggregate_pubkey − Σ absent` (G1ADD of negations), `Hm = hash_to_G2(digest)`, pairing `e(aggPk,Hm)·e(−G1,sig)=1` via EIP-2537; `aggregate_pubkey` is consensus-computed on B3 and attested by the signing quorum. ✔ |
-| Quorum | `signedWeight ≥ quorumWeight` and `quorumWeight == (2W)/3 + 1` enforced on-chain for ruleset 1; unknown ruleset rejected. ✔ |
-| Withdrawal root | single cumulative depth-32 keccak tree, leaf with `origin_chain_id`, index = `withdrawal_id`; release = path to `latest.withdrawalRoot` ∧ chain id ∧ unreleased ∧ asset table. ✔ (all-zero root before A3) |
-| Epoch transition | `fb.epoch == current` or `current+1` with `nextSetHash != 0`; rotation before verification; successor header hash-checked and rule-checked. Matches B3 §3 after F-2. ✔ |
+| Quorum | B3 and Ethereum both enforce `signedWeight ≥ quorumWeight`, `quorumWeight == (2W)/3 + 1`, and `signerCount ≥ floor(2n/3)+1` for ruleset 1; unknown ruleset rejected. ✔ aligned 2026-09-02 |
+| Withdrawal root | single cumulative depth-32 keccak tree, leaf with `origin_chain_id`, index = `withdrawal_id`; release = path to `latest.withdrawalRoot` ∧ chain id ∧ unreleased ∧ asset table. ✔ (all-zero before inbound bridge activation B; from B it is the nonzero canonical empty/current tree root even while the separate burn height W is unset; A3 is unrelated) |
+| Epoch transition | `fb.epoch == current` or `current+1` with `nextSetHash != 0`; the precommitted successor verifies first and rotation occurs only after proof acceptance; successor header is hash-checked and rule-checked. Matches B3 §3 after F-2. ✔ amended 2026-09-02 |
+| Bridge gas ceiling | `MAX_BRIDGE_VALIDATORS=64`; 64 distinct PoP keys, 43 signers and 21 absent paths verify under post-Fusaka Osaka in 18,144 proof bytes / 18,724 submit calldata bytes / 5,513,351 gas for the complete successful verifier call. Conservative EIP-7623 calldata gives 6,283,311 total, below EIP-7825. Larger current/successor sets close `bridgeReady`. ✔ measured 2026-09-02 |
 
 ---
 

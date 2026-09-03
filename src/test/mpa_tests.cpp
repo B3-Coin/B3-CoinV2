@@ -2,17 +2,20 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 //
-// Commit 5 of the Modern PoS V1 finality plan: Modern Payload Area
+// Modern Payload Area
 // serialization (BIP144 flag 0x02 under the Modern context only), canonical
 // encoding, the typed/versioned registry (unknown / known-inactive / active),
 // activation fail-closed behaviour, and the transaction-identity guardrail
-// (txid excludes the MPA; wtxid unchanged; no new identity yet).
+// (txid excludes the MPA; ptxid and the wtxid-shaped relay slot commit to it).
 
+#include <bridge/proof.h>
 #include <chainparams.h>
 #include <consensus/consensus.h>
 #include <consensus/params.h>
 #include <hash.h>
+#include <kernel/chainparams.h>
 #include <legacy/codec.h>
+#include <modern/bridge_binding.h>
 #include <modern/creation_action.h>
 #include <modern/finality_types.h>
 #include <modern/mpa.h>
@@ -268,7 +271,7 @@ BOOST_AUTO_TEST_CASE(registry_and_activation_fail_closed)
     // Statuses
     for (const uint16_t t : {1, 2, 3}) {
         BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, production) == PayloadTypeStatus::INACTIVE);
-        BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, active) == PayloadTypeStatus::INACTIVE); // 1-3 never silently activate
+        BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, active) == PayloadTypeStatus::INACTIVE);
         BOOST_CHECK(modern::GetPayloadTypeStatus(t, 2, active) == PayloadTypeStatus::UNKNOWN);
     }
     // 4 (certificate, Commit 12) and 5 (key evidence): production inactive,
@@ -278,7 +281,15 @@ BOOST_AUTO_TEST_CASE(registry_and_activation_fail_closed)
         BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, active) == PayloadTypeStatus::ACTIVE);
         BOOST_CHECK(modern::GetPayloadTypeStatus(t, 2, active) == PayloadTypeStatus::UNKNOWN);
     }
-    for (const uint16_t t : {0, 6, 7, 99, 65535}) BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, active) == PayloadTypeStatus::UNKNOWN);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(6, 1, active) == PayloadTypeStatus::INACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(6, 2, active) == PayloadTypeStatus::UNKNOWN);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(7, 1, active) == PayloadTypeStatus::INACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(7, 2, active) == PayloadTypeStatus::UNKNOWN);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(8, 1, active) == PayloadTypeStatus::INACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(9, 1, active) == PayloadTypeStatus::INACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(10, 1, active) == PayloadTypeStatus::INACTIVE);
+    BOOST_CHECK(modern::GetPayloadTypeStatus(10, 2, active) == PayloadTypeStatus::UNKNOWN);
+    for (const uint16_t t : {0, 99, 65535}) BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, active) == PayloadTypeStatus::UNKNOWN);
     std::string err;
     // Production: any MPA is invalid (not active), even a perfectly formed type-5 record.
     {
@@ -297,9 +308,13 @@ BOOST_AUTO_TEST_CASE(registry_and_activation_fail_closed)
     }
     {
         CMutableTransaction tx{BaseTx()};
-        tx.mpa.push_back(Rec(9, 1, {0x00}));
+        tx.mpa.push_back(Rec(10, 1, {0x00}));
+        const auto binding{modern::MakeBridgeBindingOutput(tx.mpa.front())};
+        BOOST_REQUIRE(binding);
+        tx.vout.push_back(*binding);
         BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{tx}, active, err));
-        BOOST_CHECK_EQUAL(err, "mpa-unknown-type");
+        BOOST_CHECK_EQUAL(err, "mpa-inactive-type");
+        tx.vout.pop_back();
         tx.mpa[0] = Rec(5, 2, Evidence244());
         BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{tx}, active, err));
         BOOST_CHECK_EQUAL(err, "mpa-unknown-type");
@@ -325,16 +340,100 @@ BOOST_AUTO_TEST_CASE(registry_and_activation_fail_closed)
         BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{tx}, active, err));
         BOOST_CHECK_EQUAL(err, "mpa-record-order");
     }
-    // No chainparams enable the context.
-    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::REGTEST}) {
-        BOOST_CHECK(!Consensus::ModernObjectRulesActive(CreateChainParams(ArgsManager{}, chain)->GetConsensus()));
+    // The sealed mainnet transition enables the modern-object context. Other
+    // ordinary shipped networks remain unpinned and fail closed; the complete
+    // FlowMesh regtest exists only behind explicit test options.
+    BOOST_CHECK(Consensus::ModernObjectRulesActive(
+        CreateChainParams(ArgsManager{}, ChainType::MAIN)->GetConsensus()));
+    for (const auto chain : {ChainType::TESTNET, ChainType::TESTNET4,
+                             ChainType::SIGNET, ChainType::REGTEST}) {
+        BOOST_CHECK(!Consensus::ModernObjectRulesActive(
+            CreateChainParams(ArgsManager{}, chain)->GetConsensus()));
     }
-    // The test-only creation-action registry is unchanged: 1-3 known there, 4/5 not.
-    BOOST_CHECK(modern::IsKnownCreationAction(1, 1) && modern::IsKnownCreationAction(2, 1) && modern::IsKnownCreationAction(3, 1));
-    BOOST_CHECK(!modern::IsKnownCreationAction(4, 1) && !modern::IsKnownCreationAction(5, 1));
+    // Standalone creation actions know 1-3 and proof-free modern FN type 6;
+    // finality records 4/5 and FlowMesh records 7/8/9 remain MPA-only.
+    BOOST_CHECK(modern::IsKnownCreationAction(1, 1) && modern::IsKnownCreationAction(2, 1) &&
+                modern::IsKnownCreationAction(3, 1) && modern::IsKnownCreationAction(6, 1));
+    BOOST_CHECK(!modern::IsKnownCreationAction(4, 1) &&
+                !modern::IsKnownCreationAction(5, 1) &&
+                !modern::IsKnownCreationAction(7, 1) &&
+                !modern::IsKnownCreationAction(8, 1) &&
+                !modern::IsKnownCreationAction(9, 1));
 }
 
-BOOST_AUTO_TEST_CASE(txid_unchanged_by_mpa_and_wtxid_unchanged)
+BOOST_AUTO_TEST_CASE(bridge_record_is_independently_gated_and_strictly_decoded)
+{
+    CChainParams::RegTestOptions options;
+    CChainParams::B3ModernRegTestOptions b3;
+    b3.flowmesh_test = true;
+    options.b3_modern = b3;
+    const auto chain{CChainParams::RegTest(options)};
+    const Consensus::Params& params{chain->GetConsensus()};
+    BOOST_REQUIRE(params.busd_bridge);
+    BOOST_REQUIRE(params.busd_bridge->activation_height);
+    const int activation{*params.busd_bridge->activation_height};
+
+    bridge::BridgeManagedWithdrawalV1 withdrawal;
+    withdrawal.registry_id = uint256{uint8_t{1}};
+    withdrawal.raw_amount = 1;
+    withdrawal.ethereum_recipient.fill(0x22);
+    const auto record{bridge::MakeBridgeMpaRecord(
+        bridge::BridgeRecordV1{bridge::BridgeRecordKindV1::MANAGED_WITHDRAWAL,
+                               withdrawal})};
+    BOOST_REQUIRE(record);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+
+    CMutableTransaction tx{BaseTx()};
+    tx.mpa = {*record};
+    tx.vout.push_back(*binding);
+    std::string error;
+    BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{tx}, params,
+                                              activation - 1, error));
+    BOOST_CHECK_EQUAL(error, "mpa-inactive-type");
+    BOOST_CHECK(modern::CheckTransactionMpa(CTransaction{tx}, params,
+                                             activation, error));
+
+    CMutableTransaction missing{tx};
+    missing.vout.pop_back();
+    BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{missing}, params,
+                                              activation, error));
+    BOOST_CHECK_EQUAL(error, "bridge-binding-missing");
+
+    CMutableTransaction mismatch{tx};
+    mismatch.mpa[0].payload.back() ^= 0x01;
+    BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{mismatch}, params,
+                                              activation, error));
+    BOOST_CHECK_EQUAL(error, "bridge-binding-mismatch");
+
+    CMutableTransaction duplicate{tx};
+    duplicate.vout.push_back(*binding);
+    BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{duplicate}, params,
+                                              activation, error));
+    BOOST_CHECK_EQUAL(error, "bridge-binding-multiple");
+
+    CMutableTransaction orphan{BaseTx()};
+    orphan.vout.push_back(*binding);
+    BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{orphan}, params,
+                                              activation, error));
+    BOOST_CHECK_EQUAL(error, "mpa-orphan-bridge-binding");
+
+    tx.mpa.insert(tx.mpa.begin(), Rec(3, 1, {0x00}));
+    BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{tx}, params,
+                                              activation, error));
+    BOOST_CHECK_EQUAL(error, "mpa-bridge-record-not-exclusive");
+    tx.mpa.erase(tx.mpa.begin());
+
+    tx.mpa[0].payload[1] = 1; // reserved byte must remain zero
+    const auto malformed_binding{modern::MakeBridgeBindingOutput(tx.mpa[0])};
+    BOOST_REQUIRE(malformed_binding);
+    tx.vout.back() = *malformed_binding;
+    BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{tx}, params,
+                                              activation, error));
+    BOOST_CHECK_EQUAL(error, "mpa-malformed-bridge-record");
+}
+
+BOOST_AUTO_TEST_CASE(txid_unchanged_by_mpa_full_relay_id_changes)
 {
     CMutableTransaction a{BaseTx()};
     CMutableTransaction b{BaseTx()};
@@ -346,11 +445,12 @@ BOOST_AUTO_TEST_CASE(txid_unchanged_by_mpa_and_wtxid_unchanged)
     // Same base data, different (or no) MPA: the existing txid is identical...
     BOOST_CHECK(ta.GetHash() == tb.GetHash());
     BOOST_CHECK(ta.GetHash() == tc.GetHash());
-    // ...and so is the existing witness hash (no new identity semantics in this commit;
-    // the normative ptxid over the full form arrives in Commit 6).
-    BOOST_CHECK(ta.GetWitnessHash() == tb.GetWitnessHash());
-    BOOST_CHECK(ta.GetWitnessHash() == tc.GetWitnessHash());
-    // ...while the full Modern serializations differ.
+    // ...while the existing wtxid-shaped relay slot carries the normative
+    // ptxid bytes and therefore distinguishes exact MPA variants.
+    BOOST_CHECK(ta.GetWitnessHash() != tb.GetWitnessHash());
+    BOOST_CHECK(ta.GetWitnessHash() != tc.GetWitnessHash());
+    BOOST_CHECK(ta.GetWitnessHash().ToUint256() == ta.GetPtxid().ToUint256());
+    // The full Modern serializations differ accordingly.
     BOOST_CHECK(Ser(a, TX_MODERN) != Ser(b, TX_MODERN));
     BOOST_CHECK(Ser(a, TX_MODERN) != Ser(c, TX_MODERN));
     // The txid form is literally the base bytes.

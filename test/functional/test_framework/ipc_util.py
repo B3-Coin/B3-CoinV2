@@ -34,6 +34,7 @@ class CoinbaseTxData:
     blockRewardRemaining: int
     requiredOutputs: list[bytes]
     lockTime: int
+    mpaSection: bytes
 
 
 @asynccontextmanager
@@ -150,6 +151,7 @@ async def mining_get_coinbase_tx(block_template, ctx) -> CoinbaseTxData:
         blockRewardRemaining=int(template_capnp.blockRewardRemaining),
         requiredOutputs=[bytes(output) for output in template_capnp.requiredOutputs],
         lockTime=int(template_capnp.lockTime),
+        mpaSection=bytes(template_capnp.mpaSection),
     )
 
 async def make_mining_ctx(self):

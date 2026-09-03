@@ -117,6 +117,10 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   core_io.cpp
   deploymentinfo.cpp
   external_signer.cpp
+  flowmesh/bls_certificate.cpp
+  flowmesh/p2p.cpp
+  flowmesh/production_engine.cpp
+  flowmesh/production_wire.cpp
   init/common.cpp
   kernel/chainparams.cpp
   legacy/checkpoints.cpp
@@ -144,6 +148,10 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   script/sign.cpp
   script/signingprovider.cpp
   script/solver.cpp
+)
+include(TargetDataSources)
+target_raw_data_sources(bitcoin_common NAMESPACE kernel::data
+  kernel/data/mainnet_fn_genesis_v1.bin
 )
 target_link_libraries(bitcoin_common
   PRIVATE
@@ -228,6 +236,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/connection_types.cpp
   node/context.cpp
   node/database_args.cpp
+  node/bridge_state.cpp
   node/eviction.cpp
   node/interface_ui.cpp
   node/interfaces.cpp
@@ -247,12 +256,18 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/txorphanage.cpp
   node/txreconciliation.cpp
   node/flowmesh_anchor.cpp
-  node/flowmesh_dev.cpp
+  node/flowmesh_production_store.cpp
+  node/flowmesh_runtime.cpp
+  node/flowmesh_service.cpp
   node/flowmesh_store.cpp
+  node/flowmesh_vault_index.cpp
+  node/flowmesh_checkpoint_index.cpp
   node/fn_pod.cpp
+  node/fn_seat_index.cpp
   node/legacy_fn_issuance.cpp
   node/finality_binding_index.cpp
   node/finality_pin.cpp
+  node/finality_signer_store.cpp
   node/finality_signature.cpp
   node/finality_tracker.cpp
   node/validator_set.cpp
@@ -492,10 +507,26 @@ if(B3_UPDATE_TOOLS)
 endif()
 
 if(B3_BRIDGE_TOOLS)
-  # Relayer dry-run harness over the same header-only bridge verification
-  # stack the tests use. Tooling only; never linked into the node.
+  # Relayer verifier and canonical payload emitter over the same header-only
+  # bridge codec/verification stack the tests use. Tooling only; never linked
+  # into the node.
   add_executable(b3-bridge-ethcheck bridge/ethcheck.cpp)
   target_link_libraries(b3-bridge-ethcheck
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+      univalue
+  )
+
+  # Offline, deterministic 3-of-4 BLS bootstrap proof/calldata builder for
+  # B3FinalityVerifier.initialize. Public manifests and signatures only.
+  add_executable(b3-bridge-bootstrap-proof bridge/bootstrap_proof.cpp)
+  target_link_libraries(b3-bridge-bootstrap-proof
     PRIVATE
       core_interface
       b3_blst

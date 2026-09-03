@@ -4,6 +4,8 @@
 
 #include <wallet/wallet.h>
 #include <coins.h>
+#include <modern/asset_output.h>
+#include <modern/asset_validation.h>
 #include <script/interpreter.h>
 #include <script/sign.h>
 #include <modern/stake.h>
@@ -14,7 +16,10 @@
 #include <vector>
 
 #include <addresstype.h>
+#include <common/args.h>
 #include <interfaces/chain.h>
+#include <interfaces/wallet.h>
+#include <kernel/mempool_removal_reason.h>
 #include <key_io.h>
 #include <legacy/consensus.h>
 #include <node/blockstorage.h>
@@ -696,6 +701,161 @@ BOOST_FIXTURE_TEST_CASE(CreateWalletWithoutChain, BasicTestingSetup)
     WaitForDeleteWallet(std::move(wallet));
 }
 
+BOOST_AUTO_TEST_CASE(b3_blank_recovery_wallet_uses_spendable_legacy_defaults)
+{
+    // Deliberately bypass WalletInit::ParameterInteraction. Migration and
+    // recovery loaders must preserve the default-address invariant themselves.
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    auto wallet{TestCreateWallet(
+        CreateMockableWalletDatabase(), context,
+        WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_BLANK_WALLET)};
+    BOOST_REQUIRE(wallet);
+    BOOST_CHECK(wallet->m_default_address_type == OutputType::LEGACY);
+    BOOST_REQUIRE(wallet->m_default_change_type.has_value());
+    BOOST_CHECK(*wallet->m_default_change_type == OutputType::LEGACY);
+
+    // This is the same operation importlegacywalletdump performs when a blank
+    // recovery wallet has no active descriptor chains.
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->GetActiveScriptPubKeyMans().empty());
+        wallet->SetupDescriptorScriptPubKeyMans();
+    }
+
+    const auto receive{
+        wallet->GetNewDestination(wallet->m_default_address_type, "recovery")};
+    const auto change{wallet->GetNewChangeDestination(
+        wallet->m_default_change_type.value())};
+    BOOST_REQUIRE(receive);
+    BOOST_REQUIRE(change);
+    BOOST_CHECK(std::holds_alternative<PKHash>(*receive));
+    BOOST_CHECK(std::holds_alternative<PKHash>(*change));
+
+    const auto witness{wallet->GetNewDestination(OutputType::BECH32, "unsafe")};
+    BOOST_CHECK(!witness);
+    BOOST_CHECK(util::ErrorString(witness).original.find(
+                    "witness addresses are not active") != std::string::npos);
+
+    // The descriptor created for the default legacy chain can actually sign
+    // its recovered wallet's next spend; this catches a receive-only fix which
+    // would still leave bind/funding RPCs unable to create change.
+    CMutableTransaction parent;
+    parent.vin.emplace_back(
+        COutPoint{Txid::FromUint256(uint256::ONE), 0});
+    parent.vout.emplace_back(2 * COIN, GetScriptForDestination(*receive));
+    const CTransactionRef parent_ref{MakeTransactionRef(parent)};
+    CMutableTransaction spend;
+    spend.vin.emplace_back(COutPoint{parent_ref->GetHash(), 0});
+    spend.vout.emplace_back(COIN, GetScriptForDestination(*change));
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->AddToWallet(parent_ref, TxStateInactive{}));
+        BOOST_CHECK(WalletCanSpendScriptNow(
+            *wallet, parent_ref->vout[0].scriptPubKey));
+        BOOST_REQUIRE(wallet->SignTransaction(spend));
+    }
+    BOOST_CHECK(!spend.vin[0].scriptSig.empty());
+    BOOST_CHECK(spend.vin[0].scriptWitness.IsNull());
+
+    // An explicit unsafe default is rejected even when the caller bypassed
+    // the node-wide parameter interaction.
+    ArgsManager explicit_args;
+    explicit_args.ForceSetArg("-addresstype", "bech32");
+    WalletContext explicit_context;
+    explicit_context.args = &explicit_args;
+    explicit_context.chain = m_node.chain.get();
+    auto rejected_wallet{std::make_shared<CWallet>(
+        m_node.chain.get(), "", CreateMockableWalletDatabase())};
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    BOOST_CHECK(!CWallet::LoadWalletArgs(
+        rejected_wallet, explicit_context, error, warnings));
+    BOOST_CHECK(error.original.find("witness addresses are not active") !=
+                std::string::npos);
+
+    // Outputs created by an older unsafe default stay visible for recovery,
+    // but automatic coin selection must not build an unconfirmable spend.
+    CTransactionRef old_witness_funds;
+    {
+        LOCK(wallet->cs_wallet);
+        ScriptPubKeyMan* witness_manager{
+            wallet->GetScriptPubKeyMan(OutputType::BECH32,
+                                       /*internal=*/false)};
+        ScriptPubKeyMan* wrapped_manager{
+            wallet->GetScriptPubKeyMan(OutputType::P2SH_SEGWIT,
+                                       /*internal=*/false)};
+        BOOST_REQUIRE(witness_manager != nullptr);
+        BOOST_REQUIRE(wrapped_manager != nullptr);
+        const auto old_destination{
+            witness_manager->GetNewDestination(OutputType::BECH32)};
+        const auto old_wrapped_destination{
+            wrapped_manager->GetNewDestination(OutputType::P2SH_SEGWIT)};
+        BOOST_REQUIRE(old_destination);
+        BOOST_REQUIRE(old_wrapped_destination);
+        CMutableTransaction old_parent;
+        old_parent.vin.emplace_back(
+            COutPoint{Txid::FromUint256(uint256{2}), 0});
+        old_parent.vout.emplace_back(
+            2 * COIN, GetScriptForDestination(*old_destination));
+        old_parent.vout.emplace_back(
+            3 * COIN, GetScriptForDestination(*old_wrapped_destination));
+        old_witness_funds = MakeTransactionRef(old_parent);
+        const uint256 genesis{m_node.chain->getBlockHash(0)};
+        BOOST_REQUIRE(wallet->AddToWallet(
+            old_witness_funds,
+            TxStateConfirmed{genesis, /*height=*/0, /*index=*/1}));
+        wallet->SetLastBlockProcessed(/*height=*/0, genesis);
+
+        const CoinsResult visible{AvailableCoins(*wallet)};
+        BOOST_REQUIRE_EQUAL(visible.Size(), 2U);
+        for (uint32_t vout{0}; vout < 2; ++vout) {
+            const COutPoint outpoint{old_witness_funds->GetHash(), vout};
+            BOOST_CHECK(std::ranges::any_of(
+                visible.All(), [&](const COutput& output) {
+                    return output.outpoint == outpoint;
+                }));
+
+            CCoinControl selected_control;
+            selected_control.Select(outpoint);
+            FastRandomContext rng{/*fDeterministic=*/true};
+            CoinSelectionParams params{rng};
+            const auto selected{FetchSelectedInputs(
+                *wallet, selected_control, params)};
+            BOOST_CHECK(!selected);
+            BOOST_CHECK(util::ErrorString(selected).original.find(
+                            "witness addresses are not active") !=
+                        std::string::npos);
+        }
+
+        // Direct bech32 recipients fail before selection and tell the caller
+        // to supply a legacy recipient address.
+        CCoinControl recipient_control;
+        const auto unsafe_recipient{CreateTransaction(
+            *wallet,
+            {{*old_destination, COIN,
+              /*fSubtractFeeFromAmount=*/false}},
+            /*change_pos=*/std::nullopt, recipient_control)};
+        BOOST_CHECK(!unsafe_recipient);
+        BOOST_CHECK(util::ErrorString(unsafe_recipient).original.find(
+                        "Use a legacy recipient address") !=
+                    std::string::npos);
+
+        CCoinControl coin_control;
+        const auto created{CreateTransaction(
+            *wallet,
+            {{*receive, COIN, /*fSubtractFeeFromAmount=*/false}},
+            /*change_pos=*/std::nullopt, coin_control)};
+        BOOST_CHECK(!created);
+        BOOST_CHECK(util::ErrorString(created).original.find(
+                        "witness addresses are not active") !=
+                    std::string::npos);
+    }
+
+    TestUnloadWallet(std::move(wallet));
+}
+
 BOOST_FIXTURE_TEST_CASE(RemoveTxs, TestChain100Setup)
 {
     m_args.ForceSetArg("-unsafesqlitesync", "1");
@@ -762,6 +922,25 @@ BOOST_FIXTURE_TEST_CASE(b3_validator_key_and_stake_outputs, TestChain100Setup)
         const auto secret{wallet->GetValidatorSecret()};
         BOOST_REQUIRE_MESSAGE(secret, util::ErrorString(secret).original);
         BOOST_CHECK(secret->GetPubKey() == *created);
+
+        // The trading account is a separate BIP340 identity and persists via
+        // its own hidden pk() descriptor.
+        BOOST_CHECK(!wallet->GetFlowMeshAccountPubKey());
+        const auto flowmesh_account{wallet->GetOrCreateFlowMeshAccountKey()};
+        BOOST_REQUIRE_MESSAGE(flowmesh_account,
+                              util::ErrorString(flowmesh_account).original);
+        BOOST_CHECK(*flowmesh_account != *created);
+        BOOST_CHECK(wallet->GetFlowMeshAccountPubKey() == *flowmesh_account);
+        const auto flowmesh_account_again{
+            wallet->GetOrCreateFlowMeshAccountKey()};
+        BOOST_REQUIRE(flowmesh_account_again);
+        BOOST_CHECK(*flowmesh_account_again == *flowmesh_account);
+        {
+            const auto account_secret{wallet->GetFlowMeshAccountSecret()};
+            BOOST_REQUIRE_MESSAGE(account_secret,
+                                  util::ErrorString(account_secret).original);
+            BOOST_CHECK(account_secret->GetPubKey() == *flowmesh_account);
+        }
 
         // BLS finality-key derivation (Commit 17): deterministic per (identity,
         // seq), distinct across sequences, re-derivable after any restore --
@@ -831,6 +1010,31 @@ BOOST_FIXTURE_TEST_CASE(b3_validator_key_and_stake_outputs, TestChain100Setup)
             BOOST_CHECK(!wallet->IsMine(CTxOut{COIN, GetScriptForDestination(PKHash(shadow.GetPubKey()))}));
             BOOST_CHECK(wallet->GetWalletDescriptors(GetScriptForRawPubKey(shadow.GetPubKey())).empty());
         }
+        // FlowMesh seat keys are a separate multi-key collection. A wallet
+        // can operate more than one FN seat and retains old keys for
+        // historical reward claims.
+        std::array<unsigned char, 32> flowmesh_ikm1{};
+        flowmesh_ikm1.fill(0x71);
+        std::array<unsigned char, 32> flowmesh_ikm2{};
+        flowmesh_ikm2.fill(0x72);
+        const auto flowmesh_key1{bls::SecretKey::FromIKM(flowmesh_ikm1)};
+        const auto flowmesh_key2{bls::SecretKey::FromIKM(flowmesh_ikm2)};
+        BOOST_REQUIRE(flowmesh_key1);
+        BOOST_REQUIRE(flowmesh_key2);
+        const auto flowmesh_pubkey1{flowmesh_key1->GetPublicKey().Compressed()};
+        const auto flowmesh_pubkey2{flowmesh_key2->GetPublicKey().Compressed()};
+        BOOST_REQUIRE(wallet->ImportFlowMeshBlsKey(*flowmesh_key1));
+        BOOST_REQUIRE(wallet->ImportFlowMeshBlsKey(*flowmesh_key2));
+        // Re-import is idempotent and cannot replace another key.
+        BOOST_REQUIRE(wallet->ImportFlowMeshBlsKey(*flowmesh_key1));
+        BOOST_CHECK_EQUAL(wallet->ListFlowMeshBlsPubkeys().size(), 2U);
+        BOOST_CHECK(wallet->HasFlowMeshBlsKey(flowmesh_pubkey1));
+        BOOST_CHECK(wallet->HasFlowMeshBlsKey(flowmesh_pubkey2));
+        {
+            const auto back{wallet->GetFlowMeshBlsKey(flowmesh_pubkey2)};
+            BOOST_REQUIRE_MESSAGE(back, util::ErrorString(back).original);
+            BOOST_CHECK(back->Bytes() == flowmesh_key2->Bytes());
+        }
         // ENCRYPTION LIFECYCLE: EncryptWallet converts the plain record to
         // ciphertext in the same batch; a locked wallet refuses the key;
         // unlocking returns the identical scalar; re-import while encrypted
@@ -838,12 +1042,27 @@ BOOST_FIXTURE_TEST_CASE(b3_validator_key_and_stake_outputs, TestChain100Setup)
         BOOST_REQUIRE(wallet->EncryptWallet("qualification-pass"));
         BOOST_CHECK(wallet->IsLocked());
         BOOST_CHECK(!wallet->GetImportedFinalityBlsKey());
+        BOOST_CHECK(!wallet->GetFlowMeshBlsKey(flowmesh_pubkey1));
+        BOOST_CHECK(!wallet->GetFlowMeshAccountSecret());
         BOOST_REQUIRE(wallet->Unlock("qualification-pass"));
+        {
+            const auto account_secret{wallet->GetFlowMeshAccountSecret()};
+            BOOST_REQUIRE(account_secret);
+            BOOST_CHECK(account_secret->GetPubKey() == *flowmesh_account);
+        }
         {
             const auto back{wallet->GetImportedFinalityBlsKey()};
             BOOST_REQUIRE_MESSAGE(back, util::ErrorString(back).original);
             BOOST_CHECK(back->Bytes() == independent->Bytes());
             BOOST_CHECK(back->GetPublicKey().Compressed() == independent->GetPublicKey().Compressed());
+        }
+        {
+            const auto back1{wallet->GetFlowMeshBlsKey(flowmesh_pubkey1)};
+            const auto back2{wallet->GetFlowMeshBlsKey(flowmesh_pubkey2)};
+            BOOST_REQUIRE(back1);
+            BOOST_REQUIRE(back2);
+            BOOST_CHECK(back1->Bytes() == flowmesh_key1->Bytes());
+            BOOST_CHECK(back2->Bytes() == flowmesh_key2->Bytes());
         }
         {
             std::array<unsigned char, 32> ikm2{};
@@ -856,10 +1075,33 @@ BOOST_FIXTURE_TEST_CASE(b3_validator_key_and_stake_outputs, TestChain100Setup)
             BOOST_REQUIRE(back2);
             BOOST_CHECK(back2->Bytes() == second->Bytes());
         }
+        {
+            std::array<unsigned char, 32> flowmesh_ikm3{};
+            flowmesh_ikm3.fill(0x73);
+            const auto flowmesh_key3{
+                bls::SecretKey::FromIKM(flowmesh_ikm3)};
+            BOOST_REQUIRE(flowmesh_key3);
+            const auto imported3{
+                wallet->ImportFlowMeshBlsKey(*flowmesh_key3)};
+            BOOST_REQUIRE_MESSAGE(imported3,
+                                  util::ErrorString(imported3).original);
+            const auto back3{wallet->GetFlowMeshBlsKey(
+                flowmesh_key3->GetPublicKey().Compressed())};
+            BOOST_REQUIRE(back3);
+            BOOST_CHECK(back3->Bytes() == flowmesh_key3->Bytes());
+            BOOST_CHECK_EQUAL(wallet->ListFlowMeshBlsPubkeys().size(), 3U);
+        }
 
         // Ownership and standardness through the carrier.
         BOOST_CHECK(wallet->IsMine(CTxOut{COIN, stake_script}));
         BOOST_CHECK(!wallet->IsMine(CTxOut{COIN, witness_owner_stake}));
+        // FULL_SCRIPT is the conservative/pre-H B3A1 context. B3S1 still
+        // unwraps because legacy Script drops its payload before executing
+        // the owner suffix; era-gating this would strand ordinary funds.
+        BOOST_CHECK(OutputScriptForWalletContext(
+                        CTxOut{COIN, stake_script},
+                        AssetSigningContext::FULL_SCRIPT) ==
+                    GetScriptForDestination(owner));
         std::vector<std::vector<unsigned char>> solutions;
         BOOST_CHECK(Solver(stake_script, solutions) == TxoutType::PUBKEYHASH);
         BOOST_CHECK(Solver(witness_owner_stake, solutions) == TxoutType::NONSTANDARD);
@@ -980,6 +1222,467 @@ BOOST_AUTO_TEST_CASE(legacy_coinstake_maturity_depth_and_conflict)
     BOOST_REQUIRE(modern_shaped.tx->IsCoinStake());
     BOOST_CHECK(!modern_shaped.IsCoinStake());
     BOOST_CHECK_EQUAL(m_wallet.GetTxBlocksToMaturity(modern_shaped), 0);
+}
+
+BOOST_AUTO_TEST_CASE(optional_data_wallet_replacement_is_monotonic)
+{
+    CKey key;
+    key.MakeNewKey(/*fCompressedIn=*/true);
+    const CScript owned_script{
+        GetScriptForDestination(PKHash{key.GetPubKey()})};
+    {
+        LOCK(m_wallet.cs_wallet);
+        LegacyDataSPKM* legacy{m_wallet.GetOrCreateLegacyDataSPKM()};
+        BOOST_REQUIRE(legacy != nullptr);
+        BOOST_REQUIRE(legacy->LoadKey(key, key.GetPubKey()));
+        m_wallet.CacheNewScriptPubKeys({owned_script}, legacy);
+    }
+
+    CMutableTransaction base;
+    base.version = 2;
+    base.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0});
+    base.vout.emplace_back(COIN, owned_script);
+
+    CMutableTransaction mpa_only{base};
+    mpa_only.mpa.push_back(CMpaRecord{1, 1, {0x01}});
+    CMutableTransaction witness_only{base};
+    witness_only.vin[0].scriptWitness.stack.push_back({0x02});
+    CMutableTransaction both{mpa_only};
+    both.vin[0].scriptWitness.stack.push_back({0x02});
+    CMutableTransaction changed_both{both};
+    changed_both.mpa[0].payload = {0x03};
+
+    const Txid txid{base.GetHash()};
+    LOCK(m_wallet.cs_wallet);
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(base),
+                                       TxStateInactive{}));
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(mpa_only),
+                                       TxStateInactive{}));
+    BOOST_REQUIRE(m_wallet.GetWalletTx(txid)->tx->HasMpa());
+    BOOST_CHECK(!m_wallet.GetWalletTx(txid)->tx->HasWitness());
+    const auto enriched_txo{m_wallet.GetTXO(COutPoint{txid, 0})};
+    BOOST_REQUIRE(enriched_txo.has_value());
+    BOOST_CHECK(&enriched_txo->GetTxOut() ==
+                &m_wallet.GetWalletTx(txid)->tx->vout[0]);
+
+    // A witness-only variant would drop the retained MPA, so ignore it.
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(witness_only),
+                                       TxStateInactive{}));
+    BOOST_REQUIRE(m_wallet.GetWalletTx(txid)->tx->HasMpa());
+    BOOST_CHECK(!m_wallet.GetWalletTx(txid)->tx->HasWitness());
+
+    // Adding witness while preserving the exact MPA is strict enrichment.
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(both),
+                                       TxStateInactive{}));
+    BOOST_CHECK(m_wallet.GetWalletTx(txid)->tx->HasMpa());
+    BOOST_CHECK(m_wallet.GetWalletTx(txid)->tx->HasWitness());
+
+    // Neither a stripped variant nor a variant mutating retained MPA may win.
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(base),
+                                       TxStateInactive{}));
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(changed_both),
+                                       TxStateInactive{}));
+    const CTransactionRef stored{m_wallet.GetWalletTx(txid)->tx};
+    BOOST_CHECK(stored->HasMpa());
+    BOOST_CHECK(stored->HasWitness());
+    BOOST_CHECK(stored->mpa == CTransaction{both}.mpa);
+    BOOST_CHECK(stored->vin[0].scriptWitness.stack ==
+                CTransaction{both}.vin[0].scriptWitness.stack);
+    const auto stored_txo{m_wallet.GetTXO(COutPoint{txid, 0})};
+    BOOST_REQUIRE(stored_txo.has_value());
+    BOOST_CHECK(&stored_txo->GetTxOut() == &stored->vout[0]);
+}
+
+BOOST_AUTO_TEST_CASE(commit_transaction_allows_external_keyless_input)
+{
+    CMutableTransaction transaction;
+    const Txid external_parent{Txid::FromUint256(GetRandHash())};
+    transaction.vin.emplace_back(COutPoint{external_parent, 0});
+    transaction.vout.emplace_back(1, CScript{} << OP_TRUE);
+    const CTransactionRef tx{MakeTransactionRef(std::move(transaction))};
+
+    // A FlowMesh type-9 publication owns its native fee input but not the
+    // keyless vault parent. Committing it must retain the transaction without
+    // assuming every input parent belongs to the wallet.
+    BOOST_CHECK_NO_THROW(m_wallet.CommitTransaction(
+        tx, {{"b3", "external-keyless-input-test"}}, {}));
+    LOCK(m_wallet.cs_wallet);
+    BOOST_CHECK(m_wallet.mapWallet.contains(tx->GetHash()));
+    BOOST_CHECK(!m_wallet.mapWallet.contains(external_parent));
+}
+
+BOOST_AUTO_TEST_CASE(legacy_imported_key_asset_owner_needs_post_h_provenance)
+{
+    const std::optional<int> legacy_final_height{
+        Consensus::LegacyFinalHeight(Params().GetConsensus())};
+    BOOST_REQUIRE(legacy_final_height.has_value());
+
+    CKey key;
+    key.MakeNewKey(/*fCompressedIn=*/true);
+    const CScript owner{
+        GetScriptForDestination(PKHash{key.GetPubKey()})};
+    modern::AssetId asset;
+    asset.begin()[0] = 0x42;
+    const auto asset_output{modern::MakeAssetOwnerOutput(
+        asset, /*amount=*/1, modern::PolicyType::FN, owner)};
+    BOOST_REQUIRE(asset_output.has_value());
+
+    {
+        LOCK(m_wallet.cs_wallet);
+        LegacyDataSPKM* legacy{m_wallet.GetOrCreateLegacyDataSPKM()};
+        BOOST_REQUIRE(legacy != nullptr);
+        BOOST_REQUIRE(legacy->LoadKey(key, key.GetPubKey()));
+        m_wallet.CacheNewScriptPubKeys({owner}, legacy);
+
+        // Context-free inspection cannot distinguish an old lookalike from a
+        // modern asset. A trusted post-H Coin context resolves the ordinary
+        // owner script and must work with imported-key wallets as well as
+        // descriptor wallets.
+        BOOST_CHECK(!m_wallet.IsMine(*asset_output));
+        BOOST_CHECK(m_wallet.IsMine(
+            *asset_output, AssetSigningContext::OWNER_SUFFIX));
+    }
+
+    CMutableTransaction funding;
+    funding.version = 2;
+    funding.vin.emplace_back(
+        COutPoint{Txid::FromUint256(uint256::ONE), 0});
+    funding.vout.push_back(*asset_output);
+    const CTransaction funding_tx{funding};
+
+    const auto spend_from = [&](const int coin_height) {
+        CMutableTransaction spend;
+        spend.version = 2;
+        spend.vin.emplace_back(COutPoint{funding_tx.GetHash(), 0});
+        spend.vout.push_back(*asset_output);
+        std::map<COutPoint, Coin> coins;
+        coins.emplace(spend.vin[0].prevout,
+                      Coin{*asset_output, coin_height,
+                           /*fCoinBaseIn=*/false});
+        return std::pair{std::move(spend), std::move(coins)};
+    };
+
+    auto [pre_h_spend, pre_h_coins]{
+        spend_from(*legacy_final_height)};
+    std::map<int, bilingual_str> input_errors;
+    BOOST_CHECK(!m_wallet.SignTransaction(
+        pre_h_spend, pre_h_coins, SIGHASH_ALL, input_errors));
+    BOOST_CHECK(pre_h_spend.vin[0].scriptSig.empty());
+
+    auto [post_h_spend, post_h_coins]{
+        spend_from(*legacy_final_height + 1)};
+    input_errors.clear();
+    BOOST_REQUIRE(m_wallet.SignTransaction(
+        post_h_spend, post_h_coins, SIGHASH_ALL, input_errors));
+    BOOST_CHECK(input_errors.empty());
+
+    const CTransaction signed_tx{post_h_spend};
+    ScriptError script_error{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifyScript(
+        signed_tx.vin[0].scriptSig, asset_output->scriptPubKey,
+        &signed_tx.vin[0].scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS,
+        TransactionSignatureChecker{
+            &signed_tx, 0, asset_output->nValue,
+            MissingDataBehavior::ASSERT_FAIL},
+        &script_error, /*enable_asset_owner=*/true));
+
+    // Fee estimation and preset-input funding must use the same trusted
+    // provenance rule as signing. A wallet-known post-H carrier is solvable
+    // through its owner suffix; byte-identical pre-H script semantics remain
+    // full-script and therefore fail closed.
+    CMutableTransaction pre_h_funding{funding};
+    pre_h_funding.nLockTime = 1;
+    const CTransaction pre_h_funding_tx{pre_h_funding};
+    const uint256 block_hash{GetRandHash()};
+    BOOST_REQUIRE(m_wallet.AddToWallet(
+        MakeTransactionRef(funding_tx),
+        TxStateConfirmed{block_hash, *legacy_final_height + 1, /*index=*/1}));
+    BOOST_REQUIRE(m_wallet.AddToWallet(
+        MakeTransactionRef(pre_h_funding_tx),
+        TxStateConfirmed{block_hash, *legacy_final_height, /*index=*/2}));
+
+    FastRandomContext rng;
+    CoinSelectionParams selection_params{
+        rng,
+        /*change_output_size=*/34,
+        /*change_spend_size=*/148,
+        /*min_change_target=*/1'000,
+        /*effective_feerate=*/CFeeRate{1'000},
+        /*long_term_feerate=*/CFeeRate{1'000},
+        /*discard_feerate=*/CFeeRate{1'000},
+        /*tx_noinputs_size=*/0,
+        /*avoid_partial=*/false,
+    };
+
+    LOCK(m_wallet.cs_wallet);
+    m_wallet.SetLastBlockProcessed(*legacy_final_height + 10, block_hash);
+    const COutPoint post_h_outpoint{funding_tx.GetHash(), 0};
+    const COutPoint pre_h_outpoint{pre_h_funding_tx.GetHash(), 0};
+    BOOST_REQUIRE(m_wallet.GetTXO(post_h_outpoint).has_value());
+    BOOST_CHECK(!m_wallet.GetTXO(pre_h_outpoint).has_value());
+
+    CCoinControl post_h_control;
+    post_h_control.Select(post_h_outpoint);
+    const auto post_h_selected{
+        FetchSelectedInputs(m_wallet, post_h_control, selection_params)};
+    BOOST_REQUIRE(post_h_selected);
+    BOOST_CHECK_EQUAL(post_h_selected->Size(), 1U);
+
+    CCoinControl pre_h_control;
+    pre_h_control.Select(pre_h_outpoint).SetTxOut(*asset_output);
+    BOOST_CHECK(!FetchSelectedInputs(
+        m_wallet, pre_h_control, selection_params));
+}
+
+BOOST_AUTO_TEST_CASE(asset_parent_context_controls_input_trust_and_txo_refresh)
+{
+    const std::optional<int> legacy_final_height{
+        Consensus::LegacyFinalHeight(Params().GetConsensus())};
+    BOOST_REQUIRE(legacy_final_height.has_value());
+
+    CKey key;
+    key.MakeNewKey(/*fCompressedIn=*/true);
+    const CScript owner{
+        GetScriptForDestination(PKHash{key.GetPubKey()})};
+    modern::AssetId asset;
+    asset.begin()[0] = 0x43;
+    const auto asset_output{modern::MakeAssetOwnerOutput(
+        asset, /*amount=*/2, modern::PolicyType::OWNER, owner)};
+    BOOST_REQUIRE(asset_output.has_value());
+    const std::optional<modern::AssetId> fn_asset{
+        modern::ConfiguredFnAssetId(Params().GetConsensus())};
+    BOOST_REQUIRE(fn_asset.has_value());
+    const auto fn_output{modern::MakeAssetOwnerOutput(
+        *fn_asset, /*amount=*/1, modern::PolicyType::FN, owner)};
+    BOOST_REQUIRE(fn_output.has_value());
+
+    CMutableTransaction parent;
+    parent.vin.emplace_back(
+        COutPoint{Txid::FromUint256(uint256::ONE), 0});
+    parent.vout.push_back(*asset_output);
+    const CTransactionRef parent_ref{MakeTransactionRef(parent)};
+
+    CMutableTransaction old_lookalike{parent};
+    old_lookalike.nLockTime = 1;
+    const CTransactionRef old_ref{MakeTransactionRef(old_lookalike)};
+
+    CMutableTransaction child;
+    child.vin.emplace_back(COutPoint{parent_ref->GetHash(), 0});
+    child.vout.push_back(*asset_output);
+    const CTransactionRef child_ref{MakeTransactionRef(child)};
+
+    CMutableTransaction fn_genesis;
+    fn_genesis.vin.resize(1);
+    fn_genesis.vin[0].prevout.SetNull();
+    fn_genesis.vin[0].scriptSig = CScript() << CScriptNum{1} << CScriptNum{1};
+    fn_genesis.vout.push_back(*fn_output);
+    const CTransactionRef fn_genesis_ref{MakeTransactionRef(fn_genesis)};
+
+    const uint256 block_hash{GetRandHash()};
+    LOCK(m_wallet.cs_wallet);
+    LegacyDataSPKM* legacy{m_wallet.GetOrCreateLegacyDataSPKM()};
+    BOOST_REQUIRE(legacy != nullptr);
+    BOOST_REQUIRE(legacy->LoadKey(key, key.GetPubKey()));
+    m_wallet.CacheNewScriptPubKeys({owner}, legacy);
+
+    BOOST_REQUIRE(m_wallet.AddToWallet(
+        parent_ref, TxStateConfirmed{block_hash,
+                                     *legacy_final_height + 1,
+                                     /*index=*/1}));
+    BOOST_REQUIRE(m_wallet.AddToWallet(
+        old_ref, TxStateConfirmed{block_hash,
+                                  *legacy_final_height,
+                                  /*index=*/2}));
+    BOOST_REQUIRE(m_wallet.AddToWallet(
+        fn_genesis_ref, TxStateConfirmed{block_hash,
+                                         *legacy_final_height + 1,
+                                         /*index=*/0}));
+    m_wallet.SetLastBlockProcessed(*legacy_final_height + 10, block_hash);
+
+    WalletContext interface_context;
+    const std::shared_ptr<CWallet> wallet_alias{
+        &m_wallet, [](CWallet*) {}};
+    const std::unique_ptr<interfaces::Wallet> wallet_interface{
+        interfaces::MakeWallet(interface_context, wallet_alias)};
+
+    // This is the exact backend consumed by WalletModel's nonblocking asset
+    // cache. The trusted post-H carrier is reported once; the byte-identical
+    // pre-H lookalike is absent, so it cannot inflate the confirmed total.
+    const std::vector<interfaces::WalletAssetBalance> asset_balances{
+        wallet_interface->getAssetBalances()};
+    BOOST_REQUIRE_EQUAL(asset_balances.size(), 2U);
+    const auto colored_balance{std::ranges::find_if(
+        asset_balances, [&](const auto& balance) {
+            return balance.asset_id == asset;
+        })};
+    BOOST_REQUIRE(colored_balance != asset_balances.end());
+    BOOST_CHECK_EQUAL(colored_balance->confirmed, 2);
+    BOOST_CHECK_EQUAL(colored_balance->unconfirmed, 0);
+    BOOST_CHECK_EQUAL(colored_balance->immature, 0);
+    BOOST_CHECK_EQUAL(colored_balance->spendable, 2);
+    BOOST_CHECK(!colored_balance->is_fn);
+
+    const auto fn_balance{std::ranges::find_if(
+        asset_balances, [&](const auto& balance) {
+            return balance.asset_id == *fn_asset;
+        })};
+    BOOST_REQUIRE(fn_balance != asset_balances.end());
+    BOOST_CHECK_EQUAL(fn_balance->confirmed, 1);
+    BOOST_CHECK_EQUAL(fn_balance->unconfirmed, 0);
+    BOOST_CHECK_EQUAL(fn_balance->immature, 1);
+    BOOST_CHECK_EQUAL(fn_balance->spendable, 0);
+    BOOST_CHECK(fn_balance->is_fn);
+
+    // CWalletTx-aware reporting unwraps the owner only with trusted post-H
+    // provenance. This drives both gettransaction.details and the Qt Activity
+    // model; the byte-identical pre-H lookalike must remain unknown.
+    const CWalletTx* parent_wtx{m_wallet.GetWalletTx(parent_ref->GetHash())};
+    const CWalletTx* old_wtx{m_wallet.GetWalletTx(old_ref->GetHash())};
+    BOOST_REQUIRE(parent_wtx != nullptr);
+    BOOST_REQUIRE(old_wtx != nullptr);
+    std::list<COutputEntry> received;
+    std::list<COutputEntry> sent;
+    CAmount fee{0};
+    CachedTxGetAmounts(m_wallet, *parent_wtx, received, sent, fee,
+                       /*include_change=*/false);
+    BOOST_REQUIRE_EQUAL(received.size(), 1U);
+    BOOST_CHECK(sent.empty());
+    BOOST_CHECK(std::get_if<PKHash>(&received.front().destination) != nullptr);
+    BOOST_CHECK_EQUAL(received.front().vout, 0);
+
+    CachedTxGetAmounts(m_wallet, *old_wtx, received, sent, fee,
+                       /*include_change=*/false);
+    BOOST_CHECK(received.empty());
+    BOOST_CHECK(sent.empty());
+
+    const interfaces::WalletTx parent_report{
+        wallet_interface->getWalletTx(parent_ref->GetHash())};
+    BOOST_REQUIRE_EQUAL(parent_report.txout_is_mine.size(), 1U);
+    BOOST_REQUIRE_EQUAL(parent_report.txout_address.size(), 1U);
+    BOOST_REQUIRE_EQUAL(parent_report.txout_address_is_mine.size(), 1U);
+    BOOST_CHECK(parent_report.txout_is_mine[0]);
+    BOOST_CHECK(parent_report.txout_address_is_mine[0]);
+    BOOST_CHECK(std::get_if<PKHash>(&parent_report.txout_address[0]) != nullptr);
+
+    const interfaces::WalletTx old_report{
+        wallet_interface->getWalletTx(old_ref->GetHash())};
+    BOOST_REQUIRE_EQUAL(old_report.txout_is_mine.size(), 1U);
+    BOOST_REQUIRE_EQUAL(old_report.txout_address.size(), 1U);
+    BOOST_REQUIRE_EQUAL(old_report.txout_address_is_mine.size(), 1U);
+    BOOST_CHECK(!old_report.txout_is_mine[0]);
+    BOOST_CHECK(!old_report.txout_address_is_mine[0]);
+    BOOST_CHECK(std::get_if<CNoDestination>(
+                    &old_report.txout_address[0]) != nullptr);
+
+    BOOST_REQUIRE(m_wallet.AddToWallet(child_ref, TxStateInMempool{}));
+
+    const CTxDestination owner_destination{PKHash{key.GetPubKey()}};
+    const std::map<CTxDestination, CAmount> address_balances{
+        GetAddressBalances(m_wallet)};
+    BOOST_CHECK(address_balances.contains(owner_destination));
+    const std::set<std::set<CTxDestination>> address_groupings{
+        GetAddressGroupings(m_wallet)};
+    BOOST_CHECK(std::ranges::any_of(
+        address_groupings, [&](const auto& group) {
+            return group.contains(owner_destination);
+        }));
+
+    const CWalletTx* child_wtx{m_wallet.GetWalletTx(child_ref->GetHash())};
+    BOOST_REQUIRE(child_wtx != nullptr);
+    BOOST_CHECK(InputIsMine(m_wallet, child_ref->vin[0]));
+    BOOST_CHECK(CachedTxIsTrusted(m_wallet, *child_wtx));
+    BOOST_REQUIRE(m_wallet.GetTXO(
+        COutPoint{child_ref->GetHash(), 0}).has_value());
+
+    const CTxIn old_input{COutPoint{old_ref->GetHash(), 0}};
+    BOOST_CHECK(!InputIsMine(m_wallet, old_input));
+
+    // Losing mempool provenance removes owner-suffix semantics. Refresh must
+    // delete the formerly owned cached output rather than leave it spendable
+    // until restart.
+    m_wallet.transactionRemovedFromMempool(
+        child_ref, MemPoolRemovalReason::EXPIRY);
+    BOOST_CHECK(!m_wallet.GetTXO(
+        COutPoint{child_ref->GetHash(), 0}).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(b3_witness_assets_remain_visible_but_not_spendable)
+{
+    const std::optional<int> legacy_final_height{
+        Consensus::LegacyFinalHeight(Params().GetConsensus())};
+    BOOST_REQUIRE(legacy_final_height.has_value());
+
+    CKey key;
+    key.MakeNewKey(/*fCompressedIn=*/true);
+    const CScript witness_owner{
+        GetScriptForDestination(WitnessV0KeyHash{key.GetPubKey()})};
+    const CScript wrapped_owner{
+        GetScriptForDestination(ScriptHash{witness_owner})};
+    const CScript legacy_owner{
+        GetScriptForDestination(PKHash{key.GetPubKey()})};
+
+    modern::AssetId asset;
+    asset.begin()[0] = 0x71;
+    const auto direct_output{modern::MakeAssetOwnerOutput(
+        asset, /*amount=*/2, modern::PolicyType::OWNER, witness_owner)};
+    const auto wrapped_output{modern::MakeAssetOwnerOutput(
+        asset, /*amount=*/3, modern::PolicyType::OWNER, wrapped_owner)};
+    BOOST_REQUIRE(direct_output.has_value());
+    BOOST_REQUIRE(wrapped_output.has_value());
+
+    CMutableTransaction parent;
+    parent.vin.emplace_back(
+        COutPoint{Txid::FromUint256(uint256::ONE), 0});
+    parent.vout.push_back(*direct_output);
+    parent.vout.push_back(*wrapped_output);
+    const CTransactionRef parent_ref{MakeTransactionRef(parent)};
+    const uint256 block_hash{GetRandHash()};
+
+    LOCK(m_wallet.cs_wallet);
+    LegacyDataSPKM* legacy{m_wallet.GetOrCreateLegacyDataSPKM()};
+    BOOST_REQUIRE(legacy != nullptr);
+    BOOST_REQUIRE(legacy->LoadKey(key, key.GetPubKey()));
+    BOOST_REQUIRE(legacy->LoadCScript(witness_owner));
+    m_wallet.CacheNewScriptPubKeys(
+        {legacy_owner, witness_owner, wrapped_owner}, legacy);
+
+    BOOST_CHECK(WalletCanSpendScriptNow(m_wallet, legacy_owner));
+    BOOST_CHECK(ScriptRequiresInactiveB3Witness(m_wallet, witness_owner));
+    BOOST_CHECK(ScriptRequiresInactiveB3Witness(m_wallet, wrapped_owner));
+    BOOST_CHECK(!WalletCanSpendScriptNow(m_wallet, witness_owner));
+    BOOST_CHECK(!WalletCanSpendScriptNow(m_wallet, wrapped_owner));
+
+    BOOST_REQUIRE(m_wallet.AddToWallet(
+        parent_ref, TxStateConfirmed{block_hash,
+                                     *legacy_final_height + 1,
+                                     /*index=*/1}));
+    m_wallet.SetLastBlockProcessed(*legacy_final_height + 10, block_hash);
+
+    WalletContext interface_context;
+    const std::shared_ptr<CWallet> wallet_alias{&m_wallet, [](CWallet*) {}};
+    const std::unique_ptr<interfaces::Wallet> wallet_interface{
+        interfaces::MakeWallet(interface_context, wallet_alias)};
+    const std::vector<interfaces::WalletAssetBalance> balances{
+        wallet_interface->getAssetBalances()};
+    BOOST_REQUIRE_EQUAL(balances.size(), 1U);
+    BOOST_CHECK(balances.front().asset_id == asset);
+    BOOST_CHECK_EQUAL(balances.front().confirmed, 5);
+    BOOST_CHECK_EQUAL(balances.front().spendable, 0);
+
+    // Explicit asset coin selection fails with the same clear policy error.
+    // The outputs remain in the wallet and in balance reporting for a future
+    // release which intentionally activates SegWit.
+    for (uint32_t vout{0}; vout < 2; ++vout) {
+        CCoinControl coin_control;
+        coin_control.Select(COutPoint{parent_ref->GetHash(), vout});
+        FastRandomContext rng{/*fDeterministic=*/true};
+        CoinSelectionParams params{rng};
+        const auto selected{
+            FetchSelectedInputs(m_wallet, coin_control, params)};
+        BOOST_CHECK(!selected);
+        BOOST_CHECK(util::ErrorString(selected).original.find(
+                        "witness addresses are not active") != std::string::npos);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

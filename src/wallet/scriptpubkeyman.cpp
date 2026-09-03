@@ -3,8 +3,11 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <hash.h>
+#include <chainparams.h>
+#include <consensus/era.h>
 #include <key_io.h>
 #include <logging.h>
+#include <modern/asset_output.h>
 #include <modern/stake.h>
 #include <node/types.h>
 #include <outputtype.h>
@@ -254,6 +257,37 @@ bool LegacyDataSPKM::CheckDecryptionKey(const CKeyingMaterial& master_key)
 std::unique_ptr<SigningProvider> LegacyDataSPKM::GetSolvingProvider(const CScript& script) const
 {
     return std::make_unique<LegacySigningProvider>(*this);
+}
+
+bool LegacyDataSPKM::SignTransaction(
+    CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins,
+    const int sighash, std::map<int, bilingual_str>& input_errors) const
+{
+    return ::SignTransaction(
+        tx, this, coins, sighash, input_errors,
+        Consensus::LegacyFinalHeight(Params().GetConsensus()));
+}
+
+std::optional<PSBTError> LegacyDataSPKM::FillPSBT(
+    PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata,
+    const std::optional<int> sighash_type, const bool sign,
+    const bool bip32derivs, int* n_signed, const bool finalize) const
+{
+    if (n_signed) *n_signed = 0;
+    for (size_t i{0}; i < psbt.inputs.size(); ++i) {
+        if (PSBTInputSigned(psbt.inputs[i])) continue;
+        const PSBTError result{SignPSBTInput(
+            HidingSigningProvider(this, /*hide_secret=*/!sign,
+                                  /*hide_origin=*/!bip32derivs),
+            psbt, i, &txdata, sighash_type, nullptr, finalize)};
+        if (result != PSBTError::OK && result != PSBTError::INCOMPLETE) {
+            return result;
+        }
+        if (n_signed && (PSBTInputSigned(psbt.inputs[i]) || !sign)) {
+            ++*n_signed;
+        }
+    }
+    return {};
 }
 
 bool LegacyDataSPKM::CanProvide(const CScript& script, SignatureData& sigdata)
@@ -864,8 +898,10 @@ util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestination(const 
 bool DescriptorScriptPubKeyMan::IsMine(const CScript& script) const
 {
     LOCK(cs_desc_man);
-    // B3 STAKE carrier: ownership is decided by the bare owner script.
-    if (const auto owner{modern::StakeOwnerScript(script)}) return m_map_script_pub_keys.contains(*owner);
+    // Asset callers must authenticate Coin provenance and pass the selected
+    // owner script. Only STAKE is unwrapped context-free here.
+    auto owner{modern::StakeOwnerScript(script)};
+    if (owner) return m_map_script_pub_keys.contains(*owner);
     return m_map_script_pub_keys.contains(script);
 }
 
@@ -1070,8 +1106,9 @@ std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(co
 {
     LOCK(cs_desc_man);
     std::vector<WalletDestination> result;
-    // B3 STAKE carrier: the keypool item in use is the bare owner script.
-    const CScript script{modern::StakeOwnerScript(script_in).value_or(script_in)};
+    // Asset callers pass their authenticated owner script explicitly.
+    auto owner{modern::StakeOwnerScript(script_in)};
+    const CScript script{owner.value_or(script_in)};
     if (IsMine(script)) {
         int32_t index = m_map_script_pub_keys[script];
         if (index >= m_wallet_descriptor.next_index) {
@@ -1208,9 +1245,8 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
 {
     LOCK(cs_desc_man);
 
-    // Find the index of the script (a B3 STAKE carrier is looked up by its
-    // bare owner script; the signer's scriptCode stays the full script).
-    const auto owner{modern::StakeOwnerScript(script)};
+    // Asset callers pass their authenticated owner script explicitly.
+    auto owner{modern::StakeOwnerScript(script)};
     auto it = m_map_script_pub_keys.find(owner ? *owner : script);
     if (it == m_map_script_pub_keys.end()) {
         return nullptr;
@@ -1290,14 +1326,25 @@ bool DescriptorScriptPubKeyMan::SignTransaction(CMutableTransaction& tx, const s
 {
     std::unique_ptr<FlatSigningProvider> keys = std::make_unique<FlatSigningProvider>();
     for (const auto& coin_pair : coins) {
-        std::unique_ptr<FlatSigningProvider> coin_keys = GetSigningProvider(coin_pair.second.out.scriptPubKey, true);
+        const AssetSigningContext asset_context{AssetSigningContextForCoin(
+            coin_pair.second,
+            Consensus::LegacyFinalHeight(Params().GetConsensus()))};
+        const CScript authorization_script{
+            asset_context == AssetSigningContext::OWNER_SUFFIX
+                ? modern::AssetOwnerScript(coin_pair.second.out.scriptPubKey)
+                      .value_or(coin_pair.second.out.scriptPubKey)
+                : coin_pair.second.out.scriptPubKey};
+        std::unique_ptr<FlatSigningProvider> coin_keys =
+            GetSigningProvider(authorization_script, true);
         if (!coin_keys) {
             continue;
         }
         keys->Merge(std::move(*coin_keys));
     }
 
-    return ::SignTransaction(tx, keys.get(), coins, sighash, input_errors);
+    return ::SignTransaction(
+        tx, keys.get(), coins, sighash, input_errors,
+        Consensus::LegacyFinalHeight(Params().GetConsensus()));
 }
 
 SigningResult DescriptorScriptPubKeyMan::SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const
@@ -1346,7 +1393,13 @@ std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTran
         }
 
         std::unique_ptr<FlatSigningProvider> keys = std::make_unique<FlatSigningProvider>();
-        std::unique_ptr<FlatSigningProvider> script_keys = GetSigningProvider(script, /*include_private=*/sign);
+        const CScript authorization_script{
+            psbtx.GetInputAssetSigningContext(i) ==
+                    AssetSigningContext::OWNER_SUFFIX
+                ? modern::AssetOwnerScript(script).value_or(script)
+                : script};
+        std::unique_ptr<FlatSigningProvider> script_keys =
+            GetSigningProvider(authorization_script, /*include_private=*/sign);
         if (script_keys) {
             keys->Merge(std::move(*script_keys));
         } else {

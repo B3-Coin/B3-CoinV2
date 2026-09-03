@@ -106,4 +106,8 @@ Functional/regtest (`test/functional/feature_b3_finality*.py`, `feature_b3_mpa.p
 3. Release operations: two further fixed seeds + DNS seed; Linux x86_64 build box/CI; the X-pin itself (block H buried, X recorded).
 4. Bootstrap operations: owner validators stake and publish `FINALITY_KEY` bindings during the corridor so `Set_0 = Snapshot(M−1)` has ≥ `MIN_FINALITY_SET` members.
 
-**Out of scope here:** A3 bridge parameters (incl. bridge security thresholds, `MAX_EPOCH_LAG`), ZK prover.
+**Out of scope for this historical Modern-PoS plan:** separately activated
+bridge parameters (including bridge security thresholds and `MAX_EPOCH_LAG`),
+the bridge stage-4 work now implemented elsewhere in the transition tree, and
+the ZK prover. `A3` now names FlowMesh activation and never activates bridge
+minting or redemption.

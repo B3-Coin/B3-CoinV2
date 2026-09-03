@@ -3,93 +3,260 @@ pragma solidity ^0.8.24;
 
 import {B3Types, IB3FinalityProver} from "./IB3FinalityProver.sol";
 
-/// @title B3FinalityVerifier — the Ethereum attestation of B3 modern finality.
+/// Permissionless Ethereum mirror of B3's stake-and-headcount finality lineage.
 ///
-/// Implements doc/design/b3-cross-chain-finality-v1.md §5 EXACTLY: it accepts a
-/// finality certificate only from the current signing set (or the disclosed
-/// successor, which performs the epoch rotation before the signature is
-/// checked), enforces monotone finalized height, binds the successor set hash,
-/// and delegates the cryptographic check to a swappable prover (§5.3 / §7).
+/// This contract deliberately has no owner, pause key, upgrade proxy, or
+/// emergency signer. Authority starts with one immutable four-key bootstrap
+/// committee. Any three of those keys may attest the public Set_0 snapshot
+/// produced by B3 at M-1 exactly once. Authority then advances only when the
+/// normal B3 stake/BLS quorum signs its successor; the bootstrap committee has
+/// no callable path after initialization.
 ///
-/// The contract stores NO validator list — only committed set HEADERS and the
-/// single latest FinalizedBlock. Signer identities travel in events for
-/// accountability, never in storage. There is NO owner and NO upgrade path; the
-/// `prover` reference is immutable in v1 (a governance-swap variant would make
-/// exactly that one slot settable behind its own timelock, out of v1 scope).
+/// Bootstrap is fail-closed and time-bounded. The four-key header, proof
+/// backend runtime, deadline, minimum bridge validator count, and minimum
+/// bridge total staked weight are all pinned at deployment. A small Set_0 may
+/// still be tracked for lineage continuity; it cannot authorize withdrawal
+/// roots until both the current and known successor sets satisfy the bridge
+/// count and weight thresholds.
 contract B3FinalityVerifier {
-    // --- immutable genesis commitments (spec §5.1) ------------------------
-    bytes32 public immutable CHAIN_DOMAIN;      // genesis || X (32 B)
-    bytes32 public immutable GENESIS_SET_HASH;  // keccak(header of Set_0)
-    uint64  public immutable GENESIS_EPOCH;     // = 0
+    struct DeploymentConfig {
+        uint64 modernStartHeight;
+        uint64 bridgeActivationHeight;
+        uint32 minBridgeValidators;
+        uint32 maxBridgeValidators;
+        uint64 minBridgeTotalWeight;
+        uint256 minEpochDuration;
+        uint256 maxEpochLag;
+        uint256 maxCertificateAge;
+        uint256 minDepositExitWindow;
+        uint256 bootstrapDeadline;
+    }
+
+    bytes32 public immutable CHAIN_DOMAIN;
+    bytes32 public immutable BOOTSTRAP_SET_HASH;
+    bytes32 public immutable PROVER_CODE_HASH;
+    uint64 public immutable MODERN_START_HEIGHT;
+    uint64 public immutable BRIDGE_ACTIVATION_HEIGHT;
+    uint32 public immutable MIN_BRIDGE_VALIDATORS;
+    uint32 public immutable MAX_BRIDGE_VALIDATORS;
+    uint64 public immutable MIN_BRIDGE_TOTAL_WEIGHT;
+    uint256 public immutable MIN_EPOCH_DURATION;
+    uint256 public immutable MAX_EPOCH_LAG;
+    uint256 public immutable MAX_CERTIFICATE_AGE;
+    uint256 public immutable MIN_DEPOSIT_EXIT_WINDOW;
+    uint256 public immutable BOOTSTRAP_DEADLINE;
     IB3FinalityProver public immutable prover;
 
-    // --- rotation-tracked state ------------------------------------------
-    uint64  public currentEpoch;
+    bool public initialized;
+    uint256 public GENESIS_TIME;
+    bytes32 public GENESIS_SET_HASH;
+    B3Types.SetHeader private _bootstrapSet;
+    uint64 public currentEpoch;
     bytes32 public currentSetHash;
     B3Types.SetHeader public currentSet;
-
-    bytes32 public nextSetHash;                 // zero until the successor is learned
+    bytes32 public nextSetHash;
     B3Types.SetHeader public nextSet;
-
-    mapping(uint64 => bytes32) public setHashByEpoch;   // append-only history
-    B3Types.FinalizedBlock public latest;               // height strictly increasing
+    mapping(uint64 => bytes32) public setHashByEpoch;
+    B3Types.FinalizedBlock public latest;
+    /// Wall-clock time of the newest accepted certificate. It exposes live
+    /// bridge-finality readiness, but same-epoch certificates MUST NOT renew
+    /// the validator set's weak-subjectivity lifetime.
+    uint256 public lastCertificateTime;
+    /// Wall-clock time at which the current validator-set lineage first became
+    /// live on Ethereum or most recently completed an epoch handover.
     uint256 public lastRotationTime;
+    uint64 private _latestBridgeFinalizedHeight;
+    bytes32 private _latestBridgeWithdrawalRoot;
 
-    /// Ethereum-side liveness bound: an epoch that has been disclosed but not
-    /// rotated within MAX_EPOCH_LAG marks the lineage stale on rotation
-    /// (spec §9; the only bridge-activation-tunable numeric).
-    uint256 public immutable MAX_EPOCH_LAG;
+    event Finalized(
+        uint64 indexed epoch, uint64 indexed height, bytes32 blockHash, bytes32 withdrawalRoot, bytes signerBitmap
+    );
+    event Initialized(bytes32 indexed genesisSetHash, bytes32 indexed snapshotBlockHash, bytes signerBitmap);
 
-    event Finalized(uint64 indexed epoch, uint64 indexed height,
-                    bytes32 blockHash, bytes32 withdrawalRoot, bytes signerBitmap);
-
-    error BadGenesisHeader();
+    error BadBootstrap();
+    error AlreadyInitialized();
+    error NotInitialized();
+    error BootstrapExpired();
+    error BadGenesisSet();
+    error BadProver();
     error EpochNotAccepted();
     error NotMonotone();
+    error BadFinalizedBlock();
+    error PrematureWithdrawalRoot();
+    error MissingWithdrawalRoot();
     error BadSuccessor();
-    error ProofRejected();
     error SuccessorMismatch();
     error EpochLagExceeded();
+    error EpochTimeWindow();
+    error ProofRejected();
 
     constructor(
         bytes32 chainDomain,
-        B3Types.SetHeader memory genesisSet,
+        B3Types.SetHeader memory bootstrapSet,
+        bytes32 expectedBootstrapSetHash,
         IB3FinalityProver prover_,
-        uint256 maxEpochLag,
-        uint64 mMinusOne
+        bytes32 expectedProverCodeHash,
+        DeploymentConfig memory config
     ) {
-        if (!_checkHeaderRules(genesisSet) || genesisSet.epoch != 0) revert BadGenesisHeader();
-        CHAIN_DOMAIN = chainDomain;
-        GENESIS_EPOCH = 0;
-        prover = prover_;
-        MAX_EPOCH_LAG = maxEpochLag;
+        if (
+            chainDomain == bytes32(0) || expectedBootstrapSetHash == bytes32(0) || expectedProverCodeHash == bytes32(0)
+                || config.modernStartHeight == 0 || config.bridgeActivationHeight < config.modernStartHeight
+                || config.minBridgeValidators < 4 || config.maxBridgeValidators < config.minBridgeValidators
+                || config.maxBridgeValidators > B3Types.MAX_PROVEN_BRIDGE_VALIDATORS || config.minBridgeTotalWeight == 0
+                || config.minEpochDuration < B3Types.MIN_PROVEN_EPOCH_DURATION
+                || config.minEpochDuration > config.maxEpochLag || config.maxEpochLag == 0
+                || config.maxCertificateAge == 0 || config.maxCertificateAge >= config.maxEpochLag
+                || config.minDepositExitWindow == 0 || config.minDepositExitWindow >= config.maxEpochLag
+                || config.bootstrapDeadline <= block.timestamp
+                || config.bootstrapDeadline - block.timestamp > config.maxEpochLag
+        ) revert BadBootstrap();
 
-        bytes32 h = _hashHeader(genesisSet);
-        GENESIS_SET_HASH = h;
-        currentEpoch = 0;
-        currentSet = genesisSet;
-        currentSetHash = h;
-        setHashByEpoch[0] = h;
-        // latest = {M-1, 0, 0, 0, 0}
+        // Equal synthetic weights make both prover quorums exactly 3-of-4.
+        // The member root pins which four PoP-verified BLS identities those
+        // weights belong to; the public deployment manifest carries the rows.
+        if (
+            bootstrapSet.epoch != 0 || bootstrapSet.validatorCount != 4 || bootstrapSet.totalWeight != 4
+                || bootstrapSet.quorumWeight != 3 || !B3Types.headerShapeValid(bootstrapSet)
+                || B3Types.hashSetHeader(bootstrapSet) != expectedBootstrapSetHash
+        ) revert BadGenesisSet();
+
+        if (
+            address(prover_) == address(0) || address(prover_).code.length == 0
+                || _codeHash(address(prover_)) != expectedProverCodeHash
+        ) revert BadProver();
+
+        CHAIN_DOMAIN = chainDomain;
+        BOOTSTRAP_SET_HASH = expectedBootstrapSetHash;
+        PROVER_CODE_HASH = expectedProverCodeHash;
+        MODERN_START_HEIGHT = config.modernStartHeight;
+        BRIDGE_ACTIVATION_HEIGHT = config.bridgeActivationHeight;
+        MIN_BRIDGE_VALIDATORS = config.minBridgeValidators;
+        MAX_BRIDGE_VALIDATORS = config.maxBridgeValidators;
+        MIN_BRIDGE_TOTAL_WEIGHT = config.minBridgeTotalWeight;
+        MIN_EPOCH_DURATION = config.minEpochDuration;
+        MAX_EPOCH_LAG = config.maxEpochLag;
+        MAX_CERTIFICATE_AGE = config.maxCertificateAge;
+        MIN_DEPOSIT_EXIT_WINDOW = config.minDepositExitWindow;
+        BOOTSTRAP_DEADLINE = config.bootstrapDeadline;
+        prover = prover_;
+
+        _bootstrapSet = bootstrapSet;
         latest = B3Types.FinalizedBlock({
-            height: mMinusOne, blockHash: 0, withdrawalRoot: 0,
-            validatorSetHash: 0, epoch: 0
+            height: config.modernStartHeight - 1,
+            blockHash: bytes32(0),
+            withdrawalRoot: bytes32(0),
+            validatorSetHash: bytes32(0),
+            epoch: 0
         });
-        lastRotationTime = block.timestamp;
+        lastCertificateTime = 0;
+        lastRotationTime = 0;
     }
 
-    /// Spec §5.2, steps 1..7 in order.
+    /// One-time 3-of-4 handoff from the pinned bootstrap identities to the
+    /// canonical B3 Set_0. `snapshot` uses the existing FinalizedBlock digest:
+    /// height=M-1, the real B3 block hash, zero withdrawal root,
+    /// validatorSetHash=hash(genesisSet), epoch=0. Reusing the ordinary prover
+    /// keeps one BLS scheme, bitmap rule, member tree and witness ABI.
+    function initialize(
+        B3Types.FinalizedBlock calldata snapshot,
+        B3Types.SetHeader calldata genesisSet,
+        bytes calldata proof
+    ) external {
+        if (initialized) revert AlreadyInitialized();
+        if (block.timestamp > BOOTSTRAP_DEADLINE) revert BootstrapExpired();
+        if (
+            snapshot.height != MODERN_START_HEIGHT - 1 || snapshot.blockHash == bytes32(0)
+                || snapshot.withdrawalRoot != bytes32(0) || snapshot.validatorSetHash == bytes32(0)
+                || snapshot.epoch != 0
+        ) revert BadFinalizedBlock();
+
+        bytes32 genesisSetHash = B3Types.hashSetHeader(genesisSet);
+        if (
+            genesisSet.epoch != 0 || !B3Types.headerShapeValid(genesisSet)
+                || genesisSetHash != snapshot.validatorSetHash
+        ) revert BadGenesisSet();
+        if (!prover.verify(CHAIN_DOMAIN, snapshot, BOOTSTRAP_SET_HASH, _bootstrapSet, proof)) revert ProofRejected();
+
+        initialized = true;
+        GENESIS_TIME = block.timestamp;
+        GENESIS_SET_HASH = genesisSetHash;
+        currentSet = genesisSet;
+        currentSetHash = genesisSetHash;
+        setHashByEpoch[0] = genesisSetHash;
+        latest = snapshot;
+        lastCertificateTime = 0;
+        lastRotationTime = block.timestamp;
+        emit Initialized(genesisSetHash, snapshot.blockHash, _bitmapOf(proof));
+    }
+
+    /// Anyone may relay a certificate. No relayer gains authority: acceptance
+    /// depends only on the pinned B3 lineage and its stake/BLS quorum.
     function submitCertificate(
-        B3Types.FinalizedBlock calldata fb,
+        B3Types.FinalizedBlock calldata finalizedBlock,
         B3Types.SetHeader calldata successor,
         bytes calldata proof
     ) external {
-        // 1: only the current signing set, or the disclosed successor.
-        bool transition = (fb.epoch == currentEpoch + 1) && (nextSetHash != bytes32(0));
-        if (fb.epoch != currentEpoch && !transition) revert EpochNotAccepted();
+        if (!initialized) revert NotInitialized();
+        bool transition = finalizedBlock.epoch == currentEpoch + 1 && nextSetHash != bytes32(0);
+        if (finalizedBlock.epoch != currentEpoch && !transition) {
+            revert EpochNotAccepted();
+        }
+        // A current set has one bounded weak-subjectivity lifetime. Ordinary
+        // same-epoch certificates may advance finality but cannot renew it.
+        // A precommitted nextSet also cannot rotate after expiry: its proof has
+        // no trusted signing timestamp, so accepting it later would reopen the
+        // same long-range attack with keys from an obsolete set. Successful
+        // initialization starts the clock; only a timely, verified epoch
+        // handover resets it.
+        if (block.timestamp - lastRotationTime > MAX_EPOCH_LAG) {
+            revert EpochLagExceeded();
+        }
+        // An absolute epoch lower bound alone is insufficient after a relay
+        // outage: once several lower bounds are in the past, a withheld
+        // lineage could otherwise batch-walk those epochs in one transaction
+        // sequence and repeatedly renew lastRotationTime. Every accepted
+        // handover must consume at least one real minimum epoch as well.
+        if (transition && block.timestamp - lastRotationTime < MIN_EPOCH_DURATION) revert EpochTimeWindow();
+        if (!_epochTimeValid(finalizedBlock.epoch, block.timestamp)) {
+            revert EpochTimeWindow();
+        }
 
-        // 2: EPOCH TRANSITION — rotate BEFORE verifying, so the signature is
-        //    checked against the set that actually signed it.
+        if (finalizedBlock.height <= latest.height) revert NotMonotone();
+        if (finalizedBlock.blockHash == bytes32(0) || finalizedBlock.validatorSetHash == bytes32(0)) {
+            revert BadFinalizedBlock();
+        }
+        if (finalizedBlock.height < BRIDGE_ACTIVATION_HEIGHT && finalizedBlock.withdrawalRoot != bytes32(0)) {
+            revert PrematureWithdrawalRoot();
+        }
+        if (finalizedBlock.height >= BRIDGE_ACTIVATION_HEIGHT && finalizedBlock.withdrawalRoot == bytes32(0)) {
+            revert MissingWithdrawalRoot();
+        }
+
+        bytes32 successorHash = B3Types.hashSetHeader(successor);
+        if (
+            successor.epoch != finalizedBlock.epoch + 1 || !B3Types.headerShapeValid(successor)
+                || successorHash != finalizedBlock.validatorSetHash
+        ) revert BadSuccessor();
+
+        B3Types.SetHeader memory signingSet;
+        bytes32 signingSetHash;
+        if (transition) {
+            signingSet = nextSet;
+            signingSetHash = nextSetHash;
+        } else {
+            signingSet = currentSet;
+            signingSetHash = currentSetHash;
+        }
+
+        if (!prover.verify(CHAIN_DOMAIN, finalizedBlock, signingSetHash, signingSet, proof)) revert ProofRejected();
+
+        bool signingSetBridgeReady = _bridgeThresholdMet(signingSet);
+        if (signingSetBridgeReady && finalizedBlock.height >= BRIDGE_ACTIVATION_HEIGHT) {
+            _latestBridgeFinalizedHeight = finalizedBlock.height;
+            _latestBridgeWithdrawalRoot = finalizedBlock.withdrawalRoot;
+        }
+
+        // Rotate only after the successor-signed certificate has verified.
         if (transition) {
             currentSet = nextSet;
             currentSetHash = nextSetHash;
@@ -97,78 +264,127 @@ contract B3FinalityVerifier {
             delete nextSet;
             nextSetHash = bytes32(0);
             setHashByEpoch[currentEpoch] = currentSetHash;
-            if (block.timestamp - lastRotationTime > MAX_EPOCH_LAG) revert EpochLagExceeded();
-            lastRotationTime = block.timestamp;
         }
 
-        // 3: monotone finalized height.
-        if (fb.height <= latest.height) revert NotMonotone();
-
-        // 4: successor header well-formed and bound to fb.validatorSetHash.
-        if (successor.epoch != fb.epoch + 1
-            || !_checkHeaderRules(successor)
-            || _hashHeader(successor) != fb.validatorSetHash) revert BadSuccessor();
-
-        // 5: cryptographic verification against the CURRENT (signing) set.
-        if (!prover.verify(CHAIN_DOMAIN, fb, currentSetHash, currentSet, proof)) revert ProofRejected();
-
-        // 6: learn / confirm the one successor for this epoch.
         if (nextSetHash == bytes32(0)) {
             nextSet = successor;
-            nextSetHash = fb.validatorSetHash;
-        } else if (nextSetHash != fb.validatorSetHash) {
+            nextSetHash = successorHash;
+        } else if (nextSetHash != successorHash) {
             revert SuccessorMismatch();
         }
 
-        // 7: commit and emit (bitmap surfaced for accountability).
-        latest = fb;
-        emit Finalized(fb.epoch, fb.height, fb.blockHash, fb.withdrawalRoot, _bitmapOf(proof));
+        latest = finalizedBlock;
+        lastCertificateTime = block.timestamp;
+        if (transition) {
+            lastRotationTime = block.timestamp;
+        }
+        emit Finalized(
+            finalizedBlock.epoch,
+            finalizedBlock.height,
+            finalizedBlock.blockHash,
+            finalizedBlock.withdrawalRoot,
+            _bitmapOf(proof)
+        );
     }
 
-    // --- reads (spec §5.5) ------------------------------------------------
-    function latestWithdrawalRoot() external view returns (bytes32) { return latest.withdrawalRoot; }
-
-    // --- §5.4 header rules ------------------------------------------------
-    function _checkHeaderRules(B3Types.SetHeader memory h) internal pure returns (bool) {
-        if (h.rulesetVersion != 1) return false;
-        if (h.validatorCount < 1 || h.validatorCount > 8192) return false;
-        if (h.totalWeight == 0) return false;
-        if (h.quorumWeight != (2 * h.totalWeight) / 3 + 1) return false;
-        if (h.aggregatePubkey.length != 48) return false;
-        // aggregatePubkey != INFINITY: the compressed-infinity encoding has the
-        // second-most-significant bit set with all other bits zero.
-        if (_isG1Infinity(h.aggregatePubkey)) return false;
-        return true;
+    function latestWithdrawalRoot() external view returns (bytes32) {
+        return latest.withdrawalRoot;
     }
 
-    /// keccak(ValidatorSetHeader) over the exact 110-byte big-endian encoding.
-    function _hashHeader(B3Types.SetHeader memory h) internal pure returns (bytes32) {
-        return keccak256(abi.encodePacked(
-            h.epoch, h.rulesetVersion, h.validatorCount, h.totalWeight,
-            h.quorumWeight, h.aggregatePubkey, h.membersRoot));
+    function latestFinalizedHeight() external view returns (uint64) {
+        return latest.height;
     }
 
-    function _isG1Infinity(bytes memory pk48) internal pure returns (bool) {
-        if (pk48.length != 48) return false;
-        // compressed infinity: 0xc0 0x00 ... 0x00
-        if (uint8(pk48[0]) != 0xc0) return false;
-        for (uint256 i = 1; i < 48; i++) if (pk48[i] != 0) return false;
-        return true;
+    /// Live finality readiness is intentionally stronger than chain finality.
+    /// It requires the current B3 signing set AND its known successor to meet
+    /// the public bridge thresholds, a threshold-qualified post-activation
+    /// certificate, and a recent certificate with enough validator-set
+    /// lifetime remaining. Requiring the successor identifies a scheduled
+    /// handover to a bridge-ineligible set. The custody contract uses this same
+    /// fail-closed predicate for deposits, so funds cannot enter before the
+    /// contract has a live verifier/release path. B3 consensus may still keep
+    /// creation of irreversible withdrawal leaves disabled behind its
+    /// separate outbound height W; this contract cannot observe that B3-only
+    /// release pin.
+    function bridgeReady() public view returns (bool) {
+        if (!initialized || lastCertificateTime == 0) return false;
+        if (!_epochTimeValid(currentEpoch, block.timestamp)) return false;
+        if (
+            block.timestamp - lastCertificateTime > MAX_CERTIFICATE_AGE
+                || block.timestamp - lastRotationTime >= MAX_EPOCH_LAG - MIN_DEPOSIT_EXIT_WINDOW
+        ) return false;
+        return _bridgeThresholdMet(currentSet) && nextSetHash != bytes32(0) && _bridgeThresholdMet(nextSet)
+            && _latestBridgeFinalizedHeight >= BRIDGE_ACTIVATION_HEIGHT;
     }
 
-    /// The signer bitmap is the head of the v1 proof witness (see prover ABI);
-    /// decoded here only to surface it in the Finalized event. A prover whose
-    /// witness has no bitmap (e.g. a future ZK prover) returns empty bytes.
-    function _bitmapOf(bytes calldata proof) internal pure returns (bytes memory) {
+    /// Custody is irreversible and has no owner/refund path. Accept deposits
+    /// only while the complete bridge-readiness predicate holds; accepting them
+    /// during bootstrap, a certificate outage, or a weak-set handover could
+    /// otherwise lock funds permanently.
+    function depositViable() public view returns (bool) {
+        return bridgeReady();
+    }
+
+    /// A lag stop rejects new certificates, but it does not invalidate a
+    /// withdrawal root that was already accepted from a fresh, bridge-qualified
+    /// set. The vault may keep releasing exact proofs against that frozen root
+    /// without granting any stale validator new authority.
+    function releaseReady() public view returns (bool) {
+        return initialized && _latestBridgeFinalizedHeight >= BRIDGE_ACTIVATION_HEIGHT;
+    }
+
+    function latestBridgeFinalizedHeight() external view returns (uint64) {
+        return _latestBridgeFinalizedHeight;
+    }
+
+    function latestBridgeWithdrawalRoot() external view returns (bytes32) {
+        return _latestBridgeWithdrawalRoot;
+    }
+
+    function epochTimeValid(uint64 epoch) external view returns (bool) {
+        return initialized && _epochTimeValid(epoch, block.timestamp);
+    }
+
+    function hashSetHeader(B3Types.SetHeader calldata header) external pure returns (bytes32) {
+        return B3Types.hashSetHeader(header);
+    }
+
+    function _bitmapOf(bytes calldata proof) private pure returns (bytes memory) {
+        // V1 witness starts with abi.encode(bytes bitmap, ...). Event decoding
+        // is observability only; malformed data never bypasses prover.verify.
         if (proof.length < 64) return "";
-        // proof = abi.encode(bytes bitmap, bytes sig, Absent[] absent, bytes32[] multiproof, bool[] flags)
-        // the first head word is the offset to `bitmap`.
-        uint256 off;
-        assembly { off := calldataload(proof.offset) }
-        if (off + 32 > proof.length) return "";
-        uint256 len;
-        assembly { len := calldataload(add(proof.offset, off)) }
-        if (off + 32 + len > proof.length) return "";
-        return proof[off + 32 : off + 32 + len];
+        uint256 offset;
+        assembly {
+            offset := calldataload(proof.offset)
+        }
+        if (offset > proof.length - 32) return "";
+        uint256 length;
+        assembly {
+            length := calldataload(add(proof.offset, offset))
+        }
+        if (length > proof.length - offset - 32) return "";
+        return proof[offset + 32:offset + 32 + length];
+    }
+
+    function _codeHash(address account) private view returns (bytes32 hash) {
+        assembly {
+            hash := extcodehash(account)
+        }
+    }
+
+    function _bridgeThresholdMet(B3Types.SetHeader memory set) private view returns (bool) {
+        return set.validatorCount >= MIN_BRIDGE_VALIDATORS && set.validatorCount <= MAX_BRIDGE_VALIDATORS
+            && set.totalWeight >= MIN_BRIDGE_TOTAL_WEIGHT;
+    }
+
+    function _epochTimeValid(uint64 epoch, uint256 timestamp) private view returns (bool) {
+        uint256 epochNumber = uint256(epoch);
+        if (epochNumber > (type(uint256).max - GENESIS_TIME) / MIN_EPOCH_DURATION) return false;
+        uint256 earliest = GENESIS_TIME + epochNumber * MIN_EPOCH_DURATION;
+
+        uint256 epochAfter = epochNumber + 1;
+        if (epochAfter > (type(uint256).max - GENESIS_TIME) / MAX_EPOCH_LAG) return false;
+        uint256 latestAllowed = GENESIS_TIME + epochAfter * MAX_EPOCH_LAG;
+        return timestamp >= earliest && timestamp <= latestAllowed;
     }
 }

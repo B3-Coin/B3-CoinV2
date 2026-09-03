@@ -15,6 +15,8 @@
 #include <script/signingprovider.h>
 #include <uint256.h>
 
+#include <optional>
+
 class CKey;
 class CKeyID;
 class CScript;
@@ -24,6 +26,28 @@ class SigningProvider;
 struct bilingual_str;
 struct CMutableTransaction;
 struct SignatureData;
+
+/**
+ * Select the script whose satisfaction a signer is allowed to construct.
+ *
+ * B3A1-looking bytes in the sealed legacy UTXO set are ordinary scripts.
+ * They must never be reinterpreted as an asset carrier merely because their
+ * byte pattern parses. Callers may select OWNER_SUFFIX only after deriving
+ * post-H provenance for the particular input from trusted local chain state.
+ */
+enum class AssetSigningContext {
+    FULL_SCRIPT,
+    OWNER_SUFFIX,
+};
+
+/** Derive the conservative signing context for a locally known Coin. */
+constexpr AssetSigningContext AssetSigningContextForCoin(
+    const Coin& coin, const std::optional<int> legacy_final_height)
+{
+    return legacy_final_height && coin.nHeight > *legacy_final_height
+               ? AssetSigningContext::OWNER_SUFFIX
+               : AssetSigningContext::FULL_SCRIPT;
+}
 
 /** Interface for signature creators. */
 class BaseSignatureCreator {
@@ -110,16 +134,24 @@ struct SignatureData {
 };
 
 /** Produce a script signature using a generic signature creator. */
-bool ProduceSignature(const SigningProvider& provider, const BaseSignatureCreator& creator, const CScript& scriptPubKey, SignatureData& sigdata);
+bool ProduceSignature(const SigningProvider& provider, const BaseSignatureCreator& creator,
+                      const CScript& scriptPubKey, SignatureData& sigdata,
+                      AssetSigningContext asset_context = AssetSigningContext::FULL_SCRIPT);
 
 /** Extract signature data from a transaction input, and insert it. */
-SignatureData DataFromTransaction(const CMutableTransaction& tx, unsigned int nIn, const CTxOut& txout);
+SignatureData DataFromTransaction(const CMutableTransaction& tx, unsigned int nIn,
+                                  const CTxOut& txout,
+                                  AssetSigningContext asset_context = AssetSigningContext::FULL_SCRIPT);
 void UpdateInput(CTxIn& input, const SignatureData& data);
 
 /** Check whether a scriptPubKey is known to be segwit. */
-bool IsSegWitOutput(const SigningProvider& provider, const CScript& script);
+bool IsSegWitOutput(const SigningProvider& provider, const CScript& script,
+                    AssetSigningContext asset_context = AssetSigningContext::FULL_SCRIPT);
 
 /** Sign the CMutableTransaction */
-bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* provider, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors);
+bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* provider,
+                     const std::map<COutPoint, Coin>& coins, int sighash,
+                     std::map<int, bilingual_str>& input_errors,
+                     std::optional<int> legacy_final_height = std::nullopt);
 
 #endif // BITCOIN_SCRIPT_SIGN_H

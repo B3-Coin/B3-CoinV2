@@ -7,6 +7,7 @@
 
 #include <policy/policy.h>
 
+#include <modern/asset_output.h>
 #include <modern/metadata_cell.h>
 
 #include <modern/payload_cost.h>
@@ -43,10 +44,11 @@ CAmount GetDustThreshold(const CTxOut& txout, const CFeeRate& dustRelayFeeIn)
     // so dust is a spendable txout less than
     // 98*dustRelayFee/1000 (in satoshis).
     // 294 satoshis at the default rate of 3000 sat/kvB.
-    // B3 metadata cells are consensus-excluded from the UTXO set (amount 0,
-    // nothing ever spends them): like provably unspendable outputs they have
-    // no dust threshold.
-    if (txout.scriptPubKey.IsUnspendable() || modern::IsMetadataCell(txout.scriptPubKey))
+    // B3 metadata cells and canonical asset outputs carry no native value.
+    // Metadata and BURN-policy cells never enter the modern UTXO set; OWNER/FN
+    // carry their value in the typed asset amount. None has native dust.
+    if (txout.scriptPubKey.IsUnspendable() || modern::IsMetadataCell(txout.scriptPubKey) ||
+        modern::ParseAssetOutput(txout).has_value())
         return 0;
 
     uint64_t nSize{GetSerializeSize(txout)};
@@ -83,10 +85,11 @@ std::vector<uint32_t> GetDust(const CTransaction& tx, CFeeRate dust_relay_rate)
     return dust_outputs;
 }
 
-bool IsStandard(const CScript& scriptPubKey, TxoutType& whichType)
+bool IsStandard(const CScript& scriptPubKey, TxoutType& whichType,
+                const bool enable_asset_owner)
 {
     std::vector<std::vector<unsigned char> > vSolutions;
-    whichType = Solver(scriptPubKey, vSolutions);
+    whichType = Solver(scriptPubKey, vSolutions, enable_asset_owner);
 
     if (whichType == TxoutType::NONSTANDARD) {
         return false;
@@ -103,7 +106,11 @@ bool IsStandard(const CScript& scriptPubKey, TxoutType& whichType)
     return true;
 }
 
-bool IsStandardTx(const CTransaction& tx, const std::optional<unsigned>& max_datacarrier_bytes, bool permit_bare_multisig, const CFeeRate& dust_relay_fee, std::string& reason)
+bool IsStandardTx(const CTransaction& tx,
+                  const std::optional<unsigned>& max_datacarrier_bytes,
+                  const bool permit_bare_multisig,
+                  const CFeeRate& dust_relay_fee, std::string& reason,
+                  const bool enable_asset_owner)
 {
     if (tx.version > TX_MAX_STANDARD_VERSION || tx.version < TX_MIN_STANDARD_VERSION) {
         reason = "version";
@@ -143,12 +150,22 @@ bool IsStandardTx(const CTransaction& tx, const std::optional<unsigned>& max_dat
     unsigned int datacarrier_bytes_left = max_datacarrier_bytes.value_or(0);
     TxoutType whichType;
     for (const CTxOut& txout : tx.vout) {
-        if (!::IsStandard(txout.scriptPubKey, whichType)) {
+        if (!::IsStandard(txout.scriptPubKey, whichType,
+                          enable_asset_owner)) {
             reason = "scriptpubkey";
             return false;
         }
 
-        if (whichType == TxoutType::NULL_DATA) {
+        // Metadata cells, BURN and DEX_VAULT are typed Modern outputs, not
+        // OP_RETURN/data carriers. Solver classifies their deliberately
+        // keyless script shapes as NULL_DATA for policy plumbing, but none
+        // consumes the unrelated -datacarriersize budget. DEX_VAULT
+        // nevertheless remains in the UTXO set; metadata cells and typed BURN
+        // are excluded there by their own Modern rules.
+        if (whichType == TxoutType::NULL_DATA &&
+            !modern::IsMetadataCell(txout.scriptPubKey) &&
+            !modern::IsAssetBurnOutput(txout) &&
+            !modern::IsDexVaultOutput(txout)) {
             unsigned int size = txout.scriptPubKey.size();
             if (size > datacarrier_bytes_left) {
                 reason = "datacarrier";
@@ -173,13 +190,26 @@ bool IsStandardTx(const CTransaction& tx, const std::optional<unsigned>& max_dat
 /**
  * Check the total number of non-witness sigops across the whole transaction, as per BIP54.
  */
-static bool CheckSigopsBIP54(const CTransaction& tx, const CCoinsViewCache& inputs)
+static CScript AuthorizationScriptForCoin(const Coin& coin,
+                                          const std::optional<int> legacy_final_height)
+{
+    if (legacy_final_height && coin.nHeight > *legacy_final_height) {
+        return modern::AssetOwnerScript(coin.out.scriptPubKey)
+            .value_or(coin.out.scriptPubKey);
+    }
+    return coin.out.scriptPubKey;
+}
+
+static bool CheckSigopsBIP54(const CTransaction& tx, const CCoinsViewCache& inputs,
+                             const std::optional<int> legacy_final_height)
 {
     Assert(!tx.IsCoinBase());
 
     unsigned int sigops{0};
     for (const auto& txin: tx.vin) {
-        const auto& prev_txo{inputs.AccessCoin(txin.prevout).out};
+        const Coin& coin{inputs.AccessCoin(txin.prevout)};
+        const CScript prev_script{
+            AuthorizationScriptForCoin(coin, legacy_final_height)};
 
         // Unlike the existing block wide sigop limit which counts sigops present in the block
         // itself (including the scriptPubKey which is not executed until spending later), BIP54
@@ -189,7 +219,7 @@ static bool CheckSigopsBIP54(const CTransaction& tx, const CCoinsViewCache& inpu
         // or fewer. This method of accounting was introduced by BIP16, and BIP54 reuses it.
         // The GetSigOpCount call on the previous scriptPubKey counts both bare and P2SH sigops.
         sigops += txin.scriptSig.GetSigOpCount(/*fAccurate=*/true);
-        sigops += prev_txo.scriptPubKey.GetSigOpCount(txin.scriptSig);
+        sigops += prev_script.GetSigOpCount(txin.scriptSig);
 
         if (sigops > MAX_TX_LEGACY_SIGOPS) {
             return false;
@@ -217,21 +247,27 @@ static bool CheckSigopsBIP54(const CTransaction& tx, const CCoinsViewCache& inpu
  *
  * We also check the total number of non-witness sigops across the whole transaction, as per BIP54.
  */
-bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
+bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs,
+                       const std::optional<int> legacy_final_height)
 {
     if (tx.IsCoinBase()) {
         return true; // Coinbases don't use vin normally
     }
 
-    if (!CheckSigopsBIP54(tx, mapInputs)) {
+    if (!CheckSigopsBIP54(tx, mapInputs, legacy_final_height)) {
         return false;
     }
 
     for (unsigned int i = 0; i < tx.vin.size(); i++) {
-        const CTxOut& prev = mapInputs.AccessCoin(tx.vin[i].prevout).out;
+        const Coin& coin{mapInputs.AccessCoin(tx.vin[i].prevout)};
+        const CScript prev_script{
+            AuthorizationScriptForCoin(coin, legacy_final_height)};
 
         std::vector<std::vector<unsigned char> > vSolutions;
-        TxoutType whichType = Solver(prev.scriptPubKey, vSolutions);
+        const bool enable_asset_owner{
+            legacy_final_height && coin.nHeight > *legacy_final_height};
+        TxoutType whichType = Solver(prev_script, vSolutions,
+                                     enable_asset_owner);
         if (whichType == TxoutType::NONSTANDARD || whichType == TxoutType::WITNESS_UNKNOWN) {
             // WITNESS_UNKNOWN failures are typically also caught with a policy
             // flag in the script interpreter, but it can be helpful to catch
@@ -255,7 +291,8 @@ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
     return true;
 }
 
-bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
+bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs,
+                       const std::optional<int> legacy_final_height)
 {
     if (tx.IsCoinBase())
         return true; // Coinbases are skipped
@@ -267,10 +304,9 @@ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
         if (tx.vin[i].scriptWitness.IsNull())
             continue;
 
-        const CTxOut &prev = mapInputs.AccessCoin(tx.vin[i].prevout).out;
-
         // get the scriptPubKey corresponding to this input:
-        CScript prevScript = prev.scriptPubKey;
+        CScript prevScript{AuthorizationScriptForCoin(
+            mapInputs.AccessCoin(tx.vin[i].prevout), legacy_final_height)};
 
         // witness stuffing detected
         if (prevScript.IsPayToAnchor()) {
@@ -344,7 +380,8 @@ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
     return true;
 }
 
-bool SpendsNonAnchorWitnessProg(const CTransaction& tx, const CCoinsViewCache& prevouts)
+bool SpendsNonAnchorWitnessProg(const CTransaction& tx, const CCoinsViewCache& prevouts,
+                               const std::optional<int> legacy_final_height)
 {
     if (tx.IsCoinBase()) {
         return false;
@@ -353,7 +390,8 @@ bool SpendsNonAnchorWitnessProg(const CTransaction& tx, const CCoinsViewCache& p
     int version;
     std::vector<uint8_t> program;
     for (const auto& txin: tx.vin) {
-        const auto& prev_spk{prevouts.AccessCoin(txin.prevout).out.scriptPubKey};
+        const CScript prev_spk{AuthorizationScriptForCoin(
+            prevouts.AccessCoin(txin.prevout), legacy_final_height)};
 
         // Note this includes not-yet-defined witness programs.
         if (prev_spk.IsWitnessProgram(version, program) && !prev_spk.IsPayToAnchor(version, program)) {

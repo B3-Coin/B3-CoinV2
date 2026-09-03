@@ -34,6 +34,7 @@ class ImportLegacyWalletDumpTest(BitcoinTestFramework):
         source = MiniWallet(node)
         compressed_wif, compressed_pubkey = generate_keypair(compressed=True, wif=True)
         uncompressed_wif, uncompressed_pubkey = generate_keypair(compressed=False, wif=True)
+        blank_wif, blank_pubkey = generate_keypair(compressed=True, wif=True)
 
         source.send_to(
             from_node=node,
@@ -44,6 +45,11 @@ class ImportLegacyWalletDumpTest(BitcoinTestFramework):
             from_node=node,
             scriptPubKey=key_to_p2pk_script(uncompressed_pubkey),
             amount=2 * LEGACY_COIN,
+        )
+        source.send_to(
+            from_node=node,
+            scriptPubKey=key_to_p2pkh_script(blank_pubkey),
+            amount=4 * LEGACY_COIN,
         )
         self.generate(source, 1)
 
@@ -97,6 +103,36 @@ class ImportLegacyWalletDumpTest(BitcoinTestFramework):
 
         node.createwallet(wallet_name="sink")
         sink = node.get_wallet_rpc("sink")
+
+        blank_dump_path = node.datadir_path / "blank-recovery.dump"
+        blank_dump_path.write_text(
+            "# Wallet dump created by B3-Coin v3.1.2.2\n"
+            f"{self.record(blank_wif, blank_pubkey, '2018-02-03T04:05:06Z', 'label=Blank%20Recovery')}\n"
+            "# End of dump\n",
+            encoding="utf8",
+        )
+        node.createwallet(wallet_name="blank-recovery", blank=True, passphrase="blank-passphrase")
+        blank_recovery = node.get_wallet_rpc("blank-recovery")
+        blank_recovery.walletpassphrase("blank-passphrase", 600)
+        assert_equal(blank_recovery.getwalletinfo()["blank"], True)
+        assert_raises_rpc_error(-4, "This wallet has no available keys", blank_recovery.getnewaddress)
+
+        blank_result = blank_recovery.importlegacywalletdump(str(blank_dump_path))
+        assert_equal(blank_result["keys_imported"], 1)
+        assert_equal(blank_recovery.getwalletinfo()["blank"], False)
+        assert_equal(blank_recovery.getbalances()["mine"]["trusted"], Decimal("0.004000000"))
+        blank_recovery.getnewaddress(address_type="legacy")
+        blank_recovery.getrawchangeaddress(address_type="legacy")
+
+        # Funding a transaction for less than the recovered UTXO must create
+        # change. This is the same wallet capability bindfinalitykey needs.
+        funded = blank_recovery.walletcreatefundedpsbt(
+            inputs=[],
+            outputs={sink.getnewaddress(address_type="legacy"): Decimal("0.001000000")},
+            feeRate=Decimal("0.000100000"),
+        )
+        assert funded["changepos"] >= 0
+
         spend = recovery.sendall(recipients=[sink.getnewaddress()])
         assert_equal(spend["complete"], True)
 

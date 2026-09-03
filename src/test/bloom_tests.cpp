@@ -7,7 +7,6 @@
 #include <clientversion.h>
 #include <common/system.h>
 #include <key.h>
-#include <key_io.h>
 #include <merkleblock.h>
 #include <primitives/block.h>
 #include <random.h>
@@ -83,8 +82,15 @@ BOOST_AUTO_TEST_CASE(bloom_create_insert_serialize_with_tweak)
 
 BOOST_AUTO_TEST_CASE(bloom_create_insert_key)
 {
-    std::string strSecret = std::string("5Kg1gnAjaLfKiwhhPpGS3QfRg2m6awQvaj98JCZBZQ5SuS2F15C");
-    CKey key = DecodeSecret(strSecret);
+    // Fix the secret bytes directly. The historical upstream vector encoded
+    // them as a Bitcoin-mainnet WIF, which is intentionally invalid under
+    // B3's distinct private-key prefix even though the bloom vector itself is
+    // network-independent.
+    constexpr auto secret{
+        "f49addfd726a59abde172c86452f5f73038a02f4415878dc14934175e8418aff"_hex};
+    CKey key;
+    key.Set(secret.begin(), secret.end(), /*fCompressedIn=*/false);
+    BOOST_REQUIRE(key.IsValid());
     CPubKey pubkey = key.GetPubKey();
     std::vector<unsigned char> vchPubKey(pubkey.begin(), pubkey.end());
 

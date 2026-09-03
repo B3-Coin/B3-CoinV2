@@ -140,9 +140,15 @@ BOOST_FIXTURE_TEST_CASE(bootstrap_floor_halts_production, FinalityChainFixture)
     BOOST_CHECK_EQUAL(Tip()->nHeight, M - 1);
     {
         LOCK(cs_main);
-        const auto w{m_node.chainman->ActiveChainstate().ModernEligibilityWeights(m_vk_a, *m_node.chainman->ActiveChain().Tip())};
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        const auto w{chainstate.ModernEligibilityWeights(
+            m_vk_a, *m_node.chainman->ActiveChain().Tip())};
         BOOST_REQUIRE(w.has_value());
         BOOST_CHECK(*w == std::make_pair(CAmount{0}, CAmount{0}));
+        // getfinalitystatus derives ready=false from this exact projection at
+        // M-1; an undersized candidate must never become Set0.
+        BOOST_CHECK(!chainstate.ModernFinality().SetInForceAt(
+            M, m_node.chainman->GetConsensus()));
     }
     ProduceExpectConnectFailure(m_vk_a, {}, 1);
     ProduceExpectConnectFailure(m_vk_b, {}, 2);

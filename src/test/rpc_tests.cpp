@@ -3,7 +3,10 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <core_io.h>
+#include <consensus/fn_params.h>
 #include <interfaces/chain.h>
+#include <key.h>
+#include <key_io.h>
 #include <node/context.h>
 #include <rpc/blockchain.h>
 #include <rpc/client.h>
@@ -12,6 +15,7 @@
 #include <test/util/common.h>
 #include <test/util/setup_common.h>
 #include <univalue.h>
+#include <util/strencodings.h>
 #include <util/time.h>
 
 #include <any>
@@ -85,6 +89,127 @@ UniValue RPCTestingSetup::CallRPC(std::string args)
 
 
 BOOST_FIXTURE_TEST_SUITE(rpc_tests, RPCTestingSetup)
+
+BOOST_AUTO_TEST_CASE(getassetstate_reports_production_schedule)
+{
+    const UniValue result{CallRPC("getassetstate")};
+    BOOST_CHECK_EQUAL(result.find_value("next_height").getInt<int>(), 1);
+
+    const UniValue& fn{result.find_value("fn")};
+    BOOST_CHECK(fn.find_value("configured").get_bool());
+    BOOST_CHECK(!fn.find_value("active").get_bool());
+    BOOST_CHECK(!fn.find_value("pod_active").get_bool());
+    BOOST_CHECK(fn.find_value("counter_known").get_bool());
+    BOOST_CHECK_EQUAL(fn.find_value("historical_issued").getInt<int>(), 3'592);
+    BOOST_CHECK_EQUAL(fn.find_value("modern_issued").getInt<int>(), 0);
+    BOOST_CHECK_EQUAL(fn.find_value("modern_capacity").getInt<int>(), 1'408);
+
+    const UniValue& colored{result.find_value("colored")};
+    BOOST_CHECK(colored.find_value("configured").get_bool());
+    BOOST_CHECK(!colored.find_value("active").get_bool());
+}
+
+BOOST_AUTO_TEST_CASE(getbridgeinfo_reports_incomplete_mainnet_pins)
+{
+    const UniValue result{CallRPC("getbridgeinfo")};
+    BOOST_CHECK_EQUAL(result.find_value("status").get_str(), "incomplete");
+    BOOST_CHECK(result.find_value("configured").get_bool());
+    BOOST_CHECK(!result.find_value("ready").get_bool());
+    BOOST_CHECK(!result.find_value("active").get_bool());
+    BOOST_CHECK(!result.find_value("mint_approval_open").get_bool());
+    BOOST_CHECK(!result.find_value("asset_id").isNull());
+    BOOST_CHECK(!result.find_value("asset_id_evm").isNull());
+    BOOST_CHECK(result.find_value("registry_id").isNull());
+    BOOST_CHECK_EQUAL(result.find_value("vault").get_str(),
+                      "143f207e23e6aebd7e974be90ac6d434f4c7bfb6");
+    BOOST_CHECK(result.find_value("vault_runtime_code_hash").isNull());
+    BOOST_CHECK_EQUAL(result.find_value("token").get_str(),
+                      "dac17f958d2ee523a2206206994597c13d831ec7");
+    BOOST_CHECK(!result.find_value("state_available").get_bool());
+    BOOST_CHECK(!result.find_value("light_client_bootstrapped").get_bool());
+    BOOST_CHECK_EQUAL(result.find_value("anchors").getInt<int>(), 0);
+    BOOST_CHECK_EQUAL(result.find_value("nullifiers").getInt<int>(), 0);
+    BOOST_CHECK_EQUAL(result.find_value("managed_withdrawals").getInt<int>(), 0);
+    BOOST_CHECK_THROW(CallRPC("getbridgelightclientstore"), std::runtime_error);
+    BOOST_CHECK_THROW(CallRPC("getbridgeanchorforblock 19000000"),
+                      std::runtime_error);
+    BOOST_CHECK_THROW(CallRPC("getbridgefinalityproof 0"),
+                      std::runtime_error);
+    BOOST_CHECK_THROW(
+        CallRPC("getbridgewithdrawalproof " + std::string(64, '0') + " 0"),
+        std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(getbridgeproofstatus_is_fail_closed_and_uses_ethereum_hash_order)
+{
+    const std::string eth_hash{
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"};
+    const UniValue result{
+        CallRPC("getbridgeproofstatus " + eth_hash + " 42")};
+    BOOST_CHECK(!result.find_value("state_available").get_bool());
+
+    const UniValue& anchor{result.find_value("anchor")};
+    BOOST_CHECK_EQUAL(anchor.find_value("hash").get_str(), eth_hash);
+    BOOST_CHECK(!anchor.find_value("known").get_bool());
+
+    const UniValue& deposit{result.find_value("deposit")};
+    BOOST_CHECK_EQUAL(deposit.find_value("deposit_id").getInt<int>(), 42);
+    BOOST_CHECK(!deposit.find_value("claimed").get_bool());
+}
+
+BOOST_AUTO_TEST_CASE(getbridgeanchorforblock_converts_target_to_number)
+{
+    const UniValue converted{
+        RPCConvertValues("getbridgeanchorforblock", {"19000000"})};
+    BOOST_REQUIRE_EQUAL(converted.size(), 1U);
+    BOOST_CHECK(converted[0].isNum());
+    BOOST_CHECK_EQUAL(converted[0].getInt<uint64_t>(), 19'000'000U);
+}
+
+BOOST_AUTO_TEST_CASE(outbound_bridge_rpc_converts_hashes_or_heights)
+{
+    const std::string hash{
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"};
+    UniValue converted{
+        RPCConvertValues("getbridgefinalityproof", {"811002"})};
+    BOOST_REQUIRE_EQUAL(converted.size(), 1U);
+    BOOST_CHECK(converted[0].isNum());
+    BOOST_CHECK_EQUAL(converted[0].getInt<uint64_t>(), 811002U);
+    converted = RPCConvertValues("getbridgefinalityproof", {hash});
+    BOOST_CHECK(converted[0].isStr());
+    BOOST_CHECK_EQUAL(converted[0].get_str(), hash);
+
+    converted = RPCConvertValues(
+        "getbridgewithdrawalproof", {hash, "7", "812442"});
+    BOOST_REQUIRE_EQUAL(converted.size(), 3U);
+    BOOST_CHECK(converted[0].isStr());
+    BOOST_CHECK_EQUAL(converted[0].get_str(), hash);
+    BOOST_CHECK(converted[1].isNum());
+    BOOST_CHECK(converted[2].isNum());
+    BOOST_CHECK_EQUAL(converted[1].getInt<uint64_t>(), 7U);
+    BOOST_CHECK_EQUAL(converted[2].getInt<uint64_t>(), 812442U);
+    converted = RPCConvertValues(
+        "getbridgewithdrawalproof", {hash, "7", hash});
+    BOOST_CHECK(converted[2].isStr());
+    BOOST_CHECK_EQUAL(converted[2].get_str(), hash);
+}
+
+BOOST_AUTO_TEST_CASE(outbound_bridge_rpc_rejects_malformed_burn_sources)
+{
+    const std::string txid(64, '1');
+    BOOST_CHECK_THROW(CallRPC("getbridgewithdrawalproof not-a-txid 0"),
+                      std::runtime_error);
+    BOOST_CHECK_THROW(CallRPC("getbridgewithdrawalproof " + txid),
+                      std::runtime_error);
+    BOOST_CHECK_THROW(CallRPC("getbridgewithdrawalproof " + txid + " -1"),
+                      std::runtime_error);
+    BOOST_CHECK_THROW(
+        CallRPC("getbridgewithdrawalproof " + txid + " 4294967296"),
+        std::runtime_error);
+    BOOST_CHECK_THROW(
+        CallRPC("getbridgewithdrawalproof " + txid + " 0 bad-block"),
+        std::runtime_error);
+}
 
 BOOST_AUTO_TEST_CASE(rpc_namedparams)
 {
@@ -195,16 +320,25 @@ BOOST_AUTO_TEST_CASE(rpc_togglenetwork)
 BOOST_AUTO_TEST_CASE(rpc_rawsign)
 {
     UniValue r;
+    const std::vector<unsigned char> secret1{ParseHex("6cf864daeb6a276e7bc66466ec624d7e1ca9c5be11155399f37ce7a9f819b641")};
+    const std::vector<unsigned char> secret2{ParseHex("4a09f53de410732e5e6e82deca3498bf58d23ee079e70b1c06b3cae26bf34d53")};
+    CKey key1;
+    CKey key2;
+    key1.Set(secret1.begin(), secret1.end(), /*fCompressedIn=*/true);
+    key2.Set(secret2.begin(), secret2.end(), /*fCompressedIn=*/true);
+    BOOST_REQUIRE(key1.IsValid());
+    BOOST_REQUIRE(key2.IsValid());
+
     // input is a 1-of-2 multisig (so is output):
     std::string prevout =
       "[{\"txid\":\"b4cc287e58f87cdae59417329f710f3ecd75a4ee1d2872b7248f50977c8493f3\","
       "\"vout\":1,\"scriptPubKey\":\"a914b10c9df5f7edf436c697f02f1efdba4cf399615187\","
       "\"redeemScript\":\"512103debedc17b3df2badbcdd86d5feb4562b86fe182e5998abd8bcd4f122c6155b1b21027e940bb73ab8732bfdf7f9216ecefca5b94d6df834e77e108f68e66f126044c052ae\"}]";
     r = CallRPC(std::string("createrawtransaction ")+prevout+" "+
-      "{\"3HqAe9LtNBjnsfM4CyYaWTnvCaUYT7v4oZ\":11}");
+      "{\"" + EncodeDestination(PKHash{key1.GetPubKey()}) + "\":11}");
     std::string notsigned = r.get_str();
-    std::string privkey1 = "\"KzsXybp9jX64P5ekX1KUxRQ79Jht9uzW7LorgwE65i5rWACL6LQe\"";
-    std::string privkey2 = "\"Kyhdf5LuKTRx4ge69ybABsiUAWjVRK4XGxAKk2FQLp2HjGMy87Z4\"";
+    const std::string privkey1 = "\"" + EncodeSecret(key1) + "\"";
+    const std::string privkey2 = "\"" + EncodeSecret(key2) + "\"";
     r = CallRPC(std::string("signrawtransactionwithkey ")+notsigned+" [] "+prevout);
     BOOST_CHECK(r.get_obj().find_value("complete").get_bool() == false);
     r = CallRPC(std::string("signrawtransactionwithkey ")+notsigned+" ["+privkey1+","+privkey2+"] "+prevout);

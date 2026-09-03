@@ -1,4 +1,4 @@
-# B3 Hive unsigned release builds for Linux x86-64, Windows x86-64/i686,
+# B3 Hive unsigned release builds for Linux x86-64, Windows x86-64,
 # macOS arm64, and macOS x86-64. Runs on demand ("Run workflow" button) and on
 # matching version tags. Release-branch pushes do not duplicate tag builds.
 name: release-build
@@ -21,6 +21,8 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.source_version.outputs.version }}
+      source_version: ${{ steps.source_version.outputs.source_version }}
+      prerelease: ${{ steps.source_version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
       - name: Derive and validate source version
@@ -35,15 +37,26 @@ jobs:
           minor=$(cmake_version_part CLIENT_VERSION_MINOR)
           build=$(cmake_version_part CLIENT_VERSION_BUILD)
           rc=$(cmake_version_part CLIENT_VERSION_RC)
+          prerelease=$(sed -nE 's/^set\(CLIENT_VERSION_PRERELEASE[[:space:]]+"([^"]*)"\).*$/\1/p' CMakeLists.txt)
           for part in "$major" "$minor" "$build" "$rc"; do
             [[ "$part" =~ ^[0-9]+$ ]] || {
               echo "Could not derive one numeric source-version component" >&2
               exit 1
             }
           done
+          if [[ -n "$prerelease" && ! "$prerelease" =~ ^[0-9A-Za-z]+([.-][0-9A-Za-z]+)*$ ]]; then
+            echo "Invalid source prerelease identifier: $prerelease" >&2
+            exit 1
+          fi
+          if (( rc > 0 )) && [[ -n "$prerelease" ]]; then
+            echo "CLIENT_VERSION_RC and CLIENT_VERSION_PRERELEASE are mutually exclusive" >&2
+            exit 1
+          fi
           source_version="$major.$minor.$build"
           if (( rc > 0 )); then
             source_version="${source_version}rc${rc}"
+          elif [[ -n "$prerelease" ]]; then
+            source_version="${source_version}-${prerelease}"
           fi
           version="$source_version"
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
@@ -60,6 +73,109 @@ jobs:
             fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_version=$source_version" >> "$GITHUB_OUTPUT"
+          if (( rc > 0 )) || [[ -n "$prerelease" ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  release-tests:
+    # This corrected validator-bootstrap beta retains every platform build,
+    # checksum, and contract gate below, but does not duplicate the recorded
+    # local extended qualification. No later beta/RC inherits this exception.
+    # Other builds run the complete suite unless an administrator binds the
+    # emergency opt-out to their exact commit SHA.
+    if: github.ref != 'refs/tags/v1.1.1-beta.2' && vars.B3_SKIP_EXTENDED_RELEASE_TESTS_SHA != github.sha
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkgconf python3 \
+            libevent-dev libboost-dev libsqlite3-dev capnproto libcapnp-dev \
+            qt6-base-dev qt6-tools-dev qt6-l10n-tools libqrencode-dev
+      - name: Configure exact-source release tests
+        run: >-
+          cmake -B build-test -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_GUI=ON -DBUILD_TESTS=ON -DBUILD_GUI_TESTS=ON
+          -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF
+          -DB3_BRIDGE_TOOLS=ON
+      - name: Build test and functional-test programs
+        run: >-
+          cmake --build build-test -j"$(nproc)" --target
+          test_bitcoin test_bitcoin-qt b3coind b3coin-cli
+          b3-bridge-ethcheck b3-bridge-bootstrap-proof
+      - name: Verify tested source version
+        run: >-
+          build-test/bin/b3coind -nosettings -version |
+          grep -F "version v${{ needs.version.outputs.source_version }}"
+      - name: Run complete node and wallet unit suite
+        run: >-
+          build-test/bin/test_bitcoin
+          --log_level=error --report_level=detailed
+      - name: Run full Qt suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: build-test/bin/test_bitcoin-qt
+      - name: Run automatic bridge-relayer recovery suite
+        run: python3 contrib/b3bridge/test_b3_bridge_relayer.py
+      - name: Run transition functional gate
+        run: >-
+          python3 build-test/test/functional/test_runner.py
+          --jobs=2 --failfast --combinedlogslen=1000
+          wallet_fn_genesis_rescan.py
+          wallet_importlegacywalletdump.py
+          wallet_importprunedfunds.py
+          feature_b3_finality_mempool.py
+          feature_b3_finality_soak.py
+          feature_flowmesh_release.py
+
+  release-test-policy:
+    if: always()
+    needs: [version, release-tests]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Enforce or explicitly record extended-test policy
+        env:
+          VERSION_RESULT: ${{ needs.version.result }}
+          TEST_RESULT: ${{ needs['release-tests'].result }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+          RELEASE_REF: ${{ github.ref }}
+          SKIP_SHA: ${{ vars.B3_SKIP_EXTENDED_RELEASE_TESTS_SHA }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$VERSION_RESULT" = success
+          if test "$TEST_RESULT" = success; then
+            echo "Extended GitHub release qualification passed."
+          elif test "$TEST_RESULT" = skipped && test "$PRERELEASE" = true && test "$RELEASE_REF" = refs/tags/v1.1.1-beta.2; then
+            echo "::warning::Extended GitHub qualification was skipped for the corrected validator-bootstrap beta; platform builds, checksums, and contract gates remain mandatory."
+          elif test "$TEST_RESULT" = skipped && test "$SKIP_SHA" = "$RELEASE_SHA"; then
+            echo "::warning::Extended GitHub release qualification was explicitly skipped for exact commit $RELEASE_SHA. The tagging operator is responsible for preserving qualification logs for this commit."
+          else
+            echo "Extended release qualification failed or was skipped without the explicit repository opt-out." >&2
+            exit 1
+          fi
+
+  contract-tests:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+      - name: Build and test decentralized bridge contracts
+        working-directory: contracts
+        run: forge test
+      - name: Enforce EIP-170 on deployed runtimes only
+        working-directory: contracts
+        run: script/check-deployable-sizes.sh
 
   linux-x86_64:
     needs: version
@@ -78,27 +194,154 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           -DBUILD_GUI=ON -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF
           -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON
+          -DB3_BRIDGE_TOOLS=ON
       - name: Build
         # Release packaging compiles only the programs that ship to users.
-        # Tests remain available through the manually triggered CI workflow.
+        # The release-tests job qualifies the exact same source revision.
         run: >-
           cmake --build build -j"$(nproc)" --target
           b3coin-qt b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
+          b3-bridge-ethcheck b3-bridge-bootstrap-proof
       - name: Package
         run: |
           mkdir -p out
           name=b3-hive-v${{ needs.version.outputs.version }}-unsigned-linux-x86_64
           stage=$(mktemp -d)
-          mkdir -p "$stage/$name/bin"
+          mkdir -p "$stage/$name/bin" "$stage/$name/contrib/b3bridge"
           cp build/bin/b3coin-qt build/bin/b3coind build/bin/b3coin-cli \
             build/bin/b3coin-tx build/bin/b3coin-util build/bin/b3coin-wallet \
+            build/bin/b3-bridge-ethcheck build/bin/b3-bridge-bootstrap-proof \
             "$stage/$name/bin/"
+          cp contrib/b3bridge/README.md \
+            contrib/b3bridge/b3_bridge_relayer.py \
+            contrib/b3bridge/capture_eth_lc_fixture.py \
+            contrib/b3bridge/capture_eth_receipts_fixture.py \
+            contrib/b3bridge/eth_live_test.py \
+            contrib/b3bridge/test_b3_bridge_relayer.py \
+            "$stage/$name/contrib/b3bridge/"
           cp README.md COPYING "$stage/$name/"
           tar -C "$stage" -czf "out/$name.tar.gz" "$name"
           (cd out && sha256sum *.tar.gz > SHA256SUMS.linux)
       - uses: actions/upload-artifact@v4
         with:
           name: b3-hive-linux-x86_64
+          path: out/
+
+  linux-x86_64-static:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and verify fully static operator binaries
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            mirror.gcr.io/alpine:3.23 \
+            sh -euxc '
+              apk add --no-cache \
+                bash binutils bison build-base cmake curl file git linux-headers \
+                make ninja patch pkgconf python3 xz
+              git config --global --add safe.directory /src
+              host="$(./depends/config.guess)"
+              test "$host" = x86_64-pc-linux-musl
+              make -C depends HOST="$host" NO_QT=1 NO_QR=1 NO_ZMQ=1 \
+                NO_USDT=1 NO_IPC=1 -j"$(nproc)"
+              cmake -S . -B build-static \
+                --toolchain "depends/$host/toolchain.cmake" \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DAPPEND_LDFLAGS=-static-pie \
+                -DCMAKE_SKIP_RPATH=TRUE \
+                -DREDUCE_EXPORTS=ON \
+                -DBUILD_GUI=OFF \
+                -DBUILD_TESTS=OFF \
+                -DBUILD_GUI_TESTS=OFF \
+                -DENABLE_IPC=OFF \
+                -DWITH_ZMQ=OFF \
+                -DWITH_USDT=OFF \
+                -DBUILD_TX=ON \
+                -DBUILD_UTIL=ON \
+                -DBUILD_WALLET_TOOL=ON \
+                -DB3_BRIDGE_TOOLS=ON
+              cmake --build build-static -j"$(nproc)" --target \
+                b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet \
+                b3-bridge-ethcheck b3-bridge-bootstrap-proof
+              for binary in b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet; do
+                file "build-static/bin/$binary" | grep -Eq "static-pie linked|statically linked"
+                ! readelf -l "build-static/bin/$binary" | grep -q "Requesting program interpreter"
+                ! readelf -d "build-static/bin/$binary" 2>&1 | grep -q NEEDED
+                if test "$binary" = b3coind; then
+                  "build-static/bin/$binary" -nosettings -version >/dev/null
+                else
+                  "build-static/bin/$binary" -version >/dev/null
+                fi
+              done
+              for binary in b3-bridge-ethcheck b3-bridge-bootstrap-proof; do
+                file "build-static/bin/$binary" | grep -Eq "static-pie linked|statically linked"
+                ! readelf -l "build-static/bin/$binary" | grep -q "Requesting program interpreter"
+                ! readelf -d "build-static/bin/$binary" 2>&1 | grep -q NEEDED
+              done
+
+              smoke_dir="$(mktemp -d)"
+              rpc_port=18455
+              build-static/bin/b3coind -regtest -datadir="$smoke_dir" \
+                -server -daemonwait -networkactive=0 -listen=0 -discover=0 \
+                -dnsseed=0 -listenonion=0 -natpmp=0 -nosettings \
+                -rpcport="$rpc_port"
+              build-static/bin/b3coin-cli -regtest -datadir="$smoke_dir" \
+                -rpcport="$rpc_port" getblockchaininfo >/dev/null
+              build-static/bin/b3coin-cli -regtest -datadir="$smoke_dir" \
+                -rpcport="$rpc_port" createwallet static-smoke >/dev/null
+              build-static/bin/b3coin-cli -regtest -datadir="$smoke_dir" \
+                -rpcport="$rpc_port" -rpcwallet=static-smoke \
+                getwalletinfo >/dev/null
+              build-static/bin/b3coin-cli -regtest -datadir="$smoke_dir" \
+                -rpcport="$rpc_port" stop
+              for attempt in $(seq 1 300); do
+                test ! -f "$smoke_dir/regtest/b3coind.pid" && break
+                sleep 0.1
+              done
+              test ! -f "$smoke_dir/regtest/b3coind.pid"
+              rm -rf "$smoke_dir"
+            '
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          name=b3-hive-v${{ needs.version.outputs.version }}-unsigned-linux-x86_64-static-headless
+          stage=$(mktemp -d)
+          mkdir -p "$stage/$name/bin" "$stage/$name/contrib/b3bridge"
+          cp build-static/bin/b3coind build-static/bin/b3coin-cli \
+            build-static/bin/b3coin-tx build-static/bin/b3coin-util \
+            build-static/bin/b3coin-wallet \
+            build-static/bin/b3-bridge-ethcheck \
+            build-static/bin/b3-bridge-bootstrap-proof \
+            "$stage/$name/bin/"
+          cp contrib/b3bridge/README.md \
+            contrib/b3bridge/b3_bridge_relayer.py \
+            contrib/b3bridge/capture_eth_lc_fixture.py \
+            contrib/b3bridge/capture_eth_receipts_fixture.py \
+            contrib/b3bridge/eth_live_test.py \
+            contrib/b3bridge/test_b3_bridge_relayer.py \
+            "$stage/$name/contrib/b3bridge/"
+          cp README.md COPYING "$stage/$name/"
+          cat > "$stage/$name/STATIC-LINUX-README.txt" <<'EOF'
+          This is the fully static x86-64 Linux operator package built against
+          musl. It contains the daemon, RPC client, transaction utility, general
+          utility, wallet utility, and optional bridge proof/relayer tools. The
+          Python relayer requires Python 3 on the operator host. It intentionally
+          does not contain Qt.
+          IPC, ZeroMQ, and USDT tracepoints are also disabled in this package.
+          Every executable passed static-ELF checks. The daemon and standard
+          CLI utilities also passed version checks, and the daemon/RPC pair
+          passed an isolated regtest startup-and-shutdown smoke test.
+          EOF
+          tar -C "$stage" -czf "out/$name.tar.gz" "$name"
+          (cd out && sha256sum *.tar.gz > SHA256SUMS.linux-static)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: b3-hive-linux-x86_64-static
           path: out/
 
   windows-cross:
@@ -145,80 +388,6 @@ jobs:
           name: b3-hive-win64
           path: out/
 
-  windows-win32:
-    needs: version
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install i686 mingw toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake curl make pkgconf python3 \
-            g++-mingw-w64-i686-posix nsis zip
-          sudo update-alternatives --set i686-w64-mingw32-g++ /usr/bin/i686-w64-mingw32-g++-posix
-      - name: Build depends (Qt + libs for 32-bit Windows)
-        run: |
-          cd depends && make HOST=i686-w64-mingw32 -j"$(nproc)"
-      - name: Configure + build
-        run: |
-          cmake -B build --toolchain depends/i686-w64-mingw32/toolchain.cmake \
-            -DBUILD_GUI=ON -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF \
-            -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)" --target deploy
-      - name: Verify genuine i686 payload architecture
-        run: |
-          set -euo pipefail
-          test -f build/b3coin-win32-setup.exe
-          for binary in build/release/*.exe; do
-            description=$(file "$binary")
-            echo "$description"
-            grep -Eq 'PE32 executable.*Intel 80386' <<<"$description"
-            ! grep -q 'PE32+' <<<"$description"
-          done
-      - name: Package
-        run: |
-          mkdir -p out
-          cp build/b3coin-win32-setup.exe \
-            out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win32-setup.exe
-          zip -j out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win32.zip \
-            build/release/b3coin-qt.exe build/release/b3coind.exe \
-            build/release/b3coin-cli.exe build/release/b3coin-tx.exe \
-            build/release/b3coin-util.exe build/release/b3coin-wallet.exe \
-            README.md COPYING
-          (cd out && sha256sum *.exe *.zip > SHA256SUMS.win32)
-      - uses: actions/upload-artifact@v4
-        with:
-          name: b3-hive-win32
-          path: out/
-
-  windows-win32-smoke:
-    needs: [version, windows-win32]
-    runs-on: windows-2025
-    timeout-minutes: 15
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: b3-hive-win32
-          path: release-assets
-      - name: Run 32-bit command-line programs under WoW64
-        shell: pwsh
-        run: |
-          $archive = Get-ChildItem release-assets -Filter '*-win32.zip' | Select-Object -First 1
-          if (-not $archive) { throw 'Win32 archive not found' }
-          Expand-Archive $archive.FullName -DestinationPath smoke
-          & smoke/b3coind.exe -nosettings -version
-          if ($LASTEXITCODE -ne 0) { throw 'b3coind Win32 smoke test failed' }
-          & smoke/b3coin-cli.exe -version
-          if ($LASTEXITCODE -ne 0) { throw 'b3coin-cli Win32 smoke test failed' }
-          & smoke/b3coin-tx.exe -version
-          if ($LASTEXITCODE -ne 0) { throw 'b3coin-tx Win32 smoke test failed' }
-          & smoke/b3coin-util.exe -version
-          if ($LASTEXITCODE -ne 0) { throw 'b3coin-util Win32 smoke test failed' }
-          & smoke/b3coin-wallet.exe -version
-          if ($LASTEXITCODE -ne 0) { throw 'b3coin-wallet Win32 smoke test failed' }
-
   macos-arm64:
     needs: version
     runs-on: macos-15
@@ -236,8 +405,9 @@ jobs:
             -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON \
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
-          # Release packaging builds only the programs shipped to users. Test
-          # binaries and suites remain in the separately triggered CI workflow.
+          # deploy creates the dependency-bundled GUI app. The raw CLI targets
+          # are compile checks only: Homebrew-linked binaries are not portable
+          # release artifacts.
           cmake --build build -j4 --target deploy b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
       - name: Verify unsigned app bundle
         run: |
@@ -292,6 +462,8 @@ jobs:
       - name: Package
         run: |
           mkdir -p out
+          # The macOS release is the bundled GUI app only and requires macOS
+          # 15.0 or newer, as verified from every Mach-O file above.
           cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-arm64.zip
           (cd out && shasum -a 256 *.zip > SHA256SUMS.macos-arm64)
       - uses: actions/upload-artifact@v4
@@ -317,8 +489,9 @@ jobs:
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)" \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
-          # Release packaging builds only the programs shipped to users. Test
-          # binaries and suites remain in the separately triggered CI workflow.
+          # deploy creates the dependency-bundled GUI app. The raw CLI targets
+          # are compile checks only: Homebrew-linked binaries are not portable
+          # release artifacts.
           cmake --build build -j4 --target deploy b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
       - name: Verify unsigned app bundle
         run: |
@@ -373,6 +546,8 @@ jobs:
       - name: Package
         run: |
           mkdir -p out
+          # The macOS release is the bundled GUI app only and requires macOS
+          # 15.0 or newer, as verified from every Mach-O file above.
           cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-x86_64.zip
           (cd out && shasum -a 256 *.zip > SHA256SUMS.macos-x86_64)
       - uses: actions/upload-artifact@v4
@@ -381,8 +556,25 @@ jobs:
           path: out/
 
   publish:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [version, linux-x86_64, windows-cross, windows-win32, windows-win32-smoke, macos-arm64, macos-x86_64]
+    # `always()` prevents the deliberately skipped extended-test ancestor from
+    # suppressing publication after release-test-policy has approved it. Every
+    # direct build and safety gate must still have succeeded.
+    if: >-
+      ${{
+        always() &&
+        !cancelled() &&
+        github.event_name == 'push' &&
+        github.ref_type == 'tag' &&
+        needs.version.result == 'success' &&
+        needs['release-test-policy'].result == 'success' &&
+        needs['contract-tests'].result == 'success' &&
+        needs['linux-x86_64'].result == 'success' &&
+        needs['linux-x86_64-static'].result == 'success' &&
+        needs['windows-cross'].result == 'success' &&
+        needs['macos-arm64'].result == 'success' &&
+        needs['macos-x86_64'].result == 'success'
+      }}
+    needs: [version, release-test-policy, contract-tests, linux-x86_64, linux-x86_64-static, windows-cross, macos-arm64, macos-x86_64]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -398,40 +590,45 @@ jobs:
         run: |
           set -euo pipefail
           sha256sum --check SHA256SUMS.linux
+          sha256sum --check SHA256SUMS.linux-static
           sha256sum --check SHA256SUMS.win64
-          sha256sum --check SHA256SUMS.win32
           sha256sum --check SHA256SUMS.macos-arm64
           sha256sum --check SHA256SUMS.macos-x86_64
-          cat SHA256SUMS.linux SHA256SUMS.win64 SHA256SUMS.win32 SHA256SUMS.macos-arm64 \
+          cat SHA256SUMS.linux SHA256SUMS.linux-static SHA256SUMS.win64 SHA256SUMS.macos-arm64 \
             SHA256SUMS.macos-x86_64 \
             | sort -k2 > SHA256SUMS
-      - name: Publish final GitHub release
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           notes_file="doc/release-notes-${GITHUB_REF_NAME}.md"
           test -f "$notes_file"
+          release_flags=(--prerelease=false --latest)
+          if [[ "${{ needs.version.outputs.prerelease }}" == "true" ]]; then
+            release_flags=(--prerelease=true --latest=false)
+          fi
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             is_draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
               --json isDraft --jq .isDraft)
             asset_count=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
               --json assets --jq '.assets | length')
-            if (( asset_count != 0 )); then
-              echo "Refusing to overwrite a release that already has uploaded assets" >&2
-              exit 1
-            fi
-            # v1.0.0 already exists as the published, assetless release-candidate
-            # page. Permit that one migration; all later published tags are immutable.
-            if [[ "$is_draft" != "true" && "$GITHUB_REF_NAME" != "v1.0.0" ]]; then
+            if [[ "$is_draft" != "true" ]]; then
               echo "Refusing to overwrite an existing published release" >&2
               exit 1
             fi
-            if [[ "$is_draft" != "true" ]]; then
-              # Hide the assetless candidate while the complete final asset set
-              # uploads. Any failure leaves a draft, never a partial public release.
-              gh release edit "$GITHUB_REF_NAME" \
-                --repo "$GITHUB_REPOSITORY" --verify-tag --draft=true
+            if (( asset_count != 0 )); then
+              # A cancelled upload can leave a private draft with a partial
+              # asset set. Delete only that draft's assets and retry the whole
+              # upload; published releases remain immutable.
+              mapfile -t existing_assets < <(
+                gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                  --json assets --jq '.assets[].name'
+              )
+              for asset in "${existing_assets[@]}"; do
+                gh release delete-asset "$GITHUB_REF_NAME" "$asset" \
+                  --repo "$GITHUB_REPOSITORY" --yes
+              done
             fi
             gh release upload "$GITHUB_REF_NAME" release-assets/* \
               --repo "$GITHUB_REPOSITORY"
@@ -440,7 +637,7 @@ jobs:
               --verify-tag \
               --title "B3 Hive $GITHUB_REF_NAME" \
               --notes-file "$notes_file" \
-              --draft=false --prerelease=false --latest
+              --draft=false "${release_flags[@]}"
           else
             # Keep a new release private until every asset is present. A
             # cancelled upload must never expose a partial public release.
@@ -455,5 +652,5 @@ jobs:
             gh release edit "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
-              --draft=false --prerelease=false --latest
+              --draft=false "${release_flags[@]}"
           fi

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
+import {TestBase} from "./TestBase.sol";
 import {B3DepositVault} from "../B3DepositVault.sol";
 
 /// Standard-compliant ERC-20 (returns bool).
@@ -98,7 +98,7 @@ contract ReentrantToken {
     }
 }
 
-contract B3DepositVaultTest is Test {
+contract B3DepositVaultTest is TestBase {
     event Deposit(uint64 indexed depositId, address indexed token, uint256 amount, bytes32 b3Recipient);
     event Released(address indexed token, address indexed to, uint256 amount);
     event Rescued(address indexed token, address indexed to, uint256 amount);

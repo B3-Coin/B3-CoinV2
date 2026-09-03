@@ -90,9 +90,6 @@ void EnsureWalletIsUnlocked(const CWallet& wallet)
     if (wallet.IsLocked()) {
         throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.");
     }
-    if (wallet.m_unlock_staking_only) {
-        throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Error: Wallet is unlocked for staking only. Unlock it fully with walletpassphrase first.");
-    }
 }
 
 WalletContext& EnsureWalletContext(const std::any& context)

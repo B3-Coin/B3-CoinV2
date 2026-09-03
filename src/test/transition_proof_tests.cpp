@@ -223,9 +223,8 @@ BOOST_AUTO_TEST_CASE(proof_area_layout_is_canonical)
 
 namespace {
 
-//! A registered-type action frame with an arbitrary payload. The
-//! GENERIC layer validates framing and bounds only; FN payload
-//! semantics are fn_claim_tests' separate concern.
+//! A reserved-type action frame with an arbitrary payload. The generic layer
+//! validates framing and bounds only; type 1 remains permanently inactive.
 modern::CreationAction GenericAction(const size_t payload_size = 3)
 {
     modern::CreationAction action;

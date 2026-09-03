@@ -22,6 +22,7 @@
 #include <crypto/siphash.h>
 #include <deploymentstatus.h>
 #include <flatfile.h>
+#include <flowmesh/p2p.h>
 #include <headerssync.h>
 #include <index/blockfilterindex.h>
 #include <kernel/types.h>
@@ -29,12 +30,14 @@
 #include <legacy/consensus.h>
 #include <logging.h>
 #include <merkleblock.h>
+#include <modern/finality_types.h>
 #include <net.h>
 #include <net_permissions.h>
 #include <netaddress.h>
 #include <netbase.h>
 #include <netmessagemaker.h>
 #include <node/blockstorage.h>
+#include <node/bridge_state.h>
 #include <node/connection_types.h>
 #include <node/legacy_orphanage.h>
 #include <node/protocol_version.h>
@@ -226,6 +229,22 @@ static constexpr double MAX_ADDR_RATE_PER_SECOND{0.1};
  *  based increments won't go above this, but the MAX_ADDR_TO_SEND increment following GETADDR
  *  is exempt from this limit). */
 static constexpr size_t MAX_ADDR_PROCESSING_TOKEN_BUCKET{MAX_ADDR_TO_SEND};
+/**
+ * Finality signatures each require an expensive BLS verification. Bound that
+ * work before entering cs_main without penalizing honest peers whose
+ * signatures became stale across a reorg or epoch race. A one-shot gossip
+ * protocol cannot retry messages dropped from a small burst, so the per-peer
+ * bucket admits one complete maximum-size validator set and the global bucket
+ * admits two such bursts for duplicate-path overlap. The much smaller refill
+ * rates still bound sustained hostile verification work.
+ */
+static constexpr double MAX_FINALITY_SIG_RATE_PER_SECOND{32.0};
+static constexpr size_t MAX_FINALITY_SIG_TOKEN_BUCKET{
+    modern::MAX_FINALITY_SET};
+static constexpr double MAX_GLOBAL_FINALITY_SIG_RATE_PER_SECOND{128.0};
+static constexpr size_t MAX_GLOBAL_FINALITY_SIG_TOKEN_BUCKET{
+    2 * modern::MAX_FINALITY_SET};
+static_assert(MAX_FINALITY_SIG_TOKEN_BUCKET >= modern::MAX_FINALITY_SET);
 /** The compactblocks version we support. See BIP 152. */
 static constexpr uint64_t CMPCTBLOCKS_VERSION{2};
 /** For private broadcast, send a transaction to this many peers. */
@@ -420,6 +439,11 @@ struct Peer {
     /** Total number of addresses that were processed (excludes rate-limited ones). */
     std::atomic<uint64_t> m_addr_processed{0};
 
+    /** Expensive finality-signature verifications allowed from this peer. */
+    double m_finality_sig_token_bucket GUARDED_BY(NetEventsInterface::g_msgproc_mutex){MAX_FINALITY_SIG_TOKEN_BUCKET};
+    /** When m_finality_sig_token_bucket was last updated. */
+    std::chrono::microseconds m_finality_sig_token_timestamp GUARDED_BY(NetEventsInterface::g_msgproc_mutex){GetTime<std::chrono::microseconds>()};
+
     /** Whether we've sent this peer a getheaders in response to an inv prior to initial-headers-sync completing */
     bool m_inv_triggered_getheaders_before_sync GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
 
@@ -481,19 +505,42 @@ struct Peer {
     std::atomic<bool> m_sent_sendheaders{false};
 
     /**
-     * Protocol capability negotiated at VERSION: true when the peer speaks
-     * the historical B3Coin protocol family (versions 80000..80008). A
+     * Effective mode negotiated at VERSION: true when either endpoint
+     * advertised the historical B3Coin protocol family (80000..80008). A
      * property of this connection only — distinct from the chain having
-     * legacy history, from any candidate block's consensus era, and from
-     * the codec of any particular message.
+     * legacy history, from any candidate block's consensus era, and from the
+     * codec of any particular block message.
      */
     std::atomic<bool> m_legacy_protocol{false};
+
+    /**
+     * Whether this node advertised the historical 80008 banner on this
+     * connection. This is separate from m_legacy_protocol because either
+     * endpoint can select the effective legacy mode. It is also separate from
+     * m_reconnect_at_legacy_boundary: a post-H archival node advertises 80008
+     * when replying to an inbound historical peer but keeps that connection
+     * open to serve sealed history.
+     */
+    std::atomic<bool> m_our_legacy_version{false};
+
+    /**
+     * Whether our VERSION was selected as legacy because our own active tip
+     * was still below the boundary. Such a connection must be recycled when
+     * we cross H. This is deliberately distinct from m_our_legacy_version:
+     * a post-H archival node replies 80008 to an inbound historical peer for
+     * handshake compatibility, but must keep that serving connection open.
+     */
+    std::atomic<bool> m_reconnect_at_legacy_boundary{false};
 
     /** When to potentially disconnect peer for stalling headers download */
     std::chrono::microseconds m_headers_sync_timeout GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0us};
 
     /** Whether this peer wants invs or headers (when possible) for block announcements */
     bool m_prefers_headers GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+
+    /** Repeated malformed/oversized FlowMesh frames are a disconnect. */
+    uint8_t m_flowmesh_framing_strikes
+        GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0};
 
     /** Time offset computed during the version handshake based on the
      * timestamp the peer sent in the version message. */
@@ -593,7 +640,7 @@ public:
 
     /** Overridden from CValidationInterface. */
     void ActiveTipChange(const CBlockIndex& new_tip, bool) override
-        EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex, !m_peer_mutex);
     void BlockConnected(const ChainstateRole& role, const std::shared_ptr<const CBlock>& pblock, const CBlockIndex* pindexConnected) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex);
     void BlockDisconnected(const std::shared_ptr<const CBlock> &block, const CBlockIndex* pindex) override
@@ -626,6 +673,11 @@ public:
     std::vector<CTransactionRef> AbortPrivateBroadcast(const uint256& id) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void SendPings() override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void RelayFinalitySignatures(std::span<const node::FinalitySig> sigs) override;
+    void RelayFlowMeshMessage(
+        const flowmesh::WireMessage& message,
+        std::optional<NodeId> peer = std::nullopt,
+        std::optional<NodeId> exclude_peer = std::nullopt) override
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void InitiateTxBroadcastToAll(const Txid& txid, const Wtxid& wtxid) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void InitiateTxBroadcastPrivate(const CTransactionRef& tx) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void SetBestBlock(int height, std::chrono::seconds time) override
@@ -811,7 +863,8 @@ private:
     }
 
     /** Send a version message to a peer */
-    void PushNodeVersion(CNode& pnode, const Peer& peer);
+    void PushNodeVersion(CNode& pnode, Peer& peer,
+                         bool reply_to_legacy_peer = false);
 
     /** Send a ping message every PING_INTERVAL or if requested via RPC (peer.m_ping_queued is true).
      *  May mark the peer to be disconnected if a ping has timed out.
@@ -951,6 +1004,11 @@ private:
     std::atomic<int> m_best_height{-1};
     /** The time of the best chain tip block */
     std::atomic<std::chrono::seconds> m_best_block_time{0s};
+
+    /** Whole-node BLS verification budget for finality-signature gossip. */
+    double m_finality_sig_global_token_bucket GUARDED_BY(g_msgproc_mutex){MAX_GLOBAL_FINALITY_SIG_TOKEN_BUCKET};
+    /** When m_finality_sig_global_token_bucket was last updated. */
+    std::chrono::microseconds m_finality_sig_global_token_timestamp GUARDED_BY(g_msgproc_mutex){GetTime<std::chrono::microseconds>()};
 
     /** Next time to check for stale tip */
     std::chrono::seconds m_stale_tip_check_time GUARDED_BY(cs_main){0s};
@@ -1734,18 +1792,31 @@ void PeerManagerImpl::FindNextBlocks(std::vector<const CBlockIndex*>& vBlocks, c
 
 } // namespace
 
-void PeerManagerImpl::PushNodeVersion(CNode& pnode, const Peer& peer)
+void PeerManagerImpl::PushNodeVersion(CNode& pnode, Peer& peer,
+                                      const bool reply_to_legacy_peer)
 {
     // Final legacy B3Coin peers disconnect clients which advertise less than
     // 80006, so the legacy handshake banner is advertised while the network
     // is still in its legacy phase. Once the tip crosses the finalized
-    // boundary, new connections negotiate the modern protocol. This is a
-    // wire-compatibility value only: do not change Core's global
-    // PROTOCOL_VERSION, since it controls feature negotiation on other
-    // chains.
-    const int protocol_version{WITH_LOCK(cs_main, return IsLegacyPhase())
-                                   ? legacy::P2P_PROTOCOL_VERSION
-                                   : PROTOCOL_VERSION};
+    // boundary, new modern-to-modern connections negotiate the modern
+    // protocol. An inbound historical peer has already sent 80008, and its
+    // final client rejects replies below 80006, so a post-H archival node
+    // must answer that peer with 80008 too. Outbound sockets cannot know this
+    // before sending VERSION; the lagging historical node must initiate the
+    // mixed connection. This is a wire-compatibility value only: do not
+    // change Core's global PROTOCOL_VERSION, since it controls feature
+    // negotiation on other chains.
+    const bool local_legacy_phase{
+        m_in_legacy_phase.load(std::memory_order_relaxed)};
+    const int protocol_version{
+        local_legacy_phase || reply_to_legacy_peer
+            ? legacy::P2P_PROTOCOL_VERSION
+            : PROTOCOL_VERSION};
+    peer.m_our_legacy_version.store(
+        protocol_version == legacy::P2P_PROTOCOL_VERSION,
+        std::memory_order_relaxed);
+    peer.m_reconnect_at_legacy_boundary.store(local_legacy_phase,
+                                               std::memory_order_relaxed);
     uint64_t my_services;
     int64_t my_time;
     uint64_t your_services;
@@ -1932,6 +2003,9 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
         WITH_LOCK(m_tx_download_mutex, m_txdownloadman.CheckIsEmpty());
     }
     } // cs_main
+    if (m_opts.flowmesh_sink) {
+        m_opts.flowmesh_sink->FlowMeshPeerDisconnected(nodeid);
+    }
     if (node.fSuccessfullyConnected &&
         !node.IsBlockOnlyConn() && !node.IsPrivateBroadcastConn() && !node.IsInboundConn()) {
         // Only change visible addrman state for full outbound peers.  We don't
@@ -2271,8 +2345,36 @@ void PeerManagerImpl::ActiveTipChange(const CBlockIndex& new_tip, bool is_ibd)
     AssertLockNotHeld(m_mempool.cs);
     AssertLockNotHeld(m_tx_download_mutex);
 
-    // Keep the lock-free legacy-phase mirror current for the connection thread.
-    m_in_legacy_phase.store(IsLegacyPhaseAt(&new_tip), std::memory_order_relaxed);
+    // Keep the lock-free legacy-phase mirror current for the connection
+    // thread. VERSION cannot be renegotiated in place. Every connection whose
+    // 80008 banner was selected by our pre-H phase must therefore reconnect
+    // exactly when this node crosses H; upgraded peers then negotiate the
+    // modern banner, while historical peers remain legacy-only. A post-H
+    // archival node serving history to a still-pre-H peer is intentionally
+    // kept: its 80008 compatibility reply was not selected by our own phase.
+    const bool legacy_phase{IsLegacyPhaseAt(&new_tip)};
+    const bool crossed_boundary{
+        m_in_legacy_phase.exchange(legacy_phase, std::memory_order_relaxed) &&
+        !legacy_phase};
+    if (crossed_boundary) {
+        std::set<NodeId> renegotiate;
+        {
+            LOCK(m_peer_mutex);
+            for (const auto& [id, peer] : m_peer_map) {
+                if (peer->m_reconnect_at_legacy_boundary.load(
+                        std::memory_order_relaxed)) {
+                    renegotiate.insert(id);
+                }
+            }
+        }
+        m_connman.ForEachNode([&](CNode* node) {
+            if (!renegotiate.contains(node->GetId())) return;
+            LogDebug(BCLog::NET,
+                     "Disconnecting pre-boundary peer=%d to renegotiate the modern B3 protocol\n",
+                     node->GetId());
+            node->fDisconnect = true;
+        });
+    }
 
     if (!is_ibd) {
         LOCK(m_tx_download_mutex);
@@ -2474,6 +2576,49 @@ void PeerManagerImpl::RelayFinalitySignatures(std::span<const node::FinalitySig>
     });
 }
 
+void PeerManagerImpl::RelayFlowMeshMessage(
+    const flowmesh::WireMessage& message, std::optional<NodeId> target_peer,
+    std::optional<NodeId> exclude_peer)
+{
+    flowmesh::WireCheck check;
+    const auto encoded{flowmesh::EncodeWireMessage(message, check)};
+    if (!encoded) {
+        LogDebug(BCLog::NET, "refusing malformed local FlowMesh frame: %s\n",
+                 flowmesh::WireCheckName(check));
+        return;
+    }
+
+    std::vector<NodeId> eligible;
+    {
+        LOCK(m_peer_mutex);
+        if (target_peer) {
+            const auto it{m_peer_map.find(*target_peer)};
+            if (it != m_peer_map.end() &&
+                (it->second->m_our_services & NODE_B3_FLOWMESH) &&
+                (it->second->m_their_services.load() & NODE_B3_FLOWMESH)) {
+                eligible.push_back(*target_peer);
+            }
+        } else {
+            eligible.reserve(m_peer_map.size());
+            for (const auto& [id, peer] : m_peer_map) {
+                if (exclude_peer && id == *exclude_peer) continue;
+                if ((peer->m_our_services & NODE_B3_FLOWMESH) &&
+                    (peer->m_their_services.load() & NODE_B3_FLOWMESH)) {
+                    eligible.push_back(id);
+                }
+            }
+        }
+    }
+    for (const NodeId id : eligible) {
+        m_connman.ForNode(id, [&](CNode* node) {
+            if (!node->fSuccessfullyConnected || node->fDisconnect) return false;
+            MakeAndPushMessage(*node, std::string{flowmesh::WireCommand(message.kind)},
+                               std::span{*encoded});
+            return true;
+        });
+    }
+}
+
 void PeerManagerImpl::SendPings()
 {
     LOCK(m_peer_mutex);
@@ -2638,6 +2783,16 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
         block_pos = pindex->GetBlockPos();
     }
 
+    // The raw witness-block fast path below bypasses the decoded-block guard.
+    // Apply the same protocol boundary from the index header first: an
+    // effective legacy connection can serve history through H, but cannot
+    // decode a marker-modern block regardless of the requested inventory
+    // flavor.
+    if (peer.m_legacy_protocol && Consensus::HasB3BlockCodecV2(pindex->nVersion)) {
+        LogDebug(BCLog::NET, "Not serving modern block to legacy-protocol peer=%d\n", pfrom.GetId());
+        return;
+    }
+
     std::shared_ptr<const CBlock> pblock;
     if (a_recent_block && a_recent_block->GetHash(m_chainparams.GetConsensus(), pindex->nHeight) == inv.hash) {
         pblock = a_recent_block;
@@ -2674,10 +2829,7 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
         // A legacy-protocol peer cannot decode a marker-modern block; it is
         // served history through the boundary only. Modern (archival) peers
         // are served both eras — each block in its own self-described codec.
-        if (peer.m_legacy_protocol && Consensus::HasB3BlockCodecV2(pblock->nVersion)) {
-            LogDebug(BCLog::NET, "Not serving modern block to legacy-protocol peer=%d\n", pfrom.GetId());
-            return;
-        }
+        assert(!peer.m_legacy_protocol || !Consensus::HasB3BlockCodecV2(pblock->nVersion));
         // Legacy-codec blocks are served in their historical encoding. A
         // marker-modern block keeps stock witness semantics: MSG_BLOCK
         // strips witnesses, MSG_WITNESS_BLOCK carries them.
@@ -3102,7 +3254,7 @@ bool PeerManagerImpl::IsAncestorOfBestHeaderOrTip(const CBlockIndex* header)
 
 bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer)
 {
-    if (WITH_LOCK(cs_main, return IsLegacyPhase()) && peer.m_legacy_protocol) {
+    if (WITH_LOCK(cs_main, return IsLegacyPhase())) {
         // A legacy B3Coin header cannot establish whether it meets a PoW
         // target or contains a valid stake kernel. Retain the old peer's
         // getblocks inventory and validate full blocks sequentially, with
@@ -3918,7 +4070,7 @@ void PeerManagerImpl::PushPrivateBroadcastTx(CNode& node)
     const CTransactionRef& tx{*opt_tx};
 
     LogDebug(BCLog::PRIVBROADCAST, "P2P handshake completed, sending INV for txid=%s%s, peer=%d%s",
-             tx->GetHash().ToString(), tx->HasWitness() ? strprintf(", wtxid=%s", tx->GetWitnessHash().ToString()) : "",
+             tx->GetHash().ToString(), tx->HasOptionalData() ? strprintf(", ptxid=%s", tx->GetWitnessHash().ToString()) : "",
              node.GetId(), node.LogIP(fLogIPs));
 
     MakeAndPushMessage(node, NetMsgType::INV, std::vector<CInv>{{CInv{MSG_TX, tx->GetHash().ToUint256()}}});
@@ -3961,19 +4113,18 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // messages are only ever added but cannot replace existing ones.
             m_addrman.SetServices(pfrom.addr, nServices);
         }
-        // Classify the peer's protocol capability from its advertised
-        // version before judging its services: the historical B3Coin client
-        // family used 80000..80008, while modern B3 peers use Core-line
-        // versions. The capability is a property of this connection only —
-        // it does not describe the chain or any block's era.
-        const bool legacy_protocol_peer{m_chainparams.GetConsensus().legacy_b3coin &&
-                                        nVersion >= 80'000 &&
-                                        nVersion <= legacy::P2P_PROTOCOL_VERSION};
-        peer.m_legacy_protocol = legacy_protocol_peer;
+        // Record the remote banner first. The effective connection mode is
+        // resolved below after an inbound connection has sent its own VERSION:
+        // if either endpoint advertised the historical range, both sides must
+        // use the legacy standalone-transaction/common-version mode.
+        const bool remote_legacy_protocol{
+            m_chainparams.GetConsensus().legacy_b3coin &&
+            nVersion >= 80'000 &&
+            nVersion <= legacy::P2P_PROTOCOL_VERSION};
 
         // A legacy-protocol peer can never offer modern service bits such
         // as NODE_WITNESS; it only needs to serve the network.
-        const bool acceptable_services{legacy_protocol_peer
+        const bool acceptable_services{remote_legacy_protocol
                                            ? (nServices & NODE_NETWORK) != 0
                                            : HasAllDesirableServiceFlags(nServices)};
         if (pfrom.ExpectServicesFromConn() && !acceptable_services)
@@ -4027,8 +4178,13 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         // Inbound peers send us their version message when they connect.
         // We send our version message in response.
         if (pfrom.IsInboundConn()) {
-            PushNodeVersion(pfrom, peer);
+            PushNodeVersion(pfrom, peer, remote_legacy_protocol);
         }
+
+        const bool legacy_protocol_peer{
+            remote_legacy_protocol ||
+            peer.m_our_legacy_version.load(std::memory_order_relaxed)};
+        peer.m_legacy_protocol = legacy_protocol_peer;
 
         // A legacy peer does not implement modern Core extensions keyed off
         // the 70012+ range. Keep its negotiated feature set in the last
@@ -4119,7 +4275,17 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         {
             LOCK(cs_main);
             CNodeState* state = State(pfrom.GetId());
-            state->fPreferredDownload = (!pfrom.IsInboundConn() || pfrom.HasPermission(NetPermissionFlags::NoBan)) && !pfrom.IsAddrFetchConn() && CanServeBlocks(peer);
+            // A post-H node may keep an effective-legacy connection solely to
+            // serve a lagging historical peer. It cannot provide modern
+            // headers or blocks, so counting it as preferred would suppress
+            // usable inbound peers and could stall modern synchronization.
+            const bool protocol_can_sync_local_tip{
+                m_in_legacy_phase.load(std::memory_order_relaxed) ||
+                !legacy_protocol_peer};
+            state->fPreferredDownload =
+                protocol_can_sync_local_tip &&
+                (!pfrom.IsInboundConn() || pfrom.HasPermission(NetPermissionFlags::NoBan)) &&
+                !pfrom.IsAddrFetchConn() && CanServeBlocks(peer);
             m_num_preferred_download_peers += state->fPreferredDownload;
         }
 
@@ -4269,6 +4435,39 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         }
 
         pfrom.fSuccessfullyConnected = true;
+        return;
+    }
+
+    if (const auto kind{flowmesh::WireKindForCommand(msg_type)}) {
+        // FlowMesh is negotiated solely as a service on this existing B3
+        // connection. No message is accepted before VERACK or from a peer
+        // that did not advertise the capability.
+        if (!pfrom.fSuccessfullyConnected ||
+            !(peer.m_our_services & NODE_B3_FLOWMESH) ||
+            !(peer.m_their_services.load() & NODE_B3_FLOWMESH)) {
+            if (++peer.m_flowmesh_framing_strikes >= 2) pfrom.fDisconnect = true;
+            return;
+        }
+
+        flowmesh::WireCheck check;
+        auto decoded{flowmesh::DecodeWireMessage(*kind, MakeUCharSpan(vRecv), check)};
+        if (!decoded) {
+            LogDebug(BCLog::NET,
+                     "dropping malformed FlowMesh %s frame (%s), peer=%d\n",
+                     msg_type, flowmesh::WireCheckName(check), pfrom.GetId());
+            if (++peer.m_flowmesh_framing_strikes >= 2) pfrom.fDisconnect = true;
+            return;
+        }
+
+        // A disabled or not-yet-started local worker changes only local relay
+        // behavior, never block validity. Framing still completes cheaply.
+        if (!m_opts.flowmesh_sink) return;
+        const auto result{m_opts.flowmesh_sink->EnqueueWireMessage(
+            pfrom.GetId(), std::move(*decoded))};
+        if (result == flowmesh::QueueResult::MALFORMED &&
+            ++peer.m_flowmesh_framing_strikes >= 2) {
+            pfrom.fDisconnect = true;
+        }
         return;
     }
 
@@ -4755,9 +4954,24 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         if (pindex)
             pindex = m_chainman.ActiveChain().Next(pindex);
         int nLimit = 500;
+        const std::optional<int> legacy_last_height{
+            peer.m_legacy_protocol.load(std::memory_order_relaxed)
+                ? Consensus::LegacyFinalHeight(m_chainparams.GetConsensus())
+                : std::nullopt};
         LogDebug(BCLog::NET, "getblocks %d to %s limit %d from peer=%d\n", (pindex ? pindex->nHeight : -1), hashStop.IsNull() ? "end" : hashStop.ToString(), nLimit, pfrom.GetId());
         for (; pindex; pindex = m_chainman.ActiveChain().Next(pindex))
         {
+            // A historical peer can decode and request blocks only through
+            // the pinned legacy boundary. Advertising marker-modern hashes
+            // would make its final getblocks page end in requests we must
+            // refuse, leaving the old client waiting after it already reached
+            // all serveable history.
+            if (legacy_last_height && pindex->nHeight > *legacy_last_height) {
+                LogDebug(BCLog::NET,
+                         "  getblocks stopping at legacy boundary %d for peer=%d\n",
+                         *legacy_last_height, pfrom.GetId());
+                break;
+            }
             if (pindex->GetBlockHash() == hashStop)
             {
                 LogDebug(BCLog::NET, "  getblocks stopping at %d %s\n", pindex->nHeight, pindex->GetBlockHash().ToString());
@@ -5847,22 +6061,62 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         // B3 finality-signature gossip (liveness only; consensus acceptance
         // happens exclusively through certificates in blocks). Fixed-size
         // message; cheap structural / schedule / set checks run before the
-        // single BLS verification, inside the pool. No peer penalty for
-        // semantically stale or unverifiable signatures: forks and epoch
-        // races make them indistinguishable from honest latecomers.
-        node::FinalitySig finsig;
-        vRecv >> finsig;
+        // single BLS verification, inside the pool. Per-peer and global token
+        // buckets bound that expensive work before cs_main. There is no peer
+        // penalty for semantically stale or unverifiable signatures: forks
+        // and epoch races make them indistinguishable from honest latecomers.
         const Consensus::Params& consensus{m_chainparams.GetConsensus()};
         if (!consensus.legacy_b3coin || !consensus.modern_pos) return;
+
+        const auto now{GetTime<std::chrono::microseconds>()};
+        const auto refill_bucket = [&](double& bucket,
+                                       std::chrono::microseconds& updated,
+                                       const double rate,
+                                       const size_t capacity) {
+            if (bucket < capacity) {
+                const auto elapsed{std::max(now - updated, 0us)};
+                bucket = std::min<double>(
+                    bucket + Ticks<SecondsDouble>(elapsed) * rate, capacity);
+            }
+            updated = now;
+        };
+        refill_bucket(peer.m_finality_sig_token_bucket,
+                      peer.m_finality_sig_token_timestamp,
+                      MAX_FINALITY_SIG_RATE_PER_SECOND,
+                      MAX_FINALITY_SIG_TOKEN_BUCKET);
+        refill_bucket(m_finality_sig_global_token_bucket,
+                      m_finality_sig_global_token_timestamp,
+                      MAX_GLOBAL_FINALITY_SIG_RATE_PER_SECOND,
+                      MAX_GLOBAL_FINALITY_SIG_TOKEN_BUCKET);
+        if (peer.m_finality_sig_token_bucket < 1.0 ||
+            m_finality_sig_global_token_bucket < 1.0) {
+            return;
+        }
+        peer.m_finality_sig_token_bucket -= 1.0;
+        m_finality_sig_global_token_bucket -= 1.0;
+
+        node::FinalitySig finsig;
+        vRecv >> finsig;
         bool relay{false};
         {
             LOCK(cs_main);
             Chainstate& chainstate{m_chainman.ActiveChainstate()};
             const CBlockIndex* tip{chainstate.m_chain.Tip()};
             if (!tip) return;
+            const node::BridgeStateIndex* bridge_index{nullptr};
+            if (Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
+                node::BridgeStateTracker& bridge{
+                    chainstate.ModernBridgeState()};
+                if (!bridge.Sync(chainstate.m_chain, chainstate.m_blockman,
+                                 consensus, *tip)) return;
+                bridge_index = &bridge.Index();
+            }
             node::FinalityTracker& tracker{chainstate.ModernFinality()};
-            if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip)) return;
-            const auto accept{chainstate.FinalitySignatures().Submit(finsig, tracker, chainstate.m_chain, consensus)};
+            if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman,
+                              consensus, *tip, bridge_index)) return;
+            const auto accept{chainstate.FinalitySignatures().Submit(
+                finsig, tracker, chainstate.m_chain, consensus,
+                bridge_index)};
             LogDebug(BCLog::NET, "finsig epoch=%d height=%d index=%d peer=%d: %s\n", finsig.epoch, finsig.height,
                      finsig.index, pfrom.GetId(), node::FinalitySignaturePool::AcceptName(accept));
             relay = accept == node::FinalitySignaturePool::Accept::ACCEPTED;
@@ -6475,6 +6729,18 @@ bool PeerManagerImpl::SendMessages(CNode& node)
     // disconnect misbehaving peers even before the version handshake is complete.
     if (MaybeDiscourageAndDisconnect(node, peer)) return true;
 
+    // Belt-and-suspenders for a handshake that was still in flight when H
+    // connected: ActiveTipChange can only walk fully connected nodes, so the
+    // next message pass closes any connection whose VERSION was selected by
+    // our pre-H phase. A post-H 80008 reply to an inbound historical peer is
+    // a stable compatibility connection and is deliberately excluded.
+    if (!m_in_legacy_phase.load(std::memory_order_relaxed) &&
+        peer.m_reconnect_at_legacy_boundary.load(
+            std::memory_order_relaxed)) {
+        node.fDisconnect = true;
+        return true;
+    }
+
     // Initiate version handshake for outbound connections
     if (!node.IsInboundConn() && !peer.m_outbound_version_message_sent) {
         PushNodeVersion(node, peer);
@@ -6545,7 +6811,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
             }
         }
 
-        if (IsLegacyPhase() && peer.m_legacy_protocol && CanServeBlocks(peer) &&
+        if (IsLegacyPhase() && CanServeBlocks(peer) &&
             !m_chainman.m_blockman.LoadingBlocks() && sync_blocks_and_headers_from_peer) {
             // Hybrid legacy headers are not independently valid, so avoid the
             // headers-sync state machine and advance only after a full block.
@@ -6578,7 +6844,8 @@ bool PeerManagerImpl::SendMessages(CNode& node)
             if (m_legacy_sync_peer == node.GetId()) {
                 (void)MaybeSendGetHeaders(node, GetLocator(m_chainman.ActiveChain().Tip()), peer);
             }
-        } else if (!state.fSyncStarted && CanServeBlocks(peer) && !m_chainman.m_blockman.LoadingBlocks()) {
+        } else if (!peer.m_legacy_protocol && !state.fSyncStarted &&
+                   CanServeBlocks(peer) && !m_chainman.m_blockman.LoadingBlocks()) {
             // Only actively request headers from a single peer, unless we're close to today.
             if ((nSyncStarted == 0 && sync_blocks_and_headers_from_peer) || m_chainman.m_best_header->Time() > NodeClock::now() - 24h) {
                 const CBlockIndex* pindexStart = m_chainman.m_best_header;

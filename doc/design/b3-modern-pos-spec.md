@@ -4,13 +4,12 @@
 This document supersedes the earlier VRF/slot/epoch "design base" revision of
 itself. The owner explicitly replaced that direction (ruling M1) with the
 deterministic stake-weighted design below and authorized a complete V1
-implementation. Everything the earlier revision reserved for simulation-locked
-numerics is carried here as **provisional constants** marked
-`REVISABLE_BEFORE_MAINNET`, kept in one configurable place
-(`src/consensus/modern_pos_params.h`) and never configured on mainnet until
-explicitly ratified. Advanced mechanisms are **V2 research** (§10) and are
-deliberately absent from V1: **no VRF, no epochs, no committees, no slashing,
-no finality gadget, no delegation.**
+implementation. All V1 numerics are kept in one configurable place
+(`src/consensus/modern_pos_params.h`). They are now explicitly ratified and
+pinned by mainnet's sealed transition release; unconfigured networks continue
+to fail closed. Advanced mechanisms remain **V2 research** (§10) and are
+deliberately absent from V1: **no VRF, no slashing, and no delegation.** M7's
+BLS finality epochs are the one later V1 amendment described below.
 
 Owner rulings incorporated (2026-08-20):
 
@@ -242,15 +241,16 @@ cover the rest without protocol machinery. No slashing/BFT ships in V1.
 - **M6:** any coinbase output claiming the STAKE magic is invalid
   (`bad-cb-stake`); rewards pay ordinary outputs; restaking is an explicit
   STAKE output plus the activation depth.
-- The reward schedule and all amounts remain owner parameters
-  (`REVISABLE_BEFORE_MAINNET`; V1 provisional: 0 — fees only).
+- Mainnet pins `R0 = 19,836,712,254` base units from the sealed supply, halves
+  it every 525,600 modern-PoS blocks, and pays 10% of subsidy (never fees) to
+  the pinned treasury script.
 
-## 9. Parameters — one place, all provisional
+## 9. Parameters — one place, mainnet pinned
 
-All in `src/consensus/modern_pos_params.h`, marked `REVISABLE_BEFORE_MAINNET`,
-configured **only** by test fixtures; mainnet params never set the block, and a
-guard test enforces that. Unset ⇒ modern-PoS validation and production fail
-closed (`no-modern-pos-rules`), exactly as before this specification.
+All mechanism values live in `src/consensus/modern_pos_params.h`. Mainnet's
+transition release assigns every field explicitly and tests it value by value.
+Unset still means modern-PoS validation and production fail closed
+(`no-modern-pos-rules`) on other networks.
 
 | Parameter | Value | Status | Meaning |
 |---|---|---|---|
@@ -258,23 +258,25 @@ closed (`no-modern-pos-rules`), exactly as before this specification.
 | `round_seconds` | 30 | **RATIFIED 2026-08-21** | recovery-round length |
 | `f0_num / f0_den` | 1 / 1 | **RATIFIED 2026-08-21** | round-0 expected eligible ≈ f0 · online fraction |
 | relaxation | ×2 per round | **RATIFIED 2026-08-21** (fixed in V1) | eligibility doubling |
-| `sentinel_bits` | 0x207fffff | provisional | enforced constant `nBits` |
-| `max_future_seconds` | 120 | provisional | clock-skew allowance / pacing gate |
-| `reward` | 0 (fees only) | provisional (OD-2) | per-block subsidy under the cap |
+| `sentinel_bits` | 0x207fffff | **PINNED 2026-09-01** | enforced constant `nBits` |
+| `max_future_seconds` | 120 | **PINNED 2026-09-01** | clock-skew allowance / pacing gate |
+| `reward` | 19,836,712,254 base units | **SEALED/PINNED 2026-09-01** | initial per-block subsidy under the cap |
+| `halving_interval` | 525600 | **RATIFIED/PINNED** | modern-PoS blocks per subsidy halving |
+| `treasury_percent` | 10 | **RATIFIED/PINNED** | subsidy share; fees excluded |
+| `treasury_script` | `76a91412602418ffc74640e37f1a73d0cdc255d2a07c3588ac` | **RATIFIED/PINNED** | treasury P2PKH script |
 | `reorg_horizon` (D) | 1440 | **RATIFIED 2026-08-21** (one day at 60 s) | modern reorg refusal depth |
 | `finality_epoch_blocks` (E) | 1440 | **RATIFIED 2026-08-23** (M7) | validator-set epoch length |
 | `checkpoint_interval` / `checkpoint_depth` | 10 / 12 | **RATIFIED 2026-08-23** | finality checkpoint cadence / signing depth |
 | `max_epoch_extension` | 7·E = 10080 | **RATIFIED 2026-08-23** | certificate-gated epoch may extend this far before the lineage is declared broken |
-| `min_finality_set` | 4 | **RATIFIED 2026-08-23** | chain bootstrap floor only — not a bridge security threshold |
+| `min_finality_set` | 2 | **UPDATED/PINNED 2026-09-01** | permits the ruled two-staker chain bootstrap; not a bridge security threshold |
 | payload cost budget | 120000 / block, 12000 / tx; cert 2000, key-evidence 700; 1 vbyte per unit | **RATIFIED 2026-08-23** | MPA verification-cost accounting (checked before cryptography) |
 | MPA limits | record 32768 B, section 65536 B, weight ×4 | **RATIFIED 2026-08-23** | Modern Payload Area |
 
-The ratified rows are the confirmed V1 numbers; `sentinel_bits`, `max_future_seconds`
-and `reward` remain the only provisional rows (min stake is likewise
-ratified: 333 modern B3 = 333e9 base units, stated on mainnet, inert until
-H/X); the parameter block still ships unset on every network until the
-remaining provisional rows are settled, so nothing activates piecemeal. The STAKE v1 carrier is likewise RATIFIED
-(2026-08-21) exactly as implemented and tested.
+Every V1 row is now fixed on mainnet. The sealed supply
+`1,042,617,596,101,695,152` base units deterministically yields R0 by integer
+division by 52,560,000. Minimum stake is likewise pinned at 333 modern B3 =
+333e9 base units. The STAKE v1 carrier remains exactly as ratified on
+2026-08-21 and implemented/tested.
 
 Timing behavior at f0 = 1 (from the accepted analysis): ~63% of blocks in
 round 0 at full participation; 95% by round 2/3/4/5/8 at 100/50/25/10/1%

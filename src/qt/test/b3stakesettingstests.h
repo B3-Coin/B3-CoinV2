@@ -12,7 +12,7 @@ class B3StakeSettingsTests : public QObject
     Q_OBJECT
 
 private Q_SLOTS:
-    void stakePageIsHonestWithoutWallet();
+    void stakePageDisablesActionsWithoutWallet();
     void settingsPageRoutesToExistingDialogs();
     void settingsPageMirrorsWalletActions();
     void shellShowsInstalledSettingsPage();

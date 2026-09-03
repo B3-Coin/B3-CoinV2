@@ -5,6 +5,7 @@
 #include <consensus/tx_verify.h>
 
 #include <legacy/consensus.h>
+#include <modern/asset_output.h>
 
 #include <chain.h>
 #include <coins.h>
@@ -125,7 +126,18 @@ unsigned int GetLegacySigOpCount(const CTransaction& tx)
     return nSigOps;
 }
 
-unsigned int GetP2SHSigOpCount(const CTransaction& tx, const CCoinsViewCache& inputs)
+namespace {
+
+bool AssetOwnerEnabledForCoin(const Coin& coin,
+                              const std::optional<int> legacy_final_height)
+{
+    return legacy_final_height && coin.nHeight > *legacy_final_height;
+}
+
+} // namespace
+
+unsigned int GetP2SHSigOpCount(const CTransaction& tx, const CCoinsViewCache& inputs,
+                               const std::optional<int> legacy_final_height)
 {
     if (tx.IsCoinBase())
         return 0;
@@ -136,13 +148,22 @@ unsigned int GetP2SHSigOpCount(const CTransaction& tx, const CCoinsViewCache& in
         const Coin& coin = inputs.AccessCoin(tx.vin[i].prevout);
         assert(!coin.IsSpent());
         const CTxOut &prevout = coin.out;
-        if (prevout.scriptPubKey.IsPayToScriptHash())
-            nSigOps += prevout.scriptPubKey.GetSigOpCount(tx.vin[i].scriptSig);
+        const std::optional<CScript> asset_owner{
+            AssetOwnerEnabledForCoin(coin, legacy_final_height)
+                ? modern::AssetOwnerScript(prevout.scriptPubKey)
+                : std::nullopt};
+        const CScript& authorization_script{
+            asset_owner ? *asset_owner : prevout.scriptPubKey};
+        if (authorization_script.IsPayToScriptHash()) {
+            nSigOps += authorization_script.GetSigOpCount(tx.vin[i].scriptSig);
+        }
     }
     return nSigOps;
 }
 
-int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& inputs, script_verify_flags flags)
+int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& inputs,
+                                script_verify_flags flags,
+                                const std::optional<int> legacy_final_height)
 {
     int64_t nSigOps = GetLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR;
 
@@ -150,7 +171,7 @@ int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& i
         return nSigOps;
 
     if (flags & SCRIPT_VERIFY_P2SH) {
-        nSigOps += GetP2SHSigOpCount(tx, inputs) * WITNESS_SCALE_FACTOR;
+        nSigOps += GetP2SHSigOpCount(tx, inputs, legacy_final_height) * WITNESS_SCALE_FACTOR;
     }
 
     for (unsigned int i = 0; i < tx.vin.size(); i++)
@@ -158,7 +179,9 @@ int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& i
         const Coin& coin = inputs.AccessCoin(tx.vin[i].prevout);
         assert(!coin.IsSpent());
         const CTxOut &prevout = coin.out;
-        nSigOps += CountWitnessSigOps(tx.vin[i].scriptSig, prevout.scriptPubKey, tx.vin[i].scriptWitness, flags);
+        nSigOps += CountWitnessSigOps(tx.vin[i].scriptSig, prevout.scriptPubKey,
+                                     tx.vin[i].scriptWitness, flags,
+                                     AssetOwnerEnabledForCoin(coin, legacy_final_height));
     }
     return nSigOps;
 }

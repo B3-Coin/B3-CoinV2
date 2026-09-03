@@ -1,21 +1,5 @@
 # B3Coin Core — Repository Context
 
-## Branch and scope lock (owner ruling 2026-08-31)
-
-- The only authorized Claude workspace is
-  `/Users/josh/development/ON/B3-FlowMesh`, checked out on branch
-  **`FlowMesh`**. Before any write or commit, verify both the canonical
-  repository root and current branch. If either differs, stop and report it.
-- Do not create, enter, or use another Git worktree or development branch.
-  Never modify `release/v1.0.0final` from this workspace.
-- This branch is for completing and testing FlowMesh in isolated development
-  and regtest environments. Do not activate FlowMesh on mainnet, change H/X or
-  Modern PoS transition parameters, alter release versioning/updater behavior,
-  or publish anything without a later explicit owner instruction.
-- The regtest-only `-b3flowmeshdev` validator spike is an integration starting
-  point, not production activation. Keep production paths fail-closed while
-  implementing small, reviewed, test-backed increments.
-
 B3Coin is **one continuous blockchain**. This tree is a Bitcoin Core 31.1 fork that
 carries the original B3 chain through a two-era design: a **legacy era** (the existing
 B3Coin PoS chain, preserved exactly) and a **modern era** (clean Core-31.1-style
@@ -46,8 +30,9 @@ authority merely by declaring precedence. The persistent order is:
 
 - **[doc/design/b3-master-handoff.md](doc/design/b3-master-handoff.md)** — the **top
   authority**. The complete project concept: one chain, three economic roles (B3+STAKE
-  secures the base chain, FN Coin operates FlowMesh, approved stablecoins denominate
-  trading), the transition corridor, colored assets, FN Coin / Proof of Disintegration,
+  secures the base chain, FN Coin operates FlowMesh, registered assets trade against
+  native B3 and FlowMesh fees are native B3), the transition corridor, colored assets,
+  FN Coin / Proof of Disintegration,
   the FlowMesh DEX, microblocks, the 12-step build order, and Claude's operating
   contract. Where it disagrees with any other document here, **it governs** — subject
   only to its own §0 precedence order (the owner's later explicit corrections outrank
@@ -59,11 +44,18 @@ authority merely by declaring precedence. The persistent order is:
   the locked architecture contract. Authoritative over all earlier design notes, and
   still binding in every area the master handoff does not contradict.
 - **[doc/design/b3-open-decisions.md](doc/design/b3-open-decisions.md)** — decisions
-  that are **not yet locked**. Notably, **modern PoS is UNRESOLVED at the protocol-detail
-  level** and must not be implemented until its consensus specification is supplied.
+  that are **not yet locked**, plus an explicitly marked historical register
+  of items closed by later owner rulings. Modern PoS V1 and the sealed
+  transition/A1/A2/A3 parameters are implemented and pinned; do not reopen or
+  redesign them while working on the genuinely open items.
 - **[doc/design/b3-implementation-status.md](doc/design/b3-implementation-status.md)** —
   the implementation-status / gap matrix: what is LOCKED / IMPLEMENTED / PARTIAL / WRONG /
   MISSING / SECURITY-BLOCKER, and the minimal critical path to a clean H+1.
+- **[doc/design/b3-fn-assets-activation-design.md](doc/design/b3-fn-assets-activation-design.md)**
+  and **[doc/design/b3-flowmesh-v1-production.md](doc/design/b3-flowmesh-v1-production.md)** —
+  the current transition-release contracts for FN Genesis, simple assets and production
+  FlowMesh. These implement later explicit owner rulings and therefore supersede older
+  documents that defer those features to another release.
 - [doc/design/b3-legacy-fork-choice.md](doc/design/b3-legacy-fork-choice.md) — how a
   legacy PoS block earns chain weight, traced from the historical `master` client. The
   reference for legacy-era anti-DoS work.
@@ -77,25 +69,36 @@ authority merely by declaring precedence. The persistent order is:
 1. **Do not silently alter the locked architecture to solve an implementation problem.**
    If code contradicts the contract, **report the contradiction** — do not choose a new
    protocol.
-2. **FlowMesh scope:** implementation and isolated regtest wiring may proceed on
-   this branch, but mainnet consensus/network activation remains forbidden until
-   the transition is complete and its later activation rules are owner-approved.
-3. **Transition isolation:** Modern PoS and its mainnet boundary parameters are
-   outside this branch's scope. Preserve their current fail-closed release state.
+2. **Sequencing (do not skip):** preserve the implemented H/X transition and Modern-PoS
+   rules. FN PoD, assets and FlowMesh remain separately height-gated at A1/A2/A3; an
+   incomplete mainnet schedule must fail closed.
+3. **Modern PoS:** the reviewed V1 implementation is present. Do not replace or redesign
+   it while implementing later activation-gated features.
 4. **Genesis is permanent.** Never regenerate it, change its bytes/nonce/bits/time/merkle/
    hash, apply the modern marker to it, or reinterpret historical blocks with the modern
    codec. If a task appears to require any of these, stop and report.
-5. **Small, buildable commits.** One logical change per commit; each must build and be
+5. **Bridge-backed bUSD (latest owner ruling):** bUSD is the B3 representation of USDT
+   locked through the Ethereum bridge, not the earlier CDP proposal and not an
+   unrestricted fixed-supply token. The managed-v1 vault is exactly
+   `0x143F207e23e6aebD7E974be90ac6D434f4c7BFb6`, with Ethereum-mainnet
+   canonical USDT `0xdAC17F958D2ee523a2206206994597C13D831ec7` and exact six-decimal
+   conversion. Authority, runtime code, bootstrap, caps, adapter, persistence,
+   and activation pins must all pass independent review before mainnet minting.
+6. **Managed withdrawal leg for transition v1 (owner ruling 2026-09-01):** the
+   already-deployed vault's immutable owner authority is intentionally used for
+   withdrawals in this release. Label it honestly; do not describe the release
+   leg as decentralized. Pin the authority and runtime code from independent
+   mainnet observations before activation. A future verifier requires a new
+   vault and explicit reserve migration because this authority is immutable.
+7. **Small, buildable commits.** One logical change per commit; each must build and be
    independently reviewable.
 
 ## Git rules
 
-- Work only on branch **`FlowMesh`** in the canonical worktree named above.
-  Do not switch branches, create worktrees, or move work to an automatically
-  generated Claude branch.
-- Do not push, merge, amend, squash, reset, rebase, or rewrite history. Do not
-  modify previous commits. Make one new, independently reviewable commit per
-  logical change after its focused tests pass.
+- Work only on the already checked-out branch **`release/transition`**. Do not switch,
+  recreate or merge another FlowMesh/Claude branch into it.
+- Do not push, amend, squash, reset, rebase, or rewrite history. Do not modify previous
+  commits.
 - **Never** add AI/assistant attribution to commits (no "Claude", "Anthropic",
   "Generated-By", "Co-Authored-By", etc.). Use the repository Git identity only.
 
@@ -114,9 +117,9 @@ authority merely by declaring precedence. The persistent order is:
   transition boundary (`boundary.h`). Wired and live.
 - `src/legacy/` — legacy consensus (PoS kernel, stake modifier, rewards, difficulty, FN
   collateral), legacy codec, and `TrustedReplay` (historical UTXO reconstruction).
-- `src/modern/` — modern data models (policy outputs, transition proofs, assets, vault,
-  PoS dispatch). Header-only; only `modern/pos.h` is reachable from validation, and it
-  fails closed.
-- `src/flowmesh/` — DEX execution models (ledger, clearing, batch). Header-only,
-  test-only. **Not** wired into consensus.
+- `src/modern/` — modern data models and the live, activation-gated FN/assets/FlowMesh
+  carrier and validation rules.
+- `src/flowmesh/` and `src/node/flowmesh_*` — production execution, BLS-certified log,
+  persistence, chain indexes, P2P runtime and service. FlowMesh uses existing B3 P2P and
+  must remain fail-independent from base-chain liveness.
 - `src/qt/` — B3/FlowMesh UI shell. Renders no fabricated data; does not touch consensus.

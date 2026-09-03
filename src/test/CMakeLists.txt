@@ -11,6 +11,9 @@ add_executable(test_bitcoin
   amount_tests.cpp
   argsman_tests.cpp
   asset_conservation_tests.cpp
+  asset_authorization_tests.cpp
+  asset_output_tests.cpp
+  asset_validation_tests.cpp
   b3_evolution_tests.cpp
   arith_uint256_tests.cpp
   banman_tests.cpp
@@ -37,14 +40,23 @@ add_executable(test_bitcoin
   coinstatsindex_tests.cpp
   coinsviewoverlay_tests.cpp
   common_url_tests.cpp
+  bridge_admission_tests.cpp
+  bridge_asset_vector_tests.cpp
+  bridge_bootstrap_proof_tests.cpp
+  bridge_params_tests.cpp
   bridge_deposit_tests.cpp
   bridge_eth_light_client_tests.cpp
+  bridge_ethereum_calldata_tests.cpp
   bridge_exec_chain_tests.cpp
   bridge_mpt_tests.cpp
+  bridge_proof_tests.cpp
+  bridge_state_tests.cpp
   update_downloader_tests.cpp
   update_manager_tests.cpp
   legacy_wallet_send_tests.cpp
   modern_reward_tests.cpp
+  modern_serialization_tests.cpp
+  modern_fn_pod_tests.cpp
   update_manifest_tests.cpp
   compress_tests.cpp
   consensus_phase_tests.cpp
@@ -58,11 +70,23 @@ add_executable(test_bitcoin
   feerounder_tests.cpp
   flatfile_tests.cpp
   flowmesh_batch_tests.cpp
+  flowmesh_bls_certificate_tests.cpp
+  flowmesh_checkpoint_codec_tests.cpp
+  flowmesh_checkpoint_index_tests.cpp
+  flowmesh_fee_allocation_tests.cpp
+  flowmesh_p2p_tests.cpp
+  flowmesh_production_engine_tests.cpp
+  flowmesh_production_store_tests.cpp
+  flowmesh_runtime_tests.cpp
+  flowmesh_production_wire_tests.cpp
+  flowmesh_seat_binding_tests.cpp
+  flowmesh_vault_index_tests.cpp
+  fn_seat_index_tests.cpp
   flowmesh_microblock_tests.cpp
   flowmesh_sync_tests.cpp
   flowmesh_clearing_tests.cpp
   flowmesh_ledger_tests.cpp
-  fn_claim_tests.cpp
+  fn_genesis_tests.cpp
   fn_pod_tests.cpp
   fs_tests.cpp
   getarg_tests.cpp
@@ -91,6 +115,7 @@ add_executable(test_bitcoin
   miner_tests.cpp
   modern_stake_tests.cpp
   finality_types_tests.cpp
+  fn_pod_mempool_tests.cpp
   bls_tests.cpp
   metadata_cell_tests.cpp
   finality_key_tests.cpp
@@ -106,6 +131,7 @@ add_executable(test_bitcoin
   finality_pin_tests.cpp
   finality_eligibility_tests.cpp
   finality_pin_persist_tests.cpp
+  finality_signer_store_tests.cpp
   finality_signature_tests.cpp
   finality_production_tests.cpp
   finality_operations_tests.cpp

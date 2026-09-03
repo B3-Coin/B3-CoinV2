@@ -5,12 +5,14 @@
 #include <test/data/bip341_wallet_vectors.json.h>
 
 #include <addresstype.h>
+#include <chainparams.h>
 #include <key.h>
 #include <key_io.h>
 #include <script/script.h>
 #include <script/signingprovider.h>
 #include <script/solver.h>
 #include <test/util/common.h>
+#include <test/util/key_io.h>
 #include <test/util/setup_common.h>
 #include <util/strencodings.h>
 
@@ -448,7 +450,11 @@ BOOST_AUTO_TEST_CASE(script_standard_taproot_builder)
     BOOST_CHECK(builder.IsValid() && builder.IsComplete());
     builder.Finalize(key_inner);
     BOOST_CHECK(builder.IsValid() && builder.IsComplete());
-    BOOST_CHECK_EQUAL(EncodeDestination(builder.GetOutput()), "bc1pj6gaw944fy0xpmzzu45ugqde4rz7mqj5kj0tg8kmr5f0pjq8vnaqgynnge");
+    BOOST_CHECK_EQUAL(
+        EncodeDestination(builder.GetOutput()),
+        test::TranslateBitcoinMainKeyIO(
+            "bc1pj6gaw944fy0xpmzzu45ugqde4rz7mqj5kj0tg8kmr5f0pjq8vnaqgynnge",
+            Params()));
 }
 
 BOOST_AUTO_TEST_CASE(bip341_spk_test_vectors)
@@ -479,7 +485,10 @@ BOOST_AUTO_TEST_CASE(bip341_spk_test_vectors)
         parse_tree(vec["given"]["scriptTree"], 0);
         spktest.Finalize(XOnlyPubKey(ParseHex(vec["given"]["internalPubkey"].get_str())));
         BOOST_CHECK_EQUAL(HexStr(GetScriptForDestination(spktest.GetOutput())), vec["expected"]["scriptPubKey"].get_str());
-        BOOST_CHECK_EQUAL(EncodeDestination(spktest.GetOutput()), vec["expected"]["bip350Address"].get_str());
+        BOOST_CHECK_EQUAL(
+            EncodeDestination(spktest.GetOutput()),
+            test::TranslateBitcoinMainKeyIO(
+                vec["expected"]["bip350Address"].get_str(), Params()));
         auto spend_data = spktest.GetSpendData();
         BOOST_CHECK_EQUAL(vec["intermediary"]["merkleRoot"].isNull(), spend_data.merkle_root.IsNull());
         if (!spend_data.merkle_root.IsNull()) {

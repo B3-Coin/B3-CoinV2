@@ -162,8 +162,9 @@ static bool DecodeTx(CMutableTransaction& tx, const std::vector<unsigned char>& 
 {
     // General strategy:
     // - Decode both with extended serialization (which interprets the 0x0001 tag as a marker for
-    //   the presence of witnesses) and with legacy serialization (which interprets the tag as a
-    //   0-input 1-output incomplete transaction).
+    //   the presence of witnesses, and on B3 also accepts the Modern Payload Area flag) and with
+    //   legacy serialization (which interprets the tag as a 0-input 1-output incomplete
+    //   transaction).
     //   - Restricted by try_no_witness (which disables legacy if false) and try_witness (which
     //     disables extended if false).
     //   - Ignore serializations that do not fully consume the hex string.
@@ -177,11 +178,17 @@ static bool DecodeTx(CMutableTransaction& tx, const std::vector<unsigned char>& 
     bool ok_extended = false, ok_legacy = false;
 
     // Try decoding with extended serialization support, and remember if the result successfully
-    // consumes the entire input.
-    if (try_witness) {
+    // consumes the entire input. MPA is independent of witness: an explicit no-witness attempt on
+    // B3 still accepts flag 0x02, while continuing to reject flag 0x01.
+    const bool b3_modern_codec{Params().GetConsensus().legacy_b3coin};
+    if (try_witness || (try_no_witness && b3_modern_codec)) {
+        const TransactionSerParams rpc_params{
+            .allow_witness = try_witness,
+            .allow_mpa = b3_modern_codec,
+        };
         SpanReader ssData{tx_data};
         try {
-            ssData >> TX_WITH_WITNESS(tx_extended);
+            ssData >> rpc_params(tx_extended);
             if (ssData.empty()) ok_extended = true;
         } catch (const std::exception&) {
             // Fall through.
@@ -206,7 +213,7 @@ static bool DecodeTx(CMutableTransaction& tx, const std::vector<unsigned char>& 
     // independent of the caller's witness-strategy flags: default callers
     // (sendrawtransaction, both signing RPCs) pass try_no_witness=false
     // and must still round-trip real legacy-era transactions.
-    if (Params().GetConsensus().legacy_b3coin) {
+    if (b3_modern_codec) {
         SpanReader ssData{tx_data};
         try {
             ssData >> TX_LEGACY_B3(tx_b3);
@@ -452,9 +459,13 @@ std::string EncodeHexTx(const CTransaction& tx)
 {
     DataStream ssTx;
     // Legacy-encoded B3 transactions round-trip in their historical nTime
-    // format; anything else uses the modern extended serialization.
+    // format. Marker-modern B3 transactions use the full codec so RPC, GBT
+    // and signing surfaces never silently discard their MPA. For non-B3
+    // chains the existing witness serialization is unchanged.
     if (tx.IsLegacyEncoded()) {
         ssTx << TX_LEGACY_B3(tx);
+    } else if (Params().GetConsensus().legacy_b3coin) {
+        ssTx << TX_MODERN(tx);
     } else {
         ssTx << TX_WITH_WITNESS(tx);
     }
@@ -488,11 +499,25 @@ void TxToUniv(const CTransaction& tx, const uint256& block_hash, UniValue& entry
 
     entry.pushKV("txid", tx.GetHash().GetHex());
     entry.pushKV("hash", tx.GetWitnessHash().GetHex());
+    entry.pushKV("ptxid", tx.GetPtxid().GetHex());
     entry.pushKV("version", tx.version);
     entry.pushKV("size", tx.ComputeTotalSize());
     entry.pushKV("vsize", (GetTransactionWeight(tx) + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR);
     entry.pushKV("weight", GetTransactionWeight(tx));
     entry.pushKV("locktime", tx.nLockTime);
+
+    if (!tx.mpa.empty()) {
+        UniValue records{UniValue::VARR};
+        records.reserve(tx.mpa.size());
+        for (const CMpaRecord& record : tx.mpa) {
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("type", static_cast<uint64_t>(record.payload_type));
+            out.pushKV("version", static_cast<uint64_t>(record.payload_version));
+            out.pushKV("payload", HexStr(record.payload));
+            records.push_back(std::move(out));
+        }
+        entry.pushKV("mpa", std::move(records));
+    }
 
     UniValue vin{UniValue::VARR};
     vin.reserve(tx.vin.size());

@@ -66,6 +66,10 @@ namespace node {
 class SnapshotMetadata;
 class StakeTracker;
 class FinalityBindingTracker;
+class FnSeatTracker;
+class FlowMeshCheckpointTracker;
+class FlowMeshVaultTracker;
+class BridgeStateTracker;
 class FinalityTracker;
 class FinalitySignaturePool;
 } // namespace node
@@ -104,6 +108,14 @@ enum class SynchronizationState {
 extern const std::vector<std::string> CHECKLEVEL_DOC;
 
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams);
+
+/**
+ * Return the branch-local number of modern FN PoD creations through `index`.
+ * A missing sidecar after activation, or a value outside the configured
+ * lifetime capacity, is reported as unavailable instead of guessed.
+ */
+std::optional<uint32_t> GetFnPodIssuedThrough(const CBlockIndex* index,
+                                              const Consensus::Params& params);
 
 bool FatalError(kernel::Notifications& notifications, BlockValidationState& state, const bilingual_str& message);
 
@@ -347,12 +359,13 @@ private:
     unsigned int nIn;
     script_verify_flags m_flags;
     bool cacheStore;
+    bool m_enable_asset_owner;
     PrecomputedTransactionData *txdata;
     SignatureCache* m_signature_cache;
 
 public:
-    CScriptCheck(const CTxOut& outIn, const CTransaction& txToIn, SignatureCache& signature_cache, unsigned int nInIn, script_verify_flags flags, bool cacheIn, PrecomputedTransactionData* txdataIn) :
-        m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), m_flags(flags), cacheStore(cacheIn), txdata(txdataIn), m_signature_cache(&signature_cache) { }
+    CScriptCheck(const CTxOut& outIn, const CTransaction& txToIn, SignatureCache& signature_cache, unsigned int nInIn, script_verify_flags flags, bool cacheIn, PrecomputedTransactionData* txdataIn, bool enable_asset_owner = false) :
+        m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), m_flags(flags), cacheStore(cacheIn), m_enable_asset_owner(enable_asset_owner), txdata(txdataIn), m_signature_cache(&signature_cache) { }
 
     CScriptCheck(const CScriptCheck&) = delete;
     CScriptCheck& operator=(const CScriptCheck&) = delete;
@@ -592,6 +605,14 @@ protected:
     std::unique_ptr<node::StakeTracker> m_stake_tracker GUARDED_BY(::cs_main);
     //! Lazily created FINALITY_KEY binding tracker (derived, rebuildable); see ModernFinalityBindings().
     std::unique_ptr<node::FinalityBindingTracker> m_finality_bindings GUARDED_BY(::cs_main);
+    //! Lazily created active FN-v2 seat tracker; see ModernFnSeats().
+    std::unique_ptr<node::FnSeatTracker> m_fn_seats GUARDED_BY(::cs_main);
+    //! Lazily created A3+ FlowMesh checkpoint/effect-nullifier tracker.
+    std::unique_ptr<node::FlowMeshCheckpointTracker> m_flowmesh_checkpoints GUARDED_BY(::cs_main);
+    //! Lazily created A3+ DEX_VAULT history; see ModernFlowMeshVaults().
+    std::unique_ptr<node::FlowMeshVaultTracker> m_flowmesh_vaults GUARDED_BY(::cs_main);
+    //! Lazily created, replayable type-10 bridge light-client/nullifier state.
+    std::unique_ptr<node::BridgeStateTracker> m_bridge_state GUARDED_BY(::cs_main);
     //! Lazily created finality / epoch state tracker (derived, rebuildable); see ModernFinality().
     std::unique_ptr<node::FinalityTracker> m_finality_tracker GUARDED_BY(::cs_main);
     //! Lazily created finality-signature pool (liveness only); see FinalitySignatures().
@@ -621,6 +642,14 @@ public:
      */
     node::StakeTracker& ModernStakeTracker() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     node::FinalityBindingTracker& ModernFinalityBindings() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! Derived, rebuildable FN-v2 seat ownership and anchor snapshots.
+    node::FnSeatTracker& ModernFnSeats() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! Derived checkpoint heads, history and effect nullifiers.
+    node::FlowMeshCheckpointTracker& ModernFlowMeshCheckpoints() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! Derived, rebuildable DEX_VAULT creation/spend history by anchor.
+    node::FlowMeshVaultTracker& ModernFlowMeshVaults() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! Derived Ethereum light-client, execution-anchor, mint and withdrawal state.
+    node::BridgeStateTracker& ModernBridgeState() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     //! The derived finality / epoch state machine of this chainstate (certificate
     //! verification, gated epoch rotation, finalized tip). Consensus reads it in
     //! ConnectBlock; it rebuilds from the active chain whenever out of step.

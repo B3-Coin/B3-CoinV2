@@ -29,7 +29,9 @@
 #include <dbwrapper.h>
 #include <kernel/cs_main.h>
 #include <legacy/codec.h>
+#include <modern/fn_genesis.h>
 #include <node/blockstorage.h>
+#include <node/legacy_fn_issuance.h>
 #include <node/utxo_equivalence_check.h>
 #include <node/utxo_rows.h>
 #include <primitives/block.h>
@@ -39,6 +41,7 @@
 #include <txdb.h>
 #include <uint256.h>
 #include <util/fs.h>
+#include <util/fs_helpers.h>
 #include <util/hasher.h>
 #include <util/obfuscation.h>
 #include <util/signalinterrupt.h>
@@ -92,12 +95,13 @@ void Usage()
                 "\n"
                 "FN Proof-of-Disintegration report (doc/design/b3-fn-pod.md):\n"
                 "  -podreport             derive every qualifying historical PoD during the\n"
-                "                         replay pass and print the report. The QUALIFYING\n"
-                "                         COUNT (R vs the 5,000 lifetime cap) is an FN-activation\n"
-                "                         gate; pre-H results are a floor and the through-H\n"
-                "                         count is final. Payload figures are a SUPERSEDED type-1\n"
-                "                         diagnostic, NOT the type-2 issuance capacity gate\n"
-                "                         (real type-2 proof sizes = future measurement)\n");
+                "                         replay pass, then build and print the canonical,\n"
+                "                         proof-free FN Genesis manifest: every eligible row,\n"
+                "                         count, H+1, chain domain, and rights root. Run at the\n"
+                "                         sealed H/X pair; pre-H output is not a release pin.\n"
+                "  -fnmanifest=<file>     with -podreport, atomically write the canonical binary\n"
+                "                         FN manifest and print its standard SHA-256 checksum;\n"
+                "                         refuses to overwrite an existing file\n");
 }
 
 struct ToolArgs {
@@ -110,6 +114,7 @@ struct ToolArgs {
     fs::path replayrows;
     fs::path masterrows;
     bool podreport{false};
+    fs::path fnmanifest;
 };
 
 std::optional<ToolArgs> ParseArgs(const int argc, char* argv[])
@@ -137,6 +142,12 @@ std::optional<ToolArgs> ParseArgs(const int argc, char* argv[])
             args.replayrows = fs::PathFromString(*v);
         } else if (arg == "-podreport") {
             args.podreport = true;
+        } else if (const auto v{eat("-fnmanifest=")}) {
+            if (v->empty()) {
+                tfm::format(std::cerr, "error: -fnmanifest requires a non-empty path\n");
+                return std::nullopt;
+            }
+            args.fnmanifest = fs::PathFromString(*v);
         } else if (const auto v{eat("-masterrows=")}) {
             args.masterrows = fs::PathFromString(*v);
         } else {
@@ -145,6 +156,10 @@ std::optional<ToolArgs> ParseArgs(const int argc, char* argv[])
         }
     }
     if (args.datadir.empty() || args.height < 0 || args.hash.IsNull()) return std::nullopt;
+    if (!args.fnmanifest.empty() && !args.podreport) {
+        tfm::format(std::cerr, "error: -fnmanifest requires -podreport\n");
+        return std::nullopt;
+    }
     if (args.workdir.empty()) args.workdir = args.datadir / "utxo-verify.tmp";
     return args;
 }
@@ -178,6 +193,65 @@ bool WriteRowsFile(const fs::path& path, std::vector<node::UtxoEntry> entries,
         return false;
     }
     tfm::format(std::cout, "rows written:       %s\n", fs::PathToString(path));
+    return true;
+}
+
+//! Atomically write verified manifest bytes without clobbering an earlier run.
+bool WriteFnManifestFile(const fs::path& path,
+                         const std::span<const unsigned char> bytes)
+{
+    if (fs::exists(path)) {
+        tfm::format(std::cerr,
+                    "error: refusing to overwrite existing FN manifest %s\n",
+                    fs::PathToString(path));
+        return false;
+    }
+    const fs::path tmp{path + ".tmp"};
+    if (fs::exists(tmp)) {
+        tfm::format(std::cerr,
+                    "error: refusing to overwrite stale FN manifest temporary file %s\n",
+                    fs::PathToString(tmp));
+        return false;
+    }
+
+    std::ofstream out{tmp.std_path(), std::ios::binary | std::ios::trunc};
+    if (!out) {
+        tfm::format(std::cerr, "error: cannot open %s\n", fs::PathToString(tmp));
+        return false;
+    }
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+    out.flush();
+    if (!out) {
+        out.close();
+        std::error_code ignored;
+        std::filesystem::remove(tmp.std_path(), ignored);
+        tfm::format(std::cerr, "error: cannot write %s\n", fs::PathToString(tmp));
+        return false;
+    }
+    out.close();
+    if (!out) {
+        std::error_code ignored;
+        std::filesystem::remove(tmp.std_path(), ignored);
+        tfm::format(std::cerr, "error: cannot close %s\n", fs::PathToString(tmp));
+        return false;
+    }
+    // The second existence check prevents a concurrent operator run from
+    // being silently replaced between the initial check and publication.
+    if (fs::exists(path)) {
+        std::error_code ignored;
+        std::filesystem::remove(tmp.std_path(), ignored);
+        tfm::format(std::cerr,
+                    "error: FN manifest target appeared during export: %s\n",
+                    fs::PathToString(path));
+        return false;
+    }
+    if (!RenameOver(tmp, path)) {
+        std::error_code ignored;
+        std::filesystem::remove(tmp.std_path(), ignored);
+        tfm::format(std::cerr, "error: cannot publish %s\n", fs::PathToString(path));
+        return false;
+    }
     return true;
 }
 
@@ -347,40 +421,58 @@ int main(int argc, char* argv[])
         tfm::format(std::cout, "result:             %s\n",
                     result.ok ? "EQUAL (U_port == U_replay)" : "NOT EQUAL");
 
-        // ---- Historical PoD report (doc/design/b3-fn-pod.md §8.4);
-        // payload portion superseded/non-authoritative.
+        // ---- Historical PoD report and the transition release's exact,
+        // proof-free FN Genesis artifact. Encoding happens here; publication
+        // is deferred until every requested equivalence gate, including an
+        // optional U_master comparison, has passed below.
+        std::optional<std::vector<unsigned char>> fn_manifest_bytes;
         if (result.pod_report) {
             const node::PodCapacityReport& pod{*result.pod_report};
             tfm::format(std::cout, "PoD qualifying:     %d\n", pod.total_qualifying);
-            tfm::format(std::cout, "PoD claimable:      %d\n", pod.claimable);
-            for (const auto& [reason, count] : pod.by_reason) {
-                tfm::format(std::cout, "PoD reason %d:       %d (%s)\n", reason, count,
-                            reason == 0 ? "SUPPORTED" : "UNSUPPORTED_FUNDING_SCRIPT");
+            const node::LegacyFnBlockAt manifest_block_at{
+                [&](const int height, CBlock& block) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+                    const std::optional<CBlock> loaded{read_block(height)};
+                    if (!loaded) return false;
+                    block = *loaded;
+                    return true;
+                }};
+            node::LegacyFnGenesisManifest manifest;
+            std::string manifest_error;
+            if (!node::BuildLegacyFnGenesisManifestFromRecords(
+                    consensus, args->height, args->hash, result.pod_records,
+                    manifest_block_at, manifest, manifest_error)) {
+                tfm::format(std::cerr,
+                            "error: FN Genesis manifest construction failed: %s\n",
+                            manifest_error);
+                return 1;
             }
-            tfm::format(std::cout, "PoD max scripts:    %d (largest eligible claim)\n",
-                        pod.max_distinct_funding_scripts);
-            tfm::format(std::cout, "PoD max action:     %d bytes (SUPERSEDED: worst-case payload of the ABANDONED type-1 FnClaimActionV1)\n",
-                        pod.max_action_payload);
-            tfm::format(std::cout, "PoD within 4000:    %d (superseded type-1 arithmetic)\n",
-                        pod.within_native_bound);
-            tfm::format(std::cout, "PoD exceeding 4000: %d (superseded type-1 arithmetic)\n",
-                        pod.exceeding_native_bound);
-            tfm::format(std::cout, "PoD native fit:     %s\n",
-                        pod.fits_native_action
-                            ? "yes (SUPERSEDED type-1 verdict; NOT the type-2 issuance capacity gate)"
-                            : "NO (superseded type-1 verdict)");
-            tfm::format(std::cout,
-                        "NOTE: the payload figures above measure the ABANDONED funding-signature\n"
-                        "claim encoding and are NON-AUTHORITATIVE for activation. Real encoded\n"
-                        "LegacyFnIssuanceActionV1 (type-2) proof sizes over actual history are\n"
-                        "UNMEASURED future work; FN activation remains blocked until that\n"
-                        "measurement exists or a reviewed versioned carrier is selected.\n");
-            for (const node::PodRecord& record : result.pod_records) {
-                tfm::format(std::cout,
-                            "  pod %s h=%d gap=%d tier=%d scripts=%d claimable=%s markers=%d\n",
-                            record.pod_id.ToString(), record.height, record.disintegrated,
-                            record.tier, record.funding_scripts.size(),
-                            record.claimable ? "yes" : "no", record.marker_vouts.size());
+            tfm::format(std::cout, "FN Genesis eligible: %d\n", manifest.rights.size());
+            tfm::format(std::cout, "FN Genesis ignored:  %d (qualifying PoDs without the exact 1-old-B3 P2PKH designation)\n",
+                        pod.total_qualifying - manifest.rights.size());
+            tfm::format(std::cout, "FN Genesis version:  %d\n", manifest.manifest_version);
+            tfm::format(std::cout, "FN Genesis height:   %d\n", manifest.genesis_height);
+            tfm::format(std::cout, "FN chain domain:     %s\n", manifest.chain_domain.ToString());
+            tfm::format(std::cout, "FN rights root:      %s\n", manifest.root.ToString());
+            tfm::format(std::cout, "FN modern capacity:  %d (5000 - historical rights)\n",
+                        Consensus::MAX_FN_EVER_ISSUED - manifest.rights.size());
+            if (!args->fnmanifest.empty()) {
+                std::string encode_error;
+                fn_manifest_bytes = modern::EncodeFnGenesisManifestFileV1(
+                    manifest.chain_domain, manifest.genesis_height,
+                    manifest.manifest_version, manifest.rights, manifest.root,
+                    &encode_error);
+                if (!fn_manifest_bytes) {
+                    tfm::format(std::cerr,
+                                "error: FN manifest encoding failed: %s\n",
+                                encode_error);
+                    return 1;
+                }
+            }
+            for (size_t index{0}; index < manifest.rights.size(); ++index) {
+                const Consensus::FnGenesisRight& right{manifest.rights[index]};
+                tfm::format(std::cout, "  fn-right index=%d pod=%s keyhash=%s\n",
+                            index, right.pod_id.ToString(),
+                            HexStr(right.recipient_key_hash));
             }
         }
 
@@ -407,6 +499,7 @@ int main(int argc, char* argv[])
             return 2;
         }
 
+        bool equivalence_ok{result.ok};
         if (!args->masterrows.empty()) {
             std::ifstream in{args->masterrows.std_path(), std::ios::binary};
             if (!in) {
@@ -440,10 +533,24 @@ int main(int argc, char* argv[])
             const bool three_way{master_port && master_replay && result.ok};
             tfm::format(std::cout, "three-way result:   %s\n",
                         three_way ? "EQUAL (U_master == U_port == U_replay)" : "NOT EQUAL");
-            return three_way ? 0 : 1;
+            equivalence_ok = three_way;
         }
 
-        return result.ok ? 0 : 1;
+        if (!equivalence_ok) return 1;
+
+        if (fn_manifest_bytes) {
+            if (!WriteFnManifestFile(args->fnmanifest, *fn_manifest_bytes)) return 2;
+            const auto checksum{
+                modern::FnGenesisManifestFileSha256(*fn_manifest_bytes)};
+            tfm::format(std::cout, "FN manifest file:    %s\n",
+                        fs::PathToString(args->fnmanifest));
+            tfm::format(std::cout, "FN manifest bytes:   %d\n",
+                        fn_manifest_bytes->size());
+            tfm::format(std::cout, "FN manifest SHA256:  %s\n",
+                        HexStr(checksum));
+        }
+
+        return 0;
     } catch (const std::exception& e) {
         tfm::format(std::cerr, "error: %s\n", e.what());
         return 2;

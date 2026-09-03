@@ -23,6 +23,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -63,6 +64,10 @@ enum class ActionType : uint8_t {
     //! numbers are fixed now so the registry stays append-only.
     SPOT_TO_FUTURES = 6,
     FUTURES_TO_SPOT = 7,
+    //! Withdraw native-B3 fees from the reward account of one historical
+    //! FlowMesh epoch seat. Authorization is the historical member's BLS
+    //! key; execution remains an ordinary ledger withdrawal.
+    CLAIM_SEAT_REWARD = 8,
 };
 
 //! Structural bounds, enforced during decode (before allocation) and
@@ -160,6 +165,10 @@ struct Action {
         case ActionType::WITHDRAW:
             return !signer.IsNull() && curve.empty() && amount > 0 && amount <= MAX_MONEY &&
                    !destination.IsNull() && outpoint.IsNull();
+        case ActionType::CLAIM_SEAT_REWARD:
+            return !signer.IsNull() && curve.empty() && asset == modern::NativeAsset() &&
+                   amount > 0 && amount <= MAX_MONEY && !destination.IsNull() &&
+                   outpoint.IsNull();
         case ActionType::DEPOSIT:
             return signer.IsNull() && sequence == 0 && curve.empty() && asset.IsNull() &&
                    amount == 0 && destination.IsNull() && !outpoint.IsNull();
@@ -265,6 +274,32 @@ enum class ActionReject : uint8_t {
 };
 
 struct BatchResult {
+    struct CreditedDeposit {
+        COutPoint outpoint;
+        AccountId account;
+        AssetId asset;
+        CAmount amount{0};
+
+        friend bool operator==(const CreditedDeposit&, const CreditedDeposit&) = default;
+    };
+
+    struct AccountWithdrawalRequest {
+        AccountId account;
+        modern::WithdrawalReceipt request;
+
+        friend bool operator==(const AccountWithdrawalRequest& a,
+                               const AccountWithdrawalRequest& b)
+        {
+            return a.account == b.account &&
+                   a.request.receipt_id == b.request.receipt_id &&
+                   a.request.asset == b.request.asset &&
+                   a.request.amount == b.request.amount &&
+                   a.request.destination == b.request.destination &&
+                   a.request.finalized_slot == b.request.finalized_slot &&
+                   a.request.vault_commitment == b.request.vault_commitment;
+        }
+    };
+
     uint64_t slot{0};
     //! Action ids applied, in canonical execution order.
     std::vector<uint256> applied;
@@ -273,6 +308,14 @@ struct BatchResult {
     //! Withdrawal REQUESTS created this slot (REQUESTED stage; see the
     //! lifecycle note in ledger.h — nothing here is B3-redeemable).
     std::vector<modern::WithdrawalReceipt> withdrawal_requests;
+    //! Anchor-derived type-9 withdrawals retired by a dedicated settlement
+    //! execution. Strictly ordered by receipt id; never proposer-supplied.
+    std::vector<WithdrawalSettlementFactV1> settled_withdrawals;
+    //! Production-only chain facts retained without changing the legacy
+    //! request/result commitments used by the regtest Schnorr prototype.
+    //! Order is exact canonical execution order.
+    std::vector<CreditedDeposit> credited_deposits;
+    std::vector<AccountWithdrawalRequest> account_withdrawal_requests;
     uint256 request_root;
     //! PURE resulting state root: FlowMeshState::Root() after the slot.
     uint256 state_root;
@@ -287,8 +330,9 @@ class BatchExecutor
 public:
     //! `deposits` may be null: every DEPOSIT action is then rejected by
     //! state (fail closed) — custody facts must come from a verifier.
-    explicit BatchExecutor(FlowMeshState& state, const DepositVerifier* deposits = nullptr)
-        : m_state{state}, m_deposits{deposits}
+    explicit BatchExecutor(FlowMeshState& state, const DepositVerifier* deposits = nullptr,
+                           const FlowMeshFeeContext* fee_context = nullptr)
+        : m_state{state}, m_deposits{deposits}, m_fee_context{fee_context}
     {
     }
 
@@ -312,13 +356,91 @@ public:
      * settlement inconsistency): the caller must discard this state
      * copy. Ordinary rejections are never fatal.
      */
-    [[nodiscard]] std::optional<BatchResult> ExecuteSlot(const std::vector<Action>& actions,
-                                                         const AnchorRef& anchor = {})
+    [[nodiscard]] std::optional<BatchResult> ExecuteSlot(
+        const std::vector<Action>& actions, const AnchorRef& anchor = {},
+        const std::span<const WithdrawalSettlementFactV1> settlements = {})
     {
         BatchResult result;
         result.slot = m_state.Slot();
 
         const std::vector<Action> canonical{CanonicalizeActions(actions)};
+
+        // A connected B3 withdrawal changes custody and FlowMesh liabilities
+        // together in one dedicated, BLS-certified state transition. Mixing
+        // user actions or clearing into that transition would make the
+        // mandatory chain reconciliation depend on optional order flow.
+        if (!settlements.empty()) {
+            if (!canonical.empty()) return std::nullopt;
+            for (size_t i{0}; i < settlements.size(); ++i) {
+                const WithdrawalSettlementFactV1& settlement{settlements[i]};
+                if ((i > 0 &&
+                     !(settlements[i - 1].receipt.receipt_id <
+                       settlement.receipt.receipt_id)) ||
+                    !m_state.ConsumeWithdrawalSettlement(settlement)) {
+                    return std::nullopt;
+                }
+                result.settled_withdrawals.push_back(settlement);
+            }
+            {
+                HashWriter h;
+                h << std::string{"b3/flowmesh/receipts/v1"} << result.slot
+                  << uint64_t{0};
+                result.request_root = h.GetHash();
+            }
+            result.state_root = m_state.Root();
+            {
+                HashWriter h;
+                h << std::string{"b3/flowmesh/settlement-result/v1"}
+                  << result.slot
+                  << static_cast<uint64_t>(result.settled_withdrawals.size());
+                for (const WithdrawalSettlementFactV1& settlement :
+                     result.settled_withdrawals) {
+                    const auto& receipt{settlement.receipt};
+                    h << receipt.receipt_id << receipt.market_id
+                      << receipt.epoch << receipt.sequence << receipt.account
+                      << receipt.asset << receipt.amount
+                      << receipt.destination_owner_commitment
+                      << receipt.vault_id
+                      << receipt.deterministic_change_shard
+                      << settlement.checkpoint_id
+                      << settlement.transaction_id
+                      << settlement.connected_height
+                      << settlement.connected_block;
+                }
+                result.result_commitment = h.GetHash();
+            }
+            return result;
+        }
+
+        // Capacity is an exact chain fact at this entry anchor. Query it at
+        // most once per asset per slot; every later request compares the
+        // same capacity with the ledger's already-updated pending total.
+        std::map<AssetId, std::optional<CAmount>> capacity_cache;
+        const auto withdrawal_capacity = [&](const AssetId& asset) {
+            auto capacity{capacity_cache.find(asset)};
+            if (capacity == capacity_cache.end()) {
+                capacity = capacity_cache
+                               .emplace(
+                                   asset,
+                                   m_deposits
+                                       ? m_deposits->GetWithdrawalCapacity(
+                                             asset, anchor)
+                                       : std::nullopt)
+                               .first;
+            }
+            return capacity->second;
+        };
+        const auto request_withdrawal = [&](const AccountId& account,
+                                            const AssetId& asset,
+                                            const CAmount amount,
+                                            const uint256& destination) {
+            const auto capacity{withdrawal_capacity(asset)};
+            if (!capacity) {
+                return std::optional<modern::WithdrawalReceipt>{};
+            }
+            return m_state.RequestWithdrawal(account, asset, amount,
+                                             destination, *capacity);
+        };
 
         std::map<COutPoint, const Action*> deposit_entries;
         std::map<std::pair<AccountId, uint64_t>, std::vector<const Action*>> groups;
@@ -349,7 +471,10 @@ public:
         // Deposits, in outpoint order.
         for (const auto& [outpoint, action_ptr] : deposit_entries) {
             const uint256 id{action_ptr->Id()};
-            if (ApplyDeposit(*action_ptr, anchor)) {
+            if (const auto credited{ApplyDeposit(*action_ptr, anchor)}) {
+                result.credited_deposits.push_back(
+                    {action_ptr->outpoint, credited->account,
+                     credited->asset, credited->amount});
                 result.applied.push_back(id);
             } else {
                 result.rejected.emplace_back(id, ActionReject::REJECTED_BY_STATE);
@@ -381,9 +506,13 @@ public:
                 break;
             case ActionType::WITHDRAW: {
                 const std::optional<modern::WithdrawalReceipt> request{
-                    m_state.RequestWithdrawal(action.signer, action.asset, action.amount,
-                                              action.destination)};
-                if (request) result.withdrawal_requests.push_back(*request);
+                    request_withdrawal(action.signer, action.asset,
+                                       action.amount, action.destination)};
+                if (request) {
+                    result.withdrawal_requests.push_back(*request);
+                    result.account_withdrawal_requests.push_back(
+                        {action.signer, *request});
+                }
                 ok = request.has_value();
                 break;
             }
@@ -393,6 +522,18 @@ public:
             case ActionType::FUTURES_TO_SPOT:
                 ok = false; // unreachable: shape validation rejects reserved types
                 break;
+            case ActionType::CLAIM_SEAT_REWARD: {
+                const std::optional<modern::WithdrawalReceipt> request{
+                    request_withdrawal(action.signer, action.asset,
+                                       action.amount, action.destination)};
+                if (request) {
+                    result.withdrawal_requests.push_back(*request);
+                    result.account_withdrawal_requests.push_back(
+                        {action.signer, *request});
+                }
+                ok = request.has_value();
+                break;
+            }
             }
 
             m_state.AdvanceSequence(action.signer, action.sequence + 1);
@@ -407,9 +548,52 @@ public:
 
         // ONE clearing pass per slot (advances the ledger slot). A fatal
         // clearing/settlement failure poisons this whole candidate.
-        const std::optional<ClearingEngine::ClearingResult> clearing{m_state.ClearSlot()};
+        const std::optional<ClearingEngine::ClearingResult> clearing{
+            m_state.ClearSlot(m_fee_context)};
         if (!clearing) return std::nullopt;
         result.clearing = *clearing;
+
+        // Treasury fees never depend on a private FlowMesh account key. Fee
+        // allocation always accrues the pinned 20% share to its deterministic
+        // account. After every ordinary slot, withdraw as much of that balance
+        // as the exact residual anchored pool capacity can safely cover;
+        // retain any remainder and retry on a later slot. This lets
+        // A3 trading start while post-A3 pool outputs are still becoming
+        // 30-deep, without certifying an unpayable receipt or losing a fee.
+        // One maximal receipt avoids a permanent 65-dust-output stall while
+        // preserving the same pending-total <= top-64-capacity invariant.
+        const bool canonical_fee_context{
+            m_fee_context != nullptr &&
+            FlowMeshFeeContextIsCanonical(*m_fee_context)};
+        if (result.clearing.fees.treasury_fee > 0 &&
+            !canonical_fee_context) {
+            return std::nullopt;
+        }
+        if (canonical_fee_context) {
+            const AccountId treasury_account{
+                FlowMeshTreasuryFeeAccount(*m_fee_context)};
+            const CAmount accrued{m_state.LedgerView().Available(
+                treasury_account, modern::NativeAsset())};
+            if (accrued > 0) {
+                const auto capacity{
+                    withdrawal_capacity(modern::NativeAsset())};
+                const CAmount pending{m_state.LedgerView().PendingWithdrawals(
+                    modern::NativeAsset())};
+                if (capacity && pending <= *capacity) {
+                    const CAmount amount{
+                        std::min(accrued, *capacity - pending)};
+                    if (amount > 0) {
+                        const auto treasury_request{request_withdrawal(
+                            treasury_account, modern::NativeAsset(), amount,
+                            m_fee_context->treasury_owner_commitment)};
+                        if (!treasury_request) return std::nullopt;
+                        result.withdrawal_requests.push_back(*treasury_request);
+                        result.account_withdrawal_requests.push_back(
+                            {treasury_account, *treasury_request});
+                    }
+                }
+            }
+        }
 
         {
             HashWriter h;
@@ -438,6 +622,18 @@ public:
             for (const auto& [account, fill] : result.clearing.bid_fill) h << account << fill;
             h << static_cast<uint64_t>(result.clearing.ask_fill.size());
             for (const auto& [account, fill] : result.clearing.ask_fill) h << account << fill;
+            h << result.clearing.fees.matched_b3_quote_notional
+              << result.clearing.fees.fee_total << result.clearing.fees.treasury_fee
+              << result.clearing.fees.seat_fee;
+            h << static_cast<uint64_t>(result.clearing.fees.seller_fees.size());
+            for (const SellerFeeShare& share : result.clearing.fees.seller_fees) {
+                h << share.account << share.gross_quote_proceeds << share.fee
+                  << share.net_quote_proceeds;
+            }
+            h << static_cast<uint64_t>(result.clearing.fees.seat_rewards.size());
+            for (const SeatFeeShare& share : result.clearing.fees.seat_rewards) {
+                h << share.seat_id << share.reward;
+            }
             result.result_commitment = h.GetHash();
         }
 
@@ -445,22 +641,27 @@ public:
     }
 
 private:
-    bool ApplyDeposit(const Action& action, const AnchorRef& anchor)
+    std::optional<DepositInfo> ApplyDeposit(const Action& action,
+                                            const AnchorRef& anchor)
     {
         // consumed-deposit state is provisional model state only.
         // OWNER DECISION REQUIRED: retain or defer consumed-deposit
         // state, and define same-slot deposit/trading semantics.
         // Production deposits stay fail-closed regardless (null
         // verifier), and no additional semantics are added here.
-        if (m_deposits == nullptr) return false;
-        if (m_state.DepositConsumed(action.outpoint)) return false;
+        if (m_deposits == nullptr) return std::nullopt;
+        if (m_state.DepositConsumed(action.outpoint)) return std::nullopt;
         const std::optional<DepositInfo> info{m_deposits->GetDeposit(action.outpoint, anchor)};
-        if (!info) return false;
-        return m_state.CreditDeposit(action.outpoint, info->account, info->asset, info->amount);
+        if (!info || !m_state.CreditDeposit(action.outpoint, info->account,
+                                            info->asset, info->amount)) {
+            return std::nullopt;
+        }
+        return info;
     }
 
     FlowMeshState& m_state;
     const DepositVerifier* m_deposits;
+    const FlowMeshFeeContext* m_fee_context;
 };
 
 } // namespace flowmesh

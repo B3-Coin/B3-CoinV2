@@ -11,6 +11,7 @@
 #include <test/util/setup_common.h>
 #include <wallet/types.h>
 #include <wallet/wallet.h>
+#include <wallet/receive.h>
 #include <wallet/test/util.h>
 
 #include <boost/test/unit_test.hpp>
@@ -279,6 +280,97 @@ BOOST_AUTO_TEST_CASE(ismine_standard)
         scriptPubKey = GetScriptForDestination(output);
         result = spk_manager->IsMine(scriptPubKey);
         BOOST_CHECK(result);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(exact_script_signability)
+{
+    CKey keys[3];
+    CPubKey pubkeys[3];
+    for (int i = 0; i < 3; ++i) {
+        keys[i].MakeNewKey(/*fCompressedIn=*/true);
+        pubkeys[i] = keys[i].GetPubKey();
+    }
+    std::unique_ptr<interfaces::Chain>& chain = m_node.chain;
+    const auto can_sign = [](CWallet& wallet, const CScript& script) {
+        LOCK(wallet.cs_wallet);
+        return WalletCanSignScript(wallet, script);
+    };
+
+    // A private descriptor can satisfy its exact script, but possession of a
+    // wallet key never makes an unrelated script signable.
+    {
+        CWallet wallet(chain.get(), "private", CreateMockableWalletDatabase());
+        CreateDescriptor(wallet, "pkh(" + EncodeSecret(keys[0]) + ")", true);
+        BOOST_CHECK(can_sign(
+            wallet, GetScriptForDestination(PKHash{pubkeys[0]})));
+        BOOST_CHECK(!can_sign(
+            wallet, GetScriptForDestination(PKHash{pubkeys[1]})));
+    }
+
+    // A descriptor which knows the exact script but no secret remains
+    // watch-only.
+    {
+        CWallet wallet(chain.get(), "watch", CreateMockableWalletDatabase());
+        CreateDescriptor(wallet, "pkh(" + HexStr(pubkeys[0]) + ")", true);
+        BOOST_CHECK(!can_sign(
+            wallet, GetScriptForDestination(PKHash{pubkeys[0]})));
+    }
+
+    // Manager-wide HavePrivateKeys() is insufficient: one key in a 2-of-2
+    // descriptor must not make the output spendable.
+    {
+        CWallet wallet(chain.get(), "partial", CreateMockableWalletDatabase());
+        CreateDescriptor(
+            wallet,
+            "sh(multi(2," + EncodeSecret(keys[0]) + "," +
+                HexStr(pubkeys[1]) + "))",
+            true);
+        const CScript redeem{GetScriptForMultisig(
+            2, {pubkeys[0], pubkeys[1]})};
+        BOOST_CHECK(!can_sign(
+            wallet, GetScriptForDestination(ScriptHash{redeem})));
+    }
+
+    // Threshold semantics are exact as well: two available keys satisfy a
+    // 2-of-3 descriptor even though the third key is watch-only.
+    {
+        CWallet wallet(chain.get(), "threshold", CreateMockableWalletDatabase());
+        CreateDescriptor(
+            wallet,
+            "sh(multi(2," + EncodeSecret(keys[0]) + "," +
+                EncodeSecret(keys[1]) + "," + HexStr(pubkeys[2]) + "))",
+            true);
+        const CScript redeem{GetScriptForMultisig(
+            2, {pubkeys[0], pubkeys[1], pubkeys[2]})};
+        BOOST_CHECK(can_sign(
+            wallet, GetScriptForDestination(ScriptHash{redeem})));
+    }
+
+    // Locked encryption removes present signing capability and unlocking
+    // restores it without changing ownership.
+    {
+        CWallet wallet(chain.get(), "locked", CreateMockableWalletDatabase());
+        CreateDescriptor(wallet, "pkh(" + EncodeSecret(keys[0]) + ")", true);
+        const CScript script{GetScriptForDestination(PKHash{pubkeys[0]})};
+        BOOST_REQUIRE(wallet.EncryptWallet("signability-pass"));
+        BOOST_CHECK(wallet.IsLocked());
+        BOOST_CHECK(!can_sign(wallet, script));
+        BOOST_REQUIRE(wallet.Unlock("signability-pass"));
+        BOOST_CHECK(can_sign(wallet, script));
+    }
+
+    // An external signer has no local secrets. Exact manager ownership is the
+    // capability boundary; foreign scripts still fail.
+    {
+        CWallet wallet(chain.get(), "external", CreateMockableWalletDatabase());
+        CreateDescriptor(wallet, "pkh(" + HexStr(pubkeys[0]) + ")", true);
+        wallet.SetWalletFlag(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
+        wallet.SetWalletFlag(WALLET_FLAG_EXTERNAL_SIGNER);
+        BOOST_CHECK(can_sign(
+            wallet, GetScriptForDestination(PKHash{pubkeys[0]})));
+        BOOST_CHECK(!can_sign(
+            wallet, GetScriptForDestination(PKHash{pubkeys[1]})));
     }
 }
 

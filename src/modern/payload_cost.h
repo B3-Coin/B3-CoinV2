@@ -27,16 +27,30 @@ namespace modern {
  * relay than the CPU they consume.
  *
  * Declared costs (frozen): FINALITY_CERTIFICATE 2,000; FINALITY_KEY_EVIDENCE
- * 700. The inactive creation-action types 1-3 carry cost 0 here (they are
- * invalid on the wire regardless); unknown types are rejected by the registry
- * before cost is consulted.
+ * 700; FLOWMESH_SEAT_BINDING 700; FLOWMESH_CHECKPOINT 6,000;
+ * FLOWMESH_VAULT_PROOF 500; BRIDGE_V1 12,000. A bridge record consumes the
+ * complete per-transaction budget because its inner kind may perform a
+ * 512-key BLS aggregate check plus SSZ/Keccak/MPT verification. The type-8
+ * cost admits at most two checkpoints under the frozen 12,000-unit
+ * transaction budget. Retired types 1/2 and the
+ * lightweight, non-cryptographic type 3/6 declarations carry cost 0; unknown
+ * types are rejected by the registry before cost is consulted.
  */
+inline constexpr int64_t FLOWMESH_SEAT_BINDING_VERIFY_COST{700};
+inline constexpr int64_t FLOWMESH_CHECKPOINT_VERIFY_COST{6000};
+inline constexpr int64_t FLOWMESH_VAULT_PROOF_VERIFY_COST{500};
+inline constexpr int64_t BRIDGE_VERIFY_COST{MAX_TX_PAYLOAD_COST};
+
 inline int64_t PayloadRecordVerifyCost(const uint16_t type, const uint16_t version)
 {
     if (version != 1) return 0;
     switch (type) {
     case CREATION_ACTION_FINALITY_CERTIFICATE: return FINALITY_CERTIFICATE_VERIFY_COST;
     case CREATION_ACTION_FINALITY_KEY_EVIDENCE: return FINALITY_KEY_EVIDENCE_VERIFY_COST;
+    case CREATION_ACTION_FLOWMESH_SEAT_BINDING: return FLOWMESH_SEAT_BINDING_VERIFY_COST;
+    case CREATION_ACTION_FLOWMESH_CHECKPOINT: return FLOWMESH_CHECKPOINT_VERIFY_COST;
+    case CREATION_ACTION_FLOWMESH_VAULT_PROOF: return FLOWMESH_VAULT_PROOF_VERIFY_COST;
+    case CREATION_ACTION_BRIDGE: return BRIDGE_VERIFY_COST;
     default: return 0;
     }
 }

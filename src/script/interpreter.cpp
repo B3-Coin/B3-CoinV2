@@ -8,6 +8,7 @@
 #include <crypto/ripemd160.h>
 #include <crypto/sha1.h>
 #include <crypto/sha256.h>
+#include <modern/asset_output.h>
 #include <pubkey.h>
 #include <script/script.h>
 #include <tinyformat.h>
@@ -204,6 +205,10 @@ bool CheckSignatureEncoding(const std::vector<unsigned char> &vchSig, script_ver
     if (vchSig.size() == 0) {
         return true;
     }
+    if ((flags & SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL) != 0 &&
+        vchSig.back() != SIGHASH_ALL) {
+        return set_error(serror, SCRIPT_ERR_SIG_HASHTYPE);
+    }
     if ((flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC | SCRIPT_VERIFY_LEGACY_B3_STRICTENC)) != 0 && !IsValidSignatureEncoding(vchSig)) {
         return set_error(serror, SCRIPT_ERR_SIG_DER);
     } else if ((flags & (SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_LEGACY_B3_STRICTENC)) != 0 && !IsLowDERSignature(vchSig, serror)) {
@@ -212,6 +217,23 @@ bool CheckSignatureEncoding(const std::vector<unsigned char> &vchSig, script_ver
     } else if ((flags & SCRIPT_VERIFY_STRICTENC) != 0 && !IsDefinedHashtypeSignature(vchSig)) {
         return set_error(serror, SCRIPT_ERR_SIG_HASHTYPE);
     }
+    return true;
+}
+
+static bool CheckBridgeSchnorrSighash(const std::span<const unsigned char> sig,
+                                      const script_verify_flags flags,
+                                      ScriptError* serror)
+{
+    if ((flags & SCRIPT_VERIFY_BRIDGE_SIGHASH_ALL) == 0 ||
+        sig.size() == 64) {
+        // A 64-byte Schnorr signature uses SIGHASH_DEFAULT, which is
+        // equivalent to SIGHASH_ALL and commits every input and output.
+        return true;
+    }
+    if (sig.size() == 65 && sig.back() != SIGHASH_ALL) {
+        return set_error(serror, SCRIPT_ERR_SCHNORR_SIG_HASHTYPE);
+    }
+    // Preserve the ordinary size error for malformed signatures.
     return true;
 }
 
@@ -356,6 +378,9 @@ static bool EvalChecksigTapscript(const valtype& sig, const valtype& pubkey, Scr
      */
     success = !sig.empty();
     if (success) {
+        if (!CheckBridgeSchnorrSighash(sig, flags, serror)) {
+            return false;
+        }
         // Implement the sigops/witnesssize ratio test.
         // Passing with an upgradable public key version is also counted.
         assert(execdata.m_validation_weight_left_init);
@@ -1422,8 +1447,18 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
     bool uses_bip341_taproot = force;
     for (size_t inpos = 0; inpos < txTo.vin.size() && !(uses_bip143_segwit && uses_bip341_taproot); ++inpos) {
         if (!txTo.vin[inpos].scriptWitness.IsNull()) {
-            if (m_spent_outputs_ready && m_spent_outputs[inpos].scriptPubKey.size() == 2 + WITNESS_V1_TAPROOT_SIZE &&
-                m_spent_outputs[inpos].scriptPubKey[0] == OP_1) {
+            std::optional<CScript> asset_owner;
+            const CScript* authorization_script{nullptr};
+            if (m_spent_outputs_ready) {
+                asset_owner = modern::AssetOwnerScript(
+                    m_spent_outputs[inpos].scriptPubKey);
+                authorization_script = asset_owner
+                                           ? &*asset_owner
+                                           : &m_spent_outputs[inpos].scriptPubKey;
+            }
+            if (authorization_script &&
+                authorization_script->size() == 2 + WITNESS_V1_TAPROOT_SIZE &&
+                (*authorization_script)[0] == OP_1) {
                 // Treat every witness-bearing spend with 34-byte scriptPubKey that starts with OP_1 as a Taproot
                 // spend. This only works if spent_outputs was provided as well, but if it wasn't, actual validation
                 // will fail anyway. Note that this branch may trigger for scriptPubKeys that aren't actually segwit
@@ -1966,6 +2001,9 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
         execdata.m_annex_init = true;
         if (stack.size() == 1) {
             // Key path spending (stack size is 1 after removing optional annex)
+            if (!CheckBridgeSchnorrSighash(stack.front(), flags, serror)) {
+                return false;
+            }
             if (!checker.CheckSchnorrSignature(stack.front(), program, SigVersion::TAPROOT, execdata, serror)) {
                 return false; // serror is set
             }
@@ -2006,7 +2044,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
     // There is intentionally no return statement here, to be able to use "control reaches end of non-void function" warnings to detect gaps in the logic above.
 }
 
-bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror)
+bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror, const bool enable_asset_owner)
 {
     static const CScriptWitness emptyWitness;
     if (witness == nullptr) {
@@ -2015,6 +2053,14 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
     bool hadWitness = false;
 
     set_error(serror, SCRIPT_ERR_UNKNOWN_ERROR);
+
+    // A canonical B3A1 output authorizes its owner suffix exactly as an
+    // ordinary output of that script. Asset identity/amount/policy are checked
+    // separately by contextual consensus; script authorization must retain
+    // the normal P2PKH, P2SH, witness, taproot and bare-multisig semantics.
+    const std::optional<CScript> asset_owner{
+        enable_asset_owner ? modern::AssetOwnerScript(scriptPubKey) : std::nullopt};
+    const CScript& authorization_script{asset_owner ? *asset_owner : scriptPubKey};
 
     if ((flags & SCRIPT_VERIFY_SIGPUSHONLY) != 0 && !scriptSig.IsPushOnly()) {
         return set_error(serror, SCRIPT_ERR_SIG_PUSHONLY);
@@ -2028,7 +2074,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
         return false;
     if (flags & SCRIPT_VERIFY_P2SH)
         stackCopy = stack;
-    if (!EvalScript(stack, scriptPubKey, flags, checker, SigVersion::BASE, serror))
+    if (!EvalScript(stack, authorization_script, flags, checker, SigVersion::BASE, serror))
         // serror is set
         return false;
     if (stack.empty())
@@ -2040,7 +2086,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
     int witnessversion;
     std::vector<unsigned char> witnessprogram;
     if (flags & SCRIPT_VERIFY_WITNESS) {
-        if (scriptPubKey.IsWitnessProgram(witnessversion, witnessprogram)) {
+        if (authorization_script.IsWitnessProgram(witnessversion, witnessprogram)) {
             hadWitness = true;
             if (scriptSig.size() != 0) {
                 // The scriptSig must be _exactly_ CScript(), otherwise we reintroduce malleability.
@@ -2056,7 +2102,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
     }
 
     // Additional validation for spend-to-script-hash transactions:
-    if ((flags & SCRIPT_VERIFY_P2SH) && scriptPubKey.IsPayToScriptHash())
+    if ((flags & SCRIPT_VERIFY_P2SH) && authorization_script.IsPayToScriptHash())
     {
         // scriptSig must be literals-only or validation fails
         if (!scriptSig.IsPushOnly())
@@ -2143,20 +2189,24 @@ size_t static WitnessSigOps(int witversion, const std::vector<unsigned char>& wi
     return 0;
 }
 
-size_t CountWitnessSigOps(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness& witness, script_verify_flags flags)
+size_t CountWitnessSigOps(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness& witness, script_verify_flags flags, const bool enable_asset_owner)
 {
     if ((flags & SCRIPT_VERIFY_WITNESS) == 0) {
         return 0;
     }
     assert((flags & SCRIPT_VERIFY_P2SH) != 0);
 
+    const std::optional<CScript> asset_owner{
+        enable_asset_owner ? modern::AssetOwnerScript(scriptPubKey) : std::nullopt};
+    const CScript& authorization_script{asset_owner ? *asset_owner : scriptPubKey};
+
     int witnessversion;
     std::vector<unsigned char> witnessprogram;
-    if (scriptPubKey.IsWitnessProgram(witnessversion, witnessprogram)) {
+    if (authorization_script.IsWitnessProgram(witnessversion, witnessprogram)) {
         return WitnessSigOps(witnessversion, witnessprogram, witness);
     }
 
-    if (scriptPubKey.IsPayToScriptHash() && scriptSig.IsPushOnly()) {
+    if (authorization_script.IsPayToScriptHash() && scriptSig.IsPushOnly()) {
         CScript::const_iterator pc = scriptSig.begin();
         std::vector<unsigned char> data;
         while (pc < scriptSig.end()) {
@@ -2197,6 +2247,7 @@ const std::map<std::string, script_verify_flag_name>& ScriptFlagNamesToEnum()
         FLAG_NAME(DISCOURAGE_UPGRADABLE_PUBKEYTYPE),
         FLAG_NAME(DISCOURAGE_OP_SUCCESS),
         FLAG_NAME(DISCOURAGE_UPGRADABLE_TAPROOT_VERSION),
+        FLAG_NAME(BRIDGE_SIGHASH_ALL),
     };
 #undef FLAG_NAME
     return g_names_to_enum;

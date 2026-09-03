@@ -19,11 +19,18 @@
 #include <key.h>
 #include <logging.h>
 #include <modern/fn.h>
+#include <modern/fn_genesis_validation.h>
+#include <modern/fn_pod.h>
 #include <modern/finality_certificate.h>
 #include <modern/payload_root.h>
 #include <modern/pos_v1.h>
+#include <node/bridge_state.h>
+#include <node/finality_binding_index.h>
 #include <node/finality_signature.h>
 #include <node/finality_tracker.h>
+#include <node/flowmesh_checkpoint_index.h>
+#include <node/flowmesh_vault_index.h>
+#include <node/fn_seat_index.h>
 #include <node/stake_tracker.h>
 #include <node/context.h>
 #include <node/kernel_notifications.h>
@@ -31,6 +38,7 @@
 #include <policy/policy.h>
 #include <pow.h>
 #include <primitives/transaction.h>
+#include <streams.h>
 #include <util/moneystr.h>
 #include <util/signalinterrupt.h>
 #include <util/time.h>
@@ -126,6 +134,7 @@ void BlockAssembler::resetBlock()
     // These counters do not include coinbase tx
     nBlockTx = 0;
     nFees = 0;
+    m_fn_pod_issued_total.reset();
 }
 
 std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
@@ -162,6 +171,11 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     const bool b3_corridor{b3_consensus.legacy_b3coin &&
                            Consensus::GetConsensusPhase(nHeight, b3_consensus) ==
                                Consensus::ConsensusPhase::TRANSITION_POW};
+    const bool b3_bridge_active{
+        b3_modern && Consensus::BridgeRulesActive(nHeight, b3_consensus)};
+    const bool b3_bridge_withdrawals_active{
+        b3_modern &&
+        Consensus::BridgeWithdrawalRulesActive(nHeight, b3_consensus)};
     if (b3_consensus.legacy_b3coin && !b3_modern) {
         throw std::runtime_error("legacy-era B3 block production is not supported");
     }
@@ -180,6 +194,105 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     }
     if (b3_corridor && !b3_consensus.transition_pow_reward) {
         throw std::runtime_error("temporary-PoW corridor reward is not configured");
+    }
+    if (b3_modern && Consensus::FnPodRulesActive(nHeight, b3_consensus)) {
+        if (!b3_consensus.fn_pod_activation_height ||
+            pindexPrev->nHeight < *b3_consensus.fn_pod_activation_height) {
+            m_fn_pod_issued_total = 0;
+        } else if (pindexPrev->m_fn_pod_issued_total_known) {
+            m_fn_pod_issued_total = pindexPrev->m_fn_pod_issued_total;
+        } else {
+            throw std::runtime_error("modern FN PoD counter for the parent is unavailable");
+        }
+        if (!modern::ModernFnCapacity(b3_consensus)) {
+            throw std::runtime_error("historical FN count exceeds the lifetime cap");
+        }
+    }
+    if (b3_modern && Consensus::FlowMeshRulesActive(nHeight, b3_consensus)) {
+        node::FnSeatTracker& seats{m_chainstate.ModernFnSeats()};
+        if (!seats.Sync(m_chainstate.m_chain, m_chainstate.m_blockman,
+                        b3_consensus, *pindexPrev)) {
+            throw std::runtime_error(
+                "FlowMesh FN-seat index is unavailable for block assembly");
+        }
+        node::FlowMeshCheckpointTracker& checkpoints{
+            m_chainstate.ModernFlowMeshCheckpoints()};
+        node::FlowMeshVaultTracker& vaults{
+            m_chainstate.ModernFlowMeshVaults()};
+        if (!vaults.Sync(m_chainstate.m_chain, m_chainstate.m_blockman,
+                         b3_consensus, *pindexPrev)) {
+            throw std::runtime_error(
+                "FlowMesh vault index is unavailable for block assembly");
+        }
+        if (!checkpoints.Sync(m_chainstate.m_chain,
+                              m_chainstate.m_blockman, b3_consensus,
+                              seats.Index(), vaults.Index(), *pindexPrev)) {
+            throw std::runtime_error(
+                "FlowMesh checkpoint index is unavailable for block assembly");
+        }
+    }
+    BridgeBurnReadiness bridge_burn_readiness{
+        b3_bridge_withdrawals_active ? BridgeBurnReadiness::READY
+                                     : BridgeBurnReadiness::UNAVAILABLE};
+    if (b3_bridge_active) {
+        node::BridgeStateTracker& bridge{m_chainstate.ModernBridgeState()};
+        if (!bridge.Sync(m_chainstate.m_chain, m_chainstate.m_blockman,
+                         b3_consensus, *pindexPrev)) {
+            throw std::runtime_error(
+                "bridge state is unavailable for block assembly");
+        }
+        if (b3_bridge_withdrawals_active &&
+            b3_consensus.busd_bridge->withdrawal_mode ==
+                Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1 &&
+            b3_consensus.busd_bridge->decentralized_withdrawal) {
+            bridge_burn_readiness = BridgeBurnReadiness::UNAVAILABLE;
+            node::FinalityTracker& finality{m_chainstate.ModernFinality()};
+            if (finality.Sync(m_chainstate.m_chain,
+                              m_chainstate.m_blockman, b3_consensus,
+                              *pindexPrev, &bridge.Index())) {
+                const node::FinalityTracker::State projected{
+                    finality.Projected(nHeight, b3_consensus)};
+                bridge_burn_readiness =
+                    node::BridgeWithdrawalValidatorSetsReady(
+                        projected,
+                        *b3_consensus.busd_bridge
+                             ->decentralized_withdrawal)
+                        ? BridgeBurnReadiness::READY
+                        : BridgeBurnReadiness::NOT_READY;
+            }
+        }
+    }
+
+    // The historical FN supply is a mandatory one-time coinbase event in the
+    // first corridor block. Resolve and reserve it before mempool selection so
+    // ordinary transactions can never crowd the pinned outputs out.
+    std::vector<CTxOut> fn_genesis_outputs;
+    if (b3_modern && b3_consensus.hard_fork_height &&
+        nHeight == *b3_consensus.hard_fork_height &&
+        (b3_consensus.fn_genesis_required ||
+         modern::HasFnGenesisConfigurationIntent(b3_consensus))) {
+        std::string fn_error;
+        auto expected{modern::ExpectedFnGenesisOutputs(b3_consensus, fn_error)};
+        if (!expected) {
+            throw std::runtime_error("invalid FN Genesis configuration: " + fn_error);
+        }
+        fn_genesis_outputs = std::move(*expected);
+        const uint64_t fn_weight{static_cast<uint64_t>(GetSerializeSize(fn_genesis_outputs)) *
+                                 WITNESS_SCALE_FACTOR};
+        if (fn_weight > m_options.nBlockMaxWeight - nBlockWeight) {
+            throw std::runtime_error("FN Genesis outputs exceed the configured block weight");
+        }
+        uint64_t fn_sigops_cost{0};
+        for (const CTxOut& out : fn_genesis_outputs) {
+            fn_sigops_cost += static_cast<uint64_t>(
+                out.scriptPubKey.GetSigOpCount(/*fAccurate=*/false)) *
+                WITNESS_SCALE_FACTOR;
+        }
+        if (fn_sigops_cost > MAX_BLOCK_SIGOPS_COST - nBlockSigOpsCost) {
+            throw std::runtime_error("FN Genesis outputs exceed the block sigop limit");
+        }
+        nBlockWeight += fn_weight;
+        nBlockSigOpsCost += fn_sigops_cost;
     }
     // Modern-PoS production (frozen V1 spec §3-§5): fully deterministic —
     // resolve the seed and the validator's weights, find the smallest
@@ -230,13 +343,75 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         if (!eligible) throw std::runtime_error("no eligible modern-PoS round found");
     }
 
-    pblock->nTime = TicksSinceEpoch<std::chrono::seconds>(NodeClock::now());
+    // The bridge freshness rule commits to the candidate block time. Modern
+    // PoS time is already known from the selected recovery round, so expose
+    // that exact value during chunk selection rather than a wall-clock value
+    // that would be replaced after selection.
+    pblock->nTime = b3_modern_pos
+                        ? static_cast<uint32_t>(modern::ModernPosBlockTime(
+                              pindexPrev->GetBlockTime(), pos_round,
+                              *b3_consensus.modern_pos))
+                        : TicksSinceEpoch<std::chrono::seconds>(NodeClock::now());
+    if (!b3_modern_pos && b3_bridge_active) {
+        // Freeze the exact transition-PoW time before bridge selection. A
+        // later wall-clock refresh could otherwise make a mint cross the
+        // light-client freshness boundary after it had been admitted.
+        UpdateTime(pblock, b3_consensus, pindexPrev);
+        if (b3_corridor) {
+            pblock->nTime = static_cast<uint32_t>(std::max<int64_t>(
+                pblock->nTime,
+                pindexPrev->GetBlockTime() +
+                    b3_consensus.transition_pow_min_spacing));
+        }
+    }
     m_lock_time_cutoff = pindexPrev->GetMedianTimePast();
+
+    std::unique_ptr<BridgeBlockPreview> bridge_preview;
+    if (m_mempool && b3_bridge_active) {
+        uint256 preview_block_id;
+        preview_block_id.begin()[0] = 1; // scratch identity; never persisted
+        std::string error;
+        bridge_preview = m_chainstate.ModernBridgeState()
+                             .Index()
+                             .BeginBlockPreview(
+                                 nHeight, pblock->GetBlockTime(),
+                                 preview_block_id, b3_consensus, error);
+        if (!bridge_preview) {
+            throw std::runtime_error(
+                "bridge preview is unavailable for block assembly: " +
+                error);
+        }
+    }
+
+    // A binding can be valid by itself against the confirmed tip yet conflict
+    // with another unconfirmed binding selected earlier for this block (same
+    // validator sequence or reused BLS key). Keep the exact consensus state
+    // machine as a candidate-local preview so one toxic mempool entry cannot
+    // make every block template fail final validation.
+    std::optional<FinalityBindingOverlay> finality_binding_preview;
+    if (m_mempool && b3_modern) {
+        const auto domain{modern::ModernChainDomain(
+            b3_consensus.hashGenesisBlock,
+            b3_consensus.legacy_final_hash.value_or(uint256{}))};
+        if (!domain) {
+            throw std::runtime_error(
+                "modern chain domain is unavailable for finality-key block assembly");
+        }
+        node::FinalityBindingTracker& bindings{
+            m_chainstate.ModernFinalityBindings()};
+        if (!bindings.Sync(m_chainstate.m_chain, m_chainstate.m_blockman,
+                           b3_consensus, *pindexPrev)) {
+            throw std::runtime_error(
+                "finality-key binding index is unavailable for block assembly");
+        }
+        finality_binding_preview.emplace(bindings.Index(), nHeight, *domain);
+    }
 
     if (m_mempool) {
         LOCK(m_mempool->cs);
         m_mempool->StartBlockBuilding();
-        addChunks();
+        addChunks(bridge_preview.get(), bridge_burn_readiness,
+                  finality_binding_preview ? &*finality_binding_preview : nullptr);
         m_mempool->StopBlockBuilding();
     }
 
@@ -262,9 +437,8 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     coinbaseTx.vout[0].scriptPubKey = m_options.coinbase_output_script;
     // Block subsidy + fees. Corridor blocks claim fees plus the configured
     // corridor reward; modern-PoS blocks claim fees plus the configured
-    // (REVISABLE_BEFORE_MAINNET, provisionally 0) modern reward, matching
-    // the unconditional consensus cap. Only non-B3 chains use the stock
-    // subsidy schedule.
+    // sealed-supply-derived modern reward, matching the unconditional
+    // consensus cap. Only non-B3 chains use the stock subsidy schedule.
     CAmount modern_subsidy{0};
     CAmount treasury_share{0};
     if (b3_modern_pos && b3_consensus.modern_pos) {
@@ -280,11 +454,20 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     if (treasury_share > 0) {
         // OD-2 treasury split: the ruled share of the SUBSIDY pays the
         // pinned treasury script; the producer keeps the rest plus fees.
-        coinbaseTx.vout.emplace_back(
+        const CTxOut treasury_output{
             treasury_share, CScript{b3_consensus.modern_pos->treasury_script.begin(),
-                                    b3_consensus.modern_pos->treasury_script.end()});
+                                    b3_consensus.modern_pos->treasury_script.end()}};
+        coinbaseTx.vout.push_back(treasury_output);
+        coinbase_tx.required_outputs.push_back(treasury_output);
     }
-    coinbase_tx.block_reward_remaining = block_reward;
+    if (!fn_genesis_outputs.empty()) {
+        coinbaseTx.vout.insert(coinbaseTx.vout.end(), fn_genesis_outputs.begin(),
+                               fn_genesis_outputs.end());
+        coinbase_tx.required_outputs.insert(coinbase_tx.required_outputs.end(),
+                                            fn_genesis_outputs.begin(),
+                                            fn_genesis_outputs.end());
+    }
+    coinbase_tx.block_reward_remaining = block_reward - treasury_share;
 
     // Start the coinbase scriptSig with the block height as required by BIP34.
     // Mining clients are expected to append extra data to this prefix, so
@@ -319,14 +502,26 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // certificates and the epoch simply extends (frozen behaviour).
     if (b3_modern_pos) {
         node::FinalityTracker& finality{m_chainstate.ModernFinality()};
-        if (finality.Sync(m_chainstate.m_chain, m_chainstate.m_blockman, b3_consensus, *pindexPrev)) {
+        const node::BridgeStateIndex* bridge_index{nullptr};
+        if (Consensus::BridgeRulesActive(pindexPrev->nHeight, b3_consensus)) {
+            node::BridgeStateTracker& bridge{
+                m_chainstate.ModernBridgeState()};
+            if (bridge.Sync(m_chainstate.m_chain, m_chainstate.m_blockman,
+                            b3_consensus, *pindexPrev)) {
+                bridge_index = &bridge.Index();
+            }
+        }
+        if (finality.Sync(m_chainstate.m_chain, m_chainstate.m_blockman,
+                          b3_consensus, *pindexPrev, bridge_index)) {
             if (auto best{m_chainstate.FinalitySignatures().BestCertificate(finality, m_chainstate.m_chain,
-                                                                            b3_consensus)}) {
+                                                                            b3_consensus, bridge_index)}) {
                 std::string cert_error;
                 if (finality.JudgeCandidateCertificate(best->first, best->second, *pindexPrev, b3_consensus,
-                                                       cert_error)) {
+                                                       cert_error, bridge_index)) {
                     const auto [payload, cell] = modern::BuildFinalityCertificate(best->first, best->second);
-                    coinbaseTx.vout.emplace_back(0, cell);
+                    const CTxOut certificate_output{0, cell};
+                    coinbaseTx.vout.push_back(certificate_output);
+                    coinbase_tx.required_outputs.push_back(certificate_output);
                     CMpaRecord record;
                     record.payload_type = modern::MPA_TYPE_FINALITY_CERTIFICATE;
                     record.payload_version = modern::MPA_VERSION_V1;
@@ -356,8 +551,17 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         if (any_mpa) {
             CBlock probe{*pblock};
             probe.vtx[0] = MakeTransactionRef(CTransaction{coinbaseTx});
-            coinbaseTx.vout.emplace_back(0, modern::MakePayloadRootCellScript(modern::ComputePayloadRoot(probe)));
+            const CTxOut root_output{
+                0, modern::MakePayloadRootCellScript(modern::ComputePayloadRoot(probe))};
+            coinbaseTx.vout.push_back(root_output);
+            coinbase_tx.required_outputs.push_back(root_output);
         }
+    }
+    if (!coinbaseTx.mpa.empty()) {
+        DataStream section;
+        SerializeMpaSection(section, coinbaseTx.mpa);
+        coinbase_tx.mpa_section.assign(UCharCast(section.data()),
+                                       UCharCast(section.data()) + section.size());
     }
     pblock->vtx[0] = MakeTransactionRef(std::move(coinbaseTx));
     m_chainstate.m_chainman.GenerateCoinbaseCommitment(*pblock, pindexPrev);
@@ -390,7 +594,11 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         pblock->nBits = b3_consensus.modern_pos->sentinel_bits;
         pblock->vchBlockSig.assign(modern::MODERN_POS_SIG_SIZE, 0x00);
     } else {
-        UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
+        // Bridge-active block assembly already froze the exact preview time
+        // above. Preserve it through final validation.
+        if (!b3_bridge_active) {
+            UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
+        }
         if (b3_corridor) {
             // Corridor pacing: never earlier than parent + minimum spacing
             // (the network refuses it); the future bound then paces
@@ -432,10 +640,95 @@ bool BlockAssembler::TestChunkBlockLimits(FeePerWeight chunk_feerate, int64_t ch
 
 // Perform transaction-level checks before adding to block:
 // - transaction finality (locktime)
-bool BlockAssembler::TestChunkTransactions(const std::vector<CTxMemPoolEntryRef>& txs) const
+bool BlockAssembler::TestChunkTransactions(
+    const std::vector<CTxMemPoolEntryRef>& txs,
+    std::optional<uint32_t>& resulting_fn_pod_total,
+    const FinalityBindingOverlay* const finality_binding_preview,
+    std::optional<FinalityBindingOverlay>& resulting_finality_binding_preview) const
 {
+    resulting_fn_pod_total = m_fn_pod_issued_total;
+    resulting_finality_binding_preview.reset();
+    const bool witness_active{DeploymentActiveAfter(
+        m_chainstate.m_chain.Tip(), m_chainstate.m_chainman,
+        Consensus::DEPLOYMENT_SEGWIT)};
     for (const auto tx : txs) {
         if (!IsFinalTx(tx.get().GetTx(), nHeight, m_lock_time_cutoff)) {
+            return false;
+        }
+        const CTransaction& transaction{tx.get().GetTx()};
+        // The mempool rejects these while witness commitments are inactive,
+        // but retain a production-side guard for entries restored by an older
+        // binary or injected through test/debug code. One stale entry must not
+        // poison every block template.
+        if (!witness_active && transaction.HasWitness()) {
+            return false;
+        }
+        const bool has_finality_key_evidence{std::any_of(
+            transaction.mpa.begin(), transaction.mpa.end(),
+            [](const CMpaRecord& record) {
+                return record.payload_type ==
+                       modern::MPA_TYPE_FINALITY_KEY_EVIDENCE;
+            })};
+        if (finality_binding_preview != nullptr && has_finality_key_evidence) {
+            if (!resulting_finality_binding_preview) {
+                resulting_finality_binding_preview.emplace(
+                    *finality_binding_preview);
+            }
+            std::vector<FinalityBindingIndex::Transition> transitions;
+            std::string error;
+            if (!resulting_finality_binding_preview->ApplyTransaction(
+                    transaction, transitions, error)) {
+                LogDebug(BCLog::VALIDATION,
+                         "CreateNewBlock(): skipping FINALITY_KEY conflict in %s (%s)\n",
+                         transaction.GetHash().ToString(), error);
+                return false;
+            }
+        }
+        const size_t declarations{modern::CountModernFnPodDeclarations(transaction)};
+        if (declarations == 0) continue;
+        if (declarations != 1 || !resulting_fn_pod_total) return false;
+
+        modern::ModernFnPodActionV1 action;
+        bool decoded{false};
+        for (const CMpaRecord& record : transaction.mpa) {
+            if (record.payload_type != modern::CREATION_ACTION_MODERN_FN_POD) continue;
+            std::string error;
+            if (!modern::DecodeModernFnPodRecord(record, action, error)) return false;
+            decoded = true;
+        }
+        const auto capacity{modern::ModernFnCapacity(chainparams.GetConsensus())};
+        if (!decoded || !capacity || action.created_before != *resulting_fn_pod_total ||
+            *resulting_fn_pod_total >= *capacity) {
+            return false;
+        }
+        ++*resulting_fn_pod_total;
+    }
+    if (Consensus::FlowMeshRulesActive(nHeight,
+                                       chainparams.GetConsensus())) {
+        CBlock candidate;
+        // The block template still has a null coinbase placeholder during
+        // selection. Only ordinary transactions can carry type 8/9 here.
+        for (size_t i{1}; i < pblocktemplate->block.vtx.size(); ++i) {
+            if (pblocktemplate->block.vtx[i]) {
+                candidate.vtx.push_back(pblocktemplate->block.vtx[i]);
+            }
+        }
+        for (const auto& entry : txs) {
+            candidate.vtx.push_back(entry.get().GetSharedTx());
+        }
+        uint256 candidate_id;
+        candidate_id.begin()[0] = 1; // scratch identity; never persisted
+        node::FlowMeshCheckpointBlockDelta delta;
+        std::string error;
+        const node::FnSeatTracker& seats{m_chainstate.ModernFnSeats()};
+        const node::FlowMeshCheckpointTracker& checkpoints{
+            m_chainstate.ModernFlowMeshCheckpoints()};
+        const node::FlowMeshVaultTracker& vaults{
+            m_chainstate.ModernFlowMeshVaults()};
+        if (!checkpoints.Index().VerifyBlock(
+                candidate, nHeight, candidate_id, m_chainstate.m_chain,
+                chainparams.GetConsensus(), seats.Index(), vaults.Index(),
+                delta, error)) {
             return false;
         }
     }
@@ -459,7 +752,10 @@ void BlockAssembler::AddToBlock(const CTxMemPoolEntry& entry)
     }
 }
 
-void BlockAssembler::addChunks()
+void BlockAssembler::addChunks(
+    BridgeBlockPreview* const bridge_preview,
+    const BridgeBurnReadiness bridge_burn_readiness,
+    FinalityBindingOverlay* const finality_binding_preview)
 {
     // Limit the number of attempts to add transactions to the block when it is
     // close to full; this is just a simple heuristic to finish quickly if the
@@ -488,8 +784,37 @@ void BlockAssembler::addChunks()
             chunk_sig_ops += tx.get().GetSigOpCost();
         }
 
-        // Check to see if this chunk will fit.
-        if (!TestChunkBlockLimits(chunk_feerate, chunk_sig_ops) || !TestChunkTransactions(selected_transactions)) {
+        // Check to see if this chunk will fit. Bridge preview is deliberately
+        // last: a successful atomic append is followed immediately by
+        // inclusion, while a rejected chunk leaves the accepted preview
+        // prefix unchanged.
+        std::optional<uint32_t> resulting_fn_pod_total;
+        std::optional<FinalityBindingOverlay> resulting_finality_binding_preview;
+        bool chunk_accepted{
+            TestChunkBlockLimits(chunk_feerate, chunk_sig_ops) &&
+            TestChunkTransactions(selected_transactions,
+                                  resulting_fn_pod_total,
+                                  finality_binding_preview,
+                                  resulting_finality_binding_preview)};
+        if (chunk_accepted && bridge_preview != nullptr) {
+            std::vector<CTransactionRef> bridge_transactions;
+            bridge_transactions.reserve(selected_transactions.size());
+            for (const auto& entry : selected_transactions) {
+                bridge_transactions.push_back(entry.get().GetSharedTx());
+            }
+            std::string error;
+            chunk_accepted = std::all_of(
+                bridge_transactions.begin(), bridge_transactions.end(),
+                [&](const CTransactionRef& tx) {
+                    return CheckBridgeBurnReadiness(
+                        *tx, bridge_burn_readiness, error);
+                });
+            if (chunk_accepted) {
+                chunk_accepted = bridge_preview->TryAppend(
+                    bridge_transactions, error);
+            }
+        }
+        if (!chunk_accepted) {
             // This chunk won't fit, so we skip it and will try the next best one.
             m_mempool->SkipBuilderChunk();
             ++nConsecutiveFailed;
@@ -501,6 +826,12 @@ void BlockAssembler::addChunks()
             }
         } else {
             m_mempool->IncludeBuilderChunk();
+            m_fn_pod_issued_total = resulting_fn_pod_total;
+            if (finality_binding_preview != nullptr &&
+                resulting_finality_binding_preview) {
+                *finality_binding_preview =
+                    std::move(*resulting_finality_binding_preview);
+            }
 
             // This chunk will fit, so add it to the block.
             nConsecutiveFailed = 0;

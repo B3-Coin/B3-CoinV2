@@ -13,6 +13,14 @@ Further information is available in the [doc folder](doc/).
 - `b3coind` — headless full node
 - `b3coin-cli` — RPC command-line client
 - `b3coin-wallet` — offline wallet utility
+- `b3-bridge-ethcheck` — optional bridge proof verifier and canonical payload
+  emitter (`-DB3_BRIDGE_TOOLS=ON`)
+- `b3-bridge-bootstrap-proof` — optional offline 3-of-4 bootstrap proof and
+  Ethereum initialization-calldata builder (`-DB3_BRIDGE_TOOLS=ON`)
+
+Linux operator archives also include the automatic Ethereum-to-B3 relayer and
+its fail-closed operating guide under `contrib/b3bridge/`. Bridge tools being
+present in an archive does not activate an unconfigured mainnet bridge.
 
 ## License
 
@@ -24,7 +32,8 @@ derives.
 ## Development process
 
 Development branches are built and tested regularly, but are not guaranteed to
-be stable. Release branches and signed tags identify reviewed releases.
+be stable. Release branches and version tags identify reviewed releases. Check
+each release's notes for its exact signature and checksum guarantees.
 
 The contribution workflow is described in
 [CONTRIBUTING.md](CONTRIBUTING.md), and useful guidance is available in

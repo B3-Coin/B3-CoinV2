@@ -870,6 +870,7 @@ RPCHelpMan lockunspent();
 RPCHelpMan listlockunspent();
 RPCHelpMan getbalances();
 RPCHelpMan listunspent();
+RPCHelpMan getwalletassets();
 
 // encryption
 RPCHelpMan walletpassphrase();
@@ -888,6 +889,27 @@ RPCHelpMan sendall();
 RPCHelpMan walletprocesspsbt();
 RPCHelpMan walletcreatefundedpsbt();
 RPCHelpMan signrawtransactionwithwallet();
+RPCHelpMan issueasset();
+RPCHelpMan sendasset();
+RPCHelpMan burnasset();
+RPCHelpMan createfncoin();
+RPCHelpMan submitbridgecarrier();
+RPCHelpMan claimbridgedeposit();
+RPCHelpMan bridgewithdraw();
+RPCHelpMan importflowmeshkey();
+RPCHelpMan bindflowmeshseat();
+RPCHelpMan flowmeshdeposit();
+RPCHelpMan listflowmeshmarkets();
+RPCHelpMan getflowmeshbalance();
+RPCHelpMan listflowmeshvaultoperations();
+RPCHelpMan submitflowmeshdeposit();
+RPCHelpMan submitflowmeshorder();
+RPCHelpMan cancelflowmeshorder();
+RPCHelpMan requestflowmeshwithdrawal();
+RPCHelpMan startflowmeshvalidator();
+RPCHelpMan stopflowmeshvalidator();
+RPCHelpMan createflowmeshcheckpoint();
+RPCHelpMan createflowmeshvaulttx();
 
 // signmessage
 RPCHelpMan signmessage();
@@ -900,6 +922,8 @@ RPCHelpMan bindfinalitykey();
 RPCHelpMan importfinalitykey();
 RPCHelpMan revokefinalitykey();
 RPCHelpMan getfinalityinfo();
+RPCHelpMan exportbridgebootstrapidentity();
+RPCHelpMan signbridgebootstrap();
 RPCHelpMan stopstaking();
 
 // transactions
@@ -919,17 +943,30 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &abandontransaction},
         {"wallet", &abortrescan},
         {"wallet", &backupwallet},
+        {"wallet", &bridgewithdraw},
+        {"wallet", &burnasset},
         {"wallet", &bumpfee},
         {"wallet", &psbtbumpfee},
         {"wallet", &createstake},
         {"wallet", &bindfinalitykey},
+        {"wallet", &bindflowmeshseat},
+        {"wallet", &cancelflowmeshorder},
+        {"wallet", &createflowmeshcheckpoint},
+        {"wallet", &createflowmeshvaulttx},
         {"wallet", &importfinalitykey},
+        {"wallet", &importflowmeshkey},
         {"wallet", &revokefinalitykey},
         {"wallet", &getfinalityinfo},
+        {"wallet", &exportbridgebootstrapidentity},
+        {"wallet", &signbridgebootstrap},
         {"wallet", &createwallet},
         {"wallet", &createwalletdescriptor},
+        {"wallet", &claimbridgedeposit},
+        {"wallet", &createfncoin},
         {"wallet", &restorewallet},
         {"wallet", &encryptwallet},
+        {"wallet", &flowmeshdeposit},
+        {"wallet", &getflowmeshbalance},
         {"wallet", &getaddressesbylabel},
         {"wallet", &getaddressinfo},
         {"wallet", &getbalance},
@@ -941,10 +978,14 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &getstakinginfo},
         {"wallet", &gettransaction},
         {"wallet", &getbalances},
+        {"wallet", &getwalletassets},
         {"wallet", &getwalletinfo},
         {"wallet", &importdescriptors},
         {"wallet", &importlegacywalletdump},
+        {"wallet", &listflowmeshmarkets},
+        {"wallet", &listflowmeshvaultoperations},
         {"wallet", &importprunedfunds},
+        {"wallet", &issueasset},
         {"wallet", &keypoolrefill},
         {"wallet", &listaddressgroupings},
         {"wallet", &listdescriptors},
@@ -963,6 +1004,8 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &removeprunedfunds},
         {"wallet", &rescanblockchain},
         {"wallet", &send},
+        {"wallet", &sendasset},
+        {"wallet", &requestflowmeshwithdrawal},
         {"wallet", &sendmany},
         {"wallet", &sendtoaddress},
         {"wallet", &setlabel},
@@ -970,7 +1013,12 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &signmessage},
         {"wallet", &signrawtransactionwithwallet},
         {"wallet", &startstaking},
+        {"wallet", &startflowmeshvalidator},
         {"wallet", &stopstaking},
+        {"wallet", &stopflowmeshvalidator},
+        {"wallet", &submitbridgecarrier},
+        {"wallet", &submitflowmeshdeposit},
+        {"wallet", &submitflowmeshorder},
         {"wallet", &simulaterawtransaction},
         {"wallet", &sendall},
         {"wallet", &unloadwallet},

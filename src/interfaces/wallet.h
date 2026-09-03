@@ -13,6 +13,7 @@
 #include <pubkey.h>
 #include <script/script.h>
 #include <support/allocators/secure.h>
+#include <uint256.h>
 #include <util/fs.h>
 #include <util/result.h>
 #include <util/ui_change_type.h>
@@ -52,6 +53,7 @@ namespace interfaces {
 
 class Handler;
 struct WalletAddress;
+struct WalletAssetBalance;
 struct WalletBalances;
 struct WalletTx;
 struct WalletTxOut;
@@ -60,6 +62,21 @@ struct WalletMigrationResult;
 
 using WalletOrderForm = std::vector<std::pair<std::string, std::string>>;
 using WalletValueMap = std::map<std::string, std::string>;
+
+//! One non-native policy asset held by a wallet.
+struct WalletAssetBalance
+{
+    uint256 asset_id{};
+    CAmount confirmed{0};
+    CAmount unconfirmed{0};
+    CAmount spendable{0};
+    CAmount immature{0};
+    bool is_fn{false};
+    bool is_bridge{false};
+
+    friend bool operator==(const WalletAssetBalance&,
+                           const WalletAssetBalance&) = default;
+};
 
 //! Interface for accessing a wallet.
 class Wallet
@@ -76,12 +93,8 @@ public:
     //! Lock wallet.
     virtual bool lock() = 0;
 
-    //! Unlock wallet (optionally for staking only: block signing works,
-    //! transaction creation and signing refuse until a full unlock).
-    virtual bool unlock(const SecureString& wallet_passphrase, bool staking_only = false) = 0;
-
-    //! Return whether the wallet is unlocked for staking only.
-    virtual bool unlockStakingOnly() = 0;
+    //! Unlock wallet.
+    virtual bool unlock(const SecureString& wallet_passphrase) = 0;
 
     //! Return whether wallet is locked.
     virtual bool isLocked() = 0;
@@ -215,6 +228,20 @@ public:
 
     //! Get balances.
     virtual WalletBalances getBalances() = 0;
+
+    /**
+     * Return trusted, unspent non-native policy-asset balances. Amounts are
+     * exact asset base units. Confirmed includes immature outputs, while
+     * spendable contains only mature, unlocked outputs this wallet can sign.
+     */
+    virtual std::vector<WalletAssetBalance> getAssetBalances() { return {}; }
+
+    //! Get policy-asset balances without blocking the caller.
+    virtual bool tryGetAssetBalances(std::vector<WalletAssetBalance>& balances)
+    {
+        balances = getAssetBalances();
+        return true;
+    }
 
     //! Get balances if possible without blocking.
     virtual bool tryGetBalances(WalletBalances& balances, uint256& block_hash) = 0;

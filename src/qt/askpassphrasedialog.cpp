@@ -12,8 +12,6 @@
 #include <support/allocators/secure.h>
 
 #include <QKeyEvent>
-#include <QCheckBox>
-#include <QVBoxLayout>
 #include <QMessageBox>
 #include <QPushButton>
 
@@ -54,15 +52,6 @@ AskPassphraseDialog::AskPassphraseDialog(Mode _mode, QWidget *parent, SecureStri
             ui->passLabel3->hide();
             ui->passEdit3->hide();
             setWindowTitle(tr("Unlock wallet"));
-            if (mode == Unlock) {
-                // B3: staking-only unlock — the wallet signs blocks but
-                // refuses to create or sign transactions.
-                m_staking_only_checkbox = new QCheckBox(tr("Unlock for staking only"), this);
-                m_staking_only_checkbox->setToolTip(tr("The wallet can sign blocks and earn rewards, but funds cannot be sent until it is unlocked fully."));
-                if (auto* box_layout = qobject_cast<QVBoxLayout*>(layout())) {
-                    box_layout->insertWidget(box_layout->count() - 1, m_staking_only_checkbox);
-                }
-            }
             break;
         case ChangePass: // Ask old passphrase + new passphrase x2
             setWindowTitle(tr("Change passphrase"));
@@ -169,7 +158,7 @@ void AskPassphraseDialog::accept()
     } break;
     case Unlock:
         try {
-            if (!model->setWalletLocked(false, oldpass, m_staking_only_checkbox && m_staking_only_checkbox->isChecked())) {
+            if (!model->setWalletLocked(false, oldpass)) {
                 // Check if the passphrase has a null character (see #27067 for details)
                 if (oldpass.find('\0') == std::string::npos) {
                     QMessageBox::critical(this, tr("Wallet unlock failed"),

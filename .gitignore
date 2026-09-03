@@ -27,6 +27,7 @@ target/
 /guix-build-*
 
 /ci/scratch/
+/test/cache/
 dist/
 .DS_Store
 **/.DS_Store

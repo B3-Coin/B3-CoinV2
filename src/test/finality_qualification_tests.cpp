@@ -104,6 +104,24 @@ struct QualSet {
     }
 };
 
+Consensus::BridgeDecentralizedWithdrawalPins BridgeThresholdPins(
+    const uint32_t min_validators, const uint32_t max_validators,
+    const uint64_t min_weight)
+{
+    Consensus::BridgeDecentralizedWithdrawalPins pins;
+    pins.ethereum_verifier_address.fill(0x11);
+    pins.ethereum_verifier_code_hash = uint256::ONE;
+    pins.bootstrap_validator_set_hash = uint256{uint8_t{2}};
+    pins.withdrawal_rules_version =
+        Consensus::DECENTRALIZED_WITHDRAWAL_RULES_VERSION_V1;
+    pins.withdrawal_rules_commitment = uint256{uint8_t{3}};
+    pins.min_bridge_validators = min_validators;
+    pins.max_bridge_validators = max_validators;
+    pins.min_bridge_total_weight = min_weight;
+    pins.max_epoch_lag = 1;
+    return pins;
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(finality_qualification_tests)
@@ -194,14 +212,20 @@ BOOST_FIXTURE_TEST_CASE(large_set_and_multibyte_bitmaps, BasicTestingSetup)
         fb.block_hash = uint256::ONE;
         fb.validator_set_hash = uint256{"4444444444444444444444444444444444444444444444444444444444444444"};
         fb.epoch = 7;
-        // Greedy: sign with members 0..k until the quorum is exactly reached.
+        // Greedy: sign with members 0..k until both the stake quorum and the
+        // cross-chain signer-count quorum are reached.
         std::vector<uint32_t> signers;
         uint64_t weight{0};
-        for (uint32_t i = 0; i < 512 && weight < quorum; ++i) {
+        const uint32_t headcount{modern::FinalityHeadcountQuorum(512)};
+        for (uint32_t i = 0;
+             i < 512 &&
+             (weight < quorum || signers.size() < headcount);
+             ++i) {
             signers.push_back(i);
             weight += set.snapshot.Members()[i].weight;
         }
         BOOST_REQUIRE_GE(weight, quorum);
+        BOOST_REQUIRE_GE(signers.size(), headcount);
         const auto at_quorum{set.Sign(fb, signers)};
         BOOST_CHECK(modern::VerifyFinalityCertificate(QUAL_DOMAIN, fb, at_quorum, set.snapshot.View(),
                                                       fb.validator_set_hash) == modern::CertificateCheck::OK);
@@ -261,14 +285,26 @@ BOOST_FIXTURE_TEST_CASE(three_validator_quorum_end_to_end, FinalityChainFixture)
         BOOST_REQUIRE(tmpl);
         BOOST_CHECK(!tmpl->block.vtx[0]->HasMpa());
     }
-    // C joins (B abstains): 25 >= 18. Any node aggregates; the assembler
-    // includes the two-signer certificate; consensus finalizes and pins.
+    // C joins (B still abstains): 25 >= 18 by weight, but two of three does
+    // not satisfy the independent >2/3 headcount quorum. This is intentionally
+    // identical to the Ethereum verifier's rule, so no certificate accepted by
+    // B3 can become impossible to relay.
     {
         LOCK(cs_main);
         Chainstate& cs{chainman.ActiveChainstate()};
         node::FinalitySigner sc;
         sc.SetKey(m_bls_c, m_vk_c);
         BOOST_CHECK(!sc.MaybeSign(Finality(), cs.m_chain, params, cs.FinalitySignatures()).empty());
+        BOOST_CHECK(!cs.FinalitySignatures().BestCertificate(Finality(), cs.m_chain, params).has_value());
+    }
+    // B supplies the third signature. Both the 18/26 weight threshold and the
+    // 3/3 headcount threshold are now satisfied.
+    {
+        LOCK(cs_main);
+        Chainstate& cs{chainman.ActiveChainstate()};
+        node::FinalitySigner sb;
+        sb.SetKey(m_bls_b, m_vk_b);
+        BOOST_CHECK(!sb.MaybeSign(Finality(), cs.m_chain, params, cs.FinalitySignatures()).empty());
     }
     const auto tmpl{node::BlockAssembler(chainman.ActiveChainstate(), nullptr, options).CreateNewBlock()};
     BOOST_REQUIRE(tmpl);
@@ -280,7 +316,7 @@ BOOST_FIXTURE_TEST_CASE(three_validator_quorum_end_to_end, FinalityChainFixture)
         BOOST_REQUIRE(pair.has_value());
         BOOST_CHECK_EQUAL(pair->finalized_block.height, static_cast<uint64_t>(M + 5));
         const auto view{FinalityState().current->View()};
-        BOOST_CHECK_EQUAL(modern::SignedWeight(pair->certificate.signer_bitmap, view), 25U); // A + C, B abstained
+        BOOST_CHECK_EQUAL(modern::SignedWeight(pair->certificate.signer_bitmap, view), 26U);
     }
     block.hashMerkleRoot = BlockMerkleRoot(block);
     Sign(block, m_validator_a);
@@ -295,6 +331,57 @@ BOOST_FIXTURE_TEST_CASE(three_validator_quorum_end_to_end, FinalityChainFixture)
     const auto after{FinalityState()};
     BOOST_CHECK(before.finalized == after.finalized);
     BOOST_CHECK_EQUAL(before.current->SetHash().GetHex(), after.current->SetHash().GetHex());
+}
+
+BOOST_FIXTURE_TEST_CASE(bridge_withdrawal_readiness_threshold_boundaries,
+                        BasicTestingSetup)
+{
+    const QualSet set3{3, 7};
+    const QualSet set4{4, 7};
+    const QualSet next4{4, 8};
+    const QualSet next5{5, 8};
+
+    node::FinalityTracker::State state;
+    state.bootstrapped = true;
+    state.epoch = 7;
+    state.current =
+        std::make_shared<const ValidatorSetSnapshot>(set4.snapshot);
+    state.next =
+        std::make_shared<const ValidatorSetSnapshot>(next4.snapshot);
+
+    // Count and weight comparisons are inclusive, matching the immutable
+    // Ethereum verifier. The four-member fixture weighs exactly 10.
+    const auto exact{BridgeThresholdPins(4, 4, 10)};
+    BOOST_REQUIRE(exact.Valid());
+    BOOST_CHECK(node::BridgeWithdrawalValidatorSetsReady(state, exact));
+
+    const auto weight_too_high{BridgeThresholdPins(4, 4, 11)};
+    BOOST_REQUIRE(weight_too_high.Valid());
+    BOOST_CHECK(!node::BridgeWithdrawalValidatorSetsReady(
+        state, weight_too_high));
+
+    state.current =
+        std::make_shared<const ValidatorSetSnapshot>(set3.snapshot);
+    const auto minimum_four{BridgeThresholdPins(4, 64, 1)};
+    BOOST_CHECK(!node::BridgeWithdrawalValidatorSetsReady(
+        state, minimum_four));
+
+    state.current =
+        std::make_shared<const ValidatorSetSnapshot>(set4.snapshot);
+    state.next =
+        std::make_shared<const ValidatorSetSnapshot>(next5.snapshot);
+    BOOST_CHECK(!node::BridgeWithdrawalValidatorSetsReady(state, exact));
+    const auto maximum_five{BridgeThresholdPins(4, 5, 10)};
+    BOOST_CHECK(node::BridgeWithdrawalValidatorSetsReady(
+        state, maximum_five));
+
+    state.next.reset();
+    BOOST_CHECK(!node::BridgeWithdrawalValidatorSetsReady(
+        state, maximum_five));
+    state.next =
+        std::make_shared<const ValidatorSetSnapshot>(next4.snapshot);
+    state.lineage_broken = true;
+    BOOST_CHECK(!node::BridgeWithdrawalValidatorSetsReady(state, exact));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

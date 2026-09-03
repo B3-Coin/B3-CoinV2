@@ -90,6 +90,42 @@ private:
 };
 
 /**
+ * Candidate-local FINALITY_KEY state layered over the confirmed binding
+ * index. This is the common state machine used by block verification and by
+ * block assembly: a transaction accepted against the confirmed tip may still
+ * conflict with another unconfirmed transaction selected earlier for the
+ * same candidate block.
+ *
+ * The overlay is cheap to copy (only candidate transitions are copied), so a
+ * block assembler can test a mempool chunk on a copy and commit that copy
+ * only when the whole chunk is selected. ApplyTransaction() must only be
+ * followed by another call when it returned true.
+ */
+class FinalityBindingOverlay
+{
+public:
+    FinalityBindingOverlay(const FinalityBindingIndex& base, int height,
+                           const uint256& chain_domain)
+        : m_base{&base}, m_height{height}, m_chain_domain{chain_domain}
+    {
+    }
+
+    /** Verify and apply every FINALITY_KEY pair in one transaction. Ordinary
+     * transactions are a no-op. On success, `out` contains this transaction's
+     * transitions; on failure it is empty and `error` names the rule. */
+    bool ApplyTransaction(const CTransaction& tx,
+                          std::vector<FinalityBindingIndex::Transition>& out,
+                          std::string& error);
+
+private:
+    const FinalityBindingIndex* m_base;
+    int m_height;
+    uint256 m_chain_domain;
+    std::map<modern::ValidatorKeyBytes, modern::BindingRecord> m_pending;
+    std::map<modern::BlsPubkeyBytes, modern::ValidatorKeyBytes> m_pending_owner;
+};
+
+/**
  * Verify every FINALITY_KEY cell+evidence pair of a block (in block / tx /
  * key order) against `index` plus an in-block overlay, and collect the
  * resulting transitions. All-or-nothing: on any failure `out` is left empty

@@ -6,6 +6,8 @@
 
 #include <chain.h>
 #include <common/args.h>
+#include <consensus/block_codec.h>
+#include <consensus/era.h>
 #include <net_processing.h>
 #include <node/context.h>
 #include <node/miner.h>
@@ -139,12 +141,36 @@ void NextEmptyBlockIndex(CBlockIndex& tip, const Consensus::Params& consensusPar
     CBlockHeader next_header{};
     next_header.hashPrevBlock  = tip.GetBlockHash();
     UpdateTime(&next_header, consensusParams, &tip);
-    next_header.nBits = GetNextWorkRequired(&tip, &next_header, consensusParams);
+    const int next_height{tip.nHeight + 1};
+    const Consensus::ConsensusPhase next_phase{
+        Consensus::GetConsensusPhase(next_height, consensusParams)};
+
+    if (consensusParams.legacy_b3coin &&
+        Consensus::GetB3Era(next_height, consensusParams) == Consensus::B3Era::MODERN) {
+        next_header.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+    }
+
+    // B3's transition corridor has a fixed target and Modern PoS uses a
+    // fixed sentinel. Neither value participates in legacy difficulty
+    // retargeting, so the informational "next" block must mirror the block
+    // assembler instead of feeding these phases through legacy PoW logic.
+    if (consensusParams.legacy_b3coin &&
+        next_phase == Consensus::ConsensusPhase::TRANSITION_POW &&
+        consensusParams.transition_pow_bits) {
+        next_header.nBits = *consensusParams.transition_pow_bits;
+    } else if (consensusParams.legacy_b3coin &&
+               next_phase == Consensus::ConsensusPhase::MODERN_POS &&
+               consensusParams.modern_pos) {
+        next_header.nBits = consensusParams.modern_pos->sentinel_bits;
+    } else {
+        next_header.nBits = GetNextWorkRequired(&tip, &next_header, consensusParams);
+    }
     next_header.nNonce = 0;
 
     next_index.pprev = &tip;
+    next_index.nVersion = next_header.nVersion;
     next_index.nTime = next_header.nTime;
     next_index.nBits = next_header.nBits;
     next_index.nNonce = next_header.nNonce;
-    next_index.nHeight = tip.nHeight + 1;
+    next_index.nHeight = next_height;
 }

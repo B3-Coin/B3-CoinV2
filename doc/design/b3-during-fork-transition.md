@@ -1,13 +1,28 @@
 # B3 transition corridor — temporary PoW between legacy PoS and modern PoS
 
-**Status: AUTHORITATIVE DESIGN DIRECTION (2026-08-16).** This document
+**Status: AUTHORITATIVE CORRIDOR DESIGN (updated 2026-09-01).** This document
 supersedes BOTH earlier transition models: the post-boundary
 "self-activating bootstrap" and the **1,000-block legacy-PoS declaration
 window (SUPERSEDED)** — the corridor is no longer legacy blocks carrying
-declarations; it is temporary PoW with modern semantics. Specification and
-inspection only: no consensus code is implemented by this mission, and the
-`no-modern-pos-rules` fail-closed gate is untouched. OPEN items must not be
-closed by implementation choice.
+declarations; it is temporary PoW with modern semantics. The corridor and
+modern consensus paths are implemented. At the pre-pin checkpoint, mainnet
+remained fail-closed until the seal-derived X/R0/FN-manifest pins and the ruled
+A1/A2/A3 activation heights were set and the transition-release gates in the
+runbook were complete.
+
+> **Current pin supersession (2026-09-01).** Those consensus pins are now set:
+> H/X = 810,000/
+> `2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6`,
+> M = 811,001, R0 = 19,836,712,254 base units, the 3,592-row FN artifact has
+> SHA-256
+> `c80470eec785600f33fa2e69c520ff331c2b354ebf6e0a9bf8cae7d1eb5f9dca`,
+> and A1/A2/A3 = 812,000/813,000/815,000. The preceding sentence records the
+> pre-pin gate; it no longer describes the current transition binary. Release
+> rehearsal/verification remain required, and bUSD remains independently
+> fail-closed.
+
+Later sections retain historical investigation where useful; `FINALIZED.md`
+and the FN/assets and FlowMesh production designs govern any conflict.
 
 ## 1. Timeline
 
@@ -119,21 +134,22 @@ never scrypt).
 **Block P0 = H+1** is: the first block after the immutable legacy anchor X;
 the first modern-format block; the first modern-transaction block; the first
 Policy Output block; the first temporary-PoW block. It is NOT the first
-modern-PoS block. The existing integration expectation "H+1 →
-`no-modern-pos-rules`" is recorded as a contradiction (§11) and will
-eventually move to the first attempted M = H+1001; tests are not modified in
-this mission.
+modern-PoS block. Modern-family rules begin at H+1; modern PoS production
+begins only at M = H+1001.
 
 **Policy surface during the corridor (minimal):** OWNER, LEGACY_LOCK, STAKE,
-BURN (already part of the model, where needed), basic native B3 transfers.
-NOT activated: FlowMesh, DEX, bridge, FN, real USDT/USDC, advanced
-colored-asset issuance, microblocks, leverage, general smart contracts.
+BURN (where needed), basic native B3 transfers, and the mandatory FN Genesis
+outputs in the H+1 coinbase. FN units become ordinarily transferable after
+their 30-block coinbase maturity. Permissionless modern FN PoD creation waits
+for the separately pinned post-M height A1; simple-v1 colored-asset issuance
+waits for A2. During the corridor itself, FlowMesh, DEX, bridge, real
+USDT/USDC, microblocks, leverage, and general smart contracts are not active.
 
 **Legacy UTXO spending:** old outputs keep original txid/vout/nValue/
 scriptPubKey; a modern corridor transaction spends them through
 ViewLegacyCoin/LEGACY_LOCK under frozen legacy script rules into modern
-OWNER or STAKE outputs. No rewrite, no migration, no snapshot, no new
-genesis; non-stakers may leave UTXOs untouched forever.
+OWNER or STAKE outputs. No rewrite, forced migration, snapshot, or chain
+restart occurs; non-stakers may leave UTXOs untouched forever.
 
 **STAKE outputs are real modern outputs** committing to: native B3 principal
 amount, owner authorization, validator public key, creation height, policy
@@ -305,50 +321,15 @@ equivalence framework, legacy UTXO identity, LEGACY_LOCK, Policy Output
 models, marker/codec work, boundary finality, and the modern PosValidator
 interface. What changes is only the phase immediately after H.
 
-## 11. Contradiction register — current code/tests encoding "H+1 = modern PoS"
+## 11. Former contradiction register — resolved
 
-Recorded only; nothing modified in this mission.
-
-1. `src/test/legacy_transition_tests.cpp` —
-   `non_empty_transition_fails_closed_at_h_plus_one` expects H+1 →
-   `no-modern-pos-rules`; under the corridor, H+1 should eventually
-   validate under TRANSITION_POW and the fail-closed expectation moves to
-   the first attempted H+1001.
-2. Same file — `full_legacy_to_modern_transition` installs the test PoS
-   validator for H+1 and treats H-connect as "next block is modern PoS";
-   under the corridor the installed validator would first bind at M.
-3. `src/modern/pos.h` — `SelectStakeRules` is two-state (LEGACY/MODERN by
-   codec marker × era); a third TRANSITION_POW phase must dispatch
-   modern-codec corridor blocks to PoW validation, not `CheckModernStake`.
-4. `src/consensus/era.h` — `GetB3Era` is boolean (LEGACY/MODERN); correct
-   for format/tx dimensions but not for block-production phase; the future
-   `ConsensusPhase` abstraction (§3) supersedes it as the production
-   selector; `hard_fork_height` remains the format boundary = H+1.
-5. `src/validation.cpp` modern branch of `CheckBlock`/
-   `ContextualCheckBlockHeader` — checks stock SHA256d
-   `CheckProofOfWork(block.GetHash(), nBits)` and Bitcoin
-   `GetNextWorkRequired`; corridor blocks need scrypt-hash work checks and
-   the corridor difficulty policy while identity stays SHA256d.
-6. `src/modern/policy.h` — no STAKE policy type exists yet (types 0–3),
-   and OWNER/BURN/DEX_VAULT activation is test-only
-   (`test_only_asset_policies_active`); the corridor requires a production
-   activation story for the minimal surface OWNER/LEGACY_LOCK/STAKE(/BURN)
-   from H+1.
-7. Mempool era gate (`MemPoolAccept::PreChecks`) — era-of-next-block logic
-   is correct for the corridor (modern txs from H+1) but "next block
-   modern" currently implies modern-PoS context in tests; corridor-phase
-   awareness will be needed for miner/relay policy, not admission.
-8. `Consensus::Params` — no corridor constants exist
-   (`TRANSITION_LENGTH`, cutoff C, corridor difficulty/reward params);
-   `legacy_last_pow_block = 500` exists and must remain untouched by the
-   corridor (it governs the historical era only).
-9. The PoS spec's per-output eligibility wording (threshold "split-
-   invariant" per STAKE output) conflicts with the now-LOCKED
-   per-validator aggregation rule; corrected in the PoS spec by this
-   mission (documentation only).
-10. No mining/block-production path exists for any era (miner/submitblock
-    are stock Bitcoin); corridor mining needs the marker-aware production
-    path already listed as missing in the status matrix.
+The earlier implementation gaps that treated H+1 as immediate modern PoS are
+closed: production phase is distinct from codec era; the scrypt corridor,
+difficulty/reward rules, Policy Output surface, mempool/miner dispatch, and
+marker-aware block production are implemented and covered by transition and
+evolution tests. `hard_fork_height` retains its exact meaning as the first
+modern-family height H+1, while M = H+1001 selects modern PoS production.
+Mainnet activation still fails closed until the seal-derived pins are set.
 
 ## 12. Decision status
 
@@ -381,20 +362,16 @@ derives from the corridor-exit block).
 
 **RULED 2026-08-23 in addition:** corridor PACING — minimum spacing 60 s and future bound 120 s (§6.1).
 
-**STILL OPEN:** the modern-PoS sentinel-bits and future-drift values
-(provisional); corridor reorg-depth bounds and other §7 mitigations;
-modern reward schedule
-(OD-2). Ratified 2026-08-21 in addition: minimum stake 333 modern B3
-(kB3) and the modern horizon D = 1440.
+**Later resolution:** Modern-PoS sentinel bits, future drift, horizon, stake,
+and reward rules are governed by the reviewed Modern-PoS specification and
+`FINALIZED.md`; they are not open corridor choices.
 
 ## 13. Destination unchanged
 
-After modern PoS: asset registry → bridge → TEST_USDT → FlowMesh → spot DEX
-→ USDT/USDC fees → futures (only "supported, max leverage 10×" is locked;
-margin mode, funding, liquidation and every other mechanic are OPEN owner
-decisions) → microblocks → real bridges → FN system. (This roadmap line
-originally read "isolated leverage ≤10× → PnL/liquidation → deterministic
-epochs"; corrected 2026-08-20 per the Codex directive — no futures
-mechanics beyond the 10× cap are approved, and microblocks, not epochs,
-are the execution unit.) The corridor must not couple to or redesign any
-of these.
+After modern PoS: A1 activates modern FN PoD; A2 activates simple assets plus
+FlowMesh seat/vault preparation; A3 activates FlowMesh spot trading and
+microblocks after the preparation runway. Bridge-backed bUSD remains
+independently fail-closed until every proof/readiness pin passes. The later
+FlowMesh release expands the working spot product; futures follow spot, with
+only support and the 10× maximum currently locked. The corridor must not couple
+to or redesign any of these.

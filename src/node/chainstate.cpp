@@ -7,6 +7,7 @@
 #include <arith_uint256.h>
 #include <chain.h>
 #include <coins.h>
+#include <consensus/era.h>
 #include <consensus/params.h>
 #include <kernel/caches.h>
 #include <node/blockstorage.h>
@@ -42,6 +43,15 @@ static ChainstateLoadResult CompleteChainstateInitialization(
     // Note that it also sets m_blockfiles_indexed based on the disk flag!
     if (!chainman.LoadBlockIndex()) {
         if (chainman.m_interrupt) return {ChainstateLoadStatus::INTERRUPTED, {}};
+        // The transition release persists additional B3 block-index fields.
+        // Current transition-beta databases already use this layout and are
+        // compatible. Much older legacy or otherwise incompatible unversioned
+        // records cannot be decoded safely; rebuilding the index from the
+        // original block files is the correct recovery.
+        if (chainman.GetConsensus().legacy_b3coin) {
+            return {ChainstateLoadStatus::FAILURE,
+                    _("Error loading the B3 block database. Current transition-beta databases do not require a reindex solely for this update. If this data directory was created by a much older legacy or incompatible release, restart with -reindex to rebuild the block index; otherwise check the disk and block files for corruption.")};
+        }
         return {ChainstateLoadStatus::FAILURE, _("Error loading block database")};
     }
 
@@ -245,18 +255,105 @@ ChainstateLoadResult VerifyLoadedChainstate(ChainstateManager& chainman, const C
 
     LOCK(cs_main);
 
+    // beta.2's normal network admission checked post-H block bodies, but its
+    // -reindex-chainstate path did not repeat every deterministic contextual
+    // rule in ConnectBlock. An existing beta database can therefore be used
+    // without a full reindex only after one level-4 disconnect/reconnect pass
+    // over every post-H block under the repaired ConnectBlock implementation.
+    //
+    // The versioned marker belongs to each coins database and records its exact
+    // best-block hash. Once enabled, BatchWrite advances marker and
+    // DB_BEST_BLOCK atomically. An older binary does not know that key, so
+    // advancing or rebuilding the chainstate makes the marker stale and forces
+    // this check again after returning to patched software. Fresh/pre-H or
+    // freshly wiped chainstates are safe to mark because no old post-H state
+    // remains and every future connection uses this implementation.
+    const std::optional<int> legacy_final_height{
+        Consensus::LegacyFinalHeight(chainman.GetConsensus())};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    std::vector<CCoinsViewDB*> schema_dbs_to_mark;
+
     for (auto& chainstate : chainman.m_chainstates) {
+        const CBlockIndex* tip{chainstate->m_chain.Tip()};
+
+        // Check every configured modern checkpoint against the loaded active
+        // chain on every startup. This is deliberately independent of the
+        // validation-schema marker: that marker can have been written by a
+        // release which predates a newly hardened checkpoint, so it cannot
+        // attest the identity of an already-connected ancestor.
+        if (tip) {
+            for (const auto& [checkpoint_height, checkpoint_hash] :
+                 consensus.modern_checkpoints) {
+                if (checkpoint_height < 0) {
+                    return {ChainstateLoadStatus::FAILURE,
+                            strprintf(_("The B3 release contains an invalid hardened modern checkpoint height %d. Startup stopped before using the chainstate; install a corrected release before continuing."),
+                                      checkpoint_height)};
+                }
+                if (checkpoint_height > tip->nHeight) break;
+                if (Consensus::GetB3Era(checkpoint_height, consensus) !=
+                    Consensus::B3Era::MODERN) {
+                    continue;
+                }
+
+                const CBlockIndex* active_checkpoint{
+                    chainstate->m_chain[checkpoint_height]};
+                if (!active_checkpoint ||
+                    active_checkpoint->GetBlockHash() != checkpoint_hash) {
+                    return {ChainstateLoadStatus::FAILURE,
+                            strprintf(_("The active B3 chain does not match the hardened modern checkpoint at height %d. Startup stopped before using this chainstate. Restart with -reindex-chainstate to rebuild against the pinned chain; if the canonical block is not available locally, restart with -reindex to rebuild and download the block history."),
+                                      checkpoint_height)};
+                }
+            }
+        }
+
+        const bool off_anchor_tip{
+            tip && chainman.m_blockman.IsAnchorIneligible(*tip)};
+        bool needs_schema_check{
+            legacy_final_height &&
+            !chainstate->CoinsDB().B3ValidationSchemaV1Current()};
+        if (legacy_final_height && off_anchor_tip) {
+            // A marker may legitimately predate the X pin (for example, a
+            // height-only pause release verified the then-active competing H
+            // block). Do not let undo/reconnect atomically carry that old
+            // marker onto the canonical branch. Revoke it synchronously
+            // before recovery; only a later canonical level-4 pass may restore
+            // it.
+            bool marker_cleared{false};
+            try {
+                marker_cleared =
+                    chainstate->CoinsDB().ClearB3ValidationSchemaV1();
+            } catch (const dbwrapper_error& error) {
+                LogError("Unable to revoke B3 validation-schema marker before off-anchor recovery: %s\n",
+                         error.what());
+            }
+            if (!marker_cleared) {
+                return {ChainstateLoadStatus::FAILURE,
+                        _("The active chain lies off the finalized B3 anchor, but its old validation marker could not be revoked safely. Startup stopped before recovery; check the disk and chainstate database permissions.")};
+            }
+            needs_schema_check = true;
+        }
+        const bool defer_schema_for_off_anchor_tip{
+            needs_schema_check && off_anchor_tip};
         if (!is_coinsview_empty(*chainstate)) {
-            const CBlockIndex* tip = chainstate->m_chain.Tip();
             if (tip && tip->nTime > GetTime() + MAX_FUTURE_BLOCK_TIME) {
                 return {ChainstateLoadStatus::FAILURE, _("The block database contains a block which appears to be from the future. "
                                                          "This may be due to your computer's date and time being set incorrectly. "
                                                          "Only rebuild the block database if you are sure that your computer's date and time are correct")};
             }
 
+            // A pre-pin active branch may contain legacy-codec blocks above
+            // the newly pinned boundary. Levels 0-3 still prove that its block
+            // and undo data can be read and disconnected. Level 4 would try
+            // to reconnect history which is now deliberately ineligible and
+            // prevent ActivateBestChain() from reaching the recovery path.
+            // Never relax verification for an on-anchor tip.
+            const int64_t ordinary_check_level{
+                off_anchor_tip
+                    ? std::min<int64_t>(options.check_level, 3)
+                    : options.check_level};
             VerifyDBResult result = CVerifyDB(chainman.GetNotifications()).VerifyDB(
                 *chainstate, chainman.GetConsensus(), chainstate->CoinsDB(),
-                options.check_level,
+                ordinary_check_level,
                 options.check_blocks);
             switch (result) {
             case VerifyDBResult::SUCCESS:
@@ -272,7 +369,76 @@ ChainstateLoadResult VerifyLoadedChainstate(ChainstateManager& chainman, const C
                 }
                 break;
             } // no default case, so the compiler can warn about missing cases
+
+            if (needs_schema_check && !defer_schema_for_off_anchor_tip && tip &&
+                tip->nHeight > *legacy_final_height) {
+                const int post_h_blocks{tip->nHeight - *legacy_final_height};
+                const CBlockIndex* first_post_h{
+                    chainstate->m_chain[*legacy_final_height + 1]};
+                assert(first_post_h != nullptr);
+                if (!chainman.m_blockman.CheckBlockDataAvailability(
+                        *tip, *first_post_h)) {
+                    return {ChainstateLoadStatus::FAILURE,
+                            strprintf(_("The mandatory B3 post-transition validation cannot read every block from height %d through the current tip. This node cannot safely use the existing chainstate. Restart with -reindex to restore and validate the complete block history (pruned nodes must redownload the missing data)."),
+                                      *legacy_final_height + 1)};
+                }
+                LogInfo("Running mandatory one-time B3 post-H validation-schema check over %d blocks", post_h_blocks);
+                const VerifyDBResult schema_result{
+                    CVerifyDB(chainman.GetNotifications())
+                        .VerifyDB(*chainstate, chainman.GetConsensus(),
+                                  chainstate->CoinsDB(),
+                                  /*nCheckLevel=*/4,
+                                  /*nCheckDepth=*/post_h_blocks)};
+                switch (schema_result) {
+                case VerifyDBResult::SUCCESS:
+                    break;
+                case VerifyDBResult::INTERRUPTED:
+                    return {ChainstateLoadStatus::INTERRUPTED,
+                            _("The mandatory B3 post-transition validation was interrupted. The database was not marked as verified.")};
+                case VerifyDBResult::SKIPPED_MISSING_BLOCKS:
+                    return {ChainstateLoadStatus::FAILURE,
+                            _("The mandatory B3 post-transition validation could not read every post-H block. This node cannot safely use the existing chainstate. Restart with -reindex to restore and validate the complete block history (pruned nodes must redownload the missing data).")};
+                case VerifyDBResult::CORRUPTED_BLOCK_DB:
+                    return {ChainstateLoadStatus::FAILURE,
+                            _("The existing B3 post-transition chainstate failed validation under the repaired consensus rules. The database was not marked as verified. Inspect debug.log for the exact block and reject reason. Reindexing can repair local database, undo, or block-file corruption, but it cannot make a block which reproducibly violates consensus valid; in that case stop and verify the release and chain before proceeding.")};
+                case VerifyDBResult::SKIPPED_L3_CHECKS:
+                    return {ChainstateLoadStatus::FAILURE_INSUFFICIENT_DBCACHE,
+                            _("Insufficient dbcache for the mandatory one-time B3 post-transition validation. Increase -dbcache and restart, or rebuild the chainstate with -reindex-chainstate.")};
+                } // no default case, so the compiler can warn about missing cases
+            }
         }
+        if (defer_schema_for_off_anchor_tip) {
+            // A pre-pin database may still have an old branch active when X
+            // first becomes known. That branch must reach
+            // ActivateBestChain(), whose first action is the existing
+            // undo-backed AbandonOffAnchorTip() recovery. Reconnecting it
+            // under the now-pinned boundary would reject it before that safe
+            // unwind can run. Do not grant the schema marker either: after
+            // recovery the canonical chain is checked and marked on the next
+            // startup (or an explicit verification pass).
+            LogWarning("Deferring B3 validation-schema marker for off-anchor active tip %s at height %d until the canonical branch is active\n",
+                       tip->GetBlockHash().ToString(), tip->nHeight);
+        } else if (needs_schema_check) {
+            schema_dbs_to_mark.push_back(&chainstate->CoinsDB());
+        }
+    }
+
+    // Delay all marker writes until every chainstate has passed. Each marker
+    // is synchronously read back; subsequent tip changes keep it atomic with
+    // that chainstate's DB_BEST_BLOCK.
+    for (CCoinsViewDB* coins_db : schema_dbs_to_mark) {
+        bool marker_stored{false};
+        try {
+            marker_stored = coins_db->MarkB3ValidationSchemaV1Current();
+        } catch (const dbwrapper_error& error) {
+            LogError("Unable to store B3 validation-schema marker: %s\n",
+                     error.what());
+        }
+        if (!marker_stored) {
+            return {ChainstateLoadStatus::FAILURE,
+                    _("The B3 post-transition validation succeeded, but its database marker could not be stored safely. Startup was stopped; check the disk and database permissions before retrying.")};
+        }
+        LogInfo("B3 post-H validation schema v1 is verified for one chainstate");
     }
 
     return {ChainstateLoadStatus::SUCCESS, {}};

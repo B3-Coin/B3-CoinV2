@@ -10,9 +10,8 @@
 #include <span>
 #include <vector>
 
-/** Strict RLP (Recursive Length Prefix) decoding for the Ethereum bridge
- *  mint leg (bridge proposal stage 2; test-only/header-only per the staged
- *  build order — nothing here is reachable from consensus).
+/** Strict RLP (Recursive Length Prefix) decoding for the gated type-10
+ *  Ethereum bridge mint and execution-backfill paths.
  *
  *  The decoder is CANONICAL-STRICT: any encoding a conforming Ethereum
  *  encoder would never emit (non-minimal length-of-length, a long form

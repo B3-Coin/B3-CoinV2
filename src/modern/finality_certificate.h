@@ -38,6 +38,8 @@ namespace modern {
  *   - bitmap well-formed for exactly n (width, zero high bits);
  *   - FinalizedBlock.validator_set_hash == hash(Set_{epoch+1}) (wrong set);
  *   - signed weight = sum of weights of set bits >= quorum_weight;
+ *   - signer count >= floor(2*n/3)+1, matching the Ethereum bridge prover so
+ *     every consensus-valid certificate remains permissionlessly relayable;
  *   - FastAggregateVerify over the signers' keys of the digest under the
  *     chain domain (wrong domain / wrong signers / bad signature all fail);
  *   - an empty signer set, an infinity aggregate, a duplicate "signer" (a bit
@@ -50,8 +52,8 @@ namespace modern {
  * mismatch are invalid. Wired into block validation from plan Commit 12:
  * node::FinalityTracker judges the certificate against the epoch state
  * derived from the chain (modern/finality_schedule.h rules) in ConnectBlock.
- * Type 4 is ACTIVE only under the test MPA context; production stays
- * fail-closed until the F = M activation plumbing commit.
+ * Type 4 is active when the complete Modern PoS object rules are configured;
+ * mainnet pins F = M, while unconfigured networks remain fail-closed.
  */
 
 //! The verifier's view of the signing validator set (built from a snapshot).
@@ -68,6 +70,7 @@ enum class CertificateCheck {
     WRONG_SUCCESSOR_SET,     //!< FinalizedBlock.validator_set_hash != expected hash(Set_{epoch+1})
     NO_SIGNERS,              //!< empty bitmap
     INSUFFICIENT_WEIGHT,     //!< signed weight < quorum
+    INSUFFICIENT_HEADCOUNT,  //!< fewer than floor(2*n/3)+1 validators signed
     BAD_SIGNATURE,           //!< aggregate signature does not verify (wrong domain, wrong signers, tampered)
     SET_VIEW_INCONSISTENT,   //!< keys/weights sizes != n (programming error, fail closed)
 };
@@ -80,6 +83,7 @@ inline const char* CertificateCheckName(const CertificateCheck c)
     case CertificateCheck::WRONG_SUCCESSOR_SET: return "wrong-successor-set";
     case CertificateCheck::NO_SIGNERS: return "no-signers";
     case CertificateCheck::INSUFFICIENT_WEIGHT: return "insufficient-weight";
+    case CertificateCheck::INSUFFICIENT_HEADCOUNT: return "insufficient-headcount";
     case CertificateCheck::BAD_SIGNATURE: return "bad-signature";
     case CertificateCheck::SET_VIEW_INCONSISTENT: return "set-view-inconsistent";
     }
@@ -94,6 +98,13 @@ inline uint64_t SignedWeight(std::span<const unsigned char> bitmap, const Valida
         if (SignerBit(bitmap, i)) w += set.weights[i];
     }
     return w;
+}
+
+//! Dual-quorum signer threshold shared with the immutable Ethereum prover.
+inline uint32_t FinalityHeadcountQuorum(const uint32_t validator_count)
+{
+    return static_cast<uint32_t>((static_cast<uint64_t>(validator_count) * 2) /
+                                 3 + 1);
 }
 
 /**
@@ -118,6 +129,9 @@ inline CertificateCheck VerifyFinalityCertificate(const uint256& chain_domain, c
     }
     if (signers.empty()) return CertificateCheck::NO_SIGNERS;
     if (signed_weight < set.quorum_weight) return CertificateCheck::INSUFFICIENT_WEIGHT;
+    if (signers.size() < FinalityHeadcountQuorum(set.validator_count)) {
+        return CertificateCheck::INSUFFICIENT_HEADCOUNT;
+    }
     const auto sig{bls::Signature::Decode(cert.aggregate_sig)};
     if (!sig) return CertificateCheck::BAD_SIGNATURE;
     const uint256 digest{FinalityDigest(chain_domain, fb)};

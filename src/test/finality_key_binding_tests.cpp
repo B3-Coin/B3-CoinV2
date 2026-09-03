@@ -260,15 +260,19 @@ BOOST_FIXTURE_TEST_CASE(txid_unchanged_and_production_fail_closed, BindingFixtur
     const auto e2{MakeBinding(m_validator_a, m_vk_a, &k1, 0)};
     // Same base transaction, different evidence bytes (a second signature with the
     // same inputs is identical under BIP340 with zero aux... so perturb the PoP
-    // by using another key's PoP): txid identical.
+    // by using another key's PoP): txid stays stable, while the full relay
+    // identities commit to the changed MPA payload.
     CMutableTransaction ta{MakeTx(0, {e1.cell}, {e1.record})};
     CMutableTransaction tb{MakeTx(0, {e2.cell}, {e2.record})};
     FinalityKeyEvidence ev{*FinalityKeyEvidence::Decode(tb.mpa[0].payload)};
     ev.pop = k2.SignPoP().Compressed();
     const auto enc{ev.Encode()};
     tb.mpa[0].payload.assign(enc.begin(), enc.end());
-    BOOST_CHECK(CTransaction{ta}.GetHash() == CTransaction{tb}.GetHash());
-    BOOST_CHECK(CTransaction{ta}.GetWitnessHash() == CTransaction{tb}.GetWitnessHash());
+    const CTransaction tx_a{ta};
+    const CTransaction tx_b{tb};
+    BOOST_CHECK(tx_a.GetHash() == tx_b.GetHash());
+    BOOST_CHECK(tx_a.GetWitnessHash() != tx_b.GetWitnessHash());
+    BOOST_CHECK(!(tx_a.GetPtxid() == tx_b.GetPtxid()));
     BOOST_CHECK(!(ta.mpa == tb.mpa));
     // Production: the same block shape is refused while the X-pin
     // configuration is incomplete (the F = M activation predicate is off).
@@ -278,8 +282,12 @@ BOOST_FIXTURE_TEST_CASE(txid_unchanged_and_production_fail_closed, BindingFixtur
     BOOST_CHECK(!SubmitCorridor({ta}, 61));
     MutableConsensus().modern_pos = saved_pos;
     BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H);
-    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::REGTEST}) {
-        const auto& c{CreateChainParams(ArgsManager{}, chain)->GetConsensus()};
+    BOOST_CHECK(Consensus::ModernObjectRulesActive(
+        CreateChainParams(ArgsManager{}, ChainType::MAIN)->GetConsensus()));
+    for (const auto chain : {ChainType::TESTNET, ChainType::TESTNET4,
+                             ChainType::SIGNET, ChainType::REGTEST}) {
+        const auto chain_params{CreateChainParams(ArgsManager{}, chain)};
+        const auto& c{chain_params->GetConsensus()};
         BOOST_CHECK(!Consensus::ModernObjectRulesActive(c));
     }
     // Legacy era: a legacy block cannot carry an MPA at all (codec), and the

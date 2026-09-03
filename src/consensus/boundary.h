@@ -42,6 +42,22 @@ inline BoundaryCheck CheckLegacyBoundaryHeader(const CBlockHeader& header, const
     return BoundaryCheck::OK;
 }
 
+/**
+ * Return whether a post-legacy block has the exact identity pinned for its
+ * height. This table is intentionally separate from legacy checkpoints: it
+ * uses the modern block identity supplied by the caller and never applies to
+ * an attested legacy height.
+ */
+inline bool ModernCheckpointAllows(const Params& params, const int height,
+                                   const uint256& block_hash)
+{
+    if (GetB3Era(height, params) != B3Era::MODERN) return true;
+
+    const auto checkpoint{params.modern_checkpoints.find(height)};
+    return checkpoint == params.modern_checkpoints.end() ||
+           checkpoint->second == block_hash;
+}
+
 } // namespace Consensus
 
 #endif // B3COIN_CONSENSUS_BOUNDARY_H

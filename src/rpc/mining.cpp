@@ -10,6 +10,7 @@
 #include <chainparamsbase.h>
 #include <common/system.h>
 #include <consensus/amount.h>
+#include <consensus/block_codec.h>
 #include <consensus/consensus.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
@@ -33,6 +34,7 @@
 #include <script/descriptor.h>
 #include <script/script.h>
 #include <script/signingprovider.h>
+#include <streams.h>
 #include <txmempool.h>
 #include <univalue.h>
 #include <util/signalinterrupt.h>
@@ -480,7 +482,7 @@ static RPCHelpMan getmininginfo()
     if (BlockAssembler::m_last_block_num_txs) obj.pushKV("currentblocktx", *BlockAssembler::m_last_block_num_txs);
     obj.pushKV("bits", strprintf("%08x", tip.nBits));
     obj.pushKV("difficulty", GetDifficulty(tip));
-    obj.pushKV("target", GetTarget(tip, chainman.GetConsensus().powLimit).GetHex());
+    obj.pushKV("target", GetTarget(tip, chainman.GetConsensus()).GetHex());
     obj.pushKV("networkhashps",    getnetworkhashps().HandleRequest(request));
     obj.pushKV("pooledtx", mempool.size());
     BlockAssembler::Options assembler_options;
@@ -495,7 +497,7 @@ static RPCHelpMan getmininginfo()
     next.pushKV("height", next_index.nHeight);
     next.pushKV("bits", strprintf("%08x", next_index.nBits));
     next.pushKV("difficulty", GetDifficulty(next_index));
-    next.pushKV("target", GetTarget(next_index, chainman.GetConsensus().powLimit).GetHex());
+    next.pushKV("target", GetTarget(next_index, chainman.GetConsensus()).GetHex());
     obj.pushKV("next", next);
 
     if (chainman.GetParams().GetChainType() == ChainType::SIGNET) {
@@ -693,7 +695,17 @@ static RPCHelpMan getblocktemplate()
                 {
                     {RPCResult::Type::STR_HEX, "key", "values must be in the coinbase (keys may be ignored)"},
                 }},
-                {RPCResult::Type::NUM, "coinbasevalue", "maximum allowable input to coinbase transaction, including the generation award and transaction fees (in satoshis)"},
+                {RPCResult::Type::NUM, "coinbasevalue", "maximum allowable total coinbase output value, including the generation award and transaction fees (in satoshis)"},
+                {RPCResult::Type::NUM, "coinbasevalue_remaining", "value available to miner-controlled payout outputs after subtracting all non-zero coinbase_required_outputs"},
+                {RPCResult::Type::ARR, "coinbase_required_outputs", /*optional=*/true, "outputs which must be copied in this exact order after miner-controlled payout outputs",
+                {
+                    {RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::NUM, "value", "native value in satoshis; subtract this from miner-controlled payouts"},
+                        {RPCResult::Type::STR_HEX, "scriptPubKey", "exact output script"},
+                    }},
+                }},
+                {RPCResult::Type::STR_HEX, "coinbase_mpa", /*optional=*/true, "exact serialized coinbase Modern Payload Area section (CompactSize count plus records); preserve it under modern transaction flag 0x02"},
                 {RPCResult::Type::STR, "longpollid", "an id to include with a request to longpoll on an update to this template"},
                 {RPCResult::Type::STR, "target", "The hash target"},
                 {RPCResult::Type::NUM_TIME, "mintime", "The minimum timestamp appropriate for the next block time, expressed in " + UNIX_EPOCH_TIME + ". Adjusted for the proposed BIP94 timewarp rule."},
@@ -922,7 +934,18 @@ static RPCHelpMan getblocktemplate()
 
         UniValue entry(UniValue::VOBJ);
 
-        entry.pushKV("data", EncodeHexTx(tx));
+        if (consensusParams.legacy_b3coin &&
+            Consensus::HasB3BlockCodecV2(block.nVersion)) {
+            // Encode byte-for-byte as the marker-modern block body will. The
+            // generic RPC transaction encoder intentionally omits B3's MPA,
+            // which would make a reconstructed template disagree with the
+            // mandatory payload-root commitment.
+            DataStream modern_tx;
+            modern_tx << TX_MODERN(tx);
+            entry.pushKV("data", HexStr(modern_tx));
+        } else {
+            entry.pushKV("data", EncodeHexTx(tx));
+        }
         entry.pushKV("txid", txHash.GetHex());
         entry.pushKV("hash", tx.GetWitnessHash().GetHex());
 
@@ -1004,7 +1027,9 @@ static RPCHelpMan getblocktemplate()
     result.pushKV("previousblockhash", block.hashPrevBlock.GetHex());
     result.pushKV("transactions", std::move(transactions));
     result.pushKV("coinbaseaux", std::move(aux));
-    result.pushKV("coinbasevalue", block.vtx[0]->vout[0].nValue);
+    const node::CoinbaseTx coinbase_fields{block_template->getCoinbaseTx()};
+    result.pushKV("coinbasevalue", block.vtx[0]->GetValueOut());
+    result.pushKV("coinbasevalue_remaining", coinbase_fields.block_reward_remaining);
     result.pushKV("longpollid", tip.GetHex() + ToString(nTransactionsUpdatedLast));
     result.pushKV("target", hashTarget.GetHex());
     result.pushKV("mintime", GetMinimumTime(pindexPrev, consensusParams.DifficultyAdjustmentInterval()));
@@ -1031,9 +1056,23 @@ static RPCHelpMan getblocktemplate()
         result.pushKV("signet_challenge", HexStr(consensusParams.signet_challenge));
     }
 
-    if (auto coinbase{block_template->getCoinbaseTx()}; coinbase.required_outputs.size() > 0) {
-        CHECK_NONFATAL(coinbase.required_outputs.size() == 1); // Only one output is currently expected
-        result.pushKV("default_witness_commitment", HexStr(coinbase.required_outputs[0].scriptPubKey));
+    if (!coinbase_fields.required_outputs.empty()) {
+        UniValue required{UniValue::VARR};
+        for (const CTxOut& out : coinbase_fields.required_outputs) {
+            UniValue entry{UniValue::VOBJ};
+            entry.pushKV("value", out.nValue);
+            entry.pushKV("scriptPubKey", HexStr(out.scriptPubKey));
+            required.push_back(std::move(entry));
+        }
+        result.pushKV("coinbase_required_outputs", std::move(required));
+    }
+    if (!coinbase_fields.mpa_section.empty()) {
+        result.pushKV("coinbase_mpa", HexStr(coinbase_fields.mpa_section));
+    }
+    if (const int witness_index{GetWitnessCommitmentIndex(block)};
+        witness_index != NO_WITNESS_COMMITMENT) {
+        result.pushKV("default_witness_commitment",
+                      HexStr(block.vtx[0]->vout.at(witness_index).scriptPubKey));
     }
 
     return result;

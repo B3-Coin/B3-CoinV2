@@ -7,6 +7,7 @@
 
 #include <consensus/amount.h>
 #include <consensus/params.h>
+#include <modern/policy.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
 
@@ -43,8 +44,14 @@ namespace modern {
  * ANY push encoding — claims to be a STAKE output, and a claiming output
  * that violates any v1 constraint (non-minimal push encoding, missing
  * OP_DROP, missing owner script, zero validator key, non-zero reserved
- * bytes, amount below the configured minimum) is INVALID in a modern-era
- * block — never silently reinterpreted as an ordinary output. Outputs
+ * bytes, an unsupported P2SH/witness or nested B3-policy owner suffix, amount
+ * below the configured minimum) is INVALID in a modern-era block — never
+ * silently reinterpreted as an ordinary output. P2SH and witness are special
+ * only when they are the complete scriptPubKey; nested behind the carrier
+ * prefix they would not execute their intended authorization. A nested B3
+ * carrier could hide those same forms one layer deeper, so every B3 policy
+ * owner remains a single envelope.
+ * Outputs
  * whose first push has a different size or magic are ordinary outputs.
  *
  * CANONICAL ENCODING (corridor-final): the payload push must be the
@@ -168,6 +175,21 @@ inline std::optional<StakeOutputView> ParseStakeOutput(const CTxOut& out, std::s
             return std::nullopt;
         }
     }
+    int witness_version{0};
+    std::vector<unsigned char> witness_program;
+    if (view.owner_script.IsPayToScriptHash()) {
+        error = "stake owner script cannot be P2SH";
+        return std::nullopt;
+    }
+    if (view.owner_script.IsWitnessProgram(witness_version,
+                                           witness_program)) {
+        error = "stake owner script cannot be a witness program";
+        return std::nullopt;
+    }
+    if (ClaimsB3PolicyCarrier(view.owner_script)) {
+        error = "stake owner script cannot be another B3 policy carrier";
+        return std::nullopt;
+    }
     return view;
 }
 
@@ -178,11 +200,10 @@ inline std::optional<StakeOutputView> ParseStakeOutput(const CTxOut& out, std::s
  * consensus prefix is dropped before the owner script executes, so for
  * ownership, standardness and signing the output IS its owner script, and
  * the signature's scriptCode is still the full scriptPubKey (the
- * interpreter runs the whole thing). Only a bare suffix is solvable this
- * way -- a P2SH pattern or a witness program inside the carrier is NOT
- * special-cased by the interpreter and would be anyone-can-spend, so such
- * claims are deliberately reported as unsolvable (consensus still judges
- * them as STAKE outputs; this is a wallet/policy predicate only).
+ * interpreter runs the whole thing). Only a bare suffix is valid this way --
+ * a P2SH pattern or witness program inside the carrier is NOT special-cased
+ * by the interpreter and would fail to enforce its intended authorization,
+ * so ParseStakeOutput and consensus reject it.
  */
 inline std::optional<CScript> StakeOwnerScript(const CScript& script)
 {
@@ -190,12 +211,6 @@ inline std::optional<CScript> StakeOwnerScript(const CScript& script)
     std::string error;
     const auto view{ParseStakeOutput(CTxOut{1, script}, error)};
     if (!view) return std::nullopt;
-    int witness_version{0};
-    std::vector<unsigned char> witness_program;
-    if (view->owner_script.empty() || view->owner_script.IsPayToScriptHash() ||
-        view->owner_script.IsWitnessProgram(witness_version, witness_program)) {
-        return std::nullopt;
-    }
     return view->owner_script;
 }
 

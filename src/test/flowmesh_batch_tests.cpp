@@ -23,6 +23,8 @@
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <array>
+#include <map>
 #include <random>
 #include <set>
 #include <vector>
@@ -41,6 +43,7 @@ const uint256 VAULT{uint256{"000000000000000000000000000000000000000000000000000
 const flowmesh::AccountId ALICE{uint256{"00000000000000000000000000000000000000000000000000000000000000a1"}};
 const flowmesh::AccountId BOB{uint256{"00000000000000000000000000000000000000000000000000000000000000b1"}};
 const uint256 DEST{uint256{"00000000000000000000000000000000000000000000000000000000000000d1"}};
+const flowmesh::AnchorRef A2_ANCHOR{130, uint256::ONE};
 
 modern::AssetId BaseX()
 {
@@ -89,6 +92,39 @@ Action Withdraw(const flowmesh::AccountId& signer, uint64_t seq, const modern::A
     return a;
 }
 
+std::array<unsigned char, bls::PUBKEY_SIZE> BlsKey(const unsigned char id)
+{
+    std::array<unsigned char, 32> ikm{};
+    for (size_t i{0}; i < ikm.size(); ++i) ikm[i] = id + i + 1;
+    const auto secret{bls::SecretKey::FromIKM(ikm)};
+    BOOST_REQUIRE(secret.has_value());
+    return secret->GetPublicKey().Compressed();
+}
+
+flowmesh::FlowMeshFeeContext FeeContext()
+{
+    flowmesh::FlowMeshFeeContext fees;
+    fees.market_id = uint256::ONE;
+    fees.epoch = 7;
+    fees.treasury_owner_commitment = DEST;
+    for (unsigned char i{1}; i <= 4; ++i) {
+        flowmesh::FlowMeshFeeSeat seat;
+        seat.seat_id = uint256{i};
+        seat.bls_pubkey = BlsKey(i);
+        fees.seats.push_back(seat);
+    }
+    BOOST_REQUIRE(flowmesh::FlowMeshFeeContextIsCanonical(fees));
+    return fees;
+}
+
+std::vector<Action> FeeBearingTrade()
+{
+    return {
+        Bid(ALICE, 0, Pts({{1'000, 100}, {1'001, 0}})),
+        Ask(BOB, 0, Pts({{1'000, 100}})),
+    };
+}
+
 //! Test funding shortcut over the test-only bridge.
 inline bool Fund(flowmesh::FlowMeshState& state, const flowmesh::AccountId& account,
                  const modern::AssetId& asset, const CAmount amount)
@@ -96,10 +132,42 @@ inline bool Fund(flowmesh::FlowMeshState& state, const flowmesh::AccountId& acco
     return flowmesh::test_only::StateFunding::Fund(state, account, asset, amount);
 }
 
+class TestChainFacts final : public flowmesh::DepositVerifier
+{
+public:
+    std::optional<flowmesh::DepositInfo> GetDeposit(
+        const COutPoint&, const flowmesh::AnchorRef&) const override
+    {
+        return std::nullopt;
+    }
+
+    std::optional<CAmount> GetWithdrawalCapacity(
+        const modern::AssetId& asset,
+        const flowmesh::AnchorRef&) const override
+    {
+        ++capacity_calls[asset];
+        const auto it{capacities.find(asset)};
+        return it == capacities.end() ? default_capacity : it->second;
+    }
+
+    std::optional<std::vector<flowmesh::WithdrawalSettlementFactV1>>
+    GetWithdrawalSettlements(
+        const std::optional<flowmesh::AnchorRef>&,
+        const flowmesh::AnchorRef&) const override
+    {
+        return std::vector<flowmesh::WithdrawalSettlementFactV1>{};
+    }
+
+    std::optional<CAmount> default_capacity{MAX_MONEY};
+    std::map<modern::AssetId, std::optional<CAmount>> capacities;
+    mutable std::map<modern::AssetId, size_t> capacity_calls;
+};
+
 struct Fixture {
     flowmesh::FlowMeshState state{VAULT, BaseX(), Quote()};
     const flowmesh::Ledger& ledger{state.LedgerView()};
-    flowmesh::BatchExecutor exec{state};
+    TestChainFacts chain_facts;
+    flowmesh::BatchExecutor exec{state, &chain_facts};
     Fixture()
     {
         Fund(state, ALICE, Quote(), 2400); // covers the standard bid's 2300 bound
@@ -201,14 +269,15 @@ BOOST_AUTO_TEST_CASE(withdrawals_create_one_time_receipts_committed_by_root)
         Withdraw(ALICE, 1, Quote(), 200, DEST)})};
 
     BOOST_REQUIRE_EQUAL(result.withdrawal_requests.size(), 2U);
-    // Request ids are unique and one-time; these are REQUESTS, not
-    // redeemable receipts (B3 authorization is an owner decision).
+    // Request ids are unique and one-time. They become spend-authorizing only
+    // through the connected type-8 checkpoint and type-9 proof path.
     BOOST_CHECK(result.withdrawal_requests[0].receipt_id != result.withdrawal_requests[1].receipt_id);
     for (const auto& receipt : result.withdrawal_requests) {
         BOOST_CHECK(f.ledger.GetRequest(receipt.receipt_id).has_value());
         BOOST_CHECK(receipt.vault_commitment == VAULT);
     }
     BOOST_CHECK_EQUAL(f.exec.NextSequence(ALICE), 2);
+    BOOST_CHECK_EQUAL(f.chain_facts.capacity_calls[Quote()], 1U);
 
     // The receipt root commits to exactly these receipts; a slot with no
     // withdrawals has a different (empty) receipt root.
@@ -219,6 +288,180 @@ BOOST_AUTO_TEST_CASE(withdrawals_create_one_time_receipts_committed_by_root)
 
     // Solvency is preserved across the batch.
     BOOST_CHECK(f.ledger.SolvencyHolds());
+}
+
+BOOST_AUTO_TEST_CASE(withdrawal_capacity_rejects_before_debit)
+{
+    Fixture f;
+    f.chain_facts.capacities[Quote()] = 64;
+    const CAmount before{f.ledger.Available(ALICE, Quote())};
+    const auto result{
+        *f.exec.ExecuteSlot({Withdraw(ALICE, 0, Quote(), 65, DEST)})};
+    BOOST_REQUIRE_EQUAL(result.rejected.size(), 1U);
+    BOOST_CHECK(result.withdrawal_requests.empty());
+    BOOST_CHECK_EQUAL(f.ledger.Available(ALICE, Quote()), before);
+    BOOST_CHECK_EQUAL(f.ledger.PendingWithdrawals(Quote()), 0);
+    BOOST_CHECK_EQUAL(f.chain_facts.capacity_calls[Quote()], 1U);
+}
+
+BOOST_AUTO_TEST_CASE(treasury_fee_defers_at_a3_until_anchored_capacity_exists)
+{
+    flowmesh::FlowMeshState state{VAULT, BaseX(), Quote()};
+    const flowmesh::Ledger& ledger{state.LedgerView()};
+    TestChainFacts chain_facts;
+    chain_facts.capacities[Quote()] = 0;
+    const flowmesh::FlowMeshFeeContext fees{FeeContext()};
+    const flowmesh::AccountId treasury{
+        flowmesh::FlowMeshTreasuryFeeAccount(fees)};
+    flowmesh::BatchExecutor exec{state, &chain_facts, &fees};
+    BOOST_REQUIRE(Fund(state, ALICE, Quote(), 100'000));
+    BOOST_REQUIRE(Fund(state, BOB, BaseX(), 100));
+
+    // The first A3 slot still anchors into A2. With no anchored pool-change
+    // output, trading and fee allocation succeed while the treasury receipt
+    // is safely deferred in its fixed internal account.
+    const auto first{exec.ExecuteSlot(FeeBearingTrade(), A2_ANCHOR)};
+    BOOST_REQUIRE(first.has_value());
+    BOOST_REQUIRE(first->clearing.cleared);
+    BOOST_CHECK_EQUAL(first->clearing.fees.treasury_fee, 2);
+    BOOST_CHECK(first->withdrawal_requests.empty());
+    BOOST_CHECK_EQUAL(ledger.Available(treasury, Quote()), 2);
+    BOOST_CHECK_EQUAL(ledger.PendingWithdrawals(Quote()), 0);
+    BOOST_CHECK_EQUAL(chain_facts.capacity_calls[Quote()], 1U);
+    BOOST_CHECK(ledger.SolvencyHolds());
+
+    // Once capacity appears, the next ordinary slot emits exactly one receipt
+    // for the complete accrued balance. A separate user withdrawal proves
+    // retry is not tied to another fee-bearing trade.
+    chain_facts.capacities[Quote()] = 2;
+    const auto second{exec.ExecuteSlot(
+        {Withdraw(ALICE, 1, BaseX(), 1, DEST)}, A2_ANCHOR)};
+    BOOST_REQUIRE(second.has_value());
+    BOOST_REQUIRE_EQUAL(second->withdrawal_requests.size(), 2U);
+    const auto treasury_request{std::find_if(
+        second->account_withdrawal_requests.begin(),
+        second->account_withdrawal_requests.end(), [&](const auto& request) {
+            return request.account == treasury;
+        })};
+    BOOST_REQUIRE(treasury_request !=
+                  second->account_withdrawal_requests.end());
+    BOOST_CHECK_EQUAL(treasury_request->request.amount, 2);
+    BOOST_CHECK(treasury_request->request.asset == Quote());
+    BOOST_CHECK(treasury_request->request.destination == DEST);
+    BOOST_CHECK_EQUAL(ledger.Available(treasury, Quote()), 0);
+    BOOST_CHECK_EQUAL(ledger.PendingWithdrawals(Quote()), 2);
+    BOOST_CHECK_EQUAL(chain_facts.capacity_calls[Quote()], 2U);
+
+    // Later slots cannot debit the already-empty treasury account or create a
+    // duplicate receipt while the first one remains pending.
+    const auto third{exec.ExecuteSlot({}, A2_ANCHOR)};
+    BOOST_REQUIRE(third.has_value());
+    BOOST_CHECK(third->withdrawal_requests.empty());
+    BOOST_CHECK_EQUAL(ledger.Available(treasury, Quote()), 0);
+    BOOST_CHECK_EQUAL(ledger.PendingWithdrawals(Quote()), 2);
+    BOOST_CHECK_EQUAL(chain_facts.capacity_calls[Quote()], 2U);
+    BOOST_CHECK(ledger.SolvencyHolds());
+}
+
+BOOST_AUTO_TEST_CASE(treasury_fee_with_immediate_capacity_still_emits_once)
+{
+    flowmesh::FlowMeshState state{VAULT, BaseX(), Quote()};
+    const flowmesh::Ledger& ledger{state.LedgerView()};
+    TestChainFacts chain_facts;
+    chain_facts.capacities[Quote()] = MAX_MONEY;
+    const flowmesh::FlowMeshFeeContext fees{FeeContext()};
+    const flowmesh::AccountId treasury{
+        flowmesh::FlowMeshTreasuryFeeAccount(fees)};
+    flowmesh::BatchExecutor exec{state, &chain_facts, &fees};
+    BOOST_REQUIRE(Fund(state, ALICE, Quote(), 100'000));
+    BOOST_REQUIRE(Fund(state, BOB, BaseX(), 100));
+
+    const auto result{exec.ExecuteSlot(FeeBearingTrade(), A2_ANCHOR)};
+    BOOST_REQUIRE(result.has_value());
+    BOOST_REQUIRE_EQUAL(result->withdrawal_requests.size(), 1U);
+    BOOST_REQUIRE_EQUAL(result->account_withdrawal_requests.size(), 1U);
+    BOOST_CHECK(result->account_withdrawal_requests[0].account == treasury);
+    BOOST_CHECK_EQUAL(result->withdrawal_requests[0].amount, 2);
+    BOOST_CHECK(result->withdrawal_requests[0].destination == DEST);
+    BOOST_CHECK_EQUAL(ledger.Available(treasury, Quote()), 0);
+    BOOST_CHECK_EQUAL(ledger.PendingWithdrawals(Quote()), 2);
+    BOOST_CHECK_EQUAL(chain_facts.capacity_calls[Quote()], 1U);
+    BOOST_CHECK(ledger.SolvencyHolds());
+}
+
+BOOST_AUTO_TEST_CASE(fragmented_treasury_capacity_flushes_maximal_then_remainder)
+{
+    flowmesh::FlowMeshState state{VAULT, BaseX(), Quote()};
+    const flowmesh::Ledger& ledger{state.LedgerView()};
+    TestChainFacts chain_facts;
+    chain_facts.capacities[Quote()] = 64;
+    const flowmesh::FlowMeshFeeContext fees{FeeContext()};
+    const flowmesh::AccountId treasury{
+        flowmesh::FlowMeshTreasuryFeeAccount(fees)};
+    flowmesh::BatchExecutor exec{state, &chain_facts, &fees};
+    BOOST_REQUIRE(Fund(state, treasury, Quote(), 65));
+
+    // Model 65 one-unit pool outputs. The first slot emits the maximal safe
+    // receipt (top-64 capacity), leaving one unit available rather than
+    // permanently waiting for capacity 65 that fragmentation cannot expose.
+    const auto first{exec.ExecuteSlot({}, A2_ANCHOR)};
+    BOOST_REQUIRE(first.has_value());
+    BOOST_REQUIRE_EQUAL(first->withdrawal_requests.size(), 1U);
+    const modern::WithdrawalReceipt first_request{
+        first->withdrawal_requests.front()};
+    BOOST_CHECK_EQUAL(first_request.amount, 64);
+    BOOST_CHECK_EQUAL(ledger.Available(treasury, Quote()), 1);
+    BOOST_CHECK_EQUAL(ledger.PendingWithdrawals(Quote()), 64);
+
+    flowmesh::WithdrawalSettlementFactV1 settlement;
+    settlement.receipt.receipt_id = first_request.receipt_id;
+    settlement.receipt.market_id = fees.market_id;
+    settlement.receipt.epoch = fees.epoch;
+    settlement.receipt.sequence = 0;
+    settlement.receipt.account = treasury;
+    settlement.receipt.asset = Quote();
+    settlement.receipt.amount = first_request.amount;
+    settlement.receipt.destination_owner_commitment = DEST;
+    settlement.receipt.vault_id = VAULT;
+    settlement.receipt.deterministic_change_shard = 1;
+    settlement.checkpoint_id = uint256::ONE;
+    settlement.transaction_id = Txid::FromUint256(ALICE);
+    settlement.connected_height = 131;
+    settlement.connected_block = BOB;
+    const std::vector<flowmesh::WithdrawalSettlementFactV1> settlements{
+        settlement};
+    const auto retired{exec.ExecuteSlot({}, A2_ANCHOR, settlements)};
+    BOOST_REQUIRE(retired.has_value());
+    BOOST_REQUIRE_EQUAL(retired->settled_withdrawals.size(), 1U);
+    BOOST_CHECK_EQUAL(ledger.PendingWithdrawals(Quote()), 0);
+    BOOST_CHECK_EQUAL(ledger.Custody(Quote()), 1);
+
+    // After the first payout/settlement leaves one one-unit pool output, the
+    // next ordinary slot emits the exact remainder once, with no lost or
+    // duplicate debit.
+    chain_facts.capacities[Quote()] = 1;
+    const auto remainder{exec.ExecuteSlot({}, A2_ANCHOR)};
+    BOOST_REQUIRE(remainder.has_value());
+    BOOST_REQUIRE_EQUAL(remainder->withdrawal_requests.size(), 1U);
+    BOOST_CHECK_EQUAL(remainder->withdrawal_requests.front().amount, 1);
+    BOOST_CHECK(remainder->withdrawal_requests.front().receipt_id !=
+                first_request.receipt_id);
+    BOOST_CHECK_EQUAL(ledger.Available(treasury, Quote()), 0);
+    BOOST_CHECK_EQUAL(ledger.PendingWithdrawals(Quote()), 1);
+    BOOST_CHECK(ledger.SolvencyHolds());
+}
+
+BOOST_AUTO_TEST_CASE(missing_withdrawal_capacity_fails_closed)
+{
+    flowmesh::FlowMeshState state{VAULT, BaseX(), Quote()};
+    BOOST_REQUIRE(Fund(state, ALICE, Quote(), 100));
+    const CAmount before{state.LedgerView().Available(ALICE, Quote())};
+    flowmesh::BatchExecutor exec{state, /*deposits=*/nullptr};
+    const auto result{
+        *exec.ExecuteSlot({Withdraw(ALICE, 0, Quote(), 1, DEST)})};
+    BOOST_REQUIRE_EQUAL(result.rejected.size(), 1U);
+    BOOST_CHECK(result.withdrawal_requests.empty());
+    BOOST_CHECK_EQUAL(state.LedgerView().Available(ALICE, Quote()), before);
 }
 
 BOOST_AUTO_TEST_CASE(state_rejected_actions_still_consume_their_sequence)
