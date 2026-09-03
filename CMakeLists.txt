@@ -27,15 +27,15 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 # Project / Package metadata
 #=============================
 set(CLIENT_NAME "B3 FlowMesh client")
-# B3 Hive product versioning. v1.1.1 is the audited transition follow-up to
+# B3 Hive product versioning. v1.1.1 is the hardened transition follow-up to
 # the already-tagged v1.1.0; P2P protocol versioning remains independent.
 # The P2P protocol version is a separate constant and is unaffected.
 set(CLIENT_VERSION_MAJOR 1)
 set(CLIENT_VERSION_MINOR 1)
 set(CLIENT_VERSION_BUILD 1)
 set(CLIENT_VERSION_RC 0)
-# Public transition/validator beta. Clear this for the final v1.1.1 tag.
-set(CLIENT_VERSION_PRERELEASE "beta.3")
+# Final transition/validator release.
+set(CLIENT_VERSION_PRERELEASE "")
 set(CLIENT_VERSION_IS_RELEASE "true")
 set(COPYRIGHT_YEAR "2026")
 

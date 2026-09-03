@@ -77,7 +77,8 @@ Consensus::BridgeDecentralizedWithdrawalPins DecentralizedWithdrawalPins()
     out.bootstrap_validator_set_hash = Hash(13);
     out.withdrawal_rules_version =
         Consensus::DECENTRALIZED_WITHDRAWAL_RULES_VERSION_V1;
-    out.withdrawal_rules_commitment = Hash(14);
+    out.withdrawal_rules_commitment =
+        Consensus::DECENTRALIZED_WITHDRAWAL_RULES_COMMITMENT_V1;
     out.min_bridge_validators = 4;
     out.max_bridge_validators = 64;
     out.min_bridge_total_weight = 1'000'000;
@@ -123,7 +124,7 @@ ProvenBridgeDeposit MatchingDeposit(const Consensus::BridgeAssetParams& params,
 
 } // namespace
 
-BOOST_AUTO_TEST_CASE(mainnet_pins_identity_but_bridge_remains_fail_closed)
+BOOST_AUTO_TEST_CASE(mainnet_bridge_pins_are_complete_and_literal)
 {
     const auto chain{CChainParams::Main()};
     const Consensus::Params& params{chain->GetConsensus()};
@@ -133,56 +134,108 @@ BOOST_AUTO_TEST_CASE(mainnet_pins_identity_but_bridge_remains_fail_closed)
     BOOST_CHECK(busd.asset == Consensus::ETHEREUM_MAINNET_BUSD_IDENTITY);
     BOOST_CHECK_EQUAL(busd.asset.origin_chain_id, 1U);
     BOOST_CHECK_EQUAL(HexStr(busd.asset.vault_address),
-                      "143f207e23e6aebd7e974be90ac6d434f4c7bfb6");
+                      "077839b12cebfbf163acaeac3a59a015d100c64b");
     BOOST_CHECK_EQUAL(HexStr(busd.asset.token_address),
                       "dac17f958d2ee523a2206206994597c13d831ec7");
     BOOST_CHECK_EQUAL(busd.asset.origin_decimals, 6U);
     BOOST_CHECK_EQUAL(busd.asset.asset_decimals, 6U);
+    BOOST_REQUIRE(busd.origin_deployment_block);
+    BOOST_CHECK_EQUAL(*busd.origin_deployment_block, 25'898'729U);
+    BOOST_REQUIRE(busd.vault_runtime_code_hash);
+    BOOST_CHECK_EQUAL(HexStr(std::span<const unsigned char>{
+                          busd.vault_runtime_code_hash->begin(), 32}),
+                      "db267712887568bffd394e46538bddba01da11cefc38e32b2428c00911237f8d");
+    BOOST_REQUIRE(busd.implementation_or_adapter);
+    BOOST_CHECK_EQUAL(HexStr(std::span<const unsigned char>{
+                          busd.implementation_or_adapter->begin(), 32}),
+                      "b44fb4e949d0f78f87f79ee46428f23a2a5713ce6fc6e0beb3dda78c2ac1ea55");
+    BOOST_REQUIRE(busd.adapter_version);
+    BOOST_CHECK_EQUAL(*busd.adapter_version, 1U);
+    BOOST_REQUIRE(busd.recipient_encoding_version);
+    BOOST_CHECK_EQUAL(*busd.recipient_encoding_version, 1U);
+    BOOST_REQUIRE(busd.activation_height);
+    BOOST_CHECK_EQUAL(*busd.activation_height, 811'001);
+    BOOST_CHECK(!busd.approval_last_height);
+    BOOST_REQUIRE(busd.mint_caps);
+    BOOST_CHECK_EQUAL(busd.mint_caps->max_per_block, 10'000'000'000);
+    BOOST_CHECK_EQUAL(busd.mint_caps->max_per_epoch, 10'000'000'000);
+    BOOST_CHECK_EQUAL(busd.mint_caps->epoch_length_blocks, 1'440U);
+
+    BOOST_REQUIRE(busd.light_client);
+    const auto& light{*busd.light_client};
+    BOOST_CHECK_EQUAL(HexStr(std::span<const unsigned char>{
+                          light.trusted_checkpoint_root.begin(), 32}),
+                      "f6744774a1bcfe910c643e447cd09fe8443cc2edc25d9ae65155b3cbbef3b646");
+    BOOST_CHECK_EQUAL(light.trusted_checkpoint_slot, 15'136'512U);
+    BOOST_CHECK(light.genesis_validators_root ==
+                Consensus::ETHEREUM_MAINNET_GENESIS_VALIDATORS_ROOT);
+    const std::vector<Consensus::EthereumForkVersionPin> expected_forks{
+        {0, {0x00, 0x00, 0x00, 0x00}},
+        {74'240, {0x01, 0x00, 0x00, 0x00}},
+        {144'896, {0x02, 0x00, 0x00, 0x00}},
+        {194'048, {0x03, 0x00, 0x00, 0x00}},
+        {269'568, {0x04, 0x00, 0x00, 0x00}},
+        {364'032, {0x05, 0x00, 0x00, 0x00}},
+        {411'392, {0x06, 0x00, 0x00, 0x00}},
+    };
+    BOOST_CHECK(light.fork_schedule == expected_forks);
+    BOOST_CHECK_EQUAL(light.fork_schedule_valid_through_epoch, 479'999U);
+    BOOST_CHECK_EQUAL(light.electra_epoch, 364'032U);
+    BOOST_CHECK_EQUAL(light.min_sync_committee_participants, 342U);
+    BOOST_CHECK_EQUAL(light.max_sync_lag_slots, 8'192U);
+
     BOOST_REQUIRE(busd.withdrawal_mode);
     BOOST_CHECK(*busd.withdrawal_mode ==
-                Consensus::BridgeWithdrawalMode::MANAGED_V1);
-    BOOST_REQUIRE(busd.managed_withdrawal);
-    BOOST_CHECK(busd.managed_withdrawal->authority_address ==
-                Consensus::BUSD_ETHEREUM_MANAGED_AUTHORITY);
-    BOOST_CHECK_EQUAL(
-        HexStr(busd.managed_withdrawal->authority_address),
-        "76c7a245d0d2e4cf92403af0144825df1cc614f1");
-    BOOST_CHECK(busd.managed_withdrawal->vault_runtime_code_hash ==
-                Consensus::BUSD_ETHEREUM_VAULT_RUNTIME_CODE_HASH);
-    BOOST_CHECK_EQUAL(
-        HexStr(std::span<const unsigned char>{
-            busd.managed_withdrawal->vault_runtime_code_hash.begin(), 32}),
-        "1be220c18efa4e4cda0bb1c912c7c41346f5c04d49a36ec2c68f6ddcc5586233");
-    BOOST_CHECK_EQUAL(
-        busd.managed_withdrawal->withdrawal_rules_version,
-        Consensus::MANAGED_WITHDRAWAL_RULES_VERSION_V1);
-    BOOST_CHECK(busd.managed_withdrawal->withdrawal_rules_commitment.IsNull());
-    BOOST_CHECK(!busd.decentralized_withdrawal);
+                Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1);
+    BOOST_CHECK(!busd.managed_withdrawal);
+    BOOST_REQUIRE(busd.decentralized_withdrawal);
+    const auto& withdrawal{*busd.decentralized_withdrawal};
+    BOOST_CHECK_EQUAL(HexStr(withdrawal.ethereum_verifier_address),
+                      "e72b3fe73f0d42a6e964d33e7bb1cc2ea7a3f690");
+    BOOST_CHECK_EQUAL(HexStr(std::span<const unsigned char>{
+                          withdrawal.ethereum_verifier_code_hash.begin(), 32}),
+                      "afdba8befb1aacc832bff4e08dcd92e6645a012ea8a8088b0f2811d916022902");
+    BOOST_CHECK_EQUAL(HexStr(std::span<const unsigned char>{
+                          withdrawal.bootstrap_validator_set_hash.begin(), 32}),
+                      "7a0b8aaca4e778df114ad13dcbb8cfdbb0c8cdf45760a564a2ac6c39dd6b2327");
+    BOOST_CHECK_EQUAL(withdrawal.withdrawal_rules_version, 1U);
+    BOOST_CHECK(withdrawal.withdrawal_rules_commitment ==
+                Consensus::DECENTRALIZED_WITHDRAWAL_RULES_COMMITMENT_V1);
+    BOOST_CHECK_EQUAL(withdrawal.min_bridge_validators, 4U);
+    BOOST_CHECK_EQUAL(withdrawal.max_bridge_validators, 64U);
+    BOOST_CHECK_EQUAL(withdrawal.min_bridge_total_weight, 900U);
+    BOOST_CHECK_EQUAL(withdrawal.max_epoch_lag, 2'592'000U);
 
-    // X and the A1/A2/A3 feature schedule are pinned, so the stable bUSD
-    // AssetId is now derivable. None of that completes or activates the
-    // independently gated bridge registry.
     BOOST_REQUIRE(params.legacy_final_hash);
     BOOST_REQUIRE(params.flowmesh_activation_height);
     BOOST_CHECK_EQUAL(*params.flowmesh_activation_height, 815'000);
-    BOOST_CHECK(!busd.activation_height);
-    BOOST_CHECK(!Consensus::BridgeMintParamsReady(busd));
-    BOOST_CHECK(!params.bridge_withdrawal_activation_height);
+    BOOST_CHECK(Consensus::BridgeMintParamsReady(busd));
+    BOOST_REQUIRE(params.bridge_withdrawal_activation_height);
+    BOOST_CHECK_EQUAL(*params.bridge_withdrawal_activation_height, 811'001);
     const auto asset{modern::ConfiguredBridgeAssetId(params)};
     BOOST_REQUIRE(asset);
-    BOOST_CHECK(!asset->IsNull());
-    // The historical managed identity remains inspectable, but wallet/GUI
-    // metadata must not present it as the current decentralized bUSD.
-    BOOST_CHECK(!modern::ConfiguredDecentralizedBridgeAssetId(params));
-    BOOST_CHECK(!modern::ConfiguredBridgeRegistryId(params));
-    BOOST_CHECK(!ConfiguredBridgeRegistryEntry(params));
-    BOOST_CHECK(!Consensus::BridgeRulesActive(815'000, params));
-    BOOST_CHECK(!Consensus::BridgeRulesActive(2'000'000'000, params));
+    BOOST_CHECK_EQUAL(asset->GetHex(),
+                      "ad615d316693dc97d54c20cf2c50ec794cf34699cf970de88f18c381d56b9cc6");
+    BOOST_CHECK_EQUAL(HexStr(std::span<const unsigned char>{asset->begin(), 32}),
+                      "c69c6bd581c3188fe80d97cf9946f34c79ec502ccf204cd597dc9366315d61ad");
+    BOOST_CHECK(modern::ConfiguredDecentralizedBridgeAssetId(params) == asset);
+    const auto registry{modern::ConfiguredBridgeRegistryId(params)};
+    BOOST_REQUIRE(registry);
+    BOOST_CHECK_EQUAL(registry->GetHex(),
+                      "cc10d9d9e702e228ab1cb4c5f3fc7821a145f0c0948f1213f09598d5b9806b00");
+    BOOST_CHECK_EQUAL(
+        HexStr(std::span<const unsigned char>{registry->begin(), 32}),
+        "006b80b9d59895f013128f94c0f045a12178fcf3c5b41cab28e202e7d9d910cc");
+    BOOST_CHECK(ConfiguredBridgeRegistryEntry(params));
+    BOOST_CHECK(!Consensus::BridgeRulesActive(811'000, params));
+    BOOST_CHECK(Consensus::BridgeRulesActive(811'001, params));
+    BOOST_CHECK(!Consensus::BridgeWithdrawalRulesActive(811'000, params));
+    BOOST_CHECK(Consensus::BridgeWithdrawalRulesActive(811'001, params));
 
     BridgeMintAuthorization mint;
     BOOST_CHECK(AdmitConfiguredDeposit(params, MatchingDeposit(busd, 1'000'000),
                                         1'000'000, {}, mint) ==
-                BridgeAdmissionResult::CONFIGURATION_INCOMPLETE);
+                BridgeAdmissionResult::OK);
 }
 
 BOOST_AUTO_TEST_CASE(asset_and_registry_ids_are_deterministic_and_domain_bound)
@@ -195,9 +248,9 @@ BOOST_AUTO_TEST_CASE(asset_and_registry_ids_are_deterministic_and_domain_bound)
     BOOST_CHECK(!asset->IsNull());
     BOOST_CHECK(!registry->IsNull());
     BOOST_CHECK_EQUAL(asset->GetHex(),
-                      "92f9192bf9a9d2b14798cd51368a4022776113f1337fb59ddd18da551d95238d");
+                      "dff7406176b62792ac0227cc8cc7b76042e8eeaa103624d11782ca3a149f2735");
     BOOST_CHECK_EQUAL(registry->GetHex(),
-                      "d165599bed752722d110c39eddaca4a95ccc42966e77d12719821a53a52da29b");
+                      "7e106fb63a6ea3d7a06ea657517ed7f2488ee8de40ce27748a15d32a8409f377");
 
     // An unknown adapter version cannot borrow direct-token-v1 consensus.
     Consensus::Params upgraded{first};
@@ -377,6 +430,10 @@ BOOST_AUTO_TEST_CASE(withdrawal_modes_are_explicit_exclusive_and_versioned)
 
     auto incomplete{decentralized};
     incomplete.decentralized_withdrawal->withdrawal_rules_version = 0;
+    BOOST_CHECK(!Consensus::BridgeMintParamsReady(incomplete));
+    incomplete = decentralized;
+    incomplete.decentralized_withdrawal->withdrawal_rules_commitment =
+        Hash(14);
     BOOST_CHECK(!Consensus::BridgeMintParamsReady(incomplete));
     incomplete = decentralized;
     incomplete.decentralized_withdrawal->ethereum_verifier_code_hash = {};

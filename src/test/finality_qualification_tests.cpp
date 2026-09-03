@@ -114,7 +114,8 @@ Consensus::BridgeDecentralizedWithdrawalPins BridgeThresholdPins(
     pins.bootstrap_validator_set_hash = uint256{uint8_t{2}};
     pins.withdrawal_rules_version =
         Consensus::DECENTRALIZED_WITHDRAWAL_RULES_VERSION_V1;
-    pins.withdrawal_rules_commitment = uint256{uint8_t{3}};
+    pins.withdrawal_rules_commitment =
+        Consensus::DECENTRALIZED_WITHDRAWAL_RULES_COMMITMENT_V1;
     pins.min_bridge_validators = min_validators;
     pins.max_bridge_validators = max_validators;
     pins.min_bridge_total_weight = min_weight;

@@ -116,17 +116,23 @@ BOOST_AUTO_TEST_CASE(mainnet_sealed_transition_pins_are_complete)
                     modern::PayloadTypeStatus::ACTIVE);
     }
 
-    // FlowMesh activation cannot activate bUSD minting by implication. The
-    // bridge keeps its independent activation/security envelope unset.
+    // The bridge has its own complete security envelope and activates at the
+    // independently pinned first modern-PoS height, before FlowMesh trading.
     BOOST_REQUIRE(c.busd_bridge.has_value());
-    BOOST_CHECK(!c.busd_bridge->activation_height.has_value());
-    BOOST_CHECK(!Consensus::BridgeMintParamsReady(*c.busd_bridge));
-    BOOST_CHECK(!Consensus::BridgeRulesActive(815'000, c));
-    BOOST_CHECK(!modern::IsMetadataCellActive(
+    BOOST_REQUIRE(c.busd_bridge->activation_height.has_value());
+    BOOST_CHECK_EQUAL(*c.busd_bridge->activation_height, 811'001);
+    BOOST_CHECK(Consensus::BridgeMintParamsReady(*c.busd_bridge));
+    BOOST_REQUIRE(c.bridge_withdrawal_activation_height.has_value());
+    BOOST_CHECK_EQUAL(*c.bridge_withdrawal_activation_height, 811'001);
+    BOOST_CHECK(!Consensus::BridgeRulesActive(811'000, c));
+    BOOST_CHECK(Consensus::BridgeRulesActive(811'001, c));
+    BOOST_CHECK(!Consensus::BridgeWithdrawalRulesActive(811'000, c));
+    BOOST_CHECK(Consensus::BridgeWithdrawalRulesActive(811'001, c));
+    BOOST_CHECK(modern::IsMetadataCellActive(
         static_cast<uint16_t>(modern::PolicyType::BRIDGE_RECORD),
         modern::POLICY_VERSION_V1, c, 815'000));
     BOOST_CHECK(modern::GetPayloadTypeStatus(10, 1, c, 815'000) ==
-                modern::PayloadTypeStatus::INACTIVE);
+                modern::PayloadTypeStatus::ACTIVE);
     for (const uint16_t t : {1, 2}) {
         BOOST_CHECK(modern::GetPayloadTypeStatus(t, 1, c, 815'000) ==
                     modern::PayloadTypeStatus::INACTIVE);

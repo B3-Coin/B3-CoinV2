@@ -134,7 +134,8 @@ struct OutboundRpcFixture : public b3test::FinalityChainFixture {
         withdrawal.bootstrap_validator_set_hash = Filled(0x76);
         withdrawal.withdrawal_rules_version =
             Consensus::DECENTRALIZED_WITHDRAWAL_RULES_VERSION_V1;
-        withdrawal.withdrawal_rules_commitment = Filled(0x77);
+        withdrawal.withdrawal_rules_commitment =
+            Consensus::DECENTRALIZED_WITHDRAWAL_RULES_COMMITMENT_V1;
         withdrawal.min_bridge_validators = 4;
         withdrawal.max_bridge_validators = 64;
         withdrawal.min_bridge_total_weight = 34;

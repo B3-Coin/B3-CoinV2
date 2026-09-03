@@ -117,23 +117,71 @@ BOOST_AUTO_TEST_CASE(getassetstate_reports_production_schedule)
     BOOST_CHECK(!colored.find_value("active").get_bool());
 }
 
-BOOST_AUTO_TEST_CASE(getbridgeinfo_reports_incomplete_mainnet_pins)
+BOOST_AUTO_TEST_CASE(getbridgeinfo_reports_complete_waiting_mainnet_pins)
 {
     const UniValue result{CallRPC("getbridgeinfo")};
-    BOOST_CHECK_EQUAL(result.find_value("status").get_str(), "incomplete");
+    BOOST_CHECK_EQUAL(result.find_value("status").get_str(), "waiting");
     BOOST_CHECK(result.find_value("configured").get_bool());
-    BOOST_CHECK(!result.find_value("ready").get_bool());
+    BOOST_CHECK(result.find_value("ready").get_bool());
     BOOST_CHECK(!result.find_value("active").get_bool());
+    BOOST_CHECK(!result.find_value("withdrawal_active").get_bool());
     BOOST_CHECK(!result.find_value("mint_approval_open").get_bool());
-    BOOST_CHECK(!result.find_value("asset_id").isNull());
-    BOOST_CHECK(!result.find_value("asset_id_evm").isNull());
-    BOOST_CHECK(result.find_value("registry_id").isNull());
+    BOOST_CHECK_EQUAL(result.find_value("activation_height").getInt<int>(),
+                      811'001);
+    BOOST_CHECK_EQUAL(
+        result.find_value("withdrawal_activation_height").getInt<int>(),
+        811'001);
+    BOOST_CHECK(result.find_value("approval_last_height").isNull());
+    BOOST_CHECK_EQUAL(
+        result.find_value("asset_id").get_str(),
+        "ad615d316693dc97d54c20cf2c50ec794cf34699cf970de88f18c381d56b9cc6");
+    BOOST_CHECK_EQUAL(
+        result.find_value("asset_id_evm").get_str(),
+        "0xc69c6bd581c3188fe80d97cf9946f34c79ec502ccf204cd597dc9366315d61ad");
+    BOOST_CHECK_EQUAL(
+        result.find_value("registry_id").get_str(),
+        "cc10d9d9e702e228ab1cb4c5f3fc7821a145f0c0948f1213f09598d5b9806b00");
+    BOOST_CHECK_EQUAL(
+        result.find_value("registry_id_evm").get_str(),
+        "0x006b80b9d59895f013128f94c0f045a12178fcf3c5b41cab28e202e7d9d910cc");
     BOOST_CHECK_EQUAL(result.find_value("vault").get_str(),
-                      "143f207e23e6aebd7e974be90ac6d434f4c7bfb6");
-    BOOST_CHECK(result.find_value("vault_runtime_code_hash").isNull());
+                      "077839b12cebfbf163acaeac3a59a015d100c64b");
+    BOOST_CHECK_EQUAL(
+        result.find_value("origin_deployment_block").getInt<uint64_t>(),
+        25'898'729U);
+    BOOST_CHECK_EQUAL(
+        result.find_value("vault_runtime_code_hash").get_str(),
+        "db267712887568bffd394e46538bddba01da11cefc38e32b2428c00911237f8d");
     BOOST_CHECK_EQUAL(result.find_value("token").get_str(),
                       "dac17f958d2ee523a2206206994597c13d831ec7");
-    BOOST_CHECK(!result.find_value("state_available").get_bool());
+    BOOST_CHECK_EQUAL(
+        result.find_value("implementation_or_adapter").get_str(),
+        "b44fb4e949d0f78f87f79ee46428f23a2a5713ce6fc6e0beb3dda78c2ac1ea55");
+    BOOST_CHECK_EQUAL(result.find_value("withdrawal_mode").get_str(),
+                      "decentralized-verifier-v1");
+    BOOST_CHECK_EQUAL(result.find_value("decentralized_verifier").get_str(),
+                      "e72b3fe73f0d42a6e964d33e7bb1cc2ea7a3f690");
+    BOOST_CHECK_EQUAL(
+        result.find_value("decentralized_verifier_code_hash").get_str(),
+        "afdba8befb1aacc832bff4e08dcd92e6645a012ea8a8088b0f2811d916022902");
+    BOOST_CHECK_EQUAL(
+        result.find_value("bootstrap_validator_set_hash").get_str(),
+        "7a0b8aaca4e778df114ad13dcbb8cfdbb0c8cdf45760a564a2ac6c39dd6b2327");
+    BOOST_CHECK_EQUAL(
+        result.find_value("withdrawal_rules_commitment").get_str(),
+        "f96ee37321b191d9ba3e573fd7739ab8a163033824a1c534045bd168c3c88b44");
+    BOOST_CHECK_EQUAL(result.find_value("trusted_checkpoint_root").get_str(),
+                      "f6744774a1bcfe910c643e447cd09fe8443cc2edc25d9ae65155b3cbbef3b646");
+    BOOST_CHECK_EQUAL(
+        result.find_value("trusted_checkpoint_slot").getInt<uint64_t>(),
+        15'136'512U);
+    BOOST_CHECK_EQUAL(result.find_value("max_per_block").getInt<int64_t>(),
+                      10'000'000'000);
+    BOOST_CHECK_EQUAL(result.find_value("max_per_epoch").getInt<int64_t>(),
+                      10'000'000'000);
+    BOOST_CHECK_EQUAL(
+        result.find_value("mint_epoch_length_blocks").getInt<uint32_t>(),
+        1'440U);
     BOOST_CHECK(!result.find_value("light_client_bootstrapped").get_bool());
     BOOST_CHECK_EQUAL(result.find_value("anchors").getInt<int>(), 0);
     BOOST_CHECK_EQUAL(result.find_value("nullifiers").getInt<int>(), 0);
@@ -154,7 +202,10 @@ BOOST_AUTO_TEST_CASE(getbridgeproofstatus_is_fail_closed_and_uses_ethereum_hash_
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"};
     const UniValue result{
         CallRPC("getbridgeproofstatus " + eth_hash + " 42")};
-    BOOST_CHECK(!result.find_value("state_available").get_bool());
+    // Complete production pins let the tracker synchronize an empty pre-B
+    // state. No Ethereum anchor or deposit can exist before activation, so
+    // the proof lookup still fails closed even though the index is available.
+    BOOST_CHECK(result.find_value("state_available").get_bool());
 
     const UniValue& anchor{result.find_value("anchor")};
     BOOST_CHECK_EQUAL(anchor.find_value("hash").get_str(), eth_hash);

@@ -19,10 +19,12 @@ wrapped BTC. Those assets require a later converted-vault contract plus a
 separate B3 registry release; deploying a contract alone does not activate an
 asset or make its deposits mintable.
 
-No live deployer/contract address, key, validator root, cap, deadline, or
-deployment coordinate is supplied by the repository. The example carries a
-few already-ruled candidate schedule/ceiling values, but every value below must
-still be compared with the reviewed release record.
+The repository now carries the sanitized finalized Ethereum-mainnet evidence
+at `deployments/ethereum-mainnet-v1.1.1.json`. It contains only public values
+and retains `production_approved: false`; it is not a key file, an activation
+claim, or a substitute for the remaining B3 and operational gates. The example
+environment remains a template, and every value below must still be compared
+with the reviewed release record.
 Do not put a private key in this environment file; use Foundry's normal hardware
 wallet, keystore, or interactive signer support.
 Copy `.env.example` separately as `.env.testnet` and `.env.mainnet`; never reuse
@@ -39,6 +41,58 @@ script deliberately does not decide either release gate.
 `foundry.toml` pins Solidity 0.8.35, post-Fusaka Osaka bytecode, IR compilation, optimizer
 settings, and metadata mode. Preserve the matching Foundry version, source
 commit, build-info output, and broadcast record with the release evidence.
+
+## Finalized Ethereum-mainnet record
+
+The immutable stack was finalized at origin block 25,898,729:
+
+| Artifact | Address | Runtime code hash |
+|---|---|---|
+| `B3StakerBridge` vault | `0x077839b12cebfbF163acAEAC3A59A015D100c64b` | `0xdb267712887568bffd394e46538bddba01da11cefc38e32b2428c00911237f8d` |
+| `B3FinalityVerifier` | `0xE72B3Fe73F0d42A6e964D33E7BB1cc2EA7a3F690` | `0xafdba8befb1aacc832bff4e08dcd92e6645a012ea8a8088b0f2811d916022902` |
+| `BlsCertificateProver` | `0x8e612aE4D475d25940E2A2FC907F21b6813eedA7` | `0x77d2aea2d2a6842fae8b29e64a146622e2f45e772a6c351640ffe8362211a959` |
+
+It pins canonical Ethereum-mainnet USDT
+`0xdAC17F958D2ee523a2206206994597C13D831ec7`, raw/EVM AssetId
+`0xc69c6bd581c3188fe80d97cf9946f34c79ec502ccf204cd597dc9366315d61ad`,
+deployment commitment
+`0x202f7b92c6f9e624de364fc794aa8785d02ec627ffe68559811db1cacb448730`,
+and a 10,000-USDT (`10,000,000,000` raw) single-deposit ceiling. The intended
+pilot B3 policy also limits minting to 10,000 bUSD per 1,440-block epoch
+(nominally one day), with no higher per-block allowance. Inbound `B` is
+811,001 and the full two-way owner ruling sets outbound `W` to the same height,
+811,001. This does not create an inbound-only operating interval.
+
+The light-client evidence pins raw Ethereum checkpoint root
+`0xf6744774a1bcfe910c643e447cd09fe8443cc2edc25d9ae65155b3cbbef3b646`
+at slot 15,136,512, a fork schedule valid through epoch 479,999, and a
+2026-10-04 20:00:23 UTC operational horizon. Its bootstrap payload SHA-256 is
+`8ddc57324951849dd0dbe272540325cb9b2e1d975cbc2c871a35cf83d40f7996`.
+The tracked record binds the complete local finalizer output and light-client
+capture provenance by SHA-256 without publishing credentials or private keys.
+The four public bootstrap identities and ownership proofs are published in
+`deployments/ethereum-mainnet-bootstrap-members-v1.1.1.json` with SHA-256
+`1af9ed3227213d5d02a6c7b84e7392b2a252091f95f954ec122939fb54cd8de3`;
+that file contains no wallet or BLS private keys.
+
+The code-enforced readiness path is separate from release approval. B3 pins
+the exact deployment, checkpoint/forks, pilot caps, adapter and rules at `B`;
+the one-time 3-of-4 initialization must land before the immutable
+2026-09-10 18:52:50 UTC bootstrap deadline; current and successor sets must
+each have 4–64 validators and at least 900 B3 total weight; a fresh certificate
+must be accepted; and each operation must carry its exact proof. Equal B/W
+heights do not bypass these conditions.
+
+Separately, operators must include the four intended Set0 stakes by B3 height
+810,980 with confirmed, non-revoked bindings, and require independent execution
+providers plus successful relayer checks before accepting funds. These are
+operational procedures, not predicates the contracts can observe.
+
+This deployment is deliberately not production-approved and has no completed
+external cryptography or contract audit or end-to-end operational rehearsal.
+Those are unresolved operator/release risks which neither the Ethereum
+contracts nor B3 consensus can detect. The checkpoint horizon is likewise an
+operator release stop/renewal rule, not an audit bit enforced by the vault.
 
 ## Required deployment inputs
 
@@ -233,7 +287,7 @@ Only then does it write a manifest with `deployment_inputs_complete: true`.
 correct deployment is not a cryptography audit, contract audit, light-client
 checkpoint, mint-cap ruling, or activation approval.
 
-The deployment is deliberately two-stage. First deploy the exact audited
+The deployment is deliberately two-stage. First deploy the exact build-reviewed
 verifier and USDT vault and collect the Ethereum chain ID, verifier/vault
 addresses, their runtime code hashes, the vault deployment block, canonical
 USDT token address, and derived B3 AssetId. Only a later B3 build may pin that
@@ -241,11 +295,11 @@ complete reviewed tuple. Missing or mismatching fields keep the bridge closed.
 The vault may exist before M, but deposits remain disabled until verifier
 initialization and a fresh valid certificate prove that both the current and
 successor sets satisfy the pinned bridge qualifications. Contract deployment,
-initialization, and pinning do not enable Ethereum withdrawals or B3 burns;
-those remain disabled until the canonicality and liveness safety of the full
-round trip has been solved, audited, rehearsed, and explicitly enabled by
-pinning the separate B3 outbound height `W`. If inbound `B` is enabled first,
-deposits can mint bUSD while withdrawals remain unavailable.
+initialization, and height pinning alone do not establish readiness. The full
+two-way ruling sets `B = W = 811001`, but deposits, burns, and releases still
+depend on the qualified current and successor sets, fresh finality certificate,
+and exact proofs. External audit and rehearsal remain unmet release risks, not
+additional predicates in the deployed contracts.
 
 ## B3 chainparams mapping
 
@@ -272,10 +326,12 @@ The final manifest directly supplies these reviewed facts:
 | threshold/timing fields | verifier security pins; map the immutable committee floor/cap to B3 `min_bridge_validators` / `max_bridge_validators`, and express `min_bridge_total_weight` in whole modern B3 |
 | `deposit_event_topic0` | deposit adapter/event commitment input |
 
-The manifest does **not** invent the remaining B3 consensus inputs: Ethereum
-light-client checkpoint/fork schedule, inbound B3 activation height `B`,
-outbound burn height `W`, mint caps, adapter version, withdrawal-rules
-commitment, or minimum bridge validator weight expressed in whole modern B3.
+The contract-generated finalizer manifest does **not** invent the remaining B3
+consensus inputs: Ethereum light-client checkpoint/fork schedule, activation
+heights, mint caps, adapter version, withdrawal-rules commitment, or minimum
+bridge validator weight expressed in whole modern B3. The tracked v1.1.1
+release-evidence extension records the separate owner ruling `B = W = 811001`;
+the activating B3 build must still pin and enforce it.
 The deployment-time `bootstrap_set_hash` is the chainparams
 trust root; canonical Set_0 does not exist yet and is deliberately installed
 later by the verifier's one-time 3-of-4 handoff. This avoids requiring another

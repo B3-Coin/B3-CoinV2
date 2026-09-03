@@ -38,9 +38,10 @@ inline constexpr uint64_t ETHEREUM_SLOTS_PER_EPOCH{32};
 inline constexpr uint64_t BUSD_ETHEREUM_CHAIN_ID{1};
 inline constexpr uint8_t BUSD_ORIGIN_DECIMALS{6};
 inline constexpr uint8_t BUSD_ASSET_DECIMALS{6};
+inline constexpr uint64_t BUSD_ETHEREUM_ORIGIN_DEPLOYMENT_BLOCK{25'898'729};
 inline constexpr BridgeEthAddress BUSD_ETHEREUM_VAULT{
-    0x14, 0x3f, 0x20, 0x7e, 0x23, 0xe6, 0xae, 0xbd, 0x7e, 0x97,
-    0x4b, 0xe9, 0x0a, 0xc6, 0xd4, 0x34, 0xf4, 0xc7, 0xbf, 0xb6,
+    0x07, 0x78, 0x39, 0xb1, 0x2c, 0xeb, 0xfb, 0xf1, 0x63, 0xac,
+    0xae, 0xac, 0x3a, 0x59, 0xa0, 0x15, 0xd1, 0x00, 0xc6, 0x4b,
 };
 inline constexpr BridgeEthAddress BUSD_ETHEREUM_USDT{
     0xda, 0xc1, 0x7f, 0x95, 0x8d, 0x2e, 0xe5, 0x23, 0xa2, 0x20,
@@ -56,23 +57,67 @@ inline constexpr std::array<unsigned char, 32>
 inline constexpr uint256 ETHEREUM_MAINNET_GENESIS_VALIDATORS_ROOT{
     std::span<const unsigned char>{
         ETHEREUM_MAINNET_GENESIS_VALIDATORS_ROOT_BYTES}};
-// Independently read from releaseAuthority() and eth_getCode at Ethereum
-// block 25,877,643 (0xde867e...adffe6) through PublicNode and dRPC. The same
-// EOA is rescueAuthority; the vault has no owner() or proxy interface.
+// Historical managed-v1 authority retained only as an audit constant. It is
+// not an authority of the production keyless vault pinned below.
 inline constexpr BridgeEthAddress BUSD_ETHEREUM_MANAGED_AUTHORITY{
     0x76, 0xc7, 0xa2, 0x45, 0xd0, 0xd2, 0xe4, 0xcf, 0x92, 0x40,
     0x3a, 0xf0, 0x14, 0x48, 0x25, 0xdf, 0x1c, 0xc6, 0x14, 0xf1,
 };
 inline constexpr std::array<unsigned char, 32>
     BUSD_ETHEREUM_VAULT_RUNTIME_CODE_HASH_BYTES{
-        0x1b, 0xe2, 0x20, 0xc1, 0x8e, 0xfa, 0x4e, 0x4c,
-        0xda, 0x0b, 0xb1, 0xc9, 0x12, 0xc7, 0xc4, 0x13,
-        0x46, 0xf5, 0xc0, 0x4d, 0x49, 0xa3, 0x6e, 0xc2,
-        0xc6, 0x8f, 0x6d, 0xdc, 0xc5, 0x58, 0x62, 0x33,
+        0xdb, 0x26, 0x77, 0x12, 0x88, 0x75, 0x68, 0xbf,
+        0xfd, 0x39, 0x4e, 0x46, 0x53, 0x8b, 0xdd, 0xba,
+        0x01, 0xda, 0x11, 0xce, 0xfc, 0x38, 0xe3, 0x2b,
+        0x24, 0x28, 0xc0, 0x09, 0x11, 0x23, 0x7f, 0x8d,
     };
 inline constexpr uint256 BUSD_ETHEREUM_VAULT_RUNTIME_CODE_HASH{
     std::span<const unsigned char>{
         BUSD_ETHEREUM_VAULT_RUNTIME_CODE_HASH_BYTES}};
+inline constexpr std::array<unsigned char, 32>
+    BUSD_ETHEREUM_USDT_RUNTIME_CODE_HASH_BYTES{
+        0xb4, 0x4f, 0xb4, 0xe9, 0x49, 0xd0, 0xf7, 0x8f,
+        0x87, 0xf7, 0x9e, 0xe4, 0x64, 0x28, 0xf2, 0x3a,
+        0x2a, 0x57, 0x13, 0xce, 0x6f, 0xc6, 0xe0, 0xbe,
+        0xb3, 0xdd, 0xa7, 0x8c, 0x2a, 0xc1, 0xea, 0x55,
+    };
+inline constexpr uint256 BUSD_ETHEREUM_USDT_RUNTIME_CODE_HASH{
+    std::span<const unsigned char>{
+        BUSD_ETHEREUM_USDT_RUNTIME_CODE_HASH_BYTES}};
+inline constexpr BridgeEthAddress BUSD_ETHEREUM_VERIFIER{
+    0xe7, 0x2b, 0x3f, 0xe7, 0x3f, 0x0d, 0x42, 0xa6, 0xe9, 0x64,
+    0xd3, 0x3e, 0x7b, 0xb1, 0xcc, 0x2e, 0xa7, 0xa3, 0xf6, 0x90,
+};
+inline constexpr std::array<unsigned char, 32>
+    BUSD_ETHEREUM_VERIFIER_RUNTIME_CODE_HASH_BYTES{
+        0xaf, 0xdb, 0xa8, 0xbe, 0xfb, 0x1a, 0xac, 0xc8,
+        0x32, 0xbf, 0xf4, 0xe0, 0x8d, 0xcd, 0x92, 0xe6,
+        0x64, 0x5a, 0x01, 0x2e, 0xa8, 0xa8, 0x08, 0x8b,
+        0x0f, 0x28, 0x11, 0xd9, 0x16, 0x02, 0x29, 0x02,
+    };
+inline constexpr uint256 BUSD_ETHEREUM_VERIFIER_RUNTIME_CODE_HASH{
+    std::span<const unsigned char>{
+        BUSD_ETHEREUM_VERIFIER_RUNTIME_CODE_HASH_BYTES}};
+inline constexpr std::array<unsigned char, 32>
+    BUSD_ETHEREUM_BOOTSTRAP_VALIDATOR_SET_HASH_BYTES{
+        0x7a, 0x0b, 0x8a, 0xac, 0xa4, 0xe7, 0x78, 0xdf,
+        0x11, 0x4a, 0xd1, 0x3d, 0xcb, 0xb8, 0xcf, 0xdb,
+        0xb0, 0xc8, 0xcd, 0xf4, 0x57, 0x60, 0xa5, 0x64,
+        0xa2, 0xac, 0x6c, 0x39, 0xdd, 0x6b, 0x23, 0x27,
+    };
+inline constexpr uint256 BUSD_ETHEREUM_BOOTSTRAP_VALIDATOR_SET_HASH{
+    std::span<const unsigned char>{
+        BUSD_ETHEREUM_BOOTSTRAP_VALIDATOR_SET_HASH_BYTES}};
+inline constexpr std::array<unsigned char, 32>
+    ETHEREUM_MAINNET_BRIDGE_CHECKPOINT_ROOT_BYTES{
+        0xf6, 0x74, 0x47, 0x74, 0xa1, 0xbc, 0xfe, 0x91,
+        0x0c, 0x64, 0x3e, 0x44, 0x7c, 0xd0, 0x9f, 0xe8,
+        0x44, 0x3c, 0xc2, 0xed, 0xc2, 0x5d, 0x9a, 0xe6,
+        0x51, 0x55, 0xb3, 0xcb, 0xbe, 0xf3, 0xb6, 0x46,
+    };
+inline constexpr uint256 ETHEREUM_MAINNET_BRIDGE_CHECKPOINT_ROOT{
+    std::span<const unsigned char>{
+        ETHEREUM_MAINNET_BRIDGE_CHECKPOINT_ROOT_BYTES}};
+inline constexpr uint64_t ETHEREUM_MAINNET_BRIDGE_CHECKPOINT_SLOT{15'136'512};
 
 inline bool BridgeAddressIsNull(const BridgeEthAddress& address)
 {
@@ -180,6 +225,22 @@ enum class BridgeWithdrawalMode : uint8_t {
 
 inline constexpr uint32_t MANAGED_WITHDRAWAL_RULES_VERSION_V1{1};
 inline constexpr uint32_t DECENTRALIZED_WITHDRAWAL_RULES_VERSION_V1{1};
+/**
+ * Cross-language decentralized-withdrawal V1 rules commitment. This is the
+ * existing C++/Solidity leaf vector for the exact 128-byte big-endian layout:
+ * id=0, chain=1, asset bytes 00..1f, token bytes 20..33, recipient bytes
+ * 40..53, amount=1,000,000 and B3 height=815,000.
+ */
+inline constexpr std::array<unsigned char, 32>
+    DECENTRALIZED_WITHDRAWAL_RULES_COMMITMENT_V1_BYTES{
+        0xf9, 0x6e, 0xe3, 0x73, 0x21, 0xb1, 0x91, 0xd9,
+        0xba, 0x3e, 0x57, 0x3f, 0xd7, 0x73, 0x9a, 0xb8,
+        0xa1, 0x63, 0x03, 0x38, 0x24, 0xa1, 0xc5, 0x34,
+        0x04, 0x5b, 0xd1, 0x68, 0xc3, 0xc8, 0x8b, 0x44,
+    };
+inline constexpr uint256 DECENTRALIZED_WITHDRAWAL_RULES_COMMITMENT_V1{
+    std::span<const unsigned char>{
+        DECENTRALIZED_WITHDRAWAL_RULES_COMMITMENT_V1_BYTES}};
 // The deployment verifier deliberately permits only the gas-benchmarked
 // bridge-authorizing subset of B3's larger (8,192-member) finality-set shape.
 inline constexpr uint32_t MIN_BRIDGE_VALIDATORS_V1{4};
@@ -238,7 +299,8 @@ struct BridgeDecentralizedWithdrawalPins {
                !bootstrap_validator_set_hash.IsNull() &&
                withdrawal_rules_version ==
                    DECENTRALIZED_WITHDRAWAL_RULES_VERSION_V1 &&
-               !withdrawal_rules_commitment.IsNull() &&
+               withdrawal_rules_commitment ==
+                   DECENTRALIZED_WITHDRAWAL_RULES_COMMITMENT_V1 &&
                min_bridge_validators >= MIN_BRIDGE_VALIDATORS_V1 &&
                max_bridge_validators >= min_bridge_validators &&
                max_bridge_validators <= MAX_PROVEN_BRIDGE_VALIDATORS_V1 &&

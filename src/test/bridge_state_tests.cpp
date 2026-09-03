@@ -94,7 +94,8 @@ Consensus::Params DecentralizedBridgeParams()
     decentralized.bootstrap_validator_set_hash = TestHash(32);
     decentralized.withdrawal_rules_version =
         Consensus::DECENTRALIZED_WITHDRAWAL_RULES_VERSION_V1;
-    decentralized.withdrawal_rules_commitment = TestHash(33);
+    decentralized.withdrawal_rules_commitment =
+        Consensus::DECENTRALIZED_WITHDRAWAL_RULES_COMMITMENT_V1;
     decentralized.min_bridge_validators = 4;
     decentralized.max_bridge_validators = 64;
     decentralized.min_bridge_total_weight = 1;
@@ -521,6 +522,8 @@ BOOST_AUTO_TEST_CASE(decentralized_burn_ids_roots_and_undo_are_deterministic)
     BOOST_CHECK_EQUAL(
         HexStr(*vector_leaf),
         "f96ee37321b191d9ba3e573fd7739ab8a163033824a1c534045bd168c3c88b44");
+    BOOST_CHECK(*vector_leaf ==
+                Consensus::DECENTRALIZED_WITHDRAWAL_RULES_COMMITMENT_V1);
 
     const Consensus::Params params{FullyActiveBridgeParams(true)};
     const auto asset{modern::ConfiguredBridgeAssetId(params)};

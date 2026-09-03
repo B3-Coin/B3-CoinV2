@@ -187,34 +187,75 @@ public:
         // Its complete sealed-history manifest is decoded and verified below
         // after the chain genesis hash is assigned.
         consensus.fn_genesis_required = true;
-        // Historical managed-v1 identity retained as a fail-closed audit
-        // record. It is not the 2026-09-02 decentralized production target and
-        // must be replaced, not completed in place. The reviewed production
-        // commit must pin the newly deployed keyless vault, its derived
-        // AssetId, decentralized verifier envelope, light-client/cap/adapter
-        // values, and independent activation B. Until then mainnet cannot mint
-        // bridge-backed bUSD or accept a bridge burn.
+        // Production Ethereum-mainnet USDT <-> bUSD bridge. Both directions
+        // activate at the first modern-PoS block; the verifier remains
+        // operationally fail-closed until initialized by the approved set.
         Consensus::BridgeAssetParams busd;
         busd.asset = Consensus::ETHEREUM_MAINNET_BUSD_IDENTITY;
-        busd.withdrawal_mode = Consensus::BridgeWithdrawalMode::MANAGED_V1;
-        Consensus::BridgeManagedWithdrawalPins managed;
-        managed.authority_address =
-            Consensus::BUSD_ETHEREUM_MANAGED_AUTHORITY;
-        managed.vault_runtime_code_hash =
+        busd.origin_deployment_block =
+            Consensus::BUSD_ETHEREUM_ORIGIN_DEPLOYMENT_BLOCK;
+        busd.vault_runtime_code_hash =
             Consensus::BUSD_ETHEREUM_VAULT_RUNTIME_CODE_HASH;
-        managed.withdrawal_rules_version =
-            Consensus::MANAGED_WITHDRAWAL_RULES_VERSION_V1;
-        // Deliberately incomplete: this keeps BridgeMintParamsReady false and
-        // prevents the historical vault from becoming active accidentally.
-        busd.managed_withdrawal = managed;
-        consensus.busd_bridge = busd;
-        assert(Consensus::BridgeAssetIdentityValid(consensus.busd_bridge->asset));
-        assert(!Consensus::BridgeMintParamsReady(*consensus.busd_bridge));
-        // If a later reviewed pinning commit completes this mainnet envelope,
-        // it must never silently point B3 mainnet at an Ethereum test chain.
-        assert(!Consensus::BridgeMintParamsReady(*consensus.busd_bridge) ||
-               consensus.busd_bridge->asset.origin_chain_id ==
-                   Consensus::BUSD_ETHEREUM_CHAIN_ID);
+        busd.implementation_or_adapter =
+            Consensus::BUSD_ETHEREUM_USDT_RUNTIME_CODE_HASH;
+        busd.adapter_version =
+            Consensus::BRIDGE_ADAPTER_VERSION_DIRECT_TOKEN_V1;
+        busd.recipient_encoding_version =
+            Consensus::BRIDGE_RECIPIENT_VERSION_P2PKH_V1;
+        busd.activation_height = 811'001;
+        busd.mint_caps = Consensus::BridgeMintCaps{
+            .max_per_block = 10'000'000'000,
+            .max_per_epoch = 10'000'000'000,
+            .epoch_length_blocks = 1'440,
+        };
+
+        Consensus::EthereumLightClientPins light_client;
+        light_client.trusted_checkpoint_root =
+            Consensus::ETHEREUM_MAINNET_BRIDGE_CHECKPOINT_ROOT;
+        light_client.trusted_checkpoint_slot =
+            Consensus::ETHEREUM_MAINNET_BRIDGE_CHECKPOINT_SLOT;
+        light_client.genesis_validators_root =
+            Consensus::ETHEREUM_MAINNET_GENESIS_VALIDATORS_ROOT;
+        light_client.fork_schedule = {
+            {0, {0x00, 0x00, 0x00, 0x00}},
+            {74'240, {0x01, 0x00, 0x00, 0x00}},
+            {144'896, {0x02, 0x00, 0x00, 0x00}},
+            {194'048, {0x03, 0x00, 0x00, 0x00}},
+            {269'568, {0x04, 0x00, 0x00, 0x00}},
+            {364'032, {0x05, 0x00, 0x00, 0x00}},
+            {411'392, {0x06, 0x00, 0x00, 0x00}},
+        };
+        light_client.fork_schedule_valid_through_epoch = 479'999;
+        light_client.electra_epoch = 364'032;
+        light_client.min_sync_committee_participants =
+            Consensus::ETHEREUM_SYNC_COMMITTEE_SUPERMAJORITY;
+        light_client.max_sync_lag_slots = 8'192;
+        busd.light_client = std::move(light_client);
+
+        busd.withdrawal_mode =
+            Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1;
+        Consensus::BridgeDecentralizedWithdrawalPins withdrawal;
+        withdrawal.ethereum_verifier_address =
+            Consensus::BUSD_ETHEREUM_VERIFIER;
+        withdrawal.ethereum_verifier_code_hash =
+            Consensus::BUSD_ETHEREUM_VERIFIER_RUNTIME_CODE_HASH;
+        withdrawal.bootstrap_validator_set_hash =
+            Consensus::BUSD_ETHEREUM_BOOTSTRAP_VALIDATOR_SET_HASH;
+        withdrawal.withdrawal_rules_version =
+            Consensus::DECENTRALIZED_WITHDRAWAL_RULES_VERSION_V1;
+        withdrawal.withdrawal_rules_commitment =
+            Consensus::DECENTRALIZED_WITHDRAWAL_RULES_COMMITMENT_V1;
+        withdrawal.min_bridge_validators = 4;
+        withdrawal.max_bridge_validators = 64;
+        withdrawal.min_bridge_total_weight = 900;
+        withdrawal.max_epoch_lag = 2'592'000;
+        busd.decentralized_withdrawal = withdrawal;
+
+        consensus.busd_bridge = std::move(busd);
+        consensus.bridge_withdrawal_activation_height = 811'001;
+        assert(Consensus::BridgeMintParamsReady(*consensus.busd_bridge));
+        assert(consensus.busd_bridge->asset.origin_chain_id ==
+               Consensus::BUSD_ETHEREUM_CHAIN_ID);
         // RATIFIED (owner ruling 2026-08-21): minimum STAKE principal is
         // 333 modern B3 (the kB3 nomination: 1 modern B3 = 1,000 legacy B3
         // = 1e9 base units), i.e. 333,000 legacy-denomination B3.

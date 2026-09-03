@@ -103,7 +103,10 @@ BOOST_AUTO_TEST_CASE(mainnet_release_parameters_are_exact)
     BOOST_CHECK(!Consensus::FlowMeshRulesActive(814'999, consensus));
     BOOST_CHECK(Consensus::FlowMeshRulesActive(815'000, consensus));
     BOOST_REQUIRE(consensus.busd_bridge.has_value());
-    BOOST_CHECK(!consensus.busd_bridge->activation_height.has_value());
+    BOOST_REQUIRE(consensus.busd_bridge->activation_height.has_value());
+    BOOST_CHECK_EQUAL(*consensus.busd_bridge->activation_height, 811'001);
+    BOOST_REQUIRE(consensus.bridge_withdrawal_activation_height.has_value());
+    BOOST_CHECK_EQUAL(*consensus.bridge_withdrawal_activation_height, 811'001);
 }
 
 BOOST_AUTO_TEST_CASE(other_shipped_networks_have_no_transition_parameters)
