@@ -34,8 +34,8 @@ set(CLIENT_VERSION_MAJOR 1)
 set(CLIENT_VERSION_MINOR 1)
 set(CLIENT_VERSION_BUILD 1)
 set(CLIENT_VERSION_RC 0)
-# Stable transition release. Keep this empty for the final v1.1.1 tag.
-set(CLIENT_VERSION_PRERELEASE "")
+# Public validator-bootstrap beta. Clear this for the final v1.1.1 tag.
+set(CLIENT_VERSION_PRERELEASE "beta.1")
 set(CLIENT_VERSION_IS_RELEASE "true")
 set(COPYRIGHT_YEAR "2026")
 
