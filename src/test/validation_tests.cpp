@@ -63,7 +63,9 @@ BOOST_AUTO_TEST_CASE(subsidy_limit_test)
         nSum += nSubsidy * 1000;
         BOOST_CHECK(MoneyRange(nSum));
     }
-    BOOST_CHECK_EQUAL(nSum, CAmount{2099999997690000});
+    // The retained halving schedule is expressed in B3's 1e6-unit COIN, so
+    // its exact rounded tail differs from Bitcoin's 1e8-unit test vector.
+    BOOST_CHECK_EQUAL(nSum, CAmount{20999997480000});
 }
 
 BOOST_AUTO_TEST_CASE(signet_parse_tests)
@@ -142,11 +144,14 @@ BOOST_AUTO_TEST_CASE(test_assumeutxo)
     }
 
     const auto out110 = *params->AssumeutxoForHeight(110);
-    BOOST_CHECK_EQUAL(out110.hash_serialized.ToString(), "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327");
+    BOOST_CHECK_EQUAL(out110.hash_serialized.ToString(),
+                      "fd1ec1f3b8d4063995c7cf97556e2d45602ddacd4dd3cd912e066da2f3455685");
     BOOST_CHECK_EQUAL(out110.m_chain_tx_count, 111U);
 
-    const auto out110_2 = *params->AssumeutxoForBlockhash(uint256{"6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"});
-    BOOST_CHECK_EQUAL(out110_2.hash_serialized.ToString(), "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327");
+    const auto out110_2 = *params->AssumeutxoForBlockhash(
+        uint256{"76197ca032a8164db4563574e4829518b613a6d95b112ceca064feb9269def1f"});
+    BOOST_CHECK_EQUAL(out110_2.hash_serialized.ToString(),
+                      "fd1ec1f3b8d4063995c7cf97556e2d45602ddacd4dd3cd912e066da2f3455685");
     BOOST_CHECK_EQUAL(out110_2.m_chain_tx_count, 111U);
 }
 

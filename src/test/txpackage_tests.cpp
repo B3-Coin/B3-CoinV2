@@ -356,8 +356,8 @@ BOOST_AUTO_TEST_CASE(noncontextual_package_tests)
 
 BOOST_AUTO_TEST_CASE(package_submission_tests)
 {
-    // Mine blocks to mature coinbases.
-    mineBlocks(3);
+    // Mine enough blocks to populate all coinbase test inputs below.
+    mineBlocks(5);
     MockMempoolMinFee(CFeeRate(5000), *m_node.mempool);
     LOCK(cs_main);
     unsigned int expected_pool_size = m_node.mempool->size();

@@ -35,10 +35,18 @@ using node::SnapshotMetadata;
 
 BOOST_FIXTURE_TEST_SUITE(validation_chainstatemanager_tests, TestingSetup)
 
+struct ChainstateManager100Setup : TestChain100Setup {
+    explicit ChainstateManager100Setup(TestOpts opts = {})
+        : TestChain100Setup{ChainType::REGTEST, std::move(opts)}
+    {
+        mineBlocks(100 - static_cast<int>(m_coinbase_txns.size()));
+    }
+};
+
 //! Basic tests for ChainstateManager.
 //!
 //! First create a legacy (IBD) chainstate, then create a snapshot chainstate.
-BOOST_FIXTURE_TEST_CASE(chainstatemanager, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(chainstatemanager, ChainstateManager100Setup)
 {
     ChainstateManager& manager = *m_node.chainman;
 
@@ -206,7 +214,8 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_ibd_exit_after_loading_blocks, ChainTe
         chainman.m_cached_is_ibd.store(cached_is_ibd, std::memory_order_relaxed);
         chainman.m_blockman.m_importing = loading_blocks;
         if (tip_exists) {
-            tip.nChainWork = chainman.MinimumChainWork() - (enough_work ? 0 : 1);
+            const bool insufficient_work{!enough_work && chainman.MinimumChainWork() > 0};
+            tip.nChainWork = chainman.MinimumChainWork() - (insufficient_work ? 1 : 0);
             tip.nTime = (recent_time - (tip_recent ? 0h : 100h)).time_since_epoch().count();
             chainman.ActiveChain().SetTip(tip);
         } else {
@@ -221,7 +230,10 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_ibd_exit_after_loading_blocks, ChainTe
                 for (const bool enough_work : {false, true}) {
                     for (const bool tip_recent : {false, true}) {
                         apply(cached_is_ibd, loading_blocks, tip_exists, enough_work, tip_recent);
-                        const bool expected_ibd = cached_is_ibd && (loading_blocks || !tip_exists || !enough_work || !tip_recent);
+                        // A zero minimum-chain-work threshold, as configured by B3,
+                        // has no representable "insufficient work" value.
+                        const bool insufficient_work{!enough_work && chainman.MinimumChainWork() > 0};
+                        const bool expected_ibd = cached_is_ibd && (loading_blocks || !tip_exists || insufficient_work || !tip_recent);
                         BOOST_CHECK_EQUAL(chainman.IsInitialBlockDownload(), expected_ibd);
                     }
                 }
@@ -230,20 +242,18 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_ibd_exit_after_loading_blocks, ChainTe
     }
 }
 
-struct SnapshotTestSetup : TestChain100Setup {
+struct SnapshotTestSetup : ChainstateManager100Setup {
     // Run with coinsdb on the filesystem to support, e.g., moving invalidated
     // chainstate dirs to "*_invalid".
     //
     // Note that this means the tests run considerably slower than in-memory DB
     // tests, but we can't otherwise test this functionality since it relies on
     // destructive filesystem operations.
-    SnapshotTestSetup() : TestChain100Setup{
-                              {},
-                              {
-                                  .coins_db_in_memory = false,
-                                  .block_tree_db_in_memory = false,
-                              },
-                          }
+    SnapshotTestSetup()
+        : ChainstateManager100Setup{TestOpts{
+              .coins_db_in_memory = false,
+              .block_tree_db_in_memory = false,
+          }}
     {
     }
 
@@ -489,7 +499,7 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_activate_snapshot, SnapshotTestSetup)
 //!   chainstate only contains fully validated blocks and the other chainstate contains all blocks,
 //!   except those marked assume-valid, because those entries don't HAVE_DATA.
 //!
-BOOST_FIXTURE_TEST_CASE(chainstatemanager_loadblockindex, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_loadblockindex, ChainstateManager100Setup)
 {
     ChainstateManager& chainman = *Assert(m_node.chainman);
     Chainstate& cs1 = chainman.ActiveChainstate();

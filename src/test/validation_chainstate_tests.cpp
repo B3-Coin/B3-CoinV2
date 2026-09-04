@@ -97,6 +97,8 @@ BOOST_FIXTURE_TEST_CASE(connect_tip_does_not_cache_inputs_on_failed_connect, Tes
 BOOST_FIXTURE_TEST_CASE(chainstate_update_tip, TestChain100Setup)
 {
     ChainstateManager& chainman = *Assert(m_node.chainman);
+    mineBlocks(100 - static_cast<int>(m_coinbase_txns.size()));
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(chainman.GetMutex(), return chainman.ActiveHeight()), 100);
     const auto get_notify_tip{[&]() {
         LOCK(m_node.notifications->m_tip_block_mutex);
         BOOST_REQUIRE(m_node.notifications->TipBlock());
