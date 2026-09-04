@@ -12,6 +12,7 @@
 #include <modern/bridge_asset.h>
 #include <modern/bridge_binding.h>
 #include <primitives/transaction.h>
+#include <test/data/eth_lc_fixture.h>
 #include <util/strencodings.h>
 
 #include <boost/test/unit_test.hpp>
@@ -26,6 +27,8 @@
 
 namespace {
 
+namespace ethfx = eth_lc_fixture;
+
 constexpr int BRIDGE_HEIGHT{100};
 
 constexpr uint256 TestHash(const uint8_t value) { return uint256{value}; }
@@ -35,6 +38,142 @@ uint256 TestBlockHash(const uint32_t value)
     uint256 hash;
     WriteBE32(hash.begin() + 28, value + 1);
     return hash;
+}
+
+std::vector<unsigned char> FixtureHex(const std::string& hex)
+{
+    const auto value{TryParseHex<unsigned char>(hex)};
+    BOOST_REQUIRE_MESSAGE(value.has_value(), "invalid light-client fixture hex");
+    return *value;
+}
+
+uint256 FixtureHex32(const std::string& hex)
+{
+    const auto value{FixtureHex(hex)};
+    BOOST_REQUIRE_EQUAL(value.size(), 32U);
+    return uint256{std::span<const unsigned char>{value}};
+}
+
+template <size_t N>
+std::array<unsigned char, N> FixtureHexArray(const std::string& hex)
+{
+    const auto value{FixtureHex(hex)};
+    BOOST_REQUIRE_EQUAL(value.size(), N);
+    std::array<unsigned char, N> out;
+    std::copy(value.begin(), value.end(), out.begin());
+    return out;
+}
+
+std::vector<uint256> FixtureBranch(const std::vector<std::string>& branch)
+{
+    std::vector<uint256> out;
+    out.reserve(branch.size());
+    for (const auto& value : branch) out.push_back(FixtureHex32(value));
+    return out;
+}
+
+bridge::ssz::BeaconBlockHeader FixtureBeacon(
+    const ethfx::BeaconHeaderHex& header)
+{
+    return {header.slot, header.proposer_index,
+            FixtureHex32(header.parent_root), FixtureHex32(header.state_root),
+            FixtureHex32(header.body_root)};
+}
+
+bridge::ssz::ExecutionPayloadHeader FixtureExecution(
+    const ethfx::ExecHeaderHex& execution)
+{
+    bridge::ssz::ExecutionPayloadHeader out;
+    out.parent_hash = FixtureHex32(execution.parent_hash);
+    out.fee_recipient = FixtureHexArray<20>(execution.fee_recipient);
+    out.state_root = FixtureHex32(execution.state_root);
+    out.receipts_root = FixtureHex32(execution.receipts_root);
+    out.logs_bloom = FixtureHexArray<256>(execution.logs_bloom);
+    out.prev_randao = FixtureHex32(execution.prev_randao);
+    out.block_number = execution.block_number;
+    out.gas_limit = execution.gas_limit;
+    out.gas_used = execution.gas_used;
+    out.timestamp = execution.timestamp;
+    out.extra_data = FixtureHex(execution.extra_data);
+    out.base_fee_per_gas = FixtureHex32(execution.base_fee_le);
+    out.block_hash = FixtureHex32(execution.block_hash);
+    out.transactions_root = FixtureHex32(execution.transactions_root);
+    out.withdrawals_root = FixtureHex32(execution.withdrawals_root);
+    out.blob_gas_used = execution.blob_gas_used;
+    out.excess_blob_gas = execution.excess_blob_gas;
+    return out;
+}
+
+bridge::ssz::SyncCommittee FixtureCommittee(const std::string& pubkeys_hex,
+                                             const std::string& aggregate_hex)
+{
+    const auto pubkeys{FixtureHex(pubkeys_hex)};
+    BOOST_REQUIRE_EQUAL(
+        pubkeys.size(), bridge::ssz::SYNC_COMMITTEE_SIZE * 48);
+    bridge::ssz::SyncCommittee out;
+    out.pubkeys.resize(bridge::ssz::SYNC_COMMITTEE_SIZE);
+    for (size_t i{0}; i < bridge::ssz::SYNC_COMMITTEE_SIZE; ++i) {
+        std::copy(pubkeys.begin() + i * 48, pubkeys.begin() + (i + 1) * 48,
+                  out.pubkeys[i].begin());
+    }
+    out.aggregate_pubkey = FixtureHexArray<48>(aggregate_hex);
+    return out;
+}
+
+bridge::LightClientConfig FixtureLightClientConfig()
+{
+    bridge::LightClientConfig config;
+    config.genesis_validators_root =
+        FixtureHex32(ethfx::GENESIS_VALIDATORS_ROOT);
+    for (const auto& fixture_fork : ethfx::FORKS) {
+        bridge::ForkVersion fork;
+        fork.epoch = fixture_fork.epoch;
+        fork.version = FixtureHexArray<4>(fixture_fork.version);
+        config.forks.push_back(fork);
+        if (fork.version[0] == 0x05) config.electra_epoch = fork.epoch;
+    }
+    config.min_participants =
+        Consensus::ETHEREUM_SYNC_COMMITTEE_SUPERMAJORITY;
+    return config;
+}
+
+bridge::LightClientStore FixtureBootstrapStore()
+{
+    const bridge::LightClientHeader header{
+        FixtureBeacon(ethfx::U1_FINALIZED_BEACON),
+        FixtureExecution(ethfx::U1_FINALIZED_EXEC),
+        FixtureBranch(ethfx::U1_FINALIZED_EXEC_BRANCH)};
+    bridge::LightClientStore store;
+    const auto result{bridge::InitStore(
+        store, FixtureLightClientConfig(), FixtureHex32(ethfx::BOOTSTRAP_ROOT),
+        header,
+        FixtureCommittee(ethfx::BOOTSTRAP_COMMITTEE_PUBKEYS,
+                         ethfx::BOOTSTRAP_COMMITTEE_AGG),
+        FixtureBranch(ethfx::BOOTSTRAP_COMMITTEE_BRANCH))};
+    BOOST_REQUIRE(result == bridge::LcResult::OK);
+    return store;
+}
+
+bridge::LightClientUpdate FixtureCommitteeUpdate()
+{
+    bridge::LightClientUpdate update;
+    update.attested = {
+        FixtureBeacon(ethfx::U1_ATTESTED_BEACON),
+        FixtureExecution(ethfx::U1_ATTESTED_EXEC),
+        FixtureBranch(ethfx::U1_ATTESTED_EXEC_BRANCH)};
+    update.finalized = {
+        FixtureBeacon(ethfx::U1_FINALIZED_BEACON),
+        FixtureExecution(ethfx::U1_FINALIZED_EXEC),
+        FixtureBranch(ethfx::U1_FINALIZED_EXEC_BRANCH)};
+    update.finality_branch = FixtureBranch(ethfx::U1_FINALITY_BRANCH);
+    update.has_next = true;
+    update.next_committee = FixtureCommittee(
+        ethfx::U1_NEXT_PUBKEYS, ethfx::U1_NEXT_AGG);
+    update.next_branch = FixtureBranch(ethfx::U1_NEXT_BRANCH);
+    update.sync_aggregate.bits = FixtureHexArray<64>(ethfx::U1_SYNC_BITS);
+    update.sync_aggregate.signature = FixtureHexArray<96>(ethfx::U1_SYNC_SIG);
+    update.signature_slot = ethfx::U1_SIGNATURE_SLOT;
+    return update;
 }
 
 Consensus::Params BridgeParams()
@@ -78,6 +217,27 @@ Consensus::Params BridgeParams()
     busd.managed_withdrawal = managed;
     BOOST_REQUIRE(Consensus::BridgeMintParamsReady(busd));
     params.busd_bridge = std::move(busd);
+    return params;
+}
+
+Consensus::Params FixtureBridgeParams()
+{
+    Consensus::Params params{BridgeParams()};
+    auto& pins{*params.busd_bridge->light_client};
+    const auto config{FixtureLightClientConfig()};
+    pins.trusted_checkpoint_root = FixtureHex32(ethfx::BOOTSTRAP_ROOT);
+    pins.trusted_checkpoint_slot = ethfx::U1_FINALIZED_BEACON.slot;
+    pins.genesis_validators_root = config.genesis_validators_root;
+    pins.fork_schedule.clear();
+    for (const auto& fork : config.forks) {
+        pins.fork_schedule.push_back({fork.epoch, fork.version});
+    }
+    pins.fork_schedule_valid_through_epoch =
+        bridge::EpochAtSlot(ethfx::U1_SIGNATURE_SLOT) + 1;
+    pins.electra_epoch = config.electra_epoch;
+    pins.min_sync_committee_participants = config.min_participants;
+    pins.max_sync_lag_slots = bridge::SLOTS_PER_PERIOD;
+    BOOST_REQUIRE(Consensus::BridgeMintParamsReady(*params.busd_bridge));
     return params;
 }
 
@@ -977,6 +1137,97 @@ BOOST_AUTO_TEST_CASE(light_client_operations_require_order_and_non_coinbase)
         Block(1'000, {MakeTransactionRef(std::move(coinbase))}),
         BRIDGE_HEIGHT, TestHash(18), params, ignored, error));
     BOOST_CHECK(error.find("coinbase") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(older_committee_update_changes_only_the_proven_committee)
+{
+    const Consensus::Params params{FixtureBridgeParams()};
+    const bridge::LightClientUpdate update{FixtureCommitteeUpdate()};
+    bridge::LightClientStore initial{FixtureBootstrapStore()};
+
+    // The trusted store is newer than the canonical committee update but is
+    // still in that update's period, matching the production checkpoint.
+    initial.finalized_header.beacon.slot = update.attested.beacon.slot + 1;
+    BOOST_REQUIRE_EQUAL(
+        bridge::PeriodAtSlot(initial.finalized_header.beacon.slot),
+        initial.period);
+    BOOST_REQUIRE(!initial.next);
+
+    node::BridgeStateIndex index;
+    node::BridgeBlockDelta seed;
+    seed.height = BRIDGE_HEIGHT - 1;
+    seed.block_hash = TestHash(80);
+    seed.light_client_after = initial;
+    seed.light_client_connection_after =
+        node::BridgeStateConnection{seed.height, seed.block_hash};
+    seed.anchors_added.push_back(node::BridgeExecutionAnchor{
+        initial.finalized_header.execution.block_number,
+        initial.finalized_header.execution.block_hash,
+        initial.finalized_header.execution.receipts_root,
+        initial.finalized_header.beacon.slot,
+        initial.finalized_header.execution.block_number,
+        initial.finalized_header.execution.timestamp, seed.height,
+        seed.block_hash});
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(index.ConnectBlock(seed, error), error);
+    BOOST_REQUIRE_EQUAL(index.AnchorCount(), 1U);
+
+    const auto record{bridge::MakeBridgeMpaRecord(bridge::BridgeRecordV1{
+        bridge::BridgeRecordKindV1::UPDATE,
+        bridge::BridgeUpdateV1{update}})};
+    BOOST_REQUIRE(record);
+    const auto binding{modern::MakeBridgeBindingOutput(*record)};
+    BOOST_REQUIRE(binding);
+    CMutableTransaction mutable_tx;
+    mutable_tx.vout.push_back(*binding);
+    mutable_tx.mpa.push_back(*record);
+    const CTransactionRef transaction{
+        MakeTransactionRef(std::move(mutable_tx))};
+
+    const uint256 update_block{TestHash(81)};
+    node::BridgeBlockDelta delta;
+    BOOST_REQUIRE_MESSAGE(index.VerifyBlock(
+                              Block(1'000, {transaction}), BRIDGE_HEIGHT,
+                              update_block, params, delta, error),
+                          error);
+    BOOST_REQUIRE(delta.light_client_before);
+    BOOST_REQUIRE(delta.light_client_after);
+    BOOST_CHECK(delta.light_client_before->finalized_header ==
+                initial.finalized_header);
+    BOOST_CHECK(delta.light_client_after->finalized_header ==
+                initial.finalized_header);
+    BOOST_CHECK_EQUAL(delta.light_client_after->period, initial.period);
+    BOOST_CHECK(delta.light_client_after->current.HashTreeRoot() ==
+                initial.current.HashTreeRoot());
+    BOOST_REQUIRE(delta.light_client_after->next);
+    BOOST_CHECK(delta.light_client_after->next->HashTreeRoot() ==
+                update.next_committee.HashTreeRoot());
+    BOOST_CHECK(delta.anchors_added.empty());
+
+    BOOST_REQUIRE_MESSAGE(index.ConnectBlock(delta, error), error);
+    BOOST_REQUIRE(index.LightClient());
+    BOOST_REQUIRE(index.LightClient()->next);
+    BOOST_CHECK(index.LightClient()->finalized_header ==
+                initial.finalized_header);
+    BOOST_CHECK_EQUAL(index.AnchorCount(), 1U);
+
+    node::BridgeBlockDelta replay;
+    error.clear();
+    BOOST_CHECK(!index.VerifyBlock(
+        Block(1'001, {transaction}), BRIDGE_HEIGHT + 1, TestHash(82), params,
+        replay, error));
+    BOOST_CHECK(error.find("light-client update is invalid") !=
+                std::string::npos);
+    BOOST_REQUIRE(index.LightClient());
+    BOOST_CHECK(index.LightClient()->finalized_header ==
+                initial.finalized_header);
+    BOOST_CHECK_EQUAL(index.AnchorCount(), 1U);
+
+    BOOST_REQUIRE_MESSAGE(
+        index.DisconnectBlock(BRIDGE_HEIGHT, update_block, error), error);
+    BOOST_REQUIRE(index.LightClient());
+    BOOST_CHECK(*index.LightClient() == initial);
+    BOOST_CHECK_EQUAL(index.AnchorCount(), 1U);
 }
 
 BOOST_AUTO_TEST_CASE(light_client_connection_metadata_tracks_store_changes_and_undo)

@@ -1570,6 +1570,14 @@ def run_once(args, state, eth, witnesses, node, wallet, prefix):
     if store_snapshot_fingerprint(rechecked_store) != store_snapshot_fingerprint(store_snapshot):
         raise RelayerError("B3 light-client store changed while assembling a relayer plan; retry")
     state.add_plan(sync_records)
+    if args.dry_run and sync_records:
+        # The verified sync records are intentionally not applied in dry-run
+        # mode, so the B3 node cannot yet expose their retained execution
+        # anchor. Report the planned records and stop before deposit scanning;
+        # a later rehearsal can continue once those records exist on B3.
+        process_jobs(state, node, wallet, args.b3_confirmations, True,
+                     args.max_fee_atoms, args.daily_fee_budget_atoms)
+        return
     if not args.dry_run:
         process_jobs(state, node, wallet, args.b3_confirmations, False,
                      args.max_fee_atoms, args.daily_fee_budget_atoms)

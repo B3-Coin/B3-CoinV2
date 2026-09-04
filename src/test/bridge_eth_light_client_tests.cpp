@@ -240,6 +240,84 @@ BOOST_AUTO_TEST_CASE(mainnet_rejections)
     }
 }
 
+BOOST_AUTO_TEST_CASE(mainnet_older_update_can_complete_committee_handover)
+{
+    const auto cfg{Config()};
+    const auto update{Update1()};
+    auto store{Bootstrapped(cfg)};
+
+    // Model a trusted bootstrap taken later in the same committee period than
+    // the canonical best update returned for that period.
+    store.finalized_header.beacon.slot = update.attested.beacon.slot + 1;
+    BOOST_REQUIRE_EQUAL(PeriodAtSlot(store.finalized_header.beacon.slot),
+                        store.period);
+    BOOST_REQUIRE(update.finalized.beacon.slot <
+                  store.finalized_header.beacon.slot);
+    const auto newer_finalized{store.finalized_header};
+    const auto current_committee_root{store.current.HashTreeRoot()};
+    const uint64_t current_period{store.period};
+
+    BOOST_REQUIRE(VerifyUpdate(store, cfg, update) == LcResult::OK);
+    BOOST_REQUIRE(ProcessUpdate(store, cfg, update) == LcResult::OK);
+    BOOST_CHECK(store.finalized_header == newer_finalized);
+    BOOST_CHECK_EQUAL(store.period, current_period);
+    BOOST_CHECK(store.current.HashTreeRoot() == current_committee_root);
+    BOOST_REQUIRE(store.next.has_value());
+    BOOST_CHECK(store.next->HashTreeRoot() ==
+                update.next_committee.HashTreeRoot());
+
+    // The exception is only for filling an unknown same-period committee.
+    // Ordinary stale updates and repeat attempts remain rejected.
+    auto without_next{update};
+    without_next.has_next = false;
+    auto fresh_store{Bootstrapped(cfg)};
+    fresh_store.finalized_header = newer_finalized;
+    BOOST_CHECK(VerifyUpdate(fresh_store, cfg, without_next) ==
+                LcResult::MONOTONICITY);
+    BOOST_CHECK(VerifyUpdate(store, cfg, update) == LcResult::MONOTONICITY);
+
+    auto wrong_period{update};
+    wrong_period.signature_slot += SLOTS_PER_PERIOD;
+    BOOST_CHECK(VerifyUpdate(fresh_store, cfg, wrong_period) ==
+                LcResult::MONOTONICITY);
+
+    auto prior_finalized_period{update};
+    prior_finalized_period.finalized.beacon.slot -= SLOTS_PER_PERIOD;
+    BOOST_CHECK(VerifyUpdate(fresh_store, cfg, prior_finalized_period) ==
+                LcResult::MONOTONICITY);
+
+    auto bad_finality{update};
+    bad_finality.finalized.beacon.state_root = uint256::ONE;
+    BOOST_CHECK(VerifyUpdate(fresh_store, cfg, bad_finality) ==
+                LcResult::FINALITY_PROOF);
+
+    auto bad_execution{update};
+    bad_execution.finalized.execution.receipts_root = uint256::ONE;
+    BOOST_CHECK(VerifyUpdate(fresh_store, cfg, bad_execution) ==
+                LcResult::EXECUTION_PROOF);
+
+    auto bad_attested_execution{update};
+    bad_attested_execution.attested.execution.receipts_root = uint256::ONE;
+    BOOST_CHECK(VerifyUpdate(fresh_store, cfg, bad_attested_execution) ==
+                LcResult::EXECUTION_PROOF);
+
+    auto bad_next{update};
+    bad_next.next_committee.pubkeys[0][5] ^= 0x01;
+    BOOST_CHECK(VerifyUpdate(fresh_store, cfg, bad_next) ==
+                LcResult::NEXT_PROOF);
+
+    auto strict{cfg};
+    strict.min_participants = 513;
+    BOOST_CHECK(VerifyUpdate(fresh_store, strict, update) ==
+                LcResult::PARTICIPATION);
+
+    auto bad_signature{update};
+    bad_signature.sync_aggregate.signature[10] ^= 0x01;
+    const auto bad_signature_result{VerifyUpdate(fresh_store, cfg, bad_signature)};
+    BOOST_CHECK(bad_signature_result == LcResult::SIGNATURE ||
+                bad_signature_result == LcResult::BAD_STRUCTURE);
+}
+
 BOOST_AUTO_TEST_CASE(finalized_store_snapshot_json_roundtrip)
 {
     const auto cfg{Config()};

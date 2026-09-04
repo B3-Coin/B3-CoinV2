@@ -612,6 +612,45 @@ class RelayerTests(unittest.TestCase):
                 scan.assert_not_called()
             self.assertEqual(state.cursor(), 50)
 
+    def test_dry_run_stops_after_verified_unapplied_sync_plan(self):
+        args = SimpleNamespace(
+            ethereum_chain_id=1, trusted_root=ROOT_B, start_block=None,
+            b3_confirmations=1, beacon_url="https://beacon.invalid",
+            payload_tool="ethcheck", dry_run=True, max_fee_atoms=None,
+            daily_fee_budget_atoms=None, scan_chunk=100, max_ancestry=100,
+            workdir_retention=8)
+        primary = FakeRpc({
+            "eth_chainId": "0x1",
+            "eth_getCode": pinned_code,
+            "eth_getBlockByNumber": {"hash": H32},
+        })
+        witness = FakeRpc({
+            "eth_chainId": "0x1",
+            "eth_getCode": pinned_code,
+            "eth_getBlockByNumber": {"hash": H32},
+        })
+        node = FakeRpc({"getbridgeinfo": bridge_info()})
+        wallet = FakeRpc()
+        common = ({}, {}, [], {}, 100, H32)
+        plan = {"bootstrap": store("bootstrap", "01", 8192),
+                "updates": [], "backfills": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            args.work_root = str(Path(directory) / "work")
+            state = relayer.State(Path(directory) / "state.sqlite3")
+            with (patch.object(relayer, "capture_common", return_value=common),
+                  patch.object(relayer, "emit_plan", return_value=plan),
+                  patch.object(relayer, "fetch_execution_anchor") as anchor,
+                  patch.object(relayer, "scan_finalized") as scan):
+                relayer.run_once(args, state, primary, [witness], node,
+                                 wallet, 63)
+                anchor.assert_not_called()
+                scan.assert_not_called()
+            self.assertEqual(state.cursor(), 50)
+            self.assertEqual(state.first()["kind"], "bootstrap")
+            self.assertEqual(state.first()["state"], "planned")
+            self.assertEqual(wallet.calls, [])
+
     def test_update_slots_respect_pinned_fork_horizon(self):
         update = {"data": {"signature_slot": "65",
                            "attested_header": {"beacon": {"slot": "64"}},

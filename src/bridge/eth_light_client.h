@@ -186,9 +186,25 @@ inline LcResult VerifyUpdate(const LightClientStore& store, const LightClientCon
     // Slot ordering; finalized-only client: a finality proof is mandatory.
     if (!(u.signature_slot > u.attested.beacon.slot)) return LcResult::MONOTONICITY;
     if (!(u.attested.beacon.slot >= u.finalized.beacon.slot)) return LcResult::MONOTONICITY;
-    if (u.finalized.beacon.slot < store.finalized_header.beacon.slot) return LcResult::MONOTONICITY;
     const uint64_t attested_epoch{EpochAtSlot(u.attested.beacon.slot)};
     const uint64_t attested_period{PeriodAtSlot(u.attested.beacon.slot)};
+    const uint64_t finalized_period{PeriodAtSlot(u.finalized.beacon.slot)};
+    const uint64_t sig_period{PeriodAtSlot(u.signature_slot)};
+
+    // A trusted bootstrap can be newer than the canonical best update for its
+    // sync-committee period. Ethereum light-client processing still accepts
+    // that older update when it is the fully verified proof of the missing
+    // next committee. ProcessUpdate installs the committee without regressing
+    // finalized_header. Keep every other stale-finality update fail-closed.
+    const bool fills_next_committee{
+        u.has_next && !store.next &&
+        attested_period == store.period &&
+        finalized_period == store.period &&
+        sig_period == store.period};
+    if (u.finalized.beacon.slot < store.finalized_header.beacon.slot &&
+        !fills_next_committee) {
+        return LcResult::MONOTONICITY;
+    }
 
     // Once a next committee has been proven for the store's current period,
     // another update may repeat it but may not overwrite it. A next committee
@@ -219,7 +235,6 @@ inline LcResult VerifyUpdate(const LightClientStore& store, const LightClientCon
     }
     // Next committee, when present, proven under the attested state and only
     // for the store's own period (one-period-lookahead discipline).
-    const uint64_t sig_period{PeriodAtSlot(u.signature_slot)};
     if (u.has_next) {
         if (attested_period != sig_period) return LcResult::PERIOD;
         if (!ssz::VerifyBranch(u.next_committee.HashTreeRoot(), u.next_branch,
