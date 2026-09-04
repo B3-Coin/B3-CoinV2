@@ -251,6 +251,20 @@ BOOST_AUTO_TEST_CASE(outbound_bridge_rpc_converts_hashes_or_heights)
         "getbridgewithdrawalproof", {hash, "7", hash});
     BOOST_CHECK(converted[2].isStr());
     BOOST_CHECK_EQUAL(converted[2].get_str(), hash);
+
+    converted = RPCConvertValues(
+        "bridgewithdraw",
+        {"1250000", "0x00112233445566778899aabbccddeeff00112233",
+         R"({"broadcast":false,"minconf":2})"});
+    BOOST_REQUIRE_EQUAL(converted.size(), 3U);
+    BOOST_CHECK(converted[0].isNum());
+    BOOST_CHECK_EQUAL(converted[0].getInt<int64_t>(), 1'250'000);
+    BOOST_CHECK(converted[1].isStr());
+    BOOST_CHECK_EQUAL(converted[1].get_str(),
+                      "0x00112233445566778899aabbccddeeff00112233");
+    BOOST_CHECK(converted[2].isObject());
+    BOOST_CHECK(!converted[2].find_value("broadcast").get_bool());
+    BOOST_CHECK_EQUAL(converted[2].find_value("minconf").getInt<int>(), 2);
 }
 
 BOOST_AUTO_TEST_CASE(outbound_bridge_rpc_rejects_malformed_burn_sources)
