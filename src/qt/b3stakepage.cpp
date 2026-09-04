@@ -187,7 +187,7 @@ B3StakePage::B3StakePage(QWidget* parent)
         AddInfoRow(balance_layout, m_balance_card, tr("Minimum stake"), &m_minimum_stake, "stakeMinimum");
         AddInfoRow(balance_layout, m_balance_card, tr("Active stake"), &m_active_stake, "stakeActive");
         AddInfoRow(balance_layout, m_balance_card, tr("Pending / unconfirmed"), &m_pending_stake, "stakePending");
-        AddInfoRow(balance_layout, m_balance_card, tr("Your / total weight"), &m_validator_weight, "stakeWeight");
+        AddInfoRow(balance_layout, m_balance_card, tr("Next-block set weight / total"), &m_validator_weight, "stakeWeight");
         balance_layout->addStretch();
     }
 
@@ -439,7 +439,7 @@ void B3StakePage::setValidatorStatus(const B3ValidatorStatus& status)
     } else if (status.next_block_phase == QLatin1String("corridor")) {
         m_backend_state->setText(tr("The transition corridor is active. Bind the BLS key, create stake early, and optionally help produce corridor blocks."));
     } else if (status.next_block_phase == QLatin1String("modern_pos")) {
-        m_backend_state->setText(tr("Modern proof of stake is active. Keep an eligible validator online and the finality signer armed."));
+        m_backend_state->setText(tr("Modern proof of stake is active. Set weights are frozen per epoch; newly active stake enters through a future certified rotation."));
     } else {
         m_backend_state->setText(tr("Validator backend connected."));
     }
@@ -460,7 +460,7 @@ void B3StakePage::setValidatorStatus(const B3ValidatorStatus& status)
         m_binding_state->setText(tr("Not bound"));
     }
     m_set_state->setText(status.current_set_member
-                             ? tr("Member — weight %1").arg(status.member_weight)
+                             ? tr("Current epoch member — frozen weight %1").arg(status.member_weight)
                              : tr("Not in current set"));
     if (status.staking_running && status.staking_uses_this_wallet) {
         m_staking_state->setText(tr("Running — %1").arg(status.staking_state));

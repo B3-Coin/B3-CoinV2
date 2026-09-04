@@ -41,7 +41,7 @@ struct B3ValidatorStatus {
     //! A binding transaction was created locally but is not yet in the chain view.
     bool binding_pending{false};
     bool current_set_member{false};
-    //! Projected eligibility weight for the next block (including bootstrap).
+    //! Epoch-frozen eligibility weight for the next block (including bootstrap).
     uint64_t eligible_weight{0};
     uint64_t total_eligible_weight{0};
     //! Membership weight in the finality epoch set currently in force.

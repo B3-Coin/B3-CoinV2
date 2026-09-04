@@ -2462,6 +2462,16 @@ void CConnman::StartExtraBlockRelayPeers()
     m_start_extra_block_relay_peers = true;
 }
 
+void CConnman::StartB3ModernSeedRescue()
+{
+    m_b3_modern_seed_rescue_requested.store(true, std::memory_order_relaxed);
+}
+
+bool CConnman::B3ModernSeedRescueRequested() const
+{
+    return m_b3_modern_seed_rescue_requested.load(std::memory_order_relaxed);
+}
+
 // Return the number of outbound connections that are full relay (not blocks only)
 int CConnman::GetFullOutboundConnCount() const
 {
@@ -2588,7 +2598,19 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, std
     auto next_extra_block_relay = start + rng.rand_exp_duration(EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL);
     auto next_extra_network_peer{start + rng.rand_exp_duration(EXTRA_NETWORK_PEER_INTERVAL)};
     const bool dnsseed = gArgs.GetBoolArg("-dnsseed", DEFAULT_DNSSEED);
-    bool add_fixed_seeds = gArgs.GetBoolArg("-fixedseeds", DEFAULT_FIXEDSEEDS);
+    const bool fixed_seeds_enabled{
+        gArgs.GetBoolArg("-fixedseeds", DEFAULT_FIXEDSEEDS)};
+    bool add_fixed_seeds{fixed_seeds_enabled};
+    // B3's sealed transition gives fixed seeds one additional, bounded role.
+    // A migrated peers.dat can be nonempty while containing only historical
+    // 80008 peers. Those addresses are unusable for automatic post-boundary
+    // synchronization, but their presence prevents Core's ordinary
+    // "empty-network" fixed-seed fallback. Keep a separate one-shot rescue so
+    // an earlier ordinary attempt which filters to zero addresses cannot
+    // consume it. The rescue remains subject to -fixedseeds and never changes
+    // the behavior of non-B3 networks.
+    bool add_b3_fixed_seed_rescue{false};
+    auto b3_fixed_seed_rescue_deadline{NodeClock::time_point::max()};
     const bool use_seednodes{!gArgs.GetArgs("-seednode").empty()};
 
     auto seed_node_timer = NodeClock::now();
@@ -2626,14 +2648,43 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, std
         }
 
         const std::unordered_set<Network> fixed_seed_networks{GetReachableEmptyNetworks()};
-        if (add_fixed_seeds && !fixed_seed_networks.empty()) {
+        const auto rescue_now{NodeClock::now()};
+        if (m_b3_modern_seed_rescue_requested.exchange(
+                false, std::memory_order_relaxed)) {
+            add_b3_fixed_seed_rescue =
+                fixed_seeds_enabled &&
+                m_params.GetConsensus().legacy_b3coin &&
+                !m_params.ModernRecoverySeeds().empty();
+            b3_fixed_seed_rescue_deadline = rescue_now + 1min;
+        }
+        int usable_full_outbound{0};
+        if (add_b3_fixed_seed_rescue &&
+            rescue_now >= b3_fixed_seed_rescue_deadline) {
+            LOCK(m_nodes_mutex);
+            for (const CNode* node : m_nodes) {
+                if (node->fSuccessfullyConnected && !node->fDisconnect &&
+                    node->IsFullOutboundConn()) {
+                    ++usable_full_outbound;
+                }
+            }
+        }
+        const int b3_fixed_seed_rescue_target{
+            std::min(SEED_OUTBOUND_CONNECTION_THRESHOLD,
+                     m_max_outbound_full_relay)};
+        const bool b3_fixed_seed_rescue{
+            add_b3_fixed_seed_rescue &&
+            rescue_now >= b3_fixed_seed_rescue_deadline &&
+            usable_full_outbound < b3_fixed_seed_rescue_target};
+        if ((add_fixed_seeds && !fixed_seed_networks.empty()) ||
+            b3_fixed_seed_rescue) {
             // When the node starts with an empty peers.dat, there are a few other sources of peers before
             // we fallback on to fixed seeds: -dnsseed, -seednode, -addnode
             // If none of those are available, we fallback on to fixed seeds immediately, else we allow
             // 60 seconds for any of those sources to populate addrman.
-            bool add_fixed_seeds_now = false;
+            bool add_fixed_seeds_now = b3_fixed_seed_rescue;
             // It is cheapest to check if enough time has passed first.
-            if (GetTime<std::chrono::seconds>() > start + std::chrono::minutes{1}) {
+            if (!add_fixed_seeds_now &&
+                GetTime<std::chrono::seconds>() > start + std::chrono::minutes{1}) {
                 add_fixed_seeds_now = true;
                 LogInfo("Adding fixed seeds as 60 seconds have passed and addrman is empty for at least one reachable network\n");
             }
@@ -2648,20 +2699,32 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, std
             }
 
             if (add_fixed_seeds_now) {
-                std::vector<CAddress> seed_addrs{ConvertSeeds(m_params.FixedSeeds())};
+                std::vector<CAddress> seed_addrs{ConvertSeeds(
+                    b3_fixed_seed_rescue ? m_params.ModernRecoverySeeds()
+                                          : m_params.FixedSeeds())};
                 // We will not make outgoing connections to peers that are unreachable
                 // (e.g. because of -onlynet configuration).
                 // Therefore, we do not add them to addrman in the first place.
                 // In case previously unreachable networks become reachable
                 // (e.g. in case of -onlynet changes by the user), fixed seeds will
                 // be loaded only for networks for which we have no addresses.
-                seed_addrs.erase(std::remove_if(seed_addrs.begin(), seed_addrs.end(),
-                                                [&fixed_seed_networks](const CAddress& addr) { return !fixed_seed_networks.contains(addr.GetNetwork()); }),
+                seed_addrs.erase(std::remove_if(
+                                     seed_addrs.begin(), seed_addrs.end(),
+                                     [&](const CAddress& addr) {
+                                         return b3_fixed_seed_rescue
+                                                    ? !g_reachable_nets.Contains(addr)
+                                                    : !fixed_seed_networks.contains(addr.GetNetwork());
+                                     }),
                                  seed_addrs.end());
                 CNetAddr local;
                 local.SetInternal("fixedseeds");
                 addrman.get().Add(seed_addrs, local);
                 add_fixed_seeds = false;
+                if (b3_fixed_seed_rescue) {
+                    add_b3_fixed_seed_rescue = false;
+                    LogInfo("Adding B3 modern recovery seeds after 60 seconds with %d of %d usable full outbound peers\n",
+                            usable_full_outbound, b3_fixed_seed_rescue_target);
+                }
                 LogInfo("Added %d fixed seeds from reachable networks.\n", seed_addrs.size());
             }
         }

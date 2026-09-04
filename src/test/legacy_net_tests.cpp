@@ -6,8 +6,10 @@
 //! capabilities. All peers are in-process mocks; no live peers are
 //! contacted.
 
-#include <consensus/era.h>
+#include <addrman.h>
+#include <banman.h>
 #include <chain.h>
+#include <consensus/era.h>
 #include <crypto/common.h>
 #include <legacy/consensus.h>
 #include <net.h>
@@ -22,6 +24,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <memory>
 #include <span>
 #include <string>
@@ -422,6 +425,7 @@ BOOST_AUTO_TEST_CASE(modern_archival_peer_owns_legacy_window_and_renegotiates_at
     // VERSION cannot change on an open socket. Once our tip reaches H, every
     // connection on which we sent 80008 is closed without punishment so the
     // upgraded pair immediately renegotiates the modern protocol.
+    BOOST_CHECK(!connman.B3ModernSeedRescueRequested());
     m_node.validation_signals->RegisterValidationInterface(&peerman);
     CBlockIndex boundary;
     uint256 boundary_hash{uint256::ONE};
@@ -429,6 +433,7 @@ BOOST_AUTO_TEST_CASE(modern_archival_peer_owns_legacy_window_and_renegotiates_at
     boundary.nHeight = *Consensus::LegacyFinalHeight(Params().GetConsensus());
     m_node.validation_signals->ActiveTipChange(boundary, /*is_ibd=*/false);
     m_node.validation_signals->UnregisterValidationInterface(&peerman);
+    BOOST_CHECK(connman.B3ModernSeedRescueRequested());
     BOOST_CHECK(modern->fDisconnect);
     BOOST_CHECK(peerman.SendMessages(*pending));
     BOOST_CHECK(pending->fDisconnect);
@@ -463,20 +468,87 @@ BOOST_AUTO_TEST_CASE(modern_archival_peer_owns_legacy_window_and_renegotiates_at
     BOOST_CHECK_EQUAL(modern_handshake->GetCommonVersion(), PROTOCOL_VERSION);
     peerman.FinalizeNode(*modern_handshake);
 
-    // A post-H outbound 80009 connection can also accept an old node's 80008
-    // reply and safely downgrade only that socket to the legacy capability
-    // mode used for serving sealed history.
+    // A post-H automatic outbound 80009 connection must reject an old node's
+    // 80008 reply. It cannot supply modern headers or blocks, and keeping it
+    // would let obsolete addresses occupy every useful synchronization slot.
+    // This is a clean capability disconnect, not a ban or a consensus fault.
     auto historical_outbound{MakeNode(5)};
+    CAddress remembered_historical{historical_outbound->addr,
+                                   ServiceFlags(NODE_NETWORK | NODE_WITNESS | NODE_B3_FLOWMESH)};
+    BOOST_REQUIRE(m_node.addrman->Add({remembered_historical}, ip(500)));
     connman.Handshake(*historical_outbound,
+                      /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS | NODE_B3_FLOWMESH),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/legacy::P2P_PROTOCOL_VERSION,
+                      /*relay_txs=*/true);
+    BOOST_CHECK(historical_outbound->fDisconnect);
+    BOOST_CHECK(!m_node.banman->IsBanned(historical_outbound->addr));
+    BOOST_CHECK(!m_node.banman->IsDiscouraged(historical_outbound->addr));
+    const auto remembered{m_node.addrman->GetAddr(
+        /*max_addresses=*/0, /*max_pct=*/0, /*network=*/std::nullopt,
+        /*filtered=*/false)};
+    const auto found{std::find_if(
+        remembered.begin(), remembered.end(), [&](const CAddress& candidate) {
+            return static_cast<const CService&>(candidate) == historical_outbound->addr;
+        })};
+    BOOST_REQUIRE(found != remembered.end());
+    BOOST_CHECK_EQUAL(found->nServices, NODE_NETWORK);
+    peerman.FinalizeNode(*historical_outbound);
+
+    // Block-relay slots are scarce too and obey the same post-H rule.
+    auto historical_block_relay{MakeNode(6, ConnectionType::BLOCK_RELAY)};
+    connman.Handshake(*historical_block_relay,
+                      /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/legacy::P2P_PROTOCOL_VERSION,
+                      /*relay_txs=*/false);
+    BOOST_CHECK(historical_block_relay->fDisconnect);
+    peerman.FinalizeNode(*historical_block_relay);
+
+    // Discovery-only automatic sockets must not promote obsolete addresses
+    // back into AddrMan's tried set after learning their historical banner.
+    for (const ConnectionType type : {ConnectionType::FEELER,
+                                      ConnectionType::ADDR_FETCH,
+                                      ConnectionType::PRIVATE_BROADCAST}) {
+        auto historical_discovery{MakeNode(9 + static_cast<int>(type), type)};
+        connman.Handshake(*historical_discovery,
+                          /*successfully_connected=*/true,
+                          /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS | NODE_B3_FLOWMESH),
+                          /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                          /*version=*/legacy::P2P_PROTOCOL_VERSION,
+                          /*relay_txs=*/false);
+        BOOST_CHECK(historical_discovery->fDisconnect);
+        peerman.FinalizeNode(*historical_discovery);
+    }
+
+    // An explicitly configured historical peer is harmless to the automatic
+    // slot pool and remains connected under operator control.
+    auto historical_manual{MakeNode(7, ConnectionType::MANUAL)};
+    connman.Handshake(*historical_manual,
                       /*successfully_connected=*/true,
                       /*remote_services=*/ServiceFlags(NODE_NETWORK),
                       /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
                       /*version=*/legacy::P2P_PROTOCOL_VERSION,
                       /*relay_txs=*/true);
-    BOOST_REQUIRE(!historical_outbound->fDisconnect);
-    BOOST_CHECK_EQUAL(historical_outbound->GetCommonVersion(),
+    BOOST_REQUIRE(!historical_manual->fDisconnect);
+    BOOST_CHECK_EQUAL(historical_manual->GetCommonVersion(),
                       legacy::P2P_COMPATIBILITY_VERSION);
-    peerman.FinalizeNode(*historical_outbound);
+    peerman.FinalizeNode(*historical_manual);
+
+    // The inherited Core capability number 70016 is not a legacy-B3 banner.
+    // A pre-80009 upgraded peer therefore remains a valid modern sync peer.
+    auto core_version_modern{MakeNode(8)};
+    connman.Handshake(*core_version_modern,
+                      /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/PROTOCOL_VERSION,
+                      /*relay_txs=*/true);
+    BOOST_REQUIRE(!core_version_modern->fDisconnect);
+    BOOST_CHECK_EQUAL(core_version_modern->GetCommonVersion(), PROTOCOL_VERSION);
+    peerman.FinalizeNode(*core_version_modern);
 
     // A lagging historical node now initiates an inbound connection to this
     // post-H archival node. The old client rejects any VERSION below 80006,

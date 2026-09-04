@@ -1331,6 +1331,11 @@ public:
 
     void StartExtraBlockRelayPeers();
 
+    /** Arm B3's one-shot modern peer rescue after entering the post-H network. */
+    void StartB3ModernSeedRescue();
+    /** Test/diagnostic view; the connection thread consumes this request. */
+    bool B3ModernSeedRescueRequested() const;
+
     // Count the number of full-relay peer we have.
     int GetFullOutboundConnCount() const;
     // Return the number of outbound peers we have in excess of our target (eg,
@@ -1743,6 +1748,9 @@ private:
      *  as these connections are intended to be short-lived and low-bandwidth.
      */
     std::atomic_bool m_start_extra_block_relay_peers{false};
+
+    /** Set by PeerManager only when a B3 node starts post-H or crosses H. */
+    std::atomic_bool m_b3_modern_seed_rescue_requested{false};
 
     /**
      * A vector of -bind=<address>:<port>=onion arguments each of which is

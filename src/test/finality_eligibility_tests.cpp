@@ -53,6 +53,13 @@ BOOST_FIXTURE_TEST_CASE(binding_required_and_one_weight_universe, FinalityChainF
     BOOST_CHECK(weights(m_vk_a) == std::make_pair(CAmount{15}, CAmount{16}));
     BOOST_CHECK(weights(m_vk_b) == std::make_pair(CAmount{1}, CAmount{16}));
     BOOST_CHECK(weights(m_vk_c) == std::make_pair(CAmount{0}, CAmount{16})); // unbound: ineligible
+    {
+        LOCK(cs_main);
+        const auto total_only{chainman.ActiveChainstate().ModernEligibilityWeights(
+            std::nullopt, *chainman.ActiveChain().Tip())};
+        BOOST_REQUIRE(total_only.has_value());
+        BOOST_CHECK(*total_only == std::make_pair(CAmount{0}, CAmount{16}));
+    }
     // C cannot produce the block at M; A can. W_block == W_finality.
     ProduceExpectConnectFailure(m_vk_c, {}, 1);
     Produce(m_vk_a);

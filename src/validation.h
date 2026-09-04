@@ -673,21 +673,24 @@ public:
     bool ReorgFromForkViolatesFinality(int fork_height) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /**
      * ONE STAKE UNIVERSE (plan Commit 14; owner ruling 2026-08-23, F = M):
-     * the block-production weights (w, W) of `validator_key` for the block
-     * that extends `parent`, read from the validator set in force at that
+     * the block-production weights (w, W) of optional `validator_key` for the
+     * block that extends `parent`, read from the validator set in force at that
      * height -- the same epoch snapshot (StakeTracker ACTIVE weights joined
      * with the non-revoked FINALITY_KEY bindings, whole modern B3) whose
      * weights define the finality quorum. A validator without a binding, with
      * a revoked binding, or below one whole B3 has w = 0 and is not
      * block-eligible; a mid-epoch binding change does not touch the snapshot
      * in force. Without any set (bootstrap floor not met) W = 0: nobody is
-     * eligible, the chain halts at M (fail closed). nullopt only when the
-     * derived state cannot be built (a block of the span is unreadable).
+     * eligible, the chain halts at M (fail closed). When no validator key is
+     * supplied, w = 0 while W still reports the projected set total. nullopt
+     * only when the derived state cannot be built (a block of the span is
+     * unreadable).
      * Validation, block assembly and the staking loop all read here; there
      * is no other weight path for modern-PoS blocks.
      */
-    std::optional<std::pair<CAmount, CAmount>> ModernEligibilityWeights(const std::array<unsigned char, 32>& validator_key,
-                                                                        const CBlockIndex& parent) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    std::optional<std::pair<CAmount, CAmount>> ModernEligibilityWeights(
+        const std::optional<std::array<unsigned char, 32>>& validator_key,
+        const CBlockIndex& parent) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     //! Return path to chainstate leveldb directory.
     fs::path StoragePath() const;

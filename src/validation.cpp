@@ -2539,7 +2539,8 @@ bool Chainstate::ReorgFromForkViolatesFinality(const int fork_height) const
 }
 
 std::optional<std::pair<CAmount, CAmount>> Chainstate::ModernEligibilityWeights(
-    const std::array<unsigned char, 32>& validator_key, const CBlockIndex& parent)
+    const std::optional<std::array<unsigned char, 32>>& validator_key,
+    const CBlockIndex& parent)
 {
     AssertLockHeld(::cs_main);
     const Consensus::Params& consensus{m_chainman.GetConsensus()};
@@ -2556,7 +2557,7 @@ std::optional<std::pair<CAmount, CAmount>> Chainstate::ModernEligibilityWeights(
                        bridge_index)) return std::nullopt;
     const auto set{finality.SetInForceAt(parent.nHeight + 1, consensus)};
     if (!set) return std::make_pair(CAmount{0}, CAmount{0});
-    const auto index{set->IndexOf(validator_key)};
+    const auto index{validator_key ? set->IndexOf(*validator_key) : std::nullopt};
     const CAmount w{index ? static_cast<CAmount>(set->Members()[*index].weight) : CAmount{0}};
     return std::make_pair(w, static_cast<CAmount>(set->TotalWeight()));
 }

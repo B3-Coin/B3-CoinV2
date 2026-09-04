@@ -49,7 +49,7 @@ namespace {
 // BIP155-serialized CService entries for B3Coin IPv4 bootstrap peers. Each
 // entry is:
 // IPv4 network id, address length, IPv4 octets, then port 5647 (big-endian).
-constexpr std::array<uint8_t, 33 * 8> B3COIN_FIXED_SEEDS{
+constexpr std::array<uint8_t, 36 * 8> B3COIN_FIXED_SEEDS{
     0x01, 0x04, 0x65, 0x6f, 0x59, 0x55, 0x16, 0x0f, // 101.111.89.85
     0x01, 0x04, 0xbc, 0x44, 0x34, 0xac, 0x16, 0x0f, // 188.68.52.172
     0x01, 0x04, 0x65, 0xb0, 0x76, 0x67, 0x16, 0x0f, // 101.176.118.103
@@ -83,11 +83,26 @@ constexpr std::array<uint8_t, 33 * 8> B3COIN_FIXED_SEEDS{
     0x01, 0x04, 0x5f, 0xb3, 0x97, 0xba, 0x16, 0x0f, // 95.179.151.186
     0x01, 0x04, 0x5f, 0xb3, 0x9d, 0x37, 0x16, 0x0f, // 95.179.157.55
     0x01, 0x04, 0x62, 0x61, 0x8f, 0x0e, 0x16, 0x0f, // 98.97.143.14
+    // Transition-capable peers are also ordinary fresh-node seeds. Their
+    // modern-only duplicate below is used by the bounded recovery path.
+    0x01, 0x04, 0x26, 0xbf, 0xf6, 0xa6, 0x16, 0x0f, // 38.191.246.166
+    0x01, 0x04, 0x2e, 0x97, 0x8c, 0x05, 0x16, 0x0f, // 46.151.140.5
+    0x01, 0x04, 0x4d, 0x4a, 0x53, 0x93, 0x16, 0x0f, // 77.74.83.147
     // Owner-supplied release-v1 seed (ruling 2026-08-23). At least two more
     // independently hosted fixed seeds and an owner-controlled DNS seed are
     // required before the final release; no explorer peers are hardcoded
     // without operator approval.
     0x01, 0x04, 0xb0, 0x1f, 0x0d, 0xc6, 0x16, 0x0f, // 176.31.13.198
+};
+
+// Transition-capable recovery peers observed on distinct IPv4 netgroups.
+// Keep these separate from the historical seed set: the post-transition
+// rescue path must not repeatedly advertise legacy-only peers as modern.
+// These are ordinary discovery hints, never trusted consensus sources.
+constexpr std::array<uint8_t, 3 * 8> B3COIN_MODERN_RECOVERY_SEEDS{
+    0x01, 0x04, 0x26, 0xbf, 0xf6, 0xa6, 0x16, 0x0f, // 38.191.246.166
+    0x01, 0x04, 0x2e, 0x97, 0x8c, 0x05, 0x16, 0x0f, // 46.151.140.5
+    0x01, 0x04, 0x4d, 0x4a, 0x53, 0x93, 0x16, 0x0f, // 77.74.83.147
 };
 
 // Sealed mainnet transition constants. S_H is the exact spendable supply at
@@ -434,6 +449,8 @@ public:
         // still online.
         vSeeds.clear();
         vFixedSeeds.assign(B3COIN_FIXED_SEEDS.begin(), B3COIN_FIXED_SEEDS.end());
+        vModernRecoverySeeds.assign(B3COIN_MODERN_RECOVERY_SEEDS.begin(),
+                                    B3COIN_MODERN_RECOVERY_SEEDS.end());
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,63);
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,85);
@@ -1111,9 +1128,9 @@ public:
         m_assumeutxo_data = {
             {   // For use by unit tests
                 .height = 110,
-                .hash_serialized = AssumeutxoHash{uint256{"b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327"}},
+                .hash_serialized = AssumeutxoHash{uint256{"fd1ec1f3b8d4063995c7cf97556e2d45602ddacd4dd3cd912e066da2f3455685"}},
                 .m_chain_tx_count = 111,
-                .blockhash = uint256{"6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"},
+                .blockhash = uint256{"76197ca032a8164db4563574e4829518b613a6d95b112ceca064feb9269def1f"},
             },
             {
                 // For use by fuzz target src/test/fuzz/utxo_snapshot.cpp

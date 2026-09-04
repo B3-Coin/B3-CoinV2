@@ -70,6 +70,7 @@ RPCHelpMan createstake()
         "Lock an amount of B3 as a STAKE output for this wallet's validator key (Modern PoS V1).\n"
         "The validator key is created on first use and held by the wallet. The output becomes\n"
         "PENDING when confirmed and ACTIVE once buried STAKE_ACTIVATION_DEPTH blocks deep; it is\n"
+        "included in weight at Set0 bootstrap or through a later certified set rotation. It is\n"
         "never auto-selected for ordinary spends (unstaking is an explicit spend of the outpoint).\n"
         "Requires the modern era (after the legacy boundary H) and an unlocked wallet.\n",
         {
@@ -156,8 +157,8 @@ RPCHelpMan getstakinginfo()
                 {RPCResult::Type::BOOL, "modern_pos_active", "whether the next block is a modern-PoS block with rules configured"},
                 {RPCResult::Type::STR_AMOUNT, "min_stake_amount", /*optional=*/true, "the network's minimum stake"},
                 {RPCResult::Type::NUM, "activation_depth", "blocks after inclusion until a stake is ACTIVE"},
-                {RPCResult::Type::NUM, "active_weight", "this validator's block-production weight at the next height, in whole modern B3 (bound + ACTIVE stake; the finality weight)"},
-                {RPCResult::Type::NUM, "total_active_weight", "the validator set's total weight at the next height, in whole modern B3"},
+                {RPCResult::Type::NUM, "active_weight", "this validator's epoch-frozen block-production/finality weight at the next height, in whole modern B3; once a set is in force, newly ACTIVE stake enters only through a later certified rotation"},
+                {RPCResult::Type::NUM, "total_active_weight", "the epoch-frozen validator set's total weight at the next height, in whole modern B3"},
                 {RPCResult::Type::OBJ, "staking", "the node's staking loop",
                  {
                      {RPCResult::Type::BOOL, "available", "a staking loop exists in this node"},
@@ -539,7 +540,7 @@ RPCHelpMan getfinalityinfo()
                       {RPCResult::Type::OBJ, "validator_set", "the set in force",
                        {
                            {RPCResult::Type::BOOL, "member", "this validator is in the current set (block-eligible)"},
-                           {RPCResult::Type::NUM, "weight", "this validator's weight (whole modern B3)"},
+                           {RPCResult::Type::NUM, "weight", "this validator's epoch-frozen current-set weight (whole modern B3)"},
                            {RPCResult::Type::NUM, "total_weight", ""},
                            {RPCResult::Type::NUM, "quorum_weight", ""},
                            {RPCResult::Type::NUM, "size", ""},

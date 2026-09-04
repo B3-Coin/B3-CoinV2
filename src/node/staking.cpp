@@ -215,10 +215,12 @@ void StakingLoop::FillChainFacts(interfaces::StakingStatus& status, const std::o
     status.modern_pos_active = params.legacy_b3coin && params.modern_pos.has_value() &&
                                Consensus::LegacyBoundaryPinned(params) &&
                                Consensus::GetConsensusPhase(next_height, params) == Consensus::ConsensusPhase::MODERN_POS;
-    if (!key || !params.legacy_b3coin || !Consensus::LegacyBoundaryPinned(params)) return;
-    // One stake universe: the weights the validation rule will apply to the
-    // next block (whole modern B3, bound + ACTIVE stake).
-    const auto weights{chainstate.ModernEligibilityWeights(*key, *tip)};
+    if (!params.legacy_b3coin || !Consensus::LegacyBoundaryPinned(params)) return;
+    // One stake universe: the epoch-frozen weights the validation rule will
+    // apply to the next block (whole modern B3). Once an epoch set is in
+    // force, newly ACTIVE stake is picked up only by a later certified set
+    // rotation, never mid-epoch.
+    const auto weights{chainstate.ModernEligibilityWeights(key, *tip)};
     if (!weights) return;
     status.active_weight = weights->first;
     status.total_active_weight = weights->second;

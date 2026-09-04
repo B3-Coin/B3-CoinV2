@@ -114,6 +114,8 @@ public:
     const std::vector<unsigned char>& Base58Prefix(Base58Type type) const { return base58Prefixes[type]; }
     const std::string& Bech32HRP() const { return bech32_hrp; }
     const std::vector<uint8_t>& FixedSeeds() const { return vFixedSeeds; }
+    /** Modern-capable discovery hints used by B3's bounded transition rescue. */
+    const std::vector<uint8_t>& ModernRecoverySeeds() const { return vModernRecoverySeeds; }
     const HeadersSyncParams& HeadersSync() const { return m_headers_sync_params; }
 
     std::optional<AssumeutxoData> AssumeutxoForHeight(int height) const
@@ -218,6 +220,7 @@ protected:
     ChainType m_chain_type;
     CBlock genesis;
     std::vector<uint8_t> vFixedSeeds;
+    std::vector<uint8_t> vModernRecoverySeeds;
     bool fDefaultConsistencyChecks;
     bool m_is_mockable_chain;
     std::vector<AssumeutxoData> m_assumeutxo_data;

@@ -136,20 +136,37 @@ BOOST_AUTO_TEST_CASE(legacy_bootstrap_addresses_are_fixed_seeds)
     const auto params{CChainParams::Main()};
     BOOST_CHECK(params->DNSSeeds().empty());
 
-    ParamsStream stream{SpanReader{params->FixedSeeds()}, CAddress::V2_NETWORK};
-    std::vector<CService> endpoints;
-    while (!stream.empty()) {
-        CService endpoint;
-        stream >> endpoint;
-        endpoints.push_back(std::move(endpoint));
-    }
+    const auto decode_endpoints = [](const std::vector<uint8_t>& serialized) {
+        ParamsStream stream{SpanReader{serialized}, CAddress::V2_NETWORK};
+        std::vector<CService> endpoints;
+        while (!stream.empty()) {
+            CService endpoint;
+            stream >> endpoint;
+            endpoints.push_back(std::move(endpoint));
+        }
+        return endpoints;
+    };
 
-    // 32 historical bootstrap peers plus the owner-supplied release-v1 seed
-    // (ruling 2026-08-23, appended last in 958eeb3).
-    BOOST_REQUIRE_EQUAL(endpoints.size(), 33U);
+    const std::vector<CService> endpoints{decode_endpoints(params->FixedSeeds())};
+
+    // 32 historical bootstrap peers, three transition-capable peers available
+    // to ordinary fresh nodes, and the owner-supplied release-v1 seed last.
+    BOOST_REQUIRE_EQUAL(endpoints.size(), 36U);
     BOOST_CHECK_EQUAL(endpoints.front().ToStringAddrPort(), "101.111.89.85:5647");
     BOOST_CHECK_EQUAL(endpoints[31].ToStringAddrPort(), "98.97.143.14:5647");
+    BOOST_CHECK_EQUAL(endpoints[32].ToStringAddrPort(), "38.191.246.166:5647");
+    BOOST_CHECK_EQUAL(endpoints[33].ToStringAddrPort(), "46.151.140.5:5647");
+    BOOST_CHECK_EQUAL(endpoints[34].ToStringAddrPort(), "77.74.83.147:5647");
     BOOST_CHECK_EQUAL(endpoints.back().ToStringAddrPort(), "176.31.13.198:5647");
+
+    // The rescue list is deliberately modern-only so a stale peers.dat cannot
+    // cause historical-only endpoints to be re-advertised as capable peers.
+    const std::vector<CService> recovery_endpoints{
+        decode_endpoints(params->ModernRecoverySeeds())};
+    BOOST_REQUIRE_EQUAL(recovery_endpoints.size(), 3U);
+    BOOST_CHECK_EQUAL(recovery_endpoints[0].ToStringAddrPort(), "38.191.246.166:5647");
+    BOOST_CHECK_EQUAL(recovery_endpoints[1].ToStringAddrPort(), "46.151.140.5:5647");
+    BOOST_CHECK_EQUAL(recovery_endpoints[2].ToStringAddrPort(), "77.74.83.147:5647");
 }
 
 BOOST_AUTO_TEST_CASE(live_legacy_client_wire_identity)

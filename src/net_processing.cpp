@@ -2317,7 +2317,11 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
     }
     // Seed the lock-free legacy-phase mirror from the loaded tip so outbound
     // service-flag selection is correct before the first tip change.
-    m_in_legacy_phase.store(WITH_LOCK(cs_main, return IsLegacyPhase()), std::memory_order_relaxed);
+    const bool legacy_phase{WITH_LOCK(cs_main, return IsLegacyPhase())};
+    m_in_legacy_phase.store(legacy_phase, std::memory_order_relaxed);
+    if (m_chainparams.GetConsensus().legacy_b3coin && !legacy_phase) {
+        m_connman.StartB3ModernSeedRescue();
+    }
 }
 
 void PeerManagerImpl::StartScheduledTasks(CScheduler& scheduler)
@@ -2357,6 +2361,7 @@ void PeerManagerImpl::ActiveTipChange(const CBlockIndex& new_tip, bool is_ibd)
         m_in_legacy_phase.exchange(legacy_phase, std::memory_order_relaxed) &&
         !legacy_phase};
     if (crossed_boundary) {
+        m_connman.StartB3ModernSeedRescue();
         std::set<NodeId> renegotiate;
         {
             LOCK(m_peer_mutex);
@@ -4106,21 +4111,53 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         }
         vRecv.ignore(8); // Ignore the addrMe service bits sent by the peer
         vRecv >> CNetAddr::V1(addrMe);
+        // B3's historical protocol versions occupy their own 80000..80008
+        // namespace. A peer using that codec cannot serve witness-era blocks
+        // or FlowMesh, regardless of unauthenticated service bits it may claim.
+        const bool remote_legacy_protocol{
+            m_chainparams.GetConsensus().legacy_b3coin &&
+            nVersion >= 80'000 &&
+            nVersion <= legacy::P2P_PROTOCOL_VERSION};
         if (!pfrom.IsInboundConn() && !pfrom.IsPrivateBroadcastConn())
         {
             // Overwrites potentially existing services. In contrast to this,
             // unvalidated services received via gossip relay in ADDR/ADDRV2
             // messages are only ever added but cannot replace existing ones.
-            m_addrman.SetServices(pfrom.addr, nServices);
+            // Normalize a historical peer to the only capability relevant to
+            // address selection. This prevents a false NODE_WITNESS claim from
+            // making an obsolete address immediately eligible again post-H.
+            const ServiceFlags addrman_services{
+                remote_legacy_protocol
+                    ? ((nServices & NODE_NETWORK) ? NODE_NETWORK : NODE_NONE)
+                    : nServices};
+            m_addrman.SetServices(pfrom.addr, addrman_services);
         }
         // Record the remote banner first. The effective connection mode is
         // resolved below after an inbound connection has sent its own VERSION:
         // if either endpoint advertised the historical range, both sides must
         // use the legacy standalone-transaction/common-version mode.
-        const bool remote_legacy_protocol{
-            m_chainparams.GetConsensus().legacy_b3coin &&
-            nVersion >= 80'000 &&
-            nVersion <= legacy::P2P_PROTOCOL_VERSION};
+        // Once this node has crossed the sealed legacy boundary, any automatic
+        // connection to an 80000..80008 peer is unusable for modern discovery
+        // or synchronization. Keeping one can fill a scarce automatic slot or
+        // promote an obsolete address back into AddrMan, leaving an upgraded
+        // wallet parked at H forever.
+        //
+        // This is capability selection, not misbehavior. Record the peer's
+        // actual services above so AddrMan will not immediately select the
+        // same obsolete candidate again, then release automatic full-relay,
+        // block-relay, feeler, address-fetch and private-broadcast connections.
+        // Inbound historical peers remain connected so this archival node can
+        // serve them through H, and a manual/addnode connection remains under
+        // the operator's control.
+        if (remote_legacy_protocol &&
+            !m_in_legacy_phase.load(std::memory_order_relaxed) &&
+            !pfrom.IsInboundConn() &&
+            !pfrom.IsManualConn()) {
+            LogInfo("Disconnecting legacy-protocol outbound peer after the sealed boundary, %s\n",
+                    pfrom.DisconnectMsg(fLogIPs));
+            pfrom.fDisconnect = true;
+            return;
+        }
 
         // A legacy-protocol peer can never offer modern service bits such
         // as NODE_WITNESS; it only needs to serve the network.

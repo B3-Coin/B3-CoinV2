@@ -161,10 +161,12 @@ struct StakingStatus {
     std::string next_block_phase;
     //! Modern PoS is configured and the next block is a modern-PoS block.
     bool modern_pos_active{false};
-    //! Block-production weight of the selected validator key and the total
-    //! weight of the validator set in force at the next height, in whole
-    //! modern B3 (one stake universe: bound + ACTIVE stake, the same numbers
-    //! that define the finality quorum).
+    //! Epoch-frozen block-production weight of the selected validator key and
+    //! total weight of the validator set in force at the next height, in whole
+    //! modern B3 (one stake universe: the same snapshot numbers that define
+    //! the finality quorum). Once an epoch set is in force, newly ACTIVE stake
+    //! enters only at a later certified rotation; it never mutates that set
+    //! mid-epoch.
     CAmount active_weight{0};
     CAmount total_active_weight{0};
     std::optional<CAmount> min_stake_amount;
