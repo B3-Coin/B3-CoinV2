@@ -27,12 +27,12 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 # Project / Package metadata
 #=============================
 set(CLIENT_NAME "B3 FlowMesh client")
-# B3 Hive product versioning. v1.1.2 is the peer-recovery and bridge-safety
-# follow-up to v1.1.1; P2P protocol versioning remains independent.
+# B3 Hive product versioning. v1.1.3 is the fork-recovery and Qt-updater
+# follow-up to v1.1.2; P2P protocol versioning remains independent.
 # The P2P protocol version is a separate constant and is unaffected.
 set(CLIENT_VERSION_MAJOR 1)
 set(CLIENT_VERSION_MINOR 1)
-set(CLIENT_VERSION_BUILD 2)
+set(CLIENT_VERSION_BUILD 3)
 set(CLIENT_VERSION_RC 0)
 # Final transition/validator release.
 set(CLIENT_VERSION_PRERELEASE "")
@@ -198,6 +198,99 @@ option(BUILD_BENCH "Build bench_bitcoin executable." OFF)
 option(B3_FINALITY_BENCH "Build the B3 finality benchmark harness (timing of the consensus BLS wrapper and MPA codecs)." OFF)
 option(B3_BRIDGE_TOOLS "Build the B3 bridge proof/payload verifier and bootstrap-calldata tools (operator/test tooling only, never part of the node)." OFF)
 option(B3_UPDATE_TOOLS "Build the offline B3 Hive release-manifest signing tool (b3hive-sign; operator tooling, never part of the node)." OFF)
+
+# Production B3 Hive update-channel trust is a build input. Public keys and
+# endpoint metadata are compiled into the GUI; private signing keys must stay
+# on offline operator machines. A partially specified channel is always an
+# error. Release automation sets B3_REQUIRE_UPDATE_CHANNEL so it cannot
+# accidentally publish another GUI with a disabled updater.
+set(B3_UPDATE_MANIFEST_URL "" CACHE STRING "HTTPS URL of the signed B3 Hive stable update manifest.")
+set(B3_UPDATE_PUBLIC_KEYS "" CACHE STRING "Comma-separated x-only B3 Hive release public keys (64 hex characters each).")
+set(B3_UPDATE_SIGNATURE_THRESHOLD "0" CACHE STRING "Number of distinct pinned signatures required on a B3 Hive update manifest.")
+set(B3_UPDATE_ALLOWED_HOSTS "" CACHE STRING "Comma-separated HTTPS hosts allowed for B3 Hive manifests, artifacts, and redirects.")
+option(B3_REQUIRE_UPDATE_CHANNEL "Fail configuration unless a complete production B3 Hive update channel is supplied." OFF)
+
+set(B3_UPDATE_CHANNEL_CONFIGURED 0)
+set(B3_UPDATE_PUBLIC_KEYS_NORMALIZED "")
+set(B3_UPDATE_ALLOWED_HOSTS_NORMALIZED "")
+if(NOT B3_UPDATE_MANIFEST_URL STREQUAL "" OR
+   NOT B3_UPDATE_PUBLIC_KEYS STREQUAL "" OR
+   NOT B3_UPDATE_SIGNATURE_THRESHOLD STREQUAL "0" OR
+   NOT B3_UPDATE_ALLOWED_HOSTS STREQUAL "")
+  if(B3_UPDATE_MANIFEST_URL STREQUAL "" OR
+     B3_UPDATE_PUBLIC_KEYS STREQUAL "" OR
+     B3_UPDATE_SIGNATURE_THRESHOLD STREQUAL "0" OR
+     B3_UPDATE_ALLOWED_HOSTS STREQUAL "")
+    message(FATAL_ERROR "B3 update channel is incomplete: URL, public keys, threshold, and allowed hosts are all required")
+  endif()
+  string(LENGTH "${B3_UPDATE_MANIFEST_URL}" B3_UPDATE_MANIFEST_URL_LENGTH)
+  if(B3_UPDATE_MANIFEST_URL_LENGTH GREATER 1024 OR
+     B3_UPDATE_MANIFEST_URL MATCHES "[\"\\\\;\r\n]" OR
+     NOT B3_UPDATE_MANIFEST_URL MATCHES "^https://[A-Za-z0-9][A-Za-z0-9.-]*(:443)?([/?#].*)?$")
+    message(FATAL_ERROR "B3_UPDATE_MANIFEST_URL must be a safe HTTPS URL of at most 1024 characters")
+  endif()
+  if(NOT B3_UPDATE_SIGNATURE_THRESHOLD MATCHES "^([1-9]|[1-5][0-9]|6[0-4])$")
+    message(FATAL_ERROR "B3_UPDATE_SIGNATURE_THRESHOLD must be a decimal integer from 1 through 64")
+  endif()
+
+  if(B3_UPDATE_PUBLIC_KEYS MATCHES "(^,|,$|,,)")
+    message(FATAL_ERROR "B3_UPDATE_PUBLIC_KEYS must be a comma-separated list without empty entries")
+  endif()
+  string(REPLACE "," ";" B3_UPDATE_PUBLIC_KEY_LIST "${B3_UPDATE_PUBLIC_KEYS}")
+  set(B3_UPDATE_PUBLIC_KEY_LIST_NORMALIZED "")
+  set(B3_UPDATE_PUBLIC_KEY_ID_LIST "")
+  foreach(B3_UPDATE_PUBLIC_KEY IN LISTS B3_UPDATE_PUBLIC_KEY_LIST)
+    string(LENGTH "${B3_UPDATE_PUBLIC_KEY}" B3_UPDATE_PUBLIC_KEY_LENGTH)
+    if(NOT B3_UPDATE_PUBLIC_KEY_LENGTH EQUAL 64 OR
+       NOT B3_UPDATE_PUBLIC_KEY MATCHES "^[0-9A-Fa-f]+$")
+      message(FATAL_ERROR "Each B3 update public key must contain exactly 64 hexadecimal characters")
+    endif()
+    string(TOLOWER "${B3_UPDATE_PUBLIC_KEY}" B3_UPDATE_PUBLIC_KEY)
+    if(B3_UPDATE_PUBLIC_KEY IN_LIST B3_UPDATE_PUBLIC_KEY_LIST_NORMALIZED)
+      message(FATAL_ERROR "B3_UPDATE_PUBLIC_KEYS contains a duplicate release authority")
+    endif()
+    # Manifests identify signers by the first four public-key bytes. Reject a
+    # collision up front so one signature line can never be ambiguous.
+    string(SUBSTRING "${B3_UPDATE_PUBLIC_KEY}" 0 8 B3_UPDATE_PUBLIC_KEY_ID)
+    if(B3_UPDATE_PUBLIC_KEY_ID IN_LIST B3_UPDATE_PUBLIC_KEY_ID_LIST)
+      message(FATAL_ERROR "B3_UPDATE_PUBLIC_KEYS contains colliding 8-hex signer identifiers")
+    endif()
+    list(APPEND B3_UPDATE_PUBLIC_KEY_ID_LIST "${B3_UPDATE_PUBLIC_KEY_ID}")
+    list(APPEND B3_UPDATE_PUBLIC_KEY_LIST_NORMALIZED "${B3_UPDATE_PUBLIC_KEY}")
+  endforeach()
+  list(LENGTH B3_UPDATE_PUBLIC_KEY_LIST_NORMALIZED B3_UPDATE_PUBLIC_KEY_COUNT)
+  if(B3_UPDATE_PUBLIC_KEY_COUNT GREATER 64 OR
+     B3_UPDATE_SIGNATURE_THRESHOLD GREATER B3_UPDATE_PUBLIC_KEY_COUNT)
+    message(FATAL_ERROR "B3 update signature threshold must be satisfiable by at most 64 distinct public keys")
+  endif()
+  list(JOIN B3_UPDATE_PUBLIC_KEY_LIST_NORMALIZED "," B3_UPDATE_PUBLIC_KEYS_NORMALIZED)
+
+  if(B3_UPDATE_ALLOWED_HOSTS MATCHES "(^,|,$|,,)")
+    message(FATAL_ERROR "B3_UPDATE_ALLOWED_HOSTS must be a comma-separated list without empty entries")
+  endif()
+  string(REPLACE "," ";" B3_UPDATE_ALLOWED_HOST_LIST "${B3_UPDATE_ALLOWED_HOSTS}")
+  set(B3_UPDATE_ALLOWED_HOST_LIST_NORMALIZED "")
+  foreach(B3_UPDATE_ALLOWED_HOST IN LISTS B3_UPDATE_ALLOWED_HOST_LIST)
+    if(NOT B3_UPDATE_ALLOWED_HOST MATCHES "^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
+      message(FATAL_ERROR "Each B3 update allowed host must be a hostname without a scheme, port, or path")
+    endif()
+    string(TOLOWER "${B3_UPDATE_ALLOWED_HOST}" B3_UPDATE_ALLOWED_HOST)
+    if(NOT B3_UPDATE_ALLOWED_HOST IN_LIST B3_UPDATE_ALLOWED_HOST_LIST_NORMALIZED)
+      list(APPEND B3_UPDATE_ALLOWED_HOST_LIST_NORMALIZED "${B3_UPDATE_ALLOWED_HOST}")
+    endif()
+  endforeach()
+  list(JOIN B3_UPDATE_ALLOWED_HOST_LIST_NORMALIZED "," B3_UPDATE_ALLOWED_HOSTS_NORMALIZED)
+
+  string(REGEX REPLACE "^https://([^/:?#]+)(:443)?([/?#].*)?$" "\\1" B3_UPDATE_MANIFEST_HOST "${B3_UPDATE_MANIFEST_URL}")
+  string(TOLOWER "${B3_UPDATE_MANIFEST_HOST}" B3_UPDATE_MANIFEST_HOST)
+  if(NOT B3_UPDATE_MANIFEST_HOST IN_LIST B3_UPDATE_ALLOWED_HOST_LIST_NORMALIZED)
+    message(FATAL_ERROR "The B3 update manifest host must appear in B3_UPDATE_ALLOWED_HOSTS")
+  endif()
+  set(B3_UPDATE_CHANNEL_CONFIGURED 1)
+endif()
+if(B3_REQUIRE_UPDATE_CHANNEL AND NOT B3_UPDATE_CHANNEL_CONFIGURED)
+  message(FATAL_ERROR "A complete B3 update channel is required for this build")
+endif()
 # The vendored blst (src/blst) is a consensus dependency of crypto/bls since
 # plan Commit 2 (cmake/blst.cmake). Upstream defines exactly two build paths
 # and the processor selects between them (mirroring upstream build.sh):

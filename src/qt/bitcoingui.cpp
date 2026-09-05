@@ -1489,10 +1489,22 @@ void BitcoinGUI::message(const QString& title, QString message, unsigned int sty
 void BitcoinGUI::changeEvent(QEvent *e)
 {
     if (e->type() == QEvent::PaletteChange) {
-        overviewAction->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/overview")));
-        sendCoinsAction->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/send")));
-        receiveCoinsAction->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/receiving_addresses")));
-        historyAction->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/history")));
+        // restoreGeometry() can synchronously deliver a palette change while
+        // this window is still being constructed, before createActions() has
+        // initialized every action. Keep the handler safe throughout partial
+        // construction (and teardown) rather than assuming all four exist.
+        if (overviewAction) {
+            overviewAction->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/overview")));
+        }
+        if (sendCoinsAction) {
+            sendCoinsAction->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/send")));
+        }
+        if (receiveCoinsAction) {
+            receiveCoinsAction->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/receiving_addresses")));
+        }
+        if (historyAction) {
+            historyAction->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/history")));
+        }
     }
 
     QMainWindow::changeEvent(e);

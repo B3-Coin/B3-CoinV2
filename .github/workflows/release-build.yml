@@ -101,10 +101,12 @@ jobs:
             qt6-base-dev qt6-tools-dev qt6-l10n-tools libqrencode-dev
       - name: Configure exact-source release tests
         run: >-
-          cmake -B build-test -DCMAKE_BUILD_TYPE=Release
+          cmake -C contrib/b3hive-release/stable-channel-v1.cmake
+          -B build-test -DCMAKE_BUILD_TYPE=Release
           -DBUILD_GUI=ON -DBUILD_TESTS=ON -DBUILD_GUI_TESTS=ON
           -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF
           -DB3_BRIDGE_TOOLS=ON
+          -DB3_REQUIRE_UPDATE_CHANNEL=ON
       - name: Build test and functional-test programs
         run: >-
           cmake --build build-test -j"$(nproc)" --target
@@ -192,10 +194,12 @@ jobs:
             qt6-base-dev qt6-tools-dev qt6-l10n-tools libqrencode-dev
       - name: Configure
         run: >-
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -C contrib/b3hive-release/stable-channel-v1.cmake
+          -B build -DCMAKE_BUILD_TYPE=Release
           -DBUILD_GUI=ON -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF
           -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON
           -DB3_BRIDGE_TOOLS=ON
+          -DB3_REQUIRE_UPDATE_CHANNEL=ON
       - name: Build
         # Release packaging compiles only the programs that ship to users.
         # The release-tests job qualifies the exact same source revision.
@@ -362,9 +366,11 @@ jobs:
           cd depends && make HOST=x86_64-w64-mingw32 -j"$(nproc)"
       - name: Configure + build
         run: |
-          cmake -B build --toolchain depends/x86_64-w64-mingw32/toolchain.cmake \
+          cmake -C contrib/b3hive-release/stable-channel-v1.cmake \
+            -B build --toolchain depends/x86_64-w64-mingw32/toolchain.cmake \
             -DBUILD_GUI=ON -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF \
             -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON \
+            -DB3_REQUIRE_UPDATE_CHANNEL=ON \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)" --target deploy
       - name: Verify x86-64 payload architecture
@@ -401,9 +407,11 @@ jobs:
         run: brew install cmake boost libevent sqlite capnp qt@6 qrencode
       - name: Configure + build
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=ON \
+          cmake -C contrib/b3hive-release/stable-channel-v1.cmake \
+            -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=ON \
             -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF \
             -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON \
+            -DB3_REQUIRE_UPDATE_CHANNEL=ON \
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
           # deploy creates the dependency-bundled GUI app. The raw CLI targets
@@ -484,9 +492,11 @@ jobs:
         run: brew install cmake boost libevent sqlite capnp qt@6 qrencode
       - name: Configure + build
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=ON \
+          cmake -C contrib/b3hive-release/stable-channel-v1.cmake \
+            -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=ON \
             -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF \
             -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON \
+            -DB3_REQUIRE_UPDATE_CHANNEL=ON \
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)" \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0

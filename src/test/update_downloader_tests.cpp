@@ -104,6 +104,24 @@ BOOST_AUTO_TEST_CASE(artifact_happy_path)
     BOOST_CHECK_EQUAL(files, 1U);
 }
 
+BOOST_AUTO_TEST_CASE(release_archive_keeps_conventional_extension)
+{
+    const std::string body(64, 'A');
+    FakeTransport t;
+    t.body = body;
+    Artifact artifact{Art(body, "https://rel.example/b3-hive-linux-x86_64.tar.gz")};
+    artifact.os = "linux";
+    artifact.arch = "x86_64";
+    artifact.format = "targz";
+    const fs::path dir{m_args.GetDataDirBase() / "updates_archive"};
+    fs::create_directories(dir);
+    std::string err;
+    const auto path{FetchArtifact(t, artifact, dir, Policy(), err)};
+    BOOST_REQUIRE_MESSAGE(path, err);
+    BOOST_CHECK_EQUAL(fs::PathToString(path->filename()),
+                      "hive-update-" + Sha(body).GetHex() + ".tar.gz");
+}
+
 BOOST_AUTO_TEST_CASE(redirect_policy)
 {
     const std::string body(64, 'R');

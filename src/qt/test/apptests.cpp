@@ -11,17 +11,21 @@
 #include <qt/bitcoingui.h>
 #include <qt/networkstyle.h>
 #include <qt/rpcconsole.h>
+#include <qt/updatecontroller.h>
 #include <test/util/setup_common.h>
 #include <validation.h>
 
 #include <QAction>
+#include <QEvent>
 #include <QLineEdit>
 #include <QRegularExpression>
 #include <QScopedPointer>
+#include <QSettings>
 #include <QSignalSpy>
 #include <QString>
 #include <QTest>
 #include <QTextEdit>
+#include <QWidget>
 #include <QtGlobal>
 #include <QtTest/QtTestWidgets>
 #include <QtTest/QtTestGui>
@@ -69,8 +73,21 @@ void AppTests::appTests()
     qRegisterMetaType<interfaces::BlockAndHeaderTipInfo>("interfaces::BlockAndHeaderTipInfo");
     m_app.parameterSetup();
     QVERIFY(m_app.createOptionsModel(/*resetSettings=*/true));
+    // A configured production build must not perform a real network check
+    // during the GUI test. The controller state itself is asserted below.
+    QSettings{}.setValue("fHiveUpdateAutoCheck", false);
     QScopedPointer<const NetworkStyle> style(NetworkStyle::instantiate(Params().GetChainType()));
     m_app.setupPlatformStyle();
+
+    // Exercise the saved-geometry constructor path. On macOS, restoreGeometry
+    // may synchronously send PaletteChange before BitcoinGUI::createActions().
+    // The window must tolerate that partially constructed state.
+    {
+        QWidget geometry_source;
+        geometry_source.resize(1200, 800);
+        QSettings settings;
+        settings.setValue("MainWindowGeometry", geometry_source.saveGeometry());
+    }
     m_app.createWindow(style.data());
     connect(&m_app, &BitcoinApplication::windowShown, this, &AppTests::guiTests);
     expectCallback("guiTests");
@@ -88,6 +105,16 @@ void AppTests::appTests()
 void AppTests::guiTests(BitcoinGUI* window)
 {
     HandleCallback callback{"guiTests", *this};
+
+    QVERIFY(window->updateController());
+    QCOMPARE(window->updateController()->configured(),
+             static_cast<bool>(B3_UPDATE_CHANNEL_CONFIGURED));
+    QCOMPARE(window->updateController()->installedVersion(), QStringLiteral("1.1.3"));
+
+    // Palette refresh remains valid after construction as well.
+    QEvent palette_change{QEvent::PaletteChange};
+    QVERIFY(QApplication::sendEvent(window, &palette_change));
+
     connect(window, &BitcoinGUI::consoleShown, this, &AppTests::consoleTests);
     expectCallback("consoleTests");
     QAction* action = window->findChild<QAction*>("openRPCConsoleAction");

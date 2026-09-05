@@ -5,8 +5,8 @@
 #ifndef B3COIN_NODE_STAKING_H
 #define B3COIN_NODE_STAKING_H
 
-#include <interfaces/chain.h>
 #include <crypto/bls.h>
+#include <interfaces/chain.h>
 #include <key.h>
 #include <script/script.h>
 #include <sync.h>
@@ -25,21 +25,60 @@ class ChainstateManager;
 class CTxMemPool;
 class PeerManager;
 
+namespace Consensus {
+struct ModernPosParams;
+}
+
 namespace node {
+
+class ValidatorSetSnapshot;
+
+/**
+ * Local, non-consensus proposer coordination for one existing Modern-PoS
+ * recovery round. Every consensus-eligible validator gets the same
+ * deterministic rank; rank zero sends at the round time and backups wait a
+ * short, bounded interval. This value is scheduling policy only: validation,
+ * fork choice and relay never consult it.
+ */
+enum class PreferredProposerAction {
+    SCHEDULE,
+    WAIT_NEXT_ROUND,
+    UNAVAILABLE,
+};
+
+struct PreferredProposerPlan {
+    PreferredProposerAction action{PreferredProposerAction::UNAVAILABLE};
+    uint32_t rank{0};
+    uint32_t eligible_count{0};
+    std::chrono::milliseconds delay{0};
+    std::chrono::milliseconds window{0};
+};
+
+/**
+ * Compute this validator's advisory send order among the members that are
+ * already consensus-eligible at (height, round). Invalid coordination input
+ * is distinguished from a local key that is ineligible or whose unique slot
+ * does not fit. WAIT_NEXT_ROUND is never permission to back-fill this one.
+ */
+PreferredProposerPlan ComputePreferredProposerPlan(
+    const uint256& chain_domain, const uint256& seed, int height,
+    int64_t round, const ValidatorSetSnapshot& set,
+    const std::array<unsigned char, 32>& validator_key,
+    const Consensus::ModernPosParams& pos);
 
 /**
  * The automatic Modern PoS staking loop (release-v1 validator UX, owner
  * ruling 2026-08-23: "automatic staking loop ... nothing more advanced in
  * V1").
  *
- * One thread, one validator key. For every new tip it asks the block
- * assembler for the deterministic modern-PoS template of this validator
- * (the assembler resolves the smallest eligible recovery round and forces
- * the exact round timestamp, frozen V1 spec §3-§4), waits until wall-clock
- * reaches that timestamp (the network refuses earlier blocks as
- * time-too-new), rebuilds the template with the latest transactions, signs
- * it with the validator key (spec §5) and submits it. A tip change while
- * waiting restarts the computation; any error is recorded and retried.
+ * One thread, one validator key. For every new tip it derives the current
+ * consensus recovery round from wall-clock time, ranks all validators already
+ * eligible in that round, and waits for this validator's unique advisory send
+ * window. The assembler rechecks eligibility for that exact round and forces
+ * its consensus timestamp (frozen V1 spec §3-§4); the loop then signs with
+ * the validator key (spec §5) and submits. A tip change or expired send
+ * window discards the local candidate and restarts the computation; any error
+ * is recorded and retried.
  *
  * It produces nothing while the next block is not a modern-PoS block
  * (legacy era, corridor, unpinned boundary, unconfigured rules), during

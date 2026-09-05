@@ -23,6 +23,13 @@ bool HostApproved(const std::string& url, const FetchPolicy& policy)
            policy.allowed_hosts.end();
 }
 
+std::string ArtifactExtension(std::string_view format)
+{
+    // The canonical manifest token has no punctuation, while the release
+    // package keeps the conventional two-part archive suffix.
+    return format == "targz" ? "tar.gz" : std::string{format};
+}
+
 } // namespace
 
 std::optional<std::string> FetchManifestBytes(UpdateTransport& transport, const std::string& url,
@@ -113,7 +120,8 @@ std::optional<fs::path> FetchArtifact(UpdateTransport& transport, const Artifact
     }
     f = nullptr;
 
-    const fs::path final_path{dir / fs::u8path("hive-update-" + got.GetHex() + "." + artifact.format)};
+    const fs::path final_path{dir / fs::u8path("hive-update-" + got.GetHex() + "." +
+                                               ArtifactExtension(artifact.format))};
     // A prior verified download, a crash residue, or an attacker-planted
     // symlink may already occupy the digest-derived name. Remove that
     // directory entry only after the replacement has been fully verified;

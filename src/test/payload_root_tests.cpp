@@ -367,6 +367,85 @@ BOOST_FIXTURE_TEST_CASE(block_level_rule_and_reorg, BindingFixture)
     BOOST_CHECK_EQUAL(Index().Size(), 1u);
 }
 
+//! MPA bytes do not enter a transaction id or the ordinary block Merkle root.
+//! A malformed relay copy must therefore be treated like other uncommitted
+//! block data: it cannot permanently invalidate the shared header before the
+//! authentic body arrives. Once the payload root commits the same malformed
+//! bytes, their semantic failure remains consensus-invalid.
+BOOST_FIXTURE_TEST_CASE(uncommitted_mpa_cannot_poison_authentic_block, BindingFixture)
+{
+    Prepare();
+    const auto bls_a{Bls(1)};
+    const auto binding_a{MakeBinding(m_validator_a, m_vk_a, &bls_a, 0)};
+    const CMutableTransaction tx{MakeTx(0, {binding_a.cell}, {binding_a.record})};
+    const CBlock authentic{BuildCorridorWithRoot({tx})};
+
+    // Alter only the hash-external MPA. The committed transaction and block
+    // identities stay exactly the same as the authentic block.
+    CBlock malformed_copy{authentic};
+    CMutableTransaction malformed_tx{*malformed_copy.vtx[1]};
+    BOOST_REQUIRE(!malformed_tx.mpa.empty());
+    BOOST_REQUIRE(!malformed_tx.mpa[0].payload.empty());
+    malformed_tx.mpa[0].payload.pop_back();
+    malformed_copy.vtx[1] = MakeTransactionRef(std::move(malformed_tx));
+    BOOST_REQUIRE(malformed_copy.vtx[1]->GetHash() == authentic.vtx[1]->GetHash());
+    BOOST_REQUIRE(malformed_copy.GetHash() == authentic.GetHash());
+
+    {
+        LOCK(cs_main);
+        const BlockValidationState state{TestBlockValidity(
+            m_node.chainman->ActiveChainstate(), malformed_copy,
+            /*check_pow=*/false, /*check_merkle_root=*/true)};
+        BOOST_REQUIRE(state.IsInvalid());
+        BOOST_CHECK(state.GetResult() == BlockValidationResult::BLOCK_MUTATED);
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-payload-root");
+    }
+
+    const int height_before{Tip()->nHeight};
+    BOOST_CHECK(!Submit(malformed_copy));
+    {
+        LOCK(cs_main);
+        const CBlockIndex* index{
+            m_node.chainman->m_blockman.LookupBlockIndex(authentic.GetHash())};
+        BOOST_REQUIRE(index != nullptr);
+        BOOST_CHECK(!(index->nStatus & BLOCK_FAILED_VALID));
+        BOOST_CHECK(!(index->nStatus & BLOCK_HAVE_DATA));
+    }
+
+    // The authentic body with the same header is still accepted and stored.
+    BOOST_REQUIRE(Submit(authentic));
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, height_before + 1);
+    BOOST_CHECK(Tip()->GetBlockHash() == authentic.GetHash());
+
+    // Recompute the payload root over a malformed record. Now the header does
+    // commit those bytes, so their grammar failure is a consensus failure.
+    const auto bls_b{Bls(2)};
+    const auto binding_b{MakeBinding(m_validator_b, m_vk_b, &bls_b, 0)};
+    CMutableTransaction committed_bad_tx{
+        MakeTx(1, {binding_b.cell}, {binding_b.record})};
+    BOOST_REQUIRE(!committed_bad_tx.mpa.empty());
+    committed_bad_tx.mpa[0].payload.pop_back();
+    const CBlock committed_bad{BuildCorridorWithRoot({committed_bad_tx})};
+    {
+        LOCK(cs_main);
+        const BlockValidationState state{TestBlockValidity(
+            m_node.chainman->ActiveChainstate(), committed_bad,
+            /*check_pow=*/false, /*check_merkle_root=*/true)};
+        BOOST_REQUIRE(state.IsInvalid());
+        BOOST_CHECK(state.GetResult() == BlockValidationResult::BLOCK_CONSENSUS);
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-mpa");
+    }
+    BOOST_CHECK(!Submit(committed_bad));
+    {
+        LOCK(cs_main);
+        const CBlockIndex* index{
+            m_node.chainman->m_blockman.LookupBlockIndex(committed_bad.GetHash())};
+        BOOST_REQUIRE(index != nullptr);
+        BOOST_CHECK(index->nStatus & BLOCK_FAILED_VALID);
+        BOOST_CHECK(!(index->nStatus & BLOCK_HAVE_DATA));
+    }
+}
+
 //! Legacy era: a root-shaped cell in a legacy block is an ordinary output and
 //! no payload-root rule runs below H+1 (legacy blocks cannot carry an MPA).
 BOOST_FIXTURE_TEST_CASE(legacy_unchanged, ModernPosSetup)

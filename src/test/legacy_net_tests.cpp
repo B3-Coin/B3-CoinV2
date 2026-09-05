@@ -9,37 +9,33 @@
 #include <addrman.h>
 #include <banman.h>
 #include <chain.h>
+#include <consensus/block_codec.h>
 #include <consensus/era.h>
+#include <consensus/merkle.h>
 #include <crypto/common.h>
+#include <legacy/codec.h>
 #include <legacy/consensus.h>
+#include <modern/pos_v1.h>
 #include <net.h>
 #include <net_processing.h>
 #include <netaddress.h>
+#include <pow.h>
 #include <protocol.h>
 #include <serialize.h>
 #include <streams.h>
 #include <test/util/net.h>
 #include <test/util/setup_common.h>
+#include <validation.h>
 #include <validationinterface.h>
 
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <span>
 #include <string>
 #include <vector>
-
-BOOST_FIXTURE_TEST_SUITE(legacy_net_tests, TestingSetup)
-
-BOOST_AUTO_TEST_CASE(b3_protocol_version_namespaces_are_pinned)
-{
-    BOOST_CHECK_EQUAL(PROTOCOL_VERSION, 70'016);
-    BOOST_CHECK_EQUAL(legacy::P2P_PROTOCOL_VERSION, 80'008);
-    BOOST_CHECK_EQUAL(B3_MODERN_PROTOCOL_VERSION, 80'009);
-    BOOST_CHECK_GT(B3_MODERN_PROTOCOL_VERSION,
-                   legacy::P2P_PROTOCOL_VERSION);
-}
 
 namespace {
 
@@ -48,6 +44,14 @@ CService ip(uint32_t i)
     struct in_addr s;
     s.s_addr = i;
     return CService(CNetAddr(s), Params().GetDefaultPort());
+}
+
+uint256 BlockHashFromInt(uint64_t n)
+{
+    uint256 out;
+    out.data()[0] = static_cast<unsigned char>(n & 0xff);
+    out.data()[1] = static_cast<unsigned char>(n >> 8);
+    return out;
 }
 
 std::unique_ptr<CNode> MakeNode(
@@ -110,7 +114,79 @@ size_t CountType(const std::vector<SentMsg>& msgs, const std::string& type)
     return count;
 }
 
+struct ModernOrphanNetSetup : public TestingSetup {
+    ModernOrphanNetSetup()
+        : TestingSetup{ChainType::REGTEST,
+                       {.extra_args = {"-b3modernregtest",
+                                       "-b3corridorlength=2"}}}
+    {
+    }
+};
+
+CBlock BuildMarkerModernBlock(const uint256& prev_hash, int height,
+                              uint32_t block_time, uint32_t bits,
+                              CAmount coinbase_value = 0)
+{
+    CMutableTransaction coinbase;
+    coinbase.version = 2;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig =
+        CScript() << CScriptNum{height} << CScriptNum{7};
+    coinbase.vout.emplace_back(coinbase_value, CScript() << OP_TRUE);
+
+    CBlock block;
+    block.nVersion =
+        static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+    block.hashPrevBlock = prev_hash;
+    block.nTime = block_time;
+    block.nBits = bits;
+    block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    return block;
+}
+
+class BlockCheckedRecorder final : public CValidationInterface
+{
+public:
+    explicit BlockCheckedRecorder(uint256 watched) : m_watched{watched} {}
+
+    void BlockChecked(const std::shared_ptr<const CBlock>& block,
+                      const BlockValidationState&) override
+    {
+        if (block->GetHash() == m_watched) ++m_seen;
+    }
+
+    int Seen() const { return m_seen.load(); }
+
+private:
+    const uint256 m_watched;
+    std::atomic<int> m_seen{0};
+};
+
+void ProcessB3BlockMessage(ConnmanTestMsg& connman, CNode& node,
+                           const CBlock& block)
+    EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(
+        node, NetMsg::Make(NetMsgType::BLOCK,
+                          legacy::TX_LEGACY(block))));
+    node.fPauseSend = false;
+    connman.ProcessMessagesOnce(node);
+}
+
 } // namespace
+
+BOOST_FIXTURE_TEST_SUITE(legacy_net_tests, TestingSetup)
+
+BOOST_AUTO_TEST_CASE(b3_protocol_version_namespaces_are_pinned)
+{
+    BOOST_CHECK_EQUAL(PROTOCOL_VERSION, 70'016);
+    BOOST_CHECK_EQUAL(legacy::P2P_PROTOCOL_VERSION, 80'008);
+    BOOST_CHECK_EQUAL(B3_MODERN_PROTOCOL_VERSION, 80'009);
+    BOOST_CHECK_GT(B3_MODERN_PROTOCOL_VERSION,
+                   legacy::P2P_PROTOCOL_VERSION);
+}
 
 BOOST_AUTO_TEST_CASE(legacy_phase_advertises_the_legacy_version_banner)
 {
@@ -598,6 +674,289 @@ BOOST_AUTO_TEST_CASE(modern_archival_peer_owns_legacy_window_and_renegotiates_at
 
     peerman.FinalizeNode(*modern);
     connman.ClearTestNodes();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(modern_orphan_net_tests, ModernOrphanNetSetup)
+
+BOOST_AUTO_TEST_CASE(connected_wrong_codec_block_keeps_marker_source_identity)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ConnmanTestMsg& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    PeerManager& peerman = *m_node.peerman;
+
+    CNode* node{MakeNode(0).release()};
+    connman.Handshake(*node,
+                      /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/B3_MODERN_PROTOCOL_VERSION,
+                      /*relay_txs=*/true);
+    BOOST_REQUIRE(!node->fDisconnect);
+    (void)DrainSentMessages(*node);
+    connman.AddTestNode(*node);
+
+    const Consensus::Params& consensus{Params().GetConsensus()};
+    const CBlockIndex* genesis{
+        WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip())};
+    BOOST_REQUIRE(genesis);
+    BOOST_REQUIRE_EQUAL(genesis->nHeight, 0);
+
+    // This body is structurally valid under the marker-selected legacy codec,
+    // but that codec is forbidden at connected height 1 in this H=0 fixture.
+    // Its marker identity (scrypt) therefore differs from the height-selected
+    // modern identity (SHA256d). Source bookkeeping must retain the former so
+    // BlockChecked can attribute the bad-block-codec failure to this peer.
+    CMutableTransaction coinbase;
+    coinbase.version = 1;
+    coinbase.nTime = static_cast<uint32_t>(genesis->GetBlockTime() + 17);
+    coinbase.m_legacy_encoding = true;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig = CScript() << 1 << CScriptNum{99};
+    coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+
+    CBlock wrong_codec;
+    wrong_codec.nVersion = 4;
+    wrong_codec.hashPrevBlock = genesis->GetBlockHash();
+    wrong_codec.nTime = coinbase.nTime;
+    wrong_codec.nBits = genesis->nBits;
+    wrong_codec.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+    wrong_codec.hashMerkleRoot = BlockMerkleRoot(wrong_codec);
+    BOOST_REQUIRE(wrong_codec.GetMarkerHash(consensus) !=
+                  wrong_codec.GetHash(consensus, 1));
+
+    m_node.validation_signals->RegisterValidationInterface(&peerman);
+    ProcessB3BlockMessage(connman, *node, wrong_codec);
+    BOOST_CHECK(!node->fDisconnect); // Applied on the next send pass.
+    BOOST_CHECK(peerman.SendMessages(*node));
+    BOOST_CHECK(node->fDisconnect);
+    m_node.validation_signals->UnregisterValidationInterface(&peerman);
+
+    peerman.FinalizeNode(*node);
+    connman.ClearTestNodes();
+}
+
+BOOST_AUTO_TEST_CASE(unknown_parent_block_requests_headers_with_peer_rate_limit)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ConnmanTestMsg& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    PeerManager& peerman = *m_node.peerman;
+
+    const auto t0{std::chrono::seconds{1'700'000'000}};
+    SetMockTime(t0);
+    auto node{MakeNode(0)};
+    connman.Handshake(*node,
+                      /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/B3_MODERN_PROTOCOL_VERSION,
+                      /*relay_txs=*/true);
+    BOOST_REQUIRE(!node->fDisconnect);
+    (void)DrainSentMessages(*node); // Initial synchronization request.
+
+    const Consensus::Params& consensus{Params().GetConsensus()};
+    BOOST_REQUIRE(consensus.modern_pos.has_value());
+    BOOST_REQUIRE(consensus.transition_pow_bits.has_value());
+
+    // Advance through the two-block transition corridor so the next valid
+    // height is genuinely Modern PoS, not merely modern wire format.
+    const CBlockIndex* genesis{
+        WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip())};
+    BOOST_REQUIRE(genesis);
+    CBlock corridor1{BuildMarkerModernBlock(
+        genesis->GetBlockHash(), /*height=*/1,
+        static_cast<uint32_t>(genesis->GetBlockTime() +
+                              consensus.transition_pow_min_spacing),
+        *consensus.transition_pow_bits)};
+    while (!CheckTransitionPowEligibility(corridor1)) ++corridor1.nNonce;
+    ProcessB3BlockMessage(connman, *node, corridor1);
+    CBlock corridor2{BuildMarkerModernBlock(
+        corridor1.GetHash(consensus, 1), /*height=*/2,
+        static_cast<uint32_t>(corridor1.GetBlockTime() +
+                              consensus.transition_pow_min_spacing),
+        *consensus.transition_pow_bits)};
+    while (!CheckTransitionPowEligibility(corridor2)) ++corridor2.nNonce;
+    ProcessB3BlockMessage(connman, *node, corridor2);
+    BOOST_REQUIRE_EQUAL(
+        WITH_LOCK(cs_main,
+                  return m_node.chainman->ActiveChain().Tip()->nHeight),
+        2);
+    BOOST_CHECK(Consensus::GetConsensusPhase(3, consensus) ==
+                Consensus::ConsensusPhase::MODERN_POS);
+    (void)DrainSentMessages(*node);
+
+    const uint32_t sentinel_bits{consensus.modern_pos->sentinel_bits};
+
+    // A marker-modern full block with a modern-PoS signature shape is safe to
+    // check context-free even though its parent (and therefore height) is not
+    // known. The sender is not a legacy download owner in this post-boundary
+    // fixture, but must still receive a recovery request.
+    SetMockTime(t0 + 121s);
+    CBlock orphan{BuildMarkerModernBlock(
+        BlockHashFromInt(10'000), /*height=*/4,
+        static_cast<uint32_t>(t0.count()),
+        sentinel_bits)};
+    orphan.vchBlockSig.assign(modern::MODERN_POS_SIG_SIZE, 0x01);
+    ProcessB3BlockMessage(connman, *node, orphan);
+    BOOST_CHECK_EQUAL(
+        CountType(DrainSentMessages(*node), NetMsgType::GETHEADERS), 1U);
+    BOOST_CHECK(!node->fDisconnect);
+
+    // A second orphan cannot amplify recovery traffic inside the outstanding
+    // response window.
+    orphan.hashPrevBlock = BlockHashFromInt(10'001);
+    ++orphan.nNonce;
+    ProcessB3BlockMessage(connman, *node, orphan);
+    BOOST_CHECK_EQUAL(
+        CountType(DrainSentMessages(*node), NetMsgType::GETHEADERS), 0U);
+
+    // Once the response window passes, recovery can be retried.
+    SetMockTime(t0 + 242s);
+    orphan.hashPrevBlock = BlockHashFromInt(10'002);
+    ++orphan.nNonce;
+    ProcessB3BlockMessage(connman, *node, orphan);
+    BOOST_CHECK_EQUAL(
+        CountType(DrainSentMessages(*node), NetMsgType::GETHEADERS), 1U);
+
+    peerman.FinalizeNode(*node);
+    SetMockTime(0s);
+}
+
+BOOST_AUTO_TEST_CASE(parent_block_drains_cached_marker_modern_descendants)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ConnmanTestMsg& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    PeerManager& peerman = *m_node.peerman;
+
+    auto node{MakeNode(0)};
+    connman.Handshake(*node,
+                      /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/B3_MODERN_PROTOCOL_VERSION,
+                      /*relay_txs=*/true);
+    BOOST_REQUIRE(!node->fDisconnect);
+    (void)DrainSentMessages(*node);
+
+    const Consensus::Params& consensus{Params().GetConsensus()};
+    BOOST_REQUIRE(consensus.transition_pow_bits.has_value());
+    const CBlockIndex* genesis{
+        WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip())};
+    BOOST_REQUIRE(genesis);
+    BOOST_REQUIRE_EQUAL(genesis->nHeight, 0);
+
+    CBlock parent{BuildMarkerModernBlock(
+        genesis->GetBlockHash(), /*height=*/1,
+        static_cast<uint32_t>(genesis->GetBlockTime() +
+                              consensus.transition_pow_min_spacing),
+        *consensus.transition_pow_bits)};
+    while (!CheckTransitionPowEligibility(parent)) ++parent.nNonce;
+
+    CBlock child{BuildMarkerModernBlock(
+        parent.GetHash(consensus, 1), /*height=*/2,
+        static_cast<uint32_t>(parent.GetBlockTime() +
+                              consensus.transition_pow_min_spacing),
+        *consensus.transition_pow_bits)};
+    while (!CheckTransitionPowEligibility(child)) ++child.nNonce;
+    const uint256 child_hash{child.GetHash(consensus, 2)};
+
+    // The child is retained but cannot enter the block index before its
+    // parent/header ancestry is known.
+    ProcessB3BlockMessage(connman, *node, child);
+    BOOST_CHECK(WITH_LOCK(
+                    cs_main,
+                    return m_node.chainman->m_blockman.LookupBlockIndex(
+                               child_hash)) == nullptr);
+
+    // A full parent arriving on the P2P path releases the cached child in the
+    // same message pass; no reannouncement or second download is needed.
+    ProcessB3BlockMessage(connman, *node, parent);
+    {
+        LOCK(cs_main);
+        const CBlockIndex* child_index{
+            m_node.chainman->m_blockman.LookupBlockIndex(child_hash)};
+        BOOST_REQUIRE(child_index);
+        BOOST_CHECK(child_index->nStatus & BLOCK_HAVE_DATA);
+        BOOST_CHECK_EQUAL(m_node.chainman->ActiveChain().Tip(), child_index);
+    }
+    BOOST_CHECK(!node->fDisconnect);
+
+    peerman.FinalizeNode(*node);
+}
+
+BOOST_AUTO_TEST_CASE(invalid_parent_does_not_drain_cached_descendant)
+{
+    ConnmanTestMsg& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    PeerManager& peerman = *m_node.peerman;
+    auto node{MakeNode(0)};
+
+    const Consensus::Params& consensus{Params().GetConsensus()};
+    BOOST_REQUIRE(consensus.transition_pow_bits.has_value());
+    const CBlockIndex* genesis{
+        WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip())};
+    BOOST_REQUIRE(genesis);
+
+    // One unit over the configured corridor reward passes context-free checks
+    // and is stored, but fails when connection checks its coinbase amount.
+    BOOST_REQUIRE(consensus.transition_pow_reward.has_value());
+    CBlock invalid_parent{BuildMarkerModernBlock(
+        genesis->GetBlockHash(), /*height=*/1,
+        static_cast<uint32_t>(genesis->GetBlockTime() +
+                              consensus.transition_pow_min_spacing),
+        *consensus.transition_pow_bits,
+        /*coinbase_value=*/*consensus.transition_pow_reward + 1)};
+    while (!CheckTransitionPowEligibility(invalid_parent)) {
+        ++invalid_parent.nNonce;
+    }
+    const uint256 parent_hash{invalid_parent.GetHash(consensus, 1)};
+
+    CBlock child{BuildMarkerModernBlock(
+        parent_hash, /*height=*/2,
+        static_cast<uint32_t>(invalid_parent.GetBlockTime() +
+                              consensus.transition_pow_min_spacing),
+        *consensus.transition_pow_bits)};
+    while (!CheckTransitionPowEligibility(child)) ++child.nNonce;
+    const uint256 child_hash{child.GetHash(consensus, 2)};
+    BlockCheckedRecorder recorder{child_hash};
+    m_node.validation_signals->RegisterValidationInterface(&recorder);
+
+    {
+        LOCK(NetEventsInterface::g_msgproc_mutex);
+        connman.Handshake(*node,
+                          /*successfully_connected=*/true,
+                          /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                          /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                          /*version=*/B3_MODERN_PROTOCOL_VERSION,
+                          /*relay_txs=*/true);
+        BOOST_REQUIRE(!node->fDisconnect);
+        (void)DrainSentMessages(*node);
+
+        ProcessB3BlockMessage(connman, *node, child);
+        ProcessB3BlockMessage(connman, *node, invalid_parent);
+    }
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+
+    // The failed parent may be retained for diagnostics, but it must not
+    // release or force-process the cached child.
+    BOOST_CHECK_EQUAL(recorder.Seen(), 0);
+    {
+        LOCK(cs_main);
+        const CBlockIndex* parent_index{
+            m_node.chainman->m_blockman.LookupBlockIndex(parent_hash)};
+        BOOST_REQUIRE(parent_index);
+        BOOST_CHECK(parent_index->nStatus & BLOCK_HAVE_DATA);
+        BOOST_CHECK(parent_index->nStatus & BLOCK_FAILED_VALID);
+        BOOST_CHECK(m_node.chainman->m_blockman.LookupBlockIndex(child_hash) ==
+                    nullptr);
+    }
+
+    m_node.validation_signals->UnregisterValidationInterface(&recorder);
+    {
+        LOCK(NetEventsInterface::g_msgproc_mutex);
+        peerman.FinalizeNode(*node);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

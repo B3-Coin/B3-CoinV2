@@ -4,7 +4,9 @@
 
 #include <node/legacy_orphanage.h>
 
+#include <consensus/block_codec.h>
 #include <primitives/block.h>
+#include <primitives/transaction.h>
 #include <uint256.h>
 #include <util/time.h>
 
@@ -47,14 +49,87 @@ BOOST_AUTO_TEST_CASE(add_take_and_duplicates)
     BOOST_CHECK_EQUAL(orphanage.Count(), 3U);
     BOOST_CHECK_EQUAL(orphanage.Bytes(), 1500U);
 
-    auto children{orphanage.TakeChildrenOf(parent)};
+    auto children{orphanage.TakeChildrenOf(parent, T0)};
     BOOST_CHECK_EQUAL(children.size(), 2U);
     BOOST_CHECK_EQUAL(orphanage.Count(), 1U);
     BOOST_CHECK_EQUAL(orphanage.Bytes(), 300U);
     BOOST_CHECK(!orphanage.Contains(H(1)));
     BOOST_CHECK(orphanage.Contains(H(3)));
     // Taking again yields nothing.
-    BOOST_CHECK(orphanage.TakeChildrenOf(parent).empty());
+    BOOST_CHECK(orphanage.TakeChildrenOf(parent, T0).empty());
+}
+
+BOOST_AUTO_TEST_CASE(hash_external_signature_variants_are_retained)
+{
+    LegacyBlockOrphanage orphanage;
+    const uint256 hash{H(1)};
+    const uint256 parent{H(1000)};
+
+    auto first{std::make_shared<CBlock>()};
+    first->vchBlockSig.assign(64, 0x11);
+    auto second{std::make_shared<CBlock>(*first)};
+    second->vchBlockSig[0] = 0x22;
+
+    BOOST_REQUIRE(orphanage.Add(hash, parent, first, /*from=*/7,
+                                /*bytes=*/500, T0));
+    BOOST_CHECK(!orphanage.Add(hash, parent, first, /*from=*/7,
+                               /*bytes=*/500, T0));
+    BOOST_REQUIRE(orphanage.Add(hash, parent, second, /*from=*/8,
+                                /*bytes=*/500, T0));
+    BOOST_CHECK_EQUAL(orphanage.Count(), 2U);
+    BOOST_CHECK(orphanage.Contains(hash));
+
+    const auto variants{orphanage.TakeChildrenOf(parent, T0)};
+    BOOST_REQUIRE_EQUAL(variants.size(), 2U);
+    BOOST_CHECK(variants[0].block->vchBlockSig !=
+                variants[1].block->vchBlockSig);
+    BOOST_CHECK(!orphanage.Contains(hash));
+    BOOST_CHECK_EQUAL(orphanage.Count(), 0U);
+    BOOST_CHECK_EQUAL(orphanage.Bytes(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(hash_external_mpa_variants_are_retained)
+{
+    LegacyBlockOrphanage orphanage;
+    const uint256 hash{H(1)};
+    const uint256 parent{H(1000)};
+
+    CMutableTransaction first_tx;
+    first_tx.mpa.push_back(CMpaRecord{/*payload_type=*/1,
+                                     /*payload_version=*/1,
+                                     /*payload=*/{0x11}});
+    auto first{std::make_shared<CBlock>()};
+    first->nVersion =
+        static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+    first->vtx.push_back(MakeTransactionRef(std::move(first_tx)));
+    first->vchBlockSig.assign(64, 0x22);
+
+    CMutableTransaction second_tx{*first->vtx.front()};
+    second_tx.mpa.front().payload.front() = 0x33;
+    auto second{std::make_shared<CBlock>(*first)};
+    second->vtx.front() = MakeTransactionRef(std::move(second_tx));
+
+    // MPA is outside the state txid and block-header hash, and both bodies
+    // deliberately carry the same trailing signature. They must still be
+    // retained as distinct bounded candidates until the parent arrives.
+    BOOST_CHECK(first->vtx.front()->GetHash() ==
+                second->vtx.front()->GetHash());
+    BOOST_CHECK(first->vtx.front()->GetPtxid() !=
+                second->vtx.front()->GetPtxid());
+    BOOST_CHECK(first->vchBlockSig == second->vchBlockSig);
+
+    BOOST_REQUIRE(orphanage.Add(hash, parent, first, /*from=*/7,
+                                /*bytes=*/500, T0));
+    BOOST_CHECK(!orphanage.Add(hash, parent, first, /*from=*/7,
+                               /*bytes=*/500, T0));
+    BOOST_REQUIRE(orphanage.Add(hash, parent, second, /*from=*/8,
+                                /*bytes=*/500, T0));
+    BOOST_CHECK_EQUAL(orphanage.Count(), 2U);
+
+    const auto variants{orphanage.TakeChildrenOf(parent, T0)};
+    BOOST_REQUIRE_EQUAL(variants.size(), 2U);
+    BOOST_CHECK(variants[0].block->vtx.front()->GetPtxid() !=
+                variants[1].block->vtx.front()->GetPtxid());
 }
 
 BOOST_AUTO_TEST_CASE(per_peer_caps_are_enforced_without_evicting_others)
@@ -139,6 +214,19 @@ BOOST_AUTO_TEST_CASE(entries_expire)
     BOOST_CHECK(!orphanage.Contains(H(2)));
     BOOST_CHECK(orphanage.Contains(H(3)));
     BOOST_CHECK_EQUAL(orphanage.Count(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(take_children_does_not_revive_expired_entries)
+{
+    LegacyBlockOrphanage orphanage;
+    const uint256 parent{H(9001)};
+    BOOST_REQUIRE(orphanage.Add(H(1), parent, DummyBlock(), 1, 100, T0));
+
+    const auto children{orphanage.TakeChildrenOf(
+        parent, T0 + LegacyBlockOrphanage::ORPHAN_EXPIRY + 1s)};
+    BOOST_CHECK(children.empty());
+    BOOST_CHECK_EQUAL(orphanage.Count(), 0U);
+    BOOST_CHECK_EQUAL(orphanage.Bytes(), 0U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

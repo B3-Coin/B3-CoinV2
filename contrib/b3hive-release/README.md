@@ -23,8 +23,38 @@ cat sigs.txt >> manifest.txt
 b3hive-sign verify manifest.txt 2 <pub1hex>,<pub2hex>,<pub3hex>
 ```
 
-Client configuration (release inputs — never invented, never defaulted):
-`-hiveupdateurl`, repeated `-hiveupdatekey`, `-hiveupdatethreshold`,
-optional `-hiveupdatehost`. Unset => the update system is quietly and
-completely disabled (fail-closed). A test key must never ship as trusted
-production material.
+Production client configuration is compiled into each Qt release. The public
+inputs are comma-separated where noted:
+
+```
+cmake -B build-release \
+  -DBUILD_GUI=ON \
+  -DB3_REQUIRE_UPDATE_CHANNEL=ON \
+  -DB3_UPDATE_MANIFEST_URL=https://<manifest-host>/<stable-manifest> \
+  -DB3_UPDATE_PUBLIC_KEYS=<pub1hex>,<pub2hex>,<pub3hex> \
+  -DB3_UPDATE_SIGNATURE_THRESHOLD=2 \
+  -DB3_UPDATE_ALLOWED_HOSTS=<manifest-host>,<artifact-host>,<redirect-host>
+```
+
+`B3_REQUIRE_UPDATE_CHANNEL=ON` makes configuration fail if the URL, keys,
+threshold, or allowed hosts are missing or malformed, so release automation
+cannot silently publish another GUI with updates disabled. The manifest's
+initial host and every HTTPS redirect/artifact host must be listed. Public
+keys are validated again by the client as fully valid, distinct x-only keys.
+
+The release workflow loads the public values tracked in
+`stable-channel-v1.cmake` and passes the required-channel gate to every Qt
+build. Keeping the trust inputs in the tagged source makes an official build
+reproducible and prevents mutable runner or repository variables from silently
+changing a tag's updater authorities. Rotate that tracked file in a reviewed
+release; never add the corresponding private keys. Runtime `-hiveupdate*`
+arguments remain available only in non-release developer builds and cannot
+override production trust.
+
+Current release packaging uses manifest format `targz` for the Linux GUI
+`.tar.gz`, `zip` for macOS GUI archives, and `exe` for the Windows x86-64
+installer. Automatic replacement remains unsupported: the client verifies and
+downloads the signed artifact, then reports that installation is manual.
+
+Unset production inputs keep ordinary local builds quietly fail-closed. A test
+key must never ship as trusted production material.

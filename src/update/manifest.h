@@ -49,7 +49,7 @@ std::optional<Version> ParseVersion(std::string_view s);
 struct Artifact {
     std::string os;      // macos | windows | linux
     std::string arch;    // arm64 | x86 | x86_64
-    std::string format;  // dmg | pkg | exe | appimage | targz
+    std::string format;  // dmg | pkg | exe | appimage | targz | zip
     Version version{};
     uint64_t size{0};
     uint256 sha256{};

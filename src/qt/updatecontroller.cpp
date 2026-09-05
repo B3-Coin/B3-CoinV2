@@ -9,6 +9,7 @@
 #include <random.h>
 #include <update/downloader.h>
 #include <util/strencodings.h>
+#include <util/string.h>
 
 #include <QEventLoop>
 #include <QNetworkAccessManager>
@@ -190,11 +191,18 @@ public:
 update::UpdateConfig BuildConfig()
 {
     update::UpdateConfig c;
-    // A release build may trust only keys and an endpoint pinned at compile
-    // time. None exist yet, so release builds remain fail-closed even when
-    // runtime arguments are supplied. Runtime trust is available solely to
-    // non-release developer builds for offline/integration testing.
-#if !CLIENT_VERSION_IS_RELEASE
+    // Tagged releases use only the endpoint and authorities pinned at build
+    // time. Runtime trust injection remains available solely to non-release
+    // developer builds for offline/integration testing.
+#if B3_UPDATE_CHANNEL_CONFIGURED
+    c.manifest_url = B3_UPDATE_MANIFEST_URL;
+    c.keys.threshold = B3_UPDATE_SIGNATURE_THRESHOLD;
+    for (const std::string& hex : util::SplitString(B3_UPDATE_PUBLIC_KEYS, ',')) {
+        const auto bytes{TryParseHex<unsigned char>(hex)};
+        if (bytes && bytes->size() == 32) c.keys.keys.emplace_back(std::span<const unsigned char>{*bytes});
+    }
+    c.allowed_hosts = util::SplitString(B3_UPDATE_ALLOWED_HOSTS, ',');
+#elif !CLIENT_VERSION_IS_RELEASE
     c.manifest_url = gArgs.GetArg("-hiveupdateurl", "");
     c.keys.threshold = static_cast<unsigned>(gArgs.GetIntArg("-hiveupdatethreshold", 2));
     for (const std::string& hex : gArgs.GetArgs("-hiveupdatekey")) {
@@ -211,13 +219,13 @@ update::UpdateConfig BuildConfig()
 #endif
 #if defined(Q_OS_MACOS)
     c.os = "macos";
-    c.format = "dmg";
+    c.format = "zip";
 #elif defined(Q_OS_WIN)
     c.os = "windows";
     c.format = "exe";
 #else
     c.os = "linux";
-    c.format = "appimage";
+    c.format = "targz";
 #endif
 #if defined(__aarch64__) || defined(_M_ARM64)
     c.arch = "arm64";

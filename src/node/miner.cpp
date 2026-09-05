@@ -295,11 +295,14 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         nBlockSigOpsCost += fn_sigops_cost;
     }
     // Modern-PoS production (frozen V1 spec §3-§5): fully deterministic —
-    // resolve the seed and the validator's weights, find the smallest
-    // eligible recovery round, and force the exact round timestamp. The
-    // caller signs after finalizing the merkle root.
+    // resolve the seed and validator weights, then either verify the exact
+    // producer-policy round requested by the caller or find the smallest
+    // eligible recovery round. Both paths use the unchanged consensus
+    // eligibility predicate and exact timestamp. The caller signs after
+    // finalizing the merkle root.
     const bool b3_modern_pos{b3_modern && !b3_corridor};
     int64_t pos_round{0};
+    std::optional<uint32_t> modern_pos_time;
     if (b3_modern_pos) {
         if (!b3_consensus.modern_pos) {
             throw std::runtime_error("modern-PoS parameters are not configured");
@@ -329,18 +332,50 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         if (w <= 0) {
             throw std::runtime_error("validator is not in the active validator set (no bound, active stake)");
         }
-        constexpr int64_t MAX_PRODUCTION_ROUNDS{100'000};
         bool eligible{false};
-        for (; pos_round < MAX_PRODUCTION_ROUNDS; ++pos_round) {
+        if (m_options.modern_pos_round) {
+            pos_round = *m_options.modern_pos_round;
             const uint256 digest{modern::ModernPosEligibilityDigest(
                 *domain, seed, static_cast<uint32_t>(nHeight), static_cast<uint32_t>(pos_round),
                 *m_options.modern_pos_validator_key)};
-            if (modern::ModernPosEligible(digest, w, W, pos_round, *b3_consensus.modern_pos)) {
-                eligible = true;
-                break;
+            eligible = modern::ModernPosEligible(
+                digest, w, W, pos_round, *b3_consensus.modern_pos);
+        } else {
+            constexpr int64_t MAX_PRODUCTION_ROUNDS{100'000};
+            for (; pos_round < MAX_PRODUCTION_ROUNDS; ++pos_round) {
+                const uint256 digest{modern::ModernPosEligibilityDigest(
+                    *domain, seed, static_cast<uint32_t>(nHeight), static_cast<uint32_t>(pos_round),
+                    *m_options.modern_pos_validator_key)};
+                if (modern::ModernPosEligible(digest, w, W, pos_round, *b3_consensus.modern_pos)) {
+                    eligible = true;
+                    break;
+                }
             }
         }
-        if (!eligible) throw std::runtime_error("no eligible modern-PoS round found");
+        if (!eligible) {
+            throw std::runtime_error(m_options.modern_pos_round
+                                         ? "validator is not eligible in the requested modern-PoS round"
+                                         : "no eligible modern-PoS round found");
+        }
+        // Check in the header's uint32 range before doing either addition or
+        // multiplication. An operator-supplied exact round must never turn a
+        // very large test parameter into signed overflow.
+        const int64_t max_header_time{
+            std::numeric_limits<uint32_t>::max()};
+        const int64_t parent_time{pindexPrev->GetBlockTime()};
+        const int64_t interval{b3_consensus.modern_pos->block_interval_seconds};
+        const int64_t round_seconds{b3_consensus.modern_pos->round_seconds};
+        if (parent_time < 0 || parent_time > max_header_time ||
+            interval > max_header_time - parent_time) {
+            throw std::runtime_error("modern-PoS round timestamp is outside the block-header range");
+        }
+        const int64_t first_round_time{parent_time + interval};
+        if (pos_round > 0 &&
+            round_seconds > (max_header_time - first_round_time) / pos_round) {
+            throw std::runtime_error("modern-PoS round timestamp is outside the block-header range");
+        }
+        modern_pos_time = static_cast<uint32_t>(
+            first_round_time + pos_round * round_seconds);
     }
 
     // The bridge freshness rule commits to the candidate block time. Modern
@@ -348,9 +383,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // that exact value during chunk selection rather than a wall-clock value
     // that would be replaced after selection.
     pblock->nTime = b3_modern_pos
-                        ? static_cast<uint32_t>(modern::ModernPosBlockTime(
-                              pindexPrev->GetBlockTime(), pos_round,
-                              *b3_consensus.modern_pos))
+                        ? *modern_pos_time
                         : TicksSinceEpoch<std::chrono::seconds>(NodeClock::now());
     if (!b3_modern_pos && b3_bridge_active) {
         // Freeze the exact transition-PoW time before bridge selection. A

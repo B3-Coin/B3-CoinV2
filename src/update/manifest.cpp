@@ -51,7 +51,7 @@ bool SplitKV(std::string_view line, std::string_view& key, std::string_view& val
 
 const std::set<std::string_view> VALID_OS{"macos", "windows", "linux"};
 const std::set<std::string_view> VALID_ARCH{"arm64", "x86", "x86_64"};
-const std::set<std::string_view> VALID_FORMAT{"dmg", "pkg", "exe", "appimage", "targz"};
+const std::set<std::string_view> VALID_FORMAT{"dmg", "pkg", "exe", "appimage", "targz", "zip"};
 
 } // namespace
 

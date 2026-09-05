@@ -13,14 +13,16 @@
 #include <cstddef>
 #include <map>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace node {
 
 /**
- * Bounded holding area for structurally-valid legacy blocks that arrived
+ * Bounded holding area for structurally-valid B3 full blocks that arrived
  * before their parent. The historical client kept a byte-capped orphan cache
- * for exactly this case; this is its bounded, deterministic counterpart.
+ * for exactly this case; the same bounded, deterministic cache also retains
+ * marker-modern blocks while their header ancestry is recovered.
  *
  * Every dimension of memory use is capped: total entry count, total bytes,
  * per-peer entry count and per-peer bytes, and a hard expiry. Entries carry
@@ -32,8 +34,9 @@ class LegacyBlockOrphanage
 {
 public:
     //! Bounds. A legacy block is at most 5 MB on the wire
-    //! (legacy::MAX_BLOCK_SIZE), so the per-peer byte cap admits at least one
-    //! maximal block and the global byte cap roughly three.
+    //! (legacy::MAX_BLOCK_SIZE), which is larger than the modern block limit,
+    //! so the per-peer byte cap admits at least one maximal B3 block and the
+    //! global byte cap roughly three legacy maxima.
     static constexpr size_t MAX_ORPHAN_COUNT{64};
     static constexpr size_t MAX_ORPHAN_BYTES{16 * 1024 * 1024};
     static constexpr size_t MAX_PEER_ORPHAN_COUNT{16};
@@ -49,37 +52,48 @@ public:
 
     /**
      * Add a block that is missing its parent. Returns false without storing
-     * when the hash is already present, when the block alone exceeds the
-     * per-peer byte cap, or when the providing peer is at one of its caps
-     * (a peer cannot evict other peers' entries to make room for its own).
-     * Global caps are enforced by evicting expired entries first, then the
-     * oldest entries, before insertion.
+     * when the same complete wire-body variant is already present, when the block
+     * alone exceeds the per-peer byte cap, or when the providing peer is at
+     * one of its caps (a peer cannot evict other peers' entries to make room
+     * for its own). A marker-modern block's trailing signature is external to
+     * its header hash, so bounded distinct variants are retained until the
+     * parent reveals which one is contextually valid. The variant identity
+     * covers every hash-external field, including the trailing signature,
+     * witness, and MPA bytes. Global caps are enforced by evicting expired
+     * entries first, then the oldest entries.
      */
     bool Add(const uint256& hash, const uint256& parent_hash,
              std::shared_ptr<const CBlock> block, NodeId from, size_t bytes,
              NodeClock::time_point now);
 
-    /** Remove and return all stored children of the given parent. */
-    std::vector<Entry> TakeChildrenOf(const uint256& parent_hash);
+    /**
+     * Expire stale entries, then remove and return all stored children of the
+     * given parent. Expiring as part of the take operation prevents a parent
+     * arriving after the retention window from reviving stale children.
+     */
+    std::vector<Entry> TakeChildrenOf(const uint256& parent_hash,
+                                      NodeClock::time_point now);
 
     /** Drop every entry older than ORPHAN_EXPIRY. */
     void Expire(NodeClock::time_point now);
 
-    bool Contains(const uint256& hash) const { return m_orphans.count(hash) > 0; }
+    bool Contains(const uint256& hash) const;
     size_t Count() const { return m_orphans.size(); }
     size_t Bytes() const { return m_total_bytes; }
     size_t PeerCount(NodeId peer) const;
     size_t PeerBytes(NodeId peer) const;
 
 private:
-    void EraseByHash(const uint256& hash);
+    using VariantKey = std::pair<uint256, uint256>;
+
+    void EraseByKey(const VariantKey& key);
     //! Evict the entry with the earliest insertion time. No-op when empty.
     void EvictOldest();
 
-    //! Keyed by the block's own (marker) hash.
-    std::map<uint256, Entry> m_orphans;
-    //! parent hash -> child hash, for TakeChildrenOf.
-    std::multimap<uint256, uint256> m_by_parent;
+    //! Keyed by the block's marker hash plus its complete canonical wire digest.
+    std::map<VariantKey, Entry> m_orphans;
+    //! parent hash -> child variant, for TakeChildrenOf.
+    std::multimap<uint256, VariantKey> m_by_parent;
     size_t m_total_bytes{0};
 };
 

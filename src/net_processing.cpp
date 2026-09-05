@@ -1082,11 +1082,12 @@ private:
     NodeClock::time_point m_legacy_sync_lease GUARDED_BY(cs_main){};
 
     /**
-     * Bounded holding area for structurally-valid legacy-chain blocks that
-     * arrived before their parent (count/bytes/per-peer/expiry capped).
-     * Accessed only from the message-processing thread.
+     * Bounded holding area for structurally-valid B3 full blocks (legacy or
+     * marker-modern) that arrived before their parent
+     * (count/bytes/per-peer/expiry capped). Accessed only from the
+     * message-processing thread.
      */
-    node::LegacyBlockOrphanage m_legacy_orphanage GUARDED_BY(g_msgproc_mutex);
+    node::LegacyBlockOrphanage m_b3_orphanage GUARDED_BY(g_msgproc_mutex);
 
     /** Stalling timeout for blocks in IBD */
     std::atomic<std::chrono::seconds> m_block_stalling_timeout{BLOCK_STALLING_TIMEOUT_DEFAULT};
@@ -1206,8 +1207,14 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, peer.m_getdata_requests_mutex, NetEventsInterface::g_msgproc_mutex)
         LOCKS_EXCLUDED(::cs_main);
 
-    /** Process a new block. Perform any post-processing housekeeping */
-    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked);
+    /** Process a new block. Perform any post-processing housekeeping. */
+    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block,
+                      bool force_processing, bool min_pow_checked)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+
+    /** Reprocess bounded B3 orphan-cache descendants after a P2P parent arrives. */
+    void DrainB3BlockOrphans(const uint256& root_hash)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
 
     /** Process compact block txns  */
     void ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
@@ -2531,9 +2538,11 @@ void PeerManagerImpl::BlockChecked(const std::shared_ptr<const CBlock>& block, c
 {
     LOCK(cs_main);
 
-    const CBlockIndex* parent{m_chainman.m_blockman.LookupBlockIndex(block->hashPrevBlock)};
-    const int height{parent ? parent->nHeight + 1 : 0};
-    const uint256 hash{block->GetHash(m_chainparams.GetConsensus(), height)};
+    // Source attribution follows the permanent wire-codec marker, just like
+    // block-index insertion and the BLOCK handler. In particular, an invalid
+    // connected block using the wrong era codec must still erase and punish
+    // the source entry that was created for its wire identity.
+    const uint256 hash{block->GetMarkerHash(m_chainparams.GetConsensus())};
     std::map<uint256, std::pair<NodeId, bool>>::iterator it = mapBlockSource.find(hash);
 
     // If the block failed validation, we know where it came from and we're still connected
@@ -3924,18 +3933,104 @@ void PeerManagerImpl::ProcessGetCFCheckPt(CNode& node, Peer& peer, DataStream& v
               headers);
 }
 
-void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
+void PeerManagerImpl::DrainB3BlockOrphans(const uint256& root_hash)
 {
-    uint256 block_hash;
-    {
-        LOCK(cs_main);
-        const CBlockIndex* parent{m_chainman.m_blockman.LookupBlockIndex(block->hashPrevBlock)};
-        const int height{parent ? parent->nHeight + 1 : 0};
-        block_hash = block->GetHash(m_chainparams.GetConsensus(), height);
+    if (!m_chainparams.GetConsensus().legacy_b3coin) return;
+
+    // Every accepted child can release its own children. The orphanage is
+    // count-bounded, and TakeChildrenOf removes entries as it returns them,
+    // so this traversal is bounded and each cached block is attempted once.
+    std::deque<uint256> connectable{root_hash};
+    while (!connectable.empty()) {
+        const uint256 parent_hash{connectable.front()};
+        connectable.pop_front();
+
+        bool parent_available{false};
+        {
+            LOCK(cs_main);
+            parent_available =
+                m_chainman.m_blockman.LookupBlockIndex(parent_hash) != nullptr;
+        }
+        // A root is queued only after its full block was accepted, and a
+        // descendant is queued only after the same check below. Keep cached
+        // children intact if that invariant is ever broken.
+        if (!parent_available) {
+            LogDebug(BCLog::NET,
+                     "not draining B3 orphans for unavailable parent %s\n",
+                     parent_hash.ToString());
+            continue;
+        }
+
+        std::set<uint256> accepted_children;
+        for (auto& entry :
+             m_b3_orphanage.TakeChildrenOf(parent_hash, NodeClock::now())) {
+            const uint256 child_hash{
+                entry.block->GetMarkerHash(m_chainparams.GetConsensus())};
+            // The orphanage may retain bounded hash-external signature
+            // variants. Once one authentic body has been accepted, never let
+            // a later variant replace its source bookkeeping or trigger a
+            // redundant activation pass.
+            if (accepted_children.contains(child_hash)) continue;
+            bool child_min_pow_checked{false};
+            {
+                LOCK(cs_main);
+                mapBlockSource.emplace(child_hash,
+                                       std::make_pair(entry.from, true));
+                const CBlockIndex* parent_index{
+                    m_chainman.m_blockman.LookupBlockIndex(parent_hash)};
+                if (parent_index &&
+                    parent_index->nChainWork + GetBlockProof(*entry.block) >=
+                        GetAntiDoSWorkThreshold()) {
+                    child_min_pow_checked = true;
+                }
+            }
+
+            LogDebug(BCLog::NET,
+                     "processing cached B3 orphan %s now that parent %s arrived\n",
+                     child_hash.ToString(), parent_hash.ToString());
+            bool child_new_block{false};
+            const bool child_processed{m_chainman.ProcessNewBlock(
+                entry.block, /*force_processing=*/true,
+                child_min_pow_checked, &child_new_block)};
+
+            bool child_available{false};
+            {
+                LOCK(cs_main);
+                const CBlockIndex* child_index{
+                    m_chainman.m_blockman.LookupBlockIndex(child_hash)};
+                child_available = child_processed && child_index &&
+                                  (child_index->nStatus & BLOCK_HAVE_DATA) &&
+                                  child_index->IsValid(
+                                      BLOCK_VALID_TRANSACTIONS);
+                if (!child_new_block) mapBlockSource.erase(child_hash);
+            }
+            if (child_available) {
+                accepted_children.insert(child_hash);
+                connectable.push_back(child_hash);
+            } else {
+                LogDebug(BCLog::NET,
+                         "cached B3 orphan %s was not accepted; descendants remain cached\n",
+                         child_hash.ToString());
+            }
+        }
     }
+}
+
+void PeerManagerImpl::ProcessBlock(CNode& node,
+                                   const std::shared_ptr<const CBlock>& block,
+                                   bool force_processing,
+                                   bool min_pow_checked)
+{
+    // Keep request/source bookkeeping in the same marker-selected identity
+    // domain used when the BLOCK message was received and indexed. The
+    // contextual height check decides whether that codec is legal; it must
+    // not change the lookup key for an invalid wrong-codec block.
+    const uint256 block_hash{
+        block->GetMarkerHash(m_chainparams.GetConsensus())};
 
     bool new_block{false};
-    m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &new_block);
+    const bool processed{m_chainman.ProcessNewBlock(
+        block, force_processing, min_pow_checked, &new_block)};
     if (new_block) {
         node.m_last_block_time = GetTime<std::chrono::seconds>();
         // In case this block came from a different peer than we requested
@@ -3947,6 +4042,16 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
         LOCK(cs_main);
         mapBlockSource.erase(block_hash);
     }
+
+    bool block_available{false};
+    if (m_chainparams.GetConsensus().legacy_b3coin && processed) {
+        LOCK(cs_main);
+        const CBlockIndex* index{
+            m_chainman.m_blockman.LookupBlockIndex(block_hash)};
+        block_available = index && (index->nStatus & BLOCK_HAVE_DATA) &&
+                          index->IsValid(BLOCK_VALID_TRANSACTIONS);
+    }
+    if (block_available) DrainB3BlockOrphans(block_hash);
 }
 
 void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
@@ -5634,12 +5739,12 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             LOCK(cs_main);
             prev_block = m_chainman.m_blockman.LookupBlockIndex(pblock->hashPrevBlock);
         }
-        // The legacy download machinery (getblocks, inv queue, getdata
+        // The B3 download machinery (getblocks, inv queue, getdata
         // window) is gated on the chain parameter, so its accounting here
         // must match or the window wedges at the hard-fork boundary.
         // Switching sync itself off at that boundary is future modern-sync
         // work (see doc/design/b3-era-architecture.md).
-        const bool legacy_sync{m_chainparams.GetConsensus().legacy_b3coin};
+        const bool b3_chain{m_chainparams.GetConsensus().legacy_b3coin};
         // Identity always comes from the codec marker — never an assumed
         // height (doc/design/b3-architecture-contract.md). The connected
         // height later decides only whether the codec is legal, so the
@@ -5647,7 +5752,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         const uint256 hash{pblock->GetMarkerHash(m_chainparams.GetConsensus())};
         bool legacy_block_requested{false};
         bool legacy_block_is_next{false};
-        if (legacy_sync) {
+        if (b3_chain) {
             for (size_t i = 0; i < peer.m_legacy_blocks_in_flight; ++i) {
                 if (peer.m_legacy_block_queue[i] == hash) {
                     legacy_block_requested = true;
@@ -5670,15 +5775,15 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             return;
         }
 
-        // The historical B3Coin network can relay a child block before its
-        // parent. Its original client kept a bounded orphan-block cache for
-        // that case; keep one here so a structurally-valid child is retained
-        // (bounded by count, bytes, per-peer share, and expiry) instead of
-        // being re-downloaded, and restart the request from our connected tip
-        // rather than sending it into Core's missing-parent rejection path.
-        const bool legacy_missing_parent{
-            legacy_sync && !prev_block && !pblock->hashPrevBlock.IsNull()};
-        if (legacy_missing_parent) {
+        // A B3 peer can relay a child block before its parent in both the
+        // historical and marker-modern eras. Keep a structurally-valid child
+        // in the bounded orphan cache instead of sending it into Core's
+        // missing-parent rejection path. Legacy discovery remains owned by a
+        // single peer; after the boundary, the sending peer is asked for the
+        // missing headers through the normal per-peer rate limiter.
+        const bool b3_missing_parent{
+            b3_chain && !prev_block && !pblock->hashPrevBlock.IsNull()};
+        if (b3_missing_parent) {
             // Context-free validation: no chain state involved, so cs_main is
             // deliberately not held for this attacker-sized (up to 5 MB) work.
             BlockValidationState state;
@@ -5690,14 +5795,16 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                 return;
             }
             {
-                LogDebug(BCLog::NET,
-                         "received legacy block %s before parent %s; requesting from connected tip peer=%d\n",
-                         hash.ToString(), pblock->hashPrevBlock.ToString(), pfrom.GetId());
-
                 const auto now{NodeClock::now()};
-                m_legacy_orphanage.Expire(now);
-                (void)m_legacy_orphanage.Add(hash, pblock->hashPrevBlock, pblock, pfrom.GetId(),
-                                             GetSerializeSize(legacy::TX_LEGACY(*pblock)), now);
+                const bool cached{m_b3_orphanage.Add(
+                    hash, pblock->hashPrevBlock, pblock, pfrom.GetId(),
+                    GetSerializeSize(legacy::TX_LEGACY(*pblock)), now)};
+                if (!cached) {
+                    LogDebug(BCLog::NET,
+                             "not caching unknown-parent B3 block %s from peer=%d "
+                             "(duplicate or orphan-cache limit)\n",
+                             hash.ToString(), pfrom.GetId());
+                }
 
                 peer.m_legacy_sync_exhausted = false;
                 if (legacy_block_requested) {
@@ -5726,20 +5833,32 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                     peer.m_legacy_getblocks_in_flight = false;
                 }
 
-                // Only the sync owner drives discovery. Restarting getblocks
-                // for every peer that delivers an orphan lets any peer
-                // trigger repeated discovery traffic at will.
+                // Only the sync owner drives historical getblocks discovery.
+                // In the marker-modern phase, request the missing header path
+                // from this sender even when there is no legacy owner;
+                // MaybeSendGetHeaders enforces one request per response window.
                 std::optional<CBlockLocator> next_locator;
+                bool recover_with_headers{false};
                 {
                     LOCK(cs_main);
-                    if (m_legacy_sync_peer == pfrom.GetId()) {
-                        if (const CBlockIndex* active_tip{m_chainman.ActiveChain().Tip()}) {
-                            next_locator = GetLocator(active_tip);
-                        }
+                    recover_with_headers = !IsLegacyPhase();
+                    if (recover_with_headers ||
+                        m_legacy_sync_peer == pfrom.GetId()) {
+                        const CBlockIndex* locator_start{
+                            m_chainman.m_best_header
+                                ? m_chainman.m_best_header
+                                : m_chainman.ActiveChain().Tip()};
+                        if (locator_start) next_locator = GetLocator(locator_start);
                     }
                 }
-                if (next_locator) {
-                    (void)MaybeSendGetHeaders(pfrom, *next_locator, peer);
+                if (next_locator &&
+                    MaybeSendGetHeaders(pfrom, *next_locator, peer)) {
+                    LogDebug(BCLog::NET,
+                             "received B3 block %s before parent %s; sending %s "
+                             "from connected chain peer=%d cached=%d\n",
+                             hash.ToString(), pblock->hashPrevBlock.ToString(),
+                             recover_with_headers ? "getheaders" : "getblocks",
+                             pfrom.GetId(), cached);
                 }
                 return;
             }
@@ -5776,36 +5895,6 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             }
         }
         ProcessBlock(pfrom, pblock, forceProcessing, min_pow_checked);
-
-        if (legacy_sync) {
-            // Reprocess any cached orphans whose parent just arrived; each
-            // accepted child may in turn release its own children. The cache
-            // only holds structurally-validated blocks and is bounded, so this
-            // drain is bounded with it.
-            std::deque<uint256> connectable{hash};
-            while (!connectable.empty()) {
-                const uint256 parent{connectable.front()};
-                connectable.pop_front();
-                for (auto& entry : m_legacy_orphanage.TakeChildrenOf(parent)) {
-                    const uint256 child_hash{entry.block->GetMarkerHash(m_chainparams.GetConsensus())};
-                    bool child_min_pow_checked{false};
-                    {
-                        LOCK(cs_main);
-                        mapBlockSource.emplace(child_hash, std::make_pair(entry.from, true));
-                        const CBlockIndex* parent_index{m_chainman.m_blockman.LookupBlockIndex(parent)};
-                        if (parent_index && parent_index->nChainWork + GetBlockProof(*entry.block) >= GetAntiDoSWorkThreshold()) {
-                            child_min_pow_checked = true;
-                        }
-                    }
-                    LogDebug(BCLog::NET, "processing cached orphan %s now that parent %s arrived\n",
-                             child_hash.ToString(), parent.ToString());
-                    bool child_new_block{false};
-                    m_chainman.ProcessNewBlock(entry.block, /*force_processing=*/true,
-                                               child_min_pow_checked, &child_new_block);
-                    if (child_new_block) connectable.push_back(child_hash);
-                }
-            }
-        }
 
         if (legacy_block_requested) {
             // Bookkeeping happens whatever the connect outcome: a duplicate

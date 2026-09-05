@@ -9,15 +9,19 @@
 #include <consensus/merkle.h>
 #include <consensus/modern_pos_params.h>
 #include <consensus/params.h>
+#include <crypto/bls.h>
 #include <key.h>
 #include <legacy/codec.h>
 #include <legacy/consensus.h>
 #include <modern/fn.h>
 #include <modern/pos_v1.h>
 #include <modern/stake.h>
+#include <node/finality_binding_index.h>
+#include <node/finality_tracker.h>
 #include <node/miner.h>
 #include <node/stake_registry.h>
 #include <node/staking.h>
+#include <node/validator_set.h>
 #include <pow.h>
 #include <primitives/block.h>
 #include <script/script.h>
@@ -31,13 +35,73 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <array>
+#include <chrono>
+#include <map>
 #include <memory>
+#include <optional>
+#include <utility>
 #include <vector>
 
 #include <test/util/modern_pos_setup.h>
 
 using namespace b3test;
+
+namespace {
+
+using CoordinationMember =
+    std::pair<modern::ValidatorKeyBytes, uint64_t>;
+
+modern::ValidatorKeyBytes CoordinationValidator(const unsigned char id)
+{
+    modern::ValidatorKeyBytes key{};
+    key[0] = id;
+    key[31] = 0xa5;
+    return key;
+}
+
+std::optional<bls::SecretKey> CoordinationBlsKey(const unsigned char id)
+{
+    std::array<unsigned char, 32> ikm{};
+    ikm[0] = id;
+    ikm[31] = 0x6c;
+    return bls::SecretKey::FromIKM(ikm);
+}
+
+std::optional<node::ValidatorSetSnapshot> BuildCoordinationSet(
+    const std::vector<CoordinationMember>& members)
+{
+    node::FinalityBindingIndex bindings;
+    std::map<node::ValidatorKey, CAmount> weights;
+    std::vector<node::FinalityBindingIndex::Transition> transitions;
+    for (const auto& [validator, weight] : members) {
+        const auto bls_key{CoordinationBlsKey(validator[0])};
+        if (!bls_key) return std::nullopt;
+        transitions.push_back(
+            {validator, {bls_key->GetPublicKey().Compressed(), 0, 1}});
+        weights[validator] = static_cast<CAmount>(weight) *
+                             modern::FINALITY_WEIGHT_UNIT;
+    }
+    bindings.ConnectBlock(/*height=*/1, transitions);
+    return node::ValidatorSetSnapshot::Build(/*epoch=*/7, weights, bindings);
+}
+
+uint256 CoordinationHash(const unsigned char first,
+                         const unsigned char last)
+{
+    uint256 hash{};
+    hash.begin()[0] = first;
+    hash.begin()[31] = last;
+    return hash;
+}
+
+const uint256 COORDINATION_DOMAIN{CoordinationHash(0xd1, 0x01)};
+const uint256 COORDINATION_SEED{CoordinationHash(0x5e, 0xed)};
+constexpr int COORDINATION_HEIGHT{1'234};
+constexpr int64_t SATURATED_ROUND{128};
+
+} // namespace
 
 BOOST_FIXTURE_TEST_SUITE(modern_pos_tests, BasicTestingSetup)
 
@@ -142,6 +206,262 @@ BOOST_AUTO_TEST_CASE(parameter_block_is_structurally_valid)
     pos = Consensus::ModernPosParams{};
     pos.reorg_horizon = 0;
     BOOST_CHECK(!pos.Valid());
+}
+
+//! The advisory proposer order is a deterministic permutation when every
+//! eligible validator fits into a distinct mainnet recovery-round window.
+//! Rebuilding the same immutable snapshot from the opposite insertion order
+//! must give every validator the same rank and delay.
+BOOST_AUTO_TEST_CASE(preferred_proposer_ranks_and_delays_are_deterministic)
+{
+    Consensus::ModernPosParams pos{};
+    BOOST_REQUIRE_EQUAL(pos.round_seconds, 30);
+
+    std::vector<CoordinationMember> members;
+    for (unsigned char id{1}; id <= 5; ++id) {
+        members.emplace_back(CoordinationValidator(id), 1);
+    }
+    const auto set{BuildCoordinationSet(members)};
+    BOOST_REQUIRE(set.has_value());
+
+    std::vector<CoordinationMember> reversed{members};
+    std::reverse(reversed.begin(), reversed.end());
+    const auto rebuilt{BuildCoordinationSet(reversed)};
+    BOOST_REQUIRE(rebuilt.has_value());
+    BOOST_REQUIRE(set->SetHash() == rebuilt->SetHash());
+
+    std::array<bool, 5> ranks{};
+    std::array<bool, 5> delay_slots{};
+    for (const auto& [validator, weight] : members) {
+        const auto plan{node::ComputePreferredProposerPlan(
+            COORDINATION_DOMAIN, COORDINATION_SEED, COORDINATION_HEIGHT,
+            SATURATED_ROUND, *set, validator, pos)};
+        const auto repeat{node::ComputePreferredProposerPlan(
+            COORDINATION_DOMAIN, COORDINATION_SEED, COORDINATION_HEIGHT,
+            SATURATED_ROUND, *set, validator, pos)};
+        const auto from_rebuilt{node::ComputePreferredProposerPlan(
+            COORDINATION_DOMAIN, COORDINATION_SEED, COORDINATION_HEIGHT,
+            SATURATED_ROUND, *rebuilt, validator, pos)};
+
+        BOOST_CHECK(plan.action == node::PreferredProposerAction::SCHEDULE);
+        BOOST_REQUIRE_LT(plan.rank, ranks.size());
+        BOOST_CHECK(!ranks[plan.rank]);
+        ranks[plan.rank] = true;
+        BOOST_CHECK_EQUAL(plan.eligible_count, members.size());
+        BOOST_CHECK(plan.delay == std::chrono::seconds{5} * plan.rank);
+        BOOST_CHECK(plan.window == std::chrono::seconds{5});
+        const size_t delay_slot{
+            static_cast<size_t>(plan.delay / std::chrono::seconds{5})};
+        BOOST_REQUIRE_LT(delay_slot, delay_slots.size());
+        BOOST_CHECK(!delay_slots[delay_slot]);
+        delay_slots[delay_slot] = true;
+
+        BOOST_CHECK(repeat.action == plan.action);
+        BOOST_CHECK_EQUAL(repeat.rank, plan.rank);
+        BOOST_CHECK_EQUAL(repeat.eligible_count, plan.eligible_count);
+        BOOST_CHECK(repeat.delay == plan.delay);
+        BOOST_CHECK(repeat.window == plan.window);
+        BOOST_CHECK(from_rebuilt.action == plan.action);
+        BOOST_CHECK_EQUAL(from_rebuilt.rank, plan.rank);
+        BOOST_CHECK_EQUAL(from_rebuilt.eligible_count,
+                          plan.eligible_count);
+        BOOST_CHECK(from_rebuilt.delay == plan.delay);
+        BOOST_CHECK(from_rebuilt.window == plan.window);
+        (void)weight;
+    }
+    BOOST_CHECK(std::ranges::all_of(ranks, [](const bool used) { return used; }));
+    BOOST_CHECK(std::ranges::all_of(delay_slots,
+                                    [](const bool used) { return used; }));
+}
+
+//! Selection is stake-weighted, not merely a hash-sort of validator keys.
+//! At saturated recovery rounds both members are consensus-eligible; across
+//! this fixed deterministic sample the member holding 90% of the stake must
+//! receive a strong majority of the first-proposer positions.
+BOOST_AUTO_TEST_CASE(preferred_proposer_first_rank_is_stake_weighted)
+{
+    Consensus::ModernPosParams pos{};
+    const auto light{CoordinationValidator(1)};
+    const auto heavy{CoordinationValidator(2)};
+    const auto set{BuildCoordinationSet({{light, 1}, {heavy, 9}})};
+    BOOST_REQUIRE(set.has_value());
+
+    unsigned int heavy_first{0};
+    constexpr unsigned int SAMPLES{256};
+    for (unsigned int offset{0}; offset < SAMPLES; ++offset) {
+        const int64_t round{SATURATED_ROUND + offset};
+        const auto light_plan{node::ComputePreferredProposerPlan(
+            COORDINATION_DOMAIN, COORDINATION_SEED, COORDINATION_HEIGHT,
+            round, *set, light, pos)};
+        const auto heavy_plan{node::ComputePreferredProposerPlan(
+            COORDINATION_DOMAIN, COORDINATION_SEED, COORDINATION_HEIGHT,
+            round, *set, heavy, pos)};
+        BOOST_REQUIRE(light_plan.action ==
+                      node::PreferredProposerAction::SCHEDULE);
+        BOOST_REQUIRE(heavy_plan.action ==
+                      node::PreferredProposerAction::SCHEDULE);
+        BOOST_REQUIRE_EQUAL(light_plan.eligible_count, 2U);
+        BOOST_REQUIRE_EQUAL(heavy_plan.eligible_count, 2U);
+        BOOST_REQUIRE_NE(light_plan.rank, heavy_plan.rank);
+        if (heavy_plan.rank == 0) ++heavy_first;
+    }
+    BOOST_CHECK_GT(heavy_first, SAMPLES * 3 / 4);
+}
+
+//! Candidate membership is exactly the existing consensus eligibility result
+//! for this recovery round. A snapshot member that is ineligible, and a key
+//! outside the snapshot, wait for another round instead of receiving a slot.
+BOOST_AUTO_TEST_CASE(preferred_proposer_filters_consensus_ineligible_keys)
+{
+    Consensus::ModernPosParams pos{};
+    constexpr int64_t round{2};
+
+    const auto heavy_a{CoordinationValidator(1)};
+    const auto heavy_b{CoordinationValidator(2)};
+    std::optional<modern::ValidatorKeyBytes> light;
+    for (unsigned int id{3}; id <= 255; ++id) {
+        const auto candidate{
+            CoordinationValidator(static_cast<unsigned char>(id))};
+        const uint256 digest{modern::ModernPosEligibilityDigest(
+            COORDINATION_DOMAIN, COORDINATION_SEED, COORDINATION_HEIGHT,
+            static_cast<uint32_t>(round), candidate)};
+        if (!modern::ModernPosEligible(digest, /*w=*/1, /*W=*/9, round,
+                                       pos)) {
+            light = candidate;
+            break;
+        }
+    }
+    BOOST_REQUIRE(light.has_value());
+
+    const auto set{BuildCoordinationSet(
+        {{heavy_a, 4}, {heavy_b, 4}, {*light, 1}})};
+    BOOST_REQUIRE(set.has_value());
+    BOOST_REQUIRE(set->IndexOf(*light).has_value());
+
+    for (const auto& heavy : {heavy_a, heavy_b}) {
+        const uint256 digest{modern::ModernPosEligibilityDigest(
+            COORDINATION_DOMAIN, COORDINATION_SEED, COORDINATION_HEIGHT,
+            static_cast<uint32_t>(round), heavy)};
+        BOOST_REQUIRE(modern::ModernPosEligible(digest, /*w=*/4, /*W=*/9,
+                                                round, pos));
+        const auto plan{node::ComputePreferredProposerPlan(
+            COORDINATION_DOMAIN, COORDINATION_SEED, COORDINATION_HEIGHT,
+            round, *set, heavy, pos)};
+        BOOST_CHECK(plan.action == node::PreferredProposerAction::SCHEDULE);
+        BOOST_CHECK_EQUAL(plan.eligible_count, 2U);
+        BOOST_CHECK_LT(plan.rank, 2U);
+    }
+
+    const auto ineligible{node::ComputePreferredProposerPlan(
+        COORDINATION_DOMAIN, COORDINATION_SEED, COORDINATION_HEIGHT, round,
+        *set, *light, pos)};
+    BOOST_CHECK(ineligible.action ==
+                node::PreferredProposerAction::WAIT_NEXT_ROUND);
+    BOOST_CHECK_EQUAL(ineligible.eligible_count, 2U);
+    BOOST_CHECK_EQUAL(ineligible.delay.count(), 0);
+    BOOST_CHECK_EQUAL(ineligible.window.count(), 0);
+
+    const auto outsider{node::ComputePreferredProposerPlan(
+        COORDINATION_DOMAIN, COORDINATION_SEED, COORDINATION_HEIGHT, round,
+        *set, CoordinationValidator(0xfe), pos)};
+    BOOST_CHECK(outsider.action ==
+                node::PreferredProposerAction::WAIT_NEXT_ROUND);
+    BOOST_CHECK_EQUAL(outsider.eligible_count, 2U);
+}
+
+//! Five unique five-second windows fit safely in the 30-second mainnet round.
+//! With six eligible validators exactly one defers to the next reshuffle; it
+//! must never share a fallback timestamp with another honest validator.
+BOOST_AUTO_TEST_CASE(preferred_proposer_overflow_defers_without_shared_slot)
+{
+    Consensus::ModernPosParams pos{};
+    std::vector<CoordinationMember> members;
+    for (unsigned char id{1}; id <= 6; ++id) {
+        members.emplace_back(CoordinationValidator(id), 1);
+    }
+    const auto set{BuildCoordinationSet(members)};
+    BOOST_REQUIRE(set.has_value());
+
+    std::array<bool, 5> delay_slots{};
+    unsigned int scheduled_count{0};
+    unsigned int deferred_count{0};
+    for (const auto& [validator, weight] : members) {
+        const auto plan{node::ComputePreferredProposerPlan(
+            COORDINATION_DOMAIN, COORDINATION_SEED, COORDINATION_HEIGHT,
+            SATURATED_ROUND, *set, validator, pos)};
+        BOOST_CHECK_EQUAL(plan.eligible_count, members.size());
+        if (plan.action == node::PreferredProposerAction::SCHEDULE) {
+            ++scheduled_count;
+            BOOST_REQUIRE_LT(plan.rank, delay_slots.size());
+            BOOST_CHECK(!delay_slots[plan.rank]);
+            delay_slots[plan.rank] = true;
+            BOOST_CHECK(plan.delay == std::chrono::seconds{5} * plan.rank);
+            BOOST_CHECK(plan.window == std::chrono::seconds{5});
+        } else {
+            BOOST_CHECK(plan.action ==
+                        node::PreferredProposerAction::WAIT_NEXT_ROUND);
+            ++deferred_count;
+            BOOST_CHECK_EQUAL(plan.rank, 5U);
+        }
+        (void)weight;
+    }
+    BOOST_CHECK_EQUAL(scheduled_count, 5U);
+    BOOST_CHECK_EQUAL(deferred_count, 1U);
+    BOOST_CHECK(std::ranges::all_of(delay_slots,
+                                    [](const bool used) { return used; }));
+    const auto outsider{node::ComputePreferredProposerPlan(
+        COORDINATION_DOMAIN, COORDINATION_SEED, COORDINATION_HEIGHT,
+        SATURATED_ROUND, *set, CoordinationValidator(0xfe), pos)};
+    BOOST_CHECK(outsider.action ==
+                node::PreferredProposerAction::WAIT_NEXT_ROUND);
+    BOOST_CHECK_EQUAL(outsider.eligible_count, members.size());
+}
+
+//! Accelerated regtest uses one-second recovery rounds. One eligible proposer
+//! owns that full round; every other eligible proposer waits for the next
+//! deterministic reshuffle instead of using subsecond slots.
+BOOST_AUTO_TEST_CASE(preferred_proposer_one_second_round_defers_backups)
+{
+    Consensus::ModernPosParams pos{};
+    pos.round_seconds = 1;
+    BOOST_REQUIRE(pos.Valid());
+
+    const auto sole{CoordinationValidator(1)};
+    const auto one{BuildCoordinationSet({{sole, 1}})};
+    BOOST_REQUIRE(one.has_value());
+    const auto scheduled{node::ComputePreferredProposerPlan(
+        COORDINATION_DOMAIN, COORDINATION_SEED, COORDINATION_HEIGHT,
+        SATURATED_ROUND, *one, sole, pos)};
+    BOOST_CHECK(scheduled.action == node::PreferredProposerAction::SCHEDULE);
+    BOOST_CHECK_EQUAL(scheduled.rank, 0U);
+    BOOST_CHECK_EQUAL(scheduled.eligible_count, 1U);
+    BOOST_CHECK_EQUAL(scheduled.delay.count(), 0);
+    BOOST_CHECK(scheduled.window == std::chrono::seconds{1});
+
+    const auto second{CoordinationValidator(2)};
+    const auto two{BuildCoordinationSet({{sole, 1}, {second, 1}})};
+    BOOST_REQUIRE(two.has_value());
+    unsigned int scheduled_count{0};
+    unsigned int deferred_count{0};
+    for (const auto& validator : {sole, second}) {
+        const auto plan{node::ComputePreferredProposerPlan(
+            COORDINATION_DOMAIN, COORDINATION_SEED, COORDINATION_HEIGHT,
+            SATURATED_ROUND, *two, validator, pos)};
+        BOOST_CHECK_EQUAL(plan.eligible_count, 2U);
+        if (plan.action == node::PreferredProposerAction::SCHEDULE) {
+            ++scheduled_count;
+            BOOST_CHECK_EQUAL(plan.rank, 0U);
+            BOOST_CHECK_EQUAL(plan.delay.count(), 0);
+            BOOST_CHECK(plan.window == std::chrono::seconds{1});
+        } else {
+            ++deferred_count;
+            BOOST_CHECK(plan.action ==
+                        node::PreferredProposerAction::WAIT_NEXT_ROUND);
+            BOOST_CHECK_EQUAL(plan.rank, 1U);
+        }
+    }
+    BOOST_CHECK_EQUAL(scheduled_count, 1U);
+    BOOST_CHECK_EQUAL(deferred_count, 1U);
 }
 
 //! The RULED mainnet corridor constant (owner, 2026-08-23) is the canonical
@@ -355,6 +675,69 @@ BOOST_FIXTURE_TEST_CASE(v1_normal_operation, ModernPosSetup)
     options.include_dummy_extranonce = true;
     options.modern_pos_validator_key = m_val_a;
 
+    // Producer policy may request an exact existing recovery round, but the
+    // assembler still refuses it when this validator is not consensus-
+    // eligible. The low-weight validator's first eligible round gives us an
+    // exact negative case by definition.
+    {
+        const CBlockIndex* prev{Tip()};
+        const int64_t round_b{FindRound(prev, m_val_b, STAKE_B, W)};
+        BOOST_REQUIRE_GT(round_b, 0);
+        node::BlockAssembler::Options exact_bad{options};
+        exact_bad.modern_pos_validator_key = m_val_b;
+        exact_bad.modern_pos_round = static_cast<uint32_t>(round_b - 1);
+        BOOST_CHECK_THROW(
+            node::BlockAssembler(chainman.ActiveChainstate(), nullptr,
+                                 exact_bad)
+                .CreateNewBlock(),
+            std::runtime_error);
+    }
+
+    // The preferred-proposer schedule is deliberately not a validity rule.
+    // At a saturated round both validators are eligible; build and accept the
+    // rank-one backup directly to prove old/non-coordinating producers remain
+    // consensus-compatible.
+    {
+        const CBlockIndex* prev{Tip()};
+        constexpr int64_t round{128};
+        std::shared_ptr<const node::ValidatorSetSnapshot> set;
+        {
+            LOCK(cs_main);
+            Chainstate& chainstate{chainman.ActiveChainstate()};
+            BOOST_REQUIRE(chainstate.ModernEligibilityWeights(m_val_a,
+                                                               *prev));
+            set = chainstate.ModernFinality().SetInForceAt(
+                prev->nHeight + 1, consensus);
+        }
+        BOOST_REQUIRE(set != nullptr);
+        const auto plan_a{node::ComputePreferredProposerPlan(
+            Domain(), SeedFor(prev), prev->nHeight + 1, round, *set, m_val_a,
+            *consensus.modern_pos)};
+        const auto plan_b{node::ComputePreferredProposerPlan(
+            Domain(), SeedFor(prev), prev->nHeight + 1, round, *set, m_val_b,
+            *consensus.modern_pos)};
+        BOOST_REQUIRE(plan_a.action ==
+                      node::PreferredProposerAction::SCHEDULE);
+        BOOST_REQUIRE(plan_b.action ==
+                      node::PreferredProposerAction::SCHEDULE);
+        BOOST_REQUIRE_NE(plan_a.rank, plan_b.rank);
+        const bool backup_is_a{plan_a.rank > plan_b.rank};
+
+        node::BlockAssembler::Options exact{options};
+        exact.modern_pos_validator_key = backup_is_a ? m_val_a : m_val_b;
+        exact.modern_pos_round = static_cast<uint32_t>(round);
+        const auto tmpl{node::BlockAssembler(chainman.ActiveChainstate(),
+                                             nullptr, exact)
+                            .CreateNewBlock()};
+        BOOST_REQUIRE(tmpl);
+        CBlock backup{tmpl->block};
+        backup.hashMerkleRoot = BlockMerkleRoot(backup);
+        Sign(backup, backup_is_a ? m_key_a : m_key_b);
+        BOOST_REQUIRE(Submit(backup));
+        BOOST_CHECK_EQUAL(Tip()->GetBlockHash().GetHex(),
+                          backup.GetHash().GetHex());
+    }
+
     for (int i{0}; i < 5; ++i) {
         const CBlockIndex* prev{Tip()};
         const int64_t expected_round{FindRound(prev, m_val_a, STAKE_A, W)};
@@ -385,7 +768,7 @@ BOOST_FIXTURE_TEST_CASE(v1_normal_operation, ModernPosSetup)
             WITH_LOCK(cs_main, return Tip()->m_modern_pos_digest).GetHex(),
             expected_digest.GetHex());
     }
-    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H + SYN_CORRIDOR + 5);
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H + SYN_CORRIDOR + 6);
 }
 
 //! Scenario 2 — low online stake: only the small validator (B, 0.5% of
@@ -460,40 +843,111 @@ BOOST_FIXTURE_TEST_CASE(v1_low_online_stake_recovery, ModernPosSetup)
     }
 }
 
-//! Scenario 3 — invalid validator signatures: corrupted, missing, and
-//! wrong-key signatures are all refused and never move the tip. Each
-//! variant carries a distinct identity (coinbase extra data), because the
-//! signature itself lives outside the block hash.
+//! Scenario 3 — a malicious peer must not poison a valid block identity by
+//! sending corrupted, missing, or wrong-key trailing signature bytes first.
+//! Those bytes live outside the block hash: each malformed copy is rejected
+//! as mutated without storing data or marking the header failed, then the
+//! authentic same-hash body is accepted.
 BOOST_FIXTURE_TEST_CASE(v1_invalid_signature, ModernPosSetup)
 {
     AdvanceToModernPos();
     const CAmount W{STAKE_A + STAKE_B};
-    const CBlockIndex* prev{Tip()};
-    const int64_t round_a{FindRound(prev, m_val_a, STAKE_A, W)};
+    unsigned int extra{1};
+    const auto reject_mutation_then_accept =
+        [&](const auto& mutate_signature) {
+            const CBlockIndex* prev{Tip()};
+            const int64_t round_a{
+                FindRound(prev, m_val_a, STAKE_A, W)};
+            CBlock good{BuildPos(prev, m_val_a, round_a, 0, extra++)};
+            Sign(good, m_key_a);
+            CBlock bad{good};
+            mutate_signature(bad);
+            BOOST_REQUIRE(bad.GetHash() == good.GetHash());
 
-    { // Corrupted signature.
-        CBlock block{BuildPos(prev, m_val_a, round_a, 0, /*extra=*/1)};
-        Sign(block, m_key_a);
+            BOOST_CHECK(!Submit(bad));
+            BOOST_CHECK_EQUAL(Tip()->GetBlockHash().GetHex(),
+                              prev->GetBlockHash().GetHex());
+            {
+                LOCK(cs_main);
+                const CBlockIndex* index{
+                    m_node.chainman->m_blockman.LookupBlockIndex(
+                        good.GetHash())};
+                BOOST_REQUIRE(index != nullptr);
+                BOOST_CHECK(!(index->nStatus & BLOCK_FAILED_VALID));
+                BOOST_CHECK(!(index->nStatus & BLOCK_HAVE_DATA));
+            }
+
+            BOOST_REQUIRE(Submit(good));
+            BOOST_CHECK_EQUAL(Tip()->GetBlockHash().GetHex(),
+                              good.GetHash().GetHex());
+        };
+
+    reject_mutation_then_accept([](CBlock& block) {
         block.vchBlockSig[0] ^= 0x01;
-        SubmitExpectConnectFailure(block);
-    }
-    { // Missing signature (fails the contextual size rule).
-        CBlock block{BuildPos(prev, m_val_a, round_a, 0, /*extra=*/2)};
+    });
+    reject_mutation_then_accept([](CBlock& block) {
         block.vchBlockSig.clear();
-        BOOST_CHECK(!Submit(block));
-    }
-    { // Signed by a different key than the coinbase declares.
-        CBlock block{BuildPos(prev, m_val_a, round_a, 0, /*extra=*/3)};
+    });
+    reject_mutation_then_accept([&](CBlock& block) {
         Sign(block, m_key_b);
-        SubmitExpectConnectFailure(block);
-    }
-    BOOST_CHECK_EQUAL(Tip()->nHeight, prev->nHeight); // tip never moved
+    });
+}
 
-    // The honest block still connects afterwards.
-    CBlock good{BuildPos(prev, m_val_a, round_a, 0)};
-    Sign(good, m_key_a);
-    BOOST_REQUIRE(Submit(good));
-    BOOST_CHECK_EQUAL(Tip()->GetBlockHash().GetHex(), good.GetHash().GetHex());
+//! A malformed duplicate must also be unable to replace the valid bytes of an
+//! already-stored side-chain block when that branch is next activated. The
+//! duplicate has the same header/hash, so activation must reload the body
+//! accepted on disk rather than trusting the duplicate caller's trailing
+//! signature.
+BOOST_FIXTURE_TEST_CASE(v1_stored_body_wins_over_bad_signature_duplicate,
+                        ModernPosSetup)
+{
+    AdvanceToModernPos();
+    const CAmount W{STAKE_A + STAKE_B};
+    const CBlockIndex* parent{Tip()};
+
+    CBlock active{BuildPos(parent, m_val_a,
+                           FindRound(parent, m_val_a, STAKE_A, W), 0,
+                           /*extra=*/41)};
+    Sign(active, m_key_a);
+    BOOST_REQUIRE(Submit(active));
+    BOOST_REQUIRE(Tip()->GetBlockHash() == active.GetHash());
+
+    CBlock stored_side{BuildPos(parent, m_val_b,
+                                FindRound(parent, m_val_b, STAKE_B, W), 0,
+                                /*extra=*/42)};
+    Sign(stored_side, m_key_b);
+    BOOST_REQUIRE(Submit(stored_side));
+    BOOST_REQUIRE(Tip()->GetBlockHash() == active.GetHash());
+
+    CBlockIndex* active_index{nullptr};
+    CBlockIndex* side_index{nullptr};
+    {
+        LOCK(cs_main);
+        active_index = m_node.chainman->m_blockman.LookupBlockIndex(
+            active.GetHash());
+        side_index = m_node.chainman->m_blockman.LookupBlockIndex(
+            stored_side.GetHash());
+        BOOST_REQUIRE(active_index != nullptr);
+        BOOST_REQUIRE(side_index != nullptr);
+        BOOST_REQUIRE(side_index->nStatus & BLOCK_HAVE_DATA);
+        BOOST_REQUIRE(!(side_index->nStatus & BLOCK_FAILED_VALID));
+    }
+
+    BlockValidationState invalidate_state;
+    BOOST_REQUIRE(m_node.chainman->ActiveChainstate().InvalidateBlock(
+        invalidate_state, active_index));
+    BOOST_REQUIRE(Tip()->GetBlockHash() == parent->GetBlockHash());
+
+    CBlock bad_duplicate{stored_side};
+    bad_duplicate.vchBlockSig[0] ^= 0x01;
+    BOOST_REQUIRE(bad_duplicate.GetHash() == stored_side.GetHash());
+    BOOST_REQUIRE(Submit(bad_duplicate));
+    BOOST_CHECK(Tip()->GetBlockHash() == stored_side.GetHash());
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!(side_index->nStatus & BLOCK_FAILED_VALID));
+        BOOST_CHECK(side_index->nStatus & BLOCK_HAVE_DATA);
+    }
 }
 
 //! Scenario 4 — invalid eligibility proofs: a validator with no stake, a

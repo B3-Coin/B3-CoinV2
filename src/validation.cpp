@@ -6198,7 +6198,17 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
     // contextual).
     if (!block.vchBlockSig.empty() &&
         !(consensusParams.legacy_b3coin && block.vchBlockSig.size() == modern::MODERN_POS_SIG_SIZE)) {
-        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-signature",
+        // A marker-modern B3 block's trailing signature is intentionally not
+        // part of its header/hash. Treat a malformed copy as mutated data so
+        // it cannot permanently poison the shared header identity before the
+        // authentic body arrives.
+        const bool marker_modern_b3{
+            consensusParams.legacy_b3coin &&
+            Consensus::HasB3BlockCodecV2(block.nVersion)};
+        return state.Invalid(marker_modern_b3
+                                 ? BlockValidationResult::BLOCK_MUTATED
+                                 : BlockValidationResult::BLOCK_CONSENSUS,
+                             "bad-blk-signature",
                              "unexpected block signature");
     }
 
@@ -6709,6 +6719,31 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
     // valid v1 STAKE output — a malformed claim is a block failure, never a
     // silent reinterpretation as an ordinary output.
     if (consensus_params.legacy_b3coin) {
+        // MPA bytes are deliberately outside transaction ids and the ordinary
+        // block Merkle root. First validate the committed metadata-cell
+        // grammar, then authenticate those hash-external bytes against the
+        // coinbase payload root before interpreting any MPA record. A missing,
+        // stripped, or mismatched MPA/root pair can therefore never poison the
+        // shared header identity; malformed MPA that matches the committed root
+        // remains an ordinary consensus failure below.
+        for (const auto& tx : block.vtx) {
+            if (std::string cell_error;
+                !modern::CheckMetadataCellOutputs(*tx, consensus_params, nHeight, cell_error)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-metadata-cell",
+                                     strprintf("%s in transaction %s", cell_error, tx->GetHash().ToString()));
+            }
+        }
+        if (std::string root_error; !modern::CheckBlockPayloadRoot(block, root_error)) {
+            const bool hash_external_mpa{
+                root_error == "payload-root-missing" ||
+                root_error == "payload-root-without-mpa" ||
+                root_error == "payload-root-mismatch"};
+            return state.Invalid(hash_external_mpa
+                                     ? BlockValidationResult::BLOCK_MUTATED
+                                     : BlockValidationResult::BLOCK_CONSENSUS,
+                                 "bad-payload-root", root_error);
+        }
+
         for (const auto& tx : block.vtx) {
             // B3A1 is a reserved, fail-closed output namespace. Semantic
             // conservation is UTXO-dependent and runs in ConnectBlock.
@@ -6721,13 +6756,6 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
             if (std::string stake_error; !modern::CheckStakeOutputs(*tx, consensus_params, stake_error)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-stake-output",
                                      strprintf("%s in transaction %s", stake_error, tx->GetHash().ToString()));
-            }
-            // Metadata cells (policy 6/7/8/9 carriers): a claiming output must be
-            // well-formed, zero-valued and activated; never reinterpreted.
-            if (std::string cell_error;
-                !modern::CheckMetadataCellOutputs(*tx, consensus_params, nHeight, cell_error)) {
-                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-metadata-cell",
-                                     strprintf("%s in transaction %s", cell_error, tx->GetHash().ToString()));
             }
             // Modern Payload Area: activation context, canonical order, registry and
             // per-type grammar; and the FINALITY_KEY cell<->evidence bijection.
@@ -6755,11 +6783,6 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
         if (std::string cost_error; !modern::CheckBlockPayloadCost(block, cost_error)) {
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-block-payload-cost", cost_error);
         }
-        // MODERN_PAYLOAD_ROOT (Path B): every MPA in the block is committed into
-        // the block hash through exactly one coinbase root cell; no MPA => no cell.
-        if (std::string root_error; !modern::CheckBlockPayloadRoot(block, root_error)) {
-            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-payload-root", root_error);
-        }
         // FINALITY_CERT cells / certificate records live in the coinbase only
         // (structural; the certificate itself is judged at connect).
         if (std::string cert_error; !modern::CheckFinalityCertificatePlacement(block, cert_error)) {
@@ -6771,12 +6794,12 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
         // validator signature (verified cryptographically at connect).
         const Consensus::ConsensusPhase phase{Consensus::GetConsensusPhase(nHeight, consensus_params)};
         if (phase == Consensus::ConsensusPhase::TRANSITION_POW && !block.vchBlockSig.empty()) {
-            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-corridor-sig",
+            return state.Invalid(BlockValidationResult::BLOCK_MUTATED, "bad-corridor-sig",
                                  "temporary-PoW corridor block carries a block signature");
         }
         if (phase == Consensus::ConsensusPhase::MODERN_POS && consensus_params.modern_pos &&
             block.vchBlockSig.size() != modern::MODERN_POS_SIG_SIZE) {
-            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-pos-signature",
+            return state.Invalid(BlockValidationResult::BLOCK_MUTATED, "bad-pos-signature",
                                  "modern-PoS block does not carry a 64-byte validator signature");
         }
     }
@@ -6831,6 +6854,48 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-weight", strprintf("%s : weight limit failed", __func__));
     }
 
+    return true;
+}
+
+/**
+ * Verify the hash-external Modern-PoS signature before AcceptBlock stores the
+ * body. This is an admission/malleability check, not a new validity rule:
+ * ConnectBlock retains the same cryptographic verification for consensus and
+ * replay. Invalid committed keys/configuration are deliberately left to that
+ * path; only a bad signature attached to an otherwise usable committed key is
+ * classified as mutated transport data.
+ */
+static bool CheckModernPosUncommittedSignature(
+    const CBlock& block, BlockValidationState& state,
+    const ChainstateManager& chainman, const CBlockIndex* pindex_prev)
+{
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    const int height{pindex_prev == nullptr ? 0 : pindex_prev->nHeight + 1};
+    if (!consensus.legacy_b3coin || !consensus.modern_pos ||
+        Consensus::GetConsensusPhase(height, consensus) !=
+            Consensus::ConsensusPhase::MODERN_POS) {
+        return true;
+    }
+    // ContextualCheckBlock has already enforced the exact signature size and
+    // CheckBlock has established the coinbase structure before this helper is
+    // called.
+    if (block.vtx.empty() || block.vtx[0]->vin.empty()) return true;
+    const auto key{modern::ExtractModernPosValidatorKey(
+        block.vtx[0]->vin[0].scriptSig)};
+    if (!key) return true;
+    const XOnlyPubKey pubkey{std::span<const unsigned char>{*key}};
+    if (!pubkey.IsFullyValid()) return true;
+    const auto domain{modern::ModernChainDomain(
+        consensus.hashGenesisBlock,
+        consensus.legacy_final_hash.value_or(uint256{}))};
+    if (!domain) return true;
+    if (!modern::VerifyModernPosSignature(
+            block.vchBlockSig, *key,
+            modern::ModernPosSignatureHash(*domain, block.GetHash()))) {
+        return state.Invalid(
+            BlockValidationResult::BLOCK_MUTATED, "bad-pos-signature",
+            "modern-PoS block signature does not match the committed validator key");
+    }
     return true;
 }
 
@@ -7018,7 +7083,9 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     const CChainParams& params{GetParams()};
 
     if (!CheckBlock(block, state, params.GetConsensus()) ||
-        !ContextualCheckBlock(block, state, *this, pindex->pprev)) {
+        !ContextualCheckBlock(block, state, *this, pindex->pprev) ||
+        !CheckModernPosUncommittedSignature(block, state, *this,
+                                            pindex->pprev)) {
         if (Assume(state.IsInvalid())) {
             ActiveChainstate().InvalidBlockFound(pindex, state);
         }
@@ -7077,6 +7144,15 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
 {
     AssertLockNotHeld(cs_main);
 
+    // Only a body newly accepted and written by this call may be forwarded to
+    // ActivateBestChain as its in-memory fast path. A duplicate has already
+    // returned from AcceptBlock before contextual checks, and B3 block
+    // signatures deliberately live outside the block hash. Forwarding a
+    // duplicate caller body could therefore let altered trailing signature
+    // bytes replace the valid body already stored for the same header. Force
+    // duplicate activation to reload the canonical disk body instead.
+    bool accepted_new_block{false};
+
     {
         CBlockIndex *pindex = nullptr;
         if (new_block) *new_block = false;
@@ -7094,7 +7170,8 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
         bool ret = CheckBlock(*block, state, GetConsensus());
         if (ret) {
             // Store to disk
-            ret = AcceptBlock(block, state, &pindex, force_processing, nullptr, new_block, min_pow_checked);
+            ret = AcceptBlock(block, state, &pindex, force_processing,
+                              nullptr, &accepted_new_block, min_pow_checked);
         }
         if (!ret) {
             if (m_options.signals) {
@@ -7107,15 +7184,19 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
 
     NotifyHeaderTip();
 
+    if (new_block) *new_block = accepted_new_block;
+    const std::shared_ptr<const CBlock> activation_block{
+        accepted_new_block ? block : nullptr};
     BlockValidationState state; // Only used to report errors, not invalidity - ignore it
-    if (!ActiveChainstate().ActivateBestChain(state, block)) {
+    if (!ActiveChainstate().ActivateBestChain(state, activation_block)) {
         LogError("%s: ActivateBestChain failed (%s)\n", __func__, state.ToString());
         return false;
     }
 
     Chainstate* bg_chain{WITH_LOCK(cs_main, return HistoricalChainstate())};
     BlockValidationState bg_state;
-    if (bg_chain && !bg_chain->ActivateBestChain(bg_state, block)) {
+    if (bg_chain &&
+        !bg_chain->ActivateBestChain(bg_state, activation_block)) {
         LogError("%s: [background] ActivateBestChain failed (%s)\n", __func__, bg_state.ToString());
         return false;
      }

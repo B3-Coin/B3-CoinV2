@@ -103,6 +103,14 @@ public:
          * after the merkle root is finalized (node::SignModernPosBlock).
          */
         std::optional<std::array<unsigned char, 32>> modern_pos_validator_key{};
+        /**
+         * Producer-only scheduling override. When engaged, assemble for this
+         * exact existing consensus recovery round instead of searching for the
+         * validator's first eligible round. CreateNewBlock still applies the
+         * unchanged ModernPosEligible predicate and throws when the validator
+         * is not eligible. Validation and fork choice never read this option.
+         */
+        std::optional<uint32_t> modern_pos_round{};
     };
 
     explicit BlockAssembler(Chainstate& chainstate, const CTxMemPool* mempool, const Options& options);

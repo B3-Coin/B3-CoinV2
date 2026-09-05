@@ -132,6 +132,38 @@ BOOST_AUTO_TEST_CASE(windows_x86_artifact_is_signed_parsed_and_selected_exactly)
     BOOST_CHECK_EQUAL(err, "update-reject-platform");
 }
 
+BOOST_AUTO_TEST_CASE(release_archive_formats_are_signed_parsed_and_selected_exactly)
+{
+    Signer s1, s2;
+    const ReleaseKeys keys{{s1.pub, s2.pub}, 2};
+    std::string err;
+
+    const auto select = [&](const std::string& os, const std::string& arch,
+                            const std::string& format, const std::string& url) {
+        const std::string payload{Payload("stable", 5, 1'000'000, 2'000'000,
+                                          "31.1.1", url, os, arch, format)};
+        const auto manifest{ParseAndVerifyManifest(File(payload, {&s1, &s2}), keys, err)};
+        BOOST_REQUIRE_MESSAGE(manifest, err);
+        HostPolicy host;
+        host.os = os;
+        host.arch = arch;
+        host.format = format;
+        host.installed = *ParseVersion("31.1.0");
+        host.last_accepted_sequence = 4;
+        host.now = 1'500'000;
+        host.allowed_hosts = {"releases.b3flowmesh.example"};
+        const Artifact* artifact{SelectArtifact(*manifest, host, err)};
+        BOOST_REQUIRE_MESSAGE(artifact, err);
+        BOOST_CHECK_EQUAL(artifact->format, format);
+    };
+
+    // These are the actual package types emitted by release-build.yml.
+    select("macos", "arm64", "zip",
+           "https://releases.b3flowmesh.example/b3-hive-macos-arm64.zip");
+    select("linux", "x86_64", "targz",
+           "https://releases.b3flowmesh.example/b3-hive-linux-x86_64.tar.gz");
+}
+
 BOOST_AUTO_TEST_CASE(unconfigured_fails_closed)
 {
     Signer s1;
