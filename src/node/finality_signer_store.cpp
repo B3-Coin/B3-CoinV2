@@ -458,4 +458,55 @@ bool FinalitySignerStore::CommitCertifiedAnchor(
     return Commit(next, error);
 }
 
+bool FinalitySignerStore::CommitPinnedRecoveryAnchor(
+    const Consensus::FinalitySignerRecovery& recovery,
+    const uint256& anchor_digest, std::string& error)
+{
+    if (!m_open || !m_state) {
+        error = "finality signer state is not durably initialized";
+        return false;
+    }
+    if (!recovery.Valid() || anchor_digest.IsNull()) {
+        error = "invalid pinned recovery";
+        return false;
+    }
+    if (recovery.chain_domain != m_chain_domain) {
+        error = "pinned recovery belongs to another chain";
+        return false;
+    }
+    const FinalitySignerState& current{*m_state};
+    // The durable record must be the pinned incident and nothing else: the
+    // orphaned checkpoint is both the last vote and the lock (they were
+    // written together, with one digest), under the pinned epoch and exact
+    // validator sets. Any newer vote, any moved lock, or any other
+    // coordinate is a different history and fails closed.
+    const bool exact_incident{
+        current.last_signed_height == recovery.incident_height &&
+        current.last_signed_block_hash == recovery.incident_block_hash &&
+        current.lock_height == recovery.incident_height &&
+        current.lock_block_hash == recovery.incident_block_hash &&
+        current.lock_digest == current.last_signed_digest &&
+        current.lock_epoch == recovery.incident_epoch &&
+        current.lock_signing_set_hash == recovery.incident_signing_set_hash &&
+        current.lock_successor_set_hash ==
+            recovery.incident_successor_set_hash};
+    if (!exact_incident) {
+        error = "durable signer state is not exactly the pinned recovery incident";
+        return false;
+    }
+    // Implied by Valid() (anchor above the incident) together with the exact
+    // match above; kept as a belt-and-braces guard on the invariant that the
+    // lock never moves backwards.
+    if (recovery.anchor_height <= current.lock_height ||
+        recovery.anchor_height <= current.last_signed_height) {
+        error = "pinned recovery anchor does not advance the durable ancestry lock";
+        return false;
+    }
+    FinalitySignerState next{current};
+    next.lock_height = recovery.anchor_height;
+    next.lock_block_hash = recovery.anchor_block_hash;
+    next.lock_digest = anchor_digest;
+    return Commit(next, error);
+}
+
 } // namespace node

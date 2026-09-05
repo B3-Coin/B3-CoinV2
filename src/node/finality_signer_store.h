@@ -4,6 +4,7 @@
 #ifndef B3COIN_NODE_FINALITY_SIGNER_STORE_H
 #define B3COIN_NODE_FINALITY_SIGNER_STORE_H
 
+#include <consensus/finality_signer_recovery.h>
 #include <modern/finality_key.h>
 #include <uint256.h>
 #include <util/fs.h>
@@ -93,6 +94,17 @@ public:
                                const uint256& signing_set_hash,
                                const uint256& successor_set_hash,
                                std::string& error);
+
+    /** The chain-pinned one-time recovery of an orphaned vote (see
+     * Consensus::FinalitySignerRecovery). Refuses unless the durable state is
+     * EXACTLY the pinned incident: the same checkpoint as both the last vote
+     * and the ancestry lock, the same epoch and validator sets, and no newer
+     * record. Then moves ONLY the ancestry lock to the pinned anchor (strictly
+     * newer); the last actual vote is retained. `anchor_digest` is the exact
+     * finality digest this node derives for the anchor checkpoint. */
+    bool CommitPinnedRecoveryAnchor(
+        const Consensus::FinalitySignerRecovery& recovery,
+        const uint256& anchor_digest, std::string& error);
 
     static fs::path StatePath(
         const fs::path& directory, const uint256& chain_domain,

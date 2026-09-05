@@ -1808,10 +1808,12 @@ void PeerManagerImpl::PushNodeVersion(CNode& pnode, Peer& peer,
     // boundary, new modern-to-modern connections negotiate the modern
     // protocol. An inbound historical peer has already sent 80008, and its
     // final client rejects replies below 80006, so a post-H archival node
-    // must answer that peer with 80008 too. New B3 peers advertise 80009, the
-    // monotone modern B3 identity. This is a wire-identity value only: Core
-    // feature negotiation remains capped at PROTOCOL_VERSION (70016), and
-    // non-B3 networks continue to advertise that Core value.
+    // must answer that peer with 80008 too. New B3 peers advertise
+    // B3_MODERN_PROTOCOL_VERSION (80010 since the v1.1.3 finality-recovery
+    // build; 80009 before it), the monotone modern B3 identity. This is a
+    // wire-identity value only: Core feature negotiation remains capped at
+    // PROTOCOL_VERSION (70016), and non-B3 networks continue to advertise
+    // that Core value.
     const bool local_legacy_phase{
         m_in_legacy_phase.load(std::memory_order_relaxed)};
     const bool b3_network{m_chainparams.GetConsensus().legacy_b3coin};

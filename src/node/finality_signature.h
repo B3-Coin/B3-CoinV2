@@ -176,6 +176,24 @@ private:
                                 const CChain& chain,
                                 const Consensus::Params& params,
                                 const BridgeStateIndex* bridge_index);
+    /**
+     * The chain-pinned one-time recovery (Consensus::FinalitySignerRecovery)
+     * for a journal whose ancestry lock is exactly the pinned orphaned vote.
+     * NOT_APPLICABLE when any pinned fact does not match this journal, this
+     * chain, this epoch state, or the active chain (the caller then fails
+     * closed as usual; `reason` names the refusal when the journal itself is
+     * the pinned incident, so an operator can tell a pending recovery from
+     * an inapplicable one); APPLIED after the durable lock moved; FAILED
+     * after a durable-write failure (already reported through Fail()).
+     */
+    enum class PinnedRecovery { NOT_APPLICABLE, APPLIED, FAILED };
+    PinnedRecovery TryPinnedRecovery(const FinalitySignerState& persisted,
+                                     const FinalityTracker::State& state,
+                                     const CChain& chain,
+                                     const Consensus::Params& params,
+                                     const uint256& chain_domain,
+                                     const BridgeStateIndex* bridge_index,
+                                     std::string& reason);
     void Fail(std::string error, bool permanent = true);
 
     std::optional<bls::SecretKey> m_key;

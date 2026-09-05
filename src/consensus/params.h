@@ -8,6 +8,7 @@
 #define BITCOIN_CONSENSUS_PARAMS_H
 
 #include <consensus/bridge_params.h>
+#include <consensus/finality_signer_recovery.h>
 #include <consensus/modern_pos_params.h>
 #include <consensus/fn_params.h>
 #include <script/verify_flags.h>
@@ -172,6 +173,15 @@ struct Params {
      * the block unset.
      */
     std::optional<ModernPosParams> modern_pos;
+    /**
+     * One-time finality signer journal recovery pin
+     * (consensus/finality_signer_recovery.h). Validator signing behaviour
+     * only, never block validity: it lets a journal that holds exactly the
+     * pinned orphaned vote, and nothing newer, move its ancestry lock to the
+     * pinned recovery anchor on the current chain. Unset everywhere except a
+     * network that has pinned an exact incident and its agreed anchor.
+     */
+    std::optional<FinalitySignerRecovery> finality_signer_recovery;
     /**
      * Historical FN Genesis manifest measured from the sealed legacy chain.
      * When populated, every row and the matching commitment are pinned by the

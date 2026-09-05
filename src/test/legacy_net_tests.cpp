@@ -183,7 +183,7 @@ BOOST_AUTO_TEST_CASE(b3_protocol_version_namespaces_are_pinned)
 {
     BOOST_CHECK_EQUAL(PROTOCOL_VERSION, 70'016);
     BOOST_CHECK_EQUAL(legacy::P2P_PROTOCOL_VERSION, 80'008);
-    BOOST_CHECK_EQUAL(B3_MODERN_PROTOCOL_VERSION, 80'009);
+    BOOST_CHECK_EQUAL(B3_MODERN_PROTOCOL_VERSION, 80'010);
     BOOST_CHECK_GT(B3_MODERN_PROTOCOL_VERSION,
                    legacy::P2P_PROTOCOL_VERSION);
 }
@@ -530,9 +530,10 @@ BOOST_AUTO_TEST_CASE(modern_archival_peer_owns_legacy_window_and_renegotiates_at
     BOOST_CHECK(found_modern_version);
     peerman.FinalizeNode(*renegotiated);
 
-    // 80009 is B3's modern wire identity, not a claim that Core has features
-    // beyond 70016. Two modern B3 peers therefore cap their effective feature
-    // version at the inherited Core capability ceiling.
+    // B3_MODERN_PROTOCOL_VERSION (80010; 80009 before the v1.1.3
+    // finality-recovery build) is B3's modern wire identity, not a claim that
+    // Core has features beyond 70016. Two modern B3 peers therefore cap their
+    // effective feature version at the inherited Core capability ceiling.
     auto modern_handshake{MakeNode(4)};
     connman.Handshake(*modern_handshake,
                       /*successfully_connected=*/true,
@@ -544,7 +545,7 @@ BOOST_AUTO_TEST_CASE(modern_archival_peer_owns_legacy_window_and_renegotiates_at
     BOOST_CHECK_EQUAL(modern_handshake->GetCommonVersion(), PROTOCOL_VERSION);
     peerman.FinalizeNode(*modern_handshake);
 
-    // A post-H automatic outbound 80009 connection must reject an old node's
+    // A post-H automatic outbound modern connection must reject an old node's
     // 80008 reply. It cannot supply modern headers or blocks, and keeping it
     // would let obsolete addresses occupy every useful synchronization slot.
     // This is a clean capability disconnect, not a ban or a consensus fault.

@@ -78,7 +78,8 @@ global `CTransaction` serialization height-aware.
 their call sites:
 
 - P2P identity and capability pinning: legacy protocol version 80008 /
-  compatibility cap 70011, modern B3 wire identity 80009 / Core capability
+  compatibility cap 70011, modern B3 wire identity 80010 (80009 before the
+  v1.1.3 finality-recovery build) / Core capability
   cap 70016, headers-first sync disabled, witness service bits and v2
   transport disabled where the legacy connection mode requires it
   (`net_processing.cpp`, `init.cpp`).

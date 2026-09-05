@@ -51,11 +51,69 @@ Validators should upgrade together to receive the full fork-reduction benefit.
   version, size, and SHA-256 before retaining a download. Installation remains
   manual in v1.1.3; the application does not replace itself automatically.
 
+## Finality signer recovery (revised v1.1.3 build)
+
+- Validators that signed the later-discarded checkpoint at height 811,631
+  (block `86297c10…26be0`) hold a durable ancestry lock on that block. The
+  protocol's only unlock proof is a newer quorum certificate on the active
+  chain, and that certificate cannot form without the locked weight, so
+  finality deadlocked at checkpoint 811,591 while every node agrees on the
+  same active chain.
+- This build carries a compiled-in, one-time recovery pin for that exact
+  incident, in the same spirit as a checkpoint. A signer journal that holds
+  precisely the 811,631 vote, and no newer vote, under epoch 0 with the
+  recorded validator sets, moves only its ancestry lock to the agreed
+  current-chain block at height 811,641 (`5dbb0e58…3b1f75`; verify with
+  `getblockhash 811641`) once that block is buried beyond the modern reorg
+  horizon (1,440 blocks, so from tip height 813,081). The recorded 811,631
+  vote is retained; journals are never deleted or recreated; the next
+  signature is strictly above both heights (811,651 or later). Any
+  other chain, height, hash, epoch, validator set, journal state or newer
+  signing record leaves the journal untouched and the signer fails closed
+  exactly as before. While the recovery is pending or inapplicable the
+  staking status names the reason after the usual fork-refusal message.
+- The 811,591 certificate already certified the epoch-0 handover, so nodes
+  rotated into epoch 1 at height 812,441 on schedule. The pin resolves the
+  incident's validator sets through the normal current-or-previous epoch
+  window, so it still applies after that rotation, and recovered validators
+  then sign the remaining epoch-0 checkpoints and the epoch-1 checkpoints in
+  order. It also still applies to a validator that upgrades after the first
+  new certificate has been included; that validator's next vote is then the
+  first checkpoint above both the anchor and the newly finalized checkpoint.
+- The recovery window closes when epoch 2 starts: the first height at or
+  above 813,881 once an epoch-1 certificate has been included (epoch 0 then
+  leaves the current-or-previous window), or, if no epoch-1 certificate is
+  ever included, when the finality lineage breaks at height 823,961. Every
+  locked validator must therefore run this build and be recovered before
+  height 813,881, about thirteen hours after the anchor settles at 813,081.
+  A validator that misses the window stays locked, exactly as any validator
+  that misses a whole epoch of votes does under the existing journal rule.
+- There is no operator unlock, configuration option, RPC or timeout. A
+  journal that has been recovered, or that has signed anything newer, can
+  never match the pin again, and the pin stops matching every journal once
+  epoch 2 starts or the lineage breaks. Normal operation then continues.
+- The production Ethereum vault currently holds zero USDT and records zero
+  locked USDT, so the temporary exposure of the previously relayed
+  certificate carries no reserve risk. After B3 finality resumes, a newer
+  current-chain certificate is relayed to Ethereum immediately.
+- The advertised B3 modern protocol version changes from `80009` to `80010`
+  so that recovered peers can be identified on the network. This is a wire
+  identity only: the Core feature version stays `70016`, every modern B3
+  version above `80008` negotiates the same mode, and the application version
+  remains 1.1.3.
+
 ## Upgrade
 
 Back up the wallet, shut down the old B3 Hive application completely, and then
 replace it with the v1.1.3 package for your platform. The existing data
 directory and wallet remain compatible; no rescan or reindex is expected.
+
+Nodes already running the first v1.1.3 build must install the revised build
+manually: the secure updater only offers strictly newer versions, so it
+reports the revised same-version package as not newer. The published stable
+update manifest still describes the first build; the release operator must
+re-publish a higher-sequence manifest for the revised packages so that older
+nodes are not offered the pre-recovery build.
 
 The exact source revision was qualified locally with focused Modern-PoS,
 finality, orphan-recovery, updater, and Qt regression suites. The extended

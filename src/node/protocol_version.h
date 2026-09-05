@@ -13,11 +13,14 @@ static const int PROTOCOL_VERSION = 70016;
 
 /**
  * B3's post-transition wire identity. This is intentionally separate from
- * PROTOCOL_VERSION: modern B3 peers advertise the monotone successor to the
+ * PROTOCOL_VERSION: modern B3 peers advertise a monotone successor to the
  * historical 80008 banner, while Core feature negotiation remains capped at
- * PROTOCOL_VERSION below.
+ * PROTOCOL_VERSION below. 80009 was the first modern identity; 80010 is the
+ * v1.1.3 finality-recovery build. Every value above 80008 negotiates the
+ * same modern mode, so the bump identifies builds without changing
+ * compatibility.
  */
-static const int B3_MODERN_PROTOCOL_VERSION = 80009;
+static const int B3_MODERN_PROTOCOL_VERSION = 80010;
 
 //! initial proto version, to be increased after version/verack negotiation
 static const int INIT_PROTO_VERSION = 209;

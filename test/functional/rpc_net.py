@@ -212,7 +212,8 @@ class NetTest(BitcoinTestFramework):
         self.log.info("Test getnetworkinfo")
         info = self.nodes[0].getnetworkinfo()
         # Non-B3 test networks retain the inherited Core capability/wire
-        # version. Only B3 mainnet uses the post-transition 80009 identity.
+        # version. Only B3 mainnet uses the post-transition B3 identity
+        # (80010; 80009 before the v1.1.3 finality-recovery build).
         assert_equal(info['protocolversion'], P2P_VERSION)
         assert_equal(info['networkactive'], True)
         assert_equal(info['connections'], 2)

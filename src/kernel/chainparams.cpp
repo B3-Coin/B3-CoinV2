@@ -443,6 +443,57 @@ public:
                 "invalid mainnet FN Genesis configuration: " + manifest_error);
         }
 
+        // One-time finality signer recovery pin (validator signing behaviour,
+        // never block validity; consensus/finality_signer_recovery.h).
+        // Incident: validators signed epoch-0 checkpoint 811,631 on a branch
+        // that was later discarded (that block is no longer on any node's
+        // active chain), the finalized checkpoint stayed at 811,591, and the
+        // locked validators hold 27,000,666 of the 58,782,918 total weight
+        // while the quorum needs 39,188,613, so no newer certificate -- the
+        // protocol's only unlock proof -- could ever be included. The agreed
+        // recovery anchor is the current-chain block at 811,641 (the next
+        // scheduled checkpoint above the incident). A journal holding exactly
+        // the incident vote moves only its ancestry lock to that anchor once
+        // the anchor is buried beyond the reorg horizon (tip >= 813,081); the
+        // recorded vote is kept and the next signature is 811,651 or later.
+        // The 811,591 certificate already certified the epoch-0 handover, so
+        // the tracker rotated into epoch 1 at 812,441 on schedule; the pin
+        // resolves the incident sets through the {current, current-1}
+        // window and therefore still applies after that rotation, and also
+        // after the first post-incident (epoch-1) certificate, which is not
+        // a protocol unlock proof for an epoch-0 lock. The window closes
+        // when epoch 2 starts: the first height >= 812,441 + 1,440 = 813,881
+        // once an epoch-1 certificate is included below it (Set_0 then
+        // leaves the window), or, should no epoch-1 certificate ever be
+        // included, when the lineage breaks at 813,881 + 10,080 = 823,961.
+        // Every locked validator must therefore run this build and be
+        // recovered before 813,881. Every hash below was
+        // taken from independent observations of the live network, never
+        // derived here: on the kept chain (tip 812,499 when observed on
+        // 2026-09-05) height 811,631 is c45c033d752fabc3dc782f741fe4319e
+        // 37260c5c729e6242e01867966a42442e, not the signed block, and height
+        // 811,641 is the anchor pinned below.
+        {
+            Consensus::FinalitySignerRecovery recovery;
+            recovery.chain_domain = pinned_domain;
+            recovery.incident_height = 811'631;
+            recovery.incident_block_hash = uint256{
+                "86297c1075392fa614a6b0733eeb178de0eb8dc11602226b2b10344453426be0"};
+            recovery.incident_epoch = 0;
+            recovery.incident_signing_set_hash = uint256{
+                "ff7c306f539eec01c793cd7fd389672c53a955d10f00758a2807ef0e9d22514e"};
+            recovery.incident_successor_set_hash = uint256{
+                "6dd7d4575e9f1d74036c7c86175e4fd2e6cf9dc621cddac5b91831b85361d63a"};
+            recovery.anchor_height = 811'641;
+            recovery.anchor_block_hash = uint256{
+                "5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f75"};
+            if (!recovery.Valid()) {
+                throw std::runtime_error(
+                    "invalid mainnet finality signer recovery pin");
+            }
+            consensus.finality_signer_recovery = recovery;
+        }
+
         // Core treats vSeeds as DNS hostnames. These legacy values are literal
         // IPv4 endpoints, so feed them through its fixed-seed path instead.
         // They are historical bootstrap addresses, not a claim that each is
