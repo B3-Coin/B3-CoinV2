@@ -1,9 +1,11 @@
 # B3 Hive v1.1.3 — Validator Coordination and Stability
 
-B3 Hive v1.1.3 is a compatibility-preserving stability release for the live
-Modern-PoS network. It does not change block validity, stake eligibility,
-chain-work selection, activation heights, bridge rules, or wallet data.
-Validators should upgrade together to receive the full fork-reduction benefit.
+B3 Hive v1.1.3 is a targeted stability and recovery release for the live
+Modern-PoS network. It changes block validity only by hardening the agreed
+block at height 811,641 as a checkpoint; stake eligibility, normal chain-work
+selection, activation heights, bridge rules, and wallet data are unchanged.
+Validators should upgrade together to receive the full fork-reduction benefit
+and resume finality on the checkpointed chain.
 
 ## Fewer honest same-height blocks
 
@@ -59,13 +61,16 @@ Validators should upgrade together to receive the full fork-reduction benefit.
   chain, and that certificate cannot form without the locked weight, so
   finality deadlocked at checkpoint 811,591 while every node agrees on the
   same active chain.
-- This build carries a compiled-in, one-time recovery pin for that exact
-  incident, in the same spirit as a checkpoint. A signer journal that holds
+- This build hardens the agreed current-chain block at height 811,641
+  (`5dbb0e58…3b1f75`) as a real modern checkpoint. Updated nodes reject a
+  competing history at that height during normal synchronization and reindex.
+  It also carries a compiled-in, one-time signer recovery for that exact
+  incident. A signer journal that holds
   precisely the 811,631 vote, and no newer vote, under epoch 0 with the
   recorded validator sets, moves only its ancestry lock to the agreed
-  current-chain block at height 811,641 (`5dbb0e58…3b1f75`; verify with
-  `getblockhash 811641`) once that block is buried beyond the modern reorg
-  horizon (1,440 blocks, so from tip height 813,081). The recorded 811,631
+  checkpoint at height 811,641 (verify with
+  `getblockhash 811641`) once that block has the normal 12-block
+  finality-signing depth (from tip height 811,653). The recorded 811,631
   vote is retained; journals are never deleted or recreated; the next
   signature is strictly above both heights (811,651 or later). Any
   other chain, height, hash, epoch, validator set, journal state or newer
@@ -85,7 +90,7 @@ Validators should upgrade together to receive the full fork-reduction benefit.
   leaves the current-or-previous window), or, if no epoch-1 certificate is
   ever included, when the finality lineage breaks at height 823,961. Every
   locked validator must therefore run this build and be recovered before
-  height 813,881, about thirteen hours after the anchor settles at 813,081.
+  height 813,881.
   A validator that misses the window stays locked, exactly as any validator
   that misses a whole epoch of votes does under the existing journal rule.
 - There is no operator unlock, configuration option, RPC or timeout. A
@@ -96,6 +101,10 @@ Validators should upgrade together to receive the full fork-reduction benefit.
   locked USDT, so the temporary exposure of the previously relayed
   certificate carries no reserve risk. After B3 finality resumes, a newer
   current-chain certificate is relayed to Ethereum immediately.
+- Do not deposit into, or otherwise interact directly with, the production
+  vault until the Ethereum verifier reports a current-chain certificate
+  strictly above height 811,631. A saved certificate from the discarded
+  branch could otherwise be submitted before the replacement certificate.
 - The advertised B3 modern protocol version changes from `80009` to `80010`
   so that recovered peers can be identified on the network. This is a wire
   identity only: the Core feature version stays `70016`, every modern B3
@@ -106,7 +115,17 @@ Validators should upgrade together to receive the full fork-reduction benefit.
 
 Back up the wallet, shut down the old B3 Hive application completely, and then
 replace it with the v1.1.3 package for your platform. The existing data
-directory and wallet remain compatible; no rescan or reindex is expected.
+directory and wallet remain compatible. A node already on the checkpointed
+chain needs no rescan or reindex. If startup detects another block at height
+811,641, it stops safely and tells the operator to rebuild the chainstate.
+
+Affected validators must preserve the `finality_signer` directory, unlock the
+wallet, and run `startstaking` normally after installing the build. Confirm
+that `getblockhash 811641` returns
+`5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f75`
+and that `getstakinginfo` reports `finality_signing: true`. Do not delete or
+manually edit the signer journal; the one-time recovery matches and updates it
+in place.
 
 Nodes already running the first v1.1.3 build must install the revised build
 manually: the secure updater only offers strictly newer versions, so it

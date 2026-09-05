@@ -44,10 +44,13 @@ BOOST_AUTO_TEST_CASE(mainnet_sealed_transition_pins_are_complete)
     BOOST_CHECK(!Consensus::LegacyBoundaryHeightOnly(c));
     BOOST_CHECK_EQUAL(Consensus::ModernPosStartHeight(c).value_or(0), 811'001);
     BOOST_CHECK_EQUAL(c.legacy_checkpoints.count(810'001), 0U);
-    BOOST_REQUIRE_EQUAL(c.modern_checkpoints.size(), 1U);
+    BOOST_REQUIRE_EQUAL(c.modern_checkpoints.size(), 2U);
     BOOST_REQUIRE_EQUAL(c.modern_checkpoints.count(810'001), 1U);
     BOOST_CHECK(c.modern_checkpoints.at(810'001) == uint256{
         "913fb38c75e0f12d8d5e6ea65a0ffce33a22a6908392a94661eab7c8506f6014"});
+    BOOST_REQUIRE_EQUAL(c.modern_checkpoints.count(811'641), 1U);
+    BOOST_CHECK(c.modern_checkpoints.at(811'641) == uint256{
+        "5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f75"});
 
     BOOST_CHECK(c.fn_genesis_required);
     BOOST_CHECK_EQUAL(c.fn_genesis_manifest_version, 1);
@@ -154,6 +157,19 @@ BOOST_AUTO_TEST_CASE(mainnet_first_corridor_checkpoint_accepts_only_exact_hash)
     // table cannot accidentally override attested legacy history.
     BOOST_CHECK(Consensus::ModernCheckpointAllows(c, 810'002, wrong));
     BOOST_CHECK(Consensus::ModernCheckpointAllows(c, 810'000, wrong));
+}
+
+BOOST_AUTO_TEST_CASE(mainnet_recovery_anchor_checkpoint_accepts_only_exact_hash)
+{
+    const auto params{CreateChainParams(ArgsManager{}, ChainType::MAIN)};
+    const Consensus::Params& c{params->GetConsensus()};
+    const uint256 exact{
+        "5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f75"};
+    const uint256 wrong{
+        "5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f74"};
+
+    BOOST_CHECK(Consensus::ModernCheckpointAllows(c, 811'641, exact));
+    BOOST_CHECK(!Consensus::ModernCheckpointAllows(c, 811'641, wrong));
 }
 
 BOOST_AUTO_TEST_CASE(other_shipped_networks_remain_fail_closed)

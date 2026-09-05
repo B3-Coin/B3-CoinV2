@@ -492,17 +492,27 @@ FinalitySigner::PinnedRecovery FinalitySigner::TryPinnedRecovery(
             pin->incident_successor_set_hash) {
         return PinnedRecovery::NOT_APPLICABLE;
     }
+    // 3. Hardened anchor: recovery is permitted only when the exact anchor is
+    //    also a modern block checkpoint. This turns the chosen history into a
+    //    block-validity rule for upgraded nodes, including reindex, rather
+    //    than trusting a signer-only observation of the active tip.
+    const auto hardened_anchor{
+        params.modern_checkpoints.find(pin->anchor_height)};
+    if (hardened_anchor == params.modern_checkpoints.end() ||
+        hardened_anchor->second != pin->anchor_block_hash) {
+        reason = "pinned recovery not applicable: the recovery anchor is not a hardened modern checkpoint";
+        return PinnedRecovery::NOT_APPLICABLE;
+    }
     // From here on this journal IS the pinned incident, so every refusal is
     // named: an operator must be able to tell a recovery that is still
     // pending from one that does not apply to this chain.
     //
-    // 3. Active chain: the incident block must really be orphaned here (the
+    // 4. Active chain: the incident block must really be orphaned here (the
     //    caller only reaches this path when it is; kept as a guard), and the
-    //    pinned anchor must be this chain's block at its height, buried
-    //    beyond the modern reorg horizon -- the depth at which consensus
-    //    treats a block as irreversible for online nodes -- and never less
-    //    than checkpoint depth. A recovered lock must never sit on a block
-    //    the chain could still discard.
+    //    hardened anchor must be this chain's block at its height and buried
+    //    to normal finality-signing depth. A recovered lock can never move to
+    //    a competing block at this height because header admission and
+    //    ConnectBlock both enforce the checkpoint.
     const CBlockIndex* at_incident{chain[pin->incident_height]};
     const CBlockIndex* anchor{chain[pin->anchor_height]};
     if (!at_incident) {
@@ -517,14 +527,12 @@ FinalitySigner::PinnedRecovery FinalitySigner::TryPinnedRecovery(
         reason = "pinned recovery not applicable: this chain does not carry the pinned anchor block";
         return PinnedRecovery::NOT_APPLICABLE;
     }
-    const int settled_depth{
-        std::max(pos.checkpoint_depth, pos.reorg_horizon.value_or(0))};
     if (!modern::CheckpointDepthSatisfied(pin->anchor_height, tip->nHeight,
-                                          settled_depth)) {
-        reason = "pinned recovery pending: the anchor is not yet buried beyond the reorg horizon";
+                                          pos.checkpoint_depth)) {
+        reason = "pinned recovery pending: the hardened anchor is not yet buried to finality-signing depth";
         return PinnedRecovery::NOT_APPLICABLE;
     }
-    // 4. Lineage: the incident's epoch must still be inside this chain's
+    // 5. Lineage: the incident's epoch must still be inside this chain's
     //    certificate window ({current, current-1}, exactly as the signature
     //    pool resolves it), with the exact signing set and the exact
     //    committed successor set of the orphaned vote, and the anchor must be
@@ -552,7 +560,7 @@ FinalitySigner::PinnedRecovery FinalitySigner::TryPinnedRecovery(
         reason = "pinned recovery not applicable: the anchor is not a scheduled checkpoint of the incident epoch";
         return PinnedRecovery::NOT_APPLICABLE;
     }
-    // 5. The exact object this node would sign at the anchor must be
+    // 6. The exact object this node would sign at the anchor must be
     //    derivable on this chain and commit to the same successor set.
     const auto fb{FinalitySignaturePool::ExpectedFinalizedBlock(
         pin->incident_epoch, static_cast<uint64_t>(pin->anchor_height),

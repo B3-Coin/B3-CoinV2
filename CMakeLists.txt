@@ -28,8 +28,8 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 #=============================
 set(CLIENT_NAME "B3 FlowMesh client")
 # B3 Hive product versioning. v1.1.3 is the fork-recovery and Qt-updater
-# follow-up to v1.1.2; P2P protocol versioning remains independent.
-# The P2P protocol version is a separate constant and is unaffected.
+# follow-up to v1.1.2. P2P protocol versioning remains independent of this
+# product version; the revised recovery build advertises modern identity 80010.
 set(CLIENT_VERSION_MAJOR 1)
 set(CLIENT_VERSION_MINOR 1)
 set(CLIENT_VERSION_BUILD 3)

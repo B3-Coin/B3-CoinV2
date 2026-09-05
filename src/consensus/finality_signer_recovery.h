@@ -11,9 +11,10 @@
 namespace Consensus {
 
 /**
- * One-time, chain-pinned recovery of a finality signer journal whose
- * ancestry lock points at an orphaned checkpoint (validator behaviour, not
- * block consensus).
+ * One-time recovery of a finality signer journal whose ancestry lock points
+ * at an orphaned checkpoint. The journal move is validator behaviour; the
+ * configured recovery anchor must also be enforced by the network as a
+ * hardened modern block checkpoint.
  *
  * A validator's durable journal refuses to sign on any branch that does not
  * descend from its last signed checkpoint, and the sole protocol unlock proof
@@ -21,16 +22,17 @@ namespace Consensus {
  * proof cannot exist when the locked validators themselves hold the weight
  * the quorum needs: finality then deadlocks even though every node agrees on
  * the active chain. This record pins, per network, exactly one such incident
- * and exactly one agreed recovery anchor on the current chain. A journal that
- * holds precisely the pinned incident vote, and no newer vote, may move ONLY
- * its ancestry lock to the pinned anchor; the recorded last vote is kept.
+ * and exactly one agreed recovery anchor on the hardened current chain. A
+ * journal that holds precisely the pinned incident vote, and no newer vote,
+ * may move ONLY its ancestry lock to the pinned anchor after normal
+ * finality-signing depth; the recorded last vote is kept.
  *
  * Everything else fails closed: another chain domain, another height or hash,
  * another epoch or validator set, a journal that differs from the incident in
  * any field, an anchor that is absent from or differs on the active chain, or
  * an anchor not yet buried to checkpoint depth. There is no operator switch,
  * no timeout, and no generic unlock; the pin is compiled into the network's
- * consensus parameters exactly like a checkpoint.
+ * consensus parameters alongside the checkpoint.
  */
 struct FinalitySignerRecovery {
     //! The modern chain domain the journal must belong to (wrong network

@@ -318,11 +318,14 @@ public:
         // Historical live-legacy checkpoint rules, ported verbatim.
         consensus.legacy_checkpoints = legacy::MainnetCheckpoints();
         consensus.legacy_checkpoint_span = legacy::LEGACY_CHECKPOINT_SPAN;
-        // Separately pin the first post-legacy corridor block, which also
-        // carries deterministic historical FN Genesis. This is its modern
-        // SHA256d block identity, not a legacy replay checkpoint.
+        // Harden exact modern-chain identities. The first entry is the first
+        // post-legacy corridor block and carries deterministic historical FN
+        // Genesis. The second is the agreed live-chain recovery anchor for
+        // the one-time finality signer incident below. These are modern
+        // SHA256d block identities, not legacy replay checkpoints.
         consensus.modern_checkpoints = {
             {810'001, uint256{"913fb38c75e0f12d8d5e6ea65a0ffce33a22a6908392a94661eab7c8506f6014"}},
+            {811'641, uint256{"5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f75"}},
         };
         // The historical one-off superblock (chainparams nSuperBlockHeight /
         // vSuperBlockPubKey in the final client, hex verbatim).
@@ -443,19 +446,21 @@ public:
                 "invalid mainnet FN Genesis configuration: " + manifest_error);
         }
 
-        // One-time finality signer recovery pin (validator signing behaviour,
-        // never block validity; consensus/finality_signer_recovery.h).
+        // One-time finality signer recovery pin. The recovery itself changes
+        // validator signing behaviour; its anchor is separately enforced as
+        // a hardened modern block checkpoint above.
         // Incident: validators signed epoch-0 checkpoint 811,631 on a branch
         // that was later discarded (that block is no longer on any node's
         // active chain), the finalized checkpoint stayed at 811,591, and the
         // locked validators hold 27,000,666 of the 58,782,918 total weight
         // while the quorum needs 39,188,613, so no newer certificate -- the
         // protocol's only unlock proof -- could ever be included. The agreed
-        // recovery anchor is the current-chain block at 811,641 (the next
-        // scheduled checkpoint above the incident). A journal holding exactly
-        // the incident vote moves only its ancestry lock to that anchor once
-        // the anchor is buried beyond the reorg horizon (tip >= 813,081); the
-        // recorded vote is kept and the next signature is 811,651 or later.
+        // recovery anchor is the hardened current-chain block at 811,641 (the
+        // next scheduled checkpoint above the incident). A journal holding
+        // exactly the incident vote moves only its ancestry lock to that
+        // anchor once it has the normal 12-block finality-signing depth (tip
+        // >= 811,653); the recorded vote is kept and the next signature is
+        // 811,651 or later.
         // The 811,591 certificate already certified the epoch-0 handover, so
         // the tracker rotated into epoch 1 at 812,441 on schedule; the pin
         // resolves the incident sets through the {current, current-1}
@@ -467,12 +472,12 @@ public:
         // leaves the window), or, should no epoch-1 certificate ever be
         // included, when the lineage breaks at 813,881 + 10,080 = 823,961.
         // Every locked validator must therefore run this build and be
-        // recovered before 813,881. Every hash below was
-        // taken from independent observations of the live network, never
-        // derived here: on the kept chain (tip 812,499 when observed on
+        // recovered before 813,881. Every hash below was taken from
+        // independent observations of the live network, never derived here:
+        // on the kept chain (tip 812,499 when observed on
         // 2026-09-05) height 811,631 is c45c033d752fabc3dc782f741fe4319e
         // 37260c5c729e6242e01867966a42442e, not the signed block, and height
-        // 811,641 is the anchor pinned below.
+        // 811,641 is the anchor checkpointed above and repeated below.
         {
             Consensus::FinalitySignerRecovery recovery;
             recovery.chain_domain = pinned_domain;
@@ -487,7 +492,11 @@ public:
             recovery.anchor_height = 811'641;
             recovery.anchor_block_hash = uint256{
                 "5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f75"};
-            if (!recovery.Valid()) {
+            const auto anchor_checkpoint{
+                consensus.modern_checkpoints.find(recovery.anchor_height)};
+            if (!recovery.Valid() ||
+                anchor_checkpoint == consensus.modern_checkpoints.end() ||
+                anchor_checkpoint->second != recovery.anchor_block_hash) {
                 throw std::runtime_error(
                     "invalid mainnet finality signer recovery pin");
             }

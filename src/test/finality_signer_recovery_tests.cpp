@@ -36,8 +36,8 @@ using node::FinalitySignaturePool;
 
 namespace {
 
-//! Scaled reorg horizon for these tests: the manual fork below is four blocks
-//! deep, and the anchor must be buried this deep before the pin applies.
+//! Scaled reorg horizon for these tests: the manual incident fork below is
+//! four blocks deep and must remain admissible while the fixture builds it.
 constexpr int SCALED_HORIZON{5};
 
 //! The incident as the fixture builds it: A's vote on M+10 (old branch) that
@@ -401,9 +401,16 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
     BOOST_CHECK_EQUAL(restarted.LastSignedHeight(), M + 10);
     ExpectDeadlocked(restarted, m_store_dir, "no pin");
 
-    // The exact pin, but the anchor (M+15) is only two blocks deep at tip
-    // M+17: not yet buried beyond the scaled reorg horizon. The refusal is
-    // named as pending.
+    // A signer-only anchor is not sufficient: recovery requires the same
+    // identity in the hardened modern checkpoint table.
+    params.finality_signer_recovery = pin;
+    ExpectDeadlocked(restarted, m_store_dir, "anchor is not hardened",
+                     "recovery anchor is not a hardened modern checkpoint");
+    params.finality_signer_recovery.reset();
+    params.modern_checkpoints[pin.anchor_height] = pin.anchor_block_hash;
+
+    // The exact hardened pin, but the anchor (M+15) is only two blocks deep
+    // at tip M+17: not yet at the scaled finality-signing depth of three.
     const auto rejects{[&](const std::string& why, const auto& mutate,
                            const std::string& note) {
         Consensus::FinalitySignerRecovery bad{pin};
@@ -412,22 +419,18 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
         ExpectDeadlocked(restarted, m_store_dir, why, note);
         params.finality_signer_recovery.reset();
     }};
-    rejects("anchor not yet buried beyond the reorg horizon",
+    rejects("anchor not yet buried to finality-signing depth",
             [](Consensus::FinalitySignerRecovery&) {},
-            "pinned recovery pending: the anchor is not yet buried");
-    ProduceTo(M + 19, m_vk_a);
-    rejects("anchor one block short of the reorg horizon",
-            [](Consensus::FinalitySignerRecovery&) {},
-            "pinned recovery pending: the anchor is not yet buried");
-    Produce(m_vk_a);
-    BOOST_REQUIRE_EQUAL(Tip()->nHeight, M + 20);
+            "pinned recovery pending: the hardened anchor is not yet buried");
+    ProduceTo(M + 18, m_vk_a);
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, M + 18);
 
     // Wrong chain / wrong facts at a settled anchor: every deviation leaves
     // the deadlock intact. Pin-vs-journal mismatches are silent (the journal
     // is simply not the incident); pin-vs-chain mismatches are named.
     rejects("wrong anchor hash", [&](Consensus::FinalitySignerRecovery& p) {
         p.anchor_block_hash = ChainHashAt(M + 14);
-    }, "does not carry the pinned anchor block");
+    }, "recovery anchor is not a hardened modern checkpoint");
     rejects("wrong chain domain", [&](Consensus::FinalitySignerRecovery& p) {
         p.chain_domain = m_rng.rand256();
     }, "");
@@ -448,7 +451,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
                 p.anchor_height = M + 14;
                 p.anchor_block_hash = ChainHashAt(M + 14);
             },
-            "not a scheduled checkpoint");
+            "recovery anchor is not a hardened modern checkpoint");
 
     // Journals that agree with a pin but not with this chain, or that carry
     // a newer record than the incident, fail closed at the signer level too.
@@ -713,6 +716,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_applies_after_the_epoch_rotated_and_resu
         BOOST_REQUIRE_EQUAL(state.finalized->height, M);
     }
     const Consensus::FinalitySignerRecovery pin{MakePin(incident)};
+    params.modern_checkpoints[pin.anchor_height] = pin.anchor_block_hash;
 
     node::FinalitySigner restarted;
     BOOST_REQUIRE_MESSAGE(restarted.SetKeyPersistent(
@@ -857,11 +861,15 @@ BOOST_AUTO_TEST_CASE(mainnet_pins_the_811631_incident_and_the_811641_anchor)
         pin->anchor_block_hash.GetHex(),
         "5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f75");
     BOOST_CHECK(pin->anchor_block_hash != pin->incident_block_hash);
+    BOOST_REQUIRE_EQUAL(consensus.modern_checkpoints.count(pin->anchor_height),
+                        1U);
+    BOOST_CHECK(consensus.modern_checkpoints.at(pin->anchor_height) ==
+                pin->anchor_block_hash);
 
     // Both heights are scheduled epoch-0 checkpoints of the mainnet schedule
     // (M = 811,001, interval 10), the anchor is one interval above the
     // incident, so the first permitted new vote is 811,651; the anchor is
-    // settled from tip 813,081 (reorg horizon 1,440). Epoch 1 started at
+    // settled from tip 811,653 (normal checkpoint depth 12). Epoch 1 started at
     // 812,441; the pin applies while epoch 0 is inside the
     // {current, current-1} window, i.e. until epoch 2 starts at the first
     // height >= 813,881 once an epoch-1 certificate is included, or until
@@ -875,8 +883,7 @@ BOOST_AUTO_TEST_CASE(mainnet_pins_the_811631_incident_and_the_811641_anchor)
     BOOST_CHECK(modern::IsCheckpointHeight(pin->anchor_height, *modern_start, pos.checkpoint_interval));
     BOOST_CHECK_EQUAL(pin->anchor_height - pin->incident_height, pos.checkpoint_interval);
     BOOST_CHECK_LT(pin->anchor_height, *modern_start + pos.finality_epoch_blocks);
-    BOOST_REQUIRE(pos.reorg_horizon.has_value());
-    BOOST_CHECK_EQUAL(pin->anchor_height + *pos.reorg_horizon, 813'081);
+    BOOST_CHECK_EQUAL(pin->anchor_height + pos.checkpoint_depth, 811'653);
     BOOST_CHECK_EQUAL(*modern_start + pos.finality_epoch_blocks, 812'441);
     BOOST_CHECK_EQUAL(*modern_start + 2 * pos.finality_epoch_blocks, 813'881);
     BOOST_CHECK_EQUAL(*modern_start + 2 * pos.finality_epoch_blocks +

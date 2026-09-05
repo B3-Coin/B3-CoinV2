@@ -545,6 +545,21 @@ BOOST_AUTO_TEST_CASE(modern_archival_peer_owns_legacy_window_and_renegotiates_at
     BOOST_CHECK_EQUAL(modern_handshake->GetCommonVersion(), PROTOCOL_VERSION);
     peerman.FinalizeNode(*modern_handshake);
 
+    // The immediately preceding modern identity remains fully compatible.
+    // It is above the sealed legacy range and negotiates the same inherited
+    // Core feature ceiling, so the recovery banner does not partition 80009
+    // wallets from 80010 wallets.
+    auto previous_modern{MakeNode(42)};
+    connman.Handshake(*previous_modern,
+                      /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/80'009,
+                      /*relay_txs=*/true);
+    BOOST_REQUIRE(!previous_modern->fDisconnect);
+    BOOST_CHECK_EQUAL(previous_modern->GetCommonVersion(), PROTOCOL_VERSION);
+    peerman.FinalizeNode(*previous_modern);
+
     // A post-H automatic outbound modern connection must reject an old node's
     // 80008 reply. It cannot supply modern headers or blocks, and keeping it
     // would let obsolete addresses occupy every useful synchronization slot.

@@ -176,10 +176,11 @@ struct Params {
     /**
      * One-time finality signer journal recovery pin
      * (consensus/finality_signer_recovery.h). Validator signing behaviour
-     * only, never block validity: it lets a journal that holds exactly the
-     * pinned orphaned vote, and nothing newer, move its ancestry lock to the
-     * pinned recovery anchor on the current chain. Unset everywhere except a
-     * network that has pinned an exact incident and its agreed anchor.
+     * only: it lets a journal that holds exactly the pinned orphaned vote, and
+     * nothing newer, move its ancestry lock to a recovery anchor which the
+     * network separately enforces as a hardened modern block checkpoint.
+     * Unset everywhere except a network that has pinned an exact incident and
+     * its agreed anchor.
      */
     std::optional<FinalitySignerRecovery> finality_signer_recovery;
     /**
