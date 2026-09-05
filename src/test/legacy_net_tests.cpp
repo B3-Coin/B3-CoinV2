@@ -7,6 +7,7 @@
 //! contacted.
 
 #include <addrman.h>
+#include <arith_uint256.h>
 #include <banman.h>
 #include <chain.h>
 #include <consensus/block_codec.h>
@@ -695,6 +696,130 @@ BOOST_AUTO_TEST_CASE(modern_archival_peer_owns_legacy_window_and_renegotiates_at
 BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_FIXTURE_TEST_SUITE(modern_orphan_net_tests, ModernOrphanNetSetup)
+
+BOOST_AUTO_TEST_CASE(modern_headers_reply_across_the_sealed_boundary_is_continuous)
+{
+    // A node parked at the sealed boundary X is already post-legacy and syncs
+    // forward through modern peers with headers-first. Its request must start
+    // at X, and a reply that begins with the legacy-codec X header followed by
+    // the first corridor header must be accepted as continuous: the corridor
+    // header references X by its legacy scrypt identity, not by SHA256d.
+    // Before this was fixed the reply was judged non-continuous, every modern
+    // peer was discouraged, and the node never learned block H+1.
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ConnmanTestMsg& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    PeerManager& peerman = *m_node.peerman;
+    Consensus::Params& consensus{
+        const_cast<Consensus::Params&>(m_node.chainman->GetConsensus())};
+    BOOST_REQUIRE(consensus.transition_pow_bits.has_value());
+
+    // Shape the boundary like mainnet: one real legacy block above genesis
+    // becomes the sealed final block X at H = 1, so X's own parent is known
+    // and a peer's headers reply can start at X. Until X is pinned the chain
+    // is in the X-distribution pause, which accepts the legacy block at H.
+    const CBlockIndex* genesis{
+        WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip())};
+    BOOST_REQUIRE(genesis);
+    consensus.legacy_last_pow_block = 1'000;
+    consensus.hard_fork_height = 2;
+    consensus.legacy_final_hash.reset();
+    CBlock legacy1;
+    {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(genesis->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << int64_t{1} << CScriptNum{99};
+        coinbase.vout.emplace_back(
+            legacy::GetProofOfWorkReward(0, 1, consensus), CScript() << OP_TRUE);
+        legacy1.nVersion = 4;
+        legacy1.hashPrevBlock = genesis->GetBlockHash();
+        legacy1.nTime = coinbase.nTime;
+        legacy1.nBits = legacy::GetNextTargetRequired(
+            genesis, /*proof_of_stake=*/false, consensus);
+        legacy1.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        legacy1.hashMerkleRoot = BlockMerkleRoot(legacy1);
+        const arith_uint256 target{arith_uint256().SetCompact(legacy1.nBits)};
+        while (UintToArith256(legacy1.GetLegacyB3Hash()) > target) ++legacy1.nNonce;
+    }
+    {
+        DataStream bytes;
+        bytes << legacy::TX_LEGACY(legacy1);
+        auto decoded{std::make_shared<CBlock>()};
+        bytes >> legacy::TX_LEGACY(*decoded);
+        bool new_block{false};
+        BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(decoded, true, true, &new_block));
+    }
+    const CBlockIndex* boundary{
+        WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip())};
+    BOOST_REQUIRE_EQUAL(boundary->nHeight, 1);
+    consensus.legacy_final_hash = boundary->GetBlockHash();
+    {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        chainstate.setBlockIndexCandidates.clear();
+        chainstate.PopulateBlockIndexCandidates();
+    }
+    BOOST_REQUIRE_EQUAL(boundary->nHeight,
+                        *Consensus::LegacyFinalHeight(consensus));
+    // The boundary block is legacy-codec: its identity differs from SHA256d.
+    const CBlockHeader boundary_header{boundary->GetBlockHeader()};
+    BOOST_REQUIRE(boundary_header.GetMarkerHash(consensus) ==
+                  boundary->GetBlockHash());
+    BOOST_REQUIRE(boundary_header.GetHash() != boundary->GetBlockHash());
+
+    auto node{MakeNode(0)};
+    connman.Handshake(*node,
+                      /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/B3_MODERN_PROTOCOL_VERSION,
+                      /*relay_txs=*/true);
+    BOOST_REQUIRE(!node->fDisconnect);
+
+    // The initial synchronization request starts at X, not below it.
+    bool found_getheaders{false};
+    for (const SentMsg& msg : DrainSentMessages(*node)) {
+        if (msg.type != NetMsgType::GETHEADERS) continue;
+        SpanReader reader{std::as_bytes(std::span{msg.payload})};
+        CBlockLocator locator;
+        reader >> locator;
+        BOOST_REQUIRE(!locator.vHave.empty());
+        BOOST_CHECK(locator.vHave.front() == boundary->GetBlockHash());
+        found_getheaders = true;
+    }
+    BOOST_CHECK(found_getheaders);
+
+    // A synced modern peer that was asked from below X (an older node, or a
+    // reorganized locator) answers with X itself and the corridor header.
+    CBlock corridor{BuildMarkerModernBlock(
+        boundary->GetBlockHash(), /*height=*/boundary->nHeight + 1,
+        static_cast<uint32_t>(boundary->GetBlockTime() +
+                              consensus.transition_pow_min_spacing),
+        *consensus.transition_pow_bits)};
+    while (!CheckTransitionPowEligibility(corridor)) ++corridor.nNonce;
+    BOOST_REQUIRE(corridor.hashPrevBlock == boundary->GetBlockHash());
+    std::vector<CBlock> reply;
+    reply.emplace_back(boundary_header);
+    reply.emplace_back(CBlockHeader{corridor});
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(
+        *node, NetMsg::Make(NetMsgType::HEADERS, TX_WITH_WITNESS(reply))));
+    node->fPauseSend = false;
+    connman.ProcessMessagesOnce(*node);
+    BOOST_CHECK(peerman.SendMessages(*node));
+
+    // Continuous: the peer is kept, the corridor header becomes the best
+    // header, and its block is requested.
+    BOOST_CHECK(!node->fDisconnect);
+    const uint256 corridor_hash{corridor.GetHash(consensus, boundary->nHeight + 1)};
+    BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->m_best_header->GetBlockHash()) ==
+                corridor_hash);
+    BOOST_CHECK_EQUAL(
+        CountType(DrainSentMessages(*node), NetMsgType::GETDATA), 1U);
+    peerman.FinalizeNode(*node);
+}
 
 BOOST_AUTO_TEST_CASE(connected_wrong_codec_block_keeps_marker_source_identity)
 {

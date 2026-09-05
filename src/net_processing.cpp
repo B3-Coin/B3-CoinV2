@@ -3098,7 +3098,7 @@ void PeerManagerImpl::HandleUnconnectingHeaders(CNode& pfrom, Peer& peer,
     const CBlockIndex* best_header{WITH_LOCK(cs_main, return m_chainman.m_best_header)};
     if (MaybeSendGetHeaders(pfrom, GetLocator(best_header), peer)) {
         LogDebug(BCLog::NET, "received header %s: missing prev block %s, sending getheaders (%d) to end (peer=%d)\n",
-            headers[0].GetHash().ToString(),
+            headers[0].GetMarkerHash(m_chainparams.GetConsensus()).ToString(),
             headers[0].hashPrevBlock.ToString(),
             best_header->nHeight,
             pfrom.GetId());
@@ -3107,17 +3107,24 @@ void PeerManagerImpl::HandleUnconnectingHeaders(CNode& pfrom, Peer& peer,
     // Set hashLastUnknownBlock for this peer, so that if we
     // eventually get the headers - even from a different peer -
     // we can use this peer to download.
-    WITH_LOCK(cs_main, UpdateBlockAvailability(pfrom.GetId(), headers.back().GetHash()));
+    WITH_LOCK(cs_main, UpdateBlockAvailability(pfrom.GetId(), headers.back().GetMarkerHash(m_chainparams.GetConsensus())));
 }
 
 bool PeerManagerImpl::CheckHeadersAreContinuous(const std::vector<CBlockHeader>& headers) const
 {
+    // A B3 header is identified by its marker hash: the legacy scrypt hash
+    // for a legacy-codec header, SHA256d otherwise. A modern peer answering
+    // a locator from just below the sealed boundary replies with the
+    // legacy-codec boundary block X followed by the first corridor header,
+    // which references X by that legacy identity. Comparing SHA256d there
+    // would misjudge every such honest reply as non-continuous, discourage
+    // the peer, and leave a node parked at H without a sync peer.
     uint256 hashLastBlock;
     for (const CBlockHeader& header : headers) {
         if (!hashLastBlock.IsNull() && header.hashPrevBlock != hashLastBlock) {
             return false;
         }
-        hashLastBlock = header.GetHash();
+        hashLastBlock = header.GetMarkerHash(m_chainparams.GetConsensus());
     }
     return true;
 }
@@ -3560,7 +3567,8 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
     const CBlockIndex *last_received_header{nullptr};
     {
         LOCK(cs_main);
-        last_received_header = m_chainman.m_blockman.LookupBlockIndex(headers.back().GetHash());
+        last_received_header = m_chainman.m_blockman.LookupBlockIndex(
+            headers.back().GetMarkerHash(m_chainparams.GetConsensus()));
         already_validated_work = already_validated_work || IsAncestorOfBestHeaderOrTip(last_received_header);
     }
 
@@ -6984,7 +6992,16 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                    the peer's known best block.  This wouldn't be possible
                    if we requested starting at m_chainman.m_best_header and
                    got back an empty response.  */
-                if (pindexStart->pprev)
+                // Never step back below the sealed legacy boundary: a
+                // node parked at H asks from X itself, so the reply holds
+                // only modern-codec corridor headers and a parked peer
+                // answers with nothing rather than with history we hold.
+                const std::optional<int> legacy_final{
+                    Consensus::LegacyFinalHeight(consensusParams)};
+                const bool at_sealed_boundary{
+                    consensusParams.legacy_b3coin && legacy_final &&
+                    pindexStart->nHeight == *legacy_final};
+                if (pindexStart->pprev && !at_sealed_boundary)
                     pindexStart = pindexStart->pprev;
                 if (MaybeSendGetHeaders(node, GetLocator(pindexStart), peer)) {
                     LogDebug(BCLog::NET, "initial getheaders (%d) to peer=%d (startheight:%d)\n", pindexStart->nHeight, node.GetId(), peer.m_starting_height);
