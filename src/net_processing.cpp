@@ -1154,6 +1154,9 @@ private:
     bool BlockRequested(NodeId nodeid, const CBlockIndex& block, std::list<QueuedBlock>::iterator** pit = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     bool TipMayBeStale() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    /** Force the B3 modern seed rescue while a stale post-boundary tip has no
+     *  connected peer ahead of it (see the definition). */
+    void MaybeForceB3ModernSeedRescue() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /** Update pindexLastCommonBlock and add not-in-flight missing successors to vBlocks, until it has
      *  at most count entries.
@@ -1581,6 +1584,39 @@ void PeerManagerImpl::MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid)
         lNodesAnnouncingHeaderAndIDs.push_back(pfrom->GetId());
         return true;
     });
+}
+
+void PeerManagerImpl::MaybeForceB3ModernSeedRescue()
+{
+    AssertLockHeld(cs_main);
+    // Past the sealed boundary the only way forward is a modern peer that is
+    // ahead of us. The address-based rescue counts connected full outbound
+    // peers, which does not tell whether any of them can serve modern
+    // blocks: upgraded wallets that are themselves parked at H satisfy it
+    // and fill the slots, so a node could stay parked with a full peer set.
+    // While the tip is stale and no connected peer has announced a block
+    // above it, force the rescue (which then also contacts the recovery
+    // seeds directly). This runs on the ten-minute stale-tip cadence.
+    if (!m_chainparams.GetConsensus().legacy_b3coin ||
+        m_in_legacy_phase.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
+    if (!tip) return;
+    bool any_peer_ahead{false};
+    m_connman.ForEachNode([&](CNode* pnode) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+        AssertLockHeld(::cs_main);
+        if (any_peer_ahead || pnode->fDisconnect || !pnode->fSuccessfullyConnected) return;
+        const CNodeState* state{State(pnode->GetId())};
+        if (state && state->pindexBestKnownBlock &&
+            state->pindexBestKnownBlock->nChainWork > tip->nChainWork) {
+            any_peer_ahead = true;
+        }
+    });
+    if (any_peer_ahead) return;
+    LogInfo("No connected peer has announced a block above the stale post-boundary tip at height %d; forcing the B3 modern recovery seeds\n",
+            tip->nHeight);
+    m_connman.StartB3ModernSeedRescue(/*force=*/true);
 }
 
 bool PeerManagerImpl::TipMayBeStale()
@@ -6613,6 +6649,7 @@ void PeerManagerImpl::CheckForStaleTipAndEvictPeers()
             LogInfo("Potential stale tip detected, will try using extra outbound peer (last tip update: %d seconds ago)\n",
                       count_seconds(now - m_last_tip_update.load()));
             m_connman.SetTryNewOutboundPeer(true);
+            MaybeForceB3ModernSeedRescue();
         } else if (m_connman.GetTryNewOutboundPeer()) {
             m_connman.SetTryNewOutboundPeer(false);
         }

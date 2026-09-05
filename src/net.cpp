@@ -2462,14 +2462,22 @@ void CConnman::StartExtraBlockRelayPeers()
     m_start_extra_block_relay_peers = true;
 }
 
-void CConnman::StartB3ModernSeedRescue()
+void CConnman::StartB3ModernSeedRescue(const bool force)
 {
+    if (force) {
+        m_b3_modern_seed_rescue_forced.store(true, std::memory_order_relaxed);
+    }
     m_b3_modern_seed_rescue_requested.store(true, std::memory_order_relaxed);
 }
 
 bool CConnman::B3ModernSeedRescueRequested() const
 {
     return m_b3_modern_seed_rescue_requested.load(std::memory_order_relaxed);
+}
+
+bool CConnman::B3ModernSeedRescueForced() const
+{
+    return m_b3_modern_seed_rescue_forced.load(std::memory_order_relaxed);
 }
 
 // Return the number of outbound connections that are full relay (not blocks only)
@@ -2610,7 +2618,11 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, std
     // consume it. The rescue remains subject to -fixedseeds and never changes
     // the behavior of non-B3 networks.
     bool add_b3_fixed_seed_rescue{false};
+    bool b3_fixed_seed_rescue_forced{false};
     auto b3_fixed_seed_rescue_deadline{NodeClock::time_point::max()};
+    // Recovery seeds a forced rescue still has to contact directly; consumed
+    // by the outbound selection below ahead of any AddrMan candidate.
+    std::vector<CAddress> b3_rescue_direct;
     const bool use_seednodes{!gArgs.GetArgs("-seednode").empty()};
 
     auto seed_node_timer = NodeClock::now();
@@ -2651,11 +2663,17 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, std
         const auto rescue_now{NodeClock::now()};
         if (m_b3_modern_seed_rescue_requested.exchange(
                 false, std::memory_order_relaxed)) {
+            const bool forced{m_b3_modern_seed_rescue_forced.exchange(
+                false, std::memory_order_relaxed)};
             add_b3_fixed_seed_rescue =
                 fixed_seeds_enabled &&
                 m_params.GetConsensus().legacy_b3coin &&
                 !m_params.ModernRecoverySeeds().empty();
-            b3_fixed_seed_rescue_deadline = rescue_now + 1min;
+            // A forced request comes from PeerManager after it has already
+            // watched a stale post-H tip with no peer ahead of it: fire now.
+            b3_fixed_seed_rescue_forced = add_b3_fixed_seed_rescue && forced;
+            b3_fixed_seed_rescue_deadline =
+                forced ? rescue_now : rescue_now + 1min;
         }
         int usable_full_outbound{0};
         if (add_b3_fixed_seed_rescue &&
@@ -2674,7 +2692,8 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, std
         const bool b3_fixed_seed_rescue{
             add_b3_fixed_seed_rescue &&
             rescue_now >= b3_fixed_seed_rescue_deadline &&
-            usable_full_outbound < b3_fixed_seed_rescue_target};
+            (b3_fixed_seed_rescue_forced ||
+             usable_full_outbound < b3_fixed_seed_rescue_target)};
         if ((add_fixed_seeds && !fixed_seed_networks.empty()) ||
             b3_fixed_seed_rescue) {
             // When the node starts with an empty peers.dat, there are a few other sources of peers before
@@ -2722,8 +2741,17 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, std
                 add_fixed_seeds = false;
                 if (b3_fixed_seed_rescue) {
                     add_b3_fixed_seed_rescue = false;
-                    LogInfo("Adding B3 modern recovery seeds after 60 seconds with %d of %d usable full outbound peers\n",
-                            usable_full_outbound, b3_fixed_seed_rescue_target);
+                    if (b3_fixed_seed_rescue_forced) {
+                        // Do not leave the seeds to random selection among
+                        // the many dead historical addresses: contact them.
+                        b3_rescue_direct = seed_addrs;
+                        b3_fixed_seed_rescue_forced = false;
+                        LogInfo("Adding B3 modern recovery seeds and contacting them directly: no connected peer is ahead of the stale post-boundary tip (%d usable full outbound peers)\n",
+                                usable_full_outbound);
+                    } else {
+                        LogInfo("Adding B3 modern recovery seeds after 60 seconds with %d of %d usable full outbound peers\n",
+                                usable_full_outbound, b3_fixed_seed_rescue_target);
+                    }
                 }
                 LogInfo("Added %d fixed seeds from reachable networks.\n", seed_addrs.size());
             }
@@ -2870,6 +2898,21 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, std
                     outbound_ipv46_peer_netgroups.contains(m_netgroupman.GetGroup(addr))) continue;
                 addrConnect = addr;
                 LogDebug(BCLog::NET, "Trying to make an anchor connection to %s\n", addrConnect.ToStringAddrPort());
+                break;
+            }
+
+            // A forced B3 recovery seed goes ahead of any AddrMan candidate,
+            // under the same reachability, duplicate and netgroup rules.
+            if (!b3_rescue_direct.empty() && !fFeeler && !preferred_net.has_value()) {
+                const CAddress addr{b3_rescue_direct.back()};
+                b3_rescue_direct.pop_back();
+                if (!addr.IsValid() || IsLocal(addr) || !g_reachable_nets.Contains(addr) ||
+                    AlreadyConnectedToAddress(addr) ||
+                    outbound_ipv46_peer_netgroups.contains(m_netgroupman.GetGroup(addr))) {
+                    continue;
+                }
+                addrConnect = addr;
+                LogInfo("Trying B3 modern recovery seed %s directly\n", addrConnect.ToStringAddrPort());
                 break;
             }
 

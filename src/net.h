@@ -1331,10 +1331,20 @@ public:
 
     void StartExtraBlockRelayPeers();
 
-    /** Arm B3's one-shot modern peer rescue after entering the post-H network. */
-    void StartB3ModernSeedRescue();
+    /**
+     * Arm B3's modern peer rescue after entering the post-H network. The
+     * plain request fires 60 s later only while fewer than the seeding
+     * threshold of full outbound peers are connected. A forced request
+     * (PeerManager found no connected peer that has announced a block
+     * above a stale post-H tip) fires at once regardless of that count and
+     * additionally tries the recovery seeds directly, so a node whose
+     * outbound slots are held by peers that are themselves parked at the
+     * boundary still reaches the modern network.
+     */
+    void StartB3ModernSeedRescue(bool force = false);
     /** Test/diagnostic view; the connection thread consumes this request. */
     bool B3ModernSeedRescueRequested() const;
+    bool B3ModernSeedRescueForced() const;
 
     // Count the number of full-relay peer we have.
     int GetFullOutboundConnCount() const;
@@ -1749,8 +1759,10 @@ private:
      */
     std::atomic_bool m_start_extra_block_relay_peers{false};
 
-    /** Set by PeerManager only when a B3 node starts post-H or crosses H. */
+    /** Set by PeerManager when a B3 node starts post-H, crosses H, or finds
+     *  itself parked post-H with no peer ahead of its tip (forced). */
     std::atomic_bool m_b3_modern_seed_rescue_requested{false};
+    std::atomic_bool m_b3_modern_seed_rescue_forced{false};
 
     /**
      * A vector of -bind=<address>:<port>=onion arguments each of which is

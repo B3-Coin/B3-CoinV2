@@ -42,6 +42,14 @@ struct ConnmanTestMsg : public CConnman {
 
     void SetAddrman(AddrMan& in) { addrman = in; }
 
+    /** Consume a pending B3 modern seed rescue request the way the (absent)
+     *  connection thread would; returns whether one was pending. */
+    bool ConsumeB3ModernSeedRescue()
+    {
+        m_b3_modern_seed_rescue_forced.store(false, std::memory_order_relaxed);
+        return m_b3_modern_seed_rescue_requested.exchange(false, std::memory_order_relaxed);
+    }
+
     void SetPeerConnectTimeout(std::chrono::seconds timeout)
     {
         m_peer_connect_timeout = timeout;

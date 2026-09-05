@@ -821,6 +821,78 @@ BOOST_AUTO_TEST_CASE(modern_headers_reply_across_the_sealed_boundary_is_continuo
     peerman.FinalizeNode(*node);
 }
 
+BOOST_AUTO_TEST_CASE(parked_post_boundary_node_forces_the_modern_seed_rescue)
+{
+    // A node past the sealed boundary whose outbound peers have announced
+    // nothing above its stale tip is parked: upgraded wallets that are
+    // themselves stuck at H satisfy the connection count the address-based
+    // rescue uses, so that rescue never fires. The stale-tip check must then
+    // force the rescue (which contacts the recovery seeds directly), and
+    // must stop forcing as soon as a peer announces a block above the tip.
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ConnmanTestMsg& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    PeerManager& peerman = *m_node.peerman;
+    const Consensus::Params& consensus{Params().GetConsensus()};
+    BOOST_REQUIRE(consensus.transition_pow_bits.has_value());
+
+    // Construction at a post-boundary tip armed the ordinary rescue.
+    BOOST_CHECK(connman.ConsumeB3ModernSeedRescue());
+    BOOST_CHECK(!connman.B3ModernSeedRescueRequested());
+
+    const auto t0{std::chrono::seconds{1'700'000'000}};
+    SetMockTime(t0);
+    // Owned by the connection manager once added (ClearTestNodes deletes).
+    CNode* node{MakeNode(0).release()};
+    connman.Handshake(*node,
+                      /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/B3_MODERN_PROTOCOL_VERSION,
+                      /*relay_txs=*/true);
+    BOOST_REQUIRE(!node->fDisconnect);
+    connman.AddTestNode(*node);
+    (void)DrainSentMessages(*node);
+
+    // The first check only starts the stale-tip clock.
+    peerman.CheckForStaleTipAndEvictPeers();
+    BOOST_CHECK(!connman.B3ModernSeedRescueRequested());
+
+    // Stale tip, connected modern peer, nothing announced above the tip:
+    // the rescue is forced.
+    SetMockTime(t0 + 2h);
+    peerman.CheckForStaleTipAndEvictPeers();
+    BOOST_CHECK(connman.GetTryNewOutboundPeer());
+    BOOST_CHECK(connman.B3ModernSeedRescueRequested());
+    BOOST_CHECK(connman.B3ModernSeedRescueForced());
+    BOOST_CHECK(connman.ConsumeB3ModernSeedRescue());
+
+    // The peer announces the first corridor header above our tip: the
+    // ordinary download path owns recovery again and nothing is forced.
+    const CBlockIndex* tip{
+        WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip())};
+    CBlock corridor{BuildMarkerModernBlock(
+        tip->GetBlockHash(), /*height=*/tip->nHeight + 1,
+        static_cast<uint32_t>(tip->GetBlockTime() +
+                              consensus.transition_pow_min_spacing),
+        *consensus.transition_pow_bits)};
+    while (!CheckTransitionPowEligibility(corridor)) ++corridor.nNonce;
+    std::vector<CBlock> announcement;
+    announcement.emplace_back(CBlockHeader{corridor});
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(
+        *node, NetMsg::Make(NetMsgType::HEADERS, TX_WITH_WITNESS(announcement))));
+    node->fPauseSend = false;
+    connman.ProcessMessagesOnce(*node);
+    BOOST_CHECK(!node->fDisconnect);
+    SetMockTime(t0 + 4h);
+    peerman.CheckForStaleTipAndEvictPeers();
+    BOOST_CHECK(!connman.B3ModernSeedRescueRequested());
+    BOOST_CHECK(!connman.B3ModernSeedRescueForced());
+
+    peerman.FinalizeNode(*node);
+    connman.ClearTestNodes();
+    SetMockTime(0s);
+}
+
 BOOST_AUTO_TEST_CASE(connected_wrong_codec_block_keeps_marker_source_identity)
 {
     LOCK(NetEventsInterface::g_msgproc_mutex);
