@@ -617,7 +617,11 @@ void B3DashboardPage::renderNetworkEra(int height)
         era_name = tr("Legacy network");
         detail = tr("The final legacy height is configured, but anchor X is not pinned. The transition remains paused.");
     } else {
-        switch (Consensus::GetConsensusPhase(height, params)) {
+        // The era of the NEXT block: that is the phase the node operates in
+        // (its peer selection, banner and block rules), and what the Stake
+        // page reports. A node holding the sealed boundary block itself is
+        // already past the legacy network and must be shown as such.
+        switch (Consensus::GetConsensusPhase(height + 1, params)) {
         case Consensus::ConsensusPhase::LEGACY_POS:
             era_name = tr("Legacy network");
             detail = tr("Legacy operation continues through the sealed boundary at block %1.")

@@ -73,3 +73,19 @@ Work ONLY on copies; every attempt can worsen the original.
 
 After ANY successful recovery: sweep all funds to a freshly created
 wallet and retire the damaged file permanently.
+
+## Wallet stopped at block 810,000
+
+Block 810,000 is the sealed final legacy block; everything after it comes
+only from modern B3 Hive peers. Install the current release first: builds
+before v1.1.0 refuse block 810,001 by design, and every v1.1.x build before
+the revised v1.1.3 could discourage its modern peers while crossing the
+boundary. Then check `getblockhash 810000` against
+`2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6`, remove
+any `connect=` line from `b3coin.conf`, and if the node still has no peer
+above 810,000 after a few minutes, add a modern peer by hand:
+
+    b3coin-cli addnode 38.191.246.166:5647 onetry
+
+The v1.1.3 release notes list the log lines that identify each cause. Do
+not reindex for this problem unless startup itself asks for a rebuild.

@@ -111,6 +111,88 @@ and resume finality on the checkpointed chain.
   version above `80008` negotiates the same mode, and the application version
   remains 1.1.3.
 
+## Wallets that stop at block 810,000 (revised v1.1.3 build)
+
+Block 810,000 is the sealed final legacy block. A node that holds it is
+already treated as a modern node: it advertises the modern protocol, drops
+automatic connections to historical 80008 peers after the handshake, and can
+only continue through modern peers using header-first synchronization.
+Several distinct problems made wallets stop exactly there.
+
+- **Header replies across the boundary were rejected (fixed).** A node that
+  reached 810,000 asked its first modern peer for headers starting one block
+  below its tip, so the honest reply began with block 810,000 itself followed
+  by block 810,001. The receiver compared block identities with the modern
+  SHA256d hash, but block 810,000 is a legacy block whose identity is its
+  scrypt hash, so the reply looked discontinuous, the peer was discouraged
+  for the rest of the process lifetime, and the same happened with every
+  modern peer. Header
+  continuity now uses each header's real identity, and a node parked at the
+  boundary asks for headers from 810,000 itself. This affected every
+  v1.1.x build for nodes that arrived at 810,000 after the transition; nodes
+  that were already online when block 810,001 appeared were not affected.
+- **No modern peer found.** v1.1.0 and v1.1.1 have no recovery path at all:
+  their address database holds only historical peers, which can never
+  satisfy the post-boundary service requirement. v1.1.2 introduced a one-shot
+  rescue that seeds three modern addresses after 60 seconds, but it is
+  skipped while two outbound peers are connected even when those peers are
+  themselves parked at 810,000, and it is never re-armed. This build adds a
+  forced rescue: on the ten-minute stale-tip check, a node past the boundary
+  whose connected peers have announced nothing above its tip re-arms the
+  rescue regardless of how many peers it has, and the connection manager
+  then contacts the three recovery seeds directly instead of leaving them to
+  random selection among thousands of dead legacy addresses.
+- **Builds older than v1.1.0 stop by design.** v1.0.0, v1.0.0rev and
+  v1.0.0rev2 pin the final legacy height but deliberately not its hash, so
+  they refuse every block above 810,000 until replaced. The historical
+  B3-CoinV2 client is served only through 810,000 by upgraded peers.
+
+What to check on a stuck wallet:
+
+1. `getnetworkinfo`: the `subversion` names the build. Anything before
+   1.1.3 must be replaced by a manual download of this release; the in-app
+   updater on older builds is not configured and cannot deliver it. A
+   subversion of 1.1.3 alone is not proof: the first v1.1.3 build has the
+   header bug too and reports the same version. Verify the binary's SHA-256
+   against the revised release, or start with `-debug=net` and look for
+   `initial getheaders (810000)`; the first build asks from 809999.
+2. `getblockhash 810000` must be
+   `2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6`. A
+   different hash means an older build followed a minority legacy fork at
+   the boundary. Install this release and start it normally: if the node
+   already knows the sealed block it unwinds the wrong branch by itself
+   (debug.log: `lies off the finalized legacy boundary anchor; unwinding`);
+   if startup reports `Error initializing block database` it offers
+   `-reindex` or `-reindex-chainstate`, and `-reindex-chainstate` is
+   sufficient unless the node is pruned.
+3. `getpeerinfo`: a healthy node has at least one outbound peer with
+   `version` 80009 or higher (70016 from a v1.1.0 peer) whose
+   `synced_headers` is above 810,000. Historical peers report 80008.
+4. `debug.log`: `Disconnecting legacy-protocol outbound peer after the sealed
+   boundary` and `Adding B3 modern recovery seeds` are written by default.
+   The header bug is only visible with `-debug=net` (or after
+   `b3coin-cli logging '["net"]'`): `Misbehaving: peer=N: non-continuous
+   headers sequence` right after `initial getheaders (809999)`. Without net
+   logging its signature is modern peers that disappear seconds after
+   `New outbound-full-relay` while `getpeerinfo` never shows one with
+   `synced_headers` above 810,000.
+5. Remove any `connect=` line from `b3coin.conf`; it bypasses peer discovery
+   entirely.
+
+Manual recovery on any v1.1.x build, while waiting for the fixed build:
+
+    b3coin-cli addnode 38.191.246.166:5647 onetry
+    b3coin-cli addnode 46.151.140.5:5647 onetry
+    b3coin-cli addnode 77.74.83.147:5647 onetry
+
+Manual connections are exempt from the post-boundary service filter and are
+never disconnected or discouraged for misbehaviour. On builds with the header
+bug the manual peer's first headers reply is still dropped (debug.log with
+net logging: `not punishing manually connected peer`), and sync resumes when
+that peer announces its next block; on this build the reply is accepted at
+once. Do not reindex unless startup explicitly reports an incompatible block
+index.
+
 ## Upgrade
 
 Back up the wallet, shut down the old B3 Hive application completely, and then
