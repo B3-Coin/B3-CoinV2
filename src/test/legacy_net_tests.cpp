@@ -770,7 +770,9 @@ BOOST_AUTO_TEST_CASE(modern_headers_reply_across_the_sealed_boundary_is_continuo
                   boundary->GetBlockHash());
     BOOST_REQUIRE(boundary_header.GetHash() != boundary->GetBlockHash());
 
-    auto node{MakeNode(0)};
+    // Owned by the connection manager once added (ClearTestNodes deletes);
+    // registering it makes a discouragement observable as fDisconnect.
+    CNode* node{MakeNode(0).release()};
     connman.Handshake(*node,
                       /*successfully_connected=*/true,
                       /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
@@ -778,6 +780,7 @@ BOOST_AUTO_TEST_CASE(modern_headers_reply_across_the_sealed_boundary_is_continuo
                       /*version=*/B3_MODERN_PROTOCOL_VERSION,
                       /*relay_txs=*/true);
     BOOST_REQUIRE(!node->fDisconnect);
+    connman.AddTestNode(*node);
 
     // The initial synchronization request starts at X, not below it.
     bool found_getheaders{false};
@@ -818,7 +821,22 @@ BOOST_AUTO_TEST_CASE(modern_headers_reply_across_the_sealed_boundary_is_continuo
                 corridor_hash);
     BOOST_CHECK_EQUAL(
         CountType(DrainSentMessages(*node), NetMsgType::GETDATA), 1U);
+
+    // A legacy-codec header anywhere but first position cannot be honest
+    // past the boundary and must not cost a scrypt each: the message is
+    // refused as non-continuous and the peer discouraged.
+    std::vector<CBlock> hostile;
+    hostile.emplace_back(CBlockHeader{corridor});
+    hostile.emplace_back(boundary_header);
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(
+        *node, NetMsg::Make(NetMsgType::HEADERS, TX_WITH_WITNESS(hostile))));
+    node->fPauseSend = false;
+    connman.ProcessMessagesOnce(*node);
+    BOOST_CHECK(peerman.SendMessages(*node));
+    BOOST_CHECK(node->fDisconnect);
+
     peerman.FinalizeNode(*node);
+    connman.ClearTestNodes();
 }
 
 BOOST_AUTO_TEST_CASE(parked_post_boundary_node_forces_the_modern_seed_rescue)

@@ -3155,12 +3155,25 @@ bool PeerManagerImpl::CheckHeadersAreContinuous(const std::vector<CBlockHeader>&
     // which references X by that legacy identity. Comparing SHA256d there
     // would misjudge every such honest reply as non-continuous, discourage
     // the peer, and leave a node parked at H without a sync peer.
+    //
+    // The legacy identity costs a scrypt evaluation. Header messages are
+    // only processed past the boundary, where every locator this node sends
+    // starts at or above X and announcements carry modern headers, so the
+    // only legacy-codec header an honest message can hold is X itself in
+    // first position. Refuse one anywhere else, bounding the cost of an
+    // unauthenticated message to a single scrypt.
+    const Consensus::Params& consensus{m_chainparams.GetConsensus()};
     uint256 hashLastBlock;
-    for (const CBlockHeader& header : headers) {
+    for (size_t i{0}; i < headers.size(); ++i) {
+        const CBlockHeader& header{headers[i]};
         if (!hashLastBlock.IsNull() && header.hashPrevBlock != hashLastBlock) {
             return false;
         }
-        hashLastBlock = header.GetMarkerHash(m_chainparams.GetConsensus());
+        if (i > 0 && consensus.legacy_b3coin &&
+            !Consensus::HasB3BlockCodecV2(header.nVersion)) {
+            return false;
+        }
+        hashLastBlock = header.GetMarkerHash(consensus);
     }
     return true;
 }

@@ -2907,7 +2907,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, std
                 const CAddress addr{b3_rescue_direct.back()};
                 b3_rescue_direct.pop_back();
                 if (!addr.IsValid() || IsLocal(addr) || !g_reachable_nets.Contains(addr) ||
-                    AlreadyConnectedToAddress(addr) ||
+                    AlreadyConnectedToAddress(addr) || AddedNodesContain(addr) ||
                     outbound_ipv46_peer_netgroups.contains(m_netgroupman.GetGroup(addr))) {
                     continue;
                 }
