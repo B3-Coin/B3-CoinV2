@@ -25,10 +25,12 @@
 #include <node/finality_tracker.h>
 #include <test/util/finality_fixture.h>
 #include <test/util/setup_common.h>
+#include <util/strencodings.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <string>
 
 using b3test::FinalityChainFixture;
@@ -118,8 +120,8 @@ struct RecoveryFixture : public FinalityChainFixture {
         // nothing. A node still on the old fork therefore keeps its journal
         // exactly as it was.
         {
-            MutableConsensus().finality_signer_recovery =
-                MakePin(incident, m_rng.rand256());
+            MutableConsensus().finality_signer_recoveries = {
+                MakePin(incident, m_rng.rand256())};
             LOCK(cs_main);
             FinalitySignaturePool pool;
             BOOST_CHECK(original.MaybeSign(
@@ -132,7 +134,7 @@ struct RecoveryFixture : public FinalityChainFixture {
             BOOST_REQUIRE(probe.Open(m_store_dir, m_domain, m_vk_a, e));
             BOOST_CHECK_EQUAL(probe.State()->lock_height, M + 10);
             BOOST_CHECK(probe.State()->lock_block_hash == incident.hash);
-            MutableConsensus().finality_signer_recovery.reset();
+            MutableConsensus().finality_signer_recoveries.clear();
         }
 
         // The incident: M+10 is replaced by a longer branch from M+9 (four
@@ -278,9 +280,9 @@ BOOST_FIXTURE_TEST_CASE(store_recovery_moves_only_the_lock_and_fails_closed_othe
     BOOST_REQUIRE(pin.Valid());
 
     // Every single deviating fact fails closed and leaves the journal as it
-    // was: another chain, another incident coordinate, another epoch or set,
-    // a null digest, or a structurally invalid pin (anchor not above the
-    // incident, rejected by Valid()).
+    // was: another chain or validator, another incident coordinate, another
+    // epoch or set, a null digest, or a structurally invalid pin (anchor not
+    // above the incident, rejected by Valid()).
     const auto refused{[&](const auto& mutate) {
         Consensus::FinalitySignerRecovery bad{pin};
         mutate(bad);
@@ -292,6 +294,11 @@ BOOST_FIXTURE_TEST_CASE(store_recovery_moves_only_the_lock_and_fails_closed_othe
         BOOST_CHECK_EQUAL(store.State()->last_signed_height, 10);
     }};
     refused([&](Consensus::FinalitySignerRecovery& p) { p.chain_domain = m_rng.rand256(); });
+    refused([&](Consensus::FinalitySignerRecovery& p) {
+        modern::ValidatorKeyBytes other_validator{};
+        other_validator.fill(0x52);
+        p.validator_key = other_validator;
+    });
     refused([&](Consensus::FinalitySignerRecovery& p) { p.incident_height = 5; });
     refused([&](Consensus::FinalitySignerRecovery& p) { p.incident_block_hash = m_rng.rand256(); });
     refused([&](Consensus::FinalitySignerRecovery& p) { p.incident_epoch = 1; });
@@ -334,7 +341,9 @@ BOOST_FIXTURE_TEST_CASE(store_recovery_moves_only_the_lock_and_fails_closed_othe
         BOOST_CHECK_EQUAL(moved.State()->last_signed_height, 10);
     }
 
-    // The exact incident: only the lock moves; the recorded vote is kept.
+    // The exact validator-targeted incident: only the lock moves; the
+    // recorded vote is kept.
+    pin.validator_key = validator;
     BOOST_REQUIRE_MESSAGE(
         store.CommitPinnedRecoveryAnchor(pin, anchor_digest, error), error);
     BOOST_REQUIRE(store.State().has_value());
@@ -403,10 +412,10 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
 
     // A signer-only anchor is not sufficient: recovery requires the same
     // identity in the hardened modern checkpoint table.
-    params.finality_signer_recovery = pin;
+    params.finality_signer_recoveries = {pin};
     ExpectDeadlocked(restarted, m_store_dir, "anchor is not hardened",
                      "recovery anchor is not a hardened modern checkpoint");
-    params.finality_signer_recovery.reset();
+    params.finality_signer_recoveries.clear();
     params.modern_checkpoints[pin.anchor_height] = pin.anchor_block_hash;
 
     // The exact hardened pin, but the anchor (M+15) is only two blocks deep
@@ -415,9 +424,9 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
                            const std::string& note) {
         Consensus::FinalitySignerRecovery bad{pin};
         mutate(bad);
-        params.finality_signer_recovery = bad;
+        params.finality_signer_recoveries = {bad};
         ExpectDeadlocked(restarted, m_store_dir, why, note);
-        params.finality_signer_recovery.reset();
+        params.finality_signer_recoveries.clear();
     }};
     rejects("anchor not yet buried to finality-signing depth",
             [](Consensus::FinalitySignerRecovery&) {},
@@ -469,7 +478,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
             }
             Consensus::FinalitySignerRecovery variant{pin};
             mutate_pin(variant);
-            params.finality_signer_recovery = variant;
+            params.finality_signer_recoveries = {variant};
             node::FinalitySigner signer;
             std::string e;
             BOOST_REQUIRE_MESSAGE(signer.SetKeyPersistent(
@@ -486,7 +495,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
                                         std::string::npos,
                                     why << ": " << signer.LastError());
             }
-            params.finality_signer_recovery.reset();
+            params.finality_signer_recoveries.clear();
             return Journal(dir);
         }};
     {
@@ -572,10 +581,20 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
         BOOST_CHECK(j.last_signed_block_hash == incident.hash);
     }
 
-    // The exact pin at a settled anchor: the lock moves, the recorded vote is
-    // retained, and nothing at or below the anchor is signed. M+15 is
+    // A validator-targeted pin is invisible to every other signer, even when
+    // all incident fields match. Put that decoy first to also prove that a
+    // later matching recovery is still considered.
+    Consensus::FinalitySignerRecovery wrong_target{pin};
+    wrong_target.validator_key = m_vk_b;
+    params.finality_signer_recoveries = {wrong_target};
+    ExpectDeadlocked(restarted, m_store_dir, "pin targets another validator");
+
+    // The exact targeted pin at a settled anchor: the lock moves, the recorded
+    // vote is retained, and nothing at or below the anchor is signed. M+15 is
     // signable by depth but is the anchor itself; M+20 is not yet signable.
-    params.finality_signer_recovery = pin;
+    Consensus::FinalitySignerRecovery exact_target{pin};
+    exact_target.validator_key = m_vk_a;
+    params.finality_signer_recoveries = {wrong_target, exact_target};
     {
         FinalitySignaturePool pool;
         BOOST_CHECK(Sign(restarted, pool).empty());
@@ -608,7 +627,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
     // Restart persistence: with the pin removed, a fresh process stands on
     // the reloaded journal alone, signs nothing at or below the anchor, and
     // leaves the recovered lock exactly as persisted.
-    params.finality_signer_recovery.reset();
+    params.finality_signer_recoveries.clear();
     node::FinalitySigner reloaded;
     BOOST_REQUIRE_MESSAGE(reloaded.SetKeyPersistent(
                               m_bls_a, m_vk_a, m_domain, m_store_dir, m_error),
@@ -674,7 +693,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
     // longer resolve, the journal stays locked, and nothing is recreated.
     ProduceTo(M + 2 * SCALED_E + SCALED_MAX_EXTENSION, m_vk_a);
     BOOST_REQUIRE(FinalityState().lineage_broken);
-    params.finality_signer_recovery = pin;
+    params.finality_signer_recoveries = {pin};
     {
         node::FinalitySigner late;
         BOOST_REQUIRE_MESSAGE(late.SetKeyPersistent(
@@ -688,7 +707,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
         BOOST_CHECK_EQUAL(j.last_signed_height, M + 10);
         BOOST_CHECK(j.lock_block_hash == incident.hash);
     }
-    params.finality_signer_recovery.reset();
+    params.finality_signer_recoveries.clear();
 }
 
 BOOST_FIXTURE_TEST_CASE(pinned_recovery_applies_after_the_epoch_rotated_and_resumes_in_the_next_epoch,
@@ -727,7 +746,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_applies_after_the_epoch_rotated_and_resu
     // The pin applies through the previous-epoch window, and the signer then
     // votes on every signable checkpoint strictly above the anchor: the
     // remaining epoch-0 checkpoints and the first epoch-1 checkpoint.
-    params.finality_signer_recovery = pin;
+    params.finality_signer_recoveries = {pin};
     std::optional<std::pair<modern::FinalizedBlock,
                             modern::FinalityCertificate>> best;
     {
@@ -784,10 +803,10 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_applies_after_the_epoch_rotated_and_resu
                                   m_bls_a, m_vk_a, m_domain, late_dir, m_error),
                               m_error);
         BOOST_CHECK_EQUAL(late.LastSignedHeight(), M + 10);
-        params.finality_signer_recovery.reset();
+        params.finality_signer_recoveries.clear();
         ExpectDeadlocked(late, late_dir, "late, no pin", "",
                          "included certificate does not use the exact epoch");
-        params.finality_signer_recovery = pin;
+        params.finality_signer_recoveries = {pin};
         FinalitySignaturePool pool;
         BOOST_CHECK(Sign(late, pool).empty());
         BOOST_CHECK_MESSAGE(late.LastError().empty(), late.LastError());
@@ -830,45 +849,121 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_applies_after_the_epoch_rotated_and_resu
         BOOST_CHECK_EQUAL(j.last_signed_height, M + 10);
         BOOST_CHECK(j.lock_block_hash == incident.hash);
     }
-    params.finality_signer_recovery.reset();
+    params.finality_signer_recoveries.clear();
 }
 
-BOOST_AUTO_TEST_CASE(mainnet_pins_the_811631_incident_and_the_811641_anchor)
+BOOST_AUTO_TEST_CASE(mainnet_pins_all_exact_recovery_incidents)
 {
     const auto params{CreateChainParams(ArgsManager{}, ChainType::MAIN)};
     const Consensus::Params& consensus{params->GetConsensus()};
-    const auto& pin{consensus.finality_signer_recovery};
-    BOOST_REQUIRE(pin.has_value());
-    BOOST_CHECK(pin->Valid());
+    const auto& recoveries{consensus.finality_signer_recoveries};
+    BOOST_REQUIRE_EQUAL(recoveries.size(), 3U);
     BOOST_REQUIRE(consensus.legacy_final_hash.has_value());
     const auto domain{modern::ModernChainDomain(consensus.hashGenesisBlock,
                                                 *consensus.legacy_final_hash)};
     BOOST_REQUIRE(domain.has_value());
-    BOOST_CHECK(pin->chain_domain == *domain);
-    BOOST_CHECK_EQUAL(pin->incident_height, 811'631);
+
+    const auto old_it{std::find_if(
+        recoveries.begin(), recoveries.end(),
+        [](const auto& recovery) {
+            return recovery.incident_height == 811'631;
+        })};
+    const auto caa_it{std::find_if(
+        recoveries.begin(), recoveries.end(),
+        [](const auto& recovery) {
+            return recovery.incident_height == 812'961;
+        })};
+    const auto five_e_it{std::find_if(
+        recoveries.begin(), recoveries.end(),
+        [](const auto& recovery) {
+            return recovery.incident_height == 812'151;
+        })};
+    BOOST_REQUIRE(old_it != recoveries.end());
+    BOOST_REQUIRE(five_e_it != recoveries.end());
+    BOOST_REQUIRE(caa_it != recoveries.end());
+    const Consensus::FinalitySignerRecovery& pin{*old_it};
+    const Consensus::FinalitySignerRecovery& five_e{*five_e_it};
+    const Consensus::FinalitySignerRecovery& caa{*caa_it};
+
+    BOOST_CHECK(pin.Valid());
+    BOOST_CHECK(pin.chain_domain == *domain);
+    BOOST_CHECK(!pin.validator_key.has_value());
+    BOOST_CHECK_EQUAL(pin.incident_height, 811'631);
     BOOST_CHECK_EQUAL(
-        pin->incident_block_hash.GetHex(),
+        pin.incident_block_hash.GetHex(),
         "86297c1075392fa614a6b0733eeb178de0eb8dc11602226b2b10344453426be0");
-    BOOST_CHECK_EQUAL(pin->incident_epoch, 0U);
+    BOOST_CHECK_EQUAL(pin.incident_epoch, 0U);
     BOOST_CHECK_EQUAL(
-        pin->incident_signing_set_hash.GetHex(),
+        pin.incident_signing_set_hash.GetHex(),
         "ff7c306f539eec01c793cd7fd389672c53a955d10f00758a2807ef0e9d22514e");
     BOOST_CHECK_EQUAL(
-        pin->incident_successor_set_hash.GetHex(),
+        pin.incident_successor_set_hash.GetHex(),
         "6dd7d4575e9f1d74036c7c86175e4fd2e6cf9dc621cddac5b91831b85361d63a");
-    BOOST_CHECK_EQUAL(pin->anchor_height, 811'641);
+    BOOST_CHECK_EQUAL(pin.anchor_height, 811'641);
     BOOST_CHECK_EQUAL(
-        pin->anchor_block_hash.GetHex(),
+        pin.anchor_block_hash.GetHex(),
         "5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f75");
-    BOOST_CHECK(pin->anchor_block_hash != pin->incident_block_hash);
-    BOOST_REQUIRE_EQUAL(consensus.modern_checkpoints.count(pin->anchor_height),
+    BOOST_CHECK(pin.anchor_block_hash != pin.incident_block_hash);
+    BOOST_REQUIRE_EQUAL(consensus.modern_checkpoints.count(pin.anchor_height),
                         1U);
-    BOOST_CHECK(consensus.modern_checkpoints.at(pin->anchor_height) ==
-                pin->anchor_block_hash);
+    BOOST_CHECK(consensus.modern_checkpoints.at(pin.anchor_height) ==
+                pin.anchor_block_hash);
 
-    // Both heights are scheduled epoch-0 checkpoints of the mainnet schedule
-    // (M = 811,001, interval 10), the anchor is one interval above the
-    // incident, so the first permitted new vote is 811,651; the anchor is
+    BOOST_CHECK(five_e.Valid());
+    BOOST_CHECK(five_e.chain_domain == *domain);
+    BOOST_REQUIRE(five_e.validator_key.has_value());
+    BOOST_CHECK_EQUAL(
+        HexStr(*five_e.validator_key),
+        "5e62687180477d750f480d24bb02f952c0c807f44fd67128d1fd7a1d09d91142");
+    BOOST_CHECK_EQUAL(five_e.incident_height, 812'151);
+    BOOST_CHECK_EQUAL(
+        five_e.incident_block_hash.GetHex(),
+        "bc6807d5d543c6dde7baf50fc08146409e824194c306e8ca9af9329319f5dade");
+    BOOST_CHECK_EQUAL(five_e.incident_epoch, 0U);
+    BOOST_CHECK_EQUAL(
+        five_e.incident_signing_set_hash.GetHex(),
+        "ff7c306f539eec01c793cd7fd389672c53a955d10f00758a2807ef0e9d22514e");
+    BOOST_CHECK_EQUAL(
+        five_e.incident_successor_set_hash.GetHex(),
+        "6dd7d4575e9f1d74036c7c86175e4fd2e6cf9dc621cddac5b91831b85361d63a");
+    BOOST_CHECK_EQUAL(five_e.anchor_height, 812'401);
+    BOOST_CHECK_EQUAL(
+        five_e.anchor_block_hash.GetHex(),
+        "6cc78147e8ad80348e81ea5d6b00c7723188edafec8d544d55e1bac4b90ea22a");
+    BOOST_REQUIRE_EQUAL(
+        consensus.modern_checkpoints.count(five_e.anchor_height), 1U);
+    BOOST_CHECK(consensus.modern_checkpoints.at(five_e.anchor_height) ==
+                five_e.anchor_block_hash);
+
+    BOOST_CHECK(caa.Valid());
+    BOOST_CHECK(caa.chain_domain == *domain);
+    BOOST_REQUIRE(caa.validator_key.has_value());
+    BOOST_CHECK_EQUAL(
+        HexStr(*caa.validator_key),
+        "caa592dda8d13dd45e3596402b0577a67d31c1c27cffdf56b20ddfa648b58e2f");
+    BOOST_CHECK_EQUAL(caa.incident_height, 812'961);
+    BOOST_CHECK_EQUAL(
+        caa.incident_block_hash.GetHex(),
+        "1b5bceaec722edb63a50a9b392a79f5a53a2003fed163fe848880d8a09632659");
+    BOOST_CHECK_EQUAL(caa.incident_epoch, 1U);
+    BOOST_CHECK_EQUAL(
+        caa.incident_signing_set_hash.GetHex(),
+        "6dd7d4575e9f1d74036c7c86175e4fd2e6cf9dc621cddac5b91831b85361d63a");
+    BOOST_CHECK_EQUAL(
+        caa.incident_successor_set_hash.GetHex(),
+        "9e3540ce806cfcafe263191cf85daa8d38252f4a990a192be5cd17f88eb2d3de");
+    BOOST_CHECK_EQUAL(caa.anchor_height, 813'401);
+    BOOST_CHECK_EQUAL(
+        caa.anchor_block_hash.GetHex(),
+        "1490ab26fca2e91490ae9e3b94208e9fa65d126b4cd75b97abab1097440f54eb");
+    BOOST_REQUIRE_EQUAL(consensus.modern_checkpoints.count(caa.anchor_height),
+                        1U);
+    BOOST_CHECK(consensus.modern_checkpoints.at(caa.anchor_height) ==
+                caa.anchor_block_hash);
+
+    // The historical incident and anchor are scheduled epoch-0 checkpoints
+    // of the mainnet schedule (M = 811,001, interval 10), one interval apart,
+    // so the first permitted new vote is 811,651. The anchor is
     // settled from tip 811,653 (normal checkpoint depth 12). Epoch 1 started at
     // 812,441; the pin applies while epoch 0 is inside the
     // {current, current-1} window, i.e. until epoch 2 starts at the first
@@ -879,22 +974,46 @@ BOOST_AUTO_TEST_CASE(mainnet_pins_the_811631_incident_and_the_811641_anchor)
     const auto modern_start{Consensus::ModernPosStartHeight(consensus)};
     BOOST_REQUIRE(modern_start.has_value());
     BOOST_CHECK_EQUAL(*modern_start, 811'001);
-    BOOST_CHECK(modern::IsCheckpointHeight(pin->incident_height, *modern_start, pos.checkpoint_interval));
-    BOOST_CHECK(modern::IsCheckpointHeight(pin->anchor_height, *modern_start, pos.checkpoint_interval));
-    BOOST_CHECK_EQUAL(pin->anchor_height - pin->incident_height, pos.checkpoint_interval);
-    BOOST_CHECK_LT(pin->anchor_height, *modern_start + pos.finality_epoch_blocks);
-    BOOST_CHECK_EQUAL(pin->anchor_height + pos.checkpoint_depth, 811'653);
+    BOOST_CHECK(modern::IsCheckpointHeight(
+        pin.incident_height, *modern_start, pos.checkpoint_interval));
+    BOOST_CHECK(modern::IsCheckpointHeight(
+        pin.anchor_height, *modern_start, pos.checkpoint_interval));
+    BOOST_CHECK_EQUAL(pin.anchor_height - pin.incident_height,
+                      pos.checkpoint_interval);
+    BOOST_CHECK_LT(pin.anchor_height,
+                   *modern_start + pos.finality_epoch_blocks);
+    BOOST_CHECK_EQUAL(pin.anchor_height + pos.checkpoint_depth, 811'653);
     BOOST_CHECK_EQUAL(*modern_start + pos.finality_epoch_blocks, 812'441);
     BOOST_CHECK_EQUAL(*modern_start + 2 * pos.finality_epoch_blocks, 813'881);
     BOOST_CHECK_EQUAL(*modern_start + 2 * pos.finality_epoch_blocks +
                           pos.max_epoch_extension,
                       823'961);
 
+    BOOST_CHECK(modern::IsCheckpointHeight(
+        five_e.incident_height, *modern_start, pos.checkpoint_interval));
+    BOOST_CHECK(modern::IsCheckpointHeight(
+        five_e.anchor_height, *modern_start, pos.checkpoint_interval));
+    BOOST_CHECK_GT(five_e.anchor_height, five_e.incident_height);
+    BOOST_CHECK_LT(five_e.anchor_height,
+                   *modern_start + pos.finality_epoch_blocks);
+    BOOST_CHECK_EQUAL(five_e.anchor_height + pos.checkpoint_depth, 812'413);
+
+    BOOST_CHECK(modern::IsCheckpointHeight(caa.incident_height, *modern_start,
+                                            pos.checkpoint_interval));
+    BOOST_CHECK(modern::IsCheckpointHeight(caa.anchor_height, *modern_start,
+                                            pos.checkpoint_interval));
+    BOOST_CHECK_GT(caa.anchor_height, caa.incident_height);
+    BOOST_CHECK_GE(caa.incident_height,
+                   *modern_start + pos.finality_epoch_blocks);
+    BOOST_CHECK_LT(caa.anchor_height,
+                   *modern_start + 2 * pos.finality_epoch_blocks);
+    BOOST_CHECK_EQUAL(caa.anchor_height + pos.checkpoint_depth, 813'413);
+
     // No other shipped network pins a recovery.
     for (const ChainType chain : {ChainType::TESTNET, ChainType::TESTNET4,
                                   ChainType::SIGNET, ChainType::REGTEST}) {
         const auto other{CreateChainParams(ArgsManager{}, chain)};
-        BOOST_CHECK(!other->GetConsensus().finality_signer_recovery.has_value());
+        BOOST_CHECK(other->GetConsensus().finality_signer_recoveries.empty());
     }
 }
 

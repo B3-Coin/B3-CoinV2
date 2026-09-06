@@ -474,6 +474,11 @@ bool FinalitySignerStore::CommitPinnedRecoveryAnchor(
         error = "pinned recovery belongs to another chain";
         return false;
     }
+    if (recovery.validator_key &&
+        *recovery.validator_key != m_validator_key) {
+        error = "pinned recovery belongs to another validator";
+        return false;
+    }
     const FinalitySignerState& current{*m_state};
     // The durable record must be the pinned incident and nothing else: the
     // orphaned checkpoint is both the last vote and the lock (they were

@@ -44,13 +44,19 @@ BOOST_AUTO_TEST_CASE(mainnet_sealed_transition_pins_are_complete)
     BOOST_CHECK(!Consensus::LegacyBoundaryHeightOnly(c));
     BOOST_CHECK_EQUAL(Consensus::ModernPosStartHeight(c).value_or(0), 811'001);
     BOOST_CHECK_EQUAL(c.legacy_checkpoints.count(810'001), 0U);
-    BOOST_REQUIRE_EQUAL(c.modern_checkpoints.size(), 2U);
+    BOOST_REQUIRE_EQUAL(c.modern_checkpoints.size(), 4U);
     BOOST_REQUIRE_EQUAL(c.modern_checkpoints.count(810'001), 1U);
     BOOST_CHECK(c.modern_checkpoints.at(810'001) == uint256{
         "913fb38c75e0f12d8d5e6ea65a0ffce33a22a6908392a94661eab7c8506f6014"});
     BOOST_REQUIRE_EQUAL(c.modern_checkpoints.count(811'641), 1U);
     BOOST_CHECK(c.modern_checkpoints.at(811'641) == uint256{
         "5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f75"});
+    BOOST_REQUIRE_EQUAL(c.modern_checkpoints.count(812'401), 1U);
+    BOOST_CHECK(c.modern_checkpoints.at(812'401) == uint256{
+        "6cc78147e8ad80348e81ea5d6b00c7723188edafec8d544d55e1bac4b90ea22a"});
+    BOOST_REQUIRE_EQUAL(c.modern_checkpoints.count(813'401), 1U);
+    BOOST_CHECK(c.modern_checkpoints.at(813'401) == uint256{
+        "1490ab26fca2e91490ae9e3b94208e9fa65d126b4cd75b97abab1097440f54eb"});
 
     BOOST_CHECK(c.fn_genesis_required);
     BOOST_CHECK_EQUAL(c.fn_genesis_manifest_version, 1);
@@ -159,17 +165,29 @@ BOOST_AUTO_TEST_CASE(mainnet_first_corridor_checkpoint_accepts_only_exact_hash)
     BOOST_CHECK(Consensus::ModernCheckpointAllows(c, 810'000, wrong));
 }
 
-BOOST_AUTO_TEST_CASE(mainnet_recovery_anchor_checkpoint_accepts_only_exact_hash)
+BOOST_AUTO_TEST_CASE(mainnet_recovery_anchor_checkpoints_accept_only_exact_hashes)
 {
     const auto params{CreateChainParams(ArgsManager{}, ChainType::MAIN)};
     const Consensus::Params& c{params->GetConsensus()};
-    const uint256 exact{
+    const uint256 old_exact{
         "5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f75"};
-    const uint256 wrong{
+    const uint256 old_wrong{
         "5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f74"};
+    const uint256 five_e_exact{
+        "6cc78147e8ad80348e81ea5d6b00c7723188edafec8d544d55e1bac4b90ea22a"};
+    const uint256 five_e_wrong{
+        "6cc78147e8ad80348e81ea5d6b00c7723188edafec8d544d55e1bac4b90ea22b"};
+    const uint256 caa_exact{
+        "1490ab26fca2e91490ae9e3b94208e9fa65d126b4cd75b97abab1097440f54eb"};
+    const uint256 caa_wrong{
+        "1490ab26fca2e91490ae9e3b94208e9fa65d126b4cd75b97abab1097440f54ea"};
 
-    BOOST_CHECK(Consensus::ModernCheckpointAllows(c, 811'641, exact));
-    BOOST_CHECK(!Consensus::ModernCheckpointAllows(c, 811'641, wrong));
+    BOOST_CHECK(Consensus::ModernCheckpointAllows(c, 811'641, old_exact));
+    BOOST_CHECK(!Consensus::ModernCheckpointAllows(c, 811'641, old_wrong));
+    BOOST_CHECK(Consensus::ModernCheckpointAllows(c, 812'401, five_e_exact));
+    BOOST_CHECK(!Consensus::ModernCheckpointAllows(c, 812'401, five_e_wrong));
+    BOOST_CHECK(Consensus::ModernCheckpointAllows(c, 813'401, caa_exact));
+    BOOST_CHECK(!Consensus::ModernCheckpointAllows(c, 813'401, caa_wrong));
 }
 
 BOOST_AUTO_TEST_CASE(other_shipped_networks_remain_fail_closed)

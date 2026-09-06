@@ -187,13 +187,15 @@ private:
      * after a durable-write failure (already reported through Fail()).
      */
     enum class PinnedRecovery { NOT_APPLICABLE, APPLIED, FAILED };
-    PinnedRecovery TryPinnedRecovery(const FinalitySignerState& persisted,
-                                     const FinalityTracker::State& state,
-                                     const CChain& chain,
-                                     const Consensus::Params& params,
-                                     const uint256& chain_domain,
-                                     const BridgeStateIndex* bridge_index,
-                                     std::string& reason);
+    PinnedRecovery TryPinnedRecovery(
+        const Consensus::FinalitySignerRecovery& pin,
+        const FinalitySignerState& persisted,
+        const FinalityTracker::State& state,
+        const CChain& chain,
+        const Consensus::Params& params,
+        const uint256& chain_domain,
+        const BridgeStateIndex* bridge_index,
+        std::string& reason);
     void Fail(std::string error, bool permanent = true);
 
     std::optional<bls::SecretKey> m_key;

@@ -228,6 +228,7 @@ jobs:
           tar -C "$stage" -czf "out/$name.tar.gz" "$name"
           (cd out && sha256sum *.tar.gz > SHA256SUMS.linux)
       - uses: actions/upload-artifact@v4
+        if: needs.version.outputs.source_version != '1.1.3-finality-recovery1'
         with:
           name: b3-hive-linux-x86_64
           path: out/
@@ -345,6 +346,7 @@ jobs:
           tar -C "$stage" -czf "out/$name.tar.gz" "$name"
           (cd out && sha256sum *.tar.gz > SHA256SUMS.linux-static)
       - uses: actions/upload-artifact@v4
+        if: needs.version.outputs.source_version != '1.1.3-finality-recovery1'
         with:
           name: b3-hive-linux-x86_64-static
           path: out/
@@ -382,14 +384,24 @@ jobs:
       - name: Package
         run: |
           mkdir -p out
-          cp build/b3coin-win64-setup.exe \
-            out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64-setup.exe
+          if [[ "${{ needs.version.outputs.source_version }}" != "1.1.3-finality-recovery1" ]]; then
+            cp build/b3coin-win64-setup.exe \
+              out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64-setup.exe
+          fi
           zip -j out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64.zip \
             build/release/b3coin-qt.exe build/release/b3coind.exe \
             build/release/b3coin-cli.exe build/release/b3coin-tx.exe \
             build/release/b3coin-util.exe build/release/b3coin-wallet.exe \
-            README.md COPYING
-          (cd out && sha256sum *.exe *.zip > SHA256SUMS.win64)
+            README.md COPYING \
+            doc/release-notes-v${{ needs.version.outputs.version }}.md
+          sha256sum build/release/b3coin-qt.exe \
+            | sed 's#  build/release/#  #' > out/SHA256SUMS.win64-inner
+          qt_sha=$(cut -d' ' -f1 out/SHA256SUMS.win64-inner)
+          test "$(unzip -p out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64.zip b3coin-qt.exe | sha256sum | cut -d' ' -f1)" = "$qt_sha"
+          (cd out && sha256sum b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64.zip > SHA256SUMS.win64)
+          if [[ -f out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64-setup.exe ]]; then
+            (cd out && sha256sum b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64-setup.exe >> SHA256SUMS.win64)
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: b3-hive-win64
@@ -476,6 +488,7 @@ jobs:
           cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-arm64.zip
           (cd out && shasum -a 256 *.zip > SHA256SUMS.macos-arm64)
       - uses: actions/upload-artifact@v4
+        if: needs.version.outputs.source_version != '1.1.3-finality-recovery1'
         with:
           name: b3-hive-macos-arm64
           path: out/
@@ -562,6 +575,7 @@ jobs:
           cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-x86_64.zip
           (cd out && shasum -a 256 *.zip > SHA256SUMS.macos-x86_64)
       - uses: actions/upload-artifact@v4
+        if: needs.version.outputs.source_version != '1.1.3-finality-recovery1'
         with:
           name: b3-hive-macos-x86_64
           path: out/
@@ -600,14 +614,20 @@ jobs:
         working-directory: release-assets
         run: |
           set -euo pipefail
-          sha256sum --check SHA256SUMS.linux
-          sha256sum --check SHA256SUMS.linux-static
           sha256sum --check SHA256SUMS.win64
-          sha256sum --check SHA256SUMS.macos-arm64
-          sha256sum --check SHA256SUMS.macos-x86_64
-          cat SHA256SUMS.linux SHA256SUMS.linux-static SHA256SUMS.win64 SHA256SUMS.macos-arm64 \
-            SHA256SUMS.macos-x86_64 \
-            | sort -k2 > SHA256SUMS
+          win_inner=$(mktemp -d)
+          trap 'rm -rf "$win_inner"' EXIT
+          unzip -q -j b3-hive-v*-unsigned-win64.zip b3coin-qt.exe -d "$win_inner"
+          (cd "$win_inner" && sha256sum --check "$GITHUB_WORKSPACE/release-assets/SHA256SUMS.win64-inner")
+          if [[ "${{ needs.version.outputs.source_version }}" != "1.1.3-finality-recovery1" ]]; then
+            sha256sum --check SHA256SUMS.linux
+            sha256sum --check SHA256SUMS.linux-static
+            sha256sum --check SHA256SUMS.macos-arm64
+            sha256sum --check SHA256SUMS.macos-x86_64
+            cat SHA256SUMS.linux SHA256SUMS.linux-static SHA256SUMS.win64 SHA256SUMS.macos-arm64 \
+              SHA256SUMS.macos-x86_64 \
+              | sort -k2 > SHA256SUMS
+          fi
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -615,6 +635,15 @@ jobs:
           set -euo pipefail
           notes_file="doc/release-notes-${GITHUB_REF_NAME}.md"
           test -f "$notes_file"
+          release_assets=(release-assets/*)
+          if [[ "${{ needs.version.outputs.source_version }}" == "1.1.3-finality-recovery1" ]]; then
+            release_assets=(
+              "release-assets/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64.zip"
+              "release-assets/SHA256SUMS.win64"
+              "release-assets/SHA256SUMS.win64-inner"
+            )
+            for asset in "${release_assets[@]}"; do test -f "$asset"; done
+          fi
           release_flags=(--prerelease=false --latest)
           if [[ "${{ needs.version.outputs.prerelease }}" == "true" ]]; then
             release_flags=(--prerelease=true --latest=false)
@@ -641,7 +670,7 @@ jobs:
                   --repo "$GITHUB_REPOSITORY" --yes
               done
             fi
-            gh release upload "$GITHUB_REF_NAME" release-assets/* \
+            gh release upload "$GITHUB_REF_NAME" "${release_assets[@]}" \
               --repo "$GITHUB_REPOSITORY"
             gh release edit "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
@@ -658,7 +687,7 @@ jobs:
               --title "B3 Hive $GITHUB_REF_NAME" \
               --notes-file "$notes_file" \
               --draft
-            gh release upload "$GITHUB_REF_NAME" release-assets/* \
+            gh release upload "$GITHUB_REF_NAME" "${release_assets[@]}" \
               --repo "$GITHUB_REPOSITORY"
             gh release edit "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \

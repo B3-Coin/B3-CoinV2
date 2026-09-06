@@ -6,7 +6,10 @@
 
 #include <uint256.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
+#include <optional>
 
 namespace Consensus {
 
@@ -38,6 +41,11 @@ struct FinalitySignerRecovery {
     //! The modern chain domain the journal must belong to (wrong network
     //! fails closed even when every other field would match).
     uint256 chain_domain{};
+    //! Optional exact validator identity. When present, only the signer
+    //! journal for this x-only validator key may use the recovery. Leaving
+    //! this unset retains the incident-wide behaviour needed when several
+    //! validators signed the same discarded checkpoint.
+    std::optional<std::array<unsigned char, 32>> validator_key;
     //! The orphaned vote: the exact checkpoint the journal must hold as both
     //! its last signed checkpoint and its ancestry lock.
     int incident_height{-1};
@@ -54,7 +62,12 @@ struct FinalitySignerRecovery {
 
     bool Valid() const
     {
-        return !chain_domain.IsNull() && incident_height >= 0 &&
+        const bool target_valid{
+            !validator_key ||
+            std::any_of(validator_key->begin(), validator_key->end(),
+                        [](unsigned char byte) { return byte != 0; })};
+        return !chain_domain.IsNull() && target_valid &&
+               incident_height >= 0 &&
                !incident_block_hash.IsNull() &&
                !incident_signing_set_hash.IsNull() &&
                !incident_successor_set_hash.IsNull() &&

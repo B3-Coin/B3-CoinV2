@@ -320,12 +320,14 @@ public:
         consensus.legacy_checkpoint_span = legacy::LEGACY_CHECKPOINT_SPAN;
         // Harden exact modern-chain identities. The first entry is the first
         // post-legacy corridor block and carries deterministic historical FN
-        // Genesis. The second is the agreed live-chain recovery anchor for
-        // the one-time finality signer incident below. These are modern
-        // SHA256d block identities, not legacy replay checkpoints.
+        // Genesis. The remaining entries are agreed live-chain recovery
+        // anchors for the exact signer incidents configured below. These are
+        // modern SHA256d block identities, not legacy replay checkpoints.
         consensus.modern_checkpoints = {
             {810'001, uint256{"913fb38c75e0f12d8d5e6ea65a0ffce33a22a6908392a94661eab7c8506f6014"}},
             {811'641, uint256{"5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f75"}},
+            {812'401, uint256{"6cc78147e8ad80348e81ea5d6b00c7723188edafec8d544d55e1bac4b90ea22a"}},
+            {813'401, uint256{"1490ab26fca2e91490ae9e3b94208e9fa65d126b4cd75b97abab1097440f54eb"}},
         };
         // The historical one-off superblock (chainparams nSuperBlockHeight /
         // vSuperBlockPubKey in the final client, hex verbatim).
@@ -446,9 +448,9 @@ public:
                 "invalid mainnet FN Genesis configuration: " + manifest_error);
         }
 
-        // One-time finality signer recovery pin. The recovery itself changes
-        // validator signing behaviour; its anchor is separately enforced as
-        // a hardened modern block checkpoint above.
+        // One-time finality signer recovery pins. The recoveries change
+        // validator signing behaviour; every anchor is separately enforced
+        // as a hardened modern block checkpoint above.
         // Incident: validators signed epoch-0 checkpoint 811,631 on a branch
         // that was later discarded (that block is no longer on any node's
         // active chain), the finalized checkpoint stayed at 811,591, and the
@@ -500,7 +502,93 @@ public:
                 throw std::runtime_error(
                     "invalid mainnet finality signer recovery pin");
             }
-            consensus.finality_signer_recovery = recovery;
+            consensus.finality_signer_recoveries.push_back(recovery);
+        }
+
+        // Incident 2: validator 5e6268...91142 signed epoch-0 checkpoint
+        // 812,151 on a later-discarded branch. Its intact journal therefore
+        // refuses the agreed active chain at that height. Recovery is scoped
+        // to that validator and exact journal state, retains the recorded
+        // vote, and moves only the ancestry lock to the deeply buried,
+        // scheduled epoch-0 checkpoint at 812,401. Its next vote must be
+        // 812,411 or later.
+        //
+        // The canonical 812,151 and 812,401 hashes were confirmed from the
+        // active chain of a current protocol-80010 audit node at tip 813,616;
+        // an independently synced node's log records those same active-chain
+        // identities. The orphan hash was read from this validator's durable
+        // fork-refusal error. The set hashes are the frozen epoch-0 lineage.
+        // This pin must run while epoch 0 remains in the tracker's
+        // {current, previous} set window. In particular, recover this signer
+        // before the CAA incident below supplies an epoch-1 certificate that
+        // can rotate the tracker into epoch 2 at or after height 813,881.
+        {
+            Consensus::FinalitySignerRecovery recovery;
+            recovery.chain_domain = pinned_domain;
+            recovery.validator_key =
+                "5e62687180477d750f480d24bb02f952c0c807f44fd67128d1fd7a1d09d91142"_hex_u8;
+            recovery.incident_height = 812'151;
+            recovery.incident_block_hash = uint256{
+                "bc6807d5d543c6dde7baf50fc08146409e824194c306e8ca9af9329319f5dade"};
+            recovery.incident_epoch = 0;
+            recovery.incident_signing_set_hash = uint256{
+                "ff7c306f539eec01c793cd7fd389672c53a955d10f00758a2807ef0e9d22514e"};
+            recovery.incident_successor_set_hash = uint256{
+                "6dd7d4575e9f1d74036c7c86175e4fd2e6cf9dc621cddac5b91831b85361d63a"};
+            recovery.anchor_height = 812'401;
+            recovery.anchor_block_hash = uint256{
+                "6cc78147e8ad80348e81ea5d6b00c7723188edafec8d544d55e1bac4b90ea22a"};
+            const auto anchor_checkpoint{
+                consensus.modern_checkpoints.find(recovery.anchor_height)};
+            if (!recovery.Valid() ||
+                anchor_checkpoint == consensus.modern_checkpoints.end() ||
+                anchor_checkpoint->second != recovery.anchor_block_hash) {
+                throw std::runtime_error(
+                    "invalid mainnet validator-specific finality signer recovery pin");
+            }
+            consensus.finality_signer_recoveries.push_back(recovery);
+        }
+
+        // Incident 3: validator caa592...58e2f signed epoch-1 checkpoint
+        // 812,961 on a later-discarded branch. Its intact journal therefore
+        // refuses the agreed active chain at that height. Finality is still
+        // pinned at 811,591, so no newer exact-set certificate exists to move
+        // the lock through the normal protocol rule. This recovery is scoped
+        // to that one validator identity and exact journal state. It retains
+        // the 812,961 vote and moves only the ancestry lock to the deeply
+        // buried, scheduled epoch-1 checkpoint at 813,401; its next vote must
+        // be 813,411 or later.
+        //
+        // Independent protocol-80010 observations of the agreed active chain
+        // at tip 813,572 returned b7cce34e...0b83b at 812,961 and the hardened
+        // anchor 1490ab26...f54eb at 813,401. The orphan hash below was read
+        // from this validator's durable fork-refusal error. The epoch and set
+        // hashes are the frozen epoch-1 lineage reported by the same chain.
+        {
+            Consensus::FinalitySignerRecovery recovery;
+            recovery.chain_domain = pinned_domain;
+            recovery.validator_key =
+                "caa592dda8d13dd45e3596402b0577a67d31c1c27cffdf56b20ddfa648b58e2f"_hex_u8;
+            recovery.incident_height = 812'961;
+            recovery.incident_block_hash = uint256{
+                "1b5bceaec722edb63a50a9b392a79f5a53a2003fed163fe848880d8a09632659"};
+            recovery.incident_epoch = 1;
+            recovery.incident_signing_set_hash = uint256{
+                "6dd7d4575e9f1d74036c7c86175e4fd2e6cf9dc621cddac5b91831b85361d63a"};
+            recovery.incident_successor_set_hash = uint256{
+                "9e3540ce806cfcafe263191cf85daa8d38252f4a990a192be5cd17f88eb2d3de"};
+            recovery.anchor_height = 813'401;
+            recovery.anchor_block_hash = uint256{
+                "1490ab26fca2e91490ae9e3b94208e9fa65d126b4cd75b97abab1097440f54eb"};
+            const auto anchor_checkpoint{
+                consensus.modern_checkpoints.find(recovery.anchor_height)};
+            if (!recovery.Valid() ||
+                anchor_checkpoint == consensus.modern_checkpoints.end() ||
+                anchor_checkpoint->second != recovery.anchor_block_hash) {
+                throw std::runtime_error(
+                    "invalid mainnet validator-specific finality signer recovery pin");
+            }
+            consensus.finality_signer_recoveries.push_back(recovery);
         }
 
         // Core treats vSeeds as DNS hostnames. These legacy values are literal

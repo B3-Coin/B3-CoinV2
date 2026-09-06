@@ -174,15 +174,15 @@ struct Params {
      */
     std::optional<ModernPosParams> modern_pos;
     /**
-     * One-time finality signer journal recovery pin
+     * One-time finality signer journal recovery pins
      * (consensus/finality_signer_recovery.h). Validator signing behaviour
-     * only: it lets a journal that holds exactly the pinned orphaned vote, and
-     * nothing newer, move its ancestry lock to a recovery anchor which the
-     * network separately enforces as a hardened modern block checkpoint.
-     * Unset everywhere except a network that has pinned an exact incident and
-     * its agreed anchor.
+     * only: each lets a journal that holds exactly the pinned orphaned vote,
+     * and nothing newer, move its ancestry lock to a recovery anchor which
+     * the network separately enforces as a hardened modern block checkpoint.
+     * Empty everywhere except a network that has pinned exact incidents and
+     * their agreed anchors.
      */
-    std::optional<FinalitySignerRecovery> finality_signer_recovery;
+    std::vector<FinalitySignerRecovery> finality_signer_recoveries;
     /**
      * Historical FN Genesis manifest measured from the sealed legacy chain.
      * When populated, every row and the matching commitment are pinned by the

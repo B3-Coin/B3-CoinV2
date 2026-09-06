@@ -34,8 +34,11 @@ set(CLIENT_VERSION_MAJOR 1)
 set(CLIENT_VERSION_MINOR 1)
 set(CLIENT_VERSION_BUILD 3)
 set(CLIENT_VERSION_RC 0)
-# Final transition/validator release.
-set(CLIENT_VERSION_PRERELEASE "")
+# One-off, exact-incident signer-recovery prerelease. The numeric client and
+# P2P protocol versions remain compatible with v1.1.3.
+set(CLIENT_VERSION_PRERELEASE "finality-recovery1")
+# Tagged B3 prereleases use release build semantics; GitHub publication is
+# still marked prerelease from the non-empty identifier above.
 set(CLIENT_VERSION_IS_RELEASE "true")
 set(COPYRIGHT_YEAR "2026")
 
