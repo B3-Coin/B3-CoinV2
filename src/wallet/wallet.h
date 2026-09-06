@@ -1061,6 +1061,12 @@ public:
      * and diagnostics.
      */
     util::Result<bls::SecretKey> ResolveFinalityBlsKey(uint32_t seq, const std::vector<unsigned char>* bound_bls_pubkey) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Resolve the exact current, previous and prepared next snapshot keys,
+     * plus the latest nonrevoked binding for a future bootstrap/rotation.
+     * Returned keys are deduplicated by public key. Missing keys produce
+     * public-only diagnostic notes; another sequence is never substituted. */
+    std::vector<bls::SecretKey> ResolveFinalitySigningKeys(const interfaces::FinalityStatus& status,
+                                                        std::vector<std::string>& notes) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** One wallet-held FlowMesh BIP340 account key, deliberately independent
      * from B3 payment, validator, finality, and FN-seat BLS keys. */
     std::optional<CPubKey> GetFlowMeshAccountPubKey() const

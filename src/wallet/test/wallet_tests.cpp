@@ -891,6 +891,135 @@ BOOST_FIXTURE_TEST_CASE(RemoveTxs, TestChain100Setup)
     TestUnloadWallet(std::move(wallet));
 }
 
+BOOST_AUTO_TEST_CASE(b3_finality_snapshot_key_resolution)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+    wallet.SetupDescriptorScriptPubKeyMans();
+    BOOST_REQUIRE(wallet.GetOrCreateValidatorKey());
+    const auto old_key{wallet.DeriveFinalityBlsKey(0)};
+    const auto new_key{wallet.DeriveFinalityBlsKey(1)};
+    BOOST_REQUIRE(old_key);
+    BOOST_REQUIRE(new_key);
+    const auto old_pubkey{old_key->GetPublicKey().Compressed()};
+    const auto new_pubkey{new_key->GetPublicKey().Compressed()};
+    const std::vector<unsigned char> old_pubkey_bytes(old_pubkey.begin(), old_pubkey.end());
+    const std::vector<unsigned char> new_pubkey_bytes(new_pubkey.begin(), new_pubkey.end());
+
+    interfaces::FinalityStatus status;
+    status.configured = true;
+    status.bound = true;
+    status.binding_seq = 1;
+    status.binding_bls_pubkey = new_pubkey_bytes;
+    status.epoch = 1;
+    status.in_current_set = true;
+    status.signing_keys = {
+        {1, 0, old_pubkey_bytes},
+        {0, 0, old_pubkey_bytes},
+        {2, 1, new_pubkey_bytes},
+    };
+    std::vector<std::string> notes;
+
+    // A latest sequence-1 rotation cannot replace the current epoch's
+    // frozen sequence-0 key. Both are loaded for handover without restart,
+    // and repeated public keys across snapshots/binding are deduplicated.
+    auto keys{wallet.ResolveFinalitySigningKeys(status, notes)};
+    BOOST_REQUIRE_EQUAL(keys.size(), 2U);
+    BOOST_CHECK(keys[0].GetPublicKey().Compressed() == old_pubkey);
+    BOOST_CHECK(keys[1].GetPublicKey().Compressed() == new_pubkey);
+    BOOST_CHECK(notes.empty());
+
+    // An unavailable prepared-next key is reported without discarding the
+    // available current key or the latest bound key retained for startup.
+    status.signing_keys[2].binding_seq = 2;
+    keys = wallet.ResolveFinalitySigningKeys(status, notes);
+    BOOST_REQUIRE_EQUAL(keys.size(), 2U);
+    BOOST_CHECK(keys[0].GetPublicKey().Compressed() == old_pubkey);
+    BOOST_CHECK(keys[1].GetPublicKey().Compressed() == new_pubkey);
+    BOOST_REQUIRE_EQUAL(notes.size(), 1U);
+    BOOST_CHECK(notes[0].find("epoch 2 snapshot, binding sequence 2") != std::string::npos);
+
+    // Revoking the latest binding does not revoke an immutable current or
+    // previous snapshot, and the revoked latest key is not loaded alone.
+    status.revoked = true;
+    status.signing_keys.resize(2);
+    keys = wallet.ResolveFinalitySigningKeys(status, notes);
+    BOOST_REQUIRE_EQUAL(keys.size(), 1U);
+    BOOST_CHECK(keys[0].GetPublicKey().Compressed() == old_pubkey);
+    BOOST_CHECK(notes.empty());
+
+    // Pre-bootstrap/corridor startup still loads a confirmed binding, then
+    // leaves finality unarmed with an explanation when no binding exists.
+    status.signing_keys.clear();
+    status.revoked = false;
+    keys = wallet.ResolveFinalitySigningKeys(status, notes);
+    BOOST_REQUIRE_EQUAL(keys.size(), 1U);
+    BOOST_CHECK(keys[0].GetPublicKey().Compressed() == new_pubkey);
+    BOOST_CHECK(notes.empty());
+    status.bound = false;
+    BOOST_CHECK(wallet.ResolveFinalitySigningKeys(status, notes).empty());
+    BOOST_REQUIRE_EQUAL(notes.size(), 1U);
+    BOOST_CHECK(notes[0].find("no FINALITY_KEY binding") != std::string::npos);
+    status.configured = false;
+    BOOST_CHECK(wallet.ResolveFinalitySigningKeys(status, notes).empty());
+    BOOST_CHECK(notes.empty());
+}
+
+BOOST_AUTO_TEST_CASE(b3_finality_snapshot_missing_imported_key)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+    wallet.SetupDescriptorScriptPubKeyMans();
+    BOOST_REQUIRE(wallet.GetOrCreateValidatorKey());
+
+    std::array<unsigned char, 32> ikm{};
+    ikm.fill(0x81);
+    const auto old_imported{bls::SecretKey::FromIKM(ikm)};
+    ikm.fill(0x82);
+    const auto new_imported{bls::SecretKey::FromIKM(ikm)};
+    BOOST_REQUIRE(old_imported);
+    BOOST_REQUIRE(new_imported);
+    const auto old_pubkey{old_imported->GetPublicKey().Compressed()};
+    const auto new_pubkey{new_imported->GetPublicKey().Compressed()};
+    const std::vector<unsigned char> old_pubkey_bytes(old_pubkey.begin(), old_pubkey.end());
+    const std::vector<unsigned char> new_pubkey_bytes(new_pubkey.begin(), new_pubkey.end());
+    BOOST_REQUIRE(wallet.ImportFinalityBlsKey(*old_imported));
+    BOOST_REQUIRE(wallet.ResolveFinalityBlsKey(0, &old_pubkey_bytes));
+    // The wallet stores one imported finality key. If a rotation overwrote
+    // the old secret, neither the new import nor a derived key may stand in.
+    BOOST_REQUIRE(wallet.ImportFinalityBlsKey(*new_imported));
+    BOOST_CHECK(!wallet.ResolveFinalityBlsKey(0, &old_pubkey_bytes));
+    interfaces::FinalityStatus status;
+    status.configured = true;
+    status.bound = true;
+    status.binding_seq = 1;
+    status.binding_bls_pubkey = new_pubkey_bytes;
+    status.epoch = 1;
+    status.in_current_set = true;
+    status.signing_keys = {{1, 0, old_pubkey_bytes}, {2, 1, new_pubkey_bytes}};
+    std::vector<std::string> notes;
+    const auto keys{wallet.ResolveFinalitySigningKeys(status, notes)};
+    BOOST_REQUIRE_EQUAL(keys.size(), 1U);
+    BOOST_CHECK(keys[0].GetPublicKey().Compressed() == new_pubkey);
+    BOOST_REQUIRE_EQUAL(notes.size(), 1U);
+    BOOST_CHECK(notes[0].find("epoch 1 snapshot, binding sequence 0") != std::string::npos);
+    BOOST_CHECK(notes[0].find("matches the bound BLS public key") != std::string::npos);
+
+    // Exact sequence + public key matching also fails closed for a derived
+    // key at a different sequence; the resolver must never scan sequences.
+    const auto derived{wallet.DeriveFinalityBlsKey(2)};
+    BOOST_REQUIRE(derived);
+    const auto derived_pubkey{derived->GetPublicKey().Compressed()};
+    const std::vector<unsigned char> derived_bytes(derived_pubkey.begin(), derived_pubkey.end());
+    status.signing_keys = {{1, 0, derived_bytes}};
+    status.bound = false;
+    BOOST_CHECK(wallet.ResolveFinalitySigningKeys(status, notes).empty());
+    BOOST_REQUIRE_EQUAL(notes.size(), 1U);
+    BOOST_CHECK(notes[0].find("epoch 1 snapshot, binding sequence 0") != std::string::npos);
+}
+
 //! B3 validator key + STAKE outputs (release-v1 validator UX): the wallet
 //! creates and persists one validator key; a STAKE carrier whose bare owner
 //! script is ours IS ours (standard, solvable, signable = unstakeable), a

@@ -4013,6 +4013,42 @@ util::Result<bls::SecretKey> CWallet::ResolveFinalityBlsKey(const uint32_t seq,
     return DeriveFinalityBlsKey(seq);
 }
 
+std::vector<bls::SecretKey> CWallet::ResolveFinalitySigningKeys(
+    const interfaces::FinalityStatus& status, std::vector<std::string>& notes) const
+{
+    AssertLockHeld(cs_wallet);
+    notes.clear();
+    std::vector<bls::SecretKey> keys;
+    if (!status.configured) return keys;
+
+    std::set<std::array<unsigned char, 48>> resolved_pubkeys;
+    const auto resolve = [&](const uint32_t seq, const std::vector<unsigned char>& pubkey,
+                             const std::string& context) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+        const auto key{ResolveFinalityBlsKey(seq, &pubkey)};
+        if (!key) {
+            notes.push_back(context + ": " + util::ErrorString(key).original);
+            return;
+        }
+        if (resolved_pubkeys.insert(key->GetPublicKey().Compressed()).second) {
+            keys.push_back(*key);
+        }
+    };
+    // A rotation or revocation updates the binding tracker, not an already
+    // frozen validator snapshot. Resolve each snapshot independently.
+    for (const auto& snapshot : status.signing_keys) {
+        resolve(snapshot.binding_seq, snapshot.bls_pubkey,
+                strprintf("epoch %u snapshot, binding sequence %u", snapshot.epoch, snapshot.binding_seq));
+    }
+    if (status.bound && !status.revoked) {
+        resolve(status.binding_seq, status.binding_bls_pubkey,
+                strprintf("latest binding, sequence %u", status.binding_seq));
+    } else if (status.signing_keys.empty()) {
+        notes.emplace_back(status.revoked ? "the FINALITY_KEY binding is revoked"
+                                          : "no FINALITY_KEY binding (bindfinalitykey)");
+    }
+    return keys;
+}
+
 bool CWallet::LoadFlowMeshBlsKey(
     const std::array<unsigned char, 48>& pubkey,
     const std::vector<unsigned char>& data, const bool crypted)

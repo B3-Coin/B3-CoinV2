@@ -363,6 +363,34 @@ void B3ValidatorController::createStake(const CAmount amount)
     executeUnlocked(QStringLiteral("create_stake"), "createstake", params);
 }
 
+QString B3ValidatorController::FinalityStartError(const UniValue& finality)
+{
+    const UniValue& validator_set{finality.find_value("validator_set")};
+    if (BoolField(validator_set, "member")) {
+        const UniValue& signing{finality.find_value("signing")};
+        const UniValue& snapshots{signing.find_value("snapshot_keys")};
+        if (snapshots.isArray()) {
+            for (const UniValue& snapshot : snapshots.getValues()) {
+                if (!BoolField(snapshot, "current")) continue;
+                if (BoolField(snapshot, "key_available")) return {};
+                return tr("This wallet does not hold the signing key required by the current validator set. Use the wallet containing the original key and preserve its existing finality_signer folder.");
+            }
+        }
+        return tr("The current validator set's signing key could not be checked. Refresh the finality status before starting staking.");
+    }
+
+    // Before membership/bootstrap, a confirmed binding prepares the signer
+    // for a future snapshot. It must never substitute for a current-set key.
+    const UniValue& binding{finality.find_value("binding")};
+    if (!BoolField(binding, "bound") || BoolField(binding, "revoked")) {
+        return tr("Confirm this wallet's BLS finality binding before starting staking.");
+    }
+    if (!BoolField(binding, "key_is_ours")) {
+        return tr("This wallet does not hold the BLS key bound to its validator.");
+    }
+    return {};
+}
+
 void B3ValidatorController::startStaking()
 {
     const QString operation{QStringLiteral("start_staking")};
@@ -388,18 +416,13 @@ void B3ValidatorController::startStaking()
             failure = tr("The wallet was not unlocked.");
         } else {
             try {
-                // The staking loop is node-global. Only start after proving
-                // that this unlocked wallet owns its live binding.
+                // The staking loop is node-global. A current member needs
+                // the epoch-frozen key even if its live binding has rotated.
                 const UniValue empty{UniValue::VARR};
                 const UniValue finality{m_wallet_model->node().executeRpc(
                     "getfinalityinfo", empty, walletUri())};
-                const UniValue& binding{finality.find_value("binding")};
-                if (!binding.isObject() || !BoolField(binding, "bound") ||
-                    BoolField(binding, "revoked")) {
-                    failure = tr("Confirm this wallet's BLS finality binding before starting staking.");
-                } else if (!BoolField(binding, "key_is_ours")) {
-                    failure = tr("This wallet does not hold the BLS key bound to its validator.");
-                } else {
+                failure = FinalityStartError(finality);
+                if (failure.isEmpty()) {
                     const UniValue result{m_wallet_model->node().executeRpc(
                         "startstaking", empty, walletUri())};
                     details = ToVariantMap(result);

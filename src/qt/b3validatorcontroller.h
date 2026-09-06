@@ -16,6 +16,7 @@
 
 class QThread;
 class QTimer;
+class UniValue;
 class WalletModel;
 
 /**
@@ -89,6 +90,10 @@ public:
     WalletModel* walletModel() const { return m_wallet_model; }
     const B3ValidatorStatus& currentStatus() const { return m_status; }
     bool autoCorridorMining() const { return m_auto_mining; }
+
+    //! Check public getfinalityinfo key availability after unlocking the wallet.
+    //! A current member must own its current snapshot key; a future key cannot replace it.
+    static QString FinalityStartError(const UniValue& finality);
 
 public Q_SLOTS:
     void setWalletModel(WalletModel* wallet_model);

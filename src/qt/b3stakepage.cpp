@@ -594,7 +594,8 @@ void B3StakePage::updateControls()
     m_start_stop->setEnabled(
         ready && (m_status.staking_running
                       ? m_status.staking_uses_this_wallet
-                      : (modern_window && finality_ready && m_status.finality_bound && have_any_stake)));
+                      : (modern_window && finality_ready &&
+                         (m_status.current_set_member || m_status.finality_bound) && have_any_stake)));
 
     m_corridor_mining->setText(m_status.auto_corridor_mining
                                    ? tr("Stop corridor mining")

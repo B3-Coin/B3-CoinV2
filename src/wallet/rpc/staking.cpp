@@ -15,6 +15,7 @@
 #include <script/solver.h>
 #include <util/moneystr.h>
 #include <util/strencodings.h>
+#include <util/string.h>
 #include <wallet/coincontrol.h>
 #include <wallet/rpc/util.h>
 #include <crypto/bls.h>
@@ -569,9 +570,22 @@ RPCHelpMan getfinalityinfo()
                        }},
                       {RPCResult::Type::OBJ, "signing", "local finality signing",
                        {
-                           {RPCResult::Type::BOOL, "armed", "a BLS key is loaded in the staking loop"},
+                           {RPCResult::Type::BOOL, "armed", "the local finality signer is enabled; last_signed_height shows its actual progress"},
                            {RPCResult::Type::NUM, "last_signed_height", ""},
                            {RPCResult::Type::NUM, "pool_checkpoints", "checkpoints tracked by the local signature pool"},
+                           {RPCResult::Type::STR, "last_error", /*optional=*/true, "the staking loop's last reported error"},
+                           {RPCResult::Type::ARR, "snapshot_keys", "public keys required by the frozen current, previous and prepared next validator sets",
+                            {
+                                {RPCResult::Type::OBJ, "", "",
+                                 {
+                                     {RPCResult::Type::NUM, "epoch", "the snapshot epoch"},
+                                     {RPCResult::Type::NUM, "binding_seq", "the binding sequence recorded by this snapshot"},
+                                     {RPCResult::Type::STR_HEX, "bls_pubkey", "the exact BLS public key required by this snapshot"},
+                                     {RPCResult::Type::BOOL, "current", "this is the validator's current-set key"},
+                                     {RPCResult::Type::BOOL, "key_available", /*optional=*/true, "whether this unlocked wallet can resolve the exact snapshot key; does not indicate that it is loaded in the staking loop"},
+                                     {RPCResult::Type::STR, "key_error", /*optional=*/true, "why the unlocked wallet could not resolve this snapshot key"},
+                                 }},
+                            }},
                        }},
                   }},
         RPCExamples{HelpExampleCli("getfinalityinfo", "") + HelpExampleRpc("getfinalityinfo", "")},
@@ -649,6 +663,22 @@ RPCHelpMan getfinalityinfo()
             signing.pushKV("armed", staking.finality_signing);
             signing.pushKV("last_signed_height", staking.last_signed_height);
             signing.pushKV("pool_checkpoints", st.pool_checkpoints);
+            if (!staking.last_error.empty()) signing.pushKV("last_error", staking.last_error);
+            UniValue snapshot_keys(UniValue::VARR);
+            for (const auto& snapshot : st.signing_keys) {
+                UniValue snapshot_key(UniValue::VOBJ);
+                snapshot_key.pushKV("epoch", snapshot.epoch);
+                snapshot_key.pushKV("binding_seq", static_cast<uint64_t>(snapshot.binding_seq));
+                snapshot_key.pushKV("bls_pubkey", HexStr(snapshot.bls_pubkey));
+                snapshot_key.pushKV("current", st.in_current_set && snapshot.epoch == st.epoch);
+                if (!pwallet->IsLocked()) {
+                    const auto key{pwallet->ResolveFinalityBlsKey(snapshot.binding_seq, &snapshot.bls_pubkey)};
+                    snapshot_key.pushKV("key_available", key.has_value());
+                    if (!key) snapshot_key.pushKV("key_error", util::ErrorString(key).original);
+                }
+                snapshot_keys.push_back(std::move(snapshot_key));
+            }
+            signing.pushKV("snapshot_keys", std::move(snapshot_keys));
             obj.pushKV("signing", signing);
             return obj;
         },
@@ -925,8 +955,8 @@ RPCHelpMan startstaking()
                 {RPCResult::Type::BOOL, "running", ""},
                 {RPCResult::Type::STR_HEX, "validator_key", "the x-only validator key now staking"},
                 {RPCResult::Type::STR, "rewards_address", "where produced-block fees are paid"},
-                {RPCResult::Type::BOOL, "finality_signing", "whether the finality signer was armed with this validator's bound BLS key"},
-                {RPCResult::Type::STR, "finality_note", /*optional=*/true, "why the finality signer is not armed"},
+                {RPCResult::Type::BOOL, "finality_signing", "whether at least one matching BLS key was loaded; getfinalityinfo reports the signer's actual progress and errors"},
+                {RPCResult::Type::STR, "finality_note", /*optional=*/true, "binding or snapshot keys that could not be resolved, including unavailable previous or next keys"},
             }},
         RPCExamples{HelpExampleCli("startstaking", "") + HelpExampleRpc("startstaking", "")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
@@ -943,38 +973,24 @@ RPCHelpMan startstaking()
             const auto rewards{pwallet->GetNewDestination(pwallet->m_default_address_type, "b3-staking-rewards")};
             if (!rewards) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(rewards).original);
 
-            // Resolve the optional finality key before entering the node. The
-            // node installs it atomically with this validator key so concurrent
+            // Resolve the snapshot keys before entering the node. The
+            // node installs them atomically with this validator key so concurrent
             // calls from different wallets cannot cross their signing keys.
-            std::optional<bls::SecretKey> finality_key;
-            std::string finality_note;
-            {
-                const interfaces::FinalityStatus fstatus{pwallet->chain().finalityStatus(XOnlyBytes(*validator))};
-                if (fstatus.configured && fstatus.bound && !fstatus.revoked) {
-                    // Derived or imported: whichever wallet key matches the binding.
-                    const auto bls_key{pwallet->ResolveFinalityBlsKey(fstatus.binding_seq, &fstatus.binding_bls_pubkey)};
-                    if (bls_key) {
-                        finality_key = *bls_key;
-                    } else {
-                        finality_note = util::ErrorString(bls_key).original;
-                    }
-                } else if (fstatus.configured) {
-                    finality_note = fstatus.revoked ? "the FINALITY_KEY binding is revoked"
-                                                    : "no FINALITY_KEY binding (bindfinalitykey)";
-                }
-            }
+            const interfaces::FinalityStatus fstatus{pwallet->chain().finalityStatus(XOnlyBytes(*validator))};
+            std::vector<std::string> finality_notes;
+            const auto finality_keys{pwallet->ResolveFinalitySigningKeys(fstatus, finality_notes)};
 
             std::string error;
             if (!pwallet->chain().startStaking(*secret, GetScriptForDestination(*rewards),
-                                               finality_key, error)) {
+                                               finality_keys, error)) {
                 throw JSONRPCError(RPC_MISC_ERROR, error);
             }
             UniValue obj(UniValue::VOBJ);
             obj.pushKV("running", true);
             obj.pushKV("validator_key", HexStr(XOnlyBytes(*validator)));
             obj.pushKV("rewards_address", EncodeDestination(*rewards));
-            obj.pushKV("finality_signing", finality_key.has_value());
-            if (!finality_note.empty()) obj.pushKV("finality_note", finality_note);
+            obj.pushKV("finality_signing", !finality_keys.empty());
+            if (!finality_notes.empty()) obj.pushKV("finality_note", util::Join(finality_notes, "; "));
             return obj;
         },
     };

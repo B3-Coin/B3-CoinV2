@@ -186,7 +186,7 @@ bool StakingLoop::SetFinalityKey(const bls::SecretKey& key, const std::array<uns
         error = "cannot change the finality key while the staking loop is running";
         return false;
     }
-    m_bls_key = key;
+    m_bls_keys = {key};
     m_validator = validator_key;
     m_finality_signing_failed = false;
     return true;
@@ -200,7 +200,7 @@ bool StakingLoop::ClearFinalityKey(std::string& error)
         error = "cannot change the finality key while the staking loop is running";
         return false;
     }
-    m_bls_key.reset();
+    m_bls_keys.clear();
     return true;
 }
 
@@ -212,21 +212,34 @@ StakingLoop::~StakingLoop()
 bool StakingLoop::Start(const CKey& validator_key, const CScript& coinbase_script, std::string& error)
 {
     LOCK(m_lifecycle_mutex);
-    return StartImpl(validator_key, coinbase_script, /*finality_key=*/nullptr, error);
+    return StartImpl(validator_key, coinbase_script, /*finality_keys=*/nullptr, error);
 }
 
 bool StakingLoop::StartWithFinalityKey(const CKey& validator_key, const CScript& coinbase_script,
                                        const std::optional<bls::SecretKey>& finality_key,
                                        std::string& error)
 {
+    const std::vector<bls::SecretKey> keys{finality_key ? std::vector<bls::SecretKey>{*finality_key}
+                                                     : std::vector<bls::SecretKey>{}};
+    return StartWithFinalityKeys(validator_key, coinbase_script, keys, error);
+}
+
+bool StakingLoop::StartWithFinalityKeys(const CKey& validator_key, const CScript& coinbase_script,
+                                        const std::vector<bls::SecretKey>& finality_keys,
+                                        std::string& error)
+{
     LOCK(m_lifecycle_mutex);
-    return StartImpl(validator_key, coinbase_script, &finality_key, error);
+    return StartImpl(validator_key, coinbase_script, &finality_keys, error);
 }
 
 bool StakingLoop::StartImpl(const CKey& validator_key, const CScript& coinbase_script,
-                            const std::optional<bls::SecretKey>* finality_key,
+                            const std::vector<bls::SecretKey>* finality_keys,
                             std::string& error)
 {
+    if (finality_keys && finality_keys->size() > FinalitySigner::MAX_KEYS) {
+        error = strprintf("too many finality snapshot keys (maximum %u)", FinalitySigner::MAX_KEYS);
+        return false;
+    }
     if (!validator_key.IsValid()) {
         error = "invalid validator key";
         return false;
@@ -251,14 +264,14 @@ bool StakingLoop::StartImpl(const CKey& validator_key, const CScript& coinbase_s
         std::array<unsigned char, 32> validator{};
         std::copy(xonly.begin(), xonly.end(), validator.begin());
 
-        if (finality_key != nullptr) {
-            // This is an explicit replacement, including nullopt when the
-            // current wallet has no usable live binding.
-            m_bls_key = *finality_key;
-        } else if (m_bls_key && m_validator != validator) {
+        if (finality_keys != nullptr) {
+            // This is an explicit replacement, including an empty collection
+            // when the current wallet has no usable snapshot key.
+            m_bls_keys = *finality_keys;
+        } else if (!m_bls_keys.empty() && m_validator != validator) {
             // Preserve the old arm-then-start API only for the validator it
             // was armed for. Never carry a BLS secret across identities.
-            m_bls_key.reset();
+            m_bls_keys.clear();
         }
         m_key = validator_key;
         m_validator = validator;
@@ -276,7 +289,7 @@ bool StakingLoop::StartImpl(const CKey& validator_key, const CScript& coinbase_s
             m_running = false;
             m_state = "stopped";
             m_key = CKey{};
-            m_bls_key.reset();
+            m_bls_keys.clear();
             memory_cleanse(m_validator.data(), m_validator.size());
             if (!m_coinbase_script.empty()) {
                 memory_cleanse(m_coinbase_script.data(), m_coinbase_script.size());
@@ -306,7 +319,7 @@ void StakingLoop::Stop()
     // forget every copied key and its associated public routing data before a
     // different wallet can start this node-global loop.
     m_key = CKey{};
-    m_bls_key.reset();
+    m_bls_keys.clear();
     memory_cleanse(m_validator.data(), m_validator.size());
     if (!m_coinbase_script.empty()) {
         memory_cleanse(m_coinbase_script.data(), m_coinbase_script.size());
@@ -369,7 +382,7 @@ interfaces::StakingStatus StakingLoop::Status(const std::optional<std::array<uns
         status.last_block_hash = m_last_block_hash;
         status.next_block_time = m_next_block_time;
         status.finality_signing =
-            m_bls_key.has_value() && !m_finality_signing_failed;
+            !m_bls_keys.empty() && !m_finality_signing_failed;
         status.last_signed_height = m_last_signed_height;
         if (m_running) {
             status.validator_key = m_validator;
@@ -391,7 +404,7 @@ void StakingLoop::ThreadLoop()
         key = m_key;
         validator = m_validator;
         coinbase_script = m_coinbase_script;
-        if (m_bls_key) {
+        if (!m_bls_keys.empty()) {
             const Consensus::Params& params{m_chainman.GetConsensus()};
             const auto domain{
                 params.legacy_final_hash
@@ -400,8 +413,8 @@ void StakingLoop::ThreadLoop()
                           *params.legacy_final_hash)
                     : std::nullopt};
             std::string error;
-            if (!domain || !signer.SetKeyPersistent(
-                               *m_bls_key, validator,
+            if (!domain || !signer.SetKeysPersistent(
+                               m_bls_keys, validator,
                                domain.value_or(uint256{}),
                                m_finality_signer_dir, error)) {
                 if (error.empty()) error = "chain domain is not configured";
@@ -483,9 +496,9 @@ void StakingLoop::ThreadLoop()
                         "finality signing disabled safely: %s",
                         signer.LastError());
                 } else if (m_finality_signing_failed) {
-                    // A branch-lock wait is recoverable only when a newer
-                    // included quorum certificate supplies the lock-change
-                    // proof. The signer rechecks that proof every loop.
+                    // The signer rechecks recoverable ancestry-lock waits
+                    // and snapshot-key availability every loop. Permanent
+                    // journal failures never reach this recovery branch.
                     m_finality_signing_failed = false;
                     if (m_last_error.starts_with(
                             "finality signing disabled safely:")) {

@@ -51,6 +51,9 @@ struct ValidatorSetMember {
     modern::ValidatorKeyBytes validator_key{};
     modern::BlsPubkeyBytes bls_pubkey{};
     uint64_t weight{0};
+    //! Wallet key-resolution metadata from the validated binding at snapshot
+    //! creation. Not part of the consensus member, leaf, header or set hash.
+    uint32_t binding_seq{0};
     friend bool operator==(const ValidatorSetMember& a, const ValidatorSetMember& b)
     {
         return a.validator_key == b.validator_key && a.bls_pubkey == b.bls_pubkey && a.weight == b.weight;

@@ -20,6 +20,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 class ChainstateManager;
 class CTxMemPool;
@@ -104,7 +105,7 @@ public:
     bool SetFinalityKey(const bls::SecretKey& key, const std::array<unsigned char, 32>& validator_key,
                         std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_lifecycle_mutex, !m_mutex);
     bool ClearFinalityKey(std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_lifecycle_mutex, !m_mutex);
-    bool HasFinalityKey() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) { LOCK(m_mutex); return m_bls_key.has_value(); }
+    bool HasFinalityKey() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) { LOCK(m_mutex); return !m_bls_keys.empty(); }
 
     //! Start staking with `validator_key`; block fees pay `coinbase_script`.
     //! Returns false (with `error`) if already running or the key is unusable.
@@ -120,6 +121,11 @@ public:
     bool StartWithFinalityKey(const CKey& validator_key, const CScript& coinbase_script,
                               const std::optional<bls::SecretKey>& finality_key,
                               std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_lifecycle_mutex, !m_mutex);
+    //! Atomically load the bounded current/previous/next snapshot key collection.
+    //! All keys use the same validator-scoped durable signing journal.
+    bool StartWithFinalityKeys(const CKey& validator_key, const CScript& coinbase_script,
+                              const std::vector<bls::SecretKey>& finality_keys,
+                              std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_lifecycle_mutex, !m_mutex);
     //! Stop and join the loop (idempotent).
     void Stop() EXCLUSIVE_LOCKS_REQUIRED(!m_lifecycle_mutex, !m_mutex);
     //! Current status; stake weights are reported for `validator_key` (x-only)
@@ -128,7 +134,7 @@ public:
 
 private:
     bool StartImpl(const CKey& validator_key, const CScript& coinbase_script,
-                   const std::optional<bls::SecretKey>* finality_key,
+                   const std::vector<bls::SecretKey>* finality_keys,
                    std::string& error) EXCLUSIVE_LOCKS_REQUIRED(m_lifecycle_mutex, !m_mutex);
     void ThreadLoop() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     //! Sleep up to `d` unless stopped; returns false when stop was requested.
@@ -151,7 +157,7 @@ private:
     bool m_running GUARDED_BY(m_mutex){false};
     bool m_stop GUARDED_BY(m_mutex){false};
     CKey m_key GUARDED_BY(m_mutex);
-    std::optional<bls::SecretKey> m_bls_key GUARDED_BY(m_mutex);
+    std::vector<bls::SecretKey> m_bls_keys GUARDED_BY(m_mutex);
     std::array<unsigned char, 32> m_validator GUARDED_BY(m_mutex){};
     CScript m_coinbase_script GUARDED_BY(m_mutex);
     std::string m_state GUARDED_BY(m_mutex){"stopped"};

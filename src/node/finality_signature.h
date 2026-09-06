@@ -134,21 +134,22 @@ private:
  * spec section 4 "Signing"): only scheduled checkpoints, only once the
  * depth is reached, strictly increasing heights, only on the active chain
  * (descendants of the latest certified checkpoint), and only with the BLS
- * key the ACTIVE epoch snapshot records for this validator -- a mid-epoch
- * rotation signs nothing until its snapshot takes effect.
+ * key the checkpoint's epoch snapshot records for this validator. Retained
+ * rotation keys share one validator-scoped journal and anti-repeat watermark.
  */
 class FinalitySigner
 {
 public:
+    static constexpr size_t MAX_KEYS{4};
+
     void SetKey(const bls::SecretKey& key, const modern::ValidatorKeyBytes& validator_key)
     {
-        m_key = key;
-        m_validator_key = validator_key;
-        m_store = FinalitySignerStore{};
-        m_last_signed = -1;
-        m_error.clear();
-        m_permanent_error = false;
+        std::string error;
+        SetKeys({key}, validator_key, error);
     }
+    //! Offline/test setup. Invalid empty/oversized collections leave the signer unchanged.
+    bool SetKeys(const std::vector<bls::SecretKey>& keys,
+                 const modern::ValidatorKeyBytes& validator_key, std::string& error);
     /** Arm a production signer with its durable, validator-identity-scoped
      * journal. A corrupt, unreadable, foreign, or otherwise unsafe existing
      * record is rejected before the key is armed. */
@@ -157,9 +158,14 @@ public:
                           const uint256& chain_domain,
                           const fs::path& store_directory,
                           std::string& error);
-    bool HasKey() const { return m_key.has_value(); }
+    bool SetKeysPersistent(const std::vector<bls::SecretKey>& keys,
+                           const modern::ValidatorKeyBytes& validator_key,
+                           const uint256& chain_domain,
+                           const fs::path& store_directory,
+                           std::string& error);
+    bool HasKey() const { return !m_keys.empty(); }
     int LastSignedHeight() const { return m_last_signed; }
-    const std::string& LastError() const { return m_error; }
+    const std::string& LastError() const { return m_error.empty() ? m_key_error : m_error; }
 
     /**
      * Sign every checkpoint now signable and not yet signed; the produced
@@ -195,12 +201,19 @@ private:
                                      const BridgeStateIndex* bridge_index,
                                      std::string& reason);
     void Fail(std::string error, bool permanent = true);
+    const bls::SecretKey* KeyFor(const std::array<unsigned char, bls::PUBKEY_SIZE>& pubkey) const;
 
-    std::optional<bls::SecretKey> m_key;
+    struct SigningKey {
+        bls::SecretKey secret;
+        std::array<unsigned char, bls::PUBKEY_SIZE> pubkey;
+    };
+    std::vector<SigningKey> m_keys;
     modern::ValidatorKeyBytes m_validator_key{};
     int m_last_signed{-1};
     FinalitySignerStore m_store;
     std::string m_error;
+    //! Recoverable key availability is separate from durable safety failures.
+    std::string m_key_error;
     bool m_permanent_error{false};
 };
 

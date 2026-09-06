@@ -352,4 +352,56 @@ BOOST_FIXTURE_TEST_CASE(staking_reports_corrupt_finality_journal_as_disabled, Fi
                 std::string::npos);
 }
 
+BOOST_FIXTURE_TEST_CASE(staking_reports_missing_snapshot_key_and_resumes_with_retained_key, FinalityStakingFixture)
+{
+    PrepareFinalityChain();
+    const fs::path signer_dir{m_path_root / "snapshot_finality_signer"};
+    std::string error;
+    node::FinalitySignerStore store;
+    BOOST_REQUIRE_MESSAGE(store.Open(signer_dir, m_domain, m_vk_a, error), error);
+    BOOST_REQUIRE_MESSAGE(store.InitializeEmpty(error), error);
+    ProduceTo(m_M + 8, m_vk_a);
+    SetMockTime(Tip()->GetBlockTime() + 1);
+    WITH_LOCK(cs_main, m_node.chainman->UpdateIBDStatus());
+    BOOST_REQUIRE(!m_node.chainman->IsInitialBlockDownload());
+
+    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr, signer_dir);
+    const bls::SecretKey future_key{Bls(9)};
+    BOOST_CHECK(!loop.StartWithFinalityKeys(
+        m_validator_a, CScript() << OP_TRUE,
+        std::vector<bls::SecretKey>(node::FinalitySigner::MAX_KEYS + 1, future_key), error));
+    BOOST_CHECK(!loop.HasFinalityKey());
+    BOOST_REQUIRE_MESSAGE(loop.StartWithFinalityKeys(
+                              m_validator_a, CScript() << OP_TRUE,
+                              {future_key}, error), error);
+    interfaces::StakingStatus status;
+    for (int i{0}; i < 200; ++i) {
+        status = loop.Status(std::nullopt);
+        if (!status.finality_signing && status.last_error.find(
+                "missing finality private key for current epoch") != std::string::npos) break;
+        UninterruptibleSleep(std::chrono::milliseconds{5});
+    }
+    loop.Stop();
+    BOOST_CHECK(!status.finality_signing);
+    BOOST_CHECK_EQUAL(status.last_signed_height, -1);
+    BOOST_CHECK(status.last_error.find("missing finality private key for current epoch") != std::string::npos);
+    BOOST_CHECK(!loop.HasFinalityKey());
+
+    // Reload the retained current key alongside the future key, keeping the
+    // exact same validator journal. Selection must ignore collection order.
+    BOOST_REQUIRE_MESSAGE(loop.StartWithFinalityKeys(
+                              m_validator_a, CScript() << OP_TRUE,
+                              {future_key, m_bls_a}, error), error);
+    for (int i{0}; i < 200; ++i) {
+        status = loop.Status(std::nullopt);
+        if (status.finality_signing && status.last_signed_height >= m_M + 5) break;
+        UninterruptibleSleep(std::chrono::milliseconds{5});
+    }
+    loop.Stop();
+    BOOST_CHECK(status.finality_signing);
+    BOOST_CHECK_GE(status.last_signed_height, m_M + 5);
+    BOOST_CHECK(status.last_error.empty());
+    BOOST_CHECK(!loop.HasFinalityKey());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

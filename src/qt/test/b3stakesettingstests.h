@@ -13,6 +13,7 @@ class B3StakeSettingsTests : public QObject
 
 private Q_SLOTS:
     void stakePageDisablesActionsWithoutWallet();
+    void stakingRequiresCurrentSnapshotKey();
     void settingsPageRoutesToExistingDialogs();
     void settingsPageMirrorsWalletActions();
     void shellShowsInstalledSettingsPage();

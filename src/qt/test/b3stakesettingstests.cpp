@@ -11,6 +11,8 @@
 #include <qt/b3settingspage.h>
 #include <qt/b3shell.h>
 #include <qt/b3stakepage.h>
+#include <qt/b3validatorcontroller.h>
+#include <univalue.h>
 
 #include <QAction>
 #include <QLabel>
@@ -43,6 +45,58 @@ void B3StakeSettingsTests::stakePageDisablesActionsWithoutWallet()
 
     // Detaching again is a no-op, not a crash.
     page.setWalletModel(nullptr);
+}
+
+void B3StakeSettingsTests::stakingRequiresCurrentSnapshotKey()
+{
+    UniValue finality;
+    // Rotation or revocation cannot prevent an unlocked wallet from using
+    // the original key still frozen into its current validator snapshot.
+    QVERIFY(finality.read(R"({
+        "validator_set":{"member":true},
+        "binding":{"bound":true,"revoked":true,"key_is_ours":false},
+        "signing":{"snapshot_keys":[
+            {"current":false,"key_available":false},
+            {"current":true,"key_available":true}
+        ]}
+    })"));
+    QVERIFY(B3ValidatorController::FinalityStartError(finality).isEmpty());
+
+    // Neither a future/previous key nor the latest bound key may stand in
+    // for an unavailable current snapshot key.
+    QVERIFY(finality.read(R"({
+        "validator_set":{"member":true},
+        "binding":{"bound":true,"revoked":false,"key_is_ours":true},
+        "signing":{"snapshot_keys":[
+            {"current":false,"key_available":true},
+            {"current":true,"key_available":false}
+        ]}
+    })"));
+    QVERIFY(B3ValidatorController::FinalityStartError(finality).contains(QStringLiteral("original key")));
+    QVERIFY(finality.read(R"({
+        "validator_set":{"member":true},
+        "binding":{"bound":true,"revoked":false,"key_is_ours":true},
+        "signing":{"snapshot_keys":[{"current":false,"key_available":true}]}
+    })"));
+    QVERIFY(!B3ValidatorController::FinalityStartError(finality).isEmpty());
+
+    // Before the validator becomes a current member, retain the existing
+    // confirmed-binding startup path and its missing-key refusal.
+    QVERIFY(finality.read(R"({
+        "validator_set":{"member":false},
+        "binding":{"bound":true,"revoked":false,"key_is_ours":true}
+    })"));
+    QVERIFY(B3ValidatorController::FinalityStartError(finality).isEmpty());
+    QVERIFY(finality.read(R"({
+        "validator_set":{"member":false},
+        "binding":{"bound":true,"revoked":false,"key_is_ours":false}
+    })"));
+    QVERIFY(!B3ValidatorController::FinalityStartError(finality).isEmpty());
+    QVERIFY(finality.read(R"({
+        "validator_set":{"member":false},
+        "binding":{"bound":false}
+    })"));
+    QVERIFY(!B3ValidatorController::FinalityStartError(finality).isEmpty());
 }
 
 void B3StakeSettingsTests::settingsPageRoutesToExistingDialogs()

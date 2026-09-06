@@ -15,6 +15,7 @@
 #include <node/finality_tracker.h>
 #include <streams.h>
 #include <test/util/finality_fixture.h>
+#include <util/strencodings.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
@@ -234,10 +235,166 @@ BOOST_FIXTURE_TEST_CASE(signer_signs_each_scheduled_checkpoint_once_with_the_act
         node::FinalitySigner rotated;
         rotated.SetKey(Bls(9), m_vk_a);
         BOOST_CHECK(rotated.MaybeSign(tracker, chain, params, pool).empty());
+        BOOST_CHECK(rotated.LastError().find("missing finality private key for current epoch") != std::string::npos);
         // A non-member signs nothing.
         node::FinalitySigner outsider;
         outsider.SetKey(Bls(8), m_vk_c);
         BOOST_CHECK(outsider.MaybeSign(tracker, chain, params, pool).empty());
+        BOOST_CHECK(outsider.LastError().empty());
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(snapshot_keys_share_a_durable_watermark_across_rotation_and_restart, FinalityChainFixture)
+{
+    PrepareFinalityChain();
+    const int M{m_M};
+    auto& params{MutableConsensus()};
+    auto& pos{*params.modern_pos};
+    pos.finality_epoch_blocks = 4;
+    pos.checkpoint_interval = 1;
+    pos.checkpoint_depth = 0;
+    pos.max_epoch_extension = 8;
+    BOOST_REQUIRE(pos.Valid());
+    const bls::SecretKey rotated{Bls(9)};
+    const fs::path directory{m_path_root / "snapshot-key-journal"};
+    node::FinalitySigner signer;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(signer.SetKeysPersistent(
+                              {rotated, m_bls_a, m_bls_a}, m_vk_a,
+                              m_domain, directory, error), error);
+    {
+        LOCK(cs_main);
+        FinalitySignaturePool pool;
+        BOOST_CHECK(signer.MaybeSign(Finality(), m_node.chainman->ActiveChain(), params, pool).empty());
+        BOOST_CHECK(signer.LastError().empty());
+    }
+
+    Produce(m_vk_a);
+    const auto set0{*FinalityState().current};
+    const auto set1{*FinalityState().next};
+    const auto binding{MakeBinding(m_validator_a, m_vk_a, &rotated, 1)};
+    Produce(m_vk_a, {MakeCertificate({M, 0, set1.SetHash()}, set0)},
+            {MakeTx(4, {binding.cell}, {binding.record})});
+    ProduceTo(M + 3, m_vk_a);
+    {
+        LOCK(cs_main);
+        FinalitySignaturePool pool;
+        const auto sigs{signer.MaybeSign(Finality(), m_node.chainman->ActiveChain(), params, pool)};
+        BOOST_REQUIRE_EQUAL(sigs.size(), 3U);
+        BOOST_CHECK_EQUAL(signer.LastSignedHeight(), M + 3);
+        BOOST_CHECK(signer.LastError().empty());
+    }
+    Produce(m_vk_a); // Set_1 retains the old key; Set_2 commits the rotation.
+    const auto set2{*FinalityState().next};
+    BOOST_REQUIRE_EQUAL(FinalityState().epoch, 1U);
+    BOOST_CHECK(set2.Members()[*set2.IndexOf(m_vk_a)].bls_pubkey == rotated.GetPublicKey().Compressed());
+    Produce(m_vk_a, {MakeCertificate({M + 4, 1, set2.SetHash()}, set1)});
+    ProduceTo(M + 9, m_vk_a);
+    BOOST_REQUIRE_EQUAL(FinalityState().epoch, 2U);
+    {
+        LOCK(cs_main);
+        const CChain& chain{m_node.chainman->ActiveChain()};
+        node::FinalityTracker& tracker{Finality()};
+        FinalitySignaturePool pool;
+        const auto sigs{signer.MaybeSign(tracker, chain, params, pool)};
+        BOOST_REQUIRE_EQUAL(sigs.size(), 5U);
+        FinalitySignaturePool independent;
+        for (size_t i{0}; i < sigs.size(); ++i) {
+            BOOST_CHECK_EQUAL(sigs[i].height, static_cast<uint64_t>(M + 5 + i));
+            BOOST_CHECK_EQUAL(sigs[i].epoch, i < 3 ? 1U : 2U);
+            BOOST_CHECK(independent.Submit(sigs[i], tracker, chain, params) == Accept::ACCEPTED);
+        }
+        BOOST_CHECK_EQUAL(signer.LastSignedHeight(), M + 9);
+        BOOST_CHECK(signer.LastError().empty());
+    }
+
+    node::FinalitySigner restarted;
+    BOOST_REQUIRE_MESSAGE(restarted.SetKeysPersistent(
+                              {m_bls_a, rotated}, m_vk_a,
+                              m_domain, directory, error), error);
+    BOOST_CHECK_EQUAL(restarted.LastSignedHeight(), M + 9);
+    // Invalid replacements cannot discard an existing journal or anti-repeat state.
+    BOOST_CHECK(!restarted.SetKeys({}, m_vk_a, error));
+    BOOST_CHECK(!restarted.SetKeysPersistent(
+        std::vector<bls::SecretKey>(node::FinalitySigner::MAX_KEYS + 1, rotated),
+        m_vk_a, m_domain, directory, error));
+    BOOST_CHECK(restarted.HasKey());
+    BOOST_CHECK_EQUAL(restarted.LastSignedHeight(), M + 9);
+    {
+        LOCK(cs_main);
+        FinalitySignaturePool pool;
+        BOOST_CHECK(restarted.MaybeSign(Finality(), m_node.chainman->ActiveChain(), params, pool).empty());
+        BOOST_CHECK(restarted.LastError().empty());
+    }
+    Produce(m_vk_a);
+    {
+        LOCK(cs_main);
+        FinalitySignaturePool pool;
+        const auto sigs{restarted.MaybeSign(Finality(), m_node.chainman->ActiveChain(), params, pool)};
+        BOOST_REQUIRE_EQUAL(sigs.size(), 1U);
+        BOOST_CHECK_EQUAL(sigs[0].height, static_cast<uint64_t>(M + 10));
+        BOOST_CHECK_EQUAL(sigs[0].epoch, 2U);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(snapshot_key_errors_recover_on_handover_without_blocking_other_usable_keys, FinalityChainFixture)
+{
+    PrepareFinalityChain();
+    const int M{m_M};
+    auto& params{MutableConsensus()};
+    auto& pos{*params.modern_pos};
+    pos.finality_epoch_blocks = 4;
+    pos.checkpoint_interval = 1;
+    pos.checkpoint_depth = 0;
+    pos.max_epoch_extension = 8;
+    BOOST_REQUIRE(pos.Valid());
+    const bls::SecretKey rotated{Bls(9)};
+    node::FinalitySigner future_only;
+    future_only.SetKey(rotated, m_vk_a);
+    node::FinalitySigner old_only;
+    old_only.SetKey(m_bls_a, m_vk_a);
+
+    Produce(m_vk_a);
+    const auto set0{*FinalityState().current};
+    const auto set1{*FinalityState().next};
+    const auto binding{MakeBinding(m_validator_a, m_vk_a, &rotated, 1)};
+    Produce(m_vk_a, {MakeCertificate({M, 0, set1.SetHash()}, set0)},
+            {MakeTx(4, {binding.cell}, {binding.record})});
+    ProduceTo(M + 4, m_vk_a);
+    BOOST_REQUIRE_EQUAL(FinalityState().epoch, 1U);
+    const auto set2{*FinalityState().next};
+    {
+        LOCK(cs_main);
+        FinalitySignaturePool pool;
+        BOOST_CHECK(future_only.MaybeSign(Finality(), m_node.chainman->ActiveChain(), params, pool).empty());
+        BOOST_CHECK(future_only.LastError().find(HexStr(m_bls_a.GetPublicKey().Compressed())) != std::string::npos);
+        BOOST_CHECK_EQUAL(future_only.LastSignedHeight(), -1);
+        // A missing future key does not disable the available current key.
+        BOOST_CHECK(!old_only.MaybeSign(Finality(), m_node.chainman->ActiveChain(), params, pool).empty());
+        BOOST_CHECK(old_only.LastError().empty());
+    }
+    Produce(m_vk_a, {MakeCertificate({M + 4, 1, set2.SetHash()}, set1)});
+    ProduceTo(M + 9, m_vk_a);
+    BOOST_REQUIRE_EQUAL(FinalityState().epoch, 2U);
+    {
+        LOCK(cs_main);
+        const CChain& chain{m_node.chainman->ActiveChain()};
+        node::FinalityTracker& tracker{Finality()};
+        FinalitySignaturePool old_pool;
+        const auto previous{old_only.MaybeSign(tracker, chain, params, old_pool)};
+        BOOST_REQUIRE_EQUAL(previous.size(), 3U);
+        for (const auto& sig : previous) BOOST_CHECK_EQUAL(sig.epoch, 1U);
+        // Missing current key is actionable, but did not suppress previous signatures.
+        BOOST_CHECK(old_only.LastError().find(HexStr(rotated.GetPublicKey().Compressed())) != std::string::npos);
+
+        FinalitySignaturePool current_pool;
+        const auto current{future_only.MaybeSign(tracker, chain, params, current_pool)};
+        BOOST_REQUIRE_EQUAL(current.size(), 2U);
+        for (const auto& sig : current) BOOST_CHECK_EQUAL(sig.epoch, 2U);
+        // The key became current without replacing keys or resetting any watermark.
+        BOOST_CHECK(future_only.LastError().empty());
+        BOOST_CHECK_EQUAL(future_only.LastSignedHeight(), M + 9);
+        BOOST_CHECK(future_only.MaybeSign(tracker, chain, params, current_pool).empty());
     }
 }
 

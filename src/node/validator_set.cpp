@@ -24,7 +24,7 @@ std::optional<ValidatorSetSnapshot> ValidatorSetSnapshot::Build(const uint64_t e
         if (w == 0) continue;
         const auto binding{bindings.Get(vk)};
         if (!binding || binding->IsRevoked()) continue;
-        snap.m_members.push_back(ValidatorSetMember{vk, binding->bls_pubkey, w});
+        snap.m_members.push_back(ValidatorSetMember{vk, binding->bls_pubkey, w, binding->seq});
     }
     if (snap.m_members.empty() || snap.m_members.size() > modern::MAX_FINALITY_SET) return std::nullopt;
 

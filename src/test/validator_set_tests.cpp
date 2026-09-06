@@ -114,6 +114,34 @@ BOOST_AUTO_TEST_CASE(build_ordering_weights_exclusions_and_header)
     BOOST_CHECK(e8->SetHash() != snap->SetHash());
 }
 
+BOOST_AUTO_TEST_CASE(binding_sequence_metadata_preserves_consensus_snapshot)
+{
+    const auto key{BlsK(1)};
+    const auto pubkey{key.GetPublicKey().Compressed()};
+    const std::map<node::ValidatorKey, CAmount> weights{{VK(0x01), 333 * UNIT}};
+    FinalityBindingIndex bindings;
+    bindings.ConnectBlock(10, {{VK(0x01), {pubkey, 0, 10}}});
+    const auto original{ValidatorSetSnapshot::Build(1, weights, bindings)};
+    BOOST_REQUIRE(original);
+    BOOST_CHECK_EQUAL(original->Members()[0].binding_seq, 0u);
+
+    // Sequence is validated-chain metadata for wallet key resolution, not
+    // part of the frozen consensus serialization. Rebinding the same public
+    // key at another sequence must leave every consensus commitment intact.
+    bindings.ConnectBlock(11, {{VK(0x01), {pubkey, 1, 11}}});
+    const auto rebound{ValidatorSetSnapshot::Build(1, weights, bindings)};
+    BOOST_REQUIRE(rebound);
+    BOOST_CHECK_EQUAL(rebound->Members()[0].binding_seq, 1u);
+    BOOST_CHECK_EQUAL(original->Members()[0].binding_seq, 0u);
+    BOOST_CHECK(original->Header().Encode() == rebound->Header().Encode());
+    BOOST_CHECK(original->Leaves() == rebound->Leaves());
+    BOOST_CHECK(original->SetHash() == rebound->SetHash());
+    BOOST_CHECK(*original == *rebound);
+    const auto carried{rebound->WithEpoch(2)};
+    BOOST_CHECK_EQUAL(carried.Members()[0].binding_seq, 1u);
+    BOOST_CHECK(carried.Leaves() == rebound->Leaves());
+}
+
 BOOST_AUTO_TEST_CASE(fail_closed_and_immutability)
 {
     FinalityBindingIndex bindings;

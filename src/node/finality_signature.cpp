@@ -11,6 +11,7 @@
 #include <modern/finality_schedule.h>
 #include <node/bridge_state.h>
 #include <node/validator_set.h>
+#include <util/strencodings.h>
 
 #include <algorithm>
 
@@ -239,23 +240,74 @@ size_t FinalitySignaturePool::SignatureCount(const uint64_t epoch, const uint64_
     return it == m_slots.end() ? 0 : it->second.sigs.size();
 }
 
+bool FinalitySigner::SetKeys(
+    const std::vector<bls::SecretKey>& keys,
+    const modern::ValidatorKeyBytes& validator_key, std::string& error)
+{
+    if (keys.empty() || keys.size() > MAX_KEYS) {
+        error = strprintf("finality signer requires between 1 and %u snapshot keys", MAX_KEYS);
+        return false;
+    }
+    std::vector<SigningKey> selected;
+    for (const auto& key : keys) {
+        const auto pubkey{key.GetPublicKey().Compressed()};
+        if (std::none_of(selected.begin(), selected.end(), [&](const SigningKey& entry) {
+                return entry.pubkey == pubkey;
+            })) {
+            selected.push_back({key, pubkey});
+        }
+    }
+    m_keys = std::move(selected);
+    m_validator_key = validator_key;
+    m_store = FinalitySignerStore{};
+    m_last_signed = -1;
+    m_error.clear();
+    m_key_error.clear();
+    m_permanent_error = false;
+    error.clear();
+    return true;
+}
+
+const bls::SecretKey* FinalitySigner::KeyFor(
+    const std::array<unsigned char, bls::PUBKEY_SIZE>& pubkey) const
+{
+    const auto found{std::find_if(m_keys.begin(), m_keys.end(), [&](const SigningKey& entry) {
+        return entry.pubkey == pubkey;
+    })};
+    return found == m_keys.end() ? nullptr : &found->secret;
+}
+
 bool FinalitySigner::SetKeyPersistent(
     const bls::SecretKey& key,
     const modern::ValidatorKeyBytes& validator_key,
     const uint256& chain_domain, const fs::path& store_directory,
     std::string& error)
 {
+    return SetKeysPersistent({key}, validator_key, chain_domain, store_directory, error);
+}
+
+bool FinalitySigner::SetKeysPersistent(
+    const std::vector<bls::SecretKey>& keys,
+    const modern::ValidatorKeyBytes& validator_key,
+    const uint256& chain_domain, const fs::path& store_directory,
+    std::string& error)
+{
+    // Prepare keys without touching the live signer or its journal. Invalid
+    // input or an unsafe existing record must leave both unchanged.
+    FinalitySigner candidate;
+    if (!candidate.SetKeys(keys, validator_key, error)) return false;
     FinalitySignerStore store;
     if (!store.Open(store_directory, chain_domain, validator_key, error)) {
         return false;
     }
-    m_key = key;
+    m_keys = std::move(candidate.m_keys);
     m_validator_key = validator_key;
     m_store = std::move(store);
     m_last_signed = m_store.State()
                         ? m_store.State()->last_signed_height
                         : -1;
     m_error.clear();
+    m_key_error.clear();
     m_permanent_error = false;
     return true;
 }
@@ -594,7 +646,7 @@ std::vector<FinalitySig> FinalitySigner::MaybeSign(const FinalityTracker& tracke
                                                    const BridgeStateIndex* bridge_index)
 {
     std::vector<FinalitySig> out;
-    if (!m_key || !params.legacy_b3coin || !params.modern_pos) return out;
+    if (m_keys.empty() || !params.legacy_b3coin || !params.modern_pos) return out;
     if (!EnsurePersistentSafety(tracker, chain, params, bridge_index)) {
         return out;
     }
@@ -604,6 +656,26 @@ std::vector<FinalitySig> FinalitySigner::MaybeSign(const FinalityTracker& tracke
     const Consensus::ModernPosParams& pos{*params.modern_pos};
     const FinalityTracker::State& state{tracker.Current()};
     if (!state.bootstrapped || state.lineage_broken) return out;
+
+    // A loaded rotation key does not mean this validator can currently sign.
+    // Report the exact missing active key, but still permit any available
+    // previous-epoch key below. Re-evaluate every pass so a future key becomes
+    // usable automatically when its snapshot takes effect.
+    std::string key_error;
+    if (state.current) {
+        if (const auto index{state.current->IndexOf(m_validator_key)}) {
+            const auto& expected{state.current->Members()[*index].bls_pubkey};
+            if (!KeyFor(expected)) {
+                key_error = strprintf(
+                    "missing finality private key for current epoch %u snapshot BLS public key %s; unlock the wallet containing this original key and restart staking, preserving the existing finality_signer journal",
+                    state.epoch, HexStr(expected));
+            }
+        }
+    }
+    if (!key_error.empty() && key_error != m_key_error) {
+        LogError("finality signer: %s", key_error);
+    }
+    m_key_error = std::move(key_error);
 
     int deepest{m_last_signed};
     if (state.finalized) deepest = std::max(deepest, state.finalized->height);
@@ -622,16 +694,15 @@ std::vector<FinalitySig> FinalitySigner::MaybeSign(const FinalityTracker& tracke
         const int rem{(h - *modern_start) % pos.checkpoint_interval};
         if (rem != 0) h += pos.checkpoint_interval - rem;
     }
-    const auto pk{m_key->GetPublicKey().Compressed()};
     for (; h <= signable_to; h += pos.checkpoint_interval) {
         const auto epoch{modern::EpochOfHeight(state.epoch_starts, h)};
         if (!epoch) continue;
         const ValidatorSetSnapshot* set{SetForEpoch(state, *epoch)};
         if (!set) continue;
         const auto index{set->IndexOf(m_validator_key)};
-        // Not a member of the set in force, or the snapshot records a
-        // different (pre-rotation) BLS key than ours: do not sign.
-        if (!index || set->Members()[*index].bls_pubkey != pk) continue;
+        if (!index) continue;
+        const bls::SecretKey* key{KeyFor(set->Members()[*index].bls_pubkey)};
+        if (!key) continue;
         const auto fb{FinalitySignaturePool::ExpectedFinalizedBlock(
             *epoch, static_cast<uint64_t>(h), state, chain, params,
             bridge_index)};
@@ -644,7 +715,7 @@ std::vector<FinalitySig> FinalitySigner::MaybeSign(const FinalityTracker& tracke
         sig.epoch = *epoch;
         sig.height = static_cast<uint64_t>(h);
         sig.index = *index;
-        sig.signature = m_key->Sign(std::span<const unsigned char>(digest.begin(), 32)).Compressed();
+        sig.signature = key->Sign(std::span<const unsigned char>(digest.begin(), 32)).Compressed();
         // Crash safety and fork safety come before every externally usable
         // signature. In production, atomically persist the exact vote and its
         // ancestry lock before adding it even to the node-local pool. A pool

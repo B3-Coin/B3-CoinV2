@@ -973,15 +973,15 @@ public:
         return bool{chainman().CurrentChainstate().m_from_snapshot_blockhash};
     }
     bool startStaking(const CKey& validator_key, const CScript& coinbase_script,
-                      const std::optional<bls::SecretKey>& finality_key,
+                      const std::vector<bls::SecretKey>& finality_keys,
                       std::string& error) override
     {
         if (!m_node.staking) {
             error = "staking is not available in this node";
             return false;
         }
-        return m_node.staking->StartWithFinalityKey(validator_key, coinbase_script,
-                                                    finality_key, error);
+        return m_node.staking->StartWithFinalityKeys(validator_key, coinbase_script,
+                                                     finality_keys, error);
     }
     void stopStaking() override
     {
@@ -1063,6 +1063,21 @@ public:
             }
         }
         if (state.next) out.next_set_hash = state.next->SetHash();
+
+        // A pending rotation/revocation changes the live binding immediately,
+        // but checkpoint signing must keep using the key frozen into each
+        // epoch. Expose only public, validated snapshot metadata to the wallet.
+        if (validator_key) {
+            for (const auto& snapshot : {state.current, state.previous, state.next}) {
+                if (!snapshot) continue;
+                if (const auto index{snapshot->IndexOf(*validator_key)}) {
+                    const auto& member{snapshot->Members()[*index]};
+                    out.signing_keys.push_back(interfaces::FinalitySigningKey{
+                        snapshot->Epoch(), member.binding_seq,
+                        {member.bls_pubkey.begin(), member.bls_pubkey.end()}});
+                }
+            }
+        }
 
         // Preserve the exact one-time Set_0 handoff object independently of
         // the rolling {current, previous} certificate window. The contract's

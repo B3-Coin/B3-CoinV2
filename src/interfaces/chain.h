@@ -98,6 +98,14 @@ enum class SettingsAction {
 
 using SettingsUpdate = std::function<std::optional<interfaces::SettingsAction>(common::SettingsValue&)>;
 
+//! Public key-resolution data from an immutable validator snapshot. The
+//! sequence is derived metadata; the snapshot public key must also match.
+struct FinalitySigningKey {
+    uint64_t epoch{0};
+    uint32_t binding_seq{0};
+    std::vector<unsigned char> bls_pubkey;
+};
+
 //! B3 modern-era finality status (see Chain::finalityStatus): the epoch
 //! state machine, the finalized checkpoint and persisted pin, the local
 //! signature pool, and -- when a validator key is given -- its FINALITY_KEY
@@ -139,6 +147,9 @@ struct FinalityStatus {
     int binding_height{-1};
     bool in_current_set{false};
     uint64_t member_weight{0};
+    //! Current, previous and prepared next snapshot keys for this validator.
+    //! May differ from the latest on-chain binding after a pending rotation.
+    std::vector<FinalitySigningKey> signing_keys;
 };
 
 //! B3 Modern PoS staking status (see Chain::stakingStatus).
@@ -579,7 +590,7 @@ public:
     //! 2026-08-23): start the node's automatic staking loop with the wallet's
     //! validator secret key and the script that receives block fees.
     virtual bool startStaking(const CKey& validator_key, const CScript& coinbase_script,
-                              const std::optional<bls::SecretKey>& finality_key,
+                              const std::vector<bls::SecretKey>& finality_keys,
                               std::string& error) = 0;
     //! Stop the staking loop (no-op if not running).
     virtual void stopStaking() = 0;
