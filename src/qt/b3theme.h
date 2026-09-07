@@ -6,6 +6,7 @@
 #define BITCOIN_QT_B3THEME_H
 
 #include <QColor>
+#include <QIcon>
 #include <QString>
 
 class QApplication;
@@ -58,6 +59,9 @@ bool reducedMotion();
 
 //! The global application stylesheet implementing the visual system.
 QString styleSheet();
+
+//! Explicit normal/disabled glyph colors for dark, icon-only form actions.
+QIcon formActionIcon(const QString& resource);
 
 //! Apply the palette + stylesheet to the application once at startup.
 void apply(QApplication& app);

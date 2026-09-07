@@ -672,6 +672,84 @@ def store_snapshot_fingerprint(snapshot):
         snapshot, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def light_client_waiting_finality(node, info, eth_chain, trusted_root,
+                                  start_block=None):
+    """Recognize a canonical but not yet B3-finalized LC connection.
+
+    getbridgeinfo describes the active chain, whereas getbridgelightclientstore
+    exports only a B3-finalized store. Do not compare those two generations or
+    construct a synthetic merged store. This gate can only postpone work; once
+    the connection is finalized, the normal exact snapshot checks still apply.
+    """
+    def bounded_quantity(value, maximum):
+        # bool is an int subclass in Python, but never a valid RPC quantity.
+        if isinstance(value, bool):
+            raise RelayerError("B3 light-client/finality quantity is a boolean")
+        number = quantity(value)
+        if not 0 <= number <= maximum:
+            raise RelayerError("B3 light-client/finality quantity is out of range")
+        return number
+
+    # B3 getblockhash heights are signed 32-bit; Ethereum LC fields are uint64.
+    max_height, max_uint64 = (1 << 31) - 1, (1 << 64) - 1
+
+    def observation(value):
+        try:
+            if not all(value.get(name) is True for name in (
+                    "active", "state_available", "light_client_bootstrapped")):
+                raise RelayerError("B3 active light-client state is unavailable")
+            identity = bridge_identity(value, eth_chain, trusted_root)
+            if (start_block is not None and
+                    start_block != identity["origin_deployment_block"]):
+                raise RelayerError("--start-block does not match B3 origin_deployment_block")
+            numbers = {name: bounded_quantity(
+                value[name], max_height if name == "light_client_connected_height"
+                else max_uint64) for name in (
+                "light_client_connected_height", "light_client_period",
+                "finalized_beacon_slot", "finalized_execution_block")}
+            hashes = {name: norm_hex(value[name], 32, False) for name in (
+                "light_client_connected_block", "current_sync_committee_root",
+                "finalized_beacon_root", "finalized_execution_hash")}
+            hashes["next_sync_committee_root"] = (
+                norm_hex(value["next_sync_committee_root"], 32, False)
+                if "next_sync_committee_root" in value else None)
+            return identity, numbers, hashes
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            raise RelayerError("malformed B3 active light-client state") from e
+
+    def finality():
+        try:
+            checkpoint = node.call("getfinalitystatus")["finalized"]
+            height = bounded_quantity(checkpoint["height"], max_height)
+            block_hash = norm_hex(checkpoint["hash"], 32, False)
+            return height, block_hash
+        except (KeyError, TypeError, ValueError) as e:
+            raise RelayerError("B3 finalized checkpoint is unavailable or malformed") from e
+
+    initial = observation(info)
+    finalized = finality()
+    connected_height = initial[1]["light_client_connected_height"]
+    connected_hash = initial[2]["light_client_connected_block"]
+
+    def check_canonical():
+        if active_block_hash(node, connected_height) != connected_hash:
+            raise RelayerError("B3 light-client connection is not on the active chain; retry")
+        if active_block_hash(node, finalized[0]) != finalized[1]:
+            raise RelayerError("B3 finalized checkpoint is not on the active chain; retry")
+
+    check_canonical()
+    if observation(node.call("getbridgeinfo")) != initial:
+        raise RelayerError("B3 light-client state changed while checking finality; retry")
+    if finality() != finalized:
+        raise RelayerError("B3 finality changed while checking the light-client connection; retry")
+    check_canonical()
+    if connected_height <= finalized[0]:
+        return False
+    log("light_client_waiting_finality", connected_height=connected_height,
+        connected_block=connected_hash, finalized_height=finalized[0])
+    return True
+
+
 def validate_execution_anchor(snapshot, requested_target):
     """Normalize one B3-finalized retained execution-anchor selection."""
     try:
@@ -1512,6 +1590,13 @@ def process_jobs(state, node, wallet, required, dry_run,
 
 def run_once(args, state, eth, witnesses, node, wallet, prefix):
     info = node.call("getbridgeinfo")
+    # A newly connected LC effect may be ahead of the finalized export. Wait
+    # before any provider/proof requests, wallet calls, or durable-state changes.
+    if (info.get("light_client_bootstrapped") and
+            light_client_waiting_finality(
+                node, info, args.ethereum_chain_id, args.trusted_root,
+                args.start_block)):
+        return
     eth_chain = quantity(eth.call("eth_chainId"))
     if eth_chain != args.ethereum_chain_id:
         raise RelayerError(f"Ethereum chain id {eth_chain} is not {args.ethereum_chain_id}")

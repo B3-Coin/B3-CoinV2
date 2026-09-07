@@ -7,6 +7,7 @@
 
 #include <qt/addressbookpage.h>
 #include <qt/addresstablemodel.h>
+#include <qt/b3theme.h>
 #include <qt/guiutil.h>
 #include <qt/optionsmodel.h>
 #include <qt/platformstyle.h>
@@ -22,9 +23,13 @@ SendCoinsEntry::SendCoinsEntry(const PlatformStyle *_platformStyle, QWidget *par
 {
     ui->setupUi(this);
 
-    ui->addressBookButton->setIcon(platformStyle->SingleColorIcon(":/icons/address-book"));
-    ui->pasteButton->setIcon(platformStyle->SingleColorIcon(":/icons/editpaste"));
-    ui->deleteButton->setIcon(platformStyle->SingleColorIcon(":/icons/remove"));
+    for (auto* button : {ui->addressBookButton, ui->pasteButton, ui->deleteButton}) {
+        button->setProperty("b3variant", QStringLiteral("recipientAction"));
+        button->setFocusPolicy(Qt::StrongFocus);
+    }
+    ui->addressBookButton->setIcon(B3Theme::formActionIcon(QStringLiteral(":/icons/address-book")));
+    ui->pasteButton->setIcon(B3Theme::formActionIcon(QStringLiteral(":/icons/editpaste")));
+    ui->deleteButton->setIcon(B3Theme::formActionIcon(QStringLiteral(":/icons/remove")));
 
     if (platformStyle->getUseExtraSpacing())
         ui->payToLayout->setSpacing(4);
@@ -215,9 +220,9 @@ void SendCoinsEntry::updateDisplayUnit()
 void SendCoinsEntry::changeEvent(QEvent* e)
 {
     if (e->type() == QEvent::PaletteChange) {
-        ui->addressBookButton->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/address-book")));
-        ui->pasteButton->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/editpaste")));
-        ui->deleteButton->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/remove")));
+        ui->addressBookButton->setIcon(B3Theme::formActionIcon(QStringLiteral(":/icons/address-book")));
+        ui->pasteButton->setIcon(B3Theme::formActionIcon(QStringLiteral(":/icons/editpaste")));
+        ui->deleteButton->setIcon(B3Theme::formActionIcon(QStringLiteral(":/icons/remove")));
     }
 
     QWidget::changeEvent(e);

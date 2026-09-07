@@ -269,6 +269,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/finality_pin.cpp
   node/finality_signer_store.cpp
   node/finality_signature.cpp
+  node/finality_transport.cpp
   node/finality_tracker.cpp
   node/validator_set.cpp
   node/stake_registry.cpp

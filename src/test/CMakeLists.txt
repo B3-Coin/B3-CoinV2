@@ -134,6 +134,7 @@ add_executable(test_bitcoin
   finality_signer_store_tests.cpp
   finality_signer_recovery_tests.cpp
   finality_signature_tests.cpp
+  finality_transport_tests.cpp
   finality_production_tests.cpp
   finality_operations_tests.cpp
   finality_activation_tests.cpp

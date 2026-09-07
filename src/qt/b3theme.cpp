@@ -10,7 +10,10 @@
 
 #include <QApplication>
 #include <QByteArray>
+#include <QImage>
 #include <QPalette>
+#include <QPainter>
+#include <QPixmap>
 #include <QString>
 #include <QWidget>
 
@@ -178,6 +181,20 @@ QPushButton[b3variant="timeframe"]:checked {
     background: %ACCENTMUTED%; color: %ACCENT%; border-color: #4c4021;
 }
 
+/* Only the send form's icon actions, not sidebar or other tool buttons.
+   Native macOS/Windows tool-button surfaces can otherwise stay white. */
+QToolButton[b3variant="recipientAction"] {
+    background: %CARD%; color: %TEXT%;
+    border: %BW%px solid %BORDER%; border-radius: %RSM%px;
+    min-width: 22px; min-height: 22px; padding: 5px;
+}
+QToolButton[b3variant="recipientAction"]:hover:enabled { background: %CARDHOVER%; }
+QToolButton[b3variant="recipientAction"]:pressed:enabled { background: %ACCENTMUTED%; }
+QToolButton[b3variant="recipientAction"]:focus:enabled { border-color: %ACCENT%; }
+QToolButton[b3variant="recipientAction"]:disabled {
+    background: %SURFACE%; color: %MUTED%; border-color: %BORDER%;
+}
+
 /* Trading remains a deliberately inert preview. Make that boundary more
    prominent than any individual ticket control. */
 #tradePreviewBadge {
@@ -252,6 +269,32 @@ QProgressBar::chunk { background: %ACCENT%; border-radius: %RSM%px; }
         .replace("%RMD%", QString::number(kRadiusMd))
         .replace("%RLG%", QString::number(kRadiusLg))
         .replace("%BW%", QString::number(kBorderWidth));
+}
+
+QIcon formActionIcon(const QString& resource)
+{
+    const QImage source{resource};
+    if (source.isNull()) return {};
+    const auto tinted = [&](const QColor& color) {
+        QImage image{source.size(), QImage::Format_ARGB32_Premultiplied};
+        image.setDevicePixelRatio(source.devicePixelRatio());
+        image.fill(Qt::transparent);
+        QPainter painter{&image};
+        painter.drawImage(0, 0, source);
+        painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+        painter.fillRect(image.rect(), color);
+        painter.end();
+        return QPixmap::fromImage(image);
+    };
+    // Do not rely on native icon tinting: Windows retains the black source,
+    // and native disabled-icon generation can lose contrast on dark surfaces.
+    const QPixmap normal{tinted(kTextPrimary)};
+    QIcon icon;
+    for (const auto mode : {QIcon::Normal, QIcon::Active, QIcon::Selected}) {
+        icon.addPixmap(normal, mode);
+    }
+    icon.addPixmap(tinted(kTextMuted), QIcon::Disabled);
+    return icon;
 }
 
 void apply(QApplication& app)

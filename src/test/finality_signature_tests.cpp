@@ -48,6 +48,90 @@ FinalitySig Sig(const node::FinalityTracker::State& state, const CChain& chain, 
 
 BOOST_AUTO_TEST_SUITE(finality_signature_tests)
 
+BOOST_FIXTURE_TEST_CASE(verified_observations_and_exact_replay_exclude_shallow_and_finalized, FinalityChainFixture)
+{
+    PrepareFinalityChain();
+    const int M{m_M};
+    ProduceTo(M + 6, m_vk_a);
+    const auto& params{m_node.chainman->GetConsensus()};
+    FinalitySignaturePool pool;
+    FinalitySig early;
+    {
+        LOCK(cs_main);
+        const auto& chain{m_node.chainman->ActiveChain()};
+        auto& tracker{Finality()};
+        const auto idx_a{*tracker.Current().current->IndexOf(m_vk_a)};
+        early = Sig(tracker.Current(), chain, m_domain, 0, M + 5, idx_a, m_bls_a);
+        BOOST_CHECK(pool.Submit(early, tracker, chain, params) == Accept::TOO_SHALLOW);
+        BOOST_CHECK(pool.VerifiedCheckpoints(tracker, chain, params).empty());
+        BOOST_CHECK(pool.RelayableSignatures(tracker, chain, params).empty());
+    }
+    ProduceTo(M + 8, m_vk_a);
+    {
+        LOCK(cs_main);
+        const auto& chain{m_node.chainman->ActiveChain()};
+        auto& tracker{Finality()};
+        const auto& state{tracker.Current()};
+        const auto idx_a{*state.current->IndexOf(m_vk_a)};
+        const auto idx_b{*state.current->IndexOf(m_vk_b)};
+        const auto other{Sig(state, chain, m_domain, 0, M + 5, idx_b, m_bls_b)};
+        const auto older{Sig(state, chain, m_domain, 0, M, idx_a, m_bls_a)};
+        // The identical early bytes become valid at depth; no new signing is required.
+        BOOST_CHECK(pool.Submit(early, tracker, chain, params) == Accept::ACCEPTED);
+        BOOST_CHECK(pool.Submit(other, tracker, chain, params) == Accept::ACCEPTED);
+        BOOST_CHECK(pool.Submit(older, tracker, chain, params) == Accept::ACCEPTED);
+        const auto observed{pool.VerifiedCheckpoints(tracker, chain, params)};
+        BOOST_REQUIRE_EQUAL(observed.size(), 2U);
+        BOOST_CHECK_EQUAL(observed[0].checkpoint.height, static_cast<uint64_t>(M + 5));
+        BOOST_CHECK(observed[0].checkpoint.block_hash == chain[M + 5]->GetBlockHash());
+        BOOST_CHECK(observed[0].signing_set_hash == state.current->SetHash());
+        BOOST_CHECK_EQUAL(observed[0].validator_count, 2U);
+        BOOST_CHECK_EQUAL(observed[0].quorum_count, 2U);
+        BOOST_CHECK_EQUAL(observed[0].total_weight, 16U);
+        BOOST_CHECK_EQUAL(observed[0].quorum_weight, 11U);
+        BOOST_CHECK_EQUAL(observed[0].signed_weight, 16U);
+        BOOST_CHECK_EQUAL(observed[0].signer_indices.size(), 2U);
+        BOOST_CHECK_EQUAL(observed[1].checkpoint.height, static_cast<uint64_t>(M));
+        BOOST_CHECK_EQUAL(observed[1].signed_weight, 15U);
+        BOOST_CHECK_EQUAL(observed[1].signer_indices.size(), 1U);
+        const auto replay{pool.RelayableSignatures(tracker, chain, params)};
+        BOOST_REQUIRE_EQUAL(replay.size(), 3U);
+        BOOST_CHECK(replay[0] == (idx_a < idx_b ? early : other));
+        BOOST_CHECK(replay[1] == (idx_a < idx_b ? other : early));
+        BOOST_CHECK(replay[2] == older);
+        FinalitySignaturePool receiver;
+        for (const auto& sig : replay) {
+            BOOST_CHECK(receiver.Submit(sig, tracker, chain, params) == Accept::ACCEPTED);
+        }
+        BOOST_CHECK(receiver.BestCertificate(tracker, chain, params).has_value());
+        BOOST_CHECK(pool.RelayableSignatures(tracker, chain, params) == replay);
+        // Roll back the observed tip without changing the checkpoint hash:
+        // formerly accepted M+5 is now shallow and must not be exported.
+        CChain shorter;
+        shorter.SetTip(*chain[M + 6]);
+        node::FinalityTracker earlier;
+        BOOST_REQUIRE(earlier.Sync(shorter, m_node.chainman->m_blockman, params, *shorter.Tip()));
+        const auto shallow_observation{pool.VerifiedCheckpoints(earlier, shorter, params)};
+        BOOST_REQUIRE_EQUAL(shallow_observation.size(), 1U);
+        BOOST_CHECK_EQUAL(shallow_observation[0].checkpoint.height, static_cast<uint64_t>(M));
+        const auto shallow_replay{pool.RelayableSignatures(earlier, shorter, params)};
+        BOOST_REQUIRE_EQUAL(shallow_replay.size(), 1U);
+        BOOST_CHECK(shallow_replay[0] == older);
+    }
+    const auto set0{*FinalityState().current};
+    const auto next_hash{FinalityState().next->SetHash()};
+    Produce(m_vk_a, {MakeCertificate({M + 5, 0, next_hash}, set0)});
+    {
+        LOCK(cs_main);
+        const auto& chain{m_node.chainman->ActiveChain()};
+        auto& tracker{Finality()};
+        // Read-only exports suppress obsolete slots without relying on a new submission.
+        BOOST_CHECK_EQUAL(pool.TrackedCheckpoints(), 2U);
+        BOOST_CHECK(pool.VerifiedCheckpoints(tracker, chain, params).empty());
+        BOOST_CHECK(pool.RelayableSignatures(tracker, chain, params).empty());
+    }
+}
+
 BOOST_FIXTURE_TEST_CASE(pool_verifies_dedupes_bounds_and_aggregates, FinalityChainFixture)
 {
     PrepareFinalityChain();
@@ -678,6 +762,8 @@ BOOST_FIXTURE_TEST_CASE(pool_replaces_same_checkpoint_after_prefinality_reorg, F
         // The old branch had quorum, but it must stop being eligible before a
         // replacement signature has arrived.
         BOOST_CHECK(!pool.BestCertificate(tracker, chain, params).has_value());
+        BOOST_CHECK(pool.VerifiedCheckpoints(tracker, chain, params).empty());
+        BOOST_CHECK(pool.RelayableSignatures(tracker, chain, params).empty());
         BOOST_CHECK(pool.Submit(old_a, tracker, chain, params) ==
                     Accept::BAD_SIGNATURE);
         BOOST_CHECK_EQUAL(pool.SignatureCount(0, M + 5), 0U);

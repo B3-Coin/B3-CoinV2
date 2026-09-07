@@ -10,7 +10,7 @@ import tempfile
 import traceback
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import b3_bridge_relayer as relayer
@@ -1159,6 +1159,198 @@ class RelayerTests(unittest.TestCase):
             relayer.audit_confirmed(state, node, FakeRpc(), 1)
             self.assertEqual(state.first()["state"], "planned")
             self.assertIsNone(state.first()["effect_height"])
+
+
+class FinalitySequencingTests(unittest.TestCase):
+    def setUp(self):
+        self.info = {**bridge_info(), "active": True, "state_available": True,
+                     "light_client_bootstrapped": True,
+                     "light_client_connected_height": 120,
+                     "light_client_connected_block": H32,
+                     "light_client_period": 1,
+                     "current_sync_committee_root": ROOT_A,
+                     "next_sync_committee_root": ROOT_B,
+                     "finalized_beacon_slot": 8192,
+                     "finalized_beacon_root": ROOT_A,
+                     "finalized_execution_block": 100,
+                     "finalized_execution_hash": H32}
+        self.finalized = {"height": 110, "hash": ROOT_B}
+        self.snapshot = {
+            "version": 1, "connection": {"height": 120, "block_hash": H32},
+            "b3_finalized": {"height": 130, "block_hash": ROOT_A},
+            "store": {"period": 1, "finalized_header": {
+                "beacon": {"slot": 8192},
+                "execution": {"block_number": 100, "block_hash": H32}}}}
+        self.node = FakeRpc({
+            "getbridgeinfo": lambda _: self.info,
+            "getfinalitystatus": lambda _: {"finalized": self.finalized},
+            "getblockhash": lambda params: {110: ROOT_B, 120: H32,
+                                             130: ROOT_A}[params[0]],
+            "getbridgelightclientstore": lambda _: self.snapshot,
+        })
+        self.primary = FakeRpc({"eth_chainId": "0x1", "eth_getCode": pinned_code,
+                                "eth_getBlockByNumber": {"hash": H32}})
+        self.witness = FakeRpc(dict(self.primary.replies))
+        self.wallet = FakeRpc()
+        self.state = Mock()
+        self.state.confirmed.return_value = []
+        self.args = SimpleNamespace(
+            ethereum_chain_id=1, trusted_root=ROOT_B, start_block=None,
+            b3_confirmations=1, beacon_url="https://beacon.invalid",
+            payload_tool="ethcheck", dry_run=True, max_fee_atoms=None,
+            daily_fee_budget_atoms=None)
+
+    def run_once(self):
+        relayer.run_once(self.args, self.state, self.primary, [self.witness],
+                         self.node, self.wallet, 63)
+
+    def assert_no_external_work(self):
+        self.assertEqual(self.primary.calls, [])
+        self.assertEqual(self.witness.calls, [])
+        self.assertEqual(self.wallet.calls, [])
+        self.assertEqual(self.state.mock_calls, [])
+
+    def test_canonical_unfinalized_connection_waits_before_providers_or_state(self):
+        # This is a legitimate older finalized export, not the active LC state.
+        self.snapshot["connection"] = {"height": 80, "block_hash": ROOT_A}
+        with (patch.object(relayer, "capture_common") as capture,
+              patch.object(relayer, "log") as event):
+            self.run_once()
+            capture.assert_not_called()
+            event.assert_called_once_with(
+                "light_client_waiting_finality", connected_height=120,
+                connected_block=H32[2:], finalized_height=110)
+        self.assert_no_external_work()
+        self.assertNotIn("getbridgelightclientstore", [m for m, _ in self.node.calls])
+
+    def test_stale_connection_hash_is_not_classified_as_wait(self):
+        self.info["light_client_connected_block"] = ROOT_A
+        with self.assertRaisesRegex(relayer.RelayerError, "connection is not on the active chain"):
+            self.run_once()
+        self.assert_no_external_work()
+
+    def test_stale_finalized_hash_is_not_classified_as_wait(self):
+        self.finalized["hash"] = ROOT_A
+        with self.assertRaisesRegex(relayer.RelayerError, "finalized checkpoint is not on the active chain"):
+            self.run_once()
+        self.assert_no_external_work()
+
+    def test_light_client_and_pin_races_fail_closed(self):
+        for field, changed in (("light_client_connected_height", 121),
+                               ("finalized_execution_hash", ROOT_A),
+                               ("next_sync_committee_root", ROOT_A),
+                               ("registry_id", ROOT_A)):
+            with self.subTest(field=field):
+                observations = iter([self.info, {**self.info, field: changed}])
+                self.node.replies["getbridgeinfo"] = lambda _: next(observations)
+                with self.assertRaisesRegex(relayer.RelayerError, "state changed while checking finality"):
+                    self.run_once()
+                self.assert_no_external_work()
+
+    def test_finality_catching_up_during_check_requires_retry(self):
+        observations = iter([self.finalized, {"height": 130, "hash": ROOT_A}])
+        self.node.replies["getfinalitystatus"] = lambda _: {"finalized": next(observations)}
+        with self.assertRaisesRegex(relayer.RelayerError, "finality changed while checking"):
+            self.run_once()
+        self.assert_no_external_work()
+
+    def test_reorg_during_canonical_recheck_requires_retry(self):
+        hashes = iter([H32, ROOT_B, ROOT_A])
+        self.node.replies["getblockhash"] = lambda _: next(hashes)
+        with self.assertRaisesRegex(relayer.RelayerError, "connection is not on the active chain"):
+            self.run_once()
+        self.assert_no_external_work()
+
+    def test_missing_finality_or_light_client_state_fails_closed(self):
+        for missing in ("finality", "light_client_connected_block", "state_available"):
+            with self.subTest(missing=missing):
+                info, finalized = dict(self.info), self.finalized
+                if missing == "finality":
+                    self.finalized = None
+                else:
+                    self.info.pop(missing)
+                with self.assertRaises(relayer.RelayerError):
+                    self.run_once()
+                self.assert_no_external_work()
+                self.info, self.finalized = info, finalized
+
+    def test_config_mismatch_is_not_hidden_by_wait(self):
+        self.args.start_block = 51
+        with self.assertRaisesRegex(relayer.RelayerError, "start-block does not match"):
+            self.run_once()
+        self.assert_no_external_work()
+
+    def test_boolean_or_out_of_range_quantities_fail_closed(self):
+        for field in ("light_client_connected_height", "light_client_period",
+                      "finalized_beacon_slot", "finalized_execution_block"):
+            original = self.info[field]
+            maximum = (1 << 31) - 1 if field == "light_client_connected_height" else (1 << 64) - 1
+            for value in (True, False, -1, maximum + 1, str(maximum + 1)):
+                with self.subTest(field=field, value=value):
+                    self.info[field] = value
+                    with self.assertRaisesRegex(relayer.RelayerError, "quantity is (a boolean|out of range)"):
+                        self.run_once()
+                    self.assert_no_external_work()
+            self.info[field] = original
+        for value in (True, False, -1, 1 << 31, str(1 << 64)):
+            with self.subTest(field="b3_finalized_height", value=value):
+                self.finalized["height"] = value
+                with self.assertRaisesRegex(relayer.RelayerError, "quantity is (a boolean|out of range)"):
+                    self.run_once()
+                self.assert_no_external_work()
+
+    def test_finalized_connection_still_requires_exact_store_match(self):
+        self.snapshot["connection"] = {"height": 80, "block_hash": ROOT_A}
+        for height, block_hash in ((120, H32), (130, ROOT_A)):
+            self.finalized = {"height": height, "hash": block_hash}
+            with (self.subTest(finalized_height=height),
+                  patch.object(relayer, "capture_common") as capture):
+                with self.assertRaisesRegex(relayer.RelayerError, "store disagrees with getbridgeinfo"):
+                    self.run_once()
+                capture.assert_not_called()
+        self.state.add_plan.assert_not_called()
+        self.assertEqual(self.wallet.calls, [])
+
+    def run_finalized_plan(self, directory, capture, emit):
+        self.args.work_root = directory
+        self.finalized = {"height": 130, "hash": ROOT_A}
+        capture.return_value = ({}, None, [], {}, 100, H32, self.snapshot)
+        emit.return_value = {"store": store("store", "01", 8192),
+                             "updates": [store("update", "02", 8224)],
+                             "backfills": []}
+        self.run_once()
+
+    def test_wait_automatically_proceeds_when_connection_is_finalized(self):
+        with patch.object(relayer, "log"):
+            self.run_once()
+        self.assert_no_external_work()
+        with (tempfile.TemporaryDirectory() as directory,
+              patch.object(relayer, "capture_common") as capture,
+              patch.object(relayer, "write_common"),
+              patch.object(relayer, "emit_plan") as emit,
+              patch.object(relayer, "process_jobs") as process):
+            self.run_finalized_plan(directory, capture, emit)
+            capture.assert_called_once_with("https://beacon.invalid", ROOT_B,
+                                            self.info, self.snapshot)
+            self.state.add_plan.assert_called_once_with(emit.return_value["updates"])
+            process.assert_called_once_with(self.state, self.node, self.wallet,
+                                            1, True, None, None)
+        self.assertEqual(self.wallet.calls, [])
+
+    def test_finalized_store_fingerprint_race_is_still_rejected(self):
+        changed = {**self.snapshot, "b3_finalized": {"height": 140, "block_hash": ROOT_B}}
+        snapshots = iter([self.snapshot, changed])
+        self.node.replies["getbridgelightclientstore"] = lambda _: next(snapshots)
+        with (tempfile.TemporaryDirectory() as directory,
+              patch.object(relayer, "capture_common") as capture,
+              patch.object(relayer, "write_common"),
+              patch.object(relayer, "emit_plan") as emit,
+              patch.object(relayer, "process_jobs") as process):
+            with self.assertRaisesRegex(relayer.RelayerError, "store changed while assembling"):
+                self.run_finalized_plan(directory, capture, emit)
+            process.assert_not_called()
+        self.state.add_plan.assert_not_called()
+        self.assertEqual(self.wallet.calls, [])
 
 
 if __name__ == "__main__":

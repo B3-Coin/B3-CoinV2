@@ -240,6 +240,70 @@ size_t FinalitySignaturePool::SignatureCount(const uint64_t epoch, const uint64_
     return it == m_slots.end() ? 0 : it->second.sigs.size();
 }
 
+std::vector<FinalitySignaturePool::CheckpointStatus>
+FinalitySignaturePool::VerifiedCheckpoints(
+    const FinalityTracker& tracker, const CChain& chain,
+    const Consensus::Params& params, const BridgeStateIndex* bridge_index) const
+{
+    std::vector<CheckpointStatus> out;
+    const auto* tip{chain.Tip()};
+    const auto start{Consensus::ModernPosStartHeight(params)};
+    const auto domain{params.legacy_final_hash
+                          ? modern::ModernChainDomain(params.hashGenesisBlock,
+                                                      *params.legacy_final_hash)
+                          : std::nullopt};
+    if (!params.legacy_b3coin || !params.modern_pos || !tip || !start || !domain) return out;
+    const auto& state{tracker.Current()};
+    for (auto it{m_slots.rbegin()}; it != m_slots.rend(); ++it) {
+        const auto [epoch, height]{it->first};
+        if (height > static_cast<uint64_t>(tip->nHeight) ||
+            (state.finalized && height <= static_cast<uint64_t>(state.finalized->height))) continue;
+        const int h{static_cast<int>(height)};
+        const auto* set{SetForEpoch(state, epoch)};
+        const auto checkpoint_epoch{modern::EpochOfHeight(state.epoch_starts, h)};
+        if (!set || !checkpoint_epoch || *checkpoint_epoch != epoch ||
+            !modern::IsCheckpointHeight(h, *start, params.modern_pos->checkpoint_interval) ||
+            !modern::CheckpointDepthSatisfied(h, tip->nHeight, params.modern_pos->checkpoint_depth)) continue;
+        const auto checkpoint{ExpectedFinalizedBlock(epoch, height, state, chain, params, bridge_index)};
+        if (!checkpoint || modern::FinalityDigest(*domain, *checkpoint) != it->second.digest) continue;
+
+        CheckpointStatus status;
+        status.checkpoint = *checkpoint;
+        status.signing_set_hash = set->SetHash();
+        status.validator_count = static_cast<uint32_t>(set->Size());
+        status.quorum_count = modern::FinalityHeadcountQuorum(status.validator_count);
+        status.total_weight = set->TotalWeight();
+        status.quorum_weight = set->QuorumWeight();
+        for (const auto& [index, signature] : it->second.sigs) {
+            if (index >= set->Size()) continue;
+            status.signer_indices.push_back(index);
+            status.signed_weight += set->Members()[index].weight;
+        }
+        if (!status.signer_indices.empty()) out.push_back(std::move(status));
+    }
+    return out;
+}
+
+std::vector<FinalitySig> FinalitySignaturePool::RelayableSignatures(
+    const FinalityTracker& tracker, const CChain& chain,
+    const Consensus::Params& params, const BridgeStateIndex* bridge_index) const
+{
+    std::vector<FinalitySig> out;
+    for (const auto& status : VerifiedCheckpoints(tracker, chain, params, bridge_index)) {
+        const auto& checkpoint{status.checkpoint};
+        const auto& slot{m_slots.at({checkpoint.epoch, checkpoint.height})};
+        for (const auto index : status.signer_indices) {
+            FinalitySig sig;
+            sig.epoch = checkpoint.epoch;
+            sig.height = checkpoint.height;
+            sig.index = index;
+            sig.signature = slot.sigs.at(index);
+            out.push_back(std::move(sig));
+        }
+    }
+    return out;
+}
+
 bool FinalitySigner::SetKeys(
     const std::vector<bls::SecretKey>& keys,
     const modern::ValidatorKeyBytes& validator_key, std::string& error)

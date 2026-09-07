@@ -110,6 +110,34 @@ public:
     size_t TrackedCheckpoints() const { return m_slots.size(); }
     size_t SignatureCount(uint64_t epoch, uint64_t height) const;
 
+    struct CheckpointStatus {
+        modern::FinalizedBlock checkpoint;
+        uint256 signing_set_hash;
+        uint32_t validator_count{0};
+        uint32_t quorum_count{0};
+        uint64_t total_weight{0};
+        uint64_t quorum_weight{0};
+        uint64_t signed_weight{0};
+        std::vector<uint32_t> signer_indices;
+    };
+
+    /** Verified local observations, newest first. Excludes finalized, shallow,
+     * orphaned, or no-longer-retained epoch slots, even before the next Submit.
+     * Does not count unverified transport buffers or imply online status.
+     * Caller holds cs_main and has synced the supplied tracker to this chain. */
+    std::vector<CheckpointStatus> VerifiedCheckpoints(
+        const FinalityTracker& tracker, const CChain& chain,
+        const Consensus::Params& params,
+        const BridgeStateIndex* bridge_index = nullptr) const;
+
+    /** Exact already-verified wire messages eligible for bounded network
+     * retransmission. Never signs, changes journals, or mutates consensus.
+     * Same chain/locking preconditions as VerifiedCheckpoints. */
+    std::vector<FinalitySig> RelayableSignatures(
+        const FinalityTracker& tracker, const CChain& chain,
+        const Consensus::Params& params,
+        const BridgeStateIndex* bridge_index = nullptr) const;
+
     //! Reconstruct the FinalizedBlock this node expects for (epoch, height);
     //! nullopt when the slot is not derivable from the current state.
     static std::optional<modern::FinalizedBlock> ExpectedFinalizedBlock(uint64_t epoch, uint64_t height,

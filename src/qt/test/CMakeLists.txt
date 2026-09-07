@@ -41,6 +41,20 @@ if(ENABLE_WALLET)
       wallettests.cpp
       ../../wallet/test/wallet_test_fixture.cpp
   )
+
+  # Focused, headless form regression: no node/wallet startup or full GUI suite.
+  add_executable(test_b3_sendcoinsentry-qt b3sendcoinsentrytests.cpp)
+  target_link_libraries(test_b3_sendcoinsentry-qt
+    core_interface
+    bitcoinqt
+    bitcoin_node
+    Qt6::Test
+  )
+  import_plugins(test_b3_sendcoinsentry-qt)
+  add_test(NAME test_b3_sendcoinsentry-qt COMMAND test_b3_sendcoinsentry-qt)
+  set_tests_properties(test_b3_sendcoinsentry-qt PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=minimal"
+  )
 endif()
 
 add_test(NAME test_bitcoin-qt
@@ -55,6 +69,13 @@ if(WIN32 AND VCPKG_TARGET_TRIPLET)
       QT_QPA_PLATFORM=set:windows
       QT_PLUGIN_PATH=set:${plugin_path}
   )
+  if(TARGET test_b3_sendcoinsentry-qt)
+    set_property(TEST test_b3_sendcoinsentry-qt APPEND PROPERTY
+      ENVIRONMENT_MODIFICATION
+        QT_QPA_PLATFORM=set:windows
+        QT_PLUGIN_PATH=set:${plugin_path}
+    )
+  endif()
   unset(plugin_path)
 endif()
 

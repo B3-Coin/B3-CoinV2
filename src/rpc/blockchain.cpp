@@ -3572,6 +3572,24 @@ static RPCHelpMan getfinalitystatus()
                            {RPCResult::Type::STR_HEX, "hash", ""},
                        }},
                       {RPCResult::Type::NUM, "pool_checkpoints", "checkpoints tracked by the local signature pool"},
+                      {RPCResult::Type::ARR, "verified_checkpoints", /*optional=*/true,
+                       "Newest-first verified signature observations for this node's active chain; not an online-validator count. Unverified early messages are excluded.",
+                       {{RPCResult::Type::OBJ, "", "Checkpoint observation",
+                         {
+                             {RPCResult::Type::NUM, "epoch", "Signing epoch"},
+                             {RPCResult::Type::NUM, "height", "Checkpoint height"},
+                             {RPCResult::Type::STR_HEX, "hash", "Checkpoint hash in ordinary B3 display order"},
+                             {RPCResult::Type::STR_HEX, "set_hash", "Signing set hash in ordinary B3 display order"},
+                             {RPCResult::Type::NUM, "validator_count", "Signing set size"},
+                             {RPCResult::Type::NUM, "signer_count", "Distinct verified signatures held locally"},
+                             {RPCResult::Type::NUM, "quorum_count", "Required distinct signatures"},
+                             {RPCResult::Type::NUM, "signed_weight", "Verified signed stake weight"},
+                             {RPCResult::Type::NUM, "total_weight", "Signing set stake weight"},
+                             {RPCResult::Type::NUM, "quorum_weight", "Required signed stake weight"},
+                             {RPCResult::Type::BOOL, "quorum_reached", "Both count and weight requirements met locally; not final until included in a valid block"},
+                             {RPCResult::Type::ARR, "signer_indices", "Indices into getfinalityset for this epoch",
+                              {{RPCResult::Type::NUM, "", "Verified member index"}}},
+                         }}}},
                   }},
         RPCExamples{HelpExampleCli("getfinalitystatus", "") + HelpExampleRpc("getfinalitystatus", "")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
@@ -3649,6 +3667,29 @@ static RPCHelpMan getfinalitystatus()
                         fin.pushKV("epoch", state.finalized->epoch);
                         obj.pushKV("finalized", fin);
                     }
+                    UniValue checkpoints{UniValue::VARR};
+                    for (const auto& observed : chainstate.FinalitySignatures().VerifiedCheckpoints(
+                             tracker, chainstate.m_chain, consensus, bridge_index)) {
+                        UniValue checkpoint{UniValue::VOBJ};
+                        checkpoint.pushKV("epoch", observed.checkpoint.epoch);
+                        checkpoint.pushKV("height", observed.checkpoint.height);
+                        checkpoint.pushKV("hash", observed.checkpoint.block_hash.GetHex());
+                        checkpoint.pushKV("set_hash", observed.signing_set_hash.GetHex());
+                        checkpoint.pushKV("validator_count", observed.validator_count);
+                        checkpoint.pushKV("signer_count", static_cast<uint64_t>(observed.signer_indices.size()));
+                        checkpoint.pushKV("quorum_count", observed.quorum_count);
+                        checkpoint.pushKV("signed_weight", observed.signed_weight);
+                        checkpoint.pushKV("total_weight", observed.total_weight);
+                        checkpoint.pushKV("quorum_weight", observed.quorum_weight);
+                        checkpoint.pushKV("quorum_reached",
+                                          observed.signer_indices.size() >= observed.quorum_count &&
+                                              observed.signed_weight >= observed.quorum_weight);
+                        UniValue indices{UniValue::VARR};
+                        for (const auto index : observed.signer_indices) indices.push_back(index);
+                        checkpoint.pushKV("signer_indices", std::move(indices));
+                        checkpoints.push_back(std::move(checkpoint));
+                    }
+                    obj.pushKV("verified_checkpoints", std::move(checkpoints));
                 }
             }
             if (const auto pin{chainstate.m_blockman.FinalityAnchor()}) {
