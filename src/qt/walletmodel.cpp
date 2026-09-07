@@ -447,7 +447,7 @@ void WalletModel::unsubscribeFromCoreSignals()
 }
 
 // WalletModel::UnlockContext implementation
-WalletModel::UnlockContext WalletModel::requestUnlock()
+WalletModel::UnlockContext WalletModel::requestUnlock(const UnlockPurpose purpose)
 {
     // Bugs in earlier versions may have resulted in wallets with private keys disabled to become "encrypted"
     // (encryption keys are present, but not actually doing anything).
@@ -456,16 +456,35 @@ WalletModel::UnlockContext WalletModel::requestUnlock()
     if (m_wallet->privateKeysDisabled()) {
         return UnlockContext(this, /*valid=*/true, /*relock=*/false);
     }
-    bool was_locked = getEncryptionStatus() == Locked;
-    if(was_locked)
-    {
-        // Request UI to unlock wallet
-        Q_EMIT requireUnlock();
-    }
-    // If wallet is still locked, unlock was failed or cancelled, mark context as invalid
-    bool valid = getEncryptionStatus() != Locked;
+    const EncryptionStatus initial_status{getEncryptionStatus()};
+    const bool was_locked{initial_status == Locked};
+    try {
+        if (was_locked) {
+            // Request UI to unlock wallet
+            if (purpose == UnlockPurpose::StakingOnly) {
+                Q_EMIT requireUnlockForStaking();
+            } else {
+                Q_EMIT requireUnlock();
+            }
+        }
+        // If still locked, the unlock failed or was cancelled.
+        const bool valid{getEncryptionStatus() != Locked};
 
-    return UnlockContext(this, valid, was_locked);
+        // This is the normal core wallet lock, not a UI-only spending restriction.
+        // An unencrypted wallet cannot offer password-protected staking-only use.
+        const bool relock{was_locked ||
+                          (purpose == UnlockPurpose::StakingOnly && initial_status == Unlocked)};
+        return UnlockContext(this, valid, relock);
+    } catch (...) {
+        // The synchronous prompt can unlock before throwing, while no
+        // UnlockContext has been returned yet. Preserve the staking-only
+        // relock guarantee at this boundary as well as during the operation.
+        if (purpose == UnlockPurpose::StakingOnly &&
+            (initial_status == Locked || initial_status == Unlocked)) {
+            setWalletLocked(true);
+        }
+        throw;
+    }
 }
 
 WalletModel::UnlockContext::UnlockContext(WalletModel *_wallet, bool _valid, bool _relock):

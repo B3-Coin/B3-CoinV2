@@ -44,6 +44,10 @@ public:
     //! Attach the current wallet (null for the no-wallet state).
     void setWalletModel(WalletModel* wallet_model);
 
+    //! Presentation only: encryption_status is a WalletModel::EncryptionStatus.
+    static QString StakingActionText(int encryption_status, const B3ValidatorStatus& status);
+    static QString WalletLockText(int encryption_status, const B3ValidatorStatus& status);
+
 public Q_SLOTS:
     void setBalance(const interfaces::WalletBalances& balances);
 
@@ -104,6 +108,7 @@ private:
     BitcoinAmountField* m_stake_amount{nullptr};
     QPushButton* m_create_stake{nullptr};
     QPushButton* m_start_stop{nullptr};
+    QLabel* m_staking_security_note{nullptr};
     QPushButton* m_corridor_mining{nullptr};
     QLabel* m_operation_state{nullptr};
 

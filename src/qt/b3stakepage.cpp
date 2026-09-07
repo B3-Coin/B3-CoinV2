@@ -164,6 +164,7 @@ B3StakePage::B3StakePage(QWidget* parent)
         B3Theme::markTextRole(m_backend_state, QStringLiteral("secondary"));
         status_layout->addWidget(m_backend_state);
         AddInfoRow(status_layout, m_status_card, tr("Wallet"), &m_lock_state, "stakeLockState");
+        m_lock_state->setWordWrap(true);
         AddInfoRow(status_layout, m_status_card, tr("Chain height"), &m_chain_height, "stakeChainHeight");
         AddInfoRow(status_layout, m_status_card, tr("Next block"), &m_phase, "stakeNextPhase");
         AddKeyRow(status_layout, m_status_card, tr("Validator key"), &m_validator_key,
@@ -230,6 +231,12 @@ B3StakePage::B3StakePage(QWidget* parent)
         m_start_stop = new QPushButton(tr("Start staking"), m_controls_card);
         m_start_stop->setObjectName(QStringLiteral("stakeStartStop"));
         controls_layout->addWidget(m_start_stop);
+
+        m_staking_security_note = new QLabel(m_controls_card);
+        m_staking_security_note->setObjectName(QStringLiteral("stakeSecurityNote"));
+        m_staking_security_note->setWordWrap(true);
+        B3Theme::markTextRole(m_staking_security_note, QStringLiteral("secondary"));
+        controls_layout->addWidget(m_staking_security_note);
 
         auto* mining_note = new QLabel(
             tr("Corridor mining is optional, uses one CPU thread, pays fees only, and stops automatically when Modern PoS begins."),
@@ -351,6 +358,8 @@ void B3StakePage::setWalletModel(WalletModel* wallet_model)
 
     if (!have_wallet) {
         m_lock_state->setText(QStringLiteral("—"));
+        m_staking_security_note->clear();
+        m_staking_security_note->hide();
         m_wallet_balance->setText(QStringLiteral("—"));
         m_backend_state->setText(tr("Select a wallet to load validator state."));
         m_rewards->hide();
@@ -399,23 +408,58 @@ void B3StakePage::setBalance(const interfaces::WalletBalances& balances)
     m_wallet_balance->setText(BitcoinUnits::formatWithUnit(unit, balances.balance));
 }
 
+QString B3StakePage::StakingActionText(int encryption_status, const B3ValidatorStatus& status)
+{
+    if (status.staking_running) {
+        return status.staking_uses_this_wallet ? tr("Stop staking") : tr("Another wallet is staking");
+    }
+    if (encryption_status == WalletModel::Locked) return tr("Unlock for staking only");
+    // A literal ampersand is doubled for QPushButton's mnemonic processing.
+    if (encryption_status == WalletModel::Unlocked) return tr("Start staking && lock wallet");
+    return tr("Start staking");
+}
+
+QString B3StakePage::WalletLockText(int encryption_status, const B3ValidatorStatus& status)
+{
+    const bool own_staking{status.valid && status.staking_running && status.staking_uses_this_wallet};
+    switch (encryption_status) {
+    case WalletModel::NoKeys:
+        return tr("Watch-only");
+    case WalletModel::Unencrypted:
+        return own_staking ? tr("Staking active — wallet not encrypted") : tr("Not encrypted");
+    case WalletModel::Locked:
+        return own_staking ? tr("Staking active — spending locked") : tr("Spending locked");
+    case WalletModel::Unlocked:
+        return own_staking ? tr("Staking active — spending unlocked") : tr("Unlocked for spending");
+    }
+    return QStringLiteral("—");
+}
+
 void B3StakePage::updateLockState()
 {
     if (!m_wallet_model) return;
-    switch (m_wallet_model->getEncryptionStatus()) {
-    case WalletModel::NoKeys:
-        m_lock_state->setText(tr("Watch-only"));
-        break;
-    case WalletModel::Unencrypted:
-        m_lock_state->setText(tr("Not encrypted"));
-        break;
-    case WalletModel::Locked:
-        m_lock_state->setText(tr("Locked — actions will request the password"));
-        break;
-    case WalletModel::Unlocked:
-        m_lock_state->setText(tr("Unlocked"));
-        break;
+    const auto encryption_status{m_wallet_model->getEncryptionStatus()};
+    const bool own_staking{m_status.valid && m_status.staking_running && m_status.staking_uses_this_wallet};
+    const bool unprotected{encryption_status == WalletModel::Unencrypted || encryption_status == WalletModel::Unlocked};
+    m_lock_state->setText(WalletLockText(encryption_status, m_status));
+    B3Theme::markTextRole(m_lock_state, unprotected ? QStringLiteral("negative") : QStringLiteral("secondary"));
+    m_lock_state->style()->unpolish(m_lock_state);
+    m_lock_state->style()->polish(m_lock_state);
+
+    m_staking_security_note->setVisible(encryption_status != WalletModel::NoKeys);
+    if (encryption_status == WalletModel::Unencrypted) {
+        m_staking_security_note->setText(tr("Warning: this wallet is not encrypted. Spending is not passphrase protected. Stopping staking or closing B3 Hive clears the staking service's in-memory signing keys, but does not encrypt the wallet."));
+    } else if (own_staking && encryption_status == WalletModel::Unlocked) {
+        m_staking_security_note->setText(tr("Warning: this wallet is unlocked for spending. Lock the wallet to protect spending; staking can continue. Stopping staking or closing B3 Hive clears the staking service's in-memory signing keys."));
+    } else if (own_staking && encryption_status == WalletModel::Locked) {
+        m_staking_security_note->setText(tr("Spending is locked. Signing new spends requires another unlock. Validator and BLS signing keys remain in the staking service until you stop staking or close B3 Hive."));
+    } else {
+        m_staking_security_note->setText(tr("Starting staking briefly unlocks this wallet to load validator and BLS keys into the staking service, then locks spending again after the attempt. Signing new spends requires another unlock. Stop staking or close B3 Hive to clear the service's signing keys."));
     }
+    B3Theme::markTextRole(m_staking_security_note, unprotected ? QStringLiteral("negative") : QStringLiteral("secondary"));
+    m_staking_security_note->style()->unpolish(m_staking_security_note);
+    m_staking_security_note->style()->polish(m_staking_security_note);
+    updateControls();
 }
 
 void B3StakePage::setValidatorStatus(const B3ValidatorStatus& status)
@@ -428,7 +472,7 @@ void B3StakePage::setValidatorStatus(const B3ValidatorStatus& status)
         m_backend_state->setText(status.refresh_error.isEmpty()
                                      ? tr("Loading validator state…")
                                      : tr("Validator state is unavailable: %1").arg(status.refresh_error));
-        updateControls();
+        updateLockState();
         return;
     }
 
@@ -525,7 +569,7 @@ void B3StakePage::setValidatorStatus(const B3ValidatorStatus& status)
     } else {
         Q_EMIT stakingSummaryChanged(QString{});
     }
-    updateControls();
+    updateLockState();
 }
 
 void B3StakePage::setPublicKeys(const QString& validator_key, const QString& bls_pubkey)
@@ -584,17 +628,14 @@ void B3StakePage::updateControls()
     m_stake_amount->setEnabled(can_prepare);
     m_create_stake->setEnabled(can_prepare);
 
-    m_start_stop->setText(m_status.staking_running
-                              ? (m_status.staking_uses_this_wallet
-                                     ? tr("Stop staking")
-                                     : tr("Another wallet is staking"))
-                              : tr("Start staking"));
+    const auto encryption_status{have_wallet ? m_wallet_model->getEncryptionStatus() : WalletModel::NoKeys};
+    m_start_stop->setText(StakingActionText(encryption_status, m_status));
     const bool have_any_stake{m_status.active_stake > 0 || m_status.pending_stake > 0 ||
                               m_status.unconfirmed_stake > 0};
     m_start_stop->setEnabled(
         ready && (m_status.staking_running
                       ? m_status.staking_uses_this_wallet
-                      : (modern_window && finality_ready &&
+                      : (encryption_status != WalletModel::NoKeys && modern_window && finality_ready &&
                          (m_status.current_set_member || m_status.finality_bound) && have_any_stake)));
 
     m_corridor_mining->setText(m_status.auto_corridor_mining
@@ -649,9 +690,13 @@ void B3StakePage::toggleStaking()
         m_controller->stopStaking();
         return;
     }
+    const auto encryption_status{m_wallet_model->getEncryptionStatus()};
+    const bool encrypted{encryption_status == WalletModel::Locked || encryption_status == WalletModel::Unlocked};
     const auto answer = QMessageBox::question(
-        this, tr("Start staking"),
-        tr("Start the automatic Modern-PoS producer and finality signer? It continues after the wallet re-locks, until you stop it or close B3 Hive."));
+        this, encrypted ? tr("Unlock for staking only") : tr("Start staking"),
+        encrypted
+            ? tr("Start staking with validator and BLS signing keys? The wallet is briefly unlocked to load these keys into the staking service, then locked again after this attempt, even if it is already unlocked. Signing new spends then requires another unlock. Stopping staking or closing B3 Hive clears the service's signing keys.")
+            : tr("Start staking with validator and BLS signing keys? Warning: this wallet is not encrypted, so spending is not passphrase protected. Stopping staking or closing B3 Hive clears the service's in-memory signing keys, but does not encrypt the wallet."));
     if (answer != QMessageBox::Yes) {
         m_operation_busy = false;
         updateControls();
@@ -689,11 +734,17 @@ void B3StakePage::operationSucceeded(const QString& operation, const QVariantMap
         setOperationMessage(tr("Stake transaction submitted: %1").arg(DetailString(details, "txid")),
                             QStringLiteral("positive"));
     } else if (operation == QLatin1String("start_staking")) {
-        const bool armed{details.value(QStringLiteral("finality_signing")).toBool()};
-        setOperationMessage(armed
-                                ? tr("Staking started and the finality signer is armed.")
-                                : tr("Staking started, but the finality signer is not armed. Check the confirmed BLS binding."),
-                            armed ? QStringLiteral("positive") : QStringLiteral("negative"));
+        const auto encryption_status{m_wallet_model ? m_wallet_model->getEncryptionStatus() : WalletModel::NoKeys};
+        if (encryption_status == WalletModel::Locked) {
+            setOperationMessage(tr("Staking started. Spending is locked; signing new spends requires another unlock."),
+                                QStringLiteral("positive"));
+        } else if (encryption_status == WalletModel::Unencrypted) {
+            setOperationMessage(tr("Staking started. Warning: this wallet is not encrypted and spending is not passphrase protected."),
+                                QStringLiteral("negative"));
+        } else {
+            setOperationMessage(tr("Staking started. Warning: wallet spending is not locked."),
+                                QStringLiteral("negative"));
+        }
     } else if (operation == QLatin1String("stop_staking")) {
         setOperationMessage(tr("Staking stopped and in-memory signing keys were cleared."),
                             QStringLiteral("positive"));
@@ -705,12 +756,15 @@ void B3StakePage::operationSucceeded(const QString& operation, const QVariantMap
     } else if (operation == QLatin1String("stop_corridor_mining")) {
         setOperationMessage(tr("Corridor mining stopped."));
     }
-    updateControls();
+    updateLockState();
 }
 
 void B3StakePage::operationFailed(const QString& operation, const QString& error)
 {
     m_operation_busy = false;
+    // Read the actual post-attempt lock state before a modal warning runs its
+    // event loop; queued wallet notifications need not have arrived yet.
+    updateLockState();
     if (operation == QLatin1String("refresh")) {
         m_backend_state->setText(tr("Validator state is unavailable: %1").arg(error));
     } else {

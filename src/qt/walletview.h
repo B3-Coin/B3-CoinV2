@@ -100,6 +100,8 @@ public Q_SLOTS:
     void changePassphrase();
     /** Ask for the passphrase to unlock the wallet. UnlockContext callers relock automatically. */
     void unlockWallet();
+    /** Staking-specific prompt; only used by a scoped staking unlock request. */
+    void unlockWalletForStaking();
     /** Lock the wallet immediately */
     void lockWallet();
 

@@ -23,6 +23,10 @@ suffix and mark the build as a release only when the release is approved.
 - The Python Ethereum-to-B3 relayer recognizes an active light-client update
   awaiting B3 finality as a wait condition before making external proof/RPC
   requests. Finalized-store consistency and proof validation remain required.
+- The Stake screen explicitly offers the staking-only equivalent for encrypted
+  wallets: briefly unlock, load dedicated validator/finality keys, start staking,
+  and lock spending again. This also relocks wallets that were already fully
+  unlocked before the action. The normal spending unlock workflow is unchanged.
 
 ## Safety and operator expectations
 
@@ -56,6 +60,15 @@ upgrading. Do not run two signers for one validator identity. ETH gas does not
 repair a stalled B3 finality quorum. No live-wallet replacement, transaction
 broadcast, release tag, or release publication is part of this source change.
 
+The staking-only workflow uses the real wallet lock after its brief normal
+unlock; it is not a separate partial-unlock permission mode. Dedicated staking
+keys remain in the node's memory while staking runs. New spending signatures
+and private-key access require another wallet unlock after relocking. An
+already-signed transaction can still be broadcast, and an authorized concurrent
+RPC caller is not restricted during the brief normal unlock. Unencrypted wallets
+cannot offer passphrase-protected spending and are labeled accordingly. Stop
+staking or close the node to stop the retained signing keys from being used.
+
 ## Qualification
 
 Local macOS arm64 qualification (2026-09-07):
@@ -73,6 +86,17 @@ Local macOS arm64 qualification (2026-09-07):
   verified signer observations, and stale/fork/finalized suppression. These
   use synthetic chains and in-process peers, not the live node. A mock send
   queue issue was corrected and only the affected network case was rerun.
+- Built the staking-only Qt preview separately from the running executable.
+  Its isolated headless test passed 19 entries (17 cases/data rows plus setup
+  and cleanup) in 0.96 seconds. Checks cover real encrypted-wallet relocking,
+  ordinary message-signing refusal after relock, cancellation, wrong password,
+  failures before and after scoped-unlock construction, unchanged general
+  unlock behavior, unencrypted/watch-only handling, and nine presentation rows.
+  It uses an in-memory regtest wallet with no mining or networking; it does not
+  claim end-to-end live staking coverage or a native Windows run.
+- The existing focused `ismine_tests/exact_script_signability` core test passed
+  all 12 assertions. No long staking/mining suite was repeated for this Qt-only
+  change, and the live wallet was neither replaced nor restarted.
 
 No full integration/soak suite, cross-platform release packaging, or live
 network deployment is claimed by these local checks.

@@ -127,6 +127,7 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
 
     // Ask for passphrase if needed
     connect(walletModel, &WalletModel::requireUnlock, this, &WalletView::unlockWallet);
+    connect(walletModel, &WalletModel::requireUnlockForStaking, this, &WalletView::unlockWalletForStaking);
 
     // Show progress dialog
     connect(walletModel, &WalletModel::showProgress, this, &WalletView::showProgress);
@@ -275,6 +276,18 @@ void WalletView::lockWallet()
 {
     if (walletModel->getEncryptionStatus() == WalletModel::Unlocked &&
         walletModel->setWalletLocked(true)) {
+        Q_EMIT encryptionStatusChanged();
+    }
+}
+
+void WalletView::unlockWalletForStaking()
+{
+    if (walletModel->getEncryptionStatus() == WalletModel::Locked) {
+        AskPassphraseDialog dlg(AskPassphraseDialog::UnlockStaking, this);
+        dlg.setModel(walletModel);
+        // requestUnlock(StakingOnly) owns the mandatory relock when its scope
+        // ends. Never expose this prompt as a standalone permanent unlock.
+        dlg.exec();
         Q_EMIT encryptionStatusChanged();
     }
 }

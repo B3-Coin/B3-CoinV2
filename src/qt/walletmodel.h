@@ -127,7 +127,13 @@ public:
         const bool relock;
     };
 
-    UnlockContext requestUnlock();
+    enum class UnlockPurpose {
+        General,
+        //! Briefly unlock to load dedicated staking keys, then lock spending
+        //! even when this encrypted wallet was already unlocked on entry.
+        StakingOnly,
+    };
+    UnlockContext requestUnlock(UnlockPurpose purpose = UnlockPurpose::General);
 
     bool bumpFee(Txid hash, Txid& new_hash);
     void displayAddress(std::string sAddress) const;
@@ -207,6 +213,9 @@ Q_SIGNALS:
     // It is valid behaviour for listeners to keep the wallet locked after this signal;
     // this means that the unlocking failed or was cancelled.
     void requireUnlock();
+
+    //! Synchronous staking-specific prompt, always used inside a relocking context.
+    void requireUnlockForStaking();
 
     // Fired when a message should be reported to the user
     void message(const QString &title, const QString &message, unsigned int style);

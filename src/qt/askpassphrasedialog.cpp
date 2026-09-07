@@ -45,13 +45,16 @@ AskPassphraseDialog::AskPassphraseDialog(Mode _mode, QWidget *parent, SecureStri
             setWindowTitle(tr("Encrypt wallet"));
             break;
         case UnlockMigration:
+        case UnlockStaking:
         case Unlock: // Ask passphrase
-            ui->warningLabel->setText(tr("This operation needs your wallet passphrase to unlock the wallet."));
+            ui->warningLabel->setText(mode == UnlockStaking
+                ? tr("Your wallet will briefly unlock to load the validator and finality signing keys, then lock again for spending. Staking can continue while spending is locked. Sending coins requires another unlock.")
+                : tr("This operation needs your wallet passphrase to unlock the wallet."));
             ui->passLabel2->hide();
             ui->passEdit2->hide();
             ui->passLabel3->hide();
             ui->passEdit3->hide();
-            setWindowTitle(tr("Unlock wallet"));
+            setWindowTitle(mode == UnlockStaking ? tr("Unlock for staking only") : tr("Unlock wallet"));
             break;
         case ChangePass: // Ask old passphrase + new passphrase x2
             setWindowTitle(tr("Change passphrase"));
@@ -156,9 +159,11 @@ void AskPassphraseDialog::accept()
             }
         }
     } break;
+    case UnlockStaking:
     case Unlock:
         try {
             if (!model->setWalletLocked(false, oldpass)) {
+                if (mode == UnlockStaking) model->setWalletLocked(true);
                 // Check if the passphrase has a null character (see #27067 for details)
                 if (oldpass.find('\0') == std::string::npos) {
                     QMessageBox::critical(this, tr("Wallet unlock failed"),
@@ -179,7 +184,12 @@ void AskPassphraseDialog::accept()
                 QDialog::accept(); // Success
             }
         } catch (const std::runtime_error& e) {
+            // Unlock can decrypt the master key before a descriptor-cache
+            // upgrade throws. Relock before displaying an error; the outer
+            // scoped unlock has not returned to its caller yet.
+            if (mode == UnlockStaking) model->setWalletLocked(true);
             QMessageBox::critical(this, tr("Wallet unlock failed"), e.what());
+            if (mode == UnlockStaking) QDialog::reject();
         }
         break;
     case UnlockMigration:
@@ -230,6 +240,7 @@ void AskPassphraseDialog::textChanged()
         acceptable = !ui->passEdit2->text().isEmpty() && !ui->passEdit3->text().isEmpty();
         break;
     case UnlockMigration:
+    case UnlockStaking:
     case Unlock: // Old passphrase x1
         acceptable = !ui->passEdit1->text().isEmpty();
         break;

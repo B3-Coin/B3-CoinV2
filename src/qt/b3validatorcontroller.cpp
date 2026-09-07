@@ -406,45 +406,63 @@ void B3ValidatorController::startStaking()
                 : tr("This node is already staking with another wallet's validator."));
         return;
     }
+    if (m_wallet_model->getEncryptionStatus() == WalletModel::NoKeys) {
+        Q_EMIT operationFailed(operation, tr("This watch-only wallet cannot start a validator. Select the wallet that holds its validator and BLS signing keys."));
+        return;
+    }
 
     QVariantMap details;
     QString failure;
     bool succeeded{false};
-    {
-        WalletModel::UnlockContext unlock{m_wallet_model->requestUnlock()};
+    const auto encryption_status{m_wallet_model->getEncryptionStatus()};
+    const bool encrypted{encryption_status == WalletModel::Locked || encryption_status == WalletModel::Unlocked};
+    try {
+        WalletModel::UnlockContext unlock{m_wallet_model->requestUnlock(WalletModel::UnlockPurpose::StakingOnly)};
         if (!unlock.isValid()) {
             failure = tr("The wallet was not unlocked.");
         } else {
-            try {
-                // The staking loop is node-global. A current member needs
-                // the epoch-frozen key even if its live binding has rotated.
-                const UniValue empty{UniValue::VARR};
-                const UniValue finality{m_wallet_model->node().executeRpc(
-                    "getfinalityinfo", empty, walletUri())};
-                failure = FinalityStartError(finality);
-                if (failure.isEmpty()) {
-                    const UniValue result{m_wallet_model->node().executeRpc(
-                        "startstaking", empty, walletUri())};
-                    details = ToVariantMap(result);
-                    if (!details.value(QStringLiteral("finality_signing")).toBool()) {
-                        // Defensive fail closed: never leave a producer
-                        // running without its exact finality signer.
-                        m_wallet_model->node().executeRpc("stopstaking", empty, walletUri());
-                        failure = tr("Staking was stopped because the finality signer was not armed.");
-                    } else {
-                        succeeded = true;
-                    }
+            // The staking loop is node-global. A current member needs
+            // the epoch-frozen key even if its live binding has rotated.
+            const UniValue empty{UniValue::VARR};
+            const UniValue finality{m_wallet_model->node().executeRpc(
+                "getfinalityinfo", empty, walletUri())};
+            failure = FinalityStartError(finality);
+            if (failure.isEmpty()) {
+                const UniValue result{m_wallet_model->node().executeRpc(
+                    "startstaking", empty, walletUri())};
+                details = ToVariantMap(result);
+                if (!details.value(QStringLiteral("finality_signing")).toBool()) {
+                    // Defensive fail closed: never leave a producer
+                    // running without its exact finality signer.
+                    m_wallet_model->node().executeRpc("stopstaking", empty, walletUri());
+                    failure = tr("Staking was stopped because the finality signer was not armed.");
+                } else {
+                    succeeded = true;
                 }
-            } catch (UniValue& rpc_error) {
-                failure = RpcErrorText(rpc_error);
-            } catch (const std::exception& e) {
-                failure = QString::fromStdString(e.what());
             }
         }
+    } catch (UniValue& rpc_error) {
+        failure = RpcErrorText(rpc_error);
+    } catch (const std::exception& e) {
+        failure = QString::fromStdString(e.what());
     }
 
-    // UnlockContext has relocked an originally locked wallet before the page
-    // can display either the success state or a modal error.
+    // StakingOnly relocks encrypted wallets, including previously unlocked
+    // ones. Do not report success if that spending-lock postcondition failed.
+    if (succeeded && encrypted && m_wallet_model->getEncryptionStatus() != WalletModel::Locked) {
+        succeeded = false;
+        try {
+            m_wallet_model->node().executeRpc("stopstaking", UniValue{UniValue::VARR}, walletUri());
+            failure = tr("The wallet could not be locked after starting staking. Staking was stopped. Lock the wallet before trying again.");
+        } catch (UniValue& rpc_error) {
+            failure = tr("The wallet could not be locked and stopping staking also failed: %1. Close B3 Hive to clear the staking service's signing keys.").arg(RpcErrorText(rpc_error));
+        } catch (const std::exception& e) {
+            failure = tr("The wallet could not be locked and stopping staking also failed: %1. Close B3 Hive to clear the staking service's signing keys.").arg(QString::fromStdString(e.what()));
+        }
+    } else if (!succeeded && encrypted && m_wallet_model->getEncryptionStatus() != WalletModel::Locked) {
+        failure += QLatin1Char(' ') + tr("Wallet spending remains unlocked. Lock the wallet before trying again.");
+    }
+
     if (succeeded) {
         Q_EMIT operationSucceeded(operation, details);
         refresh();

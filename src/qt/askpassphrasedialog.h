@@ -27,6 +27,7 @@ public:
         Unlock,     /**< Ask passphrase and unlock */
         ChangePass, /**< Ask old passphrase + new passphrase twice */
         UnlockMigration, /**< Ask passphrase for unlocking during migration */
+        UnlockStaking, /**< Prompt only; caller must hold a staking-only relocking context */
     };
 
     explicit AskPassphraseDialog(Mode mode, QWidget *parent, SecureString* passphrase_out = nullptr);

@@ -55,6 +55,22 @@ if(ENABLE_WALLET)
   set_tests_properties(test_b3_sendcoinsentry-qt PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=minimal"
   )
+
+  # Isolated encrypted-wallet staking unlock checks, with no mining/network.
+  add_executable(test_b3_stakingunlock-qt b3stakingunlocktests.cpp)
+  target_link_libraries(test_b3_stakingunlock-qt
+    core_interface
+    bitcoinqt
+    test_util
+    bitcoin_node
+    Boost::headers
+    Qt6::Test
+  )
+  import_plugins(test_b3_stakingunlock-qt)
+  add_test(NAME test_b3_stakingunlock-qt COMMAND test_b3_stakingunlock-qt)
+  set_tests_properties(test_b3_stakingunlock-qt PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=minimal"
+  )
 endif()
 
 add_test(NAME test_bitcoin-qt
@@ -71,6 +87,13 @@ if(WIN32 AND VCPKG_TARGET_TRIPLET)
   )
   if(TARGET test_b3_sendcoinsentry-qt)
     set_property(TEST test_b3_sendcoinsentry-qt APPEND PROPERTY
+      ENVIRONMENT_MODIFICATION
+        QT_QPA_PLATFORM=set:windows
+        QT_PLUGIN_PATH=set:${plugin_path}
+    )
+  endif()
+  if(TARGET test_b3_stakingunlock-qt)
+    set_property(TEST test_b3_stakingunlock-qt APPEND PROPERTY
       ENVIRONMENT_MODIFICATION
         QT_QPA_PLATFORM=set:windows
         QT_PLUGIN_PATH=set:${plugin_path}
