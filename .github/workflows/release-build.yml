@@ -5,6 +5,12 @@ name: release-build
 
 on:
   workflow_dispatch:
+    inputs:
+      windows_build_only:
+        description: "Build Windows artifacts only, without tests or release publication"
+        required: false
+        type: boolean
+        default: false
   push:
     tags: [ "v*" ]
 
@@ -87,7 +93,13 @@ jobs:
     # exception.
     # Other builds run the complete suite unless an administrator binds the
     # emergency opt-out to their exact commit SHA.
-    if: github.ref != 'refs/tags/v1.1.1-beta.2' && github.ref != 'refs/tags/v1.1.1-beta.3' && vars.B3_SKIP_EXTENDED_RELEASE_TESTS_SHA != github.sha
+    if: >-
+      ${{
+        !(github.event_name == 'workflow_dispatch' && inputs.windows_build_only) &&
+        github.ref != 'refs/tags/v1.1.1-beta.2' &&
+        github.ref != 'refs/tags/v1.1.1-beta.3' &&
+        vars.B3_SKIP_EXTENDED_RELEASE_TESTS_SHA != github.sha
+      }}
     needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 240
@@ -138,7 +150,7 @@ jobs:
           feature_flowmesh_release.py
 
   release-test-policy:
-    if: always()
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.windows_build_only) }}
     needs: [version, release-tests]
     runs-on: ubuntu-24.04
     steps:
@@ -165,6 +177,7 @@ jobs:
           fi
 
   contract-tests:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.windows_build_only) }}
     needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -181,6 +194,7 @@ jobs:
         run: script/check-deployable-sizes.sh
 
   linux-x86_64:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.windows_build_only) }}
     needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -233,6 +247,7 @@ jobs:
           path: out/
 
   linux-x86_64-static:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.windows_build_only) }}
     needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -355,6 +370,10 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
+      - name: Record build-only scope
+        if: github.event_name == 'workflow_dispatch' && inputs.windows_build_only
+        run: |
+          echo "::notice::Windows compilation and packaging only for $GITHUB_SHA. Test programs and test execution are disabled. No tag or release will be published."
       - name: Install mingw toolchain
         run: |
           sudo apt-get update
@@ -369,6 +388,7 @@ jobs:
           cmake -C contrib/b3hive-release/stable-channel-v1.cmake \
             -B build --toolchain depends/x86_64-w64-mingw32/toolchain.cmake \
             -DBUILD_GUI=ON -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF \
+            -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF \
             -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON \
             -DB3_REQUIRE_UPDATE_CHANNEL=ON \
             -DCMAKE_BUILD_TYPE=Release
@@ -396,6 +416,7 @@ jobs:
           path: out/
 
   macos-arm64:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.windows_build_only) }}
     needs: version
     runs-on: macos-15
     timeout-minutes: 180
@@ -481,6 +502,7 @@ jobs:
           path: out/
 
   macos-x86_64:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.windows_build_only) }}
     needs: version
     runs-on: macos-15-intel
     timeout-minutes: 180
