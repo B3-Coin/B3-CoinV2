@@ -9,6 +9,7 @@
 
 #include <interfaces/wallet.h>
 
+#include <QPointer>
 #include <QWidget>
 
 #include <memory>
@@ -56,6 +57,8 @@ Q_SIGNALS:
     void backupRequested();
     //! Empty hides the shell chip; otherwise this is verified controller state.
     void stakingSummaryChanged(const QString& summary);
+    //! Forward the existing controller snapshot to the selected wallet's overview.
+    void validatorStatusChanged(const B3ValidatorStatus& status);
 
 private Q_SLOTS:
     void updateLockState();
@@ -75,7 +78,9 @@ private:
     void setOperationMessage(const QString& message, const QString& role = QStringLiteral("secondary"));
     void setPublicKeys(const QString& validator_key, const QString& bls_pubkey);
 
-    WalletModel* m_wallet_model{nullptr};
+    // QObject destruction can publish controller status after WalletModel's
+    // own members are gone. Clear the observed model before those callbacks.
+    QPointer<WalletModel> m_wallet_model;
     B3ValidatorController* m_controller{nullptr};
     B3ValidatorStatus m_status;
     std::unique_ptr<TransactionFilterProxy> m_rewards_filter;

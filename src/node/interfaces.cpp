@@ -996,6 +996,29 @@ public:
         }
         return m_node.staking->Status(validator_key);
     }
+    interfaces::FinalityRecoveryControl finalityRecoveryControl() override
+    {
+        return m_node.staking ? m_node.staking->RecoveryControl() : interfaces::FinalityRecoveryControl{};
+    }
+    bool setFinalityRecovery(const std::array<unsigned char, 32>& wallet_validator,
+                            const Consensus::FinalitySignerRecovery& recovery,
+                            std::string& error) override
+    {
+        if (!m_node.staking) {
+            error = "staking is not available in this node";
+            return false;
+        }
+        return m_node.staking->SetFinalityRecovery(wallet_validator, recovery, error);
+    }
+    bool clearFinalityRecovery(const std::array<unsigned char, 32>& wallet_validator,
+                              std::string& error) override
+    {
+        if (!m_node.staking) {
+            error = "staking is not available in this node";
+            return false;
+        }
+        return m_node.staking->ClearFinalityRecovery(wallet_validator, error);
+    }
     interfaces::FinalityStatus finalityStatus(const std::optional<std::array<unsigned char, 32>>& validator_key) override
     {
         interfaces::FinalityStatus out;

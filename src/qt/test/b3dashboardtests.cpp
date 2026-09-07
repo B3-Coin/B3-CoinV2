@@ -10,6 +10,7 @@
 
 #include <consensus/amount.h>
 #include <qt/b3dashboardpage.h>
+#include <qt/b3validatorcontroller.h>
 #include <qt/bitcoinunits.h>
 #include <qt/platformstyle.h>
 
@@ -178,4 +179,40 @@ void B3DashboardTests::clientViewSlotsRenderWithoutNode()
     }
     QVERIFY(warning_visible);
     page.showOutOfSyncWarning(false);
+}
+
+void B3DashboardTests::stakingCardUsesVerifiedControllerStatus()
+{
+    auto style = TestStyle();
+    B3DashboardPage page(style.get());
+    auto* card = page.findChild<QWidget*>(QStringLiteral("dashboardStakingCard"));
+    auto* text = page.findChild<QLabel*>(QStringLiteral("dashboardStakingStatus"));
+    QVERIFY(card && text);
+    QVERIFY(!card->isHidden());
+    QCOMPARE(text->textFormat(), Qt::PlainText);
+    QVERIFY(text->text().contains(QStringLiteral("Select a wallet")));
+
+    B3ValidatorStatus status;
+    status.valid = true;
+    status.staking_running = true;
+    status.staking_uses_this_wallet = true;
+    status.finality_signing = true;
+    status.last_signed_height = 814461;
+    page.setValidatorStatus(status);
+    QVERIFY(text->text().contains(QStringLiteral("Staking is running")));
+    QVERIFY(text->text().contains(QStringLiteral("814461")));
+
+    status.staking_uses_this_wallet = false;
+    page.setValidatorStatus(status);
+    QVERIFY(text->text().contains(QStringLiteral("Another wallet")));
+    QVERIFY(!text->text().contains(QStringLiteral("814461")));
+
+    status.valid = false;
+    status.refresh_error = QStringLiteral("<b>test error</b>");
+    page.setValidatorStatus(status);
+    QVERIFY(text->text().contains(QStringLiteral("unavailable")));
+    QVERIFY(!text->text().contains(QStringLiteral("Staking is running")));
+    QCOMPARE(text->textFormat(), Qt::PlainText);
+    page.setWalletModel(nullptr);
+    QVERIFY(text->text().contains(QStringLiteral("Select a wallet")));
 }

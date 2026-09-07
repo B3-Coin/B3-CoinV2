@@ -7,10 +7,12 @@
 
 #include <consensus/amount.h>
 #include <qt/bitcoinunits.h>
+#include <qt/b3navsidebar.h>
 
 #include <QStackedWidget>
 
 class B3DashboardPage;
+struct B3ValidatorStatus;
 class ClientModel;
 class OverviewPage;
 class PlatformStyle;
@@ -45,6 +47,8 @@ public:
     */
     void setClientModel(ClientModel *clientModel);
     WalletModel* getWalletModel() const noexcept { return walletModel; }
+    //! Public page identity, independent of private stack indices.
+    B3Page currentPage() const;
 
     bool handlePaymentRequest(const SendCoinsRecipient& recipient);
 
@@ -73,6 +77,8 @@ private:
     const PlatformStyle *platformStyle;
 
 public Q_SLOTS:
+    //! Feed the current wallet's dashboard from existing validator polling.
+    void setValidatorStatus(const B3ValidatorStatus& status);
     /** Switch to overview (home) page */
     void gotoOverviewPage();
     /** Switch to history (transactions) page */
@@ -117,6 +123,7 @@ private Q_SLOTS:
     void disableTransactionView(bool disable);
 
 Q_SIGNALS:
+    void pageChanged(B3Page page);
     void setPrivacy(bool privacy);
     void transactionClicked();
     void coinsSent();

@@ -118,6 +118,14 @@ void B3Shell::setWalletWidget(QWidget* wallet_widget)
 
 void B3Shell::showPage(B3Page page)
 {
+    // A fallback options dialog is not a replacement for the visible page.
+    // Sidebar clicks have already checked their button, so restore it too.
+    if (!m_sidebar->isPageEnabled(page) ||
+        (page == B3Page::Settings && !hasSettingsPage())) {
+        m_sidebar->setCurrentPage(m_currentPage);
+        return;
+    }
+    m_currentPage = page;
     m_sidebar->setCurrentPage(page);
     switch (page) {
     case B3Page::Dashboard:
@@ -126,6 +134,14 @@ void B3Shell::showPage(B3Page page)
         break;
     case B3Page::Activity:
         m_topStatus->setSectionTitle(tr("Activity"));
+        m_content->setCurrentIndex(m_walletIndex);
+        break;
+    case B3Page::Send:
+        m_topStatus->setSectionTitle(tr("Send"));
+        m_content->setCurrentIndex(m_walletIndex);
+        break;
+    case B3Page::Receive:
+        m_topStatus->setSectionTitle(tr("Receive"));
         m_content->setCurrentIndex(m_walletIndex);
         break;
     case B3Page::Trade:
@@ -149,16 +165,24 @@ void B3Shell::showPage(B3Page page)
     }
 }
 
+bool B3Shell::walletPageVisible() const
+{
+    return m_content->currentIndex() == m_walletIndex;
+}
+
 void B3Shell::replacePage(int index, QWidget* page)
 {
     if (!page || index < 0) return;
     QWidget* old = m_content->widget(index);
+    if (old == page) return;
+    const bool was_current{m_content->currentWidget() == old};
     page->setParent(m_content);
     m_content->insertWidget(index, page);
     if (old) {
         m_content->removeWidget(old);
         old->deleteLater();
     }
+    if (was_current) m_content->setCurrentWidget(page);
 }
 
 void B3Shell::setTradePage(QWidget* page) { replacePage(m_tradeIndex, page); }

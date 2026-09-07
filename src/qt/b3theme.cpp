@@ -167,11 +167,12 @@ QPushButton {
     border: %BW%px solid %BORDER%; border-radius: %RSM%px;
     padding: 7px 14px;
 }
-QPushButton:hover { background: %CARDHOVER%; }
+QPushButton:hover:enabled { background: %CARDHOVER%; }
+QPushButton:pressed:enabled { background: %ACCENTMUTED%; }
 QPushButton:focus { border: %BW%px solid %ACCENT%; }
 QPushButton:disabled { color: %MUTED%; background: %SURFACE%; }
 QPushButton[b3variant="primary"] { background: %ACCENT%; color: #17140d; border: none; font-weight: 700; }
-QPushButton[b3variant="primary"]:hover { background: %ACCENT%; }
+QPushButton[b3variant="primary"]:hover:enabled { background: %ACCENT%; }
 QPushButton[b3variant="primary"]:disabled { background: %ACCENTMUTED%; color: %MUTED%; }
 QPushButton[b3variant="timeframe"] {
     min-width: 30px; padding: 4px 9px;
@@ -181,8 +182,21 @@ QPushButton[b3variant="timeframe"]:checked {
     background: %ACCENTMUTED%; color: %ACCENT%; border-color: #4c4021;
 }
 
-/* Only the send form's icon actions, not sidebar or other tool buttons.
-   Native macOS/Windows tool-button surfaces can otherwise stay white. */
+/* Legacy dialogs and the QWidget-based RPC console have icon-only actions.
+   Scope these surfaces so the custom sidebar keeps its own style, including
+   when the console is embedded rather than opened as a separate window. */
+QDialog QToolButton, #RPCConsole QToolButton {
+    background: %CARD%; color: %TEXT%;
+    border: %BW%px solid %BORDER%; border-radius: %RSM%px;
+    padding: 5px;
+}
+QDialog QToolButton:hover:enabled, #RPCConsole QToolButton:hover:enabled { background: %CARDHOVER%; }
+QDialog QToolButton:pressed:enabled, QDialog QToolButton:checked:enabled,
+#RPCConsole QToolButton:pressed:enabled, #RPCConsole QToolButton:checked:enabled { background: %ACCENTMUTED%; }
+QDialog QToolButton:focus:enabled, #RPCConsole QToolButton:focus:enabled { border-color: %ACCENT%; }
+QDialog QToolButton:disabled, #RPCConsole QToolButton:disabled { background: %SURFACE%; color: %MUTED%; }
+
+/* The embedded send form is not necessarily a QDialog descendant. */
 QToolButton[b3variant="recipientAction"] {
     background: %CARD%; color: %TEXT%;
     border: %BW%px solid %BORDER%; border-radius: %RSM%px;
@@ -215,6 +229,77 @@ QLineEdit, QComboBox, QAbstractSpinBox {
     selection-background-color: %ACCENTMUTED%;
 }
 QLineEdit:focus, QComboBox:focus, QAbstractSpinBox:focus { border: %BW%px solid %ACCENT%; }
+QLineEdit:disabled, QComboBox:disabled, QAbstractSpinBox:disabled { color: %MUTED%; }
+QTextEdit, QPlainTextEdit {
+    background: %SURFACE%; color: %TEXT%;
+    border: %BW%px solid %BORDER%; border-radius: %RSM%px;
+    selection-background-color: %ACCENTMUTED%; selection-color: %TEXT%;
+}
+QTextEdit:focus, QPlainTextEdit:focus { border-color: %ACCENT%; }
+QTextEdit:disabled, QPlainTextEdit:disabled { color: %MUTED%; }
+
+/* Do not mix native light subcontrols with the dark input frame. The local
+   glyphs have distinct checked/partial/disabled states and need no plugins. */
+QComboBox { padding-right: 28px; }
+QComboBox::drop-down {
+    subcontrol-origin: padding; subcontrol-position: top right; width: 24px;
+    border-left: %BW%px solid %BORDER%; background: %CARD%;
+    border-top-right-radius: %RSM%px; border-bottom-right-radius: %RSM%px;
+}
+QComboBox::drop-down:hover:enabled { background: %CARDHOVER%; }
+QComboBox::drop-down:disabled { background: %SURFACE%; }
+QComboBox::down-arrow { image: url(:/icons/b3-controls/down); width: 10px; height: 8px; }
+QComboBox::down-arrow:disabled { image: url(:/icons/b3-controls/down-disabled); }
+QComboBox QAbstractItemView {
+    background: %CARD%; color: %TEXT%;
+    selection-background-color: %ACCENTMUTED%; selection-color: %TEXT%;
+}
+QAbstractSpinBox { padding-right: 26px; }
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {
+    subcontrol-origin: border; width: 22px; height: 13px;
+    border-left: %BW%px solid %BORDER%; background: %CARD%;
+}
+QAbstractSpinBox::up-button { subcontrol-position: top right; border-top-right-radius: %RSM%px; }
+QAbstractSpinBox::down-button { subcontrol-position: bottom right; border-bottom-right-radius: %RSM%px; }
+QAbstractSpinBox::up-button:hover:enabled, QAbstractSpinBox::down-button:hover:enabled { background: %CARDHOVER%; }
+QAbstractSpinBox::up-button:pressed:enabled, QAbstractSpinBox::down-button:pressed:enabled { background: %ACCENTMUTED%; }
+QAbstractSpinBox::up-button:disabled, QAbstractSpinBox::down-button:disabled { background: %SURFACE%; }
+QAbstractSpinBox::up-arrow { image: url(:/icons/b3-controls/up); width: 10px; height: 8px; }
+QAbstractSpinBox::down-arrow { image: url(:/icons/b3-controls/down); width: 10px; height: 8px; }
+QAbstractSpinBox::up-arrow:disabled, QAbstractSpinBox::up-arrow:off { image: url(:/icons/b3-controls/up-disabled); }
+QAbstractSpinBox::down-arrow:disabled, QAbstractSpinBox::down-arrow:off { image: url(:/icons/b3-controls/down-disabled); }
+
+QCheckBox, QRadioButton { spacing: 7px; }
+QCheckBox:disabled, QRadioButton:disabled { color: %MUTED%; }
+QCheckBox::indicator, QGroupBox::indicator, QAbstractItemView::indicator {
+    width: 16px; height: 16px; border: %BW%px solid %MUTED%;
+    border-radius: 3px; background: %SURFACE%;
+}
+QCheckBox::indicator:hover:enabled, QCheckBox::indicator:focus:enabled,
+QGroupBox::indicator:hover:enabled, QAbstractItemView::indicator:hover:enabled { border-color: %ACCENT%; }
+QCheckBox::indicator:checked, QGroupBox::indicator:checked, QAbstractItemView::indicator:checked {
+    background: %ACCENT%; border-color: %ACCENT%; image: url(:/icons/b3-controls/check);
+}
+QCheckBox::indicator:indeterminate, QAbstractItemView::indicator:indeterminate {
+    background: %ACCENT%; border-color: %ACCENT%; image: url(:/icons/b3-controls/minus);
+}
+QCheckBox::indicator:disabled, QGroupBox::indicator:disabled, QAbstractItemView::indicator:disabled {
+    background: %CARD%; border-color: %BORDER%;
+}
+QCheckBox::indicator:checked:disabled, QGroupBox::indicator:checked:disabled, QAbstractItemView::indicator:checked:disabled {
+    image: url(:/icons/b3-controls/check-disabled);
+}
+QCheckBox::indicator:indeterminate:disabled, QAbstractItemView::indicator:indeterminate:disabled {
+    image: url(:/icons/b3-controls/minus-disabled);
+}
+QRadioButton::indicator {
+    width: 16px; height: 16px; border: %BW%px solid %MUTED%;
+    border-radius: 9px; background: %SURFACE%;
+}
+QRadioButton::indicator:hover:enabled, QRadioButton::indicator:focus:enabled { border-color: %ACCENT%; }
+QRadioButton::indicator:checked { border-color: %ACCENT%; image: url(:/icons/b3-controls/radio-dot); }
+QRadioButton::indicator:disabled { background: %CARD%; border-color: %BORDER%; }
+QRadioButton::indicator:checked:disabled { image: url(:/icons/b3-controls/radio-dot-disabled); }
 
 /* Tables / lists */
 QTableView, QListView, QTreeView {
@@ -313,6 +398,13 @@ void apply(QApplication& app)
     palette.setColor(QPalette::ToolTipText, kTextPrimary);
     palette.setColor(QPalette::PlaceholderText, kTextMuted);
     palette.setColor(QPalette::Link, kAccent);
+    palette.setColor(QPalette::LinkVisited, kTextSecondary);
+    palette.setColor(QPalette::Light, kCardHover);
+    palette.setColor(QPalette::Midlight, kCardHover);
+    palette.setColor(QPalette::Mid, kBorder);
+    palette.setColor(QPalette::Dark, kBackground);
+    palette.setColor(QPalette::Shadow, kBackground);
+    palette.setColor(QPalette::Disabled, QPalette::WindowText, kTextMuted);
     palette.setColor(QPalette::Disabled, QPalette::Text, kTextMuted);
     palette.setColor(QPalette::Disabled, QPalette::ButtonText, kTextMuted);
     app.setPalette(palette);

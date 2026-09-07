@@ -24,6 +24,8 @@ enum class B3Page {
     Stake = 3,
     Activity = 4,
     Settings = 5,
+    Send = 6,
+    Receive = 7,
 };
 Q_DECLARE_METATYPE(B3Page)
 
@@ -42,6 +44,9 @@ public:
     //! Reflect the active page without emitting navigated().
     void setCurrentPage(B3Page page);
     B3Page currentPage() const { return m_current; }
+    //! Mirror the existing wallet action's availability (including privacy).
+    void setPageEnabled(B3Page page, bool enabled);
+    bool isPageEnabled(B3Page page) const;
 
     //! Collapse to an icon rail for narrow windows. Navigation identities,
     //! signals and selected state remain unchanged.

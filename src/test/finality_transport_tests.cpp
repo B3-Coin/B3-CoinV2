@@ -12,6 +12,7 @@
 #include <streams.h>
 #include <test/util/finality_fixture.h>
 #include <test/util/net.h>
+#include <test/util/time.h>
 #include <util/time.h>
 #include <validation.h>
 
@@ -92,6 +93,7 @@ std::vector<node::FinalitySig> DrainSignatures(CNode& peer)
 }
 
 struct FinalityTransportNetSetup : b3test::FinalityChainFixture {
+    SteadyClockContext transport_clock;
     std::set<NodeId> live;
 
     void SetupNetwork()
@@ -284,6 +286,7 @@ BOOST_FIXTURE_TEST_CASE(early_messages_retry_then_verified_votes_replay_on_loss_
 
     ProduceTo(m_M + 13, m_vk_a); // unchanged consensus depth is now satisfied
     SetMockTime(GetTime() + 2);
+    transport_clock += 2s;
     BOOST_CHECK(m_node.peerman->SendMessages(receiver));
     BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveChainstate().FinalitySignatures().SignatureCount(a.epoch, a.height)), 2U);
     const auto first{DrainSignatures(receiver)};
@@ -294,6 +297,7 @@ BOOST_FIXTURE_TEST_CASE(early_messages_retry_then_verified_votes_replay_on_loss_
     // Drop every first-delivery byte. A clock-driven retry sends the EXACT
     // already-verified messages without invoking a validator signer again.
     SetMockTime(GetTime() + 30);
+    transport_clock += 30s;
     receiver.fPauseSend = true;
     BOOST_CHECK(m_node.peerman->SendMessages(receiver));
     BOOST_CHECK(DrainSignatures(receiver).empty()); // respects backpressure

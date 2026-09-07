@@ -56,6 +56,14 @@ QPixmap sidebarGlyphPixmap(B3Page page, int logicalSize, qreal devicePixelRatio,
             return path;
         }());
         break;
+    case B3Page::Send:
+        painter.drawLine(QPointF{3.0, 13.0}, QPointF{13.0, 3.0});
+        painter.drawPolyline(QPolygonF{{5.0, 3.0}, {13.0, 3.0}, {13.0, 11.0}});
+        break;
+    case B3Page::Receive:
+        painter.drawLine(QPointF{13.0, 3.0}, QPointF{3.0, 13.0});
+        painter.drawPolyline(QPolygonF{{3.0, 5.0}, {3.0, 13.0}, {11.0, 13.0}});
+        break;
     case B3Page::Trade:
         painter.drawPolyline(QPolygonF{{2.5, 12.5}, {6.3, 8.2}, {9.2, 9.8}, {13.3, 3.5}});
         painter.drawPolyline(QPolygonF{{10.1, 3.5}, {13.3, 3.5}, {13.3, 6.7}});
@@ -199,6 +207,8 @@ B3NavSidebar::B3NavSidebar(QWidget* parent)
     m_group->setExclusive(true);
 
     addItem(B3Page::Dashboard, tr("Overview"), "navDashboard");
+    addItem(B3Page::Send, tr("Send"), "navSend");
+    addItem(B3Page::Receive, tr("Receive"), "navReceive");
     addItem(B3Page::Trade, tr("Trade"), "navTrade");
     addItem(B3Page::Assets, tr("Assets"), "navAssets");
     addItem(B3Page::Stake, tr("Stake"), "navStake");
@@ -206,10 +216,11 @@ B3NavSidebar::B3NavSidebar(QWidget* parent)
     m_layout->addStretch(1);
     addItem(B3Page::Settings, tr("Settings"), "navSettings");
 
-    m_platform = new QLabel(tr("B3 HIVE DESKTOP\nMODERN FEATURES INACTIVE"), this);
+    // No chain state is available to this navigation-only widget.
+    m_platform = new QLabel(tr("B3 HIVE DESKTOP"), this);
     m_platform->setObjectName("B3SidebarPlatform");
     m_platform->setWordWrap(true);
-    m_platform->setAccessibleName(tr("B3 Hive desktop; modern features inactive"));
+    m_platform->setAccessibleName(tr("B3 Hive desktop"));
     m_layout->addSpacing(B3Theme::kSpaceMd);
     m_layout->addWidget(m_platform);
 
@@ -276,4 +287,15 @@ void B3NavSidebar::setCurrentPage(B3Page page)
         const QSignalBlocker blocker{m_group};
         button->setChecked(true);
     }
+}
+
+void B3NavSidebar::setPageEnabled(B3Page page, bool enabled)
+{
+    if (auto* button = m_group->button(static_cast<int>(page))) button->setEnabled(enabled);
+}
+
+bool B3NavSidebar::isPageEnabled(B3Page page) const
+{
+    const auto* button = m_group->button(static_cast<int>(page));
+    return button && button->isEnabled();
 }

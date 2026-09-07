@@ -16,6 +16,7 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
+#include <QPointer>
 #include <QResizeEvent>
 #include <QScrollArea>
 #include <QVBoxLayout>
@@ -176,19 +177,42 @@ void B3SettingsPage::reflowCards(int width)
 
 void B3SettingsPage::setWalletActions(const QList<QAction*>& actions)
 {
-    bool any{false};
+    for (QPushButton* button : m_wallet_buttons) delete button;
+    m_wallet_buttons.clear();
     for (QAction* action : actions) {
         if (!action) continue;
-        any = true;
         auto* button = new QPushButton(action->text(), m_wallet_card);
-        button->setEnabled(action->isEnabled());
+        button->setProperty("b3WalletAction", true);
+        m_wallet_buttons.push_back(button);
+        const QPointer<QAction> guarded_action{action};
+        const auto mirror = [this, guarded_action, button] {
+            if (!guarded_action) {
+                button->setEnabled(false);
+                button->hide();
+            } else {
+                button->setEnabled(guarded_action->isEnabled());
+                button->setVisible(guarded_action->isVisible());
+                button->setText(guarded_action->text());
+                button->setIcon(guarded_action->icon());
+                button->setToolTip(guarded_action->toolTip());
+                button->setCheckable(guarded_action->isCheckable());
+                button->setChecked(guarded_action->isChecked());
+            }
+            updateWalletActionNote();
+        };
         connect(button, &QPushButton::clicked, action, &QAction::trigger);
-        connect(action, &QAction::changed, button, [action, button] {
-            button->setEnabled(action->isEnabled());
-            button->setText(action->text());
-        });
+        connect(action, &QAction::changed, button, mirror);
+        connect(action, &QObject::destroyed, button, mirror);
+        mirror();
         // Insert above the trailing stretch.
         m_wallet_actions_layout->insertWidget(m_wallet_actions_layout->count() - 1, button, 0, Qt::AlignLeft);
     }
-    m_wallet_note->setVisible(!any);
+    updateWalletActionNote();
+}
+
+void B3SettingsPage::updateWalletActionNote()
+{
+    bool any_visible{false};
+    for (const QPushButton* button : m_wallet_buttons) any_visible |= !button->isHidden();
+    m_wallet_note->setVisible(!any_visible);
 }

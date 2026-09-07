@@ -87,6 +87,9 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
     addWidget(transactionsPage);
     addWidget(receiveCoinsPage);
     addWidget(sendCoinsPage);
+    connect(this, &QStackedWidget::currentChanged, this, [this] {
+        Q_EMIT pageChanged(currentPage());
+    });
 
     // Dashboard interactions reuse the existing per-wallet pages.
     connect(dashboardPage, &B3DashboardPage::transactionClicked, this, &WalletView::transactionClicked);
@@ -134,6 +137,19 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
 }
 
 WalletView::~WalletView() = default;
+
+B3Page WalletView::currentPage() const
+{
+    if (currentWidget() == sendCoinsPage) return B3Page::Send;
+    if (currentWidget() == receiveCoinsPage) return B3Page::Receive;
+    if (currentWidget() == transactionsPage) return B3Page::Activity;
+    return B3Page::Dashboard;
+}
+
+void WalletView::setValidatorStatus(const B3ValidatorStatus& status)
+{
+    dashboardPage->setValidatorStatus(status);
+}
 
 void WalletView::setClientModel(ClientModel *_clientModel)
 {

@@ -15,6 +15,7 @@
 #include <univalue.h>
 
 #include <QAction>
+#include <QIcon>
 #include <QLabel>
 #include <QPushButton>
 #include <QSignalSpy>
@@ -166,4 +167,47 @@ void B3StakeSettingsTests::shellShowsInstalledSettingsPage()
     shell.showPage(B3Page::Settings);
     QCOMPARE(shell.sidebar()->currentPage(), B3Page::Settings);
     QVERIFY(settings->isVisibleTo(&shell) || settings->parent() != nullptr);
+}
+
+void B3StakeSettingsTests::settingsActionsTrackVisibilityIconsAndReplacement()
+{
+    B3SettingsPage page;
+    // Use a registered resource, and verify the source before testing the
+    // mirror. There is no ":/icons/filesave" alias in bitcoin.qrc.
+    const QIcon backup_icon{QStringLiteral(":/icons/export")};
+    QVERIFY(!backup_icon.isNull());
+    QAction backup(backup_icon, QStringLiteral("Backup"), &page);
+    backup.setToolTip(QStringLiteral("Back up this wallet"));
+    page.setWalletActions({&backup});
+    const auto buttons = [&] {
+        QList<QPushButton*> result;
+        for (auto* button : page.findChildren<QPushButton*>()) {
+            if (button->property("b3WalletAction").toBool()) result.push_back(button);
+        }
+        return result;
+    };
+    QCOMPARE(buttons().size(), 1);
+    auto* button = buttons().front();
+    QVERIFY(!button->icon().isNull());
+    QCOMPARE(button->icon().cacheKey(), backup.icon().cacheKey());
+    const QIcon changed_icon{QStringLiteral(":/icons/lock_closed")};
+    QVERIFY(!changed_icon.isNull());
+    backup.setIcon(changed_icon);
+    QCOMPARE(button->icon().cacheKey(), changed_icon.cacheKey());
+    QCOMPARE(button->toolTip(), backup.toolTip());
+    backup.setVisible(false);
+    QVERIFY(button->isHidden());
+    backup.setVisible(true);
+    QVERIFY(!button->isHidden());
+    page.setWalletActions({&backup});
+    QCOMPARE(buttons().size(), 1);
+
+    auto* transient = new QAction(QStringLiteral("Temporary"));
+    page.setWalletActions({transient});
+    button = buttons().front();
+    delete transient;
+    QVERIFY(button->isHidden());
+    QVERIFY(!button->isEnabled());
+    page.setWalletActions({});
+    QVERIFY(buttons().isEmpty());
 }

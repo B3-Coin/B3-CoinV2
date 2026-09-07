@@ -84,6 +84,9 @@ bool WalletFrame::addView(WalletView* walletView)
 
     walletStack->addWidget(walletView);
     mapWalletViews[walletView->getWalletModel()] = walletView;
+    connect(walletView, &WalletView::pageChanged, this, [this, walletView](B3Page page) {
+        if (walletView == currentWalletView()) Q_EMIT currentPageChanged(page);
+    });
 
     return true;
 }
@@ -112,6 +115,7 @@ void WalletFrame::setCurrentWallet(WalletModel* wallet_model)
     walletStack->setCurrentWidget(walletView);
 
     Q_EMIT currentWalletSet();
+    Q_EMIT currentPageChanged(walletView->currentPage());
 }
 
 void WalletFrame::removeWallet(WalletModel* wallet_model)
@@ -146,6 +150,11 @@ void WalletFrame::showOutOfSyncWarning(bool fShow)
     QMap<WalletModel*, WalletView*>::const_iterator i;
     for (i = mapWalletViews.constBegin(); i != mapWalletViews.constEnd(); ++i)
         i.value()->showOutOfSyncWarning(fShow);
+}
+
+void WalletFrame::setValidatorStatus(const B3ValidatorStatus& status)
+{
+    if (auto* view = currentWalletView()) view->setValidatorStatus(status);
 }
 
 void WalletFrame::gotoOverviewPage()

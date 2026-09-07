@@ -16,6 +16,7 @@
 class PlatformStyle;
 class TransactionFilterProxy;
 class WalletModel;
+struct B3ValidatorStatus;
 
 QT_BEGIN_NAMESPACE
 class QLabel;
@@ -32,8 +33,8 @@ QT_END_NAMESPACE
  * balances come from WalletModel::balanceChanged, activity from the
  * wallet's TransactionTableModel through a TransactionFilterProxy, and
  * sync/network state from ClientModel signals. Nothing is fabricated —
- * no prices, no fiat value, and the staking card states honestly that no
- * staking model is available. All amount rendering respects the display
+ * no prices or fiat value. Staking status comes from the existing validator
+ * controller, without starting a second poller. All amount rendering respects the display
  * unit and the existing privacy (mask values) mode.
  */
 class B3DashboardPage : public QWidget
@@ -55,6 +56,7 @@ public:
 public Q_SLOTS:
     void setBalance(const interfaces::WalletBalances& balances);
     void setPrivacy(bool privacy);
+    void setValidatorStatus(const B3ValidatorStatus& status);
     //! Pure view updates, driven by ClientModel signals (public so tests
     //! can exercise the rendering without a node).
     void setNumBlocks(int count, const QDateTime& block_date, double verification_progress, SyncType header, SynchronizationState sync_state);

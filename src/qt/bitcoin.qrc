@@ -45,6 +45,16 @@
         <file alias="hd_disabled">res/icons/hd_disabled.png</file>
         <file alias="network_disabled">res/icons/network_disabled.png</file>
         <file alias="proxy">res/icons/proxy.png</file>
+        <file alias="b3-controls/check">res/icons/b3-controls/check.xpm</file>
+        <file alias="b3-controls/check-disabled">res/icons/b3-controls/check-disabled.xpm</file>
+        <file alias="b3-controls/minus">res/icons/b3-controls/minus.xpm</file>
+        <file alias="b3-controls/minus-disabled">res/icons/b3-controls/minus-disabled.xpm</file>
+        <file alias="b3-controls/radio-dot">res/icons/b3-controls/radio-dot.xpm</file>
+        <file alias="b3-controls/radio-dot-disabled">res/icons/b3-controls/radio-dot-disabled.xpm</file>
+        <file alias="b3-controls/up">res/icons/b3-controls/up.xpm</file>
+        <file alias="b3-controls/up-disabled">res/icons/b3-controls/up-disabled.xpm</file>
+        <file alias="b3-controls/down">res/icons/b3-controls/down.xpm</file>
+        <file alias="b3-controls/down-disabled">res/icons/b3-controls/down-disabled.xpm</file>
     </qresource>
     <qresource prefix="/animation">
         <file alias="spinner-000">res/animation/spinner-000.png</file>

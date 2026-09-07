@@ -71,6 +71,7 @@
 #include <QScreen>
 #include <QSettings>
 #include <QShortcut>
+#include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QStatusBar>
 #include <QStyle>
@@ -81,6 +82,7 @@
 #include <QVBoxLayout>
 #include <QWindow>
 
+#include <utility>
 
 /**
  * Maximum gap between node time and block time used
@@ -142,6 +144,7 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         m_shell->topStatus()->setNetwork(m_network_style->getAppName(),
                                          m_network_style->getTitleAddText());
         connect(m_shell, &B3Shell::pageSelected, this, &BitcoinGUI::onShellPageSelected);
+        connect(walletFrame, &WalletFrame::currentPageChanged, this, &BitcoinGUI::reflectWalletPage);
         // The Assets page starts in the honest no-wallet state; wallet
         // attach/detach below keeps it current.
         m_assets_page = new B3AssetsPage(m_shell);
@@ -160,6 +163,8 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
                 walletFrame, &WalletFrame::backupWallet);
         connect(m_stake_page, &B3StakePage::stakingSummaryChanged,
                 m_shell->topStatus(), &B3TopStatus::setStakingStatus);
+        connect(m_stake_page, &B3StakePage::validatorStatusChanged,
+                walletFrame, &WalletFrame::setValidatorStatus);
         // Settings organizes the existing dialogs; nothing changes meaning.
         m_settings_page = new B3SettingsPage(m_shell);
         m_shell->setSettingsPage(m_settings_page);
@@ -220,16 +225,10 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
 #ifdef ENABLE_WALLET
     // The B3FlowMesh sidebar replaces the tab toolbar for navigation. Hide
     // the redundant toolbar (its actions remain live, driven by the
-    // sidebar and menus) and relocate the wallet selector into the shell's
-    // top status area so multi-wallet selection keeps working.
+    // sidebar and menus). The wallet selector is created directly in the
+    // top status area, never owned by an action on this hidden toolbar.
     if (m_shell && appToolBar) {
         appToolBar->setVisible(false);
-        if (m_wallet_selector_label && m_wallet_selector) {
-            m_shell->topStatus()->addTrailingWidget(m_wallet_selector_label);
-            m_shell->topStatus()->addTrailingWidget(m_wallet_selector);
-            m_wallet_selector_label->setVisible(false);
-            m_wallet_selector->setVisible(false);
-        }
         if (m_settings_page) {
             // Existing wallet-security actions, surfaced on the Settings
             // page; ownership and behavior stay with the window.
@@ -360,6 +359,7 @@ void BitcoinGUI::createActions()
     connect(modalOverlay, &ModalOverlay::triggered, tabGroup, &QActionGroup::setEnabled);
 
     overviewAction = new QAction(platformStyle->SingleColorIcon(":/icons/overview"), tr("&Overview"), this);
+    overviewAction->setObjectName(QStringLiteral("overviewAction"));
     overviewAction->setStatusTip(tr("Show general overview of wallet"));
     overviewAction->setToolTip(overviewAction->statusTip());
     overviewAction->setCheckable(true);
@@ -367,6 +367,7 @@ void BitcoinGUI::createActions()
     tabGroup->addAction(overviewAction);
 
     sendCoinsAction = new QAction(platformStyle->SingleColorIcon(":/icons/send"), tr("&Send"), this);
+    sendCoinsAction->setObjectName(QStringLiteral("sendCoinsAction"));
     sendCoinsAction->setStatusTip(tr("Send B3 to a B3 address"));
     sendCoinsAction->setToolTip(sendCoinsAction->statusTip());
     sendCoinsAction->setCheckable(true);
@@ -374,6 +375,7 @@ void BitcoinGUI::createActions()
     tabGroup->addAction(sendCoinsAction);
 
     receiveCoinsAction = new QAction(platformStyle->SingleColorIcon(":/icons/receiving_addresses"), tr("&Receive"), this);
+    receiveCoinsAction->setObjectName(QStringLiteral("receiveCoinsAction"));
     receiveCoinsAction->setStatusTip(tr("Request payments (generates QR codes and b3coin: URIs)"));
     receiveCoinsAction->setToolTip(receiveCoinsAction->statusTip());
     receiveCoinsAction->setCheckable(true);
@@ -381,11 +383,24 @@ void BitcoinGUI::createActions()
     tabGroup->addAction(receiveCoinsAction);
 
     historyAction = new QAction(platformStyle->SingleColorIcon(":/icons/history"), tr("&Transactions"), this);
+    historyAction->setObjectName(QStringLiteral("historyAction"));
     historyAction->setStatusTip(tr("Browse transaction history"));
     historyAction->setToolTip(historyAction->statusTip());
     historyAction->setCheckable(true);
     historyAction->setShortcut(QKeySequence(QStringLiteral("Alt+4")));
     tabGroup->addAction(historyAction);
+    if (m_shell) {
+        for (const auto& [action, page] : {
+                 std::pair{overviewAction, B3Page::Dashboard},
+                 std::pair{sendCoinsAction, B3Page::Send},
+                 std::pair{receiveCoinsAction, B3Page::Receive},
+                 std::pair{historyAction, B3Page::Activity}}) {
+            connect(action, &QAction::changed, this, [this, action, page] {
+                m_shell->sidebar()->setPageEnabled(page, action->isEnabled());
+            });
+            m_shell->sidebar()->setPageEnabled(page, action->isEnabled());
+        }
+    }
 
 #ifdef ENABLE_WALLET
     // These showNormalIfMinimized are needed because Send Coins and Receive Coins
@@ -669,6 +684,17 @@ void BitcoinGUI::createMenuBar()
     }
     file->addAction(quitAction);
 
+    if (walletFrame) {
+        // These existing actions used to belong only to the hidden toolbar.
+        // Keep both their shortcuts and normal menu access discoverable.
+        auto* view = appMenuBar->addMenu(tr("&View"));
+        view->setObjectName(QStringLiteral("viewMenu"));
+        view->addAction(overviewAction);
+        view->addAction(sendCoinsAction);
+        view->addAction(receiveCoinsAction);
+        view->addAction(historyAction);
+    }
+
     QMenu *settings = appMenuBar->addMenu(tr("&Settings"));
     if(walletFrame)
     {
@@ -759,18 +785,28 @@ void BitcoinGUI::createToolBars()
         toolbar->addWidget(spacer);
 
         m_wallet_selector = new QComboBox();
-        m_wallet_selector->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+        m_wallet_selector->setObjectName(QStringLiteral("B3WalletSelector"));
+        m_wallet_selector->setAccessibleName(tr("Current wallet"));
+        m_wallet_selector->setAccessibleDescription(tr("Switch between loaded wallets. Open another wallet from File > Open Wallet."));
+        m_wallet_selector->setMinimumContentsLength(14);
+        m_wallet_selector->setMaximumWidth(260);
+        m_wallet_selector->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+        m_wallet_selector->setFocusPolicy(Qt::StrongFocus);
         connect(m_wallet_selector, qOverload<int>(&QComboBox::currentIndexChanged), this, &BitcoinGUI::setCurrentWalletBySelectorIndex);
 
         m_wallet_selector_label = new QLabel();
+        m_wallet_selector_label->setObjectName(QStringLiteral("B3WalletSelectorLabel"));
         m_wallet_selector_label->setText(tr("Wallet:") + " ");
         m_wallet_selector_label->setBuddy(m_wallet_selector);
 
-        m_wallet_selector_label_action = appToolBar->addWidget(m_wallet_selector_label);
-        m_wallet_selector_action = appToolBar->addWidget(m_wallet_selector);
-
-        m_wallet_selector_label_action->setVisible(false);
-        m_wallet_selector_action->setVisible(false);
+        if (m_shell) {
+            m_shell->topStatus()->addTrailingWidget(m_wallet_selector_label);
+            m_shell->topStatus()->addTrailingWidget(m_wallet_selector);
+        } else {
+            m_wallet_selector_label_action = appToolBar->addWidget(m_wallet_selector_label);
+            m_wallet_selector_action = appToolBar->addWidget(m_wallet_selector);
+        }
+        updateWalletSelector();
 #endif
     }
 }
@@ -852,7 +888,7 @@ void BitcoinGUI::enableHistoryAction(bool privacy)
 {
     if (walletFrame->currentWalletModel()) {
         historyAction->setEnabled(!privacy);
-        if (historyAction->isChecked()) gotoOverviewPage();
+        if (privacy && historyAction->isChecked()) gotoOverviewPage();
     }
 }
 
@@ -891,15 +927,14 @@ void BitcoinGUI::addWallet(WalletModel* walletModel)
     if (!walletFrame || !m_wallet_controller) return;
 
     WalletView* wallet_view = new WalletView(walletModel, platformStyle, walletFrame);
-    if (!walletFrame->addView(wallet_view)) return;
+    if (!walletFrame->addView(wallet_view)) {
+        delete wallet_view;
+        return;
+    }
 
     rpcConsole->addWallet(walletModel);
     if (m_wallet_selector->count() == 0) {
         setWalletActionsEnabled(true);
-    } else if (m_wallet_selector->count() == 1) {
-        // Relocated into the top status area: toggle the widgets directly.
-        m_wallet_selector_label->setVisible(true);
-        m_wallet_selector->setVisible(true);
     }
 
     connect(wallet_view, &WalletView::outOfSyncWarningClicked, this, &BitcoinGUI::showModalOverlay);
@@ -914,6 +949,7 @@ void BitcoinGUI::addWallet(WalletModel* walletModel)
     wallet_view->setPrivacy(isPrivacyModeActivated());
     const QString display_name = walletModel->getDisplayName();
     m_wallet_selector->addItem(display_name, QVariant::fromValue(walletModel));
+    updateWalletSelector();
 }
 
 void BitcoinGUI::removeWallet(WalletModel* walletModel)
@@ -923,21 +959,30 @@ void BitcoinGUI::removeWallet(WalletModel* walletModel)
     labelWalletHDStatusIcon->hide();
     labelWalletEncryptionIcon->hide();
 
-    int index = m_wallet_selector->findData(QVariant::fromValue(walletModel));
-    m_wallet_selector->removeItem(index);
+    {
+        // Remove the old view before routing the new selection. Otherwise a
+        // combo signal can transiently route shell pages to the closing model.
+        const QSignalBlocker blocker{m_wallet_selector};
+        const int index = m_wallet_selector->findData(QVariant::fromValue(walletModel));
+        m_wallet_selector->removeItem(index);
+    }
     if (m_wallet_selector->count() == 0) {
+        if (m_shell && m_shell->walletPageVisible()) m_shell->showPage(B3Page::Dashboard);
         setWalletActionsEnabled(false);
-        overviewAction->setChecked(true);
-    } else if (m_wallet_selector->count() == 1) {
-        m_wallet_selector_label->setVisible(false);
-        m_wallet_selector->setVisible(false);
+        if (m_shell) updateNavigationActions(m_shell->currentPage());
     }
     rpcConsole->removeWallet(walletModel);
     walletFrame->removeWallet(walletModel);
     // Never leave shell pages attached to a removed wallet model.
-    WalletModel* const remaining = m_wallet_selector->count() > 0 ? walletFrame->currentWalletModel() : nullptr;
-    if (m_assets_page) m_assets_page->setWalletModel(remaining);
-    if (m_stake_page) m_stake_page->setWalletModel(remaining);
+    WalletModel* const remaining = m_wallet_selector->currentData().value<WalletModel*>();
+    if (remaining) {
+        setCurrentWallet(remaining);
+    } else {
+        if (m_assets_page) m_assets_page->setWalletModel(nullptr);
+        if (m_stake_page) m_stake_page->setWalletModel(nullptr);
+    }
+    updateWalletSelector();
+    updateWalletStatus();
     updateWindowTitle();
 }
 
@@ -945,8 +990,11 @@ void BitcoinGUI::setCurrentWallet(WalletModel* wallet_model)
 {
     if (!walletFrame || !m_wallet_controller) return;
     walletFrame->setCurrentWallet(wallet_model);
+    if (walletFrame->currentWalletModel() != wallet_model) return;
     if (m_assets_page) m_assets_page->setWalletModel(wallet_model);
     if (m_stake_page) m_stake_page->setWalletModel(wallet_model);
+    rpcConsole->setCurrentWallet(wallet_model);
+    const QSignalBlocker blocker{m_wallet_selector};
     for (int index = 0; index < m_wallet_selector->count(); ++index) {
         if (m_wallet_selector->itemData(index).value<WalletModel*>() == wallet_model) {
             m_wallet_selector->setCurrentIndex(index);
@@ -962,20 +1010,46 @@ void BitcoinGUI::setCurrentWalletBySelectorIndex(int index)
     if (wallet_model) setCurrentWallet(wallet_model);
 }
 
+void BitcoinGUI::updateWalletSelector()
+{
+    if (!m_wallet_selector || !m_wallet_selector_label) return;
+    const int count{m_wallet_selector->count()};
+    const bool visible{m_shell ? count > 0 : count > 1};
+    m_wallet_selector->setVisible(visible);
+    m_wallet_selector_label->setVisible(visible);
+    if (m_wallet_selector_action) m_wallet_selector_action->setVisible(visible);
+    if (m_wallet_selector_label_action) m_wallet_selector_label_action->setVisible(visible);
+    m_wallet_selector->setToolTip(count > 1
+        ? tr("Switch between loaded wallets")
+        : tr("This is the only loaded wallet. Use File > Open Wallet to open another."));
+}
+
 void BitcoinGUI::removeAllWallets()
 {
     if(!walletFrame)
         return;
+    if (m_shell && m_shell->walletPageVisible()) m_shell->showPage(B3Page::Dashboard);
     setWalletActionsEnabled(false);
     if (m_assets_page) m_assets_page->setWalletModel(nullptr);
     if (m_stake_page) m_stake_page->setWalletModel(nullptr);
+    {
+        const QSignalBlocker blocker{m_wallet_selector};
+        for (int index = 0; index < m_wallet_selector->count(); ++index) {
+            rpcConsole->removeWallet(m_wallet_selector->itemData(index).value<WalletModel*>());
+        }
+        m_wallet_selector->clear();
+    }
+    updateWalletSelector();
     walletFrame->removeAllWallets();
+    if (m_shell) updateNavigationActions(m_shell->currentPage());
+    updateWalletStatus();
 }
 #endif // ENABLE_WALLET
 
 void BitcoinGUI::setWalletActionsEnabled(bool enabled)
 {
-    overviewAction->setEnabled(enabled);
+    // Overview also hosts the no-wallet Welcome/Create Wallet screen.
+    overviewAction->setEnabled(enabled || m_shell != nullptr);
     sendCoinsAction->setEnabled(enabled);
     receiveCoinsAction->setEnabled(enabled);
     historyAction->setEnabled(enabled && !isPrivacyModeActivated());
@@ -1132,30 +1206,48 @@ void BitcoinGUI::openClicked()
 
 void BitcoinGUI::gotoOverviewPage()
 {
-    overviewAction->setChecked(true);
+    if (!overviewAction->isEnabled()) return;
+    updateNavigationActions(B3Page::Dashboard);
     if (m_shell) m_shell->showPage(B3Page::Dashboard);
     if (walletFrame) walletFrame->gotoOverviewPage();
 }
 
 void BitcoinGUI::gotoHistoryPage()
 {
-    historyAction->setChecked(true);
+    if (!historyAction->isEnabled()) return;
+    updateNavigationActions(B3Page::Activity);
     if (m_shell) m_shell->showPage(B3Page::Activity);
     if (walletFrame) walletFrame->gotoHistoryPage();
 }
 
 void BitcoinGUI::gotoReceiveCoinsPage()
 {
-    receiveCoinsAction->setChecked(true);
-    if (m_shell) m_shell->showPage(B3Page::Dashboard);
+    if (!receiveCoinsAction->isEnabled()) return;
+    updateNavigationActions(B3Page::Receive);
+    if (m_shell) m_shell->showPage(B3Page::Receive);
     if (walletFrame) walletFrame->gotoReceiveCoinsPage();
 }
 
 void BitcoinGUI::gotoSendCoinsPage(QString addr)
 {
-    sendCoinsAction->setChecked(true);
-    if (m_shell) m_shell->showPage(B3Page::Dashboard);
+    if (!sendCoinsAction->isEnabled()) return;
+    updateNavigationActions(B3Page::Send);
+    if (m_shell) m_shell->showPage(B3Page::Send);
     if (walletFrame) walletFrame->gotoSendCoinsPage(addr);
+}
+
+void BitcoinGUI::reflectWalletPage(B3Page page)
+{
+    // Dashboard buttons navigate inside WalletView directly. Wallet switching
+    // may also reveal a different page; neither should leave stale chrome.
+    // A hidden wallet must not pull the user away from Trade/Stake/Settings.
+    if (!m_shell || !m_shell->walletPageVisible()) return;
+    if (page == B3Page::Activity && !historyAction->isEnabled()) {
+        gotoOverviewPage();
+        return;
+    }
+    updateNavigationActions(page);
+    m_shell->showPage(page);
 }
 
 void BitcoinGUI::gotoSignMessageTab(QString addr)
@@ -1172,6 +1264,14 @@ void BitcoinGUI::gotoLoadPSBT(bool from_clipboard)
     if (walletFrame) walletFrame->gotoLoadPSBT(from_clipboard);
 }
 #endif // ENABLE_WALLET
+
+void BitcoinGUI::updateNavigationActions(B3Page page)
+{
+    overviewAction->setChecked(page == B3Page::Dashboard);
+    sendCoinsAction->setChecked(page == B3Page::Send);
+    receiveCoinsAction->setChecked(page == B3Page::Receive);
+    historyAction->setChecked(page == B3Page::Activity);
+}
 
 void BitcoinGUI::updateNetworkState()
 {
@@ -1221,9 +1321,17 @@ void BitcoinGUI::onShellPageSelected(B3Page page)
     case B3Page::Activity:
         if (walletFrame) gotoHistoryPage();
         break;
+    case B3Page::Send:
+        if (walletFrame) gotoSendCoinsPage();
+        break;
+    case B3Page::Receive:
+        if (walletFrame) gotoReceiveCoinsPage();
+        break;
 #else
     case B3Page::Dashboard:
     case B3Page::Activity:
+    case B3Page::Send:
+    case B3Page::Receive:
         break;
 #endif
     case B3Page::Settings:
@@ -1236,6 +1344,7 @@ void BitcoinGUI::onShellPageSelected(B3Page page)
     case B3Page::Stake:
         break;
     }
+    if (m_shell) updateNavigationActions(m_shell->currentPage());
 }
 
 void BitcoinGUI::setNumConnections(int count)
@@ -1684,6 +1793,12 @@ void BitcoinGUI::updateWalletStatus()
 
     WalletView * const walletView = walletFrame->currentWalletView();
     if (!walletView) {
+        labelWalletHDStatusIcon->hide();
+        labelWalletEncryptionIcon->hide();
+        if (m_shell) {
+            m_shell->topStatus()->setWalletStatus(QString());
+            m_shell->topStatus()->setStakingStatus(QString());
+        }
         return;
     }
     WalletModel * const walletModel = walletView->getWalletModel();
@@ -1691,7 +1806,9 @@ void BitcoinGUI::updateWalletStatus()
     setHDStatus(walletModel->wallet().privateKeysDisabled(), walletModel->wallet().hdEnabled());
     if (m_shell) {
         const QString name{walletModel->getDisplayName()};
-        m_shell->topStatus()->setWalletStatus(name);
+        // The actual selector already names the current wallet. Do not
+        // show a second passive name that looks like the switching control.
+        m_shell->topStatus()->setWalletStatus(m_wallet_selector ? QString{} : name);
     }
 }
 #endif // ENABLE_WALLET

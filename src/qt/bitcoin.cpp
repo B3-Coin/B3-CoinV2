@@ -367,6 +367,9 @@ void BitcoinApplication::requestShutdown()
     pollShutdownTimer->stop();
 
 #ifdef ENABLE_WALLET
+    // Shell pages outlive the wallet controller. Detach their models and stop
+    // validator polling before wallet destruction can emit status callbacks.
+    window->removeAllWallets();
     // Delete wallet controller here manually, instead of relying on Qt object
     // tracking (https://doc.qt.io/qt-5/objecttrees.html). This makes sure
     // walletmodel m_handle_* notification handlers are deleted before wallets

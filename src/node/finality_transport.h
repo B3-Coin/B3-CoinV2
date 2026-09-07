@@ -10,9 +10,24 @@
 #include <chrono>
 #include <functional>
 #include <map>
+#include <optional>
+#include <tuple>
 #include <utility>
+#include <vector>
 
 namespace node {
+
+/** Admission is not verification. A missing digest means that the checkpoint
+ * is within the bounded look-ahead window but its block is not connected yet. */
+struct FinalityTransportCandidate {
+    std::optional<uint256> digest;
+};
+inline constexpr uint64_t MAX_FINALITY_TRANSPORT_AHEAD_BLOCKS{64};
+
+std::optional<FinalityTransportCandidate> InspectFinalityTransport(
+    const FinalitySig& sig, const FinalityTracker::State& state,
+    const CChain& chain, const Consensus::Params& params,
+    const BridgeStateIndex* bridge_index = nullptr);
 
 /** Cheap transport admission only. This does NOT verify a signature or relax
  * the pool's depth requirement. The returned digest binds a pending message
@@ -23,8 +38,10 @@ std::optional<uint256> FinalityTransportDigest(
     const BridgeStateIndex* bridge_index = nullptr);
 
 /** Unverified, fixed-size messages waiting for the local chain to reach depth.
- * Entries never count toward quorum. Admission callers must check the near-tip
- * checkpoint/epoch/index and bind the exact digest before calling Add(). */
+ * Entries never count toward quorum. Admission callers must check the bounded
+ * near-tip checkpoint/epoch/index before Add(). A future entry binds its exact
+ * digest once its block is known. All clocks here must use the same monotonic
+ * microsecond epoch, not wall-clock time. */
 class PendingFinalitySignatures
 {
 public:
@@ -34,27 +51,47 @@ public:
     static constexpr size_t MAX_RETRY_BATCH{64};
     static constexpr size_t MAX_RETRY_PER_PEER{32};
     static constexpr size_t MAX_RETRY_PER_COORDINATE{2};
+    static constexpr size_t MAX_SOURCES{3};
 
     struct Entry {
         FinalitySig sig;
         int64_t peer;
         uint256 digest;
         std::chrono::microseconds added;
+        bool digest_bound{true};
+        std::vector<int64_t> sources;
     };
 
     /** Complete-message deduplication: an invalid signature claiming an index
      * must not suppress a different, valid signature for the same index.
-     * Duplicates cannot extend expiry or change the charged source peer. */
+     * Duplicates cannot extend expiry. Up to MAX_SOURCES peers can share one
+     * byte-identical entry; every association consumes that peer's quota.
+     * Returns true only for a newly inserted payload, not an added source. */
     bool Add(const FinalitySig& sig, int64_t peer, const uint256& digest,
              std::chrono::microseconds now);
+    bool Add(const FinalitySig& sig, int64_t peer, const std::optional<uint256>& digest,
+             std::chrono::microseconds now);
 
-    /** Prune expired/disconnected/stale/fork entries; remove at most one
-     * bounded batch of depth-ready messages whose ORIGINAL source peer and
-     * global verification budgets permit another Submit(). A false budget
-     * result leaves the entry pending, never bypasses the limits. */
+    /** Compatibility wrapper for already-bound entries and a caller-supplied
+     * validity predicate. Remove at most one bounded batch of depth-ready
+     * messages whose source/global budgets permit another Submit(). A false
+     * budget result leaves the entry pending, never bypasses the limits. */
     std::vector<Entry> TakeReady(
         int ready_height, std::chrono::microseconds now,
         const std::function<bool(const Entry&)>& still_valid,
+        const std::function<bool(int64_t)>& spend_budget);
+
+    /** Bind future entries once resolver can derive their checkpoint. A
+     * changed bound digest is discarded at depth, never rebound to a different
+     * fork. Missing derived state before depth is not invalidity: the entry
+     * waits until depth/expiry; an unresolved ready entry is discarded. Choose
+     * a connected source whose verification budget
+     * permits retry; Entry.peer in the result is that charged source. Results
+     * are STILL UNVERIFIED and must pass the ordinary signature pool Submit(). */
+    std::vector<Entry> TakeReadyWithSources(
+        int ready_height, std::chrono::microseconds now,
+        const std::function<std::optional<uint256>(const Entry&)>& resolver,
+        const std::function<bool(int64_t)>& source_available,
         const std::function<bool(int64_t)>& spend_budget);
 
     void Expire(std::chrono::microseconds now);
@@ -63,6 +100,8 @@ public:
 
 private:
     using Entries = std::map<uint256, Entry>;
+    using Coordinate = std::tuple<uint64_t, uint64_t, uint32_t>;
+    void RemoveSource(int64_t peer);
     Entries::iterator Erase(Entries::iterator it);
     Entries m_entries;
     std::map<int64_t, size_t> m_peer_counts;

@@ -22,8 +22,11 @@ namespace node {
  * `last_signed_*` prevents signing the same or a lower height with a
  * different object. `lock_*` additionally prevents signing a higher
  * checkpoint on a non-descendant fork. Normally both advance together. The
- * lock may move ahead independently only after the node has validated a
- * newer, exact-same-set quorum certificate included on the active chain.
+ * lock may move ahead independently after the node has validated a newer,
+ * exact-same-set quorum certificate included on the active chain, or through
+ * the separate exact-incident recovery write below. The caller must establish
+ * that recovery's hardened-checkpoint or explicit operator-trust conditions;
+ * the store itself cannot establish agreement on the chosen chain.
  */
 struct FinalitySignerState {
     uint256 chain_domain{};
@@ -95,13 +98,14 @@ public:
                                const uint256& successor_set_hash,
                                std::string& error);
 
-    /** The chain-pinned one-time recovery of an orphaned vote (see
+    /** The exact-incident one-time recovery of an orphaned vote (see
      * Consensus::FinalitySignerRecovery). Refuses unless the durable state is
      * EXACTLY the pinned incident: the same checkpoint as both the last vote
      * and the ancestry lock, the same epoch and validator sets, and no newer
      * record. Then moves ONLY the ancestry lock to the pinned anchor (strictly
      * newer); the last actual vote is retained. `anchor_digest` is the exact
-     * finality digest this node derives for the anchor checkpoint. */
+     * finality digest this node derives for the anchor checkpoint. The signer
+     * must validate the selected trust mode before calling this write. */
     bool CommitPinnedRecoveryAnchor(
         const Consensus::FinalitySignerRecovery& recovery,
         const uint256& anchor_digest, std::string& error);
@@ -109,6 +113,18 @@ public:
     static fs::path StatePath(
         const fs::path& directory, const uint256& chain_domain,
         const modern::ValidatorKeyBytes& validator_key);
+
+    /** Read-only configuration preflight. Unlike Open(), creates no directory
+     * and never initializes a missing journal. Checks the exact intact incident
+     * only, not anchor agreement or chain eligibility. The live signer and
+     * durable write must recheck their own current state before applying it. */
+    static bool CheckOperatorRecoveryIncident(
+        const fs::path& directory, const uint256& chain_domain,
+        const modern::ValidatorKeyBytes& validator_key,
+        const Consensus::FinalitySignerRecovery& recovery, std::string& error);
+    static bool MatchesOperatorRecoveryIncident(
+        const FinalitySignerState& state,
+        const Consensus::FinalitySignerRecovery& recovery, std::string& error);
 
 private:
     bool Commit(const FinalitySignerState& next, std::string& error);

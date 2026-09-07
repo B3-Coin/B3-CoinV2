@@ -9,6 +9,7 @@
 // the pool never touches consensus state.
 
 #include <chain.h>
+#include <interfaces/chain.h>
 #include <modern/finality_certificate.h>
 #include <modern/finality_schedule.h>
 #include <node/finality_signature.h>
@@ -47,6 +48,115 @@ FinalitySig Sig(const node::FinalityTracker::State& state, const CChain& chain, 
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(finality_signature_tests)
+
+BOOST_FIXTURE_TEST_CASE(pool_verification_budget_follows_exact_dedup_and_cheap_checks, FinalityChainFixture)
+{
+    PrepareFinalityChain();
+    const int M{m_M};
+    ProduceTo(M + 48, m_vk_a);
+    const auto& params{m_node.chainman->GetConsensus()};
+    LOCK(cs_main);
+    const auto& chain{m_node.chainman->ActiveChain()};
+    auto& tracker{Finality()};
+    const auto& state{tracker.Current()};
+    const auto idx_a{*state.current->IndexOf(m_vk_a)};
+    const auto idx_b{*state.current->IndexOf(m_vk_b)};
+    const auto a{Sig(state, chain, m_domain, 0, M + 5, idx_a, m_bls_a)};
+    const auto b{Sig(state, chain, m_domain, 0, M + 5, idx_b, m_bls_b)};
+    FinalitySignaturePool pool;
+    unsigned budget_calls{0};
+    bool allow_verification{false};
+    const auto budget = [&] {
+        ++budget_calls;
+        return allow_verification;
+    };
+    const auto submit = [&](const FinalitySig& sig) {
+        return pool.Submit(sig, tracker, chain, params, nullptr, budget);
+    };
+
+    BOOST_CHECK_EQUAL(FinalitySignaturePool::AcceptName(Accept::VERIFICATION_DEFERRED), "verification-deferred");
+    BOOST_CHECK(submit(a) == Accept::VERIFICATION_DEFERRED);
+    BOOST_CHECK_EQUAL(budget_calls, 1U);
+    BOOST_CHECK_EQUAL(pool.TrackedCheckpoints(), 0U);
+    allow_verification = true;
+    BOOST_REQUIRE(submit(a) == Accept::ACCEPTED);
+    BOOST_CHECK_EQUAL(budget_calls, 2U);
+
+    // Only these exact verified bytes qualify for the cheap duplicate path,
+    // even when no verification capacity is currently available.
+    allow_verification = false;
+    BOOST_CHECK(submit(a) == Accept::DUPLICATE);
+    FinalitySig poisoned{a};
+    poisoned.signature.fill(0);
+    BOOST_CHECK(submit(poisoned) == Accept::BAD_SIGNATURE);
+    poisoned.signature = b.signature;
+    BOOST_CHECK(submit(poisoned) == Accept::BAD_SIGNATURE);
+    BOOST_CHECK_EQUAL(budget_calls, 2U);
+    BOOST_CHECK_EQUAL(pool.SignatureCount(0, M + 5), 1U);
+    BOOST_CHECK(pool.RelayableSignatures(tracker, chain, params) == std::vector<FinalitySig>{a});
+
+    // A new index must obtain a budget even within an existing checkpoint.
+    BOOST_CHECK(submit(b) == Accept::VERIFICATION_DEFERRED);
+    BOOST_CHECK_EQUAL(budget_calls, 3U);
+    BOOST_CHECK_EQUAL(pool.SignatureCount(0, M + 5), 1U);
+    allow_verification = true;
+    poisoned = b;
+    poisoned.signature.fill(0);
+    BOOST_CHECK(submit(poisoned) == Accept::BAD_SIGNATURE);
+    BOOST_CHECK_EQUAL(budget_calls, 4U);
+    BOOST_CHECK_EQUAL(pool.SignatureCount(0, M + 5), 1U);
+    BOOST_REQUIRE(submit(b) == Accept::ACCEPTED);
+    BOOST_CHECK_EQUAL(budget_calls, 5U);
+    BOOST_CHECK(pool.BestCertificate(tracker, chain, params).has_value());
+
+    // Malformed coordinates and shallow checkpoints are rejected before the
+    // BLS budget, without relying on their signature bytes being valid.
+    auto bad{a};
+    bad.index = static_cast<uint32_t>(state.current->Size());
+    BOOST_CHECK(submit(bad) == Accept::BAD_INDEX);
+    bad = a;
+    bad.epoch = 99;
+    BOOST_CHECK(submit(bad) == Accept::UNKNOWN_EPOCH);
+    bad = a;
+    bad.height = M + 6;
+    BOOST_CHECK(submit(bad) == Accept::NOT_CHECKPOINT);
+    bad.height = M + 55;
+    BOOST_CHECK(submit(bad) == Accept::NOT_CHECKPOINT);
+    auto shallow_params{params};
+    shallow_params.modern_pos->checkpoint_depth = 50;
+    BOOST_CHECK(pool.Submit(a, tracker, chain, shallow_params, nullptr, budget) == Accept::TOO_SHALLOW);
+    const Consensus::Params unconfigured{};
+    BOOST_CHECK(pool.Submit(a, tracker, chain, unconfigured, nullptr, budget) == Accept::STALE);
+    BOOST_CHECK_EQUAL(budget_calls, 5U);
+
+    // Fill all eight slots using the unchanged local/default submission path.
+    for (int i{2}; i <= 8; ++i) {
+        BOOST_REQUIRE(pool.Submit(Sig(state, chain, m_domain, 0, M + 5 * i, idx_a, m_bls_a),
+                                  tracker, chain, params) == Accept::ACCEPTED);
+    }
+    BOOST_REQUIRE_EQUAL(pool.TrackedCheckpoints(), FinalitySignaturePool::MAX_TRACKED_CHECKPOINTS);
+    BOOST_CHECK(submit(Sig(state, chain, m_domain, 0, M, idx_a, m_bls_a)) == Accept::POOL_FULL);
+    BOOST_CHECK_EQUAL(budget_calls, 5U);
+    const auto retained{pool.RelayableSignatures(tracker, chain, params)};
+    const auto newest{Sig(state, chain, m_domain, 0, M + 45, idx_a, m_bls_a)};
+    allow_verification = false;
+    BOOST_CHECK(submit(newest) == Accept::VERIFICATION_DEFERRED);
+    BOOST_CHECK_EQUAL(budget_calls, 6U);
+    BOOST_CHECK_EQUAL(pool.TrackedCheckpoints(), FinalitySignaturePool::MAX_TRACKED_CHECKPOINTS);
+    BOOST_CHECK(pool.RelayableSignatures(tracker, chain, params) == retained);
+    BOOST_CHECK_EQUAL(pool.SignatureCount(0, M + 45), 0U);
+    allow_verification = true;
+    poisoned = newest;
+    poisoned.signature.fill(0);
+    BOOST_CHECK(submit(poisoned) == Accept::BAD_SIGNATURE);
+    BOOST_CHECK_EQUAL(budget_calls, 7U);
+    BOOST_CHECK(pool.RelayableSignatures(tracker, chain, params) == retained);
+    BOOST_REQUIRE(submit(newest) == Accept::ACCEPTED);
+    BOOST_CHECK_EQUAL(budget_calls, 8U);
+    BOOST_CHECK_EQUAL(pool.SignatureCount(0, M + 5), 0U);
+    BOOST_CHECK_EQUAL(pool.SignatureCount(0, M + 45), 1U);
+    BOOST_CHECK_EQUAL(pool.TrackedCheckpoints(), FinalitySignaturePool::MAX_TRACKED_CHECKPOINTS);
+}
 
 BOOST_FIXTURE_TEST_CASE(verified_observations_and_exact_replay_exclude_shallow_and_finalized, FinalityChainFixture)
 {
@@ -506,6 +616,11 @@ BOOST_FIXTURE_TEST_CASE(durable_signer_survives_restart_locks_forks_and_rebases_
                         initial_pool)
                         .empty());
         BOOST_CHECK(original.LastError().empty());
+        const auto observed{original.RecoveryStatus(
+            Finality(), m_node.chainman->ActiveChain(), params)};
+        BOOST_CHECK_EQUAL(observed.state, "no_ancestry_lock");
+        BOOST_CHECK(observed.journal_present);
+        BOOST_CHECK(!observed.lock_height);
     }
 
     ProduceTo(M + 8, m_vk_a);
@@ -530,6 +645,12 @@ BOOST_FIXTURE_TEST_CASE(durable_signer_survives_restart_locks_forks_and_rebases_
         BOOST_CHECK(late_without_journal.LastError().find(
                         "possibly deleted anti-equivocation record") !=
                     std::string::npos);
+        const auto observed{late_without_journal.RecoveryStatus(
+            Finality(), m_node.chainman->ActiveChain(), params)};
+        BOOST_CHECK_EQUAL(observed.state, "journal_missing");
+        BOOST_CHECK(observed.journal_open);
+        BOOST_CHECK(!observed.journal_present);
+        BOOST_CHECK(!observed.blocked_on_orphan_vote);
     }
 
     node::FinalitySigner newcomer;
@@ -601,6 +722,26 @@ BOOST_FIXTURE_TEST_CASE(durable_signer_survives_restart_locks_forks_and_rebases_
                         .empty());
         BOOST_CHECK(!restarted.LastError().empty());
         BOOST_CHECK_EQUAL(new_branch_pool.SignatureCount(0, M + 10), 0U);
+        const auto observed{restarted.RecoveryStatus(
+            Finality(), m_node.chainman->ActiveChain(), params)};
+        BOOST_CHECK_EQUAL(observed.state, "blocked_on_orphan_vote");
+        BOOST_CHECK(observed.blocked_on_orphan_vote);
+        BOOST_REQUIRE(observed.lock_height);
+        BOOST_CHECK_EQUAL(*observed.lock_height, M + 5);
+        BOOST_CHECK_EQUAL(observed.last_signed_height, M + 5);
+        BOOST_CHECK(observed.last_signed_hash == old_lock_hash);
+        BOOST_CHECK(observed.last_signed_digest == observed.lock_digest);
+        BOOST_CHECK(observed.lock_hash == old_lock_hash);
+        BOOST_REQUIRE(observed.current_chain_hash);
+        BOOST_CHECK(*observed.current_chain_hash == m_node.chainman->ActiveChain()[M + 5]->GetBlockHash());
+        BOOST_CHECK_EQUAL(observed.lock_epoch, 0U);
+        BOOST_CHECK(observed.lock_signing_set_hash == Finality().Current().current->SetHash());
+        BOOST_CHECK_EQUAL(observed.observed_tip_height, M + 13);
+        BOOST_CHECK(!observed.certificate_strictly_newer);
+
+        // An observation must never move the last vote or its orphan lock.
+        BOOST_CHECK_EQUAL(restarted.LastSignedHeight(), M + 5);
+        BOOST_CHECK(restarted.RecoveryStatus(Finality(), m_node.chainman->ActiveChain(), params).lock_hash == old_lock_hash);
     }
 
     // A certificate validly signed by the quorum and INCLUDED on B3 is the
@@ -615,6 +756,16 @@ BOOST_FIXTURE_TEST_CASE(durable_signer_survives_restart_locks_forks_and_rebases_
     ProduceTo(M + 18, m_vk_a);
     {
         LOCK(cs_main);
+        const auto before{restarted.RecoveryStatus(
+            Finality(), m_node.chainman->ActiveChain(), params)};
+        BOOST_CHECK(before.blocked_on_orphan_vote);
+        BOOST_CHECK(before.certificate_included);
+        BOOST_CHECK(before.certificate_strictly_newer);
+        BOOST_CHECK(before.certificate_same_epoch);
+        BOOST_CHECK(before.certificate_same_set);
+        BOOST_CHECK(before.certificate_reconstructible);
+        BOOST_CHECK(before.lock_hash == old_lock_hash);
+        BOOST_CHECK_EQUAL(restarted.LastSignedHeight(), M + 5);
         const auto signed_new{restarted.MaybeSign(
             Finality(), m_node.chainman->ActiveChain(), params,
             new_branch_pool)};
@@ -622,6 +773,12 @@ BOOST_FIXTURE_TEST_CASE(durable_signer_survives_restart_locks_forks_and_rebases_
         BOOST_CHECK_EQUAL(signed_new.front().height,
                           static_cast<uint64_t>(M + 15));
         BOOST_CHECK(restarted.LastError().empty());
+        const auto after{restarted.RecoveryStatus(
+            Finality(), m_node.chainman->ActiveChain(), params)};
+        BOOST_CHECK_EQUAL(after.state, "lock_matches_chain");
+        BOOST_CHECK(!after.blocked_on_orphan_vote);
+        BOOST_REQUIRE(after.lock_height);
+        BOOST_CHECK_EQUAL(*after.lock_height, M + 15);
     }
 
     // A genuinely new validator may be armed after M once an included
@@ -764,8 +921,19 @@ BOOST_FIXTURE_TEST_CASE(pool_replaces_same_checkpoint_after_prefinality_reorg, F
         BOOST_CHECK(!pool.BestCertificate(tracker, chain, params).has_value());
         BOOST_CHECK(pool.VerifiedCheckpoints(tracker, chain, params).empty());
         BOOST_CHECK(pool.RelayableSignatures(tracker, chain, params).empty());
-        BOOST_CHECK(pool.Submit(old_a, tracker, chain, params) ==
-                    Accept::BAD_SIGNATURE);
+        unsigned budget_calls{0};
+        // Bytes verified on the abandoned branch do not become a cheap
+        // duplicate on this branch: the current digest must match first.
+        BOOST_CHECK(pool.Submit(old_a, tracker, chain, params, nullptr, [&] {
+                        ++budget_calls;
+                        return false;
+                    }) == Accept::VERIFICATION_DEFERRED);
+        BOOST_CHECK_EQUAL(budget_calls, 1U);
+        BOOST_CHECK(pool.Submit(old_a, tracker, chain, params, nullptr, [&] {
+                        ++budget_calls;
+                        return true;
+                    }) == Accept::BAD_SIGNATURE);
+        BOOST_CHECK_EQUAL(budget_calls, 2U);
         BOOST_CHECK_EQUAL(pool.SignatureCount(0, M + 5), 0U);
         const FinalitySig new_a{Sig(tracker.Current(), chain, m_domain, 0,
                                     M + 5, idx_a, m_bls_a)};

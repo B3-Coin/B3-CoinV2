@@ -27,16 +27,14 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 # Project / Package metadata
 #=============================
 set(CLIENT_NAME "B3 FlowMesh client")
-# B3 Hive 1.1.4 release preparation. Keep development builds distinguishable
-# until the release is explicitly approved. Product versioning is independent
-# of the unchanged modern P2P protocol and consensus rules.
+# B3 Hive 1.1.4. Product versioning is independent of the unchanged modern
+# P2P protocol and consensus rules.
 set(CLIENT_VERSION_MAJOR 1)
 set(CLIENT_VERSION_MINOR 1)
 set(CLIENT_VERSION_BUILD 4)
 set(CLIENT_VERSION_RC 0)
-# Not a published final release.
-set(CLIENT_VERSION_PRERELEASE "dev")
-set(CLIENT_VERSION_IS_RELEASE "false")
+set(CLIENT_VERSION_PRERELEASE "")
+set(CLIENT_VERSION_IS_RELEASE "true")
 set(COPYRIGHT_YEAR "2026")
 
 # During the enabling of the CXX and CXXOBJ languages, we modify

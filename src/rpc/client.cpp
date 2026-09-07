@@ -56,6 +56,8 @@ public:
  */
 static const CRPCConvertParam vRPCConvertParams[] =
 {
+    { "setfinalityrecovery", 0, "manifest" },
+    { "setfinalityrecovery", 1, "accepted_anchor", ParamFormat::STRING },
     { "setmocktime", 0, "timestamp" },
     { "mockscheduler", 0, "delta_time" },
     { "utxoupdatepsbt", 0, "psbt", ParamFormat::STRING },

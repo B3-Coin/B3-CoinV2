@@ -1,0 +1,23 @@
+/* XPM */
+/* Local B3 control glyph; built-in Qt image support, no SVG plugin needed. */
+static const char *b3_radio_dot[] = {
+"16 16 2 1",
+"  c None",
+". c #f1bd47",
+"                ",
+"                ",
+"                ",
+"                ",
+"      ....      ",
+"     ......     ",
+"    ........    ",
+"    ........    ",
+"    ........    ",
+"    ........    ",
+"     ......     ",
+"      ....      ",
+"                ",
+"                ",
+"                ",
+"                "
+};

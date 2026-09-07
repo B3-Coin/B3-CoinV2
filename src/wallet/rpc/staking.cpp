@@ -17,6 +17,8 @@
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <wallet/coincontrol.h>
+#include <wallet/rpc/finality_recovery.h>
+#include <wallet/rpc/finality_recovery_status.h>
 #include <wallet/rpc/util.h>
 #include <crypto/bls.h>
 #include <random.h>
@@ -522,7 +524,12 @@ RPCHelpMan getfinalityinfo()
         "This wallet's Modern-PoS finality view: the validator's FINALITY_KEY binding and derived BLS\n"
         "public keys, eligibility and weight in the active validator set, the epoch state machine, the\n"
         "latest finalized checkpoint, the persisted pin and the local signing status. Private BLS material\n"
-        "is never returned.\n",
+        "is never returned. Recovery diagnostics are a cached observation from this wallet's running signer,\n"
+        "not a fresh disk-journal inspection or permission to reset its lock. Normal orphan-lock recovery\n"
+        "requires a strictly newer certificate included on the active chain using the exact locked epoch\n"
+        "and signing set. A higher tip, timeout, or successor-epoch certificate is not that proof.\n"
+        "Separately, getfinalityrecoveryinfo and setfinalityrecovery expose an explicit operator-trusted\n"
+        "emergency exception. It is not normal certificate recovery and does not revoke old signatures.\n",
         {},
         RPCResult{RPCResult::Type::OBJ, "", "",
                   {
@@ -574,6 +581,57 @@ RPCHelpMan getfinalityinfo()
                            {RPCResult::Type::NUM, "last_signed_height", ""},
                            {RPCResult::Type::NUM, "pool_checkpoints", "checkpoints tracked by the local signature pool"},
                            {RPCResult::Type::STR, "last_error", /*optional=*/true, "the staking loop's last reported error"},
+                           {RPCResult::Type::OBJ, "recovery", "read-only snapshot; unavailable does not mean safe to sign",
+                            {
+                                {RPCResult::Type::BOOL, "available", "a matching running signer has observed a synced chain tip"},
+                                {RPCResult::Type::STR, "state", "diagnostic state, including blocked_on_orphan_vote, waiting_for_locked_height, journal_missing, signer_error, lock_matches_chain, or an unavailable reason"},
+                                {RPCResult::Type::STR, "source", /*optional=*/true, "running_signer_snapshot; never reads or recreates a journal"},
+                                {RPCResult::Type::OBJ, "observed_tip", /*optional=*/true, "chain tip used for this cached observation",
+                                 {{RPCResult::Type::NUM, "height", ""}, {RPCResult::Type::STR_HEX, "hash", "B3 display order"}}},
+                                {RPCResult::Type::BOOL, "journal_open", /*optional=*/true, "the signer already has an open journal"},
+                                {RPCResult::Type::BOOL, "journal_present", /*optional=*/true, "the open signer has a loaded public journal record"},
+                                {RPCResult::Type::BOOL, "permanent_error", /*optional=*/true, "the signer requires its durable-state error to be resolved; certificate checks alone cannot bypass it"},
+                                {RPCResult::Type::BOOL, "blocked_on_orphan_vote", /*optional=*/true, "the observed active-chain block at the lock height differs from the locked block; false is not an assertion that the signer is armed"},
+                                {RPCResult::Type::OBJ, "last_vote", /*optional=*/true, "last vote recorded in the journal, which may precede a later certified ancestry anchor; hashes/digest use B3 display order",
+                                 {
+                                     {RPCResult::Type::NUM, "height", ""},
+                                     {RPCResult::Type::STR_HEX, "hash", "signed block hash"},
+                                     {RPCResult::Type::STR_HEX, "digest", "exact signed-object digest"},
+                                 }},
+                                {RPCResult::Type::OBJ, "lock", /*optional=*/true, "the existing ancestry lock; hashes use B3 display order",
+                                 {
+                                     {RPCResult::Type::NUM, "height", ""},
+                                     {RPCResult::Type::STR_HEX, "hash", "locked block hash"},
+                                     {RPCResult::Type::STR_HEX, "digest", "locked signed-object digest"},
+                                     {RPCResult::Type::NUM, "epoch", ""},
+                                     {RPCResult::Type::STR_HEX, "signing_set_hash", ""},
+                                     {RPCResult::Type::STR_HEX, "successor_set_hash", ""},
+                                     {RPCResult::Type::STR_HEX, "current_chain_hash", /*optional=*/true, "observed active-chain block at this height; absent if that height is not available"},
+                                 }},
+                                {RPCResult::Type::OBJ, "required_proof", /*optional=*/true, "normal protocol proof for changing an orphan lock; the separate operator exception is described by getfinalityrecoveryinfo",
+                                 {
+                                     {RPCResult::Type::STR, "type", "newer_included_same_epoch_same_set_certificate"},
+                                     {RPCResult::Type::NUM, "checkpoint_height_strictly_greater_than", "the locked height; equality is insufficient"},
+                                     {RPCResult::Type::NUM, "epoch", "required exact signing epoch"},
+                                     {RPCResult::Type::STR_HEX, "signing_set_hash", "required exact signing set"},
+                                 }},
+                                {RPCResult::Type::OBJ, "latest_certificate_checks", /*optional=*/true, "checks on the observed latest certificate, not authorization to change a journal; false if absent or not derivable",
+                                 {
+                                     {RPCResult::Type::BOOL, "included_on_active_chain", ""},
+                                     {RPCResult::Type::BOOL, "strictly_newer", ""},
+                                     {RPCResult::Type::BOOL, "same_epoch", ""},
+                                     {RPCResult::Type::BOOL, "same_signing_set", ""},
+                                     {RPCResult::Type::BOOL, "checkpoint_reconstructible", ""},
+                                 }},
+                                {RPCResult::Type::OBJ, "observed_finalized", /*optional=*/true, "latest finalized checkpoint at observed_tip, which may lag the top-level finalized view",
+                                 {
+                                     {RPCResult::Type::NUM, "height", ""},
+                                     {RPCResult::Type::STR_HEX, "hash", ""},
+                                     {RPCResult::Type::NUM, "epoch", ""},
+                                     {RPCResult::Type::NUM, "included_at_height", ""},
+                                     {RPCResult::Type::STR_HEX, "signing_set_hash", /*optional=*/true, "present only while the signing set can be reconstructed"},
+                                 }},
+                            }},
                            {RPCResult::Type::ARR, "snapshot_keys", "public keys required by the frozen current, previous and prepared next validator sets",
                             {
                                 {RPCResult::Type::OBJ, "", "",
@@ -664,6 +722,7 @@ RPCHelpMan getfinalityinfo()
             signing.pushKV("last_signed_height", staking.last_signed_height);
             signing.pushKV("pool_checkpoints", st.pool_checkpoints);
             if (!staking.last_error.empty()) signing.pushKV("last_error", staking.last_error);
+            signing.pushKV("recovery", FinalityRecoveryStatusToJSON(staking, ctx.vk));
             UniValue snapshot_keys(UniValue::VARR);
             for (const auto& snapshot : st.signing_keys) {
                 UniValue snapshot_key(UniValue::VOBJ);
@@ -936,6 +995,168 @@ RPCHelpMan signbridgebootstrap()
             result.pushKV("finality_pin_hash", HexStr(status.pin_hash));
             result.pushKV("finality_pin_hash_b3", status.pin_hash.GetHex());
             return result;
+        },
+    };
+}
+
+RPCHelpMan getfinalityrecoveryinfo()
+{
+    return RPCHelpMan{
+        "getfinalityrecoveryinfo",
+        "Read this wallet's cached finality signer observation and public recovery configuration.\n"
+        "Does not unlock the wallet, create a validator key, open a journal, or authorize recovery.\n"
+        "Normal recovery uses a newer included same-epoch, same-set certificate. The separate\n"
+        "operator-trusted exception requires an exact incident manifest and accepted anchor.\n"
+        "A configured manifest is not evidence that recovery has applied. After startstaking,\n"
+        "inspect the observed lock and subsequent last_vote to confirm actual progress.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "",
+                  {
+                      {RPCResult::Type::STR_HEX, "validator_key", /*optional=*/true, "this wallet's existing public validator key"},
+                      {RPCResult::Type::OBJ, "signer", "cached observation, with the same fields as getfinalityinfo signing.recovery; not a new journal inspection",
+                       {{RPCResult::Type::ELISION, "", ""}}},
+                      {RPCResult::Type::OBJ, "operator_recovery", "explicit emergency exception, not a quorum proof",
+                       {
+                           {RPCResult::Type::BOOL, "supported", "the node supports operator recovery configuration"},
+                           {RPCResult::Type::BOOL, "staking_running", "stop staking before changing the plan"},
+                           {RPCResult::Type::BOOL, "configured_for_wallet", "this wallet has a configured plan; does not mean applied"},
+                           {RPCResult::Type::BOOL, "configured_for_other_wallet", "another validator has a plan; this wallet cannot replace or clear it"},
+                           {RPCResult::Type::STR, "persistence", "RPC configuration is memory-only; startup options remain unchanged"},
+                           {RPCResult::Type::OBJ, "manifest", /*optional=*/true, "this wallet's public manifest, using the setfinalityrecovery schema",
+                            {{RPCResult::Type::ELISION, "", ""}}},
+                           {RPCResult::Type::STR, "warning", "limitations of this operator trust exception"},
+                       }},
+                  }},
+        RPCExamples{HelpExampleCli("getfinalityrecoveryinfo", "") + HelpExampleRpc("getfinalityrecoveryinfo", "")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const std::shared_ptr<CWallet> pwallet{GetWalletForJSONRPCRequest(request)};
+            if (!pwallet) return UniValue::VNULL;
+            LOCK(pwallet->cs_wallet);
+            const auto validator{pwallet->GetValidatorPubKey()};
+            std::optional<std::array<unsigned char, 32>> vk;
+            if (validator) vk = XOnlyBytes(*validator);
+            UniValue obj{UniValue::VOBJ};
+            if (vk) {
+                obj.pushKV("validator_key", HexStr(*vk));
+                obj.pushKV("signer", FinalityRecoveryStatusToJSON(pwallet->chain().stakingStatus(vk), *vk));
+            } else {
+                UniValue signer{UniValue::VOBJ};
+                signer.pushKV("available", false);
+                signer.pushKV("state", "wallet_has_no_validator_key");
+                obj.pushKV("signer", std::move(signer));
+            }
+            obj.pushKV("operator_recovery", FinalityRecoveryControlToJSON(pwallet->chain().finalityRecoveryControl(), vk));
+            return obj;
+        },
+    };
+}
+
+RPCHelpMan setfinalityrecovery()
+{
+    return RPCHelpMan{
+        "setfinalityrecovery",
+        "Configure an explicit operator-trusted, one-time orphan-lock recovery for this wallet's\n"
+        "existing validator. Requires an unlocked wallet and stopped staking. The node checks the\n"
+        "intact journal against the exact incident; missing/deleted journals cannot be recovered.\n"
+        "This call only configures memory: it does not change the journal or sign. Run startstaking\n"
+        "afterward; the signer rechecks the anchor, epoch, sets and depth before moving the lock\n"
+        "forward, preserving the old vote. The anchor must be in the incident epoch, which must\n"
+        "still be current or immediately previous. On mainnet subsequent checkpoints wait 20 blocks.\n"
+        "WARNING: the manifest is operator trust, not a quorum proof. Old signatures remain valid\n"
+        "and this exception can weaken finality safety. Independently agree the exact incident and\n"
+        "anchor before accepting it. Twenty blocks does not eliminate reorg risk. No default anchor\n"
+        "is chosen. Configuration is lost on restart; any startup recovery options are unchanged.\n",
+        {
+            {"manifest", RPCArg::Type::OBJ, RPCArg::Optional::NO, "public incident and agreed anchor; exact fields only, no private keys or file paths",
+             {
+                 {"version", RPCArg::Type::NUM, RPCArg::Optional::NO, "integer 1"},
+                 {"chain_domain", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "64 hex characters, B3 display order"},
+                 {"validator_key", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "this wallet's exact 32-byte x-only public key, hex"},
+                 {"incident_height", RPCArg::Type::NUM, RPCArg::Optional::NO, "existing orphan vote and lock height"},
+                 {"incident_block_hash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "exact orphan hash, B3 display order"},
+                 {"incident_epoch", RPCArg::Type::NUM, RPCArg::Optional::NO, "exact journal epoch"},
+                 {"incident_signing_set_hash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "exact locked signing set, B3 display order"},
+                 {"incident_successor_set_hash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "exact locked successor set, B3 display order"},
+                 {"anchor_height", RPCArg::Type::NUM, RPCArg::Optional::NO, "agreed scheduled checkpoint strictly above the incident in that same retained epoch"},
+                 {"anchor_block_hash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "agreed active-chain checkpoint hash, B3 display order"},
+             }},
+            {"accepted_anchor", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "repeat the exact 64-hex anchor_block_hash to explicitly accept this trust exception"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "configuration only, never an assertion of recovered signing",
+                  {
+                      {RPCResult::Type::BOOL, "configured", "true when the pending plan was accepted"},
+                      {RPCResult::Type::BOOL, "recovered", "always false: this RPC never applies recovery"},
+                      {RPCResult::Type::STR, "state", "configured_for_next_startstaking"},
+                      {RPCResult::Type::BOOL, "journal_unchanged", "always true"},
+                      {RPCResult::Type::STR_HEX, "validator_key", "the targeted public validator"},
+                      {RPCResult::Type::NUM, "anchor_height", "the approved anchor height"},
+                      {RPCResult::Type::STR_HEX, "anchor_block_hash", "the approved anchor hash"},
+                  }},
+        RPCExamples{HelpExampleCli("setfinalityrecovery", "'<manifest JSON>' '<accepted anchor hash>'")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const std::shared_ptr<CWallet> pwallet{GetWalletForJSONRPCRequest(request)};
+            if (!pwallet) return UniValue::VNULL;
+            LOCK(pwallet->cs_wallet);
+            EnsureWalletIsUnlocked(*pwallet);
+            const auto validator{pwallet->GetValidatorPubKey()};
+            if (!validator) throw JSONRPCError(RPC_WALLET_ERROR, "This wallet has no existing validator key; recovery does not create one");
+            const auto vk{XOnlyBytes(*validator)};
+            std::string error;
+            Consensus::FinalitySignerRecovery plan;
+            if (!ParseWalletFinalityRecoveryManifest(request.params[0], request.params[1], vk, plan, error)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, error);
+            }
+            if (!CheckWalletFinalityRecoveryControl(pwallet->chain().finalityRecoveryControl(), vk, error) ||
+                !pwallet->chain().setFinalityRecovery(vk, plan, error)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, error);
+            }
+            UniValue obj{UniValue::VOBJ};
+            obj.pushKV("configured", true);
+            obj.pushKV("recovered", false);
+            obj.pushKV("state", "configured_for_next_startstaking");
+            obj.pushKV("journal_unchanged", true);
+            obj.pushKV("validator_key", HexStr(vk));
+            obj.pushKV("anchor_height", plan.anchor_height);
+            obj.pushKV("anchor_block_hash", plan.anchor_block_hash.GetHex());
+            return obj;
+        },
+    };
+}
+
+RPCHelpMan clearfinalityrecovery()
+{
+    return RPCHelpMan{
+        "clearfinalityrecovery",
+        "Clear this wallet's pending operator-recovery configuration from node memory. Requires an\n"
+        "unlocked wallet with an existing validator key and stopped staking. Refuses to clear another\n"
+        "validator's plan. This does not undo an applied recovery, rewind or erase a journal, or remove\n"
+        "startup recovery options. If options remain in the configuration file they are read at restart.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "",
+                  {
+                      {RPCResult::Type::BOOL, "configured", "false after successful clearing"},
+                      {RPCResult::Type::BOOL, "journal_unchanged", "always true"},
+                      {RPCResult::Type::BOOL, "startup_options_unchanged", "always true; this RPC never edits configuration files"},
+                  }},
+        RPCExamples{HelpExampleCli("clearfinalityrecovery", "") + HelpExampleRpc("clearfinalityrecovery", "")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const std::shared_ptr<CWallet> pwallet{GetWalletForJSONRPCRequest(request)};
+            if (!pwallet) return UniValue::VNULL;
+            LOCK(pwallet->cs_wallet);
+            EnsureWalletIsUnlocked(*pwallet);
+            const auto validator{pwallet->GetValidatorPubKey()};
+            if (!validator) throw JSONRPCError(RPC_WALLET_ERROR, "This wallet has no existing validator key; recovery does not create one");
+            const auto vk{XOnlyBytes(*validator)};
+            std::string error;
+            if (!CheckWalletFinalityRecoveryControl(pwallet->chain().finalityRecoveryControl(), vk, error) ||
+                !pwallet->chain().clearFinalityRecovery(vk, error)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, error);
+            }
+            UniValue obj{UniValue::VOBJ};
+            obj.pushKV("configured", false);
+            obj.pushKV("journal_unchanged", true);
+            obj.pushKV("startup_options_unchanged", true);
+            return obj;
         },
     };
 }

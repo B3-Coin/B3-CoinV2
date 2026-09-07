@@ -8,6 +8,7 @@
 #include <blockfilter.h>
 #include <common/settings.h>
 #include <crypto/bls.h>
+#include <consensus/finality_signer_recovery.h>
 #include <flowmesh/batch.h>
 #include <uint256.h>
 #include <script/script.h>
@@ -152,6 +153,45 @@ struct FinalityStatus {
     std::vector<FinalitySigningKey> signing_keys;
 };
 
+//! Public, read-only observation of the existing running signer's journal and
+//! chain. This is a cached diagnostic, not an authorization to change its lock.
+struct FinalityRecoveryStatus {
+    std::string state{"unavailable"};
+    int observed_tip_height{-1};
+    uint256 observed_tip_hash{};
+    bool journal_open{false};
+    bool journal_present{false};
+    bool permanent_error{false};
+    bool blocked_on_orphan_vote{false};
+    int last_signed_height{-1};
+    uint256 last_signed_hash{};
+    uint256 last_signed_digest{};
+    std::optional<int> lock_height;
+    uint256 lock_hash{};
+    uint256 lock_digest{};
+    uint64_t lock_epoch{0};
+    uint256 lock_signing_set_hash{};
+    uint256 lock_successor_set_hash{};
+    std::optional<uint256> current_chain_hash;
+    std::optional<int> finalized_height;
+    uint256 finalized_hash{};
+    uint64_t finalized_epoch{0};
+    int finalized_certified_at{-1};
+    std::optional<uint256> finalized_signing_set_hash;
+    bool certificate_included{false};
+    bool certificate_strictly_newer{false};
+    bool certificate_same_epoch{false};
+    bool certificate_same_set{false};
+    bool certificate_reconstructible{false};
+};
+
+//! Public configuration, not proof that any journal recovery was applied.
+struct FinalityRecoveryControl {
+    bool supported{false};
+    bool running{false};
+    std::optional<Consensus::FinalitySignerRecovery> configured;
+};
+
 //! B3 Modern PoS staking status (see Chain::stakingStatus).
 struct StakingStatus {
     //! A staking loop exists in this node.
@@ -186,6 +226,8 @@ struct StakingStatus {
     //! the staking loop, and the highest checkpoint it has signed.
     bool finality_signing{false};
     int last_signed_height{-1};
+    //! Present only after the running signer has observed a synced chain tip.
+    std::optional<FinalityRecoveryStatus> finality_recovery;
 };
 
 //! One production FlowMesh market plus an optional wallet-account view.
@@ -597,6 +639,23 @@ public:
     //! Staking status; `validator_key` (x-only) selects whose stake weight to
     //! report when the loop is not running (the loop's own key otherwise).
     virtual StakingStatus stakingStatus(const std::optional<std::array<unsigned char, 32>>& validator_key) = 0;
+
+    //! Configure exact operator trust only while staking is stopped. These
+    //! operations never change a journal, load secrets, sign, or broadcast.
+    virtual FinalityRecoveryControl finalityRecoveryControl() { return {}; }
+    virtual bool setFinalityRecovery(const std::array<unsigned char, 32>& wallet_validator,
+                                    const Consensus::FinalitySignerRecovery& recovery,
+                                    std::string& error)
+    {
+        error = "finality recovery control is not supported by this node";
+        return false;
+    }
+    virtual bool clearFinalityRecovery(const std::array<unsigned char, 32>& wallet_validator,
+                                      std::string& error)
+    {
+        error = "finality recovery control is not supported by this node";
+        return false;
+    }
 
     //! B3: finality diagnostics (epoch state, finalized checkpoint, pin,
     //! signature pool; binding/membership of `validator_key` when given).

@@ -41,12 +41,14 @@
 #include <key.h>
 #include <logging.h>
 #include <mapport.h>
+#include <modern/chain_domain.h>
 #include <net.h>
 #include <net_permissions.h>
 #include <net_processing.h>
 #include <netbase.h>
 #include <netgroup.h>
 #include <node/flowmesh_service.h>
+#include <node/finality_recovery_options.h>
 #include <node/staking.h>
 #include <node/warnings.h>
 #include <node/blockmanager_args.h>
@@ -518,6 +520,8 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-coinstatsindex", strprintf("Maintain coinstats index used by the gettxoutsetinfo RPC (default: %u)", DEFAULT_COINSTATSINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-conf=<file>", strprintf("Specify path to read-only configuration file. Relative paths will be prefixed by datadir location (only useable from command line, not configuration file) (default: %s)", BITCOIN_CONF_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-datadir=<dir>", "Specify data directory", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::OPTIONS);
+    argsman.AddArg("-finalityrecoveryfile=<path>", "Read one public operator-trusted finality recovery manifest at startup (off by default; relative paths use the network datadir). Requires -acceptfinalityrecovery. This local emergency trust exception is not a quorum proof and does not revoke old signatures.", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION | ArgsManager::DISALLOW_ELISION, OptionsCategory::OPTIONS);
+    argsman.AddArg("-acceptfinalityrecovery=<anchor-hash>", "Explicitly accept the exact 64-hex anchor hash in -finalityrecoveryfile. Both options are required; no block-validity or bridge-verifier rules change.", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION | ArgsManager::DISALLOW_ELISION, OptionsCategory::OPTIONS);
     argsman.AddArg("-dbbatchsize", strprintf("Maximum database write batch size in bytes (default: %u)", DEFAULT_DB_CACHE_BATCH), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
     argsman.AddArg("-dbcache=<n>", strprintf("Maximum database cache size <n> MiB (minimum %d, default: %d). Make sure you have enough RAM. In addition, unused memory allocated to the mempool is shared with this cache (see -maxmempool).", MIN_DB_CACHE >> 20, node::GetDefaultDBCache() >> 20), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-includeconf=<file>", "Specify additional configuration file, relative to the -datadir path (only useable from configuration file, not command line)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -1465,6 +1469,21 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     const ArgsManager& args = *Assert(node.args);
     const CChainParams& chainparams = Params();
 
+    // Validate and read this explicit public plan exactly once, before wallet
+    // loading, networking or staking. Never discover a default manifest.
+    const Consensus::Params& recovery_params{chainparams.GetConsensus()};
+    const auto recovery_domain{recovery_params.legacy_final_hash
+        ? modern::ModernChainDomain(recovery_params.hashGenesisBlock, *recovery_params.legacy_final_hash)
+        : std::nullopt};
+    std::optional<Consensus::FinalitySignerRecovery> operator_recovery;
+    std::string recovery_error;
+    if (!node::LoadFinalityRecoveryOptions(
+            args.GetArgs("-finalityrecoveryfile"), args.GetArgs("-acceptfinalityrecovery"),
+            args.GetDataDirNet(), recovery_domain.value_or(uint256{}),
+            operator_recovery, recovery_error)) {
+        return InitError(Untranslated(recovery_error));
+    }
+
     // B3 X-distribution PAUSE safety: if any configuration sets H but leaves
     // X blank, say so loudly and refuse every post-H block. Mainnet's
     // transition release pins X and does not enter this branch.
@@ -1488,6 +1507,11 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (!init::StartLogging(args)) {
         // Detailed error printed inside StartLogging().
         return false;
+    }
+
+    if (operator_recovery) {
+        LogWarning("Operator-trusted finality recovery explicitly configured for anchor %d %s. This is not a quorum proof, does not revoke old signatures, and changes no block-validity or bridge-verifier rules.",
+                   operator_recovery->anchor_height, operator_recovery->anchor_block_hash.ToString());
     }
 
     LogInfo("Using at most %i automatic connections (%i file descriptors available)", nMaxConnections, available_fds);
@@ -1949,7 +1973,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     // (startstaking) and until the next block is a modern-PoS block.
     node.staking = std::make_unique<node::StakingLoop>(
         *node.chainman, node.mempool.get(),
-        args.GetDataDirNet() / "finality_signer");
+        args.GetDataDirNet() / "finality_signer", std::move(operator_recovery));
 
     // Every node owns the production service object. It remains dormant and
     // does not advertise the capability unless the complete A2/A3 schedule

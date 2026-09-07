@@ -133,8 +133,11 @@ add_executable(test_bitcoin
   finality_pin_persist_tests.cpp
   finality_signer_store_tests.cpp
   finality_signer_recovery_tests.cpp
+  finality_signing_policy_tests.cpp
+  finality_depth_recovery_prototype_tests.cpp
   finality_signature_tests.cpp
   finality_transport_tests.cpp
+  finality_transport_recovery_tests.cpp
   finality_production_tests.cpp
   finality_operations_tests.cpp
   finality_activation_tests.cpp
@@ -258,6 +261,16 @@ target_link_libraries(test_bitcoin
   libevent::extra
   $<TARGET_NAME_IF_EXISTS:USDT::headers>
 )
+
+# Fast synthetic recovery checks using the same freshly built production
+# libraries. No node startup, legacy-prefix mining or live wallet access.
+foreach(recovery_test IN ITEMS operator_recovery_signer finality_recovery_options targeted_recovery_store)
+  add_executable(test_${recovery_test}
+    ${PROJECT_SOURCE_DIR}/contrib/b3finality/test_${recovery_test}.cpp)
+  target_link_libraries(test_${recovery_test}
+    core_interface bitcoin_node bitcoin_consensus univalue Boost::headers)
+  add_test(NAME test_${recovery_test} COMMAND test_${recovery_test})
+endforeach()
 
 if(ENABLE_WALLET)
   add_subdirectory(${PROJECT_SOURCE_DIR}/src/wallet/test wallet)

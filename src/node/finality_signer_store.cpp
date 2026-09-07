@@ -249,6 +249,59 @@ fs::path FinalitySignerStore::StatePath(
         HexStr(validator_key)));
 }
 
+bool FinalitySignerStore::MatchesOperatorRecoveryIncident(
+    const FinalitySignerState& state,
+    const Consensus::FinalitySignerRecovery& recovery, std::string& error)
+{
+    if (!recovery.Valid() || !recovery.validator_key) {
+        error = "operator-trusted recovery requires a valid exact incident and a mandatory validator target";
+        return false;
+    }
+    if (!IsValidState(state, error)) return false;
+    if (*recovery.validator_key != state.validator_key ||
+        recovery.chain_domain != state.chain_domain) {
+        error = "operator-trusted recovery does not match the journal validator identity and chain domain";
+        return false;
+    }
+    if (state.last_signed_height != recovery.incident_height ||
+        state.last_signed_block_hash != recovery.incident_block_hash ||
+        state.lock_height != recovery.incident_height ||
+        state.lock_block_hash != recovery.incident_block_hash ||
+        state.last_signed_digest.IsNull() ||
+        state.lock_digest != state.last_signed_digest ||
+        state.lock_epoch != recovery.incident_epoch ||
+        state.lock_signing_set_hash != recovery.incident_signing_set_hash ||
+        state.lock_successor_set_hash != recovery.incident_successor_set_hash ||
+        recovery.anchor_height <= state.last_signed_height ||
+        recovery.anchor_height <= state.lock_height) {
+        error = "operator-trusted recovery does not exactly match the journal's last vote, ancestry lock, digest and epoch sets; refusing to infer or rewind history";
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
+bool FinalitySignerStore::CheckOperatorRecoveryIncident(
+    const fs::path& directory, const uint256& chain_domain,
+    const modern::ValidatorKeyBytes& validator_key,
+    const Consensus::FinalitySignerRecovery& recovery, std::string& error)
+{
+    if (directory.empty() || chain_domain.IsNull() ||
+        recovery.chain_domain != chain_domain || !recovery.validator_key ||
+        *recovery.validator_key != validator_key) {
+        error = "operator-trusted recovery does not match the configured chain and wallet validator";
+        return false;
+    }
+    FinalitySignerState state;
+    const auto result{ReadState(StatePath(directory, chain_domain, validator_key), state, error)};
+    if (result == ReadStatus::ABSENT) {
+        error = "operator-trusted recovery requires an intact existing signer journal; the journal is absent";
+        return false;
+    }
+    if (result != ReadStatus::VALID) return false;
+    return MatchesOperatorRecoveryIncident(state, recovery, error);
+}
+
 bool FinalitySignerStore::Open(
     const fs::path& directory, const uint256& chain_domain,
     const modern::ValidatorKeyBytes& validator_key, std::string& error)
@@ -472,6 +525,11 @@ bool FinalitySignerStore::CommitPinnedRecoveryAnchor(
     }
     if (recovery.chain_domain != m_chain_domain) {
         error = "pinned recovery belongs to another chain";
+        return false;
+    }
+    if (recovery.validator_key &&
+        *recovery.validator_key != m_validator_key) {
+        error = "pinned recovery belongs to another validator";
         return false;
     }
     const FinalitySignerState& current{*m_state};

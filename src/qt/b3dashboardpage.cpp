@@ -11,6 +11,7 @@
 #include <chainparams.h>
 #include <consensus/era.h>
 #include <qt/b3theme.h>
+#include <qt/b3validatorcontroller.h>
 #include <qt/guiutil.h>
 #include <qt/optionsmodel.h>
 #include <qt/platformstyle.h>
@@ -35,6 +36,7 @@
 #include <QResizeEvent>
 #include <QScrollArea>
 #include <QSizePolicy>
+#include <QStringList>
 #include <QStyle>
 #include <QVBoxLayout>
 
@@ -271,11 +273,12 @@ B3DashboardPage::B3DashboardPage(const PlatformStyle* platform_style, QWidget* p
     m_staking_card = makeCard(tr("Staking"));
     m_staking_card->setObjectName(QStringLiteral("dashboardStakingCard"));
     m_staking_card->setProperty("b3surface", QStringLiteral("quiet"));
-    m_staking_card->hide();
     {
         m_staking_note = new QLabel(
-            tr("Staking information is unavailable in this build. No estimated rewards or network weight are invented."),
+            tr("Select a wallet to see its staking and finality status."),
             m_staking_card);
+        m_staking_note->setObjectName(QStringLiteral("dashboardStakingStatus"));
+        m_staking_note->setTextFormat(Qt::PlainText);
         m_staking_note->setWordWrap(true);
         B3Theme::markTextRole(m_staking_note, QStringLiteral("secondary"));
         static_cast<QVBoxLayout*>(m_staking_card->layout())->addWidget(m_staking_note);
@@ -438,7 +441,6 @@ void B3DashboardPage::reflowCards(int width)
                           m_sync_card, m_network_card, m_activity_card}) {
         m_card_grid->removeWidget(card);
     }
-    m_staking_card->hide();
     for (int column = 0; column < 3; ++column) {
         m_card_grid->setColumnStretch(column, 0);
     }
@@ -448,19 +450,22 @@ void B3DashboardPage::reflowCards(int width)
         m_card_grid->addWidget(m_sync_card, 1, 0);
         m_card_grid->addWidget(m_wallet_card, 2, 0);
         m_card_grid->addWidget(m_network_card, 3, 0);
-        m_card_grid->addWidget(m_activity_card, 4, 0);
+        m_card_grid->addWidget(m_staking_card, 4, 0);
+        m_card_grid->addWidget(m_activity_card, 5, 0);
     } else if (columns == 2) {
         m_card_grid->addWidget(m_balance_card, 0, 0, 1, 2);
         m_card_grid->addWidget(m_sync_card, 1, 0);
         m_card_grid->addWidget(m_wallet_card, 1, 1);
-        m_card_grid->addWidget(m_network_card, 2, 0, 1, 2);
+        m_card_grid->addWidget(m_network_card, 2, 0);
+        m_card_grid->addWidget(m_staking_card, 2, 1);
         m_card_grid->addWidget(m_activity_card, 3, 0, 1, 2);
     } else {
         m_card_grid->addWidget(m_balance_card, 0, 0, 1, 3);
         m_card_grid->addWidget(m_sync_card, 1, 0);
         m_card_grid->addWidget(m_wallet_card, 1, 1);
         m_card_grid->addWidget(m_network_card, 1, 2);
-        m_card_grid->addWidget(m_activity_card, 2, 0, 1, 3);
+        m_card_grid->addWidget(m_staking_card, 2, 0, 1, 3);
+        m_card_grid->addWidget(m_activity_card, 3, 0, 1, 3);
     }
     for (int column = 0; column < columns; ++column) {
         m_card_grid->setColumnStretch(column, 1);
@@ -515,6 +520,9 @@ void B3DashboardPage::setWalletModel(WalletModel* wallet_model)
     m_filter.reset();
     m_wallet_model = wallet_model;
     m_have_balances = false;
+    m_staking_note->setText(wallet_model
+        ? tr("Loading staking and finality status…")
+        : tr("Select a wallet to see its staking and finality status."));
 
     if (wallet_model && wallet_model->getOptionsModel()) {
         m_filter = std::make_unique<TransactionFilterProxy>();
@@ -562,6 +570,41 @@ void B3DashboardPage::setPrivacy(bool privacy)
     m_privacy = privacy;
     renderBalances();
     updateActivityEmptyState();
+}
+
+void B3DashboardPage::setValidatorStatus(const B3ValidatorStatus& status)
+{
+    if (!status.valid) {
+        m_staking_note->setText(status.refresh_error.isEmpty()
+            ? tr("Loading staking and finality status…")
+            : tr("Staking status unavailable: %1").arg(status.refresh_error));
+        return;
+    }
+    QStringList lines;
+    if (status.auto_corridor_mining) {
+        lines << tr("Corridor mining is running.");
+    } else if (status.staking_running && status.staking_uses_this_wallet) {
+        lines << tr("Staking is running.");
+        if (!status.staking_state.isEmpty()) lines << status.staking_state;
+    } else if (status.staking_running) {
+        lines << tr("Another wallet is staking on this node.");
+    } else {
+        lines << tr("Staking is stopped.");
+    }
+    if (status.finality_signing && status.staking_uses_this_wallet) {
+        lines << (status.last_signed_height >= 0
+            ? tr("Finality signing enabled · last signed %1").arg(status.last_signed_height)
+            : tr("Finality signing enabled · no checkpoint signed yet"));
+    } else if (status.finality_signing) {
+        lines << tr("Finality signing belongs to another wallet.");
+    } else {
+        lines << tr("Finality signing is not armed.");
+    }
+    if (!status.staking_last_error.isEmpty()) {
+        lines << tr("Last reported error: %1").arg(status.staking_last_error);
+    }
+    lines << tr("Open Stake for validator details and controls.");
+    m_staking_note->setText(lines.join(QLatin1Char('\n')));
 }
 
 void B3DashboardPage::setNumBlocks(int count, const QDateTime& block_date, double verification_progress,

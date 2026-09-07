@@ -17,6 +17,7 @@ private Q_SLOTS:
     void immatureRowReflectsActualBalance();
     void privacyMasksActivity();
     void clientViewSlotsRenderWithoutNode();
+    void stakingCardUsesVerifiedControllerStatus();
 };
 
 #endif // BITCOIN_QT_TEST_B3DASHBOARDTESTS_H

@@ -16,6 +16,7 @@ private Q_SLOTS:
     void stakingRequiresCurrentSnapshotKey();
     void settingsPageRoutesToExistingDialogs();
     void settingsPageMirrorsWalletActions();
+    void settingsActionsTrackVisibilityIconsAndReplacement();
     void shellShowsInstalledSettingsPage();
 };
 

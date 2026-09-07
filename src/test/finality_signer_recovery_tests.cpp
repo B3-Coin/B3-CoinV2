@@ -23,13 +23,19 @@
 #include <node/finality_signature.h>
 #include <node/finality_signer_store.h>
 #include <node/finality_tracker.h>
+#include <node/staking.h>
 #include <test/util/finality_fixture.h>
 #include <test/util/setup_common.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <cstdio>
+#include <fstream>
+#include <functional>
+#include <iterator>
 #include <string>
+#include <vector>
 
 using b3test::FinalityChainFixture;
 using node::FinalitySignaturePool;
@@ -118,8 +124,8 @@ struct RecoveryFixture : public FinalityChainFixture {
         // nothing. A node still on the old fork therefore keeps its journal
         // exactly as it was.
         {
-            MutableConsensus().finality_signer_recovery =
-                MakePin(incident, m_rng.rand256());
+            MutableConsensus().finality_signer_recoveries =
+                {MakePin(incident, m_rng.rand256())};
             LOCK(cs_main);
             FinalitySignaturePool pool;
             BOOST_CHECK(original.MaybeSign(
@@ -132,7 +138,7 @@ struct RecoveryFixture : public FinalityChainFixture {
             BOOST_REQUIRE(probe.Open(m_store_dir, m_domain, m_vk_a, e));
             BOOST_CHECK_EQUAL(probe.State()->lock_height, M + 10);
             BOOST_CHECK(probe.State()->lock_block_hash == incident.hash);
-            MutableConsensus().finality_signer_recovery.reset();
+            MutableConsensus().finality_signer_recoveries.clear();
         }
 
         // The incident: M+10 is replaced by a longer branch from M+9 (four
@@ -242,6 +248,214 @@ struct RecoveryFixture : public FinalityChainFixture {
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(finality_signer_recovery_tests)
+
+BOOST_FIXTURE_TEST_CASE(operator_recovery_configuration_reads_only_exact_intact_journal,
+                        BasicTestingSetup)
+{
+    const fs::path dir{m_path_root / "operator-recovery-preflight"};
+    const uint256 domain{m_rng.rand256()};
+    modern::ValidatorKeyBytes validator{};
+    validator.fill(0x71);
+    modern::ValidatorKeyBytes other_validator{};
+    other_validator.fill(0x72);
+    Consensus::FinalitySignerRecovery recovery;
+    recovery.chain_domain = domain;
+    recovery.validator_key = validator;
+    recovery.incident_height = 10;
+    recovery.incident_block_hash = m_rng.rand256();
+    recovery.incident_epoch = 2;
+    recovery.incident_signing_set_hash = m_rng.rand256();
+    recovery.incident_successor_set_hash = m_rng.rand256();
+    recovery.anchor_height = 20;
+    recovery.anchor_block_hash = m_rng.rand256();
+    const uint256 digest{m_rng.rand256()};
+    std::string error;
+    using Store = node::FinalitySignerStore;
+    auto check = [&](const Consensus::FinalitySignerRecovery& plan) {
+        return Store::CheckOperatorRecoveryIncident(dir, domain, validator, plan, error);
+    };
+
+    // Configuration cannot manufacture a missing directory or journal.
+    BOOST_CHECK(!fs::exists(dir));
+    BOOST_CHECK(!check(recovery));
+    BOOST_CHECK(!fs::exists(dir));
+    Store store;
+    BOOST_REQUIRE(store.Open(dir, domain, validator, error));
+    BOOST_CHECK(!check(recovery));
+    BOOST_CHECK(!fs::exists(store.Path()));
+    BOOST_REQUIRE(store.InitializeEmpty(error));
+    BOOST_CHECK(!check(recovery));
+    BOOST_REQUIRE(store.CommitSignedCheckpoint(
+        10, recovery.incident_block_hash, digest, recovery.incident_epoch,
+        recovery.incident_signing_set_hash, recovery.incident_successor_set_hash, error));
+    const auto original{*store.State()};
+    const auto modified{fs::last_write_time(store.Path())};
+    BOOST_REQUIRE(check(recovery));
+    BOOST_CHECK(error.empty());
+    BOOST_CHECK(fs::last_write_time(store.Path()) == modified);
+
+    const std::vector<std::function<void(Consensus::FinalitySignerRecovery&)>> invalid_plans{
+        [](auto& p) { p.validator_key.reset(); },
+        [&](auto& p) { p.validator_key = other_validator; },
+        [](auto& p) { p.chain_domain.SetNull(); },
+        [&](auto& p) { p.chain_domain = m_rng.rand256(); },
+        [](auto& p) { ++p.incident_height; },
+        [&](auto& p) { p.incident_block_hash = m_rng.rand256(); },
+        [](auto& p) { ++p.incident_epoch; },
+        [&](auto& p) { p.incident_signing_set_hash = m_rng.rand256(); },
+        [&](auto& p) { p.incident_successor_set_hash = m_rng.rand256(); },
+        [](auto& p) { p.anchor_height = p.incident_height; },
+        [](auto& p) { p.anchor_block_hash = p.incident_block_hash; },
+    };
+    for (const auto& mutate : invalid_plans) {
+        auto bad{recovery};
+        mutate(bad);
+        BOOST_CHECK(!check(bad));
+        BOOST_CHECK(!error.empty());
+        BOOST_CHECK(check(recovery));
+        BOOST_CHECK(fs::last_write_time(store.Path()) == modified);
+    }
+    const std::vector<std::function<void(node::FinalitySignerState&)>> invalid_states{
+        [](auto& s) { s.last_signed_digest.SetNull(); },
+        [&](auto& s) { s.last_signed_digest = m_rng.rand256(); },
+        [&](auto& s) { s.lock_digest = m_rng.rand256(); },
+        [](auto& s) { ++s.last_signed_height; },
+        [](auto& s) { ++s.lock_height; },
+        [&](auto& s) { s.lock_block_hash = m_rng.rand256(); },
+        [](auto& s) { ++s.lock_epoch; },
+        [&](auto& s) { s.lock_signing_set_hash = m_rng.rand256(); },
+        [&](auto& s) { s.lock_successor_set_hash = m_rng.rand256(); },
+        [&](auto& s) { s.validator_key = other_validator; },
+        [&](auto& s) { s.chain_domain = m_rng.rand256(); },
+    };
+    for (const auto& mutate : invalid_states) {
+        auto bad{original};
+        mutate(bad);
+        BOOST_CHECK(!Store::MatchesOperatorRecoveryIncident(bad, recovery, error));
+        BOOST_CHECK(!error.empty());
+    }
+    Store reread;
+    BOOST_REQUIRE(reread.Open(dir, domain, validator, error));
+    BOOST_REQUIRE(reread.State());
+    BOOST_CHECK(*reread.State() == original);
+
+    // Correctly checksummed data at another identity's path is still refused.
+    const auto wrong_path{Store::StatePath(dir, domain, other_validator)};
+    BOOST_REQUIRE(fs::copy_file(store.Path(), wrong_path, fs::copy_options::none));
+    auto other_plan{recovery};
+    other_plan.validator_key = other_validator;
+    BOOST_CHECK(!Store::CheckOperatorRecoveryIncident(
+        dir, domain, other_validator, other_plan, error));
+
+    // A moved lock or newer vote cannot be approved using this old incident.
+    BOOST_REQUIRE(store.CommitCertifiedAnchor(
+        20, recovery.anchor_block_hash, m_rng.rand256(), recovery.incident_epoch,
+        recovery.incident_signing_set_hash, recovery.incident_successor_set_hash, error));
+    BOOST_CHECK(!check(recovery));
+    BOOST_REQUIRE(store.CommitSignedCheckpoint(
+        30, m_rng.rand256(), m_rng.rand256(), recovery.incident_epoch,
+        recovery.incident_signing_set_hash, recovery.incident_successor_set_hash, error));
+    BOOST_CHECK(!check(recovery));
+
+    // Corruption must be an error, never treated as a new empty journal.
+    FILE* file{fsbridge::fopen(store.Path(), "r+b")};
+    BOOST_REQUIRE(file != nullptr);
+    const unsigned char byte{0}; // corrupt the nonzero magic byte
+    BOOST_REQUIRE_EQUAL(std::fwrite(&byte, 1, 1, file), 1U);
+    BOOST_REQUIRE_EQUAL(std::fclose(file), 0);
+    BOOST_CHECK(!check(recovery));
+    BOOST_CHECK(!error.empty());
+}
+
+BOOST_FIXTURE_TEST_CASE(operator_recovery_control_is_stopped_and_wallet_scoped,
+                        TestingSetup)
+{
+    // Genesis-only node fixture; the briefly started loop has no BLS key and
+    // no modern block-production rules. No mining/signing/broadcast occurs.
+    auto& params{const_cast<Consensus::Params&>(m_node.chainman->GetConsensus())};
+    struct RestoreParams {
+        Consensus::Params& target;
+        Consensus::Params original;
+        ~RestoreParams() { target = std::move(original); }
+    } restore{params, params};
+    params.legacy_final_hash = uint256{2};
+    params.legacy_b3coin = false;
+    params.modern_pos.reset();
+    const auto domain{modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)};
+    BOOST_REQUIRE(domain);
+    CKey validator_secret;
+    validator_secret.MakeNewKey(true);
+    const XOnlyPubKey xonly{validator_secret.GetPubKey()};
+    modern::ValidatorKeyBytes validator{};
+    std::copy(xonly.begin(), xonly.end(), validator.begin());
+    auto other_validator{validator};
+    other_validator[0] ^= 1;
+    const fs::path dir{m_path_root / "operator-recovery-control"};
+    node::StakingLoop staking{*m_node.chainman, nullptr, dir};
+    node::FinalitySignerStore store;
+    std::string error;
+    Consensus::FinalitySignerRecovery recovery;
+    recovery.chain_domain = *domain;
+    recovery.validator_key = validator;
+    recovery.incident_height = 10;
+    recovery.incident_block_hash = m_rng.rand256();
+    recovery.incident_epoch = 2;
+    recovery.incident_signing_set_hash = m_rng.rand256();
+    recovery.incident_successor_set_hash = m_rng.rand256();
+    recovery.anchor_height = 20;
+    recovery.anchor_block_hash = m_rng.rand256();
+    BOOST_CHECK(staking.RecoveryControl().supported);
+    BOOST_CHECK(!staking.RecoveryControl().running);
+    BOOST_CHECK(!staking.RecoveryControl().configured);
+    BOOST_CHECK(!staking.SetFinalityRecovery(validator, recovery, error));
+    BOOST_CHECK(!fs::exists(dir));
+    BOOST_REQUIRE(store.Open(dir, *domain, validator, error));
+    BOOST_REQUIRE(store.InitializeEmpty(error));
+    BOOST_REQUIRE(store.CommitSignedCheckpoint(
+        10, recovery.incident_block_hash, m_rng.rand256(), recovery.incident_epoch,
+        recovery.incident_signing_set_hash, recovery.incident_successor_set_hash, error));
+    const auto journal_bytes = [&] {
+        std::ifstream input{store.Path().std_path(), std::ios::binary};
+        BOOST_REQUIRE(input.good());
+        return std::string{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+    };
+    const auto before{journal_bytes()};
+    BOOST_REQUIRE(staking.SetFinalityRecovery(validator, recovery, error));
+    BOOST_CHECK(error.empty());
+    BOOST_REQUIRE(staking.RecoveryControl().configured);
+    BOOST_CHECK(staking.RecoveryControl().configured->anchor_block_hash == recovery.anchor_block_hash);
+    BOOST_CHECK(journal_bytes() == before);
+
+    auto foreign{recovery};
+    foreign.validator_key = other_validator;
+    BOOST_CHECK(!staking.SetFinalityRecovery(other_validator, foreign, error));
+    BOOST_CHECK(!staking.ClearFinalityRecovery(other_validator, error));
+    BOOST_CHECK(!staking.SetFinalityRecovery(other_validator, recovery, error));
+    auto wrong_domain{recovery};
+    wrong_domain.chain_domain = m_rng.rand256();
+    BOOST_CHECK(!staking.SetFinalityRecovery(validator, wrong_domain, error));
+    BOOST_CHECK(staking.RecoveryControl().configured->anchor_block_hash == recovery.anchor_block_hash);
+    BOOST_CHECK(journal_bytes() == before);
+
+    auto replacement{recovery};
+    replacement.anchor_height = 30;
+    replacement.anchor_block_hash = m_rng.rand256();
+    BOOST_REQUIRE(staking.SetFinalityRecovery(validator, replacement, error));
+    BOOST_CHECK(staking.RecoveryControl().configured->anchor_height == 30);
+    BOOST_REQUIRE(staking.StartWithFinalityKeys(
+        validator_secret, CScript{} << OP_TRUE, {}, error));
+    BOOST_CHECK(staking.RecoveryControl().running);
+    BOOST_CHECK(!staking.SetFinalityRecovery(validator, recovery, error));
+    BOOST_CHECK(!staking.ClearFinalityRecovery(validator, error));
+    BOOST_CHECK(staking.RecoveryControl().configured->anchor_height == 30);
+    staking.Stop();
+    BOOST_CHECK(!staking.RecoveryControl().running);
+    BOOST_CHECK(journal_bytes() == before);
+    BOOST_REQUIRE(staking.ClearFinalityRecovery(validator, error));
+    BOOST_CHECK(!staking.RecoveryControl().configured);
+    BOOST_CHECK(journal_bytes() == before);
+    BOOST_CHECK(staking.ClearFinalityRecovery(validator, error));
+}
 
 BOOST_FIXTURE_TEST_CASE(store_recovery_moves_only_the_lock_and_fails_closed_otherwise,
                         BasicTestingSetup)
@@ -403,10 +617,10 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
 
     // A signer-only anchor is not sufficient: recovery requires the same
     // identity in the hardened modern checkpoint table.
-    params.finality_signer_recovery = pin;
+    params.finality_signer_recoveries = {pin};
     ExpectDeadlocked(restarted, m_store_dir, "anchor is not hardened",
                      "recovery anchor is not a hardened modern checkpoint");
-    params.finality_signer_recovery.reset();
+    params.finality_signer_recoveries.clear();
     params.modern_checkpoints[pin.anchor_height] = pin.anchor_block_hash;
 
     // The exact hardened pin, but the anchor (M+15) is only two blocks deep
@@ -415,9 +629,9 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
                            const std::string& note) {
         Consensus::FinalitySignerRecovery bad{pin};
         mutate(bad);
-        params.finality_signer_recovery = bad;
+        params.finality_signer_recoveries = {bad};
         ExpectDeadlocked(restarted, m_store_dir, why, note);
-        params.finality_signer_recovery.reset();
+        params.finality_signer_recoveries.clear();
     }};
     rejects("anchor not yet buried to finality-signing depth",
             [](Consensus::FinalitySignerRecovery&) {},
@@ -469,7 +683,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
             }
             Consensus::FinalitySignerRecovery variant{pin};
             mutate_pin(variant);
-            params.finality_signer_recovery = variant;
+            params.finality_signer_recoveries = {variant};
             node::FinalitySigner signer;
             std::string e;
             BOOST_REQUIRE_MESSAGE(signer.SetKeyPersistent(
@@ -486,7 +700,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
                                         std::string::npos,
                                     why << ": " << signer.LastError());
             }
-            params.finality_signer_recovery.reset();
+            params.finality_signer_recoveries.clear();
             return Journal(dir);
         }};
     {
@@ -575,7 +789,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
     // The exact pin at a settled anchor: the lock moves, the recorded vote is
     // retained, and nothing at or below the anchor is signed. M+15 is
     // signable by depth but is the anchor itself; M+20 is not yet signable.
-    params.finality_signer_recovery = pin;
+    params.finality_signer_recoveries = {pin};
     {
         FinalitySignaturePool pool;
         BOOST_CHECK(Sign(restarted, pool).empty());
@@ -608,7 +822,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
     // Restart persistence: with the pin removed, a fresh process stands on
     // the reloaded journal alone, signs nothing at or below the anchor, and
     // leaves the recovered lock exactly as persisted.
-    params.finality_signer_recovery.reset();
+    params.finality_signer_recoveries.clear();
     node::FinalitySigner reloaded;
     BOOST_REQUIRE_MESSAGE(reloaded.SetKeyPersistent(
                               m_bls_a, m_vk_a, m_domain, m_store_dir, m_error),
@@ -674,7 +888,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
     // longer resolve, the journal stays locked, and nothing is recreated.
     ProduceTo(M + 2 * SCALED_E + SCALED_MAX_EXTENSION, m_vk_a);
     BOOST_REQUIRE(FinalityState().lineage_broken);
-    params.finality_signer_recovery = pin;
+    params.finality_signer_recoveries = {pin};
     {
         node::FinalitySigner late;
         BOOST_REQUIRE_MESSAGE(late.SetKeyPersistent(
@@ -688,7 +902,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_unlocks_the_exact_incident_and_resumes_c
         BOOST_CHECK_EQUAL(j.last_signed_height, M + 10);
         BOOST_CHECK(j.lock_block_hash == incident.hash);
     }
-    params.finality_signer_recovery.reset();
+    params.finality_signer_recoveries.clear();
 }
 
 BOOST_FIXTURE_TEST_CASE(pinned_recovery_applies_after_the_epoch_rotated_and_resumes_in_the_next_epoch,
@@ -727,7 +941,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_applies_after_the_epoch_rotated_and_resu
     // The pin applies through the previous-epoch window, and the signer then
     // votes on every signable checkpoint strictly above the anchor: the
     // remaining epoch-0 checkpoints and the first epoch-1 checkpoint.
-    params.finality_signer_recovery = pin;
+    params.finality_signer_recoveries = {pin};
     std::optional<std::pair<modern::FinalizedBlock,
                             modern::FinalityCertificate>> best;
     {
@@ -784,10 +998,10 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_applies_after_the_epoch_rotated_and_resu
                                   m_bls_a, m_vk_a, m_domain, late_dir, m_error),
                               m_error);
         BOOST_CHECK_EQUAL(late.LastSignedHeight(), M + 10);
-        params.finality_signer_recovery.reset();
+        params.finality_signer_recoveries.clear();
         ExpectDeadlocked(late, late_dir, "late, no pin", "",
                          "included certificate does not use the exact epoch");
-        params.finality_signer_recovery = pin;
+        params.finality_signer_recoveries = {pin};
         FinalitySignaturePool pool;
         BOOST_CHECK(Sign(late, pool).empty());
         BOOST_CHECK_MESSAGE(late.LastError().empty(), late.LastError());
@@ -830,41 +1044,41 @@ BOOST_FIXTURE_TEST_CASE(pinned_recovery_applies_after_the_epoch_rotated_and_resu
         BOOST_CHECK_EQUAL(j.last_signed_height, M + 10);
         BOOST_CHECK(j.lock_block_hash == incident.hash);
     }
-    params.finality_signer_recovery.reset();
+    params.finality_signer_recoveries.clear();
 }
 
 BOOST_AUTO_TEST_CASE(mainnet_pins_the_811631_incident_and_the_811641_anchor)
 {
     const auto params{CreateChainParams(ArgsManager{}, ChainType::MAIN)};
     const Consensus::Params& consensus{params->GetConsensus()};
-    const auto& pin{consensus.finality_signer_recovery};
-    BOOST_REQUIRE(pin.has_value());
-    BOOST_CHECK(pin->Valid());
+    BOOST_REQUIRE_EQUAL(consensus.finality_signer_recoveries.size(), 1U);
+    const auto& pin{consensus.finality_signer_recoveries.front()};
+    BOOST_CHECK(pin.Valid());
     BOOST_REQUIRE(consensus.legacy_final_hash.has_value());
     const auto domain{modern::ModernChainDomain(consensus.hashGenesisBlock,
                                                 *consensus.legacy_final_hash)};
     BOOST_REQUIRE(domain.has_value());
-    BOOST_CHECK(pin->chain_domain == *domain);
-    BOOST_CHECK_EQUAL(pin->incident_height, 811'631);
+    BOOST_CHECK(pin.chain_domain == *domain);
+    BOOST_CHECK_EQUAL(pin.incident_height, 811'631);
     BOOST_CHECK_EQUAL(
-        pin->incident_block_hash.GetHex(),
+        pin.incident_block_hash.GetHex(),
         "86297c1075392fa614a6b0733eeb178de0eb8dc11602226b2b10344453426be0");
-    BOOST_CHECK_EQUAL(pin->incident_epoch, 0U);
+    BOOST_CHECK_EQUAL(pin.incident_epoch, 0U);
     BOOST_CHECK_EQUAL(
-        pin->incident_signing_set_hash.GetHex(),
+        pin.incident_signing_set_hash.GetHex(),
         "ff7c306f539eec01c793cd7fd389672c53a955d10f00758a2807ef0e9d22514e");
     BOOST_CHECK_EQUAL(
-        pin->incident_successor_set_hash.GetHex(),
+        pin.incident_successor_set_hash.GetHex(),
         "6dd7d4575e9f1d74036c7c86175e4fd2e6cf9dc621cddac5b91831b85361d63a");
-    BOOST_CHECK_EQUAL(pin->anchor_height, 811'641);
+    BOOST_CHECK_EQUAL(pin.anchor_height, 811'641);
     BOOST_CHECK_EQUAL(
-        pin->anchor_block_hash.GetHex(),
+        pin.anchor_block_hash.GetHex(),
         "5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f75");
-    BOOST_CHECK(pin->anchor_block_hash != pin->incident_block_hash);
-    BOOST_REQUIRE_EQUAL(consensus.modern_checkpoints.count(pin->anchor_height),
+    BOOST_CHECK(pin.anchor_block_hash != pin.incident_block_hash);
+    BOOST_REQUIRE_EQUAL(consensus.modern_checkpoints.count(pin.anchor_height),
                         1U);
-    BOOST_CHECK(consensus.modern_checkpoints.at(pin->anchor_height) ==
-                pin->anchor_block_hash);
+    BOOST_CHECK(consensus.modern_checkpoints.at(pin.anchor_height) ==
+                pin.anchor_block_hash);
 
     // Both heights are scheduled epoch-0 checkpoints of the mainnet schedule
     // (M = 811,001, interval 10), the anchor is one interval above the
@@ -879,11 +1093,11 @@ BOOST_AUTO_TEST_CASE(mainnet_pins_the_811631_incident_and_the_811641_anchor)
     const auto modern_start{Consensus::ModernPosStartHeight(consensus)};
     BOOST_REQUIRE(modern_start.has_value());
     BOOST_CHECK_EQUAL(*modern_start, 811'001);
-    BOOST_CHECK(modern::IsCheckpointHeight(pin->incident_height, *modern_start, pos.checkpoint_interval));
-    BOOST_CHECK(modern::IsCheckpointHeight(pin->anchor_height, *modern_start, pos.checkpoint_interval));
-    BOOST_CHECK_EQUAL(pin->anchor_height - pin->incident_height, pos.checkpoint_interval);
-    BOOST_CHECK_LT(pin->anchor_height, *modern_start + pos.finality_epoch_blocks);
-    BOOST_CHECK_EQUAL(pin->anchor_height + pos.checkpoint_depth, 811'653);
+    BOOST_CHECK(modern::IsCheckpointHeight(pin.incident_height, *modern_start, pos.checkpoint_interval));
+    BOOST_CHECK(modern::IsCheckpointHeight(pin.anchor_height, *modern_start, pos.checkpoint_interval));
+    BOOST_CHECK_EQUAL(pin.anchor_height - pin.incident_height, pos.checkpoint_interval);
+    BOOST_CHECK_LT(pin.anchor_height, *modern_start + pos.finality_epoch_blocks);
+    BOOST_CHECK_EQUAL(pin.anchor_height + pos.checkpoint_depth, 811'653);
     BOOST_CHECK_EQUAL(*modern_start + pos.finality_epoch_blocks, 812'441);
     BOOST_CHECK_EQUAL(*modern_start + 2 * pos.finality_epoch_blocks, 813'881);
     BOOST_CHECK_EQUAL(*modern_start + 2 * pos.finality_epoch_blocks +
@@ -894,7 +1108,7 @@ BOOST_AUTO_TEST_CASE(mainnet_pins_the_811631_incident_and_the_811641_anchor)
     for (const ChainType chain : {ChainType::TESTNET, ChainType::TESTNET4,
                                   ChainType::SIGNET, ChainType::REGTEST}) {
         const auto other{CreateChainParams(ArgsManager{}, chain)};
-        BOOST_CHECK(!other->GetConsensus().finality_signer_recovery.has_value());
+        BOOST_CHECK(other->GetConsensus().finality_signer_recoveries.empty());
     }
 }
 

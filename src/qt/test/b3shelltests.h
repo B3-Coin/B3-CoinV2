@@ -16,6 +16,12 @@ class B3ShellTests : public QObject
 private Q_SLOTS:
     void sidebarEmitsCanonicalPages();
     void shellRoutesNavigationAndSwitchesContent();
+    void everyDestinationHasMatchingTitleAndSelection_data();
+    void everyDestinationHasMatchingTitleAndSelection();
+    void disabledNavigationCannotBypassWalletActionPolicy();
+    void settingsDialogFallbackPreservesVisiblePage();
+    void replacingVisiblePagesPreservesSelection();
+    void sidebarDoesNotInventNetworkFeatureStatus();
     void placeholderPagesAreHonest();
     void topStatusReflectsNetworkAndPeers();
     void reducedMotionUnderOffscreen();

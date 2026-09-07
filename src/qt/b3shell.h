@@ -33,16 +33,18 @@ class B3Shell : public QWidget
 public:
     explicit B3Shell(QWidget* parent = nullptr);
 
-    //! Install the existing wallet UI as the Dashboard/Activity content.
+    //! Install the existing wallet UI as the Overview/Send/Receive/Activity content.
     void setWalletWidget(QWidget* wallet_widget);
 
     B3TopStatus* topStatus() const { return m_topStatus; }
     B3NavSidebar* sidebar() const { return m_sidebar; }
 
     //! Reflect the active page and switch the content stack. Wallet-backed
-    //! destinations (Dashboard/Activity) show the wallet widget; the window
+    //! destinations (Overview/Send/Receive/Activity) show the wallet widget; the window
     //! is responsible for the corresponding in-wallet navigation.
     void showPage(B3Page page);
+    B3Page currentPage() const { return m_currentPage; }
+    bool walletPageVisible() const;
 
     //! Replace a placeholder page's body (e.g. an honest unavailable note).
     void setTradePage(QWidget* page);
@@ -74,6 +76,7 @@ private:
     int m_assetsIndex{-1};
     int m_stakeIndex{-1};
     int m_settingsIndex{-1};
+    B3Page m_currentPage{B3Page::Dashboard};
 };
 
 #endif // BITCOIN_QT_B3SHELL_H

@@ -71,6 +71,29 @@ if(ENABLE_WALLET)
   set_tests_properties(test_b3_stakingunlock-qt PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=minimal"
   )
+
+  # Fast view-only regression/gallery: no wallet startup, mining or networking.
+  add_executable(test_b3_uipreview-qt
+    b3uipreviewtests.cpp b3shelltests.cpp b3dashboardtests.cpp b3assettests.cpp
+    b3stakesettingstests.cpp b3tradetests.cpp b3hardeningtests.cpp
+  )
+  target_link_libraries(test_b3_uipreview-qt
+    core_interface bitcoinqt test_util bitcoin_node Boost::headers Qt6::Test
+  )
+  import_plugins(test_b3_uipreview-qt)
+  add_test(NAME test_b3_uipreview-qt COMMAND test_b3_uipreview-qt)
+  set_tests_properties(test_b3_uipreview-qt PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=minimal")
+
+  add_executable(test_b3_themerendering-qt b3themerenderingtests.cpp)
+  set_property(TARGET test_b3_themerendering-qt PROPERTY AUTOUIC_SEARCH_PATHS
+    "${CMAKE_CURRENT_SOURCE_DIR}/../forms"
+  )
+  target_link_libraries(test_b3_themerendering-qt
+    core_interface bitcoinqt bitcoin_node Qt6::Test
+  )
+  import_plugins(test_b3_themerendering-qt)
+  add_test(NAME test_b3_themerendering-qt COMMAND test_b3_themerendering-qt)
+  set_tests_properties(test_b3_themerendering-qt PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=minimal")
 endif()
 
 add_test(NAME test_bitcoin-qt
@@ -94,6 +117,20 @@ if(WIN32 AND VCPKG_TARGET_TRIPLET)
   endif()
   if(TARGET test_b3_stakingunlock-qt)
     set_property(TEST test_b3_stakingunlock-qt APPEND PROPERTY
+      ENVIRONMENT_MODIFICATION
+        QT_QPA_PLATFORM=set:windows
+        QT_PLUGIN_PATH=set:${plugin_path}
+    )
+  endif()
+  if(TARGET test_b3_uipreview-qt)
+    set_property(TEST test_b3_uipreview-qt APPEND PROPERTY
+      ENVIRONMENT_MODIFICATION
+        QT_QPA_PLATFORM=set:windows
+        QT_PLUGIN_PATH=set:${plugin_path}
+    )
+  endif()
+  if(TARGET test_b3_themerendering-qt)
+    set_property(TEST test_b3_themerendering-qt APPEND PROPERTY
       ENVIRONMENT_MODIFICATION
         QT_QPA_PLATFORM=set:windows
         QT_PLUGIN_PATH=set:${plugin_path}

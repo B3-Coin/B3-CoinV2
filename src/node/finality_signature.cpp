@@ -6,6 +6,7 @@
 
 #include <chain.h>
 #include <consensus/era.h>
+#include <interfaces/chain.h>
 #include <logging.h>
 #include <modern/chain_domain.h>
 #include <modern/finality_schedule.h>
@@ -28,6 +29,7 @@ const char* FinalitySignaturePool::AcceptName(const Accept a)
     case Accept::TOO_SHALLOW: return "too-shallow";
     case Accept::BAD_INDEX: return "bad-index";
     case Accept::POOL_FULL: return "pool-full";
+    case Accept::VERIFICATION_DEFERRED: return "verification-deferred";
     case Accept::BAD_SIGNATURE: return "bad-signature";
     }
     return "unknown";
@@ -80,7 +82,8 @@ std::optional<modern::FinalizedBlock> FinalitySignaturePool::ExpectedFinalizedBl
 
 FinalitySignaturePool::Accept FinalitySignaturePool::Submit(const FinalitySig& sig, const FinalityTracker& tracker,
                                                             const CChain& chain, const Consensus::Params& params,
-                                                            const BridgeStateIndex* bridge_index)
+                                                            const BridgeStateIndex* bridge_index,
+                                                            const std::function<bool()>& consume_verification_budget)
 {
     const FinalityTracker::State& state{tracker.Current()};
     // Reclaim finalized slots on every submission, including malformed or
@@ -138,9 +141,15 @@ FinalitySignaturePool::Accept FinalitySignaturePool::Submit(const FinalitySig& s
 
     const auto key{std::make_pair(sig.epoch, sig.height)};
     auto slot_it{m_slots.find(key)};
-    if (slot_it != m_slots.end() &&
-        slot_it->second.sigs.count(sig.index)) {
-        return Accept::DUPLICATE;
+    if (slot_it != m_slots.end()) {
+        const auto known{slot_it->second.sigs.find(sig.index)};
+        if (known != slot_it->second.sigs.end()) {
+            // Coordinates alone are not proof of receipt of verified bytes.
+            // Canonical BLS encoding is unique for this member and digest, so
+            // another byte string is not a valid duplicate and cannot replace
+            // the verified record or acquire its relay/acceptance status.
+            return known->second == sig.signature ? Accept::DUPLICATE : Accept::BAD_SIGNATURE;
+        }
     }
     // A prolonged quorum outage must not freeze the pool on its first eight
     // checkpoints forever. A newer valid checkpoint replaces the oldest
@@ -154,6 +163,9 @@ FinalitySignaturePool::Accept FinalitySignaturePool::Submit(const FinalitySig& s
     }
 
     // Expensive BLS verification remains last.
+    if (consume_verification_budget && !consume_verification_budget()) {
+        return Accept::VERIFICATION_DEFERRED;
+    }
     const auto decoded{bls::Signature::Decode(sig.signature)};
     if (!decoded) return Accept::BAD_SIGNATURE;
     // Provenance: the member key passed its PoP in consensus at binding time.
@@ -324,6 +336,7 @@ bool FinalitySigner::SetKeys(
     m_keys = std::move(selected);
     m_validator_key = validator_key;
     m_store = FinalitySignerStore{};
+    m_operator_trusted_recovery.reset();
     m_last_signed = -1;
     m_error.clear();
     m_key_error.clear();
@@ -367,12 +380,43 @@ bool FinalitySigner::SetKeysPersistent(
     m_keys = std::move(candidate.m_keys);
     m_validator_key = validator_key;
     m_store = std::move(store);
+    m_operator_trusted_recovery.reset();
     m_last_signed = m_store.State()
                         ? m_store.State()->last_signed_height
                         : -1;
     m_error.clear();
     m_key_error.clear();
     m_permanent_error = false;
+    return true;
+}
+
+bool FinalitySigner::SetOperatorTrustedRecovery(
+    const Consensus::FinalitySignerRecovery& recovery, std::string& error)
+{
+    if (!recovery.Valid() || !recovery.validator_key) {
+        error = "operator-trusted recovery requires a valid exact incident and a mandatory validator target";
+        return false;
+    }
+    if (!HasKey() || !m_store.IsOpen() || !m_store.State() ||
+        m_permanent_error) {
+        error = "operator-trusted recovery requires an already loaded, intact persistent signer journal without a permanent safety failure";
+        return false;
+    }
+    const FinalitySignerState& persisted{*m_store.State()};
+    if (*recovery.validator_key != m_validator_key ||
+        persisted.validator_key != m_validator_key ||
+        recovery.chain_domain != m_store.ChainDomain() ||
+        persisted.chain_domain != recovery.chain_domain) {
+        error = "operator-trusted recovery does not match the loaded validator identity and chain domain";
+        return false;
+    }
+    if (!FinalitySignerStore::MatchesOperatorRecoveryIncident(persisted, recovery, error)) return false;
+    // Approval is local and in memory only. The active chain is not supplied
+    // here: application checks it afresh, and the store rechecks the on-disk
+    // predecessor before any durable lock move. Never clear an existing
+    // safety error merely because an operator supplied a recovery plan.
+    m_operator_trusted_recovery = recovery;
+    error.clear();
     return true;
 }
 
@@ -383,6 +427,79 @@ void FinalitySigner::Fail(std::string error, const bool permanent)
     }
     m_error = std::move(error);
     m_permanent_error = m_permanent_error || permanent;
+}
+
+interfaces::FinalityRecoveryStatus FinalitySigner::RecoveryStatus(
+    const FinalityTracker& tracker, const CChain& chain,
+    const Consensus::Params& params, const BridgeStateIndex* bridge_index) const
+{
+    interfaces::FinalityRecoveryStatus result;
+    if (const auto* tip{chain.Tip()}) {
+        result.observed_tip_height = tip->nHeight;
+        result.observed_tip_hash = tip->GetBlockHash();
+    }
+    result.journal_open = m_store.IsOpen();
+    result.journal_present = m_store.State().has_value();
+    result.permanent_error = m_permanent_error;
+    const auto& state{tracker.Current()};
+    if (state.finalized) {
+        const auto& finalized{*state.finalized};
+        result.finalized_height = finalized.height;
+        result.finalized_hash = finalized.block_hash;
+        result.finalized_epoch = finalized.epoch;
+        result.finalized_certified_at = finalized.certified_at;
+        result.certificate_included = finalized.certified_at > finalized.height &&
+                                      chain[finalized.certified_at] != nullptr;
+        if (const auto* set{SetForEpoch(state, finalized.epoch)}) {
+            result.finalized_signing_set_hash = set->SetHash();
+        }
+        const auto expected{FinalitySignaturePool::ExpectedFinalizedBlock(
+            finalized.epoch, finalized.height, state, chain, params, bridge_index)};
+        result.certificate_reconstructible = expected && expected->block_hash == finalized.block_hash;
+    }
+    if (!result.journal_open) {
+        result.state = "journal_unavailable";
+        return result;
+    }
+    if (!result.journal_present) {
+        result.state = result.permanent_error ? "signer_error" : "journal_missing";
+        return result;
+    }
+    const auto& persisted{*m_store.State()};
+    result.last_signed_height = persisted.last_signed_height;
+    result.last_signed_hash = persisted.last_signed_block_hash;
+    result.last_signed_digest = persisted.last_signed_digest;
+    if (persisted.lock_height < 0) {
+        result.state = result.permanent_error ? "signer_error" : "no_ancestry_lock";
+        return result;
+    }
+    result.lock_height = persisted.lock_height;
+    result.lock_hash = persisted.lock_block_hash;
+    result.lock_digest = persisted.lock_digest;
+    result.lock_epoch = persisted.lock_epoch;
+    result.lock_signing_set_hash = persisted.lock_signing_set_hash;
+    result.lock_successor_set_hash = persisted.lock_successor_set_hash;
+    if (const auto* locked{chain[persisted.lock_height]}) {
+        result.current_chain_hash = locked->GetBlockHash();
+        result.blocked_on_orphan_vote = *result.current_chain_hash != persisted.lock_block_hash;
+    }
+    if (state.finalized) {
+        result.certificate_strictly_newer = state.finalized->height > persisted.lock_height;
+        result.certificate_same_epoch = state.finalized->epoch == persisted.lock_epoch;
+        result.certificate_same_set = result.finalized_signing_set_hash &&
+                                      *result.finalized_signing_set_hash == persisted.lock_signing_set_hash;
+    }
+    if (result.permanent_error) {
+        result.state = "signer_error";
+    } else if (!result.current_chain_hash) {
+        // Being behind this height is not evidence that the vote was orphaned.
+        result.state = "waiting_for_locked_height";
+    } else if (result.blocked_on_orphan_vote) {
+        result.state = "blocked_on_orphan_vote";
+    } else {
+        result.state = "lock_matches_chain";
+    }
+    return result;
 }
 
 bool FinalitySigner::EnsurePersistentSafety(
@@ -494,11 +611,11 @@ bool FinalitySigner::EnsurePersistentSafety(
     // strictly newer quorum certificate which consensus already validated and
     // included on this active chain. Quorum intersection then makes a second
     // conflicting certificate impossible under the protocol fault bound.
-    // The only other lock change is the chain-pinned one-time recovery of an
-    // exactly matching incident. It is consulted whenever the protocol proof
-    // is absent or does not apply to this lock (so a validator that recovers
-    // late, after the first post-incident certificate, is not shut out), and
-    // it leaves this journal untouched unless every pinned fact holds.
+    // The chain-pinned one-time recovery is consulted next. A separately
+    // opted-in operator-trusted incident may be consulted last; unlike the
+    // protocol proof or a hardened checkpoint, that choice relies on explicit
+    // external trust and cannot revoke the old signature. Both incident
+    // paths leave the journal untouched unless every specified fact holds.
     std::string protocol_refusal;
     const bool newer_certificate{
         state.finalized.has_value() &&
@@ -547,20 +664,46 @@ bool FinalitySigner::EnsurePersistentSafety(
                                error));
                 return false;
             }
+            m_operator_trusted_recovery.reset();
             m_error.clear();
             return true;
         }
     }
     std::string recovery_note;
-    switch (TryPinnedRecovery(persisted, state, chain, params,
-                              *configured_domain, bridge_index,
-                              recovery_note)) {
+    for (const Consensus::FinalitySignerRecovery& pin :
+         params.finality_signer_recoveries) {
+        std::string candidate_note;
+        switch (TryPinnedRecovery(pin, persisted, state, chain, params,
+                                  *configured_domain, bridge_index,
+                                  candidate_note)) {
+        case PinnedRecovery::APPLIED:
+            m_operator_trusted_recovery.reset();
+            m_error.clear();
+            return true;
+        case PinnedRecovery::FAILED:
+            return false;
+        case PinnedRecovery::NOT_APPLICABLE:
+            if (!candidate_note.empty()) {
+                if (!recovery_note.empty()) recovery_note += "; ";
+                recovery_note += candidate_note;
+            }
+            break;
+        }
+    }
+    std::string operator_note;
+    switch (TryOperatorTrustedRecovery(persisted, state, chain, params,
+                                       *configured_domain, bridge_index,
+                                       operator_note)) {
     case PinnedRecovery::APPLIED:
         m_error.clear();
         return true;
     case PinnedRecovery::FAILED:
         return false;
     case PinnedRecovery::NOT_APPLICABLE:
+        if (!operator_note.empty()) {
+            if (!recovery_note.empty()) recovery_note += "; ";
+            recovery_note += operator_note;
+        }
         break;
     }
     Fail(protocol_refusal +
@@ -570,14 +713,48 @@ bool FinalitySigner::EnsurePersistentSafety(
 }
 
 FinalitySigner::PinnedRecovery FinalitySigner::TryPinnedRecovery(
+    const Consensus::FinalitySignerRecovery& pin,
+    const FinalitySignerState& persisted,
+    const FinalityTracker::State& state, const CChain& chain,
+    const Consensus::Params& params, const uint256& chain_domain,
+    const BridgeStateIndex* bridge_index, std::string& reason)
+{
+    return TryRecoveryAnchor(pin, persisted, state, chain, params, chain_domain,
+                             bridge_index, RecoveryTrust::HARDENED_CHECKPOINT,
+                             reason);
+}
+
+FinalitySigner::PinnedRecovery FinalitySigner::TryOperatorTrustedRecovery(
     const FinalitySignerState& persisted,
     const FinalityTracker::State& state, const CChain& chain,
     const Consensus::Params& params, const uint256& chain_domain,
     const BridgeStateIndex* bridge_index, std::string& reason)
 {
     reason.clear();
-    const auto& pin{params.finality_signer_recovery};
-    if (!pin || !pin->Valid() || !params.modern_pos) {
+    if (!m_operator_trusted_recovery) return PinnedRecovery::NOT_APPLICABLE;
+    const PinnedRecovery result{TryRecoveryAnchor(
+        *m_operator_trusted_recovery, persisted, state, chain, params,
+        chain_domain, bridge_index, RecoveryTrust::OPERATOR_TRUSTED, reason)};
+    if (result == PinnedRecovery::APPLIED) m_operator_trusted_recovery.reset();
+    return result;
+}
+
+FinalitySigner::PinnedRecovery FinalitySigner::TryRecoveryAnchor(
+    const Consensus::FinalitySignerRecovery& pin,
+    const FinalitySignerState& persisted,
+    const FinalityTracker::State& state, const CChain& chain,
+    const Consensus::Params& params, const uint256& chain_domain,
+    const BridgeStateIndex* bridge_index, const RecoveryTrust trust,
+    std::string& reason)
+{
+    reason.clear();
+    const bool operator_trusted{trust == RecoveryTrust::OPERATOR_TRUSTED};
+    const std::string label{operator_trusted ? "operator-trusted recovery" : "pinned recovery"};
+    if (!pin.Valid() || !params.modern_pos) {
+        return PinnedRecovery::NOT_APPLICABLE;
+    }
+    if (operator_trusted && (!state.bootstrapped || state.lineage_broken)) {
+        reason = label + " not applicable: the epoch state is not bootstrapped with intact lineage";
         return PinnedRecovery::NOT_APPLICABLE;
     }
     const Consensus::ModernPosParams& pos{*params.modern_pos};
@@ -588,8 +765,20 @@ FinalitySigner::PinnedRecovery FinalitySigner::TryPinnedRecovery(
 
     // 1. Network: the pin, the configured chain and the journal must all
     //    name the same modern chain domain.
-    if (pin->chain_domain != chain_domain ||
+    if (pin.chain_domain != chain_domain ||
         m_store.ChainDomain() != chain_domain) {
+        return PinnedRecovery::NOT_APPLICABLE;
+    }
+    if (pin.validator_key && *pin.validator_key != m_validator_key) {
+        return PinnedRecovery::NOT_APPLICABLE;
+    }
+    if (operator_trusted &&
+        (!pin.validator_key || persisted.validator_key != m_validator_key ||
+         persisted.chain_domain != chain_domain ||
+         persisted.last_signed_digest.IsNull() ||
+         pin.anchor_height <= persisted.last_signed_height ||
+         pin.anchor_height <= persisted.lock_height)) {
+        reason = label + " not applicable: the intact targeted incident journal is required and the anchor must advance both recorded heights";
         return PinnedRecovery::NOT_APPLICABLE;
     }
     // 2. Journal: exactly the pinned incident as both the last vote and the
@@ -597,55 +786,65 @@ FinalitySigner::PinnedRecovery FinalitySigner::TryPinnedRecovery(
     //    epoch and exact validator sets, with no newer signing record. The
     //    store re-checks every one of these before writing. A journal that
     //    is not the incident is silently left alone.
-    if (persisted.last_signed_height != pin->incident_height ||
-        persisted.last_signed_block_hash != pin->incident_block_hash ||
-        persisted.lock_height != pin->incident_height ||
-        persisted.lock_block_hash != pin->incident_block_hash ||
+    if (persisted.last_signed_height != pin.incident_height ||
+        persisted.last_signed_block_hash != pin.incident_block_hash ||
+        persisted.lock_height != pin.incident_height ||
+        persisted.lock_block_hash != pin.incident_block_hash ||
         persisted.lock_digest != persisted.last_signed_digest ||
-        persisted.lock_epoch != pin->incident_epoch ||
-        persisted.lock_signing_set_hash != pin->incident_signing_set_hash ||
+        persisted.lock_epoch != pin.incident_epoch ||
+        persisted.lock_signing_set_hash != pin.incident_signing_set_hash ||
         persisted.lock_successor_set_hash !=
-            pin->incident_successor_set_hash) {
+            pin.incident_successor_set_hash) {
+        if (operator_trusted) {
+            reason = label + " not applicable: the journal no longer exactly matches the approved incident; a later vote or recovery lock cannot be bypassed";
+        }
         return PinnedRecovery::NOT_APPLICABLE;
     }
-    // 3. Hardened anchor: recovery is permitted only when the exact anchor is
-    //    also a modern block checkpoint. This turns the chosen history into a
-    //    block-validity rule for upgraded nodes, including reindex, rather
-    //    than trusting a signer-only observation of the active tip.
-    const auto hardened_anchor{
-        params.modern_checkpoints.find(pin->anchor_height)};
-    if (hardened_anchor == params.modern_checkpoints.end() ||
-        hardened_anchor->second != pin->anchor_block_hash) {
-        reason = "pinned recovery not applicable: the recovery anchor is not a hardened modern checkpoint";
-        return PinnedRecovery::NOT_APPLICABLE;
+    // 3. The existing chain-pinned mode still requires the exact hardened
+    //    modern checkpoint. Its block-validity rule is unchanged, including
+    //    during reindex; only the separately opted-in mode uses local trust.
+    if (!operator_trusted) {
+        const auto hardened_anchor{
+            params.modern_checkpoints.find(pin.anchor_height)};
+        if (hardened_anchor == params.modern_checkpoints.end() ||
+            hardened_anchor->second != pin.anchor_block_hash) {
+            reason = "pinned recovery not applicable: the recovery anchor is not a hardened modern checkpoint";
+            return PinnedRecovery::NOT_APPLICABLE;
+        }
     }
+    // Operator trust does not add or require a hardened block checkpoint.
+    // It is a local exceptional choice, NOT an alternative quorum proof.
     // From here on this journal IS the pinned incident, so every refusal is
     // named: an operator must be able to tell a recovery that is still
     // pending from one that does not apply to this chain.
     //
     // 4. Active chain: the incident block must really be orphaned here (the
     //    caller only reaches this path when it is; kept as a guard), and the
-    //    hardened anchor must be this chain's block at its height and buried
-    //    to normal finality-signing depth. A recovered lock can never move to
-    //    a competing block at this height because header admission and
-    //    ConnectBlock both enforce the checkpoint.
-    const CBlockIndex* at_incident{chain[pin->incident_height]};
-    const CBlockIndex* anchor{chain[pin->anchor_height]};
+    //    agreed anchor must be this chain's block at its height and buried
+    //    to the required depth. ONLY hardened mode also has header admission
+    //    and ConnectBlock enforcement. An operator-trusted anchor can itself
+    //    be orphaned later; the normal ancestry guard must then refuse again.
+    const CBlockIndex* at_incident{chain[pin.incident_height]};
+    const CBlockIndex* anchor{chain[pin.anchor_height]};
     if (!at_incident) {
-        reason = "pinned recovery pending: the active chain has not reached the incident height";
+        reason = label + " pending: the active chain has not reached the incident height";
         return PinnedRecovery::NOT_APPLICABLE;
     }
-    if (at_incident->GetBlockHash() == pin->incident_block_hash) {
-        reason = "pinned recovery not applicable: the incident block is on this chain";
+    if (at_incident->GetBlockHash() == pin.incident_block_hash) {
+        reason = label + " not applicable: the incident block is on this chain";
         return PinnedRecovery::NOT_APPLICABLE;
     }
-    if (!anchor || anchor->GetBlockHash() != pin->anchor_block_hash) {
-        reason = "pinned recovery not applicable: this chain does not carry the pinned anchor block";
+    if (!anchor || anchor->GetBlockHash() != pin.anchor_block_hash) {
+        reason = label + " not applicable: this chain does not carry the pinned anchor block";
         return PinnedRecovery::NOT_APPLICABLE;
     }
-    if (!modern::CheckpointDepthSatisfied(pin->anchor_height, tip->nHeight,
-                                          pos.checkpoint_depth)) {
-        reason = "pinned recovery pending: the hardened anchor is not yet buried to finality-signing depth";
+    const int recovery_depth{operator_trusted ? std::max(20, pos.checkpoint_depth)
+                                             : pos.checkpoint_depth};
+    if (!modern::CheckpointDepthSatisfied(pin.anchor_height, tip->nHeight,
+                                          recovery_depth)) {
+        reason = operator_trusted
+                     ? label + " pending: the trusted anchor is not yet buried by at least 20 blocks and the consensus signing depth"
+                     : "pinned recovery pending: the hardened anchor is not yet buried to finality-signing depth";
         return PinnedRecovery::NOT_APPLICABLE;
     }
     // 5. Lineage: the incident's epoch must still be inside this chain's
@@ -658,50 +857,57 @@ FinalitySigner::PinnedRecovery FinalitySigner::TryPinnedRecovery(
     //    resolved, and the previous epoch stays signable until the lineage
     //    breaks.
     const ValidatorSetSnapshot* incident_set{
-        SetForEpoch(state, pin->incident_epoch)};
+        SetForEpoch(state, pin.incident_epoch)};
     const auto incident_successor{
-        SuccessorHashForEpoch(state, pin->incident_epoch)};
+        SuccessorHashForEpoch(state, pin.incident_epoch)};
     if (!incident_set ||
-        incident_set->SetHash() != pin->incident_signing_set_hash ||
+        incident_set->SetHash() != pin.incident_signing_set_hash ||
         !incident_successor ||
-        *incident_successor != pin->incident_successor_set_hash) {
-        reason = "pinned recovery not applicable: this chain's epoch state does not match the incident lineage";
+        *incident_successor != pin.incident_successor_set_hash) {
+        reason = label + " not applicable: this chain's epoch state does not match the incident lineage";
         return PinnedRecovery::NOT_APPLICABLE;
     }
     const auto anchor_epoch{
-        modern::EpochOfHeight(state.epoch_starts, pin->anchor_height)};
-    if (!modern::IsCheckpointHeight(pin->anchor_height, *modern_start,
+        modern::EpochOfHeight(state.epoch_starts, pin.anchor_height)};
+    if (!modern::IsCheckpointHeight(pin.anchor_height, *modern_start,
                                     pos.checkpoint_interval) ||
-        !anchor_epoch || *anchor_epoch != pin->incident_epoch) {
-        reason = "pinned recovery not applicable: the anchor is not a scheduled checkpoint of the incident epoch";
+        !anchor_epoch || *anchor_epoch != pin.incident_epoch) {
+        reason = label + " not applicable: the anchor is not a scheduled checkpoint of the incident epoch";
         return PinnedRecovery::NOT_APPLICABLE;
     }
     // 6. The exact object this node would sign at the anchor must be
     //    derivable on this chain and commit to the same successor set.
     const auto fb{FinalitySignaturePool::ExpectedFinalizedBlock(
-        pin->incident_epoch, static_cast<uint64_t>(pin->anchor_height),
+        pin.incident_epoch, static_cast<uint64_t>(pin.anchor_height),
         state, chain, params, bridge_index)};
     if (!fb) {
-        reason = "pinned recovery pending: the anchor checkpoint object is not derivable on this node yet (bridge state not synced?)";
+        reason = label + " pending: the anchor checkpoint object is not derivable on this node yet (bridge state not synced?)";
         return PinnedRecovery::NOT_APPLICABLE;
     }
-    if (fb->block_hash != pin->anchor_block_hash ||
-        fb->validator_set_hash != pin->incident_successor_set_hash) {
-        reason = "pinned recovery not applicable: the anchor checkpoint object differs from the pinned incident lineage";
+    if (fb->block_hash != pin.anchor_block_hash ||
+        fb->validator_set_hash != pin.incident_successor_set_hash) {
+        reason = label + " not applicable: the anchor checkpoint object differs from the pinned incident lineage";
         return PinnedRecovery::NOT_APPLICABLE;
     }
     const uint256 digest{modern::FinalityDigest(chain_domain, *fb)};
     std::string error;
-    if (!m_store.CommitPinnedRecoveryAnchor(*pin, digest, error)) {
-        Fail(strprintf("cannot persist the pinned recovery anchor: %s",
-                       error));
+    if (!m_store.CommitPinnedRecoveryAnchor(pin, digest, error)) {
+        Fail(strprintf("cannot persist the %s anchor: %s", label, error));
         return PinnedRecovery::FAILED;
     }
-    LogWarning(
-        "finality signer: applied the pinned one-time recovery: ancestry lock moved from orphaned checkpoint %d %s to the agreed anchor %d %s; the recorded vote at %d is retained and the next signature must be above %d",
-        pin->incident_height, pin->incident_block_hash.ToString(),
-        pin->anchor_height, pin->anchor_block_hash.ToString(),
-        pin->incident_height, pin->anchor_height);
+    if (operator_trusted) {
+        LogWarning(
+            "finality signer: applied explicitly operator-trusted one-time recovery, NOT a quorum proof or hardened checkpoint: ancestry lock moved from orphaned checkpoint %d %s to the trusted anchor %d %s; the recorded vote at %d remains unchanged and is NOT revoked, and the next signature must be above %d",
+            pin.incident_height, pin.incident_block_hash.ToString(),
+            pin.anchor_height, pin.anchor_block_hash.ToString(),
+            pin.incident_height, pin.anchor_height);
+    } else {
+        LogWarning(
+            "finality signer: applied the pinned one-time recovery: ancestry lock moved from orphaned checkpoint %d %s to the agreed anchor %d %s; the recorded vote at %d is retained and the next signature must be above %d",
+            pin.incident_height, pin.incident_block_hash.ToString(),
+            pin.anchor_height, pin.anchor_block_hash.ToString(),
+            pin.incident_height, pin.anchor_height);
+    }
     return PinnedRecovery::APPLIED;
 }
 
@@ -750,15 +956,16 @@ std::vector<FinalitySig> FinalitySigner::MaybeSign(const FinalityTracker& tracke
     if (m_store.IsOpen() && m_store.State()) {
         deepest = std::max(deepest, m_store.State()->lock_height);
     }
-    const int signable_to{tip->nHeight - pos.checkpoint_depth};
-    // First scheduled checkpoint strictly above everything signed/final.
-    int h{*modern_start};
-    if (deepest >= *modern_start) {
-        h = deepest + 1;
-        const int rem{(h - *modern_start) % pos.checkpoint_interval};
-        if (rem != 0) h += pos.checkpoint_interval - rem;
-    }
-    for (; h <= signable_to; h += pos.checkpoint_interval) {
+    // A local delay restricts only new signatures. Journal recovery and the
+    // pool's consensus minimum remain unchanged, including during an upgrade.
+    const auto signing_window{m_signing_policy.Checkpoints(
+        tip->nHeight, pos.checkpoint_depth, *modern_start,
+        pos.checkpoint_interval, deepest)};
+    if (!signing_window) return out;
+    for (int64_t candidate{signing_window->first_checkpoint};
+         candidate <= signing_window->last_checkpoint;
+         candidate += pos.checkpoint_interval) {
+        const int h{static_cast<int>(candidate)};
         const auto epoch{modern::EpochOfHeight(state.epoch_starts, h)};
         if (!epoch) continue;
         const ValidatorSetSnapshot* set{SetForEpoch(state, *epoch)};

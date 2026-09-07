@@ -354,6 +354,13 @@ void B3StakePage::setWalletModel(WalletModel* wallet_model)
 
     const bool have_wallet = m_wallet_model != nullptr;
     m_no_wallet->setVisible(!have_wallet);
+    if (m_wallet_model) {
+        // Connect before the controller's destruction listener: detach the
+        // page and its reward model before that listener publishes status.
+        // QPointer additionally makes callbacks safe regardless of ordering.
+        connect(m_wallet_model.data(), &QObject::destroyed, this,
+                [this] { setWalletModel(nullptr); });
+    }
     m_controller->setWalletModel(wallet_model);
 
     if (!have_wallet) {
@@ -391,8 +398,8 @@ void B3StakePage::setWalletModel(WalletModel* wallet_model)
     connect(m_rewards_filter.get(), &TransactionFilterProxy::modelReset, this, refresh_empty_state);
     refresh_empty_state();
 
-    connect(m_wallet_model, &WalletModel::balanceChanged, this, &B3StakePage::setBalance);
-    connect(m_wallet_model, &WalletModel::encryptionStatusChanged, this, &B3StakePage::updateLockState);
+    connect(m_wallet_model.data(), &WalletModel::balanceChanged, this, &B3StakePage::setBalance);
+    connect(m_wallet_model.data(), &WalletModel::encryptionStatusChanged, this, &B3StakePage::updateLockState);
 
     const auto& balances = m_wallet_model->getCachedBalance();
     if (balances.balance != -1) setBalance(balances);
@@ -466,6 +473,7 @@ void B3StakePage::setValidatorStatus(const B3ValidatorStatus& status)
 {
     m_status = status;
     if (!m_wallet_model) return;
+    Q_EMIT validatorStatusChanged(status);
 
     if (!status.valid) {
         resetValidatorDisplay();

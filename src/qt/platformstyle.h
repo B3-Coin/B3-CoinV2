@@ -30,13 +30,13 @@ public:
     /** Colorize an icon (given filename) with the icon color */
     QIcon SingleColorIcon(const QString& filename) const;
 
-    /** Colorize an icon (given object) with the icon color */
+    /** Colorize an icon, preserving scalable sources, On/Off art and display scale. */
     QIcon SingleColorIcon(const QIcon& icon) const;
 
     /** Colorize an icon (given filename) with the text color */
     QIcon TextColorIcon(const QString& filename) const;
 
-    /** Colorize an icon (given object) with the text color */
+    /** Colorize an icon with the text color and an explicit disabled foreground. */
     QIcon TextColorIcon(const QIcon& icon) const;
 
 private:

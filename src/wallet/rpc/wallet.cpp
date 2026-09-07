@@ -922,6 +922,9 @@ RPCHelpMan bindfinalitykey();
 RPCHelpMan importfinalitykey();
 RPCHelpMan revokefinalitykey();
 RPCHelpMan getfinalityinfo();
+RPCHelpMan getfinalityrecoveryinfo();
+RPCHelpMan setfinalityrecovery();
+RPCHelpMan clearfinalityrecovery();
 RPCHelpMan exportbridgebootstrapidentity();
 RPCHelpMan signbridgebootstrap();
 RPCHelpMan stopstaking();
@@ -957,6 +960,9 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &importflowmeshkey},
         {"wallet", &revokefinalitykey},
         {"wallet", &getfinalityinfo},
+        {"wallet", &getfinalityrecoveryinfo},
+        {"wallet", &setfinalityrecovery},
+        {"wallet", &clearfinalityrecovery},
         {"wallet", &exportbridgebootstrapidentity},
         {"wallet", &signbridgebootstrap},
         {"wallet", &createwallet},

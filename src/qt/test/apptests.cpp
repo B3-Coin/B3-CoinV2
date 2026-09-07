@@ -5,6 +5,7 @@
 #include <qt/test/apptests.h>
 
 #include <chainparams.h>
+#include <clientversion.h>
 #include <key.h>
 #include <logging.h>
 #include <qt/bitcoin.h>
@@ -109,7 +110,9 @@ void AppTests::guiTests(BitcoinGUI* window)
     QVERIFY(window->updateController());
     QCOMPARE(window->updateController()->configured(),
              static_cast<bool>(B3_UPDATE_CHANNEL_CONFIGURED));
-    QCOMPARE(window->updateController()->installedVersion(), QStringLiteral("1.1.3"));
+    QCOMPARE(window->updateController()->installedVersion(),
+             QStringLiteral("%1.%2.%3").arg(CLIENT_VERSION / 10000)
+                 .arg((CLIENT_VERSION / 100) % 100).arg(CLIENT_VERSION % 100));
 
     // Palette refresh remains valid after construction as well.
     QEvent palette_change{QEvent::PaletteChange};

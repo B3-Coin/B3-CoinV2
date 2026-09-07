@@ -1,0 +1,15 @@
+/* XPM */
+/* Local B3 control glyph; built-in Qt image support, no SVG plugin needed. */
+static const char *b3_up[] = {
+"10 8 2 1",
+"  c None",
+". c #f3f0e8",
+"          ",
+"          ",
+"    ..    ",
+"   ....   ",
+"  ..  ..  ",
+" ..    .. ",
+"          ",
+"          "
+};

@@ -10,6 +10,7 @@
 #include <consensus/merkle.h>
 #include <consensus/params.h>
 #include <hash.h>
+#include <kernel/chainparams.h>
 #include <logging.h>
 #include <modern/chain_domain.h>
 #include <modern/pos_v1.h>
@@ -173,9 +174,74 @@ PreferredProposerPlan ComputePreferredProposerPlan(
 }
 
 StakingLoop::StakingLoop(ChainstateManager& chainman, CTxMemPool* mempool,
-                         fs::path finality_signer_dir)
+                         fs::path finality_signer_dir,
+                         std::optional<Consensus::FinalitySignerRecovery> operator_recovery)
     : m_chainman{chainman}, m_mempool{mempool},
-      m_finality_signer_dir{std::move(finality_signer_dir)} {}
+      m_finality_signer_dir{std::move(finality_signer_dir)},
+      m_operator_recovery{std::move(operator_recovery)} {}
+
+interfaces::FinalityRecoveryControl StakingLoop::RecoveryControl()
+{
+    LOCK(m_mutex);
+    return {true, m_running, m_operator_recovery};
+}
+
+bool StakingLoop::SetFinalityRecovery(
+    const std::array<unsigned char, 32>& wallet_validator,
+    const Consensus::FinalitySignerRecovery& recovery, std::string& error)
+{
+    LOCK(m_lifecycle_mutex);
+    LOCK(m_mutex);
+    if (m_running) {
+        error = "stop staking before configuring finality recovery";
+        return false;
+    }
+    if (!recovery.Valid() || !recovery.validator_key ||
+        *recovery.validator_key != wallet_validator) {
+        error = "finality recovery must target this wallet's exact validator identity";
+        return false;
+    }
+    if (m_operator_recovery &&
+        m_operator_recovery->validator_key != recovery.validator_key) {
+        error = "cannot replace another validator's finality recovery configuration";
+        return false;
+    }
+    const auto& params{m_chainman.GetConsensus()};
+    const auto domain{params.legacy_final_hash
+        ? modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)
+        : std::nullopt};
+    if (!domain || recovery.chain_domain != *domain) {
+        error = "finality recovery belongs to another or unconfigured modern chain domain";
+        return false;
+    }
+    if (!FinalitySignerStore::CheckOperatorRecoveryIncident(
+            m_finality_signer_dir, *domain, wallet_validator, recovery, error)) return false;
+    // This is approval for the next normal staking start, not an applied
+    // recovery. The worker reopens the journal and rechecks the active chain.
+    m_operator_recovery = recovery;
+    error.clear();
+    return true;
+}
+
+bool StakingLoop::ClearFinalityRecovery(
+    const std::array<unsigned char, 32>& wallet_validator, std::string& error)
+{
+    LOCK(m_lifecycle_mutex);
+    LOCK(m_mutex);
+    if (m_running) {
+        error = "stop staking before clearing finality recovery";
+        return false;
+    }
+    if (m_operator_recovery &&
+        (!m_operator_recovery->validator_key ||
+         *m_operator_recovery->validator_key != wallet_validator)) {
+        error = "cannot clear another validator's finality recovery configuration";
+        return false;
+    }
+    m_operator_recovery.reset();
+    error.clear();
+    return true;
+}
 
 bool StakingLoop::SetFinalityKey(const bls::SecretKey& key, const std::array<unsigned char, 32>& validator_key,
                                  std::string& error)
@@ -280,7 +346,9 @@ bool StakingLoop::StartImpl(const CKey& validator_key, const CScript& coinbase_s
         m_stop = false;
         m_state = "starting";
         m_last_error.clear();
+        m_finality_startup_failed = false;
         m_last_signed_height = -1;
+        m_finality_recovery.reset();
         m_finality_signing_failed = false;
         m_next_block_time = 0;
         try {
@@ -326,6 +394,7 @@ void StakingLoop::Stop()
     }
     m_coinbase_script.clear();
     m_next_block_time = 0;
+    m_finality_recovery.reset();
 }
 
 bool StakingLoop::SleepUnlessStopped(const std::chrono::milliseconds d)
@@ -339,7 +408,7 @@ void StakingLoop::SetState(const std::string& state, const std::string& error)
     LOCK(m_mutex);
     if (m_state != state) LogDebug(BCLog::VALIDATION, "staking: %s\n", state);
     m_state = state;
-    if (!error.empty()) m_last_error = error;
+    if (!error.empty() && !m_finality_startup_failed) m_last_error = error;
 }
 
 void StakingLoop::FillChainFacts(interfaces::StakingStatus& status, const std::optional<std::array<unsigned char, 32>>& key)
@@ -386,6 +455,7 @@ interfaces::StakingStatus StakingLoop::Status(const std::optional<std::array<uns
         status.last_signed_height = m_last_signed_height;
         if (m_running) {
             status.validator_key = m_validator;
+            status.finality_recovery = m_finality_recovery;
             if (!key) key = m_validator;
         }
     }
@@ -398,7 +468,12 @@ void StakingLoop::ThreadLoop()
     CKey key;
     std::array<unsigned char, 32> validator{};
     CScript coinbase_script;
-    FinalitySigner signer;
+    // Mainnet waits longer before making new votes; other networks retain
+    // their existing consensus/scaled timing. Received certificates and the
+    // persistent signer safety checks do not use this local policy.
+    FinalitySigner signer{FinalitySigningPolicy::ForNetwork(
+        m_chainman.GetParams().GetChainType())};
+    bool finality_startup_ready{false};
     {
         LOCK(m_mutex);
         key = m_key;
@@ -419,10 +494,20 @@ void StakingLoop::ThreadLoop()
                                m_finality_signer_dir, error)) {
                 if (error.empty()) error = "chain domain is not configured";
                 m_finality_signing_failed = true;
+                m_finality_startup_failed = true;
                 m_last_error = strprintf(
                     "finality signing disabled safely: %s", error);
             } else {
                 m_last_signed_height = signer.LastSignedHeight();
+                if (m_operator_recovery &&
+                    !signer.SetOperatorTrustedRecovery(*m_operator_recovery, error)) {
+                    m_finality_signing_failed = true;
+                    m_finality_startup_failed = true;
+                    m_last_error = strprintf(
+                        "finality signing disabled safely: operator recovery configuration rejected: %s", error);
+                } else {
+                    finality_startup_ready = true;
+                }
             }
         }
     }
@@ -458,8 +543,12 @@ void StakingLoop::ThreadLoop()
         // are eligible for at the current tip, self-aggregate, relay. The
         // signer refuses everything the spec forbids (wrong key, repeat,
         // shallow, below the finalized checkpoint), so this is idempotent.
-        if (signer.HasKey()) {
+        // A rejected explicit plan must not silently fall back to normal
+        // signing merely because key loading succeeded. Block staking remains
+        // independent; restarting staking is required after fixing the plan.
+        if (finality_startup_ready && signer.HasKey()) {
             std::vector<FinalitySig> sigs;
+            std::optional<interfaces::FinalityRecoveryStatus> recovery;
             {
                 LOCK(::cs_main);
                 Chainstate& chainstate{m_chainman.ActiveChainstate()};
@@ -480,16 +569,18 @@ void StakingLoop::ThreadLoop()
                     sigs = signer.MaybeSign(
                         tracker, chainstate.m_chain, params,
                         chainstate.FinalitySignatures(), bridge_index);
+                    recovery = signer.RecoveryStatus(
+                        tracker, chainstate.m_chain, params, bridge_index);
                 }
             }
             // This is the local anti-repeat watermark, not merely the last
             // signature selected for relay. A valid old checkpoint can be
             // deliberately discarded by the bounded pool while still
             // advancing the signer, and RPC status must reflect that.
-            WITH_LOCK(m_mutex,
-                      m_last_signed_height = signer.LastSignedHeight());
             {
                 LOCK(m_mutex);
+                m_last_signed_height = signer.LastSignedHeight();
+                if (recovery) m_finality_recovery = std::move(recovery);
                 if (!signer.LastError().empty()) {
                     m_finality_signing_failed = true;
                     m_last_error = strprintf(

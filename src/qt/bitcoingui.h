@@ -123,6 +123,12 @@ protected:
     bool eventFilter(QObject *object, QEvent *event) override;
 
 private:
+    //! Keep native wallet actions consistent with the visible shell page.
+    void updateNavigationActions(B3Page page);
+#ifdef ENABLE_WALLET
+    void reflectWalletPage(B3Page page);
+    void updateWalletSelector();
+#endif
     interfaces::Node& m_node;
     WalletController* m_wallet_controller{nullptr};
     std::unique_ptr<interfaces::Handler> m_handler_message_box;

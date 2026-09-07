@@ -12,6 +12,7 @@
 QT_BEGIN_NAMESPACE
 class QLabel;
 class QGridLayout;
+class QPushButton;
 class QResizeEvent;
 class QVBoxLayout;
 QT_END_NAMESPACE
@@ -45,11 +46,13 @@ Q_SIGNALS:
 private:
     void resizeEvent(QResizeEvent* event) override;
     void reflowCards(int width);
+    void updateWalletActionNote();
 
     QVBoxLayout* m_layout{nullptr};
     QWidget* m_content{nullptr};
     QVBoxLayout* m_wallet_actions_layout{nullptr};
     QLabel* m_wallet_note{nullptr};
+    QList<QPushButton*> m_wallet_buttons;
     QGridLayout* m_card_grid{nullptr};
     QWidget* m_application_card{nullptr};
     QWidget* m_network_card{nullptr};

@@ -23,6 +23,10 @@
 #include <qt/guiutil.h>
 #include <qt/modaloverlay.h>
 #include <qt/platformstyle.h>
+#include <qt/receivecoinsdialog.h>
+#include <qt/sendcoinsdialog.h>
+#include <qt/signverifymessagedialog.h>
+#include <qt/transactionview.h>
 
 #include <chainparams.h>
 
@@ -31,6 +35,7 @@
 #include <QDir>
 #include <QLabel>
 #include <QPushButton>
+#include <QStackedWidget>
 #include <QStringList>
 #include <QTest>
 #include <QToolButton>
@@ -71,7 +76,8 @@ void B3HardeningTests::sidebarKeyboardNavigationAndAccessibility()
 {
     B3NavSidebar sidebar;
 
-    const QStringList names{QStringLiteral("navDashboard"), QStringLiteral("navTrade"),
+    const QStringList names{QStringLiteral("navDashboard"), QStringLiteral("navSend"),
+                            QStringLiteral("navReceive"), QStringLiteral("navTrade"),
                             QStringLiteral("navAssets"), QStringLiteral("navStake"),
                             QStringLiteral("navActivity"), QStringLiteral("navSettings")};
     for (const QString& name : names) {
@@ -223,6 +229,7 @@ void B3HardeningTests::topStatusNetworkIdentitiesAreUnmistakable()
 void B3HardeningTests::shellSurvivesWalletWidgetReplacementAndPageCycling()
 {
     B3Shell shell;
+    shell.setSettingsPage(new B3SettingsPage());
     auto first = std::make_unique<QLabel>(QStringLiteral("wallet-one"));
     shell.setWalletWidget(first.get());
 
@@ -234,7 +241,7 @@ void B3HardeningTests::shellSurvivesWalletWidgetReplacementAndPageCycling()
     // Cycle every destination twice, including after the wallet widget
     // goes away mid-flight.
     for (int round = 0; round < 2; ++round) {
-        for (B3Page page : {B3Page::Dashboard, B3Page::Trade, B3Page::Assets,
+        for (B3Page page : {B3Page::Dashboard, B3Page::Send, B3Page::Receive, B3Page::Trade, B3Page::Assets,
                             B3Page::Stake, B3Page::Activity, B3Page::Settings}) {
             shell.showPage(page);
             QCOMPARE(shell.sidebar()->currentPage(), page);
@@ -366,9 +373,18 @@ void B3HardeningTests::visualRegressionFrames()
     B3Theme::apply(*qApp);
 
     {
-        std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+        std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("macosx")};
         B3Shell shell;
-        shell.setWalletWidget(new B3DashboardPage(style.get()));
+        auto* wallet_views = new QStackedWidget;
+        auto* dashboard = new B3DashboardPage(style.get());
+        auto* send = new SendCoinsDialog(style.get());
+        auto* receive = new ReceiveCoinsDialog(style.get());
+        auto* activity = new TransactionView(style.get());
+        for (QWidget* view : {static_cast<QWidget*>(dashboard), static_cast<QWidget*>(send),
+                              static_cast<QWidget*>(receive), static_cast<QWidget*>(activity)}) {
+            wallet_views->addWidget(view);
+        }
+        shell.setWalletWidget(wallet_views);
         shell.setTradePage(new B3TradePage());
         shell.setAssetsPage(new B3AssetsPage());
         shell.setStakePage(new B3StakePage());
@@ -383,16 +399,24 @@ void B3HardeningTests::visualRegressionFrames()
         qApp->processEvents();
 
         const auto save_page = [&](B3Page page, const QString& filename) {
+            if (page == B3Page::Dashboard) wallet_views->setCurrentWidget(dashboard);
+            if (page == B3Page::Send) wallet_views->setCurrentWidget(send);
+            if (page == B3Page::Receive) wallet_views->setCurrentWidget(receive);
+            if (page == B3Page::Activity) wallet_views->setCurrentWidget(activity);
             shell.showPage(page);
             qApp->processEvents();
             return shell.grab().save(output_dir + QLatin1Char('/') + filename, "PNG");
         };
         QVERIFY(save_page(B3Page::Dashboard, QStringLiteral("dashboard.png")));
+        QVERIFY(save_page(B3Page::Send, QStringLiteral("send.png")));
+        QVERIFY(save_page(B3Page::Receive, QStringLiteral("receive.png")));
+        QVERIFY(save_page(B3Page::Activity, QStringLiteral("activity.png")));
         QVERIFY(save_page(B3Page::Trade, QStringLiteral("trade-preview.png")));
         QVERIFY(save_page(B3Page::Assets, QStringLiteral("assets.png")));
         QVERIFY(save_page(B3Page::Stake, QStringLiteral("stake.png")));
         QVERIFY(save_page(B3Page::Settings, QStringLiteral("settings.png")));
 
+        wallet_views->setCurrentWidget(dashboard);
         shell.showPage(B3Page::Dashboard);
         shell.resize(720, 900);
         qApp->processEvents();
@@ -405,6 +429,24 @@ void B3HardeningTests::visualRegressionFrames()
         qApp->processEvents();
         QCOMPARE(shell.size(), QSize(736, 1044));
         QVERIFY(shell.grab().save(output_dir + QStringLiteral("/dashboard-reference.png"), "PNG"));
+
+        // Empty-state and failure surfaces are actual widgets; this never
+        // opens the live wallet or submits any transaction/signing operation.
+        shell.resize(1440, 900);
+        B3ValidatorStatus staking;
+        staking.valid = true;
+        staking.staking_running = true;
+        staking.staking_uses_this_wallet = true;
+        staking.finality_signing = true;
+        staking.last_signed_height = 100;
+        staking.staking_state = QStringLiteral("Waiting for a proposer slot (isolated preview)");
+        dashboard->setValidatorStatus(staking);
+        QVERIFY(save_page(B3Page::Dashboard, QStringLiteral("dashboard-staking-preview.png")));
+
+        SignVerifyMessageDialog signing(style.get(), nullptr);
+        signing.resize(780, 680);
+        signing.ensurePolished();
+        QVERIFY(signing.grab().save(output_dir + QStringLiteral("sign-verify.png"), "PNG"));
 
         shell.resize(1440, 900);
         ModalOverlay overlay{/*enable_wallet=*/true, &shell};

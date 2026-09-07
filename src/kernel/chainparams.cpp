@@ -500,7 +500,7 @@ public:
                 throw std::runtime_error(
                     "invalid mainnet finality signer recovery pin");
             }
-            consensus.finality_signer_recovery = recovery;
+            consensus.finality_signer_recoveries.push_back(recovery);
         }
 
         // Core treats vSeeds as DNS hostnames. These legacy values are literal

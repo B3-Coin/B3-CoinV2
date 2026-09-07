@@ -91,7 +91,8 @@ class StakingLoop
 {
 public:
     StakingLoop(ChainstateManager& chainman, CTxMemPool* mempool,
-                fs::path finality_signer_dir);
+                fs::path finality_signer_dir,
+                std::optional<Consensus::FinalitySignerRecovery> operator_recovery = std::nullopt);
     ~StakingLoop();
 
     //! Wire the peer manager for finality-signature relay (after net setup).
@@ -106,6 +107,15 @@ public:
                         std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_lifecycle_mutex, !m_mutex);
     bool ClearFinalityKey(std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_lifecycle_mutex, !m_mutex);
     bool HasFinalityKey() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) { LOCK(m_mutex); return !m_bls_keys.empty(); }
+
+    //! Recovery approval is node-local memory only. Set/Clear serialize with
+    //! every start/stop; both refuse to run while staking is active.
+    interfaces::FinalityRecoveryControl RecoveryControl() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool SetFinalityRecovery(const std::array<unsigned char, 32>& wallet_validator,
+                            const Consensus::FinalitySignerRecovery& recovery,
+                            std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_lifecycle_mutex, !m_mutex);
+    bool ClearFinalityRecovery(const std::array<unsigned char, 32>& wallet_validator,
+                              std::string& error) EXCLUSIVE_LOCKS_REQUIRED(!m_lifecycle_mutex, !m_mutex);
 
     //! Start staking with `validator_key`; block fees pay `coinbase_script`.
     //! Returns false (with `error`) if already running or the key is unusable.
@@ -146,6 +156,8 @@ private:
     ChainstateManager& m_chainman;
     CTxMemPool* const m_mempool;
     const fs::path m_finality_signer_dir;
+    //! Explicit startup/RPC operator trust; never a consensus checkpoint.
+    std::optional<Consensus::FinalitySignerRecovery> m_operator_recovery GUARDED_BY(m_mutex);
     PeerManager* m_peerman{nullptr};
 
     // Serialize complete start/stop/key-replacement operations. m_mutex alone
@@ -166,7 +178,10 @@ private:
     uint256 m_last_block_hash GUARDED_BY(m_mutex);
     int64_t m_next_block_time GUARDED_BY(m_mutex){0};
     int m_last_signed_height GUARDED_BY(m_mutex){-1};
+    std::optional<interfaces::FinalityRecoveryStatus> m_finality_recovery GUARDED_BY(m_mutex);
     bool m_finality_signing_failed GUARDED_BY(m_mutex){false};
+    //! Startup refusals stay visible until a new staking session is started.
+    bool m_finality_startup_failed GUARDED_BY(m_mutex){false};
 };
 
 } // namespace node

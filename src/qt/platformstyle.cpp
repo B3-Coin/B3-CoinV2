@@ -6,8 +6,12 @@
 
 #include <QApplication>
 #include <QColor>
+#include <QIconEngine>
 #include <QImage>
 #include <QPalette>
+#include <QPainter>
+
+#include <utility>
 
 static const struct {
     const char *platformId;
@@ -18,8 +22,10 @@ static const struct {
     /** Extra padding/spacing in transactionview */
     const bool useExtraSpacing;
 } platform_styles[] = {
-    {"macosx", false, true, true},
-    {"windows", true, false, false},
+    // B3 uses the same dark application theme on every platform. Inherited
+    // macOS dialogs must not erase their icons, nor Windows retain black ink.
+    {"macosx", true, true, true},
+    {"windows", true, true, false},
     /* Other: linux, unix, ... */
     {"other", true, true, false}
 };
@@ -40,16 +46,67 @@ void MakeSingleColorImage(QImage& img, const QColor& colorbase)
     }
 }
 
-QIcon ColorizeIcon(const QIcon& ico, const QColor& colorbase)
+class MonochromeIconEngine final : public QIconEngine
 {
-    QIcon new_ico;
-    for (const QSize& sz : ico.availableSizes())
+public:
+    MonochromeIconEngine(QIcon source, QColor foreground)
+        : m_source{std::move(source)}, m_foreground{std::move(foreground)} {}
+
+    QIconEngine* clone() const override { return new MonochromeIconEngine{*this}; }
+    bool isNull() override { return m_source.isNull(); }
+    QList<QSize> availableSizes(QIcon::Mode mode, QIcon::State state) override
     {
-        QImage img(ico.pixmap(sz).toImage());
-        MakeSingleColorImage(img, colorbase);
-        new_ico.addPixmap(QPixmap::fromImage(img));
+        return m_source.availableSizes(mode, state);
     }
-    return new_ico;
+
+    void paint(QPainter* painter, const QRect& rect, QIcon::Mode mode, QIcon::State state) override
+    {
+        const QPixmap image{Render(rect.size(), painter->device()->devicePixelRatioF(), mode, state)};
+        painter->drawPixmap(rect, image);
+    }
+
+    QPixmap pixmap(const QSize& size, QIcon::Mode mode, QIcon::State state) override
+    {
+        return Render(size, 1.0, mode, state);
+    }
+
+    QPixmap scaledPixmap(const QSize& size, QIcon::Mode mode, QIcon::State state, qreal scale) override
+    {
+        // Before Qt 6.8, QIcon passed device pixels to this hook instead of
+        // logical pixels. Avoid applying the display scale twice there.
+#if QT_VERSION < QT_VERSION_CHECK(6, 8, 0)
+        return Render((QSizeF{size} / scale).toSize(), scale, mode, state);
+#else
+        return Render(size, scale, mode, state);
+#endif
+    }
+
+private:
+    QPixmap Render(const QSize& size, qreal scale, QIcon::Mode mode, QIcon::State state) const
+    {
+        // Keep the source engine alive: scalable/native icons may report no
+        // availableSizes(), and the On and Off states may use different art.
+        // We supply the disabled appearance ourselves below. Some native
+        // styles generate a Disabled source pixmap at half opacity; tinting
+        // that again would double-dim the glyph into the dark background.
+        // Preserve the On/Off artwork, but use its undimmed source alpha.
+        const QIcon::Mode source_mode{mode == QIcon::Disabled ? QIcon::Normal : mode};
+        QImage image{m_source.pixmap(size, scale, source_mode, state).toImage()};
+        if (image.isNull()) return {};
+        const QColor color{mode == QIcon::Disabled
+                               ? QApplication::palette().color(QPalette::Disabled, QPalette::WindowText)
+                               : m_foreground};
+        MakeSingleColorImage(image, color);
+        return QPixmap::fromImage(image);
+    }
+
+    QIcon m_source;
+    QColor m_foreground;
+};
+
+QIcon ColorizeIcon(const QIcon& icon, const QColor& colorbase)
+{
+    return icon.isNull() ? QIcon{} : QIcon{new MonochromeIconEngine{icon, colorbase}};
 }
 
 QImage ColorizeImage(const QString& filename, const QColor& colorbase)
@@ -61,7 +118,7 @@ QImage ColorizeImage(const QString& filename, const QColor& colorbase)
 
 QIcon ColorizeIcon(const QString& filename, const QColor& colorbase)
 {
-    return QIcon(QPixmap::fromImage(ColorizeImage(filename, colorbase)));
+    return ColorizeIcon(QIcon{filename}, colorbase);
 }
 
 }

@@ -5,6 +5,8 @@
 #ifndef BITCOIN_QT_WALLETFRAME_H
 #define BITCOIN_QT_WALLETFRAME_H
 
+#include <qt/b3navsidebar.h>
+
 #include <QFrame>
 #include <QMap>
 
@@ -13,6 +15,7 @@ class PlatformStyle;
 class SendCoinsRecipient;
 class WalletModel;
 class WalletView;
+struct B3ValidatorStatus;
 
 QT_BEGIN_NAMESPACE
 class QStackedWidget;
@@ -50,6 +53,8 @@ Q_SIGNALS:
     void createWalletButtonClicked();
     void message(const QString& title, const QString& message, unsigned int style);
     void currentWalletSet();
+    //! Only the displayed wallet may change the surrounding shell navigation.
+    void currentPageChanged(B3Page page);
 
 private:
     QStackedWidget *walletStack;
@@ -67,6 +72,8 @@ public:
     WalletModel* currentWalletModel() const;
 
 public Q_SLOTS:
+    //! Never copy one wallet's validator status into hidden wallets.
+    void setValidatorStatus(const B3ValidatorStatus& status);
     /** Switch to overview (home) page */
     void gotoOverviewPage();
     /** Switch to history (transactions) page */

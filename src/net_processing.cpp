@@ -245,6 +245,12 @@ static constexpr double MAX_GLOBAL_FINALITY_SIG_RATE_PER_SECOND{128.0};
 static constexpr size_t MAX_GLOBAL_FINALITY_SIG_TOKEN_BUCKET{
     2 * modern::MAX_FINALITY_SET};
 static_assert(MAX_FINALITY_SIG_TOKEN_BUCKET >= modern::MAX_FINALITY_SET);
+/** Cheap wire admission is separate from actual BLS work: known duplicates
+ * cannot exhaust the verification budget, but still have a bounded CPU cost. */
+static constexpr double MAX_FINALITY_WIRE_RATE_PER_SECOND{128.0};
+static constexpr double MAX_GLOBAL_FINALITY_WIRE_RATE_PER_SECOND{512.0};
+static constexpr size_t MAX_FINALITY_WIRE_TOKEN_BUCKET{2 * MAX_FINALITY_SIG_TOKEN_BUCKET};
+static constexpr size_t MAX_GLOBAL_FINALITY_WIRE_TOKEN_BUCKET{2 * MAX_GLOBAL_FINALITY_SIG_TOKEN_BUCKET};
 /** The compactblocks version we support. See BIP 152. */
 static constexpr uint64_t CMPCTBLOCKS_VERSION{2};
 /** For private broadcast, send a transaction to this many peers. */
@@ -254,6 +260,21 @@ static constexpr auto PRIVATE_BROADCAST_MAX_CONNECTION_LIFETIME{3min};
 
 // Internal stuff
 namespace {
+std::chrono::microseconds FinalityTransportNow()
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        MockableSteadyClock::now().time_since_epoch());
+}
+
+void RefillFinalityBucket(double& bucket, std::chrono::microseconds& updated,
+                         const std::chrono::microseconds now,
+                         const double rate, const size_t capacity)
+{
+    const auto elapsed{std::max(now - updated, 0us)};
+    bucket = std::min<double>(bucket + Ticks<SecondsDouble>(elapsed) * rate, capacity);
+    updated = now;
+}
+
 /** Blocks that are in flight, and that are in the queue to be downloaded. */
 struct QueuedBlock {
     /** BlockIndex. We must have this since we only request blocks when we've already validated the header. */
@@ -442,7 +463,9 @@ struct Peer {
     /** Expensive finality-signature verifications allowed from this peer. */
     double m_finality_sig_token_bucket GUARDED_BY(NetEventsInterface::g_msgproc_mutex){MAX_FINALITY_SIG_TOKEN_BUCKET};
     /** When m_finality_sig_token_bucket was last updated. */
-    std::chrono::microseconds m_finality_sig_token_timestamp GUARDED_BY(NetEventsInterface::g_msgproc_mutex){GetTime<std::chrono::microseconds>()};
+    std::chrono::microseconds m_finality_sig_token_timestamp GUARDED_BY(NetEventsInterface::g_msgproc_mutex){FinalityTransportNow()};
+    double m_finality_wire_token_bucket GUARDED_BY(NetEventsInterface::g_msgproc_mutex){MAX_FINALITY_WIRE_TOKEN_BUCKET};
+    std::chrono::microseconds m_finality_wire_token_timestamp GUARDED_BY(NetEventsInterface::g_msgproc_mutex){FinalityTransportNow()};
     node::FinalityRelayCursor m_finality_relay_cursor GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
 
     /** Whether we've sent this peer a getheaders in response to an inv prior to initial-headers-sync completing */
@@ -1009,7 +1032,9 @@ private:
     /** Whole-node BLS verification budget for finality-signature gossip. */
     double m_finality_sig_global_token_bucket GUARDED_BY(g_msgproc_mutex){MAX_GLOBAL_FINALITY_SIG_TOKEN_BUCKET};
     /** When m_finality_sig_global_token_bucket was last updated. */
-    std::chrono::microseconds m_finality_sig_global_token_timestamp GUARDED_BY(g_msgproc_mutex){GetTime<std::chrono::microseconds>()};
+    std::chrono::microseconds m_finality_sig_global_token_timestamp GUARDED_BY(g_msgproc_mutex){FinalityTransportNow()};
+    double m_finality_wire_global_token_bucket GUARDED_BY(g_msgproc_mutex){MAX_GLOBAL_FINALITY_WIRE_TOKEN_BUCKET};
+    std::chrono::microseconds m_finality_wire_global_token_timestamp GUARDED_BY(g_msgproc_mutex){FinalityTransportNow()};
     node::PendingFinalitySignatures m_pending_finality_sigs GUARDED_BY(g_msgproc_mutex);
     std::chrono::microseconds m_next_pending_finality_retry GUARDED_BY(g_msgproc_mutex){0};
     /** One pool export shared by every peer, never reused across tip hashes. */
@@ -1020,6 +1045,8 @@ private:
     std::atomic_bool m_finality_relay_dirty{true};
 
     bool ConsumeFinalityVerificationBudget(Peer& peer, std::chrono::microseconds now)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+    bool ConsumeFinalityWireBudget(Peer& peer, std::chrono::microseconds now)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
     void MaybeFinalityTransport(CNode& node, Peer& peer, std::chrono::microseconds now)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex);
@@ -2636,8 +2663,9 @@ void PeerManagerImpl::RelayFinalitySignatures(std::span<const node::FinalitySig>
     if (sigs.empty()) return;
     m_finality_relay_dirty.store(true, std::memory_order_relaxed);
     m_connman.ForEachNode([&](CNode* pnode) {
-        if (!pnode->fSuccessfullyConnected || pnode->fDisconnect) return;
+        if (!pnode->fSuccessfullyConnected || pnode->fDisconnect || pnode->fPauseSend) return;
         for (const node::FinalitySig& sig : sigs) {
+            if (pnode->fPauseSend) break;
             MakeAndPushMessage(*pnode, NetMsgType::FINSIG, sig);
         }
     });
@@ -2646,19 +2674,26 @@ void PeerManagerImpl::RelayFinalitySignatures(std::span<const node::FinalitySig>
 bool PeerManagerImpl::ConsumeFinalityVerificationBudget(Peer& peer,
                                                        const std::chrono::microseconds now)
 {
-    const auto refill = [&](double& bucket, std::chrono::microseconds& updated,
-                            const double rate, const size_t capacity) {
-        const auto elapsed{std::max(now - updated, 0us)};
-        bucket = std::min<double>(bucket + Ticks<SecondsDouble>(elapsed) * rate, capacity);
-        updated = now;
-    };
-    refill(peer.m_finality_sig_token_bucket, peer.m_finality_sig_token_timestamp,
-           MAX_FINALITY_SIG_RATE_PER_SECOND, MAX_FINALITY_SIG_TOKEN_BUCKET);
-    refill(m_finality_sig_global_token_bucket, m_finality_sig_global_token_timestamp,
-           MAX_GLOBAL_FINALITY_SIG_RATE_PER_SECOND, MAX_GLOBAL_FINALITY_SIG_TOKEN_BUCKET);
+    RefillFinalityBucket(peer.m_finality_sig_token_bucket, peer.m_finality_sig_token_timestamp, now,
+                        MAX_FINALITY_SIG_RATE_PER_SECOND, MAX_FINALITY_SIG_TOKEN_BUCKET);
+    RefillFinalityBucket(m_finality_sig_global_token_bucket, m_finality_sig_global_token_timestamp, now,
+                        MAX_GLOBAL_FINALITY_SIG_RATE_PER_SECOND, MAX_GLOBAL_FINALITY_SIG_TOKEN_BUCKET);
     if (peer.m_finality_sig_token_bucket < 1.0 || m_finality_sig_global_token_bucket < 1.0) return false;
     peer.m_finality_sig_token_bucket -= 1.0;
     m_finality_sig_global_token_bucket -= 1.0;
+    return true;
+}
+
+bool PeerManagerImpl::ConsumeFinalityWireBudget(Peer& peer,
+                                               const std::chrono::microseconds now)
+{
+    RefillFinalityBucket(peer.m_finality_wire_token_bucket, peer.m_finality_wire_token_timestamp, now,
+                        MAX_FINALITY_WIRE_RATE_PER_SECOND, MAX_FINALITY_WIRE_TOKEN_BUCKET);
+    RefillFinalityBucket(m_finality_wire_global_token_bucket, m_finality_wire_global_token_timestamp, now,
+                        MAX_GLOBAL_FINALITY_WIRE_RATE_PER_SECOND, MAX_GLOBAL_FINALITY_WIRE_TOKEN_BUCKET);
+    if (peer.m_finality_wire_token_bucket < 1.0 || m_finality_wire_global_token_bucket < 1.0) return false;
+    peer.m_finality_wire_token_bucket -= 1.0;
+    m_finality_wire_global_token_bucket -= 1.0;
     return true;
 }
 
@@ -2710,8 +2745,7 @@ void PeerManagerImpl::MaybeFinalityTransport(CNode& node, Peer& peer,
             };
             using Coordinates = std::pair<uint64_t, uint64_t>;
             std::map<Coordinates, std::pair<std::optional<uint256>, uint32_t>> objects;
-            const auto still_valid = [&](const node::PendingFinalitySignatures::Entry& entry) {
-                if (!source_peer(entry.peer)) return false;
+            const auto resolver = [&](const node::PendingFinalitySignatures::Entry& entry) -> std::optional<uint256> {
                 const auto [it, inserted]{objects.try_emplace(Coordinates{entry.sig.epoch, entry.sig.height})};
                 if (inserted) {
                     auto probe{entry.sig};
@@ -2720,14 +2754,19 @@ void PeerManagerImpl::MaybeFinalityTransport(CNode& node, Peer& peer,
                                   tracker.Current().SetSize(entry.sig.epoch).value_or(0)};
                 }
                 const auto& [digest, size]{it->second};
-                return entry.sig.index < size && digest && *digest == entry.digest;
+                return entry.sig.index < size ? digest : std::nullopt;
             };
+            const auto available = [&](const int64_t source) { return source_peer(source) != nullptr; };
             const auto budget = [&](const int64_t source) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex) {
                 const PeerRef from{source_peer(source)};
                 return from && ConsumeFinalityVerificationBudget(*from, now);
             };
             const int ready_height{tip->nHeight - consensus.modern_pos->checkpoint_depth};
-            for (const auto& entry : m_pending_finality_sigs.TakeReady(ready_height, now, still_valid, budget)) {
+            for (const auto& entry : m_pending_finality_sigs.TakeReadyWithSources(ready_height, now, resolver, available, budget)) {
+                // TakeReady charged exactly one surviving source. Re-run all
+                // ordinary pool validation, without charging BLS a second time.
+                // This bounded retry reserves a token conservatively even if
+                // Submit can now deduplicate a vote verified since admission.
                 const auto result{chainstate.FinalitySignatures().Submit(entry.sig, tracker, chain,
                                                                         consensus, bridge_index)};
                 LogDebug(BCLog::NET, "finsig retry epoch=%d height=%d index=%d peer=%d: %s\n",
@@ -2764,7 +2803,7 @@ void PeerManagerImpl::MaybeFinalityTransport(CNode& node, Peer& peer,
     // pending entry is never relayed or counted simply because depth elapsed.
     for (const auto& entry : accepted) {
         m_connman.ForEachNode([&](CNode* other) {
-            if (other->GetId() == entry.peer || !other->fSuccessfullyConnected || other->fDisconnect) return;
+            if (other->GetId() == entry.peer || !other->fSuccessfullyConnected || other->fDisconnect || other->fPauseSend) return;
             MakeAndPushMessage(*other, NetMsgType::FINSIG, entry.sig);
         });
     }
@@ -6389,16 +6428,17 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         // B3 finality-signature gossip (liveness only; consensus acceptance
         // happens exclusively through certificates in blocks). Fixed-size
         // message; cheap structural / schedule / set checks run before the
-        // single BLS verification, inside the pool. Per-peer and global token
-        // buckets bound that expensive work before cs_main. There is no peer
+        // single BLS verification, inside the pool. Cheap wire-admission
+        // buckets bound work before cs_main; separate budgets are charged only
+        // immediately before BLS verification, not for known duplicates. There is no peer
         // penalty for semantically stale or unverifiable signatures: forks
         // and epoch races make them indistinguishable from honest latecomers.
         const Consensus::Params& consensus{m_chainparams.GetConsensus()};
         if (!consensus.legacy_b3coin || !consensus.modern_pos) return;
 
         if (vRecv.size() != 116) return;
-        const auto now{GetTime<std::chrono::microseconds>()};
-        if (!ConsumeFinalityVerificationBudget(peer, now)) return;
+        const auto now{FinalityTransportNow()};
+        if (!ConsumeFinalityWireBudget(peer, now)) return;
         node::FinalitySig finsig;
         vRecv >> finsig;
         bool relay{false};
@@ -6420,17 +6460,22 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                               consensus, *tip, bridge_index)) return;
             const auto accept{chainstate.FinalitySignatures().Submit(
                 finsig, tracker, chainstate.m_chain, consensus,
-                bridge_index)};
+                bridge_index, [&]() EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex) {
+                    return ConsumeFinalityVerificationBudget(peer, now);
+                })};
             LogDebug(BCLog::NET, "finsig epoch=%d height=%d index=%d peer=%d: %s\n", finsig.epoch, finsig.height,
                      finsig.index, pfrom.GetId(), node::FinalitySignaturePool::AcceptName(accept));
             relay = accept == node::FinalitySignaturePool::Accept::ACCEPTED;
-            if (accept == node::FinalitySignaturePool::Accept::TOO_SHALLOW) {
-                // Submit checks depth before epoch/index. Do those cheap
-                // checks explicitly before admitting unverified bytes, and
-                // bind the exact current-branch digest for later pruning.
-                if (const auto digest{node::FinalityTransportDigest(
+            if (accept == node::FinalitySignaturePool::Accept::TOO_SHALLOW ||
+                accept == node::FinalitySignaturePool::Accept::VERIFICATION_DEFERRED ||
+                (accept == node::FinalitySignaturePool::Accept::NOT_CHECKPOINT &&
+                 finsig.height > static_cast<uint64_t>(tip->nHeight))) {
+                // The bounded transport queue also covers a nearby block not
+                // connected yet, and valid coordinates awaiting BLS budget.
+                // Neither admission nor elapsed time grants signature validity.
+                if (const auto candidate{node::InspectFinalityTransport(
                         finsig, tracker.Current(), chainstate.m_chain, consensus, bridge_index)}) {
-                    if (m_pending_finality_sigs.Add(finsig, pfrom.GetId(), *digest, now)) {
+                    if (m_pending_finality_sigs.Add(finsig, pfrom.GetId(), candidate->digest, now)) {
                         LogDebug(BCLog::NET, "finsig buffered epoch=%d height=%d index=%d peer=%d\n",
                                  finsig.epoch, finsig.height, finsig.index, pfrom.GetId());
                     }
@@ -6441,7 +6486,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         if (relay) {
             m_finality_relay_dirty.store(true, std::memory_order_relaxed);
             m_connman.ForEachNode([&](CNode* pnode) {
-                if (pnode->GetId() == pfrom.GetId() || !pnode->fSuccessfullyConnected || pnode->fDisconnect) return;
+                if (pnode->GetId() == pfrom.GetId() || !pnode->fSuccessfullyConnected || pnode->fDisconnect || pnode->fPauseSend) return;
                 MakeAndPushMessage(*pnode, NetMsgType::FINSIG, finsig);
             });
         }
@@ -7098,7 +7143,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
 
     MaybeSendSendHeaders(node, peer);
 
-    MaybeFinalityTransport(node, peer, current_time);
+    MaybeFinalityTransport(node, peer, FinalityTransportNow());
 
     {
         LOCK(cs_main);

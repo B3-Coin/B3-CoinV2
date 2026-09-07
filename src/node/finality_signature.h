@@ -8,11 +8,13 @@
 #include <crypto/bls.h>
 #include <modern/finality_types.h>
 #include <node/finality_signer_store.h>
+#include <node/finality_signing_policy.h>
 #include <node/finality_tracker.h>
 #include <serialize.h>
 #include <uint256.h>
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -20,6 +22,10 @@
 #include <vector>
 
 class CChain;
+
+namespace interfaces {
+struct FinalityRecoveryStatus;
+}
 
 namespace node {
 
@@ -46,7 +52,7 @@ class BridgeStateIndex;
  * {current, current-1} -> checkpoint schedule -> depth (tip - h >= D) ->
  * strictly above the finalized height -> index < n -> reconstruct this
  * branch's exact digest and evict obsolete branch slots -> duplicate -> pool
- * bounds -> single BLS verify. One slot per (epoch, height), explicitly bound
+ * bounds -> optional verification budget -> single BLS verify. One slot per (epoch, height), explicitly bound
  * to that digest. A permitted pre-finality reorg replaces an obsolete slot;
  * a signature over the old branch then fails verification against the new
  * digest and is dropped.
@@ -74,13 +80,14 @@ public:
 
     enum class Accept {
         ACCEPTED,
-        DUPLICATE,      //!< already have this (epoch, height, index)
+        DUPLICATE,      //!< exact signature bytes already verified for this index and current digest
         STALE,          //!< at or below the finalized height, or unconfigured
         UNKNOWN_EPOCH,  //!< outside {current, current-1} or no set on this chain
         NOT_CHECKPOINT, //!< height not on the schedule, above the tip, or in the wrong epoch span
         TOO_SHALLOW,    //!< tip - height < CHECKPOINT_DEPTH: not signable yet
         BAD_INDEX,      //!< index >= n
         POOL_FULL,      //!< bounded pool is full of checkpoints newer than this one
+        VERIFICATION_DEFERRED, //!< caller declined the expensive verification budget; retry is permitted
         BAD_SIGNATURE,  //!< BLS verification failed (wrong branch, wrong key, garbage)
     };
     static const char* AcceptName(Accept a);
@@ -88,10 +95,15 @@ public:
     /**
      * Validate and store one signature. `tracker` must be synced to the
      * active tip of `chain`. Cheap checks precede the BLS verification.
+     * If supplied, consume_verification_budget is called once, immediately
+     * before BLS decoding/verification, never for cheap rejects or exact
+     * verified duplicates. A false result leaves all still-valid signatures
+     * untouched (ordinary finalized/fork cleanup may already have occurred).
      */
     Accept Submit(const FinalitySig& sig, const FinalityTracker& tracker, const CChain& chain,
                   const Consensus::Params& params,
-                  const BridgeStateIndex* bridge_index = nullptr);
+                  const BridgeStateIndex* bridge_index = nullptr,
+                  const std::function<bool()>& consume_verification_budget = {});
 
     /**
      * The highest tracked checkpoint whose collected signatures meet both
@@ -170,6 +182,10 @@ class FinalitySigner
 public:
     static constexpr size_t MAX_KEYS{4};
 
+    //! Default timing is unchanged for offline/scaled tests. Live mainnet
+    //! staking explicitly supplies its additional local signing wait.
+    explicit FinalitySigner(FinalitySigningPolicy policy = {}) : m_signing_policy{policy} {}
+
     void SetKey(const bls::SecretKey& key, const modern::ValidatorKeyBytes& validator_key)
     {
         std::string error;
@@ -191,9 +207,27 @@ public:
                            const uint256& chain_domain,
                            const fs::path& store_directory,
                            std::string& error);
+    /** Explicit, local operator trust for one exact, intact orphan-vote
+     * journal. This is NOT a quorum proof and does not revoke an old vote or
+     * enforce a block checkpoint. The validator target is mandatory. No
+     * journal write occurs here; all active-chain conditions are rechecked
+     * before moving only the lock. A failed setter leaves the signer and any
+     * previous plan unchanged. The plan is absent by default, is not persisted,
+     * and is cleared on successful key reload or recovery. */
+    bool SetOperatorTrustedRecovery(const Consensus::FinalitySignerRecovery& recovery,
+                                    std::string& error);
     bool HasKey() const { return !m_keys.empty(); }
     int LastSignedHeight() const { return m_last_signed; }
     const std::string& LastError() const { return m_error.empty() ? m_key_error : m_error; }
+
+    //! Read the already-open journal's public state only. Never opens a store,
+    //! signs, rebases a lock, or changes the recovery policy. Caller holds
+    //! cs_main and has synced tracker to chain; call after MaybeSign to report
+    //! the actual post-attempt state, including a failed durable write.
+    interfaces::FinalityRecoveryStatus RecoveryStatus(
+        const FinalityTracker& tracker, const CChain& chain,
+        const Consensus::Params& params,
+        const BridgeStateIndex* bridge_index = nullptr) const;
 
     /**
      * Sign every checkpoint now signable and not yet signed; the produced
@@ -221,13 +255,34 @@ private:
      * after a durable-write failure (already reported through Fail()).
      */
     enum class PinnedRecovery { NOT_APPLICABLE, APPLIED, FAILED };
-    PinnedRecovery TryPinnedRecovery(const FinalitySignerState& persisted,
-                                     const FinalityTracker::State& state,
-                                     const CChain& chain,
-                                     const Consensus::Params& params,
-                                     const uint256& chain_domain,
-                                     const BridgeStateIndex* bridge_index,
-                                     std::string& reason);
+    PinnedRecovery TryPinnedRecovery(
+        const Consensus::FinalitySignerRecovery& pin,
+        const FinalitySignerState& persisted,
+        const FinalityTracker::State& state,
+        const CChain& chain,
+        const Consensus::Params& params,
+        const uint256& chain_domain,
+        const BridgeStateIndex* bridge_index,
+        std::string& reason);
+    PinnedRecovery TryOperatorTrustedRecovery(
+        const FinalitySignerState& persisted,
+        const FinalityTracker::State& state,
+        const CChain& chain,
+        const Consensus::Params& params,
+        const uint256& chain_domain,
+        const BridgeStateIndex* bridge_index,
+        std::string& reason);
+    enum class RecoveryTrust { HARDENED_CHECKPOINT, OPERATOR_TRUSTED };
+    PinnedRecovery TryRecoveryAnchor(
+        const Consensus::FinalitySignerRecovery& pin,
+        const FinalitySignerState& persisted,
+        const FinalityTracker::State& state,
+        const CChain& chain,
+        const Consensus::Params& params,
+        const uint256& chain_domain,
+        const BridgeStateIndex* bridge_index,
+        RecoveryTrust trust,
+        std::string& reason);
     void Fail(std::string error, bool permanent = true);
     const bls::SecretKey* KeyFor(const std::array<unsigned char, bls::PUBKEY_SIZE>& pubkey) const;
 
@@ -235,7 +290,9 @@ private:
         bls::SecretKey secret;
         std::array<unsigned char, bls::PUBKEY_SIZE> pubkey;
     };
+    FinalitySigningPolicy m_signing_policy;
     std::vector<SigningKey> m_keys;
+    std::optional<Consensus::FinalitySignerRecovery> m_operator_trusted_recovery;
     modern::ValidatorKeyBytes m_validator_key{};
     int m_last_signed{-1};
     FinalitySignerStore m_store;

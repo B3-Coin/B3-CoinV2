@@ -16,6 +16,7 @@
 
 #include <QLabel>
 #include <QSignalSpy>
+#include <QStackedWidget>
 #include <QToolButton>
 
 void B3ShellTests::sidebarEmitsCanonicalPages()
@@ -53,7 +54,10 @@ void B3ShellTests::shellRoutesNavigationAndSwitchesContent()
 
     // Returning to Dashboard shows the wallet content again.
     shell.showPage(B3Page::Dashboard);
-    QVERIFY(wallet->isVisibleTo(&shell) || wallet->parent() != nullptr);
+    auto* content = shell.findChild<QStackedWidget*>("B3Content");
+    QVERIFY(content != nullptr);
+    QCOMPARE(content->currentWidget(), wallet->parentWidget());
+    QVERIFY(wallet->isVisibleTo(&shell));
     QCOMPARE(shell.sidebar()->currentPage(), B3Page::Dashboard);
     auto* title = shell.topStatus()->findChild<QLabel*>("B3TopStatusTitle");
     QVERIFY(title != nullptr);
@@ -61,6 +65,128 @@ void B3ShellTests::shellRoutesNavigationAndSwitchesContent()
 
     shell.showPage(B3Page::Trade);
     QCOMPARE(title->text(), QStringLiteral("Trade"));
+}
+
+void B3ShellTests::everyDestinationHasMatchingTitleAndSelection_data()
+{
+    QTest::addColumn<B3Page>("page");
+    QTest::addColumn<QString>("button_name");
+    QTest::addColumn<QString>("title");
+    QTest::addColumn<bool>("wallet_page");
+    QTest::newRow("overview") << B3Page::Dashboard << QStringLiteral("navDashboard") << QStringLiteral("Overview") << true;
+    QTest::newRow("send") << B3Page::Send << QStringLiteral("navSend") << QStringLiteral("Send") << true;
+    QTest::newRow("receive") << B3Page::Receive << QStringLiteral("navReceive") << QStringLiteral("Receive") << true;
+    QTest::newRow("activity") << B3Page::Activity << QStringLiteral("navActivity") << QStringLiteral("Activity") << true;
+    QTest::newRow("trade") << B3Page::Trade << QStringLiteral("navTrade") << QStringLiteral("Trade") << false;
+    QTest::newRow("assets") << B3Page::Assets << QStringLiteral("navAssets") << QStringLiteral("Assets") << false;
+    QTest::newRow("stake") << B3Page::Stake << QStringLiteral("navStake") << QStringLiteral("Stake") << false;
+    QTest::newRow("settings") << B3Page::Settings << QStringLiteral("navSettings") << QStringLiteral("Settings") << false;
+}
+
+void B3ShellTests::everyDestinationHasMatchingTitleAndSelection()
+{
+    QFETCH(B3Page, page);
+    QFETCH(QString, button_name);
+    QFETCH(QString, title);
+    QFETCH(bool, wallet_page);
+    B3Shell shell;
+    shell.setWalletWidget(new QLabel(QStringLiteral("wallet-content")));
+    shell.setSettingsPage(new QLabel(QStringLiteral("settings-content")));
+    QSignalSpy navigated(&shell, &B3Shell::pageSelected);
+    auto* button = shell.sidebar()->findChild<QToolButton*>(button_name);
+    auto* heading = shell.topStatus()->findChild<QLabel*>("B3TopStatusTitle");
+    QVERIFY(button != nullptr);
+    QVERIFY(heading != nullptr);
+    button->click();
+    QCOMPARE(navigated.count(), 1);
+    QCOMPARE(qvariant_cast<B3Page>(navigated.at(0).at(0)), page);
+    QCOMPARE(shell.currentPage(), page);
+    QCOMPARE(shell.sidebar()->currentPage(), page);
+    QCOMPARE(heading->text(), title);
+    QCOMPARE(shell.walletPageVisible(), wallet_page);
+    QVERIFY(button->isChecked());
+    QVERIFY(!button->icon().isNull());
+    QCOMPARE(button->accessibleName(), title);
+
+    shell.sidebar()->setCompact(true);
+    QCOMPARE(button->toolTip(), title);
+    QCOMPARE(button->toolButtonStyle(), Qt::ToolButtonIconOnly);
+    QVERIFY(button->isChecked());
+}
+
+void B3ShellTests::disabledNavigationCannotBypassWalletActionPolicy()
+{
+    B3Shell shell;
+    shell.showPage(B3Page::Send);
+    QSignalSpy navigated(&shell, &B3Shell::pageSelected);
+    auto* activity = shell.sidebar()->findChild<QToolButton*>("navActivity");
+    QVERIFY(activity != nullptr);
+    shell.sidebar()->setPageEnabled(B3Page::Activity, false);
+    QVERIFY(!shell.sidebar()->isPageEnabled(B3Page::Activity));
+    activity->click();
+    QCOMPARE(navigated.count(), 0);
+    shell.showPage(B3Page::Activity);
+    QCOMPARE(shell.currentPage(), B3Page::Send);
+    QCOMPARE(shell.sidebar()->currentPage(), B3Page::Send);
+    shell.sidebar()->setPageEnabled(B3Page::Activity, true);
+    activity->click();
+    QCOMPARE(navigated.count(), 1);
+    QCOMPARE(shell.currentPage(), B3Page::Activity);
+}
+
+void B3ShellTests::settingsDialogFallbackPreservesVisiblePage()
+{
+    B3Shell shell;
+    shell.showPage(B3Page::Trade);
+    auto* content = shell.findChild<QStackedWidget*>("B3Content");
+    auto* heading = shell.topStatus()->findChild<QLabel*>("B3TopStatusTitle");
+    auto* settings = shell.sidebar()->findChild<QToolButton*>("navSettings");
+    QVERIFY(content != nullptr);
+    QVERIFY(heading != nullptr);
+    QVERIFY(settings != nullptr);
+    QWidget* previous = content->currentWidget();
+    QSignalSpy navigated(&shell, &B3Shell::pageSelected);
+    settings->click();
+    // The request still reaches the window to open the options dialog.
+    QCOMPARE(navigated.count(), 1);
+    QCOMPARE(qvariant_cast<B3Page>(navigated.at(0).at(0)), B3Page::Settings);
+    QCOMPARE(content->currentWidget(), previous);
+    QCOMPARE(heading->text(), QStringLiteral("Trade"));
+    QCOMPARE(shell.currentPage(), B3Page::Trade);
+    QCOMPARE(shell.sidebar()->currentPage(), B3Page::Trade);
+}
+
+void B3ShellTests::replacingVisiblePagesPreservesSelection()
+{
+    B3Shell shell;
+    auto* content = shell.findChild<QStackedWidget*>("B3Content");
+    QVERIFY(content != nullptr);
+    shell.showPage(B3Page::Trade);
+    auto* trade = new QLabel(QStringLiteral("live-trade-body"));
+    shell.setTradePage(trade);
+    QCOMPARE(content->currentWidget(), trade);
+    QCOMPARE(shell.currentPage(), B3Page::Trade);
+    const int page_count = content->count();
+    shell.setTradePage(trade);
+    QCOMPARE(content->currentWidget(), trade);
+    QCOMPARE(content->count(), page_count);
+    shell.setAssetsPage(new QLabel(QStringLiteral("asset-body")));
+    QCOMPARE(content->currentWidget(), trade);
+    shell.setSettingsPage(new QLabel(QStringLiteral("settings-body")));
+    shell.showPage(B3Page::Settings);
+    auto* settings = new QLabel(QStringLiteral("replacement-settings-body"));
+    shell.setSettingsPage(settings);
+    QCOMPARE(content->currentWidget(), settings);
+    QCOMPARE(shell.currentPage(), B3Page::Settings);
+}
+
+void B3ShellTests::sidebarDoesNotInventNetworkFeatureStatus()
+{
+    B3NavSidebar sidebar;
+    const auto* footer = sidebar.findChild<QLabel*>("B3SidebarPlatform");
+    QVERIFY(footer != nullptr);
+    QCOMPARE(footer->text(), QStringLiteral("B3 HIVE DESKTOP"));
+    QVERIFY(!footer->accessibleName().contains(QStringLiteral("inactive"), Qt::CaseInsensitive));
 }
 
 void B3ShellTests::placeholderPagesAreHonest()
@@ -77,7 +203,7 @@ void B3ShellTests::placeholderPagesAreHonest()
     page.setNote(QStringLiteral("Backend unavailable"));
     bool found_note{false};
     for (const QLabel* label : page.findChildren<QLabel*>()) {
-        if (label->text() == "Backend unavailable") found_note = label->isVisibleTo(&page) || true;
+        if (label->text() == "Backend unavailable") found_note = label->isVisibleTo(&page);
     }
     QVERIFY(found_note);
 }

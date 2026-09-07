@@ -7,17 +7,26 @@
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <qt/askpassphrasedialog.h>
+#include <qt/b3assetspage.h>
+#include <qt/b3shell.h>
 #include <qt/b3stakepage.h>
 #include <qt/b3theme.h>
+#include <qt/b3topstatus.h>
+#include <qt/bitcoingui.h>
 #include <qt/clientmodel.h>
+#include <qt/networkstyle.h>
 #include <qt/optionsmodel.h>
 #include <qt/platformstyle.h>
+#include <qt/walletcontroller.h>
+#include <qt/walletframe.h>
 #include <qt/walletmodel.h>
+#include <qt/walletview.h>
 #include <test/util/setup_common.h>
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
 
 #include <QApplication>
+#include <QComboBox>
 #include <QImage>
 #include <QLabel>
 #include <QLineEdit>
@@ -25,9 +34,11 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalSpy>
+#include <QTableView>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTimer>
+#include <QToolBar>
 
 #include <functional>
 #include <memory>
@@ -63,12 +74,18 @@ class B3StakingUnlockTests : public QObject
     std::unique_ptr<WalletModel> m_model;
     std::optional<PKHash> m_address;
 
-    std::shared_ptr<wallet::CWallet> MakeWallet(bool private_keys = true)
+    std::shared_ptr<wallet::CWallet> MakeWallet(
+        bool private_keys = true, const std::string& name = "isolated-staking-unlock")
     {
         auto wallet = std::make_shared<wallet::CWallet>(
-            m_setup->m_node.chain.get(), "isolated-staking-unlock",
+            m_setup->m_node.chain.get(), name,
             wallet::CreateMockableWalletDatabase());
+        const uint256 genesis{m_setup->m_node.chain->getBlockHash(0)};
         LOCK(wallet->cs_wallet);
+        // The controller starts real balance polling. A loaded wallet has a
+        // processed-chain watermark even when this fixture contains genesis
+        // only; leaving it at -1 violates the production wallet precondition.
+        wallet->SetLastBlockProcessed(0, genesis);
         wallet->m_keypool_size = 1;
         wallet->SetWalletFlag(wallet::WALLET_FLAG_DESCRIPTORS);
         if (private_keys) {
@@ -233,8 +250,16 @@ private Q_SLOTS:
         QCOMPARE(SignMessage(), SigningResult::PRIVATE_KEY_NOT_AVAILABLE);
     }
 
+    void dialogUnlockExceptionRelocksBeforeShowingError_data()
+    {
+        QTest::addColumn<bool>("staking_only");
+        QTest::newRow("staking-unlock") << true;
+        QTest::newRow("ordinary-unlock") << false;
+    }
+
     void dialogUnlockExceptionRelocksBeforeShowingError()
     {
+        QFETCH(bool, staking_only);
         bool injected{false};
         bool error_seen{false};
         // Throw only after the real wallet has decrypted, not on its subsequent
@@ -245,9 +270,12 @@ private Q_SLOTS:
                 throw std::runtime_error("synthetic post-decryption failure");
             }
         });
-        const auto connection = connect(m_model.get(), &WalletModel::requireUnlockForStaking,
-                                        this, [this, &error_seen] {
-            AskPassphraseDialog dialog{AskPassphraseDialog::UnlockStaking, nullptr};
+        const auto signal = staking_only ? &WalletModel::requireUnlockForStaking
+                                         : &WalletModel::requireUnlock;
+        const auto connection = connect(m_model.get(), signal,
+                                        this, [this, &error_seen, staking_only] {
+            AskPassphraseDialog dialog{staking_only ? AskPassphraseDialog::UnlockStaking
+                                                   : AskPassphraseDialog::Unlock, nullptr};
             dialog.setModel(m_model.get());
             auto* passphrase = dialog.findChild<QLineEdit*>(QStringLiteral("passEdit1"));
             QVERIFY(passphrase != nullptr);
@@ -271,7 +299,8 @@ private Q_SLOTS:
             QCOMPARE(dialog.result(), int(QDialog::Rejected));
         });
         {
-            auto unlock = m_model->requestUnlock(WalletModel::UnlockPurpose::StakingOnly);
+            auto unlock = m_model->requestUnlock(staking_only ? WalletModel::UnlockPurpose::StakingOnly
+                                                            : WalletModel::UnlockPurpose::General);
             QVERIFY(!unlock.isValid());
         }
         disconnect(connection);
@@ -316,6 +345,157 @@ private Q_SLOTS:
             QCOMPARE(general.count(), 0);
             QCOMPARE(staking.count(), 0);
         }
+    }
+
+    void stakePageSurvivesWalletModelDestruction_data()
+    {
+        QTest::addColumn<bool>("explicit_detach");
+        QTest::newRow("model-destroyed-first") << false;
+        QTest::newRow("shutdown-detaches-first") << true;
+    }
+
+    void stakePageSurvivesWalletModelDestruction()
+    {
+        QFETCH(bool, explicit_detach);
+        // Actual WalletModel destruction, including its wallet interface and
+        // QObject::destroyed signal; no fabricated pointer or live wallet.
+        const auto wallet = MakeWallet();
+        auto model = MakeModel(wallet);
+        B3StakePage page;
+        page.setWalletModel(model.get());
+        auto* controller = page.findChild<B3ValidatorController*>();
+        auto* no_wallet = page.findChild<QLabel*>(QStringLiteral("stakeNoWallet"));
+        auto* lock = page.findChild<QLabel*>(QStringLiteral("stakeLockState"));
+        auto* backup = page.findChild<QPushButton*>(QStringLiteral("stakeBackupWallet"));
+        auto* start = page.findChild<QPushButton*>(QStringLiteral("stakeStartStop"));
+        auto* rewards = page.findChild<QTableView*>(QStringLiteral("stakeRewards"));
+        QVERIFY(controller && no_wallet && lock && backup && start && rewards);
+        QCOMPARE(controller->walletModel(), model.get());
+        QVERIFY(backup->isEnabled());
+        QVERIFY(rewards->model() != nullptr);
+
+        if (explicit_detach) page.setWalletModel(nullptr);
+        model.reset(); // Previously crashed through controller status -> lock state.
+        QCOMPARE(controller->walletModel(), nullptr);
+        QVERIFY(!no_wallet->isHidden());
+        QCOMPARE(lock->text(), QStringLiteral("—"));
+        QVERIFY(!backup->isEnabled());
+        QVERIFY(!start->isEnabled());
+        QCOMPARE(rewards->model(), nullptr);
+
+        // A status callback after detach must not touch the destroyed model or
+        // re-enable actions. Queued read-only refreshes also use this boundary.
+        B3ValidatorStatus stale;
+        stale.valid = true;
+        stale.staking_running = true;
+        stale.staking_uses_this_wallet = true;
+        QVERIFY(QMetaObject::invokeMethod(&page, "setValidatorStatus", Qt::DirectConnection,
+                                         Q_ARG(B3ValidatorStatus, stale)));
+        QCoreApplication::processEvents();
+        QCOMPARE(controller->walletModel(), nullptr);
+        QCOMPARE(lock->text(), QStringLiteral("—"));
+        QVERIFY(!backup->isEnabled());
+        QVERIFY(!start->isEnabled());
+    }
+
+    void stakePageReplacementSurvivesOldModelDestruction()
+    {
+        const auto old_wallet = MakeWallet();
+        const auto current_wallet = MakeWallet();
+        auto old_model = MakeModel(old_wallet);
+        auto current_model = MakeModel(current_wallet);
+        B3StakePage page;
+        page.setWalletModel(old_model.get());
+        page.setWalletModel(current_model.get());
+        old_model.reset();
+        auto* controller = page.findChild<B3ValidatorController*>();
+        auto* backup = page.findChild<QPushButton*>(QStringLiteral("stakeBackupWallet"));
+        auto* no_wallet = page.findChild<QLabel*>(QStringLiteral("stakeNoWallet"));
+        QVERIFY(controller && backup && no_wallet);
+        QCOMPARE(controller->walletModel(), current_model.get());
+        QVERIFY(backup->isEnabled());
+        QVERIFY(no_wallet->isHidden());
+        current_model.reset();
+        QCOMPARE(controller->walletModel(), nullptr);
+        QVERIFY(!backup->isEnabled());
+        QVERIFY(!no_wallet->isHidden());
+    }
+
+    void topbarWalletSelectorRoutesLoadedWalletsAndSurvivesRemoval()
+    {
+        // Actual GUI routing with two in-memory wallets; never open a disk
+        // wallet, start a node, unlock, or invoke a financial operation.
+        QSettings{}.setValue("fHiveUpdateAutoCheck", false);
+        const std::unique_ptr<const NetworkStyle> network_style{
+            NetworkStyle::instantiate(ChainType::REGTEST)};
+        QVERIFY(network_style != nullptr);
+        BitcoinGUI window{*m_node, m_style.get(), network_style.get()};
+        auto* frame = window.findChild<WalletFrame*>();
+        auto* shell = window.findChild<B3Shell*>();
+        auto* selector = window.findChild<QComboBox*>(QStringLiteral("B3WalletSelector"));
+        auto* assets = window.findChild<B3AssetsPage*>();
+        auto* stake = window.findChild<B3StakePage*>();
+        QVERIFY(frame && shell && selector && assets && stake);
+        auto* validator = stake->findChild<B3ValidatorController*>();
+        QVERIFY(validator != nullptr);
+        frame->setClientModel(m_client.get());
+        auto controller = std::make_unique<WalletController>(*m_client, m_style.get(), nullptr);
+        window.setWalletController(controller.get(), false);
+        QVERIFY(selector->isHidden());
+
+        const auto first_wallet = MakeWallet(true, "selector-first");
+        const auto second_wallet = MakeWallet(true, "selector-second");
+        WalletModel* first = controller->getOrCreateWallet(
+            interfaces::MakeWallet(*m_loader->context(), first_wallet));
+        QCOMPARE(selector->count(), 1);
+        QVERIFY(!selector->isHidden());
+        QVERIFY(selector->isVisibleTo(&window));
+        QVERIFY(selector->isEnabled());
+        QVERIFY(selector->toolTip().contains(QStringLiteral("only loaded wallet")));
+        QVERIFY(shell->topStatus()->isAncestorOf(selector));
+        for (auto* toolbar : window.findChildren<QToolBar*>()) {
+            QVERIFY(!toolbar->isAncestorOf(selector));
+        }
+        QCOMPARE(frame->currentWalletModel(), first);
+        QCOMPARE(validator->walletModel(), first);
+        auto* passive_name = shell->topStatus()->findChild<QLabel*>(QStringLiteral("statusWallet"));
+        QVERIFY(passive_name && passive_name->isHidden());
+
+        WalletModel* second = controller->getOrCreateWallet(
+            interfaces::MakeWallet(*m_loader->context(), second_wallet));
+        QCOMPARE(selector->count(), 2);
+        QCOMPARE(frame->currentWalletModel(), first);
+        frame->gotoSendCoinsPage();
+        QSignalSpy asset_changes{assets->model(), &QAbstractItemModel::modelReset};
+        // Deliver the same keyboard selection a user can make in the combo,
+        // rather than calling the window's routing slot directly.
+        QTest::keyClick(selector, Qt::Key_End);
+        QCOMPARE(selector->currentData().value<WalletModel*>(), second);
+        QCOMPARE(selector->currentText(), second->getDisplayName());
+        QCOMPARE(frame->currentWalletModel(), second);
+        QCOMPARE(frame->currentWalletView()->getWalletModel(), second);
+        QCOMPARE(frame->currentWalletView()->currentPage(), B3Page::Send);
+        QCOMPARE(validator->walletModel(), second);
+        QVERIFY(!asset_changes.isEmpty());
+        QTest::keyClick(selector, Qt::Key_Home);
+        QCOMPARE(frame->currentWalletModel(), first);
+        QCOMPARE(validator->walletModel(), first);
+
+        window.removeWallet(first);
+        QCOMPARE(selector->count(), 1);
+        QVERIFY(!selector->isHidden());
+        QCOMPARE(selector->currentData().value<WalletModel*>(), second);
+        QCOMPARE(frame->currentWalletModel(), second);
+        QCOMPARE(validator->walletModel(), second);
+        window.removeAllWallets();
+        QCOMPARE(selector->count(), 0);
+        QVERIFY(selector->isHidden());
+        QCOMPARE(frame->currentWalletModel(), nullptr);
+        QCOMPARE(validator->walletModel(), nullptr);
+        // Finish temporary load-notification work while its controller and
+        // parent window still exist; this enumerates only this test's models.
+        QCoreApplication::processEvents();
+        controller.reset();
     }
 
     void stakingLabelsAreHonestAboutSpendingProtection_data()
