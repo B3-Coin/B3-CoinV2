@@ -626,7 +626,13 @@ public:
     // Used to prevent deleting the passphrase from memory when it is still in use.
     RecursiveMutex m_relock_mutex;
 
-    bool Unlock(const SecureString& strWalletPassphrase);
+    /** Unlock and optionally finish preparing the authorization under cs_wallet.
+     * If decryption, cache upgrade, notification, or on_unlocked throws, restore
+     * the previous master-key state. The callback must arrange its own rollback
+     * for other state and publish irreversible effects only as its final step.
+     * It must not acquire locks that precede cs_wallet in the lock order.
+     */
+    bool Unlock(const SecureString& strWalletPassphrase, const std::function<void()>& on_unlocked = {});
     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
     bool EncryptWallet(const SecureString& strWalletPassphrase);
 

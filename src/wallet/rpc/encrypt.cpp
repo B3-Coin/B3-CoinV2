@@ -38,12 +38,17 @@ RPCHelpMan walletpassphrase()
     if (!wallet) return UniValue::VNULL;
     CWallet* const pwallet = wallet.get();
 
-    int64_t nSleepTime;
-    int64_t relock_time;
+    WalletContext& context = EnsureWalletContext(request.context);
+    if (!context.scheduler) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "Wallet relock scheduler is unavailable");
+    }
     // Prevent concurrent calls to walletpassphrase with the same wallet.
     LOCK(pwallet->m_unlock_mutex);
     {
-        LOCK(pwallet->cs_wallet);
+        // Match walletlock and the timeout callback's lock order. Keep both
+        // locks until scheduling and deadline publication have succeeded: an
+        // old timer or a zero-second new timer cannot observe a partial attempt.
+        LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
 
         if (!pwallet->HasEncryptionKeys()) {
             throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an unencrypted wallet, but walletpassphrase was called.");
@@ -55,7 +60,7 @@ RPCHelpMan walletpassphrase()
         strWalletPass = std::string_view{request.params[0].get_str()};
 
         // Get the timeout
-        nSleepTime = request.params[1].getInt<int64_t>();
+        int64_t nSleepTime = request.params[1].getInt<int64_t>();
         // Timeout cannot be negative, otherwise it will relock immediately
         if (nSleepTime < 0) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Timeout cannot be negative.");
@@ -70,7 +75,26 @@ RPCHelpMan walletpassphrase()
             throw JSONRPCError(RPC_INVALID_PARAMETER, "passphrase cannot be empty");
         }
 
-        if (!pwallet->Unlock(strWalletPass)) {
+        const auto prepare_unlock = [&]() EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+            if (!pwallet->TopUpKeyPool()) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Unable to refresh the wallet keypool");
+            }
+            const int64_t relock_time{GetTime() + nSleepTime};
+            std::weak_ptr<CWallet> weak_wallet = wallet;
+            context.scheduler->scheduleFromNow([weak_wallet, relock_time] {
+                if (auto shared_wallet = weak_wallet.lock()) {
+                    LOCK2(shared_wallet->m_relock_mutex, shared_wallet->cs_wallet);
+                    // Failed attempts leave the existing deadline untouched.
+                    if (shared_wallet->nRelockTime != relock_time) return;
+                    shared_wallet->Lock();
+                    shared_wallet->nRelockTime = 0;
+                }
+            }, std::chrono::seconds(nSleepTime));
+            // No fallible work follows publication. If scheduling throws, the
+            // prior deadline remains valid and Unlock restores the prior key.
+            pwallet->nRelockTime = relock_time;
+        };
+        if (!pwallet->Unlock(strWalletPass, prepare_unlock)) {
             // Check if the passphrase has a null character (see #27067 for details)
             if (strWalletPass.find('\0') == std::string::npos) {
                 throw JSONRPCError(RPC_WALLET_PASSPHRASE_INCORRECT, "Error: The wallet passphrase entered was incorrect.");
@@ -83,31 +107,7 @@ RPCHelpMan walletpassphrase()
                                                                     "passphrase to avoid this issue in the future.");
             }
         }
-
-        pwallet->TopUpKeyPool();
-
-        pwallet->nRelockTime = GetTime() + nSleepTime;
-        relock_time = pwallet->nRelockTime;
     }
-
-    // Get wallet scheduler to queue up the relock callback in the future.
-    // Scheduled events don't get destructed until they are executed,
-    // and they are executed in series in a single scheduler thread so
-    // no cs_wallet lock is needed.
-    WalletContext& context = EnsureWalletContext(request.context);
-    // Keep a weak pointer to the wallet so that it is possible to unload the
-    // wallet before the following callback is called. If a valid shared pointer
-    // is acquired in the callback then the wallet is still loaded.
-    std::weak_ptr<CWallet> weak_wallet = wallet;
-    context.scheduler->scheduleFromNow([weak_wallet, relock_time] {
-        if (auto shared_wallet = weak_wallet.lock()) {
-            LOCK2(shared_wallet->m_relock_mutex, shared_wallet->cs_wallet);
-            // Skip if this is not the most recent relock callback.
-            if (shared_wallet->nRelockTime != relock_time) return;
-            shared_wallet->Lock();
-            shared_wallet->nRelockTime = 0;
-        }
-    }, std::chrono::seconds(nSleepTime));
 
     return UniValue::VNULL;
 },

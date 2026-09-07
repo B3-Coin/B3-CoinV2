@@ -685,12 +685,15 @@ static bool DecryptMasterKey(const SecureString& wallet_passphrase, const CMaste
     return true;
 }
 
-bool CWallet::Unlock(const SecureString& strWalletPassphrase)
+bool CWallet::Unlock(const SecureString& strWalletPassphrase, const std::function<void()>& on_unlocked)
 {
     CKeyingMaterial plain_master_key;
-
-    {
-        LOCK(cs_wallet);
+    LOCK(cs_wallet);
+    // Secure allocator storage is cleansed on destruction. In particular, an
+    // error must not discard an already authorized unlock or retain a newly
+    // decrypted key after returning failure to a previously locked caller.
+    CKeyingMaterial previous_master_key{vMasterKey};
+    try {
         for (const auto& [_, master_key] : mapMasterKeys)
         {
             if (!DecryptMasterKey(strWalletPassphrase, master_key, plain_master_key)) {
@@ -699,9 +702,20 @@ bool CWallet::Unlock(const SecureString& strWalletPassphrase)
             if (Unlock(plain_master_key)) {
                 // Now that we've unlocked, upgrade the descriptor cache
                 UpgradeDescriptorCache();
+                if (on_unlocked) on_unlocked();
                 return true;
             }
         }
+    } catch (...) {
+        vMasterKey.swap(previous_master_key);
+        // An observer itself may have caused the failure. The actual key state
+        // is restored before notifying, and another observer exception must not
+        // replace the original error or prevent secure key cleanup.
+        try {
+            NotifyStatusChanged(this);
+        } catch (...) {
+        }
+        throw;
     }
     return false;
 }
