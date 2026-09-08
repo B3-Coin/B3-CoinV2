@@ -4,6 +4,7 @@
 
 # Wallet functionality used by bitcoind and bitcoin-wallet executables.
 add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
+  asset_metadata.cpp
   coincontrol.cpp
   coinselection.cpp
   context.cpp
@@ -20,6 +21,7 @@ add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
   receive.cpp
   rpc/addresses.cpp
   rpc/asset_queries.cpp
+  rpc/asset_metadata.cpp
   rpc/assets.cpp
   rpc/backup.cpp
   rpc/coins.cpp

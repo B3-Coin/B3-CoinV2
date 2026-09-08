@@ -35,6 +35,7 @@ namespace DBKeys {
 const std::string ACENTRY{"acentry"};
 const std::string ACTIVEEXTERNALSPK{"activeexternalspk"};
 const std::string B3_VALIDATOR_PUBKEY{"b3validatorpubkey"};
+const std::string B3_ASSET_METADATA{"b3assetmetadata"};
 const std::string B3_FLOWMESH_ACCOUNT_PUBKEY{"b3flowmeshaccountpubkey"};
 const std::string B3_BLS_KEY{"b3blskey"};
 const std::string B3_BLS_CRYPTED_KEY{"b3cblskey"};
@@ -71,6 +72,17 @@ const std::string WATCHMETA{"watchmeta"};
 const std::string WATCHS{"watchs"};
 const std::unordered_set<std::string> LEGACY_TYPES{CRYPTED_KEY, CSCRIPT, DEFAULTKEY, HDCHAIN, KEYMETA, KEY, OLD_KEY, POOL, WATCHMETA, WATCHS};
 } // namespace DBKeys
+
+bool WalletBatch::WriteAssetMetadata(const uint256& domain, const uint256& asset,
+                                     const LocalAssetMetadata& metadata)
+{
+    return WriteIC(std::make_pair(DBKeys::B3_ASSET_METADATA, std::make_pair(domain, asset)), metadata);
+}
+
+bool WalletBatch::EraseAssetMetadata(const uint256& domain, const uint256& asset)
+{
+    return EraseIC(std::make_pair(DBKeys::B3_ASSET_METADATA, std::make_pair(domain, asset)));
+}
 
 void LogDBInfo()
 {
@@ -1289,6 +1301,31 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
 
         // Load decryption keys
         result = std::max(LoadDecryptionKeys(pwallet, *m_batch), result);
+
+        // Cosmetic asset labels are noncritical, but their precision proof must
+        // bind to the complete chain-and-asset database key before use.
+        const auto asset_metadata_result = LoadRecords(pwallet, *m_batch, DBKeys::B3_ASSET_METADATA,
+            [](CWallet* wallet, DataStream& key, DataStream& value, std::string& error)
+                EXCLUSIVE_LOCKS_REQUIRED(wallet->cs_wallet) {
+                try {
+                    uint256 domain, asset;
+                    LocalAssetMetadata metadata;
+                    key >> domain >> asset;
+                    value >> metadata;
+                    if (!key.empty() || !value.empty()) {
+                        error = "Trailing data in asset metadata record";
+                        return DBErrors::NONCRITICAL_ERROR;
+                    }
+                    if (!wallet->LoadAssetMetadata(domain, asset, metadata, error)) {
+                        return DBErrors::NONCRITICAL_ERROR;
+                    }
+                } catch (const std::exception& exception) {
+                    error = exception.what();
+                    return DBErrors::NONCRITICAL_ERROR;
+                }
+                return DBErrors::LOAD_OK;
+            });
+        result = std::max(asset_metadata_result.m_result, result);
 
         // Load tx records
         result = std::max(LoadTxRecords(pwallet, *m_batch, any_unordered), result);

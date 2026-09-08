@@ -31,6 +31,7 @@
 #include <util/time.h>
 #include <util/ui_change_type.h>
 #include <wallet/crypter.h>
+#include <wallet/asset_metadata.h>
 #include <wallet/db.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/transaction.h>
@@ -526,6 +527,18 @@ public:
     /** Map from txid to CWalletTx for all transactions this wallet is
      * interested in, including received and sent transactions. */
     std::unordered_map<Txid, CWalletTx, SaltedTxidHasher> mapWallet GUARDED_BY(cs_wallet);
+
+    //! Immutable genesis proofs learned once while wallet transactions are loaded/updated.
+    //! Proof knowledge is independent of current-chain transaction confirmations.
+    std::map<uint256, AssetMetadataProof> m_asset_genesis GUARDED_BY(cs_wallet);
+    std::map<uint256, LocalAssetMetadata> m_asset_metadata GUARDED_BY(cs_wallet);
+    void LearnAssetMetadata(const CTransaction& tx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    WalletAssetMetadata GetAssetMetadata(const uint256& asset) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool LoadAssetMetadata(const uint256& domain, const uint256& asset,
+                           const LocalAssetMetadata& metadata, std::string& error) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool SetAssetMetadata(const uint256& asset, const LocalAssetMetadata& metadata,
+                          std::string& error) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool ClearAssetMetadata(const uint256& asset, std::string& error) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     typedef std::multimap<int64_t, CWalletTx*> TxItems;
     TxItems wtxOrdered;

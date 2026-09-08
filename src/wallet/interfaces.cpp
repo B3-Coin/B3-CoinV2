@@ -205,6 +205,12 @@ std::vector<WalletAssetBalance> GetWalletAssetBalances(const CWallet& wallet)
     std::vector<WalletAssetBalance> result;
     result.reserve(balances.size());
     for (auto& item : balances) {
+        const auto metadata{wallet.GetAssetMetadata(item.first)};
+        item.second.display_name = metadata.display_name;
+        item.second.ticker = metadata.ticker;
+        item.second.decimals = metadata.decimals;
+        item.second.metadata_source = metadata.source;
+        item.second.is_test_asset = metadata.test_only;
         result.push_back(std::move(item.second));
     }
     return result;

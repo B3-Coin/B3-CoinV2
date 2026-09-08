@@ -57,7 +57,11 @@ RPCHelpMan getwalletassets()
                     {RPCResult::Type::STR_HEX, "asset_id", "Asset identifier"},
                     {RPCResult::Type::STR, "kind", "fn, bridge, or colored"},
                     {RPCResult::Type::STR, "ticker", "Known ticker, or empty when metadata is unavailable"},
-                    {RPCResult::Type::NUM, "decimals", "Configured display decimals; zero when metadata is unavailable"},
+                    {RPCResult::Type::STR, "name", "Configured or wallet-local display name; empty when unnamed"},
+                    {RPCResult::Type::NUM, "decimals", "Verified display decimals; legacy fallback zero when precision_known is false"},
+                    {RPCResult::Type::BOOL, "precision_known", "Whether immutable display precision is known"},
+                    {RPCResult::Type::STR, "metadata_source", "consensus, bundled-registry, local-registry, wallet-issuance or unknown; does not certify backing or chain inclusion"},
+                    {RPCResult::Type::BOOL, "test_only", "Whether this is a configured test-only asset"},
                     {RPCResult::Type::NUM, "confirmed", "Confirmed unspent amount"},
                     {RPCResult::Type::NUM, "unconfirmed", "Unconfirmed unspent amount"},
                     {RPCResult::Type::NUM, "spendable", "Amount currently mature, safe, unlocked, and signable by this wallet"},
@@ -199,10 +203,13 @@ RPCHelpMan getwalletassets()
                                          ? "fn"
                                          : (bucket.is_bridge ? "bridge"
                                                              : "colored"));
-                entry.pushKV("ticker", bucket.is_fn
-                                           ? "FN"
-                                           : (bucket.is_bridge ? "bUSD" : ""));
-                entry.pushKV("decimals", bucket.is_bridge ? 6 : 0);
+                const auto metadata{wallet->GetAssetMetadata(asset_id)};
+                entry.pushKV("ticker", metadata.ticker);
+                entry.pushKV("name", metadata.display_name);
+                entry.pushKV("decimals", metadata.decimals.value_or(0));
+                entry.pushKV("precision_known", metadata.decimals.has_value());
+                entry.pushKV("metadata_source", metadata.source);
+                entry.pushKV("test_only", metadata.test_only);
                 entry.pushKV("confirmed", bucket.confirmed);
                 entry.pushKV("unconfirmed", bucket.unconfirmed);
                 entry.pushKV("spendable", bucket.spendable);

@@ -27,6 +27,7 @@ class CMasterKey;
 class CWallet;
 class CWalletTx;
 struct WalletContext;
+struct LocalAssetMetadata;
 
 // Logs information about the database, including available engines, features, and other capabilities
 void LogDBInfo();
@@ -60,6 +61,7 @@ namespace DBKeys {
 extern const std::string ACENTRY;
 extern const std::string ACTIVEEXTERNALSPK;
 extern const std::string B3_VALIDATOR_PUBKEY;
+extern const std::string B3_ASSET_METADATA;
 extern const std::string B3_FLOWMESH_ACCOUNT_PUBKEY;
 extern const std::string B3_BLS_KEY;
 extern const std::string B3_BLS_CRYPTED_KEY;
@@ -227,6 +229,9 @@ public:
 
     bool WriteName(const std::string& strAddress, const std::string& strName);
     bool EraseName(const std::string& strAddress);
+
+    bool WriteAssetMetadata(const uint256& domain, const uint256& asset, const LocalAssetMetadata& metadata);
+    bool EraseAssetMetadata(const uint256& domain, const uint256& asset);
 
     bool WritePurpose(const std::string& strAddress, const std::string& purpose);
     bool ErasePurpose(const std::string& strAddress);

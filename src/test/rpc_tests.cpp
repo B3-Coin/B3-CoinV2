@@ -225,6 +225,102 @@ BOOST_AUTO_TEST_CASE(getbridgeanchorforblock_converts_target_to_number)
     BOOST_CHECK_EQUAL(converted[0].getInt<uint64_t>(), 19'000'000U);
 }
 
+BOOST_AUTO_TEST_CASE(asset_rpc_positional_values_preserve_exact_units)
+{
+    // Above 2^53: CLI conversion must preserve integer units without using
+    // floating point or scaling them by the asset's display decimals.
+    const std::string units{"9007199254740993"};
+    const std::string options{R"({"broadcast":false,"minconf":2})"};
+    BOOST_CHECK_EQUAL(
+        RPCConvertValues("issueasset", {units, "2", "destination", options}).write(),
+        R"([9007199254740993,2,"destination",{"broadcast":false,"minconf":2}])");
+    BOOST_CHECK_EQUAL(
+        RPCConvertValues("sendasset", {"asset-id", units, "destination", options}).write(),
+        R"(["asset-id",9007199254740993,"destination",{"broadcast":false,"minconf":2}])");
+    BOOST_CHECK_EQUAL(
+        RPCConvertValues("burnasset", {"asset-id", units, options}).write(),
+        R"(["asset-id",9007199254740993,{"broadcast":false,"minconf":2}])");
+    BOOST_CHECK_EQUAL(
+        RPCConvertValues("createfncoin", {"destination", options}).write(),
+        R"(["destination",{"broadcast":false,"minconf":2}])");
+
+    // A valid, entirely numeric hexadecimal ID must remain a string.
+    const std::string asset_id(64, '1');
+    const UniValue inventory{
+        RPCConvertValues("getwalletassets", {asset_id, "2", "true"})};
+    BOOST_REQUIRE_EQUAL(inventory.size(), 3U);
+    BOOST_CHECK_EQUAL(inventory[0].get_str(), asset_id);
+    BOOST_CHECK_EQUAL(inventory[1].getInt<int>(), 2);
+    BOOST_CHECK(inventory[2].get_bool());
+}
+
+BOOST_AUTO_TEST_CASE(asset_rpc_named_values_preserve_types)
+{
+    BOOST_CHECK_EQUAL(
+        RPCConvertNamedValues("issueasset", {"max_supply=9007199254740993", "decimals=2", "address=destination", R"(options={"broadcast":false})"}).write(),
+        R"({"max_supply":9007199254740993,"decimals":2,"address":"destination","options":{"broadcast":false}})");
+    BOOST_CHECK_EQUAL(
+        RPCConvertNamedValues("sendasset", {"asset_id=asset-id", "amount=9007199254740993", "address=destination", R"(options={"broadcast":false})"}).write(),
+        R"({"asset_id":"asset-id","amount":9007199254740993,"address":"destination","options":{"broadcast":false}})");
+    BOOST_CHECK_EQUAL(
+        RPCConvertNamedValues("burnasset", {"asset_id=asset-id", "amount=9007199254740993", R"(options={"broadcast":false})"}).write(),
+        R"({"asset_id":"asset-id","amount":9007199254740993,"options":{"broadcast":false}})");
+    BOOST_CHECK_EQUAL(
+        RPCConvertNamedValues("createfncoin", {"address=destination", R"(options={"broadcast":false})"}).write(),
+        R"({"address":"destination","options":{"broadcast":false}})");
+
+    // Named arguments allow callers to omit the optional asset filter.
+    const UniValue inventory{
+        RPCConvertNamedValues("getwalletassets", {"minconf=2", "include_unsafe=false"})};
+    BOOST_CHECK_EQUAL(inventory.write(), R"({"minconf":2,"include_unsafe":false})");
+    BOOST_CHECK_EQUAL(
+        TransformParams(inventory, {{"asset_id", false}, {"minconf", false}, {"include_unsafe", false}}).write(),
+        R"([null,2,false])");
+    const std::string asset_id(64, '1');
+    BOOST_CHECK_EQUAL(
+        RPCConvertNamedValues("getwalletassets", {"asset_id=" + asset_id}).find_value("asset_id").get_str(),
+        asset_id);
+}
+
+BOOST_AUTO_TEST_CASE(asset_rpc_rejects_malformed_json_parameters)
+{
+    BOOST_CHECK_THROW(RPCConvertValues("issueasset", {"not-a-number", "2"}), std::runtime_error);
+    BOOST_CHECK_THROW(RPCConvertValues("sendasset", {"asset-id", "1", "destination", "not-an-object"}), std::runtime_error);
+    BOOST_CHECK_THROW(RPCConvertNamedValues("getwalletassets", {"include_unsafe=not-a-boolean"}), std::runtime_error);
+    BOOST_CHECK_THROW(RPCConvertNamedValues("burnasset", {"options=not-an-object"}), std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(asset_rpc_metadata_strings_support_mixed_named_values)
+{
+    const std::string asset_id(64, '1');
+    const std::string issuance_hex(64, '2');
+    const UniValue positional{
+        RPCConvertValues("setassetmetadata", {asset_id, "Unit=Test", "U=T", issuance_hex})};
+    BOOST_REQUIRE_EQUAL(positional.size(), 4U);
+    BOOST_CHECK_EQUAL(positional[0].get_str(), asset_id);
+    BOOST_CHECK_EQUAL(positional[1].get_str(), "Unit=Test");
+    BOOST_CHECK_EQUAL(positional[2].get_str(), "U=T");
+    BOOST_CHECK_EQUAL(positional[3].get_str(), issuance_hex);
+
+    const std::vector<std::pair<std::string, bool>> names{
+        {"asset_id", false}, {"name", false}, {"ticker", false}, {"issuance_hex", false}};
+    const UniValue mixed{
+        RPCConvertNamedValues("setassetmetadata", {asset_id, "Unit=Test", "ticker=U=T", "issuance_hex=" + issuance_hex})};
+    // The unrecognized prefix in a positional name is literal text, while
+    // registered argument names still select their slots in mixed -named use.
+    BOOST_CHECK_EQUAL(TransformParams(mixed, names).write(), positional.write());
+    const UniValue named{
+        RPCConvertNamedValues("setassetmetadata", {"asset_id=" + asset_id, "name=Unit=Test", "ticker=U=T", "issuance_hex=" + issuance_hex})};
+    BOOST_CHECK_EQUAL(TransformParams(named, names).write(), positional.write());
+
+    const UniValue clear{RPCConvertValues("clearassetmetadata", {asset_id})};
+    BOOST_REQUIRE_EQUAL(clear.size(), 1U);
+    BOOST_CHECK_EQUAL(clear[0].get_str(), asset_id);
+    BOOST_CHECK_EQUAL(
+        RPCConvertNamedValues("clearassetmetadata", {"asset_id=" + asset_id}).find_value("asset_id").get_str(),
+        asset_id);
+}
+
 BOOST_AUTO_TEST_CASE(outbound_bridge_rpc_converts_hashes_or_heights)
 {
     const std::string hash{

@@ -871,6 +871,8 @@ RPCHelpMan listlockunspent();
 RPCHelpMan getbalances();
 RPCHelpMan listunspent();
 RPCHelpMan getwalletassets();
+RPCHelpMan setassetmetadata();
+RPCHelpMan clearassetmetadata();
 
 // encryption
 RPCHelpMan walletpassphrase();
@@ -985,6 +987,8 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &gettransaction},
         {"wallet", &getbalances},
         {"wallet", &getwalletassets},
+        {"wallet", &setassetmetadata},
+        {"wallet", &clearassetmetadata},
         {"wallet", &getwalletinfo},
         {"wallet", &importdescriptors},
         {"wallet", &importlegacywalletdump},

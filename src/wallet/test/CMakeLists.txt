@@ -6,6 +6,7 @@
 # SOURCES property is processed to gather test suite macros.
 target_sources(test_bitcoin
   PRIVATE
+    asset_metadata_tests.cpp
     init_test_fixture.cpp
     wallet_test_fixture.cpp
     db_tests.cpp

@@ -1263,6 +1263,8 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
     // Cache the outputs that belong to the wallet
     RefreshTXOsFromTx(wtx);
 
+    if (fInsertedNew || fUpdated) LearnAssetMetadata(*wtx.tx);
+
     // Notify UI of new or updated transaction
     NotifyTransactionChanged(hash, fInsertedNew ? CT_NEW : CT_UPDATED);
 
@@ -1332,6 +1334,7 @@ bool CWallet::LoadToWallet(const Txid& hash, const UpdateWalletTxFn& fill_wtx)
 
     // Make sure the tx outputs are known by the wallet
     RefreshTXOsFromTx(wtx);
+    LearnAssetMetadata(*wtx.tx);
     return true;
 }
 

@@ -22,6 +22,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -73,6 +74,11 @@ struct WalletAssetBalance
     CAmount immature{0};
     bool is_fn{false};
     bool is_bridge{false};
+    std::string display_name;
+    std::string ticker;
+    std::optional<int> decimals;
+    std::string metadata_source;
+    bool is_test_asset{false};
 
     friend bool operator==(const WalletAssetBalance&,
                            const WalletAssetBalance&) = default;
