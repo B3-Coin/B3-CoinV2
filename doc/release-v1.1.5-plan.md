@@ -49,6 +49,14 @@ shrinking quorum, inactivity slashing, privileged removal or signer rollback.
 
 ## Other pending work
 
+Guarantee already-covered Ethereum history a scan opportunity even when slow
+B3 finality repeatedly leaves the proven Ethereum head more than 128 blocks
+ahead. The current priority gate can otherwise keep scheduling refreshes.
+This is a relayer scheduling change, not a consensus change. Add a repeated
+slow-finality regression, preserve signed/in-flight jobs and exact-store
+rechecks, and use suitable retained anchors when the cursor is more than
+20,000 blocks behind the latest anchor. Do not relax proof or ancestry limits.
+
 The existing uncommitted finality-recovery/RPC/Qt prototype remains separate
 until its durable receipt installation, failure behavior and supported
 platforms are reviewed and tested. It must not be described as shipped merely

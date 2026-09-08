@@ -42,6 +42,15 @@ relayer database between runs remains mandatory.
 
 ## Qualification and release gates
 
+Known remaining relayer limitation: the covered-history scan priority still
+requires the proven Ethereum head to be within 128 blocks of the finalized
+B3 light-client store. Repeated slow B3 finality can leave a larger gap on
+every cycle and repeatedly favor another update over covered-history scanning.
+This is distinct from preserving an already-prepared deposit plan. A follow-up
+scheduling fix and regression are required; this draft does not claim that all
+history-scan starvation is resolved. That fix must preserve in-flight jobs,
+exact finalized-store verification and retained-anchor/ancestry limits.
+
 The relayer changes passed 108 focused offline tests in the master checkout
 (55 existing, 14 coalescing, 10 scheduling and 29 header/cache cases).
 Read-only live checks also verified sixteen Ethereum headers against a
