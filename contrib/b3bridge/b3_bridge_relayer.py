@@ -24,6 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 
 import capture_eth_receipts_fixture as receipts
 from eth_live_test import encode_exec_header
@@ -33,6 +34,11 @@ DEPOSIT_TOPIC = "0xdaf0af297d25c0e96a0b209d35692b4e07c503634eeca57fc5c35c006acf5
 PERIOD_SLOTS = 8192
 MAX_ANCESTRY_DISTANCE = 20000
 MAX_LC_EXECUTION_ADVANCE = 20000
+HEADER_BATCH_SIZE = 16
+MAX_CACHED_HEADER_BYTES = 1024 * 1024
+MAX_HEADER_CACHE_ENTRIES = MAX_ANCESTRY_DISTANCE + 1
+MAX_HEADER_CACHE_BYTES = 64 * 1024 * 1024
+MAX_HEADER_BATCH_RESPONSE_BYTES = HEADER_BATCH_SIZE * MAX_CACHED_HEADER_BYTES + 1024 * 1024
 B3_ATOMS = 1_000_000_000
 
 
@@ -176,6 +182,10 @@ class JsonRpc:
         self.url, self.user, self.password = url.rstrip("/"), user, password
         self.endpoint = endpoint_label(self.url)
         self.cookie, self.timeout, self.next_id = cookie, timeout, 0
+        self._header_batch_supported = None
+        # Conservative production default, supported by the configured free
+        # execution provider. The helper still enforces its independent cap.
+        self.execution_header_batch_size = 3
 
     def wallet(self, name):
         return JsonRpc(self.url + "/wallet/" + urllib.parse.quote(name, safe=""),
@@ -214,6 +224,104 @@ class JsonRpc:
             raise RpcError(result["error"])
         return result.get("result")
 
+    def execution_headers(self, numbers):
+        """Bounded read-only batch; never retry a write or fan out on failure.
+
+        A server's explicit refusal of batch requests permits one sequential
+        fallback and disables future batch probes for this client. Transport,
+        rate-limit, malformed-response and per-item errors fail this scan;
+        already verified cached batches remain available to its next attempt.
+        """
+        numbers = list(numbers)
+        if (not numbers or len(numbers) > HEADER_BATCH_SIZE or
+                any(type(number) is not int or number < 0 for number in numbers) or
+                len(set(numbers)) != len(numbers)):
+            raise RelayerError("execution header batch requires 1 to 16 unique non-negative heights")
+
+        def sequential():
+            return [self.call("eth_getBlockByNumber", [hex(number), False])
+                    for number in numbers]
+
+        if len(numbers) == 1 or self._header_batch_supported is False:
+            return sequential()
+        requests = []
+        for number in numbers:
+            self.next_id += 1
+            requests.append({"jsonrpc": "2.0", "id": self.next_id,
+                             "method": "eth_getBlockByNumber",
+                             "params": [hex(number), False]})
+        headers = {"Content-Type": "application/json", "User-Agent": "b3-bridge-relayer/1.1"}
+        auth = None
+        if self.cookie:
+            try:
+                auth = Path(self.cookie).read_text().strip()
+            except OSError as e:
+                raise RelayerError(f"cannot read RPC cookie: {e}") from e
+        elif self.user is not None:
+            auth = f"{self.user}:{self.password}"
+        if auth is not None:
+            headers["Authorization"] = "Basic " + base64.b64encode(auth.encode()).decode()
+        request = urllib.request.Request(self.url, json.dumps(requests).encode(), headers=headers)
+
+        def decode(response):
+            raw = response.read(MAX_HEADER_BATCH_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_HEADER_BATCH_RESPONSE_BYTES:
+                raise RelayerError("execution header batch response exceeds its size limit")
+            return json.loads(raw, parse_float=Decimal)
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                result = decode(response)
+        except urllib.error.HTTPError as e:
+            # In particular, 429/5xx must not multiply requests via fallback.
+            if e.code not in (400, 405, 413, 415, 422, 501):
+                raise RelayerError(f"HTTP {e.code} from {self.endpoint} during execution header batch") from None
+            try:
+                result = decode(e)
+            except (ValueError, OSError):
+                self._header_batch_supported = False
+                return sequential()
+        except (OSError, ValueError) as e:
+            raise RelayerError(
+                f"RPC transport failure for execution header batch via {self.endpoint} "
+                f"({type(e).__name__})") from None
+
+        # A whole-request JSON-RPC rejection is how non-batch endpoints often
+        # reject an array. An item-level error is not evidence of this and is
+        # never retried here. Error text is deliberately not used for guessing.
+        expected_ids = {item["id"] for item in requests}
+        if isinstance(result, dict) and isinstance(result.get("error"), dict):
+            response_id = result.get("id")
+            if (result.get("jsonrpc") != "2.0" or "id" not in result or
+                    response_id is not None or
+                    type(result["error"].get("code")) is not int or
+                    not isinstance(result["error"].get("message"), str) or "result" in result):
+                raise RelayerError("execution header batch has a malformed whole-request error")
+            if result["error"].get("code") in (-32600, -32601):
+                self._header_batch_supported = False
+                return sequential()
+            raise RpcError(result["error"])
+        if not isinstance(result, list) or len(result) != len(requests):
+            raise RelayerError("execution header batch has a missing or malformed response set")
+        responses = {}
+        for item in result:
+            if (not isinstance(item, dict) or item.get("jsonrpc") != "2.0" or
+                    type(item.get("id")) is not int or item["id"] not in expected_ids or
+                    item["id"] in responses):
+                raise RelayerError("execution header batch has a duplicate, unexpected or malformed response ID")
+            responses[item["id"]] = item
+        for item in responses.values():
+            if item.get("error") is not None:
+                if (not isinstance(item["error"], dict) or
+                        type(item["error"].get("code")) is not int or
+                        not isinstance(item["error"].get("message"), str)):
+                    raise RelayerError("execution header batch response has a malformed error")
+                raise RpcError(item["error"])
+            if "result" not in item:
+                raise RelayerError("execution header batch response is missing its result")
+        self._header_batch_supported = True
+        return [responses[item["id"]]["result"] for item in requests]
+
 
 def fetch(url):
     req = urllib.request.Request(url, headers={"Accept": "application/json",
@@ -239,6 +347,10 @@ class State:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS execution_headers(
+            block_hash TEXT PRIMARY KEY,block_number INTEGER NOT NULL,
+            payload BLOB NOT NULL,encoded_size INTEGER NOT NULL);
+          CREATE INDEX IF NOT EXISTS execution_headers_height ON execution_headers(block_number);
           CREATE TABLE IF NOT EXISTS deposits(
             id INTEGER PRIMARY KEY,deposit_id TEXT NOT NULL,block_number INTEGER NOT NULL,
             block_hash TEXT NOT NULL,tx_hash TEXT NOT NULL,tx_index INTEGER NOT NULL,
@@ -322,6 +434,67 @@ class State:
     def cursor(self):
         return int(self.db.execute("SELECT value FROM meta WHERE key='next_block'").fetchone()[0])
 
+    def cached_execution_header(self, block_hash):
+        """Cache data is untrusted: the caller must repeat the full anchor walk."""
+        row = self.db.execute(
+            "SELECT payload,encoded_size FROM execution_headers WHERE block_hash=?",
+            (norm_hex(block_hash, 32),)).fetchone()
+        if row is None:
+            return None
+        try:
+            payload, encoded_size = row
+            if (not isinstance(payload, bytes) or len(payload) > MAX_CACHED_HEADER_BYTES or
+                    type(encoded_size) is not int or not 0 < encoded_size <= MAX_CACHED_HEADER_BYTES):
+                raise ValueError("invalid cached header size")
+            decoder = zlib.decompressobj()
+            encoded = decoder.decompress(payload, MAX_CACHED_HEADER_BYTES + 1)
+            if (not decoder.eof or decoder.unused_data or decoder.unconsumed_tail or
+                    len(encoded) != encoded_size or len(encoded) > MAX_CACHED_HEADER_BYTES):
+                raise ValueError("invalid compressed cached header")
+            header = json.loads(encoded)
+            if not isinstance(header, dict):
+                raise ValueError("invalid cached header object")
+            return header
+        except (ValueError, TypeError, zlib.error) as e:
+            raise RelayerError("corrupt execution header cache; refusing cursor advancement") from e
+
+    def cache_execution_headers(self, headers):
+        """Persist a verified contiguous segment, never a scan-cursor update.
+
+        Full public JSON is compressed rather than replacing transaction lists
+        with invented data. Logical payload is bounded by both bytes and rows;
+        SQLite may retain freed pages for reuse. Oversized headers remain valid
+        scan inputs but are not cached. Eviction favors higher anchor-side
+        headers, retaining a useful restart prefix when a window exceeds quota.
+        """
+        rows = []
+        for header in headers:
+            encoded = json.dumps(header, sort_keys=True, separators=(",", ":")).encode()
+            if len(encoded) > MAX_CACHED_HEADER_BYTES:
+                continue
+            payload = zlib.compress(encoded)
+            if len(payload) > MAX_CACHED_HEADER_BYTES:
+                continue
+            rows.append((norm_hex(header["hash"], 32), quantity(header["number"]),
+                         payload, len(encoded)))
+        if not rows:
+            return
+        with self.tx():
+            self.db.executemany("INSERT OR IGNORE INTO execution_headers VALUES(?,?,?,?)", rows)
+            count, size = self.db.execute(
+                "SELECT COUNT(*),COALESCE(SUM(length(payload)),0) FROM execution_headers").fetchone()
+            if count > MAX_HEADER_CACHE_ENTRIES or size > MAX_HEADER_CACHE_BYTES:
+                victims = self.db.execute(
+                    "SELECT block_hash,length(payload) FROM execution_headers ORDER BY block_number,block_hash")
+                remove = []
+                for block_hash, length in victims:
+                    if count <= MAX_HEADER_CACHE_ENTRIES and size <= MAX_HEADER_CACHE_BYTES:
+                        break
+                    remove.append((block_hash,))
+                    count -= 1
+                    size -= length
+                self.db.executemany("DELETE FROM execution_headers WHERE block_hash=?", remove)
+
     def unplanned(self):
         return self.db.execute("SELECT * FROM deposits WHERE planned=0 ORDER BY block_number,id").fetchall()
 
@@ -348,6 +521,65 @@ class State:
             self._insert_plan(records_to_add)
             if deposit_id is not None:
                 self.db.execute("UPDATE deposits SET planned=1 WHERE id=?", (deposit_id,))
+
+    def coalesce_verified_sync_plan(self, records):
+        """Replace unused sync plans with an independently verified sequence.
+
+        The caller MUST first verify this entire sequence against the exact
+        current B3-finalized store (C++ signatures/committee transitions,
+        execution windows, independent execution RPCs, and an unchanged store
+        recheck). This method authenticates no proofs. It only manages jobs.
+
+        Keep audit rows and every preparation/effect field. Uncertain history
+        or deposit dependencies fall back to ordinary append without changing
+        existing jobs. No active-chain effect is claimed for superseded plans.
+        """
+        records = list(records)
+        if any(record.get("kind") not in ("bootstrap", "update") for record in records):
+            raise RelayerError("coalescing accepts only verified sync records")
+        payload_ids = [hashlib.sha256(bytes.fromhex(norm_hex(
+            record["payload_hex"], prefix=False))).hexdigest() for record in records]
+        if len(set(payload_ids)) != len(payload_ids):
+            raise RelayerError("verified sync sequence repeats a payload")
+        pristine = ("txid", "raw_tx", "fee_atoms", "fee_day",
+                    "effect_height", "effect_block")
+        with self.tx():
+            # Reuse the exact existing payload/metadata collision checks. An
+            # error rolls back insertions, supersessions and ordering together.
+            self._insert_plan(records)
+            pending = self.db.execute(
+                "SELECT * FROM jobs WHERE state NOT IN ('confirmed','superseded')"
+            ).fetchall()
+            reason = None
+            if self.db.execute("SELECT 1 FROM deposits WHERE planned=0 LIMIT 1").fetchone():
+                reason = "unplanned deposit dependency"
+            elif any(row["kind"] not in ("bootstrap", "update") for row in pending):
+                reason = "pending deposit/backfill dependency"
+            elif any(row["state"] != "planned" or
+                     any(row[field] is not None for field in pristine) for row in pending):
+                reason = "pending transaction or preparation history"
+            fresh = [self.db.execute("SELECT * FROM jobs WHERE payload_id=?", (pid,)).fetchone()
+                     for pid in payload_ids]
+            if any(row["state"] not in ("planned", "superseded") or
+                   any(row[field] is not None for field in pristine) for row in fresh):
+                reason = "verified payload already has transaction/effect history"
+            if reason:
+                return {"superseded": 0, "reactivated": 0, "fallback": reason}
+            wanted = set(payload_ids)
+            obsolete = [row["id"] for row in pending if row["payload_id"] not in wanted]
+            for row_id in obsolete:
+                self.db.execute("UPDATE jobs SET state='superseded' WHERE id=?", (row_id,))
+            reactivated = 0
+            for row in fresh:
+                if row["state"] == "superseded":
+                    self.db.execute("UPDATE jobs SET state='planned' WHERE id=?", (row["id"],))
+                    reactivated += 1
+            # An old row can occur later in the fresh verified sequence than a
+            # newly inserted row. Keep immutable row IDs and record the exact
+            # proof order instead of accidentally reverting to insertion order.
+            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                            ("verified_sync_order", json.dumps(payload_ids)))
+            return {"superseded": len(obsolete), "reactivated": reactivated, "fallback": None}
 
     def add_verified_deposit(self, deposit, records_to_add):
         """Atomically persist one proof-verified deposit and its B3 plan."""
@@ -394,9 +626,26 @@ class State:
                             (str(next_block),))
 
     def pending(self):
-        return self.db.execute(
+        rows = self.db.execute(
             """SELECT * FROM jobs WHERE state NOT IN ('confirmed','superseded')
                ORDER BY CASE WHEN kind IN ('bootstrap','update') THEN 0 ELSE 1 END,id""").fetchall()
+        order = self.db.execute(
+            "SELECT value FROM meta WHERE key='verified_sync_order'").fetchone()
+        if order is None:
+            return rows
+        try:
+            sequence = json.loads(order[0])
+            if (not isinstance(sequence, list) or
+                    any(not isinstance(pid, str) or len(pid) != 64 or
+                        any(char not in "0123456789abcdef" for char in pid) for pid in sequence) or
+                    len(sequence) != len(set(sequence))):
+                raise ValueError("malformed order")
+        except (TypeError, ValueError) as e:
+            raise RelayerError("invalid durable verified sync ordering; inspect state") from e
+        ranks = {pid: index for index, pid in enumerate(sequence)}
+        return sorted(rows, key=lambda row: (
+            0 if row["kind"] in ("bootstrap", "update") else 1,
+            ranks.get(row["payload_id"], len(ranks)), row["id"]))
 
     def job_counts(self):
         row = self.db.execute("SELECT COUNT(*),SUM(state='confirmed') FROM jobs").fetchone()
@@ -415,9 +664,8 @@ class State:
         return out
 
     def first(self):
-        return self.db.execute(
-            """SELECT * FROM jobs WHERE state NOT IN ('confirmed','superseded')
-               ORDER BY CASE WHEN kind IN ('bootstrap','update') THEN 0 ELSE 1 END,id LIMIT 1""").fetchone()
+        rows = self.pending()
+        return rows[0] if rows else None
 
     def confirmed(self):
         return self.db.execute("SELECT * FROM jobs WHERE state='confirmed' ORDER BY id").fetchall()
@@ -433,6 +681,7 @@ class State:
 
     def reopen_from(self, row_id):
         with self.tx():
+            self.db.execute("DELETE FROM meta WHERE key='verified_sync_order'")
             self.db.execute("""UPDATE jobs SET state='planned',txid=NULL,raw_tx=NULL,
                                effect_height=NULL,effect_block=NULL,
                                fee_atoms=NULL,fee_day=NULL
@@ -980,22 +1229,29 @@ def block_might_contain_deposit(header, identity):
 
 
 def verified_execution_headers(eth, start, finalized, finalized_hash,
-                               max_ancestry):
-    """Return a finalized-hash-anchored header map for one forward scan."""
+                               max_ancestry, header_cache=None):
+    """Return a finalized-hash-anchored header map for one forward scan.
+
+    The caller supplies a currently authenticated anchor, never a cached claim
+    of finality. Cached content is revalidated identically to an RPC response.
+    Bounded batches save contiguous verified progress without advancing the
+    omission cursor: only the subsequent full forward receipt scan may do so.
+    """
     if start > finalized:
         return {}
     depth = finalized - start
-    if depth > max_ancestry:
+    if depth > max_ancestry or depth > MAX_ANCESTRY_DISTANCE:
         raise RelayerError(
             f"Ethereum scan cursor is {depth} blocks behind finality; "
             "a retained historical B3 anchor is required")
-    headers, expected_hash = {}, norm_hex(finalized_hash, 32)
-    for number in range(finalized, start - 1, -1):
-        header = eth.call("eth_getBlockByNumber", [hex(number), False])
+    def validate(header, number, expected_hash):
         if (not isinstance(header, dict) or quantity(header.get("number")) != number or
                 norm_hex(header.get("hash"), 32) != expected_hash):
             raise RelayerError(f"execution header mismatch at block {number}")
-        encoded = encode_exec_header(header)
+        try:
+            encoded = encode_exec_header(header)
+        except (KeyError, TypeError, ValueError, AssertionError) as e:
+            raise RelayerError(f"malformed execution header at block {number}") from e
         if receipts.keccak256(encoded).hex() != expected_hash[2:]:
             raise RelayerError(f"execution RLP mismatch at block {number}")
         # Parse these now so a malformed negative-bloom header cannot advance
@@ -1004,8 +1260,59 @@ def verified_execution_headers(eth, start, finalized, finalized_hash,
         norm_hex(header.get("logsBloom"), 256)
         if not isinstance(header.get("transactions"), list):
             raise RelayerError("execution header transaction list is unavailable")
-        headers[number] = header
-        expected_hash = norm_hex(header.get("parentHash"), 32)
+        return norm_hex(header.get("parentHash"), 32)
+
+    headers, expected_hash = {}, norm_hex(finalized_hash, 32)
+    number = finalized
+    cached_count, last_report = 0, 0
+    began = time.monotonic()
+    log("ethereum_header_scan", first=start, anchor=finalized,
+        verified=0, cached=0, total=depth + 1)
+
+    def report_progress():
+        nonlocal last_report
+        if len(headers) - last_report >= 512 or number < start:
+            log("ethereum_header_scan", first=start, anchor=finalized,
+                verified=len(headers), cached=cached_count, total=depth + 1,
+                elapsed_seconds=round(time.monotonic() - began, 1))
+            last_report = len(headers)
+
+    batch_reader = getattr(eth, "execution_headers", None)
+    batch_size = getattr(eth, "execution_header_batch_size", HEADER_BATCH_SIZE)
+    if type(batch_size) is not int or not 1 <= batch_size <= HEADER_BATCH_SIZE:
+        raise RelayerError("execution header batch size must be between 1 and 16")
+    while number >= start:
+        cached = (header_cache.cached_execution_header(expected_hash)
+                  if header_cache is not None else None)
+        if cached is not None:
+            expected_hash = validate(cached, number, expected_hash)
+            headers[number] = cached
+            cached_count += 1
+            number -= 1
+            report_progress()
+            continue
+        # Fetching by height can be batched; authentication still proceeds in
+        # strict parent order from the exact expected hash, never arrival order.
+        count = batch_size if callable(batch_reader) else 1
+        numbers = list(range(number, max(start - 1, number - count), -1))
+        fetched = (batch_reader(numbers) if callable(batch_reader) else
+                   [eth.call("eth_getBlockByNumber", [hex(number), False])])
+        if not isinstance(fetched, list) or len(fetched) != len(numbers):
+            raise RelayerError("execution header batch returned an incomplete header list")
+        verified = []
+        try:
+            for height, header in zip(numbers, fetched):
+                expected_hash = validate(header, height, expected_hash)
+                headers[height] = header
+                verified.append(header)
+                number = height - 1
+        finally:
+            # Even if a later header is wrong, this prefix is already anchored
+            # cryptographically. Save it for retry, but return no partial map
+            # to the forward scan and never commit its cursor here.
+            if verified and header_cache is not None:
+                header_cache.cache_execution_headers(verified)
+        report_progress()
     return headers
 
 
@@ -1071,7 +1378,7 @@ def scan_finalized(state, eth, identity, finalized, finalized_hash, chunk,
                    before_commit=None):
     start = state.cursor()
     headers = verified_execution_headers(
-        eth, start, finalized, finalized_hash, max_ancestry)
+        eth, start, finalized, finalized_hash, max_ancestry, header_cache=state)
     if headers and before_commit is not None:
         before_commit()
     batch_first, batch_deposits = start, 0
@@ -1094,7 +1401,13 @@ def write_common(workdir, common):
     workdir.mkdir(parents=True, exist_ok=True)
     atomic_json(workdir / "config.json", common[0])
     atomic_json(workdir / "updates.json", common[2])
-    atomic_json(workdir / "finality_update.json", common[3])
+    if common[3] is None:
+        # Receipt proofs may use the exact already-finalized B3 store. Do not
+        # accidentally reuse an optional refresh from an earlier proof run.
+        with contextlib.suppress(FileNotFoundError):
+            (workdir / "finality_update.json").unlink()
+    else:
+        atomic_json(workdir / "finality_update.json", common[3])
     store_snapshot = common[6] if len(common) > 6 else None
     if store_snapshot is None:
         atomic_json(workdir / "bootstrap.json", common[1])
@@ -1588,6 +1901,20 @@ def process_jobs(state, node, wallet, required, dry_run,
         log("job_confirmed", kind=row["kind"], txid=row["txid"], confirmations=seen)
 
 
+def reconcile_pending_sync_effects(state, node, info, final):
+    """Account for on-chain effects without preparing any new transaction."""
+    for row in state.pending():
+        if row["kind"] not in ("bootstrap", "update"):
+            continue
+        effect, height, block_hash = effect_status(node, row, info, final)
+        if effect == "final":
+            state.confirm_effect(row["id"], height, block_hash)
+            log("job_reconciled", kind=row["kind"], txid=row["txid"])
+        elif effect == "superseded":
+            state.set_state(row["id"], "superseded")
+            log("job_superseded", kind=row["kind"])
+
+
 def run_once(args, state, eth, witnesses, node, wallet, prefix):
     info = node.call("getbridgeinfo")
     # A newly connected LC effect may be ahead of the finalized export. Wait
@@ -1654,7 +1981,61 @@ def run_once(args, state, eth, witnesses, node, wallet, prefix):
             node.call("getbridgelightclientstore"), rechecked_info)
     if store_snapshot_fingerprint(rechecked_store) != store_snapshot_fingerprint(store_snapshot):
         raise RelayerError("B3 light-client store changed while assembling a relayer plan; retry")
-    state.add_plan(sync_records)
+    if not args.dry_run:
+        reconcile_pending_sync_effects(
+            state, node, info, finalized_height(node))
+        # A previously prepared deposit plan already contains its required
+        # updates/backfills. Drain that finite plan before adding optional tip
+        # refreshes, otherwise continuous Ethereum progress can starve mints.
+        if any(row["kind"] not in ("bootstrap", "update")
+               for row in state.pending()):
+            process_jobs(state, node, wallet, args.b3_confirmations, False,
+                         args.max_fee_atoms, args.daily_fee_budget_atoms)
+            return
+
+        current_execution = quantity(info.get("finalized_execution_block", 0))
+        # This is a conservative scheduling threshold, not a consensus rule.
+        # Once caught up, let already-covered deposits use the finalized store
+        # before enqueuing another optional refresh and waiting for it again.
+        scan_due = (store_snapshot is not None and
+                    0 <= proven_number - current_execution <= 128 and
+                    (state.cursor() <= current_execution or
+                     any(row["block_number"] <= current_execution
+                         for row in state.unplanned())))
+        if scan_due:
+            frozen = (common[0], None, [], None, current_execution,
+                      norm_hex(info["finalized_execution_hash"], 32),
+                      store_snapshot)
+            frozen_dir = Path(args.work_root) / "finalized-scan"
+            write_common(frozen_dir, frozen)
+            with contextlib.suppress(FileNotFoundError):
+                (frozen_dir / "receipt_proof.json").unlink()
+            frozen_plan = emit_plan(args.payload_tool, frozen_dir)
+            if (select_records(frozen_plan, info, prefix) or
+                    plan_finalized_execution(frozen_plan) != frozen[4:6]):
+                raise RelayerError("finalized-only scan plan changed the B3 light-client store")
+            latest_info = node.call("getbridgeinfo")
+            latest_store = validate_store_snapshot(
+                node.call("getbridgelightclientstore"), latest_info)
+            if (bridge_identity(latest_info, eth_chain, args.trusted_root) != identity or
+                    store_snapshot_fingerprint(latest_store) !=
+                    store_snapshot_fingerprint(store_snapshot)):
+                raise RelayerError("B3 store changed before finalized-only scanning")
+            state.coalesce_verified_sync_plan([])
+            if state.first() is not None:
+                # A signed/in-flight job was preserved. Finish it, never
+                # replace it or construct a proof against a mixed store.
+                process_jobs(state, node, wallet, args.b3_confirmations, False,
+                             args.max_fee_atoms, args.daily_fee_budget_atoms)
+                return
+            scan_deposits(args, state, eth, witnesses, node, wallet, prefix,
+                          info, identity, frozen)
+            return
+        coalesced = state.coalesce_verified_sync_plan(sync_records)
+        if coalesced["superseded"] or coalesced["reactivated"]:
+            log("verified_sync_queue_coalesced", **coalesced)
+    else:
+        state.add_plan(sync_records)
     if args.dry_run and sync_records:
         # The verified sync records are intentionally not applied in dry-run
         # mode, so the B3 node cannot yet expose their retained execution
@@ -1670,6 +2051,13 @@ def run_once(args, state, eth, witnesses, node, wallet, prefix):
             return
         info = node.call("getbridgeinfo")
 
+    scan_deposits(args, state, eth, witnesses, node, wallet, prefix,
+                  info, identity, common)
+
+
+def scan_deposits(args, state, eth, witnesses, node, wallet, prefix,
+                  info, identity, common):
+    """Scan only authenticated history and submit its already-verified plans."""
     providers = [eth, *witnesses]
     anchor_cache = {}
 
@@ -1709,6 +2097,8 @@ def run_once(args, state, eth, witnesses, node, wallet, prefix):
     # advancing the cursor. New pages persist each Deposit and plan together.
     for dep_row in state.unplanned():
         dep = dict(dep_row)
+        if dep["block_number"] > common[4]:
+            continue  # A later LC refresh must cover this legacy preview row.
         # Legacy preview databases predate the explicit token field; the
         # immutable database identity already binds the configured token.
         dep["token"] = identity["token"]
