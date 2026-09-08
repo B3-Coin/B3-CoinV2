@@ -59,6 +59,7 @@ B3AssetRecord NativeRecord()
     record.available = 2'100'000'000'000'000LL;
     record.decimals = 9;
     record.metadata_known = true;
+    record.precision_known = true;
     record.status = B3AssetRecord::Status::Native;
     return record;
 }
@@ -99,6 +100,7 @@ void B3AssetTests::amountFormattingIsIntegerExact()
     QCOMPARE(B3AssetTableModel::formatAmount(42, 0), QStringLiteral("42"));
     // Different precisions round-trip the raw integer faithfully.
     QCOMPARE(B3AssetTableModel::formatAmount(123456, 3), QStringLiteral("123.456"));
+    QCOMPARE(B3AssetTableModel::formatAmount(1, 18), QStringLiteral("0.000000000000000001"));
 }
 
 void B3AssetTests::walletAssetRecordsExposeFnAndColoredAssets()
@@ -148,6 +150,7 @@ void B3AssetTests::walletAssetRecordsExposeFnAndColoredAssets()
     QCOMPARE(records.at(2).available, 12'000);
     QCOMPARE(records.at(2).decimals, 0);
     QVERIFY(!records.at(2).metadata_known);
+    QVERIFY(!records.at(2).precision_known);
     QVERIFY(!records.at(2).is_fn);
 
     QCOMPARE(records.at(3).ticker, QStringLiteral("bUSD"));
@@ -156,6 +159,152 @@ void B3AssetTests::walletAssetRecordsExposeFnAndColoredAssets()
     QCOMPARE(records.at(3).available, 1'250'000);
     QVERIFY(records.at(3).metadata_known);
     QVERIFY(records.at(3).is_bridge);
+}
+
+void B3AssetTests::registeredAssetUsesVerifiedPrecision()
+{
+    interfaces::WalletAssetBalance balance;
+    balance.asset_id = uint256::FromHex("43d4555d04fdb78726381db4e8340c6f59e5761f2945d634aef0a5d4a3c3a299").value();
+    balance.confirmed = 1'000'000'000'000;
+    balance.spendable = balance.confirmed;
+    balance.display_name = "Test USD";
+    balance.ticker = "tUSD";
+    balance.decimals = 6;
+    balance.metadata_source = "bundled-registry";
+    balance.is_test_asset = true;
+    const auto records{B3NativeAssetSource::recordsForBalances({}, {balance})};
+    QCOMPARE(records.size(), 2);
+    const B3AssetRecord& asset{records.at(1)};
+    QVERIFY(asset.metadata_known);
+    QVERIFY(asset.precision_known);
+    QVERIFY(asset.is_test_asset);
+    QCOMPARE(asset.display_name, QStringLiteral("Test USD"));
+    QCOMPARE(asset.ticker, QStringLiteral("tUSD"));
+    QCOMPARE(asset.decimals, 6);
+    QCOMPARE(asset.available, 1'000'000'000'000);
+
+    B3AssetsPage page;
+    TestAssetSource source;
+    source.set({asset});
+    page.setSource(&source);
+    QCOMPARE(page.model()->index(0, B3AssetTableModel::Name).data().toString(), QStringLiteral("Test USD"));
+    QCOMPARE(page.model()->index(0, B3AssetTableModel::Available).data().toString(),
+             QStringLiteral("1\u2009000\u2009000.000000"));
+    QVERIFY(page.findChild<QLabel*>("assetStatus")->text().contains(QStringLiteral("Unbacked test asset")));
+    QCOMPARE(page.findChild<QLabel*>("assetId")->text(), QStringLiteral("Asset ID: %1").arg(asset.asset_id));
+    page.findChild<QLineEdit*>("assetSearch")->setText(QStringLiteral("tUSD"));
+    QCOMPARE(page.findChild<QTableView*>("assetList")->model()->rowCount(), 1);
+    // Display metadata must not turn disconnected trading controls on.
+    QVERIFY(!page.findChild<QPushButton*>("assetDeposit")->isEnabled());
+    QVERIFY(!page.findChild<QPushButton*>("assetSend")->isEnabled());
+    const QString preview{qEnvironmentVariable("B3_ASSET_PREVIEW_PNG")};
+    if (!preview.isEmpty()) {
+        page.resize(1200, 850);
+        page.show();
+        QCoreApplication::processEvents();
+        QVERIFY(page.grab().save(preview));
+    }
+    page.setSource(nullptr);
+}
+
+void B3AssetTests::precisionWithoutNameRemainsDistinctFromUnknown()
+{
+    interfaces::WalletAssetBalance balance;
+    balance.asset_id = uint256::FromHex(std::string(64, '3')).value();
+    balance.spendable = 12'345;
+    balance.decimals = 6;
+    balance.metadata_source = "wallet-issuance";
+    auto asset{B3NativeAssetSource::recordsForBalances({}, {balance}).at(1)};
+    QVERIFY(asset.precision_known);
+    QVERIFY(!asset.metadata_known);
+    QCOMPARE(B3AssetTableModel::assetName(asset), QStringLiteral("Unnamed asset"));
+    QCOMPARE(B3AssetTableModel::formatAmount(asset.available, asset.decimals), QStringLiteral("0.012345"));
+
+    balance.decimals = 0;
+    asset = B3NativeAssetSource::recordsForBalances({}, {balance}).at(1);
+    QVERIFY(asset.precision_known);
+    QCOMPARE(asset.decimals, 0);
+    balance.decimals.reset();
+    asset = B3NativeAssetSource::recordsForBalances({}, {balance}).at(1);
+    QVERIFY(!asset.precision_known);
+    QCOMPARE(B3AssetTableModel::assetName(asset), QStringLiteral("Unknown asset"));
+
+    // Invalid precision cannot enable a plausible-looking label or scale.
+    balance.display_name = "False label";
+    balance.ticker = "FALSE";
+    for (const int bad : {-1, 19}) {
+        balance.decimals = bad;
+        asset = B3NativeAssetSource::recordsForBalances({}, {balance}).at(1);
+        QVERIFY(!asset.precision_known);
+        QVERIFY(!asset.metadata_known);
+        QCOMPARE(asset.decimals, 0);
+    }
+}
+
+void B3AssetTests::metadataRefreshUpdatesDisplayWithoutChangingBalances()
+{
+    interfaces::WalletAssetBalance balance;
+    balance.asset_id = uint256::FromHex(std::string(64, '4')).value();
+    balance.spendable = 2'500'000;
+    B3AssetsPage page;
+    TestAssetSource source;
+    source.set({B3NativeAssetSource::recordsForBalances({}, {balance}).at(1)});
+    page.setSource(&source);
+    QCOMPARE(page.model()->index(0, B3AssetTableModel::Name).data().toString(), QStringLiteral("Unknown asset"));
+    QSignalSpy reset_spy(page.model(), &QAbstractItemModel::modelReset);
+    balance.display_name = "Example Asset";
+    balance.ticker = "EXAMPLE";
+    balance.decimals = 6;
+    balance.metadata_source = "local-registry";
+    source.set({B3NativeAssetSource::recordsForBalances({}, {balance}).at(1)});
+    QCOMPARE(reset_spy.count(), 1);
+    QCOMPARE(page.model()->index(0, B3AssetTableModel::Name).data().toString(), QStringLiteral("Example Asset"));
+    QCOMPARE(page.model()->index(0, B3AssetTableModel::Available).data().toString(), QStringLiteral("2.500000"));
+    QCOMPARE(page.model()->recordAt(0).available, balance.spendable);
+    QVERIFY(page.findChild<QLabel*>("assetStatus")->text().contains(QStringLiteral("Local asset label")));
+    QCOMPARE(page.findChild<QTableView*>("assetList")->currentIndex().data(B3AssetTableModel::AssetIdRole).toString(),
+             QString::fromStdString(balance.asset_id.GetHex()));
+    page.setSource(nullptr);
+}
+
+void B3AssetTests::assetLabelsRenderAsPlainText()
+{
+    B3AssetRecord asset{NativeRecord()};
+    asset.asset_id = QString(64, QLatin1Char('5'));
+    asset.status = B3AssetRecord::Status::Active;
+    asset.display_name = QStringLiteral("<b>Untrusted label</b>");
+    B3AssetsPage page;
+    TestAssetSource source;
+    source.set({asset});
+    page.setSource(&source);
+    const QLabel* label{page.findChild<QLabel*>("assetName")};
+    QCOMPARE(label->textFormat(), Qt::PlainText);
+    QVERIFY(label->toolTip().contains(QStringLiteral("&lt;b&gt;")));
+    QVERIFY(!label->toolTip().contains(QStringLiteral("<b>")));
+    QVERIFY(page.model()->index(0, 0).data(Qt::ToolTipRole).toString().contains(QStringLiteral("&lt;b&gt;")));
+    page.setSource(nullptr);
+}
+
+void B3AssetTests::assetSendAllowsUnlockButRejectsWatchOnlyAndImmature()
+{
+    B3AssetRecord asset;
+    asset.status = B3AssetRecord::Status::Active;
+    asset.asset_id = QString(64, QLatin1Char('6'));
+    asset.confirmed = 1'000'000;
+    // Spending-locked wallets report available=0. Let them open the form and
+    // request the normal spending unlock; never treat cached available as a
+    // substitute for the backend's signing checks.
+    asset.available = 0;
+    QVERIFY(B3AssetsPage::canSendAsset(asset, true));
+    QVERIFY(!B3AssetsPage::canSendAsset(asset, false));
+    asset.immature = asset.confirmed;
+    QVERIFY(!B3AssetsPage::canSendAsset(asset, true));
+    asset.pending = 1;
+    QVERIFY(!B3AssetsPage::canSendAsset(asset, true)); // Send uses confirmed inputs.
+    asset.status = B3AssetRecord::Status::Unavailable;
+    QVERIFY(!B3AssetsPage::canSendAsset(asset, true));
+    asset.status = B3AssetRecord::Status::Native;
+    QVERIFY(!B3AssetsPage::canSendAsset(asset, true));
 }
 
 void B3AssetTests::assetIdSearchSelectsOwnedAsset()

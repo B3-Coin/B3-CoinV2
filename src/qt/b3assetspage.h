@@ -41,22 +41,30 @@ public:
     void setSource(B3AssetSource* source);
 
     B3AssetTableModel* model() const { return m_model; }
+    //! Locked signing wallets may prompt for unlock; watch-only wallets cannot send.
+    static bool canSendAsset(const B3AssetRecord& record, bool signing_wallet);
 
 Q_SIGNALS:
     void sendRequested();
     void receiveRequested();
+    void walletChanged();
 
 private Q_SLOTS:
     void updateDetails();
+    void sendSelectedAsset();
+    void receiveSelectedAsset();
 
 private:
     void resizeEvent(QResizeEvent* event) override;
     void reflowCards(int width);
+    B3AssetRecord selectedAsset() const;
 
     B3AssetTableModel* m_model{nullptr};
     QSortFilterProxyModel* m_proxy{nullptr};
     B3AssetSource* m_owned_source{nullptr};
     bool m_have_wallet{false};
+    QPointer<WalletModel> m_wallet_model;
+    bool m_action_open{false};
     bool m_model_resetting{false};
     QString m_selected_asset_id;
 

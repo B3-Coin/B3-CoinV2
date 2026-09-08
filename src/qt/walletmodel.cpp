@@ -33,6 +33,7 @@
 
 #include <QDebug>
 #include <QMessageBox>
+#include <QPointer>
 #include <QSet>
 #include <QTimer>
 
@@ -449,6 +450,10 @@ void WalletModel::unsubscribeFromCoreSignals()
 // WalletModel::UnlockContext implementation
 WalletModel::UnlockContext WalletModel::requestUnlock(const UnlockPurpose purpose)
 {
+    const QPointer<WalletModel> guard{this};
+    // Modal unlock callbacks can destroy the model while leaving its loaded
+    // backend alive. Keep the backend itself until lock restoration is settled.
+    const std::shared_ptr<interfaces::Wallet> backend{m_wallet};
     // Bugs in earlier versions may have resulted in wallets with private keys disabled to become "encrypted"
     // (encryption keys are present, but not actually doing anything).
     // To avoid issues with such wallets, check if the wallet has private keys disabled, and if so, return a context
@@ -458,6 +463,8 @@ WalletModel::UnlockContext WalletModel::requestUnlock(const UnlockPurpose purpos
     }
     const EncryptionStatus initial_status{getEncryptionStatus()};
     const bool was_locked{initial_status == Locked};
+    const bool relock_required{was_locked ||
+        (purpose == UnlockPurpose::StakingOnly && initial_status == Unlocked)};
     try {
         if (was_locked) {
             // Request UI to unlock wallet
@@ -467,28 +474,28 @@ WalletModel::UnlockContext WalletModel::requestUnlock(const UnlockPurpose purpos
                 Q_EMIT requireUnlock();
             }
         }
+        // A synchronous passphrase dialog can process wallet-removal events.
+        if (!guard) {
+            if (relock_required) backend->lock();
+            return UnlockContext(nullptr, /*valid=*/false, /*relock=*/false);
+        }
         // If still locked, the unlock failed or was cancelled.
         const bool valid{getEncryptionStatus() != Locked};
 
         // This is the normal core wallet lock, not a UI-only spending restriction.
         // An unencrypted wallet cannot offer password-protected staking-only use.
-        const bool relock{was_locked ||
-                          (purpose == UnlockPurpose::StakingOnly && initial_status == Unlocked)};
-        return UnlockContext(this, valid, relock);
+        return UnlockContext(this, valid, relock_required);
     } catch (...) {
         // The synchronous prompt can unlock before throwing, while no
-        // UnlockContext has been returned yet. Preserve the staking-only
-        // relock guarantee at this boundary as well as during the operation.
-        if (purpose == UnlockPurpose::StakingOnly &&
-            (initial_status == Locked || initial_status == Unlocked)) {
-            setWalletLocked(true);
-        }
+        // UnlockContext has been returned yet. Restore the actual backend
+        // even if the same callback also deleted the Qt model.
+        if (relock_required) backend->lock();
         throw;
     }
 }
 
 WalletModel::UnlockContext::UnlockContext(WalletModel *_wallet, bool _valid, bool _relock):
-        wallet(_wallet),
+        relock_wallet(_wallet && _valid && _relock ? _wallet->m_wallet : nullptr),
         valid(_valid),
         relock(_relock)
 {
@@ -496,9 +503,11 @@ WalletModel::UnlockContext::UnlockContext(WalletModel *_wallet, bool _valid, boo
 
 WalletModel::UnlockContext::~UnlockContext()
 {
-    if(valid && relock)
+    if(relock_wallet && valid && relock)
     {
-        wallet->setWalletLocked(true);
+        // Core notifications update any remaining views; no Qt model access
+        // is needed and its deletion must never suppress spending relock.
+        relock_wallet->lock();
     }
 }
 

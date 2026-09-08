@@ -13,6 +13,7 @@
 #include <primitives/transaction_identifier.h>
 #include <support/allocators/secure.h>
 
+#include <memory>
 #include <vector>
 
 #include <QObject>
@@ -122,7 +123,9 @@ public:
         UnlockContext& operator=(UnlockContext&&) = delete;
 
     private:
-        WalletModel *wallet;
+        //! Retain only the backend needed to restore spending lock state even
+        //! when a modal callback or wallet unload destroys the Qt model first.
+        std::shared_ptr<interfaces::Wallet> relock_wallet;
         const bool valid;
         const bool relock;
     };
@@ -165,7 +168,8 @@ public:
     CAmount getAvailableBalance(const wallet::CCoinControl* control);
 
 private:
-    std::unique_ptr<interfaces::Wallet> m_wallet;
+    //! Unlock contexts may outlive this Qt model while restoring backend state.
+    std::shared_ptr<interfaces::Wallet> m_wallet;
     std::unique_ptr<interfaces::Handler> m_handler_unload;
     std::unique_ptr<interfaces::Handler> m_handler_status_changed;
     std::unique_ptr<interfaces::Handler> m_handler_address_book_changed;

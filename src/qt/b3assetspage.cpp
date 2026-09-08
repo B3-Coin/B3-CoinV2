@@ -8,9 +8,18 @@
 
 #include <qt/b3assetspage.h>
 
+#include <qt/b3assetsenddialog.h>
 #include <qt/b3theme.h>
+#include <qt/guiutil.h>
 #include <qt/walletmodel.h>
 
+#include <interfaces/wallet.h>
+#include <key_io.h>
+#include <outputtype.h>
+#include <util/result.h>
+
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QFontMetrics>
 #include <QFrame>
 #include <QGridLayout>
@@ -18,6 +27,7 @@
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QScrollArea>
@@ -25,6 +35,9 @@
 #include <QSortFilterProxyModel>
 #include <QTableView>
 #include <QVBoxLayout>
+
+#include <optional>
+#include <string>
 
 namespace {
 QLabel* makeDetailValue(QWidget* parent)
@@ -171,11 +184,15 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
         detailLayout->addWidget(detailEyebrow);
 
         m_detail_name = new QLabel(m_detail_card);
+        m_detail_name->setObjectName(QStringLiteral("assetName"));
+        m_detail_name->setTextFormat(Qt::PlainText);
         B3Theme::markTextRole(m_detail_name, QStringLiteral("h2"));
         m_detail_name->setTextInteractionFlags(Qt::TextSelectableByMouse);
         detailLayout->addWidget(m_detail_name);
 
         m_detail_status = new QLabel(m_detail_card);
+        m_detail_status->setTextFormat(Qt::PlainText);
+        m_detail_status->setWordWrap(true);
         m_detail_status->setObjectName(QStringLiteral("assetStatus"));
         B3Theme::markTextRole(m_detail_status, QStringLiteral("status"));
         detailLayout->addWidget(m_detail_status);
@@ -241,8 +258,8 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
 
         detailLayout->addStretch();
 
-        connect(m_send, &QPushButton::clicked, this, &B3AssetsPage::sendRequested);
-        connect(m_receive, &QPushButton::clicked, this, &B3AssetsPage::receiveRequested);
+        connect(m_send, &QPushButton::clicked, this, &B3AssetsPage::sendSelectedAsset);
+        connect(m_receive, &QPushButton::clicked, this, &B3AssetsPage::receiveSelectedAsset);
         // Deposit/withdraw stay disconnected as well as disabled: there is
         // no backend to submit to.
     }
@@ -284,6 +301,18 @@ void B3AssetsPage::reflowCards(int width)
 
 void B3AssetsPage::setWalletModel(WalletModel* wallet_model)
 {
+    Q_EMIT walletChanged();
+    if (m_wallet_model) disconnect(m_wallet_model, nullptr, this, nullptr);
+    m_wallet_model = wallet_model;
+    if (wallet_model) {
+        connect(wallet_model, &WalletModel::canGetAddressesChanged, this, &B3AssetsPage::updateDetails);
+        connect(wallet_model, &QObject::destroyed, this, [this] {
+            m_wallet_model = nullptr;
+            m_have_wallet = false;
+            Q_EMIT walletChanged();
+            updateDetails();
+        });
+    }
     m_have_wallet = wallet_model != nullptr;
     B3AssetSource* old = m_owned_source;
     if (m_have_wallet) {
@@ -300,6 +329,9 @@ void B3AssetsPage::setWalletModel(WalletModel* wallet_model)
 
 void B3AssetsPage::setSource(B3AssetSource* source)
 {
+    Q_EMIT walletChanged();
+    if (m_wallet_model) disconnect(m_wallet_model, nullptr, this, nullptr);
+    m_wallet_model = nullptr;
     B3AssetSource* old = m_owned_source;
     m_owned_source = nullptr;
     m_have_wallet = source != nullptr;
@@ -369,10 +401,12 @@ void B3AssetsPage::updateDetails()
         return;
     }
 
-    const QString name = record.metadata_known ? record.display_name : tr("Unknown asset");
+    const QString name{B3AssetTableModel::assetName(record)};
     QFontMetrics fm(m_detail_name->font());
     m_detail_name->setText(fm.elidedText(name + QStringLiteral(" (") + record.ticker + QStringLiteral(")"),
                                          Qt::ElideMiddle, 320));
+    m_detail_name->setToolTip(QStringLiteral("<qt>%1</qt>")
+        .arg(QString{name + QStringLiteral(" (") + record.ticker + QStringLiteral(")")}.toHtmlEscaped()));
     switch (record.status) {
     case B3AssetRecord::Status::Native:
         m_detail_status->setText(tr("Native coin · real wallet balance"));
@@ -384,8 +418,14 @@ void B3AssetsPage::updateDetails()
                 : tr("FN Coin"));
         } else if (record.is_bridge) {
             m_detail_status->setText(tr("Bridged USD · exact six-decimal units"));
+        } else if (record.is_test_asset) {
+            m_detail_status->setText(tr("Unbacked test asset · %1 decimal places").arg(record.decimals));
+        } else if (record.precision_known) {
+            m_detail_status->setText(record.metadata_source == QStringLiteral("local-registry")
+                ? tr("Local asset label · verified precision (%1 decimals)").arg(record.decimals)
+                : tr("Coloured asset · verified precision (%1 decimals)").arg(record.decimals));
         } else {
-            m_detail_status->setText(tr("Coloured asset · exact raw units"));
+            m_detail_status->setText(tr("Metadata unavailable · showing exact raw units"));
         }
         break;
     case B3AssetRecord::Status::Unavailable:
@@ -404,11 +444,14 @@ void B3AssetsPage::updateDetails()
     m_detail_reserved->setText(record.reserved_available ? amount(record.reserved) : tr("Not available"));
     m_detail_flowmesh->setText(record.flowmesh_available ? amount(record.flowmesh) : tr("Not available"));
 
-    // Only native B3 with a wallet attached can act; everything else is
-    // visibly disabled with the reason stated.
+    // Native actions keep their existing pages. Asset sends use a separate
+    // exact-unit confirmation flow and never pass through the native B3 form.
     const bool native = record.status == B3AssetRecord::Status::Native;
-    m_send->setEnabled(native && m_have_wallet);
-    m_receive->setEnabled(native && m_have_wallet);
+    const bool signing_wallet{m_wallet_model && !m_wallet_model->wallet().privateKeysDisabled()};
+    m_send->setEnabled(!m_action_open && ((native && m_have_wallet) || canSendAsset(record, signing_wallet)));
+    m_receive->setEnabled(!m_action_open && ((native && m_have_wallet) ||
+        (m_wallet_model && m_wallet_model->wallet().canGetAddresses() &&
+         record.status == B3AssetRecord::Status::Active)));
 
     // The model can expose FlowMesh balances, but this page has no approved
     // deposit/withdraw submission path yet. Never turn disconnected buttons
@@ -423,6 +466,134 @@ void B3AssetsPage::updateDetails()
     m_activity_note->setVisible(true);
     m_activity_note->setText(native
         ? tr("Native B3 transactions are listed on the Activity page.")
-        : tr("This balance comes directly from wallet-owned asset outputs. "
-             "Asset transfer controls remain available through the console in this beta."));
+        : tr("Send transfers only the selected asset; a small native B3 balance pays the network fee. "
+             "Receive creates a B3 address and shows the full asset ID for the sender. "
+             "Names are labels, not a guarantee of backing."));
+}
+
+bool B3AssetsPage::canSendAsset(const B3AssetRecord& record, const bool signing_wallet)
+{
+    return signing_wallet && record.status == B3AssetRecord::Status::Active &&
+           !record.asset_id.isEmpty() &&
+           record.confirmed > record.immature;
+}
+
+B3AssetRecord B3AssetsPage::selectedAsset() const
+{
+    const QModelIndex current{m_list->currentIndex()};
+    return current.isValid() ? m_model->recordAt(m_proxy->mapToSource(current).row()) : B3AssetRecord{};
+}
+
+void B3AssetsPage::sendSelectedAsset()
+{
+    if (m_action_open) return;
+    const auto record{selectedAsset()};
+    if (record.status == B3AssetRecord::Status::Native && m_have_wallet) {
+        Q_EMIT sendRequested();
+        return;
+    }
+    if (!m_wallet_model || !canSendAsset(record, !m_wallet_model->wallet().privateKeysDisabled())) return;
+    m_action_open = true;
+    updateDetails();
+    QPointer<B3AssetsPage> self{this};
+    QPointer<B3AssetSendDialog> dialog{new B3AssetSendDialog(m_wallet_model, record, this)};
+    connect(this, &B3AssetsPage::walletChanged, dialog, &B3AssetSendDialog::cancelAndWait);
+    dialog->exec();
+    if (dialog) dialog->deleteLater();
+    if (self) {
+        m_action_open = false;
+        updateDetails();
+    }
+}
+
+void B3AssetsPage::receiveSelectedAsset()
+{
+    if (m_action_open) return;
+    const auto record{selectedAsset()};
+    if (record.status == B3AssetRecord::Status::Native && m_have_wallet) {
+        Q_EMIT receiveRequested();
+        return;
+    }
+    const QPointer<WalletModel> wallet_model{m_wallet_model};
+    if (!wallet_model || !wallet_model->wallet().canGetAddresses() ||
+        record.status != B3AssetRecord::Status::Active) return;
+    m_action_open = true;
+    updateDetails();
+    QPointer<B3AssetsPage> self{this};
+    // A normal owner address can receive policy assets. Never invent a token
+    // payment URI which an older wallet might interpret as a native B3 send.
+    std::optional<CTxDestination> destination;
+    std::string destination_error;
+    const auto create_destination = [&] {
+        const auto result{wallet_model->wallet().getNewDestination(
+            OutputType::LEGACY, "Asset receive " + record.asset_id.toStdString())};
+        if (result) {
+            destination = *result;
+        } else {
+            destination_error = util::ErrorString(result).original;
+        }
+    };
+    create_destination();
+    if (!destination && wallet_model->getEncryptionStatus() == WalletModel::Locked) {
+        // A locked wallet can normally use its public keypool. If that pool
+        // is exhausted, follow native Receive's temporary-unlock path.
+        const auto unlock{wallet_model->requestUnlock()};
+        if (!self) return;
+        if (!wallet_model || m_wallet_model != wallet_model || !unlock.isValid()) {
+            m_action_open = false;
+            updateDetails();
+            return;
+        }
+        create_destination();
+    }
+    if (!destination) {
+        QPointer<QMessageBox> error{new QMessageBox(QMessageBox::Warning, tr("Unable to create receive address"),
+            QString::fromStdString(destination_error), QMessageBox::Ok, this)};
+        error->setTextFormat(Qt::PlainText);
+        connect(this, &B3AssetsPage::walletChanged, error, &QDialog::reject);
+        error->exec();
+        if (error) error->deleteLater();
+        if (self) {
+            m_action_open = false;
+            updateDetails();
+        }
+        return;
+    }
+    const QString address{QString::fromStdString(EncodeDestination(*destination))};
+    QPointer<QDialog> dialog{new QDialog(this, GUIUtil::dialog_flags)};
+    dialog->setWindowTitle(tr("Receive %1").arg(record.ticker));
+    dialog->setMinimumWidth(560);
+    auto* layout{new QVBoxLayout(dialog)};
+    const auto add_text = [&](const QString& text) {
+        auto* label{new QLabel(text, dialog)};
+        label->setTextFormat(Qt::PlainText);
+        label->setWordWrap(true);
+        label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        layout->addWidget(label);
+    };
+    add_text(tr("Wallet: %1").arg(QString::fromStdString(wallet_model->wallet().getWalletName())));
+    add_text(B3AssetTableModel::assetName(record) + QStringLiteral(" (") + record.ticker + QStringLiteral(")"));
+    add_text(tr("Asset ID: %1").arg(record.asset_id));
+    add_text(tr("B3 receiving address:"));
+    auto* address_field{new QLineEdit(address, dialog)};
+    address_field->setObjectName(QStringLiteral("assetReceiveAddress"));
+    address_field->setReadOnly(true);
+    layout->addWidget(address_field);
+    add_text(tr("Give the sender this address AND the full asset ID. They must send the selected asset, "
+                "not native B3 or a token on another network. Creating this address spends no coins."));
+    if (record.is_test_asset) add_text(tr("Unbacked test asset — no dollar redemption is promised."));
+    auto* buttons{new QDialogButtonBox(QDialogButtonBox::Close, dialog)};
+    auto* copy_address{buttons->addButton(tr("Copy address"), QDialogButtonBox::ActionRole)};
+    auto* copy_asset{buttons->addButton(tr("Copy asset ID"), QDialogButtonBox::ActionRole)};
+    connect(copy_address, &QPushButton::clicked, dialog, [address] { GUIUtil::setClipboard(address); });
+    connect(copy_asset, &QPushButton::clicked, dialog, [record] { GUIUtil::setClipboard(record.asset_id); });
+    connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
+    connect(this, &B3AssetsPage::walletChanged, dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    dialog->exec();
+    if (dialog) dialog->deleteLater();
+    if (self) {
+        m_action_open = false;
+        updateDetails();
+    }
 }

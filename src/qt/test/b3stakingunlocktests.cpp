@@ -6,8 +6,10 @@
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
+#include <key_io.h>
 #include <qt/askpassphrasedialog.h>
 #include <qt/b3assetspage.h>
+#include <qt/b3assetsenddialog.h>
 #include <qt/b3shell.h>
 #include <qt/b3stakepage.h>
 #include <qt/b3theme.h>
@@ -23,10 +25,12 @@
 #include <qt/walletview.h>
 #include <test/util/setup_common.h>
 #include <wallet/test/util.h>
+#include <wallet/context.h>
 #include <wallet/wallet.h>
 
 #include <QApplication>
 #include <QComboBox>
+#include <QDialog>
 #include <QImage>
 #include <QLabel>
 #include <QLineEdit>
@@ -34,7 +38,9 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalSpy>
+#include <QStringList>
 #include <QTableView>
+#include <QThread>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTimer>
@@ -58,6 +64,47 @@ SecureString Passphrase()
 {
     return SecureString{TEST_PASSPHRASE};
 }
+
+//! Only the selected display row is synthetic. Receive uses the real isolated
+//! wallet's keypool/address book, without requiring issuance, funding or mining.
+class ReceiveAssetSource final : public B3AssetSource
+{
+public:
+    B3AssetRecord record;
+
+    ReceiveAssetSource()
+    {
+        record.asset_id = QString(64, QLatin1Char('7'));
+        record.display_name = QStringLiteral("Receive fixture token");
+        record.ticker = QStringLiteral("RCV");
+        record.decimals = 6;
+        record.precision_known = true;
+        record.metadata_known = true;
+        record.status = B3AssetRecord::Status::Active;
+    }
+
+    QList<B3AssetRecord> assets() const override { return {record}; }
+    bool coloredAssetsAvailable() const override { return true; }
+    bool flowMeshAvailable() const override { return false; }
+};
+
+//! Make only this mock wallet discoverable to the send dialog's backend lookup.
+//! This is an in-memory fixture registration, not a wallet load or node start.
+struct ScopedFixtureWalletRegistration {
+    wallet::WalletContext& context;
+    std::shared_ptr<wallet::CWallet> registered_wallet;
+
+    ScopedFixtureWalletRegistration(wallet::WalletContext& context_in,
+                                     std::shared_ptr<wallet::CWallet> wallet_in)
+        : context{context_in}, registered_wallet{std::move(wallet_in)}
+    {
+        WITH_LOCK(context.wallets_mutex, context.wallets.push_back(registered_wallet));
+    }
+    ~ScopedFixtureWalletRegistration()
+    {
+        WITH_LOCK(context.wallets_mutex, std::erase(context.wallets, registered_wallet));
+    }
+};
 } // namespace
 
 class B3StakingUnlockTests : public QObject
@@ -345,6 +392,260 @@ private Q_SLOTS:
             QCOMPARE(general.count(), 0);
             QCOMPARE(staking.count(), 0);
         }
+    }
+
+    void unlockContextRelocksBackendAfterWalletModelDeletion()
+    {
+        const auto wallet{MakeWallet(true, "unlock-context-model-lifetime")};
+        auto model{MakeModel(wallet)};
+        QVERIFY(model->setWalletEncrypted(Passphrase()));
+        QVERIFY(wallet->IsLocked());
+        bool prompt_seen{false};
+        bool unlocked{false};
+        connect(model.get(), &WalletModel::requireUnlock, this, [&] {
+            prompt_seen = true;
+            unlocked = model->setWalletLocked(false, Passphrase());
+        });
+        {
+            auto unlock{model->requestUnlock()};
+            QVERIFY(unlock.isValid());
+            QVERIFY(prompt_seen && unlocked);
+            QVERIFY(!wallet->IsLocked());
+            // The underlying wallet intentionally outlives its Qt model.
+            // Destroying the context must still restore its prior lock state.
+            model.reset();
+        }
+        const bool relocked{wallet->IsLocked()};
+        wallet->Lock(); // Keep fixture cleanup safe even if the assertion fails.
+        QVERIFY(relocked);
+    }
+
+    void walletModelDeletionInsideUnlockPromptFailsClosed()
+    {
+        const auto wallet{MakeWallet(true, "unlock-prompt-model-lifetime")};
+        auto model{MakeModel(wallet)};
+        QVERIFY(model->setWalletEncrypted(Passphrase()));
+        QVERIFY(wallet->IsLocked());
+        bool prompt_seen{false};
+        bool unlocked{false};
+        connect(model.get(), &WalletModel::requireUnlock, this, [&] {
+            prompt_seen = true;
+            unlocked = model->setWalletLocked(false, Passphrase());
+            // Equivalent to an unload event processed by a modal prompt.
+            model.reset();
+        });
+        bool valid{true};
+        {
+            auto unlock{model->requestUnlock()};
+            valid = unlock.isValid();
+        }
+        const bool relocked{wallet->IsLocked()};
+        wallet->Lock();
+        QVERIFY(prompt_seen && unlocked);
+        QVERIFY(!model);
+        QVERIFY(!valid);
+        QVERIFY(relocked);
+    }
+
+    void assetSendCancelsWhenWalletChangesDuringUnlock()
+    {
+        const auto first_wallet{MakeWallet(true, "asset-send-before-switch")};
+        const auto second_wallet{MakeWallet(true, "asset-send-after-switch")};
+        const auto first_model{MakeModel(first_wallet)};
+        const auto second_model{MakeModel(second_wallet)};
+        QVERIFY(first_model->setWalletEncrypted(Passphrase()));
+        QVERIFY(first_wallet->IsLocked());
+        const auto recipient{second_model->wallet().getNewDestination(OutputType::LEGACY, "offline-send-cancel")};
+        QVERIFY(recipient.has_value());
+        const QString recipient_address{QString::fromStdString(EncodeDestination(*recipient))};
+        const auto first_transactions{WITH_LOCK(first_wallet->cs_wallet, return first_wallet->mapWallet.size())};
+        const auto second_transactions{WITH_LOCK(second_wallet->cs_wallet, return second_wallet->mapWallet.size())};
+        ScopedFixtureWalletRegistration registration{*m_loader->context(), first_wallet};
+
+        ReceiveAssetSource source;
+        source.record.confirmed = 1'000'000; // Display-only input; neither wallet owns any coins.
+        B3AssetsPage page;
+        page.setWalletModel(first_model.get());
+        page.model()->setSource(&source);
+        page.show();
+        auto* send{page.findChild<QPushButton*>(QStringLiteral("assetSend"))};
+        QVERIFY(send && send->isEnabled());
+        QSignalSpy native_send{&page, &B3AssetsPage::sendRequested};
+        bool prompt_seen{false};
+        bool unlocked{false};
+        connect(first_model.get(), &WalletModel::requireUnlock, &page, [&] {
+            prompt_seen = true;
+            unlocked = first_model->setWalletLocked(false, Passphrase());
+            page.setWalletModel(second_model.get());
+        });
+
+        bool dialog_seen{false};
+        bool closed_by_switch{false};
+        bool worker_started{true};
+        int submitted{-1};
+        int uncertain{-1};
+        QTimer prepare;
+        prepare.setSingleShot(true);
+        connect(&prepare, &QTimer::timeout, &page, [&] {
+            QPointer<B3AssetSendDialog> dialog{page.findChild<B3AssetSendDialog*>()};
+            if (!dialog) {
+                if (auto* modal{qobject_cast<QDialog*>(QApplication::activeModalWidget())}) modal->reject();
+                return;
+            }
+            dialog_seen = true;
+            QSignalSpy submitted_spy{dialog, &B3AssetSendDialog::transactionSubmitted};
+            QSignalSpy uncertain_spy{dialog, &B3AssetSendDialog::submissionUncertain};
+            auto* address{dialog->findChild<QLineEdit*>(QStringLiteral("assetRecipient"))};
+            auto* amount{dialog->findChild<QLineEdit*>(QStringLiteral("assetAmount"))};
+            auto* action{dialog->findChild<QPushButton*>(QStringLiteral("assetSendAction"))};
+            if (address && amount && action) {
+                address->setText(recipient_address);
+                amount->setText(QStringLiteral("1"));
+                QTest::mouseClick(action, Qt::LeftButton);
+            }
+            closed_by_switch = !dialog || !dialog->isVisible();
+            worker_started = dialog && !dialog->findChildren<QThread*>().isEmpty();
+            submitted = submitted_spy.count();
+            uncertain = uncertain_spy.count();
+            // On a regression, drain any worker before leaving the fixture.
+            // No submit confirmation is ever given, and both wallets are empty.
+            if (dialog && dialog->isVisible()) dialog->cancelAndWait();
+        });
+        prepare.start(0);
+        QTest::mouseClick(send, Qt::LeftButton);
+        prepare.stop();
+        const bool relocked{first_wallet->IsLocked()};
+        first_wallet->Lock();
+
+        QVERIFY(dialog_seen);
+        QVERIFY(prompt_seen && unlocked);
+        QVERIFY(closed_by_switch);
+        QVERIFY(!worker_started);
+        QVERIFY(relocked);
+        QCOMPARE(submitted, 0);
+        QCOMPARE(uncertain, 0);
+        QCOMPARE(native_send.count(), 0);
+        QCOMPARE(WITH_LOCK(first_wallet->cs_wallet, return first_wallet->mapWallet.size()), first_transactions);
+        QCOMPARE(WITH_LOCK(second_wallet->cs_wallet, return second_wallet->mapWallet.size()), second_transactions);
+    }
+
+    void assetReceiveUsesSelectedWalletWithoutNativeRoutingOrTransactions()
+    {
+        const auto first_wallet{MakeWallet(true, "asset-receive-selected")};
+        const auto second_wallet{MakeWallet(true, "asset-receive-other")};
+        const auto first_model{MakeModel(first_wallet)};
+        const auto second_model{MakeModel(second_wallet)};
+        const auto first_addresses{first_model->wallet().getAddresses().size()};
+        const auto second_addresses{second_model->wallet().getAddresses().size()};
+        const auto first_transactions{WITH_LOCK(first_wallet->cs_wallet, return first_wallet->mapWallet.size())};
+        const auto second_transactions{WITH_LOCK(second_wallet->cs_wallet, return second_wallet->mapWallet.size())};
+
+        ReceiveAssetSource source;
+        B3AssetsPage page;
+        page.setWalletModel(first_model.get());
+        // B3AssetsPage::setSource deliberately detaches its wallet. Override
+        // only the display model, retaining the actual selected-wallet action.
+        page.model()->setSource(&source);
+        page.show();
+        auto* receive{page.findChild<QPushButton*>(QStringLiteral("assetReceive"))};
+        QVERIFY(receive && receive->isEnabled());
+        QSignalSpy native_receive{&page, &B3AssetsPage::receiveRequested};
+        QSignalSpy unlock{first_model.get(), &WalletModel::requireUnlock};
+        bool dialog_seen{false};
+        bool address_read_only{false};
+        QString address;
+        QStringList labels;
+        QTimer close_dialog;
+        close_dialog.setSingleShot(true);
+        connect(&close_dialog, &QTimer::timeout, &page, [&] {
+            auto* dialog{qobject_cast<QDialog*>(QApplication::activeModalWidget())};
+            if (!dialog) dialog = page.findChild<QDialog*>();
+            if (!dialog) return;
+            dialog_seen = true;
+            if (auto* field{dialog->findChild<QLineEdit*>(QStringLiteral("assetReceiveAddress"))}) {
+                address = field->text();
+                address_read_only = field->isReadOnly();
+            }
+            for (const auto* label : dialog->findChildren<QLabel*>()) labels.push_back(label->text());
+            // Close even an unexpected error dialog before making assertions.
+            dialog->reject();
+        });
+        close_dialog.start(0);
+        QTest::mouseClick(receive, Qt::LeftButton);
+        close_dialog.stop();
+
+        QVERIFY(dialog_seen);
+        QVERIFY(address_read_only);
+        QVERIFY(!address.isEmpty());
+        QVERIFY(!address.contains(QLatin1Char(':'))); // No ambiguous native payment URI.
+        const auto destination{DecodeDestination(address.toStdString())};
+        QVERIFY(IsValidDestination(destination));
+        QVERIFY(first_model->wallet().isSpendable(destination));
+        QVERIFY(!second_model->wallet().isSpendable(destination));
+        QVERIFY(labels.contains(QStringLiteral("Asset ID: ") + source.record.asset_id));
+        QVERIFY(labels.contains(QStringLiteral("Wallet: asset-receive-selected")));
+        QCOMPARE(native_receive.count(), 0);
+        QCOMPARE(unlock.count(), 0);
+        QCOMPARE(first_model->wallet().getAddresses().size(), first_addresses + 1);
+        QCOMPARE(second_model->wallet().getAddresses().size(), second_addresses);
+        QCOMPARE(WITH_LOCK(first_wallet->cs_wallet, return first_wallet->mapWallet.size()), first_transactions);
+        QCOMPARE(WITH_LOCK(second_wallet->cs_wallet, return second_wallet->mapWallet.size()), second_transactions);
+        QVERIFY(receive->isEnabled());
+    }
+
+    void assetReceiveClosesWhenSelectedWalletChanges()
+    {
+        const auto first_wallet{MakeWallet(true, "asset-receive-before-switch")};
+        const auto second_wallet{MakeWallet(true, "asset-receive-after-switch")};
+        const auto first_model{MakeModel(first_wallet)};
+        const auto second_model{MakeModel(second_wallet)};
+        const auto first_addresses{first_model->wallet().getAddresses().size()};
+        const auto second_addresses{second_model->wallet().getAddresses().size()};
+        const auto first_transactions{WITH_LOCK(first_wallet->cs_wallet, return first_wallet->mapWallet.size())};
+        const auto second_transactions{WITH_LOCK(second_wallet->cs_wallet, return second_wallet->mapWallet.size())};
+
+        ReceiveAssetSource source;
+        B3AssetsPage page;
+        page.setWalletModel(first_model.get());
+        page.model()->setSource(&source);
+        page.show();
+        auto* receive{page.findChild<QPushButton*>(QStringLiteral("assetReceive"))};
+        QVERIFY(receive && receive->isEnabled());
+        QSignalSpy native_receive{&page, &B3AssetsPage::receiveRequested};
+        QSignalSpy wallet_changed{&page, &B3AssetsPage::walletChanged};
+        bool dialog_seen{false};
+        bool closed_by_switch{false};
+        QString address;
+        QTimer switch_wallet;
+        switch_wallet.setSingleShot(true);
+        connect(&switch_wallet, &QTimer::timeout, &page, [&] {
+            QPointer<QDialog> dialog{qobject_cast<QDialog*>(QApplication::activeModalWidget())};
+            if (!dialog) dialog = page.findChild<QDialog*>();
+            if (!dialog) return;
+            dialog_seen = true;
+            if (auto* field{dialog->findChild<QLineEdit*>(QStringLiteral("assetReceiveAddress"))}) {
+                address = field->text();
+            }
+            page.setWalletModel(second_model.get());
+            closed_by_switch = !dialog || !dialog->isVisible();
+            if (dialog && dialog->isVisible()) dialog->reject(); // Never hang on a regression.
+        });
+        switch_wallet.start(0);
+        QTest::mouseClick(receive, Qt::LeftButton);
+        switch_wallet.stop();
+
+        QVERIFY(dialog_seen);
+        QVERIFY(closed_by_switch);
+        QCOMPARE(wallet_changed.count(), 1);
+        QCOMPARE(native_receive.count(), 0);
+        const auto destination{DecodeDestination(address.toStdString())};
+        QVERIFY(IsValidDestination(destination));
+        QVERIFY(first_model->wallet().isSpendable(destination));
+        QVERIFY(!second_model->wallet().isSpendable(destination));
+        QCOMPARE(first_model->wallet().getAddresses().size(), first_addresses + 1);
+        QCOMPARE(second_model->wallet().getAddresses().size(), second_addresses);
+        QCOMPARE(WITH_LOCK(first_wallet->cs_wallet, return first_wallet->mapWallet.size()), first_transactions);
+        QCOMPARE(WITH_LOCK(second_wallet->cs_wallet, return second_wallet->mapWallet.size()), second_transactions);
     }
 
     void stakePageSurvivesWalletModelDestruction_data()

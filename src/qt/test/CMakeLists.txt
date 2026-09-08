@@ -56,6 +56,14 @@ if(ENABLE_WALLET)
     ENVIRONMENT "QT_QPA_PLATFORM=minimal"
   )
 
+  # Pure amount/transaction-review checks: no wallet, RPC, node or GUI startup.
+  add_executable(test_b3_assettransfer-qt b3assettransfertests.cpp)
+  target_link_libraries(test_b3_assettransfer-qt
+    core_interface bitcoinqt bitcoin_node univalue Qt6::Test
+  )
+  import_plugins(test_b3_assettransfer-qt)
+  add_test(NAME test_b3_assettransfer-qt COMMAND test_b3_assettransfer-qt)
+
   # Isolated encrypted-wallet staking unlock checks, with no mining/network.
   add_executable(test_b3_stakingunlock-qt b3stakingunlocktests.cpp)
   target_link_libraries(test_b3_stakingunlock-qt

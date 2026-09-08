@@ -45,6 +45,9 @@ struct B3AssetRecord {
     bool flowmesh_available{false};
     int decimals{8};
     bool metadata_known{false};
+    bool precision_known{false};
+    QString metadata_source;
+    bool is_test_asset{false};
     bool is_fn{false};
     bool is_bridge{false};
     Status status{Status::Unavailable};
@@ -119,6 +122,8 @@ public:
     //! Fixed-point rendering from integer amounts only; never routes
     //! financial values through floating point.
     static QString formatAmount(CAmount amount, int decimals);
+    //! A missing label and missing precision are different states.
+    static QString assetName(const B3AssetRecord& record);
 
 private Q_SLOTS:
     void reload();

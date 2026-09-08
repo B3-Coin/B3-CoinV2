@@ -61,6 +61,8 @@ QList<B3AssetRecord> B3NativeAssetSource::recordsForBalances(
     // The locked human-facing B3 denomination is 1 B3 = 1e9 base units.
     native.decimals = 9;
     native.metadata_known = true;
+    native.precision_known = true;
+    native.metadata_source = QStringLiteral("consensus");
     native.status = B3AssetRecord::Status::Native;
     records.push_back(native);
 
@@ -82,6 +84,8 @@ QList<B3AssetRecord> B3NativeAssetSource::recordsForBalances(
             asset.display_name = tr("FN Coin");
             asset.decimals = 0;
             asset.metadata_known = true;
+            asset.precision_known = true;
+            asset.metadata_source = QStringLiteral("consensus");
         } else if (asset.is_bridge) {
             // The bridge identity is consensus-configured metadata. Showing
             // its ticker/precision does not imply that bridge admission is
@@ -90,14 +94,23 @@ QList<B3AssetRecord> B3NativeAssetSource::recordsForBalances(
             asset.display_name = tr("Bridged USD");
             asset.decimals = 6;
             asset.metadata_known = true;
+            asset.precision_known = true;
+            asset.metadata_source = QStringLiteral("consensus");
         } else {
-            // Simple-v1 outputs do not repeat their genesis metadata. Until
-            // a metadata registry is available, show exact raw units and a
-            // short id rather than inventing a ticker or precision.
-            asset.ticker = asset.asset_id.left(8).toUpper();
-            asset.display_name = tr("Unknown asset");
-            asset.decimals = 0;
-            asset.metadata_known = false;
+            // The wallet verifies the genesis precision against the full,
+            // chain-bound asset ID. Labels are cosmetic registry metadata,
+            // not proof of issuer identity, backing, or redeemability.
+            asset.precision_known = balance.decimals.has_value() &&
+                                    *balance.decimals >= 0 && *balance.decimals <= 18;
+            asset.decimals = asset.precision_known ? *balance.decimals : 0;
+            asset.metadata_known = asset.precision_known &&
+                                   !balance.display_name.empty() && !balance.ticker.empty();
+            asset.ticker = asset.metadata_known
+                ? QString::fromStdString(balance.ticker) : asset.asset_id.left(8).toUpper();
+            asset.display_name = asset.metadata_known
+                ? QString::fromStdString(balance.display_name) : QString{};
+            asset.metadata_source = QString::fromStdString(balance.metadata_source);
+            asset.is_test_asset = asset.metadata_known && balance.is_test_asset;
         }
         records.push_back(std::move(asset));
     }
@@ -155,7 +168,7 @@ QVariant B3AssetTableModel::data(const QModelIndex& index, int role) const
     if (role == Qt::DisplayRole) {
         switch (index.column()) {
         case Name:
-            return record.metadata_known ? record.display_name : tr("Unknown asset");
+            return assetName(record);
         case Ticker:
             return record.ticker;
         case Available:
@@ -163,11 +176,16 @@ QVariant B3AssetTableModel::data(const QModelIndex& index, int role) const
         }
     }
     if (role == SearchRole) {
-        const QString name{record.metadata_known ? record.display_name : tr("Unknown asset")};
+        const QString name{assetName(record)};
         return QString{name + QLatin1Char(' ') + record.ticker + QLatin1Char(' ') +
                        record.asset_id};
     }
     if (role == AssetIdRole) return record.asset_id;
+    if (role == Qt::ToolTipRole) {
+        const QString description{tr("%1\nAsset ID: %2\nMetadata source: %3\nNames are labels, not a guarantee of backing or issuer identity.")
+            .arg(assetName(record), record.asset_id, record.metadata_source)};
+        return QStringLiteral("<qt>%1</qt>").arg(description.toHtmlEscaped().replace(QLatin1Char('\n'), QStringLiteral("<br>")));
+    }
     if (role == Qt::TextAlignmentRole && index.column() == Available) {
         return QVariant{Qt::AlignRight | Qt::AlignVCenter};
     }
@@ -189,4 +207,10 @@ QString B3AssetTableModel::formatAmount(CAmount amount, int decimals)
 {
     // Integer arithmetic only: no float ever touches a financial value.
     return B3Fixed::format(amount, decimals);
+}
+
+QString B3AssetTableModel::assetName(const B3AssetRecord& record)
+{
+    if (record.metadata_known && !record.display_name.isEmpty()) return record.display_name;
+    return record.precision_known ? tr("Unnamed asset") : tr("Unknown asset");
 }

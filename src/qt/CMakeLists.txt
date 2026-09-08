@@ -192,6 +192,10 @@ if(ENABLE_WALLET)
       b3assetmodel.h
       b3assetspage.cpp
       b3assetspage.h
+      b3assetsenddialog.cpp
+      b3assetsenddialog.h
+      b3assettransfer.cpp
+      b3assettransfer.h
       b3dashboardpage.cpp
       b3dashboardpage.h
       b3stakepage.cpp
