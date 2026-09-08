@@ -66,14 +66,79 @@ class SchedulingTests(unittest.TestCase):
             scan.assert_not_called()
         self.assertEqual([row["kind"] for row in self.state.pending()], ["mint"])
 
-    def test_far_behind_queues_verified_update_without_scanning(self):
+    def test_far_behind_prioritizes_covered_history_without_optional_update(self):
         self.record["anchor_block_number"] = 229
+        self.state.add_plan([self.record])
+        with self.mocked_cycle() as (emit, process, scan):
+            self.cycle()
+            self.assertEqual(emit.call_count, 2)
+            process.assert_not_called()
+            scan.assert_called_once()
+            self.assertEqual(scan.call_args.args[-1][4:6], (100, H32))
+        self.assertIsNone(self.state.first())
+        self.assertEqual(self.state.db.execute("SELECT state FROM jobs").fetchone()[0],
+                         "superseded")
+        self.assertEqual(self.wallet.calls, [])
+
+    def test_covered_history_wins_at_equal_near_and_large_refresh_gaps(self):
+        for gap in (0, 128, 129, 1000, 20000):
+            with self.subTest(gap=gap):
+                self.record["anchor_block_number"] = 100 + gap
+                with self.mocked_cycle() as (emit, process, scan):
+                    self.cycle()
+                    self.assertEqual(emit.call_count, 2)
+                    process.assert_not_called()
+                    scan.assert_called_once()
+                    self.assertEqual(scan.call_args.args[-1][4:6], (100, H32))
+                self.assertIsNone(self.state.first())
+        self.assertEqual(self.wallet.calls, [])
+
+    def test_large_refresh_gap_dry_run_still_only_previews_update(self):
+        self.args.dry_run = True
+        self.record["anchor_block_number"] = 1100
         with self.mocked_cycle() as (emit, process, scan):
             self.cycle()
             self.assertEqual(emit.call_count, 1)
             process.assert_called_once()
+            self.assertTrue(process.call_args.args[4])
             scan.assert_not_called()
         self.assertEqual(self.state.first()["kind"], "update")
+        self.assertEqual(self.state.first()["state"], "planned")
+        self.assertIsNone(self.state.first()["txid"])
+        self.assertEqual(self.wallet.calls, [])
+
+    def test_regressing_proven_height_never_scans_or_submits(self):
+        self.record["anchor_block_number"] = 99
+        with self.mocked_cycle() as (_, process, scan):
+            with self.assertRaisesRegex(relayer.RelayerError, "execution advance exceeds"):
+                self.cycle()
+            process.assert_not_called()
+            scan.assert_not_called()
+        self.assertIsNone(self.state.first())
+        self.assertEqual(self.state.cursor(), 50)
+        self.assertEqual(self.wallet.calls, [])
+
+    def test_history_scan_uses_retained_anchor_not_current_tip_distance(self):
+        identity = relayer.bridge_identity(self.info, 1, self.args.trusted_root)
+        self.state.bind(identity, 50)
+        historical = relayer.validate_execution_anchor(
+            {**fixtures.retained_anchor(100), "found": True, "target_block": 50}, 50)
+        frozen = (*self.common[:4], 30100, H32, self.snapshot)
+        self.args.scan_chunk = 32
+        self.args.max_ancestry = 20000
+        with (patch.object(relayer, "fetch_execution_anchor", return_value=historical) as anchor,
+              patch.object(relayer, "corroborate_execution_anchor") as corroborate,
+              patch.object(relayer, "scan_finalized") as scan,
+              patch.object(relayer, "process_jobs") as process):
+            relayer.scan_deposits(self.args, self.state, self.primary, [self.witness],
+                                 self.node, self.wallet, 63, self.info, identity, frozen)
+            anchor.assert_called_once_with(self.node, 50)
+            corroborate.assert_called_once_with(historical, [self.primary, self.witness])
+            self.assertEqual(scan.call_args.args[3:5], (100, H32))
+            self.assertEqual(scan.call_args.args[6], 20000)
+            self.assertTrue(callable(scan.call_args.kwargs["before_commit"]))
+            process.assert_called_once()
+        self.assertEqual(self.state.cursor(), 50) # Mocked authentication never advances history.
 
     def test_already_scanned_tip_queues_refresh(self):
         self.state.bind(relayer.bridge_identity(self.info, 1, self.args.trusted_root), 50)
@@ -129,6 +194,7 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(self.state.first()["state"], "planned")
 
     def test_signed_job_is_preserved_and_processed_before_scan(self):
+        self.record["anchor_block_number"] = 1100 # Freshness cannot replace a submitted job.
         self.state.add_plan([self.record])
         self.state.db.execute("UPDATE jobs SET state='broadcast',txid=?,raw_tx='1234'", (H32,))
         self.state.db.commit()

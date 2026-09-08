@@ -1994,11 +1994,13 @@ def run_once(args, state, eth, witnesses, node, wallet, prefix):
             return
 
         current_execution = quantity(info.get("finalized_execution_block", 0))
-        # This is a conservative scheduling threshold, not a consensus rule.
-        # Once caught up, let already-covered deposits use the finalized store
-        # before enqueuing another optional refresh and waiting for it again.
+        # Covered history does not need a near-tip Ethereum store. Waiting for
+        # every LC carrier to become B3-finalized can let Ethereum outrun a
+        # freshness cutoff forever, repeatedly starving the historical scan.
+        # scan_deposits selects a retained B3-finalized source anchor and keeps
+        # the existing 20,000-block ancestry bound; no proof rule is relaxed.
         scan_due = (store_snapshot is not None and
-                    0 <= proven_number - current_execution <= 128 and
+                    proven_number >= current_execution and
                     (state.cursor() <= current_execution or
                      any(row["block_number"] <= current_execution
                          for row in state.unplanned())))
@@ -2028,6 +2030,11 @@ def run_once(args, state, eth, witnesses, node, wallet, prefix):
                 process_jobs(state, node, wallet, args.b3_confirmations, False,
                              args.max_fee_atoms, args.daily_fee_budget_atoms)
                 return
+            log("authenticated_history_prioritized", cursor=state.cursor(),
+                covered_execution=current_execution,
+                optional_proven_execution=proven_number,
+                refresh_gap=proven_number - current_execution,
+                anchor_source="retained-b3-finalized")
             scan_deposits(args, state, eth, witnesses, node, wallet, prefix,
                           info, identity, frozen)
             return

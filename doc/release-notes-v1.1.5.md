@@ -11,9 +11,11 @@ production wallet build is implied by these notes.
   selecting a freshly verified sync sequence. Superseded unprepared plans
   remain in the audit history; in-flight transactions and deposit dependencies
   are preserved.
-- Once sufficiently caught up, the relayer can scan deposits against its
-  exact B3-finalized Ethereum store before adding an optional tip refresh.
-  Existing prepared deposit plans are not starved by continuous refreshes.
+- The relayer prioritizes already-covered history against its exact
+  B3-finalized Ethereum store before adding an optional tip refresh, even
+  when slow B3 finality lets Ethereum move more than 128 blocks ahead.
+  Historical scans still select retained finalized anchors and obey the
+  unchanged 20,000-block ancestry bound. Signed/in-flight jobs remain first.
 - Authenticated Ethereum history scanning uses bounded read-only batches and
   a bounded persistent header cache. The configured production default is
   three headers per batch, with an independent hard cap of sixteen.
@@ -42,14 +44,13 @@ relayer database between runs remains mandatory.
 
 ## Qualification and release gates
 
-Known remaining relayer limitation: the covered-history scan priority still
-requires the proven Ethereum head to be within 128 blocks of the finalized
-B3 light-client store. Repeated slow B3 finality can leave a larger gap on
-every cycle and repeatedly favor another update over covered-history scanning.
-This is distinct from preserving an already-prepared deposit plan. A follow-up
-scheduling fix and regression are required; this draft does not claim that all
-history-scan starvation is resolved. That fix must preserve in-flight jobs,
-exact finalized-store verification and retained-anchor/ancestry limits.
+Covered-history scheduling no longer has the 128-block freshness prerequisite
+that could repeatedly favor optional updates after every slow finality wait.
+New regressions cover gaps from zero through 20,000 blocks, older retained
+anchors, dry-run behavior and preservation of submitted transactions.
+This does not remove the requirement to finalize an already-connected update,
+relax the separate local deposit-readiness checks, or solve a missing quorum
+or unavailable Ethereum provider. A successful scan is not a completed mint.
 
 The relayer changes passed 108 focused offline tests in the master checkout
 (55 existing, 14 coalescing, 10 scheduling and 29 header/cache cases).
