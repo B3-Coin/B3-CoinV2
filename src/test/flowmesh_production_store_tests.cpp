@@ -417,6 +417,23 @@ BOOST_AUTO_TEST_CASE(atomic_execution_handoff_connection_and_epoch_replay)
                                   committed, error),
                               error);
         BOOST_CHECK(committed.Root() == scenario.execution0.next_state.Root());
+        const auto trade_history{store.ReadMarketHistory(1, 50)};
+        BOOST_REQUIRE(trade_history.available);
+        BOOST_REQUIRE_EQUAL(trade_history.entries.size(), 1U);
+        const auto& trade{trade_history.entries.front()};
+        BOOST_CHECK(trade.microblock_hash == scenario.execution0.entry.GetHash());
+        BOOST_CHECK(trade.cleared);
+        BOOST_CHECK_EQUAL(trade.price, 100);
+        BOOST_CHECK_EQUAL(trade.quantity, 200);
+        BOOST_CHECK_EQUAL(trade.notional_atoms, 20'000);
+        BOOST_CHECK_EQUAL(trade.fee_atoms, 2);
+        BOOST_REQUIRE_EQUAL(trade.account_fills.size(), 2U);
+        BOOST_CHECK(trade.account_fills_complete);
+        const auto buyer_fill{std::find_if(trade.account_fills.begin(), trade.account_fills.end(),
+            [&](const auto& fill) { return fill.account_id == scenario.buyer; })};
+        BOOST_REQUIRE(buyer_fill != trade.account_fills.end());
+        BOOST_CHECK_EQUAL(buyer_fill->bid_quantity, 200);
+        BOOST_CHECK_EQUAL(buyer_fill->ask_quantity, 0);
         std::optional<node::ProductionCheckpointCandidate> candidate;
         BOOST_REQUIRE_MESSAGE(store.NextCheckpointCandidate(
                                   scenario.seats0.seats, candidate, error),
@@ -492,6 +509,18 @@ BOOST_AUTO_TEST_CASE(atomic_execution_handoff_connection_and_epoch_replay)
                                   refused, error),
                               error);
         BOOST_CHECK(refused.Root() == scenario.execution2.next_state.Root());
+        const auto newest{store.ReadMarketHistory(3, 1)};
+        BOOST_REQUIRE_EQUAL(newest.entries.size(), 1U);
+        BOOST_CHECK_EQUAL(newest.entries.front().sequence, 2U);
+        BOOST_CHECK(!newest.entries.front().cleared);
+        BOOST_REQUIRE(newest.next_before_sequence);
+        const auto older{store.ReadMarketHistory(*newest.next_before_sequence, 1)};
+        BOOST_REQUIRE_EQUAL(older.entries.size(), 1U);
+        BOOST_CHECK_EQUAL(older.entries.front().sequence, 1U);
+        BOOST_CHECK(older.entries.front().handoff);
+        BOOST_CHECK(!older.entries.front().cleared);
+        BOOST_CHECK(store.ReadMarketHistory(0, 50).entries.empty());
+        BOOST_CHECK(!store.ReadMarketHistory(3, 101).available);
         BOOST_REQUIRE_MESSAGE(store.NextCheckpointCandidate(
                                   scenario.seats1.seats, candidate, error),
                               error);
@@ -506,6 +535,7 @@ BOOST_AUTO_TEST_CASE(atomic_execution_handoff_connection_and_epoch_replay)
                           error);
     BOOST_CHECK(reopened.LockOnce({8, 3}, Filled(0xee)) ==
                 flowmesh::ProductionLockResult::STORAGE_FAILURE);
+    BOOST_CHECK(!reopened.ReadMarketHistory(3, 50).available);
     SeatSource source;
     source.m_domain = scenario.domain;
     source.m_market = scenario.market;
@@ -521,6 +551,13 @@ BOOST_AUTO_TEST_CASE(atomic_execution_handoff_connection_and_epoch_replay)
                           error);
     BOOST_CHECK(replayed.Root() == scenario.execution2.next_state.Root());
     BOOST_CHECK(last_hash == scenario.execution2.entry.GetHash());
+    const auto replayed_history{reopened.ReadMarketHistory(3, 50)};
+    BOOST_REQUIRE(replayed_history.available);
+    BOOST_REQUIRE_EQUAL(replayed_history.entries.size(), 3U);
+    BOOST_CHECK(!replayed_history.truncated);
+    BOOST_CHECK(replayed_history.entries.back().microblock_hash == scenario.execution0.entry.GetHash());
+    BOOST_CHECK_EQUAL(replayed_history.entries.back().quantity, 200);
+    BOOST_CHECK_EQUAL(replayed_history.entries.back().fee_atoms, 2);
     BOOST_CHECK(reopened.LockOnce({8, 3}, Filled(0xee)) ==
                 flowmesh::ProductionLockResult::STORAGE_FAILURE);
 }
@@ -1276,6 +1313,7 @@ BOOST_AUTO_TEST_CASE(append_rejects_wrong_sequence_parent_state_set_and_certific
         scenario.execution0.entry, scenario.certificate0,
         scenario.seats1.seats, scenario.state0, anchors, scenario.treasury,
         &scenario.chain_facts, output, error));
+    BOOST_CHECK(store.ReadMarketHistory(1, 50).entries.empty());
 
     BOOST_REQUIRE_MESSAGE(store.AppendExecution(
                               scenario.execution0.entry,

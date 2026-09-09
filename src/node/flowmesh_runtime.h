@@ -236,6 +236,7 @@ public:
     flowmesh::QueueResult EnqueueWireMessage(
         flowmesh::WirePeerId peer,
         flowmesh::WireMessage message) override;
+    void FlowMeshPeerConnected(flowmesh::WirePeerId peer) override;
     void FlowMeshPeerDisconnected(flowmesh::WirePeerId peer) override;
 
     /** Wake the worker to evaluate timeout/anchor/set policy. */
@@ -269,6 +270,13 @@ public:
     std::optional<flowmesh::FlowMeshState> StateSnapshot(
         const flowmesh::MarketId& market_id) const;
 
+    /** One bounded snapshot of certified curves, account state and history.
+     * No whole-state copy, state hashing, log scanning or execution on reads. */
+    std::optional<flowmesh::MarketData> MarketData(
+        const flowmesh::MarketId& market_id,
+        const std::optional<flowmesh::AccountId>& account,
+        const flowmesh::MarketDataQuery& query, std::string& error) const;
+
     /** Test/shutdown aid: waits only for this runtime's current work queue. */
     bool WaitForIdle(std::chrono::milliseconds timeout);
 
@@ -289,12 +297,17 @@ private:
     void WorkerLoop();
     void ProcessMessage(const flowmesh::QueuedWireMessage& queued);
     void ProcessTick();
+    void AnnounceMarkets(bool refresh);
+    void ProbeLegacyPeers(const std::vector<flowmesh::WirePeerId>& peers);
+    bool TryRequestCatchup(Market& market, flowmesh::WirePeerId peer);
     void ProcessCatchupCommand(const CatchupCommand& command);
     void ProcessAddMarketCommand(AddMarketCommand command);
     void RemovePeerOnWorker(flowmesh::WirePeerId peer);
 
     void HandleAction(Market& market, flowmesh::WirePeerId peer,
                       const flowmesh::WireMessage& message);
+    void HandleHello(Market& market, flowmesh::WirePeerId peer,
+                     const flowmesh::WireMessage& message);
     void HandleProposal(Market& market, flowmesh::WirePeerId peer,
                         const flowmesh::WireMessage& message);
     void HandleAttestation(Market& market, flowmesh::WirePeerId peer,
@@ -321,10 +334,13 @@ private:
     flowmesh::BoundedWireQueue m_queue;
     //! Ready market ids admitted to m_queue; guarded by m_queue_mutex.
     std::set<flowmesh::MarketId> m_admitted_markets;
+    //! Negotiated connections only, capped independently of incoming hints.
+    std::set<flowmesh::WirePeerId> m_discovery_peers;
     std::deque<flowmesh::WirePeerId> m_removed_peers;
     std::deque<CatchupCommand> m_catchup_commands;
     std::deque<AddMarketCommand> m_add_market_commands;
     bool m_tick_pending{false};
+    bool m_discovery_refresh{false};
     bool m_started{false};
     bool m_stopping{false};
     bool m_processing{false};
@@ -337,9 +353,20 @@ private:
         uint64_t from_sequence{0};
         uint16_t max_entries{0};
         uint32_t max_bytes{0};
+        flowmesh::WireClock::time_point deadline{};
     };
     std::map<std::pair<flowmesh::WirePeerId, flowmesh::MarketId>,
              PendingCatchup> m_pending_catchup;
+    std::map<std::pair<flowmesh::WirePeerId, flowmesh::MarketId>,
+             flowmesh::WireClock::time_point> m_catchup_cooldowns;
+    flowmesh::MarketId m_announcement_cursor;
+    flowmesh::WireClock::time_point m_next_announcement_batch{};
+    //! One cursor per peer: each known market gets one compatibility probe
+    //! on connection; newly admitted markets extend the scan without replay.
+    std::vector<flowmesh::MarketId> m_probe_markets;
+    std::map<flowmesh::WirePeerId, size_t> m_peer_probe_cursors;
+    flowmesh::WirePeerId m_probe_peer_cursor{0};
+    flowmesh::WireClock::time_point m_next_legacy_probe{};
 };
 
 } // namespace node

@@ -82,6 +82,24 @@ public:
         SERIALIZE_METHODS(Breakpoint, obj) { READWRITE(obj.price, obj.qty); }
     };
 
+    using CurveKey = std::pair<Side, AccountId>;
+
+    struct CurveView {
+        AccountId account_id;
+        Side side{Side::BID};
+        std::vector<Breakpoint> points;
+        CAmount filled_quantity{0};
+        CAmount remaining_quantity{0};
+        CAmount reserved_amount{0};
+    };
+
+    struct CurvePage {
+        std::vector<CurveView> curves;
+        size_t total_curves{0};
+        bool complete{true};
+        std::optional<CurveKey> next_cursor;
+    };
+
     struct ClearingResult {
         bool cleared{false};
         CAmount price{0};
@@ -109,6 +127,47 @@ public:
 
     const AssetId& BaseAsset() const { return m_base; }
     const AssetId& QuoteAsset() const { return m_quote; }
+
+    //! A bounded account-ordered page of the persistent curve auction. It is
+    //! not a price-time order book. No scan/copy of omitted curves occurs.
+    CurvePage ReadCurves(const size_t limit,
+                         const std::optional<CurveKey>& after = std::nullopt) const
+    {
+        CurvePage out;
+        out.total_curves = m_curves.size();
+        auto it{after ? m_curves.upper_bound(*after) : m_curves.begin()};
+        for (; it != m_curves.end() && out.curves.size() < limit; ++it) {
+            const auto& [key, curve]{*it};
+            const CAmount maximum{key.first == Side::BID
+                                      ? curve.points.front().qty
+                                      : curve.points.back().qty};
+            out.curves.push_back({key.second, key.first, curve.points,
+                                  curve.filled, maximum - curve.filled,
+                                  curve.reserved});
+        }
+        out.complete = !after && it == m_curves.end();
+        if (it != m_curves.end() && !out.curves.empty()) {
+            const auto& last{out.curves.back()};
+            out.next_cursor = CurveKey{last.side, last.account_id};
+        }
+        return out;
+    }
+
+    //! At most two map lookups, regardless of total market size.
+    std::vector<CurveView> AccountCurves(const AccountId& account) const
+    {
+        std::vector<CurveView> out;
+        for (const Side side : {Side::BID, Side::ASK}) {
+            const auto it{m_curves.find({side, account})};
+            if (it == m_curves.end()) continue;
+            const auto& curve{it->second};
+            const CAmount maximum{side == Side::BID ? curve.points.front().qty
+                                                    : curve.points.back().qty};
+            out.push_back({account, side, curve.points, curve.filled,
+                           maximum - curve.filled, curve.reserved});
+        }
+        return out;
+    }
 
     //! Validate a curve independently of the ledger (bounds + monotonicity).
     //! A BID must terminate at zero quantity so its worst-case spend — and

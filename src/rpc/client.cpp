@@ -84,6 +84,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "flowmeshdeposit", 2, "amount" },
     { "flowmeshdeposit", 3, "options" },
     { "createflowmeshcheckpoint", 0, "market_id", ParamFormat::STRING },
+    { "getflowmeshmarketdata", 0, "market_id", ParamFormat::STRING },
+    { "getflowmeshmarketdata", 1, "options" },
     { "createflowmeshcheckpoint", 1, "options" },
     { "createflowmeshvaulttx", 0, "effect_id", ParamFormat::STRING },
     { "createflowmeshvaulttx", 1, "destination", ParamFormat::STRING },

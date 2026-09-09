@@ -33,6 +33,51 @@ bool FlowMeshHandoffConnectionMature(
 
 namespace {
 
+void CacheMarketHistory(std::deque<flowmesh::MarketHistoryEntry>& history,
+                        const flowmesh::ProductionEntryCore& entry,
+                        const flowmesh::BatchResult* result)
+{
+    flowmesh::MarketHistoryEntry item;
+    item.sequence = entry.sequence;
+    item.microblock_hash = entry.GetHash();
+    item.epoch = entry.epoch;
+    item.anchor_height = entry.anchor.height;
+    item.anchor_hash = entry.anchor.hash;
+    item.handoff = entry.kind == static_cast<uint8_t>(flowmesh::ProductionEntryKind::EPOCH_HANDOFF);
+    if (result) {
+        const auto& clearing{result->clearing};
+        item.cleared = clearing.cleared;
+        item.price = clearing.price;
+        item.quantity = clearing.volume;
+        item.notional_atoms = clearing.fees.matched_b3_quote_notional;
+        item.fee_atoms = clearing.fees.fee_total;
+        auto bid{clearing.bid_fill.begin()};
+        auto ask{clearing.ask_fill.begin()};
+        while ((bid != clearing.bid_fill.end() || ask != clearing.ask_fill.end()) &&
+               item.account_fills.size() < flowmesh::MARKET_DATA_MAX_FILL_ACCOUNTS) {
+            flowmesh::MarketAccountFill fill;
+            if (ask == clearing.ask_fill.end() ||
+                (bid != clearing.bid_fill.end() && bid->first < ask->first)) {
+                fill.account_id = bid->first;
+            } else {
+                fill.account_id = ask->first;
+            }
+            if (bid != clearing.bid_fill.end() && bid->first == fill.account_id) {
+                fill.bid_quantity = bid->second;
+                ++bid;
+            }
+            if (ask != clearing.ask_fill.end() && ask->first == fill.account_id) {
+                fill.ask_quantity = ask->second;
+                ++ask;
+            }
+            item.account_fills.push_back(fill);
+        }
+        item.account_fills_complete = bid == clearing.bid_fill.end() && ask == clearing.ask_fill.end();
+    }
+    history.push_back(std::move(item));
+    if (history.size() > flowmesh::MARKET_DATA_HISTORY_CAPACITY) history.pop_front();
+}
+
 constexpr uint8_t KEY_MARKER{'m'};
 constexpr uint8_t KEY_ENTRY{'e'};
 constexpr uint8_t KEY_CONNECTION{'c'};
@@ -1576,6 +1621,7 @@ bool FlowMeshProductionStore::AppendExecution(
         error = std::string{"FlowMesh v3 execution append failed: "} + e.what();
         return false;
     }
+    CacheMarketHistory(m_market_history, entry, &executed->result);
     next_state_out = executed->next_state;
     return true;
 }
@@ -1660,6 +1706,7 @@ bool FlowMeshProductionStore::AppendHandoff(
         error = std::string{"FlowMesh v3 handoff append failed: "} + e.what();
         return false;
     }
+    CacheMarketHistory(m_market_history, handoff, nullptr);
     return true;
 }
 
@@ -1897,6 +1944,8 @@ bool FlowMeshProductionStore::Replay(
     // Replay is the signing/append readiness boundary. Any failure below
     // leaves the store fail-closed until a complete replay succeeds.
     m_ready = false;
+    m_market_history.clear();
+    std::deque<flowmesh::MarketHistoryEntry> history;
     Marker marker;
     if (ReadMarkerStrict(m_db, marker) != ReadResult::FOUND ||
         !ValidateStorage(m_db, marker, error)) {
@@ -1960,6 +2009,7 @@ bool FlowMeshProductionStore::Replay(
                 error = "FlowMesh v3 replay effects/settlements differ from deterministic execution";
                 return false;
             }
+            CacheMarketHistory(history, stored->entry, &executed->result);
             working = executed->next_state;
         } else {
             const auto next_seats{seat_sets.GetSeatSet(
@@ -1978,6 +2028,8 @@ bool FlowMeshProductionStore::Replay(
                         flowmesh::ProductionEntryCheckName(check);
                 return false;
             }
+
+            CacheMarketHistory(history, stored->entry, nullptr);
 
             DiskConnection connection;
             const ReadResult connected{
@@ -2055,8 +2107,30 @@ bool FlowMeshProductionStore::Replay(
     }
     state = std::move(working);
     last_hash = running_hash;
+    m_market_history = std::move(history);
     m_ready = true;
     return true;
+}
+
+flowmesh::MarketHistoryPage FlowMeshProductionStore::ReadMarketHistory(
+    const uint64_t before_sequence, const size_t limit)
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    flowmesh::MarketHistoryPage out;
+    if (!m_open || !m_ready || limit == 0 || limit > flowmesh::MARKET_DATA_MAX_HISTORY) return out;
+    out.available = true;
+    if (m_market_history.empty()) return out;
+    out.oldest_retained_sequence = m_market_history.front().sequence;
+    out.truncated = *out.oldest_retained_sequence != 0;
+    for (auto it{m_market_history.rbegin()}; it != m_market_history.rend(); ++it) {
+        if (it->sequence >= before_sequence) continue;
+        if (out.entries.size() == limit) {
+            out.next_before_sequence = out.entries.back().sequence;
+            break;
+        }
+        out.entries.push_back(*it);
+    }
+    return out;
 }
 
 flowmesh::ProductionLockResult FlowMeshProductionStore::LockCandidate(

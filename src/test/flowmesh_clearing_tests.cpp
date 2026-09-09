@@ -82,6 +82,54 @@ inline bool Fund(flowmesh::FlowMeshState& state, const flowmesh::AccountId& acco
 
 } // namespace
 
+BOOST_AUTO_TEST_CASE(certified_curve_pages_preserve_partial_fills_and_exact_units)
+{
+    flowmesh::FlowMeshState state{VAULT, BaseX(), Quote()};
+    BOOST_REQUIRE(Fund(state, ALICE, Quote(), 1000));
+    BOOST_REQUIRE(Fund(state, ACC_A, Quote(), 250));
+    BOOST_REQUIRE(Fund(state, BOB, BaseX(), 80));
+    BOOST_REQUIRE(state.SubmitCurve(ALICE, Side::BID, Pts({{10, 100}, {11, 0}})));
+    BOOST_REQUIRE(state.SubmitCurve(ACC_A, Side::BID, Pts({{5, 50}, {6, 0}})));
+    BOOST_REQUIRE(state.SubmitCurve(BOB, Side::ASK, Pts({{9, 0}, {10, 80}})));
+    const auto cleared{state.ClearSlot()};
+    BOOST_REQUIRE(cleared);
+    BOOST_REQUIRE(cleared->cleared);
+    BOOST_CHECK_EQUAL(cleared->volume, 80);
+    const uint256 root{state.Root()};
+
+    const auto first{state.ReadCurves(1)};
+    BOOST_CHECK_EQUAL(first.total_curves, 2U);
+    BOOST_REQUIRE_EQUAL(first.curves.size(), 1U);
+    BOOST_CHECK(!first.complete);
+    BOOST_REQUIRE(first.next_cursor);
+    const auto second{state.ReadCurves(1, first.next_cursor)};
+    BOOST_REQUIRE_EQUAL(second.curves.size(), 1U);
+    BOOST_CHECK(!second.next_cursor);
+    BOOST_CHECK(!second.complete); // A last page alone is not the whole book.
+    BOOST_CHECK(first.curves.front().account_id != second.curves.front().account_id);
+
+    const auto own{state.AccountCurves(ALICE)};
+    BOOST_REQUIRE_EQUAL(own.size(), 1U);
+    BOOST_CHECK_EQUAL(own.front().filled_quantity, 80);
+    BOOST_CHECK_EQUAL(own.front().remaining_quantity, 20);
+    BOOST_CHECK_EQUAL(own.front().reserved_amount, 200);
+    BOOST_CHECK_EQUAL(own.front().points.front().qty, 100);
+    BOOST_CHECK(state.AccountCurves(BOB).empty()); // Exhausted curve is absent.
+    BOOST_CHECK(state.Root() == root); // Reading never mutates execution state.
+    BOOST_REQUIRE(state.CancelCurve(ALICE, Side::BID));
+    BOOST_CHECK(state.AccountCurves(ALICE).empty());
+
+    const CAmount exact{9'007'199'254'740'993}; // Beyond IEEE-754 exact integers.
+    flowmesh::FlowMeshState large{VAULT, BaseX(), Quote()};
+    BOOST_REQUIRE(Fund(large, BOB, BaseX(), exact));
+    BOOST_REQUIRE(large.SubmitCurve(BOB, Side::ASK, Pts({{0, 0}, {1, exact}})));
+    const auto page{large.ReadCurves(128)};
+    BOOST_REQUIRE_EQUAL(page.curves.size(), 1U);
+    BOOST_CHECK(page.complete);
+    BOOST_CHECK_EQUAL(page.curves.front().remaining_quantity, exact);
+    BOOST_CHECK_EQUAL(page.curves.front().points.back().qty, exact);
+}
+
 BOOST_AUTO_TEST_CASE(curve_validity_bounds_and_monotonicity)
 {
     flowmesh::FlowMeshState st{VAULT, BaseX(), Quote(), /*max_k=*/3};

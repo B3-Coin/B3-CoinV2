@@ -10,6 +10,7 @@
 #include <crypto/bls.h>
 #include <consensus/finality_signer_recovery.h>
 #include <flowmesh/batch.h>
+#include <flowmesh/market_data.h>
 #include <uint256.h>
 #include <script/script.h>
 #include <key.h>
@@ -682,6 +683,9 @@ public:
     virtual std::optional<FlowMeshMarketStatus> flowMeshMarketStatus(
         const uint256& market_id,
         const std::optional<uint256>& account_id) = 0;
+    virtual std::optional<flowmesh::MarketData> flowMeshMarketData(
+        const uint256& market_id, const std::optional<uint256>& account_id,
+        const flowmesh::MarketDataQuery& query, std::string& error) = 0;
     //! Current active-chain registry fact (not the 30-deep runtime view).
     virtual bool flowMeshMarketEstablished(const uint256& market_id) = 0;
     virtual bool submitFlowMeshAction(const uint256& market_id,

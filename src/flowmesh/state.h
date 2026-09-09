@@ -133,6 +133,18 @@ public:
 
     // ---- Read-only book views. ----
 
+    const AssetId& BaseAsset() const { return book.BaseAsset(); }
+    ClearingEngine::CurvePage ReadCurves(
+        const size_t limit,
+        const std::optional<ClearingEngine::CurveKey>& after = std::nullopt) const
+    {
+        return book.ReadCurves(limit, after);
+    }
+    std::vector<ClearingEngine::CurveView> AccountCurves(const AccountId& account) const
+    {
+        return book.AccountCurves(account);
+    }
+
     bool CurveIsValid(const ClearingEngine::Side side,
                       const std::vector<ClearingEngine::Breakpoint>& points) const
     {

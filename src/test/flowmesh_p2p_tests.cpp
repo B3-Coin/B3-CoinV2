@@ -233,4 +233,32 @@ BOOST_AUTO_TEST_CASE(unsolicited_or_oversized_catchup_responses_are_rejected)
     BOOST_CHECK_EQUAL(tracker.Size(), 0U);
 }
 
+BOOST_AUTO_TEST_CASE(market_hello_revision_and_targeted_catchup_expiry)
+{
+    using namespace flowmesh;
+    const auto payload{EncodeMarketHello({uint256::ONE, uint256{}})};
+    const auto hello{DecodeMarketHello(payload)};
+    BOOST_REQUIRE(hello);
+    BOOST_CHECK(hello->domain == uint256::ONE);
+    BOOST_CHECK(hello->last_microblock_hash.IsNull());
+    auto bad{payload};
+    bad[0] = 2;
+    BOOST_CHECK(!DecodeMarketHello(bad));
+    bad = payload;
+    bad.pop_back();
+    BOOST_CHECK(!DecodeMarketHello(bad));
+    bad = payload;
+    bad.push_back(0);
+    BOOST_CHECK(!DecodeMarketHello(bad));
+    BOOST_CHECK(!DecodeMarketHello(EncodeMarketHello({uint256{}, uint256{}})));
+    CatchupRequestTracker tracker;
+    BOOST_REQUIRE(tracker.Begin(8, uint256::ONE, 0, 64, 4096));
+    BOOST_REQUIRE(tracker.Begin(9, uint256::ONE, 0, 64, 4096));
+    tracker.Cancel(8, uint256::ONE);
+    BOOST_CHECK_EQUAL(tracker.Size(), 1U);
+    BOOST_CHECK(!tracker.AcceptResponse(8, uint256::ONE, 0, 1, 100));
+    BOOST_CHECK(tracker.AcceptResponse(9, uint256::ONE, 0, 1, 100));
+    BOOST_CHECK(tracker.Begin(8, uint256::ONE, 0, 64, 4096));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

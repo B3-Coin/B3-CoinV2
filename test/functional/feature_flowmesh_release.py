@@ -60,6 +60,9 @@ B3_ARGS = [
 
 
 class FlowMeshReleaseTest(BitcoinTestFramework):
+    def exercise_extra_trading(self, market_id):
+        """Optional bounded workload used by the separate speed test."""
+
     def set_test_params(self):
         self.num_nodes = 4
         self.setup_clean_chain = True
@@ -450,6 +453,45 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
         assert_equal(genesis_checkpoint["sequence"], 0)
         assert_equal(genesis_checkpoint["effect_count"], 0)
 
+        self.log.info("Certified market data is bounded, exact and read-only")
+        market_data = n0.getflowmeshmarketdata(market_id, {"limit": 1})
+        assert_equal(market_data["market_id"], market_id)
+        assert_equal(market_data["base_asset_id"], asset_id)
+        assert_equal(market_data["matching_model"], "uniform-price-curve-auction")
+        assert_equal(market_data["quantity_lot_raw"], 1)
+        assert_equal(market_data["price_tick_raw"], 1)
+        assert_equal(market_data["base_metadata"]["known"], True)
+        assert_equal(market_data["base_metadata"]["decimals"], 2)
+        assert_equal(market_data["snapshot"]["certified"], True)
+        assert_equal(market_data["history"]["available"], True)
+        assert_equal(len(market_data["history"]["entries"]), 1)
+        assert_equal(market_data["history"]["entries"][0]["cleared"], False)
+        assert_equal(market_data["liquidity"]["curves"], [])
+        assert_equal(market_data["liquidity"]["complete"], True)
+        head = market_data["snapshot"]["last_microblock_hash"]
+        wallet_before = n0.getwalletinfo()
+        mempool_before = n0.getrawmempool()
+        unchanged = n0.getflowmeshmarketdata(market_id, {"known_head": head})
+        assert_equal(unchanged["unchanged"], True)
+        assert_equal(unchanged["snapshot"]["last_microblock_hash"], head)
+        assert_equal(unchanged["snapshot"]["state_root"], market_data["snapshot"]["state_root"])
+        for field in ("round", "candidate_count", "max_verified_attestations", "active_catchup_requests",
+                      "proposals_missing_evidence", "proposals_rejected_round", "attestations_without_candidate"):
+            assert isinstance(unchanged["snapshot"]["runtime"][field], int)
+            assert unchanged["snapshot"]["runtime"][field] >= 0
+        for heavy_field in ("liquidity", "history", "account", "base_metadata"):
+            assert heavy_field not in unchanged
+        wallet_after = n0.getwalletinfo()
+        for field in ("txcount", "keypoolsize", "keypoolsize_hd_internal"):
+            assert_equal(wallet_before.get(field), wallet_after.get(field))
+        assert_equal(n0.getrawmempool(), mempool_before)
+        for options in ({"unexpected": 1}, {"limit": 0}, {"limit": 101}, {"curve_limit": 129}):
+            assert_raises_rpc_error(-8, "", n0.getflowmeshmarketdata, market_id, options)
+        assert_raises_rpc_error(-3, "", n0.getflowmeshmarketdata, market_id, {"limit": "1"})
+        assert_raises_rpc_error(-8, "curve_cursor requires expected_head", n0.getflowmeshmarketdata, market_id, {"curve_cursor": "bid:" + "01" * 32})
+        assert_raises_rpc_error(-1, "certified head changed", n0.getflowmeshmarketdata, market_id, {"expected_head": "01" * 32})
+        assert_equal(n0.getflowmeshmarketdata(market_id, {"before_sequence": 0})["history"]["entries"], [])
+
         self.log.info("FlowMesh pauses if a reorg crosses back below A3")
         active_height = n0.getblockcount()
         invalidated = []
@@ -584,6 +626,19 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
 
         self.wait_until(temporary_order_certified, timeout=120)
         self.wait_for_market_convergence(market_id)
+        standing_data = n1.getflowmeshmarketdata(market_id)
+        assert_equal(standing_data["account"]["b3_reserved_atoms"], int(temporary_notional * 1_000_000_000))
+        assert_equal(len(standing_data["account"]["curves"]), 1)
+        standing_bid = standing_data["account"]["curves"][0]
+        assert_equal(standing_bid["side"], "bid")
+        assert_equal(standing_bid["status"], "open")
+        assert_equal(standing_bid["filled_quantity"], 0)
+        assert_equal(standing_bid["remaining_quantity"], TRADE_QUANTITY)
+        assert_equal(standing_bid["points"], [
+            {"price": TRADE_PRICE // 2, "quantity": TRADE_QUANTITY},
+            {"price": TRADE_PRICE // 2 + 1, "quantity": 0},
+        ])
+        assert_equal(standing_data["liquidity"]["curves"], [standing_bid])
         cancellation = n1.cancelflowmeshorder(market_id, "bid")
         assert_equal(cancellation["accepted"], True)
         assert_equal(cancellation["sequence"], buyer_before["next_sequence"] + 1)
@@ -600,6 +655,7 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
         self.wait_for_market_convergence(market_id)
         # The following trade checkpoints these two certified entries as well;
         # no extra B3 blocks are needed just to observe order cancellation.
+        self.exercise_extra_trading(market_id)
         self.log.info("One matched TEST_ASSET/B3 trade charges exactly 0.01% once")
         n1.submitflowmeshorder(
             market_id, "bid", TRADE_PRICE, TRADE_QUANTITY,
@@ -621,6 +677,20 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
 
         self.wait_until(trade_settled, timeout=120)
         self.wait_for_market_convergence(market_id)
+        settled_data = n1.getflowmeshmarketdata(market_id)
+        assert_equal(settled_data["account"]["curves"], [])
+        assert_equal(settled_data["account"]["b3_reserved_atoms"], 0)
+        assert_equal(settled_data["account"]["base_available"], TRADE_QUANTITY)
+        clears = [entry for entry in settled_data["history"]["entries"] if entry["cleared"]]
+        assert_equal(len(clears), 1)
+        assert_equal(clears[0]["price"], TRADE_PRICE)
+        assert_equal(clears[0]["quantity"], TRADE_QUANTITY)
+        assert_equal(clears[0]["notional_atoms"], int(TRADE_NOTIONAL * 1_000_000_000))
+        assert_equal(clears[0]["fee_atoms"], int(TRADE_FEE * 1_000_000_000))
+        assert_equal(clears[0]["account_fills_known"], True)
+        assert_equal(clears[0]["account_bid_fill"], TRADE_QUANTITY)
+        assert_equal(clears[0]["account_ask_fill"], 0)
+        assert "timestamp" not in clears[0]
         self.publish_pending_checkpoints(market_id)
         seller = n0.getflowmeshbalance(market_id)["account"]
         buyer = n1.getflowmeshbalance(market_id)["account"]

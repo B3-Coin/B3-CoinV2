@@ -7,9 +7,11 @@
 
 #include <dbwrapper.h>
 #include <flowmesh/production_engine.h>
+#include <flowmesh/market_data.h>
 #include <modern/flowmesh_checkpoint.h>
 
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -226,6 +228,11 @@ public:
                    std::optional<StoredProductionEntry>& out,
                    std::string& error);
 
+    /** Bounded derived cache, populated by verified append and existing startup
+     * replay only. Reading never opens/scans the log or executes an entry. */
+    flowmesh::MarketHistoryPage ReadMarketHistory(uint64_t before_sequence,
+                                                size_t limit);
+
     /**
      * Return the earliest entry after the last connected type-8 that must be
      * published: sequence-zero market genesis, every handoff, or the first
@@ -285,6 +292,7 @@ private:
     //! Fresh/empty stores are ready after their initial binding is checked.
     //! A reopened nonempty store becomes ready only after full replay.
     bool m_ready{false};
+    std::deque<flowmesh::MarketHistoryEntry> m_market_history;
 };
 
 } // namespace node

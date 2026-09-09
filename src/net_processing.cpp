@@ -4818,6 +4818,11 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         }
 
         pfrom.fSuccessfullyConnected = true;
+        if (m_opts.flowmesh_sink &&
+            (peer.m_our_services & NODE_B3_FLOWMESH) &&
+            (peer.m_their_services.load() & NODE_B3_FLOWMESH)) {
+            m_opts.flowmesh_sink->FlowMeshPeerConnected(pfrom.GetId());
+        }
         return;
     }
 

@@ -23,6 +23,8 @@ struct Action {
     QString side, destination, txid;
     CAmount price{0}, amount{0};
     bool native{false};
+    std::optional<int> display_decimals;
+    QString display_ticker;
     uint32_t vout{0};
     UniValue effect;
 };

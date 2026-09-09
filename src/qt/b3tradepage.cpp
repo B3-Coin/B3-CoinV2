@@ -351,6 +351,7 @@ void B3TradePage::setWalletModel(WalletModel* wallet)
 #ifdef ENABLE_WALLET
     if (!m_trading_panel && wallet) {
         m_trading_panel = new B3FlowMeshTradingPanel(this);
+        connect(m_trading_panel, &B3FlowMeshTradingPanel::securityWarning, this, &B3TradePage::securityWarning);
         layout()->addWidget(m_trading_panel);
     }
     if (m_trading_panel) {

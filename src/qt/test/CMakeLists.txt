@@ -74,6 +74,18 @@ if(ENABLE_WALLET)
     ENVIRONMENT "QT_QPA_PLATFORM=minimal"
   )
 
+  # Synthetic certified snapshots only: exact units, curves, empty/stale UI;
+  # no node, wallet, sockets, signing or mainnet state.
+  add_executable(test_b3_flowmeshworkspace-qt b3flowmeshworkspacetests.cpp)
+  target_link_libraries(test_b3_flowmeshworkspace-qt
+    core_interface bitcoinqt bitcoin_node univalue Qt6::Test
+  )
+  import_plugins(test_b3_flowmeshworkspace-qt)
+  add_test(NAME test_b3_flowmeshworkspace-qt COMMAND test_b3_flowmeshworkspace-qt)
+  set_tests_properties(test_b3_flowmeshworkspace-qt PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=minimal"
+  )
+
   add_executable(test_b3_flowmeshop-qt b3flowmeshoptests.cpp)
   target_link_libraries(test_b3_flowmeshop-qt
     core_interface bitcoinqt bitcoin_node univalue Qt6::Test

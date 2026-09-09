@@ -155,6 +155,7 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         // external RPC credential or the legacy chart-preview backend.
         m_trade_page = new B3TradePage(m_shell);
         m_shell->setTradePage(m_trade_page);
+        connect(m_trade_page, &B3TradePage::securityWarning, m_assets_page, &B3AssetsPage::showSecurityWarning);
         connect(m_assets_page, &B3AssetsPage::flowMeshRequested, this,
                 [this](const QString& asset_id, bool withdrawal) {
             m_trade_page->openFlowMeshAsset(asset_id, withdrawal);

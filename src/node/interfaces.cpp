@@ -1217,6 +1217,16 @@ public:
         }
         return out;
     }
+    std::optional<flowmesh::MarketData> flowMeshMarketData(
+        const uint256& market_id, const std::optional<uint256>& account_id,
+        const flowmesh::MarketDataQuery& query, std::string& error) override
+    {
+        if (!m_node.flowmesh) {
+            error = "FlowMesh service is not available in this node";
+            return std::nullopt;
+        }
+        return m_node.flowmesh->MarketData(market_id, account_id, query, error);
+    }
     bool flowMeshMarketEstablished(const uint256& market_id) override
     {
         LOCK(::cs_main);

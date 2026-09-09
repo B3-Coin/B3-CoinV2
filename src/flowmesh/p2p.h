@@ -130,6 +130,14 @@ std::optional<std::vector<unsigned char>> EncodeCatchupRequest(uint16_t max_entr
 bool DecodeCatchupRequest(std::span<const unsigned char> payload, uint16_t& max_entries,
                           uint32_t& max_bytes);
 
+/** Advisory only: header.sequence is the next sequence, never a trusted tip. */
+struct MarketHello {
+    uint256 domain;
+    uint256 last_microblock_hash;
+};
+std::vector<unsigned char> EncodeMarketHello(const MarketHello& hello);
+std::optional<MarketHello> DecodeMarketHello(std::span<const unsigned char> payload);
+
 using WirePeerId = int64_t;
 using WireClock = std::chrono::steady_clock;
 
@@ -218,6 +226,7 @@ public:
     bool AcceptResponse(WirePeerId peer, const MarketId& market,
                         uint64_t from_sequence, size_t entry_count,
                         size_t response_bytes);
+    void Cancel(WirePeerId peer, const MarketId& market);
     void RemovePeer(WirePeerId peer);
     size_t Size() const { return m_requests.size(); }
 
@@ -237,6 +246,8 @@ public:
     virtual ~WireMessageSink() = default;
     virtual QueueResult EnqueueWireMessage(WirePeerId peer,
                                            WireMessage message) = 0;
+    //! Called only after the B3 handshake negotiated NODE_B3_FLOWMESH.
+    virtual void FlowMeshPeerConnected(WirePeerId peer) {}
     virtual void FlowMeshPeerDisconnected(WirePeerId peer) = 0;
 };
 

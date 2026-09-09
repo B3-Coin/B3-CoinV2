@@ -53,11 +53,14 @@ Q_SIGNALS:
     void flowMeshRequested(const QString& asset_id, bool withdrawal);
     void walletChanged();
 
+public Q_SLOTS:
+    //! Persistent cross-page warning if any wallet action cannot verify relock.
+    void showSecurityWarning(const QString& warning);
+
 private Q_SLOTS:
     void updateDetails();
     void sendSelectedAsset();
     void receiveSelectedAsset();
-    void showSecurityWarning(const QString& warning);
 
 private:
     void resizeEvent(QResizeEvent* event) override;

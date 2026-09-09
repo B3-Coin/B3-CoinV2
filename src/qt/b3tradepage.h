@@ -49,6 +49,9 @@ public:
     B3OrderBookModel* asks() const { return m_asks; }
     B3TradesModel* trades() const { return m_trades; }
 
+Q_SIGNALS:
+    void securityWarning(const QString& warning);
+
 private Q_SLOTS:
     void updateAvailability();
     void updateTicketTotal();

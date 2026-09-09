@@ -1,6 +1,7 @@
 // Copyright (c) 2026 The B3Coin Core developers
 // Distributed under the MIT software license, see COPYING.
 #include <qt/b3flowmeshtrading.h>
+#include <qt/b3flowmeshmarketdata.h>
 #include <core_io.h>
 #include <flowmesh/market.h>
 #include <key_io.h>
@@ -205,12 +206,14 @@ UniValue DispatchApproved(const Action& a, bool approved, const std::function<bo
 QString Describe(const Action& a)
 {
     const QString prefix{QStringLiteral("Market: %1\nFull base asset ID: %2\nWallet account: %3\n").arg(a.market.id, a.market.base, a.market.has_account ? a.market.account : QStringLiteral("created during deposit preparation"))};
-    const QString amount{a.native ? QString::fromStdString(FormatMoney(a.amount)) + QStringLiteral(" B3") : QString::number(a.amount) + QStringLiteral(" raw base-asset units")};
+    const QString amount{a.native ? QString::fromStdString(FormatMoney(a.amount)) + QStringLiteral(" B3") : a.display_decimals ? B3FlowMeshMarketData::FormatAmount(a.amount, *a.display_decimals) + QLatin1Char(' ') + a.display_ticker + QStringLiteral(" (%1 atomic units)").arg(a.amount) : QString::number(a.amount) + QStringLiteral(" raw base-asset units")};
     switch (a.operation) {
-    case Operation::Order:
+    case Operation::Order: {
         Positive(a.price); Positive(a.amount);
         if (a.price > MAX_MONEY / a.amount) Fail("The order's B3 notional exceeds the consensus range.");
-        return prefix + QStringLiteral("Limit %1: %2 raw base units at %3 B3 atoms per raw base unit.\nExact limit notional: %4 B3\nAccount sequence: %5\nAccepted is not filled. No on-chain network fee is charged by this request; protocol and settlement fees are not quoted by this RPC.").arg(a.side, QString::number(a.amount), QString::number(a.price), QString::fromStdString(FormatMoney(a.price * a.amount)), QString::number(a.market.sequence));
+        const QString base_amount{a.display_decimals ? B3FlowMeshMarketData::FormatAmount(a.amount, *a.display_decimals) + QLatin1Char(' ') + a.display_ticker + QStringLiteral(" (%1 atomic units)").arg(a.amount) : QString::number(a.amount) + QStringLiteral(" raw base-asset units")};
+        return prefix + QStringLiteral("Limit %1: %2 at %3.\nExact limit notional: %4 B3\nAccount sequence: %5\nOne uniform-price curve auction, not price-time priority. Accepted is not filled. Protocol fee is 0.01% of matched notional deducted from seller proceeds; actual allocation depends on certified fills. No network fee for this request.").arg(a.side == QStringLiteral("bid") ? QStringLiteral("Buy") : QStringLiteral("Sell"), base_amount, a.display_decimals ? B3FlowMeshMarketData::FormatPrice(a.price, *a.display_decimals) + QStringLiteral(" B3 / ") + a.display_ticker : QString::number(a.price) + QStringLiteral(" B3 atoms per raw base unit"), QString::fromStdString(FormatMoney(a.price * a.amount)), QString::number(a.market.sequence));
+    }
     case Operation::Cancel: return prefix + QStringLiteral("Cancel this account's standing %1; sequence %2. Cancellation is not certified until processed.").arg(a.side, QString::number(a.market.sequence));
     case Operation::Deposit: return prefix + QStringLiteral("Deposit %1 into a KEYLESS vault. Funds may remain locked if the validator quorum fails. Preparation creates a wallet trading-account key if needed; back up this wallet even if you cancel. Admission needs 31 confirmations.").arg(amount);
     case Operation::Admit: return prefix + QStringLiteral("Admit existing deposit %1:%2. Must have at least 31 confirmations. Admission is not completed settlement.").arg(a.txid).arg(a.vout);

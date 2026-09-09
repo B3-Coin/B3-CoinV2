@@ -81,6 +81,26 @@ bool PayloadShapeValid(const WireMessageKind kind,
 
 } // namespace
 
+std::vector<unsigned char> EncodeMarketHello(const MarketHello& hello)
+{
+    // Existing v1 fmhello framing permits bounded opaque payloads. Older
+    // nodes ignore these hints; unknown payload revisions remain ignorable.
+    std::vector<unsigned char> out{1};
+    out.insert(out.end(), hello.domain.begin(), hello.domain.end());
+    out.insert(out.end(), hello.last_microblock_hash.begin(), hello.last_microblock_hash.end());
+    return out;
+}
+
+std::optional<MarketHello> DecodeMarketHello(const std::span<const unsigned char> payload)
+{
+    if (payload.size() != 65 || payload[0] != 1) return std::nullopt;
+    MarketHello out;
+    std::copy_n(payload.begin() + 1, 32, out.domain.begin());
+    std::copy_n(payload.begin() + 33, 32, out.last_microblock_hash.begin());
+    if (out.domain.IsNull()) return std::nullopt;
+    return out;
+}
+
 std::optional<WireMessageKind> WireKindForCommand(const std::string_view command)
 {
     if (command == "fmhello") return WireMessageKind::HELLO;
@@ -564,6 +584,11 @@ bool CatchupRequestTracker::AcceptResponse(const WirePeerId peer,
     }
     m_requests.erase(it);
     return true;
+}
+
+void CatchupRequestTracker::Cancel(const WirePeerId peer, const MarketId& market)
+{
+    m_requests.erase({peer, market});
 }
 
 void CatchupRequestTracker::RemovePeer(const WirePeerId peer)

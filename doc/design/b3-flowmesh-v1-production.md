@@ -502,7 +502,33 @@ fmentries  bounded catch-up response
 ```
 
 All messages carry version, MarketId, epoch, and sequence before variable data.
-Unknown versions are rejected. Production limits are:
+Unknown versions are rejected.
+
+The `fmhello` revision-1 payload is `u8(1) || domain[32] || last_microblock_hash[32]`;
+its common header carries the sender's current epoch and **next** sequence.
+These are advisory discovery hints, never evidence of finality or authority to
+change committee, state, or signing locks. Nodes announce on connection and
+market discovery and refresh every five seconds (at most two markets per
+worker tick, rotating fairly; connection churn cannot force a market above
+one announcement per second). A higher hint requests the missing certified
+log through the unchanged verification and re-execution path. Older nodes may
+ignore this previously unused hello payload without a wire-version change.
+For mixed-version connections, one ordinary `fmget` probe per negotiated peer
+and locally admitted market discovers an idle older peer's history. A bounded
+cursor per peer covers markets added after the handshake too; it does not
+repeat completed blind probes on every tick. At most 256 negotiated peers are
+tracked, at most eight probe candidates are examined per tick, and at most one
+blind probe is sent per second globally. Disconnect drops that connection's
+cursor; a reconnect gets a fresh scan. Hint-driven and continuation requests
+remain subject to the shared request limits below.
+Catch-up requests expire after five seconds; attempts without verified progress
+retain a fifteen-second cooldown. The runtime bounds outstanding requests to
+16 globally, two per peer and two per market, and retains at most 256 cooldowns.
+Any page that advances verified state permits the next request, including a
+page shortened by the byte limit. An idle market need not produce empty
+microblocks to keep its existing certified history discoverable.
+
+Production limits are:
 
 - action: 4 KiB; action pool: 65,536 actions/16 MiB per market and 256
   actions/1 MiB attributable to one peer;

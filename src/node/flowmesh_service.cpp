@@ -1405,6 +1405,33 @@ std::optional<flowmesh::FlowMeshState> FlowMeshService::StateSnapshot(
     return runtime ? runtime->StateSnapshot(market_id) : std::nullopt;
 }
 
+std::optional<flowmesh::MarketData> FlowMeshService::MarketData(
+    const flowmesh::MarketId& market_id,
+    const std::optional<flowmesh::AccountId>& account,
+    const flowmesh::MarketDataQuery& query, std::string& error) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    bool running{false};
+    {
+        std::lock_guard<std::mutex> lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+        running = m_impl->running && !m_impl->stopping;
+    }
+    if (!runtime) {
+        error = "FlowMesh runtime is unavailable";
+        return std::nullopt;
+    }
+    auto out{runtime->MarketData(market_id, account, query, error)};
+    if (out) {
+        out->snapshot.running = running;
+        if (!running || !m_impl->RulesActiveAtTip() || !m_impl->ReconciledAtTip()) {
+            out->snapshot.paused = true;
+            out->snapshot.error = "FlowMesh service is not active at the current B3 tip";
+        }
+    }
+    return out;
+}
+
 bool FlowMeshService::SubmitLocalAction(const flowmesh::MarketId& market_id,
                                         const flowmesh::Action& action,
                                         std::string& error)
@@ -1924,6 +1951,16 @@ flowmesh::QueueResult FlowMeshService::EnqueueWireMessage(
     }
     return runtime ? runtime->EnqueueWireMessage(peer, std::move(message))
                    : flowmesh::QueueResult::GLOBAL_LIMIT;
+}
+
+void FlowMeshService::FlowMeshPeerConnected(const flowmesh::WirePeerId peer)
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard<std::mutex> lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    if (runtime) runtime->FlowMeshPeerConnected(peer);
 }
 
 void FlowMeshService::FlowMeshPeerDisconnected(

@@ -66,6 +66,200 @@ static uint256 ParseMarketId(const UniValue& value)
     return market;
 }
 
+static flowmesh::MarketDataQuery ParseMarketDataQuery(const UniValue& options)
+{
+    flowmesh::MarketDataQuery query;
+    if (options.isNull()) return query;
+    if (!options.isObject()) throw JSONRPCError(RPC_TYPE_ERROR, "options must be an object");
+    const std::set<std::string> allowed{
+        "limit", "curve_limit", "before_sequence", "curve_cursor", "expected_head", "known_head"};
+    for (const auto& key : options.getKeys()) {
+        if (!allowed.contains(key)) throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown option '" + key + "'");
+    }
+    const auto integer = [&](const std::string& name, const uint64_t minimum, const uint64_t maximum) {
+        const UniValue& value{options[name]};
+        if (!value.isNum()) throw JSONRPCError(RPC_TYPE_ERROR, name + " must be an integer");
+        uint64_t number;
+        try {
+            number = value.getInt<uint64_t>();
+        } catch (const UniValue::type_error&) {
+            throw JSONRPCError(RPC_TYPE_ERROR, name + " must be a nonnegative integer");
+        }
+        if (number < minimum || number > maximum) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, name + " is outside its supported range");
+        }
+        return number;
+    };
+    if (options.exists("limit")) query.limit = integer("limit", 1, flowmesh::MARKET_DATA_MAX_HISTORY);
+    if (options.exists("curve_limit")) query.curve_limit = integer("curve_limit", 1, flowmesh::MARKET_DATA_MAX_CURVES);
+    if (options.exists("before_sequence")) query.before_sequence = integer("before_sequence", 0, std::numeric_limits<uint64_t>::max());
+    for (const auto* name : {"expected_head", "known_head"}) {
+        if (!options.exists(name)) continue;
+        if (!options[name].isStr()) throw JSONRPCError(RPC_TYPE_ERROR, std::string{name} + " must be a hash string");
+        const uint256 head{ParseHashV(options[name], name)};
+        if (std::string{name} == "expected_head") query.expected_head = head;
+        else query.known_head = head;
+    }
+    if (options.exists("curve_cursor")) {
+        if (!options["curve_cursor"].isStr()) throw JSONRPCError(RPC_TYPE_ERROR, "curve_cursor must be a string");
+        const std::string cursor{options["curve_cursor"].get_str()};
+        if (cursor.size() != 68 || (cursor.substr(0, 4) != "bid:" && cursor.substr(0, 4) != "ask:")) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "curve_cursor must be bid:<account_id> or ask:<account_id>");
+        }
+        query.curve_cursor = flowmesh::ClearingEngine::CurveKey{
+            cursor.starts_with("bid:") ? flowmesh::ClearingEngine::Side::BID : flowmesh::ClearingEngine::Side::ASK,
+            ParseHashV(UniValue{cursor.substr(4)}, "curve_cursor")};
+        if (!query.expected_head) throw JSONRPCError(RPC_INVALID_PARAMETER, "curve_cursor requires expected_head");
+    }
+    if (query.known_head && (query.curve_cursor || query.before_sequence)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "known_head cannot be combined with pagination cursors");
+    }
+    return query;
+}
+
+static UniValue MarketCurvesJson(const std::vector<flowmesh::ClearingEngine::CurveView>& curves)
+{
+    UniValue out{UniValue::VARR};
+    for (const auto& curve : curves) {
+        UniValue item{UniValue::VOBJ};
+        item.pushKV("account_id", curve.account_id.GetHex());
+        item.pushKV("side", curve.side == flowmesh::ClearingEngine::Side::BID ? "bid" : "ask");
+        item.pushKV("status", curve.filled_quantity ? "partially-filled" : "open");
+        item.pushKV("filled_quantity", curve.filled_quantity);
+        item.pushKV("remaining_quantity", curve.remaining_quantity);
+        item.pushKV("reserved_amount", curve.reserved_amount);
+        UniValue points{UniValue::VARR};
+        for (const auto& point : curve.points) {
+            UniValue row{UniValue::VOBJ};
+            row.pushKV("price", point.price);
+            row.pushKV("quantity", point.qty);
+            points.push_back(std::move(row));
+        }
+        item.pushKV("points", std::move(points));
+        out.push_back(std::move(item));
+    }
+    return out;
+}
+
+static RPCResult MarketCurveResult()
+{
+    using T = RPCResult::Type;
+    return RPCResult{T::OBJ, "", "Certified standing curve; identity is account and side, not a price-time order", {
+        {T::STR_HEX, "account_id", "Curve owner"},
+        {T::STR, "side", "bid or ask"},
+        {T::STR, "status", "open or partially-filled"},
+        {T::NUM, "filled_quantity", "Base units consumed from this current curve"},
+        {T::NUM, "remaining_quantity", "Maximum original curve quantity minus consumed quantity"},
+        {T::NUM, "reserved_amount", "B3 atoms for bids, base units for asks"},
+        {T::ARR, "points", "Original curve breakpoints; effective quantity is max(evaluate(points, price)-filled_quantity, 0)", {
+            {T::OBJ, "", "Breakpoint", {
+                {T::NUM, "price", "B3 atoms per base atomic unit"},
+                {T::NUM, "quantity", "Original base atomic units at this price"},
+            }},
+        }},
+    }};
+}
+
+static UniValue CertifiedMarketDataJson(const flowmesh::MarketData& data)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("domain", data.domain.GetHex());
+    out.pushKV("market_id", data.market_id.GetHex());
+    out.pushKV("base_asset_id", data.base_asset_id.GetHex());
+    out.pushKV("quote_asset", "B3");
+    out.pushKV("execution_config_id", data.execution_config_id.GetHex());
+    out.pushKV("matching_model", "uniform-price-curve-auction");
+    out.pushKV("quantity_lot_raw", 1);
+    out.pushKV("price_tick_raw", 1);
+    out.pushKV("unchanged", data.unchanged);
+    const auto& source{data.snapshot};
+    UniValue snapshot{UniValue::VOBJ};
+    snapshot.pushKV("certified", source.certified);
+    snapshot.pushKV("next_microblock_sequence", source.next_microblock_sequence);
+    snapshot.pushKV("last_microblock_hash", source.last_microblock_hash.GetHex());
+    snapshot.pushKV("state_root", source.state_root.GetHex());
+    snapshot.pushKV("epoch", source.epoch);
+    snapshot.pushKV("anchor_height", source.anchor_height);
+    snapshot.pushKV("anchor_hash", source.anchor_hash.GetHex());
+    snapshot.pushKV("active_seats", static_cast<uint64_t>(source.active_seats));
+    snapshot.pushKV("quorum_required", static_cast<uint64_t>(source.quorum_required));
+    snapshot.pushKV("running", source.running);
+    snapshot.pushKV("paused", source.paused);
+    snapshot.pushKV("observer_only", source.observer_only);
+    snapshot.pushKV("pending_handoff", source.pending_handoff);
+    snapshot.pushKV("halt", source.halt);
+    snapshot.pushKV("error", source.error);
+    snapshot.pushKV("pending_actions", static_cast<uint64_t>(source.pending_actions));
+    snapshot.pushKV("checkpoint_status_known", false);
+    if (source.local_observed_at) snapshot.pushKV("local_observed_at", *source.local_observed_at);
+    const auto& diagnostics{source.runtime};
+    UniValue runtime{UniValue::VOBJ};
+    runtime.pushKV("round", diagnostics.round);
+    runtime.pushKV("candidate_count", static_cast<uint64_t>(diagnostics.candidate_count));
+    runtime.pushKV("max_verified_attestations", static_cast<uint64_t>(diagnostics.max_verified_attestations));
+    runtime.pushKV("active_catchup_requests", static_cast<uint64_t>(diagnostics.active_catchup_requests));
+    runtime.pushKV("proposals_missing_evidence", diagnostics.proposals_missing_evidence);
+    runtime.pushKV("proposals_rejected_round", diagnostics.proposals_rejected_round);
+    runtime.pushKV("attestations_without_candidate", diagnostics.attestations_without_candidate);
+    if (diagnostics.last_message_observed_at) runtime.pushKV("last_message_observed_at", *diagnostics.last_message_observed_at);
+    if (diagnostics.local_locked_candidate) runtime.pushKV("local_locked_candidate", diagnostics.local_locked_candidate->GetHex());
+    snapshot.pushKV("runtime", std::move(runtime));
+    out.pushKV("snapshot", std::move(snapshot));
+    if (data.unchanged) return out;
+
+    UniValue liquidity{UniValue::VOBJ};
+    liquidity.pushKV("curves", MarketCurvesJson(data.liquidity.curves));
+    liquidity.pushKV("total_curves", static_cast<uint64_t>(data.liquidity.total_curves));
+    liquidity.pushKV("complete", data.liquidity.complete);
+    if (data.liquidity.next_cursor) {
+        liquidity.pushKV("next_cursor", std::string{data.liquidity.next_cursor->first == flowmesh::ClearingEngine::Side::BID ? "bid:" : "ask:"} + data.liquidity.next_cursor->second.GetHex());
+    }
+    out.pushKV("liquidity", std::move(liquidity));
+    if (data.account) {
+        const auto& source_account{*data.account};
+        UniValue account{UniValue::VOBJ};
+        account.pushKV("account_id", source_account.account_id.GetHex());
+        account.pushKV("next_sequence", source_account.next_sequence);
+        account.pushKV("base_available", source_account.base_available);
+        account.pushKV("base_reserved", source_account.base_reserved);
+        account.pushKV("b3_available_atoms", source_account.b3_available_atoms);
+        account.pushKV("b3_reserved_atoms", source_account.b3_reserved_atoms);
+        account.pushKV("curves", MarketCurvesJson(source_account.curves));
+        out.pushKV("account", std::move(account));
+    }
+    UniValue history{UniValue::VOBJ};
+    history.pushKV("available", data.history.available);
+    history.pushKV("scope", "bounded-certified-log-cache");
+    history.pushKV("truncated", data.history.truncated);
+    if (data.history.oldest_retained_sequence) history.pushKV("oldest_retained_sequence", *data.history.oldest_retained_sequence);
+    if (data.history.next_before_sequence) history.pushKV("next_before_sequence", *data.history.next_before_sequence);
+    UniValue entries{UniValue::VARR};
+    for (const auto& entry : data.history.entries) {
+        UniValue item{UniValue::VOBJ};
+        item.pushKV("sequence", entry.sequence);
+        item.pushKV("microblock_hash", entry.microblock_hash.GetHex());
+        item.pushKV("epoch", entry.epoch);
+        item.pushKV("anchor_height", entry.anchor_height);
+        item.pushKV("anchor_hash", entry.anchor_hash.GetHex());
+        item.pushKV("kind", entry.handoff ? "handoff" : "execution");
+        item.pushKV("cleared", entry.cleared);
+        item.pushKV("price", entry.price);
+        item.pushKV("quantity", entry.quantity);
+        item.pushKV("notional_atoms", entry.notional_atoms);
+        item.pushKV("fee_atoms", entry.fee_atoms);
+        const auto fill{data.account ? std::find_if(entry.account_fills.begin(), entry.account_fills.end(),
+            [&](const auto& candidate) { return candidate.account_id == data.account->account_id; }) : entry.account_fills.end()};
+        const bool found{fill != entry.account_fills.end()};
+        item.pushKV("account_fills_known", data.account.has_value() && (entry.account_fills_complete || found));
+        item.pushKV("account_bid_fill", found ? fill->bid_quantity : CAmount{0});
+        item.pushKV("account_ask_fill", found ? fill->ask_quantity : CAmount{0});
+        entries.push_back(std::move(item));
+    }
+    history.pushKV("entries", std::move(entries));
+    out.pushKV("history", std::move(history));
+    return out;
+}
+
 static COutPoint ParseOutPoint(const UniValue& txid_value,
                                const UniValue& vout_value)
 {
@@ -572,6 +766,151 @@ RPCHelpMan listflowmeshmarkets()
             for (const auto& status : wallet->chain().flowMeshMarkets(account)) {
                 out.push_back(MarketStatusJson(status));
             }
+            return out;
+        }};
+}
+
+RPCHelpMan getflowmeshmarketdata()
+{
+    using T = RPCResult::Type;
+    return RPCHelpMan{
+        "getflowmeshmarketdata",
+        "Read certified standing curves, exact auction clearing history and this wallet's account without creating keys, signing or submitting actions. "
+        "FlowMesh uses one uniform-price curve auction per microblock, not price-time priority. "
+        "All prices are integer B3 atoms per base atomic unit and all quantities are integer base units; B3 has nine decimals. "
+        "History contains at most the latest 256 certified microblocks, rebuilt during normal verified startup replay. "
+        "Account fills are explicitly marked unknown if outside the bounded per-entry account cache. "
+        "Microblocks contain no execution timestamp: chart actual cleared entries against sequence. "
+        "local_observed_at is only this process's observation time and is absent for replayed heads. "
+        "An old head on an idle market does not prove quorum failure. Standing curve identity is account and side; the v1 state does not retain submission ids or original submission sequences. "
+        "Use expected_head when continuing curve pages; a changed head rejects pagination. "
+        "known_head returns current lightweight status with unchanged=true when immutable data is unchanged. "
+        "Checkpoint status remains available through listflowmeshmarkets; this bounded query does not scan the checkpoint backlog.\n",
+        {
+            {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Market id"},
+            {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Bounded query options", {
+                {"limit", RPCArg::Type::NUM, RPCArg::Default{50}, "History entries, 1-100"},
+                {"before_sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Exclusive history sequence cursor; newest first"},
+                {"curve_limit", RPCArg::Type::NUM, RPCArg::Default{128}, "Standing curves, 1-128"},
+                {"curve_cursor", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Exclusive bid:<account_id> or ask:<account_id> cursor; requires expected_head"},
+                {"expected_head", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Reject if the certified head has changed"},
+                {"known_head", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Omit heavy data when the head matches; cannot be combined with pagination cursors"},
+            }},
+        },
+        RPCResult{T::OBJ, "", "Bounded certified market snapshot", {
+            {T::STR_HEX, "domain", "FlowMesh domain binding"},
+            {T::STR_HEX, "market_id", "Market id"},
+            {T::STR_HEX, "base_asset_id", "Base asset id"},
+            {T::STR, "quote_asset", "B3"},
+            {T::STR_HEX, "execution_config_id", "Immutable execution configuration"},
+            {T::STR, "matching_model", "uniform-price-curve-auction"},
+            {T::NUM, "quantity_lot_raw", "Current limit-order RPC input granularity in base units"},
+            {T::NUM, "price_tick_raw", "Current limit-order RPC input granularity in B3 atoms per base unit"},
+            {T::BOOL, "unchanged", "Heavy data omitted because known_head matches"},
+            {T::OBJ, "base_metadata", /*optional=*/true, "Verified display precision and cosmetic labels; omitted on unchanged responses; does not certify backing", {
+                {T::BOOL, "known", "Immutable display precision is verified"},
+                {T::NUM, "decimals", /*optional=*/true, "Verified display precision; omitted when unknown"},
+                {T::STR, "ticker", "Display ticker or empty"},
+                {T::STR, "name", "Display name or empty"},
+                {T::STR, "source", "Metadata provenance"},
+                {T::BOOL, "test_only", "Configured unbacked test asset"},
+            }},
+            {T::OBJ, "snapshot", "Atomic certified state plus current local service status; seat count does not prove online quorum", {
+                {T::BOOL, "certified", "At least one threshold-certified microblock is available"},
+                {T::NUM, "next_microblock_sequence", "Next global sequence"},
+                {T::STR_HEX, "last_microblock_hash", "Certified head or zero before genesis"},
+                {T::STR_HEX, "state_root", "Root belonging to this snapshot"},
+                {T::NUM, "epoch", "Active epoch"},
+                {T::NUM, "anchor_height", "Head's B3 anchor height; -1 before genesis"},
+                {T::STR_HEX, "anchor_hash", "Head's B3 anchor, not an execution timestamp"},
+                {T::NUM, "active_seats", "Canonical active-seat count"},
+                {T::NUM, "quorum_required", "Certificate signature threshold"},
+                {T::BOOL, "running", "Local service is running"},
+                {T::BOOL, "paused", "Local execution is paused"},
+                {T::BOOL, "observer_only", "Local node has no active signing seat"},
+                {T::BOOL, "pending_handoff", "Committee handoff is pending"},
+                {T::STR, "halt", "Local fail-closed halt state"},
+                {T::STR, "error", "Local service error"},
+                {T::NUM, "pending_actions", "Uncertified local queued actions; not fills"},
+                {T::BOOL, "checkpoint_status_known", "False: use listflowmeshmarkets for checkpoint backlog"},
+                {T::NUM, "local_observed_at", /*optional=*/true, "Local Unix seconds when this process committed the head; not certified time"},
+                {T::OBJ, "runtime", "Bounded local observations for the current epoch/next sequence, not consensus or proof of live quorum; counters reset at certified advancement", {
+                    {T::NUM, "round", "Current local proposal round"},
+                    {T::NUM, "candidate_count", "Locally cached candidates at the current signing position"},
+                    {T::NUM, "max_verified_attestations", "Largest verified attestation count for one cached candidate"},
+                    {T::NUM, "active_catchup_requests", "Current bounded peer catch-up requests"},
+                    {T::NUM, "proposals_missing_evidence", "Observed proposals missing locally available action evidence"},
+                    {T::NUM, "proposals_rejected_round", "Observed proposals rejected for local round mismatch; not proof that their signatures were valid"},
+                    {T::NUM, "attestations_without_candidate", "Decoded attestation frames naming an in-range seat received with no cached candidate; these are not verified votes"},
+                    {T::NUM, "last_message_observed_at", /*optional=*/true, "Local Unix observation time of market traffic, not certified time"},
+                    {T::STR_HEX, "local_locked_candidate", /*optional=*/true, "Cached local safety-lock candidate at the current signing position; no journal is read by this RPC"},
+                }},
+            }},
+            {T::OBJ, "liquidity", /*optional=*/true, "Account-ordered certified curve page; aggregate depth is complete only when complete=true", {
+                {T::NUM, "total_curves", "Total standing curves"},
+                {T::BOOL, "complete", "This response contains the entire current curve set"},
+                {T::STR, "next_cursor", /*optional=*/true, "Continue with this cursor and the same expected_head"},
+                {T::ARR, "curves", "Standing curves", {MarketCurveResult()}},
+            }},
+            {T::OBJ, "account", /*optional=*/true, "Selected wallet's existing certified account; never creates an account", {
+                {T::STR_HEX, "account_id", "Account identity"},
+                {T::NUM, "next_sequence", "Next certified account action sequence"},
+                {T::NUM, "base_available", "Available base atomic units"},
+                {T::NUM, "base_reserved", "Reserved base atomic units"},
+                {T::NUM, "b3_available_atoms", "Available B3 atoms"},
+                {T::NUM, "b3_reserved_atoms", "Reserved B3 atoms"},
+                {T::ARR, "curves", "At most the account's current bid and ask", {MarketCurveResult()}},
+            }},
+            {T::OBJ, "history", /*optional=*/true, "Verified execution-derived history, newest first", {
+                {T::BOOL, "available", "Verified history cache is ready"},
+                {T::STR, "scope", "bounded-certified-log-cache"},
+                {T::BOOL, "truncated", "Older certified entries have fallen outside the retained cache"},
+                {T::NUM, "oldest_retained_sequence", /*optional=*/true, "Oldest available microblock"},
+                {T::NUM, "next_before_sequence", /*optional=*/true, "Exclusive cursor for another retained page"},
+                {T::ARR, "entries", "Actual certified microblocks, including executions without a match", {
+                    {T::OBJ, "", "Certified execution or handoff", {
+                        {T::NUM, "sequence", "Global microblock sequence"},
+                        {T::STR_HEX, "microblock_hash", "Certified microblock id"},
+                        {T::NUM, "epoch", "Certifying epoch"},
+                        {T::NUM, "anchor_height", "B3 production anchor height"},
+                        {T::STR_HEX, "anchor_hash", "B3 production anchor hash"},
+                        {T::STR, "kind", "execution or handoff"},
+                        {T::BOOL, "cleared", "An actual nonzero match occurred"},
+                        {T::NUM, "price", "Uniform clearing price in B3 atoms per base unit; zero when not cleared"},
+                        {T::NUM, "quantity", "Matched base atomic units"},
+                        {T::NUM, "notional_atoms", "Actual matched native B3 atoms"},
+                        {T::NUM, "fee_atoms", "Exact total protocol fee in B3 atoms"},
+                        {T::BOOL, "account_fills_known", "This account's fill quantities are complete; false means unknown, not no fill"},
+                        {T::NUM, "account_bid_fill", "Base units bought by this account; consult account_fills_known"},
+                        {T::NUM, "account_ask_fill", "Base units sold by this account; consult account_fills_known"},
+                    }},
+                }},
+            }},
+        }},
+        RPCExamples{HelpExampleCli("getflowmeshmarketdata", "\"<market_id>\" '{\"limit\":50}'")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto wallet{GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            const uint256 market_id{ParseMarketId(request.params[0])};
+            const auto query{ParseMarketDataQuery(request.params[1])};
+            const auto account{ExistingWalletAccount(*wallet)};
+            std::string error;
+            const auto data{wallet->chain().flowMeshMarketData(market_id, account, query, error)};
+            if (!data) throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "FlowMesh market data is unavailable" : error);
+            UniValue out{CertifiedMarketDataJson(*data)};
+            if (data->unchanged) return out;
+            UniValue metadata{UniValue::VOBJ};
+            {
+                LOCK(wallet->cs_wallet);
+                const auto asset{wallet->GetAssetMetadata(data->base_asset_id)};
+                metadata.pushKV("known", asset.decimals.has_value());
+                if (asset.decimals) metadata.pushKV("decimals", *asset.decimals);
+                metadata.pushKV("ticker", asset.ticker);
+                metadata.pushKV("name", asset.display_name);
+                metadata.pushKV("source", asset.source);
+                metadata.pushKV("test_only", asset.test_only);
+            }
+            out.pushKV("base_metadata", std::move(metadata));
             return out;
         }};
 }

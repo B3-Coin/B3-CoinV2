@@ -282,6 +282,21 @@ BOOST_AUTO_TEST_CASE(asset_rpc_named_values_preserve_types)
         asset_id);
 }
 
+BOOST_AUTO_TEST_CASE(flowmesh_marketdata_rpc_options_preserve_exact_cursors)
+{
+    const std::string id(64, '1');
+    const auto positional{RPCConvertValues("getflowmeshmarketdata",
+        {id, R"({"limit":100,"before_sequence":9007199254740993,"curve_limit":128})"})};
+    BOOST_CHECK_EQUAL(positional[0].get_str(), id);
+    BOOST_CHECK_EQUAL(positional[1]["before_sequence"].getInt<uint64_t>(), 9'007'199'254'740'993ULL);
+    BOOST_CHECK_EQUAL(positional[1]["limit"].getInt<int>(), 100);
+    const auto named{RPCConvertNamedValues("getflowmeshmarketdata",
+        {"market_id=" + id, "options={\"known_head\":\"" + id + "\"}"})};
+    BOOST_CHECK_EQUAL(named["market_id"].get_str(), id);
+    BOOST_CHECK_EQUAL(named["options"]["known_head"].get_str(), id);
+    BOOST_CHECK_THROW(RPCConvertValues("getflowmeshmarketdata", {id, "not-json"}), std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(flowmesh_prepare_rpc_positional_values_preserve_types)
 {
     // Hashes containing only decimal digits remain strings, and preparation

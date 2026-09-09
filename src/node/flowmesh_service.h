@@ -124,6 +124,10 @@ public:
         const flowmesh::MarketId& market_id) const;
     std::optional<flowmesh::FlowMeshState> StateSnapshot(
         const flowmesh::MarketId& market_id) const;
+    std::optional<flowmesh::MarketData> MarketData(
+        const flowmesh::MarketId& market_id,
+        const std::optional<flowmesh::AccountId>& account,
+        const flowmesh::MarketDataQuery& query, std::string& error) const;
 
     bool SubmitLocalAction(const flowmesh::MarketId& market_id,
                            const flowmesh::Action& action,
@@ -158,6 +162,7 @@ public:
     flowmesh::QueueResult EnqueueWireMessage(
         flowmesh::WirePeerId peer,
         flowmesh::WireMessage message) override;
+    void FlowMeshPeerConnected(flowmesh::WirePeerId peer) override;
     void FlowMeshPeerDisconnected(flowmesh::WirePeerId peer) override;
 
 private:
