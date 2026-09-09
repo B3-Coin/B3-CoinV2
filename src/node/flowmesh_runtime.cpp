@@ -2434,6 +2434,7 @@ void FlowMeshRuntime::HandleEntries(
         m_pending_catchup.erase(pending);
         return;
     }
+    const auto request{pending->second};
     m_pending_catchup.erase(pending);
 
     uint64_t expected{message.header.sequence};
@@ -2472,10 +2473,16 @@ void FlowMeshRuntime::HandleEntries(
     if (market.halt == FlowMeshRuntimeHalt::NONE &&
         expected > message.header.sequence) {
         m_catchup_cooldowns.erase(key);
-        // A byte-limited response may contain fewer than 64 entries. Follow
-        // every page that actually advanced verified state, not just full
-        // count pages. At the peer's tip the final unanswered probe expires.
-        RequestCatchup(peer, market.market_id);
+        // Do not create an unanswered tip probe (and its failure cooldown)
+        // when an honest greedy sender had room for any further legal entry.
+        // This is only local scheduling: no remote tip becomes trusted.
+        // Count- or byte-limited pages, including partial application, retain
+        // the existing follow-up; a short count alone cannot imply a tail.
+        if (!FlowMeshCatchupPageHasTailSlack(
+                request.max_entries, request.max_bytes, entries->size(),
+                message.payload.size(), expected - message.header.sequence)) {
+            RequestCatchup(peer, market.market_id);
+        }
     }
 }
 

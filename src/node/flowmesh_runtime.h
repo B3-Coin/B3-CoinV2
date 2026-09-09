@@ -208,6 +208,19 @@ struct FlowMeshRuntimeMarketStatus {
     std::string error;
 };
 
+/** Local scheduling only: a fully applied page could fit any further entry,
+ * so a greedy honest sender would have included it. This is not a tip proof. */
+inline bool FlowMeshCatchupPageHasTailSlack(
+    const size_t requested_count, const size_t requested_bytes,
+    const size_t received_count, const size_t received_bytes,
+    const size_t applied_count)
+{
+    constexpr size_t MAX_FRAMED_ENTRY{4 + flowmesh::FLOWMESH_CERTIFICATE_MAX_BYTES};
+    return received_count != 0 && applied_count == received_count &&
+           received_count < requested_count && received_bytes <= requested_bytes &&
+           requested_bytes - received_bytes >= MAX_FRAMED_ENTRY;
+}
+
 /** Memory-only relay policy, independent of consensus and signing. */
 class FlowMeshEvidenceRetryBudget
 {

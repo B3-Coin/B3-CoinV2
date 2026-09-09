@@ -366,12 +366,6 @@ public:
         m_partitioned = partitioned;
     }
 
-    void SetCatchupPageLimit(const size_t limit)
-    {
-        std::lock_guard<std::mutex> lock{m_mutex};
-        m_catchup_page_limit = limit;
-    }
-
     void IgnoreHellos()
     {
         std::lock_guard<std::mutex> lock{m_mutex};
@@ -401,13 +395,6 @@ public:
             filter = m_filter;
             if (relay.message.kind == flowmesh::WireMessageKind::GET) ++m_get_requests.at(from);
             if (m_ignore_hellos && relay.message.kind == flowmesh::WireMessageKind::HELLO) return;
-            if (relay.message.kind == flowmesh::WireMessageKind::ENTRIES) {
-                auto entries{flowmesh::DecodeCatchupEntries(relay.message.payload)};
-                if (entries && entries->size() > m_catchup_page_limit) {
-                    entries->resize(m_catchup_page_limit);
-                    relay.message.payload = *flowmesh::EncodeCatchupEntries(*entries);
-                }
-            }
             if (relay.peer) {
                 const size_t target{static_cast<size_t>(*relay.peer)};
                 if (target < m_nodes.size() && m_online[target] &&
@@ -441,7 +428,6 @@ private:
     std::mutex m_mutex;
     std::array<node::FlowMeshRuntime*, 4> m_nodes{};
     std::array<bool, 4> m_online{};
-    size_t m_catchup_page_limit{flowmesh::FLOWMESH_CATCHUP_MAX_ENTRIES};
     bool m_ignore_hellos{false};
     bool m_partitioned{false};
     Filter m_filter;
@@ -2986,7 +2972,28 @@ BOOST_AUTO_TEST_CASE(incoming_committee_waits_for_mature_handoff_publication)
     runtime.Stop();
 }
 
-BOOST_AUTO_TEST_CASE(idle_legacy_peer_discovery_catches_up_new_market_and_byte_limited_pages)
+BOOST_AUTO_TEST_CASE(catchup_tail_slack_requires_full_application_and_count_byte_room)
+{
+    constexpr size_t framed_maximum{4 + flowmesh::FLOWMESH_CERTIFICATE_MAX_BYTES};
+    constexpr size_t response_bytes{1000};
+    const auto tail = [&](const size_t requested_count, const size_t budget,
+                          const size_t returned_count, const size_t applied_count) {
+        return node::FlowMeshCatchupPageHasTailSlack(
+            requested_count, budget, returned_count, response_bytes, applied_count);
+    };
+    BOOST_CHECK(!tail(64, response_bytes + framed_maximum - 1, 1, 1));
+    BOOST_CHECK(tail(64, response_bytes + framed_maximum, 1, 1));
+    BOOST_CHECK(tail(64, response_bytes + framed_maximum + 1, 1, 1));
+    BOOST_CHECK(!tail(1, flowmesh::FLOWMESH_CATCHUP_MAX_BYTES, 1, 1)); // count limited
+    BOOST_CHECK(!tail(64, flowmesh::FLOWMESH_CATCHUP_MAX_BYTES, 64, 64));
+    BOOST_CHECK(!tail(64, flowmesh::FLOWMESH_CATCHUP_MAX_BYTES, 2, 1)); // invalid tail
+    BOOST_CHECK(!tail(64, flowmesh::FLOWMESH_CATCHUP_MAX_BYTES, 1, 0));
+    BOOST_CHECK(!tail(64, flowmesh::FLOWMESH_CATCHUP_MAX_BYTES, 0, 0));
+    BOOST_CHECK(!tail(64, response_bytes - 1, 1, 1)); // no subtraction underflow
+    BOOST_CHECK(!tail(0, flowmesh::FLOWMESH_CATCHUP_MAX_BYTES, 1, 1));
+}
+
+BOOST_AUTO_TEST_CASE(idle_legacy_discovery_stops_small_pages_and_fresh_ahead_recovers)
 {
     const uint256 domain{Filled(0x19)};
     const modern::AssetId asset{Filled(0x39)};
@@ -3008,9 +3015,9 @@ BOOST_AUTO_TEST_CASE(idle_legacy_peer_discovery_catches_up_new_market_and_byte_l
     keys[0].m_keys[market] = seats.secrets;
     std::array<std::unique_ptr<node::FlowMeshProductionStore>, 2> stores;
     RuntimeNetwork network;
+    std::mutex pages_mutex;
+    std::vector<flowmesh::WireMessage> captured_pages;
     std::array<std::unique_ptr<node::FlowMeshRuntime>, 2> runtimes;
-    // Simulate a response limited by bytes rather than by the 64-entry cap.
-    network.SetCatchupPageLimit(1);
     // All remote peers behave like the old version: they never process or
     // advertise fmhello, but their existing certified-history handler works.
     network.IgnoreHellos();
@@ -3072,7 +3079,7 @@ BOOST_AUTO_TEST_CASE(idle_legacy_peer_discovery_catches_up_new_market_and_byte_l
     BOOST_REQUIRE(runtimes[0]->WaitForIdle(std::chrono::seconds{2}));
     BOOST_REQUIRE(runtimes[1]->WaitForIdle(std::chrono::seconds{2}));
     const auto requests_after_sync{network.GetRequests(1)};
-    BOOST_CHECK_GE(requests_after_sync, 3U); // initial + partial page + tip probe
+    BOOST_CHECK_EQUAL(requests_after_sync, 1U); // small verified page; no speculative tip probe
     const auto data{runtimes[1]->MarketData(market, std::nullopt, {}, error)};
     BOOST_REQUIRE_MESSAGE(data, error);
     BOOST_CHECK(data->snapshot.certified);
@@ -3093,7 +3100,7 @@ BOOST_AUTO_TEST_CASE(idle_legacy_peer_discovery_catches_up_new_market_and_byte_l
     query.limit = 101;
     BOOST_CHECK(!runtimes[1]->MarketData(market, std::nullopt, query, error));
 
-    // Expiring the final unanswered probe must not restart blind polling.
+    // Omitting the unnecessary tip probe must not restart blind polling.
     clock.m_now += std::chrono::seconds{30};
     runtimes[1]->NotifyTick();
     BOOST_REQUIRE(runtimes[1]->WaitForIdle(std::chrono::seconds{2}));
@@ -3123,6 +3130,81 @@ BOOST_AUTO_TEST_CASE(idle_legacy_peer_discovery_catches_up_new_market_and_byte_l
     }));
     BOOST_CHECK(runtimes[1]->MarketStatus(market)->last_microblock_hash ==
                 runtimes[0]->MarketStatus(market)->last_microblock_hash);
+    BOOST_REQUIRE(runtimes[0]->WaitForIdle(std::chrono::seconds{2}));
+    BOOST_REQUIRE(runtimes[1]->WaitForIdle(std::chrono::seconds{2}));
+    const auto requests_after_reconnect{network.GetRequests(1)};
+    BOOST_CHECK_EQUAL(requests_after_reconnect, requests_after_sync + 1);
+
+    // Miss two certificates without a reconnect or any clock advancement.
+    // A cryptographically verified future certificate must immediately earn
+    // catch-up: the prior small page installed no unanswered-tip cooldown.
+    network.Set(1, runtimes[1].get(), false);
+    for (size_t i{0}; i < 2; ++i) {
+        const COutPoint next_outpoint{Txid::FromUint256(Filled(0x8b + i)), 0};
+        deposits.entries.emplace(next_outpoint,
+                                 flowmesh::DepositInfo{asset, 1, Filled(0x69)});
+        BOOST_REQUIRE(runtimes[0]->SubmitLocalAction(market, Deposit(next_outpoint)) ==
+                      flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(runtimes[0]->WaitForIdle(std::chrono::seconds{2}));
+        runtimes[0]->NotifyTick();
+        BOOST_REQUIRE(WaitUntil([&] {
+            return runtimes[0]->MarketStatus(market)->next_sequence == 4 + i;
+        }));
+        BOOST_REQUIRE(runtimes[0]->WaitForIdle(std::chrono::seconds{2}));
+    }
+    BOOST_CHECK_EQUAL(runtimes[1]->MarketStatus(market)->next_sequence, 3U);
+    std::optional<node::StoredProductionEntry> future;
+    BOOST_REQUIRE(stores[0]->ReadEntry(4, seats.seats, future, error));
+    BOOST_REQUIRE(future);
+    flowmesh::WireMessage future_certificate{flowmesh::WireMessageKind::CERTIFICATE,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, market, seats.seats.epoch, 4},
+        *flowmesh::EncodeProductionCertifiedPayload({future->entry, future->certificate}, seats.seats.Size())};
+    network.Set(1, runtimes[1].get(), true);
+    BOOST_REQUIRE(runtimes[1]->EnqueueWireMessage(0, future_certificate) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return runtimes[1]->MarketStatus(market)->next_sequence == 5; }));
+    BOOST_REQUIRE(runtimes[0]->WaitForIdle(std::chrono::seconds{2}));
+    BOOST_REQUIRE(runtimes[1]->WaitForIdle(std::chrono::seconds{2}));
+    BOOST_CHECK_EQUAL(network.GetRequests(1), requests_after_reconnect + 1);
+    BOOST_CHECK(runtimes[1]->StateSnapshot(market)->Root() == runtimes[0]->StateSnapshot(market)->Root());
+
+    // Exercise the real greedy sender, not a transport that silently truncates
+    // a tiny response to a 4 MiB request. These replies have no pending request
+    // at the observer, so they cannot change its state.
+    network.SetFilter([&](size_t from, size_t to, const flowmesh::WireMessage& message) {
+        if (from == 0 && to == 1 && message.kind == flowmesh::WireMessageKind::ENTRIES) {
+            std::lock_guard<std::mutex> lock{pages_mutex};
+            captured_pages.push_back(message);
+        }
+        return true;
+    });
+    std::optional<node::StoredProductionEntry> first_entry;
+    BOOST_REQUIRE(stores[0]->ReadEntry(0, seats.seats, first_entry, error));
+    BOOST_REQUIRE(first_entry);
+    const auto first_payload{flowmesh::EncodeProductionCertifiedPayload(
+        {first_entry->entry, first_entry->certificate}, seats.seats.Size())};
+    BOOST_REQUIRE(first_payload);
+    const uint32_t one_entry_bytes{static_cast<uint32_t>(2 + 4 + first_payload->size())};
+    for (const auto& [maximum_count, maximum_bytes] :
+         std::vector<std::pair<uint16_t, uint32_t>>{{1, flowmesh::FLOWMESH_CATCHUP_MAX_BYTES},
+                                                   {64, one_entry_bytes}}) {
+        flowmesh::WireMessage request{flowmesh::WireMessageKind::GET,
+            {flowmesh::FLOWMESH_WIRE_VERSION_V1, market, seats.seats.epoch, 0},
+            *flowmesh::EncodeCatchupRequest(maximum_count, maximum_bytes)};
+        BOOST_REQUIRE(runtimes[0]->EnqueueWireMessage(1, request) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(runtimes[0]->WaitForIdle(std::chrono::seconds{2}));
+        BOOST_REQUIRE(runtimes[1]->WaitForIdle(std::chrono::seconds{2}));
+        std::lock_guard<std::mutex> lock{pages_mutex};
+        BOOST_REQUIRE_EQUAL(captured_pages.size(), 1U);
+        const auto page{flowmesh::DecodeCatchupEntries(captured_pages.front().payload)};
+        BOOST_REQUIRE(page);
+        BOOST_REQUIRE_EQUAL(page->size(), 1U);
+        BOOST_CHECK(page->front() == *first_payload);
+        BOOST_CHECK_EQUAL(captured_pages.front().payload.size(), one_entry_bytes);
+        BOOST_CHECK(!node::FlowMeshCatchupPageHasTailSlack(
+            maximum_count, maximum_bytes, page->size(), captured_pages.front().payload.size(), page->size()));
+        captured_pages.clear();
+    }
+    BOOST_CHECK_EQUAL(runtimes[1]->MarketStatus(market)->next_sequence, 5U);
     for (auto& runtime : runtimes) runtime->Stop();
 }
 
@@ -3225,6 +3307,47 @@ BOOST_AUTO_TEST_CASE(discovery_hints_are_untrusted_and_failed_catchup_is_bounded
     std::optional<uint256> lock;
     BOOST_REQUIRE(store.ReadLock({7, 0}, lock, error));
     BOOST_CHECK(!lock);
+
+    // A valid prefix followed by an invalid entry must not satisfy the
+    // whole-page tail condition, even with ample count/byte slack. Preserve
+    // the existing progress-follow-up behavior from the first missing entry.
+    flowmesh::ProductionEpochGate gate{domain, market, seats.seats};
+    flowmesh::ProductionEntryCheck entry_check;
+    const auto genesis{flowmesh::BuildProductionExecutionEntry(
+        initial, domain, market, seats.seats, gate, 0, 0, {},
+        {100, Filled(0x71)}, {chain.TipHeight(), std::nullopt, &chain},
+        Filled(0x5a), {}, nullptr, entry_check)};
+    BOOST_REQUIRE(genesis);
+    const auto certificate{Certify(genesis->entry, seats)};
+    const auto valid_payload{flowmesh::EncodeProductionCertifiedPayload(
+        {genesis->entry, certificate}, seats.seats.Size())};
+    BOOST_REQUIRE(valid_payload);
+    const auto partial_payload{flowmesh::EncodeCatchupEntries(
+        std::vector<std::vector<unsigned char>>{*valid_payload, {0x42}})};
+    BOOST_REQUIRE(partial_payload);
+    flowmesh::WireMessage partial{flowmesh::WireMessageKind::ENTRIES,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, market, seats.seats.epoch, 0},
+        *partial_payload};
+    BOOST_REQUIRE(runtime.EnqueueWireMessage(8, partial) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(market)->next_sequence, 1U);
+    BOOST_CHECK(runtime.MarketStatus(market)->last_microblock_hash == genesis->entry.GetHash());
+    BOOST_CHECK(runtime.MarketStatus(market)->halt == node::FlowMeshRuntimeHalt::NONE);
+    BOOST_CHECK_EQUAL(count(flowmesh::WireMessageKind::GET), 4);
+    {
+        std::lock_guard<std::mutex> guard{relay_mutex};
+        const auto last_get{std::find_if(relayed.rbegin(), relayed.rend(), [](const auto& relay) {
+            return relay.message.kind == flowmesh::WireMessageKind::GET;
+        })};
+        BOOST_REQUIRE(last_get != relayed.rend());
+        BOOST_CHECK_EQUAL(last_get->message.header.sequence, 1U);
+    }
+    clock.m_now += std::chrono::seconds{6};
+    runtime.NotifyTick();
+    BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
+    BOOST_REQUIRE(runtime.EnqueueWireMessage(8, hello) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
+    BOOST_CHECK_EQUAL(count(flowmesh::WireMessageKind::GET), 4); // failure cooldown unchanged
     runtime.Stop();
 }
 
