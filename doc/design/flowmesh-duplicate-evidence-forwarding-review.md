@@ -1,6 +1,9 @@
 # FlowMesh exact duplicate-evidence forwarding
 
-Status: implemented; focused execution and full functional qualification pending.
+Status: implemented and independently reviewed. Runtime `8ea5251` passed all
+59 focused P2P/store/runtime/clearing cases (103,182 assertions) and one complete
+four-node speed/lifecycle test on 10 September 2026. This qualifies the observed
+repair workload, not general liveness or recovery of existing conflicting locks.
 
 ## Scope
 
@@ -67,3 +70,18 @@ This is a transport repair opportunity before incompatible final locks exist.
 The unchanged protocol cannot repair an already split irreversible lock. It also
 does not relax stale ACTION headers or solve a locally originated action that
 never reaches any peer. Passing unit tests alone does not qualify burst trading.
+
+The unchanged full workload used 40 sequential actions followed by a 64-action
+burst on a line topology, with the prior failed-run seed
+`412028412145430128`. All burst actions certified in 3.556 seconds, including
+1.975 seconds of RPC submission. The sequential median was 248 ms, p95 2.183 s,
+and p99 13.652 s; the slow tail must not be hidden by the median. No B3 blocks
+were produced during these 104 actions. Deposits, exact-fee matching, treasury
+and user payouts, settlement, restart and reindex also passed. These are local
+regtest observations, not a mainnet throughput or latency guarantee.
+
+Three earlier real-P2P runs and a deterministic regression produced honest
+two-against-two permanent-lock splits. Those records were preserved, and the
+existing split-lock regression still characterizes a safe halt. A successful
+transport repair does not revoke the earlier signatures or establish a general
+round-change agreement protocol.
