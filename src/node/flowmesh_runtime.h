@@ -278,6 +278,20 @@ private:
     size_t m_bytes{0};
 };
 
+/** Additional exact ACTION copies; not the retained-candidate retry budget. */
+class FlowMeshDuplicateActionRelayBudget : public FlowMeshCommitteeRelayBudget
+{
+public:
+    static constexpr size_t MAX_MESSAGES{4};
+    static constexpr size_t MAX_BYTES{16 * 1024};
+    static constexpr size_t MAX_MARKETS_SCANNED{16};
+    static constexpr size_t MAX_ACTIONS_SCANNED{16};
+    static constexpr auto REPEAT_DELAY{std::chrono::milliseconds{250}};
+
+    FlowMeshDuplicateActionRelayBudget()
+        : FlowMeshCommitteeRelayBudget{MAX_MESSAGES, MAX_BYTES} {}
+};
+
 /**
  * Production FlowMesh orchestration core.
  *
@@ -368,6 +382,7 @@ private:
     void ProcessMessage(const flowmesh::QueuedWireMessage& queued);
     void ProcessTick();
     void RetryRetainedEvidence();
+    void ForwardPendingDuplicateActions();
     void AnnounceMarkets(bool refresh);
     void ProbeLegacyPeers(const std::vector<flowmesh::WirePeerId>& peers);
     bool TryRequestCatchup(Market& market, flowmesh::WirePeerId peer);
@@ -448,6 +463,8 @@ private:
     FlowMeshCommitteeRelayBudget m_committee_relay_budget{
         FlowMeshCommitteeRelayBudget::GLOBAL_MESSAGES,
         FlowMeshCommitteeRelayBudget::GLOBAL_BYTES};
+    FlowMeshDuplicateActionRelayBudget m_duplicate_action_relay_budget;
+    flowmesh::MarketId m_duplicate_action_relay_cursor;
 };
 
 } // namespace node

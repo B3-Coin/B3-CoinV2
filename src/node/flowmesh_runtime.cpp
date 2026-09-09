@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <list>
 #include <set>
 #include <span>
 #include <utility>
@@ -75,7 +76,7 @@ public:
         } else if (m_signed.count({action.signer, action.sequence}) != 0) {
             return false;
         }
-        m_actions.emplace(id, action);
+        m_actions.emplace(id, StoredAction{action});
         m_origins.emplace(id, origin);
         m_bytes += bytes;
         if (origin != LOCAL_ACTION_PEER) {
@@ -99,7 +100,7 @@ public:
         for (const flowmesh::Action& semantic : semantic_actions) {
             const auto it{m_actions.find(semantic.Id())};
             if (it == m_actions.end()) return std::nullopt;
-            flowmesh::Action stripped{it->second};
+            flowmesh::Action stripped{it->second.action};
             stripped.credential.clear();
             const auto semantic_bytes{
                 flowmesh::EncodeProductionActionPayload(semantic)};
@@ -109,7 +110,7 @@ public:
                 *semantic_bytes != *stripped_bytes) {
                 return std::nullopt;
             }
-            out.push_back(it->second);
+            out.push_back(it->second.action);
         }
         return out;
     }
@@ -123,7 +124,7 @@ public:
         out.reserve(std::min(maximum, m_actions.size()));
         for (const auto& [outpoint, id] : m_deposits) {
             if (out.size() >= maximum) return out;
-            if (!state.DepositConsumed(outpoint)) out.push_back(m_actions.at(id));
+            if (!state.DepositConsumed(outpoint)) out.push_back(m_actions.at(id).action);
         }
         const flowmesh::AccountId* signer_before{nullptr};
         uint64_t expected{0};
@@ -135,10 +136,74 @@ public:
                 expected = state.NextSequence(signer);
             }
             if (sequence != expected) continue;
-            out.push_back(m_actions.at(id));
+            out.push_back(m_actions.at(id).action);
             ++expected;
         }
         return out;
+    }
+
+    // Admit an obligation only for an incoming exact authenticated duplicate.
+    // Action::Id deliberately excludes credentials, so compare full bytes.
+    bool QueueDuplicateForward(const flowmesh::Action& action,
+                               const flowmesh::WireMessage& message,
+                               const flowmesh::WirePeerId peer,
+                               const flowmesh::FlowMeshState& state,
+                               const flowmesh::WireClock::time_point now)
+    {
+        const auto found{m_actions.find(action.Id())};
+        if (found == m_actions.end() || !action.ShapeIsCanonical() ||
+            !m_verifier || !m_verifier(action) || !StillPending(action, state)) return false;
+        auto& stored{found->second};
+        const auto bytes{flowmesh::EncodeProductionActionPayload(stored.action)};
+        if (!bytes || *bytes != message.payload) return false;
+        if (stored.forward) return true; // coalesce without changing FIFO order/origin
+        if (stored.last_forward_attempt &&
+            now < *stored.last_forward_attempt + FlowMeshDuplicateActionRelayBudget::REPEAT_DELAY) return false;
+        m_pending_forwards.push_back(found->first);
+        stored.forward = PendingForward{message.header, peer,
+                                        std::prev(m_pending_forwards.end())};
+        return true;
+    }
+
+    bool HasPendingForwards() const { return !m_pending_forwards.empty(); }
+
+    // Invalid/stale obligations are removed. A valid front remains in place
+    // until its complete frame fits the shared budget, preventing tail loss.
+    std::optional<flowmesh::WireMessage> PrepareDuplicateForward(
+        const flowmesh::WireHeader& expected,
+        const flowmesh::FlowMeshState& state,
+        flowmesh::WirePeerId& exclude_peer)
+    {
+        if (m_pending_forwards.empty()) return std::nullopt;
+        auto& stored{m_actions.at(m_pending_forwards.front())};
+        if (!(stored.forward->header == expected) ||
+            !StillPending(stored.action, state) || !m_verifier ||
+            !m_verifier(stored.action)) {
+            RemoveForward(stored);
+            return std::nullopt;
+        }
+        const auto payload{flowmesh::EncodeProductionActionPayload(stored.action)};
+        if (!payload) {
+            RemoveForward(stored);
+            return std::nullopt;
+        }
+        exclude_peer = stored.forward->peer;
+        return flowmesh::WireMessage{flowmesh::WireMessageKind::ACTION,
+                                     stored.forward->header, *payload};
+    }
+
+    void CompleteDuplicateForward(const flowmesh::WireClock::time_point now)
+    {
+        auto& stored{m_actions.at(m_pending_forwards.front())};
+        stored.last_forward_attempt = now;
+        RemoveForward(stored);
+    }
+
+    void ClearDuplicateForwards()
+    {
+        while (!m_pending_forwards.empty()) {
+            RemoveForward(m_actions.at(m_pending_forwards.front()));
+        }
     }
 
     void Prune(const flowmesh::FlowMeshState& state)
@@ -191,11 +256,36 @@ public:
     }
 
 private:
+    struct PendingForward {
+        flowmesh::WireHeader header;
+        flowmesh::WirePeerId peer;
+        std::list<uint256>::iterator position;
+    };
+    struct StoredAction {
+        flowmesh::Action action;
+        std::optional<flowmesh::WireClock::time_point> last_forward_attempt{};
+        std::optional<PendingForward> forward{};
+    };
+
+    static bool StillPending(const flowmesh::Action& action,
+                             const flowmesh::FlowMeshState& state)
+    {
+        return action.IsDeposit() ? !state.DepositConsumed(action.outpoint)
+                                  : action.sequence >= state.NextSequence(action.signer);
+    }
+
+    void RemoveForward(StoredAction& stored)
+    {
+        if (!stored.forward) return;
+        m_pending_forwards.erase(stored.forward->position);
+        stored.forward.reset();
+    }
+
     void Drop(const uint256& id)
     {
         const auto it{m_actions.find(id)};
         if (it == m_actions.end()) return;
-        const size_t bytes{static_cast<size_t>(::GetSerializeSize(it->second))};
+        const size_t bytes{static_cast<size_t>(::GetSerializeSize(it->second.action))};
         m_bytes -= bytes;
         const auto origin{m_origins.find(id)};
         if (origin != m_origins.end()) {
@@ -209,6 +299,7 @@ private:
             }
             m_origins.erase(origin);
         }
+        RemoveForward(it->second);
         m_actions.erase(it);
     }
 
@@ -218,7 +309,8 @@ private:
     };
 
     Verifier m_verifier;
-    std::map<uint256, flowmesh::Action> m_actions;
+    std::map<uint256, StoredAction> m_actions;
+    std::list<uint256> m_pending_forwards; // one ID, no payload, per stored action
     std::map<uint256, flowmesh::WirePeerId> m_origins;
     std::map<flowmesh::WirePeerId, Usage> m_peer_usage;
     std::map<COutPoint, uint256> m_deposits;
@@ -313,6 +405,7 @@ struct FlowMeshRuntime::Market {
     FlowMeshCommitteeRelayBudget committee_relay_budget{
         FlowMeshCommitteeRelayBudget::MARKET_MESSAGES,
         FlowMeshCommitteeRelayBudget::MARKET_BYTES};
+    FlowMeshDuplicateActionRelayBudget duplicate_action_relay_budget;
 
     Market(const FlowMeshRuntimeMarketConfig& config,
            FlowMeshRuntimeConfig& runtime_config)
@@ -342,6 +435,7 @@ void HaltMarket(Market& market, const FlowMeshRuntimeHalt halt,
 {
     if (market.halt != FlowMeshRuntimeHalt::NONE) return;
     market.halt = halt;
+    market.pool.ClearDuplicateForwards();
     market.error = std::move(error);
 }
 
@@ -729,6 +823,7 @@ bool CommitCertified(Market& market,
     market.certified_state_root = certified.entry.state_root;
     market.local_observed_at = GetTime();
     ++market.next_sequence;
+    market.pool.ClearDuplicateForwards(); // never rewrite a queued retry to the new head
     market.next_effect_index += certified.entry.effect_count;
     market.previous_anchor = certified.entry.anchor;
     market.committed_anchors[{certified.entry.anchor.height,
@@ -1446,6 +1541,55 @@ void FlowMeshRuntime::ProcessTick()
         MaybePropose(market);
     }
     RetryRetainedEvidence();
+    ForwardPendingDuplicateActions();
+}
+
+void FlowMeshRuntime::ForwardPendingDuplicateActions()
+{
+    if (m_markets.empty()) return;
+    const auto now{m_config.clock->Now()};
+    auto it{m_markets.upper_bound(m_duplicate_action_relay_cursor)};
+    size_t actions_scanned{0};
+    for (size_t markets_scanned{0};
+         markets_scanned < std::min(m_markets.size(), FlowMeshDuplicateActionRelayBudget::MAX_MARKETS_SCANNED) &&
+         actions_scanned < FlowMeshDuplicateActionRelayBudget::MAX_ACTIONS_SCANNED;
+         ++markets_scanned) {
+        // Do not move past the next market when the previous one consumed
+        // the entire global batch: it must lead the next batch fairly.
+        if (!m_duplicate_action_relay_budget.Available(
+                now, flowmesh::FLOWMESH_WIRE_HEADER_SIZE + 1)) return;
+        if (it == m_markets.end()) it = m_markets.begin();
+        Market& market{*it->second};
+        m_duplicate_action_relay_cursor = it->first;
+        ++it;
+        if (!market.ready || market.halt != FlowMeshRuntimeHalt::NONE || market.pending_handoff) {
+            market.pool.ClearDuplicateForwards();
+            continue;
+        }
+        const auto transition{CurrentSeatTransition(market)};
+        if (!transition || transition->kind != FlowMeshSeatTransitionKind::CONTINUE) {
+            market.pool.ClearDuplicateForwards();
+            continue;
+        }
+        const flowmesh::WireHeader expected{flowmesh::FLOWMESH_WIRE_VERSION_V1,
+            market.market_id, market.seats.epoch, market.next_sequence};
+        while (market.pool.HasPendingForwards() &&
+               actions_scanned < FlowMeshDuplicateActionRelayBudget::MAX_ACTIONS_SCANNED) {
+            ++actions_scanned;
+            flowmesh::WirePeerId exclude_peer;
+            auto message{market.pool.PrepareDuplicateForward(expected, market.state, exclude_peer)};
+            if (!message) continue;
+            const size_t bytes{flowmesh::FLOWMESH_WIRE_HEADER_SIZE + message->payload.size()};
+            // Preserve FIFO position on exhausted budget; a later tick
+            // completes this already received obligation without re-enqueue.
+            if (!m_duplicate_action_relay_budget.Available(now, bytes)) return;
+            if (!market.duplicate_action_relay_budget.Available(now, bytes)) break;
+            market.pool.CompleteDuplicateForward(now);
+            m_duplicate_action_relay_budget.Charge(bytes);
+            market.duplicate_action_relay_budget.Charge(bytes);
+            RelayMessage(market, std::move(*message), std::nullopt, exclude_peer);
+        }
+    }
 }
 
 void FlowMeshRuntime::RetryRetainedEvidence()
@@ -1658,7 +1802,14 @@ void FlowMeshRuntime::HandleAction(
         return;
     }
     const auto action{flowmesh::DecodeProductionActionPayload(message.payload)};
-    if (!action || !market.pool.Add(*action, peer)) return;
+    if (!action) return;
+    if (!market.pool.Add(*action, peer)) {
+        if (peer != LOCAL_ACTION_PEER) {
+            market.pool.QueueDuplicateForward(*action, message, peer,
+                                               market.state, market.clock->Now());
+        }
+        return;
+    }
     RelayMessage(market, message, std::nullopt,
                  peer == LOCAL_ACTION_PEER
                      ? std::nullopt
