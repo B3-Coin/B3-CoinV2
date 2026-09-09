@@ -17,6 +17,7 @@
 #include <flowmesh/ledger.h>
 #include <hash.h>
 #include <modern/policy.h>
+#include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
 
@@ -260,6 +261,33 @@ BOOST_AUTO_TEST_CASE(production_fee_is_withheld_once_from_seller_and_split_80_20
     }
     BOOST_CHECK_EQUAL(ledger.Available(flowmesh::FeeAccount(), Quote()), 0);
     BOOST_CHECK(ledger.SolvencyHolds());
+}
+
+BOOST_AUTO_TEST_CASE(small_trade_treasury_share_can_be_below_native_payout_dust)
+{
+    // Characterize a wallet/relay-policy boundary, not a new minimum trade.
+    // BatchExecutor can emit the positive treasury balance once pool custody
+    // is mature; native receipt payouts must preserve this exact amount.
+    const CScript destination{CScript{} << OP_DUP << OP_HASH160
+        << std::vector<unsigned char>(20, 0x11) << OP_EQUALVERIFY << OP_CHECKSIG};
+    const CFeeRate dust_fee{DUST_RELAY_TX_FEE};
+    const std::array<flowmesh::SeatId, 4> seats{uint256{1}, uint256{2}, uint256{3}, uint256{4}};
+    for (const CAmount notional : {CAmount{10'000'000}, CAmount{27'300'000}, CAmount{50'000'000}}) {
+        const std::array<flowmesh::SellerQuoteProceeds, 1> sellers{{{BOB, notional}}};
+        flowmesh::FeeAllocationCheck check;
+        const auto allocation{flowmesh::AllocateFlowMeshFees(notional, sellers, seats, check)};
+        BOOST_REQUIRE(allocation);
+        BOOST_REQUIRE(check == flowmesh::FeeAllocationCheck::OK);
+        const CTxOut payout{allocation->treasury_fee, destination};
+        BOOST_CHECK_EQUAL(GetDustThreshold(payout, dust_fee), 546);
+        if (notional == 10'000'000) { // 0.01 B3 trade => 200-atom treasury share.
+            BOOST_CHECK_EQUAL(allocation->treasury_fee, 200);
+            BOOST_CHECK(IsDust(payout, dust_fee));
+        } else {
+            BOOST_CHECK_GE(allocation->treasury_fee, 546);
+            BOOST_CHECK(!IsDust(payout, dust_fee));
+        }
+    }
 }
 
 BOOST_AUTO_TEST_CASE(noncanonical_fee_epoch_rejects_atomically)

@@ -121,8 +121,11 @@ private Q_SLOTS:
     {
         B3FlowMeshTradingPanel panel; panel.resize(1200, 850); panel.m_timer->stop();
         const auto s{Parse(Data())}; B3FlowMeshTrading::Market m; m.id = s.market; m.base = s.base; m.domain = s.domain; m.config = s.config; m.vault = QString::fromStdString(flowmesh::ComputeFlowMeshVaultId(H(1), *uint256::FromHex(s.market.toStdString()))->GetHex()); m.account = s.account; m.has_account = true; m.ready = true; m.publish_ready = true; m.base_available = s.base_available; m.b3_available = s.b3_available;
+        m.base_reserved = s.base_reserved; m.b3_reserved = s.b3_reserved;
         panel.m_market_data = {m}; { QSignalBlocker block{panel.m_market}; panel.m_market->addItem(QStringLiteral("tUSD / B3"), m.id); } panel.m_snapshot = s; panel.m_response_age.start(); panel.updateDataViews(); panel.updateMarketText();
         QCOMPARE(panel.m_chart->pricePointCount(), 1); QCOMPARE(panel.m_history_view->rowCount(), 1); QCOMPARE(panel.m_own_view->rowCount(), 1);
+        QCOMPARE(panel.m_own_view->item(0, 3)->text(), QStringLiteral("0.75 B3"));
+        QVERIFY(panel.m_balances->text().contains(QStringLiteral("Reserved  0 tUSD · 0.75 B3")));
         panel.m_price->setText(QStringLiteral("1")); panel.m_quantity->setText(QStringLiteral("1")); QVERIFY(panel.m_ticket_total->text().contains(QStringLiteral("1 B3"))); QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_deposit->isEnabled()); QVERIFY(!panel.m_advanced->isVisible());
         panel.m_read_failed = true; panel.updateMarketText(); QVERIFY(panel.m_status->text().contains(QStringLiteral("stale"))); QVERIFY(!panel.m_order->isEnabled());
         panel.setWalletModel(nullptr); QVERIFY(!panel.m_snapshot); QCOMPARE(panel.m_chart->pricePointCount(), 0); QCOMPARE(panel.m_history_view->rowCount(), 0); QVERIFY(!panel.m_order->isEnabled());
@@ -138,9 +141,12 @@ private Q_SLOTS:
         }
         B3FlowMeshTradingPanel panel; panel.resize(1320, 940); panel.m_timer->stop();
         B3FlowMeshTrading::Market m; m.id = s.market; m.base = s.base; m.domain = s.domain; m.config = s.config; m.vault = QString::fromStdString(flowmesh::ComputeFlowMeshVaultId(H(1), *uint256::FromHex(s.market.toStdString()))->GetHex()); m.account = s.account; m.has_account = true; m.ready = true; m.publish_ready = true; m.sequence = s.account_sequence; m.base_available = s.base_available; m.b3_available = s.b3_available;
+        m.base_reserved = s.base_reserved; m.b3_reserved = s.b3_reserved;
         panel.m_market_data = {m}; { QSignalBlocker block{panel.m_market}; panel.m_market->addItem(QStringLiteral("tUSD / B3 — SYNTHETIC QA"), m.id); }
         panel.m_wallet_name = QStringLiteral("SYNTHETIC QA · no wallet / no signing"); panel.m_snapshot = s; panel.m_response_age.start(); panel.m_certificate_age.start(); panel.m_pending_market = s.market; panel.m_pending_account = s.account; panel.m_pending_sequence = s.account_sequence;
         panel.m_price->setText(QStringLiteral("1.009")); panel.m_quantity->setText(QStringLiteral("0.25")); panel.updateDataViews(); panel.updateMarketText(); panel.show(); QCoreApplication::processEvents();
+        QCOMPARE(panel.m_own_view->item(0, 3)->text(), QStringLiteral("0.75 B3"));
+        QVERIFY(panel.m_balances->text().contains(QStringLiteral("Reserved  0 tUSD · 0.75 B3")));
         const auto save = [&](const QString& name) { QImage image{panel.size(), QImage::Format_ARGB32}; image.fill(Qt::transparent); panel.render(&image); return image.save(output.filePath(name)); };
         QVERIFY(save(QStringLiteral("synthetic-flowmesh-pending.png")));
         panel.m_chart->setMode(B3FlowMeshChart::Mode::Liquidity); QVERIFY(save(QStringLiteral("synthetic-flowmesh-liquidity.png")));
