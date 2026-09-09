@@ -180,12 +180,15 @@ Snapshot Parse(const UniValue& value)
     return s;
 }
 
-bool AdmissionReady(const Snapshot& s, int64_t response_age, int64_t certificate_age)
+bool AdmissionReady(const Snapshot& s, int64_t response_age, int64_t certificate_age, int64_t queued_without_progress)
 {
     (void)certificate_age; // Idle markets do not produce empty heartbeat certificates.
+    // Local UI precaution, not a claim that the committee is offline. Only
+    // time with outstanding requests counts; an idle chart does not pause it.
+    if (s.pending_actions > 0 && queued_without_progress >= 30'000) return false;
     return response_age >= 0 && response_age <= 3000 && s.certified && s.running && !s.paused && !s.handoff && s.halt == QStringLiteral("none") && s.error.isEmpty() && s.active_seats >= 4 && s.active_seats <= 1'000'000 && s.quorum_required == (s.active_seats * 2) / 3 + 1;
 }
-QString StatusText(const Snapshot& s, int64_t response_age, int64_t certificate_age)
+QString StatusText(const Snapshot& s, int64_t response_age, int64_t certificate_age, int64_t queued_without_progress)
 {
     if (response_age < 0 || response_age > 3000) return QStringLiteral("Connection stale · last certified data retained; new orders are disabled.");
     if (!s.running) return QStringLiteral("Market service offline · waiting for the node.");
@@ -193,6 +196,7 @@ QString StatusText(const Snapshot& s, int64_t response_age, int64_t certificate_
     if (s.handoff) return QStringLiteral("Validator handoff · new orders paused; certified settlement remains available.");
     if (s.paused) return QStringLiteral("Market paused · quorum or checkpoint progress required.");
     if (!s.certified) return QStringLiteral("Awaiting first certified microblock · no price or fills yet.");
+    if (s.pending_actions > 0 && queued_without_progress >= 30'000) return QStringLiteral("Queued requests have not certified for 30 seconds · new submissions paused locally. Existing requests are not canceled.");
     if (certificate_age < 0 || certificate_age > 10000) return QStringLiteral("Certified state · awaiting another auction; current quorum is not independently proven.");
     return QStringLiteral("Certified updates observed · runtime status alone is not proof of current quorum.");
 }

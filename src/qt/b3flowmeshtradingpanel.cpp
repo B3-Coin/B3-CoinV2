@@ -161,7 +161,7 @@ void B3FlowMeshTradingPanel::setWalletModel(WalletModel* wallet)
     cancelAndWait();
     if (m_wallet) disconnect(m_wallet, nullptr, this, nullptr);
     m_wallet = wallet; m_backend.reset(); m_market_data.clear(); m_effect_data.clear(); m_snapshot.reset();
-    m_response_age.invalidate(); m_certificate_age.invalidate(); m_catalog_age.invalidate(); m_attempt_age.invalidate(); m_read_failed = false; m_read_failures = 0;
+    m_response_age.invalidate(); m_certificate_age.invalidate(); m_catalog_age.invalidate(); m_attempt_age.invalidate(); m_queue_age.invalidate(); m_read_failed = false; m_read_failures = 0;
     m_uncertain_refreshed = false;
     { QSignalBlocker blocker{m_market}; m_market->clear(); } m_effect->clear();
     m_wallet_name = wallet ? wallet->getDisplayName() : tr("No wallet");
@@ -202,7 +202,7 @@ void B3FlowMeshTradingPanel::updateMarketText()
         m_pair_title->setText(matched && m_snapshot->units.known ? m_snapshot->units.ticker + QStringLiteral(" / B3") : tr("Spot market · %1…").arg(selected->base.left(12)));
         m_pair_title->setToolTip(tr("Wallet: %1\nBase asset: %2\nMarket: %3\nVault: %4").arg(m_wallet_name, selected->base, selected->id, selected->vault));
         m_identity_detail->setText(m_pair_title->toolTip() + (matched && m_snapshot->units.known ? tr("\nMetadata: %1 · %2 decimals · %3\nNames and tickers do not prove reserves or dollar backing.").arg(m_snapshot->units.source).arg(m_snapshot->units.decimals).arg(m_snapshot->units.test_only ? tr("TEST ASSET") : tr("asset identity shown above")) : tr("\nToken precision has not been verified.")));
-        m_status->setText(matched ? B3FlowMeshMarketData::StatusText(*m_snapshot, m_read_failed || !m_response_age.isValid() ? -1 : m_response_age.elapsed(), m_certificate_age.isValid() ? m_certificate_age.elapsed() : -1) : tr("Reading certified market snapshot…"));
+        m_status->setText(matched ? B3FlowMeshMarketData::StatusText(*m_snapshot, m_read_failed || !m_response_age.isValid() ? -1 : m_response_age.elapsed(), m_certificate_age.isValid() ? m_certificate_age.elapsed() : -1, m_queue_age.isValid() ? m_queue_age.elapsed() : -1) : tr("Reading certified market snapshot…"));
         if (matched) {
             const auto& s{*m_snapshot}; const auto base = [&](CAmount n) -> QString {
                 if (s.units.known) return B3FlowMeshMarketData::FormatAmount(n, s.units.decimals) + QLatin1Char(' ') + s.units.ticker;
@@ -314,7 +314,7 @@ void B3FlowMeshTradingPanel::updateControls()
     const auto selected{market()};
     const bool idle{m_wallet && m_backend && !m_busy && m_security_warning.isEmpty()};
     const bool signing{idle && !m_thread && !m_uncertain && !m_backend->privateKeysDisabled()};
-    const bool data_ready{selected && m_snapshot && m_snapshot->market == selected->id && !m_read_failed && B3FlowMeshMarketData::AdmissionReady(*m_snapshot, m_response_age.isValid() ? m_response_age.elapsed() : -1, m_certificate_age.isValid() ? m_certificate_age.elapsed() : -1)};
+    const bool data_ready{selected && m_snapshot && m_snapshot->market == selected->id && !m_read_failed && B3FlowMeshMarketData::AdmissionReady(*m_snapshot, m_response_age.isValid() ? m_response_age.elapsed() : -1, m_certificate_age.isValid() ? m_certificate_age.elapsed() : -1, m_queue_age.isValid() ? m_queue_age.elapsed() : -1)};
     const bool ready{signing && selected && selected->ready && data_ready};
     const bool known{m_snapshot && selected && m_snapshot->market == selected->id && m_snapshot->units.known};
     const bool pending{selected && m_pending_sequence && selected->id == m_pending_market && selected->account == m_pending_account && selected->sequence <= *m_pending_sequence};
@@ -369,6 +369,8 @@ void B3FlowMeshTradingPanel::begin(Operation operation)
         // mutation; never bypass that check or silently refresh reviewed units.
         if (operation != Operation::Checkpoint && operation != Operation::Vault &&
             (!m_snapshot || m_snapshot->market != selected->id || m_read_failed || !m_snapshot->certified)) throw std::runtime_error{"Certified market data is required. Refresh the market before submitting."};
+        if (operation != Operation::Checkpoint && operation != Operation::Vault &&
+            m_snapshot && m_snapshot->pending_actions > 0 && m_queue_age.isValid() && m_queue_age.elapsed() >= 30'000) throw std::runtime_error{"Queued requests have not certified for 30 seconds. Refresh and inspect the market before submitting. Existing requests were not canceled."};
         if (operation == Operation::Order) {
             const auto price{B3FlowMeshMarketData::ParsePrice(m_price->text(), m_snapshot->units, &error)}, quantity{B3FlowMeshMarketData::ParseQuantity(m_quantity->text(), m_snapshot->units, &error)};
             if (!price || !quantity) throw std::runtime_error{error.toStdString()}; a.price = *price; a.amount = *quantity;
@@ -413,6 +415,14 @@ void B3FlowMeshTradingPanel::begin(Operation operation)
 void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optional<B3AssetTransfer::Prepared> prepared)
 {
     if (!m_wallet || !m_backend || m_thread) return;
+    const bool watch_queue{action && action->operation != Operation::Checkpoint && action->operation != Operation::Vault &&
+        m_snapshot && m_snapshot->market == action->market.id && m_snapshot->pending_actions > 0 && m_queue_age.isValid()};
+    const QElapsedTimer queue_watch{m_queue_age};
+    // Recheck after any modal review/unlock/fee dialog, including the second
+    // exact-transaction review. A rejected start must restore acquired unlock.
+    if (watch_queue && queue_watch.elapsed() >= 30'000) {
+        restoreLock(); m_busy = false; notice(tr("Queued requests have not certified for 30 seconds. No new request was submitted. Refresh and inspect the market; existing requests are not canceled.")); updateControls(); return;
+    }
     m_busy = action.has_value(); m_loading = !action && !m_snapshot; m_cancel->store(false); m_attempt_age.restart(); updateControls(); m_chart->setLoading(m_loading);
     auto result{std::make_shared<Result>()}; result->action = action; result->prepared = prepared; result->broadcast = prepared.has_value(); result->wallet = m_wallet_name;
     m_active_result = result;
@@ -423,12 +433,16 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     result->markets = m_market_data; result->effects = m_effect_data;
     const QString known_head{m_snapshot && m_snapshot->market == selected_id ? m_snapshot->head : QString{}};
     const QString route_base{m_route_pending ? m_requested_base : QString{}};
-    m_thread = QThread::create([node, backend, cancel, uri, result, selected_id, known_head, route_base] {
+    m_thread = QThread::create([node, backend, cancel, uri, result, selected_id, known_head, route_base, watch_queue, queue_watch] {
         try {
             const auto cancelled = [&] { return cancel->load() || node->shutdownRequested(); };
             const B3FlowMeshTrading::RpcCall rpc = [&](const std::string& method, const UniValue& params) {
                 if (cancelled()) throw std::runtime_error{"Operation cancelled."};
                 if (!ReadOnly(method)) {
+                    // Readiness RPCs may themselves outlast the local deadline.
+                    // Do not access UI timers from this worker; this captured
+                    // monotonic observation only fails closed until refresh.
+                    if (watch_queue && queue_watch.elapsed() >= 30'000) throw std::runtime_error{"Queued requests have not certified for 30 seconds. Refresh before submitting; no new mutation was started."};
                     if (method != "submitflowmeshdeposit" && (backend->isLocked() || backend->privateKeysDisabled())) throw std::runtime_error{"The captured wallet is locked for spending."};
                     if (method == "sendrawtransaction" || method == "submitflowmeshorder" || method == "cancelflowmeshorder" || method == "requestflowmeshwithdrawal" || method == "submitflowmeshdeposit") result->write_attempted = true;
                 }
@@ -534,6 +548,7 @@ void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
         const auto selected_now{market()};
         if (result->snapshot && selected_now && result->snapshot->market == selected_now->id) {
             auto fresh{*result->snapshot};
+            const bool new_head{!m_snapshot || m_snapshot->market != fresh.market || m_snapshot->head != fresh.head};
             if (fresh.unchanged) {
                 if (!m_snapshot || m_snapshot->market != fresh.market || m_snapshot->head != fresh.head || m_snapshot->state_root != fresh.state_root) { m_read_failed = true; notice(tr("Unchanged snapshot did not match the retained certificate; data was not reused.")); }
                 else {
@@ -543,7 +558,11 @@ void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
                 if (!m_snapshot || m_snapshot->head != fresh.head) m_certificate_age.restart();
                 m_snapshot = std::move(fresh); m_response_age.restart(); updateDataViews();
             }
-        } else if (!selected_now || !m_snapshot || selected_now->id != m_snapshot->market) { m_snapshot.reset(); m_response_age.invalidate(); updateDataViews(); }
+            if (!m_read_failed && m_snapshot) {
+                if (m_snapshot->pending_actions == 0) m_queue_age.invalidate();
+                else if (new_head || !m_queue_age.isValid()) m_queue_age.restart();
+            }
+        } else if (!selected_now || !m_snapshot || selected_now->id != m_snapshot->market) { m_snapshot.reset(); m_response_age.invalidate(); m_queue_age.invalidate(); updateDataViews(); }
         const bool changed_selection{selected_now && selected_now->id != previous};
         const bool open_routed_funding{m_route_pending && selected_now && m_snapshot && m_snapshot->market == selected_now->id};
         if (open_routed_funding) { m_asset->setCurrentIndex(m_requested_base.isEmpty() ? 1 : 0); m_route_pending = false; }

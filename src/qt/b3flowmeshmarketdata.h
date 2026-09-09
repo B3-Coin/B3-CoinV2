@@ -55,7 +55,7 @@ struct Snapshot {
 Snapshot Parse(const UniValue& value);
 std::vector<Depth> Aggregate(const std::vector<Curve>& curves);
 //! Poll health is not evidence that validators currently form a quorum.
-bool AdmissionReady(const Snapshot& snapshot, int64_t response_age_ms, int64_t certificate_age_ms);
-QString StatusText(const Snapshot& snapshot, int64_t response_age_ms, int64_t certificate_age_ms);
+bool AdmissionReady(const Snapshot& snapshot, int64_t response_age_ms, int64_t certificate_age_ms, int64_t queued_without_progress_ms = -1);
+QString StatusText(const Snapshot& snapshot, int64_t response_age_ms, int64_t certificate_age_ms, int64_t queued_without_progress_ms = -1);
 } // namespace B3FlowMeshMarketData
 #endif

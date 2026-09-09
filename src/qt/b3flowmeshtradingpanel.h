@@ -76,7 +76,7 @@ private:
     bool m_route_pending{false}, m_requested_withdrawal{false};
     uint64_t m_generation{0};
     std::optional<B3FlowMeshMarketData::Snapshot> m_snapshot;
-    QElapsedTimer m_response_age, m_certificate_age, m_catalog_age, m_attempt_age;
+    QElapsedTimer m_response_age, m_certificate_age, m_catalog_age, m_attempt_age, m_queue_age;
     unsigned m_read_failures{0};
     bool m_loading{false}, m_read_failed{false};
     std::vector<B3FlowMeshTrading::Market> m_market_data;

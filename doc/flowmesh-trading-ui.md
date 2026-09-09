@@ -69,6 +69,13 @@ prove loss of quorum. Stale reads, paused markets and validator handoffs can
 disable new trading; the page does not guarantee execution latency. Test-asset
 labels and tickers such as tUSD do not establish dollar backing or redemption.
 
+If the page observes queued requests with no new certified head for 30 seconds,
+it pauses new submissions and deposits locally. This is a precaution, not proof
+that validators are offline. Existing requests remain pending, not canceled;
+certified settlement controls remain available. A new certified head or an empty
+queue clears this local condition. The timer starts from this page's observation,
+not an invented certified timestamp, and resets when you change wallet or market.
+
 ## Withdraw and settle
 
 Choose **Withdraw**, the asset and amount, and a B3 destination address. This

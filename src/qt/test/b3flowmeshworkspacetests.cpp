@@ -98,6 +98,12 @@ private Q_SLOTS:
     void staleAndPausedGatesDoNotMisdiagnoseIdleMarkets()
     {
         auto s{Parse(Data(false))}; QVERIFY(AdmissionReady(s, 100, 600'000));
+        s.pending_actions = 1;
+        QVERIFY(AdmissionReady(s, 100, 600'000, 29'999));
+        QVERIFY(!AdmissionReady(s, 100, 600'000, 30'000));
+        QVERIFY(StatusText(s, 100, 600'000, 30'000).contains(QStringLiteral("not canceled")));
+        s.pending_actions = 0;
+        QVERIFY(AdmissionReady(s, 100, 600'000, 600'000));
         QVERIFY(!AdmissionReady(s, 3001, 10)); QVERIFY(StatusText(s, 3001, 10).contains(QStringLiteral("stale")));
         s.paused = true; QVERIFY(!AdmissionReady(s, 10, 10)); QVERIFY(StatusText(s, 10, 10).contains(QStringLiteral("paused")));
         s.paused = false; s.handoff = true; QVERIFY(!AdmissionReady(s, 10, 10));
@@ -133,7 +139,8 @@ private Q_SLOTS:
         QVERIFY(panel.m_balances->text().contains(QStringLiteral("Reserved  0 tUSD · 0.75 B3")));
         panel.m_price->setText(QStringLiteral("1")); panel.m_quantity->setText(QStringLiteral("1")); QVERIFY(panel.m_ticket_total->text().contains(QStringLiteral("1 B3"))); QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_deposit->isEnabled()); QVERIFY(!panel.m_advanced->isVisible());
         panel.m_read_failed = true; panel.updateMarketText(); QVERIFY(panel.m_status->text().contains(QStringLiteral("stale"))); QVERIFY(!panel.m_order->isEnabled());
-        panel.setWalletModel(nullptr); QVERIFY(!panel.m_snapshot); QCOMPARE(panel.m_chart->pricePointCount(), 0); QCOMPARE(panel.m_history_view->rowCount(), 0); QVERIFY(!panel.m_order->isEnabled());
+        panel.m_queue_age.start(); QVERIFY(panel.m_queue_age.isValid());
+        panel.setWalletModel(nullptr); QVERIFY(!panel.m_snapshot); QVERIFY(!panel.m_queue_age.isValid()); QCOMPARE(panel.m_chart->pricePointCount(), 0); QCOMPARE(panel.m_history_view->rowCount(), 0); QVERIFY(!panel.m_order->isEnabled());
     }
     void exportOptInSyntheticVisualFixtures()
     {
