@@ -1,7 +1,9 @@
 # FlowMesh conservative catch-up tail scheduling
 
-Status: implemented as a separate increment after qualified `8ea5251`;
-executable qualification pending. This does not amend that candidate's results.
+Status: implemented as a separate increment after qualified `8ea5251`.
+Runtime `4032908` passed 60 focused cases (103,253 assertions) and the unchanged
+four-node speed/lifecycle workload at 22:42:36 UTC on 9 September 2026
+(10 September locally). This does not amend the earlier candidate's results.
 
 ## Observed limitation
 
@@ -61,3 +63,10 @@ heuristic; that source check is not mixed-version execution qualification.
 
 This increment targets an avoidable transport delay, not permanent split-lock
 recovery or a production latency guarantee.
+
+The local run observed a 178.733 ms sequential median, 2.187 s p95, and 5.050 s
+maximum among 40 actions (the reported nearest-rank p99 for this small sample).
+All 64 burst actions certified within 2.458 s including 2.173 s of RPC
+submission. No B3 blocks were produced during those 104 actions. Matching,
+exact fees, payouts, settlement, restart and reindex passed as well. The
+remaining tail and general split-lock risk must not be hidden by this result.
