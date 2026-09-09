@@ -339,6 +339,12 @@ flowmesh::BlsMicroblockCertificate Certify(
 class RuntimeNetwork
 {
 public:
+    void PartitionHalves(const bool partitioned)
+    {
+        std::lock_guard<std::mutex> lock{m_mutex};
+        m_partitioned = partitioned;
+    }
+
     void SetCatchupPageLimit(const size_t limit)
     {
         std::lock_guard<std::mutex> lock{m_mutex};
@@ -395,6 +401,11 @@ public:
                     targets.emplace_back(i, m_nodes[i]);
                 }
             }
+            if (m_partitioned) {
+                std::erase_if(targets, [from](const auto& target) {
+                    return (from < 2) != (target.first < 2);
+                });
+            }
         }
         for (const auto& [id, runtime] : targets) {
             (void)id;
@@ -409,6 +420,7 @@ private:
     std::array<bool, 4> m_online{};
     size_t m_catchup_page_limit{flowmesh::FLOWMESH_CATCHUP_MAX_ENTRIES};
     bool m_ignore_hellos{false};
+    bool m_partitioned{false};
     std::array<size_t, 4> m_get_requests{};
 };
 
@@ -1460,6 +1472,165 @@ BOOST_AUTO_TEST_CASE(authenticated_future_round_reunites_split_validators)
         }
     }
 
+    for (auto& runtime : runtimes) runtime->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(honest_divergent_round_candidates_preserve_permanent_locks_and_halt)
+{
+    const uint256 domain{Filled(0x1b)};
+    const modern::AssetId asset{Filled(0x3b)};
+    const auto market{*flowmesh::ComputeFlowMeshMarketId(domain, asset)};
+    const auto vault{*flowmesh::ComputeFlowMeshVaultId(domain, market)};
+    const uint256 treasury{Filled(0x5b)};
+    const SeatFixture seats{Seats(domain, market, 4, 7, 100, Filled(0x71), 123)};
+    RuntimeChain chain;
+    chain.m_domain = domain;
+    chain.Add(seats.seats);
+    MapDeposits deposits;
+    deposits.required_anchor = chain.m_current;
+    const COutPoint left_outpoint{Txid::FromUint256(Filled(0x8b)), 0};
+    const COutPoint right_outpoint{Txid::FromUint256(Filled(0x8c)), 0};
+    deposits.entries.emplace(left_outpoint, flowmesh::DepositInfo{asset, 250, Filled(0x6b)});
+    deposits.entries.emplace(right_outpoint, flowmesh::DepositInfo{asset, 125, Filled(0x6c)});
+    const flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(),
+                                        flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+    std::array<FixedClock, 4> clocks;
+    std::array<RuntimeKeys, 4> keys;
+    std::array<std::unique_ptr<node::FlowMeshProductionStore>, 4> stores;
+    RuntimeNetwork network;
+    std::array<std::unique_ptr<node::FlowMeshRuntime>, 4> runtimes;
+    std::string error;
+    for (size_t i{0}; i < runtimes.size(); ++i) {
+        keys[i].m_keys[market] = {seats.secrets[i]};
+        stores[i] = std::make_unique<node::FlowMeshProductionStore>(DBParams{
+            .path = m_args.GetDataDirBase() / fs::PathFromString(
+                        "flowmesh_runtime_honest_lock_split_" + std::to_string(i)),
+            .cache_bytes = size_t{1} << 20, .wipe_data = true});
+        BOOST_REQUIRE_MESSAGE(stores[i]->OpenForMarket(
+            domain, market, seats.seats, initial.Root(), error), error);
+        node::FlowMeshRuntimeConfig config;
+        config.chain = &chain;
+        config.keys = &keys[i];
+        config.clock = &clocks[i];
+        config.round_timeout = std::chrono::seconds{1};
+        config.relay = [&network, i](node::FlowMeshRuntimeRelay relay) {
+            network.Relay(i, std::move(relay));
+        };
+        runtimes[i] = std::make_unique<node::FlowMeshRuntime>(config,
+            std::vector<node::FlowMeshRuntimeMarketConfig>{MarketConfig(
+                domain, market, treasury, seats.seats, initial, *stores[i], &deposits)});
+        network.Set(i, runtimes[i].get(), true);
+        BOOST_REQUIRE_MESSAGE(runtimes[i]->Start(error), error);
+    }
+    runtimes[0]->NotifyTick();
+    BOOST_REQUIRE(WaitUntil([&] {
+        return std::all_of(runtimes.begin(), runtimes.end(), [&](const auto& runtime) {
+            return runtime->MarketStatus(market)->next_sequence == 1;
+        });
+    }));
+    for (const auto& runtime : runtimes) {
+        BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+    }
+    const auto certified_head{runtimes[0]->MarketStatus(market)->last_microblock_hash};
+
+    // No equivocation, invalid anchor, or Byzantine signer: only different
+    // delivered action pools and a delayed cross-half network at one position.
+    network.PartitionHalves(true);
+    const flowmesh::Action left_action{Deposit(left_outpoint)};
+    const flowmesh::Action right_action{Deposit(right_outpoint)};
+    BOOST_REQUIRE(runtimes[1]->SubmitLocalAction(market, left_action) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(runtimes[2]->SubmitLocalAction(market, right_action) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] {
+        return std::all_of(runtimes.begin(), runtimes.end(), [&](const auto& runtime) {
+            return runtime->MarketStatus(market)->pending_actions == 1;
+        });
+    }));
+    runtimes[1]->NotifyTick(); // seq1/round0 proposer B; A/B lock X.
+    BOOST_REQUIRE(WaitUntil([&] {
+        const auto data{runtimes[1]->MarketData(market, std::nullopt, {}, error)};
+        return data && data->snapshot.runtime.max_verified_attestations == 2;
+    }));
+    for (const auto& runtime : runtimes) {
+        BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+    }
+    clocks[2].m_now += std::chrono::seconds{2};
+    clocks[3].m_now += std::chrono::seconds{2};
+    runtimes[2]->NotifyTick(); // seq1/round1 proposer C; C/D lock Y.
+    BOOST_REQUIRE(WaitUntil([&] {
+        const auto data{runtimes[2]->MarketData(market, std::nullopt, {}, error)};
+        return data && data->snapshot.runtime.max_verified_attestations == 2;
+    }));
+    for (const auto& runtime : runtimes) {
+        BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+    }
+
+    const flowmesh::ProductionSignPosition position{seats.seats.epoch, 1};
+    std::array<uint256, 4> locked_hashes;
+    for (size_t i{0}; i < runtimes.size(); ++i) {
+        std::optional<uint256> locked;
+        BOOST_REQUIRE(stores[i]->ReadLock(position, locked, error));
+        BOOST_REQUIRE(locked);
+        locked_hashes[i] = *locked;
+        const auto data{runtimes[i]->MarketData(market, std::nullopt, {}, error)};
+        BOOST_REQUIRE_MESSAGE(data, error);
+        BOOST_CHECK_EQUAL(data->snapshot.quorum_required, 3U);
+        BOOST_CHECK_EQUAL(data->snapshot.next_microblock_sequence, 1U);
+        BOOST_CHECK(data->snapshot.last_microblock_hash == certified_head);
+        BOOST_CHECK(data->snapshot.runtime.local_locked_candidate == locked);
+        BOOST_CHECK(runtimes[i]->MarketStatus(market)->halt == node::FlowMeshRuntimeHalt::NONE);
+    }
+    BOOST_CHECK(locked_hashes[0] == locked_hashes[1]);
+    BOOST_CHECK(locked_hashes[2] == locked_hashes[3]);
+    BOOST_CHECK(locked_hashes[0] != locked_hashes[2]);
+    for (const size_t proposer : {size_t{1}, size_t{2}}) {
+        const auto data{runtimes[proposer]->MarketData(market, std::nullopt, {}, error)};
+        BOOST_REQUIRE_MESSAGE(data, error);
+        BOOST_CHECK_EQUAL(data->snapshot.runtime.max_verified_attestations, 2U);
+        BOOST_CHECK_LT(data->snapshot.runtime.max_verified_attestations,
+                       data->snapshot.quorum_required);
+    }
+    BOOST_CHECK_EQUAL(runtimes[1]->MarketStatus(market)->round, 0U);
+    BOOST_CHECK_EQUAL(runtimes[2]->MarketStatus(market)->round, 1U);
+
+    // Deliver the delayed credentials first. Receiving the other action does
+    // not replace a locked candidate. All nodes can now execute either body.
+    network.PartitionHalves(false);
+    for (size_t i{0}; i < runtimes.size(); ++i) {
+        flowmesh::WireMessage delayed;
+        delayed.kind = flowmesh::WireMessageKind::ACTION;
+        delayed.header = {flowmesh::FLOWMESH_WIRE_VERSION_V1, market, seats.seats.epoch, 1};
+        const auto payload{flowmesh::EncodeProductionActionPayload(
+            i < 2 ? right_action : left_action)};
+        BOOST_REQUIRE(payload);
+        delayed.payload = *payload;
+        BOOST_REQUIRE(runtimes[i]->EnqueueWireMessage(i < 2 ? 2 : 1, std::move(delayed)) ==
+                      flowmesh::QueueResult::ACCEPTED);
+    }
+    BOOST_REQUIRE(WaitUntil([&] {
+        return std::all_of(runtimes.begin(), runtimes.end(), [&](const auto& runtime) {
+            return runtime->MarketStatus(market)->pending_actions == 2;
+        });
+    }));
+    // C's authentic next-round proposal is round-admissible at A/B, but its
+    // different hash cannot replace their durable X locks. The safe halt is
+    // the current protocol contract, not a recovery mechanism to bypass.
+    runtimes[2]->NotifyTick();
+    BOOST_REQUIRE(WaitUntil([&] {
+        return runtimes[0]->MarketStatus(market)->halt == node::FlowMeshRuntimeHalt::SIGNING_CONFLICT &&
+               runtimes[1]->MarketStatus(market)->halt == node::FlowMeshRuntimeHalt::SIGNING_CONFLICT;
+    }));
+    for (size_t i{0}; i < runtimes.size(); ++i) {
+        BOOST_REQUIRE(runtimes[i]->WaitForIdle(std::chrono::seconds{2}));
+        std::optional<uint256> locked;
+        BOOST_REQUIRE(stores[i]->ReadLock(position, locked, error));
+        BOOST_REQUIRE(locked);
+        BOOST_CHECK(*locked == locked_hashes[i]);
+        const auto status{runtimes[i]->MarketStatus(market)};
+        BOOST_CHECK_EQUAL(status->next_sequence, 1U);
+        BOOST_CHECK(status->last_microblock_hash == certified_head);
+    }
     for (auto& runtime : runtimes) runtime->Stop();
 }
 
