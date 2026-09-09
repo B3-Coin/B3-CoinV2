@@ -1240,22 +1240,37 @@ public:
         }
         return m_node.flowmesh->SubmitLocalAction(market_id, action, error);
     }
-    bool armFlowMeshSeatKeys(const std::vector<bls::SecretKey>& keys,
-                             std::string& error) override
+    interfaces::FlowMeshValidatorStatus flowMeshValidatorStatus() override
     {
-        if (!m_node.flowmesh) {
-            error = "FlowMesh service is not available in this node";
-            return false;
-        }
-        return m_node.flowmesh->ArmSeatKeys(keys, error);
+        if (!m_node.flowmesh) return {};
+        const auto status{m_node.flowmesh->SeatKeyStatus()};
+        return {true, status.enabled, status.running, status.armed_pubkeys, status.fingerprint};
     }
-    bool disarmFlowMeshSeatKeys(std::string& error) override
+    bool armFlowMeshSeatKeys(const std::vector<bls::SecretKey>& keys,
+                             std::string& error,
+                             const std::optional<uint256>& expected_fingerprint,
+                             interfaces::FlowMeshValidatorStatus* result) override
     {
         if (!m_node.flowmesh) {
             error = "FlowMesh service is not available in this node";
             return false;
         }
-        m_node.flowmesh->DisarmSeatKeys();
+        node::FlowMeshSeatKeyStatus status;
+        if (!m_node.flowmesh->ArmSeatKeys(keys, error, expected_fingerprint, &status)) return false;
+        if (result) *result = {true, status.enabled, status.running, status.armed_pubkeys, status.fingerprint};
+        return true;
+    }
+    bool disarmFlowMeshSeatKeys(std::string& error,
+                               const std::optional<uint256>& expected_fingerprint,
+                               interfaces::FlowMeshValidatorStatus* result) override
+    {
+        if (!m_node.flowmesh) {
+            error = "FlowMesh service is not available in this node";
+            return false;
+        }
+        node::FlowMeshSeatKeyStatus status;
+        if (!m_node.flowmesh->DisarmSeatKeys(error, expected_fingerprint, &status)) return false;
+        if (result) *result = {true, status.enabled, status.running, status.armed_pubkeys, status.fingerprint};
         return true;
     }
     std::optional<interfaces::FlowMeshPendingCheckpoint>

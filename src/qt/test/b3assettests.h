@@ -13,6 +13,9 @@ class B3AssetTests : public QObject
 
 private Q_SLOTS:
     void noWalletShowsEmptyState();
+    void disabledActionReasonsFollowSelection();
+    void relockWarningSurvivesRefreshDetachAndBlocksActions();
+    void viewOnlyFnDataNeverEnablesOperatorActions();
     void amountFormattingIsIntegerExact();
     void walletAssetRecordsExposeFnAndColoredAssets();
     void registeredAssetUsesVerifiedPrecision();

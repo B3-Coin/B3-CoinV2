@@ -6,14 +6,23 @@
 #define BITCOIN_WALLET_RPC_ASSETS_H
 
 #include <bridge/proof.h>
+#include <consensus/amount.h>
 #include <consensus/bridge_params.h>
 #include <consensus/params.h>
 #include <modern/policy.h>
 
 #include <cstdint>
 #include <optional>
+#include <string>
+
+class UniValue;
 
 namespace wallet {
+
+/** Exact positive atomic asset units from a canonical integer JSON number or
+ * string. No floating-point conversion or display-decimal scaling. Throws a
+ * JSON RPC error for malformed values or amounts outside [1, MAX_MONEY]. */
+CAmount AssetUnitsFromValue(const UniValue& value, const std::string& name);
 
 /** Return the spend policy used by an existing wallet-owned asset at the
  * next block height, or throw the same activation error exposed by the asset

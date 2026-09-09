@@ -39,6 +39,19 @@ struct FlowMeshServiceMarket {
                            const FlowMeshServiceMarket&) = default;
 };
 
+/** One mutex-protected snapshot of the node-global FN signing capability.
+ * Loaded keys are not proof of active seat membership or of any signature. */
+struct FlowMeshSeatKeyStatus {
+    bool enabled{false};
+    bool running{false};
+    std::vector<std::array<unsigned char, bls::PUBKEY_SIZE>> armed_pubkeys;
+    uint256 fingerprint;
+};
+
+//! Local operator CAS token, not a consensus commitment. Ignores order/duplicates.
+uint256 FlowMeshSeatKeysFingerprint(
+    std::vector<std::array<unsigned char, bls::PUBKEY_SIZE>> public_keys);
+
 /**
  * A wallet-ready type-8 publication. The service, rather than the wallet,
  * resolves the historical seat count and performs the exact bitmap encoding.
@@ -115,8 +128,14 @@ public:
     bool SubmitLocalAction(const flowmesh::MarketId& market_id,
                            const flowmesh::Action& action,
                            std::string& error);
-    bool ArmSeatKeys(std::vector<bls::SecretKey> keys, std::string& error);
+    FlowMeshSeatKeyStatus SeatKeyStatus() const;
+    bool ArmSeatKeys(std::vector<bls::SecretKey> keys, std::string& error,
+                     const std::optional<uint256>& expected_fingerprint = std::nullopt,
+                     FlowMeshSeatKeyStatus* result = nullptr);
     void DisarmSeatKeys();
+    bool DisarmSeatKeys(std::string& error,
+                        const std::optional<uint256>& expected_fingerprint,
+                        FlowMeshSeatKeyStatus* result = nullptr);
 
     /** Earliest unconnected effect-bearing entry, fully encoded for MPA. */
     std::optional<FlowMeshPendingCheckpoint> NextCheckpointMpa(

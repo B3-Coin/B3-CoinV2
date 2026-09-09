@@ -5,9 +5,15 @@
 #ifndef BITCOIN_WALLET_RPC_FLOWMESH_H
 #define BITCOIN_WALLET_RPC_FLOWMESH_H
 
+#include <crypto/bls.h>
+
+#include <array>
+#include <vector>
+
 class UniValue;
 namespace interfaces {
 struct FlowMeshVaultOperation;
+struct FlowMeshValidatorStatus;
 }
 
 namespace wallet {
@@ -37,6 +43,11 @@ FlowMeshDepositAdmission CheckFlowMeshDepositAdmission(
 //! Stable JSON projection shared by the discovery RPC and its focused test.
 UniValue FlowMeshVaultOperationToJSON(
     const interfaces::FlowMeshVaultOperation& operation);
+
+//! Public-only projection; never decrypts or creates a wallet key.
+UniValue FlowMeshValidatorStatusToJSON(
+    const interfaces::FlowMeshValidatorStatus& status,
+    std::vector<std::array<unsigned char, bls::PUBKEY_SIZE>> wallet_public_keys);
 
 } // namespace wallet
 

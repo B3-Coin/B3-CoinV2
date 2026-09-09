@@ -7,6 +7,7 @@
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <qt/b3fixed.h>
+#include <qt/b3flowmeshoperator.h>
 #include <univalue.h>
 #include <util/moneystr.h>
 
@@ -71,24 +72,27 @@ void CheckSynced(interfaces::Node& node)
 
 struct B3AssetSendDialog::JobResult {
     std::optional<B3AssetTransfer::Prepared> prepared;
+    QString fn_public_key;
     QString error;
     bool broadcast_attempted{false};
     bool broadcast_succeeded{false};
 };
 
-B3AssetSendDialog::B3AssetSendDialog(WalletModel* wallet, const B3AssetRecord& asset, QWidget* parent)
-    : QDialog{parent}, m_wallet{wallet}, m_asset{asset},
+B3AssetSendDialog::B3AssetSendDialog(WalletModel* wallet, const B3AssetRecord& asset, QWidget* parent, bool fn_binding)
+    : QDialog{parent}, m_wallet{wallet}, m_asset{asset}, m_fn_binding{fn_binding},
       m_wallet_name{wallet ? wallet->getWalletName() : QString{}},
       m_wallet_display{wallet ? wallet->getDisplayName() : QString{}},
       m_wallet_uri{B3AssetTransfer::WalletUri(m_wallet_name)},
       m_node{wallet ? &wallet->node() : nullptr}
 {
     setObjectName(QStringLiteral("b3AssetSendDialog"));
-    setWindowTitle(tr("Send asset"));
+    setWindowTitle(m_fn_binding ? tr("Bind FN validator key") : tr("Send asset"));
     setModal(true);
     resize(650, 570);
     auto* layout{new QVBoxLayout{this}};
-    layout->addWidget(PlainLabel(tr("Prepare the transfer, check the exact asset and network fee, then confirm sending."), this));
+    layout->addWidget(PlainLabel(m_fn_binding
+        ? tr("Bind one existing unbound FN Coin. Preparation generates and stores a fresh BLS key in this wallet and signs a transaction, but does not broadcast it. Review the owner and fee before confirming. Back up the wallet after preparing, even if you cancel.")
+        : tr("Prepare the transfer, check the exact asset and network fee, then confirm sending."), this));
     auto* form{new QFormLayout};
     form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
     form->addRow(tr("Wallet"), PlainLabel(m_wallet_display + (m_wallet_name.isEmpty() ? tr(" (unnamed wallet)") : QStringLiteral("\n") + m_wallet_name), this));
@@ -107,6 +111,16 @@ B3AssetSendDialog::B3AssetSendDialog(WalletModel* wallet, const B3AssetRecord& a
     m_amount->setObjectName(QStringLiteral("assetAmount"));
     m_amount->setMaxLength(64);
     form->addRow(m_asset.precision_known ? tr("Amount") : tr("Amount (raw integer units)"), m_amount);
+    if (m_fn_binding) {
+        m_address->setPlaceholderText(tr("New FN owner address in this wallet; shown after preparation"));
+        m_address->setReadOnly(true);
+        m_amount->setText(QStringLiteral("1"));
+        m_amount->setReadOnly(true);
+        m_fn_public_key = new QLineEdit{this};
+        m_fn_public_key->setObjectName(QStringLiteral("fnBindingPublicKey"));
+        m_fn_public_key->setReadOnly(true);
+        form->addRow(tr("New BLS public key"), m_fn_public_key);
+    }
     if (m_asset.precision_known) {
         layout->addWidget(PlainLabel(tr("Verified asset precision: %1 decimal places.").arg(m_asset.decimals), this));
     } else {
@@ -123,7 +137,9 @@ B3AssetSendDialog::B3AssetSendDialog(WalletModel* wallet, const B3AssetRecord& a
     m_txid->setReadOnly(true);
     form->addRow(tr("Transaction ID"), m_txid);
     layout->addLayout(form);
-    m_confirm = new QCheckBox{tr("I checked this wallet, the full asset ID, amount, recipient and B3 fee."), this};
+    m_confirm = new QCheckBox{m_fn_binding
+        ? tr("I checked this wallet, the one-FN binding, owner address, public key and B3 fee.")
+        : tr("I checked this wallet, the full asset ID, amount, recipient and B3 fee."), this};
     m_confirm->setObjectName(QStringLiteral("assetSendConfirmation"));
     m_confirm->setEnabled(false);
     layout->addWidget(m_confirm);
@@ -133,7 +149,7 @@ B3AssetSendDialog::B3AssetSendDialog(WalletModel* wallet, const B3AssetRecord& a
     layout->addStretch();
     auto* buttons{new QHBoxLayout};
     buttons->addStretch();
-    m_action = new QPushButton{tr("Prepare transfer"), this};
+    m_action = new QPushButton{m_fn_binding ? tr("Prepare FN binding") : tr("Prepare transfer"), this};
     m_action->setObjectName(QStringLiteral("assetSendAction"));
     // Enter/double-click must never turn a preparation into confirmation.
     m_action->setAutoDefault(false);
@@ -167,7 +183,8 @@ B3AssetSendDialog::B3AssetSendDialog(WalletModel* wallet, const B3AssetRecord& a
         }
     }
     const QString validation{B3AssetTransfer::ValidateAsset(m_asset)};
-    if (!m_wallet || !m_backend || !validation.isEmpty() || m_backend->privateKeysDisabled()) {
+    if (!m_wallet || !m_backend || !validation.isEmpty() || m_backend->privateKeysDisabled() ||
+        (m_fn_binding && !m_asset.is_fn)) {
         m_action->setEnabled(false);
         setStatus(!validation.isEmpty() ? validation : tr("A loaded wallet with spending keys is required for this asset transfer."));
     }
@@ -177,7 +194,7 @@ B3AssetSendDialog::~B3AssetSendDialog()
 {
     m_cancel->store(true);
     stopWorker();
-    m_unlock.reset();
+    restoreSpendingLock();
 }
 
 int B3AssetSendDialog::execForAsset(WalletModel* wallet, const B3AssetRecord& asset, QWidget* parent)
@@ -188,29 +205,39 @@ int B3AssetSendDialog::execForAsset(WalletModel* wallet, const B3AssetRecord& as
     return result;
 }
 
+int B3AssetSendDialog::execForFnBinding(WalletModel* wallet, const B3AssetRecord& asset, QWidget* parent)
+{
+    QPointer<B3AssetSendDialog> dialog{new B3AssetSendDialog{wallet, asset, parent, true}};
+    const int result{dialog->exec()};
+    if (dialog) delete dialog.data();
+    return result;
+}
+
 void B3AssetSendDialog::setStatus(const QString& text)
 {
-    m_status->setText(text);
+    m_status->setText(m_security_warning.isEmpty() ? text : m_security_warning + QStringLiteral("\n") + text);
+    if (!m_security_warning.isEmpty()) { m_action->setEnabled(false); m_confirm->setEnabled(false); }
 }
 
 void B3AssetSendDialog::setEditing(const bool editing)
 {
-    m_amount->setReadOnly(!editing);
-    m_address->setReadOnly(!editing);
+    m_amount->setReadOnly(m_fn_binding || !editing);
+    m_address->setReadOnly(m_fn_binding || !editing);
 }
 
 void B3AssetSendDialog::prepare()
 {
-    if (m_phase != Phase::Editing || !m_wallet || !m_backend || m_thread) return;
+    if (m_phase != Phase::Editing || !m_wallet || !m_backend || m_thread || !m_security_warning.isEmpty()) return;
     QString error;
-    const auto amount{B3AssetTransfer::ParseAmount(m_amount->text(), m_asset.precision_known ? m_asset.decimals : 0, &error)};
+    const auto amount{m_fn_binding ? std::optional<CAmount>{1} :
+        B3AssetTransfer::ParseAmount(m_amount->text(), m_asset.precision_known ? m_asset.decimals : 0, &error)};
     if (!amount) {
         setStatus(error);
         return;
     }
     const QString recipient{m_address->text()};
     try {
-        B3AssetTransfer::PrepareParameters(m_asset, *amount, recipient);
+        if (!m_fn_binding) B3AssetTransfer::PrepareParameters(m_asset, *amount, recipient);
     } catch (const std::exception& e) {
         setStatus(QString::fromUtf8(e.what()));
         return;
@@ -223,6 +250,7 @@ void B3AssetSendDialog::prepare()
     const QPointer<B3AssetSendDialog> self{this};
     const QPointer<WalletModel> wallet{m_wallet};
     const bool was_locked{m_backend->isLocked()};
+    m_restore_locked = was_locked;
     // Keep the context on the GUI thread. The guard also covers parent/wallet
     // deletion while the synchronous passphrase dialog processes events.
     std::unique_ptr<WalletModel::UnlockContext> unlocked;
@@ -233,6 +261,7 @@ void B3AssetSendDialog::prepare()
         // existed. Restore the state captured at this operation's boundary.
         if (wallet && was_locked) wallet->setWalletLocked(true);
         if (self && m_phase == Phase::Preparing && !m_cancel->load()) {
+            restoreSpendingLock();
             m_phase = Phase::Editing;
             setEditing(true);
             m_action->setEnabled(true);
@@ -243,6 +272,8 @@ void B3AssetSendDialog::prepare()
     if (!self || !wallet) return;
     if (m_cancel->load() || m_phase != Phase::Preparing) return;
     if (!unlocked->isValid() || m_backend->isLocked()) {
+        unlocked.reset();
+        restoreSpendingLock();
         m_phase = Phase::Editing;
         setEditing(true);
         m_action->setEnabled(true);
@@ -252,19 +283,21 @@ void B3AssetSendDialog::prepare()
     m_unlock = std::move(unlocked);
     m_raw_amount = *amount;
     m_recipient = recipient;
-    setStatus(tr("Checking current balances and preparing a signed transfer. Nothing is being broadcast."));
+    setStatus(m_fn_binding
+        ? tr("Selecting one unbound FN and storing its new BLS key before preparing the signed binding. Nothing is being broadcast.")
+        : tr("Checking current balances and preparing a signed transfer. Nothing is being broadcast."));
     startJob(false);
 }
 
 void B3AssetSendDialog::submit()
 {
     if (m_phase != Phase::Review || !m_confirm->isChecked() || !m_prepared ||
-        !m_wallet || !m_backend || m_thread || m_cancel->load()) return;
+        !m_wallet || !m_backend || m_thread || m_cancel->load() || !m_security_warning.isEmpty()) return;
     if (m_backend->isLocked()) {
         m_phase = Phase::Finished;
         m_action->setEnabled(false);
         m_confirm->setEnabled(false);
-        m_unlock.reset();
+        restoreSpendingLock();
         setStatus(tr("The wallet was locked after preparation. Nothing was submitted. Close this dialog and explicitly prepare again after unlocking."));
         return;
     }
@@ -288,7 +321,8 @@ void B3AssetSendDialog::startJob(const bool broadcast)
     const auto uri{m_wallet_uri};
     const auto amount{m_raw_amount};
     const auto recipient{m_recipient};
-    m_thread = QThread::create([node, backend, cancel, asset, uri, amount, recipient, result, broadcast] {
+    const bool fn_binding{m_fn_binding};
+    m_thread = QThread::create([node, backend, cancel, asset, uri, amount, recipient, result, broadcast, fn_binding] {
         try {
             CheckReady(*node, *backend, cancel);
             CheckSynced(*node);
@@ -300,9 +334,16 @@ void B3AssetSendDialog::startJob(const bool broadcast)
                 balances_params.push_back(false);
                 B3AssetTransfer::CheckAvailable(node->executeRpc("getwalletassets", balances_params, uri), asset, amount);
                 CheckReady(*node, *backend, cancel);
-                result->prepared = B3AssetTransfer::ParsePrepared(
-                    node->executeRpc("sendasset", B3AssetTransfer::PrepareParameters(asset, amount, recipient), uri),
-                    asset, amount, recipient);
+                if (fn_binding) {
+                    result->prepared = B3FlowMeshOperator::ParseBinding(
+                        node->executeRpc("bindflowmeshseat", B3FlowMeshOperator::BindParameters(), uri), asset,
+                        [backend](const CTxDestination& destination) { return backend->isSpendable(destination); },
+                        result->fn_public_key);
+                } else {
+                    result->prepared = B3AssetTransfer::ParsePrepared(
+                        node->executeRpc("sendasset", B3AssetTransfer::PrepareParameters(asset, amount, recipient), uri),
+                        asset, amount, recipient);
+                }
             }
             CheckReady(*node, *backend, cancel);
             B3AssetTransfer::CheckChangeOwnership(*result->prepared,
@@ -341,17 +382,19 @@ void B3AssetSendDialog::finishJob(const std::shared_ptr<JobResult>& result)
 {
     stopWorker();
     if (!m_wallet || (m_close_requested && !result->broadcast_attempted)) {
-        m_unlock.reset();
+        restoreSpendingLock();
         QDialog::reject();
         return;
     }
     if (result->broadcast_attempted) {
         m_phase = Phase::Finished;
-        m_unlock.reset();
+        restoreSpendingLock();
         m_action->setEnabled(false);
         m_close->setText(tr("Close"));
         if (result->broadcast_succeeded) {
-            setStatus(tr("Transaction submitted. Track the transaction ID shown above for confirmation."));
+            setStatus(m_fn_binding
+                ? tr("FN binding submitted. Back up this wallet: it contains the newly generated FN BLS key. Wait for the seat to become eligible before expecting market signatures. Binding does not start the FN worker or arm PoS finality.")
+                : tr("Transaction submitted. Track the transaction ID shown above for confirmation."));
             Q_EMIT transactionSubmitted(result->prepared->txid);
         } else {
             setStatus(tr("Submission outcome may be unknown. Transaction ID: %1\n%2\nCheck wallet history and node state before another send. This dialog will not retry or regenerate the transaction.")
@@ -361,7 +404,7 @@ void B3AssetSendDialog::finishJob(const std::shared_ptr<JobResult>& result)
         return;
     }
     if (!result->error.isEmpty()) {
-        m_unlock.reset();
+        restoreSpendingLock();
         m_prepared.reset();
         if (m_phase == Phase::Submitting) {
             m_phase = Phase::Finished;
@@ -377,23 +420,29 @@ void B3AssetSendDialog::finishJob(const std::shared_ptr<JobResult>& result)
         return;
     }
     if (m_cancel->load() || m_backend->isLocked()) {
-        m_unlock.reset();
+        restoreSpendingLock();
         m_phase = Phase::Finished;
         setStatus(tr("The operation was cancelled or the wallet locked. Nothing was submitted."));
         return;
     }
     m_prepared = result->prepared;
     m_phase = Phase::Review;
-    m_review_amount->setText(m_asset.precision_known
+    m_review_amount->setText(m_fn_binding ? tr("1 FN remains owned by this wallet; no FN or native B3 is burned (network fee only)") : m_asset.precision_known
         ? tr("%1 %2 (%3 raw units)").arg(B3Fixed::format(m_prepared->raw_amount, m_asset.decimals), m_asset.ticker, QString::number(m_prepared->raw_amount))
         : tr("%1 raw integer units (display precision unknown)").arg(m_prepared->raw_amount));
     m_fee->setText(QString::fromStdString(FormatMoney(m_prepared->fee)) + QStringLiteral(" B3"));
     m_txid->setText(m_prepared->txid);
+    if (m_fn_binding) {
+        m_address->setText(m_prepared->recipient);
+        m_fn_public_key->setText(result->fn_public_key);
+    }
     m_confirm->setChecked(false);
     m_confirm->setEnabled(true);
-    m_action->setText(tr("Send this transaction"));
+    m_action->setText(m_fn_binding ? tr("Submit this FN binding") : tr("Send this transaction"));
     m_action->setEnabled(false);
-    setStatus(tr("Review the full asset ID, recipient, exact amount and B3 fee above. This signed transaction has not been broadcast."));
+    setStatus(m_fn_binding
+        ? tr("Review the public key, owner address and fee. This exact binding has not been broadcast. The new key is already stored: make a fresh wallet backup. No private key is displayed.")
+        : tr("Review the full asset ID, recipient, exact amount and B3 fee above. This signed transaction has not been broadcast."));
 }
 
 void B3AssetSendDialog::stopWorker()
@@ -421,7 +470,7 @@ void B3AssetSendDialog::reject()
             : tr("Cancelling after the current wallet operation finishes. Nothing will be submitted."));
         return;
     }
-    m_unlock.reset();
+    restoreSpendingLock();
     QDialog::reject();
 }
 
@@ -432,6 +481,22 @@ void B3AssetSendDialog::cancelAndWait()
     m_phase = Phase::Finished;
     ++m_generation;
     stopWorker();
-    m_unlock.reset();
+    restoreSpendingLock();
     QDialog::reject();
+}
+
+bool B3AssetSendDialog::restoreSpendingLock()
+{
+    m_unlock.reset();
+    if (!m_restore_locked) return true;
+    try {
+        if (m_backend && !m_backend->isLocked()) m_backend->lock();
+        if (m_backend && m_backend->isLocked()) { m_restore_locked = false; return true; }
+    } catch (...) { /* A verified relock is required before reporting ordinary success. */ }
+    m_security_warning = tr("SECURITY: spending relock could not be verified for wallet '%1'. Lock this wallet or close the application before leaving it unattended. Do not repeat the transaction to fix this.")
+        .arg(m_wallet_display);
+    setStatus(QString{});
+    qCritical("Asset operation could not verify restoration of the captured wallet spending lock.");
+    Q_EMIT securityWarning(m_security_warning);
+    return false;
 }

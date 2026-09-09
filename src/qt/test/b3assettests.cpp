@@ -83,7 +83,92 @@ void B3AssetTests::noWalletShowsEmptyState()
         auto* button = page.findChild<QPushButton*>(name);
         QVERIFY(button != nullptr);
         QVERIFY(!button->isEnabled());
+        QVERIFY(button->toolTip().contains(QStringLiteral("wallet")));
+        QCOMPARE(button->accessibleDescription(), button->toolTip());
     }
+    auto* reason{page.findChild<QLabel*>("assetActionReason")};
+    QVERIFY(reason);
+    QVERIFY(reason->isVisibleTo(&page));
+    QCOMPARE(reason->textFormat(), Qt::PlainText);
+}
+
+void B3AssetTests::disabledActionReasonsFollowSelection()
+{
+    B3AssetsPage page;
+    TestAssetSource source;
+    B3AssetRecord asset;
+    asset.asset_id = QString(64, QLatin1Char('6'));
+    asset.status = B3AssetRecord::Status::Active;
+    asset.confirmed = 100;
+    source.set({asset});
+    page.setSource(&source); // A display source is not a captured signing wallet.
+    auto* send{page.findChild<QPushButton*>("assetSend")};
+    auto* receive{page.findChild<QPushButton*>("assetReceive")};
+    auto* reason{page.findChild<QLabel*>("assetActionReason")};
+    QVERIFY(!send->isEnabled());
+    QVERIFY(!receive->isEnabled());
+    QVERIFY(reason->isVisibleTo(&page));
+    QVERIFY(reason->text().contains(QStringLiteral("Send unavailable:")));
+    QVERIFY(reason->text().contains(QStringLiteral("Receive unavailable:")));
+    QVERIFY(send->toolTip().contains(QStringLiteral("loaded wallet")));
+
+    source.set({NativeRecord()});
+    QVERIFY(send->isEnabled());
+    QVERIFY(receive->isEnabled());
+    QVERIFY(!reason->isVisibleTo(&page));
+    QVERIFY(!send->toolTip().contains(QStringLiteral("loaded wallet")));
+    QVERIFY(!receive->toolTip().contains(QStringLiteral("loaded wallet")));
+
+    source.set({});
+    QVERIFY(!send->isEnabled());
+    QVERIFY(!receive->isEnabled());
+    QVERIFY(reason->isVisibleTo(&page));
+    QVERIFY(reason->text().contains(QStringLiteral("Select an asset")));
+    QCOMPARE(send->toolTip(), reason->text());
+    QCOMPARE(receive->accessibleDescription(), reason->text());
+    page.setSource(nullptr);
+}
+
+void B3AssetTests::relockWarningSurvivesRefreshDetachAndBlocksActions()
+{
+    B3AssetsPage page;
+    TestAssetSource source;
+    source.set({NativeRecord()});
+    page.setSource(&source);
+    auto* send{page.findChild<QPushButton*>("assetSend")};
+    auto* receive{page.findChild<QPushButton*>("assetReceive")};
+    auto* reason{page.findChild<QLabel*>("assetActionReason")};
+    auto* fn_panel{page.findChild<QWidget*>("fnOperatorPanel")};
+    QVERIFY(send && receive && reason && fn_panel);
+    QVERIFY(send->isEnabled());
+    QVERIFY(receive->isEnabled());
+    QSignalSpy sent(&page, &B3AssetsPage::sendRequested);
+    QSignalSpy received(&page, &B3AssetsPage::receiveRequested);
+
+    const QString warning{QStringLiteral("SECURITY: spending relock failed for captured old wallet <test>.")};
+    QVERIFY(QMetaObject::invokeMethod(&page, "showSecurityWarning", Qt::DirectConnection,
+                                     Q_ARG(QString, warning)));
+    QVERIFY(!send->isEnabled());
+    QVERIFY(!receive->isEnabled());
+    QVERIFY(!fn_panel->isEnabled());
+    QCOMPARE(reason->textFormat(), Qt::PlainText);
+    QVERIFY(reason->text().contains(warning));
+    QVERIFY(QMetaObject::invokeMethod(&page, "sendSelectedAsset", Qt::DirectConnection));
+    QVERIFY(QMetaObject::invokeMethod(&page, "receiveSelectedAsset", Qt::DirectConnection));
+    QCOMPARE(sent.count(), 0);
+    QCOMPARE(received.count(), 0);
+
+    source.set({NativeRecord()}); // A balance/model refresh cannot clear it.
+    QVERIFY(reason->text().contains(warning));
+    page.setSource(nullptr);
+    QCOMPARE(reason->text(), warning);
+    QVERIFY(reason->isVisibleTo(&page));
+    page.setSource(&source); // Nor can switching away and back to a wallet.
+    QVERIFY(reason->text().contains(warning));
+    QVERIFY(!send->isEnabled());
+    QVERIFY(!receive->isEnabled());
+    QVERIFY(!fn_panel->isEnabled());
+    page.setSource(nullptr);
 }
 
 void B3AssetTests::amountFormattingIsIntegerExact()
@@ -101,6 +186,32 @@ void B3AssetTests::amountFormattingIsIntegerExact()
     // Different precisions round-trip the raw integer faithfully.
     QCOMPARE(B3AssetTableModel::formatAmount(123456, 3), QStringLiteral("123.456"));
     QCOMPARE(B3AssetTableModel::formatAmount(1, 18), QStringLiteral("0.000000000000000001"));
+}
+
+void B3AssetTests::viewOnlyFnDataNeverEnablesOperatorActions()
+{
+    B3AssetsPage page;
+    TestAssetSource source;
+    B3AssetRecord fn;
+    fn.asset_id = QString(64, QLatin1Char('6'));
+    fn.status = B3AssetRecord::Status::Active;
+    fn.confirmed = fn.available = 1;
+    fn.is_fn = true;
+    source.setMeshAvailable(true);
+    source.set({NativeRecord(), fn});
+    page.setSource(&source);
+    auto* panel{page.findChild<QWidget*>("fnOperatorPanel")};
+    QVERIFY(panel);
+    QVERIFY(panel->isVisibleTo(&page));
+    for (const char* name : {"fnBindKey", "fnArmKeys", "fnDisarmKeys", "fnRefresh"}) {
+        auto* action{panel->findChild<QPushButton*>(name)};
+        QVERIFY(action);
+        QVERIFY(!action->isEnabled());
+    }
+    QVERIFY(page.findChild<QLabel*>("fnOperatorWallet")->text().contains(QStringLiteral("No wallet")));
+    QVERIFY(!page.findChild<QPushButton*>("assetDeposit")->isEnabled());
+    QVERIFY(!page.findChild<QPushButton*>("assetWithdraw")->isEnabled());
+    page.setSource(nullptr);
 }
 
 void B3AssetTests::walletAssetRecordsExposeFnAndColoredAssets()
@@ -296,11 +407,20 @@ void B3AssetTests::assetSendAllowsUnlockButRejectsWatchOnlyAndImmature()
     // substitute for the backend's signing checks.
     asset.available = 0;
     QVERIFY(B3AssetsPage::canSendAsset(asset, true));
+    QVERIFY(B3AssetsPage::sendAssetDisabledReason(asset, true).isEmpty());
     QVERIFY(!B3AssetsPage::canSendAsset(asset, false));
+    QVERIFY(B3AssetsPage::sendAssetDisabledReason(asset, false).contains(QStringLiteral("watch-only")));
     asset.immature = asset.confirmed;
     QVERIFY(!B3AssetsPage::canSendAsset(asset, true));
+    QVERIFY(B3AssetsPage::sendAssetDisabledReason(asset, true).contains(QStringLiteral("not yet mature")));
     asset.pending = 1;
     QVERIFY(!B3AssetsPage::canSendAsset(asset, true)); // Send uses confirmed inputs.
+    asset.confirmed = asset.immature = 0;
+    QVERIFY(!B3AssetsPage::canSendAsset(asset, true));
+    QVERIFY(B3AssetsPage::sendAssetDisabledReason(asset, true).contains(QStringLiteral("awaiting confirmation")));
+    asset.pending = 0;
+    QVERIFY(!B3AssetsPage::canSendAsset(asset, true));
+    QVERIFY(B3AssetsPage::sendAssetDisabledReason(asset, true).contains(QStringLiteral("no confirmed, mature balance")));
     asset.status = B3AssetRecord::Status::Unavailable;
     QVERIFY(!B3AssetsPage::canSendAsset(asset, true));
     asset.status = B3AssetRecord::Status::Native;
@@ -414,14 +534,17 @@ void B3AssetTests::nativeOnlySourceEnablesOnlySupportedActions()
     QVERIFY(!deposit->isEnabled());
     QVERIFY(!withdraw->isEnabled());
 
-    bool mesh_note{false};
-    for (const QLabel* label : page.findChildren<QLabel*>()) {
-        if (label->text().contains(QStringLiteral("not available on this page")) &&
-            label->isVisibleTo(&page)) {
-            mesh_note = true;
-        }
-    }
+    const QLabel* mesh_note{page.findChild<QLabel*>("assetFlowMeshReason")};
     QVERIFY(mesh_note);
+    QVERIFY(mesh_note->isVisibleTo(&page));
+    QCOMPARE(mesh_note->textFormat(), Qt::PlainText);
+    QVERIFY(mesh_note->text().contains(QStringLiteral("pending successful market, deposit and withdrawal testing")));
+    QVERIFY(mesh_note->text().contains(QStringLiteral("Activation height alone does not make a market ready")));
+    QVERIFY(mesh_note->text().contains(QStringLiteral("keyless vault")));
+    QVERIFY(mesh_note->text().contains(QStringLiteral("Trading remains disabled")));
+    QVERIFY(!mesh_note->text().contains(QStringLiteral("Use the console")));
+    QCOMPARE(deposit->toolTip(), mesh_note->text());
+    QCOMPARE(withdraw->accessibleDescription(), mesh_note->text());
 
     // Data availability is not an approved deposit/withdraw action path.
     // Even a source advertising FlowMesh data must not make disconnected

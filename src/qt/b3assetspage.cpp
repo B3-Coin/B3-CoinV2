@@ -9,6 +9,7 @@
 #include <qt/b3assetspage.h>
 
 #include <qt/b3assetsenddialog.h>
+#include <qt/b3flowmeshpanel.h>
 #include <qt/b3theme.h>
 #include <qt/guiutil.h>
 #include <qt/walletmodel.h>
@@ -33,6 +34,7 @@
 #include <QScrollArea>
 #include <QSizePolicy>
 #include <QSortFilterProxyModel>
+#include <QStringList>
 #include <QTableView>
 #include <QVBoxLayout>
 
@@ -236,6 +238,13 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
         actionRow->addStretch();
         detailLayout->addLayout(actionRow);
 
+        m_action_note = new QLabel(m_detail_card);
+        m_action_note->setObjectName(QStringLiteral("assetActionReason"));
+        m_action_note->setTextFormat(Qt::PlainText);
+        m_action_note->setWordWrap(true);
+        B3Theme::markTextRole(m_action_note, QStringLiteral("status"));
+        detailLayout->addWidget(m_action_note);
+
         auto* meshRow = new QHBoxLayout();
         m_deposit = new QPushButton(tr("Deposit to FlowMesh"), m_detail_card);
         m_deposit->setObjectName(QStringLiteral("assetDeposit"));
@@ -247,6 +256,8 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
         detailLayout->addLayout(meshRow);
 
         m_backend_note = new QLabel(m_detail_card);
+        m_backend_note->setObjectName(QStringLiteral("assetFlowMeshReason"));
+        m_backend_note->setTextFormat(Qt::PlainText);
         B3Theme::markTextRole(m_backend_note, QStringLiteral("status"));
         m_backend_note->setWordWrap(true);
         detailLayout->addWidget(m_backend_note);
@@ -260,10 +271,14 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
 
         connect(m_send, &QPushButton::clicked, this, &B3AssetsPage::sendSelectedAsset);
         connect(m_receive, &QPushButton::clicked, this, &B3AssetsPage::receiveSelectedAsset);
-        // Deposit/withdraw stay disconnected as well as disabled: there is
-        // no backend to submit to.
+        // The RPC exists, but the production deposit/withdraw UI remains
+        // deliberately gated until its complete market lifecycle is tested.
     }
     layout->addLayout(m_columns, 1);
+    m_flowmesh_panel = new B3FlowMeshPanel(content);
+    layout->addWidget(m_flowmesh_panel);
+    connect(this, &B3AssetsPage::walletChanged,
+            m_flowmesh_panel, &B3FlowMeshPanel::cancelAndWait);
     scroll->setWidget(content);
     reflowCards(width());
 
@@ -304,12 +319,15 @@ void B3AssetsPage::setWalletModel(WalletModel* wallet_model)
     Q_EMIT walletChanged();
     if (m_wallet_model) disconnect(m_wallet_model, nullptr, this, nullptr);
     m_wallet_model = wallet_model;
+    m_flowmesh_panel->setFnAsset({});
+    m_flowmesh_panel->setWalletModel(wallet_model);
     if (wallet_model) {
         connect(wallet_model, &WalletModel::canGetAddressesChanged, this, &B3AssetsPage::updateDetails);
         connect(wallet_model, &QObject::destroyed, this, [this] {
             m_wallet_model = nullptr;
             m_have_wallet = false;
             Q_EMIT walletChanged();
+            m_flowmesh_panel->setWalletModel(nullptr);
             updateDetails();
         });
     }
@@ -332,6 +350,8 @@ void B3AssetsPage::setSource(B3AssetSource* source)
     Q_EMIT walletChanged();
     if (m_wallet_model) disconnect(m_wallet_model, nullptr, this, nullptr);
     m_wallet_model = nullptr;
+    m_flowmesh_panel->setFnAsset({});
+    m_flowmesh_panel->setWalletModel(nullptr);
     B3AssetSource* old = m_owned_source;
     m_owned_source = nullptr;
     m_have_wallet = source != nullptr;
@@ -343,6 +363,19 @@ void B3AssetsPage::setSource(B3AssetSource* source)
 
 void B3AssetsPage::updateDetails()
 {
+    // FN operator controls follow the captured wallet's FN record, not the
+    // selected trading asset. A view-only test/source must never arm controls.
+    B3AssetRecord fn;
+    if (m_wallet_model) {
+        for (int row{0}; row < m_model->rowCount(); ++row) {
+            const auto candidate{m_model->recordAt(row)};
+            if (candidate.is_fn) {
+                fn = candidate;
+                break;
+            }
+        }
+    }
+    m_flowmesh_panel->setFnAsset(fn);
     const int rows = m_proxy->rowCount();
     m_empty->setVisible(rows == 0);
     m_empty->setText(m_have_wallet ? tr("No assets to show.") : tr("No wallet is loaded."));
@@ -396,6 +429,15 @@ void B3AssetsPage::updateDetails()
         m_receive->setEnabled(false);
         m_deposit->setEnabled(false);
         m_withdraw->setEnabled(false);
+        const QString reason{!m_security_warning.isEmpty() ? m_security_warning :
+            m_have_wallet ? tr("Select an asset to see its available actions.")
+                          : tr("Load and select a wallet to use asset actions.")};
+        for (QPushButton* button : {m_send, m_receive, m_deposit, m_withdraw}) {
+            button->setToolTip(reason);
+            button->setAccessibleDescription(reason);
+        }
+        m_action_note->setText(reason);
+        m_action_note->setVisible(true);
         m_backend_note->setVisible(false);
         m_activity_note->setVisible(false);
         return;
@@ -448,20 +490,55 @@ void B3AssetsPage::updateDetails()
     // exact-unit confirmation flow and never pass through the native B3 form.
     const bool native = record.status == B3AssetRecord::Status::Native;
     const bool signing_wallet{m_wallet_model && !m_wallet_model->wallet().privateKeysDisabled()};
-    m_send->setEnabled(!m_action_open && ((native && m_have_wallet) || canSendAsset(record, signing_wallet)));
-    m_receive->setEnabled(!m_action_open && ((native && m_have_wallet) ||
-        (m_wallet_model && m_wallet_model->wallet().canGetAddresses() &&
-         record.status == B3AssetRecord::Status::Active)));
+    QString send_reason, receive_reason;
+    if (!m_security_warning.isEmpty()) {
+        send_reason = receive_reason = m_security_warning;
+    } else if (m_action_open) {
+        send_reason = receive_reason = tr("Finish or close the current asset dialog first.");
+    } else if (!native || !m_have_wallet) {
+        if (!m_wallet_model) {
+            send_reason = receive_reason = tr("Select a loaded wallet for this asset.");
+        } else {
+            send_reason = sendAssetDisabledReason(record, signing_wallet);
+            if (record.status != B3AssetRecord::Status::Active) {
+                receive_reason = tr("This asset's wallet data is unavailable.");
+            } else if (!m_wallet_model->wallet().canGetAddresses()) {
+                receive_reason = tr("This wallet has no receiving addresses available. Load a wallet that can generate receiving addresses.");
+            }
+        }
+    }
+    m_send->setEnabled(send_reason.isEmpty());
+    m_receive->setEnabled(receive_reason.isEmpty());
+    m_send->setToolTip(send_reason.isEmpty()
+        ? (native ? tr("Open the native B3 send page.")
+                  : tr("Prepare and review a transfer of this asset. A temporary spending unlock will be requested if needed."))
+        : send_reason);
+    m_receive->setToolTip(receive_reason.isEmpty()
+        ? (native ? tr("Open the native B3 receive page.")
+                  : tr("Create a receiving address in the selected wallet. No balance or network fee is required."))
+        : receive_reason);
+    m_send->setAccessibleDescription(m_send->toolTip());
+    m_receive->setAccessibleDescription(m_receive->toolTip());
+    QStringList disabled_reasons;
+    if (!send_reason.isEmpty()) disabled_reasons.push_back(tr("Send unavailable: %1").arg(send_reason));
+    if (!receive_reason.isEmpty()) disabled_reasons.push_back(tr("Receive unavailable: %1").arg(receive_reason));
+    m_action_note->setText(disabled_reasons.join(QLatin1Char('\n')));
+    m_action_note->setVisible(!disabled_reasons.isEmpty());
 
     // The model can expose FlowMesh balances, but this page has no approved
     // deposit/withdraw submission path yet. Never turn disconnected buttons
     // into controls that merely look live.
     m_deposit->setEnabled(false);
     m_withdraw->setEnabled(false);
+    const QString mesh_reason{tr("FlowMesh deposits and withdrawals remain disabled here pending successful market, deposit and withdrawal testing. "
+                                 "Activation height alone does not make a market ready. Deposits enter a keyless vault and may remain locked "
+                                 "if the market's validator quorum is unavailable. Trading remains disabled.")};
+    for (QPushButton* button : {m_deposit, m_withdraw}) {
+        button->setToolTip(mesh_reason);
+        button->setAccessibleDescription(mesh_reason);
+    }
     m_backend_note->setVisible(true);
-    m_backend_note->setText(tr("FlowMesh deposit and withdrawal controls are not available "
-                               "on this page in this beta. Use the console after the "
-                               "configured activation height."));
+    m_backend_note->setText(mesh_reason);
 
     m_activity_note->setVisible(true);
     m_activity_note->setText(native
@@ -471,11 +548,39 @@ void B3AssetsPage::updateDetails()
              "Names are labels, not a guarantee of backing."));
 }
 
+void B3AssetsPage::showSecurityWarning(const QString& warning)
+{
+    if (warning.isEmpty()) return;
+    // The warning names the captured wallet, which may no longer be selected.
+    // Do not clear it on refresh/detach, or permit another unlock on this page.
+    if (!m_security_warning.contains(warning)) {
+        if (!m_security_warning.isEmpty()) m_security_warning += QLatin1Char('\n');
+        m_security_warning += warning;
+    }
+    m_flowmesh_panel->setEnabled(false);
+    updateDetails();
+}
+
 bool B3AssetsPage::canSendAsset(const B3AssetRecord& record, const bool signing_wallet)
 {
-    return signing_wallet && record.status == B3AssetRecord::Status::Active &&
-           !record.asset_id.isEmpty() &&
-           record.confirmed > record.immature;
+    return sendAssetDisabledReason(record, signing_wallet).isEmpty();
+}
+
+QString B3AssetsPage::sendAssetDisabledReason(const B3AssetRecord& record, const bool signing_wallet)
+{
+    if (record.status != B3AssetRecord::Status::Active || record.asset_id.isEmpty()) {
+        return tr("Select an active asset with available wallet data.");
+    }
+    if (!signing_wallet) return tr("This wallet has no spending keys (watch-only).");
+    if (record.confirmed <= record.immature) {
+        if (record.immature > 0) return tr("This asset balance is not yet mature. Wait for the required confirmations.");
+        if (record.pending > 0) return tr("This asset is awaiting confirmation. Only confirmed asset inputs can be sent.");
+        return tr("There is no confirmed, mature balance of this asset to send.");
+    }
+    // A locked wallet can report available=0 while still owning mature
+    // inputs. Let the existing send form request unlock and then recheck its
+    // actual spendable balance, precision, transaction and B3 fee.
+    return {};
 }
 
 B3AssetRecord B3AssetsPage::selectedAsset() const
@@ -486,7 +591,7 @@ B3AssetRecord B3AssetsPage::selectedAsset() const
 
 void B3AssetsPage::sendSelectedAsset()
 {
-    if (m_action_open) return;
+    if (m_action_open || !m_security_warning.isEmpty()) return;
     const auto record{selectedAsset()};
     if (record.status == B3AssetRecord::Status::Native && m_have_wallet) {
         Q_EMIT sendRequested();
@@ -498,6 +603,7 @@ void B3AssetsPage::sendSelectedAsset()
     QPointer<B3AssetsPage> self{this};
     QPointer<B3AssetSendDialog> dialog{new B3AssetSendDialog(m_wallet_model, record, this)};
     connect(this, &B3AssetsPage::walletChanged, dialog, &B3AssetSendDialog::cancelAndWait);
+    connect(dialog, &B3AssetSendDialog::securityWarning, this, &B3AssetsPage::showSecurityWarning);
     dialog->exec();
     if (dialog) dialog->deleteLater();
     if (self) {
@@ -508,7 +614,7 @@ void B3AssetsPage::sendSelectedAsset()
 
 void B3AssetsPage::receiveSelectedAsset()
 {
-    if (m_action_open) return;
+    if (m_action_open || !m_security_warning.isEmpty()) return;
     const auto record{selectedAsset()};
     if (record.status == B3AssetRecord::Status::Native && m_have_wallet) {
         Q_EMIT receiveRequested();

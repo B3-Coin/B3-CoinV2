@@ -430,6 +430,109 @@ UniValue FlowMeshVaultOperationToJSON(
     return VaultOperationJson(operation);
 }
 
+UniValue FlowMeshValidatorStatusToJSON(
+    const interfaces::FlowMeshValidatorStatus& status,
+    std::vector<std::array<unsigned char, bls::PUBKEY_SIZE>> wallet_public_keys)
+{
+    std::sort(wallet_public_keys.begin(), wallet_public_keys.end());
+    wallet_public_keys.erase(std::unique(wallet_public_keys.begin(), wallet_public_keys.end()), wallet_public_keys.end());
+    UniValue armed{UniValue::VARR};
+    std::set<std::array<unsigned char, bls::PUBKEY_SIZE>> armed_keys{
+        status.armed_pubkeys.begin(), status.armed_pubkeys.end()};
+    for (const auto& key : armed_keys) armed.push_back(HexStr(key));
+    UniValue wallet_keys{UniValue::VARR};
+    uint64_t wallet_armed{0};
+    for (const auto& key : wallet_public_keys) {
+        wallet_keys.push_back(HexStr(key));
+        if (armed_keys.contains(key)) ++wallet_armed;
+    }
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("scope", "node-global");
+    out.pushKV("service_available", status.available);
+    out.pushKV("service_enabled", status.enabled);
+    out.pushKV("service_running", status.running);
+    out.pushKV("armed", !armed_keys.empty());
+    out.pushKV("armed_keys_fingerprint", status.fingerprint.GetHex());
+    out.pushKV("armed_key_count", static_cast<uint64_t>(armed_keys.size()));
+    out.pushKV("armed_bls_pubkeys", std::move(armed));
+    out.pushKV("wallet_bls_pubkeys", std::move(wallet_keys));
+    out.pushKV("wallet_key_count", static_cast<uint64_t>(wallet_public_keys.size()));
+    out.pushKV("wallet_armed_key_count", wallet_armed);
+    out.pushKV("wallet_all_keys_armed", !wallet_public_keys.empty() && wallet_armed == wallet_public_keys.size());
+    out.pushKV("armed_is_signing_proof", false);
+    out.pushKV("warning", "Armed keys are node-global and do not prove active seat membership, a signature, or a certified microblock. Market status is a separate observation.");
+    return out;
+}
+
+namespace {
+
+RPCResult FlowMeshValidatorStatusResult(const bool include_markets,
+                                       const bool legacy_fields)
+{
+    std::vector<RPCResult> fields{
+        {RPCResult::Type::STR, "scope", "Always node-global; changing keys affects every wallet"},
+        {RPCResult::Type::BOOL, "service_available", "Whether this node has a FlowMesh service"},
+        {RPCResult::Type::BOOL, "service_enabled", "Whether the service's activation schedule is configured"},
+        {RPCResult::Type::BOOL, "service_running", "Whether the service worker is running"},
+        {RPCResult::Type::BOOL, "armed", "At least one FN BLS key is loaded; not proof of signing"},
+        {RPCResult::Type::STR_HEX, "armed_keys_fingerprint", "CAS token for the exact sorted unique public-key set"},
+        {RPCResult::Type::NUM, "armed_key_count", "Number of unique node-global armed keys"},
+        {RPCResult::Type::ARR, "armed_bls_pubkeys", "Sorted unique node-global public keys", {
+            {RPCResult::Type::STR_HEX, "", "48-byte BLS public key"}}},
+        {RPCResult::Type::ARR, "wallet_bls_pubkeys", "Public keys stored in the selected wallet; no secrets are read", {
+            {RPCResult::Type::STR_HEX, "", "48-byte BLS public key"}}},
+        {RPCResult::Type::NUM, "wallet_key_count", "Unique stored wallet FN BLS keys; not a count of owned or eligible seats"},
+        {RPCResult::Type::NUM, "wallet_armed_key_count", "Stored wallet keys also present in the armed snapshot"},
+        {RPCResult::Type::BOOL, "wallet_all_keys_armed", "All stored wallet keys are armed, false if none are stored"},
+        {RPCResult::Type::BOOL, "armed_is_signing_proof", "Always false"},
+        {RPCResult::Type::STR, "warning", "Status interpretation and node-global scope"},
+    };
+    if (include_markets) {
+        fields.emplace_back(RPCResult::Type::ARR, "markets", "Separately sampled node-wide market status; not proof of a local signature",
+                            std::vector<RPCResult>{MarketStatusResult("Market status")});
+    }
+    if (legacy_fields) {
+        fields.emplace_back(RPCResult::Type::BOOL, "running", "Legacy alias for armed, not service_running or proof of signing");
+        fields.emplace_back(RPCResult::Type::NUM, "armed_keys", "Legacy alias for armed_key_count");
+    }
+    return RPCResult{RPCResult::Type::OBJ, "", "Public FN validator key status", std::move(fields)};
+}
+
+std::optional<uint256> ExpectedArmedKeys(const UniValue& value)
+{
+    return value.isNull() ? std::nullopt
+                          : std::optional<uint256>{ParseHashV(value, "expected_armed_keys_fingerprint")};
+}
+
+} // namespace
+
+RPCHelpMan getflowmeshvalidatorinfo()
+{
+    return RPCHelpMan{
+        "getflowmeshvalidatorinfo",
+        "Read the selected wallet's stored FN BLS public keys and a locked snapshot of the node-global armed keys. "
+        "Does not unlock, create keys, sign, or broadcast. Armed is not proof of seat eligibility or actual signing.\n",
+        {},
+        FlowMeshValidatorStatusResult(/*include_markets=*/true, /*legacy_fields=*/false),
+        RPCExamples{HelpExampleCli("getflowmeshvalidatorinfo", "")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto wallet{GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            std::vector<std::array<unsigned char, bls::PUBKEY_SIZE>> public_keys;
+            {
+                LOCK(wallet->cs_wallet);
+                public_keys = wallet->ListFlowMeshBlsPubkeys();
+            }
+            UniValue out{FlowMeshValidatorStatusToJSON(wallet->chain().flowMeshValidatorStatus(), std::move(public_keys))};
+            UniValue markets{UniValue::VARR};
+            for (const auto& market : wallet->chain().flowMeshMarkets(std::nullopt)) {
+                markets.push_back(MarketStatusJson(market));
+            }
+            out.pushKV("markets", std::move(markets));
+            return out;
+        }};
+}
+
 RPCHelpMan listflowmeshmarkets()
 {
     return RPCHelpMan{
@@ -819,23 +922,27 @@ RPCHelpMan startflowmeshvalidator()
 {
     return RPCHelpMan{
         "startflowmeshvalidator",
-        "Arm the local FlowMesh worker with every wallet-held FN-seat BLS key. Keys remain in node memory and are never returned.\n" +
+        "Replace the NODE-GLOBAL armed FN keys with every FN-seat BLS key held by this wallet. "
+        "This also replaces any keys loaded by another wallet. Keys remain in node memory; secrets are never returned. "
+        "Supply the fingerprint from getflowmeshvalidatorinfo to reject a stale approval atomically. "
+        "Omitting it preserves the legacy unconditional behavior. Loaded keys do not prove signing.\n" +
             HELP_REQUIRING_PASSPHRASE,
-        {},
-        RPCResult{RPCResult::Type::OBJ, "", "Validator status", {
-            {RPCResult::Type::BOOL, "running", "Whether the local validator is armed"},
-            {RPCResult::Type::NUM, "armed_keys", "Number of armed wallet seat keys"},
-        }},
+        {{"expected_armed_keys_fingerprint", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED,
+          "Expected node-global armed-key snapshot; reject without replacing keys if it changed"}},
+        FlowMeshValidatorStatusResult(/*include_markets=*/false, /*legacy_fields=*/true),
         RPCExamples{HelpExampleCli("startflowmeshvalidator", "")},
         [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
             const std::shared_ptr<CWallet> wallet{
                 GetWalletForJSONRPCRequest(request)};
             if (!wallet) return UniValue::VNULL;
+            const auto expected{ExpectedArmedKeys(request.params[0])};
             std::vector<bls::SecretKey> keys;
+            std::vector<std::array<unsigned char, bls::PUBKEY_SIZE>> public_keys;
             {
                 LOCK(wallet->cs_wallet);
                 EnsureWalletIsUnlocked(*wallet);
-                for (const auto& pubkey : wallet->ListFlowMeshBlsPubkeys()) {
+                public_keys = wallet->ListFlowMeshBlsPubkeys();
+                for (const auto& pubkey : public_keys) {
                     const auto key{wallet->GetFlowMeshBlsKey(pubkey)};
                     if (!key) {
                         throw JSONRPCError(RPC_WALLET_ERROR,
@@ -850,15 +957,16 @@ RPCHelpMan startflowmeshvalidator()
                     "This wallet has no FlowMesh BLS seat keys; bind a seat first");
             }
             std::string error;
-            if (!wallet->chain().armFlowMeshSeatKeys(keys, error)) {
+            interfaces::FlowMeshValidatorStatus status;
+            if (!wallet->chain().armFlowMeshSeatKeys(keys, error, expected, &status)) {
                 throw JSONRPCError(
                     RPC_MISC_ERROR,
                     error.empty() ? "Unable to start FlowMesh validator"
                                   : error);
             }
-            UniValue out{UniValue::VOBJ};
-            out.pushKV("running", true);
-            out.pushKV("armed_keys", static_cast<uint64_t>(keys.size()));
+            UniValue out{FlowMeshValidatorStatusToJSON(status, std::move(public_keys))};
+            out.pushKV("running", !status.armed_pubkeys.empty());
+            out.pushKV("armed_keys", static_cast<uint64_t>(status.armed_pubkeys.size()));
             return out;
         }};
 }
@@ -867,25 +975,34 @@ RPCHelpMan stopflowmeshvalidator()
 {
     return RPCHelpMan{
         "stopflowmeshvalidator",
-        "Remove every armed FlowMesh seat key from node memory.\n",
-        {},
-        RPCResult{RPCResult::Type::OBJ, "", "Validator status", {
-            {RPCResult::Type::BOOL, "running", "Whether the local validator is armed"},
-        }},
+        "Remove ALL node-global armed FN keys, including keys loaded by other wallets. "
+        "Supply the fingerprint from getflowmeshvalidatorinfo to reject a stale approval atomically. "
+        "Omitting it preserves the legacy unconditional behavior.\n",
+        {{"expected_armed_keys_fingerprint", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED,
+          "Expected node-global armed-key snapshot; reject without clearing keys if it changed"}},
+        FlowMeshValidatorStatusResult(/*include_markets=*/false, /*legacy_fields=*/true),
         RPCExamples{HelpExampleCli("stopflowmeshvalidator", "")},
         [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
             const std::shared_ptr<CWallet> wallet{
                 GetWalletForJSONRPCRequest(request)};
             if (!wallet) return UniValue::VNULL;
+            const auto expected{ExpectedArmedKeys(request.params[0])};
+            std::vector<std::array<unsigned char, bls::PUBKEY_SIZE>> public_keys;
+            {
+                LOCK(wallet->cs_wallet);
+                public_keys = wallet->ListFlowMeshBlsPubkeys();
+            }
             std::string error;
-            if (!wallet->chain().disarmFlowMeshSeatKeys(error)) {
+            interfaces::FlowMeshValidatorStatus status;
+            if (!wallet->chain().disarmFlowMeshSeatKeys(error, expected, &status)) {
                 throw JSONRPCError(
                     RPC_MISC_ERROR,
                     error.empty() ? "Unable to stop FlowMesh validator"
                                   : error);
             }
-            UniValue out{UniValue::VOBJ};
+            UniValue out{FlowMeshValidatorStatusToJSON(status, std::move(public_keys))};
             out.pushKV("running", false);
+            out.pushKV("armed_keys", static_cast<uint64_t>(status.armed_pubkeys.size()));
             return out;
         }};
 }

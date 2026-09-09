@@ -40,6 +40,7 @@
 #include <univalue.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -49,6 +50,36 @@
 #include <vector>
 
 namespace wallet {
+
+CAmount AssetUnitsFromValue(const UniValue& value, const std::string& name)
+{
+    if (!value.isNum() && !value.isStr()) {
+        throw JSONRPCError(RPC_TYPE_ERROR,
+                           name + " must be an integer number or string of asset units");
+    }
+    // Parse the original decimal characters, never a floating-point value or
+    // an amount scaled by display precision. Quoted and JSON-number inputs
+    // have the same canonical, unsigned integer grammar.
+    const std::string& text{value.getValStr()};
+    if (text.empty() || (text.size() > 1 && text.front() == '0') ||
+        !std::all_of(text.begin(), text.end(), [](const char digit) {
+            return digit >= '0' && digit <= '9';
+        })) {
+        throw JSONRPCError(RPC_TYPE_ERROR,
+                           name + " must contain only canonical integer asset units, without a sign, fraction, or exponent");
+    }
+    CAmount units{0};
+    const auto [end, error]{std::from_chars(text.data(), text.data() + text.size(), units)};
+    if (error == std::errc::result_out_of_range || units < 1 || units > MAX_MONEY) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           name + " must be in the range [1, MAX_MONEY]");
+    }
+    if (error != std::errc{} || end != text.data() + text.size()) {
+        throw JSONRPCError(RPC_TYPE_ERROR,
+                           name + " must be an integer number or string of asset units");
+    }
+    return units;
+}
 
 std::optional<CMpaRecord> BuildBridgeWithdrawalMpaRecord(
     const Consensus::BridgeWithdrawalMode mode, const uint256& registry_id,
@@ -196,24 +227,6 @@ static bridge::EthAddress ParseEthereumRecipient(const UniValue& value)
                            "ethereum_recipient cannot be the zero address");
     }
     return address;
-}
-
-static CAmount AssetUnitsFromValue(const UniValue& value, const std::string& name)
-{
-    if (!value.isNum()) {
-        throw JSONRPCError(RPC_TYPE_ERROR, name + " must be an integer number of asset units");
-    }
-    try {
-        const int64_t units{value.getInt<int64_t>()};
-        if (units < 1 || units > MAX_MONEY) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER,
-                               name + " must be in the range [1, MAX_MONEY]");
-        }
-        return units;
-    } catch (const UniValue::type_error&) {
-        throw JSONRPCError(RPC_TYPE_ERROR,
-                           name + " must be an integer number of asset units");
-    }
 }
 
 static uint8_t AssetDecimalsFromValue(const UniValue& value)
@@ -1032,8 +1045,8 @@ RPCHelpMan sendasset()
         {
             {"asset_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
              "32-byte chain-bound asset id"},
-            {"amount", RPCArg::Type::NUM, RPCArg::Optional::NO,
-             "Integer asset units"},
+            {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO,
+             "Positive integer atomic asset units, as a JSON number or string; no display-decimal scaling"},
             {"address", RPCArg::Type::STR, RPCArg::Optional::NO,
              "Recipient owner address"},
             {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED,
@@ -1071,8 +1084,8 @@ RPCHelpMan burnasset()
         {
             {"asset_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
              "32-byte chain-bound asset id"},
-            {"amount", RPCArg::Type::NUM, RPCArg::Optional::NO,
-             "Integer asset units"},
+            {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO,
+             "Positive integer atomic asset units, as a JSON number or string; no display-decimal scaling"},
             {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED,
              "Transaction options", {
                  {"broadcast", RPCArg::Type::BOOL, RPCArg::Default{true},
@@ -1422,7 +1435,7 @@ RPCHelpMan flowmeshdeposit()
             {"deposit_asset", RPCArg::Type::STR, RPCArg::Optional::NO,
              "The base asset id, or 'B3' for native quote funds"},
             {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO,
-             "B3 decimal amount, or integer colored-asset units"},
+             "Number or string: decimal B3 units for native deposits, or positive integer atomic units for colored assets (no display-decimal scaling)"},
             {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED,
              "Transaction options", {
                  {"broadcast", RPCArg::Type::BOOL, RPCArg::Default{true},

@@ -902,6 +902,7 @@ RPCHelpMan importflowmeshkey();
 RPCHelpMan bindflowmeshseat();
 RPCHelpMan flowmeshdeposit();
 RPCHelpMan listflowmeshmarkets();
+RPCHelpMan getflowmeshvalidatorinfo();
 RPCHelpMan getflowmeshbalance();
 RPCHelpMan listflowmeshvaultoperations();
 RPCHelpMan submitflowmeshdeposit();
@@ -975,6 +976,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &encryptwallet},
         {"wallet", &flowmeshdeposit},
         {"wallet", &getflowmeshbalance},
+        {"wallet", &getflowmeshvalidatorinfo},
         {"wallet", &getaddressesbylabel},
         {"wallet", &getaddressinfo},
         {"wallet", &getbalance},

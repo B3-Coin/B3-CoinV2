@@ -34,9 +34,10 @@ class B3AssetSendDialog : public QDialog
 
 public:
     explicit B3AssetSendDialog(WalletModel* wallet, const B3AssetRecord& asset,
-                               QWidget* parent = nullptr);
+                               QWidget* parent = nullptr, bool fn_binding = false);
     ~B3AssetSendDialog() override;
     static int execForAsset(WalletModel* wallet, const B3AssetRecord& asset, QWidget* parent = nullptr);
+    static int execForFnBinding(WalletModel* wallet, const B3AssetRecord& asset, QWidget* parent = nullptr);
 
 public Q_SLOTS:
     void reject() override;
@@ -47,6 +48,8 @@ public Q_SLOTS:
 Q_SIGNALS:
     void transactionSubmitted(const QString& txid);
     void submissionUncertain(const QString& txid);
+    //! Keep a relock failure visible on the owning page after this dialog closes.
+    void securityWarning(const QString& warning);
 
 private:
     enum class Phase { Editing, Preparing, Review, Submitting, Finished };
@@ -58,9 +61,11 @@ private:
     void stopWorker();
     void setStatus(const QString& text);
     void setEditing(bool editing);
+    bool restoreSpendingLock();
 
     QPointer<WalletModel> m_wallet;
     const B3AssetRecord m_asset;
+    const bool m_fn_binding;
     const QString m_wallet_name;
     const QString m_wallet_display;
     const std::string m_wallet_uri;
@@ -72,6 +77,8 @@ private:
     QThread* m_thread{nullptr};
     Phase m_phase{Phase::Editing};
     bool m_close_requested{false};
+    bool m_restore_locked{false};
+    QString m_security_warning;
     uint64_t m_generation{0};
     CAmount m_raw_amount{0};
     QString m_recipient;
@@ -81,6 +88,7 @@ private:
     QLabel* m_fee{nullptr};
     QLabel* m_review_amount{nullptr};
     QLineEdit* m_txid{nullptr};
+    QLineEdit* m_fn_public_key{nullptr};
     QLabel* m_status{nullptr};
     QCheckBox* m_confirm{nullptr};
     QPushButton* m_action{nullptr};

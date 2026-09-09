@@ -230,6 +230,16 @@ struct StakingStatus {
     std::optional<FinalityRecoveryStatus> finality_recovery;
 };
 
+//! Public node-global key snapshot. Armed does not establish seat eligibility
+//! or prove that the node produced a signature. All keys here are public.
+struct FlowMeshValidatorStatus {
+    bool available{false};
+    bool enabled{false};
+    bool running{false};
+    std::vector<std::array<unsigned char, bls::PUBKEY_SIZE>> armed_pubkeys;
+    uint256 fingerprint;
+};
+
 //! One production FlowMesh market plus an optional wallet-account view.
 //! The node owns the authoritative runtime/state; this value is a bounded
 //! copy for wallet RPC and GUI clients.
@@ -677,9 +687,15 @@ public:
     virtual bool submitFlowMeshAction(const uint256& market_id,
                                       const flowmesh::Action& action,
                                       std::string& error) = 0;
+    virtual FlowMeshValidatorStatus flowMeshValidatorStatus() = 0;
+    //! Optional CAS guard and result are checked/copied under the same service mutex.
     virtual bool armFlowMeshSeatKeys(const std::vector<bls::SecretKey>& keys,
-                                     std::string& error) = 0;
-    virtual bool disarmFlowMeshSeatKeys(std::string& error) = 0;
+                                     std::string& error,
+                                     const std::optional<uint256>& expected_fingerprint = std::nullopt,
+                                     FlowMeshValidatorStatus* result = nullptr) = 0;
+    virtual bool disarmFlowMeshSeatKeys(std::string& error,
+                                       const std::optional<uint256>& expected_fingerprint = std::nullopt,
+                                       FlowMeshValidatorStatus* result = nullptr) = 0;
     virtual std::optional<FlowMeshPendingCheckpoint> nextFlowMeshCheckpoint(
         const uint256& market_id, std::string& error) = 0;
     virtual std::optional<FlowMeshVaultOperation> flowMeshVaultOperation(

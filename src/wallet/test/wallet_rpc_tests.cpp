@@ -7,6 +7,7 @@
 #include <kernel/chainparams.h>
 #include <modern/bridge_asset.h>
 #include <modern/policy.h>
+#include <rpc/client.h>
 #include <rpc/request.h>
 #include <rpc/server.h>
 #include <test/util/setup_common.h>
@@ -125,6 +126,64 @@ BOOST_AUTO_TEST_CASE(flowmesh_deposit_admission_fails_closed)
                 Admission::BOOTSTRAP_REQUIRES_BASE_ASSET);
     BOOST_CHECK(check(true, true, true, true, false, true) ==
                 Admission::BOOTSTRAP_MARKET_ALREADY_ESTABLISHED);
+}
+
+BOOST_AUTO_TEST_CASE(flowmesh_validator_public_status_never_claims_signatures)
+{
+    std::array<unsigned char, bls::PUBKEY_SIZE> a{};
+    std::array<unsigned char, bls::PUBKEY_SIZE> b{};
+    std::array<unsigned char, bls::PUBKEY_SIZE> c{};
+    a.fill(1);
+    b.fill(2);
+    c.fill(3);
+    interfaces::FlowMeshValidatorStatus status;
+    status.available = true;
+    status.enabled = true;
+    status.running = true;
+    status.fingerprint = TestHash(0x61);
+    status.armed_pubkeys = {b, a};
+    const UniValue json{FlowMeshValidatorStatusToJSON(status, {c, b, b})};
+    BOOST_CHECK_EQUAL(json.find_value("scope").get_str(), "node-global");
+    BOOST_CHECK(json.find_value("armed").get_bool());
+    BOOST_CHECK_EQUAL(json.find_value("armed_key_count").getInt<int>(), 2);
+    BOOST_CHECK_EQUAL(json.find_value("wallet_key_count").getInt<int>(), 2);
+    BOOST_CHECK_EQUAL(json.find_value("wallet_armed_key_count").getInt<int>(), 1);
+    BOOST_CHECK(!json.find_value("wallet_all_keys_armed").get_bool());
+    BOOST_CHECK(!json.find_value("armed_is_signing_proof").get_bool());
+    BOOST_CHECK(json.find_value("last_signed_height").isNull());
+    BOOST_CHECK(json.find_value("private_key").isNull());
+    BOOST_CHECK_EQUAL(json.find_value("armed_keys_fingerprint").get_str(), status.fingerprint.GetHex());
+
+    BOOST_CHECK(FlowMeshValidatorStatusToJSON(status, {a, b}).find_value("wallet_all_keys_armed").get_bool());
+    BOOST_CHECK(!FlowMeshValidatorStatusToJSON(status, {}).find_value("wallet_all_keys_armed").get_bool());
+    status.armed_pubkeys.clear();
+    const auto observer{FlowMeshValidatorStatusToJSON(status, {a})};
+    BOOST_CHECK(observer.find_value("service_running").get_bool());
+    BOOST_CHECK(!observer.find_value("armed").get_bool());
+    BOOST_CHECK_EQUAL(observer.find_value("wallet_armed_key_count").getInt<int>(), 0);
+    const auto absent{FlowMeshValidatorStatusToJSON({}, {a})};
+    BOOST_CHECK(!absent.find_value("service_available").get_bool());
+    BOOST_CHECK(!absent.find_value("armed").get_bool());
+}
+
+BOOST_AUTO_TEST_CASE(flowmesh_validator_commands_and_numeric_fingerprints)
+{
+    std::set<std::string> found;
+    for (const CRPCCommand& command : GetWalletRPCCommands()) {
+        if (command.name == "getflowmeshvalidatorinfo" || command.name == "startflowmeshvalidator" ||
+            command.name == "stopflowmeshvalidator") found.insert(command.name);
+    }
+    BOOST_CHECK_EQUAL(found.size(), 3U);
+    const std::string fingerprint(64, '1'); // Valid hex must remain a string, not a JSON number.
+    for (const std::string method : {"startflowmeshvalidator", "stopflowmeshvalidator"}) {
+        const auto positional{RPCConvertValues(method, {fingerprint})};
+        BOOST_REQUIRE(positional[0].isStr());
+        BOOST_CHECK_EQUAL(positional[0].get_str(), fingerprint);
+        const auto named{RPCConvertNamedValues(method, {"expected_armed_keys_fingerprint=" + fingerprint})};
+        BOOST_REQUIRE(named.find_value("expected_armed_keys_fingerprint").isStr());
+        BOOST_CHECK_EQUAL(named.find_value("expected_armed_keys_fingerprint").get_str(), fingerprint);
+        BOOST_CHECK_EQUAL(RPCConvertValues(method, {}).size(), 0U);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(bridge_transaction_commands_are_registered)

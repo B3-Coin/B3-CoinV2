@@ -10,6 +10,7 @@
 #include <QWidget>
 
 class WalletModel;
+class B3FlowMeshPanel;
 
 QT_BEGIN_NAMESPACE
 class QLabel;
@@ -43,6 +44,8 @@ public:
     B3AssetTableModel* model() const { return m_model; }
     //! Locked signing wallets may prompt for unlock; watch-only wallets cannot send.
     static bool canSendAsset(const B3AssetRecord& record, bool signing_wallet);
+    //! Empty when a signing wallet may open the asset's guarded send form.
+    static QString sendAssetDisabledReason(const B3AssetRecord& record, bool signing_wallet);
 
 Q_SIGNALS:
     void sendRequested();
@@ -53,6 +56,7 @@ private Q_SLOTS:
     void updateDetails();
     void sendSelectedAsset();
     void receiveSelectedAsset();
+    void showSecurityWarning(const QString& warning);
 
 private:
     void resizeEvent(QResizeEvent* event) override;
@@ -67,6 +71,8 @@ private:
     bool m_action_open{false};
     bool m_model_resetting{false};
     QString m_selected_asset_id;
+    //! A captured-wallet relock failure must survive dialog/selection changes.
+    QString m_security_warning;
 
     QLineEdit* m_search{nullptr};
     QTableView* m_list{nullptr};
@@ -85,8 +91,10 @@ private:
     QPushButton* m_receive{nullptr};
     QPushButton* m_deposit{nullptr};
     QPushButton* m_withdraw{nullptr};
+    QLabel* m_action_note{nullptr};
     QLabel* m_backend_note{nullptr};
     QLabel* m_activity_note{nullptr};
+    B3FlowMeshPanel* m_flowmesh_panel{nullptr};
 
     QGridLayout* m_columns{nullptr};
     QWidget* m_list_card{nullptr};

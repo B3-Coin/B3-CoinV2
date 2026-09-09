@@ -78,6 +78,7 @@ add_executable(test_bitcoin
   flowmesh_production_engine_tests.cpp
   flowmesh_production_store_tests.cpp
   flowmesh_runtime_tests.cpp
+  flowmesh_service_tests.cpp
   flowmesh_production_wire_tests.cpp
   flowmesh_seat_binding_tests.cpp
   flowmesh_vault_index_tests.cpp

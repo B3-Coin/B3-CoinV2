@@ -57,12 +57,30 @@ if(ENABLE_WALLET)
   )
 
   # Pure amount/transaction-review checks: no wallet, RPC, node or GUI startup.
+  add_executable(test_b3_flowmeshop-qt b3flowmeshoptests.cpp)
+  target_link_libraries(test_b3_flowmeshop-qt
+    core_interface bitcoinqt bitcoin_node univalue Qt6::Test
+  )
+  import_plugins(test_b3_flowmeshop-qt)
+  add_test(NAME test_b3_flowmeshop-qt COMMAND test_b3_flowmeshop-qt)
+
   add_executable(test_b3_assettransfer-qt b3assettransfertests.cpp)
   target_link_libraries(test_b3_assettransfer-qt
     core_interface bitcoinqt bitcoin_node univalue Qt6::Test
   )
   import_plugins(test_b3_assettransfer-qt)
   add_test(NAME test_b3_assettransfer-qt COMMAND test_b3_assettransfer-qt)
+
+  # Isolated FN-panel lifecycle and relock checks, with no mining/network.
+  add_executable(test_b3_flowmeshpanel-qt b3flowmeshpaneltests.cpp)
+  target_link_libraries(test_b3_flowmeshpanel-qt
+    core_interface bitcoinqt test_util bitcoin_node Boost::headers Qt6::Test
+  )
+  import_plugins(test_b3_flowmeshpanel-qt)
+  add_test(NAME test_b3_flowmeshpanel-qt COMMAND test_b3_flowmeshpanel-qt)
+  set_tests_properties(test_b3_flowmeshpanel-qt PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=minimal"
+  )
 
   # Isolated encrypted-wallet staking unlock checks, with no mining/network.
   add_executable(test_b3_stakingunlock-qt b3stakingunlocktests.cpp)
@@ -125,6 +143,13 @@ if(WIN32 AND VCPKG_TARGET_TRIPLET)
   endif()
   if(TARGET test_b3_stakingunlock-qt)
     set_property(TEST test_b3_stakingunlock-qt APPEND PROPERTY
+      ENVIRONMENT_MODIFICATION
+        QT_QPA_PLATFORM=set:windows
+        QT_PLUGIN_PATH=set:${plugin_path}
+    )
+  endif()
+  if(TARGET test_b3_flowmeshpanel-qt)
+    set_property(TEST test_b3_flowmeshpanel-qt APPEND PROPERTY
       ENVIRONMENT_MODIFICATION
         QT_QPA_PLATFORM=set:windows
         QT_PLUGIN_PATH=set:${plugin_path}

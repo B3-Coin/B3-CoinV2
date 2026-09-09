@@ -7,6 +7,7 @@
 #include <chain.h>
 #include <consensus/era.h>
 #include <flowmesh/fee_allocation.h>
+#include <hash.h>
 #include <logging.h>
 #include <modern/asset_output.h>
 #include <modern/chain_domain.h>
@@ -36,6 +37,16 @@
 #include <utility>
 
 namespace node {
+
+uint256 FlowMeshSeatKeysFingerprint(
+    std::vector<std::array<unsigned char, bls::PUBKEY_SIZE>> public_keys)
+{
+    std::sort(public_keys.begin(), public_keys.end());
+    public_keys.erase(std::unique(public_keys.begin(), public_keys.end()), public_keys.end());
+    HashWriter writer{TaggedHash("B3/FlowMesh/ArmedSeatKeys/v1")};
+    writer << public_keys;
+    return writer.GetHash();
+}
 
 namespace {
 
@@ -114,12 +125,25 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     std::map<flowmesh::MarketId, std::unique_ptr<MarketResources>> markets;
     mutable std::map<SeatKey, flowmesh::ActiveFnBlsSeatSet> seat_sets;
     std::vector<bls::SecretKey> local_keys;
+    std::vector<std::array<unsigned char, bls::PUBKEY_SIZE>> local_public_keys;
+    uint256 local_key_fingerprint{FlowMeshSeatKeysFingerprint({})};
     std::thread ticker;
     bool enabled{false};
     bool running{false};
     bool stopping{false};
     std::atomic<bool> chain_reconciling{false};
     uint256 reconciled_tip;
+
+    // Caller holds mutex; neither this snapshot nor the CAS token contains secrets.
+    FlowMeshSeatKeyStatus SeatKeyStatusLocked() const
+    {
+        FlowMeshSeatKeyStatus out;
+        out.enabled = enabled;
+        out.running = running && !stopping;
+        out.armed_pubkeys = local_public_keys;
+        out.fingerprint = local_key_fingerprint;
+        return out;
+    }
 
     int32_t TipHeight() const override
     {
@@ -1436,8 +1460,16 @@ bool FlowMeshService::SubmitLocalAction(const flowmesh::MarketId& market_id,
     return true;
 }
 
+FlowMeshSeatKeyStatus FlowMeshService::SeatKeyStatus() const
+{
+    std::lock_guard<std::mutex> lock{m_impl->mutex};
+    return m_impl->SeatKeyStatusLocked();
+}
+
 bool FlowMeshService::ArmSeatKeys(std::vector<bls::SecretKey> keys,
-                                  std::string& error)
+                                  std::string& error,
+                                  const std::optional<uint256>& expected_fingerprint,
+                                  FlowMeshSeatKeyStatus* result)
 {
     if (keys.empty()) {
         error = "no FlowMesh BLS seat key was supplied";
@@ -1451,6 +1483,17 @@ bool FlowMeshService::ArmSeatKeys(std::vector<bls::SecretKey> keys,
                                return a.Bytes() == b.Bytes();
                            }),
                keys.end());
+    // Derive public metadata before taking the runtime mutex. UI polling
+    // must never repeat BLS multiplication while blocking market work.
+    std::vector<std::array<unsigned char, bls::PUBKEY_SIZE>> public_keys;
+    public_keys.reserve(keys.size());
+    for (const auto& key : keys) public_keys.push_back(key.GetPublicKey().Compressed());
+    std::sort(public_keys.begin(), public_keys.end());
+    if (std::adjacent_find(public_keys.begin(), public_keys.end()) != public_keys.end()) {
+        error = "distinct FlowMesh secret keys produced a duplicate public key";
+        return false;
+    }
+    const uint256 fingerprint{FlowMeshSeatKeysFingerprint(public_keys)};
     std::shared_ptr<FlowMeshRuntime> runtime;
     {
         std::lock_guard<std::mutex> lock{m_impl->mutex};
@@ -1458,7 +1501,15 @@ bool FlowMeshService::ArmSeatKeys(std::vector<bls::SecretKey> keys,
             error = "FlowMesh service is not running";
             return false;
         }
+        if (expected_fingerprint &&
+            m_impl->local_key_fingerprint != *expected_fingerprint) {
+            error = "FlowMesh armed keys changed; refresh and explicitly confirm the node-global operation again";
+            return false;
+        }
         m_impl->local_keys = std::move(keys);
+        m_impl->local_public_keys = std::move(public_keys);
+        m_impl->local_key_fingerprint = fingerprint;
+        if (result) *result = m_impl->SeatKeyStatusLocked();
         runtime = m_impl->runtime;
     }
     if (runtime && m_impl->ReconciledAtTip()) {
@@ -1469,8 +1520,25 @@ bool FlowMeshService::ArmSeatKeys(std::vector<bls::SecretKey> keys,
 
 void FlowMeshService::DisarmSeatKeys()
 {
+    std::string error;
+    DisarmSeatKeys(error, std::nullopt);
+}
+
+bool FlowMeshService::DisarmSeatKeys(
+    std::string& error, const std::optional<uint256>& expected_fingerprint,
+    FlowMeshSeatKeyStatus* result)
+{
     std::lock_guard<std::mutex> lock{m_impl->mutex};
+    if (expected_fingerprint &&
+        m_impl->local_key_fingerprint != *expected_fingerprint) {
+        error = "FlowMesh armed keys changed; refresh and explicitly confirm the node-global operation again";
+        return false;
+    }
     m_impl->local_keys.clear();
+    m_impl->local_public_keys.clear();
+    m_impl->local_key_fingerprint = FlowMeshSeatKeysFingerprint({});
+    if (result) *result = m_impl->SeatKeyStatusLocked();
+    return true;
 }
 
 std::optional<FlowMeshPendingCheckpoint> FlowMeshService::NextCheckpointMpa(
