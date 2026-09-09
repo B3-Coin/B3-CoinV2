@@ -450,9 +450,10 @@ private:
 
 /**
  * Three-node star used to prove proposal retry recovers one lost vote.
- * Voter attestations travel only to node 0, so neither voter can assemble a
- * certificate on the side. Node 2's first broadcast vote is deliberately
- * dropped; its later targeted reply must be the exact cached payload.
+ * Directional loss also suppresses forwarded non-proposer votes from the
+ * hub to leaves, so neither voter can assemble a side certificate. Node 2's
+ * first own broadcast vote is dropped; its later targeted reply must be the
+ * exact cached payload. Transport sender is not necessarily signing seat.
  */
 class RetryAttestationNetwork
 {
@@ -468,23 +469,7 @@ public:
         std::vector<std::pair<size_t, node::FlowMeshRuntime*>> targets;
         {
             std::lock_guard<std::mutex> lock{m_mutex};
-            if (relay.message.kind ==
-                    flowmesh::WireMessageKind::ATTESTATION &&
-                from != 0) {
-                // New votes retain normal broadcast semantics at the runtime
-                // boundary, but this star has only the proposer as a peer.
-                const size_t target{
-                    relay.peer ? static_cast<size_t>(*relay.peer) : 0};
-                if (target != 0 || m_nodes[0] == nullptr) return;
-                if (from == 2 && !m_dropped_first) {
-                    m_dropped_first = relay.message.payload;
-                    return;
-                }
-                if (from == 2 && relay.peer) {
-                    m_targeted_retry = relay.message.payload;
-                }
-                targets.emplace_back(0, m_nodes[0]);
-            } else if (relay.peer) {
+            if (relay.peer) {
                 const size_t target{static_cast<size_t>(*relay.peer)};
                 if (target < m_nodes.size() && m_nodes[target] != nullptr) {
                     targets.emplace_back(target, m_nodes[target]);
@@ -497,6 +482,29 @@ public:
                         continue;
                     }
                     targets.emplace_back(i, m_nodes[i]);
+                }
+            }
+            // Every message obeys physical star edges and origin exclusion,
+            // including proposals now forwarded by a leaf. No leaf-to-leaf
+            // shortcut may manufacture an extra cached-reply opportunity.
+            std::erase_if(targets, [&](const auto& target) {
+                return target.first == from || (from != 0 && target.first != 0) ||
+                       (relay.exclude_peer && *relay.exclude_peer ==
+                            static_cast<flowmesh::WirePeerId>(target.first));
+            });
+            if (targets.empty()) return;
+            if (relay.message.kind == flowmesh::WireMessageKind::ATTESTATION) {
+                const auto vote{flowmesh::DecodeProductionAttestationPayload(relay.message.payload)};
+                if (!vote) return;
+                // Keep the intended lost-vote experiment isolated even now
+                // that the hub correctly gossips already verified shares.
+                if (from == 0 && vote->seat_index != 0) return;
+                if (from == 2 && vote->seat_index == 2) {
+                    if (!m_dropped_first) {
+                        m_dropped_first = relay.message.payload;
+                        return;
+                    }
+                    if (relay.peer == 0) m_targeted_retry = relay.message.payload;
                 }
             }
         }
@@ -1088,6 +1096,7 @@ BOOST_AUTO_TEST_CASE(dropped_action_evidence_retries_exact_locked_candidate)
     bool exact_candidate{true};
     bool exact_vote{true};
     size_t proposer_action_attempts{0};
+    size_t voter_replays{0};
     std::optional<std::vector<unsigned char>> candidate_bytes;
     std::optional<std::vector<unsigned char>> voter_bytes;
     struct StopBeforeCapturedState {
@@ -1110,8 +1119,17 @@ BOOST_AUTO_TEST_CASE(dropped_action_evidence_retries_exact_locked_candidate)
             else exact_candidate &= *candidate_bytes == *bytes;
         }
         if (message.kind == flowmesh::WireMessageKind::ATTESTATION && from == 1 && to == 2) {
-            if (!voter_bytes) voter_bytes = message.payload;
-            else exact_vote &= *voter_bytes == message.payload;
+            const auto vote{flowmesh::DecodeProductionAttestationPayload(message.payload)};
+            if (!vote) exact_vote = false;
+            // A peer can now forward another seat's vote. Compare the exact
+            // cached payload by signing identity, not transport sender.
+            else if (vote->seat_index == 1) {
+                if (!voter_bytes) voter_bytes = message.payload;
+                else {
+                    exact_vote &= *voter_bytes == message.payload;
+                    ++voter_replays;
+                }
+            }
         }
         return true;
     });
@@ -1166,6 +1184,8 @@ BOOST_AUTO_TEST_CASE(dropped_action_evidence_retries_exact_locked_candidate)
         BOOST_REQUIRE(candidate_bytes);
         BOOST_CHECK(*flowmesh::EncodeProductionEntry(committed->entry) == *candidate_bytes);
         BOOST_CHECK(exact_evidence && exact_candidate && exact_vote);
+        BOOST_REQUIRE(voter_bytes);
+        BOOST_CHECK_GT(voter_replays, 0U);
         BOOST_CHECK_EQUAL(proposer_action_attempts, 2U);
     }
     for (size_t i{0}; i < runtimes.size(); ++i) {
