@@ -51,6 +51,13 @@ endfunction()
 function(add_macos_deploy_target)
   if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND TARGET b3coin-qt)
     set(macos_app "B3 Hive.app")
+    # Do not advertise an older OS than the selected native build target.
+    # Dependency deployment checks may require an even newer target; release
+    # packaging must still inspect every bundled Mach-O library.
+    set(B3_MACOS_MINIMUM_SYSTEM_VERSION "15.0")
+    if(CMAKE_OSX_DEPLOYMENT_TARGET VERSION_GREATER B3_MACOS_MINIMUM_SYSTEM_VERSION)
+      set(B3_MACOS_MINIMUM_SYSTEM_VERSION "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    endif()
     # Populate Contents subdirectory.
     configure_file(${PROJECT_SOURCE_DIR}/share/qt/Info.plist.in ${macos_app}/Contents/Info.plist NO_SOURCE_PERMISSIONS)
     file(CONFIGURE OUTPUT ${macos_app}/Contents/PkgInfo CONTENT "APPL????")

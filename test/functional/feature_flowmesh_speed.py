@@ -23,6 +23,27 @@ class FlowMeshSpeedTest(FlowMeshReleaseTest):
     def run_test(self):
         super().run_test()
 
+    def wait_for_account_sequence(self, buyer, market_id, sequence):
+        try:
+            self.wait_until(lambda: buyer.getflowmeshbalance(market_id)["account"]["next_sequence"] == sequence,
+                            timeout=60, check_interval=0.05)
+        except AssertionError:
+            # Preserve transient candidate/evidence/vote observations before
+            # test cleanup. A restart retains locks, but not these counters.
+            for index, node in enumerate(self.nodes):
+                try:
+                    peers = [{"id": p["id"],
+                              "received": {k: v for k, v in p.get("bytesrecv_per_msg", {}).items() if k.startswith("fm")},
+                              "sent": {k: v for k, v in p.get("bytessent_per_msg", {}).items() if k.startswith("fm")}}
+                             for p in node.getpeerinfo()]
+                    diagnostic = {"node": index, "expected_account_sequence": sequence,
+                                  "balance": node.getflowmeshbalance(market_id),
+                                  "validator": node.getflowmeshvalidatorinfo(), "peers": peers}
+                    self.log.error("FLOWMESH_STALL_DIAGNOSTIC %s", json.dumps(diagnostic, sort_keys=True, default=str))
+                except Exception as error:
+                    self.log.error("FlowMesh diagnostic unavailable for test node %s: %s", index, error)
+            raise
+
     def exercise_extra_trading(self, market_id):
         buyer = self.nodes[1]
         height = buyer.getblockcount()
@@ -40,8 +61,7 @@ class FlowMeshSpeedTest(FlowMeshReleaseTest):
             rpc_times.append((time.monotonic() - started) * 1000)
             assert_equal(response["accepted"], True)
             sequence += 1
-            self.wait_until(lambda: buyer.getflowmeshbalance(market_id)["account"]["next_sequence"] == sequence,
-                            timeout=60, check_interval=0.05)
+            self.wait_for_account_sequence(buyer, market_id, sequence)
             latencies.append((time.monotonic() - started) * 1000)
             account = buyer.getflowmeshbalance(market_id)["account"]
             if index % 2:
@@ -62,8 +82,7 @@ class FlowMeshSpeedTest(FlowMeshReleaseTest):
             assert_equal(reply["sequence"], sequence)
             sequence += 1
         submitted_ms = (time.monotonic() - started) * 1000
-        self.wait_until(lambda: buyer.getflowmeshbalance(market_id)["account"]["next_sequence"] == sequence,
-                        timeout=60, check_interval=0.05)
+        self.wait_for_account_sequence(buyer, market_id, sequence)
         certified_ms = (time.monotonic() - started) * 1000
         self.wait_for_market_convergence(market_id)
         account = buyer.getflowmeshbalance(market_id)["account"]

@@ -3,7 +3,7 @@
 <plist version="0.9">
 <dict>
   <key>LSMinimumSystemVersion</key>
-  <string>15.0</string>
+  <string>@B3_MACOS_MINIMUM_SYSTEM_VERSION@</string>
 
   <key>CFBundleIconFile</key>
   <string>b3-hive.icns</string>

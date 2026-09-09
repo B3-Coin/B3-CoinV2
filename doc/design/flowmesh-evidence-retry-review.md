@@ -2,9 +2,12 @@
 
 Date: 2026-09-10.
 
-Status: **narrow local relay implementation and focused regressions added;
-executable qualification of this increment is pending**. The proposal was
-approved for this bounded implementation. No early-attestation cache or
+Status: **narrow local relay implementation passes focused unit qualification;
+the final four-node burst test failed and is under investigation**. All 53
+selected runtime/P2P/store/clearing cases passed (102,304 assertions), including
+the exact-evidence loss/recovery and pacing tests. In a subsequent four-node
+functional run, 40 sequential actions completed but the 64-action burst timed
+out; this increment is not qualified as trading-ready. No early-attestation cache or
 protocol-level lock-recovery change is included. This document does not identify
 the cause of the observed live stall or claim that conflicting locks recover.
 
