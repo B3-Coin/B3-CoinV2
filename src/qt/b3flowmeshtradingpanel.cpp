@@ -87,6 +87,7 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     auto* chart_modes{new QHBoxLayout}; auto* modes{new QButtonGroup{chart_card}};
     for (const auto& mode : {std::pair{tr("Clearing price"), B3FlowMeshChart::Mode::Prices}, std::pair{tr("Liquidity curves"), B3FlowMeshChart::Mode::Liquidity}}) {
         auto* button{new QPushButton{mode.first, chart_card}}; button->setCheckable(true); button->setChecked(mode.second == B3FlowMeshChart::Mode::Prices); button->setProperty("b3variant", QStringLiteral("timeframe")); modes->addButton(button); chart_modes->addWidget(button);
+        button->setObjectName(mode.second == B3FlowMeshChart::Mode::Prices ? QStringLiteral("flowMeshChartPrices") : QStringLiteral("flowMeshChartLiquidity"));
         connect(button, &QPushButton::clicked, this, [this, mode] { m_chart->setMode(mode.second); });
     }
     chart_modes->addStretch(); chart_layout->addLayout(chart_modes); m_chart = new B3FlowMeshChart{chart_card}; chart_layout->addWidget(m_chart, 1);

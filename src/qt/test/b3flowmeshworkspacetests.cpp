@@ -124,6 +124,11 @@ private Q_SLOTS:
         m.base_reserved = s.base_reserved; m.b3_reserved = s.b3_reserved;
         panel.m_market_data = {m}; { QSignalBlocker block{panel.m_market}; panel.m_market->addItem(QStringLiteral("tUSD / B3"), m.id); } panel.m_snapshot = s; panel.m_response_age.start(); panel.updateDataViews(); panel.updateMarketText();
         QCOMPARE(panel.m_chart->pricePointCount(), 1); QCOMPARE(panel.m_history_view->rowCount(), 1); QCOMPARE(panel.m_own_view->rowCount(), 1);
+        auto* prices{panel.findChild<QPushButton*>(QStringLiteral("flowMeshChartPrices"))};
+        auto* liquidity{panel.findChild<QPushButton*>(QStringLiteral("flowMeshChartLiquidity"))};
+        QVERIFY(prices); QVERIFY(liquidity); QVERIFY(prices->isChecked());
+        liquidity->click(); QVERIFY(liquidity->isChecked()); QVERIFY(!prices->isChecked());
+        prices->click(); QVERIFY(prices->isChecked()); QVERIFY(!liquidity->isChecked());
         QCOMPARE(panel.m_own_view->item(0, 3)->text(), QStringLiteral("0.75 B3"));
         QVERIFY(panel.m_balances->text().contains(QStringLiteral("Reserved  0 tUSD · 0.75 B3")));
         panel.m_price->setText(QStringLiteral("1")); panel.m_quantity->setText(QStringLiteral("1")); QVERIFY(panel.m_ticket_total->text().contains(QStringLiteral("1 B3"))); QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_deposit->isEnabled()); QVERIFY(!panel.m_advanced->isVisible());
@@ -149,7 +154,9 @@ private Q_SLOTS:
         QVERIFY(panel.m_balances->text().contains(QStringLiteral("Reserved  0 tUSD · 0.75 B3")));
         const auto save = [&](const QString& name) { QImage image{panel.size(), QImage::Format_ARGB32}; image.fill(Qt::transparent); panel.render(&image); return image.save(output.filePath(name)); };
         QVERIFY(save(QStringLiteral("synthetic-flowmesh-pending.png")));
-        panel.m_chart->setMode(B3FlowMeshChart::Mode::Liquidity); QVERIFY(save(QStringLiteral("synthetic-flowmesh-liquidity.png")));
+        auto* liquidity{panel.findChild<QPushButton*>(QStringLiteral("flowMeshChartLiquidity"))};
+        QVERIFY(liquidity); liquidity->click(); QVERIFY(liquidity->isChecked());
+        QVERIFY(save(QStringLiteral("synthetic-flowmesh-liquidity.png")));
         panel.m_snapshot->paused = true; panel.m_market_data[0].ready = false; panel.m_market_data[0].checkpoint_pending = true; panel.m_market_data[0].checkpoint = QString::fromStdString(H(80).GetHex()); panel.updateMarketText();
         QVERIFY(save(QStringLiteral("synthetic-flowmesh-paused.png")));
         panel.m_read_failed = true; panel.updateMarketText(); QVERIFY(save(QStringLiteral("synthetic-flowmesh-stale.png")));
