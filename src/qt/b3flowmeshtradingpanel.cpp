@@ -202,7 +202,10 @@ void B3FlowMeshTradingPanel::updateMarketText()
         m_identity_detail->setText(m_pair_title->toolTip() + (matched && m_snapshot->units.known ? tr("\nMetadata: %1 · %2 decimals · %3\nNames and tickers do not prove reserves or dollar backing.").arg(m_snapshot->units.source).arg(m_snapshot->units.decimals).arg(m_snapshot->units.test_only ? tr("TEST ASSET") : tr("asset identity shown above")) : tr("\nToken precision has not been verified.")));
         m_status->setText(matched ? B3FlowMeshMarketData::StatusText(*m_snapshot, m_read_failed || !m_response_age.isValid() ? -1 : m_response_age.elapsed(), m_certificate_age.isValid() ? m_certificate_age.elapsed() : -1) : tr("Reading certified market snapshot…"));
         if (matched) {
-            const auto& s{*m_snapshot}; const auto base = [&](CAmount n) { return s.units.known ? B3FlowMeshMarketData::FormatAmount(n, s.units.decimals) + QLatin1Char(' ') + s.units.ticker : QString::number(n) + tr(" raw units (precision unknown)"); };
+            const auto& s{*m_snapshot}; const auto base = [&](CAmount n) -> QString {
+                if (s.units.known) return B3FlowMeshMarketData::FormatAmount(n, s.units.decimals) + QLatin1Char(' ') + s.units.ticker;
+                return QString::number(n) + tr(" raw units (precision unknown)");
+            };
             m_balances->setText(selected->has_account ? tr("Available  %1 · %2 B3    |    Reserved  %3 · %4 B3\nAccount %5 · next sequence %6").arg(base(selected->base_available), B3FlowMeshMarketData::FormatAmount(selected->b3_available, 9), base(selected->base_reserved), B3FlowMeshMarketData::FormatAmount(selected->b3_reserved, 9), selected->account, QString::number(selected->sequence)) : tr("No trading account yet. Deposit creates one in this wallet; back it up afterward."));
         }
     }
@@ -502,7 +505,9 @@ void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
         { QSignalBlocker block{m_market}; m_market->clear(); int selected{-1};
             for (size_t i{0}; i < m_market_data.size(); ++i) {
                 const auto& m{m_market_data[i]}; const auto* units{result->snapshot && result->snapshot->market == m.id && result->snapshot->units.known ? &result->snapshot->units : m_snapshot && m_snapshot->market == m.id && m_snapshot->units.known ? &m_snapshot->units : nullptr};
-                m_market->addItem(units ? units->ticker + QStringLiteral(" / B3") : m.base.left(12) + QStringLiteral("… / B3"), m.id);
+                QString label = m.base.left(12) + QStringLiteral("… / B3");
+                if (units) label = units->ticker + QStringLiteral(" / B3");
+                m_market->addItem(label, m.id);
                 if (m_route_pending && !m_requested_base.isEmpty() ? m.base == m_requested_base : m.id == previous) selected = static_cast<int>(i);
             }
             if (m_route_pending && !m_requested_base.isEmpty() && selected == -1) { m_market->setCurrentIndex(-1); notice(tr("No established market was reported for the selected asset. This panel does not bootstrap one.")); }

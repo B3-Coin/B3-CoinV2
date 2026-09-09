@@ -206,13 +206,17 @@ UniValue DispatchApproved(const Action& a, bool approved, const std::function<bo
 QString Describe(const Action& a)
 {
     const QString prefix{QStringLiteral("Market: %1\nFull base asset ID: %2\nWallet account: %3\n").arg(a.market.id, a.market.base, a.market.has_account ? a.market.account : QStringLiteral("created during deposit preparation"))};
-    const QString amount{a.native ? QString::fromStdString(FormatMoney(a.amount)) + QStringLiteral(" B3") : a.display_decimals ? B3FlowMeshMarketData::FormatAmount(a.amount, *a.display_decimals) + QLatin1Char(' ') + a.display_ticker + QStringLiteral(" (%1 atomic units)").arg(a.amount) : QString::number(a.amount) + QStringLiteral(" raw base-asset units")};
+    QString base_amount = QString::number(a.amount) + QStringLiteral(" raw base-asset units");
+    if (a.display_decimals) base_amount = B3FlowMeshMarketData::FormatAmount(a.amount, *a.display_decimals) + QLatin1Char(' ') + a.display_ticker + QStringLiteral(" (%1 atomic units)").arg(a.amount);
+    QString amount{base_amount};
+    if (a.native) amount = QString::fromStdString(FormatMoney(a.amount)) + QStringLiteral(" B3");
     switch (a.operation) {
     case Operation::Order: {
         Positive(a.price); Positive(a.amount);
         if (a.price > MAX_MONEY / a.amount) Fail("The order's B3 notional exceeds the consensus range.");
-        const QString base_amount{a.display_decimals ? B3FlowMeshMarketData::FormatAmount(a.amount, *a.display_decimals) + QLatin1Char(' ') + a.display_ticker + QStringLiteral(" (%1 atomic units)").arg(a.amount) : QString::number(a.amount) + QStringLiteral(" raw base-asset units")};
-        return prefix + QStringLiteral("Limit %1: %2 at %3.\nExact limit notional: %4 B3\nAccount sequence: %5\nOne uniform-price curve auction, not price-time priority. Accepted is not filled. Protocol fee is 0.01% of matched notional deducted from seller proceeds; actual allocation depends on certified fills. No network fee for this request.").arg(a.side == QStringLiteral("bid") ? QStringLiteral("Buy") : QStringLiteral("Sell"), base_amount, a.display_decimals ? B3FlowMeshMarketData::FormatPrice(a.price, *a.display_decimals) + QStringLiteral(" B3 / ") + a.display_ticker : QString::number(a.price) + QStringLiteral(" B3 atoms per raw base unit"), QString::fromStdString(FormatMoney(a.price * a.amount)), QString::number(a.market.sequence));
+        QString price = QString::number(a.price) + QStringLiteral(" B3 atoms per raw base unit");
+        if (a.display_decimals) price = B3FlowMeshMarketData::FormatPrice(a.price, *a.display_decimals) + QStringLiteral(" B3 / ") + a.display_ticker;
+        return prefix + QStringLiteral("Limit %1: %2 at %3.\nExact limit notional: %4 B3\nAccount sequence: %5\nOne uniform-price curve auction, not price-time priority. Accepted is not filled. Protocol fee is 0.01% of matched notional deducted from seller proceeds; actual allocation depends on certified fills. No network fee for this request.").arg(a.side == QStringLiteral("bid") ? QStringLiteral("Buy") : QStringLiteral("Sell"), base_amount, price, QString::fromStdString(FormatMoney(a.price * a.amount)), QString::number(a.market.sequence));
     }
     case Operation::Cancel: return prefix + QStringLiteral("Cancel this account's standing %1; sequence %2. Cancellation is not certified until processed.").arg(a.side, QString::number(a.market.sequence));
     case Operation::Deposit: return prefix + QStringLiteral("Deposit %1 into a KEYLESS vault. Funds may remain locked if the validator quorum fails. Preparation creates a wallet trading-account key if needed; back up this wallet even if you cancel. Admission needs 31 confirmations.").arg(amount);

@@ -26,7 +26,7 @@ void B3FlowMeshChart::leaveEvent(QEvent*) { m_pointer = {-1, -1}; update(); }
 void B3FlowMeshChart::paintEvent(QPaintEvent*)
 {
     QPainter p{this}; p.setRenderHint(QPainter::Antialiasing); p.fillRect(rect(), B3Theme::kSurface);
-    const QRectF plot{12, 26, std::max(20, width() - 104), std::max(20, height() - 66)};
+    const QRectF plot{12, 26, static_cast<qreal>(std::max(20, width() - 104)), static_cast<qreal>(std::max(20, height() - 66))};
     p.setPen(B3Theme::kBorder);
     for (int i{0}; i <= 4; ++i) { const qreal y{plot.top() + plot.height() * i / 4}; p.drawLine(QPointF{plot.left(), y}, QPointF{plot.right(), y}); }
     for (int i{1}; i < 5; ++i) { const qreal x{plot.left() + plot.width() * i / 5}; p.drawLine(QPointF{x, plot.top()}, QPointF{x, plot.bottom()}); }
