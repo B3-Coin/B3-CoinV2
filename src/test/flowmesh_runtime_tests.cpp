@@ -147,6 +147,12 @@ public:
         if (domain != m_domain || market != current.market_id) {
             return {node::FlowMeshSeatTransitionKind::PAUSED, std::nullopt};
         }
+        if (m_pause_after_checks) {
+            if (*m_pause_after_checks == 0) {
+                return {node::FlowMeshSeatTransitionKind::PAUSED, std::nullopt};
+            }
+            --*m_pause_after_checks;
+        }
         const auto it{m_transitions.find(market)};
         return it == m_transitions.end() ? node::FlowMeshSeatTransition{}
                                          : it->second;
@@ -177,6 +183,12 @@ public:
     {
         std::lock_guard<std::mutex> lock{m_mutex};
         m_transitions[market] = {kind, std::nullopt};
+    }
+
+    void PauseAfterTransitionChecks(const size_t checks)
+    {
+        std::lock_guard<std::mutex> lock{m_mutex};
+        m_pause_after_checks = checks;
     }
 
     void SetHandoff(const flowmesh::MarketId& market,
@@ -227,6 +239,7 @@ public:
 private:
     mutable std::mutex m_mutex;
     int32_t m_tip_height{260};
+    mutable std::optional<size_t> m_pause_after_checks;
     std::map<std::pair<flowmesh::MarketId, uint64_t>,
              flowmesh::ActiveFnBlsSeatSet> m_sets;
     std::map<flowmesh::MarketId, node::FlowMeshSeatTransition> m_transitions;
@@ -567,6 +580,441 @@ BOOST_AUTO_TEST_CASE(evidence_retry_budget_bounds_count_bytes_and_clock)
     for (size_t i{0}; i < 8; ++i) BOOST_CHECK(budget.Consume(1));
     BOOST_CHECK(!budget.Consume(1));
     BOOST_CHECK(!budget.Begin(now - std::chrono::seconds{1}));
+}
+
+BOOST_AUTO_TEST_CASE(committee_forwarding_budget_bounds_count_bytes_and_clock)
+{
+    using Budget = node::FlowMeshCommitteeRelayBudget;
+    flowmesh::WireClock::time_point now{};
+    Budget global{Budget::GLOBAL_MESSAGES, Budget::GLOBAL_BYTES};
+    Budget market{Budget::MARKET_MESSAGES, Budget::MARKET_BYTES};
+    const size_t maximum_proposal{flowmesh::FLOWMESH_PROPOSAL_MAX_BYTES +
+                                  flowmesh::FLOWMESH_WIRE_HEADER_SIZE};
+    BOOST_REQUIRE(global.Available(now, maximum_proposal));
+    BOOST_REQUIRE(market.Available(now, maximum_proposal));
+    global.Charge(maximum_proposal);
+    market.Charge(maximum_proposal);
+    BOOST_CHECK(!global.Available(now, maximum_proposal));
+    BOOST_CHECK(!market.Available(now, maximum_proposal));
+    BOOST_CHECK(!market.Available(now + std::chrono::milliseconds{249}, maximum_proposal));
+    now += Budget::INTERVAL;
+    // Four independent markets share the same global frame cap. Neither
+    // multiple markets nor an unchanged/backward clock refills it.
+    for (size_t group{0}; group < 4; ++group) {
+        Budget next_market{Budget::MARKET_MESSAGES, Budget::MARKET_BYTES};
+        for (size_t i{0}; i < Budget::MARKET_MESSAGES; ++i) {
+            BOOST_REQUIRE(global.Available(now, 50));
+            BOOST_REQUIRE(next_market.Available(now, 50));
+            global.Charge(50);
+            next_market.Charge(50);
+        }
+        BOOST_CHECK(!next_market.Available(now, 50));
+    }
+    BOOST_CHECK(!global.Available(now, 50));
+    BOOST_CHECK(!global.Available(now - Budget::INTERVAL, 50));
+    now += std::chrono::hours{1};
+    for (size_t i{0}; i < Budget::GLOBAL_MESSAGES; ++i) {
+        BOOST_REQUIRE(global.Available(now, 50));
+        global.Charge(50);
+    }
+    BOOST_CHECK(!global.Available(now, 50)); // no idle-time accumulation
+}
+
+BOOST_AUTO_TEST_CASE(committee_forwarding_line_recovers_exact_dropped_vote)
+{
+    const uint256 domain{Filled(0x1d)};
+    const modern::AssetId asset{Filled(0x3d)};
+    const auto market{*flowmesh::ComputeFlowMeshMarketId(domain, asset)};
+    const auto vault{*flowmesh::ComputeFlowMeshVaultId(domain, market)};
+    const uint256 treasury{Filled(0x5d)};
+    const SeatFixture seats{Seats(domain, market, 4, 7, 100, Filled(0x71), 124)};
+    RuntimeChain chain;
+    chain.m_domain = domain;
+    chain.Add(seats.seats);
+    const flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(),
+                                        flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+    std::array<FixedClock, 4> clocks;
+    std::array<RuntimeKeys, 4> keys;
+    // Topology: seat0 -- observer -- seat1 -- seat2. Seat3 is offline.
+    // Every certificate needs all three live seats; no fully connected mesh.
+    keys[0].m_keys[market] = {seats.secrets[0]};
+    keys[2].m_keys[market] = {seats.secrets[1]};
+    keys[3].m_keys[market] = {seats.secrets[2]};
+    std::array<std::unique_ptr<node::FlowMeshProductionStore>, 4> stores;
+    std::array<std::unique_ptr<node::FlowMeshRuntime>, 4> runtimes;
+    RuntimeNetwork network;
+    struct Seen { size_t from; size_t to; flowmesh::WireMessage wire; };
+    std::mutex seen_mutex;
+    std::vector<Seen> seen;
+    std::optional<std::vector<unsigned char>> dropped_vote;
+    std::optional<std::vector<unsigned char>> retried_vote;
+    struct StopBeforeCapturedState {
+        std::array<std::unique_ptr<node::FlowMeshRuntime>, 4>& runtimes;
+        ~StopBeforeCapturedState()
+        {
+            for (const auto& runtime : runtimes) if (runtime) runtime->Stop();
+        }
+    } stop_before_captured_state{runtimes};
+    network.SetFilter([&](const size_t from, const size_t to, const auto& wire) {
+        if (!(from + 1 == to || to + 1 == from)) return false;
+        std::lock_guard<std::mutex> guard{seen_mutex};
+        if (seen.size() < 512) seen.push_back({from, to, wire});
+        if (wire.kind == flowmesh::WireMessageKind::ATTESTATION) {
+            const auto vote{flowmesh::DecodeProductionAttestationPayload(wire.payload)};
+            if (!vote) return false;
+            // Only the endpoint proposer can collect all three votes. This
+            // prevents a side certificate from masking lost-vote recovery.
+            if (vote->seat_index == 0 || to == 3) return false;
+            if (from == 3 && to == 2 && vote->seat_index == 2) {
+                if (!dropped_vote) {
+                    dropped_vote = wire.payload;
+                    return false;
+                }
+                retried_vote = wire.payload;
+            }
+        }
+        return true;
+    });
+    std::string error;
+    for (size_t i{0}; i < runtimes.size(); ++i) {
+        stores[i] = std::make_unique<node::FlowMeshProductionStore>(DBParams{
+            .path = m_args.GetDataDirBase() / fs::PathFromString(
+                        "flowmesh_runtime_committee_line_" + std::to_string(i)),
+            .cache_bytes = size_t{1} << 20, .wipe_data = true});
+        BOOST_REQUIRE_MESSAGE(stores[i]->OpenForMarket(
+            domain, market, seats.seats, initial.Root(), error), error);
+        node::FlowMeshRuntimeConfig config;
+        config.chain = &chain;
+        config.keys = &keys[i];
+        config.clock = &clocks[i];
+        config.round_timeout = std::chrono::hours{1};
+        config.relay = [&network, i](node::FlowMeshRuntimeRelay relay) {
+            network.Relay(i, std::move(relay));
+        };
+        runtimes[i] = std::make_unique<node::FlowMeshRuntime>(config,
+            std::vector<node::FlowMeshRuntimeMarketConfig>{MarketConfig(
+                domain, market, treasury, seats.seats, initial, *stores[i], nullptr)});
+        network.Set(i, runtimes[i].get(), true);
+        BOOST_REQUIRE_MESSAGE(runtimes[i]->Start(error), error);
+    }
+    const auto drain = [&] {
+        for (size_t pass{0}; pass < 4; ++pass) {
+            for (const auto& runtime : runtimes) {
+                BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+            }
+        }
+    };
+    runtimes[0]->NotifyTick();
+    BOOST_REQUIRE(WaitUntil([&] {
+        std::lock_guard<std::mutex> guard{seen_mutex};
+        return dropped_vote.has_value();
+    }));
+    drain();
+    flowmesh::WireMessage original;
+    size_t forwarded_before;
+    {
+        std::lock_guard<std::mutex> guard{seen_mutex};
+        const auto found{std::find_if(seen.begin(), seen.end(), [](const auto& item) {
+            return item.from == 0 && item.wire.kind == flowmesh::WireMessageKind::PROPOSAL;
+        })};
+        BOOST_REQUIRE(found != seen.end());
+        original = found->wire;
+        forwarded_before = std::count_if(seen.begin(), seen.end(), [](const auto& item) {
+            return item.from == 1 && item.wire.kind == flowmesh::WireMessageKind::PROPOSAL;
+        });
+        BOOST_CHECK_EQUAL(forwarded_before, 1U);
+    }
+    for (const auto& runtime : runtimes) {
+        BOOST_CHECK_EQUAL(runtime->MarketStatus(market)->next_sequence, 0U);
+        BOOST_CHECK(runtime->MarketStatus(market)->halt == node::FlowMeshRuntimeHalt::NONE);
+    }
+    const auto proposal{flowmesh::DecodeProductionProposalPayload(original.payload)};
+    BOOST_REQUIRE(proposal);
+    const auto locked_hash{proposal->entry.GetHash()};
+    for (const size_t i : {size_t{0}, size_t{2}, size_t{3}}) {
+        std::optional<uint256> lock;
+        BOOST_REQUIRE(stores[i]->ReadLock({seats.seats.epoch, 0}, lock, error));
+        BOOST_REQUIRE(lock == locked_hash);
+    }
+
+    // Identical loop copies do not amplify at an unchanged clock. A forged
+    // proposal and a well-formed vote signed by the wrong seat do not relay.
+    for (size_t i{0}; i < 8; ++i) {
+        BOOST_REQUIRE(runtimes[1]->EnqueueWireMessage(i % 2 ? 2 : 0, original) ==
+                      flowmesh::QueueResult::ACCEPTED);
+    }
+    auto forged{*proposal};
+    forged.proposer_signature[0] ^= 1;
+    auto invalid_proposal{original};
+    invalid_proposal.payload = *flowmesh::EncodeProductionProposalPayload(forged);
+    BOOST_REQUIRE(runtimes[1]->EnqueueWireMessage(0, invalid_proposal) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    const auto wrong_signature{flowmesh::SignBlsMicroblockCertificate(
+        seats.secrets[3], flowmesh::ProductionCertificateContext(proposal->entry), seats.seats)};
+    BOOST_REQUIRE(wrong_signature);
+    flowmesh::WireMessage invalid_vote;
+    invalid_vote.kind = flowmesh::WireMessageKind::ATTESTATION;
+    invalid_vote.header = original.header;
+    invalid_vote.payload = *flowmesh::EncodeProductionAttestationPayload({2, *wrong_signature});
+    const auto before_bad{runtimes[1]->MarketData(market, std::nullopt, {}, error)};
+    BOOST_REQUIRE(before_bad);
+    BOOST_REQUIRE(runtimes[1]->EnqueueWireMessage(2, invalid_vote) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    drain();
+    const auto after_bad{runtimes[1]->MarketData(market, std::nullopt, {}, error)};
+    BOOST_REQUIRE(after_bad);
+    BOOST_CHECK_EQUAL(before_bad->snapshot.runtime.max_verified_attestations,
+                      after_bad->snapshot.runtime.max_verified_attestations);
+    {
+        std::lock_guard<std::mutex> guard{seen_mutex};
+        BOOST_CHECK_EQUAL(std::count_if(seen.begin(), seen.end(), [](const auto& item) {
+            return item.from == 1 && item.wire.kind == flowmesh::WireMessageKind::PROPOSAL;
+        }), forwarded_before);
+        BOOST_CHECK(std::none_of(seen.begin(), seen.end(), [&](const auto& item) {
+            return item.from == 1 && item.wire.kind == flowmesh::WireMessageKind::ATTESTATION &&
+                   item.wire.payload == invalid_vote.payload;
+        }));
+    }
+    for (auto& clock : clocks) clock.m_now += std::chrono::milliseconds{999};
+    runtimes[0]->NotifyTick();
+    drain();
+    BOOST_CHECK_EQUAL(runtimes[0]->MarketStatus(market)->next_sequence, 0U);
+    for (auto& clock : clocks) clock.m_now += std::chrono::milliseconds{1};
+    // Same-round proposal retry crosses the observer again. The distant
+    // signer replies with its exact cached vote; two intermediaries verify
+    // and relay it before the endpoint can form a certificate.
+    runtimes[0]->NotifyTick();
+    BOOST_REQUIRE(WaitUntil([&] {
+        return std::all_of(runtimes.begin(), runtimes.end(), [&](const auto& runtime) {
+            return runtime->MarketStatus(market)->next_sequence == 1;
+        });
+    }));
+    drain();
+    {
+        std::lock_guard<std::mutex> guard{seen_mutex};
+        BOOST_REQUIRE(retried_vote);
+        BOOST_CHECK(*retried_vote == *dropped_vote);
+        for (const size_t from : {size_t{1}, size_t{2}}) {
+            BOOST_CHECK(std::any_of(seen.begin(), seen.end(), [&](const auto& item) {
+                return item.from == from && item.to + 1 == from &&
+                       item.wire.kind == flowmesh::WireMessageKind::ATTESTATION &&
+                       item.wire.payload == *dropped_vote;
+            }));
+        }
+        BOOST_CHECK(std::all_of(seen.begin(), seen.end(), [&](const auto& item) {
+            return item.wire.kind != flowmesh::WireMessageKind::PROPOSAL ||
+                   item.wire.payload == original.payload;
+        }));
+        BOOST_CHECK_LT(seen.size(), 100U); // bounded copies, no relay storm
+    }
+    for (size_t i{0}; i < runtimes.size(); ++i) {
+        BOOST_CHECK(runtimes[i]->MarketStatus(market)->last_microblock_hash == locked_hash);
+        BOOST_CHECK_EQUAL(runtimes[i]->MarketStatus(market)->round, 0U);
+        BOOST_CHECK(runtimes[i]->MarketStatus(market)->halt == node::FlowMeshRuntimeHalt::NONE);
+        runtimes[i]->Stop();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(committee_forwarding_paces_verified_repeats_and_denied_budget)
+{
+    const uint256 domain{Filled(0x1e)};
+    const modern::AssetId asset{Filled(0x3e)};
+    const auto market{*flowmesh::ComputeFlowMeshMarketId(domain, asset)};
+    const auto vault{*flowmesh::ComputeFlowMeshVaultId(domain, market)};
+    const uint256 treasury{Filled(0x5e)};
+    const SeatFixture seats{Seats(domain, market, 20, 7, 100, Filled(0x71), 125)};
+    RuntimeChain chain;
+    chain.m_domain = domain;
+    chain.Add(seats.seats);
+    FixedClock clock;
+    RuntimeKeys observer;
+    const flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(),
+                                        flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+    node::FlowMeshProductionStore store{DBParams{
+        .path = m_args.GetDataDirBase() / "flowmesh_runtime_committee_pacing",
+        .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+    std::string error;
+    BOOST_REQUIRE(store.OpenForMarket(domain, market, seats.seats, initial.Root(), error));
+    flowmesh::ProductionEpochGate gate{domain, market, seats.seats};
+    flowmesh::ProductionEntryCheck check;
+    const auto built{flowmesh::BuildProductionExecutionEntry(
+        initial, domain, market, seats.seats, gate, 0, 0, {},
+        {100, Filled(0x71)}, {chain.TipHeight(), std::nullopt, &chain},
+        treasury, {}, nullptr, check)};
+    BOOST_REQUIRE(built);
+    flowmesh::ProductionProposalEnvelope proposal;
+    proposal.entry = built->entry;
+    const auto proposal_wire = [&](const uint32_t round) {
+        proposal.round = round;
+        proposal.proposer_seat_index = flowmesh::ProductionProposerSeatIndex(0, round, seats.seats.Size());
+        const auto digest{flowmesh::ProductionProposalDigest(proposal.entry, round)};
+        proposal.proposer_signature = seats.secrets[proposal.proposer_seat_index]
+            .Sign(std::span<const unsigned char>{digest.begin(), 32}).Compressed();
+        flowmesh::WireMessage wire;
+        wire.kind = flowmesh::WireMessageKind::PROPOSAL;
+        wire.header = {flowmesh::FLOWMESH_WIRE_VERSION_V1, market, seats.seats.epoch, 0};
+        wire.payload = *flowmesh::EncodeProductionProposalPayload(proposal);
+        return wire;
+    };
+    std::mutex relay_mutex;
+    std::vector<node::FlowMeshRuntimeRelay> relays;
+    node::FlowMeshRuntimeConfig config;
+    config.chain = &chain;
+    config.keys = &observer;
+    config.clock = &clock;
+    config.round_timeout = std::chrono::hours{1};
+    config.relay = [&](node::FlowMeshRuntimeRelay relay) {
+        if (relay.message.kind != flowmesh::WireMessageKind::PROPOSAL &&
+            relay.message.kind != flowmesh::WireMessageKind::ATTESTATION) return;
+        std::lock_guard<std::mutex> guard{relay_mutex};
+        relays.push_back(std::move(relay));
+    };
+    node::FlowMeshRuntime runtime{config, {MarketConfig(
+        domain, market, treasury, seats.seats, initial, store, nullptr)}};
+    BOOST_REQUIRE(runtime.Start(error));
+    const auto submit = [&](const flowmesh::WireMessage& wire) {
+        BOOST_REQUIRE(runtime.EnqueueWireMessage(77, wire) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
+    };
+    const auto count = [&] {
+        std::lock_guard<std::mutex> guard{relay_mutex};
+        return relays.size();
+    };
+    submit(proposal_wire(0));
+    BOOST_REQUIRE_EQUAL(count(), 1U);
+    std::vector<flowmesh::WireMessage> votes;
+    for (uint32_t i{0}; i < 8; ++i) {
+        const auto signature{flowmesh::SignBlsMicroblockCertificate(
+            seats.secrets[i], flowmesh::ProductionCertificateContext(built->entry), seats.seats)};
+        BOOST_REQUIRE(signature);
+        flowmesh::WireMessage vote;
+        vote.kind = flowmesh::WireMessageKind::ATTESTATION;
+        vote.header = {flowmesh::FLOWMESH_WIRE_VERSION_V1, market, seats.seats.epoch, 0};
+        vote.payload = *flowmesh::EncodeProductionAttestationPayload({i, *signature});
+        votes.push_back(vote);
+        submit(vote);
+    }
+    BOOST_CHECK_EQUAL(count(), 8U); // proposal + seven votes; eighth vote denied
+    BOOST_CHECK_EQUAL(runtime.MarketData(market, std::nullopt, {}, error)->snapshot.runtime.max_verified_attestations, 8U);
+    submit(proposal_wire(1)); // valid next round does not refill identity cooldown
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(market)->round, 1U);
+    BOOST_CHECK_EQUAL(count(), 8U);
+    clock.m_now += std::chrono::milliseconds{250};
+    submit(votes.back()); // batch refill does not erase denied-attempt cooldown
+    BOOST_CHECK_EQUAL(count(), 8U);
+    clock.m_now -= std::chrono::milliseconds{1};
+    submit(votes.front()); // a backward clock also grants no opportunity
+    BOOST_CHECK_EQUAL(count(), 8U);
+    clock.m_now += std::chrono::milliseconds{751};
+    submit(votes.back());
+    BOOST_CHECK_EQUAL(count(), 9U);
+    for (size_t i{0}; i < 12; ++i) submit(votes.back());
+    BOOST_CHECK_EQUAL(count(), 9U); // exact same-payload cycles are paced
+    submit(votes.front());
+    submit(proposal_wire(1));
+    BOOST_CHECK_EQUAL(count(), 11U); // exact known vote and round1 payload retry
+    {
+        std::lock_guard<std::mutex> guard{relay_mutex};
+        BOOST_CHECK(relays[8].message.payload == votes.back().payload);
+        BOOST_CHECK(relays[9].message.payload == votes.front().payload);
+        for (const auto& relay : relays) {
+            BOOST_CHECK(!relay.peer);
+            BOOST_CHECK(relay.exclude_peer == 77);
+        }
+    }
+    // A known seat's vote for a second valid candidate is equivocation, not
+    // a fresh relay identity. No additional verified vote or forwarding.
+    const auto other{flowmesh::BuildProductionExecutionEntry(
+        initial, domain, market, seats.seats, gate, 0, 0, {},
+        chain.m_current, {chain.TipHeight(), std::nullopt, &chain},
+        treasury, {}, nullptr, check)};
+    BOOST_REQUIRE(other);
+    proposal.entry = other->entry;
+    submit(proposal_wire(1));
+    BOOST_REQUIRE_EQUAL(runtime.MarketData(market, std::nullopt, {}, error)->snapshot.runtime.candidate_count, 2U);
+    const auto other_signature{flowmesh::SignBlsMicroblockCertificate(
+        seats.secrets[0], flowmesh::ProductionCertificateContext(other->entry), seats.seats)};
+    BOOST_REQUIRE(other_signature);
+    auto conflicting{votes.front()};
+    conflicting.payload = *flowmesh::EncodeProductionAttestationPayload({0, *other_signature});
+    const auto before_conflict{count()};
+    submit(conflicting);
+    BOOST_CHECK_EQUAL(count(), before_conflict);
+    BOOST_CHECK_EQUAL(runtime.MarketData(market, std::nullopt, {}, error)->snapshot.runtime.max_verified_attestations, 8U);
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(market)->next_sequence, 0U);
+    runtime.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(committee_forwarding_fresh_pause_prevents_local_vote)
+{
+    const uint256 domain{Filled(0x1f)};
+    const modern::AssetId asset{Filled(0x3f)};
+    const auto market{*flowmesh::ComputeFlowMeshMarketId(domain, asset)};
+    const auto vault{*flowmesh::ComputeFlowMeshVaultId(domain, market)};
+    const uint256 treasury{Filled(0x5f)};
+    const SeatFixture seats{Seats(domain, market, 4, 7, 100, Filled(0x71), 126)};
+    RuntimeChain chain;
+    chain.m_domain = domain;
+    chain.Add(seats.seats);
+    FixedClock clock;
+    RuntimeKeys keys;
+    keys.m_keys[market] = {seats.secrets[1]};
+    const flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(),
+                                        flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+    node::FlowMeshProductionStore store{DBParams{
+        .path = m_args.GetDataDirBase() / "flowmesh_runtime_committee_fresh_pause",
+        .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+    std::string error;
+    BOOST_REQUIRE(store.OpenForMarket(domain, market, seats.seats, initial.Root(), error));
+    flowmesh::ProductionEpochGate gate{domain, market, seats.seats};
+    flowmesh::ProductionEntryCheck check;
+    const auto built{flowmesh::BuildProductionExecutionEntry(
+        initial, domain, market, seats.seats, gate, 0, 0, {},
+        {100, Filled(0x71)}, {chain.TipHeight(), std::nullopt, &chain},
+        treasury, {}, nullptr, check)};
+    BOOST_REQUIRE(built);
+    flowmesh::ProductionProposalEnvelope proposal;
+    proposal.entry = built->entry;
+    const auto digest{flowmesh::ProductionProposalDigest(proposal.entry, 0)};
+    proposal.proposer_signature = seats.secrets[0]
+        .Sign(std::span<const unsigned char>{digest.begin(), 32}).Compressed();
+    flowmesh::WireMessage wire;
+    wire.kind = flowmesh::WireMessageKind::PROPOSAL;
+    wire.header = {flowmesh::FLOWMESH_WIRE_VERSION_V1, market, seats.seats.epoch, 0};
+    wire.payload = *flowmesh::EncodeProductionProposalPayload(proposal);
+    std::mutex relay_mutex;
+    size_t committee_relays{0};
+    node::FlowMeshRuntimeConfig config;
+    config.chain = &chain;
+    config.keys = &keys;
+    config.clock = &clock;
+    config.relay = [&](node::FlowMeshRuntimeRelay relay) {
+        if (relay.message.kind == flowmesh::WireMessageKind::PROPOSAL ||
+            relay.message.kind == flowmesh::WireMessageKind::ATTESTATION) {
+            std::lock_guard<std::mutex> guard{relay_mutex};
+            ++committee_relays;
+        }
+    };
+    node::FlowMeshRuntime runtime{config, {MarketConfig(
+        domain, market, treasury, seats.seats, initial, store, nullptr)}};
+    BOOST_REQUIRE(runtime.Start(error));
+    BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
+    // Existing proposal policy and candidate evaluation pass. Only the new
+    // third check observes PAUSED, after the durable retain but before signing.
+    chain.PauseAfterTransitionChecks(2);
+    BOOST_REQUIRE(runtime.EnqueueWireMessage(0, wire) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
+    const auto data{runtime.MarketData(market, std::nullopt, {}, error)};
+    BOOST_REQUIRE(data);
+    BOOST_CHECK(data->snapshot.runtime.local_locked_candidate == proposal.entry.GetHash());
+    BOOST_CHECK_EQUAL(data->snapshot.runtime.max_verified_attestations, 0U);
+    BOOST_CHECK(runtime.MarketStatus(market)->paused);
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(market)->next_sequence, 0U);
+    {
+        std::lock_guard<std::mutex> guard{relay_mutex};
+        BOOST_CHECK_EQUAL(committee_relays, 0U);
+    }
+    runtime.Stop();
 }
 
 BOOST_AUTO_TEST_CASE(dropped_action_evidence_retries_exact_locked_candidate)

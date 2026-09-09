@@ -241,6 +241,43 @@ private:
     size_t m_bytes{0};
 };
 
+/** Incoming verified committee gossip only; ceilings before peer fan-out. */
+class FlowMeshCommitteeRelayBudget
+{
+public:
+    static constexpr size_t GLOBAL_MESSAGES{32};
+    static constexpr size_t GLOBAL_BYTES{4 * 1024 * 1024};
+    static constexpr size_t MARKET_MESSAGES{8};
+    static constexpr size_t MARKET_BYTES{2 * 1024 * 1024 + 4 * 1024};
+    static constexpr auto INTERVAL{std::chrono::milliseconds{250}};
+    static constexpr auto REPEAT_DELAY{std::chrono::seconds{1}};
+
+    FlowMeshCommitteeRelayBudget(size_t messages, size_t bytes)
+        : m_max_messages{messages}, m_max_bytes{bytes} {}
+
+    bool Available(flowmesh::WireClock::time_point now, size_t bytes)
+    {
+        if (now >= m_next) {
+            m_next = now + INTERVAL;
+            m_messages = m_max_messages;
+            m_bytes = m_max_bytes;
+        }
+        return m_messages != 0 && bytes <= m_bytes;
+    }
+    void Charge(size_t bytes)
+    {
+        --m_messages;
+        m_bytes -= bytes;
+    }
+
+private:
+    const size_t m_max_messages;
+    const size_t m_max_bytes;
+    flowmesh::WireClock::time_point m_next{};
+    size_t m_messages{0};
+    size_t m_bytes{0};
+};
+
 /**
  * Production FlowMesh orchestration core.
  *
@@ -355,6 +392,11 @@ private:
                        const flowmesh::WireMessage& message);
     void MaybePropose(Market& market);
     void MaybeCertify(Market& market, const uint256& candidate_hash);
+    /** False means fresh safety policy failed, not merely a paced no-send. */
+    bool ForwardCommitteeMessage(
+        Market& market, const flowmesh::ProductionEntryCore& entry,
+        flowmesh::WirePeerId peer, const flowmesh::WireMessage& message,
+        std::optional<flowmesh::WireClock::time_point>& last_attempt);
 
     FlowMeshRuntimeConfig m_config;
     std::vector<FlowMeshRuntimeMarketConfig> m_market_configs;
@@ -403,6 +445,9 @@ private:
     flowmesh::WireClock::time_point m_next_legacy_probe{};
     FlowMeshEvidenceRetryBudget m_evidence_retry_budget;
     flowmesh::MarketId m_evidence_retry_cursor;
+    FlowMeshCommitteeRelayBudget m_committee_relay_budget{
+        FlowMeshCommitteeRelayBudget::GLOBAL_MESSAGES,
+        FlowMeshCommitteeRelayBudget::GLOBAL_BYTES};
 };
 
 } // namespace node

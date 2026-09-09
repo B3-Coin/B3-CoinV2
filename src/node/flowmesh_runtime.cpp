@@ -261,6 +261,11 @@ struct FlowMeshRuntime::Market {
         flowmesh::FlowMeshState next_state;
         std::optional<flowmesh::ActiveFnBlsSeatSet> next_seats;
         std::vector<flowmesh::Action> evidence;
+        // Shared across rounds: churn cannot refill an identity's cooldown.
+        // These contain no payloads and die with the bounded candidate map.
+        std::optional<flowmesh::WireClock::time_point> proposal_forward_attempt{};
+        std::map<uint32_t, std::optional<flowmesh::WireClock::time_point>>
+            attestation_forward_attempts{};
     };
     struct EvidenceRetry {
         uint256 candidate_hash;
@@ -305,6 +310,9 @@ struct FlowMeshRuntime::Market {
     flowmesh::MarketDataRuntimeDiagnostics diagnostics;
     std::optional<EvidenceRetry> evidence_retry;
     bool evidence_retry_eligible{false};
+    FlowMeshCommitteeRelayBudget committee_relay_budget{
+        FlowMeshCommitteeRelayBudget::MARKET_MESSAGES,
+        FlowMeshCommitteeRelayBudget::MARKET_BYTES};
 
     Market(const FlowMeshRuntimeMarketConfig& config,
            FlowMeshRuntimeConfig& runtime_config)
@@ -1813,6 +1821,9 @@ void FlowMeshRuntime::MaybePropose(Market& market)
     wire.kind = flowmesh::WireMessageKind::PROPOSAL;
     wire.header = HeaderFor(proposal->entry);
     wire.payload = *payload;
+    // Local originals already broadcast normally; their returning copies
+    // must not create a second broadcast through the forwarding path.
+    candidate->proposal_forward_attempt = market.clock->Now();
     RelayMessage(market, wire, std::nullopt, std::nullopt);
     HandleProposal(market, LOCAL_ACTION_PEER, wire);
 }
@@ -1912,6 +1923,11 @@ void FlowMeshRuntime::HandleProposal(
         !RetainCandidateBeforeSigning(market, candidate_it->second)) {
         return;
     }
+    // Send the fully checked proposal onward before our own vote. Transport
+    // priority may still reorder delivery, so incoming repeats get paced
+    // opportunities rather than once-ever deduplication.
+    if (!ForwardCommitteeMessage(market, candidate_it->second.entry, peer, message,
+                                 candidate_it->second.proposal_forward_attempt)) return;
     flowmesh::ProductionSigningGuard guard{*market.store};
     for (const auto& [seat_index, key] : local_keys) {
         auto& attestations{market.attestations[hash]};
@@ -1961,6 +1977,8 @@ void FlowMeshRuntime::HandleProposal(
         wire.kind = flowmesh::WireMessageKind::ATTESTATION;
         wire.header = HeaderFor(candidate_it->second.entry);
         wire.payload = *payload;
+        candidate_it->second.attestation_forward_attempts[seat_index] =
+            market.clock->Now();
         RelayMessage(market, std::move(wire), std::nullopt, std::nullopt);
     }
     MaybeCertify(market, hash);
@@ -1970,7 +1988,6 @@ void FlowMeshRuntime::HandleAttestation(
     Market& market, const flowmesh::WirePeerId peer,
     const flowmesh::WireMessage& message)
 {
-    (void)peer;
     if (message.header.market_id != market.market_id ||
         message.header.epoch != market.seats.epoch ||
         message.header.sequence != market.next_sequence) {
@@ -2006,11 +2023,54 @@ void FlowMeshRuntime::HandleAttestation(
     }
     auto& by_seat{market.attestations[*matching_hash]};
     const auto existing{by_seat.find(attestation->seat_index)};
-    if (existing != by_seat.end()) return;
-    by_seat.emplace(attestation->seat_index, *attestation);
-    market.attested_hash_by_seat.emplace(attestation->seat_index,
-                                         *matching_hash);
+    if (existing == by_seat.end()) {
+        by_seat.emplace(attestation->seat_index, *attestation);
+        market.attested_hash_by_seat.emplace(attestation->seat_index,
+                                             *matching_hash);
+    } else if (existing->second.signature.Compressed() !=
+               attestation->signature.Compressed()) {
+        return;
+    }
+    auto& candidate{market.candidates.at(*matching_hash)};
+    if (!ForwardCommitteeMessage(
+        market, candidate.entry, peer, message,
+        candidate.attestation_forward_attempts[attestation->seat_index])) return;
     MaybeCertify(market, *matching_hash);
+}
+
+bool FlowMeshRuntime::ForwardCommitteeMessage(
+    Market& market, const flowmesh::ProductionEntryCore& entry,
+    const flowmesh::WirePeerId peer, const flowmesh::WireMessage& message,
+    std::optional<flowmesh::WireClock::time_point>& last_attempt)
+{
+    if (!market.ready || market.pending_handoff ||
+        market.halt != FlowMeshRuntimeHalt::NONE) return false;
+    const auto transition{CurrentSeatTransition(market)};
+    if (!transition || !market.chain->Acceptable(entry.anchor)) return false;
+    const bool execution{entry.kind == static_cast<uint8_t>(
+        flowmesh::ProductionEntryKind::EXECUTION)};
+    if (execution ? transition->kind != FlowMeshSeatTransitionKind::CONTINUE
+                  : (transition->kind != FlowMeshSeatTransitionKind::HANDOFF ||
+                     !transition->next_seats ||
+                     transition->next_seats->epoch != entry.next_epoch ||
+                     transition->next_seats->set_hash != entry.next_seat_set_hash)) {
+        return false;
+    }
+    if (peer == LOCAL_ACTION_PEER) return true;
+    const auto now{market.clock->Now()};
+    if (last_attempt &&
+        now < *last_attempt + FlowMeshCommitteeRelayBudget::REPEAT_DELAY) return true;
+    // Even denied attempts wait: untrusted repetitions and round churn may
+    // not spin against a depleted budget. No delayed payload queue is kept.
+    last_attempt = now;
+    const size_t bytes{flowmesh::FLOWMESH_WIRE_HEADER_SIZE + message.payload.size()};
+    if (!m_committee_relay_budget.Available(now, bytes) ||
+        !market.committee_relay_budget.Available(now, bytes)) return true;
+    m_committee_relay_budget.Charge(bytes);
+    market.committee_relay_budget.Charge(bytes);
+    // Charge before the external gate/callback, including suppressed sends.
+    RelayMessage(market, message, std::nullopt, peer);
+    return true;
 }
 
 void FlowMeshRuntime::MaybeCertify(Market& market,
