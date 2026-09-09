@@ -18,6 +18,7 @@
 #include <hash.h>
 #include <modern/policy.h>
 #include <policy/policy.h>
+#include <policy/feerate.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
 
