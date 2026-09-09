@@ -271,8 +271,15 @@ B3AssetsPage::B3AssetsPage(QWidget* parent)
 
         connect(m_send, &QPushButton::clicked, this, &B3AssetsPage::sendSelectedAsset);
         connect(m_receive, &QPushButton::clicked, this, &B3AssetsPage::receiveSelectedAsset);
-        // The RPC exists, but the production deposit/withdraw UI remains
-        // deliberately gated until its complete market lifecycle is tested.
+        auto openFlowMesh = [this](bool withdrawal) {
+            if (!m_wallet_model || m_action_open || !m_security_warning.isEmpty()) return;
+            const auto record{selectedAsset()};
+            if (record.is_fn || record.status == B3AssetRecord::Status::Unavailable) return;
+            Q_EMIT flowMeshRequested(record.status == B3AssetRecord::Status::Native
+                                         ? QString{} : record.asset_id, withdrawal);
+        };
+        connect(m_deposit, &QPushButton::clicked, this, [openFlowMesh] { openFlowMesh(false); });
+        connect(m_withdraw, &QPushButton::clicked, this, [openFlowMesh] { openFlowMesh(true); });
     }
     layout->addLayout(m_columns, 1);
     m_flowmesh_panel = new B3FlowMeshPanel(content);
@@ -525,14 +532,18 @@ void B3AssetsPage::updateDetails()
     m_action_note->setText(disabled_reasons.join(QLatin1Char('\n')));
     m_action_note->setVisible(!disabled_reasons.isEmpty());
 
-    // The model can expose FlowMesh balances, but this page has no approved
-    // deposit/withdraw submission path yet. Never turn disconnected buttons
-    // into controls that merely look live.
-    m_deposit->setEnabled(false);
-    m_withdraw->setEnabled(false);
-    const QString mesh_reason{tr("FlowMesh deposits and withdrawals remain disabled here pending successful market, deposit and withdrawal testing. "
-                                 "Activation height alone does not make a market ready. Deposits enter a keyless vault and may remain locked "
-                                 "if the market's validator quorum is unavailable. Trading remains disabled.")};
+    // Opening the form moves no funds. Its live market checks, unlock and
+    // exact transaction review still gate every signing/broadcast operation.
+    const bool mesh_form{signing_wallet && !record.is_fn && !m_action_open &&
+        m_security_warning.isEmpty() && (native || record.status == B3AssetRecord::Status::Active)};
+    m_deposit->setEnabled(mesh_form);
+    m_withdraw->setEnabled(mesh_form);
+    const QString mesh_reason{!m_security_warning.isEmpty() ? m_security_warning :
+        record.is_fn ? tr("FN Coin is a validator seat, not a FlowMesh trading pair.") :
+        !signing_wallet ? tr("Select a spending wallet to open FlowMesh actions.") :
+        tr("Open this asset's FlowMesh form to review a deposit or withdrawal. "
+           "A ready market and FN quorum are required. Deposits enter a keyless vault and can remain locked "
+           "without quorum; a withdrawal request is not yet an on-chain payout.")};
     for (QPushButton* button : {m_deposit, m_withdraw}) {
         button->setToolTip(mesh_reason);
         button->setAccessibleDescription(mesh_reason);

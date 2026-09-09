@@ -282,6 +282,61 @@ BOOST_AUTO_TEST_CASE(asset_rpc_named_values_preserve_types)
         asset_id);
 }
 
+BOOST_AUTO_TEST_CASE(flowmesh_prepare_rpc_positional_values_preserve_types)
+{
+    // Hashes containing only decimal digits remain strings, and preparation
+    // options reach the wallet as a JSON object containing a boolean.
+    const std::string id(64, '1');
+    const std::string options{R"({"broadcast":false})"};
+    const UniValue checkpoint{
+        RPCConvertValues("createflowmeshcheckpoint", {id, options})};
+    BOOST_REQUIRE_EQUAL(checkpoint.size(), 2U);
+    BOOST_CHECK_EQUAL(checkpoint[0].get_str(), id);
+    BOOST_CHECK(checkpoint[1].isObject());
+    BOOST_CHECK(checkpoint[1]["broadcast"].isFalse());
+
+    const UniValue withdrawal{
+        RPCConvertValues("createflowmeshvaulttx", {id, "destination", options})};
+    BOOST_REQUIRE_EQUAL(withdrawal.size(), 3U);
+    BOOST_CHECK_EQUAL(withdrawal[0].get_str(), id);
+    BOOST_CHECK_EQUAL(withdrawal[1].get_str(), "destination");
+    BOOST_CHECK(withdrawal[2].isObject());
+    BOOST_CHECK(withdrawal[2]["broadcast"].isFalse());
+    BOOST_CHECK_THROW(
+        RPCConvertValues("createflowmeshcheckpoint", {id, "not-json"}),
+        std::runtime_error);
+    BOOST_CHECK_THROW(
+        RPCConvertValues("createflowmeshvaulttx", {id, "destination", "not-json"}),
+        std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(flowmesh_prepare_rpc_named_values_omit_deposit_destination)
+{
+    const std::string id(64, '1');
+    const UniValue deposit{
+        RPCConvertNamedValues("createflowmeshvaulttx",
+                              {"effect_id=" + id, R"(options={"broadcast":false})"})};
+    const UniValue transformed{
+        TransformParams(deposit,
+                        {{"effect_id", false}, {"destination", false}, {"options", false}})};
+    BOOST_REQUIRE_EQUAL(transformed.size(), 3U);
+    BOOST_CHECK_EQUAL(transformed[0].get_str(), id);
+    BOOST_CHECK(transformed[1].isNull());
+    BOOST_CHECK(transformed[2].isObject());
+    BOOST_CHECK(transformed[2]["broadcast"].isFalse());
+
+    const UniValue checkpoint{
+        RPCConvertNamedValues("createflowmeshcheckpoint",
+                              {"market_id=" + id, R"(options={"broadcast":false})"})};
+    BOOST_CHECK_EQUAL(checkpoint["market_id"].get_str(), id);
+    BOOST_CHECK(checkpoint["options"].isObject());
+    BOOST_CHECK(checkpoint["options"]["broadcast"].isFalse());
+    BOOST_CHECK_THROW(
+        RPCConvertNamedValues("createflowmeshvaulttx",
+                              {"effect_id=" + id, "options=not-json"}),
+        std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(asset_rpc_rejects_malformed_json_parameters)
 {
     BOOST_CHECK_THROW(RPCConvertValues("issueasset", {"not-a-number", "2"}), std::runtime_error);

@@ -50,6 +50,7 @@ public:
 Q_SIGNALS:
     void sendRequested();
     void receiveRequested();
+    void flowMeshRequested(const QString& asset_id, bool withdrawal);
     void walletChanged();
 
 private Q_SLOTS:

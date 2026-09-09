@@ -10,6 +10,8 @@
 #include <QWidget>
 
 class B3ChartWidget;
+class B3FlowMeshTradingPanel;
+class WalletModel;
 
 QT_BEGIN_NAMESPACE
 class QComboBox;
@@ -21,12 +23,10 @@ class QTabWidget;
 QT_END_NAMESPACE
 
 /**
- * Inactive B3 FlowMesh trading preview: market header, native chart,
- * liquidity view, recent trades, limit ticket and spot activity tabs.
- * Entirely model-driven; with the null backend of this build every
- * market control is disabled, every surface reports the unavailable state,
- * and nothing can be submitted. Futures and market orders are deliberately
- * absent until their protocol and production backend exist.
+ * Selected-wallet FlowMesh workspace, with a non-submitting chart preview
+ * when no wallet is attached. Live operations are routed through the guarded
+ * wallet RPC panel, never through an arbitrary preview-data backend.
+ * Futures and market orders are absent until their protocol exists.
  */
 class B3TradePage : public QWidget
 {
@@ -34,6 +34,9 @@ class B3TradePage : public QWidget
 
 public:
     explicit B3TradePage(QWidget* parent = nullptr);
+    //! Real wallet actions use the guarded RPC panel; preview data cannot submit.
+    void setWalletModel(WalletModel* wallet);
+    void openFlowMeshAsset(const QString& asset_id, bool withdrawal);
 
     //! Attach a trading backend (not owned; null falls back to the
     //! built-in null backend semantics).
@@ -51,6 +54,8 @@ private Q_SLOTS:
     void updateTicketTotal();
 
 private:
+    QWidget* m_preview_widget{nullptr};
+    B3FlowMeshTradingPanel* m_trading_panel{nullptr};
     B3TradingBackend* m_backend{nullptr};
     B3NullTradingBackend* m_null_backend{nullptr};
 

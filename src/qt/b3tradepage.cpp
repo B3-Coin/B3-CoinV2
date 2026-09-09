@@ -2,15 +2,16 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
-#if defined(HAVE_CONFIG_H)
-#include <config/bitcoin-config.h>
-#endif
+#include <bitcoin-build-config.h> // IWYU pragma: keep
 
 #include <qt/b3tradepage.h>
 
 #include <qt/b3chartwidget.h>
 #include <qt/b3fixed.h>
 #include <qt/b3theme.h>
+#ifdef ENABLE_WALLET
+#include <qt/b3flowmeshtradingpanel.h>
+#endif
 
 #include <QButtonGroup>
 #include <QComboBox>
@@ -92,7 +93,11 @@ B3TradePage::B3TradePage(QWidget* parent)
     }
     m_trades->setPrecision(kPriceDecimals, kQuantityDecimals);
 
-    auto* layout = new QVBoxLayout(this);
+    auto* outer = new QVBoxLayout(this);
+    outer->setContentsMargins(0, 0, 0, 0);
+    m_preview_widget = new QWidget(this);
+    outer->addWidget(m_preview_widget);
+    auto* layout = new QVBoxLayout(m_preview_widget);
     layout->setContentsMargins(B3Theme::kSpaceLg, B3Theme::kSpaceLg, B3Theme::kSpaceLg, B3Theme::kSpaceLg);
     layout->setSpacing(B3Theme::kSpaceMd);
 
@@ -339,6 +344,33 @@ B3TradePage::B3TradePage(QWidget* parent)
 
     updateAvailability();
     updateTicketTotal();
+}
+
+void B3TradePage::setWalletModel(WalletModel* wallet)
+{
+#ifdef ENABLE_WALLET
+    if (!m_trading_panel && wallet) {
+        m_trading_panel = new B3FlowMeshTradingPanel(this);
+        layout()->addWidget(m_trading_panel);
+    }
+    if (m_trading_panel) {
+        m_trading_panel->setWalletModel(wallet);
+        m_trading_panel->setVisible(wallet != nullptr);
+    }
+    m_preview_widget->setVisible(wallet == nullptr);
+#else
+    (void)wallet;
+#endif
+}
+
+void B3TradePage::openFlowMeshAsset(const QString& asset_id, bool withdrawal)
+{
+#ifdef ENABLE_WALLET
+    if (m_trading_panel) m_trading_panel->selectBaseAsset(asset_id, withdrawal);
+#else
+    (void)asset_id;
+    (void)withdrawal;
+#endif
 }
 
 void B3TradePage::setBackend(B3TradingBackend* backend)

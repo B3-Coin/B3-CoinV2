@@ -37,6 +37,25 @@ namespace {
 
 using MarketStatus = interfaces::FlowMeshMarketStatus;
 
+static bool ParseBroadcastOption(const UniValue& options)
+{
+    if (options.isNull()) return true;
+    if (!options.isObject()) {
+        throw JSONRPCError(RPC_TYPE_ERROR, "options must be an object");
+    }
+    for (const std::string& key : options.getKeys()) {
+        if (key != "broadcast") {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               "Unknown option '" + key + "'");
+        }
+    }
+    if (!options.exists("broadcast")) return true;
+    if (!options["broadcast"].isBool()) {
+        throw JSONRPCError(RPC_TYPE_ERROR, "broadcast must be a boolean");
+    }
+    return options["broadcast"].get_bool();
+}
+
 static uint256 ParseMarketId(const UniValue& value)
 {
     const uint256 market{ParseHashV(value, "market_id")};
@@ -1011,28 +1030,44 @@ RPCHelpMan createflowmeshcheckpoint()
 {
     return RPCHelpMan{
         "createflowmeshcheckpoint",
-        "Publish the service-selected next certified FlowMesh entry as one type-8 MPA record in an ordinary wallet-funded B3 transaction.\n" +
+        "Create the service-selected next certified FlowMesh entry as one "
+        "type-8 MPA record in an ordinary wallet-funded B3 transaction. "
+        "By default the signed transaction is committed and broadcast. "
+        "Set options.broadcast=false to return the signed transaction for "
+        "review without committing or broadcasting it; send its exact hex "
+        "with sendrawtransaction to publish it. Prepared inputs are not "
+        "reserved and may be spent before publication.\n" +
             HELP_REQUIRING_PASSPHRASE,
-        {{"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
-          "32-byte market id"}},
-        RPCResult{RPCResult::Type::OBJ, "", "Published checkpoint transaction", {
+        {
+            {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "32-byte market id"},
+            {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED,
+             "Transaction options", {
+                 {"broadcast", RPCArg::Type::BOOL, RPCArg::Default{true},
+                  "Commit and broadcast the signed transaction"},
+             }},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Signed checkpoint transaction", {
             {RPCResult::Type::STR_HEX, "txid", "Transaction id"},
             {RPCResult::Type::STR_HEX, "ptxid", "Payload-aware transaction id"},
             {RPCResult::Type::STR_HEX, "hex", "Serialized transaction"},
             {RPCResult::Type::STR_HEX, "market_id", "FlowMesh market id"},
-            {RPCResult::Type::STR_HEX, "checkpoint_id", "Published checkpoint id"},
-            {RPCResult::Type::NUM, "sequence", "Published checkpoint sequence"},
+            {RPCResult::Type::STR_HEX, "checkpoint_id", "Checkpoint id"},
+            {RPCResult::Type::NUM, "sequence", "Checkpoint sequence"},
             {RPCResult::Type::NUM, "effect_count", "Effects committed by the checkpoint"},
             {RPCResult::Type::STR_AMOUNT, "network_fee", "Native B3 network fee"},
             {RPCResult::Type::BOOL, "broadcast", "Whether the transaction was broadcast"},
         }},
-        RPCExamples{HelpExampleCli(
-            "createflowmeshcheckpoint", "\"<market_id>\"")},
+        RPCExamples{
+            HelpExampleCli("createflowmeshcheckpoint", "\"<market_id>\"") +
+            HelpExampleCli("createflowmeshcheckpoint",
+                           "\"<market_id>\" '{\"broadcast\":false}'")},
         [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
             const std::shared_ptr<CWallet> wallet{
                 GetWalletForJSONRPCRequest(request)};
             if (!wallet) return UniValue::VNULL;
             wallet->BlockUntilSyncedToCurrentChain();
+            const bool broadcast{ParseBroadcastOption(request.params[1])};
             const uint256 market_id{ParseMarketId(request.params[0])};
             std::string service_error;
             const auto pending{wallet->chain().nextFlowMeshCheckpoint(
@@ -1093,11 +1128,13 @@ RPCHelpMan createflowmeshcheckpoint()
                 }
                 created = std::move(*result);
             }
-            wallet->CommitTransaction(
-                created.tx,
-                {{"b3", "flowmesh-checkpoint"},
-                 {"b3_network_fee", FormatMoney(created.fee)}},
-                /*orderForm=*/{});
+            if (broadcast) {
+                wallet->CommitTransaction(
+                    created.tx,
+                    {{"b3", "flowmesh-checkpoint"},
+                     {"b3_network_fee", FormatMoney(created.fee)}},
+                    /*orderForm=*/{});
+            }
 
             UniValue out{UniValue::VOBJ};
             out.pushKV("txid", created.tx->GetHash().GetHex());
@@ -1108,7 +1145,7 @@ RPCHelpMan createflowmeshcheckpoint()
             out.pushKV("sequence", pending->sequence);
             out.pushKV("effect_count", pending->effect_count);
             out.pushKV("network_fee", ValueFromAmount(created.fee));
-            out.pushKV("broadcast", true);
+            out.pushKV("broadcast", broadcast);
             return out;
         }};
 }
@@ -1117,18 +1154,28 @@ RPCHelpMan createflowmeshvaulttx()
 {
     return RPCHelpMan{
         "createflowmeshvaulttx",
-        "Publish one certified type-9 FlowMesh deposit sweep or withdrawal. "
+        "Create one certified type-9 FlowMesh deposit sweep or withdrawal. "
         "The service selects the connected proof and exact keyless vault "
         "inputs; this wallet supplies and signs a separate native-B3 fee "
-        "input. A destination is required only for a withdrawal.\n" +
+        "input. A destination is required only for a withdrawal. "
+        "By default the signed transaction is committed and broadcast. "
+        "Set options.broadcast=false to return the signed transaction for "
+        "review without committing or broadcasting it; send its exact hex "
+        "with sendrawtransaction to publish it. Prepared inputs are not "
+        "reserved and may be spent before publication.\n" +
             HELP_REQUIRING_PASSPHRASE,
         {
             {"effect_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
              "Certified deposit-acceptance or withdrawal-receipt id"},
             {"destination", RPCArg::Type::STR, RPCArg::Optional::OMITTED,
              "Exact owner address committed by a withdrawal receipt"},
+            {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED,
+             "Transaction options", {
+                 {"broadcast", RPCArg::Type::BOOL, RPCArg::Default{true},
+                  "Commit and broadcast the signed transaction"},
+             }},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "Published vault transaction", {
+        RPCResult{RPCResult::Type::OBJ, "", "Signed vault transaction", {
             {RPCResult::Type::STR_HEX, "txid", "Transaction id"},
             {RPCResult::Type::STR_HEX, "ptxid", "Payload-aware transaction id"},
             {RPCResult::Type::STR_HEX, "hex", "Serialized transaction"},
@@ -1145,13 +1192,16 @@ RPCHelpMan createflowmeshvaulttx()
         RPCExamples{
             HelpExampleCli("createflowmeshvaulttx", "\"<acceptance_id>\"") +
             HelpExampleCli("createflowmeshvaulttx",
-                           "\"<receipt_id>\" \"<address>\"")},
+                           "\"<receipt_id>\" \"<address>\"") +
+            HelpExampleCli("-named createflowmeshvaulttx",
+                           "effect_id=\"<acceptance_id>\" options='{\"broadcast\":false}'")},
         [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
             const std::shared_ptr<CWallet> wallet{
                 GetWalletForJSONRPCRequest(request)};
             if (!wallet) return UniValue::VNULL;
             wallet->BlockUntilSyncedToCurrentChain();
 
+            const bool broadcast{ParseBroadcastOption(request.params[2])};
             const uint256 effect_id{ParseHashV(request.params[0],
                                                "effect_id")};
             if (effect_id.IsNull()) {
@@ -1450,11 +1500,13 @@ RPCHelpMan createflowmeshvaulttx()
                 signed_tx = MakeTransactionRef(std::move(mutable_tx));
             }
 
-            wallet->CommitTransaction(
-                signed_tx,
-                {{"b3", "flowmesh-" + operation_kind},
-                 {"b3_network_fee", FormatMoney(created.fee)}},
-                /*orderForm=*/{});
+            if (broadcast) {
+                wallet->CommitTransaction(
+                    signed_tx,
+                    {{"b3", "flowmesh-" + operation_kind},
+                     {"b3_network_fee", FormatMoney(created.fee)}},
+                    /*orderForm=*/{});
+            }
 
             UniValue out{UniValue::VOBJ};
             out.pushKV("txid", signed_tx->GetHash().GetHex());
@@ -1474,7 +1526,7 @@ RPCHelpMan createflowmeshvaulttx()
             out.pushKV("vault_inputs",
                        static_cast<uint64_t>(operation->inputs.size()));
             out.pushKV("network_fee", ValueFromAmount(created.fee));
-            out.pushKV("broadcast", true);
+            out.pushKV("broadcast", broadcast);
             return out;
         }};
 }

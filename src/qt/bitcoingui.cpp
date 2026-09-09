@@ -151,9 +151,15 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         m_shell->setAssetsPage(m_assets_page);
         connect(m_assets_page, &B3AssetsPage::sendRequested, this, [this] { gotoSendCoinsPage(); });
         connect(m_assets_page, &B3AssetsPage::receiveRequested, this, &BitcoinGUI::gotoReceiveCoinsPage);
-        // The trading workspace ships with the null backend only: every
-        // surface reports honestly unavailable and nothing can submit.
-        m_shell->setTradePage(new B3TradePage(m_shell));
+        // Wallet-backed FlowMesh actions share the selected wallet, not an
+        // external RPC credential or the legacy chart-preview backend.
+        m_trade_page = new B3TradePage(m_shell);
+        m_shell->setTradePage(m_trade_page);
+        connect(m_assets_page, &B3AssetsPage::flowMeshRequested, this,
+                [this](const QString& asset_id, bool withdrawal) {
+            m_trade_page->openFlowMeshAsset(asset_id, withdrawal);
+            m_shell->showPage(B3Page::Trade);
+        });
         // Validator operations reuse the wallet's production staking/finality
         // backends. Secret material remains behind the normal wallet unlock
         // boundary; the page exposes public status and explicit controls only.
@@ -979,6 +985,7 @@ void BitcoinGUI::removeWallet(WalletModel* walletModel)
         setCurrentWallet(remaining);
     } else {
         if (m_assets_page) m_assets_page->setWalletModel(nullptr);
+        if (m_trade_page) m_trade_page->setWalletModel(nullptr);
         if (m_stake_page) m_stake_page->setWalletModel(nullptr);
     }
     updateWalletSelector();
@@ -992,6 +999,7 @@ void BitcoinGUI::setCurrentWallet(WalletModel* wallet_model)
     walletFrame->setCurrentWallet(wallet_model);
     if (walletFrame->currentWalletModel() != wallet_model) return;
     if (m_assets_page) m_assets_page->setWalletModel(wallet_model);
+    if (m_trade_page) m_trade_page->setWalletModel(wallet_model);
     if (m_stake_page) m_stake_page->setWalletModel(wallet_model);
     rpcConsole->setCurrentWallet(wallet_model);
     const QSignalBlocker blocker{m_wallet_selector};
@@ -1031,6 +1039,7 @@ void BitcoinGUI::removeAllWallets()
     if (m_shell && m_shell->walletPageVisible()) m_shell->showPage(B3Page::Dashboard);
     setWalletActionsEnabled(false);
     if (m_assets_page) m_assets_page->setWalletModel(nullptr);
+    if (m_trade_page) m_trade_page->setWalletModel(nullptr);
     if (m_stake_page) m_stake_page->setWalletModel(nullptr);
     {
         const QSignalBlocker blocker{m_wallet_selector};

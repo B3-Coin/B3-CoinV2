@@ -44,6 +44,7 @@ class B3SettingsPage;
 class UpdateController;
 class B3Shell;
 class B3StakePage;
+class B3TradePage;
 enum class B3Page;
 enum class SynchronizationState;
 
@@ -137,6 +138,7 @@ private:
     WalletFrame* walletFrame = nullptr;
     B3Shell* m_shell = nullptr;
     B3AssetsPage* m_assets_page = nullptr;
+    B3TradePage* m_trade_page = nullptr;
     B3StakePage* m_stake_page = nullptr;
     B3SettingsPage* m_settings_page = nullptr;
     UpdateController* m_update_controller = nullptr;

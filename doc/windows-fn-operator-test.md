@@ -2,8 +2,8 @@
 
 This is an unsigned development artifact, not a release or a consensus upgrade.
 GitHub's `release-build` workflow with `windows_build_only=true` compiles and
-packages the Windows programs without publishing a release or running the
-extended release test suites. A successful cross-build is not proof of Windows
+packages Windows only; `desktop_build_only=true` builds Windows plus both Macs.
+Neither mode compiles tests, runs tests or publishes a release. A successful cross-build is not proof of Windows
 runtime testing. Record the source commit and check the downloaded hashes.
 
 ## Included scope
@@ -14,11 +14,15 @@ runtime testing. Record the source commit and check the downloaded hashes.
 - FN public-key/market diagnostics and reviewed binding, arm and disarm actions.
 - Confirmation of node-global FN controls, stale-state guards and persistent
   warnings if a temporary spending unlock cannot be restored.
+- A selected-wallet FlowMesh workspace for reviewed deposits, limit orders,
+  cancellation, admission, withdrawal requests and certified checkpoint/vault
+  publication. See [the test workflow and units](flowmesh-qt-test.md).
 
 The new recovery prototypes, relayer changes, automatic FN peer discovery and
 any changes to validator membership/quorum are excluded. Existing recovery
-features inherited from v1.1.4 are unchanged. FlowMesh trade, vault deposit and
-withdraw buttons remain disabled; this package is not a complete trading UI.
+features inherited from v1.1.4 are unchanged. Market-readiness checks remain
+mandatory: enabling the forms does not create an FN quorum or counterparty
+liquidity. The old chart preview is not a live price feed.
 
 ## Initial Windows checks
 

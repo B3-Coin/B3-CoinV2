@@ -11,6 +11,11 @@ on:
         required: false
         type: boolean
         default: false
+      desktop_build_only:
+        description: "Build Windows and macOS artifacts only, without tests or release publication"
+        required: false
+        type: boolean
+        default: false
   push:
     tags: [ "v*" ]
 
@@ -30,6 +35,20 @@ jobs:
       source_version: ${{ steps.source_version.outputs.source_version }}
       prerelease: ${{ steps.source_version.outputs.prerelease }}
     steps:
+      - name: Validate manual build scope
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          WINDOWS_BUILD_ONLY: ${{ inputs.windows_build_only }}
+          DESKTOP_BUILD_ONLY: ${{ inputs.desktop_build_only }}
+        run: |
+          set -euo pipefail
+          if [[ "$WINDOWS_BUILD_ONLY" == true && "$DESKTOP_BUILD_ONLY" == true ]]; then
+            echo "Select only one build-only mode." >&2
+            exit 1
+          fi
+          if [[ "$DESKTOP_BUILD_ONLY" == true ]]; then
+            echo "::notice::Windows and macOS arm64/Intel compilation and packaging only for $GITHUB_SHA. Test programs and test execution are disabled. No tag or release will be published."
+          fi
       - uses: actions/checkout@v4
       - name: Derive and validate source version
         id: source_version
@@ -95,7 +114,7 @@ jobs:
     # emergency opt-out to their exact commit SHA.
     if: >-
       ${{
-        !(github.event_name == 'workflow_dispatch' && inputs.windows_build_only) &&
+        !(github.event_name == 'workflow_dispatch' && (inputs.windows_build_only || inputs.desktop_build_only)) &&
         github.ref != 'refs/tags/v1.1.1-beta.2' &&
         github.ref != 'refs/tags/v1.1.1-beta.3' &&
         vars.B3_SKIP_EXTENDED_RELEASE_TESTS_SHA != github.sha
@@ -150,7 +169,7 @@ jobs:
           feature_flowmesh_release.py
 
   release-test-policy:
-    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.windows_build_only) }}
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && (inputs.windows_build_only || inputs.desktop_build_only)) }}
     needs: [version, release-tests]
     runs-on: ubuntu-24.04
     steps:
@@ -177,7 +196,7 @@ jobs:
           fi
 
   contract-tests:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.windows_build_only) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.windows_build_only || inputs.desktop_build_only)) }}
     needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -194,7 +213,7 @@ jobs:
         run: script/check-deployable-sizes.sh
 
   linux-x86_64:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.windows_build_only) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.windows_build_only || inputs.desktop_build_only)) }}
     needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -247,7 +266,7 @@ jobs:
           path: out/
 
   linux-x86_64-static:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.windows_build_only) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.windows_build_only || inputs.desktop_build_only)) }}
     needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -431,6 +450,7 @@ jobs:
           cmake -C contrib/b3hive-release/stable-channel-v1.cmake \
             -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=ON \
             -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF \
+            -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF \
             -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON \
             -DB3_REQUIRE_UPDATE_CHANNEL=ON \
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)" \
@@ -439,6 +459,21 @@ jobs:
           # are compile checks only: Homebrew-linked binaries are not portable
           # release artifacts.
           cmake --build build -j4 --target deploy b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
+      - name: Complete Qt plugin deployment
+        run: |
+          set -euo pipefail
+          app='build/B3 Hive.app'
+          # The legacy deploy script only includes styles/platform plugins.
+          # Start from its unmodified source app so Qt can discover and bundle
+          # the TLS backends and their transitive dependencies too.
+          find 'build/dist/B3 Hive.app/Contents/Resources' -maxdepth 1 \
+            -type f -name '*.qm' -exec cp {} "$app/Contents/Resources/" \;
+          macdeployqt="$(brew --prefix qt@6)/bin/macdeployqt"
+          test -x "$macdeployqt"
+          "$macdeployqt" "$app" -verbose=2 -always-overwrite
+          codesign --deep --force --sign - "$app"
+          ditto -c -k --sequesterRsrc --keepParent "$app" build/b3coin-macos-app-complete.zip
+          mv build/b3coin-macos-app-complete.zip build/b3coin-macos-app.zip
       - name: Verify unsigned app bundle
         run: |
           set -euo pipefail
@@ -449,6 +484,11 @@ jobs:
           test "$(plutil -extract CFBundleDisplayName raw "$app/Contents/Info.plist")" = "B3 Hive"
           test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = "co.b3coin.B3Hive"
           test "$(plutil -extract LSMinimumSystemVersion raw "$app/Contents/Info.plist")" = "$deployment_target"
+          test -f "$app/Contents/Resources/qt.conf"
+          test -f "$app/Contents/PlugIns/platforms/libqcocoa.dylib"
+          # The certificate-only backend cannot provide HTTPS connections.
+          [[ -f "$app/Contents/PlugIns/tls/libqsecuretransportbackend.dylib" || \
+             -f "$app/Contents/PlugIns/tls/libqopensslbackend.dylib" ]]
           version_le() {
             /usr/bin/awk -v actual="$1" -v limit="$2" 'BEGIN {
               na = split(actual, a, "."); nl = split(limit, l, ".");
@@ -517,6 +557,7 @@ jobs:
           cmake -C contrib/b3hive-release/stable-channel-v1.cmake \
             -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=ON \
             -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF \
+            -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF \
             -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON \
             -DB3_REQUIRE_UPDATE_CHANNEL=ON \
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)" \
@@ -526,6 +567,21 @@ jobs:
           # are compile checks only: Homebrew-linked binaries are not portable
           # release artifacts.
           cmake --build build -j4 --target deploy b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet
+      - name: Complete Qt plugin deployment
+        run: |
+          set -euo pipefail
+          app='build/B3 Hive.app'
+          # The legacy deploy script only includes styles/platform plugins.
+          # Start from its unmodified source app so Qt can discover and bundle
+          # the TLS backends and their transitive dependencies too.
+          find 'build/dist/B3 Hive.app/Contents/Resources' -maxdepth 1 \
+            -type f -name '*.qm' -exec cp {} "$app/Contents/Resources/" \;
+          macdeployqt="$(brew --prefix qt@6)/bin/macdeployqt"
+          test -x "$macdeployqt"
+          "$macdeployqt" "$app" -verbose=2 -always-overwrite
+          codesign --deep --force --sign - "$app"
+          ditto -c -k --sequesterRsrc --keepParent "$app" build/b3coin-macos-app-complete.zip
+          mv build/b3coin-macos-app-complete.zip build/b3coin-macos-app.zip
       - name: Verify unsigned app bundle
         run: |
           set -euo pipefail
@@ -536,6 +592,11 @@ jobs:
           test "$(plutil -extract CFBundleDisplayName raw "$app/Contents/Info.plist")" = "B3 Hive"
           test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = "co.b3coin.B3Hive"
           test "$(plutil -extract LSMinimumSystemVersion raw "$app/Contents/Info.plist")" = "$deployment_target"
+          test -f "$app/Contents/Resources/qt.conf"
+          test -f "$app/Contents/PlugIns/platforms/libqcocoa.dylib"
+          # The certificate-only backend cannot provide HTTPS connections.
+          [[ -f "$app/Contents/PlugIns/tls/libqsecuretransportbackend.dylib" || \
+             -f "$app/Contents/PlugIns/tls/libqopensslbackend.dylib" ]]
           version_le() {
             /usr/bin/awk -v actual="$1" -v limit="$2" 'BEGIN {
               na = split(actual, a, "."); nl = split(limit, l, ".");

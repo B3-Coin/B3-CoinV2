@@ -57,6 +57,23 @@ if(ENABLE_WALLET)
   )
 
   # Pure amount/transaction-review checks: no wallet, RPC, node or GUI startup.
+  add_executable(test_b3_flowmeshtrading-qt b3flowmeshtradingtests.cpp)
+  target_link_libraries(test_b3_flowmeshtrading-qt
+    core_interface bitcoinqt bitcoin_node univalue Qt6::Test
+  )
+  import_plugins(test_b3_flowmeshtrading-qt)
+  add_test(NAME test_b3_flowmeshtrading-qt COMMAND test_b3_flowmeshtrading-qt)
+
+  add_executable(test_b3_flowmeshtradingpanel-qt b3flowmeshtradingpaneltests.cpp)
+  target_link_libraries(test_b3_flowmeshtradingpanel-qt
+    core_interface bitcoinqt test_util bitcoin_node Boost::headers Qt6::Test
+  )
+  import_plugins(test_b3_flowmeshtradingpanel-qt)
+  add_test(NAME test_b3_flowmeshtradingpanel-qt COMMAND test_b3_flowmeshtradingpanel-qt)
+  set_tests_properties(test_b3_flowmeshtradingpanel-qt PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=minimal"
+  )
+
   add_executable(test_b3_flowmeshop-qt b3flowmeshoptests.cpp)
   target_link_libraries(test_b3_flowmeshop-qt
     core_interface bitcoinqt bitcoin_node univalue Qt6::Test

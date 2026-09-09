@@ -219,13 +219,60 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
 
         self.wait_until(converged, timeout=120)
 
-    def publish_checkpoint(self, market_id):
+    def prepare_and_publish(self, node, create_transaction, *args):
+        """Review a signed transaction without committing it, then send its exact bytes."""
+        node.syncwithvalidationinterfacequeue()
+        txcount = node.getwalletinfo()["txcount"]
+        mempool = set(node.getrawmempool())
+        locked_coins = node.listlockunspent()
+
+        assert_raises_rpc_error(
+            -8, "Unknown option 'unexpected'", create_transaction,
+            *args, {"broadcast": False, "unexpected": True},
+        )
+        assert_raises_rpc_error(
+            -3, "Wrong type passed", create_transaction, *args, False,
+        )
+        for invalid_broadcast in (None, "false", 0, [], {}):
+            assert_raises_rpc_error(
+                -3, "broadcast must be a boolean", create_transaction,
+                *args, {"broadcast": invalid_broadcast},
+            )
+
+        prepared = create_transaction(*args, {"broadcast": False})
+        assert_equal(prepared["broadcast"], False)
+        assert_equal(set(node.getrawmempool()), mempool)
+        assert_equal(node.getwalletinfo()["txcount"], txcount)
+        assert_equal(node.listlockunspent(), locked_coins)
+        assert_raises_rpc_error(
+            -5, "Invalid or non-wallet transaction id",
+            node.gettransaction, prepared["txid"],
+        )
+        decoded = node.decoderawtransaction(prepared["hex"])
+        assert_equal(decoded["txid"], prepared["txid"])
+        assert_equal(decoded["ptxid"], prepared["ptxid"])
+
+        assert_equal(node.sendrawtransaction(prepared["hex"]), prepared["txid"])
+        node.syncwithvalidationinterfacequeue()
+        assert prepared["txid"] in node.getrawmempool()
+        assert_equal(node.getrawtransaction(prepared["txid"]), prepared["hex"])
+        assert_equal(node.gettransaction(prepared["txid"])["hex"], prepared["hex"])
+        return prepared
+
+    def publish_checkpoint(self, market_id, prepare=False):
         self.wait_until(
             lambda: bool(self.market_status(self.nodes[0], market_id) or {}) and
                     self.market_status(self.nodes[0], market_id)["checkpoint_pending"],
             timeout=120,
         )
-        checkpoint = self.nodes[0].createflowmeshcheckpoint(market_id)
+        node = self.nodes[0]
+        if prepare:
+            checkpoint = self.prepare_and_publish(
+                node, node.createflowmeshcheckpoint, market_id,
+            )
+        else:
+            checkpoint = node.createflowmeshcheckpoint(market_id)
+            assert_equal(checkpoint["broadcast"], True)
         self.synchronize_mempools()
         self.mine_pos_blocks(1, allow_overshoot=True)
         self.wait_for_market_convergence(market_id)
@@ -399,7 +446,7 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
                     self.market_status(n0, market_id)["pending_checkpoint_sequence"] == 0,
             timeout=120,
         )
-        genesis_checkpoint = self.publish_checkpoint(market_id)
+        genesis_checkpoint = self.publish_checkpoint(market_id, prepare=True)
         assert_equal(genesis_checkpoint["sequence"], 0)
         assert_equal(genesis_checkpoint["effect_count"], 0)
 
@@ -494,8 +541,14 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
 
         self.log.info("Certified type-9 sweeps move both deposits into pool custody")
         custody_records = [asset_deposit, native_deposit]
-        for operation in deposit_operations:
-            sweep = n0.createflowmeshvaulttx(operation["effect_id"])
+        for index, operation in enumerate(deposit_operations):
+            if index == 0:
+                sweep = self.prepare_and_publish(
+                    n0, n0.createflowmeshvaulttx, operation["effect_id"], None,
+                )
+            else:
+                sweep = n0.createflowmeshvaulttx(operation["effect_id"])
+                assert_equal(sweep["broadcast"], True)
             assert_equal(sweep["operation"], "deposit-sweep")
             custody_records.append(sweep)
         self.synchronize_mempools()
@@ -514,6 +567,39 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
         assert_equal(self.custody(custody_records, "00" * 32, vault_id),
                      int(B3_DEPOSIT * 1_000_000_000))
 
+        self.log.info("A certified cancellation restores the standing bid's reserved B3")
+        buyer_before = n1.getflowmeshbalance(market_id)["account"]
+        temporary_notional = TRADE_NOTIONAL / 2
+        temporary_order = n1.submitflowmeshorder(
+            market_id, "bid", TRADE_PRICE // 2, TRADE_QUANTITY,
+        )
+        assert_equal(temporary_order["accepted"], True)
+        assert_equal(temporary_order["sequence"], buyer_before["next_sequence"])
+
+        def temporary_order_certified():
+            buyer = n1.getflowmeshbalance(market_id)["account"]
+            return (buyer["next_sequence"] == buyer_before["next_sequence"] + 1 and
+                    buyer["b3_available"] == B3_DEPOSIT - temporary_notional and
+                    buyer["b3_reserved"] == temporary_notional)
+
+        self.wait_until(temporary_order_certified, timeout=120)
+        self.wait_for_market_convergence(market_id)
+        cancellation = n1.cancelflowmeshorder(market_id, "bid")
+        assert_equal(cancellation["accepted"], True)
+        assert_equal(cancellation["sequence"], buyer_before["next_sequence"] + 1)
+
+        def cancellation_certified():
+            buyer = n1.getflowmeshbalance(market_id)["account"]
+            return (buyer["next_sequence"] == buyer_before["next_sequence"] + 2 and
+                    buyer["base_available"] == 0 and
+                    buyer["base_reserved"] == 0 and
+                    buyer["b3_available"] == B3_DEPOSIT and
+                    buyer["b3_reserved"] == Decimal("0"))
+
+        self.wait_until(cancellation_certified, timeout=120)
+        self.wait_for_market_convergence(market_id)
+        # The following trade checkpoints these two certified entries as well;
+        # no extra B3 blocks are needed just to observe order cancellation.
         self.log.info("One matched TEST_ASSET/B3 trade charges exactly 0.01% once")
         n1.submitflowmeshorder(
             market_id, "bid", TRADE_PRICE, TRADE_QUANTITY,
@@ -586,8 +672,11 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
             n0.get_deterministic_priv_key().address,
         )
         assert_equal(treasury_payout["operation"], "withdrawal")
+        assert_equal(treasury_payout["broadcast"], True)
         custody_records.append(treasury_payout)
-        payout = n0.createflowmeshvaulttx(receipt["effect_id"], payout_address)
+        payout = self.prepare_and_publish(
+            n0, n0.createflowmeshvaulttx, receipt["effect_id"], payout_address,
+        )
         assert_equal(payout["operation"], "withdrawal")
         custody_records.append(payout)
         self.synchronize_mempools()
