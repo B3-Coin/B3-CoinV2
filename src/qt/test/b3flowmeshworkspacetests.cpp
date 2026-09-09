@@ -8,6 +8,7 @@
 #include <util/translation.h>
 #include <QApplication>
 #include <QComboBox>
+#include <QDir>
 #include <QImage>
 #include <QLabel>
 #include <QLineEdit>
@@ -16,6 +17,7 @@
 #include <QTableWidget>
 #include <QTest>
 #include <QTimer>
+#include <array>
 #include <stdexcept>
 
 const TranslateFn G_TRANSLATION_FUN{nullptr};
@@ -79,6 +81,12 @@ private Q_SLOTS:
         QCOMPARE(s.own_curves.size(), size_t{1}); QCOMPARE(s.history.size(), size_t{1}); QCOMPARE(s.history[0].own_buy, CAmount{250'000});
         auto malformed{s.curves}; malformed[0].points.clear(); QVERIFY(Rejects([&] { Aggregate(malformed); }));
     }
+    void fundingSelectionCannotRelabelAnOrderQuantity()
+    {
+        B3FlowMeshTrading::Action a; const auto s{Parse(Data())}; a.market.id = s.market; a.market.base = s.base; a.market.account = s.account; a.market.has_account = true;
+        a.side = QStringLiteral("bid"); a.price = 1000; a.amount = 1'000'000; a.native = true; a.display_decimals = 6; a.display_ticker = QStringLiteral("tUSD");
+        const auto text{B3FlowMeshTrading::Describe(a)}; QVERIFY(text.contains(QStringLiteral("1 tUSD (1000000 atomic units)"))); QVERIFY(text.contains(QStringLiteral("1 B3 / tUSD")));
+    }
     void malformedOrUncertifiedRowsFailClosed()
     {
         auto v{Data()}; v.pushKV("matching_model", "price-time-book"); QVERIFY(Rejects([&] { Parse(v); }));
@@ -118,6 +126,28 @@ private Q_SLOTS:
         panel.m_price->setText(QStringLiteral("1")); panel.m_quantity->setText(QStringLiteral("1")); QVERIFY(panel.m_ticket_total->text().contains(QStringLiteral("1 B3"))); QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_deposit->isEnabled()); QVERIFY(!panel.m_advanced->isVisible());
         panel.m_read_failed = true; panel.updateMarketText(); QVERIFY(panel.m_status->text().contains(QStringLiteral("stale"))); QVERIFY(!panel.m_order->isEnabled());
         panel.setWalletModel(nullptr); QVERIFY(!panel.m_snapshot); QCOMPARE(panel.m_chart->pricePointCount(), 0); QCOMPARE(panel.m_history_view->rowCount(), 0); QVERIFY(!panel.m_order->isEnabled());
+    }
+    void exportOptInSyntheticVisualFixtures()
+    {
+        const QString directory{qEnvironmentVariable("FLOWMESH_UI_SNAPSHOT_DIR")};
+        if (directory.isEmpty()) QSKIP("Set FLOWMESH_UI_SNAPSHOT_DIR to export explicitly synthetic, walletless QA PNGs.");
+        QVERIFY(QDir::isAbsolutePath(directory)); QDir output{directory}; QVERIFY(output.mkpath(QStringLiteral(".")));
+        auto s{Parse(Data())}; s.next_sequence = 9; s.pending_actions = 2; s.history.clear();
+        for (int i{0}; i < 7; ++i) {
+            Trade t; t.sequence = i + 2; t.hash = QString::fromStdString(H(30 + i).GetHex()); t.epoch = 0; t.anchor_height = 50; t.cleared = true; t.price = 1000 + std::array<int, 7>{0, 4, 2, 6, 3, 7, 9}[i]; t.quantity = 100'000 + i * 25'000; t.notional = t.price * t.quantity; t.fee = *FeeExample(t.notional); t.own_fills_known = true; t.own_buy = i % 2 ? 0 : t.quantity / 2; t.own_sell = 0; s.history.push_back(t);
+        }
+        B3FlowMeshTradingPanel panel; panel.resize(1320, 940); panel.m_timer->stop();
+        B3FlowMeshTrading::Market m; m.id = s.market; m.base = s.base; m.domain = s.domain; m.config = s.config; m.vault = QString::fromStdString(flowmesh::ComputeFlowMeshVaultId(H(1), *uint256::FromHex(s.market.toStdString()))->GetHex()); m.account = s.account; m.has_account = true; m.ready = true; m.publish_ready = true; m.sequence = s.account_sequence; m.base_available = s.base_available; m.b3_available = s.b3_available;
+        panel.m_market_data = {m}; { QSignalBlocker block{panel.m_market}; panel.m_market->addItem(QStringLiteral("tUSD / B3 — SYNTHETIC QA"), m.id); }
+        panel.m_wallet_name = QStringLiteral("SYNTHETIC QA · no wallet / no signing"); panel.m_snapshot = s; panel.m_response_age.start(); panel.m_certificate_age.start(); panel.m_pending_market = s.market; panel.m_pending_account = s.account; panel.m_pending_sequence = s.account_sequence;
+        panel.m_price->setText(QStringLiteral("1.009")); panel.m_quantity->setText(QStringLiteral("0.25")); panel.updateDataViews(); panel.updateMarketText(); panel.show(); QCoreApplication::processEvents();
+        const auto save = [&](const QString& name) { QImage image{panel.size(), QImage::Format_ARGB32}; image.fill(Qt::transparent); panel.render(&image); return image.save(output.filePath(name)); };
+        QVERIFY(save(QStringLiteral("synthetic-flowmesh-pending.png")));
+        panel.m_chart->setMode(B3FlowMeshChart::Mode::Liquidity); QVERIFY(save(QStringLiteral("synthetic-flowmesh-liquidity.png")));
+        panel.m_snapshot->paused = true; panel.m_market_data[0].ready = false; panel.m_market_data[0].checkpoint_pending = true; panel.m_market_data[0].checkpoint = QString::fromStdString(H(80).GetHex()); panel.updateMarketText();
+        QVERIFY(save(QStringLiteral("synthetic-flowmesh-paused.png")));
+        panel.m_read_failed = true; panel.updateMarketText(); QVERIFY(save(QStringLiteral("synthetic-flowmesh-stale.png")));
+        panel.hide(); QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_wallet); // Fixture cannot submit.
     }
 };
 int main(int argc, char** argv) { QApplication app{argc, argv}; B3Theme::apply(app); B3FlowMeshWorkspaceTests tests; return QTest::qExec(&tests, argc, argv); }
