@@ -90,14 +90,14 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         connect(button, &QPushButton::clicked, this, [this, mode] { m_chart->setMode(mode.second); });
     }
     chart_modes->addStretch(); chart_layout->addLayout(chart_modes); m_chart = new B3FlowMeshChart{chart_card}; chart_layout->addWidget(m_chart, 1);
-    auto* chart_note{Label(tr("Certified sequence, not wall-clock candles. Each point is a real clearing; idle intervals are not filled in."), chart_card)}; B3Theme::markTextRole(chart_note, QStringLiteral("secondary")); chart_layout->addWidget(chart_note);
+    m_chart->setToolTip(tr("Each price point is a real certified clearing, indexed by microblock sequence—not an invented timestamp. Idle intervals are not filled in. Liquidity lines are a display guide through exact evaluated samples."));
     const auto table = [](QWidget* parent, const QStringList& headers, const char* name) {
         auto* view{new QTableWidget{parent}}; view->setObjectName(QLatin1String(name)); view->setColumnCount(headers.size()); view->setHorizontalHeaderLabels(headers); view->verticalHeader()->hide(); view->setShowGrid(false); view->setAlternatingRowColors(false); view->setEditTriggers(QAbstractItemView::NoEditTriggers); view->setSelectionMode(QAbstractItemView::NoSelection); view->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch); view->setMinimumWidth(220); return view;
     };
     auto* liquidity_card{new QWidget{center}}; B3Theme::markCard(liquidity_card); auto* liquidity_layout{new QVBoxLayout{liquidity_card}};
-    auto* liquidity_title{Label(tr("Auction liquidity"), liquidity_card)}; B3Theme::markTextRole(liquidity_title, QStringLiteral("h3")); liquidity_layout->addWidget(liquidity_title);
-    m_depth_view = table(liquidity_card, {tr("B3 / token"), tr("Demand"), tr("Supply")}, "flowMeshCurveDepth"); liquidity_layout->addWidget(m_depth_view, 1);
-    m_liquidity_note = Label(tr("No certified curves yet. This is not a price-time order book."), liquidity_card); B3Theme::markTextRole(m_liquidity_note, QStringLiteral("secondary")); liquidity_layout->addWidget(m_liquidity_note);
+    auto* liquidity_title{Label(tr("Auction liquidity"), liquidity_card)}; liquidity_title->setObjectName(QStringLiteral("flowMeshLiquidityTitle")); B3Theme::markTextRole(liquidity_title, QStringLiteral("h3")); liquidity_layout->addWidget(liquidity_title);
+    m_depth_view = table(liquidity_card, {tr("Price"), tr("Demand"), tr("Supply")}, "flowMeshCurveDepth"); liquidity_layout->addWidget(m_depth_view, 1);
+    m_liquidity_note = Label(tr("No certified curves yet."), liquidity_card); B3Theme::markTextRole(m_liquidity_note, QStringLiteral("secondary")); liquidity_layout->addWidget(m_liquidity_note);
     auto* ticket_card{new QWidget{center}}; ticket_card->setMinimumWidth(250); B3Theme::markCard(ticket_card); auto* ticket{new QVBoxLayout{ticket_card}};
     auto* sides{new QHBoxLayout}; auto* side_group{new QButtonGroup{ticket_card}};
     m_buy = new QPushButton{tr("Buy"), ticket_card}; m_sell = new QPushButton{tr("Sell"), ticket_card};
@@ -110,16 +110,17 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     m_quantity_label = Label(tr("Quantity · token"), ticket_card); ticket->addWidget(m_quantity_label); m_quantity = entry("flowMeshRawQuantity", 64); m_quantity->setPlaceholderText(tr("Enter quantity")); ticket->addWidget(m_quantity);
     m_grid_note = Label(tr("Token units will be verified from asset metadata."), ticket_card); B3Theme::markTextRole(m_grid_note, QStringLiteral("secondary")); ticket->addWidget(m_grid_note);
     m_ticket_available = Label(tr("Available  —"), ticket_card); ticket->addWidget(m_ticket_available); m_ticket_total = Label(tr("Limit notional  —"), ticket_card); ticket->addWidget(m_ticket_total);
-    m_ticket_fee = Label(tr("Spot fee · 0.01% of matched B3 notional"), ticket_card); B3Theme::markTextRole(m_ticket_fee, QStringLiteral("secondary")); ticket->addWidget(m_ticket_fee);
+    m_ticket_fee = Label(tr("Spot fee 0.01% · seller-paid"), ticket_card); B3Theme::markTextRole(m_ticket_fee, QStringLiteral("secondary")); ticket->addWidget(m_ticket_fee);
     m_order = new QPushButton{tr("Review buy order…"), ticket_card}; m_order->setObjectName(QStringLiteral("flowMeshSubmitOrder")); ticket->addWidget(m_order);
-    ticket->addWidget(Label(tr("A limit intent becomes a persistent curve. Matching happens at one uniform clearing price; an accepted request is not a fill."), ticket_card)); ticket->addStretch();
+    auto* order_note{Label(tr("One order per side. A new order replaces that side."), ticket_card)};
+    order_note->setToolTip(tr("A limit intent becomes a persistent demand or supply curve. Each certified microblock matches at one uniform clearing price, without price-time priority. An accepted request is not a fill.")); ticket->addWidget(order_note); ticket->addStretch();
     center->addWidget(chart_card); center->addWidget(liquidity_card); center->addWidget(ticket_card); center->setStretchFactor(0, 6); center->setStretchFactor(1, 3); center->setStretchFactor(2, 3); center->setSizes({600, 290, 300}); layout->addWidget(center, 1);
     m_activity = new QTabWidget{content}; m_activity->setMinimumHeight(220);
     auto* own{new QWidget{m_activity}}; auto* own_layout{new QVBoxLayout{own}}; m_own_note = Label(tr("No wallet curves loaded."), own); own_layout->addWidget(m_own_note); m_own_view = table(own, {tr("Side"), tr("Limit / curve"), tr("Remaining"), tr("Reserved")}, "flowMeshOwnCurves"); own_layout->addWidget(m_own_view);
-    m_balances = Label(tr("Certified balances will appear here."), own); own_layout->addWidget(m_balances); m_cancel_order = new QPushButton{tr("Cancel selected Buy / Sell side…"), own}; own_layout->addWidget(m_cancel_order); m_activity->addTab(own, tr("Your curves & balances"));
+    m_balances = Label(tr("Certified balances will appear here."), own); own_layout->addWidget(m_balances); m_cancel_order = new QPushButton{tr("Cancel selected Buy / Sell side…"), own}; own_layout->addWidget(m_cancel_order); m_activity->addTab(own, tr("Your orders"));
     auto* history_page{new QWidget{m_activity}}; auto* history_layout{new QVBoxLayout{history_page}}; m_history_note = Label(tr("No certified market history loaded."), history_page); history_layout->addWidget(m_history_note); m_history_view = table(history_page, {tr("Microblock"), tr("B3 / token"), tr("Matched"), tr("Your buy"), tr("Your sell")}, "flowMeshCertifiedFills"); history_layout->addWidget(m_history_view); m_activity->addTab(history_page, tr("Certified trades"));
     m_log = new QPlainTextEdit{m_activity}; m_log->setObjectName(QStringLiteral("flowMeshOperationLog")); m_log->setReadOnly(true); m_log->setMaximumBlockCount(100); m_activity->addTab(m_log, tr("Activity")); layout->addWidget(m_activity);
-    auto* advanced_toggle{new QPushButton{tr("Advanced settlement & market details"), content}}; advanced_toggle->setCheckable(true); layout->addWidget(advanced_toggle);
+    auto* advanced_toggle{new QPushButton{tr("Advanced settlement and market details"), content}}; advanced_toggle->setCheckable(true); layout->addWidget(advanced_toggle);
     m_advanced = new QWidget{content}; B3Theme::markCard(m_advanced); auto* settlement{new QVBoxLayout{m_advanced}};
     m_identity_detail = Label(tr("Full market identity will appear after a verified snapshot."), m_advanced); settlement->addWidget(m_identity_detail);
     settlement->addWidget(Label(tr("Operator tools: publish certified checkpoints and connected sweeps/payouts. Each transaction requires a separate B3-fee review; nothing is automatically broadcast."), m_advanced));
@@ -224,15 +225,22 @@ void B3FlowMeshTradingPanel::updateDataViews()
     const auto selected{market()}; const bool matched{selected && m_snapshot && selected->id == m_snapshot->market};
     m_chart->setSnapshot(matched ? m_snapshot : std::nullopt); m_chart->setLoading(m_loading);
     for (auto* table : {m_depth_view, m_history_view, m_own_view}) table->setRowCount(0);
+    if (auto* title{m_depth_view->parentWidget()->findChild<QLabel*>(QStringLiteral("flowMeshLiquidityTitle"))}) title->setText(tr("Auction liquidity"));
+    for (int column : {0, 1, 2}) m_depth_view->horizontalHeaderItem(column)->setToolTip(QString{});
     m_history_note->setText(tr("No certified trades loaded. No synthetic fills or timestamps are displayed.")); m_own_note->setText(tr("No certified standing curves for this wallet."));
     if (!matched || !m_snapshot->units.known) { m_last_price->setText(tr("Last clearing price  —")); m_liquidity_note->setText(matched ? tr("Verified token precision unavailable. Values are not guessed from the ticker.") : tr("No certified liquidity loaded. Demand and supply will appear after actual orders are certified.")); return; }
     const auto& s{*m_snapshot}; const auto& u{s.units};
     m_history_note->setText(!s.history_available ? tr("This node has no retained certified history. Empty is not a claim that trading never occurred.") : s.history_truncated ? tr("Recent certified history only; older records fall outside this node's bounded cache. A dash means your fill quantity is unknown.") : s.history_page_partial ? tr("Latest 100 certified microblocks; older retained records are outside this displayed window. A dash means your fill quantity is unknown.") : tr("Actual certified clearings. A dash means this node cannot identify your fill quantity, not that it was zero."));
-    if (!s.own_curves.empty()) m_own_note->setText(tr("Persistent certified curves, one per Buy/Sell side. Replacing a side changes that entire curve; there is no time-priority queue."));
+    if (!s.own_curves.empty()) m_own_note->setText(tr("Certified orders · one Buy and one Sell side."));
+    m_own_note->setToolTip(tr("Orders are persistent certified curves. Replacing a side changes that entire curve; there is no price-time priority queue."));
     const auto row = [](QTableWidget* table, const QStringList& cells) { const int r{table->rowCount()}; table->insertRow(r); for (int c{0}; c < cells.size(); ++c) { auto* item{new QTableWidgetItem{cells[c]}}; item->setTextAlignment(c == 0 ? Qt::AlignLeft | Qt::AlignVCenter : Qt::AlignRight | Qt::AlignVCenter); table->setItem(r, c, item); } };
     for (const auto& d : s.depth) row(m_depth_view, {FormatPrice(d.price, u.decimals), FormatAmount(d.demand, u.decimals), FormatAmount(d.supply, u.decimals)});
-    m_depth_view->setHorizontalHeaderLabels({tr("B3 / %1").arg(u.ticker), tr("Demand · %1").arg(u.ticker), tr("Supply · %1").arg(u.ticker)});
-    m_liquidity_note->setText(s.curves.empty() ? tr("No standing curves. Orders become visible only after certification.") : s.curves_complete ? tr("Complete certified demand/supply curves. Quantities are evaluated at each price, not cumulative order-book levels.") : tr("Partial page of certified curves. Chart and table show only this page, not total market liquidity."));
+    m_depth_view->setHorizontalHeaderLabels({tr("Price"), tr("Demand"), tr("Supply")});
+    m_depth_view->horizontalHeaderItem(0)->setToolTip(tr("Price in B3 per %1").arg(u.ticker));
+    for (int column : {1, 2}) m_depth_view->horizontalHeaderItem(column)->setToolTip(tr("Quantity in %1, evaluated at this price").arg(u.ticker));
+    if (auto* title{m_depth_view->parentWidget()->findChild<QLabel*>(QStringLiteral("flowMeshLiquidityTitle"))}) title->setText(tr("Liquidity · %1").arg(u.ticker));
+    m_liquidity_note->setText(s.curves.empty() ? tr("No certified orders yet.") : s.curves_complete ? tr("Certified curves · price in B3/%1").arg(u.ticker) : tr("Partial curve page · not total liquidity"));
+    m_liquidity_note->setToolTip(tr("Price is B3 per %1; demand and supply are quantities of %1. Each quantity is evaluated at that price, not added as a cumulative order-book level. Only certified curves are shown.").arg(u.ticker));
     m_last_price->setText(tr("Last clearing price  —"));
     for (auto it{s.history.rbegin()}; it != s.history.rend(); ++it) {
         if (!it->cleared || it->quantity == 0) continue;
@@ -255,15 +263,17 @@ void B3FlowMeshTradingPanel::updateTicket()
     const QString ticker{units_known ? m_snapshot->units.ticker : tr("token")}; const bool buy{m_side->currentIndex() == 0};
     m_price_label->setText(tr("Limit price · B3 / %1").arg(ticker)); m_quantity_label->setText(tr("Quantity · %1").arg(ticker));
     m_order->setText(buy ? tr("Review buy order…") : tr("Review sell order…")); m_cancel_order->setText(buy ? tr("Cancel your standing Buy curve…") : tr("Cancel your standing Sell curve…"));
-    m_ticket_total->setText(tr("Limit notional  —")); m_ticket_fee->setText(tr("Spot fee · 0.01% of matched B3 notional"));
-    if (!units_known) { m_grid_note->setText(tr("Verified asset precision required; no raw-unit guessing.")); m_ticket_available->setText(tr("Available  —")); return; }
-    const auto& u{m_snapshot->units}; m_grid_note->setText(tr("Quantity step %1 %2 · price step %3 B3/%2. Inputs are never rounded.").arg(FormatAmount(u.quantity_step, u.decimals), ticker, FormatPrice(u.price_step, u.decimals)));
+    m_ticket_total->setText(tr("Limit notional  —")); m_ticket_fee->setText(tr("Spot fee 0.01% · seller-paid"));
+    m_ticket_fee->setToolTip(tr("The protocol fee is 0.01% of matched B3 notional, deducted from seller proceeds. Actual fees and allocation depend on certified fills. Submitting an order has no network fee."));
+    if (!units_known) { m_grid_note->setText(tr("Verified asset precision required; no raw-unit guessing.")); m_grid_note->setToolTip(QString{}); m_ticket_available->setText(tr("Available  —")); return; }
+    const auto& u{m_snapshot->units}; m_grid_note->setText(tr("Steps: %1 %2 · %3 B3").arg(FormatAmount(u.quantity_step, u.decimals), ticker, FormatPrice(u.price_step, u.decimals)));
+    m_grid_note->setToolTip(tr("Quantity step %1 %2; price step %3 B3 per %2. Inputs are exact and never rounded.").arg(FormatAmount(u.quantity_step, u.decimals), ticker, FormatPrice(u.price_step, u.decimals)));
     m_ticket_available->setText(tr("Available  %1 %2").arg(FormatAmount(buy ? selected->b3_available : selected->base_available, buy ? 9 : u.decimals), buy ? QStringLiteral("B3") : ticker));
     QString error; const auto price{ParsePrice(m_price->text(), u, &error)}, quantity{ParseQuantity(m_quantity->text(), u, &error)};
     if (!price || !quantity) return;
     const auto total{Notional(*price, *quantity)}; if (!total) { m_ticket_total->setText(tr("Notional exceeds the supported range")); return; }
     m_ticket_total->setText(tr("Limit notional  %1 B3").arg(FormatAmount(*total, 9)));
-    m_ticket_fee->setText(tr("Protocol fee: 0.01%, deducted from seller proceeds. Whole-auction example at this notional: %1 B3. Your final share depends on certified fills; submitting an order has no network fee.").arg(FormatAmount(*FeeExample(*total), 9)));
+    m_ticket_fee->setToolTip(tr("Protocol fee: 0.01%, deducted from seller proceeds. Whole-auction example at this notional: %1 B3. Your final share depends on certified fills; submitting an order has no network fee.").arg(FormatAmount(*FeeExample(*total), 9)));
 }
 
 void B3FlowMeshTradingPanel::openFunding(bool withdrawal)
