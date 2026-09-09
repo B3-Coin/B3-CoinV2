@@ -2,14 +2,15 @@
 
 Date: 2026-09-10.
 
-Status: **proposal, not an implemented production fix**. The separate honest
-lock-split regression described below has been authored in the runtime unit
-suite; executable qualification is pending. This document does not identify the
-cause of the observed live stall or authorize a protocol change.
+Status: **narrow local relay implementation and focused regressions added;
+executable qualification of this increment is pending**. The proposal was
+approved for this bounded implementation. No early-attestation cache or
+protocol-level lock-recovery change is included. This document does not identify
+the cause of the observed live stall or claim that conflicting locks recover.
 
 ## Scope and existing behavior
 
-The proposed change is a local relay-reliability policy only. Keep the existing
+The implemented change is a local relay-reliability policy only. Keep the existing
 wire format, action authentication, auction matching, proposer schedule, quorum,
 anchor checks, certificate finality and permanent signing journal unchanged.
 The binding decisions are O-9a/O-9b in
@@ -27,9 +28,11 @@ Relevant current paths:
   with credentials stripped. Before voting, a receiver must match each body to
   separately received authenticated evidence. Missing evidence rejects the
   proposal without voting.
-- `MaybePropose`: reuses the permanently locked candidate across rounds. Its
-  existing `reannounce_evidence` path broadcasts evidence once after restoring
-  a retained candidate on restart, not periodically during an ordinary stall.
+- `MaybePropose`: reuses the permanently locked candidate across rounds. Before
+  this change, `reannounce_evidence` broadcast evidence once after restoring a
+  retained candidate on restart, not periodically during an ordinary stall.
+  `RetryRetainedEvidence` now handles both restored and newly retained evidence
+  under the same budget, without changing the proposal or signing path.
 - `HandleAttestation`: a frame arriving before a matching candidate is not a
   verified vote and is discarded. Cached-vote replies on later proposals help
   recover lost votes, but are separate from missing action evidence.
@@ -47,7 +50,7 @@ share a distinct 8/s, burst-32 committee bucket. Loss, early arrival, local roun
 skew, and conflicting signer locks must be distinguished using observations on
 the actual signer nodes. An unhalted observer does not prove unhalted signers.
 
-## Smallest proposed retry policy
+## Implemented retry policy
 
 Reuse the exact `Candidate::evidence` vector already retained before signing.
 Do not regenerate credentials, select a fresh action set, rebuild an entry,
@@ -74,7 +77,7 @@ change its anchor, or create a new signing position in the retry path.
    certified advancement; never carry it into another sequence. Halted markets
    do not retry. Missing keys or a nonlocal current proposer defer the sweep.
 
-Proposed initial limits, all local policy:
+Implemented initial limits, all local policy:
 
 | Resource | Limit |
 | --- | --- |
@@ -103,13 +106,13 @@ guarantee that a busy receiver will admit every retry.
 Do not lift existing receiver pool limits. A peer may hold at most 256 admitted
 actions per originating peer/market; a maximum 1,024-action candidate cannot
 necessarily be reconstructed from a single retransmitting source if the
-receiver missed all its evidence. The proposal improves loss recovery for
+receiver missed all its evidence. The implementation improves loss recovery for
 admissible missing evidence, not arbitrary-state transfer or guaranteed
 sub-second certification of maximum-size candidates.
 
-## Required evidence-loss regression
+## Evidence-loss regression
 
-Proposed test name:
+Implemented test name:
 `dropped_action_evidence_retries_exact_locked_candidate`.
 
 Use the existing real runtime/store fixtures, deterministic clocks, and a
@@ -146,12 +149,28 @@ Transport schedule and assertions:
    Assert no extra execution, no duplicate account-sequence consumption, and
    no retry cursor surviving into the next microblock.
 
-Add focused pacing variants: repeated ticks at one timestamp; a vector larger
-than one chunk; a maximum-size action; two or more markets requiring fair
-rotation; restart with retained evidence; reconciliation suppression followed
-by recovery; and halt/epoch/sequence changes. Assert emitted count and framed
-bytes, not wall-clock throughput. Existing wire admission limits remain in
-force in every variant.
+Additional implemented coverage:
+
+- `evidence_retry_budget_bounds_count_bytes_and_clock`: full 4-KiB wire-limit
+  arithmetic including headers, count versus byte exhaustion, same-time ticks,
+  a backwards clock sample, and no accumulated capacity after a long gap.
+- `evidence_retry_rotates_markets_and_preserves_pacing_gates`: two markets with
+  20 signed actions each, eight-point production-maximum curves, global batch
+  count/bytes, alternating chunks while the first market still has a backlog,
+  complete-sweep delay, suppressed relay consuming its budget followed by a
+  later exact-payload sweep, pause, missing key, non-proposer key, and anchor halt.
+- `action_bearing_signing_lock_resumes_after_restart`: existing real durable
+  restart/replay case now allows the ordinary next proposal tick after evidence
+  is queued by the paced scheduler.
+- The loss-recovery case checks the old-sequence frame after commit and that
+  no evidence cursor follows the committed candidate into the next sequence.
+
+The 4-KiB limit is exercised as budget arithmetic, not by manufacturing an
+invalid authenticated v1 action: v1 itself limits curves to eight points.
+Epoch/handoff behavior continues to be covered by the existing runtime suite;
+no additional epoch-transition loss-injection scenario is claimed here.
+Assertions measure frames and bytes, not wall-clock throughput. Existing wire
+admission limits are unchanged.
 
 An early-attestation cache is explicitly a separate proposal. It would require
 global/per-peer/per-position count and byte bounds, TTL and deduplication, with

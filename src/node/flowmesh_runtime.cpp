@@ -261,7 +261,11 @@ struct FlowMeshRuntime::Market {
         flowmesh::FlowMeshState next_state;
         std::optional<flowmesh::ActiveFnBlsSeatSet> next_seats;
         std::vector<flowmesh::Action> evidence;
-        bool reannounce_evidence{false};
+    };
+    struct EvidenceRetry {
+        uint256 candidate_hash;
+        size_t cursor{0};
+        flowmesh::WireClock::time_point next_sweep{};
     };
 
     uint256 domain;
@@ -299,6 +303,8 @@ struct FlowMeshRuntime::Market {
     std::optional<flowmesh::WireClock::time_point> last_announcement;
     flowmesh::WireClock::time_point next_announcement{};
     flowmesh::MarketDataRuntimeDiagnostics diagnostics;
+    std::optional<EvidenceRetry> evidence_retry;
+    bool evidence_retry_eligible{false};
 
     Market(const FlowMeshRuntimeMarketConfig& config,
            FlowMeshRuntimeConfig& runtime_config)
@@ -653,6 +659,11 @@ bool RetainCandidateBeforeSigning(Market& market,
     if (result == flowmesh::ProductionLockResult::LOCKED ||
         result == flowmesh::ProductionLockResult::ALREADY_LOCKED_SAME) {
         market.diagnostics.local_locked_candidate = candidate.entry.GetHash();
+        if (!market.evidence_retry && !candidate.evidence.empty()) {
+            market.evidence_retry = typename Market::EvidenceRetry{
+                candidate.entry.GetHash(), 0,
+                market.clock->Now() + FlowMeshEvidenceRetryBudget::INTERVAL};
+        }
         return true;
     }
     HaltMarket(market, FlowMeshRuntimeHalt::SIGNING_CONFLICT,
@@ -720,6 +731,8 @@ bool CommitCertified(Market& market,
     market.candidates.clear();
     market.attestations.clear();
     market.attested_hash_by_seat.clear();
+    market.evidence_retry.reset();
+    market.evidence_retry_eligible = false;
     const auto last_message_observed_at{market.diagnostics.last_message_observed_at};
     market.diagnostics = {};
     market.diagnostics.last_message_observed_at = last_message_observed_at;
@@ -912,7 +925,10 @@ bool FlowMeshRuntime::InitializeMarket(
                         : market->error;
             return false;
         }
-        candidate->reannounce_evidence = true;
+        if (!candidate->evidence.empty()) {
+            market->evidence_retry = Market::EvidenceRetry{
+                candidate->entry.GetHash(), 0, market->clock->Now()};
+        }
         market->diagnostics.local_locked_candidate = candidate->entry.GetHash();
         market->candidates.emplace(candidate->entry.GetHash(),
                                    std::move(*candidate));
@@ -931,6 +947,8 @@ bool FlowMeshRuntime::Start(std::string& error)
         m_admitted_markets.clear();
         m_probe_markets.clear();
         m_peer_probe_cursors.clear();
+        m_evidence_retry_budget = {};
+        m_evidence_retry_cursor.SetNull();
         for (const auto& [market_id, market] : m_markets) {
             if (market->ready) {
                 m_admitted_markets.insert(market_id);
@@ -1404,6 +1422,7 @@ void FlowMeshRuntime::ProcessTick()
     for (auto& [market_id, market_ptr] : m_markets) {
         (void)market_id;
         Market& market{*market_ptr};
+        market.evidence_retry_eligible = false;
         if (!RefreshMarker(market)) continue;
         const auto now{market.clock->Now()};
         if (!market.pending_handoff &&
@@ -1417,6 +1436,52 @@ void FlowMeshRuntime::ProcessTick()
             market.round_started = now;
         }
         MaybePropose(market);
+    }
+    RetryRetainedEvidence();
+}
+
+void FlowMeshRuntime::RetryRetainedEvidence()
+{
+    const auto now{m_config.clock->Now()};
+    if (m_markets.empty() || !m_evidence_retry_budget.Begin(now)) return;
+    auto it{m_markets.upper_bound(m_evidence_retry_cursor)};
+    for (size_t scanned{0};
+         scanned < std::min(m_markets.size(), FlowMeshEvidenceRetryBudget::MAX_MARKETS_SCANNED) &&
+         !m_evidence_retry_budget.Full(); ++scanned) {
+        if (it == m_markets.end()) it = m_markets.begin();
+        Market& market{*it->second};
+        m_evidence_retry_cursor = it->first;
+        ++it;
+        if (!market.evidence_retry_eligible || !market.evidence_retry ||
+            market.halt != FlowMeshRuntimeHalt::NONE || market.pending_handoff ||
+            now < market.evidence_retry->next_sweep) continue;
+        auto& retry{*market.evidence_retry};
+        const auto found{market.candidates.find(retry.candidate_hash)};
+        if (found == market.candidates.end()) continue;
+        const auto& candidate{found->second};
+        if (candidate.entry.epoch != market.seats.epoch ||
+            candidate.entry.sequence != market.next_sequence) continue;
+        while (retry.cursor < candidate.evidence.size() && !m_evidence_retry_budget.Full()) {
+            const auto payload{flowmesh::EncodeProductionActionPayload(candidate.evidence[retry.cursor])};
+            if (!payload) {
+                HaltMarket(market, FlowMeshRuntimeHalt::STORE_FAILURE,
+                           "retained FlowMesh action evidence is not encodable");
+                break;
+            }
+            if (!m_evidence_retry_budget.Consume(flowmesh::FLOWMESH_WIRE_HEADER_SIZE + payload->size())) break;
+            flowmesh::WireMessage evidence;
+            evidence.kind = flowmesh::WireMessageKind::ACTION;
+            evidence.header = HeaderFor(candidate.entry);
+            evidence.payload = *payload;
+            // Charge attempted delivery even when service reconciliation
+            // suppresses relay. Only a later paced sweep may retry it.
+            RelayMessage(market, std::move(evidence), std::nullopt, std::nullopt);
+            ++retry.cursor;
+        }
+        if (retry.cursor == candidate.evidence.size()) {
+            retry.cursor = 0;
+            retry.next_sweep = now + FlowMeshEvidenceRetryBudget::SWEEP_DELAY;
+        }
     }
 }
 
@@ -1721,25 +1786,11 @@ void FlowMeshRuntime::MaybePropose(Market& market)
 
     if (!RetainCandidateBeforeSigning(market, *candidate)) return;
 
-    if (candidate->reannounce_evidence) {
-        for (const flowmesh::Action& action : candidate->evidence) {
-            const auto payload{flowmesh::EncodeProductionActionPayload(action)};
-            if (!payload) {
-                HaltMarket(market, FlowMeshRuntimeHalt::STORE_FAILURE,
-                           "retained FlowMesh action evidence is not encodable");
-                return;
-            }
-            flowmesh::WireMessage evidence;
-            evidence.kind = flowmesh::WireMessageKind::ACTION;
-            evidence.header = {flowmesh::FLOWMESH_WIRE_VERSION_V1,
-                               market.market_id, market.seats.epoch,
-                               market.next_sequence};
-            evidence.payload = *payload;
-            RelayMessage(market, std::move(evidence), std::nullopt,
-                         std::nullopt);
-        }
-        candidate->reannounce_evidence = false;
-    }
+    // Eligibility is sampled only through the normal proposer gates on this
+    // tick. The separate bounded scheduler never chooses/signs a candidate.
+    market.evidence_retry_eligible =
+        transition->kind == FlowMeshSeatTransitionKind::CONTINUE &&
+        market.chain->Acceptable(candidate->entry.anchor);
 
     flowmesh::ProductionSigningGuard guard{*market.store};
     flowmesh::ProductionProposalCheck check;

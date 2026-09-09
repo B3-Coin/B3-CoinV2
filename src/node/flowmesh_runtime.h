@@ -208,6 +208,39 @@ struct FlowMeshRuntimeMarketStatus {
     std::string error;
 };
 
+/** Memory-only relay policy, independent of consensus and signing. */
+class FlowMeshEvidenceRetryBudget
+{
+public:
+    static constexpr size_t MAX_MESSAGES{8};
+    static constexpr size_t MAX_BYTES{32 * 1024};
+    static constexpr size_t MAX_MARKETS_SCANNED{16};
+    static constexpr auto INTERVAL{std::chrono::milliseconds{250}};
+    static constexpr auto SWEEP_DELAY{std::chrono::seconds{1}};
+
+    bool Begin(flowmesh::WireClock::time_point now)
+    {
+        if (now < m_next) return false;
+        m_next = now + INTERVAL;
+        m_messages = MAX_MESSAGES;
+        m_bytes = MAX_BYTES;
+        return true;
+    }
+    bool Consume(size_t framed_bytes)
+    {
+        if (m_messages == 0 || framed_bytes > m_bytes) return false;
+        --m_messages;
+        m_bytes -= framed_bytes;
+        return true;
+    }
+    bool Full() const { return m_messages == 0 || m_bytes == 0; }
+
+private:
+    flowmesh::WireClock::time_point m_next{};
+    size_t m_messages{0};
+    size_t m_bytes{0};
+};
+
 /**
  * Production FlowMesh orchestration core.
  *
@@ -297,6 +330,7 @@ private:
     void WorkerLoop();
     void ProcessMessage(const flowmesh::QueuedWireMessage& queued);
     void ProcessTick();
+    void RetryRetainedEvidence();
     void AnnounceMarkets(bool refresh);
     void ProbeLegacyPeers(const std::vector<flowmesh::WirePeerId>& peers);
     bool TryRequestCatchup(Market& market, flowmesh::WirePeerId peer);
@@ -367,6 +401,8 @@ private:
     std::map<flowmesh::WirePeerId, size_t> m_peer_probe_cursors;
     flowmesh::WirePeerId m_probe_peer_cursor{0};
     flowmesh::WireClock::time_point m_next_legacy_probe{};
+    FlowMeshEvidenceRetryBudget m_evidence_retry_budget;
+    flowmesh::MarketId m_evidence_retry_cursor;
 };
 
 } // namespace node
