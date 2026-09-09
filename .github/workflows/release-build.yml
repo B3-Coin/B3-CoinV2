@@ -470,7 +470,9 @@ jobs:
             -type f -name '*.qm' -exec cp {} "$app/Contents/Resources/" \;
           macdeployqt="$(brew --prefix qt@6)/bin/macdeployqt"
           test -x "$macdeployqt"
-          "$macdeployqt" "$app" -verbose=2 -always-overwrite
+          "$macdeployqt" "$app" -verbose=2 -always-overwrite \
+            -libpath="$(brew --prefix)/lib"
+          ruby contrib/macdeploy/normalize_bundled_libraries.rb "$app"
           codesign --deep --force --sign - "$app"
           ditto -c -k --sequesterRsrc --keepParent "$app" build/b3coin-macos-app-complete.zip
           mv build/b3coin-macos-app-complete.zip build/b3coin-macos-app.zip
@@ -578,7 +580,9 @@ jobs:
             -type f -name '*.qm' -exec cp {} "$app/Contents/Resources/" \;
           macdeployqt="$(brew --prefix qt@6)/bin/macdeployqt"
           test -x "$macdeployqt"
-          "$macdeployqt" "$app" -verbose=2 -always-overwrite
+          "$macdeployqt" "$app" -verbose=2 -always-overwrite \
+            -libpath="$(brew --prefix)/lib"
+          ruby contrib/macdeploy/normalize_bundled_libraries.rb "$app"
           codesign --deep --force --sign - "$app"
           ditto -c -k --sequesterRsrc --keepParent "$app" build/b3coin-macos-app-complete.zip
           mv build/b3coin-macos-app-complete.zip build/b3coin-macos-app.zip
