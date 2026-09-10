@@ -181,6 +181,10 @@ QPushButton[b3variant="timeframe"] {
 QPushButton[b3variant="timeframe"]:checked {
     background: %ACCENTMUTED%; color: %ACCENT%; border-color: #4c4021;
 }
+/* Stable, explicit side selection on the compact FlowMesh ticket. */
+#flowMeshBuy:checked { background: #183a2d; color: %POSITIVE%; border-color: %POSITIVE%; }
+#flowMeshSell:checked { background: #3b2426; color: %NEGATIVE%; border-color: %NEGATIVE%; }
+#flowMeshBuy:disabled, #flowMeshSell:disabled { color: %MUTED%; border-color: %BORDER%; }
 
 /* Legacy dialogs and the QWidget-based RPC console have icon-only actions.
    Scope these surfaces so the custom sidebar keeps its own style, including

@@ -22,6 +22,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QSplitter>
 #include <QSignalBlocker>
 #include <QTableWidget>
@@ -51,6 +52,43 @@ QString RpcError(const UniValue& error) {
     const auto& message{error.find_value("message")};
     return error.isObject() && message.isStr() ? QString::fromStdString(message.get_str()).left(500) : QStringLiteral("FlowMesh RPC failed.");
 }
+// Keep the model and its existing items alive during background updates.
+// Identical data must not reset selection, scroll position or widget geometry.
+void SetRows(QTableWidget* table, const std::vector<QStringList>& rows)
+{
+    const int scroll{table->verticalScrollBar()->value()};
+    if (table->rowCount() != static_cast<int>(rows.size())) table->setRowCount(static_cast<int>(rows.size()));
+    for (int r{0}; r < static_cast<int>(rows.size()); ++r) {
+        for (int c{0}; c < rows[r].size(); ++c) {
+            auto* item{table->item(r, c)};
+            if (!item) {
+                item = new QTableWidgetItem{rows[r][c]};
+                item->setTextAlignment(c == 0 ? Qt::AlignLeft | Qt::AlignVCenter : Qt::AlignRight | Qt::AlignVCenter);
+                table->setItem(r, c, item);
+            } else if (item->text() != rows[r][c]) item->setText(rows[r][c]);
+        }
+    }
+    if (table->verticalScrollBar()->value() != scroll) table->verticalScrollBar()->setValue(scroll);
+}
+struct Choice { QString text; QVariant data; QString identity; };
+void SetChoices(QComboBox* combo, const std::vector<Choice>& choices, const QString& selected, bool fallback)
+{
+    const QSignalBlocker block{combo};
+    while (combo->count() > static_cast<int>(choices.size())) combo->removeItem(combo->count() - 1);
+    int selected_index{-1};
+    for (int i{0}; i < static_cast<int>(choices.size()); ++i) {
+        const auto& choice{choices[i]};
+        if (i == combo->count()) combo->addItem(choice.text, choice.data);
+        else {
+            if (combo->itemText(i) != choice.text) combo->setItemText(i, choice.text);
+            if (combo->itemData(i) != choice.data) combo->setItemData(i, choice.data);
+        }
+        if (combo->itemData(i, Qt::UserRole + 1).toString() != choice.identity) combo->setItemData(i, choice.identity, Qt::UserRole + 1);
+        if (choice.identity == selected) selected_index = i;
+    }
+    if (selected_index < 0 && fallback && !choices.empty()) selected_index = 0;
+    if (combo->currentIndex() != selected_index) combo->setCurrentIndex(selected_index);
+}
 } // namespace
 
 struct B3FlowMeshTradingPanel::Result {
@@ -70,22 +108,21 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     auto* outer{new QVBoxLayout{this}}; outer->setContentsMargins(0, 0, 0, 0);
     auto* scroll{new QScrollArea{this}}; scroll->setWidgetResizable(true);
     auto* content{new QWidget{scroll}}; auto* layout{new QVBoxLayout{content}};
-    layout->setContentsMargins(24, 20, 24, 24); layout->setSpacing(16);
+    layout->setContentsMargins(12, 10, 12, 12); layout->setSpacing(8);
     auto* heading{new QHBoxLayout}; auto* heading_copy{new QVBoxLayout};
-    auto* eyebrow{Label(tr("FLOWMESH / SPOT"), content)}; B3Theme::markTextRole(eyebrow, QStringLiteral("eyebrow")); heading_copy->addWidget(eyebrow);
-    m_pair_title = Label(tr("Your trading workspace"), content); B3Theme::markTextRole(m_pair_title, QStringLiteral("h1")); heading_copy->addWidget(m_pair_title); heading->addLayout(heading_copy); heading->addStretch();
+    auto* eyebrow{Label(tr("FlowMesh"), content)}; B3Theme::markTextRole(eyebrow, QStringLiteral("h3")); heading_copy->addWidget(eyebrow);
+    m_pair_title = Label(tr("Trade"), content); m_pair_title->hide(); heading->addLayout(heading_copy);
     m_market = new QComboBox{content}; m_market->setObjectName(QStringLiteral("flowMeshMarket"));
     m_market->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon); m_market->setMinimumContentsLength(16); m_market->setAccessibleName(tr("Spot market")); heading->addWidget(m_market);
-    m_refresh = new QPushButton{tr("Refresh"), content}; m_refresh->setToolTip(tr("Refresh market and certified balance")); heading->addWidget(m_refresh); layout->addLayout(heading);
-    auto* status_card{new QWidget{content}}; B3Theme::markCard(status_card); auto* status_layout{new QVBoxLayout{status_card}};
-    m_status = Label(tr("Select a wallet to read certified market data."), status_card); m_status->setObjectName(QStringLiteral("flowMeshReadiness")); status_layout->addWidget(m_status);
-    m_progress = Label(tr("One uniform-price curve auction per certified microblock. No price-time priority."), status_card); B3Theme::markTextRole(m_progress, QStringLiteral("secondary")); status_layout->addWidget(m_progress); layout->addWidget(status_card);
-    auto* market_stats{new QHBoxLayout}; m_last_price = Label(tr("Last clearing price  —"), content); B3Theme::markTextRole(m_last_price, QStringLiteral("h2")); market_stats->addWidget(m_last_price); market_stats->addStretch();
-    m_deposit = new QPushButton{tr("Deposit"), content}; m_withdraw = new QPushButton{tr("Withdraw"), content}; market_stats->addWidget(m_deposit); market_stats->addWidget(m_withdraw); layout->addLayout(market_stats);
+    m_last_price = Label(tr("Last price  —"), content); B3Theme::markTextRole(m_last_price, QStringLiteral("h3")); heading->addWidget(m_last_price); heading->addStretch();
+    m_deposit = new QPushButton{tr("Deposit"), content}; m_deposit->setProperty("b3variant", QStringLiteral("primary")); m_withdraw = new QPushButton{tr("Withdraw"), content}; heading->addWidget(m_deposit); heading->addWidget(m_withdraw); layout->addLayout(heading);
+    m_status = Label(tr("Select a wallet to trade."), content); m_status->setObjectName(QStringLiteral("flowMeshReadiness")); B3Theme::markTextRole(m_status, QStringLiteral("secondary")); layout->addWidget(m_status);
+    m_refresh = new QPushButton{tr("Refresh now"), content}; m_refresh->setToolTip(tr("Market data updates automatically. Request an immediate read-only update."));
+    m_progress = Label(QString{}, content); B3Theme::markTextRole(m_progress, QStringLiteral("secondary"));
     auto* center{new QSplitter{Qt::Horizontal, content}}; center->setChildrenCollapsible(false);
     auto* chart_card{new QWidget{center}}; B3Theme::markCard(chart_card); auto* chart_layout{new QVBoxLayout{chart_card}};
     auto* chart_modes{new QHBoxLayout}; auto* modes{new QButtonGroup{chart_card}};
-    for (const auto& mode : {std::pair{tr("Clearing price"), B3FlowMeshChart::Mode::Prices}, std::pair{tr("Liquidity curves"), B3FlowMeshChart::Mode::Liquidity}}) {
+    for (const auto& mode : {std::pair{tr("Chart"), B3FlowMeshChart::Mode::Prices}, std::pair{tr("Depth"), B3FlowMeshChart::Mode::Liquidity}}) {
         auto* button{new QPushButton{mode.first, chart_card}}; button->setCheckable(true); button->setChecked(mode.second == B3FlowMeshChart::Mode::Prices); button->setProperty("b3variant", QStringLiteral("timeframe")); modes->addButton(button); chart_modes->addWidget(button);
         button->setObjectName(mode.second == B3FlowMeshChart::Mode::Prices ? QStringLiteral("flowMeshChartPrices") : QStringLiteral("flowMeshChartLiquidity"));
         connect(button, &QPushButton::clicked, this, [this, mode] { m_chart->setMode(mode.second); });
@@ -93,15 +130,16 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     chart_modes->addStretch(); chart_layout->addLayout(chart_modes); m_chart = new B3FlowMeshChart{chart_card}; chart_layout->addWidget(m_chart, 1);
     m_chart->setToolTip(tr("Each price point is a real certified clearing, indexed by microblock sequence—not an invented timestamp. Idle intervals are not filled in. Liquidity lines are a display guide through exact evaluated samples."));
     const auto table = [](QWidget* parent, const QStringList& headers, const char* name) {
-        auto* view{new QTableWidget{parent}}; view->setObjectName(QLatin1String(name)); view->setColumnCount(headers.size()); view->setHorizontalHeaderLabels(headers); view->verticalHeader()->hide(); view->setShowGrid(false); view->setAlternatingRowColors(false); view->setEditTriggers(QAbstractItemView::NoEditTriggers); view->setSelectionMode(QAbstractItemView::NoSelection); view->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch); view->setMinimumWidth(220); return view;
+        auto* view{new QTableWidget{parent}}; view->setObjectName(QLatin1String(name)); view->setColumnCount(headers.size()); view->setHorizontalHeaderLabels(headers); view->verticalHeader()->hide(); view->setShowGrid(false); view->setAlternatingRowColors(false); view->setEditTriggers(QAbstractItemView::NoEditTriggers); view->setSelectionMode(QAbstractItemView::NoSelection); view->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch); view->verticalHeader()->setDefaultSectionSize(26); view->setMinimumWidth(200); return view;
     };
     auto* liquidity_card{new QWidget{center}}; B3Theme::markCard(liquidity_card); auto* liquidity_layout{new QVBoxLayout{liquidity_card}};
-    auto* liquidity_title{Label(tr("Auction liquidity"), liquidity_card)}; liquidity_title->setObjectName(QStringLiteral("flowMeshLiquidityTitle")); B3Theme::markTextRole(liquidity_title, QStringLiteral("h3")); liquidity_layout->addWidget(liquidity_title);
+    auto* liquidity_title{Label(tr("Liquidity"), liquidity_card)}; liquidity_title->setObjectName(QStringLiteral("flowMeshLiquidityTitle")); B3Theme::markTextRole(liquidity_title, QStringLiteral("h3")); liquidity_layout->addWidget(liquidity_title);
     m_depth_view = table(liquidity_card, {tr("Price"), tr("Demand"), tr("Supply")}, "flowMeshCurveDepth"); liquidity_layout->addWidget(m_depth_view, 1);
     m_liquidity_note = Label(tr("No certified curves yet."), liquidity_card); B3Theme::markTextRole(m_liquidity_note, QStringLiteral("secondary")); liquidity_layout->addWidget(m_liquidity_note);
     auto* ticket_card{new QWidget{center}}; ticket_card->setMinimumWidth(250); B3Theme::markCard(ticket_card); auto* ticket{new QVBoxLayout{ticket_card}};
     auto* sides{new QHBoxLayout}; auto* side_group{new QButtonGroup{ticket_card}};
     m_buy = new QPushButton{tr("Buy"), ticket_card}; m_sell = new QPushButton{tr("Sell"), ticket_card};
+    m_buy->setObjectName(QStringLiteral("flowMeshBuy")); m_sell->setObjectName(QStringLiteral("flowMeshSell"));
     for (auto* b : {m_buy, m_sell}) { b->setCheckable(true); side_group->addButton(b); sides->addWidget(b); } m_buy->setChecked(true); ticket->addLayout(sides);
     m_side = new QComboBox{this}; m_side->addItems({QStringLiteral("bid"), QStringLiteral("ask")}); m_side->hide();
     const auto entry = [&](const char* name, int length) {
@@ -109,21 +147,21 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     };
     m_price_label = Label(tr("Limit price · B3 / token"), ticket_card); ticket->addWidget(m_price_label); m_price = entry("flowMeshPriceAtoms", 64); m_price->setPlaceholderText(tr("Enter price")); ticket->addWidget(m_price);
     m_quantity_label = Label(tr("Quantity · token"), ticket_card); ticket->addWidget(m_quantity_label); m_quantity = entry("flowMeshRawQuantity", 64); m_quantity->setPlaceholderText(tr("Enter quantity")); ticket->addWidget(m_quantity);
-    m_grid_note = Label(tr("Token units will be verified from asset metadata."), ticket_card); B3Theme::markTextRole(m_grid_note, QStringLiteral("secondary")); ticket->addWidget(m_grid_note);
+    m_grid_note = Label(tr("Token units will be verified from asset metadata."), ticket_card); B3Theme::markTextRole(m_grid_note, QStringLiteral("secondary"));
     m_ticket_available = Label(tr("Available  —"), ticket_card); ticket->addWidget(m_ticket_available); m_ticket_total = Label(tr("Limit notional  —"), ticket_card); ticket->addWidget(m_ticket_total);
     m_ticket_fee = Label(tr("Spot fee 0.01% · seller-paid"), ticket_card); B3Theme::markTextRole(m_ticket_fee, QStringLiteral("secondary")); ticket->addWidget(m_ticket_fee);
-    m_order = new QPushButton{tr("Review buy order…"), ticket_card}; m_order->setObjectName(QStringLiteral("flowMeshSubmitOrder")); ticket->addWidget(m_order);
-    auto* order_note{Label(tr("One order per side. A new order replaces that side."), ticket_card)};
-    order_note->setToolTip(tr("A limit intent becomes a persistent demand or supply curve. Each certified microblock matches at one uniform clearing price, without price-time priority. An accepted request is not a fill.")); ticket->addWidget(order_note); ticket->addStretch();
+    m_order = new QPushButton{tr("Review buy order…"), ticket_card}; m_order->setObjectName(QStringLiteral("flowMeshSubmitOrder")); m_order->setProperty("b3variant", QStringLiteral("primary")); ticket->addWidget(m_order);
+    m_order->setToolTip(tr("One order per side. A new order replaces that side. Orders clear together at one auction price; an accepted request is not a fill.")); ticket->addStretch();
     center->addWidget(chart_card); center->addWidget(liquidity_card); center->addWidget(ticket_card); center->setStretchFactor(0, 6); center->setStretchFactor(1, 3); center->setStretchFactor(2, 3); center->setSizes({600, 290, 300}); layout->addWidget(center, 1);
-    m_activity = new QTabWidget{content}; m_activity->setMinimumHeight(220);
-    auto* own{new QWidget{m_activity}}; auto* own_layout{new QVBoxLayout{own}}; m_own_note = Label(tr("No wallet curves loaded."), own); own_layout->addWidget(m_own_note); m_own_view = table(own, {tr("Side"), tr("Limit / curve"), tr("Remaining"), tr("Reserved")}, "flowMeshOwnCurves"); own_layout->addWidget(m_own_view);
+    m_activity = new QTabWidget{content}; m_activity->setMinimumHeight(185);
+    auto* own{new QWidget{m_activity}}; auto* own_layout{new QVBoxLayout{own}}; m_own_note = Label(tr("No open orders"), own); own_layout->addWidget(m_own_note); m_own_view = table(own, {tr("Side"), tr("Price"), tr("Remaining"), tr("Reserved")}, "flowMeshOwnCurves"); own_layout->addWidget(m_own_view);
     m_balances = Label(tr("Certified balances will appear here."), own); own_layout->addWidget(m_balances); m_cancel_order = new QPushButton{tr("Cancel selected Buy / Sell side…"), own}; own_layout->addWidget(m_cancel_order); m_activity->addTab(own, tr("Your orders"));
-    auto* history_page{new QWidget{m_activity}}; auto* history_layout{new QVBoxLayout{history_page}}; m_history_note = Label(tr("No certified market history loaded."), history_page); history_layout->addWidget(m_history_note); m_history_view = table(history_page, {tr("Microblock"), tr("B3 / token"), tr("Matched"), tr("Your buy"), tr("Your sell")}, "flowMeshCertifiedFills"); history_layout->addWidget(m_history_view); m_activity->addTab(history_page, tr("Certified trades"));
+    auto* history_page{new QWidget{m_activity}}; auto* history_layout{new QVBoxLayout{history_page}}; m_history_note = Label(tr("No trades yet"), history_page); history_layout->addWidget(m_history_note); m_history_view = table(history_page, {tr("Trade batch"), tr("Price (B3)"), tr("Amount"), tr("Your buy"), tr("Your sell")}, "flowMeshCertifiedFills"); history_layout->addWidget(m_history_view); m_activity->addTab(history_page, tr("Trade history"));
     m_log = new QPlainTextEdit{m_activity}; m_log->setObjectName(QStringLiteral("flowMeshOperationLog")); m_log->setReadOnly(true); m_log->setMaximumBlockCount(100); m_activity->addTab(m_log, tr("Activity")); layout->addWidget(m_activity);
-    auto* advanced_toggle{new QPushButton{tr("Advanced settlement and market details"), content}}; advanced_toggle->setCheckable(true); layout->addWidget(advanced_toggle);
+    auto* advanced_toggle{new QPushButton{tr("Details"), content}}; advanced_toggle->setObjectName(QStringLiteral("flowMeshDetails")); advanced_toggle->setCheckable(true); advanced_toggle->setFlat(true); auto* details_row{new QHBoxLayout}; details_row->addStretch(); details_row->addWidget(advanced_toggle); layout->addLayout(details_row);
     m_advanced = new QWidget{content}; B3Theme::markCard(m_advanced); auto* settlement{new QVBoxLayout{m_advanced}};
     m_identity_detail = Label(tr("Full market identity will appear after a verified snapshot."), m_advanced); settlement->addWidget(m_identity_detail);
+    settlement->addWidget(m_progress); settlement->addWidget(m_grid_note); settlement->addWidget(m_refresh);
     settlement->addWidget(Label(tr("Operator tools: publish certified checkpoints and connected sweeps/payouts. Each transaction requires a separate B3-fee review; nothing is automatically broadcast."), m_advanced));
     m_checkpoint = new QPushButton{tr("Prepare pending checkpoint…"), m_advanced}; settlement->addWidget(m_checkpoint);
     m_effect = new QComboBox{m_advanced}; m_effect->setMinimumContentsLength(20); m_effect->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon); settlement->addWidget(m_effect);
@@ -136,7 +174,14 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     m_admit = new QPushButton{this}; m_admit->hide();
     scroll->setWidget(content); outer->addWidget(scroll);
     connect(m_refresh, &QPushButton::clicked, this, &B3FlowMeshTradingPanel::refresh);
-    connect(m_market, &QComboBox::currentIndexChanged, this, [this] { updateMarketText(); if (!m_busy) refresh(); });
+    connect(m_market, &QComboBox::currentIndexChanged, this, [this] {
+        const auto selected{market()};
+        if (!selected || !m_snapshot || selected->id != m_snapshot->market) {
+            m_snapshot.reset(); m_response_age.invalidate(); m_certificate_age.invalidate(); m_queue_age.invalidate();
+            m_loading = selected.has_value(); updateDataViews();
+        }
+        updateMarketText(); if (!m_busy) refresh();
+    });
     connect(m_order, &QPushButton::clicked, this, [this] { begin(Operation::Order); });
     connect(m_cancel_order, &QPushButton::clicked, this, [this] { begin(Operation::Cancel); });
     connect(m_deposit, &QPushButton::clicked, this, [this] { openFunding(false); });
@@ -197,26 +242,45 @@ void B3FlowMeshTradingPanel::updateMarketText()
 {
     const auto selected{market()};
     const bool matched{selected && m_snapshot && m_snapshot->market == selected->id};
-    if (!selected) { m_status->setText(m_wallet ? tr("No market selected · reading only established markets, never bootstrapping one.") : tr("Select a wallet to view its spot markets. No orders can be submitted.")); m_balances->clear(); m_pair_title->setText(tr("Your trading workspace")); }
+    QString status{m_wallet ? tr("Select a market") : tr("Select a wallet to trade")};
+    if (!selected) { m_balances->clear(); m_pair_title->setText(tr("Trade")); m_identity_detail->setText(tr("Select a market to see its details.")); }
     else {
         m_pair_title->setText(matched && m_snapshot->units.known ? m_snapshot->units.ticker + QStringLiteral(" / B3") : tr("Spot market · %1…").arg(selected->base.left(12)));
         m_pair_title->setToolTip(tr("Wallet: %1\nBase asset: %2\nMarket: %3\nVault: %4").arg(m_wallet_name, selected->base, selected->id, selected->vault));
         m_identity_detail->setText(m_pair_title->toolTip() + (matched && m_snapshot->units.known ? tr("\nMetadata: %1 · %2 decimals · %3\nNames and tickers do not prove reserves or dollar backing.").arg(m_snapshot->units.source).arg(m_snapshot->units.decimals).arg(m_snapshot->units.test_only ? tr("TEST ASSET") : tr("asset identity shown above")) : tr("\nToken precision has not been verified.")));
-        m_status->setText(matched ? B3FlowMeshMarketData::StatusText(*m_snapshot, m_read_failed || !m_response_age.isValid() ? -1 : m_response_age.elapsed(), m_certificate_age.isValid() ? m_certificate_age.elapsed() : -1, m_queue_age.isValid() ? m_queue_age.elapsed() : -1) : tr("Reading certified market snapshot…"));
+        status = m_read_failed ? tr("Updates delayed · trading paused") : tr("Loading market…");
+        if (!matched) m_balances->clear();
         if (matched) {
-            const auto& s{*m_snapshot}; const auto base = [&](CAmount n) -> QString {
+            const auto& s{*m_snapshot};
+            if (m_read_failed || !m_response_age.isValid() || m_response_age.elapsed() > 3000) status = tr("Updates delayed · trading paused");
+            else if (!s.running) status = tr("Market service offline");
+            else if (s.halt != QStringLiteral("none") || !s.error.isEmpty()) status = tr("Market halted · see Details");
+            else if (s.handoff) status = tr("Validator handoff · trading paused");
+            else if (s.paused) status = tr("Trading paused · waiting for validators");
+            else if (!s.certified) status = tr("Waiting for the first confirmed update");
+            else if (s.pending_actions && m_queue_age.isValid() && m_queue_age.elapsed() >= 30'000) status = tr("Confirmation delayed · new requests paused");
+            else if (!B3FlowMeshMarketData::AdmissionReady(s, m_response_age.elapsed(), -1)) status = tr("Trading unavailable · check Details");
+            else if (m_pending_sequence && selected->id == m_pending_market && selected->account == m_pending_account && selected->sequence <= *m_pending_sequence) status = tr("Request submitted · awaiting confirmation");
+            else if (s.pending_actions) status = tr("Confirming orders…");
+            else status = tr("Latest confirmed market data");
+            if (!s.units.known) status += tr(" · asset precision unavailable");
+            if (s.units.test_only) status = tr("TEST ASSET · unbacked · ") + status;
+            const auto base = [&](CAmount n) -> QString {
                 if (s.units.known) return B3FlowMeshMarketData::FormatAmount(n, s.units.decimals) + QLatin1Char(' ') + s.units.ticker;
                 return QString::number(n) + tr(" raw units (precision unknown)");
             };
-            m_balances->setText(selected->has_account ? tr("Available  %1 · %2 B3    |    Reserved  %3 · %4 B3\nAccount %5 · next sequence %6").arg(base(selected->base_available), B3FlowMeshMarketData::FormatAmount(selected->b3_available, 9), base(selected->base_reserved), B3FlowMeshMarketData::FormatAmount(selected->b3_reserved, 9), selected->account, QString::number(selected->sequence)) : tr("No trading account yet. Deposit creates one in this wallet; back it up afterward."));
+            m_balances->setText(selected->has_account ? tr("Available  %1 · %2 B3    |    In orders  %3 · %4 B3").arg(base(selected->base_available), B3FlowMeshMarketData::FormatAmount(selected->b3_available, 9), base(selected->base_reserved), B3FlowMeshMarketData::FormatAmount(selected->b3_reserved, 9)) : tr("Deposit to start trading"));
+            m_identity_detail->setText(m_identity_detail->text() + tr("\nAccount %1 · next sequence %2").arg(selected->account, QString::number(selected->sequence)));
         }
     }
-    if (selected && selected->checkpoint_pending) m_progress->setText(tr("Certified checkpoint awaiting B3 publication · open Advanced settlement. This is separate from trade execution."));
+    if (selected && selected->checkpoint_pending) m_progress->setText(tr("Certified checkpoint awaiting B3 publication. This is separate from trade execution."));
     else if (selected && m_pending_sequence && selected->id == m_pending_market && selected->sequence <= *m_pending_sequence) m_progress->setText(tr("Request accepted · awaiting account sequence %1 to be certified. No retry will be sent.").arg(*m_pending_sequence));
     else if (matched) m_progress->setText(tr("Certified microblock #%1 · epoch %2 · configured threshold %3 of %4 FN seats · %5 queued actions\nAn available runtime or configured threshold is not proof that those validators are currently online.").arg(m_snapshot->next_sequence ? m_snapshot->next_sequence - 1 : 0).arg(m_snapshot->epoch).arg(m_snapshot->quorum_required).arg(m_snapshot->active_seats).arg(m_snapshot->pending_actions));
     else m_progress->setText(tr("Uniform-price curve auction · no price-time priority, no fabricated prices or trades."));
-    if (matched && m_snapshot->units.test_only) m_progress->setText(tr("TEST ASSET · not a claim of dollar backing\n") + m_progress->text());
-    if (!m_security_warning.isEmpty()) m_status->setText(m_security_warning + QStringLiteral("\n") + m_status->text());
+    if (matched) m_progress->setText(B3FlowMeshMarketData::StatusText(*m_snapshot, m_read_failed || !m_response_age.isValid() ? -1 : m_response_age.elapsed(), m_certificate_age.isValid() ? m_certificate_age.elapsed() : -1, m_queue_age.isValid() ? m_queue_age.elapsed() : -1) + QLatin1Char('\n') + m_progress->text());
+    if (m_uncertain) status = tr("Submission outcome unknown · review before trading") + (matched && m_snapshot->units.test_only ? tr(" · TEST ASSET · unbacked") : QString{});
+    if (!m_security_warning.isEmpty()) status = m_security_warning + QLatin1Char('\n') + status;
+    m_status->setText(status); m_status->setToolTip(m_progress->text());
     updateTicket(); updateControls();
 }
 
@@ -225,36 +289,39 @@ void B3FlowMeshTradingPanel::updateDataViews()
     using namespace B3FlowMeshMarketData;
     const auto selected{market()}; const bool matched{selected && m_snapshot && selected->id == m_snapshot->market};
     m_chart->setSnapshot(matched ? m_snapshot : std::nullopt); m_chart->setLoading(m_loading);
-    for (auto* table : {m_depth_view, m_history_view, m_own_view}) table->setRowCount(0);
-    if (auto* title{m_depth_view->parentWidget()->findChild<QLabel*>(QStringLiteral("flowMeshLiquidityTitle"))}) title->setText(tr("Auction liquidity"));
-    for (int column : {0, 1, 2}) m_depth_view->horizontalHeaderItem(column)->setToolTip(QString{});
-    m_history_note->setText(tr("No certified trades loaded. No synthetic fills or timestamps are displayed.")); m_own_note->setText(tr("No certified standing curves for this wallet."));
-    if (!matched || !m_snapshot->units.known) { m_last_price->setText(tr("Last clearing price  —")); m_liquidity_note->setText(matched ? tr("Verified token precision unavailable. Values are not guessed from the ticker.") : tr("No certified liquidity loaded. Demand and supply will appear after actual orders are certified.")); return; }
+    if (!matched || !m_snapshot->units.known) {
+        for (auto* table : {m_depth_view, m_history_view, m_own_view}) SetRows(table, {});
+        if (auto* title{m_depth_view->parentWidget()->findChild<QLabel*>(QStringLiteral("flowMeshLiquidityTitle"))}) title->setText(tr("Liquidity"));
+        m_history_note->setText(tr("Trade history unavailable")); m_own_note->setText(tr("Orders unavailable"));
+        m_last_price->setText(tr("Last price  —")); m_liquidity_note->setText(matched ? tr("Asset precision unavailable") : tr("Loading liquidity…")); return;
+    }
     const auto& s{*m_snapshot}; const auto& u{s.units};
-    m_history_note->setText(!s.history_available ? tr("This node has no retained certified history. Empty is not a claim that trading never occurred.") : s.history_truncated ? tr("Recent certified history only; older records fall outside this node's bounded cache. A dash means your fill quantity is unknown.") : s.history_page_partial ? tr("Latest 100 certified microblocks; older retained records are outside this displayed window. A dash means your fill quantity is unknown.") : tr("Actual certified clearings. A dash means this node cannot identify your fill quantity, not that it was zero."));
-    if (!s.own_curves.empty()) m_own_note->setText(tr("Certified orders · one Buy and one Sell side."));
+    m_own_note->setText(s.own_curves.empty() ? tr("No open orders") : tr("Your open orders"));
     m_own_note->setToolTip(tr("Orders are persistent certified curves. Replacing a side changes that entire curve; there is no price-time priority queue."));
-    const auto row = [](QTableWidget* table, const QStringList& cells) { const int r{table->rowCount()}; table->insertRow(r); for (int c{0}; c < cells.size(); ++c) { auto* item{new QTableWidgetItem{cells[c]}}; item->setTextAlignment(c == 0 ? Qt::AlignLeft | Qt::AlignVCenter : Qt::AlignRight | Qt::AlignVCenter); table->setItem(r, c, item); } };
-    for (const auto& d : s.depth) row(m_depth_view, {FormatPrice(d.price, u.decimals), FormatAmount(d.demand, u.decimals), FormatAmount(d.supply, u.decimals)});
-    m_depth_view->setHorizontalHeaderLabels({tr("Price"), tr("Demand"), tr("Supply")});
+    std::vector<QStringList> depth, history, own;
+    for (const auto& d : s.depth) depth.push_back({FormatPrice(d.price, u.decimals), FormatAmount(d.demand, u.decimals), FormatAmount(d.supply, u.decimals)});
     m_depth_view->horizontalHeaderItem(0)->setToolTip(tr("Price in B3 per %1").arg(u.ticker));
     for (int column : {1, 2}) m_depth_view->horizontalHeaderItem(column)->setToolTip(tr("Quantity in %1, evaluated at this price").arg(u.ticker));
     if (auto* title{m_depth_view->parentWidget()->findChild<QLabel*>(QStringLiteral("flowMeshLiquidityTitle"))}) title->setText(tr("Liquidity · %1").arg(u.ticker));
-    m_liquidity_note->setText(s.curves.empty() ? tr("No certified orders yet.") : s.curves_complete ? tr("Certified curves · price in B3/%1").arg(u.ticker) : tr("Partial curve page · not total liquidity"));
+    m_liquidity_note->setText(s.curves.empty() ? tr("No orders yet") : s.curves_complete ? tr("Price in B3 / %1").arg(u.ticker) : tr("Partial liquidity only"));
     m_liquidity_note->setToolTip(tr("Price is B3 per %1; demand and supply are quantities of %1. Each quantity is evaluated at that price, not added as a cumulative order-book level. Only certified curves are shown.").arg(u.ticker));
-    m_last_price->setText(tr("Last clearing price  —"));
+    QString last_price{tr("Last price  —")};
     for (auto it{s.history.rbegin()}; it != s.history.rend(); ++it) {
         if (!it->cleared || it->quantity == 0) continue;
-        if (m_history_view->rowCount() == 0) m_last_price->setText(tr("%1 B3 / %2").arg(FormatPrice(it->price, u.decimals), u.ticker));
-        row(m_history_view, {QStringLiteral("#%1").arg(it->sequence), FormatPrice(it->price, u.decimals), FormatAmount(it->quantity, u.decimals), it->own_fills_known ? FormatAmount(it->own_buy, u.decimals) : QStringLiteral("—"), it->own_fills_known ? FormatAmount(it->own_sell, u.decimals) : QStringLiteral("—")});
+        if (history.empty()) last_price = tr("%1 B3 / %2").arg(FormatPrice(it->price, u.decimals), u.ticker);
+        history.push_back({QStringLiteral("#%1").arg(it->sequence), FormatPrice(it->price, u.decimals), FormatAmount(it->quantity, u.decimals), it->own_fills_known ? FormatAmount(it->own_buy, u.decimals) : QStringLiteral("—"), it->own_fills_known ? FormatAmount(it->own_sell, u.decimals) : QStringLiteral("—")});
     }
     for (const auto& c : s.own_curves) {
         QString description;
         if (c.points.size() == 2 && c.points[1].price == c.points[0].price + 1) description = FormatPrice(c.side == QStringLiteral("bid") ? c.points[0].price : c.points[1].price, u.decimals) + QStringLiteral(" B3");
         else description = tr("%1-point curve").arg(c.points.size());
-        row(m_own_view, {c.side == QStringLiteral("bid") ? tr("Buy") : tr("Sell"), description, FormatAmount(c.remaining, u.decimals), FormatAmount(c.reserved, c.side == QStringLiteral("bid") ? 9 : u.decimals) + (c.side == QStringLiteral("bid") ? QStringLiteral(" B3") : QLatin1Char(' ') + u.ticker)});
-        m_own_view->item(m_own_view->rowCount() - 1, 0)->setToolTip(tr("Certified account %1\nFilled: %2 %3\nCancellation targets this account's whole selected side.").arg(c.account, FormatAmount(c.filled, u.decimals), u.ticker));
+        own.push_back({c.side == QStringLiteral("bid") ? tr("Buy") : tr("Sell"), description, FormatAmount(c.remaining, u.decimals), FormatAmount(c.reserved, c.side == QStringLiteral("bid") ? 9 : u.decimals) + (c.side == QStringLiteral("bid") ? QStringLiteral(" B3") : QLatin1Char(' ') + u.ticker)});
     }
+    SetRows(m_depth_view, depth); SetRows(m_history_view, history); SetRows(m_own_view, own);
+    for (int i{0}; i < static_cast<int>(s.own_curves.size()); ++i) { const auto& c{s.own_curves[i]}; m_own_view->item(i, 0)->setToolTip(tr("Certified account %1\nFilled: %2 %3\nCancellation targets this account's whole selected side.").arg(c.account, FormatAmount(c.filled, u.decimals), u.ticker)); }
+    m_last_price->setText(last_price);
+    m_history_note->setText(!s.history_available ? tr("History unavailable on this node") : history.empty() ? tr("No trades in recent history") : s.history_truncated || s.history_page_partial ? tr("Recent trades · partial history") : tr("Confirmed trades"));
+    m_history_note->setToolTip(tr("Only retained certified clearings are shown, indexed by microblock sequence. A dash means your fill is unknown, not zero. Missing history does not prove that no trading occurred."));
 }
 
 void B3FlowMeshTradingPanel::updateTicket()
@@ -263,23 +330,24 @@ void B3FlowMeshTradingPanel::updateTicket()
     const auto selected{market()}; const bool units_known{selected && m_snapshot && selected->id == m_snapshot->market && m_snapshot->units.known};
     const QString ticker{units_known ? m_snapshot->units.ticker : tr("token")}; const bool buy{m_side->currentIndex() == 0};
     m_price_label->setText(tr("Limit price · B3 / %1").arg(ticker)); m_quantity_label->setText(tr("Quantity · %1").arg(ticker));
-    m_order->setText(buy ? tr("Review buy order…") : tr("Review sell order…")); m_cancel_order->setText(buy ? tr("Cancel your standing Buy curve…") : tr("Cancel your standing Sell curve…"));
-    m_ticket_total->setText(tr("Limit notional  —")); m_ticket_fee->setText(tr("Spot fee 0.01% · seller-paid"));
+    m_order->setText(buy ? tr("Review buy order…") : tr("Review sell order…")); m_cancel_order->setText(buy ? tr("Cancel buy order…") : tr("Cancel sell order…"));
+    m_ticket_fee->setText(tr("Spot fee 0.01% · seller-paid"));
     m_ticket_fee->setToolTip(tr("The protocol fee is 0.01% of matched B3 notional, deducted from seller proceeds. Actual fees and allocation depend on certified fills. Submitting an order has no network fee."));
-    if (!units_known) { m_grid_note->setText(tr("Verified asset precision required; no raw-unit guessing.")); m_grid_note->setToolTip(QString{}); m_ticket_available->setText(tr("Available  —")); return; }
+    if (!units_known) { m_grid_note->setText(tr("Verified asset precision required; no raw-unit guessing.")); m_grid_note->setToolTip(QString{}); m_ticket_available->setText(tr("Available  —")); m_ticket_total->setText(tr("Order value  —")); return; }
     const auto& u{m_snapshot->units}; m_grid_note->setText(tr("Steps: %1 %2 · %3 B3").arg(FormatAmount(u.quantity_step, u.decimals), ticker, FormatPrice(u.price_step, u.decimals)));
     m_grid_note->setToolTip(tr("Quantity step %1 %2; price step %3 B3 per %2. Inputs are exact and never rounded.").arg(FormatAmount(u.quantity_step, u.decimals), ticker, FormatPrice(u.price_step, u.decimals)));
     m_ticket_available->setText(tr("Available  %1 %2").arg(FormatAmount(buy ? selected->b3_available : selected->base_available, buy ? 9 : u.decimals), buy ? QStringLiteral("B3") : ticker));
     QString error; const auto price{ParsePrice(m_price->text(), u, &error)}, quantity{ParseQuantity(m_quantity->text(), u, &error)};
-    if (!price || !quantity) return;
-    const auto total{Notional(*price, *quantity)}; if (!total) { m_ticket_total->setText(tr("Notional exceeds the supported range")); return; }
-    m_ticket_total->setText(tr("Limit notional  %1 B3").arg(FormatAmount(*total, 9)));
+    if (!price || !quantity) { m_ticket_total->setText(tr("Order value  —")); return; }
+    const auto total{Notional(*price, *quantity)}; if (!total) { m_ticket_total->setText(tr("Order value exceeds supported range")); return; }
+    m_ticket_total->setText(tr("Order value  %1 B3").arg(FormatAmount(*total, 9)));
     m_ticket_fee->setToolTip(tr("Protocol fee: 0.01%, deducted from seller proceeds. Whole-auction example at this notional: %1 B3. Your final share depends on certified fills; submitting an order has no network fee.").arg(FormatAmount(*FeeExample(*total), 9)));
 }
 
 void B3FlowMeshTradingPanel::openFunding(bool withdrawal)
 {
-    if (!m_wallet || !m_backend || m_busy || m_thread || !m_security_warning.isEmpty() || m_uncertain) return;
+    if (!m_wallet || !m_backend || m_busy || !m_security_warning.isEmpty() || m_uncertain) return;
+    if (m_thread) { deferReview(withdrawal ? Operation::Withdraw : Operation::Deposit, true); return; }
     const auto selected{market()}; if (!selected) return;
     const bool known{m_snapshot && m_snapshot->market == selected->id && m_snapshot->units.known};
     const QString ticker{known ? m_snapshot->units.ticker : tr("Base asset (precision unavailable)")};
@@ -313,7 +381,9 @@ void B3FlowMeshTradingPanel::updateControls()
 {
     const auto selected{market()};
     const bool idle{m_wallet && m_backend && !m_busy && m_security_warning.isEmpty()};
-    const bool signing{idle && !m_thread && !m_uncertain && !m_backend->privateKeysDisabled()};
+    // A read does not disable the ticket. A click waits for that read before
+    // opening its review; writes remain serialized by m_busy and m_thread.
+    const bool signing{idle && !m_uncertain && !m_backend->privateKeysDisabled()};
     const bool data_ready{selected && m_snapshot && m_snapshot->market == selected->id && !m_read_failed && B3FlowMeshMarketData::AdmissionReady(*m_snapshot, m_response_age.isValid() ? m_response_age.elapsed() : -1, m_certificate_age.isValid() ? m_certificate_age.elapsed() : -1, m_queue_age.isValid() ? m_queue_age.elapsed() : -1)};
     const bool ready{signing && selected && selected->ready && data_ready};
     const bool known{m_snapshot && selected && m_snapshot->market == selected->id && m_snapshot->units.known};
@@ -356,7 +426,8 @@ bool B3FlowMeshTradingPanel::confirm(const QString& text, bool final_transaction
 
 void B3FlowMeshTradingPanel::begin(Operation operation)
 {
-    if (!m_wallet || !m_backend || m_busy || m_thread || m_uncertain || !m_security_warning.isEmpty()) return;
+    if (!m_wallet || !m_backend || m_busy || m_uncertain || !m_security_warning.isEmpty()) return;
+    if (m_thread) { deferReview(operation); return; }
     const auto selected{market()}; if (!selected) return;
     Action a; a.operation = operation; a.market = *selected; a.side = m_side->currentText(); a.native = m_asset->currentIndex() == 1;
     if (operation == Operation::Order) a.native = false; // Funding selection never changes the traded base quantity.
@@ -410,6 +481,44 @@ void B3FlowMeshTradingPanel::begin(Operation operation)
         m_unlock = std::move(unlock);
     }
     startJob(a);
+}
+
+bool B3FlowMeshTradingPanel::deferReview(Operation operation, bool funding)
+{
+    const auto selected{market()};
+    if (!m_thread || m_busy || !m_wallet || !m_backend || !selected || m_uncertain || !m_security_warning.isEmpty()) return false;
+    // Save only an intent to OPEN a review. No action is approved, signed or
+    // sent here. Freeze inputs so the pending click cannot change underneath it.
+    m_deferred_review = DeferredReview{operation, funding, m_generation, selected->id, m_effect->currentData(Qt::UserRole + 1).toString()};
+    m_busy = true; updateControls(); return true;
+}
+
+void B3FlowMeshTradingPanel::resumeReview()
+{
+    if (!m_deferred_review || m_thread) return;
+    const auto intent{*m_deferred_review}; m_deferred_review.reset();
+    m_busy = false; updateControls();
+    const auto selected{market()};
+    if (intent.generation != m_generation || !selected || intent.market != selected->id ||
+        m_read_failed || m_uncertain || !m_security_warning.isEmpty()) return;
+    if (intent.operation == Operation::Vault && (intent.effect.isEmpty() || intent.effect != m_effect->currentData(Qt::UserRole + 1).toString())) {
+        notice(tr("The selected settlement changed. Nothing was submitted; select it again.")); return;
+    }
+    QPushButton* button{nullptr};
+    switch (intent.operation) {
+    case Operation::Order: button = m_order; break;
+    case Operation::Cancel: button = m_cancel_order; break;
+    case Operation::Deposit: button = m_deposit; break;
+    case Operation::Withdraw: button = m_withdraw; break;
+    case Operation::Admit: button = m_admit; break;
+    case Operation::Checkpoint: button = m_checkpoint; break;
+    case Operation::Vault: button = m_publish; break;
+    }
+    // Re-evaluate freshness/readiness after the read, never approve on the
+    // authority of the stale frame in which the click occurred.
+    if (!button || !button->isEnabled()) { notice(tr("Market status changed. Nothing was submitted; review again when ready.")); return; }
+    if (intent.funding) openFunding(intent.operation == Operation::Withdraw);
+    else begin(intent.operation);
 }
 
 void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optional<B3AssetTransfer::Prepared> prepared)
@@ -506,8 +615,9 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
 void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
 {
     stopWorker(); m_active_result.reset();
-    if (!m_wallet || m_cancel->load()) { restoreLock(); m_busy = false; updateControls(); return; }
+    if (!m_wallet || m_cancel->load()) { m_deferred_review.reset(); restoreLock(); m_busy = false; updateControls(); return; }
     if (!result->error.isEmpty()) {
+        m_deferred_review.reset();
         if (!result->action) {
             if (!m_read_failed) notice(tr("Market refresh failed: %1. Last certified data is retained; new actions are disabled until a successful refresh.").arg(result->error));
             m_read_failed = true; m_read_failures = std::min(5U, m_read_failures + 1); m_loading = false; m_uncertain_refreshed = false; m_busy = false;
@@ -526,24 +636,28 @@ void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
         m_loading = false; m_read_failed = false; m_read_failures = 0;
         if (result->catalog) m_catalog_age.restart();
         if (m_uncertain && m_uncertain_backend && m_backend->wallet() == m_uncertain_backend->wallet()) m_uncertain_refreshed = true;
-        const QString previous{market() ? market()->id : QString{}}; m_market_data = result->markets; m_effect_data = result->effects;
-        { QSignalBlocker block{m_market}; m_market->clear(); int selected{-1};
+        const QString previous{market() ? market()->id : QString{}};
+        const QString previous_effect{m_effect->currentData(Qt::UserRole + 1).toString()};
+        m_market_data = result->markets; m_effect_data = result->effects;
+        { std::vector<Choice> choices; QString selection{previous}; const bool route_asset{m_route_pending && !m_requested_base.isEmpty()};
+            if (route_asset) selection.clear();
             for (size_t i{0}; i < m_market_data.size(); ++i) {
                 const auto& m{m_market_data[i]}; const auto* units{result->snapshot && result->snapshot->market == m.id && result->snapshot->units.known ? &result->snapshot->units : m_snapshot && m_snapshot->market == m.id && m_snapshot->units.known ? &m_snapshot->units : nullptr};
                 QString label = m.base.left(12) + QStringLiteral("… / B3");
                 if (units) label = units->ticker + QStringLiteral(" / B3");
-                m_market->addItem(label, m.id);
-                if (m_route_pending && !m_requested_base.isEmpty() ? m.base == m_requested_base : m.id == previous) selected = static_cast<int>(i);
+                choices.push_back({label, m.id, m.id});
+                if (route_asset && m.base == m_requested_base) selection = m.id;
             }
-            if (m_route_pending && !m_requested_base.isEmpty() && selected == -1) { m_market->setCurrentIndex(-1); notice(tr("No established market was reported for the selected asset. This panel does not bootstrap one.")); }
-            else if (selected >= 0) m_market->setCurrentIndex(selected);
+            SetChoices(m_market, choices, selection, !route_asset);
+            if (route_asset && selection.isEmpty()) notice(tr("No established market was reported for the selected asset. This panel does not bootstrap one."));
         }
-        { QSignalBlocker block{m_effect}; m_effect->clear(); const auto selected{market()};
+        { std::vector<Choice> choices; const auto selected{market()};
             for (size_t i{0}; selected && i < m_effect_data.size(); ++i) {
                 const auto& e{m_effect_data[i]}; if (e.find_value("market_id").get_str() != selected->id.toStdString()) continue;
                 const auto& kind{e.find_value("kind")}; const auto& id{e.find_value("effect_id")};
-                if (kind.isStr() && id.isStr()) m_effect->addItem(QString::fromStdString(kind.get_str()) + QStringLiteral(" — ") + QString::fromStdString(id.get_str()).left(20), static_cast<int>(i));
+                if (kind.isStr() && id.isStr()) choices.push_back({QString::fromStdString(kind.get_str()) + QStringLiteral(" — ") + QString::fromStdString(id.get_str()).left(20), static_cast<int>(i), QString::fromStdString(id.get_str())});
             }
+            SetChoices(m_effect, choices, previous_effect, true);
         }
         const auto selected_now{market()};
         if (result->snapshot && selected_now && result->snapshot->market == selected_now->id) {
@@ -567,7 +681,8 @@ void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
         const bool open_routed_funding{m_route_pending && selected_now && m_snapshot && m_snapshot->market == selected_now->id};
         if (open_routed_funding) { m_asset->setCurrentIndex(m_requested_base.isEmpty() ? 1 : 0); m_route_pending = false; }
         m_busy = false; updateMarketText();
-        if (open_routed_funding) openFunding(m_requested_withdrawal);
+        if (m_deferred_review) resumeReview();
+        else if (open_routed_funding) openFunding(m_requested_withdrawal);
         else if (changed_selection) refresh(); // Fill the newly selected account/effects immediately.
         return;
     }
@@ -598,7 +713,7 @@ void B3FlowMeshTradingPanel::stopWorker()
 }
 void B3FlowMeshTradingPanel::cancelAndWait()
 {
-    m_timer->stop(); m_cancel->store(true); ++m_generation;
+    m_timer->stop(); m_cancel->store(true); m_deferred_review.reset(); ++m_generation;
     if (m_confirmation) m_confirmation->reject();
     if (m_funding_dialog) m_funding_dialog->reject();
     stopWorker();

@@ -17,6 +17,7 @@ struct Units {
     int decimals{0};
     bool known{false}, test_only{false};
     CAmount quantity_step{1}, price_step{1};
+    bool operator==(const Units&) const = default;
 };
 QString FormatAmount(CAmount raw, int decimals);
 QString FormatPrice(CAmount raw_atoms_per_raw_unit, int base_decimals);
@@ -26,19 +27,21 @@ std::optional<CAmount> Notional(CAmount raw_price, CAmount raw_quantity);
 //! The published aggregate 100-ppm fee; seller allocation is not a future quote.
 std::optional<CAmount> FeeExample(CAmount raw_notional);
 
-struct Point { CAmount price{0}, quantity{0}; };
+struct Point { CAmount price{0}, quantity{0}; bool operator==(const Point&) const = default; };
 struct Curve {
     QString account, side;
     std::vector<Point> points;
     CAmount filled{0}, remaining{0}, reserved{0};
+    bool operator==(const Curve&) const = default;
 };
-struct Depth { CAmount price{0}, demand{0}, supply{0}; };
+struct Depth { CAmount price{0}, demand{0}, supply{0}; bool operator==(const Depth&) const = default; };
 struct Trade {
     uint64_t sequence{0}, epoch{0};
     QString hash;
     int64_t anchor_height{0};
     bool cleared{false}, own_fills_known{false};
     CAmount price{0}, quantity{0}, notional{0}, fee{0}, own_buy{0}, own_sell{0};
+    bool operator==(const Trade&) const = default;
 };
 struct Snapshot {
     QString market, base, domain, config, head, state_root, account, halt, error;
@@ -50,6 +53,7 @@ struct Snapshot {
     std::vector<Curve> curves, own_curves;
     std::vector<Trade> history;
     std::vector<Depth> depth;
+    bool operator==(const Snapshot&) const = default;
 };
 //! Fail closed; no JSON display values are financial sources of truth.
 Snapshot Parse(const UniValue& value);

@@ -10,16 +10,16 @@
 
 using namespace B3FlowMeshMarketData;
 B3FlowMeshChart::B3FlowMeshChart(QWidget* parent) : QWidget{parent} { setMouseTracking(true); setMinimumHeight(280); setObjectName(QStringLiteral("certifiedAuctionChart")); }
-void B3FlowMeshChart::setSnapshot(const std::optional<Snapshot>& s) { m_snapshot = s; update(); }
-void B3FlowMeshChart::setMode(Mode mode) { m_mode = mode; update(); }
-void B3FlowMeshChart::setLoading(bool loading) { m_loading = loading; update(); }
-void B3FlowMeshChart::setStale(bool stale) { m_stale = stale; update(); }
+void B3FlowMeshChart::setSnapshot(const std::optional<Snapshot>& s) { if (m_snapshot == s) return; m_snapshot = s; update(); }
+void B3FlowMeshChart::setMode(Mode mode) { if (m_mode == mode) return; m_mode = mode; update(); }
+void B3FlowMeshChart::setLoading(bool loading) { if (m_loading == loading) return; m_loading = loading; update(); }
+void B3FlowMeshChart::setStale(bool stale) { if (m_stale == stale) return; m_stale = stale; update(); }
 int B3FlowMeshChart::pricePointCount() const { return m_snapshot ? static_cast<int>(std::count_if(m_snapshot->history.begin(), m_snapshot->history.end(), [](const auto& t) { return t.cleared && t.quantity > 0; })) : 0; }
 QString B3FlowMeshChart::emptyMessage() const {
     if (!m_snapshot) return m_loading ? tr("Reading certified market data…") : tr("Select a market to view certified auctions");
     if (!m_snapshot->units.known) return tr("Asset precision unavailable\nPrices are hidden until token units are verified.");
-    if (m_mode == Mode::Prices) return m_snapshot->history_available ? tr("No certified trades in this history window\nA price appears only after a real uniform-price auction clears.") : tr("Certified history is unavailable on this node\nNo price history is invented or inferred from balances.");
-    return tr("No standing demand or supply curves\nThe first accepted orders will appear after certification.");
+    if (m_mode == Mode::Prices) return m_snapshot->history_available ? tr("No trades yet\nWaiting for the first confirmed trade in this history window.") : tr("Trade history unavailable\nThis node has no certified history to display.");
+    return tr("No orders yet\nOrders appear after certification.");
 }
 void B3FlowMeshChart::mouseMoveEvent(QMouseEvent* e) { m_pointer = e->position(); update(); }
 void B3FlowMeshChart::leaveEvent(QEvent*) { m_pointer = {-1, -1}; update(); }

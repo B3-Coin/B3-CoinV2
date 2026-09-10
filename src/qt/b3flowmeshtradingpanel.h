@@ -43,6 +43,15 @@ Q_SIGNALS:
 private:
     friend class B3FlowMeshWorkspaceTests;
     struct Result;
+    struct DeferredReview {
+        B3FlowMeshTrading::Operation operation;
+        bool funding;
+        uint64_t generation;
+        QString market;
+        QString effect;
+    };
+    bool deferReview(B3FlowMeshTrading::Operation operation, bool funding = false);
+    void resumeReview();
     void refresh();
     void updateControls();
     void updateMarketText();
@@ -64,6 +73,7 @@ private:
     QPointer<WalletModel> m_wallet;
     std::shared_ptr<interfaces::Wallet> m_backend, m_relock_backend, m_uncertain_backend;
     std::shared_ptr<Result> m_active_result;
+    std::optional<DeferredReview> m_deferred_review;
     QString m_wallet_name, m_security_warning, m_requested_base, m_relock_wallet_name, m_uncertain_details;
     std::unique_ptr<WalletModel::UnlockContext> m_unlock;
     std::shared_ptr<std::atomic_bool> m_cancel{std::make_shared<std::atomic_bool>(false)};
