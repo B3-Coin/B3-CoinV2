@@ -18,6 +18,7 @@
 #include <QComboBox>
 #include <QDir>
 #include <QImage>
+#include <QItemSelectionModel>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
@@ -293,14 +294,19 @@ private Q_SLOTS:
         panel.show();
         QCoreApplication::processEvents();
         QCOMPARE(panel.m_history_view->rowCount(), 40);
-        panel.m_history_view->setCurrentCell(20, 1);
         panel.m_history_view->selectRow(20);
+        // selectRow may make the leading column current. Establish the exact
+        // current cell AFTER row selection without changing that selection,
+        // and verify the precondition before testing refresh preservation.
+        panel.m_history_view->selectionModel()->setCurrentIndex(
+            panel.m_history_view->model()->index(20, 1), QItemSelectionModel::NoUpdate);
+        QCOMPARE(panel.m_history_view->currentIndex(), panel.m_history_view->model()->index(20, 1));
         auto* scroll{panel.m_history_view->verticalScrollBar()};
         QVERIFY(scroll->maximum() > 0);
         scroll->setValue(std::max(1, scroll->maximum() / 2));
         const int position{scroll->value()};
         QVERIFY(position > 0);
-        const QPersistentModelIndex selected{panel.m_history_view->model()->index(20, 1)};
+        const QPersistentModelIndex selected{panel.m_history_view->currentIndex()};
         const auto selection{panel.m_history_view->selectionModel()->selectedIndexes()};
         QVERIFY(!selection.isEmpty());
         const std::array<QTableWidgetItem*, 3> cells{
