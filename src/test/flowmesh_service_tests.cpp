@@ -441,17 +441,27 @@ BOOST_AUTO_TEST_CASE(retained_service_lock_rejects_conflicting_proposal_after_re
         wire.payload = *payload;
         BOOST_REQUIRE(service.EnqueueWireMessage(7, wire) == flowmesh::QueueResult::ACCEPTED);
         BOOST_REQUIRE(WaitUntil([&] {
-            const auto status{service.MarketStatus(market)};
-            return status && status->halt == node::FlowMeshRuntimeHalt::SIGNING_CONFLICT;
+            const auto data{service.MarketData(market, std::nullopt, {}, error)};
+            return data && data->snapshot.runtime.proposals_conflicting_lock > 0;
         }));
         BOOST_CHECK(service.Running());
         BOOST_CHECK_EQUAL(service.MarketStatus(market)->next_sequence, 0U);
+        BOOST_CHECK(service.MarketStatus(market)->halt == node::FlowMeshRuntimeHalt::NONE);
         const auto data{service.MarketData(market, std::nullopt, {}, error)};
         BOOST_REQUIRE(data);
         BOOST_CHECK(data->snapshot.runtime.local_locked_candidate == entry.GetHash());
         BOOST_CHECK_EQUAL(data->snapshot.runtime.max_verified_attestations, 0U);
+        // The competing remote body cannot disable the worker. Once quorum
+        // keys are available, the original retained candidate still completes.
+        BOOST_REQUIRE_MESSAGE(service.ArmSeatKeys(secrets, error), error);
+        BOOST_REQUIRE(WaitUntil([&] {
+            const auto status{service.MarketStatus(market)};
+            return status && status->next_sequence == 1 &&
+                   status->halt == node::FlowMeshRuntimeHalt::NONE;
+        }));
+        BOOST_CHECK(service.MarketStatus(market)->last_microblock_hash == entry.GetHash());
     }
-    CheckLock(entry, /*committed=*/false);
+    CheckLock(entry, /*committed=*/true);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

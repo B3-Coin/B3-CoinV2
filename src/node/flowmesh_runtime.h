@@ -188,9 +188,13 @@ struct FlowMeshRuntimeConfig {
     FlowMeshRuntimeRelayFn relay;
 
     //! Policy only. It selects the next proposer round but is never serialized
-    //! into a consensus parameter. A fully validated signed proposal may pull
-    //! a receiver forward by one round to reconcile local timer skew.
+    //! into a consensus parameter. Fully validated proposals are processed
+    //! independently of timer skew; only an adjacent round can nudge the
+    //! local timer. Permanent candidate/signature locks remain authoritative.
     std::chrono::milliseconds round_timeout{std::chrono::seconds{2}};
+    //! Repeat a completed legacy peer/market discovery sweep after this delay.
+    //! At least one minute; global probe pacing remains one request per second.
+    std::chrono::milliseconds legacy_probe_interval{std::chrono::seconds{60}};
 };
 
 struct FlowMeshRuntimeMarketStatus {
@@ -465,10 +469,14 @@ private:
              flowmesh::WireClock::time_point> m_catchup_cooldowns;
     flowmesh::MarketId m_announcement_cursor;
     flowmesh::WireClock::time_point m_next_announcement_batch{};
-    //! One cursor per peer: each known market gets one compatibility probe
-    //! on connection; newly admitted markets extend the scan without replay.
+    //! One bounded cursor/backoff per peer. Each known market gets a probe
+    //! per sweep; newly admitted markets extend an in-progress or idle scan.
     std::vector<flowmesh::MarketId> m_probe_markets;
-    std::map<flowmesh::WirePeerId, size_t> m_peer_probe_cursors;
+    struct LegacyPeerProbe {
+        size_t market_cursor{0};
+        flowmesh::WireClock::time_point next_sweep{};
+    };
+    std::map<flowmesh::WirePeerId, LegacyPeerProbe> m_peer_probe_cursors;
     flowmesh::WirePeerId m_probe_peer_cursor{0};
     flowmesh::WireClock::time_point m_next_legacy_probe{};
     FlowMeshEvidenceRetryBudget m_evidence_retry_budget;

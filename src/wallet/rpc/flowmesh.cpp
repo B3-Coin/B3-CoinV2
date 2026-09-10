@@ -200,6 +200,8 @@ static UniValue CertifiedMarketDataJson(const flowmesh::MarketData& data)
     runtime.pushKV("active_catchup_requests", static_cast<uint64_t>(diagnostics.active_catchup_requests));
     runtime.pushKV("proposals_missing_evidence", diagnostics.proposals_missing_evidence);
     runtime.pushKV("proposals_rejected_round", diagnostics.proposals_rejected_round);
+    runtime.pushKV("proposals_verified_different_round", diagnostics.proposals_verified_different_round);
+    runtime.pushKV("proposals_conflicting_lock", diagnostics.proposals_conflicting_lock);
     runtime.pushKV("attestations_without_candidate", diagnostics.attestations_without_candidate);
     if (diagnostics.last_message_observed_at) runtime.pushKV("last_message_observed_at", *diagnostics.last_message_observed_at);
     if (diagnostics.local_locked_candidate) runtime.pushKV("local_locked_candidate", diagnostics.local_locked_candidate->GetHex());
@@ -840,7 +842,9 @@ RPCHelpMan getflowmeshmarketdata()
                     {T::NUM, "max_verified_attestations", "Largest verified attestation count for one cached candidate"},
                     {T::NUM, "active_catchup_requests", "Current bounded peer catch-up requests"},
                     {T::NUM, "proposals_missing_evidence", "Observed proposals missing locally available action evidence"},
-                    {T::NUM, "proposals_rejected_round", "Observed proposals rejected for local round mismatch; not proof that their signatures were valid"},
+                    {T::NUM, "proposals_rejected_round", "Legacy compatibility field; local timer skew no longer rejects proposals"},
+                    {T::NUM, "proposals_verified_different_round", "Fully checked candidate proposals processed despite differing local rounds; not a count of unique signers"},
+                    {T::NUM, "proposals_conflicting_lock", "Authenticated competing proposals ignored while preserving the exact local safety lock; not evidence of a conflicting certificate"},
                     {T::NUM, "attestations_without_candidate", "Decoded attestation frames naming an in-range seat received with no cached candidate; these are not verified votes"},
                     {T::NUM, "last_message_observed_at", /*optional=*/true, "Local Unix observation time of market traffic, not certified time"},
                     {T::STR_HEX, "local_locked_candidate", /*optional=*/true, "Cached local safety-lock candidate at the current signing position; no journal is read by this RPC"},

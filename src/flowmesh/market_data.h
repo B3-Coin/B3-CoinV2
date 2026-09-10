@@ -72,8 +72,12 @@ struct MarketDataRuntimeDiagnostics {
     size_t max_verified_attestations{0};
     size_t active_catchup_requests{0};
     uint64_t proposals_missing_evidence{0};
-    // Decoded proposals rejected before signature verification for round skew.
+    // Legacy RPC field retained for compatibility; timer skew is not rejection.
     uint64_t proposals_rejected_round{0};
+    // Fully checked candidate proposals received at a different local round.
+    uint64_t proposals_verified_different_round{0};
+    // Authenticated competing proposals ignored without changing our lock.
+    uint64_t proposals_conflicting_lock{0};
     // Decoded seat-in-range attestations observed with no candidate to verify.
     uint64_t attestations_without_candidate{0};
     std::optional<int64_t> last_message_observed_at;

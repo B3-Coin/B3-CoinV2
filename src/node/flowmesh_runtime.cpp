@@ -919,8 +919,9 @@ bool FlowMeshRuntime::InitializeMarkets(std::string& error)
 {
     if (m_config.chain == nullptr || m_config.keys == nullptr ||
         m_config.clock == nullptr || !m_config.relay ||
-        m_config.round_timeout <= std::chrono::milliseconds{0}) {
-        error = "FlowMesh runtime dependencies or round policy are incomplete";
+        m_config.round_timeout <= std::chrono::milliseconds{0} ||
+        m_config.legacy_probe_interval < std::chrono::seconds{60}) {
+        error = "FlowMesh runtime dependencies or timing policy are incomplete";
         return false;
     }
     m_markets.clear();
@@ -1724,35 +1725,46 @@ void FlowMeshRuntime::ProcessCatchupCommand(
 
 void FlowMeshRuntime::ProbeLegacyPeers(const std::vector<flowmesh::WirePeerId>& peers)
 {
-    for (const auto peer : peers) m_peer_probe_cursors.try_emplace(peer, 0);
+    for (const auto peer : peers) m_peer_probe_cursors.try_emplace(peer);
     const auto now{m_config.clock->Now()};
-    if (m_peer_probe_cursors.empty() || now < m_next_legacy_probe) return;
+    if (m_peer_probe_cursors.empty() || m_probe_markets.empty() ||
+        now < m_next_legacy_probe) return;
     auto it{m_peer_probe_cursors.upper_bound(m_probe_peer_cursor)};
     for (size_t scanned{0}; scanned < std::min(size_t{8}, m_peer_probe_cursors.size()); ++scanned) {
         if (it == m_peer_probe_cursors.end()) it = m_peer_probe_cursors.begin();
         const auto peer{it->first};
-        size_t& cursor{it->second};
+        LegacyPeerProbe& probe{it->second};
         ++it;
         m_probe_peer_cursor = peer;
-        if (cursor >= m_probe_markets.size()) continue;
-        const auto market{m_markets.find(m_probe_markets[cursor])};
+        if (probe.market_cursor >= m_probe_markets.size()) {
+            if (now < probe.next_sweep) continue;
+            probe.market_cursor = 0;
+        }
+        const auto advance = [&] {
+            ++probe.market_cursor;
+            if (probe.market_cursor >= m_probe_markets.size()) {
+                probe.next_sweep = now + m_config.legacy_probe_interval;
+            }
+        };
+        const auto market{m_markets.find(m_probe_markets[probe.market_cursor])};
         if (market == m_markets.end() || !market->second->ready ||
             market->second->halt != FlowMeshRuntimeHalt::NONE) {
-            ++cursor;
+            advance();
             continue;
         }
-        // Do not spend the one-shot probe while service reconciliation would
-        // suppress relay. This check does not waive any certificate checks.
+        // Do not spend a probe while local reconciliation suppresses relay.
+        // Remote reconciliation can also silently discard a request, so a
+        // completed sweep earns another bounded attempt after the backoff.
+        // Neither the retry nor a peer hint waives certificate verification.
         if (!market->second->chain->Acceptable(market->second->chain->Current())) continue;
         const auto key{std::make_pair(peer, market->first)};
         if (m_pending_catchup.contains(key) || m_catchup_cooldowns.contains(key)) {
-            ++cursor; // a hint/proposal already initiated this discovery
+            advance(); // a hint/proposal already initiated this discovery
             continue;
         }
         if (TryRequestCatchup(*market->second, peer)) {
-            ++cursor;
+            advance();
             // At most one blind compatibility probe per second globally.
-            // A silent old peer is not probed repeatedly after this scan.
             m_next_legacy_probe = now + std::chrono::seconds{1};
             return;
         }
@@ -2045,15 +2057,11 @@ void FlowMeshRuntime::HandleProposal(
         return;
     }
 
-    const bool current_or_next_round{
-        proposal->round == market.round ||
-        (market.round != std::numeric_limits<uint32_t>::max() &&
-         proposal->round == market.round + 1)};
     if (proposal->entry.sequence != market.next_sequence) return;
-    if (!current_or_next_round) {
-        CountObservation(market.diagnostics.proposals_rejected_round);
-        return;
-    }
+    // A round selects and authenticates a proposer; it is not part of the
+    // certified entry or attestation digest. Local timers can differ after
+    // reconnect/restart, so they must not prevent checking the same entry.
+    // Validate against the envelope's signed round, never an untrusted hint.
     if (flowmesh::CheckProductionProposal(
             *proposal, market.domain, market.market_id, market.seats.epoch,
             proposal->round, market.seats) !=
@@ -2081,6 +2089,36 @@ void FlowMeshRuntime::HandleProposal(
         return;
     }
     const uint256 hash{proposal->entry.GetHash()};
+    const flowmesh::ProductionSignPosition position{market.seats.epoch,
+                                                    market.next_sequence};
+    std::optional<StoredLockedProductionCandidate> retained;
+    std::optional<uint256> locked_hash;
+    std::string lock_error;
+    if (!market.store->ReadLockedCandidate(position, retained, lock_error) ||
+        !market.store->ReadLock(position, locked_hash, lock_error) ||
+        retained.has_value() != locked_hash.has_value() ||
+        (retained && retained->entry.GetHash() != *locked_hash) ||
+        (market.diagnostics.local_locked_candidate &&
+         market.diagnostics.local_locked_candidate != locked_hash) ||
+        (locked_hash && market.candidates.count(*locked_hash) == 0)) {
+        HaltMarket(market, FlowMeshRuntimeHalt::STORE_FAILURE,
+                   lock_error.empty()
+                       ? "FlowMesh pending lock and retained candidate disagree"
+                       : std::move(lock_error));
+        return;
+    }
+    if (locked_hash && *locked_hash != hash) {
+        if (peer == LOCAL_ACTION_PEER) {
+            HaltMarket(market, FlowMeshRuntimeHalt::SIGNING_CONFLICT,
+                       "local FlowMesh proposal conflicts with its retained candidate");
+        } else {
+            // A competing proposal is not a conflicting certificate. Keep
+            // the exact durable lock and continue retrying that candidate;
+            // a remote proposer must not stop our worker with another hash.
+            CountObservation(market.diagnostics.proposals_conflicting_lock);
+        }
+        return;
+    }
     auto candidate_it{market.candidates.find(hash)};
     if (candidate_it == market.candidates.end()) {
         if (market.candidates.size() >= MAX_RUNTIME_CANDIDATES_PER_SEQUENCE) {
@@ -2097,11 +2135,14 @@ void FlowMeshRuntime::HandleProposal(
                                                   std::move(*candidate)).first;
     }
 
-    // Round timeouts are local policy, so independently installed markets can
-    // be one round apart. A fully validated proposal from the authenticated
-    // next-round proposer safely reunites them. Never accept a larger jump:
-    // an otherwise valid Byzantine proposer must not exhaust the round space.
-    if (proposal->round > market.round) {
+    if (proposal->round != market.round) {
+        CountObservation(market.diagnostics.proposals_verified_different_round);
+    }
+    // Preserve the existing adjacent-round timer nudge for mixed-version
+    // peers. Distant rounds may carry a valid entry, but cannot set our
+    // scheduling clock or remotely exhaust its finite round space.
+    if (market.round != std::numeric_limits<uint32_t>::max() &&
+        proposal->round == market.round + 1) {
         market.round = proposal->round;
         market.round_started = market.clock->Now();
     }
