@@ -7,12 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       windows_build_only:
-        description: "Build Windows artifacts only, without tests or release publication"
+        description: "Build a portable Windows ZIP only, without an installer, tests, or release publication"
         required: false
         type: boolean
         default: false
       desktop_build_only:
-        description: "Build Windows and macOS artifacts only, without tests or release publication"
+        description: "Build a portable Windows ZIP and macOS apps only, without tests or release publication"
         required: false
         type: boolean
         default: false
@@ -387,12 +387,14 @@ jobs:
     needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 240
+    env:
+      WINDOWS_PORTABLE_ONLY: ${{ github.event_name == 'workflow_dispatch' && (inputs.windows_build_only || inputs.desktop_build_only) }}
     steps:
       - uses: actions/checkout@v4
       - name: Record build-only scope
-        if: github.event_name == 'workflow_dispatch' && inputs.windows_build_only
+        if: github.event_name == 'workflow_dispatch' && (inputs.windows_build_only || inputs.desktop_build_only)
         run: |
-          echo "::notice::Windows compilation and packaging only for $GITHUB_SHA. Test programs and test execution are disabled. No tag or release will be published."
+          echo "::notice::Portable Windows ZIP compilation and packaging only for $GITHUB_SHA. No setup installer will be generated. Test programs and test execution are disabled. No tag or release will be published."
       - name: Install mingw toolchain
         run: |
           sudo apt-get update
@@ -404,6 +406,7 @@ jobs:
           cd depends && make HOST=x86_64-w64-mingw32 -j"$(nproc)"
       - name: Configure + build
         run: |
+          set -euo pipefail
           cmake -C contrib/b3hive-release/stable-channel-v1.cmake \
             -B build --toolchain depends/x86_64-w64-mingw32/toolchain.cmake \
             -DBUILD_GUI=ON -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF \
@@ -411,7 +414,16 @@ jobs:
             -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON \
             -DB3_REQUIRE_UPDATE_CHANNEL=ON \
             -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)" --target deploy
+          if [[ "$WINDOWS_PORTABLE_ONLY" == true ]]; then
+            targets=(b3coin-qt b3coind b3coin-cli b3coin-tx b3coin-util b3coin-wallet)
+            cmake --build build -j"$(nproc)" --target "${targets[@]}"
+            mkdir -p build/release
+            for binary in "${targets[@]}"; do
+              x86_64-w64-mingw32-strip "build/bin/$binary.exe" -o "build/release/$binary.exe"
+            done
+          else
+            cmake --build build -j"$(nproc)" --target deploy
+          fi
       - name: Verify x86-64 payload architecture
         run: |
           set -euo pipefail
@@ -420,15 +432,25 @@ jobs:
           done
       - name: Package
         run: |
+          set -euo pipefail
           mkdir -p out
-          cp build/b3coin-win64-setup.exe \
-            out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64-setup.exe
-          zip -j out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64.zip \
-            build/release/b3coin-qt.exe build/release/b3coind.exe \
-            build/release/b3coin-cli.exe build/release/b3coin-tx.exe \
-            build/release/b3coin-util.exe build/release/b3coin-wallet.exe \
-            README.md COPYING
-          (cd out && sha256sum *.exe *.zip > SHA256SUMS.win64)
+          archive="out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64.zip"
+          if [[ "$WINDOWS_PORTABLE_ONLY" == true ]]; then
+            test ! -e build/b3coin-win64-setup.exe
+            python3 contrib/windeploy/package_portable.py \
+              --binaries build/release --depends depends/x86_64-w64-mingw32 \
+              --archive "$archive" --source .
+            (cd out && sha256sum *.zip > SHA256SUMS.win64)
+          else
+            cp build/b3coin-win64-setup.exe \
+              out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64-setup.exe
+            zip -j "$archive" \
+              build/release/b3coin-qt.exe build/release/b3coind.exe \
+              build/release/b3coin-cli.exe build/release/b3coin-tx.exe \
+              build/release/b3coin-util.exe build/release/b3coin-wallet.exe \
+              README.md COPYING
+            (cd out && sha256sum *.exe *.zip > SHA256SUMS.win64)
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: b3-hive-win64

@@ -394,6 +394,9 @@ struct FlowMeshRuntime::Market {
     std::optional<flowmesh::AnchorRef> previous_anchor;
     std::map<std::pair<int32_t, uint256>, uint64_t> committed_anchors;
     std::map<uint256, Candidate> candidates;
+    // Decoded/authenticated durable evidence is not permission to sign. The
+    // service installs markets while its live chain gate is still closed.
+    std::optional<StoredLockedProductionCandidate> pending_candidate_restore;
     std::map<uint256, std::map<uint32_t, flowmesh::IndexedBlsSignature>>
         attestations;
     std::map<uint32_t, uint256> attested_hash_by_seat;
@@ -753,6 +756,43 @@ std::unique_ptr<typename Market::Candidate> EvaluateCandidate(
 }
 
 template <typename Market>
+bool RestoreRetainedCandidate(Market& market)
+{
+    if (!market.pending_candidate_restore) return true;
+    if (market.halt != FlowMeshRuntimeHalt::NONE) return false;
+    market.paused = true;
+    // Do not evaluate a saved candidate through the live production gate
+    // until checkpoint/index reconciliation has finished. This also prevents
+    // messages queued during startup from signing ahead of restoration.
+    if (!market.chain->Acceptable(market.chain->Current())) return false;
+
+    const auto& retained{*market.pending_candidate_restore};
+    auto candidate{EvaluateCandidate(market, retained.entry,
+                                     &retained.evidence)};
+    if (!candidate || candidate->entry.GetHash() != retained.entry.GetHash()) {
+        // A concurrent B3 reconciliation is a wait, not evidence that the
+        // retained record is invalid. Never clear or replace its disk lock.
+        if (market.halt == FlowMeshRuntimeHalt::NONE &&
+            !market.chain->Acceptable(market.chain->Current())) {
+            market.paused = true;
+            return false;
+        }
+        HaltMarket(market, FlowMeshRuntimeHalt::SIGNING_CONFLICT,
+                   "FlowMesh runtime cannot re-execute its retained signing candidate after chain reconciliation; signing remains blocked");
+        market.paused = true;
+        return false;
+    }
+    if (!candidate->evidence.empty()) {
+        market.evidence_retry = typename Market::EvidenceRetry{
+            candidate->entry.GetHash(), 0, market.clock->Now()};
+    }
+    market.diagnostics.local_locked_candidate = candidate->entry.GetHash();
+    market.candidates.emplace(candidate->entry.GetHash(), std::move(*candidate));
+    market.pending_candidate_restore.reset();
+    return true;
+}
+
+template <typename Market>
 bool RetainCandidateBeforeSigning(Market& market,
                                   const typename Market::Candidate& candidate)
 {
@@ -1019,22 +1059,16 @@ bool FlowMeshRuntime::InitializeMarket(
                 return false;
             }
         }
-        auto candidate{EvaluateCandidate(*market, retained->entry,
-                                         &retained->evidence)};
-        if (!candidate || candidate->entry.GetHash() !=
-                              retained->entry.GetHash()) {
-            error = market->error.empty()
-                        ? "FlowMesh runtime cannot re-execute its retained signing candidate"
-                        : market->error;
+        market->diagnostics.local_locked_candidate = retained->entry.GetHash();
+        market->pending_candidate_restore = std::move(retained);
+        // A service-start reconciliation gate is expected here. Keep the
+        // market installed but paused, and retry from the first live tick or
+        // message. Already-live runtimes retain immediate verification.
+        if (!RestoreRetainedCandidate(*market) &&
+            market->halt != FlowMeshRuntimeHalt::NONE) {
+            error = market->error;
             return false;
         }
-        if (!candidate->evidence.empty()) {
-            market->evidence_retry = Market::EvidenceRetry{
-                candidate->entry.GetHash(), 0, market->clock->Now()};
-        }
-        market->diagnostics.local_locked_candidate = candidate->entry.GetHash();
-        market->candidates.emplace(candidate->entry.GetHash(),
-                                   std::move(*candidate));
     }
     m_markets.emplace(config.market_id, std::move(market));
     return true;
@@ -1471,6 +1505,8 @@ void FlowMeshRuntime::ProcessMessage(
         queued.message.kind != flowmesh::WireMessageKind::GET) {
         return;
     }
+    if (queued.message.kind != flowmesh::WireMessageKind::GET &&
+        !RestoreRetainedCandidate(market)) return;
     market.diagnostics.last_message_observed_at = GetTime();
     switch (queued.message.kind) {
     case flowmesh::WireMessageKind::ACTION:
@@ -1526,6 +1562,7 @@ void FlowMeshRuntime::ProcessTick()
         (void)market_id;
         Market& market{*market_ptr};
         market.evidence_retry_eligible = false;
+        if (!RestoreRetainedCandidate(market)) continue;
         if (!RefreshMarker(market)) continue;
         const auto now{market.clock->Now()};
         if (!market.pending_handoff &&

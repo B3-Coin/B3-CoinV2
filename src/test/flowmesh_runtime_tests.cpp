@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -90,6 +91,8 @@ SeatFixture Seats(const uint256& domain, const flowmesh::MarketId& market,
 class RuntimeChain final : public node::FlowMeshRuntimeChain
 {
 public:
+    void SetReconciled(const bool reconciled) { m_reconciled = reconciled; }
+
     int32_t TipHeight() const override
     {
         std::lock_guard<std::mutex> lock{m_mutex};
@@ -98,6 +101,7 @@ public:
 
     bool Acceptable(const flowmesh::AnchorRef& anchor) const override
     {
+        if (!m_reconciled.load()) return false;
         const int32_t tip_height{TipHeight()};
         return StillCanonical(anchor) && anchor.height <= tip_height &&
                tip_height - anchor.height >=
@@ -144,7 +148,7 @@ public:
         const flowmesh::ActiveFnBlsSeatSet& current) const override
     {
         std::lock_guard<std::mutex> lock{m_mutex};
-        if (domain != m_domain || market != current.market_id) {
+        if (!m_reconciled.load() || domain != m_domain || market != current.market_id) {
             return {node::FlowMeshSeatTransitionKind::PAUSED, std::nullopt};
         }
         if (m_pause_after_checks) {
@@ -237,6 +241,7 @@ public:
                                            {200, Filled(0x74)}};
 
 private:
+    std::atomic<bool> m_reconciled{true};
     mutable std::mutex m_mutex;
     int32_t m_tip_height{260};
     mutable std::optional<size_t> m_pause_after_checks;
@@ -2273,14 +2278,52 @@ BOOST_AUTO_TEST_CASE(action_bearing_signing_lock_resumes_after_restart)
     restarted_config.keys = &keys[1];
     restarted_config.clock = &clock;
     restarted_config.round_timeout = std::chrono::hours{1};
-    restarted_config.relay = [&network](node::FlowMeshRuntimeRelay relay) {
+    std::atomic<size_t> restarted_signing_messages{0};
+    restarted_config.relay = [&network, &restarted_signing_messages](node::FlowMeshRuntimeRelay relay) {
+        if (relay.message.kind == flowmesh::WireMessageKind::PROPOSAL ||
+            relay.message.kind == flowmesh::WireMessageKind::ATTESTATION ||
+            relay.message.kind == flowmesh::WireMessageKind::CERTIFICATE) {
+            ++restarted_signing_messages;
+        }
         network.Relay(1, std::move(relay));
     };
     runtimes[1] = std::make_unique<node::FlowMeshRuntime>(
         std::move(restarted_config),
         std::vector<node::FlowMeshRuntimeMarketConfig>{restarted_market});
     network.Set(1, runtimes[1].get(), true);
+    // Match the production service: the durable store is restored before
+    // chain/index reconciliation opens the live anchor and transition gate.
+    chain.SetReconciled(false);
     BOOST_REQUIRE_MESSAGE(runtimes[1]->Start(error), error);
+    const auto paused_status{runtimes[1]->MarketStatus(market)};
+    BOOST_REQUIRE(paused_status);
+    BOOST_CHECK(paused_status->paused);
+    BOOST_CHECK(paused_status->halt == node::FlowMeshRuntimeHalt::NONE);
+    BOOST_CHECK_EQUAL(paused_status->next_sequence, 1U);
+    BOOST_CHECK(paused_status->state_root == replayed.Root());
+    runtimes[1]->NotifyTick();
+    BOOST_REQUIRE(runtimes[1]->SubmitLocalAction(market, withdrawal) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(runtimes[1]->WaitForIdle(std::chrono::seconds{2}));
+    BOOST_CHECK_EQUAL(restarted_signing_messages.load(), 0U);
+    BOOST_CHECK(runtimes[1]->MarketStatus(market)->paused);
+    const uint256 expected_lock{*locked_hash};
+    BOOST_REQUIRE(stores[1]->ReadLock(position, locked_hash, error));
+    BOOST_REQUIRE(locked_hash);
+    BOOST_CHECK(*locked_hash == expected_lock);
+    retained.reset();
+    BOOST_REQUIRE(stores[1]->ReadLockedCandidate(position, retained, error));
+    BOOST_REQUIRE(retained);
+    BOOST_CHECK(retained->entry.GetHash() == expected_lock);
+    BOOST_REQUIRE_EQUAL(retained->evidence.size(), 1U);
+    BOOST_CHECK(retained->evidence.front().credential == withdrawal.credential);
+    for (const auto& runtime : runtimes) {
+        BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+    }
+    // The closed-gate tick still advances the bounded relay scheduler. Model
+    // the next real tick instead of expecting a retry at a frozen timestamp.
+    clock.m_now += node::FlowMeshEvidenceRetryBudget::INTERVAL;
+    chain.SetReconciled(true);
 
     // The restarted proposer re-authenticates/re-executes the exact retained
     // candidate, re-gossips its evidence, and may sign only the same hash.
