@@ -25,7 +25,7 @@ gdi32.dll hid.dll imm32.dll iphlpapi.dll kernel32.dll mf.dll mfplat.dll
 mfreadwrite.dll mpr.dll msimg32.dll msvcrt.dll ncrypt.dll netapi32.dll
 normaliz.dll ntdll.dll ole32.dll oleacc.dll oleaut32.dll opengl32.dll
 powrprof.dll propsys.dll psapi.dll rpcrt4.dll secur32.dll setupapi.dll
-shell32.dll shlwapi.dll synchronization.dll ucrtbase.dll user32.dll
+shcore.dll shell32.dll shlwapi.dll synchronization.dll ucrtbase.dll user32.dll
 userenv.dll usp10.dll uxtheme.dll version.dll winhttp.dll wininet.dll
 winmm.dll winscard.dll winspool.drv wintrust.dll wldap32.dll ws2_32.dll
 wtsapi32.dll
