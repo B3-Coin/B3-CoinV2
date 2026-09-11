@@ -2147,7 +2147,22 @@ void FlowMeshRuntime::HandleProposal(
         market.round_started = market.clock->Now();
     }
 
-    const auto local_keys{LocalSeatKeys(market)};
+    auto local_keys{LocalSeatKeys(market)};
+    if (peer == LOCAL_ACTION_PEER) {
+        // When a wallet owns more seats than fit in one relay budget, serve
+        // the oldest retry first rather than starving higher seat indices.
+        const auto last_attempt = [&](const uint32_t seat) {
+            const auto& attempts{candidate_it->second.attestation_forward_attempts};
+            const auto it{attempts.find(seat)};
+            return it == attempts.end()
+                ? std::optional<flowmesh::WireClock::time_point>{}
+                : it->second;
+        };
+        std::stable_sort(local_keys.begin(), local_keys.end(),
+                        [&](const auto& a, const auto& b) {
+                            return last_attempt(a.first) < last_attempt(b.first);
+                        });
+    }
     if (!local_keys.empty() &&
         !RetainCandidateBeforeSigning(market, candidate_it->second)) {
         return;
@@ -2162,24 +2177,42 @@ void FlowMeshRuntime::HandleProposal(
         auto& attestations{market.attestations[hash]};
         const auto cached{attestations.find(seat_index)};
         if (cached != attestations.end()) {
-            // Proposals are retried across recovery rounds, while a seat may
-            // sign this candidate only once. If the original attestation was
-            // lost while the peer was starting or reconciling its B3 tip,
-            // return the exact cached signature to the authenticated
-            // proposer. Never re-sign, never target the synthetic local peer,
-            // and leave the initial broadcast behavior below unchanged.
-            if (peer != LOCAL_ACTION_PEER) {
-                const auto payload{
-                    flowmesh::EncodeProductionAttestationPayload(
-                        cached->second)};
-                if (payload) {
-                    flowmesh::WireMessage wire;
-                    wire.kind = flowmesh::WireMessageKind::ATTESTATION;
-                    wire.header = HeaderFor(candidate_it->second.entry);
-                    wire.payload = *payload;
-                    RelayMessage(market, std::move(wire), peer,
-                                 std::nullopt);
+            // Replay the exact vote; do not sign again. A locally retried
+            // proposal also needs its vote resent: a peer may have joined
+            // after the original broadcast, or reconciliation may have
+            // suppressed that send. Pace local broadcasts with the same
+            // per-seat and shared limits as committee forwarding.
+            const auto payload{
+                flowmesh::EncodeProductionAttestationPayload(cached->second)};
+            if (!payload) continue;
+            flowmesh::WireMessage wire;
+            wire.kind = flowmesh::WireMessageKind::ATTESTATION;
+            wire.header = HeaderFor(candidate_it->second.entry);
+            wire.payload = *payload;
+            if (peer == LOCAL_ACTION_PEER) {
+                const auto now{market.clock->Now()};
+                auto& last_attempt{
+                    candidate_it->second.attestation_forward_attempts[seat_index]};
+                if (last_attempt &&
+                    now < *last_attempt + FlowMeshCommitteeRelayBudget::REPEAT_DELAY) {
+                    continue;
                 }
+                const size_t bytes{
+                    flowmesh::FLOWMESH_WIRE_HEADER_SIZE + wire.payload.size()};
+                if (!m_committee_relay_budget.Available(now, bytes) ||
+                    !market.committee_relay_budget.Available(now, bytes)) {
+                    continue;
+                }
+                // Keep budget-denied local votes eligible for a later tick.
+                // Charge before the external gate, even if it drops the send.
+                last_attempt = now;
+                m_committee_relay_budget.Charge(bytes);
+                market.committee_relay_budget.Charge(bytes);
+                RelayMessage(market, std::move(wire), std::nullopt, std::nullopt);
+            } else {
+                // Preserve the direct response to an authenticated remote
+                // proposal; the synthetic local peer is never a destination.
+                RelayMessage(market, std::move(wire), peer, std::nullopt);
             }
             continue;
         }

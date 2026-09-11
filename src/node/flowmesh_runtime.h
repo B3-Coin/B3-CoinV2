@@ -258,7 +258,7 @@ private:
     size_t m_bytes{0};
 };
 
-/** Incoming verified committee gossip only; ceilings before peer fan-out. */
+/** Verified committee gossip and cached local vote retries; before fan-out. */
 class FlowMeshCommitteeRelayBudget
 {
 public:

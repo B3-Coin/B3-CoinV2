@@ -19,6 +19,12 @@ older relay/signing nodes do not acquire these runtime fixes automatically.
    new connection, announcement, or authenticated future message.
 3. A competing authenticated proposal caused a permanently locked receiver
    to halt even though it could safely keep retrying its original candidate.
+4. A proposer broadcast its own attestation only at first signing. Later
+   local proposal retries skipped that cached vote. A peer joining after the
+   first broadcast could therefore receive proposals indefinitely without
+   the vote needed to certify them. Suppression during B3 reconciliation can
+   produce the same missed-first-send condition. This gap remained in
+   `5e9cb403a823` and was reproduced against that revision.
 
 ## Changed behavior
 
@@ -39,6 +45,14 @@ older relay/signing nodes do not acquire these runtime fixes automatically.
 - Keep the legacy `proposals_rejected_round` RPC field for compatibility and
   expose `proposals_verified_different_round` and `proposals_conflicting_lock`.
   These are observations, not online-validator counts or finality proofs.
+- When retrying a local proposal, rebroadcast its byte-identical cached local
+  attestations. Preserve all proposal, anchor, transition, key and durable
+  lock gates; do not sign a different vote. Rate-limit each candidate/seat to
+  one replay per second, sharing the existing global and market committee
+  budgets. Serve oldest attempts first so wallets with more owned seats than
+  the per-market budget are not permanently skipped. Disarmed keys do not
+  initiate these retries. Existing direct replies to remote proposals remain
+  unchanged.
 
 ## Safety and availability limits
 
@@ -75,12 +89,26 @@ rounds and malformed/context/anchor/state proposals, preserved incompatible
 locks, and a real service restart that ignores a competing proposal then
 certifies its exact original retained candidate.
 
-The final local verification passed 41 cases and 104,255 assertions: 22 runtime
+The round/reconnect patch's local verification passed 41 cases and 104,255 assertions: 22 runtime
 cases (102,118 assertions), five service-status cases (63), two real startup
 cases (1,414), and 12 production-store cases (660). The round-skew regression
 also certifies a non-genesis deposit through the observer and verifies the
 exact 250-unit ledger credit, parent hash, three-seat certificate and retained
 signer locks. The test and Qt application targets compile locally.
+
+The follow-up cached-vote regression starts a proposer before its recipients
+connect. A late keyless observer must receive the exact original vote after
+the retry delay, without extra same-clock/early copies. Two more signers then
+join a line topology in which only the observer can assemble quorum; all four
+nodes must converge on the same independently verified certificate and retain
+the original lock. A second regression checks ten owned keys against an
+eight-message retry budget, identical replay payloads, fairness and disarming.
+
+With the cached-vote repair, all 43 focused cases passed (104,524 assertions):
+24 runtime, five service-status, two real startup and 12 production-store
+cases. Both Qt and the test program compiled locally. The late-observer case
+failed at its required replay assertion against `5e9cb403a823` before passing
+with the repair.
 
 These are local deterministic tests, not evidence of WAN trading latency or
 proof that the live market has resumed. Mainnet resumption must be confirmed
