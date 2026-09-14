@@ -6,6 +6,7 @@
 #include <qt/b3theme.h>
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
+#include <rpc/server.h>
 #include <qt/clientmodel.h>
 #include <qt/optionsmodel.h>
 #include <qt/platformstyle.h>
@@ -42,6 +43,7 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -79,6 +81,33 @@ UniValue RemoteData(bool trade = true)
     proof.pushKV("certificate_verified", true); proof.pushKV("account_state_verified", true); proof.pushKV("execution_result_verified", false);
     proof.pushKV("b3_checkpoint_confirmed", false); proof.pushKV("event_gap", false); v.pushKV("verification", proof); return v;
 }
+
+// Intercept only the existing read-only RPC in an isolated Qt unit process.
+// No remote endpoint, wallet outbox or signing path is substituted or opened.
+struct StatusReadProbe {
+    QSemaphore entered, release;
+    std::atomic_int count{0};
+    std::atomic_bool fail{false}, wrong_account{false};
+    std::mutex mutex;
+    std::vector<std::pair<std::string, UniValue>> requests;
+    CRPCCommand command;
+    StatusReadProbe() : command{"hidden", "getflowmeshactionstatus",
+        [this](const JSONRPCRequest& request, UniValue& result, bool) {
+            { std::lock_guard lock{mutex}; requests.emplace_back(request.URI, request.params); }
+            ++count; entered.release();
+            if (!release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic status request exceeded its test bound"};
+            if (fail) throw std::runtime_error{"Synthetic status endpoint unavailable"};
+            result = UniValue{UniValue::VOBJ};
+            result.pushKV("market_id", request.params[0].get_str()); result.pushKV("action_id", request.params[1].get_str());
+            result.pushKV("accepted", false); // Existing legacy status format; account_id is optional.
+            if (wrong_account) result.pushKV("account_id", H(111).GetHex());
+            return true;
+        }, {}, 998877} {
+        if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
+        tableRPC.appendCommand(command.name, &command);
+    }
+    ~StatusReadProbe() { tableRPC.removeCommand(command.name, &command); }
+};
 }
 
 class B3FlowMeshWorkspaceTests : public QObject
@@ -138,6 +167,23 @@ class B3FlowMeshWorkspaceTests : public QObject
         panel.m_thread = new QThread{&panel};
         panel.m_busy = false;
         panel.updateControls();
+    }
+
+    static B3FlowMeshTrading::SavedActions SavedReadFixture(B3FlowMeshTradingPanel& panel)
+    {
+        B3FlowMeshTrading::SavedActions saved;
+        saved.account = panel.m_snapshot->account;
+        B3FlowMeshTrading::SavedAction action;
+        action.market = panel.m_snapshot->market; action.domain = panel.m_snapshot->domain;
+        action.config = panel.m_snapshot->config; action.account = saved.account;
+        action.sequence = 7; action.type = 0; action.signed_bytes_size = 279;
+        action.initial_submission_ms = 123; action.may_have_been_sent = true;
+        action.signed_bytes_sha256 = QString::fromStdString(H(94).GetHex());
+        action.receipt.action_id = QString::fromStdString(H(95).GetHex());
+        action.receipt.market = action.market; action.receipt.account = action.account;
+        action.receipt.state = QStringLiteral("unknown"); action.receipt.no_resubmit = true;
+        saved.actions = {action}; panel.restoreSavedActions(saved);
+        return saved;
     }
 
     static void Observe(B3FlowMeshTradingPanel& panel, const Snapshot& snapshot, bool inverse = false)
@@ -1259,6 +1305,207 @@ private Q_SLOTS:
         QVERIFY(depth_changed.count() > 0); // Real updates are not suppressed.
         QVERIFY(panel.m_depth_view->item(changed_row, 1)->text() != before);
     }
+    void passiveSavedControlsStayEnabled()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        SavedReadFixture(panel);
+        const QString card{panel.m_receipt_card->text()};
+        ReadInFlight(panel);
+        for (int i{0}; i < 5; ++i) {
+            panel.updateControls();
+            QVERIFY(panel.m_saved_selector->isEnabled());
+            QVERIFY(panel.m_check_receipt->isEnabled());
+            QCOMPARE(panel.m_receipt_card->text(), card);
+        }
+    }
+
+    void explicitStatusClickIsNotLostDuringRead()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        const auto saved{SavedReadFixture(panel)};
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        ReadInFlight(panel); const auto original_thread{panel.m_thread};
+        for (int i{0}; i < 5; ++i) panel.m_check_receipt->click();
+        QCOMPARE(panel.m_thread, original_thread);
+        QVERIFY(!panel.m_active_result);
+        const auto failed{std::make_shared<B3FlowMeshTradingPanel::Result>()};
+        failed->error = QStringLiteral("Synthetic passive endpoint failure");
+        panel.finishJob(failed);
+        // A failed passive read still drains the one explicit read. The
+        // isolated RPC may fail, but it must not silently lose the click.
+        QVERIFY(panel.m_active_result);
+        QVERIFY(panel.m_active_result->receipt_only);
+        QCOMPARE(panel.m_active_result->receipt_action_id, saved.actions[0].receipt.action_id);
+        QVERIFY(!panel.m_active_result->action); QVERIFY(!panel.m_active_result->exact_retry);
+        panel.cancelAndWait();
+        QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+        QCOMPARE(panel.m_saved_actions.actions[0].signed_bytes_sha256, saved.actions[0].signed_bytes_sha256);
+        QCOMPARE(panel.m_saved_actions.actions[0].sequence, saved.actions[0].sequence);
+        QVERIFY(panel.m_saved_actions.actions[0].receipt.no_resubmit);
+    }
+
+    void deferredStatusReadCoalescesWhileVisibleOrHidden_data()
+    {
+        QTest::addColumn<bool>("hidden");
+        QTest::newRow("visible") << false;
+        QTest::newRow("hidden") << true;
+    }
+    void deferredStatusReadCoalescesWhileVisibleOrHidden()
+    {
+        QFETCH(bool, hidden);
+        StatusReadProbe probe;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        struct Cleanup { StatusReadProbe& probe; B3FlowMeshTradingPanel& panel; ~Cleanup() { probe.release.release(8); panel.cancelAndWait(); } } cleanup{probe, panel};
+        const auto saved{SavedReadFixture(panel)};
+        const auto card{panel.m_receipt_card->text()};
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        if (!hidden) panel.show();
+        ReadInFlight(panel); const auto thread{panel.m_thread};
+        for (int i{0}; i < 20; ++i) panel.m_check_receipt->click();
+        QCOMPARE(probe.count.load(), 0); QCOMPARE(panel.m_thread, thread);
+        QVERIFY(panel.m_deferred_status); QVERIFY(panel.m_status_read_state->text().contains(QStringLiteral("queued")));
+        QCOMPARE(panel.m_receipt_card->text(), card);
+        auto failed{std::make_shared<B3FlowMeshTradingPanel::Result>()}; failed->error = QStringLiteral("Passive endpoint unavailable");
+        panel.finishJob(failed);
+        QVERIFY(probe.entered.tryAcquire(1, 1000)); QVERIFY(panel.m_active_result);
+        const auto active{panel.m_active_result};
+        QVERIFY(active->receipt_only); QVERIFY(!active->write_attempted); QVERIFY(!active->action); QVERIFY(!active->exact_retry);
+        QVERIFY(!panel.m_deferred_status); QVERIFY(panel.m_status_read_state->text().contains(QStringLiteral("Checking")));
+        const auto active_thread{panel.m_thread};
+        for (int i{0}; i < 20; ++i) panel.m_check_receipt->click();
+        QCOMPARE(panel.m_thread, active_thread); QVERIFY(!panel.m_deferred_status);
+        QCOMPARE(probe.count.load(), 1);
+        {
+            std::lock_guard lock{probe.mutex}; QCOMPARE(probe.requests.size(), size_t{1});
+            QCOMPARE(probe.requests[0].first, B3AssetTransfer::WalletUri(m_model->getWalletName()));
+            QCOMPARE(probe.requests[0].second[0].get_str(), saved.actions[0].market.toStdString());
+            QCOMPARE(probe.requests[0].second[1].get_str(), saved.actions[0].receipt.action_id.toStdString());
+        }
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.count.load(), 1); QVERIFY(!active->write_attempted);
+        QCOMPARE(panel.m_receipt->account, saved.account); QVERIFY(panel.m_receipt->no_resubmit);
+        QCOMPARE(panel.m_saved_actions.actions[0].sequence, saved.actions[0].sequence);
+        QCOMPARE(panel.m_saved_actions.actions[0].signed_bytes_sha256, saved.actions[0].signed_bytes_sha256);
+        QCOMPARE(panel.m_saved_actions.actions[0].signed_bytes_size, saved.actions[0].signed_bytes_size);
+        QCOMPARE(panel.m_saved_actions.actions[0].initial_submission_ms, saved.actions[0].initial_submission_ms);
+        QVERIFY(panel.m_saved_actions.actions[0].may_have_been_sent);
+        QVERIFY(panel.m_check_receipt->isEnabled()); QVERIFY(panel.m_saved_selector->isEnabled());
+        QVERIFY(!panel.m_deferred_review); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+
+    void deferredStatusReadInvalidatesChangedScope_data()
+    {
+        QTest::addColumn<QString>("change");
+        for (const auto* change : {"selection-away-and-back", "market", "wallet", "generation", "account", "domain", "config"})
+            QTest::newRow(change) << QString::fromLatin1(change);
+    }
+    void deferredStatusReadInvalidatesChangedScope()
+    {
+        QFETCH(QString, change);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        auto saved{SavedReadFixture(panel)};
+        auto second{saved.actions[0]}; second.sequence = 8; second.receipt.action_id = QString::fromStdString(H(96).GetHex());
+        saved.actions.push_back(second); panel.restoreSavedActions(saved);
+        ReadInFlight(panel); panel.m_check_receipt->click(); QVERIFY(panel.m_deferred_status);
+        std::optional<OfflineWallet> replacement;
+        if (change == QStringLiteral("selection-away-and-back")) {
+            panel.m_saved_selector->setCurrentIndex(1); panel.m_saved_selector->setCurrentIndex(0);
+        } else if (change == QStringLiteral("market")) {
+            auto market{panel.m_market_data.front()}; market.id = QString::fromStdString(H(101).GetHex());
+            panel.m_market_data.push_back(market); panel.m_market->addItem(QStringLiteral("other market"), market.id); panel.m_market->setCurrentIndex(1);
+        } else if (change == QStringLiteral("wallet")) {
+            panel.cancelAndWait(); replacement = MakeOfflineWallet(m_wallet->GetName());
+            AttachOfflineWallet(panel, *replacement->model, replacement->wallet); SavedReadFixture(panel);
+        } else if (change == QStringLiteral("generation")) ++panel.m_generation;
+        else if (change == QStringLiteral("account")) panel.m_saved_actions.account = QString::fromStdString(H(101).GetHex());
+        else if (change == QStringLiteral("domain")) panel.m_saved_actions.actions[0].domain = QString::fromStdString(H(101).GetHex());
+        else if (change == QStringLiteral("config")) panel.m_market_data[0].config = QString::fromStdString(H(101).GetHex());
+        auto failed{std::make_shared<B3FlowMeshTradingPanel::Result>()}; failed->error = QStringLiteral("Passive read complete");
+        panel.finishJob(failed);
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_deferred_status);
+        panel.cancelAndWait();
+    }
+
+    void statusReadLateResultStaysWithOriginalRequest_data()
+    {
+        QTest::addColumn<bool>("failure"); QTest::addColumn<bool>("wrong_account");
+        QTest::newRow("success-with-optional-account-omitted") << false << false;
+        QTest::newRow("endpoint-failure") << true << false;
+        QTest::newRow("wrong-account-rejected") << false << true;
+    }
+    void statusReadLateResultStaysWithOriginalRequest()
+    {
+        QFETCH(bool, failure); QFETCH(bool, wrong_account);
+        StatusReadProbe probe; probe.fail = failure; probe.wrong_account = wrong_account;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        struct Cleanup { StatusReadProbe& probe; B3FlowMeshTradingPanel& panel; ~Cleanup() { probe.release.release(8); panel.cancelAndWait(); } } cleanup{probe, panel};
+        auto saved{SavedReadFixture(panel)};
+        // Same semantic ActionId in another market must not alias the first.
+        auto second{saved.actions[0]}; second.market = QString::fromStdString(H(101).GetHex()); second.receipt.market = second.market;
+        saved.actions.push_back(second); panel.restoreSavedActions(saved);
+        panel.m_check_receipt->click(); QVERIFY(probe.entered.tryAcquire(1, 1000));
+        auto first_result{panel.m_active_result}; QVERIFY(first_result);
+        panel.m_saved_selector->setCurrentIndex(1); const auto other_card{panel.m_receipt_card->text()};
+        panel.m_check_receipt->click(); QVERIFY(panel.m_deferred_status);
+        probe.release.release();
+        QTRY_COMPARE_WITH_TIMEOUT(probe.count.load(), 2, 2000);
+        QVERIFY(probe.entered.tryAcquire(1, 1000));
+        QCOMPARE(panel.m_receipt_card->text(), other_card); // A's late error/success cannot relabel B.
+        QCOMPARE(panel.m_receipt->market, second.market); QVERIFY(panel.m_receipt_error.isEmpty());
+        const auto second_result{panel.m_active_result}; QVERIFY(second_result); QVERIFY(second_result != first_result);
+        QCOMPARE(second_result->receipt_market, second.market);
+        if (!failure && !wrong_account) {
+            QVERIFY(first_result->receipt); QCOMPARE(first_result->receipt->account, saved.account);
+        } else QVERIFY(!first_result->receipt);
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.count.load(), 2); QVERIFY(!first_result->write_attempted); QVERIFY(!second_result->write_attempted);
+        QCOMPARE(panel.m_receipt->market, second.market); QVERIFY(panel.m_receipt->no_resubmit);
+        QCOMPARE(panel.m_saved_actions.actions[0].signed_bytes_sha256, saved.actions[0].signed_bytes_sha256);
+        if (failure || wrong_account) QVERIFY(!panel.m_receipt_error.isEmpty());
+    }
+
+    void shutdownDropsPendingStatusWithoutOwningWalletOrChangingInstruction()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        const auto saved{SavedReadFixture(panel)};
+        const std::weak_ptr<interfaces::Wallet> backend{panel.m_backend};
+        ReadInFlight(panel); panel.m_check_receipt->click(); QVERIFY(panel.m_deferred_status);
+        const auto scope{*panel.m_deferred_status};
+        panel.hide(); panel.cancelAndWait();
+        QVERIFY(backend.expired()); QVERIFY(!panel.m_deferred_status); QVERIFY(!panel.m_thread);
+        QVERIFY(!panel.m_wallet); QVERIFY(!panel.m_backend); QVERIFY(!panel.m_active_result);
+        QVERIFY(!panel.statusReadValid(scope, true));
+        QCOMPARE(panel.m_saved_actions.actions[0].receipt.action_id, saved.actions[0].receipt.action_id);
+        QCOMPARE(panel.m_saved_actions.actions[0].signed_bytes_sha256, saved.actions[0].signed_bytes_sha256);
+        QCOMPARE(panel.m_saved_actions.actions[0].sequence, saved.actions[0].sequence);
+        QVERIFY(panel.m_saved_actions.actions[0].receipt.no_resubmit);
+        QVERIFY(!panel.m_check_receipt->isEnabled()); QVERIFY(m_wallet->IsLocked());
+    }
+
+    void pendingReadCannotDrainThroughPanelDestroyedInExistingReview()
+    {
+        auto* panel{new B3FlowMeshTradingPanel}; AttachOfflineWallet(*panel);
+        SavedReadFixture(*panel); ReadInFlight(*panel); panel->m_check_receipt->click();
+        QVERIFY(panel->m_deferred_status);
+        const QPointer<B3FlowMeshTradingPanel> alive{panel};
+        const std::weak_ptr<interfaces::Wallet> backend{panel->m_backend};
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        // Synthetic completion enters the existing fee-review dialog. No RPC,
+        // transaction construction or broadcast is performed by this fixture.
+        auto result{std::make_shared<B3FlowMeshTradingPanel::Result>()};
+        B3FlowMeshTrading::Action action; action.operation = B3FlowMeshTrading::Operation::Checkpoint;
+        action.market = panel->m_market_data.front(); result->action = action;
+        result->prepared.emplace(); result->prepared->txid = QString::fromStdString(H(112).GetHex());
+        bool dialog_seen{false};
+        QTimer::singleShot(0, [&] {
+            dialog_seen = alive && alive->m_confirmation;
+            delete alive.data();
+        });
+        panel->finishJob(result);
+        QVERIFY(dialog_seen); QVERIFY(!alive); QVERIFY(backend.expired());
+        QVERIFY(!result->write_attempted); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+
     void backgroundReadKeepsReviewControlsStableAndQueuesOnlyReview()
     {
         B3FlowMeshTradingPanel panel;

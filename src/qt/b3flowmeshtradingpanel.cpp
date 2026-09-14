@@ -157,10 +157,12 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     saved_layout->addWidget(m_saved_selector);
     m_receipt_card = Label(tr("Loading this wallet's locally saved requests. No action is automatically resent."), saved_page);
     m_receipt_card->setObjectName(QStringLiteral("flowMeshReceiptCard")); saved_layout->addWidget(m_receipt_card);
+    m_status_read_state = Label(tr("Status checks are read-only; no action is resent."), saved_page);
+    m_status_read_state->setObjectName(QStringLiteral("flowMeshStatusReadState")); saved_layout->addWidget(m_status_read_state);
     m_check_receipt = new QPushButton{tr("Check selected request status"), saved_page}; m_check_receipt->setObjectName(QStringLiteral("flowMeshCheckReceipt"));
     saved_layout->addWidget(m_check_receipt); m_activity->addTab(saved_page, tr("Saved requests"));
     connect(m_saved_selector, &QComboBox::currentIndexChanged, this, &B3FlowMeshTradingPanel::selectSavedAction);
-    connect(m_check_receipt, &QPushButton::clicked, this, [this] { selectSavedAction(); startJob(std::nullopt, std::nullopt, false, true); });
+    connect(m_check_receipt, &QPushButton::clicked, this, &B3FlowMeshTradingPanel::requestStatusRead);
     auto* advanced_toggle{new QPushButton{tr("Details"), content}}; advanced_toggle->setObjectName(QStringLiteral("flowMeshDetails")); advanced_toggle->setCheckable(true); advanced_toggle->setFlat(true); auto* details_row{new QHBoxLayout}; details_row->addStretch(); details_row->addWidget(advanced_toggle); layout->addLayout(details_row);
     m_advanced = new QWidget{content}; B3Theme::markCard(m_advanced); auto* settlement{new QVBoxLayout{m_advanced}};
     m_identity_detail = Label(tr("Full market identity will appear after a verified snapshot."), m_advanced); settlement->addWidget(m_identity_detail);
@@ -184,6 +186,7 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         updateMarketText(); updateDataViews();
     });
     connect(m_market, &QComboBox::currentIndexChanged, this, [this] {
+        m_deferred_status.reset(); // A queued click never follows a market switch.
         const auto selected{market()};
         if (!selected || !m_snapshot || selected->id != m_snapshot->market) {
             m_snapshot.reset(); m_response_age.invalidate(); m_certificate_age.invalidate(); m_queue_age.invalidate();
@@ -503,8 +506,9 @@ void B3FlowMeshTradingPanel::updateControls()
     const bool saved{m_receipt && !m_receipt->Included() && !m_receipt->no_resubmit && receiptWalletSelected()};
     m_retry_receipt->setVisible(saved);
     m_retry_receipt->setEnabled(saved && idle && !m_thread && !m_read_failed && m_response_age.isValid() && m_response_age.elapsed() <= 3000);
-    m_saved_selector->setEnabled(idle && !m_thread);
-    m_check_receipt->setEnabled(idle && !m_thread && m_saved_actions_ready && m_saved_selector->currentIndex() >= 0);
+    m_saved_selector->setEnabled(idle);
+    m_check_receipt->setEnabled(idle && selectedStatusRead().has_value());
+    updateStatusReadState();
     m_chart->setStale(m_snapshot && (m_read_failed || !m_response_age.isValid() || m_response_age.elapsed() > 3000));
     m_chart->setLoading(m_loading);
 }
@@ -512,6 +516,7 @@ void B3FlowMeshTradingPanel::updateControls()
 void B3FlowMeshTradingPanel::refresh()
 {
     if (!m_wallet || !m_backend || m_busy || m_thread) return;
+    if (m_deferred_status) { resumeStatusRead(); return; }
     if (m_read_failures && m_attempt_age.isValid() && m_attempt_age.elapsed() < std::min(10000U, 500U << std::min(4U, m_read_failures))) return;
     startJob();
 }
@@ -670,9 +675,80 @@ std::vector<UniValue> B3FlowMeshTradingPanel::ReadEffectsForRefresh(
     return out;
 }
 
-void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optional<B3AssetTransfer::Prepared> prepared, bool exact_retry, bool receipt_only)
+std::optional<B3FlowMeshTradingPanel::StatusRead> B3FlowMeshTradingPanel::selectedStatusRead() const
+{
+    if (!m_wallet || !m_backend || !m_saved_actions_ready || m_cancel->load()) return std::nullopt;
+    const QString selected{m_saved_selector->currentData(Qt::UserRole + 1).toString()};
+    const auto row{std::find_if(m_saved_actions.actions.begin(), m_saved_actions.actions.end(), [&](const auto& a) {
+        return a.market + QLatin1Char(':') + a.receipt.action_id == selected;
+    })};
+    if (row == m_saved_actions.actions.end()) return std::nullopt;
+    const auto visible{market()};
+    StatusRead scope{m_wallet, m_generation, &m_wallet->node(), row->domain, row->config,
+                     row->market, row->account, row->receipt.action_id, visible ? visible->id : QString{}};
+    return statusReadValid(scope, false) ? std::optional{scope} : std::nullopt;
+}
+
+bool B3FlowMeshTradingPanel::statusReadValid(const StatusRead& scope, bool selected) const
+{
+    if (!m_wallet || !m_backend || m_cancel->load() || !m_saved_actions_ready ||
+        scope.wallet != m_wallet || scope.generation != m_generation || scope.node != &m_wallet->node()) return false;
+    const auto row{std::find_if(m_saved_actions.actions.begin(), m_saved_actions.actions.end(), [&](const auto& a) {
+        return a.domain == scope.domain && a.config == scope.config && a.market == scope.market &&
+            a.account == scope.account && a.receipt.action_id == scope.action_id;
+    })};
+    if (row == m_saved_actions.actions.end() || scope.account != m_saved_actions.account) return false;
+    const auto known{std::find_if(m_market_data.begin(), m_market_data.end(), [&](const auto& m) { return m.id == scope.market; })};
+    if (known != m_market_data.end() && (known->domain != scope.domain || known->config != scope.config ||
+        (known->has_account && known->account != scope.account))) return false;
+    if (!selected) return true; // A late result may update only its original saved row.
+    const auto visible{market()};
+    return scope.selected_market == (visible ? visible->id : QString{}) &&
+        m_saved_selector->currentData(Qt::UserRole + 1).toString() == scope.market + QLatin1Char(':') + scope.action_id;
+}
+
+void B3FlowMeshTradingPanel::requestStatusRead()
+{
+    if (m_busy || !m_security_warning.isEmpty()) return;
+    const auto scope{selectedStatusRead()};
+    if (!scope) return;
+    // Repeated clicks for an already-running explicit read coalesce into that
+    // read. Otherwise one non-owning slot waits behind the existing worker.
+    if (m_active_result && m_active_result->receipt_only && m_active_result->receipt_scope == scope) {
+        updateStatusReadState(); return;
+    }
+    m_deferred_status = scope;
+    updateStatusReadState(); resumeStatusRead();
+}
+
+void B3FlowMeshTradingPanel::resumeStatusRead()
+{
+    if (!m_deferred_status || m_thread || m_busy) return;
+    const auto scope{*m_deferred_status}; m_deferred_status.reset();
+    if (m_security_warning.isEmpty() && statusReadValid(scope, true))
+        startJob(std::nullopt, std::nullopt, false, true, scope);
+    updateStatusReadState();
+}
+
+void B3FlowMeshTradingPanel::updateStatusReadState()
+{
+    QString text{tr("Status checks are read-only; no action is resent.")};
+    if (m_deferred_status && statusReadValid(*m_deferred_status, true))
+        text = tr("Status check queued after the current read; original request retained.");
+    else if (m_active_result && m_active_result->receipt_only && m_active_result->receipt_scope &&
+             statusReadValid(*m_active_result->receipt_scope, true))
+        text = tr("Checking this saved request; original instruction and protections retained.");
+    if (m_status_read_state->text() != text) m_status_read_state->setText(text);
+}
+
+void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optional<B3AssetTransfer::Prepared> prepared, bool exact_retry, bool receipt_only,
+                                    std::optional<StatusRead> status_read)
 {
     if (!m_wallet || !m_backend || m_thread) return;
+    if (receipt_only) {
+        if (!status_read) status_read = selectedStatusRead();
+        if (!status_read || !statusReadValid(*status_read, true)) return;
+    }
     if (action && !m_saved_actions_ready) return;
     const bool tracked{m_receipt && receiptWalletSelected()};
     if ((exact_retry || receipt_only) && !tracked) return;
@@ -688,6 +764,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     m_busy = action.has_value() || exact_retry; m_loading = !action && !m_snapshot; m_cancel->store(false); m_attempt_age.restart(); updateControls(); m_chart->setLoading(m_loading);
     auto result{std::make_shared<Result>()}; result->action = action; result->prepared = prepared; result->broadcast = prepared.has_value(); result->wallet = m_wallet_name;
     result->exact_retry = exact_retry; result->receipt_only = receipt_only;
+    result->receipt_scope = receipt_only ? status_read : !action && !exact_retry ? selectedStatusRead() : std::nullopt;
     m_active_result = result;
     auto* node{&m_wallet->node()}; const auto backend{m_backend}; const auto cancel{m_cancel};
     const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())}; const auto generation{m_generation};
@@ -696,9 +773,10 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     result->markets = m_market_data; result->effects = m_effect_data;
     const QString known_head{m_snapshot && m_snapshot->market == selected_id ? m_snapshot->head : QString{}};
     const QString route_base{m_route_pending ? m_requested_base : QString{}};
-    const QString receipt_market{tracked ? m_pending_market : QString{}}, receipt_id{tracked ? m_receipt->action_id : QString{}};
+    const QString receipt_market{status_read ? status_read->market : tracked ? m_pending_market : QString{}},
+        receipt_id{status_read ? status_read->action_id : tracked ? m_receipt->action_id : QString{}};
     result->receipt_market = receipt_market; result->receipt_action_id = receipt_id;
-    result->receipt_account = tracked ? m_pending_account : QString{};
+    result->receipt_account = status_read ? status_read->account : tracked ? m_pending_account : QString{};
     m_thread = QThread::create([this, generation, node, backend, cancel, uri, result, selected_id, known_head, route_base, watch_queue, queue_watch, receipt_market, receipt_id] {
         try {
             const auto cancelled = [&] { return cancel->load() || node->shutdownRequested(); };
@@ -714,9 +792,18 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                 }
                 return node->executeRpc(method, params, method == "getblockchaininfo" || method == "testmempoolaccept" ? "" : uri);
             };
+            const auto read_receipt = [&](const UniValue& response) {
+                auto receipt{B3FlowMeshTrading::ParseReceipt(response, receipt_market, receipt_id)};
+                // Older status responses omit account_id. Bind them to the
+                // captured request, never a newly selected row on completion.
+                if (receipt.account.isEmpty()) receipt.account = result->receipt_account;
+                else if (!result->receipt_account.isEmpty() && receipt.account != result->receipt_account)
+                    throw std::runtime_error{"Status response belongs to another captured wallet account."};
+                return receipt;
+            };
             if (result->exact_retry || result->receipt_only) {
                 const auto request{B3FlowMeshTrading::ReceiptParameters(receipt_market, receipt_id, result->exact_retry)};
-                result->receipt = B3FlowMeshTrading::ParseReceipt(rpc(request.method, request.params), receipt_market, receipt_id);
+                result->receipt = read_receipt(rpc(request.method, request.params));
                 return;
             }
             if (!result->action) {
@@ -759,7 +846,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                 if (!receipt_id.isEmpty()) {
                     try {
                         const auto request{B3FlowMeshTrading::ReceiptParameters(receipt_market, receipt_id)};
-                        result->receipt = B3FlowMeshTrading::ParseReceipt(rpc(request.method, request.params), receipt_market, receipt_id);
+                        result->receipt = read_receipt(rpc(request.method, request.params));
                     } catch (const UniValue& error) { result->receipt_error = RpcError(error); }
                     catch (const std::exception& error) { result->receipt_error = QString::fromUtf8(error.what()).left(500); }
                 }
@@ -795,6 +882,24 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
 void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
 {
     stopWorker(); m_active_result.reset();
+    if (result->receipt_scope && !statusReadValid(*result->receipt_scope, false)) {
+        result->receipt.reset(); result->receipt_error.clear();
+        result->receipt_market.clear(); result->receipt_account.clear(); result->receipt_action_id.clear();
+        if (result->receipt_only) result->error = tr("Captured status scope changed; the late result was not applied.");
+    }
+    // Applying an economic result can enter an existing modal review, whose
+    // event loop may destroy the panel. Never drain a read through that owner.
+    const QPointer<B3FlowMeshTradingPanel> self{this};
+    applyJobResult(result);
+    if (!self) return;
+    // Drain on both successful and failed reads, including while hidden. The
+    // existing worker must be destroyed before another read can be started.
+    resumeStatusRead();
+    updateStatusReadState();
+}
+
+void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& result)
+{
     if (!m_wallet || m_cancel->load()) { m_deferred_review.reset(); restoreLock(); m_busy = false; updateControls(); return; }
     if (result->exact_retry || result->receipt_only) {
         m_busy = false;
@@ -805,7 +910,10 @@ void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
             notice((result->receipt_only ? tr("Status unavailable: %1. The original request and its protections are retained; no action was resent.")
                 : tr("Exact-action retry did not return a verified status: %1. No new request was created or signed; the saved action remains unresolved.")).arg(result->error));
         }
-        updateReceiptCard(); updateMarketText(); if (!result->receipt_only) refresh(); return;
+        updateReceiptCard(); updateMarketText();
+        if (m_deferred_review) resumeReview();
+        else if (!result->receipt_only) refresh();
+        return;
     }
     if (!result->error.isEmpty()) {
         m_deferred_review.reset();
@@ -913,7 +1021,7 @@ void B3FlowMeshTradingPanel::stopWorker()
 }
 void B3FlowMeshTradingPanel::cancelAndWait()
 {
-    m_timer->stop(); m_cancel->store(true); m_deferred_review.reset(); ++m_generation;
+    m_timer->stop(); m_cancel->store(true); m_deferred_review.reset(); m_deferred_status.reset(); ++m_generation;
     m_busy = true; updateControls();
     if (m_wallet) disconnect(m_wallet, nullptr, this, nullptr);
     if (m_confirmation) m_confirmation->reject();
@@ -1063,6 +1171,7 @@ void B3FlowMeshTradingPanel::restoreSavedActions(const B3FlowMeshTrading::SavedA
 void B3FlowMeshTradingPanel::selectSavedAction()
 {
     if (!m_wallet || !m_saved_actions_ready || m_busy) return;
+    if (m_deferred_status && !statusReadValid(*m_deferred_status, true)) m_deferred_status.reset();
     const QString selected{m_saved_selector->currentData(Qt::UserRole + 1).toString()};
     const auto action{std::find_if(m_saved_actions.actions.begin(), m_saved_actions.actions.end(), [&](const auto& a) { return a.market + QLatin1Char(':') + a.receipt.action_id == selected; })};
     if (action == m_saved_actions.actions.end()) { updateReceiptCard(); updateControls(); return; }
