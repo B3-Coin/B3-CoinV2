@@ -185,6 +185,7 @@ static UniValue CertifiedMarketDataJson(const flowmesh::MarketData& data)
     snapshot.pushKV("quorum_required", static_cast<uint64_t>(source.quorum_required));
     snapshot.pushKV("running", source.running);
     snapshot.pushKV("paused", source.paused);
+    snapshot.pushKV("chain_reconciling", source.chain_reconciling);
     snapshot.pushKV("observer_only", source.observer_only);
     snapshot.pushKV("pending_handoff", source.pending_handoff);
     snapshot.pushKV("halt", source.halt);
@@ -829,6 +830,7 @@ RPCHelpMan getflowmeshmarketdata()
                 {T::NUM, "quorum_required", "Certificate signature threshold"},
                 {T::BOOL, "running", "Local service is running"},
                 {T::BOOL, "paused", "Local execution is paused"},
+                {T::BOOL, "chain_reconciling", "Local service is reconciling the current B3 tip; retry reads and do not submit actions yet"},
                 {T::BOOL, "observer_only", "Local node has no active signing seat"},
                 {T::BOOL, "pending_handoff", "Committee handoff is pending"},
                 {T::STR, "halt", "Local fail-closed halt state"},

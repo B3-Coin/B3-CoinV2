@@ -148,6 +148,9 @@ enum class QueueResult : uint8_t {
     PEER_LIMIT,
     MARKET_LIMIT,
     GLOBAL_LIMIT,
+    // Local service admission only; never encoded on the wire.
+    RECONCILING,
+    STOPPED,
 };
 
 struct QueuedWireMessage {

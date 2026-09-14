@@ -260,6 +260,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/flowmesh_runtime.cpp
   node/flowmesh_service.cpp
   node/flowmesh_store.cpp
+  node/flowmesh_net.cpp
   node/flowmesh_vault_index.cpp
   node/flowmesh_checkpoint_index.cpp
   node/fn_pod.cpp
@@ -297,6 +298,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   rpc/mining.cpp
   rpc/net.cpp
   rpc/node.cpp
+  rpc/flowmesh_network.cpp
   rpc/output_script.cpp
   rpc/rawtransaction.cpp
   rpc/server.cpp

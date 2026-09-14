@@ -98,6 +98,8 @@ struct MarketDataSnapshot {
     size_t quorum_required{0};
     bool running{false};
     bool paused{true};
+    // Local service overlay only; never part of a certificate or state root.
+    bool chain_reconciling{false};
     bool observer_only{true};
     bool pending_handoff{false};
     std::string halt;

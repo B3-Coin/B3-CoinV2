@@ -80,6 +80,8 @@ add_executable(test_bitcoin
   flowmesh_runtime_tests.cpp
   flowmesh_service_tests.cpp
   flowmesh_production_wire_tests.cpp
+  flowmesh_net_tests.cpp
+  flowmesh_transport_compat_tests.cpp
   flowmesh_seat_binding_tests.cpp
   flowmesh_vault_index_tests.cpp
   fn_seat_index_tests.cpp

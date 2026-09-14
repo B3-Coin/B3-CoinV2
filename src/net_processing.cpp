@@ -697,7 +697,7 @@ public:
     std::vector<CTransactionRef> AbortPrivateBroadcast(const uint256& id) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void SendPings() override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void RelayFinalitySignatures(std::span<const node::FinalitySig> sigs) override;
-    void RelayFlowMeshMessage(
+    node::FlowMeshRelayResult RelayFlowMeshMessage(
         const flowmesh::WireMessage& message,
         std::optional<NodeId> peer = std::nullopt,
         std::optional<NodeId> exclude_peer = std::nullopt) override
@@ -2810,16 +2810,19 @@ void PeerManagerImpl::MaybeFinalityTransport(CNode& node, Peer& peer,
     for (const node::FinalitySig& sig : replay) MakeAndPushMessage(node, NetMsgType::FINSIG, sig);
 }
 
-void PeerManagerImpl::RelayFlowMeshMessage(
+node::FlowMeshRelayResult PeerManagerImpl::RelayFlowMeshMessage(
     const flowmesh::WireMessage& message, std::optional<NodeId> target_peer,
     std::optional<NodeId> exclude_peer)
 {
+    node::FlowMeshRelayResult result;
     flowmesh::WireCheck check;
     const auto encoded{flowmesh::EncodeWireMessage(message, check)};
     if (!encoded) {
         LogDebug(BCLog::NET, "refusing malformed local FlowMesh frame: %s\n",
                  flowmesh::WireCheckName(check));
-        return;
+        result.no_peer_reason = node::FlowMeshDeliveryAdmission::INVALID;
+        result.reason = flowmesh::WireCheckName(check);
+        return result;
     }
 
     std::vector<NodeId> eligible;
@@ -2844,13 +2847,32 @@ void PeerManagerImpl::RelayFlowMeshMessage(
         }
     }
     for (const NodeId id : eligible) {
+        node::FlowMeshPeerAdmission admission{id, node::FlowMeshDeliveryAdmission::DISCONNECTED, "B3 peer disconnected before queue admission"};
         m_connman.ForNode(id, [&](CNode* node) {
             if (!node->fSuccessfullyConnected || node->fDisconnect) return false;
+            if (node->fPauseSend) {
+                admission.admission = node::FlowMeshDeliveryAdmission::FULL;
+                admission.reason = "B3 peer send buffer is backpressured";
+                return false;
+            }
             MakeAndPushMessage(*node, std::string{flowmesh::WireCommand(message.kind)},
                                std::span{*encoded});
+            admission.admission = node::FlowMeshDeliveryAdmission::LEGACY_UNTRACKED;
+            admission.reason = "B3 queue accepted; socket completion is not tracked";
             return true;
         });
+        result.peers.push_back(std::move(admission));
     }
+    if (result.peers.empty()) {
+        result.reason = "No connected B3 peer advertising FlowMesh carriage";
+    } else if (std::all_of(result.peers.begin(), result.peers.end(), [](const auto& admission) {
+        return admission.admission == node::FlowMeshDeliveryAdmission::LEGACY_UNTRACKED;
+    })) {
+        result.no_peer_reason = node::FlowMeshDeliveryAdmission::LEGACY_UNTRACKED;
+    } else {
+        result.no_peer_reason = node::FlowMeshDeliveryAdmission::ADMITTED; // outcomes are per-peer
+    }
+    return result;
 }
 
 void PeerManagerImpl::SendPings()
@@ -4827,6 +4849,9 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
     }
 
     if (const auto kind{flowmesh::WireKindForCommand(msg_type)}) {
+        // No legacy FlowMesh sink means these optional application frames
+        // must not alter ordinary B3 peer connectivity or ban state.
+        if (!m_opts.flowmesh_sink) return;
         // FlowMesh is negotiated solely as a service on this existing B3
         // connection. No message is accepted before VERACK or from a peer
         // that did not advertise the capability.
@@ -4852,6 +4877,24 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         if (!m_opts.flowmesh_sink) return;
         const auto result{m_opts.flowmesh_sink->EnqueueWireMessage(
             pfrom.GetId(), std::move(*decoded))};
+        if (result != flowmesh::QueueResult::ACCEPTED) {
+            const char* reason{"unknown"};
+            switch (result) {
+            case flowmesh::QueueResult::RECONCILING: reason = "b3_reconciling"; break;
+            case flowmesh::QueueResult::STOPPED: reason = "service_stopped"; break;
+            case flowmesh::QueueResult::MALFORMED: reason = "malformed"; break;
+            case flowmesh::QueueResult::RATE_LIMITED: reason = "rate_limited"; break;
+            case flowmesh::QueueResult::PEER_LIMIT: reason = "peer_queue_limit"; break;
+            case flowmesh::QueueResult::MARKET_LIMIT: reason = "market_unavailable_or_queue_limit"; break;
+            case flowmesh::QueueResult::GLOBAL_LIMIT: reason = "global_queue_limit"; break;
+            case flowmesh::QueueResult::ACCEPTED: break;
+            }
+            // Legacy B3 framing has no receipt ACK. Current senders retain
+            // exact critical objects for paced retries; do not call this an
+            // admission, or make ordinary B3 processing wait on this worker.
+            LogDebug(BCLog::NET, "FlowMesh legacy ingress refused command=%s peer=%d reason=%s; no receipt acknowledged\n",
+                     msg_type, pfrom.GetId(), reason);
+        }
         if (result == flowmesh::QueueResult::MALFORMED &&
             ++peer.m_flowmesh_framing_strikes >= 2) {
             pfrom.fDisconnect = true;

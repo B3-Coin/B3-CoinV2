@@ -9,6 +9,7 @@
 #include <flowmesh/production_engine.h>
 #include <modern/flowmesh_vault_proof.h>
 #include <node/flowmesh_runtime.h>
+#include <node/flowmesh_net.h>
 #include <node/flowmesh_vault_index.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
@@ -83,11 +84,19 @@ struct FlowMeshVaultOperation {
     std::vector<FlowMeshVaultInput> inputs;
 };
 
+/** Local routing policy; never part of a consensus or signing identity. */
+struct FlowMeshServiceTransport {
+    std::string mode{"legacy"};
+    FlowMeshNetConfig network;
+    bool LegacyEnabled() const { return mode == "legacy" || mode == "dual"; }
+    bool IndependentEnabled() const { return mode == "independent" || mode == "dual"; }
+};
+
 /**
- * One production FlowMesh service exists on every node. It remains dormant
- * unless the complete A2/A3 schedule is pinned. When enabled it uses only the
- * existing B3 connection and PeerManager's prioritized FlowMesh messages;
- * there is no second listener, port, or transport.
+ * One production FlowMesh service owns execution and durable signing history.
+ * It remains dormant unless the complete A2/A3 schedule is pinned. Legacy B3
+ * carriage and independent connections feed this same runtime in dual mode.
+ * Neither transport grants seat membership or changes application identities.
  *
  * The service starts as an observer. Supplying wallet-owned BLS seat keys is
  * an explicit, reversible operation and raw keys never reach P2P objects.
@@ -96,7 +105,8 @@ class FlowMeshService final : public flowmesh::WireMessageSink,
                               public CValidationInterface
 {
 public:
-    FlowMeshService(ChainstateManager& chainman, fs::path datadir);
+    FlowMeshService(ChainstateManager& chainman, fs::path datadir,
+                    FlowMeshServiceTransport transport = {});
     ~FlowMeshService();
 
     FlowMeshService(const FlowMeshService&) = delete;
@@ -116,6 +126,11 @@ public:
 
     bool Enabled() const;
     bool Running() const;
+    bool LegacyTransportEnabled() const;
+    std::string TransportMode() const;
+    FlowMeshNetSnapshot NetworkSnapshot() const;
+    std::vector<FlowMeshRuntimeDeliverySnapshot> DeliverySnapshots(
+        std::optional<flowmesh::MarketId> market_id = std::nullopt) const;
 
     std::vector<FlowMeshServiceMarket> Markets() const;
     std::optional<FlowMeshServiceMarket> Market(

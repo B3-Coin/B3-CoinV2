@@ -561,6 +561,13 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                 #ifdef ENABLE_EMBEDDED_ASMAP
                     " If a bool arg is given (-asmap or -asmap=1), the embedded mapping data in the binary will be used."
                 #else
+    argsman.AddArg("-flowmeshtransport=<mode>", "Experimental FlowMesh routing: legacy (default), dual, or independent. Dual shares one runtime and signing history. Independent disables B3-carried FlowMesh messages, not ordinary B3 networking.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshlisten", "Listen for independent FlowMesh peers when dual/independent transport is selected (default: 1)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshbind=<ip>", "Numeric independent FlowMesh bind address (default: 127.0.0.1)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshport=<port>", "Independent FlowMesh listener port (default: 5649)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshconnect=<peer>", "Independent FlowMesh peer: compressed-public-operator-key@numeric-address:port. Repeat for independent hosts. An unpinned peer proves only self-selected identity, not trusted routing or FN eligibility.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshrole=<role>", "Independent transport role: observer (default), sentry, or validator. Validator role does not create or arm an FN seat.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshdatadir=<dir>", "Absolute FlowMesh store directory (default: network datadir/flowmesh). Do not copy live signing keys into independent runtimes or discard signing history.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
                     ""
                 #endif
                 ), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -1975,13 +1982,41 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         *node.chainman, node.mempool.get(),
         args.GetDataDirNet() / "finality_signer", std::move(operator_recovery));
 
-    // Every node owns the production service object. It remains dormant and
-    // does not advertise the capability unless the complete A2/A3 schedule
-    // is pinned. P2P hands framed messages directly to its bounded worker;
-    // FlowMesh never opens a second port or blocks the B3 validation path.
+    // Select application transport without changing B3 validation or creating
+    // another execution/signing runtime. Legacy remains the review-stage
+    // default until the separate engine-off trading client is implemented.
+    node::FlowMeshServiceTransport flowmesh_transport;
+    flowmesh_transport.mode = args.GetArg("-flowmeshtransport", "legacy");
+    if (!flowmesh_transport.LegacyEnabled() && !flowmesh_transport.IndependentEnabled()) {
+        return InitError(Untranslated("Invalid -flowmeshtransport; use legacy, dual or independent"));
+    }
+    fs::path flowmesh_datadir{args.GetPathArg("-flowmeshdatadir", args.GetDataDirNet() / "flowmesh")};
+    if (!flowmesh_datadir.is_absolute()) {
+        return InitError(Untranslated("-flowmeshdatadir must be an absolute path"));
+    }
+    if (flowmesh_transport.IndependentEnabled()) {
+        const auto& consensus{chainman.GetConsensus()};
+        const auto domain{consensus.legacy_final_hash
+            ? modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash)
+            : std::nullopt};
+        if (!domain) return InitError(Untranslated("Independent FlowMesh requires a configured ModernChainDomain"));
+        const int64_t port{args.GetIntArg("-flowmeshport", 5649)};
+        if (port < 1 || port > 65535) return InitError(Untranslated("-flowmeshport must be between 1 and 65535"));
+        auto& network{flowmesh_transport.network};
+        network.domain = *domain;
+        network.bind_host = args.GetArg("-flowmeshbind", "127.0.0.1");
+        network.port = static_cast<uint16_t>(port);
+        network.peers = args.GetArgs("-flowmeshconnect");
+        network.enable_listen = args.GetBoolArg("-flowmeshlisten", true);
+        network.role = args.GetArg("-flowmeshrole", "observer");
+        if (network.role != "observer" && network.role != "sentry" && network.role != "validator") {
+            return InitError(Untranslated("-flowmeshrole must be observer, sentry or validator"));
+        }
+        network.datadir = flowmesh_datadir / "network";
+    }
     node.flowmesh = std::make_unique<node::FlowMeshService>(
-        chainman, args.GetDataDirNet() / "flowmesh");
-    peerman_opts.flowmesh_sink = node.flowmesh.get();
+        chainman, flowmesh_datadir, std::move(flowmesh_transport));
+    peerman_opts.flowmesh_sink = node.flowmesh->LegacyTransportEnabled() ? node.flowmesh.get() : nullptr;
     node.peerman = PeerManager::make(*node.connman, *node.addrman,
                                      node.banman.get(), chainman,
                                      *node.mempool, *node.warnings,
@@ -1993,8 +2028,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             flowmesh_error)));
     }
     if (node.flowmesh->Enabled()) {
-        g_local_services =
-            ServiceFlags(g_local_services | NODE_B3_FLOWMESH);
+        if (node.flowmesh->LegacyTransportEnabled()) {
+            g_local_services = ServiceFlags(g_local_services | NODE_B3_FLOWMESH);
+        }
         validation_signals.RegisterValidationInterface(node.flowmesh.get());
     }
     validation_signals.RegisterValidationInterface(node.peerman.get());

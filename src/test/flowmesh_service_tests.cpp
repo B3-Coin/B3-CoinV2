@@ -363,7 +363,164 @@ BOOST_AUTO_TEST_CASE(empty_or_stopped_service_cannot_arm_and_failure_keeps_resul
 
 BOOST_AUTO_TEST_SUITE_END()
 
+BOOST_FIXTURE_TEST_SUITE(flowmesh_transport_policy_tests, FlowMeshServiceSetup)
+
+BOOST_AUTO_TEST_CASE(legacy_default_and_transport_modes_select_only_routing_policy)
+{
+    node::FlowMeshServiceTransport config;
+    BOOST_CHECK(config.LegacyEnabled());
+    BOOST_CHECK(!config.IndependentEnabled());
+    config.mode = "dual";
+    BOOST_CHECK(config.LegacyEnabled());
+    BOOST_CHECK(config.IndependentEnabled());
+    config.mode = "independent";
+    BOOST_CHECK(!config.LegacyEnabled());
+    BOOST_CHECK(config.IndependentEnabled());
+    BOOST_CHECK_EQUAL(service.TransportMode(), "legacy");
+    BOOST_CHECK(service.LegacyTransportEnabled());
+    BOOST_CHECK(!service.NetworkSnapshot().running);
+    BOOST_CHECK(service.NetworkSnapshot().operator_pubkey.empty());
+    BOOST_CHECK(service.SeatKeyStatus().armed_pubkeys.empty());
+}
+
+BOOST_AUTO_TEST_CASE(ingress_reports_reconciliation_and_stop_without_admitting_or_mutating)
+{
+    flowmesh::WireMessage message;
+    message.kind = flowmesh::WireMessageKind::CERTIFICATE;
+    // This isolated service is below activation and cannot reconcile the
+    // active production domain. It reports backpressure before decoding.
+    BOOST_CHECK(service.EnqueueWireMessage(-2, message) == flowmesh::QueueResult::RECONCILING);
+    BOOST_CHECK(service.DeliverySnapshots().empty());
+    BOOST_CHECK(service.SeatKeyStatus().armed_pubkeys.empty());
+    service.Stop();
+    BOOST_CHECK(service.EnqueueWireMessage(-2, message) == flowmesh::QueueResult::STOPPED);
+    BOOST_CHECK(service.DeliverySnapshots().empty());
+}
+
+BOOST_AUTO_TEST_CASE(failed_independent_network_leaves_service_running_but_cannot_arm)
+{
+    node::FlowMeshServiceTransport config;
+    config.mode = "independent";
+    config.network.role = "validator";
+    config.network.enable_listen = false;
+    config.network.datadir = m_args.GetDataDirNet() / "invalid-fmnet";
+    // Null domain fails transport validation before key creation or sockets.
+    node::FlowMeshService isolated{*m_node.chainman,
+        m_args.GetDataDirNet() / "failed-fmnet-service", config};
+    std::string error;
+    BOOST_REQUIRE(isolated.Start(*m_node.peerman, error));
+    BOOST_CHECK(isolated.Running());
+    BOOST_CHECK(!isolated.LegacyTransportEnabled());
+    BOOST_CHECK(!isolated.NetworkSnapshot().running);
+    BOOST_CHECK(!isolated.NetworkSnapshot().error.empty());
+    BOOST_CHECK(!isolated.ArmSeatKeys({SeatKey(30)}, error));
+    BOOST_CHECK(error.find("transport is unavailable") != std::string::npos);
+    BOOST_CHECK(isolated.SeatKeyStatus().armed_pubkeys.empty());
+    isolated.Stop();
+    isolated.Stop();
+    BOOST_CHECK(!isolated.Running());
+}
+
+BOOST_AUTO_TEST_CASE(invalid_transport_mode_fails_before_starting_service)
+{
+    node::FlowMeshServiceTransport config;
+    config.mode = "unexpected";
+    BOOST_CHECK(!config.LegacyEnabled());
+    BOOST_CHECK(!config.IndependentEnabled());
+    node::FlowMeshService isolated{*m_node.chainman,
+        m_args.GetDataDirNet() / "invalid-transport-mode", config};
+    std::string error;
+    BOOST_CHECK(!isolated.Start(*m_node.peerman, error));
+    BOOST_CHECK(error.find("Invalid FlowMesh transport") != std::string::npos);
+    BOOST_CHECK(!isolated.Running());
+    BOOST_CHECK(!isolated.NetworkSnapshot().running);
+    BOOST_CHECK(isolated.SeatKeyStatus().armed_pubkeys.empty());
+}
+
+BOOST_AUTO_TEST_CASE(observer_and_sentry_roles_do_not_grant_signing_permission)
+{
+    for (const std::string role : {"observer", "sentry"}) {
+        node::FlowMeshServiceTransport config;
+        config.mode = "dual";
+        config.network.role = role;
+        node::FlowMeshService isolated{*m_node.chainman,
+            m_args.GetDataDirNet() / "unarmed-fmnet-service", config};
+        std::string error;
+        BOOST_CHECK(!isolated.ArmSeatKeys({SeatKey(31)}, error));
+        BOOST_CHECK(error.find("observer/sentry") != std::string::npos);
+        BOOST_CHECK(isolated.SeatKeyStatus().armed_pubkeys.empty());
+    }
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
 BOOST_FIXTURE_TEST_SUITE(flowmesh_service_startup_tests, FlowMeshServiceRestartSetup)
+
+BOOST_AUTO_TEST_CASE(dual_ingress_shares_vote_state_and_one_retained_signing_history)
+{
+    const auto entry{Genesis()};
+    Retain(entry);
+    node::FlowMeshServiceTransport config;
+    config.mode = "dual";
+    config.network.role = "validator";
+    config.network.enable_listen = false;
+    config.network.datadir = m_args.GetDataDirNet() / "dual-ingress-invalid-network";
+    // Deliberately fail FMNET preflight before identity creation or sockets.
+    // Inject directly at the existing shared sink: this tests one runtime's
+    // admission/deduplication, NOT authentication or an actual network route.
+    std::string error;
+    {
+        node::FlowMeshService service{*m_node.chainman, ServicePath(), config};
+        BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+        BOOST_CHECK_EQUAL(service.TransportMode(), "dual");
+        BOOST_CHECK(service.LegacyTransportEnabled());
+        BOOST_CHECK(!service.NetworkSnapshot().running);
+        BOOST_REQUIRE(WaitUntil([&] {
+            const auto data{service.MarketData(market, std::nullopt, {}, error)};
+            return data && !data->snapshot.paused &&
+                   data->snapshot.runtime.local_locked_candidate == entry.GetHash();
+        }));
+        BOOST_CHECK(service.SeatKeyStatus().armed_pubkeys.empty());
+        const auto vote = [&](const uint32_t seat) {
+            const auto signature{flowmesh::SignBlsMicroblockCertificate(
+                secrets[seat], flowmesh::ProductionCertificateContext(entry), seats)};
+            BOOST_REQUIRE(signature);
+            const auto payload{flowmesh::EncodeProductionAttestationPayload({seat, *signature})};
+            BOOST_REQUIRE(payload);
+            flowmesh::WireMessage wire;
+            wire.kind = flowmesh::WireMessageKind::ATTESTATION;
+            wire.header = {flowmesh::FLOWMESH_WIRE_VERSION_V1, market, 0, 0};
+            wire.payload = *payload;
+            return wire;
+        };
+
+        // Independent peer IDs are negative; B3 peer IDs are nonnegative.
+        // The same seat arriving through another connection earns no vote.
+        BOOST_REQUIRE(service.EnqueueWireMessage(7, vote(0)) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(service.EnqueueWireMessage(-2, vote(0)) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(service.EnqueueWireMessage(-3, vote(1)) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(WaitUntil([&] {
+            const auto data{service.MarketData(market, std::nullopt, {}, error)};
+            return data && data->snapshot.runtime.max_verified_attestations == 2;
+        }));
+        BOOST_CHECK_EQUAL(service.MarketStatus(market)->next_sequence, 0U);
+        BOOST_CHECK(service.MarketStatus(market)->halt == node::FlowMeshRuntimeHalt::NONE);
+
+        // Three distinct seats, not three connections, finish the one entry.
+        BOOST_REQUIRE(service.EnqueueWireMessage(-4, vote(2)) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(WaitUntil([&] {
+            const auto status{service.MarketStatus(market)};
+            return status && status->next_sequence == 1 &&
+                   status->last_microblock_hash == entry.GetHash() &&
+                   status->halt == node::FlowMeshRuntimeHalt::NONE;
+        }));
+        const auto state{service.StateSnapshot(market)};
+        BOOST_REQUIRE(state);
+        BOOST_CHECK(state->Root() == entry.state_root);
+        BOOST_CHECK(service.SeatKeyStatus().armed_pubkeys.empty());
+    }
+    CheckLock(entry, /*committed=*/true);
+}
 
 BOOST_AUTO_TEST_CASE(retained_candidate_survives_service_start_and_resumes_exact_vote)
 {
