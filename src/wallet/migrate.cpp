@@ -528,6 +528,9 @@ static void SeekToPage(AutoFile& s, uint32_t page_num, uint32_t page_size)
 
 void BerkeleyRODatabase::Open()
 {
+    // Publish a complete snapshot only after the read succeeds. This also
+    // makes a repeated Open independent of previously loaded records.
+    BerkeleyROData records;
     // Open the file
     FILE* file = fsbridge::fopen(m_filepath, "rb");
     AutoFile db_file(file);
@@ -690,7 +693,13 @@ void BerkeleyRODatabase::Open()
                 if (is_key) {
                     key = data;
                 } else {
-                    m_records.emplace(SerializeData{key.begin(), key.end()}, SerializeData{data.begin(), data.end()});
+                    const auto [_, inserted]{records.emplace(SerializeData{key.begin(), key.end()}, SerializeData{data.begin(), data.end()})};
+                    if (!inserted) {
+                        // Wallet databases do not enable duplicate keys. An
+                        // ambiguous live record must not be silently discarded
+                        // before migration, even if its value happens to match.
+                        throw std::runtime_error("Duplicate live record key in BDB wallet");
+                    }
                     key.clear();
                 }
                 is_key = !is_key;
@@ -701,6 +710,7 @@ void BerkeleyRODatabase::Open()
             throw std::runtime_error("Unexpected page type");
         }
     }
+    m_records = std::move(records);
 }
 
 std::unique_ptr<DatabaseBatch> BerkeleyRODatabase::MakeBatch()

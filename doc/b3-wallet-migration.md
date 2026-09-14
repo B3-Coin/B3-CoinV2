@@ -1,91 +1,107 @@
-# Migrating from the legacy B3-CoinV2 wallet to B3 Hive
+# Legacy B3 wallet migration: preservation and recovery
 
-B3 Hive 1.1.0 uses the SAME default data directory as the legacy client
-(`~/Library/Application Support/B3-CoinV2`, `%APPDATA%\B3-CoinV2`,
-`~/.B3-CoinV2`), so the normal path is: close the old wallet, open
-B3 Hive, and migrate in place.
+The failure-safety changes described here are a separately reviewed candidate,
+not authorization to migrate a holder wallet or deploy an unreleased build.
+Generated-fixture tests do not demonstrate recovery of a community wallet.
 
-## Healthy wallet (the normal case)
+## Preserve before attempting migration
 
-1. Close the legacy client completely.
-2. **Back up `wallet.dat`** (two copies, one off-machine).
-3. Open B3 Hive; it finds the legacy data directory automatically. If startup
-   asks for the transition block-index upgrade, close it and perform the full
-   `-reindex` described below. That rebuild reuses the existing raw block files,
-   then the node downloads only the blocks it is still missing.
-4. Migrate the old wallet:  `b3coin-cli migratewallet wallet.dat`
-   (or the equivalent Hive menu action). This converts the legacy
-   Berkeley-DB wallet into a modern descriptor wallet. Encrypted wallets
-   prompt for the passphrase.
-5. Verify balances after sync completes, then make a FRESH backup of the
-   migrated wallet.
+B3 Hive can use the same default data directory as the legacy client:
+`~/Library/Application Support/B3-CoinV2`, `%APPDATA%\\B3-CoinV2`, or
+`~/.B3-CoinV2`. Confirm the actual executable, wallet name and datadir; do not
+assume a different application icon means it uses different data.
 
-For the transition release, a data directory whose block index was written by
-the legacy client or an incompatible pre-transition build must use full
-`-reindex`:
+1. Shut down the legacy client cleanly and confirm no process still owns its
+   wallet/datadir. Do not launch two versions against the same directory.
+2. Preserve an offline copy of the **complete legacy wallet environment**:
+   `wallet.dat`, the corresponding `database/` directory and any accompanying
+   files that exist after clean shutdown. Preserve file paths and permissions.
+   Keep a second protected copy off-machine. Do not publish these copies.
+3. Keep the original untouched. Initial migration/recovery attempts belong in
+   an explicitly isolated copy using an approved build. Verify exclusive
+   ownership of that copied directory before starting it.
+4. A wallet that did not shut down cleanly may require its historical Berkeley
+   database environment and logs. The migration reader does **not** replay
+   those logs. A readable `wallet.dat`, reset LSN or matching displayed balance
+   does not prove that no later committed records exist in the logs.
 
-    b3coind -reindex
+Do not delete lockfiles, discard `database/`, reset signing journals, run blind
+salvage/reindex, rewrite transaction timestamps or sweep funds merely to make
+migration appear successful. Preserve the exact error and investigate it.
 
-or start the GUI as `b3coin-qt -reindex`. Do not use
-`-reindex-chainstate`; the block index itself must be rebuilt. Existing raw
-block files are reused, but the rebuild can take time. A current transition
-beta data directory does not need this merely because the wallet is being
-migrated; use it when startup reports the B3 block-index incompatibility.
+## What the candidate does
 
-Historical FN Coins were created in block 810,001. After importing a legacy
-dump or key, let the wallet finish its rescan. If the expected FN Coin is still
-missing after the node is fully synced, run this once in that wallet:
+The migration RPC/menu action uses the wallet's exact configured name. An
+encrypted legacy wallet requires its passphrase through a trusted local UI;
+never share the passphrase, wallet file, seeds or keys in a bug report.
 
-    b3coin-cli rescanblockchain 810001
+Before replacement, the candidate creates a new exclusive backup named:
 
-The FN Coin remains in the wallet; during ordinary coinbase maturity the GUI
-shows it as confirmed and immature rather than spendable.
+`<wallet-prefix>_<timestamp>_<unique-id>.legacy.bak`
 
-## Wallet misbehaving in the OLD client first?
+The successful RPC returns its exact `backup_path`; handled preparation errors
+also identify it where available. The backup lives in the configured wallet
+directory, not necessarily beside the original if an explicit wallet path is
+used. The backup is file-flushed and byte-compared with the original. It is
+never overwritten or consumed by automatic rollback.
 
-Symptoms and the right tool — these fix DIFFERENT problems:
+The replacement is built in a unique `.migration-<unique-id>` directory beside
+the original database. Raw records are committed and verified, existing
+descriptor conversion is completed, and SQLite is closed/reopened for
+verification before publication. Existing SQLite sidecars are refused rather
+than deleted, including symlinks. The old transaction encoding and `nTime`
+are not changed by the storage copy.
 
-| Symptom | Fix (old client) |
-|---|---|
-| Wrong balance, "lost" coins, stuck stake — wallet opens fine | RPC `checkwallet`, then `repairwallet` (fixes spent-state mismatches) |
-| Transactions missing after key import | `-rescan` |
-| "wallet.dat corrupted" / `-salvagewallet` FAILED | see the recovery ladder below |
+Directory wallets publish a completed `wallet.dat`. Historical flat-file
+wallets must become directories: their original is first retained at the
+returned backup path plus `.original.bak`, before the staged directory is
+promoted. Both preserved copies must be kept until the migration is reviewed.
 
-## Corruption recovery ladder (salvage failed)
+Auxiliary watch-only/solvable wallets are registered for automatic startup only
+after the complete migration succeeds. Handled failures close/unload created
+wallets before exact, non-recursive cleanup. If a wallet cannot be unloaded,
+its files are left intact and the error identifies the preserved backup.
 
-Work ONLY on copies; every attempt can worsen the original.
+## After a failure or interruption
 
-1. **Copy `wallet.dat` (and the `database/` folder) somewhere safe.**
-2. **Fresh-datadir trick:** place a copy of `wallet.dat` in a new, empty
-   data directory and open it with the old client — once WITH the copied
-   `database/` folder beside it, once WITHOUT. Stale BDB environments
-   masquerade as corruption surprisingly often.
-3. **Try B3 Hive's `migratewallet` on the corrupted copy.** Hive reads
-   old wallets through an independent Berkeley reader that needs no BDB
-   environment or log replay — it frequently opens files the old
-   client's salvage cannot.
-4. `db_dump -r wallet.dat > dump.txt && db_load new.dat < dump.txt`
-   (Berkeley DB 4.8 utilities; `-R` for the aggressive variant).
-5. Raw key carving as the last resort: private keys sit in recognizable
-   byte patterns and can be extracted from badly damaged files, then
-   imported into Hive. Ask the maintainers before running third-party
-   carving tools against key material.
+Do not repeatedly start migration, delete staging files or overwrite a wallet
+path to bypass an error. First record the error, stop the affected installation
+cleanly if it is running, and preserve the original, backup, retained original,
+staging directory and any auxiliary wallet files.
 
-After ANY successful recovery: sweep all funds to a freshly created
-wallet and retire the damaged file permanently.
+The supported recovery decision depends on the actual boundary:
 
-## Wallet stopped at block 810,000
+- **Before publication:** the legacy original is still at its original path.
+  Resolve the specific refusal before an operator-approved retry on a copy.
+- **After successful publication:** a complete SQLite replacement may exist
+  even if the process stopped before returning an RPC response. Inspect/load
+  that same wallet; do not treat a missing response as permission to overwrite
+  it or blindly repeat the conversion.
+- **During flat-file promotion:** the original name may temporarily be absent.
+  The unique retained original and verified backup must be preserved. With no
+  process owning the directory, an operator can verify the backup and restore
+  it **exclusively to the absent original path**, then retry migration. Never
+  overwrite an occupied path. This is explicit recovery, not automatic startup
+  recovery, and must be qualified on isolated copies first.
+- **Cleanup/restoration incomplete:** keep all remaining files. Do not infer
+  that an RPC error means nothing was published; use the exact reported state
+  and verify the original/backup before choosing a recovery path.
 
-Block 810,000 is the sealed final legacy block; everything after it comes
-only from modern B3 Hive peers. Install the current release first: builds
-before v1.1.0 refuse block 810,001 by design, and every v1.1.x build before
-the revised v1.1.3 could discourage its modern peers while crossing the
-boundary. Then check `getblockhash 810000` against
-`2413ba59476afb9a01b971c350b2c5a51494b37925055be42dde774f30d865c6`, remove
-any `connect=` line from `b3coin.conf`, and if the node still has no peer
-above 810,000 after a few minutes, add a modern peer by hand:
+After success, verify transaction identities and relevant history, encryption
+and ownership, addresses, and spendable/locked/immature/STAKE classifications.
+A UTXO comparison or matching totals alone is not complete recovery evidence.
+Make a fresh protected backup of each resulting descriptor wallet.
 
-    b3coin-cli addnode 38.191.246.166:5647 onetry
+## Limits and separate incidents
 
-The v1.1.3 release notes list the log lines that identify each cause. Do
-not reindex for this problem unless startup itself asks for a rebuild.
+File flush failures are checked, but the existing directory-flush helper is
+best-effort and is a no-op on Windows. Process-interruption tests are not proof
+of power-loss-safe directory persistence. Historical-log replay, genuine old
+client wallet variants, filesystem/hardware failures and concurrent access
+remain separate qualification requirements.
+
+Block synchronization failures, including a stall at height 819599, are not
+diagnosed by wallet migration tests. Finality signing readiness is also a
+separate concern. This guide does not authorize reindexing, chain invalidation,
+anchor changes, journal resets or network-configuration changes for a sync
+incident.

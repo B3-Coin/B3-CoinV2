@@ -1194,12 +1194,12 @@ public:
     //! Add a descriptor to the wallet, return a ScriptPubKeyMan & associated output type
     util::Result<std::reference_wrapper<DescriptorScriptPubKeyMan>> AddWalletDescriptor(WalletDescriptor& desc, const FlatSigningProvider& signing_provider, const std::string& label, bool internal) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    /** Move all records from the BDB database to a new SQLite database for storage.
-     * The original BDB file will be deleted and replaced with a new SQLite file.
-     * A backup is not created.
-     * May crash if something unexpected happens in the filesystem.
+    /** Copy records to a separately created SQLite database. The original file
+     * is never removed here. Adopt the replacement only after a successful
+     * transaction and exact record verification; publication belongs to the
+     * migration coordinator after descriptor conversion also succeeds.
      */
-    bool MigrateToSQLite(bilingual_str& error) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool MigrateToSQLite(std::unique_ptr<WalletDatabase> replacement, bilingual_str& error) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Get all of the descriptors from a legacy wallet
     std::optional<MigrationData> GetDescriptorsForLegacy(bilingual_str& error) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1290,10 +1290,14 @@ struct MigrationResult {
     fs::path backup_path;
 };
 
+//! Direct-call test seam for deterministic I/O failure/interruption coverage.
+//! It has no RPC, command-line or environment option in production code.
+using MigrationTestCallback = std::function<void(std::string_view, const fs::path&)>;
+
 //! Do all steps to migrate a legacy wallet to a descriptor wallet
 [[nodiscard]] util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& wallet_name, const SecureString& passphrase, WalletContext& context);
 //! Requirement: The wallet provided to this function must be isolated, with no attachment to the node's context.
-[[nodiscard]] util::Result<MigrationResult> MigrateLegacyToDescriptor(std::shared_ptr<CWallet> local_wallet, const SecureString& passphrase, WalletContext& context);
+[[nodiscard]] util::Result<MigrationResult> MigrateLegacyToDescriptor(std::shared_ptr<CWallet> local_wallet, const SecureString& passphrase, WalletContext& context, const MigrationTestCallback& test_callback = {});
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_WALLET_H

@@ -14,6 +14,7 @@
 #include <external_signer.h>
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
+#include <tinyformat.h>
 #include <util/string.h>
 #include <util/threadnames.h>
 #include <util/translation.h>
@@ -21,6 +22,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 
 #include <QApplication>
 #include <QMessageBox>
@@ -451,6 +453,7 @@ void MigrateWalletActivity::do_migrate(const std::string& name)
     showProgressDialog(tr("Migrate Wallet"), tr("Migrating Wallet <b>%1</b>…").arg(GUIUtil::HtmlEscape(name)));
 
     QTimer::singleShot(0, worker(), [this, name, passphrase] {
+        try {
         auto res{node().walletLoader().migrateWallet(name, passphrase)};
 
         if (res) {
@@ -464,6 +467,9 @@ void MigrateWalletActivity::do_migrate(const std::string& name)
             m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(res->wallet));
         } else {
             m_error_message = util::ErrorString(res);
+        }
+        } catch (const std::exception& e) {
+            m_error_message = Untranslated(strprintf("Wallet migration failed: %s. Preserve the original wallet, backup and staging files; do not retry until the error is reviewed.", e.what()));
         }
 
         QTimer::singleShot(0, this, &MigrateWalletActivity::finish);
@@ -480,10 +486,10 @@ void MigrateWalletActivity::migrate(const std::string& name)
                 "If this wallet contains any watchonly scripts, a new wallet will be created which contains those watchonly scripts.\n"
                 "If this wallet contains any solvable but not watched scripts, a different and new wallet will be created which contains those scripts.\n\n"
                 "The migration process will create a backup of the wallet before migrating. This backup file will be named "
-                "<wallet name>-<timestamp>.legacy.bak and can be found in the directory for this wallet. In the event of "
+                "<wallet name>_<timestamp>_<unique id>.legacy.bak and can be found in the wallet directory. In the event of "
                 "an incorrect migration, the backup can be restored with the \"Restore Wallet\" functionality."));
     box.setStandardButtons(QMessageBox::Yes|QMessageBox::Cancel);
-    box.setDefaultButton(QMessageBox::Yes);
+    box.setDefaultButton(QMessageBox::Cancel);
     if (box.exec() != QMessageBox::Yes) return;
 
     do_migrate(name);
@@ -501,7 +507,7 @@ void MigrateWalletActivity::restore_and_migrate(const fs::path& path, const std:
                 "If this wallet contains any watchonly scripts, a new wallet will be created which contains those watchonly scripts.\n"
                 "If this wallet contains any solvable but not watched scripts, a different and new wallet will be created which contains those scripts.\n\n"
                 "The migration process will create a backup of the wallet before migrating. This backup file will be named "
-                "<wallet name>-<timestamp>.legacy.bak and can be found in the directory for this wallet. In the event of "
+                "<wallet name>_<timestamp>_<unique id>.legacy.bak and can be found in the wallet directory. In the event of "
                 "an incorrect migration, the backup can be restored with the \"Restore Wallet\" functionality."));
     box.setStandardButtons(QMessageBox::Yes|QMessageBox::Cancel);
     box.setDefaultButton(QMessageBox::Yes);

@@ -74,7 +74,8 @@ FUZZ_TARGET(wallet_bdb_parser, .init = initialize_wallet_bdb_parser)
             error.original == "Internal record position not in page" ||
             error.original == "LSNs are not reset, this database is not completely flushed. Please reopen then close the database with a version that has BDB support" ||
             error.original == "Records page has odd number of records" ||
-            error.original == "Bad overflow record page type") {
+            error.original == "Bad overflow record page type" ||
+            error.original == "Duplicate live record key in BDB wallet") {
             // Do nothing
         } else if (error.original == "Subdatabase last page is greater than database last page" ||
                    error.original == "Page number is greater than database last page" ||
