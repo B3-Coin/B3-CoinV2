@@ -452,6 +452,72 @@ BOOST_AUTO_TEST_CASE(legacy_peer_services_are_outbound_eligible)
     BOOST_CHECK(peerman.HasAllDesirableServiceFlags(ServiceFlags(NODE_NETWORK | NODE_WITNESS)));
 }
 
+BOOST_AUTO_TEST_CASE(obsolete_3x_software_is_retired_without_blocking_upgraded_bootstrap)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ConnmanTestMsg& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    connman.SetPeerConnectTimeout(99999s);
+    PeerManager& peerman = *m_node.peerman;
+    NodeId next_id{100};
+    const auto receive_version = [&](const std::string& user_agent,
+                                     ConnectionType type) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
+        auto node{MakeNode(next_id++, type)};
+        peerman.InitializeNode(*node, ServiceFlags(NODE_NETWORK | NODE_WITNESS));
+        BOOST_REQUIRE(connman.ReceiveMsgFrom(
+            *node, NetMsg::Make(NetMsgType::VERSION,
+                int32_t{legacy::P2P_PROTOCOL_VERSION},
+                Using<CustomUintFormatter<8>>(ServiceFlags{NODE_NETWORK}),
+                int64_t{}, int64_t{}, CNetAddr::V1(CService{}),
+                int64_t{}, CNetAddr::V1(CService{}), uint64_t{1},
+                user_agent, int32_t{}, true)));
+        node->fPauseSend = false;
+        connman.ProcessMessagesOnce(*node);
+        return node;
+    };
+
+    // Before H, genuine old software can still supply historical blocks.
+    auto before_boundary{receive_version("/B3-Coin:3.1.2.2/", ConnectionType::INBOUND)};
+    BOOST_CHECK(!before_boundary->fDisconnect);
+    peerman.FinalizeNode(*before_boundary);
+
+    m_node.validation_signals->RegisterValidationInterface(&peerman);
+    CBlockIndex boundary;
+    uint256 boundary_hash{uint256::ONE};
+    boundary.phashBlock = &boundary_hash;
+    boundary.nHeight = *Consensus::LegacyFinalHeight(Params().GetConsensus());
+    m_node.validation_signals->ActiveTipChange(boundary, /*is_ibd=*/false);
+    m_node.validation_signals->UnregisterValidationInterface(&peerman);
+
+    // These banners follow the actual v3.0.0.0 and v3.1.2.2 release sources.
+    // Neither inbound nor explicitly added obsolete software is retained.
+    for (const std::string user_agent : {"/B3-Coin:3.0.0/", "/B3-Coin:3.1.2.2/"}) {
+        for (const ConnectionType type : {ConnectionType::INBOUND, ConnectionType::MANUAL}) {
+            auto obsolete{receive_version(user_agent, type)};
+            BOOST_CHECK(obsolete->fDisconnect);
+            BOOST_CHECK(!obsolete->fSuccessfullyConnected);
+            BOOST_CHECK(!m_node.banman->IsBanned(obsolete->addr));
+            BOOST_CHECK(!m_node.banman->IsDiscouraged(obsolete->addr));
+            peerman.FinalizeNode(*obsolete);
+        }
+    }
+
+    // A modern wallet below H still sends 80008. Preserve its complete
+    // archival handshake, including user-agent comments. An unidentified
+    // banner is not evidence that a peer runs the obsolete software family.
+    for (const std::string user_agent : {"/B3Hive:1.1.5/", "/B3Hive:1.1.5(operator)/", ""}) {
+        auto upgraded{receive_version(user_agent, ConnectionType::INBOUND)};
+        BOOST_REQUIRE(!upgraded->fDisconnect);
+        BOOST_CHECK_EQUAL(upgraded->GetCommonVersion(), legacy::P2P_COMPATIBILITY_VERSION);
+        BOOST_REQUIRE(connman.ReceiveMsgFrom(*upgraded, NetMsg::Make(NetMsgType::VERACK)));
+        upgraded->fPauseSend = false;
+        connman.ProcessMessagesOnce(*upgraded);
+        BOOST_CHECK(peerman.SendMessages(*upgraded));
+        BOOST_CHECK(upgraded->fSuccessfullyConnected);
+        BOOST_CHECK(!upgraded->fDisconnect);
+        peerman.FinalizeNode(*upgraded);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(modern_archival_peer_owns_legacy_window_and_renegotiates_at_h)
 {
     LOCK(NetEventsInterface::g_msgproc_mutex);

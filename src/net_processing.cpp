@@ -4514,9 +4514,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         // actual services above so AddrMan will not immediately select the
         // same obsolete candidate again, then release automatic full-relay,
         // block-relay, feeler, address-fetch and private-broadcast connections.
-        // Inbound historical peers remain connected so this archival node can
-        // serve them through H, and a manual/addnode connection remains under
-        // the operator's control.
+        // Inbound historical-protocol peers can still bootstrap through H,
+        // including upgraded wallets which advertise 80008 before H. A
+        // separate software-banner check below rejects known obsolete builds.
+        // Manual/addnode connections bypass this automatic-slot policy only.
         if (remote_legacy_protocol &&
             !m_in_legacy_phase.load(std::memory_order_relaxed) &&
             !pfrom.IsInboundConn() &&
@@ -4561,6 +4562,19 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             std::string strSubVer;
             vRecv >> LIMITED_STRING(strSubVer, MAX_SUBVERSION_LENGTH);
             cleanSubVer = SanitizeString(strSubVer);
+        }
+        // Historical B3-Coin v3.x releases identify themselves with this BIP14
+        // prefix (v3.1.2.2: src/version.cpp and src/net.cpp). Retire those
+        // clients after H without denying upgraded B3Hive wallets which still
+        // advertise 80008 while downloading the legacy prefix. This is a
+        // self-reported software policy, not authentication or an IP ban.
+        if (m_chainparams.GetConsensus().legacy_b3coin &&
+            !m_in_legacy_phase.load(std::memory_order_relaxed) &&
+            cleanSubVer.starts_with("/B3-Coin:3.")) {
+            LogInfo("Disconnecting obsolete B3-Coin 3.x software after the sealed boundary, %s\n",
+                    pfrom.DisconnectMsg(fLogIPs));
+            pfrom.fDisconnect = true;
+            return;
         }
         if (!vRecv.empty()) {
             vRecv >> starting_height;
