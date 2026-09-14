@@ -581,6 +581,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-flowmeshendpointca=<file>", "PEM CA trust bundle for trading endpoints; one bundle may cover all endpoints, or repeat in endpoint order. Empty uses OpenSSL default trust paths. Relative paths are resolved under the network datadir.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshendpointpin=<sha256>", "Optional DER leaf-certificate SHA256 pin for each trading endpoint, repeated in endpoint order (empty entry means no additional pin). CA and hostname/IP verification remain mandatory.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshapi", "Serve the separate restricted HTTPS trading API (default: 0); requires -enableflowmeshvalidator=1 and explicit TLS certificate/key files. Does not expose wallet or administrator RPC.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshassetmetadata=<file>", "Explicit public asset label catalog for the FlowMesh operator and its HTTPS clients; JSON array, at most 256 entries/256 KiB. Labels are not issuer or backing proofs. Private wallet labels are never exported. Relative paths use the network datadir; loaded at startup. Requires -enableflowmeshvalidator=1.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshapibind=<ip>", "Numeric bind address for the restricted HTTPS trading API (default: 127.0.0.1)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshapiport=<port>", "Restricted HTTPS trading API port (default: 5650)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshapicert=<file>", "PEM server certificate chain for the restricted HTTPS trading API; relative paths are resolved under the network datadir", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
@@ -2013,6 +2014,20 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (flowmesh_api && !flowmesh_validator) {
         return InitError(Untranslated("-flowmeshapi requires -enableflowmeshvalidator=1"));
     }
+    node::FlowMeshAssetMetadataCatalog flowmesh_metadata;
+    auto metadata_path{args.GetPathArg("-flowmeshassetmetadata")};
+    if (!metadata_path.empty()) {
+        if (!flowmesh_validator) return InitError(Untranslated("-flowmeshassetmetadata requires -enableflowmeshvalidator=1"));
+        if (!metadata_path.is_absolute()) metadata_path = args.GetDataDirNet() / metadata_path;
+        const auto& consensus{chainman.GetConsensus()};
+        const auto domain{consensus.legacy_final_hash
+            ? modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash)
+            : std::nullopt};
+        std::string error;
+        if (!domain || !node::LoadFlowMeshAssetMetadataCatalog(metadata_path, *domain, flowmesh_metadata, error)) {
+            return InitError(Untranslated("Invalid public FlowMesh asset catalog: " + (domain ? error : "chain domain unavailable")));
+        }
+    }
     peerman_opts.flowmesh_sink = nullptr;
     g_local_services = ServiceFlags(g_local_services & ~NODE_B3_FLOWMESH);
     if (flowmesh_validator) {
@@ -2059,7 +2074,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             if (node.flowmesh->LegacyTransportEnabled()) g_local_services = ServiceFlags(g_local_services | NODE_B3_FLOWMESH);
             validation_signals.RegisterValidationInterface(node.flowmesh.get());
         }
-        node.flowmesh_trading = node::MakeLocalFlowMeshBackend(*node.flowmesh);
+        node.flowmesh_trading = node::MakeLocalFlowMeshBackend(*node.flowmesh, flowmesh_metadata);
         if (flowmesh_api) {
             node::FlowMeshHttpsServer::Options options;
             options.bind_host = args.GetArg("-flowmeshapibind", "127.0.0.1");
@@ -2073,7 +2088,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             }
             if (!options.cert_file.is_absolute()) options.cert_file = args.GetDataDirNet() / options.cert_file;
             if (!options.key_file.is_absolute()) options.key_file = args.GetDataDirNet() / options.key_file;
-            node.flowmesh_api = node::MakeFlowMeshTradingApi(*node.flowmesh, std::move(options));
+            node.flowmesh_api = node::MakeFlowMeshTradingApi(*node.flowmesh, std::move(options), flowmesh_metadata);
             if (!node.flowmesh_api || !node.flowmesh_api->Start(flowmesh_error)) {
                 return InitError(Untranslated("FlowMesh HTTPS API failed to start: " + flowmesh_error));
             }

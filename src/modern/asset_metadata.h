@@ -28,6 +28,15 @@ struct AssetMetadataProof {
     }
 };
 
+//! Optional display data, never part of an asset commitment or signed action.
+//! The proof authenticates precision; name/ticker are assertions by source.
+struct AssetDisplayMetadata {
+    std::string name;
+    std::string ticker;
+    AssetMetadataProof proof;
+    std::string source;
+};
+
 inline bool VerifyAssetMetadataProof(const uint256& domain, const uint256& asset,
                                      const AssetMetadataProof& proof)
 {

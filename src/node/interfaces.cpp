@@ -647,9 +647,14 @@ public:
     {
         return m_node.asset_metadata ? m_node.asset_metadata->Get(asset) : std::nullopt;
     }
+    std::optional<modern::AssetDisplayMetadata> assetDisplayMetadata(const uint256& asset) override
+    {
+        return m_node.flowmesh_trading ? m_node.flowmesh_trading->Metadata(asset) : std::nullopt;
+    }
     uint64_t assetMetadataGeneration() override
     {
-        return m_node.asset_metadata ? m_node.asset_metadata->Generation() : 0;
+        return (m_node.asset_metadata ? m_node.asset_metadata->Generation() : 0) +
+               (m_node.flowmesh_trading ? m_node.flowmesh_trading->MetadataGeneration() : 0);
     }
     double guessVerificationProgress(const uint256& block_hash) override
     {

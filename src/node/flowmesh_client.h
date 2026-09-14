@@ -4,6 +4,7 @@
 #define BITCOIN_NODE_FLOWMESH_CLIENT_H
 
 #include <interfaces/chain.h>
+#include <node/flowmesh_asset_metadata.h>
 #include <node/flowmesh_https.h>
 #include <univalue.h>
 
@@ -21,6 +22,9 @@ class FlowMeshService;
 class FlowMeshTradingBackend {
 public:
     virtual ~FlowMeshTradingBackend() = default;
+    //! Bounded in-memory lookup; safe under a wallet lock, never waits for HTTP.
+    virtual std::optional<modern::AssetDisplayMetadata> Metadata(const uint256& asset) const { return std::nullopt; }
+    virtual uint64_t MetadataGeneration() const { return 0; }
     virtual std::vector<interfaces::FlowMeshMarketStatus> Markets(const std::optional<uint256>& account) = 0;
     virtual std::optional<interfaces::FlowMeshMarketStatus> Market(const uint256& market, const std::optional<uint256>& account) = 0;
     virtual std::optional<flowmesh::MarketData> Data(const uint256& market, const std::optional<uint256>& account,
@@ -35,14 +39,16 @@ public:
     virtual std::optional<interfaces::FlowMeshVaultOperation> VaultOperation(const uint256& effect, std::string& error) = 0;
 };
 
-std::unique_ptr<FlowMeshTradingBackend> MakeLocalFlowMeshBackend(FlowMeshService& service);
+std::unique_ptr<FlowMeshTradingBackend> MakeLocalFlowMeshBackend(
+    FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata = {});
 std::unique_ptr<FlowMeshTradingBackend> MakeRemoteFlowMeshBackend(
     ChainstateManager& chainman, std::vector<HttpsEndpoint> endpoints,
     const fs::path& client_datadir, std::string& error);
 
 //! Restricted HTTPS adapter. It holds no wallet and never invokes the RPC table.
 std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(
-    FlowMeshService& service, FlowMeshHttpsServer::Options options);
+    FlowMeshService& service, FlowMeshHttpsServer::Options options,
+    FlowMeshAssetMetadataCatalog metadata = {});
 
 //! Shared public projection used by the wallet RPC and restricted endpoint.
 UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data);

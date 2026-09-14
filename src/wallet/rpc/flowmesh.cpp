@@ -904,7 +904,7 @@ RPCHelpMan getflowmeshmarketdata()
                 {T::BOOL, "event_gap", "Explicit cursor gap requiring snapshot recovery"},
                 {T::BOOL, "freshest_network_head_proven", "False: a valid response does not prove the freshest network head"},
             }},
-            {T::OBJ, "base_metadata", /*optional=*/true, "Verified display precision and cosmetic labels; omitted on unchanged responses; does not certify backing", {
+            {T::OBJ, "base_metadata", /*optional=*/true, "Verified display precision and sourced cosmetic labels, including on unchanged responses; does not certify backing", {
                 {T::BOOL, "known", "Immutable display precision is verified"},
                 {T::NUM, "decimals", /*optional=*/true, "Verified display precision; omitted when unknown"},
                 {T::STR, "ticker", "Display ticker or empty"},
@@ -998,7 +998,6 @@ RPCHelpMan getflowmeshmarketdata()
             const auto data{wallet->chain().flowMeshMarketData(market_id, account, query, error)};
             if (!data) throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "FlowMesh market data is unavailable" : error);
             UniValue out{CertifiedMarketDataJson(*data)};
-            if (data->unchanged) return out;
             UniValue metadata{UniValue::VOBJ};
             {
                 LOCK(wallet->cs_wallet);

@@ -36,6 +36,9 @@ balances and confirmations still come from normal wallet/chain processing.
   wallets use the same verified precision even when the issuance is not in
   their own history.
 - Imported metadata supplies a local name and ticker plus ID-verified precision.
+- A configured FlowMesh HTTPS endpoint may provide an explicitly published
+  display catalog for its listed assets. Trading discovery and market refreshes
+  automatically verify and cache this metadata; recipients need no import RPC.
 - An asset without a matching genesis proof remains **Unknown asset**, showing
   exact raw units. Unknown precision is not treated as verified zero decimals.
 
@@ -45,6 +48,7 @@ amounts. `getwalletassets` retains its existing `decimals` field (zero fallback
 when unknown) and adds `precision_known`, `name`, `metadata_source`, and
 `test_only`. Clients must check `precision_known` before scaling an unknown
 asset. Metadata sources are `consensus`, `bundled-registry`, `local-registry`,
+`operator-public-catalog`, `endpoint-label: <configured HTTPS origin>`,
 `wallet-issuance`, `node-issuance`, and `unknown`.
 
 ## Register a custom asset locally
@@ -64,8 +68,9 @@ the local label; it does not delete coins or change the immutable genesis.
 
 Imported labels survive wallet reload and are included in wallet backups.
 They remain local to that wallet: arbitrary peer names/tickers are not trusted
-or automatically relayed. A recipient can import the same public proof and
-label if desired. Reviewed bundled identities include tUSD and cUSD below.
+or automatically relayed. The separate explicit public operator catalog below
+never exports this wallet-local registry. A recipient can import the same public
+proof and label if desired. Reviewed bundled identities include tUSD and cUSD below.
 
 Names are limited to 64 safe ASCII characters and tickers to 12; configured
 names and their normalized aliases are reserved. A proof may be at most
@@ -99,6 +104,61 @@ backing, redemption, or an issuer's identity. Unnamed assets keep their full
 asset identity and can display correctly scaled prices without inventing a
 ticker. Other wallets need a build containing this feature; it does not change
 the behavior of already-running older binaries or the network consensus rules.
+
+## Automatic public labels for FlowMesh clients
+
+Existing bundled tUSD/cUSD identities need no operator catalog. For other
+listed simple-v1 assets, the operator may set `flowmeshassetmetadata=assets.json`
+in the appropriate network section of `b3coin.conf`. This requires
+`enableflowmeshvalidator=1`; sharing uses the existing restricted HTTPS API and
+its existing certificate verification. No new public wallet RPC is exposed.
+Relative file paths are resolved under the network datadir.
+
+The file is an explicitly PUBLIC JSON array, at most 256 records and 256 KiB.
+Each record has exactly these eight fields (replace placeholders with real
+public genesis data; integer amounts are atomic units):
+
+```json
+[
+  {
+    "domain": "<64-hex chain domain>",
+    "asset_id": "<64-hex AssetId>",
+    "name": "Example Token",
+    "ticker": "EXM",
+    "issuance_txid": "<64-hex first input transaction id of the issuance>",
+    "issuance_vout": 0,
+    "max_supply": 1000000000,
+    "decimals": 6
+  }
+]
+```
+
+`issuance_txid`/`issuance_vout` identify the issuance transaction's FIRST INPUT
+outpoint, not the issuance transaction itself or a later transfer. The proof
+must reconstruct the exact AssetId on this chain. The entire file is checked
+before any entry is published; malformed or duplicate records fail the explicit
+startup configuration with a bounded diagnostic. Updating the file takes effect
+on the next normal operator restart, not through signing-history resets.
+
+Recipients automatically learn the optional `asset_display` field during
+market discovery/snapshot/status reads. Only metadata for the locally established
+market's exact base AssetId is accepted. Names/tickers remain endpoint assertions,
+not issuer identity, current issuance confirmation, reserves or redemption proof.
+Unsafe labels, reserved configured aliases, malformed integers, wrong-chain
+proofs and mismatched AssetIds are rejected. Cosmetic rejection does not stop
+valid market data, change balances, or alter a signed instruction.
+
+Local and bundled names take precedence. Remote labels are bounded, in-memory
+and re-fetched during trading reads after restart. The displayed source identifies
+the configured HTTPS origin; previously learned metadata is retained if a later
+response omits it. Opening only Assets does not itself make a trading-network
+request. This is not general B3 P2P gossip of all token labels.
+
+Metadata changes can appear on an unchanged certified market head without
+clearing order inputs or signed request history. Wallet metadata lookups are
+cache-only and never wait for HTTP under a wallet lock. The optional wire field
+is separate from all signed actions, certificates and consensus commitments;
+older operators can omit it and older clients ignore it.
 
 ## Send and receive in Qt
 

@@ -25,6 +25,7 @@
 #include <util/strencodings.h>
 #include <util/time.h>
 #include <util/int128.h>
+#include <util/log.h>
 #include <validation.h>
 
 #ifdef FLOWMESH_CLIENT_CRASH_TEST_HOOKS
@@ -32,6 +33,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <limits>
@@ -125,8 +127,19 @@ Receipt EventReceipt(const flowmesh::ClientEvent& event)
 
 class LocalBackend final : public FlowMeshTradingBackend {
     FlowMeshService& m_service;
+    const FlowMeshAssetMetadataCatalog m_metadata;
 public:
-    explicit LocalBackend(FlowMeshService& service) : m_service(service) {}
+    explicit LocalBackend(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata = {})
+        : m_service(service), m_metadata(std::move(metadata)) {}
+    std::optional<modern::AssetDisplayMetadata> Metadata(const uint256& asset) const override
+    {
+        const auto it{m_metadata.find(asset)};
+        if (it == m_metadata.end()) return std::nullopt;
+        auto out{it->second};
+        out.source = "operator-public-catalog";
+        return out;
+    }
+    uint64_t MetadataGeneration() const override { return m_metadata.empty() ? 0 : 1; }
     std::vector<MarketStatus> Markets(const std::optional<uint256>& account) override
     {
         std::vector<MarketStatus> out;
@@ -276,6 +289,14 @@ class TradingApi {
     std::map<std::string, Bucket> m_clients;
     unsigned m_global_count{0};
     std::chrono::steady_clock::time_point m_global_time{};
+    UniValue MarketResponse(const MarketStatus& status) const
+    {
+        auto out{MarketJson(status)};
+        if (const auto metadata{m_local.Metadata(status.base_asset)}) {
+            out.pushKV("asset_display", FlowMeshAssetMetadataJson(status.domain, status.base_asset, *metadata));
+        }
+        return out;
+    }
     bool Admit(const std::string& peer)
     {
         // Charged before decoding/authentication and before the operator's
@@ -293,7 +314,8 @@ class TradingApi {
         return ++bucket.count <= 32;
     }
 public:
-    explicit TradingApi(FlowMeshService& service) : m_service(service), m_local(service) {}
+    explicit TradingApi(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata)
+        : m_service(service), m_local(service, std::move(metadata)) {}
     UniValue Call(const UniValue& request)
     {
         Keys(request, {"method", "params"});
@@ -302,7 +324,7 @@ public:
         if (method == "markets") {
             Keys(params, {});
             UniValue out{UniValue::VARR};
-            for (const auto& value : m_local.Markets(std::nullopt)) out.push_back(MarketJson(value));
+            for (const auto& value : m_local.Markets(std::nullopt)) out.push_back(MarketResponse(value));
             return out;
         }
         if (method == "snapshot") {
@@ -315,7 +337,7 @@ public:
             const auto status{m_local.Market(id, std::nullopt)};
             if (!status) Fail("Unknown market");
             UniValue out{UniValue::VOBJ};
-            out.pushKV("status", MarketJson(*status));
+            out.pushKV("status", MarketResponse(*status));
             out.pushKV("certified_payload", HexStr(evidence->certified_payload));
             out.pushKV("state_bytes", HexStr(evidence->state_bytes));
             out.pushKV("cursor", CursorJson(evidence->cursor));
@@ -333,7 +355,7 @@ public:
             const auto status{m_local.Market(id, std::nullopt)};
             if (!status) Fail("Unknown market");
             UniValue out{UniValue::VOBJ};
-            out.pushKV("status", MarketJson(*status)); out.pushKV("cursor", CursorJson(page.cursor));
+            out.pushKV("status", MarketResponse(*status)); out.pushKV("cursor", CursorJson(page.cursor));
             out.pushKV("gap", page.gap); out.pushKV("more", page.more);
             out.pushKV("oldest_event_id", page.oldest_event_id); out.pushKV("latest_event_id", page.latest_event_id);
             UniValue events{UniValue::VARR};
@@ -438,6 +460,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // Network waits never hold cs_main, a wallet lock or an operator lock.
     // Only this client's requests are serialized; Status remains nonblocking.
     std::mutex m_work;
+    // Never acquire m_work from a wallet metadata lookup: it covers HTTPS.
+    mutable std::mutex m_metadata_mutex;
+    FlowMeshAssetMetadataCatalog m_metadata;
+    std::atomic<uint64_t> m_metadata_generation{0};
     mutable std::mutex m_status_mutex;
     interfaces::FlowMeshClientStatus m_status;
     size_t m_selected{0};
@@ -470,6 +496,26 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         std::optional<uint256> account_scope;
     };
     std::map<uint256, Cache> m_cache;
+
+    void LearnMetadata(const UniValue& status, const flowmesh::ClientEvidencePins& pins, size_t endpoint)
+    {
+        if (!status.exists("asset_display")) return; // Older operators remain compatible.
+        std::string error;
+        auto metadata{ParseFlowMeshAssetMetadata(status["asset_display"], pins.domain, pins.base_asset, error)};
+        if (!metadata) {
+            // Cosmetic failure must not alter admission, balances or signing.
+            LogDebug(BCLog::NET, "Ignoring invalid FlowMesh display metadata for asset=%s: %s\n", pins.base_asset.GetHex(), error);
+            return;
+        }
+        metadata->source = "endpoint-label: " + m_endpoints.at(endpoint).url;
+        std::lock_guard lock{m_metadata_mutex};
+        const auto old{m_metadata.find(pins.base_asset)};
+        if (old == m_metadata.end() && m_metadata.size() >= CLIENT_MAX_MARKETS) return;
+        if (old != m_metadata.end() && old->second.name == metadata->name &&
+            old->second.ticker == metadata->ticker && old->second.source == metadata->source) return;
+        m_metadata.insert_or_assign(pins.base_asset, std::move(*metadata));
+        m_metadata_generation.fetch_add(1, std::memory_order_release);
+    }
 
     void SyncIndexes() EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
     {
@@ -719,6 +765,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                     Inclusion(pending, m_cache.at(id).verified.certified, endpoint, evidence.certified_payload);
             }
             Save();
+            LearnMetadata(value["status"], pins, endpoint);
         });
     }
     Cache& Refresh(const uint256& id, const std::optional<uint256>& account, const flowmesh::MarketDataQuery& query)
@@ -804,6 +851,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             // A 'more' page is not skipped: cursor remains at the returned
             // page boundary, and the next refresh resumes there.
             (void)Flag(value, "more");
+            LearnMetadata(value["status"], cache.pins, endpoint);
         });
         if (snapshot_needed) Snapshot(id, account);
         return m_cache.at(id);
@@ -946,6 +994,13 @@ public:
         for (const auto& endpoint : m_endpoints) m_status.endpoints.push_back({endpoint.url, false, {}});
         Restore();
     }
+    std::optional<modern::AssetDisplayMetadata> Metadata(const uint256& asset) const override
+    {
+        std::lock_guard lock{m_metadata_mutex};
+        const auto it{m_metadata.find(asset)};
+        return it == m_metadata.end() ? std::nullopt : std::optional{it->second};
+    }
+    uint64_t MetadataGeneration() const override { return m_metadata_generation.load(std::memory_order_acquire); }
     std::vector<MarketStatus> Markets(const std::optional<uint256>& account) override
     {
         std::lock_guard lock{m_work};
@@ -963,6 +1018,7 @@ public:
         // demand, not every market's snapshot on each Qt refresh.
         for (const auto& row : rows.getValues()) {
             MarketStatus status; const auto pins{Pins(Id(row, "market_id"))};
+            LearnMetadata(row, pins, m_selected);
             status.market_id = pins.market_id; status.domain = pins.domain; status.base_asset = pins.base_asset;
             status.vault_id = pins.vault_id; status.execution_config_id = pins.execution_config_id;
             status.remote = true; status.endpoint = m_endpoints[m_selected].url;
@@ -1162,9 +1218,9 @@ std::optional<interfaces::FlowMeshVaultOperation> RemoteBackend::VaultOperation(
 
 } // namespace
 
-std::unique_ptr<FlowMeshTradingBackend> MakeLocalFlowMeshBackend(FlowMeshService& service)
+std::unique_ptr<FlowMeshTradingBackend> MakeLocalFlowMeshBackend(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata)
 {
-    return std::make_unique<LocalBackend>(service);
+    return std::make_unique<LocalBackend>(service, std::move(metadata));
 }
 std::unique_ptr<FlowMeshTradingBackend> MakeRemoteFlowMeshBackend(
     ChainstateManager& chainman, std::vector<HttpsEndpoint> endpoints, const fs::path& client_datadir, std::string& error)
@@ -1172,10 +1228,11 @@ std::unique_ptr<FlowMeshTradingBackend> MakeRemoteFlowMeshBackend(
     try { return std::make_unique<RemoteBackend>(chainman, std::move(endpoints), client_datadir); }
     catch (const std::exception& e) { error = e.what(); return {}; }
 }
-std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(FlowMeshService& service, FlowMeshHttpsServer::Options options)
+std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(FlowMeshService& service, FlowMeshHttpsServer::Options options,
+                                                        FlowMeshAssetMetadataCatalog metadata)
 {
     options.max_reply_bytes = CLIENT_MAX_REPLY;
-    auto api{std::make_shared<TradingApi>(service)};
+    auto api{std::make_shared<TradingApi>(service, std::move(metadata))};
     return std::make_unique<FlowMeshHttpsServer>(std::move(options), [api](const auto& request) { return api->Handle(request); });
 }
 } // namespace node

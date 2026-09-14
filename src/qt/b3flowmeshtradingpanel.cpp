@@ -969,6 +969,10 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
                 else {
                     auto retained{*m_snapshot}; retained.running = fresh.running; retained.paused = fresh.paused; retained.chain_reconciling = fresh.chain_reconciling; retained.handoff = fresh.handoff; retained.observer = fresh.observer; retained.halt = fresh.halt; retained.error = fresh.error; retained.pending_actions = fresh.pending_actions; retained.active_seats = fresh.active_seats; retained.quorum_required = fresh.quorum_required;
                     retained.remote = fresh.remote; retained.endpoint = fresh.endpoint; retained.certificate_verified = fresh.certificate_verified; retained.account_state_verified = fresh.account_state_verified; retained.execution_result_verified = fresh.execution_result_verified; retained.b3_checkpoint_confirmed = fresh.b3_checkpoint_confirmed; retained.event_gap = fresh.event_gap;
+                    // Cosmetic discovery can advance without a new certified
+                    // microblock. Keep the exact account/book and user inputs;
+                    // only accept units for this same canonical asset.
+                    if (fresh.units.known && fresh.units.asset == retained.base) retained.units = fresh.units;
                     m_snapshot = std::move(retained); m_response_age.restart(); updateDataViews();
                 }
             } else {

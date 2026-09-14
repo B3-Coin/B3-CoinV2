@@ -475,6 +475,9 @@ public:
     //! callers may hold cs_wallet. Absence never means zero-decimal precision.
     //! This is preimage knowledge, not a current-inclusion/backing assertion.
     virtual std::optional<modern::AssetMetadataProof> assetMetadataProof(const uint256& asset) { return std::nullopt; }
+    //! Optional sourced display labels with independently verified precision.
+    //! Cache-only, with no network, disk, chain lock or wallet callback.
+    virtual std::optional<modern::AssetDisplayMetadata> assetDisplayMetadata(const uint256& asset) { return std::nullopt; }
     //! Cheap cache generation for display refreshes without a new block.
     virtual uint64_t assetMetadataGeneration() { return 0; }
 

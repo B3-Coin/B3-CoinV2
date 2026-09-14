@@ -129,6 +129,16 @@ WalletAssetMetadata CWallet::GetAssetMetadata(const uint256& asset) const
     if (const auto it{m_asset_metadata.find(asset)}; it != m_asset_metadata.end()) {
         return {it->second.name, it->second.ticker, it->second.proof.decimals, "local-registry", false};
     }
+    if (HaveChain()) {
+        // These labels come only from the explicitly published catalog of a
+        // configured trading endpoint. Local/bundled labels take precedence.
+        // Recheck the immutable proof here; display names prove no backing.
+        const auto metadata{chain().assetDisplayMetadata(asset)};
+        const auto domain{AssetMetadataDomain(Params().GetConsensus())};
+        if (metadata && domain && AssetMetadataProofMatches(*domain, asset, metadata->proof)) {
+            return {metadata->name, metadata->ticker, metadata->proof.decimals, metadata->source, false};
+        }
+    }
     if (const auto it{m_asset_genesis.find(asset)}; it != m_asset_genesis.end()) {
         return {{}, {}, it->second.decimals, "wallet-issuance", false};
     }
