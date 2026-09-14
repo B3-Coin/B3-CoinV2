@@ -221,7 +221,11 @@ std::vector<WalletAssetBalance> GetWalletAssetBalances(const CWallet& wallet)
             parsed->asset,
             WalletAssetBalance{.asset_id = parsed->asset,
                                .is_fn = is_fn,
-                               .is_bridge = is_bridge})
+                               .is_bridge = is_bridge,
+                               .display_name = {},
+                               .ticker = {},
+                               .decimals = {},
+                               .metadata_source = {}})
                                          .first->second};
 
         const bool mature{!wallet.IsTxImmatureCoinBase(wtx)};

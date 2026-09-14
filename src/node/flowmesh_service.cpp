@@ -1190,7 +1190,9 @@ bool FlowMeshService::Impl::InstallMarket(
                 .domain = *domain,
                 .market_id = record.market_id,
                 .treasury_owner_commitment = *treasury,
+                .active_seats = {},
                 .state = metadata_state,
+                .last_microblock_hash = {},
                 .readiness =
                     FlowMeshRuntimeMarketReadiness::INSUFFICIENT_SEATS};
             std::string add_error;

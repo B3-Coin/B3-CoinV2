@@ -24,7 +24,9 @@ define $(package)_set_vars
   $(package)_config_opts_riscv64_linux=linux64-riscv64
   $(package)_cflags+=-fPIC -fdebug-prefix-map=$($(package)_extract_dir)=/usr -fmacro-prefix-map=$($(package)_extract_dir)=/usr
   $(package)_config_env+=CC="$($(package)_cc)" AR="$($(package)_ar)" RANLIB="$($(package)_ranlib)"
-  $(package)_config_env+=CFLAGS="$($(package)_cflags)" CPPFLAGS="$($(package)_cppflags)" LDFLAGS="$($(package)_ldflags)"
+  # OpenSSL's x86-64 C helpers use GNU asm. Keep this exception local to
+  # OpenSSL; preserve all other flags and the default C standard elsewhere.
+  $(package)_config_env+=CFLAGS="$$(patsubst -std=c11,-std=gnu11,$$($(package)_cflags))" CPPFLAGS="$($(package)_cppflags)" LDFLAGS="$($(package)_ldflags)"
 endef
 
 define $(package)_config_cmds

@@ -5,7 +5,12 @@
   "dependencies": [
     "boost-multi-index",
     "boost-signals2",
-    "libevent"
+    {
+      "name": "libevent",
+      "features": [
+        "openssl"
+      ]
+    }
   ],
   "default-features": [
     "qt",

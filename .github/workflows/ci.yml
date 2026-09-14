@@ -175,7 +175,11 @@ jobs:
         run: |
           # A workaround for "The `brew link` step did not complete successfully" error.
           brew install --quiet python@3 || brew link --overwrite python@3
-          brew install --quiet coreutils ninja pkgconf ccache boost libevent zeromq qt@6 qrencode capnp
+          brew install --quiet coreutils ninja pkgconf ccache boost libevent openssl@3 zeromq qt@6 qrencode capnp
+          # Bottled libevent metadata can retain a removed OpenSSL Cellar path.
+          # Rebuild after all installs so its TLS component uses this runner's
+          # actual OpenSSL headers and libraries, without weakening TLS checks.
+          brew reinstall --build-from-source libevent
 
       - name: Set Ccache directory
         run: echo "CCACHE_DIR=${RUNNER_TEMP}/ccache_dir" >> "$GITHUB_ENV"
