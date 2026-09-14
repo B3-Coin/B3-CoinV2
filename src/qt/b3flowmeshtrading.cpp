@@ -299,10 +299,11 @@ QString DescribeReceipt(const Receipt& r)
     QString text;
     if (r.Included()) text = QStringLiteral("Exact action inclusion verified in certified microblock #%1. %2")
         .arg(r.microblock_sequence).arg(r.outcome_verified ? QStringLiteral("Execution evidence verified; inspect the reported outcome separately.") : QStringLiteral("Execution outcome is unknown: inclusion alone does not prove a fill, successful withdrawal or B3 payout."));
+    else if (r.no_resubmit) text = QStringLiteral("Previously certified; fresh proof currently unavailable. The retained verified record prevents resubmission; this is not a never-established submission outcome.");
     else if (r.state == QStringLiteral("admitted")) text = QStringLiteral("Endpoint reports pool admission; not certified inclusion or execution.");
     else if (r.state == QStringLiteral("queued")) text = QStringLiteral("Request queued; pool admission, certified inclusion and execution are not yet proven.");
     else if (r.state == QStringLiteral("rejected")) text = QStringLiteral("Endpoint reports rejection; this does not prove that another endpoint did not already accept the exact action.");
-    else text = QStringLiteral("Submission outcome unknown. Do not create or re-sign a replacement request to retry it.");
+    else text = QStringLiteral("Submission outcome has never been established by verified inclusion. Do not create or re-sign a replacement request to retry it.");
     if (r.no_resubmit) text += QStringLiteral("\nPreviously certified: retained no-resubmit protection is active. A fresh verification label requires current evidence; this instruction will not be resent.");
     text += QStringLiteral("\nAction ID: %1").arg(r.action_id);
     if (!r.endpoint.isEmpty()) text += QStringLiteral("\nEndpoint: %1").arg(r.endpoint);

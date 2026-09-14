@@ -135,6 +135,30 @@ private Q_SLOTS:
         UniValue legacy{UniValue::VOBJ}; legacy.pushKV("market_id", market.toStdString()); legacy.pushKV("action_id", id.toStdString()); legacy.pushKV("accepted", true);
         const auto receipt{ParseReceipt(legacy, market)}; QCOMPARE(receipt.state, QStringLiteral("queued")); QVERIFY(!receipt.Included());
     }
+    void previouslyCertifiedWithoutFreshProofIsNotNeverEstablished()
+    {
+        Receipt receipt;
+        receipt.action_id = QString::fromStdString(H(8).GetHex());
+        receipt.state = QStringLiteral("unknown");
+        QVERIFY(DescribeReceipt(receipt).contains(QStringLiteral("Submission outcome has never been established")));
+        QVERIFY(!DescribeReceipt(receipt).contains(QStringLiteral("Previously certified;")));
+        for (const auto* state : {"unknown", "queued", "admitted", "rejected"}) {
+            receipt.state = QString::fromLatin1(state);
+            receipt.no_resubmit = true; // Only the retained verified local record supplies this flag.
+            const auto text{DescribeReceipt(receipt)};
+            QVERIFY(text.contains(QStringLiteral("Previously certified; fresh proof currently unavailable")));
+            QVERIFY(!text.contains(QStringLiteral("Submission outcome has never been established")));
+            QVERIFY(!text.contains(QStringLiteral("Exact action inclusion verified")));
+            QVERIFY(!receipt.Included());
+        }
+        receipt.state = QStringLiteral("certified_inclusion");
+        receipt.certificate_verified = true;
+        receipt.microblock_hash = QString::fromStdString(H(9).GetHex());
+        receipt.microblock_sequence = 21;
+        QVERIFY(receipt.Included());
+        QVERIFY(DescribeReceipt(receipt).contains(QStringLiteral("Exact action inclusion verified")));
+        QVERIFY(!DescribeReceipt(receipt).contains(QStringLiteral("fresh proof currently unavailable")));
+    }
     void savedInstructionsRestoreIdentityWithoutTrustingPriorCertification()
     {
         const auto market{Order().market};
