@@ -92,6 +92,14 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 set(QT_TRANSLATIONS_DIR "${CMAKE_CURRENT_LIST_DIR}/translations")
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  # depends builds OpenSSL with no-shared. FindOpenSSL needs this explicit
+  # hint even when it discovers .a files, otherwise its imported targets omit
+  # Crypt32 and the static Windows certificate-store implementation cannot
+  # link. Keep the requirement transitive for both Qt and headless consumers.
+  set(OPENSSL_USE_STATIC_LIBS TRUE)
+endif()
+
 # The following is only necessary when using cmake from Nix or NixOS, because
 # Nix patches cmake to remove the root directory `/` from
 # CMAKE_SYSTEM_PREFIX_PATH. Adding it back is harmless on other platforms and

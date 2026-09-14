@@ -1,5 +1,23 @@
 # Review-only desktop compilation follow-up
 
+## Windows linker follow-up
+
+Run `34839249533` built both Mac artifacts successfully at source `59e29b0`.
+Windows reached the final Qt link, then failed with unresolved
+`CertFindCertificateInStore`, `CertFreeCertificateContext`, `CertCloseStore`
+and `CertOpenSystemStoreW` imports from static OpenSSL's `winstore_store`.
+These require Crypt32. The application configure step had discovered static
+OpenSSL archives without setting `OPENSSL_USE_STATIC_LIBS`, which CMake's
+FindOpenSSL uses to attach the Windows system-library dependencies.
+
+The Windows depends toolchain now declares its actual static OpenSSL mode.
+This keeps Crypt32/socket dependencies transitive to Qt and headless consumers;
+it does not disable TLS or the Windows certificate store. Non-Windows build
+configuration and runtime code are unchanged. Local MinGW compilation was not
+available; the follow-up qualification is the Windows-only GitHub build with
+tests still disabled. Preserve the successful Mac artifacts at their original
+source identity; they were not rebuilt or relabeled as the Windows fix commit.
+
 This delta follows the published draft review branch. It does not replace any
 frozen Candidate04/05 artifacts or their retained evidence. It is not a public
 release, deployment, mainnet qualification or repair of the historical
