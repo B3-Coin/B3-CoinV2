@@ -24,6 +24,13 @@ private Q_SLOTS:
     void repeatedProgressUpdatesAreSafe();
     void closeDuringInitRequestsShutdown();
     void teardownWithNodeHandlersIsClean();
+    void delayedPhaseKeepsHeartbeat_data();
+    void delayedPhaseKeepsHeartbeat();
+    void idleFramesContinueAfterIntro();
+    void reducedMotionDoesNotPulseDuringDelay();
+    void queuedProgressIsDiscardedAfterDestruction();
+    void controlledStartupEndStopsTimers_data();
+    void controlledStartupEndStopsTimers();
 
 private:
     interfaces::Node& m_node;

@@ -30,6 +30,16 @@ target_link_libraries(test_bitcoin-qt
 
 import_plugins(test_bitcoin-qt)
 
+# Splash-only timing/lifecycle checks: generated temporary settings and regtest
+# parameters, with no wallet/database startup, sockets, RPC or validator duties.
+add_executable(test_b3_splash-qt b3splash_test_main.cpp b3splashtests.cpp)
+target_link_libraries(test_b3_splash-qt
+  core_interface bitcoinqt test_util bitcoin_node Boost::headers Qt6::Test
+)
+import_plugins(test_b3_splash-qt)
+add_test(NAME test_b3_splash-qt COMMAND test_b3_splash-qt)
+set_tests_properties(test_b3_splash-qt PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=minimal")
+
 if(ENABLE_WALLET)
   target_sources(test_bitcoin-qt
     PRIVATE
