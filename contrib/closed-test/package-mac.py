@@ -57,6 +57,15 @@ def framework_version(plist):
     return value
 
 
+def loopback_https_endpoint(endpoint):
+    # The client accepts an HTTPS origin, origin/, or the fixed API path.
+    # Closed mode A additionally requires an explicit local service port.
+    if not isinstance(endpoint, str):
+        return False
+    match = re.fullmatch(r'https://(?:127\.0\.0\.1|localhost):([0-9]+)(?:/|/flowmesh/v1)?', endpoint)
+    return bool(match and 0 < int(match.group(1)) <= 65535)
+
+
 def verify_export(root, document):
     rows = document['files']
     canonical = ''
@@ -151,7 +160,7 @@ def main():
     if profile.get('ready') is not True or profile.get('network') != 'regtest':
         parser.error('Only an enabled isolated regtest profile may be packaged')
     if not profile['b3_peer'].startswith('127.0.0.1:') or any(
-        not re.fullmatch(r'https://(127\.0\.0\.1|localhost):[0-9]+/flowmesh/v1', endpoint)
+        not loopback_https_endpoint(endpoint)
         for endpoint in profile['https_endpoints']):
         parser.error('This mode-A package requires loopback B3 and HTTPS endpoints')
     notices = args.notices_dir.resolve(strict=True)

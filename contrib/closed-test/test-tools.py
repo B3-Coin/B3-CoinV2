@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pure generated-file tests for source manifest/package helpers; no services."""
 import hashlib
+import ast
 import importlib.util
 import json
 from pathlib import Path
@@ -15,6 +16,10 @@ spec.loader.exec_module(package)
 notice_spec = importlib.util.spec_from_file_location('collect_notices', Path(__file__).with_name('collect-notices.py'))
 notices = importlib.util.module_from_spec(notice_spec)
 notice_spec.loader.exec_module(notices)
+capture_path = Path(__file__).with_name('capture-qt.py')
+capture_spec = importlib.util.spec_from_file_location('capture_qt', capture_path)
+capture = importlib.util.module_from_spec(capture_spec)
+capture_spec.loader.exec_module(capture)
 
 
 class PackagingHelpers(unittest.TestCase):
@@ -92,6 +97,35 @@ class PackagingHelpers(unittest.TestCase):
             notices.read_attribution(b'{broken')
         with self.assertRaises(ValueError):
             notices.read_attribution(b'[1]')
+
+    def test_loopback_origin_forms_match_client_endpoint_contract(self):
+        for host in ('127.0.0.1', 'localhost'):
+            for suffix in ('', '/', '/flowmesh/v1'):
+                endpoint = f'https://{host}:20952{suffix}'
+                self.assertTrue(package.loopback_https_endpoint(endpoint))
+                self.assertEqual(capture.loopback_https_endpoint(endpoint).port, 20952)
+        for endpoint in ('http://127.0.0.1:20952', 'https://example.org:20952',
+                         'https://127.0.0.1:0', 'https://localhost:65536',
+                         'https://localhost', 'https://user@localhost:20952',
+                         'https://localhost:20952/other', 'https://localhost:20952?',
+                         'https://localhost:20952#', 'https://localhost:20952\n'):
+            self.assertFalse(package.loopback_https_endpoint(endpoint), endpoint)
+            with self.assertRaises(RuntimeError, msg=endpoint):
+                capture.loopback_https_endpoint(endpoint)
+
+    def test_capture_posts_fixed_api_path_for_origin_endpoints(self):
+        # Inspect the actual preflight request expression, not only a constant
+        # which might be unused. No connection or service is started.
+        tree = ast.parse(capture_path.read_text())
+        requests = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute) and node.func.attr == 'request']
+        self.assertEqual(len(requests), 1)
+        for suffix in ('', '/', '/flowmesh/v1'):
+            expression = ast.Expression(requests[0].args[1])
+            value = eval(compile(expression, str(capture_path), 'eval'),
+                         {'API_PATH': capture.API_PATH,
+                          'parsed': capture.loopback_https_endpoint('https://127.0.0.1:20952' + suffix)})
+            self.assertEqual(value, '/flowmesh/v1')
 
 
 if __name__ == '__main__':

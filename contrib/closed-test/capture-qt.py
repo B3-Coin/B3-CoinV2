@@ -8,11 +8,24 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import ssl
 import subprocess
 import time
 from urllib.parse import urlsplit
+
+
+API_PATH = '/flowmesh/v1'
+
+
+def loopback_https_endpoint(endpoint):
+    # Match the package's controlled origin forms. The application always
+    # sends the API path even when the configured endpoint is a bare origin.
+    match = re.fullmatch(r'https://(?:127\.0\.0\.1|localhost):([0-9]+)(?:/|/flowmesh/v1)?', endpoint)
+    if not match or not 0 < int(match.group(1)) <= 65535:
+        raise RuntimeError('Only declared loopback HTTPS origins or /flowmesh/v1 endpoints are allowed')
+    return urlsplit(endpoint)
 
 
 def save(path, obj):
@@ -44,14 +57,12 @@ def main():
     profile = json.loads((session_dir / 'enabled-profile.json').read_text())
     context = ssl.create_default_context(cadata=profile['ca_pem'])
     for endpoint in profile['https_endpoints']:
-        parsed = urlsplit(endpoint)
-        if parsed.scheme != 'https' or parsed.hostname not in ('localhost', '127.0.0.1'):
-            raise RuntimeError('Only declared loopback HTTPS endpoints are allowed')
+        parsed = loopback_https_endpoint(endpoint)
         healthy = False
         for attempt in range(3):
             connection = http.client.HTTPSConnection(parsed.hostname, parsed.port, context=context, timeout=5)
             try:
-                connection.request('POST', parsed.path, json.dumps({'method':'markets','params':{}}),
+                connection.request('POST', API_PATH, json.dumps({'method':'markets','params':{}}),
                                    {'Content-Type':'application/json'})
                 response = connection.getresponse()
                 body = response.read(1024 * 1024 + 1)
