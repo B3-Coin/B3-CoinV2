@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string>
+<key>CFBundleName</key><string>B3 FlowMesh CLOSED TEST</string>
+<key>CFBundleDisplayName</key><string>B3 FlowMesh CLOSED TEST</string>
+<key>CFBundleIdentifier</key><string>org.b3coin.flowmesh.closed-test.candidate04</string>
+<key>CFBundleVersion</key><string>20260914.4</string>
+<key>CFBundleShortVersionString</key><string>20260914.4</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>LSMinimumSystemVersion</key><string>26.0</string>
+<key>NSHighResolutionCapable</key><true/>
+<key>NSHumanReadableCopyright</key><string>CLOSED TEST — regtest tokens have no value. Not a public release.</string>
+</dict></plist>

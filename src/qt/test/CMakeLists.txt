@@ -247,3 +247,4 @@ if(WIN32 AND VCPKG_TARGET_TRIPLET)
 endif()
 
 install_binary_component(test_bitcoin-qt INTERNAL)
+include(flowmeshclosedtest.cmake)
