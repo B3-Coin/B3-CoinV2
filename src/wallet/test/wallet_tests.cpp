@@ -31,6 +31,7 @@
 #include <test/util/logging.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
+#include <test/util/txmempool.h>
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
@@ -1027,11 +1028,10 @@ BOOST_AUTO_TEST_CASE(b3_finality_snapshot_missing_imported_key)
 //! auto-selected for ordinary spends.
 BOOST_FIXTURE_TEST_CASE(b3_validator_key_and_stake_outputs, TestChain100Setup)
 {
-    std::unique_ptr<CWallet> wallet;
-    {
-        LOCK(cs_main);
-        wallet = CreateSyncedWallet(*m_node.chain, m_node.chainman->ActiveChain(), coinbaseKey);
-    }
+    // The helper takes wallet -> cs_main internally. Do not wrap its wallet
+    // construction and rescan in the opposite cs_main -> wallet order.
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(cs_main, return m_node.chainman->ActiveChain()), coinbaseKey);
     const CTxDestination owner{PKHash(coinbaseKey.GetPubKey())};
     std::array<unsigned char, 32> validator_id{};
     validator_id.fill(0x42);
@@ -1266,6 +1266,61 @@ BOOST_FIXTURE_TEST_CASE(b3_validator_key_and_stake_outputs, TestChain100Setup)
                                        m_coinbase_txns[0]->vout[0].scriptPubKey, sigdata));
         UpdateInput(stake_tx.vin[0], sigdata);
     }
+    {
+        const auto stake_ref = MakeTransactionRef(stake_tx);
+        {
+            LOCK(cs_main);
+            const auto admitted = m_node.chainman->ProcessTransaction(stake_ref);
+            // This generic chain fixture intentionally has no B3 minimum.
+            // Preserve its fail-closed admission result; do not change chain
+            // parameters merely to exercise the wallet's trust policy below.
+            BOOST_REQUIRE(!m_node.chainman->GetConsensus().min_stake_amount);
+            BOOST_REQUIRE(admitted.m_result_type == MempoolAcceptResult::ResultType::INVALID);
+            BOOST_REQUIRE_EQUAL(admitted.m_state.GetRejectReason(), "bad-stake-output");
+        }
+        // Unit-only pool membership simulates trusted zero-conf change. This
+        // is not evidence of successful STAKE creation through admission.
+        TestMemPoolEntryHelper entry;
+        TryAddToMempool(*m_node.mempool, entry.Fee(10000).FromTx(stake_ref));
+        BOOST_REQUIRE(m_node.mempool->exists(stake_ref->GetHash()));
+        {
+            LOCK(wallet->cs_wallet);
+            BOOST_REQUIRE(wallet->AddToWallet(stake_ref, TxStateInMempool{}));
+        }
+        WalletContext trust_context;
+        const std::shared_ptr<CWallet> trust_alias{wallet.get(), [](CWallet*) {}};
+        const auto trust_backend = interfaces::MakeWallet(trust_context, trust_alias);
+        const COutPoint outpoint{stake_ref->GetHash(), 0};
+        // Existing safe zero-conf owner change stays eligible; there is no
+        // new blanket confirmation restriction for STAKE owner spends.
+        BOOST_CHECK(trust_backend->getCoins({outpoint})[0].stake_unavailable_reason.empty());
+        BOOST_CHECK(trust_backend->checkStakeInputs({outpoint}));
+        {
+            LOCK(wallet->cs_wallet);
+            wallet->m_spend_zero_conf_change = false;
+        }
+        BOOST_CHECK(!trust_backend->checkStakeInputs({outpoint}));
+        BOOST_CHECK(!trust_backend->checkStakeInputs({outpoint}, false));
+        BOOST_CHECK(trust_backend->getCoins({outpoint})[0].stake_unavailable_reason.find("Untrusted") != std::string::npos);
+        {
+            LOCK(wallet->cs_wallet);
+            wallet->m_spend_zero_conf_change = true;
+        }
+        for (const auto* marker : {"replaces_txid", "replaced_by_txid"}) {
+            {
+                LOCK(wallet->cs_wallet);
+                wallet->mapWallet.at(outpoint.hash).mapValue[marker] = uint256::ONE.GetHex();
+            }
+            BOOST_CHECK(!trust_backend->checkStakeInputs({outpoint}));
+            BOOST_CHECK(!trust_backend->checkStakeInputs({outpoint}, false));
+            BOOST_CHECK(trust_backend->getCoins({outpoint})[0].stake_unavailable_reason.find("replaced") != std::string::npos);
+            {
+                LOCK(wallet->cs_wallet);
+                wallet->mapWallet.at(outpoint.hash).mapValue.erase(marker);
+            }
+        }
+        BOOST_CHECK(trust_backend->checkStakeInputs({outpoint}));
+    }
     const CBlock stake_block{CreateAndProcessBlock({stake_tx}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()))};
     {
         LOCK(cs_main);
@@ -1273,15 +1328,16 @@ BOOST_FIXTURE_TEST_CASE(b3_validator_key_and_stake_outputs, TestChain100Setup)
         BOOST_REQUIRE_EQUAL(m_node.chainman->ActiveChain().Tip()->GetBlockHash().GetHex(), stake_block.GetHash().GetHex());
         BOOST_REQUIRE_EQUAL(stake_block.vtx.size(), 2U);
         BOOST_REQUIRE_EQUAL(stake_block.vtx[1]->GetHash().GetHex(), stake_tx.GetHash().GetHex());
-        LOCK(wallet->cs_wallet);
-        BOOST_REQUIRE(wallet->IsMine(*stake_block.vtx[1]));
     }
+    BOOST_REQUIRE(WITH_LOCK(wallet->cs_wallet, return wallet->IsMine(*stake_block.vtx[1])));
     {
         // The wallet is not subscribed to block notifications in this test, so
         // tell it the chain advanced (a rescan stops at the wallet's own
         // last-processed height) and rescan from genesis.
-        LOCK2(wallet->cs_wallet, cs_main);
-        wallet->SetLastBlockProcessed(m_node.chainman->ActiveChain().Height(), m_node.chainman->ActiveChain().Tip()->GetBlockHash());
+        const auto tip = WITH_LOCK(cs_main, return std::make_pair(
+            m_node.chainman->ActiveChain().Height(), m_node.chainman->ActiveChain().Tip()->GetBlockHash()));
+        LOCK(wallet->cs_wallet);
+        wallet->SetLastBlockProcessed(tip.first, tip.second);
     }
     {
         WalletRescanReserver reserver(*wallet);
@@ -1299,6 +1355,88 @@ BOOST_FIXTURE_TEST_CASE(b3_validator_key_and_stake_outputs, TestChain100Setup)
         for (const COutput& coin : AvailableCoins(*wallet).All()) listed |= coin.outpoint == stake_outpoint;
         BOOST_CHECK(!listed);
     }
+
+    WalletContext interface_context;
+    const std::shared_ptr<CWallet> alias{wallet.get(), [](CWallet*) {}};
+    const auto backend = interfaces::MakeWallet(interface_context, alias);
+    const COutPoint stake_outpoint{stake_tx.GetHash(), 0};
+    const auto contains_stake = [&](const interfaces::Wallet::CoinsList& list) {
+        for (const auto& [address, coins] : list)
+            for (const auto& [outpoint, info] : coins)
+                if (outpoint == stake_outpoint) return true;
+        return false;
+    };
+    BOOST_CHECK(!contains_stake(backend->listCoins()));
+    BOOST_CHECK(contains_stake(backend->listCoins(/*include_stake=*/true)));
+    const auto described = backend->getCoins({stake_outpoint});
+    BOOST_REQUIRE_EQUAL(described.size(), 1U);
+    BOOST_CHECK(described[0].is_stake);
+    BOOST_CHECK(!described[0].stake_active);
+    BOOST_CHECK_EQUAL(described[0].blocks_to_maturity, 0);
+    BOOST_CHECK(described[0].owner_spendable);
+    BOOST_CHECK(backend->checkStakeInputs({stake_outpoint}));
+    BOOST_CHECK_EQUAL(backend->getCoins({COutPoint{stake_outpoint.hash, 999999}})[0].depth_in_main_chain, -1);
+
+    backend->lockCoin(stake_outpoint, /*write_to_db=*/true);
+    BOOST_CHECK(contains_stake(backend->listCoins(true)));
+    BOOST_CHECK(backend->getCoins({stake_outpoint})[0].is_locked);
+    BOOST_CHECK(!backend->checkStakeInputs({stake_outpoint}));
+    BOOST_CHECK(backend->isLockedCoin(stake_outpoint));
+    backend->unlockCoin(stake_outpoint); // Deliberate test owner action, not a selection side effect.
+    BOOST_CHECK(backend->checkStakeInputs({stake_outpoint}));
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->Lock();
+    }
+    BOOST_CHECK(!backend->checkStakeInputs({stake_outpoint}));
+    // A prepared, already signed transaction may be published after its normal
+    // unlock context has relocked. Chain/coin locks are still checked.
+    BOOST_CHECK(backend->checkStakeInputs({stake_outpoint}, /*require_signing=*/false));
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->Unlock("qualification-pass"));
+    }
+
+    CCoinControl explicit_inputs;
+    explicit_inputs.Select(stake_outpoint);
+    explicit_inputs.m_allow_other_inputs = false;
+    explicit_inputs.m_feerate = CFeeRate(1000);
+    const auto prepared = CreateTransaction(*wallet,
+        {CRecipient{owner, COIN, false}}, std::nullopt, explicit_inputs, /*sign=*/true);
+    BOOST_REQUIRE_MESSAGE(prepared, util::ErrorString(prepared).original);
+    BOOST_REQUIRE_EQUAL(prepared->tx->vin.size(), 1U);
+    BOOST_CHECK(prepared->tx->vin[0].prevout == stake_outpoint);
+    BOOST_REQUIRE(prepared->change_pos);
+    CAmount outputs_value{0};
+    for (const auto& output : prepared->tx->vout) {
+        outputs_value += output.nValue;
+        BOOST_CHECK(!modern::ClaimsStakeMagic(output.scriptPubKey));
+    }
+    BOOST_CHECK_EQUAL(outputs_value + prepared->fee, in_value - 10000);
+    // Prepare/cancel has no economic effect.
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return !wallet->IsSpent(stake_outpoint)));
+    BOOST_CHECK(VerifyScript(prepared->tx->vin[0].scriptSig, stake_script, nullptr,
+        STANDARD_SCRIPT_VERIFY_FLAGS,
+        TransactionSignatureChecker(prepared->tx.get(), 0, in_value - 10000, MissingDataBehavior::FAIL)));
+    {
+        LOCK(cs_main);
+        const auto admitted = m_node.chainman->ProcessTransaction(prepared->tx);
+        BOOST_REQUIRE_MESSAGE(admitted.m_result_type == MempoolAcceptResult::ResultType::VALID,
+                              admitted.m_state.ToString());
+    }
+    // This wallet deliberately receives no mempool notifications. The old
+    // findCoins lookup still returns the parent; explicit preflight must not.
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return !wallet->IsSpent(stake_outpoint)));
+    std::map<COutPoint, Coin> ordinary_lookup{{stake_outpoint, Coin{}}};
+    m_node.chain->findCoins(ordinary_lookup);
+    BOOST_CHECK(!ordinary_lookup.at(stake_outpoint).IsSpent());
+    BOOST_CHECK(!backend->checkStakeInputs({stake_outpoint}, false));
+    // The final check detects a selected input consumed elsewhere, even before
+    // this wallet's asynchronous transaction history catches up.
+    const auto spent_block = CreateAndProcessBlock(
+        {CMutableTransaction{*prepared->tx}}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    BOOST_REQUIRE_EQUAL(spent_block.vtx.size(), 2U);
+    BOOST_CHECK(!backend->checkStakeInputs({stake_outpoint}, false));
 }
 
 BOOST_AUTO_TEST_CASE(legacy_coinstake_maturity_depth_and_conflict)

@@ -174,6 +174,7 @@ bool WalletModel::validateAddress(const QString& address) const
 WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransaction &transaction, const CCoinControl& coinControl)
 {
     transaction.getWtx() = nullptr; // reset tx output
+    transaction.setChangePosition(std::nullopt);
 
     CAmount total = 0;
     bool fSubtractFeeFromAmount = false;
@@ -234,6 +235,7 @@ WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransact
         }
 
         newTx = res->tx;
+        transaction.setChangePosition(res->change_pos);
         CAmount nFeeRequired = res->fee;
         transaction.setTransactionFee(nFeeRequired);
         if (fSubtractFeeFromAmount && newTx) {

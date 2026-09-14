@@ -111,6 +111,15 @@ if(ENABLE_WALLET)
     ENVIRONMENT "QT_QPA_PLATFORM=minimal"
   )
 
+  # Generated in-memory owner/watch-only wallets; no network or economic actions.
+  add_executable(test_b3_stakecoincontrol-qt b3stakecoincontroltests.cpp)
+  target_link_libraries(test_b3_stakecoincontrol-qt
+    core_interface bitcoinqt test_util bitcoin_node Boost::headers Qt6::Test
+  )
+  import_plugins(test_b3_stakecoincontrol-qt)
+  add_test(NAME test_b3_stakecoincontrol-qt COMMAND test_b3_stakecoincontrol-qt)
+  set_tests_properties(test_b3_stakecoincontrol-qt PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=minimal")
+
   # Isolated encrypted-wallet staking unlock checks, with no mining/network.
   add_executable(test_b3_stakingunlock-qt b3stakingunlocktests.cpp)
   target_link_libraries(test_b3_stakingunlock-qt

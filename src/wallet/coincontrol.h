@@ -92,6 +92,8 @@ public:
     //! If true, the selection process can add extra unselected inputs from the wallet
     //! while requires all selected inputs be used
     bool m_allow_other_inputs = true;
+    //! Qt's explicit STAKE display/selection consent. Never affects automatic selection.
+    bool m_include_stake = false;
     //! Override automatic min/max checks on fee, m_feerate must be set if true
     bool fOverrideFeeRate = false;
     //! Override the wallet's fee rate if set

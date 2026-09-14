@@ -9,7 +9,7 @@
 #include <validation.h>
 
 namespace node {
-void FindCoins(const NodeContext& node, std::map<COutPoint, Coin>& coins)
+void FindCoins(const NodeContext& node, std::map<COutPoint, Coin>& coins, bool exclude_mempool_spent)
 {
     assert(node.mempool);
     assert(node.chainman);
@@ -17,6 +17,10 @@ void FindCoins(const NodeContext& node, std::map<COutPoint, Coin>& coins)
     CCoinsViewCache& chain_view = node.chainman->ActiveChainstate().CoinsTip();
     CCoinsViewMemPool mempool_view(&chain_view, *node.mempool);
     for (auto& [outpoint, coin] : coins) {
+        if (exclude_mempool_spent && node.mempool->isSpent(outpoint)) {
+            coin.Clear();
+            continue;
+        }
         if (auto c{mempool_view.GetCoin(outpoint)}) {
             coin = std::move(*c);
         } else {

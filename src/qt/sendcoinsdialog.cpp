@@ -37,8 +37,10 @@
 #include <memory>
 
 #include <QFontMetrics>
+#include <QPointer>
 #include <QScrollBar>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QTextDocument>
 
 using common::PSBTError;
@@ -148,19 +150,34 @@ void SendCoinsDialog::setClientModel(ClientModel *_clientModel)
 
 void SendCoinsDialog::setModel(WalletModel *_model)
 {
+    if (model == _model) return;
+    if (model != _model) {
+        // This asynchronous child holds references to both the current wallet
+        // and coin control. Destroy it before either reference can change.
+        delete m_coin_control_dialog.data();
+        if (model) disconnect(model, nullptr, this, nullptr);
+        // OptionsModel normally outlives WalletModel, so disconnect it
+        // explicitly as well as the wallet's own signals.
+        if (m_options_model) disconnect(m_options_model, nullptr, this, nullptr);
+        m_options_model = nullptr;
+        // Coin-control consent and outpoints belong to one wallet only.
+        m_coin_control = std::make_unique<CCoinControl>();
+        m_current_transaction.reset();
+        fNewRecipientAllowed = true;
+    }
     this->model = _model;
+
+    // Recipient widgets also hold the wallet model. Clear their references on
+    // removal, before a later address-edit callback can use the old wallet.
+    for (int i = 0; i < ui->entries->count(); ++i) {
+        auto* entry = qobject_cast<SendCoinsEntry*>(ui->entries->itemAt(i)->widget());
+        if (entry) entry->setModel(_model);
+    }
 
     if(_model && _model->getOptionsModel())
     {
-        for(int i = 0; i < ui->entries->count(); ++i)
-        {
-            SendCoinsEntry *entry = qobject_cast<SendCoinsEntry*>(ui->entries->itemAt(i)->widget());
-            if(entry)
-            {
-                entry->setModel(_model);
-            }
-        }
-
+        m_options_model = _model->getOptionsModel();
+        connect(_model, &QObject::destroyed, this, [this] { setModel(nullptr); });
         connect(_model, &WalletModel::balanceChanged, this, &SendCoinsDialog::setBalance);
         connect(_model->getOptionsModel(), &OptionsModel::displayUnitChanged, this, &SendCoinsDialog::refreshBalance);
         refreshBalance();
@@ -172,22 +189,26 @@ void SendCoinsDialog::setModel(WalletModel *_model)
         coinControlUpdateLabels();
 
         // fee section
-        for (const int n : confTargets) {
-            ui->confTargetSelector->addItem(tr("%1 (%2 blocks)").arg(GUIUtil::formatNiceTimeOffset(n*Params().GetConsensus().nPowTargetSpacing)).arg(n));
+        {
+            const QSignalBlocker rebuilding(ui->confTargetSelector);
+            ui->confTargetSelector->clear();
+            for (const int n : confTargets) {
+                ui->confTargetSelector->addItem(tr("%1 (%2 blocks)").arg(GUIUtil::formatNiceTimeOffset(n*Params().GetConsensus().nPowTargetSpacing)).arg(n));
+            }
         }
-        connect(ui->confTargetSelector, qOverload<int>(&QComboBox::currentIndexChanged), this, &SendCoinsDialog::updateSmartFeeLabel);
-        connect(ui->confTargetSelector, qOverload<int>(&QComboBox::currentIndexChanged), this, &SendCoinsDialog::coinControlUpdateLabels);
+        connect(ui->confTargetSelector, qOverload<int>(&QComboBox::currentIndexChanged), this, &SendCoinsDialog::updateSmartFeeLabel, Qt::UniqueConnection);
+        connect(ui->confTargetSelector, qOverload<int>(&QComboBox::currentIndexChanged), this, &SendCoinsDialog::coinControlUpdateLabels, Qt::UniqueConnection);
 
-        connect(ui->groupFee, &QButtonGroup::idClicked, this, &SendCoinsDialog::updateFeeSectionControls);
-        connect(ui->groupFee, &QButtonGroup::idClicked, this, &SendCoinsDialog::coinControlUpdateLabels);
+        connect(ui->groupFee, &QButtonGroup::idClicked, this, &SendCoinsDialog::updateFeeSectionControls, Qt::UniqueConnection);
+        connect(ui->groupFee, &QButtonGroup::idClicked, this, &SendCoinsDialog::coinControlUpdateLabels, Qt::UniqueConnection);
 
-        connect(ui->customFee, &BitcoinAmountField::valueChanged, this, &SendCoinsDialog::coinControlUpdateLabels);
+        connect(ui->customFee, &BitcoinAmountField::valueChanged, this, &SendCoinsDialog::coinControlUpdateLabels, Qt::UniqueConnection);
 #if (QT_VERSION >= QT_VERSION_CHECK(6, 7, 0))
-        connect(ui->optInRBF, &QCheckBox::checkStateChanged, this, &SendCoinsDialog::updateSmartFeeLabel);
-        connect(ui->optInRBF, &QCheckBox::checkStateChanged, this, &SendCoinsDialog::coinControlUpdateLabels);
+        connect(ui->optInRBF, &QCheckBox::checkStateChanged, this, &SendCoinsDialog::updateSmartFeeLabel, Qt::UniqueConnection);
+        connect(ui->optInRBF, &QCheckBox::checkStateChanged, this, &SendCoinsDialog::coinControlUpdateLabels, Qt::UniqueConnection);
 #else
-        connect(ui->optInRBF, &QCheckBox::stateChanged, this, &SendCoinsDialog::updateSmartFeeLabel);
-        connect(ui->optInRBF, &QCheckBox::stateChanged, this, &SendCoinsDialog::coinControlUpdateLabels);
+        connect(ui->optInRBF, &QCheckBox::stateChanged, this, &SendCoinsDialog::updateSmartFeeLabel, Qt::UniqueConnection);
+        connect(ui->optInRBF, &QCheckBox::stateChanged, this, &SendCoinsDialog::coinControlUpdateLabels, Qt::UniqueConnection);
 #endif
         CAmount requiredFee = model->wallet().getRequiredFee(1000);
         ui->customFee->SetMinValue(requiredFee);
@@ -247,6 +268,7 @@ void SendCoinsDialog::setModel(WalletModel *_model)
 
 SendCoinsDialog::~SendCoinsDialog()
 {
+    delete m_coin_control_dialog.data();
     QSettings settings;
     settings.setValue("fFeeSectionMinimized", fFeeMinimized);
     settings.setValue("nFeeRadio", ui->groupFee->checkedId());
@@ -284,8 +306,9 @@ bool SendCoinsDialog::PrepareSendText(QString& question_string, QString& informa
     }
 
     fNewRecipientAllowed = false;
+    const QPointer<WalletModel> unlocking_wallet{model};
     WalletModel::UnlockContext ctx(model->requestUnlock());
-    if(!ctx.isValid())
+    if(!ctx.isValid() || !unlocking_wallet || model != unlocking_wallet)
     {
         // Unlock wallet was cancelled
         fNewRecipientAllowed = true;
@@ -300,6 +323,22 @@ bool SendCoinsDialog::PrepareSendText(QString& question_string, QString& informa
 
     CCoinControl coin_control = *m_coin_control;
     coin_control.m_allow_other_inputs = !coin_control.HasSelected(); // future, could introduce a checkbox to customize this value.
+    if (coin_control.HasSelected()) {
+        const auto inputs = coin_control.ListSelected();
+        const auto coins = model->wallet().getCoins(inputs);
+        const bool includes_stake = std::any_of(coins.begin(), coins.end(), [](const auto& out) { return out.is_stake; });
+        if (includes_stake && !coin_control.m_include_stake) {
+            QMessageBox::warning(this, tr("Review STAKE selection"), tr("Enable Include/select STAKE outputs in coin control before spending staking principal."));
+            fNewRecipientAllowed = true;
+            return false;
+        }
+        const auto check = model->wallet().checkStakeInputs(inputs);
+        if (!check) {
+            QMessageBox::warning(this, tr("Review coin selection"), QString::fromStdString(util::ErrorString(check).translated));
+            fNewRecipientAllowed = true;
+            return false;
+        }
+    }
     prepareStatus = model->prepareTransaction(*m_current_transaction, coin_control);
 
     // process prepareStatus and on error generate message shown to user
@@ -407,6 +446,38 @@ bool SendCoinsDialog::PrepareSendText(QString& question_string, QString& informa
         question_string = question_string.arg("<br /><br />" + formatted.at(0));
     }
 
+    // Review the actual prepared transaction, not just the earlier selection.
+    std::vector<COutPoint> actual_inputs;
+    for (const auto& input : m_current_transaction->getWtx()->vin) actual_inputs.push_back(input.prevout);
+    const auto actual_coins = model->wallet().getCoins(actual_inputs);
+    QStringList stake_details;
+    CAmount stake_total{0};
+    for (size_t i = 0; i < actual_inputs.size(); ++i) {
+        if (!actual_coins[i].is_stake) continue;
+        stake_total += actual_coins[i].txout.nValue;
+        stake_details.append(QString::fromStdString(actual_inputs[i].hash.GetHex()) + ":" +
+            QString::number(actual_inputs[i].n) + " — " +
+            BitcoinUnits::formatWithUnit(model->getOptionsModel()->getDisplayUnit(), actual_coins[i].txout.nValue));
+    }
+    if (!stake_details.empty()) {
+        question_string += "<hr /><b>" + tr("Spending STAKE principal: %1").arg(
+            BitcoinUnits::formatHtmlWithUnit(model->getOptionsModel()->getDisplayUnit(), stake_total)) + "</b><br />";
+        question_string += tr("The whole selected STAKE outputs are consumed. Their old identities and ages do not carry into change. Frozen epoch participation changes only under the existing snapshot rules. No change is automatically restaked.");
+        question_string += "<br />" + GUIUtil::HtmlEscape(stake_details.join("\n"), true);
+        const auto change_pos = m_current_transaction->getChangePosition();
+        if (change_pos) {
+            const auto& change = m_current_transaction->getWtx()->vout.at(*change_pos);
+            CTxDestination change_address;
+            const QString destination = ExtractDestination(change.scriptPubKey, change_address)
+                ? QString::fromStdString(EncodeDestination(change_address)) : QString::fromStdString(HexStr(change.scriptPubKey));
+            question_string += "<br /><b>" + tr("Ordinary B3 change: %1 to %2").arg(
+                BitcoinUnits::formatHtmlWithUnit(model->getOptionsModel()->getDisplayUnit(), change.nValue),
+                GUIUtil::HtmlEscape(destination)) + "</b>";
+        } else {
+            question_string += "<br />" + tr("No change output.");
+        }
+    }
+
     return true;
 }
 
@@ -494,6 +565,7 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
     if(!model || !model->getOptionsModel())
         return;
 
+    const QPointer<WalletModel> reviewed_wallet{model};
     QString question_string, informative_text, detailed_text;
     if (!PrepareSendText(question_string, informative_text, detailed_text)) return;
     assert(m_current_transaction);
@@ -506,9 +578,25 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
     // TODO: Replace QDialog::exec() with safer QDialog::show().
     const auto retval = static_cast<QMessageBox::StandardButton>(confirmationDialog->exec());
 
+    if (!reviewed_wallet || model != reviewed_wallet || !m_current_transaction) {
+        fNewRecipientAllowed = true;
+        return;
+    }
+
     if(retval != QMessageBox::Yes && retval != QMessageBox::Save)
     {
         fNewRecipientAllowed = true;
+        return;
+    }
+
+    std::vector<COutPoint> reviewed_inputs;
+    for (const auto& input : m_current_transaction->getWtx()->vin) reviewed_inputs.push_back(input.prevout);
+    const auto input_check = model->wallet().checkStakeInputs(reviewed_inputs, /*require_signing=*/false);
+    if (!input_check) {
+        QMessageBox::warning(this, tr("Inputs changed during review"),
+            QString::fromStdString(util::ErrorString(input_check).translated));
+        fNewRecipientAllowed = true;
+        m_current_transaction.reset();
         return;
     }
 
@@ -539,6 +627,10 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
             assert(!complete);
             assert(!err);
             send_failure = !signWithExternalSigner(psbtx, mtx, complete);
+            if (!reviewed_wallet || model != reviewed_wallet || !m_current_transaction) {
+                fNewRecipientAllowed = true;
+                return;
+            }
             // Don't broadcast when user rejects it on the device or there's a failure:
             broadcast = complete && !send_failure;
             if (!send_failure) {
@@ -557,6 +649,16 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
         // Broadcast the transaction, unless an external signer was used and it
         // failed, or more signatures are needed.
         if (broadcast) {
+            // Device interaction can take time. Recheck immediately before
+            // publication too; this is not a reservation or consensus bypass.
+            const auto still_available = model->wallet().checkStakeInputs(reviewed_inputs, /*require_signing=*/false);
+            if (!still_available) {
+                QMessageBox::warning(this, tr("Inputs changed during review"),
+                    QString::fromStdString(util::ErrorString(still_available).translated));
+                fNewRecipientAllowed = true;
+                m_current_transaction.reset();
+                return;
+            }
             // now send the prepared transaction
             model->sendCoins(*m_current_transaction);
             Q_EMIT coinsSent(m_current_transaction->getWtx()->GetHash());
@@ -573,10 +675,12 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
 
 void SendCoinsDialog::clear()
 {
+    delete m_coin_control_dialog.data();
     m_current_transaction.reset();
 
     // Clear coin control settings
     m_coin_control->UnSelectAll();
+    m_coin_control->m_include_stake = false;
     ui->checkBoxCoinControlChange->setChecked(false);
     ui->lineEditCoinControlChange->clear();
     coinControlUpdateLabels();
@@ -730,6 +834,7 @@ void SendCoinsDialog::setBalance(const interfaces::WalletBalances& balances)
 
 void SendCoinsDialog::refreshBalance()
 {
+    if (!model || !model->getOptionsModel()) return;
     setBalance(model->getCachedBalance());
     ui->customFee->setDisplayUnit(model->getOptionsModel()->getDisplayUnit());
     updateSmartFeeLabel();
@@ -938,6 +1043,7 @@ void SendCoinsDialog::coinControlFeatureChanged(bool checked)
     ui->frameCoinControl->setVisible(checked);
 
     if (!checked && model) { // coin control features disabled
+        delete m_coin_control_dialog.data();
         m_coin_control = std::make_unique<CCoinControl>();
     }
 
@@ -947,7 +1053,13 @@ void SendCoinsDialog::coinControlFeatureChanged(bool checked)
 // Coin Control: button inputs -> show actual coin control dialog
 void SendCoinsDialog::coinControlButtonClicked()
 {
-    auto dlg = new CoinControlDialog(*m_coin_control, model, platformStyle);
+    if (!model) return;
+    if (m_coin_control_dialog) {
+        m_coin_control_dialog->raise();
+        return;
+    }
+    auto dlg = new CoinControlDialog(*m_coin_control, model, platformStyle, this);
+    m_coin_control_dialog = dlg;
     connect(dlg, &QDialog::finished, this, &SendCoinsDialog::coinControlUpdateLabels);
     GUIUtil::ShowModalDialogAsynchronously(dlg);
 }

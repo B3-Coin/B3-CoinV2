@@ -21,7 +21,7 @@ struct NodeContext;
  * @param[in] node The node context to use for lookup
  * @param[in,out] coins map to fill
  */
-void FindCoins(const node::NodeContext& node, std::map<COutPoint, Coin>& coins);
+void FindCoins(const node::NodeContext& node, std::map<COutPoint, Coin>& coins, bool exclude_mempool_spent = false);
 } // namespace node
 
 #endif // BITCOIN_NODE_COIN_H

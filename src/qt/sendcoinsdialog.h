@@ -11,12 +11,14 @@
 
 #include <QDialog>
 #include <QMessageBox>
+#include <QPointer>
 #include <QString>
 #include <QTimer>
 
 class PlatformStyle;
 class SendCoinsEntry;
 class SendCoinsRecipient;
+class CoinControlDialog;
 enum class SynchronizationState;
 namespace wallet {
 class CCoinControl;
@@ -68,7 +70,9 @@ private:
     Ui::SendCoinsDialog *ui;
     ClientModel* clientModel{nullptr};
     WalletModel* model{nullptr};
+    QPointer<OptionsModel> m_options_model;
     std::unique_ptr<wallet::CCoinControl> m_coin_control;
+    QPointer<CoinControlDialog> m_coin_control_dialog;
     std::unique_ptr<WalletModelTransaction> m_current_transaction;
     bool fNewRecipientAllowed{true};
     bool fFeeMinimized{true};

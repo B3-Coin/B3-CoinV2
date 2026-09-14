@@ -412,7 +412,9 @@ public:
     //! Look up unspent output information. Returns coins in the mempool and in
     //! the current chain UTXO set. Iterates through all the keys in the map and
     //! populates the values.
-    virtual void findCoins(std::map<COutPoint, Coin>& coins) = 0;
+    //! UI spending preflight may exclude outputs already consumed in the mempool.
+    //! The default preserves callers which intentionally inspect conflicting inputs.
+    virtual void findCoins(std::map<COutPoint, Coin>& coins, bool exclude_mempool_spent = false) = 0;
 
     //! Estimate fraction of total transactions verified if blocks up to
     //! the specified block hash are verified.

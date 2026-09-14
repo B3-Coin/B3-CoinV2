@@ -25,8 +25,13 @@
 #include <QDialogButtonBox>
 #include <QFlags>
 #include <QIcon>
+#include <QMessageBox>
+#include <QPointer>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QTreeWidget>
+
+#include <set>
 
 using wallet::CCoinControl;
 
@@ -48,6 +53,47 @@ CoinControlDialog::CoinControlDialog(CCoinControl& coin_control, WalletModel* _m
     platformStyle(_platformStyle)
 {
     ui->setupUi(this);
+
+    auto* include_stake = new QCheckBox(tr("Include/select STAKE outputs"), this);
+    include_stake->setObjectName("includeStakeOutputs");
+    include_stake->setChecked(m_coin_control.m_include_stake);
+    ui->verticalLayout->insertWidget(1, include_stake);
+    const auto apply_inclusion = [this](bool enabled) {
+        m_coin_control.m_include_stake = enabled;
+        if (!enabled) {
+            const auto selected = m_coin_control.ListSelected();
+            const auto coins = model->wallet().getCoins(selected);
+            for (size_t i = 0; i < selected.size(); ++i)
+                if (coins[i].is_stake) m_coin_control.UnSelect(selected[i]);
+        }
+        updateView();
+        updateLabels(m_coin_control, model, this);
+    };
+    connect(include_stake, &QCheckBox::toggled, this, [this, include_stake, apply_inclusion](bool enabled) {
+        if (!enabled) {
+            apply_inclusion(false);
+            return;
+        }
+        // Do not run a nested event loop inside QCheckBox::nextCheckState:
+        // wallet removal can destroy that checkbox before its click returns.
+        // No selection consent is applied until this asynchronous warning ends.
+        include_stake->setEnabled(false);
+        auto* warning = new QMessageBox(QMessageBox::Warning, tr("Explicit STAKE spending"),
+            tr("STAKE outputs are staking principal. Spending consumes the whole selected output; any change is ordinary B3, not a continuation of the old stake. Current epoch snapshots can retain earlier weight until their normal transition. No change is automatically restaked. Include these outputs in coin control?"),
+            QMessageBox::Yes | QMessageBox::No, this);
+        warning->setDefaultButton(QMessageBox::No);
+        warning->setAttribute(Qt::WA_DeleteOnClose);
+        connect(warning, &QDialog::finished, this, [include_stake, warning, apply_inclusion](int) {
+            include_stake->setEnabled(true);
+            if (warning->standardButton(warning->clickedButton()) != QMessageBox::Yes) {
+                const QSignalBlocker blocker(include_stake);
+                include_stake->setChecked(false);
+                return;
+            }
+            apply_inclusion(true);
+        });
+        warning->open();
+    });
 
     // context menu
     contextMenu = new QMenu(this);
@@ -105,6 +151,9 @@ CoinControlDialog::CoinControlDialog(CCoinControl& coin_control, WalletModel* _m
     ui->treeWidget->setColumnWidth(COLUMN_ADDRESS, 320);
     ui->treeWidget->setColumnWidth(COLUMN_DATE, 130);
     ui->treeWidget->setColumnWidth(COLUMN_CONFIRMATIONS, 110);
+    ui->treeWidget->setColumnCount(COLUMN_STATUS + 1);
+    ui->treeWidget->headerItem()->setText(COLUMN_STATUS, tr("Output / availability"));
+    ui->treeWidget->setColumnWidth(COLUMN_STATUS, 350);
 
     // default view is sorted by amount desc
     sortView(COLUMN_AMOUNT, Qt::DescendingOrder);
@@ -247,8 +296,8 @@ void CoinControlDialog::unlockCoin()
 {
     COutPoint outpt(Txid::FromHex(contextMenuItem->data(COLUMN_ADDRESS, TxHashRole).toString().toStdString()).value(), contextMenuItem->data(COLUMN_ADDRESS, VOutRole).toUInt());
     model->wallet().unlockCoin(outpt);
-    contextMenuItem->setDisabled(false);
-    contextMenuItem->setIcon(COLUMN_CHECKBOX, QIcon());
+    // Removing a user lock does not remove maturity or ownership restrictions.
+    updateView();
     updateLabelLocked();
 }
 
@@ -384,20 +433,30 @@ void CoinControlDialog::updateLabels(CCoinControl& m_coin_control, WalletModel *
     unsigned int nBytes         = 0;
     unsigned int nBytesInputs   = 0;
     unsigned int nQuantity      = 0;
+    unsigned int unavailable_selected = 0;
     bool fWitness               = false;
 
     auto vCoinControl{m_coin_control.ListSelected()};
 
     size_t i = 0;
     for (const auto& out : model->wallet().getCoins(vCoinControl)) {
-        if (out.depth_in_main_chain < 0) continue;
+        const COutPoint& outpt = vCoinControl[i++];
+        if (out.depth_in_main_chain < 0) {
+            // A refresh must not turn explicit STAKE-spending intent into
+            // automatic ordinary coin selection. Missing entries cannot be
+            // identified as STAKE any more, so retain all selections in this
+            // mode until the owner explicitly clears or reviews them.
+            if (m_coin_control.m_include_stake) ++unavailable_selected;
+            else m_coin_control.UnSelect(outpt);
+            continue;
+        }
 
         // unselect already spent, very unlikely scenario, this could happen
         // when selected are spent elsewhere, like rpc or another computer
-        const COutPoint& outpt = vCoinControl[i++];
-        if (out.is_spent)
+        if (out.is_spent || (out.is_stake && !out.stake_unavailable_reason.empty()))
         {
-            m_coin_control.UnSelect(outpt);
+            if (m_coin_control.m_include_stake) ++unavailable_selected;
+            else m_coin_control.UnSelect(outpt);
             continue;
         }
 
@@ -508,7 +567,8 @@ void CoinControlDialog::updateLabels(CCoinControl& m_coin_control, WalletModel *
     dialog->findChild<QLabel *>("labelCoinControlChange")       ->setEnabled(nPayAmount > 0);
 
     // stats
-    l1->setText(QString::number(nQuantity));                                 // Quantity
+    l1->setText(unavailable_selected == 0 ? QString::number(nQuantity) :
+        tr("%1 selected (%2 unavailable — review selection)").arg(nQuantity + unavailable_selected).arg(unavailable_selected));
     l2->setText(BitcoinUnits::formatWithUnit(nDisplayUnit, nAmount));        // Amount
     l3->setText(BitcoinUnits::formatWithUnit(nDisplayUnit, nPayFee));        // Fee
     l4->setText(BitcoinUnits::formatWithUnit(nDisplayUnit, nAfterFee));      // After Fee
@@ -557,6 +617,9 @@ void CoinControlDialog::updateView()
 
     bool treeMode = ui->radioTreeMode->isChecked();
 
+    // Rendering checked, disabled rows is not a user deselection. In
+    // particular, a relocked owner wallet must retain the chosen outpoints.
+    const QSignalBlocker rebuilding(ui->treeWidget);
     ui->treeWidget->clear();
     ui->treeWidget->setEnabled(false); // performance, otherwise updateLabels would be called for every checked checkbox
     ui->treeWidget->setAlternatingRowColors(!treeMode);
@@ -564,8 +627,9 @@ void CoinControlDialog::updateView()
     QFlags<Qt::ItemFlag> flgTristate = Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsUserCheckable | Qt::ItemIsAutoTristate;
 
     BitcoinUnit nDisplayUnit = model->getOptionsModel()->getDisplayUnit();
+    std::set<COutPoint> displayed;
 
-    for (const auto& coins : model->wallet().listCoins()) {
+    for (const auto& coins : model->wallet().listCoins(m_coin_control.m_include_stake)) {
         CCoinControlWidgetItem* itemWalletAddress{nullptr};
         QString sWalletAddress = QString::fromStdString(EncodeDestination(coins.first));
         QString sWalletLabel = model->getAddressTableModel()->labelForAddress(sWalletAddress);
@@ -591,6 +655,7 @@ void CoinControlDialog::updateView()
         int nChildren = 0;
         for (const auto& outpair : coins.second) {
             const COutPoint& output = std::get<0>(outpair);
+            displayed.insert(output);
             const interfaces::WalletTxOut& out = std::get<1>(outpair);
             nSum += out.txout.nValue;
             nChildren++;
@@ -645,11 +710,29 @@ void CoinControlDialog::updateView()
 
             // vout index
             itemOutput->setData(COLUMN_ADDRESS, VOutRole, output.n);
+            const QString outpoint = QString::fromStdString(output.ToString());
+            itemOutput->setToolTip(COLUMN_ADDRESS, outpoint);
+            if (out.is_stake) {
+                QString state = out.stake_active ? tr("STAKE — active by depth for next block") : tr("STAKE — pending activation");
+                if (!out.stake_unavailable_reason.empty())
+                    state += " — " + QString::fromStdString(out.stake_unavailable_reason);
+                else state += tr(" — owner-spendable");
+                itemOutput->setText(COLUMN_STATUS, state);
+                const QString details = tr("Outpoint: %1\nStake activation height: %2\nSpend maturity remaining: %3 block(s)\nUser coin lock: %4\nActivation depth is not a spending cooldown. The validator/BLS key is not spending authority.")
+                    .arg(outpoint).arg(out.stake_activation_height < 0 ? tr("unconfirmed") : QString::number(out.stake_activation_height))
+                    .arg(out.blocks_to_maturity).arg(out.is_locked ? tr("locked") : tr("unlocked"));
+                itemOutput->setToolTip(COLUMN_STATUS, details);
+                if (!out.stake_unavailable_reason.empty()) {
+                    itemOutput->setDisabled(true);
+                }
+            } else {
+                itemOutput->setText(COLUMN_STATUS, tr("Ordinary B3"));
+            }
 
              // disable locked coins
             if (model->wallet().isLockedCoin(output))
             {
-                m_coin_control.UnSelect(output); // just to be sure
+                if (!m_coin_control.m_include_stake) m_coin_control.UnSelect(output);
                 itemOutput->setDisabled(true);
                 itemOutput->setIcon(COLUMN_CHECKBOX, platformStyle->SingleColorIcon(":/icons/lock_closed"));
             }
@@ -665,6 +748,21 @@ void CoinControlDialog::updateView()
             itemWalletAddress->setText(COLUMN_CHECKBOX, "(" + QString::number(nChildren) + ")");
             itemWalletAddress->setText(COLUMN_AMOUNT, BitcoinUnits::format(nDisplayUnit, nSum));
             itemWalletAddress->setData(COLUMN_AMOUNT, Qt::UserRole, QVariant((qlonglong)nSum));
+        }
+    }
+
+    if (m_coin_control.m_include_stake) {
+        for (const auto& output : m_coin_control.ListSelected()) {
+            if (displayed.contains(output)) continue;
+            // A spent/conflicted/removed selection may no longer be returned
+            // by listCoins. Keep its exact identity visible and clearable.
+            auto* item = new CCoinControlWidgetItem(ui->treeWidget);
+            item->setFlags(flgCheckbox);
+            item->setData(COLUMN_ADDRESS, TxHashRole, QString::fromStdString(output.hash.GetHex()));
+            item->setData(COLUMN_ADDRESS, VOutRole, output.n);
+            item->setText(COLUMN_ADDRESS, QString::fromStdString(output.hash.GetHex()) + ":" + QString::number(output.n));
+            item->setText(COLUMN_STATUS, tr("Selected input unavailable — clear or review selection"));
+            item->setCheckState(COLUMN_CHECKBOX, Qt::Checked);
         }
     }
 

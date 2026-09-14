@@ -640,7 +640,7 @@ public:
                int{FillBlock(block1, block1_out, lock, active, chainman().m_blockman)} &
                int{FillBlock(block2, block2_out, lock, active, chainman().m_blockman)};
     }
-    void findCoins(std::map<COutPoint, Coin>& coins) override { return FindCoins(m_node, coins); }
+    void findCoins(std::map<COutPoint, Coin>& coins, bool exclude_mempool_spent) override { return FindCoins(m_node, coins, exclude_mempool_spent); }
     double guessVerificationProgress(const uint256& block_hash) override
     {
         LOCK(chainman().GetMutex());

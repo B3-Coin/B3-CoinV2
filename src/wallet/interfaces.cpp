@@ -12,6 +12,7 @@
 #include <modern/asset_output.h>
 #include <modern/asset_validation.h>
 #include <modern/bridge_asset.h>
+#include <modern/stake.h>
 #include <node/types.h>
 #include <policy/fees/block_policy_estimator.h>
 #include <primitives/transaction.h>
@@ -62,6 +63,15 @@ namespace wallet {
 // All members of the classes in this namespace are intentionally public, as the
 // classes themselves are private.
 namespace {
+// Match AvailableCoins' default trust/replacement policy. This is a wallet
+// safety rule, not a blanket confirmation requirement or a consensus rule.
+bool IsSafeStakeTransaction(const CWallet& wallet, const CWalletTx& wtx, int depth)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    return CachedTxIsTrusted(wallet, wtx) &&
+        (depth != 0 || (!wtx.mapValue.contains("replaces_txid") && !wtx.mapValue.contains("replaced_by_txid")));
+}
+
 //! Construct wallet tx struct.
 WalletTx MakeWalletTx(CWallet& wallet, const CWalletTx& wtx)
 {
@@ -131,6 +141,31 @@ WalletTxOut MakeWalletTxOut(const CWallet& wallet,
     result.time = wtx.GetTxTime();
     result.depth_in_main_chain = depth;
     result.is_spent = wallet.IsSpent(COutPoint(wtx.GetHash(), n));
+    if (modern::ClaimsStakeMagic(result.txout.scriptPubKey)) {
+        result.is_stake = true;
+        const COutPoint outpoint{wtx.GetHash(), static_cast<uint32_t>(n)};
+        result.is_locked = wallet.IsLockedCoin(outpoint);
+        result.blocks_to_maturity = wallet.GetTxBlocksToMaturity(wtx);
+        if (const auto* confirmed = wtx.state<TxStateConfirmed>()) {
+            result.stake_activation_height = confirmed->confirmed_block_height + modern::STAKE_ACTIVATION_DEPTH;
+            // Match getstakinginfo: readiness by depth for the next block,
+            // separately from frozen epoch weight or ordinary spend maturity.
+            result.stake_active = modern::IsStakeMature(
+                confirmed->confirmed_block_height, wallet.GetLastBlockHeight() + 1);
+        }
+        std::string parse_error;
+        const auto stake = modern::ParseStakeOutput(result.txout, parse_error);
+        result.owner_spendable = stake && WalletCanSpendScriptNow(wallet, stake->owner_script);
+        if (!stake) result.stake_unavailable_reason = "Malformed STAKE output";
+        else if (result.is_spent) result.stake_unavailable_reason = "Already spent";
+        else if (depth < 0) result.stake_unavailable_reason = "Conflicted transaction";
+        else if (depth == 0 && !wtx.InMempool()) result.stake_unavailable_reason = "Unconfirmed transaction is not in the mempool";
+        else if (!IsSafeStakeTransaction(wallet, wtx, depth)) result.stake_unavailable_reason = "Untrusted or replaced transaction; wait for confirmation";
+        else if (result.blocks_to_maturity > 0) result.stake_unavailable_reason = "Transaction output is not spend-mature";
+        else if (result.is_locked) result.stake_unavailable_reason = "User-locked output";
+        else if (wallet.IsLocked()) result.stake_unavailable_reason = "Unlock the owner wallet to check spending authority";
+        else if (!result.owner_spendable) result.stake_unavailable_reason = "Owner spending keys unavailable (watch-only or incomplete authorization)";
+    }
     return result;
 }
 
@@ -531,7 +566,7 @@ public:
         LOCK(m_wallet->cs_wallet);
         return OutputGetCredit(*m_wallet, txout);
     }
-    CoinsList listCoins() override
+    CoinsList listCoins(bool include_stake) override
     {
         LOCK(m_wallet->cs_wallet);
         CoinsList result;
@@ -540,6 +575,20 @@ public:
             for (const auto& coin : entry.second) {
                 group.emplace_back(coin.outpoint,
                     MakeWalletTxOut(*m_wallet, coin));
+            }
+        }
+        if (include_stake) {
+            for (const auto& [outpoint, txo] : m_wallet->GetTXOs()) {
+                const auto& output = txo.GetTxOut();
+                if (!modern::ClaimsStakeMagic(output.scriptPubKey) ||
+                    m_wallet->IsSpent(outpoint) || !m_wallet->IsMine(output)) continue;
+                const auto& wtx = txo.GetWalletTx();
+                const int depth = m_wallet->GetTxDepthInMainChain(wtx);
+                if (depth < 0) continue;
+                CTxDestination owner;
+                // A non-address bare owner script is still shown, grouped without an address.
+                ExtractDestination(output.scriptPubKey, owner);
+                result[owner].emplace_back(outpoint, MakeWalletTxOut(*m_wallet, wtx, outpoint.n, depth));
             }
         }
         return result;
@@ -552,7 +601,7 @@ public:
         for (const auto& output : outputs) {
             result.emplace_back();
             auto it = m_wallet->mapWallet.find(output.hash);
-            if (it != m_wallet->mapWallet.end()) {
+            if (it != m_wallet->mapWallet.end() && output.n < it->second.tx->vout.size()) {
                 int depth = m_wallet->GetTxDepthInMainChain(it->second);
                 if (depth >= 0) {
                     result.back() = MakeWalletTxOut(*m_wallet, it->second, output.n, depth);
@@ -560,6 +609,36 @@ public:
             }
         }
         return result;
+    }
+    util::Result<void> checkStakeInputs(const std::vector<COutPoint>& outputs, bool require_signing) override
+    {
+        LOCK(m_wallet->cs_wallet);
+        std::map<COutPoint, Coin> coins;
+        for (const auto& outpoint : outputs) coins.try_emplace(outpoint);
+        m_wallet->chain().findCoins(coins, /*exclude_mempool_spent=*/true);
+        for (const auto& outpoint : outputs) {
+            const auto txo = m_wallet->GetTXO(outpoint);
+            if (!txo || !m_wallet->IsMine(txo->GetTxOut()) || m_wallet->IsSpent(outpoint) || coins.at(outpoint).IsSpent() ||
+                coins.at(outpoint).out != txo->GetTxOut()) {
+                return util::Error{strprintf(_("Selected input %s is no longer an available wallet UTXO. Review coin selection again."), outpoint.ToString())};
+            }
+            const auto& wtx = txo->GetWalletTx();
+            if (m_wallet->IsLockedCoin(outpoint) || m_wallet->GetTxDepthInMainChain(wtx) < 0 ||
+                (m_wallet->GetTxDepthInMainChain(wtx) == 0 && !wtx.InMempool()) ||
+                m_wallet->GetTxBlocksToMaturity(wtx) > 0) {
+                return util::Error{strprintf(_("Selected input %s is locked, conflicted or immature. Review coin selection again."), outpoint.ToString())};
+            }
+            const auto out = MakeWalletTxOut(*m_wallet, wtx, outpoint.n, m_wallet->GetTxDepthInMainChain(wtx));
+            if (out.is_stake && !IsSafeStakeTransaction(*m_wallet, wtx, out.depth_in_main_chain)) {
+                return util::Error{strprintf(_("Cannot spend STAKE input %s: transaction is untrusted or replaced. Wait for confirmation."), outpoint.ToString())};
+            }
+            // The normal unlock context relocks after preparing a signed transaction.
+            // Publication rechecks UTXO/restrictions, not possession of an unlocked key.
+            if (out.is_stake && require_signing && !out.stake_unavailable_reason.empty()) {
+                return util::Error{strprintf(_("Cannot spend STAKE input %s: %s"), outpoint.ToString(), out.stake_unavailable_reason)};
+            }
+        }
+        return {};
     }
     CAmount getRequiredFee(unsigned int tx_bytes) override { return GetRequiredFee(*m_wallet, tx_bytes); }
     CAmount getMinimumFee(unsigned int tx_bytes,

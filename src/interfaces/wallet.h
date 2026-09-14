@@ -273,10 +273,15 @@ public:
     //! Return AvailableCoins + LockedCoins grouped by wallet address.
     //! (put change in one group with wallet address)
     using CoinsList = std::map<CTxDestination, std::vector<std::tuple<COutPoint, WalletTxOut>>>;
-    virtual CoinsList listCoins() = 0;
+    //! STAKE entries are a display-only opt-in; this never changes automatic selection.
+    virtual CoinsList listCoins(bool include_stake = false) = 0;
 
     //! Return wallet transaction output information.
     virtual std::vector<WalletTxOut> getCoins(const std::vector<COutPoint>& outputs) = 0;
+
+    //! Revalidate explicit GUI inputs against wallet restrictions and the chain/mempool UTXO view.
+    //! Only STAKE inputs require owner signing capability; no signing or publication occurs.
+    virtual util::Result<void> checkStakeInputs(const std::vector<COutPoint>& outputs, bool require_signing = true) = 0;
 
     //! Get required fee.
     virtual CAmount getRequiredFee(unsigned int tx_bytes) = 0;
@@ -451,9 +456,17 @@ struct WalletTxStatus
 struct WalletTxOut
 {
     CTxOut txout;
-    int64_t time;
+    int64_t time{0};
     int depth_in_main_chain = -1;
     bool is_spent = false;
+    bool is_stake{false};
+    bool stake_active{false};
+    int stake_activation_height{-1};
+    int blocks_to_maturity{0};
+    bool is_locked{false};
+    bool owner_spendable{false};
+    //! Empty only when the explicitly selected STAKE output can currently be spent.
+    std::string stake_unavailable_reason;
 };
 
 //! Migrated wallet info
