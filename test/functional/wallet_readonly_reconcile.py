@@ -20,10 +20,10 @@ tool=importlib.util.module_from_spec(spec);spec.loader.exec_module(tool)
 class WalletReadOnlyReconcile(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes=1;self.setup_clean_chain=True;self.wallet_names=[]
-        # This release base has no enableflowmeshvalidator switch. Plain
-        # regtest has no A2/A3 schedule; verify service dormancy explicitly.
+        # The integrated client has an explicit default-off validator switch.
+        # Keep both the flag and the published service-dormancy assertions.
         self.extra_args=[['-connect=0','-dnsseed=0','-fixedseeds=0','-natpmp=0',
-                          '-keypool=20','-unsafesqlitesync=0']]
+                          '-enableflowmeshvalidator=0','-keypool=20','-unsafesqlitesync=0']]
 
     def skip_test_if_missing_module(self):self.skip_if_no_wallet()
 
