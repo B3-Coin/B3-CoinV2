@@ -36,8 +36,8 @@ CORE_FLOWMESH = ",".join((
     "flowmesh_transport_compat_tests", "flowmesh_checkpoint_codec_tests",
     "flowmesh_seat_binding_tests", "flowmesh_fee_allocation_tests"))
 CORE_CLIENT = "flowmesh_https_tests,flowmesh_client_evidence_tests,wallet_rpc_tests"
-CORE_WALLET = ("legacy_wallet_dump_tests,walletdb_tests,"
-               "wallet_tests/b3_validator_key_and_stake_outputs,"
+CORE_WALLET = ("legacy_wallet_dump_tests,walletdb_tests:"
+               "wallet_tests/b3_validator_key_and_stake_outputs:"
                "mempool_tests/MempoolCheckUsesRepresentableHeight")
 QT_TARGETS = ("test_b3_flowmeshtrading-qt", "test_b3_flowmeshworkspace-qt",
               "test_b3_flowmeshtradingpanel-qt", "test_b3_stakecoincontrol-qt",
