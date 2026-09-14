@@ -1,6 +1,7 @@
 // Copyright (c) 2026 The B3Coin Core developers
 // Distributed under the MIT software license, see COPYING.
 #include <node/flowmesh_net.h>
+#include <node/flowmesh_keyfile.h>
 #include <node/flowmesh_runtime.h>
 
 #include <crypto/common.h>
@@ -14,6 +15,7 @@
 #include <util/fs_helpers.h>
 #include <util/sock.h>
 #include <util/strencodings.h>
+#include <util/syserror.h>
 
 #include <algorithm>
 #include <array>
@@ -323,8 +325,8 @@ struct FlowMeshNetService::Impl {
             struct stat st{};
             if (stat(path.c_str(), &st) != 0 || (st.st_mode & 077) || st.st_uid != geteuid()) throw std::runtime_error{"FlowMesh operator key must be owner-only (0600)"};
 #endif
-            FILE* file{fsbridge::fopen(path, "rb")};
-            if (!file) throw std::runtime_error{"Cannot read FlowMesh operator key"};
+            FILE* file{detail::OpenFlowMeshKeyFile(path.std_path(), false)};
+            if (!file) throw std::runtime_error{"Cannot read FlowMesh operator key: " + SysErrorString(errno)};
             std::array<unsigned char, 32> secret{};
             const bool valid_size{std::fread(secret.data(), 1, secret.size(), file) == secret.size() && std::fgetc(file) == EOF && !std::ferror(file)};
             std::fclose(file);
@@ -334,8 +336,8 @@ struct FlowMeshNetService::Impl {
         } else {
             key.MakeNewKey(true);
             // Exclusive creation prevents overwriting another network identity.
-            FILE* file{fsbridge::fopen(path, "wbx")};
-            if (!file) throw std::runtime_error{"Cannot create FlowMesh operator key"};
+            FILE* file{detail::OpenFlowMeshKeyFile(path.std_path(), true)};
+            if (!file) throw std::runtime_error{"Cannot create FlowMesh operator key: " + SysErrorString(errno)};
 #ifndef WIN32
             if (fchmod(fileno(file), 0600) != 0) { std::fclose(file); throw std::runtime_error{"Cannot protect FlowMesh operator key"}; }
 #endif

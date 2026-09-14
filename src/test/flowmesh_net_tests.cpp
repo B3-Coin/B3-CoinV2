@@ -1,6 +1,7 @@
 // Copyright (c) 2026 The B3Coin Core developers
 // Distributed under the MIT software license, see COPYING.
 #include <node/flowmesh_net.h>
+#include <node/flowmesh_keyfile.h>
 #include <node/flowmesh_runtime.h>
 #include <crypto/common.h>
 #include <hash.h>
@@ -237,6 +238,39 @@ BOOST_AUTO_TEST_CASE(pinned_three_channel_round_trip_and_persistent_identity)
     const auto start{std::chrono::steady_clock::now()}; b.Stop(); a.Stop();
     BOOST_CHECK(std::chrono::steady_clock::now() - start < 1s);
     BOOST_REQUIRE_MESSAGE(a.Start(error), error); BOOST_CHECK_EQUAL(a.Snapshot().operator_pubkey, identity.operator_pubkey);
+}
+
+BOOST_AUTO_TEST_CASE(operator_key_creation_never_overwrites_existing_or_partial_identity)
+{
+    Sink sink;
+    auto config{Config(m_path_root / "fmnet-key-preserve")};
+    config.enable_listen = false;
+    node::FlowMeshNetService service{config, sink};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(error), error);
+    const auto identity{service.Snapshot().operator_pubkey};
+    BOOST_REQUIRE(!identity.empty());
+    service.Stop();
+    const auto path{config.datadir / "operator.key"};
+    FILE* duplicate{node::detail::OpenFlowMeshKeyFile(path.std_path(), true)};
+    if (duplicate) std::fclose(duplicate);
+    BOOST_REQUIRE(!duplicate);
+    BOOST_REQUIRE_MESSAGE(service.Start(error), error);
+    BOOST_CHECK_EQUAL(service.Snapshot().operator_pubkey, identity);
+    service.Stop();
+
+    auto partial_config{Config(m_path_root / "fmnet-key-partial")};
+    partial_config.enable_listen = false;
+    fs::create_directories(partial_config.datadir);
+    const auto partial_path{partial_config.datadir / "operator.key"};
+    FILE* partial{node::detail::OpenFlowMeshKeyFile(partial_path.std_path(), true)};
+    BOOST_REQUIRE(partial);
+    BOOST_REQUIRE_EQUAL(std::fclose(partial), 0);
+    node::FlowMeshNetService partial_service{partial_config, sink};
+    BOOST_CHECK(!partial_service.Start(error));
+    BOOST_CHECK_EQUAL(error, "Invalid FlowMesh operator key; refusing replacement");
+    BOOST_CHECK(fs::exists(partial_path));
+    BOOST_CHECK_EQUAL(fs::file_size(partial_path), 0U);
 }
 
 BOOST_AUTO_TEST_CASE(bench_trace_round_trip_correlates_exact_inner_wire_without_changing_delivery)

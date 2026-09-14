@@ -6,6 +6,11 @@ name: release-build
 on:
   workflow_dispatch:
     inputs:
+      check_operator_key:
+        description: "Run only the focused native-Windows operator-key file regression alongside compilation (not full suites)"
+        required: false
+        type: boolean
+        default: false
       windows_build_only:
         description: "Build a portable Windows ZIP only, without an installer, tests, or release publication"
         required: false
@@ -28,6 +33,65 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  keyfile-regression-cross:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.check_operator_key }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build only the standalone file-creation regression
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64-posix
+          x86_64-w64-mingw32-g++-posix -std=c++20 -O2 -Wall -Wextra -Werror -static \
+            -Isrc contrib/b3hive-release/check-flowmesh-keyfile.cpp -o keyfile-check.exe
+          x86_64-w64-mingw32-objdump -p keyfile-check.exe > imports.txt
+          grep -i 'DLL Name: msvcrt.dll' imports.txt
+          sha256sum keyfile-check.exe > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msvcrt-keyfile-probe
+          path: |
+            keyfile-check.exe
+            imports.txt
+            SHA256SUMS
+
+  keyfile-regression-windows:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.check_operator_key }}
+    needs: keyfile-regression-cross
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: msvcrt-keyfile-probe
+      - name: Reproduce old failure and verify exclusive creation and reopening
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $probeRoot = Join-Path $env:RUNNER_TEMP ('fm-keyfile-' + [guid]::NewGuid().ToString())
+          $legacyPath = Join-Path $probeRoot 'legacy'
+          $fixedPath = Join-Path $probeRoot 'fixed'
+          & .\keyfile-check.exe $legacyPath --legacy 2>&1 | Tee-Object legacy.txt
+          $legacyExit = $LASTEXITCODE
+          if ($legacyExit -ne 11) { throw "Expected old MSVCRT creation failure; got $legacyExit" }
+          & .\keyfile-check.exe $fixedPath 2>&1 | Tee-Object fixed.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Fixed exclusive-creation regression failed' }
+          & .\keyfile-check.exe $fixedPath --reopen 2>&1 | Tee-Object reopen.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Separate-process exact-byte reopen failed' }
+          "PASS old failure reproduced; fixed helper and fresh-process reopen passed at $env:GITHUB_SHA" | Tee-Object summary.txt
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-keyfile-results
+          path: |
+            legacy.txt
+            fixed.txt
+            reopen.txt
+            summary.txt
+
   version:
     runs-on: ubuntu-24.04
     outputs:
