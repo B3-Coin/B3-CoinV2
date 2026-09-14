@@ -132,6 +132,8 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   net_types.cpp
   netaddress.cpp
   netbase.cpp
+  # Shared with wallet RPC; the standalone wallet tool does not link bitcoin_node.
+  node/flowmesh_client_json.cpp
   outputtype.cpp
   policy/feerate.cpp
   policy/policy.cpp
@@ -262,7 +264,6 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/flowmesh_runtime.cpp
   node/flowmesh_service.cpp
   node/flowmesh_client.cpp
-  node/flowmesh_client_json.cpp
   node/flowmesh_client_settlement.cpp
   node/flowmesh_https.cpp
   flowmesh/client_evidence.cpp

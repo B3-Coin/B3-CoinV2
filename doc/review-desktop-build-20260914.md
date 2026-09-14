@@ -18,6 +18,26 @@ available; the follow-up qualification is the Windows-only GitHub build with
 tests still disabled. Preserve the successful Mac artifacts at their original
 source identity; they were not rebuilt or relabeled as the Windows fix commit.
 
+## Standalone Windows wallet-tool link follow-up
+
+Run `34844145276` at `91a395b` passed the Qt link, then failed linking
+`b3coin-wallet.exe`. Wallet RPC references three shared JSON projections:
+`FlowMeshClientStatusJson`, `FlowMeshClientReceiptJson` and
+`FlowMeshClientMarketDataJson`. Their implementation was compiled only into
+`bitcoin_node`, which the standalone wallet tool correctly does not link.
+
+Move the existing `node/flowmesh_client_json.cpp` source entry to
+`bitcoin_common`, already shared by the wallet, node and GUI. Its implementation
+and public response formats are unchanged. This does not add a node, network
+service or execution engine to the wallet tool. Preserve the successful earlier
+Mac artifacts and run only the Windows compile/packaging workflow; tests remain
+disabled. The actual Windows link must be confirmed by that follow-up run.
+
+A focused macOS arm64 object/link check compiled the unchanged JSON projection
+source and resolved all three symbols using common/util/consensus/crypto and
+UniValue libraries, without `bitcoin_node` or HTTPS libraries. This is a local
+dependency check, not a Windows link or runtime test pass.
+
 This delta follows the published draft review branch. It does not replace any
 frozen Candidate04/05 artifacts or their retained evidence. It is not a public
 release, deployment, mainnet qualification or repair of the historical
