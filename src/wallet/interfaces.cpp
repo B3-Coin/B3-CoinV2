@@ -507,6 +507,10 @@ public:
         LOCK(m_wallet->cs_wallet);
         return GetWalletAssetBalances(*m_wallet);
     }
+    uint64_t assetMetadataGeneration() override
+    {
+        return m_wallet->HaveChain() ? m_wallet->chain().assetMetadataGeneration() : 0;
+    }
     bool tryGetAssetBalances(std::vector<WalletAssetBalance>& balances) override
     {
         TRY_LOCK(m_wallet->cs_wallet, locked_wallet);

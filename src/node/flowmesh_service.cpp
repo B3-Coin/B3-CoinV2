@@ -39,6 +39,118 @@
 
 namespace node {
 
+std::optional<flowmesh::ActiveFnBlsSeatSet> ResolveFlowMeshClientSeats(
+    ChainstateManager& chainman, const flowmesh::ClientEvidencePins& pins,
+    const flowmesh::ProductionEntryCore& entry, std::string& error)
+{
+    if (!flowmesh::CheckClientEvidencePins(pins) || entry.domain != pins.domain ||
+        entry.market_id != pins.market_id) {
+        error = "FlowMesh client market/domain pins do not match the entry";
+        return std::nullopt;
+    }
+    std::vector<flowmesh::BlsSeatBinding> bindings;
+    flowmesh::AnchorRef seat_anchor;
+    {
+        LOCK(::cs_main);
+        Chainstate& chainstate{chainman.ActiveChainstate()};
+        const CBlockIndex* tip{chainstate.m_chain.Tip()};
+        const auto& params{chainman.GetConsensus()};
+        const auto domain{params.legacy_final_hash
+            ? modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)
+            : std::nullopt};
+        if (!tip || !domain || *domain != pins.domain ||
+            !Consensus::FlowMeshRulesActive(tip->nHeight, params)) {
+            error = "FlowMesh client B3 chain/domain is unavailable";
+            return std::nullopt;
+        }
+        auto& seats{chainstate.ModernFnSeats()};
+        auto& vaults{chainstate.ModernFlowMeshVaults()};
+        auto& checkpoints{chainstate.ModernFlowMeshCheckpoints()};
+        if (!seats.Sync(chainstate.m_chain, chainstate.m_blockman, params, *tip) ||
+            !vaults.Sync(chainstate.m_chain, chainstate.m_blockman, params, *tip) ||
+            !checkpoints.Sync(chainstate.m_chain, chainstate.m_blockman, params,
+                              seats.Index(), vaults.Index(), *tip)) {
+            error = "FlowMesh client mandatory B3 indexes are unavailable";
+            return std::nullopt;
+        }
+        const CBlockIndex* anchor{entry.anchor.height >= 0 ? chainstate.m_chain[entry.anchor.height] : nullptr};
+        if (!anchor || anchor->GetBlockHash() != entry.anchor.hash ||
+            tip->nHeight - entry.anchor.height < Consensus::FLOWMESH_ANCHOR_DEPTH) {
+            error = "FlowMesh client production anchor is not canonical and deep";
+            return std::nullopt;
+        }
+        const auto market{vaults.Index().MarketAt(pins.market_id, *anchor)};
+        if (!market || market->base_asset != pins.base_asset || market->vault_id != pins.vault_id) {
+            error = "FlowMesh client market is not established at its anchor";
+            return std::nullopt;
+        }
+        auto authority{checkpoints.Index().Head(pins.market_id)};
+        // Historical action evidence may use an earlier connected epoch.
+        // Bound this metadata walk; it never downloads/replays microblocks.
+        size_t traversed{0};
+        while (authority && authority->core.sequence > entry.sequence) {
+            if (++traversed > 4096) {
+                error = "FlowMesh client historical authority exceeds lookup bound";
+                return std::nullopt;
+            }
+            authority = authority->core.previous_checkpoint_id.IsNull()
+                ? std::nullopt : checkpoints.Index().Get(authority->core.previous_checkpoint_id);
+        }
+        uint64_t epoch{0};
+        uint256 expected_set;
+        if (authority) {
+            if (authority->core.sequence == entry.sequence &&
+                authority->core.microblock_hash != entry.GetHash()) {
+                error = "FlowMesh client entry conflicts with the connected checkpoint";
+                return std::nullopt;
+            }
+            if (authority->core.handoff && authority->core.sequence < entry.sequence) {
+                if (!FlowMeshHandoffConnectionMature(
+                        {authority->connected_height, authority->connected_block}, tip->nHeight)) {
+                    error = "FlowMesh client incoming epoch handoff is not mature";
+                    return std::nullopt;
+                }
+                epoch = authority->core.handoff->next_epoch;
+                seat_anchor = {static_cast<int32_t>(authority->core.handoff->next_anchor.height),
+                               authority->core.handoff->next_anchor.block_hash};
+                expected_set = authority->core.handoff->next_seat_set_hash;
+            } else {
+                epoch = authority->core.epoch;
+                seat_anchor = {static_cast<int32_t>(authority->core.anchor.height), authority->core.anchor.block_hash};
+                expected_set = authority->core.seat_set_hash;
+            }
+        } else {
+            const auto bootstrap{seats.Index().EarliestFlowMeshReadySnapshot(
+                chainstate.m_chain, market->created_height, tip->nHeight, params, error)};
+            if (!bootstrap) return std::nullopt;
+            seat_anchor = {bootstrap->anchor_height, bootstrap->anchor_hash};
+        }
+        if (entry.epoch != epoch || (!expected_set.IsNull() && entry.seat_set_hash != expected_set)) {
+            error = "FlowMesh client epoch has no matching connected B3 authority";
+            return std::nullopt;
+        }
+        const CBlockIndex* seat_index{seat_anchor.height >= 0 ? chainstate.m_chain[seat_anchor.height] : nullptr};
+        if (!seat_index || seat_index->GetBlockHash() != seat_anchor.hash) {
+            error = "FlowMesh client seat anchor is no longer canonical";
+            return std::nullopt;
+        }
+        const auto snapshot{seats.AnchoredSnapshot(chainstate.m_chain, *seat_index, tip->nHeight, params, error)};
+        if (!snapshot || !snapshot->FlowMeshReady()) return std::nullopt;
+        bindings.reserve(snapshot->members.size());
+        for (const auto& member : snapshot->members) {
+            bindings.push_back({member.outpoint, member.bls_pubkey, member.proof_of_possession});
+        }
+    }
+    flowmesh::BlsSeatSetCheck check;
+    auto out{flowmesh::BuildActiveFnBlsSeatSet(pins.domain, pins.market_id, entry.epoch,
+        static_cast<uint64_t>(seat_anchor.height), seat_anchor.hash, bindings, check)};
+    if (!out || out->set_hash != entry.seat_set_hash) {
+        error = "FlowMesh client certificate names a different anchored seat set";
+        return std::nullopt;
+    }
+    return out;
+}
+
 uint256 FlowMeshSeatKeysFingerprint(
     std::vector<std::array<unsigned char, bls::PUBKEY_SIZE>> public_keys)
 {
@@ -1583,6 +1695,57 @@ std::optional<flowmesh::MarketData> FlowMeshService::MarketData(
         }
     }
     return out;
+}
+
+std::optional<flowmesh::ClientStateEvidence> FlowMeshService::ClientSnapshot(
+    const flowmesh::MarketId& market_id, std::string& error) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    if (!runtime) { error = "FlowMesh runtime is unavailable"; return std::nullopt; }
+    return runtime->ClientSnapshot(market_id, error);
+}
+
+std::optional<std::vector<unsigned char>> FlowMeshService::ClientCertifiedEntry(
+    const flowmesh::MarketId& market_id, const uint64_t sequence, std::string& error) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    if (!runtime) { error = "FlowMesh runtime is unavailable"; return std::nullopt; }
+    return runtime->ClientCertifiedEntry(market_id, sequence, error);
+}
+
+flowmesh::ClientEventPage FlowMeshService::ClientEvents(
+    const std::optional<flowmesh::ClientEventCursor>& after,
+    const std::optional<flowmesh::MarketId>& market,
+    const std::optional<flowmesh::AccountId>& account, const size_t limit) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    if (runtime) return runtime->ClientEvents(after, market, account, limit);
+    flowmesh::ClientEventPage out;
+    out.gap = true;
+    return out;
+}
+
+std::optional<flowmesh::ClientEvent> FlowMeshService::ClientActionStatus(
+    const flowmesh::MarketId& market_id, const uint256& action_id) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    return runtime ? runtime->ClientActionStatus(market_id, action_id) : std::nullopt;
 }
 
 bool FlowMeshService::SubmitLocalAction(const flowmesh::MarketId& market_id,

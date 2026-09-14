@@ -753,7 +753,7 @@ once that exact anchor is 30 blocks deep.
 
 ## 55. Consensus activation is deterministic
 
-No runtime configuration (`-enableflowmesh`, `-modernassets=1`) may change block validity
+No runtime configuration (`-enableflowmeshvalidator`, `-modernassets=1`) may change block validity
 on mainnet. Activation comes from a fixed height, a versioned deployment, or another
 explicitly defined deterministic mechanism. Local configuration may affect relay, mining
 and UI only.

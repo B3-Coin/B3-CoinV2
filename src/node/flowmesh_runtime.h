@@ -5,6 +5,7 @@
 #ifndef B3COIN_NODE_FLOWMESH_RUNTIME_H
 #define B3COIN_NODE_FLOWMESH_RUNTIME_H
 
+#include <flowmesh/client_evidence.h>
 #include <flowmesh/p2p.h>
 #include <flowmesh/production_wire.h>
 #include <node/flowmesh_delivery.h>
@@ -463,6 +464,20 @@ public:
         const std::optional<flowmesh::AccountId>& account,
         const flowmesh::MarketDataQuery& query, std::string& error) const;
 
+    /** Exact current certificate and state captured at one locked head.
+     * Serialization stops at the client cap; no execution or network I/O. */
+    std::optional<flowmesh::ClientStateEvidence> ClientSnapshot(
+        const flowmesh::MarketId& market_id, std::string& error) const;
+    std::optional<std::vector<unsigned char>> ClientCertifiedEntry(
+        const flowmesh::MarketId& market_id, uint64_t sequence, std::string& error) const;
+    flowmesh::ClientEventPage ClientEvents(
+        const std::optional<flowmesh::ClientEventCursor>& after,
+        const std::optional<flowmesh::MarketId>& market,
+        const std::optional<flowmesh::AccountId>& account,
+        size_t limit = flowmesh::CLIENT_EVENT_PAGE_MAX) const;
+    std::optional<flowmesh::ClientEvent> ClientActionStatus(
+        const flowmesh::MarketId& market_id, const uint256& action_id) const;
+
     /** Test/shutdown aid: waits only for this runtime's current work queue. */
     bool WaitForIdle(std::chrono::milliseconds timeout);
 
@@ -486,8 +501,8 @@ private:
     bool InitializeMarket(const FlowMeshRuntimeMarketConfig& config,
                           std::string& error);
     void WorkerLoop();
-    void ProcessMessage(const flowmesh::QueuedWireMessage& queued);
-    void ProcessTick();
+    void ProcessMessage(const flowmesh::QueuedWireMessage& queued, uint64_t dequeued_us);
+    void ProcessTick(uint64_t requested_us, uint64_t dequeued_us);
     struct PendingDelivery;
     void RelayMessage(Market& market, flowmesh::WireMessage message,
                       std::optional<flowmesh::WirePeerId> peer,
@@ -537,6 +552,7 @@ private:
         std::optional<flowmesh::WireClock::time_point>& last_attempt);
 
     FlowMeshRuntimeConfig m_config;
+    flowmesh::ClientEventLog m_client_events{uint256{}};
     std::vector<FlowMeshRuntimeMarketConfig> m_market_configs;
 
     mutable std::mutex m_market_mutex;
@@ -556,6 +572,8 @@ private:
     std::deque<FlowMeshDeliveryEvent> m_delivery_events;
     std::atomic<uint64_t> m_delivery_event_overflows{0};
     bool m_tick_pending{false};
+    //! Observation of the first coalesced tick request; never a timer input.
+    uint64_t m_tick_requested_us{0};
     bool m_discovery_refresh{false};
     bool m_started{false};
     bool m_stopping{false};

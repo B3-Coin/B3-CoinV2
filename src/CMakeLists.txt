@@ -226,6 +226,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   net_processing.cpp
   netgroup.cpp
   node/abort.cpp
+  node/asset_metadata.cpp
   node/blockmanager_args.cpp
   node/blockstorage.cpp
   node/caches.cpp
@@ -259,8 +260,13 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/flowmesh_production_store.cpp
   node/flowmesh_runtime.cpp
   node/flowmesh_service.cpp
-  node/flowmesh_store.cpp
+  node/flowmesh_client.cpp
+  node/flowmesh_client_json.cpp
+  node/flowmesh_client_settlement.cpp
+  node/flowmesh_https.cpp
+  flowmesh/client_evidence.cpp
   node/flowmesh_net.cpp
+  node/flowmesh_store.cpp
   node/flowmesh_vault_index.cpp
   node/flowmesh_checkpoint_index.cpp
   node/fn_pod.cpp
@@ -297,8 +303,8 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   rpc/mempool.cpp
   rpc/mining.cpp
   rpc/net.cpp
-  rpc/node.cpp
   rpc/flowmesh_network.cpp
+  rpc/node.cpp
   rpc/output_script.cpp
   rpc/rawtransaction.cpp
   rpc/server.cpp
@@ -331,6 +337,9 @@ target_link_libraries(bitcoin_node
     $<TARGET_NAME_IF_EXISTS:libevent::core>
     $<TARGET_NAME_IF_EXISTS:libevent::extra>
     $<TARGET_NAME_IF_EXISTS:libevent::pthreads>
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    libevent::openssl
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
 )
 if(WITH_EMBEDDED_ASMAP)

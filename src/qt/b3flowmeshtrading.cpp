@@ -3,7 +3,9 @@
 #include <qt/b3flowmeshtrading.h>
 #include <qt/b3flowmeshmarketdata.h>
 #include <core_io.h>
+#include <flowmesh/batch.h>
 #include <flowmesh/market.h>
+#include <flowmesh/p2p.h>
 #include <key_io.h>
 #include <modern/asset_output.h>
 #include <modern/flowmesh_checkpoint.h>
@@ -14,6 +16,7 @@
 #include <rpc/util.h>
 #include <util/moneystr.h>
 #include <util/strencodings.h>
+#include <algorithm>
 #include <set>
 #include <stdexcept>
 #include <type_traits>
@@ -90,7 +93,17 @@ Market ParseMarket(const UniValue& value)
     // pause. Connected vault effects likewise remain publishable while paused;
     // proof validity and actual fees are independently checked by mempool acceptance.
     m.publish_ready = available && running;
-    m.reason = !available || !running ? QStringLiteral("Market runtime is unavailable.") : paused ? QStringLiteral("Market paused: validator quorum is not ready.") :
+    const auto& verification{Field(value, "verification")};
+    if (!verification.isNull()) {
+        const auto source{Text(Field(verification, "source"))};
+        if (source != QStringLiteral("local_engine") && source != QStringLiteral("remote_endpoint")) Fail("Unsupported market verification source.");
+        if (source == QStringLiteral("remote_endpoint")) {
+            m.remote = true;
+            m.ready = m.ready && Flag(Field(verification, "certificate_verified")) && Flag(Field(verification, "account_state_verified")) && !Text(Field(verification, "endpoint")).isEmpty();
+            m.publish_ready = m.publish_ready && Flag(Field(verification, "certificate_verified")) && Flag(Field(verification, "account_state_verified"));
+        }
+    }
+    m.reason = !available || !running ? QStringLiteral("Market service is unavailable.") : paused ? QStringLiteral("Market paused: inspect endpoint readiness and checkpoint progress.") :
         handoff ? QStringLiteral("Validator handoff is pending.") : halt != QStringLiteral("none") ? QStringLiteral("Market halted: ") + halt : error;
     m.checkpoint_pending = Flag(Field(value, "checkpoint_pending"));
     if (m.checkpoint_pending) m.checkpoint = Id(Field(value, "pending_checkpoint_id"));
@@ -122,10 +135,12 @@ Market ReadMarket(const QString& id, const RpcCall& rpc)
 {
     for (const auto& m : ParseMarkets(rpc("listflowmeshmarkets", UniValue{UniValue::VARR}))) {
         if (m.id != id) continue;
-        if (!m.has_account) return m;
+        // Remote discovery intentionally has no account/state proof. Read only
+        // the selected market, including first-deposit wallets with no account.
+        if (!m.has_account && !m.remote) return m;
         UniValue params{UniValue::VARR}; params.push_back(id.toStdString());
         const auto fresh{ParseMarket(rpc("getflowmeshbalance", params))};
-        if (fresh.id != m.id || fresh.account != m.account) Fail("Wallet or market changed during refresh.");
+        if (fresh.id != m.id || fresh.base != m.base || fresh.vault != m.vault || fresh.domain != m.domain || fresh.config != m.config || fresh.remote != m.remote || (m.has_account && fresh.account != m.account)) Fail("Wallet or market changed during refresh.");
         return fresh;
     }
     Fail("The selected market is no longer reported by this node.");
@@ -155,13 +170,16 @@ Request Parameters(const Action& a)
     Request r; r.params.push_back(a.market.id.toStdString());
     UniValue options{UniValue::VOBJ}; options.pushKV("broadcast", false);
     switch (a.operation) {
-    case Operation::Order:
+    case Operation::Order: {
         if (a.side != QStringLiteral("bid") && a.side != QStringLiteral("ask")) Fail("Choose bid or ask.");
         Positive(a.price); Positive(a.amount);
         if (a.price > MAX_MONEY / a.amount) Fail("The order's B3 notional exceeds the consensus range.");
-        if (a.side == QStringLiteral("bid") && (a.price >= MAX_MONEY || a.price > MAX_MONEY / a.amount || a.price * a.amount > a.market.b3_available)) Fail("The bid exceeds the available certified B3 balance or price range.");
-        if (a.side == QStringLiteral("ask") && a.amount > a.market.base_available) Fail("The ask exceeds the available certified asset balance.");
+        const bool bid{a.side == QStringLiteral("bid")};
+        const auto budget{B3FlowMeshMarketData::ReplacementBudget(bid ? a.market.b3_available : a.market.base_available,
+                                                                 bid ? a.market.b3_reserved : a.market.base_reserved)};
+        if (!budget || (bid ? a.price >= MAX_MONEY || a.price * a.amount > *budget : a.amount > *budget)) Fail("The replacement exceeds this side's available plus already reserved certified balance or price range.");
         r.method = "submitflowmeshorder"; r.params.push_back(a.side.toStdString()); r.params.push_back(a.price); r.params.push_back(a.amount); r.params.push_back(a.market.sequence); break;
+    }
     case Operation::Cancel:
         if (a.side != QStringLiteral("bid") && a.side != QStringLiteral("ask")) Fail("Choose bid or ask.");
         r.method = "cancelflowmeshorder"; r.params.push_back(a.side.toStdString()); r.params.push_back(a.market.sequence); break;
@@ -214,11 +232,29 @@ QString Describe(const Action& a)
     case Operation::Order: {
         Positive(a.price); Positive(a.amount);
         if (a.price > MAX_MONEY / a.amount) Fail("The order's B3 notional exceeds the consensus range.");
+        if (a.inverse_display) {
+            if (!a.display_decimals) Fail("Verified asset precision is required for the inverse order review.");
+            const bool buy{B3FlowMeshMarketData::DisplayBuy(a.side, true)};
+            const auto executable{B3FlowMeshMarketData::ExactInversePrice(a.price, *a.display_decimals)};
+            QString review{prefix + QStringLiteral("%1 B3: %2 %3.\nExecutable limit: %4 %5 %6 / B3 (gross, before fee).\n%7\nThe exact order quantity is in %6, NOT B3. This is a quantity cap, not a guaranteed fill. Partial fills and a better clearing price change the B3 amount.\n%8\nCanonical market: %6/B3. Canonical side: %9; account sequence: %10. This replaces your existing order on that side.\nUniform-price curve auction; accepted is not filled. No network fee for this request.")
+                .arg(buy ? QStringLiteral("Buy") : QStringLiteral("Sell"), buy ? QStringLiteral("Spend up to") : QStringLiteral("Receive up to"), base_amount,
+                     buy ? QStringLiteral("no more than") : QStringLiteral("no less than"), executable, a.display_ticker,
+                     (buy ? QStringLiteral("Estimated gross B3 at the limit: %1 B3, IF the full token cap fills. Better clearing can increase gross B3; partial fills reduce it.")
+                          : QStringLiteral("Maximum B3 reservation/spend: %1 B3. Better clearing may spend less; no exact B3 sale is promised.")).arg(QString::fromStdString(FormatMoney(a.price * a.amount))),
+                     buy ? QStringLiteral("Actual trading fee asset: B3. The whole-auction 0.01% fee is allocated from matched B3 proceeds and deducted from the B3 you receive; your allocated fee and net B3 are unknown before execution. The price limit above is gross, not fee-inclusive.")
+                         : QStringLiteral("Actual trading fee asset: B3, paid from the counterparty's B3 received, not deducted from your token receipt. The exact whole-auction fee allocation is unknown before execution."),
+                     a.side, QString::number(a.market.sequence))};
+            review += QStringLiteral("\nExact canonical limit: %1 B3 atoms per token atom; quantity cap: %2 token atoms.").arg(a.price).arg(a.amount);
+            if (a.display_limit_adjusted) review += QStringLiteral("\nYour entered limit was %1 %2 / B3. It was adjusted only in your favor to the executable limit %3 %2 / B3 shown above; that exact canonical limit is what will be signed.").arg(a.entered_display_limit, a.display_ticker, executable);
+            return review;
+        }
         QString price = QString::number(a.price) + QStringLiteral(" B3 atoms per raw base unit");
         if (a.display_decimals) price = B3FlowMeshMarketData::FormatPrice(a.price, *a.display_decimals) + QStringLiteral(" B3 / ") + a.display_ticker;
         return prefix + QStringLiteral("Limit %1: %2 at %3.\nExact limit notional: %4 B3\nAccount sequence: %5\nOne uniform-price curve auction, not price-time priority. Accepted is not filled. Protocol fee is 0.01% of matched notional deducted from seller proceeds; actual allocation depends on certified fills. No network fee for this request.").arg(a.side == QStringLiteral("bid") ? QStringLiteral("Buy") : QStringLiteral("Sell"), base_amount, price, QString::fromStdString(FormatMoney(a.price * a.amount)), QString::number(a.market.sequence));
     }
-    case Operation::Cancel: return prefix + QStringLiteral("Cancel this account's standing %1; sequence %2. Cancellation is not certified until processed.").arg(a.side, QString::number(a.market.sequence));
+    case Operation::Cancel: return prefix + QStringLiteral("Cancel this account's standing %1 (%2); sequence %3. Cancellation is not certified until processed.").arg(
+        a.inverse_display ? (B3FlowMeshMarketData::DisplayBuy(a.side, true) ? QStringLiteral("Buy B3") : QStringLiteral("Sell B3")) : a.side,
+        a.side, QString::number(a.market.sequence));
     case Operation::Deposit: return prefix + QStringLiteral("Deposit %1 into a KEYLESS vault. Funds may remain locked if the validator quorum fails. Preparation creates a wallet trading-account key if needed; back up this wallet even if you cancel. Admission needs 31 confirmations.").arg(amount);
     case Operation::Admit: return prefix + QStringLiteral("Admit existing deposit %1:%2. Must have at least 31 confirmations. Admission is not completed settlement.").arg(a.txid).arg(a.vout);
     case Operation::Withdraw: return prefix + QStringLiteral("Request withdrawal of %1 to %2; sequence %3. This is NOT an on-chain payout. A certified checkpoint and a separately fee-funded vault transaction must follow.").arg(amount, a.destination, QString::number(a.market.sequence));
@@ -230,9 +266,133 @@ QString Describe(const Action& a)
 
 void CheckActionResult(const UniValue& value, const Action& a)
 {
-    if (!Flag(Field(value, "accepted")) || Id(Field(value, "market_id")) != a.market.id) Fail("The node did not confirm the expected action. Its outcome may be unknown; do not retry.");
-    Id(Field(value, "action_id"));
+    ParseReceipt(value, a.market.id);
     if (Sequenced(a.operation) && (Id(Field(value, "account_id")) != a.market.account || Integer(Field(value, "sequence")) != static_cast<int64_t>(a.market.sequence))) Fail("The accepted action differs from the reviewed wallet or sequence; inspect state before retrying.");
+}
+
+Receipt ParseReceipt(const UniValue& value, const QString& market, const QString& expected_action)
+{
+    if (Id(Field(value, "market_id")) != market) Fail("Action receipt belongs to another market; outcome remains unknown.");
+    Receipt r; r.action_id = Id(Field(value, "action_id")); r.market = market;
+    if (!Field(value, "account_id").isNull()) r.account = Id(Field(value, "account_id"));
+    if (!expected_action.isEmpty() && r.action_id != expected_action) Fail("Action receipt does not match the saved action ID.");
+    const bool accepted{Flag(Field(value, "accepted"))};
+    if (Field(value, "receipt_state").isNull()) {
+        // Older local RPC acceptance meant queue admission, never execution.
+        r.state = accepted ? QStringLiteral("queued") : QStringLiteral("unknown");
+        return r;
+    }
+    r.state = Text(Field(value, "receipt_state")); r.reason = Text(Field(value, "reason")); r.endpoint = Text(Field(value, "endpoint"));
+    r.certificate_verified = Flag(Field(value, "certificate_verified")); r.outcome_verified = Flag(Field(value, "outcome_verified"));
+    const bool admitted{r.state == QStringLiteral("queued") || r.state == QStringLiteral("admitted") || r.state == QStringLiteral("certified_inclusion")};
+    if ((!admitted && r.state != QStringLiteral("unknown") && r.state != QStringLiteral("rejected")) || accepted != admitted) Fail("Inconsistent action receipt state.");
+    if (!Field(value, "microblock_hash").isNull()) {
+        r.microblock_hash = Id(Field(value, "microblock_hash")); r.microblock_sequence = Integer(Field(value, "microblock_sequence"));
+    }
+    if (r.state == QStringLiteral("certified_inclusion") && (!r.certificate_verified || r.microblock_hash.isEmpty())) Fail("Action inclusion lacks verified certificate evidence.");
+    if (r.outcome_verified && !r.Included()) Fail("An execution outcome cannot precede verified action inclusion.");
+    return r;
+}
+
+QString DescribeReceipt(const Receipt& r)
+{
+    QString text;
+    if (r.Included()) text = QStringLiteral("Exact action inclusion verified in certified microblock #%1. %2")
+        .arg(r.microblock_sequence).arg(r.outcome_verified ? QStringLiteral("Execution evidence verified; inspect the reported outcome separately.") : QStringLiteral("Execution outcome is unknown: inclusion alone does not prove a fill, successful withdrawal or B3 payout."));
+    else if (r.state == QStringLiteral("admitted")) text = QStringLiteral("Endpoint reports pool admission; not certified inclusion or execution.");
+    else if (r.state == QStringLiteral("queued")) text = QStringLiteral("Request queued; pool admission, certified inclusion and execution are not yet proven.");
+    else if (r.state == QStringLiteral("rejected")) text = QStringLiteral("Endpoint reports rejection; this does not prove that another endpoint did not already accept the exact action.");
+    else text = QStringLiteral("Submission outcome unknown. Do not create or re-sign a replacement request to retry it.");
+    if (r.no_resubmit) text += QStringLiteral("\nPreviously certified: retained no-resubmit protection is active. A fresh verification label requires current evidence; this instruction will not be resent.");
+    text += QStringLiteral("\nAction ID: %1").arg(r.action_id);
+    if (!r.endpoint.isEmpty()) text += QStringLiteral("\nEndpoint: %1").arg(r.endpoint);
+    if (!r.reason.isEmpty()) text += QStringLiteral("\n%1").arg(r.reason);
+    return text;
+}
+
+SavedActions ParseSavedActions(const UniValue& value)
+{
+    if (Text(Field(value, "source")) != QStringLiteral("local-retained-outbox")) Fail("Unexpected saved-action source.");
+    const auto& rows{Field(value, "actions")};
+    if (!rows.isArray() || rows.size() > 512) Fail("Saved-action list exceeds its local bound.");
+    SavedActions out;
+    if (!Field(value, "account_id").isNull()) out.account = Id(Field(value, "account_id"));
+    if (out.account.isEmpty() && rows.size()) Fail("Saved instructions lack a wallet account.");
+    for (const auto& row : rows.getValues()) {
+        SavedAction action;
+        action.market = Id(Field(row, "market_id")); action.domain = Id(Field(row, "domain"));
+        action.config = Id(Field(row, "execution_config_id")); action.account = Id(Field(row, "account_id"));
+        if (action.account != out.account) Fail("Saved instruction belongs to another wallet account.");
+        const QString id{Id(Field(row, "action_id"))};
+        if (std::any_of(out.actions.begin(), out.actions.end(), [&](const auto& other) { return other.market == action.market && other.receipt.action_id == id; })) Fail("Duplicate saved instruction identity.");
+        action.receipt = ParseReceipt(Field(row, "receipt"), action.market, id);
+        if (Id(Field(Field(row, "receipt"), "account_id")) != action.account) Fail("Saved receipt belongs to another wallet account.");
+        action.receipt.no_resubmit = Flag(Field(row, "previously_certified")) || action.receipt.Included();
+        const auto type{Integer(Field(row, "action_type"))};
+        if (type > 8) Fail("Unsupported saved instruction type.");
+        action.type = type;
+        const auto& side{Field(row, "canonical_side")};
+        const auto& points{Field(row, "canonical_points")};
+        if (!side.isNull() || !points.isNull()) {
+            action.canonical_side = Text(side);
+            const QString expected{type == 0 || type == 2 ? QStringLiteral("bid") : type == 1 || type == 3 ? QStringLiteral("ask") : QString{}};
+            if (expected.isEmpty() || action.canonical_side != expected || !points.isArray() || points.size() > flowmesh::MAX_ACTION_CURVE_POINTS ||
+                (type >= 2 && points.size())) Fail("Saved canonical presentation does not match its original action type.");
+            for (const auto& point : points.getValues()) action.canonical_points.push_back({Money(Field(point, "price"), false), Money(Field(point, "quantity"), false)});
+        }
+        if (!Field(row, "sequence").isNull()) action.sequence = Integer(Field(row, "sequence"));
+        if ((type == 5) == action.sequence.has_value()) Fail("Saved instruction sequence does not match its original type.");
+        action.signed_bytes_sha256 = Id(Field(row, "signed_bytes_sha256"));
+        action.signed_bytes_size = Integer(Field(row, "signed_bytes_size"));
+        if (action.signed_bytes_size == 0 || action.signed_bytes_size > flowmesh::FLOWMESH_ACTION_MAX_BYTES) Fail("Saved instruction size exceeds its codec bound.");
+        action.initial_submission_ms = Integer(Field(row, "initial_submission_ms"));
+        action.may_have_been_sent = Flag(Field(row, "may_have_been_sent"));
+        out.actions.push_back(std::move(action));
+    }
+    std::sort(out.actions.begin(), out.actions.end(), [](const auto& a, const auto& b) {
+        return a.initial_submission_ms != b.initial_submission_ms ? a.initial_submission_ms > b.initial_submission_ms
+            : std::pair{a.market, a.receipt.action_id} < std::pair{b.market, b.receipt.action_id};
+    });
+    return out;
+}
+
+QString DescribeSavedAction(const SavedAction& action, std::optional<int> decimals, const QString& ticker)
+{
+    QString description{QStringLiteral("Market: %1\nAccount: %2\nOriginal action type: %3 · Original account sequence: %4\nOriginal signed payload: %5 bytes · SHA-256: %6\n%7")
+        .arg(action.market, action.account).arg(action.type)
+        .arg(action.sequence ? QString::number(*action.sequence) : QStringLiteral("not sequenced (deposit)"))
+        .arg(action.signed_bytes_size).arg(action.signed_bytes_sha256, DescribeReceipt(action.receipt))};
+    if (action.type <= 3) {
+        // Action type itself has always fixed the economic direction. Old
+        // records need no rewrite, presentation tag, re-signing or fresh send.
+        const bool bid{action.type == 0 || action.type == 2};
+        const bool cancel{action.type >= 2};
+        const QString token{decimals && !ticker.isEmpty() ? ticker : QStringLiteral("configured token")};
+        description += QStringLiteral("\n%1%2 B3 = %3 %4; canonical %5. This is the original instruction, not a conversion or a new order.")
+            .arg(cancel ? QStringLiteral("Cancel ") : QString{}, bid ? QStringLiteral("Sell") : QStringLiteral("Buy"),
+                 bid ? QStringLiteral("buy") : QStringLiteral("sell"), token, bid ? QStringLiteral("bid") : QStringLiteral("ask"));
+        const auto& points{action.canonical_points};
+        if (!cancel && points.size() == 2 && points[0].price < MAX_MONEY && points[1].price == points[0].price + 1 &&
+            (bid ? points[0].quantity > 0 && points[1].quantity == 0 : points[0].quantity == 0 && points[1].quantity > 0)) {
+            const CAmount price{bid ? points[0].price : points[1].price}, quantity{bid ? points[0].quantity : points[1].quantity};
+            description += QStringLiteral("\nOriginal canonical limit: %1 B3 atoms per token atom; %2 token atoms %3.").arg(price).arg(quantity).arg(bid ? QStringLiteral("to receive, at most") : QStringLiteral("to spend, at most"));
+            if (decimals) description += QStringLiteral("\n%1 up to %2 %3; original gross limit %4 %3 / B3. No exact B3 fill is promised.")
+                .arg(bid ? QStringLiteral("Receive") : QStringLiteral("Spend"), B3FlowMeshMarketData::FormatAmount(quantity, *decimals), token, B3FlowMeshMarketData::ExactInversePrice(price, *decimals));
+            if (const auto notional{B3FlowMeshMarketData::Notional(price, quantity)}) description += (bid ? QStringLiteral("\nOriginal maximum B3 reservation/spend: %1 B3.") : QStringLiteral("\nGross B3 at the limit if fully filled: %1 B3, before the allocated B3 fee.")).arg(B3FlowMeshMarketData::FormatAmount(*notional, 9));
+        } else if (!points.empty()) {
+            description += QStringLiteral("\nOriginal canonical curve (price: B3 atoms per token atom; quantity: token atoms):");
+            for (const auto& point : points) description += QStringLiteral("\n%1 : %2").arg(point.price).arg(point.quantity);
+        } else if (!cancel) description += QStringLiteral("\nOriginal price/quantity details unavailable from this backend; no amount or price is guessed.");
+        if (!cancel) description += QStringLiteral("\nActual trading fee asset: B3. This receipt does not report your allocated executed fee; no fee amount is inferred from inclusion.");
+    }
+    return description;
+}
+
+Request ReceiptParameters(const QString& market, const QString& action_id, bool retry)
+{
+    Hash(market); Hash(action_id);
+    Request r{retry ? "retryflowmeshaction" : "getflowmeshactionstatus"};
+    r.params.push_back(market.toStdString()); r.params.push_back(action_id.toStdString()); return r;
 }
 
 B3AssetTransfer::Prepared ParsePrepared(const UniValue& value, const Action& a, const std::function<bool(const CTxDestination&)>& owned)

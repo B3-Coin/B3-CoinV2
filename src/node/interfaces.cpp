@@ -30,6 +30,7 @@
 #include <netaddress.h>
 #include <netbase.h>
 #include <node/blockstorage.h>
+#include <node/asset_metadata.h>
 #include <node/bridge_state.h>
 #include <node/coin.h>
 #include <consensus/era.h>
@@ -40,6 +41,7 @@
 #include <node/finality_signature.h>
 #include <node/finality_tracker.h>
 #include <node/flowmesh_service.h>
+#include <node/flowmesh_client.h>
 #include <node/flowmesh_vault_index.h>
 #include <node/interface_ui.h>
 #include <node/mini_miner.h>
@@ -641,6 +643,14 @@ public:
                int{FillBlock(block2, block2_out, lock, active, chainman().m_blockman)};
     }
     void findCoins(std::map<COutPoint, Coin>& coins, bool exclude_mempool_spent) override { return FindCoins(m_node, coins, exclude_mempool_spent); }
+    std::optional<modern::AssetMetadataProof> assetMetadataProof(const uint256& asset) override
+    {
+        return m_node.asset_metadata ? m_node.asset_metadata->Get(asset) : std::nullopt;
+    }
+    uint64_t assetMetadataGeneration() override
+    {
+        return m_node.asset_metadata ? m_node.asset_metadata->Generation() : 0;
+    }
     double guessVerificationProgress(const uint256& block_hash) override
     {
         LOCK(chainman().GetMutex());
@@ -1151,6 +1161,9 @@ public:
     std::vector<interfaces::FlowMeshMarketStatus> flowMeshMarkets(
         const std::optional<uint256>& account_id) override
     {
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Markets(account_id);
+        // Direct service fixtures predate the trading backend. Preserve their
+        // local path without ever constructing an engine for a remote client.
         if (!m_node.flowmesh) return {};
         std::vector<interfaces::FlowMeshMarketStatus> out;
         const auto markets{m_node.flowmesh->Markets()};
@@ -1166,6 +1179,7 @@ public:
         const uint256& market_id,
         const std::optional<uint256>& account_id) override
     {
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Market(market_id, account_id);
         if (!m_node.flowmesh) return std::nullopt;
         const auto market{m_node.flowmesh->Market(market_id)};
         if (!market) return std::nullopt;
@@ -1221,6 +1235,7 @@ public:
         const uint256& market_id, const std::optional<uint256>& account_id,
         const flowmesh::MarketDataQuery& query, std::string& error) override
     {
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Data(market_id, account_id, query, error);
         if (!m_node.flowmesh) {
             error = "FlowMesh service is not available in this node";
             return std::nullopt;
@@ -1244,11 +1259,45 @@ public:
                               const flowmesh::Action& action,
                               std::string& error) override
     {
+        if (m_node.flowmesh_trading) {
+            const auto receipt{m_node.flowmesh_trading->Submit(market_id, action)};
+            error = receipt.reason;
+            if (receipt.state == "unknown" && error.empty()) {
+                error = "FlowMesh submission outcome is unknown; query or retry the same retained action ID";
+            }
+            return receipt.Admitted();
+        }
         if (!m_node.flowmesh) {
             error = "FlowMesh service is not available in this node";
             return false;
         }
         return m_node.flowmesh->SubmitLocalAction(market_id, action, error);
+    }
+    interfaces::FlowMeshActionReceipt submitFlowMeshActionReceipt(
+        const uint256& market_id, const flowmesh::Action& action) override
+    {
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Submit(market_id, action);
+        return interfaces::Chain::submitFlowMeshActionReceipt(market_id, action);
+    }
+    interfaces::FlowMeshActionReceipt flowMeshActionStatus(
+        const uint256& market_id, const uint256& action_id, bool retry) override
+    {
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->ActionStatus(market_id, action_id, retry);
+        if (m_node.flowmesh) return node::MakeLocalFlowMeshBackend(*m_node.flowmesh)->ActionStatus(market_id, action_id, retry);
+        return interfaces::Chain::flowMeshActionStatus(market_id, action_id, retry);
+    }
+    interfaces::FlowMeshClientStatus flowMeshClientStatus() override
+    {
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Status();
+        interfaces::FlowMeshClientStatus status;
+        status.engine_enabled = m_node.flowmesh && m_node.flowmesh->Enabled();
+        return status;
+    }
+    std::vector<interfaces::FlowMeshSavedAction> flowMeshSavedActions(
+        const uint256& account_id, const std::optional<uint256>& market_id) override
+    {
+        return m_node.flowmesh_trading ? m_node.flowmesh_trading->SavedActions(account_id, market_id)
+                                     : std::vector<interfaces::FlowMeshSavedAction>{};
     }
     interfaces::FlowMeshValidatorStatus flowMeshValidatorStatus() override
     {
@@ -1287,6 +1336,7 @@ public:
     nextFlowMeshCheckpoint(const uint256& market_id,
                            std::string& error) override
     {
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Checkpoint(market_id, error);
         if (!m_node.flowmesh) {
             error = "FlowMesh service is not available in this node";
             return std::nullopt;
@@ -1302,6 +1352,7 @@ public:
     flowMeshVaultOperation(const uint256& effect_id,
                            std::string& error) override
     {
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->VaultOperation(effect_id, error);
         if (!m_node.flowmesh) {
             error = "FlowMesh service is not available in this node";
             return std::nullopt;
@@ -1326,6 +1377,7 @@ public:
     flowMeshVaultOperations(const std::optional<uint256>& market_id,
                             std::string& error) override
     {
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->VaultOperations(market_id, error);
         if (!m_node.flowmesh) {
             error = "FlowMesh service is not available in this node";
             return {};

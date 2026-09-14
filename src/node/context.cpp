@@ -13,7 +13,9 @@
 #include <net.h>
 #include <net_processing.h>
 #include <netgroup.h>
+#include <node/asset_metadata.h>
 #include <node/flowmesh_service.h>
+#include <node/flowmesh_client.h>
 #include <node/kernel_notifications.h>
 #include <node/staking.h>
 #include <node/warnings.h>

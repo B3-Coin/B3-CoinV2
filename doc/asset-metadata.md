@@ -28,9 +28,13 @@ balances and confirmations still come from normal wallet/chain processing.
 - Native B3, FN, and the configured bridge asset retain their existing names
   and precision.
 - A bundled registry resolves known assets by exact chain-bound ID, including
-  the tUSD test asset below.
+  the tUSD and cUSD test assets below.
 - Wallet-known issuance transactions supply verified precision automatically,
   even if no human-readable name is registered. These show as **Unnamed asset**.
+- A node-wide background cache discovers other simple-v1 issuance proofs from
+  contiguous locally available validated modern blocks. New and existing
+  wallets use the same verified precision even when the issuance is not in
+  their own history.
 - Imported metadata supplies a local name and ticker plus ID-verified precision.
 - An asset without a matching genesis proof remains **Unknown asset**, showing
   exact raw units. Unknown precision is not treated as verified zero decimals.
@@ -41,7 +45,7 @@ amounts. `getwalletassets` retains its existing `decimals` field (zero fallback
 when unknown) and adds `precision_known`, `name`, `metadata_source`, and
 `test_only`. Clients must check `precision_known` before scaling an unknown
 asset. Metadata sources are `consensus`, `bundled-registry`, `local-registry`,
-`wallet-issuance`, and `unknown`.
+`wallet-issuance`, `node-issuance`, and `unknown`.
 
 ## Register a custom asset locally
 
@@ -58,16 +62,43 @@ wallet, and refreshes the GUI without requiring a new block or restart. It
 requires no wallet unlock and spends no coins. `clearassetmetadata` removes
 the local label; it does not delete coins or change the immutable genesis.
 
-Metadata survives wallet reload and is included in wallet backups. It is
-local to that wallet: it is not automatically published or relayed to other
-wallets. A recipient whose wallet never saw the issuance can import the same
-public proof and label. There is no new whole-chain scan or network metadata
-service. Automatic global name discovery is outside this change.
+Imported labels survive wallet reload and are included in wallet backups.
+They remain local to that wallet: arbitrary peer names/tickers are not trusted
+or automatically relayed. A recipient can import the same public proof and
+label if desired. Reviewed bundled identities include tUSD and cUSD below.
 
 Names are limited to 64 safe ASCII characters and tickers to 12; configured
 names and their normalized aliases are reserved. A proof may be at most
 1,000,000 bytes. These limits also prevent display markup and control characters
 from becoming wallet labels.
+
+## Automatic precision discovery
+
+The node scans available **validated modern blocks**, starting at asset
+activation, in a separate interruptible background worker. It stores compact
+chain-scoped genesis preimages and a resumable block cursor outside wallet
+databases. There is no per-wallet historical scan, no requirement to enable
+`txindex`, and no block read or chain synchronization inside a balance lookup.
+With contiguous available history from asset activation to the scan cursor,
+the cache also discovers later issuances regardless of whether their outputs
+belong to a loaded wallet. Qt refreshes when cached precision becomes available,
+including when the chain is idle.
+
+Every cached proof is checked against its full asset ID and chain domain.
+The scanner pauses at the first missing or pruned block. Until that gap is
+restored, it cannot discover issuances in later blocks either, including new
+issuances. Previously verified cached precision remains usable; unknown
+precision is never guessed.
+Cache failures must not stop the blockchain or prevent the wallet from opening.
+Manual import and bundled proofs remain available as fallbacks on pruned nodes.
+Discovery does not assert that a retained proof's issuance is still confirmed
+after a reorg; balances and spendability continue to use normal chain rules.
+
+This discovery concerns immutable **precision**, not arbitrary names, dollar
+backing, redemption, or an issuer's identity. Unnamed assets keep their full
+asset identity and can display correctly scaled prices without inventing a
+ticker. Other wallets need a build containing this feature; it does not change
+the behavior of already-running older binaries or the network consensus rules.
 
 ## Send and receive in Qt
 
@@ -118,3 +149,18 @@ The exact-ID entry lets recipient wallets display this existing asset after
 upgrading, without reissuing it or paying another issuance fee. A test asset's
 display label does not enable FlowMesh trading/deposit buttons or change any
 bridge permission.
+
+## Bundled cUSD test asset
+
+- Name / ticker: **cUSD Unbacked Test / cUSD**.
+- Asset ID: `929d3345f4bc08683dabce49cbca6f79cf646621e1f18342713f975dc2111ade`.
+- Fixed supply: `10000000000` raw units; **10,000 cUSD** at six decimals.
+- Issuance transaction: `eed79c52111c0d8faf367afb8899d83c33c66434cad28602e900ccd1d6e7e260`.
+- Issuance anchor: `97976c28709507dc443ecf07d6bb8caf1202688f18e102a5004acf34fb130800:1`.
+- Serialized genesis: `00e40b5402000000060000`.
+- Status: **unbacked test asset**, not bridge-backed USDT or a redemption promise.
+
+Its reviewed label and verified precision are available even on a fresh wallet
+or one without historical issuance block data. A wallet that already imported
+the same asset still loads successfully; the bundled identity takes precedence
+over its older, independently verified local display record.

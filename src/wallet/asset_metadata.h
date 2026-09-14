@@ -5,6 +5,7 @@
 #ifndef BITCOIN_WALLET_ASSET_METADATA_H
 #define BITCOIN_WALLET_ASSET_METADATA_H
 
+#include <modern/asset_metadata.h>
 #include <primitives/transaction.h>
 #include <serialize.h>
 #include <uint256.h>
@@ -17,18 +18,9 @@ namespace Consensus { struct Params; }
 
 namespace wallet {
 
-//! A compact preimage proving immutable simple-v1 precision, not chain inclusion.
-//! Only fixed-genesis issuance with empty mode parameters is supported.
-struct AssetMetadataProof {
-    COutPoint issuance_prevout;
-    uint64_t max_supply{0};
-    uint8_t decimals{0};
-
-    SERIALIZE_METHODS(AssetMetadataProof, obj)
-    {
-        READWRITE(obj.issuance_prevout, obj.max_supply, obj.decimals);
-    }
-};
+//! Keep the wallet's serialized proof format unchanged while sharing verified
+//! public genesis facts with the node's background metadata cache.
+using AssetMetadataProof = modern::AssetMetadataProof;
 
 //! Cosmetic, wallet-local labels. The database key also contains the chain domain.
 struct LocalAssetMetadata {

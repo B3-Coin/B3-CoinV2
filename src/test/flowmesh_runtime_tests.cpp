@@ -4056,6 +4056,223 @@ BOOST_AUTO_TEST_CASE(independent_rounds_recover_quorum_through_observer)
     }
 }
 
+BOOST_AUTO_TEST_CASE(normal_and_restarted_proposer_round_deadlines)
+{
+    // Injected time measures scheduling decisions only, not network or disk
+    // throughput. Run the no-restart control independently of the fault case.
+    for (const bool restart_proposer : {false, true}) {
+        const std::string scenario{restart_proposer ? "restarted_proposer" : "normal"};
+        const uint256 domain{Filled(0x2a)};
+        const modern::AssetId asset{Filled(0x4a)};
+        const auto market{*flowmesh::ComputeFlowMeshMarketId(domain, asset)};
+        const auto vault{*flowmesh::ComputeFlowMeshVaultId(domain, market)};
+        const uint256 treasury{Filled(0x6a)};
+        const SeatFixture seats{Seats(domain, market, 4, 7, 100, Filled(0x71), 130)};
+        const flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(),
+                                            flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+        RuntimeChain chain;
+        chain.m_domain = domain;
+        chain.Add(seats.seats);
+        MapDeposits deposits;
+        deposits.required_anchor = chain.m_current;
+        const flowmesh::AccountId account{Filled(0x8a)};
+        const COutPoint outpoint{Txid::FromUint256(Filled(0xaa)), 0};
+        deposits.entries.emplace(outpoint, flowmesh::DepositInfo{asset, 250, account});
+        std::array<FixedClock, 4> clocks;
+        std::array<RuntimeKeys, 4> keys;
+        std::array<std::unique_ptr<node::FlowMeshProductionStore>, 4> stores;
+        RuntimeNetwork network;
+        network.IgnoreHellos();
+        std::array<std::unique_ptr<node::FlowMeshRuntime>, 4> runtimes;
+        struct StopRuntimes {
+            decltype(runtimes)& all;
+            ~StopRuntimes() { for (const auto& runtime : all) if (runtime) runtime->Stop(); }
+        } stop{runtimes};
+        std::string error;
+        const auto runtime_config = [&](const size_t i) {
+            node::FlowMeshRuntimeConfig config;
+            config.chain = &chain;
+            config.keys = &keys[i];
+            config.clock = &clocks[i];
+            config.round_timeout = std::chrono::seconds{2};
+            config.relay = [&network, i](node::FlowMeshRuntimeRelay relay) {
+                network.Relay(i, std::move(relay));
+                return LegacyRelayResult();
+            };
+            return config;
+        };
+        const auto drain = [&] {
+            for (size_t pass{0}; pass < 4; ++pass) {
+                for (const auto& runtime : runtimes) {
+                    BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+                }
+            }
+        };
+        const auto set_time = [&](const int64_t micros) {
+            drain();
+            for (auto& clock : clocks) {
+                clock.m_now = flowmesh::WireClock::time_point{std::chrono::microseconds{micros}};
+            }
+        };
+        const auto tick_all = [&] {
+            for (const auto& runtime : runtimes) runtime->NotifyTick();
+            drain();
+        };
+        const auto observe_rounds = [&](const char* phase, const uint64_t sequence) {
+            for (size_t i{0}; i < runtimes.size(); ++i) {
+                const auto snapshots{runtimes[i]->DeliverySnapshots()};
+                BOOST_REQUIRE_EQUAL(snapshots.size(), 1U);
+                const auto& events{snapshots.front().events};
+                const auto entered{std::find_if(events.rbegin(), events.rend(), [&](const auto& event) {
+                    return event.stage == "round_entered" && event.sequence == sequence;
+                })};
+                BOOST_REQUIRE(entered != events.rend());
+                BOOST_REQUIRE(entered->round);
+                BOOST_REQUIRE(entered->seat_index);
+                BOOST_CHECK(entered->reason.find(" start_us=") != std::string::npos);
+                BOOST_CHECK(entered->reason.find(" deadline_us=") != std::string::npos);
+                BOOST_TEST_MESSAGE("scheduler_event scenario=" << scenario << " node=" << i
+                    << " phase=" << phase << " stage=" << entered->stage
+                    << " event_us=" << entered->monotonic_us << " round=" << *entered->round
+                    << " proposer=" << *entered->seat_index << " reason=" << entered->reason);
+            }
+        };
+        for (size_t i{0}; i < runtimes.size(); ++i) {
+            keys[i].m_keys[market] = {seats.secrets[i]};
+            stores[i] = std::make_unique<node::FlowMeshProductionStore>(DBParams{
+                .path = m_args.GetDataDirBase() / fs::PathFromString(
+                    "flowmesh_round_deadline_" + scenario + "_" + std::to_string(i)),
+                .cache_bytes = size_t{1} << 20, .wipe_data = true});
+            BOOST_REQUIRE_MESSAGE(stores[i]->OpenForMarket(
+                domain, market, seats.seats, initial.Root(), error), error);
+            runtimes[i] = std::make_unique<node::FlowMeshRuntime>(runtime_config(i),
+                std::vector<node::FlowMeshRuntimeMarketConfig>{MarketConfig(
+                    domain, market, treasury, seats.seats, initial, *stores[i], &deposits)});
+            network.Set(i, runtimes[i].get(), true);
+            BOOST_REQUIRE_MESSAGE(runtimes[i]->Start(error), error);
+        }
+        runtimes[0]->NotifyTick();
+        BOOST_REQUIRE(WaitUntil([&] {
+            return std::all_of(runtimes.begin(), runtimes.end(), [&](const auto& runtime) {
+                return runtime->MarketStatus(market)->next_sequence == 1;
+            });
+        }));
+        drain();
+        observe_rounds("previous_certificate", 1);
+        for (auto& provider : keys) provider.m_keys.clear();
+        // CommitCertified set round zero at 100s on every node. A later
+        // restart replaces only node0's local timer, just as Run5's reindex
+        // happened after sequence six had already committed everywhere.
+        if (restart_proposer) {
+            set_time(101100000);
+            const auto state{*runtimes[0]->StateSnapshot(market)};
+            const auto status{*runtimes[0]->MarketStatus(market)};
+            network.Set(0, nullptr, false);
+            runtimes[0]->Stop();
+            auto restored{MarketConfig(domain, market, treasury, seats.seats,
+                                      state, *stores[0], &deposits)};
+            restored.next_sequence = status.next_sequence;
+            restored.next_effect_index = status.next_effect_index;
+            restored.last_microblock_hash = status.last_microblock_hash;
+            runtimes[0] = std::make_unique<node::FlowMeshRuntime>(
+                runtime_config(0), std::vector<node::FlowMeshRuntimeMarketConfig>{restored});
+            network.Set(0, runtimes[0].get(), true);
+            BOOST_REQUIRE_MESSAGE(runtimes[0]->Start(error), error);
+        }
+        set_time(102224000);
+        tick_all();
+        for (size_t i{0}; i < runtimes.size(); ++i) {
+            BOOST_CHECK_EQUAL(runtimes[i]->MarketStatus(market)->round,
+                              restart_proposer && i == 0 ? 0U : 1U);
+        }
+        observe_rounds("before_action", 1);
+        // Sequence1/round1 and Run5 sequence7/round11 both select seat2.
+        const std::array<size_t, 4> local_seats{2, 1, 0, 3};
+        for (size_t i{0}; i < keys.size(); ++i) {
+            keys[i].m_keys[market] = {seats.secrets[local_seats[i]]};
+        }
+        BOOST_REQUIRE(runtimes[0]->SubmitLocalAction(market, Deposit(outpoint)) ==
+                      flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(WaitUntil([&] {
+            return std::all_of(runtimes.begin(), runtimes.end(), [&](const auto& runtime) {
+                return runtime->MarketStatus(market)->pending_actions == 1;
+            });
+        }));
+        tick_all();
+        if (restart_proposer) {
+            for (const int64_t now : {102500000LL, 102900000LL, 103099999LL}) {
+                set_time(now);
+                tick_all();
+                BOOST_CHECK_EQUAL(runtimes[0]->MarketStatus(market)->round, 0U);
+                for (const auto& runtime : runtimes) {
+                    BOOST_CHECK_EQUAL(runtime->MarketStatus(market)->next_sequence, 1U);
+                }
+                const auto snapshots{runtimes[0]->DeliverySnapshots()};
+                const auto& events{snapshots.front().events};
+                const auto tick{std::find_if(events.rbegin(), events.rend(), [](const auto& event) {
+                    return event.stage == "tick_market_lock_acquired";
+                })};
+                BOOST_REQUIRE(tick != events.rend());
+                BOOST_CHECK_EQUAL(tick->monotonic_us, static_cast<uint64_t>(now));
+                BOOST_CHECK(tick->reason.find("request_us=" + std::to_string(now)) != std::string::npos);
+                BOOST_CHECK(tick->reason.find("dequeue_us=" + std::to_string(now)) != std::string::npos);
+                BOOST_CHECK(tick->reason.find("lock_request_us=" + std::to_string(now)) != std::string::npos);
+                BOOST_CHECK(tick->reason.find("locked_us=" + std::to_string(now)) != std::string::npos);
+                BOOST_TEST_MESSAGE("scheduler_event scenario=" << scenario << " node=0"
+                    << " phase=before_deadline stage=" << tick->stage
+                    << " event_us=" << tick->monotonic_us << " round=" << *tick->round
+                    << " reason=" << tick->reason);
+            }
+            set_time(103100000);
+            tick_all();
+        }
+        BOOST_REQUIRE(WaitUntil([&] {
+            return std::all_of(runtimes.begin(), runtimes.end(), [&](const auto& runtime) {
+                return runtime->MarketStatus(market)->next_sequence == 2;
+            });
+        }));
+        drain();
+        observe_rounds("new_certificate", 2);
+        const uint64_t expected_execution{restart_proposer ? 103100000U : 102224000U};
+        const auto certified_hash{runtimes[0]->MarketStatus(market)->last_microblock_hash};
+        for (size_t i{0}; i < runtimes.size(); ++i) {
+            const auto snapshots{runtimes[i]->DeliverySnapshots()};
+            BOOST_REQUIRE_EQUAL(snapshots.size(), 1U);
+            const auto& events{snapshots.front().events};
+            const auto admitted{std::find_if(events.begin(), events.end(), [&](const auto& event) {
+                return event.stage == "action_verified" && event.object_id == Deposit(outpoint).Id();
+            })};
+            const auto applied{std::find_if(events.begin(), events.end(), [](const auto& event) {
+                return event.stage == "durably_applied" && event.sequence == 1;
+            })};
+            const auto action_round{std::find_if(events.begin(), events.end(), [](const auto& event) {
+                return event.stage == "action_round_observed" && event.sequence == 1;
+            })};
+            BOOST_REQUIRE(admitted != events.end());
+            BOOST_REQUIRE(applied != events.end());
+            BOOST_REQUIRE(action_round != events.end());
+            BOOST_REQUIRE(action_round->round);
+            BOOST_REQUIRE(action_round->seat_index);
+            BOOST_CHECK_EQUAL(*action_round->round, restart_proposer && i == 0 ? 0U : 1U);
+            BOOST_CHECK_EQUAL(*action_round->seat_index, restart_proposer && i == 0 ? 1U : 2U);
+            BOOST_CHECK_EQUAL(admitted->monotonic_us, 102224000U);
+            BOOST_CHECK_EQUAL(applied->monotonic_us, expected_execution);
+            BOOST_CHECK(runtimes[i]->MarketStatus(market)->last_microblock_hash == certified_hash);
+            BOOST_CHECK_EQUAL(runtimes[i]->StateSnapshot(market)->LedgerView().Available(account, asset), 250);
+            BOOST_CHECK_EQUAL(runtimes[i]->MarketStatus(market)->round, 0U);
+            std::optional<node::StoredProductionEntry> entry;
+            BOOST_REQUIRE(stores[i]->ReadEntry(1, seats.seats, entry, error));
+            BOOST_REQUIRE(entry);
+            BOOST_CHECK(flowmesh::CheckProductionEntryCertificate(
+                entry->entry, seats.seats, entry->certificate) == flowmesh::BlsCertificateCheck::OK);
+            BOOST_TEST_MESSAGE("scheduler_scenario=" << scenario << " node=" << i
+                << " admitted_us=" << admitted->monotonic_us
+                << " applied_us=" << applied->monotonic_us
+                << " virtual_wait_us=" << applied->monotonic_us - admitted->monotonic_us);
+        }
+    }
+}
+
 BOOST_AUTO_TEST_CASE(remote_round_cannot_drive_timer_or_bypass_proposal_validation)
 {
     const uint256 domain{Filled(0x29)};

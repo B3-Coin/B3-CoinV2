@@ -905,6 +905,10 @@ RPCHelpMan listflowmeshmarkets();
 RPCHelpMan getflowmeshvalidatorinfo();
 RPCHelpMan getflowmeshbalance();
 RPCHelpMan getflowmeshmarketdata();
+RPCHelpMan getflowmeshclientinfo();
+RPCHelpMan getflowmeshactionstatus();
+RPCHelpMan listflowmeshactions();
+RPCHelpMan retryflowmeshaction();
 RPCHelpMan listflowmeshvaultoperations();
 RPCHelpMan submitflowmeshdeposit();
 RPCHelpMan submitflowmeshorder();
@@ -978,6 +982,10 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &flowmeshdeposit},
         {"wallet", &getflowmeshbalance},
         {"wallet", &getflowmeshmarketdata},
+        {"wallet", &getflowmeshclientinfo},
+        {"wallet", &getflowmeshactionstatus},
+        {"wallet", &listflowmeshactions},
+        {"wallet", &retryflowmeshaction},
         {"wallet", &getflowmeshvalidatorinfo},
         {"wallet", &getaddressesbylabel},
         {"wallet", &getaddressinfo},

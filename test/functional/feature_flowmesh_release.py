@@ -58,6 +58,10 @@ B3_ARGS = [
     "-rpcdoccheck=1",
 ]
 
+# This fixture intentionally qualifies the original B3-carried operator path.
+# Keep these separate from B3_ARGS, which ordinary engine-off clients reuse.
+FLOWMESH_OPERATOR_ARGS = ["-enableflowmeshvalidator=1", "-flowmeshtransport=legacy"]
+
 
 class FlowMeshReleaseTest(BitcoinTestFramework):
     def exercise_extra_trading(self, market_id):
@@ -66,7 +70,7 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 4
         self.setup_clean_chain = True
-        self.extra_args = [B3_ARGS] * self.num_nodes
+        self.extra_args = [[*B3_ARGS, *FLOWMESH_OPERATOR_ARGS] for _ in range(self.num_nodes)]
         self.mock_time = int(time.time()) - 300
         self.pos_running = False
 
@@ -832,7 +836,7 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
         reindex_height = n0.getblockcount()
         reindex_tip = n0.getbestblockhash()
         self.log.info("Clean reindex restores FlowMesh without a new block")
-        self.restart_node(0, extra_args=[*B3_ARGS, "-reindex=1"])
+        self.restart_node(0, extra_args=[*B3_ARGS, *FLOWMESH_OPERATOR_ARGS, "-reindex=1"])
         n0.setmocktime(self.mock_time)
         started = n0.startflowmeshvalidator()
         assert_equal(started["running"], True)

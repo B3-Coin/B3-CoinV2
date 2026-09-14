@@ -50,7 +50,7 @@ class FlowMeshIndependentTest(FlowMeshReleaseTest):
                for other, port in enumerate(self.proxy_ports) if other != index]]
             for index in range(self.num_nodes)
         ]
-        self.extra_args = [list(args) + self.fm_args[index]
+        self.extra_args = [[arg for arg in args if not arg.startswith("-flowmeshtransport=")] + self.fm_args[index]
                            for index, args in enumerate(self.extra_args)]
         self.operator_keys = None
         self.last_market = None

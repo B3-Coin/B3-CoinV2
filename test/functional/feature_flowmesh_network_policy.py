@@ -3,9 +3,9 @@
 # Distributed under the MIT software license.
 """Short walletless FMNET policy/isolation smoke test, not trading qualification.
 
-Three private regtest processes: two independent transports and one default
-legacy transport. This first integration stage intentionally retains the legacy
-transport default; it does not qualify the future engine-off remote client.
+Three explicitly enabled private regtest operators: two independent transports
+and one explicit legacy transport. Ordinary clients now default engine-off;
+this operator-policy test does not qualify the remote trading client.
 No wallet, FN binding, staking, custody or live chain is used. Empty-block
 convergence is a B3 availability check, not checkpoint/withdrawal compatibility.
 """
@@ -23,7 +23,8 @@ class FlowMeshNetworkPolicyTest(BitcoinTestFramework):
     def set_test_params(self):
         self.setup_clean_chain = True
         self.num_nodes = 3
-        self.common_args = [*B3_ARGS, "-disablewallet"]
+        self.common_args = [*B3_ARGS, "-enableflowmeshvalidator=1", "-disablewallet"]
+        self.legacy_args = [*self.common_args, "-flowmeshtransport=legacy"]
         self.fm_ports = [p2p_port(4), p2p_port(5)]
         self.occupied_port = p2p_port(6)
         self.independent_args = [
@@ -33,10 +34,10 @@ class FlowMeshNetworkPolicyTest(BitcoinTestFramework):
              f"-flowmeshconnect=127.0.0.1:{self.fm_ports[1 - index]}"]
             for index in range(2)
         ]
-        self.extra_args = [*self.independent_args, self.common_args]
+        self.extra_args = [*self.independent_args, self.legacy_args]
 
     @staticmethod
-    def check_legacy_default(node):
+    def check_explicit_legacy(node):
         status = node.getflowmeshnetworkinfo()
         assert_equal(status["mode"], "legacy")
         assert_equal(status["legacy_enabled"], True)
@@ -73,7 +74,7 @@ class FlowMeshNetworkPolicyTest(BitcoinTestFramework):
         independent0, independent1, legacy = self.nodes
         self.log.info("Independent paired channels are observable without a wallet or FN keys")
         self.wait_for_independent_pair()
-        self.check_legacy_default(legacy)
+        self.check_explicit_legacy(legacy)
         for node in self.nodes:
             delivery = node.getflowmeshdeliveryinfo()
             assert_equal(delivery["remote_receipt_proven"], False)
@@ -92,7 +93,7 @@ class FlowMeshNetworkPolicyTest(BitcoinTestFramework):
         peer.peer_disconnect()
         peer.wait_for_disconnect()
 
-        self.log.info("Default legacy mode retains its negotiated-service framing policy")
+        self.log.info("Explicit legacy mode retains its negotiated-service framing policy")
         legacy_peer = legacy.add_p2p_connection(P2PInterface())
         legacy_peer.send_without_ping(msg_generic(b"fmprop", b""))
         legacy_peer.send_without_ping(msg_generic(b"fmprop", b""))
@@ -151,7 +152,7 @@ class FlowMeshNetworkPolicyTest(BitcoinTestFramework):
         self.start_node(2)
         self.connect_nodes(2, 1)
         self.sync_all()
-        self.check_legacy_default(legacy)
+        self.check_explicit_legacy(legacy)
         self.log.info("Walletless independent-network policy and B3 failure-isolation smoke test passed")
 
 

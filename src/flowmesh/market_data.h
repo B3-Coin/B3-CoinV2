@@ -131,6 +131,14 @@ struct MarketData {
     ClearingEngine::CurvePage liquidity;
     std::optional<MarketAccountData> account;
     MarketHistoryPage history;
+    //! Public-client verification observations; never serialized into state roots.
+    bool remote{false};
+    bool certificate_verified{false};
+    bool account_state_verified{false};
+    bool execution_result_verified{false};
+    bool b3_checkpoint_confirmed{false};
+    bool event_gap{false};
+    std::string endpoint;
 };
 
 } // namespace flowmesh

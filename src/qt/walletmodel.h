@@ -192,6 +192,7 @@ private:
     // Cache some values to be able to detect changes
     interfaces::WalletBalances m_cached_balances;
     std::vector<interfaces::WalletAssetBalance> m_cached_asset_balances;
+    uint64_t m_cached_asset_metadata_generation{0};
     bool m_force_asset_balance_refresh{false};
     EncryptionStatus cachedEncryptionStatus{Unencrypted};
     QTimer* timer;

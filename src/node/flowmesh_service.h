@@ -27,6 +27,12 @@ class PeerManager;
 
 namespace node {
 
+/** Engine-free B3 authority lookup. Uses mandatory chain indexes only, never
+ * a FlowMesh service, signer, execution store or microblock history. */
+std::optional<flowmesh::ActiveFnBlsSeatSet> ResolveFlowMeshClientSeats(
+    ChainstateManager& chainman, const flowmesh::ClientEvidencePins& pins,
+    const flowmesh::ProductionEntryCore& entry, std::string& error);
+
 /** Public, chain-derived identity of one production FlowMesh v1 market. */
 struct FlowMeshServiceMarket {
     uint256 domain;
@@ -143,6 +149,17 @@ public:
         const flowmesh::MarketId& market_id,
         const std::optional<flowmesh::AccountId>& account,
         const flowmesh::MarketDataQuery& query, std::string& error) const;
+    std::optional<flowmesh::ClientStateEvidence> ClientSnapshot(
+        const flowmesh::MarketId& market_id, std::string& error) const;
+    std::optional<std::vector<unsigned char>> ClientCertifiedEntry(
+        const flowmesh::MarketId& market_id, uint64_t sequence, std::string& error) const;
+    flowmesh::ClientEventPage ClientEvents(
+        const std::optional<flowmesh::ClientEventCursor>& after,
+        const std::optional<flowmesh::MarketId>& market,
+        const std::optional<flowmesh::AccountId>& account,
+        size_t limit = flowmesh::CLIENT_EVENT_PAGE_MAX) const;
+    std::optional<flowmesh::ClientEvent> ClientActionStatus(
+        const flowmesh::MarketId& market_id, const uint256& action_id) const;
 
     bool SubmitLocalAction(const flowmesh::MarketId& market_id,
                            const flowmesh::Action& action,

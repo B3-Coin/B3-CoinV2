@@ -7,12 +7,14 @@
 #include <chainparams.h>
 #include <consensus/era.h>
 #include <core_io.h>
+#include <interfaces/chain.h>
 #include <interfaces/wallet.h>
 #include <key.h>
 #include <modern/asset.h>
 #include <modern/asset_output.h>
 #include <modern/asset_validation.h>
 #include <modern/bridge_asset.h>
+#include <node/asset_metadata.h>
 #include <streams.h>
 #include <rpc/request.h>
 #include <rpc/server.h>
@@ -29,6 +31,24 @@
 #include <boost/signals2/connection.hpp>
 
 #include <algorithm>
+
+namespace node {
+struct AssetMetadataCacheTestAccess {
+    static bool Add(AssetMetadataCache& cache, const uint256& asset,
+                    const modern::AssetMetadataProof& proof)
+    {
+        return cache.Remember(asset, proof);
+    }
+
+    static void InjectUnchecked(AssetMetadataCache& cache, const uint256& asset,
+                                const modern::AssetMetadataProof& proof)
+    {
+        // Fault injection only: production insertion always uses Remember.
+        LOCK(cache.m_mutex);
+        cache.m_proofs.insert_or_assign(asset, proof);
+    }
+};
+} // namespace node
 
 namespace wallet {
 RPCHelpMan setassetmetadata();
@@ -176,6 +196,84 @@ BOOST_AUTO_TEST_CASE(reviewed_registry_precision_is_verified_and_chain_scoped)
     BOOST_REQUIRE(ConfiguredAssetMetadata(Params().GetConsensus(), modern::NativeAsset()));
 }
 
+BOOST_AUTO_TEST_CASE(cusd_registry_migrates_existing_local_metadata_without_wallet_load_error)
+{
+    const auto asset{*uint256::FromHex("929d3345f4bc08683dabce49cbca6f79cf646621e1f18342713f975dc2111ade")};
+    const AssetMetadataProof proof{
+        COutPoint{Txid::FromUint256(*uint256::FromHex("97976c28709507dc443ecf07d6bb8caf1202688f18e102a5004acf34fb130800")), 1},
+        10'000'000'000, 6};
+    BOOST_REQUIRE(ProofId(proof) == asset);
+    auto params{Params().GetConsensus()};
+    const auto domain{AssetMetadataDomain(params).value()};
+    const auto metadata{ConfiguredAssetMetadata(params, asset)};
+    BOOST_REQUIRE(metadata);
+    BOOST_CHECK_EQUAL(metadata->display_name, "cUSD Unbacked Test");
+    BOOST_CHECK_EQUAL(metadata->ticker, "cUSD");
+    BOOST_CHECK_EQUAL(metadata->decimals.value(), 6);
+    BOOST_CHECK_EQUAL(metadata->source, "bundled-registry");
+    BOOST_CHECK(metadata->test_only);
+    params.hashGenesisBlock = uint256::ONE;
+    BOOST_CHECK(!ConfiguredAssetMetadata(params, asset));
+
+    CWallet previous{nullptr, "previous-cusd", CreateMockableWalletDatabase()};
+    WalletBatch batch{previous.GetDatabase()};
+    BOOST_REQUIRE(batch.WriteWalletFlags(WALLET_FLAG_DESCRIPTORS));
+    // An older release allowed this exact asset's verified wallet-local label.
+    // Simulate its existing database rather than invoking today's override guard.
+    BOOST_REQUIRE(batch.WriteAssetMetadata(domain, asset, {"Old cUSD Label", "cUSD", proof}));
+    CWallet restored{nullptr, "restored-cusd", DuplicateMockDatabase(previous.GetDatabase())};
+    BOOST_REQUIRE(WalletBatch{restored.GetDatabase()}.LoadWallet(&restored) == DBErrors::LOAD_OK);
+    {
+        LOCK(restored.cs_wallet);
+        const auto resolved{restored.GetAssetMetadata(asset)};
+        BOOST_CHECK_EQUAL(resolved.display_name, "cUSD Unbacked Test");
+        BOOST_CHECK_EQUAL(resolved.ticker, "cUSD");
+        BOOST_CHECK_EQUAL(resolved.decimals.value(), 6);
+        BOOST_CHECK_EQUAL(resolved.source, "bundled-registry");
+        BOOST_CHECK(resolved.test_only);
+        BOOST_CHECK(restored.mapWallet.empty());
+        BOOST_CHECK(restored.m_asset_genesis.empty());
+        BOOST_CHECK(restored.m_asset_metadata.empty());
+        std::string error;
+        BOOST_CHECK(!restored.SetAssetMetadata(asset, {"Another Label", "OTHER", proof}, error));
+        error.clear();
+        BOOST_CHECK(!restored.ClearAssetMetadata(asset, error));
+        BOOST_CHECK(error.empty());
+    }
+    CWallet reloaded{nullptr, "reloaded-cusd", DuplicateMockDatabase(restored.GetDatabase())};
+    BOOST_REQUIRE(WalletBatch{reloaded.GetDatabase()}.LoadWallet(&reloaded) == DBErrors::LOAD_OK);
+    {
+        LOCK(reloaded.cs_wallet);
+        BOOST_CHECK_EQUAL(reloaded.GetAssetMetadata(asset).ticker, "cUSD");
+        BOOST_CHECK(reloaded.GetAssetMetadata(asset).test_only);
+    }
+
+    // Becoming bundled must not turn a corrupt old proof into a valid record.
+    auto wrong{proof};
+    ++wrong.decimals;
+    BOOST_REQUIRE(batch.WriteAssetMetadata(domain, asset, {"Old cUSD Label", "cUSD", wrong}));
+    CWallet corrupt{nullptr, "corrupt-cusd", DuplicateMockDatabase(previous.GetDatabase())};
+    BOOST_CHECK(WalletBatch{corrupt.GetDatabase()}.LoadWallet(&corrupt) == DBErrors::NONCRITICAL_ERROR);
+    LOCK(corrupt.cs_wallet);
+    BOOST_CHECK(corrupt.m_asset_metadata.empty());
+    BOOST_CHECK_EQUAL(corrupt.GetAssetMetadata(asset).decimals.value(), 6);
+    BOOST_CHECK(corrupt.GetAssetMetadata(asset).test_only);
+}
+
+BOOST_AUTO_TEST_CASE(unknown_asset_without_chain_or_issuance_stays_unknown)
+{
+    CWallet wallet{nullptr, "unknown", CreateMockableWalletDatabase()};
+    LOCK(wallet.cs_wallet);
+    const auto metadata{wallet.GetAssetMetadata(ProofId(TestProof()))};
+    BOOST_CHECK(!metadata.decimals);
+    BOOST_CHECK(metadata.display_name.empty());
+    BOOST_CHECK(metadata.ticker.empty());
+    BOOST_CHECK_EQUAL(metadata.source, "unknown");
+    BOOST_CHECK(!metadata.test_only);
+    BOOST_CHECK(wallet.m_asset_genesis.empty());
+    BOOST_CHECK(wallet.m_asset_metadata.empty());
+}
+
 BOOST_AUTO_TEST_CASE(wallet_learning_local_import_restart_clear_and_write_failure)
 {
     const auto proof{TestProof()};
@@ -299,6 +397,151 @@ struct AssetMetadataRpcSetup : WalletTestingSetup {
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(asset_metadata_rpc_tests, AssetMetadataRpcSetup)
+
+BOOST_AUTO_TEST_CASE(transfer_only_recipient_uses_node_precision_without_importing_issuance)
+{
+    const auto proof{TestProof()};
+    const auto asset{ProofId(proof)};
+    BOOST_REQUIRE(!ConfiguredAssetMetadata(Params().GetConsensus(), asset));
+    CKey key;
+    key.MakeNewKey(true);
+    const CScript owner{GetScriptForDestination(PKHash{key.GetPubKey()})};
+    CMutableTransaction transfer;
+    transfer.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 8});
+    transfer.vout.push_back(modern::MakeAssetOwnerOutput(asset, 12'345'678,
+                                                       modern::PolicyType::OWNER, owner).value());
+    const auto received{MakeTransactionRef(transfer)};
+    const auto block{uint256{2}};
+    const int height{Consensus::LegacyFinalHeight(Params().GetConsensus()).value() + 10};
+    {
+        LOCK(m_wallet.cs_wallet);
+        auto* legacy{m_wallet.GetOrCreateLegacyDataSPKM()};
+        BOOST_REQUIRE(legacy);
+        BOOST_REQUIRE(legacy->LoadKey(key, key.GetPubKey()));
+        m_wallet.CacheNewScriptPubKeys({owner}, legacy);
+        BOOST_REQUIRE(m_wallet.AddToWallet(received, TxStateConfirmed{block, height, 1}));
+        m_wallet.SetLastBlockProcessed(height, block);
+        BOOST_REQUIRE_EQUAL(m_wallet.mapWallet.size(), 1U);
+        BOOST_CHECK(m_wallet.mapWallet.contains(received->GetHash()));
+        BOOST_CHECK(m_wallet.m_asset_genesis.empty());
+        BOOST_CHECK(m_wallet.m_asset_metadata.empty());
+    }
+    UniValue filter{UniValue::VARR};
+    filter.push_back(asset.GetHex());
+    const auto before{Call(getwalletassets(), filter)["assets"]};
+    BOOST_REQUIRE_EQUAL(before.size(), 1U);
+    BOOST_CHECK(!before[0]["precision_known"].get_bool());
+    const auto interface{interfaces::MakeWallet(context, wallet_alias)};
+    const auto initial_generation{interface->assetMetadataGeneration()};
+
+    // Populate the node's public cache, not the recipient's wallet history.
+    // No background scan is started by this focused wallet/interface test.
+    m_node.asset_metadata = std::make_unique<node::AssetMetadataCache>(*m_node.chainman, m_path_root);
+    BOOST_REQUIRE(node::AssetMetadataCacheTestAccess::Add(*m_node.asset_metadata, asset, proof));
+    BOOST_REQUIRE(m_node.chain->assetMetadataProof(asset));
+    BOOST_CHECK(interface->assetMetadataGeneration() > initial_generation);
+    const auto assets{Call(getwalletassets(), filter)["assets"]};
+    BOOST_REQUIRE_EQUAL(assets.size(), 1U);
+    BOOST_CHECK(assets[0]["precision_known"].get_bool());
+    BOOST_CHECK_EQUAL(assets[0]["decimals"].getInt<int>(), 6);
+    BOOST_CHECK_EQUAL(assets[0]["metadata_source"].get_str(), "node-issuance");
+    BOOST_CHECK(assets[0]["name"].get_str().empty());
+    BOOST_CHECK(assets[0]["ticker"].get_str().empty());
+    BOOST_CHECK(!assets[0]["test_only"].get_bool());
+    BOOST_CHECK_EQUAL(assets[0]["confirmed"].getInt<int64_t>(), 12'345'678);
+    const auto balances{interface->getAssetBalances()};
+    BOOST_REQUIRE_EQUAL(balances.size(), 1U);
+    BOOST_CHECK_EQUAL(balances[0].decimals.value(), 6);
+    BOOST_CHECK_EQUAL(balances[0].metadata_source, "node-issuance");
+    BOOST_CHECK_EQUAL(balances[0].confirmed, 12'345'678);
+    BOOST_CHECK(balances[0].display_name.empty());
+    BOOST_CHECK(balances[0].ticker.empty());
+    BOOST_CHECK(!balances[0].is_test_asset);
+    {
+        LOCK(m_wallet.cs_wallet);
+        BOOST_CHECK_EQUAL(m_wallet.mapWallet.size(), 1U);
+        BOOST_CHECK(m_wallet.m_asset_genesis.empty());
+        BOOST_CHECK(m_wallet.m_asset_metadata.empty());
+        std::string error;
+        BOOST_REQUIRE(m_wallet.SetAssetMetadata(asset, {"Recipient Label", "RCPT", proof}, error));
+        BOOST_CHECK_EQUAL(m_wallet.GetAssetMetadata(asset).source, "local-registry");
+        BOOST_CHECK_EQUAL(m_wallet.GetAssetMetadata(asset).ticker, "RCPT");
+        BOOST_REQUIRE(m_wallet.ClearAssetMetadata(asset, error));
+        BOOST_CHECK_EQUAL(m_wallet.GetAssetMetadata(asset).source, "node-issuance");
+        BOOST_CHECK_EQUAL(m_wallet.GetAssetMetadata(asset).decimals.value(), 6);
+    }
+    const auto cleared{Call(getwalletassets(), filter)["assets"]};
+    BOOST_CHECK(cleared[0]["precision_known"].get_bool());
+    BOOST_CHECK(cleared[0]["name"].get_str().empty());
+    BOOST_CHECK_EQUAL(cleared[0]["confirmed"].getInt<int64_t>(), 12'345'678);
+    CWallet later{m_node.chain.get(), "later-recipient", CreateMockableWalletDatabase()};
+    LOCK(later.cs_wallet);
+    BOOST_CHECK(later.mapWallet.empty());
+    BOOST_CHECK(later.m_asset_genesis.empty());
+    BOOST_CHECK(later.m_asset_metadata.empty());
+    BOOST_CHECK_EQUAL(later.GetAssetMetadata(asset).source, "node-issuance");
+    BOOST_CHECK_EQUAL(later.GetAssetMetadata(asset).decimals.value(), 6);
+}
+
+BOOST_AUTO_TEST_CASE(node_precision_cache_and_wallet_reject_malformed_and_wrong_domain_proofs)
+{
+    const auto proof{TestProof()};
+    const auto asset{ProofId(proof)};
+    m_node.asset_metadata = std::make_unique<node::AssetMetadataCache>(*m_node.chainman, m_path_root);
+    const auto generation{m_node.chain->assetMetadataGeneration()};
+    std::vector<AssetMetadataProof> invalid;
+    auto changed{proof};
+    ++changed.decimals;
+    invalid.push_back(changed);
+    changed = proof;
+    changed.decimals = 19;
+    invalid.push_back(changed);
+    changed = proof;
+    changed.max_supply = 0;
+    invalid.push_back(changed);
+    changed = proof;
+    changed.issuance_prevout.SetNull();
+    invalid.push_back(changed);
+    for (const auto& candidate : invalid) {
+        BOOST_CHECK(!node::AssetMetadataCacheTestAccess::Add(*m_node.asset_metadata, asset, candidate));
+        BOOST_CHECK(!m_node.chain->assetMetadataProof(asset));
+        LOCK(m_wallet.cs_wallet);
+        BOOST_CHECK(!m_wallet.GetAssetMetadata(asset).decimals);
+        BOOST_CHECK_EQUAL(m_wallet.GetAssetMetadata(asset).source, "unknown");
+    }
+    const auto other_chain_asset{modern::AssetIdV1(uint256::ONE, proof.issuance_prevout,
+        modern::AssetGenesisCommitment({.max_supply = proof.max_supply, .decimals = proof.decimals}))};
+    BOOST_CHECK(!node::AssetMetadataCacheTestAccess::Add(*m_node.asset_metadata, other_chain_asset, proof));
+    BOOST_CHECK(!m_node.chain->assetMetadataProof(other_chain_asset));
+    BOOST_CHECK_EQUAL(m_node.chain->assetMetadataGeneration(), generation);
+    {
+        LOCK(m_wallet.cs_wallet);
+        BOOST_CHECK(!m_wallet.GetAssetMetadata(other_chain_asset).decimals);
+        BOOST_CHECK(m_wallet.m_asset_genesis.empty());
+        BOOST_CHECK(m_wallet.m_asset_metadata.empty());
+    }
+
+    // Even if the chain interface supplies a corrupt cache entry, the wallet
+    // must independently bind its proof to the requested asset and this chain.
+    for (const auto& candidate : invalid) {
+        node::AssetMetadataCacheTestAccess::InjectUnchecked(*m_node.asset_metadata, asset, candidate);
+        const auto supplied{m_node.chain->assetMetadataProof(asset)};
+        BOOST_REQUIRE(supplied);
+        BOOST_CHECK_EQUAL(supplied->max_supply, candidate.max_supply);
+        BOOST_CHECK_EQUAL(supplied->decimals, candidate.decimals);
+        LOCK(m_wallet.cs_wallet);
+        const auto metadata{m_wallet.GetAssetMetadata(asset)};
+        BOOST_CHECK(!metadata.decimals);
+        BOOST_CHECK_EQUAL(metadata.source, "unknown");
+        BOOST_CHECK(metadata.display_name.empty());
+        BOOST_CHECK(metadata.ticker.empty());
+    }
+    node::AssetMetadataCacheTestAccess::InjectUnchecked(*m_node.asset_metadata, other_chain_asset, proof);
+    BOOST_REQUIRE(m_node.chain->assetMetadataProof(other_chain_asset));
+    LOCK(m_wallet.cs_wallet);
+    BOOST_CHECK(!m_wallet.GetAssetMetadata(other_chain_asset).decimals);
+    BOOST_CHECK_EQUAL(m_wallet.GetAssetMetadata(other_chain_asset).source, "unknown");
+}
 
 BOOST_AUTO_TEST_CASE(local_registry_rpc_matches_wallet_interface_and_notifies_without_new_tip)
 {
