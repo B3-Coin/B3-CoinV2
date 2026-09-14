@@ -10,7 +10,7 @@ import sys
 from test_framework.authproxy import JSONRPCException
 from test_framework.descriptors import descsum_create
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error
 
 tool_path=pathlib.Path(__file__).resolve().parents[2]/'contrib/wallet-reconcile.py'
 spec=importlib.util.spec_from_file_location('reconcile',tool_path)
@@ -27,14 +27,29 @@ class WalletReadOnlyReconcile(BitcoinTestFramework):
 
     def skip_test_if_missing_module(self):self.skip_if_no_wallet()
 
+    def assert_engine_off(self, node, wallet):
+        # Validator-info also requests remote markets in the integrated client.
+        # This endpoint-free wallet fixture must inspect local-only status, not
+        # configure an endpoint or enable an operator merely to read that RPC.
+        client=wallet.getflowmeshclientinfo()
+        assert_equal(client['backend'],'remote')
+        assert_equal(client['engine_enabled'],False)
+        assert_equal(client['endpoints'],[])
+        assert_equal(client['active_endpoint'],'')
+        assert_raises_rpc_error(-10,'FlowMesh service is not available yet',node.getflowmeshnetworkinfo)
+        # That specific error establishes a missing node-global service, not
+        # merely an idle worker: without it no local FN keys can be armed.
+        assert 'B3_FLOWMESH' not in node.getnetworkinfo()['localservicesnames']
+        assert not (node.chain_path/'flowmesh').exists()
+        startup=(node.chain_path/'debug.log').read_text()
+        assert 'FlowMesh validator engine disabled; HTTPS trading client configured with 0 endpoints' in startup
+        assert 'FlowMesh production service started' not in startup
+
     def run_test(self):
         node=self.nodes[0]
         node.createwallet('generated-owner')
         owner=node.get_wallet_rpc('generated-owner')
-        validator=owner.getflowmeshvalidatorinfo()
-        assert_equal(validator['service_enabled'],False)
-        assert_equal(validator['service_running'],False)
-        assert_equal(validator['armed'],False)
+        self.assert_engine_off(node,owner)
         mining=owner.getnewaddress('', 'legacy')
         self.generatetoaddress(node,101,mining)
         target=owner.getnewaddress('', 'legacy')
@@ -99,10 +114,7 @@ class WalletReadOnlyReconcile(BitcoinTestFramework):
         self.restart_node(0)
         if 'generated-owner' not in node.listwallets():node.loadwallet('generated-owner')
         assert_equal(node.get_wallet_rpc('generated-owner').listdescriptors(False),before_restart)
-        validator=node.get_wallet_rpc('generated-owner').getflowmeshvalidatorinfo()
-        assert_equal(validator['service_enabled'],False)
-        assert_equal(validator['service_running'],False)
-        assert_equal(validator['armed'],False)
+        self.assert_engine_off(node,node.get_wallet_rpc('generated-owner'))
         # Exercise the shipped diagnostic entry point, including real CLI JSON
         # conversion and protected output creation, not only an in-process RPC shim.
         cli=pathlib.Path(self.config['environment']['BUILDDIR'])/'bin'/('b3coin-cli'+self.config['environment']['EXEEXT'])
