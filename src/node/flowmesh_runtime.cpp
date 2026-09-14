@@ -1174,9 +1174,9 @@ bool RetainCandidateBeforeSigning(Market& market,
 }
 
 template <typename Market>
-void ClientActionEvent(Market& market, const flowmesh::ClientEventKind kind,
-                       const flowmesh::Action& action, std::string reason = {},
-                       const flowmesh::ProductionEntryCore* certified = nullptr)
+flowmesh::ClientEvent MakeClientActionEvent(Market& market, const flowmesh::ClientEventKind kind,
+                                           const flowmesh::Action& action, std::string reason,
+                                           const flowmesh::ProductionEntryCore* certified)
 {
     flowmesh::ClientEvent event;
     event.market_id = market.market_id;
@@ -1192,7 +1192,15 @@ void ClientActionEvent(Market& market, const flowmesh::ClientEventKind kind,
         event.signed_action_hash = Hash(*bytes);
     }
     event.reason = std::move(reason);
-    market.client_events.Append(std::move(event));
+    return event;
+}
+
+template <typename Market>
+void ClientActionEvent(Market& market, const flowmesh::ClientEventKind kind,
+                       const flowmesh::Action& action, std::string reason = {},
+                       const flowmesh::ProductionEntryCore* certified = nullptr)
+{
+    market.client_events.Append(MakeClientActionEvent(market, kind, action, std::move(reason), certified));
 }
 
 template <typename Market>
@@ -1981,6 +1989,11 @@ bool FlowMeshRuntime::InitializeMarket(
     }
 
     auto market{std::make_unique<Market>(config, m_config, m_client_events)};
+    // Rebuild only bounded inclusion lookup hints during the existing verified
+    // history replay. Never resubmit actions or scan history on status requests.
+    // Publish after the WHOLE market validates: AddMarket may run on a live
+    // service, and a failed initialization must not leak partial lookup events.
+    std::deque<flowmesh::ClientEvent> restored_client_actions;
     uint256 previous_hash;
     uint64_t expected_effect_start{0};
     for (uint64_t sequence{0}; sequence < config.next_sequence; ++sequence) {
@@ -2005,6 +2018,12 @@ bool FlowMeshRuntime::InitializeMarket(
         market->previous_anchor = stored->entry.anchor;
         market->committed_anchors[{stored->entry.anchor.height,
                                    stored->entry.anchor.hash}] = sequence;
+        for (const auto& action : stored->entry.actions) {
+            if (restored_client_actions.size() == flowmesh::CLIENT_EVENT_CAPACITY) restored_client_actions.pop_front();
+            restored_client_actions.push_back(MakeClientActionEvent(*market,
+                flowmesh::ClientEventKind::CERTIFIED_INCLUDED, action,
+                "restored semantic inclusion only; execution outcome not established by this event", &stored->entry));
+        }
         if (sequence + 1 == config.next_sequence) {
             market->client_head = flowmesh::ProductionCertifiedEnvelope{
                 stored->entry, stored->certificate};
@@ -2058,6 +2077,7 @@ bool FlowMeshRuntime::InitializeMarket(
         }
     }
     RoundEntered(*market, "market_initialized");
+    for (auto& event : restored_client_actions) m_client_events.Append(std::move(event));
     m_markets.emplace(config.market_id, std::move(market));
     return true;
 }

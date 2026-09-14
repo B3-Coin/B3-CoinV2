@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 
 namespace {
 
@@ -280,20 +281,26 @@ BOOST_AUTO_TEST_CASE(action_status_does_not_regress_when_queue_observation_arriv
     BOOST_CHECK(!log.ActionStatus(event.market_id, Filled(9)));
 }
 
-BOOST_AUTO_TEST_CASE(runtime_pool_events_atomic_certified_snapshot_and_restart_unknown)
+BOOST_AUTO_TEST_CASE(runtime_certified_action_status_recovers_after_restart_without_resubmission)
 {
     EvidenceFixture f;
     EvidenceChain chain{f};
     NoSeatKeys keys;
     node::SteadyFlowMeshRuntimeClock clock;
-    node::FlowMeshProductionStore store{DBParams{.path = m_path_root / "client-evidence", .cache_bytes = 1 << 20, .memory_only = true}};
+    node::FlowMeshProductionStore store{DBParams{.path = m_path_root / "client-evidence", .cache_bytes = 1 << 20}};
     std::string error;
     BOOST_REQUIRE(store.OpenForMarket(f.pins.domain, f.pins.market_id, f.seats, f.state.Root(), error));
     node::FlowMeshRuntimeConfig config;
     config.chain = &chain;
     config.keys = &keys;
     config.clock = &clock;
-    config.relay = [](node::FlowMeshRuntimeRelay) { return node::FlowMeshRelayResult{}; };
+    std::atomic<size_t> action_relays{0}, signing_relays{0};
+    config.relay = [&](node::FlowMeshRuntimeRelay relay) {
+        if (relay.message.kind == flowmesh::WireMessageKind::ACTION) ++action_relays;
+        if (relay.message.kind == flowmesh::WireMessageKind::PROPOSAL ||
+            relay.message.kind == flowmesh::WireMessageKind::ATTESTATION) ++signing_relays;
+        return node::FlowMeshRelayResult{};
+    };
     node::FlowMeshRuntimeMarketConfig market{f.pins.domain, f.pins.market_id, Filled(9), f.seats, f.state};
     market.store = &store;
     node::FlowMeshRuntime runtime{config, {market}};
@@ -304,6 +311,9 @@ BOOST_AUTO_TEST_CASE(runtime_pool_events_atomic_certified_snapshot_and_restart_u
     action.sequence = 7;
     action.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_BID);
     BOOST_REQUIRE(flowmesh::SignAction(f.account_key, f.pins.domain, f.pins.execution_config_id, action));
+    const auto original_bytes{flowmesh::EncodeProductionActionPayload(action)};
+    BOOST_REQUIRE(original_bytes);
+    const auto original_id{action.Id()};
     BOOST_REQUIRE(runtime.SubmitLocalAction(f.pins.market_id, action) == flowmesh::QueueResult::ACCEPTED);
     BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{5}));
     const auto admitted{runtime.ClientActionStatus(f.pins.market_id, action.Id())};
@@ -338,20 +348,62 @@ BOOST_AUTO_TEST_CASE(runtime_pool_events_atomic_certified_snapshot_and_restart_u
     BOOST_CHECK(snapshot->certified_payload == *payload);
     BOOST_CHECK(runtime.ClientActionStatus(f.pins.market_id, action.Id())->kind == flowmesh::ClientEventKind::CERTIFIED_INCLUDED);
     BOOST_CHECK(runtime.ClientCertifiedEntry(f.pins.market_id, 0, error) == payload);
+    // Move the certified head past the target instruction. Recovery must find
+    // its old certificate, not attribute it to the latest whole-state proof.
+    auto later{action};
+    later.sequence = 8;
+    later.type = static_cast<uint8_t>(flowmesh::ActionType::SUBMIT_BID);
+    later.curve = {{6, 1}, {7, 0}};
+    BOOST_REQUIRE(flowmesh::SignAction(f.account_key, f.pins.domain, f.pins.execution_config_id, later));
+    const std::array<flowmesh::Action, 1> later_actions{later};
+    const auto next{flowmesh::BuildProductionExecutionEntry(built->next_state, f.pins.domain, f.pins.market_id,
+        f.seats, gate, 1, built->entry.effect_count, built->entry.GetHash(), f.anchor,
+        {130, f.anchor, &chain}, Filled(9), later_actions, nullptr, check)};
+    BOOST_REQUIRE(next);
+    const flowmesh::ProductionCertifiedEnvelope later_certified{next->entry, f.Certify(next->entry)};
+    const auto later_payload{flowmesh::EncodeProductionCertifiedPayload(later_certified, 4)};
+    BOOST_REQUIRE(later_payload);
+    BOOST_REQUIRE(runtime.EnqueueWireMessage(7, {flowmesh::WireMessageKind::CERTIFICATE,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.pins.market_id, 0, 1}, *later_payload}) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{5}));
     const auto cursor{snapshot->cursor};
     runtime.Stop();
-    market.state = built->next_state;
-    market.next_sequence = 1;
-    market.next_effect_index = built->entry.effect_count;
-    market.last_microblock_hash = built->entry.GetHash();
+    const auto action_relays_before{action_relays.load()};
+    const auto signing_relays_before{signing_relays.load()};
+    market.state = next->next_state;
+    market.next_sequence = 2;
+    market.next_effect_index = next->entry.effect_start + next->entry.effect_count;
+    market.last_microblock_hash = next->entry.GetHash();
     node::FlowMeshRuntime restarted{config, {market}};
     BOOST_REQUIRE_MESSAGE(restarted.Start(error), error);
     const auto restored{restarted.ClientSnapshot(f.pins.market_id, error)};
     BOOST_REQUIRE(restored);
-    BOOST_CHECK(restored->certified_payload == *payload);
+    BOOST_CHECK(restored->certified_payload == *later_payload);
     BOOST_CHECK(restarted.ClientEvents(cursor, f.pins.market_id, f.account).gap);
-    BOOST_CHECK(!restarted.ClientActionStatus(f.pins.market_id, action.Id()));
+    // The old proof is durably available even before the action lookup repair.
+    const auto old_payload{restarted.ClientCertifiedEntry(f.pins.market_id, 0, error)};
+    BOOST_REQUIRE_MESSAGE(old_payload, error);
+    BOOST_CHECK(*old_payload == *payload);
+    const auto old_state{flowmesh::EncodeClientState(built->next_state, error)};
+    BOOST_REQUIRE(old_state);
+    BOOST_REQUIRE(f.Verify({*old_payload, *old_state, restored->cursor}, error));
+    const auto recovered{restarted.ClientActionStatus(f.pins.market_id, original_id)};
+    BOOST_CHECK_MESSAGE(recovered, "Stored certificate is available, but restarted action lookup lost certified inclusion");
+    if (recovered) {
+        BOOST_CHECK(recovered->kind == flowmesh::ClientEventKind::CERTIFIED_INCLUDED);
+        BOOST_CHECK(recovered->action_id == original_id && recovered->account_id == f.account);
+        BOOST_CHECK_EQUAL(recovered->account_sequence, 7U);
+        BOOST_CHECK_EQUAL(recovered->microblock_sequence, 0U);
+        BOOST_CHECK(recovered->microblock_hash == built->entry.GetHash());
+    }
+    BOOST_CHECK(!restarted.ClientActionStatus(f.pins.market_id, Filled(123)));
+    BOOST_CHECK(!restarted.ClientActionStatus(Filled(124), original_id));
+    BOOST_CHECK(!restarted.ClientActionStatus(f.pins.market_id, bad.Id()));
+    BOOST_CHECK(flowmesh::EncodeProductionActionPayload(action) == original_bytes);
+    BOOST_CHECK(action.Id() == original_id && action.sequence == 7);
     restarted.Stop();
+    BOOST_CHECK_EQUAL(action_relays.load(), action_relays_before);
+    BOOST_CHECK_EQUAL(signing_relays.load(), signing_relays_before);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
