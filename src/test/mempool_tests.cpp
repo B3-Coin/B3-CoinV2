@@ -7,6 +7,7 @@
 #include <test/util/txmempool.h>
 #include <txmempool.h>
 #include <util/time.h>
+#include <util/translation.h>
 
 #include <test/util/setup_common.h>
 
@@ -22,6 +23,44 @@ class MemPoolTest final : public CTxMemPool
 public:
     using CTxMemPool::GetMinFee;
 };
+
+BOOST_AUTO_TEST_CASE(MempoolCheckUsesRepresentableHeight)
+{
+    bilingual_str error;
+    CTxMemPool pool{CTxMemPool::Options{.check_ratio = 1}, error};
+    BOOST_REQUIRE(error.empty());
+    CCoinsView base;
+    CCoinsViewCache coins{&base};
+
+    CMutableTransaction funding;
+    funding.vout.emplace_back(2 * COIN, CScript() << OP_TRUE);
+    const COutPoint input{funding.GetHash(), 0};
+    coins.AddCoin(input, Coin{funding.vout[0], 1, false}, false);
+
+    CMutableTransaction spend;
+    spend.vin.emplace_back(input);
+    spend.vout.emplace_back(COIN, CScript() << OP_TRUE);
+    TestMemPoolEntryHelper entry;
+    TryAddToMempool(pool, entry.Fee(COIN).FromTx(spend));
+    BOOST_REQUIRE_EQUAL(pool.size(), 1U);
+
+    // This must execute the full self-check, not its probabilistic early exit.
+    // INT_MAX in its temporary output view violates B3's 30-bit Coin height.
+    WITH_LOCK(cs_main, pool.check(coins, 2));
+    BOOST_CHECK(coins.HaveCoin(input)); // The diagnostic view must be private.
+    BOOST_CHECK(!coins.HaveCoin(COutPoint{spend.GetHash(), 0}));
+
+    CCoinsViewCache duplicate{&coins};
+    AddCoins(duplicate, CTransaction{spend}, MEMPOOL_HEIGHT);
+    const auto simulated = duplicate.GetCoin(COutPoint{spend.GetHash(), 0});
+    BOOST_REQUIRE(simulated);
+    BOOST_CHECK_EQUAL(uint32_t{simulated->nHeight}, MEMPOOL_HEIGHT);
+    BOOST_CHECK_EQUAL(simulated->out.nValue, COIN);
+    CCoinsViewMemPool with_mempool{&coins, pool};
+    const auto visible = with_mempool.GetCoin(COutPoint{spend.GetHash(), 0});
+    BOOST_REQUIRE(visible);
+    BOOST_CHECK_EQUAL(uint32_t{visible->nHeight}, MEMPOOL_HEIGHT);
+}
 
 BOOST_AUTO_TEST_CASE(MempoolRemoveTest)
 {
