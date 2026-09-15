@@ -2,7 +2,7 @@ packages:=
 
 boost_packages = boost
 
-libevent_packages = libevent
+libevent_packages = libevent openssl
 
 qrencode_linux_packages = qrencode
 qrencode_darwin_packages = qrencode

@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "ready": false,
+  "profile_id": "client-20260914-review04",
+  "network": "regtest",
+  "regtest_profile": "flowmesh-client-v1",
+  "reason": "HTTPS TEST endpoints and private regtest operators are not provisioned or authorized for this candidate. This locally prepared package is NOT READY for tester handoff."
+}

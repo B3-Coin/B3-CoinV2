@@ -9,6 +9,7 @@
 #include <consensus/amount.h>
 #include <net.h>
 #include <node/finality_signature.h>
+#include <node/flowmesh_delivery.h>
 #include <node/txorphanage.h>
 #include <private_broadcast.h>
 #include <protocol.h>
@@ -169,7 +170,7 @@ public:
      * selects one direct reply (catch-up/control); otherwise the frame is
      * broadcast to capable peers except `exclude_peer` (gossip fanout).
      */
-    virtual void RelayFlowMeshMessage(
+    virtual node::FlowMeshRelayResult RelayFlowMeshMessage(
         const flowmesh::WireMessage& message,
         std::optional<NodeId> peer = std::nullopt,
         std::optional<NodeId> exclude_peer = std::nullopt) = 0;

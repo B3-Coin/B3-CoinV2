@@ -15,6 +15,7 @@
 #include <script/script.h>
 #include <key.h>
 #include <kernel/chain.h> // IWYU pragma: export
+#include <modern/asset_metadata.h>
 #include <modern/flowmesh_checkpoint.h>
 #include <node/types.h>
 #include <primitives/transaction.h>
@@ -276,6 +277,59 @@ struct FlowMeshMarketStatus {
     CAmount base_reserved{0};
     CAmount b3_available{0};
     CAmount b3_reserved{0};
+    //! Client observations, not consensus or certificate fields.
+    bool remote{false};
+    bool certificate_verified{false};
+    bool account_state_verified{false};
+    bool b3_checkpoint_confirmed{false};
+    std::string endpoint;
+};
+
+//! Never equate local queue admission, a network write, or an endpoint reply
+//! with pool admission, certified inclusion, or a successfully executed action.
+struct FlowMeshActionReceipt {
+    uint256 action_id;
+    std::string state{"unknown"};
+    std::string reason;
+    std::string endpoint;
+    bool certificate_verified{false};
+    bool outcome_verified{false};
+    uint256 microblock_hash;
+    uint64_t microblock_sequence{0};
+    //! Locally derived owner of the retained instruction, never an endpoint row.
+    std::optional<uint256> account_id;
+    bool Admitted() const { return state == "queued" || state == "admitted" || state == "certified_inclusion"; }
+};
+
+//! Public, locally retained instruction metadata. Enumerating this view never
+//! queries an endpoint, changes an action, saves an outbox or signs anything.
+struct FlowMeshSavedAction {
+    uint256 market_id, domain, execution_config_id, account_id;
+    FlowMeshActionReceipt receipt;
+    std::optional<uint64_t> sequence;
+    uint8_t action_type{0};
+    //! Read-only economics decoded from the original retained action. No
+    //! presentation preference or token metadata is added to the journal.
+    std::string canonical_side;
+    std::vector<flowmesh::ClearingEngine::Breakpoint> canonical_points;
+    std::string signed_bytes_sha256;
+    uint32_t signed_bytes_size{0};
+    int64_t initial_submission_ms{0};
+    bool may_have_been_sent{false}, previously_certified{false};
+};
+
+struct FlowMeshClientEndpointStatus {
+    std::string url;
+    bool available{false};
+    std::string last_error;
+};
+struct FlowMeshClientStatus {
+    std::string backend{"local"};
+    bool engine_enabled{false};
+    std::string active_endpoint;
+    std::vector<FlowMeshClientEndpointStatus> endpoints;
+    uint64_t event_gaps{0};
+    uint64_t pending_actions{0};
 };
 
 //! Fully encoded, service-selected type-8 record. Bitmap sizing and the
@@ -415,6 +469,17 @@ public:
     //! UI spending preflight may exclude outputs already consumed in the mempool.
     //! The default preserves callers which intentionally inspect conflicting inputs.
     virtual void findCoins(std::map<COutPoint, Coin>& coins, bool exclude_mempool_spent = false) = 0;
+
+    //! Cached immutable precision discovered from public issuance data. No
+    //! block reads, chain locks, synchronization waits, or wallet callbacks:
+    //! callers may hold cs_wallet. Absence never means zero-decimal precision.
+    //! This is preimage knowledge, not a current-inclusion/backing assertion.
+    virtual std::optional<modern::AssetMetadataProof> assetMetadataProof(const uint256& asset) { return std::nullopt; }
+    //! Optional sourced display labels with independently verified precision.
+    //! Cache-only, with no network, disk, chain lock or wallet callback.
+    virtual std::optional<modern::AssetDisplayMetadata> assetDisplayMetadata(const uint256& asset) { return std::nullopt; }
+    //! Cheap cache generation for display refreshes without a new block.
+    virtual uint64_t assetMetadataGeneration() { return 0; }
 
     //! Estimate fraction of total transactions verified if blocks up to
     //! the specified block hash are verified.
@@ -693,6 +758,25 @@ public:
     virtual bool submitFlowMeshAction(const uint256& market_id,
                                       const flowmesh::Action& action,
                                       std::string& error) = 0;
+    virtual FlowMeshActionReceipt submitFlowMeshActionReceipt(const uint256& market_id,
+                                                             const flowmesh::Action& action)
+    {
+        FlowMeshActionReceipt receipt;
+        receipt.action_id = action.Id();
+        receipt.state = submitFlowMeshAction(market_id, action, receipt.reason) ? "queued" : "rejected";
+        return receipt;
+    }
+    virtual FlowMeshActionReceipt flowMeshActionStatus(const uint256& market_id,
+                                                       const uint256& action_id, bool retry = false)
+    {
+        FlowMeshActionReceipt receipt;
+        receipt.action_id = action_id;
+        receipt.reason = "Action receipt lookup is unavailable";
+        return receipt;
+    }
+    virtual FlowMeshClientStatus flowMeshClientStatus() { return {}; }
+    virtual std::vector<FlowMeshSavedAction> flowMeshSavedActions(
+        const uint256& account_id, const std::optional<uint256>& market_id) { return {}; }
     virtual FlowMeshValidatorStatus flowMeshValidatorStatus() = 0;
     //! Optional CAS guard and result are checked/copied under the same service mutex.
     virtual bool armFlowMeshSeatKeys(const std::vector<bls::SecretKey>& keys,

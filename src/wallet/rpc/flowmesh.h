@@ -11,12 +11,16 @@
 #include <vector>
 
 class UniValue;
+class RPCHelpMan;
 namespace interfaces {
 struct FlowMeshVaultOperation;
 struct FlowMeshValidatorStatus;
 }
 
 namespace wallet {
+
+//! Wallet-scoped retained-action RPC; also constructed by startup-schema tests.
+RPCHelpMan listflowmeshactions();
 
 /**
  * Wallet-side admission result for creating a keyless FlowMesh vault output.

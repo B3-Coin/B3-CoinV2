@@ -40,7 +40,7 @@ function(check_evhttp_connection_get_peer target)
   )
 endfunction()
 
-set(_libevent_components core extra)
+set(_libevent_components core extra openssl)
 if(NOT WIN32)
   list(APPEND _libevent_components pthreads)
 endif()

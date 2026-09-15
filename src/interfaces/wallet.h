@@ -241,6 +241,8 @@ public:
      * spendable contains only mature, unlocked outputs this wallet can sign.
      */
     virtual std::vector<WalletAssetBalance> getAssetBalances() { return {}; }
+    //! Memory-only public precision-cache generation; does not scan the wallet.
+    virtual uint64_t assetMetadataGeneration() { return 0; }
 
     //! Get policy-asset balances without blocking the caller.
     virtual bool tryGetAssetBalances(std::vector<WalletAssetBalance>& balances)

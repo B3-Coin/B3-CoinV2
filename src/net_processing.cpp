@@ -479,6 +479,10 @@ struct Peer {
      * rather than bounded by one round-trip per block.
     */
     bool m_legacy_getblocks_in_flight GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    /** Last available block on this peer's discovery path, not necessarily
+     * the active tip. Retained across owner leases so a sparse locator can
+     * traverse known pages and a downloaded fork before it becomes active. */
+    uint256 m_legacy_sync_cursor GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
     /** Ordered block inventory retained from the latest legacy getblocks response. */
     std::deque<uint256> m_legacy_block_queue GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
     /** Deduplicates the queued block inventory, including blocks currently requested. */
@@ -697,7 +701,7 @@ public:
     std::vector<CTransactionRef> AbortPrivateBroadcast(const uint256& id) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void SendPings() override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void RelayFinalitySignatures(std::span<const node::FinalitySig> sigs) override;
-    void RelayFlowMeshMessage(
+    node::FlowMeshRelayResult RelayFlowMeshMessage(
         const flowmesh::WireMessage& message,
         std::optional<NodeId> peer = std::nullopt,
         std::optional<NodeId> exclude_peer = std::nullopt) override
@@ -1001,6 +1005,29 @@ private:
         peer.m_legacy_sync_retry_after = NodeClock::now() + LEGACY_SYNC_PROGRESS_LEASE;
         m_legacy_sync_peer = -1;
         m_legacy_sync_lease = {};
+    }
+
+    /** An index/header alone cannot replace downloading a historical block.
+     * This is availability, not permission to activate an unvalidated fork. */
+    static bool LegacyBlockAvailable(const CBlockIndex* index)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+    {
+        return index && (index->nStatus & BLOCK_HAVE_DATA) &&
+               index->IsValid(BLOCK_VALID_TRANSACTIONS) && index->HaveNumChainTxs();
+    }
+
+    bool AdvanceLegacySyncCursor(Peer& peer, const CBlockIndex* index)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, NetEventsInterface::g_msgproc_mutex)
+    {
+        if (!LegacyBlockAvailable(index)) return false;
+        const CBlockIndex* previous{
+            m_chainman.m_blockman.LookupBlockIndex(peer.m_legacy_sync_cursor)};
+        if (LegacyBlockAvailable(previous) &&
+            (index->nHeight <= previous->nHeight ||
+             index->GetAncestor(previous->nHeight) != previous)) return false;
+        peer.m_legacy_sync_cursor = index->GetBlockHash();
+        // Inventory is not chain progress and must not renew the owner's lease.
+        return true;
     }
 
     const CChainParams& m_chainparams;
@@ -2810,16 +2837,19 @@ void PeerManagerImpl::MaybeFinalityTransport(CNode& node, Peer& peer,
     for (const node::FinalitySig& sig : replay) MakeAndPushMessage(node, NetMsgType::FINSIG, sig);
 }
 
-void PeerManagerImpl::RelayFlowMeshMessage(
+node::FlowMeshRelayResult PeerManagerImpl::RelayFlowMeshMessage(
     const flowmesh::WireMessage& message, std::optional<NodeId> target_peer,
     std::optional<NodeId> exclude_peer)
 {
+    node::FlowMeshRelayResult result;
     flowmesh::WireCheck check;
     const auto encoded{flowmesh::EncodeWireMessage(message, check)};
     if (!encoded) {
         LogDebug(BCLog::NET, "refusing malformed local FlowMesh frame: %s\n",
                  flowmesh::WireCheckName(check));
-        return;
+        result.no_peer_reason = node::FlowMeshDeliveryAdmission::INVALID;
+        result.reason = flowmesh::WireCheckName(check);
+        return result;
     }
 
     std::vector<NodeId> eligible;
@@ -2844,13 +2874,32 @@ void PeerManagerImpl::RelayFlowMeshMessage(
         }
     }
     for (const NodeId id : eligible) {
+        node::FlowMeshPeerAdmission admission{id, node::FlowMeshDeliveryAdmission::DISCONNECTED, "B3 peer disconnected before queue admission"};
         m_connman.ForNode(id, [&](CNode* node) {
             if (!node->fSuccessfullyConnected || node->fDisconnect) return false;
+            if (node->fPauseSend) {
+                admission.admission = node::FlowMeshDeliveryAdmission::FULL;
+                admission.reason = "B3 peer send buffer is backpressured";
+                return false;
+            }
             MakeAndPushMessage(*node, std::string{flowmesh::WireCommand(message.kind)},
                                std::span{*encoded});
+            admission.admission = node::FlowMeshDeliveryAdmission::LEGACY_UNTRACKED;
+            admission.reason = "B3 queue accepted; socket completion is not tracked";
             return true;
         });
+        result.peers.push_back(std::move(admission));
     }
+    if (result.peers.empty()) {
+        result.reason = "No connected B3 peer advertising FlowMesh carriage";
+    } else if (std::all_of(result.peers.begin(), result.peers.end(), [](const auto& admission) {
+        return admission.admission == node::FlowMeshDeliveryAdmission::LEGACY_UNTRACKED;
+    })) {
+        result.no_peer_reason = node::FlowMeshDeliveryAdmission::LEGACY_UNTRACKED;
+    } else {
+        result.no_peer_reason = node::FlowMeshDeliveryAdmission::ADMITTED; // outcomes are per-peer
+    }
+    return result;
 }
 
 void PeerManagerImpl::SendPings()
@@ -3509,6 +3558,9 @@ bool PeerManagerImpl::IsAncestorOfBestHeaderOrTip(const CBlockIndex* header)
 bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer)
 {
     if (WITH_LOCK(cs_main, return IsLegacyPhase())) {
+        // Late replies to a former owner's requests may still be accounted
+        // for, but must not start a second discovery/download window.
+        if (WITH_LOCK(cs_main, return m_legacy_sync_peer != pfrom.GetId())) return false;
         // A legacy B3Coin header cannot establish whether it meets a PoW
         // target or contains a valid stake kernel. Retain the old peer's
         // getblocks inventory and validate full blocks sequentially, with
@@ -3558,7 +3610,20 @@ bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& loc
             LogDebug(BCLog::NET, "Retrying stalled legacy B3Coin getblocks request to peer=%d\n", pfrom.GetId());
             peer.m_legacy_getblocks_in_flight = false;
         }
-        MakeAndPushMessage(pfrom, NetMsgType::GETBLOCKS, locator, uint256{});
+        CBlockLocator next_locator{locator};
+        {
+            LOCK(cs_main);
+            const CBlockIndex* cursor{
+                m_chainman.m_blockman.LookupBlockIndex(peer.m_legacy_sync_cursor)};
+            if (LegacyBlockAvailable(cursor)) {
+                next_locator = GetLocator(cursor);
+            } else {
+                // A later validation failure or pruning cannot turn a stale
+                // cursor into permission to skip unavailable/invalid history.
+                peer.m_legacy_sync_cursor.SetNull();
+            }
+        }
+        MakeAndPushMessage(pfrom, NetMsgType::GETBLOCKS, next_locator, uint256{});
         peer.m_legacy_getblocks_in_flight = true;
         peer.m_legacy_request_time = current_time;
         return true;
@@ -4492,9 +4557,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         // actual services above so AddrMan will not immediately select the
         // same obsolete candidate again, then release automatic full-relay,
         // block-relay, feeler, address-fetch and private-broadcast connections.
-        // Inbound historical peers remain connected so this archival node can
-        // serve them through H, and a manual/addnode connection remains under
-        // the operator's control.
+        // Inbound historical-protocol peers can still bootstrap through H,
+        // including upgraded wallets which advertise 80008 before H. A
+        // separate software-banner check below rejects known obsolete builds.
+        // Manual/addnode connections bypass this automatic-slot policy only.
         if (remote_legacy_protocol &&
             !m_in_legacy_phase.load(std::memory_order_relaxed) &&
             !pfrom.IsInboundConn() &&
@@ -4539,6 +4605,19 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             std::string strSubVer;
             vRecv >> LIMITED_STRING(strSubVer, MAX_SUBVERSION_LENGTH);
             cleanSubVer = SanitizeString(strSubVer);
+        }
+        // Historical B3-Coin v3.x releases identify themselves with this BIP14
+        // prefix (v3.1.2.2: src/version.cpp and src/net.cpp). Retire those
+        // clients after H without denying upgraded B3Hive wallets which still
+        // advertise 80008 while downloading the legacy prefix. This is a
+        // self-reported software policy, not authentication or an IP ban.
+        if (m_chainparams.GetConsensus().legacy_b3coin &&
+            !m_in_legacy_phase.load(std::memory_order_relaxed) &&
+            cleanSubVer.starts_with("/B3-Coin:3.")) {
+            LogInfo("Disconnecting obsolete B3-Coin 3.x software after the sealed boundary, %s\n",
+                    pfrom.DisconnectMsg(fLogIPs));
+            pfrom.fDisconnect = true;
+            return;
         }
         if (!vRecv.empty()) {
             vRecv >> starting_height;
@@ -4827,6 +4906,9 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
     }
 
     if (const auto kind{flowmesh::WireKindForCommand(msg_type)}) {
+        // No legacy FlowMesh sink means these optional application frames
+        // must not alter ordinary B3 peer connectivity or ban state.
+        if (!m_opts.flowmesh_sink) return;
         // FlowMesh is negotiated solely as a service on this existing B3
         // connection. No message is accepted before VERACK or from a peer
         // that did not advertise the capability.
@@ -4852,6 +4934,24 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         if (!m_opts.flowmesh_sink) return;
         const auto result{m_opts.flowmesh_sink->EnqueueWireMessage(
             pfrom.GetId(), std::move(*decoded))};
+        if (result != flowmesh::QueueResult::ACCEPTED) {
+            const char* reason{"unknown"};
+            switch (result) {
+            case flowmesh::QueueResult::RECONCILING: reason = "b3_reconciling"; break;
+            case flowmesh::QueueResult::STOPPED: reason = "service_stopped"; break;
+            case flowmesh::QueueResult::MALFORMED: reason = "malformed"; break;
+            case flowmesh::QueueResult::RATE_LIMITED: reason = "rate_limited"; break;
+            case flowmesh::QueueResult::PEER_LIMIT: reason = "peer_queue_limit"; break;
+            case flowmesh::QueueResult::MARKET_LIMIT: reason = "market_unavailable_or_queue_limit"; break;
+            case flowmesh::QueueResult::GLOBAL_LIMIT: reason = "global_queue_limit"; break;
+            case flowmesh::QueueResult::ACCEPTED: break;
+            }
+            // Legacy B3 framing has no receipt ACK. Current senders retain
+            // exact critical objects for paced retries; do not call this an
+            // admission, or make ordinary B3 processing wait on this worker.
+            LogDebug(BCLog::NET, "FlowMesh legacy ingress refused command=%s peer=%d reason=%s; no receipt acknowledged\n",
+                     msg_type, pfrom.GetId(), reason);
+        }
         if (result == flowmesh::QueueResult::MALFORMED &&
             ++peer.m_flowmesh_framing_strikes >= 2) {
             pfrom.fDisconnect = true;
@@ -5110,6 +5210,9 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         bool legacy_block_inventory{false};
         bool legacy_unknown_block{false};
         const bool legacy_getblocks_response{legacy_sync_peer && peer.m_legacy_getblocks_in_flight};
+        size_t legacy_block_inventory_count{0};
+        bool legacy_known_prefix{true};
+        bool legacy_cursor_advanced{false};
 
         if (legacy_sync_peer && vInv.empty() && legacy_getblocks_response &&
             peer.m_legacy_blocks_in_flight == 0 && peer.m_legacy_block_queue.empty()) {
@@ -5134,7 +5237,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             }
 
             if (inv.IsMsgBlk()) {
-                const bool fAlreadyHave = AlreadyHaveBlock(inv.hash);
+                const CBlockIndex* known_index{
+                    legacy_chain ? m_chainman.m_blockman.LookupBlockIndex(inv.hash) : nullptr};
+                const bool fAlreadyHave = legacy_chain
+                    ? LegacyBlockAvailable(known_index) : AlreadyHaveBlock(inv.hash);
                 LogDebug(BCLog::NET, "got inv: %s  %s peer=%d\n", inv.ToString(), fAlreadyHave ? "have" : "new", pfrom.GetId());
 
                 if (legacy_chain) {
@@ -5144,7 +5250,19 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                     // window with no shared ordering or request accounting.
                     if (!legacy_sync_peer) continue;
                     legacy_block_inventory = true;
+                    ++legacy_block_inventory_count;
+                    if (fAlreadyHave && legacy_getblocks_response && legacy_known_prefix) {
+                        if (AdvanceLegacySyncCursor(peer, known_index)) {
+                            legacy_cursor_advanced = true;
+                        } else {
+                            legacy_known_prefix = false;
+                        }
+                    }
                     if (!fAlreadyHave) {
+                        // Do not jump over a missing body to a known suffix.
+                        // Requested full-block reception advances this cursor
+                        // only after the ordinary validation/storage path.
+                        legacy_known_prefix = false;
                         legacy_unknown_block = true;
                         peer.m_legacy_sync_exhausted = false;
                         // A legacy peer marks every hash in its getblocks
@@ -5199,17 +5317,26 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             }
             if (legacy_getblocks_response && legacy_block_inventory && !legacy_unknown_block &&
                 peer.m_legacy_blocks_in_flight == 0 && peer.m_legacy_block_queue.empty()) {
-                if (vInv.size() < LEGACY_GETBLOCKS_RESPONSE_SIZE) {
+                if (legacy_block_inventory_count < LEGACY_GETBLOCKS_RESPONSE_SIZE) {
                     // A short page of blocks we already have: same as an empty
                     // inventory, this peer is exhausted but sync is not done.
                     peer.m_legacy_request_time = {};
                     NoteLegacyPeerExhausted(pfrom.GetId(), peer);
-                } else {
-                    // A full-size response of already-known blocks is a
-                    // truncated page (another peer supplied this range);
-                    // continue from an updated locator instead of parking
-                    // this peer.
+                } else if (legacy_cursor_advanced) {
+                    // A sparse active-tip locator may land hundreds of blocks
+                    // before a fork. Walk past this known page using the peer's
+                    // cursor; asking from the unchanged active tip loops forever
+                    // (the mainnet stall observed at height 344404).
+                    LogDebug(BCLog::NET, "Legacy discovery advanced through %zu known blocks to %s peer=%d\n",
+                             legacy_block_inventory_count, peer.m_legacy_sync_cursor.ToString(), pfrom.GetId());
                     (void)MaybeSendGetHeaders(pfrom, GetLocator(m_chainman.ActiveChain().Tip()), peer);
+                } else {
+                    // A repeated/backward/divergent page is not progress. Give
+                    // another peer a turn; rebase after the existing cooldown
+                    // rather than spinning or permanently pinning a peer fork.
+                    LogDebug(BCLog::NET, "Legacy discovery page made no cursor progress; releasing peer=%d\n", pfrom.GetId());
+                    peer.m_legacy_sync_cursor.SetNull();
+                    NoteLegacyPeerExhausted(pfrom.GetId(), peer);
                 }
             }
             if (peer.m_legacy_block_queue.size() > peer.m_legacy_blocks_in_flight) {
@@ -6161,13 +6288,18 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             std::optional<CBlockLocator> next_locator;
             {
                 LOCK(cs_main);
+                const CBlockIndex* index{m_chainman.m_blockman.LookupBlockIndex(hash)};
+                // Retain this connection's progress even for a late response
+                // after owner failover. Stored, linked side-branch blocks can
+                // advance discovery before activation; they cannot renew the
+                // lease or start another download window here.
+                (void)AdvanceLegacySyncCursor(peer, index);
                 // Renew the owner's forward-progress lease only when this
                 // requested block actually advanced synchronization, i.e. it
                 // connected to the active chain. A peer that keeps answering
                 // getdata with blocks that never connect does not hold the
                 // window: the lease still expires and ownership moves on.
                 if (m_legacy_sync_peer == pfrom.GetId()) {
-                    const CBlockIndex* index{m_chainman.m_blockman.LookupBlockIndex(hash)};
                     if (index && m_chainman.ActiveChain().Contains(index)) {
                         m_legacy_sync_lease = NodeClock::now() + LEGACY_SYNC_PROGRESS_LEASE;
                     }

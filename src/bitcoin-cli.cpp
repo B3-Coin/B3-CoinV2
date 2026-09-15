@@ -104,7 +104,7 @@ static void SetupCliArgs(ArgsManager& argsman)
     argsman.AddArg("-rpcuser=<user>", "Username for JSON-RPC connections", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-rpcwait", "Wait for RPC server to start", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-rpcwaittimeout=<n>", strprintf("Timeout in seconds to wait for the RPC server to start, or 0 for no timeout. (default: %d)", DEFAULT_WAIT_CLIENT_TIMEOUT), ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::OPTIONS);
-    argsman.AddArg("-rpcwallet=<walletname>", "Send RPC for non-default wallet on RPC server (needs to exactly match corresponding -wallet option passed to b3coind). This changes the RPC endpoint used, e.g. http://127.0.0.1:8332/wallet/<walletname>", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-rpcwallet=<walletname>", "Send RPC for non-default wallet on RPC server (needs to exactly match corresponding -wallet option passed to b3coind). This changes the RPC endpoint used, e.g. http://127.0.0.1:5467/wallet/<walletname>", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-stdin", "Read extra arguments from standard input, one per line until EOF/Ctrl-D (recommended for sensitive information such as passphrases). When combined with -stdinrpcpass, the first line from standard input is used for the RPC password.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-stdinrpcpass", "Read RPC password from standard input as a single line. When combined with -stdin, the first line from standard input is used for the RPC password. When combined with -stdinwalletpassphrase, -stdinrpcpass consumes the first line, and -stdinwalletpassphrase consumes the second.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-stdinwalletpassphrase", "Read wallet passphrase from standard input as a single line. When combined with -stdin, the first line from standard input is used for the wallet passphrase.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -487,15 +487,15 @@ public:
                 n = *res;
                 m_details_level = std::min(n, NETINFO_MAX_LEVEL);
             } else {
-                throw std::runtime_error(strprintf("invalid -netinfo level argument: %s\nFor more information, run: bitcoin-cli -netinfo help", args.at(0)));
+                throw std::runtime_error(strprintf("invalid -netinfo level argument: %s\nFor more information, run: b3coin-cli -netinfo help", args.at(0)));
             }
             if (args.size() > 1) {
                 if (std::string_view s{args.at(1)}; n && (s == "o" || s == "outonly")) {
                     m_outbound_only_selected = true;
                 } else if (n) {
-                    throw std::runtime_error(strprintf("invalid -netinfo outonly argument: %s\nFor more information, run: bitcoin-cli -netinfo help", s));
+                    throw std::runtime_error(strprintf("invalid -netinfo outonly argument: %s\nFor more information, run: b3coin-cli -netinfo help", s));
                 } else {
-                    throw std::runtime_error(strprintf("invalid -netinfo outonly argument: %s\nThe outonly argument is only valid for a level greater than 0 (the first argument). For more information, run: bitcoin-cli -netinfo help", s));
+                    throw std::runtime_error(strprintf("invalid -netinfo outonly argument: %s\nThe outonly argument is only valid for a level greater than 0 (the first argument). For more information, run: b3coin-cli -netinfo help", s));
                 }
             }
         }
@@ -738,17 +738,17 @@ public:
         "* The local addresses table lists each local address broadcast by the node, the port, and the score.\n\n"
         "Examples:\n\n"
         "Peer counts table of reachable networks and list of local addresses\n"
-        "> bitcoin-cli -netinfo\n\n"
+        "> b3coin-cli -netinfo\n\n"
         "The same, preceded by a peers listing without address and version columns\n"
-        "> bitcoin-cli -netinfo 1\n\n"
+        "> b3coin-cli -netinfo 1\n\n"
         "Full dashboard\n"
-        + strprintf("> bitcoin-cli -netinfo %d\n\n", NETINFO_MAX_LEVEL) +
+        + strprintf("> b3coin-cli -netinfo %d\n\n", NETINFO_MAX_LEVEL) +
         "Full dashboard, but with outbound peers only\n"
-        + strprintf("> bitcoin-cli -netinfo %d outonly\n\n", NETINFO_MAX_LEVEL) +
+        + strprintf("> b3coin-cli -netinfo %d outonly\n\n", NETINFO_MAX_LEVEL) +
         "Full live dashboard, adjust --interval or --no-title as needed (Linux)\n"
-        + strprintf("> watch --interval 1 --no-title bitcoin-cli -netinfo %d\n\n", NETINFO_MAX_LEVEL) +
+        + strprintf("> watch --interval 1 --no-title b3coin-cli -netinfo %d\n\n", NETINFO_MAX_LEVEL) +
         "See this help\n"
-        "> bitcoin-cli -netinfo help\n"};
+        "> b3coin-cli -netinfo help\n"};
 };
 
 /** Process RPC generatetoaddress request. */

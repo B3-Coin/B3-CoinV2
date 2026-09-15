@@ -5,10 +5,12 @@
 #include <consensus/flowmesh_params.h>
 #include <core_io.h>
 #include <flowmesh/auth.h>
+#include <flowmesh/market.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
 #include <modern/asset_output.h>
 #include <modern/mpa.h>
+#include <node/flowmesh_client.h>
 #include <policy/policy.h>
 #include <rpc/protocol.h>
 #include <rpc/request.h>
@@ -66,6 +68,30 @@ static uint256 ParseMarketId(const UniValue& value)
     return market;
 }
 
+static uint256 ParseActionId(const UniValue& value)
+{
+    const uint256 action{ParseHashV(value, "action_id")};
+    if (action.IsNull()) throw JSONRPCError(RPC_INVALID_PARAMETER, "action_id cannot be zero");
+    return action;
+}
+
+// Never replace the locally approved identity with a transport response, or
+// turn an uncertain submission into an exception that loses that identity.
+static interfaces::FlowMeshActionReceipt BoundActionReceipt(
+    interfaces::FlowMeshActionReceipt receipt, const uint256& action_id)
+{
+    if (receipt.action_id != action_id ||
+        (receipt.state != "queued" && receipt.state != "admitted" &&
+         receipt.state != "rejected" && receipt.state != "unknown" &&
+         receipt.state != "certified_inclusion") ||
+        (receipt.state == "certified_inclusion" && (!receipt.certificate_verified || receipt.microblock_hash.IsNull()))) {
+        receipt = {};
+        receipt.reason = "Unusable action receipt; submission outcome is unknown";
+    }
+    receipt.action_id = action_id;
+    return receipt;
+}
+
 static flowmesh::MarketDataQuery ParseMarketDataQuery(const UniValue& options)
 {
     flowmesh::MarketDataQuery query;
@@ -117,29 +143,6 @@ static flowmesh::MarketDataQuery ParseMarketDataQuery(const UniValue& options)
     return query;
 }
 
-static UniValue MarketCurvesJson(const std::vector<flowmesh::ClearingEngine::CurveView>& curves)
-{
-    UniValue out{UniValue::VARR};
-    for (const auto& curve : curves) {
-        UniValue item{UniValue::VOBJ};
-        item.pushKV("account_id", curve.account_id.GetHex());
-        item.pushKV("side", curve.side == flowmesh::ClearingEngine::Side::BID ? "bid" : "ask");
-        item.pushKV("status", curve.filled_quantity ? "partially-filled" : "open");
-        item.pushKV("filled_quantity", curve.filled_quantity);
-        item.pushKV("remaining_quantity", curve.remaining_quantity);
-        item.pushKV("reserved_amount", curve.reserved_amount);
-        UniValue points{UniValue::VARR};
-        for (const auto& point : curve.points) {
-            UniValue row{UniValue::VOBJ};
-            row.pushKV("price", point.price);
-            row.pushKV("quantity", point.qty);
-            points.push_back(std::move(row));
-        }
-        item.pushKV("points", std::move(points));
-        out.push_back(std::move(item));
-    }
-    return out;
-}
 
 static RPCResult MarketCurveResult()
 {
@@ -162,104 +165,7 @@ static RPCResult MarketCurveResult()
 
 static UniValue CertifiedMarketDataJson(const flowmesh::MarketData& data)
 {
-    UniValue out{UniValue::VOBJ};
-    out.pushKV("domain", data.domain.GetHex());
-    out.pushKV("market_id", data.market_id.GetHex());
-    out.pushKV("base_asset_id", data.base_asset_id.GetHex());
-    out.pushKV("quote_asset", "B3");
-    out.pushKV("execution_config_id", data.execution_config_id.GetHex());
-    out.pushKV("matching_model", "uniform-price-curve-auction");
-    out.pushKV("quantity_lot_raw", 1);
-    out.pushKV("price_tick_raw", 1);
-    out.pushKV("unchanged", data.unchanged);
-    const auto& source{data.snapshot};
-    UniValue snapshot{UniValue::VOBJ};
-    snapshot.pushKV("certified", source.certified);
-    snapshot.pushKV("next_microblock_sequence", source.next_microblock_sequence);
-    snapshot.pushKV("last_microblock_hash", source.last_microblock_hash.GetHex());
-    snapshot.pushKV("state_root", source.state_root.GetHex());
-    snapshot.pushKV("epoch", source.epoch);
-    snapshot.pushKV("anchor_height", source.anchor_height);
-    snapshot.pushKV("anchor_hash", source.anchor_hash.GetHex());
-    snapshot.pushKV("active_seats", static_cast<uint64_t>(source.active_seats));
-    snapshot.pushKV("quorum_required", static_cast<uint64_t>(source.quorum_required));
-    snapshot.pushKV("running", source.running);
-    snapshot.pushKV("paused", source.paused);
-    snapshot.pushKV("observer_only", source.observer_only);
-    snapshot.pushKV("pending_handoff", source.pending_handoff);
-    snapshot.pushKV("halt", source.halt);
-    snapshot.pushKV("error", source.error);
-    snapshot.pushKV("pending_actions", static_cast<uint64_t>(source.pending_actions));
-    snapshot.pushKV("checkpoint_status_known", false);
-    if (source.local_observed_at) snapshot.pushKV("local_observed_at", *source.local_observed_at);
-    const auto& diagnostics{source.runtime};
-    UniValue runtime{UniValue::VOBJ};
-    runtime.pushKV("round", diagnostics.round);
-    runtime.pushKV("candidate_count", static_cast<uint64_t>(diagnostics.candidate_count));
-    runtime.pushKV("max_verified_attestations", static_cast<uint64_t>(diagnostics.max_verified_attestations));
-    runtime.pushKV("active_catchup_requests", static_cast<uint64_t>(diagnostics.active_catchup_requests));
-    runtime.pushKV("proposals_missing_evidence", diagnostics.proposals_missing_evidence);
-    runtime.pushKV("proposals_rejected_round", diagnostics.proposals_rejected_round);
-    runtime.pushKV("proposals_verified_different_round", diagnostics.proposals_verified_different_round);
-    runtime.pushKV("proposals_conflicting_lock", diagnostics.proposals_conflicting_lock);
-    runtime.pushKV("attestations_without_candidate", diagnostics.attestations_without_candidate);
-    if (diagnostics.last_message_observed_at) runtime.pushKV("last_message_observed_at", *diagnostics.last_message_observed_at);
-    if (diagnostics.local_locked_candidate) runtime.pushKV("local_locked_candidate", diagnostics.local_locked_candidate->GetHex());
-    snapshot.pushKV("runtime", std::move(runtime));
-    out.pushKV("snapshot", std::move(snapshot));
-    if (data.unchanged) return out;
-
-    UniValue liquidity{UniValue::VOBJ};
-    liquidity.pushKV("curves", MarketCurvesJson(data.liquidity.curves));
-    liquidity.pushKV("total_curves", static_cast<uint64_t>(data.liquidity.total_curves));
-    liquidity.pushKV("complete", data.liquidity.complete);
-    if (data.liquidity.next_cursor) {
-        liquidity.pushKV("next_cursor", std::string{data.liquidity.next_cursor->first == flowmesh::ClearingEngine::Side::BID ? "bid:" : "ask:"} + data.liquidity.next_cursor->second.GetHex());
-    }
-    out.pushKV("liquidity", std::move(liquidity));
-    if (data.account) {
-        const auto& source_account{*data.account};
-        UniValue account{UniValue::VOBJ};
-        account.pushKV("account_id", source_account.account_id.GetHex());
-        account.pushKV("next_sequence", source_account.next_sequence);
-        account.pushKV("base_available", source_account.base_available);
-        account.pushKV("base_reserved", source_account.base_reserved);
-        account.pushKV("b3_available_atoms", source_account.b3_available_atoms);
-        account.pushKV("b3_reserved_atoms", source_account.b3_reserved_atoms);
-        account.pushKV("curves", MarketCurvesJson(source_account.curves));
-        out.pushKV("account", std::move(account));
-    }
-    UniValue history{UniValue::VOBJ};
-    history.pushKV("available", data.history.available);
-    history.pushKV("scope", "bounded-certified-log-cache");
-    history.pushKV("truncated", data.history.truncated);
-    if (data.history.oldest_retained_sequence) history.pushKV("oldest_retained_sequence", *data.history.oldest_retained_sequence);
-    if (data.history.next_before_sequence) history.pushKV("next_before_sequence", *data.history.next_before_sequence);
-    UniValue entries{UniValue::VARR};
-    for (const auto& entry : data.history.entries) {
-        UniValue item{UniValue::VOBJ};
-        item.pushKV("sequence", entry.sequence);
-        item.pushKV("microblock_hash", entry.microblock_hash.GetHex());
-        item.pushKV("epoch", entry.epoch);
-        item.pushKV("anchor_height", entry.anchor_height);
-        item.pushKV("anchor_hash", entry.anchor_hash.GetHex());
-        item.pushKV("kind", entry.handoff ? "handoff" : "execution");
-        item.pushKV("cleared", entry.cleared);
-        item.pushKV("price", entry.price);
-        item.pushKV("quantity", entry.quantity);
-        item.pushKV("notional_atoms", entry.notional_atoms);
-        item.pushKV("fee_atoms", entry.fee_atoms);
-        const auto fill{data.account ? std::find_if(entry.account_fills.begin(), entry.account_fills.end(),
-            [&](const auto& candidate) { return candidate.account_id == data.account->account_id; }) : entry.account_fills.end()};
-        const bool found{fill != entry.account_fills.end()};
-        item.pushKV("account_fills_known", data.account.has_value() && (entry.account_fills_complete || found));
-        item.pushKV("account_bid_fill", found ? fill->bid_quantity : CAmount{0});
-        item.pushKV("account_ask_fill", found ? fill->ask_quantity : CAmount{0});
-        entries.push_back(std::move(item));
-    }
-    history.pushKV("entries", std::move(entries));
-    out.pushKV("history", std::move(history));
-    return out;
+    return node::FlowMeshClientMarketDataJson(data);
 }
 
 static COutPoint ParseOutPoint(const UniValue& txid_value,
@@ -364,6 +270,14 @@ static UniValue MarketStatusJson(const MarketStatus& status)
     }
     out.pushKV("halt", status.halt);
     out.pushKV("error", status.error);
+    UniValue verification{UniValue::VOBJ};
+    verification.pushKV("source", status.remote ? "remote_endpoint" : "local_engine");
+    verification.pushKV("endpoint", status.endpoint);
+    verification.pushKV("certificate_verified", status.certificate_verified);
+    verification.pushKV("account_state_verified", status.account_state_verified);
+    verification.pushKV("b3_checkpoint_confirmed", status.b3_checkpoint_confirmed);
+    verification.pushKV("freshest_network_head_proven", false);
+    out.pushKV("verification", std::move(verification));
     if (status.account_id) {
         UniValue account{UniValue::VOBJ};
         account.pushKV("account_id", status.account_id->GetHex());
@@ -396,6 +310,21 @@ struct WalletActionContext {
     MarketStatus market;
 };
 
+static void RequireActionMarket(const MarketStatus& status, const uint256& market_id,
+                                const flowmesh::AccountId& account)
+{
+    const auto canonical_market{flowmesh::ComputeFlowMeshMarketId(status.domain, status.base_asset, status.quote_asset)};
+    const auto canonical_vault{flowmesh::ComputeFlowMeshVaultId(status.domain, market_id)};
+    if (!status.account_id || *status.account_id != account ||
+        !canonical_market || *canonical_market != market_id || status.market_id != market_id ||
+        !canonical_vault || *canonical_vault != status.vault_id || status.execution_config_id.IsNull()) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "FlowMesh account or canonical market binding is unavailable");
+    }
+    if (status.remote && (!status.certificate_verified || !status.account_state_verified)) {
+        throw JSONRPCError(RPC_MISC_ERROR, "Remote FlowMesh actions require a verified certificate and authenticated account state");
+    }
+}
+
 static WalletActionContext GetWalletActionContext(CWallet& wallet,
                                                    const uint256& market_id)
 {
@@ -425,17 +354,14 @@ static WalletActionContext GetWalletActionContext(CWallet& wallet,
     const auto status{wallet.chain().flowMeshMarketStatus(market_id, account)};
     if (!status || !status->available || !status->running) {
         throw JSONRPCError(RPC_MISC_ERROR,
-                           "FlowMesh market is not running in this node");
+                           status && !status->error.empty() ? status->error.substr(0, 1024)
+                               : "FlowMesh market is unavailable through the configured trading backend");
     }
     if (status->paused) {
         throw JSONRPCError(RPC_MISC_ERROR,
                            "FlowMesh market is paused (at least four active seats are required)");
     }
-    if (!status->account_id || *status->account_id != account ||
-        status->domain.IsNull() || status->execution_config_id.IsNull()) {
-        throw JSONRPCError(RPC_INTERNAL_ERROR,
-                           "FlowMesh account or market binding is unavailable");
-    }
+    RequireActionMarket(*status, market_id, account);
     return {std::move(secret), account, *status};
 }
 
@@ -449,19 +375,12 @@ static UniValue SubmitSignedAction(CWallet& wallet,
         throw JSONRPCError(RPC_INTERNAL_ERROR,
                            "Unable to sign the canonical FlowMesh action");
     }
-    std::string error;
-    if (!wallet.chain().submitFlowMeshAction(context.market.market_id,
-                                              action, error)) {
-        throw JSONRPCError(RPC_MISC_ERROR,
-                           error.empty() ? "FlowMesh action was not accepted"
-                                         : error);
-    }
-    UniValue out{UniValue::VOBJ};
-    out.pushKV("accepted", true);
+    auto receipt{BoundActionReceipt(
+        wallet.chain().submitFlowMeshActionReceipt(context.market.market_id, action), action.Id())};
+    receipt.account_id = context.account;
+    UniValue out{node::FlowMeshClientReceiptJson(receipt)};
     out.pushKV("market_id", context.market.market_id.GetHex());
-    out.pushKV("account_id", context.account.GetHex());
     out.pushKV("sequence", action.sequence);
-    out.pushKV("action_id", action.Id().GetHex());
     return out;
 }
 
@@ -586,6 +505,14 @@ static RPCResult MarketStatusResult(std::string description)
         {RPCResult::Type::BOOL, "genesis_checkpoint_required", /*optional=*/true, "Whether the pending checkpoint is the market genesis checkpoint"},
         {RPCResult::Type::STR, "halt", "none or the fail-closed halt reason"},
         {RPCResult::Type::STR, "error", "Most recent market error"},
+        {RPCResult::Type::OBJ, "verification", "Evidence labels; a certified balance is not B3 settlement or proof of the freshest network head", {
+            {RPCResult::Type::STR, "source", "local_engine or remote_endpoint"},
+            {RPCResult::Type::STR, "endpoint", "Remote endpoint, or empty for the local engine"},
+            {RPCResult::Type::BOOL, "certificate_verified", "Certificate verified against locally checked anchored seats"},
+            {RPCResult::Type::BOOL, "account_state_verified", "Account derived from authenticated whole-state bytes"},
+            {RPCResult::Type::BOOL, "b3_checkpoint_confirmed", "B3 checkpoint confirmation independently checked"},
+            {RPCResult::Type::BOOL, "freshest_network_head_proven", "False: a valid response does not prove the freshest network head"},
+        }},
         {RPCResult::Type::OBJ, "account", /*optional=*/true, "This wallet's account state", {
             {RPCResult::Type::STR_HEX, "account_id", "FlowMesh account id"},
             {RPCResult::Type::NUM, "next_sequence", "Next account action sequence"},
@@ -620,24 +547,180 @@ static RPCResult VaultOperationResult(std::string description)
     }};
 }
 
-static RPCResult AcceptedActionResult(
-    std::string description, std::vector<RPCResult> action_fields)
+static RPCResult ActionReceiptResult(
+    std::string description, std::vector<RPCResult> action_fields = {}, std::string key = {})
 {
-    std::vector<RPCResult> fields;
-    fields.reserve(5 + action_fields.size());
-    fields.emplace_back(RPCResult::Type::BOOL, "accepted", "Whether the action was accepted");
+    std::vector<RPCResult> fields{
+        {RPCResult::Type::STR_HEX, "action_id", "Canonical action identity; preserved even when the submission outcome is unknown"},
+        {RPCResult::Type::STR_HEX, "account_id", /*optional=*/true, "Locally bound originating wallet account; never taken from an endpoint's claim"},
+        {RPCResult::Type::BOOL, "accepted", "True for queued, admitted or certified_inclusion; queue acceptance alone does not prove execution"},
+        {RPCResult::Type::STR, "receipt_state", "queued, admitted, rejected, unknown or certified_inclusion"},
+        {RPCResult::Type::STR, "reason", "Bounded receipt explanation; unknown is not definite rejection"},
+        {RPCResult::Type::STR, "endpoint", "Reporting endpoint, or empty for the local engine"},
+        {RPCResult::Type::BOOL, "certificate_verified", "An inclusion certificate was verified"},
+        {RPCResult::Type::BOOL, "outcome_verified", "Per-action execution outcome independently verified; certificate inclusion alone does not establish this"},
+        {RPCResult::Type::STR_HEX, "microblock_hash", /*optional=*/true, "Certificate-linked microblock hash"},
+        {RPCResult::Type::NUM, "microblock_sequence", /*optional=*/true, "Certificate-linked microblock sequence"},
+    };
     fields.emplace_back(RPCResult::Type::STR_HEX, "market_id", "FlowMesh market id");
-    fields.emplace_back(RPCResult::Type::STR_HEX, "account_id", "FlowMesh account id");
-    fields.emplace_back(RPCResult::Type::NUM, "sequence", "Account action sequence");
-    fields.emplace_back(RPCResult::Type::STR_HEX, "action_id", "Signed action id");
     for (RPCResult& field : action_fields) {
         fields.push_back(std::move(field));
     }
-    return RPCResult{RPCResult::Type::OBJ, "", std::move(description),
+    return RPCResult{RPCResult::Type::OBJ, std::move(key), std::move(description),
                      std::move(fields)};
 }
 
+static RPCResult AcceptedActionResult(
+    std::string description, std::vector<RPCResult> action_fields)
+{
+    action_fields.emplace_back(RPCResult::Type::NUM, "sequence", "Exact locally signed account action sequence");
+    return ActionReceiptResult(std::move(description), std::move(action_fields));
+}
+
+static RPCHelpMan ActionStatusRPC(const bool retry)
+{
+    return RPCHelpMan{
+        retry ? "retryflowmeshaction" : "getflowmeshactionstatus",
+        retry
+            ? "Resolve or retry a locally retained FlowMesh action by its original identity, only for this wallet's existing account. Only the saved exact instruction is eligible; no wallet unlock, new signature, account sequence or order is created. A proven certified action is returned without resubmission. Unknown means the outcome is uncertain, not rejected.\n"
+            : "Read the locally configured trading backend's receipt for an exact FlowMesh action belonging to this wallet's existing account. This never signs or submits an action. Certificate-verified inclusion is distinct from a verified execution outcome and B3 settlement.\n",
+        {
+            {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte market id"},
+            {"action_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Original nonzero canonical action id"},
+        },
+        ActionReceiptResult("Action receipt, including an explicit unknown outcome"),
+        RPCExamples{HelpExampleCli(retry ? "retryflowmeshaction" : "getflowmeshactionstatus", "\"<market_id>\" \"<action_id>\"")},
+        [retry](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto wallet{GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            const uint256 market_id{ParseMarketId(request.params[0])};
+            const uint256 action_id{ParseActionId(request.params[1])};
+            const auto account{ExistingWalletAccount(*wallet)};
+            if (!account) throw JSONRPCError(RPC_WALLET_ERROR, "This wallet has no FlowMesh account");
+            auto receipt{BoundActionReceipt(wallet->chain().flowMeshActionStatus(market_id, action_id, false), action_id)};
+            if (receipt.account_id != account) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Action is not retained for this wallet's existing FlowMesh account");
+            }
+            if (retry && !receipt.certificate_verified) {
+                receipt = BoundActionReceipt(wallet->chain().flowMeshActionStatus(market_id, action_id, true), action_id);
+                if (receipt.account_id != account) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "Action is not retained for this wallet's existing FlowMesh account");
+                }
+            }
+            UniValue out{node::FlowMeshClientReceiptJson(receipt)};
+            out.pushKV("market_id", market_id.GetHex());
+            return out;
+        }};
+}
+
 } // namespace
+
+RPCHelpMan getflowmeshclientinfo()
+{
+    return RPCHelpMan{
+        "getflowmeshclientinfo",
+        "Read the node's configured FlowMesh trading backend, endpoint observations and local receipt backlog without unlocking or creating wallet keys. Endpoint availability does not prove quorum or the freshest certified head.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "Local trading client status", {
+            {RPCResult::Type::STR, "backend", "local or remote"},
+            {RPCResult::Type::BOOL, "engine_enabled", "Whether the optional local validator engine is enabled with -enableflowmeshvalidator"},
+            {RPCResult::Type::STR, "active_endpoint", "Most recently selected remote endpoint, or empty"},
+            {RPCResult::Type::NUM, "event_gaps", "Observed cursor gaps requiring snapshot recovery"},
+            {RPCResult::Type::NUM, "pending_actions", "Locally retained actions without a terminal receipt; not trades or fills"},
+            {RPCResult::Type::ARR, "endpoints", "Configured trading endpoints", {
+                {RPCResult::Type::OBJ, "", "Endpoint observation", {
+                    {RPCResult::Type::STR, "url", "Configured HTTPS URL"},
+                    {RPCResult::Type::BOOL, "available", "Last observed request availability"},
+                    {RPCResult::Type::STR, "last_error", "Bounded last request error"},
+                }},
+            }},
+        }},
+        RPCExamples{HelpExampleCli("getflowmeshclientinfo", "")},
+        [](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto wallet{GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            return node::FlowMeshClientStatusJson(wallet->chain().flowMeshClientStatus());
+        }};
+}
+
+RPCHelpMan getflowmeshactionstatus() { return ActionStatusRPC(/*retry=*/false); }
+RPCHelpMan retryflowmeshaction() { return ActionStatusRPC(/*retry=*/true); }
+
+RPCHelpMan listflowmeshactions()
+{
+    return RPCHelpMan{
+        "listflowmeshactions",
+        "List at most 512 locally retained public FlowMesh instructions belonging to this wallet's existing account. No endpoint is contacted, no account is created, and no action is signed, resent or changed. After restart, previous certification prevents resubmission but requires fresh evidence before it is reported as currently verified. The list is retained client history, not a complete exchange history.\n",
+        {{"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Filter by exact market id; omit to inspect all retained markets"}},
+        RPCResult{RPCResult::Type::OBJ, "", "Local wallet-scoped retained instruction view", {
+            {RPCResult::Type::STR, "source", "local-retained-outbox"},
+            {RPCResult::Type::STR_HEX, "account_id", /*optional=*/true, "Existing wallet account; absent if no account exists"},
+            {RPCResult::Type::ARR, "actions", "At most 512 public summaries", {
+                {RPCResult::Type::OBJ, "", "Retained instruction", {
+                    {RPCResult::Type::STR_HEX, "market_id", "Original market"},
+                    {RPCResult::Type::STR_HEX, "domain", "Original chain domain"},
+                    {RPCResult::Type::STR_HEX, "execution_config_id", "Original execution configuration"},
+                    {RPCResult::Type::STR_HEX, "account_id", "Locally bound owner"},
+                    {RPCResult::Type::STR_HEX, "action_id", "Original semantic action identity"},
+                    {RPCResult::Type::NUM, "action_type", "Original canonical action type"},
+                    {RPCResult::Type::STR, "canonical_side", /*optional=*/true, "Original bid/ask side for a curve or cancellation; a bid buys the configured colored asset using B3"},
+                    {RPCResult::Type::ARR, "canonical_points", /*optional=*/true, "Original exact curve; empty for a cancellation. No metadata or order meaning is inferred from a ticker", {
+                        {RPCResult::Type::OBJ, "", "Original canonical breakpoint", {
+                            {RPCResult::Type::NUM, "price", "B3 atoms per configured colored-asset atom"},
+                            {RPCResult::Type::NUM, "quantity", "Configured colored-asset atoms"},
+                        }},
+                    }},
+                    {RPCResult::Type::NUM, "sequence", /*optional=*/true, "Original account sequence; deposits are unsequenced"},
+                    {RPCResult::Type::STR_HEX, "signed_bytes_sha256", "SHA-256 of original retained credential-bearing payload, standard digest byte order"},
+                    {RPCResult::Type::NUM, "signed_bytes_size", "Original payload byte count"},
+                    {RPCResult::Type::NUM, "initial_submission_ms", "Original local submission timestamp, milliseconds since epoch"},
+                    {RPCResult::Type::BOOL, "may_have_been_sent", "Delivery uncertainty retained by the local outbox"},
+                    {RPCResult::Type::BOOL, "previously_certified", "Durable no-resubmit protection, not renewed proof"},
+                    ActionReceiptResult("Cached local receipt; no fresh endpoint query", {}, "receipt"),
+                }},
+            }},
+        }},
+        RPCExamples{HelpExampleCli("listflowmeshactions", "")},
+        [](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto wallet{GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            const auto account{ExistingWalletAccount(*wallet)};
+            std::optional<uint256> market;
+            if (!request.params[0].isNull()) market = ParseMarketId(request.params[0]);
+            UniValue out{UniValue::VOBJ}, actions{UniValue::VARR};
+            out.pushKV("source", "local-retained-outbox");
+            if (account) {
+                out.pushKV("account_id", account->GetHex());
+                const auto saved{wallet->chain().flowMeshSavedActions(*account, market)};
+                if (saved.size() > 512) throw JSONRPCError(RPC_INTERNAL_ERROR, "Local action enumeration exceeds its bound");
+                for (const auto& item : saved) {
+                    if (item.account_id != *account || item.receipt.account_id != account || (market && item.market_id != *market))
+                        throw JSONRPCError(RPC_INTERNAL_ERROR, "Retained action attribution mismatch");
+                    UniValue row{UniValue::VOBJ};
+                    row.pushKV("market_id", item.market_id.GetHex()); row.pushKV("domain", item.domain.GetHex());
+                    row.pushKV("execution_config_id", item.execution_config_id.GetHex()); row.pushKV("account_id", account->GetHex());
+                    row.pushKV("action_id", item.receipt.action_id.GetHex()); row.pushKV("action_type", item.action_type);
+                    if (!item.canonical_side.empty()) {
+                        row.pushKV("canonical_side", item.canonical_side);
+                        UniValue points{UniValue::VARR};
+                        for (const auto& point : item.canonical_points) {
+                            UniValue value{UniValue::VOBJ};
+                            value.pushKV("price", point.price); value.pushKV("quantity", point.qty);
+                            points.push_back(std::move(value));
+                        }
+                        row.pushKV("canonical_points", std::move(points));
+                    }
+                    if (item.sequence) row.pushKV("sequence", *item.sequence);
+                    row.pushKV("signed_bytes_sha256", item.signed_bytes_sha256); row.pushKV("signed_bytes_size", item.signed_bytes_size);
+                    row.pushKV("initial_submission_ms", item.initial_submission_ms);
+                    row.pushKV("may_have_been_sent", item.may_have_been_sent); row.pushKV("previously_certified", item.previously_certified);
+                    UniValue receipt{node::FlowMeshClientReceiptJson(item.receipt)}; receipt.pushKV("market_id", item.market_id.GetHex());
+                    row.pushKV("receipt", std::move(receipt)); actions.push_back(std::move(row));
+                }
+            }
+            out.pushKV("actions", std::move(actions)); return out;
+        }};
+}
 
 UniValue FlowMeshVaultOperationToJSON(
     const interfaces::FlowMeshVaultOperation& operation)
@@ -777,7 +860,8 @@ RPCHelpMan getflowmeshmarketdata()
     using T = RPCResult::Type;
     return RPCHelpMan{
         "getflowmeshmarketdata",
-        "Read certified standing curves, exact auction clearing history and this wallet's account without creating keys, signing or submitting actions. "
+        "Read standing curves, auction history and this wallet's account without creating keys, signing or submitting actions. Consult verification for the evidence available through the configured backend. "
+        "Remote balances and curves are derived from locally authenticated whole-state bytes; adjacent endpoint-reported history is not independently execution-verified. "
         "FlowMesh uses one uniform-price curve auction per microblock, not price-time priority. "
         "All prices are integer B3 atoms per base atomic unit and all quantities are integer base units; B3 has nine decimals. "
         "History contains at most the latest 256 certified microblocks, rebuilt during normal verified startup replay. "
@@ -809,7 +893,18 @@ RPCHelpMan getflowmeshmarketdata()
             {T::NUM, "quantity_lot_raw", "Current limit-order RPC input granularity in base units"},
             {T::NUM, "price_tick_raw", "Current limit-order RPC input granularity in B3 atoms per base unit"},
             {T::BOOL, "unchanged", "Heavy data omitted because known_head matches"},
-            {T::OBJ, "base_metadata", /*optional=*/true, "Verified display precision and cosmetic labels; omitted on unchanged responses; does not certify backing", {
+            {T::OBJ, "verification", "Independent evidence labels, including on unchanged responses", {
+                {T::STR, "source", "local_engine or remote_endpoint"},
+                {T::STR, "endpoint", "Remote endpoint, or empty for local engine"},
+                {T::BOOL, "certificate_verified", "Certificate checked against locally verified anchored seats"},
+                {T::BOOL, "account_state_verified", "Account and curves derived from authenticated whole-state bytes"},
+                {T::BOOL, "execution_result_verified", "Execution results independently replayed; a state certificate alone is insufficient"},
+                {T::BOOL, "b3_checkpoint_confirmed", "B3 checkpoint confirmation independently checked"},
+                {T::BOOL, "history_endpoint_reported", "History is endpoint-reported rather than independently execution-verified"},
+                {T::BOOL, "event_gap", "Explicit cursor gap requiring snapshot recovery"},
+                {T::BOOL, "freshest_network_head_proven", "False: a valid response does not prove the freshest network head"},
+            }},
+            {T::OBJ, "base_metadata", /*optional=*/true, "Verified display precision and sourced cosmetic labels, including on unchanged responses; does not certify backing", {
                 {T::BOOL, "known", "Immutable display precision is verified"},
                 {T::NUM, "decimals", /*optional=*/true, "Verified display precision; omitted when unknown"},
                 {T::STR, "ticker", "Display ticker or empty"},
@@ -829,6 +924,7 @@ RPCHelpMan getflowmeshmarketdata()
                 {T::NUM, "quorum_required", "Certificate signature threshold"},
                 {T::BOOL, "running", "Local service is running"},
                 {T::BOOL, "paused", "Local execution is paused"},
+                {T::BOOL, "chain_reconciling", "Local service is reconciling the current B3 tip; retry reads and do not submit actions yet"},
                 {T::BOOL, "observer_only", "Local node has no active signing seat"},
                 {T::BOOL, "pending_handoff", "Committee handoff is pending"},
                 {T::STR, "halt", "Local fail-closed halt state"},
@@ -865,7 +961,7 @@ RPCHelpMan getflowmeshmarketdata()
                 {T::NUM, "b3_reserved_atoms", "Reserved B3 atoms"},
                 {T::ARR, "curves", "At most the account's current bid and ask", {MarketCurveResult()}},
             }},
-            {T::OBJ, "history", /*optional=*/true, "Verified execution-derived history, newest first", {
+            {T::OBJ, "history", /*optional=*/true, "History, newest first; consult verification.history_endpoint_reported before treating execution rows as verified", {
                 {T::BOOL, "available", "Verified history cache is ready"},
                 {T::STR, "scope", "bounded-certified-log-cache"},
                 {T::BOOL, "truncated", "Older certified entries have fallen outside the retained cache"},
@@ -902,7 +998,6 @@ RPCHelpMan getflowmeshmarketdata()
             const auto data{wallet->chain().flowMeshMarketData(market_id, account, query, error)};
             if (!data) throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "FlowMesh market data is unavailable" : error);
             UniValue out{CertifiedMarketDataJson(*data)};
-            if (data->unchanged) return out;
             UniValue metadata{UniValue::VOBJ};
             {
                 LOCK(wallet->cs_wallet);
@@ -923,7 +1018,7 @@ RPCHelpMan getflowmeshbalance()
 {
     return RPCHelpMan{
         "getflowmeshbalance",
-        "Return this wallet's certified FlowMesh balance for one market.\n",
+        "Return market status and this wallet's certified FlowMesh balance when an account already exists. Before the first deposit, return market status without an account; this read never creates wallet keys. Consult verification to distinguish authenticated state from B3 settlement.\n",
         {{"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
           "32-byte market id"}},
         MarketStatusResult("Market and account status"),
@@ -935,11 +1030,6 @@ RPCHelpMan getflowmeshbalance()
             wallet->BlockUntilSyncedToCurrentChain();
             const uint256 market_id{ParseMarketId(request.params[0])};
             const auto account{ExistingWalletAccount(*wallet)};
-            if (!account) {
-                throw JSONRPCError(
-                    RPC_WALLET_ERROR,
-                    "This wallet has no FlowMesh account yet; create a vault deposit first");
-            }
             const auto status{
                 wallet->chain().flowMeshMarketStatus(market_id, account)};
             if (!status) {
@@ -995,7 +1085,7 @@ RPCHelpMan submitflowmeshdeposit()
 {
     return RPCHelpMan{
         "submitflowmeshdeposit",
-        "Submit a confirmed keyless vault output to FlowMesh after its 30-block anchor depth.\n",
+        "Submit a confirmed keyless vault output to FlowMesh after its 30-block anchor depth. The receipt distinguishes queue admission, unknown outcome and certificate inclusion; submission alone does not credit the account. No account nonce or new signature is used.\n",
         {
             {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
              "32-byte market id"},
@@ -1004,14 +1094,11 @@ RPCHelpMan submitflowmeshdeposit()
             {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO,
              "Vault-deposit output index"},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "Accepted deposit action", {
-            {RPCResult::Type::BOOL, "accepted", "Whether the deposit action was accepted"},
+        ActionReceiptResult("Deposit submission receipt", {
             {RPCResult::Type::STR, "kind", "Action kind"},
-            {RPCResult::Type::STR_HEX, "market_id", "FlowMesh market id"},
             {RPCResult::Type::STR_HEX, "deposit_txid", "Vault-deposit transaction id"},
             {RPCResult::Type::NUM, "deposit_vout", "Vault-deposit output index"},
-            {RPCResult::Type::STR_HEX, "action_id", "Deposit action id"},
-        }},
+        }),
         RPCExamples{HelpExampleCli(
             "submitflowmeshdeposit", "\"<market_id>\" \"<txid>\" 0")},
         [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
@@ -1032,12 +1119,14 @@ RPCHelpMan submitflowmeshdeposit()
                 wallet->chain().flowMeshMarketStatus(market_id, account)};
             if (!status || !status->available || !status->running) {
                 throw JSONRPCError(RPC_MISC_ERROR,
-                                   "FlowMesh market is not running in this node");
+                                   status && !status->error.empty() ? status->error.substr(0, 1024)
+                                       : "FlowMesh market is unavailable through the configured trading backend");
             }
             if (status->paused) {
                 throw JSONRPCError(RPC_MISC_ERROR,
                                    "FlowMesh market is paused");
             }
+            RequireActionMarket(*status, market_id, *account);
 
             {
                 LOCK(wallet->cs_wallet);
@@ -1078,20 +1167,14 @@ RPCHelpMan submitflowmeshdeposit()
             flowmesh::Action action;
             action.type = static_cast<uint8_t>(flowmesh::ActionType::DEPOSIT);
             action.outpoint = outpoint;
-            std::string error;
-            if (!wallet->chain().submitFlowMeshAction(market_id, action,
-                                                       error)) {
-                throw JSONRPCError(
-                    RPC_MISC_ERROR,
-                    error.empty() ? "FlowMesh deposit was not accepted" : error);
-            }
-            UniValue out{UniValue::VOBJ};
-            out.pushKV("accepted", true);
+            auto receipt{BoundActionReceipt(
+                wallet->chain().submitFlowMeshActionReceipt(market_id, action), action.Id())};
+            receipt.account_id = *account;
+            UniValue out{node::FlowMeshClientReceiptJson(receipt)};
             out.pushKV("kind", QueueActionName(action.type));
             out.pushKV("market_id", market_id.GetHex());
             out.pushKV("deposit_txid", outpoint.hash.GetHex());
             out.pushKV("deposit_vout", outpoint.n);
-            out.pushKV("action_id", action.Id().GetHex());
             return out;
         }};
 }
@@ -1100,7 +1183,7 @@ RPCHelpMan submitflowmeshorder()
 {
     return RPCHelpMan{
         "submitflowmeshorder",
-        "Place a signed limit bid or ask in a colored-asset/B3 market. Price is integer native-B3 atomic units per colored-asset unit.\n" +
+        "Place a locally signed limit bid or ask in a colored-asset/B3 market. Price is integer native-B3 atomic units per colored-asset unit. A queued/admitted receipt is not a fill. For an unknown outcome, retain the action_id and use retryflowmeshaction rather than signing a replacement.\n" +
             HELP_REQUIRING_PASSPHRASE,
         {
             {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
@@ -1114,7 +1197,7 @@ RPCHelpMan submitflowmeshorder()
             {"sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
              "Account sequence (default: current certified next sequence)"},
         },
-        AcceptedActionResult("Accepted signed order", {
+        AcceptedActionResult("Signed order submission receipt", {
             {RPCResult::Type::STR, "side", "bid or ask"},
             {RPCResult::Type::NUM, "price", "Limit price in B3 atomic units per base unit"},
             {RPCResult::Type::NUM, "quantity", "Exact base-asset quantity"},
@@ -1155,7 +1238,7 @@ RPCHelpMan cancelflowmeshorder()
 {
     return RPCHelpMan{
         "cancelflowmeshorder",
-        "Cancel this wallet's standing bid or ask.\n" +
+        "Submit a locally signed cancellation of this wallet's standing bid or ask. Queue/admission is not certified cancellation; unknown outcomes retain their action_id for exact-object retry.\n" +
             HELP_REQUIRING_PASSPHRASE,
         {
             {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
@@ -1165,7 +1248,7 @@ RPCHelpMan cancelflowmeshorder()
             {"sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
              "Account sequence (default: current certified next sequence)"},
         },
-        AcceptedActionResult("Accepted signed cancellation", {
+        AcceptedActionResult("Signed cancellation submission receipt", {
             {RPCResult::Type::STR, "side", "bid or ask"},
         }),
         RPCExamples{HelpExampleCli(
@@ -1200,7 +1283,7 @@ RPCHelpMan requestflowmeshwithdrawal()
 {
     return RPCHelpMan{
         "requestflowmeshwithdrawal",
-        "Create a signed FlowMesh withdrawal request. This creates a certified request; a later connected checkpoint and type-9 vault transaction perform the on-chain payout.\n" +
+        "Create a locally signed FlowMesh withdrawal instruction. Submission is not certification: inspect receipt_state, then observe the certified request separately from a later connected checkpoint and type-9 vault transaction that perform the B3 payout. Unknown outcomes retain their action_id for exact-object retry.\n" +
             HELP_REQUIRING_PASSPHRASE,
         {
             {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
@@ -1214,12 +1297,12 @@ RPCHelpMan requestflowmeshwithdrawal()
             {"sequence", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
              "Account sequence (default: current certified next sequence)"},
         },
-        AcceptedActionResult("Accepted signed request", {
+        AcceptedActionResult("Signed withdrawal submission receipt", {
             {RPCResult::Type::STR, "asset", "B3 or the colored-asset id"},
             {RPCResult::Type::NUM, "amount", "B3 decimal amount or exact colored-asset units"},
             {RPCResult::Type::STR, "destination", "Destination owner address"},
             {RPCResult::Type::STR_HEX, "destination_owner_commitment", "Destination owner commitment"},
-            {RPCResult::Type::STR, "status", "Withdrawal request status"},
+            {RPCResult::Type::STR, "status", "Legacy label requested means the instruction was created, not accepted, certified or paid; use receipt_state"},
         }),
         RPCExamples{HelpExampleCli(
             "requestflowmeshwithdrawal",

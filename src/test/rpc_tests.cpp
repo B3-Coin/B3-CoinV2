@@ -297,6 +297,142 @@ BOOST_AUTO_TEST_CASE(flowmesh_marketdata_rpc_options_preserve_exact_cursors)
     BOOST_CHECK_THROW(RPCConvertValues("getflowmeshmarketdata", {id, "not-json"}), std::runtime_error);
 }
 
+BOOST_AUTO_TEST_CASE(flowmesh_deposit_rpc_values_preserve_numeric_vout)
+{
+    // The Qt console shares this conversion path with the CLI. An unquoted
+    // output index must reach the RPC as a number, while numeric hashes stay strings.
+    const std::string market_id(64, '1');
+    const std::string txid(64, '2');
+    for (const std::string vout : {"0", "4294967295"}) {
+        const UniValue positional{
+            RPCConvertValues("submitflowmeshdeposit", {market_id, txid, vout})};
+        BOOST_REQUIRE_EQUAL(positional.size(), 3U);
+        BOOST_CHECK_EQUAL(positional[0].get_str(), market_id);
+        BOOST_CHECK_EQUAL(positional[1].get_str(), txid);
+        BOOST_CHECK(positional[2].isNum());
+        BOOST_CHECK_EQUAL(positional[2].getValStr(), vout);
+
+        const UniValue named{RPCConvertNamedValues("submitflowmeshdeposit",
+            {"market_id=" + market_id, "txid=" + txid, "vout=" + vout})};
+        BOOST_CHECK_EQUAL(named["market_id"].get_str(), market_id);
+        BOOST_CHECK_EQUAL(named["txid"].get_str(), txid);
+        BOOST_CHECK(named["vout"].isNum());
+        BOOST_CHECK_EQUAL(
+            TransformParams(named, {{"market_id", false}, {"txid", false}, {"vout", false}}).write(),
+            positional.write());
+    }
+    const UniValue mixed{RPCConvertNamedValues("submitflowmeshdeposit",
+        {market_id, "txid=" + txid, "vout=0"})};
+    BOOST_CHECK_EQUAL(
+        TransformParams(mixed, {{"market_id", false}, {"txid", false}, {"vout", false}}).write(),
+        RPCConvertValues("submitflowmeshdeposit", {market_id, txid, "0"}).write());
+}
+
+BOOST_AUTO_TEST_CASE(flowmesh_action_rpc_positional_values_preserve_exact_units)
+{
+    const std::string id(64, '1');
+    const std::string asset(64, '2');
+    const std::string units{"9007199254740993"};
+    const std::string sequence{"9007199254740995"};
+    BOOST_CHECK_EQUAL(
+        RPCConvertValues("submitflowmeshorder", {id, "bid", "17", units, sequence}).write(),
+        "[\"" + id + "\",\"bid\",17,9007199254740993,9007199254740995]");
+    BOOST_CHECK_EQUAL(
+        RPCConvertValues("cancelflowmeshorder", {id, "ask", sequence}).write(),
+        "[\"" + id + "\",\"ask\",9007199254740995]");
+    BOOST_CHECK_EQUAL(
+        RPCConvertValues("requestflowmeshwithdrawal", {id, asset, units, "12345", sequence}).write(),
+        "[\"" + id + "\",\"" + asset + "\",9007199254740993,\"12345\",9007199254740995]");
+    // Native withdrawals use decimal B3; identifiers and the destination
+    // remain literal strings regardless of whether they are valid JSON numbers.
+    BOOST_CHECK_EQUAL(
+        RPCConvertValues("requestflowmeshwithdrawal", {id, "B3", "0.000000001", "12345"}).write(),
+        "[\"" + id + "\",\"B3\",0.000000001,\"12345\"]");
+    BOOST_CHECK_EQUAL(
+        RPCConvertValues("submitflowmeshorder", {id, "ask", "17", "1"}).write(),
+        "[\"" + id + "\",\"ask\",17,1]");
+    BOOST_CHECK_EQUAL(
+        RPCConvertValues("cancelflowmeshorder", {id, "bid"}).write(),
+        "[\"" + id + "\",\"bid\"]");
+}
+
+BOOST_AUTO_TEST_CASE(flowmesh_action_rpc_named_values_match_wallet_schemas)
+{
+    const std::string id(64, '1');
+    const std::string asset(64, '2');
+    const UniValue order{RPCConvertNamedValues("submitflowmeshorder",
+        {"quantity=9007199254740993", "sequence=9007199254740995", "price=17", "side=ask", "market_id=" + id})};
+    BOOST_CHECK_EQUAL(
+        TransformParams(order, {{"market_id", false}, {"side", false}, {"price", false}, {"quantity", false}, {"sequence", false}}).write(),
+        "[\"" + id + "\",\"ask\",17,9007199254740993,9007199254740995]");
+
+    const UniValue cancel{RPCConvertNamedValues("cancelflowmeshorder",
+        {"sequence=9007199254740995", "side=bid", "market_id=" + id})};
+    BOOST_CHECK_EQUAL(
+        TransformParams(cancel, {{"market_id", false}, {"side", false}, {"sequence", false}}).write(),
+        "[\"" + id + "\",\"bid\",9007199254740995]");
+
+    const UniValue withdrawal{RPCConvertNamedValues("requestflowmeshwithdrawal",
+        {"destination=12345", "asset=" + asset, "amount=9007199254740993", "sequence=9007199254740995", "market_id=" + id})};
+    BOOST_CHECK_EQUAL(
+        TransformParams(withdrawal, {{"market_id", false}, {"asset", false}, {"amount", false}, {"destination", false}, {"sequence", false}}).write(),
+        "[\"" + id + "\",\"" + asset + "\",9007199254740993,\"12345\",9007199254740995]");
+
+    const UniValue native{RPCConvertNamedValues("requestflowmeshwithdrawal",
+        {"market_id=" + id, "asset=B3", "amount=0.000000001", "destination=12345"})};
+    BOOST_CHECK_EQUAL(
+        TransformParams(native, {{"market_id", false}, {"asset", false}, {"amount", false}, {"destination", false}, {"sequence", false}}).write(),
+        "[\"" + id + "\",\"B3\",0.000000001,\"12345\"]");
+}
+
+BOOST_AUTO_TEST_CASE(flowmesh_action_rpc_rejects_malformed_numeric_json)
+{
+    const std::string id(64, '1');
+    for (const std::string malformed : {"not-a-number", "0oops", "1e"}) {
+        BOOST_CHECK_THROW(RPCConvertValues("submitflowmeshdeposit", {id, id, malformed}), std::runtime_error);
+        BOOST_CHECK_THROW(RPCConvertNamedValues("submitflowmeshdeposit", {"market_id=" + id, "txid=" + id, "vout=" + malformed}), std::runtime_error);
+        BOOST_CHECK_THROW(RPCConvertValues("submitflowmeshorder", {id, "bid", malformed, "1"}), std::runtime_error);
+        BOOST_CHECK_THROW(RPCConvertValues("submitflowmeshorder", {id, "bid", "1", malformed}), std::runtime_error);
+        BOOST_CHECK_THROW(RPCConvertValues("submitflowmeshorder", {id, "bid", "1", "1", malformed}), std::runtime_error);
+        BOOST_CHECK_THROW(RPCConvertNamedValues("submitflowmeshorder", {"price=" + malformed}), std::runtime_error);
+        BOOST_CHECK_THROW(RPCConvertNamedValues("submitflowmeshorder", {"quantity=" + malformed}), std::runtime_error);
+        BOOST_CHECK_THROW(RPCConvertNamedValues("submitflowmeshorder", {"sequence=" + malformed}), std::runtime_error);
+        BOOST_CHECK_THROW(RPCConvertValues("cancelflowmeshorder", {id, "ask", malformed}), std::runtime_error);
+        BOOST_CHECK_THROW(RPCConvertNamedValues("cancelflowmeshorder", {"sequence=" + malformed}), std::runtime_error);
+        BOOST_CHECK_THROW(RPCConvertValues("requestflowmeshwithdrawal", {id, "B3", malformed, "destination"}), std::runtime_error);
+        BOOST_CHECK_THROW(RPCConvertValues("requestflowmeshwithdrawal", {id, "B3", "1", "destination", malformed}), std::runtime_error);
+        BOOST_CHECK_THROW(RPCConvertNamedValues("requestflowmeshwithdrawal", {"amount=" + malformed}), std::runtime_error);
+        BOOST_CHECK_THROW(RPCConvertNamedValues("requestflowmeshwithdrawal", {"sequence=" + malformed}), std::runtime_error);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(flowmesh_seat_binding_rpc_options_preserve_types)
+{
+    const std::string txid(64, '1');
+    const std::string public_key(96, '2');
+    const std::string options{"{\"broadcast\":false,\"fn_txid\":\"" + txid +
+        "\",\"fn_vout\":0,\"bls_pubkey\":\"" + public_key + "\",\"minconf\":2}"};
+    const UniValue positional{RPCConvertValues("bindflowmeshseat", {"12345", options})};
+    BOOST_REQUIRE_EQUAL(positional.size(), 2U);
+    BOOST_CHECK_EQUAL(positional[0].get_str(), "12345");
+    BOOST_CHECK(positional[1].isObject());
+    BOOST_CHECK(positional[1]["broadcast"].isFalse());
+    BOOST_CHECK_EQUAL(positional[1]["fn_txid"].get_str(), txid);
+    BOOST_CHECK_EQUAL(positional[1]["fn_vout"].getInt<uint32_t>(), 0U);
+    BOOST_CHECK_EQUAL(positional[1]["bls_pubkey"].get_str(), public_key);
+    BOOST_CHECK_EQUAL(positional[1]["minconf"].getInt<int>(), 2);
+
+    const UniValue named{RPCConvertNamedValues("bindflowmeshseat", {"options=" + options})};
+    BOOST_CHECK_EQUAL(
+        TransformParams(named, {{"address", false}, {"options", false}}).write(),
+        "[null," + options + "]");
+    BOOST_CHECK_EQUAL(
+        RPCConvertNamedValues("bindflowmeshseat", {"address=12345"})["address"].get_str(),
+        "12345");
+    BOOST_CHECK_THROW(RPCConvertValues("bindflowmeshseat", {"destination", "not-json"}), std::runtime_error);
+    BOOST_CHECK_THROW(RPCConvertNamedValues("bindflowmeshseat", {"options=not-json"}), std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(flowmesh_prepare_rpc_positional_values_preserve_types)
 {
     // Hashes containing only decimal digits remain strings, and preparation
@@ -920,31 +1056,36 @@ BOOST_AUTO_TEST_CASE(check_dup_param_names)
 
 BOOST_AUTO_TEST_CASE(help_example)
 {
+    // Positional examples use the shipped B3 CLI and mainnet RPC endpoint.
+    BOOST_CHECK_EQUAL(HelpExampleCli("getblockcount", ""), "> b3coin-cli getblockcount \n");
+    BOOST_CHECK_EQUAL(HelpExampleCli("getblockhash", "100"), "> b3coin-cli getblockhash 100\n");
+    BOOST_CHECK_EQUAL(HelpExampleRpc("getblockhash", "100"), "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"getblockhash\", \"params\": [100]}' -H 'content-type: application/json' http://127.0.0.1:5467/\n");
+
     // test different argument types
     const RPCArgList& args = {{"foo", "bar"}, {"b", true}, {"n", 1}};
-    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", args), "> bitcoin-cli -named test foo=bar b=true n=1\n");
-    BOOST_CHECK_EQUAL(HelpExampleRpcNamed("test", args), "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"test\", \"params\": {\"foo\":\"bar\",\"b\":true,\"n\":1}}' -H 'content-type: application/json' http://127.0.0.1:8332/\n");
+    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", args), "> b3coin-cli -named test foo=bar b=true n=1\n");
+    BOOST_CHECK_EQUAL(HelpExampleRpcNamed("test", args), "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"test\", \"params\": {\"foo\":\"bar\",\"b\":true,\"n\":1}}' -H 'content-type: application/json' http://127.0.0.1:5467/\n");
 
     // test shell escape
-    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"foo", "b'ar"}}), "> bitcoin-cli -named test foo='b'''ar'\n");
-    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"foo", "b\"ar"}}), "> bitcoin-cli -named test foo='b\"ar'\n");
-    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"foo", "b ar"}}), "> bitcoin-cli -named test foo='b ar'\n");
+    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"foo", "b'ar"}}), "> b3coin-cli -named test foo='b'''ar'\n");
+    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"foo", "b\"ar"}}), "> b3coin-cli -named test foo='b\"ar'\n");
+    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"foo", "b ar"}}), "> b3coin-cli -named test foo='b ar'\n");
 
     // test object params
     UniValue obj_value(UniValue::VOBJ);
     obj_value.pushKV("foo", "bar");
     obj_value.pushKV("b", false);
     obj_value.pushKV("n", 1);
-    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"name", obj_value}}), "> bitcoin-cli -named test name='{\"foo\":\"bar\",\"b\":false,\"n\":1}'\n");
-    BOOST_CHECK_EQUAL(HelpExampleRpcNamed("test", {{"name", obj_value}}), "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"test\", \"params\": {\"name\":{\"foo\":\"bar\",\"b\":false,\"n\":1}}}' -H 'content-type: application/json' http://127.0.0.1:8332/\n");
+    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"name", obj_value}}), "> b3coin-cli -named test name='{\"foo\":\"bar\",\"b\":false,\"n\":1}'\n");
+    BOOST_CHECK_EQUAL(HelpExampleRpcNamed("test", {{"name", obj_value}}), "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"test\", \"params\": {\"name\":{\"foo\":\"bar\",\"b\":false,\"n\":1}}}' -H 'content-type: application/json' http://127.0.0.1:5467/\n");
 
     // test array params
     UniValue arr_value(UniValue::VARR);
     arr_value.push_back("bar");
     arr_value.push_back(false);
     arr_value.push_back(1);
-    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"name", arr_value}}), "> bitcoin-cli -named test name='[\"bar\",false,1]'\n");
-    BOOST_CHECK_EQUAL(HelpExampleRpcNamed("test", {{"name", arr_value}}), "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"test\", \"params\": {\"name\":[\"bar\",false,1]}}' -H 'content-type: application/json' http://127.0.0.1:8332/\n");
+    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"name", arr_value}}), "> b3coin-cli -named test name='[\"bar\",false,1]'\n");
+    BOOST_CHECK_EQUAL(HelpExampleRpcNamed("test", {{"name", arr_value}}), "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"test\", \"params\": {\"name\":[\"bar\",false,1]}}' -H 'content-type: application/json' http://127.0.0.1:5467/\n");
 
     // test types don't matter for shell
     BOOST_CHECK_EQUAL(HelpExampleCliNamed("foo", {{"arg", true}}), HelpExampleCliNamed("foo", {{"arg", "true"}}));
