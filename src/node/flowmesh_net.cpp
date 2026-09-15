@@ -26,6 +26,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -205,6 +206,8 @@ struct Target {
     std::optional<CPubKey> pin;
     std::string learned_key;
     std::array<Clock::time_point, CHANNELS> next{};
+    std::array<Clock::time_point, CHANNELS> last_attempt{};
+    FlowMeshNetTarget info;
 };
 Target ParseTarget(const std::string& value, uint16_t port)
 {
@@ -220,6 +223,8 @@ Target ParseTarget(const std::string& value, uint16_t port)
     }
     out.address = LookupNumeric(endpoint, port);
     if (!out.address.IsValid() || (!out.address.IsIPv4() && !out.address.IsIPv6())) throw std::runtime_error{"FlowMesh peers require numeric IPv4 or bracketed IPv6 addresses"};
+    out.info.address = out.address.ToStringAddrPort();
+    out.info.operator_pubkey = out.pin ? HexStr(*out.pin) : std::string{};
     return out;
 }
 } // namespace
@@ -246,6 +251,12 @@ struct FlowMeshNetService::Impl {
     std::vector<Target> targets;
     mutable std::mutex mutex;
     FlowMeshNetSnapshot snapshot;
+    // Shared admission registry reserves slots before the worker sees a new
+    // endpoint. Worker targets are append-only; live connection indices never
+    // change. Both collections are bounded by max_peers (hard maximum 32).
+    std::vector<Target> admitted_targets;
+    std::deque<Target> pending_targets;
+    std::set<std::string> unconfigured_peers;
     // Only queue admission/accounting is shared with callers. Socket state is
     // worker-owned, and no lock is held across I/O, crypto, sink or feedback.
     std::map<flowmesh::WirePeerId, std::shared_ptr<EgressPeer>> admission_peers;
@@ -274,6 +285,7 @@ struct FlowMeshNetService::Impl {
         uint8_t channel{0}, remote_role{0};
         std::optional<size_t> target;
         std::string address, peer_key;
+        std::string failure;
         CPubKey remote_key;
         Bytes local_hello, remote_hello;
         uint256 session;
@@ -311,6 +323,29 @@ struct FlowMeshNetService::Impl {
     std::map<std::string, Peer> peers;
 
     Impl(FlowMeshNetConfig c, flowmesh::WireMessageSink& s) : config{std::move(c)}, sink{s} {}
+
+    bool Fail(Connection& c, std::string reason)
+    {
+        c.failure = std::move(reason);
+        return false;
+    }
+    void ApplyTargets()
+    {
+        std::lock_guard lock{mutex};
+        while (!pending_targets.empty()) {
+            auto target{std::move(pending_targets.front())}; pending_targets.pop_front();
+            target.info.admitted_to_worker = true;
+            auto peer{peers.find(target.info.operator_pubkey)};
+            if (peer != peers.end()) peer->second.configured = true;
+            targets.push_back(std::move(target));
+        }
+    }
+    void TargetFailed(size_t target, uint8_t channel, const std::string& reason)
+    {
+        auto& info{targets[target].info.channels[channel]};
+        ++info.failures; info.last_error = reason; info.state = "retry_wait";
+        info.authenticated = false;
+    }
 
     void LoadKey()
     {
@@ -362,13 +397,14 @@ struct FlowMeshNetService::Impl {
     bool ReceiveHello(Connection& c)
     {
         const auto& h{c.rx};
-        if (!std::equal(h.begin(), h.begin() + 4, "FMN2") || ReadLE16(h.data() + 4) != 2 ||
-            !std::equal(config.domain.begin(), config.domain.end(), h.begin() + 6) || h[38] >= CHANNELS || h[39] > 2 ||
-            (c.outbound && h[38] != c.channel)) return false;
+        if (!std::equal(h.begin(), h.begin() + 4, "FMN2") || ReadLE16(h.data() + 4) != 2) return Fail(c, "incompatible FMN2 handshake version");
+        if (!std::equal(config.domain.begin(), config.domain.end(), h.begin() + 6)) return Fail(c, "FlowMesh network domain mismatch");
+        if (h[38] >= CHANNELS || h[39] > 2 || (c.outbound && h[38] != c.channel)) return Fail(c, "invalid handshake channel or role");
         c.channel = h[38]; c.remote_role = h[39];
         c.remote_key.Set(h.begin() + 40, h.begin() + 73);
-        if (!c.remote_key.IsFullyValid() || !c.remote_key.IsCompressed() || c.remote_key == pubkey) return false;
-        if (c.target && targets[*c.target].pin && c.remote_key != *targets[*c.target].pin) return false;
+        if (!c.remote_key.IsFullyValid() || !c.remote_key.IsCompressed()) return Fail(c, "invalid remote operator public key");
+        if (c.remote_key == pubkey) return Fail(c, "remote operator identity is this node's own key");
+        if (c.target && targets[*c.target].pin && c.remote_key != *targets[*c.target].pin) return Fail(c, "remote operator public key does not match configured pin");
         c.peer_key = HexStr(c.remote_key);
         c.remote_hello = h;
         if (!c.outbound) { c.local_hello = Hello(c.channel); c.tx = c.local_hello; c.tx_pos = 0; }
@@ -377,38 +413,49 @@ struct FlowMeshNetService::Impl {
         hash.write(MakeByteSpan(c.outbound ? c.remote_hello : c.local_hello));
         c.session = hash.GetHash();
         Bytes signature;
-        if (!key.SignCompact(AuthDigest(c.session, pubkey), signature)) return false;
+        if (!key.SignCompact(AuthDigest(c.session, pubkey), signature)) return Fail(c, "cannot sign local operator handshake");
         c.tx.insert(c.tx.end(), signature.begin(), signature.end());
         c.stage = Connection::Stage::AUTH; c.rx.assign(SIGNATURE_SIZE, 0); c.rx_pos = 0;
         return true;
     }
     bool Authenticate(Connection& c)
     {
-        if (!Verify(c.remote_key, AuthDigest(c.session, c.remote_key), c.rx)) return false;
+        if (!Verify(c.remote_key, AuthDigest(c.session, c.remote_key), c.rx)) return Fail(c, "invalid remote operator handshake signature");
         // Even a redundant authenticated dial learns which already-active
         // peer satisfies this unpinned endpoint; do not redial it forever.
         if (c.target) targets[*c.target].learned_key = c.peer_key;
-        const bool configured{c.target.has_value() || std::any_of(targets.begin(), targets.end(), [&](const auto& target) {
-            return (target.pin && *target.pin == c.remote_key) || target.learned_key == c.peer_key;
-        })};
+        bool configured;
         auto it{peers.find(c.peer_key)};
+        {
+            // Synchronize inbound slot reservations with live AddPeer. A newly
+            // queued pin may claim its already-connected identity's slot, but
+            // cannot evict another inbound operator or overbook the bound.
+            std::lock_guard lock{mutex};
+            if (c.target) admitted_targets[*c.target].learned_key = c.peer_key;
+            configured = c.target.has_value() || std::any_of(admitted_targets.begin(), admitted_targets.end(), [&](const auto& target) {
+                return (target.pin && *target.pin == c.remote_key) || target.learned_key == c.peer_key;
+            });
+            if (it == peers.end()) {
+                if (peers.size() >= config.max_peers || next_peer <= std::numeric_limits<flowmesh::WirePeerId>::min() + 1) return Fail(c, "authenticated peer limit reached");
+                if (!configured && admitted_targets.size() + unconfigured_peers.size() >= config.max_peers) return Fail(c, "peer slots reserved for configured operators");
+                if (!configured) unconfigured_peers.insert(c.peer_key);
+            } else if (configured) {
+                unconfigured_peers.erase(c.peer_key);
+            }
+        }
         if (it == peers.end()) {
-            if (peers.size() >= config.max_peers || next_peer <= std::numeric_limits<flowmesh::WirePeerId>::min() + 1) return false;
-            // Public self-identities cannot consume configured-peer slots.
-            const size_t unknown{static_cast<size_t>(std::count_if(peers.begin(), peers.end(), [](const auto& peer) { return !peer.second.configured; }))};
-            if (!configured && unknown >= config.max_peers - targets.size()) return false;
             Peer p; p.info.id = next_peer--; p.info.address = c.address; p.info.operator_pubkey = c.peer_key;
             p.info.role = RoleName(c.remote_role); p.info.inbound = !c.outbound;
             it = peers.emplace(c.peer_key, std::move(p)).first;
-        } else if (it->second.info.role != RoleName(c.remote_role)) return false;
+        } else if (it->second.info.role != RoleName(c.remote_role)) return Fail(c, "operator role differs across channels");
         auto& p{it->second};
         p.configured |= configured;
         if (p.channels[c.channel]) {
             auto& old{*connections.at(p.channels[c.channel])};
             // Simultaneous dial deterministically prefers the lower-key dialer.
             const bool prefer_outbound{HexStr(pubkey) < c.peer_key};
-            if (old.outbound == prefer_outbound || c.outbound != prefer_outbound) return false;
-            old.dead = true;
+            if (old.outbound == prefer_outbound || c.outbound != prefer_outbound) return Fail(c, "redundant authenticated channel; preferred connection retained");
+            old.dead = true; old.failure = "redundant authenticated channel replaced by preferred connection";
         }
         p.channels[c.channel] = c.id;
         c.egress = p.egress; c.peer_id = p.info.id;
@@ -624,7 +671,8 @@ struct FlowMeshNetService::Impl {
         if (c.connecting) {
             if (!(events & Sock::SEND)) return true;
             int error{0}; socklen_t len{sizeof(error)};
-            if (c.sock->GetSockOpt(SOL_SOCKET, SO_ERROR, &error, &len) != 0 || error) return false;
+            if (c.sock->GetSockOpt(SOL_SOCKET, SO_ERROR, &error, &len) != 0) return Fail(c, "cannot read TCP connect result: " + NetworkErrorString(WSAGetLastError()));
+            if (error) return Fail(c, "TCP connect failed: " + NetworkErrorString(error));
             c.connecting = false;
         }
         if ((events & Sock::RECV) && bytes && frames) {
@@ -639,11 +687,11 @@ struct FlowMeshNetService::Impl {
                     --frames;
                     const bool valid{ReadFrame(c, allowance, now)};
                     bytes -= before - allowance;
-                    if (!valid) return false;
+                    if (!valid) return Fail(c, c.ingress_failure.empty() ? "authenticated frame rejected or socket read failed" : c.ingress_failure);
                 } else {
                     const auto n{c.sock->Recv(c.rx.data() + c.rx_pos, std::min(c.rx.size() - c.rx_pos, allowance), 0)};
-                    if (n < 0) { if (!RetryError()) return false; break; }
-                    if (n == 0) return false;
+                    if (n < 0) { if (!RetryError()) return Fail(c, "handshake receive failed: " + NetworkErrorString(WSAGetLastError())); break; }
+                    if (n == 0) return Fail(c, "remote closed socket during handshake");
                     c.rx_pos += n; allowance -= n; bytes -= n;
                     if (c.rx_pos == c.rx.size()) {
                         --frames;
@@ -653,13 +701,13 @@ struct FlowMeshNetService::Impl {
                 if (before == allowance) break;
             }
         }
-        if (!PrepareSend(c, now, frames)) return false;
+        if (!PrepareSend(c, now, frames)) return Fail(c, "outgoing frame preparation failed or partial delivery was cancelled");
         if ((events & Sock::SEND) && !c.tx.empty() && bytes) {
             const auto allowance{std::min({size_t{64 * 1024}, bytes, c.tx.size() - c.tx_pos})};
             if (!global_tx[c.channel].Take(allowance, now)) return true;
             const auto n{c.sock->Send(c.tx.data() + c.tx_pos, allowance, MSG_NOSIGNAL)};
-            if (n < 0) return RetryError();
-            if (!n) return false;
+            if (n < 0) return RetryError() || Fail(c, "socket send failed: " + NetworkErrorString(WSAGetLastError()));
+            if (!n) return Fail(c, "socket send returned zero bytes");
             c.tx_pos += n; bytes -= n; c.last_send = now; IoBytes(c, n, true);
             if (c.tx_pos == c.tx.size()) {
                 if (c.in_flight) {
@@ -676,12 +724,14 @@ struct FlowMeshNetService::Impl {
     void AddOutgoing(size_t target, uint8_t channel, Clock::time_point now)
     {
         auto& t{targets[target]}; t.next[channel] = now + RECONNECT_DELAY;
+        t.last_attempt[channel] = now; ++t.info.channels[channel].attempts;
+        t.info.channels[channel].state = "connecting";
         auto sock{CreateSock(t.address.GetSAFamily(), SOCK_STREAM, IPPROTO_TCP)};
-        if (!sock || !Configure(*sock)) return;
+        if (!sock || !Configure(*sock)) { TargetFailed(target, channel, "cannot create/configure TCP socket: " + NetworkErrorString(WSAGetLastError())); return; }
         sockaddr_storage address{}; socklen_t length{sizeof(address)};
-        if (!t.address.GetSockAddr(reinterpret_cast<sockaddr*>(&address), &length)) return;
+        if (!t.address.GetSockAddr(reinterpret_cast<sockaddr*>(&address), &length)) { TargetFailed(target, channel, "cannot encode numeric TCP endpoint"); return; }
         const int result{sock->Connect(reinterpret_cast<sockaddr*>(&address), length)};
-        if (result != 0 && !RetryError()) return;
+        if (result != 0 && !RetryError()) { TargetFailed(target, channel, "TCP connect failed: " + NetworkErrorString(WSAGetLastError())); return; }
         auto c{std::make_unique<Connection>(next_connection++, std::move(sock))};
         c->target = target; c->outbound = true; c->connecting = result != 0; c->channel = channel;
         c->address = t.address.ToStringAddrPort(); c->local_hello = Hello(channel); c->tx = c->local_hello;
@@ -736,11 +786,17 @@ struct FlowMeshNetService::Impl {
                 stopping ? FlowMeshDeliveryOutcome::STOPPED : FlowMeshDeliveryOutcome::DISCONNECTED);
             if (p->second.notified) sink.FlowMeshPeerDisconnected(p->second.info.id);
             for (uint64_t channel : p->second.channels) { auto other{connections.find(channel)}; if (other != connections.end()) other->second->dead = true; }
+            { std::lock_guard lock{mutex}; unconfigured_peers.erase(c->peer_key); }
             peers.erase(p);
         }
         for (auto it{connections.begin()}; it != connections.end();) {
             auto& c{*it->second};
             if (!c.dead) { ++it; continue; }
+            if (!stopping) {
+                const std::string reason{c.failure.empty() ? "companion channel disconnected; reconnecting all channels" : c.failure};
+                if (c.target) TargetFailed(*c.target, c.channel, reason);
+                std::lock_guard lock{mutex}; snapshot.last_disconnect_reason = reason;
+            }
             if (c.in_flight) Finish(*c.in_flight, c.peer_id, c.egress,
                 c.in_flight->cancellation->cancelled ? FlowMeshDeliveryOutcome::CANCELLED :
                 stopping ? FlowMeshDeliveryOutcome::STOPPED : FlowMeshDeliveryOutcome::DISCONNECTED);
@@ -762,6 +818,32 @@ struct FlowMeshNetService::Impl {
     {
         std::vector<FlowMeshNetPeer> public_peers;
         std::lock_guard lock{mutex};
+        const auto now{Clock::now()};
+        snapshot.targets.clear();
+        for (const auto& target : admitted_targets) snapshot.targets.push_back(target.info);
+        for (size_t i{0}; i < targets.size(); ++i) {
+            const auto& target{targets[i]}; auto info{target.info};
+            const std::string identity{target.pin ? HexStr(*target.pin) : target.learned_key};
+            const auto peer{peers.find(identity)};
+            info.authenticated = peer != peers.end() && peer->second.notified;
+            for (uint8_t channel{0}; channel < CHANNELS; ++channel) {
+                auto& detail{info.channels[channel]};
+                detail.authenticated = peer != peers.end() && peer->second.channels[channel] != 0;
+                detail.last_attempt_age_ms = detail.attempts ? std::chrono::duration_cast<std::chrono::milliseconds>(now - target.last_attempt[channel]).count() : -1;
+                detail.retry_in_ms = 0;
+                if (detail.authenticated) { detail.state = "authenticated"; continue; }
+                const auto connection{std::find_if(connections.begin(), connections.end(), [&](const auto& entry) {
+                    return entry.second->target == i && entry.second->channel == channel && !entry.second->dead;
+                })};
+                if (connection != connections.end()) detail.state = connection->second->connecting ? "connecting" : "handshake";
+                else if (now < target.next[channel]) {
+                    detail.state = "retry_wait";
+                    detail.retry_in_ms = std::chrono::duration_cast<std::chrono::milliseconds>(target.next[channel] - now).count();
+                } else if (connections.size() >= config.max_peers * CHANNELS + MAX_HANDSHAKES) detail.state = "connection_capacity_wait";
+                else detail.state = "waiting_to_dial";
+            }
+            snapshot.targets[i] = std::move(info);
+        }
         for (const auto& [identity, peer] : peers) {
             auto info{peer.info}; info.live = peer.channels[0] != 0;
             info.actions = peer.channels[1] != 0; info.bulk = peer.channels[2] != 0;
@@ -795,13 +877,14 @@ struct FlowMeshNetService::Impl {
             ++snapshot.receive_idle_timeouts;
             snapshot.last_disconnect_reason = traffic + " socket receive idle timeout (30 seconds without bytes)";
         }
+        c.failure = snapshot.last_disconnect_reason;
         return false;
     }
     void Run()
     {
         try {
             while (!stopping) {
-                auto now{Clock::now()}; Clean(); Dial(now);
+                auto now{Clock::now()}; Clean(); ApplyTargets(); Dial(now);
                 Sock::EventsPerSock wait;
                 if (listener) wait.emplace(listener, Sock::Events{Sock::RECV});
                 for (auto& [id, c] : connections) {
@@ -812,7 +895,7 @@ struct FlowMeshNetService::Impl {
                     const bool send{c->connecting || !c->tx.empty() || queued || (c->authenticated && now - c->last_send >= std::chrono::seconds{10})};
                     wait.emplace(c->sock, Sock::Events{static_cast<Sock::Event>((receive ? Sock::RECV : 0) | (send ? Sock::SEND : 0))});
                 }
-                if (wait.empty()) { std::this_thread::sleep_for(IO_WAIT); continue; }
+                if (wait.empty()) { Publish(); std::this_thread::sleep_for(IO_WAIT); continue; }
                 if (!wait.begin()->first->WaitMany(IO_WAIT, wait)) throw std::runtime_error{"FlowMesh socket poll failed"};
                 now = Clock::now();
                 if (listener && (wait.at(listener).occurred & Sock::RECV)) Accept(now);
@@ -836,13 +919,22 @@ struct FlowMeshNetService::Impl {
                         // Retrying a retained payload also copies bounded work
                         // into the sink; charge it against this class's pass.
                         if (c.pending_ingress && now >= c.next_ingress_retry) --frames;
-                        if (!RetryIngress(c, now) || (events->second.occurred & Sock::ERR) ||
-                            (!c.authenticated && now - c.created > HANDSHAKE_TIMEOUT) ||
-                            !ReceiveDeadline(c, now) ||
-                            !Pump(c, events->second.occurred, now, bytes, frames)) c.dead = true;
+                        if (!RetryIngress(c, now)) { c.dead = true; c.failure = c.ingress_failure.empty() ? "runtime ingress peer is no longer ready" : c.ingress_failure; }
+                        else if (events->second.occurred & Sock::ERR) {
+                            int error{0}; socklen_t length{sizeof(error)};
+                            if (c.sock->GetSockOpt(SOL_SOCKET, SO_ERROR, &error, &length) != 0) error = WSAGetLastError();
+                            c.failure = error ? "socket error: " + NetworkErrorString(error) : "socket poll reported an error";
+                            c.dead = true;
+                        } else if (!c.authenticated && now - c.created > HANDSHAKE_TIMEOUT) {
+                            c.failure = c.connecting ? "TCP connect deadline exceeded (five seconds)" : "operator handshake deadline exceeded (five seconds)";
+                            c.dead = true;
+                        } else if (!ReceiveDeadline(c, now) || !Pump(c, events->second.occurred, now, bytes, frames)) c.dead = true;
                         else if (c.authenticated) {
                             auto peer{peers.find(c.peer_key)};
-                            if (peer != peers.end() && !peer->second.notified && now - c.created > HANDSHAKE_TIMEOUT) c.dead = true;
+                            if (peer != peers.end() && !peer->second.notified && now - c.created > HANDSHAKE_TIMEOUT) {
+                                c.failure = "authenticated operator did not complete all three channels within five seconds";
+                                c.dead = true;
+                            }
                         }
                         if (c.egress) {
                             const auto us{std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - peer_start).count()};
@@ -867,6 +959,11 @@ struct FlowMeshNetService::Impl {
         try { Clean(); } catch (...) { peers.clear(); connections.clear(); }
         listener.reset();
         std::lock_guard lock{mutex}; admission_peers.clear(); cancellations.clear(); rx_bytes.fill(0);
+        pending_targets.clear(); unconfigured_peers.clear();
+        for (auto& target : snapshot.targets) {
+            target.authenticated = false;
+            for (auto& channel : target.channels) { channel.state = "stopped"; channel.authenticated = false; channel.retry_in_ms = 0; }
+        }
         snapshot.running = false; snapshot.listening = false; snapshot.peers.clear();
         snapshot.pending_ingress_bytes = snapshot.outbox_queued_bytes = 0;
         for (auto& traffic : snapshot.traffic) traffic.queued_bytes = traffic.queued_messages = 0;
@@ -899,8 +996,16 @@ bool FlowMeshNetService::Start(std::string& error)
             if (socket->GetSockName(reinterpret_cast<sockaddr*>(&raw), &length) != 0 || !actual.SetSockAddr(reinterpret_cast<sockaddr*>(&raw), length)) throw std::runtime_error{"Cannot inspect FlowMesh listener"};
             bound = actual.ToStringAddrPort(); s.listener = std::move(socket);
         }
-        { std::lock_guard lock{s.mutex}; s.snapshot = {}; s.snapshot.running = true; s.snapshot.listening = static_cast<bool>(s.listener); s.snapshot.operator_pubkey = HexStr(s.pubkey); s.snapshot.bind_address = bound; }
-        s.stopping = false;
+        {
+            std::lock_guard lock{s.mutex};
+            s.pending_targets.clear(); s.unconfigured_peers.clear();
+            for (auto& target : s.targets) target.info.admitted_to_worker = true;
+            s.admitted_targets = s.targets;
+            s.snapshot = {}; s.snapshot.running = true; s.snapshot.listening = static_cast<bool>(s.listener);
+            s.snapshot.operator_pubkey = HexStr(s.pubkey); s.snapshot.bind_address = bound;
+            for (const auto& target : s.targets) s.snapshot.targets.push_back(target.info);
+            s.stopping = false;
+        }
         s.worker = std::thread{[&s] { s.Run(); }};
         error.clear(); return true;
     } catch (const std::exception& e) {
@@ -916,6 +1021,54 @@ void FlowMeshNetService::Stop()
     std::lock_guard lock{s.mutex};
     s.snapshot.running = false; s.snapshot.listening = false; s.snapshot.peers.clear();
     s.snapshot.pending_ingress_bytes = s.snapshot.outbox_queued_bytes = 0;
+}
+FlowMeshNetConnectResult FlowMeshNetService::AddPeer(const std::string& peer)
+{
+    FlowMeshNetConnectResult result;
+    Target target;
+    try {
+        if (peer.size() > 256 || peer.find('@') == std::string::npos) throw std::runtime_error{"FlowMesh live connection requires compressed-public-key@numeric-address:port"};
+        target = ParseTarget(peer, 0);
+        if (!target.pin || target.address.GetPort() == 0) throw std::runtime_error{"FlowMesh live connection requires an explicit nonzero TCP port"};
+    } catch (const std::exception& e) { result.error = e.what(); return result; }
+    result.address = target.info.address; result.operator_pubkey = target.info.operator_pubkey;
+    auto& s{*m_impl};
+    std::lock_guard lock{s.mutex};
+    if (s.stopping || !s.snapshot.running) { result.error = "independent network is not running"; return result; }
+    if (result.operator_pubkey == s.snapshot.operator_pubkey) { result.error = "cannot add this node's own operator identity"; return result; }
+    for (const auto& existing : s.admitted_targets) {
+        if (existing.address == target.address) {
+            if (existing.pin == target.pin) { result.accepted = true; result.already_present = true; }
+            else result.error = "endpoint already configured with a different or absent operator pin";
+            return result;
+        }
+        if (existing.pin == target.pin || existing.learned_key == result.operator_pubkey) {
+            result.error = "operator identity already configured at another endpoint";
+            return result;
+        }
+    }
+    const size_t existing_inbound{s.unconfigured_peers.count(result.operator_pubkey)};
+    if (s.admitted_targets.size() + s.unconfigured_peers.size() - existing_inbound >= s.config.max_peers) {
+        result.error = "peer capacity reserved by configured targets or connected inbound operators";
+        return result;
+    }
+    target.info.runtime_added = true;
+    const auto admitted_size{s.admitted_targets.size()}, pending_size{s.pending_targets.size()}, public_size{s.snapshot.targets.size()};
+    try {
+        s.admitted_targets.push_back(target);
+        s.pending_targets.push_back(target);
+        s.snapshot.targets.push_back(target.info);
+    } catch (...) {
+        // Do not leave a reserved-but-never-applied target or shift the live
+        // target indices if an allocation fails partway through admission.
+        while (s.admitted_targets.size() > admitted_size) s.admitted_targets.pop_back();
+        while (s.pending_targets.size() > pending_size) s.pending_targets.pop_back();
+        while (s.snapshot.targets.size() > public_size) s.snapshot.targets.pop_back();
+        throw;
+    }
+    s.unconfigured_peers.erase(result.operator_pubkey);
+    result.accepted = true;
+    return result;
 }
 FlowMeshRelayResult FlowMeshNetService::Relay(const FlowMeshRuntimeRelay& relay)
 {

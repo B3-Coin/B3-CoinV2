@@ -46,6 +46,70 @@ static UniValue TrafficJSON(const node::FlowMeshNetTraffic& traffic)
     return out;
 }
 
+static RPCResult TargetChannelResult(const std::string& name)
+{
+    return {RPCResult::Type::OBJ, name, "Connection-attempt observation, not application delivery", {
+        {RPCResult::Type::STR, "state", "Current local connection/retry state"},
+        {RPCResult::Type::NUM, "attempts", "Outgoing connection attempts during this process"},
+        {RPCResult::Type::NUM, "failures", "Observed failed attempts or connection losses"},
+        {RPCResult::Type::STR, "last_error", "Most recent explicit local failure reason; may remain after recovery"},
+        {RPCResult::Type::NUM, "retry_in_ms", "Local retry delay in milliseconds; eligibility is not a connection promise"},
+        {RPCResult::Type::NUM, "last_attempt_age_ms", "Milliseconds since last attempt, or -1 when none"},
+        {RPCResult::Type::BOOL, "authenticated", "This channel completed challenge authentication"},
+    }};
+}
+
+static UniValue TargetChannelJSON(const node::FlowMeshNetTargetChannel& channel)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("state", channel.state);
+    out.pushKV("attempts", channel.attempts);
+    out.pushKV("failures", channel.failures);
+    out.pushKV("last_error", channel.last_error);
+    out.pushKV("retry_in_ms", channel.retry_in_ms);
+    out.pushKV("last_attempt_age_ms", channel.last_attempt_age_ms);
+    out.pushKV("authenticated", channel.authenticated);
+    return out;
+}
+
+static RPCHelpMan flowmeshconnect()
+{
+    return RPCHelpMan{
+        "flowmeshconnect",
+        "Add a pinned peer to the running independent FlowMesh network without restarting. "
+        "Admission is not connection: use getflowmeshnetworkinfo for per-target retry/error and authentication status. "
+        "The target is memory-only; add the same flowmeshconnect= entry to your existing configuration if it must survive restart. "
+        "Does not change listening/firewall settings, arm FN keys, or prove quorum.\n",
+        {{"peer", RPCArg::Type::STR, RPCArg::Optional::NO,
+          "Other operator's 66-hex compressed network public key@numeric-IP:port (IPv6 uses [address]:port); not an FN BLS key"}},
+        RPCResult{RPCResult::Type::OBJ, "", "Local connection-target admission", {
+            {RPCResult::Type::BOOL, "accepted", "Target was admitted or was already present; not a connection result"},
+            {RPCResult::Type::BOOL, "already_present", "Exact target was already registered; no duplicate retry work was created"},
+            {RPCResult::Type::STR, "status", "queued, already_present, or refused"},
+            {RPCResult::Type::STR, "address", "Validated target endpoint, or empty on validation failure"},
+            {RPCResult::Type::STR, "operator_pubkey", "Pinned public network identity, or empty on validation failure"},
+            {RPCResult::Type::STR, "persistence", "memory_only; this call never edits startup configuration"},
+            {RPCResult::Type::BOOL, "connection_is_quorum_proof", "Always false"},
+            {RPCResult::Type::STR, "error", "Precise admission refusal, or empty"},
+        }},
+        RPCExamples{HelpExampleCli("flowmeshconnect", "\"<operator_pubkey>@<numeric_ip>:5649\"")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto& service{EnsureAnyNodeContext(request.context).flowmesh};
+            if (!service) throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "FlowMesh service is not available yet");
+            const auto result{service->AddNetworkPeer(request.params[0].get_str())};
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("accepted", result.accepted);
+            out.pushKV("already_present", result.already_present);
+            out.pushKV("status", !result.accepted ? "refused" : result.already_present ? "already_present" : "queued");
+            out.pushKV("address", result.address);
+            out.pushKV("operator_pubkey", result.operator_pubkey);
+            out.pushKV("persistence", "memory_only");
+            out.pushKV("connection_is_quorum_proof", false);
+            out.pushKV("error", result.error);
+            return out;
+        }};
+}
+
 static RPCHelpMan getflowmeshnetworkinfo()
 {
     return RPCHelpMan{
@@ -76,6 +140,18 @@ static RPCHelpMan getflowmeshnetworkinfo()
             TrafficResult("critical"),
             TrafficResult("action"),
             TrafficResult("bulk"),
+            {RPCResult::Type::ARR, "targets", "Bounded configured and runtime-added connection targets, including unsuccessful attempts", {
+                {RPCResult::Type::OBJ, "", "", {
+                    {RPCResult::Type::STR, "address", "Numeric destination endpoint"},
+                    {RPCResult::Type::STR, "operator_pubkey", "Pinned identity, or empty for an unpinned startup target"},
+                    {RPCResult::Type::BOOL, "runtime_added", "Added through RPC rather than startup configuration"},
+                    {RPCResult::Type::BOOL, "admitted_to_worker", "Worker has installed this queued target"},
+                    {RPCResult::Type::BOOL, "authenticated", "Logical peer completed all required transport channels"},
+                    TargetChannelResult("critical"),
+                    TargetChannelResult("action"),
+                    TargetChannelResult("bulk"),
+                }},
+            }},
             {RPCResult::Type::ARR, "peers", "Bounded independent logical peers", {
                 {RPCResult::Type::OBJ, "", "", {
                     {RPCResult::Type::NUM, "id", "Connection-local independent peer id"},
@@ -129,6 +205,20 @@ static RPCHelpMan getflowmeshnetworkinfo()
             out.pushKV("critical", TrafficJSON(snapshot.traffic[0]));
             out.pushKV("action", TrafficJSON(snapshot.traffic[1]));
             out.pushKV("bulk", TrafficJSON(snapshot.traffic[2]));
+            UniValue targets{UniValue::VARR};
+            for (const auto& target : snapshot.targets) {
+                UniValue item{UniValue::VOBJ};
+                item.pushKV("address", target.address);
+                item.pushKV("operator_pubkey", target.operator_pubkey);
+                item.pushKV("runtime_added", target.runtime_added);
+                item.pushKV("admitted_to_worker", target.admitted_to_worker);
+                item.pushKV("authenticated", target.authenticated);
+                item.pushKV("critical", TargetChannelJSON(target.channels[0]));
+                item.pushKV("action", TargetChannelJSON(target.channels[1]));
+                item.pushKV("bulk", TargetChannelJSON(target.channels[2]));
+                targets.push_back(std::move(item));
+            }
+            out.pushKV("targets", std::move(targets));
             UniValue peers{UniValue::VARR};
             for (const auto& peer : snapshot.peers) {
                 UniValue item{UniValue::VOBJ};
@@ -304,6 +394,7 @@ static RPCHelpMan getflowmeshdeliveryinfo()
 void RegisterFlowMeshNetworkRPCCommands(CRPCTable& table)
 {
     static const CRPCCommand commands[]{
+        {"flowmesh", &flowmeshconnect},
         {"flowmesh", &getflowmeshnetworkinfo},
         {"flowmesh", &getflowmeshdeliveryinfo},
     };

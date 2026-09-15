@@ -135,6 +135,8 @@ public:
     bool LegacyTransportEnabled() const;
     std::string TransportMode() const;
     FlowMeshNetSnapshot NetworkSnapshot() const;
+    /** Admit one pinned, process-lifetime connection target; never arms a key. */
+    FlowMeshNetConnectResult AddNetworkPeer(const std::string& peer);
     std::vector<FlowMeshRuntimeDeliverySnapshot> DeliverySnapshots(
         std::optional<flowmesh::MarketId> market_id = std::nullopt) const;
 

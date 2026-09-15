@@ -1604,6 +1604,26 @@ FlowMeshNetSnapshot FlowMeshService::NetworkSnapshot() const
     return network ? network->Snapshot() : FlowMeshNetSnapshot{};
 }
 
+FlowMeshNetConnectResult FlowMeshService::AddNetworkPeer(const std::string& peer)
+{
+    std::shared_ptr<FlowMeshNetService> network;
+    {
+        std::lock_guard<std::mutex> lock{m_impl->mutex};
+        if (!m_impl->running || m_impl->stopping) {
+            FlowMeshNetConnectResult result;
+            result.error = "FlowMesh service is not running";
+            return result;
+        }
+        network = m_impl->network;
+    }
+    // Keep the transport alive without holding a service/chain lock across
+    // admission. AddPeer checks transport shutdown under its own queue lock.
+    if (network) return network->AddPeer(peer);
+    FlowMeshNetConnectResult result;
+    result.error = "Independent FlowMesh transport is not configured";
+    return result;
+}
+
 std::vector<FlowMeshRuntimeDeliverySnapshot> FlowMeshService::DeliverySnapshots(
     std::optional<flowmesh::MarketId> market_id) const
 {

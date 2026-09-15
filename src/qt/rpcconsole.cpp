@@ -79,6 +79,7 @@ const QStringList historyFilter = QStringList()
     << "importdescriptors"
     << "importfinalitykey"
     << "importflowmeshkey"
+    << "exportflowmeshkey"
     << "importlegacywalletdump"
     << "migratewallet"
     << "signmessagewithprivkey"

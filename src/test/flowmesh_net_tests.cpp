@@ -15,6 +15,7 @@
 #include <boost/test/unit_test.hpp>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <list>
@@ -238,6 +239,210 @@ BOOST_AUTO_TEST_CASE(pinned_three_channel_round_trip_and_persistent_identity)
     const auto start{std::chrono::steady_clock::now()}; b.Stop(); a.Stop();
     BOOST_CHECK(std::chrono::steady_clock::now() - start < 1s);
     BOOST_REQUIRE_MESSAGE(a.Start(error), error); BOOST_CHECK_EQUAL(a.Snapshot().operator_pubkey, identity.operator_pubkey);
+}
+
+BOOST_AUTO_TEST_CASE(runtime_peer_addition_authenticates_three_channels_without_restart)
+{
+    Sink a_sink, b_sink;
+    node::FlowMeshNetService a{Config(m_path_root / "fmnet-live-a"), a_sink};
+    auto b_config{Config(m_path_root / "fmnet-live-b")}; b_config.enable_listen = false;
+    node::FlowMeshNetService b{b_config, b_sink}; std::string error;
+    BOOST_REQUIRE_MESSAGE(a.Start(error), error);
+    BOOST_REQUIRE_MESSAGE(b.Start(error), error);
+    BOOST_CHECK(b.Snapshot().targets.empty());
+    const auto remote{a.Snapshot()}, local{b.Snapshot()};
+    const auto endpoint{remote.operator_pubkey + "@" + remote.bind_address};
+    const auto added{b.AddPeer(endpoint)};
+    BOOST_REQUIRE_MESSAGE(added.accepted, added.error);
+    BOOST_CHECK(!added.already_present);
+    BOOST_CHECK_EQUAL(added.address, remote.bind_address);
+    const auto duplicate{b.AddPeer(endpoint)};
+    BOOST_CHECK(duplicate.accepted && duplicate.already_present);
+    BOOST_REQUIRE(Wait([&] {
+        const auto status{b.Snapshot()};
+        return status.targets.size() == 1 && status.targets[0].authenticated;
+    }));
+    const auto status{b.Snapshot()};
+    BOOST_REQUIRE_EQUAL(status.peers.size(), 1U);
+    BOOST_CHECK(status.peers[0].authenticated);
+    BOOST_CHECK(status.targets[0].runtime_added && status.targets[0].admitted_to_worker);
+    for (const auto& channel : status.targets[0].channels) {
+        BOOST_CHECK(channel.authenticated);
+        BOOST_CHECK_EQUAL(channel.state, "authenticated");
+        BOOST_CHECK_GE(channel.attempts, 1U);
+        BOOST_CHECK_EQUAL(channel.retry_in_ms, 0);
+    }
+    node::FlowMeshRuntimeRelay relay; relay.message = Message(Kind::HELLO);
+    BOOST_CHECK(Admitted(b.Relay(relay)));
+    BOOST_REQUIRE(Wait([&] { return a_sink.Messages().size() == 1; }));
+    b.Stop();
+    BOOST_CHECK(!b.AddPeer(endpoint).accepted);
+    BOOST_REQUIRE_MESSAGE(b.Start(error), error);
+    BOOST_CHECK_EQUAL(b.Snapshot().operator_pubkey, local.operator_pubkey);
+    BOOST_CHECK(b.Snapshot().targets.empty()); // runtime-only, never persisted to config
+}
+
+BOOST_AUTO_TEST_CASE(runtime_peer_addition_validates_pins_ports_duplicates_and_capacity)
+{
+    Sink sink; auto config{Config(m_path_root / "fmnet-live-bounds")};
+    config.enable_listen = false; config.max_peers = 2;
+    node::FlowMeshNetService service{config, sink}; std::string error;
+    CKey first, second, third; first.MakeNewKey(true); second.MakeNewKey(true); third.MakeNewKey(true);
+    const auto key1{HexStr(first.GetPubKey())}, key2{HexStr(second.GetPubKey())}, key3{HexStr(third.GetPubKey())};
+    BOOST_CHECK(!service.AddPeer(key1 + "@127.0.0.1:1").accepted);
+    BOOST_REQUIRE_MESSAGE(service.Start(error), error);
+    for (const auto& value : std::vector<std::string>{"127.0.0.1:1", key1 + "@127.0.0.1", key1 + "@127.0.0.1:0",
+             key1 + "@localhost:5649", key1 + "@127.0.0.1:65536", "bad@127.0.0.1:1",
+             key1 + "\\@127.0.0.1:1", std::string(257, 'a'), service.Snapshot().operator_pubkey + "@127.0.0.1:1"}) {
+        const auto result{service.AddPeer(value)};
+        BOOST_CHECK_MESSAGE(!result.accepted && !result.error.empty(), value);
+    }
+    BOOST_CHECK(service.Snapshot().targets.empty());
+    BOOST_REQUIRE(service.AddPeer(key1 + "@127.0.0.1:1").accepted);
+    BOOST_CHECK(service.AddPeer(key1 + "@127.0.0.1:1").already_present);
+    BOOST_CHECK(!service.AddPeer(key2 + "@127.0.0.1:1").accepted);
+    BOOST_CHECK(!service.AddPeer(key1 + "@127.0.0.1:2").accepted);
+    BOOST_REQUIRE(service.AddPeer(key2 + "@127.0.0.1:2").accepted);
+    const auto full{service.AddPeer(key3 + "@127.0.0.1:3")};
+    BOOST_CHECK(!full.accepted);
+    BOOST_CHECK(full.error.find("capacity") != std::string::npos);
+    BOOST_CHECK_EQUAL(service.Snapshot().targets.size(), 2U);
+    std::atomic<bool> start{false};
+    std::thread caller{[&] {
+        while (!start.load()) std::this_thread::yield();
+        for (size_t i{0}; i < 1000; ++i) (void)service.AddPeer(key1 + "@127.0.0.1:1");
+    }};
+    start = true; service.Stop(); caller.join();
+    BOOST_CHECK(!service.Snapshot().running);
+    BOOST_CHECK(!service.AddPeer(key1 + "@127.0.0.1:1").accepted);
+}
+
+BOOST_AUTO_TEST_CASE(runtime_peer_reservations_do_not_evict_existing_inbound_operator)
+{
+    Sink a_sink, b_sink;
+    auto a_config{Config(m_path_root / "fmnet-live-inbound-a")}; a_config.max_peers = 1;
+    node::FlowMeshNetService a{a_config, a_sink}; std::string error;
+    BOOST_REQUIRE_MESSAGE(a.Start(error), error);
+    const auto remote{a.Snapshot()};
+    auto b_config{Config(m_path_root / "fmnet-live-inbound-b")};
+    b_config.peers = {remote.operator_pubkey + "@" + remote.bind_address};
+    node::FlowMeshNetService b{b_config, b_sink};
+    BOOST_REQUIRE_MESSAGE(b.Start(error), error);
+    BOOST_REQUIRE(Wait([&] { const auto s{a.Snapshot()}; return s.peers.size() == 1 && s.peers[0].authenticated; }));
+    const auto original_id{a.Snapshot().peers[0].id};
+    CKey unrelated; unrelated.MakeNewKey(true);
+    const auto refused{a.AddPeer(HexStr(unrelated.GetPubKey()) + "@127.0.0.1:1")};
+    BOOST_CHECK(!refused.accepted);
+    BOOST_CHECK(refused.error.find("capacity") != std::string::npos);
+    const auto b_identity{b.Snapshot()};
+    BOOST_REQUIRE(a.AddPeer(b_identity.operator_pubkey + "@" + b_identity.bind_address).accepted);
+    BOOST_REQUIRE(Wait([&] { const auto s{a.Snapshot()}; return s.targets.size() == 1 && s.targets[0].authenticated; }));
+    BOOST_CHECK_EQUAL(a.Snapshot().peers[0].id, original_id);
+    BOOST_CHECK(a.Snapshot().peers[0].authenticated);
+}
+
+BOOST_AUTO_TEST_CASE(runtime_peer_concurrent_additions_keep_the_target_bound)
+{
+    Sink sink; auto config{Config(m_path_root / "fmnet-live-concurrent")};
+    config.enable_listen = false; config.max_peers = 4;
+    node::FlowMeshNetService service{config, sink}; std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(error), error);
+    std::array<std::string, 8> endpoints;
+    for (size_t i{0}; i < endpoints.size(); ++i) {
+        CKey key; key.MakeNewKey(true);
+        endpoints[i] = HexStr(key.GetPubKey()) + "@127.0.0.1:" + std::to_string(i + 1);
+    }
+    std::atomic<bool> start{false}; std::atomic<size_t> accepted{0};
+    std::vector<std::thread> callers;
+    for (const auto& endpoint : endpoints) callers.emplace_back([&, endpoint] {
+        while (!start.load()) std::this_thread::yield();
+        if (service.AddPeer(endpoint).accepted) ++accepted;
+    });
+    start = true;
+    for (auto& caller : callers) caller.join();
+    BOOST_CHECK_EQUAL(accepted.load(), config.max_peers);
+    BOOST_CHECK_EQUAL(service.Snapshot().targets.size(), config.max_peers);
+    BOOST_REQUIRE(Wait([&] {
+        const auto status{service.Snapshot()};
+        return std::all_of(status.targets.begin(), status.targets.end(), [](const auto& t) { return t.admitted_to_worker; });
+    }));
+}
+
+BOOST_AUTO_TEST_CASE(runtime_peer_reports_handshake_timeout_separately_from_connect_refusal)
+{
+    auto listener{CreateSock(AF_INET, SOCK_STREAM, IPPROTO_TCP)};
+    BOOST_REQUIRE(listener); BOOST_REQUIRE(listener->SetNonBlocking());
+    const auto endpoint{LookupNumeric("127.0.0.1", 0)};
+    sockaddr_storage raw{}; socklen_t length{sizeof(raw)};
+    BOOST_REQUIRE(endpoint.GetSockAddr(reinterpret_cast<sockaddr*>(&raw), &length));
+    BOOST_REQUIRE_EQUAL(listener->Bind(reinterpret_cast<sockaddr*>(&raw), length), 0);
+    BOOST_REQUIRE_EQUAL(listener->Listen(4), 0);
+    length = sizeof(raw); BOOST_REQUIRE_EQUAL(listener->GetSockName(reinterpret_cast<sockaddr*>(&raw), &length), 0);
+    CService bound; BOOST_REQUIRE(bound.SetSockAddr(reinterpret_cast<sockaddr*>(&raw), length));
+    Sink sink; auto config{Config(m_path_root / "fmnet-live-handshake-timeout")}; config.enable_listen = false;
+    node::FlowMeshNetService service{config, sink}; std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(error), error);
+    CKey expected; expected.MakeNewKey(true);
+    BOOST_REQUIRE(service.AddPeer(HexStr(expected.GetPubKey()) + "@" + bound.ToStringAddrPort()).accepted);
+    std::vector<std::unique_ptr<Sock>> accepted;
+    BOOST_REQUIRE(Wait([&] {
+        length = sizeof(raw); auto socket{listener->Accept(reinterpret_cast<sockaddr*>(&raw), &length)};
+        if (socket) accepted.push_back(std::move(socket));
+        return accepted.size() == 3;
+    }));
+    // Real TCP connections are accepted, but no operator hello is returned.
+    BOOST_REQUIRE(Wait([&] {
+        const auto status{service.Snapshot()};
+        return std::any_of(status.targets[0].channels.begin(), status.targets[0].channels.end(), [](const auto& channel) {
+            return channel.last_error == "operator handshake deadline exceeded (five seconds)" && channel.failures != 0;
+        });
+    }, 7000ms));
+    BOOST_CHECK(service.Snapshot().peers.empty());
+    BOOST_CHECK(!service.Snapshot().targets[0].authenticated);
+}
+
+BOOST_AUTO_TEST_CASE(runtime_peer_wrong_pin_is_reported_and_retried_without_authentication)
+{
+    Sink a_sink, b_sink;
+    node::FlowMeshNetService a{Config(m_path_root / "fmnet-live-wrong-a"), a_sink};
+    auto b_config{Config(m_path_root / "fmnet-live-wrong-b")}; b_config.enable_listen = false;
+    node::FlowMeshNetService b{b_config, b_sink}; std::string error;
+    BOOST_REQUIRE_MESSAGE(a.Start(error), error);
+    BOOST_REQUIRE_MESSAGE(b.Start(error), error);
+    CKey wrong; wrong.MakeNewKey(true);
+    BOOST_REQUIRE(b.AddPeer(HexStr(wrong.GetPubKey()) + "@" + a.Snapshot().bind_address).accepted);
+    BOOST_REQUIRE(Wait([&] {
+        const auto s{b.Snapshot()};
+        return !s.targets.empty() && std::any_of(s.targets[0].channels.begin(), s.targets[0].channels.end(), [](const auto& c) {
+            return c.failures != 0 && c.last_error == "remote operator public key does not match configured pin";
+        });
+    }));
+    BOOST_REQUIRE(Wait([&] {
+        const auto s{b.Snapshot()};
+        return std::any_of(s.targets[0].channels.begin(), s.targets[0].channels.end(), [](const auto& c) { return c.attempts >= 2; });
+    }, 5000ms));
+    BOOST_CHECK(b.Snapshot().peers.empty());
+    BOOST_CHECK(!b.Snapshot().targets[0].authenticated);
+}
+
+BOOST_AUTO_TEST_CASE(runtime_peer_reports_refusal_then_connects_when_listener_returns)
+{
+    Sink a_sink, b_sink; auto a_config{Config(m_path_root / "fmnet-live-return-a")};
+    node::FlowMeshNetService a{a_config, a_sink}; std::string error;
+    BOOST_REQUIRE_MESSAGE(a.Start(error), error);
+    const auto remote{a.Snapshot()}; a.Stop();
+    auto b_config{Config(m_path_root / "fmnet-live-return-b")}; b_config.enable_listen = false;
+    node::FlowMeshNetService b{b_config, b_sink}; BOOST_REQUIRE_MESSAGE(b.Start(error), error);
+    BOOST_REQUIRE(b.AddPeer(remote.operator_pubkey + "@" + remote.bind_address).accepted);
+    BOOST_REQUIRE(Wait([&] { const auto s{b.Snapshot()}; return s.targets[0].channels[0].failures != 0; }));
+    const auto refused{b.Snapshot().targets[0].channels[0]};
+    BOOST_CHECK(!refused.authenticated);
+    BOOST_CHECK(!refused.last_error.empty());
+    a_config.port = LookupNumeric(remote.bind_address).GetPort();
+    node::FlowMeshNetService returning{a_config, a_sink}; BOOST_REQUIRE_MESSAGE(returning.Start(error), error);
+    BOOST_REQUIRE(Wait([&] { return b.Snapshot().targets[0].authenticated; }, 6000ms));
+    BOOST_CHECK_GE(b.Snapshot().targets[0].channels[0].attempts, 2U);
+    BOOST_CHECK_GE(b.Snapshot().targets[0].channels[0].failures, 1U);
 }
 
 BOOST_AUTO_TEST_CASE(operator_key_creation_never_overwrites_existing_or_partial_identity)

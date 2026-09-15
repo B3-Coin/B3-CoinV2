@@ -100,6 +100,8 @@ void RPCNestedTests::rpcNestedTests()
     QVERIFY(filtered == "importfinalitykey(…)");
     RPCConsole::RPCParseCommandLine(nullptr, result, "importflowmeshkey secret", false, &filtered);
     QVERIFY(filtered == "importflowmeshkey(…)");
+    RPCConsole::RPCParseCommandLine(nullptr, result, "exportflowmeshkey public true", false, &filtered);
+    QVERIFY(filtered == "exportflowmeshkey(…)");
     RPCConsole::RPCParseCommandLine(nullptr, result, "importlegacywalletdump /secret/path", false, &filtered);
     QVERIFY(filtered == "importlegacywalletdump(…)");
     RPCConsole::RPCParseCommandLine(nullptr, result, "signmessagewithprivkey abc", false, &filtered);

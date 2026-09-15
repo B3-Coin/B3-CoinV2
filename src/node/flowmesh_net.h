@@ -67,10 +67,28 @@ struct FlowMeshNetPeer {
     std::array<FlowMeshNetTraffic, 3> traffic;
 };
 
+/** Public connection diagnostics, not application delivery or quorum proofs. */
+struct FlowMeshNetTargetChannel {
+    std::string state{"queued"}, last_error;
+    uint64_t attempts{0}, failures{0};
+    int64_t retry_in_ms{0}, last_attempt_age_ms{-1};
+    bool authenticated{false};
+};
+struct FlowMeshNetTarget {
+    std::string address, operator_pubkey;
+    bool runtime_added{false}, admitted_to_worker{false}, authenticated{false};
+    std::array<FlowMeshNetTargetChannel, 3> channels;
+};
+struct FlowMeshNetConnectResult {
+    bool accepted{false}, already_present{false};
+    std::string address, operator_pubkey, error;
+};
+
 struct FlowMeshNetSnapshot {
     bool running{false}, listening{false};
     std::string operator_pubkey, bind_address, error;
     std::vector<FlowMeshNetPeer> peers;
+    std::vector<FlowMeshNetTarget> targets;
     size_t pending_ingress_bytes{0}, outbox_queued_bytes{0};
     uint64_t ingress_retries{0}, ingress_discarded_messages{0}, egress_rejected_messages{0};
     std::string last_ingress_error, last_egress_error;
@@ -99,6 +117,10 @@ public:
     FlowMeshNetService& operator=(const FlowMeshNetService&) = delete;
     bool Start(std::string& error);
     void Stop();
+    //! Queue one pinned numeric endpoint for this service lifetime only. A
+    //! successful return is bounded local admission, NOT TCP/authentication.
+    //! Does not write configuration, touch wallet keys or restart the service.
+    FlowMeshNetConnectResult AddPeer(const std::string& peer);
     //! Synchronous per-peer queue admission, never a claim of remote receipt.
     FlowMeshRelayResult Relay(const FlowMeshRuntimeRelay& relay);
     //! Retire this owner's delivery id. Partially written frames require a

@@ -899,6 +899,7 @@ RPCHelpMan submitbridgecarrier();
 RPCHelpMan claimbridgedeposit();
 RPCHelpMan bridgewithdraw();
 RPCHelpMan importflowmeshkey();
+RPCHelpMan exportflowmeshkey();
 RPCHelpMan bindflowmeshseat();
 RPCHelpMan flowmeshdeposit();
 RPCHelpMan listflowmeshmarkets();
@@ -966,6 +967,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &createflowmeshvaulttx},
         {"wallet", &importfinalitykey},
         {"wallet", &importflowmeshkey},
+        {"wallet", &exportflowmeshkey},
         {"wallet", &revokefinalitykey},
         {"wallet", &getfinalityinfo},
         {"wallet", &getfinalityrecoveryinfo},

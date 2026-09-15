@@ -81,6 +81,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "createfncoin", 1, "options" },
     { "bindflowmeshseat", 0, "address", ParamFormat::STRING },
     { "bindflowmeshseat", 1, "options" },
+    { "exportflowmeshkey", 0, "bls_pubkey", ParamFormat::STRING },
+    { "exportflowmeshkey", 1, "ack_risk" },
     { "flowmeshdeposit", 0, "base_asset_id", ParamFormat::STRING },
     { "flowmeshdeposit", 1, "deposit_asset", ParamFormat::STRING },
     { "flowmeshdeposit", 2, "amount" },
