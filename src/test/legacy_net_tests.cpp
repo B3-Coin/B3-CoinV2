@@ -344,6 +344,33 @@ void ProcessB3BlockMessage(ConnmanTestMsg& connman, CNode& node,
     connman.ProcessMessagesOnce(node);
 }
 
+const CBlockIndex* ReceiveLegacyContinuationTail(
+    ScopedLegacyIndexHistory& history, ChainstateManager& chainman,
+    ConnmanTestMsg& connman, CNode& node)
+    EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    const auto initial{GetBlocksLocators(DrainSentMessages(node))};
+    BOOST_REQUIRE_EQUAL(initial.size(), 1U);
+    const int common_height{history.SparseForkStart(initial.front())};
+    auto page{history.Page(common_height + 1, 499)};
+    const CBlock tail{BuildLegacyDiscoveryBlock(*history.active.at(common_height + 499))};
+    page.emplace_back(MSG_BLOCK, tail.GetLegacyB3Hash());
+    ProcessLegacyInventory(connman, node, page);
+    const auto requested{GetDataInventory(DrainSentMessages(node))};
+    BOOST_REQUIRE_EQUAL(requested.size(), 1U);
+    BOOST_CHECK(requested.front().hash == page.back().hash);
+    ProcessB3BlockMessage(connman, node, tail);
+    const auto waiting{DrainSentMessages(node)};
+    BOOST_CHECK_EQUAL(CountType(waiting, NetMsgType::GETBLOCKS), 0U);
+    BOOST_CHECK_EQUAL(CountType(waiting, NetMsgType::GETDATA), 0U);
+    LOCK(cs_main);
+    const CBlockIndex* stored{chainman.m_blockman.LookupBlockIndex(page.back().hash)};
+    BOOST_REQUIRE(stored);
+    BOOST_CHECK(stored->nStatus & BLOCK_HAVE_DATA);
+    BOOST_CHECK(stored->IsValid(BLOCK_VALID_TRANSACTIONS));
+    return stored;
+}
+
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(legacy_net_tests, TestingSetup)
@@ -602,6 +629,288 @@ BOOST_AUTO_TEST_CASE(exhausted_peer_repolls_after_its_retry_bar_expires)
     SetMockTime(0s);
 }
 
+BOOST_AUTO_TEST_CASE(legacy_continuation_tip_announcement_cannot_precede_the_next_page)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ScopedLegacyIndexHistory history{*m_node.chainman};
+    ConnmanTestMsg& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    connman.SetPeerConnectTimeout(99999s);
+    PeerManager& peerman{*m_node.peerman};
+    auto node{MakeNode(0)};
+    HandshakeLegacy(connman, *node);
+    const auto initial{GetBlocksLocators(DrainSentMessages(*node))};
+    BOOST_REQUIRE_EQUAL(initial.size(), 1U);
+    const int common_height{history.SparseForkStart(initial.front())};
+
+    // A full getblocks page ends in one body we still need. Its following
+    // continuation notification must be consumed before requesting a page.
+    auto page{history.Page(common_height + 1, 499)};
+    const CBlock tail{BuildLegacyDiscoveryBlock(*history.active.at(common_height + 499))};
+    page.emplace_back(MSG_BLOCK, tail.GetLegacyB3Hash());
+    ProcessLegacyInventory(connman, *node, page);
+    const auto tail_request{GetDataInventory(DrainSentMessages(*node))};
+    BOOST_REQUIRE_EQUAL(tail_request.size(), 1U);
+    BOOST_CHECK(tail_request.front().hash == page.back().hash);
+    ProcessB3BlockMessage(connman, *node, tail);
+    const CBlockIndex* stored_tail{
+        WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(page.back().hash))};
+    BOOST_REQUIRE(stored_tail);
+    const auto waiting{DrainSentMessages(*node)};
+    BOOST_CHECK_EQUAL(CountType(waiting, NetMsgType::GETBLOCKS), 0U);
+    BOOST_CHECK_EQUAL(CountType(waiting, NetMsgType::GETDATA), 0U);
+
+    // ProcessGetBlockData appends INV(active tip) after serving the page's
+    // continuation block. This notification was already on the wire before
+    // the new GETBLOCKS reached the server; it is not its next page. Model an
+    // archival peer whose modern tip body cannot be served on this legacy
+    // connection, so the announcement will not receive a BLOCK reply.
+    const uint256 remote_tip{BlockHashFromInt(40'000)};
+    ProcessLegacyInventory(connman, *node, {{MSG_BLOCK, remote_tip}});
+    const auto after_notification{DrainSentMessages(*node)};
+    BOOST_CHECK_EQUAL(GetDataInventory(after_notification).size(), 0U);
+    const auto continued{GetBlocksLocators(after_notification)};
+    BOOST_REQUIRE_EQUAL(continued.size(), 1U);
+    BOOST_CHECK(continued.front().vHave == GetLocator(stored_tail).vHave);
+
+    const CBlock first_next{BuildLegacyDiscoveryBlock(*stored_tail)};
+    const uint256 first_next_hash{first_next.GetLegacyB3Hash()};
+    std::vector<CInv> next_page{{MSG_BLOCK, first_next_hash}};
+    for (uint64_t hash_number{40'001}; hash_number < 40'500; ++hash_number) {
+        next_page.emplace_back(MSG_BLOCK, BlockHashFromInt(hash_number));
+    }
+    ProcessLegacyInventory(connman, *node, next_page);
+    const auto requested{GetDataInventory(DrainSentMessages(*node))};
+    BOOST_CHECK(std::any_of(requested.begin(), requested.end(), [&](const CInv& inv) {
+        return inv.type == MSG_BLOCK && inv.hash == first_next_hash;
+    }));
+
+    // The server correctly starts with the first requested historical block.
+    // An unrelated tip notification must not make that answer out-of-order.
+    ProcessB3BlockMessage(connman, *node, first_next);
+    BOOST_CHECK_MESSAGE(!node->fDisconnect,
+        "hashContinue tip notification contaminated the ordered historical download queue");
+    BOOST_CHECK_MESSAGE(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(first_next_hash)) != nullptr,
+        "the first body of the genuine next page must reach normal block validation");
+    peerman.FinalizeNode(*node);
+}
+
+BOOST_AUTO_TEST_CASE(legacy_continuation_legitimate_singleton_final_page_is_downloaded)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ScopedLegacyIndexHistory history{*m_node.chainman};
+    ConnmanTestMsg& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    connman.SetPeerConnectTimeout(99999s);
+    PeerManager& peerman{*m_node.peerman};
+    auto node{MakeNode(0)};
+    HandshakeLegacy(connman, *node);
+    const auto initial{GetBlocksLocators(DrainSentMessages(*node))};
+    BOOST_REQUIRE_EQUAL(initial.size(), 1U);
+    const int common_height{history.SparseForkStart(initial.front())};
+
+    // This full page is already stored, so no GETDATA for its tail occurs and
+    // the server emits no hashContinue tip notification. A singleton received
+    // after the next GETBLOCKS really can be the final historical page.
+    const auto known_page{history.Page(common_height + 1)};
+    ProcessLegacyInventory(connman, *node, known_page);
+    const auto continued{DrainSentMessages(*node)};
+    BOOST_CHECK_EQUAL(CountType(continued, NetMsgType::GETDATA), 0U);
+    BOOST_REQUIRE_EQUAL(GetBlocksLocators(continued).size(), 1U);
+    const CBlock final_block{BuildLegacyDiscoveryBlock(*history.active.at(common_height + 500))};
+    const uint256 final_hash{final_block.GetLegacyB3Hash()};
+    ProcessLegacyInventory(connman, *node, {{MSG_BLOCK, final_hash}});
+    const auto requested{GetDataInventory(DrainSentMessages(*node))};
+    BOOST_REQUIRE_EQUAL(requested.size(), 1U);
+    BOOST_CHECK_EQUAL(requested.front().type, MSG_BLOCK);
+    BOOST_CHECK(requested.front().hash == final_hash);
+    ProcessB3BlockMessage(connman, *node, final_block);
+    BOOST_CHECK(!node->fDisconnect);
+    const CBlockIndex* stored{
+        WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(final_hash))};
+    BOOST_REQUIRE(stored);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(stored->nStatus & BLOCK_HAVE_DATA);
+        BOOST_CHECK(stored->IsValid(BLOCK_VALID_TRANSACTIONS));
+    }
+    (void)DrainSentMessages(*node);
+    peerman.FinalizeNode(*node);
+}
+
+BOOST_AUTO_TEST_CASE(legacy_continuation_missing_notification_retires_ambiguous_connection)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ScopedLegacyIndexHistory history{*m_node.chainman};
+    ConnmanTestMsg& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    connman.SetPeerConnectTimeout(99999s);
+    PeerManager& peerman{*m_node.peerman};
+    const auto t0{std::chrono::seconds{1'700'000'000}};
+    SetMockTime(t0);
+    auto owner{MakeNode(0)};
+    auto backup{MakeNode(1)};
+    HandshakeLegacy(connman, *owner);
+    HandshakeLegacy(connman, *backup);
+    const CBlockIndex* cursor{ReceiveLegacyContinuationTail(
+        history, *m_node.chainman, connman, *owner)};
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*backup), NetMsgType::GETBLOCKS), 0U);
+
+    // No continuation INV arrives. The existing response timeout is strictly
+    // greater than two minutes; the owner lease may move in the meantime.
+    SetMockTime(t0 + 119s);
+    BOOST_CHECK(peerman.SendMessages(*owner));
+    BOOST_CHECK(peerman.SendMessages(*backup));
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*owner), NetMsgType::GETBLOCKS), 0U);
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*backup), NetMsgType::GETBLOCKS), 0U);
+    BOOST_CHECK(!owner->fDisconnect);
+    SetMockTime(t0 + 120s);
+    BOOST_CHECK(peerman.SendMessages(*owner));
+    BOOST_CHECK(!owner->fDisconnect);
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*owner), NetMsgType::GETBLOCKS), 0U);
+    SetMockTime(t0 + 121s);
+    BOOST_CHECK(peerman.SendMessages(*backup));
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*backup), NetMsgType::GETBLOCKS), 1U);
+    BOOST_CHECK(peerman.SendMessages(*owner));
+    const auto released{DrainSentMessages(*owner)};
+    BOOST_CHECK_EQUAL(CountType(released, NetMsgType::GETBLOCKS), 0U);
+    BOOST_CHECK_EQUAL(CountType(released, NetMsgType::GETDATA), 0U);
+    BOOST_CHECK_MESSAGE(owner->fDisconnect,
+        "an expired continuation must retire its ambiguous connection");
+    BOOST_CHECK(!m_node.banman->IsBanned(owner->addr));
+    BOOST_CHECK(!m_node.banman->IsDiscouraged(owner->addr));
+
+    // Both the backup's lease and the old owner's cooldown are now expired.
+    // Reusing the old connection would make its delayed continuation appear
+    // to answer a new GETBLOCKS and request the unrelated remote tip body.
+    SetMockTime(t0 + 242s);
+    BOOST_CHECK(peerman.SendMessages(*owner));
+    const auto resumed{DrainSentMessages(*owner)};
+    BOOST_CHECK_EQUAL(CountType(resumed, NetMsgType::GETBLOCKS), 0U);
+    BOOST_CHECK_EQUAL(CountType(resumed, NetMsgType::GETDATA), 0U);
+    ProcessLegacyInventory(connman, *owner, {{MSG_BLOCK, BlockHashFromInt(43'000)}});
+    const auto delayed{DrainSentMessages(*owner)};
+    BOOST_CHECK_EQUAL(CountType(delayed, NetMsgType::GETBLOCKS), 0U);
+    BOOST_CHECK_EQUAL(CountType(delayed, NetMsgType::GETDATA), 0U);
+    BOOST_CHECK(owner->fDisconnect);
+    BOOST_CHECK(!m_node.banman->IsBanned(owner->addr));
+    BOOST_CHECK(!m_node.banman->IsDiscouraged(owner->addr));
+    BOOST_CHECK(!backup->fDisconnect);
+    peerman.FinalizeNode(*owner);
+    peerman.FinalizeNode(*backup);
+
+    // A fresh connection can discover and download a legitimate singleton
+    // final page through the normal body-validation path.
+    auto fresh{MakeNode(2)};
+    HandshakeLegacy(connman, *fresh);
+    BOOST_REQUIRE_EQUAL(GetBlocksLocators(DrainSentMessages(*fresh)).size(), 1U);
+    const CBlock final_block{BuildLegacyDiscoveryBlock(*cursor)};
+    const uint256 final_hash{final_block.GetLegacyB3Hash()};
+    ProcessLegacyInventory(connman, *fresh, {{MSG_BLOCK, final_hash}});
+    const auto requested{GetDataInventory(DrainSentMessages(*fresh))};
+    BOOST_REQUIRE_EQUAL(requested.size(), 1U);
+    BOOST_CHECK_EQUAL(requested.front().type, MSG_BLOCK);
+    BOOST_CHECK(requested.front().hash == final_hash);
+    ProcessB3BlockMessage(connman, *fresh, final_block);
+    BOOST_CHECK(!fresh->fDisconnect);
+    const CBlockIndex* stored{
+        WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(final_hash))};
+    BOOST_REQUIRE(stored);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(stored->nStatus & BLOCK_HAVE_DATA);
+        BOOST_CHECK(stored->IsValid(BLOCK_VALID_TRANSACTIONS));
+    }
+    peerman.FinalizeNode(*fresh);
+    SetMockTime(0s);
+}
+
+BOOST_AUTO_TEST_CASE(legacy_continuation_late_former_owner_cannot_start_another_window)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ScopedLegacyIndexHistory history{*m_node.chainman};
+    ConnmanTestMsg& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    connman.SetPeerConnectTimeout(99999s);
+    PeerManager& peerman{*m_node.peerman};
+    const auto t0{std::chrono::seconds{1'700'000'000}};
+    SetMockTime(t0);
+    auto owner{MakeNode(0)};
+    auto backup{MakeNode(1)};
+    HandshakeLegacy(connman, *owner);
+    HandshakeLegacy(connman, *backup);
+    // The owner's progress lease expires at t0+120, while its continuation
+    // response remains within the existing two-minute wait until t0+150.
+    SetMockTime(t0 + 30s);
+    (void)ReceiveLegacyContinuationTail(history, *m_node.chainman, connman, *owner);
+    (void)DrainSentMessages(*backup);
+    SetMockTime(t0 + 121s);
+    BOOST_CHECK(peerman.SendMessages(*backup));
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*backup), NetMsgType::GETBLOCKS), 1U);
+
+    // The delayed notification belongs to the expired owner's old page. It
+    // cannot seize the backup's lease or add a parallel historical queue.
+    ProcessLegacyInventory(connman, *owner, {{MSG_BLOCK, BlockHashFromInt(41'000)}});
+    BOOST_CHECK(peerman.SendMessages(*owner));
+    const auto late{DrainSentMessages(*owner)};
+    BOOST_CHECK_EQUAL(CountType(late, NetMsgType::GETBLOCKS), 0U);
+    BOOST_CHECK_EQUAL(CountType(late, NetMsgType::GETDATA), 0U);
+    const uint256 backup_block{BlockHashFromInt(41'001)};
+    ProcessLegacyInventory(connman, *backup, {{MSG_BLOCK, backup_block}});
+    const auto requested{GetDataInventory(DrainSentMessages(*backup))};
+    BOOST_REQUIRE_EQUAL(requested.size(), 1U);
+    BOOST_CHECK(requested.front().hash == backup_block);
+    BOOST_CHECK(!owner->fDisconnect);
+    BOOST_CHECK(!backup->fDisconnect);
+    peerman.FinalizeNode(*owner);
+    peerman.FinalizeNode(*backup);
+    SetMockTime(0s);
+}
+
+BOOST_AUTO_TEST_CASE(legacy_continuation_async_inventory_cannot_extend_an_active_body_queue)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ScopedLegacyIndexHistory history{*m_node.chainman};
+    ConnmanTestMsg& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    connman.SetPeerConnectTimeout(99999s);
+    PeerManager& peerman{*m_node.peerman};
+    auto node{MakeNode(0)};
+    HandshakeLegacy(connman, *node);
+    const auto initial{GetBlocksLocators(DrainSentMessages(*node))};
+    BOOST_REQUIRE_EQUAL(initial.size(), 1U);
+    const int common_height{history.SparseForkStart(initial.front())};
+    const CBlock first{BuildLegacyDiscoveryBlock(*history.active.at(common_height))};
+    const uint256 first_hash{first.GetLegacyB3Hash()};
+    CBlockIndex first_header{first};
+    first_header.phashBlock = &first_hash;
+    first_header.nHeight = common_height + 1;
+    const CBlock second{BuildLegacyDiscoveryBlock(first_header)};
+    const uint256 second_hash{second.GetLegacyB3Hash()};
+    ProcessLegacyInventory(connman, *node, {{MSG_BLOCK, first_hash}, {MSG_BLOCK, second_hash}});
+    const auto requested{GetDataInventory(DrainSentMessages(*node))};
+    BOOST_REQUIRE_EQUAL(requested.size(), 2U);
+    BOOST_CHECK(requested[0].hash == first_hash);
+    BOOST_CHECK(requested[1].hash == second_hash);
+
+    // A tip announcement during the reply stream is not part of the page.
+    // It must not append an unavailable third body or consume download slots.
+    ProcessLegacyInventory(connman, *node, {{MSG_BLOCK, BlockHashFromInt(42'000)}});
+    const auto asynchronous{DrainSentMessages(*node)};
+    BOOST_CHECK_EQUAL(CountType(asynchronous, NetMsgType::GETDATA), 0U);
+    BOOST_CHECK_EQUAL(CountType(asynchronous, NetMsgType::GETBLOCKS), 0U);
+    ProcessB3BlockMessage(connman, *node, first);
+    const auto after_first{DrainSentMessages(*node)};
+    BOOST_CHECK_EQUAL(CountType(after_first, NetMsgType::GETDATA), 0U);
+    BOOST_CHECK_EQUAL(CountType(after_first, NetMsgType::GETBLOCKS), 0U);
+    ProcessB3BlockMessage(connman, *node, second);
+    const auto complete{DrainSentMessages(*node)};
+    BOOST_CHECK_EQUAL(CountType(complete, NetMsgType::GETDATA), 0U);
+    const auto locators{GetBlocksLocators(complete)};
+    BOOST_REQUIRE_EQUAL(locators.size(), 1U);
+    const CBlockIndex* stored{
+        WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(second_hash))};
+    BOOST_REQUIRE(stored);
+    BOOST_CHECK(locators.front().vHave == GetLocator(stored).vHave);
+    BOOST_CHECK(!node->fDisconnect);
+    peerman.FinalizeNode(*node);
+}
+
 BOOST_AUTO_TEST_CASE(legacy_discovery_known_pages_advance_and_repeated_page_stops)
 {
     LOCK(NetEventsInterface::g_msgproc_mutex);
@@ -779,7 +1088,8 @@ BOOST_AUTO_TEST_CASE(legacy_discovery_received_side_branch_continues_and_former_
     BOOST_CHECK_EQUAL(CountType(waiting, NetMsgType::GETBLOCKS), 0U);
 
     // Receipt writes the full body and links its transaction history, but its
-    // branch still has less work. Continue from that stored body immediately.
+    // branch still has less work. Consume its continuation notification, then
+    // continue from that stored body without requiring activation.
     ProcessB3BlockMessage(connman, *owner, tail);
     const CBlockIndex* stored_tail{
         WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(tail_hash))};
@@ -791,7 +1101,11 @@ BOOST_AUTO_TEST_CASE(legacy_discovery_received_side_branch_continues_and_former_
         BOOST_CHECK(stored_tail->HaveNumChainTxs());
     }
     BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip()) == history.active.back());
-    const auto continued{GetBlocksLocators(DrainSentMessages(*owner))};
+    BOOST_CHECK_EQUAL(CountType(DrainSentMessages(*owner), NetMsgType::GETBLOCKS), 0U);
+    ProcessLegacyInventory(connman, *owner, {{MSG_BLOCK, BlockHashFromInt(30'999)}});
+    const auto continuation_messages{DrainSentMessages(*owner)};
+    BOOST_CHECK_EQUAL(CountType(continuation_messages, NetMsgType::GETDATA), 0U);
+    const auto continued{GetBlocksLocators(continuation_messages)};
     BOOST_REQUIRE_EQUAL(continued.size(), 1U);
     BOOST_CHECK(continued.front().vHave == GetLocator(stored_tail).vHave);
 

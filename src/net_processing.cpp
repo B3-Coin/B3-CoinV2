@@ -483,6 +483,12 @@ struct Peer {
      * the active tip. Retained across owner leases so a sparse locator can
      * traverse known pages and a downloaded fork before it becomes active. */
     uint256 m_legacy_sync_cursor GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+    /** Requested full-page tail whose delivery will trigger the peer's
+     * hashContinue announcement. A known tail that we skip never arms this. */
+    uint256 m_legacy_continuation_tail GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+    /** The page tail arrived; consume its following tip INV as a discovery
+     * signal before issuing another getblocks, not as an ordered block body. */
+    bool m_legacy_waiting_for_continuation GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     /** Ordered block inventory retained from the latest legacy getblocks response. */
     std::deque<uint256> m_legacy_block_queue GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
     /** Deduplicates the queued block inventory, including blocks currently requested. */
@@ -999,6 +1005,7 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(cs_main, NetEventsInterface::g_msgproc_mutex)
     {
         peer.m_legacy_sync_exhausted = true;
+        ClearLegacyContinuation(peer);
         if (LegacySyncTargetReached()) return;
         if (m_legacy_sync_peer != nodeid) return;
         LogDebug(BCLog::NET, "Legacy sync peer=%d has no further inventory; releasing the window\n", nodeid);
@@ -1027,6 +1034,36 @@ private:
              index->GetAncestor(previous->nHeight) != previous)) return false;
         peer.m_legacy_sync_cursor = index->GetBlockHash();
         // Inventory is not chain progress and must not renew the owner's lease.
+        return true;
+    }
+
+    static void ClearLegacyContinuation(Peer& peer)
+        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+    {
+        peer.m_legacy_continuation_tail.SetNull();
+        peer.m_legacy_waiting_for_continuation = false;
+    }
+
+    bool DisconnectExpiredLegacyContinuation(CNode& node, Peer& peer)
+        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+    {
+        if (!peer.m_legacy_waiting_for_continuation ||
+            NodeClock::now() - peer.m_legacy_request_time <= HEADERS_RESPONSE_TIME) return false;
+        LOCK(cs_main);
+        if (!IsLegacyPhase()) {
+            ClearLegacyContinuation(peer);
+            return false;
+        }
+        // INV has no request identifier. Reusing this connection for a fresh
+        // page would mistake a delayed old continuation for its response.
+        // Retire the ambiguous connection, without banning the peer or
+        // changing the existing response deadline or validated history.
+        LogDebug(BCLog::NET, "Missing legacy page continuation from peer=%d; disconnecting to retry on a fresh connection\n", node.GetId());
+        node.fDisconnect = true;
+        if (m_legacy_sync_peer == node.GetId()) {
+            m_legacy_sync_peer = -1;
+            m_legacy_sync_lease = {};
+        }
         return true;
     }
 
@@ -3557,6 +3594,7 @@ bool PeerManagerImpl::IsAncestorOfBestHeaderOrTip(const CBlockIndex* header)
 
 bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer)
 {
+    if (pfrom.fDisconnect || DisconnectExpiredLegacyContinuation(pfrom, peer)) return false;
     if (WITH_LOCK(cs_main, return IsLegacyPhase())) {
         // Late replies to a former owner's requests may still be accounted
         // for, but must not start a second discovery/download window.
@@ -3603,6 +3641,9 @@ bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& loc
         if (peer.m_legacy_sync_exhausted) {
             return false;
         }
+        if (peer.m_legacy_waiting_for_continuation) {
+            return false;
+        }
         if (peer.m_legacy_getblocks_in_flight) {
             if (current_time - peer.m_legacy_request_time <= HEADERS_RESPONSE_TIME) {
                 return false;
@@ -3623,12 +3664,14 @@ bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& loc
                 peer.m_legacy_sync_cursor.SetNull();
             }
         }
+        ClearLegacyContinuation(peer);
         MakeAndPushMessage(pfrom, NetMsgType::GETBLOCKS, next_locator, uint256{});
         peer.m_legacy_getblocks_in_flight = true;
         peer.m_legacy_request_time = current_time;
         return true;
     }
 
+    ClearLegacyContinuation(peer);
     const auto current_time = NodeClock::now();
 
     // Only allow a new getheaders message to go out if we don't have a recent
@@ -5204,13 +5247,23 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         // reaction to a block inv -- otherwise the >MAX_BLOCKS_TO_ANNOUNCE
         // inv fallback of a fast-advancing tip would be dropped here and
         // peers would stall (found by the multi-node finality soak).
+        const bool legacy_phase{IsLegacyPhase()};
         const bool legacy_chain{m_chainparams.GetConsensus().legacy_b3coin &&
-                                (IsLegacyPhase() || peer.m_legacy_protocol)};
+                                (legacy_phase || peer.m_legacy_protocol)};
+        if (!legacy_phase) ClearLegacyContinuation(peer);
         const bool legacy_sync_peer{legacy_chain && m_legacy_sync_peer == pfrom.GetId()};
         bool legacy_block_inventory{false};
         bool legacy_unknown_block{false};
-        const bool legacy_getblocks_response{legacy_sync_peer && peer.m_legacy_getblocks_in_flight};
+        const bool legacy_continuation{legacy_phase && peer.m_legacy_waiting_for_continuation &&
+            std::any_of(vInv.begin(), vInv.end(), [](const CInv& inv) { return inv.IsMsgBlk(); })};
+        // Account for a former owner's late continuation too, without opening
+        // a second download window. INV does not identify the getblocks it
+        // answers, so consume this expected signal before sending a new one.
+        if (legacy_continuation) ClearLegacyContinuation(peer);
+        const bool legacy_getblocks_response{legacy_sync_peer && !legacy_continuation &&
+                                             peer.m_legacy_getblocks_in_flight};
         size_t legacy_block_inventory_count{0};
+        uint256 legacy_inventory_tail;
         bool legacy_known_prefix{true};
         bool legacy_cursor_advanced{false};
 
@@ -5248,9 +5301,12 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                     // peer. Other peers may announce the same history, but
                     // accepting their inventories would create an independent
                     // window with no shared ordering or request accounting.
-                    if (!legacy_sync_peer) continue;
+                    // Asynchronous tip announcements are discovery hints,
+                    // not members of the ordered getblocks page being fetched.
+                    if (!legacy_getblocks_response) continue;
                     legacy_block_inventory = true;
                     ++legacy_block_inventory_count;
+                    legacy_inventory_tail = inv.hash;
                     if (fAlreadyHave && legacy_getblocks_response && legacy_known_prefix) {
                         if (AdvanceLegacySyncCursor(peer, known_index)) {
                             legacy_cursor_advanced = true;
@@ -5312,8 +5368,19 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         }
 
         if (legacy_chain) {
+            if (legacy_continuation) {
+                LogDebug(BCLog::NET, "Consumed legacy page continuation from peer=%d\n", pfrom.GetId());
+                if (legacy_sync_peer) {
+                    (void)MaybeSendGetHeaders(pfrom, GetLocator(m_chainman.ActiveChain().Tip()), peer);
+                }
+                return;
+            }
             if (legacy_block_inventory) {
                 peer.m_legacy_getblocks_in_flight = false;
+                if (legacy_phase && legacy_block_inventory_count == LEGACY_GETBLOCKS_RESPONSE_SIZE &&
+                    peer.m_legacy_block_queue_set.contains(legacy_inventory_tail)) {
+                    peer.m_legacy_continuation_tail = legacy_inventory_tail;
+                }
             }
             if (legacy_getblocks_response && legacy_block_inventory && !legacy_unknown_block &&
                 peer.m_legacy_blocks_in_flight == 0 && peer.m_legacy_block_queue.empty()) {
@@ -6147,6 +6214,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             pfrom.fDisconnect = true;
             return;
         }
+        if (legacy_block_requested && hash == peer.m_legacy_continuation_tail) {
+            peer.m_legacy_continuation_tail.SetNull();
+            peer.m_legacy_waiting_for_continuation = WITH_LOCK(cs_main, return IsLegacyPhase());
+        }
 
         // A B3 peer can relay a child block before its parent in both the
         // historical and marker-modern eras. Keep a structurally-valid child
@@ -6203,6 +6274,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                     // connected tip.
                     peer.m_legacy_block_queue.clear();
                     peer.m_legacy_block_queue_set.clear();
+                    peer.m_legacy_continuation_tail.SetNull();
                     peer.m_legacy_getblocks_in_flight = false;
                 }
 
@@ -7225,6 +7297,10 @@ bool PeerManagerImpl::SendMessages(CNode& node)
     Peer& peer{*maybe_peer};
     const Consensus::Params& consensusParams = m_chainparams.GetConsensus();
 
+    // ActiveTipChange does not hold the message-processing mutex. Clear this
+    // connection's historical continuation state on its next message pass.
+    if (!m_in_legacy_phase.load(std::memory_order_relaxed)) ClearLegacyContinuation(peer);
+
     // We must call MaybeDiscourageAndDisconnect first, to ensure that we'll
     // disconnect misbehaving peers even before the version handshake is complete.
     if (MaybeDiscourageAndDisconnect(node, peer)) return true;
@@ -7250,6 +7326,10 @@ bool PeerManagerImpl::SendMessages(CNode& node)
     // Don't send anything until the version handshake is complete
     if (!node.fSuccessfullyConnected || node.fDisconnect)
         return true;
+
+    // This also checks former download owners before they can reclaim the
+    // window; an expired continuation cannot be safely cleared and reused.
+    if (DisconnectExpiredLegacyContinuation(node, peer)) return true;
 
     const auto current_time{GetTime<std::chrono::microseconds>()};
 
@@ -7330,6 +7410,9 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                          m_legacy_sync_peer);
                 if (PeerRef stalled{GetPeerRef(m_legacy_sync_peer)}) {
                     stalled->m_legacy_sync_retry_after = now + LEGACY_SYNC_PROGRESS_LEASE;
+                    // Keep the pending page-tail identity and continuation
+                    // expectation with this connection: late replies still
+                    // need accounting, but cannot send requests as a nonowner.
                 }
                 m_legacy_sync_peer = -1;
                 m_legacy_sync_lease = {};

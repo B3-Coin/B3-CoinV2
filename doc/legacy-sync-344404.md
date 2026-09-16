@@ -74,3 +74,47 @@ This documents the source repair, not recovery of a deployed installation.
 Deployment requires its own controlled restart and verification of sustained
 tip advancement toward the existing sealed history; no reindex, chain
 invalidation or signing-state reset is part of the repair.
+
+## Follow-up: page-continuation announcements
+
+Deployment exposed a second, older download defect. After a requested full
+page's final body, an archival peer sends a `hashContinue` inventory announcing
+its tip. The downloader immediately sent another GETBLOCKS, then treated that
+intervening singleton announcement as the next page. Its tip hash entered the
+ordered GETDATA queue ahead of the actual next historical page. The remote
+modern tip was not delivered on the legacy connection; the next historical
+body therefore triggered the strict out-of-order disconnect.
+
+A bounded deployed trace observed the page-tail block connecting, outgoing
+GETBLOCKS, singleton INV, outgoing singleton GETDATA, next 500-entry INV and
+the out-of-order disconnect. The remote serving implementation explains the
+missing modern body; its internal execution was not captured. An isolated
+two-case reproduction fails for that continuation sequence while a legitimate
+singleton final-page control passes. The latter must remain supported: INV
+has no request identifier, so discarding every singleton is not a fix.
+
+The continuation correction tracks the requested full-page tail. It consumes
+the following continuation announcement as a discovery signal, not a body
+request, before asking from the validated cursor again. All-known pages do not
+wait for a notification that was never requested. Ordinary block announcements
+must not extend a busy ordered download queue. A missing notification remains
+bounded by existing download/owner timeouts; it does not authorize skipping a
+block, accepting a different chain or clearing signing history.
+
+An expired continuation retires that connection without banning its address.
+Clearing the wait and reusing the same connection would let a delayed old INV
+be mistaken for a fresh reply. The focused timeout regression demonstrated
+that failure before the connection-retirement correction. Late replies from a
+former owner that arrive before their response deadline are consumed without
+opening a second download window.
+
+All 53 selected networking, modern-orphan, boundary, checkpoint, identity and
+orphanage cases pass after the correction, including five continuation cases.
+The timeout-reuse candidate fails four targeted assertions before connection
+retirement; the corrected version preserves the strict greater-than-120-second
+deadline, no-ban behavior and fresh-peer singleton download. This does not
+extend the previously stated full-suite or live synchronization qualification.
+
+This targets the standard page-continuation exchange. Because INV contains
+neither a request identifier nor parent headers, it does not claim complete
+correlation of arbitrary unsolicited announcements with pending requests.
