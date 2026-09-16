@@ -48,6 +48,8 @@
 #include <netbase.h>
 #include <netgroup.h>
 #include <node/flowmesh_service.h>
+#include <node/flowmesh_client.h>
+#include <node/asset_metadata.h>
 #include <node/finality_recovery_options.h>
 #include <node/staking.h>
 #include <node/warnings.h>
@@ -290,6 +292,7 @@ void Interrupt(NodeContext& node)
         index->Interrupt();
     }
     if (node.staking) node.staking->Stop();
+    if (node.asset_metadata) node.asset_metadata->Stop();
 }
 
 void Shutdown(NodeContext& node)
@@ -307,6 +310,10 @@ void Shutdown(NodeContext& node)
     util::ThreadRename("shutoff");
     if (node.mempool) node.mempool->AddTransactionsUpdated(1);
 
+    // Public trading admission stops before either the local service or B3
+    // chainstate can disappear. This listener never owns a wallet or FN key.
+    if (node.flowmesh_api) node.flowmesh_api->Stop();
+    node.flowmesh_api.reset();
     StopHTTPRPC();
     StopREST();
     StopRPC();
@@ -329,6 +336,7 @@ void Shutdown(NodeContext& node)
             node.flowmesh.get());
     }
     if (node.flowmesh) node.flowmesh->Stop();
+    if (node.asset_metadata) node.asset_metadata->Stop();
 
     // Because these depend on each-other, we make sure that neither can be
     // using the other before destroying them.
@@ -345,8 +353,12 @@ void Shutdown(NodeContext& node)
 
     // After the threads that potentially access these pointers have been stopped,
     // destruct and reset all to nullptr.
+    // The trading backend outlives its callers and is destroyed before either
+    // its local service or the mandatory B3 chainstate it verifies against.
+    node.flowmesh_trading.reset();
     node.peerman.reset();
     node.flowmesh.reset();
+    node.asset_metadata.reset();
     node.connman.reset();
     node.banman.reset();
     node.addrman.reset();
@@ -557,6 +569,23 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                  ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 
     argsman.AddArg("-addnode=<ip>", strprintf("Add a node to connect to and attempt to keep the connection open (see the addnode RPC help for more info). This option can be specified multiple times to add multiple nodes; connections are limited to %u at a time and are counted separately from the -maxconnections limit.", MAX_ADDNODE_CONNECTIONS), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-enableflowmeshvalidator", "Run the optional local FlowMesh validator service, execution history and operator network (default: 0). Ordinary wallet trading uses configured HTTPS endpoints when disabled. This does not alter B3 consensus validation or automatically arm FN keys.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshtransport=<mode>", "FlowMesh operator routing when -enableflowmeshvalidator=1: independent (default), legacy, or dual. Dual shares one runtime and signing history. Independent disables B3-carried FlowMesh messages, not ordinary B3 networking. FMN2 is authenticated plaintext TCP; this is not the encrypted public trading API.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshlisten", "Listen for independent FlowMesh peers when dual/independent transport is selected (default: 1)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshbind=<ip>", "Numeric independent FlowMesh bind address (default: 127.0.0.1)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshport=<port>", "Independent FlowMesh listener port (default: 5649)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshconnect=<peer>", "Independent FlowMesh peer: compressed-public-operator-key@numeric-address:port. Repeat for independent hosts. An unpinned peer proves only self-selected identity, not trusted routing or FN eligibility.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshrole=<role>", "Independent transport role when -enableflowmeshvalidator=1: validator (default), observer, or sentry. Validator role does not create or automatically arm an FN seat; eligible keys and explicit arming are still required.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshdatadir=<dir>", "Absolute FlowMesh store directory (default: network datadir/flowmesh). Do not copy live signing keys into independent runtimes or discard signing history.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshendpoint=<https-url>", "Restricted HTTPS trading endpoint used without the local validator engine. Repeat for independent failover endpoints (maximum 8). No userinfo, redirects, or HTTP fallback; no wallet/admin RPC endpoint.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshendpointca=<file>", "PEM CA trust bundle for trading endpoints; one bundle may cover all endpoints, or repeat in endpoint order. Empty uses OpenSSL default trust paths. Relative paths are resolved under the network datadir.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshendpointpin=<sha256>", "Optional DER leaf-certificate SHA256 pin for each trading endpoint, repeated in endpoint order (empty entry means no additional pin). CA and hostname/IP verification remain mandatory.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapi", "Serve the separate restricted HTTPS trading API (default: 0); requires -enableflowmeshvalidator=1 and explicit TLS certificate/key files. Does not expose wallet or administrator RPC.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshassetmetadata=<file>", "Explicit public asset label catalog for the FlowMesh operator and its HTTPS clients; JSON array, at most 256 entries/256 KiB. Labels are not issuer or backing proofs. Private wallet labels are never exported. Relative paths use the network datadir; loaded at startup. Requires -enableflowmeshvalidator=1.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapibind=<ip>", "Numeric bind address for the restricted HTTPS trading API (default: 127.0.0.1)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapiport=<port>", "Restricted HTTPS trading API port (default: 5650)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapicert=<file>", "PEM server certificate chain for the restricted HTTPS trading API; relative paths are resolved under the network datadir", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapikey=<file>", "PEM TLS server key for the restricted HTTPS trading API (not an FN or wallet key). Encrypted/prompted keys are unsupported; relative paths use the network datadir.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY | ArgsManager::SENSITIVE, OptionsCategory::CONNECTION);
     argsman.AddArg("-asmap=<file>", strprintf("Specify asn mapping used for bucketing of the peers. Relative paths will be prefixed by the net-specific datadir location.%s",
                 #ifdef ENABLE_EMBEDDED_ASMAP
                     " If a bool arg is given (-asmap or -asmap=1), the embedded mapping data in the binary will be used."
@@ -1354,6 +1383,9 @@ static ChainstateLoadResult InitAndLoadChainstate(
     // This function may be called twice, so any dirty state must be reset.
     node.notifications->setChainstateLoaded(false); // Drop state, such as a cached tip block
     node.mempool.reset();
+    // Also safe on an initialization retry: no worker may outlive chainman.
+    if (node.asset_metadata) node.asset_metadata->Stop();
+    node.asset_metadata.reset();
     node.chainman.reset(); // Drop state, such as an initialized m_block_tree_db
 
     const CChainParams& chainparams = Params();
@@ -1975,31 +2007,133 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         *node.chainman, node.mempool.get(),
         args.GetDataDirNet() / "finality_signer", std::move(operator_recovery));
 
-    // Every node owns the production service object. It remains dormant and
-    // does not advertise the capability unless the complete A2/A3 schedule
-    // is pinned. P2P hands framed messages directly to its bounded worker;
-    // FlowMesh never opens a second port or blocks the B3 validation path.
-    node.flowmesh = std::make_unique<node::FlowMeshService>(
-        chainman, args.GetDataDirNet() / "flowmesh");
-    peerman_opts.flowmesh_sink = node.flowmesh.get();
+    // This one opt-in controls only the optional operator engine. Mandatory B3
+    // FN/checkpoint/vault indexes and validation are never conditional on it.
+    const bool flowmesh_validator{args.GetBoolArg("-enableflowmeshvalidator", false)};
+    const bool flowmesh_api{args.GetBoolArg("-flowmeshapi", false)};
+    if (flowmesh_api && !flowmesh_validator) {
+        return InitError(Untranslated("-flowmeshapi requires -enableflowmeshvalidator=1"));
+    }
+    node::FlowMeshAssetMetadataCatalog flowmesh_metadata;
+    auto metadata_path{args.GetPathArg("-flowmeshassetmetadata")};
+    if (!metadata_path.empty()) {
+        if (!flowmesh_validator) return InitError(Untranslated("-flowmeshassetmetadata requires -enableflowmeshvalidator=1"));
+        if (!metadata_path.is_absolute()) metadata_path = args.GetDataDirNet() / metadata_path;
+        const auto& consensus{chainman.GetConsensus()};
+        const auto domain{consensus.legacy_final_hash
+            ? modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash)
+            : std::nullopt};
+        std::string error;
+        if (!domain || !node::LoadFlowMeshAssetMetadataCatalog(metadata_path, *domain, flowmesh_metadata, error)) {
+            return InitError(Untranslated("Invalid public FlowMesh asset catalog: " + (domain ? error : "chain domain unavailable")));
+        }
+    }
+    peerman_opts.flowmesh_sink = nullptr;
+    g_local_services = ServiceFlags(g_local_services & ~NODE_B3_FLOWMESH);
+    if (flowmesh_validator) {
+        node::FlowMeshServiceTransport transport;
+        transport.mode = args.GetArg("-flowmeshtransport", "independent");
+        if (!transport.LegacyEnabled() && !transport.IndependentEnabled()) {
+            return InitError(Untranslated("Invalid -flowmeshtransport; use legacy, dual or independent"));
+        }
+        const fs::path datadir{args.GetPathArg("-flowmeshdatadir", args.GetDataDirNet() / "flowmesh")};
+        if (!datadir.is_absolute()) return InitError(Untranslated("-flowmeshdatadir must be an absolute path"));
+        if (transport.IndependentEnabled()) {
+            const auto& consensus{chainman.GetConsensus()};
+            const auto domain{consensus.legacy_final_hash
+                ? modern::ModernChainDomain(consensus.hashGenesisBlock, *consensus.legacy_final_hash)
+                : std::nullopt};
+            if (!domain) return InitError(Untranslated("Independent FlowMesh requires a configured ModernChainDomain"));
+            const int64_t port{args.GetIntArg("-flowmeshport", 5649)};
+            if (port < 1 || port > 65535) return InitError(Untranslated("-flowmeshport must be between 1 and 65535"));
+            auto& network{transport.network};
+            network.domain = *domain;
+            network.bind_host = args.GetArg("-flowmeshbind", "127.0.0.1");
+            network.port = static_cast<uint16_t>(port);
+            network.peers = args.GetArgs("-flowmeshconnect");
+            network.enable_listen = args.GetBoolArg("-flowmeshlisten", true);
+            network.role = args.GetArg("-flowmeshrole", "validator");
+            if (network.role != "observer" && network.role != "sentry" && network.role != "validator") {
+                return InitError(Untranslated("-flowmeshrole must be observer, sentry or validator"));
+            }
+            network.datadir = datadir / "network";
+        }
+        node.flowmesh = std::make_unique<node::FlowMeshService>(chainman, datadir, std::move(transport));
+        peerman_opts.flowmesh_sink = node.flowmesh->LegacyTransportEnabled() ? node.flowmesh.get() : nullptr;
+    }
     node.peerman = PeerManager::make(*node.connman, *node.addrman,
                                      node.banman.get(), chainman,
                                      *node.mempool, *node.warnings,
                                      peerman_opts);
     std::string flowmesh_error;
-    if (!node.flowmesh->Start(*node.peerman, flowmesh_error)) {
-        return InitError(Untranslated(strprintf(
-            "FlowMesh production service failed to start: %s",
-            flowmesh_error)));
-    }
-    if (node.flowmesh->Enabled()) {
-        g_local_services =
-            ServiceFlags(g_local_services | NODE_B3_FLOWMESH);
-        validation_signals.RegisterValidationInterface(node.flowmesh.get());
+    if (node.flowmesh) {
+        if (!node.flowmesh->Start(*node.peerman, flowmesh_error)) {
+            return InitError(Untranslated(strprintf("FlowMesh production service failed to start: %s", flowmesh_error)));
+        }
+        if (node.flowmesh->Enabled()) {
+            if (node.flowmesh->LegacyTransportEnabled()) g_local_services = ServiceFlags(g_local_services | NODE_B3_FLOWMESH);
+            validation_signals.RegisterValidationInterface(node.flowmesh.get());
+        }
+        node.flowmesh_trading = node::MakeLocalFlowMeshBackend(*node.flowmesh, flowmesh_metadata);
+        if (flowmesh_api) {
+            node::FlowMeshHttpsServer::Options options;
+            options.bind_host = args.GetArg("-flowmeshapibind", "127.0.0.1");
+            const auto port{args.GetIntArg("-flowmeshapiport", 5650)};
+            if (port < 1 || port > 65535) return InitError(Untranslated("-flowmeshapiport must be between 1 and 65535"));
+            options.port = static_cast<uint16_t>(port);
+            options.cert_file = args.GetPathArg("-flowmeshapicert");
+            options.key_file = args.GetPathArg("-flowmeshapikey");
+            if (options.cert_file.empty() || options.key_file.empty()) {
+                return InitError(Untranslated("-flowmeshapi requires -flowmeshapicert and -flowmeshapikey"));
+            }
+            if (!options.cert_file.is_absolute()) options.cert_file = args.GetDataDirNet() / options.cert_file;
+            if (!options.key_file.is_absolute()) options.key_file = args.GetDataDirNet() / options.key_file;
+            node.flowmesh_api = node::MakeFlowMeshTradingApi(*node.flowmesh, std::move(options), flowmesh_metadata);
+            if (!node.flowmesh_api || !node.flowmesh_api->Start(flowmesh_error)) {
+                return InitError(Untranslated("FlowMesh HTTPS API failed to start: " + flowmesh_error));
+            }
+            LogInfo("FlowMesh restricted HTTPS trading API started on port %u", node.flowmesh_api->Port());
+        }
+    } else {
+        const auto urls{args.GetArgs("-flowmeshendpoint")};
+        const auto cas{args.GetArgs("-flowmeshendpointca")};
+        const auto pins{args.GetArgs("-flowmeshendpointpin")};
+        if (urls.size() > 8 || (!cas.empty() && cas.size() != 1 && cas.size() != urls.size()) ||
+            (!pins.empty() && pins.size() != urls.size()) || (urls.empty() && !cas.empty())) {
+            return InitError(Untranslated("FlowMesh endpoints require at most 8 URLs; CA bundles must be one shared bundle or match endpoint count, and pins must match endpoint count"));
+        }
+        std::vector<node::HttpsEndpoint> endpoints;
+        for (size_t i{0}; i < urls.size(); ++i) {
+            node::HttpsEndpoint endpoint;
+            endpoint.url = urls[i];
+            if (!cas.empty()) {
+                endpoint.ca_file = fs::PathFromString(cas[cas.size() == 1 ? 0 : i]);
+                if (!endpoint.ca_file.empty() && !endpoint.ca_file.is_absolute()) {
+                    endpoint.ca_file = args.GetDataDirNet() / endpoint.ca_file;
+                }
+            }
+            if (!pins.empty()) endpoint.certificate_sha256 = pins[i];
+            if (!node::ValidateFlowMeshHttpsEndpoint(endpoint, flowmesh_error) ||
+                !node::ValidateFlowMeshHttpsTrust(endpoint, flowmesh_error)) {
+                return InitError(Untranslated(strprintf("Invalid FlowMesh endpoint %u: %s", i + 1, flowmesh_error)));
+            }
+            endpoints.push_back(std::move(endpoint));
+        }
+        node.flowmesh_trading = node::MakeRemoteFlowMeshBackend(
+            chainman, std::move(endpoints), args.GetDataDirNet() / "flowmesh_client", flowmesh_error);
+        if (!node.flowmesh_trading) {
+            return InitError(Untranslated("FlowMesh trading client failed to initialize: " + flowmesh_error));
+        }
+        LogInfo("FlowMesh validator engine disabled; HTTPS trading client configured with %u endpoints", urls.size());
     }
     validation_signals.RegisterValidationInterface(node.peerman.get());
     // The staking loop relays its finality signatures through the peer manager.
     if (node.staking) node.staking->SetPeerManager(node.peerman.get());
+
+    // Shared issuance discovery is optional, starts at asset activation, and
+    // never opens its DB or replays blocks on the wallet/startup thread.
+    node.asset_metadata = std::make_unique<node::AssetMetadataCache>(chainman, args.GetDataDirNet());
+    node.asset_metadata->Start(); // Failure is logged by this soft-failing cache.
 
     // ********************************************************* Step 8: start indexers
 

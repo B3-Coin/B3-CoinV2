@@ -11,6 +11,7 @@ add_executable(test_bitcoin
   amount_tests.cpp
   argsman_tests.cpp
   asset_conservation_tests.cpp
+  asset_metadata_cache_tests.cpp
   asset_authorization_tests.cpp
   asset_output_tests.cpp
   asset_validation_tests.cpp
@@ -69,6 +70,7 @@ add_executable(test_bitcoin
   feefrac_tests.cpp
   feerounder_tests.cpp
   flatfile_tests.cpp
+  flowmesh_asset_metadata_tests.cpp
   flowmesh_batch_tests.cpp
   flowmesh_bls_certificate_tests.cpp
   flowmesh_checkpoint_codec_tests.cpp
@@ -79,6 +81,10 @@ add_executable(test_bitcoin
   flowmesh_production_store_tests.cpp
   flowmesh_runtime_tests.cpp
   flowmesh_service_tests.cpp
+  flowmesh_net_tests.cpp
+  flowmesh_https_tests.cpp
+  flowmesh_client_evidence_tests.cpp
+  flowmesh_transport_compat_tests.cpp
   flowmesh_production_wire_tests.cpp
   flowmesh_seat_binding_tests.cpp
   flowmesh_vault_index_tests.cpp
@@ -260,6 +266,8 @@ target_link_libraries(test_bitcoin
   secp256k1
   Boost::headers
   libevent::extra
+  OpenSSL::SSL
+  OpenSSL::Crypto
   $<TARGET_NAME_IF_EXISTS:USDT::headers>
 )
 

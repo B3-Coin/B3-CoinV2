@@ -40,7 +40,10 @@ class SignalInterrupt;
 }
 
 namespace node {
+class AssetMetadataCache;
 class FlowMeshService;
+class FlowMeshTradingBackend;
+class FlowMeshHttpsServer;
 class KernelNotifications;
 class StakingLoop;
 class Warnings;
@@ -83,9 +86,13 @@ struct NodeContext {
     std::unique_ptr<interfaces::Mining> mining;
     //! B3 Modern PoS automatic staking loop (created once the chainstate is loaded).
     std::unique_ptr<node::StakingLoop> staking;
-    //! Production FlowMesh service. Always constructed after chainstate load;
-    //! dormant unless a complete A2/A3 schedule is pinned.
+    //! Optional operator service; absent when -enableflowmeshvalidator=0.
     std::unique_ptr<node::FlowMeshService> flowmesh;
+    //! Ordinary trading does not require the optional operator engine.
+    std::unique_ptr<node::FlowMeshTradingBackend> flowmesh_trading;
+    std::unique_ptr<node::FlowMeshHttpsServer> flowmesh_api;
+    //! Optional shared precision discovery, independent of wallet history.
+    std::unique_ptr<node::AssetMetadataCache> asset_metadata;
     interfaces::WalletLoader* wallet_loader{nullptr};
     std::unique_ptr<CScheduler> scheduler;
     std::function<void()> rpc_interruption_point = [] {};

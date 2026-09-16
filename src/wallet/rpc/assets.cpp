@@ -1240,12 +1240,14 @@ RPCHelpMan importflowmeshkey()
             const std::shared_ptr<CWallet> wallet{
                 GetWalletForJSONRPCRequest(request)};
             if (!wallet) return UniValue::VNULL;
-            const std::vector<unsigned char> bytes{
-                ParseHexV(request.params[0], "blssecret")};
-            if (bytes.size() != 32) {
+            // ParseHexV includes malformed input in its error. Never echo a
+            // secret or allocate an unbounded decoded buffer on this path.
+            const auto& text{request.params[0].get_str()};
+            if (text.size() != 2 * bls::SECRET_SIZE || !IsHex(text)) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER,
-                                   "blssecret must be exactly 32 bytes");
+                                   "blssecret must be exactly 32 bytes of hex");
             }
+            const auto bytes{ParseHex(text)};
             const auto key{bls::SecretKey::FromBytes(bytes)};
             if (!key) {
                 throw JSONRPCError(
@@ -1263,6 +1265,72 @@ RPCHelpMan importflowmeshkey()
             result.pushKV("bls_pubkey", HexStr(imported->Compressed()));
             result.pushKV("proof_of_possession",
                           HexStr(key->SignPoP().Compressed()));
+            return result;
+        }};
+}
+
+RPCHelpMan exportflowmeshkey()
+{
+    return RPCHelpMan{
+        "exportflowmeshkey",
+        "Export exactly one existing FN FlowMesh BLS secret held by the selected wallet. "
+        "The plaintext secret authorizes FN votes and historical FN rewards. "
+        "This does not export or migrate the signer journal, stop an existing signer, "
+        "or authorize running a duplicate signer. Keep the result private. "
+        "An encrypted wallet must be fully unlocked; a locked wallet with armed staking keys is insufficient.\n" +
+            HELP_REQUIRING_PASSPHRASE,
+        {
+            {"bls_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
+             "Exactly one canonical 48-byte compressed FN BLS public key (96 hex characters)"},
+            {"ack_risk", RPCArg::Type::BOOL, RPCArg::Optional::NO,
+             "Must be true: the plaintext secret authorizes FN votes and historical FN rewards; export does not migrate the signer journal or authorize duplicate signing"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Sensitive plaintext key export", {
+            {RPCResult::Type::STR_HEX, "bls_pubkey", "Selected 48-byte FN BLS public key"},
+            {RPCResult::Type::STR_HEX, "blssecret", "Sensitive 32-byte big-endian BLS secret scalar"},
+            {RPCResult::Type::STR, "warning", "Key authority and signer-journal warning"},
+        }},
+        RPCExamples{HelpExampleCli("exportflowmeshkey", "\"<bls_pubkey>\" true")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto wallet{GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            if (!request.params[1].isBool()) {
+                throw JSONRPCError(RPC_TYPE_ERROR, "ack_risk must be a boolean");
+            }
+            if (!request.params[1].get_bool()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "Set ack_risk=true to acknowledge plaintext FN key export and signer-journal risks");
+            }
+            // Never echo malformed input: a caller may accidentally paste a secret.
+            const auto& text{request.params[0].get_str()};
+            if (text.size() != 2 * bls::PUBKEY_SIZE || !IsHex(text)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "bls_pubkey must be exactly 96 hex characters");
+            }
+            const auto pubkey{bls::PublicKey::Decode(ParseHex(text))};
+            if (!pubkey) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "bls_pubkey must be a canonical compressed BLS public key");
+            }
+            LOCK(wallet->cs_wallet);
+            EnsureSigningWallet(*wallet);
+            if (!wallet->HasFlowMeshBlsKey(pubkey->Compressed())) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                                   "This wallet has no matching FlowMesh BLS key");
+            }
+            const auto key{wallet->GetFlowMeshBlsKey(pubkey->Compressed())};
+            if (!key) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                                   "Unable to read the selected FlowMesh BLS key");
+            }
+            struct ExportBytes {
+                std::array<unsigned char, bls::SECRET_SIZE> value;
+                ~ExportBytes() { memory_cleanse(value.data(), value.size()); }
+            } secret{key->Bytes()};
+            UniValue result{UniValue::VOBJ};
+            result.pushKV("bls_pubkey", HexStr(pubkey->Compressed()));
+            result.pushKV("blssecret", HexStr(secret.value));
+            result.pushKV("warning", "This plaintext key authorizes FN votes and historical FN rewards. Export does not migrate the signer journal, stop an existing signer, or authorize running a duplicate signer. Keep the result private.");
             return result;
         }};
 }

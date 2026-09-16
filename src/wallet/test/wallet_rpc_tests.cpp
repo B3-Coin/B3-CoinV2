@@ -41,6 +41,20 @@ static std::string TestWalletName(const std::string& endpoint, std::optional<std
 
 BOOST_FIXTURE_TEST_SUITE(wallet_rpc_tests, BasicTestingSetup)
 
+BOOST_AUTO_TEST_CASE(flowmesh_saved_actions_help_schema_constructs)
+{
+    // RPC registration constructs help before node startup. An OBJ_DYN with
+    // no child schema used to throw here and prevent every wallet from opening.
+    BOOST_CHECK_NO_THROW(listflowmeshactions());
+    const auto help{listflowmeshactions().ToString()};
+    BOOST_CHECK(help.find("signed_bytes_sha256") != std::string::npos);
+    BOOST_CHECK(help.find("canonical_side") != std::string::npos);
+    BOOST_CHECK(help.find("canonical_points") != std::string::npos);
+    BOOST_CHECK(help.find("previously_certified") != std::string::npos);
+    BOOST_CHECK(help.find("receipt_state") != std::string::npos);
+    BOOST_CHECK(help.find("outcome_verified") != std::string::npos);
+}
+
 BOOST_AUTO_TEST_CASE(ensure_unique_wallet_name)
 {
     // EnsureUniqueWalletName should only return if exactly one unique wallet name is provided

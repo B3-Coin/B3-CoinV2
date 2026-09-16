@@ -41,6 +41,32 @@ add_test(NAME test_b3_splash-qt COMMAND test_b3_splash-qt)
 set_tests_properties(test_b3_splash-qt PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=minimal")
 
 if(ENABLE_WALLET)
+  # Opt-in manual GUI qualification only: no CTest registration or installation.
+  # An unconfigured binary refuses startup; the compiled pin must name a known
+  # disposable, stopped regtest client, never a live/default wallet directory.
+  set(B3_FLOWMESHCLIENT_GUI_TEST_DATADIR "" CACHE PATH
+    "Exact disposable regtest datadir allowed by test_b3_flowmeshclient-gui (empty refuses startup)"
+  )
+  add_executable(test_b3_flowmeshclient-gui EXCLUDE_FROM_ALL
+    flowmeshclient_gui_main.cpp
+    ../../init/bitcoin-qt.cpp
+  )
+  target_compile_definitions(test_b3_flowmeshclient-gui PRIVATE
+    B3_FLOWMESHCLIENT_GUI_TEST_DATADIR="${B3_FLOWMESHCLIENT_GUI_TEST_DATADIR}"
+  )
+  target_link_libraries(test_b3_flowmeshclient-gui
+    core_interface bitcoinqt bitcoin_node
+  )
+  add_windows_application_manifest(test_b3_flowmeshclient-gui)
+  import_plugins(test_b3_flowmeshclient-gui)
+  if(APPLE)
+    set_target_properties(test_b3_flowmeshclient-gui PROPERTIES
+      MACOSX_BUNDLE TRUE
+      MACOSX_BUNDLE_BUNDLE_NAME "B3 FlowMesh Disposable Client Test"
+      MACOSX_BUNDLE_GUI_IDENTIFIER "org.b3coin.flowmesh-disposable-client-test"
+    )
+  endif()
+
   target_sources(test_bitcoin-qt
     PRIVATE
       addressbooktests.cpp
@@ -221,3 +247,4 @@ if(WIN32 AND VCPKG_TARGET_TRIPLET)
 endif()
 
 install_binary_component(test_bitcoin-qt INTERNAL)
+include(flowmeshclosedtest.cmake)

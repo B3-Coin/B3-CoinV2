@@ -9,6 +9,7 @@
 #include <flowmesh/production_engine.h>
 #include <modern/flowmesh_vault_proof.h>
 #include <node/flowmesh_runtime.h>
+#include <node/flowmesh_net.h>
 #include <node/flowmesh_vault_index.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
@@ -25,6 +26,12 @@ class ChainstateManager;
 class PeerManager;
 
 namespace node {
+
+/** Engine-free B3 authority lookup. Uses mandatory chain indexes only, never
+ * a FlowMesh service, signer, execution store or microblock history. */
+std::optional<flowmesh::ActiveFnBlsSeatSet> ResolveFlowMeshClientSeats(
+    ChainstateManager& chainman, const flowmesh::ClientEvidencePins& pins,
+    const flowmesh::ProductionEntryCore& entry, std::string& error);
 
 /** Public, chain-derived identity of one production FlowMesh v1 market. */
 struct FlowMeshServiceMarket {
@@ -83,11 +90,19 @@ struct FlowMeshVaultOperation {
     std::vector<FlowMeshVaultInput> inputs;
 };
 
+/** Local routing policy; never part of a consensus or signing identity. */
+struct FlowMeshServiceTransport {
+    std::string mode{"legacy"};
+    FlowMeshNetConfig network;
+    bool LegacyEnabled() const { return mode == "legacy" || mode == "dual"; }
+    bool IndependentEnabled() const { return mode == "independent" || mode == "dual"; }
+};
+
 /**
- * One production FlowMesh service exists on every node. It remains dormant
- * unless the complete A2/A3 schedule is pinned. When enabled it uses only the
- * existing B3 connection and PeerManager's prioritized FlowMesh messages;
- * there is no second listener, port, or transport.
+ * One production FlowMesh service owns execution and durable signing history.
+ * It remains dormant unless the complete A2/A3 schedule is pinned. Legacy B3
+ * carriage and independent connections feed this same runtime in dual mode.
+ * Neither transport grants seat membership or changes application identities.
  *
  * The service starts as an observer. Supplying wallet-owned BLS seat keys is
  * an explicit, reversible operation and raw keys never reach P2P objects.
@@ -96,7 +111,8 @@ class FlowMeshService final : public flowmesh::WireMessageSink,
                               public CValidationInterface
 {
 public:
-    FlowMeshService(ChainstateManager& chainman, fs::path datadir);
+    FlowMeshService(ChainstateManager& chainman, fs::path datadir,
+                    FlowMeshServiceTransport transport = {});
     ~FlowMeshService();
 
     FlowMeshService(const FlowMeshService&) = delete;
@@ -116,6 +132,13 @@ public:
 
     bool Enabled() const;
     bool Running() const;
+    bool LegacyTransportEnabled() const;
+    std::string TransportMode() const;
+    FlowMeshNetSnapshot NetworkSnapshot() const;
+    /** Admit one pinned, process-lifetime connection target; never arms a key. */
+    FlowMeshNetConnectResult AddNetworkPeer(const std::string& peer);
+    std::vector<FlowMeshRuntimeDeliverySnapshot> DeliverySnapshots(
+        std::optional<flowmesh::MarketId> market_id = std::nullopt) const;
 
     std::vector<FlowMeshServiceMarket> Markets() const;
     std::optional<FlowMeshServiceMarket> Market(
@@ -128,6 +151,17 @@ public:
         const flowmesh::MarketId& market_id,
         const std::optional<flowmesh::AccountId>& account,
         const flowmesh::MarketDataQuery& query, std::string& error) const;
+    std::optional<flowmesh::ClientStateEvidence> ClientSnapshot(
+        const flowmesh::MarketId& market_id, std::string& error) const;
+    std::optional<std::vector<unsigned char>> ClientCertifiedEntry(
+        const flowmesh::MarketId& market_id, uint64_t sequence, std::string& error) const;
+    flowmesh::ClientEventPage ClientEvents(
+        const std::optional<flowmesh::ClientEventCursor>& after,
+        const std::optional<flowmesh::MarketId>& market,
+        const std::optional<flowmesh::AccountId>& account,
+        size_t limit = flowmesh::CLIENT_EVENT_PAGE_MAX) const;
+    std::optional<flowmesh::ClientEvent> ClientActionStatus(
+        const flowmesh::MarketId& market_id, const uint256& action_id) const;
 
     bool SubmitLocalAction(const flowmesh::MarketId& market_id,
                            const flowmesh::Action& action,

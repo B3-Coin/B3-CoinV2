@@ -5,6 +5,7 @@
 #include <wallet/asset_metadata.h>
 
 #include <chainparams.h>
+#include <interfaces/chain.h>
 #include <modern/asset.h>
 #include <modern/asset_validation.h>
 #include <modern/bridge_asset.h>
@@ -18,11 +19,6 @@
 
 namespace wallet {
 namespace {
-modern::AssetGenesisV1 Genesis(const AssetMetadataProof& proof)
-{
-    return modern::AssetGenesisV1{.max_supply = proof.max_supply, .decimals = proof.decimals};
-}
-
 bool ReservedLabel(const std::string& text)
 {
     std::string lower;
@@ -45,48 +41,13 @@ std::optional<uint256> AssetMetadataDomain(const Consensus::Params& params)
 bool AssetMetadataProofMatches(const uint256& domain, const uint256& asset,
                                const AssetMetadataProof& proof)
 {
-    const auto genesis{Genesis(proof)};
-    return !domain.IsNull() && !asset.IsNull() && !proof.issuance_prevout.IsNull() &&
-           modern::AssetGenesisValid(genesis) &&
-           modern::AssetIdV1(domain, proof.issuance_prevout,
-                             modern::AssetGenesisCommitment(genesis)) == asset;
+    return modern::VerifyAssetMetadataProof(domain, asset, proof);
 }
 
 bool DecodeAssetMetadataProof(const CTransaction& tx, const uint256& domain,
                               uint256& asset, AssetMetadataProof& proof, std::string& error)
 {
-    if (domain.IsNull() || tx.vin.empty() || tx.vin[0].prevout.IsNull()) {
-        error = "Issuance proof requires a pinned chain domain and a non-null first input";
-        return false;
-    }
-    const CMpaRecord* issuance{nullptr};
-    for (const auto& record : tx.mpa) {
-        if (record.payload_type != modern::CREATION_ACTION_ASSET_ISSUANCE) continue;
-        if (issuance) {
-            error = "Issuance proof has multiple genesis records";
-            return false;
-        }
-        issuance = &record;
-    }
-    if (!issuance) {
-        error = "Issuance proof has no genesis record";
-        return false;
-    }
-    modern::AssetGenesisV1 genesis;
-    if (!modern::DecodeAssetIssuanceAction(
-            {issuance->payload_type, issuance->payload_version, issuance->payload}, genesis, error)) return false;
-    if (!modern::AssetGenesisValid(genesis)) {
-        error = "Issuance proof has invalid or unsupported genesis rules";
-        return false;
-    }
-    proof = {tx.vin[0].prevout, genesis.max_supply, genesis.decimals};
-    asset = modern::AssetIdV1(domain, proof.issuance_prevout,
-                              modern::AssetGenesisCommitment(genesis));
-    if (!AssetMetadataProofMatches(domain, asset, proof)) {
-        error = "Issuance proof does not identify a simple-v1 asset";
-        return false;
-    }
-    return true;
+    return modern::DecodeAssetPrecisionProof(tx, domain, asset, proof, error);
 }
 
 bool ValidAssetMetadataLabels(const std::string& name, const std::string& ticker,
@@ -134,6 +95,16 @@ std::optional<WalletAssetMetadata> ConfiguredAssetMetadata(const Consensus::Para
             return WalletAssetMetadata{"Test USD", "tUSD", 6, "bundled-registry", true};
         }
     }
+    static const uint256 cusd{*uint256::FromHex("929d3345f4bc08683dabce49cbca6f79cf646621e1f18342713f975dc2111ade")};
+    static const AssetMetadataProof cusd_proof{
+        COutPoint{Txid::FromUint256(*uint256::FromHex("97976c28709507dc443ecf07d6bb8caf1202688f18e102a5004acf34fb130800")), 1},
+        10'000'000'000, 6};
+    if (asset == cusd) {
+        const auto domain{AssetMetadataDomain(params)};
+        if (domain && AssetMetadataProofMatches(*domain, asset, cusd_proof)) {
+            return WalletAssetMetadata{"cUSD Unbacked Test", "cUSD", 6, "bundled-registry", true};
+        }
+    }
     return std::nullopt;
 }
 
@@ -158,8 +129,27 @@ WalletAssetMetadata CWallet::GetAssetMetadata(const uint256& asset) const
     if (const auto it{m_asset_metadata.find(asset)}; it != m_asset_metadata.end()) {
         return {it->second.name, it->second.ticker, it->second.proof.decimals, "local-registry", false};
     }
+    if (HaveChain()) {
+        // These labels come only from the explicitly published catalog of a
+        // configured trading endpoint. Local/bundled labels take precedence.
+        // Recheck the immutable proof here; display names prove no backing.
+        const auto metadata{chain().assetDisplayMetadata(asset)};
+        const auto domain{AssetMetadataDomain(Params().GetConsensus())};
+        if (metadata && domain && AssetMetadataProofMatches(*domain, asset, metadata->proof)) {
+            return {metadata->name, metadata->ticker, metadata->proof.decimals, metadata->source, false};
+        }
+    }
     if (const auto it{m_asset_genesis.find(asset)}; it != m_asset_genesis.end()) {
         return {{}, {}, it->second.decimals, "wallet-issuance", false};
+    }
+    if (HaveChain()) {
+        // This interface is cache-only: GetAssetMetadata is called under
+        // cs_wallet, so it must not read blocks, take cs_main, or wait for sync.
+        const auto proof{chain().assetMetadataProof(asset)};
+        const auto domain{AssetMetadataDomain(Params().GetConsensus())};
+        if (proof && domain && AssetMetadataProofMatches(*domain, asset, *proof)) {
+            return {{}, {}, proof->decimals, "node-issuance", false};
+        }
     }
     return {};
 }
@@ -177,8 +167,10 @@ bool CWallet::LoadAssetMetadata(const uint256& domain, const uint256& asset,
     // A wallet opened on another chain must never reuse its labels or precision.
     if (!current_domain || domain != *current_domain) return true;
     if (ConfiguredAssetMetadata(Params().GetConsensus(), asset)) {
-        error = "Configured asset metadata cannot be overridden";
-        return false;
+        // A later build may bundle an asset previously imported by this
+        // wallet. Its already-verified local record must not prevent loading
+        // the wallet; the reviewed bundled identity takes precedence.
+        return true;
     }
     m_asset_metadata.insert_or_assign(asset, metadata);
     return true;

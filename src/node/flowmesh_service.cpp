@@ -20,6 +20,7 @@
 #include <node/fn_seat_index.h>
 #include <script/script.h>
 #include <sync.h>
+#include <univalue.h>
 #include <util/int128.h>
 #include <util/thread.h>
 #include <validation.h>
@@ -38,6 +39,118 @@
 
 namespace node {
 
+std::optional<flowmesh::ActiveFnBlsSeatSet> ResolveFlowMeshClientSeats(
+    ChainstateManager& chainman, const flowmesh::ClientEvidencePins& pins,
+    const flowmesh::ProductionEntryCore& entry, std::string& error)
+{
+    if (!flowmesh::CheckClientEvidencePins(pins) || entry.domain != pins.domain ||
+        entry.market_id != pins.market_id) {
+        error = "FlowMesh client market/domain pins do not match the entry";
+        return std::nullopt;
+    }
+    std::vector<flowmesh::BlsSeatBinding> bindings;
+    flowmesh::AnchorRef seat_anchor;
+    {
+        LOCK(::cs_main);
+        Chainstate& chainstate{chainman.ActiveChainstate()};
+        const CBlockIndex* tip{chainstate.m_chain.Tip()};
+        const auto& params{chainman.GetConsensus()};
+        const auto domain{params.legacy_final_hash
+            ? modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash)
+            : std::nullopt};
+        if (!tip || !domain || *domain != pins.domain ||
+            !Consensus::FlowMeshRulesActive(tip->nHeight, params)) {
+            error = "FlowMesh client B3 chain/domain is unavailable";
+            return std::nullopt;
+        }
+        auto& seats{chainstate.ModernFnSeats()};
+        auto& vaults{chainstate.ModernFlowMeshVaults()};
+        auto& checkpoints{chainstate.ModernFlowMeshCheckpoints()};
+        if (!seats.Sync(chainstate.m_chain, chainstate.m_blockman, params, *tip) ||
+            !vaults.Sync(chainstate.m_chain, chainstate.m_blockman, params, *tip) ||
+            !checkpoints.Sync(chainstate.m_chain, chainstate.m_blockman, params,
+                              seats.Index(), vaults.Index(), *tip)) {
+            error = "FlowMesh client mandatory B3 indexes are unavailable";
+            return std::nullopt;
+        }
+        const CBlockIndex* anchor{entry.anchor.height >= 0 ? chainstate.m_chain[entry.anchor.height] : nullptr};
+        if (!anchor || anchor->GetBlockHash() != entry.anchor.hash ||
+            tip->nHeight - entry.anchor.height < Consensus::FLOWMESH_ANCHOR_DEPTH) {
+            error = "FlowMesh client production anchor is not canonical and deep";
+            return std::nullopt;
+        }
+        const auto market{vaults.Index().MarketAt(pins.market_id, *anchor)};
+        if (!market || market->base_asset != pins.base_asset || market->vault_id != pins.vault_id) {
+            error = "FlowMesh client market is not established at its anchor";
+            return std::nullopt;
+        }
+        auto authority{checkpoints.Index().Head(pins.market_id)};
+        // Historical action evidence may use an earlier connected epoch.
+        // Bound this metadata walk; it never downloads/replays microblocks.
+        size_t traversed{0};
+        while (authority && authority->core.sequence > entry.sequence) {
+            if (++traversed > 4096) {
+                error = "FlowMesh client historical authority exceeds lookup bound";
+                return std::nullopt;
+            }
+            authority = authority->core.previous_checkpoint_id.IsNull()
+                ? std::nullopt : checkpoints.Index().Get(authority->core.previous_checkpoint_id);
+        }
+        uint64_t epoch{0};
+        uint256 expected_set;
+        if (authority) {
+            if (authority->core.sequence == entry.sequence &&
+                authority->core.microblock_hash != entry.GetHash()) {
+                error = "FlowMesh client entry conflicts with the connected checkpoint";
+                return std::nullopt;
+            }
+            if (authority->core.handoff && authority->core.sequence < entry.sequence) {
+                if (!FlowMeshHandoffConnectionMature(
+                        {authority->connected_height, authority->connected_block}, tip->nHeight)) {
+                    error = "FlowMesh client incoming epoch handoff is not mature";
+                    return std::nullopt;
+                }
+                epoch = authority->core.handoff->next_epoch;
+                seat_anchor = {static_cast<int32_t>(authority->core.handoff->next_anchor.height),
+                               authority->core.handoff->next_anchor.block_hash};
+                expected_set = authority->core.handoff->next_seat_set_hash;
+            } else {
+                epoch = authority->core.epoch;
+                seat_anchor = {static_cast<int32_t>(authority->core.anchor.height), authority->core.anchor.block_hash};
+                expected_set = authority->core.seat_set_hash;
+            }
+        } else {
+            const auto bootstrap{seats.Index().EarliestFlowMeshReadySnapshot(
+                chainstate.m_chain, market->created_height, tip->nHeight, params, error)};
+            if (!bootstrap) return std::nullopt;
+            seat_anchor = {bootstrap->anchor_height, bootstrap->anchor_hash};
+        }
+        if (entry.epoch != epoch || (!expected_set.IsNull() && entry.seat_set_hash != expected_set)) {
+            error = "FlowMesh client epoch has no matching connected B3 authority";
+            return std::nullopt;
+        }
+        const CBlockIndex* seat_index{seat_anchor.height >= 0 ? chainstate.m_chain[seat_anchor.height] : nullptr};
+        if (!seat_index || seat_index->GetBlockHash() != seat_anchor.hash) {
+            error = "FlowMesh client seat anchor is no longer canonical";
+            return std::nullopt;
+        }
+        const auto snapshot{seats.AnchoredSnapshot(chainstate.m_chain, *seat_index, tip->nHeight, params, error)};
+        if (!snapshot || !snapshot->FlowMeshReady()) return std::nullopt;
+        bindings.reserve(snapshot->members.size());
+        for (const auto& member : snapshot->members) {
+            bindings.push_back({member.outpoint, member.bls_pubkey, member.proof_of_possession});
+        }
+    }
+    flowmesh::BlsSeatSetCheck check;
+    auto out{flowmesh::BuildActiveFnBlsSeatSet(pins.domain, pins.market_id, entry.epoch,
+        static_cast<uint64_t>(seat_anchor.height), seat_anchor.hash, bindings, check)};
+    if (!out || out->set_hash != entry.seat_set_hash) {
+        error = "FlowMesh client certificate names a different anchored seat set";
+        return std::nullopt;
+    }
+    return out;
+}
+
 uint256 FlowMeshSeatKeysFingerprint(
     std::vector<std::array<unsigned char, bls::PUBKEY_SIZE>> public_keys)
 {
@@ -52,6 +165,23 @@ namespace {
 
 constexpr size_t FLOWMESH_MARKET_DB_CACHE_BYTES{size_t{4} << 20};
 constexpr std::chrono::milliseconds FLOWMESH_TICK_INTERVAL{250};
+
+void ReconciliationTrace(const char* stage, uint64_t generation,
+                         const uint256& tip = {})
+{
+    if (!LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug)) return;
+    // Fixed-size metadata and a process-lifetime cap, including one explicit
+    // terminal marker. The marker means later reconciliation spans are unknown.
+    static std::atomic<uint64_t> trace_count{0};
+    const auto count{trace_count.fetch_add(1, std::memory_order_relaxed)};
+    if (count > 32768) return;
+    UniValue event{UniValue::VOBJ};
+    event.pushKV("monotonic_us", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    event.pushKV("stage", count == 32768 ? "trace_limit_reached" : stage);
+    event.pushKV("generation", generation);
+    event.pushKV("tip", tip.GetHex());
+    LogDebug(BCLog::BENCH, "FlowMeshServiceTrace %s\n", event.write());
+}
 
 bool SameMembers(const flowmesh::ActiveFnBlsSeatSet& a,
                  const flowmesh::ActiveFnBlsSeatSet& b)
@@ -105,14 +235,18 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     using SeatKey =
         std::tuple<flowmesh::MarketId, uint64_t, uint256>;
 
-    explicit Impl(ChainstateManager& chainman_in, fs::path datadir_in)
+    explicit Impl(ChainstateManager& chainman_in, fs::path datadir_in,
+                  FlowMeshServiceTransport transport_in)
         : chainman{chainman_in}, datadir{std::move(datadir_in)},
+          transport{std::move(transport_in)},
           anchors{chainman, FLOWMESH_ANCHOR_DEPTH}
     {
     }
 
     ChainstateManager& chainman;
     fs::path datadir;
+    const FlowMeshServiceTransport transport;
+    std::shared_ptr<FlowMeshNetService> network;
     ChainAnchorPolicy anchors;
     SteadyFlowMeshRuntimeClock clock;
 
@@ -132,6 +266,7 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     bool running{false};
     bool stopping{false};
     std::atomic<bool> chain_reconciling{false};
+    std::atomic<uint64_t> delivery_generation{0};
     uint256 reconciled_tip;
 
     // Caller holds mutex; neither this snapshot nor the CAS token contains secrets.
@@ -182,6 +317,22 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
             expected_tip = reconciled_tip;
         }
         return ReconciledTipMatches(expected_tip);
+    }
+
+    // Local admission epoch, not a chain or signing commitment. A critical
+    // handler can detect reconciliation that both started and ended while
+    // it was executing, even if the gate has reopened by its final check.
+    uint64_t DeliveryGeneration() const override
+    {
+        return delivery_generation.load(std::memory_order_acquire);
+    }
+
+    void SetChainReconciling(bool value)
+    {
+        delivery_generation.fetch_add(1, std::memory_order_acq_rel);
+        chain_reconciling.store(value, std::memory_order_release);
+        delivery_generation.fetch_add(1, std::memory_order_release);
+        ReconciliationTrace(value ? "gate_closed" : "gate_opened", DeliveryGeneration());
     }
 
     bool Acceptable(const flowmesh::AnchorRef& anchor) const override
@@ -603,7 +754,17 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         const flowmesh::ActiveFnBlsSeatSet&) const override
     {
         if (!ReconciledAtTip()) return {};
+        if (transport.mode == "independent") {
+            std::shared_ptr<FlowMeshNetService> active_network;
+            {
+                std::lock_guard<std::mutex> lock{mutex};
+                active_network = network;
+            }
+            // Transport failure is not permission to start a new signing history.
+            if (!active_network || !active_network->Snapshot().running) return {};
+        }
         std::lock_guard<std::mutex> lock{mutex};
+        if (!running || stopping) return {};
         return local_keys;
     }
 
@@ -762,18 +923,55 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         return plan->count != 0;
     }
 
-    void Relay(FlowMeshRuntimeRelay relay) const
+    FlowMeshRelayResult Relay(FlowMeshRuntimeRelay relay) const
     {
-        if (!ReconciledAtTip()) return;
+        FlowMeshRelayResult result;
         PeerManager* target{nullptr};
+        std::shared_ptr<FlowMeshNetService> independent;
         {
             std::lock_guard<std::mutex> lock{mutex};
-            if (!running || stopping) return;
+            if (!running || stopping) {
+                result.no_peer_reason = FlowMeshDeliveryAdmission::STOPPED;
+                result.reason = "FlowMesh service is stopping or not running";
+                return result;
+            }
             target = peerman;
+            independent = network;
         }
-        if (target == nullptr) return;
-        target->RelayFlowMeshMessage(relay.message, relay.peer,
-                                     relay.exclude_peer);
+        if (!ReconciledAtTip()) {
+            result.no_peer_reason = FlowMeshDeliveryAdmission::RECONCILING;
+            result.reason = "B3 tip is not yet reconciled; retain and revalidate the exact object before retry";
+            return result;
+        }
+        // Disjoint connection IDs keep directed replies on their originating
+        // transport. Both transports still feed the same execution/signing state.
+        if (transport.IndependentEnabled() && (!relay.peer || *relay.peer <= -2)) {
+            if (independent) {
+                result = independent->Relay(relay);
+            } else {
+                result.no_peer_reason = FlowMeshDeliveryAdmission::STOPPED;
+                result.reason = "Independent FlowMesh network is not available";
+            }
+        }
+        if (transport.LegacyEnabled() && target && (!relay.peer || *relay.peer >= 0)) {
+            auto legacy{target->RelayFlowMeshMessage(relay.message, relay.peer, relay.exclude_peer)};
+            result.peers.insert(result.peers.end(), legacy.peers.begin(), legacy.peers.end());
+            if (result.reason.empty()) {
+                result.no_peer_reason = legacy.no_peer_reason;
+                result.reason = std::move(legacy.reason);
+            }
+        }
+        return result;
+    }
+
+    void CancelDelivery(uint64_t delivery_id) const
+    {
+        std::shared_ptr<FlowMeshNetService> independent;
+        {
+            std::lock_guard<std::mutex> lock{mutex};
+            independent = network;
+        }
+        if (independent) independent->Cancel(delivery_id);
     }
 
     bool RefreshMarkets(uint256& sampled_tip, std::string& error);
@@ -795,7 +993,10 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
             if (stopping) break;
             std::shared_ptr<FlowMeshRuntime> active{runtime};
             lock.unlock();
-            if (active && ReconciledAtTip()) {
+            // Maintenance must continue while B3 reconciliation closes the
+            // signing gate: expire deferred ingress and cancel stale queued
+            // copies. Runtime production/retries still check chain validity.
+            if (active) {
                 active->NotifyTick();
             }
             lock.lock();
@@ -989,7 +1190,9 @@ bool FlowMeshService::Impl::InstallMarket(
                 .domain = *domain,
                 .market_id = record.market_id,
                 .treasury_owner_commitment = *treasury,
+                .active_seats = {},
                 .state = metadata_state,
+                .last_microblock_hash = {},
                 .readiness =
                     FlowMeshRuntimeMarketReadiness::INSUFFICIENT_SEATS};
             std::string add_error;
@@ -1238,8 +1441,9 @@ bool FlowMeshService::Impl::ReconcileConnectedCheckpoints(std::string& error)
     return true;
 }
 
-FlowMeshService::FlowMeshService(ChainstateManager& chainman, fs::path datadir)
-    : m_impl{std::make_unique<Impl>(chainman, std::move(datadir))}
+FlowMeshService::FlowMeshService(ChainstateManager& chainman, fs::path datadir,
+                                 FlowMeshServiceTransport transport)
+    : m_impl{std::make_unique<Impl>(chainman, std::move(datadir), std::move(transport))}
 {
 }
 
@@ -1247,6 +1451,10 @@ FlowMeshService::~FlowMeshService() { Stop(); }
 
 bool FlowMeshService::Start(PeerManager& peerman, std::string& error)
 {
+    if (!m_impl->transport.LegacyEnabled() && !m_impl->transport.IndependentEnabled()) {
+        error = "Invalid FlowMesh transport; use legacy, dual or independent";
+        return false;
+    }
     {
         std::lock_guard<std::mutex> lock{m_impl->mutex};
         if (m_impl->running) return true;
@@ -1259,7 +1467,7 @@ bool FlowMeshService::Start(PeerManager& peerman, std::string& error)
         }
         m_impl->peerman = &peerman;
         m_impl->stopping = false;
-        m_impl->chain_reconciling.store(true, std::memory_order_release);
+        m_impl->SetChainReconciling(true);
     }
 
     FlowMeshRuntimeConfig config;
@@ -1267,7 +1475,10 @@ bool FlowMeshService::Start(PeerManager& peerman, std::string& error)
     config.keys = m_impl.get();
     config.clock = &m_impl->clock;
     config.relay = [impl = m_impl.get()](FlowMeshRuntimeRelay relay) {
-        impl->Relay(std::move(relay));
+        return impl->Relay(std::move(relay));
+    };
+    config.cancel_delivery = [impl = m_impl.get()](uint64_t delivery_id) {
+        impl->CancelDelivery(delivery_id);
     };
     auto runtime{std::make_shared<FlowMeshRuntime>(
         std::move(config), std::vector<FlowMeshRuntimeMarketConfig>{})};
@@ -1299,6 +1510,23 @@ bool FlowMeshService::Start(PeerManager& peerman, std::string& error)
         Stop();
         return false;
     }
+    if (m_impl->transport.IndependentEnabled()) {
+        auto network_config{m_impl->transport.network};
+        network_config.delivery_callback = [weak_runtime = std::weak_ptr<FlowMeshRuntime>{runtime}](const FlowMeshDeliveryEvent& event) {
+            const auto active{weak_runtime.lock()};
+            return active && active->NotifyDeliveryEvent(event);
+        };
+        auto network{std::make_shared<FlowMeshNetService>(std::move(network_config), *this)};
+        {
+            std::lock_guard<std::mutex> lock{m_impl->mutex};
+            m_impl->network = network;
+        }
+        std::string net_error;
+        if (!network->Start(net_error)) {
+            // Never stop B3 or silently change routing policy on overlay failure.
+            LogWarning("Independent FlowMesh network unavailable: %s\n", net_error);
+        }
+    }
     if (!m_impl->RulesActiveAtTip()) {
         error.clear();
         LogInfo("FlowMesh production service waiting for its A3 activation height\n");
@@ -1309,32 +1537,36 @@ bool FlowMeshService::Start(PeerManager& peerman, std::string& error)
         LogInfo("FlowMesh production service waiting for a stable reconciled B3 tip\n");
         return true;
     }
-    m_impl->chain_reconciling.store(false, std::memory_order_release);
+    m_impl->SetChainReconciling(false);
     if (!m_impl->ReconciledAtTip()) {
-        m_impl->chain_reconciling.store(true, std::memory_order_release);
+        m_impl->SetChainReconciling(true);
         LogInfo("FlowMesh production service waiting: B3 tip changed before startup completed\n");
         return true;
     }
     runtime->NotifyTick();
-    LogInfo("FlowMesh production service started on the existing B3 P2P network\n");
+    LogInfo("FlowMesh production service started (transport=%s)\n", m_impl->transport.mode);
     return true;
 }
 
 void FlowMeshService::Stop()
 {
     std::shared_ptr<FlowMeshRuntime> runtime;
+    std::shared_ptr<FlowMeshNetService> network;
     {
         std::lock_guard<std::mutex> lock{m_impl->mutex};
         if (!m_impl->running && !m_impl->runtime) return;
         m_impl->stopping = true;
         m_impl->ticker_cv.notify_all();
         runtime = m_impl->runtime;
+        network = m_impl->network;
     }
+    if (network) network->Stop();
     if (m_impl->ticker.joinable()) m_impl->ticker.join();
     if (runtime) runtime->Stop();
     {
         std::lock_guard<std::mutex> lock{m_impl->mutex};
         m_impl->runtime.reset();
+        m_impl->network.reset();
         m_impl->running = false;
         m_impl->peerman = nullptr;
     }
@@ -1350,6 +1582,58 @@ bool FlowMeshService::Running() const
 {
     std::lock_guard<std::mutex> lock{m_impl->mutex};
     return m_impl->running && !m_impl->stopping;
+}
+
+bool FlowMeshService::LegacyTransportEnabled() const
+{
+    return m_impl->transport.LegacyEnabled();
+}
+
+std::string FlowMeshService::TransportMode() const
+{
+    return m_impl->transport.mode;
+}
+
+FlowMeshNetSnapshot FlowMeshService::NetworkSnapshot() const
+{
+    std::shared_ptr<FlowMeshNetService> network;
+    {
+        std::lock_guard<std::mutex> lock{m_impl->mutex};
+        network = m_impl->network;
+    }
+    return network ? network->Snapshot() : FlowMeshNetSnapshot{};
+}
+
+FlowMeshNetConnectResult FlowMeshService::AddNetworkPeer(const std::string& peer)
+{
+    std::shared_ptr<FlowMeshNetService> network;
+    {
+        std::lock_guard<std::mutex> lock{m_impl->mutex};
+        if (!m_impl->running || m_impl->stopping) {
+            FlowMeshNetConnectResult result;
+            result.error = "FlowMesh service is not running";
+            return result;
+        }
+        network = m_impl->network;
+    }
+    // Keep the transport alive without holding a service/chain lock across
+    // admission. AddPeer checks transport shutdown under its own queue lock.
+    if (network) return network->AddPeer(peer);
+    FlowMeshNetConnectResult result;
+    result.error = "Independent FlowMesh transport is not configured";
+    return result;
+}
+
+std::vector<FlowMeshRuntimeDeliverySnapshot> FlowMeshService::DeliverySnapshots(
+    std::optional<flowmesh::MarketId> market_id) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard<std::mutex> lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    return runtime ? runtime->DeliverySnapshots(market_id)
+                   : std::vector<FlowMeshRuntimeDeliverySnapshot>{};
 }
 
 std::vector<FlowMeshServiceMarket> FlowMeshService::Markets() const
@@ -1424,12 +1708,66 @@ std::optional<flowmesh::MarketData> FlowMeshService::MarketData(
     auto out{runtime->MarketData(market_id, account, query, error)};
     if (out) {
         out->snapshot.running = running;
-        if (!running || !m_impl->RulesActiveAtTip() || !m_impl->ReconciledAtTip()) {
+        const bool rules_active{m_impl->RulesActiveAtTip()};
+        const bool reconciled{m_impl->ReconciledAtTip()};
+        out->snapshot.chain_reconciling = running && rules_active && !reconciled;
+        if (!running || !rules_active || !reconciled) {
             out->snapshot.paused = true;
-            out->snapshot.error = "FlowMesh service is not active at the current B3 tip";
+            if (out->snapshot.error.empty()) out->snapshot.error = "FlowMesh service is not active at the current B3 tip";
         }
     }
     return out;
+}
+
+std::optional<flowmesh::ClientStateEvidence> FlowMeshService::ClientSnapshot(
+    const flowmesh::MarketId& market_id, std::string& error) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    if (!runtime) { error = "FlowMesh runtime is unavailable"; return std::nullopt; }
+    return runtime->ClientSnapshot(market_id, error);
+}
+
+std::optional<std::vector<unsigned char>> FlowMeshService::ClientCertifiedEntry(
+    const flowmesh::MarketId& market_id, const uint64_t sequence, std::string& error) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    if (!runtime) { error = "FlowMesh runtime is unavailable"; return std::nullopt; }
+    return runtime->ClientCertifiedEntry(market_id, sequence, error);
+}
+
+flowmesh::ClientEventPage FlowMeshService::ClientEvents(
+    const std::optional<flowmesh::ClientEventCursor>& after,
+    const std::optional<flowmesh::MarketId>& market,
+    const std::optional<flowmesh::AccountId>& account, const size_t limit) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    if (runtime) return runtime->ClientEvents(after, market, account, limit);
+    flowmesh::ClientEventPage out;
+    out.gap = true;
+    return out;
+}
+
+std::optional<flowmesh::ClientEvent> FlowMeshService::ClientActionStatus(
+    const flowmesh::MarketId& market_id, const uint256& action_id) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    return runtime ? runtime->ClientActionStatus(market_id, action_id) : std::nullopt;
 }
 
 bool FlowMeshService::SubmitLocalAction(const flowmesh::MarketId& market_id,
@@ -1480,6 +1818,12 @@ bool FlowMeshService::SubmitLocalAction(const flowmesh::MarketId& market_id,
         case flowmesh::QueueResult::GLOBAL_LIMIT:
             error = "FlowMesh action queue is full or unavailable";
             break;
+        case flowmesh::QueueResult::RECONCILING:
+            error = "FlowMesh action admission is waiting for B3 reconciliation";
+            break;
+        case flowmesh::QueueResult::STOPPED:
+            error = "FlowMesh service is stopped";
+            break;
         case flowmesh::QueueResult::ACCEPTED: break;
         }
         return false;
@@ -1498,6 +1842,15 @@ bool FlowMeshService::ArmSeatKeys(std::vector<bls::SecretKey> keys,
                                   const std::optional<uint256>& expected_fingerprint,
                                   FlowMeshSeatKeyStatus* result)
 {
+    if (m_impl->transport.IndependentEnabled() &&
+        m_impl->transport.network.role != "validator") {
+        error = "An observer/sentry transport cannot arm FN signing keys; configure flowmeshrole=validator first";
+        return false;
+    }
+    if (m_impl->transport.mode == "independent" && !NetworkSnapshot().running) {
+        error = "Independent FlowMesh transport is unavailable; inspect getflowmeshnetworkinfo before arming";
+        return false;
+    }
     if (keys.empty()) {
         error = "no FlowMesh BLS seat key was supplied";
         return false;
@@ -1937,20 +2290,16 @@ std::vector<FlowMeshVaultOperation> FlowMeshService::VaultOperations(
 flowmesh::QueueResult FlowMeshService::EnqueueWireMessage(
     const flowmesh::WirePeerId peer, flowmesh::WireMessage message)
 {
-    if (!m_impl->ReconciledAtTip()) {
-        return flowmesh::QueueResult::GLOBAL_LIMIT;
-    }
     std::shared_ptr<FlowMeshRuntime> runtime;
     {
         std::lock_guard<std::mutex> lock{m_impl->mutex};
-        if (!m_impl->running || m_impl->stopping ||
-            m_impl->chain_reconciling.load(std::memory_order_acquire)) {
-            return flowmesh::QueueResult::GLOBAL_LIMIT;
-        }
+        if (!m_impl->running || m_impl->stopping) return flowmesh::QueueResult::STOPPED;
+        if (m_impl->chain_reconciling.load(std::memory_order_acquire)) return flowmesh::QueueResult::RECONCILING;
         runtime = m_impl->runtime;
     }
+    if (!m_impl->ReconciledAtTip()) return flowmesh::QueueResult::RECONCILING;
     return runtime ? runtime->EnqueueWireMessage(peer, std::move(message))
-                   : flowmesh::QueueResult::GLOBAL_LIMIT;
+                   : flowmesh::QueueResult::STOPPED;
 }
 
 void FlowMeshService::FlowMeshPeerConnected(const flowmesh::WirePeerId peer)
@@ -1980,7 +2329,7 @@ void FlowMeshService::BlockDisconnected(
     // This callback precedes UpdatedBlockTip on the validation-interface
     // queue. Stop admitting/ticking production at the earliest available
     // disconnect signal; UpdatedBlockTip performs the exact durable rollback.
-    m_impl->chain_reconciling.store(true, std::memory_order_release);
+    m_impl->SetChainReconciling(true);
 }
 
 void FlowMeshService::ReconcileAfterInitialBlockDownload()
@@ -2000,7 +2349,7 @@ void FlowMeshService::UpdatedBlockTip(const CBlockIndex* new_tip,
                                       const bool initial_download)
 {
     if (!Running()) return;
-    m_impl->chain_reconciling.store(true, std::memory_order_release);
+    m_impl->SetChainReconciling(true);
     if (initial_download) return;
     const uint256 callback_tip{new_tip ? new_tip->GetBlockHash() : uint256{}};
     if (!m_impl->RulesActiveAtTip()) {
@@ -2013,43 +2362,54 @@ void FlowMeshService::UpdatedBlockTip(const CBlockIndex* new_tip,
         std::lock_guard<std::mutex> lock{m_impl->mutex};
         runtime = m_impl->runtime;
     }
+    ReconciliationTrace("idle_wait_started", m_impl->DeliveryGeneration(), callback_tip);
     if (runtime && !runtime->WaitForIdle(std::chrono::seconds{5})) {
+        ReconciliationTrace("idle_wait_timeout", m_impl->DeliveryGeneration(), callback_tip);
         LogWarning("FlowMesh remains paused: runtime did not quiesce for B3 checkpoint reconciliation\n");
         return;
     }
+    ReconciliationTrace("idle_wait_completed", m_impl->DeliveryGeneration(), callback_tip);
 
     std::string error;
     if (!m_impl->ReconcileAllStoreConnections(error)) {
+        ReconciliationTrace("store_reconciliation_failed", m_impl->DeliveryGeneration(), callback_tip);
         LogWarning("FlowMesh remains paused: durable checkpoint reconciliation failed: %s\n",
                    error);
         return;
     }
+    ReconciliationTrace("store_reconciled", m_impl->DeliveryGeneration(), callback_tip);
     error.clear();
     uint256 market_tip;
     if (!m_impl->RefreshMarkets(market_tip, error)) {
+        ReconciliationTrace("market_refresh_failed", m_impl->DeliveryGeneration(), callback_tip);
         LogWarning("FlowMesh market refresh failed: %s\n", error);
         return;
     }
+    ReconciliationTrace("markets_refreshed", m_impl->DeliveryGeneration(), callback_tip);
     error.clear();
     if (!m_impl->ReconcileConnectedCheckpoints(error)) {
+        ReconciliationTrace("checkpoint_reconciliation_failed", m_impl->DeliveryGeneration(), callback_tip);
         LogWarning("FlowMesh remains paused: connected checkpoint reconciliation failed: %s\n",
                    error);
         return;
     }
+    ReconciliationTrace("checkpoints_reconciled", m_impl->DeliveryGeneration(), callback_tip);
     error.clear();
     if (!m_impl->ReconcileAllStoreConnections(error)) {
+        ReconciliationTrace("final_store_reconciliation_failed", m_impl->DeliveryGeneration(), callback_tip);
         LogWarning("FlowMesh remains paused: B3 tip changed after checkpoint connection: %s\n",
                    error);
         return;
     }
+    ReconciliationTrace("final_store_reconciled", m_impl->DeliveryGeneration(), callback_tip);
     if (market_tip != callback_tip ||
         !m_impl->ReconciledTipMatches(callback_tip)) {
         LogInfo("FlowMesh remains paused: B3 tip changed during reconciliation\n");
         return;
     }
-    m_impl->chain_reconciling.store(false, std::memory_order_release);
+    m_impl->SetChainReconciling(false);
     if (!m_impl->ReconciledAtTip()) {
-        m_impl->chain_reconciling.store(true, std::memory_order_release);
+        m_impl->SetChainReconciling(true);
         LogInfo("FlowMesh remains paused: B3 tip changed before reconciliation completed\n");
         return;
     }

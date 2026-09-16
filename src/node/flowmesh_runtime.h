@@ -5,10 +5,13 @@
 #ifndef B3COIN_NODE_FLOWMESH_RUNTIME_H
 #define B3COIN_NODE_FLOWMESH_RUNTIME_H
 
+#include <flowmesh/client_evidence.h>
 #include <flowmesh/p2p.h>
 #include <flowmesh/production_wire.h>
+#include <node/flowmesh_delivery.h>
 #include <node/flowmesh_production_store.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -65,6 +68,9 @@ class FlowMeshRuntimeChain : public flowmesh::AnchorPolicy
 {
 public:
     virtual int32_t TipHeight() const = 0;
+    /** Local chain-reconciliation generation, never serialized or certified.
+     * A change detects a gate that closed and reopened during one handler. */
+    virtual uint64_t DeliveryGeneration() const { return 0; }
 
     /** Resolve one exact anchored epoch/set identity. */
     virtual std::optional<flowmesh::ActiveFnBlsSeatSet> SeatSet(
@@ -160,10 +166,64 @@ struct FlowMeshRuntimeRelay {
     std::optional<flowmesh::WirePeerId> peer;
     std::optional<flowmesh::WirePeerId> exclude_peer;
     flowmesh::WireMessage message;
+    // Process-local delivery identity; never part of the signed wire object.
+    uint64_t delivery_id{0};
 };
 
 using FlowMeshRuntimeRelayFn =
-    std::function<void(FlowMeshRuntimeRelay relay)>;
+    std::function<FlowMeshRelayResult(FlowMeshRuntimeRelay relay)>;
+
+struct FlowMeshRuntimeEvent {
+    uint64_t monotonic_us{0};
+    std::string stage;
+    flowmesh::WireMessageKind kind{flowmesh::WireMessageKind::ACTION};
+    uint64_t sequence{0};
+    uint256 object_id;
+    std::optional<flowmesh::WirePeerId> peer;
+    std::string reason;
+    // Per-market/runtime append cursor, not a protocol sequence or receipt
+    // ACK. Timestamps can precede earlier appends for concurrent admissions.
+    uint64_t event_id{0};
+    uint64_t epoch{0};
+    // Observed set unless a decoded/certified entry supplies its signed set.
+    uint256 seat_set_hash;
+    std::optional<uint32_t> round;
+    std::optional<uint32_t> seat_index;
+    std::optional<uint256> related_object_id;
+    // SHA256d of compressed public bytes/signature; no private material.
+    std::optional<uint256> bls_key_hash;
+    std::optional<uint256> signature_hash;
+    // SHA256d of EncodeWireMessage bytes, populated only for BENCH tracing.
+    std::optional<uint256> wire_hash;
+    std::optional<uint64_t> delivery_id;
+};
+
+/** Local process observations, never proof of peer receipt or a remote tip.
+ * Admission includes legacy queue acceptance, which has no socket completion.
+ * catchup_completed counts applied pages with local tail slack, not a tip ACK.
+ * event_queue_overflows is node-global and repeated in each market snapshot. */
+struct FlowMeshRuntimeDeliverySnapshot {
+    flowmesh::MarketId market_id;
+    uint64_t created{0}, admitted{0}, refused{0}, retried{0};
+    uint64_t socket_written{0}, verified{0}, certificate_formed{0};
+    uint64_t durably_applied{0}, catchup_started{0}, catchup_completed{0};
+    uint64_t catchup_timeouts{0}, catchup_replies_refused{0}, catchup_partial_pages{0};
+    uint64_t completion_timeouts{0}, retention_refused{0}, cancelled{0};
+    uint64_t event_queue_overflows{0};
+    uint64_t receive_deferred{0}, receive_refused{0};
+    size_t pending_objects{0}, pending_bytes{0};
+    size_t deferred_objects{0}, deferred_bytes{0};
+    std::string current_reason;
+    uint256 last_target_hash;
+    uint64_t sampled_monotonic_us{0};
+    uint64_t last_event_id{0}, events_dropped{0};
+    // The opt-in BENCH mirror is capped at 16 MiB per market/process.
+    uint64_t trace_bytes{0}, trace_events_dropped{0};
+    // Process-lifetime 64 MiB BENCH cap; repeated across market snapshots.
+    uint64_t trace_global_bytes{0}, trace_global_events_dropped{0};
+    // At most 128 events. Clocks are monotonic and local to this process.
+    std::vector<FlowMeshRuntimeEvent> events;
+};
 
 struct FlowMeshRuntimeMarketConfig {
     uint256 domain;
@@ -195,6 +255,7 @@ struct FlowMeshRuntimeConfig {
     //! Repeat a completed legacy peer/market discovery sweep after this delay.
     //! At least one minute; global probe pacing remains one request per second.
     std::chrono::milliseconds legacy_probe_interval{std::chrono::seconds{60}};
+    std::function<void(uint64_t)> cancel_delivery;
 };
 
 struct FlowMeshRuntimeMarketStatus {
@@ -286,6 +347,12 @@ public:
         --m_messages;
         m_bytes -= bytes;
     }
+    void Reset()
+    {
+        m_next = {};
+        m_messages = 0;
+        m_bytes = 0;
+    }
 
 private:
     const size_t m_max_messages;
@@ -307,6 +374,25 @@ public:
 
     FlowMeshDuplicateActionRelayBudget()
         : FlowMeshCommitteeRelayBudget{MAX_MESSAGES, MAX_BYTES} {}
+};
+
+/** Locally admitted pending ACTION retries; no new payload or authorization. */
+class FlowMeshLocalActionRelayBudget : public FlowMeshCommitteeRelayBudget
+{
+public:
+    // Together with retained-evidence (32/s) and duplicate forwarding (16/s),
+    // this additional 16/s stays within the existing 64 ACTION/s peer budget.
+    static constexpr size_t GLOBAL_MESSAGES{4};
+    static constexpr size_t GLOBAL_BYTES{16 * 1024};
+    static constexpr size_t MARKET_MESSAGES{2};
+    static constexpr size_t MARKET_BYTES{8 * 1024};
+    static constexpr size_t MAX_MARKETS_SCANNED{16};
+    static constexpr size_t MAX_ACTIONS_SCANNED{16};
+    static constexpr auto REPEAT_DELAY{std::chrono::seconds{1}};
+
+    FlowMeshLocalActionRelayBudget(size_t messages = GLOBAL_MESSAGES,
+                                  size_t bytes = GLOBAL_BYTES)
+        : FlowMeshCommitteeRelayBudget{messages, bytes} {}
 };
 
 /**
@@ -378,8 +464,27 @@ public:
         const std::optional<flowmesh::AccountId>& account,
         const flowmesh::MarketDataQuery& query, std::string& error) const;
 
+    /** Exact current certificate and state captured at one locked head.
+     * Serialization stops at the client cap; no execution or network I/O. */
+    std::optional<flowmesh::ClientStateEvidence> ClientSnapshot(
+        const flowmesh::MarketId& market_id, std::string& error) const;
+    std::optional<std::vector<unsigned char>> ClientCertifiedEntry(
+        const flowmesh::MarketId& market_id, uint64_t sequence, std::string& error) const;
+    flowmesh::ClientEventPage ClientEvents(
+        const std::optional<flowmesh::ClientEventCursor>& after,
+        const std::optional<flowmesh::MarketId>& market,
+        const std::optional<flowmesh::AccountId>& account,
+        size_t limit = flowmesh::CLIENT_EVENT_PAGE_MAX) const;
+    std::optional<flowmesh::ClientEvent> ClientActionStatus(
+        const flowmesh::MarketId& market_id, const uint256& action_id) const;
+
     /** Test/shutdown aid: waits only for this runtime's current work queue. */
     bool WaitForIdle(std::chrono::milliseconds timeout);
+
+    /** Nonblocking bounded network-completion handoff; false means refused. */
+    bool NotifyDeliveryEvent(const FlowMeshDeliveryEvent& event);
+    std::vector<FlowMeshRuntimeDeliverySnapshot> DeliverySnapshots(
+        std::optional<flowmesh::MarketId> market = std::nullopt) const;
 
 private:
     struct Market;
@@ -396,13 +501,29 @@ private:
     bool InitializeMarket(const FlowMeshRuntimeMarketConfig& config,
                           std::string& error);
     void WorkerLoop();
-    void ProcessMessage(const flowmesh::QueuedWireMessage& queued);
-    void ProcessTick();
+    void ProcessMessage(const flowmesh::QueuedWireMessage& queued, uint64_t dequeued_us);
+    void ProcessTick(uint64_t requested_us, uint64_t dequeued_us);
+    struct PendingDelivery;
+    void RelayMessage(Market& market, flowmesh::WireMessage message,
+                      std::optional<flowmesh::WirePeerId> peer,
+                      std::optional<flowmesh::WirePeerId> exclude,
+                      bool replay_budget_charged = false);
+    void AttemptDelivery(PendingDelivery& pending, bool retry);
+    void RestartDelivery(uint64_t id);
+    bool RecheckDelivery(uint64_t id);
+    void RetryDeliveries();
+    void RegenerateDeliveries();
+    void DeferMessage(Market& market, const flowmesh::QueuedWireMessage& queued);
+    void RetryDeferredMessages();
+    void ProcessDeliveryEvent(const FlowMeshDeliveryEvent& event);
+    void EraseDelivery(uint64_t id, const char* reason);
     void RetryRetainedEvidence();
+    void RetryLocalActions();
     void ForwardPendingDuplicateActions();
     void AnnounceMarkets(bool refresh);
     void ProbeLegacyPeers(const std::vector<flowmesh::WirePeerId>& peers);
     bool TryRequestCatchup(Market& market, flowmesh::WirePeerId peer);
+    void ExpireCatchup(flowmesh::WirePeerId peer, const flowmesh::MarketId& market_id);
     void ProcessCatchupCommand(const CatchupCommand& command);
     void ProcessAddMarketCommand(AddMarketCommand command);
     void RemovePeerOnWorker(flowmesh::WirePeerId peer);
@@ -431,6 +552,7 @@ private:
         std::optional<flowmesh::WireClock::time_point>& last_attempt);
 
     FlowMeshRuntimeConfig m_config;
+    flowmesh::ClientEventLog m_client_events{uint256{}};
     std::vector<FlowMeshRuntimeMarketConfig> m_market_configs;
 
     mutable std::mutex m_market_mutex;
@@ -447,12 +569,41 @@ private:
     std::deque<flowmesh::WirePeerId> m_removed_peers;
     std::deque<CatchupCommand> m_catchup_commands;
     std::deque<AddMarketCommand> m_add_market_commands;
+    std::deque<FlowMeshDeliveryEvent> m_delivery_events;
+    std::atomic<uint64_t> m_delivery_event_overflows{0};
     bool m_tick_pending{false};
+    //! Observation of the first coalesced tick request; never a timer input.
+    uint64_t m_tick_requested_us{0};
     bool m_discovery_refresh{false};
     bool m_started{false};
     bool m_stopping{false};
     bool m_processing{false};
     std::thread m_worker;
+
+    // Exact signed critical objects: <=8192 / 64 MiB globally, <=16 MiB per
+    // market. Retry at >=1s; lost completion expires at 5s; paused copies
+    // retire after 60s and halted/disarmed copies retire immediately.
+    // Compact proof/entry
+    // sources survive retention rotation; no retry creates a signature.
+    std::map<uint64_t, std::unique_ptr<PendingDelivery>> m_deliveries;
+    std::map<uint256, uint64_t> m_delivery_keys;
+    uint64_t m_next_delivery_id{1}, m_delivery_cursor{0};
+    size_t m_delivery_bytes{0};
+    bool m_delivery_retention_waiting{false};
+    uint256 m_delivery_regeneration_cursor;
+    flowmesh::WireClock::time_point m_next_delivery_regeneration{};
+    // Unvalidated reconciliation-race input, <=128 / 16 MiB, per-market16,
+    // per-peer8, expires after60s with an explicit bounded catch-up request.
+    std::map<uint256, flowmesh::QueuedWireMessage> m_deferred_messages;
+    std::map<uint256, flowmesh::WireClock::time_point> m_deferred_deadlines;
+    size_t m_deferred_bytes{0};
+    uint256 m_deferred_cursor;
+    flowmesh::WireClock::time_point m_next_deferred_retry{};
+    std::set<std::pair<flowmesh::WirePeerId, flowmesh::MarketId>> m_receive_recovery;
+    std::optional<std::pair<flowmesh::WirePeerId, flowmesh::MarketId>> m_receive_recovery_cursor;
+    FlowMeshCommitteeRelayBudget m_delivery_retry_budget{
+        FlowMeshCommitteeRelayBudget::GLOBAL_MESSAGES,
+        FlowMeshCommitteeRelayBudget::GLOBAL_BYTES};
 
     //! Worker-owned after Start().
     flowmesh::CatchupRequestTracker m_catchup_tracker;
@@ -461,12 +612,21 @@ private:
         uint64_t from_sequence{0};
         uint16_t max_entries{0};
         uint32_t max_bytes{0};
+        flowmesh::WireClock::time_point started{};
         flowmesh::WireClock::time_point deadline{};
     };
     std::map<std::pair<flowmesh::WirePeerId, flowmesh::MarketId>,
              PendingCatchup> m_pending_catchup;
     std::map<std::pair<flowmesh::WirePeerId, flowmesh::MarketId>,
              flowmesh::WireClock::time_point> m_catchup_cooldowns;
+    // Local delivery policy only: <=256 profiles, not committee/chain state.
+    // Timeout reduces the page count, never the size of a permitted entry.
+    struct CatchupProfile {
+        uint16_t max_entries{static_cast<uint16_t>(flowmesh::FLOWMESH_CATCHUP_MAX_ENTRIES)};
+        flowmesh::WireClock::time_point last_used{};
+    };
+    std::map<std::pair<flowmesh::WirePeerId, flowmesh::MarketId>,
+             CatchupProfile> m_catchup_profiles;
     flowmesh::MarketId m_announcement_cursor;
     flowmesh::WireClock::time_point m_next_announcement_batch{};
     //! One bounded cursor/backoff per peer. Each known market gets a probe
@@ -486,6 +646,8 @@ private:
         FlowMeshCommitteeRelayBudget::GLOBAL_BYTES};
     FlowMeshDuplicateActionRelayBudget m_duplicate_action_relay_budget;
     flowmesh::MarketId m_duplicate_action_relay_cursor;
+    FlowMeshLocalActionRelayBudget m_local_action_relay_budget;
+    flowmesh::MarketId m_local_action_relay_cursor;
 };
 
 } // namespace node

@@ -117,6 +117,11 @@ BASE_SCRIPTS = [
     'feature_b3_finality_soak.py',
     'feature_b3_finality_mempool.py',
     'feature_flowmesh_release.py',
+    'feature_flowmesh_network_policy.py',
+    'feature_flowmesh_connect_rpc.py',
+    'wallet_exportflowmeshkey.py',
+    'feature_flowmesh_independent.py',
+    'feature_flowmesh_remote_client.py',
     'mempool_updatefromblock.py',
     'mempool_persist.py',
     # vv Tests less than 60s vv

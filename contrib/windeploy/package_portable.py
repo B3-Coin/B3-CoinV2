@@ -78,6 +78,7 @@ def main():
     parser.add_argument("--depends", type=Path, required=True)
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--build-info", type=Path)
     parser.add_argument("--objdump", default="x86_64-w64-mingw32-objdump")
     parser.add_argument("--compiler", default="x86_64-w64-mingw32-g++-posix")
     args = parser.parse_args()
@@ -87,6 +88,10 @@ def main():
         if not path.is_file():
             raise RuntimeError(f"Missing package documentation: {path}")
         payload[name] = path
+    if args.build_info is not None:
+        if not args.build_info.is_file():
+            raise RuntimeError(f"Missing build identity: {args.build_info}")
+        payload["BUILD-INFO.json"] = args.build_info
     args.archive.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(args.archive, "x", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, path in sorted(payload.items()):

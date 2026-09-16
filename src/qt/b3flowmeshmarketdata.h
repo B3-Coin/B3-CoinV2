@@ -21,6 +21,24 @@ struct Units {
 };
 QString FormatAmount(CAmount raw, int decimals);
 QString FormatPrice(CAmount raw_atoms_per_raw_unit, int base_decimals);
+//! Orientation never changes canonical market data or the signed integer grid.
+//! Approximate display prices are marked; use ExactInversePrice for order input.
+QString FormatDisplayPrice(CAmount raw_price, int base_decimals, bool inverse = false);
+QString ExactInversePrice(CAmount raw_price, int base_decimals);
+//! Exact sampled gross B3 when inverted; not a fixed-B3 order quantity.
+QString FormatDepthQuantity(CAmount raw_price, CAmount base_quantity, int base_decimals, bool inverse);
+std::optional<CAmount> ParseDisplayPrice(const QString& text, const Units& units, bool inverse, QString* error = nullptr);
+//! Executable canonical limit and its exact presentation. An adjusted inverse
+//! limit is rounded only in the customer's favour; the UI must disclose it.
+struct DisplayLimit {
+    CAmount price{0};
+    bool adjusted{false};
+    QString executable_price;
+};
+std::optional<DisplayLimit> ParseDisplayLimit(const QString& text, const Units& units, bool inverse, bool display_buy, QString* error = nullptr);
+QString CanonicalSide(bool buy, bool inverse);
+bool DisplayBuy(const QString& canonical_side, bool inverse);
+std::optional<CAmount> ReplacementBudget(CAmount available, CAmount reserved);
 std::optional<CAmount> ParseQuantity(const QString& text, const Units& units, QString* error = nullptr);
 std::optional<CAmount> ParsePrice(const QString& text, const Units& units, QString* error = nullptr);
 std::optional<CAmount> Notional(CAmount raw_price, CAmount raw_quantity);
@@ -47,6 +65,11 @@ struct Snapshot {
     QString market, base, domain, config, head, state_root, account, halt, error;
     Units units;
     bool certified{false}, running{false}, paused{true}, handoff{false}, observer{true}, unchanged{false};
+    bool chain_reconciling{false};
+    // These are local-client verification results, not endpoint assertions.
+    bool remote{false}, certificate_verified{false}, account_state_verified{false}, execution_result_verified{false};
+    bool b3_checkpoint_confirmed{false}, event_gap{false};
+    QString endpoint;
     bool curves_complete{false}, history_truncated{false}, history_available{false}, history_page_partial{false};
     uint64_t next_sequence{0}, epoch{0}, account_sequence{0}, active_seats{0}, quorum_required{0}, pending_actions{0};
     CAmount base_available{0}, base_reserved{0}, b3_available{0}, b3_reserved{0};

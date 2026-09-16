@@ -15,6 +15,7 @@ public:
     explicit B3FlowMeshChart(QWidget* parent = nullptr);
     void setSnapshot(const std::optional<B3FlowMeshMarketData::Snapshot>& snapshot);
     void setMode(Mode mode);
+    void setInverted(bool inverted);
     void setLoading(bool loading);
     void setStale(bool stale);
     int pricePointCount() const;
@@ -28,6 +29,7 @@ private:
     std::optional<B3FlowMeshMarketData::Snapshot> m_snapshot;
     Mode m_mode{Mode::Prices};
     bool m_loading{false}, m_stale{false};
+    bool m_inverted{false};
     QPointF m_pointer{-1, -1};
 };
 #endif

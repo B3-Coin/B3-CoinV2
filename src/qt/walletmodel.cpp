@@ -99,6 +99,13 @@ void WalletModel::updateStatus()
 
 void WalletModel::pollBalanceChanged()
 {
+    // Background precision discovery can finish while the chain is idle.
+    // The generation lookup is memory-only and never scans wallet outputs.
+    const uint64_t metadata_generation{m_wallet->assetMetadataGeneration()};
+    if (metadata_generation != m_cached_asset_metadata_generation) {
+        fForceCheckBalanceChanged = true;
+        m_force_asset_balance_refresh = true;
+    }
     // Avoid recomputing wallet balances unless a TransactionChanged or
     // BlockTip notification was received.
     if (!fForceCheckBalanceChanged && m_cached_last_update_tip == getLastBlockProcessed()) return;
@@ -126,6 +133,7 @@ void WalletModel::pollBalanceChanged()
 
         // Balance and number of transactions might have changed
         m_cached_last_update_tip = block_hash;
+        m_cached_asset_metadata_generation = metadata_generation;
         m_cached_asset_balances = std::move(new_asset_balances);
 
         checkBalanceChanged(new_balances);

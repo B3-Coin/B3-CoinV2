@@ -6,6 +6,11 @@ name: release-build
 on:
   workflow_dispatch:
     inputs:
+      check_operator_key:
+        description: "Run only the focused native-Windows operator-key file regression alongside compilation (not full suites)"
+        required: false
+        type: boolean
+        default: false
       windows_build_only:
         description: "Build a portable Windows ZIP only, without an installer, tests, or release publication"
         required: false
@@ -28,6 +33,65 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  keyfile-regression-cross:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.check_operator_key }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build only the standalone file-creation regression
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64-posix
+          x86_64-w64-mingw32-g++-posix -std=c++20 -O2 -Wall -Wextra -Werror -static \
+            -Isrc contrib/b3hive-release/check-flowmesh-keyfile.cpp -o keyfile-check.exe
+          x86_64-w64-mingw32-objdump -p keyfile-check.exe > imports.txt
+          grep -i 'DLL Name: msvcrt.dll' imports.txt
+          sha256sum keyfile-check.exe > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msvcrt-keyfile-probe
+          path: |
+            keyfile-check.exe
+            imports.txt
+            SHA256SUMS
+
+  keyfile-regression-windows:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.check_operator_key }}
+    needs: keyfile-regression-cross
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: msvcrt-keyfile-probe
+      - name: Reproduce old failure and verify exclusive creation and reopening
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $probeRoot = Join-Path $env:RUNNER_TEMP ('fm-keyfile-' + [guid]::NewGuid().ToString())
+          $legacyPath = Join-Path $probeRoot 'legacy'
+          $fixedPath = Join-Path $probeRoot 'fixed'
+          & .\keyfile-check.exe $legacyPath --legacy 2>&1 | Tee-Object legacy.txt
+          $legacyExit = $LASTEXITCODE
+          if ($legacyExit -ne 11) { throw "Expected old MSVCRT creation failure; got $legacyExit" }
+          & .\keyfile-check.exe $fixedPath 2>&1 | Tee-Object fixed.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Fixed exclusive-creation regression failed' }
+          & .\keyfile-check.exe $fixedPath --reopen 2>&1 | Tee-Object reopen.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Separate-process exact-byte reopen failed' }
+          "PASS old failure reproduced; fixed helper and fresh-process reopen passed at $env:GITHUB_SHA" | Tee-Object summary.txt
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-keyfile-results
+          path: |
+            legacy.txt
+            fixed.txt
+            reopen.txt
+            summary.txt
+
   version:
     runs-on: ubuntu-24.04
     outputs:
@@ -435,12 +499,17 @@ jobs:
           set -euo pipefail
           mkdir -p out
           archive="out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64.zip"
+          python3 contrib/b3hive-release/write-build-info.py \
+            --output build/BUILD-INFO.json --platform win64 \
+            --version '${{ needs.version.outputs.version }}' \
+            --build-only "$WINDOWS_PORTABLE_ONLY"
+          cp build/BUILD-INFO.json out/BUILD-INFO.win64.json
           if [[ "$WINDOWS_PORTABLE_ONLY" == true ]]; then
             test ! -e build/b3coin-win64-setup.exe
             python3 contrib/windeploy/package_portable.py \
               --binaries build/release --depends depends/x86_64-w64-mingw32 \
-              --archive "$archive" --source .
-            (cd out && sha256sum *.zip > SHA256SUMS.win64)
+              --archive "$archive" --source . --build-info build/BUILD-INFO.json
+            (cd out && sha256sum *.zip BUILD-INFO.win64.json > SHA256SUMS.win64)
           else
             cp build/b3coin-win64-setup.exe \
               out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-win64-setup.exe
@@ -448,8 +517,8 @@ jobs:
               build/release/b3coin-qt.exe build/release/b3coind.exe \
               build/release/b3coin-cli.exe build/release/b3coin-tx.exe \
               build/release/b3coin-util.exe build/release/b3coin-wallet.exe \
-              README.md COPYING
-            (cd out && sha256sum *.exe *.zip > SHA256SUMS.win64)
+              README.md COPYING build/BUILD-INFO.json
+            (cd out && sha256sum *.exe *.zip BUILD-INFO.win64.json > SHA256SUMS.win64)
           fi
       - uses: actions/upload-artifact@v4
         with:
@@ -461,12 +530,18 @@ jobs:
     needs: version
     runs-on: macos-15
     timeout-minutes: 180
+    env:
+      DESKTOP_BUILD_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop_build_only }}
     steps:
       - uses: actions/checkout@v4
       - name: Select supported Xcode
         run: sudo xcode-select --switch /Applications/Xcode_16.4.app
       - name: Install toolchain
-        run: brew install cmake boost libevent sqlite capnp qt@6 qrencode
+        run: |
+          brew install cmake pkgconf boost libevent openssl@3 sqlite capnp qt@6 qrencode
+          # Avoid a bottled libevent_openssl.pc pointing at removed OpenSSL
+          # Cellar headers after a dependency upgrade on the hosted runner.
+          brew reinstall --build-from-source libevent
       - name: Configure + build
         run: |
           cmake -C contrib/b3hive-release/stable-channel-v1.cmake \
@@ -495,6 +570,10 @@ jobs:
           "$macdeployqt" "$app" -verbose=2 -always-overwrite \
             -libpath="$(brew --prefix)/lib"
           ruby contrib/macdeploy/normalize_bundled_libraries.rb "$app"
+          python3 contrib/b3hive-release/write-build-info.py \
+            --output "$app/Contents/Resources/BUILD-INFO.json" --platform macos-arm64 \
+            --version '${{ needs.version.outputs.version }}' \
+            --build-only "$DESKTOP_BUILD_ONLY"
           codesign --deep --force --sign - "$app"
           ditto -c -k --sequesterRsrc --keepParent "$app" build/b3coin-macos-app-complete.zip
           mv build/b3coin-macos-app-complete.zip build/b3coin-macos-app.zip
@@ -559,7 +638,8 @@ jobs:
           # The macOS release is the bundled GUI app only and requires macOS
           # 15.0 or newer, as verified from every Mach-O file above.
           cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-arm64.zip
-          (cd out && shasum -a 256 *.zip > SHA256SUMS.macos-arm64)
+          cp 'build/B3 Hive.app/Contents/Resources/BUILD-INFO.json' out/BUILD-INFO.macos-arm64.json
+          (cd out && shasum -a 256 *.zip BUILD-INFO.macos-arm64.json > SHA256SUMS.macos-arm64)
       - uses: actions/upload-artifact@v4
         with:
           name: b3-hive-macos-arm64
@@ -570,12 +650,18 @@ jobs:
     needs: version
     runs-on: macos-15-intel
     timeout-minutes: 180
+    env:
+      DESKTOP_BUILD_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop_build_only }}
     steps:
       - uses: actions/checkout@v4
       - name: Select supported Xcode
         run: sudo xcode-select --switch /Applications/Xcode_16.4.app
       - name: Install toolchain
-        run: brew install cmake boost libevent sqlite capnp qt@6 qrencode
+        run: |
+          brew install cmake pkgconf boost libevent openssl@3 sqlite capnp qt@6 qrencode
+          # Avoid a bottled libevent_openssl.pc pointing at removed OpenSSL
+          # Cellar headers after a dependency upgrade on the hosted runner.
+          brew reinstall --build-from-source libevent
       - name: Configure + build
         run: |
           cmake -C contrib/b3hive-release/stable-channel-v1.cmake \
@@ -605,6 +691,10 @@ jobs:
           "$macdeployqt" "$app" -verbose=2 -always-overwrite \
             -libpath="$(brew --prefix)/lib"
           ruby contrib/macdeploy/normalize_bundled_libraries.rb "$app"
+          python3 contrib/b3hive-release/write-build-info.py \
+            --output "$app/Contents/Resources/BUILD-INFO.json" --platform macos-x86_64 \
+            --version '${{ needs.version.outputs.version }}' \
+            --build-only "$DESKTOP_BUILD_ONLY"
           codesign --deep --force --sign - "$app"
           ditto -c -k --sequesterRsrc --keepParent "$app" build/b3coin-macos-app-complete.zip
           mv build/b3coin-macos-app-complete.zip build/b3coin-macos-app.zip
@@ -669,7 +759,8 @@ jobs:
           # The macOS release is the bundled GUI app only and requires macOS
           # 15.0 or newer, as verified from every Mach-O file above.
           cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-x86_64.zip
-          (cd out && shasum -a 256 *.zip > SHA256SUMS.macos-x86_64)
+          cp 'build/B3 Hive.app/Contents/Resources/BUILD-INFO.json' out/BUILD-INFO.macos-x86_64.json
+          (cd out && shasum -a 256 *.zip BUILD-INFO.macos-x86_64.json > SHA256SUMS.macos-x86_64)
       - uses: actions/upload-artifact@v4
         with:
           name: b3-hive-macos-x86_64

@@ -25,7 +25,7 @@ class QPlainTextEdit;
 class QPushButton;
 class QThread;
 class QTimer;
-namespace interfaces { class Wallet; }
+namespace interfaces { class Wallet; class Node; }
 
 class B3FlowMeshTradingPanel : public QWidget
 {
@@ -42,7 +42,27 @@ Q_SIGNALS:
     void securityWarning(const QString& warning);
 private:
     friend class B3FlowMeshWorkspaceTests;
-    struct Result;
+    struct StatusRead {
+        // Attribution only; a queued read must never own a wallet/backend.
+        QPointer<WalletModel> wallet;
+        uint64_t generation;
+        interfaces::Node* node;
+        QString domain, config, market, account, action_id, selected_market;
+        bool operator==(const StatusRead&) const = default;
+    };
+    struct Result {
+        std::optional<B3FlowMeshTrading::Action> action;
+        std::optional<B3AssetTransfer::Prepared> prepared;
+        std::vector<B3FlowMeshTrading::Market> markets;
+        std::vector<UniValue> effects;
+        std::optional<B3FlowMeshMarketData::Snapshot> snapshot;
+        std::optional<B3FlowMeshTrading::Receipt> receipt;
+        std::optional<StatusRead> receipt_scope;
+        UniValue response;
+        QString wallet, error, receipt_error;
+        QString receipt_market, receipt_account, receipt_action_id;
+        bool broadcast{false}, write_attempted{false}, catalog{false}, exact_retry{false}, receipt_only{false};
+    };
     struct DeferredReview {
         B3FlowMeshTrading::Operation operation;
         bool funding;
@@ -61,20 +81,44 @@ private:
     void begin(B3FlowMeshTrading::Operation operation);
     bool confirm(const QString& text, bool final_transaction);
     void startJob(std::optional<B3FlowMeshTrading::Action> action = std::nullopt,
-                  std::optional<B3AssetTransfer::Prepared> prepared = std::nullopt);
+                  std::optional<B3AssetTransfer::Prepared> prepared = std::nullopt, bool exact_retry = false, bool receipt_only = false,
+                  std::optional<StatusRead> status_read = std::nullopt);
+    std::optional<StatusRead> selectedStatusRead() const;
+    bool statusReadValid(const StatusRead& scope, bool selected) const;
+    void requestStatusRead();
+    void resumeStatusRead();
+    void updateStatusReadState();
+    void retryReceipt();
+    void applyReceipt(const B3FlowMeshTrading::Receipt& receipt);
+    void applyReceiptError(const Result& result, const QString& error);
+    void restoreSavedActions(const B3FlowMeshTrading::SavedActions& saved);
+    void selectSavedAction();
+    void updateReceiptCard();
+    static std::vector<UniValue> ReadEffectsForRefresh(
+        const B3FlowMeshTrading::RpcCall& rpc, const QString& market_id,
+        B3FlowMeshMarketData::Snapshot& snapshot);
     void finishJob(const std::shared_ptr<Result>& result);
+    void applyJobResult(const std::shared_ptr<Result>& result);
     void stopWorker();
     bool restoreLock();
     void notice(const QString& text);
     void markUncertain(const std::shared_ptr<Result>& result);
     void reviewUncertain();
     std::optional<B3FlowMeshTrading::Market> market() const;
+    bool inverted() const;
+    bool receiptWalletSelected() const { return m_wallet && m_receipt_wallet == m_wallet; }
+    bool uncertainWalletSelected() const { return m_wallet && m_uncertain_wallet == m_wallet; }
 
     QPointer<WalletModel> m_wallet;
-    std::shared_ptr<interfaces::Wallet> m_backend, m_relock_backend, m_uncertain_backend;
+    std::shared_ptr<interfaces::Wallet> m_backend, m_relock_backend;
+    // Attribution only: public receipt/uncertainty data must not keep a wallet
+    // alive after detach/unload, including while this panel is hidden.
+    QPointer<WalletModel> m_receipt_wallet, m_uncertain_wallet;
     std::shared_ptr<Result> m_active_result;
     std::optional<DeferredReview> m_deferred_review;
-    QString m_wallet_name, m_security_warning, m_requested_base, m_relock_wallet_name, m_uncertain_details;
+    std::optional<StatusRead> m_deferred_status;
+    QString m_wallet_name, m_security_warning, m_requested_base, m_relock_wallet_name, m_uncertain_details, m_uncertain_action_id;
+    QString m_uncertain_market, m_uncertain_account;
     std::unique_ptr<WalletModel::UnlockContext> m_unlock;
     std::shared_ptr<std::atomic_bool> m_cancel{std::make_shared<std::atomic_bool>(false)};
     QPointer<QMessageBox> m_confirmation;
@@ -91,9 +135,15 @@ private:
     bool m_loading{false}, m_read_failed{false};
     std::vector<B3FlowMeshTrading::Market> m_market_data;
     std::vector<UniValue> m_effect_data;
+    B3FlowMeshTrading::SavedActions m_saved_actions;
+    bool m_saved_actions_ready{false};
     QString m_pending_market, m_pending_account;
+    std::optional<B3FlowMeshTrading::Receipt> m_receipt;
+    QString m_receipt_error;
     std::optional<uint64_t> m_pending_sequence;
     QComboBox* m_market{nullptr};
+    QComboBox* m_saved_selector{nullptr};
+    QComboBox* m_orientation{nullptr};
     QComboBox* m_side{nullptr};
     QComboBox* m_asset{nullptr};
     QComboBox* m_effect{nullptr};
@@ -105,6 +155,8 @@ private:
     QLineEdit* m_deposit_vout{nullptr};
     QLabel* m_status{nullptr};
     QLabel* m_balances{nullptr};
+    QLabel* m_receipt_card{nullptr};
+    QLabel* m_status_read_state{nullptr};
     QLabel *m_pair_title{nullptr}, *m_last_price{nullptr}, *m_liquidity_note{nullptr}, *m_progress{nullptr},
         *m_quantity_label{nullptr}, *m_price_label{nullptr}, *m_ticket_total{nullptr}, *m_ticket_fee{nullptr}, *m_ticket_available{nullptr}, *m_grid_note{nullptr},
         *m_history_note{nullptr}, *m_own_note{nullptr}, *m_identity_detail{nullptr};
@@ -116,6 +168,6 @@ private:
     QPlainTextEdit* m_log{nullptr};
     QPushButton *m_refresh{nullptr}, *m_order{nullptr}, *m_cancel_order{nullptr},
         *m_deposit{nullptr}, *m_admit{nullptr}, *m_withdraw{nullptr},
-        *m_checkpoint{nullptr}, *m_publish{nullptr}, *m_review_uncertain{nullptr};
+        *m_checkpoint{nullptr}, *m_publish{nullptr}, *m_review_uncertain{nullptr}, *m_retry_receipt{nullptr}, *m_check_receipt{nullptr};
 };
 #endif
