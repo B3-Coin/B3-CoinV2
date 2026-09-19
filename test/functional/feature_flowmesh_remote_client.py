@@ -448,9 +448,33 @@ class FlowMeshRemoteClientTest(FlowMeshIndependentTest):
             finally:
                 for relay in self.tls_relays:
                     relay.configure()
-            recovered = self.client_balance(market_id)
+            recovered = None
+            cooldown_deferrals = 0
+            recovery_started = time.monotonic()
+
+            def recovery_ready():
+                nonlocal recovered, cooldown_deferrals
+                try:
+                    recovered = self.client_balance(market_id)
+                except JSONRPCException as error:
+                    if (error.error["code"] != -1 or
+                            not error.error["message"].startswith("Trading endpoints are waiting to retry")):
+                        raise
+                    cooldown_deferrals += 1
+                    return False
+                return True
+
+            # Oversized transport replies can leave the restored endpoint in
+            # the production read cooldown (capped at 60 seconds). Wait only
+            # for that explicit state; proof, transport and budget errors fail.
+            self.wait_until(recovery_ready, timeout=65, check_interval=.1)
             for field in fields:
                 assert_equal(recovered[field], expected[field])
+            assert_equal(submissions(), initial_submissions)
+            assert_equal(self.client.getflowmeshclientinfo()["pending_actions"], pending)
+            self.adversarial_results[-1].update(
+                recovery_cooldown_deferrals=cooldown_deferrals,
+                recovery_elapsed_ms=(time.monotonic() - recovery_started) * 1000)
             # Keep deliberate hostile-read checks below the unchanged public
             # per-IP budget; do not misclassify unrelated rate refusal as a
             # successful tampered-proof rejection.
