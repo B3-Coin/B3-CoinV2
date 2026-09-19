@@ -504,6 +504,7 @@ jobs:
             --version '${{ needs.version.outputs.version }}' \
             --build-only "$WINDOWS_PORTABLE_ONLY"
           cp build/BUILD-INFO.json out/BUILD-INFO.win64.json
+          cp FLOWMESH-TESTING.md out/FLOWMESH-TESTING.md
           if [[ "$WINDOWS_PORTABLE_ONLY" == true ]]; then
             test ! -e build/b3coin-win64-setup.exe
             python3 contrib/windeploy/package_portable.py \
@@ -560,6 +561,7 @@ jobs:
         run: |
           set -euo pipefail
           app='build/B3 Hive.app'
+          cp FLOWMESH-TESTING.md "$app/Contents/Resources/FLOWMESH-TESTING.md"
           # The legacy deploy script only includes styles/platform plugins.
           # Start from its unmodified source app so Qt can discover and bundle
           # the TLS backends and their transitive dependencies too.
@@ -588,6 +590,7 @@ jobs:
           test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = "co.b3coin.B3Hive"
           test "$(plutil -extract LSMinimumSystemVersion raw "$app/Contents/Info.plist")" = "$deployment_target"
           test -f "$app/Contents/Resources/qt.conf"
+          cmp FLOWMESH-TESTING.md "$app/Contents/Resources/FLOWMESH-TESTING.md"
           test -f "$app/Contents/PlugIns/platforms/libqcocoa.dylib"
           # The certificate-only backend cannot provide HTTPS connections.
           [[ -f "$app/Contents/PlugIns/tls/libqsecuretransportbackend.dylib" || \
@@ -639,6 +642,7 @@ jobs:
           # 15.0 or newer, as verified from every Mach-O file above.
           cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-arm64.zip
           cp 'build/B3 Hive.app/Contents/Resources/BUILD-INFO.json' out/BUILD-INFO.macos-arm64.json
+          cp FLOWMESH-TESTING.md out/FLOWMESH-TESTING.md
           (cd out && shasum -a 256 *.zip BUILD-INFO.macos-arm64.json > SHA256SUMS.macos-arm64)
       - uses: actions/upload-artifact@v4
         with:
@@ -681,6 +685,7 @@ jobs:
         run: |
           set -euo pipefail
           app='build/B3 Hive.app'
+          cp FLOWMESH-TESTING.md "$app/Contents/Resources/FLOWMESH-TESTING.md"
           # The legacy deploy script only includes styles/platform plugins.
           # Start from its unmodified source app so Qt can discover and bundle
           # the TLS backends and their transitive dependencies too.
@@ -709,6 +714,7 @@ jobs:
           test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = "co.b3coin.B3Hive"
           test "$(plutil -extract LSMinimumSystemVersion raw "$app/Contents/Info.plist")" = "$deployment_target"
           test -f "$app/Contents/Resources/qt.conf"
+          cmp FLOWMESH-TESTING.md "$app/Contents/Resources/FLOWMESH-TESTING.md"
           test -f "$app/Contents/PlugIns/platforms/libqcocoa.dylib"
           # The certificate-only backend cannot provide HTTPS connections.
           [[ -f "$app/Contents/PlugIns/tls/libqsecuretransportbackend.dylib" || \
@@ -760,6 +766,7 @@ jobs:
           # 15.0 or newer, as verified from every Mach-O file above.
           cp build/b3coin-macos-app.zip out/b3-hive-v${{ needs.version.outputs.version }}-unsigned-macos-x86_64.zip
           cp 'build/B3 Hive.app/Contents/Resources/BUILD-INFO.json' out/BUILD-INFO.macos-x86_64.json
+          cp FLOWMESH-TESTING.md out/FLOWMESH-TESTING.md
           (cd out && shasum -a 256 *.zip BUILD-INFO.macos-x86_64.json > SHA256SUMS.macos-x86_64)
       - uses: actions/upload-artifact@v4
         with:

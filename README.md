@@ -1,5 +1,17 @@
 # B3 Hive
 
+## Experimental FlowMesh tester candidate
+
+This branch builds **1.1.5-flowmesh-test.1**, not a production recovery release.
+The opt-in preliminary-agreement mode still has a reproduced withdrawal
+certification stall. Existing locked markets are not repaired. Use generated
+wallets and valueless coins on an isolated test network; do not upgrade a live
+signer or reset its history to test this candidate.
+
+Read [FLOWMESH-TESTING.md](FLOWMESH-TESTING.md) for the known failure, connection
+commands, operator/client distinction and qualification limits. Build artifacts
+and passing unit tests are not end-to-end certification or deployment approval.
+
 B3 Hive is the desktop wallet and full-node software for the B3 FlowMesh
 network. It downloads and validates the B3 chain locally, manages
 user-controlled keys, and provides the foundation for B3's modern protocol

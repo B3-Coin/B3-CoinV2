@@ -83,7 +83,7 @@ def main():
     parser.add_argument("--compiler", default="x86_64-w64-mingw32-g++-posix")
     args = parser.parse_args()
     payload = collect_payload(args.binaries, args.depends, args.objdump, args.compiler)
-    for name in ("README.md", "COPYING"):
+    for name in ("README.md", "COPYING", "FLOWMESH-TESTING.md"):
         path = args.source / name
         if not path.is_file():
             raise RuntimeError(f"Missing package documentation: {path}")

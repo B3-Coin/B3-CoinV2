@@ -102,7 +102,7 @@ class PortablePackageTests(unittest.TestCase):
             self.collect()
 
     def test_archive_contains_portable_programs_and_no_installer(self):
-        for name in ("README.md", "COPYING"):
+        for name in ("README.md", "COPYING", "FLOWMESH-TESTING.md"):
             (self.root / name).touch()
         archive = self.root / "out" / "portable.zip"
         self.imports["b3coin-qt.exe"] = ["SHCORE.dll"]
@@ -114,8 +114,21 @@ class PortablePackageTests(unittest.TestCase):
             package.main()
         with zipfile.ZipFile(archive) as result:
             self.assertEqual(set(result.namelist()),
-                             set(package.PROGRAMS) | {"README.md", "COPYING"})
+                             set(package.PROGRAMS) | {"README.md", "COPYING", "FLOWMESH-TESTING.md"})
             self.assertIsNone(result.testzip())
+
+    def test_missing_experimental_warning_refuses_archive(self):
+        for name in ("README.md", "COPYING"):
+            (self.root / name).touch()
+        archive = self.root / "out" / "portable.zip"
+        argv = ["package_portable.py", "--binaries", str(self.binaries),
+                "--depends", str(self.depends), "--source", str(self.root),
+                "--archive", str(archive), "--objdump", "objdump",
+                "--compiler", "compiler"]
+        with patch("sys.argv", argv):
+            with self.assertRaisesRegex(RuntimeError, "Missing package documentation.*FLOWMESH-TESTING"):
+                package.main()
+        self.assertFalse(archive.exists())
 
 
 if __name__ == "__main__":
