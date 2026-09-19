@@ -236,9 +236,11 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         std::tuple<flowmesh::MarketId, uint64_t, uint256>;
 
     explicit Impl(ChainstateManager& chainman_in, fs::path datadir_in,
-                  FlowMeshServiceTransport transport_in)
+                  FlowMeshServiceTransport transport_in,
+                  std::set<flowmesh::MarketId> preagreement_markets_in)
         : chainman{chainman_in}, datadir{std::move(datadir_in)},
           transport{std::move(transport_in)},
+          preagreement_markets{std::move(preagreement_markets_in)},
           anchors{chainman, FLOWMESH_ANCHOR_DEPTH}
     {
     }
@@ -246,6 +248,7 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     ChainstateManager& chainman;
     fs::path datadir;
     const FlowMeshServiceTransport transport;
+    const std::set<flowmesh::MarketId> preagreement_markets;
     std::shared_ptr<FlowMeshNetService> network;
     ChainAnchorPolicy anchors;
     SteadyFlowMeshRuntimeClock clock;
@@ -1142,9 +1145,10 @@ bool FlowMeshService::Impl::InstallMarket(
     // Open the database before choosing a bootstrap anchor. Every fresh or
     // epoch-zero store must use the same chain-derived anchor: the earliest
     // post-market block with four active seats. Discovery time is irrelevant.
+    const bool preagreement{preagreement_markets.contains(record.market_id)};
     auto store{std::make_unique<FlowMeshProductionStore>(DBParams{
         .path = datadir / fs::PathFromString(record.market_id.GetHex()),
-        .cache_bytes = FLOWMESH_MARKET_DB_CACHE_BYTES})};
+        .cache_bytes = FLOWMESH_MARKET_DB_CACHE_BYTES}, preagreement)};
     bool fresh{false};
     if (!store->CheckForMarket(*domain, record.market_id, fresh, error)) {
         return false;
@@ -1212,9 +1216,24 @@ bool FlowMeshService::Impl::InstallMarket(
         error = "FlowMesh store marker has a different canonical seat set";
         return false;
     }
-    if (!store->OpenForMarket(*domain, record.market_id, *bootstrap_seats,
-                              metadata_state.Root(), error)) {
-        return false;
+    if (preagreement && (fresh || (disk_marker && !disk_marker->agreement_bootstrap_complete))) {
+        // A missing local directory is not evidence of a globally fresh
+        // market. Require explicit selection AND no canonical B3 checkpoint.
+        // Repeat this check after an interrupted bootstrap as well. Hold the
+        // chain snapshot through the first durable mode binding.
+        LOCK(::cs_main);
+        Chainstate& chainstate{chainman.ActiveChainstate()};
+        const CBlockIndex* tip{chainstate.m_chain.Tip()};
+        if (!tip || !SyncIndexesLocked(chainstate, *tip, error)) return false;
+        if (chainstate.ModernFlowMeshCheckpoints().Index().Head(record.market_id)) {
+            error = "FlowMesh preagreement requires a fresh market without B3 checkpoint history; existing markets cannot migrate";
+            return false;
+        }
+        if (!store->OpenForMarket(*domain, record.market_id, *bootstrap_seats,
+                                 metadata_state.Root(), error)) return false;
+    } else {
+        if (!store->OpenForMarket(*domain, record.market_id, *bootstrap_seats,
+                                 metadata_state.Root(), error)) return false;
     }
 
     uint256 last_hash;
@@ -1249,7 +1268,11 @@ bool FlowMeshService::Impl::InstallMarket(
         .next_effect_index = marker->next_effect_index,
         .last_microblock_hash = marker->last_microblock_hash,
         .store = store.get(),
-        .deposits = resources->deposits.get()};
+        .deposits = resources->deposits.get(),
+        .preagreement = preagreement,
+        .agreement_path = datadir / fs::PathFromString(record.market_id.GetHex()) / "agreement",
+        .agreement_identity = marker->agreement_identity,
+        .agreement_allow_create = preagreement && !marker->agreement_bootstrap_complete};
 
     std::shared_ptr<FlowMeshRuntime> active;
     {
@@ -1441,9 +1464,28 @@ bool FlowMeshService::Impl::ReconcileConnectedCheckpoints(std::string& error)
     return true;
 }
 
+bool ParseFlowMeshPreagreementMarkets(const std::vector<std::string>& values,
+                                     std::set<flowmesh::MarketId>& out,
+                                     std::string& error)
+{
+    std::set<flowmesh::MarketId> parsed;
+    for (const std::string& value : values) {
+        const auto market{uint256::FromHex(value)};
+        if (value.size() != 64 || !market || market->IsNull()) {
+            error = "-flowmeshpreagreementmarket requires an exact nonzero 64-hex market ID";
+            return false;
+        }
+        parsed.insert(*market);
+    }
+    out = std::move(parsed);
+    return true;
+}
+
 FlowMeshService::FlowMeshService(ChainstateManager& chainman, fs::path datadir,
-                                 FlowMeshServiceTransport transport)
-    : m_impl{std::make_unique<Impl>(chainman, std::move(datadir), std::move(transport))}
+                                 FlowMeshServiceTransport transport,
+                                 std::set<flowmesh::MarketId> preagreement_markets)
+    : m_impl{std::make_unique<Impl>(chainman, std::move(datadir), std::move(transport),
+                                  std::move(preagreement_markets))}
 {
 }
 

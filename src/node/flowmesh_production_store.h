@@ -85,7 +85,8 @@ bool FlowMeshHandoffConnectionMature(
     const ProductionB3Connection& connection, int32_t canonical_tip_height);
 
 /**
- * Production FlowMesh durable log, format v3.
+ * Production FlowMesh durable log: legacy format v3, explicit fresh-market
+ * preagreement format v4. There is no migration between these modes.
  *
  * This is a separate per-market store. The older FlowMeshStore format-v2
  * regtest spike remains intact and has no migration path into this class.
@@ -99,6 +100,7 @@ class FlowMeshProductionStore final : public flowmesh::DurableProductionLockJour
 {
 public:
     static constexpr int32_t FORMAT_VERSION{3};
+    static constexpr int32_t PREAGREEMENT_FORMAT_VERSION{4};
 
     struct Marker {
         int32_t version{FORMAT_VERSION};
@@ -113,6 +115,9 @@ public:
         uint256 last_microblock_hash;
         uint256 state_root;
         modern::FlowMeshCheckpointId last_b3_checkpoint;
+        //! V4-only durable identity shared with the separate agreement journal.
+        uint256 agreement_identity;
+        bool agreement_bootstrap_complete{false};
 
         SERIALIZE_METHODS(Marker, obj)
         {
@@ -122,10 +127,21 @@ public:
                       obj.next_effect_index,
                       obj.last_microblock_hash, obj.state_root,
                       obj.last_b3_checkpoint);
+            if (obj.version == PREAGREEMENT_FORMAT_VERSION) {
+                READWRITE(obj.agreement_identity, obj.agreement_bootstrap_complete);
+            }
         }
     };
 
-    explicit FlowMeshProductionStore(DBParams db_params);
+    explicit FlowMeshProductionStore(DBParams db_params, bool preagreement = false);
+
+    bool PreagreementEnabled() const { return m_preagreement; }
+
+    /** Complete the one-time cross-journal bootstrap only after the agreement
+     * journal has synchronously persisted this exact identity. Open on that
+     * journal must not sign or publish until this synchronous write succeeds.
+     * Completion is irreversible and exact-identity retries are idempotent. */
+    bool MarkAgreementBootstrapComplete(const uint256& identity, std::string& error);
 
     bool ReadMarker(std::optional<Marker>& out, std::string& error);
 
@@ -140,8 +156,8 @@ public:
 
     /**
      * Bind a genuinely fresh database to one initial anchored seat set and
-     * state root, or strictly reopen an existing v3 database. An old v2
-     * marker is rejected; no migration is attempted.
+     * state root, or strictly reopen the constructor-selected format. Older
+     * markers and mode changes are rejected; no migration is attempted.
      */
     bool OpenForMarket(const uint256& domain,
                        const flowmesh::MarketId& market_id,
@@ -287,9 +303,11 @@ public:
 
 private:
     CDBWrapper m_db;
+    const bool m_preagreement;
     std::mutex m_mutex;
     bool m_open{false};
-    //! Fresh/empty stores are ready after their initial binding is checked.
+    //! Fresh/empty stores are ready after their initial binding is checked
+    //! and, for V4, the matching agreement journal bootstrap is complete.
     //! A reopened nonempty store becomes ready only after full replay.
     bool m_ready{false};
     std::deque<flowmesh::MarketHistoryEntry> m_market_history;

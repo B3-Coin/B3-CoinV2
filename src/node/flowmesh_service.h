@@ -18,6 +18,7 @@
 
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,12 @@ class ChainstateManager;
 class PeerManager;
 
 namespace node {
+
+/** Explicit fresh-market selection; exact nonzero 64-hex IDs, no wildcards.
+ * Duplicate selections are harmless and configuration order is irrelevant. */
+bool ParseFlowMeshPreagreementMarkets(const std::vector<std::string>& values,
+                                     std::set<flowmesh::MarketId>& out,
+                                     std::string& error);
 
 /** Engine-free B3 authority lookup. Uses mandatory chain indexes only, never
  * a FlowMesh service, signer, execution store or microblock history. */
@@ -112,7 +119,8 @@ class FlowMeshService final : public flowmesh::WireMessageSink,
 {
 public:
     FlowMeshService(ChainstateManager& chainman, fs::path datadir,
-                    FlowMeshServiceTransport transport = {});
+                    FlowMeshServiceTransport transport = {},
+                    std::set<flowmesh::MarketId> preagreement_markets = {});
     ~FlowMeshService();
 
     FlowMeshService(const FlowMeshService&) = delete;

@@ -8,6 +8,7 @@
 #include <hash.h>
 #include <random.h>
 #include <serialize.h>
+#include <streams.h>
 #include <univalue.h>
 #include <util/log.h>
 #include <util/time.h>
@@ -521,6 +522,14 @@ struct FlowMeshRuntime::Market {
     FlowMeshRuntimeDeliverySnapshot delivery;
     size_t delivery_regeneration_position{0};
     std::chrono::milliseconds round_timeout;
+    std::unique_ptr<FlowMeshAgreement> agreement;
+    std::optional<flowmesh::PreagreementContext> agreement_context;
+    flowmesh::WireClock::time_point next_agreement_retry{};
+    // Independent of legacy relay budgets: a single bounded new-view proof
+    // must fit, while each market has a bounded four-MiB scheduling burst.
+    FlowMeshCommitteeRelayBudget agreement_budget{
+        128, flowmesh::AGREEMENT_MAX_BYTES + flowmesh::FLOWMESH_WIRE_HEADER_SIZE};
+    std::map<uint256, flowmesh::WireClock::time_point> agreement_forwarded;
 
     RuntimeActionPool pool;
     bool ready{true};
@@ -1103,6 +1112,88 @@ std::unique_ptr<typename Market::Candidate> EvaluateCandidate(
                                    authenticated_evidence
                                        ? *authenticated_evidence
                                        : std::vector<flowmesh::Action>{}});
+}
+
+template <typename Market>
+flowmesh::PreagreementContext AgreementContext(const Market& market)
+{
+    return {market.domain, market.market_id, market.seats.epoch,
+            market.seats.set_hash, market.next_sequence, market.last_hash,
+            market.state.Root(), market.state.ConfigId()};
+}
+
+bool SameAgreementContext(const flowmesh::PreagreementContext& a,
+                          const flowmesh::PreagreementContext& b)
+{
+    return a.domain == b.domain && a.market_id == b.market_id &&
+        a.epoch == b.epoch && a.seat_set_hash == b.seat_set_hash &&
+        a.sequence == b.sequence && a.parent_hash == b.parent_hash &&
+        a.previous_state_root == b.previous_state_root &&
+        a.execution_config_id == b.execution_config_id;
+}
+
+// Public authentication evidence, never wallet keys. Lengths are checked
+// before allocation and every restored action is independently authenticated.
+std::optional<std::vector<flowmesh::Action>> DecodeAgreementEvidence(
+    std::span<const unsigned char> bytes)
+{
+    if (bytes.size() > flowmesh::FLOWMESH_ACTION_POOL_PER_MARKET_BYTES) return std::nullopt;
+    try {
+        DataStream stream{bytes};
+        const auto count{ReadCompactSize(stream)};
+        if (count > flowmesh::FLOWMESH_V1_MAX_MICROBLOCK_ACTIONS) return std::nullopt;
+        std::vector<flowmesh::Action> out;
+        for (size_t i{0}; i < count; ++i) {
+            const auto size{ReadCompactSize(stream)};
+            if (!size || size > stream.size() ||
+                size > flowmesh::PayloadLimitForWireKind(flowmesh::WireMessageKind::ACTION)) return std::nullopt;
+            std::vector<unsigned char> payload(size);
+            stream.read(std::as_writable_bytes(std::span{payload}));
+            auto action{flowmesh::DecodeProductionActionPayload(payload)};
+            if (!action) return std::nullopt;
+            out.push_back(std::move(*action));
+        }
+        if (!stream.empty()) return std::nullopt;
+        return out;
+    } catch (const std::exception&) { return std::nullopt; }
+}
+
+template <typename Market>
+std::optional<std::vector<unsigned char>> ValidateAgreementCandidate(
+    Market& market, std::span<const unsigned char> bytes,
+    std::optional<std::span<const unsigned char>> restored)
+{
+    if (!market.chain->Acceptable(market.chain->Current())) return std::nullopt;
+    const auto entry{flowmesh::DecodeProductionEntry(bytes)};
+    if (!entry) return std::nullopt;
+    auto evidence{restored ? DecodeAgreementEvidence(*restored)
+                          : market.pool.EvidenceFor(entry->actions)};
+    // Locally constructed candidates already carry the selected exact actions.
+    if (!restored) {
+        const auto cached{market.candidates.find(entry->GetHash())};
+        if (cached != market.candidates.end()) evidence = cached->second.evidence;
+    }
+    if (!evidence) return std::nullopt;
+    auto candidate{EvaluateCandidate(market, *entry, &*evidence)};
+    if (!candidate) return std::nullopt;
+    if (!market.candidates.contains(entry->GetHash()) &&
+        market.candidates.size() >= MAX_RUNTIME_CANDIDATES_PER_SEQUENCE) return std::nullopt;
+    DataStream encoded;
+    WriteCompactSize(encoded, evidence->size());
+    for (const auto& action : *evidence) {
+        const auto payload{flowmesh::EncodeProductionActionPayload(action)};
+        if (!payload || payload->size() > flowmesh::FLOWMESH_ACTION_POOL_PER_MARKET_BYTES - 9 ||
+            encoded.size() > flowmesh::FLOWMESH_ACTION_POOL_PER_MARKET_BYTES - payload->size() - 9) return std::nullopt;
+        WriteCompactSize(encoded, payload->size());
+        encoded.write(std::as_bytes(std::span{*payload}));
+    }
+    const auto hash{entry->GetHash()};
+    market.candidates.try_emplace(hash, std::move(*candidate));
+    if (!evidence->empty() && (!market.evidence_retry || market.evidence_retry->candidate_hash != hash)) {
+        market.evidence_retry = typename Market::EvidenceRetry{hash, 0, market.clock->Now()};
+    }
+    market.evidence_retry_eligible = true;
+    return std::vector<unsigned char>{UCharCast(encoded.data()), UCharCast(encoded.data()) + encoded.size()};
 }
 
 template <typename Market>
@@ -2076,10 +2167,247 @@ bool FlowMeshRuntime::InitializeMarket(
             return false;
         }
     }
+    if (!InitializeAgreement(*market, config, error)) return false;
     RoundEntered(*market, "market_initialized");
     for (auto& event : restored_client_actions) m_client_events.Append(std::move(event));
     m_markets.emplace(config.market_id, std::move(market));
     return true;
+}
+
+bool FlowMeshRuntime::InitializeAgreement(Market& market,
+    const FlowMeshRuntimeMarketConfig& config, std::string& error)
+{
+    if (config.preagreement != market.store->PreagreementEnabled()) {
+        error = "FlowMesh runtime/store agreement mode mismatch";
+        return false;
+    }
+    if (!config.preagreement) return true;
+    if (config.agreement_path.empty() || config.agreement_identity.IsNull()) {
+        error = "FlowMesh agreement requires an explicit durable journal identity/path";
+        return false;
+    }
+    std::optional<FlowMeshProductionStore::Marker> marker;
+    if (!market.store->ReadMarker(marker, error) || !marker ||
+        marker->agreement_identity != config.agreement_identity ||
+        config.agreement_allow_create == marker->agreement_bootstrap_complete) {
+        error = "FlowMesh agreement bootstrap permission does not match its durable production marker";
+        return false;
+    }
+    auto context{AgreementContext(market)};
+    // A handoff append is not seat activation. Do not open a next-slot journal
+    // against the outgoing roster while the B3 inclusion is still maturing.
+    if (market.pending_handoff && market.client_head) {
+        const auto& entry{market.client_head->entry};
+        context.sequence = entry.sequence;
+        context.parent_hash = entry.parent_hash;
+        context.previous_state_root = entry.previous_state_root;
+    }
+    FlowMeshAgreementCallbacks callbacks;
+    callbacks.validate_candidate = [&market](std::span<const unsigned char> entry,
+        std::optional<std::span<const unsigned char>> evidence) {
+        return ValidateAgreementCandidate(market, entry, evidence);
+    };
+    callbacks.local_keys = [&market] {
+        std::vector<bls::SecretKey> keys;
+        if (market.halt != FlowMeshRuntimeHalt::NONE || market.pending_handoff ||
+            !market.chain->Acceptable(market.chain->Current()) || !RecheckAnchors(market)) return keys;
+        const auto transition{CurrentSeatTransition(market)};
+        if (!transition || transition->kind == FlowMeshSeatTransitionKind::PAUSED) return keys;
+        for (const auto& [seat, key] : LocalSeatKeys(market)) { (void)seat; keys.push_back(key); }
+        return keys;
+    };
+    callbacks.seat_set = [&market](const flowmesh::PreagreementContext& c) {
+        return market.chain->SeatSet(c.domain, c.market_id, c.epoch, c.seat_set_hash);
+    };
+    callbacks.leader = [&market](uint32_t view) -> std::optional<uint32_t> {
+        if (!market.seats.Size()) return std::nullopt;
+        return flowmesh::ProductionProposerSeatIndex(market.next_sequence, view, market.seats.Size());
+    };
+    callbacks.publish = [this, &market](const flowmesh::AgreementMessage& message) {
+        return PublishAgreement(market, message);
+    };
+    try {
+        market.agreement = std::make_unique<FlowMeshAgreement>(
+            DBParams{.path = config.agreement_path, .cache_bytes = 1 << 20}, std::move(callbacks));
+        if (!market.agreement->Open(context, market.seats, config.agreement_identity,
+                                    config.agreement_allow_create, error)) return false;
+        if (!market.store->MarkAgreementBootstrapComplete(config.agreement_identity, error)) return false;
+        market.agreement_context = context;
+        market.round = market.agreement->View();
+        if (market.diagnostics.local_locked_candidate &&
+            market.agreement->DecidedCandidate() != market.diagnostics.local_locked_candidate) {
+            error = "permanent V1 signing lock lacks its exact durable agreement decision";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        error = std::string{"FlowMesh agreement initialization failed: "} + e.what();
+        return false;
+    }
+}
+
+bool FlowMeshRuntime::RefreshAgreement(Market& market)
+{
+    if (!market.agreement) return true;
+    if (market.halt != FlowMeshRuntimeHalt::NONE || market.pending_handoff ||
+        !market.chain->Acceptable(market.chain->Current())) return false;
+    if (market.agreement->Halted()) {
+        HaltMarket(market, FlowMeshRuntimeHalt::SIGNING_CONFLICT, market.agreement->LastError());
+        return false;
+    }
+    const auto context{AgreementContext(market)};
+    if (!market.agreement_context || !SameAgreementContext(*market.agreement_context, context)) {
+        std::string error;
+        if (!market.agreement->Advance(context, market.seats, error)) {
+            HaltMarket(market, FlowMeshRuntimeHalt::SIGNING_CONFLICT, std::move(error));
+            return false;
+        }
+        market.agreement_context = context;
+        market.agreement_forwarded.clear();
+        market.next_agreement_retry = {};
+    }
+    if (market.round != market.agreement->View()) {
+        market.round = market.agreement->View();
+        market.round_started = market.clock->Now();
+        RoundEntered(market, "authenticated_agreement_view");
+    }
+    return true;
+}
+
+bool FlowMeshRuntime::PublishAgreement(Market& market, const flowmesh::AgreementMessage& message)
+{
+    const auto refuse = [&](const std::string& reason) {
+        CountObservation(market.delivery.refused);
+        DeliveryEvent(market, "agreement_refused", flowmesh::WireMessageKind::AGREEMENT,
+                      message.candidate, message.context.sequence, std::nullopt, reason);
+        return false;
+    };
+    if (!market.agreement || !market.agreement_context ||
+        !SameAgreementContext(message.context, *market.agreement_context) ||
+        !SameAgreementContext(message.context, AgreementContext(market))) return refuse("stale_agreement_context");
+    if (market.halt != FlowMeshRuntimeHalt::NONE || market.pending_handoff ||
+        !market.chain->Acceptable(market.chain->Current())) return refuse("market_unavailable_or_reconciling");
+    const auto payload{flowmesh::EncodeAgreementMessage(message)};
+    if (!payload) return refuse("agreement_encoding_limit");
+    const size_t bytes{payload->size() + flowmesh::FLOWMESH_WIRE_HEADER_SIZE};
+    const auto now{market.clock->Now()};
+    if (!market.agreement_budget.Available(now, bytes) ||
+        !m_agreement_relay_budget.Available(now, bytes)) return refuse("agreement_relay_budget");
+    market.agreement_budget.Charge(bytes);
+    m_agreement_relay_budget.Charge(bytes);
+    flowmesh::WireMessage wire;
+    wire.kind = flowmesh::WireMessageKind::AGREEMENT;
+    wire.header = {flowmesh::FLOWMESH_WIRE_VERSION_V1, market.market_id,
+                   message.context.epoch, message.context.sequence};
+    wire.payload = *payload;
+    CountObservation(market.delivery.created);
+    DeliveryEvent(market, "agreement_delivery_attempt", wire.kind, message.candidate,
+                  message.context.sequence, std::nullopt,
+                  "stage=" + std::to_string(static_cast<unsigned>(message.stage)) +
+                      " view=" + std::to_string(message.view), WireTrace(wire));
+    if (!m_config.relay) return refuse("relay_unavailable");
+    FlowMeshRelayResult result;
+    try {
+        result = m_config.relay({std::nullopt, std::nullopt, std::move(wire)});
+    } catch (const std::exception&) { return refuse("relay_callback_exception_retryable"); }
+    bool admitted{false};
+    for (size_t i{0}; i < std::min(result.peers.size(), MAX_DELIVERY_PEERS); ++i) {
+        const auto& peer{result.peers[i]};
+        const bool accepted{peer.admission == FlowMeshDeliveryAdmission::ADMITTED ||
+                             peer.admission == FlowMeshDeliveryAdmission::LEGACY_UNTRACKED};
+        admitted |= accepted;
+        DeliveryEvent(market, accepted ? "agreement_admitted" : "agreement_refused",
+                      flowmesh::WireMessageKind::AGREEMENT, message.candidate,
+                      message.context.sequence, peer.peer, peer.reason.empty()
+                          ? FlowMeshDeliveryAdmissionName(peer.admission) : peer.reason);
+    }
+    if (result.peers.empty()) return refuse(result.reason.empty()
+        ? FlowMeshDeliveryAdmissionName(result.no_peer_reason) : result.reason);
+    // Admission is not peer receipt. The agreement journal still owns retries.
+    return admitted;
+}
+
+void FlowMeshRuntime::HandleAgreement(Market& market, flowmesh::WirePeerId peer,
+                                    const flowmesh::WireMessage& wire)
+{
+    if (!market.agreement || !RefreshAgreement(market)) return;
+    const auto message{flowmesh::DecodeAgreementMessage(wire.payload)};
+    if (!message || wire.header.version != flowmesh::FLOWMESH_WIRE_VERSION_V1 ||
+        wire.header.market_id != message->context.market_id ||
+        wire.header.epoch != message->context.epoch ||
+        wire.header.sequence != message->context.sequence) return;
+    std::string error;
+    if (!market.agreement->Receive(*message, error)) {
+        DeliveryEvent(market, "agreement_refused", wire.kind, message->candidate,
+                      message->context.sequence, peer, error);
+        RefreshAgreement(market);
+        return;
+    }
+    DeliveryEvent(market, "agreement_verified", wire.kind, message->candidate,
+                  message->context.sequence, peer,
+                  "stage=" + std::to_string(static_cast<unsigned>(message->stage)));
+    // Authenticated remote traffic must cross a star relay too. Memory is
+    // bounded; refusal leaves the sender's durable retry obligation intact.
+    const auto id{Hash(wire.payload)};
+    const auto now{market.clock->Now()};
+    if (market.agreement_forwarded.size() >= 4096) {
+        // This is a transient forwarding cooldown, not a signing journal.
+        // Expired hashes must not permanently prevent new valid messages
+        // from crossing a star relay while a slot is recovering.
+        std::erase_if(market.agreement_forwarded,
+                      [&](const auto& item) { return now >= item.second; });
+    }
+    auto found{market.agreement_forwarded.find(id)};
+    if ((found != market.agreement_forwarded.end() && now >= found->second) ||
+        (found == market.agreement_forwarded.end() && market.agreement_forwarded.size() < 4096)) {
+        if (PublishAgreement(market, *message)) market.agreement_forwarded[id] = now + DELIVERY_REPEAT;
+    }
+    RefreshAgreement(market);
+    FinalizeAgreement(market);
+}
+
+void FlowMeshRuntime::FinalizeAgreement(Market& market)
+{
+    if (!market.agreement || !RefreshAgreement(market)) return;
+    const auto hash{market.agreement->DecidedCandidate()};
+    if (!hash) return;
+    const auto bytes{market.agreement->CandidateBytes(*hash)};
+    const auto blob{market.agreement->RestoreCandidateBlob(*hash)};
+    if (!bytes || !blob || !ValidateAgreementCandidate(market, *bytes,
+        std::span<const unsigned char>{*blob})) return;
+    auto& candidate{market.candidates.at(*hash)};
+    const auto local_keys{LocalSeatKeys(market)};
+    if (!local_keys.empty() && !RetainCandidateBeforeSigning(market, candidate)) return;
+    flowmesh::ProductionSigningGuard guard{*market.store};
+    for (const auto& [seat, key] : local_keys) {
+        auto& votes{market.attestations[*hash]};
+        auto vote{votes.find(seat)};
+        if (vote == votes.end()) {
+            flowmesh::ProductionLockResult lock;
+            const auto signed_vote{flowmesh::SignProductionEntryAttestation(
+                key, seat, candidate.entry, market.seats, guard, lock)};
+            if (!signed_vote) {
+                HaltMarket(market, FlowMeshRuntimeHalt::SIGNING_CONFLICT,
+                           "durable agreement decision could not acquire its unchanged V1 signing lock");
+                return;
+            }
+            vote = votes.emplace(seat, *signed_vote).first;
+            candidate.local_signers.insert(seat);
+            market.attested_hash_by_seat.emplace(seat, *hash);
+            DeliveryEvent(market, "attestation_signed", flowmesh::WireMessageKind::ATTESTATION,
+                          *hash, market.next_sequence, LOCAL_ACTION_PEER, "after_durable_commit_decision",
+                          SeatTrace(market, seat, vote->second.signature.Compressed()));
+        }
+        auto& last{candidate.attestation_forward_attempts[seat]};
+        if (last && market.clock->Now() < *last + DELIVERY_REPEAT) continue;
+        const auto payload{flowmesh::EncodeProductionAttestationPayload(vote->second)};
+        if (!payload) continue;
+        flowmesh::WireMessage wire{flowmesh::WireMessageKind::ATTESTATION,
+                                   HeaderFor(candidate.entry), *payload};
+        last = market.clock->Now();
+        RelayMessage(market, std::move(wire), std::nullopt, std::nullopt);
+    }
+    MaybeCertify(market, *hash);
 }
 
 bool FlowMeshRuntime::Start(std::string& error)
@@ -2671,6 +2999,7 @@ void FlowMeshRuntime::ProcessMessage(
     const uint64_t delivery_generation{market.chain->DeliveryGeneration()};
     const bool critical{queued.message.kind == flowmesh::WireMessageKind::PROPOSAL ||
         queued.message.kind == flowmesh::WireMessageKind::ATTESTATION ||
+        queued.message.kind == flowmesh::WireMessageKind::AGREEMENT ||
         queued.message.kind == flowmesh::WireMessageKind::CERTIFICATE};
     if (critical && !market.chain->Acceptable(market.chain->Current())) {
         DeferMessage(market, queued);
@@ -2688,6 +3017,9 @@ void FlowMeshRuntime::ProcessMessage(
     }
     market.diagnostics.last_message_observed_at = GetTime();
     switch (queued.message.kind) {
+    case flowmesh::WireMessageKind::AGREEMENT:
+        HandleAgreement(market, queued.peer, queued.message);
+        break;
     case flowmesh::WireMessageKind::ACTION:
         HandleAction(market, queued.peer, queued.message);
         break;
@@ -2767,7 +3099,32 @@ void FlowMeshRuntime::ProcessTick(const uint64_t requested_us, const uint64_t de
         market.evidence_retry_eligible = false;
         if (!RestoreRetainedCandidate(market)) continue;
         if (!RefreshMarker(market)) continue;
+        if (!RefreshAgreement(market)) continue;
         const auto now{market.clock->Now()};
+        if (market.agreement) {
+            std::string error;
+            const bool has_work{market.next_sequence == 0 || market.pool.Size() != 0 ||
+                                !market.candidates.empty()};
+            if (has_work && !market.agreement->DecidedCandidate() &&
+                now >= market.round_started + market.round_timeout) {
+                if (!market.agreement->Timeout(error)) {
+                    RefreshAgreement(market);
+                    continue;
+                }
+                RefreshAgreement(market);
+            }
+            if (now >= market.next_agreement_retry) {
+                market.next_agreement_retry = now + DELIVERY_REPEAT;
+                if (!market.agreement->Retry(error)) {
+                    RefreshAgreement(market);
+                    continue;
+                }
+                RefreshAgreement(market);
+            }
+            FinalizeAgreement(market);
+            MaybePropose(market);
+            continue;
+        }
         if (!market.pending_handoff &&
             now >= market.round_started + market.round_timeout) {
             if (market.round == std::numeric_limits<uint32_t>::max()) {
@@ -3196,6 +3553,13 @@ void FlowMeshRuntime::MaybePropose(Market& market)
         ProposalWait(market, market.pending_handoff ? "pending_handoff" : "market_not_ready");
         return;
     }
+    if (market.agreement) {
+        if (!RefreshAgreement(market)) return;
+        if (market.agreement->DecidedCandidate()) {
+            FinalizeAgreement(market);
+            return;
+        }
+    }
     const auto transition{CurrentSeatTransition(market)};
     if (!transition ||
         transition->kind == FlowMeshSeatTransitionKind::PAUSED) {
@@ -3226,6 +3590,19 @@ void FlowMeshRuntime::MaybePropose(Market& market)
         return;
     }
 
+    if (market.agreement && !locked_hash) {
+        // Reuse exact, independently revalidated candidates. A changing B3 tip
+        // must not manufacture a different proposal on each refresh.
+        if (const auto required{market.agreement->RequiredCandidateHash()}) {
+            const auto bytes{market.agreement->CandidateBytes(*required)};
+            const auto blob{market.agreement->RestoreCandidateBlob(*required)};
+            if (!bytes || !blob || !ValidateAgreementCandidate(market, *bytes,
+                std::span<const unsigned char>{*blob})) return;
+            locked_hash = required;
+        } else if (!market.candidates.empty()) {
+            locked_hash = market.candidates.begin()->first;
+        }
+    }
     Market::Candidate* candidate{nullptr};
     if (locked_hash) {
         const auto it{market.candidates.find(*locked_hash)};
@@ -3345,6 +3722,19 @@ void FlowMeshRuntime::MaybePropose(Market& market)
     }
     if (candidate == nullptr) return;
 
+    if (market.agreement) {
+        const auto bytes{flowmesh::EncodeProductionEntry(candidate->entry)};
+        if (!bytes) return;
+        std::string agreement_error;
+        if (!market.agreement->SubmitCandidate(*bytes, agreement_error)) {
+            DeliveryEvent(market, "agreement_candidate_wait", flowmesh::WireMessageKind::AGREEMENT,
+                          candidate->entry.GetHash(), market.next_sequence, std::nullopt, agreement_error);
+        }
+        RefreshAgreement(market);
+        FinalizeAgreement(market);
+        return;
+    }
+
     if (!RetainCandidateBeforeSigning(market, *candidate)) return;
 
     // Eligibility is sampled only through the normal proposer gates on this
@@ -3399,6 +3789,11 @@ void FlowMeshRuntime::HandleProposal(
     Market& market, const flowmesh::WirePeerId peer,
     const flowmesh::WireMessage& message)
 {
+    if (market.agreement) {
+        DeliveryEvent(market, "proposal_refused", message.kind, {},
+                      message.header.sequence, peer, "preagreement_market_requires_commit_decision");
+        return;
+    }
     const auto proposal{
         flowmesh::DecodeProductionProposalPayload(message.payload)};
     if (!proposal ||
@@ -3770,6 +4165,8 @@ bool FlowMeshRuntime::ForwardCommitteeMessage(
 void FlowMeshRuntime::MaybeCertify(Market& market,
                                    const uint256& candidate_hash)
 {
+    if (market.agreement && (!RefreshAgreement(market) ||
+        market.agreement->DecidedCandidate() != candidate_hash)) return;
     const auto candidate{market.candidates.find(candidate_hash)};
     const auto signatures{market.attestations.find(candidate_hash)};
     if (candidate == market.candidates.end() ||
@@ -3894,6 +4291,15 @@ void FlowMeshRuntime::HandleCertificate(
     }
 
     const uint256 hash{certified->entry.GetHash()};
+    if (market.agreement) {
+        if (!RefreshAgreement(market)) return;
+        const auto decided{market.agreement->DecidedCandidate()};
+        if (decided && *decided != hash) {
+            HaltMarket(market, FlowMeshRuntimeHalt::CERTIFICATE_CONFLICT,
+                       "valid V1 certificate contradicts the durable agreement decision");
+            return;
+        }
+    }
     auto candidate_it{market.candidates.find(hash)};
     if (candidate_it == market.candidates.end()) {
         auto candidate{EvaluateCandidate(market, certified->entry, nullptr)};

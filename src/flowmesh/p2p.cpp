@@ -48,6 +48,12 @@ bool PayloadShapeValid(const WireMessageKind kind,
         return payload.size() == FLOWMESH_ATTESTATION_BYTES;
     case WireMessageKind::CERTIFICATE:
         return !payload.empty() && payload.size() <= FLOWMESH_CERTIFICATE_MAX_BYTES;
+    case WireMessageKind::AGREEMENT:
+        // Cheap framing only. The operator worker performs the bounded full
+        // canonical decode and BLS checks after admission, never this thread.
+        return payload.size() >= FLOWMESH_AGREEMENT_MIN_BYTES &&
+            payload.size() <= FLOWMESH_AGREEMENT_MAX_BYTES &&
+            ReadBE16(payload.data()) == 1 && payload[2] >= 1 && payload[2] <= 5;
     case WireMessageKind::GET: {
         uint16_t count{0};
         uint32_t bytes{0};
@@ -110,6 +116,7 @@ std::optional<WireMessageKind> WireKindForCommand(const std::string_view command
     if (command == "fmcert") return WireMessageKind::CERTIFICATE;
     if (command == "fmget") return WireMessageKind::GET;
     if (command == "fmentries") return WireMessageKind::ENTRIES;
+    if (command == "fmagree") return WireMessageKind::AGREEMENT;
     return std::nullopt;
 }
 
@@ -123,6 +130,7 @@ std::string_view WireCommand(const WireMessageKind kind)
     case WireMessageKind::CERTIFICATE: return "fmcert";
     case WireMessageKind::GET: return "fmget";
     case WireMessageKind::ENTRIES: return "fmentries";
+    case WireMessageKind::AGREEMENT: return "fmagree";
     }
     return {};
 }
@@ -132,6 +140,7 @@ WirePriority PriorityForWireKind(const WireMessageKind kind)
     switch (kind) {
     case WireMessageKind::ATTESTATION:
     case WireMessageKind::CERTIFICATE:
+    case WireMessageKind::AGREEMENT:
         return WirePriority::CERTIFICATE_OR_ATTESTATION;
     case WireMessageKind::PROPOSAL:
         return WirePriority::PROPOSAL;
@@ -155,6 +164,7 @@ size_t PayloadLimitForWireKind(const WireMessageKind kind)
     case WireMessageKind::CERTIFICATE: return FLOWMESH_CERTIFICATE_MAX_BYTES;
     case WireMessageKind::GET: return FLOWMESH_GET_BYTES;
     case WireMessageKind::ENTRIES: return FLOWMESH_CATCHUP_MAX_BYTES;
+    case WireMessageKind::AGREEMENT: return FLOWMESH_AGREEMENT_MAX_BYTES;
     }
     return 0;
 }
@@ -358,7 +368,8 @@ bool BoundedWireQueue::ConsumeTokens(const WirePeerId peer,
         bucket.byte_tokens -= static_cast<double>(message.MemoryUsage());
     } else if (message.kind == WireMessageKind::PROPOSAL ||
                message.kind == WireMessageKind::ATTESTATION ||
-               message.kind == WireMessageKind::CERTIFICATE) {
+               message.kind == WireMessageKind::CERTIFICATE ||
+               message.kind == WireMessageKind::AGREEMENT) {
         if (bucket.committee_tokens < 1.0) return false;
         bucket.committee_tokens -= 1.0;
     } else {

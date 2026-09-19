@@ -36,6 +36,9 @@ inline constexpr size_t FLOWMESH_CERTIFICATE_MAX_BYTES{
 inline constexpr size_t FLOWMESH_HELLO_MAX_BYTES{64 * 1024};
 inline constexpr size_t FLOWMESH_CATCHUP_MAX_ENTRIES{64};
 inline constexpr size_t FLOWMESH_CATCHUP_MAX_BYTES{4 * 1024 * 1024};
+// Operator-only preagreement envelope; never a B3 consensus object.
+inline constexpr size_t FLOWMESH_AGREEMENT_MAX_BYTES{4 * 1024 * 1024};
+inline constexpr size_t FLOWMESH_AGREEMENT_MIN_BYTES{347};
 inline constexpr size_t FLOWMESH_ATTESTATION_BYTES{4 + 96};
 inline constexpr size_t FLOWMESH_GET_BYTES{2 + 4};
 
@@ -68,6 +71,7 @@ enum class WireMessageKind : uint8_t {
     CERTIFICATE,
     GET,
     ENTRIES,
+    AGREEMENT,
 };
 
 enum class WirePriority : uint8_t {

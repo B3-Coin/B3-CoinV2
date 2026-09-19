@@ -84,7 +84,7 @@ uint8_t Channel(Kind kind)
 }
 size_t Lane(Kind kind)
 {
-    if (kind == Kind::ATTESTATION || kind == Kind::CERTIFICATE) return 0;
+    if (kind == Kind::ATTESTATION || kind == Kind::CERTIFICATE || kind == Kind::AGREEMENT) return 0;
     if (kind == Kind::PROPOSAL) return 1;
     if (kind == Kind::HELLO) return 2;
     return Channel(kind) == 2 ? 4 : 3;
@@ -566,7 +566,10 @@ struct FlowMeshNetService::Impl {
             size_t maximum{9 + SIGNATURE_SIZE};
             size_t lane{2};
             if (kind != PING) {
-                if (kind > static_cast<uint8_t>(Kind::ENTRIES) || Channel(static_cast<Kind>(kind)) != c.channel) return false;
+                // AGREEMENT is an explicit operator upgrade. Older FMN2
+                // binaries reject this distinct kind rather than treating it
+                // as a V1 proposal/vote; all peers must upgrade before enable.
+                if (kind > static_cast<uint8_t>(Kind::AGREEMENT) || Channel(static_cast<Kind>(kind)) != c.channel) return false;
                 maximum += flowmesh::FLOWMESH_WIRE_HEADER_SIZE + flowmesh::PayloadLimitForWireKind(static_cast<Kind>(kind));
                 lane = Lane(static_cast<Kind>(kind));
                 if (body < 9 + SIGNATURE_SIZE + flowmesh::FLOWMESH_WIRE_HEADER_SIZE) return false;

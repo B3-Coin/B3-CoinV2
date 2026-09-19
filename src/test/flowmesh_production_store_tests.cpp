@@ -379,9 +379,182 @@ struct TestLockKey {
     }
 };
 
+// Exact pre-upgrade marker shape: neither an extension nor a new namespace
+// may be silently consumed by the old reader.
+struct LegacyV3Marker {
+    int32_t version{3};
+    uint256 domain;
+    flowmesh::MarketId market_id;
+    uint64_t current_epoch{0};
+    flowmesh::AnchorRef current_anchor;
+    uint256 current_seat_set_hash;
+    uint64_t next_sequence{0};
+    uint64_t next_effect_index{0};
+    uint256 last_microblock_hash;
+    uint256 state_root;
+    modern::FlowMeshCheckpointId last_b3_checkpoint;
+    SERIALIZE_METHODS(LegacyV3Marker, obj)
+    {
+        READWRITE(obj.version, obj.domain, obj.market_id, obj.current_epoch,
+                  obj.current_anchor, obj.current_seat_set_hash,
+                  obj.next_sequence, obj.next_effect_index,
+                  obj.last_microblock_hash, obj.state_root, obj.last_b3_checkpoint);
+    }
+};
+
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_production_store_tests, BasicTestingSetup)
+
+BOOST_AUTO_TEST_CASE(preagreement_mode_bootstrap_identity_restart_and_downgrade_guard)
+{
+    Scenario scenario;
+    const fs::path path{m_args.GetDataDirBase() / "flowmesh_production_v4"};
+    std::string error;
+    uint256 identity;
+    std::vector<flowmesh::Action> evidence{scenario.execution0.entry.actions};
+    for (auto& action : evidence) if (!action.IsDeposit()) action.credential = {0x01};
+    {
+        node::FlowMeshProductionStore store{DBParams{
+            .path = path, .cache_bytes = size_t{1} << 20}, true};
+        BOOST_CHECK(store.PreagreementEnabled());
+        bool fresh{false};
+        BOOST_REQUIRE(store.CheckForMarket(scenario.domain, scenario.market, fresh, error));
+        BOOST_CHECK(fresh);
+        BOOST_REQUIRE(store.OpenForMarket(scenario.domain, scenario.market,
+                                         scenario.seats0.seats, scenario.state0.Root(), error));
+        std::optional<node::FlowMeshProductionStore::Marker> marker;
+        BOOST_REQUIRE(store.ReadMarker(marker, error));
+        BOOST_REQUIRE(marker);
+        BOOST_CHECK_EQUAL(marker->version, 4);
+        BOOST_CHECK(!marker->agreement_identity.IsNull());
+        BOOST_CHECK(!marker->agreement_bootstrap_complete);
+        identity = marker->agreement_identity;
+        BOOST_CHECK(store.LockCandidate(scenario.execution0.entry, evidence) ==
+                    flowmesh::ProductionLockResult::STORAGE_FAILURE);
+        flowmesh::FlowMeshState output{scenario.state0};
+        BOOST_CHECK(!store.AppendExecution(scenario.execution0.entry,
+            scenario.certificate0, scenario.seats0.seats, scenario.state0,
+            {300, flowmesh::AnchorRef{190, Filled(0x73)}, &scenario.anchors},
+            scenario.treasury, &scenario.chain_facts, output, error));
+        BOOST_CHECK(!store.MarkAgreementBootstrapComplete(Filled(0xff), error));
+    }
+    // A crash before the cross-journal handshake keeps the same identity and
+    // cannot turn the reopened store into a V1 signer.
+    {
+        node::FlowMeshProductionStore store{DBParams{
+            .path = path, .cache_bytes = size_t{1} << 20}, true};
+        bool fresh{true};
+        BOOST_REQUIRE(store.CheckForMarket(scenario.domain, scenario.market, fresh, error));
+        BOOST_CHECK(!fresh);
+        BOOST_REQUIRE(store.OpenForMarket(scenario.domain, scenario.market,
+                                         scenario.seats0.seats, scenario.state0.Root(), error));
+        std::optional<node::FlowMeshProductionStore::Marker> marker;
+        BOOST_REQUIRE(store.ReadMarker(marker, error));
+        BOOST_REQUIRE(marker);
+        BOOST_CHECK(marker->agreement_identity == identity);
+        BOOST_CHECK(!marker->agreement_bootstrap_complete);
+        BOOST_CHECK(store.LockCandidate(scenario.execution0.entry, evidence) ==
+                    flowmesh::ProductionLockResult::STORAGE_FAILURE);
+        // The caller has durably initialized the matching agreement journal.
+        BOOST_REQUIRE(store.MarkAgreementBootstrapComplete(identity, error));
+        BOOST_REQUIRE(store.MarkAgreementBootstrapComplete(identity, error));
+        BOOST_CHECK(store.LockCandidate(scenario.execution0.entry, evidence) ==
+                    flowmesh::ProductionLockResult::LOCKED);
+    }
+    {
+        node::FlowMeshProductionStore store{DBParams{
+            .path = path, .cache_bytes = size_t{1} << 20}, true};
+        BOOST_REQUIRE(store.OpenForMarket(scenario.domain, scenario.market,
+                                         scenario.seats0.seats, scenario.state0.Root(), error));
+        std::optional<node::FlowMeshProductionStore::Marker> marker;
+        BOOST_REQUIRE(store.ReadMarker(marker, error));
+        BOOST_REQUIRE(marker);
+        BOOST_CHECK(marker->agreement_identity == identity);
+        BOOST_CHECK(marker->agreement_bootstrap_complete);
+        BOOST_CHECK(store.LockCandidate(scenario.execution0.entry, evidence) ==
+                    flowmesh::ProductionLockResult::ALREADY_LOCKED_SAME);
+        BOOST_CHECK(!store.MarkAgreementBootstrapComplete(Filled(0xff), error));
+    }
+    {
+        node::FlowMeshProductionStore legacy{DBParams{
+            .path = path, .cache_bytes = size_t{1} << 20}};
+        bool fresh{true};
+        BOOST_CHECK(!legacy.CheckForMarket(scenario.domain, scenario.market, fresh, error));
+        BOOST_CHECK(!fresh);
+        BOOST_CHECK(!legacy.OpenForMarket(scenario.domain, scenario.market,
+                                         scenario.seats0.seats, scenario.state0.Root(), error));
+        std::optional<node::FlowMeshProductionStore::Marker> marker;
+        BOOST_CHECK(!legacy.ReadMarker(marker, error));
+        bool rolled_back{false};
+        BOOST_CHECK(!legacy.ReconcileCheckpointConnections({}, rolled_back, error));
+    }
+    {
+        CDBWrapper raw{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        std::unique_ptr<CDBIterator> it{raw.NewIterator()};
+        it->Seek(uint8_t{'m'});
+        LegacyV3Marker old;
+        BOOST_REQUIRE(it->Valid());
+        BOOST_CHECK(!it->GetValueExact(old)); // V4 extension cannot be ignored.
+        BOOST_REQUIRE(raw.Read(uint8_t{'m'}, old));
+        BOOST_CHECK_NE(old.version, 3); // Even a permissive reader fails mode check.
+    }
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_refuses_legacy_binding_locks_and_unmarked_history)
+{
+    Scenario scenario;
+    const fs::path path{m_args.GetDataDirBase() / "flowmesh_legacy_mode_guard"};
+    std::string error;
+    std::vector<flowmesh::Action> evidence{scenario.execution0.entry.actions};
+    for (auto& action : evidence) if (!action.IsDeposit()) action.credential = {0x01};
+    for (const bool signed_history : {false, true}) {
+        {
+            node::FlowMeshProductionStore legacy{DBParams{
+                .path = path, .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+            BOOST_REQUIRE(legacy.OpenForMarket(scenario.domain, scenario.market,
+                scenario.seats0.seats, scenario.state0.Root(), error));
+            if (signed_history) {
+                BOOST_CHECK(legacy.LockCandidate(scenario.execution0.entry, evidence) ==
+                            flowmesh::ProductionLockResult::LOCKED);
+            }
+        }
+        {
+            CDBWrapper raw{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+            std::unique_ptr<CDBIterator> it{raw.NewIterator()};
+            it->Seek(uint8_t{'m'});
+            LegacyV3Marker old;
+            BOOST_REQUIRE(it->GetValueExact(old)); // Default V3 bytes unchanged.
+            BOOST_CHECK_EQUAL(old.version, 3);
+        }
+        {
+            node::FlowMeshProductionStore upgraded{DBParams{
+                .path = path, .cache_bytes = size_t{1} << 20}, true};
+            bool fresh{true};
+            BOOST_CHECK(!upgraded.CheckForMarket(scenario.domain, scenario.market, fresh, error));
+            BOOST_CHECK(!fresh);
+            BOOST_CHECK(!upgraded.OpenForMarket(scenario.domain, scenario.market,
+                scenario.seats0.seats, scenario.state0.Root(), error));
+        }
+        {
+            node::FlowMeshProductionStore legacy{DBParams{
+                .path = path, .cache_bytes = size_t{1} << 20}};
+            BOOST_REQUIRE(legacy.OpenForMarket(scenario.domain, scenario.market,
+                scenario.seats0.seats, scenario.state0.Root(), error));
+        }
+    }
+    {
+        CDBWrapper raw{DBParams{.path = path, .cache_bytes = size_t{1} << 20}};
+        raw.Erase(uint8_t{'m'}, true); // Model a missing marker, not a reset API.
+    }
+    node::FlowMeshProductionStore unmarked{DBParams{
+        .path = path, .cache_bytes = size_t{1} << 20}, true};
+    bool fresh{true};
+    BOOST_CHECK(!unmarked.CheckForMarket(scenario.domain, scenario.market, fresh, error));
+    BOOST_CHECK(!fresh);
+    BOOST_CHECK(!unmarked.OpenForMarket(scenario.domain, scenario.market,
+        scenario.seats0.seats, scenario.state0.Root(), error));
+}
 
 BOOST_AUTO_TEST_CASE(atomic_execution_handoff_connection_and_epoch_replay)
 {

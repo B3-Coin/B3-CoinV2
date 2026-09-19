@@ -64,6 +64,9 @@ FLOWMESH_OPERATOR_ARGS = ["-enableflowmeshvalidator=1", "-flowmeshtransport=lega
 
 
 class FlowMeshReleaseTest(BitcoinTestFramework):
+    def configure_fresh_market(self, market_id):
+        """Optional operator-mode fixture hook before the bootstrap block."""
+
     def exercise_extra_trading(self, market_id):
         """Optional bounded workload used by the separate speed test."""
 
@@ -411,6 +414,7 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
         assert_equal(asset_deposit["market_bootstrap"], True)
         market_id = asset_deposit["market_id"]
         vault_id = asset_deposit["vault_id"]
+        self.configure_fresh_market(market_id)
         self.synchronize_mempools()
         self.mine_pos_blocks(1)
         assert_equal(n0.getblockcount(), A2)
@@ -483,8 +487,11 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
                       "proposals_missing_evidence", "proposals_rejected_round", "attestations_without_candidate"):
             assert isinstance(unchanged["snapshot"]["runtime"][field], int)
             assert unchanged["snapshot"]["runtime"][field] >= 0
-        for heavy_field in ("liquidity", "history", "account", "base_metadata"):
+        for heavy_field in ("liquidity", "history", "account"):
             assert heavy_field not in unchanged
+        # The current RPC contract deliberately includes cosmetic metadata on
+        # unchanged responses so a metadata-only update reaches idle clients.
+        assert_equal(unchanged["base_metadata"], market_data["base_metadata"])
         wallet_after = n0.getwalletinfo()
         for field in ("txcount", "keypoolsize", "keypoolsize_hd_internal"):
             assert_equal(wallet_before.get(field), wallet_after.get(field))

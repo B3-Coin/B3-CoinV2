@@ -112,6 +112,10 @@ flowmesh::WireMessage Message(Kind kind)
     if (kind == Kind::ATTESTATION) message.payload.assign(flowmesh::FLOWMESH_ATTESTATION_BYTES, 0x42);
     if (kind == Kind::GET) message.payload = *flowmesh::EncodeCatchupRequest(64, flowmesh::FLOWMESH_CATCHUP_MAX_BYTES);
     if (kind == Kind::ENTRIES) message.payload = *flowmesh::EncodeCatchupEntries(std::vector<Bytes>{{0x42}});
+    if (kind == Kind::AGREEMENT) {
+        message.payload.assign(flowmesh::FLOWMESH_AGREEMENT_MIN_BYTES, 0);
+        message.payload[1] = 1; message.payload[2] = 2;
+    }
     return message;
 }
 bool Transfer(Sock& socket, std::span<unsigned char> bytes, bool send)
@@ -224,7 +228,7 @@ BOOST_AUTO_TEST_CASE(pinned_three_channel_round_trip_and_persistent_identity)
     node::FlowMeshNetService b{b_config, b_sink}; BOOST_REQUIRE_MESSAGE(b.Start(error), error);
     BOOST_REQUIRE(Wait([&] { return a.Snapshot().peers.size() == 1 && b.Snapshot().peers.size() == 1 && a.Snapshot().peers[0].authenticated && b.Snapshot().peers[0].authenticated; }));
     const auto peer{b.Snapshot().peers[0]}; BOOST_CHECK(peer.live && peer.actions && peer.bulk); BOOST_CHECK(peer.id <= -2); BOOST_CHECK(peer.id != std::numeric_limits<int64_t>::min());
-    const std::vector kinds{Kind::HELLO, Kind::ACTION, Kind::PROPOSAL, Kind::ATTESTATION, Kind::CERTIFICATE, Kind::GET, Kind::ENTRIES};
+    const std::vector kinds{Kind::HELLO, Kind::ACTION, Kind::PROPOSAL, Kind::ATTESTATION, Kind::CERTIFICATE, Kind::GET, Kind::ENTRIES, Kind::AGREEMENT};
     for (const auto kind : kinds) { node::FlowMeshRuntimeRelay relay; relay.message = Message(kind); relay.peer = peer.id; b.Relay(relay); }
     BOOST_REQUIRE(Wait([&] { return a_sink.Messages().size() == kinds.size(); }));
     const auto received{a_sink.Messages()};

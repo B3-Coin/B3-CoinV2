@@ -279,6 +279,8 @@ inline constexpr const char* FMCERT{"fmcert"};
 inline constexpr const char* FMGET{"fmget"};
 /** One solicited, bounded FlowMesh catch-up response. */
 inline constexpr const char* FMENTRIES{"fmentries"};
+/** Bounded operator-only preliminary agreement; not a consensus object. */
+inline constexpr const char* FMAGREE{"fmagree"};
 /**
  * B3 modern-era finality signature gossip (liveness only, never consensus):
  * u64 epoch || u64 checkpoint height || u32 signer index || 96-byte BLS
@@ -294,7 +296,7 @@ inline constexpr bool IsFlowMeshMessageType(const std::string_view type)
     return type == NetMsgType::FMHELLO || type == NetMsgType::FMACTION ||
            type == NetMsgType::FMPROP || type == NetMsgType::FMATTEST ||
            type == NetMsgType::FMCERT || type == NetMsgType::FMGET ||
-           type == NetMsgType::FMENTRIES;
+           type == NetMsgType::FMENTRIES || type == NetMsgType::FMAGREE;
 }
 
 /**
@@ -305,7 +307,7 @@ inline constexpr bool IsFlowMeshMessageType(const std::string_view type)
 inline constexpr unsigned NetMessageQueueRank(const std::string_view type)
 {
     if (!IsFlowMeshMessageType(type)) return 0;
-    if (type == NetMsgType::FMCERT || type == NetMsgType::FMATTEST) return 1;
+    if (type == NetMsgType::FMCERT || type == NetMsgType::FMATTEST || type == NetMsgType::FMAGREE) return 1;
     if (type == NetMsgType::FMPROP) return 2;
     if (type == NetMsgType::FMACTION) return 3;
     return 4;
@@ -355,6 +357,7 @@ inline const std::array ALL_NET_MESSAGE_TYPES{std::to_array<std::string>({
     NetMsgType::FMCERT,
     NetMsgType::FMGET,
     NetMsgType::FMENTRIES,
+    NetMsgType::FMAGREE,
     NetMsgType::FINSIG,
 })};
 

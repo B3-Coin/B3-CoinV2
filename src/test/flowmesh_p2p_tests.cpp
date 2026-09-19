@@ -7,6 +7,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <vector>
@@ -29,6 +30,11 @@ flowmesh::WireMessage Message(const flowmesh::WireMessageKind kind,
     } else if (kind == flowmesh::WireMessageKind::ENTRIES) {
         std::vector<std::vector<unsigned char>> entries{{0x42}};
         message.payload = *flowmesh::EncodeCatchupEntries(entries);
+    } else if (kind == flowmesh::WireMessageKind::AGREEMENT) {
+        // Only the framing prefix is interpreted by this layer.
+        message.payload.assign(std::max(payload_size, flowmesh::FLOWMESH_AGREEMENT_MIN_BYTES), 0);
+        message.payload[1] = 1;
+        message.payload[2] = 2;
     }
     return message;
 }
@@ -44,7 +50,7 @@ BOOST_AUTO_TEST_CASE(commands_header_and_strict_shapes_round_trip)
         WireMessageKind::HELLO, WireMessageKind::ACTION,
         WireMessageKind::PROPOSAL, WireMessageKind::ATTESTATION,
         WireMessageKind::CERTIFICATE, WireMessageKind::GET,
-        WireMessageKind::ENTRIES};
+        WireMessageKind::ENTRIES, WireMessageKind::AGREEMENT};
     for (const auto kind : kinds) {
         BOOST_REQUIRE(WireKindForCommand(WireCommand(kind)).has_value());
         BOOST_CHECK(*WireKindForCommand(WireCommand(kind)) == kind);
@@ -63,6 +69,7 @@ BOOST_AUTO_TEST_CASE(commands_header_and_strict_shapes_round_trip)
     BOOST_CHECK_EQUAL(NetMessageQueueRank(NetMsgType::BLOCK), 0U);
     BOOST_CHECK_EQUAL(NetMessageQueueRank(NetMsgType::FMCERT), 1U);
     BOOST_CHECK_EQUAL(NetMessageQueueRank(NetMsgType::FMATTEST), 1U);
+    BOOST_CHECK_EQUAL(NetMessageQueueRank(NetMsgType::FMAGREE), 1U);
     BOOST_CHECK_EQUAL(NetMessageQueueRank(NetMsgType::FMPROP), 2U);
     BOOST_CHECK_EQUAL(NetMessageQueueRank(NetMsgType::FMACTION), 3U);
     BOOST_CHECK_EQUAL(NetMessageQueueRank(NetMsgType::FMENTRIES), 4U);
@@ -84,6 +91,36 @@ BOOST_AUTO_TEST_CASE(commands_header_and_strict_shapes_round_trip)
                   FLOWMESH_ACTION_MAX_BYTES + 1);
     BOOST_CHECK(!EncodeWireMessage(bad, check));
     BOOST_CHECK(check == WireCheck::TOO_LARGE);
+}
+
+BOOST_AUTO_TEST_CASE(agreement_is_distinct_bounded_and_uses_critical_committee_budget)
+{
+    using namespace flowmesh;
+    BOOST_CHECK_EQUAL(WireCommand(WireMessageKind::AGREEMENT), "fmagree");
+    BOOST_CHECK(PriorityForWireKind(WireMessageKind::AGREEMENT) == WirePriority::CERTIFICATE_OR_ATTESTATION);
+    BOOST_CHECK_EQUAL(PayloadLimitForWireKind(WireMessageKind::AGREEMENT), FLOWMESH_AGREEMENT_MAX_BYTES);
+    WireCheck check;
+    auto bad{Message(WireMessageKind::AGREEMENT)};
+    bad.payload.pop_back();
+    BOOST_CHECK(!EncodeWireMessage(bad, check));
+    bad = Message(WireMessageKind::AGREEMENT); bad.payload[2] = 6;
+    BOOST_CHECK(!EncodeWireMessage(bad, check));
+    bad = Message(WireMessageKind::AGREEMENT); bad.payload[1] = 2;
+    BOOST_CHECK(!EncodeWireMessage(bad, check));
+    bad = Message(WireMessageKind::AGREEMENT, FLOWMESH_AGREEMENT_MAX_BYTES + 1);
+    BOOST_CHECK(!EncodeWireMessage(bad, check));
+    BOOST_CHECK(check == WireCheck::TOO_LARGE);
+    BoundedWireQueue queue;
+    const auto now{WireClock::time_point{std::chrono::seconds{100}}};
+    BOOST_REQUIRE(queue.Push(1, Message(WireMessageKind::ACTION), now) == QueueResult::ACCEPTED);
+    for (size_t i{0}; i < static_cast<size_t>(FLOWMESH_COMMITTEE_TOKEN_BURST); ++i) {
+        BOOST_REQUIRE(queue.Push(1, Message(WireMessageKind::AGREEMENT), now) == QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(queue.Push(1, Message(WireMessageKind::AGREEMENT), now) == QueueResult::RATE_LIMITED);
+    BOOST_REQUIRE(queue.Pop());
+    BOOST_CHECK(queue.Pop()->message.kind == WireMessageKind::AGREEMENT);
+    BoundedWireQueue maximum;
+    BOOST_CHECK(maximum.Push(2, Message(WireMessageKind::AGREEMENT, FLOWMESH_AGREEMENT_MAX_BYTES), now) == QueueResult::ACCEPTED);
 }
 
 BOOST_AUTO_TEST_CASE(catchup_is_count_and_byte_bounded_before_allocation)

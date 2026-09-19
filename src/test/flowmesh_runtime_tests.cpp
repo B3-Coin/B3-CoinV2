@@ -5,6 +5,7 @@
 #include <node/flowmesh_runtime.h>
 
 #include <flowmesh/auth.h>
+#include <flowmesh/agreement_wire.h>
 #include <hash.h>
 #include <test/util/flowmesh.h>
 #include <test/util/setup_common.h>
@@ -333,7 +334,7 @@ public:
         const COutPoint& outpoint,
         const flowmesh::AnchorRef& anchor) const override
     {
-        if (!(anchor == required_anchor)) return std::nullopt;
+        if (anchor != required_anchor && (!additional_anchor || anchor != *additional_anchor)) return std::nullopt;
         const auto it{entries.find(outpoint)};
         return it == entries.end()
                    ? std::nullopt
@@ -357,6 +358,7 @@ public:
     }
 
     flowmesh::AnchorRef required_anchor;
+    std::optional<flowmesh::AnchorRef> additional_anchor;
     std::map<COutPoint, flowmesh::DepositInfo> entries;
 };
 
@@ -390,6 +392,7 @@ flowmesh::BlsMicroblockCertificate Certify(
 class RuntimeNetwork
 {
 public:
+    explicit RuntimeNetwork(size_t count = 4) : m_nodes(count, nullptr), m_online(count, false), m_get_requests(count, 0) {}
     using Filter = std::function<bool(size_t, size_t, const flowmesh::WireMessage&)>;
     void SetFilter(Filter filter)
     {
@@ -463,12 +466,12 @@ public:
 
 private:
     std::mutex m_mutex;
-    std::array<node::FlowMeshRuntime*, 4> m_nodes{};
-    std::array<bool, 4> m_online{};
+    std::vector<node::FlowMeshRuntime*> m_nodes;
+    std::vector<bool> m_online;
     bool m_ignore_hellos{false};
     bool m_partitioned{false};
     Filter m_filter;
-    std::array<size_t, 4> m_get_requests{};
+    std::vector<size_t> m_get_requests;
 };
 
 /**
@@ -584,6 +587,169 @@ node::FlowMeshRuntimeMarketConfig MarketConfig(
         .deposits = deposits,
     };
 }
+
+/** Real runtime/real BLS/real durable stores, with only the existing mock
+ * canonical-chain oracle, deterministic clock, and in-memory transport. */
+template <size_t Count = 4>
+class PreagreementRuntimeHarness
+{
+public:
+    explicit PreagreementRuntimeHarness(fs::path directory) : path{std::move(directory)}
+    {
+        for (auto& chain : chains) {
+            chain.m_domain = domain;
+            chain.Add(seats.seats);
+            chain.SetTipHeight(chain.Current().height + flowmesh::FLOWMESH_PRODUCTION_MIN_ANCHOR_DEPTH);
+        }
+        deposits.required_anchor = chains[0].Current();
+        deposits.entries.emplace(outpoint, flowmesh::DepositInfo{asset, 250, account});
+        network.IgnoreHellos();
+        network.SetFilter([this](size_t, size_t, const flowmesh::WireMessage& wire) {
+            if (wire.kind != flowmesh::WireMessageKind::AGREEMENT) return true;
+            const auto message{flowmesh::DecodeAgreementMessage(wire.payload)};
+            if (!message) return false;
+            if (message->stage == flowmesh::AgreementStage::PREPARE) ++prepares;
+            if (message->stage == flowmesh::AgreementStage::COMMIT) ++commits;
+            if (message->stage == flowmesh::AgreementStage::VIEW_CHANGE) ++view_changes;
+            if (message->stage == flowmesh::AgreementStage::DECISION) ++decisions;
+            return !block_commits || (message->stage != flowmesh::AgreementStage::COMMIT &&
+                                      message->stage != flowmesh::AgreementStage::DECISION);
+        });
+        std::string error;
+        try {
+            for (size_t i{0}; i < runtimes.size(); ++i) {
+                keys[i].m_keys[market] = {seats.secrets[i]};
+                stores[i] = std::make_unique<node::FlowMeshProductionStore>(DBParams{
+                    .path = StorePath(i), .cache_bytes = size_t{1} << 20}, true);
+                BOOST_REQUIRE_MESSAGE(stores[i]->OpenForMarket(domain, market, seats.seats, initial.Root(), error), error);
+                BOOST_REQUIRE_MESSAGE(StartNode(i, AgreementPath(i), std::nullopt, error), error);
+            }
+        } catch (...) {
+            for (size_t i{0}; i < runtimes.size(); ++i) network.Set(i, nullptr, false);
+            for (const auto& runtime : runtimes) if (runtime) runtime->Stop();
+            throw;
+        }
+    }
+
+    ~PreagreementRuntimeHarness()
+    {
+        StopAll();
+    }
+
+    void StopAll()
+    {
+        for (size_t i{0}; i < runtimes.size(); ++i) network.Set(i, nullptr, false);
+        for (const auto& runtime : runtimes) if (runtime) runtime->Stop();
+    }
+
+    fs::path StorePath(size_t i) const { return path / fs::PathFromString("operator_" + std::to_string(i)); }
+    fs::path AgreementPath(size_t i) const { return StorePath(i) / "agreement"; }
+
+    bool StartNode(size_t i, const fs::path& journal, std::optional<bool> allow_override, std::string& error)
+    {
+        auto& chain{chains[i]};
+        std::optional<node::FlowMeshProductionStore::Marker> marker;
+        if (!stores[i]->ReadMarker(marker, error) || !marker) return false;
+        auto restored{initial};
+        if (marker->next_sequence) {
+            RuntimeSeatSource authority;
+            authority.m_domain = domain;
+            authority.m_seats = seats.seats;
+            uint256 last;
+            if (!stores[i]->Replay(restored, last, authority,
+                {chain.TipHeight(), std::nullopt, &chain}, treasury, &deposits, error)) return false;
+        }
+        auto market_config{MarketConfig(domain, market, treasury, seats.seats, restored, *stores[i], &deposits)};
+        market_config.next_sequence = marker->next_sequence;
+        market_config.next_effect_index = marker->next_effect_index;
+        market_config.last_microblock_hash = marker->last_microblock_hash;
+        market_config.preagreement = true;
+        market_config.agreement_path = journal;
+        market_config.agreement_identity = marker->agreement_identity;
+        market_config.agreement_allow_create = allow_override.value_or(!marker->agreement_bootstrap_complete);
+        node::FlowMeshRuntimeConfig config;
+        config.chain = &chain;
+        config.keys = &keys[i];
+        config.clock = &clocks[i];
+        config.round_timeout = std::chrono::seconds{10};
+        config.relay = [this, i](node::FlowMeshRuntimeRelay relay) {
+            if (block_commits && (relay.message.kind == flowmesh::WireMessageKind::ATTESTATION ||
+                                 relay.message.kind == flowmesh::WireMessageKind::PROPOSAL)) ++premature_v1;
+            network.Relay(i, std::move(relay));
+            // This transport admits an in-memory legacy delivery, not a claim
+            // of peer verification. No socket-completion scheduler is used.
+            node::FlowMeshRelayResult result;
+            for (size_t j{0}; j < Count; ++j) if (i != j) {
+                result.peers.push_back({static_cast<int64_t>(j), node::FlowMeshDeliveryAdmission::LEGACY_UNTRACKED, {}});
+            }
+            return result;
+        };
+        auto runtime{std::make_unique<node::FlowMeshRuntime>(config,
+            std::vector<node::FlowMeshRuntimeMarketConfig>{std::move(market_config)})};
+        if (!runtime->Start(error)) return false;
+        runtimes[i] = std::move(runtime);
+        network.Set(i, runtimes[i].get(), true);
+        return true;
+    }
+
+    void StopNode(size_t i)
+    {
+        network.Set(i, nullptr, false);
+        if (runtimes[i]) runtimes[i]->Stop();
+        runtimes[i].reset();
+    }
+
+    void Drain()
+    {
+        for (size_t pass{0}; pass < 4; ++pass) for (const auto& runtime : runtimes) {
+            if (runtime) BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{5}));
+        }
+    }
+
+    void Tick(const std::chrono::milliseconds advance = std::chrono::milliseconds{0})
+    {
+        Drain(); // FixedClock is intentionally changed only while workers idle.
+        for (auto& clock : clocks) clock.m_now += advance;
+        for (const auto& runtime : runtimes) if (runtime) runtime->NotifyTick();
+        Drain();
+    }
+
+    bool AllAt(uint64_t sequence) const
+    {
+        for (const auto& runtime : runtimes) {
+            if (!runtime) continue;
+            const auto status{runtime->MarketStatus(market)};
+            if (!status || status->next_sequence != sequence || status->halt != node::FlowMeshRuntimeHalt::NONE) return false;
+        }
+        return true;
+    }
+
+    void Reach(uint64_t sequence)
+    {
+        for (size_t attempt{0}; attempt < 8 && !AllAt(sequence); ++attempt) Tick(std::chrono::seconds{2});
+        BOOST_REQUIRE(AllAt(sequence));
+    }
+
+    const fs::path path;
+    const uint256 domain{Filled(0x2e)};
+    const modern::AssetId asset{Filled(0x4e)};
+    const flowmesh::MarketId market{*flowmesh::ComputeFlowMeshMarketId(domain, asset)};
+    const flowmesh::VaultId vault{*flowmesh::ComputeFlowMeshVaultId(domain, market)};
+    const uint256 treasury{Filled(0x6e)};
+    const flowmesh::AccountId account{Filled(0xae)};
+    const COutPoint outpoint{Txid::FromUint256(Filled(0x8e)), 0};
+    const SeatFixture seats{Seats(domain, market, Count, 0, 100, Filled(0x71), 143)};
+    const flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+    std::array<RuntimeChain, Count> chains;
+    MapDeposits deposits;
+    std::array<FixedClock, Count> clocks;
+    std::array<RuntimeKeys, Count> keys;
+    std::array<std::unique_ptr<node::FlowMeshProductionStore>, Count> stores;
+    std::atomic<bool> block_commits{true};
+    std::atomic<size_t> prepares{0}, commits{0}, decisions{0}, view_changes{0}, premature_v1{0};
+    RuntimeNetwork network{Count};
+    std::array<std::unique_ptr<node::FlowMeshRuntime>, Count> runtimes;
+};
 
 /** One real signer in a four-seat committee: a proposal and a durable vote,
  * but never enough signatures to certify merely because a socket was written. */
@@ -4491,6 +4657,212 @@ BOOST_AUTO_TEST_CASE(authenticated_future_round_reunites_split_validators)
     for (auto& runtime : runtimes) runtime->Stop();
 }
 
+BOOST_AUTO_TEST_CASE(baseline_same_deposit_adjacent_anchors_split_nine_seat_quorum)
+{
+    // Baseline reproducer, not a recovery requirement: this test deliberately
+    // asserts the existing liveness failure while preserving signing safety.
+    // Three operators own three seats each. Two isolated operators permanently
+    // lock the same deposit under consecutive canonical production anchors;
+    // even all three remaining votes cannot bring either initial group to 7/9.
+    const uint256 domain{Filled(0x2d)};
+    const modern::AssetId asset{Filled(0x4d)};
+    const auto market{*flowmesh::ComputeFlowMeshMarketId(domain, asset)};
+    const auto vault{*flowmesh::ComputeFlowMeshVaultId(domain, market)};
+    const uint256 treasury{Filled(0x6d)};
+    const SeatFixture seats{Seats(domain, market, 9, 7, 100, Filled(0x71), 133)};
+    BOOST_REQUIRE_EQUAL(flowmesh::FlowMeshBlsThreshold(seats.seats.Size()), 7U);
+    const std::array<flowmesh::AnchorRef, 2> anchors{{
+        {200, Filled(0x74)}, {201, Filled(0x75)}}};
+    const COutPoint outpoint{Txid::FromUint256(Filled(0x8d)), 0};
+    const flowmesh::Action action{Deposit(outpoint)};
+
+    // The deposit is already confirmed at both anchors. Neither missing
+    // evidence nor different deposit facts can account for the split.
+    class AdjacentAnchorDeposits final : public flowmesh::DepositVerifier {
+    public:
+        std::optional<flowmesh::DepositInfo> GetDeposit(
+            const COutPoint& outpoint, const flowmesh::AnchorRef& anchor) const override
+        {
+            if (const auto earlier{left.GetDeposit(outpoint, anchor)}) return earlier;
+            return right.GetDeposit(outpoint, anchor);
+        }
+        std::optional<std::vector<flowmesh::WithdrawalSettlementFactV1>>
+        GetWithdrawalSettlements(const std::optional<flowmesh::AnchorRef>&,
+                                 const flowmesh::AnchorRef&) const override
+        {
+            return std::vector<flowmesh::WithdrawalSettlementFactV1>{};
+        }
+        MapDeposits left;
+        MapDeposits right;
+    } deposits;
+    deposits.left.required_anchor = anchors[0];
+    deposits.right.required_anchor = anchors[1];
+    for (auto* facts : {&deposits.left, &deposits.right}) {
+        facts->entries.emplace(outpoint, flowmesh::DepositInfo{asset, 250, Filled(0xad)});
+    }
+    const flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(),
+                                        flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+    std::array<RuntimeChain, 3> chains;
+    std::array<FixedClock, 3> clocks;
+    std::array<RuntimeKeys, 3> keys;
+    std::array<std::unique_ptr<node::FlowMeshProductionStore>, 3> stores;
+    RuntimeNetwork network;
+    std::array<std::unique_ptr<node::FlowMeshRuntime>, 3> runtimes;
+    struct StopRuntimes {
+        decltype(runtimes)& all;
+        ~StopRuntimes() { for (const auto& runtime : all) if (runtime) runtime->Stop(); }
+    } stop{runtimes};
+    std::string error;
+    for (size_t i{0}; i < runtimes.size(); ++i) {
+        chains[i].m_domain = domain;
+        chains[i].Add(seats.seats);
+        for (const auto& anchor : anchors) {
+            chains[i].AddCanonical(anchor);
+        }
+        chains[i].m_current = anchors[i == 0 ? 0 : 1];
+        chains[i].SetTipHeight(chains[i].m_current.height + flowmesh::FLOWMESH_PRODUCTION_MIN_ANCHOR_DEPTH);
+        BOOST_REQUIRE(chains[i].Acceptable(chains[i].Current()));
+        for (size_t seat{i * 3}; seat < (i + 1) * 3; ++seat) {
+            keys[i].m_keys[market].push_back(seats.secrets[seat]);
+        }
+        stores[i] = std::make_unique<node::FlowMeshProductionStore>(DBParams{
+            .path = m_args.GetDataDirBase() / fs::PathFromString(
+                "flowmesh_adjacent_anchor_split_" + std::to_string(i)),
+            .cache_bytes = size_t{1} << 20, .wipe_data = true});
+        BOOST_REQUIRE_MESSAGE(stores[i]->OpenForMarket(
+            domain, market, seats.seats, initial.Root(), error), error);
+        node::FlowMeshRuntimeConfig config;
+        config.chain = &chains[i];
+        config.keys = &keys[i];
+        config.clock = &clocks[i];
+        config.round_timeout = std::chrono::seconds{1};
+        config.relay = [&network, i](node::FlowMeshRuntimeRelay relay) {
+            network.Relay(i, std::move(relay));
+            return LegacyRelayResult();
+        };
+        runtimes[i] = std::make_unique<node::FlowMeshRuntime>(config,
+            std::vector<node::FlowMeshRuntimeMarketConfig>{MarketConfig(
+                domain, market, treasury, seats.seats, initial, *stores[i], &deposits)});
+        network.Set(i, runtimes[i].get(), true);
+        BOOST_REQUIRE_MESSAGE(runtimes[i]->Start(error), error);
+    }
+    const auto drain = [&] {
+        for (size_t pass{0}; pass < runtimes.size(); ++pass) {
+            for (const auto& runtime : runtimes) {
+                BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+            }
+        }
+    };
+    runtimes[0]->NotifyTick();
+    BOOST_REQUIRE(WaitUntil([&] {
+        return std::all_of(runtimes.begin(), runtimes.end(), [&](const auto& runtime) {
+            return runtime->MarketStatus(market)->next_sequence == 1;
+        });
+    }));
+    drain();
+    const auto certified_head{runtimes[0]->MarketStatus(market)->last_microblock_hash};
+    network.SetFilter([](size_t, size_t, const auto&) { return false; });
+    for (const auto& runtime : runtimes) {
+        BOOST_REQUIRE(runtime->SubmitLocalAction(market, action) == flowmesh::QueueResult::ACCEPTED);
+    }
+    drain();
+    for (const auto& runtime : runtimes) {
+        BOOST_REQUIRE_EQUAL(runtime->MarketStatus(market)->pending_actions, 1U);
+    }
+
+    runtimes[0]->NotifyTick(); // Sequence 1, round 0: seat 1 locks anchor 200.
+    drain();
+    for (size_t round{0}; round < 2; ++round) {
+        clocks[1].m_now += std::chrono::seconds{1};
+        runtimes[1]->NotifyTick(); // Round 2: seat 3 locks anchor 201.
+        drain();
+    }
+    const flowmesh::ProductionSignPosition position{seats.seats.epoch, 1};
+    std::array<node::StoredLockedProductionCandidate, 2> candidates;
+    std::array<uint256, 2> locked_hashes;
+    for (size_t i{0}; i < candidates.size(); ++i) {
+        std::optional<node::StoredLockedProductionCandidate> retained;
+        BOOST_REQUIRE_MESSAGE(stores[i]->ReadLockedCandidate(position, retained, error), error);
+        BOOST_REQUIRE(retained);
+        candidates[i] = *retained;
+        locked_hashes[i] = retained->entry.GetHash();
+        BOOST_CHECK(retained->entry.anchor == anchors[i]);
+        BOOST_REQUIRE_EQUAL(retained->entry.actions.size(), 1U);
+        BOOST_CHECK(retained->entry.actions.front().outpoint == outpoint);
+        const auto data{runtimes[i]->MarketData(market, std::nullopt, {}, error)};
+        BOOST_REQUIRE_MESSAGE(data, error);
+        BOOST_CHECK_EQUAL(data->snapshot.runtime.max_verified_attestations, 3U);
+        BOOST_CHECK_EQUAL(data->snapshot.quorum_required, 7U);
+        BOOST_CHECK(data->snapshot.runtime.local_locked_candidate == locked_hashes[i]);
+    }
+    BOOST_CHECK(locked_hashes[0] != locked_hashes[1]);
+    auto normalized{candidates[1].entry};
+    normalized.anchor = candidates[0].entry.anchor;
+    const auto left_bytes{flowmesh::EncodeProductionEntry(candidates[0].entry)};
+    const auto normalized_bytes{flowmesh::EncodeProductionEntry(normalized)};
+    BOOST_REQUIRE(left_bytes);
+    BOOST_REQUIRE(normalized_bytes);
+    BOOST_CHECK(*left_bytes == *normalized_bytes); // Only the production anchor differs.
+    std::optional<uint256> remaining_lock;
+    BOOST_REQUIRE(stores[2]->ReadLock(position, remaining_lock, error));
+    BOOST_REQUIRE(!remaining_lock);
+
+    // Advance A's mock canonical tip by one block before reconnecting. Both
+    // anchors are now deep, but the newer Current() must not replace its lock.
+    drain();
+    chains[0].SetTipHeight(anchors[1].height + flowmesh::FLOWMESH_PRODUCTION_MIN_ANCHOR_DEPTH);
+    chains[0].m_current = anchors[1];
+    for (const auto& chain : chains) {
+        for (const auto& anchor : anchors) BOOST_REQUIRE(chain.Acceptable(anchor));
+    }
+
+    // Release A to the three uncommitted seats first, deterministically. This
+    // gives A every remaining vote (6), while B retains its three honest votes.
+    network.SetFilter([](size_t from, size_t to, const auto&) { return from != 1 && to != 1; });
+    for (auto& clock : clocks) clock.m_now += node::FlowMeshCommitteeRelayBudget::REPEAT_DELAY;
+    runtimes[0]->NotifyTick(); // Round 1: seat 2 retries the exact retained A.
+    BOOST_REQUIRE(WaitUntil([&] {
+        for (const size_t i : {size_t{0}, size_t{2}}) {
+            const auto data{runtimes[i]->MarketData(market, std::nullopt, {}, error)};
+            if (!data || data->snapshot.runtime.max_verified_attestations != 6) return false;
+        }
+        return true;
+    }));
+    drain();
+    BOOST_REQUIRE(stores[2]->ReadLock(position, remaining_lock, error));
+    BOOST_REQUIRE(remaining_lock);
+    BOOST_CHECK(*remaining_lock == locked_hashes[0]);
+
+    // Heal every link, then exercise a complete proposer rotation and paced
+    // retries. A future recovery test must require progress; this baseline
+    // instead proves both alternatives arrived and the durable split persists.
+    network.SetFilter({});
+    for (size_t round{0}; round < seats.seats.Size(); ++round) {
+        for (auto& clock : clocks) clock.m_now += node::FlowMeshCommitteeRelayBudget::REPEAT_DELAY;
+        for (const auto& runtime : runtimes) {
+            runtime->NotifyTick();
+            drain();
+        }
+    }
+    for (size_t i{0}; i < runtimes.size(); ++i) {
+        std::optional<uint256> locked;
+        BOOST_REQUIRE(stores[i]->ReadLock(position, locked, error));
+        BOOST_REQUIRE(locked);
+        BOOST_CHECK(*locked == locked_hashes[i == 1 ? 1 : 0]);
+        const auto status{runtimes[i]->MarketStatus(market)};
+        BOOST_REQUIRE(status);
+        BOOST_CHECK_EQUAL(status->next_sequence, 1U);
+        BOOST_CHECK(status->last_microblock_hash == certified_head);
+        BOOST_CHECK(status->halt == node::FlowMeshRuntimeHalt::NONE);
+        const auto data{runtimes[i]->MarketData(market, std::nullopt, {}, error)};
+        BOOST_REQUIRE_MESSAGE(data, error);
+        BOOST_CHECK_GT(data->snapshot.runtime.proposals_conflicting_lock, 0U);
+        BOOST_CHECK_EQUAL(data->snapshot.runtime.max_verified_attestations, i == 1 ? 3U : 6U);
+        BOOST_CHECK_EQUAL(data->snapshot.quorum_required, 7U);
+        BOOST_CHECK_LT(data->snapshot.runtime.max_verified_attestations, data->snapshot.quorum_required);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(honest_divergent_round_candidates_preserve_permanent_locks_without_remote_halt)
 {
     const uint256 domain{Filled(0x1b)};
@@ -5317,6 +5689,337 @@ BOOST_AUTO_TEST_CASE(discovery_hints_are_untrusted_and_failed_catchup_is_bounded
     BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
     BOOST_CHECK_EQUAL(count(flowmesh::WireMessageKind::GET), 4); // failure cooldown unchanged
     runtime.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_runtime_commit_gate_genesis_deposit_and_exact_restart)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_runtime_commit"};
+    std::string error;
+    f.Tick();
+    BOOST_REQUIRE_GT(f.prepares.load(), 0U);
+    BOOST_REQUIRE_GT(f.commits.load(), 0U);
+    BOOST_CHECK_EQUAL(f.decisions.load(), 0U);
+    BOOST_CHECK_EQUAL(f.premature_v1.load(), 0U);
+    BOOST_REQUIRE(f.AllAt(0));
+    // PREPARE quorums and durable local COMMIT votes are insufficient: no V1
+    // permanent lock exists while all cross-operator COMMIT delivery is held.
+    for (const auto& store : f.stores) {
+        std::optional<uint256> locked;
+        BOOST_REQUIRE(store->ReadLock({0, 0}, locked, error));
+        BOOST_CHECK(!locked);
+        std::optional<node::FlowMeshProductionStore::Marker> marker;
+        BOOST_REQUIRE(store->ReadMarker(marker, error));
+        BOOST_REQUIRE(marker);
+        BOOST_CHECK(marker->agreement_bootstrap_complete);
+    }
+    f.block_commits = false;
+    f.Reach(1);
+    BOOST_REQUIRE_GT(f.decisions.load(), 0U);
+    const uint256 genesis{f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash};
+    for (size_t i{0}; i < 4; ++i) {
+        std::optional<node::StoredProductionEntry> stored;
+        BOOST_REQUIRE(f.stores[i]->ReadEntry(0, f.seats.seats, stored, error));
+        BOOST_REQUIRE(stored);
+        BOOST_CHECK(stored->entry.GetHash() == genesis);
+        BOOST_CHECK(stored->entry.actions.empty());
+        BOOST_REQUIRE(f.runtimes[i]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    }
+    f.Drain();
+    f.Reach(2);
+    const uint256 head{f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash};
+    for (size_t i{0}; i < 4; ++i) {
+        std::optional<node::StoredProductionEntry> stored;
+        BOOST_REQUIRE(f.stores[i]->ReadEntry(1, f.seats.seats, stored, error));
+        BOOST_REQUIRE(stored);
+        BOOST_CHECK(stored->entry.GetHash() == head);
+        BOOST_REQUIRE_EQUAL(stored->entry.actions.size(), 1U);
+        BOOST_CHECK(stored->entry.actions.front().IsDeposit());
+        const auto state{f.runtimes[i]->StateSnapshot(f.market)};
+        BOOST_REQUIRE(state);
+        BOOST_CHECK_EQUAL(state->LedgerView().Available(f.account, f.asset), 250);
+    }
+    f.Drain();
+    std::optional<node::FlowMeshProductionStore::Marker> before;
+    BOOST_REQUIRE(f.stores[0]->ReadMarker(before, error));
+    BOOST_REQUIRE(before);
+    std::optional<uint256> lock_before;
+    BOOST_REQUIRE(f.stores[0]->ReadLock({0, 1}, lock_before, error));
+    f.StopNode(0);
+    f.stores[0].reset();
+    f.stores[0] = std::make_unique<node::FlowMeshProductionStore>(DBParams{
+        .path = f.StorePath(0), .cache_bytes = size_t{1} << 20}, true);
+    BOOST_REQUIRE_MESSAGE(f.stores[0]->OpenForMarket(f.domain, f.market,
+        f.seats.seats, f.initial.Root(), error), error);
+    BOOST_REQUIRE_MESSAGE(f.StartNode(0, f.AgreementPath(0), std::nullopt, error), error);
+    BOOST_CHECK(f.AllAt(2));
+    BOOST_CHECK(f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash == head);
+    BOOST_CHECK_EQUAL(f.runtimes[0]->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 250);
+    std::optional<node::FlowMeshProductionStore::Marker> after;
+    BOOST_REQUIRE(f.stores[0]->ReadMarker(after, error));
+    BOOST_REQUIRE(after);
+    BOOST_CHECK(after->agreement_identity == before->agreement_identity);
+    BOOST_CHECK(after->agreement_bootstrap_complete);
+    std::optional<uint256> lock_after;
+    BOOST_REQUIRE(f.stores[0]->ReadLock({0, 1}, lock_after, error));
+    BOOST_CHECK(lock_after == lock_before);
+
+    f.Drain();
+    f.StopNode(0);
+    BOOST_CHECK(!f.StartNode(0, f.StorePath(0) / "missing_agreement", std::nullopt, error));
+    BOOST_CHECK(error.find("missing agreement journal") != std::string::npos);
+    // A caller cannot regain bootstrap permission merely by setting a config
+    // boolean after the production marker has completed its durable handshake.
+    BOOST_CHECK(!f.StartNode(0, f.StorePath(0) / "forged_bootstrap", true, error));
+    BOOST_CHECK(error.find("bootstrap permission") != std::string::npos);
+    BOOST_REQUIRE_MESSAGE(f.StartNode(0, f.AgreementPath(0), std::nullopt, error), error);
+    f.Drain();
+    f.StopNode(0);
+    f.stores[0].reset();
+    node::FlowMeshProductionStore legacy{DBParams{
+        .path = f.StorePath(0), .cache_bytes = size_t{1} << 20}};
+    BOOST_CHECK(!legacy.OpenForMarket(f.domain, f.market, f.seats.seats, f.initial.Root(), error));
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_runtime_divergent_preliminary_views_heal_without_v1_locks)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_runtime_views"};
+    std::string error;
+    f.network.PartitionHalves(true);
+    f.Tick(); // View-zero proposal/prepares reach only the left two seats.
+    BOOST_REQUIRE(f.AllAt(0));
+    BOOST_REQUIRE_GT(f.prepares.load(), 0U);
+    f.Drain();
+    for (size_t i{2}; i < 4; ++i) f.clocks[i].m_now += std::chrono::seconds{11};
+    for (size_t i{2}; i < 4; ++i) f.runtimes[i]->NotifyTick();
+    f.Drain();
+    BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->round, 0U);
+    BOOST_CHECK_EQUAL(f.runtimes[2]->MarketStatus(f.market)->round, 1U);
+    BOOST_REQUIRE_GT(f.view_changes.load(), 0U);
+    for (const auto& store : f.stores) {
+        std::optional<uint256> locked;
+        BOOST_REQUIRE(store->ReadLock({0, 0}, locked, error));
+        BOOST_CHECK(!locked);
+    }
+    BOOST_CHECK_EQUAL(f.premature_v1.load(), 0U);
+    f.block_commits = false;
+    f.network.PartitionHalves(false);
+    f.Reach(1);
+    BOOST_REQUIRE_GT(f.decisions.load(), 0U);
+    const auto agreed{f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash};
+    for (const auto& runtime : f.runtimes) {
+        BOOST_CHECK(runtime->MarketStatus(f.market)->last_microblock_hash == agreed);
+        BOOST_CHECK(runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_nine_runtimes_same_deposit_adjacent_anchors_heal)
+{
+    // Nine distinct operators/stores/workers, not three operators holding
+    // three seats each. Chain answers and delivery remain isolated test mocks.
+    PreagreementRuntimeHarness<9> f{m_args.GetDataDirBase() / "preagreement_nine_anchors"};
+    std::string error;
+    BOOST_REQUIRE_EQUAL(flowmesh::FlowMeshBlsThreshold(f.seats.seats.Size()), 7U);
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    const auto genesis{f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash};
+    const flowmesh::AnchorRef earlier{200, Filled(0x74)}, later{201, Filled(0x75)};
+    f.deposits.additional_anchor = later;
+    for (size_t i{0}; i < 9; ++i) {
+        f.chains[i].AddCanonical(later);
+        f.chains[i].SetTipHeight(later.height + flowmesh::FLOWMESH_PRODUCTION_MIN_ANCHOR_DEPTH);
+        f.chains[i].m_current = i < 3 ? earlier : later;
+    }
+    std::mutex observed_mutex;
+    std::map<uint32_t, flowmesh::ProductionEntryCore> proposals;
+    std::atomic<bool> healed{false};
+    std::atomic<size_t> early_final_votes{0};
+    struct StopBeforeCapturedObservations {
+        PreagreementRuntimeHarness<9>& fixture;
+        ~StopBeforeCapturedObservations() { fixture.StopAll(); }
+    } stop_before_observations{f};
+    f.network.SetFilter([&](size_t from, size_t to, const flowmesh::WireMessage& wire) {
+        if (wire.header.sequence == 1 && wire.kind == flowmesh::WireMessageKind::ATTESTATION && !healed) ++early_final_votes;
+        if (wire.kind == flowmesh::WireMessageKind::AGREEMENT) {
+            const auto message{flowmesh::DecodeAgreementMessage(wire.payload)};
+            if (!message) return false;
+            if (message->context.sequence == 1 && message->stage == flowmesh::AgreementStage::PROPOSAL) {
+                const auto entry{flowmesh::DecodeProductionEntry(message->entry_bytes)};
+                if (entry) { std::lock_guard<std::mutex> lock{observed_mutex}; proposals.try_emplace(message->view, *entry); }
+            }
+            // After healing, old messages are deliberately still delayed.
+            // View two must succeed through its own seven-report proof.
+            if (healed && message->context.sequence == 1 && message->view < 2) return false;
+        }
+        return healed || from / 3 == to / 3;
+    });
+    for (const auto& runtime : f.runtimes) {
+        BOOST_REQUIRE(runtime->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    }
+    f.Tick(); // Seat 1 proposes the earlier anchor in view zero to its partition.
+    {
+        std::lock_guard<std::mutex> lock{observed_mutex};
+        BOOST_REQUIRE(proposals.contains(0));
+        BOOST_CHECK(proposals.at(0).anchor == earlier);
+    }
+    // The right-hand partitions independently time out. Seat 3 builds the
+    // adjacent-anchor candidate, but cannot publish it without seven reports.
+    for (size_t round{0}; round < 2; ++round) {
+        f.Drain();
+        for (size_t i{3}; i < 9; ++i) f.clocks[i].m_now += std::chrono::seconds{11};
+        for (size_t i{3}; i < 9; ++i) f.runtimes[i]->NotifyTick();
+        f.Drain();
+    }
+    BOOST_REQUIRE(f.AllAt(1));
+    BOOST_CHECK_EQUAL(f.runtimes[3]->MarketStatus(f.market)->round, 2U);
+    const auto candidate_data{f.runtimes[3]->MarketData(f.market, std::nullopt, {}, error)};
+    BOOST_REQUIRE(candidate_data);
+    BOOST_REQUIRE_GT(candidate_data->snapshot.runtime.candidate_count, 0U);
+    for (const auto& store : f.stores) {
+        std::optional<uint256> locked;
+        BOOST_REQUIRE(store->ReadLock({0, 1}, locked, error));
+        BOOST_CHECK(!locked);
+    }
+    BOOST_CHECK_EQUAL(early_final_votes.load(), 0U);
+    healed = true;
+    f.Reach(2);
+    f.Drain();
+    flowmesh::ProductionEntryCore agreed;
+    {
+        std::lock_guard<std::mutex> lock{observed_mutex};
+        BOOST_REQUIRE(proposals.contains(2));
+        agreed = proposals.at(2);
+        BOOST_CHECK(agreed.anchor == later);
+        auto normalized{agreed}; normalized.anchor = earlier;
+        BOOST_CHECK(flowmesh::EncodeProductionEntry(normalized) == flowmesh::EncodeProductionEntry(proposals.at(0)));
+        BOOST_CHECK(agreed.GetHash() != proposals.at(0).GetHash());
+    }
+    for (size_t i{0}; i < 9; ++i) {
+        std::optional<node::StoredProductionEntry> stored;
+        BOOST_REQUIRE(f.stores[i]->ReadEntry(1, f.seats.seats, stored, error));
+        BOOST_REQUIRE(stored);
+        BOOST_CHECK(stored->entry.GetHash() == agreed.GetHash());
+        BOOST_CHECK(stored->entry.parent_hash == genesis);
+        BOOST_REQUIRE_EQUAL(stored->entry.actions.size(), 1U);
+        BOOST_CHECK(stored->entry.actions.front().outpoint == f.outpoint);
+        BOOST_CHECK_EQUAL(f.runtimes[i]->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 250);
+        std::optional<uint256> locked;
+        BOOST_REQUIRE(f.stores[i]->ReadLock({0, 1}, locked, error));
+        BOOST_REQUIRE(locked);
+        BOOST_CHECK(*locked == agreed.GetHash());
+    }
+    // Reopen every generated operator's original two stores, never a second
+    // signer. Replay must preserve the certified entry and credit exactly once.
+    f.network.SetFilter({});
+    for (size_t i{0}; i < 9; ++i) f.StopNode(i);
+    for (size_t i{0}; i < 9; ++i) {
+        f.stores[i].reset();
+        f.stores[i] = std::make_unique<node::FlowMeshProductionStore>(DBParams{
+            .path = f.StorePath(i), .cache_bytes = size_t{1} << 20}, true);
+        BOOST_REQUIRE(f.stores[i]->OpenForMarket(f.domain, f.market, f.seats.seats, f.initial.Root(), error));
+        BOOST_REQUIRE_MESSAGE(f.StartNode(i, f.AgreementPath(i), std::nullopt, error), error);
+        BOOST_CHECK(f.runtimes[i]->MarketStatus(f.market)->last_microblock_hash == agreed.GetHash());
+        BOOST_CHECK_EQUAL(f.runtimes[i]->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 250);
+    }
+    f.Tick();
+    BOOST_CHECK(f.AllAt(2));
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_nine_runtimes_keep_seven_vote_threshold)
+{
+    PreagreementRuntimeHarness<9> f{m_args.GetDataDirBase() / "preagreement_nine_availability"};
+    f.block_commits = false;
+    f.StopNode(7); f.StopNode(8);
+    f.Reach(1); // Seven online seats certify; two remain stopped.
+    for (size_t i{0}; i < 7; ++i) {
+        BOOST_REQUIRE(f.runtimes[i]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    }
+    f.Reach(2);
+    f.Drain();
+    f.StopNode(6);
+    const COutPoint second{Txid::FromUint256(Filled(0x9e)), 0};
+    f.deposits.entries.emplace(second, flowmesh::DepositInfo{f.asset, 125, f.account});
+    for (size_t i{0}; i < 6; ++i) {
+        BOOST_REQUIRE(f.runtimes[i]->SubmitLocalAction(f.market, Deposit(second)) == flowmesh::QueueResult::ACCEPTED);
+    }
+    for (size_t attempt{0}; attempt < 3; ++attempt) f.Tick(std::chrono::seconds{2});
+    BOOST_CHECK(f.AllAt(2));
+    std::string error;
+    for (size_t i{0}; i < 6; ++i) {
+        std::optional<uint256> locked;
+        BOOST_REQUIRE(f.stores[i]->ReadLock({0, 2}, locked, error));
+        BOOST_CHECK(!locked);
+        BOOST_CHECK_EQUAL(f.runtimes[i]->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 250);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_prepared_anchor_reorg_preserves_history_without_final_vote)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_prepared_reorg"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    f.block_commits = true;
+    const auto commits_before{f.commits.load()};
+    for (const auto& runtime : f.runtimes) {
+        BOOST_REQUIRE(runtime->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    }
+    f.Tick();
+    BOOST_REQUIRE_GT(f.commits.load(), commits_before); // Prepared quorum, not a complete decision.
+    BOOST_REQUIRE(f.AllAt(1));
+    f.Drain();
+    // Temporarily unavailable chain data is not permission to sign through
+    // reconciliation. Existing exact messages remain retryable.
+    for (auto& chain : f.chains) chain.SetReconciled(false);
+    f.block_commits = false;
+    f.Tick(std::chrono::seconds{2});
+    BOOST_CHECK(f.AllAt(1));
+    f.Drain();
+    const flowmesh::AnchorRef later{201, Filled(0x75)};
+    f.deposits.additional_anchor = later;
+    for (auto& chain : f.chains) {
+        chain.AddCanonical({200, Filled(0x99)}); // Replace the prepared candidate's anchor.
+        chain.AddCanonical(later);
+        chain.SetTipHeight(231);
+        chain.m_current = later;
+        chain.SetReconciled(true);
+    }
+    for (size_t round{0}; round < 2; ++round) f.Tick(std::chrono::seconds{11});
+    BOOST_CHECK(f.AllAt(1));
+    std::string error;
+    const auto check_unchanged = [&] {
+        for (size_t i{0}; i < 4; ++i) {
+            std::optional<uint256> lock;
+            BOOST_REQUIRE(f.stores[i]->ReadLock({0, 1}, lock, error));
+            BOOST_CHECK(!lock);
+            BOOST_CHECK_EQUAL(f.runtimes[i]->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 0);
+        }
+    };
+    check_unchanged();
+    for (size_t i{0}; i < 4; ++i) f.StopNode(i);
+    for (size_t i{0}; i < 4; ++i) {
+        f.stores[i].reset();
+        f.stores[i] = std::make_unique<node::FlowMeshProductionStore>(DBParams{
+            .path = f.StorePath(i), .cache_bytes = size_t{1} << 20}, true);
+        BOOST_REQUIRE(f.stores[i]->OpenForMarket(f.domain, f.market, f.seats.seats, f.initial.Root(), error));
+        BOOST_REQUIRE_MESSAGE(f.StartNode(i, f.AgreementPath(i), std::nullopt, error), error);
+    }
+    f.Tick();
+    BOOST_CHECK(f.AllAt(1));
+    check_unchanged();
+    // This is NOT recovery onto the replacement fork. It only proves that
+    // preserved decisions/evidence remain usable if the original anchor is
+    // canonical again. An invalid prepared anchor cannot simply be forgotten.
+    f.Drain();
+    for (auto& chain : f.chains) chain.AddCanonical({200, Filled(0x74)});
+    f.Reach(2);
+    for (size_t i{0}; i < 4; ++i) {
+        std::optional<node::StoredProductionEntry> stored;
+        BOOST_REQUIRE(f.stores[i]->ReadEntry(1, f.seats.seats, stored, error));
+        BOOST_REQUIRE(stored);
+        BOOST_CHECK(stored->entry.anchor == (flowmesh::AnchorRef{200, Filled(0x74)}));
+        BOOST_CHECK_EQUAL(f.runtimes[i]->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 250);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

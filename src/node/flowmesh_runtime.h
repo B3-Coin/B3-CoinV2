@@ -9,6 +9,7 @@
 #include <flowmesh/p2p.h>
 #include <flowmesh/production_wire.h>
 #include <node/flowmesh_delivery.h>
+#include <node/flowmesh_agreement.h>
 #include <node/flowmesh_production_store.h>
 
 #include <atomic>
@@ -236,6 +237,11 @@ struct FlowMeshRuntimeMarketConfig {
     uint256 last_microblock_hash;
     FlowMeshProductionStore* store{nullptr};
     const flowmesh::DepositVerifier* deposits{nullptr};
+    // Immutable fresh-market-only operator mode, protected by store format v4.
+    bool preagreement{false};
+    fs::path agreement_path;
+    uint256 agreement_identity;
+    bool agreement_allow_create{false};
     /** A discovered live market may exist before a valid k>=4 set exists. */
     FlowMeshRuntimeMarketReadiness readiness{
         FlowMeshRuntimeMarketReadiness::READY};
@@ -544,6 +550,13 @@ private:
     void HandleEntries(Market& market, flowmesh::WirePeerId peer,
                        const flowmesh::WireMessage& message);
     void MaybePropose(Market& market);
+    bool InitializeAgreement(Market& market, const FlowMeshRuntimeMarketConfig& config,
+                             std::string& error);
+    bool RefreshAgreement(Market& market);
+    bool PublishAgreement(Market& market, const flowmesh::AgreementMessage& message);
+    void HandleAgreement(Market& market, flowmesh::WirePeerId peer,
+                         const flowmesh::WireMessage& message);
+    void FinalizeAgreement(Market& market);
     void MaybeCertify(Market& market, const uint256& candidate_hash);
     /** False means fresh safety policy failed, not merely a paced no-send. */
     bool ForwardCommitteeMessage(
@@ -644,6 +657,8 @@ private:
     FlowMeshCommitteeRelayBudget m_committee_relay_budget{
         FlowMeshCommitteeRelayBudget::GLOBAL_MESSAGES,
         FlowMeshCommitteeRelayBudget::GLOBAL_BYTES};
+    FlowMeshCommitteeRelayBudget m_agreement_relay_budget{
+        256, 2 * (flowmesh::AGREEMENT_MAX_BYTES + flowmesh::FLOWMESH_WIRE_HEADER_SIZE)};
     FlowMeshDuplicateActionRelayBudget m_duplicate_action_relay_budget;
     flowmesh::MarketId m_duplicate_action_relay_cursor;
     FlowMeshLocalActionRelayBudget m_local_action_relay_budget;

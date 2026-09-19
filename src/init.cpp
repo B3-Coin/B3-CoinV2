@@ -577,6 +577,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-flowmeshconnect=<peer>", "Independent FlowMesh peer: compressed-public-operator-key@numeric-address:port. Repeat for independent hosts. An unpinned peer proves only self-selected identity, not trusted routing or FN eligibility.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshrole=<role>", "Independent transport role when -enableflowmeshvalidator=1: validator (default), observer, or sentry. Validator role does not create or automatically arm an FN seat; eligible keys and explicit arming are still required.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshdatadir=<dir>", "Absolute FlowMesh store directory (default: network datadir/flowmesh). Do not copy live signing keys into independent runtimes or discard signing history.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshpreagreementmarket=<marketid>", "Explicitly select a fresh market for durable preliminary agreement before V1 signing. Repeat exact nonzero 64-hex market IDs. Requires -enableflowmeshvalidator=1; cannot migrate existing local history or a market with a B3 checkpoint. All operators must select the same fresh market. Selection remains required on every restart; older software cannot open its store.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshendpoint=<https-url>", "Restricted HTTPS trading endpoint used without the local validator engine. Repeat for independent failover endpoints (maximum 8). No userinfo, redirects, or HTTP fallback; no wallet/admin RPC endpoint.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshendpointca=<file>", "PEM CA trust bundle for trading endpoints; one bundle may cover all endpoints, or repeat in endpoint order. Empty uses OpenSSL default trust paths. Relative paths are resolved under the network datadir.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshendpointpin=<sha256>", "Optional DER leaf-certificate SHA256 pin for each trading endpoint, repeated in endpoint order (empty entry means no additional pin). CA and hostname/IP verification remain mandatory.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
@@ -2011,6 +2012,16 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     // FN/checkpoint/vault indexes and validation are never conditional on it.
     const bool flowmesh_validator{args.GetBoolArg("-enableflowmeshvalidator", false)};
     const bool flowmesh_api{args.GetBoolArg("-flowmeshapi", false)};
+    std::set<flowmesh::MarketId> flowmesh_preagreement_markets;
+    std::string flowmesh_preagreement_error;
+    if (!node::ParseFlowMeshPreagreementMarkets(args.GetArgs("-flowmeshpreagreementmarket"),
+                                               flowmesh_preagreement_markets,
+                                               flowmesh_preagreement_error)) {
+        return InitError(Untranslated(flowmesh_preagreement_error));
+    }
+    if (!flowmesh_preagreement_markets.empty() && !flowmesh_validator) {
+        return InitError(Untranslated("-flowmeshpreagreementmarket requires -enableflowmeshvalidator=1"));
+    }
     if (flowmesh_api && !flowmesh_validator) {
         return InitError(Untranslated("-flowmeshapi requires -enableflowmeshvalidator=1"));
     }
@@ -2058,7 +2069,8 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             }
             network.datadir = datadir / "network";
         }
-        node.flowmesh = std::make_unique<node::FlowMeshService>(chainman, datadir, std::move(transport));
+        node.flowmesh = std::make_unique<node::FlowMeshService>(chainman, datadir, std::move(transport),
+                                                             std::move(flowmesh_preagreement_markets));
         peerman_opts.flowmesh_sink = node.flowmesh->LegacyTransportEnabled() ? node.flowmesh.get() : nullptr;
     }
     node.peerman = PeerManager::make(*node.connman, *node.addrman,

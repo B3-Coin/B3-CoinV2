@@ -12,6 +12,7 @@
 #include <modern/chain_domain.h>
 #include <modern/flowmesh_seat.h>
 #include <modern/fn.h>
+#include <modern/mpa.h>
 #include <node/flowmesh_anchor.h>
 #include <node/flowmesh_checkpoint_index.h>
 #include <node/fn_seat_index.h>
@@ -266,6 +267,28 @@ struct FlowMeshServiceRestartSetup : TestingSetup {
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_service_tests, FlowMeshServiceSetup)
 
+BOOST_AUTO_TEST_CASE(preagreement_market_selection_is_explicit_exact_and_repeatable)
+{
+    const std::string first(64, 'a');
+    const std::string second(64, 'b');
+    std::set<flowmesh::MarketId> selected;
+    std::string error;
+    BOOST_REQUIRE(node::ParseFlowMeshPreagreementMarkets({}, selected, error));
+    BOOST_CHECK(selected.empty());
+    BOOST_REQUIRE(node::ParseFlowMeshPreagreementMarkets(
+        {first, second, first}, selected, error));
+    BOOST_CHECK_EQUAL(selected.size(), 2U);
+    BOOST_CHECK(selected.contains(*uint256::FromHex(first)));
+    BOOST_CHECK(selected.contains(*uint256::FromHex(second)));
+    const auto original{selected};
+    for (const std::string& invalid : std::vector<std::string>{
+             "", "*", "1", "0x" + first, " " + first, first + " ",
+             std::string(64, '0'), std::string(64, 'g')}) {
+        BOOST_CHECK(!node::ParseFlowMeshPreagreementMarkets({first, invalid}, selected, error));
+        BOOST_CHECK(selected == original); // Invalid lists never partially apply.
+    }
+}
+
 BOOST_AUTO_TEST_CASE(public_snapshot_and_fingerprint_are_read_only_and_canonical)
 {
     const auto empty{service.SeatKeyStatus()};
@@ -455,6 +478,81 @@ BOOST_AUTO_TEST_CASE(observer_and_sentry_roles_do_not_grant_signing_permission)
 BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_service_startup_tests, FlowMeshServiceRestartSetup)
+
+BOOST_AUTO_TEST_CASE(preagreement_opt_in_cannot_convert_an_existing_service_journal)
+{
+    const auto entry{Genesis()};
+    Retain(entry);
+    std::string error;
+    {
+        node::FlowMeshService service{*m_node.chainman, ServicePath(), {}, {market}};
+        BOOST_CHECK(!service.Start(*m_node.peerman, error));
+    }
+    CheckLock(entry, /*committed=*/false);
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_fresh_local_store_refuses_existing_b3_checkpoint)
+{
+    const auto entry{Genesis()};
+    std::vector<flowmesh::IndexedBlsSignature> signatures;
+    for (uint32_t i{0}; i < flowmesh::FlowMeshBlsThreshold(seats.Size()); ++i) {
+        const auto signature{flowmesh::SignBlsMicroblockCertificate(
+            secrets[i], flowmesh::ProductionCertificateContext(entry), seats)};
+        BOOST_REQUIRE(signature);
+        signatures.push_back({i, *signature});
+    }
+    flowmesh::BlsMicroblockCertificate certificate;
+    BOOST_REQUIRE(flowmesh::AssembleProductionEntryCertificate(
+        entry, seats, signatures, certificate) == flowmesh::BlsCertificateAssemblyCheck::OK);
+    const auto checkpoint{flowmesh::BuildProductionCheckpointRecord(entry, certificate, seats, {})};
+    BOOST_REQUIRE(checkpoint);
+    const auto encoded{modern::EncodeFlowMeshCheckpointRecordV1(*checkpoint, seats.Size())};
+    BOOST_REQUIRE(encoded);
+    {
+        LOCK(::cs_main);
+        auto& chainman{*m_node.chainman};
+        auto& chainstate{chainman.ActiveChainstate()};
+        auto& chain{chainstate.m_chain};
+        const auto& params{chainman.GetConsensus()};
+        CMutableTransaction transaction;
+        transaction.version = 2;
+        transaction.mpa.push_back({modern::MPA_TYPE_FLOWMESH_CHECKPOINT,
+                                   modern::MPA_VERSION_V1, *encoded});
+        CBlock block;
+        block.nVersion = 2;
+        block.hashPrevBlock = chain.Tip()->GetBlockHash();
+        block.nTime = chain.Tip()->nTime + 1;
+        block.nNonce = chain.Height() + 1;
+        block.vtx = {MakeTransactionRef(transaction)};
+        auto* index{chainman.m_blockman.InsertBlockIndex(block.GetHash())};
+        BOOST_REQUIRE(index);
+        index->nHeight = chain.Height() + 1;
+        index->pprev = chain.Tip();
+        index->nTime = block.nTime;
+        index->BuildSkip();
+        chain.SetTip(*index);
+        auto& seat_tracker{chainstate.ModernFnSeats()};
+        auto& vault_tracker{chainstate.ModernFlowMeshVaults()};
+        auto& checkpoint_tracker{chainstate.ModernFlowMeshCheckpoints()};
+        seat_tracker.BlockConnected(block, *index, params);
+        vault_tracker.BlockConnected(block, *index, params);
+        checkpoint_tracker.BlockConnected(block, *index, chain, params,
+                                         seat_tracker.Index(), vault_tracker.Index());
+        BOOST_REQUIRE(checkpoint_tracker.Synced(index->GetBlockHash()));
+        BOOST_REQUIRE(checkpoint_tracker.Index().Head(market));
+    }
+    std::string error;
+    {
+        node::FlowMeshService service{*m_node.chainman, ServicePath(), {}, {market}};
+        BOOST_CHECK(!service.Start(*m_node.peerman, error));
+        BOOST_CHECK(error.find("without B3 checkpoint history") != std::string::npos);
+    }
+    node::FlowMeshProductionStore store{DBParams{
+        .path = StorePath(), .cache_bytes = size_t{1} << 20}, true};
+    std::optional<node::FlowMeshProductionStore::Marker> marker;
+    BOOST_REQUIRE(store.ReadMarker(marker, error));
+    BOOST_CHECK(!marker); // Refusal happens before a fresh V4 marker is written.
+}
 
 BOOST_AUTO_TEST_CASE(dual_ingress_shares_vote_state_and_one_retained_signing_history)
 {

@@ -7,6 +7,7 @@
 #include <consensus/flowmesh_params.h>
 #include <crypto/common.h>
 #include <flowmesh/production_wire.h>
+#include <random.h>
 #include <streams.h>
 
 #include <algorithm>
@@ -497,10 +498,17 @@ std::optional<flowmesh::AnchorRef> SeatAnchor(
 
 bool MarkerShapeIsValid(const FlowMeshProductionStore::Marker& marker)
 {
-    if (marker.version != FlowMeshProductionStore::FORMAT_VERSION ||
+    const bool agreement{marker.version == FlowMeshProductionStore::PREAGREEMENT_FORMAT_VERSION};
+    if ((!agreement && marker.version != FlowMeshProductionStore::FORMAT_VERSION) ||
         marker.domain.IsNull() || marker.market_id.IsNull() ||
         marker.current_anchor.IsNull() || marker.current_seat_set_hash.IsNull() ||
         marker.state_root.IsNull()) {
+        return false;
+    }
+    if ((agreement && marker.agreement_identity.IsNull()) ||
+        (!agreement && (!marker.agreement_identity.IsNull() || marker.agreement_bootstrap_complete)) ||
+        (agreement && !marker.agreement_bootstrap_complete &&
+         (marker.next_sequence != 0 || !marker.last_b3_checkpoint.IsNull()))) {
         return false;
     }
     if (marker.next_sequence == 0 && !marker.last_microblock_hash.IsNull()) {
@@ -529,9 +537,18 @@ bool MarkerMatchesSeatSet(const FlowMeshProductionStore::Marker& marker,
 }
 
 ReadResult ReadMarkerStrict(CDBWrapper& db,
-                            FlowMeshProductionStore::Marker& marker)
+                            FlowMeshProductionStore::Marker& marker,
+                            const bool preagreement)
 {
-    return ReadStrict(db, KEY_MARKER, marker);
+    const ReadResult result{ReadStrict(db, KEY_MARKER, marker)};
+    // Every marker-dependent operation checks the requested immutable mode,
+    // including startup reconciliation before OpenForMarket. Never migrate.
+    if (result == ReadResult::FOUND && marker.version !=
+        (preagreement ? FlowMeshProductionStore::PREAGREEMENT_FORMAT_VERSION
+                      : FlowMeshProductionStore::FORMAT_VERSION)) {
+        return ReadResult::ERROR;
+    }
+    return result;
 }
 
 std::optional<flowmesh::BlsMicroblockCertificate> DecodeCertificateEnvelope(
@@ -958,9 +975,7 @@ bool ValidateStorage(CDBWrapper& db,
                      std::string& error)
 {
     if (!MarkerShapeIsValid(marker)) {
-        error = marker.version == FlowMeshProductionStore::FORMAT_VERSION
-                    ? "FlowMesh v3 marker is malformed"
-                    : "FlowMesh store is not format v3; migration is unsupported";
+        error = "FlowMesh production marker is malformed or has an unsupported format";
         return false;
     }
     {
@@ -979,6 +994,20 @@ bool ValidateStorage(CDBWrapper& db,
         }
     }
     if (!ValidateConnectionNamespace(db, marker.next_sequence, error)) return false;
+    if (marker.version == FlowMeshProductionStore::PREAGREEMENT_FORMAT_VERSION &&
+        !marker.agreement_bootstrap_complete) {
+        // No first V1 signing lock may predate the cross-journal handshake.
+        for (const uint8_t prefix : {KEY_LOCK, KEY_LOCKED_CANDIDATE}) {
+            std::unique_ptr<CDBIterator> pending{db.NewIterator()};
+            pending->Seek(prefix);
+            uint8_t found{0};
+            if (!pending->StatusOK() || (pending->Valid() &&
+                (!pending->GetKey(found) || found == prefix))) {
+                error = "FlowMesh incomplete agreement bootstrap has signing history";
+                return false;
+            }
+        }
+    }
 
     uint64_t expected_sequence{0};
     uint64_t next_effect_index{0};
@@ -1284,8 +1313,8 @@ bool ReadConnectionRecords(CDBWrapper& db,
 
 } // namespace
 
-FlowMeshProductionStore::FlowMeshProductionStore(DBParams db_params)
-    : m_db{std::move(db_params)}
+FlowMeshProductionStore::FlowMeshProductionStore(DBParams db_params, const bool preagreement)
+    : m_db{std::move(db_params)}, m_preagreement{preagreement}
 {
 }
 
@@ -1295,20 +1324,45 @@ bool FlowMeshProductionStore::ReadMarker(std::optional<Marker>& out,
     const std::lock_guard<std::mutex> guard{m_mutex};
     out.reset();
     Marker marker;
-    switch (ReadMarkerStrict(m_db, marker)) {
+    switch (ReadMarkerStrict(m_db, marker, m_preagreement)) {
     case ReadResult::NOT_FOUND: return true;
     case ReadResult::ERROR:
-        error = "FlowMesh v3 marker is corrupt or unreadable";
+        error = "FlowMesh production marker is unreadable or mode differs from configuration; migration is unsupported";
         return false;
     case ReadResult::FOUND: break;
     }
     if (!MarkerShapeIsValid(marker)) {
-        error = marker.version == FORMAT_VERSION
-                    ? "FlowMesh v3 marker is malformed"
-                    : "FlowMesh store is not format v3; migration is unsupported";
+        error = "FlowMesh production marker is malformed";
         return false;
     }
     out = marker;
+    return true;
+}
+
+bool FlowMeshProductionStore::MarkAgreementBootstrapComplete(
+    const uint256& identity, std::string& error)
+{
+    const std::lock_guard<std::mutex> guard{m_mutex};
+    Marker marker;
+    if (!m_open || !m_preagreement || identity.IsNull() ||
+        ReadMarkerStrict(m_db, marker, m_preagreement) != ReadResult::FOUND ||
+        !MarkerShapeIsValid(marker) || marker.agreement_identity != identity) {
+        error = "FlowMesh agreement bootstrap identity or mode mismatch";
+        return false;
+    }
+    if (marker.agreement_bootstrap_complete) return true;
+    if (!ValidateStorage(m_db, marker, error)) return false;
+    marker.agreement_bootstrap_complete = true;
+    try {
+        CDBBatch batch{m_db};
+        batch.Write(KEY_MARKER, marker);
+        m_db.WriteBatch(batch, /*fSync=*/true);
+    } catch (const std::exception& e) {
+        m_ready = false;
+        error = std::string{"FlowMesh agreement bootstrap completion failed: "} + e.what();
+        return false;
+    }
+    m_ready = true; // An incomplete bootstrap is necessarily an empty log.
     return true;
 }
 
@@ -1318,7 +1372,7 @@ bool FlowMeshProductionStore::ConnectedB3Heights(std::vector<int32_t>& out,
     const std::lock_guard<std::mutex> guard{m_mutex};
     out.clear();
     Marker marker;
-    const ReadResult marker_result{ReadMarkerStrict(m_db, marker)};
+    const ReadResult marker_result{ReadMarkerStrict(m_db, marker, m_preagreement)};
     if (marker_result == ReadResult::NOT_FOUND) {
         return NamespaceIsEmpty(m_db, error);
     }
@@ -1347,7 +1401,7 @@ bool FlowMeshProductionStore::ReconcileCheckpointConnections(
     rolled_back = false;
     const bool ready_before{m_ready};
     Marker marker;
-    const ReadResult marker_result{ReadMarkerStrict(m_db, marker)};
+    const ReadResult marker_result{ReadMarkerStrict(m_db, marker, m_preagreement)};
     if (marker_result == ReadResult::NOT_FOUND) {
         if (!NamespaceIsEmpty(m_db, error)) {
             m_ready = false;
@@ -1449,9 +1503,9 @@ bool FlowMeshProductionStore::CheckForMarket(
         return false;
     }
     Marker marker;
-    const ReadResult result{ReadMarkerStrict(m_db, marker)};
+    const ReadResult result{ReadMarkerStrict(m_db, marker, m_preagreement)};
     if (result == ReadResult::ERROR) {
-        error = "FlowMesh v3 marker is corrupt or unreadable";
+        error = "FlowMesh production marker is unreadable or mode differs from configuration; migration is unsupported";
         return false;
     }
     if (result == ReadResult::NOT_FOUND) {
@@ -1459,8 +1513,8 @@ bool FlowMeshProductionStore::CheckForMarket(
         fresh_out = true;
         return true;
     }
-    if (marker.version != FORMAT_VERSION) {
-        error = "FlowMesh store is not format v3; migration is unsupported";
+    if (marker.version != (m_preagreement ? PREAGREEMENT_FORMAT_VERSION : FORMAT_VERSION)) {
+        error = "FlowMesh store mode differs from configuration; migration is unsupported";
         return false;
     }
     if (marker.domain != domain || marker.market_id != market_id) {
@@ -1491,13 +1545,18 @@ bool FlowMeshProductionStore::OpenForMarket(
     }
 
     Marker marker;
-    const ReadResult result{ReadMarkerStrict(m_db, marker)};
+    const ReadResult result{ReadMarkerStrict(m_db, marker, m_preagreement)};
     if (result == ReadResult::ERROR) {
-        error = "FlowMesh v3 marker is corrupt or unreadable";
+        error = "FlowMesh production marker is unreadable or mode differs from configuration; migration is unsupported";
         return false;
     }
     if (result == ReadResult::NOT_FOUND) {
         if (!NamespaceIsEmpty(m_db, error)) return false;
+        marker.version = m_preagreement ? PREAGREEMENT_FORMAT_VERSION : FORMAT_VERSION;
+        if (m_preagreement) {
+            do { marker.agreement_identity = GetRandHash(); }
+            while (marker.agreement_identity.IsNull());
+        }
         marker.domain = domain;
         marker.market_id = market_id;
         marker.current_epoch = initial_seats.epoch;
@@ -1513,11 +1572,11 @@ bool FlowMeshProductionStore::OpenForMarket(
             return false;
         }
         m_open = true;
-        m_ready = true;
+        m_ready = !m_preagreement;
         return true;
     }
-    if (marker.version != FORMAT_VERSION) {
-        error = "FlowMesh store is not format v3; migration is unsupported";
+    if (marker.version != (m_preagreement ? PREAGREEMENT_FORMAT_VERSION : FORMAT_VERSION)) {
+        error = "FlowMesh store mode differs from configuration; migration is unsupported";
         return false;
     }
     if (marker.domain != domain || marker.market_id != market_id) {
@@ -1532,7 +1591,8 @@ bool FlowMeshProductionStore::OpenForMarket(
         return false;
     }
     m_open = true;
-    m_ready = marker.next_sequence == 0;
+    m_ready = marker.next_sequence == 0 &&
+              (!m_preagreement || marker.agreement_bootstrap_complete);
     return true;
 }
 
@@ -1552,7 +1612,7 @@ bool FlowMeshProductionStore::AppendExecution(
         return false;
     }
     Marker marker;
-    if (ReadMarkerStrict(m_db, marker) != ReadResult::FOUND ||
+    if (ReadMarkerStrict(m_db, marker, m_preagreement) != ReadResult::FOUND ||
         !MarkerShapeIsValid(marker)) {
         error = "FlowMesh v3 marker is missing or corrupt";
         return false;
@@ -1641,7 +1701,7 @@ bool FlowMeshProductionStore::AppendHandoff(
         return false;
     }
     Marker marker;
-    if (ReadMarkerStrict(m_db, marker) != ReadResult::FOUND ||
+    if (ReadMarkerStrict(m_db, marker, m_preagreement) != ReadResult::FOUND ||
         !MarkerShapeIsValid(marker)) {
         error = "FlowMesh v3 marker is missing or corrupt";
         return false;
@@ -1721,7 +1781,7 @@ bool FlowMeshProductionStore::MarkExecutionCheckpointConnected(
         return false;
     }
     Marker marker;
-    if (ReadMarkerStrict(m_db, marker) != ReadResult::FOUND ||
+    if (ReadMarkerStrict(m_db, marker, m_preagreement) != ReadResult::FOUND ||
         !MarkerShapeIsValid(marker) || !MarkerMatchesSeatSet(marker, active_seats)) {
         error = "FlowMesh v3 checkpoint does not match the active marker";
         return false;
@@ -1792,7 +1852,7 @@ bool FlowMeshProductionStore::MarkHandoffCheckpointConnected(
         return false;
     }
     Marker marker;
-    if (ReadMarkerStrict(m_db, marker) != ReadResult::FOUND ||
+    if (ReadMarkerStrict(m_db, marker, m_preagreement) != ReadResult::FOUND ||
         !MarkerShapeIsValid(marker) ||
         !MarkerMatchesSeatSet(marker, outgoing_seats) ||
         checkpoint.core.kind != modern::FlowMeshCheckpointKind::EPOCH_HANDOFF ||
@@ -1875,7 +1935,7 @@ bool FlowMeshProductionStore::ReadEntry(
         return false;
     }
     Marker marker;
-    if (ReadMarkerStrict(m_db, marker) != ReadResult::FOUND ||
+    if (ReadMarkerStrict(m_db, marker, m_preagreement) != ReadResult::FOUND ||
         sequence >= marker.next_sequence ||
         flowmesh::CheckActiveFnBlsSeatSet(marker.domain, active_seats) !=
             flowmesh::BlsSeatSetCheck::OK) {
@@ -1899,7 +1959,7 @@ bool FlowMeshProductionStore::NextCheckpointCandidate(
         return false;
     }
     Marker marker;
-    if (ReadMarkerStrict(m_db, marker) != ReadResult::FOUND ||
+    if (ReadMarkerStrict(m_db, marker, m_preagreement) != ReadResult::FOUND ||
         !MarkerShapeIsValid(marker) ||
         !MarkerMatchesSeatSet(marker, active_seats)) {
         error = "FlowMesh v3 checkpoint backlog does not match the active marker";
@@ -1947,7 +2007,7 @@ bool FlowMeshProductionStore::Replay(
     m_market_history.clear();
     std::deque<flowmesh::MarketHistoryEntry> history;
     Marker marker;
-    if (ReadMarkerStrict(m_db, marker) != ReadResult::FOUND ||
+    if (ReadMarkerStrict(m_db, marker, m_preagreement) != ReadResult::FOUND ||
         !ValidateStorage(m_db, marker, error)) {
         if (error.empty()) error = "FlowMesh v3 marker is missing or corrupt";
         return false;
@@ -2108,7 +2168,7 @@ bool FlowMeshProductionStore::Replay(
     state = std::move(working);
     last_hash = running_hash;
     m_market_history = std::move(history);
-    m_ready = true;
+    m_ready = !m_preagreement || marker.agreement_bootstrap_complete;
     return true;
 }
 
@@ -2145,7 +2205,7 @@ flowmesh::ProductionLockResult FlowMeshProductionStore::LockCandidate(
     const auto disk{MakeDiskLockedCandidate(entry, authenticated_evidence)};
     if (!disk) return flowmesh::ProductionLockResult::STORAGE_FAILURE;
     Marker marker;
-    if (ReadMarkerStrict(m_db, marker) != ReadResult::FOUND ||
+    if (ReadMarkerStrict(m_db, marker, m_preagreement) != ReadResult::FOUND ||
         !MarkerShapeIsValid(marker)) {
         return flowmesh::ProductionLockResult::STORAGE_FAILURE;
     }
@@ -2211,7 +2271,7 @@ flowmesh::ProductionLockResult FlowMeshProductionStore::LockOnce(
         return flowmesh::ProductionLockResult::STORAGE_FAILURE;
     }
     Marker marker;
-    if (ReadMarkerStrict(m_db, marker) != ReadResult::FOUND ||
+    if (ReadMarkerStrict(m_db, marker, m_preagreement) != ReadResult::FOUND ||
         !MarkerShapeIsValid(marker)) {
         return flowmesh::ProductionLockResult::STORAGE_FAILURE;
     }
@@ -2273,7 +2333,7 @@ bool FlowMeshProductionStore::ReadLockedCandidate(
     if (candidate_result == ReadResult::NOT_FOUND &&
         lock_result == ReadResult::FOUND) {
         Marker marker;
-        if (ReadMarkerStrict(m_db, marker) == ReadResult::FOUND &&
+        if (ReadMarkerStrict(m_db, marker, m_preagreement) == ReadResult::FOUND &&
             MarkerShapeIsValid(marker) &&
             position.sequence < marker.next_sequence) {
             // Committed positions retain their permanent hash lock, while
