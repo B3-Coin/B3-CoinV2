@@ -119,6 +119,7 @@ BASE_SCRIPTS = [
     'feature_flowmesh_release.py',
     'feature_flowmesh_network_policy.py',
     'feature_flowmesh_connect_rpc.py',
+    'feature_flowmesh_client_reconnect.py',
     'wallet_exportflowmeshkey.py',
     'feature_flowmesh_independent.py',
     'feature_flowmesh_remote_client.py',

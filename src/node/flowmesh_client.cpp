@@ -590,7 +590,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     }
     UniValue Call(const std::string& method, const UniValue& params,
                   const std::function<void(const UniValue&, size_t)>& validate,
-                  bool* possibly_sent = nullptr, bool* earlier_possible = nullptr)
+                  bool* possibly_sent = nullptr, bool* earlier_possible = nullptr,
+                  size_t* attempted_endpoints = nullptr)
     {
         if (m_endpoints.empty()) Fail("No FlowMesh HTTPS trading endpoint configured; use -flowmeshendpoint");
         UniValue request{UniValue::VOBJ}; request.pushKV("method", method); request.pushKV("params", params);
@@ -600,6 +601,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         for (size_t attempt{0}; attempt < m_endpoints.size(); ++attempt) {
             const size_t endpoint{(first + attempt) % m_endpoints.size()};
             try {
+                if (attempted_endpoints) ++*attempted_endpoints;
                 if (earlier_possible && possibly_sent) *earlier_possible = *possibly_sent;
                 const auto reply{FlowMeshHttpsRequest(m_endpoints[endpoint], "/flowmesh/v1", body, CLIENT_REQUEST_TIMEOUT, CLIENT_MAX_REPLY)};
                 if (possibly_sent && reply.request_may_have_been_sent) *possibly_sent = true;
@@ -1157,6 +1159,45 @@ public:
     interfaces::FlowMeshClientStatus Status() const override
     {
         std::lock_guard lock{m_status_mutex}; return m_status;
+    }
+    FlowMeshClientReconnectResult Reconnect() override
+    {
+        FlowMeshClientReconnectResult out;
+        out.status = "busy";
+        out.error = "Another FlowMesh client request is running; retry this read-only command after it completes";
+        std::unique_lock work{m_work, std::try_to_lock};
+        if (!work.owns_lock()) return out;
+        if (m_endpoints.empty()) {
+            out.status = "not_configured";
+            out.error = "No FlowMesh HTTPS trading endpoint configured; use -flowmeshendpoint and restart";
+            return out;
+        }
+        try {
+            // Each Call opens fresh TLS with the existing CA/hostname/pin and
+            // bounded failover policy. This is availability, not certification.
+            // Do not call Markets/Refresh/QueryAction/Send: a connection probe
+            // must not touch market caches, account cursors or durable history.
+            Call("markets", UniValue{UniValue::VOBJ}, [&](const UniValue& value, size_t) {
+                if (!value.isArray() || value.size() > CLIENT_MAX_MARKETS) Fail("Market discovery exceeds bound");
+                std::set<uint256> seen;
+                for (const auto& row : value.getValues()) {
+                    if (!row.isObject() || !seen.insert(Id(row, "market_id")).second)
+                        Fail("Invalid or duplicate market identity in availability response");
+                }
+            }, nullptr, nullptr, &out.attempted_endpoints);
+            out.status = "reachable";
+            out.endpoint_available = true;
+            out.endpoint = m_endpoints[m_selected].url;
+            out.error.clear();
+        } catch (const std::exception& e) {
+            out.status = "unavailable";
+            out.error = std::string{e.what()}.substr(0, 1024);
+            // Every configured endpoint just failed its probe. Do not display
+            // an old successful URL as the result of this reconnect attempt.
+            std::lock_guard status{m_status_mutex};
+            m_status.active_endpoint.clear();
+        }
+        return out;
     }
     std::optional<interfaces::FlowMeshPendingCheckpoint> Checkpoint(const uint256& id, std::string& error) override;
     std::vector<interfaces::FlowMeshVaultOperation> VaultOperations(const std::optional<uint256>& id, std::string& error) override;

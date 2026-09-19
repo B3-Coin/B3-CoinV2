@@ -17,6 +17,14 @@ the BLS public key. Diagnose the reported network startup error instead.
 
 ## Add an operator peer without restarting
 
+For an ordinary **engine-off trader**, use `reconnectflowmeshclient` instead.
+It probes the configured HTTPS trading endpoints without a wallet unlock and
+without signing, resubmitting, cancelling or changing any saved action. Read
+`getflowmeshclientinfo` for per-endpoint errors. A `reachable` reply is not quorum
+or certification; `busy` is explicit refusal while another client request runs.
+This RPC does not add/change endpoints or trust: configuration changes still
+require a clean restart. See [the tester guide](../FLOWMESH-TESTING.md).
+
 In the local wallet console or authenticated node-admin RPC:
 
 ```text

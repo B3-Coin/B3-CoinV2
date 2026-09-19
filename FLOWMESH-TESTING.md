@@ -1,4 +1,4 @@
-# FlowMesh experimental tester candidate — 1.1.5-flowmesh-test.1
+# FlowMesh experimental tester candidate — 1.1.5-flowmesh-test.2
 
 **Engineering test build, not deployment-ready.** No public release or live
 upgrade is implied. Keep previous binaries and data. This candidate must not
@@ -15,6 +15,8 @@ be used to attempt recovery of existing mainnet signing conflicts.
 - The existing Qt client, reverse trading view, receipt preservation, independent
   operator network and live operator `flowmeshconnect` RPC are inherited from
   the published base. They are not new improvements in this candidate.
+- Test.2 adds `reconnectflowmeshclient`: a read-only fresh HTTPS probe/failover
+  for ordinary traders. It never signs, resubmits, cancels or changes an action.
 
 No B3 consensus, execution, action identity, fee currency, settlement encoding
 or membership change is introduced. V2 asset-to-asset markets, shared balances,
@@ -117,15 +119,29 @@ Read-only Qt console checks:
 
 ```text
 getflowmeshclientinfo
+reconnectflowmeshclient
 listflowmeshactions
 ```
 
-There is **no ordinary-client runtime HTTPS endpoint-add/reconnect RPC in this
-candidate**. `flowmeshconnect` connects operators, not an engine-off trader.
-Client endpoint changes currently use the existing startup configuration and a
-clean restart. Do not enable a local validator merely to make a trading button
-active. Endpoint failover and exact-action recovery are separate from peer
-connectivity, quorum and settlement.
+`reconnectflowmeshclient` makes a fresh read-only request using the configured
+endpoints and unchanged CA/hostname/pin verification. `status: "reachable"`
+means one replied; it does not prove quorum or certification. An empty market
+list may be a valid availability response. Market and balance proof checks still
+run when trading data is requested. `actions_submitted` is always zero.
+
+`busy` means another client request owns the worker: wait for it to finish and
+retry the read-only command. No second worker or hidden action retry is queued.
+`unavailable` reports the failure; fix the endpoint/tunnel/certificate rather
+than clearing history. There can be up to eight sequential endpoint attempts,
+each with the existing five-second transport deadline, so this is not a promise
+of a five-second total wait. `getflowmeshclientinfo` lists the per-endpoint errors.
+
+`not_configured` needs the existing `flowmeshendpoint` startup configuration and
+a clean restart. `not_remote` means the local engine is selected; no HTTPS probe
+was attempted. There is still no runtime endpoint-add RPC. `flowmeshconnect`
+connects operators, not an engine-off trader. Do not enable a local validator
+merely to make a trading button active. HTTPS reconnection is separate from
+exact-action recovery, quorum and settlement.
 
 ## What testers should record
 

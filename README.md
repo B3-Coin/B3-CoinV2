@@ -2,7 +2,7 @@
 
 ## Experimental FlowMesh tester candidate
 
-This branch builds **1.1.5-flowmesh-test.1**, not a production recovery release.
+This branch builds **1.1.5-flowmesh-test.2**, not a production recovery release.
 The opt-in preliminary-agreement mode still has a reproduced withdrawal
 certification stall. Existing locked markets are not repaired. Use generated
 wallets and valueless coins on an isolated test network; do not upgrade a live

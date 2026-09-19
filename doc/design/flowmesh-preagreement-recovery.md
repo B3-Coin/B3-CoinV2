@@ -2,7 +2,7 @@
 
 Status: **experimental runtime integration, not deployed or release-qualified**.
 The source is being published as the explicitly experimental
-`1.1.5-flowmesh-test.1` candidate. See [the tester guide](../../FLOWMESH-TESTING.md)
+`1.1.5-flowmesh-test.2` candidate. See [the tester guide](../../FLOWMESH-TESTING.md)
 for retained failures and connection instructions; compilation is not deployment
 qualification.
 The isolated node build now includes a durable preliminary agreement engine,

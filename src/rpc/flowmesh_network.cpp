@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see COPYING.
 
 #include <node/context.h>
+#include <node/flowmesh_client.h>
 #include <node/flowmesh_service.h>
 #include <rpc/server_util.h>
 #include <rpc/server.h>
@@ -70,6 +71,42 @@ static UniValue TargetChannelJSON(const node::FlowMeshNetTargetChannel& channel)
     out.pushKV("last_attempt_age_ms", channel.last_attempt_age_ms);
     out.pushKV("authenticated", channel.authenticated);
     return out;
+}
+
+static RPCHelpMan reconnectflowmeshclient()
+{
+    return RPCHelpMan{
+        "reconnectflowmeshclient",
+        "Retry the ordinary trader's configured HTTPS endpoints with a fresh, read-only markets request. "
+        "No wallet or unlock is required. Does not sign, submit/retry/cancel an action, clear saved history, change endpoints/trust, or enable a validator. "
+        "Uses the existing verified TLS and bounded failover policy (up to eight sequential attempts, each with a five-second transport deadline). "
+        "Returns busy immediately if another client request is running; no overlapping worker is started. "
+        "Reachable means an API response was obtained, not quorum, certification, synced state or a persistent socket.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "Read-only reconnect observation", {
+            {RPCResult::Type::STR, "status", "reachable, unavailable, busy, not_configured or not_remote"},
+            {RPCResult::Type::BOOL, "endpoint_available", "A configured HTTPS endpoint answered this probe successfully"},
+            {RPCResult::Type::STR, "endpoint", "Successful configured endpoint for this call; empty otherwise"},
+            {RPCResult::Type::NUM, "attempted_endpoints", "HTTPS attempts made by this call"},
+            {RPCResult::Type::NUM, "actions_submitted", "Always zero; this command never submits an action"},
+            {RPCResult::Type::BOOL, "availability_is_certification", "Always false"},
+            {RPCResult::Type::STR, "error", "Bounded failure/busy/configuration reason, or empty"},
+        }},
+        RPCExamples{HelpExampleCli("reconnectflowmeshclient", "")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto& backend{EnsureAnyNodeContext(request.context).flowmesh_trading};
+            if (!backend) throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "FlowMesh trading backend is not available yet");
+            const auto result{backend->Reconnect()};
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("status", result.status);
+            out.pushKV("endpoint_available", result.endpoint_available);
+            out.pushKV("endpoint", result.endpoint);
+            out.pushKV("attempted_endpoints", uint64_t{result.attempted_endpoints});
+            out.pushKV("actions_submitted", 0);
+            out.pushKV("availability_is_certification", false);
+            out.pushKV("error", result.error);
+            return out;
+        }};
 }
 
 static RPCHelpMan flowmeshconnect()
@@ -394,6 +431,7 @@ static RPCHelpMan getflowmeshdeliveryinfo()
 void RegisterFlowMeshNetworkRPCCommands(CRPCTable& table)
 {
     static const CRPCCommand commands[]{
+        {"flowmesh", &reconnectflowmeshclient},
         {"flowmesh", &flowmeshconnect},
         {"flowmesh", &getflowmeshnetworkinfo},
         {"flowmesh", &getflowmeshdeliveryinfo},

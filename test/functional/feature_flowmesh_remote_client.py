@@ -218,6 +218,26 @@ class FlowMeshRemoteClientTest(FlowMeshIndependentTest):
         assert_equal(node.gettransaction(prepared["txid"])["hex"], prepared["hex"])
         return prepared
 
+    def check_readonly_reconnect_preserves_actions(self, market_id, label):
+        before = self.client.listflowmeshactions(market_id)
+        counts = [len(relay.snapshot()["requests"]) for relay in self.tls_relays]
+        status = self.client.getflowmeshclientinfo()
+        result = self.client.reconnectflowmeshclient()
+        assert_equal(result["status"], "reachable")
+        assert_equal(result["actions_submitted"], 0)
+        assert_equal(result["availability_is_certification"], False)
+        assert_equal(self.client.listflowmeshactions(market_id), before)
+        after = self.client.getflowmeshclientinfo()
+        for field in ("pending_actions", "event_gaps"):
+            assert_equal(after[field], status[field])
+        requests = [row for relay, count in zip(self.tls_relays, counts)
+                    for row in relay.snapshot()["requests"][count:]]
+        assert requests and all(row["method"] == "markets" for row in requests)
+        self.adversarial_results.append({"case": "readonly_reconnect", "phase": label,
+                                         "original_actions_unchanged": True,
+                                         "action_ids": [row["action_id"] for row in before["actions"]],
+                                         "methods": [row["method"] for row in requests]})
+
     def observe_action(self, market_id, method, params, label, *, expect_sequence=None):
         started = time.monotonic()
         attempts = []
@@ -251,6 +271,9 @@ class FlowMeshRemoteClientTest(FlowMeshIndependentTest):
                 (response["receipt_state"] == "rejected" and response["reason"] in known_pre_admission)), response
         action_id = response["action_id"]
         assert len(action_id) == 64
+        if label == "ambiguous_admission_failover":
+            assert_equal(response["receipt_state"], "unknown")
+            self.check_readonly_reconnect_preserves_actions(market_id, "unknown_outcome")
         if expect_sequence is not None:
             assert_equal(response["sequence"], expect_sequence)
         next_retry = time.monotonic() + 1
@@ -505,6 +528,7 @@ class FlowMeshRemoteClientTest(FlowMeshIndependentTest):
             assert_equal([len(relay.snapshot()["requests"]) for relay in self.tls_relays], before_counts)
             return view
 
+        self.check_readonly_reconnect_preserves_actions(market_id, "already_certified")
         before_saved = saved_view(self.client, market_id)
         retained_before = {row["action_id"]: row for row in before_saved["actions"]}
         original = retained_before[action_id]

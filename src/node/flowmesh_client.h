@@ -8,6 +8,7 @@
 #include <node/flowmesh_https.h>
 #include <univalue.h>
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
@@ -16,6 +17,14 @@
 class ChainstateManager;
 namespace node {
 class FlowMeshService;
+
+struct FlowMeshClientReconnectResult {
+    std::string status{"not_remote"};
+    bool endpoint_available{false};
+    std::string endpoint;
+    size_t attempted_endpoints{0};
+    std::string error{"The local trading backend does not use remote HTTPS endpoints"};
+};
 
 //! Trading-only boundary. No wallet secrets, validator arming, RPC dispatcher,
 //! execution worker or signing-history mutation is part of this interface.
@@ -34,6 +43,9 @@ public:
     virtual std::vector<interfaces::FlowMeshSavedAction> SavedActions(
         const uint256& account, const std::optional<uint256>& market) { return {}; }
     virtual interfaces::FlowMeshClientStatus Status() const = 0;
+    //! Fresh read-only HTTPS availability probe. Never signs, retries an action,
+    //! resets an outbox/cursor or changes configured trust. Busy fails promptly.
+    virtual FlowMeshClientReconnectResult Reconnect() { return {}; }
     virtual std::optional<interfaces::FlowMeshPendingCheckpoint> Checkpoint(const uint256& market, std::string& error) = 0;
     virtual std::vector<interfaces::FlowMeshVaultOperation> VaultOperations(const std::optional<uint256>& market, std::string& error) = 0;
     virtual std::optional<interfaces::FlowMeshVaultOperation> VaultOperation(const uint256& effect, std::string& error) = 0;
