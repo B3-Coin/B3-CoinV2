@@ -71,6 +71,7 @@ add_executable(test_bitcoin
   feerounder_tests.cpp
   flatfile_tests.cpp
   flowmesh_asset_metadata_tests.cpp
+  public_asset_metadata_tests.cpp
   flowmesh_batch_tests.cpp
   flowmesh_bls_certificate_tests.cpp
   flowmesh_checkpoint_codec_tests.cpp

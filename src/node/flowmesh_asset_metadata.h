@@ -5,19 +5,13 @@
 #ifndef BITCOIN_NODE_FLOWMESH_ASSET_METADATA_H
 #define BITCOIN_NODE_FLOWMESH_ASSET_METADATA_H
 
-#include <modern/asset_metadata.h>
-#include <uint256.h>
-#include <util/fs.h>
-
-#include <map>
-#include <optional>
-#include <string>
+#include <node/public_asset_metadata.h>
 
 class UniValue;
 
 namespace node {
 
-using FlowMeshAssetMetadataCatalog = std::map<uint256, modern::AssetDisplayMetadata>;
+using FlowMeshAssetMetadataCatalog = PublicAssetMetadataCatalog;
 
 /**
  * Load an explicitly configured PUBLIC display catalog. This never reads wallet
