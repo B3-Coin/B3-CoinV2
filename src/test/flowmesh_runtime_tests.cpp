@@ -6731,9 +6731,11 @@ BOOST_AUTO_TEST_CASE(preagreement_old_view_evidence_recovers_while_duplicate_is_
     BOOST_REQUIRE(f.runtimes[3]->EnqueueWireMessage(1, exact) == flowmesh::QueueResult::ACCEPTED);
     BOOST_CHECK_EQUAL(f.runtimes[3]->DeliverySnapshots(f.market).front().agreement_duplicates_coalesced,
                       quiet_before + 1);
+    // Fresh action admission wakes the worker. Close the gate before that
+    // event so its already-due evidence retry cannot run during the setup.
+    f.chains[3].SetReconciled(false);
     BOOST_REQUIRE(f.runtimes[3]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
     f.Drain();
-    f.chains[3].SetReconciled(false);
     f.runtimes[3]->NotifyTick();
     f.Drain();
     {
@@ -7148,6 +7150,128 @@ BOOST_AUTO_TEST_CASE(preagreement_runtime_keyless_observer_accepts_quorum)
     const uint256 genesis{f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash};
     BOOST_CHECK(f.runtimes[3]->MarketStatus(f.market)->last_microblock_hash == genesis);
     BOOST_CHECK_EQUAL(f.view_changes.load(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_action_admission_wakes_proposal_without_periodic_tick)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_action_wakeup", std::chrono::seconds{2}};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Tick(std::chrono::seconds{30}); // Idle time is not active proposal time.
+    BOOST_REQUIRE(f.AllAt(1));
+    const auto submitted_at{f.clocks[0].Now()};
+    const auto decisions_before{f.decisions.load()};
+
+    // Seat zero is not sequence one's proposer. Its fresh ACTION must wake
+    // the remote proposer too; there is no ticker in this harness and no
+    // NotifyTick/clock advance between submission and durable certification.
+    BOOST_REQUIRE(f.runtimes[0]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
+    f.Drain();
+    BOOST_CHECK_GT(f.decisions.load(), decisions_before);
+    BOOST_CHECK_EQUAL(f.view_changes.load(), 0U);
+    std::string error;
+    for (size_t i{0}; i < f.runtimes.size(); ++i) {
+        BOOST_CHECK(f.clocks[i].Now() == submitted_at);
+        std::optional<node::StoredProductionEntry> stored;
+        BOOST_REQUIRE(f.stores[i]->ReadEntry(1, f.seats.seats, stored, error));
+        BOOST_REQUIRE(stored);
+        BOOST_REQUIRE_EQUAL(stored->entry.actions.size(), 1U);
+        BOOST_CHECK(stored->entry.actions.front().Id() == Deposit(f.outpoint).Id());
+        BOOST_CHECK_EQUAL(f.runtimes[i]->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 250);
+    }
+
+    // Neither the wake-up nor ordinary idle maintenance manufactures an
+    // actionless entry after the admitted action has been consumed.
+    const auto decisions_after{f.decisions.load()};
+    f.Tick();
+    f.Tick(std::chrono::seconds{30});
+    BOOST_CHECK(f.AllAt(2));
+    BOOST_CHECK_EQUAL(f.decisions.load(), decisions_after);
+    BOOST_CHECK_EQUAL(f.view_changes.load(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_duplicate_actions_do_not_schedule_proposal_ticks)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_duplicate_wakeup", std::chrono::seconds{2}};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Tick(std::chrono::seconds{30});
+    f.block_commits = true;
+    const auto commits_before{f.commits.load()};
+    BOOST_REQUIRE(f.runtimes[0]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return f.commits.load() > commits_before; }));
+    f.Drain();
+    BOOST_REQUIRE(f.AllAt(1));
+    const auto committed_votes{f.commits.load()};
+    const auto cursor{f.runtimes[0]->DeliverySnapshots(f.market).front().last_event_id};
+    const auto payload{flowmesh::EncodeProductionActionPayload(Deposit(f.outpoint))};
+    BOOST_REQUIRE(payload);
+    const flowmesh::WireMessage duplicate{flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1}, *payload};
+    for (size_t copy{0}; copy < 8; ++copy) {
+        BOOST_REQUIRE(f.runtimes[0]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(1, duplicate) == flowmesh::QueueResult::ACCEPTED);
+    }
+    f.Drain();
+    const auto snapshot{f.runtimes[0]->DeliverySnapshots(f.market).front()};
+    BOOST_REQUIRE(!snapshot.events.empty());
+    BOOST_REQUIRE_LE(snapshot.events.front().event_id, cursor + 1); // No new event escaped the bounded ring.
+    BOOST_CHECK(std::none_of(snapshot.events.begin(), snapshot.events.end(), [&](const auto& event) {
+        return event.event_id > cursor && event.stage == "tick_market_lock_acquired";
+    }));
+    BOOST_CHECK_EQUAL(f.commits.load(), committed_votes);
+    BOOST_CHECK_EQUAL(f.view_changes.load(), 0U);
+    BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->pending_actions, 1U);
+    BOOST_CHECK(f.AllAt(1));
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_action_wakeup_respects_reconciliation_pause)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_paused_wakeup", std::chrono::seconds{2}};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Tick(std::chrono::seconds{30});
+    const auto prepares_before{f.prepares.load()};
+    for (auto& chain : f.chains) chain.SetReconciled(false);
+    // Submit directly to the proposer while its production gate is closed.
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK(f.AllAt(1));
+    BOOST_CHECK_EQUAL(f.prepares.load(), prepares_before);
+    BOOST_CHECK_EQUAL(f.view_changes.load(), 0U);
+    std::string error;
+    for (size_t i{0}; i < f.runtimes.size(); ++i) {
+        std::optional<uint256> lock;
+        BOOST_REQUIRE(f.stores[i]->ReadLock({0, 1}, lock, error));
+        BOOST_CHECK(!lock);
+        BOOST_CHECK_EQUAL(f.runtimes[i]->MarketStatus(f.market)->round, 0U);
+    }
+    // Recovery still uses the existing periodic path and the exact admitted
+    // action. The admission event does not add a separate recovery timer.
+    for (auto& chain : f.chains) chain.SetReconciled(true);
+    f.Tick(std::chrono::milliseconds{250});
+    f.Reach(2);
+    for (const auto& runtime : f.runtimes) {
+        BOOST_CHECK_EQUAL(runtime->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 250);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_action_wakeup_arms_initial_timeout_without_periodic_tick)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_wakeup_timeout", std::chrono::seconds{2}};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Tick(std::chrono::seconds{30});
+    f.StopNode(1); // Sequence one's initial proposer is absent.
+    BOOST_REQUIRE(f.runtimes[0]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain(); // No manual tick: admission starts each eligible local clock.
+    BOOST_REQUIRE(f.AllAt(1));
+    f.Tick(std::chrono::milliseconds{1999});
+    BOOST_CHECK_EQUAL(f.view_changes.load(), 0U);
+    f.Tick(std::chrono::milliseconds{1});
+    BOOST_CHECK_GT(f.view_changes.load(), 0U);
+    f.Reach(2);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

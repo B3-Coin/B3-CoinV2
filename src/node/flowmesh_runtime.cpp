@@ -3741,6 +3741,12 @@ void FlowMeshRuntime::HandleAction(
                  peer == LOCAL_ACTION_PEER
                      ? std::nullopt
                      : std::optional<flowmesh::WirePeerId>{peer});
+    // Fresh authenticated work need not wait for the periodic maintenance
+    // tick. Use its existing coalesced worker wake-up so timer eligibility,
+    // reconciliation and signing gates run before proposing. Exact duplicate
+    // and refused actions return above and cannot schedule extra ticks.
+    // Legacy production keeps its existing periodic batching policy.
+    if (market.agreement) NotifyTick();
 }
 
 void FlowMeshRuntime::MaybePropose(Market& market)
