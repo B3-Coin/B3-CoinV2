@@ -641,24 +641,24 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         const flowmesh::ActiveFnBlsSeatSet& current) const override
     {
         if (!ReconciledAtTip()) {
-            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt};
+            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt, "b3_reconciliation_pending"};
         }
         const auto expected_domain{ChainDomain()};
         if (!expected_domain || domain != *expected_domain ||
             market_id != current.market_id) {
-            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt};
+            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt, "seat_context_mismatch"};
         }
         // Sequence zero is produced immediately, but no later execution may
         // begin until its deterministic genesis checkpoint is connected.
         if (GenesisNotProduced(market_id)) return {};
         if (GenesisCheckpointPending(market_id)) {
-            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt};
+            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt, "genesis_checkpoint_pending"};
         }
         // A connected type-9 withdrawal is retired inside one dedicated,
         // certified settlement entry. Do not let later state build on it
         // until that exact entry is anchored by type 8.
         if (SettlementCheckpointPending(market_id)) {
-            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt};
+            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt, "settlement_checkpoint_pending"};
         }
         // Settlement has priority over committee rotation. Otherwise a
         // handoff could advance the production anchor past a connected
@@ -666,25 +666,25 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         const auto settlement_required{
             SettlementExecutionRequired(market_id)};
         if (!settlement_required) {
-            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt};
+            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt, "settlement_plan_unavailable"};
         }
         if (*settlement_required) return {};
         if (current.epoch == std::numeric_limits<uint64_t>::max()) {
-            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt};
+            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt, "seat_epoch_exhausted"};
         }
         const flowmesh::AnchorRef anchor{anchors.Current()};
         std::string error;
         const auto next{BuildSeatSetAt(market_id, current.epoch + 1, anchor,
                                        error)};
         if (!next) {
-            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt};
+            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt, "next_seat_set_unavailable"};
         }
         if (SameMembers(current, *next)) return {};
         // Ordinary checkpoints are asynchronous and do not throttle trading.
         // A membership change is the one place where the outgoing committee
         // must drain every required checkpoint before signing its handoff.
         if (CheckpointPending(market_id)) {
-            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt};
+            return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt, "handoff_checkpoints_pending"};
         }
         return {FlowMeshSeatTransitionKind::HANDOFF, *next};
     }

@@ -205,6 +205,7 @@ struct FlowMeshAgreement::Impl {
     std::set<RecordKey> received;
     size_t received_bytes{0};
     size_t retry_cursor{0};
+    uint32_t proposal_retry_cursor{0};
     std::set<uint256> usable;
     std::optional<uint256> preferred;
     std::optional<uint256> required;
@@ -344,7 +345,7 @@ struct FlowMeshAgreement::Impl {
     {
         votes.clear(); reports.clear(); pending_proposals.clear(); pending_decision.reset();
         record_index.clear(); received.clear(); usable.clear(); preferred.reset(); required.reset();
-        received_bytes = 0; retry_cursor = 0;
+        received_bytes = 0; retry_cursor = 0; proposal_retry_cursor = 0;
     }
     void Track(const AgreementMessage& message)
     {
@@ -433,6 +434,54 @@ struct FlowMeshAgreement::Impl {
         if (!preferred) preferred = hash;
         if (required == hash) required.reset();
         return true;
+    }
+    bool RememberProposalCandidate(const AgreementMessage& proposal)
+    {
+        if (!RememberCandidate(proposal.entry_bytes, proposal.candidate)) return false;
+        // An older authenticated proposal remains the exact fetch response for
+        // a highest-prepared candidate. Retain it for restart/rebroadcast once
+        // its evidence becomes usable, without reopening that view's votes.
+        if (proposal.view < slot.view && !slot.proposals.contains(proposal.view)) {
+            slot.proposals.emplace(proposal.view, *EncodeAgreementMessage(proposal));
+            Persist();
+        }
+        return true;
+    }
+    void RetryOldProposalCandidates()
+    {
+        // A complete decision is recovered first by Pump. An unrelated old
+        // body must not consume the caller's final candidate-cache position
+        // while that decision is waiting for its evidence.
+        if (IsDecided() || pending_decision) return;
+        // Exact duplicate ingress is intentionally coalesced. Evidence/anchor
+        // recovery therefore uses the bounded, authenticated original bodies.
+        // Prefer the hash needed for progress, and also rotate through other
+        // old bodies so replacing `required` cannot strand one indefinitely.
+        // At most two extra candidate validations occur per local Retry, not
+        // per received vote. No candidate, signature or proof is reconstructed.
+        std::optional<uint256> retried;
+        if (required && !slot.candidates.contains(*required)) {
+            const auto needed{*required};
+            const auto proposal{std::find_if(pending_proposals.begin(), pending_proposals.end(),
+                [&](const auto& item) { return item.first < slot.view && item.second.candidate == needed; })};
+            if (proposal != pending_proposals.end()) {
+                retried = needed;
+                RememberProposalCandidate(proposal->second);
+            }
+        }
+        auto proposal{pending_proposals.upper_bound(proposal_retry_cursor)};
+        for (size_t visited{0}; visited < std::min<size_t>(pending_proposals.size(), 4); ++visited) {
+            if (proposal == pending_proposals.end()) proposal = pending_proposals.begin();
+            const auto& [view, message]{*proposal++};
+            proposal_retry_cursor = view;
+            if (view >= slot.view || slot.proposals.contains(view) || retried == message.candidate) continue;
+            // Keep an unavailable preferred hash as the integration's signal;
+            // a background candidate must not replace that recovery request.
+            const auto needed{required};
+            RememberProposalCandidate(message);
+            if (needed && !slot.candidates.contains(*needed)) required = needed;
+            break;
+        }
     }
     bool Send(const AgreementMessage& message)
     {
@@ -758,9 +807,9 @@ bool FlowMeshAgreement::Receive(const AgreementMessage& message, std::string& er
         // Old authenticated proposals can supply the candidate needed by a
         // later highest-prepared report, but never resurrect old-view votes.
         if (message.stage == AgreementStage::PROPOSAL) {
-            s.RememberCandidate(message.entry_bytes, message.candidate);
             if (const auto old{s.pending_proposals.find(message.view)}; old != s.pending_proposals.end() &&
                 old->second.candidate != message.candidate) { error = "leader equivocated in agreement view"; return false; }
+            s.RememberProposalCandidate(message);
         }
         s.Track(message);
         if (message.prepared && message.stage == AgreementStage::COMMIT) s.LearnPrepared(*message.prepared);
@@ -790,6 +839,7 @@ bool FlowMeshAgreement::Retry(std::string& error)
     try {
         // Evidence and anchors can become available again between retries.
         s.usable.clear();
+        s.RetryOldProposalCandidates();
         s.Pump();
         // Retain/rebroadcast the authenticated proposal even on a follower.
         // Its entry bytes are the fetch path for a hidden highest-prepared

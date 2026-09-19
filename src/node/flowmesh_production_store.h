@@ -168,6 +168,9 @@ public:
     /**
      * Re-execute, certify and atomically append the next EXECUTION entry.
      * `next_state_out` is assigned only after the synchronous batch commits.
+     * If supplied, `validation_failure` is reset on entry and populated only
+     * for an execution validation rejection before any durable write. Storage
+     * failures (including uncertain writes) never populate it.
      */
     bool AppendExecution(
         const flowmesh::ProductionEntryCore& entry,
@@ -177,12 +180,14 @@ public:
         const flowmesh::ProductionAnchorContext& anchor_context,
         const uint256& treasury_owner_commitment,
         const flowmesh::DepositVerifier* deposits,
-        flowmesh::FlowMeshState& next_state_out, std::string& error);
+        flowmesh::FlowMeshState& next_state_out, std::string& error,
+        std::optional<flowmesh::ProductionEntryCheck>* validation_failure = nullptr);
 
     /**
      * Validate and atomically append one outgoing-set EPOCH_HANDOFF. The
      * marker remains on the outgoing epoch, making both sets unable to append,
      * until the exact on-chain checkpoint is marked connected.
+     * `validation_failure` has the same pre-write-only meaning as above.
      */
     bool AppendHandoff(
         const flowmesh::ProductionEntryCore& handoff,
@@ -191,7 +196,8 @@ public:
         const flowmesh::ActiveFnBlsSeatSet& next_seats,
         const flowmesh::FlowMeshState& current_state,
         const flowmesh::ProductionAnchorContext& anchor_context,
-        std::string& error);
+        std::string& error,
+        std::optional<flowmesh::ProductionEntryCheck>* validation_failure = nullptr);
 
     /** Record an ordinary connected type-8 checkpoint and advance only the
      * marker's checkpoint head. */

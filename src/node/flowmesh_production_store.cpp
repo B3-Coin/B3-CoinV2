@@ -1604,8 +1604,10 @@ bool FlowMeshProductionStore::AppendExecution(
     const flowmesh::ProductionAnchorContext& anchor_context,
     const uint256& treasury_owner_commitment,
     const flowmesh::DepositVerifier* deposits,
-    flowmesh::FlowMeshState& next_state_out, std::string& error)
+    flowmesh::FlowMeshState& next_state_out, std::string& error,
+    std::optional<flowmesh::ProductionEntryCheck>* validation_failure)
 {
+    if (validation_failure) validation_failure->reset();
     const std::lock_guard<std::mutex> guard{m_mutex};
     if (!m_open || !m_ready) {
         error = "FlowMesh v3 store has not completed startup replay";
@@ -1648,6 +1650,7 @@ bool FlowMeshProductionStore::AppendExecution(
         marker.last_microblock_hash,
         exact_anchors, treasury_owner_commitment, deposits, check)};
     if (!executed) {
+        if (validation_failure) *validation_failure = check;
         error = std::string{"FlowMesh v3 execution entry failed: "} +
                 flowmesh::ProductionEntryCheckName(check);
         return false;
@@ -1693,8 +1696,10 @@ bool FlowMeshProductionStore::AppendHandoff(
     const flowmesh::ActiveFnBlsSeatSet& next_seats,
     const flowmesh::FlowMeshState& current_state,
     const flowmesh::ProductionAnchorContext& anchor_context,
-    std::string& error)
+    std::string& error,
+    std::optional<flowmesh::ProductionEntryCheck>* validation_failure)
 {
+    if (validation_failure) validation_failure->reset();
     const std::lock_guard<std::mutex> guard{m_mutex};
     if (!m_open || !m_ready) {
         error = "FlowMesh v3 store has not completed startup replay";
@@ -1737,6 +1742,7 @@ bool FlowMeshProductionStore::AppendHandoff(
         marker.next_sequence, marker.next_effect_index,
         marker.last_microblock_hash, exact_anchors)};
     if (check != flowmesh::ProductionEntryCheck::OK) {
+        if (validation_failure) *validation_failure = check;
         error = std::string{"FlowMesh v3 handoff failed: "} +
                 flowmesh::ProductionEntryCheckName(check);
         return false;

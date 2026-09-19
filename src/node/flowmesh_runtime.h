@@ -56,6 +56,8 @@ enum class FlowMeshSeatTransitionKind : uint8_t {
 struct FlowMeshSeatTransition {
     FlowMeshSeatTransitionKind kind{FlowMeshSeatTransitionKind::CONTINUE};
     std::optional<flowmesh::ActiveFnBlsSeatSet> next_seats;
+    // Diagnostic only. Never contributes to seat membership or signed data.
+    std::string pause_reason{};
 };
 
 /**
@@ -212,6 +214,9 @@ struct FlowMeshRuntimeDeliverySnapshot {
     uint64_t completion_timeouts{0}, retention_refused{0}, cancelled{0};
     uint64_t event_queue_overflows{0};
     uint64_t receive_deferred{0}, receive_refused{0};
+    // Exact repeats of already verified AGREEMENT bytes consumed at admission
+    // without a committee token, queue slot or second verification.
+    uint64_t agreement_duplicates_coalesced{0};
     size_t pending_objects{0}, pending_bytes{0};
     size_t deferred_objects{0}, deferred_bytes{0};
     std::string current_reason;
@@ -544,7 +549,8 @@ private:
                            const flowmesh::WireMessage& message);
     void HandleCertificate(Market& market, flowmesh::WirePeerId peer,
                            const flowmesh::WireMessage& message,
-                           bool from_catchup = false);
+                           bool from_catchup = false,
+                           bool* reconciliation_deferred = nullptr);
     void HandleGet(Market& market, flowmesh::WirePeerId peer,
                    const flowmesh::WireMessage& message);
     void HandleEntries(Market& market, flowmesh::WirePeerId peer,
@@ -553,7 +559,8 @@ private:
     bool InitializeAgreement(Market& market, const FlowMeshRuntimeMarketConfig& config,
                              std::string& error);
     bool RefreshAgreement(Market& market);
-    bool PublishAgreement(Market& market, const flowmesh::AgreementMessage& message);
+    bool PublishAgreement(Market& market, const flowmesh::AgreementMessage& message,
+                          std::optional<flowmesh::WirePeerId> exclude = std::nullopt);
     void HandleAgreement(Market& market, flowmesh::WirePeerId peer,
                          const flowmesh::WireMessage& message);
     void FinalizeAgreement(Market& market);
@@ -571,12 +578,31 @@ private:
     mutable std::mutex m_market_mutex;
     std::map<flowmesh::MarketId, std::unique_ptr<Market>> m_markets;
 
-    std::mutex m_queue_mutex;
+    mutable std::mutex m_queue_mutex;
     std::condition_variable m_work_cv;
     std::condition_variable m_idle_cv;
     flowmesh::BoundedWireQueue m_queue;
     //! Ready market ids admitted to m_queue; guarded by m_queue_mutex.
     std::set<flowmesh::MarketId> m_admitted_markets;
+    //! Exact AGREEMENT payloads the agreement engine has already verified and
+    //! retained, including the validated wire header. Recovery copies of the
+    //! active slot are paced; certified older slots stay coalesced until FIFO
+    //! eviction. Bounded per market; guarded by m_queue_mutex.
+    struct AgreementQuiet {
+        static constexpr size_t MAX_PAYLOADS{4096};
+        struct Payload {
+            flowmesh::WireHeader header;
+            flowmesh::WireClock::time_point until;
+        };
+        // Advanced only from the worker's certified production history.
+        uint64_t sequence{0};
+        std::map<uint256, Payload> payloads;
+        std::deque<uint256> order;
+        uint64_t coalesced{0};
+    };
+    std::map<flowmesh::MarketId, AgreementQuiet> m_agreement_quiet;
+    void QuietAgreementPayload(const flowmesh::WireHeader& header, const uint256& payload_hash,
+                               flowmesh::WireClock::time_point until);
     //! Negotiated connections only, capped independently of incoming hints.
     std::set<flowmesh::WirePeerId> m_discovery_peers;
     std::deque<flowmesh::WirePeerId> m_removed_peers;

@@ -779,6 +779,19 @@ class FlowMeshRemoteClientTest(FlowMeshIndependentTest):
         row = self.publish_parity_transaction(payout, 9)
         row["valid_withdrawal_txid"] = payout["txid"]
         self.wait_until(lambda: self.wallet_asset(self.client, asset)["confirmed"] == 1, timeout=60)
+        # Construction must refuse this consumed receipt, rather than produce
+        # another withdrawal. This is an RPC/index reuse check, not a claim of
+        # a fresh malicious double-withdrawal block-validation campaign.
+        for node in self.nodes:
+            assert not any(item["effect_id"] == operation["effect_id"]
+                           for item in node.listflowmeshvaultoperations(market_id))
+            assert_raises_rpc_error(-1, "FlowMesh vault effect is already nullified",
+                                    node.createflowmeshvaulttx, operation["effect_id"],
+                                    destination, {"broadcast": False})
+        row["receipt_reuse_constructor_refused"] = True
+        row["payout_destination"] = destination
+        row["payout_asset"] = asset
+        row["payout_asset_amount"] = 1
         self.assert_engine_off()
 
         self.retained_certified_restart(market_id, bid_id)

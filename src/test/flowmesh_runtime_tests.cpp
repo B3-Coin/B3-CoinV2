@@ -16,11 +16,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <vector>
@@ -104,10 +106,16 @@ public:
 
     uint64_t DeliveryGeneration() const override { return m_delivery_generation.load(); }
 
-    void ReconcileOnceWhileChecking(const flowmesh::AnchorRef& anchor)
+    void ReconcileOnceWhileChecking(const flowmesh::AnchorRef& anchor,
+                                   const size_t successful_checks = 0,
+                                   const bool reopen = true,
+                                   const bool invalidate = false)
     {
         std::lock_guard<std::mutex> lock{m_mutex};
         m_reconcile_once_anchor = anchor;
+        m_reconcile_after_checks = successful_checks;
+        m_reconcile_reopen = reopen;
+        m_reconcile_invalidate = invalidate;
     }
 
     int32_t TipHeight() const override
@@ -122,11 +130,17 @@ public:
         {
             std::lock_guard<std::mutex> lock{m_mutex};
             if (m_reconcile_once_anchor && *m_reconcile_once_anchor == anchor) {
-                m_reconcile_once_anchor.reset();
-                ++m_delivery_generation;
-                // One in-handler check sees reconciliation. It has already
-                // finished when the caller next samples the live gate.
-                return false;
+                if (m_reconcile_after_checks != 0) {
+                    --m_reconcile_after_checks;
+                } else {
+                    m_reconcile_once_anchor.reset();
+                    ++m_delivery_generation;
+                    // The gate may have reopened before the caller samples
+                    // it, or remain closed until the test completes the tip.
+                    if (!m_reconcile_reopen) m_reconciled = false;
+                    if (m_reconcile_invalidate) m_canonical[anchor.height] = Filled(0xfa);
+                    return false;
+                }
             }
         }
         const int32_t tip_height{TipHeight()};
@@ -264,13 +278,16 @@ public:
 
     uint256 m_domain;
     flowmesh::AnchorRef m_current{200, Filled(0x74)};
-    std::map<int32_t, uint256> m_canonical{{100, Filled(0x71)},
+    mutable std::map<int32_t, uint256> m_canonical{{100, Filled(0x71)},
                                            {200, Filled(0x74)}};
 
 private:
-    std::atomic<bool> m_reconciled{true};
+    mutable std::atomic<bool> m_reconciled{true};
     mutable std::atomic<uint64_t> m_delivery_generation{0};
     mutable std::optional<flowmesh::AnchorRef> m_reconcile_once_anchor;
+    mutable size_t m_reconcile_after_checks{0};
+    bool m_reconcile_reopen{true};
+    bool m_reconcile_invalidate{false};
     mutable std::mutex m_mutex;
     int32_t m_tip_height{260};
     mutable std::optional<size_t> m_pause_after_checks;
@@ -588,13 +605,140 @@ node::FlowMeshRuntimeMarketConfig MarketConfig(
     };
 }
 
+/** Deterministic model of one independent-network (FMN2) critical channel.
+ *
+ * Every directed link is a FIFO of at most 1,024 items. The receiver offers
+ * the head frame to the real runtime admission queue; a refusal retains that
+ * exact frame, backs off from 100 ms to 1 s and reads nothing queued behind
+ * it, as flowmesh_net.cpp does. Thirty seconds of refusal drops the link's
+ * queue like the production disconnect. Local queueing here is never treated
+ * as receipt: only an ACCEPTED runtime admission counts as delivered. */
+class Fmn2LinkModel
+{
+public:
+    static constexpr size_t PEER_QUEUE_ITEMS{1024};
+    static constexpr auto RETRY_INITIAL{std::chrono::milliseconds{100}};
+    static constexpr auto RETRY_MAX{std::chrono::milliseconds{1000}};
+    static constexpr auto RETRY_TIMEOUT{std::chrono::seconds{30}};
+    using Time = flowmesh::WireClock::time_point;
+
+    explicit Fmn2LinkModel(size_t count) : m_count{count}, m_links(count * count) {}
+
+    node::FlowMeshRelayResult Offer(const size_t from, const node::FlowMeshRuntimeRelay& relay, const Time now)
+    {
+        node::FlowMeshRelayResult result;
+        std::lock_guard<std::mutex> lock{m_mutex};
+        if (m_partitioned) return result; // No connected peer: nothing is queued or admitted.
+        const bool agreement{relay.message.kind == flowmesh::WireMessageKind::AGREEMENT};
+        if (agreement) {
+            ++agreement_publications;
+            max_publications_per_message = std::max(max_publications_per_message,
+                ++m_publications[Hash(relay.message.payload)]);
+        }
+        for (size_t to{0}; to < m_count; ++to) {
+            if (to == from || (relay.peer && *relay.peer != static_cast<int64_t>(to)) ||
+                (relay.exclude_peer && *relay.exclude_peer == static_cast<int64_t>(to))) continue;
+            auto& link{m_links[from * m_count + to]};
+            if (link.queue.size() >= PEER_QUEUE_ITEMS) {
+                ++queue_refusals;
+                result.peers.push_back({static_cast<int64_t>(to), node::FlowMeshDeliveryAdmission::FULL,
+                                        "critical per-peer item limit"});
+                continue;
+            }
+            link.queue.push_back({relay.message, now});
+            max_queue_depth = std::max(max_queue_depth, link.queue.size());
+            result.peers.push_back({static_cast<int64_t>(to), node::FlowMeshDeliveryAdmission::LEGACY_UNTRACKED, {}});
+        }
+        return result;
+    }
+
+    // A disconnect discards every locally queued frame, as production does.
+    void Partition(const bool partitioned)
+    {
+        std::lock_guard<std::mutex> lock{m_mutex};
+        m_partitioned = partitioned;
+        if (partitioned) for (auto& link : m_links) link = Link{};
+    }
+
+    template <typename Runtimes>
+    bool Pump(const Time now, const Runtimes& runtimes)
+    {
+        bool progress{false};
+        for (size_t from{0}; from < m_count; ++from) for (size_t to{0}; to < m_count; ++to) {
+            auto& link{m_links[from * m_count + to]};
+            for (;;) {
+                std::optional<Item> head;
+                {
+                    std::lock_guard<std::mutex> lock{m_mutex};
+                    if (link.queue.empty() || now < link.next_retry) break;
+                    head = link.queue.front();
+                }
+                const auto result{runtimes[to] ? runtimes[to]->EnqueueWireMessage(static_cast<int64_t>(from), head->message)
+                                               : flowmesh::QueueResult::STOPPED};
+                std::lock_guard<std::mutex> lock{m_mutex};
+                const bool agreement{head->message.kind == flowmesh::WireMessageKind::AGREEMENT};
+                if (result == flowmesh::QueueResult::ACCEPTED || result == flowmesh::QueueResult::MALFORMED) {
+                    if (agreement && result == flowmesh::QueueResult::ACCEPTED) {
+                        ++agreement_deliveries;
+                        if (delivered.size() < 16) delivered.push_back({from, to, head->message});
+                        max_agreement_wait = std::max(max_agreement_wait,
+                            std::chrono::duration_cast<std::chrono::milliseconds>(now - head->offered));
+                    }
+                    link.queue.pop_front();
+                    link.pending = false;
+                    link.delay = RETRY_INITIAL;
+                    link.next_retry = {};
+                    progress = true;
+                    continue;
+                }
+                if (result == flowmesh::QueueResult::RATE_LIMITED) ++rate_limited;
+                if (!link.pending) { link.pending = true; link.pending_since = now; link.delay = RETRY_INITIAL; }
+                if (now - link.pending_since >= RETRY_TIMEOUT) {
+                    ++retry_timeouts;
+                    link.queue.clear();
+                    link.pending = false;
+                    break;
+                }
+                link.next_retry = now + link.delay;
+                link.delay = std::min<std::chrono::milliseconds>(RETRY_MAX, link.delay * 2);
+                break;
+            }
+        }
+        return progress;
+    }
+
+    // Read only while every runtime worker is idle.
+    size_t agreement_publications{0}, agreement_deliveries{0}, max_publications_per_message{0};
+    size_t rate_limited{0}, queue_refusals{0}, retry_timeouts{0}, max_queue_depth{0};
+    std::chrono::milliseconds max_agreement_wait{0};
+    struct Delivered { size_t from, to; flowmesh::WireMessage message; };
+    std::vector<Delivered> delivered; // First few admitted AGREEMENT frames.
+
+private:
+    struct Item { flowmesh::WireMessage message; Time offered; };
+    struct Link {
+        std::deque<Item> queue;
+        bool pending{false};
+        Time pending_since{}, next_retry{};
+        std::chrono::milliseconds delay{RETRY_INITIAL};
+    };
+    const size_t m_count;
+    std::mutex m_mutex;
+    bool m_partitioned{false};
+    std::vector<Link> m_links;
+    std::map<uint256, size_t> m_publications;
+};
+
 /** Real runtime/real BLS/real durable stores, with only the existing mock
  * canonical-chain oracle, deterministic clock, and in-memory transport. */
 template <size_t Count = 4>
 class PreagreementRuntimeHarness
 {
 public:
-    explicit PreagreementRuntimeHarness(fs::path directory) : path{std::move(directory)}
+    explicit PreagreementRuntimeHarness(fs::path directory,
+        const std::chrono::milliseconds timeout = std::chrono::seconds{10},
+        const size_t deposit_count = 1, const bool fmn2_links = false)
+        : path{std::move(directory)}, round_timeout{timeout}, use_links{fmn2_links}
     {
         for (auto& chain : chains) {
             chain.m_domain = domain;
@@ -602,19 +746,11 @@ public:
             chain.SetTipHeight(chain.Current().height + flowmesh::FLOWMESH_PRODUCTION_MIN_ANCHOR_DEPTH);
         }
         deposits.required_anchor = chains[0].Current();
-        deposits.entries.emplace(outpoint, flowmesh::DepositInfo{asset, 250, account});
+        for (uint32_t n{0}; n < deposit_count; ++n) {
+            deposits.entries.emplace(COutPoint{outpoint.hash, n}, flowmesh::DepositInfo{asset, 250, account});
+        }
         network.IgnoreHellos();
-        network.SetFilter([this](size_t, size_t, const flowmesh::WireMessage& wire) {
-            if (wire.kind != flowmesh::WireMessageKind::AGREEMENT) return true;
-            const auto message{flowmesh::DecodeAgreementMessage(wire.payload)};
-            if (!message) return false;
-            if (message->stage == flowmesh::AgreementStage::PREPARE) ++prepares;
-            if (message->stage == flowmesh::AgreementStage::COMMIT) ++commits;
-            if (message->stage == flowmesh::AgreementStage::VIEW_CHANGE) ++view_changes;
-            if (message->stage == flowmesh::AgreementStage::DECISION) ++decisions;
-            return !block_commits || (message->stage != flowmesh::AgreementStage::COMMIT &&
-                                      message->stage != flowmesh::AgreementStage::DECISION);
-        });
+        network.SetFilter([this](size_t, size_t, const flowmesh::WireMessage& wire) { return Observe(wire); });
         std::string error;
         try {
             for (size_t i{0}; i < runtimes.size(); ++i) {
@@ -640,6 +776,19 @@ public:
     {
         for (size_t i{0}; i < runtimes.size(); ++i) network.Set(i, nullptr, false);
         for (const auto& runtime : runtimes) if (runtime) runtime->Stop();
+    }
+
+    bool Observe(const flowmesh::WireMessage& wire)
+    {
+        if (wire.kind != flowmesh::WireMessageKind::AGREEMENT) return true;
+        const auto message{flowmesh::DecodeAgreementMessage(wire.payload)};
+        if (!message) return false;
+        if (message->stage == flowmesh::AgreementStage::PREPARE) ++prepares;
+        if (message->stage == flowmesh::AgreementStage::COMMIT) ++commits;
+        if (message->stage == flowmesh::AgreementStage::VIEW_CHANGE) ++view_changes;
+        if (message->stage == flowmesh::AgreementStage::DECISION) ++decisions;
+        return !block_commits || (message->stage != flowmesh::AgreementStage::COMMIT &&
+                                  message->stage != flowmesh::AgreementStage::DECISION);
     }
 
     fs::path StorePath(size_t i) const { return path / fs::PathFromString("operator_" + std::to_string(i)); }
@@ -671,10 +820,14 @@ public:
         config.chain = &chain;
         config.keys = &keys[i];
         config.clock = &clocks[i];
-        config.round_timeout = std::chrono::seconds{10};
+        config.round_timeout = round_timeout;
         config.relay = [this, i](node::FlowMeshRuntimeRelay relay) {
             if (block_commits && (relay.message.kind == flowmesh::WireMessageKind::ATTESTATION ||
                                  relay.message.kind == flowmesh::WireMessageKind::PROPOSAL)) ++premature_v1;
+            if (use_links) {
+                if (relay.message.kind == flowmesh::WireMessageKind::HELLO || !Observe(relay.message)) return LegacyRelayResult();
+                return links.Offer(i, relay, clocks[i].Now());
+            }
             network.Relay(i, std::move(relay));
             // This transport admits an in-memory legacy delivery, not a claim
             // of peer verification. No socket-completion scheduler is used.
@@ -730,7 +883,36 @@ public:
         BOOST_REQUIRE(AllAt(sequence));
     }
 
+    // FMN2-link mode: advance every clock together, let each blocked channel
+    // retry, and schedule the production 250 ms runtime tick.
+    void Step(const std::chrono::milliseconds advance = std::chrono::milliseconds{50})
+    {
+        Drain();
+        for (auto& clock : clocks) clock.m_now += advance;
+        elapsed += advance;
+        const auto deliver = [this] {
+            for (size_t pass{0}; pass < 64 && links.Pump(clocks[0].Now(), runtimes); ++pass) Drain();
+        };
+        deliver();
+        if (elapsed.count() % 250 == 0) {
+            for (const auto& runtime : runtimes) if (runtime) runtime->NotifyTick();
+            Drain();
+            deliver();
+        }
+    }
+
+    bool StepUntil(uint64_t sequence, const std::chrono::milliseconds limit)
+    {
+        const auto start{elapsed};
+        while (!AllAt(sequence) && elapsed - start < limit) Step();
+        return AllAt(sequence);
+    }
+
     const fs::path path;
+    const std::chrono::milliseconds round_timeout;
+    const bool use_links;
+    std::chrono::milliseconds elapsed{0};
+    Fmn2LinkModel links{Count};
     const uint256 domain{Filled(0x2e)};
     const modern::AssetId asset{Filled(0x4e)};
     const flowmesh::MarketId market{*flowmesh::ComputeFlowMeshMarketId(domain, asset)};
@@ -916,6 +1098,19 @@ void CheckExactDeliveryRetry(const std::vector<node::FlowMeshRuntimeRelay>& orig
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_runtime_tests, BasicTestingSetup)
+
+BOOST_AUTO_TEST_CASE(idle_market_reports_required_chain_pause_without_refresh_spam)
+{
+    DeliveryRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_idle_pause_trace",
+        node::FlowMeshDeliveryAdmission::ADMITTED, false};
+    f.chain.SetTransition(f.seats.seats.market_id, node::FlowMeshSeatTransitionKind::PAUSED);
+    for (unsigned i{0}; i != 3; ++i) f.Tick(std::chrono::milliseconds{100});
+    const auto snapshot{f.Snapshot()};
+    BOOST_CHECK_EQUAL(std::count_if(snapshot.events.begin(), snapshot.events.end(), [](const auto& event) {
+        return event.stage == "proposer_wait" && event.reason.starts_with("seat_transition_paused");
+    }), 1);
+    BOOST_CHECK(f.Sent().empty());
+}
 
 BOOST_AUTO_TEST_CASE(delivery_trace_matches_real_returning_seat_only_after_remote_acceptance)
 {
@@ -1213,6 +1408,440 @@ BOOST_AUTO_TEST_CASE(critical_proposal_generation_change_survives_reopened_gate)
     recipient.CheckLock(original);
     BOOST_CHECK_EQUAL(recipient.Snapshot().certificate_formed, 0U);
     BOOST_CHECK_EQUAL(recipient.Snapshot().durably_applied, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(critical_certificate_append_retries_reconciliation_without_losing_lock)
+{
+    for (const bool reopen : {false, true}) {
+        DeliveryRuntimeFixture f{m_args.GetDataDirBase() /
+            (reopen ? "flowmesh_append_reopened" : "flowmesh_append_paused"),
+            node::FlowMeshDeliveryAdmission::ADMITTED};
+        const auto original{f.Sent()};
+        const auto proposal{std::find_if(original.begin(), original.end(), [](const auto& relay) {
+            return relay.message.kind == flowmesh::WireMessageKind::PROPOSAL;
+        })};
+        BOOST_REQUIRE(proposal != original.end());
+        const auto decoded{flowmesh::DecodeProductionProposalPayload(proposal->message.payload)};
+        BOOST_REQUIRE(decoded);
+        const auto certificate{Certify(decoded->entry, f.seats)};
+        const auto payload{flowmesh::EncodeProductionCertifiedPayload(
+            {decoded->entry, certificate}, f.seats.seats.Size())};
+        BOOST_REQUIRE(payload);
+        const flowmesh::WireMessage message{flowmesh::WireMessageKind::CERTIFICATE,
+            proposal->message.header, *payload};
+
+        // The candidate already exists. Its first anchor check is the commit
+        // precheck; reject the second, inside the real store's re-execution.
+        // The outer current-anchor admission uses a different anchor.
+        BOOST_REQUIRE(!(decoded->entry.anchor == f.chain.Current()));
+        f.chain.ReconcileOnceWhileChecking(decoded->entry.anchor, 1, reopen);
+        BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER, message) ==
+                      flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+        BOOST_CHECK_EQUAL(f.chain.DeliveryGeneration(), 1U);
+        BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+        BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 0U);
+        BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 0U);
+        BOOST_CHECK_EQUAL(f.Snapshot().deferred_objects, 1U);
+        const auto paused{f.Snapshot()};
+        BOOST_CHECK(std::any_of(paused.events.begin(), paused.events.end(), [](const auto& event) {
+            return event.stage == "publication_deferred";
+        }));
+        f.CheckLock(original);
+        std::string error;
+        std::optional<node::FlowMeshProductionStore::Marker> marker;
+        BOOST_REQUIRE(f.store.ReadMarker(marker, error));
+        BOOST_REQUIRE(marker);
+        BOOST_CHECK_EQUAL(marker->next_sequence, 0U);
+        std::optional<node::StoredProductionEntry> stored;
+        // ReadEntry rejects an index at/above the durable head; an absent
+        // future entry is not a successful optional lookup in this API.
+        BOOST_REQUIRE(!f.store.ReadEntry(0, f.seats.seats, stored, error));
+        BOOST_CHECK_EQUAL(error, "FlowMesh v3 entry request is outside the active database");
+        BOOST_CHECK(!stored);
+        error.clear();
+
+        f.chain.SetReconciled(true);
+        f.Tick(std::chrono::milliseconds{250});
+        BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+        BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 1U);
+        BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 1U);
+        BOOST_CHECK_EQUAL(f.Snapshot().deferred_objects, 0U);
+        BOOST_REQUIRE(f.store.ReadEntry(0, f.seats.seats, stored, error));
+        BOOST_REQUIRE(stored);
+        BOOST_CHECK(stored->entry.GetHash() == decoded->entry.GetHash());
+        BOOST_CHECK(flowmesh::CheckProductionEntryCertificate(stored->entry, f.seats.seats,
+                                                              stored->certificate) ==
+                    flowmesh::BlsCertificateCheck::OK);
+        std::optional<uint256> locked;
+        BOOST_REQUIRE(f.store.ReadLock({f.seats.seats.epoch, 0}, locked, error));
+        BOOST_REQUIRE(locked);
+        BOOST_CHECK(*locked == decoded->entry.GetHash());
+        // A later exact certificate replay never appends the entry twice.
+        BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER, message) ==
+                      flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+        BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 1U);
+        BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 1U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(catchup_first_certificate_append_retries_reconciliation_without_new_gossip)
+{
+    for (const bool reopen : {false, true}) {
+        DeliveryRuntimeFixture f{m_args.GetDataDirBase() /
+            (reopen ? "flowmesh_catchup_append_reopened" : "flowmesh_catchup_append_paused"),
+            node::FlowMeshDeliveryAdmission::ADMITTED};
+        const auto original{f.Sent()};
+        const auto proposal{std::find_if(original.begin(), original.end(), [](const auto& relay) {
+            return relay.message.kind == flowmesh::WireMessageKind::PROPOSAL;
+        })};
+        BOOST_REQUIRE(proposal != original.end());
+        const auto decoded{flowmesh::DecodeProductionProposalPayload(proposal->message.payload)};
+        BOOST_REQUIRE(decoded);
+        flowmesh::ProductionEpochGate gate{f.domain, f.market, f.seats.seats};
+        flowmesh::ProductionEntryCheck check;
+        const auto genesis{flowmesh::ExecuteProductionEntry(
+            f.initial, decoded->entry, f.domain, f.market, f.seats.seats, gate,
+            0, 0, {}, {f.chain.TipHeight(), std::nullopt, &f.chain},
+            Filled(0x6b), nullptr, check)};
+        BOOST_REQUIRE(genesis);
+        const auto next{flowmesh::BuildProductionExecutionEntry(
+            genesis->next_state, f.domain, f.market, f.seats.seats, gate,
+            1, decoded->entry.effect_count, decoded->entry.GetHash(), f.chain.Current(),
+            {f.chain.TipHeight(), decoded->entry.anchor, &f.chain}, Filled(0x6b), {}, nullptr, check)};
+        BOOST_REQUIRE(next);
+        const auto first_payload{flowmesh::EncodeProductionCertifiedPayload(
+            {decoded->entry, Certify(decoded->entry, f.seats)}, f.seats.seats.Size())};
+        const auto next_payload{flowmesh::EncodeProductionCertifiedPayload(
+            {next->entry, Certify(next->entry, f.seats)}, f.seats.seats.Size())};
+        BOOST_REQUIRE(first_payload);
+        BOOST_REQUIRE(next_payload);
+        const auto page{flowmesh::EncodeCatchupEntries(
+            std::vector<std::vector<unsigned char>>{*first_payload, *next_payload})};
+        BOOST_REQUIRE(page);
+        f.runtime->RequestCatchup(DeliveryRuntimeFixture::PEER, f.market);
+        BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+        BOOST_REQUIRE_EQUAL(f.Requests().size(), 1U);
+        const auto request{f.Requests().front()};
+
+        f.chain.ReconcileOnceWhileChecking(decoded->entry.anchor, 1, reopen);
+        BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER,
+            {flowmesh::WireMessageKind::ENTRIES, request.message.header, *page}) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+        BOOST_CHECK_EQUAL(f.chain.DeliveryGeneration(), 1U);
+        BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 0U);
+        BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+        BOOST_CHECK_EQUAL(f.Snapshot().catchup_partial_pages, 1U);
+        BOOST_CHECK_EQUAL(f.Snapshot().deferred_objects, 1U);
+        f.CheckLock(original);
+
+        // No hello, new attestation, reconnect or external RequestCatchup can
+        // rescue this page. Its exact first certificate must survive locally.
+        f.chain.SetReconciled(true);
+        f.Tick(std::chrono::milliseconds{250});
+        BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 1U);
+        BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 1U);
+        BOOST_CHECK_EQUAL(f.Snapshot().deferred_objects, 0U);
+        BOOST_CHECK_EQUAL(f.Requests().size(), 1U);
+        f.Tick(std::chrono::milliseconds{14749});
+        BOOST_CHECK_EQUAL(f.Requests().size(), 1U); // Existing 15-second cooldown is preserved.
+        f.Tick(std::chrono::milliseconds{250}); // Next bounded recovery pass after the cooldown.
+        BOOST_REQUIRE_EQUAL(f.Requests().size(), 2U);
+        const auto retry{f.Requests().back()};
+        BOOST_CHECK_EQUAL(retry.message.header.sequence, 1U);
+        BOOST_CHECK(retry.message.payload == request.message.payload); // Same bounded request limits.
+        const auto remainder{flowmesh::EncodeCatchupEntries(
+            std::vector<std::vector<unsigned char>>{*next_payload})};
+        BOOST_REQUIRE(remainder);
+        BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER,
+            {flowmesh::WireMessageKind::ENTRIES, retry.message.header, *remainder}) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+        BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 2U);
+        BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 2U);
+        BOOST_CHECK(f.runtime->MarketStatus(f.market)->last_microblock_hash == next->entry.GetHash());
+        BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(catchup_first_certificate_early_checks_retain_retry_ownership)
+{
+    DeliveryRuntimeFixture producer{m_args.GetDataDirBase() / "flowmesh_catchup_early_producer",
+                                   node::FlowMeshDeliveryAdmission::ADMITTED};
+    const auto original{producer.Sent()};
+    const auto proposal{std::find_if(original.begin(), original.end(), [](const auto& relay) {
+        return relay.message.kind == flowmesh::WireMessageKind::PROPOSAL;
+    })};
+    BOOST_REQUIRE(proposal != original.end());
+    const auto decoded{flowmesh::DecodeProductionProposalPayload(proposal->message.payload)};
+    BOOST_REQUIRE(decoded);
+    flowmesh::ProductionEpochGate gate{producer.domain, producer.market, producer.seats.seats};
+    flowmesh::ProductionEntryCheck check;
+    const auto genesis{flowmesh::ExecuteProductionEntry(
+        producer.initial, decoded->entry, producer.domain, producer.market, producer.seats.seats, gate,
+        0, 0, {}, {producer.chain.TipHeight(), std::nullopt, &producer.chain},
+        Filled(0x6b), nullptr, check)};
+    BOOST_REQUIRE(genesis);
+    const auto next{flowmesh::BuildProductionExecutionEntry(
+        genesis->next_state, producer.domain, producer.market, producer.seats.seats, gate,
+        1, decoded->entry.effect_count, decoded->entry.GetHash(), producer.chain.Current(),
+        {producer.chain.TipHeight(), decoded->entry.anchor, &producer.chain}, Filled(0x6b), {}, nullptr, check)};
+    BOOST_REQUIRE(next);
+    const auto first_payload{flowmesh::EncodeProductionCertifiedPayload(
+        {decoded->entry, Certify(decoded->entry, producer.seats)}, producer.seats.seats.Size())};
+    const auto next_payload{flowmesh::EncodeProductionCertifiedPayload(
+        {next->entry, Certify(next->entry, producer.seats)}, producer.seats.seats.Size())};
+    BOOST_REQUIRE(first_payload);
+    BOOST_REQUIRE(next_payload);
+    const auto page{flowmesh::EncodeCatchupEntries(
+        std::vector<std::vector<unsigned char>>{*first_payload, *next_payload})};
+    BOOST_REQUIRE(page);
+    for (const bool cached : {false, true}) for (const bool reopen : {false, true}) {
+        DeliveryRuntimeFixture f{m_args.GetDataDirBase() / fs::PathFromString(
+            "flowmesh_catchup_early_" + std::to_string(cached) + "_" + std::to_string(reopen)),
+            node::FlowMeshDeliveryAdmission::ADMITTED, cached};
+        f.runtime->RequestCatchup(DeliveryRuntimeFixture::PEER, f.market);
+        BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+        BOOST_REQUIRE_EQUAL(f.Requests().size(), 1U);
+        const auto request{f.Requests().front()};
+        BOOST_REQUIRE(!(decoded->entry.anchor == f.chain.Current()));
+        // An absent candidate hits EvaluateCandidate; an already cached one
+        // hits CommitCertified's precheck. Neither reaches the append API's
+        // typed rejection, and the gate can reopen before a final sample.
+        f.chain.ReconcileOnceWhileChecking(decoded->entry.anchor, 0, reopen);
+        BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER,
+            {flowmesh::WireMessageKind::ENTRIES, request.message.header, *page}) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+        BOOST_CHECK_EQUAL(f.chain.DeliveryGeneration(), 1U);
+        BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 0U);
+        BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+        const auto interrupted{f.Snapshot()};
+        BOOST_CHECK_EQUAL(interrupted.durably_applied, 0U);
+        BOOST_CHECK_EQUAL(interrupted.deferred_objects, 1U);
+        BOOST_CHECK_EQUAL(interrupted.deferred_bytes,
+                          first_payload->size() + flowmesh::FLOWMESH_WIRE_HEADER_SIZE);
+        BOOST_CHECK(std::any_of(interrupted.events.begin(), interrupted.events.end(), [](const auto& event) {
+            return event.stage == "certificate_verified";
+        }));
+        BOOST_CHECK(std::none_of(interrupted.events.begin(), interrupted.events.end(), [](const auto& event) {
+            return event.stage == "publication_started";
+        }));
+        std::string error;
+        std::optional<uint256> locked;
+        BOOST_REQUIRE(f.store.ReadLock({f.seats.seats.epoch, 0}, locked, error));
+        BOOST_CHECK_EQUAL(locked.has_value(), cached);
+        if (locked) BOOST_CHECK(*locked == decoded->entry.GetHash());
+        std::optional<node::FlowMeshProductionStore::Marker> marker;
+        BOOST_REQUIRE(f.store.ReadMarker(marker, error));
+        BOOST_REQUIRE(marker);
+        BOOST_CHECK_EQUAL(marker->next_sequence, 0U);
+
+        // No new certificate, hello, vote or reconnect provides recovery.
+        f.chain.SetReconciled(true);
+        f.Tick(std::chrono::milliseconds{250});
+        BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 1U);
+        BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 1U);
+        BOOST_CHECK_EQUAL(f.Snapshot().deferred_objects, 0U);
+        std::optional<node::StoredProductionEntry> stored;
+        BOOST_REQUIRE(f.store.ReadEntry(0, f.seats.seats, stored, error));
+        BOOST_REQUIRE(stored);
+        BOOST_CHECK(flowmesh::EncodeProductionEntry(stored->entry) ==
+                    flowmesh::EncodeProductionEntry(decoded->entry));
+        BOOST_CHECK(flowmesh::CheckProductionEntryCertificate(stored->entry, f.seats.seats,
+                                                              stored->certificate) == flowmesh::BlsCertificateCheck::OK);
+        f.Tick(std::chrono::milliseconds{14749});
+        BOOST_CHECK_EQUAL(f.Requests().size(), 1U);
+        f.Tick(std::chrono::milliseconds{250});
+        BOOST_REQUIRE_EQUAL(f.Requests().size(), 2U);
+        const auto retry{f.Requests().back()};
+        BOOST_CHECK_EQUAL(retry.message.header.sequence, 1U);
+        BOOST_CHECK(retry.message.payload == request.message.payload);
+        const auto remainder{flowmesh::EncodeCatchupEntries(
+            std::vector<std::vector<unsigned char>>{*next_payload})};
+        BOOST_REQUIRE(remainder);
+        BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER,
+            {flowmesh::WireMessageKind::ENTRIES, retry.message.header, *remainder}) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+        BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 2U);
+        BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 2U);
+        BOOST_CHECK(f.runtime->MarketStatus(f.market)->last_microblock_hash == next->entry.GetHash());
+        BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER,
+            {flowmesh::WireMessageKind::CERTIFICATE, proposal->message.header, *first_payload}) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+        BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 2U);
+        BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(catchup_invalid_certificate_during_closed_gate_has_no_retry_owner)
+{
+    DeliveryRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_catchup_early_invalid",
+                            node::FlowMeshDeliveryAdmission::ADMITTED};
+    const auto original{f.Sent()};
+    const auto proposal{std::find_if(original.begin(), original.end(), [](const auto& relay) {
+        return relay.message.kind == flowmesh::WireMessageKind::PROPOSAL;
+    })};
+    BOOST_REQUIRE(proposal != original.end());
+    const auto decoded{flowmesh::DecodeProductionProposalPayload(proposal->message.payload)};
+    BOOST_REQUIRE(decoded);
+    auto payload{flowmesh::EncodeProductionCertifiedPayload(
+        {decoded->entry, Certify(decoded->entry, f.seats)}, f.seats.seats.Size())};
+    BOOST_REQUIRE(payload);
+    payload->back() ^= 1;
+    const auto page{flowmesh::EncodeCatchupEntries(std::vector<std::vector<unsigned char>>{*payload})};
+    BOOST_REQUIRE(page);
+    f.runtime->RequestCatchup(DeliveryRuntimeFixture::PEER, f.market);
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    BOOST_REQUIRE_EQUAL(f.Requests().size(), 1U);
+    const auto request{f.Requests().front()};
+    f.chain.SetReconciled(false);
+    BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER,
+        {flowmesh::WireMessageKind::ENTRIES, request.message.header, *page}) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    const auto refused{f.Snapshot()};
+    BOOST_CHECK_EQUAL(refused.receive_deferred, 0U);
+    BOOST_CHECK_EQUAL(refused.deferred_objects, 0U);
+    BOOST_CHECK_EQUAL(refused.durably_applied, 0U);
+    BOOST_CHECK(std::none_of(refused.events.begin(), refused.events.end(), [](const auto& event) {
+        return event.stage == "certificate_verified" || event.stage == "certificate_validation_deferred";
+    }));
+    f.chain.SetReconciled(true);
+    f.Tick(std::chrono::seconds{16});
+    BOOST_CHECK_EQUAL(f.Requests().size(), 1U);
+    BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 0U);
+    BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+    f.CheckLock(original);
+}
+
+BOOST_AUTO_TEST_CASE(catchup_conflicting_decision_during_closed_gate_has_no_retry_owner)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "flowmesh_catchup_early_conflict"};
+    f.block_commits = false;
+    // Permit preliminary agreement, then hold final V1 shares so its durable
+    // decision and permanent lock exist before the certified append.
+    f.network.SetFilter([](size_t, size_t, const flowmesh::WireMessage& wire) {
+        return wire.kind == flowmesh::WireMessageKind::AGREEMENT;
+    });
+    f.Tick();
+    BOOST_REQUIRE(f.AllAt(0));
+    std::string error;
+    std::optional<node::StoredLockedProductionCandidate> locked;
+    BOOST_REQUIRE(f.stores[0]->ReadLockedCandidate({0, 0}, locked, error));
+    BOOST_REQUIRE(locked);
+    auto conflicting{locked->entry};
+    conflicting.anchor = f.chains[0].Current();
+    BOOST_REQUIRE(conflicting.GetHash() != locked->entry.GetHash());
+    const auto payload{flowmesh::EncodeProductionCertifiedPayload(
+        {conflicting, Certify(conflicting, f.seats)}, f.seats.seats.Size())};
+    BOOST_REQUIRE(payload);
+    const auto page{flowmesh::EncodeCatchupEntries(std::vector<std::vector<unsigned char>>{*payload})};
+    BOOST_REQUIRE(page);
+    f.runtimes[0]->RequestCatchup(1, f.market);
+    f.Drain();
+    f.chains[0].SetReconciled(false);
+    BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(1,
+        {flowmesh::WireMessageKind::ENTRIES,
+         {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, 0, 0}, *page}) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK(f.runtimes[0]->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::CERTIFICATE_CONFLICT);
+    BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->next_sequence, 0U);
+    const auto snapshot{f.runtimes[0]->DeliverySnapshots(f.market).front()};
+    BOOST_CHECK_EQUAL(snapshot.receive_deferred, 0U);
+    BOOST_CHECK_EQUAL(snapshot.deferred_objects, 0U);
+    std::optional<uint256> retained;
+    BOOST_REQUIRE(f.stores[0]->ReadLock({0, 0}, retained, error));
+    BOOST_CHECK(retained == locked->entry.GetHash());
+}
+
+BOOST_AUTO_TEST_CASE(catchup_invalid_certificate_does_not_earn_reconciliation_retry)
+{
+    DeliveryRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_catchup_append_invalid",
+                            node::FlowMeshDeliveryAdmission::ADMITTED};
+    const auto original{f.Sent()};
+    const auto proposal{std::find_if(original.begin(), original.end(), [](const auto& relay) {
+        return relay.message.kind == flowmesh::WireMessageKind::PROPOSAL;
+    })};
+    BOOST_REQUIRE(proposal != original.end());
+    const auto decoded{flowmesh::DecodeProductionProposalPayload(proposal->message.payload)};
+    BOOST_REQUIRE(decoded);
+    auto payload{flowmesh::EncodeProductionCertifiedPayload(
+        {decoded->entry, Certify(decoded->entry, f.seats)}, f.seats.seats.Size())};
+    BOOST_REQUIRE(payload);
+    payload->back() ^= 1; // Framed but not a valid certificate for this entry.
+    const auto page{flowmesh::EncodeCatchupEntries(
+        std::vector<std::vector<unsigned char>>{*payload})};
+    BOOST_REQUIRE(page);
+    f.runtime->RequestCatchup(DeliveryRuntimeFixture::PEER, f.market);
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    BOOST_REQUIRE_EQUAL(f.Requests().size(), 1U);
+    BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER,
+        {flowmesh::WireMessageKind::ENTRIES, f.Requests().front().message.header, *page}) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    f.Tick(std::chrono::seconds{16});
+    BOOST_CHECK_EQUAL(f.Requests().size(), 1U);
+    BOOST_CHECK_EQUAL(f.Snapshot().deferred_objects, 0U);
+    BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 0U);
+    BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 0U);
+    BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+}
+
+BOOST_AUTO_TEST_CASE(critical_certificate_append_reconciliation_does_not_mask_invalid_anchor)
+{
+    DeliveryRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_append_invalid_anchor",
+                            node::FlowMeshDeliveryAdmission::ADMITTED};
+    const auto original{f.Sent()};
+    const auto proposal{std::find_if(original.begin(), original.end(), [](const auto& relay) {
+        return relay.message.kind == flowmesh::WireMessageKind::PROPOSAL;
+    })};
+    BOOST_REQUIRE(proposal != original.end());
+    const auto decoded{flowmesh::DecodeProductionProposalPayload(proposal->message.payload)};
+    BOOST_REQUIRE(decoded);
+    const auto payload{flowmesh::EncodeProductionCertifiedPayload(
+        {decoded->entry, Certify(decoded->entry, f.seats)}, f.seats.seats.Size())};
+    BOOST_REQUIRE(payload);
+    f.chain.ReconcileOnceWhileChecking(decoded->entry.anchor, 1, true, true);
+    BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER,
+        {flowmesh::WireMessageKind::CERTIFICATE, proposal->message.header, *payload}) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    BOOST_CHECK_EQUAL(f.chain.DeliveryGeneration(), 1U);
+    BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::ANCHOR_INVALIDATED);
+    BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 0U);
+    BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 0U);
+    std::string error;
+    std::optional<uint256> locked;
+    BOOST_REQUIRE(f.store.ReadLock({f.seats.seats.epoch, 0}, locked, error));
+    BOOST_REQUIRE(locked);
+    BOOST_CHECK(*locked == decoded->entry.GetHash());
+}
+
+BOOST_AUTO_TEST_CASE(critical_certificate_append_store_failure_still_halts)
+{
+    DeliveryRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_append_store_failure",
+                            node::FlowMeshDeliveryAdmission::ADMITTED};
+    const auto original{f.Sent()};
+    const auto proposal{std::find_if(original.begin(), original.end(), [](const auto& relay) {
+        return relay.message.kind == flowmesh::WireMessageKind::PROPOSAL;
+    })};
+    BOOST_REQUIRE(proposal != original.end());
+    const auto decoded{flowmesh::DecodeProductionProposalPayload(proposal->message.payload)};
+    BOOST_REQUIRE(decoded);
+    const auto payload{flowmesh::EncodeProductionCertifiedPayload(
+        {decoded->entry, Certify(decoded->entry, f.seats)}, f.seats.seats.Size())};
+    BOOST_REQUIRE(payload);
+    // A failed strict reopen leaves this real store unavailable. The runtime
+    // still holds its independently validated candidate, so append must stop.
+    std::string error;
+    BOOST_REQUIRE(!f.store.OpenForMarket(Filled(0xfe), f.market, f.seats.seats,
+                                         f.initial.Root(), error));
+    BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER,
+        {flowmesh::WireMessageKind::CERTIFICATE, proposal->message.header, *payload}) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::STORE_FAILURE);
+    BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 0U);
+    BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 0U);
+    BOOST_CHECK_EQUAL(f.Snapshot().deferred_objects, 0U);
 }
 
 BOOST_AUTO_TEST_CASE(critical_durable_certificate_retries_after_candidate_cleanup_and_disarm)
@@ -5812,6 +6441,369 @@ BOOST_AUTO_TEST_CASE(preagreement_runtime_divergent_preliminary_views_heal_witho
     }
 }
 
+// Qualification Run03/Run04: a withdrawal that followed other certified slots
+// never reached a COMMIT certificate. Exact duplicates of already certified
+// slots had spent each receiver's per-peer committee admission (burst 32,
+// 8 messages/second) and held the FMN2 channel, so the next view-zero
+// proposal was admitted after its two-second round had already expired.
+// Limits, round timeout and quorum here are the unchanged production values.
+BOOST_AUTO_TEST_CASE(preagreement_paced_slots_survive_fmn2_committee_admission)
+{
+    constexpr uint32_t SLOTS{12};
+    constexpr auto CADENCE{std::chrono::milliseconds{1250}};
+    constexpr auto OBSERVATION{std::chrono::seconds{10}};
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_fmn2_admission",
+                                 std::chrono::seconds{2}, SLOTS, true};
+    f.block_commits = false;
+    BOOST_REQUIRE(f.StepUntil(1, OBSERVATION));
+    for (uint32_t slot{0}; slot < SLOTS; ++slot) {
+        const auto submitted{f.elapsed};
+        for (const auto& runtime : f.runtimes) {
+            BOOST_REQUIRE(runtime->SubmitLocalAction(f.market, Deposit(COutPoint{f.outpoint.hash, slot})) ==
+                          flowmesh::QueueResult::ACCEPTED);
+        }
+        const bool certified{f.StepUntil(slot + 2, OBSERVATION)};
+        f.Drain();
+        BOOST_TEST_MESSAGE("slot " << slot + 1 << " certified=" << certified
+            << " ms=" << (f.elapsed - submitted).count()
+            << " view_changes=" << f.view_changes.load()
+            << " agreement_publications=" << f.links.agreement_publications
+            << " agreement_deliveries=" << f.links.agreement_deliveries
+            << " max_publications_per_message=" << f.links.max_publications_per_message
+            << " rate_limited=" << f.links.rate_limited
+            << " max_agreement_wait_ms=" << f.links.max_agreement_wait.count()
+            << " max_queue_depth=" << f.links.max_queue_depth
+            << " queue_refusals=" << f.links.queue_refusals);
+        // Every replica durably applied this slot; local queueing is not used
+        // as evidence of delivery or certification.
+        BOOST_REQUIRE_MESSAGE(certified, "slot " << slot + 1 << " was not certified by every replica within the observation window");
+        while (f.elapsed - submitted < CADENCE) f.Step();
+    }
+    f.Drain();
+    // No round may expire merely because exact duplicates were queued first.
+    BOOST_CHECK_EQUAL(f.view_changes.load(), 0U);
+    BOOST_CHECK_LT(f.links.max_agreement_wait.count(), std::chrono::milliseconds{f.round_timeout}.count());
+    BOOST_CHECK_EQUAL(f.links.queue_refusals, 0U);
+    BOOST_CHECK_EQUAL(f.links.retry_timeouts, 0U);
+    for (size_t i{0}; i < 4; ++i) {
+        const auto state{f.runtimes[i]->StateSnapshot(f.market)};
+        BOOST_REQUIRE(state);
+        BOOST_CHECK_EQUAL(state->LedgerView().Available(f.account, f.asset), 250 * int64_t{SLOTS});
+    }
+}
+
+// Run04's failing slot: all four operators left view zero before its proposal
+// was admitted, and no later view completed. Force that state with a complete
+// disconnect longer than one round, reconnect, and require the justified later
+// view to decide, certify and be durably applied by every replica.
+BOOST_AUTO_TEST_CASE(preagreement_view_change_recovers_under_fmn2_committee_admission)
+{
+    constexpr auto OBSERVATION{std::chrono::seconds{10}};
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_fmn2_view_change",
+                                 std::chrono::seconds{2}, 3, true};
+    f.block_commits = false;
+    BOOST_REQUIRE(f.StepUntil(1, OBSERVATION));
+    const auto submit = [&](uint32_t n) {
+        for (const auto& runtime : f.runtimes) {
+            BOOST_REQUIRE(runtime->SubmitLocalAction(f.market, Deposit(COutPoint{f.outpoint.hash, n})) ==
+                          flowmesh::QueueResult::ACCEPTED);
+        }
+    };
+    submit(0);
+    BOOST_REQUIRE(f.StepUntil(2, OBSERVATION));
+
+    f.links.Partition(true);
+    submit(1);
+    const auto disconnected{f.elapsed};
+    while (f.elapsed - disconnected < std::chrono::milliseconds{2500}) f.Step();
+    f.Drain();
+    BOOST_REQUIRE(f.AllAt(2));
+    for (const auto& runtime : f.runtimes) BOOST_CHECK_GE(runtime->MarketStatus(f.market)->round, 1U);
+    BOOST_REQUIRE_GT(f.view_changes.load(), 0U);
+
+    f.links.Partition(false);
+    const auto reconnected{f.elapsed};
+    const bool certified{f.StepUntil(3, OBSERVATION)};
+    f.Drain();
+    BOOST_TEST_MESSAGE("view-change slot certified=" << certified
+        << " ms_after_reconnect=" << (f.elapsed - reconnected).count()
+        << " view_changes=" << f.view_changes.load()
+        << " agreement_publications=" << f.links.agreement_publications
+        << " max_publications_per_message=" << f.links.max_publications_per_message
+        << " rate_limited=" << f.links.rate_limited
+        << " max_agreement_wait_ms=" << f.links.max_agreement_wait.count()
+        << " max_queue_depth=" << f.links.max_queue_depth);
+    BOOST_REQUIRE_MESSAGE(certified, "justified later view was not certified by every replica after reconnect");
+    // The slot after a view change must be ordinary again.
+    submit(2);
+    const auto next{f.elapsed};
+    BOOST_REQUIRE(f.StepUntil(4, OBSERVATION));
+    BOOST_CHECK_LT((f.elapsed - next).count(), std::chrono::milliseconds{f.round_timeout}.count());
+    BOOST_CHECK_LT(f.links.max_agreement_wait.count(), std::chrono::milliseconds{f.round_timeout}.count());
+    BOOST_CHECK_EQUAL(f.links.queue_refusals, 0U);
+    const auto agreed{f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash};
+    for (size_t i{0}; i < 4; ++i) {
+        BOOST_CHECK(f.runtimes[i]->MarketStatus(f.market)->last_microblock_hash == agreed);
+        BOOST_CHECK(f.runtimes[i]->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+        const auto state{f.runtimes[i]->StateSnapshot(f.market)};
+        BOOST_REQUIRE(state);
+        BOOST_CHECK_EQUAL(state->LedgerView().Available(f.account, f.asset), 750);
+    }
+}
+
+// Only identical, already verified bytes are consumed at admission, and only
+// until their recovery forward is due. They spend no committee admission;
+// changed bytes and later recovery copies still take the ordinary path.
+BOOST_AUTO_TEST_CASE(preagreement_exact_verified_duplicates_do_not_spend_committee_admission)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_fmn2_duplicates",
+                                 std::chrono::seconds{2}, 1, true};
+    for (size_t step{0}; step < 40 && f.links.delivered.empty(); ++step) f.Step();
+    f.Drain();
+    BOOST_REQUIRE(!f.links.delivered.empty());
+    const auto sample{f.links.delivered.front()};
+    auto& receiver{*f.runtimes[sample.to]};
+    const auto coalesced = [&] {
+        const auto snapshots{receiver.DeliverySnapshots(f.market)};
+        BOOST_REQUIRE_EQUAL(snapshots.size(), 1U);
+        return snapshots.front().agreement_duplicates_coalesced;
+    };
+    const auto before{coalesced()};
+    // More exact copies than the unchanged 32-message committee burst.
+    for (size_t n{0}; n < 40; ++n) {
+        BOOST_REQUIRE(receiver.EnqueueWireMessage(static_cast<int64_t>(sample.from), sample.message) ==
+                      flowmesh::QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK_EQUAL(coalesced(), before + 40);
+
+    // One changed byte is different evidence: never matched here.
+    auto changed{sample.message};
+    changed.payload.back() ^= 1;
+    (void)receiver.EnqueueWireMessage(static_cast<int64_t>(sample.from), changed);
+    f.Drain();
+    BOOST_CHECK_EQUAL(coalesced(), before + 40);
+
+    // When the recovery forward is due the same bytes are processed again.
+    f.Drain();
+    for (auto& clock : f.clocks) clock.m_now += std::chrono::seconds{2};
+    BOOST_REQUIRE(receiver.EnqueueWireMessage(static_cast<int64_t>(sample.from), sample.message) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK_EQUAL(coalesced(), before + 40);
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_verified_duplicate_requires_exact_wire_header)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_duplicate_header",
+                                 std::chrono::seconds{2}, 1, true};
+    for (size_t step{0}; step < 40 && f.links.delivered.empty(); ++step) f.Step();
+    f.Drain();
+    BOOST_REQUIRE(!f.links.delivered.empty());
+    const auto sample{f.links.delivered.front()};
+    auto& receiver{*f.runtimes[sample.to]};
+    const auto before{receiver.DeliverySnapshots(f.market).front().agreement_duplicates_coalesced};
+    for (size_t field{0}; field < 3; ++field) {
+        auto changed{sample.message};
+        if (field == 0) ++changed.header.version;
+        if (field == 1) ++changed.header.epoch;
+        if (field == 2) ++changed.header.sequence;
+        BOOST_CHECK(receiver.EnqueueWireMessage(static_cast<int64_t>(sample.from), changed) ==
+                    flowmesh::QueueResult::MALFORMED);
+    }
+    BOOST_CHECK_EQUAL(receiver.DeliverySnapshots(f.market).front().agreement_duplicates_coalesced, before);
+    BOOST_REQUIRE(receiver.EnqueueWireMessage(static_cast<int64_t>(sample.from), sample.message) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    BOOST_CHECK_EQUAL(receiver.DeliverySnapshots(f.market).front().agreement_duplicates_coalesced, before + 1);
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_certified_duplicate_stays_quiet_after_backoff_expires)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_duplicate_old_slot",
+                                 std::chrono::seconds{2}, 1, true};
+    f.block_commits = false;
+    BOOST_REQUIRE(f.StepUntil(1, std::chrono::seconds{10}));
+    f.Drain();
+    BOOST_REQUIRE(!f.links.delivered.empty());
+    const auto sample{f.links.delivered.front()};
+    BOOST_REQUIRE_EQUAL(sample.message.header.sequence, 0U);
+    auto& receiver{*f.runtimes[sample.to]};
+    const auto before{receiver.DeliverySnapshots(f.market).front().agreement_duplicates_coalesced};
+    for (auto& chain : f.chains) chain.SetReconciled(false);
+    f.Tick();
+    for (size_t sweep{0}; sweep < 2; ++sweep) {
+        // Older-slot verification cannot succeed again after advancement. Its
+        // elapsed recovery deadline must not repeatedly reopen committee work.
+        for (auto& clock : f.clocks) clock.m_now += std::chrono::seconds{60};
+        for (size_t n{0}; n < 40; ++n) {
+            BOOST_REQUIRE(receiver.EnqueueWireMessage(static_cast<int64_t>(sample.from), sample.message) ==
+                          flowmesh::QueueResult::ACCEPTED);
+        }
+        f.Drain();
+        BOOST_CHECK_EQUAL(receiver.DeliverySnapshots(f.market).front().agreement_duplicates_coalesced,
+                          before + 40 * (sweep + 1));
+    }
+    // Different bytes still enter ordinary verification, and the next slot
+    // retains the same unmodified admission budget and full quorum.
+    auto changed{sample.message};
+    changed.payload.back() ^= 1;
+    BOOST_REQUIRE(receiver.EnqueueWireMessage(static_cast<int64_t>(sample.from), changed) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    for (auto& chain : f.chains) chain.SetReconciled(true);
+    for (const auto& runtime : f.runtimes) {
+        BOOST_REQUIRE(runtime->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    }
+    BOOST_REQUIRE(f.StepUntil(2, std::chrono::seconds{10}));
+    for (const auto& runtime : f.runtimes) {
+        BOOST_CHECK_EQUAL(runtime->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 250);
+        BOOST_CHECK(runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_old_view_evidence_recovers_while_duplicate_is_quiet)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_old_view_evidence"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    std::mutex observed_mutex;
+    std::optional<flowmesh::WireMessage> proposal;
+    size_t target_proposals{0}, target_echoes{0};
+    struct StopBeforeObservations {
+        PreagreementRuntimeHarness<4>& fixture;
+        ~StopBeforeObservations() { fixture.StopAll(); }
+    } stop_before_observations{f};
+    // All traffic is held after genesis. Observe exact proposals only; no
+    // hidden network delivery is allowed to provide the missing deposit.
+    f.network.SetFilter([&](size_t from, size_t to, const flowmesh::WireMessage& wire) {
+        if (wire.kind == flowmesh::WireMessageKind::AGREEMENT && wire.header.sequence == 1) {
+            const auto message{flowmesh::DecodeAgreementMessage(wire.payload)};
+            if (message && message->stage == flowmesh::AgreementStage::PROPOSAL && message->view == 0) {
+                std::lock_guard<std::mutex> lock{observed_mutex};
+                if (from == 1) proposal = wire;
+                if (from == 3) { ++target_proposals; if (to == 1) ++target_echoes; }
+            }
+        }
+        return false;
+    });
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    f.Tick();
+    flowmesh::WireMessage exact;
+    {
+        std::lock_guard<std::mutex> lock{observed_mutex};
+        BOOST_REQUIRE(proposal);
+        exact = *proposal;
+    }
+    const auto decoded{flowmesh::DecodeAgreementMessage(exact.payload)};
+    BOOST_REQUIRE(decoded);
+    // Two authenticated reports justify entering view one. Operator three
+    // is a follower there and cannot manufacture the hidden candidate itself.
+    for (uint32_t seat : {0U, 2U}) {
+        flowmesh::AgreementMessage report;
+        report.stage = flowmesh::AgreementStage::VIEW_CHANGE;
+        report.context = decoded->context;
+        report.view = 1;
+        report.seat_index = seat;
+        const auto digest{flowmesh::AgreementMessageDigest(report)};
+        BOOST_REQUIRE(digest);
+        report.signature = f.seats.secrets[seat].Sign(
+            std::span<const unsigned char>{digest->begin(), 32}).Compressed();
+        const auto payload{flowmesh::EncodeAgreementMessage(report)};
+        BOOST_REQUIRE(payload);
+        BOOST_REQUIRE(f.runtimes[3]->EnqueueWireMessage(seat,
+            {flowmesh::WireMessageKind::AGREEMENT, exact.header, *payload}) == flowmesh::QueueResult::ACCEPTED);
+        f.Drain();
+    }
+    BOOST_REQUIRE_EQUAL(f.runtimes[3]->MarketStatus(f.market)->round, 1U);
+    for (const auto delay : {0, 1, 2, 4}) {
+        f.clocks[3].m_now += std::chrono::seconds{delay};
+        BOOST_REQUIRE(f.runtimes[3]->EnqueueWireMessage(1, exact) == flowmesh::QueueResult::ACCEPTED);
+        f.Drain();
+    }
+    size_t before;
+    {
+        std::lock_guard<std::mutex> lock{observed_mutex};
+        before = target_proposals;
+        BOOST_CHECK_GT(before, 0U);
+        BOOST_CHECK_EQUAL(target_echoes, 0U); // every received forward excludes its source
+    }
+    const auto quiet_before{f.runtimes[3]->DeliverySnapshots(f.market).front().agreement_duplicates_coalesced};
+    BOOST_REQUIRE(f.runtimes[3]->EnqueueWireMessage(1, exact) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_CHECK_EQUAL(f.runtimes[3]->DeliverySnapshots(f.market).front().agreement_duplicates_coalesced,
+                      quiet_before + 1);
+    BOOST_REQUIRE(f.runtimes[3]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    f.chains[3].SetReconciled(false);
+    f.runtimes[3]->NotifyTick();
+    f.Drain();
+    {
+        std::lock_guard<std::mutex> lock{observed_mutex};
+        BOOST_CHECK_EQUAL(target_proposals, before);
+    }
+    f.chains[3].SetReconciled(true);
+    f.clocks[3].m_now += std::chrono::milliseconds{250};
+    f.runtimes[3]->NotifyTick();
+    f.Drain();
+    {
+        std::lock_guard<std::mutex> lock{observed_mutex};
+        // Recovery retains the exact old proposal for durable retry, well
+        // before the eight-second ingress/forward cooldown can expire.
+        BOOST_CHECK_GT(target_proposals, before);
+    }
+    BOOST_CHECK_EQUAL(f.runtimes[3]->MarketStatus(f.market)->round, 1U);
+    BOOST_CHECK_EQUAL(f.runtimes[3]->MarketStatus(f.market)->next_sequence, 1U);
+    std::optional<uint256> locked;
+    std::string error;
+    BOOST_REQUIRE(f.stores[3]->ReadLock({0, 1}, locked, error));
+    BOOST_CHECK(!locked);
+    BOOST_CHECK(f.runtimes[3]->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_star_retries_exact_proposal_after_asymmetric_loss)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_star_recovery"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    f.StopNode(2); // three online seats still require the full three-seat quorum
+    std::atomic<bool> healed{false};
+    std::atomic<size_t> blocked{0}, recovered{0};
+    std::mutex observed_mutex;
+    std::optional<std::vector<unsigned char>> original;
+    struct StopBeforeObservations {
+        PreagreementRuntimeHarness<4>& fixture;
+        ~StopBeforeObservations() { fixture.StopAll(); }
+    } stop_before_observations{f};
+    f.network.SetFilter([&](size_t from, size_t to, const flowmesh::WireMessage& wire) {
+        if (from != 0 && to != 0) return false; // physical star, no leaf shortcut
+        if (wire.kind == flowmesh::WireMessageKind::AGREEMENT && wire.header.sequence == 1) {
+            const auto message{flowmesh::DecodeAgreementMessage(wire.payload)};
+            if (message && message->stage == flowmesh::AgreementStage::PROPOSAL && message->view == 0) {
+                std::lock_guard<std::mutex> lock{observed_mutex};
+                if (from == 1) original = wire.payload;
+                if (from == 0 && to == 3) {
+                    if (!healed) { ++blocked; return false; }
+                    if (original && wire.payload == *original) ++recovered;
+                }
+            }
+        }
+        return true;
+    });
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    f.Tick();
+    BOOST_REQUIRE_GT(blocked.load(), 0U);
+    BOOST_REQUIRE(f.AllAt(1));
+    healed = true;
+    for (size_t attempt{0}; attempt < 8 && !f.AllAt(2); ++attempt) f.Tick(std::chrono::seconds{1});
+    BOOST_REQUIRE_GT(recovered.load(), 0U);
+    BOOST_REQUIRE(f.AllAt(2));
+    const auto head{f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash};
+    for (const auto& runtime : f.runtimes) if (runtime) {
+        BOOST_CHECK(runtime->MarketStatus(f.market)->last_microblock_hash == head);
+        BOOST_CHECK_EQUAL(runtime->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 250);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(preagreement_nine_runtimes_same_deposit_adjacent_anchors_heal)
 {
     // Nine distinct operators/stores/workers, not three operators holding
@@ -6020,6 +7012,142 @@ BOOST_AUTO_TEST_CASE(preagreement_prepared_anchor_reorg_preserves_history_withou
         BOOST_CHECK(stored->entry.anchor == (flowmesh::AnchorRef{200, Filled(0x74)}));
         BOOST_CHECK_EQUAL(f.runtimes[i]->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 250);
     }
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_runtime_unavailable_signers_preserve_timeout_and_history)
+{
+    // Each gate can remove local signing eligibility without authorizing a
+    // new view. Keep an already prepared deposit and the certified genesis.
+    for (const std::string gate : {"paused", "keyless", "reconciling"}) {
+        BOOST_TEST_CONTEXT(gate) {
+            PreagreementRuntimeHarness f{m_args.GetDataDirBase() /
+                fs::PathFromString("preagreement_timeout_" + gate), std::chrono::seconds{2}};
+            f.block_commits = false;
+            f.Reach(1);
+            f.Drain();
+            const uint256 genesis{f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash};
+            f.block_commits = true;
+            const auto commits_before{f.commits.load()};
+            for (const auto& runtime : f.runtimes) {
+                BOOST_REQUIRE(runtime->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+            }
+            f.Tick();
+            BOOST_REQUIRE_GT(f.commits.load(), commits_before);
+            BOOST_REQUIRE(f.AllAt(1));
+            const auto view_changes_before{f.view_changes.load()};
+            for (size_t i{0}; i < f.runtimes.size(); ++i) {
+                if (gate == "paused") f.chains[i].SetTransition(f.market, node::FlowMeshSeatTransitionKind::PAUSED);
+                if (gate == "keyless") f.keys[i].m_keys.clear();
+                if (gate == "reconciling") f.chains[i].SetReconciled(false);
+            }
+            f.Tick(); // Observe the gate closing before advancing the clock.
+            for (size_t interval{0}; interval < 130; ++interval) f.Tick(std::chrono::seconds{3});
+            BOOST_CHECK(f.AllAt(1));
+            BOOST_CHECK_EQUAL(f.view_changes.load(), view_changes_before);
+            std::string error;
+            for (size_t i{0}; i < f.runtimes.size(); ++i) {
+                BOOST_CHECK_EQUAL(f.runtimes[i]->MarketStatus(f.market)->round, 0U);
+                std::optional<uint256> lock;
+                BOOST_REQUIRE(f.stores[i]->ReadLock({0, 1}, lock, error));
+                BOOST_CHECK(!lock);
+                std::optional<node::StoredProductionEntry> stored;
+                BOOST_REQUIRE(f.stores[i]->ReadEntry(0, f.seats.seats, stored, error));
+                BOOST_REQUIRE(stored);
+                BOOST_CHECK(stored->entry.GetHash() == genesis);
+                if (gate == "paused") f.chains[i].SetTransition(f.market, node::FlowMeshSeatTransitionKind::CONTINUE);
+                if (gate == "keyless") f.keys[i].m_keys[f.market] = {f.seats.secrets[i]};
+                if (gate == "reconciling") f.chains[i].SetReconciled(true);
+            }
+            f.block_commits = false;
+            f.Tick();
+            f.Reach(2);
+            const uint256 deposit{f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash};
+            for (size_t i{0}; i < f.runtimes.size(); ++i) {
+                std::optional<node::StoredProductionEntry> stored;
+                BOOST_REQUIRE(f.stores[i]->ReadEntry(1, f.seats.seats, stored, error));
+                BOOST_REQUIRE(stored);
+                BOOST_CHECK(stored->entry.GetHash() == deposit);
+                BOOST_CHECK(stored->entry.parent_hash == genesis);
+                BOOST_CHECK_EQUAL(f.runtimes[i]->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 250);
+            }
+            // Reopen the same journal and certified history; no bootstrap or
+            // view reset is needed to recover from the signing pause.
+            f.Drain();
+            f.StopNode(0);
+            BOOST_REQUIRE_MESSAGE(f.StartNode(0, f.AgreementPath(0), std::nullopt, error), error);
+            BOOST_CHECK(f.AllAt(2));
+            BOOST_CHECK(f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash == deposit);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_runtime_idle_work_starts_fresh_timeout)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_idle_timeout", std::chrono::seconds{2}};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Tick();
+    f.Tick(std::chrono::seconds{30});
+    BOOST_REQUIRE(f.AllAt(1));
+    const auto view_changes_before{f.view_changes.load()};
+    f.block_commits = true;
+    for (const auto& runtime : f.runtimes) {
+        BOOST_REQUIRE(runtime->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    }
+    f.Tick();
+    BOOST_REQUIRE(f.AllAt(1));
+    BOOST_REQUIRE_GT(f.commits.load(), 0U);
+    for (const auto& runtime : f.runtimes) BOOST_CHECK_EQUAL(runtime->MarketStatus(f.market)->round, 0U);
+    f.Tick(std::chrono::milliseconds{1999});
+    BOOST_CHECK_EQUAL(f.view_changes.load(), view_changes_before);
+    for (const auto& runtime : f.runtimes) BOOST_CHECK_EQUAL(runtime->MarketStatus(f.market)->round, 0U);
+    f.Tick(std::chrono::milliseconds{1});
+    BOOST_CHECK_GT(f.view_changes.load(), view_changes_before);
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_runtime_missing_leader_timeout_survives_short_pauses)
+{
+    for (const bool interrupt : {false, true}) {
+        BOOST_TEST_CONTEXT("short pauses=" << interrupt) {
+            PreagreementRuntimeHarness f{m_args.GetDataDirBase() /
+                fs::PathFromString(interrupt ? "preagreement_pulsed_timeout" : "preagreement_missing_leader_timeout"),
+                std::chrono::seconds{2}};
+            f.StopNode(0); // View-zero genesis proposer is genuinely absent.
+            f.block_commits = false;
+            f.Tick();
+            for (size_t pulse{0}; pulse < 4; ++pulse) {
+                f.Tick(std::chrono::milliseconds{400});
+                BOOST_REQUIRE(f.AllAt(0));
+                if (interrupt) {
+                    for (size_t i{1}; i < f.runtimes.size(); ++i) f.chains[i].SetReconciled(false);
+                    f.Tick();
+                    f.Tick(std::chrono::milliseconds{100});
+                    for (size_t i{1}; i < f.runtimes.size(); ++i) f.chains[i].SetReconciled(true);
+                    f.Tick();
+                }
+            }
+            f.Tick(std::chrono::milliseconds{399});
+            BOOST_REQUIRE(f.AllAt(0));
+            BOOST_CHECK_EQUAL(f.view_changes.load(), 0U);
+            for (size_t i{1}; i < f.runtimes.size(); ++i) BOOST_CHECK_EQUAL(f.runtimes[i]->MarketStatus(f.market)->round, 0U);
+            f.Tick(std::chrono::milliseconds{1});
+            BOOST_CHECK_GT(f.view_changes.load(), 0U);
+            f.Reach(1); // Remaining three seats form the unchanged quorum.
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_runtime_keyless_observer_accepts_quorum)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_observer_timeout", std::chrono::seconds{2}};
+    f.Drain();
+    f.keys[3].m_keys.clear();
+    f.block_commits = false;
+    f.Tick();
+    f.Reach(1);
+    const uint256 genesis{f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash};
+    BOOST_CHECK(f.runtimes[3]->MarketStatus(f.market)->last_microblock_hash == genesis);
+    BOOST_CHECK_EQUAL(f.view_changes.load(), 0U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

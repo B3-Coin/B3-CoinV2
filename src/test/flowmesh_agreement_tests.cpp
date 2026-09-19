@@ -419,6 +419,127 @@ BOOST_AUTO_TEST_CASE(formed_commit_quorum_decides_only_after_candidate_evidence_
     BOOST_CHECK(EncodeAgreementMessage(output.back()) == EncodeAgreementMessage(decision));
 }
 
+BOOST_AUTO_TEST_CASE(old_view_candidate_retries_retained_bytes_after_evidence_recovers)
+{
+    const AgreementFixture f;
+    std::string error; bool available{false}; std::vector<AgreementMessage> output;
+    const fs::path path{m_args.GetDataDirBase() / "agreement-old-view-evidence"};
+    const auto proposal{f.Proposal(f.a)};
+    const auto exact{EncodeAgreementMessage(proposal)};
+    {
+        node::FlowMeshAgreement engine{DBParams{.path = path, .cache_bytes = 1 << 20},
+            f.Callbacks(8, output, available)};
+        BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+        BOOST_REQUIRE(engine.Timeout(error));
+        BOOST_REQUIRE_EQUAL(engine.View(), 1U);
+        BOOST_REQUIRE(engine.Receive(proposal, error));
+        BOOST_CHECK(engine.RequiredCandidateHash() == f.hash_a);
+        BOOST_CHECK(!engine.CandidateBytes(f.hash_a));
+        BOOST_REQUIRE(engine.Retry(error));
+        BOOST_CHECK(!engine.CandidateBytes(f.hash_a));
+        available = true;
+        output.clear();
+        // No second Receive: admission may suppress this exact proposal for
+        // its full relay backoff. The first local retry must recover its body.
+        BOOST_REQUIRE(engine.Retry(error));
+        BOOST_CHECK(engine.CandidateBytes(f.hash_a) == f.a);
+        BOOST_CHECK(!engine.RequiredCandidateHash());
+        BOOST_CHECK(!engine.DecidedCandidate());
+        BOOST_CHECK(std::any_of(output.begin(), output.end(), [&](const auto& message) {
+            return EncodeAgreementMessage(message) == exact;
+        }));
+        BOOST_CHECK(std::none_of(output.begin(), output.end(), [](const auto& message) {
+            return message.view == 0 && (message.stage == AgreementStage::PREPARE ||
+                                        message.stage == AgreementStage::COMMIT);
+        }));
+    }
+    output.clear();
+    node::FlowMeshAgreement restarted{DBParams{.path = path, .cache_bytes = 1 << 20},
+        f.Callbacks(8, output, available)};
+    BOOST_REQUIRE_MESSAGE(restarted.Open(f.context, f.seats, Filled(77), false, error), error);
+    BOOST_CHECK_EQUAL(restarted.View(), 1U);
+    BOOST_CHECK(restarted.CandidateBytes(f.hash_a) == f.a);
+    BOOST_REQUIRE(restarted.Retry(error));
+    BOOST_CHECK(std::any_of(output.begin(), output.end(), [&](const auto& message) {
+        return EncodeAgreementMessage(message) == exact;
+    }));
+}
+
+BOOST_AUTO_TEST_CASE(old_view_candidate_retry_rotates_past_unavailable_required_hash)
+{
+    const AgreementFixture f;
+    std::string error; bool available{true}, recover_a{false}; std::vector<AgreementMessage> output;
+    auto callbacks{f.Callbacks(8, output, available)};
+    const auto validate{callbacks.validate_candidate};
+    size_t validations{0};
+    callbacks.validate_candidate = [&](std::span<const unsigned char> bytes,
+        std::optional<std::span<const unsigned char>> evidence) -> std::optional<Bytes> {
+        ++validations;
+        if (!recover_a || DecodeProductionEntry(bytes)->GetHash() != f.hash_a) return std::nullopt;
+        return validate(bytes, evidence);
+    };
+    node::FlowMeshAgreement engine{DBParams{
+        .path = "agreement-old-view-fair-retry", .cache_bytes = 1 << 20, .memory_only = true}, std::move(callbacks)};
+    BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+    BOOST_REQUIRE(engine.Receive(f.Proposal(f.a), error));
+    PreagreementNewViewProof proof{1, f.hash_b, {}};
+    for (uint32_t seat{0}; seat < 7; ++seat) {
+        const auto report{f.Report(seat, 1)};
+        proof.reports.push_back({1, seat, std::nullopt, report.signature});
+    }
+    BOOST_REQUIRE(engine.Receive(f.Proposal(f.b, 1, proof), error));
+    BOOST_REQUIRE(engine.Timeout(error));
+    BOOST_REQUIRE_EQUAL(engine.View(), 2U);
+    BOOST_CHECK(engine.RequiredCandidateHash() == f.hash_b);
+    recover_a = true;
+    const auto before{validations};
+    BOOST_REQUIRE(engine.Retry(error));
+    BOOST_CHECK_LE(validations - before, 2U);
+    BOOST_CHECK(engine.CandidateBytes(f.hash_a) == f.a);
+    BOOST_CHECK(!engine.CandidateBytes(f.hash_b));
+    BOOST_CHECK(engine.RequiredCandidateHash() == f.hash_b);
+    BOOST_CHECK(!engine.DecidedCandidate());
+    BOOST_CHECK(!engine.Halted());
+}
+
+BOOST_AUTO_TEST_CASE(pending_decision_evidence_takes_priority_over_old_proposal_recovery)
+{
+    const AgreementFixture f;
+    std::string error; bool available{false}; std::vector<AgreementMessage> output;
+    auto callbacks{f.Callbacks(8, output, available)};
+    const auto validate{callbacks.validate_candidate};
+    // Model a runtime with one candidate-cache position remaining. Full
+    // quorum validation is unchanged; only local execution capacity is scarce.
+    std::optional<uint256> retained;
+    size_t validations{0};
+    callbacks.validate_candidate = [&](std::span<const unsigned char> bytes,
+        std::optional<std::span<const unsigned char>> evidence) -> std::optional<Bytes> {
+        ++validations;
+        const auto hash{DecodeProductionEntry(bytes)->GetHash()};
+        if (retained && *retained != hash) return std::nullopt;
+        const auto result{validate(bytes, evidence)};
+        if (result) retained = hash;
+        return result;
+    };
+    node::FlowMeshAgreement engine{DBParams{
+        .path = "agreement-decision-recovery-priority", .cache_bytes = 1 << 20, .memory_only = true}, std::move(callbacks)};
+    BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+    BOOST_REQUIRE(engine.Timeout(error));
+    BOOST_REQUIRE(engine.Receive(f.Proposal(f.b), error));
+    BOOST_REQUIRE(engine.Receive(f.Decision(f.a), error));
+    BOOST_CHECK(!retained);
+    BOOST_CHECK(!engine.DecidedCandidate());
+    available = true;
+    BOOST_REQUIRE(engine.Retry(error));
+    BOOST_CHECK(retained == f.hash_a);
+    BOOST_CHECK(engine.DecidedCandidate() == f.hash_a);
+    BOOST_CHECK(!engine.CandidateBytes(f.hash_b));
+    const auto after_decision{validations};
+    BOOST_REQUIRE(engine.Retry(error));
+    BOOST_CHECK_EQUAL(validations, after_decision);
+    BOOST_CHECK(!engine.Halted());
+}
+
 BOOST_AUTO_TEST_CASE(duplicate_commit_can_supply_missing_proof_without_another_vote)
 {
     const AgreementFixture f;

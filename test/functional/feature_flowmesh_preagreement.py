@@ -104,6 +104,60 @@ class FlowMeshPreagreementTest(FlowMeshRemoteClientTest):
         # invalid type8/type9 block submissions, not only mempool acceptance.
         super().qualification_workload(market_id)
         assert_equal(market_id, self.preagreement_market)
+        # The parent proves the type-9 payout, but ends before its canonical
+        # 30-deep fact is retired by production. Complete that EXISTING normal
+        # settlement path before the unrelated disconnect/bulk workload.
+        # Otherwise it hits the required type-8 barrier thirty blocks later.
+        payout = next(row for row in self.compatibility if "valid_withdrawal_txid" in row)
+        payout_height = payout["block_validation"]["height"]
+        pause_log = self.nodes[0].debug_log_path.open(encoding="utf-8")
+        pause_log.seek(0, 2)
+        pause_evidence = {}
+
+        def settlement_barrier_observed():
+            for line in pause_log:
+                if "FlowMeshTrace " not in line:
+                    continue
+                event = json.loads(line.split("FlowMeshTrace ", 1)[1])
+                if (event.get("market_id") == market_id and event["stage"] == "proposer_wait" and
+                        event["reason"].startswith("settlement_checkpoint_pending")):
+                    pause_evidence.update(event)
+            return bool(pause_evidence)
+
+        self.mine_pos_blocks(max(0, payout_height + 30 - self.nodes[0].getblockcount()),
+                             allow_overshoot=True)
+        try:
+            self.wait_until(settlement_barrier_observed, timeout=90)
+        finally:
+            pause_log.close()
+        settlement_checkpoints = []
+        for _ in range(64):
+            status = self.market_status(self.nodes[0], market_id)
+            if not status["checkpoint_pending"]:
+                break
+            pending_sequence = status["pending_checkpoint_sequence"]
+            checkpoint = self.nodes[0].createflowmeshcheckpoint(market_id, {"broadcast": False})
+            self.publish_parity_transaction(checkpoint, 8)
+            settlement_checkpoints.append(checkpoint)
+            # Earlier effect-bearing entries may precede settlement. Wait
+            # for their B3 recognition without requiring that settlement's
+            # safety pause has already lifted. Final convergence stays strict.
+            self.wait_until(lambda: all(
+                not (row := self.market_status(node, market_id))["checkpoint_pending"] or
+                row["pending_checkpoint_sequence"] > pending_sequence
+                for node in self.nodes), timeout=60)
+        else:
+            raise AssertionError("Existing settlement checkpoint backlog did not drain")
+        assert settlement_checkpoints, "Required settlement checkpoint was not published"
+        assert_equal(settlement_checkpoints[-1]["effect_count"], 0)
+        self.wait_for_market_convergence(market_id)
+        self.settlement_completion = {
+            "payout_height": payout_height,
+            "pause_evidence": pause_evidence,
+            "connected_checkpoints": [{k: row[k] for k in ("txid", "effect_count")}
+                                      for row in settlement_checkpoints],
+            "scope": "existing checkpoint publication rules; no bypass or replacement withdrawal",
+        }
         first_height = self.nodes[0].getblockcount()
         success = False
         try:
@@ -127,6 +181,7 @@ class FlowMeshPreagreementTest(FlowMeshRemoteClientTest):
                 "samples": self.samples,
                 "recoveries": self.recoveries,
                 "compatibility": self.compatibility,
+                "settlement_completion": self.settlement_completion,
                 "client_results": self.client_results,
                 "delivery": self.collect_delivery_trace(market_id),
                 "fault_proxy": self.fault.snapshot(),
