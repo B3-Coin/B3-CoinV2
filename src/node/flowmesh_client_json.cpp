@@ -162,6 +162,7 @@ UniValue FlowMeshClientStatusJson(const interfaces::FlowMeshClientStatus& status
     out.pushKV("backend", status.backend);
     out.pushKV("engine_enabled", status.engine_enabled);
     out.pushKV("active_endpoint", status.active_endpoint);
+    out.pushKV("selected_endpoint", status.selected_endpoint);
     out.pushKV("event_gaps", status.event_gaps);
     out.pushKV("pending_actions", status.pending_actions);
     UniValue endpoints{UniValue::VARR};
@@ -170,6 +171,10 @@ UniValue FlowMeshClientStatusJson(const interfaces::FlowMeshClientStatus& status
         row.pushKV("url", endpoint.url);
         row.pushKV("available", endpoint.available);
         row.pushKV("last_error", endpoint.last_error);
+        row.pushKV("transport_available", endpoint.transport_available);
+        row.pushKV("last_attempt_ms", endpoint.last_attempt_ms);
+        row.pushKV("retry_after_ms", endpoint.retry_after_ms);
+        row.pushKV("consecutive_failures", endpoint.consecutive_failures);
         endpoints.push_back(std::move(row));
     }
     out.pushKV("endpoints", std::move(endpoints));

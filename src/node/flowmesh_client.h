@@ -43,6 +43,13 @@ public:
     virtual std::vector<interfaces::FlowMeshSavedAction> SavedActions(
         const uint256& account, const std::optional<uint256>& market) { return {}; }
     virtual interfaces::FlowMeshClientStatus Status() const = 0;
+    //! Add/select a public HTTPS URL and probe with a read only request. A true
+    //! result means configured; Status reports transport and API availability.
+    virtual bool Connect(const std::string& url, std::string& error)
+    {
+        error = "Endpoint connections require the remote trading client; the local validator engine is enabled";
+        return false;
+    }
     //! Fresh read-only HTTPS availability probe. Never signs, retries an action,
     //! resets an outbox/cursor or changes configured trust. Busy fails promptly.
     virtual FlowMeshClientReconnectResult Reconnect() { return {}; }

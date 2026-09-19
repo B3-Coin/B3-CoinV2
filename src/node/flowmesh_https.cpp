@@ -437,6 +437,24 @@ bool ValidateFlowMeshHttpsTrust(const HttpsEndpoint& endpoint, std::string& erro
     return true;
 }
 
+bool NormalizeFlowMeshHttpsEndpoint(HttpsEndpoint& endpoint, std::string& error)
+{
+    if (!ValidateFlowMeshHttpsEndpoint(endpoint, error)) return false;
+    const auto parsed{ParseEndpoint(endpoint, std::string{API_PATH})};
+    std::string host{parsed->host};
+    if (parsed->numeric) {
+        sockaddr_storage address{};
+        socklen_t size{};
+        if (!NumericAddress(host, parsed->port, address, size)) return false;
+        host = NumericPeer(address);
+    } else {
+        for (char& c : host) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    endpoint.url = "https://" + (host.find(':') == std::string::npos ? host : "[" + host + "]");
+    if (parsed->port != 443) endpoint.url += ":" + std::to_string(parsed->port);
+    return true;
+}
+
 HttpsRequestResult FlowMeshHttpsRequest(const HttpsEndpoint& endpoint, const std::string& path,
                                       const std::string& body, Milliseconds timeout, size_t max_reply_bytes)
 {

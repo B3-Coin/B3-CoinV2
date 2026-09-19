@@ -108,6 +108,56 @@ struct StatusReadProbe {
     }
     ~StatusReadProbe() { tableRPC.removeCommand(command.name, &command); }
 };
+
+UniValue ConnectionInfo(const std::string& url = "https://trading.invalid", bool attempted = true, bool transport = true, bool available = true)
+{
+    UniValue info{UniValue::VOBJ}; info.pushKV("backend", "remote"); info.pushKV("engine_enabled", false);
+    info.pushKV("selected_endpoint", url); info.pushKV("active_endpoint", available ? url : "");
+    UniValue endpoints{UniValue::VARR};
+    if (!url.empty()) {
+        UniValue row{UniValue::VOBJ}; row.pushKV("url", url); row.pushKV("available", available);
+        row.pushKV("transport_available", transport); row.pushKV("last_attempt_ms", attempted ? 123 : 0);
+        row.pushKV("retry_after_ms", 0); row.pushKV("consecutive_failures", transport ? 0 : 1);
+        row.pushKV("last_error", available ? "" : transport ? "FlowMesh client snapshot has no certified head" : "Synthetic TLS connection failed");
+        endpoints.push_back(row);
+    }
+    info.pushKV("endpoints", endpoints); return info;
+}
+
+// Exercise the actual worker and wallet-scoped dispatch, with only the existing
+// non-economic RPCs intercepted. No sockets, signing, or live wallet are used.
+struct ConnectionProbe {
+    QSemaphore entered, release;
+    std::atomic_int count{0};
+    std::atomic_bool fail{false};
+    std::mutex mutex;
+    std::vector<std::pair<std::string, std::string>> requests;
+    std::vector<std::unique_ptr<CRPCCommand>> commands;
+    ConnectionProbe()
+    {
+        if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
+        const auto add = [&](const char* method, const std::function<UniValue(const JSONRPCRequest&)>& run) {
+            auto command{std::make_unique<CRPCCommand>("hidden", method,
+                [run](const JSONRPCRequest& request, UniValue& result, bool) { result = run(request); return true; },
+                std::vector<std::pair<std::string, bool>>{}, 998880 + commands.size())};
+            tableRPC.appendCommand(command->name, command.get()); commands.push_back(std::move(command));
+        };
+        add("flowmeshclientconnect", [this](const JSONRPCRequest& request) {
+            const auto url{request.params[0].get_str()};
+            { std::lock_guard lock{mutex}; requests.emplace_back(request.URI, url); }
+            ++count; entered.release();
+            if (!release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic connection exceeded its test bound"};
+            if (fail) throw std::runtime_error{"Synthetic endpoint configuration rejected"};
+            return ConnectionInfo(url);
+        });
+        add("getflowmeshclientinfo", [](const JSONRPCRequest&) { return ConnectionInfo(); });
+        add("listflowmeshactions", [](const JSONRPCRequest&) {
+            UniValue saved{UniValue::VOBJ}; saved.pushKV("source", "local-retained-outbox"); saved.pushKV("actions", UniValue{UniValue::VARR}); return saved;
+        });
+        add("listflowmeshmarkets", [](const JSONRPCRequest&) -> UniValue { throw std::runtime_error{"Synthetic selected-market read unavailable"}; });
+    }
+    ~ConnectionProbe() { for (const auto& command : commands) tableRPC.removeCommand(command->name, command.get()); }
+};
 }
 
 class B3FlowMeshWorkspaceTests : public QObject
@@ -857,6 +907,245 @@ private Q_SLOTS:
         const auto full{Data()}; UniValue small{UniValue::VOBJ};
         for (const auto* key : {"market_id", "base_asset_id", "domain", "execution_config_id", "quote_asset", "matching_model", "quantity_lot_raw", "price_tick_raw", "snapshot"}) small.pushKV(key, full[key]);
         small.pushKV("unchanged", true); const auto s{Parse(small)}; QVERIFY(s.unchanged); QVERIFY(!s.units.known); QVERIFY(s.history.empty());
+    }
+    void catalogSurvivesUncertifiedFirstMarket()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        const auto certified{panel.m_market_data.front()};
+        const auto snapshot{*panel.m_snapshot};
+        B3FlowMeshTrading::Market uncertified;
+        uncertified.domain = certified.domain; uncertified.config = certified.config;
+        uncertified.base = QString::fromStdString(H(90).GetHex());
+        const auto id{*flowmesh::ComputeFlowMeshMarketId(H(1), H(90))};
+        uncertified.id = QString::fromStdString(id.GetHex());
+        uncertified.vault = QString::fromStdString(flowmesh::ComputeFlowMeshVaultId(H(1), id)->GetHex());
+        uncertified.remote = true;
+        panel.m_market_data.clear(); panel.m_snapshot.reset();
+        { QSignalBlocker blocked{panel.m_market}; panel.m_market->clear(); }
+        panel.m_response_age.invalidate(); panel.m_loading = true;
+
+        // Production completed-result boundary: discovery succeeded, then the
+        // first remote market's balance RPC rejected its uncertified head.
+        auto failed{std::make_shared<B3FlowMeshTradingPanel::Result>()};
+        failed->catalog = true; failed->markets = {uncertified, certified};
+        failed->error = QStringLiteral("FlowMesh client snapshot has no certified head");
+        panel.finishJob(failed);
+        QCOMPARE(panel.m_market->count(), 2);
+        QVERIFY(panel.market()); QCOMPARE(panel.market()->id, uncertified.id);
+        QVERIFY(panel.m_market->isEnabled()); QVERIFY(panel.m_catalog_age.isValid());
+        QVERIFY(panel.m_read_failed); QVERIFY(!panel.m_loading); QVERIFY(!panel.m_snapshot);
+        panel.updateMarketText(); // Periodic updates must retain the exact error.
+        QVERIFY(panel.m_status->text().contains(failed->error));
+        QVERIFY(!panel.m_status->text().contains(QStringLiteral("Loading")));
+        QVERIFY(!panel.m_liquidity_note->text().contains(QStringLiteral("Loading")));
+        QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_deposit->isEnabled());
+        QVERIFY(!panel.m_withdraw->isEnabled()); QVERIFY(!panel.m_checkpoint->isEnabled());
+        QVERIFY(!panel.m_publish->isEnabled()); QVERIFY(!panel.m_admit->isEnabled());
+
+        // Another listed market stays selectable, and its independently
+        // successful read can make only that market ready.
+        ReadInFlight(panel);
+        panel.m_market->setCurrentIndex(1);
+        QCOMPARE(panel.market()->id, certified.id);
+        QVERIFY(!panel.m_status->text().contains(failed->error));
+        auto ready{std::make_shared<B3FlowMeshTradingPanel::Result>()};
+        ready->markets = failed->markets; ready->snapshot = snapshot;
+        panel.finishJob(ready);
+        QCOMPARE(panel.m_market->currentIndex(), 1);
+        QVERIFY(panel.m_snapshot && *panel.m_snapshot == snapshot);
+        QVERIFY(!panel.m_read_failed); QVERIFY(panel.m_order->isEnabled());
+        QCOMPARE(panel.m_chart->pricePointCount(), 1);
+        QVERIFY(!panel.m_thread); QVERIFY(!failed->write_attempted); QVERIFY(!ready->write_attempted);
+        QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void catalogFailureRetainsCertifiedDisplayAndPausesActions()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        const auto snapshot{*panel.m_snapshot};
+        const auto original{panel.m_market_data.front()};
+        const auto balances{panel.m_balances->text()};
+        const auto history{panel.m_history_view->item(0, 1)->text()};
+        auto discovery{original}; discovery.has_account = false; discovery.account.clear();
+        discovery.base_available = discovery.base_reserved = discovery.b3_available = discovery.b3_reserved = 0;
+        discovery.ready = discovery.publish_ready = false;
+        auto additional{discovery}; additional.id = QString::fromStdString(H(91).GetHex());
+        auto failed{std::make_shared<B3FlowMeshTradingPanel::Result>()};
+        failed->catalog = true; failed->markets = {discovery, additional};
+        failed->error = QStringLiteral("Synthetic selected-market read unavailable");
+        panel.finishJob(failed);
+        QCOMPARE(panel.m_market->count(), 2);
+        QCOMPARE(panel.market()->id, original.id);
+        QCOMPARE(panel.market()->account, original.account);
+        QVERIFY(panel.m_snapshot && *panel.m_snapshot == snapshot);
+        QCOMPARE(panel.m_balances->text(), balances);
+        QCOMPARE(panel.m_history_view->item(0, 1)->text(), history);
+        QCOMPARE(panel.m_chart->pricePointCount(), 1);
+        QVERIFY(panel.m_read_failed); QVERIFY(panel.m_market->isEnabled());
+        panel.updateMarketText(); QVERIFY(panel.m_status->text().contains(failed->error));
+        QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_cancel_order->isEnabled());
+        QVERIFY(!panel.m_deposit->isEnabled()); QVERIFY(!panel.m_admit->isEnabled());
+        QVERIFY(!panel.m_withdraw->isEnabled()); QVERIFY(!panel.m_checkpoint->isEnabled());
+        QVERIFY(!panel.m_publish->isEnabled()); QVERIFY(m_wallet->IsLocked());
+    }
+    void queuedCatalogFromPreviousWalletIsDiscarded()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        auto result{std::make_shared<B3FlowMeshTradingPanel::Result>()};
+        result->catalog = true; result->markets = panel.m_market_data;
+        result->error = QStringLiteral("Old wallet selected-market read failed");
+        const auto generation{panel.m_generation};
+        int delivered{0}, accepted{0};
+        QMetaObject::invokeMethod(&panel, [&] {
+            ++delivered;
+            if (generation == panel.m_generation) { ++accepted; panel.finishJob(result); }
+        }, Qt::QueuedConnection);
+        auto replacement{MakeOfflineWallet("catalog-replacement-wallet")};
+        panel.setWalletModel(replacement.model.get());
+        QCoreApplication::sendPostedEvents(&panel, QEvent::MetaCall);
+        QCOMPARE(delivered, 1); QCOMPARE(accepted, 0);
+        QCOMPARE(panel.m_wallet.data(), replacement.model.get());
+        QCOMPARE(panel.m_market->count(), 0); QVERIFY(panel.m_market_data.empty());
+        QVERIFY(!panel.m_snapshot); QVERIFY(!panel.m_read_failed);
+        QVERIFY(!panel.m_status->text().contains(result->error));
+        QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_thread);
+        panel.setWalletModel(nullptr);
+    }
+    void failedCatalogReadDoesNotReplaceExistingMarkets()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        const auto original{panel.m_market_data.front()};
+        const auto snapshot{*panel.m_snapshot};
+        auto failed{std::make_shared<B3FlowMeshTradingPanel::Result>()};
+        // No successfully parsed catalog: an empty or partially filled result
+        // cannot remove the cached choices or replace certified account data.
+        failed->error = QStringLiteral("Synthetic market discovery unavailable");
+        panel.finishJob(failed);
+        QCOMPARE(panel.m_market->count(), 1); QCOMPARE(panel.market()->id, original.id);
+        QCOMPARE(panel.market()->account, original.account);
+        QVERIFY(panel.m_snapshot && *panel.m_snapshot == snapshot);
+        QVERIFY(panel.m_read_failed); QVERIFY(!panel.m_order->isEnabled());
+        QVERIFY(!panel.m_catalog_age.isValid()); QVERIFY(m_wallet->IsLocked());
+    }
+    void connectionControlsDistinguishTransportFromMarketReadiness()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        QVERIFY(panel.findChild<QLineEdit*>(QStringLiteral("flowMeshEndpoint")));
+        QVERIFY(panel.findChild<QPushButton*>(QStringLiteral("flowMeshConnect")));
+        QVERIFY(panel.findChild<QLabel*>(QStringLiteral("flowMeshConnectionStatus")));
+        QVERIFY(!panel.m_connect->isEnabled());
+        panel.m_client_info = ConnectionInfo(""); panel.updateControls();
+        QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("No HTTPS endpoint")));
+        panel.m_endpoint->setText(QStringLiteral("http://insecure.invalid")); QVERIFY(!panel.m_connect->isEnabled());
+        panel.m_endpoint->setText(QStringLiteral("https://trading.invalid")); QVERIFY(panel.m_connect->isEnabled());
+        panel.m_client_info = ConnectionInfo("https://trading.invalid", false); panel.updateControls();
+        QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("not yet checked")));
+        panel.m_client_info = ConnectionInfo("https://trading.invalid", true, false, false); panel.updateControls();
+        QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("HTTPS connection failed")));
+        panel.m_client_info->pushKV("active_endpoint", "https://fallback.invalid"); panel.updateControls();
+        QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("Last usable endpoint: https://fallback.invalid")));
+        panel.m_client_info = ConnectionInfo("https://trading.invalid", true, true, false);
+        panel.m_read_failed = true; panel.m_read_error = QStringLiteral("FlowMesh client snapshot has no certified head"); panel.updateMarketText();
+        QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("HTTPS responded")));
+        QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("no certified head")));
+        QVERIFY(panel.m_status->text().contains(panel.m_read_error)); QVERIFY(!panel.m_order->isEnabled());
+        panel.m_client_info = ConnectionInfo(); panel.updateControls();
+        QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("readiness is shown below")));
+        QVERIFY(!panel.m_order->isEnabled()); // Transport success supplies no certificate.
+        panel.m_client_info->pushKV("backend", "local"); panel.m_client_info->pushKV("engine_enabled", true); panel.updateControls();
+        QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("Local market engine")));
+        QVERIFY(!panel.m_connect->isEnabled()); QVERIFY(!panel.m_endpoint->isEnabled());
+        panel.requestConnect(); QVERIFY(!panel.m_thread); QVERIFY(!panel.m_deferred_connect);
+    }
+    void connectUsesExistingWorkerWithoutUnlockOrSubmission()
+    {
+        ConnectionProbe probe; B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        struct Cleanup { ConnectionProbe& probe; B3FlowMeshTradingPanel& panel; ~Cleanup() { probe.release.release(8); panel.cancelAndWait(); } } cleanup{probe, panel};
+        panel.m_client_info = ConnectionInfo(""); panel.m_endpoint->setText(QStringLiteral("https://chosen.invalid")); panel.updateControls();
+        const auto snapshot{*panel.m_snapshot}; const auto balances{panel.m_balances->text()};
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        panel.m_connect->click(); QVERIFY(probe.entered.tryAcquire(1, 1000));
+        const auto active{panel.m_active_result}; QVERIFY(active); QVERIFY(!active->action); QVERIFY(!active->exact_retry);
+        QCOMPARE(active->connect_url, QStringLiteral("https://chosen.invalid")); QVERIFY(!active->write_attempted);
+        QVERIFY(panel.m_snapshot && *panel.m_snapshot == snapshot); QCOMPARE(panel.m_balances->text(), balances);
+        QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("Connecting to")));
+        QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_connect->isEnabled());
+        panel.requestConnect(); QCOMPARE(probe.count.load(), 1); // Coalesced while running.
+        panel.m_endpoint->setText(QStringLiteral("https://still-typing.invalid"));
+        panel.m_endpoint->setCursorPosition(8); const int cursor{panel.m_endpoint->cursorPosition()};
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.count.load(), 1); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+        QVERIFY(!active->write_attempted); QVERIFY(!panel.m_uncertain); QVERIFY(!panel.m_confirmation);
+        QCOMPARE(panel.m_endpoint->text(), QStringLiteral("https://still-typing.invalid"));
+        QCOMPARE(panel.m_endpoint->cursorPosition(), cursor);
+        QVERIFY(panel.m_snapshot && *panel.m_snapshot == snapshot); QCOMPARE(panel.m_balances->text(), balances);
+        QVERIFY(panel.m_read_failed); QVERIFY(!panel.m_order->isEnabled());
+        { std::lock_guard lock{probe.mutex}; QCOMPARE(probe.requests.size(), size_t{1});
+          QCOMPARE(probe.requests[0].first, B3AssetTransfer::WalletUri(m_model->getWalletName()));
+          QCOMPARE(probe.requests[0].second, std::string{"https://chosen.invalid"}); }
+    }
+    void connectQueuesOnceBehindPassiveRead()
+    {
+        ConnectionProbe probe; B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        struct Cleanup { ConnectionProbe& probe; B3FlowMeshTradingPanel& panel; ~Cleanup() { probe.release.release(8); panel.cancelAndWait(); } } cleanup{probe, panel};
+        panel.m_client_info = ConnectionInfo(); panel.m_endpoint->setText(QStringLiteral("https://queued.invalid")); panel.updateControls();
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        ReadInFlight(panel); const auto original{panel.m_thread};
+        for (int i{0}; i < 5; ++i) panel.m_connect->click();
+        QCOMPARE(panel.m_thread, original); QCOMPARE(probe.count.load(), 0); QVERIFY(panel.m_deferred_connect);
+        QCOMPARE(panel.m_deferred_connect->url, QStringLiteral("https://queued.invalid"));
+        QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("Connect queued")));
+        QVERIFY(!panel.m_order->isEnabled());
+        panel.m_endpoint->setText(QStringLiteral("https://edited-after-click.invalid"));
+        auto failed{std::make_shared<B3FlowMeshTradingPanel::Result>()}; failed->error = QStringLiteral("Synthetic passive read failed");
+        panel.finishJob(failed); QVERIFY(probe.entered.tryAcquire(1, 1000));
+        QVERIFY(!panel.m_deferred_connect); QCOMPARE(panel.m_active_result->connect_url, QStringLiteral("https://queued.invalid"));
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.count.load(), 1); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+        QCOMPARE(panel.m_endpoint->text(), QStringLiteral("https://edited-after-click.invalid"));
+    }
+    void explicitConnectionErrorSurvivesAutomaticStatusReads()
+    {
+        ConnectionProbe probe; probe.fail = true;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        struct Cleanup { ConnectionProbe& probe; B3FlowMeshTradingPanel& panel; ~Cleanup() { probe.release.release(8); panel.cancelAndWait(); } } cleanup{probe, panel};
+        panel.m_client_info = ConnectionInfo(); panel.m_endpoint->setText(QStringLiteral("https://rejected.invalid")); panel.updateControls();
+        panel.m_connect->click(); QVERIFY(probe.entered.tryAcquire(1, 1000));
+        probe.release.release(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QVERIFY(panel.m_client_info); QVERIFY(panel.m_connection_error.isEmpty());
+        QCOMPARE(panel.m_connect_error, QStringLiteral("Synthetic endpoint configuration rejected"));
+        panel.updateMarketText(); QVERIFY(panel.m_connection_status->text().contains(panel.m_connect_error));
+        QVERIFY(!panel.m_order->isEnabled()); QVERIFY(m_wallet->IsLocked());
+        panel.setWalletModel(nullptr); QVERIFY(panel.m_connect_error.isEmpty());
+    }
+    void connectionWorkCannotFollowWalletSwitch_data()
+    {
+        QTest::addColumn<bool>("completed");
+        QTest::newRow("queued-connect") << false;
+        QTest::newRow("completion-queued") << true;
+    }
+    void connectionWorkCannotFollowWalletSwitch()
+    {
+        QFETCH(bool, completed);
+        ConnectionProbe probe; B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        struct Cleanup { ConnectionProbe& probe; B3FlowMeshTradingPanel& panel; ~Cleanup() { probe.release.release(8); panel.cancelAndWait(); } } cleanup{probe, panel};
+        panel.m_client_info = ConnectionInfo(); panel.m_endpoint->setText(QStringLiteral("https://old-wallet.invalid")); panel.updateControls();
+        const auto generation{panel.m_generation};
+        if (!completed) ReadInFlight(panel);
+        panel.m_connect->click();
+        if (completed) {
+            QVERIFY(probe.entered.tryAcquire(1, 1000)); probe.release.release();
+            QVERIFY(panel.m_thread->wait(1000)); // Finished callback queued, not applied.
+        } else { QVERIFY(panel.m_deferred_connect); QCOMPARE(probe.count.load(), 0); }
+        auto replacement{MakeOfflineWallet("connection-replacement-wallet")};
+        panel.setWalletModel(replacement.model.get());
+        QCoreApplication::sendPostedEvents(&panel, QEvent::MetaCall); QCoreApplication::processEvents();
+        QVERIFY(panel.m_generation > generation); QCOMPARE(panel.m_wallet.data(), replacement.model.get());
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_deferred_connect);
+        QVERIFY(!panel.m_client_info); QVERIFY(panel.m_connection_error.isEmpty()); QVERIFY(panel.m_connect_error.isEmpty());
+        QVERIFY(!panel.m_snapshot); QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_connect->isEnabled());
+        QCOMPARE(probe.count.load(), completed ? 1 : 0); QVERIFY(m_wallet->IsLocked());
+        panel.setWalletModel(nullptr);
     }
     void chartShowsOnlyCertifiedRecordsAndHonestEmptiness()
     {

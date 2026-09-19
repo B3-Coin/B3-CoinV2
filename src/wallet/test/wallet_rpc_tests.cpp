@@ -55,6 +55,16 @@ BOOST_AUTO_TEST_CASE(flowmesh_saved_actions_help_schema_constructs)
     BOOST_CHECK(help.find("outcome_verified") != std::string::npos);
 }
 
+BOOST_AUTO_TEST_CASE(flowmesh_client_connect_help_schema_constructs)
+{
+    BOOST_CHECK_NO_THROW(flowmeshclientconnect());
+    const auto help{flowmeshclientconnect().ToString()};
+    BOOST_CHECK(help.find("transport_available") != std::string::npos);
+    BOOST_CHECK(help.find("selected_endpoint") != std::string::npos);
+    BOOST_CHECK(help.find("retry_after_ms") != std::string::npos);
+    BOOST_CHECK_NO_THROW(getflowmeshclientinfo());
+}
+
 BOOST_AUTO_TEST_CASE(ensure_unique_wallet_name)
 {
     // EnsureUniqueWalletName should only return if exactly one unique wallet name is provided

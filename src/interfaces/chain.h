@@ -322,6 +322,10 @@ struct FlowMeshClientEndpointStatus {
     std::string url;
     bool available{false};
     std::string last_error;
+    bool transport_available{false};
+    int64_t last_attempt_ms{0};
+    int64_t retry_after_ms{0};
+    uint32_t consecutive_failures{0};
 };
 struct FlowMeshClientStatus {
     std::string backend{"local"};
@@ -330,6 +334,7 @@ struct FlowMeshClientStatus {
     std::vector<FlowMeshClientEndpointStatus> endpoints;
     uint64_t event_gaps{0};
     uint64_t pending_actions{0};
+    std::string selected_endpoint;
 };
 
 //! Fully encoded, service-selected type-8 record. Bitmap sizing and the
@@ -775,6 +780,12 @@ public:
         return receipt;
     }
     virtual FlowMeshClientStatus flowMeshClientStatus() { return {}; }
+    //! Configure/select and probe a trading endpoint; never signs or submits.
+    virtual bool connectFlowMeshClient(const std::string& url, std::string& error)
+    {
+        error = "Remote FlowMesh trading client is unavailable";
+        return false;
+    }
     virtual std::vector<FlowMeshSavedAction> flowMeshSavedActions(
         const uint256& account_id, const std::optional<uint256>& market_id) { return {}; }
     virtual FlowMeshValidatorStatus flowMeshValidatorStatus() = 0;

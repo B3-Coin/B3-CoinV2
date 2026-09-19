@@ -39,6 +39,9 @@ struct HttpsRequestResult {
 
 /** Syntax and pin validation only: no DNS, filesystem or network access. */
 bool ValidateFlowMeshHttpsEndpoint(const HttpsEndpoint& endpoint, std::string& error);
+/** Validate and canonicalize an HTTPS origin for duplicate detection. Does not
+ * change CA material or certificate pins, or perform network access. */
+bool NormalizeFlowMeshHttpsEndpoint(HttpsEndpoint& endpoint, std::string& error);
 /** Load configured CA material to catch missing/malformed trust files at
  * startup. Does not contact an endpoint or read a TLS private key. */
 bool ValidateFlowMeshHttpsTrust(const HttpsEndpoint& endpoint, std::string& error);

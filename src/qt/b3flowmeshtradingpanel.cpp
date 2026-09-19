@@ -12,6 +12,7 @@
 #include <QCheckBox>
 #include <QButtonGroup>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -30,6 +31,7 @@
 #include <QTabWidget>
 #include <QThread>
 #include <QTimer>
+#include <QUrl>
 #include <QVBoxLayout>
 #include <algorithm>
 #include <exception>
@@ -46,8 +48,9 @@ QLabel* Label(const QString& text, QWidget* parent) {
 }
 bool PreparedOperation(Operation op) { return op == Operation::Deposit || op == Operation::Checkpoint || op == Operation::Vault; }
 bool SignedAction(Operation op) { return op == Operation::Order || op == Operation::Cancel || op == Operation::Withdraw; }
-bool ReadOnly(const std::string& method) {
+bool NoSpendingRequired(const std::string& method) {
     return method == "listflowmeshmarkets" || method == "getflowmeshbalance" || method == "getblockchaininfo" ||
+        method == "getflowmeshclientinfo" || method == "flowmeshclientconnect" ||
         method == "getflowmeshmarketdata" || method == "getflowmeshactionstatus" || method == "listflowmeshactions" || method == "listflowmeshvaultoperations" || method == "testmempoolaccept";
 }
 QString RpcError(const UniValue& error) {
@@ -100,6 +103,16 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     auto* scroll{new QScrollArea{this}}; scroll->setWidgetResizable(true);
     auto* content{new QWidget{scroll}}; auto* layout{new QVBoxLayout{content}};
     layout->setContentsMargins(12, 10, 12, 12); layout->setSpacing(8);
+    auto* connection_row{new QHBoxLayout};
+    m_endpoint = new QLineEdit{content}; m_endpoint->setObjectName(QStringLiteral("flowMeshEndpoint"));
+    m_endpoint->setMaxLength(2048); m_endpoint->setPlaceholderText(tr("https://trading.example.org"));
+    m_endpoint->setAccessibleName(tr("HTTPS trading endpoint"));
+    m_endpoint->setToolTip(tr("Connect saves this HTTPS endpoint and checks market discovery. It does not unlock your wallet or submit any trading action."));
+    m_connect = new QPushButton{tr("Connect"), content}; m_connect->setObjectName(QStringLiteral("flowMeshConnect"));
+    connection_row->addWidget(m_endpoint, 1); connection_row->addWidget(m_connect); layout->addLayout(connection_row);
+    m_connection_status = Label(tr("Select a wallet to check its trading connection."), content);
+    m_connection_status->setObjectName(QStringLiteral("flowMeshConnectionStatus"));
+    B3Theme::markTextRole(m_connection_status, QStringLiteral("secondary")); layout->addWidget(m_connection_status);
     auto* heading{new QHBoxLayout}; auto* heading_copy{new QVBoxLayout};
     auto* eyebrow{Label(tr("FlowMesh"), content)}; B3Theme::markTextRole(eyebrow, QStringLiteral("h3")); heading_copy->addWidget(eyebrow);
     m_pair_title = Label(tr("Trade"), content); m_pair_title->hide(); heading->addLayout(heading_copy);
@@ -180,6 +193,9 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     m_admit = new QPushButton{this}; m_admit->hide();
     scroll->setWidget(content); outer->addWidget(scroll);
     connect(m_refresh, &QPushButton::clicked, this, &B3FlowMeshTradingPanel::refresh);
+    connect(m_connect, &QPushButton::clicked, this, &B3FlowMeshTradingPanel::requestConnect);
+    connect(m_endpoint, &QLineEdit::returnPressed, this, &B3FlowMeshTradingPanel::requestConnect);
+    connect(m_endpoint, &QLineEdit::textChanged, this, &B3FlowMeshTradingPanel::updateConnectionState);
     connect(m_orientation, &QComboBox::currentIndexChanged, this, [this] {
         // Never reinterpret a typed price or a deferred click in another unit.
         m_price->clear(); m_deferred_review.reset();
@@ -187,6 +203,9 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     });
     connect(m_market, &QComboBox::currentIndexChanged, this, [this] {
         m_deferred_status.reset(); // A queued click never follows a market switch.
+        // A failed read/backoff belongs to its selected market. Another listed
+        // market may already have a certified head and can be read immediately.
+        m_read_error.clear(); m_read_failed = false; m_read_failures = 0; m_attempt_age.invalidate();
         const auto selected{market()};
         if (!selected || !m_snapshot || selected->id != m_snapshot->market) {
             m_snapshot.reset(); m_response_age.invalidate(); m_certificate_age.invalidate(); m_queue_age.invalidate();
@@ -219,9 +238,10 @@ void B3FlowMeshTradingPanel::setWalletModel(WalletModel* wallet)
     cancelAndWait();
     m_wallet = wallet; m_backend.reset(); m_market_data.clear(); m_effect_data.clear(); m_snapshot.reset();
     m_saved_actions = {}; m_saved_actions_ready = false;
+    m_client_info.reset(); m_connection_error.clear(); m_connect_error.clear();
     { QSignalBlocker blocker{m_saved_selector}; m_saved_selector->clear(); }
     m_receipt_card->setText(wallet ? tr("Loading this wallet's locally saved requests. No action is automatically resent.") : tr("Open a wallet to inspect its saved requests."));
-    m_response_age.invalidate(); m_certificate_age.invalidate(); m_catalog_age.invalidate(); m_attempt_age.invalidate(); m_queue_age.invalidate(); m_read_failed = false; m_read_failures = 0;
+    m_response_age.invalidate(); m_certificate_age.invalidate(); m_catalog_age.invalidate(); m_attempt_age.invalidate(); m_queue_age.invalidate(); m_read_failed = false; m_read_failures = 0; m_read_error.clear();
     m_uncertain_refreshed = false;
     { QSignalBlocker blocker{m_market}; m_market->clear(); } m_effect->clear();
     m_wallet_name = wallet ? wallet->getDisplayName() : tr("No wallet");
@@ -263,6 +283,7 @@ void B3FlowMeshTradingPanel::updateMarketText()
     const auto selected{market()};
     const bool matched{selected && m_snapshot && m_snapshot->market == selected->id};
     QString status{m_wallet ? tr("Select a market") : tr("Select a wallet to trade")};
+    if (m_wallet && m_read_failed) status = tr("Market list unavailable");
     QString details{tr("Select a market to see its details.")};
     if (!selected) { m_balances->clear(); m_pair_title->setText(tr("Trade")); }
     else {
@@ -275,7 +296,7 @@ void B3FlowMeshTradingPanel::updateMarketText()
         }
         m_pair_title->setToolTip(tr("Wallet: %1\nCanonical base asset: %2\nMarket: %3\nVault: %4").arg(m_wallet_name, selected->base, selected->id, selected->vault));
         details = m_pair_title->toolTip() + (matched && m_snapshot->units.known ? tr("\nMetadata: %1 · %2 decimals · %3\nNames and tickers do not prove reserves or dollar backing.").arg(m_snapshot->units.source).arg(m_snapshot->units.decimals).arg(m_snapshot->units.test_only ? tr("TEST ASSET") : tr("asset identity shown above")) : tr("\nToken precision has not been verified."));
-        status = m_read_failed ? tr("Updates delayed · trading paused") : tr("Loading market…");
+        status = m_read_failed ? tr("Market data unavailable · trading paused") : tr("Loading market…");
         if (!matched) m_balances->clear();
         if (matched) {
             const auto& s{*m_snapshot};
@@ -317,6 +338,7 @@ void B3FlowMeshTradingPanel::updateMarketText()
     }
     m_progress->setText(progress);
     if (m_uncertain) status = tr("Submission outcome unknown · review before trading") + (matched && m_snapshot->units.test_only ? tr(" · TEST ASSET · unbacked") : QString{});
+    if (m_read_failed && !m_read_error.isEmpty()) status += QLatin1Char('\n') + m_read_error;
     if (!m_security_warning.isEmpty()) status = m_security_warning + QLatin1Char('\n') + status;
     m_status->setText(status); m_status->setToolTip(m_progress->text());
     updateTicket(); updateControls();
@@ -332,7 +354,7 @@ void B3FlowMeshTradingPanel::updateDataViews()
         for (auto* table : {m_depth_view, m_history_view, m_own_view}) SetRows(table, {});
         if (auto* title{m_depth_view->parentWidget()->findChild<QLabel*>(QStringLiteral("flowMeshLiquidityTitle"))}) title->setText(tr("Liquidity"));
         m_history_note->setText(tr("Trade history unavailable")); m_own_note->setText(tr("Orders unavailable"));
-        m_last_price->setText(tr("Last price  —")); m_liquidity_note->setText(matched ? tr("Asset precision unavailable") : tr("Loading liquidity…")); return;
+        m_last_price->setText(tr("Last price  —")); m_liquidity_note->setText(matched ? tr("Asset precision unavailable") : m_loading ? tr("Loading liquidity…") : selected ? tr("Market data unavailable") : tr("Select a market")); return;
     }
     const auto& s{*m_snapshot}; const auto& u{s.units};
     m_own_note->setText(s.own_curves.empty() ? tr("No open orders") : tr("Your open orders"));
@@ -484,7 +506,8 @@ void B3FlowMeshTradingPanel::updateControls()
     const bool idle{m_wallet && m_backend && !m_busy && m_security_warning.isEmpty()};
     // A read does not disable the ticket. A click waits for that read before
     // opening its review; writes remain serialized by m_busy and m_thread.
-    const bool signing{idle && m_saved_actions_ready && !m_uncertain && !m_backend->privateKeysDisabled()};
+    const bool connecting{m_deferred_connect || (m_active_result && !m_active_result->connect_url.isEmpty())};
+    const bool signing{idle && !connecting && m_saved_actions_ready && !m_uncertain && !m_backend->privateKeysDisabled()};
     const bool data_ready{selected && m_snapshot && m_snapshot->market == selected->id && !m_read_failed && B3FlowMeshMarketData::AdmissionReady(*m_snapshot, m_response_age.isValid() ? m_response_age.elapsed() : -1, m_certificate_age.isValid() ? m_certificate_age.elapsed() : -1, m_queue_age.isValid() ? m_queue_age.elapsed() : -1)};
     const bool ready{signing && selected && selected->ready && data_ready};
     const bool settlement_ready{selected && m_snapshot && m_snapshot->market == selected->id &&
@@ -511,14 +534,91 @@ void B3FlowMeshTradingPanel::updateControls()
     updateStatusReadState();
     m_chart->setStale(m_snapshot && (m_read_failed || !m_response_age.isValid() || m_response_age.elapsed() > 3000));
     m_chart->setLoading(m_loading);
+    updateConnectionState();
 }
 
 void B3FlowMeshTradingPanel::refresh()
 {
     if (!m_wallet || !m_backend || m_busy || m_thread) return;
+    if (m_deferred_connect) { resumeConnect(); return; }
     if (m_deferred_status) { resumeStatusRead(); return; }
     if (m_read_failures && m_attempt_age.isValid() && m_attempt_age.elapsed() < std::min(10000U, 500U << std::min(4U, m_read_failures))) return;
     startJob();
+}
+
+void B3FlowMeshTradingPanel::requestConnect()
+{
+    if (!m_connect->isEnabled() || !m_wallet || !m_backend || m_busy || m_cancel->load()) return;
+    if (m_active_result && !m_active_result->connect_url.isEmpty()) return;
+    m_deferred_review.reset(); // A reviewed market choice never follows an endpoint change.
+    m_connection_error.clear(); m_connect_error.clear();
+    m_deferred_connect = DeferredConnect{m_wallet, m_generation, &m_wallet->node(), m_endpoint->text().trimmed()};
+    resumeConnect(); updateControls();
+}
+
+void B3FlowMeshTradingPanel::resumeConnect()
+{
+    if (!m_deferred_connect || m_thread || m_busy) return;
+    const auto queued{*m_deferred_connect}; m_deferred_connect.reset();
+    if (m_wallet && m_backend && !m_cancel->load() && m_security_warning.isEmpty() &&
+        queued.wallet == m_wallet && queued.generation == m_generation && queued.node == &m_wallet->node())
+        startJob(std::nullopt, std::nullopt, false, false, std::nullopt, queued.url);
+    updateConnectionState();
+}
+
+void B3FlowMeshTradingPanel::updateConnectionState()
+{
+    const auto text = [](const UniValue& value, const char* field) {
+        const auto& item{value.find_value(field)}; return item.isStr() ? QString::fromStdString(item.get_str()).left(2048) : QString{};
+    };
+    const auto flag = [](const UniValue& value, const char* field) {
+        const auto& item{value.find_value(field)}; return item.isBool() && item.get_bool();
+    };
+    const bool local{m_client_info && (text(*m_client_info, "backend") == QStringLiteral("local") || flag(*m_client_info, "engine_enabled"))};
+    const bool running{m_active_result && !m_active_result->connect_url.isEmpty()};
+    const QUrl endpoint{m_endpoint->text().trimmed(), QUrl::StrictMode};
+    const bool valid_url{endpoint.isValid() && endpoint.scheme() == QStringLiteral("https") && !endpoint.host().isEmpty() && endpoint.userInfo().isEmpty() && !endpoint.hasQuery() && !endpoint.hasFragment()};
+    const bool editable{m_wallet && m_backend && !m_busy && m_security_warning.isEmpty() && !local};
+    const bool remote{m_client_info && text(*m_client_info, "backend") == QStringLiteral("remote")};
+    m_endpoint->setEnabled(editable); m_connect->setEnabled(editable && remote && valid_url && !running);
+    m_connect->setText(running ? tr("Connecting…") : m_deferred_connect ? tr("Connect queued") : tr("Connect"));
+    QString status{m_wallet ? tr("Checking trading connection…") : tr("Select a wallet to check its trading connection.")};
+    QString details{tr("Endpoint reachability does not establish market certification, validator quorum, or trading readiness.")};
+    if (m_wallet && m_client_info) {
+        if (local) status = tr("Local market engine · remote Connect is unavailable");
+        else {
+            const auto& endpoints{m_client_info->find_value("endpoints")};
+            const QString selected{text(*m_client_info, "selected_endpoint")}, active{text(*m_client_info, "active_endpoint")};
+            const UniValue* observation{nullptr};
+            if (endpoints.isArray()) for (const auto& row : endpoints.getValues()) {
+                if (!observation || text(row, "url") == selected) observation = &row;
+                if (text(row, "url") == selected) break;
+            }
+            if (!observation) status = tr("No HTTPS endpoint configured · enter an endpoint and Connect");
+            else {
+                const auto& attempted{observation->find_value("last_attempt_ms")};
+                if (!attempted.isNum() || attempted.getInt<int64_t>() == 0) status = tr("HTTPS endpoint configured · connection not yet checked");
+                else if (!flag(*observation, "transport_available")) status = tr("Selected endpoint: HTTPS connection failed");
+                else if (!flag(*observation, "available")) status = tr("Selected endpoint: HTTPS responded · market data unavailable");
+                else status = tr("HTTPS responded · selected-market readiness is shown below");
+                const QString error{text(*observation, "last_error")};
+                if (!error.isEmpty()) status += tr(" · %1").arg(error.left(500));
+                const auto& retry{observation->find_value("retry_after_ms")};
+                if (retry.isNum() && retry.getInt<int64_t>() > QDateTime::currentMSecsSinceEpoch())
+                    status += tr(" · retry in %1 s").arg((retry.getInt<int64_t>() - QDateTime::currentMSecsSinceEpoch() + 999) / 1000);
+                details += tr("\nSelected endpoint: %1").arg(selected);
+                if (!active.isEmpty()) details += tr("\nLast usable endpoint: %1").arg(active);
+                if (!active.isEmpty() && active != selected) status += tr("\nLast usable endpoint: %1").arg(active);
+                const auto& failures{observation->find_value("consecutive_failures")};
+                if (failures.isNum()) details += tr("\nConsecutive transport failures: %1").arg(failures.getInt<int64_t>());
+            }
+        }
+    }
+    if (!m_connection_error.isEmpty()) status += tr("\nConnection check: %1").arg(m_connection_error);
+    if (!m_connect_error.isEmpty()) status += tr("\nConnect failed: %1").arg(m_connect_error);
+    if (m_deferred_connect) status += tr("\nConnect queued after the current read: %1").arg(m_deferred_connect->url);
+    else if (running) status += tr("\nConnecting to %1…").arg(m_active_result->connect_url);
+    m_connection_status->setText(status); m_connection_status->setToolTip(details);
 }
 
 bool B3FlowMeshTradingPanel::confirm(const QString& text, bool final_transaction)
@@ -742,7 +842,7 @@ void B3FlowMeshTradingPanel::updateStatusReadState()
 }
 
 void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optional<B3AssetTransfer::Prepared> prepared, bool exact_retry, bool receipt_only,
-                                    std::optional<StatusRead> status_read)
+                                    std::optional<StatusRead> status_read, const QString& connect_url)
 {
     if (!m_wallet || !m_backend || m_thread) return;
     if (receipt_only) {
@@ -763,13 +863,14 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     }
     m_busy = action.has_value() || exact_retry; m_loading = !action && !m_snapshot; m_cancel->store(false); m_attempt_age.restart(); updateControls(); m_chart->setLoading(m_loading);
     auto result{std::make_shared<Result>()}; result->action = action; result->prepared = prepared; result->broadcast = prepared.has_value(); result->wallet = m_wallet_name;
+    result->connect_url = connect_url;
     result->exact_retry = exact_retry; result->receipt_only = receipt_only;
     result->receipt_scope = receipt_only ? status_read : !action && !exact_retry ? selectedStatusRead() : std::nullopt;
     m_active_result = result;
     auto* node{&m_wallet->node()}; const auto backend{m_backend}; const auto cancel{m_cancel};
     const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())}; const auto generation{m_generation};
     const auto selected{market()}; const QString selected_id{selected ? selected->id : QString{}};
-    result->catalog = !action && (!m_catalog_age.isValid() || m_catalog_age.elapsed() >= 5000 || m_route_pending || m_market_data.empty() || (m_snapshot && m_snapshot->chain_reconciling));
+    const bool refresh_catalog{!action && (!m_catalog_age.isValid() || m_catalog_age.elapsed() >= 5000 || m_route_pending || m_market_data.empty() || (m_snapshot && m_snapshot->chain_reconciling))};
     result->markets = m_market_data; result->effects = m_effect_data;
     const QString known_head{m_snapshot && m_snapshot->market == selected_id ? m_snapshot->head : QString{}};
     const QString route_base{m_route_pending ? m_requested_base : QString{}};
@@ -777,12 +878,22 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
         receipt_id{status_read ? status_read->action_id : tracked ? m_receipt->action_id : QString{}};
     result->receipt_market = receipt_market; result->receipt_action_id = receipt_id;
     result->receipt_account = status_read ? status_read->account : tracked ? m_pending_account : QString{};
-    m_thread = QThread::create([this, generation, node, backend, cancel, uri, result, selected_id, known_head, route_base, watch_queue, queue_watch, receipt_market, receipt_id] {
+    m_thread = QThread::create([this, generation, node, backend, cancel, uri, result, selected_id, known_head, route_base, refresh_catalog, watch_queue, queue_watch, receipt_market, receipt_id] {
+        const auto read_client_info = [&] {
+            if (cancel->load() || node->shutdownRequested()) return;
+            try {
+                auto info{node->executeRpc("getflowmeshclientinfo", UniValue{UniValue::VARR}, uri)};
+                if (!info.isObject()) throw std::runtime_error{"Trading connection status is unavailable."};
+                result->client_info = std::move(info); result->client_error.clear();
+            } catch (const UniValue& error) { result->client_error = RpcError(error); }
+            catch (const std::exception& error) { result->client_error = QString::fromUtf8(error.what()).left(500); }
+            catch (...) { result->client_error = QStringLiteral("Trading connection status is unavailable."); }
+        };
         try {
             const auto cancelled = [&] { return cancel->load() || node->shutdownRequested(); };
             const B3FlowMeshTrading::RpcCall rpc = [&](const std::string& method, const UniValue& params) {
                 if (cancelled()) throw std::runtime_error{"Operation cancelled."};
-                if (!ReadOnly(method)) {
+                if (!NoSpendingRequired(method)) {
                     // Readiness RPCs may themselves outlast the local deadline.
                     // Do not access UI timers from this worker; this captured
                     // monotonic observation only fails closed until refresh.
@@ -801,12 +912,21 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                     throw std::runtime_error{"Status response belongs to another captured wallet account."};
                 return receipt;
             };
+            if (!result->connect_url.isEmpty()) {
+                // This RPC persists endpoint selection and probes discovery;
+                // it neither needs spending unlock nor touches signed actions.
+                UniValue params{UniValue::VARR}; params.push_back(result->connect_url.toStdString());
+                auto info{rpc("flowmeshclientconnect", params)};
+                if (!info.isObject()) throw std::runtime_error{"Trading connection status is unavailable."};
+                result->client_info = std::move(info); return;
+            }
             if (result->exact_retry || result->receipt_only) {
                 const auto request{B3FlowMeshTrading::ReceiptParameters(receipt_market, receipt_id, result->exact_retry)};
                 result->receipt = read_receipt(rpc(request.method, request.params));
                 return;
             }
             if (!result->action) {
+                read_client_info();
                 // Restore public cards before attempting remote reads. The
                 // panel owns and drains this worker before destruction; the
                 // queued callback is context-bound and generation guarded.
@@ -814,10 +934,14 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                 QMetaObject::invokeMethod(this, [this, generation, saved] {
                     if (generation == m_generation && m_wallet && !m_cancel->load()) restoreSavedActions(saved);
                 }, Qt::QueuedConnection);
-                if (result->catalog) result->markets = B3FlowMeshTrading::ParseMarkets(rpc("listflowmeshmarkets", UniValue{UniValue::VARR}));
+                if (refresh_catalog) {
+                    result->markets = B3FlowMeshTrading::ParseMarkets(rpc("listflowmeshmarkets", UniValue{UniValue::VARR}));
+                    result->catalog = true; // Successful discovery survives a later selected-market failure.
+                }
                 auto selected{std::find_if(result->markets.begin(), result->markets.end(), [&](const auto& m) { return route_base.isEmpty() ? m.id == selected_id : m.base == route_base; })};
                 if (selected == result->markets.end() && selected_id.isEmpty() && route_base.isEmpty()) selected = result->markets.begin();
                 if (selected != result->markets.end()) {
+                    result->read_market = selected->id;
                     if (result->catalog && selected->remote) {
                         UniValue params{UniValue::VARR}; params.push_back(selected->id.toStdString());
                         const auto status{B3FlowMeshTrading::ParseMarket(rpc("getflowmeshbalance", params))};
@@ -850,6 +974,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                     } catch (const UniValue& error) { result->receipt_error = RpcError(error); }
                     catch (const std::exception& error) { result->receipt_error = QString::fromUtf8(error.what()).left(500); }
                 }
+                read_client_info(); // Include observations from this market read.
                 return;
             }
             auto& a{*result->action};
@@ -875,6 +1000,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
         } catch (const UniValue& error) { result->error = RpcError(error); }
         catch (const std::exception& error) { result->error = QString::fromUtf8(error.what()).left(500); }
         catch (...) { result->error = QStringLiteral("The FlowMesh operation failed."); }
+        if (!result->action && !result->exact_retry && !result->receipt_only) read_client_info();
     });
     m_thread->setParent(this); connect(m_thread, &QThread::finished, this, [this, result, generation] { if (generation == m_generation) finishJob(result); }); m_thread->start(); updateControls();
 }
@@ -894,13 +1020,29 @@ void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
     if (!self) return;
     // Drain on both successful and failed reads, including while hidden. The
     // existing worker must be destroyed before another read can be started.
-    resumeStatusRead();
+    resumeConnect(); resumeStatusRead();
     updateStatusReadState();
 }
 
 void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& result)
 {
     if (!m_wallet || m_cancel->load()) { m_deferred_review.reset(); restoreLock(); m_busy = false; updateControls(); return; }
+    if (result->client_info) {
+        m_client_info = result->client_info;
+        const auto& selected{m_client_info->find_value("selected_endpoint")};
+        if (selected.isStr() && m_endpoint->text().isEmpty() && !m_endpoint->isModified() && !m_endpoint->hasFocus())
+            m_endpoint->setText(QString::fromStdString(selected.get_str()));
+        m_connection_error.clear();
+    }
+    if (!result->client_error.isEmpty()) m_connection_error = result->client_error;
+    if (!result->connect_url.isEmpty()) {
+        m_connect_error = result->error;
+        // Keep the old display, but require a fresh certificate/account read
+        // after endpoint selection before enabling any economic action.
+        m_catalog_age.invalidate(); m_response_age.invalidate(); m_attempt_age.invalidate(); m_read_failures = 0;
+        m_read_failed = true; m_read_error = tr("Refreshing selected market after the connection check.");
+        m_loading = false; m_busy = false; updateMarketText(); refresh(); return;
+    }
     if (result->exact_retry || result->receipt_only) {
         m_busy = false;
         if (result->receipt) { applyReceipt(*result->receipt); notice(B3FlowMeshTrading::DescribeReceipt(*result->receipt)); }
@@ -918,9 +1060,16 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
     if (!result->error.isEmpty()) {
         m_deferred_review.reset();
         if (!result->action) {
+            if (result->catalog) applyMarketCatalog(*result);
+            const auto selected{market()};
+            if (!result->read_market.isEmpty() && (!selected || result->read_market != selected->id)) {
+                // Selection can change during a passive read. Keep discovery,
+                // but never attach that old market's error to the new choice.
+                m_loading = false; m_busy = false; updateDataViews(); updateMarketText(); refresh(); return;
+            }
             if (!m_read_failed) notice(tr("Market refresh failed: %1. Last certified data is retained; new actions are disabled until a successful refresh.").arg(result->error));
-            m_read_failed = true; m_read_failures = std::min(5U, m_read_failures + 1); m_loading = false; m_uncertain_refreshed = false; m_busy = false;
-            updateMarketText(); if (!m_snapshot) m_status->setText((m_security_warning.isEmpty() ? QString{} : m_security_warning + QLatin1Char('\n')) + tr("Market data unavailable · %1").arg(result->error)); updateControls(); return;
+            m_read_failed = true; m_read_error = result->error; m_read_failures = std::min(5U, m_read_failures + 1); m_loading = false; m_uncertain_refreshed = false; m_busy = false;
+            updateDataViews(); updateMarketText(); return;
         }
         restoreLock(); m_busy = false;
         if (result->write_attempted) markUncertain(result);
@@ -932,26 +1081,13 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
         updateMarketText(); return;
     }
     if (!result->action) {
-        m_loading = false; m_read_failed = false; m_read_failures = 0;
+        m_loading = false; m_read_failed = false; m_read_failures = 0; m_read_error.clear();
         applyReceiptError(*result, result->receipt_error);
         if (result->receipt) applyReceipt(*result->receipt);
-        if (result->catalog) m_catalog_age.restart();
         if (m_uncertain && (uncertainWalletSelected() || !m_uncertain_wallet)) m_uncertain_refreshed = true;
         const QString previous{market() ? market()->id : QString{}};
         const QString previous_effect{m_effect->currentData(Qt::UserRole + 1).toString()};
-        m_market_data = result->markets; m_effect_data = result->effects;
-        { std::vector<Choice> choices; QString selection{previous}; const bool route_asset{m_route_pending && !m_requested_base.isEmpty()};
-            if (route_asset) selection.clear();
-            for (size_t i{0}; i < m_market_data.size(); ++i) {
-                const auto& m{m_market_data[i]}; const auto* units{result->snapshot && result->snapshot->market == m.id && result->snapshot->units.known ? &result->snapshot->units : m_snapshot && m_snapshot->market == m.id && m_snapshot->units.known ? &m_snapshot->units : nullptr};
-                const QString token{units ? units->ticker : m.base.left(12) + QStringLiteral("…")};
-                const QString label{(inverted() ? QStringLiteral("B3 / %1") : QStringLiteral("%1 / B3")).arg(token)};
-                choices.push_back({label, m.id, m.id});
-                if (route_asset && m.base == m_requested_base) selection = m.id;
-            }
-            SetChoices(m_market, choices, selection, !route_asset);
-            if (route_asset && selection.isEmpty()) notice(tr("No established market was reported for the selected asset. This panel does not bootstrap one."));
-        }
+        applyMarketCatalog(*result); m_effect_data = result->effects;
         { std::vector<Choice> choices; const auto selected{market()};
             for (size_t i{0}; selected && i < m_effect_data.size(); ++i) {
                 const auto& e{m_effect_data[i]}; if (e.find_value("market_id").get_str() != selected->id.toStdString()) continue;
@@ -984,7 +1120,7 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
                 else if (new_head || !m_queue_age.isValid()) m_queue_age.restart();
             }
         } else if (!selected_now || !m_snapshot || selected_now->id != m_snapshot->market) { m_snapshot.reset(); m_response_age.invalidate(); m_queue_age.invalidate(); updateDataViews(); }
-        const bool changed_selection{selected_now && selected_now->id != previous};
+        const bool changed_selection{selected_now && (selected_now->id != previous || (!result->read_market.isEmpty() && selected_now->id != result->read_market))};
         const bool open_routed_funding{m_route_pending && selected_now && m_snapshot && m_snapshot->market == selected_now->id};
         if (open_routed_funding) { m_asset->setCurrentIndex(m_requested_base.isEmpty() ? 1 : 0); m_route_pending = false; }
         m_busy = false; updateMarketText();
@@ -1019,13 +1155,48 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
     updateMarketText(); refresh();
 }
 
+void B3FlowMeshTradingPanel::applyMarketCatalog(const Result& result)
+{
+    const QString previous{market() ? market()->id : QString{}};
+    auto markets{result.markets};
+    if (!result.error.isEmpty()) {
+        // Discovery rows are not certified balances. Preserve cached account
+        // displays only for exactly the same pins; the failed-read gate still
+        // disables every economic action until a successful selected read.
+        for (auto& market : markets) {
+            const auto retained{std::find_if(m_market_data.begin(), m_market_data.end(), [&](const auto& old) {
+                return old.id == market.id && old.base == market.base && old.vault == market.vault &&
+                    old.domain == market.domain && old.config == market.config && old.remote == market.remote;
+            })};
+            if (retained != m_market_data.end()) market = *retained;
+        }
+    }
+    m_market_data = std::move(markets);
+    std::vector<Choice> choices; QString selection{previous}; const bool route_asset{m_route_pending && !m_requested_base.isEmpty()};
+    if (route_asset) selection.clear();
+    for (const auto& market : m_market_data) {
+        const auto* units{result.error.isEmpty() && result.snapshot && result.snapshot->market == market.id && result.snapshot->units.known ? &result.snapshot->units : m_snapshot && m_snapshot->market == market.id && m_snapshot->units.known ? &m_snapshot->units : nullptr};
+        const QString token{units ? units->ticker : market.base.left(12) + QStringLiteral("…")};
+        choices.push_back({(inverted() ? QStringLiteral("B3 / %1") : QStringLiteral("%1 / B3")).arg(token), market.id, market.id});
+        if (route_asset && market.base == m_requested_base) selection = market.id;
+    }
+    SetChoices(m_market, choices, selection, !route_asset);
+    if (route_asset && selection.isEmpty()) notice(tr("No established market was reported for the selected asset. This panel does not bootstrap one."));
+    if (result.catalog) m_catalog_age.restart();
+    const auto selected{market()};
+    if (m_snapshot && (!selected || selected->id != m_snapshot->market || selected->base != m_snapshot->base ||
+        selected->domain != m_snapshot->domain || selected->config != m_snapshot->config || selected->remote != m_snapshot->remote)) {
+        m_snapshot.reset(); m_response_age.invalidate(); m_certificate_age.invalidate(); m_queue_age.invalidate();
+    }
+}
+
 void B3FlowMeshTradingPanel::stopWorker()
 {
     if (!m_thread) return; disconnect(m_thread, nullptr, this, nullptr); m_thread->wait(); delete m_thread; m_thread = nullptr;
 }
 void B3FlowMeshTradingPanel::cancelAndWait()
 {
-    m_timer->stop(); m_cancel->store(true); m_deferred_review.reset(); m_deferred_status.reset(); ++m_generation;
+    m_timer->stop(); m_cancel->store(true); m_deferred_review.reset(); m_deferred_status.reset(); m_deferred_connect.reset(); ++m_generation;
     m_busy = true; updateControls();
     if (m_wallet) disconnect(m_wallet, nullptr, this, nullptr);
     if (m_confirmation) m_confirmation->reject();

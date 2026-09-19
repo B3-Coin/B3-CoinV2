@@ -21,6 +21,8 @@ namespace wallet {
 
 //! Wallet-scoped retained-action RPC; also constructed by startup-schema tests.
 RPCHelpMan listflowmeshactions();
+RPCHelpMan flowmeshclientconnect();
+RPCHelpMan getflowmeshclientinfo();
 
 /**
  * Wallet-side admission result for creating a keyless FlowMesh vault output.

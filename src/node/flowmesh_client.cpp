@@ -50,6 +50,7 @@ constexpr size_t CLIENT_MAX_REPLY{24 * 1024 * 1024};
 constexpr size_t CLIENT_MAX_MARKETS{256};
 constexpr size_t CLIENT_MAX_CACHED_MARKETS{8};
 constexpr size_t CLIENT_MAX_ACTIONS{512};
+constexpr size_t CLIENT_MAX_ENDPOINTS{8};
 constexpr auto CLIENT_REQUEST_TIMEOUT{std::chrono::seconds{5}};
 
 [[noreturn]] void Fail(const std::string& reason) { throw std::runtime_error(reason); }
@@ -453,9 +454,18 @@ struct ClientJournalBlob {
     SERIALIZE_METHODS(ClientJournalBlob, obj) { READWRITE(LIMITED_STRING(obj.json, 8 * 1024 * 1024)); }
 };
 
+// Kept separately from signed instructions and verified high-water marks.
+// Only user-added public origins are stored; trust material stays in config.
+struct ClientEndpointBlob {
+    std::string json;
+    SERIALIZE_METHODS(ClientEndpointBlob, obj) { READWRITE(LIMITED_STRING(obj.json, 32 * 1024)); }
+};
+
 class RemoteBackend final : public FlowMeshTradingBackend {
     ChainstateManager& m_chainman;
-    const std::vector<HttpsEndpoint> m_endpoints;
+    std::vector<HttpsEndpoint> m_endpoints;
+    std::vector<std::string> m_saved_endpoints;
+    std::vector<std::chrono::steady_clock::time_point> m_retry_after;
     const fs::path m_path;
     // Network waits never hold cs_main, a wallet lock or an operator lock.
     // Only this client's requests are serialized; Status remains nonblocking.
@@ -467,6 +477,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     mutable std::mutex m_status_mutex;
     interfaces::FlowMeshClientStatus m_status;
     size_t m_selected{0};
+    // Read preference survives successful failover, so a recovered preferred
+    // service is tried again after its transport cooldown expires.
+    size_t m_preferred{0};
     std::unique_ptr<CDBWrapper> m_db;
     struct Pending {
         uint256 market, domain, config;
@@ -581,11 +594,22 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         (void)Text(value, "halt"); (void)Text(value, "error");
         (void)Number(value, "next_microblock_sequence"); (void)Id(value, "last_microblock_hash", true);
     }
-    void EndpointResult(size_t endpoint, const std::string& error)
+    void EndpointResult(size_t endpoint, bool transport_available, const std::string& error)
     {
         std::lock_guard lock{m_status_mutex};
         auto& row{m_status.endpoints.at(endpoint)};
         row.available = error.empty(); row.last_error = error.substr(0, 1024);
+        row.transport_available = transport_available;
+        row.last_attempt_ms = TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());
+        if (transport_available) {
+            row.consecutive_failures = 0; row.retry_after_ms = 0;
+            m_retry_after[endpoint] = {};
+        } else {
+            row.consecutive_failures = std::min(row.consecutive_failures + 1, uint32_t{16});
+            const auto delay{std::chrono::seconds{std::min(uint32_t{1} << row.consecutive_failures, uint32_t{60})}};
+            row.retry_after_ms = row.last_attempt_ms + std::chrono::duration_cast<std::chrono::milliseconds>(delay).count();
+            m_retry_after[endpoint] = std::chrono::steady_clock::now() + delay;
+        }
         if (error.empty()) m_status.active_endpoint = row.url;
     }
     UniValue Call(const std::string& method, const UniValue& params,
@@ -593,36 +617,87 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                   bool* possibly_sent = nullptr, bool* earlier_possible = nullptr,
                   size_t* attempted_endpoints = nullptr)
     {
-        if (m_endpoints.empty()) Fail("No FlowMesh HTTPS trading endpoint configured; use -flowmeshendpoint");
+        if (m_endpoints.empty()) Fail("No FlowMesh HTTPS trading endpoint configured; use flowmeshclientconnect or -flowmeshendpoint");
         UniValue request{UniValue::VOBJ}; request.pushKV("method", method); request.pushKV("params", params);
         const std::string body{request.write()};
         std::string error;
-        const size_t first{m_selected};
+        // An explicit reconnect counts fresh probes and bypasses automatic
+        // read cooldowns; exact-action submission/recovery keeps its full cycle.
+        const bool automatic_read{!possibly_sent && !attempted_endpoints && method != "action"};
+        const size_t first{automatic_read ? m_preferred : m_selected};
         for (size_t attempt{0}; attempt < m_endpoints.size(); ++attempt) {
             const size_t endpoint{(first + attempt) % m_endpoints.size()};
+            if (automatic_read && std::chrono::steady_clock::now() < m_retry_after[endpoint]) continue;
+            bool transport_available{false};
             try {
                 if (attempted_endpoints) ++*attempted_endpoints;
                 if (earlier_possible && possibly_sent) *earlier_possible = *possibly_sent;
                 const auto reply{FlowMeshHttpsRequest(m_endpoints[endpoint], "/flowmesh/v1", body, CLIENT_REQUEST_TIMEOUT, CLIENT_MAX_REPLY)};
                 if (possibly_sent && reply.request_may_have_been_sent) *possibly_sent = true;
                 if (!reply.response_received) Fail(reply.error.empty() ? "No HTTPS response; outcome unknown" : reply.error);
+                transport_available = true;
                 UniValue parsed;
                 if (!parsed.read(reply.body)) Fail("Malformed endpoint JSON response");
                 Keys(parsed, {"ok", "result", "error"});
                 if (!Flag(parsed, "ok")) Fail(Text(parsed, "error"));
                 if (reply.status != 200) Fail("Unexpected HTTPS response status");
                 validate(parsed["result"], endpoint);
-                m_selected = endpoint; EndpointResult(endpoint, {});
+                m_selected = endpoint; EndpointResult(endpoint, true, {});
                 return parsed["result"];
             } catch (const std::exception& e) {
-                error = e.what(); EndpointResult(endpoint, error);
+                error = e.what(); EndpointResult(endpoint, transport_available, error);
             }
         }
-        Fail(error.empty() ? "All configured trading endpoints are unavailable" : error);
+        if (error.empty()) {
+            std::lock_guard lock{m_status_mutex};
+            error = "Trading endpoints are waiting to retry";
+            if (!m_status.endpoints[first].last_error.empty()) error += ": " + m_status.endpoints[first].last_error;
+        }
+        Fail(error);
     }
     void OpenJournal()
     {
         if (!m_db) m_db = std::make_unique<CDBWrapper>(DBParams{.path=m_path, .cache_bytes=1 << 20});
+    }
+    void SaveEndpoints(const std::vector<std::string>& urls, const std::string& selected)
+    {
+        UniValue root{UniValue::VOBJ}, entries{UniValue::VARR};
+        root.pushKV("version", 1);
+        for (const auto& url : urls) entries.push_back(url);
+        root.pushKV("urls", std::move(entries)); root.pushKV("selected_url", selected);
+        OpenJournal();
+        m_db->Write(std::string{"public-client-endpoints-v1"}, ClientEndpointBlob{root.write()}, true);
+    }
+    void RestoreEndpoints()
+    {
+        if (!fs::exists(m_path)) return;
+        OpenJournal();
+        if (!m_db->Exists(std::string{"public-client-endpoints-v1"})) return;
+        ClientEndpointBlob blob;
+        if (!m_db->Read(std::string{"public-client-endpoints-v1"}, blob)) Fail("Saved trading endpoints are unreadable; preserved without reset");
+        UniValue root;
+        if (!root.read(blob.json)) Fail("Malformed saved trading endpoints; preserved without reset");
+        Keys(root, {"version", "urls", "selected_url"});
+        if (Number(root, "version", 1) != 1 || !root["urls"].isArray() || root["urls"].size() > CLIENT_MAX_ENDPOINTS)
+            Fail("Malformed saved trading endpoint list; preserved without reset");
+        const std::string selected{Text(root, "selected_url", 2048)};
+        for (const auto& value : root["urls"].getValues()) {
+            if (!value.isStr()) Fail("Saved trading endpoint is not a public HTTPS URL");
+            HttpsEndpoint endpoint{value.get_str(), {}, {}};
+            std::string error;
+            if (!NormalizeFlowMeshHttpsEndpoint(endpoint, error) || endpoint.url != value.get_str())
+                Fail("Invalid saved trading endpoint; preserved without reset");
+            if (std::find(m_saved_endpoints.begin(), m_saved_endpoints.end(), endpoint.url) != m_saved_endpoints.end())
+                Fail("Duplicate saved trading endpoint; preserved without reset");
+            m_saved_endpoints.push_back(endpoint.url);
+            // Explicit startup trust always wins for an existing origin.
+            if (std::any_of(m_endpoints.begin(), m_endpoints.end(), [&](const auto& existing) { return existing.url == endpoint.url; })) continue;
+            if (m_endpoints.size() == CLIENT_MAX_ENDPOINTS) Fail("Configured and saved trading endpoints exceed eight; preserved without reset");
+            if (!ValidateFlowMeshHttpsTrust(endpoint, error)) Fail(error);
+            m_endpoints.push_back(std::move(endpoint));
+        }
+        const auto it{std::find_if(m_endpoints.begin(), m_endpoints.end(), [&](const auto& endpoint) { return endpoint.url == selected; })};
+        if (it != m_endpoints.end()) m_selected = std::distance(m_endpoints.begin(), it);
     }
     void Save()
     {
@@ -989,12 +1064,61 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     }
 public:
     RemoteBackend(ChainstateManager& chainman, std::vector<HttpsEndpoint> endpoints, const fs::path& path)
-        : m_chainman{chainman}, m_endpoints{std::move(endpoints)}, m_path{path}
+        : m_chainman{chainman}, m_path{path}
     {
-        if (m_endpoints.size() > 8) Fail("At most eight independent trading endpoints may be configured");
+        if (endpoints.size() > CLIENT_MAX_ENDPOINTS) Fail("At most eight independent trading endpoints may be configured");
+        for (auto& endpoint : endpoints) {
+            std::string error;
+            if (!NormalizeFlowMeshHttpsEndpoint(endpoint, error) || !ValidateFlowMeshHttpsTrust(endpoint, error)) Fail(error);
+            const auto existing{std::find_if(m_endpoints.begin(), m_endpoints.end(), [&](const auto& candidate) { return candidate.url == endpoint.url; })};
+            if (existing != m_endpoints.end()) {
+                if (existing->ca_file != endpoint.ca_file || existing->certificate_sha256 != endpoint.certificate_sha256)
+                    Fail("Duplicate trading endpoint has conflicting CA or certificate-pin settings");
+                continue;
+            }
+            m_endpoints.push_back(std::move(endpoint));
+        }
         m_status.backend = "remote"; m_status.engine_enabled = false;
-        for (const auto& endpoint : m_endpoints) m_status.endpoints.push_back({endpoint.url, false, {}});
         Restore();
+        RestoreEndpoints();
+        m_preferred = m_selected;
+        m_retry_after.resize(m_endpoints.size());
+        for (const auto& endpoint : m_endpoints) m_status.endpoints.push_back({endpoint.url, false, {}});
+        if (!m_endpoints.empty()) m_status.selected_endpoint = m_endpoints[m_selected].url;
+    }
+    bool Connect(const std::string& url, std::string& error) override
+    {
+        error.clear();
+        HttpsEndpoint endpoint{url, {}, {}};
+        if (!NormalizeFlowMeshHttpsEndpoint(endpoint, error)) return false;
+        std::lock_guard lock{m_work};
+        try {
+            const auto existing{std::find_if(m_endpoints.begin(), m_endpoints.end(), [&](const auto& candidate) { return candidate.url == endpoint.url; })};
+            const bool added{existing == m_endpoints.end()};
+            if (added && m_endpoints.size() == CLIENT_MAX_ENDPOINTS) Fail("At most eight independent trading endpoints may be configured");
+            if (added && !ValidateFlowMeshHttpsTrust(endpoint, error)) return false;
+            const size_t selected{added ? m_endpoints.size() : static_cast<size_t>(std::distance(m_endpoints.begin(), existing))};
+            auto saved{m_saved_endpoints};
+            if (added) saved.push_back(endpoint.url);
+            // A configured endpoint is selected as-is, never rewritten with
+            // default trust. Persist before publishing an in-memory change.
+            SaveEndpoints(saved, endpoint.url);
+            if (added) {
+                m_endpoints.push_back(endpoint); m_saved_endpoints = std::move(saved);
+                m_retry_after.emplace_back();
+            }
+            m_selected = selected; m_preferred = selected; m_retry_after[selected] = {};
+            {
+                std::lock_guard status_lock{m_status_mutex};
+                if (added) m_status.endpoints.push_back({endpoint.url, false, {}});
+                m_status.selected_endpoint = endpoint.url;
+                m_status.endpoints[selected].retry_after_ms = 0;
+            }
+        } catch (const std::exception& e) { error = e.what(); return false; }
+        // Reachability is an observation, not configuration failure. Only
+        // market discovery is sent; no retained action is inspected or sent.
+        try { (void)ReadMarkets(); } catch (const std::exception&) {}
+        return true;
     }
     std::optional<modern::AssetDisplayMetadata> Metadata(const uint256& asset) const override
     {
@@ -1003,19 +1127,25 @@ public:
         return it == m_metadata.end() ? std::nullopt : std::optional{it->second};
     }
     uint64_t MetadataGeneration() const override { return m_metadata_generation.load(std::memory_order_acquire); }
-    std::vector<MarketStatus> Markets(const std::optional<uint256>& account) override
+private:
+    UniValue ReadMarkets()
     {
-        std::lock_guard lock{m_work};
-        std::vector<MarketStatus> out;
         UniValue params{UniValue::VOBJ};
-        const auto rows{Call("markets", params, [&](const UniValue& value, size_t) {
+        return Call("markets", params, [&](const UniValue& value, size_t) {
             if (!value.isArray() || value.size() > CLIENT_MAX_MARKETS) Fail("Market discovery exceeds bound");
             std::set<uint256> seen;
             for (const auto& row : value.getValues()) {
                 const auto id{Id(row, "market_id")}; if (!seen.insert(id).second) Fail("Duplicate market identity");
                 CheckStatus(row, Pins(id));
             }
-        })};
+        });
+    }
+public:
+    std::vector<MarketStatus> Markets(const std::optional<uint256>& account) override
+    {
+        std::lock_guard lock{m_work};
+        std::vector<MarketStatus> out;
+        const auto rows{ReadMarkets()};
         // Discovery is bounded metadata; selected market gets full proof on
         // demand, not every market's snapshot on each Qt refresh.
         for (const auto& row : rows.getValues()) {
@@ -1169,7 +1299,7 @@ public:
         if (!work.owns_lock()) return out;
         if (m_endpoints.empty()) {
             out.status = "not_configured";
-            out.error = "No FlowMesh HTTPS trading endpoint configured; use -flowmeshendpoint and restart";
+            out.error = "No FlowMesh HTTPS trading endpoint configured; use flowmeshclientconnect or -flowmeshendpoint";
             return out;
         }
         try {

@@ -613,6 +613,29 @@ static RPCHelpMan ActionStatusRPC(const bool retry)
         }};
 }
 
+RPCResult ClientStatusResult()
+{
+    return RPCResult{RPCResult::Type::OBJ, "", "Local trading client status", {
+            {RPCResult::Type::STR, "backend", "local or remote"},
+            {RPCResult::Type::BOOL, "engine_enabled", "Whether the optional local validator engine is enabled with -enableflowmeshvalidator"},
+            {RPCResult::Type::STR, "active_endpoint", "Endpoint of the most recent successful API result, or empty"},
+            {RPCResult::Type::STR, "selected_endpoint", "Explicitly selected remote endpoint, or initial configured endpoint; read failover may use another"},
+            {RPCResult::Type::NUM, "event_gaps", "Observed cursor gaps requiring snapshot recovery"},
+            {RPCResult::Type::NUM, "pending_actions", "Locally retained actions without a terminal receipt; not trades or fills"},
+            {RPCResult::Type::ARR, "endpoints", "Configured trading endpoints", {
+                {RPCResult::Type::OBJ, "", "Endpoint observation", {
+                    {RPCResult::Type::STR, "url", "Configured HTTPS URL"},
+                    {RPCResult::Type::BOOL, "available", "Last request returned a usable API result; does not prove a certified head"},
+                    {RPCResult::Type::STR, "last_error", "Bounded last request error"},
+                    {RPCResult::Type::BOOL, "transport_available", "Last request received an authenticated HTTPS response, independent of market readiness"},
+                    {RPCResult::Type::NUM, "last_attempt_ms", "Unix time in milliseconds of last completed attempt, or zero"},
+                    {RPCResult::Type::NUM, "retry_after_ms", "Unix time in milliseconds before another automatic read attempt, or zero"},
+                    {RPCResult::Type::NUM, "consecutive_failures", "Consecutive transport failures; API or market errors do not impose a transport cooldown"},
+                }},
+            }},
+        }};
+}
+
 } // namespace
 
 RPCHelpMan getflowmeshclientinfo()
@@ -621,24 +644,30 @@ RPCHelpMan getflowmeshclientinfo()
         "getflowmeshclientinfo",
         "Read the node's configured FlowMesh trading backend, endpoint observations and local receipt backlog without unlocking or creating wallet keys. Endpoint availability does not prove quorum or the freshest certified head.\n",
         {},
-        RPCResult{RPCResult::Type::OBJ, "", "Local trading client status", {
-            {RPCResult::Type::STR, "backend", "local or remote"},
-            {RPCResult::Type::BOOL, "engine_enabled", "Whether the optional local validator engine is enabled with -enableflowmeshvalidator"},
-            {RPCResult::Type::STR, "active_endpoint", "Most recently selected remote endpoint, or empty"},
-            {RPCResult::Type::NUM, "event_gaps", "Observed cursor gaps requiring snapshot recovery"},
-            {RPCResult::Type::NUM, "pending_actions", "Locally retained actions without a terminal receipt; not trades or fills"},
-            {RPCResult::Type::ARR, "endpoints", "Configured trading endpoints", {
-                {RPCResult::Type::OBJ, "", "Endpoint observation", {
-                    {RPCResult::Type::STR, "url", "Configured HTTPS URL"},
-                    {RPCResult::Type::BOOL, "available", "Last observed request availability"},
-                    {RPCResult::Type::STR, "last_error", "Bounded last request error"},
-                }},
-            }},
-        }},
+        ClientStatusResult(),
         RPCExamples{HelpExampleCli("getflowmeshclientinfo", "")},
         [](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
             const auto wallet{GetWalletForJSONRPCRequest(request)};
             if (!wallet) return UniValue::VNULL;
+            return node::FlowMeshClientStatusJson(wallet->chain().flowMeshClientStatus());
+        }};
+}
+
+RPCHelpMan flowmeshclientconnect()
+{
+    return RPCHelpMan{
+        "flowmeshclientconnect",
+        "Add or select an HTTPS trading endpoint and run a bounded read-only discovery attempt. Returns observations even if the service is unavailable. New public URLs persist across restart and use default CA trust; selecting an existing endpoint preserves its configured CA and certificate pin. At most eight endpoints are allowed. CA and hostname verification are always required. This does not enable the validator engine, unlock the wallet, sign, or submit any action.\n",
+        {{"url", RPCArg::Type::STR, RPCArg::Optional::NO, "HTTPS origin or /flowmesh/v1 URL, without credentials, query, or fragment"}},
+        ClientStatusResult(),
+        RPCExamples{HelpExampleCli("flowmeshclientconnect", "\"https://trading.example.org\"")},
+        [](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto wallet{GetWalletForJSONRPCRequest(request)};
+            if (!wallet) return UniValue::VNULL;
+            std::string error;
+            if (!wallet->chain().connectFlowMeshClient(request.params[0].get_str(), error)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, error);
+            }
             return node::FlowMeshClientStatusJson(wallet->chain().flowMeshClientStatus());
         }};
 }

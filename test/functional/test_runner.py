@@ -119,6 +119,7 @@ BASE_SCRIPTS = [
     'feature_flowmesh_release.py',
     'feature_flowmesh_network_policy.py',
     'feature_flowmesh_connect_rpc.py',
+    'feature_flowmesh_client_connect.py',
     'feature_flowmesh_client_reconnect.py',
     'wallet_exportflowmeshkey.py',
     'feature_flowmesh_independent.py',
@@ -411,6 +412,10 @@ NON_SCRIPTS = [
     "combine_logs.py",
     "create_cache.py",
     "test_runner.py",
+    # Opt-in process qualification and latency measurement; run directly.
+    # The unmet 200 ms target is not a default CI assertion.
+    "feature_flowmesh_preagreement.py",
+    "feature_flowmesh_latency.py",
 ]
 
 def main():

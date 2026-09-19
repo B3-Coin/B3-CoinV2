@@ -59,7 +59,9 @@ private:
         std::optional<B3FlowMeshTrading::Receipt> receipt;
         std::optional<StatusRead> receipt_scope;
         UniValue response;
-        QString wallet, error, receipt_error;
+        std::optional<UniValue> client_info;
+        QString connect_url, client_error;
+        QString wallet, error, receipt_error, read_market;
         QString receipt_market, receipt_account, receipt_action_id;
         bool broadcast{false}, write_attempted{false}, catalog{false}, exact_retry{false}, receipt_only{false};
     };
@@ -70,6 +72,15 @@ private:
         QString market;
         QString effect;
     };
+    struct DeferredConnect {
+        QPointer<WalletModel> wallet;
+        uint64_t generation;
+        interfaces::Node* node;
+        QString url;
+    };
+    void requestConnect();
+    void resumeConnect();
+    void updateConnectionState();
     bool deferReview(B3FlowMeshTrading::Operation operation, bool funding = false);
     void resumeReview();
     void refresh();
@@ -82,7 +93,7 @@ private:
     bool confirm(const QString& text, bool final_transaction);
     void startJob(std::optional<B3FlowMeshTrading::Action> action = std::nullopt,
                   std::optional<B3AssetTransfer::Prepared> prepared = std::nullopt, bool exact_retry = false, bool receipt_only = false,
-                  std::optional<StatusRead> status_read = std::nullopt);
+                  std::optional<StatusRead> status_read = std::nullopt, const QString& connect_url = {});
     std::optional<StatusRead> selectedStatusRead() const;
     bool statusReadValid(const StatusRead& scope, bool selected) const;
     void requestStatusRead();
@@ -99,6 +110,7 @@ private:
         B3FlowMeshMarketData::Snapshot& snapshot);
     void finishJob(const std::shared_ptr<Result>& result);
     void applyJobResult(const std::shared_ptr<Result>& result);
+    void applyMarketCatalog(const Result& result);
     void stopWorker();
     bool restoreLock();
     void notice(const QString& text);
@@ -117,6 +129,9 @@ private:
     std::shared_ptr<Result> m_active_result;
     std::optional<DeferredReview> m_deferred_review;
     std::optional<StatusRead> m_deferred_status;
+    std::optional<DeferredConnect> m_deferred_connect;
+    std::optional<UniValue> m_client_info;
+    QString m_connection_error, m_connect_error;
     QString m_wallet_name, m_security_warning, m_requested_base, m_relock_wallet_name, m_uncertain_details, m_uncertain_action_id;
     QString m_uncertain_market, m_uncertain_account;
     std::unique_ptr<WalletModel::UnlockContext> m_unlock;
@@ -133,6 +148,7 @@ private:
     QElapsedTimer m_response_age, m_certificate_age, m_catalog_age, m_attempt_age, m_queue_age;
     unsigned m_read_failures{0};
     bool m_loading{false}, m_read_failed{false};
+    QString m_read_error;
     std::vector<B3FlowMeshTrading::Market> m_market_data;
     std::vector<UniValue> m_effect_data;
     B3FlowMeshTrading::SavedActions m_saved_actions;
@@ -148,6 +164,9 @@ private:
     QComboBox* m_asset{nullptr};
     QComboBox* m_effect{nullptr};
     QLineEdit* m_price{nullptr};
+    QLineEdit* m_endpoint{nullptr};
+    QPushButton* m_connect{nullptr};
+    QLabel* m_connection_status{nullptr};
     QLineEdit* m_quantity{nullptr};
     QLineEdit* m_amount{nullptr};
     QLineEdit* m_destination{nullptr};

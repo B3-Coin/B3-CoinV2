@@ -1298,6 +1298,11 @@ public:
         status.engine_enabled = m_node.flowmesh && m_node.flowmesh->Enabled();
         return status;
     }
+    bool connectFlowMeshClient(const std::string& url, std::string& error) override
+    {
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Connect(url, error);
+        return interfaces::Chain::connectFlowMeshClient(url, error);
+    }
     std::vector<interfaces::FlowMeshSavedAction> flowMeshSavedActions(
         const uint256& account_id, const std::optional<uint256>& market_id) override
     {

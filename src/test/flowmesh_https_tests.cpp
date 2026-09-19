@@ -3,6 +3,8 @@
 // file COPYING or https://opensource.org/license/mit/.
 
 #include <node/flowmesh_https.h>
+#include <node/flowmesh_client.h>
+#include <dbwrapper.h>
 #include <test/util/setup_common.h>
 #include <util/fs.h>
 #include <util/sock.h>
@@ -24,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -311,6 +314,32 @@ public:
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_https_tests, HttpsFixture)
+
+BOOST_AUTO_TEST_CASE(https_origin_normalization_preserves_trust_and_rejects_credentials)
+{
+    const std::vector<std::pair<std::string, std::string>> origins{
+        {"https://EXAMPLE.org:443/flowmesh/v1", "https://example.org"},
+        {"https://example.org/", "https://example.org"},
+        {"https://127.0.0.1:5650/flowmesh/v1", "https://127.0.0.1:5650"},
+        {"https://[0:0:0:0:0:0:0:1]:443/", "https://[::1]"},
+    };
+    for (const auto& [url, normalized] : origins) {
+        node::HttpsEndpoint endpoint{url, cert, pin};
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(node::NormalizeFlowMeshHttpsEndpoint(endpoint, error), error);
+        BOOST_CHECK_EQUAL(endpoint.url, normalized);
+        BOOST_CHECK(endpoint.ca_file == cert);
+        BOOST_CHECK_EQUAL(endpoint.certificate_sha256, pin);
+    }
+    for (const std::string url : {"http://example.org", "https://user:secret@example.org", "https://example.org?token=secret",
+                                 "https://example.org/#secret", "https://example.org/admin", "https://example.org:0",
+                                 "https://example.org:65536", "https://example.org/\n"}) {
+        node::HttpsEndpoint endpoint{url, cert, pin};
+        std::string error;
+        BOOST_CHECK(!node::NormalizeFlowMeshHttpsEndpoint(endpoint, error));
+        BOOST_CHECK_EQUAL(endpoint.url, url);
+    }
+}
 
 BOOST_AUTO_TEST_CASE(https_roundtrip_verifies_ca_ip_and_pin_and_preserves_exact_body)
 {
@@ -776,6 +805,249 @@ BOOST_AUTO_TEST_CASE(https_cleanup_stop_observes_inflight_rejection_then_restart
     BOOST_CHECK_EQUAL(healthy.status, 200);
     BOOST_CHECK_EQUAL(handled.load(), 1U);
     server.Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+struct ClientConnectFixture : TestingSetup {
+    ScopedClientSignals signals;
+    fs::path cert{m_path_root / "client-cert.pem"};
+    fs::path key{m_path_root / "client-key.pem"};
+    std::string pin;
+
+    ClientConnectFixture() : TestingSetup{ChainType::REGTEST}
+    {
+        HttpsFixture::CreateCertificate(cert, key, pin, true);
+    }
+    node::FlowMeshHttpsServer::Options Options() const
+    {
+        node::FlowMeshHttpsServer::Options options;
+        options.cert_file = cert; options.key_file = key;
+        options.request_timeout = std::chrono::seconds{2};
+        return options;
+    }
+    node::HttpsEndpoint Endpoint(const node::FlowMeshHttpsServer& server) const
+    {
+        return {"https://127.0.0.1:" + std::to_string(server.Port()), cert, pin};
+    }
+};
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_connect_tests, ClientConnectFixture)
+
+BOOST_AUTO_TEST_CASE(client_read_failover_distinguishes_https_from_application_readiness)
+{
+    std::atomic<unsigned int> first_requests{0}, second_requests{0};
+    node::FlowMeshHttpsServer first{Options(), [&](const auto&) {
+        ++first_requests;
+        return node::FlowMeshHttpsServer::Response{200, R"({"ok":false,"error":"Market has no certified head yet","result":null})"};
+    }};
+    node::FlowMeshHttpsServer second{Options(), [&](const auto&) {
+        ++second_requests;
+        return node::FlowMeshHttpsServer::Response{200, R"({"ok":true,"result":[],"error":""})"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(first.Start(error), error);
+    BOOST_REQUIRE_MESSAGE(second.Start(error), error);
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(first), Endpoint(second)}, m_path_root / "client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_CHECK(client->Markets(std::nullopt).empty());
+    auto status{client->Status()};
+    BOOST_REQUIRE_EQUAL(status.endpoints.size(), 2U);
+    BOOST_CHECK(status.endpoints[0].transport_available);
+    BOOST_CHECK(!status.endpoints[0].available);
+    BOOST_CHECK_EQUAL(status.endpoints[0].retry_after_ms, 0);
+    BOOST_CHECK_EQUAL(status.endpoints[0].consecutive_failures, 0U);
+    BOOST_CHECK_EQUAL(status.endpoints[0].last_error, "Market has no certified head yet");
+    BOOST_CHECK(status.endpoints[1].available);
+    BOOST_CHECK_EQUAL(status.active_endpoint, Endpoint(second).url);
+    // Another explicit probe must reach the semantically unavailable server
+    // immediately; its error must not trigger a transport cooldown.
+    BOOST_REQUIRE_MESSAGE(client->Connect(Endpoint(first).url, error), error);
+    BOOST_CHECK_EQUAL(first_requests.load(), 2U);
+    BOOST_CHECK_EQUAL(second_requests.load(), 2U);
+    BOOST_CHECK(!client->Status().engine_enabled);
+    BOOST_CHECK_EQUAL(client->Status().pending_actions, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(client_connect_persists_public_origins_without_changing_outbox_or_trust)
+{
+    std::atomic<unsigned int> requests{0};
+    std::atomic<bool> read_only{true};
+    const auto handler = [&](const node::FlowMeshHttpsServer::Request& request) {
+        ++requests;
+        UniValue json;
+        if (!json.read(request.body) || json["method"].get_str() != "markets") read_only = false;
+        return node::FlowMeshHttpsServer::Response{200, R"({"ok":true,"result":[],"error":""})"};
+    };
+    node::FlowMeshHttpsServer first{Options(), handler}, second{Options(), handler};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(first.Start(error), error);
+    BOOST_REQUIRE_MESSAGE(second.Start(error), error);
+    const fs::path path{m_path_root / "client"};
+    const std::string journal{R"({ "version":1, "actions":[], "heads":[] })"};
+    {
+        CDBWrapper db{DBParams{.path=path, .cache_bytes=1 << 20}};
+        db.Write(std::string{"public-client-v1"}, journal, true);
+    }
+    {
+        auto configured{Endpoint(first)};
+        configured.url += "/flowmesh/v1";
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {configured}, path, error)};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        BOOST_REQUIRE_MESSAGE(client->Connect(Endpoint(first).url + "/", error), error);
+        BOOST_REQUIRE_EQUAL(client->Status().endpoints.size(), 1U);
+        // Successful connection proves both custom CA and pin survived URL
+        // normalization and selecting the existing endpoint.
+        BOOST_CHECK(client->Status().endpoints[0].available);
+        BOOST_REQUIRE_MESSAGE(client->Connect(Endpoint(second).url, error), error);
+        const auto status{client->Status()};
+        BOOST_REQUIRE_EQUAL(status.endpoints.size(), 2U);
+        BOOST_CHECK(!status.endpoints[1].transport_available);
+        BOOST_CHECK_EQUAL(status.endpoints[1].consecutive_failures, 1U);
+        BOOST_CHECK(status.endpoints[1].retry_after_ms > status.endpoints[1].last_attempt_ms);
+        BOOST_CHECK_EQUAL(status.endpoints[1].last_error, "https-certificate-verification-failed");
+        BOOST_CHECK_EQUAL(status.pending_actions, 0U);
+        BOOST_CHECK(!status.engine_enabled);
+        BOOST_CHECK(read_only.load());
+    }
+    {
+        CDBWrapper db{DBParams{.path=path, .cache_bytes=1 << 20}};
+        std::string retained, saved;
+        BOOST_REQUIRE(db.Read(std::string{"public-client-v1"}, retained));
+        BOOST_CHECK_EQUAL(retained, journal);
+        BOOST_REQUIRE(db.Read(std::string{"public-client-endpoints-v1"}, saved));
+        UniValue config;
+        BOOST_REQUIRE(config.read(saved));
+        BOOST_REQUIRE_EQUAL(config["urls"].size(), 1U);
+        BOOST_CHECK_EQUAL(config["urls"][0].get_str(), Endpoint(second).url);
+        BOOST_CHECK(saved.find(pin) == std::string::npos);
+        BOOST_CHECK(saved.find(fs::PathToString(cert)) == std::string::npos);
+    }
+    {
+        // A runtime origin reappears after restart, while explicit startup
+        // CA/pin configuration takes precedence over its default trust.
+        auto configured{Endpoint(second)};
+        configured.url += "/flowmesh/v1";
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {configured}, path, error)};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        BOOST_REQUIRE_EQUAL(client->Status().endpoints.size(), 1U);
+        BOOST_REQUIRE_MESSAGE(client->Connect(Endpoint(second).url, error), error);
+        BOOST_CHECK(client->Status().endpoints[0].available);
+        BOOST_CHECK(client->Status().endpoints[0].transport_available);
+        BOOST_CHECK_EQUAL(client->Status().endpoints[0].retry_after_ms, 0);
+        BOOST_CHECK_EQUAL(client->Status().selected_endpoint, Endpoint(second).url);
+    }
+    {
+        auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {}, path, error)};
+        BOOST_REQUIRE_MESSAGE(client, error);
+        BOOST_REQUIRE_EQUAL(client->Status().endpoints.size(), 1U);
+        BOOST_CHECK_EQUAL(client->Status().endpoints[0].url, Endpoint(second).url);
+        BOOST_CHECK(!client->Status().endpoints[0].transport_available);
+        BOOST_CHECK_EQUAL(client->Status().endpoints[0].last_attempt_ms, 0);
+    }
+    CDBWrapper db{DBParams{.path=path, .cache_bytes=1 << 20}};
+    std::string retained;
+    BOOST_REQUIRE(db.Read(std::string{"public-client-v1"}, retained));
+    BOOST_CHECK_EQUAL(retained, journal);
+    BOOST_CHECK(read_only.load());
+    BOOST_CHECK_EQUAL(requests.load(), 3U);
+}
+
+BOOST_AUTO_TEST_CASE(client_selected_endpoint_recovers_while_fallback_stays_healthy)
+{
+    std::atomic<unsigned int> preferred_requests{0}, fallback_requests{0};
+    node::FlowMeshHttpsServer reserve{Options(), [&](const auto&) {
+        return node::FlowMeshHttpsServer::Response{200, R"({"ok":true,"result":[],"error":""})"};
+    }};
+    node::FlowMeshHttpsServer fallback{Options(), [&](const auto&) {
+        ++fallback_requests;
+        return node::FlowMeshHttpsServer::Response{200, R"({"ok":true,"result":[],"error":""})"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(reserve.Start(error), error);
+    BOOST_REQUIRE_MESSAGE(fallback.Start(error), error);
+    const auto preferred{Endpoint(reserve)};
+    auto options{Options()};
+    options.port = reserve.Port();
+    reserve.Stop();
+
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {preferred, Endpoint(fallback)}, m_path_root / "client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Connect(preferred.url, error), error);
+    const auto failed_over{client->Status()};
+    BOOST_CHECK_EQUAL(failed_over.selected_endpoint, preferred.url);
+    BOOST_CHECK_EQUAL(failed_over.active_endpoint, Endpoint(fallback).url);
+    BOOST_CHECK_EQUAL(failed_over.endpoints[0].consecutive_failures, 1U);
+    BOOST_CHECK(!failed_over.endpoints[0].transport_available);
+    BOOST_CHECK_EQUAL(fallback_requests.load(), 1U);
+
+    node::FlowMeshHttpsServer recovered{options, [&](const auto&) {
+        ++preferred_requests;
+        return node::FlowMeshHttpsServer::Response{200, R"({"ok":true,"result":[],"error":""})"};
+    }};
+    BOOST_REQUIRE_MESSAGE(recovered.Start(error), error);
+    // Expire the first transport cooldown. There is no explicit reconnect,
+    // node restart, or failure of the still-healthy fallback endpoint.
+    std::this_thread::sleep_for(std::chrono::milliseconds{2100});
+    BOOST_CHECK(client->Markets(std::nullopt).empty());
+    const auto restored{client->Status()};
+    BOOST_CHECK_EQUAL(restored.selected_endpoint, preferred.url);
+    BOOST_CHECK_EQUAL(restored.active_endpoint, preferred.url);
+    BOOST_CHECK(restored.endpoints[0].available);
+    BOOST_CHECK(restored.endpoints[0].transport_available);
+    BOOST_CHECK_EQUAL(restored.endpoints[0].consecutive_failures, 0U);
+    BOOST_CHECK_EQUAL(restored.endpoints[0].retry_after_ms, 0);
+    BOOST_CHECK_EQUAL(preferred_requests.load(), 1U);
+    BOOST_CHECK_EQUAL(fallback_requests.load(), 1U);
+    BOOST_CHECK_EQUAL(restored.pending_actions, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(client_transport_cooldown_does_not_weaken_configured_pin)
+{
+    std::atomic<unsigned int> requests{0};
+    node::FlowMeshHttpsServer server{Options(), [&](const auto&) {
+        ++requests;
+        return node::FlowMeshHttpsServer::Response{200, R"({"ok":true,"result":[],"error":""})"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    auto configured{Endpoint(server)};
+    configured.certificate_sha256 = std::string(64, '0');
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {configured}, m_path_root / "client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Connect(configured.url + "/flowmesh/v1", error), error);
+    const auto failed{client->Status().endpoints[0]};
+    BOOST_CHECK_EQUAL(failed.last_error, "https-certificate-pin-mismatch");
+    BOOST_CHECK_EQUAL(failed.consecutive_failures, 1U);
+    BOOST_CHECK(!failed.available);
+    BOOST_CHECK(!failed.transport_available);
+    BOOST_CHECK_THROW(client->Markets(std::nullopt), std::runtime_error);
+    BOOST_CHECK_EQUAL(client->Status().endpoints[0].last_attempt_ms, failed.last_attempt_ms);
+    BOOST_CHECK_EQUAL(client->Status().endpoints[0].consecutive_failures, 1U);
+    // An explicit user connect may bypass the timer, but never its CA/pin.
+    BOOST_REQUIRE_MESSAGE(client->Connect(configured.url, error), error);
+    BOOST_CHECK_EQUAL(client->Status().endpoints[0].last_error, "https-certificate-pin-mismatch");
+    BOOST_CHECK_EQUAL(client->Status().endpoints[0].consecutive_failures, 2U);
+    BOOST_CHECK_EQUAL(requests.load(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(client_invalid_saved_origin_fails_closed_without_reset)
+{
+    const fs::path path{m_path_root / "client"};
+    const std::string invalid{R"({"version":1,"urls":["http://127.0.0.1"],"selected_url":"http://127.0.0.1"})"};
+    {
+        CDBWrapper db{DBParams{.path=path, .cache_bytes=1 << 20}};
+        db.Write(std::string{"public-client-endpoints-v1"}, invalid, true);
+    }
+    std::string error;
+    BOOST_CHECK(!node::MakeRemoteFlowMeshBackend(*m_node.chainman, {}, path, error));
+    BOOST_CHECK(error.find("Invalid saved trading endpoint") != std::string::npos);
+    CDBWrapper db{DBParams{.path=path, .cache_bytes=1 << 20}};
+    std::string preserved;
+    BOOST_REQUIRE(db.Read(std::string{"public-client-endpoints-v1"}, preserved));
+    BOOST_CHECK_EQUAL(preserved, invalid);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
