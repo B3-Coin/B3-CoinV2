@@ -100,6 +100,43 @@ std::optional<ActiveFnBlsSeatSet> BuildActiveFnBlsSeatSet(
     uint64_t anchor_height, const uint256& anchor_hash,
     std::span<const BlsSeatBinding> bindings, BlsSeatSetCheck& result);
 
+/**
+ * Positive-only memo of the pure seat construction above, not chain authority.
+ * The complete ordered input (including every PoP byte) must match exactly.
+ * Callers still check canonical anchors, index synchronization and eligibility
+ * on every use, including hits, and serialize access externally. Nothing is
+ * persisted; returned sets are copies. One successful entry retains at most
+ * FLOWMESH_MAX_ACTIVE_FN_SEATS bindings and verified members.
+ */
+class ActiveFnBlsSeatSetCache {
+public:
+    static constexpr size_t CAPACITY{1};
+
+    struct Stats {
+        uint64_t hits{0};
+        //! Calls to the original builder, including failed cheap validation.
+        uint64_t builds{0};
+    };
+
+    std::optional<ActiveFnBlsSeatSet> Build(
+        const uint256& domain, const uint256& market_id, uint64_t epoch,
+        uint64_t anchor_height, const uint256& anchor_hash,
+        std::span<const BlsSeatBinding> bindings, BlsSeatSetCheck& result);
+
+    Stats GetStats() const { return m_stats; }
+    size_t Size() const { return m_entry ? 1 : 0; }
+
+private:
+    struct Entry {
+        uint256 domain;
+        std::vector<BlsSeatBinding> bindings;
+        ActiveFnBlsSeatSet seats;
+    };
+
+    std::optional<Entry> m_entry;
+    Stats m_stats;
+};
+
 //! Every field is signed; only epoch/sequence/hash travel in the certificate.
 struct BlsCertificateContext {
     uint256 domain;

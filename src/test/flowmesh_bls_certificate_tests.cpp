@@ -336,4 +336,181 @@ BOOST_AUTO_TEST_CASE(aggregation_rejects_bad_partial_duplicate_and_short_quorum)
     BOOST_CHECK(check == flowmesh::BlsCertificateAssemblyCheck::BAD_PARTIAL_SIGNATURE);
 }
 
+BOOST_AUTO_TEST_CASE(seat_construction_cache_reuses_exact_input_and_returns_copies)
+{
+    const SeatFixture fixture{Seats(4)};
+    auto submitted{fixture.bindings};
+    flowmesh::ActiveFnBlsSeatSetCache cache;
+    flowmesh::BlsSeatSetCheck check{flowmesh::BlsSeatSetCheck::BAD_PUBLIC_KEY};
+    const auto build = [&](auto& memo) {
+        return memo.Build(fixture.domain, fixture.market_id, fixture.seats.epoch,
+                          fixture.anchor_height, fixture.anchor_hash,
+                          submitted, check);
+    };
+    BOOST_CHECK_EQUAL(cache.Size(), 0U);
+    auto first{build(cache)};
+    BOOST_REQUIRE(first);
+    BOOST_CHECK(check == flowmesh::BlsSeatSetCheck::OK);
+    BOOST_CHECK(first->set_hash == fixture.seats.set_hash);
+    BOOST_CHECK_EQUAL(cache.GetStats().builds, 1U);
+    BOOST_CHECK_EQUAL(cache.GetStats().hits, 0U);
+    BOOST_CHECK_EQUAL(cache.Size(), 1U);
+
+    // Neither a returned value nor a caller-provided result can poison a hit.
+    first->set_hash = Filled(0x91);
+    first->members.clear();
+    check = flowmesh::BlsSeatSetCheck::BAD_PROOF_OF_POSSESSION;
+    auto second{build(cache)};
+    BOOST_REQUIRE(second);
+    BOOST_CHECK(check == flowmesh::BlsSeatSetCheck::OK);
+    BOOST_CHECK(second->set_hash == fixture.seats.set_hash);
+    BOOST_CHECK_EQUAL(second->Size(), fixture.bindings.size());
+    BOOST_CHECK(flowmesh::CheckActiveFnBlsSeatSet(fixture.domain, *second) ==
+                flowmesh::BlsSeatSetCheck::OK);
+    BOOST_CHECK_EQUAL(cache.GetStats().builds, 1U);
+    BOOST_CHECK_EQUAL(cache.GetStats().hits, 1U);
+
+    // The retained exact-input key owns its bytes, not the caller's span.
+    submitted[0].proof_of_possession.fill(0);
+    BOOST_CHECK(!build(cache));
+    BOOST_CHECK(check == flowmesh::BlsSeatSetCheck::BAD_PROOF_OF_POSSESSION);
+    BOOST_CHECK_EQUAL(cache.GetStats().builds, 2U);
+    BOOST_CHECK_EQUAL(cache.GetStats().hits, 1U);
+    submitted = fixture.bindings;
+    BOOST_REQUIRE(build(cache));
+    BOOST_CHECK_EQUAL(cache.GetStats().builds, 2U);
+    BOOST_CHECK_EQUAL(cache.GetStats().hits, 2U);
+
+    // A new service-owned memo has no restored authority or warm state.
+    flowmesh::ActiveFnBlsSeatSetCache restarted;
+    BOOST_CHECK_EQUAL(restarted.Size(), 0U);
+    BOOST_REQUIRE(build(restarted));
+    BOOST_CHECK_EQUAL(restarted.GetStats().builds, 1U);
+    BOOST_CHECK_EQUAL(restarted.GetStats().hits, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(seat_construction_cache_keys_complete_context_and_ordered_roster)
+{
+    const SeatFixture fixture{Seats(4)};
+    std::vector<SeatFixture> changed(8, fixture);
+    changed[0].domain = Filled(0x61);
+    changed[1].market_id = Filled(0x62);
+    ++changed[2].seats.epoch;
+    ++changed[3].anchor_height;
+    changed[4].anchor_hash = Filled(0x63);
+    ++changed[5].bindings[0].outpoint.n;
+    const auto replacement{Key(777, 9)};
+    changed[6].bindings[0].public_key = replacement.GetPublicKey().Compressed();
+    changed[6].bindings[0].proof_of_possession = replacement.SignPoP().Compressed();
+    changed[7] = Seats(5);
+
+    for (auto& variant : changed) {
+        // Keep valid requests canonical even when their domain/outpoint changed.
+        std::sort(variant.bindings.begin(), variant.bindings.end(),
+                  [&](const auto& a, const auto& b) {
+                      const auto aid{flowmesh::ComputeFlowMeshSeatId(variant.domain, a.outpoint)};
+                      const auto bid{flowmesh::ComputeFlowMeshSeatId(variant.domain, b.outpoint)};
+                      return aid < bid || (aid == bid && a.outpoint < b.outpoint);
+                  });
+        flowmesh::ActiveFnBlsSeatSetCache cache;
+        flowmesh::BlsSeatSetCheck check;
+        const auto build = [&](const auto& request) {
+            return cache.Build(request.domain, request.market_id, request.seats.epoch,
+                               request.anchor_height, request.anchor_hash,
+                               request.bindings, check);
+        };
+        BOOST_REQUIRE(build(fixture));
+        const auto rebuilt{build(variant)};
+        BOOST_REQUIRE(rebuilt);
+        BOOST_CHECK(check == flowmesh::BlsSeatSetCheck::OK);
+        BOOST_CHECK(rebuilt->set_hash != fixture.seats.set_hash);
+        BOOST_CHECK(flowmesh::CheckActiveFnBlsSeatSet(variant.domain, *rebuilt) ==
+                    flowmesh::BlsSeatSetCheck::OK);
+        BOOST_CHECK_EQUAL(cache.GetStats().builds, 2U);
+        BOOST_CHECK_EQUAL(cache.GetStats().hits, 0U);
+        BOOST_REQUIRE(build(variant));
+        BOOST_CHECK_EQUAL(cache.GetStats().builds, 2U);
+        BOOST_CHECK_EQUAL(cache.GetStats().hits, 1U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(seat_construction_cache_never_caches_corrupted_bindings)
+{
+    const SeatFixture fixture{Seats(4)};
+    std::vector<std::vector<flowmesh::BlsSeatBinding>> malformed(9, fixture.bindings);
+    malformed[0][0].proof_of_possession.fill(0);
+    // Validly encoded, but the wrong key's PoP: must still perform verification.
+    malformed[1][0].proof_of_possession = fixture.bindings[1].proof_of_possession;
+    malformed[2][0].public_key.fill(0xff);
+    malformed[3][0].public_key = Key(778, 9).GetPublicKey().Compressed();
+    malformed[4][1].public_key = malformed[4][0].public_key;
+    malformed[4][1].proof_of_possession = malformed[4][0].proof_of_possession;
+    std::reverse(malformed[5].begin(), malformed[5].end());
+    malformed[6].pop_back();
+    malformed[7].resize(flowmesh::FLOWMESH_MAX_ACTIVE_FN_SEATS + 1, fixture.bindings[0]);
+    malformed[8][1].outpoint = malformed[8][0].outpoint;
+
+    flowmesh::ActiveFnBlsSeatSetCache cache;
+    flowmesh::BlsSeatSetCheck check;
+    const auto build = [&](const auto& bindings) {
+        return cache.Build(fixture.domain, fixture.market_id, fixture.seats.epoch,
+                           fixture.anchor_height, fixture.anchor_hash, bindings, check);
+    };
+    BOOST_REQUIRE(build(fixture.bindings));
+    for (const auto& bindings : malformed) {
+        flowmesh::BlsSeatSetCheck expected;
+        BOOST_CHECK(!flowmesh::BuildActiveFnBlsSeatSet(
+            fixture.domain, fixture.market_id, fixture.seats.epoch,
+            fixture.anchor_height, fixture.anchor_hash, bindings, expected));
+        BOOST_CHECK(expected != flowmesh::BlsSeatSetCheck::OK);
+        const auto before{cache.GetStats()};
+        for (uint64_t attempt{1}; attempt <= 2; ++attempt) {
+            BOOST_CHECK(!build(bindings));
+            BOOST_CHECK(check == expected);
+            BOOST_CHECK_EQUAL(cache.GetStats().builds, before.builds + attempt);
+            BOOST_CHECK_EQUAL(cache.GetStats().hits, before.hits);
+            BOOST_CHECK_EQUAL(cache.Size(), 1U);
+        }
+        // A malformed attachment is not a cache key and cannot evict success.
+        BOOST_REQUIRE(build(fixture.bindings));
+        BOOST_CHECK_EQUAL(cache.GetStats().builds, before.builds + 2);
+        BOOST_CHECK_EQUAL(cache.GetStats().hits, before.hits + 1);
+    }
+
+    flowmesh::ActiveFnBlsSeatSetCache empty;
+    BOOST_CHECK(!empty.Build(fixture.domain, fixture.market_id, fixture.seats.epoch,
+                            fixture.anchor_height, fixture.anchor_hash,
+                            malformed[0], check));
+    BOOST_CHECK_EQUAL(empty.Size(), 0U);
+    BOOST_CHECK_EQUAL(empty.GetStats().builds, 1U);
+    BOOST_CHECK_EQUAL(empty.GetStats().hits, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(seat_construction_cache_is_single_entry_and_eviction_revalidates)
+{
+    static_assert(flowmesh::ActiveFnBlsSeatSetCache::CAPACITY == 1);
+    const SeatFixture fixture{Seats(4)};
+    flowmesh::ActiveFnBlsSeatSetCache cache;
+    flowmesh::BlsSeatSetCheck check;
+    const auto build = [&](const uint64_t epoch) {
+        return cache.Build(fixture.domain, fixture.market_id, epoch,
+                           fixture.anchor_height, fixture.anchor_hash,
+                           fixture.bindings, check);
+    };
+    for (uint64_t i{0}; i < 8; ++i) {
+        BOOST_REQUIRE(build(fixture.seats.epoch + i));
+        BOOST_CHECK_EQUAL(cache.Size(), flowmesh::ActiveFnBlsSeatSetCache::CAPACITY);
+        BOOST_CHECK_EQUAL(cache.GetStats().builds, i + 1);
+        BOOST_CHECK_EQUAL(cache.GetStats().hits, 0U);
+    }
+    const auto original{build(fixture.seats.epoch)};
+    BOOST_REQUIRE(original);
+    BOOST_CHECK(original->set_hash == fixture.seats.set_hash);
+    BOOST_CHECK_EQUAL(cache.GetStats().builds, 9U);
+    BOOST_CHECK_EQUAL(cache.GetStats().hits, 0U);
+    BOOST_REQUIRE(build(fixture.seats.epoch));
+    BOOST_CHECK_EQUAL(cache.GetStats().builds, 9U);
+    BOOST_CHECK_EQUAL(cache.GetStats().hits, 1U);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

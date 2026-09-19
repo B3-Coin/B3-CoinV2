@@ -168,6 +168,38 @@ std::optional<ActiveFnBlsSeatSet> BuildActiveFnBlsSeatSet(
     return out;
 }
 
+std::optional<ActiveFnBlsSeatSet> ActiveFnBlsSeatSetCache::Build(
+    const uint256& domain, const uint256& market_id, const uint64_t epoch,
+    const uint64_t anchor_height, const uint256& anchor_hash,
+    const std::span<const BlsSeatBinding> bindings, BlsSeatSetCheck& result)
+{
+    if (m_entry && m_entry->domain == domain &&
+        m_entry->seats.market_id == market_id && m_entry->seats.epoch == epoch &&
+        m_entry->seats.anchor_height == anchor_height &&
+        m_entry->seats.anchor_hash == anchor_hash &&
+        std::equal(bindings.begin(), bindings.end(),
+                   m_entry->bindings.begin(), m_entry->bindings.end(),
+                   [](const BlsSeatBinding& a, const BlsSeatBinding& b) {
+                       return a.outpoint == b.outpoint &&
+                              a.public_key == b.public_key &&
+                              a.proof_of_possession == b.proof_of_possession;
+                   })) {
+        ++m_stats.hits;
+        result = BlsSeatSetCheck::OK;
+        return m_entry->seats;
+    }
+    ++m_stats.builds;
+    auto out{BuildActiveFnBlsSeatSet(domain, market_id, epoch, anchor_height,
+                                   anchor_hash, bindings, result)};
+    // A failure neither inserts unverified data nor evicts the last success.
+    if (out) {
+        m_entry = Entry{domain,
+                       std::vector<BlsSeatBinding>{bindings.begin(), bindings.end()},
+                       *out};
+    }
+    return out;
+}
+
 uint256 FlowMeshBlsCertificateDigest(const BlsCertificateContext& context)
 {
     HashWriter writer{TaggedHash(FLOWMESH_BLS_CERTIFICATE_TAG)};

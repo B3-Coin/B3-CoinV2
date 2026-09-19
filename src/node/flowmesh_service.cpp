@@ -261,6 +261,7 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     std::shared_ptr<FlowMeshRuntime> runtime;
     std::map<flowmesh::MarketId, std::unique_ptr<MarketResources>> markets;
     mutable std::map<SeatKey, flowmesh::ActiveFnBlsSeatSet> seat_sets;
+    mutable flowmesh::ActiveFnBlsSeatSetCache seat_set_build_cache GUARDED_BY(::cs_main);
     std::vector<bls::SecretKey> local_keys;
     std::vector<std::array<unsigned char, bls::PUBKEY_SIZE>> local_public_keys;
     uint256 local_key_fingerprint{FlowMeshSeatKeysFingerprint({})};
@@ -469,7 +470,9 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
                                     member.proof_of_possession});
             }
             flowmesh::BlsSeatSetCheck check;
-            out = flowmesh::BuildActiveFnBlsSeatSet(
+            // Only the pure cryptographic construction is reused. All live
+            // canonical-anchor/index/eligibility checks above run on hits too.
+            out = seat_set_build_cache.Build(
                 *domain, market_id, epoch,
                 static_cast<uint64_t>(anchor.height), anchor.hash, bindings,
                 check);
