@@ -1,0 +1,96 @@
+{
+  "case": "test_review.ReviewTests.test_local_resource_exhaustion_preserves_intent_and_halts",
+  "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+  "revision": "1cb2dc7",
+  "schema": "flowmesh-agreement-regression/1",
+  "simulations": [
+    {
+      "events": [
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 0,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 0,
+          "ordinal": 1,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 2,
+          "payload": {
+            "instance": {
+              "config": "e1690f2d861120506543bf3bf9e30433180685456ad5e06d7ff2e49d5edd1713",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "8023a8a3d980536b005f93d71b9b54c02729ca87951a2ed4cc4ce330934061d3",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "4b31632d3cf60d491c3153b6085fa5d3f21f7a952dde95b005fb77517fef7f36",
+            "view": 0
+          },
+          "reason": "intent:PROPOSE",
+          "time": 0
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": null,
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "e1690f2d861120506543bf3bf9e30433180685456ad5e06d7ff2e49d5edd1713",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "8023a8a3d980536b005f93d71b9b54c02729ca87951a2ed4cc4ce330934061d3",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "ACTIVE",
+            "new_view": null,
+            "prepared": null,
+            "view": 0
+          },
+          "node": 0,
+          "ordinal": 3,
+          "payload": {
+            "instance": {
+              "config": "e1690f2d861120506543bf3bf9e30433180685456ad5e06d7ff2e49d5edd1713",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "8023a8a3d980536b005f93d71b9b54c02729ca87951a2ed4cc4ce330934061d3",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "4b31632d3cf60d491c3153b6085fa5d3f21f7a952dde95b005fb77517fef7f36",
+            "view": 0
+          },
+          "time": 0
+        }
+      ],
+      "issued": [],
+      "profile": "flowmesh-v2-single-sequence-pbft-test/1"
+    }
+  ],
+  "success": false,
+  "test_output": "test_local_resource_exhaustion_preserves_intent_and_halts (test_review.ReviewTests.test_local_resource_exhaustion_preserves_intent_and_halts) ... ERROR\n\n======================================================================\nERROR: test_local_resource_exhaustion_preserves_intent_and_halts (test_review.ReviewTests.test_local_resource_exhaustion_preserves_intent_and_halts)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"[SOURCE]/test/flowmesh_v2_agreement/test_review.py\", line 30, in test_local_resource_exhaustion_preserves_intent_and_halts\n    s.offer(nodes=[0])\n    ~~~~~~~^^^^^^^^^^^\n  File \"[SOURCE]/test/flowmesh_v2_agreement/fm_simulator.py\", line 85, in offer\n    self.nodes[i].offer(body)\n    ~~~~~~~~~~~~~~~~~~~^^^^^^\n  File \"[SOURCE]/test/flowmesh_v2_agreement/fm_replica.py\", line 205, in offer\n    self._drive()\n    ~~~~~~~~~~~^^\n  File \"[SOURCE]/test/flowmesh_v2_agreement/fm_replica.py\", line 526, in _drive\n    self._sign(\"PROPOSE\", value, new_view=nv)\n    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"[SOURCE]/test/flowmesh_v2_agreement/fm_replica.py\", line 180, in _sign\n    signed = self.signer(payload)\n  File \"[SOURCE]/test/flowmesh_v2_agreement/fm_protocol.py\", line 66, in sign\n    return self._issue(cap, payload)\n           ~~~~~~~~~~~^^^^^^^^^^^^^^\n  File \"[SOURCE]/test/flowmesh_v2_agreement/fm_protocol.py\", line 79, in _issue\n    raise Exhausted(\"AUTH_AUDIT_LIMIT\")\nfm_protocol.Exhausted: AUTH_AUDIT_LIMIT\n\n----------------------------------------------------------------------\nRan 1 test in 0.003s\n\nFAILED (errors=1)\n"
+}

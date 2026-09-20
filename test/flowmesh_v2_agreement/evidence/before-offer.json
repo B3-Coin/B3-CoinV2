@@ -1,0 +1,78 @@
+{
+  "case": "test_recovery.RecoveryTests.test_N_sole_final_offer_survives_crash_before_proposal_intent",
+  "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+  "revision": "5fc4b67",
+  "schema": "flowmesh-agreement-regression/1",
+  "simulations": [
+    {
+      "events": [
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 0,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 0,
+          "ordinal": 1,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "crash",
+          "node": 0,
+          "ordinal": 2,
+          "phase": "PROPOSE",
+          "point": "before_record",
+          "time": 0
+        },
+        {
+          "event": "restart",
+          "fenced": false,
+          "node": 0,
+          "ordinal": 3,
+          "time": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "DATA",
+          "node": 0,
+          "ordinal": 4,
+          "source": 0,
+          "time": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "DATA",
+          "node": 1,
+          "ordinal": 5,
+          "source": 0,
+          "time": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "DATA",
+          "node": 2,
+          "ordinal": 6,
+          "source": 0,
+          "time": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "DATA",
+          "node": 3,
+          "ordinal": 7,
+          "source": 0,
+          "time": 1
+        }
+      ],
+      "issued": [],
+      "profile": "flowmesh-v2-single-sequence-pbft-test/1"
+    }
+  ],
+  "success": false,
+  "test_output": "test_N_sole_final_offer_survives_crash_before_proposal_intent (test_recovery.RecoveryTests.test_N_sole_final_offer_survives_crash_before_proposal_intent) ... FAIL\n\n======================================================================\nFAIL: test_N_sole_final_offer_survives_crash_before_proposal_intent (test_recovery.RecoveryTests.test_N_sole_final_offer_survives_crash_before_proposal_intent)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"[SOURCE]/test/flowmesh_v2_agreement/test_recovery.py\", line 474, in test_N_sole_final_offer_survives_crash_before_proposal_intent\n    self.assertTrue(s.settled(), \"durable final offer lost its pending-work recovery path\")\n    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: False is not true : durable final offer lost its pending-work recovery path\n\n----------------------------------------------------------------------\nRan 1 test in 0.006s\n\nFAILED (failures=1)\n"
+}

@@ -1,0 +1,615 @@
+{
+  "case": "test_recovery.RecoveryTests.test_N_restart_after_decision_recovers_missing_volatile_anchor_evidence",
+  "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+  "revision": "5fc4b67",
+  "schema": "flowmesh-agreement-regression/1",
+  "simulations": [
+    {
+      "events": [
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 0,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 0,
+          "ordinal": 1,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 2,
+          "reason": "intent:PROPOSE",
+          "time": 0
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 3,
+          "reason": "signature:PROPOSE",
+          "time": 0
+        },
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "event": "publish",
+          "node": 0,
+          "ordinal": 4,
+          "phase": "PROPOSE",
+          "sequence": 0,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 5,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 1,
+          "ordinal": 6,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 7,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 2,
+          "ordinal": 8,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 9,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 3,
+          "ordinal": 10,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 11,
+          "source": 0,
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 12,
+          "reason": "accepted_proposal",
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 13,
+          "reason": "intent:PREPARE",
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 14,
+          "reason": "signature:PREPARE",
+          "time": 1
+        },
+        {
+          "auth": "a9e8b864d1d5b30880bbad86d2cab40af475a03e6489b9782829865c1f9ce976",
+          "event": "publish",
+          "node": 0,
+          "ordinal": 15,
+          "phase": "PREPARE",
+          "sequence": 0,
+          "time": 1,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 16,
+          "source": 0,
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 17,
+          "reason": "accepted_proposal",
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 18,
+          "reason": "intent:PREPARE",
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 19,
+          "reason": "signature:PREPARE",
+          "time": 1
+        },
+        {
+          "auth": "7a6acb886e2aa013ac3e2ccd12a82ed35e08de864656ce9781a8a683f05f748d",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 20,
+          "phase": "PREPARE",
+          "sequence": 0,
+          "time": 1,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 21,
+          "source": 0,
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 22,
+          "reason": "accepted_proposal",
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 23,
+          "reason": "intent:PREPARE",
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 24,
+          "reason": "signature:PREPARE",
+          "time": 1
+        },
+        {
+          "auth": "ed12b1bd9f79c5edd7b624552d7a6e4e8162fc52ab19bcc461e11d936e6cfd6d",
+          "event": "publish",
+          "node": 2,
+          "ordinal": 25,
+          "phase": "PREPARE",
+          "sequence": 0,
+          "time": 1,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 26,
+          "source": 0,
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 27,
+          "reason": "accepted_proposal",
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 28,
+          "reason": "intent:PREPARE",
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 29,
+          "reason": "signature:PREPARE",
+          "time": 1
+        },
+        {
+          "auth": "db762df20b896ba971150eb31f780a7a63da76de35cf50847f5829c315bb41bb",
+          "event": "publish",
+          "node": 3,
+          "ordinal": 30,
+          "phase": "PREPARE",
+          "sequence": 0,
+          "time": 1,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "PREPARED",
+          "node": 0,
+          "ordinal": 31,
+          "source": 0,
+          "time": 2
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 32,
+          "reason": "prepared_proof",
+          "time": 2
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 33,
+          "reason": "intent:COMMIT",
+          "time": 2
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 34,
+          "reason": "signature:COMMIT",
+          "time": 2
+        },
+        {
+          "auth": "abdb795f9a3fbce27d7d169b6a4afe5e0df1c7807919463d3de0104c7cce3f5d",
+          "event": "publish",
+          "node": 0,
+          "ordinal": 35,
+          "phase": "COMMIT",
+          "sequence": 0,
+          "time": 2,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "PREPARED",
+          "node": 1,
+          "ordinal": 36,
+          "source": 0,
+          "time": 3
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 37,
+          "reason": "prepared_proof",
+          "time": 3
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 38,
+          "reason": "intent:COMMIT",
+          "time": 3
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 39,
+          "reason": "signature:COMMIT",
+          "time": 3
+        },
+        {
+          "auth": "8e8cdef14e38a5a7b92521568af5fde1f6102706ba2ce51d58c04c13e2347087",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 40,
+          "phase": "COMMIT",
+          "sequence": 0,
+          "time": 3,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "PREPARED",
+          "node": 2,
+          "ordinal": 41,
+          "source": 0,
+          "time": 4
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 42,
+          "reason": "prepared_proof",
+          "time": 4
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 43,
+          "reason": "intent:COMMIT",
+          "time": 4
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 44,
+          "reason": "signature:COMMIT",
+          "time": 4
+        },
+        {
+          "auth": "873881c5d33bc44b40a73011131fb01b7599f07317320a1cf1efb44b18b5fc4a",
+          "event": "publish",
+          "node": 2,
+          "ordinal": 45,
+          "phase": "COMMIT",
+          "sequence": 0,
+          "time": 4,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "PREPARED",
+          "node": 3,
+          "ordinal": 46,
+          "source": 0,
+          "time": 5
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 47,
+          "reason": "prepared_proof",
+          "time": 5
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 48,
+          "reason": "intent:COMMIT",
+          "time": 5
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 49,
+          "reason": "signature:COMMIT",
+          "time": 5
+        },
+        {
+          "auth": "4ffbd0a8f543a86b6101a1f7bae597b33900f80460bfa62d9d30f90da1957e4e",
+          "event": "publish",
+          "node": 3,
+          "ordinal": 50,
+          "phase": "COMMIT",
+          "sequence": 0,
+          "time": 5,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "CERT",
+          "node": 1,
+          "ordinal": 51,
+          "source": 0,
+          "time": 6
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 52,
+          "reason": "decision",
+          "time": 6
+        },
+        {
+          "event": "certificate",
+          "node": 1,
+          "ordinal": 53,
+          "sequence": 0,
+          "time": 6,
+          "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+          "view": 0
+        },
+        {
+          "event": "crash",
+          "node": 1,
+          "ordinal": 54,
+          "phase": "",
+          "point": "after_decision",
+          "time": 6
+        },
+        {
+          "event": "restart",
+          "fenced": false,
+          "node": 1,
+          "ordinal": 55,
+          "time": 6
+        }
+      ],
+      "issued": [
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "a9e8b864d1d5b30880bbad86d2cab40af475a03e6489b9782829865c1f9ce976",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "7a6acb886e2aa013ac3e2ccd12a82ed35e08de864656ce9781a8a683f05f748d",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "ed12b1bd9f79c5edd7b624552d7a6e4e8162fc52ab19bcc461e11d936e6cfd6d",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 2,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "db762df20b896ba971150eb31f780a7a63da76de35cf50847f5829c315bb41bb",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 3,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "abdb795f9a3fbce27d7d169b6a4afe5e0df1c7807919463d3de0104c7cce3f5d",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "COMMIT",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "8e8cdef14e38a5a7b92521568af5fde1f6102706ba2ce51d58c04c13e2347087",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "COMMIT",
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "873881c5d33bc44b40a73011131fb01b7599f07317320a1cf1efb44b18b5fc4a",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "COMMIT",
+            "sender": 2,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "4ffbd0a8f543a86b6101a1f7bae597b33900f80460bfa62d9d30f90da1957e4e",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "COMMIT",
+            "sender": 3,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        }
+      ],
+      "profile": "flowmesh-v2-single-sequence-pbft-test/1"
+    }
+  ],
+  "success": false,
+  "test_output": "test_N_restart_after_decision_recovers_missing_volatile_anchor_evidence (test_recovery.RecoveryTests.test_N_restart_after_decision_recovers_missing_volatile_anchor_evidence) ... ERROR\n\n======================================================================\nERROR: test_N_restart_after_decision_recovers_missing_volatile_anchor_evidence (test_recovery.RecoveryTests.test_N_restart_after_decision_recovers_missing_volatile_anchor_evidence)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"[SOURCE]/test/flowmesh_v2_agreement/fm_replica.py\", line 187, in _valid_body\n    return Application(rec[\"before\"]).validate(body, rec[\"instance\"], rec[\"anchor_before\"], self.anchors)\n           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"[SOURCE]/test/flowmesh_v2_agreement/fm_application.py\", line 240, in validate\n    _check_descendant(body[\"anchor\"], parent_anchor, known_anchors)\n    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"[SOURCE]/test/flowmesh_v2_agreement/fm_application.py\", line 162, in _check_descendant\n    raise NeedData(identity)\nfm_application.NeedData: cc27214e0878bc241cb1de0bfedebcf5054ef98df6db9a0bb3f177a6e466c9a6\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"[SOURCE]/test/flowmesh_v2_agreement/test_recovery.py\", line 451, in test_N_restart_after_decision_recovers_missing_volatile_anchor_evidence\n    node.restart()\n    ~~~~~~~~~~~~^^\n  File \"[SOURCE]/test/flowmesh_v2_agreement/fm_replica.py\", line 99, in restart\n    self._apply()\n    ~~~~~~~~~~~^^\n  File \"[SOURCE]/test/flowmesh_v2_agreement/fm_replica.py\", line 504, in _apply\n    snapshot = self._valid_body(body, rec)\n  File \"[SOURCE]/test/flowmesh_v2_agreement/fm_replica.py\", line 189, in _valid_body\n    raise NeedData(\"anchor:\" + str(exc)) from exc\nfm_application.NeedData: anchor:cc27214e0878bc241cb1de0bfedebcf5054ef98df6db9a0bb3f177a6e466c9a6\n\n----------------------------------------------------------------------\nRan 1 test in 0.016s\n\nFAILED (errors=1)\n"
+}

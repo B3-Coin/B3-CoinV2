@@ -92,6 +92,31 @@ class AgreementTests(unittest.TestCase):
         self.assertTrue(any(e["node"] == 3 and e["event"] == "defer" and "anchor:" in e["reason"] for e in s.trace))
         self.checked(s)
 
+    def test_competing_same_trades_at_two_anchors_recover_as_distinct_values(self):
+        f, s = self.fresh(byzantine=(0,))
+        anchors = {a["height"]: a for a in anchor_chain().values()}
+        batch = {"deposits": [f.fact(BUYER, USD_A, 10)]}
+        a = s.nodes[1].application.build(s.nodes[1].instance, anchors[855500], batch)
+        b = s.nodes[1].application.build(s.nodes[1].instance, anchors[855501], batch)
+        self.assertEqual(a["batch"], b["batch"])
+        self.assertEqual(a["result"], b["result"])
+        self.assertNotEqual(value_id(a), value_id(b))
+        s.offer(body=a)
+        for i, body in ((1, a), (2, b), (3, b)):
+            s.nodes[i].local_tip = 855500 + (i % 2)
+            s.nodes[i]._store_body(body)
+            signed = s.byzantine_message(message("PROPOSE", 0, body["instance"], 0,
+                                                  value_id(body), new_view=None), [i])
+            self.assertTrue(s.deliver_where(lambda e: e.destination == i and e.kind == "SIGNED"
+                                            and e.data == signed))
+        self.assertEqual(len({v["payload"]["value"] for v in s.published("PREPARE", 0)}), 2)
+        self.checked(s)
+        s.run(180, stop=lambda sim: sim.settled())
+        self.assertTrue(s.settled())
+        self.assertEqual(len({s.nodes[i].d["parent"] for i in (1, 2, 3)}), 1)
+        self.assertEqual(len({s.nodes[i].d["snapshot"] for i in (1, 2, 3)}), 1)
+        self.checked(s)
+
     def test_four_two_two_and_seven_four_three_partitions_stop_then_heal(self):
         for n, groups in ((4, ({0, 1}, {2, 3})), (7, ({0, 1, 2, 3}, {4, 5, 6}))):
             f, s = self.fresh(n)

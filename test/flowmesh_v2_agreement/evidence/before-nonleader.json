@@ -1,0 +1,774 @@
+{
+  "case": "test_review.ReviewTests.test_sparse_offer_to_nonleader_reaches_agreement_without_next_request",
+  "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+  "revision": "1cb2dc7",
+  "schema": "flowmesh-agreement-regression/1",
+  "simulations": [
+    {
+      "events": [
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 0,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 1,
+          "ordinal": 1,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 2,
+          "reason": "enter_view:timeout",
+          "time": 30
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 3,
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 1,
+            "value": null,
+            "view": 1
+          },
+          "reason": "intent:VIEW_CHANGE",
+          "time": 30
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": null,
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "CHANGING",
+            "new_view": null,
+            "prepared": null,
+            "view": 1
+          },
+          "node": 1,
+          "ordinal": 4,
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 1,
+            "value": null,
+            "view": 1
+          },
+          "time": 30
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "durable",
+          "node": 1,
+          "ordinal": 5,
+          "reason": "signature:VIEW_CHANGE",
+          "time": 30
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 6,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 30,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 7,
+          "source": 1,
+          "time": 31
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 8,
+          "source": 1,
+          "time": 31
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 9,
+          "source": 1,
+          "time": 31
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 10,
+          "source": 1,
+          "time": 31
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 11,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 40,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 12,
+          "source": 1,
+          "time": 41
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 13,
+          "source": 1,
+          "time": 41
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 14,
+          "source": 1,
+          "time": 41
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 15,
+          "source": 1,
+          "time": 41
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 16,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 50,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 17,
+          "source": 1,
+          "time": 51
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 18,
+          "source": 1,
+          "time": 51
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 19,
+          "source": 1,
+          "time": 51
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 20,
+          "source": 1,
+          "time": 51
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 21,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 60,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 22,
+          "source": 1,
+          "time": 61
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 23,
+          "source": 1,
+          "time": 61
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 24,
+          "source": 1,
+          "time": 61
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 25,
+          "source": 1,
+          "time": 61
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 26,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 70,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 27,
+          "source": 1,
+          "time": 71
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 28,
+          "source": 1,
+          "time": 71
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 29,
+          "source": 1,
+          "time": 71
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 30,
+          "source": 1,
+          "time": 71
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 31,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 80,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 32,
+          "source": 1,
+          "time": 81
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 33,
+          "source": 1,
+          "time": 81
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 34,
+          "source": 1,
+          "time": 81
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 35,
+          "source": 1,
+          "time": 81
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 36,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 90,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 37,
+          "source": 1,
+          "time": 91
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 38,
+          "source": 1,
+          "time": 91
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 39,
+          "source": 1,
+          "time": 91
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 40,
+          "source": 1,
+          "time": 91
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 41,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 100,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 42,
+          "source": 1,
+          "time": 101
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 43,
+          "source": 1,
+          "time": 101
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 44,
+          "source": 1,
+          "time": 101
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 45,
+          "source": 1,
+          "time": 101
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 46,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 110,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 47,
+          "source": 1,
+          "time": 111
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 48,
+          "source": 1,
+          "time": 111
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 49,
+          "source": 1,
+          "time": 111
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 50,
+          "source": 1,
+          "time": 111
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 51,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 120,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 52,
+          "source": 1,
+          "time": 121
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 53,
+          "source": 1,
+          "time": 121
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 54,
+          "source": 1,
+          "time": 121
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 55,
+          "source": 1,
+          "time": 121
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 56,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 130,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 57,
+          "source": 1,
+          "time": 131
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 58,
+          "source": 1,
+          "time": 131
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 59,
+          "source": 1,
+          "time": 131
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 60,
+          "source": 1,
+          "time": 131
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 61,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 140,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 62,
+          "source": 1,
+          "time": 141
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 63,
+          "source": 1,
+          "time": 141
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 64,
+          "source": 1,
+          "time": 141
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 65,
+          "source": 1,
+          "time": 141
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 66,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 150,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 67,
+          "source": 1,
+          "time": 151
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 68,
+          "source": 1,
+          "time": 151
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 69,
+          "source": 1,
+          "time": 151
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 70,
+          "source": 1,
+          "time": 151
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 71,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 160,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 72,
+          "source": 1,
+          "time": 161
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 73,
+          "source": 1,
+          "time": 161
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 74,
+          "source": 1,
+          "time": 161
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 75,
+          "source": 1,
+          "time": 161
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 76,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 170,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 77,
+          "source": 1,
+          "time": 171
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 78,
+          "source": 1,
+          "time": 171
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 79,
+          "source": 1,
+          "time": 171
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 80,
+          "source": 1,
+          "time": 171
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 81,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 180,
+          "view": 1
+        }
+      ],
+      "issued": [
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 1,
+            "value": null,
+            "view": 1
+          }
+        }
+      ],
+      "profile": "flowmesh-v2-single-sequence-pbft-test/1"
+    }
+  ],
+  "success": false,
+  "test_output": "test_sparse_offer_to_nonleader_reaches_agreement_without_next_request (test_review.ReviewTests.test_sparse_offer_to_nonleader_reaches_agreement_without_next_request) ... FAIL\n\n======================================================================\nFAIL: test_sparse_offer_to_nonleader_reaches_agreement_without_next_request (test_review.ReviewTests.test_sparse_offer_to_nonleader_reaches_agreement_without_next_request)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"[SOURCE]/test/flowmesh_v2_agreement/test_review.py\", line 22, in test_sparse_offer_to_nonleader_reaches_agreement_without_next_request\n    self.assertTrue(s.settled(), [node.last_reason for node in s.nodes])\n    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: False is not true : ['', '', '', '']\n\n----------------------------------------------------------------------\nRan 1 test in 0.006s\n\nFAILED (failures=1)\n"
+}

@@ -84,7 +84,7 @@ timer/deadline, pending data/retry work and local diagnostic tip.
 | Event | Guard / evidence | Durable change before outgoing vote or success |
 | --- | --- | --- |
 | Start/restart | Exact configured initial state or preserved durable state; exclusive synthetic owner | Restore all safety records and application markers; finish pending committed application exactly once; no permission from a fresh process alone |
-| Offer local body | I is current; deterministic execution/anchor evidence valid | None; cache preview only, start pending-work timer |
+| Offer local body | I is current; deterministic execution/anchor evidence valid | Retain exact offered body (not an executed ledger change), start pending-work timer, disseminate bounded OFFER to configured replicas |
 | PROPOSE at view 0 | Correct scheduled signer `(sequence+view)%N`; current ACTIVE view; body valid; no conflicting accepted proposal | Persist exact accepted header/body before PREPARE intent |
 | PROPOSE at view >0 | Same, plus matching validated durably accepted NEW_VIEW | Same; no naked vote can manufacture proposal/NV acceptance |
 | PREPARE | ACTIVE/current; accepted valid body and exact NV if nonzero; fresh signing state; unused or identical phase/view slot | Persist intent, generate signature, persist exact signature, then publish; identical retransmission only |
@@ -117,6 +117,26 @@ Retries every 10 ticks retransmit exact retained objects, request missing bodies
 and advertise final proofs. Timeouts never choose an economically different
 object by themselves. No extra user trade is needed to finish the last batch.
 
+Recovery clarification after the retained counterexamples: a restart restores
+current-instance offered bodies and accepted/prepared headers from its own
+durable records. Active pending work regains a timer; a CHANGING node still
+waits for the specified report quorum. A decided-but-unapplied node missing
+anchor evidence requests that exact evidence and resumes the same decision;
+it neither signs replacement work nor mistakes that decision for application.
+
+OFFER is synthetic client ingress, not a vote or new consensus phase. Initial
+ingress and bounded retries disseminate its identical body, including from a
+nonleader. Each receiver validates the body before retaining pending work.
+Receiving it does not execute the ledger or grant any signing exception.
+There is no new production networking code or claim of authenticated client
+transport here. Current-instance retention is bounded; stale bodies cannot
+be rebased into a new economic instruction.
+
+An accepted NEW_VIEW is exact: a different signed report bundle for the same
+view is rejected even when its selected ValueId is equal. A proposal cannot
+substitute that bundle for the one durably accepted. This does not change
+ValueId or prevent a later valid view from carrying the same value.
+
 Synthetic anchor evidence is a configured linear finalized chain extending the
 agreed parent anchor; each node has its own evidence store. It verifies exact
 height/hash/context, monotonic descendant relationship, and test import facts.
@@ -145,6 +165,12 @@ progress. A finite exploration is not a theorem over every schedule.
 
 The checker inspects all generated signatures, even withheld/unpublished ones,
 and counts potential quorums independently, not just delivered certificates.
+Bounded test-only events also record exact intent, historical signing evidence,
+signature persistence and every publication (including retries). The checker
+validates their order and objects, not merely eventual durable state. Its
+anchor-ancestry walk is independent of replica acceptance; the simulator's
+initial synthetic evidence is retained for the audit, never used as a global
+candidate-selection oracle by replicas.
 Hidden COMMIT q implies at least f+1 honest prepared holders; their later view
 reports intersect every q report set. This motivates, but does not replace,
 the adversarial tests. A lone omitted prepared holder cannot veto a valid
