@@ -1,0 +1,41 @@
+{
+  "profile_id": "flowmesh-v2-isolated-accounting-test/1",
+  "reference_revision": "2b32645e26f4ba41de8aa746bd04e84192fb3972",
+  "test_only": true,
+  "domain": "generated-accounting-model-not-a-network",
+  "fee_ppm_per_side": 50,
+  "treasury_percent": 20,
+  "fee_rounding": "cumulative-order-floor",
+  "treasury_rounding": "per-batch-per-asset-floor-no-carry",
+  "seat_allocation": "equal-historical-seats-canonical-id-remainder",
+  "replacement_quantity": "additional-remaining-lots",
+  "reservation": "persistent-staircase-minus-actual-spend",
+  "completed_replay_precedence": "stored-outcome-before-unconsumed-equivocation-grouping",
+  "risk_adapter": "explicit-synthetic-input-no-production-default",
+  "stable_fee_assets": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  ],
+  "limits": {
+    "amount": 9223372036854775807,
+    "intermediate": 170141183460469231731687303715884105727,
+    "price": 1000000,
+    "lots": 1000000,
+    "curve_points": 16,
+    "markets": 16,
+    "orders": 4096,
+    "actions_per_batch": 256,
+    "facts_per_batch": 256,
+    "records": 16384,
+    "sequence": 4294967295
+  },
+  "provisional_choices": [
+    "A-D1: global five-phase ordering and all-market clearing",
+    "A-D2: one curve per account/market/side and immutable OrderId",
+    "A-D3: conservative persistent backing",
+    "A-D4: per-order fee floors, no treasury carry, equal historical-seat dust",
+    "A-D5: state rejection consumes sequence; completed replay has precedence",
+    "A-D6: synthetic custody capacity and segregated V1 payout/new-deposit cases",
+    "A-D7: synthetic explicit cash transfer checks, not futures economics"
+  ]
+}
