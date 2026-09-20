@@ -1,11 +1,27 @@
 # B3 PoS V2 + FlowMesh V2 — integrated Stage 0 specification
 
 Date: 2026-09-20. Baseline: `0b930e303e4c2c6bc28beb3bf656488b636ad49d`.
-Status: **complete Stage 0 review draft; NOT an approved protocol or an
-implementation-ready activation specification**. Explicit decisions below
-must be ratified, then codec/parameter vectors frozen before implementation.
-This document is the integrated design; the handoff and source maps are its
-evidence, not competing specifications.
+Status: **Stage 0 R1 corrected specification candidate; PROPOSED, not
+ratified, implemented or activation-ready**. Original review freeze
+`f327bd2cc334282eec17a09c1d15d04f68b7f4c5` remains unchanged in Git and on
+`design/flowmesh-v2-stage0`; R1 is a separate design revision. The original
+read-only audit remains unchanged; its nine findings are tracked in the
+[R1 disposition and review package](v2-stage0-r1-review.md).
+
+This document plus the following explicit normative proposal appendices form
+ONE integrated candidate. They refine the corresponding sections below;
+they are not implemented alternatives or permission to choose rules at runtime:
+
+- [Accounting rules, worked vectors, bounded decisions and proposed tests](v2-stage0-r1-accounting.md).
+- [PBFT-style consensus, pure validation and authority/recovery rules](v2-stage0-r1-consensus.md).
+- [Read-only bridge verification and exact outstanding evidence](v2-stage0-r1-bridge.md).
+- [Preservation/cutover routing and remaining futures gates](v2-stage0-r1-transition.md).
+
+All newly selected candidate rules remain **PROPOSED** until the owner approves
+their bounded decision set. Conflicts between the integrated text/appendices
+are review failures, not implementation discretion. Exact production codecs,
+bounds and any still-unapproved economics remain gated. No mainnet height is
+selected; the first accounting model has NOT begun.
 
 ## 0. Authority, scope and terminology
 
@@ -135,10 +151,12 @@ consumes its sequence even on deterministic state rejection, matching the
 V1 anti-replay principle. Structural/authentication failures do not.
 Duplicates return the original outcome; equal sequence/different content is
 equivocation, never a replacement. Admission alone does not allocate credit.
-Specify canonical batch ordering and resource bounds before G1; external
+The accounting appendix specifies the proposed event phases, action ordering,
+duplicate/rejection behavior and bounded model configuration. External
 oracle/deposit/settlement evidence is committed, not read nondeterministically
 during execution. Parallel outstanding client instructions must respect the
-shared nonce; no automatic re-signing around a gap.
+shared nonce; no automatic re-signing around a gap. Production resource bounds
+and byte codecs still require G1 approval.
 
 ## 4. Spot execution and cross-market reservations
 
@@ -157,15 +175,20 @@ another market. Cross-market composite actions, if later added, are all-or-
 nothing—not two independent market submissions.
 
 Partial fills debit only executed base, executed quote and the actual quote
-fees, preserve executed quantity, and recompute residual backing with the
-same bound. Return only proven excess reserve. Cancel releases the precise
+fees. R1 preserves lifetime execution/fee accumulators across same-order
+replacement, while replacement curves express NEW REMAINING quantities and
+start a new revision-local fill counter. This is a proposed V2 rule, not a
+reinterpretation of V1 replacement. Reuse the conservative persistent-curve
+staircase bound with the exact residual recurrence in the accounting appendix;
+do not replace it with the maximum notional of a single auction. Return only
+proven excess reserve under that recurrence. Cancel releases the precise
 remaining reserve after any earlier committed fills. A delayed cancel can
 legitimately lose the race to a fill; UI closure is never cancellation.
 Reject over-release, wrong-order release, replayed cancel and overflow.
 
 P: retain uniform-price curve-auction selection and deterministic volume,
 imbalance, price tie-breaking. Generalize asset units/configuration without
-silently changing the auction. All affected markets clear in a canonical
+silently changing the auction. All configured spot markets clear in a canonical
 order in a microblock; matching never consumes unreserved shared funds.
 Settlement of a trade is atomic across both counterparties and fee accounts.
 
@@ -195,9 +218,12 @@ side, charge the difference between `floor(cumulativeQuoteNotional * 50 /
 1,000,000)` after and before a fill. Preserve this accumulator through partial
 fills and same-order replacement. A new order has a new accumulator; splitting
 orders can affect dust and must be disclosed/tested before approval.
-Allocate treasury `floor(batchTotalFees * 20 / 100)`; the remainder is the FN
-pool, split using the approved epoch-seat rule with deterministic atom
-remainders. Reserve BUY remaining notional plus
+R1 groups collected fees across all markets in ONE global microblock by
+exact quote AssetId, then allocates treasury `floor(assetBatchTotalFees * 20 /
+100)`; the remainder is the FN pool. The accounting appendix defines historical
+recipient authority and deterministic seat remainders. This grouping and dust
+policy are proposed economics requiring approval, not existing mainnet rules.
+Reserve BUY remaining notional plus
 `ceil((alreadyFilledNotional + maximumRemainingNotional) * 50 / 1,000,000)
  - alreadyChargedFees`. Check this bound against actual reserve before any
 fill/replacement commits; recomputation cannot create backing. Do not round
@@ -346,16 +372,26 @@ are below one third for that profile.
 
 ### Normal case
 
+The explicit transition guards, context/authority identifiers and pure
+candidate-validation predicates are in the consensus appendix. In particular,
+"valid candidate" does not mean acceptable to a node's current private tip.
+
 1. One deterministic scheduled proposer per `(epoch, sequence, view)` sends
    complete candidate and admissibility evidence. P: anchored seat order
    rotation for FN; no persistent-leader optimization in first implementation.
-2. A replica verifies parent, configuration, complete data, user auth,
+2. A replica first checks its durable current view, the scheduled authenticated
+   proposer and absence of a different local decision. For a nonzero view it
+   must have durably accepted the matching complete NEW_VIEW and its selected
+   value; a timeout or larger view number is insufficient. It verifies parent,
+   configuration, complete data, user auth,
    custody/oracle evidence and deterministic execution on a scratch state.
    It persists proposal acceptance and a unique PREPARE intent before signing;
    persists exact signed bytes before publication. At most one candidate per
    phase/view/sequence/key may be signed.
 3. Q distinct valid PREPAREs for the same context/view/candidate form a
-   PreparedQC. Persist the complete proof before COMMIT intent/signature.
+   PreparedQC. COMMIT also requires the matching durably accepted proposal,
+   current-view authorization and NEW_VIEW where applicable. Persist the
+   complete proof before COMMIT intent/signature.
    Prepared is **not** decided and must not create an externally usable final
    attestation or a final client success response.
 4. Q valid COMMITs for that prepared value form CommitQC. For view > 0,
@@ -443,7 +479,12 @@ unfinished intent can finish only its exact object and only while still
 authorized by the durable current view. An unsigned abandoned-view intent
 must not create a new signature; already-signed exact bytes may be relayed.
 Missing/corrupt safety
-records fail closed with explicit reason. Unknown network outcome triggers
+records fail closed with explicit reason. A structurally valid old filesystem
+snapshot is NOT thereby proven fresh: the consensus appendix defines the
+stable-storage fault assumption, freshness/recovery gate and signing refusal
+after detected or suspected rollback. No claim of automatic rollback detection
+is made from checksums, process exclusivity or persist-before-sign alone.
+Unknown network outcome triggers
 identity reconciliation/exact-byte retry, never a new signature for another
 candidate. Reopening the wallet cannot clear no-resubmit records.
 
@@ -458,7 +499,10 @@ anchor to include them; already-backed internal trades need not wait for
 each new B3 block. Reorg above that anchor invalidates only speculative input
 evidence, not certified balances. Conflicting final B3 proofs or removal of
 a committed anchor are a safety breach requiring a halt and separate incident
-analysis. Never “unlock because this fork cannot gather fresh votes.”
+analysis. Never “unlock because this fork cannot gather fresh votes.” Anchor
+advancement, complete ordered event import and handover activation must follow
+the pure predicates in the consensus appendix; a newer local tip is not an
+anchor-update command.
 
 ### Committee transitions and inactive seats
 
@@ -478,21 +522,27 @@ replacement merely because a coordinator declares it offline.
 
 ## 8. B3 PoS V2 profile and fork-choice boundary (P3)
 
-P3 recommends the smallest initially specified PoS V2: retain V1 block
-production/economics and introduce full BFT checkpoint coordination plus
-versioned validation/commit enforcement. A new VRF, lower-difficulty PoW,
+P3-R1 proposes retaining V1 block-eligibility arithmetic/economics while
+separating checkpoint authority from the producer snapshot tracker, with
+full BFT checkpoint coordination and versioned validation/commit enforcement.
+The exact proposed separation and changed handover signal are in C7 of the
+consensus appendix. This is an explicit D3 choice, not an assertion that all
+producer/finality timing rules remain identical. A new VRF, lower-difficulty PoW,
 cooldown, slashing or staking reward schedule is **not selected**.
 If the owner wants replacement producer election, choose D3 before its
 implementation; this profile is a concrete default proposal, not a hidden
 promise of a complete new election algorithm.
 
-Preserve existing STAKE ownership/maturity and exact V1 arithmetic, epoch
-snapshot member/weight construction, BIP340 producer identity, 60-second spacing with
+Preserve existing STAKE ownership/maturity and exact V1 arithmetic, snapshot
+member/weight construction, BIP340 producer identity, 60-second spacing with
 30-second recovery rounds, reward cap/halving/treasury and no automatic
 restaking. Seed/first V2 block derives from the verified V1 parent state;
 do not invent a new genesis or re-decode old transactions. Existing B3
-transaction fees remain B3. Epoch snapshots, not live UTXO spending alone,
-determine the in-force producer/finality set.
+transaction fees remain B3. Authenticated snapshots, not live UTXO spending
+alone or online-peer estimates, determine the two in-force authorities.
+C7 explicitly defines producer handover by included checkpoint height and
+checkpoint snapshot selection by a terminal committed checkpoint, instead
+of implicitly reusing V1's shared inclusion-dependent epoch tracker.
 
 P3 adds a separate B3-finality instance of P2, not the FN committee. It agrees
 on exact checkpoint block hash, cumulative bridge withdrawal root and
@@ -506,10 +556,12 @@ means catch-up, not an arbitrary different checkpoint vote.
 P: B3 agreement sequence is a monotonic checkpoint-decision ordinal, not
 local tip height. The candidate names its actual schedule-valid height;
 all replicas extend the same prior committed checkpoint. The first instance
-binds the last V1 finalized checkpoint and exact committed current/next sets.
+is authorized by the fixed-outgoing-authority B0 proof in C8; it preserves
+the actual inherited V1 finalized state and all precommitted successors.
 Never create independent instances for competing hashes at one checkpoint.
 The previous committed decision/outgoing-set handover authorizes the one
-next-instance committee, exact snapshot boundary/header and activation rule.
+next-instance committee, exact snapshot boundary/header and activation rule
+under C7, including the exact checkpoint epoch-floor and terminal predicate.
 Candidate-local projections of certificate inclusion height must not create
 different authorities for the same sequence. This replaces that V1 ambiguity
 at the explicit V2 boundary while retaining member/weight construction and
@@ -557,8 +609,9 @@ Source inspected at the baseline, not merely presumed from BLS byte size:
 `B3FinalityVerifier.sol`, `BlsCertificateProver.sol`, `B3StakerBridge.sol`,
 `IB3FinalityProver.sol`, node finality/withdrawal codecs and calldata builder.
 See §15 for source anchors. These are exact source rules and retained
-deployment pins; **independent deployed-runtime/source equivalence remains
-unverified in this stage** (§9.4). Do not call this a fresh chain-state audit.
+deployment pins; **independently reproduced source/compiler-to-runtime
+equivalence remains unverified** (§9.4). R1 adds bounded public Ethereum
+runtime/getter evidence in its bridge appendix, not a live B3-node audit.
 
 ### 9.1 Frozen verifier interface
 
@@ -656,7 +709,7 @@ FlowMesh FN certificates must not be substituted for B3 finality authority.
 | New external digest/DST, round fields or ruleset | Rejected; keep legacy export and separate internal V2 domains |
 | Smaller weight/headcount threshold | Rejected; both deployed thresholds remain |
 | More than 64 bridge members | No new bridge-qualified root; either retain compatible set or separately approve a bounded, lineage-authorized bridge committee |
-| Fast base-chain epochs | Cannot force fast Ethereum rotation. Separate export epochs would be an unselected D3/D5 redesign needing explicit mapping and old-lineage handover; first profile retains existing epoch cadence |
+| Fast base-chain epochs | Cannot force fast Ethereum rotation. P3-R1 retains the inherited checkpoint interval parameter but explicitly changes checkpoint epoch boundaries; external export still obeys existing Ethereum timing/lineage and may wait or fail closed. Independent export epochs are not selected |
 | Uncommitted replacement/skip epoch | Rejected; old lineage must authenticate successor |
 | Expired deployed lineage or conflicting old final signatures | New internal BFT alone cannot repair it; preserve evidence and report incompatible/blocked state |
 | New FlowMesh internal balances/fees | No direct Ethereum change if B3 cumulative burn/root/asset/release semantics remain identical |
@@ -679,18 +732,33 @@ Public manifest: `contracts/deployments/ethereum-mainnet-v1.1.1.json`.
 The manifest's build-provenance hash is
 `0x4892851a63adab398e2496437956986e1c9ee25a3563c8fd226288a7180fdedd`.
 Historical relayer read evidence corroborates addresses, but explicitly is
-not a current readiness certificate. A bounded attempt to read the
+not a current readiness certificate. R1's bridge appendix separately records
+public state at finalized Ethereum block 26018233 and two-provider checks:
+runtime hashes match the retained manifest; depositViable is false and
+releaseReady true at that block. This is not full source/runtime equivalence
+or current B3 inbound readiness. The earlier bounded attempt to read the
 [verifier](https://etherscan.io/address/0xE72B3Fe73F0d42A6e964D33E7BB1cc2EA7a3F690#code)
 and [prover](https://etherscan.io/address/0x8e612aE4D475d25940E2A2FC907F21b6813eedA7#code)
 source pages on 2026-09-20 returned tool access failures;
 that does not prove verified source is absent.
 
-G: before asserting deployed parity, reproduce source/compiler/optimizer/
-constructor/immutable mapping, obtain runtime bytes/hash and immutable values
-at a pinned Ethereum block from independent read-only sources, and record
-initialized/current/next sets, epoch, latest roots/heights, rotation time and
-release/deposit readiness. No wallet or signer is needed. If bytecode/source
-mapping or lineage availability fails, report it; do not choose a new vault.
+G: before asserting full deployed parity, reproduce source/compiler/optimizer/
+constructor/immutable mapping and close the remaining BR-EXT evidence in the
+R1 bridge appendix. Its runtime hash and recognized-state observations narrow,
+but do not erase, that gate. No wallet or signer is needed for public getters.
+If bytecode/source mapping or lineage availability fails, report it; do not
+choose a new vault.
+
+### 9.5 Independent inbound light-client gate (R1 verification)
+
+The [bridge appendix](v2-stage0-r1-bridge.md) verifies the inspected release
+configurations, header/signature-slot boundaries, execution-timestamp mint
+freshness and preservation rules. Ethereum contract lineage expiry and B3's
+pinned Ethereum-fork horizon are separate mechanisms. The recorded
+`2026-10-04T20:00:23Z` is not a proven wall-clock stop of every bridge operation.
+An Ethereum deposit-readiness response does not prove the B3 inbound mint path
+is available; a client warning cannot change the unchanged contract's predicate.
+No pins or live configuration were changed during this verification.
 
 ## 10. V1 preservation and migration (P4, owner decision D10)
 
@@ -727,8 +795,13 @@ proposed, requires full competing-certificate/claim inventory, public rules
 and separate owner/security approval. Until then affected V1 assets remain
 accounted, visibly blocked, and excluded from V2 spendable credit.
 
-Deposits during cutover need an explicit chain-level routing rule and a
-client warning; never silently send to whichever backend is reachable.
+R1 proposes the exact semantic cutover routing table in the transition appendix:
+old deposits confirmed below symbolic H remain V1 ingress even when credited
+later; new V1 user-custody deposits at/above H are rejected; V2 deposits require
+both H and effective authorized bootstrap. Preserve V1 settlement change and
+old payouts rather than mistaking them for new user deposits. This rule is a
+pending D10 approval, not activated behavior. Never silently send to whichever
+backend is reachable.
 Keep V1 observation/claim APIs available with honest stalled/retired status.
 The manifest of preserved liabilities and its independently reproduced
 root/counts is a release gate even when no automatic migration is selected.
@@ -796,9 +869,12 @@ R: planned coordinated **B3 hard fork**, no selected mainnet height. Version
 dispatch is inactive/unset in production until a later explicit activation
 approval. Define preactivation, activation and postactivation behavior for
 block validation, finality, custody, clients and operators. First V2 state
-binds the authenticated heads of every preserved V1 market plus the B3
-finalized checkpoint and preservation manifest; unknown
-versions fail closed. No historical nTime/transaction/signature rewriting.
+requires the consensus appendix's explicit bootstrap authority and binds
+authenticated V1 preservation PREFIXES, the authoritative B3 checkpoint and
+manifest. A prefix is not proof that no later V1 certificate exists. Preserve
+later valid old claims under their original rules, and never turn a balances
+snapshot into V2 spendable credit. Unknown versions fail closed. No historical
+nTime/transaction/signature rewriting.
 
 Test first in deterministic unit/model fixtures, then separate generated
 regtest nodes. A shadow fork is isolated by network magic, ports, genesis/
@@ -845,7 +921,7 @@ do not require additional decisions. All recommended entries remain **PENDING**.
 |---|---|---|
 | D1 | BFT protocol and fault model | P2 complete single-slot PBFT-style commit/view-change first; alternative explicitly specified Tendermint-style protocol. No reduced quorum |
 | D2 | Shared execution/reservation boundary | P1 one global ordered domain with separated spot/futures accounting; alternative sharded atomic protocol adds substantial design work |
-| D3 | PoS V2 scope | P3 preserve producer selection/economics, add full checkpoint commitment; alternative VRF/new producer election needs its own security/economic specification |
+| D3 | PoS V2 scope | P3-R1 preserves producer eligibility/reward arithmetic but separates checkpoint/producer authority and explicitly changes handover linkage; approve that boundary or require a separately specified unified-authority alternative. New VRF/election remains unselected |
 | D4 | Inactive validators and staking changes | Objective diagnostics + epoch-authorized changes initially; no automatic decay/slashing/cooldown/reward change without a separate approved rule |
 | D5 | Unchanged bridge authority | Preserve existing compatible lineage/set rules; a bounded separate bridge committee is possible only with explicit trust/selection/handover approval and available old lineage |
 | D6 | Units, fee rounding and dust | Exact lot/tick amounts, cumulative per-order fee floors and provable BUY reserve bound; approve splitting/dust/replacement vectors before freezing |
@@ -865,9 +941,13 @@ stage after approval: an isolated executable shared-spot reference model and
 adversarial invariant fixtures, with no node/RPC/activation changes. Cover
 exact-AssetId shared balances, competing cross-market reserves, partial fills,
 cancel/replacement atomicity, quote-fee bounds and V1 migration accounting.
-Preserve a separate futures ledger interface and test that no spot debit can
-occur through it. This stage does not claim futures or BFT implementation.
-Prerequisites: approved D2/D6/D10 profile and exact model vectors.
+Preserve a separate futures ledger interface and test that no implicit or
+unauthorized spot debit can occur through it; explicit authorized transfers
+are the sole exception. This stage does not claim futures or BFT implementation.
+Prerequisites: approval of the compact accounting decision sheet in the R1
+accounting appendix, including its bounded D2/D6/D10 choices and exact vectors.
+That approval does not select D1/D3, production bootstrap, futures economics
+or deployed bridge compatibility. Undefined futures risk predicates fail closed.
 
 Then individually approved/audited stages: (a) complete BFT model/codec and
 restart adversarial proof; (b) PoS checkpoint adapter + isolated historical/
@@ -889,7 +969,9 @@ implementation convenience.
 
 ## 15. Source and research map
 
-All repository anchors below are at baseline `0b930e3`; historical prose
+All repository anchors below are at the commit-pinned published baseline
+[`0b930e303e4c2c6bc28beb3bf656488b636ad49d`](https://github.com/B3-Coin/B3-CoinV2/tree/0b930e303e4c2c6bc28beb3bf656488b636ad49d);
+the R1 appendices provide direct file/line links for corrected rules. Historical prose
 conflicts are recorded in the handoff. These targeted checks extend the
 existing inventory; they are not a new full security audit.
 
