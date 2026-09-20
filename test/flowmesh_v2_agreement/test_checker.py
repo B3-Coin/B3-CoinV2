@@ -11,8 +11,10 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fm_application import Application, make_anchor, value_id
 from fm_checker import check
 from fm_protocol import Proofs, message
+from fm_replica import Replica
 from fm_simulator import Simulator
 from test_model import Fixture, BUYER, USD_A
 
@@ -241,6 +243,92 @@ class CheckerTests(unittest.TestCase):
         for node in sim.nodes:
             node.crash()
             node.restart(suspected_rollback=True)
+        self.assertEqual(check(sim)["applied_records"], 4)
+
+    def test_negative_control_late_prepared_record_cannot_repair_early_commit(self):
+        sim = self.make()
+        body = sim.offer()
+        sim.run(10, stop=lambda s: len(s.published(phase="PREPARE")) >= 3)
+        node = sim.nodes[0]
+        self.assertEqual(node.record["prepared"], {})
+        proposal = sim.published(phase="PROPOSE")[0]
+        prepares = sorted(sim.published(phase="PREPARE"), key=lambda s: s["payload"]["sender"])
+        qc = {"proposal": proposal, "prepares": prepares}
+        # Deliberately bypass the caller's signing guard, then repair final
+        # durable state. This is an oracle negative control, not a fault API.
+        node._sign("COMMIT", value_id(body))
+        node._prepared(qc)
+        self.assertIn((0, value_id(body)), node.record["prepared"])
+        with self.assertRaisesRegex(AssertionError, "CHECKER_SIGN_BEFORE_PREPARED_QUORUM"):
+            check(sim)
+
+    def test_negative_control_publication_before_signature_persistence(self):
+        sim = self.settled()
+        publish = next(e for e in sim.trace if e["event"] == "publish")
+        durable = next(e for e in sim.trace if e["event"] == "durable"
+                       and e.get("auth") == publish["auth"])
+        sim.trace.remove(publish)
+        sim.trace.insert(sim.trace.index(durable), publish)
+        for ordinal, event in enumerate(sim.trace):
+            event["ordinal"] = ordinal
+        with self.assertRaisesRegex(AssertionError, "CHECKER_PUBLISH_BEFORE_DURABLE_SIGNATURE"):
+            check(sim)
+
+    def test_negative_control_signature_generation_before_durable_intent(self):
+        sim = self.settled()
+        guard = next(e for e in sim.trace if e["event"] == "pre_sign")
+        intent = next(e for e in sim.trace if e["event"] == "durable"
+                      and e.get("payload") == guard["payload"])
+        sim.trace.remove(guard)
+        sim.trace.insert(sim.trace.index(intent), guard)
+        for ordinal, event in enumerate(sim.trace):
+            event["ordinal"] = ordinal
+        with self.assertRaisesRegex(AssertionError, "CHECKER_SIGN_BEFORE_DURABLE_INTENT"):
+            check(sim)
+
+    def test_negative_control_signature_persistence_requires_historical_guard(self):
+        sim = self.settled()
+        sim.trace.remove(next(e for e in sim.trace if e["event"] == "pre_sign"))
+        for ordinal, event in enumerate(sim.trace):
+            event["ordinal"] = ordinal
+        with self.assertRaisesRegex(AssertionError, "CHECKER_SIGNATURE_BEFORE_GUARD"):
+            check(sim)
+
+    def test_negative_control_historical_anchor_fork_or_height_gap(self):
+        for fault in ("wrong_parent", "forked_ancestor", "height_gap"):
+            sim = self.make()
+            fork = make_anchor(sim.initial_anchor["height"] + 1, "f" * 64)
+            if fault == "wrong_parent":
+                anchor = fork
+            elif fault == "forked_ancestor":
+                anchor = make_anchor(fork["height"] + 1, fork["hash"])
+                for node in sim.nodes:
+                    node.anchors[fork["hash"]] = deepcopy(fork)
+            else:
+                anchor = make_anchor(sim.initial_anchor["height"] + 2, sim.initial_anchor["hash"])
+            def unsafe_preview(node, body, rec=None):
+                # Simulate a broken agreement/application boundary while
+                # preserving internally correct accounting roots/signatures.
+                return Application((rec or node.record)["before"]).preview(body["batch"])
+            with patch.object(Replica, "_valid_body", unsafe_preview):
+                sim.offer(anchor=anchor)
+                sim.run(10, stop=lambda s: s.settled())
+            self.assertTrue(sim.settled())
+            with self.subTest(fault=fault), self.assertRaisesRegex(
+                    AssertionError, "CHECKER_ANCHOR_NOT_DESCENDANT|CHECKER_ANCHOR_BROKEN_CHAIN"):
+                check(sim)
+
+    def test_multilevel_anchor_audit_survives_all_volatile_caches_restarting(self):
+        sim = self.make()
+        anchor = max(sim.nodes[0].anchors.values(), key=lambda a: a["height"])
+        self.assertGreater(anchor["height"], sim.initial_anchor["height"] + 1)
+        sim.offer(anchor=anchor)
+        sim.run(10, stop=lambda s: s.settled())
+        self.assertTrue(sim.settled())
+        for node in sim.nodes:
+            node.crash()
+            node.restart()
+            self.assertEqual(set(node.anchors), {anchor["hash"]})
         self.assertEqual(check(sim)["applied_records"], 4)
 
 

@@ -99,6 +99,12 @@ class Replica:
         self.event("crash", point="scheduler")
 
     def restart(self, suspected_rollback=False):
+        try:
+            self._restart(suspected_rollback)
+        except Exhausted as exc:
+            self._halt(str(exc))
+
+    def _restart(self, suspected_rollback=False):
         # Supported restart reuses the *same* acknowledged stable-memory state.
         # No untrusted old snapshot is made authoritative by this API.
         if suspected_rollback:
@@ -194,6 +200,15 @@ class Replica:
             self.event("timer", view=self.record["view"], deadline=self.deadline)
 
     def offer(self, body):
+        try:
+            self._offer(body)
+            self._send("OFFER", body)
+        except Exhausted as exc:
+            self._halt(str(exc))
+
+    def _offer(self, body):
+        if self.d["halt"]:
+            return
         self._valid_body(body)
         self._store_body(body)
         if value_id(body) not in self.d["retained_bodies"]:
@@ -287,6 +302,15 @@ class Replica:
         return rec
 
     def _handle(self, kind, data, source):
+        if kind == "OFFER":
+            # Client ingress is synthetic. Each recipient independently checks
+            # this exact body before retaining pending work; OFFER is not a vote.
+            rec = self._context(data["instance"])
+            if rec["applied"]:
+                self._send("CERT", rec["decision"], source)
+            else:
+                self._offer(data)
+            return
         if kind == "GET":
             if set(data) != {"type", "id"}:
                 raise Invalid("GET_SHAPE")
@@ -346,6 +370,7 @@ class Replica:
                 raise Invalid("UNKNOWN_PHASE")
         elif kind == "PREPARED":
             p = data["proposal"]["payload"]
+            self.proofs.check("prepared", data, p["instance"])
             rec = self._context(p["instance"])
             if not rec["applied"]:
                 self._prepared(data)
@@ -527,6 +552,7 @@ class Replica:
 
     def _certificate(self, cert):
         p = cert["prepared"]["proposal"]["payload"]
+        self.proofs.check("commit", cert, p["instance"])
         rec = self._context(p["instance"])
         p = self.proofs.check("commit", cert, rec["instance"])
         body = self._body(p["value"], rec)
@@ -571,6 +597,9 @@ class Replica:
     def retry(self):
         if not self.alive:
             return
+        for value in sorted(self.offers):
+            if value in self.bodies:
+                self._send("OFFER", self.bodies[value])
         # Publication of exact retained signatures is allowed even after a timeout;
         # signing a new old-view message is not. No signature is erased.
         for rec in self.d["records"].values():

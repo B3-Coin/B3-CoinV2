@@ -40,6 +40,26 @@ class _Audit:
         self.genesis = digest("TEST/V2/GENESIS/1", [self.config, sim.initial_anchor])
         self.tokens = {}
         self.proof_cache = {}
+        # Historical anchor evidence belongs to the external audit. In
+        # particular, restarting every node may erase all volatile ancestors.
+        self.anchor_evidence = {}
+        evidence = [sim.initial_anchor]
+        evidence.extend(getattr(sim, "initial_anchors", {}).values())
+        for node in sim.nodes:
+            evidence.extend(node.anchors.values())
+            evidence.append(node.d["anchor"])
+            evidence.extend(body.get("anchor") for body in node.d["retained_bodies"].values())
+            for rec in node.d["records"].values():
+                evidence.append(rec["anchor_before"])
+                if rec["body"] is not None:
+                    evidence.append(rec["body"].get("anchor"))
+                evidence.extend(item["body"].get("anchor") for item in rec["accepted"].values())
+        for anchor in evidence:
+            try:
+                self.anchor_header(anchor)
+            except (AssertionError, KeyError, TypeError, ValueError):
+                continue  # Unused malformed Byzantine/cache traffic has no authority.
+            self.anchor_evidence[anchor["hash"]] = anchor
 
     def instance(self, instance):
         _require(type(instance) is dict and set(instance) == _INSTANCE,
@@ -60,7 +80,9 @@ class _Audit:
                  and type(obj["auth"]) is str
                  and self.tokens.get(obj["auth"]) == obj,
                  "CHECKER_AUTHENTICATION")
-        p = obj["payload"]
+        return self.payload(obj["payload"], phase, instance)
+
+    def payload(self, p, phase=None, instance=None):
         _require(type(p) is dict and p.get("phase") in _EXTRAS,
                  "CHECKER_PHASE")
         _require(set(p) == _BASE | _EXTRAS[p["phase"]], "CHECKER_MESSAGE_SHAPE")
@@ -77,6 +99,31 @@ class _Audit:
         else:
             _require(_hash(p["value"]), "CHECKER_VALUE")
         return p
+
+    def anchor_header(self, anchor):
+        _require(type(anchor) is dict and set(anchor) == {"height", "hash", "parent", "context"}
+                 and type(anchor["height"]) is int and 0 <= anchor["height"] <= 0xFFFFFFFF
+                 and _hash(anchor["parent"])
+                 and anchor["context"] == self.sim.initial_anchor["context"],
+                 "CHECKER_ANCHOR_SHAPE")
+        _require(anchor["hash"] == digest("TEST/V2/ANCHOR/1",
+                 {k: anchor[k] for k in ("height", "parent", "context")}), "CHECKER_ANCHOR_HASH")
+
+    def ancestry(self, anchor, before):
+        self.anchor_header(anchor)
+        self.anchor_header(before)
+        _require(anchor["height"] >= before["height"], "CHECKER_ANCHOR_REGRESSION")
+        current = anchor
+        while current["height"] > before["height"]:
+            if current["height"] == before["height"] + 1:
+                _require(current["parent"] == before["hash"], "CHECKER_ANCHOR_NOT_DESCENDANT")
+                current = before
+            else:
+                parent = self.anchor_evidence.get(current["parent"])
+                _require(parent is not None, "CHECKER_ANCHOR_EVIDENCE_MISSING")
+                _require(parent["height"] + 1 == current["height"], "CHECKER_ANCHOR_BROKEN_CHAIN")
+                current = parent
+        _require(current == before, "CHECKER_ANCHOR_SAME_HEIGHT_FORK")
 
     def votes(self, votes, phase, proposal):
         _require(type(votes) is list and self.q <= len(votes) <= self.n,
@@ -153,17 +200,7 @@ class _Audit:
                  and value_id(body) == value, "CHECKER_BODY_IDENTITY")
         _require(normalize_batch(body["batch"]) == body["batch"], "CHECKER_BODY_CANONICAL")
         anchor = body["anchor"]
-        _require(type(anchor) is dict and set(anchor) == {"height", "hash", "parent", "context"}
-                 and type(anchor["height"]) is int and anchor["height"] >= 0
-                 and _hash(anchor["parent"])
-                 and anchor["context"] == self.sim.initial_anchor["context"],
-                 "CHECKER_ANCHOR_SHAPE")
-        _require(anchor["hash"] == digest("TEST/V2/ANCHOR/1",
-                 {k: anchor[k] for k in ("height", "parent", "context")}), "CHECKER_ANCHOR_HASH")
-        before_anchor = rec["anchor_before"]
-        _require(anchor["height"] >= before_anchor["height"], "CHECKER_ANCHOR_REGRESSION")
-        if anchor["height"] == before_anchor["height"]:
-            _require(anchor == before_anchor, "CHECKER_ANCHOR_SAME_HEIGHT_FORK")
+        self.ancestry(anchor, rec["anchor_before"])
         for field in ("deposits", "settlements"):
             for fact in body["batch"][field]:
                 _require(type(fact.get("height")) is int and 0 <= fact["height"] <= anchor["height"],
@@ -171,6 +208,92 @@ class _Audit:
         snapshot = Application(rec["before"]).preview(body["batch"])
         _require(Application(snapshot).root == body["result"], "CHECKER_RESULT_ROOT")
         return snapshot
+
+    def signing_guard(self, p, guard):
+        """Validate copied historical objects, never implementation booleans."""
+        _require(canonical(guard["instance"]) == canonical(p["instance"])
+                 and guard["view"] == p["view"], "CHECKER_SIGNING_CONTEXT")
+        _require(not guard["fenced"] and not guard["halt"] and guard["decision"] is None,
+                 "CHECKER_SIGNING_UNAVAILABLE")
+        phase, view = p["phase"], p["view"]
+        expected_mode = "CHANGING" if phase in ("VIEW_CHANGE", "NEW_VIEW") else "ACTIVE"
+        _require(guard["mode"] == expected_mode, "CHECKER_SIGNING_MODE")
+        if phase in ("PREPARE", "COMMIT"):
+            accepted = guard["accepted"]
+            _require(accepted is not None, "CHECKER_SIGN_BEFORE_ACCEPTED_PROPOSAL")
+            prop = self.proof("proposal", accepted["signed"], p["instance"])
+            _require((prop["view"], prop["value"]) == (view, p["value"]),
+                     "CHECKER_SIGN_ACCEPTED_LINK")
+            rec = self.sim.nodes[p["sender"]].d["records"][p["instance"]["sequence"]]
+            self.body(accepted["body"], rec, p["value"])
+            if view:
+                _require(guard["new_view"] is not None
+                         and guard["new_view"] == prop["new_view"],
+                         "CHECKER_SIGN_BEFORE_NEW_VIEW")
+                self.proof("new_view", guard["new_view"], p["instance"])
+            if phase == "COMMIT":
+                _require(guard["prepared"] is not None, "CHECKER_SIGN_BEFORE_PREPARED_QUORUM")
+                prepared = self.proof("prepared", guard["prepared"], p["instance"])
+                _require((prepared["view"], prepared["value"]) == (view, p["value"]),
+                         "CHECKER_SIGN_PREPARED_LINK")
+        elif phase == "VIEW_CHANGE":
+            _require(guard["highest"] == p["prepared"], "CHECKER_SIGN_REPORT_OMITS_HIGHEST")
+            if guard["highest"] is not None:
+                prepared = self.proof("prepared", guard["highest"], p["instance"])
+                _require(prepared["view"] < view, "CHECKER_SIGN_REPORT_FUTURE_PREPARATION")
+        elif phase == "PROPOSE" and view:
+            _require(guard["new_view"] is not None and guard["new_view"] == p["new_view"],
+                     "CHECKER_SIGN_BEFORE_NEW_VIEW")
+
+    def temporal(self, honest):
+        """Audit actual persistence/signing/publication order, including retries."""
+        intents, guarded, durable, published = {}, set(), set(), set()
+        for ordinal, event in enumerate(self.sim.trace):
+            _require(event["ordinal"] == ordinal, "CHECKER_TRACE_ORDER")
+            node = event["node"]
+            if node in self.sim.byzantine:
+                continue
+            kind = event["event"]
+            reason = event.get("reason", "")
+            if kind == "durable" and reason.startswith("intent:"):
+                p = self.payload(event["payload"])
+                _require(p["sender"] == node and reason == "intent:" + p["phase"],
+                         "CHECKER_INTENT_EVENT_LINK")
+                key = (node, canonical(p["instance"]), p["phase"], p["view"])
+                encoded = canonical(p)
+                _require(key not in intents or intents[key] == encoded, "CHECKER_HISTORICAL_INTENT_CONFLICT")
+                intents[key] = encoded
+            elif kind == "pre_sign":
+                p = self.payload(event["payload"])
+                _require(p["sender"] == node, "CHECKER_SIGN_EVENT_IDENTITY")
+                encoded = canonical(p)
+                key = (node, canonical(p["instance"]), p["phase"], p["view"])
+                _require(intents.get(key) == encoded, "CHECKER_SIGN_BEFORE_DURABLE_INTENT")
+                self.signing_guard(p, event["guard"])
+                guarded.add((node, encoded))
+            elif kind == "durable" and reason.startswith("signature:"):
+                signed = self.tokens.get(event["auth"])
+                _require(signed is not None and signed["payload"]["sender"] == node,
+                         "CHECKER_SIGNATURE_EVENT_IDENTITY")
+                p = signed["payload"]
+                _require(reason == "signature:" + p["phase"], "CHECKER_SIGNATURE_EVENT_PHASE")
+                _require((node, canonical(p)) in guarded, "CHECKER_SIGNATURE_BEFORE_GUARD")
+                durable.add(event["auth"])
+            elif kind == "publish":
+                token = event["auth"]
+                signed = self.tokens.get(token)
+                _require(signed is not None and signed["payload"]["sender"] == node,
+                         "CHECKER_PUBLISHED_UNAUTHENTICATED")
+                p = signed["payload"]
+                _require((p["phase"], p["view"], p["instance"]["sequence"])
+                         == (event["phase"], event["view"], event["sequence"]),
+                         "CHECKER_PUBLICATION_LINK")
+                _require(token in durable, "CHECKER_PUBLISH_BEFORE_DURABLE_SIGNATURE")
+                published.add(token)
+        for signed, p in honest:
+            _require((p["sender"], canonical(p)) in guarded, "CHECKER_ISSUED_WITHOUT_HISTORICAL_GUARD")
+            _require(signed["auth"] in durable, "CHECKER_ISSUED_WITHOUT_DURABLE_EVENT")
+        return published
 
     def run(self):
         sim = self.sim
@@ -271,20 +394,7 @@ class _Audit:
                 self.proof("proposal" if p["phase"] == "PROPOSE" else "new_view",
                            signed, rec["instance"])
 
-        published = set()
-        for event in sim.trace:
-            if event["event"] != "publish":
-                continue
-            published.add(event["auth"])
-            if event["node"] in sim.byzantine:
-                continue
-            signed = self.tokens.get(event["auth"])
-            _require(signed is not None and signed["payload"]["sender"] == event["node"],
-                     "CHECKER_PUBLISHED_UNAUTHENTICATED")
-            p = signed["payload"]
-            _require((p["phase"], p["view"], p["instance"]["sequence"])
-                     == (event["phase"], event["view"], event["sequence"]),
-                     "CHECKER_PUBLICATION_LINK")
+        published = self.temporal(honest)
 
         decisions, prefixes, applied = {}, {}, 0
         for node in sim.nodes:

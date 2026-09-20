@@ -162,6 +162,9 @@ class AgreementTests(unittest.TestCase):
 
     def test_wrong_domain_set_phase_view_and_duplicates_do_not_supply_quorum(self):
         f, s = self.fresh(byzantine=(3,))
+        # Isolate invalid vote traffic: a valid client OFFER now normally
+        # reaches the idle primary, which would independently certify it.
+        s.policy = lambda source, destination, kind, data: None if kind == "OFFER" else 1
         body = s.offer({}, nodes=(1, 2))  # primary has no offered work
         value, instance = value_id(body), s.nodes[1].instance
         for field in ("domain", "set", "config", "parent"):
