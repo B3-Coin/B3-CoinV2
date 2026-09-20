@@ -456,6 +456,51 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(node.d["records"][0]["apply_count"], 1)
         self.audit(s)
 
+    def test_N_sole_final_offer_survives_crash_before_proposal_intent(self):
+        s = self.simulator()
+        leader = s.nodes[0]
+        body = self.body(s)
+        self.assertEqual(body["anchor"], s.initial_anchor)
+        leader.cut = ("before_record", "PROPOSE")
+        s.offer(body=body, nodes=[0])
+        self.assertFalse(leader.alive)
+        self.assertEqual(leader.d["retained_bodies"], {value_id(body): body})
+        self.assertNotIn(("PROPOSE", 0), leader.record["intents"])
+        self.assertEqual(self.signatures(s, "PROPOSE"), [])
+        leader.restart()
+        # This is the final client offer. Recovery has only its durable body
+        # and fair protocol delivery; no client resubmission wakes it up.
+        s.run(160, stop=lambda sim: sim.settled())
+        self.assertTrue(s.settled(), "durable final offer lost its pending-work recovery path")
+        for node in s.nodes:
+            self.assertEqual(node.d["parent"], value_id(body))
+            self.assertEqual(node.d["records"][0]["apply_count"], 1)
+        self.audit(s)
+
+    def test_N_restarted_prepared_replica_aggregates_commit_votes_without_new_proposal(self):
+        s = self.simulator()
+        body, qc = self.prepared_schedule(s, list(range(s.n)))
+        self.assertEqual(body["anchor"], s.initial_anchor)
+        cert = self.certificate(s, qc)
+        node = s.nodes[1]
+        accepted = deepcopy(node.record["accepted"][0])
+        self.assertIsNone(node.record["decision"])
+        node.crash()
+        node.restart()
+        self.assertEqual(node.record["accepted"][0], accepted)
+        self.assertEqual(node.record["prepared"][(0, value_id(body))], qc)
+        # Deliver exactly q genuine COMMIT votes, with no proposal replay or
+        # complete certificate delivery to reconstruct the lost header cache.
+        delivered_before = s.delivered
+        for signed in cert["commits"]:
+            self.deliver_signed(s, signed, 1)
+        self.assertEqual(s.delivered - delivered_before, node.q)
+        self.assertEqual(node.d["sequence"], 1,
+                         "durable accepted proposal and PreparedQC cannot aggregate fresh COMMIT quorum")
+        self.assertEqual(node.d["parent"], value_id(body))
+        self.assertEqual(node.d["records"][0]["apply_count"], 1)
+        self.audit(s)
+
     def test_Q_missing_body_certificate_defers_without_vote_then_fetches(self):
         for n in (4, 7):
             with self.subTest(n=n):
