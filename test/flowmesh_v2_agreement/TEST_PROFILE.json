@@ -1,0 +1,21 @@
+{
+  "profile_id": "flowmesh-v2-single-sequence-pbft-test/1",
+  "test_only": true,
+  "r1_revision": "2b32645e26f4ba41de8aa746bd04e84192fb3972",
+  "accounting_revision": "9d4fd53dc7d58d397680fd64065663703cbbdd17",
+  "protocol": "R1 single-sequence PBFT-style prepared/commit",
+  "domain": "synthetic-flowmesh-agreement-not-a-network",
+  "sets": [{"n": 4, "f": 1, "quorum": 3}, {"n": 7, "f": 2, "quorum": 5}],
+  "proposer": "(sequence + view) mod N",
+  "prepare": "authenticated accepted proposal and N-f distinct PREPARE votes",
+  "commit": "matching PreparedQC and N-f distinct COMMIT votes",
+  "new_view": "N-f reports; greatest prepared view; no omitted-local-QC veto",
+  "view_sync": "f+1 distinct reports for the same higher target",
+  "authentication": "unforgeable simulation capabilities; not BLS",
+  "durability": "atomic stable-memory writes survive crash; no undetectable rollback guarantee",
+  "anchor": "synthetic authenticated finalized linear chain; no live B3 proof",
+  "limits": {"views": 8, "sequences": 32, "messages": 20000, "inbox": 512, "objects": 256, "proof_bytes": 2097152, "proof_work": 20000, "proof_depth": 32, "events": 60000, "trace": 100000},
+  "timers": {"initial_ticks": 30, "maximum_ticks": 240, "retry_ticks": 10},
+  "random_seeds": [45312, 45313, 45314, 45315, 45316, 45317, 45318, 45319],
+  "provisional": ["all-replica PREPARE quorum rather than primary plus backup PREPARE count", "single outstanding decision", "JSON/SHA256 test codec", "bounded synthetic clocks and proof resources", "synthetic bootstrap/fixed membership/finality/authentication/storage"]
+}
