@@ -120,11 +120,10 @@ class Replica:
             except NeedData as exc:
                 self._need({"kind": "CERT", "data": self.record["decision"],
                             "source": self.index}, str(exc))
-        self._resume_intents()
         self.retry()
 
     def _resume_intents(self):
-        if (not self.record or self.record["decision"] is not None
+        if (not self.alive or not self.record or self.record["decision"] is not None
                 or self.d["fenced"] or self.d["halt"]):
             return
         r = self.record
@@ -142,6 +141,15 @@ class Replica:
                     continue
             if phase in ("VIEW_CHANGE", "NEW_VIEW") and r["mode"] != "CHANGING":
                 continue
+            if payload["value"] is not None:
+                # An intent is not an issued signature or a substitute for
+                # current local evidence. Keep its exact bytes while fetching
+                # any ancestry lost with the volatile cache at restart.
+                try:
+                    self._body(payload["value"])
+                except NeedData as exc:
+                    self._request_missing(str(exc))
+                    continue
             extra = {k: deepcopy(v) for k, v in payload.items()
                      if k not in ("phase", "sender", "instance", "view", "value")}
             self._sign(phase, payload["value"], **extra)
@@ -182,6 +190,7 @@ class Replica:
                 "instance": r["instance"], "view": r["view"], "mode": r["mode"],
                 "accepted": r["accepted"].get(v), "new_view": r["new_views"].get(v),
                 "prepared": r["prepared"].get((v, value)), "highest": r["highest"],
+                "body": self.bodies.get(value), "anchors": self.anchors,
                 "fenced": self.d["fenced"], "halt": self.d["halt"], "decision": r["decision"]})
             signed = self.signer(payload)
             self._persist(lambda d: d["records"][seq]["signed"].__setitem__(slot, signed),
@@ -245,6 +254,11 @@ class Replica:
         if key not in self.pending and len(self.pending) >= PROFILE["limits"]["inbox"]:
             raise Exhausted("PENDING_LIMIT")
         self.pending[key] = deepcopy(wire)
+        self._request_missing(identity)
+
+    def _request_missing(self, identity):
+        # Incoming work lives in pending; unfinished local work already lives
+        # in durable intents. Neither needs a replacement signed instruction.
         self.last_reason = "NEED_DATA:" + str(identity)
         self.event("defer", reason=self.last_reason)
         if str(identity).startswith("body:"):
@@ -336,6 +350,7 @@ class Replica:
             else:
                 raise Invalid("DATA_TYPE")
             self._retry_pending()
+            self._resume_intents()
             return
         if kind == "SIGNED":
             if not self.proofs.authenticate(data):
@@ -597,6 +612,7 @@ class Replica:
     def retry(self):
         if not self.alive:
             return
+        self._resume_intents()
         for value in sorted(self.offers):
             if value in self.bodies:
                 self._send("OFFER", self.bodies[value])

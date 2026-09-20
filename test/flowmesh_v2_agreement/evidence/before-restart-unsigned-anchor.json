@@ -1,0 +1,2862 @@
+{
+  "case": "test_publication_recovery.PublicationRecoveryTests.test_restart_unsigned_intent_waits_for_local_evidence",
+  "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+  "revision": "11c9c87b67210b5d5ed26ec1131c013bc6bb6479",
+  "schema": "flowmesh-agreement-regression/1",
+  "simulations": [
+    {
+      "events": [
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 0,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 0,
+          "ordinal": 1,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 2,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "reason": "intent:PROPOSE",
+          "time": 0
+        },
+        {
+          "event": "crash",
+          "node": 0,
+          "ordinal": 3,
+          "phase": "PROPOSE",
+          "point": "after_intent",
+          "time": 0
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 4,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 1,
+          "ordinal": 5,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 6,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 2,
+          "ordinal": 7,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 8,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 3,
+          "ordinal": 9,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 0,
+          "ordinal": 10,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "restart",
+          "fenced": false,
+          "node": 0,
+          "ordinal": 11,
+          "time": 0
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 12,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "reason": "intent:PROPOSE",
+          "time": 0
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": null,
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "ACTIVE",
+            "new_view": null,
+            "prepared": null,
+            "view": 0
+          },
+          "node": 0,
+          "ordinal": 13,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "time": 0
+        },
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "event": "durable",
+          "node": 0,
+          "ordinal": 14,
+          "reason": "signature:PROPOSE",
+          "time": 0
+        },
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "event": "publish",
+          "node": 0,
+          "ordinal": 15,
+          "phase": "PROPOSE",
+          "sequence": 0,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "event": "publish",
+          "node": 0,
+          "ordinal": 16,
+          "phase": "PROPOSE",
+          "sequence": 0,
+          "time": 0,
+          "view": 0
+        }
+      ],
+      "issued": [
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        }
+      ],
+      "profile": "flowmesh-v2-single-sequence-pbft-test/1"
+    },
+    {
+      "events": [
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 0,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 0,
+          "ordinal": 1,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 2,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "reason": "intent:PROPOSE",
+          "time": 0
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": null,
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "ACTIVE",
+            "new_view": null,
+            "prepared": null,
+            "view": 0
+          },
+          "node": 0,
+          "ordinal": 3,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "time": 0
+        },
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "event": "durable",
+          "node": 0,
+          "ordinal": 4,
+          "reason": "signature:PROPOSE",
+          "time": 0
+        },
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "event": "publish",
+          "node": 0,
+          "ordinal": 5,
+          "phase": "PROPOSE",
+          "sequence": 0,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 6,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 1,
+          "ordinal": 7,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 8,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 2,
+          "ordinal": 9,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 10,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 3,
+          "ordinal": 11,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 12,
+          "source": 0,
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 13,
+          "reason": "accepted_proposal",
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 14,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "reason": "intent:PREPARE",
+          "time": 1
+        },
+        {
+          "event": "crash",
+          "node": 1,
+          "ordinal": 15,
+          "phase": "PREPARE",
+          "point": "after_intent",
+          "time": 1
+        },
+        {
+          "deadline": 31,
+          "event": "timer",
+          "node": 1,
+          "ordinal": 16,
+          "time": 1,
+          "view": 0
+        },
+        {
+          "event": "restart",
+          "fenced": false,
+          "node": 1,
+          "ordinal": 17,
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 18,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "reason": "intent:PREPARE",
+          "time": 1
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": {
+              "body": {
+                "anchor": {
+                  "context": "synthetic-b3-finalized/1",
+                  "hash": "cc27214e0878bc241cb1de0bfedebcf5054ef98df6db9a0bb3f177a6e466c9a6",
+                  "height": 855501,
+                  "parent": "5c1befa8e05bf45fba6ee3f92532f912efb47afb33509d80fb91aac9085d2561"
+                },
+                "batch": {
+                  "actions": [],
+                  "capacities": {},
+                  "deposits": [],
+                  "risk": {},
+                  "settlements": []
+                },
+                "instance": {
+                  "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                  "domain": "synthetic-flowmesh-agreement-not-a-network",
+                  "epoch": 0,
+                  "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                  "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                  "sequence": 0,
+                  "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                },
+                "result": "f7d952c2d975264e0dc95f506e5aec89a095963bc581431265de8a3097e098ec"
+              },
+              "signed": {
+                "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+                "payload": {
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "new_view": null,
+                  "phase": "PROPOSE",
+                  "sender": 0,
+                  "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+                  "view": 0
+                }
+              }
+            },
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "ACTIVE",
+            "new_view": null,
+            "prepared": null,
+            "view": 0
+          },
+          "node": 1,
+          "ordinal": 19,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "time": 1
+        },
+        {
+          "auth": "7a6acb886e2aa013ac3e2ccd12a82ed35e08de864656ce9781a8a683f05f748d",
+          "event": "durable",
+          "node": 1,
+          "ordinal": 20,
+          "reason": "signature:PREPARE",
+          "time": 1
+        },
+        {
+          "auth": "7a6acb886e2aa013ac3e2ccd12a82ed35e08de864656ce9781a8a683f05f748d",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 21,
+          "phase": "PREPARE",
+          "sequence": 0,
+          "time": 1,
+          "view": 0
+        },
+        {
+          "auth": "7a6acb886e2aa013ac3e2ccd12a82ed35e08de864656ce9781a8a683f05f748d",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 22,
+          "phase": "PREPARE",
+          "sequence": 0,
+          "time": 1,
+          "view": 0
+        }
+      ],
+      "issued": [
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "7a6acb886e2aa013ac3e2ccd12a82ed35e08de864656ce9781a8a683f05f748d",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        }
+      ],
+      "profile": "flowmesh-v2-single-sequence-pbft-test/1"
+    },
+    {
+      "events": [
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 0,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 0,
+          "ordinal": 1,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 2,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "reason": "intent:PROPOSE",
+          "time": 0
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": null,
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "ACTIVE",
+            "new_view": null,
+            "prepared": null,
+            "view": 0
+          },
+          "node": 0,
+          "ordinal": 3,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "time": 0
+        },
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "event": "durable",
+          "node": 0,
+          "ordinal": 4,
+          "reason": "signature:PROPOSE",
+          "time": 0
+        },
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "event": "publish",
+          "node": 0,
+          "ordinal": 5,
+          "phase": "PROPOSE",
+          "sequence": 0,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 6,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 1,
+          "ordinal": 7,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 8,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 2,
+          "ordinal": 9,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 10,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 3,
+          "ordinal": 11,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 0,
+          "ordinal": 12,
+          "source": 0,
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 13,
+          "reason": "accepted_proposal",
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 14,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "reason": "intent:PREPARE",
+          "time": 1
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": {
+              "body": {
+                "anchor": {
+                  "context": "synthetic-b3-finalized/1",
+                  "hash": "cc27214e0878bc241cb1de0bfedebcf5054ef98df6db9a0bb3f177a6e466c9a6",
+                  "height": 855501,
+                  "parent": "5c1befa8e05bf45fba6ee3f92532f912efb47afb33509d80fb91aac9085d2561"
+                },
+                "batch": {
+                  "actions": [],
+                  "capacities": {},
+                  "deposits": [],
+                  "risk": {},
+                  "settlements": []
+                },
+                "instance": {
+                  "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                  "domain": "synthetic-flowmesh-agreement-not-a-network",
+                  "epoch": 0,
+                  "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                  "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                  "sequence": 0,
+                  "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                },
+                "result": "f7d952c2d975264e0dc95f506e5aec89a095963bc581431265de8a3097e098ec"
+              },
+              "signed": {
+                "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+                "payload": {
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "new_view": null,
+                  "phase": "PROPOSE",
+                  "sender": 0,
+                  "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+                  "view": 0
+                }
+              }
+            },
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "ACTIVE",
+            "new_view": null,
+            "prepared": null,
+            "view": 0
+          },
+          "node": 0,
+          "ordinal": 15,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "time": 1
+        },
+        {
+          "auth": "a9e8b864d1d5b30880bbad86d2cab40af475a03e6489b9782829865c1f9ce976",
+          "event": "durable",
+          "node": 0,
+          "ordinal": 16,
+          "reason": "signature:PREPARE",
+          "time": 1
+        },
+        {
+          "auth": "a9e8b864d1d5b30880bbad86d2cab40af475a03e6489b9782829865c1f9ce976",
+          "event": "publish",
+          "node": 0,
+          "ordinal": 17,
+          "phase": "PREPARE",
+          "sequence": 0,
+          "time": 1,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 18,
+          "source": 0,
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 19,
+          "reason": "accepted_proposal",
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 20,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "reason": "intent:PREPARE",
+          "time": 1
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": {
+              "body": {
+                "anchor": {
+                  "context": "synthetic-b3-finalized/1",
+                  "hash": "cc27214e0878bc241cb1de0bfedebcf5054ef98df6db9a0bb3f177a6e466c9a6",
+                  "height": 855501,
+                  "parent": "5c1befa8e05bf45fba6ee3f92532f912efb47afb33509d80fb91aac9085d2561"
+                },
+                "batch": {
+                  "actions": [],
+                  "capacities": {},
+                  "deposits": [],
+                  "risk": {},
+                  "settlements": []
+                },
+                "instance": {
+                  "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                  "domain": "synthetic-flowmesh-agreement-not-a-network",
+                  "epoch": 0,
+                  "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                  "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                  "sequence": 0,
+                  "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                },
+                "result": "f7d952c2d975264e0dc95f506e5aec89a095963bc581431265de8a3097e098ec"
+              },
+              "signed": {
+                "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+                "payload": {
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "new_view": null,
+                  "phase": "PROPOSE",
+                  "sender": 0,
+                  "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+                  "view": 0
+                }
+              }
+            },
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "ACTIVE",
+            "new_view": null,
+            "prepared": null,
+            "view": 0
+          },
+          "node": 1,
+          "ordinal": 21,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "time": 1
+        },
+        {
+          "auth": "7a6acb886e2aa013ac3e2ccd12a82ed35e08de864656ce9781a8a683f05f748d",
+          "event": "durable",
+          "node": 1,
+          "ordinal": 22,
+          "reason": "signature:PREPARE",
+          "time": 1
+        },
+        {
+          "auth": "7a6acb886e2aa013ac3e2ccd12a82ed35e08de864656ce9781a8a683f05f748d",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 23,
+          "phase": "PREPARE",
+          "sequence": 0,
+          "time": 1,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 2,
+          "ordinal": 24,
+          "source": 0,
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 25,
+          "reason": "accepted_proposal",
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 26,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 2,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "reason": "intent:PREPARE",
+          "time": 1
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": {
+              "body": {
+                "anchor": {
+                  "context": "synthetic-b3-finalized/1",
+                  "hash": "cc27214e0878bc241cb1de0bfedebcf5054ef98df6db9a0bb3f177a6e466c9a6",
+                  "height": 855501,
+                  "parent": "5c1befa8e05bf45fba6ee3f92532f912efb47afb33509d80fb91aac9085d2561"
+                },
+                "batch": {
+                  "actions": [],
+                  "capacities": {},
+                  "deposits": [],
+                  "risk": {},
+                  "settlements": []
+                },
+                "instance": {
+                  "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                  "domain": "synthetic-flowmesh-agreement-not-a-network",
+                  "epoch": 0,
+                  "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                  "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                  "sequence": 0,
+                  "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                },
+                "result": "f7d952c2d975264e0dc95f506e5aec89a095963bc581431265de8a3097e098ec"
+              },
+              "signed": {
+                "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+                "payload": {
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "new_view": null,
+                  "phase": "PROPOSE",
+                  "sender": 0,
+                  "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+                  "view": 0
+                }
+              }
+            },
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "ACTIVE",
+            "new_view": null,
+            "prepared": null,
+            "view": 0
+          },
+          "node": 2,
+          "ordinal": 27,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 2,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "time": 1
+        },
+        {
+          "auth": "ed12b1bd9f79c5edd7b624552d7a6e4e8162fc52ab19bcc461e11d936e6cfd6d",
+          "event": "durable",
+          "node": 2,
+          "ordinal": 28,
+          "reason": "signature:PREPARE",
+          "time": 1
+        },
+        {
+          "auth": "ed12b1bd9f79c5edd7b624552d7a6e4e8162fc52ab19bcc461e11d936e6cfd6d",
+          "event": "publish",
+          "node": 2,
+          "ordinal": 29,
+          "phase": "PREPARE",
+          "sequence": 0,
+          "time": 1,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 3,
+          "ordinal": 30,
+          "source": 0,
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 31,
+          "reason": "accepted_proposal",
+          "time": 1
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 32,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 3,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "reason": "intent:PREPARE",
+          "time": 1
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": {
+              "body": {
+                "anchor": {
+                  "context": "synthetic-b3-finalized/1",
+                  "hash": "cc27214e0878bc241cb1de0bfedebcf5054ef98df6db9a0bb3f177a6e466c9a6",
+                  "height": 855501,
+                  "parent": "5c1befa8e05bf45fba6ee3f92532f912efb47afb33509d80fb91aac9085d2561"
+                },
+                "batch": {
+                  "actions": [],
+                  "capacities": {},
+                  "deposits": [],
+                  "risk": {},
+                  "settlements": []
+                },
+                "instance": {
+                  "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                  "domain": "synthetic-flowmesh-agreement-not-a-network",
+                  "epoch": 0,
+                  "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                  "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                  "sequence": 0,
+                  "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                },
+                "result": "f7d952c2d975264e0dc95f506e5aec89a095963bc581431265de8a3097e098ec"
+              },
+              "signed": {
+                "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+                "payload": {
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "new_view": null,
+                  "phase": "PROPOSE",
+                  "sender": 0,
+                  "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+                  "view": 0
+                }
+              }
+            },
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "ACTIVE",
+            "new_view": null,
+            "prepared": null,
+            "view": 0
+          },
+          "node": 3,
+          "ordinal": 33,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 3,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "time": 1
+        },
+        {
+          "auth": "db762df20b896ba971150eb31f780a7a63da76de35cf50847f5829c315bb41bb",
+          "event": "durable",
+          "node": 3,
+          "ordinal": 34,
+          "reason": "signature:PREPARE",
+          "time": 1
+        },
+        {
+          "auth": "db762df20b896ba971150eb31f780a7a63da76de35cf50847f5829c315bb41bb",
+          "event": "publish",
+          "node": 3,
+          "ordinal": 35,
+          "phase": "PREPARE",
+          "sequence": 0,
+          "time": 1,
+          "view": 0
+        },
+        {
+          "event": "delivered",
+          "kind": "PREPARED",
+          "node": 1,
+          "ordinal": 36,
+          "source": 0,
+          "time": 2
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 37,
+          "reason": "prepared_proof",
+          "time": 2
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 38,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "COMMIT",
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "reason": "intent:COMMIT",
+          "time": 2
+        },
+        {
+          "event": "crash",
+          "node": 1,
+          "ordinal": 39,
+          "phase": "COMMIT",
+          "point": "after_intent",
+          "time": 2
+        },
+        {
+          "deadline": 32,
+          "event": "timer",
+          "node": 1,
+          "ordinal": 40,
+          "time": 2,
+          "view": 0
+        },
+        {
+          "event": "restart",
+          "fenced": false,
+          "node": 1,
+          "ordinal": 41,
+          "time": 2
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 42,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "COMMIT",
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "reason": "intent:COMMIT",
+          "time": 2
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": {
+              "body": {
+                "anchor": {
+                  "context": "synthetic-b3-finalized/1",
+                  "hash": "cc27214e0878bc241cb1de0bfedebcf5054ef98df6db9a0bb3f177a6e466c9a6",
+                  "height": 855501,
+                  "parent": "5c1befa8e05bf45fba6ee3f92532f912efb47afb33509d80fb91aac9085d2561"
+                },
+                "batch": {
+                  "actions": [],
+                  "capacities": {},
+                  "deposits": [],
+                  "risk": {},
+                  "settlements": []
+                },
+                "instance": {
+                  "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                  "domain": "synthetic-flowmesh-agreement-not-a-network",
+                  "epoch": 0,
+                  "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                  "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                  "sequence": 0,
+                  "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                },
+                "result": "f7d952c2d975264e0dc95f506e5aec89a095963bc581431265de8a3097e098ec"
+              },
+              "signed": {
+                "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+                "payload": {
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "new_view": null,
+                  "phase": "PROPOSE",
+                  "sender": 0,
+                  "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+                  "view": 0
+                }
+              }
+            },
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": {
+              "prepares": [
+                {
+                  "auth": "a9e8b864d1d5b30880bbad86d2cab40af475a03e6489b9782829865c1f9ce976",
+                  "payload": {
+                    "instance": {
+                      "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                      "domain": "synthetic-flowmesh-agreement-not-a-network",
+                      "epoch": 0,
+                      "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                      "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                      "sequence": 0,
+                      "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                    },
+                    "phase": "PREPARE",
+                    "sender": 0,
+                    "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+                    "view": 0
+                  }
+                },
+                {
+                  "auth": "7a6acb886e2aa013ac3e2ccd12a82ed35e08de864656ce9781a8a683f05f748d",
+                  "payload": {
+                    "instance": {
+                      "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                      "domain": "synthetic-flowmesh-agreement-not-a-network",
+                      "epoch": 0,
+                      "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                      "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                      "sequence": 0,
+                      "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                    },
+                    "phase": "PREPARE",
+                    "sender": 1,
+                    "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+                    "view": 0
+                  }
+                },
+                {
+                  "auth": "ed12b1bd9f79c5edd7b624552d7a6e4e8162fc52ab19bcc461e11d936e6cfd6d",
+                  "payload": {
+                    "instance": {
+                      "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                      "domain": "synthetic-flowmesh-agreement-not-a-network",
+                      "epoch": 0,
+                      "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                      "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                      "sequence": 0,
+                      "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                    },
+                    "phase": "PREPARE",
+                    "sender": 2,
+                    "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+                    "view": 0
+                  }
+                }
+              ],
+              "proposal": {
+                "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+                "payload": {
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "new_view": null,
+                  "phase": "PROPOSE",
+                  "sender": 0,
+                  "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+                  "view": 0
+                }
+              }
+            },
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "ACTIVE",
+            "new_view": null,
+            "prepared": {
+              "prepares": [
+                {
+                  "auth": "a9e8b864d1d5b30880bbad86d2cab40af475a03e6489b9782829865c1f9ce976",
+                  "payload": {
+                    "instance": {
+                      "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                      "domain": "synthetic-flowmesh-agreement-not-a-network",
+                      "epoch": 0,
+                      "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                      "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                      "sequence": 0,
+                      "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                    },
+                    "phase": "PREPARE",
+                    "sender": 0,
+                    "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+                    "view": 0
+                  }
+                },
+                {
+                  "auth": "7a6acb886e2aa013ac3e2ccd12a82ed35e08de864656ce9781a8a683f05f748d",
+                  "payload": {
+                    "instance": {
+                      "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                      "domain": "synthetic-flowmesh-agreement-not-a-network",
+                      "epoch": 0,
+                      "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                      "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                      "sequence": 0,
+                      "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                    },
+                    "phase": "PREPARE",
+                    "sender": 1,
+                    "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+                    "view": 0
+                  }
+                },
+                {
+                  "auth": "ed12b1bd9f79c5edd7b624552d7a6e4e8162fc52ab19bcc461e11d936e6cfd6d",
+                  "payload": {
+                    "instance": {
+                      "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                      "domain": "synthetic-flowmesh-agreement-not-a-network",
+                      "epoch": 0,
+                      "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                      "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                      "sequence": 0,
+                      "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                    },
+                    "phase": "PREPARE",
+                    "sender": 2,
+                    "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+                    "view": 0
+                  }
+                }
+              ],
+              "proposal": {
+                "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+                "payload": {
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "new_view": null,
+                  "phase": "PROPOSE",
+                  "sender": 0,
+                  "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+                  "view": 0
+                }
+              }
+            },
+            "view": 0
+          },
+          "node": 1,
+          "ordinal": 43,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "COMMIT",
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "time": 2
+        },
+        {
+          "auth": "8e8cdef14e38a5a7b92521568af5fde1f6102706ba2ce51d58c04c13e2347087",
+          "event": "durable",
+          "node": 1,
+          "ordinal": 44,
+          "reason": "signature:COMMIT",
+          "time": 2
+        },
+        {
+          "auth": "8e8cdef14e38a5a7b92521568af5fde1f6102706ba2ce51d58c04c13e2347087",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 45,
+          "phase": "COMMIT",
+          "sequence": 0,
+          "time": 2,
+          "view": 0
+        },
+        {
+          "auth": "7a6acb886e2aa013ac3e2ccd12a82ed35e08de864656ce9781a8a683f05f748d",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 46,
+          "phase": "PREPARE",
+          "sequence": 0,
+          "time": 2,
+          "view": 0
+        },
+        {
+          "auth": "8e8cdef14e38a5a7b92521568af5fde1f6102706ba2ce51d58c04c13e2347087",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 47,
+          "phase": "COMMIT",
+          "sequence": 0,
+          "time": 2,
+          "view": 0
+        }
+      ],
+      "issued": [
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "a9e8b864d1d5b30880bbad86d2cab40af475a03e6489b9782829865c1f9ce976",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "7a6acb886e2aa013ac3e2ccd12a82ed35e08de864656ce9781a8a683f05f748d",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "ed12b1bd9f79c5edd7b624552d7a6e4e8162fc52ab19bcc461e11d936e6cfd6d",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 2,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "db762df20b896ba971150eb31f780a7a63da76de35cf50847f5829c315bb41bb",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "PREPARE",
+            "sender": 3,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "8e8cdef14e38a5a7b92521568af5fde1f6102706ba2ce51d58c04c13e2347087",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "COMMIT",
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        }
+      ],
+      "profile": "flowmesh-v2-single-sequence-pbft-test/1"
+    },
+    {
+      "events": [
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 0,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 0,
+          "ordinal": 1,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 2,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "reason": "intent:PROPOSE",
+          "time": 0
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": null,
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "ACTIVE",
+            "new_view": null,
+            "prepared": null,
+            "view": 0
+          },
+          "node": 0,
+          "ordinal": 3,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          },
+          "time": 0
+        },
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "event": "durable",
+          "node": 0,
+          "ordinal": 4,
+          "reason": "signature:PROPOSE",
+          "time": 0
+        },
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "event": "publish",
+          "node": 0,
+          "ordinal": 5,
+          "phase": "PROPOSE",
+          "sequence": 0,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 6,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 1,
+          "ordinal": 7,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 8,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 2,
+          "ordinal": 9,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 10,
+          "reason": "offered_body",
+          "time": 0
+        },
+        {
+          "deadline": 30,
+          "event": "timer",
+          "node": 3,
+          "ordinal": 11,
+          "time": 0,
+          "view": 0
+        },
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "event": "publish",
+          "node": 0,
+          "ordinal": 12,
+          "phase": "PROPOSE",
+          "sequence": 0,
+          "time": 30,
+          "view": 0
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 13,
+          "reason": "enter_view:timeout",
+          "time": 30
+        },
+        {
+          "event": "durable",
+          "node": 0,
+          "ordinal": 14,
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 0,
+            "value": null,
+            "view": 1
+          },
+          "reason": "intent:VIEW_CHANGE",
+          "time": 30
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": null,
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "CHANGING",
+            "new_view": null,
+            "prepared": null,
+            "view": 1
+          },
+          "node": 0,
+          "ordinal": 15,
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 0,
+            "value": null,
+            "view": 1
+          },
+          "time": 30
+        },
+        {
+          "auth": "362035d7c4d80e75d1c7e63a71f5c5780bd4f79d203b8d71a77fafc7de18b376",
+          "event": "durable",
+          "node": 0,
+          "ordinal": 16,
+          "reason": "signature:VIEW_CHANGE",
+          "time": 30
+        },
+        {
+          "auth": "362035d7c4d80e75d1c7e63a71f5c5780bd4f79d203b8d71a77fafc7de18b376",
+          "event": "publish",
+          "node": 0,
+          "ordinal": 17,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 30,
+          "view": 1
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 18,
+          "reason": "enter_view:timeout",
+          "time": 30
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 19,
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 1,
+            "value": null,
+            "view": 1
+          },
+          "reason": "intent:VIEW_CHANGE",
+          "time": 30
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": null,
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "CHANGING",
+            "new_view": null,
+            "prepared": null,
+            "view": 1
+          },
+          "node": 1,
+          "ordinal": 20,
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 1,
+            "value": null,
+            "view": 1
+          },
+          "time": 30
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "durable",
+          "node": 1,
+          "ordinal": 21,
+          "reason": "signature:VIEW_CHANGE",
+          "time": 30
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 22,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 30,
+          "view": 1
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 23,
+          "reason": "enter_view:timeout",
+          "time": 30
+        },
+        {
+          "event": "durable",
+          "node": 2,
+          "ordinal": 24,
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 2,
+            "value": null,
+            "view": 1
+          },
+          "reason": "intent:VIEW_CHANGE",
+          "time": 30
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": null,
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "CHANGING",
+            "new_view": null,
+            "prepared": null,
+            "view": 1
+          },
+          "node": 2,
+          "ordinal": 25,
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 2,
+            "value": null,
+            "view": 1
+          },
+          "time": 30
+        },
+        {
+          "auth": "d4a5fa81d23fec31b107532c919be69ff335ea3b86609111308b9ae4791f16bc",
+          "event": "durable",
+          "node": 2,
+          "ordinal": 26,
+          "reason": "signature:VIEW_CHANGE",
+          "time": 30
+        },
+        {
+          "auth": "d4a5fa81d23fec31b107532c919be69ff335ea3b86609111308b9ae4791f16bc",
+          "event": "publish",
+          "node": 2,
+          "ordinal": 27,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 30,
+          "view": 1
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 28,
+          "reason": "enter_view:timeout",
+          "time": 30
+        },
+        {
+          "event": "durable",
+          "node": 3,
+          "ordinal": 29,
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 3,
+            "value": null,
+            "view": 1
+          },
+          "reason": "intent:VIEW_CHANGE",
+          "time": 30
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": null,
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "CHANGING",
+            "new_view": null,
+            "prepared": null,
+            "view": 1
+          },
+          "node": 3,
+          "ordinal": 30,
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 3,
+            "value": null,
+            "view": 1
+          },
+          "time": 30
+        },
+        {
+          "auth": "ed39f9c766f11ddb92308742bd441266cd2964c359b80e19b82ff3d8961a84d4",
+          "event": "durable",
+          "node": 3,
+          "ordinal": 31,
+          "reason": "signature:VIEW_CHANGE",
+          "time": 30
+        },
+        {
+          "auth": "ed39f9c766f11ddb92308742bd441266cd2964c359b80e19b82ff3d8961a84d4",
+          "event": "publish",
+          "node": 3,
+          "ordinal": 32,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 30,
+          "view": 1
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 33,
+          "source": 0,
+          "time": 31
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 34,
+          "source": 1,
+          "time": 31
+        },
+        {
+          "event": "delivered",
+          "kind": "SIGNED",
+          "node": 1,
+          "ordinal": 35,
+          "source": 2,
+          "time": 31
+        },
+        {
+          "deadline": 91,
+          "event": "timer",
+          "node": 1,
+          "ordinal": 36,
+          "time": 31,
+          "view": 1
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 37,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "NEW_VIEW",
+            "reports": [
+              {
+                "auth": "362035d7c4d80e75d1c7e63a71f5c5780bd4f79d203b8d71a77fafc7de18b376",
+                "payload": {
+                  "decision": null,
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "phase": "VIEW_CHANGE",
+                  "prepared": null,
+                  "sender": 0,
+                  "value": null,
+                  "view": 1
+                }
+              },
+              {
+                "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+                "payload": {
+                  "decision": null,
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "phase": "VIEW_CHANGE",
+                  "prepared": null,
+                  "sender": 1,
+                  "value": null,
+                  "view": 1
+                }
+              },
+              {
+                "auth": "d4a5fa81d23fec31b107532c919be69ff335ea3b86609111308b9ae4791f16bc",
+                "payload": {
+                  "decision": null,
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "phase": "VIEW_CHANGE",
+                  "prepared": null,
+                  "sender": 2,
+                  "value": null,
+                  "view": 1
+                }
+              }
+            ],
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 1
+          },
+          "reason": "intent:NEW_VIEW",
+          "time": 31
+        },
+        {
+          "event": "crash",
+          "node": 1,
+          "ordinal": 38,
+          "phase": "NEW_VIEW",
+          "point": "after_intent",
+          "time": 31
+        },
+        {
+          "event": "restart",
+          "fenced": false,
+          "node": 1,
+          "ordinal": 39,
+          "time": 31
+        },
+        {
+          "event": "durable",
+          "node": 1,
+          "ordinal": 40,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "NEW_VIEW",
+            "reports": [
+              {
+                "auth": "362035d7c4d80e75d1c7e63a71f5c5780bd4f79d203b8d71a77fafc7de18b376",
+                "payload": {
+                  "decision": null,
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "phase": "VIEW_CHANGE",
+                  "prepared": null,
+                  "sender": 0,
+                  "value": null,
+                  "view": 1
+                }
+              },
+              {
+                "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+                "payload": {
+                  "decision": null,
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "phase": "VIEW_CHANGE",
+                  "prepared": null,
+                  "sender": 1,
+                  "value": null,
+                  "view": 1
+                }
+              },
+              {
+                "auth": "d4a5fa81d23fec31b107532c919be69ff335ea3b86609111308b9ae4791f16bc",
+                "payload": {
+                  "decision": null,
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "phase": "VIEW_CHANGE",
+                  "prepared": null,
+                  "sender": 2,
+                  "value": null,
+                  "view": 1
+                }
+              }
+            ],
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 1
+          },
+          "reason": "intent:NEW_VIEW",
+          "time": 31
+        },
+        {
+          "event": "pre_sign",
+          "guard": {
+            "accepted": null,
+            "decision": null,
+            "fenced": false,
+            "halt": "",
+            "highest": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "mode": "CHANGING",
+            "new_view": null,
+            "prepared": null,
+            "view": 1
+          },
+          "node": 1,
+          "ordinal": 41,
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "NEW_VIEW",
+            "reports": [
+              {
+                "auth": "362035d7c4d80e75d1c7e63a71f5c5780bd4f79d203b8d71a77fafc7de18b376",
+                "payload": {
+                  "decision": null,
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "phase": "VIEW_CHANGE",
+                  "prepared": null,
+                  "sender": 0,
+                  "value": null,
+                  "view": 1
+                }
+              },
+              {
+                "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+                "payload": {
+                  "decision": null,
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "phase": "VIEW_CHANGE",
+                  "prepared": null,
+                  "sender": 1,
+                  "value": null,
+                  "view": 1
+                }
+              },
+              {
+                "auth": "d4a5fa81d23fec31b107532c919be69ff335ea3b86609111308b9ae4791f16bc",
+                "payload": {
+                  "decision": null,
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "phase": "VIEW_CHANGE",
+                  "prepared": null,
+                  "sender": 2,
+                  "value": null,
+                  "view": 1
+                }
+              }
+            ],
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 1
+          },
+          "time": 31
+        },
+        {
+          "auth": "366a98b2df573a4498751968f34c9d625f40ba9b9e67044128df39a4b72b450b",
+          "event": "durable",
+          "node": 1,
+          "ordinal": 42,
+          "reason": "signature:NEW_VIEW",
+          "time": 31
+        },
+        {
+          "auth": "366a98b2df573a4498751968f34c9d625f40ba9b9e67044128df39a4b72b450b",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 43,
+          "phase": "NEW_VIEW",
+          "sequence": 0,
+          "time": 31,
+          "view": 1
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 44,
+          "phase": "VIEW_CHANGE",
+          "sequence": 0,
+          "time": 31,
+          "view": 1
+        },
+        {
+          "auth": "366a98b2df573a4498751968f34c9d625f40ba9b9e67044128df39a4b72b450b",
+          "event": "publish",
+          "node": 1,
+          "ordinal": 45,
+          "phase": "NEW_VIEW",
+          "sequence": 0,
+          "time": 31,
+          "view": 1
+        }
+      ],
+      "issued": [
+        {
+          "auth": "31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "new_view": null,
+            "phase": "PROPOSE",
+            "sender": 0,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 0
+          }
+        },
+        {
+          "auth": "362035d7c4d80e75d1c7e63a71f5c5780bd4f79d203b8d71a77fafc7de18b376",
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 0,
+            "value": null,
+            "view": 1
+          }
+        },
+        {
+          "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 1,
+            "value": null,
+            "view": 1
+          }
+        },
+        {
+          "auth": "d4a5fa81d23fec31b107532c919be69ff335ea3b86609111308b9ae4791f16bc",
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 2,
+            "value": null,
+            "view": 1
+          }
+        },
+        {
+          "auth": "ed39f9c766f11ddb92308742bd441266cd2964c359b80e19b82ff3d8961a84d4",
+          "payload": {
+            "decision": null,
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "VIEW_CHANGE",
+            "prepared": null,
+            "sender": 3,
+            "value": null,
+            "view": 1
+          }
+        },
+        {
+          "auth": "366a98b2df573a4498751968f34c9d625f40ba9b9e67044128df39a4b72b450b",
+          "payload": {
+            "instance": {
+              "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+              "domain": "synthetic-flowmesh-agreement-not-a-network",
+              "epoch": 0,
+              "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+              "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+              "sequence": 0,
+              "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+            },
+            "phase": "NEW_VIEW",
+            "reports": [
+              {
+                "auth": "362035d7c4d80e75d1c7e63a71f5c5780bd4f79d203b8d71a77fafc7de18b376",
+                "payload": {
+                  "decision": null,
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "phase": "VIEW_CHANGE",
+                  "prepared": null,
+                  "sender": 0,
+                  "value": null,
+                  "view": 1
+                }
+              },
+              {
+                "auth": "a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c",
+                "payload": {
+                  "decision": null,
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "phase": "VIEW_CHANGE",
+                  "prepared": null,
+                  "sender": 1,
+                  "value": null,
+                  "view": 1
+                }
+              },
+              {
+                "auth": "d4a5fa81d23fec31b107532c919be69ff335ea3b86609111308b9ae4791f16bc",
+                "payload": {
+                  "decision": null,
+                  "instance": {
+                    "config": "d3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e",
+                    "domain": "synthetic-flowmesh-agreement-not-a-network",
+                    "epoch": 0,
+                    "parent": "e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c",
+                    "profile": "flowmesh-v2-single-sequence-pbft-test/1",
+                    "sequence": 0,
+                    "set": "b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d"
+                  },
+                  "phase": "VIEW_CHANGE",
+                  "prepared": null,
+                  "sender": 2,
+                  "value": null,
+                  "view": 1
+                }
+              }
+            ],
+            "sender": 1,
+            "value": "a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db",
+            "view": 1
+          }
+        }
+      ],
+      "profile": "flowmesh-v2-single-sequence-pbft-test/1"
+    }
+  ],
+  "success": false,
+  "test_output": "test_restart_unsigned_intent_waits_for_local_evidence (test_publication_recovery.PublicationRecoveryTests.test_restart_unsigned_intent_waits_for_local_evidence) ... \n  test_restart_unsigned_intent_waits_for_local_evidence (test_publication_recovery.PublicationRecoveryTests.test_restart_unsigned_intent_waits_for_local_evidence) (phase='PROPOSE') ... FAIL\n  test_restart_unsigned_intent_waits_for_local_evidence (test_publication_recovery.PublicationRecoveryTests.test_restart_unsigned_intent_waits_for_local_evidence) (phase='PREPARE') ... FAIL\n  test_restart_unsigned_intent_waits_for_local_evidence (test_publication_recovery.PublicationRecoveryTests.test_restart_unsigned_intent_waits_for_local_evidence) (phase='COMMIT') ... FAIL\n  test_restart_unsigned_intent_waits_for_local_evidence (test_publication_recovery.PublicationRecoveryTests.test_restart_unsigned_intent_waits_for_local_evidence) (phase='NEW_VIEW') ... FAIL\n\n======================================================================\nFAIL: test_restart_unsigned_intent_waits_for_local_evidence (test_publication_recovery.PublicationRecoveryTests.test_restart_unsigned_intent_waits_for_local_evidence) (phase='PROPOSE')\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"[SOURCE]/test/flowmesh_v2_agreement/test_publication_recovery.py\", line 63, in test_restart_unsigned_intent_waits_for_local_evidence\n    self.assertNotIn(slot, node.record[\"signed\"])\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: ('PROPOSE', 0) unexpectedly found in {('PROPOSE', 0): {'payload': {'phase': 'PROPOSE', 'sender': 0, 'instance': {'profile': 'flowmesh-v2-single-sequence-pbft-test/1', 'domain': 'synthetic-flowmesh-agreement-not-a-network', 'config': 'd3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e', 'epoch': 0, 'set': 'b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d', 'sequence': 0, 'parent': 'e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c'}, 'view': 0, 'value': 'a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db', 'new_view': None}, 'auth': '31cf3e35e5ff7312e9b9d9f37775d657faaa31374096fc0b95f9b445c60fe80f'}}\n\n======================================================================\nFAIL: test_restart_unsigned_intent_waits_for_local_evidence (test_publication_recovery.PublicationRecoveryTests.test_restart_unsigned_intent_waits_for_local_evidence) (phase='PREPARE')\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"[SOURCE]/test/flowmesh_v2_agreement/test_publication_recovery.py\", line 63, in test_restart_unsigned_intent_waits_for_local_evidence\n    self.assertNotIn(slot, node.record[\"signed\"])\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: ('PREPARE', 0) unexpectedly found in {('PREPARE', 0): {'payload': {'phase': 'PREPARE', 'sender': 1, 'instance': {'profile': 'flowmesh-v2-single-sequence-pbft-test/1', 'domain': 'synthetic-flowmesh-agreement-not-a-network', 'config': 'd3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e', 'epoch': 0, 'set': 'b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d', 'sequence': 0, 'parent': 'e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c'}, 'view': 0, 'value': 'a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db'}, 'auth': '7a6acb886e2aa013ac3e2ccd12a82ed35e08de864656ce9781a8a683f05f748d'}}\n\n======================================================================\nFAIL: test_restart_unsigned_intent_waits_for_local_evidence (test_publication_recovery.PublicationRecoveryTests.test_restart_unsigned_intent_waits_for_local_evidence) (phase='COMMIT')\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"[SOURCE]/test/flowmesh_v2_agreement/test_publication_recovery.py\", line 63, in test_restart_unsigned_intent_waits_for_local_evidence\n    self.assertNotIn(slot, node.record[\"signed\"])\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: ('COMMIT', 0) unexpectedly found in {('PREPARE', 0): {'payload': {'phase': 'PREPARE', 'sender': 1, 'instance': {'profile': 'flowmesh-v2-single-sequence-pbft-test/1', 'domain': 'synthetic-flowmesh-agreement-not-a-network', 'config': 'd3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e', 'epoch': 0, 'set': 'b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d', 'sequence': 0, 'parent': 'e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c'}, 'view': 0, 'value': 'a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db'}, 'auth': '7a6acb886e2aa013ac3e2ccd12a82ed35e08de864656ce9781a8a683f05f748d'}, ('COMMIT', 0): {'payload': {'phase': 'COMMIT', 'sender': 1, 'instance': {'profile': 'flowmesh-v2-single-sequence-pbft-test/1', 'domain': 'synthetic-flowmesh-agreement-not-a-network', 'config': 'd3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e', 'epoch': 0, 'set': 'b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d', 'sequence': 0, 'parent': 'e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c'}, 'view': 0, 'value': 'a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db'}, 'auth': '8e8cdef14e38a5a7b92521568af5fde1f6102706ba2ce51d58c04c13e2347087'}}\n\n======================================================================\nFAIL: test_restart_unsigned_intent_waits_for_local_evidence (test_publication_recovery.PublicationRecoveryTests.test_restart_unsigned_intent_waits_for_local_evidence) (phase='NEW_VIEW')\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"[SOURCE]/test/flowmesh_v2_agreement/test_publication_recovery.py\", line 63, in test_restart_unsigned_intent_waits_for_local_evidence\n    self.assertNotIn(slot, node.record[\"signed\"])\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: ('NEW_VIEW', 1) unexpectedly found in {('VIEW_CHANGE', 1): {'payload': {'phase': 'VIEW_CHANGE', 'sender': 1, 'instance': {'profile': 'flowmesh-v2-single-sequence-pbft-test/1', 'domain': 'synthetic-flowmesh-agreement-not-a-network', 'config': 'd3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e', 'epoch': 0, 'set': 'b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d', 'sequence': 0, 'parent': 'e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c'}, 'view': 1, 'value': None, 'prepared': None, 'decision': None}, 'auth': 'a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c'}, ('NEW_VIEW', 1): {'payload': {'phase': 'NEW_VIEW', 'sender': 1, 'instance': {'profile': 'flowmesh-v2-single-sequence-pbft-test/1', 'domain': 'synthetic-flowmesh-agreement-not-a-network', 'config': 'd3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e', 'epoch': 0, 'set': 'b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d', 'sequence': 0, 'parent': 'e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c'}, 'view': 1, 'value': 'a81a6ac1ed99138864d894ea4f126d8f202beec2782733889c507cb6bbf2f2db', 'reports': [{'payload': {'phase': 'VIEW_CHANGE', 'sender': 0, 'instance': {'profile': 'flowmesh-v2-single-sequence-pbft-test/1', 'domain': 'synthetic-flowmesh-agreement-not-a-network', 'config': 'd3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e', 'epoch': 0, 'set': 'b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d', 'sequence': 0, 'parent': 'e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c'}, 'view': 1, 'value': None, 'prepared': None, 'decision': None}, 'auth': '362035d7c4d80e75d1c7e63a71f5c5780bd4f79d203b8d71a77fafc7de18b376'}, {'payload': {'phase': 'VIEW_CHANGE', 'sender': 1, 'instance': {'profile': 'flowmesh-v2-single-sequence-pbft-test/1', 'domain': 'synthetic-flowmesh-agreement-not-a-network', 'config': 'd3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e', 'epoch': 0, 'set': 'b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d', 'sequence': 0, 'parent': 'e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c'}, 'view': 1, 'value': None, 'prepared': None, 'decision': None}, 'auth': 'a37b68e7b4a4257916c5ebe2fc422efe63488cd00ec3a55c813306041f2f981c'}, {'payload': {'phase': 'VIEW_CHANGE', 'sender': 2, 'instance': {'profile': 'flowmesh-v2-single-sequence-pbft-test/1', 'domain': 'synthetic-flowmesh-agreement-not-a-network', 'config': 'd3037bf92a8332b4345ea4e1e73f1e83f24fc2f8625d3bc22fade2abd0b5e56e', 'epoch': 0, 'set': 'b5ea90659198b1b915cb1ac0966d554bdf3600bd6c9806c5a0018f4ab93bc64d', 'sequence': 0, 'parent': 'e2a9075ac94c67992aafbd2330573ac88fb4b5244d76bbfeb1611a1e3822b07c'}, 'view': 1, 'value': None, 'prepared': None, 'decision': None}, 'auth': 'd4a5fa81d23fec31b107532c919be69ff335ea3b86609111308b9ae4791f16bc'}]}, 'auth': '366a98b2df573a4498751968f34c9d625f40ba9b9e67044128df39a4b72b450b'}}\n\n----------------------------------------------------------------------\nRan 1 test in 0.030s\n\nFAILED (failures=4)\n"
+}

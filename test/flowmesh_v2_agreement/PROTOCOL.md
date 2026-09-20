@@ -124,6 +124,16 @@ waits for the specified report quorum. A decided-but-unapplied node missing
 anchor evidence requests that exact evidence and resumes the same decision;
 it neither signs replacement work nor mistakes that decision for application.
 
+An unfinished candidate-signing intent likewise revalidates its exact body
+against locally available anchor evidence before its **first** signature.
+Missing evidence is requested on restart, on received data, and by the bounded
+retry timer. The intent is retained unchanged; evidence arrival does not permit
+signing an abandoned view. Already-issued signatures may be retransmitted
+unchanged without generating a new signature. The historical checker records
+the local body/evidence at first signing; later/global evidence cannot repair
+an invalid past guard. This implements the existing missing-data rule, not a
+new phase, timeout or quorum rule.
+
 OFFER is synthetic client ingress, not a vote or new consensus phase. Initial
 ingress and bounded retries disseminate its identical body, including from a
 nonleader. Each receiver validates the body before retaining pending work.

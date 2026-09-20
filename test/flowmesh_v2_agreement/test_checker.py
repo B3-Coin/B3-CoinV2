@@ -331,6 +331,56 @@ class CheckerTests(unittest.TestCase):
             self.assertEqual(set(node.anchors), {anchor["hash"]})
         self.assertEqual(check(sim)["applied_records"], 4)
 
+    def local_guard_history(self, phase):
+        sim = self.make(byzantine=(0,) if phase == "NEW_VIEW" else ())
+        anchor = max(sim.initial_anchors.values(), key=lambda a: a["height"])
+        sim.offer(anchor=anchor)
+        sim.run(250, stop=lambda s: s.settled())
+        self.assertTrue(sim.settled())
+        check(sim)
+        event = next(e for e in sim.trace if e["event"] == "pre_sign"
+                     and e["payload"]["phase"] == phase)
+        return sim, event["guard"], anchor
+
+    def test_negative_control_fresh_signature_requires_local_anchor_ancestry(self):
+        for phase in ("PROPOSE", "PREPARE", "COMMIT", "NEW_VIEW"):
+            for missing in ("candidate", "intermediate"):
+                sim, guard, anchor = self.local_guard_history(phase)
+                identity = anchor["hash"] if missing == "candidate" else anchor["parent"]
+                self.assertIn(identity, sim.initial_anchors)
+                # Simulate an invalid historical signature without deleting
+                # global evidence: later caches cannot repair its local guard.
+                del guard["anchors"][identity]
+                with self.subTest(phase=phase, missing=missing), self.assertRaisesRegex(
+                        AssertionError, "CHECKER_SIGN_WITHOUT_LOCAL_ANCHOR"):
+                    with patch.object(Application, "validate", side_effect=AssertionError("runtime validator called")):
+                        check(sim)
+
+    def test_negative_control_local_anchor_lookup_must_match_exact_header(self):
+        for phase in ("PROPOSE", "PREPARE", "COMMIT", "NEW_VIEW"):
+            sim, guard, anchor = self.local_guard_history(phase)
+            guard["anchors"][anchor["hash"]] = deepcopy(sim.initial_anchor)
+            with self.subTest(phase=phase), self.assertRaisesRegex(
+                    AssertionError, "CHECKER_SIGN_LOCAL_ANCHOR_MISMATCH"):
+                check(sim)
+
+    def test_negative_control_fresh_signature_requires_local_exact_body(self):
+        for phase in ("PROPOSE", "PREPARE", "COMMIT", "NEW_VIEW"):
+            sim, guard, _ = self.local_guard_history(phase)
+            guard["body"] = None
+            with self.subTest(phase=phase), self.assertRaisesRegex(
+                    AssertionError, "CHECKER_SIGN_WITHOUT_LOCAL_BODY"):
+                check(sim)
+
+    def test_unchanged_agreed_anchor_needs_no_volatile_ancestry(self):
+        sim = self.settled(byzantine=(0,))
+        # The exact agreed anchor is already in the durable sequence record;
+        # only a newer anchor requires additional volatile ancestry evidence.
+        for event in sim.trace:
+            if event["event"] == "pre_sign":
+                event["guard"]["anchors"] = {}
+        self.assertEqual(check(sim)["applied_records"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

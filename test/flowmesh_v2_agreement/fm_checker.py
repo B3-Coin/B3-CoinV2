@@ -109,18 +109,32 @@ class _Audit:
         _require(anchor["hash"] == digest("TEST/V2/ANCHOR/1",
                  {k: anchor[k] for k in ("height", "parent", "context")}), "CHECKER_ANCHOR_HASH")
 
-    def ancestry(self, anchor, before):
+    def ancestry(self, anchor, before, local_evidence=None):
         self.anchor_header(anchor)
         self.anchor_header(before)
         _require(anchor["height"] >= before["height"], "CHECKER_ANCHOR_REGRESSION")
+        local = local_evidence is not None
+        evidence = local_evidence if local else self.anchor_evidence
         current = anchor
         while current["height"] > before["height"]:
+            if local:
+                # Availability is a property of this replica at first signing,
+                # including the candidate header itself. Global/history caches
+                # must never supply evidence missing from the copied guard.
+                cached = evidence.get(current["hash"])
+                _require(cached is not None, "CHECKER_SIGN_WITHOUT_LOCAL_ANCHOR")
+                self.anchor_header(cached)
+                _require(cached == current, "CHECKER_SIGN_LOCAL_ANCHOR_MISMATCH")
             if current["height"] == before["height"] + 1:
                 _require(current["parent"] == before["hash"], "CHECKER_ANCHOR_NOT_DESCENDANT")
                 current = before
             else:
-                parent = self.anchor_evidence.get(current["parent"])
-                _require(parent is not None, "CHECKER_ANCHOR_EVIDENCE_MISSING")
+                parent = evidence.get(current["parent"])
+                _require(parent is not None, "CHECKER_SIGN_WITHOUT_LOCAL_ANCHOR" if local
+                         else "CHECKER_ANCHOR_EVIDENCE_MISSING")
+                self.anchor_header(parent)
+                _require(parent["hash"] == current["parent"],
+                         "CHECKER_SIGN_LOCAL_ANCHOR_MISMATCH" if local else "CHECKER_ANCHOR_HASH")
                 _require(parent["height"] + 1 == current["height"], "CHECKER_ANCHOR_BROKEN_CHAIN")
                 current = parent
         _require(current == before, "CHECKER_ANCHOR_SAME_HEIGHT_FORK")
@@ -193,14 +207,14 @@ class _Audit:
         self.proof_cache[key] = p
         return p
 
-    def body(self, body, rec, value):
+    def body(self, body, rec, value, local_anchors=None):
         _require(type(body) is dict and set(body) == {"instance", "anchor", "batch", "result"},
                  "CHECKER_BODY_SHAPE")
         _require(canonical(body["instance"]) == canonical(rec["instance"])
                  and value_id(body) == value, "CHECKER_BODY_IDENTITY")
         _require(normalize_batch(body["batch"]) == body["batch"], "CHECKER_BODY_CANONICAL")
         anchor = body["anchor"]
-        self.ancestry(anchor, rec["anchor_before"])
+        self.ancestry(anchor, rec["anchor_before"], local_anchors)
         for field in ("deposits", "settlements"):
             for fact in body["batch"][field]:
                 _require(type(fact.get("height")) is int and 0 <= fact["height"] <= anchor["height"],
@@ -218,14 +232,20 @@ class _Audit:
         phase, view = p["phase"], p["view"]
         expected_mode = "CHANGING" if phase in ("VIEW_CHANGE", "NEW_VIEW") else "ACTIVE"
         _require(guard["mode"] == expected_mode, "CHECKER_SIGNING_MODE")
+        if phase in ("PROPOSE", "PREPARE", "COMMIT", "NEW_VIEW"):
+            _require(guard.get("body") is not None, "CHECKER_SIGN_WITHOUT_LOCAL_BODY")
+            anchors = guard.get("anchors")
+            _require(type(anchors) is dict and len(anchors) <= PROFILE["limits"]["objects"],
+                     "CHECKER_SIGN_LOCAL_ANCHOR_CACHE")
+            rec = self.sim.nodes[p["sender"]].d["records"][p["instance"]["sequence"]]
+            self.body(guard["body"], rec, p["value"], local_anchors=anchors)
         if phase in ("PREPARE", "COMMIT"):
             accepted = guard["accepted"]
             _require(accepted is not None, "CHECKER_SIGN_BEFORE_ACCEPTED_PROPOSAL")
             prop = self.proof("proposal", accepted["signed"], p["instance"])
             _require((prop["view"], prop["value"]) == (view, p["value"]),
                      "CHECKER_SIGN_ACCEPTED_LINK")
-            rec = self.sim.nodes[p["sender"]].d["records"][p["instance"]["sequence"]]
-            self.body(accepted["body"], rec, p["value"])
+            _require(accepted["body"] == guard["body"], "CHECKER_SIGN_BODY_ACCEPTED_LINK")
             if view:
                 _require(guard["new_view"] is not None
                          and guard["new_view"] == prop["new_view"],
