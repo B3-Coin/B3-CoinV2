@@ -96,12 +96,19 @@ class Replica:
         self._volatile()
         self.event("restart", fenced=self.d["fenced"])
         if self.record and self.record["decision"] is not None:
-            self._apply()
+            # Recovery still verifies exact anchor evidence. A durable decision
+            # is not permission to guess evidence lost from the volatile cache.
+            try:
+                self._apply()
+            except NeedData as exc:
+                self._need({"kind": "CERT", "data": self.record["decision"],
+                            "source": self.index}, str(exc))
         self._resume_intents()
         self.retry()
 
     def _resume_intents(self):
-        if not self.record or self.d["fenced"] or self.d["halt"]:
+        if (not self.record or self.record["decision"] is not None
+                or self.d["fenced"] or self.d["halt"]):
             return
         r = self.record
         for slot, payload in list(r["intents"].items()):
@@ -438,7 +445,8 @@ class Replica:
         self._timer()
 
     def _drive(self):
-        if not self.record or not self.alive or self.d["halt"] or self.d["fenced"]:
+        if (not self.record or self.record["decision"] is not None
+                or not self.alive or self.d["halt"] or self.d["fenced"]):
             return
         r, seq = self.record, self.d["sequence"]
         v = r["view"]
@@ -488,6 +496,8 @@ class Replica:
             old = rec["decision"]["prepared"]["proposal"]["payload"]["value"]
             if old != p["value"]:
                 self._halt("CONFLICTING_DECISIONS")
+            elif not rec["applied"]:
+                self._apply()
             return
         seq = p["instance"]["sequence"]
         self._persist(lambda d: d["records"][seq].update(decision=deepcopy(cert), body=deepcopy(body), mode="DECIDED"),
@@ -526,7 +536,7 @@ class Replica:
         # Publication of exact retained signatures is allowed even after a timeout;
         # signing a new old-view message is not. No signature is erased.
         for rec in self.d["records"].values():
-            if rec["applied"]:
+            if rec["decision"] is not None:
                 self._send("CERT", rec["decision"])
                 continue
             for signed in rec["signed"].values():
