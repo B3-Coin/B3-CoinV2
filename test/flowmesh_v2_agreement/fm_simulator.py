@@ -33,6 +33,7 @@ class Simulator:
         self.initial_anchor = initial_anchor()
         # Explicit synthetic source evidence distributed independently per node.
         evidence = anchor_chain() if anchors is None else anchors
+        self.initial_anchors = deepcopy(evidence)  # read-only external audit evidence
         self.nodes = []
         for index in range(n):
             node = Replica(index, n, self.authentication.signer(index), self.authentication.verify,

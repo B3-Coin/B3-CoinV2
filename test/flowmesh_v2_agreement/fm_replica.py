@@ -66,15 +66,26 @@ class Replica:
                 self.bodies[value_id(rec["body"])] = deepcopy(rec["body"])
             for data in rec["accepted"].values():
                 self.bodies[value_id(data["body"])] = deepcopy(data["body"])
+        if self.record and self.record["decision"] is None:
+            for vid, body in self.d["retained_bodies"].items():
+                if body["instance"] == self.record["instance"]:
+                    self.offers.add(vid)
+            for data in self.record["accepted"].values():
+                p = data["signed"]["payload"]
+                self.headers[(p["view"], p["value"])] = deepcopy(data["signed"])
+            for key, qc in self.record["prepared"].items():
+                self.headers.setdefault(key, deepcopy(qc["proposal"]))
+            if self.record["mode"] == "ACTIVE" and (self.offers or self.headers):
+                self._timer()
 
     def event(self, name, **info):
         self.trace(self.index, name, info)
 
-    def _persist(self, mutate, reason):
+    def _persist(self, mutate, reason, **evidence):
         candidate = deepcopy(self.d)
         mutate(candidate)
         self.d = candidate
-        self.event("durable", reason=reason)
+        self.event("durable", reason=reason, **evidence)
 
     def _crash_at(self, point, phase=""):
         if self.cut == (point, phase):
@@ -136,6 +147,10 @@ class Replica:
         self.event("halt", reason=reason)
 
     def _send(self, kind, data, destination=None):
+        if kind == "SIGNED":
+            p = data["payload"]
+            self.event("publish", auth=data["auth"], phase=p["phase"],
+                       view=p["view"], sequence=p["instance"]["sequence"])
         self.emit(self.index, kind, deepcopy(data), destination)
 
     def _sign(self, phase, value=None, **extra):
@@ -152,13 +167,21 @@ class Replica:
             return None
         if slot not in r["signed"]:
             self._crash_at("before_record", phase)
-            self._persist(lambda d: d["records"][seq]["intents"].__setitem__(slot, payload), "intent:" + phase)
+            self._persist(lambda d: d["records"][seq]["intents"].__setitem__(slot, payload),
+                          "intent:" + phase, payload=payload)
             self._crash_at("after_intent", phase)
+            r = self.record
+            # Test-only history for the independent oracle, not a voting input.
+            self.event("pre_sign", payload=payload, guard={
+                "instance": r["instance"], "view": r["view"], "mode": r["mode"],
+                "accepted": r["accepted"].get(v), "new_view": r["new_views"].get(v),
+                "prepared": r["prepared"].get((v, value)), "highest": r["highest"],
+                "fenced": self.d["fenced"], "halt": self.d["halt"], "decision": r["decision"]})
             signed = self.signer(payload)
-            self._persist(lambda d: d["records"][seq]["signed"].__setitem__(slot, signed), "signature:" + phase)
+            self._persist(lambda d: d["records"][seq]["signed"].__setitem__(slot, signed),
+                          "signature:" + phase, auth=signed["auth"])
             self._crash_at("after_record", phase)
         signed = self.record["signed"][slot]
-        self.event("publish", auth=signed["auth"], phase=phase, view=v, sequence=seq)
         self._send("SIGNED", signed)
         self._crash_at("after_publish", phase)
         return signed
@@ -238,7 +261,10 @@ class Replica:
             self._handle(kind, data, source)
             self._drive()
         except NeedData as exc:
-            self._need(wire, str(exc))
+            try:
+                self._need(wire, str(exc))
+            except Exhausted as exhausted:
+                self._halt(str(exhausted))
         except Exhausted as exc:
             self._halt(str(exc))
         except (Invalid, InvalidValue, KeyError, TypeError, ValueError, RecursionError) as exc:
@@ -288,7 +314,16 @@ class Replica:
             self._retry_pending()
             return
         if kind == "SIGNED":
+            if not self.proofs.authenticate(data):
+                raise Invalid("AUTHENTICATION")
             p = data["payload"]
+            kinds = {"PROPOSE": "proposal", "PREPARE": "prepare_vote", "COMMIT": "commit_vote",
+                     "VIEW_CHANGE": "view_change", "NEW_VIEW": "new_view"}
+            if p["phase"] not in kinds:
+                raise Invalid("UNKNOWN_PHASE")
+            # Validate before retaining an unknown parent or replying to old
+            # traffic. Authentication does not prove context or quorum weight.
+            self.proofs.check(kinds[p["phase"]], data, p["instance"])
             rec = self._context(p["instance"])
             phase = p["phase"]
             if rec["applied"]:
@@ -330,6 +365,8 @@ class Replica:
             self.event("defer", reason="ABANDONED_OR_INACTIVE_VIEW", view=p["view"])
             self._aggregate()
             return
+        if p["view"] and r["new_views"].get(p["view"]) != p["new_view"]:
+            raise Invalid("CONFLICTING_NEW_VIEW")
         existing = r["accepted"].get(p["view"])
         if existing and existing["signed"]["payload"]["value"] != p["value"]:
             raise Invalid("CONFLICTING_ACCEPTED_PROPOSAL")
@@ -346,6 +383,7 @@ class Replica:
     def _prepared(self, qc):
         p = self.proofs.check("prepared", qc, self.instance)
         self._body(p["value"])
+        self.headers.setdefault((p["view"], p["value"]), deepcopy(qc["proposal"]))
         if p["view"] > self.record["view"]:
             # Catch up only via the QC's complete valid NEW_VIEW, never its view integer.
             self._new_view(qc["proposal"]["payload"]["new_view"])
@@ -430,7 +468,7 @@ class Replica:
             return
         old = self.record["new_views"].get(p["view"])
         if old:
-            if old["payload"]["value"] != p["value"]:
+            if old != signed:
                 raise Invalid("CONFLICTING_NEW_VIEW")
             return
         if self.record["decision"] is not None:
