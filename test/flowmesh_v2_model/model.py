@@ -10,7 +10,13 @@ import hashlib
 import json
 from pathlib import Path
 
-from curves import auction, buy_bound, evaluate, validate_curve
+from curves import HARD_MAX_CURVE_POINTS, auction, buy_bound, evaluate, validate_curve
+
+
+# TEST storage envelope only; no change to action IDs or economic profile.
+SNAPSHOT_FORMAT = "TEST-MODEL-SNAPSHOT/2"
+HISTORY_BYTES_LIMIT = 8 * 1024 * 1024
+SNAPSHOT_BYTES_LIMIT = 32 * 1024 * 1024
 
 
 class ModelError(ValueError):
@@ -140,7 +146,26 @@ class Model:
             "spot", "futures", "custody", "orders", "next_sequence", "outcomes",
             "instructions", "deposits", "pending", "settled", "fn", "treasury",
             "fee_pool", "fees_collected", "v1", "v1_receipts", "v1_external")}
+        self.history = []
         self.assert_invariants()
+
+    @staticmethod
+    def _normalized_inputs(items):
+        # Candidate arrival order and exact repeated wrappers are not history
+        # identities. Execution still validates original input counts first.
+        unique = {canonical(item): deepcopy(item) for item in items}
+        return [unique[key] for key in sorted(unique)]
+
+    def _record(self, operation, arguments):
+        history = self.history + [{"operation": operation, "arguments": deepcopy(arguments)}]
+        if len(history) > self.limits["records"] or len(canonical(history)) > HISTORY_BYTES_LIMIT:
+            raise ModelError("MODEL_HISTORY_LIMIT")
+        self.history = history
+        # Fail in the staged object before committing either state or history.
+        self.snapshot()
+
+    def _commit(self, draft):
+        self.state, self.history = draft.state, draft.history
 
     def _amount(self, n, minimum=0):
         return _integer(n, self.limits["amount"], minimum)
@@ -342,7 +367,14 @@ class Model:
             raise Refusal("ORDER_CLOSED")
         if o["revision"] != p["expected_revision"]:
             raise Refusal("STALE_REVISION")
-        if kind == "CANCEL" or (p.get("curve") and all(q == 0 for _, q in p["curve"])):
+        if kind == "CANCEL":
+            self._close(o, "CANCELLED")
+            return {"order_id": o["order_id"]}
+        if p["curve"] and all(q == 0 for _, q in p["curve"]):
+            points = p["curve"]
+            if (len(points) > min(self.limits["curve_points"], HARD_MAX_CURVE_POINTS)
+                    or any(right[0] <= left[0] for left, right in zip(points, points[1:]))):
+                raise Refusal("INVALID_CURVE")
             self._close(o, "CANCELLED")
             return {"order_id": o["order_id"]}
         self._curve(o["side"], p["curve"])
@@ -425,17 +457,22 @@ class Model:
         draft = deepcopy(self)
         # Copy caller-owned inputs before validation/execution.
         try:
-            report = draft._batch(deepcopy(list(deposits)), deepcopy(list(settlements)),
-                                  deepcopy(list(actions)), deepcopy(capacities or {}),
-                                  deepcopy(risk or {}), fault)
+            inputs = {"deposits": deepcopy(list(deposits)), "settlements": deepcopy(list(settlements)),
+                      "actions": deepcopy(list(actions)), "capacities": deepcopy(capacities or {}),
+                      "risk": deepcopy(risk or {})}
+            report = draft._batch(**inputs, fault=fault)
             draft.assert_invariants()
             if any(draft.state["fee_pool"].values()):
                 raise ModelError("UNDISTRIBUTED_FEES")
+            if draft.state != self.state:
+                for key in ("deposits", "settlements", "actions"):
+                    inputs[key] = self._normalized_inputs(inputs[key])
+                draft._record("batch", inputs)
         except (ValueError, KeyError, TypeError) as e:
             if isinstance(e, ModelError):
                 raise
             raise ModelError("INVALID_CANDIDATE_INPUT") from e
-        self.state = draft.state
+        self._commit(draft)
         return deepcopy(report)
 
     def _batch(self, deposits, settlements, actions, capacities, risk, fault):
@@ -687,8 +724,11 @@ class Model:
                 self._curve(o["side"], o["curve"])
             except Refusal as e:
                 raise ModelError("INVALID_STORED_CURVE") from e
-            for k in ("revision", "revision_filled", "lifetime_filled", "notional", "charged", "spent", "bound", "reservation"):
+            _integer(o["revision"], self.limits["sequence"])
+            for k in ("revision_filled", "lifetime_filled", "notional", "charged", "spent", "bound", "reservation"):
                 self._amount(o[k])
+            if o["spent"] > o["notional"] or (o["spent"] and not o["revision_filled"]):
+                raise ModelError("REVISION_SPEND_WITHOUT_FILL")
             if o["charged"] != self._fee(o["notional"]) or o["revision_filled"] > max(q for _, q in o["curve"]):
                 raise ModelError("ORDER_COUNTERS")
             if o["lifetime_filled"] < o["revision_filled"]:
@@ -797,9 +837,13 @@ class Model:
             raise ModelError("V1_FIXTURE_ALREADY_SEEDED")
         if len(self.state["v1"]) >= self.limits["records"]:
             raise ModelError("V1_RECORD_LIMIT")
-        self.state["v1"][key] = {"asset": asset, "vault": vault, "initial": total,
+        draft = deepcopy(self)
+        draft.state["v1"][key] = {"asset": asset, "vault": vault, "initial": total,
             "custody": total, "available": available, "reserved": reserved, "pending": pending}
-        self.assert_invariants()
+        draft.assert_invariants()
+        draft._record("seed_v1", {"vault": vault, "asset": asset, "available": available,
+                                 "reserved": reserved, "pending": pending})
+        self._commit(draft)
 
     def settle_v1(self, vault, asset, receipt_id, amount, destination):
         _id(receipt_id)
@@ -822,7 +866,9 @@ class Model:
         draft.state["v1_receipts"][receipt_id] = record
         draft.state["v1_external"][receipt_id] = {**record, "remaining": amount, "deposit_id": None}
         draft.assert_invariants()
-        self.state = draft.state
+        draft._record("settle_v1", {"vault": vault, "asset": asset, "receipt_id": receipt_id,
+                                   "amount": amount, "destination": destination})
+        self._commit(draft)
 
     def redeposit_v1(self, receipt_id, deposit_fact):
         self._validate_deposit(deposit_fact)
@@ -841,12 +887,17 @@ class Model:
         draft._credit(deposit_fact)
         draft.state["v1_external"][receipt_id].update(remaining=0, deposit_id=did)
         draft.assert_invariants()
-        self.state = draft.state
+        draft._record("redeposit_v1", {"receipt_id": receipt_id, "deposit_fact": deposit_fact})
+        self._commit(draft)
 
     def snapshot(self):
-        return canonical({"format": "TEST-MODEL-SNAPSHOT/1", "profile": self.profile,
+        encoded = canonical({"format": SNAPSHOT_FORMAT, "profile": self.profile,
             "assets": self.assets, "markets": sorted(self.market_inputs, key=canonical), "seats": self.seats,
-            "treasury_owner": self.treasury_owner, "subaccounts": self.subaccounts, "state": self.state})
+            "treasury_owner": self.treasury_owner, "subaccounts": self.subaccounts,
+            "state": self.state, "history": self.history})
+        if len(encoded) > SNAPSHOT_BYTES_LIMIT:
+            raise ModelError("MODEL_SNAPSHOT_LIMIT")
+        return encoded
 
     def digest(self):
         return hashlib.sha256(self.snapshot()).hexdigest()
@@ -854,16 +905,48 @@ class Model:
     @classmethod
     def restore(cls, encoded):
         try:
+            if type(encoded) is not bytes or len(encoded) > SNAPSHOT_BYTES_LIMIT:
+                raise ModelError("MODEL_SNAPSHOT_LIMIT_OR_TYPE")
             document = json.loads(encoded)
-            if canonical(document) != encoded or document["format"] != "TEST-MODEL-SNAPSHOT/1":
+            if type(document) is not dict or canonical(document) != encoded:
                 raise ModelError("NON_CANONICAL_SNAPSHOT")
-            if set(document) != {"format", "profile", "assets", "markets", "seats", "treasury_owner", "subaccounts", "state"}:
+            if document.get("format") == "TEST-MODEL-SNAPSHOT/1":
+                raise ModelError("LEGACY_SNAPSHOT_REQUIRES_ORIGINAL_REPLAY_INPUTS")
+            if document.get("format") != SNAPSHOT_FORMAT:
+                raise ModelError("UNSUPPORTED_SNAPSHOT_FORMAT")
+            if set(document) != {"format", "profile", "assets", "markets", "seats", "treasury_owner", "subaccounts", "state", "history"}:
                 raise ModelError("SNAPSHOT_SCHEMA")
             model = cls(*(document[k] for k in ("profile", "assets", "markets", "seats", "treasury_owner", "subaccounts")))
-            model.state = deepcopy(document["state"])
+            history = document["history"]
+            if (type(history) is not list or len(history) > model.limits["records"]
+                    or len(canonical(history)) > HISTORY_BYTES_LIMIT):
+                raise ModelError("MODEL_HISTORY_LIMIT")
+            schemas = {
+                "batch": {"deposits", "settlements", "actions", "capacities", "risk"},
+                "seed_v1": {"vault", "asset", "available", "reserved", "pending"},
+                "settle_v1": {"vault", "asset", "receipt_id", "amount", "destination"},
+                "redeposit_v1": {"receipt_id", "deposit_fact"},
+            }
+            for record in history:
+                if type(record) is not dict or set(record) != {"operation", "arguments"}:
+                    raise ModelError("BAD_HISTORY_RECORD")
+                operation, arguments = record["operation"], record["arguments"]
+                if (type(operation) is not str or operation not in schemas
+                        or type(arguments) is not dict or set(arguments) != schemas[operation]):
+                    raise ModelError("BAD_HISTORY_OPERATION")
+                if operation == "batch":
+                    model.apply_batch(**arguments)
+                elif operation == "seed_v1":
+                    model.seed_v1(**arguments)
+                elif operation == "settle_v1":
+                    model.settle_v1(**arguments)
+                else:
+                    model.redeposit_v1(**arguments)
             model.assert_invariants()
-            if any(model.state["fee_pool"].values()):
-                raise ModelError("PARTIAL_BATCH_SNAPSHOT")
+            # Do not install untrusted derived state. Compare exact bytes, not
+            # Python equality (which treats True and 1 as interchangeable).
+            if model.snapshot() != encoded:
+                raise ModelError("SNAPSHOT_HISTORY_STATE_MISMATCH")
             return model
         except (ValueError, KeyError, TypeError) as e:
             if isinstance(e, ModelError):

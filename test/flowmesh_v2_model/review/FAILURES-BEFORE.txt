@@ -1,0 +1,169 @@
+Frozen implementation: dc5682785f3d8c91972fd2f3b8502fd30be1baa7
+Only the new regression test file was added for this run.
+Command: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/flowmesh_v2_model -p test_milestone1_regressions.py -v
+Actual exit status: 1. Absolute checkout prefix sanitized; test output otherwise unchanged.
+
+test_restore_rejects_fabricated_cancel_and_reservation_release (test_milestone1_regressions.MilestoneOneRestorationTests.test_restore_rejects_fabricated_cancel_and_reservation_release) ... FAIL
+test_restore_rejects_fee_reassignment_between_historical_seats (test_milestone1_regressions.MilestoneOneRestorationTests.test_restore_rejects_fee_reassignment_between_historical_seats) ... FAIL
+test_restore_rejects_lifetime_fill_without_execution (test_milestone1_regressions.MilestoneOneRestorationTests.test_restore_rejects_lifetime_fill_without_execution) ... FAIL
+test_restore_rejects_revision_above_action_revision_limit (test_milestone1_regressions.MilestoneOneRestorationTests.test_restore_rejects_revision_above_action_revision_limit) ... FAIL
+test_restore_rejects_revision_spend_without_lifetime_notional (test_milestone1_regressions.MilestoneOneRestorationTests.test_restore_rejects_revision_spend_without_lifetime_notional) ... FAIL
+test_restore_rejects_spot_owner_substitution (test_milestone1_regressions.MilestoneOneRestorationTests.test_restore_rejects_spot_owner_substitution) ... FAIL
+test_restore_rejects_v1_reservation_reclassified_as_pending (test_milestone1_regressions.MilestoneOneRestorationTests.test_restore_rejects_v1_reservation_reclassified_as_pending) ... FAIL
+test_valid_zero_replacement_still_cancels_and_releases_reserve (test_milestone1_regressions.MilestoneOneZeroReplacementTests.test_valid_zero_replacement_still_cancels_and_releases_reserve) ... ok
+test_zero_replacement_rejects_descending_prices (test_milestone1_regressions.MilestoneOneZeroReplacementTests.test_zero_replacement_rejects_descending_prices) ... FAIL
+test_zero_replacement_rejects_repeated_prices (test_milestone1_regressions.MilestoneOneZeroReplacementTests.test_zero_replacement_rejects_repeated_prices) ... FAIL
+test_zero_replacement_rejects_seventeen_points (test_milestone1_regressions.MilestoneOneZeroReplacementTests.test_zero_replacement_rejects_seventeen_points) ... FAIL
+
+======================================================================
+FAIL: test_restore_rejects_fabricated_cancel_and_reservation_release (test_milestone1_regressions.MilestoneOneRestorationTests.test_restore_rejects_fabricated_cancel_and_reservation_release)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 53, in test_restore_rejects_fabricated_cancel_and_reservation_release
+    self.reject(document)
+    ~~~~~~~~~~~^^^^^^^^^^
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 28, in reject
+    with self.assertRaises(ModelError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+AssertionError: ModelError not raised
+
+======================================================================
+FAIL: test_restore_rejects_fee_reassignment_between_historical_seats (test_milestone1_regressions.MilestoneOneRestorationTests.test_restore_rejects_fee_reassignment_between_historical_seats)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 93, in test_restore_rejects_fee_reassignment_between_historical_seats
+    self.reject(document)
+    ~~~~~~~~~~~^^^^^^^^^^
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 28, in reject
+    with self.assertRaises(ModelError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+AssertionError: ModelError not raised
+
+======================================================================
+FAIL: test_restore_rejects_lifetime_fill_without_execution (test_milestone1_regressions.MilestoneOneRestorationTests.test_restore_rejects_lifetime_fill_without_execution)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 69, in test_restore_rejects_lifetime_fill_without_execution
+    self.reject(document)
+    ~~~~~~~~~~~^^^^^^^^^^
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 28, in reject
+    with self.assertRaises(ModelError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+AssertionError: ModelError not raised
+
+======================================================================
+FAIL: test_restore_rejects_revision_above_action_revision_limit (test_milestone1_regressions.MilestoneOneRestorationTests.test_restore_rejects_revision_above_action_revision_limit)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 77, in test_restore_rejects_revision_above_action_revision_limit
+    self.reject(document)
+    ~~~~~~~~~~~^^^^^^^^^^
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 28, in reject
+    with self.assertRaises(ModelError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+AssertionError: ModelError not raised
+
+======================================================================
+FAIL: test_restore_rejects_revision_spend_without_lifetime_notional (test_milestone1_regressions.MilestoneOneRestorationTests.test_restore_rejects_revision_spend_without_lifetime_notional)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 63, in test_restore_rejects_revision_spend_without_lifetime_notional
+    self.reject(document)
+    ~~~~~~~~~~~^^^^^^^^^^
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 28, in reject
+    with self.assertRaises(ModelError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+AssertionError: ModelError not raised
+
+======================================================================
+FAIL: test_restore_rejects_spot_owner_substitution (test_milestone1_regressions.MilestoneOneRestorationTests.test_restore_rejects_spot_owner_substitution)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 45, in test_restore_rejects_spot_owner_substitution
+    self.reject(document)
+    ~~~~~~~~~~~^^^^^^^^^^
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 28, in reject
+    with self.assertRaises(ModelError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+AssertionError: ModelError not raised
+
+======================================================================
+FAIL: test_restore_rejects_v1_reservation_reclassified_as_pending (test_milestone1_regressions.MilestoneOneRestorationTests.test_restore_rejects_v1_reservation_reclassified_as_pending)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 100, in test_restore_rejects_v1_reservation_reclassified_as_pending
+    self.reject(document)
+    ~~~~~~~~~~~^^^^^^^^^^
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 28, in reject
+    with self.assertRaises(ModelError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+AssertionError: ModelError not raised
+
+======================================================================
+FAIL: test_zero_replacement_rejects_descending_prices (test_milestone1_regressions.MilestoneOneZeroReplacementTests.test_zero_replacement_rejects_descending_prices)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 141, in test_zero_replacement_rejects_descending_prices
+    self.reject_without_moving_funds([[11, 0], [10, 0]])
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 124, in reject_without_moving_funds
+    self.assertEqual((outcome["status"], outcome["code"]),
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                     ("REJECTED", "INVALID_CURVE"))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Tuples differ: ('ACCEPTED', 'OK') != ('REJECTED', 'INVALID_CURVE')
+
+First differing element 0:
+'ACCEPTED'
+'REJECTED'
+
+- ('ACCEPTED', 'OK')
++ ('REJECTED', 'INVALID_CURVE')
+
+======================================================================
+FAIL: test_zero_replacement_rejects_repeated_prices (test_milestone1_regressions.MilestoneOneZeroReplacementTests.test_zero_replacement_rejects_repeated_prices)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 138, in test_zero_replacement_rejects_repeated_prices
+    self.reject_without_moving_funds([[10, 0], [10, 0]])
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 124, in reject_without_moving_funds
+    self.assertEqual((outcome["status"], outcome["code"]),
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                     ("REJECTED", "INVALID_CURVE"))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Tuples differ: ('ACCEPTED', 'OK') != ('REJECTED', 'INVALID_CURVE')
+
+First differing element 0:
+'ACCEPTED'
+'REJECTED'
+
+- ('ACCEPTED', 'OK')
++ ('REJECTED', 'INVALID_CURVE')
+
+======================================================================
+FAIL: test_zero_replacement_rejects_seventeen_points (test_milestone1_regressions.MilestoneOneZeroReplacementTests.test_zero_replacement_rejects_seventeen_points)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 135, in test_zero_replacement_rejects_seventeen_points
+    self.reject_without_moving_funds([[price, 0] for price in range(17)])
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<checkout>/test/flowmesh_v2_model/test_milestone1_regressions.py", line 124, in reject_without_moving_funds
+    self.assertEqual((outcome["status"], outcome["code"]),
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                     ("REJECTED", "INVALID_CURVE"))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Tuples differ: ('ACCEPTED', 'OK') != ('REJECTED', 'INVALID_CURVE')
+
+First differing element 0:
+'ACCEPTED'
+'REJECTED'
+
+- ('ACCEPTED', 'OK')
++ ('REJECTED', 'INVALID_CURVE')
+
+----------------------------------------------------------------------
+Ran 11 tests in 0.021s
+
+FAILED (failures=10)
+

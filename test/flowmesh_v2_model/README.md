@@ -13,6 +13,10 @@ That historical package is unchanged. Its pre-model approval/status wording is
 part of the preserved record; this separate directory records the bounded model
 profile without rewriting that record.
 
+Milestone 1's internal review and repairs are recorded in
+[`MILESTONE1.md`](MILESTONE1.md). The original [`RESULTS.md`](RESULTS.md) remains
+the unchanged 88-test baseline record, not the successor's qualification report.
+
 ## Profile and scope
 
 [`TEST_PROFILE.json`](TEST_PROFILE.json) identifies
@@ -145,14 +149,23 @@ From the `accounting-model-source` repository root, run:
 python3 -m unittest discover -s test/flowmesh_v2_model -p 'test_*.py' -v
 ```
 
-`snapshot()` returns canonical model state and configuration; `Model.restore()`
-reconstructs and validates it, `digest()` identifies that snapshot, and
-`assert_invariants()` checks the retained accounting state. Serialization/replay
+`snapshot()` returns canonical model state, configuration and bounded synthetic
+input history; `Model.restore()` replays that history and compares all resulting
+state, `digest()` identifies that snapshot, and `assert_invariants()` checks
+current internal accounting. The latter alone does not establish historical
+ownership or authorized lifecycle changes. Serialization/replay
 qualifies model persistence only, not durable production signing journals or
 power-loss recovery. Snapshots are not authenticated: internal-consistency
 checks do not prove protection against a coherently forged history or external
 rollback. Test results must be read from the actual run; this README
 does not assert that a suite has passed.
+
+The corrected test-only envelope is `TEST-MODEL-SNAPSHOT/2`; it does not change
+the accounting profile, ActionIds, MarketIds or economics. Storage is bounded to
+the existing record-count limit, 8 MiB input history and 32 MiB complete snapshot.
+Limit exhaustion is atomic, not permission to delete history. Old `/1` snapshots
+remain preserved and fail closed under the new reader: replay requires their
+original synthetic inputs, not invented replacement events. See `API.md`.
 
 The evidence from this directory is bounded to deterministic accounting,
 reservations, replay, integer bounds, fee ownership and the synthetic fences.

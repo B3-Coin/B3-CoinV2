@@ -63,8 +63,28 @@ may be followed by their next sequence in the same batch.
 orders/reservations, custody, pending/consumed receipts, outcomes, next_sequence,
 fee totals and historical FN/treasury balances are retained explicitly.
 `model.snapshot()` returns full canonical state+configuration bytes;
-`Model.restore(bytes)` validates/reconstructs the same model;
+`Model.restore(bytes)` validates/reconstructs the same model by replaying its
+retained synthetic operation inputs, then comparing the entire snapshot;
 `model.digest()` hashes snapshot; `model.assert_invariants()` validates it.
+`assert_invariants()` checks current internal arithmetic; it is not a substitute
+for the restoration history check. `state` and `history` are inspection objects,
+not authorized mutation interfaces.
+
+The model-only envelope is `TEST-MODEL-SNAPSHOT/2`. `history` retains successful
+state-changing `batch`, `seed_v1`, `settle_v1` and `redeposit_v1` inputs. Batch
+facts/actions are sorted and exact duplicates collapsed; complete risk/capacity
+facts and original semantic instruction bytes are preserved. No-op exact retries
+do not append records. Whole-candidate failures leave both history and state
+unchanged. Restore dispatches only those four whitelisted operation shapes.
+
+Test storage limits are the profile's existing `records` ceiling for retained
+operations, 8 MiB of canonical history, and 32 MiB for the complete snapshot.
+Exhaustion fails before candidate commit; history is never pruned to fit.
+Version-1 snapshots lack the necessary inputs and fail closed with
+`LEGACY_SNAPSHOT_REQUIRES_ORIGINAL_REPLAY_INPUTS`. They remain readable with the
+preserved original implementation, not silently upgraded or declared recovered.
+Original source inputs are required to reconstruct them in the corrected model.
+
 Snapshots are not authenticated state commitments: these checks do not detect
 a coherently forged history or prove protection against external rollback.
 
