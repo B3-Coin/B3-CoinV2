@@ -3,6 +3,7 @@ from copy import deepcopy
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fm_application import digest, value_id
@@ -13,6 +14,28 @@ from test_model import Fixture
 
 
 class ReviewTests(unittest.TestCase):
+    def test_sparse_offer_to_nonleader_reaches_agreement_without_next_request(self):
+        for n in (4, 7):
+            s = Simulator(Fixture().model.snapshot(), n=n)
+            original = s.offer(nodes=[1])
+            s.run(180, stop=lambda sim: sim.settled())
+            self.assertTrue(s.settled(), [node.last_reason for node in s.nodes])
+            self.assertEqual({node.d["parent"] for node in s.nodes}, {value_id(original)})
+            check(s)
+
+    def test_local_resource_exhaustion_preserves_intent_and_halts(self):
+        # Reduced bound is a labelled boundary injection, not a mainnet profile.
+        with patch.dict(PROFILE["limits"], messages=0):
+            s = Simulator(Fixture().model.snapshot())
+            s.offer(nodes=[0])
+            node = s.nodes[0]
+            self.assertEqual(node.d["halt"], "AUTH_AUDIT_LIMIT")
+            self.assertIn(("PROPOSE", 0), node.record["intents"])
+            self.assertFalse(node.record["signed"])
+            self.assertFalse(s.authentication.issued)
+            node.restart()
+            self.assertEqual(node.d["halt"], "AUTH_AUDIT_LIMIT")
+
     def test_exact_new_view_cannot_be_substituted_after_acceptance(self):
         for reverse in (False, True):
             with self.subTest(reverse=reverse):
