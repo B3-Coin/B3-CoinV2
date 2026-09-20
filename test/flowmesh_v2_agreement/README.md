@@ -8,8 +8,11 @@ at `9d4fd53dc7d58d397680fd64065663703cbbdd17`; R1 remains unchanged at
 The exact [protocol/transition table](PROTOCOL.md) and
 [versioned profile](TEST_PROFILE.json) were committed before the transitions.
 [Results and counterexamples](RESULTS.md) distinguish tested recovery from
-safe stalls and later production work. No PR, push, release or activation is
-part of this milestone.
+safe stalls and later production work. The subsequently authorized dedicated
+branch/draft-PR publication, one bounded separate-context review and successor
+repair are recorded in [POST_FIX_REVIEW.md](POST_FIX_REVIEW.md). The frozen
+milestone and its earlier failure evidence are preserved. No release,
+activation or production integration is part of this milestone.
 
 ## Reproduce from repository root
 

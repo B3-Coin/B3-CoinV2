@@ -1,5 +1,10 @@
 # Milestone 2 evidence and limitations
 
+**Historical frozen-stage record below.** The later authorized publication
+review, new counterexample and successor correction are documented separately
+in [POST_FIX_REVIEW.md](POST_FIX_REVIEW.md). Earlier failures/review limits below
+are retained, not silently relabelled as passes or overwritten.
+
 Status: isolated model closed for owner review; no production qualification.
 Exact final revision is the local milestone commit containing this document.
 Run commands are in [README.md](README.md). Frozen accounting and design files
