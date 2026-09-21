@@ -1,0 +1,84 @@
+{
+  "schema": "flowmesh-m3a-repair-before/1",
+  "kind": "sanitized deterministic baseline reproduction, not independent audit",
+  "executed_utc_date": "2026-09-21",
+  "baseline_commit": "1d022dbf0da63636d6d43650d3864222761497a1",
+  "baseline_tree": "282977ce63eacbbca2505c3464ea5738cd13caed",
+  "python_version": "3.14.6",
+  "baseline_source": "git archive for first rerun; clean detached Git checkout for public-launcher validation",
+  "probe_adaptation": "Only source selection/import bootstrap changed. Public copies take an explicit checkout argument, verify exact baseline HEAD and a clean worktree before loading the unchanged model. Schedules, assertions and fault assumptions are unchanged.",
+  "original_probe_sha256": {
+    "probe_view_transition.py": "525f0eee76ea9265ca0d350a3bcd7d781641ad9b85cfdc1910614635dc0bf5ee",
+    "probe_admission_interactions.py": "a78907dc305e39b03c74d512534ea26308bc7d7d74ad339a0bd34bcaa4234c87"
+  },
+  "public_file_sha256": {
+    "_frozen_baseline.py": "8508c992ec03ee4562acc620ad06e8b0d41635c001df96ca433bc480d2bb9112",
+    "probe_view_transition.py": "8062c78ccbd823ea130149057b54335eed12a4c512bb4018235a7e9a9c3eec3f",
+    "probe_admission_interactions.py": "78b16b230b8f02f01e823ac0b54319f09a35e0b3150ee1a9c506bb1cb5a707b7",
+    "view-transition-results.jsonl": "4ebacf6312ffac157fb0b70abd8ace21e1deb77b993637b938716a9e2878bf2a",
+    "admission-interaction-results.jsonl": "bf6be335a055f3dbb13f69859eb46fde6d8a243bf1a76ac046f5cb2358173445"
+  },
+  "launcher_validation": {
+    "view_transition_exit": 0,
+    "admission_interactions_exit": 0,
+    "matches_retained_outputs": true,
+    "modified_checkout_refusal_exit": 1
+  },
+  "zero_exit_meaning": "Baseline counterexample assertions passed, not that the implementation satisfied the desired invariant.",
+  "findings": {
+    "R1_control": {
+      "settled": true,
+      "tick": 36,
+      "applied_records": 3,
+      "issued_signatures": 16,
+      "child_exits": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "R1_fault": {
+      "settled": false,
+      "tick": 232,
+      "sequence": 0,
+      "view": 1,
+      "mode": "CHANGING",
+      "all_three_honest_deadlines_null": true,
+      "node0_view_change_intent_absent": true,
+      "applied_records": 0,
+      "issued_signatures": 7,
+      "child_exits": [
+        -9,
+        0,
+        0,
+        0,
+        0
+      ],
+      "all_children_exited": true
+    },
+    "R2": {
+      "cycles": 150,
+      "vote_buckets": 300,
+      "references": 2,
+      "requests": 2,
+      "pending": 2,
+      "bodies": 0,
+      "durable_head_unchanged": true,
+      "halt": "",
+      "auditor_retained_byzantine_issued_signatures": 600
+    },
+    "R3": {
+      "qualifying_reports": 0,
+      "deadline_created_by_remote_offer": 60,
+      "view_after_timeout": 2
+    }
+  },
+  "scope_limits": [
+    "synthetic identities, authentication, fixed membership and anchors",
+    "R1 real process kill/reopen; R2 and R3 same-process disk simulator",
+    "checker safety success is not liveness or resource-bound proof",
+    "temporary stores cleaned by original probes; bounded stdout retained, not a full per-event runtime stream",
+    "not machine-power-loss, production signer recovery, or deployment qualification"
+  ]
+}
