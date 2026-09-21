@@ -4,13 +4,16 @@ from copy import deepcopy
 
 from fm_application import Application, NeedData, InvalidValue, canonical, digest, value_id
 from fm_protocol import PROFILE, Proofs, Invalid, Exhausted, message, proposer
+from fm_admission import AdmissionMixin
+from fm_delivery import DeliveryMixin
+from fm_memory import update_durable
 
 
 class Crash(Exception):
     pass
 
 
-class Replica:
+class Replica(AdmissionMixin, DeliveryMixin):
     def __init__(self, index, n, signer, authenticate, snapshot, anchor, emit, clock, trace):
         self.index, self.n, self.f = index, n, (n - 1) // 3
         self.q = 2 * self.f + 1
@@ -60,8 +63,9 @@ class Replica:
         self.next_retry = self.clock() + PROFILE["timers"]["retry_ticks"]
         self.local_tip = self.d["anchor"]["height"]  # diagnostics only
         self.last_reason = ""
-        self.bodies.update(deepcopy(self.d["retained_bodies"]))
-        for rec in self.d["records"].values():
+        self.bodies.update({vid: deepcopy(body) for vid, body in self.d["retained_bodies"].items()
+                            if self.record and body["instance"] == self.record["instance"]})
+        for rec in [self.record] if self.record else []:
             if rec["body"] is not None:
                 self.bodies[value_id(rec["body"])] = deepcopy(rec["body"])
             for data in rec["accepted"].values():
@@ -77,15 +81,15 @@ class Replica:
                 self.headers.setdefault(key, deepcopy(qc["proposal"]))
             if self.record["mode"] == "ACTIVE" and (self.offers or self.headers):
                 self._timer()
+        self._admission_reset()
+        self._delivery_reset()
 
     def event(self, name, **info):
         self.trace(self.index, name, info)
 
     def _persist(self, mutate, reason, **evidence):
-        candidate = deepcopy(self.d)
-        mutate(candidate)
-        self.d = candidate
-        self.event("durable", reason=reason, **evidence)
+        self.d, self.last_memory_work = update_durable(self.d, mutate)
+        self.event("durable", reason=reason, memory_work=self.last_memory_work, **evidence)
 
     def _crash_at(self, point, phase=""):
         if self.cut == (point, phase):
@@ -161,11 +165,15 @@ class Replica:
         self.event("halt", reason=reason)
 
     def _send(self, kind, data, destination=None):
+        if not self._delivery_allow_send(kind, data, destination):
+            self.event("send_deferred", kind=kind, reason="RETRY_WORK_BUDGET")
+            return False
         if kind == "SIGNED":
             p = data["payload"]
             self.event("publish", auth=data["auth"], phase=p["phase"],
                        view=p["view"], sequence=p["instance"]["sequence"])
         self.emit(self.index, kind, deepcopy(data), destination)
+        return True
 
     def _sign(self, phase, value=None, **extra):
         r = self.record
@@ -214,6 +222,8 @@ class Replica:
             self._send("OFFER", body)
         except Exhausted as exc:
             self._halt(str(exc))
+        except (Invalid, InvalidValue) as exc:
+            self._refuse(str(exc), kind="OFFER")
 
     def _offer(self, body):
         if self.d["halt"]:
@@ -228,49 +238,31 @@ class Replica:
         self._timer()
         self._drive()
 
-    def _store_body(self, body):
-        vid = value_id(body)
-        if vid not in self.bodies and len(self.bodies) >= PROFILE["limits"]["objects"]:
-            raise Exhausted("BODY_CACHE_LIMIT")
-        self.bodies[vid] = deepcopy(body)
-        return vid
-
     def _valid_body(self, body, rec=None):
         rec = rec or self.record
+        self._missing_value = value_id(body)
         try:
             return Application(rec["before"]).validate(body, rec["instance"], rec["anchor_before"], self.anchors)
         except NeedData as exc:
             raise NeedData("anchor:" + str(exc)) from exc
 
     def _body(self, vid, rec=None):
+        self._missing_value = vid
         if vid not in self.bodies:
-            raise NeedData("body:" + vid)
+            retained = self._retained_body(vid, rec)
+            if retained is None:
+                raise NeedData("body:" + vid)
+            self._valid_body(retained, rec)
+            self._store_body(retained)
         body = self.bodies[vid]
         self._valid_body(body, rec)
         return body
-
-    def _need(self, wire, identity):
-        key = digest("TEST/PENDING/1", wire)
-        if key not in self.pending and len(self.pending) >= PROFILE["limits"]["inbox"]:
-            raise Exhausted("PENDING_LIMIT")
-        self.pending[key] = deepcopy(wire)
-        self._request_missing(identity)
-
-    def _request_missing(self, identity):
-        # Incoming work lives in pending; unfinished local work already lives
-        # in durable intents. Neither needs a replacement signed instruction.
-        self.last_reason = "NEED_DATA:" + str(identity)
-        self.event("defer", reason=self.last_reason)
-        if str(identity).startswith("body:"):
-            self._send("GET", {"type": "body", "id": str(identity)[5:]})
-        elif str(identity).startswith("anchor:"):
-            self._send("GET", {"type": "anchor", "id": str(identity)[7:]})
 
     def receive(self, kind, data, source):
         if not self.alive:
             return
         if len(self.inbox) >= PROFILE["limits"]["inbox"]:
-            self._halt("INBOX_LIMIT")
+            self._refuse("INBOX_PRESSURE")
             return
         try:
             if len(canonical(data)) > PROFILE["limits"]["proof_bytes"]:
@@ -294,6 +286,8 @@ class Replica:
                 self._need(wire, str(exc))
             except Exhausted as exhausted:
                 self._halt(str(exhausted))
+            except (Invalid, InvalidValue, KeyError, TypeError, ValueError) as refused:
+                self._refuse(str(refused), kind=kind)
         except Exhausted as exc:
             self._halt(str(exc))
         except (Invalid, InvalidValue, KeyError, TypeError, ValueError, RecursionError) as exc:
@@ -316,6 +310,8 @@ class Replica:
         return rec
 
     def _handle(self, kind, data, source):
+        if self._delivery_handle(kind, data, source):
+            return
         if kind == "OFFER":
             # Client ingress is synthetic. Each recipient independently checks
             # this exact body before retaining pending work; OFFER is not a vote.
@@ -333,24 +329,7 @@ class Replica:
                 self._send("DATA", {"type": data["type"], "id": data["id"], "object": cache[data["id"]]}, source)
             return
         if kind == "DATA":
-            if set(data) != {"type", "id", "object"}:
-                raise Invalid("DATA_SHAPE")
-            if data["type"] == "body":
-                if value_id(data["object"]) != data["id"]:
-                    raise Invalid("BODY_HASH")
-                self._store_body(data["object"])
-            elif data["type"] == "anchor":
-                from fm_application import make_anchor
-                obj = data["object"]
-                if make_anchor(obj["height"], obj["parent"]) != obj or obj["hash"] != data["id"]:
-                    raise Invalid("SYNTHETIC_ANCHOR_HASH")
-                if len(self.anchors) >= PROFILE["limits"]["objects"] and data["id"] not in self.anchors:
-                    raise Exhausted("ANCHOR_CACHE_LIMIT")
-                self.anchors[data["id"]] = deepcopy(obj)
-            else:
-                raise Invalid("DATA_TYPE")
-            self._retry_pending()
-            self._resume_intents()
+            self._admit_data(data, source)
             return
         if kind == "SIGNED":
             if not self.proofs.authenticate(data):
@@ -362,7 +341,10 @@ class Replica:
                 raise Invalid("UNKNOWN_PHASE")
             # Validate before retaining an unknown parent or replying to old
             # traffic. Authentication does not prove context or quorum weight.
-            self.proofs.check(kinds[p["phase"]], data, p["instance"])
+            try:
+                self.proofs.check(kinds[p["phase"]], data, p["instance"])
+            except Exhausted as exc:
+                raise Invalid("REFERENCE_RESOURCE_LIMIT:" + str(exc)) from exc
             rec = self._context(p["instance"])
             phase = p["phase"]
             if rec["applied"]:
@@ -370,8 +352,11 @@ class Replica:
                 self._send("CERT", rec["decision"], source)
                 return
             if phase == "PROPOSE":
+                self._reference(kind, data)
                 self._proposal(data)
             elif phase in ("PREPARE", "COMMIT"):
+                if not (self._reference_live(p["value"]) or (p["view"], p["value"]) in self.headers):
+                    raise Invalid("UNREFERENCED_VOTE")
                 self.proofs.check("prepare_vote" if phase == "PREPARE" else "commit_vote", data, rec["instance"])
                 key = (p["view"], p["value"], phase)
                 self.votes.setdefault(key, {})[p["sender"]] = deepcopy(data)
@@ -380,16 +365,19 @@ class Replica:
             elif phase == "VIEW_CHANGE":
                 self._view_change(data)
             elif phase == "NEW_VIEW":
+                self._reference(kind, data)
                 self._new_view(data)
             else:
                 raise Invalid("UNKNOWN_PHASE")
         elif kind == "PREPARED":
+            self._reference(kind, data)
             p = data["proposal"]["payload"]
             self.proofs.check("prepared", data, p["instance"])
             rec = self._context(p["instance"])
             if not rec["applied"]:
                 self._prepared(data)
         elif kind == "CERT":
+            self._reference(kind, data)
             self._certificate(data)
         else:
             raise Invalid("UNKNOWN_WIRE_KIND")
@@ -562,14 +550,20 @@ class Replica:
             else:
                 return
             body = self._body(value)
-            self._send("DATA", {"type": "body", "id": value, "object": body})
-            self._sign("PROPOSE", value, new_view=nv)
+            signed = self._sign("PROPOSE", value, new_view=nv)
+            if signed is not None:
+                self._send("DATA", {"type": "body", "id": value, "object": body,
+                                    "reference": {"kind": "SIGNED", "data": signed}})
 
     def _certificate(self, cert):
         p = cert["prepared"]["proposal"]["payload"]
         self.proofs.check("commit", cert, p["instance"])
         rec = self._context(p["instance"])
         p = self.proofs.check("commit", cert, rec["instance"])
+        if rec["applied"]:
+            if rec["decision"]["prepared"]["proposal"]["payload"]["value"] != p["value"]:
+                self._halt("CONFLICTING_DECISIONS")
+            return
         body = self._body(p["value"], rec)
         if rec["decision"] is not None:
             old = rec["decision"]["prepared"]["proposal"]["payload"]["value"]
@@ -604,30 +598,8 @@ class Replica:
         self.deadline = None
         self._retry_pending()
 
-    def _retry_pending(self):
-        pending, self.pending = list(self.pending.values()), {}
-        for wire in pending:
-            self.receive(wire["kind"], wire["data"], wire["source"])
-
     def retry(self):
-        if not self.alive:
-            return
-        self._resume_intents()
-        for value in sorted(self.offers):
-            if value in self.bodies:
-                self._send("OFFER", self.bodies[value])
-        # Publication of exact retained signatures is allowed even after a timeout;
-        # signing a new old-view message is not. No signature is erased.
-        for rec in self.d["records"].values():
-            if rec["decision"] is not None:
-                self._send("CERT", rec["decision"])
-                continue
-            for signed in rec["signed"].values():
-                self._send("SIGNED", signed)
-            for accepted in rec["accepted"].values():
-                body = accepted["body"]
-                self._send("DATA", {"type": "body", "id": value_id(body), "object": body})
-        self._retry_pending()
+        self._retry_delivery()
 
     def tick(self):
         if not self.alive:

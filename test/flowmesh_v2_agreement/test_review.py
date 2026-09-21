@@ -80,7 +80,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(node.last_reason, "AUTHENTICATION")
         self.assertFalse(s.authentication.issued)
 
-    def test_authenticated_missing_data_exhaustion_halts_without_erasure(self):
+    def test_authenticated_irrelevant_future_votes_do_not_halt_or_forget_obligations(self):
         s = Simulator(Fixture().model.snapshot(), byzantine=(3,))
         node = s.nodes[0]
         s.offer()
@@ -91,12 +91,19 @@ class ReviewTests(unittest.TestCase):
                                                             digest("unavailable", i)))
             node.receive("SIGNED", packet, 3)
             node.pump()
-        self.assertEqual(node.d["halt"], "PENDING_LIMIT")
-        self.assertEqual(len(node.pending), PROFILE["limits"]["inbox"])
+        self.assertFalse(node.d["halt"])
+        self.assertFalse(node.pending)
+        self.assertFalse(node.requests)
+        self.assertEqual(node.last_reason, "MISSING_PARENT_NOT_RETAINED")
+        self.assertLessEqual(len(node._history_sent), node.n)
         self.assertEqual(node.record["signed"], obligations)
         node.restart()
-        self.assertEqual(node.d["halt"], "PENDING_LIMIT")
+        self.assertFalse(node.d["halt"])
         self.assertEqual(node.record["signed"], obligations)
+        s.run(stop=lambda sim: sim.settled())
+        self.assertTrue(s.settled())
+        for slot, signed in obligations.items():
+            self.assertEqual(node.d["records"][0]["signed"][slot], signed)
         check(s)
 
 
