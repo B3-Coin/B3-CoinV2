@@ -102,6 +102,31 @@ class AdmissionTests(unittest.TestCase):
         body = s.offer(nodes=[0])
         self.finish(s, value_id(body))
 
+    def test_remote_offer_pressure_cannot_poison_next_local_request(self):
+        s = self.simulator()
+        node = s.nodes[1]  # not the initial proposer; next sequence's proposer
+        before = node.d["snapshot"]
+        for amount in range(256):
+            node.receive("OFFER", self.body(s, 1000 + amount), 3)
+            node.pump()
+        s.record(1, "remote_offer_pressure_observation", {
+            "cached_bodies": len(node.bodies), "offers": len(node.offers),
+            "retained_bodies": len(node.d["retained_bodies"]), "halt": node.d["halt"]})
+        self.assertEqual(node.d["snapshot"], before)
+        s.offer(nodes=[0])
+        s.run(350, stop=lambda sim: sim.settled())
+        self.assertTrue(s.settled())
+        # Completing the first decision must not leave a permanent storage
+        # poison pill that stops this honest proposer's next client request.
+        s.offer(nodes=[1])
+        s.record(1, "next_local_offer_observation", {
+            "retained_bodies": len(node.d["retained_bodies"]),
+            "halt": node.d["halt"], "sequence": node.d["sequence"]})
+        self.assertFalse(node.d["halt"])
+        s.run(350, stop=lambda sim: sim.settled(2))
+        self.assertTrue(s.settled(2))
+        self.audit(s)
+
     def test_wrong_hash_malformed_and_oversized_bodies_are_refused(self):
         for case in ("wrong_hash", "malformed", "extra_field", "oversized"):
             with self.subTest(case=case):
