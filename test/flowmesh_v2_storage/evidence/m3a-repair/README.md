@@ -39,9 +39,11 @@ matched the retained logs. A modified checkout was refused with exit 1.
 | R2 exact 150-cycle churn | 300 received-vote buckets despite only 2 references, 2 requests, 2 pending entries and 0 bodies. Durable head unchanged; no permanent signing halt. |
 | R3 remote OFFER while CHANGING | Zero reports and initially no deadline; OFFER created deadline 60, then expiry advanced to view 2. |
 
-Both launchers returned **0** because their original assertions intentionally
-verify these counterexamples. That is not a pass of the desired progress,
-retention or timer invariants.
+Both launchers returned **0**. R1 explicitly asserts its control and stalled
+outcomes. R2/R3 print the observations above while checking setup and signing
+safety; their original scripts do not assert every reported final count.
+Zero exit is therefore not a pass of the desired progress, retention or timer
+invariants. The new repair regressions assert those properties separately.
 
 R1 uses separate child processes. The no-kill control exits were
 `[0, 0, 0, 0]`; the fault scenario exits were `[-9, 0, 0, 0, 0]`, including

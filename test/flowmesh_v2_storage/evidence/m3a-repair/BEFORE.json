@@ -24,7 +24,7 @@
     "matches_retained_outputs": true,
     "modified_checkout_refusal_exit": 1
   },
-  "zero_exit_meaning": "Baseline counterexample assertions passed, not that the implementation satisfied the desired invariant.",
+  "zero_exit_meaning": "Probe execution completed. R1 explicitly asserts the stall/control; R2/R3 final outcomes are printed observations, not complete outcome assertions. None is a pass of the desired repaired invariants.",
   "findings": {
     "R1_control": {
       "settled": true,
