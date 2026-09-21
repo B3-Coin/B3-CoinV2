@@ -61,6 +61,16 @@ does not itself renew authority. Strong validated quorum evidence can displace
 disposable reference metadata when the global table is full. Existing durable
 obligations do not depend on lease survival.
 
+Remote `OFFER` ingress is also bounded: at most 32 disposable validated
+candidate offers, **not** automatic durable client acknowledgements. Local
+synthetic client ingress retains its existing durable exact-body contract.
+When a remote candidate is actually chosen for first signing, its exact body
+is persisted atomically with the intent in that instance's `intent_bodies`.
+Those entries are bounded by the existing phase/view slots, restored on
+restart and never discarded as junk. Cache eviction may drop unselected
+remote offers; the originating durable client offer supplies normal retries.
+This closes the additional bypass found during the partial internal review.
+
 Unknown future-parent traffic is not retained as an unbounded pending proof.
 It prompts bounded discovery of the receiver's own next missing certificate;
 the sender must retry once preceding history is applied. No peer-supplied
@@ -81,6 +91,7 @@ signer. Genuine failure to retain indispensable state remains a safety stop.
 | Body/anchor caches, inbox, pending/reference/request metadata | Bounded disposable state; refuse, expire or evict only unprotected entries |
 | Current accepted proposal/body; prepared proof; exact signing intent; accepted NEW_VIEW; known decision | Durable records remain authoritative; referenced current bodies and their available ancestry are protected from cache eviction |
 | Locally offered exact work | Retained durably under its original instance and protected while pending; never rebased into a replacement action |
+| Remote offered candidates | Bounded disposable pool until selection; before signing, the chosen body becomes durable intent evidence, not a peer-created unlimited durable obligation |
 | Historical decisions, bodies, issued votes, application markers | Not pruned by this repair; indexed retrieval serves catch-up, while the independent checker can still inspect every issued vote |
 
 After advancing to the next applied sequence, the previous body's *cache*
@@ -229,13 +240,27 @@ Failed attempts retained during development:
   harness had already provided every anchor, so the intended missing-ancestry
   path was not reached. The fixture now uses supported restart to lose only
   volatile ancestry, then tests actual deferral and recovery; all 13 pass.
+- First new remote-proposal crash-boundary test: four subcase failures because
+  the fixture expected a Python exception to escape `pump`. The supported
+  crash handler intentionally absorbs that exception. The corrected fixture
+  asserts the actual dead replica and exact crash event, then verifies preserved
+  intent/body/signatures and recovery. No production or model crash behavior
+  was changed to satisfy it.
+
+The additional failing-before remote-OFFER case is frozen at
+`99e9b5dc3038e43689c6c771f7831ae72c7d43d1`; its
+[failure trace](evidence/before-remote-offer-pressure.json) shows 256 peer
+offers creating 256 durable retained bodies, followed by `RETAINED_BODY_LIMIT`
+at sequence 1 on the next legitimate local request. The unchanged regression
+now requires both sequences to finish without a reset. Remote-candidate
+publication-boundary and full-inbox restart regressions supplement it.
 
 ## Qualification and review record
 
 Working-tree and final clean-tree tests, the one focused fresh-context internal
 review, any successor repair, publication identity and hosted CI evidence must
-be distinguished. See the separate closeout record added after those checks;
-this document does not predeclare their result.
+be distinguished. See [the closeout record](MILESTONE_2_1_REVIEW.md); this
+document does not predeclare hosted CI success.
 
 Publication must preserve all frozen ancestors. Only this dedicated model
 branch is authorized; no PR, tag, merge, production branch or deployment.
