@@ -6,11 +6,15 @@ before implementing transitions. Frozen accounting is unchanged at
 `2b32645e26f4ba41de8aa746bd04e84192fb3972`.
 
 Profile: [`TEST_PROFILE.json`](TEST_PROFILE.json),
-`flowmesh-v2-single-sequence-pbft-test/2`. The original `/1` protocol and
+`flowmesh-v2-single-sequence-pbft-test/3`. The original `/1` protocol and
 counterexamples remain in frozen history at
 `0247001a04588fccbadf63bb9d4a8704dcaf5b2c`. The
 [Milestone 2.1 delivery supplement](MILESTONE_2_1.md) specifies `/2`'s
 non-voting admission/retry changes; the voting predicates below are unchanged.
+The [Milestone 3A repair supplement](../flowmesh_v2_storage/REPAIR_R1_R2_R3.md)
+records `/3`'s bounded received-vote policy, atomic view-entry/report intent,
+and enforcement of the already specified timer predicate. Frozen `/2`
+and its failing-before evidence remain at `1d022dbf0da63636d6d43650d3864222761497a1`.
 Reference: Castro/Liskov, [PBFT, OSDI 1999 §4.2–4.5](https://www.usenix.org/legacy/publications/library/proceedings/osdi99/full_papers/castro/castro_html/node4.html).
 R1 mapping: [C1–C6](../../doc/design/v2-stage0-r1-consensus.md).
 The shared concepts are authenticated proposal, preparation, commitment, and
@@ -127,6 +131,14 @@ durable records. Active pending work regains a timer; a CHANGING node still
 waits for the specified report quorum. A decided-but-unapplied node missing
 anchor evidence requests that exact evidence and resumes the same decision;
 it neither signs replacement work nor mistakes that decision for application.
+
+View entry and the exact VIEW_CHANGE report intent now commit atomically.
+The report carries the locally retained highest preparation at that transition;
+the following ordinary intent/signature persistence and exact publication
+path is unchanged. An interrupted transition either leaves the old view or
+the new view with its report intent, never a new view without that obligation.
+All timer callers use ACTIVE, or CHANGING with q validated same-target reports;
+request data, queued work and restart cannot stand in for those reports.
 
 An unfinished candidate-signing intent likewise revalidates its exact body
 against locally available anchor evidence before its **first** signature.

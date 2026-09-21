@@ -1,13 +1,13 @@
 # FlowMesh V2 Milestone 2.1 — bounded admission and recovery delivery
 
 **Local model for review, not production consensus or deployment.**
-Branch: `model/flowmesh-v2-agreement-test1`. Frozen Milestone 1 remains unchanged
+Ongoing branch: `flowmeshV2-dev`. Frozen Milestone 1 remains unchanged
 at `9d4fd53dc7d58d397680fd64065663703cbbdd17`; R1 remains unchanged at
 `2b32645e26f4ba41de8aa746bd04e84192fb3972`.
 
 The original [protocol/transition table](PROTOCOL.md) and profile were committed
 before Milestone 2 transitions. Milestone 2.1's
-[versioned profile](TEST_PROFILE.json) is `/2`; its bounded non-voting delivery
+[versioned profile](TEST_PROFILE.json) was `/2`; its bounded non-voting delivery
 changes, preserved failures and qualification are specified in
 [MILESTONE_2_1.md](MILESTONE_2_1.md). No voting predicate or quorum changes.
 [Results and counterexamples](RESULTS.md) distinguish tested recovery from
@@ -16,6 +16,11 @@ branch/draft-PR publication, one bounded separate-context review and successor
 repair are recorded in [POST_FIX_REVIEW.md](POST_FIX_REVIEW.md). The frozen
 milestone and its earlier failure evidence are preserved. No release,
 activation or production integration is part of this milestone.
+
+The current profile is `/3`. The separate
+[Milestone 3A repair](../flowmesh_v2_storage/REPAIR_R1_R2_R3.md) addresses the
+three reproduced review findings; prior milestone reports remain historical.
+The completed correction requires external re-review.
 
 ## Reproduce from repository root
 
@@ -27,7 +32,8 @@ python3.14 -B ci/run_flowmesh_models.py
 ```
 
 This is the same bounded command as the dedicated GitHub model workflow. It
-runs both complete suites plus nonempty/discovery guards with `PYTHONHASHSEED=0`.
+runs all accounting, agreement and storage suites plus nonempty/discovery
+guards with `PYTHONHASHSEED=0`.
 It fails on skipped tests, missing required modules or trimmed discovery.
 
 Use a clean checkout of the milestone revision. Its parent history contains

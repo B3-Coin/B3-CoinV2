@@ -4,7 +4,10 @@ This isolated test adapter persists the existing synthetic agreement model.
 It does not change accounting, agreement, authentication or economic rules,
 and does not integrate storage into a live node. The prior contract is
 [PLAN.md](PLAN.md); the versioned scope and bounds are
-[flowmesh-v2-disk-recovery-test/1](TEST_PROFILE.json). See also the existing
+[flowmesh-v2-disk-recovery-test/2](TEST_PROFILE.json). The original `/1`
+remains in frozen reviewed history; the store schema and codec remain version 1.
+The [R1/R2/R3 repair supplement](REPAIR_R1_R2_R3.md) records the successor
+implementation, tests and external re-review gate. See also the existing
 [agreement model](../flowmesh_v2_agreement/README.md),
 [protocol](../flowmesh_v2_agreement/PROTOCOL.md) and
 [accounting model](../flowmesh_v2_model/README.md).
@@ -75,8 +78,9 @@ simulate SQLite's internal VFS or a device's write cache.
 
 ## Bounded evidence
 
-The storage suite contains 55 test methods; subcases and seeded schedules add
-coverage within those methods.
+The frozen baseline contained the following 55 storage test methods; the
+repair supplement records added regressions and current complete counts.
+Subcases and seeded schedules are not counted as additional test methods.
 
 | File | Tests | Coverage |
 | --- | ---: | --- |
@@ -106,10 +110,10 @@ synthetic. These bounded tests do not establish machine power-loss durability,
 device cache behavior, real BLS/B3 verification, changing membership, live V1
 recovery, bridge validity, futures margin, WAN performance or 200 ms latency.
 
-The separate final DATA/OFFER/retry implementation review remains pending at
+Historical publication recorded a pending DATA/OFFER/retry review at
 `eb73e12d8b042f3ccdfd1e0d96701460e07f20d5`; use the
 [commit-pinned review map](../../doc/design/v2-milestone-2-1-publication.md).
-This implementation work, its [development findings](DEVELOPMENT_FINDINGS.md)
-and local/hosted tests do not replace that review or close its gate. Integrated
-safety qualification remains conditional on its findings and closure. No push
-or next milestone precedes review of this completed local milestone.
+The subsequent review of `1d022db` found R1/R2/R3. The repair supplement
+preserves its counterexamples and marks the completed correction for external
+re-review. Local/hosted automated tests do not close that gate. Publication is
+for review only; no next milestone or production deployment is approved here.

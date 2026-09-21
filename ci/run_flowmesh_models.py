@@ -44,12 +44,16 @@ SUITES = {
         "test_recovery.py": 13,
         "test_retry_bounds.py": 13,
         "test_review.py": 5,
+        "test_timer_eligibility.py": 7,
+        "test_vote_retention.py": 9,
     }),
     "storage": ("test/flowmesh_v2_storage", "test_*.py", 300, {
         "test_disk_store.py": 34,
         "test_process_recovery.py": 14,
         "test_storage_availability.py": 5,
         "test_storage_profile.py": 2,
+        "test_view_transition_repair.py": 6,
+        "test_admission_repair_disk.py": 3,
     }),
 }
 
