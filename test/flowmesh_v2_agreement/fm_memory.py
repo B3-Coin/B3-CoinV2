@@ -57,7 +57,7 @@ class _Changes(MutableMapping):
         return self.original
 
 
-def update_durable(old, mutate):
+def update_durable(old, mutate, before_commit=None):
     """Return ordinary durable dictionaries and counts; failure publishes none.
 
     Historical decisions and issued signatures are never pruned. Current-record
@@ -71,6 +71,10 @@ def update_durable(old, mutate):
     bodies = _Changes(old["retained_bodies"])
     candidate["records"], candidate["retained_bodies"] = records, bodies
     mutate(candidate)
+    # A TEST storage adapter may acknowledge these private changes before the
+    # shared memory maps are published. An exception leaves those maps intact.
+    if before_commit is not None:
+        before_commit(old, candidate)
     stats = {"records_copied": records.copies,
              "records_written": len(records.changed) + len(records.deleted),
              "bodies_copied": bodies.copies,

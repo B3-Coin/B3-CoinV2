@@ -1,0 +1,31 @@
+{
+  "profile_id": "flowmesh-v2-disk-recovery-test/1",
+  "test_only": true,
+  "baseline": "eb73e12d8b042f3ccdfd1e0d96701460e07f20d5",
+  "agreement_profile": "flowmesh-v2-single-sequence-pbft-test/2",
+  "accounting_and_agreement_rules": "unchanged",
+  "synthetic": ["authentication", "membership", "anchors", "custody", "clock", "delivery"],
+  "real": ["sqlite_files", "fsync_calls", "exclusive_local_process_lock", "spawned_children", "SIGKILL", "exit_status"],
+  "store_schema": 1,
+  "codec_version": 1,
+  "sqlite": {"journal_mode": "DELETE", "synchronous": "FULL"},
+  "limits": {
+    "journal_entries": 100000,
+    "journal_bytes": 268435456,
+    "database_bytes": 536870912,
+    "rows": 20000,
+    "row_bytes": 8388608,
+    "codec_bytes": 16777216,
+    "codec_depth": 64,
+    "child_call_seconds": 20
+  },
+  "process_campaign_members": 4,
+  "availability_members": [4, 7],
+  "schedule_seeds": [31031, 31032],
+  "retry_history_sizes": [1, 4, 16, 31],
+  "storage_fault_points": ["before_begin", "after_snapshot_row", "after_rows", "before_commit", "after_commit", "before_fsync", "after_fsync"],
+  "rollback": "external parent generation/digest required for known rollback; coherent backup without that observation is undetectable",
+  "platform": "cooperating POSIX processes on one local filesystem; no Windows or network-filesystem qualification",
+  "review_gate": "final DATA/OFFER/retry baseline implementation review remains pending",
+  "not_qualified": ["machine_power_loss", "storage_device_cache_behavior", "real_BLS", "B3_anchor_verification", "changing_membership", "live_V1_recovery", "bridge_verifier", "futures_margin", "WAN", "200ms"]
+}
