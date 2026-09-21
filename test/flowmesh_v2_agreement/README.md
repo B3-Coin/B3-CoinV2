@@ -1,12 +1,15 @@
-# FlowMesh V2 Milestone 2 — isolated agreement and recovery model
+# FlowMesh V2 Milestone 2.1 — bounded admission and recovery delivery
 
 **Local model for review, not production consensus or deployment.**
 Branch: `model/flowmesh-v2-agreement-test1`. Frozen Milestone 1 remains unchanged
 at `9d4fd53dc7d58d397680fd64065663703cbbdd17`; R1 remains unchanged at
 `2b32645e26f4ba41de8aa746bd04e84192fb3972`.
 
-The exact [protocol/transition table](PROTOCOL.md) and
-[versioned profile](TEST_PROFILE.json) were committed before the transitions.
+The original [protocol/transition table](PROTOCOL.md) and profile were committed
+before Milestone 2 transitions. Milestone 2.1's
+[versioned profile](TEST_PROFILE.json) is `/2`; its bounded non-voting delivery
+changes, preserved failures and qualification are specified in
+[MILESTONE_2_1.md](MILESTONE_2_1.md). No voting predicate or quorum changes.
 [Results and counterexamples](RESULTS.md) distinguish tested recovery from
 safe stalls and later production work. The subsequently authorized dedicated
 branch/draft-PR publication, one bounded separate-context review and successor
@@ -20,9 +23,12 @@ Python standard library only; executed using Python 3.14.6. There is no node
 build, running service, wallet, key, network connection or third-party package.
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/flowmesh_v2_agreement -p 'test_*.py' -v
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/flowmesh_v2_model -p 'test_*.py' -v
+python3.14 -B ci/run_flowmesh_models.py
 ```
+
+This is the same bounded command as the dedicated GitHub model workflow. It
+runs both complete suites plus nonempty/discovery guards with `PYTHONHASHSEED=0`.
+It fails on skipped tests, missing required modules or trimmed discovery.
 
 Use a clean checkout of the milestone revision. Its parent history contains
 all accounting and R1 prerequisites; no untracked snapshots are needed.
@@ -38,6 +44,12 @@ deadlines are abstract ticks, never milliseconds.
   their own signing capability and verification callback.
 - `fm_replica.py`: per-replica inbox, timers, durable/volatile state, safe view
   change, replay, exact-data retrieval and exactly-once committed application.
+- `fm_admission.py`: context/reference/preview checks and bounded disposable
+  body, anchor, reference and missing-data queues.
+- `fm_delivery.py`: bounded exact retries, recent commitments and non-voting
+  STATUS/GET_CERT historical discovery; no full-history selection walk.
+- `fm_memory.py`: model-only atomic updates copying touched records, not the
+  entire history. This is not filesystem or rollback-recovery qualification.
 - `fm_simulator.py`: deterministic scheduling, partitions, losses, delays,
   duplication and supported crashes. No live FlowMesh transport modification.
 - `fm_checker.py`: separately written proof/ancestry and temporal-state audit.
@@ -59,8 +71,9 @@ consensus scenarios.
 The model assumes trusted synthetic genesis, fixed equal-weight membership,
 exclusive signer ownership, stable acknowledged memory and eventual timely
 delivery for progress. It does not establish disk/power-loss durability or
-detect an undetectably restored coherent old backup. Resource exhaustion
-stops the relevant model run/signing path; it never resets safety state.
+detect an undetectably restored coherent old backup. Genuine safety-storage or
+audit exhaustion stops the relevant model run/signing path. Disposable network
+pressure uses bounded rejection/backpressure instead; neither resets safety state.
 
 Mainnet bootstrap/cutover, lineage expiry, membership transitions, genuine
 stake-weighted PoS V2, authenticated B3 custody, bridge AssetId/RegistryId and

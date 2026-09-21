@@ -6,7 +6,11 @@ before implementing transitions. Frozen accounting is unchanged at
 `2b32645e26f4ba41de8aa746bd04e84192fb3972`.
 
 Profile: [`TEST_PROFILE.json`](TEST_PROFILE.json),
-`flowmesh-v2-single-sequence-pbft-test/1`.
+`flowmesh-v2-single-sequence-pbft-test/2`. The original `/1` protocol and
+counterexamples remain in frozen history at
+`0247001a04588fccbadf63bb9d4a8704dcaf5b2c`. The
+[Milestone 2.1 delivery supplement](MILESTONE_2_1.md) specifies `/2`'s
+non-voting admission/retry changes; the voting predicates below are unchanged.
 Reference: Castro/Liskov, [PBFT, OSDI 1999 §4.2–4.5](https://www.usenix.org/legacy/publications/library/proceedings/osdi99/full_papers/castro/castro_html/node4.html).
 R1 mapping: [C1–C6](../../doc/design/v2-stage0-r1-consensus.md).
 The shared concepts are authenticated proposal, preparation, commitment, and
@@ -96,10 +100,10 @@ timer/deadline, pending data/retry work and local diagnostic tip.
 | Accept NEW_VIEW | Scheduled signature, exact I, q reports, verified highest selection, valid body; target >= current | Persist NV and ACTIVE path for its exact value, then accept matching PROPOSE; do not require omitted local QC in report set; never replace a decision |
 | Old proposal/vote | Authenticated but abandoned view | May complete evidence; no fresh old-view vote, backwards view movement or timer reset |
 | Complete CommitQC | Valid full proof from any view; valid available body; exact current or recorded I | Record immutable decision; apply cloned preview and application marker atomically/replay-safely; only then client-visible completion and next sequence |
-| Missing body/anchor/parent | Valid reference but local evidence unavailable | Bounded defer and request exact missing object; no vote/guess/rewritten candidate. Retry when data or prior decision arrives |
+| Missing body/anchor/parent | Valid relevant reference but local evidence unavailable | Bounded body/anchor defer and exact request; unknown future-instance messages are not retained, and trigger bounded discovery of the local next certificate. No vote/guess/rewritten candidate |
 | Duplicate final proof | Same decided ValueId (any valid signer subset) | No second execution, economic effect, or next-sequence allocation |
 | Conflicting valid decision | Same I, different ValueId | SAFETY_HALT with evidence; never reverse finalized value |
-| Storage/freshness/resource failure | Injection, known rollback, configured bound | Explicit signing unavailable/halt; preserve all acknowledged obligations. Resource limits do not reset safety state |
+| Storage/freshness/resource failure | Injection, known rollback, indispensable safety/audit bound | Explicit signing unavailable/halt; preserve all acknowledged obligations. Disposable network/cache pressure instead refuses/evicts/retries under the supplement; it does not reset safety state |
 
 Late learned preparation is retained for future reports, never used to rewrite
 an already signed report for the same tuple. A report may only carry preparation
