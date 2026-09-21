@@ -218,7 +218,12 @@ class Replica(AdmissionMixin, DeliveryMixin):
         return signed
 
     def _timer(self):
-        if self.deadline is None and self.record:
+        r = self.record
+        # Request data is not view-change evidence. Every caller, including
+        # OFFER/retry/restart, uses the same protocol eligibility predicate.
+        eligible = r and (r["mode"] == "ACTIVE" or (
+            r["mode"] == "CHANGING" and len(self.reports.get(r["view"], {})) >= self.q))
+        if self.deadline is None and eligible:
             ticks = min(PROFILE["timers"]["maximum_ticks"],
                         PROFILE["timers"]["initial_ticks"] * (2 ** self.record["view"]))
             self.deadline = self.clock() + ticks
@@ -369,11 +374,8 @@ class Replica(AdmissionMixin, DeliveryMixin):
                 self._reference(kind, data)
                 self._proposal(data)
             elif phase in ("PREPARE", "COMMIT"):
-                if not (self._reference_live(p["value"]) or (p["view"], p["value"]) in self.headers):
-                    raise Invalid("UNREFERENCED_VOTE")
                 self.proofs.check("prepare_vote" if phase == "PREPARE" else "commit_vote", data, rec["instance"])
-                key = (p["view"], p["value"], phase)
-                self.votes.setdefault(key, {})[p["sender"]] = deepcopy(data)
+                self._retain_received_vote(data)
                 self.event("vote_received", phase=phase, sender=p["sender"], value=p["value"], view=p["view"])
                 self._aggregate()
             elif phase == "VIEW_CHANGE":
@@ -486,7 +488,15 @@ class Replica(AdmissionMixin, DeliveryMixin):
             self.event("defer", reason=self.last_reason)
             return
         seq = self.d["sequence"]
-        self._persist(lambda d: d["records"][seq].update(view=target, mode="CHANGING"), "enter_view:" + reason)
+        report = message("VIEW_CHANGE", self.index, r["instance"], target,
+                         prepared=deepcopy(r["highest"]), decision=None)
+        def enter_view(d):
+            record = d["records"][seq]
+            record.update(view=target, mode="CHANGING")
+            # Persist the exact report obligation with view entry. A crash
+            # cannot expose CHANGING without the intent restart must resume.
+            record["intents"][("VIEW_CHANGE", target)] = deepcopy(report)
+        self._persist(enter_view, "enter_view:" + reason)
         self.deadline = None
         self._sign("VIEW_CHANGE", prepared=self.record["highest"], decision=None)
 
@@ -614,6 +624,9 @@ class Replica(AdmissionMixin, DeliveryMixin):
         self._retry_pending()
 
     def retry(self):
+        # Separate fixed-cap admission cleanup from the delivery-work budget;
+        # neither operation walks accumulated durable/audit history.
+        self._expire_admission()
         self._retry_delivery()
 
     def tick(self):

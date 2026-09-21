@@ -29,7 +29,8 @@ PROCESS_RESULTS = []
 def _view(node):
     names = ("d", "anchors", "alive", "deadline", "next_retry", "last_reason",
              "retry_work", "bodies", "offers", "local_offers", "references",
-             "requests", "pending", "headers", "history_requests")
+             "requests", "pending", "headers", "history_requests", "votes",
+             "reports", "last_vote_cleanup_work")
     return {name: deepcopy(getattr(node, name)) for name in names}
 
 

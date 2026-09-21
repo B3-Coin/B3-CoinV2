@@ -10,6 +10,88 @@ class AdmissionMixin:
     def _admission_reset(self):
         self.requests, self.references = {}, {}
         self._missing_value = None
+        self.last_vote_cleanup_work = dict(buckets_inspected=0, buckets_expired=0,
+            buckets_retained=0, votes_retained=0, protected_slots=0,
+            obligation_entries_inspected=0)
+
+    def _protected_vote_slots(self):
+        """Only the bounded current record can protect a received-vote bucket.
+
+        Headers/references alone are not signing obligations. Protection is
+        exact in both view and value; reusing a protected hash in another view
+        cannot make an unsolicited received-vote bucket immortal. Durable
+        records and the independent issued-signature audit are never pruned.
+        """
+        r = self.record
+        if r is None:
+            return set(), 0
+        slots, inspected = set(), 0
+        for entry in r["accepted"].values():
+            p = entry["signed"]["payload"]
+            slots.add((p["view"], p["value"]))
+            inspected += 1
+        for slot in r["prepared"]:
+            slots.add(slot)
+            inspected += 1
+        for p in r["intents"].values():
+            if p["value"] is not None:
+                slots.add((p["view"], p["value"]))
+            inspected += 1
+        for signed in r["new_views"].values():
+            p = signed["payload"]
+            slots.add((p["view"], p["value"]))
+            inspected += 1
+        return slots, inspected
+
+    def _vote_reference_live(self, key):
+        view, value, _ = key
+        ref = self.references.get(value)
+        return bool(ref and ref["expires"] > self.clock()
+                    and self.record and ref["instance"] == self.record["instance"]
+                    and ref["view"] == view
+                    and (view >= self.record["view"] or ref["strong"]))
+
+    def _expire_received_votes(self):
+        protected, inspected = self._protected_vote_slots()
+        work = dict(buckets_inspected=0, buckets_expired=0,
+                    obligation_entries_inspected=inspected,
+                    protected_slots=len(protected), votes_retained=0)
+        # Admission caps this entire table, including protected buckets. A
+        # cleanup pass never scans campaign history or an ever-growing cache.
+        expired = []
+        for key, votes in self.votes.items():
+            work["buckets_inspected"] += 1
+            if key[:2] not in protected and not self._vote_reference_live(key):
+                expired.append(key)
+            else:
+                work["votes_retained"] += len(votes)
+        for key in expired:
+            self.votes.pop(key)
+        work["buckets_expired"] = len(expired)
+        work["buckets_retained"] = len(self.votes)
+        self.last_vote_cleanup_work = work
+        if work["buckets_expired"]:
+            self.event("vote_cache_expired", **work)
+        return protected
+
+    def _retain_received_vote(self, signed):
+        """Retain an already verified, context-matched PREPARE/COMMIT vote."""
+        protected = self._expire_admission()
+        p = signed["payload"]
+        key = (p["view"], p["value"], p["phase"])
+        if key[:2] not in protected and not self._vote_reference_live(key):
+            raise Invalid("UNREFERENCED_VOTE")
+        if key not in self.votes and len(self.votes) >= PROFILE["admission"]["received_vote_buckets"]:
+            # Reserve recovery opportunities for an established obligation.
+            # Disposable pressure never deletes protected evidence or halts
+            # signing. Otherwise exact votes remain retransmittable by peers.
+            disposable = next((old for old in self.votes if old[:2] not in protected), None)
+            if key[:2] in protected and disposable is not None:
+                self.votes.pop(disposable)
+                self.event("cache_evicted", type="received_vote_bucket", identity=list(disposable))
+            else:
+                raise Invalid("RECEIVED_VOTE_PRESSURE")
+        self.votes.setdefault(key, {})[p["sender"]] = deepcopy(signed)
 
     def _refuse(self, reason, **info):
         self.last_reason = reason
@@ -110,10 +192,12 @@ class AdmissionMixin:
         for key, req in list(self.requests.items()):
             if req["expires"] <= self.clock() or req["sequence"] != self.d["sequence"]:
                 self.requests.pop(key)
+        protected_values = self._protected_values()
         for vid, ref in list(self.references.items()):
             if ref["instance"]["sequence"] != self.d["sequence"] or (
-                    ref["expires"] <= self.clock() and vid not in self._protected_values()):
+                    ref["expires"] <= self.clock() and vid not in protected_values):
                 self.references.pop(vid)
+        return self._expire_received_votes()
 
     def _store_body(self, body):
         vid = value_id(body)
