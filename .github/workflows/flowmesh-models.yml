@@ -11,6 +11,7 @@ on:
     paths:
       - 'test/flowmesh_v2_model/**'
       - 'test/flowmesh_v2_agreement/**'
+      - 'test/flowmesh_v2_storage/**'
       - 'ci/run_flowmesh_models.py'
       - 'ci/test_flowmesh_models_runner.py'
       - '.github/workflows/flowmesh-models.yml'
@@ -25,7 +26,7 @@ concurrency:
 
 jobs:
   models:
-    name: Accounting and agreement (Python 3.14)
+    name: Accounting, agreement and storage (Python 3.14)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -35,5 +36,5 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.14'
-      - name: Run both complete suites and discovery guards
+      - name: Run complete model/storage suites and discovery guards
         run: python3.14 -B ci/run_flowmesh_models.py

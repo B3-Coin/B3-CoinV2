@@ -5,7 +5,7 @@ From the repository root: python3.14 -B ci/run_flowmesh_models.py
 Python 3.14 is the tested baseline. Only the standard library is required.
 The accounting and agreement suites retain their predetermined campaign seeds;
 this runner additionally fixes Python's hash seed and isolates their imports.
-Every test_*.py below either model directory is discovered automatically.
+Every test_*.py below each model or storage directory is discovered automatically.
 """
 
 from collections import Counter
@@ -44,6 +44,12 @@ SUITES = {
         "test_recovery.py": 13,
         "test_retry_bounds.py": 13,
         "test_review.py": 5,
+    }),
+    "storage": ("test/flowmesh_v2_storage", "test_*.py", 300, {
+        "test_disk_store.py": 34,
+        "test_process_recovery.py": 14,
+        "test_storage_availability.py": 5,
+        "test_storage_profile.py": 2,
     }),
 }
 
