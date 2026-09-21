@@ -5,6 +5,7 @@ name: FlowMesh models
 on:
   push:
     branches:
+      - 'flowmeshV2-dev'
       - 'model/flowmesh-v2-*'
   pull_request:
     paths:
