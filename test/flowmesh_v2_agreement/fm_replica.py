@@ -38,7 +38,7 @@ class Replica(AdmissionMixin, DeliveryMixin):
              "config": self.config, "epoch": 0, "set": self.set_id,
              "sequence": seq, "parent": d["parent"]}
         d["records"][seq] = {"instance": i, "view": 0, "mode": "ACTIVE", "accepted": {},
-            "new_views": {}, "prepared": {}, "highest": None, "intents": {}, "signed": {},
+            "new_views": {}, "prepared": {}, "highest": None, "intents": {}, "intent_bodies": {}, "signed": {},
             "decision": None, "body": None, "applied": False, "apply_count": 0,
             "before": d["snapshot"], "anchor_before": deepcopy(d["anchor"])}
 
@@ -57,6 +57,7 @@ class Replica(AdmissionMixin, DeliveryMixin):
     def _volatile(self):
         self.inbox = deque()
         self.bodies, self.anchors, self.offers = {}, {self.d["anchor"]["hash"]: deepcopy(self.d["anchor"])}, set()
+        self.local_offers = set()
         self.votes, self.headers, self.reports, self.pending = {}, {}, {}, {}
         self.announced = set()
         self.deadline = None
@@ -65,7 +66,9 @@ class Replica(AdmissionMixin, DeliveryMixin):
         self.last_reason = ""
         self.bodies.update({vid: deepcopy(body) for vid, body in self.d["retained_bodies"].items()
                             if self.record and body["instance"] == self.record["instance"]})
+        self.local_offers.update(self.bodies)
         for rec in [self.record] if self.record else []:
+            self.bodies.update(deepcopy(rec["intent_bodies"]))
             if rec["body"] is not None:
                 self.bodies[value_id(rec["body"])] = deepcopy(rec["body"])
             for data in rec["accepted"].values():
@@ -188,9 +191,14 @@ class Replica(AdmissionMixin, DeliveryMixin):
             self.event("refused", reason="DURABLE_SLOT_CONFLICT", phase=phase, view=v)
             return None
         if slot not in r["signed"]:
+            body = self._body(value) if value is not None else None
             self._crash_at("before_record", phase)
-            self._persist(lambda d: d["records"][seq]["intents"].__setitem__(slot, payload),
-                          "intent:" + phase, payload=payload)
+            def retain_intent(d):
+                record = d["records"][seq]
+                record["intents"][slot] = payload
+                if body is not None:
+                    record["intent_bodies"][value] = deepcopy(body)
+            self._persist(retain_intent, "intent:" + phase, payload=payload)
             self._crash_at("after_intent", phase)
             r = self.record
             # Test-only history for the independent oracle, not a voting input.
@@ -225,16 +233,22 @@ class Replica(AdmissionMixin, DeliveryMixin):
         except (Invalid, InvalidValue) as exc:
             self._refuse(str(exc), kind="OFFER")
 
-    def _offer(self, body):
+    def _offer(self, body, local=True):
         if self.d["halt"]:
             return
         self._valid_body(body)
+        vid = value_id(body)
+        if (not local and vid not in self.offers
+                and len(self.offers - self.local_offers) >= PROFILE["admission"]["remote_offers"]):
+            raise Invalid("REMOTE_OFFER_PRESSURE")
         self._store_body(body)
-        if value_id(body) not in self.d["retained_bodies"]:
+        if local and vid not in self.d["retained_bodies"]:
             if len(self.d["retained_bodies"]) >= PROFILE["limits"]["objects"]:
                 raise Exhausted("RETAINED_BODY_LIMIT")
-            self._persist(lambda d: d["retained_bodies"].__setitem__(value_id(body), deepcopy(body)), "offered_body")
-        self.offers.add(value_id(body))
+            self._persist(lambda d: d["retained_bodies"].__setitem__(vid, deepcopy(body)), "offered_body")
+        if local:
+            self.local_offers.add(vid)
+        self.offers.add(vid)
         self._timer()
         self._drive()
 
@@ -319,7 +333,7 @@ class Replica(AdmissionMixin, DeliveryMixin):
             if rec["applied"]:
                 self._send("CERT", rec["decision"], source)
             else:
-                self._offer(data)
+                self._offer(data, local=False)
             return
         if kind == "GET":
             if set(data) != {"type", "id"}:
@@ -595,6 +609,7 @@ class Replica(AdmissionMixin, DeliveryMixin):
         self.event("applied", sequence=seq, value=value, result=body["result"])
         self._crash_at("after_application")
         self.votes, self.headers, self.reports, self.offers = {}, {}, {}, set()
+        self.local_offers.clear()
         self.deadline = None
         self._retry_pending()
 

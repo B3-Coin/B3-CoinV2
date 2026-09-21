@@ -30,6 +30,8 @@ class AdmissionMixin:
     def _retained_body(self, vid, rec=None):
         r = rec or self.record
         if r:
+            if vid in r["intent_bodies"]:
+                return r["intent_bodies"][vid]
             if r["body"] is not None and value_id(r["body"]) == vid:
                 return r["body"]
             for item in r["accepted"].values():
@@ -118,11 +120,12 @@ class AdmissionMixin:
         if vid in self.bodies:
             return vid
         if len(self.bodies) >= PROFILE["limits"]["objects"]:
-            protected = self._protected_values() | self.offers
+            protected = self._protected_values() | self.local_offers
             disposable = next((key for key in self.bodies if key not in protected), None)
             if disposable is None:
                 raise Invalid("BODY_CACHE_PRESSURE")
             self.bodies.pop(disposable)
+            self.offers.discard(disposable)
             self.event("cache_evicted", type="body", identity=disposable)
         self.bodies[vid] = deepcopy(body)
         self.event("cache_admitted", type="body", identity=vid, count=len(self.bodies))

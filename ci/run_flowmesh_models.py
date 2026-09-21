@@ -35,7 +35,7 @@ SUITES = {
         "test_validation.py": 9,
     }),
     "agreement": ("test/flowmesh_v2_agreement", "test_*.py", 300, {
-        "test_admission.py": 13,
+        "test_admission.py": 16,
         "test_agreement.py": 13,
         "test_application.py": 15,
         "test_checker.py": 35,

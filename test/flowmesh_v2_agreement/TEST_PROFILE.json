@@ -16,7 +16,7 @@
   "anchor": "synthetic authenticated finalized linear chain; no live B3 proof",
   "limits": {"views": 8, "sequences": 32, "messages": 20000, "inbox": 512, "objects": 256, "proof_bytes": 2097152, "proof_work": 20000, "proof_depth": 32, "events": 60000, "trace": 100000},
   "timers": {"initial_ticks": 30, "maximum_ticks": 240, "retry_ticks": 10},
-  "admission": {"references": 32, "references_per_slot": 2, "requests": 32, "pending": 32, "lease_ticks": 30},
+  "admission": {"references": 32, "references_per_slot": 2, "requests": 32, "pending": 32, "remote_offers": 32, "lease_ticks": 30},
   "delivery": {"records_per_retry": 4, "objects_per_retry": 96, "messages_per_retry": 256, "payload_bytes_per_retry": 33554432, "offers_per_retry": 4, "signatures_per_retry": 12, "accepted_per_retry": 4, "requests_per_retry": 8, "pending_per_retry": 8, "peer_requests": 32},
   "random_seeds": [45312, 45313, 45314, 45315, 45316, 45317, 45318, 45319],
   "provisional": ["all-replica PREPARE quorum rather than primary plus backup PREPARE count", "single outstanding decision", "JSON/SHA256 test codec", "bounded synthetic clocks and proof resources", "synthetic bootstrap/fixed membership/finality/authentication/storage"]

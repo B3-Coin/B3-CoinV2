@@ -127,6 +127,47 @@ class AdmissionTests(unittest.TestCase):
         self.assertTrue(s.settled(2))
         self.audit(s)
 
+    def test_remote_candidate_body_survives_each_proposer_publication_boundary(self):
+        for point in ("before_record", "after_intent", "after_record", "after_publish"):
+            with self.subTest(point=point):
+                s = self.simulator()
+                body = s.offer(body=self.body(s), nodes=[1])
+                leader = s.nodes[0]
+                leader.cut = (point, "PROPOSE")
+                self.assertTrue(s.deliver_where(lambda e: e.destination == 0 and e.source == 1
+                                                and e.kind == "OFFER"))
+                self.assertFalse(leader.alive)
+                self.assertTrue(any(e["event"] == "crash" and e["node"] == 0
+                                    and e["point"] == point for e in s.trace))
+                self.assertFalse(leader.d["retained_bodies"])
+                if point != "before_record":
+                    self.assertEqual(leader.record["intent_bodies"][value_id(body)], body)
+                old_intents = deepcopy(leader.record["intents"])
+                old_signed = deepcopy(leader.record["signed"])
+                leader.restart()
+                self.finish(s, value_id(body))
+                for slot, payload in old_intents.items():
+                    self.assertEqual(leader.d["records"][0]["intents"][slot], payload)
+                for slot, signed in old_signed.items():
+                    self.assertEqual(leader.d["records"][0]["signed"][slot], signed)
+
+    def test_full_disposable_inbox_preserves_accepted_vote_and_recovers(self):
+        s = self.simulator()
+        body = s.offer(body=self.body(s), nodes=[0])
+        node = s.nodes[1]
+        self.inline(s, node, body)
+        original = deepcopy(node.d)
+        for i in range(PROFILE["limits"]["inbox"] + 1):
+            junk = {"unrequested_invalid_body": i}
+            node.receive("DATA", {"type": "body", "id": value_id(junk), "object": junk}, 3)
+        self.assertEqual(node.last_reason, "INBOX_PRESSURE")
+        self.assertEqual(len(node.inbox), PROFILE["limits"]["inbox"])
+        self.assertEqual(node.d, original)
+        node.crash()
+        node.restart()
+        self.assertEqual(node.d, original)
+        self.finish(s, value_id(body))
+
     def test_wrong_hash_malformed_and_oversized_bodies_are_refused(self):
         for case in ("wrong_hash", "malformed", "extra_field", "oversized"):
             with self.subTest(case=case):
