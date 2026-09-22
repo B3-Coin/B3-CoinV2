@@ -40,6 +40,7 @@ SUITES = {
         "test_application.py": 15,
         "test_checker.py": 35,
         "test_exploration.py": 2,
+        "test_header_bounds.py": 10,
         "test_publication_recovery.py": 4,
         "test_recovery.py": 13,
         "test_retry_bounds.py": 13,
@@ -49,6 +50,7 @@ SUITES = {
     }),
     "storage": ("test/flowmesh_v2_storage", "test_*.py", 300, {
         "test_disk_store.py": 34,
+        "test_header_recovery_disk.py": 5,
         "test_process_recovery.py": 14,
         "test_storage_availability.py": 5,
         "test_storage_profile.py": 2,
