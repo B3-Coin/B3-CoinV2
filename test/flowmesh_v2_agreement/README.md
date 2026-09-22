@@ -17,10 +17,13 @@ repair are recorded in [POST_FIX_REVIEW.md](POST_FIX_REVIEW.md). The frozen
 milestone and its earlier failure evidence are preserved. No release,
 activation or production integration is part of this milestone.
 
-The current profile is `/3`. The separate
+The current profile is `/4`. The separate
 [Milestone 3A repair](../flowmesh_v2_storage/REPAIR_R1_R2_R3.md) addresses the
 three reproduced review findings; prior milestone reports remain historical.
-The completed correction requires external re-review.
+Those R1/R2/R3 corrections were accepted within their tested scope. The
+[header-retention and aggregation repair](../flowmesh_v2_storage/HEADER_REPAIR.md)
+is a separate successor requiring external re-review. No protocol, quorum,
+accounting or timeout-policy change is implied by this resource-policy version.
 
 ## Reproduce from repository root
 
@@ -52,6 +55,9 @@ deadlines are abstract ticks, never milliseconds.
   change, replay, exact-data retrieval and exactly-once committed application.
 - `fm_admission.py`: context/reference/preview checks and bounded disposable
   body, anchor, reference and missing-data queues.
+- `fm_headers.py`: admission-time count and canonical-byte header bounds,
+  verified-evidence protection and bounded disposable-index cleanup. A
+  refused cache entry does not remove a durable voting obligation.
 - `fm_delivery.py`: bounded exact retries, recent commitments and non-voting
   STATUS/GET_CERT historical discovery; no full-history selection walk.
 - `fm_memory.py`: model-only atomic updates copying touched records, not the

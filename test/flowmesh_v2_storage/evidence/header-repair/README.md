@@ -83,3 +83,70 @@ source and previous evidence are preserved outside the repair checkout.
 The reviewed baseline's synthetic signatures/membership/anchors remain
 synthetic. No liveness, global-heap, elapsed-time, WAN or production-deployment
 qualification is inferred from these measurements.
+
+## Development AFTER: same original input pattern
+
+The separate `after_probe.py` runs the original DATA-plus-PROPOSE pattern
+against an explicitly supplied repaired checkout:
+
+```sh
+python3.14 -B test/flowmesh_v2_storage/evidence/header-repair/after_probe.py .
+```
+
+It records HEAD, working-tree dirty status and hashes of the model Python/profile
+files before execution, then checks that those files and HEAD did not change.
+The retained `after-development-results.jsonl` and `AFTER.json` are **working-tree
+development observations**, not a claim that their parent HEAD contains the
+repair. A final committed-tree run must be identified separately at handoff.
+
+This is not the prepared-first regression fixture. It uses no initial prepared
+certificate: prepared count remains zero; one ordinary initial proposal is
+accepted. Tick calls remain zero and deadline30 remains overdue as the clock
+reaches 3069, 6169 and 9269. No timer, view, quorum or message pattern is changed
+to obtain the measured result.
+
+| Inputs | Headers / lookup entries / size-index entries | Bodies | Baseline-comparable serialized list bytes | New budget-accounted entry bytes | Actual keyed lookup observations |
+|---:|---:|---:|---:|---:|---:|
+| 100 | 2 / 2 / 2 | 100 | 1,349 | 1,344 | 1 |
+| 200 | 2 / 2 / 2 | 200 | 1,349 | 1,344 | 1 |
+| 300 | 2 / 2 / 2 | 256 | 1,349 | 1,344 | 1 |
+
+The comparable list uses the exact BEFORE encoding above. The repaired cache's
+budget instead sums individually encoded `{slot:[view,ValueId],signed:header}`
+entries. These encodings differ: do not compare 1,344 directly with BEFORE's
+202,201-byte list and call them the same measure. Signed-header payload-only
+bytes are 1,166 at every AFTER checkpoint. None is a Python heap-size measure.
+
+A trace hook observes one actual `_aggregate` call, one `_lookup_header` call
+and one header-cache lookup statement for the latest candidate per checkpoint.
+The model reports one key, two phase checks, zero votes scanned and no proof
+construction. The explicit diagnostic call does not change semantic state or
+traffic; only aggregation telemetry may update. It is not presented as a
+measurement of every automatic operation or a throughput benchmark.
+
+The peak reported header-cleanup scan is 3 entries in this exact pattern,
+with at most one header removed per admission. Full counter fields are retained.
+These observations are not the worst-case bound or proof of all incoming
+schedules. No secondary aggregation queue/index exists in this implementation.
+The original BEFORE launchers, results and source identities are unchanged.
+
+## Explicit failing-before / passing-after resource assertion
+
+The separate source-independent checker asserts the synthetic expectation
+`headers <= 32` against every retained 100/200/300 observation:
+
+```sh
+python3.14 -B test/flowmesh_v2_storage/evidence/header-repair/check_retained_bound.py test/flowmesh_v2_storage/evidence/header-repair/baseline-results.jsonl --max-headers 32
+python3.14 -B test/flowmesh_v2_storage/evidence/header-repair/check_retained_bound.py test/flowmesh_v2_storage/evidence/header-repair/after-development-results.jsonl --max-headers 32
+```
+
+The first command was executed and returned **exit 1**, reporting FAIL for
+100, 200 and 300 retained headers. The second returned **exit 0**, reporting
+PASS for 2 headers at each checkpoint. Exact output is retained in
+`bound-check-before.jsonl` and `bound-check-after.jsonl`.
+The checker refuses missing, duplicate or out-of-order checkpoint observations.
+
+These are explicit checks of the recorded resource observations, not claims
+that the repaired test API ran unchanged against the old implementation or
+that the independent BFT checker proves resource bounds. The 32-header policy
+is a declared synthetic TEST-profile parameter, not a production default.

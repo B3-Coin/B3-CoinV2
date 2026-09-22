@@ -1,0 +1,3 @@
+{"check": "retained_header_count_bound", "headers": 2, "inputs": 100, "maximum": 32, "result": "PASS"}
+{"check": "retained_header_count_bound", "headers": 2, "inputs": 200, "maximum": 32, "result": "PASS"}
+{"check": "retained_header_count_bound", "headers": 2, "inputs": 300, "maximum": 32, "result": "PASS"}

@@ -4,13 +4,18 @@ This isolated test adapter persists the existing synthetic agreement model.
 It does not change accounting, agreement, authentication or economic rules,
 and does not integrate storage into a live node. The prior contract is
 [PLAN.md](PLAN.md); the versioned scope and bounds are
-[flowmesh-v2-disk-recovery-test/2](TEST_PROFILE.json). The original `/1`
+[flowmesh-v2-disk-recovery-test/3](TEST_PROFILE.json). The original `/1` and `/2`
 remains in frozen reviewed history; the store schema and codec remain version 1.
 The [R1/R2/R3 repair supplement](REPAIR_R1_R2_R3.md) records the successor
 implementation, tests and external re-review gate. See also the existing
 [agreement model](../flowmesh_v2_agreement/README.md),
 [protocol](../flowmesh_v2_agreement/PROTOCOL.md) and
 [accounting model](../flowmesh_v2_model/README.md).
+
+R1/R2/R3 were subsequently accepted within their tested scope. The separate
+[header-retention/aggregation successor](HEADER_REPAIR.md) retains those
+repairs and adds bounded disposable headers and candidate-local aggregation.
+Its external re-review remains pending; the earlier reports stay frozen.
 
 ## Run from the repository root
 
