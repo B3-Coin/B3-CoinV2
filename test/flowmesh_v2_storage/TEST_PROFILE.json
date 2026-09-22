@@ -1,9 +1,10 @@
 {
-  "profile_id": "flowmesh-v2-disk-recovery-test/2",
+  "profile_id": "flowmesh-v2-disk-recovery-test/3",
   "test_only": true,
   "baseline": "eb73e12d8b042f3ccdfd1e0d96701460e07f20d5",
   "reviewed_revision": "1d022dbf0da63636d6d43650d3864222761497a1",
-  "agreement_profile": "flowmesh-v2-single-sequence-pbft-test/3",
+  "header_reviewed_revision": "00d41abc85c3fc15d6c4191bcafd699cc16b7836",
+  "agreement_profile": "flowmesh-v2-single-sequence-pbft-test/4",
   "accounting_and_agreement_rules": "unchanged",
   "synthetic": ["authentication", "membership", "anchors", "custody", "clock", "delivery"],
   "real": ["sqlite_files", "fsync_calls", "exclusive_local_process_lock", "spawned_children", "SIGKILL", "exit_status"],
@@ -27,6 +28,6 @@
   "storage_fault_points": ["before_begin", "after_snapshot_row", "after_rows", "before_commit", "after_commit", "before_fsync", "after_fsync"],
   "rollback": "external parent generation/digest required for known rollback; coherent backup without that observation is undetectable",
   "platform": "cooperating POSIX processes on one local filesystem; no Windows or network-filesystem qualification",
-  "review_gate": "R1/R2/R3 repair implementation requires external re-review; automated tests are not that review",
+  "review_gate": "R1/R2/R3 accepted within tested scope; header-retention/incremental-aggregation repair requires external re-review; automated tests are not that review",
   "not_qualified": ["machine_power_loss", "storage_device_cache_behavior", "real_BLS", "B3_anchor_verification", "changing_membership", "live_V1_recovery", "bridge_verifier", "futures_margin", "WAN", "200ms"]
 }

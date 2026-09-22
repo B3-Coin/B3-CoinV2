@@ -16,9 +16,10 @@ class StorageProfileTests(unittest.TestCase):
     def test_profile_has_explicit_test_domain_and_baseline(self):
         profile = json.loads((HERE / "TEST_PROFILE.json").read_text())
         self.assertIs(profile["test_only"], True)
-        self.assertEqual(profile["profile_id"], "flowmesh-v2-disk-recovery-test/2")
+        self.assertEqual(profile["profile_id"], "flowmesh-v2-disk-recovery-test/3")
         self.assertEqual(profile["baseline"], "eb73e12d8b042f3ccdfd1e0d96701460e07f20d5")
         self.assertEqual(profile["reviewed_revision"], "1d022dbf0da63636d6d43650d3864222761497a1")
+        self.assertEqual(profile["header_reviewed_revision"], "00d41abc85c3fc15d6c4191bcafd699cc16b7836")
         self.assertEqual(profile["agreement_profile"], AGREEMENT_PROFILE["profile_id"])
         self.assertEqual(profile["schedule_seeds"], [31031, 31032])
 

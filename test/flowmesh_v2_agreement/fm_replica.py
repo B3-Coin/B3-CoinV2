@@ -5,6 +5,7 @@ from copy import deepcopy
 from fm_application import Application, NeedData, InvalidValue, canonical, digest, value_id
 from fm_protocol import PROFILE, Proofs, Invalid, Exhausted, message, proposer
 from fm_admission import AdmissionMixin
+from fm_headers import HeaderMixin
 from fm_delivery import DeliveryMixin
 from fm_memory import update_durable
 
@@ -13,7 +14,7 @@ class Crash(Exception):
     pass
 
 
-class Replica(AdmissionMixin, DeliveryMixin):
+class Replica(HeaderMixin, AdmissionMixin, DeliveryMixin):
     def __init__(self, index, n, signer, authenticate, snapshot, anchor, emit, clock, trace):
         self.index, self.n, self.f = index, n, (n - 1) // 3
         self.q = 2 * self.f + 1
@@ -60,10 +61,13 @@ class Replica(AdmissionMixin, DeliveryMixin):
         self.local_offers = set()
         self.votes, self.headers, self.reports, self.pending = {}, {}, {}, {}
         self.announced = set()
+        self.last_aggregation_work = self._empty_aggregation_work()
         self.deadline = None
         self.next_retry = self.clock() + PROFILE["timers"]["retry_ticks"]
         self.local_tip = self.d["anchor"]["height"]  # diagnostics only
         self.last_reason = ""
+        self._admission_reset()
+        self._headers_reset()
         self.bodies.update({vid: deepcopy(body) for vid, body in self.d["retained_bodies"].items()
                             if self.record and body["instance"] == self.record["instance"]})
         self.local_offers.update(self.bodies)
@@ -78,13 +82,12 @@ class Replica(AdmissionMixin, DeliveryMixin):
                 if body["instance"] == self.record["instance"]:
                     self.offers.add(vid)
             for data in self.record["accepted"].values():
-                p = data["signed"]["payload"]
-                self.headers[(p["view"], p["value"])] = deepcopy(data["signed"])
+                self._retain_header(data["signed"], "restart_accepted")
             for key, qc in self.record["prepared"].items():
-                self.headers.setdefault(key, deepcopy(qc["proposal"]))
-            if self.record["mode"] == "ACTIVE" and (self.offers or self.headers):
+                self._retain_header(qc["proposal"], "restart_prepared")
+            if self.record["mode"] == "ACTIVE" and (
+                    self.offers or self.record["accepted"] or self.record["prepared"]):
                 self._timer()
-        self._admission_reset()
         self._delivery_reset()
 
     def event(self, name, **info):
@@ -377,7 +380,7 @@ class Replica(AdmissionMixin, DeliveryMixin):
                 self.proofs.check("prepare_vote" if phase == "PREPARE" else "commit_vote", data, rec["instance"])
                 self._retain_received_vote(data)
                 self.event("vote_received", phase=phase, sender=p["sender"], value=p["value"], view=p["view"])
-                self._aggregate()
+                self._aggregate((p["view"], p["value"]), phase)
             elif phase == "VIEW_CHANGE":
                 self._view_change(data)
             elif phase == "NEW_VIEW":
@@ -392,6 +395,7 @@ class Replica(AdmissionMixin, DeliveryMixin):
             rec = self._context(p["instance"])
             if not rec["applied"]:
                 self._prepared(data)
+                self._aggregate((p["view"], p["value"]), "COMMIT")
         elif kind == "CERT":
             self._reference(kind, data)
             self._certificate(data)
@@ -401,33 +405,40 @@ class Replica(AdmissionMixin, DeliveryMixin):
     def _proposal(self, signed):
         p = self.proofs.check("proposal", signed, self.instance)
         body = self._body(p["value"])
-        self.headers[(p["view"], p["value"])] = deepcopy(signed)
         if p["view"] > 0 and p["view"] >= self.record["view"]:
             self._new_view(p["new_view"])
         r = self.record
+        key = (p["view"], p["value"])
         if p["view"] != r["view"] or r["mode"] != "ACTIVE":
+            self._retain_header(signed, "inactive_proposal")
             self.event("defer", reason="ABANDONED_OR_INACTIVE_VIEW", view=p["view"])
-            self._aggregate()
+            self._aggregate(key)
             return
         if p["view"] and r["new_views"].get(p["view"]) != p["new_view"]:
             raise Invalid("CONFLICTING_NEW_VIEW")
         existing = r["accepted"].get(p["view"])
         if existing and existing["signed"]["payload"]["value"] != p["value"]:
-            raise Invalid("CONFLICTING_ACCEPTED_PROPOSAL")
+            # A conflicting naked proposal cannot authorize our second vote,
+            # but other valid votes may establish a transferable QC. Keep its
+            # verified header only under the disposable admission policy.
+            self._retain_header(signed, "conflicting_proposal")
+            self._refuse("CONFLICTING_ACCEPTED_PROPOSAL", kind="SIGNED")
+            self._aggregate(key)
+            return
         if not existing:
             seq = self.d["sequence"]
             self._persist(lambda d: d["records"][seq]["accepted"].__setitem__(p["view"],
                           {"signed": signed, "body": body}), "accepted_proposal")
+        self._retain_header(signed, "accepted_proposal")
         self._timer()
         slot = ("PREPARE", p["view"])
         if slot not in self.record["signed"]:
             self._sign("PREPARE", p["value"])
-        self._aggregate()
+        self._aggregate(key)
 
     def _prepared(self, qc):
         p = self.proofs.check("prepared", qc, self.instance)
         self._body(p["value"])
-        self.headers.setdefault((p["view"], p["value"]), deepcopy(qc["proposal"]))
         if p["view"] > self.record["view"]:
             # Catch up only via the QC's complete valid NEW_VIEW, never its view integer.
             self._new_view(qc["proposal"]["payload"]["new_view"])
@@ -445,6 +456,7 @@ class Replica(AdmissionMixin, DeliveryMixin):
                 if r["highest"] is None or p["view"] > r["highest"]["proposal"]["payload"]["view"]:
                     r["highest"] = deepcopy(qc)
             self._persist(store, "prepared_proof")
+        self._retain_header(qc["proposal"], "prepared_proof")
         r = self.record
         accepted = r["accepted"].get(p["view"])
         if (r["mode"] == "ACTIVE" and r["view"] == p["view"] and accepted
@@ -453,26 +465,71 @@ class Replica(AdmissionMixin, DeliveryMixin):
                 and ("COMMIT", p["view"]) not in r["signed"]):
             self._sign("COMMIT", p["value"])
 
-    def _aggregate(self):
-        # Only received messages and durable local evidence; never global vote state.
-        for (v, value), proposal in list(self.headers.items()):
-            if proposal["payload"]["instance"] != self.instance:
-                continue
+    @staticmethod
+    def _empty_aggregation_work():
+        return dict(keys_inspected=0, phase_checks=0, votes_inspected=0,
+                    proofs_built=0, header_cache_lookups=0, durable_lookups=0)
+
+    def _header_removed(self, key):
+        # No auxiliary historical/dirty-candidate queue is maintained.
+        self.announced.discard(("PREPARED", self.d["sequence"], *key))
+
+    def _lookup_header(self, key, work):
+        work["header_cache_lookups"] += 1
+        proposal = self.headers.get(key)
+        if proposal is not None:
+            return proposal
+        # Cache loss cannot erase an obligation. These are exact current-record
+        # lookups, not a scan of historical certificates or proposal headers.
+        work["durable_lookups"] += 1
+        qc = self.record["prepared"].get(key)
+        if qc is not None:
+            return qc["proposal"]
+        work["durable_lookups"] += 1
+        accepted = self.record["accepted"].get(key[0])
+        if accepted and accepted["signed"]["payload"]["value"] == key[1]:
+            return accepted["signed"]
+        work["durable_lookups"] += 1
+        signed = self.record["signed"].get(("PROPOSE", key[0]))
+        return signed if signed and signed["payload"]["value"] == key[1] else None
+
+    def _aggregate(self, key, phase=None):
+        """Evaluate one canonical candidate; never walk the header table.
+
+        A header or PREPARE can unlock both preparation and already-received
+        commits. COMMIT ingress examines only commitment. Complete proof
+        verification/application retains its separate existing resource limits.
+        """
+        work = self._empty_aggregation_work()
+        self.last_aggregation_work = work
+        if not self.record or self.record["applied"]:
+            return
+        work["keys_inspected"] = 1
+        proposal = self._lookup_header(key, work)
+        if proposal is None or proposal["payload"]["instance"] != self.instance:
+            return  # Existing exact proposal/DATA retries can supply the header.
+        v, value = key
+        if phase != "COMMIT":
+            work["phase_checks"] += 1
             prepares = self.votes.get((v, value, "PREPARE"), {})
             if len(prepares) >= self.q:
+                work["votes_inspected"] += len(prepares)
+                work["proofs_built"] += 1
                 qc = {"proposal": proposal, "prepares": [prepares[k] for k in sorted(prepares)]}
                 self._prepared(qc)
                 mark = ("PREPARED", self.d["sequence"], v, value)
                 if mark not in self.announced:
                     self.announced.add(mark)
                     self._send("PREPARED", qc)
-            qc = self.record["prepared"].get((v, value))
-            commits = self.votes.get((v, value, "COMMIT"), {})
-            if qc and len(commits) >= self.q:
-                cert = {"prepared": qc, "commits": [commits[k] for k in sorted(commits)]}
-                self._certificate(cert)
-                self._send("CERT", cert)
-                return
+        work["phase_checks"] += 1
+        qc = self.record["prepared"].get((v, value))
+        commits = self.votes.get((v, value, "COMMIT"), {})
+        if qc and len(commits) >= self.q:
+            work["votes_inspected"] += len(commits)
+            work["proofs_built"] += 1
+            cert = {"prepared": qc, "commits": [commits[k] for k in sorted(commits)]}
+            self._certificate(cert)
+            self._send("CERT", cert)
 
     def change_view(self, target, reason="timeout"):
         r = self.record
@@ -619,6 +676,8 @@ class Replica(AdmissionMixin, DeliveryMixin):
         self.event("applied", sequence=seq, value=value, result=body["result"])
         self._crash_at("after_application")
         self.votes, self.headers, self.reports, self.offers = {}, {}, {}, set()
+        self.announced.clear()
+        self._headers_reset()
         self.local_offers.clear()
         self.deadline = None
         self._retry_pending()
@@ -627,6 +686,7 @@ class Replica(AdmissionMixin, DeliveryMixin):
         # Separate fixed-cap admission cleanup from the delivery-work budget;
         # neither operation walks accumulated durable/audit history.
         self._expire_admission()
+        self._expire_headers()
         self._retry_delivery()
 
     def tick(self):
