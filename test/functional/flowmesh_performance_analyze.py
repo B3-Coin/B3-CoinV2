@@ -122,7 +122,8 @@ def read_json(path):
 
 def read_traces(paths, samples):
     slots = {(sample.get("market_id"), sample.get("certified_status", {}).get("microblock_sequence")) for sample in samples}
-    actions = {sample.get("action_id") for sample in samples if sample.get("action_id")}
+    actions = {(sample.get("market_id"), sample.get("action_id"))
+               for sample in samples if sample.get("action_id")}
     events, coverage = [], []
     for node, path in paths:
         if path.stat().st_size > MAX_FILE_BYTES:
@@ -145,7 +146,7 @@ def read_traces(paths, samples):
                         segment += 1
                         previous.clear()
                     previous[market] = event_id
-                if (market, event.get("sequence")) not in slots and event.get("object_id") not in actions:
+                if (market, event.get("sequence")) not in slots and (market, event.get("object_id")) not in actions:
                     continue
                 event.update(node=str(node), segment=segment, source=str(path), line=line_number)
                 events.append(event)
@@ -192,18 +193,28 @@ def analyze(report, events, coverage, phase="measured", outlier_ms=600, event_li
     by_slot, by_action = defaultdict(list), defaultdict(list)
     for event in events:
         by_slot[(event.get("market_id"), event.get("sequence"))].append(event)
-        by_action[event.get("object_id")].append(event)
+        by_action[(event.get("market_id"), event.get("object_id"))].append(event)
     tls = defaultdict(list)
     for record in report.get("https_submit_records", []):
         if record.get("action_id"):
-            tls[record["action_id"]].append(record)
+            # V1 semantic ActionId excludes market; its signing digest does
+            # not. Recover exact market context from the retained request.
+            if record.get("body_hex"):
+                params = json.loads(bytes.fromhex(record["body_hex"]))["params"]
+                if params["action_id"] != record["action_id"]:
+                    raise ValueError("Relay ActionId and retained request disagree")
+                market = params["market_id"]
+            else:
+                market = record.get("market_id", report.get("market_id"))
+            tls[(market, record["action_id"])].append(record)
     tls_rows, rows, outliers = [], [], []
     for index, sample in enumerate(samples):
         status = sample.get("certified_status", {})
         action, block, sequence = sample.get("action_id"), status.get("microblock_hash"), status.get("microblock_sequence")
         relevant = list(by_slot.get((sample.get("market_id"), sequence), [])) if sequence is not None else []
         seen = {(event["node"], event["line"]) for event in relevant}
-        relevant += [event for event in by_action.get(action, []) if (event["node"], event["line"]) not in seen]
+        relevant += [event for event in by_action.get((sample.get("market_id"), action), [])
+                     if (event["node"], event["line"]) not in seen]
         host_metrics = {key: value for key, value in sample.items() if key.endswith("_ms") and numeric(value)}
         for key, field in (("client_certified_ms", "client_certified_host_us"),
                            ("initial_response_ms", "initial_response_host_us"),
@@ -230,7 +241,7 @@ def analyze(report, events, coverage, phase="measured", outlier_ms=600, event_li
             row["nodes"][f"{node}:{segment}"] = {
                 "correlated_event_count": len(node_events), "admission_to_durable": lifecycle,
                 "durable_event": calibrated_event(durable, sample, offsets, multi_segment) if durable else None}
-        for record in tls.get(action, []):
+        for record in tls.get((sample.get("market_id"), action), []):
             request = {key: record[key] for key in ("endpoint", "record_index", "method", "action_id", "forwarded", "response_dropped") if key in record}
             request["timestamps_us"] = {key: value for key, value in record.items() if key.endswith("_us") and numeric(value)}
             request["spans_ms"] = {}

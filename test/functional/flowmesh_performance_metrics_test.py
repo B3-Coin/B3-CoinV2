@@ -3,9 +3,10 @@
 # Distributed under the MIT software license.
 """Offline checks for benchmark bookkeeping; never starts a node."""
 
+import json
 import unittest
 
-from feature_flowmesh_performance import arrival_offsets, expected_balance, summarize_window
+from feature_flowmesh_performance import arrival_offsets, expected_balance, submit_context, summarize_window
 from feature_flowmesh_release import TRADE_PRICE
 from flowmesh_performance_analyze import runtime_spans, stats
 
@@ -76,6 +77,22 @@ class PerformanceMetricsTest(unittest.TestCase):
         end = {**begin, "object_id": "candidate-B", "monotonic_us": 2000,
                "stage": "execution_completed"}
         self.assertEqual(runtime_spans([begin, end]), [])
+
+    def test_same_semantic_id_is_not_a_cross_market_retry(self):
+        def record(market, payload):
+            body = {"method": "submit", "params": {
+                "market_id": market, "action_id": "same-semantic-id", "action_hex": payload}}
+            return {"action_id": "same-semantic-id", "action_hex": payload,
+                    "body_hex": json.dumps(body).encode().hex()}
+        rows = [record("market-A", "01"), record("market-B", "02")]
+        # Former join merges the two authorized, domain-separated signatures.
+        self.assertEqual(len({row["action_hex"] for row in rows}), 2)
+        selected = [row for row in rows if submit_context(row) == ("market-A", "same-semantic-id")]
+        self.assertEqual([row["action_hex"] for row in selected], ["01"])
+        rows.append(record("market-A", "03"))
+        # Do not hide changed bytes within the SAME market by selecting a hash.
+        selected = [row for row in rows if submit_context(row) == ("market-A", "same-semantic-id")]
+        self.assertEqual(len({row["action_hex"] for row in selected}), 2)
 
 
 if __name__ == "__main__":

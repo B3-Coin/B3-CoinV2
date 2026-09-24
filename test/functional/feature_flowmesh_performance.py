@@ -82,6 +82,21 @@ def compact_error(error):
     return result
 
 
+def submit_context(record):
+    """Semantic ActionIds are market-scoped; never join on ActionId alone.
+
+    The retained public HTTPS body is the authority for this observation.
+    Do not filter by the expected signed-byte hash: that would conceal a real
+    changed-payload retry inside the same market.
+    """
+    body = json.loads(bytes.fromhex(record["body_hex"]))
+    assert_equal(body["method"], "submit")
+    params = body["params"]
+    assert_equal(params["action_id"], record["action_id"])
+    assert_equal(params["action_hex"], record["action_hex"])
+    return params["market_id"], params["action_id"]
+
+
 def summarize_window(samples, backlog, duration, elapsed_to_drain=None):
     complete = [row for row in samples if row["status"] == "complete"]
     metrics = {}
@@ -531,7 +546,8 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         for sample in self.performance_report["samples"]:
             if "action_id" not in sample or "retained_action" not in sample:
                 continue
-            copies = [row for row in self.submit_records if row["action_id"] == sample["action_id"]]
+            copies = [row for row in self.submit_records
+                      if submit_context(row) == (sample["market_id"], sample["action_id"])]
             assert copies, "signed action missing HTTPS observation"
             assert all(row["forwarded"] and not row["response_dropped"] for row in copies)
             payloads = {row["action_hex"] for row in copies}
