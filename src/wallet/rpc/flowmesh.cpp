@@ -597,11 +597,19 @@ static RPCHelpMan ActionStatusRPC(const bool retry)
             const uint256 action_id{ParseActionId(request.params[1])};
             const auto account{ExistingWalletAccount(*wallet)};
             if (!account) throw JSONRPCError(RPC_WALLET_ERROR, "This wallet has no FlowMesh account");
-            auto receipt{BoundActionReceipt(wallet->chain().flowMeshActionStatus(market_id, action_id, false), action_id)};
+            const bool remote{wallet->chain().flowMeshClientStatus().backend == "remote"};
+            if (remote) {
+                // Retained ownership is local durable metadata. A preliminary
+                // HTTPS query is neither necessary nor authority to retry.
+                const auto saved{wallet->chain().flowMeshSavedActions(*account, market_id)};
+                if (std::none_of(saved.begin(), saved.end(), [&](const auto& row) { return row.receipt.action_id == action_id; }))
+                    throw JSONRPCError(RPC_WALLET_ERROR, "Action is not retained for this wallet's existing FlowMesh account");
+            }
+            auto receipt{BoundActionReceipt(wallet->chain().flowMeshActionStatus(market_id, action_id, remote && retry), action_id)};
             if (receipt.account_id != account) {
                 throw JSONRPCError(RPC_WALLET_ERROR, "Action is not retained for this wallet's existing FlowMesh account");
             }
-            if (retry && !receipt.certificate_verified) {
+            if (!remote && retry && !receipt.certificate_verified) {
                 receipt = BoundActionReceipt(wallet->chain().flowMeshActionStatus(market_id, action_id, true), action_id);
                 if (receipt.account_id != account) {
                     throw JSONRPCError(RPC_WALLET_ERROR, "Action is not retained for this wallet's existing FlowMesh account");

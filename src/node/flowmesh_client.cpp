@@ -1,6 +1,7 @@
 // Copyright (c) 2026 The B3Coin Core developers
 // Distributed under the MIT software license, see COPYING.
 #include <node/flowmesh_client.h>
+#include <node/flowmesh_client_poll.h>
 #include <node/flowmesh_client_settlement.h>
 
 #include <chain.h>
@@ -524,8 +525,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         bool previously_certified{false};
         std::vector<unsigned char> inclusion_proof;
         uint256 owner_account;
+        // Volatile read failover cursor; never part of the signed instruction.
+        std::optional<size_t> automatic_endpoint;
     };
     std::map<std::pair<uint256, uint256>, Pending> m_pending;
+    FlowMeshClientPollScheduler m_action_polls;
     std::map<uint256, std::pair<uint64_t, uint256>> m_highwater;
     struct Cache {
         flowmesh::ClientEvidencePins pins;
@@ -645,7 +649,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     UniValue Call(const std::string& method, const UniValue& params,
                   const std::function<void(const UniValue&, size_t)>& validate,
                   bool* possibly_sent = nullptr, bool* earlier_possible = nullptr,
-                  size_t* attempted_endpoints = nullptr)
+                  size_t* attempted_endpoints = nullptr, Pending* automatic_action = nullptr)
     {
         if (m_endpoints.empty()) Fail("No FlowMesh HTTPS trading endpoint configured; use flowmeshclientconnect or -flowmeshendpoint");
         UniValue request{UniValue::VOBJ}; request.pushKV("method", method); request.pushKV("params", params);
@@ -654,10 +658,16 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         // An explicit reconnect counts fresh probes and bypasses automatic
         // read cooldowns; exact-action submission/recovery keeps its full cycle.
         const bool automatic_read{!possibly_sent && !attempted_endpoints && method != "action"};
-        const size_t first{automatic_read ? m_preferred : m_selected};
+        const size_t first{automatic_action ? automatic_action->automatic_endpoint.value_or(m_selected) :
+            (automatic_read ? m_preferred : m_selected)};
         for (size_t attempt{0}; attempt < m_endpoints.size(); ++attempt) {
             const size_t endpoint{(first + attempt) % m_endpoints.size()};
             if (automatic_read && std::chrono::steady_clock::now() < m_retry_after[endpoint]) continue;
+            if (automatic_action && !m_action_polls.TryChargeAttempt(std::chrono::steady_clock::now())) {
+                automatic_action->automatic_endpoint = endpoint;
+                Fail("Automatic status refresh coalesced; retained observation is not a fresh endpoint response");
+            }
+            if (automatic_action) automatic_action->automatic_endpoint = (endpoint + 1) % m_endpoints.size();
             bool transport_available{false};
             try {
                 if (attempted_endpoints) ++*attempted_endpoints;
@@ -673,11 +683,13 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 if (reply.status != 200) Fail("Unexpected HTTPS response status");
                 validate(parsed["result"], endpoint);
                 m_selected = endpoint; EndpointResult(endpoint, true, {});
+                if (automatic_action) automatic_action->automatic_endpoint.reset();
                 return parsed["result"];
             } catch (const std::exception& e) {
                 error = e.what(); EndpointResult(endpoint, transport_available, error);
             }
         }
+        if (automatic_action) automatic_action->automatic_endpoint.reset();
         if (error.empty()) {
             std::lock_guard lock{m_status_mutex};
             error = "Trading endpoints are waiting to retry";
@@ -814,6 +826,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         p.receipt.microblock_hash = entry.GetHash(); p.receipt.microblock_sequence = entry.sequence;
         p.receipt.certificate_verified = true; p.receipt.endpoint = m_endpoints[endpoint].url;
         p.previously_certified = true;
+        m_action_polls.Remove({p.market, p.action.Id()});
         size_t retained_bytes{proof.size()};
         for (const auto& [key, item] : m_pending) if (&item != &p) retained_bytes += item.inclusion_proof.size();
         if (retained_bytes > 8 * 1024 * 1024) {
@@ -1018,12 +1031,12 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (!out->unchanged) ReportedHistory(*out, cache.reported);
         return std::move(*out);
     }
-    Receipt QueryAction(Pending& p)
+    flowmesh::ClientEvidencePins RecheckActionAuthority(Pending& p)
     {
         const auto pins{Pins(p.market)};
         if (pins.domain != p.domain || pins.execution_config_id != p.config) Fail("Retained action domain/config differs from current local market");
         if (p.receipt.certificate_verified && !p.inclusion_proof.empty()) {
-            try { (void)VerifyEntry(pins, p.inclusion_proof); return p.receipt; }
+            try { (void)VerifyEntry(pins, p.inclusion_proof); return pins; }
             catch (const std::exception& e) {
                 p.receipt.certificate_verified = false; p.receipt.state = "unknown";
                 p.receipt.reason = std::string{"Prior inclusion authority no longer verified: "} + e.what();
@@ -1033,6 +1046,13 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             p.receipt.certificate_verified = false; p.receipt.state = "unknown";
             p.receipt.reason = "Previously verified inclusion retained; fresh authority evidence required";
         }
+        return pins;
+    }
+    Receipt QueryAction(Pending& p, bool automatic = false)
+    {
+        const auto pins{RecheckActionAuthority(p)};
+        if (p.receipt.certificate_verified) return p.receipt;
+        if (!automatic) p.automatic_endpoint.reset();
         UniValue params{UniValue::VOBJ}; params.pushKV("market_id", p.market.GetHex()); params.pushKV("action_id", p.action.Id().GetHex());
         Call("action", params, [&](const UniValue& value, size_t endpoint) {
             auto receipt{ParseReceipt(value, p.action.Id(), endpoint)};
@@ -1051,7 +1071,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 p.receipt = std::move(receipt);
             }
             if (!p.owner_account.IsNull()) p.receipt.account_id = p.owner_account;
-        });
+        }, nullptr, nullptr, nullptr, automatic ? &p : nullptr);
+        if (!p.receipt.certificate_verified) m_action_polls.MarkObserved({p.market, p.action.Id()});
         Save(); return p.receipt;
     }
     Receipt Send(Pending& p)
@@ -1245,6 +1266,7 @@ public:
             if (m_pending.size() >= CLIENT_MAX_ACTIONS) {
                 const auto completed{std::find_if(m_pending.begin(), m_pending.end(), [](const auto& value) { return value.second.receipt.certificate_verified; })};
                 if (completed == m_pending.end()) Fail("Pending action limit reached; unresolved signed objects are not evicted");
+                m_action_polls.Remove(completed->first);
                 m_pending.erase(completed);
             }
             Pending pending{market, pins.domain, pins.execution_config_id, action, *bytes,
@@ -1274,15 +1296,55 @@ public:
         if (it == m_pending.end()) { out.reason = "No retained local signed object; action outcome is unknown"; return out; }
         out.account_id = it->second.owner_account;
         try {
-            try { QueryAction(it->second); } catch (const std::exception& e) {
-                it->second.receipt.reason = e.what();
-                if (it->second.previously_certified) {
-                    it->second.receipt.certificate_verified = false; it->second.receipt.state = "unknown";
-                }
+            // Never use polling coalescence to preserve a stale authority label.
+            (void)RecheckActionAuthority(it->second);
+            if (it->second.receipt.certificate_verified) {
+                m_action_polls.Remove(it->first);
+                return it->second.receipt;
             }
-            if (retry && !it->second.receipt.certificate_verified) return Send(it->second);
-            return it->second.receipt;
-        } catch (const std::exception& e) { out.reason = e.what(); return out; }
+            auto refresh = [&](Pending& pending, bool automatic) {
+                try { QueryAction(pending, automatic); } catch (const std::exception& e) {
+                    pending.receipt.reason = e.what();
+                    if (pending.previously_certified) {
+                        pending.receipt.certificate_verified = false; pending.receipt.state = "unknown";
+                    }
+                }
+            };
+            if (retry) {
+                refresh(it->second, false);
+                // A fresh status lookup already occurred. Do not repeat it in
+                // Send's no-resubmit path for a previously certified action.
+                if (!it->second.receipt.certificate_verified && !it->second.previously_certified) return Send(it->second);
+                if (!it->second.receipt.certificate_verified && it->second.previously_certified)
+                    it->second.receipt.reason = "Previously verified inclusion is retained; fresh proof required for current authority, and this action will not be resubmitted";
+                return it->second.receipt;
+            }
+            if (!m_action_polls.Demand(it->first)) Fail("Automatic status demand bound reached; retained instruction preserved");
+            bool own_refresh{false};
+            if (const auto key{m_action_polls.Take(std::chrono::steady_clock::now())}) {
+                // Fair bounded work across callers/markets. Only the caller's
+                // own receipt below is returned, never another wallet's card.
+                const auto work{m_pending.find(*key)};
+                if (work != m_pending.end()) {
+                    own_refresh = *key == it->first;
+                    refresh(work->second, true);
+                    if (work->second.receipt.certificate_verified) m_action_polls.Remove(*key);
+                } else m_action_polls.Remove(*key);
+            }
+            auto receipt{it->second.receipt};
+            if (!receipt.certificate_verified && !m_action_polls.HasObservation(it->first))
+                receipt.reason = "Status read pending/coalesced; retained submission observation only. " + receipt.reason;
+            else if (!receipt.certificate_verified && !own_refresh)
+                receipt.reason = "Status read coalesced; retained endpoint observation, not a fresh response. " + receipt.reason;
+            return receipt;
+        } catch (const std::exception& e) {
+            if (it->second.previously_certified) {
+                it->second.receipt.certificate_verified = false;
+                it->second.receipt.state = "unknown";
+            }
+            it->second.receipt.reason = e.what();
+            out.reason = e.what(); return out;
+        }
     }
     std::vector<interfaces::FlowMeshSavedAction> SavedActions(
         const uint256& account, const std::optional<uint256>& market) override
