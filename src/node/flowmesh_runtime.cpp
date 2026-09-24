@@ -369,6 +369,15 @@ public:
         }
     }
 
+    // Shared by retained local retries and local queue items whose transport
+    // header aged while a higher-priority certificate advanced this state.
+    static bool StillPending(const flowmesh::Action& action,
+                             const flowmesh::FlowMeshState& state)
+    {
+        return action.IsDeposit() ? !state.DepositConsumed(action.outpoint)
+                                  : action.sequence >= state.NextSequence(action.signer);
+    }
+
 private:
     struct PendingForward {
         flowmesh::WireHeader header;
@@ -385,13 +394,6 @@ private:
         std::optional<PendingForward> forward{};
         std::optional<LocalRetry> local_retry{};
     };
-
-    static bool StillPending(const flowmesh::Action& action,
-                             const flowmesh::FlowMeshState& state)
-    {
-        return action.IsDeposit() ? !state.DepositConsumed(action.outpoint)
-                                  : action.sequence >= state.NextSequence(action.signer);
-    }
 
     void RemoveLocalRetry(StoredAction& stored)
     {
@@ -4022,14 +4024,71 @@ void FlowMeshRuntime::HandleAction(
     Market& market, const flowmesh::WirePeerId peer,
     const flowmesh::WireMessage& message)
 {
+    const bool local{peer == LOCAL_ACTION_PEER};
     if (message.header.version != flowmesh::FLOWMESH_WIRE_VERSION_V1 ||
         message.header.market_id != market.market_id ||
         message.header.epoch != market.seats.epoch ||
-        message.header.sequence != market.next_sequence) {
+        message.header.sequence > market.next_sequence ||
+        (!local && message.header.sequence != market.next_sequence)) {
+        if (local) {
+            if (const auto action{flowmesh::DecodeProductionActionPayload(message.payload)}) {
+                ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action,
+                                  "local queued action header is not current authority; this attempt was not admitted");
+            }
+        }
         return;
     }
     const auto action{flowmesh::DecodeProductionActionPayload(message.payload)};
     if (!action) return;
+    const bool refresh_local_header{local && message.header.sequence < market.next_sequence};
+    if (refresh_local_header) {
+        // SubmitLocalAction captures its wrapper before taking the bounded
+        // queue lock. A certificate can overtake it there. As with an already
+        // admitted local retry, only its routing sequence may advance: first
+        // recheck pending state, current authority and anchored deposit facts.
+        // Add below still authenticates the original shape/credential and
+        // enforces all pool/conflicting-sequence limits. No remote envelope
+        // receives this treatment, and no action payload is rewritten.
+        const auto refuse = [&](const char* reason) {
+            ClientActionEvent(market, flowmesh::ClientEventKind::POOL_REFUSED, *action, reason);
+        };
+        // Only the immediately preceding durable body is retained here with
+        // authenticated authority. It must cover the ENTIRE interval since
+        // this wrapper was captured: StillPending alone does not exclude a
+        // certified action whose execution was rejected without consuming its
+        // deposit or account sequence. Older/missing evidence needs existing
+        // exact-action status/recovery, not an unbounded history scan or an
+        // observational client-event-ring inference. This deliberately does
+        // not promise autonomous progress across multiple head advances.
+        if (!market.client_head || message.header.sequence != market.next_sequence - 1 ||
+            market.client_head->entry.sequence != message.header.sequence ||
+            market.client_head->entry.epoch != message.header.epoch ||
+            market.client_head->entry.market_id != market.market_id) {
+            refuse("local queued action lacks a complete retained certified-head interval; check exact-action status before retry");
+            return;
+        }
+        const auto id{action->Id()};
+        if (std::any_of(market.client_head->entry.actions.begin(), market.client_head->entry.actions.end(),
+                        [&](const auto& included) { return included.Id() == id; })) {
+            refuse("local queued action was already certified; inclusion is terminal regardless of execution outcome");
+            return;
+        }
+        if (!RuntimeActionPool::StillPending(*action, market.state)) {
+            refuse("local queued action is no longer pending in current state; prior certified inclusion is not undone");
+            return;
+        }
+        const auto transition{CurrentSeatTransition(market)};
+        const auto anchor{market.chain->Current()};
+        if (market.pending_handoff || market.pending_candidate_restore || !transition ||
+            transition->kind != FlowMeshSeatTransitionKind::CONTINUE || !market.chain->Acceptable(anchor)) {
+            refuse("local queued action cannot refresh its header while current authority is unavailable; retry exact instruction");
+            return;
+        }
+        if (action->IsDeposit() && (market.deposits == nullptr || !market.deposits->GetDeposit(action->outpoint, anchor))) {
+            refuse("local queued deposit has no current anchored facts; this attempt was not admitted");
+            return;
+        }
+    }
     if (!market.pool.Add(*action, peer, market.clock->Now())) {
         const bool already_admitted{market.pool.ContainsExact(*action)};
         ClientActionEvent(market, already_admitted ? flowmesh::ClientEventKind::POOL_ADMITTED
@@ -4050,8 +4109,10 @@ void FlowMeshRuntime::HandleAction(
     DeliveryEvent(market, "action_round_observed", flowmesh::WireMessageKind::ACTION,
                   action->Id(), market.next_sequence, peer,
                   "pool_admission" + RoundTiming(market), SchedulingContext(market));
-    RelayMessage(market, message, std::nullopt,
-                 peer == LOCAL_ACTION_PEER
+    auto routed{message};
+    if (refresh_local_header) routed.header.sequence = market.next_sequence;
+    RelayMessage(market, std::move(routed), std::nullopt,
+                 local
                      ? std::nullopt
                      : std::optional<flowmesh::WirePeerId>{peer});
     // Fresh authenticated work need not wait for the periodic maintenance

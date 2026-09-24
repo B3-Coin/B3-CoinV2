@@ -7403,8 +7403,11 @@ BOOST_AUTO_TEST_CASE(preagreement_local_queued_action_survives_certified_head_ad
         BOOST_CHECK_EQUAL(f.runtimes[i]->StateSnapshot(f.market)->NextSequence(account), 1U);
     }
     const auto head{f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash};
-    for (const auto& replay : {queued, flowmesh::WireMessage{flowmesh::WireMessageKind::ACTION,
-            queued.header, *flowmesh::EncodeProductionActionPayload(Deposit(f.outpoint))}}) {
+    auto replay_header{queued.header};
+    replay_header.sequence = 2; // one-head check: terminal tail and consumed older deposit
+    for (const auto& replay : {flowmesh::WireMessage{flowmesh::WireMessageKind::ACTION, replay_header, *payload},
+            flowmesh::WireMessage{flowmesh::WireMessageKind::ACTION, replay_header,
+                *flowmesh::EncodeProductionActionPayload(Deposit(f.outpoint))}}) {
         const auto action{flowmesh::DecodeProductionActionPayload(replay.payload)};
         BOOST_REQUIRE(action);
         BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(local_peer, replay) == flowmesh::QueueResult::ACCEPTED);
@@ -7419,6 +7422,145 @@ BOOST_AUTO_TEST_CASE(preagreement_local_queued_action_survives_certified_head_ad
         BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->pending_actions, 0U);
         BOOST_CHECK(f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash == head);
     }
+
+    // A fresh, valid instruction has no known terminal disposition. Its old
+    // wrapper spans TWO durable heads, so the retained last body is not a
+    // complete inclusion history. Refuse explicitly instead of guessing or
+    // scanning storage; the caller must use existing exact-action recovery.
+    f.block_commits = true;
+    auto older_tail{tail};
+    older_tail.sequence = 1;
+    older_tail.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_ASK);
+    older_tail.curve.clear();
+    BOOST_REQUIRE(flowmesh::SignAction(account_key, f.domain, f.initial.ConfigId(), older_tail));
+    const auto older_payload{flowmesh::EncodeProductionActionPayload(older_tail)};
+    BOOST_REQUIRE(older_payload);
+    BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(local_peer,
+        {flowmesh::WireMessageKind::ACTION, queued.header, *older_payload}) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    const auto older_events{f.runtimes[0]->ClientEvents(std::nullopt, f.market, account).events};
+    BOOST_CHECK(std::none_of(older_events.begin(), older_events.end(), [&](const auto& event) {
+        return event.kind == flowmesh::ClientEventKind::POOL_ADMITTED && event.action_id == older_tail.Id();
+    }));
+    BOOST_CHECK(std::any_of(older_events.begin(), older_events.end(), [&](const auto& event) {
+        return event.kind == flowmesh::ClientEventKind::POOL_REFUSED && event.action_id == older_tail.Id() &&
+               event.reason.find("complete retained certified-head interval") != std::string::npos;
+    }));
+    BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->pending_actions, 0U);
+    BOOST_CHECK(f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash == head);
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_queued_certified_but_rejected_deposit_is_terminal)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_queued_rejected_deposit"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    // Both deposits have positive, bounded anchored facts. The second cannot
+    // credit an already-full vault, so certification does NOT consume it.
+    f.deposits.entries.at(f.outpoint).amount = MAX_MONEY;
+    const COutPoint rejected_outpoint{f.outpoint.hash, 1};
+    f.deposits.entries.emplace(rejected_outpoint, flowmesh::DepositInfo{f.asset, 1, f.account});
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
+    f.Drain();
+    const auto action{Deposit(rejected_outpoint)};
+    const auto payload{flowmesh::EncodeProductionActionPayload(action)};
+    BOOST_REQUIRE(payload);
+    const auto local_peer{std::numeric_limits<flowmesh::WirePeerId>::min()};
+    const flowmesh::WireMessage queued{flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 2}, *payload};
+    // This is a controlled certified-recovery edge, not a claim that the
+    // current honest leader selects this rejected body without a view change.
+    // Use the existing production builder and actual quorum BLS signatures.
+    std::string error;
+    std::optional<node::StoredProductionEntry> previous;
+    BOOST_REQUIRE(f.stores[0]->ReadEntry(1, f.seats.seats, previous, error));
+    BOOST_REQUIRE(previous);
+    const auto before{f.runtimes[0]->StateSnapshot(f.market)};
+    const auto before_status{f.runtimes[0]->MarketStatus(f.market)};
+    BOOST_REQUIRE(before);
+    BOOST_REQUIRE(before_status);
+    flowmesh::ProductionEpochGate gate{f.domain, f.market, f.seats.seats};
+    flowmesh::ProductionEntryCheck check;
+    const std::array actions{action};
+    const auto built{flowmesh::BuildProductionExecutionEntry(
+        *before, f.domain, f.market, f.seats.seats, gate, 2,
+        before_status->next_effect_index, before_status->last_microblock_hash,
+        f.chains[0].Current(), {f.chains[0].TipHeight(), previous->entry.anchor, &f.chains[0]},
+        f.treasury, actions, &f.deposits, check)};
+    BOOST_REQUIRE(built);
+    BOOST_CHECK(!built->next_state.DepositConsumed(rejected_outpoint));
+    const auto certified_payload{flowmesh::EncodeProductionCertifiedPayload(
+        {built->entry, Certify(built->entry, f.seats)}, f.seats.seats.Size())};
+    BOOST_REQUIRE(certified_payload);
+    f.block_commits = true;
+    std::mutex barrier_mutex;
+    std::condition_variable barrier_cv;
+    bool entered{false}, released{false}, barrier_timed_out{false};
+    struct ReleaseBeforeStop {
+        PreagreementRuntimeHarness<>& fixture;
+        std::mutex& mutex;
+        std::condition_variable& cv;
+        bool& released;
+        ~ReleaseBeforeStop()
+        {
+            { std::lock_guard lock{mutex}; released = true; }
+            cv.notify_all();
+            fixture.StopAll();
+        }
+    } release_before_stop{f, barrier_mutex, barrier_cv, released};
+    f.network.SetFilter([&](size_t from, size_t, const flowmesh::WireMessage& wire) {
+        if (from == 0 && wire.kind == flowmesh::WireMessageKind::GET) {
+            std::unique_lock lock{barrier_mutex};
+            entered = true;
+            barrier_cv.notify_all();
+            barrier_timed_out = !barrier_cv.wait_for(lock, std::chrono::seconds{15}, [&] { return released; });
+            return false;
+        }
+        return f.Observe(wire);
+    });
+    BOOST_REQUIRE(f.runtimes[0]->RequestCatchup(1, f.market));
+    {
+        std::unique_lock lock{barrier_mutex};
+        BOOST_REQUIRE(barrier_cv.wait_for(lock, std::chrono::seconds{5}, [&] { return entered; }));
+    }
+    BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(local_peer, queued) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(1,
+        {flowmesh::WireMessageKind::CERTIFICATE, queued.header, *certified_payload}) == flowmesh::QueueResult::ACCEPTED);
+    // An erroneous re-admission stays observable without permitting another
+    // certificate or turning the regression into an unbounded retry loop.
+    {
+        std::lock_guard lock{barrier_mutex};
+        BOOST_REQUIRE(!barrier_timed_out);
+        released = true;
+    }
+    barrier_cv.notify_all();
+    f.Drain();
+    BOOST_REQUIRE_EQUAL(f.runtimes[0]->MarketStatus(f.market)->next_sequence, 3U);
+    const auto state{f.runtimes[0]->StateSnapshot(f.market)};
+    BOOST_REQUIRE(state);
+    BOOST_CHECK(!state->DepositConsumed(rejected_outpoint));
+    BOOST_CHECK_EQUAL(state->LedgerView().Available(f.account, f.asset), MAX_MONEY);
+    std::optional<node::StoredProductionEntry> stored;
+    BOOST_REQUIRE(f.stores[0]->ReadEntry(2, f.seats.seats, stored, error));
+    BOOST_REQUIRE(stored);
+    BOOST_REQUIRE_EQUAL(stored->entry.actions.size(), 1U);
+    BOOST_CHECK(stored->entry.actions.front().Id() == action.Id());
+    BOOST_CHECK(flowmesh::CheckProductionEntryCertificate(stored->entry, f.seats.seats, stored->certificate) ==
+                flowmesh::BlsCertificateCheck::OK);
+    const auto events{f.runtimes[0]->ClientEvents(std::nullopt, f.market, std::nullopt).events};
+    BOOST_CHECK_MESSAGE(std::none_of(events.begin(), events.end(), [&](const auto& event) {
+        return event.kind == flowmesh::ClientEventKind::POOL_ADMITTED && event.action_id == action.Id() &&
+               event.microblock_sequence == 3;
+    }), "certified but unapplied queued deposit was incorrectly re-admitted at the new head");
+    BOOST_CHECK(std::any_of(events.begin(), events.end(), [&](const auto& event) {
+        return event.kind == flowmesh::ClientEventKind::POOL_REFUSED && event.action_id == action.Id();
+    }));
+    BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->pending_actions, 0U);
+    const auto status{f.runtimes[0]->ClientActionStatus(f.market, action.Id())};
+    BOOST_REQUIRE(status);
+    BOOST_CHECK(status->kind == flowmesh::ClientEventKind::CERTIFIED_INCLUDED);
 }
 
 BOOST_AUTO_TEST_CASE(preagreement_stale_local_action_revalidation_preserves_remote_and_authority_bounds)
