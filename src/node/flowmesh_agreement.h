@@ -25,6 +25,16 @@ enum class FlowMeshAgreementCrashPoint {
     AFTER_DECISION_PERSIST,
 };
 
+/** Local benchmark observation only; never journaled or sent to peers. */
+struct FlowMeshAgreementTrace {
+    const char* operation;
+    flowmesh::PreagreementContext context;
+    uint32_t view;
+    uint256 candidate;
+    uint64_t span_id, parent_span_id, started_us, completed_us;
+    std::optional<uint32_t> agreement_stage, seat_index;
+};
+
 struct FlowMeshAgreementCallbacks {
     using Bytes = std::vector<unsigned char>;
     // Missing evidence, unavailable canonical anchors, or failed execution
@@ -42,6 +52,11 @@ struct FlowMeshAgreementCallbacks {
     std::function<bool(const flowmesh::AgreementMessage&)> publish;
     // Deterministic crash injection for tests; omitted by production callers.
     std::function<void(FlowMeshAgreementCrashPoint)> crash;
+    // Both are absent in normal operation. Callbacks must not throw. Nested
+    // spans include child work; WriteBatch(true) is a DB-call bracket, not a
+    // measurement of the storage device's fsync alone.
+    std::function<uint64_t()> trace_clock;
+    std::function<void(const FlowMeshAgreementTrace&)> trace;
 };
 
 /** Single-slot PBFT agreement with an independently fsynced signing journal.

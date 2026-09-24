@@ -11,6 +11,7 @@
 #include <streams.h>
 #include <univalue.h>
 #include <util/log.h>
+#include <util/threadnames.h>
 #include <util/time.h>
 
 #include <algorithm>
@@ -636,6 +637,101 @@ struct TraceContext {
     std::optional<uint64_t> delivery_id;
     std::optional<uint64_t> observed_monotonic_us, epoch;
     std::optional<uint256> seat_set_hash;
+    // Diagnostic-only nested spans, omitted from protocol/state snapshots.
+    std::optional<uint64_t> started_us, span_id, parent_span_id;
+    std::optional<uint32_t> agreement_stage;
+};
+
+/** Queue observations cannot take m_market_mutex: admission also runs inside
+ * relay callbacks. Keep them in a separate bounded stream, correlated by the
+ * exact wire hash/peer and monotonic clock. Duplicate admissions/evictions mean
+ * a wire hash alone is not a unique queue-item identifier. */
+struct WorkerTrace {
+    const bool enabled{util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug)};
+    const FlowMeshRuntimeClock& clock;
+    const char* stage;
+    const char* work{"none"};
+    uint64_t started_us{0}, queue_lock_requested_us{0}, queue_locked_us{0};
+    uint64_t wait_started_us{0}, wait_returned_us{0}, dequeued_us{0};
+    uint64_t notified_us{0}, tick_requested_us{0}, processing_started_us{0};
+    uint64_t enqueue_started_us{0}, enqueued_us{0}, notify_completed_us{0};
+    uint64_t work_started_us{0}, processing_completed_us{0};
+    uint64_t finish_lock_requested_us{0}, finish_locked_us{0};
+    size_t queue_before{0}, queue_after{0}, queue_bytes{0}, control_depth{0};
+    bool worker_processing{false}, worker_waiting{false}, tick_pending{false};
+    bool coalesced{false}, delivery_completion{false};
+    std::optional<flowmesh::WireHeader> header;
+    flowmesh::WireMessageKind kind{flowmesh::WireMessageKind::ACTION};
+    std::optional<flowmesh::WirePeerId> peer;
+    std::optional<uint256> wire_hash;
+    std::optional<flowmesh::QueueResult> result;
+
+    WorkerTrace(const FlowMeshRuntimeClock& c, const char* s) : clock{c}, stage{s}
+    {
+        if (enabled) started_us = TraceNow(clock);
+    }
+    void Wire(const flowmesh::WireMessage& message, flowmesh::WirePeerId source)
+    {
+        if (!enabled) return;
+        header = message.header; kind = message.kind; peer = source;
+        try {
+            flowmesh::WireCheck check;
+            if (const auto bytes{flowmesh::EncodeWireMessage(message, check)}) wire_hash = Hash(*bytes);
+        } catch (...) { /* An absent correlation hash is not admission failure. */ }
+    }
+    ~WorkerTrace()
+    {
+        if (!enabled) return;
+        // Capture the endpoint before JSON construction/logging. This stream
+        // has its own fixed count cap; truncation is an explicit unknown tail.
+        const auto completed_us{TraceNow(clock)};
+        static std::atomic<uint64_t> count{0};
+        const auto index{count.fetch_add(1, std::memory_order_relaxed)};
+        if (index > 32768) return;
+        try {
+            UniValue row{UniValue::VOBJ};
+            row.pushKV("stage", index == 32768 ? "trace_limit_reached" : stage);
+            row.pushKV("thread", util::ThreadGetInternalName());
+            row.pushKV("thread_id", uint64_t{std::hash<std::thread::id>{}(std::this_thread::get_id())});
+            row.pushKV("monotonic_us", completed_us);
+            row.pushKV("started_us", started_us);
+            row.pushKV("queue_lock_requested_us", queue_lock_requested_us);
+            row.pushKV("queue_locked_us", queue_locked_us);
+            row.pushKV("wait_started_us", wait_started_us);
+            row.pushKV("wait_returned_us", wait_returned_us);
+            row.pushKV("dequeued_us", dequeued_us);
+            row.pushKV("notified_us", notified_us);
+            row.pushKV("notify_completed_us", notify_completed_us);
+            row.pushKV("enqueue_started_us", enqueue_started_us);
+            row.pushKV("enqueued_us", enqueued_us);
+            row.pushKV("tick_requested_us", tick_requested_us);
+            row.pushKV("processing_started_us", processing_started_us);
+            row.pushKV("work_started_us", work_started_us);
+            row.pushKV("processing_completed_us", processing_completed_us);
+            row.pushKV("finish_lock_requested_us", finish_lock_requested_us);
+            row.pushKV("finish_locked_us", finish_locked_us);
+            row.pushKV("work", work);
+            row.pushKV("queue_before", uint64_t{queue_before});
+            row.pushKV("queue_after", uint64_t{queue_after});
+            row.pushKV("queue_bytes", uint64_t{queue_bytes});
+            row.pushKV("control_depth", uint64_t{control_depth});
+            row.pushKV("worker_processing", worker_processing);
+            row.pushKV("worker_waiting", worker_waiting);
+            row.pushKV("tick_pending", tick_pending);
+            row.pushKV("coalesced", coalesced);
+            row.pushKV("delivery_completion", delivery_completion);
+            if (header) {
+                row.pushKV("market_id", header->market_id.GetHex());
+                row.pushKV("epoch", header->epoch);
+                row.pushKV("sequence", header->sequence);
+                row.pushKV("kind", std::string{flowmesh::WireCommand(kind)});
+            }
+            if (peer) row.pushKV("peer", *peer);
+            if (wire_hash) row.pushKV("wire_hash", wire_hash->GetHex());
+            if (result) row.pushKV("queue_result", static_cast<unsigned>(*result));
+            LogDebug(BCLog::BENCH, "FlowMeshWorkerTrace %s\n", row.write());
+        } catch (...) { /* Diagnostics must not change admission/worker behavior. */ }
+    }
 };
 
 TraceContext EntryTrace(const flowmesh::ProductionEntryCore& entry)
@@ -715,6 +811,7 @@ void DeliveryEvent(Market& market, const char* stage,
         }
         UniValue row{UniValue::VOBJ};
         row.pushKV("market_id", market.market_id.GetHex());
+        row.pushKV("thread_id", uint64_t{std::hash<std::thread::id>{}(std::this_thread::get_id())});
         row.pushKV("event_id", event.event_id);
         row.pushKV("monotonic_us", event.monotonic_us);
         row.pushKV("stage", event.stage);
@@ -731,6 +828,10 @@ void DeliveryEvent(Market& market, const char* stage,
         if (event.signature_hash) row.pushKV("signature_hash", event.signature_hash->GetHex());
         if (event.wire_hash) row.pushKV("wire_hash", event.wire_hash->GetHex());
         if (event.delivery_id) row.pushKV("delivery_id", *event.delivery_id);
+        if (trace.started_us) row.pushKV("started_us", *trace.started_us);
+        if (trace.span_id) row.pushKV("span_id", *trace.span_id);
+        if (trace.parent_span_id) row.pushKV("parent_span_id", *trace.parent_span_id);
+        if (trace.agreement_stage) row.pushKV("agreement_stage", *trace.agreement_stage);
         row.pushKV("reason", event.reason);
         const auto line{row.write()};
         // Include a bounded allowance for the logger's prefix and newline.
@@ -752,6 +853,35 @@ void DeliveryEvent(Market& market, const char* stage,
         LogDebug(BCLog::BENCH, "FlowMeshTrace %s\n", line);
     }
 }
+
+template <typename Market>
+class BenchSpan {
+    Market& market;
+    const char* stage;
+    flowmesh::WireMessageKind kind;
+    uint256 object;
+    uint64_t sequence;
+    std::optional<uint64_t> started;
+    TraceContext trace;
+public:
+    BenchSpan(Market& m, const char* s, flowmesh::WireMessageKind k,
+              const uint256& id, uint64_t seq) : market{m}, stage{s}, kind{k}, object{id}, sequence{seq}
+    {
+        if (util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug)) {
+            started = TraceNow(*m.clock);
+            trace.epoch = market.seats.epoch;
+            trace.seat_set_hash = market.seats.set_hash;
+        }
+    }
+    ~BenchSpan()
+    {
+        if (!started) return;
+        trace.started_us = started;
+        trace.observed_monotonic_us = TraceNow(*market.clock);
+        try { DeliveryEvent(market, stage, kind, object, sequence, std::nullopt, {}, trace); }
+        catch (...) { /* A benchmark logger is not part of consensus. */ }
+    }
+};
 
 template <typename Market>
 TraceContext SchedulingContext(const Market& market)
@@ -1074,6 +1204,8 @@ std::unique_ptr<typename Market::Candidate> EvaluateCandidate(
     Market& market, const flowmesh::ProductionEntryCore& entry,
     const std::vector<flowmesh::Action>* authenticated_evidence)
 {
+    BenchSpan trace{market, "candidate_evaluation_completed", flowmesh::WireMessageKind::PROPOSAL,
+                    uint256{}, entry.sequence};
     if (market.halt != FlowMeshRuntimeHalt::NONE || market.pending_handoff ||
         entry.domain != market.domain || entry.market_id != market.market_id ||
         entry.epoch != market.seats.epoch ||
@@ -1087,10 +1219,10 @@ std::unique_ptr<typename Market::Candidate> EvaluateCandidate(
     }
     const auto transition{CurrentSeatTransition(market)};
     if (!transition) return nullptr;
-    if (authenticated_evidence != nullptr &&
-        !AuthenticateCandidateEvidence(market, entry,
-                                       *authenticated_evidence)) {
-        return nullptr;
+    if (authenticated_evidence != nullptr) {
+        BenchSpan authentication{market, "candidate_evidence_authentication_completed",
+                                flowmesh::WireMessageKind::PROPOSAL, uint256{}, entry.sequence};
+        if (!AuthenticateCandidateEvidence(market, entry, *authenticated_evidence)) return nullptr;
     }
 
     const auto anchors{AnchorContext(market)};
@@ -1193,6 +1325,8 @@ std::optional<std::vector<unsigned char>> ValidateAgreementCandidate(
     Market& market, std::span<const unsigned char> bytes,
     std::optional<std::span<const unsigned char>> restored)
 {
+    BenchSpan trace{market, "agreement_candidate_callback_completed", flowmesh::WireMessageKind::AGREEMENT,
+                    uint256{}, market.next_sequence};
     if (!market.chain->Acceptable(market.chain->Current())) return std::nullopt;
     const auto entry{flowmesh::DecodeProductionEntry(bytes)};
     if (!entry) return std::nullopt;
@@ -1206,6 +1340,8 @@ std::optional<std::vector<unsigned char>> ValidateAgreementCandidate(
     if (!evidence) return std::nullopt;
     auto candidate{EvaluateCandidate(market, *entry, &*evidence)};
     if (!candidate) return std::nullopt;
+    BenchSpan materialization{market, "agreement_candidate_materialization_completed",
+                             flowmesh::WireMessageKind::AGREEMENT, uint256{}, entry->sequence};
     if (!market.candidates.contains(entry->GetHash()) &&
         market.candidates.size() >= MAX_RUNTIME_CANDIDATES_PER_SEQUENCE) return std::nullopt;
     DataStream encoded;
@@ -2327,6 +2463,23 @@ bool FlowMeshRuntime::InitializeAgreement(Market& market,
     callbacks.publish = [this, &market](const flowmesh::AgreementMessage& message) {
         return PublishAgreement(market, message);
     };
+    if (util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug)) {
+        callbacks.trace_clock = [&market] { return TraceNow(*market.clock); };
+        callbacks.trace = [&market](const FlowMeshAgreementTrace& event) {
+            TraceContext trace;
+            trace.epoch = event.context.epoch;
+            trace.seat_set_hash = event.context.seat_set_hash;
+            trace.round = event.view;
+            trace.started_us = event.started_us;
+            trace.observed_monotonic_us = event.completed_us;
+            trace.span_id = event.span_id;
+            trace.parent_span_id = event.parent_span_id;
+            trace.agreement_stage = event.agreement_stage;
+            trace.seat_index = event.seat_index;
+            DeliveryEvent(market, "agreement_span", flowmesh::WireMessageKind::AGREEMENT,
+                          event.candidate, event.context.sequence, std::nullopt, event.operation, trace);
+        };
+    }
     try {
         market.agreement = std::make_unique<FlowMeshAgreement>(
             DBParams{.path = config.agreement_path, .cache_bytes = 1 << 20}, std::move(callbacks));
@@ -2392,6 +2545,8 @@ bool FlowMeshRuntime::RefreshAgreement(Market& market)
 bool FlowMeshRuntime::PublishAgreement(Market& market, const flowmesh::AgreementMessage& message,
                                        const std::optional<flowmesh::WirePeerId> exclude)
 {
+    BenchSpan trace{market, "agreement_publication_completed", flowmesh::WireMessageKind::AGREEMENT,
+                    message.candidate, message.context.sequence};
     const auto refuse = [&](const std::string& reason) {
         CountObservation(market.delivery.refused);
         DeliveryEvent(market, "agreement_refused", flowmesh::WireMessageKind::AGREEMENT,
@@ -2506,6 +2661,8 @@ void FlowMeshRuntime::HandleAgreement(Market& market, flowmesh::WirePeerId peer,
 
 void FlowMeshRuntime::FinalizeAgreement(Market& market)
 {
+    BenchSpan trace{market, "agreement_finalization_completed", flowmesh::WireMessageKind::AGREEMENT,
+                    uint256{}, market.next_sequence};
     if (!market.agreement || !RefreshAgreement(market)) return;
     const auto hash{market.agreement->DecidedCandidate()};
     if (!hash) return;
@@ -2522,8 +2679,12 @@ void FlowMeshRuntime::FinalizeAgreement(Market& market)
         auto vote{votes.find(seat)};
         if (vote == votes.end()) {
             flowmesh::ProductionLockResult lock;
-            const auto signed_vote{flowmesh::SignProductionEntryAttestation(
-                key, seat, candidate.entry, market.seats, guard, lock)};
+            const auto signed_vote{[&] {
+                BenchSpan signing{market, "v1_durable_lock_and_attestation_sign_completed",
+                    flowmesh::WireMessageKind::ATTESTATION, *hash, market.next_sequence};
+                return flowmesh::SignProductionEntryAttestation(
+                    key, seat, candidate.entry, market.seats, guard, lock);
+            }()};
             if (!signed_vote) {
                 HaltMarket(market, FlowMeshRuntimeHalt::SIGNING_CONFLICT,
                            "durable agreement decision could not acquire its unchanged V1 signing lock");
@@ -2622,6 +2783,8 @@ void FlowMeshRuntime::Stop()
 flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     const flowmesh::WirePeerId peer, flowmesh::WireMessage message)
 {
+    WorkerTrace trace{*m_config.clock, "wire_enqueue"};
+    trace.Wire(message, peer);
     if (message.kind == flowmesh::WireMessageKind::AGREEMENT &&
         (message.payload.empty() || message.payload.size() > flowmesh::FLOWMESH_AGREEMENT_MAX_BYTES)) {
         return flowmesh::QueueResult::MALFORMED;
@@ -2630,7 +2793,16 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     const std::optional<uint256> agreement_payload{
         message.kind == flowmesh::WireMessageKind::AGREEMENT
             ? std::optional<uint256>{Hash(message.payload)} : std::nullopt};
+    if (trace.enabled) trace.queue_lock_requested_us = TraceNow(*m_config.clock);
     std::lock_guard<std::mutex> lock{m_queue_mutex};
+    if (trace.enabled) {
+        trace.queue_locked_us = TraceNow(*m_config.clock);
+        trace.queue_before = trace.queue_after = m_queue.Size();
+        trace.queue_bytes = m_queue.Bytes();
+        trace.worker_processing = m_processing;
+        trace.worker_waiting = m_worker_waiting;
+        trace.tick_pending = m_tick_pending;
+    }
     if (!m_started || m_stopping) return flowmesh::QueueResult::STOPPED;
     // Reject caller-selected market ids before BoundedWireQueue allocates a
     // per-peer/market token bucket. Otherwise a peer can evade throttling and
@@ -2659,14 +2831,31 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
                 if (known->second.header.sequence < quiet->second.sequence ||
                     m_config.clock->Now() < known->second.until) {
                     ++quiet->second.coalesced;
+                    if (trace.enabled) {
+                        trace.result = flowmesh::QueueResult::ACCEPTED;
+                        trace.coalesced = true;
+                    }
                     return flowmesh::QueueResult::ACCEPTED;
                 }
             }
         }
     }
+    if (trace.enabled) trace.enqueue_started_us = TraceNow(*m_config.clock);
     const auto result{m_queue.Push(peer, std::move(message),
                                    m_config.clock->Now())};
-    if (result == flowmesh::QueueResult::ACCEPTED) m_work_cv.notify_one();
+    if (trace.enabled) {
+        trace.enqueued_us = TraceNow(*m_config.clock);
+        trace.result = result;
+        trace.queue_after = m_queue.Size();
+        trace.queue_bytes = m_queue.Bytes();
+        trace.control_depth = m_removed_peers.size() + m_add_market_commands.size() +
+            m_catchup_commands.size() + m_delivery_events.size();
+    }
+    if (result == flowmesh::QueueResult::ACCEPTED) {
+        if (trace.enabled) trace.notified_us = TraceNow(*m_config.clock);
+        m_work_cv.notify_one();
+        if (trace.enabled) trace.notify_completed_us = TraceNow(*m_config.clock);
+    }
     return result;
 }
 
@@ -2716,11 +2905,25 @@ void FlowMeshRuntime::FlowMeshPeerDisconnected(
 
 void FlowMeshRuntime::NotifyTick()
 {
+    WorkerTrace trace{*m_config.clock, "tick_notification"};
+    if (trace.enabled) trace.queue_lock_requested_us = TraceNow(*m_config.clock);
     std::lock_guard<std::mutex> lock{m_queue_mutex};
+    if (trace.enabled) {
+        trace.queue_locked_us = TraceNow(*m_config.clock);
+        trace.queue_before = trace.queue_after = m_queue.Size();
+        trace.worker_processing = m_processing;
+        trace.worker_waiting = m_worker_waiting;
+        trace.tick_pending = m_tick_pending;
+    }
     if (!m_started || m_stopping) return;
     if (!m_tick_pending) m_tick_requested_us = TraceNow(*m_config.clock);
     m_tick_pending = true;
+    if (trace.enabled) {
+        trace.tick_requested_us = m_tick_requested_us;
+        trace.notified_us = TraceNow(*m_config.clock);
+    }
     m_work_cv.notify_one();
+    if (trace.enabled) trace.notify_completed_us = TraceNow(*m_config.clock);
 }
 
 bool FlowMeshRuntime::RequestCatchup(
@@ -3003,6 +3206,7 @@ bool FlowMeshRuntime::WaitForIdle(const std::chrono::milliseconds timeout)
 void FlowMeshRuntime::WorkerLoop()
 {
     while (true) {
+        WorkerTrace trace{*m_config.clock, "worker_iteration"};
         std::optional<flowmesh::QueuedWireMessage> message;
         std::optional<flowmesh::WirePeerId> removed;
         std::optional<CatchupCommand> catchup;
@@ -3011,13 +3215,27 @@ void FlowMeshRuntime::WorkerLoop()
         bool tick{false};
         uint64_t tick_requested_us{0}, dequeued_us{0};
         {
+            if (trace.enabled) trace.queue_lock_requested_us = TraceNow(*m_config.clock);
             std::unique_lock<std::mutex> lock{m_queue_mutex};
+            if (trace.enabled) {
+                trace.queue_locked_us = TraceNow(*m_config.clock);
+                trace.wait_started_us = TraceNow(*m_config.clock);
+                m_worker_waiting = true;
+            }
             m_work_cv.wait(lock, [&] {
                 return m_stopping || !m_queue.Empty() ||
                        !m_removed_peers.empty() ||
                        !m_catchup_commands.empty() ||
                        !m_add_market_commands.empty() || !m_delivery_events.empty() || m_tick_pending;
             });
+            if (trace.enabled) {
+                m_worker_waiting = false;
+                trace.wait_returned_us = TraceNow(*m_config.clock);
+                trace.queue_before = m_queue.Size();
+                trace.tick_pending = m_tick_pending;
+                trace.control_depth = m_removed_peers.size() + m_add_market_commands.size() +
+                    m_catchup_commands.size() + m_delivery_events.size();
+            }
             if (m_stopping) break;
             // At most one completion alongside one normal work item. A busy
             // completion stream cannot starve incoming consensus messages.
@@ -3042,10 +3260,22 @@ void FlowMeshRuntime::WorkerLoop()
                 message = m_queue.Pop();
             }
             dequeued_us = TraceNow(*m_config.clock);
+            if (trace.enabled) {
+                trace.dequeued_us = dequeued_us;
+                trace.tick_requested_us = tick_requested_us;
+                trace.queue_after = m_queue.Size();
+                trace.queue_bytes = m_queue.Bytes();
+                trace.work = removed ? "remove_peer" : add_market ? "add_market" :
+                    catchup ? "catchup" : tick ? "tick" : message ? "message" : "delivery_only";
+                trace.delivery_completion = delivery.has_value();
+            }
             m_processing = true;
         }
 
+        if (message) trace.Wire(message->message, message->peer);
+        if (trace.enabled) trace.processing_started_us = TraceNow(*m_config.clock);
         if (delivery) ProcessDeliveryEvent(*delivery);
+        if (trace.enabled) trace.work_started_us = TraceNow(*m_config.clock);
         if (removed) {
             RemovePeerOnWorker(*removed);
         } else if (add_market) {
@@ -3058,8 +3288,11 @@ void FlowMeshRuntime::WorkerLoop()
             ProcessMessage(*message, dequeued_us);
         }
 
+        if (trace.enabled) trace.processing_completed_us = TraceNow(*m_config.clock);
         {
+            if (trace.enabled) trace.finish_lock_requested_us = TraceNow(*m_config.clock);
             std::lock_guard<std::mutex> lock{m_queue_mutex};
+            if (trace.enabled) trace.finish_locked_us = TraceNow(*m_config.clock);
             m_processing = false;
             if (m_queue.Empty() && m_removed_peers.empty() &&
                 m_catchup_commands.empty() && m_add_market_commands.empty() &&
@@ -3177,6 +3410,8 @@ void FlowMeshRuntime::ProcessMessage(
     if (it == m_markets.end()) return;
     Market& market{*it->second};
     if (!market.ready) return;
+    BenchSpan processing{market, "message_processing_completed", queued.message.kind,
+                         uint256{}, queued.message.header.sequence};
     DeliveryEvent(market, "message_processing", queued.message.kind, {},
                   queued.message.header.sequence, queued.peer,
                   "dequeue_us=" + std::to_string(dequeued_us) +
@@ -3187,7 +3422,17 @@ void FlowMeshRuntime::ProcessMessage(
         queued.message.kind == flowmesh::WireMessageKind::ATTESTATION ||
         queued.message.kind == flowmesh::WireMessageKind::AGREEMENT ||
         queued.message.kind == flowmesh::WireMessageKind::CERTIFICATE};
-    if (critical && !market.chain->Acceptable(market.chain->Current())) {
+    const bool gate_open{[&] {
+        BenchSpan gate{market, "message_chain_gate_completed", queued.message.kind,
+                       uint256{}, queued.message.header.sequence};
+        return !critical || market.chain->Acceptable(market.chain->Current());
+    }()};
+    if (util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug)) {
+        DeliveryEvent(market, "message_chain_gate", queued.message.kind, {},
+            queued.message.header.sequence, queued.peer,
+            "open=" + std::to_string(gate_open) + " generation=" + std::to_string(delivery_generation));
+    }
+    if (!gate_open) {
         DeferMessage(market, queued);
         return;
     }
@@ -3282,6 +3527,8 @@ void FlowMeshRuntime::ProcessTick(const uint64_t requested_us, const uint64_t de
     for (auto& [market_id, market_ptr] : m_markets) {
         (void)market_id;
         Market& market{*market_ptr};
+        BenchSpan processing{market, "tick_market_processing_completed", flowmesh::WireMessageKind::PROPOSAL,
+                             uint256{}, market.next_sequence};
         market.evidence_retry_eligible = false;
         if (!RestoreRetainedCandidate(market) || !RefreshMarker(market) || !RefreshAgreement(market)) {
             SuspendAgreementTimeout(market);

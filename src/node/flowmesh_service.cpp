@@ -23,6 +23,7 @@
 #include <univalue.h>
 #include <util/int128.h>
 #include <util/thread.h>
+#include <util/threadnames.h>
 #include <validation.h>
 
 #include <algorithm>
@@ -167,21 +168,66 @@ constexpr size_t FLOWMESH_MARKET_DB_CACHE_BYTES{size_t{4} << 20};
 constexpr std::chrono::milliseconds FLOWMESH_TICK_INTERVAL{250};
 
 void ReconciliationTrace(const char* stage, uint64_t generation,
-                         const uint256& tip = {})
+                         const uint256& tip = {}, const UniValue* details = nullptr,
+                         uint64_t completed_us = 0)
 {
     if (!LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug)) return;
     // Fixed-size metadata and a process-lifetime cap, including one explicit
     // terminal marker. The marker means later reconciliation spans are unknown.
     static std::atomic<uint64_t> trace_count{0};
-    const auto count{trace_count.fetch_add(1, std::memory_order_relaxed)};
+    static std::atomic<uint64_t> span_trace_count{0};
+    const auto count{(details ? span_trace_count : trace_count).fetch_add(1, std::memory_order_relaxed)};
     if (count > 32768) return;
     UniValue event{UniValue::VOBJ};
-    event.pushKV("monotonic_us", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    event.pushKV("monotonic_us", completed_us ? completed_us : static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
     event.pushKV("stage", count == 32768 ? "trace_limit_reached" : stage);
     event.pushKV("generation", generation);
     event.pushKV("tip", tip.GetHex());
+    event.pushKV("thread", util::ThreadGetInternalName());
+    event.pushKV("thread_id", uint64_t{std::hash<std::thread::id>{}(std::this_thread::get_id())});
+    event.pushKV("stream", details ? "timing_spans" : "reconciliation");
+    if (details) event.pushKV("timing", *details);
     LogDebug(BCLog::BENCH, "FlowMeshServiceTrace %s\n", event.write());
 }
+
+class ServiceSpan {
+    const bool enabled{LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug)};
+    const char* stage;
+    uint64_t generation, started_us{0};
+    uint64_t mutex_requested_us{0}, mutex_acquired_us{0};
+    uint64_t cs_main_requested_us{0}, cs_main_acquired_us{0};
+    std::optional<bool> reconciling;
+    static uint64_t Now()
+    {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+public:
+    ServiceSpan(const char* s, uint64_t g) : stage{s}, generation{g}
+    {
+        if (enabled) started_us = Now();
+    }
+    void MutexRequested() { if (enabled) mutex_requested_us = Now(); }
+    void MutexAcquired() { if (enabled) mutex_acquired_us = Now(); }
+    void ChainLockRequested() { if (enabled) cs_main_requested_us = Now(); }
+    void ChainLockAcquired() { if (enabled) cs_main_acquired_us = Now(); }
+    void Gate(bool value) { if (enabled) reconciling = value; }
+    ~ServiceSpan()
+    {
+        if (!enabled) return;
+        const auto completed_us{Now()};
+        try {
+            UniValue timing{UniValue::VOBJ};
+            timing.pushKV("started_us", started_us);
+            timing.pushKV("mutex_requested_us", mutex_requested_us);
+            timing.pushKV("mutex_acquired_us", mutex_acquired_us);
+            timing.pushKV("cs_main_requested_us", cs_main_requested_us);
+            timing.pushKV("cs_main_acquired_us", cs_main_acquired_us);
+            if (reconciling) timing.pushKV("chain_reconciling", *reconciling);
+            ReconciliationTrace(stage, generation, {}, &timing, completed_us);
+        } catch (...) { /* Diagnostic-only; never a service gate. */ }
+    }
+};
 
 bool SameMembers(const flowmesh::ActiveFnBlsSeatSet& a,
                  const flowmesh::ActiveFnBlsSeatSet& b)
@@ -300,12 +346,17 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
 
     bool ReconciledTipMatches(const uint256& expected_tip) const
     {
+        ServiceSpan trace{"reconciled_tip_matches", DeliveryGeneration()};
         if (expected_tip.IsNull()) return false;
         {
+            trace.MutexRequested();
             std::lock_guard<std::mutex> lock{reconciled_tip_mutex};
+            trace.MutexAcquired();
             if (reconciled_tip != expected_tip) return false;
         }
+        trace.ChainLockRequested();
         LOCK(::cs_main);
+        trace.ChainLockAcquired();
         const CBlockIndex* tip{chainman.ActiveChain().Tip()};
         return tip != nullptr && tip->GetBlockHash() == expected_tip &&
                Consensus::FlowMeshRulesActive(tip->nHeight,
@@ -314,6 +365,8 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
 
     bool ReconciledAtTip() const
     {
+        ServiceSpan trace{"reconciled_at_tip", DeliveryGeneration()};
+        trace.Gate(chain_reconciling.load(std::memory_order_acquire));
         if (chain_reconciling.load(std::memory_order_acquire)) return false;
         uint256 expected_tip;
         {
@@ -341,17 +394,23 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
 
     bool Acceptable(const flowmesh::AnchorRef& anchor) const override
     {
+        ServiceSpan trace{"chain_acceptable", DeliveryGeneration()};
+        trace.Gate(chain_reconciling.load(std::memory_order_acquire));
         if (chain_reconciling.load(std::memory_order_acquire) ||
             anchor.height < 0 || anchor.hash.IsNull()) {
             return false;
         }
         uint256 expected_tip;
         {
+            trace.MutexRequested();
             std::lock_guard<std::mutex> lock{reconciled_tip_mutex};
+            trace.MutexAcquired();
             expected_tip = reconciled_tip;
         }
         if (expected_tip.IsNull()) return false;
+        trace.ChainLockRequested();
         LOCK(::cs_main);
+        trace.ChainLockAcquired();
         const CChain& active{chainman.ActiveChain()};
         const CBlockIndex* tip{active.Tip()};
         if (tip == nullptr ||
@@ -369,10 +428,15 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
 
     bool StillCanonical(const flowmesh::AnchorRef& anchor) const override
     {
+        ServiceSpan trace{"anchor_still_canonical_including_chain_lock", DeliveryGeneration()};
         return anchors.StillCanonical(anchor);
     }
 
-    flowmesh::AnchorRef Current() const override { return anchors.Current(); }
+    flowmesh::AnchorRef Current() const override
+    {
+        ServiceSpan trace{"current_anchor_including_chain_lock", DeliveryGeneration()};
+        return anchors.Current();
+    }
 
     void RememberSeatSet(const flowmesh::ActiveFnBlsSeatSet& seats) const
     {
@@ -424,13 +488,16 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         const flowmesh::MarketId& market_id, const uint64_t epoch,
         const flowmesh::AnchorRef& anchor, std::string& error) const
     {
+        ServiceSpan trace{"build_seat_set", DeliveryGeneration()};
         if (anchor.height < 0 || anchor.hash.IsNull()) {
             error = "FlowMesh seat anchor is null";
             return std::nullopt;
         }
         std::optional<flowmesh::ActiveFnBlsSeatSet> out;
         {
+            trace.ChainLockRequested();
             LOCK(::cs_main);
+            trace.ChainLockAcquired();
             Chainstate& chainstate{chainman.ActiveChainstate()};
             const CBlockIndex* tip{chainstate.m_chain.Tip()};
             const CBlockIndex* anchor_index{
@@ -643,6 +710,7 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         const uint256& domain, const flowmesh::MarketId& market_id,
         const flowmesh::ActiveFnBlsSeatSet& current) const override
     {
+        ServiceSpan trace{"seat_transition", DeliveryGeneration()};
         if (!ReconciledAtTip()) {
             return {FlowMeshSeatTransitionKind::PAUSED, std::nullopt, "b3_reconciliation_pending"};
         }
@@ -759,6 +827,7 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         const flowmesh::MarketId&,
         const flowmesh::ActiveFnBlsSeatSet&) const override
     {
+        ServiceSpan trace{"local_seat_keys", DeliveryGeneration()};
         if (!ReconciledAtTip()) return {};
         if (transport.mode == "independent") {
             std::shared_ptr<FlowMeshNetService> active_network;
@@ -769,7 +838,9 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
             // Transport failure is not permission to start a new signing history.
             if (!active_network || !active_network->Snapshot().running) return {};
         }
+        trace.MutexRequested();
         std::lock_guard<std::mutex> lock{mutex};
+        trace.MutexAcquired();
         if (!running || stopping) return {};
         return local_keys;
     }
@@ -855,6 +926,7 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     bool SettlementCheckpointPending(
         const flowmesh::MarketId& market_id) const
     {
+        ServiceSpan trace{"settlement_checkpoint_pending", DeliveryGeneration()};
         FlowMeshProductionStore* store{nullptr};
         {
             std::lock_guard<std::mutex> lock{mutex};
@@ -897,6 +969,7 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     std::optional<bool> SettlementExecutionRequired(
         const flowmesh::MarketId& market_id) const
     {
+        ServiceSpan trace{"settlement_execution_required", DeliveryGeneration()};
         FlowMeshProductionStore* store{nullptr};
         const ChainDepositVerifier* chain_facts{nullptr};
         {

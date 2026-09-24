@@ -209,6 +209,36 @@ struct FlowMeshAgreement::Impl {
     std::set<uint256> usable;
     std::optional<uint256> preferred;
     std::optional<uint256> required;
+    uint64_t trace_next_span{0}, trace_parent_span{0};
+
+    class TraceSpan {
+        Impl& owner;
+        std::optional<FlowMeshAgreementTrace> event;
+    public:
+        TraceSpan(Impl& s, const char* operation, const uint256& candidate = {}) : owner{s}
+        {
+            if (!s.callbacks.trace || !s.callbacks.trace_clock) return;
+            event.emplace(FlowMeshAgreementTrace{operation, s.Context(), s.slot.view, candidate,
+                ++s.trace_next_span, s.trace_parent_span, s.callbacks.trace_clock(), 0, {}, {}});
+            s.trace_parent_span = event->span_id;
+        }
+        TraceSpan(Impl& s, const char* operation, const AgreementMessage& message)
+            : TraceSpan{s, operation, message.candidate}
+        {
+            if (!event) return;
+            event->view = message.view;
+            event->agreement_stage = static_cast<uint32_t>(message.stage);
+            event->seat_index = message.seat_index;
+        }
+        ~TraceSpan()
+        {
+            if (!event) return;
+            event->completed_us = owner.callbacks.trace_clock();
+            owner.trace_parent_span = event->parent_span_id;
+            try { owner.callbacks.trace(*event); }
+            catch (...) { /* Diagnostics never affect durable agreement. */ }
+        }
+    };
 
     Impl(DBParams params, FlowMeshAgreementCallbacks c) : db(params), callbacks(std::move(c)) {}
     const PreagreementContext& Context() const { return slot.context.value; }
@@ -223,12 +253,14 @@ struct FlowMeshAgreement::Impl {
         error.clear(); return true;
     }
     void Crash(const FlowMeshAgreementCrashPoint point) { if (callbacks.crash) callbacks.crash(point); }
-    void Persist()
+    void Persist(const char* reason)
     {
+        TraceSpan trace{*this, reason};
         if (GetSerializeSize(slot) > MAX_SLOT_BYTES) throw std::runtime_error("agreement durable slot resource limit");
         CDBBatch batch{db};
         batch.Write(MARKER_KEY, marker);
         batch.Write(SlotKey{'s', Context().epoch, Context().sequence}, slot);
+        TraceSpan write{*this, "journal_write_batch_sync"};
         db.WriteBatch(batch, true);
     }
     std::optional<PreagreementPreparedCertificate> Highest() const
@@ -236,8 +268,9 @@ struct FlowMeshAgreement::Impl {
         return slot.highest.empty() ? std::nullopt : DecodePreagreementPrepared(slot.highest);
     }
     bool IsDecided() const { return !slot.decision.empty(); }
-    std::map<uint32_t, bls::SecretKey> Keys() const
+    std::map<uint32_t, bls::SecretKey> Keys()
     {
+        TraceSpan trace{*this, "local_key_eligibility"};
         std::map<uint32_t, bls::SecretKey> result;
         if (!callbacks.local_keys) return result;
         for (const auto& key : callbacks.local_keys()) {
@@ -403,6 +436,7 @@ struct FlowMeshAgreement::Impl {
     }
     bool CandidateReady(const uint256& hash)
     {
+        TraceSpan trace{*this, "candidate_ready", hash};
         const auto found{slot.candidates.find(hash)};
         if (found == slot.candidates.end()) { required = hash; return false; }
         if (usable.contains(hash)) return true;
@@ -412,7 +446,7 @@ struct FlowMeshAgreement::Impl {
         if (restored->size() > MAX_EVIDENCE_BYTES) throw std::runtime_error("agreement evidence resource limit");
         if (*restored != found->second.evidence) {
             found->second.evidence = *restored;
-            Persist();
+            Persist("persist_candidate_evidence");
         }
         usable.insert(hash);
         if (required == hash) required.reset();
@@ -420,6 +454,7 @@ struct FlowMeshAgreement::Impl {
     }
     bool RememberCandidate(const Bytes& bytes, const uint256& hash)
     {
+        TraceSpan trace{*this, "remember_candidate", hash};
         if (!EntryMatches(bytes, Context(), hash)) return false;
         if (slot.candidates.contains(hash)) return CandidateReady(hash);
         if (!callbacks.validate_candidate) return false;
@@ -429,7 +464,7 @@ struct FlowMeshAgreement::Impl {
             throw std::runtime_error("agreement candidate/evidence resource limit");
         }
         slot.candidates.emplace(hash, Candidate{bytes, *evidence});
-        Persist();
+        Persist("persist_candidate");
         usable.insert(hash);
         if (!preferred) preferred = hash;
         if (required == hash) required.reset();
@@ -443,7 +478,7 @@ struct FlowMeshAgreement::Impl {
         // its evidence becomes usable, without reopening that view's votes.
         if (proposal.view < slot.view && !slot.proposals.contains(proposal.view)) {
             slot.proposals.emplace(proposal.view, *EncodeAgreementMessage(proposal));
-            Persist();
+            Persist("persist_old_proposal");
         }
         return true;
     }
@@ -485,10 +520,12 @@ struct FlowMeshAgreement::Impl {
     }
     bool Send(const AgreementMessage& message)
     {
+        TraceSpan trace{*this, "publish_callback", message};
         return callbacks.publish && callbacks.publish(message);
     }
     std::optional<AgreementMessage> Sign(AgreementMessage intent, const bls::SecretKey& key)
     {
+        TraceSpan trace{*this, "sign_intent", intent};
         intent.signature.fill(0);
         const RecordKey record_key{Key(intent)};
         auto found{record_index.find(record_key)};
@@ -497,11 +534,16 @@ struct FlowMeshAgreement::Impl {
             if (slot.records.size() >= MAX_RECORDS) throw std::runtime_error("agreement signing record resource limit");
             if (intent.view < slot.view || IsDecided()) return std::nullopt;
             const auto bytes{EncodeAgreementMessage(intent)};
-            if (!bytes || !ValidMessage(intent, seats, Context(), true)) throw std::runtime_error("invalid local agreement intent");
+            bool valid{false};
+            {
+                TraceSpan validation{*this, "validate_local_intent", intent.candidate};
+                valid = bytes && ValidMessage(intent, seats, Context(), true);
+            }
+            if (!valid) throw std::runtime_error("invalid local agreement intent");
             index = slot.records.size();
             slot.records.push_back({*bytes, {}});
             record_index.emplace(record_key, index);
-            Persist(); // The exact message and all associated evidence precede signing.
+            Persist("persist_signing_intent"); // Exact message/evidence precede signing.
             Crash(FlowMeshAgreementCrashPoint::AFTER_INTENT_PERSIST);
         } else {
             index = found->second;
@@ -509,14 +551,17 @@ struct FlowMeshAgreement::Impl {
             if (!slot.records[index].signed_bytes.empty()) return DecodeAgreementMessage(slot.records[index].signed_bytes);
             if (intent.view < slot.view) return std::nullopt;
         }
-        const auto digest{AgreementMessageDigest(intent)};
-        if (!digest) throw std::runtime_error("agreement intent has no signing digest");
-        intent.signature = key.Sign(std::span<const unsigned char>{digest->begin(), 32}).Compressed();
+        {
+            TraceSpan signing{*this, "digest_and_bls_sign", intent.candidate};
+            const auto digest{AgreementMessageDigest(intent)};
+            if (!digest) throw std::runtime_error("agreement intent has no signing digest");
+            intent.signature = key.Sign(std::span<const unsigned char>{digest->begin(), 32}).Compressed();
+        }
         Crash(FlowMeshAgreementCrashPoint::AFTER_SIGNATURE);
         const auto bytes{EncodeAgreementMessage(intent)};
         if (!bytes) throw std::runtime_error("signed agreement encoding failed");
         slot.records[index].signed_bytes = *bytes;
-        Persist(); // No publication, including loopback, occurs before this sync.
+        Persist("persist_signed_message"); // No publication occurs before this sync.
         Crash(FlowMeshAgreementCrashPoint::AFTER_SIGNED_PERSIST);
         Track(intent);
         Send(intent);
@@ -524,6 +569,7 @@ struct FlowMeshAgreement::Impl {
     }
     bool MoveView(const uint32_t target, const bool changing)
     {
+        TraceSpan trace{*this, "move_view"};
         if (target <= slot.view) return true;
         if (target >= MAX_VIEWS) throw std::runtime_error("agreement view resource limit reached");
         // Every earlier intent is completed before creating a view change.
@@ -532,7 +578,7 @@ struct FlowMeshAgreement::Impl {
         }
         slot.view = target;
         slot.changing = changing;
-        Persist();
+        Persist("persist_view");
         return true;
     }
     void LearnPrepared(const PreagreementPreparedCertificate& prepared)
@@ -546,11 +592,12 @@ struct FlowMeshAgreement::Impl {
             const auto bytes{EncodePreagreementPrepared(prepared)};
             if (!bytes) throw std::runtime_error("prepared proof resource limit");
             slot.highest = *bytes;
-            Persist();
+            Persist("persist_prepared");
         }
     }
     bool SaveDecision(const AgreementMessage& message)
     {
+        TraceSpan trace{*this, "save_decision", message.candidate};
         if (IsDecided()) {
             const auto existing{DecodeAgreementMessage(slot.decision)};
             if (existing->candidate != message.candidate) throw std::runtime_error("conflicting commit decisions");
@@ -563,7 +610,7 @@ struct FlowMeshAgreement::Impl {
         if (!encoded) throw std::runtime_error("decision proof resource limit");
         Crash(FlowMeshAgreementCrashPoint::BEFORE_DECISION_PERSIST);
         slot.decision = *encoded;
-        Persist();
+        Persist("persist_decision");
         Crash(FlowMeshAgreementCrashPoint::AFTER_DECISION_PERSIST);
         required.reset();
         Send(message);
@@ -571,6 +618,7 @@ struct FlowMeshAgreement::Impl {
     }
     bool Pump()
     {
+        TraceSpan trace{*this, "pump"};
         if (IsDecided()) return true;
         const auto keys{Keys()};
         // Resume a crashed exact intent before any new signing or view move.
@@ -616,7 +664,10 @@ struct FlowMeshAgreement::Impl {
                 }
             }
             if (selection && CandidateReady(*selection) &&
-                (!proof || CheckPreagreementNewView(Context(), seats, *proof) == PreagreementCheck::OK)) {
+                (!proof || [&] {
+                    TraceSpan validation{*this, "validate_new_view_proof", *selection};
+                    return CheckPreagreementNewView(Context(), seats, *proof) == PreagreementCheck::OK;
+                }())) {
                 AgreementMessage proposal;
                 proposal.stage = AgreementStage::PROPOSAL; proposal.context = Context();
                 proposal.view = slot.view; proposal.candidate = *selection;
@@ -632,7 +683,7 @@ struct FlowMeshAgreement::Impl {
                 if (!slot.proposals.contains(slot.view)) {
                     slot.proposals.emplace(slot.view, *EncodeAgreementMessage(proposal));
                     slot.changing = false;
-                    Persist();
+                    Persist("persist_proposal");
                 }
                 for (const auto& [seat, key] : keys) {
                     AgreementMessage vote;
@@ -666,7 +717,11 @@ struct FlowMeshAgreement::Impl {
             }
             if (bucket.commits.size() < Quorum() || (view && !bucket.new_view)) continue;
             PreagreementCommitCertificate certificate{*bucket.prepared, QuorumVotes(bucket.commits, Quorum()), bucket.new_view};
-            if (CheckPreagreementCommit(Context(), seats, certificate) != PreagreementCheck::OK) continue;
+            const auto certificate_check{[&] {
+                TraceSpan validation{*this, "validate_commit_certificate", hash};
+                return CheckPreagreementCommit(Context(), seats, certificate);
+            }()};
+            if (certificate_check != PreagreementCheck::OK) continue;
             if (!CandidateReady(hash)) continue;
             AgreementMessage decision;
             decision.stage = AgreementStage::DECISION; decision.context = Context();
@@ -695,7 +750,7 @@ bool FlowMeshAgreement::Open(const PreagreementContext& context, const ActiveFnB
             if (!allow_bootstrap || !s.db.IsEmpty()) return s.Stop("missing agreement journal; fresh bootstrap not authorized", error);
             s.marker.identity = identity; s.marker.active.value = context;
             s.slot.context.value = context; s.seats = seats;
-            s.Persist();
+            s.Persist("persist_bootstrap");
         } else {
             if (!ReadExact(s.db, MARKER_KEY, s.marker) || s.marker.version != 1 || s.marker.identity != identity ||
                 s.marker.active.value.domain != context.domain || s.marker.active.value.market_id != context.market_id ||
@@ -757,13 +812,14 @@ bool FlowMeshAgreement::Advance(const PreagreementContext& context, const Active
         }
         if (s.db.Exists(SlotKey{'s', context.epoch, context.sequence})) return s.Stop("agreement advancement would overwrite slot history", error);
         s.slot = Slot{}; s.slot.context.value = context; s.marker.active.value = context; s.seats = seats;
-        s.Persist(); s.RestoreMemory(); return true;
+        s.Persist("persist_advance"); s.RestoreMemory(); return true;
     } catch (const std::exception& e) { return s.Stop(std::string{"agreement advancement failed: "} + e.what(), error); }
 }
 
 bool FlowMeshAgreement::SubmitCandidate(const std::span<const unsigned char> entry, std::string& error)
 {
     auto& s{*m_impl}; if (!s.Ready(error)) return false;
+    Impl::TraceSpan trace{s, "submit_candidate"};
     try {
         s.usable.clear();
         const auto decoded{DecodeProductionEntry(entry)};
@@ -779,9 +835,15 @@ bool FlowMeshAgreement::SubmitCandidate(const std::span<const unsigned char> ent
 bool FlowMeshAgreement::Receive(const AgreementMessage& message, std::string& error)
 {
     auto& s{*m_impl}; if (!s.Ready(error)) return false;
+    Impl::TraceSpan trace{s, "receive", message};
     try {
         s.usable.clear();
-        if (!s.ValidMessage(message, s.seats, s.Context())) { error = "invalid agreement message"; return false; }
+        bool valid{false};
+        {
+            Impl::TraceSpan validation{s, "validate_received_message", message.candidate};
+            valid = s.ValidMessage(message, s.seats, s.Context());
+        }
+        if (!valid) { error = "invalid agreement message"; return false; }
         if (message.stage == AgreementStage::DECISION) { s.SaveDecision(message); return true; }
         if (s.IsDecided()) return true;
         const bool fresh{!s.received.contains(Key(message))};
@@ -825,6 +887,7 @@ bool FlowMeshAgreement::Receive(const AgreementMessage& message, std::string& er
 bool FlowMeshAgreement::Timeout(std::string& error)
 {
     auto& s{*m_impl}; if (!s.Ready(error)) return false;
+    Impl::TraceSpan trace{s, "timeout"};
     try {
         s.usable.clear();
         s.Pump();
@@ -836,6 +899,7 @@ bool FlowMeshAgreement::Timeout(std::string& error)
 bool FlowMeshAgreement::Retry(std::string& error)
 {
     auto& s{*m_impl}; if (!s.Ready(error)) return false;
+    Impl::TraceSpan trace{s, "retry"};
     try {
         // Evidence and anchors can become available again between retries.
         s.usable.clear();

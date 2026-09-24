@@ -617,6 +617,8 @@ private:
     bool m_started{false};
     bool m_stopping{false};
     bool m_processing{false};
+    //! Diagnostic state only, guarded by m_queue_mutex; never a wake predicate.
+    bool m_worker_waiting{false};
     std::thread m_worker;
 
     // Exact signed critical objects: <=8192 / 64 MiB globally, <=16 MiB per

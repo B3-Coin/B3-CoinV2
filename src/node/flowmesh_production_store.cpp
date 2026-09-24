@@ -7,15 +7,21 @@
 #include <consensus/flowmesh_params.h>
 #include <crypto/common.h>
 #include <flowmesh/production_wire.h>
+#include <logging.h>
 #include <random.h>
 #include <streams.h>
+#include <univalue.h>
+#include <util/threadnames.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <set>
 #include <span>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -33,6 +39,64 @@ bool FlowMeshHandoffConnectionMature(
 }
 
 namespace {
+
+/** BENCH-only wall-clock brackets, never part of the store's commit protocol.
+ * A synchronous DB call includes LevelDB work and OS scheduling; it does not
+ * claim to isolate the device fsync. Zero timestamps mean not reached. */
+struct StoreTrace {
+    const bool enabled{LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug)};
+    const char* operation;
+    const flowmesh::ProductionEntryCore& entry;
+    uint64_t started_us{0}, lock_requested_us{0}, lock_acquired_us{0};
+    uint64_t execution_started_us{0}, execution_completed_us{0};
+    uint64_t certificate_started_us{0}, certificate_completed_us{0};
+    uint64_t encode_started_us{0}, encode_completed_us{0};
+    uint64_t batch_started_us{0}, batch_completed_us{0};
+    uint64_t sync_started_us{0}, sync_completed_us{0};
+    static uint64_t Now()
+    {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void Mark(uint64_t& point) const { if (enabled) point = Now(); }
+    StoreTrace(const char* op, const flowmesh::ProductionEntryCore& value) : operation{op}, entry{value}
+    {
+        Mark(started_us);
+    }
+    ~StoreTrace()
+    {
+        if (!enabled) return;
+        const auto completed_us{Now()};
+        static std::atomic<uint64_t> count{0};
+        const auto index{count.fetch_add(1, std::memory_order_relaxed)};
+        if (index > 32768) return;
+        try {
+            UniValue event{UniValue::VOBJ};
+            event.pushKV("stage", index == 32768 ? "trace_limit_reached" : operation);
+            event.pushKV("thread", util::ThreadGetInternalName());
+            event.pushKV("thread_id", uint64_t{std::hash<std::thread::id>{}(std::this_thread::get_id())});
+            event.pushKV("market_id", entry.market_id.GetHex());
+            event.pushKV("epoch", entry.epoch);
+            event.pushKV("sequence", entry.sequence);
+            event.pushKV("object_id", entry.GetHash().GetHex());
+            event.pushKV("monotonic_us", completed_us);
+            event.pushKV("started_us", started_us);
+            event.pushKV("lock_requested_us", lock_requested_us);
+            event.pushKV("lock_acquired_us", lock_acquired_us);
+            event.pushKV("execution_started_us", execution_started_us);
+            event.pushKV("execution_completed_us", execution_completed_us);
+            event.pushKV("certificate_started_us", certificate_started_us);
+            event.pushKV("certificate_completed_us", certificate_completed_us);
+            event.pushKV("encode_started_us", encode_started_us);
+            event.pushKV("encode_completed_us", encode_completed_us);
+            event.pushKV("batch_started_us", batch_started_us);
+            event.pushKV("batch_completed_us", batch_completed_us);
+            event.pushKV("sync_started_us", sync_started_us);
+            event.pushKV("sync_completed_us", sync_completed_us);
+            LogDebug(BCLog::BENCH, "FlowMeshStoreTrace %s\n", event.write());
+        } catch (...) { /* Diagnostics cannot affect persistence results. */ }
+    }
+};
 
 void CacheMarketHistory(std::deque<flowmesh::MarketHistoryEntry>& history,
                         const flowmesh::ProductionEntryCore& entry,
@@ -1607,8 +1671,11 @@ bool FlowMeshProductionStore::AppendExecution(
     flowmesh::FlowMeshState& next_state_out, std::string& error,
     std::optional<flowmesh::ProductionEntryCheck>* validation_failure)
 {
+    StoreTrace trace{"append_execution", entry};
     if (validation_failure) validation_failure->reset();
+    trace.Mark(trace.lock_requested_us);
     const std::lock_guard<std::mutex> guard{m_mutex};
+    trace.Mark(trace.lock_acquired_us);
     if (!m_open || !m_ready) {
         error = "FlowMesh v3 store has not completed startup replay";
         return false;
@@ -1644,26 +1711,31 @@ bool FlowMeshProductionStore::AppendExecution(
     flowmesh::ProductionEpochGate gate{marker.domain, marker.market_id,
                                        active_seats};
     flowmesh::ProductionEntryCheck check;
+    trace.Mark(trace.execution_started_us);
     const auto executed{flowmesh::ExecuteProductionEntry(
         current_state, entry, marker.domain, marker.market_id, active_seats,
         gate, marker.next_sequence, marker.next_effect_index,
         marker.last_microblock_hash,
         exact_anchors, treasury_owner_commitment, deposits, check)};
+    trace.Mark(trace.execution_completed_us);
     if (!executed) {
         if (validation_failure) *validation_failure = check;
         error = std::string{"FlowMesh v3 execution entry failed: "} +
                 flowmesh::ProductionEntryCheckName(check);
         return false;
     }
-    if (flowmesh::CheckProductionEntryCertificate(entry, active_seats,
-                                                   certificate) !=
-        flowmesh::BlsCertificateCheck::OK) {
+    trace.Mark(trace.certificate_started_us);
+    const auto certificate_check{flowmesh::CheckProductionEntryCertificate(entry, active_seats, certificate)};
+    trace.Mark(trace.certificate_completed_us);
+    if (certificate_check != flowmesh::BlsCertificateCheck::OK) {
         error = "FlowMesh v3 execution certificate is invalid";
         return false;
     }
+    trace.Mark(trace.encode_started_us);
     const auto disk{MakeDiskEntry(entry, certificate, active_seats.Size(),
                                   executed->effects,
                                   executed->settlements)};
+    trace.Mark(trace.encode_completed_us);
     if (!disk) {
         error = "FlowMesh v3 execution record is not encodable";
         return false;
@@ -1675,11 +1747,15 @@ bool FlowMeshProductionStore::AppendExecution(
     next.last_microblock_hash = entry.GetHash();
     next.state_root = entry.state_root;
     try {
+        trace.Mark(trace.batch_started_us);
         CDBBatch batch{m_db};
         batch.Write(EntryKey(entry.sequence), *disk);
         batch.Erase(LockedCandidateKey({entry.epoch, entry.sequence}));
         batch.Write(KEY_MARKER, next);
+        trace.Mark(trace.batch_completed_us);
+        trace.Mark(trace.sync_started_us);
         m_db.WriteBatch(batch, /*fSync=*/true);
+        trace.Mark(trace.sync_completed_us);
     } catch (const std::exception& e) {
         error = std::string{"FlowMesh v3 execution append failed: "} + e.what();
         return false;
@@ -1699,8 +1775,11 @@ bool FlowMeshProductionStore::AppendHandoff(
     std::string& error,
     std::optional<flowmesh::ProductionEntryCheck>* validation_failure)
 {
+    StoreTrace trace{"append_handoff", handoff};
     if (validation_failure) validation_failure->reset();
+    trace.Mark(trace.lock_requested_us);
     const std::lock_guard<std::mutex> guard{m_mutex};
+    trace.Mark(trace.lock_acquired_us);
     if (!m_open || !m_ready) {
         error = "FlowMesh v3 store has not completed startup replay";
         return false;
@@ -1737,20 +1816,24 @@ bool FlowMeshProductionStore::AppendHandoff(
     }
     flowmesh::ProductionEpochGate gate{marker.domain, marker.market_id,
                                        outgoing_seats};
+    trace.Mark(trace.certificate_started_us);
     const flowmesh::ProductionEntryCheck check{gate.StageHandoff(
         current_state, handoff, outgoing_seats, next_seats, certificate,
         marker.next_sequence, marker.next_effect_index,
         marker.last_microblock_hash, exact_anchors)};
+    trace.Mark(trace.certificate_completed_us);
     if (check != flowmesh::ProductionEntryCheck::OK) {
         if (validation_failure) *validation_failure = check;
         error = std::string{"FlowMesh v3 handoff failed: "} +
                 flowmesh::ProductionEntryCheckName(check);
         return false;
     }
+    trace.Mark(trace.encode_started_us);
     const auto disk{MakeDiskEntry(
         handoff, certificate, outgoing_seats.Size(),
         std::span<const modern::FlowMeshEffectV1>{},
         std::span<const flowmesh::WithdrawalSettlementFactV1>{})};
+    trace.Mark(trace.encode_completed_us);
     if (!disk) {
         error = "FlowMesh v3 handoff record is not encodable";
         return false;
@@ -1763,11 +1846,15 @@ bool FlowMeshProductionStore::AppendHandoff(
     // Epoch/anchor/set deliberately remain outgoing until the checkpoint
     // connection record and transition marker commit together.
     try {
+        trace.Mark(trace.batch_started_us);
         CDBBatch batch{m_db};
         batch.Write(EntryKey(handoff.sequence), *disk);
         batch.Erase(LockedCandidateKey({handoff.epoch, handoff.sequence}));
         batch.Write(KEY_MARKER, next);
+        trace.Mark(trace.batch_completed_us);
+        trace.Mark(trace.sync_started_us);
         m_db.WriteBatch(batch, /*fSync=*/true);
+        trace.Mark(trace.sync_completed_us);
     } catch (const std::exception& e) {
         error = std::string{"FlowMesh v3 handoff append failed: "} + e.what();
         return false;
@@ -2203,12 +2290,17 @@ flowmesh::ProductionLockResult FlowMeshProductionStore::LockCandidate(
     const flowmesh::ProductionEntryCore& entry,
     const std::span<const flowmesh::Action> authenticated_evidence)
 {
+    StoreTrace trace{"lock_candidate", entry};
+    trace.Mark(trace.lock_requested_us);
     const std::lock_guard<std::mutex> guard{m_mutex};
+    trace.Mark(trace.lock_acquired_us);
     const uint256 entry_hash{entry.GetHash()};
     if (!m_open || !m_ready || entry_hash.IsNull()) {
         return flowmesh::ProductionLockResult::STORAGE_FAILURE;
     }
+    trace.Mark(trace.encode_started_us);
     const auto disk{MakeDiskLockedCandidate(entry, authenticated_evidence)};
+    trace.Mark(trace.encode_completed_us);
     if (!disk) return flowmesh::ProductionLockResult::STORAGE_FAILURE;
     Marker marker;
     if (ReadMarkerStrict(m_db, marker, m_preagreement) != ReadResult::FOUND ||
@@ -2258,10 +2350,14 @@ flowmesh::ProductionLockResult FlowMeshProductionStore::LockCandidate(
         return flowmesh::ProductionLockResult::STORAGE_FAILURE;
     }
     try {
+        trace.Mark(trace.batch_started_us);
         CDBBatch batch{m_db};
         batch.Write(LockKey(position), entry_hash);
         batch.Write(LockedCandidateKey(position), *disk);
+        trace.Mark(trace.batch_completed_us);
+        trace.Mark(trace.sync_started_us);
         m_db.WriteBatch(batch, /*fSync=*/true);
+        trace.Mark(trace.sync_completed_us);
     } catch (const std::exception&) {
         return flowmesh::ProductionLockResult::STORAGE_FAILURE;
     }
