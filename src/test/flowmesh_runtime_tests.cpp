@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <limits>
@@ -7284,6 +7285,211 @@ BOOST_AUTO_TEST_CASE(preagreement_action_admission_wakes_proposal_without_period
     BOOST_CHECK(f.AllAt(2));
     BOOST_CHECK_EQUAL(f.decisions.load(), decisions_after);
     BOOST_CHECK_EQUAL(f.view_changes.load(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_local_queued_action_survives_certified_head_advance)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_local_queued_head_advance"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    CKey account_key;
+    account_key.MakeNewKey(true);
+    const auto account{flowmesh::AccountForKey(XOnlyPubKey{account_key.GetPubKey()})};
+    f.deposits.entries.at(f.outpoint) = {f.asset, 250, account};
+    flowmesh::Action tail;
+    tail.signer = account;
+    tail.type = static_cast<uint8_t>(flowmesh::ActionType::SUBMIT_ASK);
+    tail.curve = {{10, 5}};
+    BOOST_REQUIRE(flowmesh::SignAction(account_key, f.domain, f.initial.ConfigId(), tail));
+    const auto payload{flowmesh::EncodeProductionActionPayload(tail)};
+    BOOST_REQUIRE(payload);
+    const auto submitted_at{f.clocks[0].Now()};
+    // This is exactly SubmitLocalAction's encoded queue item at head one.
+    // Use its existing queue seam so the test can hold the worker's market
+    // lock without blocking a second SubmitLocalAction's snapshot acquisition.
+    const auto local_peer{std::numeric_limits<flowmesh::WirePeerId>::min()};
+    const flowmesh::WireMessage queued{flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1}, *payload};
+    std::mutex barrier_mutex;
+    std::condition_variable barrier_cv;
+    bool entered{false}, released{false}, barrier_timed_out{false};
+    std::atomic<bool> certificate_queued{false};
+    std::vector<flowmesh::WireMessage> tail_relays;
+    struct ReleaseBeforeStop {
+        PreagreementRuntimeHarness<>& fixture;
+        std::mutex& mutex;
+        std::condition_variable& cv;
+        bool& released;
+        ~ReleaseBeforeStop()
+        {
+            { std::lock_guard lock{mutex}; released = true; }
+            cv.notify_all();
+            fixture.StopAll(); // callbacks finish before captured locals die
+        }
+    } release_before_stop{f, barrier_mutex, barrier_cv, released};
+    f.network.SetFilter([&](size_t from, size_t to, const flowmesh::WireMessage& wire) {
+        if (from == 0 && wire.kind == flowmesh::WireMessageKind::GET) {
+            std::unique_lock lock{barrier_mutex};
+            entered = true;
+            barrier_cv.notify_all();
+            barrier_timed_out = !barrier_cv.wait_for(lock, std::chrono::seconds{15}, [&] { return released; });
+            return false; // this request is only the deterministic worker barrier
+        }
+        if (to == 0 && wire.kind == flowmesh::WireMessageKind::CERTIFICATE && wire.header.sequence == 1) {
+            // Publish the synchronization flag only AFTER real queue admission.
+            const auto result{f.runtimes[0]->EnqueueWireMessage(static_cast<flowmesh::WirePeerId>(from), wire)};
+            if (result == flowmesh::QueueResult::ACCEPTED) certificate_queued = true;
+            return false; // do not enqueue a second copy through RuntimeNetwork
+        }
+        if (from == 0 && wire.kind == flowmesh::WireMessageKind::ACTION && wire.payload == *payload) {
+            std::lock_guard lock{barrier_mutex};
+            tail_relays.push_back(wire);
+        }
+        return f.Observe(wire);
+    });
+    BOOST_REQUIRE(f.runtimes[0]->RequestCatchup(1, f.market));
+    {
+        std::unique_lock lock{barrier_mutex};
+        BOOST_REQUIRE(barrier_cv.wait_for(lock, std::chrono::seconds{5}, [&] { return entered; }));
+    }
+    BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(local_peer, queued) == flowmesh::QueueResult::ACCEPTED);
+    // The other three real seats form the unchanged quorum while node zero's
+    // worker is held. Its already-queued local tail has not reached the pool.
+    BOOST_REQUIRE(f.runtimes[1]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(WaitUntil([&] {
+        return certificate_queued && std::all_of(f.runtimes.begin() + 1, f.runtimes.end(), [&](const auto& runtime) {
+            return runtime->MarketStatus(f.market)->next_sequence == 2;
+        });
+    }));
+    {
+        std::lock_guard lock{barrier_mutex};
+        BOOST_REQUIRE(!barrier_timed_out);
+        released = true;
+    }
+    barrier_cv.notify_all();
+    f.Drain();
+    // The existing certificate-priority lane advances the durable head before
+    // dequeuing the earlier ACTION lane item. Before the repair, this exact
+    // assertion fails: HandleAction silently discards its now-old wrapper.
+    const auto events{f.runtimes[0]->ClientEvents(std::nullopt, f.market, account).events};
+    const auto admitted{std::find_if(events.begin(), events.end(), [&](const auto& event) {
+        return event.kind == flowmesh::ClientEventKind::POOL_ADMITTED && event.action_id == tail.Id();
+    })};
+    BOOST_REQUIRE_MESSAGE(admitted != events.end(), "queued local tail lost before pool admission after certified head advanced");
+    BOOST_CHECK_EQUAL(admitted->microblock_sequence, 2U);
+    BOOST_CHECK(admitted->signed_action_hash == Hash(*payload));
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(3); }));
+    f.Drain(); // no new client action, manual tick or clock advance was needed
+    {
+        std::lock_guard lock{barrier_mutex};
+        BOOST_REQUIRE(!tail_relays.empty());
+        for (const auto& wire : tail_relays) {
+            BOOST_CHECK(wire.payload == *payload);
+            BOOST_CHECK(wire.header == flowmesh::WireHeader(flowmesh::FLOWMESH_WIRE_VERSION_V1,
+                f.market, f.seats.seats.epoch, 2));
+        }
+    }
+    std::string error;
+    for (size_t i{0}; i < f.runtimes.size(); ++i) {
+        BOOST_CHECK(f.clocks[i].Now() == submitted_at);
+        std::optional<node::StoredProductionEntry> stored;
+        BOOST_REQUIRE(f.stores[i]->ReadEntry(2, f.seats.seats, stored, error));
+        BOOST_REQUIRE(stored);
+        BOOST_REQUIRE_EQUAL(stored->entry.actions.size(), 1U);
+        BOOST_CHECK(stored->entry.actions.front().Id() == tail.Id());
+        BOOST_CHECK(flowmesh::CheckProductionEntryCertificate(stored->entry, f.seats.seats, stored->certificate) ==
+                    flowmesh::BlsCertificateCheck::OK);
+        BOOST_CHECK_EQUAL(f.runtimes[i]->StateSnapshot(f.market)->NextSequence(account), 1U);
+    }
+    const auto head{f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash};
+    for (const auto& replay : {queued, flowmesh::WireMessage{flowmesh::WireMessageKind::ACTION,
+            queued.header, *flowmesh::EncodeProductionActionPayload(Deposit(f.outpoint))}}) {
+        const auto action{flowmesh::DecodeProductionActionPayload(replay.payload)};
+        BOOST_REQUIRE(action);
+        BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(local_peer, replay) == flowmesh::QueueResult::ACCEPTED);
+        f.Drain();
+        const auto attempts{f.runtimes[0]->ClientEvents(std::nullopt, f.market, std::nullopt).events};
+        BOOST_CHECK(std::any_of(attempts.begin(), attempts.end(), [&](const auto& event) {
+            return event.kind == flowmesh::ClientEventKind::POOL_REFUSED && event.action_id == action->Id();
+        }));
+        const auto status{f.runtimes[0]->ClientActionStatus(f.market, action->Id())};
+        BOOST_REQUIRE(status);
+        BOOST_CHECK(status->kind == flowmesh::ClientEventKind::CERTIFIED_INCLUDED);
+        BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->pending_actions, 0U);
+        BOOST_CHECK(f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash == head);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(preagreement_stale_local_action_revalidation_preserves_remote_and_authority_bounds)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_stale_local_action_bounds"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    f.block_commits = true; // no accidental admission can finish an execution
+    CKey account_key;
+    account_key.MakeNewKey(true);
+    const auto account{flowmesh::AccountForKey(XOnlyPubKey{account_key.GetPubKey()})};
+    flowmesh::Action action;
+    action.signer = account;
+    action.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_ASK);
+    BOOST_REQUIRE(flowmesh::SignAction(account_key, f.domain, f.initial.ConfigId(), action));
+    const auto payload{flowmesh::EncodeProductionActionPayload(action)};
+    BOOST_REQUIRE(payload);
+    const auto local_peer{std::numeric_limits<flowmesh::WirePeerId>::min()};
+    const flowmesh::WireHeader stale{flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 0};
+    const uint256 head{f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash};
+    const auto refuse = [&](flowmesh::WirePeerId peer, flowmesh::WireMessage wire, bool observable) {
+        const auto decoded{flowmesh::DecodeProductionActionPayload(wire.payload)};
+        BOOST_REQUIRE(decoded);
+        const auto before{f.runtimes[0]->ClientEvents(std::nullopt, f.market, std::nullopt).cursor};
+        BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(peer, wire) == flowmesh::QueueResult::ACCEPTED);
+        f.Drain();
+        BOOST_CHECK_EQUAL(f.runtimes[0]->MarketStatus(f.market)->pending_actions, 0U);
+        BOOST_CHECK(f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash == head);
+        const auto events{f.runtimes[0]->ClientEvents(before, f.market, std::nullopt).events};
+        BOOST_CHECK(std::none_of(events.begin(), events.end(), [](const auto& event) {
+            return event.kind == flowmesh::ClientEventKind::POOL_ADMITTED;
+        }));
+        if (observable) BOOST_CHECK(std::any_of(events.begin(), events.end(), [&](const auto& event) {
+            return event.kind == flowmesh::ClientEventKind::POOL_REFUSED && event.action_id == decoded->Id();
+        }));
+    };
+    refuse(2, {flowmesh::WireMessageKind::ACTION, stale, *payload}, false); // remote old wrapper stays rejected
+    auto wrong_epoch{stale};
+    ++wrong_epoch.epoch;
+    refuse(local_peer, {flowmesh::WireMessageKind::ACTION, wrong_epoch, *payload}, true);
+    auto future{stale};
+    future.sequence = 2;
+    refuse(local_peer, {flowmesh::WireMessageKind::ACTION, future, *payload}, true);
+    auto forged{action};
+    BOOST_REQUIRE(!forged.credential.empty());
+    forged.credential.back() ^= 1;
+    refuse(local_peer, {flowmesh::WireMessageKind::ACTION, stale,
+                       *flowmesh::EncodeProductionActionPayload(forged)}, true);
+    const auto missing{Deposit(COutPoint{f.outpoint.hash, 99})};
+    refuse(local_peer, {flowmesh::WireMessageKind::ACTION, stale,
+                       *flowmesh::EncodeProductionActionPayload(missing)}, true);
+    f.chains[0].SetReconciled(false);
+    refuse(local_peer, {flowmesh::WireMessageKind::ACTION, stale, *payload}, true);
+    f.chains[0].SetReconciled(true);
+    f.chains[0].SetTransition(f.market, node::FlowMeshSeatTransitionKind::PAUSED);
+    refuse(local_peer, {flowmesh::WireMessageKind::ACTION, stale, *payload}, true);
+
+    // Local identity does not bypass the existing bounded wire admission.
+    flowmesh::BoundedWireQueue queue;
+    const flowmesh::WireMessage wire{flowmesh::WireMessageKind::ACTION, stale, *payload};
+    const auto limit{static_cast<size_t>(flowmesh::FLOWMESH_ACTION_TOKEN_COUNT_BURST)};
+    for (size_t i{0}; i < limit; ++i) BOOST_REQUIRE(queue.Push(local_peer, wire, f.clocks[0].Now()) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_CHECK(queue.Push(local_peer, wire, f.clocks[0].Now()) == flowmesh::QueueResult::RATE_LIMITED);
+    BOOST_CHECK_EQUAL(queue.Size(), limit);
+    for (size_t i{0}; i < limit; ++i) {
+        const auto item{queue.Pop()};
+        BOOST_REQUIRE(item);
+        BOOST_CHECK(item->message.payload == *payload);
+    }
+    BOOST_CHECK(queue.Empty());
 }
 
 BOOST_AUTO_TEST_CASE(preagreement_duplicate_actions_do_not_schedule_proposal_ticks)
