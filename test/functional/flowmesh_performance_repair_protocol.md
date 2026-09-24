@@ -86,6 +86,25 @@ report, and fails exit without replacing an earlier workload exception.
 
 ## Explicit read-recovery policy
 
+### Predeclared local-queue repair follow-up
+
+The first matched pair and fault run on `6698766` remain unchanged. Its separate
+BENCH run later failed two original burst requests: a certified head advanced
+after local enqueue but before pool admission, making the local routing wrapper
+stale. Preserve those deadline misses and the incomplete diagnostic RPC archive.
+A deterministic test-only successor demonstrates the same failure before the
+local-only repair; this is a new measured defect, not a latency-driven retry.
+
+After that regression passes and the narrow repair is reviewed, run one new
+healthy candidate with the same 40-offer plan against the retained baseline02.
+Then run one separate diagnostic repetition and one fault scenario. Use the
+unchanged executable harness from `6698766`, the same options/seed, and new
+generated directories. Retain all three results, including failures; do not
+retry for favorable timings or increase trace capacities. Report the exact
+successor executable separately from candidate01. The baseline need not be
+rerun: neither its binary nor the workload has changed. Later trace-integrity
+fixes cannot retroactively repair missing observations from this frozen harness.
+
 `--performance-read-recovery` is optional and identical for both builds. It
 does not change the default fail-fast fixture. After a certificate, the first
 follow-up read exception is preserved with its error and timestamp. Only that
