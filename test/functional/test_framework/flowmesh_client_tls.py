@@ -20,6 +20,8 @@ import threading
 import time
 from pathlib import Path
 
+from test_framework.flowmesh_public_trace import PublicBodyCapture, public_request_context, public_response_context
+
 
 API_PATH = "/flowmesh/v1"
 MAX_REQUEST_BYTES = 1024 * 1024
@@ -30,6 +32,7 @@ MAX_CONNECTIONS = 8
 MAX_RESPONSE_HOLD_MS = 6000
 RESPONSE_HOLD_METHODS = frozenset({"markets", "snapshot", "updates", "action", "submit"})
 MAX_RECORDED_BODY_BYTES = 8192
+MAX_PUBLIC_CONTEXT_BYTES = 64 * 1024
 
 
 def validate_response_holds(value):
@@ -146,7 +149,11 @@ class _RelayHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         relay = self.server.relay
+        def incomplete(reason):
+            if relay.public_capture is not None:
+                relay.public_capture.note_failure(reason, stage="request")
         if self.path != API_PATH or self.headers.get("Transfer-Encoding") is not None:
+            incomplete("refused path or transfer encoding; request body not captured")
             self.reply(404, b'{"ok":false,"error":"test relay path refused"}')
             return
         try:
@@ -154,17 +161,21 @@ class _RelayHandler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             length = -1
         if not 0 <= length <= MAX_REQUEST_BYTES:
+            incomplete("request size refused; body not captured")
             self.reply(413, b'{"ok":false,"error":"test relay request bound"}')
             return
         body = self.rfile.read(length)
         if len(body) != length:
+            incomplete("incomplete request body")
             return
         try:
             request = json.loads(body)
         except ValueError:
+            incomplete("invalid request JSON")
             self.reply(400, b'{"ok":false,"error":"test relay JSON refused"}')
             return
         if not isinstance(request, dict) or not isinstance(request.get("params"), dict):
+            incomplete("invalid request shape")
             self.reply(400, b'{"ok":false,"error":"test relay request shape"}')
             return
         method = request.get("method")
@@ -182,21 +193,28 @@ class _RelayHandler(http.server.BaseHTTPRequestHandler):
                    "action_id": request["params"].get("action_id"),
                    "action_hex": request["params"].get("action_hex"), "response_dropped": False,
                    "record_index": len(relay.requests), "body_bytes": len(body)}
+            row["request_id"] = relay.next_request_id
+            row["public_capture_enabled"] = relay.public_capture is not None
+            relay.next_request_id += 1
             if len(body) <= MAX_RECORDED_BODY_BYTES:
                 row["body_hex"] = body.hex()
             else:
                 row["body_hex_omitted_for_size"] = True
             # Reserve also the bounded completion flags/status/timestamp that
             # are appended to this same retained row after forwarding.
-            row_bytes = len(json.dumps(row).encode("utf-8")) + 1024
+            row["completion_reservation_bytes"] = MAX_PUBLIC_CONTEXT_BYTES + 4096 if relay.public_capture else 1024
+            row_bytes = len(json.dumps(row).encode("utf-8")) + row["completion_reservation_bytes"]
             if len(relay.requests) < MAX_REQUEST_RECORDS and relay.record_bytes + row_bytes <= MAX_REQUEST_RECORD_BYTES:
                 relay.requests.append(row)
                 relay.record_bytes += row_bytes
             else:
                 relay.records_dropped += 1
+        relay.record_public_request(row, request, body)
         if unavailable:
             try:
-                self.reply(503, b'{"ok":false,"error":"isolated test endpoint unavailable"}')
+                error_body = b'{"ok":false,"error":"isolated test endpoint unavailable"}'
+                relay.record_public_response(row, "relay_error", 503, error_body)
+                self.reply(503, error_body)
             finally:
                 with relay.lock:
                     row["handler_completed_us"] = time.monotonic_ns() // 1000
@@ -207,18 +225,25 @@ class _RelayHandler(http.server.BaseHTTPRequestHandler):
             with relay.lock:
                 row["upstream_started_us"] = time.monotonic_ns() // 1000
             upstream.request("POST", API_PATH, body=body, headers={"Content-Type": "application/json"})
+            with relay.lock:
+                row["forwarded"] = True
             response = upstream.getresponse()
             result = response.read(MAX_REPLY_BYTES + 1)
             if len(result) > MAX_REPLY_BYTES:
-                self.reply(502, b'{"ok":false,"error":"test relay reply bound"}')
+                error_body = b'{"ok":false,"error":"test relay reply bound"}'
+                if relay.public_capture is not None:
+                    relay.public_capture.note_failure("upstream response exceeds forwarding/capture bound",
+                                                      request_id=row["request_id"], stage="upstream")
+                relay.record_public_response(row, "relay_error", 502, error_body)
+                self.reply(502, error_body)
                 return
             with relay.lock:
-                row["forwarded"] = True
                 row["upstream_http_status"] = response.status
                 row["upstream_completed_us"] = time.monotonic_ns() // 1000
                 if drop:
                     row["response_dropped"] = True
                     relay.unavailable = True
+            relay.record_public_response(row, "upstream", response.status, result)
             relay.wait_response_hold(row, hold_ms, hold_release)
             if drop:
                 # The upstream completed; the trader sees an ambiguous close.
@@ -230,19 +255,24 @@ class _RelayHandler(http.server.BaseHTTPRequestHandler):
             if mutation is not None:
                 result = mutation(method, result)
                 if len(result) > MAX_REPLY_BYTES:
-                    self.reply(502, b'{"ok":false,"error":"test mutation reply bound"}')
+                    error_body = b'{"ok":false,"error":"test mutation reply bound"}'
+                    relay.record_public_response(row, "relay_error", 502, error_body)
+                    self.reply(502, error_body)
                     return
             if expired_action is not None:
                 changed = expire_action_receipt(method, result, expired_action)
                 with relay.lock:
                     row["receipt_expired_mutation"] = changed != result
                 result = changed
+            relay.record_public_response(row, "delivered", response.status, result)
             with relay.lock:
                 row["client_response_attempted_us"] = time.monotonic_ns() // 1000
             self.reply(response.status, result)
             with relay.lock:
                 row["client_response_completed_us"] = time.monotonic_ns() // 1000
-        except (OSError, ssl.SSLError, TimeoutError, http.client.HTTPException):
+        except (OSError, ssl.SSLError, TimeoutError, http.client.HTTPException) as error:
+            with relay.lock:
+                row["transport_error"] = type(error).__name__
             self.close_connection = True
         finally:
             upstream.close()
@@ -257,6 +287,8 @@ class FlowMeshTLSFaultRelay:
         self.requests = []
         self.records_dropped = 0
         self.record_bytes = 0
+        self.next_request_id = 0
+        self.public_capture = None
         self.unavailable = False
         self.drop_submit_once = False
         self.reply_mutation = None
@@ -274,6 +306,47 @@ class FlowMeshTLSFaultRelay:
         self.thread = threading.Thread(target=self.server.serve_forever,
                                        kwargs={"poll_interval": .1}, daemon=True)
         self.thread.start()
+
+    def enable_public_capture(self, directory):
+        """Opt-in generated-fixture trace, without headers or wallet RPC data."""
+        capture = PublicBodyCapture(directory)
+        with self.lock:
+            assert self.public_capture is None
+            self.public_capture = capture
+
+    def record_public_request(self, row, request, body):
+        capture = self.public_capture
+        if capture is None:
+            return
+        metadata = capture.capture(row["request_id"], "request", body)
+        context = public_request_context(request)
+        if len(json.dumps(context).encode("utf-8")) > MAX_PUBLIC_CONTEXT_BYTES // 3:
+            context = {"inline_context_omitted_for_size": True, "full_body_complete": metadata["complete"]}
+        with self.lock:
+            row["request_context"] = context
+            row["request_body"] = metadata
+
+    def record_public_response(self, row, stage, status, body):
+        capture = self.public_capture
+        if capture is None:
+            return
+        digest = hashlib.sha256(body).hexdigest()
+        if stage == "delivered" and row.get("upstream_body", {}).get("sha256") == digest:
+            metadata = dict(row["upstream_body"])
+            metadata["identical_to_upstream"] = True
+        else:
+            metadata = capture.capture(row["request_id"], stage, body)
+        context = public_response_context(body)
+        # Full bytes remain in the bounded artifact. Oversized projections
+        # are explicit instead of overflowing the in-memory record budget.
+        if len(json.dumps(context).encode("utf-8")) > MAX_PUBLIC_CONTEXT_BYTES // 3:
+            context = {"inline_context_omitted_for_size": True, "full_body_complete": metadata["complete"]}
+        with self.lock:
+            row[stage + "_body"] = metadata
+            row[stage + "_context"] = context
+            row[stage + "_http_status"] = status
+            if stage in {"delivered", "relay_error"}:
+                row["client_http_status"] = status
 
     def configure(self, *, unavailable=False, drop_submit_once=False, reply_mutation=None,
                   response_hold_ms=None, receipt_expired_action_id=None):
@@ -308,10 +381,13 @@ class FlowMeshTLSFaultRelay:
 
     def snapshot(self):
         with self.lock:
-            return {"url": self.url, "unavailable": self.unavailable,
+            result = {"url": self.url, "unavailable": self.unavailable,
                     "requests": [dict(row) for row in self.requests], "records_dropped": self.records_dropped,
                     "record_bytes": self.record_bytes, "response_hold_ms": dict(self.response_hold_ms),
                     "receipt_expired_action_id": self.receipt_expired_action_id}
+        if self.public_capture is not None:
+            result["public_capture"] = self.public_capture.snapshot()
+        return result
 
     def stop(self):
         with self.lock:

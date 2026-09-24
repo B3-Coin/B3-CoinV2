@@ -111,7 +111,7 @@ class FlowMeshPerformanceFaultsTest(FlowMeshPerformanceTest):
                 assert_equal(len(matches), 1)
                 response = matches[0]["receipt"]
                 rpc = recovery
-        observed = host_us()
+        observed = self.observed_rpc_return_us()
         action_id = response["action_id"]
         assert_equal(len(action_id), 64)
         sample.update(action_id=action_id, initial_response=response, initial_response_host_us=observed,
@@ -138,14 +138,14 @@ class FlowMeshPerformanceFaultsTest(FlowMeshPerformanceTest):
             if retryable and time.monotonic() >= next_retry:
                 retry = rpc.retryflowmeshaction(market, action_id)
                 assert_equal(retry["action_id"], action_id)
-                status, status_observed = retry, host_us()
+                status, status_observed = retry, self.observed_rpc_return_us()
                 sample["attempts"].append({"same_signed_action_retry": True, "observed_host_us": status_observed,
                                             "receipt_state": retry["receipt_state"]})
                 next_retry = time.monotonic() + 1
                 continue
             time.sleep(.005)
             status = rpc.getflowmeshactionstatus(market, action_id)
-            status_observed = host_us()
+            status_observed = self.observed_rpc_return_us()
         certified = status_observed
         assert_equal(status["certificate_verified"], True)
         assert_equal(status["outcome_verified"], False)
@@ -155,14 +155,16 @@ class FlowMeshPerformanceFaultsTest(FlowMeshPerformanceTest):
         expected = expected_balance(before, kind)
         while True:
             self.stop_requested(deadline)
-            data = self.authenticated_account(rpc, market)
+            data = self.followup_account_read(rpc, market, sample, deadline)
             account = data["account"]
             if account["next_sequence"] >= sequence + 1:
                 assert_equal(account["next_sequence"], sequence + 1)
                 assert_equal({field: account[field] for field in BALANCE_FIELDS}, expected)
+                if sample.get("read_consistency_failures"):
+                    sample["account_read_recovered"] = True
                 break
             time.sleep(.005)
-        account_observed = host_us()
+        account_observed = self.observed_rpc_return_us()
         sample.update(account_state_verified_host_us=account_observed,
                       account_state_verified_ms=(account_observed - started) / 1000,
                       account_state_verified_from_offer_ms=(account_observed - sample["scheduled_host_us"]) / 1000,
@@ -266,7 +268,7 @@ class FlowMeshPerformanceFaultsTest(FlowMeshPerformanceTest):
         self.required_replicas = list(replicas)
         self.recovery["phase"] = label
         summary = self.run_window(label, rate=.5, duration=count * 2, count=count)
-        assert summary["correctness_pass"], "fault phase failed; no scenario escalation"
+        assert self.phase_can_continue(summary), "fault phase account proof unavailable; no scenario escalation"
         assert summary["b3_advanced"], "B3 did not advance during the selected live-replica phase"
         return summary
 
@@ -315,6 +317,7 @@ class FlowMeshPerformanceFaultsTest(FlowMeshPerformanceTest):
     def write_report(self):
         if not self.performance_report:
             return
+        self.prepare_public_trace_report()
         self.performance_report["https_submit_records"] = self.submit_records
         self.performance_report["https_method_counts"] = dict(self.relay_method_counts)
         snapshot = {**self.performance_report, "windows": [
@@ -342,6 +345,11 @@ class FlowMeshPerformanceFaultsTest(FlowMeshPerformanceTest):
             "samples": [], "windows": [], "logging_checks": [], "clock_offsets": {},
             "correctness_pass": False, "fault_scenario_pass": False, "performance_pass": None,
             "recovery": self.recovery,
+            "campaign": {"read_recovery_enabled": self.options.performance_read_recovery,
+                "planned_windows": ["baseline_before_fault", "node3_offline", "node3_bulk_held",
+                    "node3_bulk_throttled", "node3_recovered_all_four"],
+                "public_trace_enabled": self.options.performance_public_trace,
+                "read_recovery_never_converts_first_read_failure_to_success": True},
             "failed_proposer": {"qualified": False,
                 "reason": "offline transport identity does not prove proposer selection; no deterministic proposer fault injected"},
             "hostile_ingress": {"qualified": False, "reason": "outside this bounded existing-proxy scenario"}}
@@ -472,6 +480,14 @@ class FlowMeshPerformanceFaultsTest(FlowMeshPerformanceTest):
                 self.verify_production_logging(market, "after_fault")
             self.performance_report["correctness_pass"] = True
             self.performance_report["fault_scenario_pass"] = True
+            self.performance_report["fault_coverage_completed"] = True
+            self.prepare_public_trace_report()
+            self.performance_report["correctness_pass"] = self.performance_report["read_consistency_pass"] and (
+                not self.options.performance_public_trace or self.performance_report["public_trace"]["complete_capture"])
+            self.performance_report["fault_scenario_pass"] = self.performance_report["correctness_pass"]
+            assert self.performance_report["read_consistency_pass"], "follow-up read consistency failed; recovered reads remain recorded failures"
+            if self.options.performance_public_trace:
+                assert self.performance_report["public_trace"]["complete_capture"], "bounded public capture incomplete; retain report"
         except Exception as error:
             self.performance_report["error"] = compact_error(error)
             self.performance_report["stopped_at_phase"] = self.recovery.get("phase", "setup")

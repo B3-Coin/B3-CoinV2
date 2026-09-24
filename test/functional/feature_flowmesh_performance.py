@@ -32,6 +32,7 @@ from urllib.parse import quote
 from feature_flowmesh_latency import FlowMeshLatencyTest, PRE_ADMISSION_REJECTIONS, distribution, host_us
 from feature_flowmesh_release import TEST_ASSET_DEPOSIT, TEST_ASSET_SUPPLY, TRADE_PRICE
 from test_framework.authproxy import JSONRPCException
+from test_framework.flowmesh_public_trace import attribute_requests, public_response_context, reply_rejected
 from test_framework.util import assert_equal, get_rpc_proxy, rpc_url
 
 
@@ -39,6 +40,12 @@ RATES = (0.5, 1.0, 2.0, 4.0)
 BUYERS = 4
 KINDS = ("fill_bid", "resting_bid", "cancel")
 BALANCE_FIELDS = ("base_available", "base_reserved", "b3_available_atoms", "b3_reserved_atoms")
+MAX_HTTP_TRACE_RECORDS = 32768
+MAX_HTTP_TRACE_BYTES = 64 * 1024 * 1024
+MAX_RPC_TRACE_RECORDS = 32768
+MAX_RPC_TRACE_BYTES = 256 * 1024 * 1024
+MAX_RPC_CONTEXT_BYTES = 32 * 1024
+READ_RECOVERY_DELAYS = (.5, 1.0, 2.0, 4.0)
 
 
 def bounded_seconds(value):
@@ -82,6 +89,54 @@ def compact_error(error):
     return result
 
 
+class ObservedClientRPC:
+    """Measure existing wallet RPC calls; never inject API fields or headers."""
+    def __init__(self, owner, rpc, wallet):
+        self.owner, self.rpc, self.wallet = owner, rpc, wallet
+
+    def __getattr__(self, method):
+        call = getattr(self.rpc, method)
+        def observed(*args, **kwargs):
+            sample = getattr(self.owner.trace_local, "sample", None)
+            row = {"method": method, "wallet": self.wallet, "start_host_us": host_us()}
+            if sample is not None:
+                row.update(sample_id=sample["sample_id"], market_id=sample["market_id"],
+                           account_id=sample.get("account_id"))
+            with self.owner.report_lock:
+                reserved = MAX_RPC_CONTEXT_BYTES + 2048
+                if (len(self.owner.rpc_calls) < MAX_RPC_TRACE_RECORDS and
+                        self.owner.rpc_trace_bytes + reserved <= MAX_RPC_TRACE_BYTES):
+                    self.owner.rpc_calls.append(row)
+                    self.owner.rpc_trace_bytes += reserved
+                else:
+                    self.owner.rpc_trace_dropped += 1
+            try:
+                result = call(*args, **kwargs)
+                row["end_host_us"] = host_us()
+                self.owner.trace_local.last_rpc_return_us = row["end_host_us"]
+            except Exception as error:
+                row.setdefault("end_host_us", host_us())
+                self.owner.trace_local.last_rpc_return_us = row["end_host_us"]
+                row["error"] = compact_error(error)
+                raise
+            finally:
+                # Diagnostic failures must not replace an original RPC error
+                # or turn a successful signing call into an ambiguous retry.
+                try:
+                    self.owner.drain_relay_observations()
+                except Exception as error:
+                    row["capture_error"] = compact_error(error)
+            try:
+                row["response_context"] = public_response_context(json.dumps({"result": result}, default=str).encode())
+                if len(json.dumps(row["response_context"]).encode()) > MAX_RPC_CONTEXT_BYTES:
+                    row["response_context"] = {"inline_context_omitted_for_size": True}
+                    row["capture_error"] = {"reason": "wallet response context exceeded bounded reservation"}
+            except Exception as error:
+                row["capture_error"] = compact_error(error)
+            return result
+        return observed
+
+
 def submit_context(record):
     """Semantic ActionIds are market-scoped; never join on ActionId alone.
 
@@ -111,9 +166,14 @@ def summarize_window(samples, backlog, duration, elapsed_to_drain=None):
     late = statistics.median([row["outstanding"] for row in backlog[-edge:]]) if backlog else 0
     queue_growth = late >= early + 2 and late >= 3
     filled = [row for row in complete if row.get("kind") == "fill_bid"]
+    read_consistency = all(row.get("read_consistency_pass", True) for row in samples)
     in_window_fills = sum(row.get("account_verified_during_offer_window", False) for row in filled)
     return {
         "offered": len(samples), "completed": len(complete),
+        "certified_inclusion_count": sum("client_certified_host_us" in row for row in samples),
+        "read_consistency_pass": read_consistency,
+        "failed_followup_read_count": sum(len(row.get("read_consistency_failures", [])) for row in samples),
+        "read_recovered_action_count": sum(row.get("account_read_recovered", False) for row in samples),
         "failed": sum(row["status"] == "failed" for row in samples),
         "dropped": sum(row["status"] == "dropped" for row in samples),
         "unresolved": sum(row["status"] not in {"complete", "failed", "dropped"} for row in samples),
@@ -135,8 +195,9 @@ def summarize_window(samples, backlog, duration, elapsed_to_drain=None):
         "few_samples": len(complete) < 100,
         "metrics": metrics, "queue_growth": queue_growth,
         "early_outstanding_median": early, "late_outstanding_median": late,
-        "correctness_pass": len(complete) == len(samples) and bool(samples),
-        "performance_pass": bool(samples) and len(complete) == len(samples) and not queue_growth and
+        "workload_completion_pass": len(complete) == len(samples) and bool(samples),
+        "correctness_pass": len(complete) == len(samples) and bool(samples) and read_consistency,
+        "performance_pass": bool(samples) and len(complete) == len(samples) and read_consistency and not queue_growth and
             certification["p50_ms"] <= 200 and certification["p95_ms"] <= 600,
         "offer_inclusive_target_pass": bool(samples) and len(complete) == len(samples) and
             metrics["client_certified_from_offer_ms"]["p50_ms"] <= 200 and
@@ -155,8 +216,19 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         parser.add_argument("--performance-action-timeout", type=bounded_seconds, default=60)
         parser.add_argument("--performance-fail-on-gate", action="store_true",
                             help="Also fail process exit on a measured performance miss; correctness always gates exit")
+        parser.add_argument("--performance-profile", choices=("ladder", "matched-repair"), default="ladder",
+                            help="matched-repair fixes two markets, 20-second windows, two repeats at 0.5/s, and burst8")
+        parser.add_argument("--performance-public-trace", action="store_true",
+                            help="Bounded full public HTTPS bodies plus RPC/context accounting in generated fixture only")
+        parser.add_argument("--performance-read-recovery", action="store_true",
+                            help="Optional bounded read-only follow-up recovery; preserves read failure and fails final exit")
 
     def set_test_params(self):
+        if self.options.performance_profile == "matched-repair":
+            self.options.performance_markets = 2
+            self.options.performance_window_seconds = 20
+            self.options.performance_idle_seconds = 10
+        self.performance_rates = (.5,) if self.options.performance_profile == "matched-repair" else RATES
         self.options.latency_production_logging = not self.options.performance_diagnostic
         super().set_test_params()
         self.market_specs = []
@@ -167,6 +239,48 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         self.performance_report = {}
         self.offered_counter = 0
         self.threads = []
+        self.http_requests = []
+        self.http_trace_bytes = self.http_trace_dropped = self.rpc_trace_dropped = self.rpc_trace_bytes = 0
+        self.rpc_calls = []
+        self.trace_local = threading.local()
+        self.trace_drain_lock = threading.Lock()
+
+    def start_ordinary_client(self):
+        super().start_ordinary_client()
+        if self.options.performance_public_trace:
+            for index, relay in enumerate(self.tls_relays):
+                relay.enable_public_capture(Path(self.options.tmpdir, "public-http-trace", f"endpoint{index}"))
+            self.public_trace_started_host_us = host_us()
+
+    def drain_relay_observations(self):
+        if not self.options.performance_public_trace:
+            return super().drain_relay_observations()
+        with self.trace_drain_lock:
+            return self._drain_public_relay_observations()
+
+    def _drain_public_relay_observations(self):
+        for relay in self.tls_relays:
+            with relay.lock:
+                assert not relay.unavailable and not relay.drop_submit_once
+                assert relay.reply_mutation is None and not relay.response_hold_ms
+                # Observation bounds never alter forwarding or request limits.
+                # Any lost record is retained as a failing capture counter.
+                completed = [row for row in relay.requests if "handler_completed_us" in row]
+                relay.requests[:] = [row for row in relay.requests if "handler_completed_us" not in row]
+                relay.record_bytes = sum(len(json.dumps(row).encode()) + row.get("completion_reservation_bytes", 1024)
+                                         for row in relay.requests)
+                for original in completed:
+                    row = {"endpoint": relay.url, **dict(original)}
+                    self.relay_method_counts[row["method"]] += 1
+                    if row["method"] == "submit":
+                        self.submit_records.append(row)
+                    size = len(json.dumps(row).encode())
+                    if len(self.http_requests) < MAX_HTTP_TRACE_RECORDS and self.http_trace_bytes + size <= MAX_HTTP_TRACE_BYTES:
+                        self.http_requests.append(row)
+                        self.http_trace_bytes += size
+                    else:
+                        self.http_trace_dropped += 1
+        assert len(self.submit_records) <= 4096, "bounded signed-action observation archive exceeded"
 
     def configure_fresh_market(self, market_id):
         """Select all generated fresh-market modes in one pre-bootstrap stop."""
@@ -202,7 +316,50 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         # Unlike TestNode.get_wallet_rpc(), this creates a NEW HTTP connection.
         proxy = get_rpc_proxy(rpc_url(node.datadir_path, node.index, self.chain, node.rpchost),
                               node.index, timeout=15, coveragedir=self.options.coveragedir)
-        return proxy if wallet is None else proxy / ("wallet/" + quote(wallet, safe=""))
+        rpc = proxy if wallet is None else proxy / ("wallet/" + quote(wallet, safe=""))
+        if self.options.performance_public_trace and node is self.client and wallet is not None:
+            return ObservedClientRPC(self, rpc, wallet)
+        return rpc
+
+    def observed_rpc_return_us(self):
+        # Capture/archive processing follows RPC completion. Do not charge
+        # that observer work to an already received certificate response.
+        if self.options.performance_public_trace:
+            return self.trace_local.last_rpc_return_us
+        return host_us()
+
+    def followup_account_read(self, rpc, market, sample, deadline):
+        """Recover only an authenticated read, never signing or action status."""
+        delays = READ_RECOVERY_DELAYS if self.options.performance_read_recovery else ()
+        while True:
+            attempt = sample.get("read_recovery_attempts", 0)
+            self.stop_requested(deadline)
+            started = host_us()
+            try:
+                result = self.authenticated_account(rpc, market)
+                sample.setdefault("read_consistency_pass", True)
+                sample.setdefault("account_read_observations", []).append({
+                    "started_host_us": started, "observed_host_us": self.observed_rpc_return_us(), "success": True,
+                    "recovery_attempt": attempt})
+                if sample.get("read_consistency_failures"):
+                    sample["account_read_rpc_recovered"] = True
+                return result
+            except (JSONRPCException, OSError, TimeoutError) as error:
+                failure = {"started_host_us": started, "observed_host_us": self.observed_rpc_return_us(),
+                           "recovery_attempt": attempt, "error": compact_error(error)}
+                sample["read_consistency_pass"] = False
+                sample.setdefault("read_consistency_failures", []).append(failure)
+                sample.setdefault("first_balance_read_error", failure)
+                if attempt == len(delays) or time.monotonic() + delays[attempt] >= deadline:
+                    raise
+                # The original submission/certification clocks remain intact.
+                sample["read_recovery_attempts"] = attempt + 1
+                if self.worker_stop.wait(delays[attempt]):
+                    raise
+
+    def phase_can_continue(self, summary):
+        key = "workload_completion_pass" if self.options.performance_read_recovery else "correctness_pass"
+        return summary[key]
 
     @staticmethod
     def authenticated_account(rpc, market):
@@ -345,7 +502,7 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 assert_equal(len(matches), 1)
                 response = matches[0]["receipt"]
                 rpc = recovery
-        observed = host_us()
+        observed = self.observed_rpc_return_us()
         action_id = response["action_id"]
         assert_equal(len(action_id), 64)
         sample.update(action_id=action_id, initial_response=response, initial_response_host_us=observed,
@@ -372,14 +529,14 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
             if retryable and time.monotonic() >= next_retry:
                 retry = rpc.retryflowmeshaction(market, action_id)
                 assert_equal(retry["action_id"], action_id)
-                status, status_observed = retry, host_us()
+                status, status_observed = retry, self.observed_rpc_return_us()
                 sample["attempts"].append({"same_signed_action_retry": True, "observed_host_us": status_observed,
                                             "receipt_state": retry["receipt_state"]})
                 next_retry = time.monotonic() + 1
                 continue
             time.sleep(.005)
             status = rpc.getflowmeshactionstatus(market, action_id)
-            status_observed = host_us()
+            status_observed = self.observed_rpc_return_us()
         certified = status_observed
         assert_equal(status["certificate_verified"], True)
         assert_equal(status["outcome_verified"], False)
@@ -389,14 +546,16 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         expected = expected_balance(before, kind)
         while True:
             self.stop_requested(deadline)
-            data = self.authenticated_account(rpc, market)
+            data = self.followup_account_read(rpc, market, sample, deadline)
             account = data["account"]
             if account["next_sequence"] >= sequence + 1:
                 assert_equal(account["next_sequence"], sequence + 1)
                 assert_equal({field: account[field] for field in BALANCE_FIELDS}, expected)
+                if sample.get("read_consistency_failures"):
+                    sample["account_read_recovered"] = True
                 break
             time.sleep(.005)
-        account_observed = host_us()
+        account_observed = self.observed_rpc_return_us()
         sample.update(account_state_verified_host_us=account_observed,
                       account_state_verified_ms=(account_observed - started) / 1000,
                       account_state_verified_from_offer_ms=(account_observed - sample["scheduled_host_us"]) / 1000,
@@ -446,10 +605,16 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                     sample.update(status="dropped", error={"reason": "previous unresolved account action"})
                     continue
                 try:
+                    self.trace_local.sample = sample
                     self.execute_action(worker, rpc, replicas, sample)
                 except Exception as error:
                     worker["failed"] = True
                     sample.update(status="failed", error=compact_error(error), failed_host_us=host_us())
+                    sample["failed_stage"] = ("before_certificate_inclusion" if "client_certified_host_us" not in sample else
+                                              "followup_account_read" if "account_state_verified_host_us" not in sample else
+                                              "replica_or_retained_action_observation")
+                finally:
+                    self.trace_local.sample = None
             finally:
                 worker["queue"].task_done()
 
@@ -586,9 +751,74 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         for spec in self.market_specs:
             assert not (self.client.chain_path / "flowmesh" / spec["market_id"]).exists()
 
+    def prepare_public_trace_report(self):
+        samples = self.performance_report["samples"]
+        planned = self.performance_report.get("campaign", {}).get("planned_windows", [])
+        windows = self.performance_report["windows"]
+        self.performance_report["campaign_progress"] = {
+            "started_windows": [row["label"] for row in windows],
+            "unrun_windows": [label for label in planned if not any(row["label"] == label for row in windows)],
+            "windows_without_completed_summary": [row["label"] for row in windows if "summary" not in row]}
+        self.performance_report["read_consistency_pass"] = all(row.get("read_consistency_pass", True) for row in samples)
+        self.performance_report["certified_inclusion_count"] = sum("client_certified_host_us" in row for row in samples)
+        self.performance_report["failed_followup_read_count"] = sum(len(row.get("read_consistency_failures", [])) for row in samples)
+        if not self.performance_report["read_consistency_pass"]:
+            self.performance_report["correctness_pass"] = False
+            self.performance_report["performance_pass"] = False
+        if not self.options.performance_public_trace:
+            return
+        self.drain_relay_observations()
+        captures = [relay.public_capture.snapshot() for relay in self.tls_relays if relay.public_capture is not None]
+        dropped = sum(relay.records_dropped for relay in self.tls_relays)
+        capture_errors = sum("capture_error" in row for row in self.rpc_calls)
+        accounting = attribute_requests(self.http_requests, samples, self.rpc_calls)
+        for sample in samples:
+            sample["http_requests"] = accounting["per_sample"][str(sample["sample_id"])]
+            calls = [row for row in self.rpc_calls if row.get("sample_id") == sample["sample_id"]]
+            sample["client_rpc_calls"] = {
+                "count": len(calls), "errors": sum("error" in row for row in calls),
+                "methods": {method: sum(row["method"] == method for row in calls)
+                            for method in sorted({row["method"] for row in calls})}}
+        self.performance_report.update(
+            http_requests=self.http_requests, rpc_calls=self.rpc_calls, http_request_accounting=accounting,
+            public_trace={"started_host_us": getattr(self, "public_trace_started_host_us", None),
+                "scope": "all public HTTPS bodies after generated engine-off client startup checks; no HTTP headers or RPC credentials",
+                "captures": captures, "relay_records_dropped": dropped,
+                "http_archive_records_dropped": self.http_trace_dropped, "rpc_records_dropped": self.rpc_trace_dropped,
+                "rpc_capture_error_count": capture_errors,
+                "rpc_archive_bytes_reserved": self.rpc_trace_bytes,
+                "pre_capture_http_records": sum(not row.get("public_capture_enabled", False) for row in self.http_requests),
+                "http_archive_bytes": self.http_trace_bytes,
+                "complete_capture": bool(captures) and all(row["complete_capture"] for row in captures) and
+                    dropped == self.http_trace_dropped == self.rpc_trace_dropped == capture_errors == 0})
+        if not self.performance_report["public_trace"]["complete_capture"]:
+            self.performance_report["correctness_pass"] = False
+            self.performance_report["performance_pass"] = False
+        for window in self.performance_report["windows"]:
+            end = window.get("drained_host_us")
+            if end is None:
+                continue
+            counts = {}
+            rejected = {}
+            api_rejected = {}
+            for row in self.http_requests:
+                if window["start_host_us"] <= row["host_monotonic_us"] <= end:
+                    method = row["method"]
+                    counts[method] = counts.get(method, 0) + 1
+                    if row.get("upstream_http_status", row.get("client_http_status", 200)) >= 400:
+                        rejected[method] = rejected.get(method, 0) + 1
+                    if reply_rejected(row):
+                        api_rejected[method] = api_rejected.get(method, 0) + 1
+            offered = len(window["samples"])
+            window["http_requests"] = {"methods": counts, "http_rejections": rejected,
+                                       "rejected_replies": api_rejected,
+                                       "total": sum(counts.values()), "offered_actions": offered,
+                                       "requests_per_offered_action": sum(counts.values()) / offered if offered else None}
+
     def write_report(self):
         if not self.performance_report:
             return
+        self.prepare_public_trace_report()
         self.performance_report["https_submit_records"] = self.submit_records
         self.performance_report["https_method_counts"] = dict(self.relay_method_counts)
         # Samples are shared with windows in memory; serialize them only once.
@@ -614,7 +844,16 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 "execution_result_verified": False, "faults_injected": False,
                 "not_qualified": ["WAN", "multiple client processes", "power-loss durability", "fault recovery"]},
             "samples": [], "windows": [], "logging_checks": [], "clock_offsets": {},
-            "correctness_pass": False, "performance_pass": False}
+            "correctness_pass": False, "performance_pass": False,
+            "campaign": {"profile": self.options.performance_profile, "rates": list(self.performance_rates),
+                "planned_windows": ["pilot", *[f"sustained_{rate:g}_repeat_{repeat + 1}"
+                    for rate in self.performance_rates for repeat in range(2)], "burst_8"],
+                "window_seconds": self.options.performance_window_seconds, "repeats_per_rate": 2,
+                "pilot_actions": 12, "pilot_rate": .5, "idle_seconds": self.options.performance_idle_seconds,
+                "burst_actions": 8, "read_recovery_enabled": self.options.performance_read_recovery,
+                "read_recovery_delays_seconds": list(READ_RECOVERY_DELAYS) if self.options.performance_read_recovery else [],
+                "read_recovery_never_converts_first_read_failure_to_success": True,
+                "public_trace_enabled": self.options.performance_public_trace}}
         self.latency_report = self.performance_report
         try:
             market, asset = self.bootstrap_latency_market()
@@ -637,7 +876,7 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 self.threads.append(thread)
             self.begin_b3_workload(range(4))
             pilot = self.run_window("pilot", rate=.5, duration=24, count=12)
-            assert pilot["correctness_pass"], "pilot correctness failed; retain report"
+            assert self.phase_can_continue(pilot), "pilot account completion failed; retain report"
             idle_start = host_us()
             deadline = time.monotonic() + self.options.performance_idle_seconds
             while time.monotonic() < deadline:
@@ -646,21 +885,21 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 time.sleep(.02)
             self.performance_report["idle"] = {"start_host_us": idle_start, "end_host_us": host_us(), "offered": 0}
             stop_reason = None
-            for rate in RATES:
+            for rate in self.performance_rates:
                 summaries = []
                 for repeat in range(2):
                     summary = self.run_window(f"sustained_{rate:g}_repeat_{repeat + 1}", rate=rate,
                                               duration=self.options.performance_window_seconds)
                     summaries.append(summary)
-                    if not summary["correctness_pass"]:
+                    if not self.phase_can_continue(summary):
                         stop_reason = "correctness failure"
                         break
                 if stop_reason or any(not row["performance_pass"] for row in summaries):
                     stop_reason = stop_reason or "latency gate miss or persistent queue growth"
                     self.performance_report["escalation_stopped"] = {"after_rate": rate, "reason": stop_reason,
-                        "unrun_rates": [value for value in RATES if value > rate]}
+                        "unrun_rates": [value for value in self.performance_rates if value > rate]}
                     break
-            if all(window["summary"]["correctness_pass"] for window in self.performance_report["windows"]):
+            if all(self.phase_can_continue(window["summary"]) for window in self.performance_report["windows"]):
                 self.run_window("burst_8", rate=0, duration=1, count=8)
             self.end_b3_workload()
             self.check_signed_observations()
@@ -686,13 +925,17 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
             windows = self.performance_report["windows"]
             self.performance_report["correctness_pass"] = all(row["summary"]["correctness_pass"] for row in windows)
             measured = [row for row in windows if row["label"].startswith("sustained_")]
-            self.performance_report["entire_requested_ladder_pass"] = len(measured) == len(RATES) * 2 and all(
+            self.performance_report["entire_requested_ladder_pass"] = len(measured) == len(self.performance_rates) * 2 and all(
                 row["summary"]["performance_pass"] and row["summary"]["b3_advanced"] for row in measured)
-            passing_rates = [rate for rate in RATES if
+            passing_rates = [rate for rate in self.performance_rates if
                 len(rows := [row for row in measured if row["rate_actions_per_second"] == rate]) == 2 and
                 all(row["summary"]["performance_pass"] and row["summary"]["b3_advanced"] for row in rows)]
             self.performance_report["highest_measured_passing_rate"] = max(passing_rates) if passing_rates else None
             self.performance_report["performance_pass"] = bool(passing_rates) and self.performance_report["correctness_pass"]
+            self.prepare_public_trace_report()
+            assert self.performance_report["read_consistency_pass"], "follow-up read consistency failed; recovered reads remain recorded failures"
+            if self.options.performance_public_trace:
+                assert self.performance_report["public_trace"]["complete_capture"], "bounded public capture incomplete; retain report"
             assert self.performance_report["correctness_pass"], "offered actions failed correctness; retain report"
             if self.options.performance_fail_on_gate:
                 assert self.performance_report["performance_pass"], "performance gate missed; retain report"
