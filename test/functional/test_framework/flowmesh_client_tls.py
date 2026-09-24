@@ -105,12 +105,19 @@ class _BoundedTLSServer(http.server.ThreadingHTTPServer):
         super().__init__(address, _RelayHandler)
 
     def process_request(self, request, client_address):
-        if not self.slots.acquire(blocking=False):
-            request.close()
-            return
+        with self.relay.lock:
+            if self.relay.capture_admission_closed or not self.slots.acquire(blocking=False):
+                request.close()
+                return
+            # Includes TLS negotiation and malformed/incomplete HTTP bodies,
+            # before a public request row exists. Finalization must await these
+            # handlers too, not merely rows already in the archive.
+            self.relay.active_handlers += 1
         try:
             super().process_request(request, client_address)
         except Exception:
+            with self.relay.lock:
+                self.relay.active_handlers -= 1
             self.slots.release()
             raise
 
@@ -123,8 +130,12 @@ class _BoundedTLSServer(http.server.ThreadingHTTPServer):
         except (OSError, ssl.SSLError, TimeoutError):
             pass
         finally:
-            self.shutdown_request(secured)
-            self.slots.release()
+            try:
+                self.shutdown_request(secured)
+            finally:
+                with self.relay.lock:
+                    self.relay.active_handlers -= 1
+                self.slots.release()
 
     def handle_error(self, *_):
         # Deliberately broken TLS/HTTP peers are evidence recorded by the
@@ -289,6 +300,8 @@ class FlowMeshTLSFaultRelay:
         self.record_bytes = 0
         self.next_request_id = 0
         self.public_capture = None
+        self.active_handlers = 0
+        self.capture_admission_closed = False
         self.unavailable = False
         self.drop_submit_once = False
         self.reply_mutation = None
@@ -384,9 +397,32 @@ class FlowMeshTLSFaultRelay:
             result = {"url": self.url, "unavailable": self.unavailable,
                     "requests": [dict(row) for row in self.requests], "records_dropped": self.records_dropped,
                     "record_bytes": self.record_bytes, "response_hold_ms": dict(self.response_hold_ms),
-                    "receipt_expired_action_id": self.receipt_expired_action_id}
+                    "receipt_expired_action_id": self.receipt_expired_action_id,
+                    "active_handlers": self.active_handlers,
+                    "capture_admission_closed": self.capture_admission_closed}
         if self.public_capture is not None:
             result["public_capture"] = self.public_capture.snapshot()
+        return result
+
+    def begin_public_capture_finalization(self):
+        """Close admission after workload cleanup; existing handlers still finish.
+
+        Do not use server_close here: its thread joins have no aggregate
+        deadline. The harness separately waits a bounded interval, records any
+        survivors, then leaves ordinary fixture shutdown to close the server.
+        """
+        with self.lock:
+            self.capture_admission_closed = True
+        self.server.shutdown()
+
+    def public_capture_progress(self):
+        with self.lock:
+            result = {"endpoint": self.url, "admission_closed": self.capture_admission_closed,
+                      "active_handlers": self.active_handlers,
+                      "pending_records": sum("handler_completed_us" not in row for row in self.requests),
+                      "unarchived_records": len(self.requests)}
+        capture = self.public_capture
+        result["writes_in_progress"] = capture.snapshot()["writes_in_progress"] if capture else 0
         return result
 
     def stop(self):

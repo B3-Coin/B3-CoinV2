@@ -115,6 +115,7 @@ class PublicBodyCapture:
         self.directory.mkdir(parents=True, exist_ok=False)
         self.max_bytes, self.max_files = max_bytes, max_files
         self.bytes_reserved = self.files_reserved = self.failure_count = 0
+        self.writes_in_progress = 0
         self.errors = []
         self.lock = threading.Lock()
 
@@ -137,6 +138,7 @@ class PublicBodyCapture:
                 return metadata
             self.bytes_reserved += len(body)
             self.files_reserved += 1
+            self.writes_in_progress += 1
         path = self.directory / f"{request_id:08d}-{stage}.json"
         try:
             with path.open("xb") as stream:
@@ -148,6 +150,9 @@ class PublicBodyCapture:
                 if len(self.errors) < MAX_CAPTURE_ERRORS:
                     self.errors.append({"request_id": request_id, "stage": stage, "error": type(error).__name__})
             metadata["error"] = type(error).__name__
+        finally:
+            with self.lock:
+                self.writes_in_progress -= 1
         return metadata
 
     def snapshot(self):
@@ -155,7 +160,9 @@ class PublicBodyCapture:
             return {"directory": str(self.directory), "bytes_reserved": self.bytes_reserved,
                     "files_reserved": self.files_reserved, "max_bytes": self.max_bytes,
                     "max_files": self.max_files, "failure_count": self.failure_count,
-                    "complete_capture": self.failure_count == 0, "errors": list(self.errors)}
+                    "writes_in_progress": self.writes_in_progress,
+                    "complete_capture": self.failure_count == 0 and self.writes_in_progress == 0,
+                    "errors": list(self.errors)}
 
 
 def attribute_requests(records, samples, rpc_calls):

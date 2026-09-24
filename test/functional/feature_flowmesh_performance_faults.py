@@ -482,12 +482,7 @@ class FlowMeshPerformanceFaultsTest(FlowMeshPerformanceTest):
             self.performance_report["fault_scenario_pass"] = True
             self.performance_report["fault_coverage_completed"] = True
             self.prepare_public_trace_report()
-            self.performance_report["correctness_pass"] = self.performance_report["read_consistency_pass"] and (
-                not self.options.performance_public_trace or self.performance_report["public_trace"]["complete_capture"])
-            self.performance_report["fault_scenario_pass"] = self.performance_report["correctness_pass"]
             assert self.performance_report["read_consistency_pass"], "follow-up read consistency failed; recovered reads remain recorded failures"
-            if self.options.performance_public_trace:
-                assert self.performance_report["public_trace"]["complete_capture"], "bounded public capture incomplete; retain report"
         except Exception as error:
             self.performance_report["error"] = compact_error(error)
             self.performance_report["stopped_at_phase"] = self.recovery.get("phase", "setup")
@@ -510,17 +505,12 @@ class FlowMeshPerformanceFaultsTest(FlowMeshPerformanceTest):
             stopped = not any(thread.is_alive() for thread in self.threads)
             self.performance_report["all_harness_threads_stopped"] = stopped
             if not stopped:
-                self.performance_report["correctness_pass"] = False
-                self.performance_report["fault_scenario_pass"] = False
+                self.invalidate_final_result()
                 self.performance_report["cleanup_error"] = {
                     "type": "AssertionError", "reason": "harness thread survived bounded cleanup joins"}
             self.end_b3_workload()
             self.performance_report["final_fault_proxy"] = self.fault.snapshot()
-            self.write_report()
-            self.log.info("FLOWMESH_FAULT_PERFORMANCE_REPORT %s",
-                          Path(self.options.tmpdir, "flowmesh-performance-faults.json"))
-            if not stopped and not primary_exception_in_flight:
-                raise AssertionError("Harness thread survived bounded cleanup; failure report preserved")
+            self.finish_report(primary_exception_in_flight, "flowmesh-performance-faults.json", "FLOWMESH_FAULT_PERFORMANCE_REPORT")
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import feature_flowmesh_performance_faults as faults
+import feature_flowmesh_performance as performance
 from feature_flowmesh_latency import FlowMeshLatencyTest
 
 
@@ -126,11 +127,14 @@ class ReturningTargetTests(unittest.TestCase):
 
 
 class CleanupTests(unittest.TestCase):
+    harness_module = faults
+    harness_name = "FlowMeshPerformanceFaultsTest"
+
     @classmethod
     def setUpClass(cls):
-        source = ast.parse(Path(faults.__file__).read_text(encoding="utf-8"))
+        source = ast.parse(Path(cls.harness_module.__file__).read_text(encoding="utf-8"))
         harness = next(node for node in source.body if isinstance(node, ast.ClassDef) and
-                       node.name == "FlowMeshPerformanceFaultsTest")
+                       node.name == cls.harness_name)
         run = next(node for node in harness.body if isinstance(node, ast.FunctionDef) and node.name == "run_test")
         actual_finally = next(node for node in run.body if isinstance(node, ast.Try)).finalbody
         scaffold = ast.parse(
@@ -141,7 +145,7 @@ class CleanupTests(unittest.TestCase):
             "    finally:\n"
             "        pass\n")
         scaffold.body[0].body[0].finalbody = copy.deepcopy(actual_finally)
-        namespace = vars(faults).copy()
+        namespace = vars(cls.harness_module).copy()
         exec(compile(ast.fix_missing_locations(scaffold), "<actual fault cleanup regression>", "exec"), namespace)
         cls.cleanup = staticmethod(namespace["exercise_tail"])
 
@@ -154,8 +158,11 @@ class CleanupTests(unittest.TestCase):
         subject = SimpleNamespace(
             fault=fault, returning_rpc=None, scheduler_stop=Mock(), worker_stop=Mock(),
             workers=[], threads=[thread], end_b3_workload=Mock(), log=Mock(),
-            options=SimpleNamespace(tmpdir="unused-mocked-report-directory"),
-            performance_report={"correctness_pass": True, "fault_scenario_pass": True})
+            options=SimpleNamespace(tmpdir="unused-mocked-report-directory", performance_public_trace=False),
+            performance_report={"correctness_pass": True, "fault_scenario_pass": True, "read_consistency_pass": True})
+        subject.invalidate_final_result = lambda: faults.FlowMeshPerformanceTest.invalidate_final_result(subject)
+        subject.finalize_public_trace = lambda: faults.FlowMeshPerformanceTest.finalize_public_trace(subject)
+        subject.finish_report = lambda *args: faults.FlowMeshPerformanceTest.finish_report(subject, *args)
         subject.write_report = lambda: reports.append(copy.deepcopy(subject.performance_report))
         return subject, reports
 
@@ -184,6 +191,11 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(len(reports), 1)
         self.assertTrue(reports[0]["correctness_pass"])
         self.assertNotIn("cleanup_error", reports[0])
+
+
+class HealthyCleanupTests(CleanupTests):
+    harness_module = performance
+    harness_name = "FlowMeshPerformanceTest"
 
 
 if __name__ == "__main__":

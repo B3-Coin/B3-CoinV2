@@ -20,7 +20,7 @@ unset, because that optional framework wrapper otherwise overrides binaries.
 env -u BITCOIN_CMD BITCOIND=/absolute/frozen-baseline/bin/b3coind BITCOINCLI=/absolute/frozen-baseline/bin/b3coin-cli \
   python3 -B test/functional/feature_flowmesh_performance.py \
   --configfile=/absolute/frozen-baseline/test/config.ini \
-  --tmpdir=/absolute/new-evidence/matched-baseline-01 --nocleanup \
+  --tmpdir=/absolute/new-evidence/matched-baseline-02 --nocleanup \
   --randomseed=24092026 --portseed=92401 \
   --performance-profile=matched-repair --performance-action-timeout=60 \
   --performance-public-trace --performance-read-recovery
@@ -61,6 +61,28 @@ not execution-result verification (`outcome_verified=false` remains explicit).
 Nearest-rank p99 from 20 sustained samples is a small-sample maximum, not a
 reliable tail guarantee. Performance misses are reported even when the default
 process exit permits a latency miss; correctness failures always fail exit.
+
+### Predeclared finalization amendment
+
+`matched-baseline-01` began with frozen harness `8a4be3a` before independent
+review identified a finalization gap: active relay handlers/body writes could
+be omitted from the final archive, and a failure first observed in the final
+report could leave the process exit or fault pass flag green. Preserve that
+run, all original failures, raw artifacts, commands and exit status unchanged.
+It is a pre-finalization observation, **not** the baseline of the final matched
+pair; do not delete it or use it to select a favorable sample.
+
+Freeze the corrected harness revision before running `matched-baseline-02`
+and `matched-candidate-01` once each, with the same predeclared workload and
+options above. This replacement is for the identified observation-integrity
+defect, not a latency/result retry. After workers stop, corrected finalization
+closes relay admission and waits at most 15 seconds for active handlers,
+unarchived/pending records, body writes and wallet RPC observations to drain.
+It reports the actual pending counts and retains every loss/error counter.
+Live reports are explicitly provisional; complete capture requires a finalized
+quiescent archive. A timeout, late write failure, surviving worker or read
+consistency failure clears both healthy and fault pass flags, writes the final
+report, and fails exit without replacing an earlier workload exception.
 
 ## Explicit read-recovery policy
 

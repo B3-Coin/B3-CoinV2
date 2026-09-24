@@ -23,6 +23,7 @@ import json
 import math
 import queue
 import statistics
+import sys
 import threading
 import time
 from decimal import Decimal
@@ -46,6 +47,7 @@ MAX_RPC_TRACE_RECORDS = 32768
 MAX_RPC_TRACE_BYTES = 256 * 1024 * 1024
 MAX_RPC_CONTEXT_BYTES = 32 * 1024
 READ_RECOVERY_DELAYS = (.5, 1.0, 2.0, 4.0)
+PUBLIC_TRACE_QUIESCENCE_SECONDS = 15
 
 
 def bounded_seconds(value):
@@ -751,6 +753,65 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         for spec in self.market_specs:
             assert not (self.client.chain_path / "flowmesh" / spec["market_id"]).exists()
 
+    def invalidate_final_result(self):
+        self.performance_report["correctness_pass"] = False
+        self.performance_report["performance_pass"] = False
+        if "fault_scenario_pass" in self.performance_report:
+            self.performance_report["fault_scenario_pass"] = False
+
+    def finalize_public_trace(self):
+        if not self.options.performance_public_trace:
+            return
+        finalization = {"started_host_us": host_us(), "quiescence_timeout_seconds": PUBLIC_TRACE_QUIESCENCE_SECONDS,
+                        "quiescent": False}
+        self.performance_report["public_trace_finalization"] = finalization
+        # Stop admission only after the workload/worker cleanup. No request or
+        # timing policy is changed while the measured windows are running.
+        for relay in self.tls_relays:
+            relay.begin_public_capture_finalization()
+        deadline = time.monotonic() + PUBLIC_TRACE_QUIESCENCE_SECONDS
+        while True:
+            self.drain_relay_observations()
+            progress = [relay.public_capture_progress() for relay in self.tls_relays]
+            rpc_pending = sum("end_host_us" not in row for row in self.rpc_calls)
+            quiescent = all(row["admission_closed"] and not any(row[key] for key in (
+                "active_handlers", "pending_records", "unarchived_records", "writes_in_progress")) for row in progress)
+            if quiescent and not rpc_pending:
+                finalization["quiescent"] = True
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(.02)
+        finalization.update(completed_host_us=host_us(), relay_progress=progress,
+                            rpc_calls_in_progress=rpc_pending, timed_out=not finalization["quiescent"])
+        if not finalization["quiescent"]:
+            self.invalidate_final_result()
+
+    def finish_report(self, primary_exception_in_flight, filename, log_label):
+        """Finalize before the last report and fail exit without masking a cause."""
+        try:
+            self.finalize_public_trace()
+        except Exception as error:
+            self.performance_report["capture_finalization_error"] = compact_error(error)
+            self.invalidate_final_result()
+        try:
+            self.write_report()
+        except Exception:
+            # Preserve an earlier workload failure even if its final report
+            # cannot be written; report failure never turns either path green.
+            self.log.exception("Final performance report could not be written")
+            if not primary_exception_in_flight:
+                raise
+            return
+        self.log.info("%s %s", log_label, Path(self.options.tmpdir, filename))
+        final_failure = (not self.performance_report.get("all_harness_threads_stopped", False) or
+                         not self.performance_report.get("read_consistency_pass", False) or
+                         "capture_finalization_error" in self.performance_report or
+                         (self.options.performance_public_trace and
+                          not self.performance_report.get("public_trace", {}).get("complete_capture", False)))
+        if final_failure and not primary_exception_in_flight:
+            raise AssertionError("Final cleanup/read/capture checks failed; failure report preserved")
+
     def prepare_public_trace_report(self):
         samples = self.performance_report["samples"]
         planned = self.performance_report.get("campaign", {}).get("planned_windows", [])
@@ -763,14 +824,19 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         self.performance_report["certified_inclusion_count"] = sum("client_certified_host_us" in row for row in samples)
         self.performance_report["failed_followup_read_count"] = sum(len(row.get("read_consistency_failures", [])) for row in samples)
         if not self.performance_report["read_consistency_pass"]:
-            self.performance_report["correctness_pass"] = False
-            self.performance_report["performance_pass"] = False
+            self.invalidate_final_result()
         if not self.options.performance_public_trace:
             return
         self.drain_relay_observations()
         captures = [relay.public_capture.snapshot() for relay in self.tls_relays if relay.public_capture is not None]
+        progress = [relay.public_capture_progress() for relay in self.tls_relays]
+        rpc_pending = sum("end_host_us" not in row for row in self.rpc_calls)
+        finalization = self.performance_report.get("public_trace_finalization", {})
         dropped = sum(relay.records_dropped for relay in self.tls_relays)
         capture_errors = sum("capture_error" in row for row in self.rpc_calls)
+        capture_failures = (any(row["failure_count"] for row in captures) or
+                            dropped + self.http_trace_dropped + self.rpc_trace_dropped + capture_errors != 0 or
+                            "capture_finalization_error" in self.performance_report)
         accounting = attribute_requests(self.http_requests, samples, self.rpc_calls)
         for sample in samples:
             sample["http_requests"] = accounting["per_sample"][str(sample["sample_id"])]
@@ -784,16 +850,23 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
             public_trace={"started_host_us": getattr(self, "public_trace_started_host_us", None),
                 "scope": "all public HTTPS bodies after generated engine-off client startup checks; no HTTP headers or RPC credentials",
                 "captures": captures, "relay_records_dropped": dropped,
+                "relay_progress": progress, "rpc_calls_in_progress": rpc_pending,
+                "finalized": "completed_host_us" in finalization,
                 "http_archive_records_dropped": self.http_trace_dropped, "rpc_records_dropped": self.rpc_trace_dropped,
                 "rpc_capture_error_count": capture_errors,
                 "rpc_archive_bytes_reserved": self.rpc_trace_bytes,
                 "pre_capture_http_records": sum(not row.get("public_capture_enabled", False) for row in self.http_requests),
                 "http_archive_bytes": self.http_trace_bytes,
-                "complete_capture": bool(captures) and all(row["complete_capture"] for row in captures) and
-                    dropped == self.http_trace_dropped == self.rpc_trace_dropped == capture_errors == 0})
-        if not self.performance_report["public_trace"]["complete_capture"]:
-            self.performance_report["correctness_pass"] = False
-            self.performance_report["performance_pass"] = False
+                "complete_capture": bool(captures) and len(captures) == len(self.tls_relays) and finalization.get("quiescent", False) and
+                    self.performance_report.get("all_harness_threads_stopped", False) and not rpc_pending and
+                    all(row["complete_capture"] for row in captures) and not capture_failures and
+                    all(row["admission_closed"] and not any(row[key] for key in (
+                        "active_handlers", "pending_records", "unarchived_records", "writes_in_progress")) for row in progress)})
+        # A live report is explicitly provisional, not a failed workload just
+        # because an observer is busy. Real loss stays sticky at any time;
+        # final incomplete capture invalidates every scenario-level pass flag.
+        if capture_failures or (finalization and not self.performance_report["public_trace"]["complete_capture"]):
+            self.invalidate_final_result()
         for window in self.performance_report["windows"]:
             end = window.get("drained_host_us")
             if end is None:
@@ -934,8 +1007,6 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
             self.performance_report["performance_pass"] = bool(passing_rates) and self.performance_report["correctness_pass"]
             self.prepare_public_trace_report()
             assert self.performance_report["read_consistency_pass"], "follow-up read consistency failed; recovered reads remain recorded failures"
-            if self.options.performance_public_trace:
-                assert self.performance_report["public_trace"]["complete_capture"], "bounded public capture incomplete; retain report"
             assert self.performance_report["correctness_pass"], "offered actions failed correctness; retain report"
             if self.options.performance_fail_on_gate:
                 assert self.performance_report["performance_pass"], "performance gate missed; retain report"
@@ -943,6 +1014,7 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
             self.performance_report["error"] = compact_error(error)
             raise
         finally:
+            primary_exception_in_flight = sys.exc_info()[0] is not None
             self.scheduler_stop.set()
             self.worker_stop.set()
             for worker in self.workers:
@@ -955,11 +1027,11 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 thread.join(timeout=20)
             self.performance_report["all_harness_threads_stopped"] = not any(thread.is_alive() for thread in self.threads)
             if not self.performance_report["all_harness_threads_stopped"]:
-                self.performance_report["correctness_pass"] = False
-                self.performance_report["performance_pass"] = False
+                self.invalidate_final_result()
+                self.performance_report["cleanup_error"] = {
+                    "type": "AssertionError", "reason": "harness thread survived bounded cleanup joins"}
             self.end_b3_workload()
-            self.write_report()
-            self.log.info("FLOWMESH_PERFORMANCE_REPORT %s", Path(self.options.tmpdir, "flowmesh-performance.json"))
+            self.finish_report(primary_exception_in_flight, "flowmesh-performance.json", "FLOWMESH_PERFORMANCE_REPORT")
 
 
 if __name__ == "__main__":

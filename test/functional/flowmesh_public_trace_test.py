@@ -11,12 +11,14 @@ certificates, or establish real HTTP request-limit recovery/performance.
 
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import threading
+import sys
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, mock_open, patch
 
 import feature_flowmesh_performance as performance
 from test_framework.authproxy import JSONRPCException
@@ -114,6 +116,147 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(row["upstream_body"]["path"], row["delivered_body"]["path"])
             self.assertEqual(row["client_http_status"], 429)
             self.assertEqual(relay.public_capture.snapshot()["files_reserved"], 1)
+
+    def test_reserved_body_is_not_complete_while_write_is_in_progress(self):
+        for write_fails in (False, True):
+            with self.subTest(write_fails=write_fails), TemporaryDirectory() as temporary:
+                capture = PublicBodyCapture(Path(temporary, "capture"))
+                observations = []
+                def write(_body):
+                    observations.append(capture.snapshot())
+                    if write_fails:
+                        raise OSError("simulated public artifact write failure")
+                stream = mock_open()
+                stream.return_value.write.side_effect = write
+                with patch.object(Path, "open", stream):
+                    metadata = capture.capture(1, "upstream", b"body")
+                self.assertEqual(observations[0]["writes_in_progress"], 1)
+                self.assertFalse(observations[0]["complete_capture"])
+                self.assertEqual(capture.snapshot()["writes_in_progress"], 0)
+                self.assertEqual(capture.snapshot()["failure_count"], int(write_fails))
+                self.assertEqual(metadata["complete"], not write_fails)
+
+
+class FinalizationTests(unittest.TestCase):
+    def subject(self, temporary):
+        # Real report/finalization methods, but no sockets, TLS, daemon or node.
+        subject = object.__new__(performance.FlowMeshPerformanceTest)
+        subject.options = SimpleNamespace(performance_public_trace=True, tmpdir=temporary)
+        subject.performance_report = {"samples": [], "windows": [], "correctness_pass": True,
+            "performance_pass": True, "fault_scenario_pass": True, "all_harness_threads_stopped": True}
+        subject.http_requests, subject.rpc_calls, subject.submit_records = [], [], []
+        subject.http_trace_bytes = subject.http_trace_dropped = subject.rpc_trace_dropped = subject.rpc_trace_bytes = 0
+        subject.relay_method_counts = Counter()
+        subject.trace_drain_lock = threading.Lock()
+        subject.log = Mock()
+        relay = object.__new__(FlowMeshTLSFaultRelay)
+        relay.lock, relay.server = threading.Lock(), Mock()
+        relay.public_capture = PublicBodyCapture(Path(temporary, "capture"))
+        relay.url = "mocked-generated-endpoint"
+        relay.active_handlers = relay.record_bytes = relay.records_dropped = 0
+        relay.capture_admission_closed = relay.unavailable = relay.drop_submit_once = False
+        relay.reply_mutation, relay.response_hold_ms, relay.requests = None, {}, []
+        subject.tls_relays = [relay]
+        return subject, relay
+
+    def finish(self, subject, primary=False):
+        subject.finish_report(primary, "flowmesh-performance.json", "TEST_REPORT")
+
+    @staticmethod
+    def saved(temporary):
+        return json.loads(Path(temporary, "flowmesh-performance.json").read_text())
+
+    @staticmethod
+    def pending(relay):
+        relay.active_handlers = 1
+        relay.requests.append({"method": "action", "host_monotonic_us": 100,
+                               "public_capture_enabled": True, "request_id": 1})
+
+    def test_live_report_is_explicitly_provisional_not_complete(self):
+        with TemporaryDirectory() as temporary:
+            subject, _relay = self.subject(temporary)
+            subject.prepare_public_trace_report()
+            self.assertFalse(subject.performance_report["public_trace"]["complete_capture"])
+            self.assertFalse(subject.performance_report["public_trace"]["finalized"])
+            self.assertTrue(subject.performance_report["correctness_pass"])
+
+    def test_late_response_is_drained_before_final_complete_report(self):
+        with TemporaryDirectory() as temporary:
+            subject, relay = self.subject(temporary)
+            self.pending(relay)
+            def complete(_delay):
+                self.assertTrue(relay.capture_admission_closed)
+                self.assertEqual(relay.public_capture_progress()["pending_records"], 1)
+                relay.requests[0]["handler_completed_us"] = 200
+                relay.active_handlers = 0
+            with patch.object(performance.time, "sleep", side_effect=complete):
+                self.finish(subject)
+            saved = self.saved(temporary)
+            self.assertTrue(saved["public_trace"]["complete_capture"])
+            self.assertTrue(saved["fault_scenario_pass"])
+            self.assertEqual(len(saved["http_requests"]), 1)
+            self.assertEqual(saved["public_trace"]["relay_progress"][0]["unarchived_records"], 0)
+            relay.server.shutdown.assert_called_once_with()
+
+    def test_each_pending_source_prevents_false_complete_and_fails_after_report(self):
+        for busy in ("handler", "record", "write", "rpc"):
+            with self.subTest(busy=busy), TemporaryDirectory() as temporary:
+                subject, relay = self.subject(temporary)
+                if busy == "handler":
+                    relay.active_handlers = 1
+                elif busy == "record":
+                    self.pending(relay)
+                    relay.active_handlers = 0
+                elif busy == "write":
+                    relay.public_capture.writes_in_progress = 1
+                else:
+                    subject.rpc_calls.append({"method": "getflowmeshaccount", "start_host_us": 100})
+                with patch.object(performance, "PUBLIC_TRACE_QUIESCENCE_SECONDS", 0):
+                    with self.assertRaisesRegex(AssertionError, "failure report preserved"):
+                        self.finish(subject)
+                saved = self.saved(temporary)
+                self.assertFalse(saved["public_trace"]["complete_capture"])
+                self.assertTrue(saved["public_trace_finalization"]["timed_out"])
+                for flag in ("correctness_pass", "performance_pass", "fault_scenario_pass"):
+                    self.assertFalse(saved[flag])
+
+    def test_late_capture_failure_is_sticky_and_fails_after_report(self):
+        with TemporaryDirectory() as temporary:
+            subject, relay = self.subject(temporary)
+            self.pending(relay)
+            def complete(_delay):
+                relay.public_capture.note_failure("late artifact failure", request_id=1, stage="upstream")
+                relay.requests[0]["handler_completed_us"] = 200
+                relay.active_handlers = 0
+            with patch.object(performance.time, "sleep", side_effect=complete):
+                with self.assertRaisesRegex(AssertionError, "failure report preserved"):
+                    self.finish(subject)
+            saved = self.saved(temporary)
+            self.assertTrue(saved["public_trace_finalization"]["quiescent"])
+            self.assertFalse(saved["public_trace"]["complete_capture"])
+            self.assertFalse(saved["fault_scenario_pass"])
+            self.assertEqual(saved["public_trace"]["captures"][0]["failure_count"], 1)
+            subject.prepare_public_trace_report()
+            self.assertFalse(subject.performance_report["fault_scenario_pass"])
+            self.assertEqual(relay.public_capture.snapshot()["failure_count"], 1)
+
+    def test_finalization_failure_preserves_original_exception_identity(self):
+        for original in (ValueError("original workload failure"), KeyboardInterrupt()):
+            with self.subTest(error=type(original).__name__), TemporaryDirectory() as temporary:
+                subject, relay = self.subject(temporary)
+                relay.server.shutdown.side_effect = RuntimeError("observer shutdown failed")
+                def exercise():
+                    try:
+                        raise original
+                    finally:
+                        self.finish(subject, sys.exc_info()[0] is not None)
+                with self.assertRaises(type(original)) as caught:
+                    exercise()
+                self.assertIs(caught.exception, original)
+                saved = self.saved(temporary)
+                self.assertIn("capture_finalization_error", saved)
+                self.assertFalse(saved["fault_scenario_pass"])
+                self.assertFalse(saved["public_trace"]["complete_capture"])
 
 
 class AttributionTests(unittest.TestCase):
