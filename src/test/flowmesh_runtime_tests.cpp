@@ -7,6 +7,7 @@
 #include <flowmesh/auth.h>
 #include <flowmesh/agreement_wire.h>
 #include <hash.h>
+#include <logging.h>
 #include <test/util/flowmesh.h>
 #include <test/util/setup_common.h>
 
@@ -1095,6 +1096,26 @@ void CheckExactDeliveryRetry(const std::vector<node::FlowMeshRuntimeRelay>& orig
     }
 }
 
+class ScopedBenchLogging
+{
+    const BCLog::CategoryMask mask{LogInstance().GetCategoryMask()};
+    const decltype(LogInstance().CategoryLevels()) levels{LogInstance().CategoryLevels()};
+public:
+    ScopedBenchLogging()
+    {
+        auto enabled{levels};
+        enabled[BCLog::BENCH] = BCLog::Level::Debug;
+        LogInstance().SetCategoryLogLevel(enabled);
+        LogInstance().EnableCategory(BCLog::BENCH);
+    }
+    ~ScopedBenchLogging()
+    {
+        LogInstance().SetCategoryLogLevel(levels);
+        LogInstance().DisableCategory(BCLog::ALL);
+        LogInstance().EnableCategory(BCLog::LogFlags{mask});
+    }
+};
+
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_runtime_tests, BasicTestingSetup)
@@ -1217,6 +1238,76 @@ BOOST_AUTO_TEST_CASE(delivery_trace_cursor_accounts_for_bounded_ring_eviction)
     }
     BOOST_CHECK_LE(snapshot.trace_bytes, uint64_t{16 * 1024 * 1024});
     BOOST_CHECK_LE(snapshot.trace_global_bytes, uint64_t{64 * 1024 * 1024});
+}
+
+BOOST_AUTO_TEST_CASE(bench_spans_preserve_operational_delivery_history)
+{
+    ScopedBenchLogging logging;
+    BOOST_REQUIRE(LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug));
+    DeliveryRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_bench_history",
+        node::FlowMeshDeliveryAdmission::ADMITTED};
+    f.Tick();
+    const auto initial{f.Snapshot()};
+    BOOST_REQUIRE(std::any_of(initial.events.begin(), initial.events.end(), [](const auto& event) {
+        return event.stage == "admitted";
+    }));
+    // The clock never advances: these ticks have no eligible retry/timer work,
+    // but each ends a BENCH market-processing span. More than a whole ring of
+    // diagnostics must leave operational evidence and its byte budget intact.
+    for (unsigned i{0}; i < 256; ++i) f.Tick();
+    const auto after{f.Snapshot()};
+    BOOST_CHECK_EQUAL(after.last_event_id, initial.last_event_id);
+    BOOST_CHECK_EQUAL(after.events_dropped, initial.events_dropped);
+    BOOST_CHECK_EQUAL(after.trace_bytes, initial.trace_bytes);
+    BOOST_CHECK_EQUAL(after.trace_events_dropped, initial.trace_events_dropped);
+    BOOST_CHECK_EQUAL(after.trace_global_bytes, initial.trace_global_bytes);
+    BOOST_CHECK_EQUAL(after.trace_global_events_dropped, initial.trace_global_events_dropped);
+    BOOST_CHECK_EQUAL(after.admitted, initial.admitted);
+    BOOST_CHECK_EQUAL(after.refused, initial.refused);
+    BOOST_CHECK(after.last_target_hash == initial.last_target_hash);
+    BOOST_REQUIRE_EQUAL(after.events.size(), initial.events.size());
+    for (size_t i{0}; i < after.events.size(); ++i) {
+        BOOST_CHECK_EQUAL(after.events[i].event_id, initial.events[i].event_id);
+        BOOST_CHECK_EQUAL(after.events[i].stage, initial.events[i].stage);
+        BOOST_CHECK(after.events[i].object_id == initial.events[i].object_id);
+    }
+    flowmesh::WireMessage hello;
+    hello.kind = flowmesh::WireMessageKind::HELLO;
+    hello.header = {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 0};
+    hello.payload = flowmesh::EncodeMarketHello({f.domain, {}});
+    for (const bool enabled : {false, true}) {
+        if (enabled) LogInstance().EnableCategory(BCLog::BENCH);
+        else LogInstance().DisableCategory(BCLog::BENCH);
+        const auto before{f.Snapshot()};
+        BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER, hello) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+        const auto processed{f.Snapshot()};
+        // The original message_processing event is the only operational
+        // observation; diagnostic completion/gate events have their own log.
+        BOOST_CHECK_EQUAL(processed.last_event_id, before.last_event_id + 1);
+        BOOST_CHECK_EQUAL(processed.events.back().stage, "message_processing");
+        BOOST_CHECK_EQUAL(processed.events_dropped, before.events_dropped);
+        BOOST_CHECK_EQUAL(processed.refused, before.refused);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(bench_agreement_spans_are_not_operational_events)
+{
+    ScopedBenchLogging logging;
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_bench_history"};
+    f.Tick();
+    BOOST_REQUIRE_GT(f.prepares.load(), 0U);
+    BOOST_REQUIRE_GT(f.commits.load(), 0U);
+    for (const auto& runtime : f.runtimes) {
+        const auto snapshots{runtime->DeliverySnapshots(f.market)};
+        BOOST_REQUIRE_EQUAL(snapshots.size(), 1U);
+        BOOST_CHECK_LE(snapshots.front().events.size(), 128U);
+        for (const auto& event : snapshots.front().events) {
+            BOOST_CHECK(event.stage != "agreement_span");
+            BOOST_CHECK(event.stage != "message_chain_gate");
+            BOOST_CHECK(event.stage != "agreement_finalization_completed");
+        }
+    }
 }
 
 BOOST_AUTO_TEST_CASE(critical_delivery_retries_refusal_pause_and_socket_write_exactly)

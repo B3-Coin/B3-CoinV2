@@ -855,6 +855,47 @@ void DeliveryEvent(Market& market, const char* stage,
 }
 
 template <typename Market>
+void BenchEvent(const Market& market, const char* stage,
+                const flowmesh::WireMessageKind kind, const uint256& object,
+                const uint64_t sequence,
+                const std::optional<flowmesh::WirePeerId> peer = std::nullopt,
+                const std::string& reason = {}, const TraceContext& trace = {})
+{
+    if (!util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug)) return;
+    // Diagnostics must not consume operational events/IDs, change the last
+    // target, or exhaust DeliverySnapshot trace budgets. This independent
+    // fixed-metadata stream has a process-lifetime cap and terminal marker.
+    // No operational history is accessed, including when this cap is reached.
+    const auto completed_us{trace.observed_monotonic_us.value_or(TraceNow(*market.clock))};
+    static std::atomic<uint64_t> count{0};
+    constexpr uint64_t MAX_BENCH_EVENTS{32768};
+    const auto index{count.fetch_add(1, std::memory_order_relaxed)};
+    if (index > MAX_BENCH_EVENTS) return;
+    try {
+        UniValue row{UniValue::VOBJ};
+        row.pushKV("market_id", market.market_id.GetHex());
+        row.pushKV("thread_id", uint64_t{std::hash<std::thread::id>{}(std::this_thread::get_id())});
+        row.pushKV("diagnostic_event_id", index + 1);
+        row.pushKV("monotonic_us", completed_us);
+        row.pushKV("stage", index == MAX_BENCH_EVENTS ? "trace_limit_reached" : stage);
+        row.pushKV("kind", std::string{flowmesh::WireCommand(kind)});
+        row.pushKV("sequence", sequence);
+        row.pushKV("object_id", object.GetHex());
+        row.pushKV("epoch", trace.epoch.value_or(market.seats.epoch));
+        row.pushKV("seat_set_hash", trace.seat_set_hash.value_or(market.seats.set_hash).GetHex());
+        if (peer) row.pushKV("peer", *peer);
+        if (trace.round) row.pushKV("round", *trace.round);
+        if (trace.seat_index) row.pushKV("seat_index", *trace.seat_index);
+        if (trace.started_us) row.pushKV("started_us", *trace.started_us);
+        if (trace.span_id) row.pushKV("span_id", *trace.span_id);
+        if (trace.parent_span_id) row.pushKV("parent_span_id", *trace.parent_span_id);
+        if (trace.agreement_stage) row.pushKV("agreement_stage", *trace.agreement_stage);
+        row.pushKV("reason", reason.substr(0, 160));
+        LogDebug(BCLog::BENCH, "FlowMeshBenchTrace %s\n", row.write());
+    } catch (...) { /* Diagnostics cannot change runtime outcomes. */ }
+}
+
+template <typename Market>
 class BenchSpan {
     Market& market;
     const char* stage;
@@ -878,8 +919,7 @@ public:
         if (!started) return;
         trace.started_us = started;
         trace.observed_monotonic_us = TraceNow(*market.clock);
-        try { DeliveryEvent(market, stage, kind, object, sequence, std::nullopt, {}, trace); }
-        catch (...) { /* A benchmark logger is not part of consensus. */ }
+        BenchEvent(market, stage, kind, object, sequence, std::nullopt, {}, trace);
     }
 };
 
@@ -2476,7 +2516,7 @@ bool FlowMeshRuntime::InitializeAgreement(Market& market,
             trace.parent_span_id = event.parent_span_id;
             trace.agreement_stage = event.agreement_stage;
             trace.seat_index = event.seat_index;
-            DeliveryEvent(market, "agreement_span", flowmesh::WireMessageKind::AGREEMENT,
+            BenchEvent(market, "agreement_span", flowmesh::WireMessageKind::AGREEMENT,
                           event.candidate, event.context.sequence, std::nullopt, event.operation, trace);
         };
     }
@@ -3454,7 +3494,7 @@ void FlowMeshRuntime::ProcessMessage(
         return !critical || market.chain->Acceptable(market.chain->Current());
     }()};
     if (util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug)) {
-        DeliveryEvent(market, "message_chain_gate", queued.message.kind, {},
+        BenchEvent(market, "message_chain_gate", queued.message.kind, {},
             queued.message.header.sequence, queued.peer,
             "open=" + std::to_string(gate_open) + " generation=" + std::to_string(delivery_generation));
     }
