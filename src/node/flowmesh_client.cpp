@@ -526,7 +526,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         std::vector<unsigned char> inclusion_proof;
         uint256 owner_account;
         // Volatile read failover cursor; never part of the signed instruction.
-        std::optional<size_t> automatic_endpoint;
+        std::optional<size_t> automatic_endpoint{};
     };
     std::map<std::pair<uint256, uint256>, Pending> m_pending;
     FlowMeshClientPollScheduler m_action_polls;
