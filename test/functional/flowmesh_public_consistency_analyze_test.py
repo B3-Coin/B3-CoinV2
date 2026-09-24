@@ -94,6 +94,12 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(findings, {"response_identity_mismatch", "reported_account_mismatch",
                                    "snapshot_projection_differs_from_entry", "history_not_strictly_descending"})
 
+    def test_equal_height_history_hash_is_bound_to_included_entry(self):
+        request, response = snapshot()
+        response["result"]["reported_data"]["history"]["entries"][0]["microblock_hash"] = "wrong"
+        findings = self.analyze_response(request, response)["findings"]
+        self.assertEqual([row["code"] for row in findings], ["snapshot_equal_height_history_commitment_conflict"])
+
     def test_updates_newer_head_requires_refresh_not_automatic_stale_finding(self):
         request, response = snapshot()
         entry = decode_entry_prefix(ENTRY)
@@ -154,6 +160,8 @@ class FileTests(unittest.TestCase):
             self.assertIsNone(result["capture_complete_as_reported"])
             self.assertEqual(result["finding_counts"], {})
             self.assertIn("not inferred", result["old_failure_reproduced"])
+            self.assertFalse(result["rpc_correlation_metadata_complete"])
+            self.assertEqual(result["requests_without_report_metadata_count"], 1)
 
     def test_missing_response_and_symlink_are_explicit_incomplete_inputs(self):
         with TemporaryDirectory() as temporary:

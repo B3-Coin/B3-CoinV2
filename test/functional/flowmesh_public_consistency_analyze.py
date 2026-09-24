@@ -177,6 +177,13 @@ def inspect_context(context, entries_by_hash):
         over = [value for value in sequences if type(value) is int and value >= expected["next_microblock_sequence"]]
         if over:
             issue("snapshot_history_at_or_ahead_of_included_entry", entry_sequence=prefix["sequence"], offending_sequences=over)
+        for row in context["history"]["entries"]:
+            if row.get("sequence") != prefix["sequence"]:
+                continue
+            for field, entry_field in (("microblock_hash", "entry_hash"), ("state_root", "state_root")):
+                if field in row and row[field] != prefix[entry_field]:
+                    issue("snapshot_equal_height_history_commitment_conflict", field=field,
+                          entry=prefix[entry_field], reported=row[field], sequence=prefix["sequence"])
     for projection_name, projection in (("status", status), ("reported_snapshot", reported)):
         bound = projection.get("next_microblock_sequence")
         over = [value for value in sequences if type(value) is int and type(bound) is int and value >= bound]
@@ -258,6 +265,14 @@ def analyze(fixture):
             if (fixture / name).is_file():
                 report, _ = reader.read_json(fixture / name, MAX_REPORT)
                 break
+    if not isinstance(report, dict):
+        raise ValueError("performance report must be an object")
+    for field in ("http_requests", "rpc_calls"):
+        if not isinstance(report.get(field, []), list):
+            raise ValueError("performance report arrays malformed")
+        if len(report.get(field, [])) > MAX_REQUESTS:
+            reader.failure(fixture, f"report {field} count exceeds bounded analysis")
+            report[field] = report[field][:MAX_REQUESTS]
     record_index = {}
     for record in report.get("http_requests", []):
         path = record.get("request_body", {}).get("path")
@@ -275,9 +290,14 @@ def analyze(fixture):
                     reader.failure(trace, "endpoint directory bound exceeded")
                     directories = directories[:16]
                     break
-    requests_seen = 0
+    requests_seen = directory_entries_seen = unindexed_count = 0
+    unindexed = []
     for directory in sorted(directories):
         for request_path in directory.iterdir():
+            directory_entries_seen += 1
+            if directory_entries_seen > MAX_REQUESTS * 4:
+                reader.failure(directory, "directory entry count bound exceeded")
+                break
             match = re.fullmatch(r"([0-9]{8})-request\.json", request_path.name)
             if not match:
                 continue
@@ -287,6 +307,10 @@ def analyze(fixture):
                 break
             request_id = int(match[1])
             record = record_index.get((directory.name, request_id), {})
+            if not record:
+                unindexed_count += 1
+                if len(unindexed) < MAX_ERRORS:
+                    unindexed.append({"endpoint_directory": directory.name, "request_id": request_id})
             try:
                 request, request_artifact = reader.read_json(request_path)
                 if not isinstance(request, dict) or not isinstance(request.get("params"), dict):
@@ -324,7 +348,7 @@ def analyze(fixture):
                     reader.failure(request_path, "no retained response body; transport error=" + str(record.get("transport_error")))
             except (OSError, ValueError, TypeError, KeyError) as error:
                 reader.failure(request_path, error)
-        if requests_seen > MAX_REQUESTS:
+        if requests_seen > MAX_REQUESTS or directory_entries_seen > MAX_REQUESTS * 4:
             break
     for row in rows:
         inspect_context(row["context"], entries_by_hash)
@@ -337,6 +361,10 @@ def analyze(fixture):
         "old_failure_reproduced": "not inferred; consult observed wire findings and independently recorded RPC errors",
         "capture_complete_as_reported": report.get("public_trace", {}).get("complete_capture"),
         "analysis_complete": reader.failure_count == 0, "analysis_bytes_read": reader.bytes_read,
+        "analysis_complete_meaning": "bounded retained-file scan succeeded; not a source-capture closure guarantee",
+        "requests_without_report_metadata_count": unindexed_count,
+        "requests_without_report_metadata": unindexed,
+        "rpc_correlation_metadata_complete": bool(report) and unindexed_count == 0,
         "analysis_failure_count": reader.failure_count, "analysis_errors": reader.errors,
         "public_requests_seen": min(requests_seen, MAX_REQUESTS), "method_counts": dict(method_counts),
         "snapshot_updates_and_error_response_count": len(rows), "observed_entry_identities": len(entries_by_hash),
