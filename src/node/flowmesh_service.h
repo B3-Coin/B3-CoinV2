@@ -161,6 +161,9 @@ public:
         const flowmesh::MarketDataQuery& query, std::string& error) const;
     std::optional<flowmesh::ClientStateEvidence> ClientSnapshot(
         const flowmesh::MarketId& market_id, std::string& error) const;
+    std::optional<FlowMeshClientSnapshotView> ClientSnapshotView(
+        const flowmesh::MarketId& market_id,
+        const std::optional<flowmesh::AccountId>& account, std::string& error) const;
     std::optional<std::vector<unsigned char>> ClientCertifiedEntry(
         const flowmesh::MarketId& market_id, uint64_t sequence, std::string& error) const;
     flowmesh::ClientEventPage ClientEvents(

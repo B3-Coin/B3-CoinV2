@@ -298,6 +298,36 @@ class TradingApi {
         }
         return out;
     }
+    UniValue MarketResponse(const flowmesh::MarketData& data) const
+    {
+        // Match all head/runtime fields to the captured projection. Looking
+        // up Market() here would race a newly committed microblock and mix
+        // its newer status with the old certified payload/history.
+        MarketStatus status;
+        status.available = m_service.Enabled();
+        status.domain = data.domain; status.market_id = data.market_id;
+        const auto vault{flowmesh::ComputeFlowMeshVaultId(data.domain, data.market_id)};
+        if (!vault) Fail("Invalid public market identity");
+        status.vault_id = *vault; status.base_asset = data.base_asset_id;
+        status.quote_asset = modern::NativeAsset(); status.execution_config_id = data.execution_config_id;
+        const auto& snapshot{data.snapshot};
+        status.running = snapshot.running; status.paused = snapshot.paused;
+        status.pending_handoff = snapshot.pending_handoff; status.halt = snapshot.halt;
+        status.error = snapshot.error; status.epoch = snapshot.epoch;
+        status.next_microblock_sequence = snapshot.next_microblock_sequence;
+        status.last_microblock_hash = snapshot.last_microblock_hash;
+        status.state_root = snapshot.state_root; status.round = snapshot.runtime.round;
+        status.pending_actions = snapshot.pending_actions;
+        // Pending checkpoint is a separate service observation, never used
+        // as a substitute for this exact certified snapshot.
+        std::string error;
+        if (const auto checkpoint{m_service.NextCheckpointMpa(data.market_id, error)}) {
+            status.checkpoint_pending = true; status.pending_checkpoint_id = checkpoint->checkpoint_id;
+            status.pending_checkpoint_sequence = checkpoint->sequence;
+            status.pending_checkpoint_effect_count = checkpoint->effect_count;
+        }
+        return MarketResponse(status);
+    }
     bool Admit(const std::string& peer)
     {
         // Charged before decoding/authentication and before the operator's
@@ -333,18 +363,17 @@ public:
             const auto id{Id(params, "market_id")};
             const std::optional<uint256> account{params.exists("account_id") ? std::optional{Id(params, "account_id")} : std::nullopt};
             std::string error;
-            const auto evidence{m_service.ClientSnapshot(id, error)};
-            if (!evidence) Fail(error.empty() ? "No certified state snapshot is available" : error);
-            const auto status{m_local.Market(id, std::nullopt)};
-            if (!status) Fail("Unknown market");
+            const auto view{m_service.ClientSnapshotView(id, account, error)};
+            if (!view) Fail(error.empty() ? "No certified state snapshot is available" : error);
+            const auto& evidence{view->evidence};
             UniValue out{UniValue::VOBJ};
-            out.pushKV("status", MarketResponse(*status));
-            out.pushKV("certified_payload", HexStr(evidence->certified_payload));
-            out.pushKV("state_bytes", HexStr(evidence->state_bytes));
-            out.pushKV("cursor", CursorJson(evidence->cursor));
+            out.pushKV("status", MarketResponse(view->reported));
+            out.pushKV("certified_payload", HexStr(evidence.certified_payload));
+            out.pushKV("state_bytes", HexStr(evidence.state_bytes));
+            out.pushKV("cursor", CursorJson(evidence.cursor));
             // Unauthenticated projections are explicitly separate. The client
             // derives its balance/book from state_bytes instead of these rows.
-            if (const auto data{m_local.Data(id, account, {}, error)}) out.pushKV("reported_data", FlowMeshClientMarketDataJson(*data));
+            out.pushKV("reported_data", FlowMeshClientMarketDataJson(view->reported));
             return out;
         }
         if (method == "updates") {
@@ -353,10 +382,8 @@ public:
             const std::optional<uint256> account{params.exists("account_id") ? std::optional{Id(params, "account_id")} : std::nullopt};
             const std::optional<flowmesh::ClientEventCursor> after{params.exists("cursor") ? std::optional{ParseCursor(params["cursor"])} : std::nullopt};
             const auto page{m_service.ClientEvents(after, id, account, flowmesh::CLIENT_EVENT_PAGE_MAX)};
-            const auto status{m_local.Market(id, std::nullopt)};
-            if (!status) Fail("Unknown market");
             UniValue out{UniValue::VOBJ};
-            out.pushKV("status", MarketResponse(*status)); out.pushKV("cursor", CursorJson(page.cursor));
+            out.pushKV("cursor", CursorJson(page.cursor));
             out.pushKV("gap", page.gap); out.pushKV("more", page.more);
             out.pushKV("oldest_event_id", page.oldest_event_id); out.pushKV("latest_event_id", page.latest_event_id);
             UniValue events{UniValue::VARR};
@@ -373,7 +400,10 @@ public:
             if (params.exists("before_sequence")) { query.before_sequence = Number(params, "before_sequence"); query.known_head.reset(); }
             if (params.exists("limit")) query.limit = Number(params, "limit", flowmesh::MARKET_DATA_MAX_HISTORY);
             std::string error;
-            if (const auto data{m_local.Data(id, account, query, error)}) out.pushKV("reported_data", FlowMeshClientMarketDataJson(*data));
+            const auto data{m_local.Data(id, account, query, error)};
+            if (!data) Fail(error.empty() ? "No market-data view is available" : error);
+            out.pushKV("status", MarketResponse(*data));
+            out.pushKV("reported_data", FlowMeshClientMarketDataJson(*data));
             return out;
         }
         if (method == "submit") {

@@ -406,6 +406,12 @@ public:
         : FlowMeshCommitteeRelayBudget{messages, bytes} {}
 };
 
+/** Certificate, state, status and reported history captured at one head. */
+struct FlowMeshClientSnapshotView {
+    flowmesh::ClientStateEvidence evidence;
+    flowmesh::MarketData reported;
+};
+
 /**
  * Production FlowMesh orchestration core.
  *
@@ -479,6 +485,11 @@ public:
      * Serialization stops at the client cap; no execution or network I/O. */
     std::optional<flowmesh::ClientStateEvidence> ClientSnapshot(
         const flowmesh::MarketId& market_id, std::string& error) const;
+    /** Certificate/state and bounded reported history captured under ONE market
+     * lock. A later publication cannot mix two heads into this response. */
+    std::optional<FlowMeshClientSnapshotView> ClientSnapshotView(
+        const flowmesh::MarketId& market_id,
+        const std::optional<flowmesh::AccountId>& account, std::string& error) const;
     std::optional<std::vector<unsigned char>> ClientCertifiedEntry(
         const flowmesh::MarketId& market_id, uint64_t sequence, std::string& error) const;
     flowmesh::ClientEventPage ClientEvents(
@@ -576,6 +587,14 @@ private:
     std::vector<FlowMeshRuntimeMarketConfig> m_market_configs;
 
     mutable std::mutex m_market_mutex;
+    // Caller holds m_market_mutex. Shared by ordinary reads and the atomic
+    // public-client view; these helpers never execute a market transition.
+    std::optional<flowmesh::MarketData> MarketDataLocked(
+        const flowmesh::MarketId& market_id,
+        const std::optional<flowmesh::AccountId>& account,
+        const flowmesh::MarketDataQuery& query, std::string& error) const;
+    std::optional<flowmesh::ClientStateEvidence> ClientSnapshotLocked(
+        const flowmesh::MarketId& market_id, std::string& error) const;
     std::map<flowmesh::MarketId, std::unique_ptr<Market>> m_markets;
 
     mutable std::mutex m_queue_mutex;

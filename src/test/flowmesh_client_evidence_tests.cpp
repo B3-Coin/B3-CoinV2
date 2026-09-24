@@ -348,6 +348,53 @@ BOOST_AUTO_TEST_CASE(runtime_certified_action_status_recovers_after_restart_with
     BOOST_CHECK(snapshot->certified_payload == *payload);
     BOOST_CHECK(runtime.ClientActionStatus(f.pins.market_id, action.Id())->kind == flowmesh::ClientEventKind::CERTIFIED_INCLUDED);
     BOOST_CHECK(runtime.ClientCertifiedEntry(f.pins.market_id, 0, error) == payload);
+
+    // A response must retain its own authenticated context even when the next
+    // certificate is published before the caller consumes that response.
+    const auto paired_before{runtime.ClientSnapshotView(f.pins.market_id, f.account, error)};
+    BOOST_REQUIRE_MESSAGE(paired_before, error);
+    const auto history_in_context = [](const flowmesh::MarketData& reported, uint64_t authenticated_next) {
+        uint64_t previous{authenticated_next};
+        for (const auto& row : reported.history.entries) {
+            // This is the stale/out-of-order rejection boundary in the remote
+            // client's ReportedHistory; endpoint history is not a state proof.
+            if (row.sequence >= authenticated_next || row.sequence >= previous) return false;
+            previous = row.sequence;
+        }
+        return true;
+    };
+    const auto check_paired_context = [&](const node::FlowMeshClientSnapshotView& paired) {
+        const auto authenticated{f.Verify(paired.evidence, error)};
+        BOOST_REQUIRE_MESSAGE(authenticated, error);
+        const auto derived{flowmesh::ClientMarketData(f.pins, *authenticated, f.account, {}, error)};
+        BOOST_REQUIRE_MESSAGE(derived, error);
+        const auto& reported{paired.reported};
+        BOOST_CHECK(reported.domain == derived->domain);
+        BOOST_CHECK(reported.market_id == derived->market_id);
+        BOOST_CHECK(reported.base_asset_id == derived->base_asset_id);
+        BOOST_CHECK(reported.execution_config_id == derived->execution_config_id);
+        BOOST_CHECK(reported.snapshot.certified);
+        BOOST_CHECK_EQUAL(reported.snapshot.next_microblock_sequence, derived->snapshot.next_microblock_sequence);
+        BOOST_CHECK(reported.snapshot.last_microblock_hash == derived->snapshot.last_microblock_hash);
+        BOOST_CHECK(reported.snapshot.state_root == derived->snapshot.state_root);
+        BOOST_REQUIRE(reported.account && derived->account);
+        BOOST_CHECK(reported.account->account_id == f.account);
+        BOOST_CHECK_EQUAL(reported.account->next_sequence, derived->account->next_sequence);
+        BOOST_CHECK_EQUAL(reported.account->base_available, derived->account->base_available);
+        BOOST_CHECK_EQUAL(reported.account->base_reserved, derived->account->base_reserved);
+        BOOST_CHECK_EQUAL(reported.account->b3_available_atoms, derived->account->b3_available_atoms);
+        BOOST_CHECK_EQUAL(reported.account->b3_reserved_atoms, derived->account->b3_reserved_atoms);
+        BOOST_REQUIRE(reported.history.available);
+        BOOST_REQUIRE(!reported.history.entries.empty());
+        BOOST_CHECK(history_in_context(reported, derived->snapshot.next_microblock_sequence));
+        BOOST_CHECK_EQUAL(reported.history.entries.front().sequence, authenticated->certified.entry.sequence);
+        BOOST_CHECK(reported.history.entries.front().microblock_hash == authenticated->certified.entry.GetHash());
+    };
+    check_paired_context(*paired_before);
+    BOOST_CHECK(paired_before->evidence.certified_payload == *payload);
+    BOOST_CHECK_EQUAL(paired_before->reported.snapshot.next_microblock_sequence, 1U);
+    BOOST_CHECK_EQUAL(paired_before->reported.account->next_sequence, 8U);
+
     // Move the certified head past the target instruction. Recovery must find
     // its old certificate, not attribute it to the latest whole-state proof.
     auto later{action};
@@ -366,6 +413,38 @@ BOOST_AUTO_TEST_CASE(runtime_certified_action_status_recovers_after_restart_with
     BOOST_REQUIRE(runtime.EnqueueWireMessage(7, {flowmesh::WireMessageKind::CERTIFICATE,
         {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.pins.market_id, 0, 1}, *later_payload}) == flowmesh::QueueResult::ACCEPTED);
     BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{5}));
+
+    // Deterministic negative control for the former split endpoint assembly:
+    // retain certificate/state at sequence 0, then fetch history after sequence
+    // 1 commits. Both reads are individually valid, but this mixed response
+    // crosses the client's authenticated-next-sequence rejection boundary.
+    const auto split_later_history{runtime.MarketData(f.pins.market_id, f.account, {}, error)};
+    BOOST_REQUIRE_MESSAGE(split_later_history, error);
+    const auto old_derived{flowmesh::ClientMarketData(f.pins, *verified, f.account, {}, error)};
+    BOOST_REQUIRE_MESSAGE(old_derived, error);
+    BOOST_CHECK_EQUAL(old_derived->snapshot.next_microblock_sequence, 1U);
+    BOOST_CHECK_EQUAL(split_later_history->snapshot.next_microblock_sequence, 2U);
+    BOOST_REQUIRE(!split_later_history->history.entries.empty());
+    BOOST_CHECK_EQUAL(split_later_history->history.entries.front().sequence, 1U);
+    BOOST_CHECK(!history_in_context(*split_later_history, old_derived->snapshot.next_microblock_sequence));
+    BOOST_CHECK(split_later_history->snapshot.last_microblock_hash != old_derived->snapshot.last_microblock_hash);
+    BOOST_CHECK(split_later_history->snapshot.state_root != old_derived->snapshot.state_root);
+
+    const auto paired_after{runtime.ClientSnapshotView(f.pins.market_id, f.account, error)};
+    BOOST_REQUIRE_MESSAGE(paired_after, error);
+    check_paired_context(*paired_after);
+    BOOST_CHECK(paired_after->evidence.certified_payload == *later_payload);
+    BOOST_CHECK_EQUAL(paired_after->reported.snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK_EQUAL(paired_after->reported.account->next_sequence, 9U);
+    // Earlier exported objects neither borrow mutable runtime state nor get
+    // relabelled with the new head: they still authenticate their original view.
+    check_paired_context(*paired_before);
+    BOOST_CHECK(paired_before->evidence.certified_payload == snapshot->certified_payload);
+    BOOST_CHECK(paired_before->evidence.state_bytes == snapshot->state_bytes);
+    BOOST_CHECK(paired_before->reported.snapshot.last_microblock_hash == built->entry.GetHash());
+    BOOST_CHECK(paired_before->reported.snapshot.state_root == built->next_state.Root());
+    BOOST_CHECK_EQUAL(paired_before->reported.account->next_sequence, 8U);
+
     const auto cursor{snapshot->cursor};
     runtime.Stop();
     const auto action_relays_before{action_relays.load()};

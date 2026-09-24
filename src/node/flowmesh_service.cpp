@@ -1849,6 +1849,35 @@ std::optional<flowmesh::ClientStateEvidence> FlowMeshService::ClientSnapshot(
     return runtime->ClientSnapshot(market_id, error);
 }
 
+std::optional<FlowMeshClientSnapshotView> FlowMeshService::ClientSnapshotView(
+    const flowmesh::MarketId& market_id,
+    const std::optional<flowmesh::AccountId>& account, std::string& error) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    bool running{false};
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+        running = m_impl->running && !m_impl->stopping;
+    }
+    if (!runtime) { error = "FlowMesh runtime is unavailable"; return std::nullopt; }
+    auto out{runtime->ClientSnapshotView(market_id, account, error)};
+    if (out) {
+        // Availability is a local observation, not an authenticated state
+        // claim. Never replace the head/history captured together below it.
+        auto& snapshot{out->reported.snapshot};
+        snapshot.running = running;
+        const bool rules_active{m_impl->RulesActiveAtTip()};
+        const bool reconciled{m_impl->ReconciledAtTip()};
+        snapshot.chain_reconciling = running && rules_active && !reconciled;
+        if (!running || !rules_active || !reconciled) {
+            snapshot.paused = true;
+            if (snapshot.error.empty()) snapshot.error = "FlowMesh service is not active at the current B3 tip";
+        }
+    }
+    return out;
+}
+
 std::optional<std::vector<unsigned char>> FlowMeshService::ClientCertifiedEntry(
     const flowmesh::MarketId& market_id, const uint64_t sequence, std::string& error) const
 {

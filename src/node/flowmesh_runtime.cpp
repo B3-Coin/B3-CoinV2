@@ -3055,6 +3055,15 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketData(
     const std::optional<flowmesh::AccountId>& account,
     const flowmesh::MarketDataQuery& query, std::string& error) const
 {
+    std::lock_guard<std::mutex> lock{m_market_mutex};
+    return MarketDataLocked(market_id, account, query, error);
+}
+
+std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
+    const flowmesh::MarketId& market_id,
+    const std::optional<flowmesh::AccountId>& account,
+    const flowmesh::MarketDataQuery& query, std::string& error) const
+{
     if (query.limit == 0 || query.limit > flowmesh::MARKET_DATA_MAX_HISTORY ||
         query.curve_limit == 0 || query.curve_limit > flowmesh::MARKET_DATA_MAX_CURVES ||
         (query.curve_cursor && !query.expected_head) ||
@@ -3062,7 +3071,6 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketData(
         error = "Invalid bounded market-data query or pagination snapshot";
         return std::nullopt;
     }
-    std::lock_guard<std::mutex> lock{m_market_mutex};
     const auto it{m_markets.find(market_id)};
     if (it == m_markets.end()) {
         error = "Unknown FlowMesh market";
@@ -3136,6 +3144,24 @@ std::optional<flowmesh::ClientStateEvidence> FlowMeshRuntime::ClientSnapshot(
     const flowmesh::MarketId& market_id, std::string& error) const
 {
     std::lock_guard lock{m_market_mutex};
+    return ClientSnapshotLocked(market_id, error);
+}
+
+std::optional<FlowMeshClientSnapshotView> FlowMeshRuntime::ClientSnapshotView(
+    const flowmesh::MarketId& market_id,
+    const std::optional<flowmesh::AccountId>& account, std::string& error) const
+{
+    std::lock_guard lock{m_market_mutex};
+    auto evidence{ClientSnapshotLocked(market_id, error)};
+    if (!evidence) return std::nullopt;
+    auto reported{MarketDataLocked(market_id, account, {}, error)};
+    if (!reported) return std::nullopt;
+    return FlowMeshClientSnapshotView{std::move(*evidence), std::move(*reported)};
+}
+
+std::optional<flowmesh::ClientStateEvidence> FlowMeshRuntime::ClientSnapshotLocked(
+    const flowmesh::MarketId& market_id, std::string& error) const
+{
     const auto it{m_markets.find(market_id)};
     if (it == m_markets.end() || !it->second->client_head) {
         error = "FlowMesh client snapshot has no certified head";
