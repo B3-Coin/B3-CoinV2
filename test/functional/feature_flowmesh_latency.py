@@ -179,7 +179,11 @@ class FlowMeshLatencyTest(FlowMeshPreagreementTest):
             started = node.startflowmeshvalidator()
             assert_equal(started["running"], True)
             assert_equal(started["armed_keys"], 1)
-        self.mine_pos_blocks(A3 - n0.getblockcount())
+        # Activation and the bootstrap transaction were pinned exactly above.
+        # This is a minimum-depth wait, not another activation-boundary test:
+        # concurrent honest staking may finish one extra block before stop.
+        self.mine_pos_blocks(A3 - n0.getblockcount(), allow_overshoot=True)
+        assert n0.getblockcount() >= A3
         self.wait_for_market_convergence(market_id, require_unpaused=False)
         checkpoint = self.publish_checkpoint(market_id)
         assert_equal(checkpoint["sequence"], 0)
