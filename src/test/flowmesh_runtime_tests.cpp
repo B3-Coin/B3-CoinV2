@@ -1246,6 +1246,10 @@ BOOST_AUTO_TEST_CASE(bench_spans_preserve_operational_delivery_history)
     BOOST_REQUIRE(LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug));
     DeliveryRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_bench_history",
         node::FlowMeshDeliveryAdmission::ADMITTED};
+    // Preserve initial admission evidence, then remove local signing
+    // eligibility while the worker is idle. No repeated V1 proposal work is
+    // expected from the diagnostic-only ticks below.
+    f.keys.m_keys.clear();
     f.Tick();
     const auto initial{f.Snapshot()};
     BOOST_REQUIRE(std::any_of(initial.events.begin(), initial.events.end(), [](const auto& event) {
