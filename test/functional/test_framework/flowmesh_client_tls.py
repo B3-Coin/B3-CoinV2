@@ -175,7 +175,11 @@ class _RelayHandler(http.server.BaseHTTPRequestHandler):
             incomplete("request size refused; body not captured")
             self.reply(413, b'{"ok":false,"error":"test relay request bound"}')
             return
-        body = self.rfile.read(length)
+        try:
+            body = self.rfile.read(length)
+        except OSError as error:
+            incomplete(f"request body read failed: {type(error).__name__}")
+            raise
         if len(body) != length:
             incomplete("incomplete request body")
             return
