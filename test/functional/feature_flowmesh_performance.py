@@ -260,7 +260,8 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         if not self.options.performance_memory_trace:
             return
         captures = self.performance_report.setdefault("memory_capture", {})
-        for index, node in enumerate(self.nodes):
+        for node in [*self.nodes, self.client]:
+            index = node.index
             before = host_us()
             result = node.flowmeshtiming("start")
             after = host_us()
@@ -282,7 +283,8 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
 
     def end_memory_capture(self):
         for index in self.memory_capture_nodes:
-            result = self.nodes[index].flowmeshtiming("stop")
+            node = self.client if index == self.client.index else self.nodes[index]
+            result = node.flowmeshtiming("stop")
             path = Path(self.options.tmpdir, f"memory-timing-node{index}.json")
             path.write_text(json.dumps(result, indent=2) + "\n")
             limited = sum(row["event"].get("stage") == "trace_limit_reached" for row in result["events"])
@@ -292,6 +294,16 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 self.invalidate_final_result()
                 raise AssertionError("Incomplete bounded timing capture; retain partial evidence")
         self.memory_capture_nodes.clear()
+
+    def shutdown(self):
+        process = self.client.process if self.client is not None else None
+        try:
+            return super().shutdown()
+        finally:
+            if process is not None and Path(self.options.tmpdir).exists():
+                with Path(self.options.tmpdir, "native-child-exits.jsonl").open("a") as output:
+                    output.write(json.dumps({"node": self.client.index, "pid": process.pid,
+                        "returncode": process.poll(), "observed_host_us": host_us()}) + "\n")
 
     def start_ordinary_client(self):
         super().start_ordinary_client()
