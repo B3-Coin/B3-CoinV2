@@ -1,5 +1,6 @@
 // Copyright (c) 2026 The B3Coin Core developers
 // Distributed under the MIT software license, see COPYING.
+#include <node/flowmesh_timing.h>
 #include <node/flowmesh_client.h>
 #include <node/flowmesh_client_poll.h>
 #include <node/flowmesh_client_settlement.h>
@@ -350,9 +351,13 @@ public:
         : m_service(service), m_local(service, std::move(metadata)) {}
     UniValue Call(const UniValue& request)
     {
+        FlowMeshTimingSpan timing{"https_server_api"};
         Keys(request, {"method", "params"});
         const std::string method{Text(request, "method", 32)};
         const auto& params{request["params"]};
+        timing.Field("method", method);
+        for (const char* key : {"market_id", "action_id", "account_id"})
+            if (timing.Enabled() && params[key].isStr()) timing.Field(key, params[key].get_str());
         if (method == "markets") {
             Keys(params, {});
             UniValue out{UniValue::VARR};
@@ -651,6 +656,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                   bool* possibly_sent = nullptr, bool* earlier_possible = nullptr,
                   size_t* attempted_endpoints = nullptr, Pending* automatic_action = nullptr)
     {
+        FlowMeshTimingSpan timing{"client_call"};
+        timing.Field("method", method);
+        for (const char* key : {"market_id", "action_id", "account_id"})
+            if (timing.Enabled() && params[key].isStr()) timing.Field(key, params[key].get_str());
         if (m_endpoints.empty()) Fail("No FlowMesh HTTPS trading endpoint configured; use flowmeshclientconnect or -flowmeshendpoint");
         UniValue request{UniValue::VOBJ}; request.pushKV("method", method); request.pushKV("params", params);
         const std::string body{request.write()};
@@ -681,7 +690,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 Keys(parsed, {"ok", "result", "error"});
                 if (!Flag(parsed, "ok")) Fail(Text(parsed, "error"));
                 if (reply.status != 200) Fail("Unexpected HTTPS response status");
-                validate(parsed["result"], endpoint);
+                {
+                    FlowMeshTimingSpan verification{"client_verify_response"};
+                    verification.Field("method", method);
+                    validate(parsed["result"], endpoint);
+                }
                 m_selected = endpoint; EndpointResult(endpoint, true, {});
                 if (automatic_action) automatic_action->automatic_endpoint.reset();
                 return parsed["result"];
@@ -743,6 +756,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     }
     void Save()
     {
+        FlowMeshTimingSpan timing{"client_outbox_save"};
         UniValue root{UniValue::VOBJ}, actions{UniValue::VARR}, heads{UniValue::VARR};
         root.pushKV("version", 1);
         for (const auto& [key, p] : m_pending) {
@@ -762,7 +776,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         ClientJournalBlob blob{root.write()};
         if (blob.json.size() > 8 * 1024 * 1024) Fail("Client outbox exceeds its durable bound");
         OpenJournal();
+        timing.Mark("sync_started_us");
         m_db->Write(std::string{"public-client-v1"}, blob, true); // throws on failed synchronous write
+        timing.Mark("sync_completed_us");
 #ifdef FLOWMESH_CLIENT_CRASH_TEST_HOOKS
         test::ClientCrashRecord(m_path, "synchronous_journal_save_returned", root);
 #endif
@@ -1142,7 +1158,11 @@ public:
         error.clear();
         HttpsEndpoint endpoint{url, {}, {}};
         if (!NormalizeFlowMeshHttpsEndpoint(endpoint, error)) return false;
+        FlowMeshTimingSpan timing_lock_1145{__func__};
+        timing_lock_1145.Field("lock_name", std::string{"client_work"});
+        timing_lock_1145.Mark("lock_requested_us");
         std::lock_guard lock{m_work};
+        timing_lock_1145.Mark("lock_acquired_us");
         try {
             const auto existing{std::find_if(m_endpoints.begin(), m_endpoints.end(), [&](const auto& candidate) { return candidate.url == endpoint.url; })};
             const bool added{existing == m_endpoints.end()};
@@ -1194,7 +1214,11 @@ private:
 public:
     std::vector<MarketStatus> Markets(const std::optional<uint256>& account) override
     {
+        FlowMeshTimingSpan timing_lock_1197{__func__};
+        timing_lock_1197.Field("lock_name", std::string{"client_work"});
+        timing_lock_1197.Mark("lock_requested_us");
         std::lock_guard lock{m_work};
+        timing_lock_1197.Mark("lock_acquired_us");
         std::vector<MarketStatus> out;
         const auto rows{ReadMarkets()};
         // Discovery is bounded metadata; selected market gets full proof on
@@ -1212,7 +1236,11 @@ public:
     }
     std::optional<MarketStatus> Market(const uint256& id, const std::optional<uint256>& account) override
     {
+        FlowMeshTimingSpan timing_lock_1215{__func__};
+        timing_lock_1215.Field("lock_name", std::string{"client_work"});
+        timing_lock_1215.Mark("lock_requested_us");
         std::lock_guard lock{m_work};
+        timing_lock_1215.Mark("lock_acquired_us");
         MarketStatus status; status.market_id = id; status.remote = true;
         try {
             auto& cache{Refresh(id, account, {})}; const auto data{Project(cache, account, {})};
@@ -1242,13 +1270,23 @@ public:
     std::optional<flowmesh::MarketData> Data(const uint256& id, const std::optional<uint256>& account,
                                           const flowmesh::MarketDataQuery& query, std::string& error) override
     {
+        FlowMeshTimingSpan timing_lock_1245{__func__};
+        timing_lock_1245.Field("lock_name", std::string{"client_work"});
+        timing_lock_1245.Mark("lock_requested_us");
         std::lock_guard lock{m_work};
+        timing_lock_1245.Mark("lock_acquired_us");
         try { return Project(Refresh(id, account, query), account, query); }
         catch (const std::exception& e) { error = e.what(); return std::nullopt; }
     }
     Receipt Submit(const uint256& market, const flowmesh::Action& action) override
     {
+        FlowMeshTimingSpan timing_lock_1251{__func__};
+        timing_lock_1251.Field("market_id", market);
+        if (timing_lock_1251.Enabled()) timing_lock_1251.Field("action_id", action.Id());
+        timing_lock_1251.Field("lock_name", std::string{"client_work"});
+        timing_lock_1251.Mark("lock_requested_us");
         std::lock_guard lock{m_work};
+        timing_lock_1251.Mark("lock_acquired_us");
         Receipt out; out.action_id = action.Id();
         try {
             const auto pins{Pins(market)};
@@ -1290,7 +1328,13 @@ public:
     }
     Receipt ActionStatus(const uint256& market, const uint256& action, bool retry) override
     {
+        FlowMeshTimingSpan timing_lock_1293{__func__};
+        timing_lock_1293.Field("market_id", market);
+        timing_lock_1293.Field("action_id", action);
+        timing_lock_1293.Field("lock_name", std::string{"client_work"});
+        timing_lock_1293.Mark("lock_requested_us");
         std::lock_guard lock{m_work};
+        timing_lock_1293.Mark("lock_acquired_us");
         Receipt out; out.action_id = action;
         const auto it{m_pending.find({market, action})};
         if (it == m_pending.end()) { out.reason = "No retained local signed object; action outcome is unknown"; return out; }
@@ -1349,7 +1393,11 @@ public:
     std::vector<interfaces::FlowMeshSavedAction> SavedActions(
         const uint256& account, const std::optional<uint256>& market) override
     {
+        FlowMeshTimingSpan timing_lock_1352{__func__};
+        timing_lock_1352.Field("lock_name", std::string{"client_work"});
+        timing_lock_1352.Mark("lock_requested_us");
         std::lock_guard lock{m_work};
+        timing_lock_1352.Mark("lock_acquired_us");
         std::vector<interfaces::FlowMeshSavedAction> out;
         if (account.IsNull()) return out;
         // m_pending is already bounded by CLIENT_MAX_ACTIONS on admission and
@@ -1428,7 +1476,11 @@ public:
 
 std::optional<interfaces::FlowMeshPendingCheckpoint> RemoteBackend::Checkpoint(const uint256& id, std::string& error)
 {
+    FlowMeshTimingSpan timing_lock_1431{__func__};
+    timing_lock_1431.Field("lock_name", std::string{"client_work"});
+    timing_lock_1431.Mark("lock_requested_us");
     std::lock_guard lock{m_work};
+    timing_lock_1431.Mark("lock_acquired_us");
     try {
         UniValue params{UniValue::VOBJ}; params.pushKV("market_id", id.GetHex());
         std::optional<interfaces::FlowMeshPendingCheckpoint> result;
@@ -1442,7 +1494,11 @@ std::optional<interfaces::FlowMeshPendingCheckpoint> RemoteBackend::Checkpoint(c
 }
 std::vector<interfaces::FlowMeshVaultOperation> RemoteBackend::VaultOperations(const std::optional<uint256>& id, std::string& error)
 {
+    FlowMeshTimingSpan timing_lock_1445{__func__};
+    timing_lock_1445.Field("lock_name", std::string{"client_work"});
+    timing_lock_1445.Mark("lock_requested_us");
     std::lock_guard lock{m_work};
+    timing_lock_1445.Mark("lock_acquired_us");
     try {
         UniValue params{UniValue::VOBJ}; if (id) params.pushKV("market_id", id->GetHex());
         std::vector<interfaces::FlowMeshVaultOperation> result;
@@ -1465,7 +1521,11 @@ std::vector<interfaces::FlowMeshVaultOperation> RemoteBackend::VaultOperations(c
 }
 std::optional<interfaces::FlowMeshVaultOperation> RemoteBackend::VaultOperation(const uint256& id, std::string& error)
 {
+    FlowMeshTimingSpan timing_lock_1468{__func__};
+    timing_lock_1468.Field("lock_name", std::string{"client_work"});
+    timing_lock_1468.Mark("lock_requested_us");
     std::lock_guard lock{m_work};
+    timing_lock_1468.Mark("lock_acquired_us");
     try {
         UniValue params{UniValue::VOBJ}; params.pushKV("effect_id", id.GetHex());
         std::optional<interfaces::FlowMeshVaultOperation> result;

@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
+#include <node/flowmesh_timing.h>
 #include <node/flowmesh_production_store.h>
 
 #include <consensus/flowmesh_params.h>
@@ -44,7 +45,7 @@ namespace {
  * A synchronous DB call includes LevelDB work and OS scheduling; it does not
  * claim to isolate the device fsync. Zero timestamps mean not reached. */
 struct StoreTrace {
-    const bool enabled{LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug)};
+    const bool enabled{(FlowMeshTimingRecording() || LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug))};
     const char* operation;
     const flowmesh::ProductionEntryCore& entry;
     uint64_t started_us{0}, lock_requested_us{0}, lock_acquired_us{0};
@@ -93,7 +94,7 @@ struct StoreTrace {
             event.pushKV("batch_completed_us", batch_completed_us);
             event.pushKV("sync_started_us", sync_started_us);
             event.pushKV("sync_completed_us", sync_completed_us);
-            LogDebug(BCLog::BENCH, "FlowMeshStoreTrace %s\n", event.write());
+            FlowMeshTimingEmit("FlowMeshStoreTrace", event);
         } catch (...) { /* Diagnostics cannot affect persistence results. */ }
     }
 };

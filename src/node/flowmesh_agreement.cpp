@@ -218,6 +218,7 @@ struct FlowMeshAgreement::Impl {
         TraceSpan(Impl& s, const char* operation, const uint256& candidate = {}) : owner{s}
         {
             if (!s.callbacks.trace || !s.callbacks.trace_clock) return;
+            if (s.callbacks.trace_enabled && !s.callbacks.trace_enabled()) return;
             event.emplace(FlowMeshAgreementTrace{operation, s.Context(), s.slot.view, candidate,
                 ++s.trace_next_span, s.trace_parent_span, s.callbacks.trace_clock(), 0, {}, {}});
             s.trace_parent_span = event->span_id;

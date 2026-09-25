@@ -57,6 +57,7 @@ struct FlowMeshAgreementCallbacks {
     // measurement of the storage device's fsync alone.
     std::function<uint64_t()> trace_clock;
     std::function<void(const FlowMeshAgreementTrace&)> trace;
+    std::function<bool()> trace_enabled;
 };
 
 /** Single-slot PBFT agreement with an independently fsynced signing journal.

@@ -3,6 +3,7 @@
 // file COPYING or https://opensource.org/license/mit/.
 
 #include <node/flowmesh_https.h>
+#include <node/flowmesh_timing.h>
 
 #include <compat/compat.h>
 #include <util/sock.h>
@@ -164,6 +165,7 @@ std::optional<std::array<unsigned char, 32>> ParsePin(const std::string& text)
 }
 
 struct ClientCall {
+    FlowMeshTimingSpan* timing{nullptr};
     event_base* base{nullptr};
     HttpsRequestResult result;
     size_t max_reply{0};
@@ -208,6 +210,7 @@ void HandshakeInfo(const SSL* ssl, int where, int)
         // The HTTP writer may run immediately after this callback. Conservatively
         // report unknown outcome after successful TLS, even if later writes fail.
         call->result.request_may_have_been_sent = true;
+        if (call->timing) call->timing->Mark("tls_handshake_done_us");
     }
 }
 
@@ -458,7 +461,9 @@ bool NormalizeFlowMeshHttpsEndpoint(HttpsEndpoint& endpoint, std::string& error)
 HttpsRequestResult FlowMeshHttpsRequest(const HttpsEndpoint& endpoint, const std::string& path,
                                       const std::string& body, Milliseconds timeout, size_t max_reply_bytes)
 {
+    FlowMeshTimingSpan timing{"https_request"};
     ClientCall call;
+    call.timing = &timing;
     call.max_reply = max_reply_bytes;
     const auto start{Clock::now()};
     const auto parsed{ParseEndpoint(endpoint, path)};
@@ -471,6 +476,7 @@ HttpsRequestResult FlowMeshHttpsRequest(const HttpsEndpoint& endpoint, const std
         call.pin = ParsePin(endpoint.certificate_sha256);
         if (!call.pin) { call.result.error = "https-invalid-certificate-pin"; return call.result; }
     }
+    timing.Mark("context_started_us");
     auto context{MakeContext(false)};
     if (!context || ClientDataIndex() < 0) { call.result.error = "https-tls-initialization-failed"; return call.result; }
     SSL_CTX_set_verify(context.get(), SSL_VERIFY_PEER, VerifyPeer);
@@ -479,6 +485,7 @@ HttpsRequestResult FlowMeshHttpsRequest(const HttpsEndpoint& endpoint, const std
         call.result.error = "https-ca-load-failed";
         return call.result;
     }
+    timing.Mark("ca_ready_us");
     Owned<event_base, event_base_free> base{event_base_new(), event_base_free};
     if (!base) { call.result.error = "https-event-base-failed"; return call.result; }
     call.base = base.get();
@@ -511,6 +518,7 @@ HttpsRequestResult FlowMeshHttpsRequest(const HttpsEndpoint& endpoint, const std
     evhttp_connection_set_timeout_tv(connection.get(), &limit);
     auto* request{evhttp_request_new([](evhttp_request* req, void* argument) {
         auto& current{*static_cast<ClientCall*>(argument)};
+        if (current.timing) current.timing->Mark("response_callback_us");
         if (req) {
             const auto status{evhttp_request_get_response_code(req)};
             auto* input{evhttp_request_get_input_buffer(req)};
@@ -554,12 +562,15 @@ HttpsRequestResult FlowMeshHttpsRequest(const HttpsEndpoint& endpoint, const std
         call.result.error = "https-deadline-setup-failed";
         return call.result;
     }
+    // Dispatch is NOT an observation of socket write or peer receipt.
+    timing.Mark("dispatch_started_us");
     // libevent owns/frees request whether make_request succeeds or fails.
     if (evhttp_make_request(connection.get(), request, EVHTTP_REQ_POST, path.c_str()) != 0) {
         call.result.error = "https-request-setup-failed";
     } else if (event_base_dispatch(base.get()) < 0) {
         call.result.error = "https-event-loop-failed";
     }
+    timing.Mark("dispatch_completed_us");
     if (call.pin_failed) call.result.error = "https-certificate-pin-mismatch";
     else if (call.tls_failed) call.result.error = "https-certificate-verification-failed";
     return call.result;
@@ -570,6 +581,7 @@ struct FlowMeshHttpsServer::Impl {
         std::unique_ptr<Sock> socket;
         std::string peer;
         Clock::time_point deadline;
+        uint64_t enqueued_us{0};
     };
     Options options;
     Handler handler;
@@ -592,6 +604,8 @@ struct FlowMeshHttpsServer::Impl {
 
     void Serve(Pending pending)
     {
+        FlowMeshTimingSpan timing{"https_server_serve"};
+        timing.Field("enqueued_us", pending.enqueued_us);
         if (stopping.load() || Clock::now() >= pending.deadline) return;
         SocketBio socket_bio{*pending.socket};
         Ssl ssl{SSL_new(context.get()), SSL_free};
@@ -603,11 +617,13 @@ struct FlowMeshHttpsServer::Impl {
         SSL_set_bio(ssl.get(), bio, bio);
         TlsIo io{ssl.get(), *pending.socket, stopping, pending.deadline};
         if (!io.Handshake()) return;
+        timing.Mark("handshake_done_us");
         Request request;
         request.remote_address = std::move(pending.peer);
         Response response;
         int failure{400};
         const bool rejected{!ReadRequest(io, options.max_request_bytes, request, failure)};
+        timing.Mark("request_read_us");
         if (rejected) {
             response = {failure, "{\"error\":\"invalid-http-request\"}"};
         } else if (!io.Alive()) return;
@@ -615,6 +631,7 @@ struct FlowMeshHttpsServer::Impl {
             try { response = handler(request); }
             catch (...) { response = {500, "{\"error\":\"handler-failed\"}"}; }
         }
+        timing.Mark("handler_completed_us");
         if (!io.Alive()) return; // Handler may have admitted; caller must treat timeout as unknown.
         if (response.status < 200 || response.status > 599 || response.body.size() > options.max_reply_bytes) {
             response = {500, "{\"error\":\"reply-out-of-bounds\"}"};
@@ -623,6 +640,7 @@ struct FlowMeshHttpsServer::Impl {
             " Response\r\nContent-Type: application/json\r\nContent-Length: " +
             std::to_string(response.body.size()) + "\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n"};
         if (io.Write(header) && io.Write(response.body)) {
+            timing.Mark("response_written_us");
             if (rejected) {
                 const auto [ciphertext, plaintext]{io.FinishRejectedResponse()};
                 if (rejected_cleanup_observer) rejected_cleanup_observer(ciphertext, plaintext);
@@ -663,7 +681,9 @@ struct FlowMeshHttpsServer::Impl {
             if (stopping.load() || queue.size() >= options.max_queue ||
                 connections.load() >= options.max_connections) continue;
             ++connections;
-            queue.push_back({std::move(socket), NumericPeer(address), Clock::now() + options.request_timeout});
+            queue.push_back({std::move(socket), NumericPeer(address), Clock::now() + options.request_timeout,
+                FlowMeshTimingRecording() ? uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                    Clock::now().time_since_epoch()).count()) : 0});
             condition.notify_one();
         }
     }

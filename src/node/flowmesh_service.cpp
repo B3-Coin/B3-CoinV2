@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
+#include <node/flowmesh_timing.h>
 #include <node/flowmesh_service.h>
 
 #include <chain.h>
@@ -52,7 +53,11 @@ std::optional<flowmesh::ActiveFnBlsSeatSet> ResolveFlowMeshClientSeats(
     std::vector<flowmesh::BlsSeatBinding> bindings;
     flowmesh::AnchorRef seat_anchor;
     {
+        FlowMeshTimingSpan timing_lock_56{__func__};
+        timing_lock_56.Field("lock_name", std::string{"cs_main"});
+        timing_lock_56.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_56.Mark("lock_acquired_us");
         Chainstate& chainstate{chainman.ActiveChainstate()};
         const CBlockIndex* tip{chainstate.m_chain.Tip()};
         const auto& params{chainman.GetConsensus()};
@@ -171,7 +176,7 @@ void ReconciliationTrace(const char* stage, uint64_t generation,
                          const uint256& tip = {}, const UniValue* details = nullptr,
                          uint64_t completed_us = 0)
 {
-    if (!LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug)) return;
+    if (!(FlowMeshTimingRecording() || LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug))) return;
     // Fixed-size metadata and a process-lifetime cap, including one explicit
     // terminal marker. The marker means later reconciliation spans are unknown.
     static std::atomic<uint64_t> trace_count{0};
@@ -187,11 +192,11 @@ void ReconciliationTrace(const char* stage, uint64_t generation,
     event.pushKV("thread_id", uint64_t{std::hash<std::thread::id>{}(std::this_thread::get_id())});
     event.pushKV("stream", details ? "timing_spans" : "reconciliation");
     if (details) event.pushKV("timing", *details);
-    LogDebug(BCLog::BENCH, "FlowMeshServiceTrace %s\n", event.write());
+    FlowMeshTimingEmit("FlowMeshServiceTrace", event);
 }
 
 class ServiceSpan {
-    const bool enabled{LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug)};
+    const bool enabled{(FlowMeshTimingRecording() || LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug))};
     const char* stage;
     uint64_t generation, started_us{0};
     uint64_t mutex_requested_us{0}, mutex_acquired_us{0};
@@ -332,13 +337,21 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
 
     int32_t TipHeight() const override
     {
+        FlowMeshTimingSpan timing_lock_336{__func__};
+        timing_lock_336.Field("lock_name", std::string{"cs_main"});
+        timing_lock_336.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_336.Mark("lock_acquired_us");
         return chainman.ActiveChain().Height();
     }
 
     bool RulesActiveAtTip() const
     {
+        FlowMeshTimingSpan timing_lock_342{__func__};
+        timing_lock_342.Field("lock_name", std::string{"cs_main"});
+        timing_lock_342.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_342.Mark("lock_acquired_us");
         const CBlockIndex* tip{chainman.ActiveChain().Tip()};
         return tip != nullptr && Consensus::FlowMeshRulesActive(
                                      tip->nHeight, chainman.GetConsensus());
@@ -355,7 +368,11 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
             if (reconciled_tip != expected_tip) return false;
         }
         trace.ChainLockRequested();
+        FlowMeshTimingSpan timing_lock_359{__func__};
+        timing_lock_359.Field("lock_name", std::string{"cs_main"});
+        timing_lock_359.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_359.Mark("lock_acquired_us");
         trace.ChainLockAcquired();
         const CBlockIndex* tip{chainman.ActiveChain().Tip()};
         return tip != nullptr && tip->GetBlockHash() == expected_tip &&
@@ -409,7 +426,11 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         }
         if (expected_tip.IsNull()) return false;
         trace.ChainLockRequested();
+        FlowMeshTimingSpan timing_lock_413{__func__};
+        timing_lock_413.Field("lock_name", std::string{"cs_main"});
+        timing_lock_413.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_413.Mark("lock_acquired_us");
         trace.ChainLockAcquired();
         const CChain& active{chainman.ActiveChain()};
         const CBlockIndex* tip{active.Tip()};
@@ -496,7 +517,11 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         std::optional<flowmesh::ActiveFnBlsSeatSet> out;
         {
             trace.ChainLockRequested();
+            FlowMeshTimingSpan timing_lock_500{__func__};
+            timing_lock_500.Field("lock_name", std::string{"cs_main"});
+            timing_lock_500.Mark("lock_requested_us");
             LOCK(::cs_main);
+            timing_lock_500.Mark("lock_acquired_us");
             trace.ChainLockAcquired();
             Chainstate& chainstate{chainman.ActiveChainstate()};
             const CBlockIndex* tip{chainstate.m_chain.Tip()};
@@ -556,7 +581,11 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     std::optional<flowmesh::AnchorRef> UniqueBootstrapAnchor(
         const FlowMeshMarketRecord& record, std::string& error) const
     {
+        FlowMeshTimingSpan timing_lock_560{__func__};
+        timing_lock_560.Field("lock_name", std::string{"cs_main"});
+        timing_lock_560.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_560.Mark("lock_acquired_us");
         Chainstate& chainstate{chainman.ActiveChainstate()};
         const CBlockIndex* tip{chainstate.m_chain.Tip()};
         if (tip == nullptr || !SyncIndexesLocked(chainstate, *tip, error)) {
@@ -602,7 +631,11 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
 
         std::vector<std::pair<uint64_t, flowmesh::AnchorRef>> candidates;
         {
+            FlowMeshTimingSpan timing_lock_606{__func__};
+            timing_lock_606.Field("lock_name", std::string{"cs_main"});
+            timing_lock_606.Mark("lock_requested_us");
             LOCK(::cs_main);
+            timing_lock_606.Mark("lock_acquired_us");
             Chainstate& chainstate{chainman.ActiveChainstate()};
             const CBlockIndex* tip{chainstate.m_chain.Tip()};
             std::string error;
@@ -662,7 +695,11 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
 
         std::optional<std::pair<uint64_t, uint256>> identity;
         {
+            FlowMeshTimingSpan timing_lock_666{__func__};
+            timing_lock_666.Field("lock_name", std::string{"cs_main"});
+            timing_lock_666.Mark("lock_requested_us");
             LOCK(::cs_main);
+            timing_lock_666.Mark("lock_acquired_us");
             Chainstate& chainstate{chainman.ActiveChainstate()};
             const CBlockIndex* tip{chainstate.m_chain.Tip()};
             std::string error;
@@ -767,7 +804,11 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     {
         const auto expected_domain{ChainDomain()};
         if (!expected_domain || domain != *expected_domain) return std::nullopt;
+        FlowMeshTimingSpan timing_lock_771{__func__};
+        timing_lock_771.Field("lock_name", std::string{"cs_main"});
+        timing_lock_771.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_771.Mark("lock_acquired_us");
         Chainstate& chainstate{chainman.ActiveChainstate()};
         const CBlockIndex* tip{chainstate.m_chain.Tip()};
         std::string error;
@@ -953,7 +994,11 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         if (stored->settlements.empty()) return false;
         if (marker->last_b3_checkpoint.IsNull()) return true;
 
+        FlowMeshTimingSpan timing_lock_957{__func__};
+        timing_lock_957.Field("lock_name", std::string{"cs_main"});
+        timing_lock_957.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_957.Mark("lock_acquired_us");
         Chainstate& chainstate{chainman.ActiveChainstate()};
         const CBlockIndex* tip{chainstate.m_chain.Tip()};
         if (tip == nullptr || !SyncIndexesLocked(chainstate, *tip, error)) {
@@ -1092,7 +1137,11 @@ bool FlowMeshService::Impl::ReconcileStoreConnections(
     std::map<int32_t, uint256> canonical_blocks;
     uint256 snapshot_tip;
     {
+        FlowMeshTimingSpan timing_lock_1096{__func__};
+        timing_lock_1096.Field("lock_name", std::string{"cs_main"});
+        timing_lock_1096.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_1096.Mark("lock_acquired_us");
         const CChain& chain{chainman.ActiveChain()};
         const CBlockIndex* tip{chain.Tip()};
         if (tip) snapshot_tip = tip->GetBlockHash();
@@ -1111,7 +1160,11 @@ bool FlowMeshService::Impl::ReconcileStoreConnections(
     // batch was being checked/written. A downward rollback remains safe; the
     // next tip callback will reconcile the newer chain before unpausing.
     {
+        FlowMeshTimingSpan timing_lock_1115{__func__};
+        timing_lock_1115.Field("lock_name", std::string{"cs_main"});
+        timing_lock_1115.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_1115.Mark("lock_acquired_us");
         const CBlockIndex* tip{chainman.ActiveChain().Tip()};
         const uint256 current_tip{tip ? tip->GetBlockHash() : uint256{}};
         if (current_tip != snapshot_tip) {
@@ -1126,7 +1179,11 @@ bool FlowMeshService::Impl::ReconcileAllStoreConnections(std::string& error)
 {
     uint256 initial_tip;
     {
+        FlowMeshTimingSpan timing_lock_1130{__func__};
+        timing_lock_1130.Field("lock_name", std::string{"cs_main"});
+        timing_lock_1130.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_1130.Mark("lock_acquired_us");
         const CBlockIndex* tip{chainman.ActiveChain().Tip()};
         if (tip) initial_tip = tip->GetBlockHash();
     }
@@ -1152,7 +1209,11 @@ bool FlowMeshService::Impl::ReconcileAllStoreConnections(std::string& error)
     }
     uint256 final_tip;
     {
+        FlowMeshTimingSpan timing_lock_1156{__func__};
+        timing_lock_1156.Field("lock_name", std::string{"cs_main"});
+        timing_lock_1156.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_1156.Mark("lock_acquired_us");
         const CBlockIndex* tip{chainman.ActiveChain().Tip()};
         final_tip = tip ? tip->GetBlockHash() : uint256{};
         if (final_tip != initial_tip) {
@@ -1204,7 +1265,11 @@ bool FlowMeshService::Impl::InstallMarket(
             resources->chain_record = record;
             Chainstate* active_chainstate{nullptr};
             {
+                FlowMeshTimingSpan timing_lock_1208{__func__};
+                timing_lock_1208.Field("lock_name", std::string{"cs_main"});
+                timing_lock_1208.Mark("lock_requested_us");
                 LOCK(::cs_main);
+                timing_lock_1208.Mark("lock_acquired_us");
                 active_chainstate = &chainman.ActiveChainstate();
             }
             resources->deposits = std::make_unique<ChainDepositVerifier>(
@@ -1297,7 +1362,11 @@ bool FlowMeshService::Impl::InstallMarket(
         // market. Require explicit selection AND no canonical B3 checkpoint.
         // Repeat this check after an interrupted bootstrap as well. Hold the
         // chain snapshot through the first durable mode binding.
+        FlowMeshTimingSpan timing_lock_1301{__func__};
+        timing_lock_1301.Field("lock_name", std::string{"cs_main"});
+        timing_lock_1301.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_1301.Mark("lock_acquired_us");
         Chainstate& chainstate{chainman.ActiveChainstate()};
         const CBlockIndex* tip{chainstate.m_chain.Tip()};
         if (!tip || !SyncIndexesLocked(chainstate, *tip, error)) return false;
@@ -1385,7 +1454,11 @@ bool FlowMeshService::Impl::RefreshMarkets(uint256& sampled_tip,
     flowmesh::AnchorRef discovery_anchor;
     std::vector<FlowMeshMarketRecord> discovered;
     {
+        FlowMeshTimingSpan timing_lock_1389{__func__};
+        timing_lock_1389.Field("lock_name", std::string{"cs_main"});
+        timing_lock_1389.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_1389.Mark("lock_acquired_us");
         Chainstate& chainstate{chainman.ActiveChainstate()};
         const CBlockIndex* tip{chainstate.m_chain.Tip()};
         if (tip == nullptr || !Consensus::FlowMeshRulesActive(tip->nHeight,
@@ -1421,7 +1494,11 @@ bool FlowMeshService::Impl::RefreshMarkets(uint256& sampled_tip,
         if (!InstallMarket(record, error)) return false;
     }
     {
+        FlowMeshTimingSpan timing_lock_1425{__func__};
+        timing_lock_1425.Field("lock_name", std::string{"cs_main"});
+        timing_lock_1425.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_1425.Mark("lock_acquired_us");
         const CBlockIndex* tip{chainman.ActiveChain().Tip()};
         if (tip == nullptr || tip->GetBlockHash() != sampled_tip) {
             error = "B3 tip changed while FlowMesh markets were refreshing";
@@ -1482,7 +1559,11 @@ bool FlowMeshService::Impl::ReconcileConnectedCheckpoints(std::string& error)
             std::optional<FlowMeshConnectedCheckpoint> connected;
             int32_t canonical_tip_height{-1};
             {
+                FlowMeshTimingSpan timing_lock_1486{__func__};
+                timing_lock_1486.Field("lock_name", std::string{"cs_main"});
+                timing_lock_1486.Mark("lock_requested_us");
                 LOCK(::cs_main);
+                timing_lock_1486.Mark("lock_acquired_us");
                 Chainstate& chainstate{chainman.ActiveChainstate()};
                 const CBlockIndex* tip{chainstate.m_chain.Tip()};
                 if (tip == nullptr) {
@@ -2161,7 +2242,11 @@ std::optional<FlowMeshVaultOperation> FlowMeshService::VaultOperation(
     };
     std::vector<ConnectedEntry> connected;
     {
+        FlowMeshTimingSpan timing_lock_2165{__func__};
+        timing_lock_2165.Field("lock_name", std::string{"cs_main"});
+        timing_lock_2165.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_2165.Mark("lock_acquired_us");
         Chainstate& chainstate{m_impl->chainman.ActiveChainstate()};
         const CBlockIndex* tip{chainstate.m_chain.Tip()};
         if (tip == nullptr ||
@@ -2244,7 +2329,11 @@ std::optional<FlowMeshVaultOperation> FlowMeshService::VaultOperation(
 
     std::vector<FlowMeshVaultInput> inputs;
     {
+        FlowMeshTimingSpan timing_lock_2248{__func__};
+        timing_lock_2248.Field("lock_name", std::string{"cs_main"});
+        timing_lock_2248.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_2248.Mark("lock_acquired_us");
         Chainstate& chainstate{m_impl->chainman.ActiveChainstate()};
         const CBlockIndex* tip{chainstate.m_chain.Tip()};
         if (tip == nullptr ||
@@ -2356,7 +2445,11 @@ std::vector<FlowMeshVaultOperation> FlowMeshService::VaultOperations(
     };
     std::vector<ConnectedEntry> connected;
     {
+        FlowMeshTimingSpan timing_lock_2360{__func__};
+        timing_lock_2360.Field("lock_name", std::string{"cs_main"});
+        timing_lock_2360.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_2360.Mark("lock_acquired_us");
         Chainstate& chainstate{m_impl->chainman.ActiveChainstate()};
         const CBlockIndex* tip{chainstate.m_chain.Tip()};
         if (tip == nullptr ||
@@ -2485,7 +2578,11 @@ void FlowMeshService::ReconcileAfterInitialBlockDownload()
 
     const CBlockIndex* tip;
     {
+        FlowMeshTimingSpan timing_lock_2489{__func__};
+        timing_lock_2489.Field("lock_name", std::string{"cs_main"});
+        timing_lock_2489.Mark("lock_requested_us");
         LOCK(::cs_main);
+        timing_lock_2489.Mark("lock_acquired_us");
         tip = m_impl->chainman.ActiveChain().Tip();
     }
     UpdatedBlockTip(tip, nullptr, /*initial_download=*/false);

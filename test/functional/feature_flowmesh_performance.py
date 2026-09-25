@@ -218,10 +218,12 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         parser.add_argument("--performance-action-timeout", type=bounded_seconds, default=60)
         parser.add_argument("--performance-fail-on-gate", action="store_true",
                             help="Also fail process exit on a measured performance miss; correctness always gates exit")
-        parser.add_argument("--performance-profile", choices=("ladder", "matched-repair"), default="ladder",
+        parser.add_argument("--performance-profile", choices=("ladder", "matched-repair", "native-queue"), default="ladder",
                             help="matched-repair fixes two markets, 20-second windows, two repeats at 0.5/s, and burst8")
         parser.add_argument("--performance-public-trace", action="store_true",
                             help="Bounded full public HTTPS bodies plus RPC/context accounting in generated fixture only")
+        parser.add_argument("--performance-memory-trace", action="store_true",
+                            help="Start bounded regtest-only memory timing after setup; freeze after measured work")
         parser.add_argument("--performance-read-recovery", action="store_true",
                             help="Optional bounded read-only follow-up recovery; preserves read failure and fails final exit")
 
@@ -231,6 +233,12 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
             self.options.performance_window_seconds = 20
             self.options.performance_idle_seconds = 10
         self.performance_rates = (.5,) if self.options.performance_profile == "matched-repair" else RATES
+        if self.options.performance_profile == "native-queue":
+            self.options.performance_markets = 2
+            self.options.performance_idle_seconds = 1
+            self.performance_rates = ()
+        if self.options.performance_memory_trace and self.options.performance_diagnostic:
+            raise ValueError("Memory capture requires BENCH logging disabled")
         self.options.latency_production_logging = not self.options.performance_diagnostic
         super().set_test_params()
         self.market_specs = []
@@ -246,6 +254,44 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         self.rpc_calls = []
         self.trace_local = threading.local()
         self.trace_drain_lock = threading.Lock()
+        self.memory_capture_nodes = []
+
+    def begin_memory_capture(self):
+        if not self.options.performance_memory_trace:
+            return
+        captures = self.performance_report.setdefault("memory_capture", {})
+        for index, node in enumerate(self.nodes):
+            before = host_us()
+            result = node.flowmeshtiming("start")
+            after = host_us()
+            self.memory_capture_nodes.append(index)
+            captures[str(index)] = {"start": result, "start_host_us_bounds": [before, after],
+                "offset_us_bounds": [before - result["start_us"], after - result["start_us"]]}
+
+    def stop_nodes(self, wait=0):
+        # Preserve actual Popen outcomes even after the framework releases its handles.
+        processes = [(node.index, node.process) for node in self.nodes if node.process]
+        try:
+            super().stop_nodes(wait)
+        finally:
+            path = Path(self.options.tmpdir, "native-child-exits.jsonl")
+            with path.open("a") as output:
+                for index, process in processes:
+                    output.write(json.dumps({"node": index, "pid": process.pid,
+                        "returncode": process.poll(), "observed_host_us": host_us()}) + "\n")
+
+    def end_memory_capture(self):
+        for index in self.memory_capture_nodes:
+            result = self.nodes[index].flowmeshtiming("stop")
+            path = Path(self.options.tmpdir, f"memory-timing-node{index}.json")
+            path.write_text(json.dumps(result, indent=2) + "\n")
+            limited = sum(row["event"].get("stage") == "trace_limit_reached" for row in result["events"])
+            self.performance_report["memory_capture"][str(index)].update(
+                file=path.name, count=len(result["events"]), dropped=result["dropped"], limit_markers=limited)
+            if result["dropped"] or limited:
+                self.invalidate_final_result()
+                raise AssertionError("Incomplete bounded timing capture; retain partial evidence")
+        self.memory_capture_nodes.clear()
 
     def start_ordinary_client(self):
         super().start_ordinary_client()
@@ -628,7 +674,7 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 while host_us() < scheduled and not self.scheduler_stop.is_set():
                     self.scheduler_stop.wait(min(.01, (scheduled - host_us()) / 1_000_000))
                 worker = selected[index % len(selected)]
-                kind = KINDS[worker["ordinal"] % len(KINDS)]
+                kind = "fill_bid" if self.options.performance_profile == "native-queue" else KINDS[worker["ordinal"] % len(KINDS)]
                 worker["ordinal"] += 1
                 stamp = host_us()
                 sample = {"sample_id": self.offered_counter, "wallet": worker["wallet"],
@@ -928,6 +974,10 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 "read_recovery_never_converts_first_read_failure_to_success": True,
                 "public_trace_enabled": self.options.performance_public_trace}}
         self.latency_report = self.performance_report
+        if self.options.performance_profile == "native-queue":
+            self.performance_report["campaign"].update(planned_windows=["isolated_fill", "burst_8"],
+                pilot_actions=1, pilot_rate=0, repeats_per_rate=0,
+                purpose="Queue attribution, not sustained-load performance qualification")
         try:
             market, asset = self.bootstrap_latency_market()
             self.market_specs.insert(0, {"market_id": market, "asset": asset})
@@ -942,13 +992,16 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                     self.calibrate_clocks(spec["market_id"], "before")
                 else:
                     self.verify_production_logging(spec["market_id"], "before")
+            self.begin_memory_capture()
             for worker in self.workers:
                 thread = threading.Thread(target=self.worker_loop, args=(worker,),
                                           name="flowmesh-buyer-worker")
                 thread.start()
                 self.threads.append(thread)
             self.begin_b3_workload(range(4))
-            pilot = self.run_window("pilot", rate=.5, duration=24, count=12)
+            pilot = (self.run_window("isolated_fill", rate=0, duration=1, count=1)
+                     if self.options.performance_profile == "native-queue" else
+                     self.run_window("pilot", rate=.5, duration=24, count=12))
             assert self.phase_can_continue(pilot), "pilot account completion failed; retain report"
             idle_start = host_us()
             deadline = time.monotonic() + self.options.performance_idle_seconds
@@ -975,6 +1028,7 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
             if all(self.phase_can_continue(window["summary"]) for window in self.performance_report["windows"]):
                 self.run_window("burst_8", rate=0, duration=1, count=8)
             self.end_b3_workload()
+            self.end_memory_capture()
             self.check_signed_observations()
             if all(sample["status"] == "complete" for sample in self.performance_report["samples"]):
                 self.check_makers()
@@ -1031,6 +1085,12 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 self.performance_report["cleanup_error"] = {
                     "type": "AssertionError", "reason": "harness thread survived bounded cleanup joins"}
             self.end_b3_workload()
+            if self.memory_capture_nodes:
+                try:
+                    self.end_memory_capture()
+                except Exception as error:
+                    self.performance_report["memory_capture_error"] = compact_error(error)
+                    self.invalidate_final_result()
             self.finish_report(primary_exception_in_flight, "flowmesh-performance.json", "FLOWMESH_PERFORMANCE_REPORT")
 
 

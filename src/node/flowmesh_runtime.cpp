@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
+#include <node/flowmesh_timing.h>
 #include <node/flowmesh_runtime.h>
 
 #include <crypto/common.h>
@@ -649,7 +650,7 @@ struct TraceContext {
  * exact wire hash/peer and monotonic clock. Duplicate admissions/evictions mean
  * a wire hash alone is not a unique queue-item identifier. */
 struct WorkerTrace {
-    const bool enabled{util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug)};
+    const bool enabled{(FlowMeshTimingRecording() || util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug))};
     const FlowMeshRuntimeClock& clock;
     const char* stage;
     const char* work{"none"};
@@ -661,7 +662,7 @@ struct WorkerTrace {
     uint64_t finish_lock_requested_us{0}, finish_locked_us{0};
     size_t queue_before{0}, queue_after{0}, queue_bytes{0}, control_depth{0};
     bool worker_processing{false}, worker_waiting{false}, tick_pending{false};
-    bool coalesced{false}, delivery_completion{false};
+    bool coalesced{false}, delivery_completion{false}, predicate_ready_before_wait{false};
     std::optional<flowmesh::WireHeader> header;
     flowmesh::WireMessageKind kind{flowmesh::WireMessageKind::ACTION};
     std::optional<flowmesh::WirePeerId> peer;
@@ -700,6 +701,7 @@ struct WorkerTrace {
             row.pushKV("queue_lock_requested_us", queue_lock_requested_us);
             row.pushKV("queue_locked_us", queue_locked_us);
             row.pushKV("wait_started_us", wait_started_us);
+            row.pushKV("predicate_ready_before_wait", predicate_ready_before_wait);
             row.pushKV("wait_returned_us", wait_returned_us);
             row.pushKV("dequeued_us", dequeued_us);
             row.pushKV("notified_us", notified_us);
@@ -731,7 +733,7 @@ struct WorkerTrace {
             if (peer) row.pushKV("peer", *peer);
             if (wire_hash) row.pushKV("wire_hash", wire_hash->GetHex());
             if (result) row.pushKV("queue_result", static_cast<unsigned>(*result));
-            LogDebug(BCLog::BENCH, "FlowMeshWorkerTrace %s\n", row.write());
+            FlowMeshTimingEmit("FlowMeshWorkerTrace", row);
         } catch (...) { /* Diagnostics must not change admission/worker behavior. */ }
     }
 };
@@ -747,7 +749,7 @@ TraceContext EntryTrace(const flowmesh::ProductionEntryCore& entry)
 TraceContext WireTrace(const flowmesh::WireMessage& message)
 {
     TraceContext trace;
-    if (util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug)) {
+    if ((FlowMeshTimingRecording() || util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug))) {
         flowmesh::WireCheck check;
         if (const auto encoded{flowmesh::EncodeWireMessage(message, check)}) trace.wire_hash = Hash(*encoded);
     }
@@ -800,7 +802,7 @@ void DeliveryEvent(Market& market, const char* stage,
     event.wire_hash = trace.wire_hash;
     event.delivery_id = trace.delivery_id;
     out.events.push_back(event);
-    if (util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug)) {
+    if ((FlowMeshTimingRecording() || util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug))) {
         constexpr uint64_t MAX_TRACE_BYTES{16 * 1024 * 1024};
         const auto dropped = [&] {
             CountObservation(out.trace_events_dropped);
@@ -852,7 +854,7 @@ void DeliveryEvent(Market& market, const char* stage,
         } while (!g_runtime_trace_bytes.compare_exchange_weak(
             global_bytes, global_bytes + bytes, std::memory_order_relaxed));
         out.trace_bytes += bytes;
-        LogDebug(BCLog::BENCH, "FlowMeshTrace %s\n", line);
+        FlowMeshTimingEmit("FlowMeshTrace", row);
     }
 }
 
@@ -863,7 +865,7 @@ void BenchEvent(const Market& market, const char* stage,
                 const std::optional<flowmesh::WirePeerId> peer = std::nullopt,
                 const std::string& reason = {}, const TraceContext& trace = {})
 {
-    if (!util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug)) return;
+    if (!(FlowMeshTimingRecording() || util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug))) return;
     // Diagnostics must not consume operational events/IDs, change the last
     // target, or exhaust DeliverySnapshot trace budgets. This independent
     // fixed-metadata stream has a process-lifetime cap and terminal marker.
@@ -893,7 +895,7 @@ void BenchEvent(const Market& market, const char* stage,
         if (trace.parent_span_id) row.pushKV("parent_span_id", *trace.parent_span_id);
         if (trace.agreement_stage) row.pushKV("agreement_stage", *trace.agreement_stage);
         row.pushKV("reason", reason.substr(0, 160));
-        LogDebug(BCLog::BENCH, "FlowMeshBenchTrace %s\n", row.write());
+        FlowMeshTimingEmit("FlowMeshBenchTrace", row);
     } catch (...) { /* Diagnostics cannot change runtime outcomes. */ }
 }
 
@@ -910,7 +912,7 @@ public:
     BenchSpan(Market& m, const char* s, flowmesh::WireMessageKind k,
               const uint256& id, uint64_t seq) : market{m}, stage{s}, kind{k}, object{id}, sequence{seq}
     {
-        if (util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug)) {
+        if ((FlowMeshTimingRecording() || util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug))) {
             started = TraceNow(*m.clock);
             trace.epoch = market.seats.epoch;
             trace.seat_set_hash = market.seats.set_hash;
@@ -975,7 +977,7 @@ void TraceActions(Market& market, const char* stage, const flowmesh::ProductionE
 {
     // Per-action correlation can be 1024 events for one candidate; avoid
     // expanding the normal observation path unless explicitly requested.
-    if (!util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug)) return;
+    if (!(FlowMeshTimingRecording() || util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug))) return;
     TraceContext trace{EntryTrace(entry)};
     trace.related_object_id = entry.GetHash();
     for (const auto& action : entry.actions) {
@@ -2217,7 +2219,11 @@ bool FlowMeshRuntime::NotifyDeliveryEvent(const FlowMeshDeliveryEvent& event)
 
 void FlowMeshRuntime::ProcessDeliveryEvent(const FlowMeshDeliveryEvent& event)
 {
+    FlowMeshTimingSpan timing_lock_2221{__func__};
+    timing_lock_2221.Field("lock_name", std::string{"market_mutex"});
+    timing_lock_2221.Mark("lock_requested_us");
     std::lock_guard<std::mutex> lock{m_market_mutex};
+    timing_lock_2221.Mark("lock_acquired_us");
     const auto it{m_deliveries.find(event.delivery_id)};
     if (it == m_deliveries.end()) return; // cancelled/replaced local identity
     auto& pending{*it->second};
@@ -2246,7 +2252,11 @@ std::vector<FlowMeshRuntimeDeliverySnapshot> FlowMeshRuntime::DeliverySnapshots(
         std::lock_guard<std::mutex> queue_lock{m_queue_mutex};
         for (const auto& [id, quiet] : m_agreement_quiet) coalesced.emplace(id, quiet.coalesced);
     }
+    FlowMeshTimingSpan timing_lock_2250{__func__};
+    timing_lock_2250.Field("lock_name", std::string{"market_mutex"});
+    timing_lock_2250.Mark("lock_requested_us");
     std::lock_guard<std::mutex> lock{m_market_mutex};
+    timing_lock_2250.Mark("lock_acquired_us");
     std::vector<FlowMeshRuntimeDeliverySnapshot> out;
     for (const auto& [id, market] : m_markets) {
         if (market_id && *market_id != id) continue;
@@ -2505,7 +2515,8 @@ bool FlowMeshRuntime::InitializeAgreement(Market& market,
     callbacks.publish = [this, &market](const flowmesh::AgreementMessage& message) {
         return PublishAgreement(market, message);
     };
-    if (util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug)) {
+    {
+        callbacks.trace_enabled = [] { return FlowMeshTimingRecording() || util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug); };
         callbacks.trace_clock = [&market] { return TraceNow(*market.clock); };
         callbacks.trace = [&market](const FlowMeshAgreementTrace& event) {
             TraceContext trace;
@@ -2756,7 +2767,11 @@ bool FlowMeshRuntime::Start(std::string& error)
     std::lock_guard<std::mutex> queue_lock{m_queue_mutex};
     if (m_started) return true;
     {
+        FlowMeshTimingSpan timing_lock_2761{__func__};
+        timing_lock_2761.Field("lock_name", std::string{"market_mutex"});
+        timing_lock_2761.Mark("lock_requested_us");
         std::lock_guard<std::mutex> market_lock{m_market_mutex};
+        timing_lock_2761.Mark("lock_acquired_us");
         m_client_events.Reset(GetRandHash());
         if (!InitializeMarkets(error)) return false;
         m_admitted_markets.clear();
@@ -2796,7 +2811,11 @@ void FlowMeshRuntime::Stop()
     }
     if (m_worker.joinable()) m_worker.join();
     {
+        FlowMeshTimingSpan timing_lock_2801{__func__};
+        timing_lock_2801.Field("lock_name", std::string{"market_mutex"});
+        timing_lock_2801.Mark("lock_requested_us");
         std::lock_guard<std::mutex> market_lock{m_market_mutex};
+        timing_lock_2801.Mark("lock_acquired_us");
         while (!m_deliveries.empty()) EraseDelivery(m_deliveries.begin()->first, "stopped");
         m_deferred_messages.clear();
         m_deferred_deadlines.clear();
@@ -3011,7 +3030,11 @@ bool FlowMeshRuntime::AddMarket(FlowMeshRuntimeMarketConfig market,
 
 std::vector<flowmesh::MarketId> FlowMeshRuntime::MarketIds() const
 {
+    FlowMeshTimingSpan timing_lock_3016{__func__};
+    timing_lock_3016.Field("lock_name", std::string{"market_mutex"});
+    timing_lock_3016.Mark("lock_requested_us");
     std::lock_guard<std::mutex> lock{m_market_mutex};
+    timing_lock_3016.Mark("lock_acquired_us");
     std::vector<flowmesh::MarketId> out;
     out.reserve(m_markets.size());
     for (const auto& [market_id, market] : m_markets) {
@@ -3029,7 +3052,11 @@ flowmesh::QueueResult FlowMeshRuntime::SubmitLocalAction(
     flowmesh::WireMessage message;
     TraceContext trace;
     {
+        FlowMeshTimingSpan timing_lock_3034{__func__};
+        timing_lock_3034.Field("lock_name", std::string{"market_mutex"});
+        timing_lock_3034.Mark("lock_requested_us");
         std::lock_guard<std::mutex> lock{m_market_mutex};
+        timing_lock_3034.Mark("lock_acquired_us");
         const auto it{m_markets.find(market_id)};
         if (it == m_markets.end() || !it->second->ready ||
             it->second->halt != FlowMeshRuntimeHalt::NONE) {
@@ -3051,7 +3078,11 @@ flowmesh::QueueResult FlowMeshRuntime::SubmitLocalAction(
     // result, not an atomic queue timestamp: worker events may precede this
     // append. Cursors order appends; monotonic_us records the observation.
     {
+        FlowMeshTimingSpan timing_lock_3056{__func__};
+        timing_lock_3056.Field("lock_name", std::string{"market_mutex"});
+        timing_lock_3056.Mark("lock_requested_us");
         std::lock_guard<std::mutex> lock{m_market_mutex};
+        timing_lock_3056.Mark("lock_acquired_us");
         const auto it{m_markets.find(market_id)};
         if (it != m_markets.end()) DeliveryEvent(*it->second, result == flowmesh::QueueResult::ACCEPTED
                           ? "local_action_admitted" : "local_action_refused",
@@ -3070,7 +3101,11 @@ flowmesh::QueueResult FlowMeshRuntime::SubmitLocalAction(
 std::optional<FlowMeshRuntimeMarketStatus> FlowMeshRuntime::MarketStatus(
     const flowmesh::MarketId& market_id) const
 {
+    FlowMeshTimingSpan timing_lock_3075{__func__};
+    timing_lock_3075.Field("lock_name", std::string{"market_mutex"});
+    timing_lock_3075.Mark("lock_requested_us");
     std::lock_guard<std::mutex> lock{m_market_mutex};
+    timing_lock_3075.Mark("lock_acquired_us");
     const auto it{m_markets.find(market_id)};
     if (it == m_markets.end()) return std::nullopt;
     const Market& market{*it->second};
@@ -3085,7 +3120,11 @@ std::optional<FlowMeshRuntimeMarketStatus> FlowMeshRuntime::MarketStatus(
 std::optional<flowmesh::FlowMeshState> FlowMeshRuntime::StateSnapshot(
     const flowmesh::MarketId& market_id) const
 {
+    FlowMeshTimingSpan timing_lock_3090{__func__};
+    timing_lock_3090.Field("lock_name", std::string{"market_mutex"});
+    timing_lock_3090.Mark("lock_requested_us");
     std::lock_guard<std::mutex> lock{m_market_mutex};
+    timing_lock_3090.Mark("lock_acquired_us");
     const auto it{m_markets.find(market_id)};
     return it == m_markets.end()
                ? std::nullopt
@@ -3097,7 +3136,11 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketData(
     const std::optional<flowmesh::AccountId>& account,
     const flowmesh::MarketDataQuery& query, std::string& error) const
 {
+    FlowMeshTimingSpan timing_lock_3102{__func__};
+    timing_lock_3102.Field("lock_name", std::string{"market_mutex"});
+    timing_lock_3102.Mark("lock_requested_us");
     std::lock_guard<std::mutex> lock{m_market_mutex};
+    timing_lock_3102.Mark("lock_acquired_us");
     return MarketDataLocked(market_id, account, query, error);
 }
 
@@ -3185,7 +3228,11 @@ std::optional<flowmesh::MarketData> FlowMeshRuntime::MarketDataLocked(
 std::optional<flowmesh::ClientStateEvidence> FlowMeshRuntime::ClientSnapshot(
     const flowmesh::MarketId& market_id, std::string& error) const
 {
+    FlowMeshTimingSpan timing_lock_3190{__func__};
+    timing_lock_3190.Field("lock_name", std::string{"market_mutex"});
+    timing_lock_3190.Mark("lock_requested_us");
     std::lock_guard lock{m_market_mutex};
+    timing_lock_3190.Mark("lock_acquired_us");
     return ClientSnapshotLocked(market_id, error);
 }
 
@@ -3193,7 +3240,11 @@ std::optional<FlowMeshClientSnapshotView> FlowMeshRuntime::ClientSnapshotView(
     const flowmesh::MarketId& market_id,
     const std::optional<flowmesh::AccountId>& account, std::string& error) const
 {
+    FlowMeshTimingSpan timing_lock_3198{__func__};
+    timing_lock_3198.Field("lock_name", std::string{"market_mutex"});
+    timing_lock_3198.Mark("lock_requested_us");
     std::lock_guard lock{m_market_mutex};
+    timing_lock_3198.Mark("lock_acquired_us");
     auto evidence{ClientSnapshotLocked(market_id, error)};
     if (!evidence) return std::nullopt;
     auto reported{MarketDataLocked(market_id, account, {}, error)};
@@ -3228,7 +3279,11 @@ std::optional<flowmesh::ClientStateEvidence> FlowMeshRuntime::ClientSnapshotLock
 std::optional<std::vector<unsigned char>> FlowMeshRuntime::ClientCertifiedEntry(
     const flowmesh::MarketId& market_id, const uint64_t sequence, std::string& error) const
 {
+    FlowMeshTimingSpan timing_lock_3233{__func__};
+    timing_lock_3233.Field("lock_name", std::string{"market_mutex"});
+    timing_lock_3233.Mark("lock_requested_us");
     std::lock_guard lock{m_market_mutex};
+    timing_lock_3233.Mark("lock_acquired_us");
     const auto it{m_markets.find(market_id)};
     if (it == m_markets.end() || !it->second->store || sequence >= it->second->next_sequence) {
         error = "FlowMesh certified entry is unavailable";
@@ -3290,12 +3345,14 @@ void FlowMeshRuntime::WorkerLoop()
                 trace.wait_started_us = TraceNow(*m_config.clock);
                 m_worker_waiting = true;
             }
-            m_work_cv.wait(lock, [&] {
+            const auto ready = [&] {
                 return m_stopping || !m_queue.Empty() ||
                        !m_removed_peers.empty() ||
                        !m_catchup_commands.empty() ||
                        !m_add_market_commands.empty() || !m_delivery_events.empty() || m_tick_pending;
-            });
+            };
+            if (trace.enabled) trace.predicate_ready_before_wait = ready();
+            m_work_cv.wait(lock, ready);
             if (trace.enabled) {
                 m_worker_waiting = false;
                 trace.wait_returned_us = TraceNow(*m_config.clock);
@@ -3376,7 +3433,11 @@ void FlowMeshRuntime::ProcessAddMarketCommand(AddMarketCommand command)
     bool ok{false};
     std::string error;
     {
+        FlowMeshTimingSpan timing_lock_3381{__func__};
+        timing_lock_3381.Field("lock_name", std::string{"market_mutex"});
+        timing_lock_3381.Mark("lock_requested_us");
         std::lock_guard<std::mutex> lock{m_market_mutex};
+        timing_lock_3381.Mark("lock_acquired_us");
         std::unique_ptr<Market> paused;
         const auto existing{m_markets.find(command.market.market_id)};
         if (existing != m_markets.end()) {
@@ -3423,7 +3484,11 @@ void FlowMeshRuntime::ProcessAddMarketCommand(AddMarketCommand command)
 
 void FlowMeshRuntime::RemovePeerOnWorker(const flowmesh::WirePeerId peer)
 {
+    FlowMeshTimingSpan timing_lock_3428{__func__};
+    timing_lock_3428.Field("lock_name", std::string{"market_mutex"});
+    timing_lock_3428.Mark("lock_requested_us");
     std::lock_guard<std::mutex> lock{m_market_mutex};
+    timing_lock_3428.Mark("lock_acquired_us");
     std::vector<uint64_t> direct;
     for (auto& [id, delivery] : m_deliveries) {
         if (delivery->outstanding.erase(peer) != 0) {
@@ -3472,7 +3537,11 @@ void FlowMeshRuntime::ProcessMessage(
     const flowmesh::QueuedWireMessage& queued, const uint64_t dequeued_us)
 {
     const auto lock_requested_us{TraceNow(*m_config.clock)};
+    FlowMeshTimingSpan timing_lock_3477{__func__};
+    timing_lock_3477.Field("lock_name", std::string{"market_mutex"});
+    timing_lock_3477.Mark("lock_requested_us");
     std::lock_guard<std::mutex> lock{m_market_mutex};
+    timing_lock_3477.Mark("lock_acquired_us");
     const auto locked_us{TraceNow(*m_config.clock)};
     const auto it{m_markets.find(queued.message.header.market_id)};
     if (it == m_markets.end()) return;
@@ -3495,7 +3564,7 @@ void FlowMeshRuntime::ProcessMessage(
                        uint256{}, queued.message.header.sequence};
         return !critical || market.chain->Acceptable(market.chain->Current());
     }()};
-    if (util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug)) {
+    if ((FlowMeshTimingRecording() || util::log::ShouldLog(BCLog::BENCH, BCLog::Level::Debug))) {
         BenchEvent(market, "message_chain_gate", queued.message.kind, {},
             queued.message.header.sequence, queued.peer,
             "open=" + std::to_string(gate_open) + " generation=" + std::to_string(delivery_generation));
@@ -3550,7 +3619,11 @@ void FlowMeshRuntime::ProcessMessage(
 void FlowMeshRuntime::ProcessTick(const uint64_t requested_us, const uint64_t dequeued_us)
 {
     const auto lock_requested_us{TraceNow(*m_config.clock)};
+    FlowMeshTimingSpan timing_lock_3555{__func__};
+    timing_lock_3555.Field("lock_name", std::string{"market_mutex"});
+    timing_lock_3555.Mark("lock_requested_us");
     std::lock_guard<std::mutex> lock{m_market_mutex};
+    timing_lock_3555.Mark("lock_acquired_us");
     const auto locked_us{TraceNow(*m_config.clock)};
     for (auto& [id, market_ptr] : m_markets) {
         (void)id;
@@ -3587,11 +3660,11 @@ void FlowMeshRuntime::ProcessTick(const uint64_t requested_us, const uint64_t de
         if (now >= it->second) it = m_catchup_cooldowns.erase(it);
         else ++it;
     }
-    RetryDeferredMessages();
-    RetryDeliveries(); // old exact objects get a fair budget before fresh scheduling
-    RegenerateDeliveries();
-    AnnounceMarkets(refresh);
-    ProbeLegacyPeers(peers);
+    { FlowMeshTimingSpan timing{"tick_retry_deferred"}; RetryDeferredMessages(); }
+    { FlowMeshTimingSpan timing{"tick_retry_deliveries"}; RetryDeliveries(); }
+    { FlowMeshTimingSpan timing{"tick_regenerate"}; RegenerateDeliveries(); }
+    { FlowMeshTimingSpan timing{"tick_announce"}; AnnounceMarkets(refresh); }
+    { FlowMeshTimingSpan timing{"tick_probe"}; ProbeLegacyPeers(peers); }
     for (auto& [market_id, market_ptr] : m_markets) {
         (void)market_id;
         Market& market{*market_ptr};
@@ -3849,7 +3922,11 @@ void FlowMeshRuntime::AnnounceMarkets(const bool refresh)
 void FlowMeshRuntime::ProcessCatchupCommand(
     const CatchupCommand& command)
 {
+    FlowMeshTimingSpan timing_lock_3854{__func__};
+    timing_lock_3854.Field("lock_name", std::string{"market_mutex"});
+    timing_lock_3854.Mark("lock_requested_us");
     std::lock_guard<std::mutex> lock{m_market_mutex};
+    timing_lock_3854.Mark("lock_acquired_us");
     const auto it{m_markets.find(command.market_id)};
     if (it == m_markets.end()) return;
     TryRequestCatchup(*it->second, command.peer);

@@ -266,6 +266,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   flowmesh/preagreement.cpp
   flowmesh/agreement_wire.cpp
   node/flowmesh_runtime.cpp
+  node/flowmesh_timing.cpp
   node/flowmesh_service.cpp
   node/flowmesh_client.cpp
   node/flowmesh_client_settlement.cpp

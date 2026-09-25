@@ -4,6 +4,8 @@
 #include <node/context.h>
 #include <node/flowmesh_client.h>
 #include <node/flowmesh_service.h>
+#include <node/flowmesh_timing.h>
+#include <chainparams.h>
 #include <rpc/server_util.h>
 #include <rpc/server.h>
 #include <rpc/util.h>
@@ -430,9 +432,25 @@ static RPCHelpMan getflowmeshdeliveryinfo()
         }};
 }
 
+static RPCHelpMan flowmeshtiming()
+{
+    return RPCHelpMan{
+        "flowmeshtiming", "Regtest-only bounded memory diagnostics; never changes protocol state. Stop before reading.\n",
+        {{"command", RPCArg::Type::STR, RPCArg::Optional::NO, "start, stop or read"}},
+        RPCResult{RPCResult::Type::OBJ, "", "Capture metadata and bounded events", {}, true},
+        RPCExamples{""},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            if (Params().GetChainType() != ChainType::REGTEST)
+                throw JSONRPCError(RPC_MISC_ERROR, "Timing capture is only available on regtest");
+            try { return node::FlowMeshTimingControl(request.params[0].get_str()); }
+            catch (const std::exception& e) { throw JSONRPCError(RPC_INVALID_PARAMETER, e.what()); }
+        }};
+}
+
 void RegisterFlowMeshNetworkRPCCommands(CRPCTable& table)
 {
     static const CRPCCommand commands[]{
+        {"hidden", &flowmeshtiming},
         {"flowmesh", &reconnectflowmeshclient},
         {"flowmesh", &flowmeshconnect},
         {"flowmesh", &getflowmeshnetworkinfo},
