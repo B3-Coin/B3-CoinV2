@@ -3,8 +3,9 @@
 Development comparison completed successfully on 2026-09-25.
 Base: `82ebbb2e31ae8df09b575d379117c55490461617`.
 Predeclared plan: `0e070cf195d63bae15d23d79c13e2a8e064ee47e`.
-The executable model source and final qualification revision are recorded in
-the accompanying qualification record after the committed-tree test run.
+Tested implementation: `233e4f6df41338d3772d12361bfa4909a6cfd76b`.
+The complete 352-test committed-tree result is in
+[QUALIFICATION.md](QUALIFICATION.md).
 
 **Finding: changing proposer tenure alone does not shorten healthy agreement
 in this model.** The complete coordinator/pipeline proposal has not been

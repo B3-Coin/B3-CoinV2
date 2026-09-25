@@ -2,7 +2,8 @@
 
 This is a bounded selection/placement experiment, not a native performance
 implementation. See the [predeclared boundary](../../doc/design/flowmesh-coordinator-experiment-20260925.md),
-[profile](TEST_PROFILE.json) and [measured results](RESULTS.md).
+[profile](TEST_PROFILE.json), [measured results](RESULTS.md) and
+[qualification record](QUALIFICATION.md).
 
 It compares the existing per-sequence proposer selection with a separately
 identified four-batch tenure. Both retain the same PREPARE/COMMIT protocol,
