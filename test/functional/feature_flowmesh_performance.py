@@ -277,6 +277,28 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
             captures[str(index)] = {"start": result, "start_host_us_bounds": [before, after],
                 "offset_us_bounds": [before - result["start_us"], after - result["start_us"]]}
 
+    def verify_production_logging(self, market_id, phase):
+        if not self.options.performance_memory_trace or phase != "after":
+            return super().verify_production_logging(market_id, phase)
+        # The old fixture expected zero serialized diagnostic bytes. Memory
+        # capture deliberately accounts these bytes but must not enable logging,
+        # drop events, or exhaust the retained runtime stream.
+        observations = {}
+        for node in [*self.nodes, self.client]:
+            enabled = sorted(name for name, enabled in node.logging().items() if enabled)
+            assert not enabled, f"Memory capture enabled disk debug logging on node {node.index}"
+            row = {"enabled_debug_categories": enabled, "bench_enabled": False}
+            if node is not self.client:
+                delivery = node.getflowmeshdeliveryinfo(market_id)["markets"]
+                assert_equal(len(delivery), 1)
+                assert_equal(delivery[0]["market_id"], market_id)
+                assert_equal(delivery[0]["trace_events_dropped"], 0)
+                row.update(runtime_trace_bytes=delivery[0]["trace_bytes"],
+                           runtime_trace_events_dropped=delivery[0]["trace_events_dropped"])
+            observations[str(node.index)] = row
+        self.performance_report["logging_checks"].append(
+            {"phase": phase, "memory_capture_bytes_permitted": True, "processes": observations})
+
     def stop_nodes(self, wait=0):
         # Preserve actual Popen outcomes even after the framework releases its handles.
         processes = [(node.index, node.process) for node in self.nodes if node.process]
