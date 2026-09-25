@@ -16,7 +16,8 @@ certification, not the Python V2 agreement/accounting model.
   and synchronous durable writes unchanged. B3 advances during both cases.
 - Same compiled executable and seed, sequential fresh fixtures:
   control with capture off, then capture on only after setup. BENCH disabled
-  in both. Existing public relay/RPC tracing enabled identically in both.
+  in both. Bounded memory-only RPC tracing enabled identically after setup.
+  Full public-body relay capture is off: it writes files during requests.
 - No sustained-load/200ms qualification from these nine samples.
 
 The hidden regtest-only RPC `flowmeshtiming start|stop|read` controls at most
@@ -46,11 +47,16 @@ BITCOIND=/absolute/build/bin/b3coind BITCOINCLI=/absolute/build/bin/b3coin-cli \
 python3 -B test/functional/feature_flowmesh_performance.py \
   --configfile=/absolute/build/test/config.ini --tmpdir=/new/disposable/path \
   --nocleanup --randomseed=24092026 --portseed=92401 \
-  --performance-profile=native-queue --performance-public-trace
+  --performance-profile=native-queue --performance-rpc-trace
 # Second fresh fixture: additionally --performance-memory-trace.
 ```
 
-Save per-action results, public request/response trace and memory-timing-nodeN
+Save per-action results, bounded RPC observations and memory-timing-nodeN
 files. Retain failures. Never add concurrent stage durations; report intervals,
 critical-path waits and missing attribution separately. A small scheduling fix
 requires an observed cause, preserved before evidence and identical repeat.
+
+The initial diagnostic pair used the inherited public-body disk capture in
+both arms. Preserve it separately; it is not the memory-only comparison.
+The harness successor includes the ordinary client (which is not a member of
+the four-operator node list) in memory capture and child-exit observations.

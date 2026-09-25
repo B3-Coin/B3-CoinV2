@@ -99,6 +99,11 @@ class ObservedClientRPC:
     def __getattr__(self, method):
         call = getattr(self.rpc, method)
         def observed(*args, **kwargs):
+            if not self.owner.options.performance_public_trace and not self.owner.rpc_capture_active:
+                try:
+                    return call(*args, **kwargs)
+                finally:
+                    self.owner.trace_local.last_rpc_return_us = host_us()
             sample = getattr(self.owner.trace_local, "sample", None)
             row = {"method": method, "wallet": self.wallet, "start_host_us": host_us()}
             if sample is not None:
@@ -224,6 +229,8 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                             help="Bounded full public HTTPS bodies plus RPC/context accounting in generated fixture only")
         parser.add_argument("--performance-memory-trace", action="store_true",
                             help="Start bounded regtest-only memory timing after setup; freeze after measured work")
+        parser.add_argument("--performance-rpc-trace", action="store_true",
+                            help="Bounded in-memory RPC observations after setup, without public-body disk capture")
         parser.add_argument("--performance-read-recovery", action="store_true",
                             help="Optional bounded read-only follow-up recovery; preserves read failure and fails final exit")
 
@@ -255,6 +262,7 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         self.trace_local = threading.local()
         self.trace_drain_lock = threading.Lock()
         self.memory_capture_nodes = []
+        self.rpc_capture_active = False
 
     def begin_memory_capture(self):
         if not self.options.performance_memory_trace:
@@ -377,14 +385,14 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
         proxy = get_rpc_proxy(rpc_url(node.datadir_path, node.index, self.chain, node.rpchost),
                               node.index, timeout=15, coveragedir=self.options.coveragedir)
         rpc = proxy if wallet is None else proxy / ("wallet/" + quote(wallet, safe=""))
-        if self.options.performance_public_trace and node is self.client and wallet is not None:
+        if (self.options.performance_public_trace or self.options.performance_rpc_trace) and node is self.client and wallet is not None:
             return ObservedClientRPC(self, rpc, wallet)
         return rpc
 
     def observed_rpc_return_us(self):
         # Capture/archive processing follows RPC completion. Do not charge
         # that observer work to an already received certificate response.
-        if self.options.performance_public_trace:
+        if self.options.performance_public_trace or self.options.performance_rpc_trace:
             return self.trace_local.last_rpc_return_us
         return host_us()
 
@@ -1005,6 +1013,7 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 else:
                     self.verify_production_logging(spec["market_id"], "before")
             self.begin_memory_capture()
+            self.rpc_capture_active = True
             for worker in self.workers:
                 thread = threading.Thread(target=self.worker_loop, args=(worker,),
                                           name="flowmesh-buyer-worker")
@@ -1041,6 +1050,11 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                 self.run_window("burst_8", rate=0, duration=1, count=8)
             self.end_b3_workload()
             self.end_memory_capture()
+            self.rpc_capture_active = False
+            if self.options.performance_rpc_trace:
+                self.performance_report["rpc_calls"] = self.rpc_calls
+                self.performance_report["rpc_capture_dropped"] = self.rpc_trace_dropped
+                assert self.rpc_trace_dropped == 0, "Incomplete bounded RPC capture"
             self.check_signed_observations()
             if all(sample["status"] == "complete" for sample in self.performance_report["samples"]):
                 self.check_makers()
@@ -1102,6 +1116,11 @@ class FlowMeshPerformanceTest(FlowMeshLatencyTest):
                     self.end_memory_capture()
                 except Exception as error:
                     self.performance_report["memory_capture_error"] = compact_error(error)
+                    self.invalidate_final_result()
+            if self.options.performance_rpc_trace:
+                self.performance_report["rpc_calls"] = self.rpc_calls
+                self.performance_report["rpc_capture_dropped"] = self.rpc_trace_dropped
+                if self.rpc_trace_dropped:
                     self.invalidate_final_result()
             self.finish_report(primary_exception_in_flight, "flowmesh-performance.json", "FLOWMESH_PERFORMANCE_REPORT")
 
