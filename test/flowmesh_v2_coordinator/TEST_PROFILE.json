@@ -1,0 +1,14 @@
+{
+  "experiment_id": "flowmesh-coordinator-comparison/1",
+  "test_only": true,
+  "baseline_revision": "82ebbb2e31ae8df09b575d379117c55490461617",
+  "base_profile": "../flowmesh_v2_agreement/TEST_PROFILE.json",
+  "alternatives": [1, 4],
+  "selection": "(floor(sequence / batches_per_coordinator) + view) mod N",
+  "time_unit": "logical simulator tick, not milliseconds",
+  "delivery_ticks": 1,
+  "consecutive_batches": 8,
+  "hosting": "optional identity placement; unchanged seat votes and quorum",
+  "commission": "proposed only; no xbps flag or reward deduction",
+  "exclusions": ["native latency", "BLS", "real networking", "Qt", "futures risk", "commission accounting", "live keys", "bridge or B3 settlement integration"]
+}

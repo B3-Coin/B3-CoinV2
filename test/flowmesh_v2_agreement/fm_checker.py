@@ -34,6 +34,20 @@ class _Audit:
     def __init__(self, sim):
         self.sim, self.n = sim, sim.n
         self.q = 2 * ((self.n - 1) // 3) + 1
+        # Independently check the optional experiment; do not call the replica's
+        # proposer helper, or an erroneous selector could certify itself.
+        self.coordinator_span = 1
+        selection = PROFILE.get("coordinator_experiment")
+        if selection is not None:
+            _require(type(selection) is dict
+                     and set(selection) == {"version", "batches_per_coordinator"}
+                     and selection["version"] == "bounded-tenure/1"
+                     and type(selection["batches_per_coordinator"]) is int
+                     and selection["batches_per_coordinator"] in (1, 4)
+                     and PROFILE["profile_id"] == "flowmesh-coordinator-test/1/"
+                        + str(selection["batches_per_coordinator"]),
+                     "CHECKER_COORDINATOR_TEST_PROFILE")
+            self.coordinator_span = selection["batches_per_coordinator"]
         self.config = digest("TEST/V2/CONFIG/1", [PROFILE, list(range(self.n)),
                              sim.initial_snapshot.hex(), sim.initial_anchor])
         self.set_id = digest("TEST/V2/SET/1", list(range(self.n)))
@@ -167,7 +181,7 @@ class _Audit:
             self.votes(obj["commits"], "COMMIT", p)
         elif kind == "proposal":
             p = self.signed(obj, "PROPOSE", instance)
-            _require(p["sender"] == (instance["sequence"] + p["view"]) % self.n,
+            _require(p["sender"] == (instance["sequence"] // self.coordinator_span + p["view"]) % self.n,
                      "CHECKER_PROPOSER")
             if p["view"] == 0:
                 _require(p["new_view"] is None, "CHECKER_UNEXPECTED_NEW_VIEW")
@@ -184,7 +198,7 @@ class _Audit:
         elif kind == "new_view":
             p = self.signed(obj, "NEW_VIEW", instance)
             _require(p["view"] > 0
-                     and p["sender"] == (instance["sequence"] + p["view"]) % self.n,
+                     and p["sender"] == (instance["sequence"] // self.coordinator_span + p["view"]) % self.n,
                      "CHECKER_NEW_VIEW_PROPOSER")
             reports = p["reports"]
             _require(type(reports) is list and self.q <= len(reports) <= self.n,

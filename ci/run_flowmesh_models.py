@@ -57,6 +57,9 @@ SUITES = {
         "test_view_transition_repair.py": 6,
         "test_admission_repair_disk.py": 3,
     }),
+    "coordinator": ("test/flowmesh_v2_coordinator", "test_*.py", 180, {
+        "test_coordinator.py": 20,
+    }),
 }
 
 

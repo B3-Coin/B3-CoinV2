@@ -35,7 +35,22 @@ def exact_id(value):
 
 
 def proposer(instance, view, n):
-    return (instance["sequence"] + view) % n
+    # Optional, separately versioned TEST experiment. The default profile and
+    # its selection rule are unchanged. PROFILE is part of every instance's
+    # configuration hash, so a local preference cannot authorize another leader.
+    experiment = PROFILE.get("coordinator_experiment")
+    span = 1
+    if experiment is not None:
+        if (type(experiment) is not dict
+                or set(experiment) != {"version", "batches_per_coordinator"}
+                or experiment["version"] != "bounded-tenure/1"
+                or type(experiment["batches_per_coordinator"]) is not int
+                or experiment["batches_per_coordinator"] not in (1, 4)
+                or PROFILE["profile_id"] != "flowmesh-coordinator-test/1/"
+                    + str(experiment["batches_per_coordinator"])):
+            raise Invalid("COORDINATOR_TEST_PROFILE")
+        span = experiment["batches_per_coordinator"]
+    return (instance["sequence"] // span + view) % n
 
 
 def message(phase, sender, instance, view, value=None, **extra):

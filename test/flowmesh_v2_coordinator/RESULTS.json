@@ -1,0 +1,17 @@
+{
+  "experiment_id": "flowmesh-coordinator-comparison/1",
+  "time_unit": "logical_tick_not_millisecond",
+  "full_capture_sha256": "2ee99288eb791ee8971fb0a5c2779ebed4828f7637ad1c1ea037df482f24918b",
+  "comparison": [
+    {"case":"healthy_matched_sequence","span":1,"ticks":[3,3,3,3,3,3,3,3],"messages":[60,92,92,160,92,92,192,92],"applied":8,"digest":"c187c28616d733679d89fce642420538393ec63276c97332937ac4ba357f6329"},
+    {"case":"healthy_matched_sequence","span":4,"ticks":[3,3,3,3,3,3,3,3],"messages":[60,92,92,160,92,92,192,92],"applied":8,"digest":"c187c28616d733679d89fce642420538393ec63276c97332937ac4ba357f6329"},
+    {"case":"eight_request_batch","span":1,"ticks":[3],"messages":[60],"applied":1,"digest":"8084fc0933352bef7e73459e2ea60186b9458a40dd075c986ad698d34912b029"},
+    {"case":"eight_request_batch","span":4,"ticks":[3],"messages":[60],"applied":1,"digest":"8084fc0933352bef7e73459e2ea60186b9458a40dd075c986ad698d34912b029"},
+    {"case":"scheduled_leader_unavailable","span":1,"ticks":[35,3,3,3],"messages":[140,68,144,68],"applied":4,"digest":"f2a5183f1f97ad6b2eb8e8022355dde45e1d31c747dabdf00034fde256452320"},
+    {"case":"scheduled_leader_unavailable","span":4,"ticks":[35,35,35,35],"messages":[140,228,374,228],"applied":4,"digest":"f2a5183f1f97ad6b2eb8e8022355dde45e1d31c747dabdf00034fde256452320"},
+    {"case":"noncoordinator_unavailable","span":1,"ticks":[3,3,3,35],"messages":[51,68,68,288],"applied":4,"digest":"f2a5183f1f97ad6b2eb8e8022355dde45e1d31c747dabdf00034fde256452320"},
+    {"case":"noncoordinator_unavailable","span":4,"ticks":[3,3,3,3],"messages":[51,68,68,120],"applied":4,"digest":"f2a5183f1f97ad6b2eb8e8022355dde45e1d31c747dabdf00034fde256452320"},
+    {"case":"two_seats_unavailable","span":1,"ticks":[null],"messages":[540],"applied":0,"digest":"5dbd316c97097129bf4809848f35f9ca3efc454dedcc01b6d4b958d1b38d615b"},
+    {"case":"two_seats_unavailable","span":4,"ticks":[null],"messages":[540],"applied":0,"digest":"5dbd316c97097129bf4809848f35f9ca3efc454dedcc01b6d4b958d1b38d615b"}
+  ]
+}
