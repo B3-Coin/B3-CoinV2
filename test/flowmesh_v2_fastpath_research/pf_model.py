@@ -77,6 +77,15 @@ class World:
     def empty(self):
         return self.packet('EMPTY')
 
+    def is_empty(self, p):
+        if type(p) is not Packet:
+            raise Invalid('PROOF_WRAPPER_TYPE')
+        if p.kind != 'EMPTY':
+            return False
+        if p != self.empty():
+            raise Invalid('NONCANONICAL_EMPTY')
+        return True
+
     def authentic(self, p, kind=None):
         if (type(p) is not Packet or p.instance != self.instance or
                 p.kind not in SIGNED or p not in self.auth.computed or
@@ -115,20 +124,21 @@ class World:
         if p.view < 1 or p.value is not None or len(p.items) != 3:
             raise Invalid('REPORT_SHAPE')
         v0, pc, decision = p.items
-        if v0.kind != 'EMPTY':
+        if not self.is_empty(v0):
             if v0.kind != 'V0' or len(v0.items) != 2 or v0.instance != self.instance:
                 raise Invalid('REPORT_V0_SHAPE')
             own, leader = v0.items
             self.vote(own, 'PREPARE')
             self.vote(leader, 'PREPARE')
             if (own.view != 0 or leader.view != 0 or own.sender != p.sender or
-                    leader.sender != 0 or own.value != leader.value):
+                    leader.sender != 0 or own.value != leader.value or
+                    v0.view != 0 or v0.sender != p.sender or v0.value != own.value):
                 raise Invalid('REPORT_V0_LINK')
-        if pc.kind != 'EMPTY':
+        if not self.is_empty(pc):
             self.certificate(pc)
             if pc.kind != 'PC' or pc.view >= p.view:
                 raise Invalid('REPORT_PC_CONTEXT')
-        if decision.kind != 'EMPTY':
+        if not self.is_empty(decision):
             self.certificate(decision)
             if decision.kind not in ('FAST', 'SLOW') or decision.view >= p.view:
                 raise Invalid('REPORT_DECISION_CONTEXT')
@@ -143,8 +153,9 @@ class World:
                 raise Invalid('REPORT_TARGET')
             if report.items[0].kind != 'EMPTY':
                 originals.append(report.items[0].items[1])
-        if eq.kind != 'EMPTY':
-            if eq.kind != 'EQ' or len(eq.items) != 2 or eq.instance != self.instance:
+        if not self.is_empty(eq):
+            if (eq.kind != 'EQ' or len(eq.items) != 2 or eq.instance != self.instance or
+                    eq.view != 0 or eq.sender != -1 or eq.value is not None):
                 raise Invalid('EQUIVOCATION_SHAPE')
             for p in eq.items:
                 self.vote(p, 'PREPARE')
@@ -191,7 +202,7 @@ class World:
                 p.sender != p.view % self.n or p.sender != leader.sender):
             raise Invalid('PROPOSAL_LEADER_OR_VALUE')
         if p.view == 0:
-            if nv.kind != 'EMPTY':
+            if not self.is_empty(nv):
                 raise Invalid('VIEW_ZERO_NEW_VIEW')
         else:
             self.new_view(nv)
@@ -201,8 +212,12 @@ class World:
     def ingress(self, p):
         if not isinstance(p, Packet) or p.instance != self.instance:
             raise Invalid('INSTANCE')
-        if any(x.kind in SIGNED and x not in self.auth.published for x in walk(p)):
-            raise Invalid('UNPUBLISHED_SIGNATURE_NOT_NETWORK_EVIDENCE')
+        for x in walk(p):
+            if type(x) is not Packet or x.instance != self.instance:
+                raise Invalid('NESTED_INSTANCE_OR_TYPE')
+            self.is_empty(x)
+            if x.kind in SIGNED and x not in self.auth.published:
+                raise Invalid('UNPUBLISHED_SIGNATURE_NOT_NETWORK_EVIDENCE')
 
     def emit(self, node, packet, targets=None):
         for p in walk(packet):
@@ -592,6 +607,15 @@ class Node:
         self._volatile()
         self.online = True
         try:
+            original = self.d['signed'].get(('PREPARE', 0))
+            if original is not None:
+                accepted = self.d['accepted'].get(0)
+                expected = (self.w.packet('V0', 0, self.id, original.value,
+                                         (original, accepted.items[0])) if accepted else None)
+                if expected is None or self.d['v0'] != expected:
+                    raise Invalid('MISSING_OR_INCONSISTENT_ORIGINAL_VOTE')
+            elif self.d['v0'] is not None:
+                raise Invalid('ORIGINAL_VOTE_WITHOUT_SIGNING_RECORD')
             for slot, packet in self.d['signed'].items():
                 self.w.authentic(packet)
                 guard = self.d['guards'].get(packet)

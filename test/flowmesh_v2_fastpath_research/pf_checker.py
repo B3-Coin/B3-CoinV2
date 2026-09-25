@@ -75,7 +75,7 @@ class _Audit:
                       (owner == packet.sender and packet in self.computed), "AUTHENTICATION")
             kind, view, items = packet.kind, packet.view, packet.items
             if kind == "EMPTY":
-                _need(not items, "EMPTY_ITEMS")
+                _need(not items and packet.sender == -1, "EMPTY_ITEMS_OR_SENDER")
             elif kind in ("PREPARE", "COMMIT"):
                 _need(not items, "VOTE_ITEMS")
                 if kind == "COMMIT":
@@ -275,6 +275,20 @@ class _Audit:
                 _need(item.kind == kind, "DURABLE_" + field.upper())
                 if field == "v0":
                     _need(item.sender == sender, "DURABLE_V0_OWNER")
+        original = durable['signed'].get(('PREPARE', 0))
+        v0 = durable['v0']
+        if original is not None:
+            _need(v0 is not None and v0.items[0] == original, "LOST_ORIGINAL_VOTE")
+            proposal = durable['accepted'].get(0)
+            _need(proposal is not None and proposal.items[0] == v0.items[1],
+                  "LOST_ORIGINAL_LEADER_EVIDENCE")
+        else:
+            _need(v0 is None, "V0_WITHOUT_LOCAL_SIGNING_RECORD")
+        # A coherently rewritten entire history remains outside this oracle.
+        # Within the supplied history, dropping a prior record is observable.
+        for (author, kind, view), packet in self.durable_signatures.items():
+            if author == sender:
+                _need(durable['signed'].get((kind, view)) == packet, "LOST_SIGNING_RECORD")
 
     def run(self):
         # Malformed Byzantine traffic may be rejected by honest replicas.  It

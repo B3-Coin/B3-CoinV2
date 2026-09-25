@@ -1,5 +1,8 @@
 # P2-FV recovery-evidence gate — research tests only
 
+Successor work: [message/restart TEST model](MESSAGE_MODEL.md), separately
+versioned from the evidence-only probe below. Neither is a native wallet.
+
 This is **not** a native fast-path implementation, protocol ratification or
 latency benchmark. The existing accounting/agreement/storage models and native
 daemon are unchanged. The probe follows one narrow prerequisite to implementing

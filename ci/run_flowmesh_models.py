@@ -60,6 +60,12 @@ SUITES = {
     "coordinator": ("test/flowmesh_v2_coordinator", "test_*.py", 180, {
         "test_coordinator.py": 20,
     }),
+    "fastpath_research": ("test/flowmesh_v2_fastpath_research", "test_*.py", 180, {
+        "test_recovery_evidence.py": 15,
+        "test_message_recovery.py": 30,
+        "test_message_admission.py": 5,
+        "test_message_checker.py": 8,
+    }),
 }
 
 

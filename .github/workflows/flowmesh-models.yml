@@ -13,6 +13,7 @@ on:
       - 'test/flowmesh_v2_agreement/**'
       - 'test/flowmesh_v2_storage/**'
       - 'test/flowmesh_v2_coordinator/**'
+      - 'test/flowmesh_v2_fastpath_research/**'
       - 'ci/run_flowmesh_models.py'
       - 'ci/test_flowmesh_models_runner.py'
       - '.github/workflows/flowmesh-models.yml'
@@ -27,7 +28,7 @@ concurrency:
 
 jobs:
   models:
-    name: Accounting, agreement, storage and coordinator (Python 3.14)
+    name: Isolated accounting, agreement, storage and research (Python 3.14)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
