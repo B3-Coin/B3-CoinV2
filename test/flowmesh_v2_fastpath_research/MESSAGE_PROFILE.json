@@ -1,0 +1,32 @@
+{
+  "id": "p2fv-message-restart-test/1",
+  "status": "PROPOSED_TEST_ONLY_NOT_OWNER_RATIFICATION",
+  "reference_sha256": "9b6010d9efe751611bee5ca4d87168958ec6a280c62da441eae1e94647ed9356",
+  "preserved_evidence_probe_commit": "03ca2db5d36735776c689c060443449ebde514ce",
+  "membership": [4, 5, 7],
+  "f": "floor((N-1)/3)",
+  "slow_quorum": "N-f",
+  "t": "min(f,floor((N-3f+1)/2))",
+  "fast_quorum": "N-t, view zero only, including original leader",
+  "abstract_values": ["x", "y"],
+  "sequences": 1,
+  "views": [0, 1, 2],
+  "timer_units": "abstract scheduler steps; never milliseconds",
+  "view_timeout_steps": 3,
+  "auth": "ideal computed registry, separate public registry; no cryptography",
+  "durability": "atomic acknowledged memory; exact signature plus full local justification before publication",
+  "application": "one abstract value and one atomic application marker; not accounting batches",
+  "test_clarifications": [
+    "Explicit pair of original view-zero leader signatures travels in NEW_VIEW when needed",
+    "Proven equivocating old leader excluded globally from selected Q reports, including PC branch",
+    "Leader proposal consumes same PREPARE slot; not an additional vote",
+    "Transferred PC contains votes, not recursive NEW_VIEW proof trees; local guards preserve justification",
+    "Unpublished computed signatures inaccessible to adversary; externally exposed signing services not modelled"
+  ],
+  "excluded": [
+    "native node wiring", "real disk or power-loss recovery", "BLS and wire codecs",
+    "real trading or matching", "changing membership", "B3 anchors", "PoS V2",
+    "bridge or settlement validation", "futures", "200ms or WAN performance",
+    "exhaustive adversarial proof", "arbitrary-load availability", "undetectable rollback"
+  ]
+}
