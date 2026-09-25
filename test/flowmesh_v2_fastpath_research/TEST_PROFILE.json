@@ -1,0 +1,16 @@
+{
+  "profile_id": "p2fv-new-view-evidence-probe/1",
+  "test_only": true,
+  "research_sha256": "9b6010d9efe751611bee5ca4d87168958ec6a280c62da441eae1e94647ed9356",
+  "scope": "one-instance view-0-vote NEW_VIEW selection branch, with no prepared or decided certificate",
+  "n": 4,
+  "f": 1,
+  "quorum": 3,
+  "fast_quorum": 3,
+  "equivocation_selection_threshold": 2,
+  "values": ["x", "y"],
+  "authentication": "ideal issued-object registry for generated synthetic proposal/report objects; not BLS",
+  "proposed_clarification": "an optional pair of original leader-signed conflicting proposals travels with the NEW_VIEW evidence; choice depends on transmitted evidence, not receiver private arrival history",
+  "approval": "exploratory test assumption only; not adopted protocol or production proof format",
+  "excluded": ["prepared/decision precedence", "full NEW_VIEW signing", "replica state machine", "view 2 recovery", "crash recovery", "durable writes", "execution", "networking", "latency", "futures", "B3 settlement"]
+}
