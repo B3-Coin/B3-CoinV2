@@ -363,6 +363,10 @@ class Node:
                     self.propose(packet.value)
                 elif self.d['view'] in self.d['new_views']:
                     self.propose(self.d['new_views'][self.d['view']].value)
+                elif self.d['mode'] == 'CHANGING' and self.id == self.d['view'] % self.w.n:
+                    # Requested body arrival completes the existing view work;
+                    # do not wait for a retry timer or a new client request.
+                    self.make_view(self.d['view'])
             elif kind == 'NEED':
                 if packet.value in self.d['bodies']:
                     self.w.enqueue(self.w.packet('DATA', value=packet.value), [packet.sender])

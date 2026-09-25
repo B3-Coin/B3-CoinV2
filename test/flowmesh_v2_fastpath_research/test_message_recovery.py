@@ -137,8 +137,12 @@ class MessageRecoveryTests(unittest.TestCase):
         w.nodes[5].receive(pc)
         self.assertEqual(w.nodes[5].d['signed'][('REPORT', 1)], original)
         self.assertNotIn(('COMMIT', 0), w.nodes[5].d['signed'])
-        w.tick(3)
-        w.pump()
+        # Seat5 already entered view1 at time0; at time3 it may legitimately
+        # enter view2 before the other seats enter view1. Give their next
+        # declared timer its turn, rather than require one-timeout progress.
+        for _ in range(2):
+            w.tick(3)
+            w.pump()
         self.settled(w)
 
     def test_votes_before_header_are_reconstructed(self):
@@ -230,8 +234,9 @@ class MessageRecoveryTests(unittest.TestCase):
                 persisted = node.d['signed'].get(('REPORT', 1))
                 self.assertEqual(node.d['view'], 1 if persisted else 0)
                 node.restart()
-                w.tick(3)
-                w.pump()
+                for _ in range(2):
+                    w.tick(3)
+                    w.pump()
                 self.settled(w)
                 if persisted:
                     self.assertEqual(node.d['signed'][('REPORT', 1)], persisted)
@@ -379,6 +384,21 @@ class MessageRecoveryTests(unittest.TestCase):
                     w.tick()
                     w.pump(seed=seed + 77)
                 self.settled(w)
+
+    def test_requested_body_wakes_waiting_new_view_without_timer(self):
+        w = World(byzantine={0})
+        # Seat1 is next leader, with authentic Q reports but no batch body.
+        for node in w.nodes[2:]:
+            node.body('x')
+        for node in w.nodes[1:]:
+            node.change_view(1)
+        w.pump(drop=lambda i, p: p.kind == 'DATA')
+        self.assertNotIn(('NEW_VIEW', 1), w.nodes[1].d['signed'])
+        self.assertEqual(len(w.nodes[1].reports[1]), 3)
+        w.nodes[1].receive(w.packet('DATA', value='x'))
+        self.assertIn(('NEW_VIEW', 1), w.nodes[1].d['signed'])
+        w.pump()
+        self.settled(w)
 
 
 if __name__ == '__main__':
