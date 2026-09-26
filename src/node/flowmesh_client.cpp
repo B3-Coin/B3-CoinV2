@@ -513,6 +513,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // take priority over queued passive refreshes, never preempt an owner.
     // Status remains nonblocking; metadata uses its separate lock below.
     FlowMeshClientWorkGate m_work;
+    // One TLS connection, owned exclusively under m_work. Reuse changes only
+    // transport setup, not economic retry, state ownership or durability.
+    FlowMeshHttpsClient m_https;
     // Never acquire m_work from a wallet metadata lookup: it covers HTTPS.
     mutable std::mutex m_metadata_mutex;
     FlowMeshAssetMetadataCatalog m_metadata;
@@ -689,7 +692,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             try {
                 if (attempted_endpoints) ++*attempted_endpoints;
                 if (earlier_possible && possibly_sent) *earlier_possible = *possibly_sent;
-                const auto reply{FlowMeshHttpsRequest(m_endpoints[endpoint], "/flowmesh/v1", body, CLIENT_REQUEST_TIMEOUT, CLIENT_MAX_REPLY)};
+                const auto reply{m_https.Request(m_endpoints[endpoint], "/flowmesh/v1", body, CLIENT_REQUEST_TIMEOUT, CLIENT_MAX_REPLY)};
                 if (possibly_sent && reply.request_may_have_been_sent) *possibly_sent = true;
                 if (!reply.response_received) Fail(reply.error.empty() ? "No HTTPS response; outcome unknown" : reply.error);
                 transport_available = true;
@@ -1190,6 +1193,7 @@ public:
                 m_retry_after.emplace_back();
             }
             m_selected = selected; m_preferred = selected; m_retry_after[selected] = {};
+            m_https.Reset(); // Explicit connect revalidates existing trust.
             {
                 std::lock_guard status_lock{m_status_mutex};
                 if (added) m_status.endpoints.push_back({endpoint.url, false, {}});
@@ -1454,8 +1458,9 @@ public:
             return out;
         }
         try {
-            // Each Call opens fresh TLS with the existing CA/hostname/pin and
+            // An explicit probe opens fresh TLS with the existing trust and
             // bounded failover policy. This is availability, not certification.
+            m_https.Reset();
             // Do not call Markets/Refresh/QueryAction/Send: a connection probe
             // must not touch market caches, account cursors or durable history.
             Call("markets", UniValue{UniValue::VOBJ}, [&](const UniValue& value, size_t) {

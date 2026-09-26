@@ -14,8 +14,11 @@
 #include <event2/dns.h>
 #include <event2/event.h>
 #include <event2/http.h>
+#include <event2/keyvalq_struct.h>
+#include <event2/util.h>
 #include <openssl/crypto.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
@@ -24,6 +27,7 @@
 #include <atomic>
 #include <charconv>
 #include <condition_variable>
+#include <cstdio>
 #include <deque>
 #include <limits>
 #include <map>
@@ -169,9 +173,20 @@ struct ClientCall {
     event_base* base{nullptr};
     HttpsRequestResult result;
     size_t max_reply{0};
+    bool complete{false};
+    bool response_reusable{false};
+    bool callback_failed{false};
+};
+
+// SSL callbacks always reference this session-owned object. The active call is
+// attached only while its stack frame and absolute-deadline event are alive.
+struct ClientSession {
+    ClientCall* active{nullptr};
     std::optional<std::array<unsigned char, 32>> pin;
     bool pin_failed{false};
     bool tls_failed{false};
+    bool handshake_done{false};
+    bool connection_closed{false};
 };
 
 int ClientDataIndex()
@@ -184,19 +199,19 @@ int VerifyPeer(int verified, X509_STORE_CTX* certificate_context)
 {
     auto* ssl{static_cast<SSL*>(X509_STORE_CTX_get_ex_data(
         certificate_context, SSL_get_ex_data_X509_STORE_CTX_idx()))};
-    auto* call{ssl ? static_cast<ClientCall*>(SSL_get_ex_data(ssl, ClientDataIndex())) : nullptr};
+    auto* session{ssl ? static_cast<ClientSession*>(SSL_get_ex_data(ssl, ClientDataIndex())) : nullptr};
     if (!verified) {
-        if (call) call->tls_failed = true;
+        if (session) session->tls_failed = true;
         return 0;
     }
-    if (!call) return 0;
-    if (call->pin && X509_STORE_CTX_get_error_depth(certificate_context) == 0) {
+    if (!session) return 0;
+    if (session->pin && X509_STORE_CTX_get_error_depth(certificate_context) == 0) {
         std::array<unsigned char, 32> digest{};
         unsigned int length{0};
         if (X509_digest(X509_STORE_CTX_get_current_cert(certificate_context), EVP_sha256(),
                         digest.data(), &length) != 1 || length != digest.size() ||
-            CRYPTO_memcmp(digest.data(), call->pin->data(), digest.size()) != 0) {
-            call->pin_failed = true;
+            CRYPTO_memcmp(digest.data(), session->pin->data(), digest.size()) != 0) {
+            session->pin_failed = true;
             return 0;
         }
     }
@@ -206,12 +221,82 @@ int VerifyPeer(int verified, X509_STORE_CTX* certificate_context)
 void HandshakeInfo(const SSL* ssl, int where, int)
 {
     if ((where & SSL_CB_HANDSHAKE_DONE) == 0) return;
-    if (auto* call{static_cast<ClientCall*>(SSL_get_ex_data(ssl, ClientDataIndex()))}) {
+    if (auto* session{static_cast<ClientSession*>(SSL_get_ex_data(ssl, ClientDataIndex()))}) {
+        session->handshake_done = true;
+        auto* call{session->active};
+        if (!call) return;
         // The HTTP writer may run immediately after this callback. Conservatively
         // report unknown outcome after successful TLS, even if later writes fail.
         call->result.request_may_have_been_sent = true;
+        call->result.tls_handshake_performed = true;
         if (call->timing) call->timing->Mark("tls_handshake_done_us");
     }
+}
+
+bool FingerprintCa(const fs::path& path, Clock::time_point deadline,
+                   std::optional<std::array<unsigned char, 32>>& digest)
+{
+    if (path.empty()) { digest.reset(); return true; }
+    // Detect replacement even when the filename, size and timestamp are kept.
+    // Only regular public trust files are accepted; memory is bounded and the
+    // deadline is checked between reads. As with OpenSSL's CA load, a blocked
+    // filesystem read itself cannot be interrupted by the network deadline.
+    std::error_code file_error;
+    if (!fs::is_regular_file(path, file_error) || file_error) return false;
+    Owned<FILE, fclose> input{fsbridge::fopen(path, "rb"), fclose};
+    Owned<EVP_MD_CTX, EVP_MD_CTX_free> hash{EVP_MD_CTX_new(), EVP_MD_CTX_free};
+    if (!input || !hash || EVP_DigestInit_ex(hash.get(), EVP_sha256(), nullptr) != 1) return false;
+    std::array<unsigned char, 4096> chunk{};
+    while (Clock::now() < deadline) {
+        const size_t size{fread(chunk.data(), 1, chunk.size(), input.get())};
+        if (size && EVP_DigestUpdate(hash.get(), chunk.data(), size) != 1) return false;
+        if (ferror(input.get())) return false;
+        if (feof(input.get())) {
+            digest.emplace();
+            unsigned int length{0};
+            return EVP_DigestFinal_ex(hash.get(), digest->data(), &length) == 1 && length == digest->size();
+        }
+    }
+    return false;
+}
+
+bool ClientCertificatesValid(SSL* ssl)
+{
+    if (!ssl || SSL_get_verify_result(ssl) != X509_V_OK) return false;
+    const auto* chain{SSL_get0_verified_chain(ssl)};
+    if (!chain || sk_X509_num(chain) == 0) return false;
+    for (int i{0}; i < sk_X509_num(chain); ++i) {
+        const auto* certificate{sk_X509_value(chain, i)};
+        if (X509_cmp_current_time(X509_get0_notBefore(certificate)) != -1 ||
+            X509_cmp_current_time(X509_get0_notAfter(certificate)) != 1) return false;
+    }
+    return true;
+}
+
+bool ClientReplyReusable(evhttp_request* request, size_t size)
+{
+    const auto* headers{evhttp_request_get_input_headers(request)};
+    bool has_length{false};
+    for (auto* field{headers->tqh_first}; field; field = field->next.tqe_next) {
+        std::string name{field->key};
+        for (char& c : name) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        if (name == "transfer-encoding") return false;
+        if (name == "content-length") {
+            if (has_length) return false;
+            has_length = true;
+            const std::string_view value{field->value};
+            size_t declared{0};
+            const auto parsed{std::from_chars(value.data(), value.data() + value.size(), declared)};
+            if (value.empty() || parsed.ec != std::errc{} ||
+                parsed.ptr != value.data() + value.size() || declared != size) return false;
+        }
+        if (name == "connection") {
+            std::string value{field->value};
+            for (char& c : value) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            if (value.find("close") != std::string::npos) return false;
+        }
+    }
+    return has_length;
 }
 
 // Socket BIO keeps the server's bounded Sock owner independent of OpenSSL and
@@ -308,9 +393,41 @@ public:
         }
         return -1;
     }
-    bool Write(std::string_view data)
+    bool PendingInput() const
+    {
+        // This restricted endpoint does not admit pipelining. Include bytes in
+        // OpenSSL and later TLS records still on the socket, rather than only
+        // surplus plaintext returned in the final ReadRequest() read.
+        if (SSL_pending(m_ssl) != 0 || SSL_has_pending(m_ssl)) return true;
+        char next;
+        return m_socket.Recv(&next, 1, MSG_PEEK) > 0;
+    }
+    bool SurplusRequest(bool& keep_alive)
+    {
+        if (SSL_pending(m_ssl) != 0) return true;
+        if (!PendingInput()) return false;
+        // Pending ciphertext can be TLS control data, close-notify, or a
+        // partial record. Never reuse it ambiguously; only positive plaintext
+        // is sufficient to reject the already framed request as pipelined.
+        keep_alive = false;
+        auto& bio{*static_cast<SocketBio*>(BIO_get_data(SSL_get_rbio(m_ssl)))};
+        const size_t previous{bio.read_budget};
+        const size_t budget{std::min(previous, size_t{32 * 1024})};
+        bio.read_budget = budget;
+        char next;
+        ERR_clear_error();
+        const int result{SSL_peek(m_ssl, &next, 1)};
+        bio.read_budget = previous - (budget - bio.read_budget);
+        return result > 0;
+    }
+    bool Write(std::string_view data, bool* subsequent_input = nullptr)
     {
         while (!data.empty() && Alive()) {
+            // Check before writes, never after the final write: a legitimate
+            // sequential client may immediately send its next request after
+            // receiving the complete response. Input before completion closes
+            // this connection after the response and is never redispatched.
+            if (subsequent_input && PendingInput()) *subsequent_input = true;
             ERR_clear_error();
             const int result{SSL_write(m_ssl, data.data(), static_cast<int>(std::min<size_t>(data.size(), 16384)))};
             if (result > 0) data.remove_prefix(result);
@@ -357,12 +474,14 @@ std::string_view TrimHeader(std::string_view text)
     return text;
 }
 
-bool ReadRequest(TlsIo& io, size_t max_body, FlowMeshHttpsServer::Request& request, int& status)
+bool ReadRequest(TlsIo& io, size_t max_body, FlowMeshHttpsServer::Request& request,
+                 int& status, bool& keep_alive)
 {
     std::string received;
     size_t end{std::string::npos};
     std::array<char, 4096> chunk{};
     status = 400;
+    keep_alive = true; // HTTP/1.1 defaults to persistence unless close is requested.
     while ((end = received.find("\r\n\r\n")) == std::string::npos) {
         if (received.size() >= MAX_HEADERS) { status = 431; return false; }
         const int size{io.Read(chunk.data(), std::min(chunk.size(), MAX_HEADERS - received.size()))};
@@ -397,6 +516,23 @@ bool ReadRequest(TlsIo& io, size_t max_body, FlowMeshHttpsServer::Request& reque
     if (!fields.contains("host") || fields.at("host").empty() ||
         !fields.contains("content-length") || fields.contains("transfer-encoding") ||
         fields.contains("expect") || fields.contains("content-encoding")) return false;
+    if (const auto connection{fields.find("connection")}; connection != fields.end()) {
+        std::string_view remaining{connection->second};
+        do {
+            const auto comma{remaining.find(',')};
+            std::string token{TrimHeader(remaining.substr(0, comma))};
+            if (token.empty()) return false;
+            for (char& c : token) {
+                if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+                if (!(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') &&
+                    std::string_view{"!#$%&'*+-.^_`|~"}.find(c) == std::string_view::npos) return false;
+            }
+            if (token == "close") keep_alive = false;
+            if (comma == std::string_view::npos) break;
+            remaining.remove_prefix(comma + 1);
+            if (remaining.empty()) return false;
+        } while (true);
+    }
     size_t length{0};
     const auto value{fields.at("content-length")};
     const auto parsed{std::from_chars(value.data(), value.data() + value.size(), length)};
@@ -410,7 +546,7 @@ bool ReadRequest(TlsIo& io, size_t max_body, FlowMeshHttpsServer::Request& reque
         if (size <= 0) return false;
         request.body.append(chunk.data(), size);
     }
-    return true;
+    return !io.SurplusRequest(keep_alive);
 }
 
 } // namespace
@@ -458,8 +594,119 @@ bool NormalizeFlowMeshHttpsEndpoint(HttpsEndpoint& endpoint, std::string& error)
     return true;
 }
 
-HttpsRequestResult FlowMeshHttpsRequest(const HttpsEndpoint& endpoint, const std::string& path,
-                                      const std::string& body, Milliseconds timeout, size_t max_reply_bytes)
+struct FlowMeshHttpsClient::Impl {
+    static constexpr auto MAX_IDLE{std::chrono::seconds{30}};
+    static constexpr auto MAX_AGE{std::chrono::minutes{5}};
+    static constexpr size_t MAX_REQUESTS{100};
+    const bool keep_alive;
+    ClientSession session;
+    HttpsEndpoint endpoint;
+    std::optional<std::array<unsigned char, 32>> ca_fingerprint;
+    SslContext context{nullptr, SSL_CTX_free};
+    Owned<event_base, event_base_free> base{nullptr, event_base_free};
+    Owned<evdns_base, FreeDns> dns{nullptr, FreeDns};
+    Owned<evhttp_connection, evhttp_connection_free> connection{nullptr, evhttp_connection_free};
+    Clock::time_point created{}, last_used{};
+    size_t requests{0};
+
+    explicit Impl(bool retain) : keep_alive{retain} {}
+
+    void Reset()
+    {
+        // Destroy callback owners before their data and event/DNS bases.
+        connection.reset();
+        dns.reset();
+        base.reset();
+        context.reset();
+        session = {};
+        endpoint = {};
+        ca_fingerprint.reset();
+        requests = 0;
+    }
+
+    bool Reusable()
+    {
+        if (!keep_alive || !connection || session.connection_closed || !session.handshake_done ||
+            requests >= MAX_REQUESTS || Clock::now() - created >= MAX_AGE ||
+            Clock::now() - last_used >= MAX_IDLE) return false;
+        // Process idle EOF and unsolicited bytes before making another request.
+        // A close callback permanently disqualifies this evhttp object: calling
+        // make_request on a reset object can otherwise reconnect using a fresh,
+        // plain bufferevent in libevent. No reset connection is ever dispatched.
+        if (event_base_loop(base.get(), EVLOOP_NONBLOCK) < 0 || session.connection_closed) return false;
+        auto* bev{evhttp_connection_get_bufferevent(connection.get())};
+        if (!bev || bufferevent_getfd(bev) == -1 ||
+            evbuffer_get_length(bufferevent_get_input(bev)) != 0 ||
+            evbuffer_get_length(bufferevent_get_output(bev)) != 0) return false;
+        SSL* ssl{bufferevent_openssl_get_ssl(bev)};
+        return ClientCertificatesValid(ssl) && SSL_pending(ssl) == 0 &&
+            SSL_has_pending(ssl) == 0 && SSL_get_shutdown(ssl) == 0;
+    }
+
+    bool Initialize(const HttpsEndpoint& configured, const ParsedEndpoint& parsed,
+                    std::optional<std::array<unsigned char, 32>> pin,
+                    std::optional<std::array<unsigned char, 32>> fingerprint,
+                    Clock::time_point expires, ClientCall& call)
+    {
+        session.pin = pin;
+        endpoint = configured;
+        ca_fingerprint = fingerprint;
+        if (call.timing) call.timing->Mark("context_started_us");
+        context = MakeContext(false);
+        if (!context || ClientDataIndex() < 0) {
+            call.result.error = "https-tls-initialization-failed"; return false;
+        }
+        SSL_CTX_set_verify(context.get(), SSL_VERIFY_PEER, VerifyPeer);
+        if ((endpoint.ca_file.empty() ? SSL_CTX_set_default_verify_paths(context.get())
+            : SSL_CTX_load_verify_locations(context.get(), fs::PathToString(endpoint.ca_file).c_str(), nullptr)) != 1) {
+            call.result.error = "https-ca-load-failed"; return false;
+        }
+        std::optional<std::array<unsigned char, 32>> loaded_fingerprint;
+        if (!FingerprintCa(endpoint.ca_file, expires, loaded_fingerprint) || loaded_fingerprint != fingerprint) {
+            call.result.error = Clock::now() >= expires ? "https-deadline" : "https-ca-changed-during-load";
+            return false;
+        }
+        if (call.timing) call.timing->Mark("ca_ready_us");
+        base.reset(event_base_new());
+        if (!base) { call.result.error = "https-event-base-failed"; return false; }
+        dns.reset(evdns_base_new(base.get(), 1));
+        if (!dns) { call.result.error = "https-dns-initialization-failed"; return false; }
+        Ssl ssl{SSL_new(context.get()), SSL_free};
+        if (!ssl || SSL_set_ex_data(ssl.get(), ClientDataIndex(), &session) != 1) {
+            call.result.error = "https-tls-initialization-failed"; return false;
+        }
+        X509_VERIFY_PARAM* verify{SSL_get0_param(ssl.get())};
+        X509_VERIFY_PARAM_set_hostflags(verify, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        const bool identity_ok{parsed.numeric
+            ? X509_VERIFY_PARAM_set1_ip_asc(verify, parsed.host.c_str()) == 1
+            : SSL_set1_host(ssl.get(), parsed.host.c_str()) == 1 &&
+              SSL_set_tlsext_host_name(ssl.get(), parsed.host.c_str()) == 1};
+        if (!identity_ok) { call.result.error = "https-invalid-server-identity"; return false; }
+        SSL_set_info_callback(ssl.get(), HandshakeInfo);
+        Owned<bufferevent, bufferevent_free> bev{bufferevent_openssl_socket_new(
+            base.get(), -1, ssl.get(), BUFFEREVENT_SSL_CONNECTING, BEV_OPT_CLOSE_ON_FREE), bufferevent_free};
+        if (!bev) { call.result.error = "https-tls-buffer-failed"; return false; }
+        ssl.release();
+        connection.reset(evhttp_connection_base_bufferevent_new(
+            base.get(), dns.get(), bev.get(), parsed.host.c_str(), parsed.port));
+        if (!connection) { call.result.error = "https-connection-creation-failed"; return false; }
+        bev.release();
+        evhttp_connection_set_retries(connection.get(), 0);
+        evhttp_connection_set_max_headers_size(connection.get(), MAX_HEADERS);
+        evhttp_connection_set_closecb(connection.get(), [](evhttp_connection*, void* argument) {
+            static_cast<ClientSession*>(argument)->connection_closed = true;
+        }, &session);
+        created = Clock::now();
+        return true;
+    }
+};
+
+FlowMeshHttpsClient::FlowMeshHttpsClient(bool keep_alive) : m_impl{std::make_unique<Impl>(keep_alive)} {}
+FlowMeshHttpsClient::~FlowMeshHttpsClient() = default;
+void FlowMeshHttpsClient::Reset() { m_impl->Reset(); }
+
+HttpsRequestResult FlowMeshHttpsClient::Request(const HttpsEndpoint& endpoint, const std::string& path,
+                                               const std::string& body, Milliseconds timeout, size_t max_reply_bytes)
 {
     FlowMeshTimingSpan timing{"https_request"};
     ClientCall call;
@@ -469,131 +716,195 @@ HttpsRequestResult FlowMeshHttpsRequest(const HttpsEndpoint& endpoint, const std
     const auto parsed{ParseEndpoint(endpoint, path)};
     if (!parsed || timeout <= Milliseconds{0} || timeout > MAX_TIMEOUT ||
         max_reply_bytes == 0 || max_reply_bytes > MAX_REPLY || body.size() > MAX_REQUEST) {
+        Reset();
         call.result.error = "https-invalid-endpoint-or-bounds";
         return call.result;
     }
+    const auto expires{start + timeout};
+    std::optional<std::array<unsigned char, 32>> pin;
     if (!endpoint.certificate_sha256.empty()) {
-        call.pin = ParsePin(endpoint.certificate_sha256);
-        if (!call.pin) { call.result.error = "https-invalid-certificate-pin"; return call.result; }
+        pin = ParsePin(endpoint.certificate_sha256);
+        if (!pin) { Reset(); call.result.error = "https-invalid-certificate-pin"; return call.result; }
     }
-    timing.Mark("context_started_us");
-    auto context{MakeContext(false)};
-    if (!context || ClientDataIndex() < 0) { call.result.error = "https-tls-initialization-failed"; return call.result; }
-    SSL_CTX_set_verify(context.get(), SSL_VERIFY_PEER, VerifyPeer);
-    if ((endpoint.ca_file.empty() ? SSL_CTX_set_default_verify_paths(context.get())
-        : SSL_CTX_load_verify_locations(context.get(), fs::PathToString(endpoint.ca_file).c_str(), nullptr)) != 1) {
-        call.result.error = "https-ca-load-failed";
+    HttpsEndpoint normalized{endpoint};
+    if (!NormalizeFlowMeshHttpsEndpoint(normalized, call.result.error)) { Reset(); return call.result; }
+    std::optional<std::array<unsigned char, 32>> fingerprint;
+    if (!FingerprintCa(endpoint.ca_file, expires, fingerprint)) {
+        Reset();
+        call.result.error = Clock::now() >= expires ? "https-deadline" : "https-ca-load-failed";
         return call.result;
     }
-    timing.Mark("ca_ready_us");
-    Owned<event_base, event_base_free> base{event_base_new(), event_base_free};
-    if (!base) { call.result.error = "https-event-base-failed"; return call.result; }
-    call.base = base.get();
-    Owned<evdns_base, FreeDns> dns{evdns_base_new(base.get(), 1), FreeDns};
-    if (!dns) { call.result.error = "https-dns-initialization-failed"; return call.result; }
-    Ssl ssl{SSL_new(context.get()), SSL_free};
-    if (!ssl || SSL_set_ex_data(ssl.get(), ClientDataIndex(), &call) != 1) {
-        call.result.error = "https-tls-initialization-failed"; return call.result;
+    auto& state{*m_impl};
+    if (state.endpoint.url != normalized.url || state.endpoint.ca_file != normalized.ca_file ||
+        state.session.pin != pin || state.ca_fingerprint != fingerprint || !state.Reusable()) Reset();
+    const bool warm{bool(state.connection)};
+    if (!warm && !state.Initialize(normalized, *parsed, pin, fingerprint, expires, call)) {
+        Reset(); return call.result;
     }
-    X509_VERIFY_PARAM* verify{SSL_get0_param(ssl.get())};
-    X509_VERIFY_PARAM_set_hostflags(verify, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-    const bool identity_ok{parsed->numeric
-        ? X509_VERIFY_PARAM_set1_ip_asc(verify, parsed->host.c_str()) == 1
-        : SSL_set1_host(ssl.get(), parsed->host.c_str()) == 1 &&
-          SSL_set_tlsext_host_name(ssl.get(), parsed->host.c_str()) == 1};
-    if (!identity_ok) { call.result.error = "https-invalid-server-identity"; return call.result; }
-    SSL_set_info_callback(ssl.get(), HandshakeInfo);
-    Owned<bufferevent, bufferevent_free> bev{bufferevent_openssl_socket_new(
-        base.get(), -1, ssl.get(), BUFFEREVENT_SSL_CONNECTING, BEV_OPT_CLOSE_ON_FREE), bufferevent_free};
-    if (!bev) { call.result.error = "https-tls-buffer-failed"; return call.result; }
-    ssl.release(); // Owned by the SSL bufferevent from now on.
-    Owned<evhttp_connection, evhttp_connection_free> connection{evhttp_connection_base_bufferevent_new(
-        base.get(), dns.get(), bev.get(), parsed->host.c_str(), parsed->port), evhttp_connection_free};
-    if (!connection) { call.result.error = "https-connection-creation-failed"; return call.result; }
-    bev.release();
-    evhttp_connection_set_retries(connection.get(), 0); // Economic retry belongs to the client backend.
-    evhttp_connection_set_max_headers_size(connection.get(), MAX_HEADERS);
-    evhttp_connection_set_max_body_size(connection.get(), max_reply_bytes);
+    call.base = state.base.get();
+    evhttp_connection_set_max_body_size(state.connection.get(), max_reply_bytes);
     const auto limit{Timeval(timeout)};
-    evhttp_connection_set_timeout_tv(connection.get(), &limit);
+    evhttp_connection_set_timeout_tv(state.connection.get(), &limit);
     auto* request{evhttp_request_new([](evhttp_request* req, void* argument) {
         auto& current{*static_cast<ClientCall*>(argument)};
+        current.complete = true;
         if (current.timing) current.timing->Mark("response_callback_us");
-        if (req) {
-            const auto status{evhttp_request_get_response_code(req)};
-            auto* input{evhttp_request_get_input_buffer(req)};
-            const size_t size{evbuffer_get_length(input)};
-            if (size <= current.max_reply && status >= 200 && status <= 599) {
-                current.result.response_received = true;
-                current.result.status = status;
-                current.result.body.resize(size);
-                if (size) evbuffer_remove(input, current.result.body.data(), size);
-                if (status >= 300 && status < 400) current.result.error = "https-redirect-refused";
-            } else current.result.error = "https-invalid-or-oversized-reply";
-        } else if (current.result.error.empty()) current.result.error = "https-transport-failed";
+        try {
+            if (req) {
+                const auto status{evhttp_request_get_response_code(req)};
+                auto* input{evhttp_request_get_input_buffer(req)};
+                const size_t size{evbuffer_get_length(input)};
+                if (size <= current.max_reply && status >= 200 && status <= 599) {
+                    current.result.response_received = true;
+                    current.result.status = status;
+                    current.result.body.resize(size);
+                    if (size) evbuffer_remove(input, current.result.body.data(), size);
+                    if (status >= 300 && status < 400) current.result.error = "https-redirect-refused";
+                    current.response_reusable = ClientReplyReusable(req, size);
+                } else current.result.error = "https-invalid-or-oversized-reply";
+            } else if (current.result.error.empty()) current.result.error = "https-transport-failed";
+        } catch (...) {
+            // Never unwind through libevent or leave its completion cleanup
+            // unfinished. Report the failure after callbacks have detached.
+            current.callback_failed = true;
+            current.result.response_received = false;
+            current.result.body.clear();
+            current.response_reusable = false;
+        }
         event_base_loopbreak(current.base);
     }, &call)};
-    if (!request) { call.result.error = "https-request-allocation-failed"; return call.result; }
+    if (!request) { Reset(); call.result.error = "https-request-allocation-failed"; return call.result; }
     evhttp_request_set_error_cb(request, [](evhttp_request_error error, void* argument) {
         auto& current{*static_cast<ClientCall*>(argument)};
-        current.result.error = error == EVREQ_HTTP_DATA_TOO_LONG ? "https-reply-too-large"
-            : error == EVREQ_HTTP_TIMEOUT ? "https-deadline" : "https-transport-failed";
+        try {
+            current.result.error = error == EVREQ_HTTP_DATA_TOO_LONG ? "https-reply-too-large"
+                : error == EVREQ_HTTP_TIMEOUT ? "https-deadline" : "https-transport-failed";
+        } catch (...) { current.callback_failed = true; }
     });
     auto* headers{evhttp_request_get_output_headers(request)};
     evhttp_add_header(headers, "Host", parsed->authority.c_str());
     evhttp_add_header(headers, "Content-Type", "application/json");
-    evhttp_add_header(headers, "Connection", "close");
+    evhttp_add_header(headers, "Connection", state.keep_alive ? "keep-alive" : "close");
     evhttp_add_header(headers, "Content-Length", std::to_string(body.size()).c_str());
     evbuffer_add(evhttp_request_get_output_buffer(request), body.data(), body.size());
     const auto remaining{timeout - std::chrono::duration_cast<Milliseconds>(Clock::now() - start)};
     if (remaining <= Milliseconds{0}) {
         evhttp_request_free(request);
+        Reset();
         call.result.error = "https-deadline";
         return call.result;
     }
-    Owned<event, event_free> deadline{evtimer_new(base.get(), [](evutil_socket_t, short, void* argument) {
+    Owned<event, event_free> deadline{evtimer_new(state.base.get(), [](evutil_socket_t, short, void* argument) {
         auto& current{*static_cast<ClientCall*>(argument)};
-        current.result.error = "https-deadline";
+        try { current.result.error = "https-deadline"; }
+        catch (...) { current.callback_failed = true; }
         event_base_loopbreak(current.base);
     }, &call), event_free};
     const auto remaining_tv{Timeval(remaining)};
     if (!deadline || evtimer_add(deadline.get(), &remaining_tv) != 0) {
         evhttp_request_free(request);
+        deadline.reset();
+        Reset();
         call.result.error = "https-deadline-setup-failed";
         return call.result;
     }
     // Dispatch is NOT an observation of socket write or peer receipt.
     timing.Mark("dispatch_started_us");
+    timing.Field("connection_reused", uint64_t{warm});
+    struct DispatchCleanup {
+        Impl& state;
+        Owned<event, event_free>& deadline;
+        bool detached{false};
+        ~DispatchCleanup()
+        {
+            if (!detached) {
+                deadline.reset();
+                state.Reset();
+            }
+        }
+    } cleanup{state, deadline};
+    state.session.active = &call;
+    // Unlike a cold handshake, a warm socket can immediately write. Mark every
+    // warm request before make_request makes any of its bytes writer-eligible.
+    call.result.connection_reused = warm;
+    if (warm) call.result.request_may_have_been_sent = true;
     // libevent owns/frees request whether make_request succeeds or fails.
-    if (evhttp_make_request(connection.get(), request, EVHTTP_REQ_POST, path.c_str()) != 0) {
+    if (evhttp_make_request(state.connection.get(), request, EVHTTP_REQ_POST, path.c_str()) != 0) {
         call.result.error = "https-request-setup-failed";
-    } else if (event_base_dispatch(base.get()) < 0) {
+    } else if (event_base_dispatch(state.base.get()) < 0) {
         call.result.error = "https-event-loop-failed";
     }
     timing.Mark("dispatch_completed_us");
-    if (call.pin_failed) call.result.error = "https-certificate-pin-mismatch";
-    else if (call.tls_failed) call.result.error = "https-certificate-verification-failed";
+    deadline.reset();
+    state.session.active = nullptr;
+    cleanup.detached = true;
+    if (call.callback_failed) {
+        Reset();
+        call.result.response_received = false;
+        call.result.body.clear();
+        call.result.error = "https-callback-failed";
+        return call.result;
+    }
+    if (state.session.pin_failed) call.result.error = "https-certificate-pin-mismatch";
+    else if (state.session.tls_failed) call.result.error = "https-certificate-verification-failed";
+    if (!call.complete && call.result.error.empty()) call.result.error = "https-transport-failed";
+    ++state.requests;
+    state.last_used = Clock::now();
+    if (!call.complete || !call.result.response_received || !call.result.error.empty() ||
+        call.result.status >= 400 || !call.response_reusable || !state.Reusable()) Reset();
     return call.result;
 }
 
+HttpsRequestResult FlowMeshHttpsRequest(const HttpsEndpoint& endpoint, const std::string& path,
+                                      const std::string& body, Milliseconds timeout, size_t max_reply_bytes)
+{
+    return FlowMeshHttpsClient{false}.Request(endpoint, path, body, timeout, max_reply_bytes);
+}
+
 struct FlowMeshHttpsServer::Impl {
-    struct Pending {
-        std::unique_ptr<Sock> socket;
+    struct Connection {
+        std::atomic<size_t>& count;
+        std::shared_ptr<Sock> socket;
+        SocketBio socket_bio;
+        Ssl ssl{nullptr, SSL_free};
         std::string peer;
         Clock::time_point deadline;
+        const Clock::time_point expires;
+        Clock::time_point idle_deadline;
         uint64_t enqueued_us{0};
+        size_t requests{0};
+
+        Connection(std::atomic<size_t>& total, std::shared_ptr<Sock> sock, std::string address,
+                   Clock::time_point accepted, const Options& options)
+            : count{total}, socket{std::move(sock)}, socket_bio{*socket}, peer{std::move(address)},
+              deadline{std::min(accepted + options.request_timeout, accepted + options.connection_lifetime)},
+              expires{accepted + options.connection_lifetime}
+        {
+            ++count;
+        }
+        ~Connection()
+        {
+            // Count closing owners until both SSL and the actual socket have
+            // been released. Readiness snapshots retain only idle sockets.
+            ssl.reset();
+            socket.reset();
+            --count;
+        }
     };
     Options options;
     Handler handler;
     SslContext context{nullptr, SSL_CTX_free};
-    std::unique_ptr<Sock> listener;
+    std::shared_ptr<Sock> listener;
+    std::shared_ptr<Sock> wake_reader;
+    std::unique_ptr<Sock> wake_writer;
     SOCKET listener_fd{INVALID_SOCKET};
     std::atomic<uint16_t> port{0};
     std::atomic<bool> stopping{true};
     std::atomic<size_t> connections{0};
     std::mutex mutex;
     std::condition_variable condition;
-    std::deque<Pending> queue;
+    std::deque<std::unique_ptr<Connection>> queue;
+    std::vector<std::unique_ptr<Connection>> idle;
     std::thread accept_thread;
     std::vector<std::thread> workers;
     // Empty in production. Test observation occurs only after immutable
@@ -602,57 +913,86 @@ struct FlowMeshHttpsServer::Impl {
 
     Impl(Options opts, Handler fn) : options{std::move(opts)}, handler{std::move(fn)} {}
 
-    void Serve(Pending pending)
+    void Wake()
+    {
+        if (wake_writer) {
+            const char wake{0};
+            // A full nonblocking wake socket already has a notification queued.
+            while (wake_writer->Send(&wake, 1, MSG_NOSIGNAL) < 0 && WSAGetLastError() == WSAEINTR) {}
+        }
+    }
+
+    static uint64_t EnqueuedTime()
+    {
+        return FlowMeshTimingRecording() ? uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+            Clock::now().time_since_epoch()).count()) : 0;
+    }
+
+    bool Serve(Connection& pending)
     {
         FlowMeshTimingSpan timing{"https_server_serve"};
         timing.Field("enqueued_us", pending.enqueued_us);
-        if (stopping.load() || Clock::now() >= pending.deadline) return;
-        SocketBio socket_bio{*pending.socket};
-        Ssl ssl{SSL_new(context.get()), SSL_free};
-        const BIO_METHOD* method{SocketBioMethod()};
-        if (!ssl || !method) return;
-        BIO* bio{BIO_new(method)};
-        if (!bio) return;
-        BIO_set_data(bio, &socket_bio);
-        SSL_set_bio(ssl.get(), bio, bio);
-        TlsIo io{ssl.get(), *pending.socket, stopping, pending.deadline};
-        if (!io.Handshake()) return;
-        timing.Mark("handshake_done_us");
+        timing.Field("connection_request_index", pending.requests + 1);
+        if (stopping.load() || Clock::now() >= pending.deadline) return false;
+        const bool first{!pending.ssl};
+        if (first) {
+            pending.ssl.reset(SSL_new(context.get()));
+            const BIO_METHOD* method{SocketBioMethod()};
+            if (!pending.ssl || !method) return false;
+            BIO* bio{BIO_new(method)};
+            if (!bio) return false;
+            BIO_set_data(bio, &pending.socket_bio);
+            SSL_set_bio(pending.ssl.get(), bio, bio);
+        }
+        TlsIo io{pending.ssl.get(), *pending.socket, stopping, pending.deadline};
+        if (first) {
+            if (!io.Handshake()) return false;
+            timing.Mark("handshake_done_us");
+        }
         Request request;
-        request.remote_address = std::move(pending.peer);
+        request.remote_address = pending.peer;
         Response response;
         int failure{400};
-        const bool rejected{!ReadRequest(io, options.max_request_bytes, request, failure)};
+        bool keep_alive{false};
+        const bool rejected{!ReadRequest(io, options.max_request_bytes, request, failure, keep_alive)};
         timing.Mark("request_read_us");
         if (rejected) {
             response = {failure, "{\"error\":\"invalid-http-request\"}"};
-        } else if (!io.Alive()) return;
+        } else if (!io.Alive()) return false;
         else {
             try { response = handler(request); }
             catch (...) { response = {500, "{\"error\":\"handler-failed\"}"}; }
         }
         timing.Mark("handler_completed_us");
-        if (!io.Alive()) return; // Handler may have admitted; caller must treat timeout as unknown.
+        if (!io.Alive()) return false; // Handler may have admitted; caller must treat timeout as unknown.
         if (response.status < 200 || response.status > 599 || response.body.size() > options.max_reply_bytes) {
             response = {500, "{\"error\":\"reply-out-of-bounds\"}"};
         }
+        ++pending.requests;
+        bool subsequent_input{!rejected && io.PendingInput()};
+        keep_alive = keep_alive && options.keep_alive && !rejected && !subsequent_input &&
+            pending.requests < options.max_requests_per_connection && Clock::now() < pending.expires;
         const std::string header{"HTTP/1.1 " + std::to_string(response.status) +
             " Response\r\nContent-Type: application/json\r\nContent-Length: " +
-            std::to_string(response.body.size()) + "\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n"};
-        if (io.Write(header) && io.Write(response.body)) {
+            std::to_string(response.body.size()) + "\r\nConnection: " + (keep_alive ? "keep-alive" : "close") +
+            "\r\nCache-Control: no-store\r\n\r\n"};
+        bool* const watch_input{keep_alive ? &subsequent_input : nullptr};
+        if (io.Write(header, watch_input) && io.Write(response.body, watch_input)) {
             timing.Mark("response_written_us");
             if (rejected) {
                 const auto [ciphertext, plaintext]{io.FinishRejectedResponse()};
                 if (rejected_cleanup_observer) rejected_cleanup_observer(ciphertext, plaintext);
             }
-            else SSL_shutdown(ssl.get());
+            else if (keep_alive && !subsequent_input && io.Alive()) return true;
+            else SSL_shutdown(pending.ssl.get());
         }
+        return false;
     }
 
     void Worker()
     {
         while (true) {
-            Pending pending;
+            std::unique_ptr<Connection> pending;
             {
                 std::unique_lock lock{mutex};
                 condition.wait(lock, [&] { return stopping.load() || !queue.empty(); });
@@ -660,30 +1000,89 @@ struct FlowMeshHttpsServer::Impl {
                 pending = std::move(queue.front());
                 queue.pop_front();
             }
-            try { Serve(std::move(pending)); } catch (...) { /* Close, never expose an exception body. */ }
-            --connections;
+            try {
+                if (Serve(*pending)) {
+                    std::lock_guard lock{mutex};
+                    if (!stopping.load() && Clock::now() < pending->expires) {
+                        pending->idle_deadline = std::min(pending->expires, Clock::now() + options.idle_timeout);
+                        idle.push_back(std::move(pending));
+                        Wake();
+                    }
+                }
+            } catch (...) { /* Close, never expose an exception body. */ }
         }
     }
 
     void Accept()
     {
         while (!stopping.load()) {
-            Sock::Event occurred{0};
-            if (!listener->Wait(Milliseconds{100}, Sock::RECV, &occurred)) break;
-            if (!(occurred & Sock::RECV)) continue;
+            Sock::EventsPerSock ready;
+            ready.emplace(listener, Sock::Events{Sock::RECV});
+            ready.emplace(wake_reader, Sock::Events{Sock::RECV});
+            auto wait_until{Clock::now() + std::chrono::seconds{1}};
+            {
+                std::lock_guard lock{mutex};
+                for (const auto& connection : idle) {
+                    ready.emplace(connection->socket, Sock::Events{Sock::RECV});
+                    wait_until = std::min(wait_until, connection->idle_deadline);
+                }
+            }
+            // The wakeup makes parking and Stop immediate. This timeout bounds
+            // only error recovery and expiry, never the warm-request latency.
+            const auto wait{std::max(Milliseconds{0},
+                std::chrono::duration_cast<Milliseconds>(wait_until - Clock::now()))};
+            if (!listener->WaitMany(wait, ready)) {
+                if (WSAGetLastError() == WSAEINTR) continue;
+                break;
+            }
+            if (stopping.load()) break;
+            if (ready.at(wake_reader).occurred) {
+                std::array<char, 256> discarded{};
+                // One bounded read is enough; remaining wake bytes will make
+                // the next wait ready, and every iteration scans all owners.
+                (void)wake_reader->Recv(discarded.data(), discarded.size(), 0);
+            }
+            const bool accept_ready{(ready.at(listener).occurred & Sock::RECV) != 0};
+            {
+                std::lock_guard lock{mutex};
+                const auto now{Clock::now()};
+                for (auto it{idle.begin()}; it != idle.end();) {
+                    auto& connection{*it};
+                    const auto event{ready.find(connection->socket)};
+                    const Sock::Event occurred{event == ready.end() ? Sock::Event{0} : event->second.occurred};
+                    if (now >= connection->idle_deadline || (occurred & Sock::ERR)) {
+                        // Drop the descriptor snapshot before destroying its
+                        // counted connection, so closing still consumes a slot.
+                        if (event != ready.end()) ready.erase(event);
+                        it = idle.erase(it);
+                    } else if (occurred & Sock::RECV) {
+                        ready.erase(event);
+                        if (queue.size() < options.max_queue) {
+                            // Capture once at readiness, including queue wait.
+                            // Further trickle bytes cannot renew this deadline.
+                            connection->deadline = std::min(connection->expires, now + options.request_timeout);
+                            connection->enqueued_us = EnqueuedTime();
+                            queue.push_back(std::move(connection));
+                            condition.notify_one();
+                        }
+                        it = idle.erase(it); // Queue overflow closes this owner.
+                    } else ++it;
+                }
+            }
+            if (!accept_ready) continue;
             sockaddr_storage address{};
             socklen_t size{sizeof(address)};
             const SOCKET fd{static_cast<SOCKET>(::accept(listener_fd, reinterpret_cast<sockaddr*>(&address), &size))};
             if (fd == INVALID_SOCKET) continue;
-            auto socket{std::make_unique<Sock>(fd)};
+            const auto accepted{Clock::now()};
+            auto socket{std::make_shared<Sock>(fd)};
             if (!ConfigureSocket(*socket)) continue;
             std::lock_guard lock{mutex};
             if (stopping.load() || queue.size() >= options.max_queue ||
                 connections.load() >= options.max_connections) continue;
-            ++connections;
-            queue.push_back({std::move(socket), NumericPeer(address), Clock::now() + options.request_timeout,
-                FlowMeshTimingRecording() ? uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                    Clock::now().time_since_epoch()).count()) : 0});
+            auto pending{std::make_unique<Connection>(connections, std::move(socket), NumericPeer(address), accepted, options)};
+            pending->enqueued_us = EnqueuedTime();
+            queue.push_back(std::move(pending));
             condition.notify_one();
         }
     }
@@ -715,7 +1114,10 @@ bool FlowMeshHttpsServer::Start(std::string& error)
         options.max_connections == 0 || options.max_connections > 256 ||
         options.worker_threads == 0 || options.worker_threads > 16 ||
         options.max_queue == 0 || options.max_queue > 256 ||
-        options.request_timeout <= Milliseconds{0} || options.request_timeout > MAX_TIMEOUT) {
+        options.request_timeout <= Milliseconds{0} || options.request_timeout > MAX_TIMEOUT ||
+        options.idle_timeout <= Milliseconds{0} || options.idle_timeout > MAX_TIMEOUT ||
+        options.connection_lifetime <= Milliseconds{0} || options.connection_lifetime > std::chrono::hours{1} ||
+        options.max_requests_per_connection == 0 || options.max_requests_per_connection > 4096) {
         error = "https-server-invalid-options";
         return false;
     }
@@ -730,7 +1132,7 @@ bool FlowMeshHttpsServer::Start(std::string& error)
     }
     const SOCKET fd{static_cast<SOCKET>(::socket(address.ss_family, SOCK_STREAM, IPPROTO_TCP))};
     if (fd == INVALID_SOCKET) { error = "https-server-socket-failed"; return false; }
-    state.listener = std::make_unique<Sock>(fd);
+    state.listener = std::make_shared<Sock>(fd);
     state.listener_fd = fd;
     const int yes{1};
     (void)state.listener->SetSockOpt(SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
@@ -744,6 +1146,24 @@ bool FlowMeshHttpsServer::Start(std::string& error)
     }
     state.port = address.ss_family == AF_INET ? ntohs(reinterpret_cast<sockaddr_in*>(&address)->sin_port)
                                                : ntohs(reinterpret_cast<sockaddr_in6*>(&address)->sin6_port);
+    evutil_socket_t wake[2];
+#ifdef WIN32
+    constexpr int wake_family{AF_INET};
+#else
+    constexpr int wake_family{AF_UNIX};
+#endif
+    if (evutil_socketpair(wake_family, SOCK_STREAM, 0, wake) != 0) {
+        Stop();
+        error = "https-server-wakeup-failed";
+        return false;
+    }
+    state.wake_reader = std::make_shared<Sock>(static_cast<SOCKET>(wake[0]));
+    state.wake_writer = std::make_unique<Sock>(static_cast<SOCKET>(wake[1]));
+    if (!ConfigureSocket(*state.wake_reader) || !ConfigureSocket(*state.wake_writer)) {
+        Stop();
+        error = "https-server-wakeup-failed";
+        return false;
+    }
     state.stopping = false;
     try {
         for (size_t i{0}; i < options.worker_threads; ++i) state.workers.emplace_back([&state] { state.Worker(); });
@@ -760,15 +1180,20 @@ void FlowMeshHttpsServer::Stop()
 {
     auto& state{*m_impl};
     state.stopping = true;
+    state.Wake();
     state.condition.notify_all();
     if (state.accept_thread.joinable()) state.accept_thread.join();
-    for (auto& worker : state.workers) if (worker.joinable()) worker.join();
-    state.workers.clear();
     {
         std::lock_guard lock{state.mutex};
         state.queue.clear();
-        state.connections = 0;
+        state.idle.clear();
     }
+    // Idle/queued peers close before joining admitted handlers, whose existing
+    // completion contract is unchanged by persistence.
+    for (auto& worker : state.workers) if (worker.joinable()) worker.join();
+    state.workers.clear();
+    state.wake_reader.reset();
+    state.wake_writer.reset();
     state.listener.reset();
     state.listener_fd = INVALID_SOCKET;
     state.context.reset();

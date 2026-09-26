@@ -35,6 +35,9 @@ struct HttpsRequestResult {
     /** Conservative transport observation, not admission. Once a request
      * could have left this process, failures must be treated as unknown. */
     bool request_may_have_been_sent{false};
+    /** Transport diagnostics only; neither field establishes admission. */
+    bool connection_reused{false};
+    bool tls_handshake_performed{false};
 };
 
 /** Syntax and pin validation only: no DNS, filesystem or network access. */
@@ -45,6 +48,29 @@ bool NormalizeFlowMeshHttpsEndpoint(HttpsEndpoint& endpoint, std::string& error)
 /** Load configured CA material to catch missing/malformed trust files at
  * startup. Does not contact an endpoint or read a TLS private key. */
 bool ValidateFlowMeshHttpsTrust(const HttpsEndpoint& endpoint, std::string& error);
+
+/** One externally serialized HTTPS session, retaining at most one connection.
+ * Requests are sequential, bounded, and never automatically replayed. Endpoint,
+ * pin or explicit CA-file content changes invalidate the connection. Call Reset
+ * on default trust-store reload; age, idle and request-count limits also bound
+ * reuse. Request/Reset/destruction must not run concurrently. */
+class FlowMeshHttpsClient {
+public:
+    explicit FlowMeshHttpsClient(bool keep_alive = true);
+    ~FlowMeshHttpsClient();
+    FlowMeshHttpsClient(const FlowMeshHttpsClient&) = delete;
+    FlowMeshHttpsClient& operator=(const FlowMeshHttpsClient&) = delete;
+    HttpsRequestResult Request(const HttpsEndpoint& endpoint,
+                               const std::string& path,
+                               const std::string& body,
+                               std::chrono::milliseconds timeout,
+                               size_t max_reply_bytes);
+    void Reset();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
 
 /** One bounded POST. Includes DNS/connect/TLS/read in a single deadline.
  * Call only on a worker, never under wallet/chain/runtime locks or on the GUI
@@ -75,6 +101,12 @@ public:
         size_t worker_threads{2};
         size_t max_queue{32};
         std::chrono::milliseconds request_timeout{std::chrono::seconds{10}};
+        /** Sequential HTTP/1.1 reuse only. Idle connections remain within
+         * max_connections, and do not occupy handler workers. */
+        bool keep_alive{true};
+        std::chrono::milliseconds idle_timeout{std::chrono::seconds{30}};
+        std::chrono::milliseconds connection_lifetime{std::chrono::minutes{5}};
+        size_t max_requests_per_connection{128};
     };
     struct Request {
         std::string path;

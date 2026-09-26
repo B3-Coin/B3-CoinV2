@@ -18,6 +18,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -265,7 +266,7 @@ public:
 #endif
     }
 
-    std::string ReadRejection()
+    std::string ReadResponse(size_t body_bytes)
     {
         std::string response;
         const auto deadline{Clock::now() + std::chrono::seconds{2}};
@@ -276,10 +277,12 @@ public:
             if (result > 0) response.append(bytes.data(), result);
             else if (!Again(result, deadline)) break;
             const auto end{response.find("\r\n\r\n")};
-            if (end != std::string::npos && response.size() >= end + 4 + 32) break;
+            if (end != std::string::npos && response.size() >= end + 4 + body_bytes) break;
         }
         return response;
     }
+
+    std::string ReadRejection() { return ReadResponse(REJECTION_BODY.size()); }
 
     void NotifyClose()
     {
@@ -314,6 +317,301 @@ public:
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_https_tests, HttpsFixture)
+
+BOOST_AUTO_TEST_CASE(https_two_requests_share_tls_and_idle_connection_releases_worker)
+{
+    auto options{Options()};
+    options.worker_threads = 1;
+    std::atomic<unsigned int> handled{0};
+    node::FlowMeshHttpsServer server{options, [&](const auto&) {
+        ++handled;
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    SplitHttpsPeer peer{server.Port(), cert};
+    const std::string request{"POST /flowmesh/v1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n{}"};
+    BOOST_REQUIRE(peer.Send(request));
+    const auto first{peer.ReadResponse(2)};
+    BOOST_REQUIRE(first.starts_with("HTTP/1.1 200 "));
+    BOOST_CHECK_MESSAGE(first.find("Connection: close") == std::string::npos,
+                        "A complete valid request should keep its TLS connection reusable");
+    // The warm peer is idle. A single server worker must still service a
+    // different client rather than wait for this peer's next request.
+    const auto other{node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", "{}",
+        std::chrono::seconds{1}, 1024)};
+    BOOST_REQUIRE_MESSAGE(other.response_received, other.error);
+    BOOST_CHECK_EQUAL(other.status, 200);
+    BOOST_REQUIRE(peer.Send(request));
+    const auto second{peer.ReadResponse(2)};
+    BOOST_CHECK_MESSAGE(second.starts_with("HTTP/1.1 200 "), second);
+    BOOST_CHECK_EQUAL(handled.load(), 3U);
+    server.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_client_reuses_verified_connection_and_exact_request_bodies)
+{
+    std::atomic<unsigned int> handled{0};
+    node::FlowMeshHttpsServer server{Options(), [&](const auto& request) {
+        ++handled;
+        return node::FlowMeshHttpsServer::Response{200, request.body};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    node::FlowMeshHttpsClient client;
+    for (unsigned int i{0}; i < 4; ++i) {
+        const auto body{std::string{"{\"request\":"} + std::to_string(i) + "}"};
+        const auto result{client.Request(Endpoint(server), "/flowmesh/v1", body, std::chrono::seconds{2}, 1024)};
+        BOOST_REQUIRE_MESSAGE(result.response_received, result.error);
+        BOOST_CHECK_EQUAL(result.body, body);
+        BOOST_CHECK_EQUAL(result.connection_reused, i != 0);
+        BOOST_CHECK_EQUAL(result.tls_handshake_performed, i == 0);
+        BOOST_CHECK(result.request_may_have_been_sent);
+    }
+    BOOST_CHECK_EQUAL(handled.load(), 4U);
+    client.Reset();
+    const auto reset{client.Request(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(reset.response_received, reset.error);
+    BOOST_CHECK(!reset.connection_reused);
+    BOOST_CHECK(reset.tls_handshake_performed);
+}
+
+BOOST_AUTO_TEST_CASE(https_warm_response_loss_is_unknown_without_hidden_replay)
+{
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool release{false};
+    std::atomic<unsigned int> submits{0};
+    node::FlowMeshHttpsServer server{Options(), [&](const auto& request) {
+        if (request.body == "signed-original") {
+            ++submits;
+            std::unique_lock lock{mutex};
+            changed.wait_for(lock, std::chrono::seconds{2}, [&] { return release; });
+        }
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    node::FlowMeshHttpsClient client;
+    BOOST_REQUIRE(client.Request(Endpoint(server), "/flowmesh/v1", "warmup", std::chrono::seconds{2}, 1024).response_received);
+    const auto lost{client.Request(Endpoint(server), "/flowmesh/v1", "signed-original", std::chrono::milliseconds{150}, 1024)};
+    {
+        std::lock_guard lock{mutex};
+        release = true;
+    }
+    changed.notify_all();
+    BOOST_CHECK(lost.connection_reused);
+    BOOST_CHECK(!lost.tls_handshake_performed);
+    BOOST_CHECK(!lost.response_received);
+    BOOST_CHECK(lost.request_may_have_been_sent);
+    BOOST_CHECK_EQUAL(lost.error, "https-deadline");
+    BOOST_CHECK_EQUAL(submits.load(), 1U);
+    const auto status{client.Request(Endpoint(server), "/flowmesh/v1", "status-only", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(status.response_received, status.error);
+    BOOST_CHECK(!status.connection_reused);
+    BOOST_CHECK_EQUAL(submits.load(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(https_reuse_respects_close_legacy_and_request_limit)
+{
+    for (bool keep_alive : {false, true}) {
+        BOOST_TEST_CONTEXT("keep-alive=" << keep_alive) {
+            auto options{Options()};
+            options.keep_alive = keep_alive;
+            options.max_requests_per_connection = 2;
+            node::FlowMeshHttpsServer server{options, [](const auto&) {
+                return node::FlowMeshHttpsServer::Response{200, "{}"};
+            }};
+            std::string error;
+            BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+            node::FlowMeshHttpsClient client;
+            for (unsigned int i{0}; i < 3; ++i) {
+                const auto reply{client.Request(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+                BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+                BOOST_CHECK_EQUAL(reply.connection_reused, keep_alive && i == 1);
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(https_warm_second_request_bounds_reject_before_dispatch)
+{
+    auto options{Options()}; options.max_request_bytes = 32;
+    std::atomic<unsigned int> handled{0};
+    node::FlowMeshHttpsServer server{options, [&](const auto&) {
+        ++handled;
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    node::FlowMeshHttpsClient client;
+    BOOST_REQUIRE(client.Request(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024).response_received);
+    const auto rejected{client.Request(Endpoint(server), "/flowmesh/v1", std::string(64, 'x'), std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(rejected.response_received, rejected.error);
+    BOOST_CHECK_EQUAL(rejected.status, 413);
+    BOOST_CHECK(rejected.connection_reused);
+    BOOST_CHECK_EQUAL(handled.load(), 1U);
+    const auto next{client.Request(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(next.response_received, next.error);
+    BOOST_CHECK(!next.connection_reused);
+    BOOST_CHECK_EQUAL(handled.load(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(https_warm_pin_and_replaced_ca_revalidate_before_dispatch)
+{
+    std::atomic<unsigned int> handled{0};
+    node::FlowMeshHttpsServer server{Options(), [&](const auto&) {
+        ++handled;
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    node::FlowMeshHttpsClient client;
+    const auto endpoint{Endpoint(server)};
+    BOOST_REQUIRE(client.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024).response_received);
+    auto wrong_pin{endpoint}; wrong_pin.certificate_sha256 = std::string(64, '0');
+    const auto rejected{client.Request(wrong_pin, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_CHECK(!rejected.response_received);
+    BOOST_CHECK(!rejected.request_may_have_been_sent);
+    BOOST_CHECK_EQUAL(handled.load(), 1U);
+    BOOST_REQUIRE(client.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024).response_received);
+    // Same CA path and restored timestamp, but a different generated CA. A
+    // warm connection cannot silently keep authority from its earlier file.
+    const auto previous_time{fs::last_write_time(cert)};
+    std::string changed_pin;
+    CreateCertificate(cert, m_path_root / "replacement-test-key.pem", changed_pin, true);
+    fs::last_write_time(cert, previous_time);
+    const auto changed_ca{client.Request(endpoint, "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_CHECK(!changed_ca.response_received);
+    BOOST_CHECK(!changed_ca.request_may_have_been_sent);
+    BOOST_CHECK_EQUAL(handled.load(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(https_warm_malformed_second_message_never_dispatches_surplus)
+{
+    std::atomic<unsigned int> handled{0};
+    node::FlowMeshHttpsServer server{Options(), [&](const auto&) {
+        ++handled;
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    SplitHttpsPeer peer{server.Port(), cert};
+    const std::string valid{"POST /flowmesh/v1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"};
+    BOOST_REQUIRE(peer.Send(valid));
+    BOOST_REQUIRE(peer.ReadResponse(2).starts_with("HTTP/1.1 200 "));
+    const std::string invalid{"POST /flowmesh/v1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{}"};
+    BOOST_REQUIRE(peer.Send(invalid + valid));
+    BOOST_CHECK(peer.ReadRejection().starts_with("HTTP/1.1 400 "));
+    BOOST_CHECK_EQUAL(handled.load(), 1U);
+    peer.NotifyClose();
+    server.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_idle_connections_consume_capacity_and_expire_without_workers)
+{
+    auto options{Options()};
+    options.max_connections = 1;
+    options.worker_threads = 1;
+    options.idle_timeout = std::chrono::milliseconds{200};
+    std::atomic<unsigned int> handled{0};
+    node::FlowMeshHttpsServer server{options, [&](const auto&) {
+        ++handled;
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    SplitHttpsPeer peer{server.Port(), cert};
+    BOOST_REQUIRE(peer.Send("POST /flowmesh/v1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"));
+    BOOST_REQUIRE(peer.ReadResponse(2).starts_with("HTTP/1.1 200 "));
+    const auto full{node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{1}, 1024)};
+    BOOST_CHECK(!full.response_received);
+    BOOST_CHECK_EQUAL(handled.load(), 1U);
+    BOOST_REQUIRE(peer.AwaitSocketClose(std::chrono::seconds{1}));
+    const auto next{node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{1}, 1024)};
+    BOOST_REQUIRE_MESSAGE(next.response_received, next.error);
+    BOOST_CHECK_EQUAL(handled.load(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(https_warm_partial_request_retains_absolute_deadline)
+{
+    auto options{Options()};
+    options.request_timeout = std::chrono::milliseconds{200};
+    options.idle_timeout = std::chrono::seconds{2};
+    std::atomic<unsigned int> handled{0};
+    node::FlowMeshHttpsServer server{options, [&](const auto&) {
+        ++handled;
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    SplitHttpsPeer peer{server.Port(), cert};
+    BOOST_REQUIRE(peer.Send("POST /flowmesh/v1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"));
+    BOOST_REQUIRE(peer.ReadResponse(2).starts_with("HTTP/1.1 200 "));
+    BOOST_REQUIRE(peer.Send("P"));
+    BOOST_CHECK(peer.AwaitSocketClose(std::chrono::seconds{1}));
+    BOOST_CHECK_EQUAL(handled.load(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(https_idle_stop_closes_peers_and_same_server_reopens)
+{
+    auto options{Options()}; options.worker_threads = 1;
+    node::FlowMeshHttpsServer server{options, [](const auto&) {
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    node::FlowMeshHttpsClient client;
+    BOOST_REQUIRE(client.Request(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024).response_received);
+    const auto start{std::chrono::steady_clock::now()};
+    server.Stop();
+    BOOST_CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{1});
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    const auto next{client.Request(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(next.response_received, next.error);
+    BOOST_CHECK(!next.connection_reused);
+    BOOST_CHECK(next.tls_handshake_performed);
+}
+
+BOOST_AUTO_TEST_CASE(https_transport_only_paired_cold_warm_observations)
+{
+    // This measures generated loopback HTTPS exchanges, NOT matching, BFT,
+    // durable certification, Qt display or WAN trading latency. No speed gate.
+    node::FlowMeshHttpsServer server{Options(), [](const auto& request) {
+        return node::FlowMeshHttpsServer::Response{200, request.body};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    node::FlowMeshHttpsClient warm;
+    const auto endpoint{Endpoint(server)};
+    const std::string body(128, 'x');
+    BOOST_REQUIRE(warm.Request(endpoint, "/flowmesh/v1", body, std::chrono::seconds{2}, 1024).response_received);
+    std::vector<double> cold_us, warm_us;
+    for (unsigned int i{0}; i < 16; ++i) {
+        const auto before{std::chrono::steady_clock::now()};
+        const auto cold{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1", body, std::chrono::seconds{2}, 1024)};
+        const auto middle{std::chrono::steady_clock::now()};
+        const auto retained{warm.Request(endpoint, "/flowmesh/v1", body, std::chrono::seconds{2}, 1024)};
+        const auto after{std::chrono::steady_clock::now()};
+        BOOST_REQUIRE_MESSAGE(cold.response_received, cold.error);
+        BOOST_REQUIRE_MESSAGE(retained.response_received, retained.error);
+        BOOST_CHECK_EQUAL(cold.body, body);
+        BOOST_CHECK_EQUAL(retained.body, body);
+        BOOST_CHECK(cold.tls_handshake_performed);
+        BOOST_CHECK(retained.connection_reused);
+        BOOST_CHECK(!retained.tls_handshake_performed);
+        cold_us.push_back(std::chrono::duration<double, std::micro>(middle - before).count());
+        warm_us.push_back(std::chrono::duration<double, std::micro>(after - middle).count());
+    }
+    // Emit only after the observations to avoid per-exchange logging overhead.
+    for (unsigned int i{0}; i < cold_us.size(); ++i) {
+        BOOST_TEST_MESSAGE("TRANSPORT_ONLY_SAMPLE index=" << i << " cold_us=" << cold_us[i] << " warm_us=" << warm_us[i]);
+    }
+    std::sort(cold_us.begin(), cold_us.end());
+    std::sort(warm_us.begin(), warm_us.end());
+    BOOST_TEST_MESSAGE("TRANSPORT_ONLY_MEDIAN samples=16 cold_us=" << (cold_us[7] + cold_us[8]) / 2
+        << " warm_us=" << (warm_us[7] + warm_us[8]) / 2 << " cold_handshakes=16 warm_handshakes=0");
+}
 
 BOOST_AUTO_TEST_CASE(https_origin_normalization_preserves_trust_and_rejects_credentials)
 {
