@@ -1,0 +1,5363 @@
+{
+  "tested_source": "2aa8587b9b9e449fbe9928e3e73c3edb4faed97f",
+  "hardware": {
+    "cpu": "Apple M4 Max",
+    "cpus": 16,
+    "memory_bytes": 137438953472,
+    "os": "macOS 26.5.2 (25F84)"
+  },
+  "campaigns": [
+    {
+      "label": "A",
+      "manifest": {
+        "profile": "native-fast-view0-v1",
+        "binary_sha256": "f814d8019ead50b77981cfe7de59cb39157130025d3be0c59bc5676072410238",
+        "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+        "started_unix": 1790394277.0553322,
+        "samples": 40,
+        "warmup": 2,
+        "boundary": "original signing + outbox sync to verified proof + terminal outbox sync",
+        "excluded": [
+          "Qt",
+          "HTTPS",
+          "B3 node/reconciliation",
+          "native view-change",
+          "WAN",
+          "power-loss"
+        ]
+      },
+      "summary": {
+        "status": "PASS",
+        "exits": {
+          "client": 0,
+          "seat0": 0,
+          "seat3": 0,
+          "seat2": 0,
+          "seat1": 0
+        },
+        "warmup": 2,
+        "measured": 40,
+        "reopened": [
+          {
+            "event": "reopened",
+            "seat": 0,
+            "committed": 42,
+            "state_root": "a06e3b9fadfb3a7e08d3145520294108da6f5230aaeea7460d3d68a1021ce290"
+          },
+          {
+            "event": "reopened",
+            "seat": 1,
+            "committed": 42,
+            "state_root": "a06e3b9fadfb3a7e08d3145520294108da6f5230aaeea7460d3d68a1021ce290"
+          },
+          {
+            "event": "reopened",
+            "seat": 2,
+            "committed": 42,
+            "state_root": "a06e3b9fadfb3a7e08d3145520294108da6f5230aaeea7460d3d68a1021ce290"
+          },
+          {
+            "event": "reopened",
+            "seat": 3,
+            "committed": 42,
+            "state_root": "a06e3b9fadfb3a7e08d3145520294108da6f5230aaeea7460d3d68a1021ce290"
+          }
+        ],
+        "latency": {
+          "verified_us": {
+            "n": 40,
+            "median_ms": 61.668,
+            "p95_ms": 80.452,
+            "min_ms": 55.225,
+            "max_ms": 1377.839
+          },
+          "client_durable_us": {
+            "n": 40,
+            "median_ms": 78.6065,
+            "p95_ms": 97.896,
+            "min_ms": 72.261,
+            "max_ms": 1625.114
+          },
+          "all_replicas_observed_us": {
+            "n": 40,
+            "median_ms": 80.3355,
+            "p95_ms": 99.256,
+            "min_ms": 73.482,
+            "max_ms": 1627.499
+          }
+        }
+      },
+      "client_samples": [
+        {
+          "event": "sample",
+          "index": 0,
+          "action_id": "15caf1f65044d68afa134e75b07afa840a4d4c83d2e1b35a0407c93b1b3d7223",
+          "sequence": 1,
+          "signed_us": 72,
+          "outbox_ready_us": 5010,
+          "received_us": 51632,
+          "verified_us": 53014,
+          "client_durable_us": 63424,
+          "all_replicas_observed_us": 77410,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 1,
+          "action_id": "36d50ddfc32466fca25a7420122763aebc776aa66e7e3de80d09bb12e4dd1b2f",
+          "sequence": 2,
+          "signed_us": 177,
+          "outbox_ready_us": 6524,
+          "received_us": 58575,
+          "verified_us": 60231,
+          "client_durable_us": 74071,
+          "all_replicas_observed_us": 75148,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 2,
+          "action_id": "b315a6115644a4584c9a12e3b64deb49bea23f37a7fc970254954a92a7971c2a",
+          "sequence": 3,
+          "signed_us": 156,
+          "outbox_ready_us": 6316,
+          "received_us": 53972,
+          "verified_us": 55759,
+          "client_durable_us": 74402,
+          "all_replicas_observed_us": 75615,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 3,
+          "action_id": "cd8f73456514e054671d69eb5ddc4b418a1ec75e5e56f9a4e3d3739aaaf78f16",
+          "sequence": 4,
+          "signed_us": 244,
+          "outbox_ready_us": 7039,
+          "received_us": 58231,
+          "verified_us": 60032,
+          "client_durable_us": 73778,
+          "all_replicas_observed_us": 74880,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 4,
+          "action_id": "15e0e3d83c2d26652b770d53ba763fac0b89b014ff3c9328f6ac4d11179ccadd",
+          "sequence": 5,
+          "signed_us": 135,
+          "outbox_ready_us": 5343,
+          "received_us": 53108,
+          "verified_us": 55225,
+          "client_durable_us": 72261,
+          "all_replicas_observed_us": 73482,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 5,
+          "action_id": "fdf8c5e5b0aa7adba10b0f9a3ad55c38bb0d9a25ab5d138e61769435e6b5c607",
+          "sequence": 6,
+          "signed_us": 151,
+          "outbox_ready_us": 7240,
+          "received_us": 53966,
+          "verified_us": 56004,
+          "client_durable_us": 74114,
+          "all_replicas_observed_us": 75467,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 6,
+          "action_id": "6704baed5e5dbc85948315374c66bc2f70aac9e10e4146bb711abb0209d2435d",
+          "sequence": 7,
+          "signed_us": 159,
+          "outbox_ready_us": 4379,
+          "received_us": 57495,
+          "verified_us": 59758,
+          "client_durable_us": 74820,
+          "all_replicas_observed_us": 76177,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 7,
+          "action_id": "3fcfe5de22fca841c2e0f50db1c9ca3d303f7dbb331800ef61e23692090c98aa",
+          "sequence": 8,
+          "signed_us": 134,
+          "outbox_ready_us": 6019,
+          "received_us": 56768,
+          "verified_us": 58783,
+          "client_durable_us": 79919,
+          "all_replicas_observed_us": 81287,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 8,
+          "action_id": "9a2d3183f6d975f36fada0aa7a246f184eb137e466748575fde9b51f07b70e75",
+          "sequence": 9,
+          "signed_us": 125,
+          "outbox_ready_us": 4051,
+          "received_us": 53180,
+          "verified_us": 55811,
+          "client_durable_us": 75350,
+          "all_replicas_observed_us": 76708,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 9,
+          "action_id": "09d199bddf5209645ffa2e33063aeeee0abe70fdce492ab5feaae282bcf18506",
+          "sequence": 10,
+          "signed_us": 103,
+          "outbox_ready_us": 5993,
+          "received_us": 58670,
+          "verified_us": 61383,
+          "client_durable_us": 80902,
+          "all_replicas_observed_us": 82483,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 10,
+          "action_id": "46bc6adb8906a2d9e7dae3aa8b0ec925a2a21b75deeb4b3d427c95cccaf43303",
+          "sequence": 11,
+          "signed_us": 117,
+          "outbox_ready_us": 4830,
+          "received_us": 63873,
+          "verified_us": 66482,
+          "client_durable_us": 89582,
+          "all_replicas_observed_us": 91167,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 11,
+          "action_id": "49a3ddee000dbdc1a5ff10c9f9f73a730d99de4f66a098db6ce2a4b6527b88ef",
+          "sequence": 12,
+          "signed_us": 117,
+          "outbox_ready_us": 6765,
+          "received_us": 60029,
+          "verified_us": 62664,
+          "client_durable_us": 83932,
+          "all_replicas_observed_us": 85532,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 12,
+          "action_id": "dc1e3b7e2f206a5b8135a3410f0ed097f6c6d81b331837977ef2231c7a29ee78",
+          "sequence": 13,
+          "signed_us": 120,
+          "outbox_ready_us": 5891,
+          "received_us": 62001,
+          "verified_us": 64661,
+          "client_durable_us": 84271,
+          "all_replicas_observed_us": 85913,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 13,
+          "action_id": "0f018f4fc84847834e81cd2d7d844af1b1429238136f99c1f7c8866bdf8a3894",
+          "sequence": 14,
+          "signed_us": 244,
+          "outbox_ready_us": 7770,
+          "received_us": 60943,
+          "verified_us": 63537,
+          "client_durable_us": 76346,
+          "all_replicas_observed_us": 77705,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 14,
+          "action_id": "7a9c957750d9aafb84af19553374bf70aedd27e692e0755cc8b695284d81587f",
+          "sequence": 15,
+          "signed_us": 121,
+          "outbox_ready_us": 5094,
+          "received_us": 63706,
+          "verified_us": 66250,
+          "client_durable_us": 87098,
+          "all_replicas_observed_us": 88676,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 15,
+          "action_id": "386b3b39190921067588812b35f80597d8cb5adbc43aabca580173aa95cf6da0",
+          "sequence": 16,
+          "signed_us": 120,
+          "outbox_ready_us": 4731,
+          "received_us": 57925,
+          "verified_us": 59875,
+          "client_durable_us": 73854,
+          "all_replicas_observed_us": 75771,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 16,
+          "action_id": "1fee9f90f7190deb87c9194924e680983404fc991c7be7a674e5dd2d22ff70e5",
+          "sequence": 17,
+          "signed_us": 76,
+          "outbox_ready_us": 6075,
+          "received_us": 55198,
+          "verified_us": 56652,
+          "client_durable_us": 76493,
+          "all_replicas_observed_us": 77432,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 17,
+          "action_id": "90d302b2449d9c286d65a929d0315f6d85cf724ebd77c1ed58c6871fb83e4798",
+          "sequence": 18,
+          "signed_us": 69,
+          "outbox_ready_us": 4551,
+          "received_us": 58409,
+          "verified_us": 60198,
+          "client_durable_us": 82199,
+          "all_replicas_observed_us": 83338,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 18,
+          "action_id": "82f91c5e50fdb681472cd84c90505ba9957a28063ffdda45d1415d8851961080",
+          "sequence": 19,
+          "signed_us": 87,
+          "outbox_ready_us": 6205,
+          "received_us": 62752,
+          "verified_us": 64805,
+          "client_durable_us": 77348,
+          "all_replicas_observed_us": 79882,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 19,
+          "action_id": "c6e6870bcf17ce4e4ba6431e403babcbd567e5e8cb9d0ab9bf29f8fc56a0c369",
+          "sequence": 20,
+          "signed_us": 88,
+          "outbox_ready_us": 5890,
+          "received_us": 60562,
+          "verified_us": 62555,
+          "client_durable_us": 83749,
+          "all_replicas_observed_us": 85125,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 20,
+          "action_id": "f5a41a77aa59a491b683f8357b957f20e90e2006c1d83d76ee9e974ae0469c21",
+          "sequence": 21,
+          "signed_us": 96,
+          "outbox_ready_us": 5150,
+          "received_us": 726453,
+          "verified_us": 729165,
+          "client_durable_us": 1625114,
+          "all_replicas_observed_us": 1627499,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 21,
+          "action_id": "6d7e08f1490d6f7f7c824aba2acf958b9fe5b5541118b9d11820429d2ecde589",
+          "sequence": 22,
+          "signed_us": 233,
+          "outbox_ready_us": 223094,
+          "received_us": 1375205,
+          "verified_us": 1377839,
+          "client_durable_us": 1398251,
+          "all_replicas_observed_us": 1399829,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 22,
+          "action_id": "9b230677015fe20c0189504c0a09e242b5989c977dcc3d38c245fa2fd50a31b8",
+          "sequence": 23,
+          "signed_us": 119,
+          "outbox_ready_us": 5924,
+          "received_us": 60120,
+          "verified_us": 62609,
+          "client_durable_us": 77542,
+          "all_replicas_observed_us": 78952,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 23,
+          "action_id": "d15cff0cd5ee4d2b33c0f0a37aaf78dd438590b7c2010b7e0af422ad92a4a48f",
+          "sequence": 24,
+          "signed_us": 114,
+          "outbox_ready_us": 6015,
+          "received_us": 59714,
+          "verified_us": 61953,
+          "client_durable_us": 80937,
+          "all_replicas_observed_us": 82515,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 24,
+          "action_id": "3e62fadcbac7b621ffe0939c18f27f142e49dd0e4b60170914cb8288c1fb56ae",
+          "sequence": 25,
+          "signed_us": 114,
+          "outbox_ready_us": 7828,
+          "received_us": 58548,
+          "verified_us": 61028,
+          "client_durable_us": 77057,
+          "all_replicas_observed_us": 78422,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 25,
+          "action_id": "1191b8efdb7f4cdc17cad628a3bee1a197d32de2246ac2cb72911c6764224c5a",
+          "sequence": 26,
+          "signed_us": 112,
+          "outbox_ready_us": 4990,
+          "received_us": 64671,
+          "verified_us": 67047,
+          "client_durable_us": 85898,
+          "all_replicas_observed_us": 87261,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 26,
+          "action_id": "59ae2ea13e9434276b1a91602b2a8d36d5c63d3f6a53a28ac371838f65e60727",
+          "sequence": 27,
+          "signed_us": 100,
+          "outbox_ready_us": 7081,
+          "received_us": 55712,
+          "verified_us": 58012,
+          "client_durable_us": 88924,
+          "all_replicas_observed_us": 90520,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 27,
+          "action_id": "5d359510851d13bbad314a72ec805a001968b595502a5d9f6dfb222abadce5c1",
+          "sequence": 28,
+          "signed_us": 117,
+          "outbox_ready_us": 9729,
+          "received_us": 78188,
+          "verified_us": 80452,
+          "client_durable_us": 97896,
+          "all_replicas_observed_us": 99256,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 28,
+          "action_id": "42eebc93998ae925b8564539cb108c68a92a92e245005963fde30fb6da1d57b4",
+          "sequence": 29,
+          "signed_us": 111,
+          "outbox_ready_us": 9323,
+          "received_us": 65359,
+          "verified_us": 67617,
+          "client_durable_us": 88710,
+          "all_replicas_observed_us": 90069,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 29,
+          "action_id": "1ebc5a374b1f5f6e302b532eefc894cf48288e15d3e2f620f3e313d7ee95f070",
+          "sequence": 30,
+          "signed_us": 102,
+          "outbox_ready_us": 4271,
+          "received_us": 55761,
+          "verified_us": 58016,
+          "client_durable_us": 73230,
+          "all_replicas_observed_us": 74605,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 30,
+          "action_id": "97a99ef3c63881943c7b970e13e67cab6d0951004ad0d45ed6da679bd77eba95",
+          "sequence": 31,
+          "signed_us": 101,
+          "outbox_ready_us": 6281,
+          "received_us": 77539,
+          "verified_us": 79893,
+          "client_durable_us": 91508,
+          "all_replicas_observed_us": 97577,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 31,
+          "action_id": "d56b6e6b96d0722fa98f759360d6148204643a13840d397da9f58a6f2494bdd4",
+          "sequence": 32,
+          "signed_us": 103,
+          "outbox_ready_us": 5989,
+          "received_us": 61189,
+          "verified_us": 63424,
+          "client_durable_us": 82332,
+          "all_replicas_observed_us": 83725,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 32,
+          "action_id": "5d751b38a93a6db26fb14e0779b1eefe00468c7ea74aac748d567f2b4fd072d0",
+          "sequence": 33,
+          "signed_us": 95,
+          "outbox_ready_us": 7394,
+          "received_us": 60109,
+          "verified_us": 62499,
+          "client_durable_us": 75712,
+          "all_replicas_observed_us": 77294,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 33,
+          "action_id": "0adeae0909b78788f598a8ed373524cb5971ce9aaedaa118c18298009ff37a45",
+          "sequence": 34,
+          "signed_us": 107,
+          "outbox_ready_us": 5807,
+          "received_us": 56480,
+          "verified_us": 57702,
+          "client_durable_us": 73889,
+          "all_replicas_observed_us": 74710,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 34,
+          "action_id": "ac4f0bb37783a70292159bdf32cc4d736da4bedc0e4237c3b4ff739aff6bcca9",
+          "sequence": 35,
+          "signed_us": 89,
+          "outbox_ready_us": 6591,
+          "received_us": 70053,
+          "verified_us": 72498,
+          "client_durable_us": 86716,
+          "all_replicas_observed_us": 88312,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 35,
+          "action_id": "facf2344543b24291257bb6effbb26b7b1080863b8e9f8ed0ffd773836af4486",
+          "sequence": 36,
+          "signed_us": 111,
+          "outbox_ready_us": 5833,
+          "received_us": 58409,
+          "verified_us": 60687,
+          "client_durable_us": 77722,
+          "all_replicas_observed_us": 79295,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 36,
+          "action_id": "2d53cb7c37ced572d37efe9314107a8b3e8f7ed84bfb92737918e49da356be59",
+          "sequence": 37,
+          "signed_us": 119,
+          "outbox_ready_us": 6930,
+          "received_us": 56638,
+          "verified_us": 58888,
+          "client_durable_us": 77807,
+          "all_replicas_observed_us": 79168,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 37,
+          "action_id": "ce8bfceb38f32919ada406f070e7eec30f9880c746344f012a92b160e51ecffd",
+          "sequence": 38,
+          "signed_us": 104,
+          "outbox_ready_us": 4358,
+          "received_us": 60014,
+          "verified_us": 62424,
+          "client_durable_us": 77238,
+          "all_replicas_observed_us": 78608,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 38,
+          "action_id": "3d8c76cf7ff1d66c2e3eeba6a40adfd9fb0b3088f7b77a0df93922e93f4cfa9f",
+          "sequence": 39,
+          "signed_us": 100,
+          "outbox_ready_us": 6079,
+          "received_us": 54725,
+          "verified_us": 56606,
+          "client_durable_us": 74934,
+          "all_replicas_observed_us": 76151,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 39,
+          "action_id": "34e9ffdaec31f53e65a7b642e162a25b1fe3493c8dc6be6b43bb03b2b42704f7",
+          "sequence": 40,
+          "signed_us": 91,
+          "outbox_ready_us": 7220,
+          "received_us": 63997,
+          "verified_us": 66241,
+          "client_durable_us": 85970,
+          "all_replicas_observed_us": 87403,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 40,
+          "action_id": "db22c0d2bcc566c12251eccad3a03951d367f711120949206b44627184554895",
+          "sequence": 41,
+          "signed_us": 99,
+          "outbox_ready_us": 5973,
+          "received_us": 59047,
+          "verified_us": 61263,
+          "client_durable_us": 79406,
+          "all_replicas_observed_us": 80789,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 41,
+          "action_id": "0bac2b74f1050df9094d9786d949d32733d9097d445ea90371a6935be2625753",
+          "sequence": 42,
+          "signed_us": 98,
+          "outbox_ready_us": 4243,
+          "received_us": 56326,
+          "verified_us": 58207,
+          "client_durable_us": 73692,
+          "all_replicas_observed_us": 74630,
+          "quantity": 1,
+          "fee": 10
+        }
+      ],
+      "replica_stage_durations": [
+        {
+          "event": "replicas_applied",
+          "sequence": 1,
+          "state_root": "418bacf2bd25cfdbfac6e12c00ae1f756265ba4d155a39f2dea463ca6da3b5bc",
+          "node_us": [
+            [
+              602,
+              4771,
+              613,
+              5860,
+              1198,
+              4179,
+              19,
+              28999
+            ],
+            [
+              698,
+              6602,
+              652,
+              13268,
+              1233,
+              16053,
+              16,
+              0
+            ],
+            [
+              685,
+              13145,
+              652,
+              11304,
+              1145,
+              5216,
+              10,
+              0
+            ],
+            [
+              692,
+              13121,
+              653,
+              11320,
+              1213,
+              22589,
+              10,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 2,
+          "state_root": "96ef5522fe8917df31a91015d35fffbf3ead43ba226fd00b4f1f1e4062365363",
+          "node_us": [
+            [
+              844,
+              6358,
+              820,
+              5900,
+              1377,
+              8106,
+              33,
+              28264
+            ],
+            [
+              839,
+              5222,
+              835,
+              11045,
+              1392,
+              4202,
+              24,
+              0
+            ],
+            [
+              830,
+              10632,
+              819,
+              12136,
+              1386,
+              8631,
+              26,
+              0
+            ],
+            [
+              829,
+              10611,
+              830,
+              19628,
+              1392,
+              8619,
+              27,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 3,
+          "state_root": "5111eef252961c2a9257660df394ebdc24080dd3618ece9b1c429d1d19ae8f64",
+          "node_us": [
+            [
+              968,
+              6526,
+              914,
+              7546,
+              1510,
+              5608,
+              14,
+              24190
+            ],
+            [
+              996,
+              6730,
+              898,
+              8342,
+              1512,
+              5908,
+              13,
+              0
+            ],
+            [
+              979,
+              11122,
+              917,
+              8368,
+              1514,
+              5881,
+              16,
+              0
+            ],
+            [
+              979,
+              6716,
+              898,
+              8341,
+              1509,
+              12279,
+              13,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 4,
+          "state_root": "1aa88ffd1d298dfa6804250162b370436f3d27046a9a81393e771a651e6222b5",
+          "node_us": [
+            [
+              1083,
+              4333,
+              1010,
+              4687,
+              1679,
+              8665,
+              15,
+              29279
+            ],
+            [
+              1102,
+              10112,
+              1127,
+              18163,
+              1603,
+              9500,
+              13,
+              0
+            ],
+            [
+              1088,
+              10127,
+              1124,
+              11824,
+              1529,
+              4823,
+              16,
+              0
+            ],
+            [
+              1084,
+              4550,
+              997,
+              10999,
+              1569,
+              9496,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 5,
+          "state_root": "ae0a3464776386c17023ca0e121e6914afcf817f61f9d11b5bfe5a0a4cee9b26",
+          "node_us": [
+            [
+              986,
+              5353,
+              906,
+              6545,
+              1679,
+              4561,
+              28,
+              27222
+            ],
+            [
+              1130,
+              6682,
+              1038,
+              10751,
+              1778,
+              5621,
+              24,
+              0
+            ],
+            [
+              1139,
+              14026,
+              1100,
+              8092,
+              1747,
+              11008,
+              27,
+              0
+            ],
+            [
+              1114,
+              6678,
+              1043,
+              10758,
+              1684,
+              5671,
+              27,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 6,
+          "state_root": "55c7df6e49626324bbc7900abceb0a8d7e6fb82c84be484047d4873e19e7b580",
+          "node_us": [
+            [
+              1199,
+              7159,
+              1124,
+              4299,
+              1685,
+              6703,
+              17,
+              24104
+            ],
+            [
+              1208,
+              4536,
+              1165,
+              8787,
+              1814,
+              6485,
+              13,
+              0
+            ],
+            [
+              1217,
+              4562,
+              1169,
+              8784,
+              1763,
+              13990,
+              16,
+              0
+            ],
+            [
+              1226,
+              8998,
+              1126,
+              9779,
+              1728,
+              6534,
+              17,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 7,
+          "state_root": "dce0d0c4ad397adf456e11321eccdafe84f35442bc1c4d6ceaaa65e2dac3def0",
+          "node_us": [
+            [
+              1210,
+              5155,
+              1145,
+              5380,
+              1914,
+              4803,
+              17,
+              33092
+            ],
+            [
+              1218,
+              6266,
+              1123,
+              11838,
+              1908,
+              4472,
+              17,
+              0
+            ],
+            [
+              1217,
+              6249,
+              1126,
+              19261,
+              1929,
+              9873,
+              16,
+              0
+            ],
+            [
+              1220,
+              12816,
+              1123,
+              17183,
+              1974,
+              9804,
+              17,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 8,
+          "state_root": "122b12259aa940e0b5b3e8c0ad8825e23d2d14979cdf4fb153a945c22dde7a8c",
+          "node_us": [
+            [
+              1209,
+              7456,
+              1301,
+              6905,
+              1697,
+              5630,
+              24,
+              26048
+            ],
+            [
+              1443,
+              9646,
+              1107,
+              8846,
+              1745,
+              14103,
+              20,
+              0
+            ],
+            [
+              1414,
+              4921,
+              1072,
+              8148,
+              1694,
+              6697,
+              27,
+              0
+            ],
+            [
+              1439,
+              9692,
+              1065,
+              8881,
+              1691,
+              14104,
+              21,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 9,
+          "state_root": "15b90af990e5d03e3bb4b5455bbddab328d052beedca0f5832b1836a9e15e732",
+          "node_us": [
+            [
+              1211,
+              4488,
+              1128,
+              4435,
+              1894,
+              5371,
+              16,
+              30134
+            ],
+            [
+              1218,
+              5321,
+              1123,
+              10736,
+              1989,
+              8202,
+              19,
+              0
+            ],
+            [
+              1213,
+              10601,
+              1131,
+              11891,
+              1956,
+              3808,
+              37,
+              0
+            ],
+            [
+              1205,
+              10564,
+              1142,
+              18333,
+              2160,
+              14221,
+              19,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 10,
+          "state_root": "b6f34e32deeaaa6646aa9cef2011d17658f382f843f38d192884007d6395484e",
+          "node_us": [
+            [
+              1200,
+              7226,
+              1302,
+              7146,
+              1995,
+              6054,
+              19,
+              27267
+            ],
+            [
+              1399,
+              9488,
+              1301,
+              9019,
+              2208,
+              6237,
+              16,
+              0
+            ],
+            [
+              1393,
+              9478,
+              1312,
+              8995,
+              2251,
+              12540,
+              20,
+              0
+            ],
+            [
+              1390,
+              4801,
+              1303,
+              7910,
+              2250,
+              12529,
+              21,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 11,
+          "state_root": "dc3ddf6467de27e8bb2c0422c42012099cfa494a82551d8e19d3bbf049b0fd7b",
+          "node_us": [
+            [
+              1434,
+              4243,
+              1325,
+              5228,
+              2184,
+              4977,
+              24,
+              39091
+            ],
+            [
+              1394,
+              17543,
+              1324,
+              17019,
+              2200,
+              5120,
+              20,
+              0
+            ],
+            [
+              1391,
+              5730,
+              1323,
+              17091,
+              2244,
+              10479,
+              19,
+              0
+            ],
+            [
+              1392,
+              11099,
+              1299,
+              19119,
+              2279,
+              16949,
+              19,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 12,
+          "state_root": "0c70fd6679ae87714318d82dfc92e9cdde47e972e8d4ec7f4f255589cc2a8c98",
+          "node_us": [
+            [
+              1397,
+              7002,
+              1554,
+              4846,
+              2185,
+              6858,
+              22,
+              28880
+            ],
+            [
+              1656,
+              10172,
+              1566,
+              9305,
+              2189,
+              7169,
+              22,
+              0
+            ],
+            [
+              1653,
+              10150,
+              1569,
+              15856,
+              2195,
+              11510,
+              21,
+              0
+            ],
+            [
+              1629,
+              4703,
+              1307,
+              9633,
+              2186,
+              16211,
+              19,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 13,
+          "state_root": "05bed8e65c832ad6ecb15f06503e24ac4c6e1d571b08f6b79e7d58f57ef733cc",
+          "node_us": [
+            [
+              1394,
+              5916,
+              1558,
+              6862,
+              2212,
+              5327,
+              22,
+              32260
+            ],
+            [
+              1665,
+              14767,
+              1550,
+              7572,
+              2248,
+              6051,
+              18,
+              0
+            ],
+            [
+              1643,
+              7314,
+              1445,
+              10393,
+              2225,
+              13304,
+              19,
+              0
+            ],
+            [
+              1632,
+              14802,
+              1619,
+              11938,
+              2191,
+              13303,
+              19,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 14,
+          "state_root": "6d95ad5453c8edfba2abf14531c2ebef6fa24905a17e00d5f73dd1b52a5d84ae",
+          "node_us": [
+            [
+              1450,
+              4755,
+              1298,
+              4512,
+              1911,
+              7929,
+              23,
+              30745
+            ],
+            [
+              1554,
+              10964,
+              1302,
+              10681,
+              2193,
+              4047,
+              16,
+              0
+            ],
+            [
+              1539,
+              10977,
+              1307,
+              17080,
+              2189,
+              8814,
+              20,
+              0
+            ],
+            [
+              1530,
+              5516,
+              1314,
+              9611,
+              2195,
+              8790,
+              19,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 15,
+          "state_root": "e1f31a723a2369cf14506688c094705ef621f65bd6db954ded872be00a6e5b28",
+          "node_us": [
+            [
+              1211,
+              6179,
+              1313,
+              6232,
+              2033,
+              5834,
+              21,
+              35345
+            ],
+            [
+              1397,
+              6760,
+              1304,
+              15372,
+              2150,
+              6316,
+              18,
+              0
+            ],
+            [
+              1392,
+              18591,
+              1303,
+              13414,
+              2142,
+              6292,
+              18,
+              0
+            ],
+            [
+              1386,
+              14188,
+              1350,
+              12290,
+              2133,
+              13756,
+              18,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 16,
+          "state_root": "e61ba56d3a560b303ff0259eb9efefcdc2b2a586cd09b5c611f617959cce5bb1",
+          "node_us": [
+            [
+              1385,
+              4317,
+              1307,
+              5141,
+              1712,
+              6589,
+              17,
+              32193
+            ],
+            [
+              1411,
+              11409,
+              1428,
+              19854,
+              1590,
+              4086,
+              12,
+              0
+            ],
+            [
+              1393,
+              11410,
+              1440,
+              12385,
+              1847,
+              14168,
+              12,
+              0
+            ],
+            [
+              1391,
+              5812,
+              1338,
+              10649,
+              1687,
+              8427,
+              13,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 17,
+          "state_root": "370a2bbb0629468d09eeaed148edd5f2b9f572b20723ddafbbf5a930961ce676",
+          "node_us": [
+            [
+              768,
+              6633,
+              690,
+              6887,
+              1196,
+              7463,
+              19,
+              25106
+            ],
+            [
+              713,
+              7522,
+              655,
+              12954,
+              1207,
+              12667,
+              40,
+              0
+            ],
+            [
+              702,
+              7539,
+              653,
+              8462,
+              1201,
+              6224,
+              37,
+              0
+            ],
+            [
+              699,
+              11879,
+              686,
+              14044,
+              1207,
+              12621,
+              44,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 18,
+          "state_root": "ef09e14f5ac20eaf4c2ba92f908a964ea13540a890bb903eaa71ddb7a72d1e3c",
+          "node_us": [
+            [
+              899,
+              4700,
+              845,
+              4666,
+              1504,
+              4943,
+              26,
+              35908
+            ],
+            [
+              892,
+              5155,
+              825,
+              17576,
+              1620,
+              15641,
+              14,
+              0
+            ],
+            [
+              879,
+              10565,
+              924,
+              19452,
+              1541,
+              4866,
+              17,
+              0
+            ],
+            [
+              881,
+              17036,
+              925,
+              17350,
+              1547,
+              10263,
+              28,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 19,
+          "state_root": "58d2472a4683bcc3a5a61dc9c6181ffba7e5afc289e511e5f19b662fce7e3c99",
+          "node_us": [
+            [
+              1069,
+              7242,
+              1007,
+              4427,
+              1685,
+              8727,
+              27,
+              31959
+            ],
+            [
+              1074,
+              8441,
+              1039,
+              16334,
+              1788,
+              4523,
+              14,
+              0
+            ],
+            [
+              1062,
+              13818,
+              1126,
+              17184,
+              1894,
+              12716,
+              14,
+              0
+            ],
+            [
+              1079,
+              4008,
+              1017,
+              14386,
+              1916,
+              8181,
+              15,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 20,
+          "state_root": "eafbf8de169ce70d3e8704f7fb1379c0566a2353bd6c77fa1a2c57739a2f53f6",
+          "node_us": [
+            [
+              1057,
+              6020,
+              1017,
+              5755,
+              1884,
+              5526,
+              34,
+              32960
+            ],
+            [
+              1186,
+              6433,
+              1122,
+              14565,
+              1762,
+              14050,
+              17,
+              0
+            ],
+            [
+              1187,
+              13860,
+              1122,
+              11578,
+              1713,
+              14095,
+              16,
+              0
+            ],
+            [
+              1196,
+              18228,
+              1183,
+              12557,
+              1683,
+              7358,
+              22,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 21,
+          "state_root": "14e7a1bd1fbbc09535a1704ea381645bd59723b187c97817912d023b66f6d22b",
+          "node_us": [
+            [
+              1066,
+              4550,
+              1125,
+              4328,
+              2257,
+              431714,
+              36,
+              273463
+            ],
+            [
+              1206,
+              31779,
+              1337,
+              445817,
+              3675,
+              447125,
+              37,
+              0
+            ],
+            [
+              1195,
+              5342,
+              1127,
+              250679,
+              3163,
+              222259,
+              39,
+              0
+            ],
+            [
+              1202,
+              5334,
+              1120,
+              250693,
+              2321,
+              671509,
+              32,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 22,
+          "state_root": "b0d3988d4daea0cebf6ffafc05fd4a43589447a599c435e5fe6863ccb1e7e892",
+          "node_us": [
+            [
+              2179,
+              222639,
+              4397,
+              220543,
+              2215,
+              6542,
+              24,
+              692493
+            ],
+            [
+              4324,
+              659992,
+              2538,
+              22116,
+              2257,
+              6999,
+              20,
+              0
+            ],
+            [
+              4160,
+              217406,
+              3628,
+              454206,
+              2262,
+              6953,
+              21,
+              0
+            ],
+            [
+              4404,
+              441642,
+              3878,
+              234185,
+              2311,
+              13356,
+              24,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 23,
+          "state_root": "64dc952ed956e5e1a6194f018d9d57ee3cae7729647c4ca620e02a386c1a6064",
+          "node_us": [
+            [
+              1409,
+              5042,
+              1330,
+              5153,
+              2165,
+              5781,
+              18,
+              32717
+            ],
+            [
+              1421,
+              12163,
+              1330,
+              18981,
+              2199,
+              9829,
+              20,
+              0
+            ],
+            [
+              1391,
+              6129,
+              1364,
+              11283,
+              2043,
+              9960,
+              19,
+              0
+            ],
+            [
+              1383,
+              6078,
+              1307,
+              17814,
+              2024,
+              5455,
+              19,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 24,
+          "state_root": "1103276a93a2010ecd5f825b5a09acc5dcfd72558be7b5dc2f0511be8ad27978",
+          "node_us": [
+            [
+              1414,
+              7357,
+              1319,
+              6817,
+              2200,
+              5430,
+              21,
+              28650
+            ],
+            [
+              1388,
+              7722,
+              1317,
+              7827,
+              1899,
+              6380,
+              19,
+              0
+            ],
+            [
+              1425,
+              7755,
+              1307,
+              7843,
+              1909,
+              12892,
+              17,
+              0
+            ],
+            [
+              1385,
+              12209,
+              1316,
+              8707,
+              1933,
+              12854,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 25,
+          "state_root": "f6f15104d67e157cb956f22649cc1aca3965c2007f0d824f2cd3480ab89b4189",
+          "node_us": [
+            [
+              1436,
+              5043,
+              1312,
+              4326,
+              1900,
+              6749,
+              17,
+              29477
+            ],
+            [
+              1414,
+              10206,
+              1355,
+              10627,
+              2029,
+              7287,
+              19,
+              0
+            ],
+            [
+              1389,
+              4759,
+              1303,
+              9786,
+              2056,
+              11900,
+              16,
+              0
+            ],
+            [
+              1390,
+              10186,
+              1311,
+              10671,
+              2050,
+              11899,
+              18,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 26,
+          "state_root": "8b59fe5f808cae9ddecbbb009661f96af0cd789ce3016adaeccc1b3b0acf8116",
+          "node_us": [
+            [
+              1276,
+              5236,
+              1130,
+              6291,
+              2008,
+              5491,
+              18,
+              37722
+            ],
+            [
+              1430,
+              6801,
+              1327,
+              17186,
+              1898,
+              6435,
+              18,
+              0
+            ],
+            [
+              1392,
+              13224,
+              1307,
+              15617,
+              1960,
+              12915,
+              17,
+              0
+            ],
+            [
+              1464,
+              20515,
+              1304,
+              13419,
+              1892,
+              6399,
+              19,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 27,
+          "state_root": "7ec4cded688efe525282ca624367ca4fc05c216ee4b346ec9eccceddfa6d7388",
+          "node_us": [
+            [
+              1322,
+              5267,
+              1305,
+              4228,
+              1880,
+              7257,
+              18,
+              26851
+            ],
+            [
+              1395,
+              4799,
+              1316,
+              9595,
+              1936,
+              7547,
+              17,
+              0
+            ],
+            [
+              1382,
+              10195,
+              1304,
+              10613,
+              1906,
+              12106,
+              17,
+              0
+            ],
+            [
+              1369,
+              4795,
+              1305,
+              9602,
+              2020,
+              20692,
+              17,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 28,
+          "state_root": "d6132320a29489300e609c871ba88e8bfb9313366008e781dfa8a3cc926e83e5",
+          "node_us": [
+            [
+              1411,
+              9310,
+              1323,
+              9929,
+              2164,
+              5350,
+              18,
+              38391
+            ],
+            [
+              1580,
+              21592,
+              1390,
+              8197,
+              1897,
+              5506,
+              18,
+              0
+            ],
+            [
+              1567,
+              10659,
+              1329,
+              14245,
+              1882,
+              5509,
+              18,
+              0
+            ],
+            [
+              1561,
+              10659,
+              1317,
+              14255,
+              1896,
+              10890,
+              17,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 29,
+          "state_root": "3d4e8386404c978038f8b9ca11399edd963f66fabd6d388855f56862fce495c5",
+          "node_us": [
+            [
+              1402,
+              9287,
+              1327,
+              5181,
+              1896,
+              6641,
+              17,
+              29735
+            ],
+            [
+              1394,
+              7183,
+              1317,
+              9554,
+              1901,
+              7890,
+              16,
+              0
+            ],
+            [
+              1392,
+              7166,
+              1305,
+              9545,
+              1887,
+              16408,
+              17,
+              0
+            ],
+            [
+              1401,
+              12378,
+              1311,
+              9629,
+              1926,
+              16320,
+              15,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 30,
+          "state_root": "6746e9a19ddc64dd0ee132d2960973f71570052641f65d9762a658dcec127e35",
+          "node_us": [
+            [
+              1282,
+              5371,
+              1306,
+              4884,
+              1887,
+              5265,
+              16,
+              31001
+            ],
+            [
+              1395,
+              12469,
+              1343,
+              13225,
+              1923,
+              10048,
+              17,
+              0
+            ],
+            [
+              1393,
+              5786,
+              1301,
+              12617,
+              1889,
+              5064,
+              16,
+              0
+            ],
+            [
+              1369,
+              5779,
+              1328,
+              12593,
+              1904,
+              10042,
+              17,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 31,
+          "state_root": "8acd641bcc50bd2b72c9bc4a972fe2695c5fc5a8548d4651d23f05e1b65fbabc",
+          "node_us": [
+            [
+              1213,
+              6947,
+              1133,
+              13727,
+              1914,
+              14935,
+              18,
+              30904
+            ],
+            [
+              1276,
+              6773,
+              1126,
+              9893,
+              1909,
+              12202,
+              19,
+              0
+            ],
+            [
+              1286,
+              6736,
+              1126,
+              16307,
+              1983,
+              12093,
+              19,
+              0
+            ],
+            [
+              1254,
+              12261,
+              1312,
+              17131,
+              2002,
+              11971,
+              22,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 32,
+          "state_root": "ef8d6a4620dd172d32bb54fa9dd54baeb2c849a369d78d3bf7775cfe00d62d3e",
+          "node_us": [
+            [
+              1214,
+              6141,
+              1129,
+              6335,
+              1910,
+              6068,
+              25,
+              31835
+            ],
+            [
+              1399,
+              6864,
+              1308,
+              11069,
+              1893,
+              12752,
+              16,
+              0
+            ],
+            [
+              1392,
+              14490,
+              1319,
+              13081,
+              1888,
+              6602,
+              18,
+              0
+            ],
+            [
+              1382,
+              14403,
+              1308,
+              8730,
+              1889,
+              6587,
+              18,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 33,
+          "state_root": "364a22def2d0f94df39512a598fb949a969dd6e31c61727e105dd8905d206867",
+          "node_us": [
+            [
+              1213,
+              4919,
+              1186,
+              4419,
+              1903,
+              8020,
+              18,
+              30548
+            ],
+            [
+              1373,
+              10302,
+              1298,
+              18021,
+              1903,
+              4612,
+              17,
+              0
+            ],
+            [
+              1361,
+              4805,
+              1123,
+              10858,
+              1887,
+              9201,
+              16,
+              0
+            ],
+            [
+              1364,
+              4820,
+              1126,
+              17310,
+              1965,
+              9110,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 34,
+          "state_root": "d20fc98d5cc0e212baa21fd00fb9c6d2da3922cd40bb897c389371b7d981f8c1",
+          "node_us": [
+            [
+              1395,
+              5988,
+              1347,
+              6202,
+              1009,
+              4519,
+              11,
+              29733
+            ],
+            [
+              2546,
+              6462,
+              908,
+              11161,
+              1020,
+              5401,
+              11,
+              0
+            ],
+            [
+              2511,
+              13989,
+              664,
+              8588,
+              1012,
+              10839,
+              41,
+              0
+            ],
+            [
+              2488,
+              13961,
+              656,
+              8583,
+              1021,
+              5354,
+              12,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 35,
+          "state_root": "3168efb59da5e11cd6c5901842f37357fe9ff25c6a878bf3c642453ed8f11ab0",
+          "node_us": [
+            [
+              1955,
+              7224,
+              2094,
+              4481,
+              2228,
+              7271,
+              27,
+              37343
+            ],
+            [
+              2173,
+              3987,
+              1592,
+              15716,
+              2117,
+              5408,
+              23,
+              0
+            ],
+            [
+              2145,
+              15285,
+              2105,
+              16772,
+              2251,
+              9933,
+              20,
+              0
+            ],
+            [
+              2177,
+              8256,
+              1184,
+              18196,
+              2087,
+              5409,
+              24,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 36,
+          "state_root": "383281c6be326c1aabd15630d5f1acadac33dd536ce377bfa19e54e06c3f8f3b",
+          "node_us": [
+            [
+              1217,
+              6090,
+              1324,
+              6175,
+              1888,
+              5327,
+              18,
+              30081
+            ],
+            [
+              1384,
+              6849,
+              1310,
+              10653,
+              1939,
+              10939,
+              17,
+              0
+            ],
+            [
+              1390,
+              14291,
+              1347,
+              7786,
+              1897,
+              5466,
+              16,
+              0
+            ],
+            [
+              1378,
+              6793,
+              1309,
+              10655,
+              1911,
+              10920,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 37,
+          "state_root": "0fc0d67401a1aec44ec8b6ec1189740f872df9bcb99245e7f2c38adbde495cde",
+          "node_us": [
+            [
+              1400,
+              6763,
+              1212,
+              5410,
+              1884,
+              6700,
+              18,
+              25755
+            ],
+            [
+              1256,
+              5241,
+              1123,
+              8842,
+              1934,
+              7408,
+              17,
+              0
+            ],
+            [
+              1239,
+              9718,
+              1139,
+              9786,
+              1889,
+              14794,
+              17,
+              0
+            ],
+            [
+              1228,
+              5241,
+              1127,
+              8847,
+              1996,
+              14666,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 38,
+          "state_root": "e74aae2a041d5cdbd8d13ad708e80038896fdefc37ec5e6f4a75e17af653ef74",
+          "node_us": [
+            [
+              1207,
+              5159,
+              1156,
+              5277,
+              1885,
+              5711,
+              21,
+              34716
+            ],
+            [
+              1394,
+              6942,
+              1313,
+              11610,
+              1886,
+              5491,
+              17,
+              0
+            ],
+            [
+              1395,
+              13379,
+              1328,
+              12615,
+              1899,
+              9876,
+              16,
+              0
+            ],
+            [
+              1382,
+              13380,
+              1314,
+              12630,
+              1906,
+              9836,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 39,
+          "state_root": "850443d34bb8a8d9aed9c373d528efb024e8cba19ba81ce62c460f7b27569165",
+          "node_us": [
+            [
+              1217,
+              6096,
+              1180,
+              6381,
+              1725,
+              5076,
+              18,
+              26459
+            ],
+            [
+              1286,
+              7053,
+              1150,
+              8140,
+              1541,
+              6016,
+              27,
+              0
+            ],
+            [
+              1315,
+              11613,
+              1124,
+              7953,
+              1569,
+              12254,
+              17,
+              0
+            ],
+            [
+              1235,
+              7057,
+              1130,
+              8161,
+              1535,
+              12281,
+              17,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 40,
+          "state_root": "c1fb3a83d0f9946b9963258354a8229cbdb0e6b44ce397b43ba25a13a8887902",
+          "node_us": [
+            [
+              1073,
+              5486,
+              1008,
+              4574,
+              1695,
+              6812,
+              20,
+              35659
+            ],
+            [
+              1181,
+              11058,
+              1025,
+              17354,
+              1886,
+              4653,
+              14,
+              0
+            ],
+            [
+              1124,
+              5591,
+              1013,
+              16464,
+              1896,
+              9130,
+              27,
+              0
+            ],
+            [
+              1159,
+              16533,
+              1141,
+              19144,
+              1994,
+              14411,
+              17,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 41,
+          "state_root": "e6f82f8242ab9f0b5a8ceb576f8b5849b18e1911093bee123100f88bd3ed02c5",
+          "node_us": [
+            [
+              1219,
+              7117,
+              1140,
+              7235,
+              1895,
+              6427,
+              18,
+              27511
+            ],
+            [
+              1402,
+              9744,
+              1141,
+              15178,
+              1826,
+              6486,
+              18,
+              0
+            ],
+            [
+              1402,
+              9701,
+              1126,
+              9812,
+              1860,
+              13949,
+              17,
+              0
+            ],
+            [
+              1383,
+              5155,
+              1257,
+              8810,
+              1831,
+              6455,
+              18,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 42,
+          "state_root": "a06e3b9fadfb3a7e08d3145520294108da6f5230aaeea7460d3d68a1021ce290",
+          "node_us": [
+            [
+              1219,
+              5122,
+              1134,
+              5445,
+              1512,
+              4717,
+              14,
+              32485
+            ],
+            [
+              1397,
+              11997,
+              1317,
+              12523,
+              1376,
+              10471,
+              13,
+              0
+            ],
+            [
+              1392,
+              12093,
+              1415,
+              16997,
+              1376,
+              5005,
+              12,
+              0
+            ],
+            [
+              1383,
+              5640,
+              1136,
+              11772,
+              1382,
+              10428,
+              13,
+              0
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "label": "B",
+      "manifest": {
+        "profile": "native-fast-view0-v1",
+        "binary_sha256": "f814d8019ead50b77981cfe7de59cb39157130025d3be0c59bc5676072410238",
+        "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+        "started_unix": 1790394301.075775,
+        "samples": 40,
+        "warmup": 2,
+        "boundary": "original signing + outbox sync to verified proof + terminal outbox sync",
+        "excluded": [
+          "Qt",
+          "HTTPS",
+          "B3 node/reconciliation",
+          "native view-change",
+          "WAN",
+          "power-loss"
+        ]
+      },
+      "summary": {
+        "status": "PASS",
+        "exits": {
+          "client": 0,
+          "seat0": 0,
+          "seat3": 0,
+          "seat2": 0,
+          "seat1": 0
+        },
+        "warmup": 2,
+        "measured": 40,
+        "reopened": [
+          {
+            "event": "reopened",
+            "seat": 0,
+            "committed": 42,
+            "state_root": "a06e3b9fadfb3a7e08d3145520294108da6f5230aaeea7460d3d68a1021ce290"
+          },
+          {
+            "event": "reopened",
+            "seat": 1,
+            "committed": 42,
+            "state_root": "a06e3b9fadfb3a7e08d3145520294108da6f5230aaeea7460d3d68a1021ce290"
+          },
+          {
+            "event": "reopened",
+            "seat": 2,
+            "committed": 42,
+            "state_root": "a06e3b9fadfb3a7e08d3145520294108da6f5230aaeea7460d3d68a1021ce290"
+          },
+          {
+            "event": "reopened",
+            "seat": 3,
+            "committed": 42,
+            "state_root": "a06e3b9fadfb3a7e08d3145520294108da6f5230aaeea7460d3d68a1021ce290"
+          }
+        ],
+        "latency": {
+          "verified_us": {
+            "n": 40,
+            "median_ms": 61.716,
+            "p95_ms": 71.402,
+            "min_ms": 53.944,
+            "max_ms": 85.806
+          },
+          "client_durable_us": {
+            "n": 40,
+            "median_ms": 78.833,
+            "p95_ms": 89.928,
+            "min_ms": 69.307,
+            "max_ms": 113.536
+          },
+          "all_replicas_observed_us": {
+            "n": 40,
+            "median_ms": 80.93,
+            "p95_ms": 93.67,
+            "min_ms": 70.523,
+            "max_ms": 122.257
+          }
+        }
+      },
+      "client_samples": [
+        {
+          "event": "sample",
+          "index": 0,
+          "action_id": "15caf1f65044d68afa134e75b07afa840a4d4c83d2e1b35a0407c93b1b3d7223",
+          "sequence": 1,
+          "signed_us": 66,
+          "outbox_ready_us": 5958,
+          "received_us": 50656,
+          "verified_us": 52019,
+          "client_durable_us": 71092,
+          "all_replicas_observed_us": 71958,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 1,
+          "action_id": "36d50ddfc32466fca25a7420122763aebc776aa66e7e3de80d09bb12e4dd1b2f",
+          "sequence": 2,
+          "signed_us": 76,
+          "outbox_ready_us": 7349,
+          "received_us": 57539,
+          "verified_us": 59175,
+          "client_durable_us": 72078,
+          "all_replicas_observed_us": 73061,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 2,
+          "action_id": "b315a6115644a4584c9a12e3b64deb49bea23f37a7fc970254954a92a7971c2a",
+          "sequence": 3,
+          "signed_us": 82,
+          "outbox_ready_us": 5450,
+          "received_us": 56718,
+          "verified_us": 58793,
+          "client_durable_us": 76999,
+          "all_replicas_observed_us": 78215,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 3,
+          "action_id": "cd8f73456514e054671d69eb5ddc4b418a1ec75e5e56f9a4e3d3739aaaf78f16",
+          "sequence": 4,
+          "signed_us": 106,
+          "outbox_ready_us": 7046,
+          "received_us": 58240,
+          "verified_us": 60116,
+          "client_durable_us": 73762,
+          "all_replicas_observed_us": 74848,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 4,
+          "action_id": "15e0e3d83c2d26652b770d53ba763fac0b89b014ff3c9328f6ac4d11179ccadd",
+          "sequence": 5,
+          "signed_us": 92,
+          "outbox_ready_us": 5374,
+          "received_us": 56537,
+          "verified_us": 58792,
+          "client_durable_us": 76729,
+          "all_replicas_observed_us": 77935,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 5,
+          "action_id": "fdf8c5e5b0aa7adba10b0f9a3ad55c38bb0d9a25ab5d138e61769435e6b5c607",
+          "sequence": 6,
+          "signed_us": 95,
+          "outbox_ready_us": 7167,
+          "received_us": 58394,
+          "verified_us": 60406,
+          "client_durable_us": 73945,
+          "all_replicas_observed_us": 75157,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 6,
+          "action_id": "6704baed5e5dbc85948315374c66bc2f70aac9e10e4146bb711abb0209d2435d",
+          "sequence": 7,
+          "signed_us": 98,
+          "outbox_ready_us": 5273,
+          "received_us": 55970,
+          "verified_us": 57901,
+          "client_durable_us": 75228,
+          "all_replicas_observed_us": 76331,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 7,
+          "action_id": "3fcfe5de22fca841c2e0f50db1c9ca3d303f7dbb331800ef61e23692090c98aa",
+          "sequence": 8,
+          "signed_us": 86,
+          "outbox_ready_us": 6367,
+          "received_us": 56416,
+          "verified_us": 58432,
+          "client_durable_us": 74903,
+          "all_replicas_observed_us": 76116,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 8,
+          "action_id": "9a2d3183f6d975f36fada0aa7a246f184eb137e466748575fde9b51f07b70e75",
+          "sequence": 9,
+          "signed_us": 89,
+          "outbox_ready_us": 5227,
+          "received_us": 61822,
+          "verified_us": 64066,
+          "client_durable_us": 82184,
+          "all_replicas_observed_us": 83555,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 9,
+          "action_id": "09d199bddf5209645ffa2e33063aeeee0abe70fdce492ab5feaae282bcf18506",
+          "sequence": 10,
+          "signed_us": 105,
+          "outbox_ready_us": 6950,
+          "received_us": 63915,
+          "verified_us": 66364,
+          "client_durable_us": 80215,
+          "all_replicas_observed_us": 81576,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 10,
+          "action_id": "46bc6adb8906a2d9e7dae3aa8b0ec925a2a21b75deeb4b3d427c95cccaf43303",
+          "sequence": 11,
+          "signed_us": 93,
+          "outbox_ready_us": 6029,
+          "received_us": 57193,
+          "verified_us": 59198,
+          "client_durable_us": 78362,
+          "all_replicas_observed_us": 79736,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 11,
+          "action_id": "49a3ddee000dbdc1a5ff10c9f9f73a730d99de4f66a098db6ce2a4b6527b88ef",
+          "sequence": 12,
+          "signed_us": 101,
+          "outbox_ready_us": 5229,
+          "received_us": 51946,
+          "verified_us": 53944,
+          "client_durable_us": 69307,
+          "all_replicas_observed_us": 70523,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 12,
+          "action_id": "dc1e3b7e2f206a5b8135a3410f0ed097f6c6d81b331837977ef2231c7a29ee78",
+          "sequence": 13,
+          "signed_us": 86,
+          "outbox_ready_us": 5235,
+          "received_us": 53913,
+          "verified_us": 56167,
+          "client_durable_us": 79686,
+          "all_replicas_observed_us": 81091,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 13,
+          "action_id": "0f018f4fc84847834e81cd2d7d844af1b1429238136f99c1f7c8866bdf8a3894",
+          "sequence": 14,
+          "signed_us": 103,
+          "outbox_ready_us": 6947,
+          "received_us": 59101,
+          "verified_us": 61685,
+          "client_durable_us": 74635,
+          "all_replicas_observed_us": 75997,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 14,
+          "action_id": "7a9c957750d9aafb84af19553374bf70aedd27e692e0755cc8b695284d81587f",
+          "sequence": 15,
+          "signed_us": 100,
+          "outbox_ready_us": 5044,
+          "received_us": 58243,
+          "verified_us": 60477,
+          "client_durable_us": 78563,
+          "all_replicas_observed_us": 79920,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 15,
+          "action_id": "386b3b39190921067588812b35f80597d8cb5adbc43aabca580173aa95cf6da0",
+          "sequence": 16,
+          "signed_us": 98,
+          "outbox_ready_us": 6995,
+          "received_us": 59101,
+          "verified_us": 61516,
+          "client_durable_us": 81229,
+          "all_replicas_observed_us": 82844,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 16,
+          "action_id": "1fee9f90f7190deb87c9194924e680983404fc991c7be7a674e5dd2d22ff70e5",
+          "sequence": 17,
+          "signed_us": 117,
+          "outbox_ready_us": 5819,
+          "received_us": 58866,
+          "verified_us": 61607,
+          "client_durable_us": 81164,
+          "all_replicas_observed_us": 82791,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 17,
+          "action_id": "90d302b2449d9c286d65a929d0315f6d85cf724ebd77c1ed58c6871fb83e4798",
+          "sequence": 18,
+          "signed_us": 121,
+          "outbox_ready_us": 4952,
+          "received_us": 58104,
+          "verified_us": 60783,
+          "client_durable_us": 74538,
+          "all_replicas_observed_us": 76187,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 18,
+          "action_id": "82f91c5e50fdb681472cd84c90505ba9957a28063ffdda45d1415d8851961080",
+          "sequence": 19,
+          "signed_us": 122,
+          "outbox_ready_us": 5772,
+          "received_us": 64411,
+          "verified_us": 66647,
+          "client_durable_us": 84663,
+          "all_replicas_observed_us": 86019,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 19,
+          "action_id": "c6e6870bcf17ce4e4ba6431e403babcbd567e5e8cb9d0ab9bf29f8fc56a0c369",
+          "sequence": 20,
+          "signed_us": 98,
+          "outbox_ready_us": 5230,
+          "received_us": 58413,
+          "verified_us": 60662,
+          "client_durable_us": 75654,
+          "all_replicas_observed_us": 77011,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 20,
+          "action_id": "f5a41a77aa59a491b683f8357b957f20e90e2006c1d83d76ee9e974ae0469c21",
+          "sequence": 21,
+          "signed_us": 95,
+          "outbox_ready_us": 6114,
+          "received_us": 56387,
+          "verified_us": 58628,
+          "client_durable_us": 76729,
+          "all_replicas_observed_us": 78092,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 21,
+          "action_id": "6d7e08f1490d6f7f7c824aba2acf958b9fe5b5541118b9d11820429d2ecde589",
+          "sequence": 22,
+          "signed_us": 94,
+          "outbox_ready_us": 4162,
+          "received_us": 62769,
+          "verified_us": 65013,
+          "client_durable_us": 83102,
+          "all_replicas_observed_us": 84690,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 22,
+          "action_id": "9b230677015fe20c0189504c0a09e242b5989c977dcc3d38c245fa2fd50a31b8",
+          "sequence": 23,
+          "signed_us": 124,
+          "outbox_ready_us": 6821,
+          "received_us": 66430,
+          "verified_us": 69289,
+          "client_durable_us": 84886,
+          "all_replicas_observed_us": 93670,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 23,
+          "action_id": "d15cff0cd5ee4d2b33c0f0a37aaf78dd438590b7c2010b7e0af422ad92a4a48f",
+          "sequence": 24,
+          "signed_us": 114,
+          "outbox_ready_us": 6085,
+          "received_us": 59953,
+          "verified_us": 62270,
+          "client_durable_us": 82077,
+          "all_replicas_observed_us": 83444,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 24,
+          "action_id": "3e62fadcbac7b621ffe0939c18f27f142e49dd0e4b60170914cb8288c1fb56ae",
+          "sequence": 25,
+          "signed_us": 110,
+          "outbox_ready_us": 7093,
+          "received_us": 59060,
+          "verified_us": 61287,
+          "client_durable_us": 74708,
+          "all_replicas_observed_us": 75914,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 25,
+          "action_id": "1191b8efdb7f4cdc17cad628a3bee1a197d32de2246ac2cb72911c6764224c5a",
+          "sequence": 26,
+          "signed_us": 83,
+          "outbox_ready_us": 5174,
+          "received_us": 61778,
+          "verified_us": 64081,
+          "client_durable_us": 84001,
+          "all_replicas_observed_us": 85218,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 26,
+          "action_id": "59ae2ea13e9434276b1a91602b2a8d36d5c63d3f6a53a28ac371838f65e60727",
+          "sequence": 27,
+          "signed_us": 97,
+          "outbox_ready_us": 5410,
+          "received_us": 61283,
+          "verified_us": 63697,
+          "client_durable_us": 80515,
+          "all_replicas_observed_us": 90215,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 27,
+          "action_id": "5d359510851d13bbad314a72ec805a001968b595502a5d9f6dfb222abadce5c1",
+          "sequence": 28,
+          "signed_us": 95,
+          "outbox_ready_us": 7175,
+          "received_us": 52387,
+          "verified_us": 54645,
+          "client_durable_us": 79103,
+          "all_replicas_observed_us": 80769,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 28,
+          "action_id": "42eebc93998ae925b8564539cb108c68a92a92e245005963fde30fb6da1d57b4",
+          "sequence": 29,
+          "signed_us": 118,
+          "outbox_ready_us": 5019,
+          "received_us": 60367,
+          "verified_us": 63090,
+          "client_durable_us": 78506,
+          "all_replicas_observed_us": 80085,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 29,
+          "action_id": "1ebc5a374b1f5f6e302b532eefc894cf48288e15d3e2f620f3e313d7ee95f070",
+          "sequence": 30,
+          "signed_us": 119,
+          "outbox_ready_us": 6964,
+          "received_us": 62069,
+          "verified_us": 64687,
+          "client_durable_us": 83372,
+          "all_replicas_observed_us": 84971,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 30,
+          "action_id": "97a99ef3c63881943c7b970e13e67cab6d0951004ad0d45ed6da679bd77eba95",
+          "sequence": 31,
+          "signed_us": 126,
+          "outbox_ready_us": 5019,
+          "received_us": 83119,
+          "verified_us": 85806,
+          "client_durable_us": 113536,
+          "all_replicas_observed_us": 122257,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 31,
+          "action_id": "d56b6e6b96d0722fa98f759360d6148204643a13840d397da9f58a6f2494bdd4",
+          "sequence": 32,
+          "signed_us": 117,
+          "outbox_ready_us": 17119,
+          "received_us": 81606,
+          "verified_us": 84243,
+          "client_durable_us": 99209,
+          "all_replicas_observed_us": 100791,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 32,
+          "action_id": "5d751b38a93a6db26fb14e0779b1eefe00468c7ea74aac748d567f2b4fd072d0",
+          "sequence": 33,
+          "signed_us": 115,
+          "outbox_ready_us": 5793,
+          "received_us": 62974,
+          "verified_us": 65535,
+          "client_durable_us": 84298,
+          "all_replicas_observed_us": 85957,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 33,
+          "action_id": "0adeae0909b78788f598a8ed373524cb5971ce9aaedaa118c18298009ff37a45",
+          "sequence": 34,
+          "signed_us": 110,
+          "outbox_ready_us": 7813,
+          "received_us": 62933,
+          "verified_us": 65656,
+          "client_durable_us": 79397,
+          "all_replicas_observed_us": 80755,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 34,
+          "action_id": "ac4f0bb37783a70292159bdf32cc4d736da4bedc0e4237c3b4ff739aff6bcca9",
+          "sequence": 35,
+          "signed_us": 99,
+          "outbox_ready_us": 6102,
+          "received_us": 61797,
+          "verified_us": 64078,
+          "client_durable_us": 76526,
+          "all_replicas_observed_us": 86018,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 35,
+          "action_id": "facf2344543b24291257bb6effbb26b7b1080863b8e9f8ed0ffd773836af4486",
+          "sequence": 36,
+          "signed_us": 104,
+          "outbox_ready_us": 6506,
+          "received_us": 60294,
+          "verified_us": 62828,
+          "client_durable_us": 82320,
+          "all_replicas_observed_us": 83696,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 36,
+          "action_id": "2d53cb7c37ced572d37efe9314107a8b3e8f7ed84bfb92737918e49da356be59",
+          "sequence": 37,
+          "signed_us": 99,
+          "outbox_ready_us": 4352,
+          "received_us": 59495,
+          "verified_us": 61747,
+          "client_durable_us": 77701,
+          "all_replicas_observed_us": 79052,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 37,
+          "action_id": "ce8bfceb38f32919ada406f070e7eec30f9880c746344f012a92b160e51ecffd",
+          "sequence": 38,
+          "signed_us": 93,
+          "outbox_ready_us": 6259,
+          "received_us": 54723,
+          "verified_us": 56404,
+          "client_durable_us": 77021,
+          "all_replicas_observed_us": 77914,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 38,
+          "action_id": "3d8c76cf7ff1d66c2e3eeba6a40adfd9fb0b3088f7b77a0df93922e93f4cfa9f",
+          "sequence": 39,
+          "signed_us": 63,
+          "outbox_ready_us": 4674,
+          "received_us": 56828,
+          "verified_us": 59446,
+          "client_durable_us": 74245,
+          "all_replicas_observed_us": 75711,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 39,
+          "action_id": "34e9ffdaec31f53e65a7b642e162a25b1fe3493c8dc6be6b43bb03b2b42704f7",
+          "sequence": 40,
+          "signed_us": 91,
+          "outbox_ready_us": 6061,
+          "received_us": 68770,
+          "verified_us": 71402,
+          "client_durable_us": 89928,
+          "all_replicas_observed_us": 93194,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 40,
+          "action_id": "db22c0d2bcc566c12251eccad3a03951d367f711120949206b44627184554895",
+          "sequence": 41,
+          "signed_us": 118,
+          "outbox_ready_us": 4373,
+          "received_us": 62583,
+          "verified_us": 65357,
+          "client_durable_us": 75320,
+          "all_replicas_observed_us": 85141,
+          "quantity": 1,
+          "fee": 10
+        },
+        {
+          "event": "sample",
+          "index": 41,
+          "action_id": "0bac2b74f1050df9094d9786d949d32733d9097d445ea90371a6935be2625753",
+          "sequence": 42,
+          "signed_us": 113,
+          "outbox_ready_us": 7133,
+          "received_us": 64753,
+          "verified_us": 67409,
+          "client_durable_us": 88863,
+          "all_replicas_observed_us": 89872,
+          "quantity": 1,
+          "fee": 10
+        }
+      ],
+      "replica_stage_durations": [
+        {
+          "event": "replicas_applied",
+          "sequence": 1,
+          "state_root": "418bacf2bd25cfdbfac6e12c00ae1f756265ba4d155a39f2dea463ca6da3b5bc",
+          "node_us": [
+            [
+              662,
+              6777,
+              618,
+              6904,
+              1107,
+              5507,
+              13,
+              22751
+            ],
+            [
+              704,
+              7511,
+              657,
+              8718,
+              1138,
+              6266,
+              9,
+              0
+            ],
+            [
+              688,
+              12127,
+              681,
+              9401,
+              1137,
+              6261,
+              8,
+              0
+            ],
+            [
+              672,
+              7509,
+              661,
+              8714,
+              1144,
+              12710,
+              12,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 2,
+          "state_root": "96ef5522fe8917df31a91015d35fffbf3ead43ba226fd00b4f1f1e4062365363",
+          "node_us": [
+            [
+              841,
+              4745,
+              771,
+              4920,
+              1371,
+              9920,
+              32,
+              27188
+            ],
+            [
+              949,
+              10598,
+              827,
+              17497,
+              1374,
+              5015,
+              15,
+              0
+            ],
+            [
+              894,
+              10615,
+              835,
+              11015,
+              1381,
+              8785,
+              15,
+              0
+            ],
+            [
+              848,
+              5090,
+              769,
+              10187,
+              1370,
+              8794,
+              14,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 3,
+          "state_root": "5111eef252961c2a9257660df394ebdc24080dd3618ece9b1c429d1d19ae8f64",
+          "node_us": [
+            [
+              998,
+              5375,
+              974,
+              6476,
+              1677,
+              6061,
+              22,
+              29281
+            ],
+            [
+              992,
+              6844,
+              916,
+              15885,
+              1674,
+              5651,
+              15,
+              0
+            ],
+            [
+              983,
+              6829,
+              991,
+              10946,
+              1672,
+              12126,
+              14,
+              0
+            ],
+            [
+              968,
+              14229,
+              1009,
+              12671,
+              1675,
+              12108,
+              14,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 4,
+          "state_root": "1aa88ffd1d298dfa6804250162b370436f3d27046a9a81393e771a651e6222b5",
+          "node_us": [
+            [
+              1114,
+              4289,
+              1003,
+              4782,
+              1697,
+              8705,
+              17,
+              29097
+            ],
+            [
+              1223,
+              10795,
+              1121,
+              10750,
+              1561,
+              5095,
+              30,
+              0
+            ],
+            [
+              1205,
+              5325,
+              1122,
+              9746,
+              1574,
+              5058,
+              37,
+              0
+            ],
+            [
+              1193,
+              10810,
+              1137,
+              17199,
+              1601,
+              9523,
+              14,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 5,
+          "state_root": "ae0a3464776386c17023ca0e121e6914afcf817f61f9d11b5bfe5a0a4cee9b26",
+          "node_us": [
+            [
+              984,
+              5423,
+              1003,
+              6532,
+              1734,
+              5826,
+              16,
+              29275
+            ],
+            [
+              1082,
+              13998,
+              998,
+              8220,
+              1699,
+              5640,
+              15,
+              0
+            ],
+            [
+              1069,
+              14001,
+              1007,
+              12631,
+              1675,
+              12143,
+              13,
+              0
+            ],
+            [
+              1065,
+              6595,
+              1000,
+              10892,
+              1674,
+              12141,
+              15,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 6,
+          "state_root": "55c7df6e49626324bbc7900abceb0a8d7e6fb82c84be484047d4873e19e7b580",
+          "node_us": [
+            [
+              1083,
+              4400,
+              1130,
+              4608,
+              1699,
+              8695,
+              17,
+              29194
+            ],
+            [
+              1208,
+              10832,
+              1129,
+              17271,
+              1716,
+              9418,
+              26,
+              0
+            ],
+            [
+              1205,
+              5433,
+              1126,
+              9723,
+              1675,
+              4871,
+              24,
+              0
+            ],
+            [
+              1197,
+              5424,
+              1128,
+              16269,
+              1699,
+              9409,
+              27,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 7,
+          "state_root": "dce0d0c4ad397adf456e11321eccdafe84f35442bc1c4d6ceaaa65e2dac3def0",
+          "node_us": [
+            [
+              1228,
+              6141,
+              1121,
+              6315,
+              1507,
+              4974,
+              15,
+              28963
+            ],
+            [
+              991,
+              6922,
+              906,
+              10928,
+              1706,
+              11051,
+              13,
+              0
+            ],
+            [
+              980,
+              14297,
+              1030,
+              8176,
+              1684,
+              11058,
+              13,
+              0
+            ],
+            [
+              973,
+              14295,
+              1015,
+              8191,
+              1630,
+              5786,
+              20,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 8,
+          "state_root": "122b12259aa940e0b5b3e8c0ad8825e23d2d14979cdf4fb153a945c22dde7a8c",
+          "node_us": [
+            [
+              1094,
+              7310,
+              1013,
+              4376,
+              1691,
+              8123,
+              17,
+              25997
+            ],
+            [
+              1095,
+              4746,
+              1006,
+              8940,
+              1689,
+              7641,
+              23,
+              0
+            ],
+            [
+              1067,
+              9237,
+              1000,
+              9905,
+              1735,
+              12174,
+              16,
+              0
+            ],
+            [
+              1077,
+              9211,
+              997,
+              16400,
+              1672,
+              12210,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 9,
+          "state_root": "15b90af990e5d03e3bb4b5455bbddab328d052beedca0f5832b1836a9e15e732",
+          "node_us": [
+            [
+              1126,
+              5264,
+              1127,
+              5456,
+              1875,
+              5569,
+              17,
+              35761
+            ],
+            [
+              1218,
+              12700,
+              1162,
+              15446,
+              1895,
+              5588,
+              16,
+              0
+            ],
+            [
+              1206,
+              6211,
+              1245,
+              17165,
+              1894,
+              5582,
+              16,
+              0
+            ],
+            [
+              1204,
+              20026,
+              1121,
+              13574,
+              1898,
+              11997,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 10,
+          "state_root": "b6f34e32deeaaa6646aa9cef2011d17658f382f843f38d192884007d6395484e",
+          "node_us": [
+            [
+              1202,
+              5228,
+              1136,
+              4611,
+              1889,
+              6237,
+              21,
+              36177
+            ],
+            [
+              1437,
+              15768,
+              1306,
+              18971,
+              2025,
+              4332,
+              15,
+              0
+            ],
+            [
+              1329,
+              4861,
+              1135,
+              16303,
+              2018,
+              4327,
+              14,
+              0
+            ],
+            [
+              1388,
+              10333,
+              1122,
+              17238,
+              2027,
+              8734,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 11,
+          "state_root": "dc3ddf6467de27e8bb2c0422c42012099cfa494a82551d8e19d3bbf049b0fd7b",
+          "node_us": [
+            [
+              1202,
+              6178,
+              1125,
+              6431,
+              1798,
+              5671,
+              29,
+              28285
+            ],
+            [
+              1516,
+              12038,
+              1307,
+              7872,
+              1684,
+              5748,
+              17,
+              0
+            ],
+            [
+              1511,
+              12048,
+              1308,
+              13360,
+              1673,
+              12168,
+              15,
+              0
+            ],
+            [
+              1445,
+              7599,
+              1317,
+              7939,
+              1671,
+              12159,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 12,
+          "state_root": "0c70fd6679ae87714318d82dfc92e9cdde47e972e8d4ec7f4f255589cc2a8c98",
+          "node_us": [
+            [
+              1083,
+              4437,
+              1008,
+              4459,
+              1685,
+              7248,
+              17,
+              26321
+            ],
+            [
+              1072,
+              5621,
+              1010,
+              10981,
+              1721,
+              5604,
+              14,
+              0
+            ],
+            [
+              1171,
+              10963,
+              1012,
+              11926,
+              1687,
+              5580,
+              16,
+              0
+            ],
+            [
+              1081,
+              5612,
+              1006,
+              10993,
+              1724,
+              10198,
+              23,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 13,
+          "state_root": "05bed8e65c832ad6ecb15f06503e24ac4c6e1d571b08f6b79e7d58f57ef733cc",
+          "node_us": [
+            [
+              1068,
+              5374,
+              1003,
+              6458,
+              1684,
+              4820,
+              15,
+              27861
+            ],
+            [
+              1063,
+              13925,
+              1117,
+              8120,
+              1781,
+              5626,
+              14,
+              0
+            ],
+            [
+              1050,
+              6644,
+              1124,
+              10872,
+              1881,
+              10967,
+              22,
+              0
+            ],
+            [
+              1057,
+              6656,
+              1128,
+              10869,
+              1838,
+              17490,
+              17,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 14,
+          "state_root": "6d95ad5453c8edfba2abf14531c2ebef6fa24905a17e00d5f73dd1b52a5d84ae",
+          "node_us": [
+            [
+              1321,
+              5144,
+              1128,
+              4571,
+              1905,
+              7862,
+              23,
+              29753
+            ],
+            [
+              1200,
+              10803,
+              1305,
+              17002,
+              2209,
+              4216,
+              14,
+              0
+            ],
+            [
+              1190,
+              10769,
+              1306,
+              10634,
+              2186,
+              8921,
+              18,
+              0
+            ],
+            [
+              1179,
+              5308,
+              1304,
+              9632,
+              2204,
+              8885,
+              19,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 15,
+          "state_root": "e1f31a723a2369cf14506688c094705ef621f65bd6db954ded872be00a6e5b28",
+          "node_us": [
+            [
+              1215,
+              6290,
+              1307,
+              6124,
+              1883,
+              5525,
+              19,
+              30407
+            ],
+            [
+              1469,
+              14195,
+              1359,
+              12260,
+              1892,
+              5460,
+              17,
+              0
+            ],
+            [
+              1414,
+              6768,
+              1229,
+              10747,
+              1889,
+              11928,
+              16,
+              0
+            ],
+            [
+              1448,
+              14181,
+              1307,
+              7847,
+              1905,
+              11907,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 16,
+          "state_root": "e61ba56d3a560b303ff0259eb9efefcdc2b2a586cd09b5c611f617959cce5bb1",
+          "node_us": [
+            [
+              1204,
+              4366,
+              1125,
+              4451,
+              1924,
+              8347,
+              18,
+              30268
+            ],
+            [
+              1196,
+              5318,
+              1145,
+              17362,
+              2126,
+              14498,
+              19,
+              0
+            ],
+            [
+              1189,
+              10796,
+              1179,
+              18243,
+              2008,
+              5400,
+              18,
+              0
+            ],
+            [
+              1186,
+              5322,
+              1131,
+              10858,
+              1972,
+              10181,
+              17,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 17,
+          "state_root": "370a2bbb0629468d09eeaed148edd5f2b9f572b20723ddafbbf5a930961ce676",
+          "node_us": [
+            [
+              1400,
+              5998,
+              1302,
+              7061,
+              2160,
+              6306,
+              19,
+              28363
+            ],
+            [
+              1397,
+              6827,
+              1311,
+              7867,
+              2247,
+              12542,
+              19,
+              0
+            ],
+            [
+              1381,
+              11488,
+              1614,
+              12789,
+              2223,
+              6230,
+              15,
+              0
+            ],
+            [
+              1356,
+              6837,
+              1320,
+              12333,
+              2268,
+              12485,
+              18,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 18,
+          "state_root": "ef09e14f5ac20eaf4c2ba92f908a964ea13540a890bb903eaa71ddb7a72d1e3c",
+          "node_us": [
+            [
+              1403,
+              4108,
+              1313,
+              5167,
+              2143,
+              6929,
+              18,
+              31626
+            ],
+            [
+              1380,
+              5767,
+              1319,
+              10564,
+              2192,
+              4316,
+              14,
+              0
+            ],
+            [
+              1366,
+              11207,
+              1317,
+              11609,
+              2187,
+              8724,
+              19,
+              0
+            ],
+            [
+              1370,
+              11187,
+              1348,
+              19092,
+              2193,
+              8701,
+              17,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 19,
+          "state_root": "58d2472a4683bcc3a5a61dc9c6181ffba7e5afc289e511e5f19b662fce7e3c99",
+          "node_us": [
+            [
+              1199,
+              6113,
+              1309,
+              7095,
+              1890,
+              6189,
+              20,
+              34319
+            ],
+            [
+              1408,
+              16078,
+              1327,
+              14883,
+              1888,
+              6317,
+              16,
+              0
+            ],
+            [
+              1366,
+              6862,
+              1131,
+              13547,
+              1887,
+              13835,
+              16,
+              0
+            ],
+            [
+              1355,
+              11387,
+              1308,
+              14264,
+              1882,
+              13837,
+              18,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 20,
+          "state_root": "eafbf8de169ce70d3e8704f7fb1379c0566a2353bd6c77fa1a2c57739a2f53f6",
+          "node_us": [
+            [
+              1202,
+              5257,
+              1307,
+              5154,
+              1886,
+              4694,
+              20,
+              33207
+            ],
+            [
+              1383,
+              5786,
+              1133,
+              11775,
+              1900,
+              4491,
+              15,
+              0
+            ],
+            [
+              1381,
+              5796,
+              1129,
+              19232,
+              1891,
+              9938,
+              15,
+              0
+            ],
+            [
+              1386,
+              12291,
+              1305,
+              17117,
+              1881,
+              9917,
+              15,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 21,
+          "state_root": "14e7a1bd1fbbc09535a1704ea381645bd59723b187c97817912d023b66f6d22b",
+          "node_us": [
+            [
+              1198,
+              6177,
+              1134,
+              7271,
+              1890,
+              6728,
+              18,
+              25433
+            ],
+            [
+              1204,
+              9128,
+              1138,
+              14182,
+              1900,
+              13837,
+              15,
+              0
+            ],
+            [
+              1175,
+              9154,
+              1124,
+              8752,
+              1888,
+              6448,
+              16,
+              0
+            ],
+            [
+              1174,
+              4468,
+              1138,
+              7989,
+              1889,
+              13822,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 22,
+          "state_root": "b0d3988d4daea0cebf6ffafc05fd4a43589447a599c435e5fe6863ccb1e7e892",
+          "node_us": [
+            [
+              1193,
+              5115,
+              1139,
+              5441,
+              1970,
+              5075,
+              21,
+              38176
+            ],
+            [
+              1356,
+              12574,
+              1314,
+              17138,
+              1887,
+              5475,
+              15,
+              0
+            ],
+            [
+              1274,
+              6095,
+              1307,
+              19083,
+              1884,
+              5461,
+              17,
+              0
+            ],
+            [
+              1339,
+              19093,
+              1313,
+              15213,
+              1890,
+              11839,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 23,
+          "state_root": "64dc952ed956e5e1a6194f018d9d57ee3cae7729647c4ca620e02a386c1a6064",
+          "node_us": [
+            [
+              1447,
+              6810,
+              1319,
+              5377,
+              2192,
+              7600,
+              21,
+              34268
+            ],
+            [
+              1436,
+              4832,
+              1323,
+              14118,
+              2439,
+              10736,
+              20,
+              0
+            ],
+            [
+              1376,
+              14781,
+              1559,
+              16802,
+              2795,
+              21168,
+              23,
+              0
+            ],
+            [
+              1399,
+              9277,
+              1310,
+              16123,
+              2538,
+              5908,
+              18,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 24,
+          "state_root": "1103276a93a2010ecd5f825b5a09acc5dcfd72558be7b5dc2f0511be8ad27978",
+          "node_us": [
+            [
+              1444,
+              7035,
+              1319,
+              7126,
+              1899,
+              5939,
+              16,
+              28540
+            ],
+            [
+              1678,
+              7395,
+              1303,
+              7915,
+              2007,
+              12829,
+              16,
+              0
+            ],
+            [
+              1647,
+              7393,
+              1305,
+              7917,
+              1938,
+              6294,
+              18,
+              0
+            ],
+            [
+              1665,
+              11879,
+              1326,
+              8815,
+              1901,
+              12882,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 25,
+          "state_root": "f6f15104d67e157cb956f22649cc1aca3965c2007f0d824f2cd3480ab89b4189",
+          "node_us": [
+            [
+              1209,
+              5048,
+              1143,
+              4615,
+              1899,
+              8122,
+              22,
+              29440
+            ],
+            [
+              1285,
+              10475,
+              1305,
+              17074,
+              1884,
+              4692,
+              16,
+              0
+            ],
+            [
+              1241,
+              5149,
+              1144,
+              9672,
+              1885,
+              4680,
+              17,
+              0
+            ],
+            [
+              1249,
+              10496,
+              1299,
+              10690,
+              1888,
+              9308,
+              27,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 26,
+          "state_root": "8b59fe5f808cae9ddecbbb009661f96af0cd789ce3016adaeccc1b3b0acf8116",
+          "node_us": [
+            [
+              1168,
+              5295,
+              1133,
+              6441,
+              1902,
+              5465,
+              18,
+              34753
+            ],
+            [
+              1197,
+              14512,
+              1128,
+              12675,
+              1901,
+              6655,
+              16,
+              0
+            ],
+            [
+              1189,
+              19070,
+              1122,
+              13425,
+              1929,
+              12958,
+              23,
+              0
+            ],
+            [
+              1189,
+              7201,
+              1200,
+              15378,
+              1938,
+              12936,
+              21,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 27,
+          "state_root": "7ec4cded688efe525282ca624367ca4fc05c216ee4b346ec9eccceddfa6d7388",
+          "node_us": [
+            [
+              1214,
+              4362,
+              1132,
+              4285,
+              1892,
+              4854,
+              18,
+              37646
+            ],
+            [
+              1216,
+              10793,
+              1133,
+              19232,
+              1953,
+              10799,
+              16,
+              0
+            ],
+            [
+              1182,
+              5368,
+              1128,
+              17419,
+              1889,
+              5428,
+              15,
+              0
+            ],
+            [
+              1227,
+              17335,
+              1119,
+              17240,
+              2171,
+              23515,
+              19,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 28,
+          "state_root": "d6132320a29489300e609c871ba88e8bfb9313366008e781dfa8a3cc926e83e5",
+          "node_us": [
+            [
+              1372,
+              6886,
+              1311,
+              4318,
+              2059,
+              5361,
+              19,
+              23268
+            ],
+            [
+              1468,
+              3832,
+              1442,
+              10534,
+              1887,
+              6573,
+              18,
+              0
+            ],
+            [
+              1492,
+              3835,
+              1414,
+              10565,
+              1896,
+              20361,
+              19,
+              0
+            ],
+            [
+              1447,
+              3864,
+              1302,
+              5232,
+              1945,
+              12848,
+              15,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 29,
+          "state_root": "3d4e8386404c978038f8b9ca11399edd963f66fabd6d388855f56862fce495c5",
+          "node_us": [
+            [
+              1402,
+              5045,
+              1323,
+              5030,
+              2195,
+              4444,
+              22,
+              35350
+            ],
+            [
+              1407,
+              12315,
+              1554,
+              17841,
+              2263,
+              10568,
+              21,
+              0
+            ],
+            [
+              1390,
+              5824,
+              1550,
+              12440,
+              2189,
+              5082,
+              22,
+              0
+            ],
+            [
+              1372,
+              12296,
+              1550,
+              13296,
+              2190,
+              10606,
+              20,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 30,
+          "state_root": "6746e9a19ddc64dd0ee132d2960973f71570052641f65d9762a658dcec127e35",
+          "node_us": [
+            [
+              1406,
+              6996,
+              1581,
+              6779,
+              2192,
+              6211,
+              23,
+              29393
+            ],
+            [
+              1666,
+              9782,
+              1548,
+              14823,
+              2191,
+              7221,
+              18,
+              0
+            ],
+            [
+              1668,
+              5228,
+              1551,
+              8411,
+              2190,
+              14552,
+              18,
+              0
+            ],
+            [
+              1650,
+              9776,
+              1548,
+              9377,
+              2192,
+              14530,
+              20,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 31,
+          "state_root": "8acd641bcc50bd2b72c9bc4a972fe2695c5fc5a8548d4651d23f05e1b65fbabc",
+          "node_us": [
+            [
+              1409,
+              5974,
+              1316,
+              11539,
+              2204,
+              7783,
+              24,
+              47189
+            ],
+            [
+              1842,
+              27229,
+              1479,
+              16957,
+              2565,
+              33306,
+              21,
+              0
+            ],
+            [
+              1761,
+              17084,
+              1337,
+              14362,
+              2508,
+              27906,
+              23,
+              0
+            ],
+            [
+              1743,
+              22643,
+              1402,
+              15123,
+              2223,
+              28179,
+              21,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 32,
+          "state_root": "ef8d6a4620dd172d32bb54fa9dd54baeb2c849a369d78d3bf7775cfe00d62d3e",
+          "node_us": [
+            [
+              1645,
+              7647,
+              1401,
+              5311,
+              2194,
+              8514,
+              22,
+              37083
+            ],
+            [
+              1959,
+              4781,
+              1396,
+              16005,
+              2213,
+              5513,
+              19,
+              0
+            ],
+            [
+              2076,
+              15546,
+              1561,
+              18814,
+              2264,
+              9849,
+              19,
+              0
+            ],
+            [
+              1963,
+              10164,
+              1557,
+              16838,
+              2192,
+              9927,
+              19,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 33,
+          "state_root": "364a22def2d0f94df39512a598fb949a969dd6e31c61727e105dd8905d206867",
+          "node_us": [
+            [
+              1399,
+              5939,
+              1319,
+              7257,
+              2185,
+              5636,
+              25,
+              32842
+            ],
+            [
+              1646,
+              14513,
+              1345,
+              8864,
+              2221,
+              6181,
+              15,
+              0
+            ],
+            [
+              1643,
+              7181,
+              1554,
+              11446,
+              2211,
+              12594,
+              18,
+              0
+            ],
+            [
+              1652,
+              14459,
+              1353,
+              13406,
+              2185,
+              6164,
+              18,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 34,
+          "state_root": "d20fc98d5cc0e212baa21fd00fb9c6d2da3922cd40bb897c389371b7d981f8c1",
+          "node_us": [
+            [
+              1368,
+              4920,
+              1331,
+              5398,
+              2074,
+              8617,
+              19,
+              30859
+            ],
+            [
+              1404,
+              10227,
+              1310,
+              11733,
+              2229,
+              9798,
+              16,
+              0
+            ],
+            [
+              1408,
+              10214,
+              1315,
+              18182,
+              2189,
+              5294,
+              18,
+              0
+            ],
+            [
+              1369,
+              4971,
+              1321,
+              10354,
+              2208,
+              9767,
+              16,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 35,
+          "state_root": "3168efb59da5e11cd6c5901842f37357fe9ff25c6a878bf3c642453ed8f11ab0",
+          "node_us": [
+            [
+              1195,
+              6170,
+              1305,
+              7277,
+              1914,
+              5755,
+              18,
+              31524
+            ],
+            [
+              1396,
+              14216,
+              1319,
+              8865,
+              1899,
+              6517,
+              19,
+              0
+            ],
+            [
+              1384,
+              14206,
+              1312,
+              8865,
+              2163,
+              19133,
+              20,
+              0
+            ],
+            [
+              1362,
+              6884,
+              1145,
+              11757,
+              1907,
+              6467,
+              19,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 36,
+          "state_root": "383281c6be326c1aabd15630d5f1acadac33dd536ce377bfa19e54e06c3f8f3b",
+          "node_us": [
+            [
+              1403,
+              7844,
+              1318,
+              5345,
+              2000,
+              7476,
+              20,
+              27830
+            ],
+            [
+              1436,
+              4860,
+              1304,
+              8541,
+              2190,
+              14440,
+              20,
+              0
+            ],
+            [
+              1374,
+              9321,
+              1305,
+              9609,
+              2139,
+              7114,
+              19,
+              0
+            ],
+            [
+              1362,
+              9333,
+              1312,
+              9606,
+              2178,
+              14399,
+              22,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 37,
+          "state_root": "0fc0d67401a1aec44ec8b6ec1189740f872df9bcb99245e7f2c38adbde495cde",
+          "node_us": [
+            [
+              1212,
+              5286,
+              1302,
+              6027,
+              1888,
+              4330,
+              20,
+              34610
+            ],
+            [
+              1404,
+              12342,
+              1127,
+              13684,
+              1911,
+              5555,
+              16,
+              0
+            ],
+            [
+              1386,
+              12337,
+              1123,
+              18256,
+              1899,
+              10939,
+              19,
+              0
+            ],
+            [
+              1367,
+              5803,
+              1131,
+              12851,
+              1926,
+              10899,
+              17,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 38,
+          "state_root": "e74aae2a041d5cdbd8d13ad708e80038896fdefc37ec5e6f4a75e17af653ef74",
+          "node_us": [
+            [
+              1217,
+              7156,
+              1124,
+              7214,
+              1476,
+              6326,
+              14,
+              23555
+            ],
+            [
+              1192,
+              5149,
+              1134,
+              7960,
+              1385,
+              13578,
+              13,
+              0
+            ],
+            [
+              1180,
+              5123,
+              1122,
+              7981,
+              1376,
+              6137,
+              12,
+              0
+            ],
+            [
+              1181,
+              9728,
+              1134,
+              8797,
+              1411,
+              13540,
+              13,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 39,
+          "state_root": "850443d34bb8a8d9aed9c373d528efb024e8cba19ba81ce62c460f7b27569165",
+          "node_us": [
+            [
+              1376,
+              4177,
+              711,
+              4783,
+              2021,
+              6978,
+              23,
+              31621
+            ],
+            [
+              1243,
+              5428,
+              1029,
+              10987,
+              2182,
+              9980,
+              19,
+              0
+            ],
+            [
+              1231,
+              10784,
+              1298,
+              12644,
+              2140,
+              4425,
+              15,
+              0
+            ],
+            [
+              1244,
+              10757,
+              1298,
+              20070,
+              2265,
+              9869,
+              20,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 40,
+          "state_root": "c1fb3a83d0f9946b9963258354a8229cbdb0e6b44ce397b43ba25a13a8887902",
+          "node_us": [
+            [
+              1397,
+              7055,
+              1321,
+              7095,
+              2196,
+              6748,
+              20,
+              36389
+            ],
+            [
+              1524,
+              7626,
+              1314,
+              14492,
+              2283,
+              18905,
+              21,
+              0
+            ],
+            [
+              1544,
+              17784,
+              1467,
+              15922,
+              2187,
+              7059,
+              18,
+              0
+            ],
+            [
+              1530,
+              13297,
+              1505,
+              14043,
+              2188,
+              14457,
+              18,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 41,
+          "state_root": "e6f82f8242ab9f0b5a8ceb576f8b5849b18e1911093bee123100f88bd3ed02c5",
+          "node_us": [
+            [
+              1395,
+              5142,
+              1309,
+              6106,
+              1845,
+              4633,
+              19,
+              37238
+            ],
+            [
+              1388,
+              6802,
+              1357,
+              12591,
+              2456,
+              15836,
+              28,
+              0
+            ],
+            [
+              1370,
+              13285,
+              1128,
+              14643,
+              1964,
+              5454,
+              20,
+              0
+            ],
+            [
+              1376,
+              13265,
+              1132,
+              19432,
+              2332,
+              15889,
+              29,
+              0
+            ]
+          ]
+        },
+        {
+          "event": "replicas_applied",
+          "sequence": 42,
+          "state_root": "a06e3b9fadfb3a7e08d3145520294108da6f5230aaeea7460d3d68a1021ce290",
+          "node_us": [
+            [
+              1456,
+              7954,
+              1305,
+              8401,
+              2186,
+              6207,
+              20,
+              29554
+            ],
+            [
+              1441,
+              10091,
+              1323,
+              9558,
+              2220,
+              7225,
+              18,
+              0
+            ],
+            [
+              1379,
+              10163,
+              1324,
+              9561,
+              2205,
+              14616,
+              16,
+              0
+            ],
+            [
+              1405,
+              5444,
+              1312,
+              8814,
+              2222,
+              14585,
+              16,
+              0
+            ]
+          ]
+        }
+      ]
+    }
+  ],
+  "interruption_checks": [
+    {
+      "cut": "after-intent",
+      "interruption_exit": 73,
+      "reopen_exit": 0,
+      "recovery_exit": 0,
+      "duplicate_exit": 0,
+      "exact_vote_observations": 1
+    },
+    {
+      "cut": "after-signed",
+      "interruption_exit": 73,
+      "reopen_exit": 0,
+      "recovery_exit": 0,
+      "duplicate_exit": 0,
+      "exact_vote_observations": 2
+    },
+    {
+      "cut": "after-published",
+      "interruption_exit": 73,
+      "reopen_exit": 0,
+      "recovery_exit": 0,
+      "duplicate_exit": 0,
+      "exact_vote_observations": 3
+    },
+    {
+      "cut": "after-decision",
+      "interruption_exit": 73,
+      "reopen_exit": 0,
+      "recovery_exit": 0,
+      "duplicate_exit": 0,
+      "exact_vote_observations": 1
+    },
+    {
+      "cut": "after-applied",
+      "interruption_exit": 73,
+      "reopen_exit": 0,
+      "recovery_exit": 0,
+      "duplicate_exit": 0,
+      "exact_vote_observations": 1
+    },
+    {
+      "fault": "missing-intent",
+      "safe_refusal_exit": 1
+    },
+    {
+      "fault": "missing-snapshot",
+      "safe_refusal_exit": 1
+    },
+    {
+      "fault": "bad-snapshot",
+      "safe_refusal_exit": 1
+    },
+    {
+      "fault": "bad-record",
+      "safe_refusal_exit": 1
+    }
+  ]
+}
