@@ -1,0 +1,179 @@
+name: FlowMesh regtest tester builds
+
+# This workflow publishes CI artifacts only. A human-authorized prerelease
+# handoff must select the exact successful revision; no production/tag deploy.
+on:
+  workflow_dispatch:
+  push:
+    branches: [flowmeshV2-dev]
+    paths:
+      - '.github/workflows/flowmesh-regtest-build.yml'
+      - 'contrib/flowmesh-regtest/**'
+      - 'src/qt/test/flowmeshclosedtest*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flowmesh-regtest-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify profile and package guard invariants
+        run: python3 -B contrib/flowmesh-regtest/test_package.py -v
+
+  windows-cross:
+    needs: profile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake curl make pkgconf python3 g++-mingw-w64-x86-64-posix zip
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+      - uses: actions/cache@v4
+        with:
+          path: |
+            depends/built
+            depends/sources
+            depends/x86_64-w64-mingw32
+          key: regtest-windows-depends-v1-${{ hashFiles('depends/**') }}
+      - name: Build pinned Windows dependencies
+        run: make -C depends HOST=x86_64-w64-mingw32 NO_IPC=1 -j"$(nproc)"
+      - name: Configure guarded GUI and focused policy tests
+        run: >-
+          cmake -S . -B build --toolchain depends/x86_64-w64-mingw32/toolchain.cmake
+          -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=ON -DENABLE_WALLET=ON
+          -DENABLE_IPC=OFF -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF
+          -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF
+          -DBUILD_FLOWMESH_REGTEST_CLIENT=ON -DBUILD_FLOWMESH_REGTEST_POLICY_TESTS=ON
+          -DB3_FLOWMESH_CLOSED_TEST_PROFILE=${{ github.workspace }}/contrib/flowmesh-regtest/profile-vps-20260926.json
+          -DB3_REQUIRE_UPDATE_CHANNEL=OFF
+      - name: Compile only the guarded app and policy test
+        run: cmake --build build -j"$(nproc)" --target test_b3_flowmeshclosed-gui test_b3_flowmeshclosed-policy
+      - name: Collect pinned public Qt dependency notices
+        run: |
+          qt_version=$(sed -nE 's/^qt_details_version := ([0-9.]+)/\1/p' depends/packages/qt_details.mk)
+          python3 -B contrib/closed-test/collect-notices.py --qt-version "$qt_version" --output-dir "$RUNNER_TEMP/regtest-notices"
+      - name: Package guarded GUI only; collect native test dependencies separately
+        run: >-
+          python3 -B contrib/flowmesh-regtest/package.py --build build --platform win64
+          --depends depends/x86_64-w64-mingw32 --output build/out --policy-probe-output build/policy-probe
+          --notices "$RUNNER_TEMP/regtest-notices"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: regtest-win64
+          path: build/out/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: regtest-windows-policy-probe
+          path: build/policy-probe/
+          if-no-files-found: error
+
+  windows-policy:
+    needs: windows-cross
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: regtest-windows-policy-probe
+      - name: Execute native Windows storage and isolation policy tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Ephemeral CI-only ordinary user: elevated tokens are deliberately
+          # refused by the launcher's same-user storage ownership guard.
+          $testUser = 'B3RegtestPolicy'
+          $testPassword = ConvertTo-SecureString ([guid]::NewGuid().ToString('N') + '!a7') -AsPlainText -Force
+          New-LocalUser -Name $testUser -Password $testPassword -AccountNeverExpires | Out-Null
+          if (!(Get-LocalGroupMember -SID 'S-1-5-32-545' | Where-Object { $_.SID -eq (Get-LocalUser $testUser).SID })) {
+            Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $testUser
+          }
+          $testDir = Join-Path $env:PUBLIC ('B3RegtestPolicy-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $testDir | Out-Null
+          Copy-Item .\*.exe $testDir
+          Get-ChildItem .\*.dll | Copy-Item -Destination $testDir
+          $testAccount = "$env:COMPUTERNAME\$testUser"
+          & icacls $testDir /grant "${testAccount}:(OI)(CI)F" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare isolated CI account directory' }
+          $credential = [pscredential]::new($testAccount, $testPassword)
+          $test = Start-Process -FilePath (Join-Path $testDir 'test_b3_flowmeshclosed-policy.exe') -Credential $credential -LoadUserProfile -WorkingDirectory $testDir -ArgumentList '-o','policy-results.txt,txt' -Wait -PassThru
+          Copy-Item (Join-Path $testDir 'policy-results.txt') policy-results.txt
+          if ($test.ExitCode -ne 0) { throw "Guard policy tests failed: $($test.ExitCode)" }
+          Get-Content policy-results.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regtest-windows-policy-results
+          path: policy-results.txt
+
+  macos:
+    needs: profile
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+          - runner: macos-15-intel
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Select supported toolchain
+        run: sudo xcode-select --switch /Applications/Xcode_16.4.app
+      - name: Install dependencies
+        run: |
+          brew install cmake pkgconf boost libevent openssl@3 sqlite capnp qt@6 qrencode
+          brew reinstall --build-from-source libevent
+      - name: Configure guarded GUI and focused policy tests
+        run: >-
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_GUI=ON -DENABLE_WALLET=ON -DENABLE_IPC=OFF
+          -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF
+          -DBUILD_FLOWMESH_REGTEST_CLIENT=ON -DBUILD_FLOWMESH_REGTEST_POLICY_TESTS=ON
+          -DB3_FLOWMESH_CLOSED_TEST_PROFILE=${{ github.workspace }}/contrib/flowmesh-regtest/profile-vps-20260926.json
+          -DB3_REQUIRE_UPDATE_CHANNEL=OFF
+          -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)"
+          -DCMAKE_OSX_ARCHITECTURES=${{ matrix.architecture }}
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
+      - name: Compile guarded app and policy test only
+        run: cmake --build build -j4 --target test_b3_flowmeshclosed-gui test_b3_flowmeshclosed-policy
+      - name: Execute policy tests
+        run: build/bin/test_b3_flowmeshclosed-policy -o build/policy-results.txt,txt
+      - name: Collect exact-version public dependency notices
+        run: |
+          qt_version=$(sed -nE 's/^set\(PACKAGE_VERSION "([0-9.]+)"\)/\1/p' "$(brew --prefix qt@6)/lib/cmake/Qt6/Qt6ConfigVersionImpl.cmake")
+          python3 -B contrib/closed-test/collect-notices.py --qt-version "$qt_version" --homebrew-prefix "$(brew --prefix)" --output-dir "$RUNNER_TEMP/regtest-notices"
+      - name: Bundle, seal and verify extracted application
+        run: >-
+          python3 -B contrib/flowmesh-regtest/package.py --build build
+          --platform macos-${{ matrix.architecture }} --output build/out
+          --macdeployqt "$(brew --prefix qt@6)/bin/macdeployqt" --minimum-macos 15.0
+          --notices "$RUNNER_TEMP/regtest-notices"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: regtest-macos-${{ matrix.architecture }}
+          path: build/out/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regtest-macos-${{ matrix.architecture }}-policy-results
+          path: build/policy-results.txt
