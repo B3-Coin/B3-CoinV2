@@ -78,14 +78,22 @@ def validate_cache(cache, build):
 def validate_compiled_identity(build, binary, commit):
     header = (build / "src/bitcoin-build-info.h").read_text()
     require(f'#define BUILD_GIT_COMMIT "{commit[:12]}"' in header, "Build is stale or was compiled from a dirty tree")
-    required = {VERSION.encode(), commit[:12].encode()}
+    expected = {"version_ascii": VERSION, "commit_ascii": commit[:12]}
+    required = {name: value.encode("ascii") for name, value in expected.items()}
+    version_utf16le = VERSION.encode("utf-16le")
+    version_utf16le_present = False
     tail = b""
     with binary.open("rb") as stream:
         while required and (block := stream.read(1024 * 1024)):
             block = tail + block
-            required = {value for value in required if value not in block}
+            required = {name: value for name, value in required.items() if value not in block}
+            # Windows version resources use UTF-16LE. Observe that encoding
+            # for diagnosis only; both original ASCII requirements remain.
+            version_utf16le_present |= version_utf16le in block
             tail = block[-256:]
-    require(not required, "Executable lacks the expected compiled source identity")
+    missing = ", ".join(f"{name}={expected[name]!r}" for name in required)
+    require(not required, "Executable lacks the expected compiled source identity: missing " + missing +
+            f"; version_utf16le_present={str(version_utf16le_present).lower()} (diagnostic only)")
 
 def macos_library_paths(macdeployqt, qt_cmake_dir, extra=()):
     # Homebrew's Qt umbrella exposes frameworks from separate formulae via

@@ -45,21 +45,66 @@ class PackageTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             PACKAGE.validate_profile(json.dumps(changed).encode(), self.ca)
 
-    def test_stale_compiled_identity_refused(self):
+    def compiled_identity_fixture(self, path):
+        build = Path(path)
+        (build / "src").mkdir()
+        commit = "123456789abc" + "1" * 28
+        header = build / "src/bitcoin-build-info.h"
+        binary = build / "gui"
+        header.write_text('#define BUILD_GIT_COMMIT "' + commit[:12] + '"\n')
+        return build, header, binary, commit
+
+    def test_matching_ascii_compiled_identity(self):
         with tempfile.TemporaryDirectory() as path:
-            build = Path(path)
-            (build / "src").mkdir()
-            commit = "1" * 40
-            header = build / "src/bitcoin-build-info.h"
-            binary = build / "gui"
-            header.write_text('#define BUILD_GIT_COMMIT "' + commit[:12] + '"\n')
+            build, _, binary, commit = self.compiled_identity_fixture(path)
             binary.write_bytes(PACKAGE.VERSION.encode() + b" " + commit[:12].encode())
             PACKAGE.validate_compiled_identity(build, binary, commit)
-            binary.write_bytes(PACKAGE.VERSION.encode() + b" oldcommit")
-            with self.assertRaises(RuntimeError):
-                PACKAGE.validate_compiled_identity(build, binary, commit)
-            header.write_text('#define BUILD_GIT_COMMIT "' + commit[:12] + '-dirty"\n')
-            with self.assertRaises(RuntimeError):
+
+    def test_missing_compiled_identity_reports_exact_ascii_requirements(self):
+        with tempfile.TemporaryDirectory() as path:
+            build, _, binary, commit = self.compiled_identity_fixture(path)
+            version = PACKAGE.VERSION.encode()
+            revision = commit[:12].encode()
+            cases = [
+                (version + b" oldcommit", {"commit_ascii"}, False),
+                (b"oldversion " + revision, {"version_ascii"}, False),
+                (b"unrelated", {"version_ascii", "commit_ascii"}, False),
+                (PACKAGE.VERSION.encode("utf-16le") + revision, {"version_ascii"}, True),
+                (PACKAGE.VERSION.encode("utf-16le") + commit[:12].encode("utf-16le"),
+                 {"version_ascii", "commit_ascii"}, True),
+            ]
+            for content, missing, utf16_present in cases:
+                with self.subTest(missing=missing, utf16_present=utf16_present):
+                    binary.write_bytes(content)
+                    with self.assertRaises(RuntimeError) as raised:
+                        PACKAGE.validate_compiled_identity(build, binary, commit)
+                    message = str(raised.exception)
+                    for name, value in (("version_ascii", PACKAGE.VERSION), ("commit_ascii", commit[:12])):
+                        self.assertEqual(f"{name}={value!r}" in message, name in missing)
+                    self.assertIn(f"version_utf16le_present={str(utf16_present).lower()} (diagnostic only)", message)
+
+    def test_stale_and_dirty_compiled_headers_refused_with_matching_binary(self):
+        with tempfile.TemporaryDirectory() as path:
+            build, header, binary, commit = self.compiled_identity_fixture(path)
+            binary.write_bytes(PACKAGE.VERSION.encode() + b" " + commit[:12].encode())
+            for recorded in ("0" * 12, commit[:12] + "-dirty"):
+                with self.subTest(recorded=recorded):
+                    header.write_text('#define BUILD_GIT_COMMIT "' + recorded + '"\n')
+                    with self.assertRaisesRegex(RuntimeError, "Build is stale or was compiled from a dirty tree"):
+                        PACKAGE.validate_compiled_identity(build, binary, commit)
+
+    def test_compiled_identity_across_scan_boundaries(self):
+        with tempfile.TemporaryDirectory() as path:
+            build, _, binary, commit = self.compiled_identity_fixture(path)
+            version = PACKAGE.VERSION.encode()
+            revision = commit[:12].encode()
+            for split, other in ((version, revision), (revision, version)):
+                with self.subTest(split=split):
+                    binary.write_bytes(b"x" * (1024 * 1024 - len(split) // 2) + split + b"\0" + other)
+                    PACKAGE.validate_compiled_identity(build, binary, commit)
+            utf16_version = PACKAGE.VERSION.encode("utf-16le")
+            binary.write_bytes(b"x" * (1024 * 1024 - len(utf16_version) // 2) + utf16_version + b"\0" + revision)
+            with self.assertRaisesRegex(RuntimeError, "version_utf16le_present=true \\(diagnostic only\\)"):
                 PACKAGE.validate_compiled_identity(build, binary, commit)
 
     def test_matching_but_unapproved_ca_refused(self):

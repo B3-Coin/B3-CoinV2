@@ -67,6 +67,7 @@ jobs:
           qt_version=$(sed -nE 's/^qt_details_version := ([0-9.]+)/\1/p' depends/packages/qt_details.mk)
           python3 -B contrib/closed-test/collect-notices.py --qt-version "$qt_version" --output-dir "$RUNNER_TEMP/regtest-notices"
       - name: Package guarded GUI only; collect native test dependencies separately
+        id: package-windows-guard
         run: >-
           python3 -B contrib/flowmesh-regtest/package.py --build build --platform win64
           --depends depends/x86_64-w64-mingw32 --output build/out --policy-probe-output build/policy-probe
@@ -81,6 +82,18 @@ jobs:
           name: regtest-windows-policy-probe
           path: build/policy-probe/
           if-no-files-found: error
+      - name: Preserve failed Windows identity evidence — NOT FOR TESTERS
+        if: ${{ failure() && steps.package-windows-guard.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: NOT-FOR-TESTERS-regtest-win64-identity-diagnostics
+          # Exact allowlist: no tester archive, wallet, runtime data, or keys.
+          path: |
+            build/bin/test_b3_flowmeshclosed-gui.exe
+            build/src/bitcoin-build-info.h
+            build/src/bitcoin-build-config.h
+          if-no-files-found: error
+          retention-days: 3
 
   windows-policy:
     needs: windows-cross
