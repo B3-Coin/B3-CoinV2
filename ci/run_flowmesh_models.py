@@ -70,6 +70,11 @@ SUITES = {
         "test_message_checker.py": 8,
         "test_future_pc_report.py": 6,
     }),
+    # Standard-library observer controls only. Real C++ process/disk campaigns
+    # require the separately documented native build and are NOT run here.
+    "native_observer": ("test/flowmesh_v2_fastpath_native", "test_native_checker.py", 30, {
+        "test_native_checker.py": 30,
+    }),
 }
 
 

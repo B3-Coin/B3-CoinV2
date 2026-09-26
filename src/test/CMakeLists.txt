@@ -293,6 +293,14 @@ if(UNIX AND BUILD_FLOWMESH_FASTPATH_PROBE)
     flowmesh_fastpath_probe.cpp flowmesh_fastpath_probe_fixture.cpp)
   target_link_libraries(flowmesh-fastpath-probe
     core_interface bitcoin_node bitcoin_consensus univalue Boost::headers)
+  add_executable(flowmesh-p2fv-proof-check
+    flowmesh_p2fv_proof_check.cpp flowmesh_p2fv_proof.cpp flowmesh_fastpath_probe_fixture.cpp)
+  target_link_libraries(flowmesh-p2fv-proof-check
+    core_interface bitcoin_node bitcoin_consensus univalue Boost::headers)
+  add_executable(flowmesh-p2fv-worker
+    flowmesh_p2fv_worker.cpp flowmesh_p2fv_proof.cpp flowmesh_fastpath_probe_fixture.cpp)
+  target_link_libraries(flowmesh-p2fv-worker
+    core_interface bitcoin_node bitcoin_consensus univalue Boost::headers)
 endif()
 
 if(ENABLE_WALLET)
