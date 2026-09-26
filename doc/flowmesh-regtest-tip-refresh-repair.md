@@ -41,6 +41,16 @@ consensus, V2 activation, a performance claim, or a production deployment.
    is rewritten. A real paused market still refuses; its actual pause reason
    is no longer misreported as necessarily insufficient seats.
 
+4. **Remote pause-reason loss:** the HTTPS snapshot/updates status omitted the
+   service's typed `chain_reconciling` observation, and the remote projection
+   always left it false. A temporary reconciliation error could therefore
+   appear as a generic market halt in engine-off Qt. Snapshot/updates now
+   carry this optional boolean and the client validates and projects it.
+   Older endpoints remain compatible (absent means unknown/false, with all
+   existing paused/error restrictions intact). This is an unauthenticated
+   runtime observation, not certified state, proof of readiness, or permission
+   to trade through an active pause. A real hard halt still takes precedence.
+
 ## Executed local checks
 
 - New `feature_flowmesh_deposit_race.py`: passed on the patched native daemon;
@@ -57,6 +67,11 @@ consensus, V2 activation, a performance claim, or a production deployment.
   cancellation, exact-fee matched trade, withdrawal, restart and its existing
   generated-data reindex check. No live datadir was reindexed.
 - `asset_amount_rpc_tests,wallet_rpc_tests`: 17 cases passed.
+- New `feature_flowmesh_reconciliation_status.py`: failed before (true status
+  observed as false), passed after, with five clean child exits. Tests actual
+  server serialization and remote projection through snapshot and unchanged
+  updates: true/false/missing/malformed field, unchanged certified head and
+  proof flags, no submitted action. Qt still distinguishes a true hard halt.
 - Native Qt workspace/policy tests: counts above. Actual screen-level behavior
   and same-wallet test-network use must be reported separately from these tests.
 
@@ -74,6 +89,8 @@ QT_QPA_PLATFORM=offscreen build/bin/test_b3_flowmeshworkspace-qt
 python3 -B test/functional/feature_flowmesh_deposit_race.py \
   --configfile=build/test/config.ini --randomseed=5482936382661989032
 python3 -B test/functional/feature_flowmesh_release.py \
+  --configfile=build/test/config.ini --randomseed=5482936382661989032
+python3 -B test/functional/feature_flowmesh_reconciliation_status.py \
   --configfile=build/test/config.ini --randomseed=5482936382661989032
 ```
 

@@ -2244,6 +2244,7 @@ private Q_SLOTS:
             result->snapshot = panel.m_snapshot;
             result->snapshot->unchanged = true;
             result->snapshot->chain_reconciling = result->snapshot->paused = reconciling;
+            result->snapshot->error = reconciling ? QStringLiteral("FlowMesh service is not active at the current B3 tip") : QString{};
             result->markets.front().ready = result->markets.front().publish_ready = !reconciling;
             ReadInFlight(panel);
             panel.finishJob(result);
@@ -2265,6 +2266,7 @@ private Q_SLOTS:
             QCOMPARE(panel.m_deposit->isEnabled(), !reconciling);
             QCOMPARE(panel.m_status->text().contains(QStringLiteral("Reconciling")), reconciling);
         }
+        panel.m_snapshot->chain_reconciling = true;
         panel.m_snapshot->halt = QStringLiteral("invalid-checkpoint"); panel.updateMarketText();
         QVERIFY(!panel.m_order->isEnabled()); QVERIFY(panel.m_status->text().contains(QStringLiteral("halted")));
         panel.m_response_age.invalidate(); panel.updateMarketText();

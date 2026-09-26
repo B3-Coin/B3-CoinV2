@@ -328,7 +328,11 @@ class TradingApi {
             status.pending_checkpoint_sequence = checkpoint->sequence;
             status.pending_checkpoint_effect_count = checkpoint->effect_count;
         }
-        return MarketResponse(status);
+        auto out{MarketResponse(status)};
+        // Keep this transient service observation with the captured response.
+        // It is not part of the certified entry or authenticated account state.
+        out.pushKV("chain_reconciling", snapshot.chain_reconciling);
+        return out;
     }
     bool Admit(const std::string& peer)
     {
@@ -630,6 +634,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             Id(value, "execution_config_id") != pins.execution_config_id || Text(value, "quote_asset") != "B3")
             Fail("Endpoint market/domain/configuration differs from local B3 pins");
         (void)Flag(value, "running"); (void)Flag(value, "paused"); (void)Flag(value, "pending_handoff");
+        if (value.exists("chain_reconciling")) (void)Flag(value, "chain_reconciling");
         (void)Text(value, "halt"); (void)Text(value, "error");
         (void)Number(value, "next_microblock_sequence"); (void)Id(value, "last_microblock_hash", true);
     }
@@ -1031,6 +1036,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         out->certificate_verified = true; out->account_state_verified = true;
         out->event_gap = cache.event_gap;
         out->snapshot.running = Flag(cache.status, "running"); out->snapshot.paused = Flag(cache.status, "paused");
+        // Older endpoints omit the reason; their paused/error gates still
+        // apply. Never infer reconciliation from an endpoint's error text.
+        out->snapshot.chain_reconciling = cache.status.exists("chain_reconciling") && Flag(cache.status, "chain_reconciling");
         out->snapshot.pending_handoff = Flag(cache.status, "pending_handoff"); out->snapshot.halt = Text(cache.status, "halt");
         out->snapshot.error = Text(cache.status, "error"); out->snapshot.runtime.round = Number(cache.status, "round", UINT32_MAX);
         out->snapshot.pending_actions = Number(cache.status, "pending_actions", 65536);
