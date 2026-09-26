@@ -5,6 +5,7 @@
 #include <qt/b3theme.h>
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
+#include <node/flowmesh_client_work.h>
 #include <node/flowmesh_timing.h>
 #include <rpc/protocol.h>
 #include <util/moneystr.h>
@@ -43,6 +44,9 @@ using B3FlowMeshTrading::Action;
 using B3FlowMeshTrading::Market;
 using B3FlowMeshTrading::Operation;
 namespace {
+// Local scheduling only: not transport failure, action cancellation or a
+// freshness observation. Caught separately before applying any partial read.
+struct PassiveRefreshYield {};
 QLabel* Label(const QString& text, QWidget* parent) {
     auto* label{new QLabel{text, parent}}; label->setTextFormat(Qt::PlainText);
     label->setWordWrap(true); label->setTextInteractionFlags(Qt::TextSelectableByMouse); return label;
@@ -556,7 +560,7 @@ void B3FlowMeshTradingPanel::requestOrderReview()
     if (!orderReviewAvailable()) return;
     // The stable entry requests only a read. Approval still requires current
     // readiness; a paused or failed refresh consumes this intent, not retries it.
-    if (!m_thread) startJob();
+    if (!m_thread) startJob(std::nullopt, std::nullopt, false, false, std::nullopt, {}, true);
     if (deferReview(Operation::Order))
         notice(tr("Checking current market readiness for this exact order. Nothing is approved, signed or sent; if the check fails, review again. There is no automatic retry."));
 }
@@ -600,7 +604,8 @@ void B3FlowMeshTradingPanel::openFunding(bool withdrawal)
     if (accepted) {
         // The modal draft pauses background reads. Refresh once after Continue,
         // then reuse the existing review-only continuation, never an action queue.
-        m_catalog_age.invalidate(); resetRefreshSchedule(); startJob();
+        m_catalog_age.invalidate(); resetRefreshSchedule();
+        startJob(std::nullopt, std::nullopt, false, false, std::nullopt, {}, true);
         if (deferReview(admission ? Operation::Admit : withdrawal ? Operation::Withdraw : Operation::Deposit))
             m_deferred_review->funding_context = DeferredReview::FundingContext{*selected, units,
                 withdrawal ? m_withdrawal_draft_amount : m_amount->text(), withdrawal ? m_destination->text() : QString{},
@@ -657,7 +662,7 @@ void B3FlowMeshTradingPanel::refresh()
 
 void B3FlowMeshTradingPanel::resetRefreshSchedule()
 {
-    m_refresh_phase = RefreshPhase::Catalog; ++m_refresh_epoch;
+    m_refresh_phase = RefreshPhase::Catalog; m_refresh_yields = 0; ++m_refresh_epoch;
 }
 
 void B3FlowMeshTradingPanel::requestConnect()
@@ -834,6 +839,7 @@ bool B3FlowMeshTradingPanel::deferReview(Operation operation, bool funding)
     if (operation == Operation::Order)
         m_deferred_review->order_context = DeferredReview::OrderContext{m_wallet, *selected, m_snapshot->units,
             m_price->text(), m_quantity->text(), m_side->currentIndex(), inverted(), m_active_result && m_active_result->receipt_only};
+    if (m_active_result && m_active_result->passive && m_refresh_yields < MAX_REFRESH_YIELDS) m_yield_refresh->store(true);
     m_busy = true; updateControls(); return true;
 }
 
@@ -861,8 +867,8 @@ void B3FlowMeshTradingPanel::resumeReview()
         }
         if (needs_market_read) {
             // An explicit saved-receipt check carries no market snapshot.
-            // Follow it once with the ordinary passive read, never an action.
-            startJob();
+            // Follow it once with a foreground read, never an action.
+            startJob(std::nullopt, std::nullopt, false, false, std::nullopt, {}, true);
             if (!m_thread) return;
             m_deferred_review = intent; m_deferred_review->order_context->needs_market_read = false;
             m_busy = true; updateControls(); return;
@@ -984,6 +990,7 @@ void B3FlowMeshTradingPanel::requestStatusRead()
         updateStatusReadState(); return;
     }
     m_deferred_status = scope;
+    if (m_active_result && m_active_result->passive && m_refresh_yields < MAX_REFRESH_YIELDS) m_yield_refresh->store(true);
     updateStatusReadState(); resumeStatusRead();
 }
 
@@ -1008,7 +1015,7 @@ void B3FlowMeshTradingPanel::updateStatusReadState()
 }
 
 void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optional<B3AssetTransfer::Prepared> prepared, bool exact_retry, bool receipt_only,
-                                    std::optional<StatusRead> status_read, const QString& connect_url)
+                                    std::optional<StatusRead> status_read, const QString& connect_url, bool foreground_read)
 {
     if (!m_wallet || !m_backend || m_thread) return;
     if (receipt_only) {
@@ -1031,18 +1038,22 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     auto result{std::make_shared<Result>()}; result->action = action; result->prepared = prepared; result->broadcast = prepared.has_value(); result->wallet = m_wallet_name;
     result->connect_url = connect_url;
     result->exact_retry = exact_retry; result->receipt_only = receipt_only;
+    result->passive = !action && !exact_retry && !receipt_only && connect_url.isEmpty() && !foreground_read;
+    result->foreground_read = foreground_read;
+    m_yield_refresh->store(false);
     result->receipt_scope = receipt_only ? status_read : !action && !exact_retry ? selectedStatusRead() : std::nullopt;
     m_active_result = result;
-    auto* node{&m_wallet->node()}; const auto backend{m_backend}; const auto cancel{m_cancel};
+    auto* node{&m_wallet->node()}; const auto backend{m_backend}; const auto cancel{m_cancel}; const auto yield_refresh{m_yield_refresh};
     const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())}; const auto generation{m_generation};
     const auto selected{market()}; const QString selected_id{selected ? selected->id : QString{}};
     const bool catalog_due{!m_catalog_age.isValid() || m_catalog_age.elapsed() >= 5000 || (m_snapshot && m_snapshot->chain_reconciling)};
     // Complete the bounded cycle before considering an overdue catalog again.
     // Receipt gets its own slot so a slow cycle cannot starve saved requests.
-    const auto phase{m_route_pending || m_market_data.empty() ? RefreshPhase::Catalog :
+    const auto phase{m_route_pending || m_market_data.empty() || (foreground_read && !m_catalog_age.isValid()) ? RefreshPhase::Catalog :
+        foreground_read ? RefreshPhase::None :
         m_refresh_phase != RefreshPhase::None ? m_refresh_phase : catalog_due ? RefreshPhase::Catalog :
         tracked ? RefreshPhase::Receipt : RefreshPhase::None};
-    if (!action && !exact_retry && !receipt_only && connect_url.isEmpty()) {
+    if (result->passive || foreground_read) {
         result->refresh_phase = phase; result->refresh_epoch = m_refresh_epoch;
     }
     const auto refresh_basis{m_snapshot};
@@ -1053,7 +1064,15 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
         receipt_id{status_read ? status_read->action_id : tracked ? m_receipt->action_id : QString{}};
     result->receipt_market = receipt_market; result->receipt_action_id = receipt_id;
     result->receipt_account = status_read ? status_read->account : tracked ? m_pending_account : QString{};
-    m_thread = QThread::create([this, generation, node, backend, cancel, uri, result, selected_id, known_head, route_base, phase, refresh_basis, watch_queue, queue_watch, receipt_market, receipt_id] {
+    m_thread = QThread::create([this, generation, node, backend, cancel, yield_refresh, uri, result, selected_id, known_head, route_base, phase, refresh_basis, watch_queue, queue_watch, receipt_market, receipt_id] {
+        const node::FlowMeshClientWorkScope priority{result->passive ? node::FlowMeshClientWorkPriority::PASSIVE : node::FlowMeshClientWorkPriority::FOREGROUND};
+        std::exception_ptr auxiliary_error;
+        const auto record_failure = [&](std::exception_ptr error) {
+            try { std::rethrow_exception(error); }
+            catch (const UniValue& value) { result->error = RpcError(value); }
+            catch (const std::exception& value) { result->error = QString::fromUtf8(value.what()).left(500); }
+            catch (...) { result->error = QStringLiteral("The FlowMesh operation failed."); }
+        };
         const auto read_client_info = [&] {
             if (cancel->load() || node->shutdownRequested()) return;
             try {
@@ -1068,6 +1087,12 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
             const auto cancelled = [&] { return cancel->load() || node->shutdownRequested(); };
             const B3FlowMeshTrading::RpcCall rpc = [&](const std::string& method, const UniValue& params) {
                 if (cancelled()) throw std::runtime_error{"Operation cancelled."};
+                if (result->passive && yield_refresh->load()) {
+                    // Priority must not turn a real earlier read failure into
+                    // a successful yield/review. Preserve conservative gating.
+                    if (auxiliary_error) std::rethrow_exception(auxiliary_error);
+                    throw PassiveRefreshYield{};
+                }
                 if (!NoSpendingRequired(method)) {
                     // Readiness RPCs may themselves outlast the local deadline.
                     // Do not access UI timers from this worker; this captured
@@ -1101,7 +1126,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                 return;
             }
             if (!result->action) {
-                node::FlowMeshTimingSpan timing{"qt_passive_refresh"};
+                node::FlowMeshTimingSpan timing{result->passive ? "qt_passive_refresh" : "qt_review_read"};
                 if (timing.Enabled()) {
                     const char* label = phase == RefreshPhase::Catalog ? "catalog" : phase == RefreshPhase::Status ? "status" :
                         phase == RefreshPhase::Effects ? "effects" : phase == RefreshPhase::Receipt ? "receipt" : "none";
@@ -1115,9 +1140,9 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                 QMetaObject::invokeMethod(this, [this, generation, saved] {
                     if (generation == m_generation && m_wallet && !m_cancel->load()) restoreSavedActions(saved);
                 }, Qt::QueuedConnection);
-                std::exception_ptr auxiliary_error;
                 const auto auxiliary = [&](const auto& read) {
-                    try { read(); } catch (...) { auxiliary_error = std::current_exception(); }
+                    try { read(); } catch (const PassiveRefreshYield&) { throw; }
+                    catch (...) { auxiliary_error = std::current_exception(); }
                 };
                 // The effects reconciliation fallback and the final selected
                 // read share one response, not a second snapshot RPC. Record
@@ -1227,10 +1252,13 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                     B3AssetTransfer::CheckAcceptance(rpc("testmempoolaccept", B3AssetTransfer::AcceptanceParameters(*result->prepared)), *result->prepared);
                 } else { B3FlowMeshTrading::CheckActionResult(response, a); result->response = response; result->receipt = B3FlowMeshTrading::ParseReceipt(response, a.market.id); }
             }
-        } catch (const UniValue& error) { result->error = RpcError(error); }
-        catch (const std::exception& error) { result->error = QString::fromUtf8(error.what()).left(500); }
-        catch (...) { result->error = QStringLiteral("The FlowMesh operation failed."); }
-        if (!result->action && !result->exact_retry && !result->receipt_only) read_client_info();
+        } catch (const PassiveRefreshYield&) {
+            // A shared snapshot attempt can cache the yield while an effects
+            // fallback restores its earlier error. That real error still wins.
+            if (auxiliary_error) record_failure(auxiliary_error);
+            else result->refresh_yielded = true;
+        } catch (...) { record_failure(std::current_exception()); }
+        if (!result->refresh_yielded && !result->action && !result->exact_retry && !result->receipt_only) read_client_info();
     });
     m_thread->setParent(this); connect(m_thread, &QThread::finished, this, [this, result, generation] { if (generation == m_generation) finishJob(result); }); m_thread->start(); updateControls();
 }
@@ -1257,7 +1285,26 @@ void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
 void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& result)
 {
     if (!m_wallet || m_cancel->load()) { m_deferred_review.reset(); restoreLock(); m_busy = false; updateControls(); return; }
-    if (result->refresh_phase && result->refresh_epoch == m_refresh_epoch) {
+    if (result->refresh_yielded) {
+        if (result->refresh_epoch == m_refresh_epoch && m_refresh_yields < MAX_REFRESH_YIELDS) ++m_refresh_yields;
+        // No partial catalog/snapshot is published or stamped fresh. Preserve
+        // any completed, correctly attributed receipt observation/error; it
+        // neither renews the market nor authorizes an action.
+        // Keep the auxiliary phase pending; a later passive cycle retries it.
+        if (result->receipt) { applyReceipt(*result->receipt); applyReceiptError(*result, {}); }
+        if (!result->receipt_error.isEmpty()) applyReceiptError(*result, result->receipt_error);
+        m_loading = false; m_busy = false; m_chart->setLoading(false); updateControls();
+        if (m_deferred_review) {
+            // The click still only asks to OPEN a review. Read the exact
+            // captured market first, then run all existing identity/readiness
+            // guards and the normal confirmation. No automatic approval.
+            startJob(std::nullopt, std::nullopt, false, false, std::nullopt, {}, true);
+            if (m_thread) { m_busy = true; updateControls(); }
+        }
+        return; // finishJob drains a captured explicit status next, if any.
+    }
+    if (!result->foreground_read && result->refresh_phase && result->refresh_epoch == m_refresh_epoch) {
+        m_refresh_yields = 0;
         switch (*result->refresh_phase) {
         case RefreshPhase::Catalog: m_refresh_phase = RefreshPhase::Status; break;
         case RefreshPhase::Status: m_refresh_phase = RefreshPhase::Effects; break;

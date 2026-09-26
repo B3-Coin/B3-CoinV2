@@ -67,6 +67,7 @@ private:
         QString wallet, error, receipt_error, read_market;
         QString receipt_market, receipt_account, receipt_action_id;
         bool broadcast{false}, write_attempted{false}, catalog{false}, exact_retry{false}, receipt_only{false};
+        bool passive{false}, foreground_read{false}, refresh_yielded{false};
         std::optional<RefreshPhase> refresh_phase;
         uint64_t refresh_epoch{0};
         QElapsedTimer snapshot_age;
@@ -123,7 +124,7 @@ private:
     bool confirm(const QString& text, bool final_transaction);
     void startJob(std::optional<B3FlowMeshTrading::Action> action = std::nullopt,
                   std::optional<B3AssetTransfer::Prepared> prepared = std::nullopt, bool exact_retry = false, bool receipt_only = false,
-                  std::optional<StatusRead> status_read = std::nullopt, const QString& connect_url = {});
+                  std::optional<StatusRead> status_read = std::nullopt, const QString& connect_url = {}, bool foreground_read = false);
     std::optional<StatusRead> selectedStatusRead() const;
     bool statusReadValid(const StatusRead& scope, bool selected) const;
     void requestStatusRead();
@@ -166,6 +167,8 @@ private:
     QString m_uncertain_market, m_uncertain_account;
     std::unique_ptr<WalletModel::UnlockContext> m_unlock;
     std::shared_ptr<std::atomic_bool> m_cancel{std::make_shared<std::atomic_bool>(false)};
+    // Yield only unstarted passive RPCs, never an in-flight request or action.
+    std::shared_ptr<std::atomic_bool> m_yield_refresh{std::make_shared<std::atomic_bool>(false)};
     QPointer<QMessageBox> m_confirmation;
     QPointer<QDialog> m_funding_dialog;
     QThread* m_thread{nullptr};
@@ -175,6 +178,10 @@ private:
     bool m_route_pending{false}, m_requested_withdrawal{false};
     uint64_t m_generation{0};
     RefreshPhase m_refresh_phase{RefreshPhase::Catalog};
+    // Local UI fairness only. After eight yields let one passive phase finish
+    // even if another click arrives, so repeated clicks cannot starve data.
+    static constexpr unsigned MAX_REFRESH_YIELDS{8};
+    unsigned m_refresh_yields{0};
     uint64_t m_refresh_epoch{0};
     std::optional<B3FlowMeshMarketData::Snapshot> m_snapshot;
     QElapsedTimer m_response_age, m_certificate_age, m_catalog_age, m_attempt_age, m_queue_age;

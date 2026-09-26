@@ -3,6 +3,7 @@
 #include <node/flowmesh_timing.h>
 #include <node/flowmesh_client.h>
 #include <node/flowmesh_client_poll.h>
+#include <node/flowmesh_client_work.h>
 #include <node/flowmesh_client_settlement.h>
 
 #include <chain.h>
@@ -508,8 +509,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     std::vector<std::chrono::steady_clock::time_point> m_retry_after;
     const fs::path m_path;
     // Network waits never hold cs_main, a wallet lock or an operator lock.
-    // Only this client's requests are serialized; Status remains nonblocking.
-    std::mutex m_work;
+    // Retain one owner across network/cache/outbox work. Explicit requests
+    // take priority over queued passive refreshes, never preempt an owner.
+    // Status remains nonblocking; metadata uses its separate lock below.
+    FlowMeshClientWorkGate m_work;
     // Never acquire m_work from a wallet metadata lookup: it covers HTTPS.
     mutable std::mutex m_metadata_mutex;
     FlowMeshAssetMetadataCatalog m_metadata;
