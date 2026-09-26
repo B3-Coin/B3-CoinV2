@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import plistlib
 import re
 import shutil
@@ -116,6 +116,70 @@ def deploy_macos(macdeployqt, app, library_paths):
     run(macdeployqt, app, "-verbose=1", "-always-overwrite", "-no-codesign",
         *("-libpath=" + str(path) for path in library_paths))
 
+def complete_macos_rpath_dependencies(app, library_paths, max_copies=128, max_files=10000):
+    """Complete macdeployqt's missing plugin closure from declared roots only.
+
+    Qt can remove executable RPATHs before processing a later plugin. No
+    missing reference is ignored: copies are bounded, transitive references
+    are revisited, and verify_macos still validates every resulting binary.
+    """
+    frameworks = app / "Contents/Frameworks"
+    copied = []
+    inspected = set()
+    while True:
+        changed = False
+        paths = list(app.rglob("*"))
+        require(len(paths) <= max_files, "Dependency completion exceeded file bound")
+        for binary in sorted(paths):
+            if binary in inspected:
+                continue
+            inspected.add(binary)
+            if binary.is_symlink() or not binary.is_file() or "Mach-O" not in run("file", "-b", binary):
+                continue
+            for line in run("otool", "-L", binary).splitlines()[1:]:
+                dep = line.strip().split(" (", 1)[0]
+                absolute_source = None
+                if dep.startswith("@rpath/"):
+                    raw = dep.removeprefix("@rpath/")
+                elif dep.startswith(("/opt/homebrew/", "/usr/local/")):
+                    absolute_source = Path(dep)
+                    raw = re.search(r"[^/]+\.framework/Versions/[^/]+/[^/]+$", dep)
+                    raw = raw.group() if raw else absolute_source.name
+                else:
+                    # System/loader/executable dependencies remain subject
+                    # to the final full closure check; do not reinterpret them.
+                    continue
+                relative = PurePosixPath(raw)
+                require(not relative.is_absolute() and ".." not in relative.parts and
+                        str(relative) == raw and relative.parts, "Unsafe rpath dependency: " + dep)
+                target = frameworks / relative
+                if target.exists():
+                    continue
+                roots = [root for root in library_paths if (root / relative).is_file()]
+                require(roots, "No declared source for missing dependency: " + dep)
+                hashes = {sha(root / relative) for root in roots}
+                require(len(hashes) == 1, "Ambiguous declared dependency: " + dep)
+                if absolute_source is not None:
+                    require(absolute_source.is_file() and sha(absolute_source) in hashes,
+                            "Declared source differs from absolute dependency: " + dep)
+                root = roots[0]
+                require(len(copied) < max_copies, "Dependency completion exceeded copy bound")
+                name = relative.parts[0]
+                if name.endswith(".framework"):
+                    destination = frameworks / name
+                    require(not destination.exists() and not destination.is_symlink(),
+                            "Incomplete existing framework: " + name)
+                    shutil.copytree(root / name, destination, symlinks=True)
+                else:
+                    require(len(relative.parts) == 1 and name.endswith(".dylib"), "Unsupported dependency shape: " + dep)
+                    require(not target.is_symlink(), "Refusing dangling dependency link: " + dep)
+                    shutil.copy2(root / relative, target)
+                require(target.is_file(), "Declared dependency copy did not resolve: " + dep)
+                copied.append(dep)
+                changed = True
+        if not changed:
+            return copied
+
 def verify_macos(app, architecture, minimum):
     executable = app / "Contents/MacOS" / TARGET
     frameworks = app / "Contents/Frameworks"
@@ -218,11 +282,9 @@ def main():
         shutil.copytree(build / "bin" / (TARGET + ".app"), app, symlinks=True)
         library_paths = macos_library_paths(args.macdeployqt, cache["Qt6_DIR"], args.macos_library_root)
         deploy_macos(args.macdeployqt, app, library_paths)
-        # qtSvg plugins may be discovered without the corresponding framework.
-        for library_root in library_paths:
-            svg = library_root / "QtSvg.framework"
-            if svg.is_dir() and not (app / "Contents/Frameworks/QtSvg.framework").exists():
-                shutil.copytree(svg, app / "Contents/Frameworks/QtSvg.framework", symlinks=True)
+        completed = complete_macos_rpath_dependencies(app, library_paths)
+        if completed:
+            print(json.dumps({"completed_declared_dependencies": completed}), flush=True)
         run("ruby", SOURCE / "contrib/macdeploy/normalize_bundled_libraries.rb", app)
         binary = app / "Contents/MacOS" / TARGET
         load = run("otool", "-l", binary)

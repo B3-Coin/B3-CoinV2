@@ -135,5 +135,69 @@ class PackageTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Missing declared"):
                 PACKAGE.macos_library_paths(prefix / "bin/macdeployqt", prefix / "lib/cmake/Qt6", [prefix / "missing"])
 
+    def test_missing_plugin_framework_and_transitive_dylib_completed(self):
+        with tempfile.TemporaryDirectory() as path:
+            prefix = Path(path)
+            app, root = prefix / "Test.app", prefix / "declared"
+            (app / "Contents/Frameworks").mkdir(parents=True)
+            plugin = app / "Contents/plugin.dylib"
+            plugin.write_text("synthetic Mach-O fixture")
+            pdf = root / "QtPdf.framework/Versions/A/QtPdf"
+            pdf.parent.mkdir(parents=True)
+            pdf.write_text("synthetic framework")
+            (root / "libbrotlicommon.1.dylib").write_text("synthetic transitive library")
+            def tools(*args):
+                if args[0] == "file":
+                    return "Mach-O arm64"
+                name = args[-1].name
+                dep = {"plugin.dylib": "@rpath/QtPdf.framework/Versions/A/QtPdf",
+                       "QtPdf": "@rpath/libbrotlicommon.1.dylib"}.get(name, "/usr/lib/libSystem.B.dylib")
+                return str(args[-1]) + ":\n\t" + dep + " (compatibility version 1.0.0)\n"
+            with mock.patch.object(PACKAGE, "run", side_effect=tools):
+                copied = PACKAGE.complete_macos_rpath_dependencies(app, [root])
+                self.assertEqual(len(copied), 2)
+                self.assertEqual(PACKAGE.complete_macos_rpath_dependencies(app, [root]), [])
+            self.assertTrue((app / "Contents/Frameworks/QtPdf.framework/Versions/A/QtPdf").is_file())
+            self.assertTrue((app / "Contents/Frameworks/libbrotlicommon.1.dylib").is_file())
+
+    def test_dependency_completion_refuses_unknown_escape_and_overflow(self):
+        for dep, maximum, expected in [("@rpath/unknown.dylib", 128, "No declared source"),
+                ("@rpath/../escape.dylib", 128, "Unsafe rpath"),
+                ("@rpath/known.dylib", 0, "copy bound")]:
+            with self.subTest(dep=dep), tempfile.TemporaryDirectory() as path:
+                root = Path(path)
+                app = root / "Test.app"
+                (app / "Contents/Frameworks").mkdir(parents=True)
+                (app / "Contents/plugin.dylib").write_text("synthetic")
+                (root / "known.dylib").write_text("synthetic")
+                with mock.patch.object(PACKAGE, "run", side_effect=lambda *args:
+                        "Mach-O" if args[0] == "file" else "binary:\n\t" + dep + " (version 1)\n"):
+                    with self.assertRaisesRegex(RuntimeError, expected):
+                        PACKAGE.complete_macos_rpath_dependencies(app, [root], maximum)
+
+    def test_dependency_completion_refuses_ambiguous_roots(self):
+        with tempfile.TemporaryDirectory() as path:
+            prefix = Path(path)
+            app = prefix / "Test.app"
+            (app / "Contents/Frameworks").mkdir(parents=True)
+            (app / "Contents/plugin.dylib").write_text("synthetic")
+            roots = [prefix / "a", prefix / "b"]
+            for number, root in enumerate(roots):
+                root.mkdir()
+                (root / "libversion.dylib").write_text(str(number))
+            with mock.patch.object(PACKAGE, "run", side_effect=lambda *args:
+                    "Mach-O" if args[0] == "file" else "binary:\n\t@rpath/libversion.dylib (version 1)\n"):
+                with self.assertRaisesRegex(RuntimeError, "Ambiguous declared"):
+                    PACKAGE.complete_macos_rpath_dependencies(app, roots)
+
+    def test_dependency_completion_bounded_before_tool_inspection(self):
+        with tempfile.TemporaryDirectory() as path:
+            app = Path(path)
+            (app / "file").touch()
+            with mock.patch.object(PACKAGE, "run") as run:
+                with self.assertRaisesRegex(RuntimeError, "file bound"):
+                    PACKAGE.complete_macos_rpath_dependencies(app, [], max_files=0)
+            run.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()
