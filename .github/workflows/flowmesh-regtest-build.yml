@@ -166,6 +166,7 @@ jobs:
           python3 -B contrib/flowmesh-regtest/package.py --build build
           --platform macos-${{ matrix.architecture }} --output build/out
           --macdeployqt "$(brew --prefix qt@6)/bin/macdeployqt" --minimum-macos 15.0
+          --macos-library-root "$(brew --prefix)/lib"
           --notices "$RUNNER_TEMP/regtest-notices"
       - uses: actions/upload-artifact@v4
         with:

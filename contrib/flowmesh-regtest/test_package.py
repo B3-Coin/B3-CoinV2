@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import unittest
 import tempfile
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("regtest_package", HERE / "package.py")
@@ -92,6 +93,34 @@ class PackageTests(unittest.TestCase):
             raw = (HERE / name).read_bytes()
             self.assertNotIn(b"/Users/", raw)
             self.assertNotIn(b"-----BEGIN PRIVATE KEY", raw)
+
+    def test_split_qt_umbrella_paths_preserved_for_plugin_dependencies(self):
+        with tempfile.TemporaryDirectory() as path:
+            prefix = Path(path)
+            umbrella = prefix / "qt"
+            base = prefix / "qtbase"
+            extra = prefix / "lib"
+            (base / "lib/cmake/Qt6").mkdir(parents=True)
+            (umbrella / "lib/cmake").mkdir(parents=True)
+            (umbrella / "lib/cmake/Qt6").symlink_to(base / "lib/cmake/Qt6", target_is_directory=True)
+            (umbrella / "lib/QtPdf.framework").mkdir()
+            extra.mkdir()
+            roots = PACKAGE.macos_library_paths(umbrella / "bin/macdeployqt", umbrella / "lib/cmake/Qt6", [extra])
+            self.assertEqual(roots, [umbrella / "lib", extra])
+            self.assertTrue((roots[0] / "QtPdf.framework").is_dir())
+            with mock.patch.object(PACKAGE, "run") as run:
+                PACKAGE.deploy_macos(umbrella / "bin/macdeployqt", prefix / "App.app", roots)
+            args = run.call_args.args
+            self.assertIn("-libpath=" + str(umbrella / "lib"), args)
+            self.assertIn("-libpath=" + str(extra), args)
+            self.assertNotIn("-no-plugins", args)
+
+    def test_macos_dependency_root_typo_refused(self):
+        with tempfile.TemporaryDirectory() as path:
+            prefix = Path(path)
+            (prefix / "lib/cmake/Qt6").mkdir(parents=True)
+            with self.assertRaisesRegex(RuntimeError, "Missing declared"):
+                PACKAGE.macos_library_paths(prefix / "bin/macdeployqt", prefix / "lib/cmake/Qt6", [prefix / "missing"])
 
 if __name__ == "__main__":
     unittest.main()

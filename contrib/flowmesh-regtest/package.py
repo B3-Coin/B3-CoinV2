@@ -87,6 +87,27 @@ def validate_compiled_identity(build, binary, commit):
             tail = block[-256:]
     require(not required, "Executable lacks the expected compiled source identity")
 
+def macos_library_paths(macdeployqt, qt_cmake_dir, extra=()):
+    # Homebrew's Qt umbrella exposes frameworks from separate formulae via
+    # symlinks. Resolving Qt6_DIR first loses that umbrella (leaving qtbase
+    # only), although deployed image/input plugins depend on other modules.
+    candidates = [Path(macdeployqt).absolute().parent.parent / "lib",
+                  Path(qt_cmake_dir).absolute().parents[1], *extra]
+    result = []
+    for candidate in candidates:
+        candidate = Path(candidate).absolute()
+        require(candidate.is_dir(), "Missing declared macOS library root: " + str(candidate))
+        if candidate not in result:
+            result.append(candidate)
+    return result
+
+def deploy_macos(macdeployqt, app, library_paths):
+    # macdeployqt must see these paths while traversing plugin dependencies,
+    # before any absolute build RPATH is removed. Final closure verification
+    # below remains authoritative; discovery warnings are never a pass.
+    run(macdeployqt, app, "-verbose=1", "-always-overwrite", "-no-codesign",
+        *("-libpath=" + str(path) for path in library_paths))
+
 def verify_macos(app, architecture, minimum):
     executable = app / "Contents/MacOS" / TARGET
     frameworks = app / "Contents/Frameworks"
@@ -134,6 +155,8 @@ def main():
     parser.add_argument("--depends", type=Path)
     parser.add_argument("--policy-probe-output", type=Path)
     parser.add_argument("--macdeployqt", type=Path)
+    parser.add_argument("--macos-library-root", type=Path, action="append", default=[],
+                        help="Additional declared dependency root for macdeployqt (repeatable)")
     parser.add_argument("--notices", type=Path, required=True)
     parser.add_argument("--minimum-macos", default="15.0")
     args = parser.parse_args()
@@ -185,12 +208,13 @@ def main():
         require(args.macdeployqt and args.macdeployqt.is_file(), "macdeployqt required")
         app = payload / "B3 FlowMesh REGTEST.app"
         shutil.copytree(build / "bin" / (TARGET + ".app"), app, symlinks=True)
-        run(args.macdeployqt, app, "-verbose=1", "-always-overwrite")
+        library_paths = macos_library_paths(args.macdeployqt, cache["Qt6_DIR"], args.macos_library_root)
+        deploy_macos(args.macdeployqt, app, library_paths)
         # qtSvg plugins may be discovered without the corresponding framework.
-        qt_prefix = Path(cache["Qt6_DIR"]).resolve().parents[2]
-        svg = qt_prefix / "lib/QtSvg.framework"
-        if svg.is_dir() and not (app / "Contents/Frameworks/QtSvg.framework").exists():
-            shutil.copytree(svg, app / "Contents/Frameworks/QtSvg.framework", symlinks=True)
+        for library_root in library_paths:
+            svg = library_root / "QtSvg.framework"
+            if svg.is_dir() and not (app / "Contents/Frameworks/QtSvg.framework").exists():
+                shutil.copytree(svg, app / "Contents/Frameworks/QtSvg.framework", symlinks=True)
         run("ruby", SOURCE / "contrib/macdeploy/normalize_bundled_libraries.rb", app)
         binary = app / "Contents/MacOS" / TARGET
         load = run("otool", "-l", binary)
