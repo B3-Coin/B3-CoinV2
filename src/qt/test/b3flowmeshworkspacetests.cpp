@@ -51,6 +51,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 const std::function<void(const std::string&)> G_TEST_LOG_FUN{};
@@ -211,16 +212,24 @@ struct ConnectionProbe {
 // successful cases stop at the first ordinary review, without wallet unlock.
 struct FundingReadProbe {
     UniValue data{RemoteData()};
-    bool fail{false}, hold{false};
+    bool fail{false}, hold{false}, effects_misc_error{false}, discovery_unproven{false}, checkpoint{false};
+    std::string failed_method, held_method;
+    std::vector<std::string> methods;
+    QSemaphore auxiliary_entered, auxiliary_release;
     QSemaphore entered, release;
-    std::atomic_int snapshots{0}, catalogs{0}, writes{0};
+    std::atomic_int snapshots{0}, catalogs{0}, balances{0}, effects{0}, receipts{0}, writes{0};
     std::vector<std::unique_ptr<CRPCCommand>> commands;
     FundingReadProbe()
     {
         if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
         const auto add = [&](const char* method, const std::function<UniValue()>& run) {
             auto command{std::make_unique<CRPCCommand>("hidden", method,
-                [run](const JSONRPCRequest&, UniValue& result, bool) { result = run(); return true; },
+                [this, method, run](const JSONRPCRequest&, UniValue& result, bool) {
+                    methods.emplace_back(method);
+                    if (held_method == method) { auxiliary_entered.release(); if (!auxiliary_release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic auxiliary exceeded its test bound"}; }
+                    if (failed_method == method) throw std::runtime_error{"Synthetic auxiliary failed"};
+                    result = run(); return true;
+                },
                 std::vector<std::pair<std::string, bool>>{}, 998900 + commands.size())};
             tableRPC.appendCommand(command->name, command.get()); commands.push_back(std::move(command));
         };
@@ -228,7 +237,8 @@ struct FundingReadProbe {
             const auto s{Parse(data)}; UniValue row{UniValue::VOBJ};
             for (const auto* key : {"market_id", "base_asset_id", "domain", "execution_config_id", "quote_asset", "verification"}) row.pushKV(key, data[key]);
             row.pushKV("vault_id", flowmesh::ComputeFlowMeshVaultId(H(1), *uint256::FromHex(s.market.toStdString()))->GetHex());
-            row.pushKV("available", true); row.pushKV("checkpoint_pending", false);
+            row.pushKV("available", true); row.pushKV("checkpoint_pending", checkpoint);
+            if (checkpoint) row.pushKV("pending_checkpoint_id", H(80).GetHex());
             for (const auto* key : {"running", "paused", "pending_handoff", "halt", "error"}) row.pushKV(key, data["snapshot"][key]);
             auto account{data["account"]}; account.pushKV("b3_available", FormatAmount(s.b3_available, 9).toStdString()); account.pushKV("b3_reserved", FormatAmount(s.b3_reserved, 9).toStdString()); row.pushKV("account", account);
             return row;
@@ -237,15 +247,27 @@ struct FundingReadProbe {
         add("listflowmeshactions", [] {
             UniValue saved{UniValue::VOBJ}; saved.pushKV("source", "local-retained-outbox"); saved.pushKV("actions", UniValue{UniValue::VARR}); return saved;
         });
-        add("listflowmeshmarkets", [this, market] { ++catalogs; UniValue rows{UniValue::VARR}; rows.push_back(market()); return rows; });
-        add("getflowmeshbalance", market);
+        add("listflowmeshmarkets", [this, market] {
+            ++catalogs; auto row{market()};
+            if (discovery_unproven) {
+                row.pushKV("account", UniValue{});
+                auto proof{row["verification"]}; proof.pushKV("certificate_verified", false); proof.pushKV("account_state_verified", false); row.pushKV("verification", proof);
+            }
+            UniValue rows{UniValue::VARR}; rows.push_back(row); return rows;
+        });
+        add("getflowmeshbalance", [this, market] { ++balances; return market(); });
         add("getflowmeshmarketdata", [this] {
             ++snapshots; entered.release();
             if (hold && !release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic funding read exceeded its test bound"};
             if (fail) throw std::runtime_error{"Synthetic funding refresh unavailable"};
             return data;
         });
-        add("listflowmeshvaultoperations", [] { return UniValue{UniValue::VARR}; });
+        add("listflowmeshvaultoperations", [this] {
+            ++effects;
+            if (effects_misc_error) { UniValue error{UniValue::VOBJ}; error.pushKV("code", -1); error.pushKV("message", "Synthetic reconciliation race"); throw error; }
+            return UniValue{UniValue::VARR};
+        });
+        add("getflowmeshactionstatus", [this]() -> UniValue { ++receipts; throw std::runtime_error{"Synthetic saved status unavailable"}; });
         for (const auto* method : {"flowmeshdeposit", "submitflowmeshdeposit", "sendrawtransaction", "createflowmeshaccount"})
             add(method, [this]() -> UniValue { ++writes; throw std::runtime_error{"Unexpected mutation in draft test"}; });
     }
@@ -2601,6 +2623,133 @@ private Q_SLOTS:
             QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_deferred_review);
             QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_unlock); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
         }
+    }
+    void passiveRefreshUsesBoundedAuxiliaryPhases()
+    {
+        FundingReadProbe probe;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        for (int phase{0}; phase < 4; ++phase) {
+            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            QVERIFY2(!panel.m_read_failed, qPrintable(panel.m_read_error));
+            QCOMPARE(probe.snapshots.load(), phase + 1);
+            QCOMPARE(probe.catalogs.load(), 1);
+            QCOMPARE(probe.balances.load(), phase >= 1 ? 1 : 0);
+            QCOMPARE(probe.effects.load(), phase >= 2 ? 1 : 0);
+        }
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void passiveRefreshFairnessAndAuxiliaryOrder()
+    {
+        FundingReadProbe probe; probe.held_method = "listflowmeshmarkets";
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_receipt = B3FlowMeshTrading::Receipt{}; panel.m_receipt->action_id = QString::fromStdString(H(42).GetHex());
+        panel.m_receipt_wallet = panel.m_wallet; panel.m_pending_market = panel.m_snapshot->market; panel.m_pending_account = panel.m_snapshot->account;
+        for (int phase{0}; phase < 4; ++phase) {
+            panel.m_catalog_age.invalidate(); // Overdue discovery must not starve later phases or receipts.
+            probe.methods.clear(); panel.startJob();
+            if (phase == 0) {
+                QVERIFY(probe.auxiliary_entered.tryAcquire(1, 2000)); QCOMPARE(probe.snapshots.load(), 0);
+                probe.auxiliary_release.release();
+            }
+            QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            std::vector<std::string> remote;
+            for (const auto& method : probe.methods) if (method != "getflowmeshclientinfo" && method != "listflowmeshactions") remote.push_back(method);
+            const std::array<const char*, 4> expected{"listflowmeshmarkets", "getflowmeshbalance", "listflowmeshvaultoperations", "getflowmeshactionstatus"};
+            QCOMPARE(remote.size(), size_t{2}); QCOMPARE(remote.front(), std::string{expected[phase]}); QCOMPARE(remote.back(), std::string{"getflowmeshmarketdata"});
+        }
+        QCOMPARE(probe.catalogs.load(), 1); QCOMPARE(probe.receipts.load(), 1); QCOMPARE(probe.snapshots.load(), 4);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void passiveAuxiliaryFailureAdvancesWithoutRenewingFreshness()
+    {
+        using Phase = B3FlowMeshTradingPanel::RefreshPhase;
+        for (const auto& [phase, method, next] : {std::tuple{Phase::Catalog, "listflowmeshmarkets", Phase::Status},
+                 std::tuple{Phase::Status, "getflowmeshbalance", Phase::Effects}, std::tuple{Phase::Effects, "listflowmeshvaultoperations", Phase::Receipt}}) {
+            FundingReadProbe probe; probe.failed_method = method;
+            B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+            panel.m_refresh_phase = phase;
+            const auto observed{panel.m_response_age.msecsSinceReference()};
+            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            QVERIFY(panel.m_read_failed); QCOMPARE(probe.snapshots.load(), 1);
+            QCOMPARE(panel.m_response_age.msecsSinceReference(), observed); QCOMPARE(panel.m_refresh_phase, next);
+            probe.failed_method.clear(); panel.m_catalog_age.invalidate();
+            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            QVERIFY(!panel.m_read_failed); QCOMPARE(probe.snapshots.load(), 2);
+            QVERIFY(panel.m_refresh_phase != Phase::Catalog); QCOMPARE(probe.writes.load(), 0);
+        }
+    }
+    void effectsFallbackUsesExactlyOneSnapshotAttempt()
+    {
+        for (int condition{0}; condition < 3; ++condition) {
+            FundingReadProbe probe; probe.effects_misc_error = true; probe.fail = condition == 2;
+            if (condition == 0) {
+                auto status{probe.data["snapshot"]}; status.pushKV("chain_reconciling", true); status.pushKV("paused", true); probe.data.pushKV("snapshot", status);
+            }
+            B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+            panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::Effects;
+            panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            QCOMPARE(probe.effects.load(), 1); QCOMPARE(probe.snapshots.load(), 1);
+            QCOMPARE(panel.m_read_failed, condition != 0); // A later healthy response never conceals the original effects error.
+            if (condition == 0) QVERIFY(panel.m_snapshot->chain_reconciling);
+            QCOMPARE(probe.writes.load(), 0);
+        }
+    }
+    void phasedDiscoveryPreservesVerifiedBindingNotNewCheckpointClaims()
+    {
+        for (bool existing : {false, true}) {
+            FundingReadProbe probe; probe.discovery_unproven = true; probe.checkpoint = true;
+            B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+            if (existing) {
+                panel.m_market_data.front().checkpoint_pending = true; panel.m_market_data.front().checkpoint = QString::fromStdString(H(70).GetHex());
+            } else {
+                panel.m_market_data.clear(); panel.m_snapshot.reset(); QSignalBlocker blocked{panel.m_market}; panel.m_market->clear();
+                probe.held_method = "getflowmeshbalance"; // First selection immediately starts its next read.
+            }
+            panel.startJob();
+            if (existing) { QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000); }
+            else { QTRY_VERIFY_WITH_TIMEOUT(probe.auxiliary_entered.available() > 0, 1000); }
+            QVERIFY(!panel.m_read_failed); QVERIFY(panel.market()); QVERIFY(panel.market()->has_account);
+            QCOMPARE(panel.market()->account, Parse(probe.data).account);
+            QCOMPARE(panel.market()->checkpoint_pending, existing);
+            QCOMPARE(panel.market()->checkpoint, existing ? QString::fromStdString(H(70).GetHex()) : QString{});
+            if (existing) panel.startJob();
+            else probe.auxiliary_release.release();
+            QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            QVERIFY(panel.market()->checkpoint_pending); QCOMPARE(panel.market()->checkpoint, QString::fromStdString(H(80).GetHex()));
+        }
+        FundingReadProbe probe; probe.discovery_unproven = true;
+        auto account{probe.data["account"]}; account.pushKV("account_id", H(99).GetHex()); account.pushKV("curves", UniValue{UniValue::VARR}); probe.data.pushKV("account", account);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        const auto original{panel.market()->account}; panel.startJob(); QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QVERIFY(panel.m_read_failed); QCOMPARE(panel.market()->account, original); QCOMPARE(panel.m_snapshot->account, original);
+        QCOMPARE(probe.writes.load(), 0);
+    }
+    void snapshotReceiptClockSurvivesDelayedUiDelivery()
+    {
+        FundingReadProbe probe; probe.hold = true;
+        auto status{probe.data["snapshot"]}; status.pushKV("pending_actions", 1); probe.data.pushKV("snapshot", status);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_snapshot->head = QString::fromStdString(H(98).GetHex()); // Observe a newly received certified head.
+        panel.startJob(); const auto result{panel.m_active_result};
+        QVERIFY(probe.entered.tryAcquire(1, 2000)); probe.release.release(); QVERIFY(panel.m_thread->wait(2000));
+        const auto received{result->snapshot_age.msecsSinceReference()};
+        QTest::qSleep(3050); // Bounded blocked GUI delivery: do not process the queued finish before the freshness limit.
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(panel.m_response_age.msecsSinceReference(), received); QCOMPARE(panel.m_certificate_age.msecsSinceReference(), received); QCOMPARE(panel.m_queue_age.msecsSinceReference(), received);
+        QVERIFY(panel.m_response_age.elapsed() > 3000); QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.depositReady());
+        QVERIFY(panel.m_status->text().contains(QStringLiteral("Updates delayed"))); QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(probe.writes.load(), 0);
+    }
+    void obsoleteRefreshCannotAdvanceResetSchedule()
+    {
+        using Phase = B3FlowMeshTradingPanel::RefreshPhase;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        auto result{std::make_shared<B3FlowMeshTradingPanel::Result>()};
+        result->refresh_phase = Phase::Status; result->refresh_epoch = panel.m_refresh_epoch;
+        result->error = QStringLiteral("Synthetic old read failure");
+        panel.resetRefreshSchedule(); panel.finishJob(result);
+        QCOMPARE(panel.m_refresh_phase, Phase::Catalog);
+        panel.m_refresh_phase = Phase::Effects; panel.cancelAndWait(); QCOMPARE(panel.m_refresh_phase, Phase::Catalog);
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_wallet); QVERIFY(m_wallet->IsLocked());
     }
     void depositDraftContinueRefreshesOnceBeforeReview_data()
     {

@@ -5,6 +5,7 @@
 #include <qt/b3theme.h>
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
+#include <node/flowmesh_timing.h>
 #include <rpc/protocol.h>
 #include <util/moneystr.h>
 #include <QApplication>
@@ -229,6 +230,7 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         updateMarketText(); updateDataViews();
     });
     connect(m_market, &QComboBox::currentIndexChanged, this, [this] {
+        resetRefreshSchedule();
         m_deferred_status.reset(); // A queued click never follows a market switch.
         // A failed read/backoff belongs to its selected market. Another listed
         // market may already have a certified head and can be read immediately.
@@ -559,7 +561,7 @@ void B3FlowMeshTradingPanel::openFunding(bool withdrawal)
     if (accepted && !withdrawal) {
         // The modal draft pauses background reads. Refresh once after Continue,
         // then reuse the existing review-only continuation, never an action queue.
-        m_catalog_age.invalidate(); startJob();
+        m_catalog_age.invalidate(); resetRefreshSchedule(); startJob();
         if (deferReview(admission ? Operation::Admit : Operation::Deposit))
             m_deferred_review->funding_context = DeferredReview::FundingContext{*selected, units};
     } else if (accepted) begin(Operation::Withdraw);
@@ -612,11 +614,17 @@ void B3FlowMeshTradingPanel::refresh()
     startJob();
 }
 
+void B3FlowMeshTradingPanel::resetRefreshSchedule()
+{
+    m_refresh_phase = RefreshPhase::Catalog; ++m_refresh_epoch;
+}
+
 void B3FlowMeshTradingPanel::requestConnect()
 {
     if (!m_connect->isEnabled() || !m_wallet || !m_backend || m_busy || m_cancel->load()) return;
     if (m_active_result && !m_active_result->connect_url.isEmpty()) return;
     m_deferred_review.reset(); // A reviewed market choice never follows an endpoint change.
+    resetRefreshSchedule();
     m_connection_error.clear(); m_connect_error.clear();
     m_deferred_connect = DeferredConnect{m_wallet, m_generation, &m_wallet->node(), m_endpoint->text().trimmed()};
     resumeConnect(); updateControls();
@@ -949,7 +957,16 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     auto* node{&m_wallet->node()}; const auto backend{m_backend}; const auto cancel{m_cancel};
     const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())}; const auto generation{m_generation};
     const auto selected{market()}; const QString selected_id{selected ? selected->id : QString{}};
-    const bool refresh_catalog{!action && (!m_catalog_age.isValid() || m_catalog_age.elapsed() >= 5000 || m_route_pending || m_market_data.empty() || (m_snapshot && m_snapshot->chain_reconciling))};
+    const bool catalog_due{!m_catalog_age.isValid() || m_catalog_age.elapsed() >= 5000 || (m_snapshot && m_snapshot->chain_reconciling)};
+    // Complete the bounded cycle before considering an overdue catalog again.
+    // Receipt gets its own slot so a slow cycle cannot starve saved requests.
+    const auto phase{m_route_pending || m_market_data.empty() ? RefreshPhase::Catalog :
+        m_refresh_phase != RefreshPhase::None ? m_refresh_phase : catalog_due ? RefreshPhase::Catalog :
+        tracked ? RefreshPhase::Receipt : RefreshPhase::None};
+    if (!action && !exact_retry && !receipt_only && connect_url.isEmpty()) {
+        result->refresh_phase = phase; result->refresh_epoch = m_refresh_epoch;
+    }
+    const auto refresh_basis{m_snapshot};
     result->markets = m_market_data; result->effects = m_effect_data;
     const QString known_head{m_snapshot && m_snapshot->market == selected_id ? m_snapshot->head : QString{}};
     const QString route_base{m_route_pending ? m_requested_base : QString{}};
@@ -957,7 +974,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
         receipt_id{status_read ? status_read->action_id : tracked ? m_receipt->action_id : QString{}};
     result->receipt_market = receipt_market; result->receipt_action_id = receipt_id;
     result->receipt_account = status_read ? status_read->account : tracked ? m_pending_account : QString{};
-    m_thread = QThread::create([this, generation, node, backend, cancel, uri, result, selected_id, known_head, route_base, refresh_catalog, watch_queue, queue_watch, receipt_market, receipt_id] {
+    m_thread = QThread::create([this, generation, node, backend, cancel, uri, result, selected_id, known_head, route_base, phase, refresh_basis, watch_queue, queue_watch, receipt_market, receipt_id] {
         const auto read_client_info = [&] {
             if (cancel->load() || node->shutdownRequested()) return;
             try {
@@ -1005,6 +1022,12 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                 return;
             }
             if (!result->action) {
+                node::FlowMeshTimingSpan timing{"qt_passive_refresh"};
+                if (timing.Enabled()) {
+                    const char* label = phase == RefreshPhase::Catalog ? "catalog" : phase == RefreshPhase::Status ? "status" :
+                        phase == RefreshPhase::Effects ? "effects" : phase == RefreshPhase::Receipt ? "receipt" : "none";
+                    timing.Field("auxiliary_phase", std::string{label});
+                }
                 read_client_info();
                 // Restore public cards before attempting remote reads. The
                 // panel owns and drains this worker before destruction; the
@@ -1013,29 +1036,83 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                 QMetaObject::invokeMethod(this, [this, generation, saved] {
                     if (generation == m_generation && m_wallet && !m_cancel->load()) restoreSavedActions(saved);
                 }, Qt::QueuedConnection);
-                if (refresh_catalog) {
-                    result->markets = B3FlowMeshTrading::ParseMarkets(rpc("listflowmeshmarkets", UniValue{UniValue::VARR}));
-                    result->catalog = true; // Successful discovery survives a later selected-market failure.
+                std::exception_ptr auxiliary_error;
+                const auto auxiliary = [&](const auto& read) {
+                    try { read(); } catch (...) { auxiliary_error = std::current_exception(); }
+                };
+                // The effects reconciliation fallback and the final selected
+                // read share one response, not a second snapshot RPC. Record
+                // its real receipt time, never GUI delivery or optional work.
+                std::optional<UniValue> received_snapshot;
+                bool snapshot_attempted{false}; std::exception_ptr snapshot_error;
+                const B3FlowMeshTrading::RpcCall snapshot_rpc = [&](const std::string& method, const UniValue& params) {
+                    if (method != "getflowmeshmarketdata") return rpc(method, params);
+                    if (!snapshot_attempted) {
+                        snapshot_attempted = true;
+                        try {
+                            received_snapshot = rpc(method, params); result->snapshot_age.restart(); timing.Mark("snapshot_received_us");
+                        } catch (...) { snapshot_error = std::current_exception(); }
+                    }
+                    if (snapshot_error) std::rethrow_exception(snapshot_error);
+                    return *received_snapshot;
+                };
+                if (phase == RefreshPhase::Catalog) auxiliary([&] {
+                    auto discovered{B3FlowMeshTrading::ParseMarkets(rpc("listflowmeshmarkets", UniValue{UniValue::VARR}))};
+                    for (auto& row : discovered) if (row.remote) {
+                        const auto previous{std::find_if(result->markets.begin(), result->markets.end(), [&](const auto& old) {
+                            return row.id == old.id && row.base == old.base && row.vault == old.vault &&
+                                row.domain == old.domain && row.config == old.config && row.remote == old.remote;
+                        })};
+                        // Remote discovery has no account/state proof. Preserve
+                        // only the exact prior binding and verified checkpoint
+                        // metadata; a new row cannot create publication eligibility.
+                        row.has_account = previous != result->markets.end() && previous->has_account;
+                        row.account = row.has_account ? previous->account : QString{};
+                        row.sequence = row.has_account ? previous->sequence : 0;
+                        row.base_available = row.has_account ? previous->base_available : 0;
+                        row.base_reserved = row.has_account ? previous->base_reserved : 0;
+                        row.b3_available = row.has_account ? previous->b3_available : 0;
+                        row.b3_reserved = row.has_account ? previous->b3_reserved : 0;
+                        row.checkpoint_pending = previous != result->markets.end() && previous->checkpoint_pending;
+                        row.checkpoint = row.checkpoint_pending ? previous->checkpoint : QString{};
+                        row.publish_ready = previous != result->markets.end() && previous->publish_ready;
+                    }
+                    result->markets = std::move(discovered);
+                    result->catalog = true; // Discovery survives a later selected-market failure.
+                });
+                if (phase == RefreshPhase::Receipt && !receipt_id.isEmpty()) {
+                    try {
+                        const auto request{B3FlowMeshTrading::ReceiptParameters(receipt_market, receipt_id)};
+                        result->receipt = read_receipt(rpc(request.method, request.params));
+                    } catch (const UniValue& error) { result->receipt_error = RpcError(error); }
+                    catch (const std::exception& error) { result->receipt_error = QString::fromUtf8(error.what()).left(500); }
                 }
                 auto selected{std::find_if(result->markets.begin(), result->markets.end(), [&](const auto& m) { return route_base.isEmpty() ? m.id == selected_id : m.base == route_base; })};
                 if (selected == result->markets.end() && selected_id.isEmpty() && route_base.isEmpty()) selected = result->markets.begin();
                 if (selected != result->markets.end()) {
                     result->read_market = selected->id;
-                    if (result->catalog && selected->remote) {
+                    if (phase == RefreshPhase::Status && (selected->remote || selected->has_account)) auxiliary([&] {
                         UniValue params{UniValue::VARR}; params.push_back(selected->id.toStdString());
                         const auto status{B3FlowMeshTrading::ParseMarket(rpc("getflowmeshbalance", params))};
-                        if (status.id != selected->id || status.base != selected->base || status.vault != selected->vault || status.domain != selected->domain || status.config != selected->config || !status.remote) throw std::runtime_error{"Selected remote status changed its pinned market identity."};
+                        if (status.id != selected->id || status.base != selected->base || status.vault != selected->vault || status.domain != selected->domain || status.config != selected->config || status.remote != selected->remote ||
+                            (selected->has_account && (!status.has_account || selected->account != status.account))) throw std::runtime_error{"Selected status changed its pinned market or account identity."};
                         *selected = status;
-                    }
+                    });
+                    if (phase == RefreshPhase::Effects) auxiliary([&] {
+                        result->effects.clear();
+                        if (refresh_basis && refresh_basis->market == selected->id && refresh_basis->base == selected->base &&
+                            refresh_basis->domain == selected->domain && refresh_basis->config == selected->config &&
+                            refresh_basis->account == selected->account && !refresh_basis->account.isEmpty()) {
+                            auto basis{*refresh_basis};
+                            result->effects = ReadEffectsForRefresh(snapshot_rpc, selected->id, basis);
+                        }
+                    });
                     UniValue params{UniValue::VARR}; params.push_back(selected->id.toStdString()); UniValue options{UniValue::VOBJ}; options.pushKV("limit", 100); options.pushKV("curve_limit", 128);
                     if (!known_head.isEmpty() && selected->id == selected_id && !result->catalog) options.pushKV("known_head", known_head.toStdString());
-                    params.push_back(options); result->snapshot = B3FlowMeshMarketData::Parse(rpc("getflowmeshmarketdata", params));
+                    params.push_back(options); result->snapshot = B3FlowMeshMarketData::Parse(snapshot_rpc("getflowmeshmarketdata", params));
                     const auto& s{*result->snapshot};
                     if (s.market != selected->id || s.base != selected->base || s.domain != selected->domain || s.config != selected->config) throw std::runtime_error{"Certified data does not match the selected market identity."};
                     if (!s.unchanged && selected->has_account && selected->account != s.account) throw std::runtime_error{"Certified data belongs to another wallet account."};
-                    // The local backend independently verifies remote connected
-                    // settlement proofs. They are separate from whole-state data.
-                    if (result->catalog && !s.account.isEmpty()) result->effects = ReadEffectsForRefresh(rpc, selected->id, *result->snapshot);
                     if (s.chain_reconciling) result->effects.clear();
                     selected->publish_ready = (s.remote ? s.certificate_verified && s.account_state_verified : selected->publish_ready) && s.running && !s.chain_reconciling;
                     selected->remote = s.remote;
@@ -1046,14 +1123,9 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                         selected->base_available = s.base_available; selected->base_reserved = s.base_reserved; selected->b3_available = s.b3_available; selected->b3_reserved = s.b3_reserved;
                     }
                 }
-                if (!receipt_id.isEmpty()) {
-                    try {
-                        const auto request{B3FlowMeshTrading::ReceiptParameters(receipt_market, receipt_id)};
-                        result->receipt = read_receipt(rpc(request.method, request.params));
-                    } catch (const UniValue& error) { result->receipt_error = RpcError(error); }
-                    catch (const std::exception& error) { result->receipt_error = QString::fromUtf8(error.what()).left(500); }
-                }
+                if (auxiliary_error) std::rethrow_exception(auxiliary_error); // Conservative failure; no new display freshness.
                 read_client_info(); // Include observations from this market read.
+                timing.Mark("completed_us");
                 return;
             }
             auto& a{*result->action};
@@ -1106,6 +1178,14 @@ void B3FlowMeshTradingPanel::finishJob(const std::shared_ptr<Result>& result)
 void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& result)
 {
     if (!m_wallet || m_cancel->load()) { m_deferred_review.reset(); restoreLock(); m_busy = false; updateControls(); return; }
+    if (result->refresh_phase && result->refresh_epoch == m_refresh_epoch) {
+        switch (*result->refresh_phase) {
+        case RefreshPhase::Catalog: m_refresh_phase = RefreshPhase::Status; break;
+        case RefreshPhase::Status: m_refresh_phase = RefreshPhase::Effects; break;
+        case RefreshPhase::Effects: m_refresh_phase = RefreshPhase::Receipt; break;
+        case RefreshPhase::Receipt: case RefreshPhase::None: m_refresh_phase = RefreshPhase::None; break;
+        }
+    }
     if (result->client_info) {
         m_client_info = result->client_info;
         const auto& selected{m_client_info->find_value("selected_endpoint")};
@@ -1165,7 +1245,7 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
     }
     if (!result->action) {
         m_loading = false; m_read_failed = false; m_read_failures = 0; m_read_error.clear();
-        applyReceiptError(*result, result->receipt_error);
+        if (!result->refresh_phase || *result->refresh_phase == RefreshPhase::Receipt) applyReceiptError(*result, result->receipt_error);
         if (result->receipt) applyReceipt(*result->receipt);
         if (m_uncertain && (uncertainWalletSelected() || !m_uncertain_wallet)) m_uncertain_refreshed = true;
         const QString previous{market() ? market()->id : QString{}};
@@ -1193,15 +1273,15 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
                     // microblock. Keep the exact account/book and user inputs;
                     // only accept units for this same canonical asset.
                     if (fresh.units.known && fresh.units.asset == retained.base) retained.units = fresh.units;
-                    m_snapshot = std::move(retained); m_response_age.restart(); updateDataViews();
+                    m_snapshot = std::move(retained); m_response_age = result->snapshot_age; updateDataViews();
                 }
             } else {
-                if (!m_snapshot || m_snapshot->head != fresh.head) m_certificate_age.restart();
-                m_snapshot = std::move(fresh); m_response_age.restart(); updateDataViews();
+                if (!m_snapshot || m_snapshot->head != fresh.head) m_certificate_age = result->snapshot_age;
+                m_snapshot = std::move(fresh); m_response_age = result->snapshot_age; updateDataViews();
             }
             if (!m_read_failed && m_snapshot) {
                 if (m_snapshot->pending_actions == 0) m_queue_age.invalidate();
-                else if (new_head || !m_queue_age.isValid()) m_queue_age.restart();
+                else if (new_head || !m_queue_age.isValid()) m_queue_age = result->snapshot_age;
             }
         } else if (!selected_now || !m_snapshot || selected_now->id != m_snapshot->market) { m_snapshot.reset(); m_response_age.invalidate(); m_queue_age.invalidate(); updateDataViews(); }
         const bool changed_selection{selected_now && (selected_now->id != previous || (!result->read_market.isEmpty() && selected_now->id != result->read_market))};
@@ -1286,6 +1366,7 @@ void B3FlowMeshTradingPanel::stopWorker()
 }
 void B3FlowMeshTradingPanel::cancelAndWait()
 {
+    resetRefreshSchedule();
     m_timer->stop(); m_cancel->store(true); m_deferred_review.reset(); m_deferred_status.reset(); m_deferred_connect.reset(); ++m_generation;
     m_busy = true; updateControls();
     if (m_wallet) disconnect(m_wallet, nullptr, this, nullptr);

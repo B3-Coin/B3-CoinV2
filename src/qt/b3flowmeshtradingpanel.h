@@ -43,6 +43,7 @@ Q_SIGNALS:
     void securityWarning(const QString& warning);
 private:
     friend class B3FlowMeshWorkspaceTests;
+    enum class RefreshPhase { None, Catalog, Status, Effects, Receipt };
     struct StatusRead {
         // Attribution only; a queued read must never own a wallet/backend.
         QPointer<WalletModel> wallet;
@@ -52,6 +53,7 @@ private:
         bool operator==(const StatusRead&) const = default;
     };
     struct Result {
+        Result() { snapshot_age.start(); }
         std::optional<B3FlowMeshTrading::Action> action;
         std::optional<B3AssetTransfer::Prepared> prepared;
         std::vector<B3FlowMeshTrading::Market> markets;
@@ -65,6 +67,9 @@ private:
         QString wallet, error, receipt_error, read_market;
         QString receipt_market, receipt_account, receipt_action_id;
         bool broadcast{false}, write_attempted{false}, catalog{false}, exact_retry{false}, receipt_only{false};
+        std::optional<RefreshPhase> refresh_phase;
+        uint64_t refresh_epoch{0};
+        QElapsedTimer snapshot_age;
     };
     struct DeferredReview {
         B3FlowMeshTrading::Operation operation;
@@ -90,6 +95,7 @@ private:
     bool deferReview(B3FlowMeshTrading::Operation operation, bool funding = false);
     void resumeReview();
     void refresh();
+    void resetRefreshSchedule();
     void updateControls();
     void updateMarketText();
     void updateDataViews();
@@ -152,6 +158,8 @@ private:
     bool m_uncertain_refreshed{false};
     bool m_route_pending{false}, m_requested_withdrawal{false};
     uint64_t m_generation{0};
+    RefreshPhase m_refresh_phase{RefreshPhase::Catalog};
+    uint64_t m_refresh_epoch{0};
     std::optional<B3FlowMeshMarketData::Snapshot> m_snapshot;
     QElapsedTimer m_response_age, m_certificate_age, m_catalog_age, m_attempt_age, m_queue_age;
     unsigned m_read_failures{0};
