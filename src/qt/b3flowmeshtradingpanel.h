@@ -5,6 +5,7 @@
 
 #include <qt/b3flowmeshtrading.h>
 #include <qt/b3flowmeshmarketdata.h>
+#include <qt/b3flowmeshorderbook.h>
 #include <qt/walletmodel.h>
 #include <QElapsedTimer>
 #include <QPointer>
@@ -181,6 +182,7 @@ private:
         *m_history_note{nullptr}, *m_own_note{nullptr}, *m_identity_detail{nullptr};
     B3FlowMeshChart* m_chart{nullptr};
     QTableWidget *m_depth_view{nullptr}, *m_history_view{nullptr}, *m_own_view{nullptr};
+    B3FlowMeshOrderBook* m_order_book{nullptr};
     QTabWidget* m_activity{nullptr};
     QWidget* m_advanced{nullptr};
     QPushButton *m_buy{nullptr}, *m_sell{nullptr};

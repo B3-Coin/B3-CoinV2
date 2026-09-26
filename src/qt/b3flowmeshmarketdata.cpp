@@ -7,6 +7,7 @@
 #include <util/strencodings.h>
 #include <util/int128.h>
 #include <algorithm>
+#include <map>
 #include <set>
 #include <stdexcept>
 
@@ -77,6 +78,44 @@ QString RatioText(const Ratio& ratio, bool exact)
     if (remainder == 0) return result;
     if (exact || result == QStringLiteral("0")) return WideText(ratio.numerator) + QLatin1Char('/') + WideText(ratio.denominator);
     return QStringLiteral("≈") + result;
+}
+// Only formatting needs this wider-than-128-bit denominator. Each digit's
+// product/carry is bounded by ten times a uint64_t; no economic value is cast.
+QString MultiplyDecimal(const QString& value, uint64_t factor)
+{
+    QString result;
+    Wide carry{0};
+    for (qsizetype i{value.size()}; i > 0;) {
+        carry += Wide{static_cast<unsigned>(value.at(--i).unicode() - '0')} * factor;
+        result.prepend(QChar{static_cast<ushort>('0' + static_cast<unsigned>(carry % 10))});
+        carry /= 10;
+    }
+    while (carry != 0) {
+        result.prepend(QChar{static_cast<ushort>('0' + static_cast<unsigned>(carry % 10))});
+        carry /= 10;
+    }
+    return result;
+}
+QString LimitSpread(CAmount bid, CAmount ask, int decimals, bool inverse)
+{
+    if (ask < bid || (inverse && (bid == 0 || ask == 0))) return {};
+    if (!inverse) return FormatPrice(ask - bid, decimals);
+    if (bid == ask) return QStringLiteral("0");
+    // 10^9 * (ask - bid) / (10^decimals * bid * ask). The raw-price
+    // product fits 128 bits, but multiplication by token precision may not.
+    Wide numerator{Wide{KILO_COIN} * static_cast<uint64_t>(ask - bid)};
+    Wide denominator{Wide{static_cast<uint64_t>(bid)} * static_cast<uint64_t>(ask)};
+    Wide scale{Pow10(decimals)};
+    for (auto* factor : {&denominator, &scale}) {
+        const Wide divisor{Gcd(numerator, *factor)};
+        numerator /= divisor;
+        *factor /= divisor;
+    }
+    const Wide maximum{~Wide{0}};
+    // RatioText's long division multiplies a remainder by ten. Beyond that
+    // bound an exact reduced fraction avoids both overflow and approximation.
+    if (denominator <= (maximum / 10) / scale) return RatioText({numerator, denominator * scale}, true);
+    return WideText(numerator) + QLatin1Char('/') + MultiplyDecimal(WideText(denominator), static_cast<uint64_t>(scale));
 }
 [[noreturn]] void Fail(const char* text) { throw std::runtime_error{text}; }
 bool ValidUnits(const Units& u) { return u.known && u.decimals >= 0 && u.decimals <= 18 && u.quantity_step > 0 && u.price_step > 0; }
@@ -274,6 +313,120 @@ std::optional<CAmount> FeeExample(CAmount notional)
 {
     if (!MoneyRange(notional)) return std::nullopt;
     return notional / 10'000; // floor(notional * 100 / 1,000,000), without overflow.
+}
+
+LimitBook ProjectLimitBook(const Snapshot& snapshot, bool inverse)
+{
+    LimitBook out;
+    out.units_known = ValidUnits(snapshot.units) && MoneyRange(snapshot.units.quantity_step) &&
+        MoneyRange(snapshot.units.price_step) && !snapshot.base.isEmpty() && snapshot.units.asset == snapshot.base;
+    // Parse() has the same page bound. A direct caller cannot turn an oversized
+    // page into an apparently complete, silently truncated book.
+    if (snapshot.curves.size() > 128) {
+        out.invalid_curves = snapshot.curves.size();
+        return out;
+    }
+    using AccountSide = std::pair<QString, QString>;
+    std::map<AccountSide, size_t> accounts;
+    for (const auto& curve : snapshot.curves) ++accounts[{curve.account.toLower(), curve.side}];
+    struct Group { Wide remaining{0}, notional{0}; size_t curves{0}; };
+    std::map<std::pair<bool, CAmount>, Group> groups;
+    uint256 base; base.begin()[0] = 1;
+    const flowmesh::ClearingEngine engine{base, modern::NativeAsset(), flowmesh::HARD_MAX_CURVE_POINTS};
+    for (const auto& curve : snapshot.curves) {
+        const QString account{curve.account.toLower()};
+        const bool bid{curve.side == QStringLiteral("bid")};
+        if ((!bid && curve.side != QStringLiteral("ask")) || account.size() != 64 ||
+            !IsHex(account.toStdString()) || account == QString(64, QLatin1Char('0')) ||
+            accounts[{account, curve.side}] != 1 || !MoneyRange(curve.filled) ||
+            !MoneyRange(curve.remaining) || !MoneyRange(curve.reserved) ||
+            curve.points.empty() || curve.points.size() > flowmesh::HARD_MAX_CURVE_POINTS) {
+            ++out.invalid_curves;
+            continue;
+        }
+        std::vector<flowmesh::ClearingEngine::Breakpoint> points;
+        points.reserve(curve.points.size());
+        for (const auto& point : curve.points) points.push_back({point.price, point.quantity});
+        if (!engine.CurveIsValid(bid ? flowmesh::ClearingEngine::Side::BID : flowmesh::ClearingEngine::Side::ASK, points)) {
+            ++out.invalid_curves;
+            continue;
+        }
+        const CAmount maximum{bid ? curve.points.front().quantity : curve.points.back().quantity};
+        if (curve.filled > maximum || curve.remaining != maximum - curve.filled) {
+            ++out.invalid_curves;
+            continue;
+        }
+        if (curve.remaining == 0) {
+            ++out.exhausted_curves;
+            continue;
+        }
+        // These are precisely the integer step shapes emitted by the native
+        // limit helpers. Sloped or merely equivalent curves are not orders.
+        CAmount price{0};
+        bool limit{false};
+        if (bid && curve.points.size() == 2) {
+            const auto& first{curve.points.front()};
+            const auto& last{curve.points.back()};
+            limit = first.price < MAX_MONEY && last.price == first.price + 1 && last.quantity == 0;
+            price = first.price;
+        } else if (!bid && curve.points.size() == 1) {
+            limit = curve.points.front().price == 0;
+        } else if (!bid && curve.points.size() == 2) {
+            const auto& first{curve.points.front()};
+            const auto& last{curve.points.back()};
+            limit = last.price > 0 && first.price == last.price - 1 && first.quantity == 0;
+            price = last.price;
+        }
+        if (!limit) {
+            ++out.general_curves;
+            continue;
+        }
+        const Wide notional{Wide{static_cast<uint64_t>(price)} * static_cast<uint64_t>(curve.remaining)};
+        if (notional > static_cast<uint64_t>(MAX_MONEY)) {
+            ++out.invalid_curves;
+            continue;
+        }
+        if (inverse && price == 0) {
+            ++out.zero_inverse_curves;
+            continue;
+        }
+        auto& group{groups[{bid, price}]};
+        group.remaining += static_cast<uint64_t>(curve.remaining);
+        group.notional += notional;
+        ++group.curves;
+    }
+    for (const auto& [key, group] : groups) {
+        // Omit the WHOLE group if aggregation exceeds the supported range;
+        // displaying a prefix would make quantity depend on account ordering.
+        if (group.remaining > static_cast<uint64_t>(MAX_MONEY) || group.notional > static_cast<uint64_t>(MAX_MONEY)) {
+            out.invalid_curves += group.curves;
+            continue;
+        }
+        const auto [bid, price]{key};
+        LimitLevel level{price, static_cast<CAmount>(group.remaining), static_cast<CAmount>(group.notional), group.curves, {}, {}, {}};
+        if (out.units_known) {
+            level.price = inverse ? ExactInversePrice(price, snapshot.units.decimals) : FormatPrice(price, snapshot.units.decimals);
+            level.amount = inverse ? FormatAmount(level.gross_notional, 9) : FormatAmount(level.remaining, snapshot.units.decimals);
+            level.total = inverse ? FormatAmount(level.remaining, snapshot.units.decimals) : FormatAmount(level.gross_notional, 9);
+        }
+        if (bid) {
+            if (!out.canonical_best_bid || price > *out.canonical_best_bid) out.canonical_best_bid = price;
+        } else if (!out.canonical_best_ask || price < *out.canonical_best_ask) {
+            out.canonical_best_ask = price;
+        }
+        (bid != inverse ? out.bids : out.asks).push_back(std::move(level));
+        out.projected_curves += group.curves;
+    }
+    const auto descending = [inverse](const LimitLevel& a, const LimitLevel& b) {
+        return inverse ? a.canonical_price < b.canonical_price : a.canonical_price > b.canonical_price;
+    };
+    std::sort(out.asks.begin(), out.asks.end(), descending);
+    std::sort(out.bids.begin(), out.bids.end(), descending);
+    out.complete = snapshot.curves_complete && out.general_curves == 0 && out.invalid_curves == 0 && out.zero_inverse_curves == 0;
+    if (out.complete && out.units_known && out.canonical_best_bid && out.canonical_best_ask) {
+        out.spread = LimitSpread(*out.canonical_best_bid, *out.canonical_best_ask, snapshot.units.decimals, inverse);
+    }
+    return out;
 }
 
 std::vector<Depth> Aggregate(const std::vector<Curve>& curves)

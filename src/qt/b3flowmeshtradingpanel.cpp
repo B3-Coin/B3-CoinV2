@@ -147,8 +147,15 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     };
     auto* liquidity_card{new QWidget{center}}; B3Theme::markCard(liquidity_card); auto* liquidity_layout{new QVBoxLayout{liquidity_card}};
     auto* liquidity_title{Label(tr("Liquidity"), liquidity_card)}; liquidity_title->setObjectName(QStringLiteral("flowMeshLiquidityTitle")); B3Theme::markTextRole(liquidity_title, QStringLiteral("h3")); liquidity_layout->addWidget(liquidity_title);
+    auto* liquidity_mode{new QComboBox{liquidity_card}}; liquidity_mode->setObjectName(QStringLiteral("flowMeshLiquidityMode"));
+    liquidity_mode->setAccessibleName(tr("Liquidity display")); liquidity_mode->addItems({tr("Order book"), tr("Curve depth")}); liquidity_layout->addWidget(liquidity_mode);
+    m_order_book = new B3FlowMeshOrderBook{liquidity_card}; liquidity_layout->addWidget(m_order_book, 1);
     m_depth_view = table(liquidity_card, {tr("Price"), tr("Buy liquidity"), tr("Sell liquidity")}, "flowMeshCurveDepth"); liquidity_layout->addWidget(m_depth_view, 1);
     m_liquidity_note = Label(tr("No certified curves yet."), liquidity_card); B3Theme::markTextRole(m_liquidity_note, QStringLiteral("secondary")); liquidity_layout->addWidget(m_liquidity_note);
+    m_depth_view->hide(); m_liquidity_note->hide();
+    connect(liquidity_mode, &QComboBox::currentIndexChanged, this, [this](int index) {
+        m_order_book->setVisible(index == 0); m_depth_view->setVisible(index == 1); m_liquidity_note->setVisible(index == 1);
+    });
     auto* ticket_card{new QWidget{center}}; ticket_card->setMinimumWidth(250); B3Theme::markCard(ticket_card); auto* ticket{new QVBoxLayout{ticket_card}};
     auto* sides{new QHBoxLayout}; auto* side_group{new QButtonGroup{ticket_card}};
     m_buy = new QPushButton{tr("Buy"), ticket_card}; m_sell = new QPushButton{tr("Sell"), ticket_card};
@@ -356,6 +363,7 @@ void B3FlowMeshTradingPanel::updateDataViews()
     const auto selected{market()}; const bool matched{selected && m_snapshot && selected->id == m_snapshot->market};
     const bool inverse{inverted()};
     m_chart->setInverted(inverse); m_chart->setSnapshot(matched ? m_snapshot : std::nullopt); m_chart->setLoading(m_loading);
+    m_order_book->setSnapshot(matched ? m_snapshot : std::nullopt, inverse);
     if (!matched || !m_snapshot->units.known) {
         for (auto* table : {m_depth_view, m_history_view, m_own_view}) SetRows(table, {});
         if (auto* title{m_depth_view->parentWidget()->findChild<QLabel*>(QStringLiteral("flowMeshLiquidityTitle"))}) title->setText(tr("Liquidity"));
@@ -542,6 +550,7 @@ void B3FlowMeshTradingPanel::updateControls()
     m_check_receipt->setEnabled(idle && selectedStatusRead().has_value());
     updateStatusReadState();
     m_chart->setStale(m_snapshot && (m_read_failed || !m_response_age.isValid() || m_response_age.elapsed() > 3000));
+    m_order_book->setStale(m_snapshot && (m_read_failed || !m_response_age.isValid() || m_response_age.elapsed() > 3000));
     m_chart->setLoading(m_loading);
     updateConnectionState();
 }

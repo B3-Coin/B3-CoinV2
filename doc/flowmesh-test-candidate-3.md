@@ -13,8 +13,13 @@ or declaration that native FlowMesh V2 is complete.
 - Exact reverse-price handling, including extrema reversal and refusal to
   invent a finite inverse candle containing a zero-price clearing. Floating
   point is used for drawing coordinates, not prices or signing.
-- Green buy/red sell liquidity remains aggregate evaluated curve liquidity,
-  not an order-by-order central limit order book. Do not add rows together.
+- Exchange-style order-book display: red sell levels above green buy levels,
+  price, amount, level total, last trade, spread and cumulative depth shading.
+  It groups only exact limit-shaped orders. General curves remain available
+  in the separate **Curve depth** view, whose sampled rows must not be summed.
+  Matching stays a uniform-price auction, not a price-time-priority CLOB.
+  The reverse view's B3 amounts are gross equivalents at each limit, not
+  fixed-B3 fill promises. Partial books do not claim a complete-market spread.
 - [Generated liquidity fixture](flowmesh-regtest-liquidity.md): four generated
   operators, an engine-off HTTPS client, six actual matched clears, then one
   resting bid and ask. No mainnet funds or existing market are used.

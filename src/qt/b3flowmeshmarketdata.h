@@ -6,6 +6,7 @@
 #include <consensus/amount.h>
 #include <QString>
 #include <univalue.h>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -78,6 +79,33 @@ struct Snapshot {
     std::vector<Depth> depth;
     bool operator==(const Snapshot&) const = default;
 };
+//! A price-grouped projection of exact limit-shaped curves, not FIFO orders.
+//! Raw fields always retain canonical units: base raw quantity and B3 atoms.
+//! Inverse amount is gross B3 at this limit, not a promised execution amount.
+struct LimitLevel {
+    CAmount canonical_price{0}, remaining{0}, gross_notional{0};
+    size_t curve_count{0};
+    QString price, amount, total;
+    bool operator==(const LimitLevel&) const = default;
+};
+struct LimitBook {
+    // Display price DESCENDING on both sides: best ask last, best bid first.
+    std::vector<LimitLevel> asks, bids;
+    // Best canonical prices among INCLUDED levels, independent of orientation.
+    std::optional<CAmount> canonical_best_bid, canonical_best_ask;
+    size_t projected_curves{0}, general_curves{0}, invalid_curves{0}, zero_inverse_curves{0}, exhausted_curves{0};
+    // Complete means no active curves are missing from this projection.
+    // Unknown/mismatched units retain raw levels but leave display text empty.
+    bool complete{false}, units_known{false};
+    // Exact decimal or rational; empty for incomplete, one-sided, crossed, or
+    // unknown-unit books. Never present a partial-limit spread as market-wide.
+    QString spread;
+    bool operator==(const LimitBook&) const = default;
+};
+//! Only exact MakeLimitBidCurve / MakeLimitAskCurve shapes are projected.
+//! Invalid curves and overflowing entire price groups are omitted fail-closed;
+//! general curves remain in Aggregate(), not misrepresented as limit orders.
+LimitBook ProjectLimitBook(const Snapshot& snapshot, bool inverse);
 //! Fail closed; no JSON display values are financial sources of truth.
 Snapshot Parse(const UniValue& value);
 std::vector<Depth> Aggregate(const std::vector<Curve>& curves);
