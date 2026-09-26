@@ -35,6 +35,8 @@ public:
     //! Invalid or duplicate records fail closed. An inverse candle containing
     //! any zero-price trade is omitted because its extrema are not finite.
     static std::vector<Candle> AggregateCandles(const std::vector<B3FlowMeshMarketData::Trade>& history, uint64_t microblocks, bool inverse = false);
+    //! Volume is canonical asset turnover in either price orientation (e.g.
+    //! rUSD in B3/rUSD view), never a conversion at the candle closing price.
     static QString FormatCandleVolume(const Candle& candle, int base_decimals, bool inverse);
     int pricePointCount() const;
     QString emptyMessage() const;

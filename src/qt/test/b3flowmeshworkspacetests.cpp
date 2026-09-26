@@ -1634,7 +1634,7 @@ private Q_SLOTS:
         QCOMPARE(first.open, CAmount{1000}); QCOMPARE(first.high, CAmount{1300}); QCOMPARE(first.low, CAmount{900}); QCOMPARE(first.close, CAmount{1100});
         QCOMPARE(first.trades, size_t{4}); QVERIFY(first.base_volume == 1000); QVERIFY(first.quote_volume == 1'070'000);
         QCOMPARE(B3FlowMeshChart::FormatCandleVolume(first, 6, false), QStringLiteral("0.001"));
-        QCOMPARE(B3FlowMeshChart::FormatCandleVolume(first, 6, true), QStringLiteral("0.00107"));
+        QCOMPARE(B3FlowMeshChart::FormatCandleVolume(first, 6, true), QStringLiteral("0.001"));
         QCOMPARE(candles[1].bucket_sequence, uint64_t{5}); QCOMPARE(candles[2].bucket_sequence, uint64_t{20});
         QCOMPARE(candles[1].open, candles[1].high); QCOMPARE(candles[1].high, candles[1].low); QCOMPARE(candles[1].low, candles[1].close);
         QCOMPARE(B3FlowMeshChart::AggregateCandles(history, 1).size(), size_t{6});
@@ -1649,6 +1649,25 @@ private Q_SLOTS:
         QVERIFY(reversed[0].base_volume == first.base_volume); QVERIFY(reversed[0].quote_volume == first.quote_volume);
         const auto boundary{B3FlowMeshChart::AggregateCandles({trade(std::numeric_limits<uint64_t>::max(), 1, 1)}, 20)};
         QCOMPARE(boundary.size(), size_t{1}); QCOMPARE(boundary.front().last_sequence, std::numeric_limits<uint64_t>::max());
+    }
+    void candleVolumeKeepsAssetUnitsWhenPriceIsInverted()
+    {
+        Trade up; up.sequence = 1; up.cleared = true; up.price = 100;
+        up.quantity = 1'000'000; up.notional = up.price * up.quantity;
+        Trade down{up}; down.sequence = 2; down.price = 200; down.notional = down.price * down.quantity;
+        const auto canonical{B3FlowMeshChart::AggregateCandles({up, down}, 1, false)};
+        const auto inverse{B3FlowMeshChart::AggregateCandles({up, down}, 1, true)};
+        // Each clearing exchanges exactly 1 rUSD. Price orientation and B3
+        // notional must not turn those equal-volume bars into 0.1 / 0.2 B3.
+        QCOMPARE(canonical.size(), size_t{2}); QCOMPARE(inverse.size(), size_t{2});
+        for (size_t i{0}; i < inverse.size(); ++i) {
+            QCOMPARE(B3FlowMeshChart::FormatCandleVolume(inverse[i], 6, true), QStringLiteral("1"));
+            QCOMPARE(B3FlowMeshChart::FormatCandleVolume(canonical[i], 6, false), QStringLiteral("1"));
+        }
+        QCOMPARE(B3FlowMeshChart::FormatCandleVolume(inverse.front(), 2, true), QStringLiteral("10000"));
+        QCOMPARE(B3FlowMeshChart::FormatCandleVolume(inverse.front(), 18, true), QStringLiteral("0.000000000001"));
+        QCOMPARE(B3FlowMeshChart::FormatCandleVolume(inverse.front(), -1, true), QStringLiteral("—"));
+        QCOMPARE(B3FlowMeshChart::FormatCandleVolume(inverse.front(), 19, true), QStringLiteral("—"));
     }
     void candleAggregationRejectsInvalidAmountsAndUndefinedInverseBuckets()
     {
@@ -1683,7 +1702,7 @@ private Q_SLOTS:
         QCOMPARE(volumes.size(), size_t{1});
         QVERIFY(volumes.front().base_volume > static_cast<uint64_t>(std::numeric_limits<CAmount>::max()));
         QCOMPARE(B3FlowMeshChart::FormatCandleVolume(volumes.front(), 0, false), QStringLiteral("13244000000000000000"));
-        QCOMPARE(B3FlowMeshChart::FormatCandleVolume(volumes.front(), 6, true), QStringLiteral("13244000000"));
+        QCOMPARE(B3FlowMeshChart::FormatCandleVolume(volumes.front(), 6, true), QStringLiteral("13244000000000"));
     }
     void candleIntervalsRetainSnapshotAndRenderGallery()
     {

@@ -78,13 +78,15 @@ std::vector<B3FlowMeshChart::Candle> B3FlowMeshChart::AggregateCandles(const std
     }
     return candles;
 }
-QString B3FlowMeshChart::FormatCandleVolume(const Candle& candle, int base_decimals, bool inverse)
+QString B3FlowMeshChart::FormatCandleVolume(const Candle& candle, int base_decimals, bool /*inverse*/)
 {
     if (base_decimals < 0 || base_decimals > 18) return QStringLiteral("—");
-    auto value{inverse ? candle.quote_volume : candle.base_volume};
+    // Price inversion does not change the volume asset. In B3/rUSD view
+    // this is rUSD turnover, not B3 notional relabelled as rUSD.
+    auto value{candle.base_volume};
     QString text;
     do { text.prepend(QChar{static_cast<ushort>('0' + static_cast<unsigned>(value % 10))}); value /= 10; } while (value != 0);
-    const int decimals{inverse ? 9 : base_decimals};
+    const int decimals{base_decimals};
     if (decimals > 0) {
         text = text.rightJustified(decimals + 1, QLatin1Char('0'));
         text.insert(text.size() - decimals, QLatin1Char('.'));
@@ -140,7 +142,7 @@ void B3FlowMeshChart::paintEvent(QPaintEvent*)
         for (const auto& candle : m_candles) {
             canonical_low = std::min(canonical_low, std::min(candle.low, candle.high));
             canonical_high = std::max(canonical_high, std::max(candle.low, candle.high));
-            max_volume = std::max(max_volume, m_inverted ? candle.quote_volume : candle.base_volume);
+            max_volume = std::max(max_volume, candle.base_volume);
         }
         const auto& first{m_candles.front()}; const auto& last{m_candles.back()};
         const long double span{static_cast<long double>((last.bucket_sequence - first.bucket_sequence) / m_candle_interval) + 1};
@@ -170,7 +172,7 @@ void B3FlowMeshChart::paintEvent(QPaintEvent*)
             const qreal body_height{std::abs(y(candle.close) - y(candle.open))};
             if (body_height < 1.5) p.drawLine(QPointF{x(candle) - body_width / 2, body_top}, QPointF{x(candle) + body_width / 2, body_top});
             else p.fillRect(QRectF{x(candle) - body_width / 2, body_top, body_width, body_height}, color);
-            const qreal volume_height{volume_plot.height() * static_cast<qreal>(static_cast<long double>(m_inverted ? candle.quote_volume : candle.base_volume) / static_cast<long double>(max_volume))};
+            const qreal volume_height{volume_plot.height() * static_cast<qreal>(static_cast<long double>(candle.base_volume) / static_cast<long double>(max_volume))};
             QColor volume_color{color}; volume_color.setAlpha(100);
             p.fillRect(QRectF{x(candle) - body_width / 2, plot.bottom() - volume_height, body_width, volume_height}, volume_color);
         }
@@ -195,7 +197,7 @@ void B3FlowMeshChart::paintEvent(QPaintEvent*)
         p.setPen(B3Theme::kTextPrimary);
         const qreal field_width{(width() - 24) / 2.0};
         for (int i{0}; i < ohlc.size(); ++i) p.drawText(QRectF{plot.left() + (i % 2) * field_width, 24.0 + (i / 2) * 18, field_width, 18}, p.fontMetrics().elidedText(ohlc[i], Qt::ElideRight, static_cast<int>(field_width - 8)));
-        const QString volume{tr("Vol %1 %2 · #%3–%4 · %5 clearing(s)").arg(FormatCandleVolume(*selected, units.decimals, m_inverted), quantity_units).arg(selected->first_sequence).arg(selected->last_sequence).arg(selected->trades)};
+        const QString volume{tr("Vol %1 %2 · #%3–%4 · %5 clearing(s)").arg(FormatCandleVolume(*selected, units.decimals, m_inverted), units.ticker).arg(selected->first_sequence).arg(selected->last_sequence).arg(selected->trades)};
         p.setPen(B3Theme::kTextSecondary);
         p.drawText(volume_plot.adjusted(2, -20, -2, -2), Qt::AlignTop | Qt::AlignLeft, p.fontMetrics().elidedText(volume, Qt::ElideRight, static_cast<int>(plot.width() - 4)));
         QStringList notices;
