@@ -4,6 +4,11 @@
 
 set(CMAKE_AUTOMOC_MOC_OPTIONS "-p${CMAKE_CURRENT_SOURCE_DIR}")
 
+include(flowmeshclosedtest.cmake)
+if(NOT BUILD_GUI_TESTS)
+  return()
+endif()
+
 add_executable(test_bitcoin-qt
   apptests.cpp
   b3shelltests.cpp
@@ -247,4 +252,3 @@ if(WIN32 AND VCPKG_TARGET_TRIPLET)
 endif()
 
 install_binary_component(test_bitcoin-qt INTERNAL)
-include(flowmeshclosedtest.cmake)

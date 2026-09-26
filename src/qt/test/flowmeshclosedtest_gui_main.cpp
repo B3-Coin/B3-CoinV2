@@ -25,14 +25,14 @@ const std::function<std::string()> G_TEST_GET_FULL_NAME{};
 namespace {
 int Refuse(const QString& reason)
 {
-    std::fprintf(stderr, "B3 FlowMesh CLOSED TEST — NOT READY: %s\n", reason.toUtf8().constData());
+    std::fprintf(stderr, "B3 FlowMesh REGTEST TEST4 — NOT READY: %s\n", reason.toUtf8().constData());
     // A Finder-opened unconfigured package must visibly explain the block. No
     // rejected caller arguments reach Qt, and GuiMain/node/wallet never starts.
     int count{1};
-    char name[]{"B3 FlowMesh CLOSED TEST"};
+    char name[]{"B3 FlowMesh REGTEST TEST4"};
     char* values[]{name, nullptr};
     QApplication app{count, values};
-    QMessageBox box{QMessageBox::Warning, QStringLiteral("B3 FlowMesh CLOSED TEST — NOT READY"),
+    QMessageBox box{QMessageBox::Warning, QStringLiteral("B3 FlowMesh REGTEST TEST4 — NOT READY"),
         reason + QStringLiteral("\n\nNo B3 node or wallet was opened. Do not use a normal wallet. Ask the test coordinator for the reviewed test environment."), QMessageBox::Ok};
     box.setTextFormat(Qt::PlainText);
     box.exec();
@@ -62,13 +62,14 @@ MAIN_FUNCTION
     const auto args{FlowMeshClosedTest::NodeArguments(profile, storage)};
     std::vector<QByteArray> encoded;
     encoded.reserve(args.size() + 1);
-    encoded.push_back(QFile::encodeName(QString::fromLocal8Bit(argv[0])));
-    for (const auto& arg : args) encoded.push_back(QFile::encodeName(arg));
+    encoded.emplace_back(argv[0]);
+    // Core paths and option values use UTF-8, including Windows account paths.
+    for (const auto& arg : args) encoded.push_back(arg.toUtf8());
     std::vector<char*> pointers;
     for (auto& arg : encoded) pointers.push_back(arg.data());
     pointers.push_back(nullptr);
-    std::fprintf(stderr, "B3 FlowMesh CLOSED TEST profile=%s network=regtest validator=0 admin_rpc=0\n", profile.id.toUtf8().constData());
+    std::fprintf(stderr, "B3 FlowMesh REGTEST TEST4 profile=%s network=regtest validator=0 admin_rpc=0; test tokens have no value; futures informational only\n", profile.id.toUtf8().constData());
     const int result{GuiMain(static_cast<int>(encoded.size()), pointers.data())};
-    std::fprintf(stderr, "B3 FlowMesh CLOSED TEST GuiMain exit status=%d\n", result);
+    std::fprintf(stderr, "B3 FlowMesh REGTEST TEST4 GuiMain exit status=%d\n", result);
     return result;
 }

@@ -579,7 +579,11 @@ int GuiMain(int argc, char* argv[])
     // User-visible identity everywhere the platform shows an app name
     // (notifications, some window managers) without touching the QSettings
     // compat key above.
+#ifdef B3_FLOWMESH_REGTEST_CLIENT
+    QGuiApplication::setApplicationDisplayName(QStringLiteral("B3 FlowMesh REGTEST TEST4"));
+#else
     QGuiApplication::setApplicationDisplayName(QStringLiteral("B3 Hive"));
+#endif
 
     /// 4. Initialization of translations, so that intro dialog is in user's language
     // Now that QSettings are accessible, initialize translations

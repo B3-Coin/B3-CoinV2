@@ -34,7 +34,11 @@ struct Storage {
     Storage& operator=(const Storage&) = delete;
     ~Storage();
 private:
+#ifdef Q_OS_WIN
+    void* lock_handle{nullptr};
+#else
     int lock_fd{-1};
+#endif
     friend bool PrepareStorage(const Profile&, const QString&, Storage&, QString&);
 };
 

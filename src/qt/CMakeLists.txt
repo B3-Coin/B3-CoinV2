@@ -157,6 +157,9 @@ target_compile_definitions(bitcoinqt
     QT_NO_KEYWORDS
     QT_USE_QSTRINGBUILDER
 )
+if(BUILD_FLOWMESH_REGTEST_CLIENT)
+  target_compile_definitions(bitcoinqt PRIVATE B3_FLOWMESH_REGTEST_CLIENT)
+endif()
 target_include_directories(bitcoinqt
   PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>
@@ -356,7 +359,9 @@ if(ENABLE_IPC)
   endif()
 endif()
 
-if(BUILD_GUI_TESTS)
+if(BUILD_GUI_TESTS OR BUILD_FLOWMESH_REGTEST_CLIENT OR BUILD_FLOWMESH_REGTEST_POLICY_TESTS)
+  # The guarded client and its pure policy tests do not require test_util or
+  # any of the normal GUI test executables.
   add_subdirectory(test)
 endif()
 

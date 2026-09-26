@@ -141,8 +141,14 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
         // navigation back to existing functionality; it invents nothing.
         m_shell = new B3Shell(this);
         m_shell->setWalletWidget(walletFrame);
+#ifdef B3_FLOWMESH_REGTEST_CLIENT
+        m_shell->topStatus()->setNetwork(QStringLiteral("B3 FlowMesh REGTEST TEST4 — ") +
+                                         tr("Test tokens have no value. Futures are informational only."),
+                                         QStringLiteral("[regtest]"));
+#else
         m_shell->topStatus()->setNetwork(m_network_style->getAppName(),
                                          m_network_style->getTitleAddText());
+#endif
         connect(m_shell, &B3Shell::pageSelected, this, &BitcoinGUI::onShellPageSelected);
         connect(walletFrame, &WalletFrame::currentPageChanged, this, &BitcoinGUI::reflectWalletPage);
         // The Assets page starts in the honest no-wallet state; wallet
@@ -1843,7 +1849,11 @@ void BitcoinGUI::updateProxyIcon()
 
 void BitcoinGUI::updateWindowTitle()
 {
+#ifdef B3_FLOWMESH_REGTEST_CLIENT
+    QString window_title = QStringLiteral("B3 FlowMesh REGTEST TEST4");
+#else
     QString window_title = HIVE_NAME;
+#endif
 #ifdef ENABLE_WALLET
     if (walletFrame) {
         WalletModel* const wallet_model = walletFrame->currentWalletModel();
