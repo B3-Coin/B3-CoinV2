@@ -287,6 +287,14 @@ foreach(recovery_test IN ITEMS operator_recovery_signer finality_recovery_option
   add_test(NAME test_${recovery_test} COMMAND test_${recovery_test})
 endforeach()
 
+option(BUILD_FLOWMESH_FASTPATH_PROBE "Build isolated TEST-ONLY native fast-path probe" OFF)
+if(UNIX AND BUILD_FLOWMESH_FASTPATH_PROBE)
+  add_executable(flowmesh-fastpath-probe
+    flowmesh_fastpath_probe.cpp flowmesh_fastpath_probe_fixture.cpp)
+  target_link_libraries(flowmesh-fastpath-probe
+    core_interface bitcoin_node bitcoin_consensus univalue Boost::headers)
+endif()
+
 if(ENABLE_WALLET)
   add_subdirectory(${PROJECT_SOURCE_DIR}/src/wallet/test wallet)
 endif()
