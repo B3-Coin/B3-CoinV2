@@ -255,8 +255,14 @@ def execute(binary, fixture, root, scenario, cut=None, seed=None):
             assert w.checker.decisions == {value}, 'hiddenFAST not reached'
             assert all(w.statuses[s]['apply_count'] == 0 for s in (1,2,3))
             w.tick()
-            w.pump(seed=seed)
+            # Keep the original standalone votes/certificate withheld while
+            # recovery uses the authenticated V0 evidence inside REPORT/NV.
+            # Releasing PREPARE0 here would merely reconstruct old FAST and
+            # would not exercise recovery's selection or COMMIT path.
+            w.pump(drop=lambda s,k,p:k == 'proof' and decode(p).view == 0
+                   and decode(p).kind in ('PREPARE','PC','FAST'), seed=seed)
             w.settled(value=value)
+            assert all(decode(w.statuses[s]['decision']).kind == 'SLOW' for s in (1,2,3))
             votes = tuple(sorted((p for p in w.checker.authenticated if p.kind == 'PREPARE' and p.view == 0 and p.value == value), key=lambda p:p.sender))
             late = Proof('FAST',0,-1,fixture['instance'],value,votes)
             for seat in (1,2,3):
