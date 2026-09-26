@@ -43,7 +43,8 @@ namespace node {
 
 std::optional<flowmesh::ActiveFnBlsSeatSet> ResolveFlowMeshClientSeats(
     ChainstateManager& chainman, const flowmesh::ClientEvidencePins& pins,
-    const flowmesh::ProductionEntryCore& entry, std::string& error)
+    const flowmesh::ProductionEntryCore& entry, std::string& error,
+    std::vector<flowmesh::BlsSeatBinding>* public_bindings)
 {
     if (!flowmesh::CheckClientEvidencePins(pins) || entry.domain != pins.domain ||
         entry.market_id != pins.market_id) {
@@ -154,6 +155,9 @@ std::optional<flowmesh::ActiveFnBlsSeatSet> ResolveFlowMeshClientSeats(
         error = "FlowMesh client certificate names a different anchored seat set";
         return std::nullopt;
     }
+    // BuildActiveFnBlsSeatSet verifies canonical input order and preserves it.
+    // These are public on-chain credentials, never access to a local signer.
+    if (public_bindings) *public_bindings = std::move(bindings);
     return out;
 }
 

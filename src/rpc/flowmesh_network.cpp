@@ -10,6 +10,9 @@
 #include <rpc/server.h>
 #include <rpc/util.h>
 #include <univalue.h>
+#ifdef ENABLE_FLOWMESH_P2FV_BOOTSTRAP_TEST
+#include <test/flowmesh_p2fv_bootstrap.h>
+#endif
 
 static RPCResult TrafficResult(const std::string& name)
 {
@@ -457,4 +460,7 @@ void RegisterFlowMeshNetworkRPCCommands(CRPCTable& table)
         {"flowmesh", &getflowmeshdeliveryinfo},
     };
     for (const auto& command : commands) table.appendCommand(command.name, &command);
+#ifdef ENABLE_FLOWMESH_P2FV_BOOTSTRAP_TEST
+    RegisterFlowMeshP2fvBootstrapRPCCommands(table);
+#endif
 }

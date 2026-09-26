@@ -35,10 +35,12 @@ bool ParseFlowMeshPreagreementMarkets(const std::vector<std::string>& values,
                                      std::string& error);
 
 /** Engine-free B3 authority lookup. Uses mandatory chain indexes only, never
- * a FlowMesh service, signer, execution store or microblock history. */
+ * a FlowMesh service, signer, execution store or microblock history. Optional
+ * public bindings are assigned only on success, in the verified seat order. */
 std::optional<flowmesh::ActiveFnBlsSeatSet> ResolveFlowMeshClientSeats(
     ChainstateManager& chainman, const flowmesh::ClientEvidencePins& pins,
-    const flowmesh::ProductionEntryCore& entry, std::string& error);
+    const flowmesh::ProductionEntryCore& entry, std::string& error,
+    std::vector<flowmesh::BlsSeatBinding>* public_bindings = nullptr);
 
 /** Public, chain-derived identity of one production FlowMesh v1 market. */
 struct FlowMeshServiceMarket {

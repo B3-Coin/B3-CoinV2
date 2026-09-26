@@ -287,6 +287,12 @@ foreach(recovery_test IN ITEMS operator_recovery_signer finality_recovery_option
   add_test(NAME test_${recovery_test} COMMAND test_${recovery_test})
 endforeach()
 
+option(BUILD_FLOWMESH_P2FV_REGTEST_GATE "Build read-only regtest bootstrap RPCs for TEST-ONLY P2FV integration" OFF)
+if(BUILD_FLOWMESH_P2FV_REGTEST_GATE)
+  target_sources(bitcoin_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/flowmesh_p2fv_bootstrap.cpp)
+  target_compile_definitions(bitcoin_node PRIVATE ENABLE_FLOWMESH_P2FV_BOOTSTRAP_TEST=1)
+endif()
+
 option(BUILD_FLOWMESH_FASTPATH_PROBE "Build isolated TEST-ONLY native fast-path probe" OFF)
 if(UNIX AND BUILD_FLOWMESH_FASTPATH_PROBE)
   add_executable(flowmesh-fastpath-probe
