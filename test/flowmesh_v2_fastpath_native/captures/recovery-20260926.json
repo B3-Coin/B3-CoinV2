@@ -1,0 +1,537 @@
+{
+  "source_commit": "f17fdabb8cc6c5e8e5249e527aac600466b57d64",
+  "profile": "native-p2fv-recovery-test/1",
+  "binary_sha256": "df89eef190f2a4bb07febb8f37eec4241c28440d0a97ddad15acb839c09a0415",
+  "process_cases": [
+    {
+      "scenario": "healthy",
+      "cut": null,
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 80,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 8
+      },
+      "schedule_sha256": "bff86eb04d2e176dfc31ea590fc325ddea82da25f258dec1b180e149f89bed76",
+      "result_sha256": "501ee0031516cab1bbb69b1d7a7056efad80ab1c047cb057ca8c1b66055b14ad"
+    },
+    {
+      "scenario": "leader-failure",
+      "cut": null,
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 142,
+      "unique_honest_signatures": 10,
+      "retained_public_signatures": 10,
+      "exit_codes": {
+        "0": 8,
+        "-9": 1
+      },
+      "schedule_sha256": "87cad0da5066b7e5a9b3ebb9503fc965c1dbc85ceb40512f51ec0417a681481f",
+      "result_sha256": "8051f86061ab5a4b37132b82f961f48b653f4cf90b387c1ac121dcb6b48e8e1a"
+    },
+    {
+      "scenario": "hidden-fast",
+      "cut": null,
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 127,
+      "unique_honest_signatures": 13,
+      "retained_public_signatures": 15,
+      "exit_codes": {
+        "0": 7
+      },
+      "schedule_sha256": "57b48835a395172ca56ed62ef7f71cca8e44352bbe875cc53250e267f9504396",
+      "result_sha256": "c0b3d5ae579dfff2a77dfb8e9772be1fe0f8c9d45b1e6b82dbfe5e4e79abf242"
+    },
+    {
+      "scenario": "missing-body",
+      "cut": null,
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 118,
+      "unique_honest_signatures": 3,
+      "retained_public_signatures": 3,
+      "exit_codes": {
+        "0": 8
+      },
+      "schedule_sha256": "984ddec39c18f0c2bbd10ac0bcfe17b50553a2818c9b3185a5e107da2f54487c",
+      "result_sha256": "29efcc5273d7afddb6f122597406658f5c9c19164187632eef980e11240c1077"
+    },
+    {
+      "scenario": "cut",
+      "cut": "after_intent",
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 96,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 8,
+        "73": 1
+      },
+      "schedule_sha256": "44dd7d2de4c81a5c9afcaf13dd3733ea24885e499265388988e2d34436af0be6",
+      "result_sha256": "5884621c4641476d6ed7da2fb9acb6e8c8eac353b4953ac6277ab21d9f278855"
+    },
+    {
+      "scenario": "cut",
+      "cut": "before_compute",
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 96,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 8,
+        "73": 1
+      },
+      "schedule_sha256": "2de478bb68fa6992c851bde5cabd4234a4780e72eaca0870001d8163555dbdfd",
+      "result_sha256": "77f5be6fcfddbe6e433678cc94882b23a3d2821f0418c3347e8a678eac33793d"
+    },
+    {
+      "scenario": "cut",
+      "cut": "after_compute_before_durable",
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 96,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 8,
+        "73": 1
+      },
+      "schedule_sha256": "8fba967a83a3c7680f5244ffe4741641a52a02e5a9b3db7ae36f680a98c119c6",
+      "result_sha256": "a45590a4d8069c72e14edb1f30fcfa331077eb190ccb15324964d168dc73a6fc"
+    },
+    {
+      "scenario": "cut",
+      "cut": "after_durable_before_publish",
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 92,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 8,
+        "73": 1
+      },
+      "schedule_sha256": "b29f8aaf794792bcd96bd967ac95132f3c994fa9789b2c7b66da5f4f7bc57d3d",
+      "result_sha256": "2b7220f8d528ba2c62f547de578f27255677152f445d42fb69a0012759702440"
+    },
+    {
+      "scenario": "cut",
+      "cut": "after_publish",
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 96,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 8,
+        "73": 1
+      },
+      "schedule_sha256": "f4bff4364158fe9357005f24e87e059ca24efa2698bbfa16505cbab78f2f5da8",
+      "result_sha256": "be46a5232a7b80d38b35a029147a458135a94f25e2e811301c954367d062f56b"
+    },
+    {
+      "scenario": "cut",
+      "cut": "after_decision_before_apply",
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 96,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 8,
+        "73": 1
+      },
+      "schedule_sha256": "4080cbf6f373efb657e85e9c5dc89542c3abf1a3890716d5de2b8f490eb48c6a",
+      "result_sha256": "40ac8b44ad9ba92fe3fdd79a1934673c4933ee47e94ce7aa6ce5ae52033911c3"
+    },
+    {
+      "scenario": "cut",
+      "cut": "during_apply_before_atomic_commit",
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 96,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 8,
+        "73": 1
+      },
+      "schedule_sha256": "41589c01e00a6ff380f97ee32d3117858269946dd88def9ca22ab437418a4731",
+      "result_sha256": "c8b10b43ed783c2767e08d3de9867d9bf1b5d32eeb8309f3081c0a06545510f6"
+    },
+    {
+      "scenario": "cut",
+      "cut": "after_apply",
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 96,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 8,
+        "73": 1
+      },
+      "schedule_sha256": "6861bfbc2d2ff6456d040d35a618e81158b6ad4c9275f73ea4dfa98f4165c69b",
+      "result_sha256": "905675a1ae3a7434dc9b8adeb3851af49f8d4fa747f7f7e7e8fd535befbca65e"
+    },
+    {
+      "scenario": "serialize-failure",
+      "cut": null,
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 96,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 9
+      },
+      "schedule_sha256": "4f6a05e8f5f192dedf33f5699373d989988e9f98f21d8cd3b48c7ccba98c536a",
+      "result_sha256": "e82cabe6d2c2d169595b2dbed1d533b0a26a07defb93370c43aa6205b177b6ad"
+    },
+    {
+      "scenario": "record-insert-failure",
+      "cut": null,
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 96,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 9
+      },
+      "schedule_sha256": "b636fb8d6ced9275291ad897489197d2a0cef333d223f48ee58e8376dfedc611",
+      "result_sha256": "78b64d5be79c114db03474af895b7b6de8edc5fb2672108dc00a3e5ad4b529d0"
+    },
+    {
+      "scenario": "future-pc",
+      "cut": null,
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 170,
+      "unique_honest_signatures": 12,
+      "retained_public_signatures": 12,
+      "exit_codes": {
+        "0": 8
+      },
+      "schedule_sha256": "c1362bc512fc8e89540db97bd01d3985af2a2a058a1c1e6a56740d0abaa306af",
+      "result_sha256": "fe1cdfd4ef7bfe576b40fd110f8471ebe156eb89f685d69d20bb54fd02c69e26"
+    },
+    {
+      "scenario": "two-view-timeout",
+      "cut": null,
+      "seed": null,
+      "status": "PASS",
+      "delivery_steps": 178,
+      "unique_honest_signatures": 13,
+      "retained_public_signatures": 13,
+      "exit_codes": {
+        "0": 8,
+        "-9": 1
+      },
+      "schedule_sha256": "802ae879d8d4f128b4a6fa40e3382f15cef5110da911c62a030e4a50f3edb004",
+      "result_sha256": "6b653d6472aa2ace356e96a45896728dd25da9c1c88aef6b4048506620369703"
+    },
+    {
+      "scenario": "healthy",
+      "cut": null,
+      "seed": 0,
+      "status": "PASS",
+      "delivery_steps": 80,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 8
+      },
+      "schedule_sha256": "b123e4e779ed2a819748ea4e5eec987a21cd37ff2d5a51d7fd7f2366783465a7",
+      "result_sha256": "49e3b43380773d5b3c637c21283074ae152e6d071669b92e3a69485793a3e580"
+    },
+    {
+      "scenario": "leader-failure",
+      "cut": null,
+      "seed": 0,
+      "status": "PASS",
+      "delivery_steps": 142,
+      "unique_honest_signatures": 10,
+      "retained_public_signatures": 10,
+      "exit_codes": {
+        "0": 8,
+        "-9": 1
+      },
+      "schedule_sha256": "c2755390ee51625ea495edb77f16a02270816cd08c57b2ce6ce8c6fc697a8f08",
+      "result_sha256": "14913197347acfbcb7a8ecc9aab13ded8ac24ac5bee6b3bbebcd9c05bc8d20fb"
+    },
+    {
+      "scenario": "hidden-fast",
+      "cut": null,
+      "seed": 0,
+      "status": "PASS",
+      "delivery_steps": 127,
+      "unique_honest_signatures": 13,
+      "retained_public_signatures": 15,
+      "exit_codes": {
+        "0": 7
+      },
+      "schedule_sha256": "79ccaaab06adea4f97977cab24259f715b039489ad5b7e426cdf8a0b56b65033",
+      "result_sha256": "af39e842c040b03e25efea970b1e6e1827001a30c793d6ae7e7865db3f5c53fd"
+    },
+    {
+      "scenario": "missing-body",
+      "cut": null,
+      "seed": 0,
+      "status": "PASS",
+      "delivery_steps": 82,
+      "unique_honest_signatures": 3,
+      "retained_public_signatures": 3,
+      "exit_codes": {
+        "0": 8
+      },
+      "schedule_sha256": "258f54fd7eafa75415a423f44fd16cde48a73887dbda5b775bf8f6ed21cbceef",
+      "result_sha256": "e124e4dfa0c2cf6c42255184dde7be7d7511acb2ffa4936bf4da37dbd0543a59"
+    },
+    {
+      "scenario": "healthy",
+      "cut": null,
+      "seed": 1,
+      "status": "PASS",
+      "delivery_steps": 76,
+      "unique_honest_signatures": 3,
+      "retained_public_signatures": 3,
+      "exit_codes": {
+        "0": 8
+      },
+      "schedule_sha256": "3afd73d86f661e9627b44308eed91f84b529d7b5535ddc52ae79a83e91daece9",
+      "result_sha256": "31d753603792a3afff60ff7a6f893dce0983104097595ecdaa150bec639012b7"
+    },
+    {
+      "scenario": "leader-failure",
+      "cut": null,
+      "seed": 1,
+      "status": "PASS",
+      "delivery_steps": 142,
+      "unique_honest_signatures": 10,
+      "retained_public_signatures": 10,
+      "exit_codes": {
+        "0": 8,
+        "-9": 1
+      },
+      "schedule_sha256": "d56fc7d109a5977c5a60b03f3d3f4249b6a6acd0967520a857fb811468393b8b",
+      "result_sha256": "1bbc5a6dc5f3d0275b4c13599ab77eeec2ab14f61f809ae3dc70d98f40f7df18"
+    },
+    {
+      "scenario": "hidden-fast",
+      "cut": null,
+      "seed": 1,
+      "status": "PASS",
+      "delivery_steps": 127,
+      "unique_honest_signatures": 13,
+      "retained_public_signatures": 15,
+      "exit_codes": {
+        "0": 7
+      },
+      "schedule_sha256": "34da2ee743a184d31c9082810b77e9b4a004b52dd1f907b6c42a0df7ffc57edd",
+      "result_sha256": "0b819449cf7052e4d1496efb24b8a2693e1d15c10d5a7c545e812a7af19fe1a0"
+    },
+    {
+      "scenario": "missing-body",
+      "cut": null,
+      "seed": 1,
+      "status": "PASS",
+      "delivery_steps": 92,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 8
+      },
+      "schedule_sha256": "8fc262be20e32f8564e1948e442fb04e6efc5c959e96f5e88a88205d9c467920",
+      "result_sha256": "a51b4dd284ee300aa80a32d332892c00886fc5f51ad5b69333b4ff8fbda009e9"
+    },
+    {
+      "scenario": "healthy",
+      "cut": null,
+      "seed": 2,
+      "status": "PASS",
+      "delivery_steps": 76,
+      "unique_honest_signatures": 3,
+      "retained_public_signatures": 3,
+      "exit_codes": {
+        "0": 8
+      },
+      "schedule_sha256": "298b7421a995b95b697d43a492a9a26c5f4cd72e0642f2ae4d37453f031510fa",
+      "result_sha256": "e46ecaf5062d48c94ac52983b54ffde9b1cae62ff06505f775f06fed34f3edb3"
+    },
+    {
+      "scenario": "leader-failure",
+      "cut": null,
+      "seed": 2,
+      "status": "PASS",
+      "delivery_steps": 142,
+      "unique_honest_signatures": 10,
+      "retained_public_signatures": 10,
+      "exit_codes": {
+        "0": 8,
+        "-9": 1
+      },
+      "schedule_sha256": "35e14a2c416cd2cd1e8188ffaa37dc50ba915918f8b182669c4a53be67969138",
+      "result_sha256": "213e239091ecdbffadf4d870a05b70e1619e0e57d90dbb5f8ac995273860693d"
+    },
+    {
+      "scenario": "hidden-fast",
+      "cut": null,
+      "seed": 2,
+      "status": "PASS",
+      "delivery_steps": 127,
+      "unique_honest_signatures": 13,
+      "retained_public_signatures": 15,
+      "exit_codes": {
+        "0": 7
+      },
+      "schedule_sha256": "26a1ad6ac60ef97cd3870e4732f7846afbfc9db585e2806bfc53b4c294b10870",
+      "result_sha256": "6f3e23e4c18026ea6f319be4fc26a448c1190a7f9ae8b35ec70d73f79f2763f8"
+    },
+    {
+      "scenario": "missing-body",
+      "cut": null,
+      "seed": 2,
+      "status": "PASS",
+      "delivery_steps": 82,
+      "unique_honest_signatures": 3,
+      "retained_public_signatures": 3,
+      "exit_codes": {
+        "0": 8
+      },
+      "schedule_sha256": "976c2f239fc32b5d0d284c712904ee76776c46e6fa63935e6936438848b5c4b8",
+      "result_sha256": "e723c7e8e55100df8f9802215f14389f7321b8cc45fa11344f1a5ebda70c475c"
+    },
+    {
+      "scenario": "healthy",
+      "cut": null,
+      "seed": 3,
+      "status": "PASS",
+      "delivery_steps": 80,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 8
+      },
+      "schedule_sha256": "2099a95d7283926b60d604ad174ff8ac5182f2b9c5cc8c3d206cc80d1033bbca",
+      "result_sha256": "477ea2e9ff0d6139f03e549431ee812d0a3984af9eae6b8f875e15fe5ab3dc30"
+    },
+    {
+      "scenario": "leader-failure",
+      "cut": null,
+      "seed": 3,
+      "status": "PASS",
+      "delivery_steps": 142,
+      "unique_honest_signatures": 10,
+      "retained_public_signatures": 10,
+      "exit_codes": {
+        "0": 8,
+        "-9": 1
+      },
+      "schedule_sha256": "2c979b488a23f0f71b9b942a28416bc5318accad30b7523ed4cfd08122eb0ea9",
+      "result_sha256": "ea8df5cefeb5b8c94559a0f257ce97b59eded2cf6160c81c1754b5c34f2881df"
+    },
+    {
+      "scenario": "hidden-fast",
+      "cut": null,
+      "seed": 3,
+      "status": "PASS",
+      "delivery_steps": 127,
+      "unique_honest_signatures": 13,
+      "retained_public_signatures": 15,
+      "exit_codes": {
+        "0": 7
+      },
+      "schedule_sha256": "8b1e36d6bc581f3d4849a515e637c698188ef3358badd3949324fcd158331d80",
+      "result_sha256": "8379c0744a973fdb8fb24d5aee6ef189221dc061c6af9b35190f991e40bb5be5"
+    },
+    {
+      "scenario": "missing-body",
+      "cut": null,
+      "seed": 3,
+      "status": "PASS",
+      "delivery_steps": 86,
+      "unique_honest_signatures": 4,
+      "retained_public_signatures": 4,
+      "exit_codes": {
+        "0": 8
+      },
+      "schedule_sha256": "359bdbc5aee58222275778f272b9180fed4dcf35b488feb8d77cc941effc912d",
+      "result_sha256": "823b804de32c55e9bbcfc868431af99bc943fd4565fd9e19236a855ea4c3b899"
+    }
+  ],
+  "store_checks": [
+    {
+      "case": "bad-snapshot",
+      "status": "PASS",
+      "refusal": "RESTART_SAFE_REFUSAL:APPLICATION_SNAPSHOT_MISMATCH",
+      "exit_codes": {
+        "0": 5
+      },
+      "schedule_sha256": "82682c2cec6c13f224b3650524877ea3a9a0fd51ba166977f9035e69b434a241"
+    },
+    {
+      "case": "drop-commit-highest",
+      "status": "PASS",
+      "refusal": "RESTART_SAFE_REFUSAL:COMMIT_GUARD_LOST_HIGHEST_PC",
+      "exit_codes": {
+        "0": 4,
+        "-9": 1
+      },
+      "schedule_sha256": "b62367005d3d665ac16702166436af112935633724f4aad857701dc468c18f4b"
+    },
+    {
+      "case": "drop-report1",
+      "status": "PASS",
+      "refusal": "RESTART_SAFE_REFUSAL:MISSING_PRE_VIEW_TRANSITION_AUTHORITY",
+      "exit_codes": {
+        "0": 5
+      },
+      "schedule_sha256": "51497fd5661d5037ef48bdc1303086e200cc8fdb1a4bcc073379d4498c09a243"
+    },
+    {
+      "case": "drop-v0",
+      "status": "PASS",
+      "refusal": "RESTART_SAFE_REFUSAL:MISSING_OR_INCONSISTENT_ORIGINAL_VOTE",
+      "exit_codes": {
+        "0": 5
+      },
+      "schedule_sha256": "a4cccff8f548fc232b35a9908a8b4d0d4b328edf8e8fb93c542f197a953806c2"
+    },
+    {
+      "case": "duplicate-owner",
+      "status": "PASS",
+      "refused_child_exit": 1,
+      "exit_codes": {
+        "0": 4
+      },
+      "schedule_sha256": "015169cf1ac6b5d8962d24f12208317f8b59503ba628a7af19da9916b2881a5f"
+    },
+    {
+      "case": "nv-without-report1",
+      "status": "PASS",
+      "refusal": "RESTART_SAFE_REFUSAL:NEW_VIEW_WITHOUT_CHANGING_REPORT_AUTHORITY",
+      "exit_codes": {
+        "0": 5
+      },
+      "schedule_sha256": "fbd99c47c08dddb5998c5de606e94fbde040c689c2197a44b86f8182b228a570"
+    }
+  ],
+  "proof_checks_passed": 46,
+  "no_latency_measurement": true,
+  "worker_exits": {
+    "0": 281,
+    "73": 8,
+    "-9": 7
+  },
+  "unexpected_cleanup_count": 0,
+  "scheduler_commit": "bb00b96e6ae40db70c57d1bcdc0d5b0e6adff855",
+  "qualification_note": "Hidden original FAST remains withheld until all honest replicas decide SLOW; original late FAST then applied as duplicate only.",
+  "model_tests_passed": 446
+}
