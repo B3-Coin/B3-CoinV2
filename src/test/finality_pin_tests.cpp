@@ -415,15 +415,15 @@ BOOST_FIXTURE_TEST_CASE(unindexed_pin_blocks_conflicting_full_block_extension, F
     if (alternate.GetBlockTime() > GetTime()) SetMockTime(alternate.GetBlockTime());
     BOOST_REQUIRE(Submit(alternate));
     BOOST_REQUIRE_EQUAL(Tip()->nHeight, M + 4);
-    BOOST_REQUIRE_EQUAL(Tip()->GetBlockHash(), alternate.GetHash());
+    BOOST_REQUIRE_EQUAL(Tip()->GetBlockHash().GetHex(), alternate.GetHash().GetHex());
     const auto conflicting{BuildPosBlock(m_vk_a, {}, {}, /*extra=*/911)};
     if (conflicting.GetBlockTime() > GetTime()) SetMockTime(conflicting.GetBlockTime());
     BOOST_REQUIRE(conflicting.GetHash() != pin_hash);
     BOOST_CHECK(!Submit(conflicting));
     BOOST_CHECK_EQUAL(Tip()->nHeight, M + 4);
-    BOOST_CHECK_EQUAL(Tip()->GetBlockHash(), alternate.GetHash());
+    BOOST_CHECK_EQUAL(Tip()->GetBlockHash().GetHex(), alternate.GetHash().GetHex());
     BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(conflicting.GetHash())) == nullptr);
-    BOOST_CHECK_EQUAL(Anchor(m_node)->second, pin_hash);
+    BOOST_CHECK_EQUAL(Anchor(m_node)->second.GetHex(), pin_hash.GetHex());
 
     // Learning the genuine pinned ancestry allows the provisional prefix to
     // be unwound and canonical block bodies to catch up, without moving pin.
@@ -433,12 +433,12 @@ BOOST_FIXTURE_TEST_CASE(unindexed_pin_blocks_conflicting_full_block_extension, F
     BOOST_REQUIRE_MESSAGE(m_node.chainman->ProcessNewBlockHeaders(headers, /*min_pow_checked=*/true, state), state.ToString());
     for (const auto& block : canonical) BOOST_REQUIRE(Submit(block));
     BOOST_CHECK_EQUAL(Tip()->nHeight, M + 12);
-    BOOST_CHECK_EQUAL(ChainHashAt(M + 5), pin_hash);
-    BOOST_CHECK_EQUAL(Anchor(m_node)->second, pin_hash);
+    BOOST_CHECK_EQUAL(ChainHashAt(M + 5).GetHex(), pin_hash.GetHex());
+    BOOST_CHECK_EQUAL(Anchor(m_node)->second.GetHex(), pin_hash.GetHex());
     const auto stored{node::ReadFinalityPin(pin_path, Params().MessageStart())};
     BOOST_REQUIRE(stored);
     BOOST_CHECK_EQUAL(stored->height, M + 5);
-    BOOST_CHECK_EQUAL(stored->hash, pin_hash);
+    BOOST_CHECK_EQUAL(stored->hash.GetHex(), pin_hash.GetHex());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

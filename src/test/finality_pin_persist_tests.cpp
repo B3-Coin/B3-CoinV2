@@ -54,7 +54,7 @@ struct FinalityPinDiskCoinsFixture : FinalityChainDiskFixture {
 struct FileOpenRefusal {
     fs::path path;
     fs::path saved;
-    explicit FileOpenRefusal(const fs::path& file) : path{file}, saved{file.string() + ".test-saved"}
+    explicit FileOpenRefusal(const fs::path& file) : path{file}, saved{fs::u8path(fs::PathToString(file) + ".test-saved")}
     {
         BOOST_REQUIRE(fs::is_regular_file(path));
         BOOST_REQUIRE(!fs::exists(saved));
@@ -366,7 +366,7 @@ BOOST_FIXTURE_TEST_CASE(pin_raise_reopens_disk_coins_at_carrier, FinalityPinDisk
     {
         LOCK(cs_main);
         m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
-        BOOST_CHECK_EQUAL(m_node.chainman->ActiveChainstate().CoinsDB().GetBestBlock(), ChainHashAt(M + 3));
+        BOOST_CHECK_EQUAL(m_node.chainman->ActiveChainstate().CoinsDB().GetBestBlock().GetHex(), ChainHashAt(M + 3).GetHex());
     }
     ProduceTo(M + 7, m_vk_a);
     const auto set0{*FinalityState().current};
@@ -374,22 +374,22 @@ BOOST_FIXTURE_TEST_CASE(pin_raise_reopens_disk_coins_at_carrier, FinalityPinDisk
     Produce(m_vk_a, {MakeCertificate({M + 5, 0, next_hash}, set0)});
     const uint256 carrier_hash{Tip()->GetBlockHash()};
     const uint256 pin_hash{ChainHashAt(M + 5)};
-    BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveChainstate().CoinsDB().GetBestBlock()), carrier_hash);
+    BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveChainstate().CoinsDB().GetBestBlock().GetHex()), carrier_hash.GetHex());
     // Later unflushed blocks must not be needed to recover the pinned carrier.
     ProduceTo(M + 12, m_vk_a);
     m_node.chainman.reset();
     m_make_chainman();
     LoadVerifyActivateChainstate();
     BOOST_REQUIRE_GE(Tip()->nHeight, M + 8);
-    BOOST_CHECK_EQUAL(ChainHashAt(M + 8), carrier_hash);
-    BOOST_CHECK_EQUAL(Anchor(m_node)->second, pin_hash);
+    BOOST_CHECK_EQUAL(ChainHashAt(M + 8).GetHex(), carrier_hash.GetHex());
+    BOOST_CHECK_EQUAL(Anchor(m_node)->second.GetHex(), pin_hash.GetHex());
     {
         LOCK(cs_main);
         const CBlockIndex* stored{m_node.chainman->m_blockman.LookupBlockIndex(
             m_node.chainman->ActiveChainstate().CoinsDB().GetBestBlock())};
         BOOST_REQUIRE(stored);
         BOOST_REQUIRE_GE(stored->nHeight, M + 8);
-        BOOST_CHECK_EQUAL(stored->GetAncestor(M + 8)->GetBlockHash(), carrier_hash);
+        BOOST_CHECK_EQUAL(stored->GetAncestor(M + 8)->GetBlockHash().GetHex(), carrier_hash.GetHex());
     }
 }
 
@@ -435,7 +435,7 @@ BOOST_FIXTURE_TEST_CASE(pin_write_refusal_does_not_publish_higher_anchor, Finali
     const auto restored{node::ReadFinalityPin(pin_path, Params().MessageStart())};
     BOOST_REQUIRE(restored);
     BOOST_CHECK_EQUAL(restored->height, old_pin->first);
-    BOOST_CHECK_EQUAL(restored->hash, old_pin->second);
+    BOOST_CHECK_EQUAL(restored->hash.GetHex(), old_pin->second.GetHex());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
