@@ -12,10 +12,13 @@
 
 using kernel::ChainstateRole;
 
-void TestBlockManager::CleanupForFuzzing()
+void TestBlockManager::CleanupForFuzzing() NO_THREAD_SAFETY_ANALYSIS
 {
+    // Fuzz iterations are quiescent; reset durability tracking alongside
+    // the file metadata without exposing a production reset interface.
     m_dirty_blockindex.clear();
     m_dirty_fileinfo.clear();
+    m_pending_finality_file_sync.clear();
     m_blockfile_info.resize(1);
 }
 

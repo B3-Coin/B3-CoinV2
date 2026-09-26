@@ -487,13 +487,15 @@ enum DisconnectResult
 class ConnectTrace;
 
 /** @see Chainstate::FlushStateToDisk */
-inline constexpr std::array FlushStateModeNames{"NONE", "IF_NEEDED", "PERIODIC", "FORCE_FLUSH", "FORCE_SYNC"};
+inline constexpr std::array FlushStateModeNames{"NONE", "IF_NEEDED", "PERIODIC", "FORCE_FLUSH", "FORCE_SYNC", "FORCE_FINALITY"};
 enum class FlushStateMode: uint8_t {
     NONE,
     IF_NEEDED,
     PERIODIC,
     FORCE_FLUSH,
     FORCE_SYNC,
+    //! FORCE_SYNC with checked block/undo replay-file durability before index writes.
+    FORCE_FINALITY,
 };
 
 /**
@@ -659,9 +661,15 @@ public:
      * manager's finality anchor to the highest certified checkpoint (the
      * finality pin, plan Commit 13). Cheap when in step; a rebuild walks the
      * modern span. Silently leaves the anchor unchanged when the state is
-     * unavailable (it is only ever raised).
+     * unavailable (it is only ever raised). False reports a fatal storage
+     * failure; callers must not continue candidate selection/invalidation.
      */
-    void RefreshFinalityAnchor() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    bool RefreshFinalityAnchor() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Write replayable block/undo data and the block index, then the coins
+     * view, before persisting a higher pin. Uses existing storage contracts;
+     * this does not add synchronous writes to the coins database itself.
+     * A storage failure returns false without publishing the higher pin. */
+    bool RaiseFinalityAnchorDurably(BlockValidationState& state, int height, const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     //! The node-local finality-signature pool (gossip aggregation; plan
     //! Commit 15). Liveness only: nothing in it affects validation.
     node::FinalitySignaturePool& FinalitySignatures() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
@@ -1006,7 +1014,7 @@ protected:
         DisconnectedBlockTransactions& disconnectpool) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
 
     void InvalidBlockFound(CBlockIndex* pindex, const BlockValidationState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
-    CBlockIndex* FindMostWorkChain() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    CBlockIndex* FindMostWorkChain(BlockValidationState* state = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     bool RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& inputs) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 

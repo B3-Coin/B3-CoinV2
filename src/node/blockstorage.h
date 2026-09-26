@@ -233,6 +233,8 @@ private:
      */
     [[nodiscard]] FlatFilePos FindNextBlockPos(unsigned int nAddSize, unsigned int nHeight, uint64_t nTime);
     [[nodiscard]] bool FlushChainstateBlockFile(int tip_height);
+    /** Checked replay-data flush before a finality pin is made durable. */
+    [[nodiscard]] bool FlushFinalityReplayFiles() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     bool FindUndoPos(BlockValidationState& state, int nFile, FlatFilePos& pos, unsigned int nAddSize);
 
     AutoFile OpenUndoFile(const FlatFilePos& pos, bool fReadOnly = false) const;
@@ -325,6 +327,11 @@ protected:
 
     /** Dirty block file entries. */
     std::set<int> m_dirty_fileinfo;
+
+    /** File writes not yet covered by a successful block AND undo flush.
+     * Separate from metadata dirtiness: WriteBlockIndexDB can clear that
+     * without flushing an older file receiving out-of-order undo data. */
+    std::set<int> m_pending_finality_file_sync GUARDED_BY(cs_LastBlockFile);
 
 public:
     using Options = kernel::BlockManagerOpts;
@@ -419,8 +426,13 @@ public:
      * chain-derived finalized height can only ever raise it further.
      */
     std::optional<std::pair<int, uint256>> FinalityAnchor() const EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return m_finality_anchor; }
-    //! Raise (never lower) the pin and persist it to FinalityPinPath().
-    void RaiseFinalityAnchor(int height, const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    /** Whether a new header on prev conflicts with the stored pin. At/above
+     * its height the stored hash suffices, even when the pin is unindexed.
+     * Below it, prefix classification waits for the pin's indexed ancestry. */
+    bool HeaderForksOffFinalityPin(const CBlockIndex& prev, const uint256& hash, const CChain& active) const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    //! Persist the pin before publishing it in memory. Caller must first
+    //! persist its replay data. False reports a fatal pin-write failure.
+    bool RaiseFinalityAnchor(int height, const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     //! `<blocksdir>/finality_pin.dat` (survives -reindex and -reindex-chainstate).
     fs::path FinalityPinPath() const;
 

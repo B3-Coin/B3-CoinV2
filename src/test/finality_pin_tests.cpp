@@ -12,6 +12,7 @@
 
 #include <chain.h>
 #include <node/blockstorage.h>
+#include <node/finality_pin.h>
 #include <node/finality_tracker.h>
 #include <test/util/finality_fixture.h>
 #include <validation.h>
@@ -232,7 +233,7 @@ BOOST_FIXTURE_TEST_CASE(restart_and_reindex_reproduce_finalized_tip, FinalityCha
         // below it is refused after the restart.
         {
             LOCK(cs_main);
-            m_node.chainman->ActiveChainstate().RefreshFinalityAnchor();
+            BOOST_REQUIRE(m_node.chainman->ActiveChainstate().RefreshFinalityAnchor());
         }
         BOOST_REQUIRE(Anchor(m_node).has_value());
         BOOST_CHECK_EQUAL(Anchor(m_node)->first, M + 5);
@@ -251,6 +252,193 @@ BOOST_FIXTURE_TEST_CASE(restart_and_reindex_reproduce_finalized_tip, FinalityCha
     Produce(m_vk_a, {MakeCertificate({M + 10, 0, next_hash}, set0)});
     BOOST_CHECK_EQUAL(FinalityState().finalized->height, M + 10);
     BOOST_CHECK_EQUAL(Anchor(m_node)->first, M + 10);
+}
+
+BOOST_FIXTURE_TEST_CASE(tip_below_pin_still_refuses_off_pin_headers, FinalityChainDiskFixture)
+{
+    PrepareFinalityChain();
+    const int M{m_M};
+    // Recreate an older client's pending pin without relying on the new-pin
+    // durability gap: only M+3 is flushed; the pin names M+5.
+    ProduceTo(M + 3, m_vk_a);
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
+    }
+    ProduceTo(M + 12, m_vk_a);
+    const uint256 pin_hash{ChainHashAt(M + 5)};
+    std::vector<CBlock> blocks;
+    for (int h{M + 4}; h <= M + 12; ++h) {
+        CBlock block;
+        BOOST_REQUIRE(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.ReadBlock(block, *IndexAt(h))));
+        blocks.push_back(block);
+    }
+    const fs::path pin_path{m_node.chainman->m_blockman.FinalityPinPath()};
+    m_node.chainman.reset();
+    m_make_chainman();
+    LoadVerifyActivateChainstate();
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, M + 3);
+    BOOST_REQUIRE(!Anchor(m_node));
+
+    const auto accept_header{[&](const CBlock& block) {
+        BlockValidationState state;
+        BOOST_CHECK_MESSAGE(m_node.chainman->ProcessNewBlockHeaders({{CBlockHeader{block}}}, /*min_pow_checked=*/true, state), state.ToString());
+        return WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(block.GetHash()));
+    }};
+    const auto header_refused{[&](const CBlock& block) {
+        BlockValidationState state;
+        BOOST_CHECK(!m_node.chainman->ProcessNewBlockHeaders({{CBlockHeader{block}}}, /*min_pow_checked=*/true, state));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "modern-finality-violation");
+        BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(block.GetHash())) == nullptr);
+    }};
+
+    // Retain conflicting headers before installing the old pin, simulating
+    // headers stored by an older client. New headers at/above the stored pin
+    // must now be refused even when that pin has not yet been indexed.
+    std::vector<std::pair<uint256, uint256>> side_records;
+    {
+        const CBlockIndex* parent{IndexAt(M + 2)};
+        uint256 seed{SeedFor(parent)};
+        for (int h{M + 3}; h <= M + 6; ++h) {
+            const auto [blk, digest] = BuildPosBlockOnSeed(parent, seed, m_vk_a, {}, {}, /*extra=*/400 + h);
+            if (blk.GetBlockTime() > GetTime()) SetMockTime(blk.GetBlockTime());
+            parent = accept_header(blk);
+            BOOST_REQUIRE(parent != nullptr);
+            side_records.emplace_back(parent->GetBlockHash(), digest);
+            seed = digest;
+        }
+    }
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
+    }
+    m_node.chainman.reset();
+    BOOST_REQUIRE(node::WriteFinalityPin(pin_path, Params().MessageStart(), {M + 5, pin_hash}));
+    m_make_chainman();
+    LoadVerifyActivateChainstate();
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, M + 3);
+    BOOST_REQUIRE(Anchor(m_node).has_value());
+    BOOST_REQUIRE_EQUAL(Anchor(m_node)->first, M + 5);
+    BOOST_REQUIRE(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(pin_hash)) == nullptr);
+    std::vector<std::pair<const CBlockIndex*, uint256>> side;
+    for (const auto& [hash, seed] : side_records) {
+        const auto* index{WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(hash))};
+        BOOST_REQUIRE(index);
+        side.emplace_back(index, seed);
+    }
+    // The stored height/hash alone classify already-indexed conflicts.
+    BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.IsAnchorIneligible(*side[2].first)));
+    BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.IsAnchorIneligible(*side.back().first)));
+    for (const size_t parent_index : {size_t{1}, size_t{3}}) {
+        const auto [parent, seed] = side[parent_index];
+        const auto [blk, digest] = BuildPosBlockOnSeed(parent, seed, m_vk_a, {}, {}, /*extra=*/690 + parent_index);
+        if (blk.GetBlockTime() > GetTime()) SetMockTime(blk.GetBlockTime());
+        header_refused(blk);
+    }
+    // Index the canonical pin without activating it (no new block bodies).
+    for (const CBlock& block : blocks) BOOST_REQUIRE(accept_header(block) != nullptr);
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, M + 3);
+    // Once the pin is indexed, siblings of its prefix are refused.
+    for (const int parent_height : {M + 3, M + 2}) {
+        const CBlockIndex* parent{IndexAt(parent_height)};
+        const auto [blk, digest] = BuildPosBlockOnSeed(parent, SeedFor(parent), m_vk_a, {}, {}, /*extra=*/600 + parent_height);
+        if (blk.GetBlockTime() > GetTime()) SetMockTime(blk.GetBlockTime());
+        header_refused(blk);
+    }
+    // A conflicting header at the pin height is refused, as is a later
+    // header whose parent does not descend from the pin.
+    {
+        const auto [parent, seed] = side[1]; // M+4'
+        const auto [blk, digest] = BuildPosBlockOnSeed(parent, seed, m_vk_a, {}, {}, /*extra=*/700);
+        if (blk.GetBlockTime() > GetTime()) SetMockTime(blk.GetBlockTime());
+        header_refused(blk);
+    }
+    {
+        const auto [parent, seed] = side.back(); // M+6'
+        const auto [blk, digest] = BuildPosBlockOnSeed(parent, seed, m_vk_a, {}, {}, /*extra=*/701);
+        if (blk.GetBlockTime() > GetTime()) SetMockTime(blk.GetBlockTime());
+        header_refused(blk);
+    }
+    for (const CBlock& block : blocks) BOOST_REQUIRE(Submit(block));
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, M + 12);
+    BOOST_CHECK_EQUAL(ChainHashAt(M + 5).GetHex(), pin_hash.GetHex());
+    BOOST_CHECK_EQUAL(Anchor(m_node)->second.GetHex(), pin_hash.GetHex());
+    // With the pin active, below-pin forks stay refused; a fork at the pin
+    // remains an ordinary permitted branch.
+    {
+        const CBlockIndex* parent{IndexAt(M + 4)};
+        const auto [blk, digest] = BuildPosBlockOnSeed(parent, SeedFor(parent), m_vk_a, {}, {}, /*extra=*/800);
+        header_refused(blk);
+    }
+    {
+        const auto [parent, seed] = side.back();
+        const auto [blk, digest] = BuildPosBlockOnSeed(parent, seed, m_vk_a, {}, {}, /*extra=*/801);
+        header_refused(blk);
+    }
+    {
+        const CBlockIndex* parent{IndexAt(M + 5)};
+        const auto [blk, digest] = BuildPosBlockOnSeed(parent, SeedFor(parent), m_vk_a, {}, {}, /*extra=*/802);
+        if (blk.GetBlockTime() > GetTime()) SetMockTime(blk.GetBlockTime());
+        BOOST_CHECK(accept_header(blk) != nullptr);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(unindexed_pin_blocks_conflicting_full_block_extension, FinalityChainDiskFixture)
+{
+    PrepareFinalityChain();
+    const int M{m_M};
+    ProduceTo(M + 3, m_vk_a);
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
+    }
+    ProduceTo(M + 12, m_vk_a);
+    const auto pin_hash{ChainHashAt(M + 5)};
+    std::vector<CBlock> canonical;
+    for (int h{M + 4}; h <= M + 12; ++h) {
+        CBlock block;
+        BOOST_REQUIRE(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.ReadBlock(block, *IndexAt(h))));
+        canonical.push_back(block);
+    }
+    const auto pin_path{m_node.chainman->m_blockman.FinalityPinPath()};
+    m_node.chainman.reset();
+    BOOST_REQUIRE(node::WriteFinalityPin(pin_path, Params().MessageStart(), {M + 5, pin_hash}));
+    m_make_chainman();
+    LoadVerifyActivateChainstate();
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, M + 3);
+    BOOST_REQUIRE(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(pin_hash)) == nullptr);
+
+    // A different valid full block can extend the loaded prefix below the
+    // pin while its ancestry is unknown, but it must not cross the stored
+    // checkpoint with another hash. This is a pure extension, not a reorg.
+    const auto alternate{BuildPosBlock(m_vk_a, {}, {}, /*extra=*/910)};
+    if (alternate.GetBlockTime() > GetTime()) SetMockTime(alternate.GetBlockTime());
+    BOOST_REQUIRE(Submit(alternate));
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, M + 4);
+    BOOST_REQUIRE_EQUAL(Tip()->GetBlockHash(), alternate.GetHash());
+    const auto conflicting{BuildPosBlock(m_vk_a, {}, {}, /*extra=*/911)};
+    if (conflicting.GetBlockTime() > GetTime()) SetMockTime(conflicting.GetBlockTime());
+    BOOST_REQUIRE(conflicting.GetHash() != pin_hash);
+    BOOST_CHECK(!Submit(conflicting));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, M + 4);
+    BOOST_CHECK_EQUAL(Tip()->GetBlockHash(), alternate.GetHash());
+    BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(conflicting.GetHash())) == nullptr);
+    BOOST_CHECK_EQUAL(Anchor(m_node)->second, pin_hash);
+
+    // Learning the genuine pinned ancestry allows the provisional prefix to
+    // be unwound and canonical block bodies to catch up, without moving pin.
+    std::vector<CBlockHeader> headers;
+    for (const auto& block : canonical) headers.emplace_back(block);
+    BlockValidationState state;
+    BOOST_REQUIRE_MESSAGE(m_node.chainman->ProcessNewBlockHeaders(headers, /*min_pow_checked=*/true, state), state.ToString());
+    for (const auto& block : canonical) BOOST_REQUIRE(Submit(block));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, M + 12);
+    BOOST_CHECK_EQUAL(ChainHashAt(M + 5), pin_hash);
+    BOOST_CHECK_EQUAL(Anchor(m_node)->second, pin_hash);
+    const auto stored{node::ReadFinalityPin(pin_path, Params().MessageStart())};
+    BOOST_REQUIRE(stored);
+    BOOST_CHECK_EQUAL(stored->height, M + 5);
+    BOOST_CHECK_EQUAL(stored->hash, pin_hash);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

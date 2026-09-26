@@ -398,6 +398,11 @@ bool BlockManager::IsAnchorIneligible(const CBlockIndex& block) const
     // The modern finality pin: the same topological rule against the highest
     // certified checkpoint of this process (see RaiseFinalityAnchor).
     if (m_finality_anchor) {
+        // Even before the pinned block has been downloaded, a complete
+        // candidate at or above its height proves which hash it contains
+        // there. Never activate a conflicting checkpoint as a pure extension.
+        const auto& [height, hash]{*m_finality_anchor};
+        if (block.nHeight >= height && block.GetAncestor(height)->GetBlockHash() != hash) return true;
         if (const CBlockIndex* pin{LookupBlockIndex(m_finality_anchor->second)}) {
             if (OffAnchor(block, *pin)) return true;
         }
@@ -405,28 +410,55 @@ bool BlockManager::IsAnchorIneligible(const CBlockIndex& block) const
     return false;
 }
 
+bool BlockManager::HeaderForksOffFinalityPin(const CBlockIndex& prev, const uint256& hash, const CChain& active) const
+{
+    AssertLockHeld(cs_main);
+    if (!m_finality_anchor) return false;
+    const auto& [height, pin_hash]{*m_finality_anchor};
+    if (prev.nHeight + 1 == height) return hash != pin_hash;
+    if (prev.nHeight + 1 > height) return prev.GetAncestor(height)->GetBlockHash() != pin_hash;
+    const CBlockIndex* pin{LookupBlockIndex(m_finality_anchor->second)};
+    if (!pin) return false;
+    if (active.Contains(pin)) {
+        const CBlockIndex* fork{active.FindFork(&prev)};
+        return fork && fork->nHeight < pin->nHeight;
+    }
+    // Below the pin, its indexed ancestry identifies the canonical prefix.
+    if (prev.nHeight + 1 <= pin->nHeight) {
+        return pin->GetAncestor(prev.nHeight + 1)->GetBlockHash() != hash;
+    }
+    return prev.GetAncestor(pin->nHeight) != pin;
+}
+
 fs::path BlockManager::FinalityPinPath() const
 {
     return m_opts.blocks_dir / fs::u8path(FINALITY_PIN_FILENAME);
 }
 
-void BlockManager::RaiseFinalityAnchor(const int height, const uint256& hash)
+bool BlockManager::RaiseFinalityAnchor(const int height, const uint256& hash)
 {
     AssertLockHeld(cs_main);
-    if (m_finality_anchor && m_finality_anchor->first >= height) return;
-    m_finality_anchor = std::make_pair(height, hash);
+    if (m_finality_anchor && m_finality_anchor->first >= height) return true;
     // Persist immediately (atomic, fsync, rename-over): a later allowed reorg
     // may remove the certificate carrier, and a crash or restart must not
     // forget the pin. The file itself refuses to go backwards and refuses to
     // replace an invalid file. FAIL CLOSED: a node that cannot persist the
     // pin must not keep running as if it had -- a crash would forget
     // accepted finality.
-    if (!WriteFinalityPin(FinalityPinPath(), m_opts.chainparams.MessageStart(), FinalityPin{height, hash})) {
-        m_opts.notifications.fatalError(strprintf(
-            _("Failed to persist the finality pin (checkpoint %d %s). See the log; restore or remove an invalid "
-              "%s only after deliberate operator review."),
-            height, hash.ToString(), fs::PathToString(FinalityPinPath())));
+    try {
+        if (!WriteFinalityPin(FinalityPinPath(), m_opts.chainparams.MessageStart(), FinalityPin{height, hash})) {
+            m_opts.notifications.fatalError(strprintf(
+                _("Failed to persist the finality pin (checkpoint %d %s). See the log; restore or remove an invalid "
+                  "%s only after deliberate operator review."),
+                height, hash.ToString(), fs::PathToString(FinalityPinPath())));
+            return false;
+        }
+    } catch (const std::runtime_error& error) {
+        m_opts.notifications.fatalError(strprintf(_("Failed to persist the finality pin: %s"), error.what()));
+        return false;
     }
+    m_finality_anchor = std::make_pair(height, hash);
+    return true;
 }
 
 CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockIndex*& best_header)
@@ -519,6 +551,7 @@ void BlockManager::PruneOneBlockFile(const int fileNumber)
 
     m_blockfile_info.at(fileNumber) = CBlockFileInfo{};
     m_dirty_fileinfo.insert(fileNumber);
+    m_pending_finality_file_sync.erase(fileNumber);
 }
 
 void BlockManager::FindFilesToPruneManual(
@@ -1162,6 +1195,7 @@ bool BlockManager::FlushBlockFile(int blockfile_num, bool fFinalize, bool finali
         if (!FlushUndoFile(blockfile_num, finalize_undo)) {
             success = false;
         }
+        if (success) m_pending_finality_file_sync.erase(blockfile_num);
     }
     return success;
 }
@@ -1185,6 +1219,27 @@ bool BlockManager::FlushChainstateBlockFile(int tip_height)
         return FlushBlockFile(cursor->file_num, /*fFinalize=*/false, /*finalize_undo=*/false);
     }
     // No need to log warnings in this case.
+    return true;
+}
+
+bool BlockManager::FlushFinalityReplayFiles()
+{
+    AssertLockHeld(cs_main);
+    LOCK(cs_LastBlockFile);
+    // The shared block index can refer to both chainstate cursors and to
+    // older files receiving undo writes. Metadata dirtiness alone is not a
+    // durability marker, since ordinary index writes clear it independently.
+    std::set<int> files{m_pending_finality_file_sync};
+    files.insert(m_dirty_fileinfo.begin(), m_dirty_fileinfo.end());
+    for (const auto& cursor : m_blockfile_cursors) {
+        if (cursor) files.insert(cursor->file_num);
+    }
+    for (const int file : files) {
+        const auto& info{m_blockfile_info.at(file)};
+        // Pruning also dirties metadata; do not recreate a pruned file.
+        if (info.nSize == 0 && info.nUndoSize == 0) continue;
+        if (!FlushBlockFile(file, /*fFinalize=*/false, /*finalize_undo=*/false)) return false;
+    }
     return true;
 }
 
@@ -1315,6 +1370,7 @@ FlatFilePos BlockManager::FindNextBlockPos(unsigned int nAddSize, unsigned int n
     }
 
     m_dirty_fileinfo.insert(nFile);
+    m_pending_finality_file_sync.insert(nFile);
     return pos;
 }
 
@@ -1340,6 +1396,7 @@ void BlockManager::UpdateBlockInfo(const CBlock& block, unsigned int nHeight, co
     m_blockfile_info[nFile].AddBlock(nHeight, block.GetBlockTime());
     m_blockfile_info[nFile].nSize = std::max(pos.nPos + added_size, m_blockfile_info[nFile].nSize);
     m_dirty_fileinfo.insert(nFile);
+    m_pending_finality_file_sync.insert(nFile);
 }
 
 bool BlockManager::FindUndoPos(BlockValidationState& state, int nFile, FlatFilePos& pos, unsigned int nAddSize)
@@ -1351,6 +1408,7 @@ bool BlockManager::FindUndoPos(BlockValidationState& state, int nFile, FlatFileP
     pos.nPos = m_blockfile_info[nFile].nUndoSize;
     m_blockfile_info[nFile].nUndoSize += nAddSize;
     m_dirty_fileinfo.insert(nFile);
+    m_pending_finality_file_sync.insert(nFile);
 
     bool out_of_space;
     size_t bytes_allocated = m_undo_file_seq.Allocate(pos, nAddSize, out_of_space);

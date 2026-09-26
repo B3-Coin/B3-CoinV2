@@ -2508,27 +2508,43 @@ node::FinalitySignaturePool& Chainstate::FinalitySignatures()
     return *m_finality_sigs;
 }
 
-void Chainstate::RefreshFinalityAnchor()
+bool Chainstate::RefreshFinalityAnchor()
 {
     AssertLockHeld(::cs_main);
     const Consensus::Params& consensus{m_chainman.GetConsensus()};
-    if (!consensus.legacy_b3coin || !consensus.modern_pos || !Consensus::LegacyBoundaryPinned(consensus)) return;
+    if (!consensus.legacy_b3coin || !consensus.modern_pos || !Consensus::LegacyBoundaryPinned(consensus)) return true;
     const CBlockIndex* tip{m_chain.Tip()};
-    if (!tip) return;
+    if (!tip) return true;
     const std::optional<int> modern_start{Consensus::ModernPosStartHeight(consensus)};
-    if (!modern_start || tip->nHeight < *modern_start) return;
+    if (!modern_start || tip->nHeight < *modern_start) return true;
     const node::BridgeStateIndex* bridge_index{nullptr};
     if (Consensus::BridgeRulesActive(tip->nHeight, consensus)) {
         node::BridgeStateTracker& bridge{ModernBridgeState()};
-        if (!bridge.Sync(m_chain, m_blockman, consensus, *tip)) return;
+        if (!bridge.Sync(m_chain, m_blockman, consensus, *tip)) return true;
         bridge_index = &bridge.Index();
     }
     node::FinalityTracker& finality{ModernFinality()};
     if (!finality.Sync(m_chain, m_blockman, consensus, *tip,
-                       bridge_index)) return;
+                       bridge_index)) return true;
     if (const auto& fin{finality.Current().finalized}) {
-        m_blockman.RaiseFinalityAnchor(fin->height, fin->block_hash);
+        BlockValidationState state;
+        return RaiseFinalityAnchorDurably(state, fin->height, fin->block_hash);
     }
+    return true;
+}
+
+bool Chainstate::RaiseFinalityAnchorDurably(BlockValidationState& state, const int height, const uint256& hash)
+{
+    AssertLockHeld(::cs_main);
+    if (const auto anchor{m_blockman.FinalityAnchor()}; anchor && anchor->first >= height) return true;
+    // A pin is a separate synchronously written file. Its certificate's
+    // replayable data/index must be written first, including older undo
+    // files that ordinary lazy chainstate flushing need not cover.
+    if (!FlushStateToDisk(state, FlushStateMode::FORCE_FINALITY)) return false;
+    if (!m_blockman.RaiseFinalityAnchor(height, hash)) {
+        return state.Error("Unable to persist finality anchor");
+    }
+    return true;
 }
 
 bool Chainstate::ReorgFromForkViolatesFinality(const int fork_height) const
@@ -4513,7 +4529,7 @@ bool Chainstate::FlushStateToDisk(
         bool fPeriodicWrite = mode == FlushStateMode::PERIODIC && nNow >= m_next_write;
         const auto empty_cache{(mode == FlushStateMode::FORCE_FLUSH) || fCacheLarge || fCacheCritical};
         // Combine all conditions that result in a write to disk.
-        bool should_write = (mode == FlushStateMode::FORCE_SYNC) || empty_cache || fPeriodicWrite || fFlushForPrune;
+        bool should_write = (mode == FlushStateMode::FORCE_SYNC) || (mode == FlushStateMode::FORCE_FINALITY) || empty_cache || fPeriodicWrite || fFlushForPrune;
         // Write blocks, block index and best chain related state to disk.
         if (should_write) {
             LogDebug(BCLog::COINDB, "Writing chainstate to disk: flush mode=%s, prune=%d, large=%d, critical=%d, periodic=%d",
@@ -4526,10 +4542,14 @@ bool Chainstate::FlushStateToDisk(
             {
                 LOG_TIME_MILLIS_WITH_CATEGORY("write block and undo data to disk", BCLog::BENCH);
 
-                // First make sure all block and undo data is flushed to disk.
-                // TODO: Handle return error, or add detailed comment why it is
-                // safe to not return an error upon failure.
-                if (!m_blockman.FlushChainstateBlockFile(m_chain.Height())) {
+                // Finality cannot publish a durable pin after a replay-data
+                // flush refusal. Keep other modes' existing behavior intact.
+                if (mode == FlushStateMode::FORCE_FINALITY) {
+                    if (!m_blockman.FlushFinalityReplayFiles()) {
+                        return FatalError(m_chainman.GetNotifications(), state,
+                                          _("Failed to flush block and undo data before persisting the finality pin."));
+                    }
+                } else if (!m_blockman.FlushChainstateBlockFile(m_chain.Height())) {
                     LogWarning("%s: Failed to flush block file.\n", __func__);
                 }
             }
@@ -4921,7 +4941,7 @@ bool Chainstate::ConnectTip(
         // its checkpoint for the life of the process (monotone).
         if (m_finality_tracker->Synced(pindexNew->GetBlockHash())) {
             if (const auto& fin{m_finality_tracker->Current().finalized}) {
-                m_blockman.RaiseFinalityAnchor(fin->height, fin->block_hash);
+                if (!RaiseFinalityAnchorDurably(state, fin->height, fin->block_hash)) return false;
             }
         }
     }
@@ -5046,12 +5066,15 @@ bool Chainstate::LegacyBoundaryActive() const
     return pindexX && m_chain.Contains(pindexX);
 }
 
-CBlockIndex* Chainstate::FindMostWorkChain()
+CBlockIndex* Chainstate::FindMostWorkChain(BlockValidationState* state)
 {
     AssertLockHeld(::cs_main);
     // Make the finality pin current before judging candidates: a candidate
     // off the pinned checkpoint is anchor-ineligible exactly like one off X.
-    RefreshFinalityAnchor();
+    if (!RefreshFinalityAnchor()) {
+        if (state) state->Error("Unable to persist finality anchor");
+        return nullptr;
+    }
     do {
         CBlockIndex *pindexNew = nullptr;
 
@@ -5427,7 +5450,8 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
                 ConnectTrace connectTrace; // Destructed before cs_main is unlocked
 
                 if (pindexMostWork == nullptr) {
-                    pindexMostWork = FindMostWorkChain();
+                    pindexMostWork = FindMostWorkChain(&state);
+                    if (state.IsError()) return false;
                 }
 
                 // Whether we have anything to do at all.
@@ -5607,7 +5631,9 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
         // The finality pin: invalidating the pinned checkpoint or anything
         // below it on the active chain would disconnect it -- refused, no
         // administrative override (b3-cross-chain-finality-v1.md section 4).
-        RefreshFinalityAnchor();
+        if (!RefreshFinalityAnchor()) {
+            return state.Error("Unable to persist finality anchor");
+        }
         if (m_chain.Contains(pindex) && ReorgFromForkViolatesFinality(pindex->nHeight - 1)) {
             state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "modern-finality-violation",
                           strprintf("block at height %d is at or below the finalized checkpoint", pindex->nHeight));
@@ -6644,14 +6670,14 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         // or above the pin remain ordinary reorganizations.
         // The anchor is kept current by ConnectTip / FindMostWorkChain (every
         // ActivateBestChain pass), so a header is judged against the pin the
-        // active chain has already established.
-        if (const auto anchor{blockman.FinalityAnchor()}; anchor && !blockman.LoadingBlocks()) {
-            if (const CBlockIndex* fork{chainman.ActiveChain().FindFork(pindexPrev)};
-                fork && fork->nHeight < anchor->first) {
-                return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "modern-finality-violation",
-                                     strprintf("modern-PoS block at height %d forks at height %d, below the finalized checkpoint",
-                                               nHeight, fork->nHeight));
-            }
+        // active chain has already established. A pending pin above the
+        // loaded tip must still admit the canonical headers that lead to it.
+        if (!blockman.LoadingBlocks() &&
+            blockman.HeaderForksOffFinalityPin(*pindexPrev, block.GetMarkerHash(consensusParams), chainman.ActiveChain())) {
+            const CBlockIndex* fork{chainman.ActiveChain().FindFork(pindexPrev)};
+            return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "modern-finality-violation",
+                                 strprintf("modern-PoS block at height %d forks at height %d, off the finalized checkpoint",
+                                           nHeight, fork ? fork->nHeight : -1));
         }
     } else {
         if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
@@ -7323,6 +7349,16 @@ bool Chainstate::LoadChainTip()
         LogError("%s: coins database tip %s at height %d is now consensus-invalid\n",
                  __func__, pindex->GetBlockHash().ToString(), pindex->nHeight);
         return false;
+    }
+    if (const auto anchor{m_blockman.FinalityAnchor()}) {
+        const CBlockIndex* pin{m_blockman.LookupBlockIndex(anchor->second)};
+        if (anchor->first > pindex->nHeight) {
+            LogWarning("Finality pin %d %s is above the loaded tip %d; treating it as pending until the active chain reaches it",
+                       anchor->first, anchor->second.ToString(), pindex->nHeight);
+        } else if (!pin || pindex->GetAncestor(anchor->first) != pin) {
+            LogWarning("Finality pin %d %s is not on the loaded active chain (tip %d %s)",
+                       anchor->first, anchor->second.ToString(), pindex->nHeight, pindex->GetBlockHash().ToString());
+        }
     }
     if (tip == pindex) {
         return true;
