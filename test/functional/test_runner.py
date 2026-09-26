@@ -412,10 +412,11 @@ NON_SCRIPTS = [
     "combine_logs.py",
     "create_cache.py",
     "test_runner.py",
-    # Opt-in process qualification and latency measurement; run directly.
+    # Opt-in process qualification, liquidity and latency campaigns; run directly.
     # The unmet 200 ms target is not a default CI assertion.
     "feature_flowmesh_preagreement.py",
     "feature_flowmesh_latency.py",
+    "feature_flowmesh_liquidity.py",
 ]
 
 def main():
