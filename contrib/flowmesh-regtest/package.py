@@ -105,6 +105,14 @@ def deploy_macos(macdeployqt, app, library_paths):
     # macdeployqt must see these paths while traversing plugin dependencies,
     # before any absolute build RPATH is removed. Final closure verification
     # below remains authoritative; discovery warnings are never a pass.
+    # Qt's @rpath resolver does not consult -libpath (that option resolves
+    # bare library names only). Give the STAGED executable temporary RPATHs
+    # as well. The existing post-deployment pass removes all absolute RPATHs.
+    executable = app / "Contents/MacOS" / TARGET
+    existing = re.findall(r"cmd LC_RPATH\s+cmdsize \d+\s+path (.*?) \(offset", run("otool", "-l", executable))
+    for path in library_paths:
+        if str(path) not in existing:
+            run("install_name_tool", "-add_rpath", path, executable)
     run(macdeployqt, app, "-verbose=1", "-always-overwrite", "-no-codesign",
         *("-libpath=" + str(path) for path in library_paths))
 

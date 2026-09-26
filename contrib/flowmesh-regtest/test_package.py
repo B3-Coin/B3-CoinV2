@@ -108,12 +108,25 @@ class PackageTests(unittest.TestCase):
             roots = PACKAGE.macos_library_paths(umbrella / "bin/macdeployqt", umbrella / "lib/cmake/Qt6", [extra])
             self.assertEqual(roots, [umbrella / "lib", extra])
             self.assertTrue((roots[0] / "QtPdf.framework").is_dir())
-            with mock.patch.object(PACKAGE, "run") as run:
+            with mock.patch.object(PACKAGE, "run", return_value="") as run:
                 PACKAGE.deploy_macos(umbrella / "bin/macdeployqt", prefix / "App.app", roots)
             args = run.call_args.args
             self.assertIn("-libpath=" + str(umbrella / "lib"), args)
             self.assertIn("-libpath=" + str(extra), args)
             self.assertNotIn("-no-plugins", args)
+            # -libpath alone does not reach Qt's @rpath resolver. Roots must
+            # be visible in the staged executable before deploying plugins.
+            calls = run.call_args_list
+            for root in roots:
+                self.assertIn(mock.call("install_name_tool", "-add_rpath", root,
+                    prefix / "App.app/Contents/MacOS" / PACKAGE.TARGET), calls[:-1])
+
+    def test_existing_staged_rpath_not_added_twice(self):
+        root = Path("/declared/qt/lib")
+        load = "cmd LC_RPATH\n cmdsize 48\n path /declared/qt/lib (offset 12)"
+        with mock.patch.object(PACKAGE, "run", return_value=load) as run:
+            PACKAGE.deploy_macos(Path("/qt/bin/macdeployqt"), Path("/stage/Test.app"), [root])
+        self.assertFalse(any(call.args[0] == "install_name_tool" for call in run.call_args_list))
 
     def test_macos_dependency_root_typo_refused(self):
         with tempfile.TemporaryDirectory() as path:
