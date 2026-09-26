@@ -16,7 +16,7 @@ python3.14 -B ci/run_flowmesh_models.py
 
 The original evidence-only probe and its `TEST_PROFILE.json` are preserved.
 The new profile is [MESSAGE_PROFILE.json](MESSAGE_PROFILE.json), version
-`p2fv-message-restart-test/1`. Choices below are proposed TEST rules, not
+`p2fv-message-restart-test/2`. Choices below are proposed TEST rules, not
 implicit owner ratification of production economics or consensus.
 
 ## Exact rules modelled
@@ -128,3 +128,22 @@ then measure real fills across separate processes with B3 advancing.
 Do not distribute the current native wallet as a 161-ms V2 implementation.
 No bridge/PoS V2 completion, production activation or hosting fee follows
 from this gate.
+
+## Native-port gate correction (2026-09-26)
+
+The frozen v1 profile at `3cb4f8b` could store PC(view1) while still in view0,
+then sign REPORT(target1) carrying that PC. Its own verifier and independent
+checker reject this: a report's PC must be strictly older than its target.
+An honest delayed-delivery schedule sufficed; no corrupt store or Byzantine
+signature was required. This was an invalid recovery signature/progress defect,
+not a demonstrated pair of conflicting decisions.
+
+Profile v2 validates the retained PC and uses
+`target = max(requested_target, verified_PC.view + 1)` before signing REPORT.
+It preserves the PC and original votes. This only enters CHANGING, never ACTIVE;
+the normal verified NEW_VIEW and proposal predicates still govern later votes.
+At the finite view boundary it records an explicit reason and signs nothing.
+No timer/quorum/certificate predicate was relaxed. The independent checker is
+unchanged. Six regressions cover delayed evidence, the existing timer, profile
+bound, durable-unpublished report restart, delayed decision and unverified PC.
+Before correction: four failures, one error, one passing negative control.

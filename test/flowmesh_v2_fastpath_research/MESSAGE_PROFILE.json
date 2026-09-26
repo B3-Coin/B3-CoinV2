@@ -1,5 +1,5 @@
 {
-  "id": "p2fv-message-restart-test/1",
+  "id": "p2fv-message-restart-test/2",
   "status": "PROPOSED_TEST_ONLY_NOT_OWNER_RATIFICATION",
   "reference_sha256": "9b6010d9efe751611bee5ca4d87168958ec6a280c62da441eae1e94647ed9356",
   "preserved_evidence_probe_commit": "03ca2db5d36735776c689c060443449ebde514ce",
@@ -21,6 +21,7 @@
     "Proven equivocating old leader excluded globally from selected Q reports, including PC branch",
     "Leader proposal consumes same PREPARE slot; not an additional vote",
     "Transferred PC contains votes, not recursive NEW_VIEW proof trees; local guards preserve justification",
+    "REPORT target strictly exceeds every retained verified PC view; beyond the finite view bound preserve evidence and sign nothing",
     "Unpublished computed signatures inaccessible to adversary; externally exposed signing services not modelled"
   ],
   "excluded": [

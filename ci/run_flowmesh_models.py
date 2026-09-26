@@ -68,6 +68,7 @@ SUITES = {
         "test_message_recovery.py": 30,
         "test_message_admission.py": 5,
         "test_message_checker.py": 8,
+        "test_future_pc_report.py": 6,
     }),
 }
 

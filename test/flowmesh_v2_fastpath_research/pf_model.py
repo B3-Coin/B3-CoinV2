@@ -510,6 +510,19 @@ class Node:
         if (target <= self.d['view'] or target > self.w.max_view or self.d['decision'] or
                 self.d['fenced'] or not self.online):
             return
+        # A lagging replica can learn PC(v) without receiving NEW_VIEW(v).
+        # Never omit that obligation or sign REPORT(v) carrying PC(v): report
+        # evidence must strictly precede its target. Only an authenticated PC,
+        # not a peer's claimed round, justifies this CHANGING-state advance.
+        highest = self.d['highest']
+        if highest is not None:
+            self.w.certificate(highest)
+            if highest.kind != 'PC':
+                raise Invalid('RETAINED_HIGHEST_IS_NOT_PC')
+            target = max(target, highest.view + 1)
+            if target > self.w.max_view:
+                self.reason = 'TEST_VIEW_BOUND_REQUIRED_BY_RETAINED_PC'
+                return
         items = tuple(p or self.w.empty() for p in
                       (self.d['v0'], self.d['highest'], self.d['decision']))
         r = self.w.packet('REPORT', target, self.id, items=items)
