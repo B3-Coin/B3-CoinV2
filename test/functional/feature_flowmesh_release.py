@@ -529,7 +529,7 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
             )
         assert_raises_rpc_error(
             -1,
-            "FlowMesh market is paused; user deposits are refused",
+            "FlowMesh market is paused: FlowMesh service is below its activation height",
             n1.flowmeshdeposit,
             asset_id,
             "B3",

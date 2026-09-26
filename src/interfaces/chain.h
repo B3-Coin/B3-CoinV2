@@ -698,6 +698,13 @@ public:
     virtual std::optional<ModernCreationSnapshot> modernCreationSnapshot(
         bool inspect_fn_pool, std::string& error) = 0;
 
+    //! Dry-run the exact ordinary FlowMesh deposit at the current active tip.
+    //! Requires active deposit rules and an established market; performs full
+    //! mempool validation without inserting, committing or broadcasting it.
+    //! Unlike FN issuance, an ordinary deposit is not bound to one tip/slot.
+    virtual bool checkFlowMeshDepositTransaction(const CTransactionRef& tx,
+        const uint256& market_id, std::string& error) = 0;
+
     //! Validate one candidate bridge transaction against the exact active tip
     //! used to construct it. The full node owns bridge-index synchronization;
     //! wallet code receives only the semantic authorization and result class.

@@ -417,6 +417,7 @@ NON_SCRIPTS = [
     "feature_flowmesh_preagreement.py",
     "feature_flowmesh_latency.py",
     "feature_flowmesh_liquidity.py",
+    "feature_flowmesh_deposit_race.py",
 ]
 
 def main():

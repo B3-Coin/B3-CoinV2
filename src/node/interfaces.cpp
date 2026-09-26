@@ -913,6 +913,40 @@ public:
         error.clear();
         return snapshot;
     }
+    bool checkFlowMeshDepositTransaction(const CTransactionRef& tx,
+        const uint256& market_id, std::string& error) override
+    {
+        if (!m_node.mempool) {
+            error = "Mempool disabled or instance not found";
+            return false;
+        }
+        LOCK(::cs_main);
+        Chainstate& chainstate{chainman().ActiveChainstate()};
+        const CBlockIndex* tip{chainstate.m_chain.Tip()};
+        const auto& consensus{chainman().GetConsensus()};
+        if (!tip || !Consensus::FlowMeshRulesActive(tip->nHeight + 1, consensus) ||
+            !Consensus::FlowMeshVaultPreparationRulesActive(tip->nHeight + 1, consensus)) {
+            error = "FlowMesh user deposits are not active at the current tip";
+            return false;
+        }
+        auto& tracker{chainstate.ModernFlowMeshVaults()};
+        if (!tracker.Sync(chainstate.m_chain, chainstate.m_blockman, consensus, *tip) ||
+            !tracker.Index().Market(market_id)) {
+            error = "FlowMesh market is not established at the current tip";
+            return false;
+        }
+        // The same signed object must still pass every contextual input,
+        // script, asset, amount, fee and policy check. Normal mempool admission
+        // repeats those checks on publication; this dry run grants no durable
+        // authorization and does not change the transaction or its identity.
+        const auto result{chainman().ProcessTransaction(tx, /*test_accept=*/true)};
+        if (result.m_result_type != MempoolAcceptResult::ResultType::VALID) {
+            error = result.m_state.ToString();
+            return false;
+        }
+        error.clear();
+        return true;
+    }
     interfaces::BridgePrevalidationResult prevalidateBridgeTransaction(
         const CTransaction& tx, const uint256& expected_tip_hash,
         const int expected_next_height,

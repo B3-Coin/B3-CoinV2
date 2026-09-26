@@ -645,9 +645,21 @@ static UniValue FinishAssetTransaction(
     const JSONRPCRequest& request, CWallet& wallet,
     const CreatedTransactionResult& created, const AssetRpcOptions& options,
     const ChainSnapshot& snapshot, const bool inspect_fn_pool,
-    const CAmount disintegration, const std::string& kind)
+    const CAmount disintegration, const std::string& kind,
+    const std::optional<uint256>& ordinary_deposit_market = std::nullopt)
 {
-    RecheckChainSnapshot(wallet, snapshot, inspect_fn_pool);
+    if (ordinary_deposit_market) {
+        CHECK_NONFATAL(!inspect_fn_pool && kind == "flowmesh-deposit");
+        std::string error;
+        if (!wallet.chain().checkFlowMeshDepositTransaction(
+                created.tx, *ordinary_deposit_market, error)) {
+            throw JSONRPCError(RPC_VERIFY_REJECTED, error);
+        }
+    } else {
+        // Issuance, FN slots, bridge operations and explicit market bootstrap
+        // retain their existing exact-snapshot guard.
+        RecheckChainSnapshot(wallet, snapshot, inspect_fn_pool);
+    }
     const CTransactionRef& tx{created.tx};
     const std::string hex{EncodeHexTx(*tx)};
     if (options.broadcast) {
@@ -1625,7 +1637,9 @@ RPCHelpMan flowmeshdeposit()
                 case FlowMeshDepositAdmission::MARKET_PAUSED:
                     throw JSONRPCError(
                         RPC_MISC_ERROR,
-                        "FlowMesh market is paused; user deposits are refused until at least four active seats are available");
+                        status && !status->error.empty()
+                            ? "FlowMesh market is paused: " + status->error
+                            : "FlowMesh market is paused; user deposits are temporarily unavailable");
                 case FlowMeshDepositAdmission::BOOTSTRAP_REQUIRES_BASE_ASSET:
                     throw JSONRPCError(
                         RPC_INVALID_PARAMETER,
@@ -1710,7 +1724,8 @@ RPCHelpMan flowmeshdeposit()
 
             UniValue result{FinishAssetTransaction(
                 request, *wallet, created, options, snapshot, false,
-                /*disintegration=*/0, "flowmesh-deposit")};
+                /*disintegration=*/0, "flowmesh-deposit",
+                options.market_bootstrap ? std::nullopt : market)};
             const COutPoint deposit_outpoint{created.tx->GetHash(), 0};
             result.pushKV("deposit_txid", deposit_outpoint.hash.GetHex());
             result.pushKV("deposit_vout", deposit_outpoint.n);
