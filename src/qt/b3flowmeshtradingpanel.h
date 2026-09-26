@@ -72,6 +72,11 @@ private:
         uint64_t generation;
         QString market;
         QString effect;
+        struct FundingContext {
+            B3FlowMeshTrading::Market market;
+            B3FlowMeshMarketData::Units units;
+        };
+        std::optional<FundingContext> funding_context;
     };
     struct DeferredConnect {
         QPointer<WalletModel> wallet;
@@ -90,6 +95,8 @@ private:
     void updateDataViews();
     void updateTicket();
     void openFunding(bool withdrawal);
+    bool depositDraftAvailable() const;
+    bool depositReady() const;
     void begin(B3FlowMeshTrading::Operation operation);
     bool confirm(const QString& text, bool final_transaction);
     void startJob(std::optional<B3FlowMeshTrading::Action> action = std::nullopt,

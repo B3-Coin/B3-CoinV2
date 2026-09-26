@@ -206,6 +206,51 @@ struct ConnectionProbe {
     }
     ~ConnectionProbe() { for (const auto& command : commands) tableRPC.removeCommand(command->name, command.get()); }
 };
+
+// A bounded passive funding refresh. Mutation RPCs are counted and rejected;
+// successful cases stop at the first ordinary review, without wallet unlock.
+struct FundingReadProbe {
+    UniValue data{RemoteData()};
+    bool fail{false}, hold{false};
+    QSemaphore entered, release;
+    std::atomic_int snapshots{0}, catalogs{0}, writes{0};
+    std::vector<std::unique_ptr<CRPCCommand>> commands;
+    FundingReadProbe()
+    {
+        if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
+        const auto add = [&](const char* method, const std::function<UniValue()>& run) {
+            auto command{std::make_unique<CRPCCommand>("hidden", method,
+                [run](const JSONRPCRequest&, UniValue& result, bool) { result = run(); return true; },
+                std::vector<std::pair<std::string, bool>>{}, 998900 + commands.size())};
+            tableRPC.appendCommand(command->name, command.get()); commands.push_back(std::move(command));
+        };
+        const auto market = [this] {
+            const auto s{Parse(data)}; UniValue row{UniValue::VOBJ};
+            for (const auto* key : {"market_id", "base_asset_id", "domain", "execution_config_id", "quote_asset", "verification"}) row.pushKV(key, data[key]);
+            row.pushKV("vault_id", flowmesh::ComputeFlowMeshVaultId(H(1), *uint256::FromHex(s.market.toStdString()))->GetHex());
+            row.pushKV("available", true); row.pushKV("checkpoint_pending", false);
+            for (const auto* key : {"running", "paused", "pending_handoff", "halt", "error"}) row.pushKV(key, data["snapshot"][key]);
+            auto account{data["account"]}; account.pushKV("b3_available", FormatAmount(s.b3_available, 9).toStdString()); account.pushKV("b3_reserved", FormatAmount(s.b3_reserved, 9).toStdString()); row.pushKV("account", account);
+            return row;
+        };
+        add("getflowmeshclientinfo", [] { return ConnectionInfo(); });
+        add("listflowmeshactions", [] {
+            UniValue saved{UniValue::VOBJ}; saved.pushKV("source", "local-retained-outbox"); saved.pushKV("actions", UniValue{UniValue::VARR}); return saved;
+        });
+        add("listflowmeshmarkets", [this, market] { ++catalogs; UniValue rows{UniValue::VARR}; rows.push_back(market()); return rows; });
+        add("getflowmeshbalance", market);
+        add("getflowmeshmarketdata", [this] {
+            ++snapshots; entered.release();
+            if (hold && !release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic funding read exceeded its test bound"};
+            if (fail) throw std::runtime_error{"Synthetic funding refresh unavailable"};
+            return data;
+        });
+        add("listflowmeshvaultoperations", [] { return UniValue{UniValue::VARR}; });
+        for (const auto* method : {"flowmeshdeposit", "submitflowmeshdeposit", "sendrawtransaction", "createflowmeshaccount"})
+            add(method, [this]() -> UniValue { ++writes; throw std::runtime_error{"Unexpected mutation in draft test"}; });
+    }
+    ~FundingReadProbe() { for (const auto& command : commands) tableRPC.removeCommand(command->name, command.get()); }
+};
 }
 
 class B3FlowMeshWorkspaceTests : public QObject
@@ -297,6 +342,7 @@ class B3FlowMeshWorkspaceTests : public QObject
             H(1), *uint256::FromHex(snapshot.market.toStdString()))->GetHex());
         market.account = snapshot.account; market.has_account = true;
         market.sequence = snapshot.account_sequence; market.ready = true;
+        market.remote = snapshot.remote;
         market.publish_ready = true;
         market.base_available = snapshot.base_available; market.base_reserved = snapshot.base_reserved;
         market.b3_available = snapshot.b3_available; market.b3_reserved = snapshot.b3_reserved;
@@ -1365,7 +1411,7 @@ private Q_SLOTS:
         QVERIFY(panel.m_read_failed); QVERIFY(panel.m_market->isEnabled());
         panel.updateMarketText(); QVERIFY(panel.m_status->text().contains(failed->error));
         QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_cancel_order->isEnabled());
-        QVERIFY(!panel.m_deposit->isEnabled()); QVERIFY(!panel.m_admit->isEnabled());
+        QVERIFY(panel.m_deposit->isEnabled()); QVERIFY(!panel.depositReady()); QVERIFY(!panel.m_admit->isEnabled());
         QVERIFY(!panel.m_withdraw->isEnabled()); QVERIFY(!panel.m_checkpoint->isEnabled());
         QVERIFY(!panel.m_publish->isEnabled()); QVERIFY(m_wallet->IsLocked());
     }
@@ -2263,7 +2309,7 @@ private Q_SLOTS:
             QCOMPARE(panel.m_history_view->item(0, 1), history_cell);
             QCOMPARE(panel.m_own_view->item(0, 0), own_cell);
             QCOMPARE(panel.m_order->isEnabled(), !reconciling);
-            QCOMPARE(panel.m_deposit->isEnabled(), !reconciling);
+            QVERIFY(panel.m_deposit->isEnabled()); QCOMPARE(panel.depositReady(), !reconciling);
             QCOMPARE(panel.m_status->text().contains(QStringLiteral("Reconciling")), reconciling);
         }
         panel.m_snapshot->chain_reconciling = true;
@@ -2527,6 +2573,179 @@ private Q_SLOTS:
         panel.cancelAndWait();
         QVERIFY(!panel.m_deferred_review); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
     }
+    void depositDraftRemainsAvailableDuringReconciliation()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        Observe(panel, Parse(RemoteData())); panel.m_market_data.front().remote = true;
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        panel.m_market_data.front().ready = false;
+        panel.m_snapshot->paused = true;
+        panel.m_snapshot->error = QStringLiteral("FlowMesh service is not active at the current B3 tip");
+        panel.m_amount->setText(QStringLiteral("1.25"));
+        for (int condition{0}; condition < 3; ++condition) {
+            panel.m_snapshot->chain_reconciling = condition == 1; // Older servers omit this flag.
+            panel.m_read_failed = condition == 2;
+            panel.updateMarketText();
+            QVERIFY(panel.m_deposit->isEnabled());
+            QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_withdraw->isEnabled());
+            bool opened{false}, retained{false}, explained{false};
+            QTimer::singleShot(0, &panel, [&] {
+                if (!panel.m_funding_dialog) return;
+                opened = true;
+                if (auto* amount{panel.m_funding_dialog->findChild<QLineEdit*>(QStringLiteral("flowMeshFundingDraftAmount"))}) retained = amount->text() == QStringLiteral("1.25");
+                for (const auto* label : panel.m_funding_dialog->findChildren<QLabel*>()) explained |= label->text().contains(QStringLiteral("draft")) && label->text().contains(QStringLiteral("readiness"));
+                panel.m_funding_dialog->reject();
+            });
+            panel.m_deposit->click();
+            QVERIFY(opened); QVERIFY(retained); QVERIFY(explained);
+            QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_deferred_review);
+            QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_unlock); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+        }
+    }
+    void depositDraftContinueRefreshesOnceBeforeReview_data()
+    {
+        QTest::addColumn<int>("outcome");
+        QTest::newRow("still paused") << 0;
+        QTest::newRow("read failed") << 1;
+        QTest::newRow("recovered ready") << 2;
+        QTest::newRow("changed units") << 3;
+        QTest::newRow("changed config") << 4;
+        QTest::newRow("hard halt") << 5;
+    }
+    void depositDraftContinueRefreshesOnceBeforeReview()
+    {
+        QFETCH(int, outcome);
+        FundingReadProbe probe;
+        if (outcome == 0 || outcome == 5) {
+            auto status{probe.data["snapshot"]}; status.pushKV("paused", true);
+            status.pushKV("error", "FlowMesh service is not active at the current B3 tip");
+            if (outcome == 5) status.pushKV("halt", "invalid-checkpoint");
+            probe.data.pushKV("snapshot", status);
+        }
+        probe.fail = outcome == 1;
+        if (outcome == 3) { auto units{probe.data["base_metadata"]}; units.pushKV("decimals", 7); probe.data.pushKV("base_metadata", units); }
+        if (outcome == 4) probe.data.pushKV("execution_config_id", H(90).GetHex());
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_market_data.front().ready = false; panel.m_snapshot->paused = true;
+        panel.m_snapshot->error = QStringLiteral("FlowMesh service is not active at the current B3 tip");
+        panel.m_catalog_age.start(); panel.updateMarketText();
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        bool reviewed{false}, cancel_default{false}, draft_opened{false};
+        QTimer review_guard;
+        connect(&review_guard, &QTimer::timeout, &panel, [&] {
+            if (!panel.m_confirmation) return;
+            reviewed = true; cancel_default = panel.m_confirmation->defaultButton() == panel.m_confirmation->button(QMessageBox::Cancel);
+            panel.m_confirmation->done(QMessageBox::Cancel); // Never approve preparation or unlock.
+        });
+        review_guard.start(1);
+        QTimer::singleShot(0, &panel, [&] {
+            if (!panel.m_funding_dialog) return;
+            draft_opened = true;
+            if (auto* amount{panel.m_funding_dialog->findChild<QLineEdit*>(QStringLiteral("flowMeshFundingDraftAmount"))}) amount->setText(QStringLiteral("1.25"));
+            panel.m_funding_dialog->accept();
+        });
+        panel.m_deposit->click();
+        QVERIFY(draft_opened); QVERIFY(panel.m_thread); QVERIFY(panel.m_deferred_review);
+        QVERIFY(!panel.m_deferred_review->funding); QVERIFY(panel.m_deferred_review->funding_context);
+        QVERIFY(panel.m_active_result && !panel.m_active_result->action);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        review_guard.stop();
+        QCOMPARE(probe.catalogs.load(), 1); QCOMPARE(probe.snapshots.load(), 1);
+        QCOMPARE(reviewed, outcome == 2); QCOMPARE(cancel_default, outcome == 2);
+        const QString retained_amount{outcome == 3 || outcome == 4 ? QString{} : QStringLiteral("1.25")};
+        QCOMPARE(panel.m_amount->text(), retained_amount); // Never carry amounts into changed units/configuration.
+        QVERIFY(!panel.m_deferred_review); QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_unlock);
+        QCOMPARE(probe.writes.load(), 0); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+        if (outcome != 5) {
+            bool retained{false};
+            QTimer::singleShot(0, &panel, [&] {
+                if (!panel.m_funding_dialog) return;
+                if (auto* amount{panel.m_funding_dialog->findChild<QLineEdit*>(QStringLiteral("flowMeshFundingDraftAmount"))}) retained = amount->text() == retained_amount;
+                panel.m_funding_dialog->reject();
+            });
+            panel.m_deposit->click(); QVERIFY(retained);
+            QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(probe.writes.load(), 0); // Cancel is read-only and does not refresh.
+        }
+    }
+    void depositDraftCannotBypassActionReadiness()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        panel.m_snapshot->paused = true; panel.m_amount->setText(QStringLiteral("1.25"));
+        panel.updateMarketText();
+        QVERIFY(panel.m_deposit->isEnabled()); QVERIFY(!panel.depositReady());
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        bool reviewed{false};
+        QTimer::singleShot(0, &panel, [&] {
+            if (panel.m_confirmation) { reviewed = true; panel.m_confirmation->done(QMessageBox::Cancel); }
+        });
+        panel.begin(B3FlowMeshTrading::Operation::Deposit);
+        QVERIFY(!reviewed); QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_thread); QVERIFY(!panel.m_unlock);
+        QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void depositDraftClickSurvivesFailedPassiveRead()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        ReadInFlight(panel); panel.m_deposit->click();
+        QVERIFY(panel.m_deferred_review && panel.m_deferred_review->funding);
+        bool opened{false};
+        QTimer::singleShot(0, &panel, [&] {
+            if (panel.m_funding_dialog) { opened = true; panel.m_funding_dialog->reject(); }
+        });
+        auto failure{std::make_shared<B3FlowMeshTradingPanel::Result>()}; failure->error = QStringLiteral("Synthetic passive read failed");
+        panel.finishJob(failure);
+        QVERIFY(opened); QVERIFY(panel.m_read_failed); QVERIFY(panel.m_deposit->isEnabled()); QVERIFY(!panel.depositReady());
+        QVERIFY(!panel.m_deferred_review); QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_unlock);
+        QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void depositDraftRejectsUnsafeContext()
+    {
+        for (int condition{0}; condition < 8; ++condition) {
+            B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+            switch (condition) {
+            case 0: panel.m_uncertain = true; break;
+            case 1: panel.m_security_warning = QStringLiteral("Synthetic relock failure"); break;
+            case 2: panel.m_snapshot.reset(); break;
+            case 3: panel.m_snapshot->certified = false; break;
+            case 4: panel.m_snapshot->account_state_verified = false; break;
+            case 5: panel.m_snapshot->config = QString::fromStdString(H(90).GetHex()); break;
+            case 6: panel.m_snapshot->halt = QStringLiteral("invalid-checkpoint"); break;
+            case 7: panel.m_saved_actions_ready = false; break;
+            }
+            panel.updateControls(); QVERIFY(!panel.m_deposit->isEnabled());
+            panel.openFunding(false); QVERIFY(!panel.m_funding_dialog); QVERIFY(!panel.m_thread);
+        }
+        auto watch{MakeOfflineWallet("deposit-watch-only")};
+        { LOCK(watch.wallet->cs_wallet); watch.wallet->SetWalletFlag(wallet::WALLET_FLAG_DISABLE_PRIVATE_KEYS); }
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel, *watch.model, watch.wallet);
+        QVERIFY(panel.m_backend->privateKeysDisabled()); panel.updateControls(); QVERIFY(!panel.m_deposit->isEnabled());
+        panel.openFunding(false); QVERIFY(!panel.m_funding_dialog); QVERIFY(!panel.m_thread);
+    }
+    void depositDraftWalletSwitchDiscardsFormAndContinuation()
+    {
+        FundingReadProbe probe;
+        for (bool during_read : {false, true}) {
+            B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+            QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+            probe.hold = during_read;
+            QTimer::singleShot(0, &panel, [&] {
+                if (!panel.m_funding_dialog) return;
+                if (auto* amount{panel.m_funding_dialog->findChild<QLineEdit*>(QStringLiteral("flowMeshFundingDraftAmount"))}) amount->setText(QStringLiteral("1.25"));
+                if (during_read) panel.m_funding_dialog->accept();
+                else panel.setWalletModel(nullptr);
+            });
+            panel.m_deposit->click();
+            if (during_read) {
+                QVERIFY(panel.m_deferred_review); QVERIFY(probe.entered.tryAcquire(1, 2000));
+                probe.release.release(); panel.setWalletModel(nullptr);
+            }
+            QCoreApplication::processEvents();
+            QVERIFY(!panel.m_wallet); QVERIFY(panel.m_amount->text().isEmpty());
+            QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_deferred_review);
+            QVERIFY(!panel.m_funding_dialog); QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_unlock);
+            QCOMPARE(unlock.count(), 0); QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+        }
+    }
     void deferredVaultReviewCannotFollowEffectFallback()
     {
         for (bool missing_identity : {false, true}) {
@@ -2608,7 +2827,9 @@ private Q_SLOTS:
             }
             panel.updateControls();
             QVERIFY(!panel.m_busy); // Not merely disabled by a modal operation.
-            for (auto* button : {panel.m_order, panel.m_cancel_order, panel.m_deposit, panel.m_withdraw, panel.m_admit}) QVERIFY(!button->isEnabled());
+            for (auto* button : {panel.m_order, panel.m_cancel_order, panel.m_withdraw, panel.m_admit}) QVERIFY(!button->isEnabled());
+            QCOMPARE(panel.m_deposit->isEnabled(), condition == 0 || condition == 1 || condition == 4 || condition == 5);
+            QVERIFY(!panel.depositReady());
             QVERIFY(!panel.m_deferred_review); QVERIFY(!panel.m_active_result);
         }
     }
