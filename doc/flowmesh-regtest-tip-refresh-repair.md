@@ -164,6 +164,75 @@ Actual same-wallet reopening and subsequent native refresh timings must be
 reported separately from these synthetic Qt checks. No constant WAN latency
 or absence of all visible flicker follows from the scheduling bound.
 
+### Native scheduling observation after 7300a1e
+
+The same generated regtest wallet was reopened after a recorded clean child
+exit (status 0 and `Shutdown done`). Original signed-action hashes, ActionIds
+and sticky certified/no-resubmit records were retained. A first after-restart
+trace contained no events and is not counted as a timing or screen pass.
+
+A subsequent 24-second memory capture, with the owner using Trade, recorded
+102 events and zero dropped. Nine complete passive-refresh jobs lasted
+2290, 2137, 1211, 2271, 2337, 2222, 1424, 2277 and 3164ms (rounded).
+Each had one auxiliary RPC followed by one selected snapshot RPC. Eight of
+nine jobs were below the unchanged 3000ms threshold, but one was not:
+the status read took 852.6ms and its selected snapshot took 2309.5ms.
+The longest consecutive snapshot-receipt gap was 3387ms. These are observed
+end-to-end read intervals, not measurements of trading certification or a
+separation of network, TLS and server work.
+
+The owner still observed Withdraw toggling. Its opening button remained
+tied directly to action readiness, so the remaining gap can legitimately
+disable it. Bounded read scheduling alone does not establish uninterrupted
+readiness; no freshness or service-reconciliation checks were relaxed.
+
+### Withdraw draft follow-up
+
+Withdraw now separates opening the draft from permission to sign a request,
+as Deposit already does. It retains verified wallet/market/account bindings,
+owner-key capability, pending-request, uncertainty and security restrictions.
+Continue performs one passive refresh and checks strict current withdrawal
+readiness before ordinary review. Existing balance/address/sequence checks
+and the fresh worker preflight remain mandatory. A failed refresh never
+unlocks, signs, sends or automatically retries a withdrawal.
+
+The draft retains its own amount/asset, distinct from Deposit, and captures
+its amount, asset, destination, market and precision across the read. Wallet
+or market changes clear the relevant draft, and explicit asset routing does
+not reuse an old amount in another asset. The existing acknowledgement of
+an uncertain outcome still re-enables new actions without deleting the old
+instruction or changing its no-resubmit history.
+
+The new button regression failed before while paused. After correction the
+full workspace suite passed **125 checks, zero failures, three opt-in skips**.
+Cases cover pause/staleness, failed reads, sufficient/insufficient fresh
+balances, native/base assets, invalid and changed destinations, changed
+amounts, deferred form opening, wallet changes, separate Deposit inputs and
+the existing explicit uncertainty acknowledgement. Tests cancel the signing
+review and assert no unlock or mutation. A focused read-only review caught
+draft-field interference and an overbroad historical pending-request check
+during development; both were removed and covered before freezing the fix.
+
+This does not prove on-screen behavior after installing the successor, a
+completed payout, or continuous service readiness under rapid B3 tips.
+
+### Windows build status
+
+CI run `36261477661` compiled the guarded Windows app and policy test, but
+packaging refused because its executable-identity scan did not find both
+required ASCII tokens. Native Windows policy execution did not follow that
+failure. Both macOS packages in that run succeeded. This is separate from
+the repaired translation-callback linker defect.
+
+The original diagnostic does not identify which token was absent. Improved
+diagnostics name the exact missing version/commit token and observe UTF-16LE
+version bytes without accepting them in place of the existing requirements.
+Failure-only CI retention includes just the built guarded executable and
+generated identity headers, explicitly marked NOT FOR TESTERS, for bounded
+inspection. Twenty-one pure package tests pass, including missing/stale/
+dirty identity rejection and scan-boundary cases. This diagnostic change
+does not itself repair or qualify the Windows package.
+
 ## Remaining reconciliation boundary
 
 The service still closes new-action admission while it reconciles each B3 tip.

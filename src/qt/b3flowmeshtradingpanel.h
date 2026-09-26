@@ -80,6 +80,8 @@ private:
         struct FundingContext {
             B3FlowMeshTrading::Market market;
             B3FlowMeshMarketData::Units units;
+            QString amount, destination;
+            int asset;
         };
         std::optional<FundingContext> funding_context;
     };
@@ -103,6 +105,8 @@ private:
     void openFunding(bool withdrawal);
     bool depositDraftAvailable() const;
     bool depositReady() const;
+    bool withdrawalDraftAvailable() const;
+    bool withdrawalReady() const;
     void begin(B3FlowMeshTrading::Operation operation);
     bool confirm(const QString& text, bool final_transaction);
     void startJob(std::optional<B3FlowMeshTrading::Action> action = std::nullopt,
@@ -165,6 +169,8 @@ private:
     unsigned m_read_failures{0};
     bool m_loading{false}, m_read_failed{false};
     QString m_read_error;
+    QString m_withdrawal_draft_amount;
+    int m_withdrawal_draft_asset{0};
     std::vector<B3FlowMeshTrading::Market> m_market_data;
     std::vector<UniValue> m_effect_data;
     B3FlowMeshTrading::SavedActions m_saved_actions;

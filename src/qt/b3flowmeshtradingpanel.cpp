@@ -237,7 +237,7 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         m_read_error.clear(); m_read_failed = false; m_read_failures = 0; m_attempt_age.invalidate();
         const auto selected{market()};
         if (!selected || !m_snapshot || selected->id != m_snapshot->market) {
-            m_amount->clear(); m_deposit_txid->clear(); m_deposit_vout->setText(QStringLiteral("0"));
+            m_amount->clear(); m_withdrawal_draft_amount.clear(); m_destination->clear(); m_deposit_txid->clear(); m_deposit_vout->setText(QStringLiteral("0"));
             m_snapshot.reset(); m_response_age.invalidate(); m_certificate_age.invalidate(); m_queue_age.invalidate();
             m_loading = selected.has_value(); updateDataViews();
         }
@@ -268,7 +268,7 @@ void B3FlowMeshTradingPanel::setWalletModel(WalletModel* wallet)
     cancelAndWait();
     m_wallet = wallet; m_backend.reset(); m_market_data.clear(); m_effect_data.clear(); m_snapshot.reset();
     m_saved_actions = {}; m_saved_actions_ready = false;
-    m_amount->clear(); m_deposit_txid->clear(); m_deposit_vout->setText(QStringLiteral("0"));
+    m_amount->clear(); m_withdrawal_draft_amount.clear(); m_destination->clear(); m_deposit_txid->clear(); m_deposit_vout->setText(QStringLiteral("0"));
     m_client_info.reset(); m_connection_error.clear(); m_connect_error.clear();
     { QSignalBlocker blocker{m_saved_selector}; m_saved_selector->clear(); }
     m_receipt_card->setText(wallet ? tr("Loading this wallet's locally saved requests. No action is automatically resent.") : tr("Open a wallet to inspect its saved requests."));
@@ -295,6 +295,8 @@ void B3FlowMeshTradingPanel::selectBaseAsset(const QString& asset_id, bool withd
 {
     if (m_busy) { notice(tr("Finish or cancel the current operation before selecting another asset.")); return; }
     m_requested_base = asset_id.toLower(); m_requested_withdrawal = withdrawal; m_route_pending = true;
+    if (withdrawal) m_withdrawal_draft_amount.clear(); // Explicit asset routing starts a new draft in that asset.
+    if (m_asset->currentIndex() != (asset_id.isEmpty() ? 1 : 0)) m_amount->clear();
     m_asset->setCurrentIndex(asset_id.isEmpty() ? 1 : 0);
     refresh();
 }
@@ -525,10 +527,24 @@ bool B3FlowMeshTradingPanel::depositReady() const
             m_certificate_age.isValid() ? m_certificate_age.elapsed() : -1, m_queue_age.isValid() ? m_queue_age.elapsed() : -1);
 }
 
+bool B3FlowMeshTradingPanel::withdrawalDraftAvailable() const
+{
+    if (!depositDraftAvailable()) return false;
+    const auto selected{market()};
+    if (!selected->has_account || (m_pending_sequence && selected->id == m_pending_market &&
+        selected->account == m_pending_account && (m_receipt || selected->sequence <= *m_pending_sequence))) return false;
+    return true; // Historical outbox rows do not undo explicit uncertain-outcome acknowledgement.
+}
+
+bool B3FlowMeshTradingPanel::withdrawalReady() const
+{
+    return withdrawalDraftAvailable() && depositReady();
+}
+
 void B3FlowMeshTradingPanel::openFunding(bool withdrawal)
 {
     if (!m_wallet || !m_backend || m_busy || !m_security_warning.isEmpty() || m_uncertain) return;
-    if (!withdrawal && !depositDraftAvailable()) return;
+    if (withdrawal ? !withdrawalDraftAvailable() : !depositDraftAvailable()) return;
     if (m_thread) { deferReview(withdrawal ? Operation::Withdraw : Operation::Deposit, true); return; }
     const auto selected{market()}; if (!selected) return;
     const bool known{m_snapshot && m_snapshot->market == selected->id && m_snapshot->units.known};
@@ -539,12 +555,12 @@ void B3FlowMeshTradingPanel::openFunding(bool withdrawal)
     m_funding_dialog = new QDialog{this}; const QPointer<QDialog> dialog{m_funding_dialog}; dialog->setWindowTitle(withdrawal ? tr("Withdraw from FlowMesh") : tr("Deposit to FlowMesh")); dialog->setMinimumWidth(430);
     auto* layout{new QVBoxLayout{dialog}}; layout->addWidget(Label(tr("Wallet: %1\nMarket view: %2\nCanonical base asset ID: %3").arg(m_wallet_name, (inverted() ? QStringLiteral("B3 / %1") : QStringLiteral("%1 / B3")).arg(ticker), selected->base), dialog));
     auto* tabs{new QTabWidget{dialog}}; auto* transfer{new QWidget{tabs}}; auto* form{new QFormLayout{transfer}};
-    auto* asset{new QComboBox{transfer}}; asset->addItems({ticker, QStringLiteral("B3")}); asset->setCurrentIndex(m_asset->currentIndex()); form->addRow(tr("Asset"), asset);
-    auto* amount{new QLineEdit{transfer}}; amount->setObjectName(QStringLiteral("flowMeshFundingDraftAmount")); amount->setMaxLength(64); amount->setPlaceholderText(tr("Amount in whole tokens, e.g. 1.25")); if (!withdrawal) amount->setText(m_amount->text()); form->addRow(tr("Amount"), amount);
-    auto* destination{new QLineEdit{transfer}}; destination->setMaxLength(256); destination->setText(m_destination->text());
+    auto* asset{new QComboBox{transfer}}; asset->setObjectName(QStringLiteral("flowMeshFundingDraftAsset")); asset->addItems({ticker, QStringLiteral("B3")}); asset->setCurrentIndex(withdrawal && !m_withdrawal_draft_amount.isEmpty() ? m_withdrawal_draft_asset : m_asset->currentIndex()); form->addRow(tr("Asset"), asset);
+    auto* amount{new QLineEdit{transfer}}; amount->setObjectName(QStringLiteral("flowMeshFundingDraftAmount")); amount->setMaxLength(64); amount->setPlaceholderText(tr("Amount in whole tokens, e.g. 1.25")); amount->setText(withdrawal ? m_withdrawal_draft_amount : m_amount->text()); form->addRow(tr("Amount"), amount);
+    auto* destination{new QLineEdit{transfer}}; destination->setObjectName(QStringLiteral("flowMeshFundingDraftDestination")); destination->setMaxLength(256); destination->setText(m_destination->text());
     if (withdrawal) form->addRow(tr("B3 destination address"), destination); else destination->hide();
     form->addRow(Label(withdrawal ? tr("This requests a certified withdrawal; it is not an immediate payout. A checkpoint and a separately reviewed on-chain payout follow. No automatic fee spending.") : tr("A new deposit locks funds in a keyless vault. It needs 31 confirmations before admission and may stay locked without validator quorum. You review the actual B3 network fee before any broadcast."), transfer));
-    if (!withdrawal) layout->addWidget(Label(tr("This is a draft, not permission to deposit. Continue checks current market readiness once before opening a review. If the market is still paused or unavailable, nothing is prepared or sent; your amount is retained for reopening. There is no automatic retry."), dialog));
+    layout->addWidget(Label(withdrawal ? tr("This is a withdrawal draft, not permission to withdraw. Continue checks current market readiness and your available balance once before opening a review. If the market is still paused or unavailable, nothing is signed or sent; your amount and destination are retained for reopening. There is no automatic retry.") : tr("This is a draft, not permission to deposit. Continue checks current market readiness once before opening a review. If the market is still paused or unavailable, nothing is prepared or sent; your amount is retained for reopening. There is no automatic retry."), dialog));
     tabs->addTab(transfer, withdrawal ? tr("Request withdrawal") : tr("New deposit"));
     auto* existing{new QWidget{tabs}}; auto* existing_form{new QFormLayout{existing}};
     auto* txid{new QLineEdit{existing}}; txid->setMaxLength(64); txid->setText(m_deposit_txid->text()); existing_form->addRow(tr("Existing deposit transaction ID"), txid);
@@ -556,15 +572,20 @@ void B3FlowMeshTradingPanel::openFunding(bool withdrawal)
     const bool accepted{dialog->exec() == QDialog::Accepted};
     if (!self || generation != m_generation) { if (dialog) delete dialog.data(); return; }
     const bool admission{!withdrawal && tabs->currentIndex() == 1};
-    if (accepted) { m_asset->setCurrentIndex(asset->currentIndex()); m_amount->setText(amount->text()); if (withdrawal) m_destination->setText(destination->text()); m_deposit_txid->setText(txid->text()); m_deposit_vout->setText(vout->text()); }
+    if (accepted) {
+        if (withdrawal) { m_destination->setText(destination->text()); m_withdrawal_draft_amount = amount->text(); m_withdrawal_draft_asset = asset->currentIndex(); }
+        else { m_asset->setCurrentIndex(asset->currentIndex()); m_amount->setText(amount->text()); m_deposit_txid->setText(txid->text()); m_deposit_vout->setText(vout->text()); }
+    }
     if (dialog) delete dialog.data(); m_busy = false; updateControls();
-    if (accepted && !withdrawal) {
+    if (accepted) {
         // The modal draft pauses background reads. Refresh once after Continue,
         // then reuse the existing review-only continuation, never an action queue.
         m_catalog_age.invalidate(); resetRefreshSchedule(); startJob();
-        if (deferReview(admission ? Operation::Admit : Operation::Deposit))
-            m_deferred_review->funding_context = DeferredReview::FundingContext{*selected, units};
-    } else if (accepted) begin(Operation::Withdraw);
+        if (deferReview(admission ? Operation::Admit : withdrawal ? Operation::Withdraw : Operation::Deposit))
+            m_deferred_review->funding_context = DeferredReview::FundingContext{*selected, units,
+                withdrawal ? m_withdrawal_draft_amount : m_amount->text(), withdrawal ? m_destination->text() : QString{},
+                withdrawal ? m_withdrawal_draft_asset : m_asset->currentIndex()};
+    }
 }
 
 void B3FlowMeshTradingPanel::updateControls()
@@ -587,7 +608,7 @@ void B3FlowMeshTradingPanel::updateControls()
     m_side->setEnabled(idle); m_asset->setEnabled(idle); m_effect->setEnabled(idle);
     m_buy->setEnabled(idle); m_sell->setEnabled(idle);
     m_order->setEnabled(ready && known && selected->has_account && !pending); m_cancel_order->setEnabled(ready && selected->has_account && !pending);
-    m_withdraw->setEnabled(ready && selected->has_account && !pending); m_deposit->setEnabled(depositDraftAvailable());
+    m_withdraw->setEnabled(withdrawalDraftAvailable()); m_deposit->setEnabled(depositDraftAvailable());
     m_admit->setEnabled(ready && selected->has_account);
     m_checkpoint->setEnabled(signing && settlement_ready && selected->publish_ready && selected->checkpoint_pending);
     m_publish->setEnabled(signing && settlement_ready && selected->publish_ready && m_effect->currentIndex() >= 0);
@@ -717,8 +738,11 @@ void B3FlowMeshTradingPanel::begin(Operation operation)
     if (operation == Operation::Deposit && !depositReady()) {
         notice(tr("Market status changed. Nothing was prepared or submitted; reopen the deposit draft when ready.")); return;
     }
+    if (operation == Operation::Withdraw && !withdrawalReady()) {
+        notice(tr("Market status changed or an account request is pending. Nothing was signed or submitted; reopen the withdrawal draft when ready.")); return;
+    }
     Action a; a.operation = operation; a.market = *selected; a.inverse_display = inverted();
-    a.side = B3FlowMeshMarketData::CanonicalSide(m_side->currentIndex() == 0, a.inverse_display); a.native = m_asset->currentIndex() == 1;
+    a.side = B3FlowMeshMarketData::CanonicalSide(m_side->currentIndex() == 0, a.inverse_display); a.native = (operation == Operation::Withdraw ? m_withdrawal_draft_asset : m_asset->currentIndex()) == 1;
     if (operation == Operation::Order) a.native = false; // Funding selection never changes the traded base quantity.
     if (m_snapshot && m_snapshot->market == selected->id && m_snapshot->units.known) { a.display_decimals = m_snapshot->units.decimals; a.display_ticker = m_snapshot->units.ticker; }
     a.destination = m_destination->text();
@@ -738,7 +762,8 @@ void B3FlowMeshTradingPanel::begin(Operation operation)
             if (!limit || !quantity) throw std::runtime_error{error.toStdString()}; a.price = limit->price; a.amount = *quantity;
             a.display_limit_adjusted = limit->adjusted; a.entered_display_limit = m_price->text();
         } else if (operation == Operation::Deposit || operation == Operation::Withdraw) {
-            const auto amount{a.native ? B3AssetTransfer::ParseAmount(m_amount->text(), 9, &error) : B3FlowMeshMarketData::ParseQuantity(m_amount->text(), m_snapshot->units, &error)};
+            const auto text{operation == Operation::Withdraw ? m_withdrawal_draft_amount : m_amount->text()};
+            const auto amount{a.native ? B3AssetTransfer::ParseAmount(text, 9, &error) : B3FlowMeshMarketData::ParseQuantity(text, m_snapshot->units, &error)};
             if (!amount) throw std::runtime_error{error.toStdString()}; a.amount = *amount;
         } else if (operation == Operation::Admit) {
             a.txid = m_deposit_txid->text().toLower(); const QString text{m_deposit_vout->text()};
@@ -791,15 +816,18 @@ void B3FlowMeshTradingPanel::resumeReview()
     const auto intent{*m_deferred_review}; m_deferred_review.reset();
     m_busy = false; updateControls();
     const auto selected{market()};
-    const bool deposit_draft{intent.funding && intent.operation == Operation::Deposit};
+    const bool funding_draft{intent.funding && (intent.operation == Operation::Deposit || intent.operation == Operation::Withdraw)};
     if (intent.generation != m_generation || !selected || intent.market != selected->id ||
-        (m_read_failed && !deposit_draft) || m_uncertain || !m_security_warning.isEmpty()) return;
+        (m_read_failed && !funding_draft) || m_uncertain || !m_security_warning.isEmpty()) return;
     if (intent.funding_context) {
         try {
             B3FlowMeshTrading::CheckSameMarket(intent.funding_context->market, *selected, false);
             if (!m_snapshot || m_snapshot->units != intent.funding_context->units ||
-                selected->remote != intent.funding_context->market.remote)
-                throw std::runtime_error{"The deposit draft's asset units or market binding changed. Reopen it and check the amount; nothing was prepared or submitted."};
+                selected->remote != intent.funding_context->market.remote ||
+                (intent.operation == Operation::Withdraw ? m_withdrawal_draft_amount : m_amount->text()) != intent.funding_context->amount ||
+                (intent.operation == Operation::Withdraw ? m_withdrawal_draft_asset : m_asset->currentIndex()) != intent.funding_context->asset ||
+                (intent.operation == Operation::Withdraw && m_destination->text() != intent.funding_context->destination))
+                throw std::runtime_error{"The funding draft's inputs, asset units or market binding changed. Reopen it and check the amount and destination; nothing was prepared or submitted."};
         } catch (const std::exception& e) { notice(QString::fromUtf8(e.what())); return; }
     }
     if (intent.operation == Operation::Vault && (intent.effect.isEmpty() || intent.effect != m_effect->currentData(Qt::UserRole + 1).toString())) {
@@ -817,7 +845,8 @@ void B3FlowMeshTradingPanel::resumeReview()
     }
     // Re-evaluate freshness/readiness after the read, never approve on the
     // authority of the stale frame in which the click occurred.
-    const bool allowed{intent.operation == Operation::Deposit && !intent.funding ? depositReady() : button && button->isEnabled()};
+    const bool allowed{!intent.funding && intent.operation == Operation::Deposit ? depositReady() :
+        !intent.funding && intent.operation == Operation::Withdraw ? withdrawalReady() : button && button->isEnabled()};
     if (!allowed) { notice(tr("Market status changed. Nothing was submitted; review again when ready.")); return; }
     if (intent.funding) openFunding(intent.operation == Operation::Withdraw);
     else begin(intent.operation);
@@ -1217,9 +1246,9 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
         return;
     }
     if (!result->error.isEmpty()) {
-        const bool open_deposit_draft{!result->action && m_deferred_review &&
-            m_deferred_review->funding && m_deferred_review->operation == Operation::Deposit};
-        if (!open_deposit_draft) m_deferred_review.reset();
+        const bool open_funding_draft{!result->action && m_deferred_review && m_deferred_review->funding &&
+            (m_deferred_review->operation == Operation::Deposit || m_deferred_review->operation == Operation::Withdraw)};
+        if (!open_funding_draft) m_deferred_review.reset();
         if (!result->action) {
             if (result->catalog) applyMarketCatalog(*result);
             const auto selected{market()};
@@ -1231,7 +1260,7 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
             if (!m_read_failed) notice(tr("Market refresh failed: %1. Last certified data is retained; new actions are disabled until a successful refresh.").arg(result->error));
             m_read_failed = true; m_read_error = result->error; m_read_failures = std::min(5U, m_read_failures + 1); m_loading = false; m_uncertain_refreshed = false; m_busy = false;
             updateDataViews(); updateMarketText();
-            if (open_deposit_draft) resumeReview(); // Opening retained draft only; failed Continue is never resumed.
+            if (open_funding_draft) resumeReview(); // Opening retained draft only; failed Continue is never resumed.
             return;
         }
         restoreLock(); m_busy = false;
@@ -1262,7 +1291,7 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
         const auto selected_now{market()};
         if (result->snapshot && selected_now && result->snapshot->market == selected_now->id) {
             auto fresh{*result->snapshot};
-            if (m_snapshot && fresh.units.known && fresh.units != m_snapshot->units) m_amount->clear();
+            if (m_snapshot && fresh.units.known && fresh.units != m_snapshot->units) { m_amount->clear(); m_withdrawal_draft_amount.clear(); }
             const bool new_head{!m_snapshot || m_snapshot->market != fresh.market || m_snapshot->head != fresh.head};
             if (fresh.unchanged) {
                 if (!m_snapshot || m_snapshot->market != fresh.market || m_snapshot->head != fresh.head || m_snapshot->state_root != fresh.state_root || m_snapshot->remote != fresh.remote || m_snapshot->execution_result_verified != fresh.execution_result_verified) { m_read_failed = true; notice(tr("Unchanged snapshot did not match the retained certificate and provenance; data was not reused.")); m_catalog_age.invalidate(); }
@@ -1352,7 +1381,7 @@ void B3FlowMeshTradingPanel::applyMarketCatalog(const Result& result)
     if (previous_market && (!selected || previous_market->id != selected->id || previous_market->base != selected->base ||
         previous_market->vault != selected->vault || previous_market->domain != selected->domain ||
         previous_market->config != selected->config || previous_market->account != selected->account || previous_market->remote != selected->remote)) {
-        m_amount->clear(); m_deposit_txid->clear(); m_deposit_vout->setText(QStringLiteral("0"));
+        m_amount->clear(); m_withdrawal_draft_amount.clear(); m_destination->clear(); m_deposit_txid->clear(); m_deposit_vout->setText(QStringLiteral("0"));
     }
     if (m_snapshot && (!selected || selected->id != m_snapshot->market || selected->base != m_snapshot->base ||
         selected->domain != m_snapshot->domain || selected->config != m_snapshot->config || selected->remote != m_snapshot->remote)) {
