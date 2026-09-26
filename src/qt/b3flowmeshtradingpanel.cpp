@@ -129,19 +129,25 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     auto* center{new QSplitter{Qt::Horizontal, content}}; center->setChildrenCollapsible(false);
     auto* chart_card{new QWidget{center}}; B3Theme::markCard(chart_card); auto* chart_layout{new QVBoxLayout{chart_card}};
     auto* chart_modes{new QHBoxLayout}; auto* modes{new QButtonGroup{chart_card}};
-    for (const auto& mode : {std::pair{tr("Chart"), B3FlowMeshChart::Mode::Prices}, std::pair{tr("Depth"), B3FlowMeshChart::Mode::Liquidity}}) {
+    auto* candle_interval{new QComboBox{chart_card}}; candle_interval->setObjectName(QStringLiteral("flowMeshCandleInterval"));
+    candle_interval->setAccessibleName(tr("Microblocks per candlestick"));
+    for (const int count : {1, 5, 20}) candle_interval->addItem(tr("%1 microblock(s)").arg(count), count);
+    candle_interval->setCurrentIndex(1);
+    candle_interval->setToolTip(tr("Candles group actual clearings by microblock sequence. These intervals are not minutes; no signed trade timestamp is available."));
+    for (const auto& mode : {std::pair{tr("Candles"), B3FlowMeshChart::Mode::Prices}, std::pair{tr("Depth"), B3FlowMeshChart::Mode::Liquidity}}) {
         auto* button{new QPushButton{mode.first, chart_card}}; button->setCheckable(true); button->setChecked(mode.second == B3FlowMeshChart::Mode::Prices); button->setProperty("b3variant", QStringLiteral("timeframe")); modes->addButton(button); chart_modes->addWidget(button);
         button->setObjectName(mode.second == B3FlowMeshChart::Mode::Prices ? QStringLiteral("flowMeshChartPrices") : QStringLiteral("flowMeshChartLiquidity"));
-        connect(button, &QPushButton::clicked, this, [this, mode] { m_chart->setMode(mode.second); });
+        connect(button, &QPushButton::clicked, this, [this, mode, candle_interval] { m_chart->setMode(mode.second); candle_interval->setEnabled(mode.second == B3FlowMeshChart::Mode::Prices); });
     }
-    chart_modes->addStretch(); chart_layout->addLayout(chart_modes); m_chart = new B3FlowMeshChart{chart_card}; chart_layout->addWidget(m_chart, 1);
-    m_chart->setToolTip(tr("Each price point is a real certified clearing, indexed by microblock sequence—not an invented timestamp. Idle intervals are not filled in. Liquidity lines are a display guide through exact evaluated samples."));
+    chart_modes->addStretch(); chart_modes->addWidget(candle_interval); chart_layout->addLayout(chart_modes); m_chart = new B3FlowMeshChart{chart_card}; chart_layout->addWidget(m_chart, 1);
+    connect(candle_interval, &QComboBox::currentIndexChanged, this, [this, candle_interval] { m_chart->setCandleInterval(candle_interval->currentData().toULongLong()); });
+    m_chart->setToolTip(tr("Candles show open, high, low and close from actual clearings, grouped by microblock sequence. Hover to inspect a candle and its volume. Idle intervals are not filled in. Depth lines show evaluated demand and supply, not historical trades."));
     const auto table = [](QWidget* parent, const QStringList& headers, const char* name) {
         auto* view{new QTableWidget{parent}}; view->setObjectName(QLatin1String(name)); view->setColumnCount(headers.size()); view->setHorizontalHeaderLabels(headers); view->verticalHeader()->hide(); view->setShowGrid(false); view->setAlternatingRowColors(false); view->setEditTriggers(QAbstractItemView::NoEditTriggers); view->setSelectionMode(QAbstractItemView::NoSelection); view->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch); view->verticalHeader()->setDefaultSectionSize(26); view->setMinimumWidth(200); return view;
     };
     auto* liquidity_card{new QWidget{center}}; B3Theme::markCard(liquidity_card); auto* liquidity_layout{new QVBoxLayout{liquidity_card}};
     auto* liquidity_title{Label(tr("Liquidity"), liquidity_card)}; liquidity_title->setObjectName(QStringLiteral("flowMeshLiquidityTitle")); B3Theme::markTextRole(liquidity_title, QStringLiteral("h3")); liquidity_layout->addWidget(liquidity_title);
-    m_depth_view = table(liquidity_card, {tr("Price"), tr("Demand"), tr("Supply")}, "flowMeshCurveDepth"); liquidity_layout->addWidget(m_depth_view, 1);
+    m_depth_view = table(liquidity_card, {tr("Price"), tr("Buy liquidity"), tr("Sell liquidity")}, "flowMeshCurveDepth"); liquidity_layout->addWidget(m_depth_view, 1);
     m_liquidity_note = Label(tr("No certified curves yet."), liquidity_card); B3Theme::markTextRole(m_liquidity_note, QStringLiteral("secondary")); liquidity_layout->addWidget(m_liquidity_note);
     auto* ticket_card{new QWidget{center}}; ticket_card->setMinimumWidth(250); B3Theme::markCard(ticket_card); auto* ticket{new QVBoxLayout{ticket_card}};
     auto* sides{new QHBoxLayout}; auto* side_group{new QButtonGroup{ticket_card}};
@@ -369,13 +375,13 @@ void B3FlowMeshTradingPanel::updateDataViews()
     else { for (const auto& d : s.depth) add_depth(d); }
     const QString price_units{(inverse ? QStringLiteral("%1 / B3") : QStringLiteral("B3 / %1")).arg(u.ticker)};
     const QString quantity_units{inverse ? QStringLiteral("B3") : u.ticker};
-    m_depth_view->setHorizontalHeaderLabels({tr("Price"), tr("Demand"), tr("Supply")});
+    m_depth_view->setHorizontalHeaderLabels({tr("Price"), tr("Buy liquidity"), tr("Sell liquidity")});
     m_depth_view->horizontalHeaderItem(0)->setToolTip(tr("Price in %1; ≈ marks display-only approximation").arg(price_units));
     for (int column : {1, 2}) m_depth_view->horizontalHeaderItem(column)->setToolTip(tr("Gross quantity in %1, evaluated at this price").arg(quantity_units));
     if (auto* title{m_depth_view->parentWidget()->findChild<QLabel*>(QStringLiteral("flowMeshLiquidityTitle"))}) title->setText(tr("Liquidity · %1").arg(quantity_units));
-    m_liquidity_note->setText(s.curves.empty() ? tr("No orders yet") : s.curves_complete ? tr("Price in %1").arg(price_units) : tr("Partial liquidity only"));
+    m_liquidity_note->setText(s.curves.empty() ? tr("No orders yet") : s.curves_complete ? tr("Aggregate curves · Price in %1").arg(price_units) : tr("Partial liquidity only"));
     m_liquidity_note->setToolTip(tr("Each row evaluates all remaining curves at that price; do not sum the rows. Only certified curves are shown. A zero canonical price has no finite inverse and is shown as a dash.") +
-        (inverse ? tr("\nDemand/supply are gross B3 equivalents at each sampled price, not fixed B3-sized orders. Original token quantities remain the exact order amounts.") : QString{}));
+        (inverse ? tr("\nBuy/sell liquidity is gross B3 equivalents at each sampled price, not fixed B3-sized orders. Original token quantities remain the exact order amounts.") : QString{}));
     if (m_history_view->columnCount() != 6) m_history_view->setColumnCount(6);
     m_history_view->setHorizontalHeaderLabels({tr("Trade batch"), tr("Price (%1)").arg(price_units), tr("Amount (%1)").arg(quantity_units), tr("Your buy"), tr("Your sell"), tr("Auction fee (B3)")});
     m_history_view->horizontalHeaderItem(5)->setToolTip(tr("Whole-auction B3 fee, not your individual allocation. Endpoint-reported history remains unverified when indicated below."));
@@ -401,6 +407,8 @@ void B3FlowMeshTradingPanel::updateDataViews()
     for (int i{0}; i < m_depth_view->rowCount(); ++i) {
         const QString tooltip{inverse ? tr("Exact inverse price: %1").arg(ExactInversePrice(s.depth[s.depth.size() - 1 - i].price, u.decimals)) : QString{}};
         m_depth_view->item(i, 0)->setToolTip(tooltip);
+        if (m_depth_view->item(i, 1)->foreground().color() != B3Theme::kPositive) m_depth_view->item(i, 1)->setForeground(B3Theme::kPositive);
+        if (m_depth_view->item(i, 2)->foreground().color() != B3Theme::kNegative) m_depth_view->item(i, 2)->setForeground(B3Theme::kNegative);
     }
     for (int i{0}; i < static_cast<int>(s.own_curves.size()); ++i) {
         const auto& c{s.own_curves[i]};
@@ -425,7 +433,8 @@ void B3FlowMeshTradingPanel::updateDataViews()
     }
     m_last_price->setText(last_price);
     m_history_note->setText(history_note); m_history_note->setToolTip(history_tooltip);
-    m_chart->setToolTip(reported ? tr("Endpoint-reported price and fill history; execution results are not independently verified.") : tr("Locally verified execution history."));
+    m_chart->setToolTip((reported ? tr("Endpoint-reported price and fill history; execution results are not independently verified.") : tr("Locally verified execution history.")) +
+        tr("\nCandles show open, high, low and close by microblock sequence, not elapsed time. Hover to inspect prices and summed trade volume. Unfilled sequence intervals remain gaps; the first and latest candle may contain only part of their interval. Depth shows current orders separately."));
     m_history_view->setToolTip(m_history_note->toolTip());
 }
 

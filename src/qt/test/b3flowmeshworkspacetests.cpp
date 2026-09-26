@@ -20,6 +20,7 @@
 #include <QDeadlineTimer>
 #include <QDir>
 #include <QEvent>
+#include <QFile>
 #include <QImage>
 #include <QItemSelectionModel>
 #include <QLabel>
@@ -42,6 +43,7 @@
 #include <algorithm>
 #include <array>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -1159,6 +1161,154 @@ private Q_SLOTS:
         chart.setSnapshot(Parse(Data())); QCOMPARE(chart.pricePointCount(), 1); QImage image{chart.size(), QImage::Format_ARGB32}; image.fill(Qt::transparent); chart.render(&image); QVERIFY(!image.isNull());
         chart.setMode(B3FlowMeshChart::Mode::Liquidity); chart.setStale(true); chart.render(&image); chart.setSnapshot(std::nullopt); QCOMPARE(chart.pricePointCount(), 0);
     }
+    void candleAggregationUsesActualClearingsAndSequenceBuckets()
+    {
+        const auto trade = [](uint64_t sequence, CAmount price, CAmount quantity) {
+            Trade t; t.sequence = sequence; t.cleared = true; t.price = price; t.quantity = quantity; t.notional = price * quantity; return t;
+        };
+        QVERIFY(B3FlowMeshChart::AggregateCandles({}, 5).empty());
+        // Endpoint order cannot choose open/close; empty sequence buckets have
+        // no invented prices or volume. Unmatched auctions are not trades.
+        Trade idle; idle.sequence = 6;
+        std::vector<Trade> history{trade(21, 800, 50), trade(4, 1100, 400), idle, trade(2, 1300, 200), trade(8, 1200, 1), trade(1, 1000, 100), trade(3, 900, 300)};
+        const auto unchanged{history};
+        const auto candles{B3FlowMeshChart::AggregateCandles(history, 5)};
+        QCOMPARE(candles.size(), size_t{3});
+        const auto& first{candles.front()};
+        QCOMPARE(first.bucket_sequence, uint64_t{0}); QCOMPARE(first.first_sequence, uint64_t{1}); QCOMPARE(first.last_sequence, uint64_t{4});
+        QCOMPARE(first.open, CAmount{1000}); QCOMPARE(first.high, CAmount{1300}); QCOMPARE(first.low, CAmount{900}); QCOMPARE(first.close, CAmount{1100});
+        QCOMPARE(first.trades, size_t{4}); QVERIFY(first.base_volume == 1000); QVERIFY(first.quote_volume == 1'070'000);
+        QCOMPARE(B3FlowMeshChart::FormatCandleVolume(first, 6, false), QStringLiteral("0.001"));
+        QCOMPARE(B3FlowMeshChart::FormatCandleVolume(first, 6, true), QStringLiteral("0.00107"));
+        QCOMPARE(candles[1].bucket_sequence, uint64_t{5}); QCOMPARE(candles[2].bucket_sequence, uint64_t{20});
+        QCOMPARE(candles[1].open, candles[1].high); QCOMPARE(candles[1].high, candles[1].low); QCOMPARE(candles[1].low, candles[1].close);
+        QCOMPARE(B3FlowMeshChart::AggregateCandles(history, 1).size(), size_t{6});
+        QCOMPARE(B3FlowMeshChart::AggregateCandles(history, 20).size(), size_t{2});
+        QVERIFY(history == unchanged);
+
+        const auto reversed{B3FlowMeshChart::AggregateCandles(history, 5, true)};
+        QCOMPARE(reversed.size(), candles.size());
+        QCOMPARE(reversed[0].open, first.open); QCOMPARE(reversed[0].close, first.close);
+        QCOMPARE(reversed[0].high, first.low); QCOMPARE(reversed[0].low, first.high);
+        QCOMPARE(FormatDisplayPrice(reversed[0].high, 6, true), QStringLiteral("≈1.111111111111111111"));
+        QVERIFY(reversed[0].base_volume == first.base_volume); QVERIFY(reversed[0].quote_volume == first.quote_volume);
+        const auto boundary{B3FlowMeshChart::AggregateCandles({trade(std::numeric_limits<uint64_t>::max(), 1, 1)}, 20)};
+        QCOMPARE(boundary.size(), size_t{1}); QCOMPARE(boundary.front().last_sequence, std::numeric_limits<uint64_t>::max());
+    }
+    void candleAggregationRejectsInvalidAmountsAndUndefinedInverseBuckets()
+    {
+        const auto valid{Parse(Data()).history.front()};
+        QVERIFY(B3FlowMeshChart::AggregateCandles({valid}, 0).empty());
+        QVERIFY(B3FlowMeshChart::AggregateCandles({valid, valid}, 5).empty());
+        for (const int kind : {0, 1, 2, 3, 4, 5}) {
+            auto invalid{valid};
+            switch (kind) {
+            case 0: invalid.price = -1; break;
+            case 1: invalid.quantity = 0; break;
+            case 2: invalid.price = MAX_MONEY; invalid.quantity = 2; break;
+            case 3: ++invalid.notional; break;
+            case 4: invalid.fee = -1; break;
+            case 5: invalid.cleared = false; break;
+            }
+            QVERIFY(B3FlowMeshChart::AggregateCandles({invalid}, 5).empty());
+        }
+        auto zero{valid}; zero.sequence = 3; zero.price = zero.notional = zero.fee = 0;
+        auto later{valid}; later.sequence = 9;
+        const std::vector<Trade> history{valid, zero, later};
+        QCOMPARE(B3FlowMeshChart::AggregateCandles(history, 5).size(), size_t{2});
+        const auto inverse{B3FlowMeshChart::AggregateCandles(history, 5, true)};
+        QCOMPARE(inverse.size(), size_t{1}); QCOMPARE(inverse.front().first_sequence, uint64_t{9});
+        // A zero-price low means this entire candle's inverse high is
+        // undefined; dropping only that trade would invent a finite high.
+        QVERIFY(B3FlowMeshChart::AggregateCandles({valid, zero}, 5, true).empty());
+
+        std::vector<Trade> large;
+        for (uint64_t i{0}; i < 20; ++i) { auto t{valid}; t.sequence = i; t.price = 1; t.quantity = t.notional = MAX_MONEY; t.fee = 0; large.push_back(t); }
+        const auto volumes{B3FlowMeshChart::AggregateCandles(large, 20)};
+        QCOMPARE(volumes.size(), size_t{1});
+        QVERIFY(volumes.front().base_volume > static_cast<uint64_t>(std::numeric_limits<CAmount>::max()));
+        QCOMPARE(B3FlowMeshChart::FormatCandleVolume(volumes.front(), 0, false), QStringLiteral("13244000000000000000"));
+        QCOMPARE(B3FlowMeshChart::FormatCandleVolume(volumes.front(), 6, true), QStringLiteral("13244000000"));
+    }
+    void candleIntervalsRetainSnapshotAndRenderGallery()
+    {
+        B3FlowMeshChart chart; chart.resize(900, 420);
+        auto snapshot{Parse(Data())}; snapshot.history.clear(); snapshot.next_sequence = 100;
+        // Deterministic isolated display fixture, never an RPC or wallet feed.
+        const CAmount prices[]{1000, 1080, 960, 1060, 1100, 1100, 1140, 1020, 1040, 1030};
+        for (uint64_t i{0}; i < 60; ++i) {
+            Trade t; t.sequence = i; t.cleared = true; t.price = prices[i % 10] + static_cast<CAmount>(i / 10) * 30;
+            t.quantity = 10'000 + static_cast<CAmount>(i % 7) * 2'000; t.notional = t.price * t.quantity;
+            snapshot.history.push_back(t);
+        }
+        chart.setSnapshot(snapshot); QCOMPARE(chart.candleInterval(), uint64_t{5}); QCOMPARE(chart.candles().size(), size_t{12});
+        chart.setCandleInterval(20); QCOMPARE(chart.candles().size(), size_t{3});
+        const auto retained{chart.candles()};
+        chart.setLoading(true); chart.setStale(true); chart.setSnapshot(snapshot);
+        QVERIFY(chart.candles() == retained); QCOMPARE(chart.candleInterval(), uint64_t{20});
+        chart.setCandleInterval(0); QCOMPARE(chart.candleInterval(), uint64_t{20});
+        chart.setCandleInterval(5); chart.setLoading(false); chart.setStale(false);
+        QImage image{chart.size(), QImage::Format_ARGB32}; image.fill(Qt::transparent);
+        chart.render(&image);
+        bool positive{false}, negative{false};
+        for (int y{0}; y < image.height(); ++y) for (int x{0}; x < image.width(); ++x) {
+            positive |= image.pixelColor(x, y) == B3Theme::kPositive;
+            negative |= image.pixelColor(x, y) == B3Theme::kNegative;
+        }
+        QVERIFY(positive); QVERIFY(negative);
+        // Optional local visual QA export. Test data stays in this test only.
+        const QString gallery{qEnvironmentVariable("B3_FLOWMESH_CHART_GALLERY")};
+        if (!gallery.isEmpty()) {
+            QVERIFY(QDir{}.mkpath(gallery));
+            QVERIFY(image.save(QDir{gallery}.filePath(QStringLiteral("candles-canonical.png"))));
+        }
+        chart.setInverted(true); chart.render(&image);
+        QCOMPARE(chart.candles().front().high, CAmount{960}); QCOMPARE(chart.candles().front().low, CAmount{1100});
+        if (!gallery.isEmpty()) QVERIFY(image.save(QDir{gallery}.filePath(QStringLiteral("candles-inverse.png"))));
+        chart.setMode(B3FlowMeshChart::Mode::Liquidity); chart.render(&image);
+        if (!gallery.isEmpty()) QVERIFY(image.save(QDir{gallery}.filePath(QStringLiteral("candles-depth.png"))));
+        snapshot.remote = true; snapshot.execution_result_verified = false;
+        chart.setSnapshot(snapshot); chart.setMode(B3FlowMeshChart::Mode::Prices); chart.render(&image);
+        if (!gallery.isEmpty()) QVERIFY(image.save(QDir{gallery}.filePath(QStringLiteral("candles-reported.png"))));
+        snapshot.certified = false; chart.setSnapshot(snapshot); QVERIFY(chart.candles().empty());
+    }
+    void renderCapturedEngineOffLiquidity()
+    {
+        const QString capture{qEnvironmentVariable("B3_FLOWMESH_CHART_CAPTURE")};
+        if (capture.isEmpty()) QSKIP("Set B3_FLOWMESH_CHART_CAPTURE to an isolated engine-off public market-data JSON capture.");
+        const QString gallery{qEnvironmentVariable("B3_FLOWMESH_CHART_GALLERY")};
+        QVERIFY2(!gallery.isEmpty(), "Set B3_FLOWMESH_CHART_GALLERY to the output directory.");
+        QFile file{capture};
+        QVERIFY2(file.open(QIODevice::ReadOnly), qPrintable(file.errorString()));
+        QVERIFY(file.size() > 0 && file.size() <= 16 * 1024 * 1024);
+        const QByteArray bytes{file.readAll()};
+        QCOMPARE(file.error(), QFileDevice::NoError);
+        UniValue value;
+        QVERIFY(value.read(bytes.toStdString()));
+        // Use precisely the normal parser and immutable captured provenance.
+        // This does not replay execution or promote remote history to verified.
+        const auto snapshot{Parse(value)};
+        QVERIFY(snapshot.remote); QVERIFY(snapshot.certified);
+        QVERIFY(snapshot.certificate_verified); QVERIFY(snapshot.account_state_verified);
+        QVERIFY(!snapshot.execution_result_verified);
+        QVERIFY(snapshot.units.known); QVERIFY(snapshot.history_available); QVERIFY(snapshot.curves_complete);
+        const auto clearings{std::count_if(snapshot.history.begin(), snapshot.history.end(), [](const auto& trade) { return trade.cleared && trade.quantity > 0; })};
+        QVERIFY(clearings > 0);
+        QVERIFY(std::any_of(snapshot.depth.begin(), snapshot.depth.end(), [](const auto& row) { return row.demand > 0; }));
+        QVERIFY(std::any_of(snapshot.depth.begin(), snapshot.depth.end(), [](const auto& row) { return row.supply > 0; }));
+        B3FlowMeshChart chart; chart.resize(1000, 460); chart.setSnapshot(snapshot);
+        QCOMPARE(chart.pricePointCount(), static_cast<int>(clearings));
+        QVERIFY(!chart.candles().empty());
+        QVERIFY(QDir{}.mkpath(gallery));
+        QImage image{chart.size(), QImage::Format_ARGB32}; image.fill(Qt::transparent);
+        chart.render(&image);
+        QVERIFY(image.save(QDir{gallery}.filePath(QStringLiteral("capture-candles-canonical.png"))));
+        chart.setInverted(true); QVERIFY(!chart.candles().empty()); chart.render(&image);
+        QVERIFY(image.save(QDir{gallery}.filePath(QStringLiteral("capture-candles-inverse.png"))));
+        chart.setMode(B3FlowMeshChart::Mode::Liquidity); chart.render(&image);
+        QVERIFY(image.save(QDir{gallery}.filePath(QStringLiteral("capture-depth.png"))));
+        QVERIFY(snapshot == Parse(value));
+    }
     void walletlessWorkspaceRendersDataButCanNeverSubmit()
     {
         B3FlowMeshTradingPanel panel; panel.resize(1200, 850); panel.m_timer->stop();
@@ -1169,8 +1319,12 @@ private Q_SLOTS:
         auto* prices{panel.findChild<QPushButton*>(QStringLiteral("flowMeshChartPrices"))};
         auto* liquidity{panel.findChild<QPushButton*>(QStringLiteral("flowMeshChartLiquidity"))};
         QVERIFY(prices); QVERIFY(liquidity); QVERIFY(prices->isChecked());
+        auto* interval{panel.findChild<QComboBox*>(QStringLiteral("flowMeshCandleInterval"))}; QVERIFY(interval);
+        interval->setCurrentIndex(2); QCOMPARE(panel.m_chart->candleInterval(), uint64_t{20});
         liquidity->click(); QVERIFY(liquidity->isChecked()); QVERIFY(!prices->isChecked());
+        QVERIFY(!interval->isEnabled());
         prices->click(); QVERIFY(prices->isChecked()); QVERIFY(!liquidity->isChecked());
+        QVERIFY(interval->isEnabled()); QCOMPARE(panel.m_chart->candleInterval(), uint64_t{20});
         QCOMPARE(panel.m_own_view->item(0, 3)->text(), QStringLiteral("0.75 B3"));
         QVERIFY(panel.m_balances->text().contains(QStringLiteral("In orders  0 tUSD · 0.75 B3")));
         panel.m_price->setText(QStringLiteral("1")); panel.m_quantity->setText(QStringLiteral("1")); QVERIFY(panel.m_ticket_total->text().contains(QStringLiteral("1 B3"))); QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_deposit->isEnabled()); QVERIFY(!panel.m_advanced->isVisible());
@@ -1217,6 +1371,12 @@ private Q_SLOTS:
             snapshot.depth.back().price, snapshot.depth.back().supply, snapshot.units.decimals, true));
         QCOMPARE(panel.m_depth_view->item(0, 2)->text(), FormatDepthQuantity(
             snapshot.depth.back().price, snapshot.depth.back().demand, snapshot.units.decimals, true));
+        QCOMPARE(panel.m_depth_view->horizontalHeaderItem(1)->text(), QStringLiteral("Buy liquidity"));
+        QCOMPARE(panel.m_depth_view->horizontalHeaderItem(2)->text(), QStringLiteral("Sell liquidity"));
+        QCOMPARE(panel.m_depth_view->item(0, 1)->foreground().color(), B3Theme::kPositive);
+        QCOMPARE(panel.m_depth_view->item(0, 2)->foreground().color(), B3Theme::kNegative);
+        QVERIFY(panel.m_liquidity_note->text().contains(QStringLiteral("Aggregate curves")));
+        QVERIFY(panel.m_liquidity_note->toolTip().contains(QStringLiteral("do not sum")));
         QCOMPARE(panel.m_history_view->item(0, 3)->text(), QStringLiteral("0"));
         QCOMPARE(panel.m_history_view->item(0, 4)->text(), QStringLiteral("0.25"));
         QVERIFY(panel.m_history_note->text().contains(QStringLiteral("gross B3 before fees")));
