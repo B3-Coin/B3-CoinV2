@@ -685,6 +685,35 @@ private Q_SLOTS:
         QVERIFY(panel.m_snapshot == snapshot); QCOMPARE(unlock.count(), 0);
         QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_confirmation);
     }
+    void futuresTabIsExplicitlyUnavailableAndDoesNotAlterSpot()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, SyntheticLimitBook());
+        auto* products{panel.findChild<QTabWidget*>(QStringLiteral("flowMeshProductTabs"))};
+        auto* futures{panel.findChild<QWidget*>(QStringLiteral("flowMeshFuturesPage"))};
+        auto* status{panel.findChild<QLabel*>(QStringLiteral("flowMeshFuturesStatus"))};
+        QVERIFY(products); QVERIFY(futures); QVERIFY(status);
+        QCOMPARE(products->count(), 2); QCOMPARE(products->tabText(0), QStringLiteral("Spot"));
+        QCOMPARE(products->tabText(1), QStringLiteral("Futures")); QCOMPARE(products->currentIndex(), 0);
+        QCOMPARE(status->text(), QStringLiteral("Not available in this build"));
+        QVERIFY(futures->findChildren<QPushButton*>().empty()); QVERIFY(futures->findChildren<QLineEdit*>().empty());
+        const QString gallery{qEnvironmentVariable("B3_FLOWMESH_CHART_GALLERY")};
+        if (!gallery.isEmpty()) {
+            QVERIFY(QDir::isAbsolutePath(gallery)); QVERIFY(QDir{}.mkpath(gallery));
+            panel.resize(1550, 1100); panel.show(); QCoreApplication::processEvents();
+            QImage image{panel.size(), QImage::Format_ARGB32}; image.fill(Qt::transparent); panel.render(&image);
+            QVERIFY(image.save(QDir{gallery}.filePath(QStringLiteral("synthetic-spot-tab.png"))));
+            products->setCurrentIndex(1); QCoreApplication::processEvents(); panel.render(&image);
+            QVERIFY(image.save(QDir{gallery}.filePath(QStringLiteral("synthetic-futures-tab.png"))));
+            products->setCurrentIndex(0);
+        }
+        panel.m_price->setText(QStringLiteral("1.009")); panel.m_quantity->setText(QStringLiteral("0.25"));
+        const auto snapshot{panel.m_snapshot}; QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        products->setCurrentIndex(1); QCOMPARE(products->currentWidget(), futures);
+        products->setCurrentIndex(0);
+        QCOMPARE(panel.m_price->text(), QStringLiteral("1.009")); QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.25"));
+        QVERIFY(panel.m_snapshot == snapshot); QCOMPARE(unlock.count(), 0);
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_confirmation);
+    }
     void fundingSelectionCannotRelabelAnOrderQuantity()
     {
         B3FlowMeshTrading::Action a; const auto s{Parse(Data())}; a.market.id = s.market; a.market.base = s.base; a.market.account = s.account; a.market.has_account = true;

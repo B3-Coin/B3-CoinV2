@@ -20,6 +20,11 @@ or declaration that native FlowMesh V2 is complete.
   Matching stays a uniform-price auction, not a price-time-priority CLOB.
   The reverse view's B3 amounts are gross equivalents at each limit, not
   fixed-B3 fill promises. Partial books do not claim a complete-market spread.
+- Separate Spot and Futures tabs. Futures is explicitly informational and
+  unavailable in this build: it has no order, unlock or transfer controls.
+  The model's synthetic futures cash transfers do not implement production
+  positions, margin, oracle checks, funding or liquidation. Both spot and
+  futures remain required for the eventual V2 release.
 - [Generated liquidity fixture](flowmesh-regtest-liquidity.md): four generated
   operators, an engine-off HTTPS client, six actual matched clears, then one
   resting bid and ask. No mainnet funds or existing market are used.
