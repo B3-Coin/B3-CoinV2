@@ -20,6 +20,12 @@ not evidence that B3 authorizes their state or that a wallet verifies their proo
 
 ## Required next bounded adapter
 
+Progress: [the read-only regtest bootstrap prerequisite](REGTEST_BOOTSTRAP.md)
+now verifies a pinned existing V1 base against local B3 authority on four real
+operators and an engine-off client. It authorizes neither a protocol cutover
+nor execution, and is not completion of the remaining runtime/store/client
+proof path below. Earlier full V1 regtest trading remains preserved separately.
+
 1. A default-off regtest-only, explicitly versioned experimental protocol
    profile. It must not masquerade as V1 or alter default/mainnet operation.
 2. Bootstrap from a verified regtest B3 state: exact domain, market, parent,

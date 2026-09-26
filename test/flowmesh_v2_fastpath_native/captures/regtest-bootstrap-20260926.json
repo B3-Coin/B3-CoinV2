@@ -1,0 +1,265 @@
+{
+  "all_children_clean": true,
+  "base_asset_id": "e36ce33a1c7908276259d8e5e2ee6693b21f4d550e098a9cd5c78e810c259256",
+  "certificate_sha256": "2a29778efc4f62a115409a49a224d7dc56e26c4ecb0988f019638b5942fa00df",
+  "checks": [
+    {
+      "name": "four operators plus engine-off client agree",
+      "passed": true
+    },
+    {
+      "code": -8,
+      "name": "wrong exact base head",
+      "reason": "P2FV test bootstrap: exact expected market/head does not match the supplied V1 base",
+      "rejected": true
+    },
+    {
+      "code": -8,
+      "name": "wrong market",
+      "reason": "P2FV test bootstrap: exact expected market/head does not match the supplied V1 base",
+      "rejected": true
+    },
+    {
+      "code": -8,
+      "name": "invalid market encoding",
+      "reason": "P2FV test bootstrap: market_id must be an exact nonzero 64-hex string",
+      "rejected": true
+    },
+    {
+      "code": -8,
+      "name": "empty state",
+      "reason": "P2FV test bootstrap: state_hex is empty, malformed, or exceeds its byte bound",
+      "rejected": true
+    },
+    {
+      "code": -8,
+      "name": "altered state",
+      "reason": "P2FV test bootstrap: FlowMesh client state is malformed or has inconsistent accounting",
+      "rejected": true
+    },
+    {
+      "code": -8,
+      "name": "state trailing bytes",
+      "reason": "P2FV test bootstrap: FlowMesh client state does not match the certified root",
+      "rejected": true
+    },
+    {
+      "code": -8,
+      "name": "malformed state hex",
+      "reason": "P2FV test bootstrap: state_hex is empty, malformed, or exceeds its byte bound",
+      "rejected": true
+    },
+    {
+      "code": -8,
+      "name": "oversized state before hex decoding",
+      "reason": "P2FV test bootstrap: state_hex is empty, malformed, or exceeds its byte bound",
+      "rejected": true
+    },
+    {
+      "code": -8,
+      "name": "empty certificate",
+      "reason": "P2FV test bootstrap: certified_payload_hex is empty, malformed, or exceeds its byte bound",
+      "rejected": true
+    },
+    {
+      "code": -8,
+      "name": "altered certificate",
+      "reason": "P2FV test bootstrap: FlowMesh client quorum certificate is invalid",
+      "rejected": true
+    },
+    {
+      "code": -8,
+      "name": "certificate trailing bytes",
+      "reason": "P2FV test bootstrap: FlowMesh client certified entry does not match pinned context",
+      "rejected": true
+    },
+    {
+      "code": -8,
+      "name": "wrong export head",
+      "reason": "P2FV test bootstrap: exact expected market/head does not match the supplied V1 base",
+      "rejected": true
+    },
+    {
+      "code": -8,
+      "name": "engine-off node cannot export engine state",
+      "reason": "P2FV test bootstrap: export requires an existing local FlowMesh service; use verify on an engine-off client",
+      "rejected": true
+    },
+    {
+      "heights_after": [
+        167,
+        167,
+        167,
+        167,
+        167
+      ],
+      "heights_before": [
+        164,
+        164,
+        164,
+        164,
+        164
+      ],
+      "name": "anchored instance unchanged as real B3 advances",
+      "passed": true
+    },
+    {
+      "name": "same engine-off wallet reopens with identical base",
+      "passed": true
+    }
+  ],
+  "children": [
+    {
+      "exit_code": 0,
+      "node": 0,
+      "pid": 74773
+    },
+    {
+      "exit_code": 0,
+      "node": 1,
+      "pid": 74774
+    },
+    {
+      "exit_code": 0,
+      "node": 2,
+      "pid": 74775
+    },
+    {
+      "exit_code": 0,
+      "node": 3,
+      "pid": 74776
+    },
+    {
+      "exit_code": 0,
+      "node": 0,
+      "pid": 74779
+    },
+    {
+      "exit_code": 0,
+      "node": 1,
+      "pid": 74780
+    },
+    {
+      "exit_code": 0,
+      "node": 2,
+      "pid": 74781
+    },
+    {
+      "exit_code": 0,
+      "node": 3,
+      "pid": 74782
+    },
+    {
+      "exit_code": 0,
+      "node": 4,
+      "pid": 74823
+    },
+    {
+      "exit_code": 0,
+      "node": 4,
+      "pid": 74826
+    }
+  ],
+  "complete": true,
+  "harness_exit_code": 0,
+  "latency_qualified": false,
+  "market_id": "2a58e59fc8f73356bc6ce19dcd929781ed0a1e6e33d6535c6dc683e118387361",
+  "new_client_signed_actions": 0,
+  "operator_subversions": [
+    "/B3Hive:1.1.5(testnode0)/",
+    "/B3Hive:1.1.5(testnode1)/",
+    "/B3Hive:1.1.5(testnode2)/",
+    "/B3Hive:1.1.5(testnode3)/"
+  ],
+  "p2fv_recovery_in_node_qualified": false,
+  "p2fv_trading_qualified": false,
+  "profile": "P2FV_REGTEST_BOOTSTRAP_GATE_V1",
+  "qualification": "existing V1-certified base, local B3 authority, engine-off verifier only",
+  "shutdown_logs": [
+    {
+      "node": 0,
+      "shutdown_done_count": 2
+    },
+    {
+      "node": 1,
+      "shutdown_done_count": 2
+    },
+    {
+      "node": 2,
+      "shutdown_done_count": 2
+    },
+    {
+      "node": 3,
+      "shutdown_done_count": 2
+    },
+    {
+      "node": 4,
+      "shutdown_done_count": 2
+    }
+  ],
+  "state_sha256": "fee0f4c7975bc64a9ef60e480d339ec935339c1e194cbd5e4b445e79b2930360",
+  "verified": {
+    "base_asset_id": "e36ce33a1c7908276259d8e5e2ee6693b21f4d550e098a9cd5c78e810c259256",
+    "bindings": [
+      {
+        "proof_of_possession": "92794d6d751c61a37784e4be60ee3f5189ef4d72246b4d4f2ff3e828f6b9768d8c573c4b29e1371940b52fb5e42f92b008668719bb380a389ab4472a8a963ef0cbed772bfe9f77385b7842a29f9f556660efb5ea0195851f3ac6fa8442495fca",
+        "public_key": "b5fb6860dc474e6f2728687e947ec2684359acb5584a782e0a478e38461c92fa5d03b2bf49e323f4bafae81d07d0feb3",
+        "seat_id": "1f0b8e5177ce1fbfb3889e88d0bdb679647b24406adb6edef2f71dbd654be972",
+        "seat_index": 0,
+        "txid": "4301fade020870b913b05626d69d8ce267027b3dc2d8d34f4f9209663cd50207",
+        "vout": 0
+      },
+      {
+        "proof_of_possession": "a2d21e5f1c79dd17950857d3254f73ba7e469c72595114f677e2eb934e61f2ebd36901fd057da53c904292065c4b83dc14b7d259064db6631bc800aa95b01ac090bacd797d15ab9170b51151f54950efbedfa4d311736f5eec774c30dc555605",
+        "public_key": "a4ea6d3c97a2d19c6246330b581c2f38edc73d7bba9af152f86116cf0152ac4daf59ee8fbaf0958b13d8a45a08a856c9",
+        "seat_id": "aed1643bc1216ea293b46d0b2d0bbc91cd54538249049657ec2b4def2a3deb72",
+        "seat_index": 1,
+        "txid": "d376ac2529bfa7ad8d153fae357f79c5c36cb7611ee190547644bfa2c382323a",
+        "vout": 0
+      },
+      {
+        "proof_of_possession": "b294e473a589ef59ad08beb8182a2cb373aa91b728f0337b78223aa751b5a632032a620ca1e275052618d23f69d1a7710a4dc75f48e7197701fff9719360cbb3e7781740b430cb1026d54fe9c1344aa09f51313889f9c11fb6ec0dca2f773724",
+        "public_key": "ad6cfba475acd94e3a28a094103471557c845a6bef647cc86b77573d06e7e6d0e4128497d0d32b73a9b121e57d63a3b8",
+        "seat_id": "2aee4828423115d3ad49791b0bf015213586059bb88bbcf23a37a60a54c43eb2",
+        "seat_index": 2,
+        "txid": "f8b5ed4355a5ab9f9ef249aa790d287fce10e1a42e42140917409385d9ee5915",
+        "vout": 0
+      },
+      {
+        "proof_of_possession": "a37246a7603c0cbbd4b76e1d36d03a198f766d47205deceaef71bbb3543a1890a4986e9a2f7d6810f8809de9b438ceae045e7dfb113e239e167256111d91dc5b89d1ed0ad042e126901cf527ec489a3559c4534543172223a0141597fa42d3e6",
+        "public_key": "aaf8d0a90ce2aee8546a018ca2f16c04a762194e813508daf6e99e0e230028cd118fe51f963680233b17bcbdca87c6e9",
+        "seat_id": "819dc35560bb0339fe62e7fa6c5543a1a7df4ef8c5566626731197c45b139aee",
+        "seat_index": 3,
+        "txid": "38ea670725acfa7010e86033a122a18076df53901c32690892db11fbf188279b",
+        "vout": 0
+      }
+    ],
+    "cutover_authorized": false,
+    "domain": "7938f4d36ac7006563b2bd25baf3f8b138af98755b0c60956b5d804a4205341a",
+    "effect_count": 0,
+    "effect_start": 0,
+    "entry_anchor": {
+      "hash": "6cbdf4820ccee39f066db7fc3570bb97951f874d4a5f0c5aeb3d5ca862740bfa",
+      "height": 133
+    },
+    "epoch": 0,
+    "execution_authorized": false,
+    "execution_config_id": "3ba6eaa614ffa6aeafbcd8f74f21b969b183c51b1be5881e04dcdacb4e7045aa",
+    "genesis": "10d0f5bb6fde880011fd56ea35dddbf9b32da2a7825f5579ac587a7904d6929a",
+    "head": "e249e8cb9d77ae3a3d23df208319eac2b9fdae8c8be72cf6bb2780b50de9581d",
+    "instance": "9f9083d65041eaa6d5346a7e020429c4ee4cc6658f18e543de520fa159300920",
+    "market_id": "2a58e59fc8f73356bc6ce19dcd929781ed0a1e6e33d6535c6dc683e118387361",
+    "next_effect_index": 0,
+    "next_sequence": 1,
+    "profile": "TEST-P2FV-fixed4-views0to2-bootstrap-v1",
+    "seat_anchor": {
+      "hash": "6cbdf4820ccee39f066db7fc3570bb97951f874d4a5f0c5aeb3d5ca862740bfa",
+      "height": 133
+    },
+    "seat_set_hash": "f4d1a32b1ae203ded6f0d7d176408e46914d1832747204dc19215784146e23ba",
+    "sequence": 0,
+    "state_root": "fbfe07565d90459efbc5cfbaad50f6fad707028c56f587816feb19028783b0ec",
+    "vault_id": "2feeb73aeeaa98d76b58aae50aea8415a7dbb1dd245eba48e20fbd02c6ba5941",
+    "version": 1
+  }
+}
