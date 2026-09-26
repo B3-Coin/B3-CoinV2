@@ -216,6 +216,57 @@ during development; both were removed and covered before freezing the fix.
 This does not prove on-screen behavior after installing the successor, a
 completed payout, or continuous service readiness under rapid B3 tips.
 
+### Order-review entry follow-up
+
+The owner next identified a brief disable/re-enable of **Review buy order**.
+Unlike the repaired funding-draft buttons, Review still required immediate
+submission readiness on every 500ms UI update. The previously measured
+3387ms interval between received snapshots crosses its unchanged 3000ms
+freshness limit; a UI update in that interval can disable the button until
+the next snapshot arrives. Reconciliation can independently disable the
+same gate. There is no timestamped native button-transition capture proving
+which condition caused the owner's particular flash.
+
+Opening an order review is now separate from permission to sign. A retained,
+verified wallet/account/market binding and known exact-asset precision keep
+the read-only entry available during temporary refresh/pause conditions.
+Its tooltip explains that availability is not trading readiness. Clicking
+requests one passive market read, or waits for an already-running one, and
+freezes price, quantity, side, orientation, units and identity. An explicit
+saved-request status read does not count as a market read; it is followed
+once by the selected-market read before review can proceed.
+
+Fresh market readiness and balances are required before the ordinary
+Cancel-default approval dialog. Changed inputs or identity, failed/paused
+reads and insufficient funds refuse without unlock or mutation. Fresh
+sequence and balances may be used before approval; the unchanged worker
+preflight rejects sequence changes after approval. The existing uncertainty,
+pending-request, watch-only, wallet-switch and shutdown restrictions remain.
+The three-second threshold, Cancel action, signed instructions and
+certified/no-resubmit records are unchanged. No automatic submission retry
+is introduced.
+
+The before-fix regression failed at the disabled Review entry. The focused
+and affected-legacy run passed 53 checks; the complete workspace suite
+passed **151 checks, zero failures, three opt-in skips**. The guarded-client
+policy suite passed 119 checks. Coverage includes both Buy/Sell orientations,
+an actual 3050ms delayed snapshot, pause/failure/insufficient funds,
+receipt-only chaining, frozen inputs and binding changes, wallet switching,
+shutdown, and zero unlocks or mutations before approval. Reviews are
+cancelled in the synthetic checks; no economic action is required.
+
+Intermediate failures were retained: canonical display text was incorrectly
+expected to use protocol-side names, and a saved-request fixture incorrectly
+returned an empty outbox. Those fixture expectations were corrected without
+weakening account binding. Older stale/pause assertions now separately check
+stable entry and strict `orderReady() == false`; signing checks were not
+removed. A separate bounded read-only review found no concrete defect in
+the new production lifecycle path; this is not a full security audit.
+
+This is a client-entry repair, not continuous network readiness or a fix to
+every possible visible blink. Actual native-installation and owner-visible
+results remain separate from the offscreen synthetic checks.
+
 ### Windows build status
 
 CI run `36261477661` compiled the guarded Windows app and policy test, but

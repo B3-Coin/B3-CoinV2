@@ -84,6 +84,15 @@ private:
             int asset;
         };
         std::optional<FundingContext> funding_context;
+        struct OrderContext {
+            QPointer<WalletModel> wallet;
+            B3FlowMeshTrading::Market market;
+            B3FlowMeshMarketData::Units units;
+            QString price, quantity;
+            int side;
+            bool inverse, needs_market_read;
+        };
+        std::optional<OrderContext> order_context;
     };
     struct DeferredConnect {
         QPointer<WalletModel> wallet;
@@ -107,6 +116,9 @@ private:
     bool depositReady() const;
     bool withdrawalDraftAvailable() const;
     bool withdrawalReady() const;
+    bool orderReviewAvailable() const;
+    bool orderReady() const;
+    void requestOrderReview();
     void begin(B3FlowMeshTrading::Operation operation);
     bool confirm(const QString& text, bool final_transaction);
     void startJob(std::optional<B3FlowMeshTrading::Action> action = std::nullopt,

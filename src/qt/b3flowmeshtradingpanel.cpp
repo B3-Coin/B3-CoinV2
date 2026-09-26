@@ -243,7 +243,7 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         }
         updateMarketText(); if (!m_busy) refresh();
     });
-    connect(m_order, &QPushButton::clicked, this, [this] { begin(Operation::Order); });
+    connect(m_order, &QPushButton::clicked, this, &B3FlowMeshTradingPanel::requestOrderReview);
     connect(m_cancel_order, &QPushButton::clicked, this, [this] { begin(Operation::Cancel); });
     connect(m_deposit, &QPushButton::clicked, this, [this] { openFunding(false); });
     connect(m_admit, &QPushButton::clicked, this, [this] { begin(Operation::Admit); });
@@ -541,6 +541,26 @@ bool B3FlowMeshTradingPanel::withdrawalReady() const
     return withdrawalDraftAvailable() && depositReady();
 }
 
+bool B3FlowMeshTradingPanel::orderReviewAvailable() const
+{
+    return withdrawalDraftAvailable() && m_snapshot->units.known && m_snapshot->units.asset == market()->base;
+}
+
+bool B3FlowMeshTradingPanel::orderReady() const
+{
+    return orderReviewAvailable() && depositReady();
+}
+
+void B3FlowMeshTradingPanel::requestOrderReview()
+{
+    if (!orderReviewAvailable()) return;
+    // The stable entry requests only a read. Approval still requires current
+    // readiness; a paused or failed refresh consumes this intent, not retries it.
+    if (!m_thread) startJob();
+    if (deferReview(Operation::Order))
+        notice(tr("Checking current market readiness for this exact order. Nothing is approved, signed or sent; if the check fails, review again. There is no automatic retry."));
+}
+
 void B3FlowMeshTradingPanel::openFunding(bool withdrawal)
 {
     if (!m_wallet || !m_backend || m_busy || !m_security_warning.isEmpty() || m_uncertain) return;
@@ -601,13 +621,13 @@ void B3FlowMeshTradingPanel::updateControls()
     const bool settlement_ready{selected && m_snapshot && m_snapshot->market == selected->id &&
         !m_read_failed && m_response_age.isValid() && m_response_age.elapsed() <= 3000 &&
         (!m_snapshot->remote || (m_snapshot->certificate_verified && m_snapshot->account_state_verified)) && m_snapshot->running && !m_snapshot->chain_reconciling};
-    const bool known{m_snapshot && selected && m_snapshot->market == selected->id && m_snapshot->units.known && m_snapshot->units.asset == selected->base};
     const bool pending{selected && m_pending_sequence && selected->id == m_pending_market && selected->account == m_pending_account && (m_receipt || selected->sequence <= *m_pending_sequence)};
     m_refresh->setEnabled(idle && !m_thread); m_market->setEnabled(idle); m_orientation->setEnabled(idle);
     for (auto* field : {m_price, m_quantity, m_amount, m_destination, m_deposit_txid, m_deposit_vout}) field->setEnabled(idle);
     m_side->setEnabled(idle); m_asset->setEnabled(idle); m_effect->setEnabled(idle);
     m_buy->setEnabled(idle); m_sell->setEnabled(idle);
-    m_order->setEnabled(ready && known && selected->has_account && !pending); m_cancel_order->setEnabled(ready && selected->has_account && !pending);
+    m_order->setEnabled(orderReviewAvailable()); m_cancel_order->setEnabled(ready && selected->has_account && !pending);
+    m_order->setToolTip(tr("Review first checks fresh market readiness and your certified balance. This button does not mean trading is ready. A failed or paused check signs and sends nothing; there is no automatic retry."));
     m_withdraw->setEnabled(withdrawalDraftAvailable()); m_deposit->setEnabled(depositDraftAvailable());
     m_admit->setEnabled(ready && selected->has_account);
     m_checkpoint->setEnabled(signing && settlement_ready && selected->publish_ready && selected->checkpoint_pending);
@@ -735,6 +755,9 @@ void B3FlowMeshTradingPanel::begin(Operation operation)
     if (!m_wallet || !m_backend || m_busy || m_uncertain || !m_security_warning.isEmpty()) return;
     if (m_thread) { deferReview(operation); return; }
     const auto selected{market()}; if (!selected) return;
+    if (operation == Operation::Order && !orderReady()) {
+        notice(tr("Market status changed or an account request is pending. Nothing was signed or submitted; review the order again when ready.")); return;
+    }
     if (operation == Operation::Deposit && !depositReady()) {
         notice(tr("Market status changed. Nothing was prepared or submitted; reopen the deposit draft when ready.")); return;
     }
@@ -804,9 +827,13 @@ bool B3FlowMeshTradingPanel::deferReview(Operation operation, bool funding)
 {
     const auto selected{market()};
     if (!m_thread || m_busy || !m_wallet || !m_backend || !selected || m_uncertain || !m_security_warning.isEmpty()) return false;
+    if (operation == Operation::Order && !orderReviewAvailable()) return false;
     // Save only an intent to OPEN a review. No action is approved, signed or
     // sent here. Freeze inputs so the pending click cannot change underneath it.
-    m_deferred_review = DeferredReview{operation, funding, m_generation, selected->id, m_effect->currentData(Qt::UserRole + 1).toString(), std::nullopt};
+    m_deferred_review = DeferredReview{operation, funding, m_generation, selected->id, m_effect->currentData(Qt::UserRole + 1).toString(), std::nullopt, std::nullopt};
+    if (operation == Operation::Order)
+        m_deferred_review->order_context = DeferredReview::OrderContext{m_wallet, *selected, m_snapshot->units,
+            m_price->text(), m_quantity->text(), m_side->currentIndex(), inverted(), m_active_result && m_active_result->receipt_only};
     m_busy = true; updateControls(); return true;
 }
 
@@ -817,8 +844,30 @@ void B3FlowMeshTradingPanel::resumeReview()
     m_busy = false; updateControls();
     const auto selected{market()};
     const bool funding_draft{intent.funding && (intent.operation == Operation::Deposit || intent.operation == Operation::Withdraw)};
+    const bool needs_market_read{intent.order_context && intent.order_context->needs_market_read};
     if (intent.generation != m_generation || !selected || intent.market != selected->id ||
-        (m_read_failed && !funding_draft) || m_uncertain || !m_security_warning.isEmpty()) return;
+        (m_read_failed && !funding_draft && !needs_market_read) || m_uncertain || !m_security_warning.isEmpty()) return;
+    if (intent.order_context) {
+        const auto& context{*intent.order_context};
+        // Fresh balances and sequence may advance before approval. Identity,
+        // units and every typed/display input must remain exactly as clicked.
+        if (!orderReviewAvailable() || context.wallet != m_wallet || context.market.id != selected->id ||
+            context.market.base != selected->base || context.market.vault != selected->vault ||
+            context.market.domain != selected->domain || context.market.config != selected->config ||
+            context.market.account != selected->account || context.market.remote != selected->remote ||
+            context.units != m_snapshot->units || context.price != m_price->text() || context.quantity != m_quantity->text() ||
+            context.side != m_side->currentIndex() || context.inverse != inverted()) {
+            notice(tr("The order inputs, asset units or wallet/market binding changed. Review the order again; nothing was signed or submitted.")); return;
+        }
+        if (needs_market_read) {
+            // An explicit saved-receipt check carries no market snapshot.
+            // Follow it once with the ordinary passive read, never an action.
+            startJob();
+            if (!m_thread) return;
+            m_deferred_review = intent; m_deferred_review->order_context->needs_market_read = false;
+            m_busy = true; updateControls(); return;
+        }
+    }
     if (intent.funding_context) {
         try {
             B3FlowMeshTrading::CheckSameMarket(intent.funding_context->market, *selected, false);
@@ -845,7 +894,8 @@ void B3FlowMeshTradingPanel::resumeReview()
     }
     // Re-evaluate freshness/readiness after the read, never approve on the
     // authority of the stale frame in which the click occurred.
-    const bool allowed{!intent.funding && intent.operation == Operation::Deposit ? depositReady() :
+    const bool allowed{intent.operation == Operation::Order ? orderReady() :
+        !intent.funding && intent.operation == Operation::Deposit ? depositReady() :
         !intent.funding && intent.operation == Operation::Withdraw ? withdrawalReady() : button && button->isEnabled()};
     if (!allowed) { notice(tr("Market status changed. Nothing was submitted; review again when ready.")); return; }
     if (intent.funding) openFunding(intent.operation == Operation::Withdraw);

@@ -213,6 +213,7 @@ struct ConnectionProbe {
 // successful cases stop at the first ordinary review, without wallet unlock.
 struct FundingReadProbe {
     UniValue data{RemoteData()};
+    UniValue saved_response;
     bool fail{false}, hold{false}, effects_misc_error{false}, discovery_unproven{false}, checkpoint{false};
     std::string failed_method, held_method;
     std::vector<std::string> methods;
@@ -245,7 +246,8 @@ struct FundingReadProbe {
             return row;
         };
         add("getflowmeshclientinfo", [] { return ConnectionInfo(); });
-        add("listflowmeshactions", [] {
+        add("listflowmeshactions", [this] {
+            if (saved_response.isObject()) return saved_response;
             UniValue saved{UniValue::VOBJ}; saved.pushKV("source", "local-retained-outbox"); saved.pushKV("actions", UniValue{UniValue::VARR}); return saved;
         });
         add("listflowmeshmarkets", [this, market] {
@@ -269,7 +271,7 @@ struct FundingReadProbe {
             return UniValue{UniValue::VARR};
         });
         add("getflowmeshactionstatus", [this]() -> UniValue { ++receipts; throw std::runtime_error{"Synthetic saved status unavailable"}; });
-        for (const auto* method : {"flowmeshdeposit", "submitflowmeshdeposit", "requestflowmeshwithdrawal", "sendrawtransaction", "createflowmeshaccount"})
+        for (const auto* method : {"flowmeshdeposit", "submitflowmeshdeposit", "submitflowmeshorder", "cancelflowmeshorder", "requestflowmeshwithdrawal", "sendrawtransaction", "createflowmeshaccount"})
             add(method, [this]() -> UniValue { ++writes; throw std::runtime_error{"Unexpected mutation in draft test"}; });
     }
     ~FundingReadProbe() { for (const auto& command : commands) tableRPC.removeCommand(command->name, command.get()); }
@@ -1433,7 +1435,7 @@ private Q_SLOTS:
         QCOMPARE(panel.m_chart->pricePointCount(), 1);
         QVERIFY(panel.m_read_failed); QVERIFY(panel.m_market->isEnabled());
         panel.updateMarketText(); QVERIFY(panel.m_status->text().contains(failed->error));
-        QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.m_cancel_order->isEnabled());
+        QVERIFY(panel.m_order->isEnabled()); QVERIFY(!panel.orderReady()); QVERIFY(!panel.m_cancel_order->isEnabled());
         QVERIFY(panel.m_deposit->isEnabled()); QVERIFY(!panel.depositReady()); QVERIFY(!panel.m_admit->isEnabled());
         QVERIFY(panel.m_withdraw->isEnabled()); QVERIFY(!panel.withdrawalReady()); QVERIFY(!panel.m_checkpoint->isEnabled());
         QVERIFY(!panel.m_publish->isEnabled()); QVERIFY(m_wallet->IsLocked());
@@ -1474,7 +1476,7 @@ private Q_SLOTS:
         QCOMPARE(panel.m_market->count(), 1); QCOMPARE(panel.market()->id, original.id);
         QCOMPARE(panel.market()->account, original.account);
         QVERIFY(panel.m_snapshot && *panel.m_snapshot == snapshot);
-        QVERIFY(panel.m_read_failed); QVERIFY(!panel.m_order->isEnabled());
+        QVERIFY(panel.m_read_failed); QVERIFY(panel.m_order->isEnabled()); QVERIFY(!panel.orderReady());
         QVERIFY(!panel.m_catalog_age.isValid()); QVERIFY(m_wallet->IsLocked());
     }
     void connectionControlsDistinguishTransportFromMarketReadiness()
@@ -1498,10 +1500,10 @@ private Q_SLOTS:
         panel.m_read_failed = true; panel.m_read_error = QStringLiteral("FlowMesh client snapshot has no certified head"); panel.updateMarketText();
         QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("HTTPS responded")));
         QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("no certified head")));
-        QVERIFY(panel.m_status->text().contains(panel.m_read_error)); QVERIFY(!panel.m_order->isEnabled());
+        QVERIFY(panel.m_status->text().contains(panel.m_read_error)); QVERIFY(panel.m_order->isEnabled()); QVERIFY(!panel.orderReady());
         panel.m_client_info = ConnectionInfo(); panel.updateControls();
         QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("readiness is shown below")));
-        QVERIFY(!panel.m_order->isEnabled()); // Transport success supplies no certificate.
+        QVERIFY(panel.m_order->isEnabled()); QVERIFY(!panel.orderReady()); // Transport success supplies no fresh certificate.
         panel.m_client_info->pushKV("backend", "local"); panel.m_client_info->pushKV("engine_enabled", true); panel.updateControls();
         QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("Local market engine")));
         QVERIFY(!panel.m_connect->isEnabled()); QVERIFY(!panel.m_endpoint->isEnabled());
@@ -1529,7 +1531,7 @@ private Q_SLOTS:
         QCOMPARE(panel.m_endpoint->text(), QStringLiteral("https://still-typing.invalid"));
         QCOMPARE(panel.m_endpoint->cursorPosition(), cursor);
         QVERIFY(panel.m_snapshot && *panel.m_snapshot == snapshot); QCOMPARE(panel.m_balances->text(), balances);
-        QVERIFY(panel.m_read_failed); QVERIFY(!panel.m_order->isEnabled());
+        QVERIFY(panel.m_read_failed); QVERIFY(panel.m_order->isEnabled()); QVERIFY(!panel.orderReady());
         { std::lock_guard lock{probe.mutex}; QCOMPARE(probe.requests.size(), size_t{1});
           QCOMPARE(probe.requests[0].first, B3AssetTransfer::WalletUri(m_model->getWalletName()));
           QCOMPARE(probe.requests[0].second, std::string{"https://chosen.invalid"}); }
@@ -1565,7 +1567,7 @@ private Q_SLOTS:
         QVERIFY(panel.m_client_info); QVERIFY(panel.m_connection_error.isEmpty());
         QCOMPARE(panel.m_connect_error, QStringLiteral("Synthetic endpoint configuration rejected"));
         panel.updateMarketText(); QVERIFY(panel.m_connection_status->text().contains(panel.m_connect_error));
-        QVERIFY(!panel.m_order->isEnabled()); QVERIFY(m_wallet->IsLocked());
+        QVERIFY(panel.m_order->isEnabled()); QVERIFY(!panel.orderReady()); QVERIFY(m_wallet->IsLocked());
         panel.setWalletModel(nullptr); QVERIFY(panel.m_connect_error.isEmpty());
     }
     void connectionWorkCannotFollowWalletSwitch_data()
@@ -2042,7 +2044,7 @@ private Q_SLOTS:
         QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
         panel.begin(B3FlowMeshTrading::Operation::Order);
         QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_thread); QCOMPARE(unlock.count(), 0);
-        QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("different configured AssetId")));
+        QVERIFY(!panel.orderReady()); QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("Nothing was signed or submitted")));
         QCOMPARE(panel.m_market_data.front().id, snapshot.market);
     }
     void restoredReverseCardsRetainCanonicalInstructionAndMeaning()
@@ -2331,7 +2333,7 @@ private Q_SLOTS:
             QCOMPARE(panel.m_receipt_card->text(), receipt); QCOMPARE(panel.m_balances->text(), balance);
             QCOMPARE(panel.m_history_view->item(0, 1), history_cell);
             QCOMPARE(panel.m_own_view->item(0, 0), own_cell);
-            QCOMPARE(panel.m_order->isEnabled(), !reconciling);
+            QVERIFY(panel.m_order->isEnabled()); QCOMPARE(panel.orderReady(), !reconciling);
             QVERIFY(panel.m_deposit->isEnabled()); QCOMPARE(panel.depositReady(), !reconciling);
             QCOMPARE(panel.m_status->text().contains(QStringLiteral("Reconciling")), reconciling);
         }
@@ -2545,6 +2547,162 @@ private Q_SLOTS:
         QVERIFY(!result->write_attempted); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
     }
 
+    void orderReviewEntryStaysAvailableDuringTemporaryReadinessChanges()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        for (int condition{0}; condition < 5; ++condition) {
+            Observe(panel, Parse(RemoteData()));
+            panel.m_read_failed = false;
+            if (condition < 2) {
+                panel.m_market_data.front().ready = false; panel.m_snapshot->paused = true;
+                panel.m_snapshot->chain_reconciling = condition == 1;
+                panel.m_snapshot->error = QStringLiteral("FlowMesh service is not active at the current B3 tip");
+            } else if (condition == 2) panel.m_response_age.invalidate();
+            else if (condition == 3) panel.m_read_failed = true;
+            else panel.m_snapshot->handoff = true;
+            panel.updateControls();
+            QVERIFY(panel.m_order->isEnabled()); // Entry is read-only; readiness is checked after its fresh read.
+            QVERIFY(!panel.orderReady());
+            QVERIFY(!panel.m_cancel_order->isEnabled()); // Cancel's submission policy is unchanged.
+            QVERIFY(panel.m_price->isEnabled()); QVERIFY(panel.m_quantity->isEnabled());
+            QVERIFY(panel.m_order->toolTip().contains(QStringLiteral("does not mean trading is ready")));
+            bool reviewed{false};
+            QTimer::singleShot(0, &panel, [&] {
+                if (panel.m_confirmation) { reviewed = true; panel.m_confirmation->done(QMessageBox::Cancel); }
+            });
+            panel.begin(B3FlowMeshTrading::Operation::Order); // Internal calls cannot bypass the strict gate.
+            QCoreApplication::processEvents(); QVERIFY(!reviewed);
+        }
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_unlock);
+        QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void orderReviewReadsOnceBeforeApproval_data()
+    {
+        QTest::addColumn<bool>("inverse"); QTest::addColumn<bool>("buy"); QTest::addColumn<int>("outcome");
+        QTest::newRow("canonical buy reuses passive read") << false << true << 0;
+        QTest::newRow("canonical sell") << false << false << 0;
+        QTest::newRow("inverse buy") << true << true << 0;
+        QTest::newRow("inverse sell") << true << false << 0;
+        QTest::newRow("still paused") << false << true << 1;
+        QTest::newRow("read failed") << false << true << 2;
+        QTest::newRow("fresh replacement balance too small") << false << true << 3;
+        QTest::newRow("hard halt") << false << true << 4;
+        QTest::newRow("snapshot older than 3000ms") << false << true << 5;
+        QTest::newRow("unverified account proof") << false << true << 6;
+        QTest::newRow("quorum unavailable") << false << true << 7;
+    }
+    void orderReviewReadsOnceBeforeApproval()
+    {
+        QFETCH(bool, inverse); QFETCH(bool, buy); QFETCH(int, outcome);
+        FundingReadProbe probe; probe.hold = true; probe.fail = outcome == 2;
+        auto account{probe.data["account"]}; account.pushKV("next_sequence", 9); // Refresh before review may advance sequence.
+        if (outcome == 3) {
+            account.pushKV("b3_available_atoms", 0); account.pushKV("b3_reserved_atoms", 0);
+            account.pushKV("curves", UniValue{UniValue::VARR});
+        }
+        probe.data.pushKV("account", account);
+        auto status{probe.data["snapshot"]};
+        if (outcome == 1) { status.pushKV("paused", true); status.pushKV("chain_reconciling", true); }
+        if (outcome == 4) status.pushKV("halt", "invalid-checkpoint");
+        if (outcome == 7) { status.pushKV("active_seats", 3); status.pushKV("quorum_required", 3); }
+        probe.data.pushKV("snapshot", status);
+        if (outcome == 6) { auto proof{probe.data["verification"]}; proof.pushKV("account_state_verified", false); probe.data.pushKV("verification", proof); }
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()), inverse);
+        panel.m_side->setCurrentIndex(buy ? 0 : 1); panel.m_price->setText(inverse ? QStringLiteral("2") : QStringLiteral("0.5"));
+        panel.m_quantity->setText(QStringLiteral("1.25")); panel.m_snapshot->paused = true; panel.m_market_data.front().ready = false;
+        panel.m_catalog_age.start(); panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None; panel.updateControls();
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        QString review; bool cancel_default{false}; QTimer review_guard;
+        connect(&review_guard, &QTimer::timeout, &panel, [&] {
+            if (!panel.m_confirmation) return;
+            review = panel.m_confirmation->text(); cancel_default = panel.m_confirmation->defaultButton() == panel.m_confirmation->button(QMessageBox::Cancel);
+            panel.m_confirmation->done(QMessageBox::Cancel);
+        });
+        review_guard.start(1);
+        const bool reuse{outcome == 0 && !inverse && buy};
+        if (reuse) { panel.startJob(); QVERIFY(probe.entered.tryAcquire(1, 2000)); }
+        QVERIFY(panel.m_order->isEnabled()); panel.m_order->click();
+        QVERIFY(panel.m_thread); QVERIFY(panel.m_deferred_review && panel.m_deferred_review->order_context);
+        QVERIFY(!panel.m_deferred_review->order_context->needs_market_read);
+        QVERIFY(panel.m_active_result && !panel.m_active_result->action && !panel.m_active_result->write_attempted);
+        QVERIFY(!panel.m_price->isEnabled()); QVERIFY(!panel.m_quantity->isEnabled()); QVERIFY(!panel.m_orientation->isEnabled());
+        const auto result{panel.m_active_result}; panel.m_order->click(); panel.requestOrderReview(); // Coalesce, never replace the intent.
+        QCOMPARE(panel.m_active_result, result); QCOMPARE(unlock.count(), 0); QCOMPARE(probe.writes.load(), 0);
+        QVERIFY(review.isEmpty()); QVERIFY(!panel.m_unlock);
+        if (!reuse) QVERIFY(probe.entered.tryAcquire(1, 2000));
+        probe.release.release();
+        if (outcome == 5) { QVERIFY(panel.m_thread->wait(2000)); QTest::qSleep(3050); }
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000); review_guard.stop();
+        QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(probe.catalogs.load(), 0);
+        QCOMPARE(!review.isEmpty(), outcome == 0); QCOMPARE(cancel_default, outcome == 0);
+        if (outcome == 0) {
+            QVERIFY(review.contains(QStringLiteral("1.25 tUSD")));
+            QVERIFY(review.contains(inverse ? CanonicalSide(buy, inverse) : buy ? QStringLiteral("Limit Buy") : QStringLiteral("Limit Sell")));
+            QVERIFY(review.contains(inverse ? QStringLiteral("Executable limit: no %1 than 2").arg(buy ? QStringLiteral("more") : QStringLiteral("less")) : QStringLiteral("at 0.5 B3 / tUSD")));
+            QVERIFY(review.contains(inverse ? QStringLiteral("account sequence: 9") : QStringLiteral("Account sequence: 9")));
+            QVERIFY(review.contains(panel.market()->account)); QCOMPARE(panel.market()->sequence, uint64_t{9});
+            if (inverse) QVERIFY(review.contains(buy ? QStringLiteral("Buy B3") : QStringLiteral("Sell B3")));
+            QVERIFY(panel.orderReady());
+        }
+        if (outcome == 5) { QVERIFY(panel.m_response_age.elapsed() > 3000); QVERIFY(panel.m_order->isEnabled()); QVERIFY(!panel.orderReady()); }
+        if (outcome == 3) QVERIFY(panel.m_log->toPlainText().contains(QStringLiteral("replacement exceeds")));
+        QVERIFY(!panel.m_deferred_review); QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_unlock);
+        QVERIFY(!result->write_attempted); QCOMPARE(probe.writes.load(), 0); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+        panel.resumeReview(); QCoreApplication::processEvents(); QCOMPARE(probe.snapshots.load(), 1); // A consumed intent never retries.
+    }
+    void orderReviewAfterReceiptOnlyNeedsOneMarketRead_data()
+    {
+        QTest::addColumn<int>("outcome");
+        QTest::newRow("ready after failed receipt check") << 0;
+        QTest::newRow("market read fails") << 1;
+        QTest::newRow("wallet switches during chained read") << 2;
+    }
+    void orderReviewAfterReceiptOnlyNeedsOneMarketRead()
+    {
+        QFETCH(int, outcome);
+        FundingReadProbe probe; probe.held_method = "getflowmeshactionstatus"; probe.hold = true; probe.fail = outcome == 1;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        const auto saved{SavedReadFixture(panel)}; // A protected historical row, not a new pending instruction.
+        // A passive refresh must return the same retained local record. An
+        // empty/mismatched outbox correctly disables new reviews.
+        const auto& action{saved.actions.front()};
+        UniValue receipt{UniValue::VOBJ}; receipt.pushKV("market_id", action.market.toStdString());
+        receipt.pushKV("account_id", action.account.toStdString()); receipt.pushKV("action_id", action.receipt.action_id.toStdString()); receipt.pushKV("accepted", false);
+        UniValue row{UniValue::VOBJ}; row.pushKV("market_id", action.market.toStdString()); row.pushKV("domain", action.domain.toStdString());
+        row.pushKV("execution_config_id", action.config.toStdString()); row.pushKV("account_id", action.account.toStdString());
+        row.pushKV("action_id", action.receipt.action_id.toStdString()); row.pushKV("receipt", receipt); row.pushKV("previously_certified", true);
+        row.pushKV("action_type", action.type); row.pushKV("sequence", *action.sequence); row.pushKV("signed_bytes_sha256", action.signed_bytes_sha256.toStdString());
+        row.pushKV("signed_bytes_size", action.signed_bytes_size); row.pushKV("initial_submission_ms", action.initial_submission_ms); row.pushKV("may_have_been_sent", action.may_have_been_sent);
+        UniValue rows{UniValue::VARR}; rows.push_back(row); probe.saved_response = UniValue{UniValue::VOBJ};
+        probe.saved_response.pushKV("source", "local-retained-outbox"); probe.saved_response.pushKV("account_id", saved.account.toStdString()); probe.saved_response.pushKV("actions", rows);
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None;
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        bool reviewed{false}; QTimer review_guard;
+        connect(&review_guard, &QTimer::timeout, &panel, [&] {
+            if (panel.m_confirmation) { reviewed = true; panel.m_confirmation->done(QMessageBox::Cancel); }
+        });
+        review_guard.start(1); panel.requestStatusRead(); QVERIFY(probe.auxiliary_entered.tryAcquire(1, 2000));
+        QVERIFY(panel.m_active_result && panel.m_active_result->receipt_only);
+        panel.m_order->click(); QVERIFY(panel.m_deferred_review && panel.m_deferred_review->order_context);
+        QVERIFY(panel.m_deferred_review->order_context->needs_market_read); QVERIFY(!reviewed); QCOMPARE(probe.snapshots.load(), 0);
+        probe.auxiliary_release.release();
+        QTRY_VERIFY_WITH_TIMEOUT(probe.entered.available() > 0, 2000);
+        QVERIFY(panel.m_active_result && !panel.m_active_result->receipt_only && !panel.m_active_result->action);
+        QVERIFY(panel.m_deferred_review && !panel.m_deferred_review->order_context->needs_market_read);
+        QVERIFY(!reviewed); QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(unlock.count(), 0); QCOMPARE(probe.writes.load(), 0);
+        probe.release.release();
+        if (outcome == 2) panel.setWalletModel(nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000); review_guard.stop();
+        QVERIFY2(reviewed == (outcome == 0), qPrintable(panel.m_log->toPlainText())); QCOMPARE(probe.receipts.load(), 1); QCOMPARE(probe.snapshots.load(), 1);
+        if (outcome != 2) {
+            QCOMPARE(panel.m_saved_actions.actions.size(), saved.actions.size());
+            QCOMPARE(panel.m_saved_actions.actions.front().signed_bytes_sha256, saved.actions.front().signed_bytes_sha256);
+            QVERIFY(panel.m_saved_actions.actions.front().receipt.no_resubmit);
+        }
+        QVERIFY(!panel.m_deferred_review); QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_unlock);
+        QCOMPARE(probe.writes.load(), 0); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+    }
     void backgroundReadKeepsReviewControlsStableAndQueuesOnlyReview()
     {
         B3FlowMeshTradingPanel panel;
@@ -2610,7 +2768,7 @@ private Q_SLOTS:
             panel.m_read_failed = condition == 2;
             panel.updateMarketText();
             QVERIFY(panel.m_deposit->isEnabled());
-            QVERIFY(!panel.m_order->isEnabled()); QVERIFY(panel.m_withdraw->isEnabled()); QVERIFY(!panel.withdrawalReady());
+            QVERIFY(panel.m_order->isEnabled()); QVERIFY(!panel.orderReady()); QVERIFY(panel.m_withdraw->isEnabled()); QVERIFY(!panel.withdrawalReady());
             bool opened{false}, retained{false}, explained{false};
             QTimer::singleShot(0, &panel, [&] {
                 if (!panel.m_funding_dialog) return;
@@ -2635,7 +2793,7 @@ private Q_SLOTS:
             panel.m_snapshot->error = condition < 2 ? QStringLiteral("FlowMesh service is not active at the current B3 tip") : QString{};
             panel.m_response_age.restart(); if (condition == 2) panel.m_response_age.invalidate();
             panel.m_read_failed = condition == 3; panel.updateMarketText();
-            QVERIFY(panel.m_withdraw->isEnabled()); QVERIFY(!panel.m_order->isEnabled());
+            QVERIFY(panel.m_withdraw->isEnabled()); QVERIFY(panel.m_order->isEnabled()); QVERIFY(!panel.orderReady());
             bool opened{false};
             QTimer::singleShot(0, &panel, [&] {
                 if (panel.m_funding_dialog) { opened = true; panel.m_funding_dialog->reject(); }
@@ -2717,17 +2875,17 @@ private Q_SLOTS:
     {
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
         auto saved{SavedReadFixture(panel)};
-        QVERIFY(panel.withdrawalReady()); QVERIFY(!panel.m_retry_receipt->isEnabled()); // Sticky no-resubmit history is not pending.
+        QVERIFY(panel.withdrawalReady()); QVERIFY(panel.orderReady()); QVERIFY(!panel.m_retry_receipt->isEnabled()); // Sticky no-resubmit history is not pending.
         saved.actions[0].receipt.no_resubmit = false; panel.m_saved_actions = saved;
         panel.m_receipt = saved.actions[0].receipt; panel.m_receipt_wallet = panel.m_wallet;
         panel.m_pending_market = saved.actions[0].market; panel.m_pending_account = saved.account; panel.m_pending_sequence = saved.actions[0].sequence;
-        panel.updateControls(); QVERIFY(!panel.m_withdraw->isEnabled());
+        panel.updateControls(); QVERIFY(!panel.m_withdraw->isEnabled()); QVERIFY(!panel.m_order->isEnabled());
         panel.m_uncertain = true; panel.m_uncertain_refreshed = true; panel.m_uncertain_wallet = panel.m_wallet;
         panel.m_uncertain_action_id = saved.actions[0].receipt.action_id; panel.m_uncertain_market = saved.actions[0].market; panel.m_uncertain_account = saved.account;
         QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
         QTimer::singleShot(0, &panel, [&] { if (panel.m_confirmation) panel.m_confirmation->done(QMessageBox::Yes); });
         panel.reviewUncertain(); // Existing explicit acknowledgement, never a signed withdrawal approval.
-        QVERIFY(!panel.m_uncertain); QVERIFY(!panel.m_pending_sequence); QVERIFY(panel.withdrawalReady());
+        QVERIFY(!panel.m_uncertain); QVERIFY(!panel.m_pending_sequence); QVERIFY(panel.withdrawalReady()); QVERIFY(panel.orderReady());
         QCOMPARE(panel.m_saved_actions.actions[0].receipt.state, QStringLiteral("unknown")); QVERIFY(!panel.m_saved_actions.actions[0].receipt.no_resubmit);
         QVERIFY(!panel.m_thread); QVERIFY(!panel.m_unlock); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
     }
@@ -2843,7 +3001,7 @@ private Q_SLOTS:
         QTest::qSleep(3050); // Bounded blocked GUI delivery: do not process the queued finish before the freshness limit.
         QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
         QCOMPARE(panel.m_response_age.msecsSinceReference(), received); QCOMPARE(panel.m_certificate_age.msecsSinceReference(), received); QCOMPARE(panel.m_queue_age.msecsSinceReference(), received);
-        QVERIFY(panel.m_response_age.elapsed() > 3000); QVERIFY(!panel.m_order->isEnabled()); QVERIFY(!panel.depositReady());
+        QVERIFY(panel.m_response_age.elapsed() > 3000); QVERIFY(panel.m_order->isEnabled()); QVERIFY(!panel.orderReady()); QVERIFY(!panel.depositReady());
         QVERIFY(panel.m_status->text().contains(QStringLiteral("Updates delayed"))); QCOMPARE(probe.snapshots.load(), 1); QCOMPARE(probe.writes.load(), 0);
     }
     void obsoleteRefreshCannotAdvanceResetSchedule()
@@ -2972,6 +3130,7 @@ private Q_SLOTS:
             }
             panel.updateControls(); QVERIFY(!panel.m_deposit->isEnabled());
             QVERIFY(!panel.m_withdraw->isEnabled()); panel.openFunding(true); QVERIFY(!panel.m_funding_dialog);
+            QVERIFY(!panel.m_order->isEnabled()); panel.requestOrderReview(); QVERIFY(!panel.m_deferred_review);
             panel.openFunding(false); QVERIFY(!panel.m_funding_dialog); QVERIFY(!panel.m_thread);
         }
         auto watch{MakeOfflineWallet("deposit-watch-only")};
@@ -2980,6 +3139,7 @@ private Q_SLOTS:
         QVERIFY(panel.m_backend->privateKeysDisabled()); panel.updateControls(); QVERIFY(!panel.m_deposit->isEnabled());
         panel.openFunding(false); QVERIFY(!panel.m_funding_dialog); QVERIFY(!panel.m_thread);
         panel.openFunding(true); QVERIFY(!panel.m_withdraw->isEnabled()); QVERIFY(!panel.m_funding_dialog);
+        QVERIFY(!panel.m_order->isEnabled()); panel.requestOrderReview(); QVERIFY(!panel.m_thread);
     }
     void fundingDraftWalletSwitchDiscardsFormAndContinuation()
     {
@@ -3090,7 +3250,9 @@ private Q_SLOTS:
             }
             panel.updateControls();
             QVERIFY(!panel.m_busy); // Not merely disabled by a modal operation.
-            for (auto* button : {panel.m_order, panel.m_cancel_order, panel.m_admit}) QVERIFY(!button->isEnabled());
+            for (auto* button : {panel.m_cancel_order, panel.m_admit}) QVERIFY(!button->isEnabled());
+            QCOMPARE(panel.m_order->isEnabled(), condition == 0 || condition == 1 || condition == 4 || condition == 5);
+            QVERIFY(!panel.orderReady());
             QCOMPARE(panel.m_deposit->isEnabled(), condition == 0 || condition == 1 || condition == 4 || condition == 5);
             QCOMPARE(panel.m_withdraw->isEnabled(), condition == 0 || condition == 1 || condition == 4 || condition == 5);
             QVERIFY(!panel.depositReady()); QVERIFY(!panel.withdrawalReady());
@@ -3108,6 +3270,17 @@ private Q_SLOTS:
         QTest::newRow("generation changed") << 5;
         QTest::newRow("market changed") << 6;
         QTest::newRow("account request still pending") << 7;
+        QTest::newRow("price text changed") << 8;
+        QTest::newRow("quantity text changed") << 9;
+        QTest::newRow("display side changed") << 10;
+        QTest::newRow("orientation changed") << 11;
+        QTest::newRow("asset units changed") << 12;
+        QTest::newRow("configuration changed") << 13;
+        QTest::newRow("account changed") << 14;
+        QTest::newRow("remote provenance changed") << 15;
+        QTest::newRow("vault changed") << 16;
+        QTest::newRow("wallet switched") << 17;
+        QTest::newRow("shutdown") << 18;
     }
     void deferredReviewRequiresSuccessfulUnchangedContext()
     {
@@ -3133,6 +3306,20 @@ private Q_SLOTS:
             panel.m_pending_account = panel.m_snapshot->account;
             panel.m_pending_sequence = panel.m_snapshot->account_sequence;
             break;
+        case 8: panel.m_price->setText(QStringLiteral("1.0")); break; // Even equivalent numeric spelling is frozen.
+        case 9: panel.m_quantity->setText(QStringLiteral("1.0")); break;
+        case 10: panel.m_side->setCurrentIndex(1); break;
+        case 11: { QSignalBlocker blocked{panel.m_orientation}; panel.m_orientation->setCurrentIndex(1); break; }
+        case 12: ++panel.m_snapshot->units.decimals; break;
+        case 13: panel.m_market_data.front().config = panel.m_snapshot->config = QString::fromStdString(H(92).GetHex()); break;
+        case 14: panel.m_market_data.front().account = panel.m_snapshot->account = QString::fromStdString(H(93).GetHex()); break;
+        case 15:
+            panel.m_market_data.front().remote = panel.m_snapshot->remote = true;
+            panel.m_snapshot->certificate_verified = panel.m_snapshot->account_state_verified = true;
+            panel.m_snapshot->endpoint = QStringLiteral("https://changed.invalid"); break;
+        case 16: panel.m_market_data.front().vault = QString::fromStdString(H(94).GetHex()); break;
+        case 17: panel.setWalletModel(nullptr); break;
+        case 18: panel.cancelAndWait(); break;
         }
         // If a regression opens a modal review, dismiss it without approving
         // anything; the explicit assertion then fails without hanging tests.
@@ -3144,7 +3331,9 @@ private Q_SLOTS:
         QVERIFY(!opened); QVERIFY(!panel.m_deferred_review); QVERIFY(!panel.m_confirmation);
         QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_thread); QVERIFY(!panel.m_unlock);
         QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
-        if (condition != 5) QVERIFY(!panel.m_order->isEnabled());
+        if (condition < 8 && condition != 5) QVERIFY(!panel.orderReady());
+        if (condition == 0 || condition == 1 || condition == 4) QVERIFY(panel.m_order->isEnabled());
+        if (condition == 2 || condition == 3 || condition == 6 || condition == 7 || condition >= 17) QVERIFY(!panel.m_order->isEnabled());
     }
     void successfulReadResumesExplicitReviewButNeverApprovesIt()
     {
