@@ -1651,6 +1651,51 @@ private Q_SLOTS:
         if (!gallery.isEmpty()) QVERIFY(image.save(QDir{gallery}.filePath(QStringLiteral("candles-reported.png"))));
         snapshot.certified = false; chart.setSnapshot(snapshot); QVERIFY(chart.candles().empty());
     }
+    void runtimeStatusDoesNotRepaintUnchangedChart()
+    {
+        B3FlowMeshChart chart;
+        chart.resize(640, 340);
+        auto snapshot{Parse(RemoteData())};
+        chart.setSnapshot(snapshot);
+        chart.show();
+        for (int warmup{0}; warmup < 3; ++warmup) QCoreApplication::processEvents();
+        struct Paints final : QObject {
+            int count{0};
+            bool eventFilter(QObject*, QEvent* event) override {
+                if (event->type() == QEvent::Paint) ++count;
+                return false;
+            }
+        } paints;
+        chart.installEventFilter(&paints);
+        const auto candles{chart.candles()};
+        for (int poll{0}; poll < 6; ++poll) {
+            snapshot.chain_reconciling = snapshot.paused = poll % 2 == 0;
+            snapshot.pending_actions = poll;
+            chart.setSnapshot(snapshot);
+            QCoreApplication::processEvents();
+            QCOMPARE(chart.candles(), candles);
+        }
+        // Runtime status is rendered by the panel's status labels. It must not
+        // invalidate the unchanged plot on every B3 tip reconciliation.
+        QCOMPARE(paints.count, 0);
+        const auto changed = [&] {
+            paints.count = 0;
+            chart.setSnapshot(snapshot);
+            QCoreApplication::processEvents();
+            return paints.count > 0;
+        };
+        snapshot.history.front().price += 1;
+        snapshot.history.front().notional = snapshot.history.front().price * snapshot.history.front().quantity;
+        QVERIFY(changed());
+        QVERIFY(chart.candles() != candles);
+        snapshot.execution_result_verified = true; QVERIFY(changed());
+        snapshot.event_gap = true; QVERIFY(changed());
+        snapshot.units.ticker = QStringLiteral("changed"); QVERIFY(changed());
+        snapshot.depth.front().demand += 1; QVERIFY(changed());
+        snapshot.certified = false; QVERIFY(changed()); QVERIFY(chart.candles().empty());
+        paints.count = 0; chart.setStale(true); QCoreApplication::processEvents();
+        QVERIFY(paints.count > 0);
+    }
     void renderCapturedEngineOffLiquidity()
     {
         const QString capture{qEnvironmentVariable("B3_FLOWMESH_CHART_CAPTURE")};
@@ -2163,6 +2208,70 @@ private Q_SLOTS:
         panel.updateDataViews(); QCoreApplication::processEvents();
         QVERIFY(depth_changed.count() > 0); // Real updates are not suppressed.
         QVERIFY(panel.m_depth_view->item(changed_row, 1)->text() != before);
+    }
+    void reconciliationRefreshRetainsInputAndReceipts()
+    {
+        B3FlowMeshTradingPanel panel;
+        AttachOfflineWallet(panel);
+        Observe(panel, Parse(RemoteData()));
+        panel.m_market_data.front().remote = true;
+        SavedReadFixture(panel);
+        panel.resize(1200, 850); panel.show();
+        panel.m_price->setText(QStringLiteral("1.009"));
+        panel.m_quantity->setText(QStringLiteral("0.25"));
+        panel.m_price->setFocus(); panel.m_price->setSelection(2, 2);
+        QCoreApplication::processEvents();
+        QVERIFY(panel.m_price->hasFocus());
+        const QString receipt{panel.m_receipt_card->text()}, balance{panel.m_balances->text()};
+        const auto* history_cell{panel.m_history_view->item(0, 1)};
+        const auto* own_cell{panel.m_own_view->item(0, 0)};
+        const int cursor{panel.m_price->cursorPosition()};
+        QSignalSpy reset{panel.m_history_view->model(), &QAbstractItemModel::modelReset};
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        struct EnabledChanges final : QObject {
+            int count{0};
+            bool eventFilter(QObject*, QEvent* event) override {
+                if (event->type() == QEvent::EnabledChange) ++count;
+                return false;
+            }
+        } enabled_changes;
+        for (QWidget* widget : std::initializer_list<QWidget*>{&panel, panel.m_price, panel.m_quantity,
+                 panel.m_market, panel.m_saved_selector, panel.m_chart}) widget->installEventFilter(&enabled_changes);
+        for (int poll{0}; poll < 6; ++poll) {
+            const bool reconciling{poll % 2 == 0};
+            auto result{std::make_shared<B3FlowMeshTradingPanel::Result>()};
+            result->markets = panel.m_market_data;
+            result->snapshot = panel.m_snapshot;
+            result->snapshot->unchanged = true;
+            result->snapshot->chain_reconciling = result->snapshot->paused = reconciling;
+            result->markets.front().ready = result->markets.front().publish_ready = !reconciling;
+            ReadInFlight(panel);
+            panel.finishJob(result);
+            QCoreApplication::processEvents();
+            QVERIFY2(panel.m_snapshot.has_value(), qPrintable(panel.m_status->text()));
+            QVERIFY2(panel.market().has_value(), qPrintable(panel.m_status->text()));
+            QVERIFY(!panel.m_busy); QVERIFY(!panel.m_thread);
+            QVERIFY(panel.m_price->isEnabled()); QVERIFY(panel.m_quantity->isEnabled());
+            QVERIFY(panel.m_market->isEnabled()); QVERIFY(panel.m_saved_selector->isEnabled());
+            QVERIFY(panel.m_check_receipt->isEnabled()); QVERIFY(panel.m_price->hasFocus());
+            QCOMPARE(panel.m_price->text(), QStringLiteral("1.009"));
+            QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.25"));
+            QCOMPARE(panel.m_price->cursorPosition(), cursor);
+            QCOMPARE(panel.m_price->selectedText(), QStringLiteral("00"));
+            QCOMPARE(panel.m_receipt_card->text(), receipt); QCOMPARE(panel.m_balances->text(), balance);
+            QCOMPARE(panel.m_history_view->item(0, 1), history_cell);
+            QCOMPARE(panel.m_own_view->item(0, 0), own_cell);
+            QCOMPARE(panel.m_order->isEnabled(), !reconciling);
+            QCOMPARE(panel.m_deposit->isEnabled(), !reconciling);
+            QCOMPARE(panel.m_status->text().contains(QStringLiteral("Reconciling")), reconciling);
+        }
+        panel.m_snapshot->halt = QStringLiteral("invalid-checkpoint"); panel.updateMarketText();
+        QVERIFY(!panel.m_order->isEnabled()); QVERIFY(panel.m_status->text().contains(QStringLiteral("halted")));
+        panel.m_response_age.invalidate(); panel.updateMarketText();
+        QVERIFY(!panel.m_deposit->isEnabled()); QVERIFY(panel.m_progress->text().contains(QStringLiteral("stale")));
+        QVERIFY(panel.m_price->isEnabled()); QVERIFY(panel.m_price->hasFocus());
+        QCOMPARE(enabled_changes.count, 0); QCOMPARE(reset.count(), 0); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
+        QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_deferred_review);
     }
     void passiveSavedControlsStayEnabled()
     {

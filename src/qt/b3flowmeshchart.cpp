@@ -11,7 +11,22 @@
 
 using namespace B3FlowMeshMarketData;
 B3FlowMeshChart::B3FlowMeshChart(QWidget* parent) : QWidget{parent} { setMouseTracking(true); setMinimumHeight(280); setObjectName(QStringLiteral("certifiedAuctionChart")); }
-void B3FlowMeshChart::setSnapshot(const std::optional<Snapshot>& s) { if (m_snapshot == s) return; m_snapshot = s; rebuildCandles(); update(); }
+void B3FlowMeshChart::setSnapshot(const std::optional<Snapshot>& s)
+{
+    if (m_snapshot == s) return;
+    const bool same_history{m_snapshot && s && m_snapshot->certified == s->certified &&
+        m_snapshot->history_available == s->history_available && m_snapshot->history == s->history};
+    const bool same_plot{same_history && m_snapshot->units == s->units && m_snapshot->depth == s->depth &&
+        m_snapshot->remote == s->remote && m_snapshot->execution_result_verified == s->execution_result_verified &&
+        m_snapshot->curves_complete == s->curves_complete && m_snapshot->history_truncated == s->history_truncated &&
+        m_snapshot->history_page_partial == s->history_page_partial && m_snapshot->event_gap == s->event_gap};
+    // Keep the latest observation, but runtime-only tip reconciliation and
+    // queue changes belong to the panel's status/action gates. They do not
+    // change chart pixels or require rebuilding the retained auction candles.
+    m_snapshot = s;
+    if (!same_history) rebuildCandles();
+    if (!same_plot) update();
+}
 void B3FlowMeshChart::setMode(Mode mode) { if (m_mode == mode) return; m_mode = mode; update(); }
 void B3FlowMeshChart::setInverted(bool inverted) { if (m_inverted == inverted) return; m_inverted = inverted; rebuildCandles(); update(); }
 void B3FlowMeshChart::setLoading(bool loading) { if (m_loading == loading) return; m_loading = loading; update(); }
