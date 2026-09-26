@@ -57,7 +57,10 @@ SUITES = {
         "test_view_transition_repair.py": 6,
         "test_admission_repair_disk.py": 3,
     }),
-    "coordinator": ("test/flowmesh_v2_coordinator", "test_*.py", 180, {
+    # GitHub run 36168474703 reached its last coordinator test at the old
+    # 180s ceiling (local complete run: 72.895s). Use the same bounded 300s
+    # budget as the other model suites; no test/assertion is omitted.
+    "coordinator": ("test/flowmesh_v2_coordinator", "test_*.py", 300, {
         "test_coordinator.py": 20,
     }),
     "fastpath_research": ("test/flowmesh_v2_fastpath_research", "test_*.py", 180, {
