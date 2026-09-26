@@ -2,8 +2,10 @@
 // Distributed under the MIT software license, see COPYING.
 #include "flowmeshclosedtest_policy.h"
 #include <chainparamsbase.h>
+#include <clientversion.h>
 #include <common/args.h>
 #include <univalue.h>
+#include <util/translation.h>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -21,6 +23,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+
+const TranslateFn G_TRANSLATION_FUN{nullptr};
 
 using namespace FlowMeshClosedTest;
 namespace {
@@ -192,6 +196,12 @@ private Q_SLOTS:
 #ifndef Q_OS_WIN
         ::umask(0077);
 #endif
+    }
+    void standaloneCoreTranslations()
+    {
+        // Exercise the linked core translation path even when the linker
+        // would otherwise discard it, so every platform checks the callback.
+        QVERIFY(LicenseInfo().find("This is experimental software.") != std::string::npos);
     }
     void approvedPublicProfile()
     {
