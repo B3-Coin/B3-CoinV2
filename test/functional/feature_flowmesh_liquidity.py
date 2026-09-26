@@ -14,13 +14,18 @@ the existing bounded manual-review window; the harness never launches Qt.
 """
 
 import hashlib
+import http.client
 import json
+import ssl
+import struct
 import time
 from pathlib import Path
 
 from feature_flowmesh_latency import FlowMeshLatencyTest, PRE_ADMISSION_REJECTIONS
 from feature_flowmesh_release import TEST_ASSET_DEPOSIT
+from flowmesh_public_consistency_analyze import ENTRY_HEADER, ENTRY_TAIL, compact_size, decode_entry_prefix
 from test_framework.authproxy import JSONRPCException
+from test_framework.messages import hash256, ser_string
 from test_framework.test_framework import TestStatus
 from test_framework.util import assert_equal
 
@@ -40,6 +45,56 @@ def cleared_rows(data):
     return sorted(({key: row[key] for key in TRADE_FIELDS}
                    for row in data["history"]["entries"] if row["cleared"]),
                   key=lambda row: row["sequence"])
+
+
+def native_action_entry(receipt, market, domain):
+    """Bind exact semantic membership to the native runtime's certified hash.
+
+    This bounded decoder does not verify BLS; all four native replicas must
+    independently expose the resulting hash as locally verified execution.
+    Reuse the existing public commitment decoder, then check its action root.
+    """
+    prefix = decode_entry_prefix(receipt["certified_payload"])
+    assert_equal((prefix["market_id"], prefix["domain"], prefix["kind"]), (market, domain, 1))
+    assert_equal((prefix["sequence"], prefix["entry_hash"]),
+                 (receipt["microblock_sequence"], receipt["microblock_hash"]))
+    payload = bytes.fromhex(receipt["certified_payload"])
+    entry = payload[4:4 + prefix["entry_bytes"]]
+    count, position = compact_size(entry, ENTRY_HEADER)
+    actions_start, actions_end = position, len(entry) - ENTRY_TAIL
+
+    def take(size):
+        nonlocal position
+        assert position + size <= actions_end, "Truncated native action"
+        value = entry[position:position + size]
+        position += size
+        return value
+
+    ids = []
+    for _ in range(count):
+        identity_prefix = take(41)  # signer, sequence, type
+        points, position = compact_size(entry, position)
+        assert points <= 64
+        curve = take(16 * points)
+        suffix = take(108)  # asset, amount, destination, deposit outpoint
+        credential_size, position = compact_size(entry, position)
+        assert_equal(credential_size, 0)  # Certified bodies exclude credentials.
+        identity = ser_string(b"b3/flowmesh/action/v2") + identity_prefix + struct.pack("<Q", points) + curve + suffix
+        ids.append(hash256(identity)[::-1].hex())
+    assert_equal(position, actions_end)
+    assert_equal(len(set(ids)), len(ids))
+    assert_equal(ids.count(receipt["action_id"]), 1)
+    tag = hashlib.sha256(b"B3/FLOWMESH/ACTIONS/V1").digest()
+    root = hashlib.sha256(tag + tag + struct.pack("<Q", count) + entry[actions_start:actions_end]).digest()
+    assert_equal(root, entry[actions_end:actions_end + 32])
+    # This fixture has exactly four seats; check framing/context, not BLS.
+    certificate = payload[4 + len(entry):]
+    assert_equal(len(certificate), 145)
+    assert_equal(struct.unpack_from(">QQ", certificate), (prefix["epoch"], prefix["sequence"]))
+    assert_equal(certificate[16:48][::-1].hex(), prefix["entry_hash"])
+    assert certificate[48] & 0xf0 == 0 and bin(certificate[48]).count("1") >= 3
+    return {**prefix, "exact_action_membership_checked": True, "actions_root_checked": True,
+            "certificate_authentication": "native replicas, not this Python decoder"}
 
 
 class FlowMeshLiquidityTest(FlowMeshLatencyTest):
@@ -64,7 +119,43 @@ class FlowMeshLiquidityTest(FlowMeshLatencyTest):
                 "bid": {"canonical": "Buy base / Sell B3", "reverse_view": "Sell B3"},
                 "ask": {"canonical": "Sell base / Buy B3", "reverse_view": "Buy B3"}},
             "evidence_scope": "Operator execution plus all-replica certified state/root and history agreement; engine-off client authenticates state/curves but history remains endpoint-reported",
+            "client_action_samples": self.client_results, "native_action_receipts": [],
         }
+
+    def observe_action(self, *args, **kwargs):
+        # Keep the inherited exact-byte retry/verification path and raw report,
+        # but do not print its large timing/trace JSON in this non-latency run.
+        def concise(record):
+            return record.msg != "FLOWMESH_REMOTE_ACTION %s"
+
+        self.log.addFilter(concise)
+        try:
+            sample = super().observe_action(*args, **kwargs)
+        finally:
+            self.log.removeFilter(concise)
+        self.log.info("FLOWMESH_LIQUIDITY_ACTION label=%s action_id=%s state=%s",
+                      sample["label"], sample["action_id"], sample["status"]["receipt_state"])
+        return sample
+
+    def native_action_status(self, market, action_id):
+        # Existing public read-only API, against only this generated node0 and
+        # its generated CA. A deposit has no action signer, so the wallet-owned
+        # status RPC cannot associate its runtime event with a wallet account.
+        connection = http.client.HTTPSConnection("127.0.0.1", self.api_ports[0], timeout=10,
+            context=ssl.create_default_context(cafile=str(self.pki["ca"])))
+        try:
+            connection.request("POST", "/flowmesh/v1", body=json.dumps({"method": "action",
+                "params": {"market_id": market, "action_id": action_id}}),
+                headers={"Content-Type": "application/json"})
+            reply = connection.getresponse()
+            body = reply.read(5 * 1024 * 1024 + 1)
+            assert_equal(reply.status, 200)
+            assert len(body) <= 5 * 1024 * 1024, "Native action response exceeded bound"
+            decoded = json.loads(body)
+            assert_equal(decoded["ok"], True)
+            return decoded["result"]
+        finally:
+            connection.close()
 
     def remember_children(self):
         known = {id(row["process"]) for row in self.child_records}
@@ -153,23 +244,37 @@ class FlowMeshLiquidityTest(FlowMeshLatencyTest):
                 assert_equal(response["sequence"], sequence)
             action_id = response["action_id"]
             status = None
+            native = {"label": label, "action_id": action_id, "initial_response": response,
+                      "source": "generated_operator_native_runtime", "status": None}
+            self.liquidity_report["native_action_receipts"].append(native)
 
             def included():
                 nonlocal status
-                status = node.getflowmeshactionstatus(market, action_id)
+                status = self.native_action_status(market, action_id)
+                native["status"] = status
                 assert_equal(status["action_id"], action_id)
-                assert status["receipt_state"] != "rejected", status
-                # Local backend has no exact-byte retry outbox. Poll this exact
-                # ActionId; timeout is a failure, not a replacement submission.
+                assert status["receipt_state"] in {"queued", "admitted", "unknown", "certified_inclusion"}, status
+                # Poll this exact ActionId. Unknown/timeout cannot authorize a
+                # replacement submission or another deposit.
                 return status["receipt_state"] == "certified_inclusion"
 
             self.wait_until(included, timeout=90, check_interval=.1)
+            native["entry_check"] = native_action_entry(status, market, self.market_data(node, market)["domain"])
             sample = {"label": label, "action_id": action_id, "initial_response": response, "status": status}
         assert_equal(status["certificate_verified"], True)
         assert_equal(status["outcome_verified"], False)
         target = (status["microblock_sequence"], status["microblock_hash"])
-        self.wait_until(lambda: all(self.contains_target(self.market_data(replica, market), *target)
-                                   for replica in self.nodes), timeout=90, check_interval=.1)
+        def applied_everywhere():
+            for replica in self.nodes:
+                data = self.market_data(replica, market)
+                assert_equal(data["verification"]["source"], "local_engine")
+                assert_equal(data["verification"]["certificate_verified"], True)
+                assert_equal(data["verification"]["execution_result_verified"], True)
+                if not self.contains_target(data, *target):
+                    return False
+            return True
+
+        self.wait_until(applied_everywhere, timeout=90, check_interval=.1)
         self.liquidity_report["actions"].append({"actor": "engine_off_buyer" if node is self.client else "operator_seller",
             "label": label, "action_id": sample["action_id"], "account_sequence": sequence,
             "certified_sequence": target[0], "certified_hash": target[1], "applied_replicas": 4})

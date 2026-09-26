@@ -27,6 +27,12 @@ is not a fill: the fixture waits for its exact certified action, all four
 replicas' application, the resulting balances/reservations, and matching
 clearing history. Unknown client outcomes use the original saved ActionId;
 local unknown outcomes are polled and fail on timeout, never silently replaced.
+Local actions use the existing operator's read-only HTTPS receipt endpoint:
+a native deposit deliberately has no signer account, so its runtime event is
+not a wallet-owned status record. The fixture checks the exact ActionId in the
+returned entry, recomputes its action root and entry identity, and binds that
+identity to all four native replicas' verified execution history. BLS validation
+remains native; the Python decoder is not an independent certificate verifier.
 The original bootstrap deposit is identified before mining and consumed by its
 exact certified sweep, not substituted with another pending transaction.
 
