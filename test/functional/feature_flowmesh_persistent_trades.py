@@ -579,12 +579,14 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                 # later ones, and its tracing overhead ends with it.
                 "trace_limits_first_sample": first_capped}
             advanced = [row["bid"]["b3"]["advanced_in_window"] for row in samples]
+            # Over the ask and bid certification loops alike.
             overdue = max(row[key]["b3"]["status_read_max_overdue_ms"] for row in samples for key in ("ask", "bid"))
+            self.trade_report["summary"]["status_read_max_overdue_ms"] = overdue
             self.trade_report["summary"]["b3_during_bid"] = {
                 "windows_with_pump_tick": sum(row["bid"]["b3"]["pump_ticks_in_window"] > 0 for row in samples),
                 "pump_ticks": sum(row["bid"]["b3"]["pump_ticks_in_window"] for row in samples),
                 "windows_with_b3_advance": sum(advanced),
-                "status_read_max_overdue_ms": overdue,
+                "status_read_max_overdue_ms": max(row["bid"]["b3"]["status_read_max_overdue_ms"] for row in samples),
                 "client_certified_with_b3_advance": distribution([row["bid"]["client_certified_ms"]
                     for row, moved in zip(samples, advanced) if moved], 200),
                 "client_certified_without_b3_advance": distribution([row["bid"]["client_certified_ms"]
