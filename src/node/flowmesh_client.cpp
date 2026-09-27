@@ -610,6 +610,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // Per endpoint (index-stable, like m_retry_after), under m_work: the bounded
     // 'action' wait each endpoint last advertised. Zero never sends wait_ms.
     std::vector<std::chrono::milliseconds> m_action_wait;
+    // Per endpoint, under m_work: a lane request to it got no HTTP response.
+    // The lane skips it until EndpointResult records a successful response
+    // from it (an ordinary read or probe), so a silent endpoint costs a
+    // waited call its lane time once, not on every call.
+    std::vector<bool> m_wait_unanswered;
     // Never acquire m_work from a wallet metadata lookup: it covers HTTPS.
     mutable std::mutex m_metadata_mutex;
     FlowMeshAssetMetadataCatalog m_metadata;
@@ -854,7 +859,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             row.retry_after_ms = row.last_attempt_ms + std::chrono::duration_cast<std::chrono::milliseconds>(delay).count();
             m_retry_after[endpoint] = std::chrono::steady_clock::now() + delay;
         }
-        if (error.empty()) m_status.active_endpoint = row.url;
+        if (error.empty()) {
+            m_status.active_endpoint = row.url;
+            m_wait_unanswered.at(endpoint) = false;
+        }
     }
     // Called by the m_work owner right after acquisition. Diagnostics only:
     // shows whether a trade's next step was captured by the gate's linger.
@@ -1479,6 +1487,14 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // means nothing was applied; the caller then takes the ordinary path. A
     // reply applied whose outbox save then failed is returned as the ordinary
     // refresh would return it: unverified, with the failure as its reason.
+    //
+    // Cost: a lane request adds at most wait + CLIENT_REQUEST_TIMEOUT (7.5 s
+    // at the 2.5 s cap) before the ordinary read that may follow it, which
+    // keeps its own c10c952 bound (CLIENT_REQUEST_TIMEOUT per endpoint
+    // attempt). The lane never starts while its endpoint is in transport
+    // cooldown, and a lane request that got no HTTP response keeps the lane
+    // off that endpoint until a successful response from it is recorded, so
+    // an endpoint that goes silent costs that extra time once, not per call.
     std::optional<Receipt> WaitedActionStatus(const uint256& market, const uint256& action, std::chrono::milliseconds requested)
     {
         FlowMeshTimingSpan timing{"client_action_wait"};
@@ -1508,9 +1524,13 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 const auto pins{Pins(p.market)};
                 if (pins.domain != p.domain || pins.execution_config_id != p.config) { outcome("not_eligible"); return std::nullopt; }
             } catch (const std::exception&) { outcome("not_eligible"); return std::nullopt; }
+            endpoint = *p.delivery_endpoint;
+            // Both are only read here: a lane failure starts no transport
+            // cooldown, and only a successful response clears 'unanswered'.
+            if (std::chrono::steady_clock::now() < m_retry_after.at(endpoint)) { outcome("cooldown"); return std::nullopt; }
+            if (m_wait_unanswered.at(endpoint)) { outcome("unanswered"); return std::nullopt; }
             // Exactly one automatic attempt, charged before transport starts.
             if (!m_action_polls.TryChargeAttempt(std::chrono::steady_clock::now())) { outcome("coalesced"); return std::nullopt; }
-            endpoint = *p.delivery_endpoint;
             target = m_endpoints.at(endpoint);
         }
         timing.Field("wait_ms", uint64_t(wait.count()));
@@ -1552,6 +1572,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         timing.Mark("apply_lock_requested_us");
         WorkLock lock{*this};
         timing.Mark("apply_lock_acquired_us");
+        if (!reply.response_received) m_wait_unanswered.at(endpoint) = true;
         if (unsupported) {
             // The endpoint no longer offers the wait (for example after a
             // downgrade). Nothing was applied or resent; wait_ms is sent there
@@ -1630,6 +1651,7 @@ public:
         m_preferred = m_selected;
         m_retry_after.resize(m_endpoints.size());
         m_action_wait.resize(m_endpoints.size());
+        m_wait_unanswered.resize(m_endpoints.size());
         for (const auto& endpoint : m_endpoints) m_status.endpoints.push_back({endpoint.url, false, {}});
         if (!m_endpoints.empty()) m_status.selected_endpoint = m_endpoints[m_selected].url;
         PublishSavedView();
@@ -1659,6 +1681,7 @@ public:
                 m_endpoints.push_back(endpoint); m_saved_endpoints = std::move(saved);
                 m_retry_after.emplace_back();
                 m_action_wait.emplace_back();
+                m_wait_unanswered.push_back(false);
             }
             m_selected = selected; m_preferred = selected; m_retry_after[selected] = {};
             m_https.Reset(); // Explicit connect revalidates existing trust.

@@ -2464,4 +2464,100 @@ BOOST_AUTO_TEST_CASE(lane_certification_whose_outbox_save_fails_is_returned_unve
 #endif
 }
 
+BOOST_AUTO_TEST_CASE(lane_skips_an_endpoint_in_transport_cooldown)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+    validator.plain = validator.submit = validator.waited = Receipt(action, "admitted");
+    validator.waited.pushKV("wait_status", "timeout");
+    auto server{Serve(validator)};
+    const uint16_t port{server->Port()};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(port)}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_REQUIRE_EQUAL(client->ActionStatus(market, action.Id(), true).state, "admitted");
+    BOOST_REQUIRE((validator.Counts() == std::array<unsigned, 4>{1, 0, 1, 1}));
+
+    // The delivering endpoint stops: an ordinary read fails at transport and
+    // starts its 2 s cooldown.
+    server->Stop();
+    server.reset();
+    (void)client->ActionStatus(market, action.Id(), false);
+    BOOST_REQUIRE(!client->Status().endpoints[0].transport_available);
+    BOOST_REQUIRE_EQUAL(client->Status().endpoints[0].consecutive_failures, 1U);
+    // Back within the cooldown: the waited call sends no waited read, only
+    // the ordinary one (which, as in c10c952, ignores read cooldowns).
+    server = Serve(validator, port);
+    std::this_thread::sleep_for(std::chrono::milliseconds{150}); // Refill the automatic read budget.
+    const auto during{client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(during.state, "admitted");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{2, 0, 1, 1}));
+    // That response ended the cooldown, so the next waited call uses the lane.
+    BOOST_REQUIRE(client->Status().endpoints[0].transport_available);
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    (void)client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000});
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{2, 1, 1, 1}));
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(lane_skips_an_endpoint_that_left_it_unanswered_until_it_answers)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint reads, deliverer;
+    for (auto* endpoint : {&reads, &deliverer}) {
+        endpoint->markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+        endpoint->plain = endpoint->submit = endpoint->waited = Receipt(action, "admitted");
+        endpoint->waited.pushKV("wait_status", "timeout");
+    }
+    auto reads_server{Serve(reads)};
+    auto deliverer_server{Serve(deliverer)};
+    const uint16_t deliverer_port{deliverer_server->Port()};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman,
+        {Endpoint(reads_server->Port()), Endpoint(deliverer_port)}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    // Deliver through the second endpoint (learning its advertisement), then
+    // select the first for ordinary reads again.
+    BOOST_REQUIRE_MESSAGE(client->Connect(Endpoint(deliverer_port).url, error), error);
+    BOOST_REQUIRE_EQUAL(client->ActionStatus(market, action.Id(), true).state, "admitted");
+    BOOST_REQUIRE_MESSAGE(client->Connect(Endpoint(reads_server->Port()).url, error), error);
+    BOOST_REQUIRE((deliverer.Counts() == std::array<unsigned, 4>{1, 0, 1, 1}));
+    BOOST_REQUIRE((reads.Counts() == std::array<unsigned, 4>{0, 0, 0, 1}));
+
+    // The delivering endpoint goes silent: the lane gets no response, and
+    // the ordinary read in the same call goes to the selected endpoint.
+    deliverer_server->Stop();
+    deliverer_server.reset();
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    BOOST_CHECK_EQUAL(client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000}).state, "admitted");
+    BOOST_CHECK((reads.Counts() == std::array<unsigned, 4>{1, 0, 0, 1}));
+    // No ordinary request went there, so it is not in transport cooldown.
+    BOOST_REQUIRE_EQUAL(client->Status().endpoints[1].retry_after_ms, 0);
+
+    // Back, but nothing has recorded a successful response from it since:
+    // the waited call does not try the lane there again.
+    deliverer_server = Serve(deliverer, deliverer_port);
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    BOOST_CHECK_EQUAL(client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000}).state, "admitted");
+    BOOST_CHECK((deliverer.Counts() == std::array<unsigned, 4>{1, 0, 1, 1}));
+    BOOST_CHECK((reads.Counts() == std::array<unsigned, 4>{2, 0, 0, 1}));
+
+    // A successful response from it (here an explicit probe) re-enables it.
+    BOOST_REQUIRE_MESSAGE(client->Connect(Endpoint(deliverer_port).url, error), error);
+    BOOST_REQUIRE((deliverer.Counts() == std::array<unsigned, 4>{1, 0, 1, 2}));
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    (void)client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000});
+    BOOST_CHECK((deliverer.Counts() == std::array<unsigned, 4>{1, 1, 1, 2}));
+    client.reset();
+    reads_server->Stop();
+    deliverer_server->Stop();
+}
+
 BOOST_AUTO_TEST_SUITE_END()
