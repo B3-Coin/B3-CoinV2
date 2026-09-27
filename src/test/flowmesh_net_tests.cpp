@@ -948,32 +948,36 @@ BOOST_AUTO_TEST_CASE(queued_frame_is_written_without_waiting_out_the_io_poll)
     BOOST_REQUIRE(Handshake(bulk, address, key, 2));
     BOOST_REQUIRE(Wait([&] { const auto status{server.Snapshot()}; return status.peers.size() == 1 && status.peers[0].authenticated; }));
     node::FlowMeshRuntimeRelay vote; vote.message = Message(Kind::ATTESTATION); vote.peer = server.Snapshot().peers[0].id;
-    // Five sends at each of nine points of the idle worker's 10 ms poll: the
-    // test sleeps 1..9 ms after each receipt, and the worker's poll restarts
-    // right after the write the test just received.
+    // Nothing else signals the worker here (no NotifyIngressReady, no Stop),
+    // so every wake-up it observes comes from a Relay onto an idle queue.
     constexpr uint64_t SAMPLES{45};
     std::vector<std::chrono::microseconds> latencies;
     for (uint64_t i{0}; i < SAMPLES; ++i) {
+        // Wait for a pass that started after the previous frame's wake-up was
+        // consumed: that pass re-armed the wake-up, so this Relay cannot be
+        // absorbed by the previous one. Then send 1..9 ms into the poll.
+        const auto passes{server.WorkerCountsForTest().passes};
+        BOOST_REQUIRE(Wait([&] { return server.WorkerCountsForTest().passes > passes; }));
         std::this_thread::sleep_for(std::chrono::milliseconds{1 + (i * 7) % 9});
         vote.message.header.sequence = i;
+        const auto wakeups{server.WorkerCountsForTest().wakeups};
         const auto start{std::chrono::steady_clock::now()};
         BOOST_REQUIRE(Admitted(server.Relay(vote)));
         const auto received{Receive(live)};
         latencies.push_back(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start));
         BOOST_REQUIRE(received); BOOST_CHECK(*received == vote.message);
+        // The frame must have interrupted the worker's I/O wait. A worker that
+        // is never woken reaches the frame only when its 10 ms poll times out,
+        // and this count then never moves, whatever the host load.
+        BOOST_REQUIRE_MESSAGE(Wait([&] { return server.WorkerCountsForTest().wakeups > wakeups; }),
+            "queued frame " << i << " did not wake the I/O worker");
     }
     std::sort(latencies.begin(), latencies.end());
-    // A worker that waits out its poll writes a frame queued s ms into it
-    // about 10 - s ms later, so at most the two or three latest of the nine
-    // points (about a third of the sends) can arrive within a quarter of the
-    // poll. A woken worker needs a fraction of a millisecond for every send.
-    // Require two thirds: that still fails without the wake-up, and a loaded
-    // host would have to delay a third of all wake-ups by 2.5 ms to fail it.
-    const auto fast{static_cast<size_t>(std::count_if(latencies.begin(), latencies.end(),
-        [](const auto latency) { return latency < 2500us; }))};
-    BOOST_CHECK_MESSAGE(fast * 3 >= SAMPLES * 2, fast << " of " << SAMPLES
-        << " queued frames arrived within 2.5 ms (median " << latencies[SAMPLES / 2].count()
-        << " us, 90th percentile " << latencies[SAMPLES * 9 / 10].count() << " us)");
+    // Timing is only a sanity bound, loose enough for a loaded host: a woken
+    // worker writes in a fraction of a millisecond, so the median queued frame
+    // must still arrive well inside one 10 ms poll.
+    BOOST_CHECK_MESSAGE(latencies[SAMPLES / 2] < 10ms, "median queue-to-receive latency "
+        << latencies[SAMPLES / 2].count() << " us (90th percentile " << latencies[SAMPLES * 9 / 10].count() << " us)");
     BOOST_CHECK(Wait([&] { return server.Snapshot().traffic[0].socket_written == latencies.size(); }));
 }
 

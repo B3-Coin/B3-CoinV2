@@ -273,6 +273,10 @@ struct FlowMeshNetService::Impl {
     std::shared_ptr<Sock> wake_reader;
     std::unique_ptr<Sock> wake_writer;
     std::atomic_bool wake_pending{false};
+    // Test-only worker observation (WorkerCountsForTest): passes started, each
+    // counted after that pass cleared wake_pending, and passes whose wait
+    // returned with the wake-up signal readable.
+    std::atomic<uint64_t> passes_for_test{0}, wakeups_for_test{0};
     std::array<uint64_t, CHANNELS> next_socket{};
     uint64_t next_connection{1};
     flowmesh::WirePeerId next_peer{-2};
@@ -932,6 +936,7 @@ struct FlowMeshNetService::Impl {
                 // this point writes a fresh wake-up byte, and one that admitted
                 // before it is seen by the scan (both take the admission lock).
                 wake_pending.store(false);
+                ++passes_for_test;
                 auto now{Clock::now()}; Clean(); ApplyTargets(); Dial(now);
                 Sock::EventsPerSock wait;
                 if (listener) wait.emplace(listener, Sock::Events{Sock::RECV});
@@ -948,6 +953,7 @@ struct FlowMeshNetService::Impl {
                 if (!wait.begin()->first->WaitMany(IO_WAIT, wait)) throw std::runtime_error{"FlowMesh socket poll failed"};
                 now = Clock::now();
                 if (wake_reader && (wait.at(wake_reader).occurred & Sock::RECV)) {
+                    ++wakeups_for_test;
                     // One bounded read; a leftover byte only costs one more pass.
                     std::array<char, 64> discarded{};
                     (void)wake_reader->Recv(discarded.data(), discarded.size(), 0);
@@ -1234,6 +1240,10 @@ void FlowMeshNetService::NotifyIngressReady()
 {
     m_impl->ingress_ready.fetch_add(1, std::memory_order_release);
     m_impl->Wake();
+}
+FlowMeshNetService::WorkerCounts FlowMeshNetService::WorkerCountsForTest() const
+{
+    return {m_impl->passes_for_test.load(), m_impl->wakeups_for_test.load()};
 }
 FlowMeshNetSnapshot FlowMeshNetService::Snapshot() const
 {
