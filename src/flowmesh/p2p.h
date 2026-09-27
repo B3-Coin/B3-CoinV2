@@ -62,6 +62,13 @@ inline constexpr double FLOWMESH_COMMITTEE_TOKEN_BURST{32.0};
 inline constexpr double FLOWMESH_COMMITTEE_TOKEN_RATE{8.0};
 inline constexpr double FLOWMESH_CONTROL_TOKEN_BURST{64.0};
 inline constexpr double FLOWMESH_CONTROL_TOKEN_RATE{16.0};
+// Committee frames the runtime can prove it would only drop (a slot it has
+// already appended, an exact repeat of verified agreement bytes) take no
+// committee token or queue slot. They spend this separate per-(peer, market)
+// budget instead, so a flood of them is still refused RATE_LIMITED. It is
+// eight times the committee budget; honest star relays stay far below it.
+inline constexpr double FLOWMESH_SETTLED_TOKEN_BURST{256.0};
+inline constexpr double FLOWMESH_SETTLED_TOKEN_RATE{64.0};
 
 enum class WireMessageKind : uint8_t {
     HELLO = 0,
@@ -179,6 +186,12 @@ class BoundedWireQueue
 public:
     QueueResult Push(WirePeerId peer, WireMessage message,
                      WireClock::time_point now = WireClock::now());
+    //! Admission of a frame the caller has proven its worker would only
+    //! drop. Nothing is queued and no committee token is spent: the framing
+    //! verdict is Push's, then one settled-frame token of (peer, market) is
+    //! spent. ACCEPTED means consumed.
+    QueueResult ConsumeSettled(WirePeerId peer, const WireMessage& message,
+                               WireClock::time_point now = WireClock::now());
     std::optional<QueuedWireMessage> Pop();
     void RemovePeer(WirePeerId peer);
 
@@ -198,6 +211,7 @@ private:
         double count_tokens{FLOWMESH_ACTION_TOKEN_COUNT_BURST};
         double byte_tokens{FLOWMESH_ACTION_TOKEN_BYTE_BURST};
         double committee_tokens{FLOWMESH_COMMITTEE_TOKEN_BURST};
+        double settled_tokens{FLOWMESH_SETTLED_TOKEN_BURST};
         WireClock::time_point updated{};
         bool initialized{false};
     };
@@ -209,6 +223,7 @@ private:
 
     using PeerMarket = std::pair<WirePeerId, MarketId>;
 
+    static void Refill(TokenBucket& bucket, WireClock::time_point now);
     bool ConsumeTokens(WirePeerId peer, const WireMessage& message,
                        WireClock::time_point now);
     bool EvictOneLowerPriority(WirePriority higher_than,

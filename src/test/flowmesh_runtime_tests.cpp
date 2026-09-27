@@ -7162,6 +7162,75 @@ BOOST_AUTO_TEST_CASE(certified_slot_committee_frames_do_not_spend_committee_admi
     BOOST_CHECK(f.runtimes[0]->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
 }
 
+// Consumed frames spend no committee token, but a flood of them is still
+// refused: both admission consumptions (exact verified agreement repeats and
+// frames for an already appended slot) draw on the sender's separate
+// settled-frame budget, 256 at once and 64 per second per peer and market.
+// The committee budget and other peers are unaffected.
+BOOST_AUTO_TEST_CASE(settled_slot_frames_spend_a_separate_bounded_budget)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "settled_slot_budget",
+                                 std::chrono::seconds{2}, 1, true};
+    f.block_commits = false;
+    BOOST_REQUIRE(f.StepUntil(1, std::chrono::seconds{10}));
+    f.Tick(); // every worker has retired slot 0's verified agreement bytes
+    BOOST_REQUIRE(!f.links.delivered.empty());
+    const auto sample{f.links.delivered.front()};
+    BOOST_REQUIRE_EQUAL(sample.message.header.sequence, 0U);
+    auto& receiver{*f.runtimes[sample.to]};
+    const auto sender{static_cast<flowmesh::WirePeerId>(sample.from)};
+    const auto snapshot = [&] {
+        const auto snapshots{receiver.DeliverySnapshots(f.market)};
+        BOOST_REQUIRE_EQUAL(snapshots.size(), 1U);
+        return snapshots.front();
+    };
+    const flowmesh::WireHeader applied{sample.message.header};
+    flowmesh::WireHeader current{applied};
+    current.sequence = 1;
+    const uint256 digest{Filled(0x5d)};
+    const auto vote{flowmesh::EncodeProductionAttestationPayload(
+        {1, f.seats.secrets[1].Sign(std::span<const unsigned char>{digest.begin(), 32})})};
+    BOOST_REQUIRE(vote);
+    const flowmesh::WireMessage settled_vote{flowmesh::WireMessageKind::ATTESTATION, applied, *vote};
+    // Let the sender's budgets refill after the slot's own traffic, then
+    // freeze the receiver's clock.
+    f.clocks[sample.to].m_now += std::chrono::seconds{5};
+    const auto before{snapshot()};
+    for (size_t n{0}; n < 200; ++n) {
+        BOOST_REQUIRE(receiver.EnqueueWireMessage(sender, sample.message) == flowmesh::QueueResult::ACCEPTED);
+    }
+    for (size_t n{0}; n < 56; ++n) {
+        BOOST_REQUIRE(receiver.EnqueueWireMessage(sender, settled_vote) == flowmesh::QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(receiver.EnqueueWireMessage(sender, sample.message) == flowmesh::QueueResult::RATE_LIMITED);
+    BOOST_CHECK(receiver.EnqueueWireMessage(sender, settled_vote) == flowmesh::QueueResult::RATE_LIMITED);
+    // The framing verdict still comes first.
+    BOOST_CHECK(receiver.EnqueueWireMessage(sender, {flowmesh::WireMessageKind::ATTESTATION, applied,
+                    std::vector<unsigned char>(vote->begin(), vote->end() - 1)}) == flowmesh::QueueResult::MALFORMED);
+    // The committee budget is separate: the current slot is still admitted.
+    BOOST_CHECK(receiver.EnqueueWireMessage(sender, {flowmesh::WireMessageKind::ATTESTATION, current, *vote}) ==
+                flowmesh::QueueResult::ACCEPTED);
+    // Another peer has a settled-frame budget of its own.
+    BOOST_CHECK(receiver.EnqueueWireMessage(sender + 100, settled_vote) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    auto after{snapshot()};
+    BOOST_CHECK_EQUAL(after.agreement_duplicates_coalesced, before.agreement_duplicates_coalesced + 200);
+    BOOST_CHECK_EQUAL(after.certified_slot_frames_consumed, before.certified_slot_frames_consumed + 57);
+    BOOST_CHECK_EQUAL(after.settled_frames_rate_limited, before.settled_frames_rate_limited + 2);
+
+    // One second refills 64 frames' worth.
+    f.clocks[sample.to].m_now += std::chrono::seconds{1};
+    for (size_t n{0}; n < 64; ++n) {
+        BOOST_REQUIRE(receiver.EnqueueWireMessage(sender, settled_vote) == flowmesh::QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(receiver.EnqueueWireMessage(sender, settled_vote) == flowmesh::QueueResult::RATE_LIMITED);
+    f.Drain();
+    after = snapshot();
+    BOOST_CHECK_EQUAL(after.certified_slot_frames_consumed, before.certified_slot_frames_consumed + 57 + 64);
+    BOOST_CHECK_EQUAL(after.settled_frames_rate_limited, before.settled_frames_rate_limited + 3);
+    BOOST_CHECK(receiver.MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+}
+
 BOOST_AUTO_TEST_CASE(preagreement_certified_duplicate_stays_quiet_after_backoff_expires)
 {
     PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_duplicate_old_slot",

@@ -343,11 +343,8 @@ bool DecodeCatchupRequest(const std::span<const unsigned char> payload,
            max_bytes > 0 && max_bytes <= FLOWMESH_CATCHUP_MAX_BYTES;
 }
 
-bool BoundedWireQueue::ConsumeTokens(const WirePeerId peer,
-                                     const WireMessage& message,
-                                     const WireClock::time_point now)
+void BoundedWireQueue::Refill(TokenBucket& bucket, const WireClock::time_point now)
 {
-    TokenBucket& bucket{m_tokens[{peer, message.header.market_id}]};
     if (!bucket.initialized) {
         bucket.updated = now;
         bucket.initialized = true;
@@ -363,8 +360,19 @@ bool BoundedWireQueue::ConsumeTokens(const WirePeerId peer,
         bucket.committee_tokens = std::min(
             FLOWMESH_COMMITTEE_TOKEN_BURST,
             bucket.committee_tokens + seconds * FLOWMESH_COMMITTEE_TOKEN_RATE);
+        bucket.settled_tokens = std::min(
+            FLOWMESH_SETTLED_TOKEN_BURST,
+            bucket.settled_tokens + seconds * FLOWMESH_SETTLED_TOKEN_RATE);
         bucket.updated = now;
     }
+}
+
+bool BoundedWireQueue::ConsumeTokens(const WirePeerId peer,
+                                     const WireMessage& message,
+                                     const WireClock::time_point now)
+{
+    TokenBucket& bucket{m_tokens[{peer, message.header.market_id}]};
+    Refill(bucket, now);
     if (message.kind == WireMessageKind::ACTION) {
         if (bucket.count_tokens < 1.0 ||
             bucket.byte_tokens < static_cast<double>(message.MemoryUsage())) {
@@ -518,6 +526,22 @@ QueueResult BoundedWireQueue::Push(const WirePeerId peer, WireMessage message,
     QueuedWireMessage item{peer, std::move(message)};
     AccountAdd(item);
     m_lanes[static_cast<size_t>(priority)].push_back(std::move(item));
+    return QueueResult::ACCEPTED;
+}
+
+QueueResult BoundedWireQueue::ConsumeSettled(const WirePeerId peer, const WireMessage& message,
+                                             const WireClock::time_point now)
+{
+    // Framing first, exactly as Push: a malformed frame still disconnects
+    // its sender whether or not its budget is spent.
+    WireCheck check;
+    if (!CheckWireMessage(message, check)) return QueueResult::MALFORMED;
+    // Same (peer, market) key as Push, so the caller's admitted-market check
+    // bounds this map as it bounds Push's, and RemovePeer resets it.
+    TokenBucket& bucket{m_tokens[{peer, message.header.market_id}]};
+    Refill(bucket, now);
+    if (bucket.settled_tokens < 1.0) return QueueResult::RATE_LIMITED;
+    bucket.settled_tokens -= 1.0;
     return QueueResult::ACCEPTED;
 }
 

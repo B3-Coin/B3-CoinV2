@@ -221,6 +221,10 @@ struct FlowMeshRuntimeDeliverySnapshot {
     // appended, and exact entry copies of its recent appends, consumed at
     // admission without a committee token, queue slot or handler pass.
     uint64_t certified_slot_frames_consumed{0};
+    // Frames of either kind above refused RATE_LIMITED because their sender
+    // spent its separate budget for consumed frames. Honest relays stay far
+    // below that budget; a non-zero value points at a flooding peer.
+    uint64_t settled_frames_rate_limited{0};
     size_t pending_objects{0}, pending_bytes{0};
     size_t deferred_objects{0}, deferred_bytes{0};
     std::string current_reason;
@@ -652,6 +656,9 @@ private:
         uint64_t consumed{0};
     };
     std::map<flowmesh::MarketId, CertifiedAdmission> m_certified_admission;
+    //! Admitted markets only; guarded by m_queue_mutex. Diagnostic count of
+    //! frames refused because their sender's settled-frame budget was spent.
+    std::map<flowmesh::MarketId, uint64_t> m_settled_rate_limited;
     void NoteCertifiedAdmission(const flowmesh::WireHeader& header, const uint256& entry_bytes_hash,
                                 uint64_t next_sequence);
     //! Negotiated connections only, capped independently of incoming hints.

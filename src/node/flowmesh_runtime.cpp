@@ -693,7 +693,9 @@ struct WorkerTrace {
     // coalesced: an exact repeat of verified AGREEMENT bytes consumed at
     // admission. certified_slot_consumed: a committee frame for a slot this
     // worker has already appended, consumed at admission. Neither is queued.
-    bool coalesced{false}, certified_slot_consumed{false};
+    // settled_rate_limited: either kind refused because the sender's
+    // separate budget for consumed frames is empty.
+    bool coalesced{false}, certified_slot_consumed{false}, settled_rate_limited{false};
     bool delivery_completion{false}, predicate_ready_before_wait{false};
     std::optional<flowmesh::WireHeader> header;
     flowmesh::WireMessageKind kind{flowmesh::WireMessageKind::ACTION};
@@ -756,6 +758,7 @@ struct WorkerTrace {
             row.pushKV("tick_pending", tick_pending);
             row.pushKV("coalesced", coalesced);
             row.pushKV("certified_slot_consumed", certified_slot_consumed);
+            row.pushKV("settled_rate_limited", settled_rate_limited);
             row.pushKV("delivery_completion", delivery_completion);
             if (header) {
                 row.pushKV("market_id", header->market_id.GetHex());
@@ -2453,11 +2456,12 @@ std::vector<FlowMeshRuntimeDeliverySnapshot> FlowMeshRuntime::DeliverySnapshots(
 {
     // Start() takes the queue lock before the market lock; never nest them
     // in the opposite order here.
-    std::map<flowmesh::MarketId, uint64_t> coalesced, consumed;
+    std::map<flowmesh::MarketId, uint64_t> coalesced, consumed, settled_limited;
     {
         std::lock_guard<std::mutex> queue_lock{m_queue_mutex};
         for (const auto& [id, quiet] : m_agreement_quiet) coalesced.emplace(id, quiet.coalesced);
         for (const auto& [id, certified] : m_certified_admission) consumed.emplace(id, certified.consumed);
+        settled_limited = m_settled_rate_limited;
     }
     FlowMeshTimingSpan timing_lock_2250{__func__};
     timing_lock_2250.Field("lock_name", std::string{"market_mutex"});
@@ -2474,6 +2478,9 @@ std::vector<FlowMeshRuntimeDeliverySnapshot> FlowMeshRuntime::DeliverySnapshots(
         }
         if (const auto count{consumed.find(id)}; count != consumed.end()) {
             out.back().certified_slot_frames_consumed = count->second;
+        }
+        if (const auto count{settled_limited.find(id)}; count != settled_limited.end()) {
+            out.back().settled_frames_rate_limited = count->second;
         }
         out.back().sampled_monotonic_us = TraceNow(*market->clock);
         out.back().trace_global_bytes = g_runtime_trace_bytes.load(std::memory_order_relaxed);
@@ -2986,6 +2993,7 @@ bool FlowMeshRuntime::Start(std::string& error)
         if (!InitializeMarkets(error)) return false;
         m_admitted_markets.clear();
         m_certified_admission.clear();
+        m_settled_rate_limited.clear();
         m_probe_markets.clear();
         m_peer_probe_cursors.clear();
         m_evidence_retry_budget = {};
@@ -3098,6 +3106,26 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     if (m_admitted_markets.count(message.header.market_id) == 0) {
         return flowmesh::QueueResult::MARKET_LIMIT;
     }
+    // Both consumptions below take no committee token or queue slot, but
+    // still spend the sender's separate settled-frame budget (256 burst,
+    // 64/s per peer and market; BoundedWireQueue::ConsumeSettled) after the
+    // unchanged framing verdict. When it is empty the frame is refused
+    // RATE_LIMITED, as a committee frame is: FMN2 then holds that sender's
+    // critical channel and stops reading it, and legacy B3 carriage refuses
+    // the frame. So a flood of settled-slot frames is bounded per peer, not
+    // only by the FMN2 receive budget (256 critical frames/s, 4 MiB/s per
+    // connection), which unauthenticated legacy/dual B3 ingress lacks.
+    // Honest star relays stay far below the budget (measured: at most 27 per
+    // peer and market in any second, 82 in any five seconds).
+    const auto consume_settled = [&] { // Caller holds m_queue_mutex.
+        const auto result{m_queue.ConsumeSettled(peer, message, m_config.clock->Now())};
+        if (result == flowmesh::QueueResult::RATE_LIMITED) ++m_settled_rate_limited[message.header.market_id];
+        if (trace.enabled) {
+            trace.result = result;
+            trace.settled_rate_limited = result == flowmesh::QueueResult::RATE_LIMITED;
+        }
+        return result;
+    };
     // The agreement engine already verified and retained these exact bytes.
     // Another copy can add no vote or proof, but it used to spend one of the
     // sender's eight committee admissions per second and, once refused, hold
@@ -3116,12 +3144,12 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
                 if (message.header != known->second.header) return flowmesh::QueueResult::MALFORMED;
                 if (known->second.header.sequence < quiet->second.sequence ||
                     m_config.clock->Now() < known->second.until) {
-                    ++quiet->second.coalesced;
-                    if (trace.enabled) {
-                        trace.result = flowmesh::QueueResult::ACCEPTED;
-                        trace.coalesced = true;
+                    const auto result{consume_settled()};
+                    if (result == flowmesh::QueueResult::ACCEPTED) {
+                        ++quiet->second.coalesced;
+                        if (trace.enabled) trace.coalesced = true;
                     }
-                    return flowmesh::QueueResult::ACCEPTED;
+                    return result;
                 }
             }
         }
@@ -3134,13 +3162,13 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     // already-durable duplicate HandleCertificate ignores. They still spent
     // the sender's eight committee admissions per second first and, once
     // refused, held that sender's critical channel (100 ms..1 s backoff) in
-    // front of its next slot's proposal and votes. Consume them here. Nothing
-    // is queued or processed for them, so no work bound moves; the framing
-    // verdict is unchanged, so a malformed frame still disconnects its sender.
-    // Every frame at or above the durably appended sequence, and every older
-    // certificate that is not byte-identical to a recorded append
-    // (CERTIFICATE_CONFLICT detection), still spends a committee token and
-    // takes the verified path.
+    // front of its next slot's proposal and votes. Consume them here, against
+    // the settled-frame budget above. Nothing is queued or processed for
+    // them; the framing verdict is unchanged, so a malformed frame still
+    // disconnects its sender. Every frame at or above the durably appended
+    // sequence, and every older certificate that is not byte-identical to a
+    // recorded append (CERTIFICATE_CONFLICT detection), still spends a
+    // committee token and takes the verified path.
     //
     // Cheap checks first, under the lock: a recorded append for this market,
     // a sequence below the next one to append and, for a CERTIFICATE, a
@@ -3176,14 +3204,12 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
         settled = settled_slot();
     }
     if (settled == Settled::YES) {
-        flowmesh::WireCheck check;
-        if (!flowmesh::CheckWireMessage(message, check)) return flowmesh::QueueResult::MALFORMED;
-        ++m_certified_admission.at(message.header.market_id).consumed;
-        if (trace.enabled) {
-            trace.result = flowmesh::QueueResult::ACCEPTED;
-            trace.certified_slot_consumed = true;
+        const auto result{consume_settled()};
+        if (result == flowmesh::QueueResult::ACCEPTED) {
+            ++m_certified_admission.at(message.header.market_id).consumed;
+            if (trace.enabled) trace.certified_slot_consumed = true;
         }
-        return flowmesh::QueueResult::ACCEPTED;
+        return result;
     }
     if (trace.enabled) trace.enqueue_started_us = TraceNow(*m_config.clock);
     const auto result{m_queue.Push(peer, std::move(message),

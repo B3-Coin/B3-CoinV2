@@ -240,6 +240,51 @@ BOOST_AUTO_TEST_CASE(priority_lanes_protect_certificates_and_enforce_rate_limits
                 QueueResult::ACCEPTED);
 }
 
+// Frames the runtime proves its worker would only drop take no committee
+// token or queue slot, but a separate, generous per-(peer, market) budget
+// still bounds them, after the unchanged framing verdict.
+BOOST_AUTO_TEST_CASE(settled_frames_spend_a_separate_bounded_budget)
+{
+    using namespace flowmesh;
+    BoundedWireQueue queue;
+    const auto now{WireClock::time_point{std::chrono::seconds{400}}};
+    const auto vote{Message(WireMessageKind::ATTESTATION)};
+    auto truncated{vote};
+    truncated.payload.pop_back();
+    BOOST_CHECK(queue.ConsumeSettled(3, truncated, now) == QueueResult::MALFORMED);
+    for (size_t i{0}; i < static_cast<size_t>(FLOWMESH_SETTLED_TOKEN_BURST); ++i) {
+        BOOST_REQUIRE(queue.ConsumeSettled(3, i % 2 ? vote : Message(WireMessageKind::AGREEMENT), now) ==
+                      QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(queue.ConsumeSettled(3, vote, now) == QueueResult::RATE_LIMITED);
+    BOOST_CHECK(queue.ConsumeSettled(3, truncated, now) == QueueResult::MALFORMED);
+    BOOST_CHECK(queue.Empty());
+
+    // The committee budget is untouched and still bounds queued frames.
+    for (size_t i{0}; i < static_cast<size_t>(FLOWMESH_COMMITTEE_TOKEN_BURST); ++i) {
+        BOOST_REQUIRE(queue.Push(3, vote, now) == QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(queue.Push(3, vote, now) == QueueResult::RATE_LIMITED);
+
+    // Other peers and markets have budgets of their own.
+    BOOST_CHECK(queue.ConsumeSettled(4, vote, now) == QueueResult::ACCEPTED);
+    auto other_market{vote};
+    other_market.header.market_id.begin()[1] = 7;
+    BOOST_CHECK(queue.ConsumeSettled(3, other_market, now) == QueueResult::ACCEPTED);
+
+    // It refills at its own rate, not the committee rate.
+    const auto later{now + std::chrono::seconds{1}};
+    for (size_t i{0}; i < static_cast<size_t>(FLOWMESH_SETTLED_TOKEN_RATE); ++i) {
+        BOOST_REQUIRE(queue.ConsumeSettled(3, vote, later) == QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(queue.ConsumeSettled(3, vote, later) == QueueResult::RATE_LIMITED);
+
+    // A disconnect resets it with the peer's other buckets.
+    queue.RemovePeer(3);
+    BOOST_CHECK(queue.Empty());
+    BOOST_CHECK(queue.ConsumeSettled(3, vote, later) == QueueResult::ACCEPTED);
+}
+
 BOOST_AUTO_TEST_CASE(lower_priority_work_is_evicted_but_b3_has_no_dependency)
 {
     using namespace flowmesh;
