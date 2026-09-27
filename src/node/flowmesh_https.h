@@ -132,6 +132,9 @@ private:
     // Test-only observation, configured before Start. Called after cleanup;
     // cannot change its byte budgets, deadline, admission or dispatch rules.
     bool SetRejectedCleanupObserverForTest(std::function<void(size_t, size_t)> observer);
+    // Test-only observation, configured before Start. Reports the read-back
+    // TCP_NODELAY state once per admitted connection, before its handshake.
+    bool SetConnectionObserverForTest(std::function<void(bool tcp_nodelay)> observer);
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };

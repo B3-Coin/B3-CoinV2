@@ -873,6 +873,7 @@ struct FlowMeshHttpsServer::Impl {
         Clock::time_point idle_deadline;
         uint64_t enqueued_us{0};
         size_t requests{0};
+        bool tcp_nodelay{false};
 
         Connection(std::atomic<size_t>& total, std::shared_ptr<Sock> sock, std::string address,
                    Clock::time_point accepted, const Options& options)
@@ -910,6 +911,8 @@ struct FlowMeshHttpsServer::Impl {
     // Empty in production. Test observation occurs only after immutable
     // cleanup has completed; it cannot alter the operation being measured.
     std::function<void(size_t, size_t)> rejected_cleanup_observer;
+    // Empty in production. Reads back socket options only, after they are set.
+    std::function<void(bool)> connection_observer;
 
     Impl(Options opts, Handler fn) : options{std::move(opts)}, handler{std::move(fn)} {}
 
@@ -936,6 +939,17 @@ struct FlowMeshHttpsServer::Impl {
         if (stopping.load() || Clock::now() >= pending.deadline) return false;
         const bool first{!pending.ssl};
         if (first) {
+            // Latency only, never a trust or admission condition: replies are
+            // whole TLS records, and with Nagle a record's tail waits for the
+            // peer's (delayed) ACK. Admitted API sockets only; ConfigureSocket
+            // also configures the listener and the AF_UNIX wake sockets.
+            const int one{1};
+            pending.tcp_nodelay = pending.socket->SetSockOpt(IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0;
+            if (connection_observer) {
+                int value{0};
+                socklen_t size{sizeof(value)};
+                connection_observer(pending.socket->GetSockOpt(IPPROTO_TCP, TCP_NODELAY, &value, &size) == 0 && value != 0);
+            }
             pending.ssl.reset(SSL_new(context.get()));
             const BIO_METHOD* method{SocketBioMethod()};
             if (!pending.ssl || !method) return false;
@@ -944,6 +958,7 @@ struct FlowMeshHttpsServer::Impl {
             BIO_set_data(bio, &pending.socket_bio);
             SSL_set_bio(pending.ssl.get(), bio, bio);
         }
+        timing.Field("tcp_nodelay", uint64_t{pending.tcp_nodelay});
         TlsIo io{pending.ssl.get(), *pending.socket, stopping, pending.deadline};
         if (first) {
             if (!io.Handshake()) return false;
@@ -1098,6 +1113,14 @@ bool FlowMeshHttpsServer::SetRejectedCleanupObserverForTest(std::function<void(s
     // replace an observer while a worker can be executing it.
     if (!m_impl->stopping.load() || !m_impl->workers.empty() || m_impl->accept_thread.joinable()) return false;
     m_impl->rejected_cleanup_observer = std::move(observer);
+    return true;
+}
+
+bool FlowMeshHttpsServer::SetConnectionObserverForTest(std::function<void(bool)> observer)
+{
+    // Same externally serialized, stopped-only rule as the cleanup observer.
+    if (!m_impl->stopping.load() || !m_impl->workers.empty() || m_impl->accept_thread.joinable()) return false;
+    m_impl->connection_observer = std::move(observer);
     return true;
 }
 

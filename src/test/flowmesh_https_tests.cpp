@@ -44,6 +44,10 @@ struct FlowMeshHttpsTestAccess {
     {
         return server.SetRejectedCleanupObserverForTest(std::move(observer));
     }
+    static bool ObserveConnection(FlowMeshHttpsServer& server, std::function<void(bool)> observer)
+    {
+        return server.SetConnectionObserverForTest(std::move(observer));
+    }
 };
 } // namespace node
 
@@ -71,6 +75,34 @@ struct CleanupObservation {
         std::unique_lock lock{mutex};
         if (!condition.wait_for(lock, std::chrono::seconds{2}, [&] { return samples.size() >= count; })) return {};
         return samples.at(count - 1);
+    }
+
+    size_t Count()
+    {
+        std::lock_guard lock{mutex};
+        return samples.size();
+    }
+};
+
+struct ConnectionObservation {
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::vector<bool> samples;
+
+    void Record(bool tcp_nodelay)
+    {
+        {
+            std::lock_guard lock{mutex};
+            samples.push_back(tcp_nodelay);
+        }
+        condition.notify_all();
+    }
+
+    std::optional<std::vector<bool>> Await(size_t count)
+    {
+        std::unique_lock lock{mutex};
+        if (!condition.wait_for(lock, std::chrono::seconds{2}, [&] { return samples.size() >= count; })) return {};
+        return samples;
     }
 
     size_t Count()
@@ -571,6 +603,36 @@ BOOST_AUTO_TEST_CASE(https_idle_stop_closes_peers_and_same_server_reopens)
     BOOST_REQUIRE_MESSAGE(next.response_received, next.error);
     BOOST_CHECK(!next.connection_reused);
     BOOST_CHECK(next.tls_handshake_performed);
+}
+
+BOOST_AUTO_TEST_CASE(https_server_disables_nagle_on_accepted_connections)
+{
+    ConnectionObservation observed;
+    node::FlowMeshHttpsServer server{Options(), [](const auto&) {
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(server,
+        [&](bool tcp_nodelay) { observed.Record(tcp_nodelay); }));
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    BOOST_CHECK(!node::FlowMeshHttpsTestAccess::ObserveConnection(server, {}));
+    SplitHttpsPeer peer{server.Port(), cert};
+    BOOST_REQUIRE(peer.Send("POST /flowmesh/v1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"));
+    BOOST_REQUIRE(peer.ReadResponse(2).starts_with("HTTP/1.1 200 "));
+    node::FlowMeshHttpsClient client;
+    for (unsigned int i{0}; i < 3; ++i) {
+        const auto reply{client.Request(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+        BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+        BOOST_CHECK_EQUAL(reply.connection_reused, i != 0);
+    }
+    // One read-back per admitted connection; warm requests add none.
+    const auto samples{observed.Await(2)};
+    BOOST_REQUIRE(samples);
+    BOOST_CHECK_EQUAL(samples->size(), 2U);
+    for (const bool tcp_nodelay : *samples) BOOST_CHECK(tcp_nodelay);
+    peer.NotifyClose();
+    server.Stop();
+    BOOST_CHECK_EQUAL(observed.Count(), 2U);
 }
 
 BOOST_AUTO_TEST_CASE(https_transport_only_paired_cold_warm_observations)
