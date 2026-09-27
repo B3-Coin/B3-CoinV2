@@ -6,12 +6,30 @@
 #include <node/flowmesh_client.h>
 #include <node/flowmesh_client_action_wait.h>
 #include <node/flowmesh_service.h>
+#include <chain.h>
+#include <consensus/era.h>
+#include <consensus/flowmesh_params.h>
 #include <crypto/sha256.h>
 #include <dbwrapper.h>
+#include <flowmesh/bls_certificate.h>
+#include <flowmesh/production_engine.h>
 #include <flowmesh/production_wire.h>
+#include <modern/asset_output.h>
+#include <modern/asset_validation.h>
+#include <modern/chain_domain.h>
+#include <modern/flowmesh_seat.h>
+#include <modern/fn.h>
+#include <modern/mpa.h>
+#include <node/flowmesh_anchor.h>
+#include <node/flowmesh_checkpoint_index.h>
+#include <node/flowmesh_vault_index.h>
+#include <node/fn_seat_index.h>
+#include <primitives/block.h>
 #include <test/util/setup_common.h>
 #include <util/fs.h>
 #include <util/sock.h>
+#include <util/strencodings.h>
+#include <validation.h>
 
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -40,6 +58,7 @@
 
 #ifndef WIN32
 #include <csignal>
+#include <sys/resource.h>
 #endif
 
 namespace node {
@@ -1643,7 +1662,8 @@ struct ClientConnectFixture : TestingSetup {
         return {"https://127.0.0.1:" + std::to_string(server.Port()), cert, pin};
     }
     //! A restart-restored outbox holding one retained public instruction.
-    static flowmesh::Action SeedRetainedAction(const fs::path& path, const uint256& market, const uint256& owner)
+    static flowmesh::Action SeedRetainedAction(const fs::path& path, const uint256& market, const uint256& owner,
+                                               const uint256& domain = uint256::ONE, const uint256& config = uint256::ONE)
     {
         flowmesh::Action action;
         action.signer = owner;
@@ -1654,8 +1674,8 @@ struct ClientConnectFixture : TestingSetup {
         BOOST_REQUIRE(bytes);
         UniValue row{UniValue::VOBJ};
         row.pushKV("market_id", market.GetHex());
-        row.pushKV("domain", uint256::ONE.GetHex());
-        row.pushKV("config", uint256::ONE.GetHex());
+        row.pushKV("domain", domain.GetHex());
+        row.pushKV("config", config.GetHex());
         row.pushKV("action_hex", HexStr(*bytes));
         row.pushKV("action_id", action.Id().GetHex());
         row.pushKV("initial_submission_ms", 1);
@@ -2083,6 +2103,365 @@ BOOST_AUTO_TEST_CASE(trading_api_action_wait_contract_and_untracked_actions)
         BOOST_CHECK_EQUAL(unknown["error"].get_str(), "Unknown or duplicate client API field");
         api->Stop();
     }
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+bls::SecretKey LaneSeatKey(const unsigned char tag)
+{
+    std::array<unsigned char, 32> ikm{};
+    ikm.fill(tag);
+    const auto key{bls::SecretKey::FromIKM(ikm)};
+    BOOST_REQUIRE(key);
+    return *key;
+}
+
+#ifndef WIN32
+//! Every write that would extend a regular file in this process fails (EFBIG,
+//! as on a full disk) until destruction, so the client outbox's synchronous
+//! write throws. SIGXFSZ is ignored meanwhile; both are restored afterwards.
+struct ScopedFailedFileWrites {
+    struct sigaction previous_action{};
+    rlimit previous{};
+    ScopedFailedFileWrites()
+    {
+        struct sigaction ignore{};
+        ignore.sa_handler = SIG_IGN;
+        sigemptyset(&ignore.sa_mask);
+        BOOST_REQUIRE_EQUAL(sigaction(SIGXFSZ, &ignore, &previous_action), 0);
+        BOOST_REQUIRE_EQUAL(getrlimit(RLIMIT_FSIZE, &previous), 0);
+        const rlimit none{0, previous.rlim_max};
+        BOOST_REQUIRE_EQUAL(setrlimit(RLIMIT_FSIZE, &none), 0);
+    }
+    ~ScopedFailedFileWrites()
+    {
+        setrlimit(RLIMIT_FSIZE, &previous);
+        sigaction(SIGXFSZ, &previous_action, nullptr);
+    }
+};
+#endif
+
+//! A scripted public trading endpoint. It answers every method with the
+//! reply the test set and counts what it received; 'action' reads with and
+//! without wait_ms are counted apart.
+struct ScriptedEndpoint {
+    std::mutex mutex;
+    UniValue markets{UniValue::VARR};
+    UniValue plain{UniValue::VOBJ}, waited{UniValue::VOBJ}, submit{UniValue::VOBJ};
+    unsigned plain_reads{0}, waited_reads{0}, submits{0}, market_reads{0};
+
+    node::FlowMeshHttpsServer::Response Handle(const node::FlowMeshHttpsServer::Request& request)
+    {
+        UniValue json;
+        if (!json.read(request.body) || !json.isObject() || !json["method"].isStr()) return {400, R"({"ok":false,"error":"test","result":null})"};
+        const auto& method{json["method"].get_str()};
+        std::lock_guard lock{mutex};
+        UniValue out{UniValue::VOBJ};
+        out.pushKV("ok", true);
+        if (method == "markets") {
+            ++market_reads;
+            out.pushKV("result", markets);
+        } else if (method == "submit") {
+            ++submits;
+            out.pushKV("result", submit);
+        } else if (method == "action" && json["params"].exists("wait_ms")) {
+            ++waited_reads;
+            out.pushKV("result", waited);
+        } else if (method == "action") {
+            ++plain_reads;
+            out.pushKV("result", plain);
+        } else {
+            return {400, R"({"ok":false,"error":"unexpected method","result":null})"};
+        }
+        out.pushKV("error", "");
+        return {200, out.write()};
+    }
+    std::array<unsigned, 4> Counts()
+    {
+        std::lock_guard lock{mutex};
+        return {plain_reads, waited_reads, submits, market_reads};
+    }
+};
+
+/** A regtest chain on which one FlowMesh market and its four anchored BLS
+ * seats are established (the synthetic blocks of flowmesh_service_tests'
+ * restart setup), so a remote client's local authority checks pass and
+ * certificates made with the seat keys verify. No block data, peers, wallet
+ * or network beyond generated loopback HTTPS endpoints. */
+struct ClientLaneFixture : TestingSetup {
+    ScopedClientSignals signals;
+    fs::path cert{m_path_root / "lane-cert.pem"};
+    fs::path key{m_path_root / "lane-key.pem"};
+    std::string pin;
+    const modern::AssetId asset{uint256{uint8_t{0x31}}};
+    uint256 domain, config;
+    flowmesh::MarketId market;
+    flowmesh::VaultId vault;
+    flowmesh::ActiveFnBlsSeatSet seats;
+    std::vector<bls::SecretKey> secrets;
+    CBlockIndex* original_tip{nullptr};
+
+    ClientLaneFixture()
+        : TestingSetup(ChainType::REGTEST, {.extra_args = {"-b3modernregtest", "-b3flowmeshtest", "-b3corridorlength=130"}})
+    {
+        HttpsFixture::CreateCertificate(cert, key, pin, true);
+        auto& chainman{*m_node.chainman};
+        const auto& params{chainman.GetConsensus()};
+        BOOST_REQUIRE(Consensus::FlowMeshSeatBindingScheduleConfigured(params));
+        domain = *modern::ModernChainDomain(params.hashGenesisBlock, *params.legacy_final_hash);
+        market = *flowmesh::ComputeFlowMeshMarketId(domain, asset);
+        vault = *flowmesh::ComputeFlowMeshVaultId(domain, market);
+        config = flowmesh::ComputeExecutionConfigId(vault, asset, modern::NativeAsset(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS);
+        const auto fn_asset{modern::ConfiguredFnAssetId(params)};
+        BOOST_REQUIRE(fn_asset);
+        CMutableTransaction bindings;
+        bindings.version = 2;
+        const CScript owner{CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 0x51) << OP_EQUALVERIFY << OP_CHECKSIG};
+        for (uint32_t i{0}; i < 4; ++i) {
+            secrets.push_back(LaneSeatKey(20 + i));
+            const auto output{modern::MakeFlowMeshSeatOutput(*fn_asset, owner, secrets.back().GetPublicKey())};
+            BOOST_REQUIRE(output);
+            bindings.vout.push_back(*output);
+            bindings.mpa.push_back(modern::MakeFlowMeshSeatBindingRecord(i, secrets.back().SignPoP().Compressed()));
+        }
+        const uint256 account{uint8_t{0x41}};
+        const auto deposit{modern::MakeDexVaultOutput(asset, 1, vault, modern::VAULT_KIND_USER_DEPOSIT,
+                                                      modern::FlowMeshUserDepositShard(vault, account), account)};
+        BOOST_REQUIRE(deposit);
+        CMutableTransaction bootstrap;
+        bootstrap.version = 2;
+        bootstrap.vout.push_back(*deposit);
+
+        LOCK(::cs_main);
+        auto& chainstate{chainman.ActiveChainstate()};
+        auto& chain{chainstate.m_chain};
+        original_tip = chain.Tip();
+        BOOST_REQUIRE(original_tip);
+        auto& seat_tracker{chainstate.ModernFnSeats()};
+        auto& vault_tracker{chainstate.ModernFlowMeshVaults()};
+        auto& checkpoint_tracker{chainstate.ModernFlowMeshCheckpoints()};
+        BOOST_REQUIRE(seat_tracker.Sync(chain, chainman.m_blockman, params, *original_tip));
+        BOOST_REQUIRE(vault_tracker.Sync(chain, chainman.m_blockman, params, *original_tip));
+        BOOST_REQUIRE(checkpoint_tracker.Sync(chain, chainman.m_blockman, params, seat_tracker.Index(), vault_tracker.Index(), *original_tip));
+        for (int height{1}; height <= *params.flowmesh_activation_height + 1; ++height) {
+            CBlock block;
+            block.nVersion = 2;
+            block.hashPrevBlock = chain.Tip()->GetBlockHash();
+            block.nTime = original_tip->nTime + height;
+            block.nNonce = height;
+            if (height == *params.asset_activation_height) block.vtx = {MakeTransactionRef(bindings), MakeTransactionRef(bootstrap)};
+            auto* index{chainman.m_blockman.InsertBlockIndex(block.GetHash())};
+            BOOST_REQUIRE(index);
+            index->nHeight = height;
+            index->pprev = chain.Tip();
+            index->nTime = block.nTime;
+            index->BuildSkip();
+            chain.SetTip(*index);
+            seat_tracker.BlockConnected(block, *index, params);
+            vault_tracker.BlockConnected(block, *index, params);
+            checkpoint_tracker.BlockConnected(block, *index, chain, params, seat_tracker.Index(), vault_tracker.Index());
+            BOOST_REQUIRE(seat_tracker.Synced(index->GetBlockHash()));
+            BOOST_REQUIRE(vault_tracker.Synced(index->GetBlockHash()));
+            BOOST_REQUIRE(checkpoint_tracker.Synced(index->GetBlockHash()));
+        }
+        const auto* anchor{chain[*params.asset_activation_height]};
+        const auto snapshot{seat_tracker.Index().SnapshotAt(*anchor)};
+        BOOST_REQUIRE(snapshot);
+        std::vector<flowmesh::BlsSeatBinding> seat_bindings;
+        for (const auto& member : snapshot->members) seat_bindings.push_back({member.outpoint, member.bls_pubkey, member.proof_of_possession});
+        flowmesh::BlsSeatSetCheck check;
+        const auto active{flowmesh::BuildActiveFnBlsSeatSet(domain, market, 0, anchor->nHeight, anchor->GetBlockHash(), seat_bindings, check)};
+        BOOST_REQUIRE_MESSAGE(active, flowmesh::BlsSeatSetCheckName(check));
+        seats = *active;
+        std::sort(secrets.begin(), secrets.end(), [&](const auto& a, const auto& b) {
+            const auto index_of = [&](const auto& secret) {
+                return std::find_if(seats.members.begin(), seats.members.end(),
+                    [&](const auto& member) { return member.key.Key() == secret.GetPublicKey(); });
+            };
+            return index_of(a) < index_of(b);
+        });
+    }
+    ~ClientLaneFixture()
+    {
+        LOCK(::cs_main);
+        m_node.chainman->ActiveChain().SetTip(*original_tip);
+    }
+
+    node::FlowMeshHttpsServer::Options Options(uint16_t port = 0) const
+    {
+        node::FlowMeshHttpsServer::Options options;
+        options.cert_file = cert; options.key_file = key;
+        options.request_timeout = std::chrono::seconds{2};
+        options.port = port;
+        return options;
+    }
+    node::HttpsEndpoint Endpoint(uint16_t port) const
+    {
+        return {"https://127.0.0.1:" + std::to_string(port), cert, pin};
+    }
+    std::unique_ptr<node::FlowMeshHttpsServer> Serve(ScriptedEndpoint& endpoint, uint16_t port = 0) const
+    {
+        auto server{std::make_unique<node::FlowMeshHttpsServer>(Options(port), [&endpoint](const auto& request) { return endpoint.Handle(request); })};
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(server->Start(error), error);
+        return server;
+    }
+    //! A restored outbox holding one possibly delivered cancel under this market's pins.
+    flowmesh::Action Seed(const fs::path& path, const uint256& owner) const
+    {
+        return ClientConnectFixture::SeedRetainedAction(path, market, owner, domain, config);
+    }
+    //! This market's discovery row, advertising `wait` when nonzero.
+    UniValue MarketRow(std::chrono::milliseconds wait) const
+    {
+        UniValue row{UniValue::VOBJ};
+        row.pushKV("domain", domain.GetHex()); row.pushKV("market_id", market.GetHex());
+        row.pushKV("base_asset_id", asset.GetHex()); row.pushKV("vault_id", vault.GetHex());
+        row.pushKV("execution_config_id", config.GetHex()); row.pushKV("quote_asset", "B3");
+        row.pushKV("running", true); row.pushKV("paused", false); row.pushKV("pending_handoff", false);
+        row.pushKV("halt", ""); row.pushKV("error", "");
+        row.pushKV("next_microblock_sequence", 1); row.pushKV("last_microblock_hash", uint256{}.GetHex());
+        if (wait.count()) row.pushKV("action_wait_ms_max", wait.count());
+        return row;
+    }
+    static UniValue Receipt(const flowmesh::Action& action, const std::string& state)
+    {
+        UniValue receipt{UniValue::VOBJ};
+        receipt.pushKV("action_id", action.Id().GetHex()); receipt.pushKV("receipt_state", state);
+        receipt.pushKV("reason", "scripted " + state);
+        return receipt;
+    }
+    /** An 'action' reply proving the action's inclusion in a microblock that
+     * this market's seats certified. The client checks inclusion by that
+     * certificate under local B3 authority and never re-executes the entry,
+     * so the certified genesis entry with this action added suffices. */
+    UniValue CertifiedReceipt(const flowmesh::Action& action) const
+    {
+        const auto& params{m_node.chainman->GetConsensus()};
+        const CScript treasury{params.modern_pos->treasury_script.begin(), params.modern_pos->treasury_script.end()};
+        node::ChainAnchorPolicy anchors{*m_node.chainman, Consensus::FLOWMESH_ANCHOR_DEPTH};
+        flowmesh::AnchorRef anchor;
+        int height;
+        {
+            LOCK(::cs_main);
+            height = m_node.chainman->ActiveChain().Height();
+            const auto* index{m_node.chainman->ActiveChain()[static_cast<int>(seats.anchor_height)]};
+            anchor = {index->nHeight, index->GetBlockHash()};
+        }
+        const flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+        flowmesh::ProductionEpochGate gate{domain, market, seats};
+        flowmesh::ProductionEntryCheck check;
+        const auto built{flowmesh::BuildProductionExecutionEntry(initial, domain, market, seats, gate, 0, 0, {}, anchor,
+            {height, std::nullopt, &anchors}, modern::AssetOwnerCommitment(treasury), {}, nullptr, check)};
+        BOOST_REQUIRE_MESSAGE(built, flowmesh::ProductionEntryCheckName(check));
+        auto entry{built->entry};
+        // Entries carry the semantic action only; its identity excludes the credential.
+        auto included{action};
+        included.credential.clear();
+        entry.actions = {included};
+        entry.actions_root = flowmesh::ComputeProductionActionsRoot(entry.actions);
+        std::vector<flowmesh::IndexedBlsSignature> signatures;
+        const auto context{flowmesh::ProductionCertificateContext(entry)};
+        for (uint32_t i{0}; i < flowmesh::FlowMeshBlsThreshold(seats.Size()); ++i) {
+            const auto signature{flowmesh::SignBlsMicroblockCertificate(secrets[i], context, seats)};
+            BOOST_REQUIRE(signature);
+            signatures.push_back({i, *signature});
+        }
+        flowmesh::BlsMicroblockCertificate certificate;
+        BOOST_REQUIRE(flowmesh::AssembleProductionEntryCertificate(entry, seats, signatures, certificate) ==
+                      flowmesh::BlsCertificateAssemblyCheck::OK);
+        const auto payload{flowmesh::EncodeProductionCertifiedPayload({entry, certificate}, seats.Size())};
+        BOOST_REQUIRE(payload);
+        auto receipt{Receipt(action, "certified_inclusion")};
+        receipt.pushKV("microblock_hash", entry.GetHash().GetHex());
+        receipt.pushKV("microblock_sequence", entry.sequence);
+        receipt.pushKV("certified_payload", HexStr(*payload));
+        return receipt;
+    }
+    //! The outbox row Restore reads back for `action`, from a closed journal.
+    static UniValue DurableRow(const fs::path& path, const flowmesh::Action& action)
+    {
+        CDBWrapper db{DBParams{.path=path, .cache_bytes=1 << 20}};
+        std::string json;
+        BOOST_REQUIRE(db.Read(std::string{"public-client-v1"}, json));
+        UniValue root;
+        BOOST_REQUIRE(root.read(json));
+        for (const auto& row : root["actions"].getValues()) {
+            if (row["action_id"].get_str() == action.Id().GetHex()) return row;
+        }
+        BOOST_FAIL("retained action missing from the outbox");
+        return {};
+    }
+};
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_wait_lane_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(lane_certification_whose_outbox_save_fails_is_returned_unverified)
+{
+#ifdef WIN32
+    BOOST_TEST_MESSAGE("Needs RLIMIT_FSIZE to fail the outbox write");
+#else
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+    validator.plain = Receipt(action, "admitted");
+    validator.submit = Receipt(action, "admitted");
+    validator.waited = CertifiedReceipt(action);
+    validator.waited.pushKV("wait_status", "terminal");
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    // Learn the advertised wait, then redeliver the same signed bytes so the
+    // endpoint that acknowledged the delivery is known.
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto delivered{client->ActionStatus(market, action.Id(), true)};
+    BOOST_REQUIRE_EQUAL(delivered.state, "admitted");
+    BOOST_REQUIRE((validator.Counts() == std::array<unsigned, 4>{1, 0, 1, 1}));
+
+    // The waited read proves certified inclusion, but the outbox write that
+    // must precede exposing it fails.
+    interfaces::FlowMeshActionReceipt waited;
+    {
+        ScopedFailedFileWrites full_disk;
+        waited = client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000});
+    }
+    // As c10c952's ordinary refresh: never a verified label that is not
+    // durable, the failure as its reason, and no second read in this call.
+    BOOST_CHECK(!waited.certificate_verified);
+    BOOST_CHECK_EQUAL(waited.state, "unknown");
+    BOOST_CHECK(waited.reason.find("LevelDB") != std::string::npos);
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{1, 1, 1, 1}));
+    const auto retained{client->SavedActions(owner, market)};
+    BOOST_REQUIRE_EQUAL(retained.size(), 1U);
+    BOOST_CHECK(!retained[0].receipt.certificate_verified);
+    BOOST_CHECK_EQUAL(retained[0].receipt.state, "unknown");
+    // Still never resent: the no-replay marker stays set in memory.
+    BOOST_CHECK(retained[0].previously_certified);
+    BOOST_CHECK(retained[0].may_have_been_sent);
+
+    // With writes working, an ordinary read proves the inclusion again and
+    // saves it before returning it. A previously certified action never
+    // takes the lane.
+    {
+        std::lock_guard lock{validator.mutex};
+        validator.plain = CertifiedReceipt(action);
+    }
+    const auto proved{client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000})};
+    BOOST_CHECK(proved.certificate_verified);
+    BOOST_CHECK_EQUAL(proved.state, "certified_inclusion");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{2, 1, 1, 1}));
+    client.reset();
+    server->Stop();
+    const auto durable{DurableRow(path, action)};
+    BOOST_CHECK(durable["previously_certified"].get_bool());
+    BOOST_CHECK(durable["may_have_been_sent"].get_bool());
+    BOOST_CHECK_EQUAL(durable["receipt"]["receipt_state"].get_str(), "certified_inclusion");
+#endif
 }
 
 BOOST_AUTO_TEST_SUITE_END()

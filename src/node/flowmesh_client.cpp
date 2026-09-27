@@ -1476,7 +1476,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // target and charge one automatic attempt, and again to apply the reply by
     // QueryAction's rules, never across the network wait. It never sends or
     // signs, and a receipt verified meanwhile is returned unchanged. nullopt
-    // means nothing was applied; the caller then takes the ordinary path.
+    // means nothing was applied; the caller then takes the ordinary path. A
+    // reply applied whose outbox save then failed is returned as the ordinary
+    // refresh would return it: unverified, with the failure as its reason.
     std::optional<Receipt> WaitedActionStatus(const uint256& market, const uint256& action, std::chrono::milliseconds requested)
     {
         FlowMeshTimingSpan timing{"client_action_wait"};
@@ -1565,6 +1567,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         const auto it{m_pending.find(key)};
         if (it == m_pending.end()) { outcome("not_retained"); return std::nullopt; }
         auto& p{it->second};
+        bool applied{false};
         try {
             const auto pins{RecheckActionAuthority(p)};
             if (p.receipt.certificate_verified) {
@@ -1574,6 +1577,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 return p.receipt;
             }
             ApplyActionResult(p, pins, result, endpoint);
+            applied = true;
             EndpointResult(endpoint, true, {});
             if (p.receipt.certificate_verified) {
                 Save();
@@ -1583,8 +1587,22 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 SaveRestartState();
             }
         } catch (const std::exception& e) {
-            outcome("failed"); timing.Field("error", std::string{e.what()});
-            return std::nullopt;
+            timing.Field("error", std::string{e.what()});
+            // A verified label here was set by this apply (the receipt was not
+            // verified before it). Without one, and with nothing applied,
+            // nothing changed: the ordinary read runs next, in the same call.
+            if (!applied && !p.receipt.certificate_verified) { outcome("failed"); return std::nullopt; }
+            // The reply was applied but the outbox write failed, so the new
+            // state is not durable. Exactly like the ordinary refresh: record
+            // why, and never return (nor leave for the ordinary path to
+            // return) a verified label that was not saved. previously_certified
+            // stays set in memory, so this action is still never resent.
+            p.receipt.reason = e.what();
+            if (p.previously_certified || p.receipt.certificate_verified) {
+                p.receipt.certificate_verified = false; p.receipt.state = "unknown";
+            }
+            outcome("save_failed");
+            return p.receipt;
         }
         outcome(p.receipt.certificate_verified ? "certified" : "observed");
         return p.receipt;
