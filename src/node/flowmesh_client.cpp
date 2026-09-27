@@ -549,6 +549,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     std::map<std::pair<uint256, uint256>, Pending> m_pending;
     FlowMeshClientPollScheduler m_action_polls;
     std::map<uint256, std::pair<uint64_t, uint256>> m_highwater;
+    // RestartDigest() of the last successful synchronous outbox write. Empty
+    // after startup and whenever a write attempt failed (durable state then
+    // unknown), so the next conditional save always writes.
+    std::optional<uint256> m_durable_restart_digest;
     struct Cache {
         flowmesh::ClientEvidencePins pins;
         flowmesh::VerifiedClientState verified;
@@ -857,9 +861,47 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         const auto it{std::find_if(m_endpoints.begin(), m_endpoints.end(), [&](const auto& endpoint) { return endpoint.url == selected; })};
         if (it != m_endpoints.end()) m_selected = std::distance(m_endpoints.begin(), it);
     }
+    // Exactly what Restore reads back: each retained action's market, domain,
+    // config, exact signed bytes (and so its ActionId), submission time,
+    // delivery and certification flags and owner, plus every market's
+    // high-water head. Receipts are written for inspection but never
+    // restored: restart always requires fresh status evidence.
+    uint256 RestartDigest() const
+    {
+        HashWriter hasher{};
+        hasher << uint64_t{m_highwater.size()};
+        for (const auto& [market, head] : m_highwater) hasher << market << head.first << head.second;
+        hasher << uint64_t{m_pending.size()};
+        for (const auto& [key, p] : m_pending) {
+            hasher << p.market << p.domain << p.config << p.bytes << p.initial_submission_ms
+                   << p.may_have_been_sent << p.previously_certified << p.owner_account;
+        }
+        return hasher.GetSHA256();
+    }
+    void PublishPendingCount()
+    {
+        std::lock_guard lock{m_status_mutex};
+        m_status.pending_actions = std::count_if(m_pending.begin(), m_pending.end(), [](const auto& item) {
+            return item.second.receipt.state != "certified_inclusion" && item.second.receipt.state != "rejected";
+        });
+    }
+    // For writes after a network observation only. Skips the synchronous
+    // write when nothing Restore reads changed since the last successful
+    // write: such a write would persist only receipt text, which restart
+    // discards. Writes that must precede a send always call Save().
+    void SaveRestartState()
+    {
+        if (m_durable_restart_digest && *m_durable_restart_digest == RestartDigest()) {
+            FlowMeshTimingSpan timing{"client_outbox_save_skipped"};
+            PublishPendingCount();
+            return;
+        }
+        Save();
+    }
     void Save()
     {
         FlowMeshTimingSpan timing{"client_outbox_save"};
+        m_durable_restart_digest.reset();
         UniValue root{UniValue::VOBJ}, actions{UniValue::VARR}, heads{UniValue::VARR};
         root.pushKV("version", 1);
         for (const auto& [key, p] : m_pending) {
@@ -882,13 +924,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         timing.Mark("sync_started_us");
         m_db->Write(std::string{"public-client-v1"}, blob, true); // throws on failed synchronous write
         timing.Mark("sync_completed_us");
+        m_durable_restart_digest = RestartDigest();
 #ifdef FLOWMESH_CLIENT_CRASH_TEST_HOOKS
         test::ClientCrashRecord(m_path, "synchronous_journal_save_returned", root);
 #endif
-        std::lock_guard lock{m_status_mutex};
-        m_status.pending_actions = std::count_if(m_pending.begin(), m_pending.end(), [](const auto& item) {
-            return item.second.receipt.state != "certified_inclusion" && item.second.receipt.state != "rejected";
-        });
+        PublishPendingCount();
     }
     Receipt ParseReceipt(const UniValue& value, const uint256& action, size_t endpoint)
     {
@@ -991,7 +1031,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             if (m_highwater.size() >= CLIENT_MAX_MARKETS && previous == m_highwater.end()) Fail("Client retained market limit reached");
             const bool lost_cursor{previous != m_highwater.end() && !m_cache.contains(id)};
             m_highwater[id] = {entry.sequence, entry.GetHash()};
-            Save(); // Preserve rollback detection before exposing this state.
+            // Preserve rollback detection before exposing this state. An
+            // unchanged head is already durable and needs no new write.
+            SaveRestartState();
             // Heads/actions are durable, event cursors are not. Restart or
             // bounded cache eviction requires an explicit snapshot gap even
             // when the certified head itself has not changed.
@@ -1004,7 +1046,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 if (std::any_of(entry.actions.begin(), entry.actions.end(), [&](const auto& action) { return action.Id() == pending.action.Id(); }))
                     Inclusion(pending, m_cache.at(id).verified.certified, endpoint, evidence.certified_payload);
             }
-            Save();
+            SaveRestartState();
             LearnMetadata(value["status"], pins, endpoint);
         });
     }
@@ -1196,7 +1238,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             if (!p.owner_account.IsNull()) p.receipt.account_id = p.owner_account;
         }, nullptr, nullptr, nullptr, automatic ? &p : nullptr);
         if (!p.receipt.certificate_verified) m_action_polls.MarkObserved({p.market, p.action.Id()});
-        Save(); return p.receipt;
+        // A non-certifying observation changes only the receipt, which
+        // restart never reads.
+        if (p.receipt.certificate_verified) Save();
+        else SaveRestartState();
+        return p.receipt;
     }
     Receipt Send(Pending& p)
     {
@@ -1234,7 +1280,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         }
         // Even a TLS failure is conservatively retryable; only an explicit
         // rejection with no earlier possibly-delivered attempt is definite.
-        Save(); return p.receipt;
+        // The write-ahead Save above already made the delivery flag durable;
+        // this observation changes only the receipt.
+        SaveRestartState(); return p.receipt;
     }
 public:
     RemoteBackend(ChainstateManager& chainman, std::vector<HttpsEndpoint> endpoints, const fs::path& path)
