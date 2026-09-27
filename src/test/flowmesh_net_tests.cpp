@@ -948,9 +948,12 @@ BOOST_AUTO_TEST_CASE(queued_frame_is_written_without_waiting_out_the_io_poll)
     BOOST_REQUIRE(Handshake(bulk, address, key, 2));
     BOOST_REQUIRE(Wait([&] { const auto status{server.Snapshot()}; return status.peers.size() == 1 && status.peers[0].authenticated; }));
     node::FlowMeshRuntimeRelay vote; vote.message = Message(Kind::ATTESTATION); vote.peer = server.Snapshot().peers[0].id;
+    // Five sends at each of nine points of the idle worker's 10 ms poll: the
+    // test sleeps 1..9 ms after each receipt, and the worker's poll restarts
+    // right after the write the test just received.
+    constexpr uint64_t SAMPLES{45};
     std::vector<std::chrono::microseconds> latencies;
-    for (uint64_t i{0}; i < 21; ++i) {
-        // Land each send at a different point of the idle worker's 10 ms poll.
+    for (uint64_t i{0}; i < SAMPLES; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds{1 + (i * 7) % 9});
         vote.message.header.sequence = i;
         const auto start{std::chrono::steady_clock::now()};
@@ -960,10 +963,17 @@ BOOST_AUTO_TEST_CASE(queued_frame_is_written_without_waiting_out_the_io_poll)
         BOOST_REQUIRE(received); BOOST_CHECK(*received == vote.message);
     }
     std::sort(latencies.begin(), latencies.end());
-    // Waiting out the poll puts the median near 5 ms; a woken worker needs a
-    // fraction of a millisecond. The median tolerates scheduler outliers.
-    const auto median{latencies[latencies.size() / 2]};
-    BOOST_CHECK_MESSAGE(median < 3ms, "median queue-to-receive latency " << median.count() << " us");
+    // A worker that waits out its poll writes a frame queued s ms into it
+    // about 10 - s ms later, so at most the two or three latest of the nine
+    // points (about a third of the sends) can arrive within a quarter of the
+    // poll. A woken worker needs a fraction of a millisecond for every send.
+    // Require two thirds: that still fails without the wake-up, and a loaded
+    // host would have to delay a third of all wake-ups by 2.5 ms to fail it.
+    const auto fast{static_cast<size_t>(std::count_if(latencies.begin(), latencies.end(),
+        [](const auto latency) { return latency < 2500us; }))};
+    BOOST_CHECK_MESSAGE(fast * 3 >= SAMPLES * 2, fast << " of " << SAMPLES
+        << " queued frames arrived within 2.5 ms (median " << latencies[SAMPLES / 2].count()
+        << " us, 90th percentile " << latencies[SAMPLES * 9 / 10].count() << " us)");
     BOOST_CHECK(Wait([&] { return server.Snapshot().traffic[0].socket_written == latencies.size(); }));
 }
 
