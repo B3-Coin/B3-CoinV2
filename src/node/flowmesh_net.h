@@ -104,7 +104,8 @@ struct FlowMeshNetSnapshot {
  * critical, action and bulk sockets/queues. Inner application wire is unchanged.
  * Authentication proves operator-key possession, NOT FN eligibility. Existing
  * inner FlowMesh objects remain unchanged and the sink verifies consensus.
- * Relay is thread-safe and bounded (no network I/O). Opt-in BENCH diagnostics
+ * Relay is thread-safe and bounded (no network I/O; at most one local wake-up
+ * byte for the I/O worker). Opt-in BENCH diagnostics
  * perform synchronous debug logging outside the queue-admission lock. Snapshot
  * exposes public metadata only. Stop never waits while holding a chain lock.
  * Sink must outlive this service. Start/Stop must be externally serialized.

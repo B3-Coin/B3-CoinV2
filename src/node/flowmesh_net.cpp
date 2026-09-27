@@ -17,6 +17,8 @@
 #include <util/strencodings.h>
 #include <util/syserror.h>
 
+#include <event2/util.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -264,6 +266,13 @@ struct FlowMeshNetService::Impl {
     // Bumped by NotifyIngressReady; the worker compares it once per pass.
     std::atomic<uint64_t> ingress_ready{0};
     uint64_t ingress_ready_seen{0};
+    // Local self-wake for the I/O wait, created once with this object and
+    // never replaced, so callers need no lock to use it. Relay writes at most
+    // one byte per worker pass when it makes an idle peer queue non-empty;
+    // the worker clears the flag before it scans the queues.
+    std::shared_ptr<Sock> wake_reader;
+    std::unique_ptr<Sock> wake_writer;
+    std::atomic_bool wake_pending{false};
     std::array<uint64_t, CHANNELS> next_socket{};
     uint64_t next_connection{1};
     flowmesh::WirePeerId next_peer{-2};
@@ -325,7 +334,31 @@ struct FlowMeshNetService::Impl {
     std::map<uint64_t, std::unique_ptr<Connection>> connections;
     std::map<std::string, Peer> peers;
 
-    Impl(FlowMeshNetConfig c, flowmesh::WireMessageSink& s) : config{std::move(c)}, sink{s} {}
+    Impl(FlowMeshNetConfig c, flowmesh::WireMessageSink& s) : config{std::move(c)}, sink{s}
+    {
+        // Start refuses to run without the pair; see there.
+        evutil_socket_t pair[2];
+#ifdef WIN32
+        constexpr int family{AF_INET};
+#else
+        constexpr int family{AF_UNIX};
+#endif
+        if (evutil_socketpair(family, SOCK_STREAM, 0, pair) != 0) return;
+        auto reader{std::make_shared<Sock>(static_cast<SOCKET>(pair[0]))};
+        auto writer{std::make_unique<Sock>(static_cast<SOCKET>(pair[1]))};
+        if (!reader->SetNonBlocking() || !reader->IsSelectable() || !writer->SetNonBlocking()) return;
+        wake_reader = std::move(reader);
+        wake_writer = std::move(writer);
+    }
+
+    //! Make the worker's I/O wait return now. Local only and coalesced: a
+    //! full nonblocking pair already holds a pending wake-up byte.
+    void Wake()
+    {
+        if (!wake_writer || wake_pending.exchange(true)) return;
+        const char byte{0};
+        while (wake_writer->Send(&byte, 1, MSG_NOSIGNAL) < 0 && WSAGetLastError() == WSAEINTR) {}
+    }
 
     bool Fail(Connection& c, std::string reason)
     {
@@ -890,9 +923,14 @@ struct FlowMeshNetService::Impl {
     {
         try {
             while (!stopping) {
+                // Clear before the queue scan below: a Relay that admits after
+                // this point writes a fresh wake-up byte, and one that admitted
+                // before it is seen by the scan (both take the admission lock).
+                wake_pending.store(false);
                 auto now{Clock::now()}; Clean(); ApplyTargets(); Dial(now);
                 Sock::EventsPerSock wait;
                 if (listener) wait.emplace(listener, Sock::Events{Sock::RECV});
+                if (wake_reader) wait.emplace(wake_reader, Sock::Events{Sock::RECV});
                 for (auto& [id, c] : connections) {
                     bool queued{false};
                     if (c->egress) { std::lock_guard lock{mutex}; queued = c->egress->queues[c->channel].count != 0; }
@@ -904,6 +942,11 @@ struct FlowMeshNetService::Impl {
                 if (wait.empty()) { Publish(); std::this_thread::sleep_for(IO_WAIT); continue; }
                 if (!wait.begin()->first->WaitMany(IO_WAIT, wait)) throw std::runtime_error{"FlowMesh socket poll failed"};
                 now = Clock::now();
+                if (wake_reader && (wait.at(wake_reader).occurred & Sock::RECV)) {
+                    // One bounded read; a leftover byte only costs one more pass.
+                    std::array<char, 64> discarded{};
+                    (void)wake_reader->Recv(discarded.data(), discarded.size(), 0);
+                }
                 // The sink reports that its refusal reason (normally the B3
                 // reconciliation gate) has cleared. Offer every held frame in
                 // this pass; a renewed refusal restarts the normal backoff.
@@ -997,6 +1040,7 @@ bool FlowMeshNetService::Start(std::string& error)
     try {
         if (s.config.domain.IsNull() || s.config.max_peers == 0 || s.config.max_peers > 32 || s.config.peers.size() > s.config.max_peers) throw std::runtime_error{"Invalid FlowMesh domain or peer bounds"};
         if (s.config.ingress_retry_timeout <= std::chrono::milliseconds{0} || s.config.ingress_retry_timeout > INGRESS_RETRY_TIMEOUT) throw std::runtime_error{"FlowMesh ingress retry timeout must be positive and at most 30 seconds"};
+        if (!s.wake_reader || !s.wake_writer) throw std::runtime_error{"Cannot create the FlowMesh network wake-up socket pair"};
         Role(s.config.role);
         s.targets.clear(); for (const auto& peer : s.config.peers) s.targets.push_back(ParseTarget(peer, s.config.port));
         s.LoadKey();
@@ -1031,7 +1075,7 @@ bool FlowMeshNetService::Start(std::string& error)
 }
 void FlowMeshNetService::Stop()
 {
-    auto& s{*m_impl}; s.stopping = true;
+    auto& s{*m_impl}; s.stopping = true; s.Wake();
     if (s.worker.joinable()) s.worker.join();
     s.listener.reset();
     if (s.directory_locked) { UnlockDirectory(s.config.datadir, ".flowmesh-network.lock"); s.directory_locked = false; }
@@ -1123,6 +1167,8 @@ FlowMeshRelayResult FlowMeshNetService::Relay(const FlowMeshRuntimeRelay& relay)
         if (it != s.cancellations.end()) packet.cancellation = it->second;
     }
     if (!packet.cancellation) packet.cancellation = std::make_shared<Packet::Cancellation>();
+    // A queue that was already non-empty is already in the worker's write set.
+    bool wake{false};
     for (const auto& [id, egress] : s.admission_peers) {
         if ((relay.peer && *relay.peer != id) || (relay.exclude_peer && *relay.exclude_peer == id)) continue;
         auto& peer{egress->traffic[channel]}; auto& global{s.snapshot.traffic[channel]};
@@ -1141,6 +1187,7 @@ FlowMeshRelayResult FlowMeshNetService::Relay(const FlowMeshRuntimeRelay& relay)
         if (admission != Admission::ADMITTED) {
             ++peer.rejected; ++global.rejected; ++s.snapshot.egress_rejected_messages; s.snapshot.last_egress_error = reason;
         } else {
+            wake |= egress->queues[channel].count == 0;
             egress->queues[channel].Push(packet); ++packet.cancellation->references;
             for (auto* traffic : {&peer, &global}) { traffic->queued_bytes += bytes; ++traffic->queued_messages; ++traffic->admitted; }
         }
@@ -1155,6 +1202,9 @@ FlowMeshRelayResult FlowMeshNetService::Relay(const FlowMeshRuntimeRelay& relay)
         s.snapshot.last_egress_error = result.reason;
     }
     lock.unlock();
+    // Otherwise the frame would wait for the rest of the worker's IO_WAIT
+    // poll (up to 10 ms per hop) before it is even prepared.
+    if (wake) s.Wake();
     // Optional synchronous debug I/O must not hold the queue-admission lock.
     // These timestamps observe queue outcomes after releasing that lock.
     for (const auto& peer : result.peers) {
@@ -1176,6 +1226,7 @@ void FlowMeshNetService::Cancel(uint64_t delivery_id)
 void FlowMeshNetService::NotifyIngressReady()
 {
     m_impl->ingress_ready.fetch_add(1, std::memory_order_release);
+    m_impl->Wake();
 }
 FlowMeshNetSnapshot FlowMeshNetService::Snapshot() const
 {

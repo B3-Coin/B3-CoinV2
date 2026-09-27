@@ -871,6 +871,35 @@ BOOST_AUTO_TEST_CASE(refused_delivery_notification_is_explicit)
     BOOST_CHECK_EQUAL(server.Snapshot().notification_refused, 1U); // Untracked control is not refused feedback.
 }
 
+BOOST_AUTO_TEST_CASE(queued_frame_is_written_without_waiting_out_the_io_poll)
+{
+    Sink sink; node::FlowMeshNetService server{Config(m_path_root / "fmnet-egress-wake"), sink}; std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    CKey key; key.MakeNewKey(true); RawChannel live, actions, bulk;
+    const auto address{server.Snapshot().bind_address};
+    BOOST_REQUIRE(Handshake(live, address, key, 0)); BOOST_REQUIRE(Handshake(actions, address, key, 1));
+    BOOST_REQUIRE(Handshake(bulk, address, key, 2));
+    BOOST_REQUIRE(Wait([&] { const auto status{server.Snapshot()}; return status.peers.size() == 1 && status.peers[0].authenticated; }));
+    node::FlowMeshRuntimeRelay vote; vote.message = Message(Kind::ATTESTATION); vote.peer = server.Snapshot().peers[0].id;
+    std::vector<std::chrono::microseconds> latencies;
+    for (uint64_t i{0}; i < 21; ++i) {
+        // Land each send at a different point of the idle worker's 10 ms poll.
+        std::this_thread::sleep_for(std::chrono::milliseconds{1 + (i * 7) % 9});
+        vote.message.header.sequence = i;
+        const auto start{std::chrono::steady_clock::now()};
+        BOOST_REQUIRE(Admitted(server.Relay(vote)));
+        const auto received{Receive(live)};
+        latencies.push_back(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start));
+        BOOST_REQUIRE(received); BOOST_CHECK(*received == vote.message);
+    }
+    std::sort(latencies.begin(), latencies.end());
+    // Waiting out the poll puts the median near 5 ms; a woken worker needs a
+    // fraction of a millisecond. The median tolerates scheduler outliers.
+    const auto median{latencies[latencies.size() / 2]};
+    BOOST_CHECK_MESSAGE(median < 3ms, "median queue-to-receive latency " << median.count() << " us");
+    BOOST_CHECK(Wait([&] { return server.Snapshot().traffic[0].socket_written == latencies.size(); }));
+}
+
 BOOST_AUTO_TEST_CASE(pending_ingress_timeout_or_malformed_retry_is_explicit)
 {
     for (const bool malformed : {false, true}) {
