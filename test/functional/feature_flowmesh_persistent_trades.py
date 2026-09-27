@@ -12,10 +12,26 @@ existing preagreement/FMN2 fixture and all economic/proof rules.
 Six one-unit matches ascend and descend through a fixed price schedule while
 B3 advances. Timing is an observed RPC-to-proof/account upper bound, not a
 consensus-only measurement or a claim that inclusion alone proves a fill.
+
+--samples=N runs N matches, cycling the same price schedule; funding grows
+with N. --status-wait-ms=MS passes MS as getflowmeshactionstatus wait_ms
+when the client binary's help lists that argument (checked once); an older
+binary reads immediately and the report records that. Either option, or
+--record-reconnects, records every sample's HTTPS reuse/handshake flags
+instead of asserting the arm's reuse per sample, so a connection rollover
+or reset stays in the distribution rather than aborting the run. It also
+records, rather than fails on, a validator trace stream reaching its
+process-lifetime cap (32,768 rows, about eight samples on node0): that
+stream is then absent from later captures, while the measured timings come
+from the harness clock. With none of them the fixture and its assertions
+are unchanged.
 """
 
+import argparse
 import hashlib
 import json
+import math
+import re
 import sys
 import time
 from collections import Counter
@@ -35,22 +51,52 @@ BALANCES = ("base_available", "base_reserved", "b3_available_atoms", "b3_reserve
 IMMUTABLE_ACTION = ("market_id", "domain", "execution_config_id", "account_id", "action_id",
                     "sequence", "canonical_side", "canonical_points", "signed_bytes_sha256",
                     "signed_bytes_size", "initial_submission_ms")
+B3_ATOMS = 1_000_000_000  # Native atomic units per B3.
+# The client retains at most 512 actions: two deposits plus an ask and a bid
+# per match. More matches would evict certified orders the final checks read.
+MAX_SAMPLES = (512 - 2) // 2
+STATUS_WAIT_MAX_MS = 2500  # getflowmeshactionstatus wait_ms bound.
+
+
+def bounded_int(name, low, high):
+    def parse(value):
+        number = int(value)
+        if not low <= number <= high:
+            raise argparse.ArgumentTypeError(f"{name} must be between {low} and {high}")
+        return number
+    return parse
 
 
 class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
     def add_options(self, parser):
         super().add_options(parser)
         parser.add_argument("--transport-arm", choices=("baseline", "warm"), required=True)
-        parser.add_argument("--harness-smoke", action="store_true",
-                            help="One match to validate the fixture; never a reported performance arm")
+        size = parser.add_mutually_exclusive_group()
+        size.add_argument("--harness-smoke", action="store_true",
+                          help="One match to validate the fixture; never a reported performance arm")
+        size.add_argument("--samples", type=bounded_int("--samples", 1, MAX_SAMPLES), default=len(PRICES),
+                          help=f"Measured matches, cycling the fixed price schedule (1-{MAX_SAMPLES}, default {len(PRICES)})")
+        parser.add_argument("--status-wait-ms", type=bounded_int("--status-wait-ms", 0, STATUS_WAIT_MAX_MS), default=0,
+                            help=f"getflowmeshactionstatus wait_ms, used only if the client binary lists it (0-{STATUS_WAIT_MAX_MS}, default 0: immediate reads)")
+        parser.add_argument("--record-reconnects", action="store_true",
+                            help=f"Record per-sample HTTPS reuse/handshake flags and validator trace-cap markers instead of asserting them (implied by --samples other than {len(PRICES)} or --status-wait-ms)")
 
     def set_test_params(self):
         self.options.latency_production_logging = True
         super().set_test_params()
-        self.prices = PRICES[:1] if self.options.harness_smoke else PRICES
+        self.prices = (PRICES[:1] if self.options.harness_smoke else
+                       tuple(PRICES[number % len(PRICES)] for number in range(self.options.samples)))
+        # Without the new options every sample keeps its original assertions.
+        self.strict_samples = not (self.options.record_reconnects or self.options.status_wait_ms or
+                                   self.options.samples != len(PRICES))
+        self.status_wait_ms = 0  # Effective wait_ms, set once the client binary is known.
+        self.capture_clock = None
         self.trade_report = {"format_version": 1, "arm": self.options.transport_arm,
             "harness_smoke": self.options.harness_smoke, "performance_measurement_qualified": False,
             "correctness_pass": False, "prices": list(self.prices), "samples": [], "child_exits": [],
+            "sample_assertions": "per_sample" if self.strict_samples else "recorded_only",
+            "status_wait": {"requested_ms": self.options.status_wait_ms, "effective_ms": 0},
+            "trace_limits_reached": [],
             "scope": {"operators": 4, "engine_off_clients": 1, "client_wallets": 2,
                 "HTTPS": "direct native TLS listeners; no relay", "B3_advancing": True,
                 "price_model": "one standing ask and equal-price bid per one-unit match",
@@ -78,6 +124,12 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
         self.client.addnode(f"127.0.0.1:{p2p_port(0)}", "onetry")
         self.wait_client_b3_sync()
         self.assert_engine_off()
+        if self.options.status_wait_ms:
+            # Asked once. A binary without the argument (c10c952) gets the
+            # unchanged two-argument read; the report records which applied.
+            supported = re.search(r"^3\. wait_ms\b", self.client.help("getflowmeshactionstatus"), re.M) is not None
+            self.status_wait_ms = self.options.status_wait_ms if supported else 0
+            self.trade_report["status_wait"].update(client_supports_wait_ms=supported, effective_ms=self.status_wait_ms)
 
     def assert_engine_off(self):
         # Client/validator status are wallet RPCs too; the inherited helper
@@ -128,6 +180,7 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
         sample.update(action_id=action_id, original_action=original)
         status, deadline, retry_at = response, time.monotonic() + 60, time.monotonic() + 1
         retries = []
+        next_read = time.monotonic()
         while status["receipt_state"] != "certified_inclusion":
             assert time.monotonic() < deadline, "bounded action certification deadline exceeded"
             self.pump_b3()
@@ -138,6 +191,13 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                 status = rpc.retryflowmeshaction(market, action_id)
                 retries.append({"host_us": host_us(), "state": status["receipt_state"]})
                 retry_at = time.monotonic() + 1
+            elif self.status_wait_ms:
+                # A waited read paces itself. Reads still start at least 5 ms
+                # apart, so one that returns at once (for example from an
+                # endpoint without the capability) cannot spin.
+                time.sleep(max(0, next_read - time.monotonic()))
+                next_read = time.monotonic() + .005
+                status = rpc.getflowmeshactionstatus(market, action_id, self.status_wait_ms)
             else:
                 time.sleep(.005)
                 status = rpc.getflowmeshactionstatus(market, action_id)
@@ -186,16 +246,21 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
 
     def fund_wallets(self, market, asset):
         self.start_ordinary_client()
+        # Six matches keep the original 1 B3 / 20 unit deposits; longer runs
+        # deposit every price with a 20% margin and one unit per ask.
+        buyer_b3 = max(1, math.ceil(sum(self.prices) * 6 / 5 / B3_ATOMS))
+        maker_units = max(20, len(self.prices))
+        self.trade_report["funding"] = {"buyer_b3": buyer_b3, "maker_base_units": maker_units}
         for rpc in (self.buyer, self.maker):
             address = rpc.getnewaddress()
-            self.nodes[0].sendtoaddress(address, Decimal("3"))
+            self.nodes[0].sendtoaddress(address, Decimal(buyer_b3 + 2) if rpc is self.buyer else Decimal("3"))
             if rpc is self.maker:
-                self.nodes[0].sendasset(asset, 20, address)
+                self.nodes[0].sendasset(asset, maker_units, address)
         self.synchronize_mempools()
         self.mine_pos_blocks(1, allow_overshoot=True)
         self.wait_client_b3_sync()
         deposits = []
-        for rpc, currency, amount in ((self.buyer, "B3", Decimal("1")), (self.maker, asset, 20)):
+        for rpc, currency, amount in ((self.buyer, "B3", Decimal(buyer_b3)), (self.maker, asset, maker_units)):
             deposit = rpc.flowmeshdeposit(asset, currency, amount)
             self.publish_client_transaction(deposit)
             deposits.append((rpc, deposit))
@@ -210,14 +275,20 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
             assert_equal(operation["kind"], "deposit-sweep")
             self.publish_client_transaction(self.maker.createflowmeshvaulttx(operation["effect_id"]))
         self.wait_for_market_convergence(market)
-        self.authenticated_account(self.buyer, market, lambda row: row["b3_available_atoms"] == 1_000_000_000)
-        self.authenticated_account(self.maker, market, lambda row: row["base_available"] == 20)
+        self.authenticated_account(self.buyer, market, lambda row: row["b3_available_atoms"] == buyer_b3 * B3_ATOMS)
+        self.authenticated_account(self.maker, market, lambda row: row["base_available"] == maker_units)
 
     def start_capture(self):
         assert not self.capture_nodes
+        self.capture_clock = None
         for node in [*self.nodes, self.client]:
             assert not any(node.logging().values()), "measured run must have debug categories disabled"
-            node.flowmeshtiming("start")
+            before = host_us()
+            started = node.flowmeshtiming("start")
+            after = host_us()
+            if node is self.client:
+                # Host time minus client span time, bracketed by this call.
+                self.capture_clock = (before - started["start_us"], after - started["start_us"])
             self.capture_nodes.append(node)
 
     def stop_capture(self, number):
@@ -228,9 +299,46 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
             path = Path(self.options.tmpdir, f"persistent-trade-{number}-node{node.index}-timing.json")
             path.write_text(json.dumps(capture, indent=2) + "\n", encoding="utf-8")
             assert_equal(capture["dropped"], 0)
-            assert not any(row["event"].get("stage") == "trace_limit_reached" for row in capture["events"])
+            limits = [row for row in capture["events"] if row["event"].get("stage") == "trace_limit_reached"]
+            assert not (self.strict_samples and limits)
+            # A capped stream is absent from every later capture of this node.
+            self.trade_report["trace_limits_reached"] += [{"sample": number, "node": node.index,
+                "stream": row["stream"], "substream": row["event"].get("stream")} for row in limits]
             result[str(node.index)] = capture
         return result
+
+    def measured_window(self, events, requests, bid):
+        """Client HTTPS requests of the measured bid window.
+
+        The window runs from the original order RPC start to the status reply
+        that returned certified inclusion. A request counts when its outermost
+        client span is one of the order/status entry points (for the bid's
+        action, where the span names one) and can overlap the window, with
+        client span times mapped to host time by this capture's bracketed
+        offset. The neighbouring client calls with HTTPS are account reads
+        (Data), which never count.
+        """
+        low, high = self.capture_clock
+        spans = {row["span_id"]: row for row in events if "span_id" in row}
+        def outermost(row):
+            while row["parent_span_id"] in spans:
+                row = spans[row["parent_span_id"]]
+            return row
+        def measured(row):
+            root = outermost(row)
+            return (root["stage"] in ("Market", "Submit", "ActionStatus", "client_action_wait") and
+                    root.get("action_id", bid["action_id"]) == bid["action_id"] and
+                    root["started_us"] + low <= bid["certified_host_us"] and
+                    root["monotonic_us"] + high >= bid["started_host_us"])
+        def caller(row):
+            parent = spans.get(row["parent_span_id"], {})
+            return parent.get("method", parent.get("stage", "unattributed"))
+        inside = [row for row in requests if measured(row)]
+        handshakes = sorted(caller(row) for row in inside if "tls_handshake_done_us" in row)
+        return {"clock_offset_us_bounds": [low, high], "requests": len(inside),
+                "reused": sum(row.get("connection_reused", 0) for row in inside),
+                "handshakes": len(handshakes), "handshake_callers": handshakes,
+                "callers": dict(Counter(caller(row) for row in inside))}
 
     def qualify_match(self, market, price, number):
         buyer_before = self.authenticated_account(self.buyer, market)["account"]
@@ -309,12 +417,17 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                 sample["HTTPS"]["measured_bid_submit"] = [{"span_id": row["span_id"],
                     "parent_span_id": row["parent_span_id"], "reused": bool(row.get("connection_reused", 0)),
                     "handshake_performed": "tls_handshake_done_us" in row} for row in bid_requests]
+                sample["HTTPS"]["measured_bid_submit_warm"] = bool(bid_requests) and bid_requests[0].get("connection_reused") == 1
+                sample["HTTPS"]["measured_window"] = self.measured_window(events, requests, sample["bid"])
             for key in ("ask", "bid"):
                 if key in sample:
                     action = sample[key]
                     assert_equal(submissions[action["action_id"]], 1 + len(action["exact_action_retries"]))
             if sample["complete"]:
                 assert requests
+            # Otherwise the flags above are the record, and a sample that paid
+            # a handshake stays in every distribution instead of ending the run.
+            if sample["complete"] and self.strict_samples:
                 if self.options.transport_arm == "warm":
                     assert sample["HTTPS"]["reused"] > 0, "persistent arm did not reuse HTTPS"
                     assert bid_requests and bid_requests[0].get("connection_reused") == 1, "measured original bid submit was not warm"
@@ -371,11 +484,21 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                 assert_equal(len({row["sequence"] for row in orders}), len(self.prices))
             self.assert_engine_off()
             self.assert_no_b3_flowmesh_traffic()
+            if self.options.transport_arm == "warm":
+                assert any(row["HTTPS"]["reused"] for row in samples), "persistent arm did not reuse HTTPS"
+            reconnected = [row["HTTPS"]["measured_window"]["handshakes"] > 0 for row in samples]
             self.trade_report["summary"] = {
                 "client_certified": distribution([row["bid"]["client_certified_ms"] for row in samples], 200),
                 "account_state_verified": distribution([row["account_state_verified_ms"] for row in samples], 200),
                 "all_replicas_observed": distribution([row["all_replicas_observed_ms"] for row in samples], 200),
-                "matched_units": len(samples), "total_fees_atoms": sum(row["fee_atoms"] for row in samples)}
+                "matched_units": len(samples), "total_fees_atoms": sum(row["fee_atoms"] for row in samples),
+                "transport": {"measured_bid_submit_warm": sum(row["HTTPS"]["measured_bid_submit_warm"] for row in samples),
+                    "measured_window_reconnected": sum(reconnected),
+                    "measured_window_handshakes": sum(row["HTTPS"]["measured_window"]["handshakes"] for row in samples),
+                    "client_certified_without_handshake": distribution([row["bid"]["client_certified_ms"]
+                        for row, paid in zip(samples, reconnected) if not paid], 200),
+                    "client_certified_with_handshake": distribution([row["bid"]["client_certified_ms"]
+                        for row, paid in zip(samples, reconnected) if paid], 200)}}
             self.trade_report["correctness_pass"] = True
             self.trade_report["performance_measurement_qualified"] = not self.options.harness_smoke
         except Exception as error:
