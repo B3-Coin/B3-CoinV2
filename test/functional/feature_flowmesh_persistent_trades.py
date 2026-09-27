@@ -357,7 +357,10 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
             node = self.capture_nodes.pop(0)
             capture = node.flowmeshtiming("stop")
             path = Path(self.options.tmpdir, f"persistent-trade-{number}-node{node.index}-timing.json")
-            path.write_text(json.dumps(capture, indent=2) + "\n", encoding="utf-8")
+            # Legacy runs keep the indented files. Record-mode runs can be
+            # long, so they write compact JSON (about 30% smaller).
+            text = json.dumps(capture, indent=2) if self.strict_samples else json.dumps(capture, separators=(",", ":"))
+            path.write_text(text + "\n", encoding="utf-8")
             assert_equal(capture["dropped"], 0)
             limits = [row for row in capture["events"] if row["event"].get("stage") == "trace_limit_reached"]
             assert not (self.strict_samples and limits)
