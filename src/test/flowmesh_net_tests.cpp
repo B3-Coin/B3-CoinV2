@@ -82,11 +82,16 @@ struct Sink final : flowmesh::WireMessageSink {
     std::vector<flowmesh::WirePeerId> connected, disconnected;
     std::map<Kind, flowmesh::QueueResult> admission;
     std::map<Kind, size_t> attempts;
+    // Every offer the I/O worker made, when, and what it was told.
+    using Offer = std::pair<std::chrono::steady_clock::time_point, flowmesh::QueueResult>;
+    std::map<Kind, std::vector<Offer>> offers;
     flowmesh::QueueResult EnqueueWireMessage(flowmesh::WirePeerId peer, flowmesh::WireMessage message) override
     {
         std::lock_guard lock{mutex}; ++attempts[message.kind];
         const auto it{admission.find(message.kind)};
-        if (it != admission.end() && it->second != flowmesh::QueueResult::ACCEPTED) return it->second;
+        const auto result{it == admission.end() ? flowmesh::QueueResult::ACCEPTED : it->second};
+        offers[message.kind].emplace_back(std::chrono::steady_clock::now(), result);
+        if (result != flowmesh::QueueResult::ACCEPTED) return result;
         received.push_back({peer, std::move(message)}); return flowmesh::QueueResult::ACCEPTED;
     }
     void FlowMeshPeerConnected(flowmesh::WirePeerId peer) override { std::lock_guard lock{mutex}; connected.push_back(peer); }
@@ -94,6 +99,7 @@ struct Sink final : flowmesh::WireMessageSink {
     std::vector<flowmesh::QueuedWireMessage> Messages() const { std::lock_guard lock{mutex}; return received; }
     void Admit(Kind kind, flowmesh::QueueResult result) { std::lock_guard lock{mutex}; admission[kind] = result; }
     size_t Attempts(Kind kind) const { std::lock_guard lock{mutex}; const auto it{attempts.find(kind)}; return it == attempts.end() ? 0 : it->second; }
+    std::vector<Offer> Offers(Kind kind) const { std::lock_guard lock{mutex}; const auto it{offers.find(kind)}; return it == offers.end() ? std::vector<Offer>{} : it->second; }
 };
 bool Wait(const std::function<bool()>& predicate, std::chrono::milliseconds timeout = 3000ms)
 {
@@ -732,6 +738,67 @@ BOOST_AUTO_TEST_CASE(reconciling_ingress_resumes_on_ready_notification)
     BOOST_CHECK_EQUAL(messages[0].peer, messages[1].peer);
     BOOST_CHECK_EQUAL(server.Snapshot().pending_ingress_bytes, 0U);
     BOOST_CHECK_EQUAL(server.Snapshot().ingress_discarded_messages, 0U);
+}
+
+// The ready notification says only that the chain gate reopened. A held frame
+// whose LAST refusal was a token, queue, limit or stop refusal keeps the
+// backoff it earned, even if the gate refused it earlier; one whose last
+// refusal was the gate is offered at once, even if other refusals came first.
+BOOST_AUTO_TEST_CASE(ready_notification_resets_only_a_backoff_earned_at_the_chain_gate)
+{
+    using Result = flowmesh::QueueResult;
+    // A refusal of offer k (1-based) schedules offer k + 1 this much later.
+    const auto backoff = [](const size_t k) {
+        return std::chrono::milliseconds{std::min<int64_t>(1000, int64_t{100} << std::min<size_t>(k - 1, 4))};
+    };
+    struct Case { Result earlier, last; size_t hold; };
+    int id{0};
+    for (const Case& test : {Case{Result::RECONCILING, Result::RATE_LIMITED, 1}, Case{Result::RECONCILING, Result::PEER_LIMIT, 1},
+                             Case{Result::RECONCILING, Result::MARKET_LIMIT, 1}, Case{Result::RECONCILING, Result::GLOBAL_LIMIT, 1},
+                             Case{Result::RECONCILING, Result::STOPPED, 1}, Case{Result::RATE_LIMITED, Result::RECONCILING, 2}}) {
+        BOOST_TEST_MESSAGE("earlier refusal " << static_cast<int>(test.earlier) << ", last refusal " << static_cast<int>(test.last));
+        Sink sink; sink.Admit(Kind::PROPOSAL, test.earlier);
+        node::FlowMeshNetService server{Config(m_path_root / fs::PathFromString("fmnet-ready-reason-" + std::to_string(id++))), sink};
+        std::string error; BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+        CKey key; key.MakeNewKey(true); RawChannel live, actions, bulk;
+        const auto address{server.Snapshot().bind_address};
+        BOOST_REQUIRE(Handshake(live, address, key, 0)); BOOST_REQUIRE(Handshake(actions, address, key, 1));
+        BOOST_REQUIRE(Handshake(bulk, address, key, 2));
+        const auto proposal{Message(Kind::PROPOSAL)};
+        auto frame{Frame(live, key, proposal)}; BOOST_REQUIRE(Transfer(*live.socket, frame, true));
+        BOOST_REQUIRE(Wait([&] { return sink.Attempts(Kind::PROPOSAL) >= test.hold; }));
+        sink.Admit(Kind::PROPOSAL, test.last);
+        // For the gate case wait for a long (800 ms) backoff, so that an
+        // offer soon after the notification can only be the notification's.
+        const size_t refusals{test.last == Result::RECONCILING ? 4U : test.hold + 1};
+        BOOST_REQUIRE(Wait([&] {
+            const auto offers{sink.Offers(Kind::PROPOSAL)};
+            return offers.size() >= refusals && offers.back().second == test.last;
+        }));
+        sink.Admit(Kind::PROPOSAL, Result::ACCEPTED);
+        const auto notified{std::chrono::steady_clock::now()};
+        server.NotifyIngressReady();
+        BOOST_REQUIRE(Wait([&] { return sink.Messages().size() == 1; }));
+        // Measured between the worker's own offers, so a slow test thread
+        // cannot shorten the gap; it can only make the reset case look late.
+        const auto offers{sink.Offers(Kind::PROPOSAL)};
+        BOOST_REQUIRE_GE(offers.size(), 2U);
+        const size_t k{offers.size() - 1};
+        BOOST_REQUIRE(offers[k].second == Result::ACCEPTED);
+        BOOST_REQUIRE(offers[k - 1].second == test.last);
+        const auto gap{std::chrono::duration_cast<std::chrono::milliseconds>(offers[k].first - offers[k - 1].first)};
+        if (test.last == Result::RECONCILING) {
+            const auto waited{std::chrono::duration_cast<std::chrono::milliseconds>(offers[k].first - notified)};
+            BOOST_CHECK_MESSAGE(waited < 300ms, "gate-held frame waited " << waited.count() << " ms after the ready notification");
+            BOOST_CHECK_MESSAGE(gap < backoff(k), "gate-held frame kept its " << backoff(k).count() << " ms backoff");
+        } else {
+            BOOST_CHECK_MESSAGE(gap >= backoff(k) - 50ms, "frame refused for another reason was offered after "
+                << gap.count() << " ms instead of its " << backoff(k).count() << " ms backoff");
+        }
+        BOOST_CHECK(sink.Messages()[0].message == proposal);
+        // The snapshot is published at the end of the worker's pass.
+        BOOST_CHECK(Wait([&] { return server.Snapshot().pending_ingress_bytes == 0; }));
+    }
 }
 
 BOOST_AUTO_TEST_CASE(bulk_admission_backpressure_does_not_block_live_ingress)

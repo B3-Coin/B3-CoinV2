@@ -311,6 +311,10 @@ struct FlowMeshNetService::Impl {
         std::string ingress_failure;
         Clock::time_point ingress_pending_since{}, next_ingress_retry{};
         std::chrono::milliseconds ingress_retry_delay{INGRESS_RETRY_INITIAL};
+        // The held frame's last refusal was the chain gate (RECONCILING). Only
+        // such a frame skips its backoff when the sink reports the gate open;
+        // token, queue and limit refusals keep their own schedule.
+        bool ingress_held_by_gate{false};
         std::array<unsigned char, FRAME_PREFIX> prefix{};
         size_t prefix_pos{0};
         Bytes tx;
@@ -568,8 +572,9 @@ struct FlowMeshNetService::Impl {
         }
         if (result == flowmesh::QueueResult::ACCEPTED) {
             rx_bytes[c.channel] -= c.pending_ingress_charge; c.pending_ingress_charge = 0;
-            c.pending_ingress.reset(); return true;
+            c.pending_ingress.reset(); c.ingress_held_by_gate = false; return true;
         }
+        c.ingress_held_by_gate = result == flowmesh::QueueResult::RECONCILING;
         const std::string reason{AdmissionReason(result)};
         peer->second.info.last_ingress_retry = reason;
         if (result == flowmesh::QueueResult::MALFORMED) {
@@ -645,7 +650,7 @@ struct FlowMeshNetService::Impl {
             { std::lock_guard lock{mutex}; ++snapshot.traffic[c.channel].received; ++c.egress->traffic[c.channel].received; }
             c.pending_ingress = std::move(*message);
             c.ingress_pending_since = now; c.next_ingress_retry = now;
-            c.ingress_retry_delay = INGRESS_RETRY_INITIAL;
+            c.ingress_retry_delay = INGRESS_RETRY_INITIAL; c.ingress_held_by_gate = false;
             // Replace raw-frame accounting with the retained decoded charge.
             ReleaseReceive(c);
             c.pending_ingress_charge = decoded_charge;
@@ -947,13 +952,15 @@ struct FlowMeshNetService::Impl {
                     std::array<char, 64> discarded{};
                     (void)wake_reader->Recv(discarded.data(), discarded.size(), 0);
                 }
-                // The sink reports that its refusal reason (normally the B3
-                // reconciliation gate) has cleared. Offer every held frame in
-                // this pass; a renewed refusal restarts the normal backoff.
+                // The sink reports that the B3 reconciliation gate has
+                // reopened. Offer every frame whose last refusal was that gate
+                // in this pass; a renewed refusal restarts the normal backoff.
+                // Frames refused for tokens, queue space or peer/global limits
+                // keep their backoff: the gate says nothing about those.
                 if (const auto ready{ingress_ready.load(std::memory_order_acquire)}; ready != ingress_ready_seen) {
                     ingress_ready_seen = ready;
                     for (auto& [id, c] : connections) {
-                        if (!c->pending_ingress) continue;
+                        if (!c->pending_ingress || !c->ingress_held_by_gate) continue;
                         c->next_ingress_retry = now;
                         c->ingress_retry_delay = INGRESS_RETRY_INITIAL;
                     }
