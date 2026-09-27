@@ -2001,15 +2001,15 @@ BOOST_AUTO_TEST_CASE(client_saved_view_reflects_completed_method)
     BOOST_CHECK(client->SavedActions(uint256::ONE, market).empty());
 }
 
-BOOST_AUTO_TEST_CASE(client_waited_status_of_a_restored_action_takes_the_ordinary_path)
+BOOST_AUTO_TEST_CASE(client_waited_status_without_a_local_market_sends_nothing)
 {
     const fs::path path{m_path_root / "client"};
     const uint256 market{uint256::ONE};
     const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
     const auto action{SeedRetainedAction(path, market, owner)};
     std::atomic<unsigned int> requests{0}, waited{0};
-    // Advertises the wait on every discovery row, but no market exists on the
-    // local chain, so no action read may reach it.
+    // Answers everything with an empty result, which advertises no wait. The
+    // market is not established on this test chain, so no read may reach it.
     node::FlowMeshHttpsServer server{Options(), [&](const node::FlowMeshHttpsServer::Request& request) {
         ++requests;
         if (request.body.find("wait_ms") != std::string::npos) ++waited;
@@ -2019,9 +2019,11 @@ BOOST_AUTO_TEST_CASE(client_waited_status_of_a_restored_action_takes_the_ordinar
     BOOST_REQUIRE_MESSAGE(server.Start(error), error);
     auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server)}, path, error)};
     BOOST_REQUIRE_MESSAGE(client, error);
-    // The endpoint that acknowledged a delivery is volatile, so a restored
-    // action never waits. The ordinary read runs in the same call, with its
-    // local authority check before any network use and the same result.
+    // A waited call returns promptly with the ordinary call's result: the
+    // local authority check fails before any network use on either path.
+    // (flowmesh_client_wait_lane_tests shows, on a chain where the market
+    // exists, that only a delivery acknowledged in this process enables a
+    // waited read.)
     const auto start{std::chrono::steady_clock::now()};
     const auto receipt{client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000})};
     BOOST_CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{1});
@@ -2599,6 +2601,39 @@ BOOST_AUTO_TEST_CASE(lane_reply_leaves_the_active_endpoint_to_ordinary_reads)
     client.reset();
     reads_server->Stop();
     deliverer_server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(lane_needs_a_delivery_acknowledged_in_this_process)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+    validator.plain = validator.submit = validator.waited = Receipt(action, "admitted");
+    validator.waited.pushKV("wait_status", "timeout");
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    // Every other condition holds: the endpoint advertises the wait, the
+    // market is established locally, and the restored action may have been
+    // sent, has no verified or previous inclusion and no refusal. Only the
+    // acknowledging endpoint is unknown after a restart: an ordinary read.
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto restored{client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(restored.state, "admitted");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{1, 0, 0, 1}));
+    // The endpoint acknowledges a redelivery of the same signed bytes; the
+    // same waited call now takes the lane.
+    BOOST_REQUIRE_EQUAL(client->ActionStatus(market, action.Id(), true).state, "admitted");
+    BOOST_REQUIRE((validator.Counts() == std::array<unsigned, 4>{2, 0, 1, 1}));
+    std::this_thread::sleep_for(std::chrono::milliseconds{150}); // Refill the automatic read budget.
+    const auto delivered{client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(delivered.state, "admitted");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{2, 1, 1, 1}));
+    client.reset();
+    server->Stop();
 }
 
 BOOST_AUTO_TEST_SUITE_END()
