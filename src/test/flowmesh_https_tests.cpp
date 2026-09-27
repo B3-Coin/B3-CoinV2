@@ -506,6 +506,46 @@ BOOST_AUTO_TEST_CASE(https_warm_second_request_bounds_reject_before_dispatch)
     BOOST_CHECK_EQUAL(handled.load(), 2U);
 }
 
+BOOST_AUTO_TEST_CASE(https_application_error_reply_keeps_verified_connection)
+{
+    std::atomic<unsigned int> handled{0};
+    node::FlowMeshHttpsServer server{Options(), [&](const auto& request) {
+        ++handled;
+        if (request.body == "reject") return node::FlowMeshHttpsServer::Response{400, "{\"ok\":false}"};
+        if (request.body == "throw") throw std::runtime_error{"handler failure"};
+        if (request.body == "redirect") return node::FlowMeshHttpsServer::Response{302, "https://elsewhere.invalid"};
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    node::FlowMeshHttpsClient client;
+    const auto rejected{client.Request(Endpoint(server), "/flowmesh/v1", "reject", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(rejected.response_received, rejected.error);
+    BOOST_CHECK_EQUAL(rejected.status, 400);
+    BOOST_CHECK_EQUAL(rejected.body, "{\"ok\":false}");
+    BOOST_CHECK(rejected.error.empty());
+    BOOST_CHECK(!rejected.connection_reused);
+    const auto failed{client.Request(Endpoint(server), "/flowmesh/v1", "throw", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(failed.response_received, failed.error);
+    BOOST_CHECK_EQUAL(failed.status, 500);
+    BOOST_CHECK(failed.connection_reused);
+    const auto next{client.Request(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(next.response_received, next.error);
+    BOOST_CHECK_EQUAL(next.status, 200);
+    BOOST_CHECK(next.connection_reused);
+    BOOST_CHECK(!next.tls_handshake_performed);
+    // A refused redirect is still an error and never keeps the connection.
+    const auto redirect{client.Request(Endpoint(server), "/flowmesh/v1", "redirect", std::chrono::seconds{2}, 1024)};
+    BOOST_CHECK_EQUAL(redirect.error, "https-redirect-refused");
+    BOOST_CHECK(redirect.connection_reused);
+    const auto after_redirect{client.Request(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(after_redirect.response_received, after_redirect.error);
+    BOOST_CHECK(!after_redirect.connection_reused);
+    BOOST_CHECK(after_redirect.tls_handshake_performed);
+    BOOST_CHECK_EQUAL(handled.load(), 5U);
+    server.Stop();
+}
+
 BOOST_AUTO_TEST_CASE(https_warm_pin_and_replaced_ca_revalidate_before_dispatch)
 {
     std::atomic<unsigned int> handled{0};

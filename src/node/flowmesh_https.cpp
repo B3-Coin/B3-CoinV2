@@ -883,8 +883,11 @@ HttpsRequestResult FlowMeshHttpsClient::Request(const HttpsEndpoint& endpoint, c
     if (!call.complete && call.result.error.empty()) call.result.error = "https-transport-failed";
     ++state.requests;
     state.last_used = Clock::now();
+    // An application-level 4xx/5xx is a complete, exactly framed reply and keeps
+    // the verified connection. Redirects and transport errors still reset, and
+    // server-side transport rejections always close.
     if (!call.complete || !call.result.response_received || !call.result.error.empty() ||
-        call.result.status >= 400 || !call.response_reusable || !state.Reusable()) Reset();
+        !call.response_reusable || !state.Reusable()) Reset();
     return call.result;
 }
 
