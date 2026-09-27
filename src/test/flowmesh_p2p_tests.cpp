@@ -344,6 +344,75 @@ BOOST_AUTO_TEST_CASE(settled_frames_are_bounded_per_peer_across_markets)
     BOOST_CHECK(queue.ConsumeSettled(3, in_market(6), third) == QueueResult::ACCEPTED);
 }
 
+// The peek admission runs before costly work reports whether either budget
+// could still admit a committee frame, with Push's framing verdict first,
+// and spends and refills nothing.
+BOOST_AUTO_TEST_CASE(settled_or_committee_peek_spends_nothing)
+{
+    using namespace flowmesh;
+    BoundedWireQueue queue;
+    const auto now{WireClock::time_point{std::chrono::seconds{600}}};
+    const auto certificate{Message(WireMessageKind::CERTIFICATE, 64)};
+    auto truncated{Message(WireMessageKind::AGREEMENT)};
+    truncated.payload.pop_back();
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, truncated, now) == QueueResult::MALFORMED);
+    // A peer never seen has both budgets whole.
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, certificate, now) == QueueResult::ACCEPTED);
+
+    // Settled budget spent, committee budget whole: still admissible. Many
+    // peeks leave the committee budget exactly as it was.
+    const auto settled_burst{static_cast<size_t>(FLOWMESH_SETTLED_TOKEN_BURST)};
+    for (size_t i{0}; i < settled_burst; ++i) {
+        BOOST_REQUIRE(queue.ConsumeSettled(3, certificate, now) == QueueResult::ACCEPTED);
+    }
+    BOOST_REQUIRE(queue.ConsumeSettled(3, certificate, now) == QueueResult::RATE_LIMITED);
+    for (size_t i{0}; i < 100; ++i) {
+        BOOST_REQUIRE(queue.PeekSettledOrCommittee(3, certificate, now) == QueueResult::ACCEPTED);
+    }
+    const auto committee_burst{static_cast<size_t>(FLOWMESH_COMMITTEE_TOKEN_BURST)};
+    for (size_t i{0}; i < committee_burst; ++i) {
+        BOOST_REQUIRE(queue.Push(3, certificate, now) == QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(queue.Push(3, certificate, now) == QueueResult::RATE_LIMITED);
+    // Neither budget can admit it now.
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, certificate, now) == QueueResult::RATE_LIMITED);
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, truncated, now) == QueueResult::MALFORMED);
+    // Only committee frames are judged; other peers and markets have their own.
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, Message(WireMessageKind::ACTION), now) == QueueResult::ACCEPTED);
+    BOOST_CHECK(queue.PeekSettledOrCommittee(4, certificate, now) == QueueResult::ACCEPTED);
+    auto other_market{certificate};
+    other_market.header.market_id.begin()[1] = 7;
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, other_market, now) == QueueResult::ACCEPTED);
+
+    // One refilled settled token makes it admissible again, and the peek
+    // leaves that token for the admission that follows.
+    const auto settled_token{now + std::chrono::milliseconds{1000 / static_cast<int>(FLOWMESH_SETTLED_TOKEN_RATE) + 1}};
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, certificate, settled_token) == QueueResult::ACCEPTED);
+    BOOST_CHECK(queue.ConsumeSettled(3, certificate, settled_token) == QueueResult::ACCEPTED);
+    BOOST_CHECK(queue.ConsumeSettled(3, certificate, settled_token) == QueueResult::RATE_LIMITED);
+    BOOST_CHECK(queue.PeekSettledOrCommittee(3, certificate, settled_token) == QueueResult::RATE_LIMITED);
+
+    // The per-peer budget across markets counts: in a market whose own
+    // settled budget is whole, a peer with no settled token left across
+    // markets and no committee token there is refused.
+    BoundedWireQueue across;
+    for (unsigned char market{1}; market <= 2; ++market) {
+        auto frame{certificate};
+        frame.header.market_id.begin()[1] = market;
+        for (size_t i{0}; i < settled_burst; ++i) {
+            BOOST_REQUIRE(across.ConsumeSettled(5, frame, now) == QueueResult::ACCEPTED);
+        }
+    }
+    auto third{certificate};
+    third.header.market_id.begin()[1] = 3;
+    BOOST_REQUIRE(across.ConsumeSettled(5, third, now) == QueueResult::RATE_LIMITED);
+    BOOST_CHECK(across.PeekSettledOrCommittee(5, third, now) == QueueResult::ACCEPTED); // committee whole
+    for (size_t i{0}; i < committee_burst; ++i) {
+        BOOST_REQUIRE(across.Push(5, third, now) == QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(across.PeekSettledOrCommittee(5, third, now) == QueueResult::RATE_LIMITED);
+}
+
 BOOST_AUTO_TEST_CASE(lower_priority_work_is_evicted_but_b3_has_no_dependency)
 {
     using namespace flowmesh;

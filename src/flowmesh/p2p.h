@@ -223,6 +223,15 @@ public:
     //! or neither. ACCEPTED means consumed.
     QueueResult ConsumeSettled(WirePeerId peer, const WireMessage& message,
                                WireClock::time_point now = WireClock::now());
+    //! For a committee frame, and without spending or refilling anything:
+    //! MALFORMED on Push's framing verdict; otherwise RATE_LIMITED when
+    //! neither ConsumeSettled's budgets nor Push's committee budget has a
+    //! token for it at `now`, else ACCEPTED. Queue capacity is not checked,
+    //! and other kinds are always ACCEPTED. It lets a caller skip costly
+    //! work, such as hashing a large frame, for a frame that both admissions
+    //! would refuse RATE_LIMITED.
+    QueueResult PeekSettledOrCommittee(WirePeerId peer, const WireMessage& message,
+                                       WireClock::time_point now = WireClock::now()) const;
     std::optional<QueuedWireMessage> Pop();
     void RemovePeer(WirePeerId peer);
 

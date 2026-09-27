@@ -7355,6 +7355,107 @@ BOOST_AUTO_TEST_CASE(settled_slot_frames_spend_a_separate_bounded_budget)
     BOOST_CHECK(receiver.MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
 }
 
+// Admission hashes a certificate's entry bytes, or an agreement payload the
+// quiet record may hold, only while the sender still has a settled or a
+// committee token that could admit the frame. A frame that neither budget
+// could admit is refused RATE_LIMITED unhashed (a refused FMN2 frame is
+// offered again on every retry); otherwise results are the hashed path's.
+BOOST_AUTO_TEST_CASE(admission_hashes_no_frame_that_no_budget_could_admit)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "admission_hash_budget",
+                                 std::chrono::seconds{2}, 1, true};
+    f.block_commits = false;
+    BOOST_REQUIRE(f.StepUntil(1, std::chrono::seconds{10}));
+    f.Tick(); // every worker has retired slot 0's verified agreement bytes
+    BOOST_REQUIRE(!f.links.delivered.empty());
+    const auto sample{f.links.delivered.front()};
+    BOOST_REQUIRE_EQUAL(sample.message.header.sequence, 0U);
+    auto& receiver{*f.runtimes[sample.to]};
+    const auto sender{static_cast<flowmesh::WirePeerId>(sample.from)};
+    const auto snapshot = [&] {
+        const auto snapshots{receiver.DeliverySnapshots(f.market)};
+        BOOST_REQUIRE_EQUAL(snapshots.size(), 1U);
+        return snapshots.front();
+    };
+    const auto enqueue = [&](const flowmesh::WireMessage& message) {
+        return receiver.EnqueueWireMessage(sender, message);
+    };
+    std::string error;
+    std::optional<node::StoredProductionEntry> stored;
+    BOOST_REQUIRE(f.stores[sample.to]->ReadEntry(0, f.seats.seats, stored, error));
+    BOOST_REQUIRE(stored);
+    const auto payload{flowmesh::EncodeProductionCertifiedPayload(
+        {stored->entry, stored->certificate}, f.seats.seats.Size())};
+    BOOST_REQUIRE(payload);
+    const flowmesh::WireHeader applied{flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, stored->entry.epoch, 0};
+    flowmesh::WireHeader current{applied};
+    current.sequence = 1;
+    const flowmesh::WireMessage certificate{flowmesh::WireMessageKind::CERTIFICATE, applied, *payload};
+    auto conflicting{certificate}; // other entry bytes under the recorded header
+    conflicting.payload[flowmesh::FLOWMESH_CERTIFIED_PAYLOAD_PREFIX_SIZE + 8] ^= 1;
+    auto relabelled{sample.message}; // verified agreement bytes under another header
+    ++relabelled.header.epoch;
+    auto misframed{sample.message};
+    misframed.payload[0] ^= 0xff;
+    const uint256 digest{Filled(0x5e)};
+    const auto vote{flowmesh::EncodeProductionAttestationPayload(
+        {1, f.seats.secrets[1].Sign(std::span<const unsigned char>{digest.begin(), 32})})};
+    BOOST_REQUIRE(vote);
+    const flowmesh::WireMessage settled_vote{flowmesh::WireMessageKind::ATTESTATION, applied, *vote};
+    const flowmesh::WireMessage current_vote{flowmesh::WireMessageKind::ATTESTATION, current, *vote};
+
+    // Let the sender's budgets refill after the slot's own traffic, then
+    // freeze the receiver's clock.
+    f.clocks[sample.to].m_now += std::chrono::seconds{5};
+    const auto before{snapshot()};
+    const auto hashes{receiver.AdmissionHashCountForTest()};
+    // With tokens left each is hashed, as before: exact copies are consumed
+    // and known bytes under another header are malformed.
+    BOOST_CHECK(enqueue(certificate) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_CHECK(enqueue(sample.message) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_CHECK(enqueue(relabelled) == flowmesh::QueueResult::MALFORMED);
+    BOOST_CHECK_EQUAL(receiver.AdmissionHashCountForTest(), hashes + 3);
+    // Spend the rest of the settled budget on frames that need no hash.
+    size_t consumed{0};
+    while (consumed < 300 && enqueue(settled_vote) == flowmesh::QueueResult::ACCEPTED) ++consumed;
+    BOOST_CHECK_EQUAL(consumed, 254U);
+    // The committee budget can still admit a certificate, so it is hashed:
+    // other entry bytes take the committee path, and an exact copy is
+    // refused by the spent settled budget, exactly as before.
+    BOOST_CHECK(enqueue(conflicting) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_CHECK(enqueue(certificate) == flowmesh::QueueResult::RATE_LIMITED);
+    BOOST_CHECK_EQUAL(receiver.AdmissionHashCountForTest(), hashes + 5);
+    // Spend the rest of the committee budget.
+    size_t queued{0};
+    while (queued < 40 && enqueue(current_vote) == flowmesh::QueueResult::ACCEPTED) ++queued;
+    BOOST_CHECK_EQUAL(queued, 31U);
+
+    // Now neither budget could admit any of these: refused unhashed. The
+    // framing verdict still comes first.
+    BOOST_CHECK(enqueue(certificate) == flowmesh::QueueResult::RATE_LIMITED);
+    BOOST_CHECK(enqueue(conflicting) == flowmesh::QueueResult::RATE_LIMITED);
+    BOOST_CHECK(enqueue(sample.message) == flowmesh::QueueResult::RATE_LIMITED);
+    BOOST_CHECK(enqueue(relabelled) == flowmesh::QueueResult::RATE_LIMITED);
+    BOOST_CHECK(enqueue(misframed) == flowmesh::QueueResult::MALFORMED);
+    BOOST_CHECK_EQUAL(receiver.AdmissionHashCountForTest(), hashes + 5);
+    f.Drain();
+    auto after{snapshot()};
+    BOOST_CHECK_EQUAL(after.agreement_duplicates_coalesced, before.agreement_duplicates_coalesced + 1);
+    BOOST_CHECK_EQUAL(after.certified_slot_frames_consumed, before.certified_slot_frames_consumed + 1 + 254);
+    // One vote and one certificate refused by the settled budget after
+    // hashing, and four refused before hashing.
+    BOOST_CHECK_EQUAL(after.settled_frames_rate_limited, before.settled_frames_rate_limited + 6);
+
+    // Once a token is back the refused frames are judged as before; the
+    // relabelled copy is found malformed on its retry.
+    f.clocks[sample.to].m_now += std::chrono::seconds{1};
+    BOOST_CHECK(enqueue(relabelled) == flowmesh::QueueResult::MALFORMED);
+    BOOST_CHECK(enqueue(certificate) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_CHECK_EQUAL(receiver.AdmissionHashCountForTest(), hashes + 7);
+    f.Drain();
+    BOOST_CHECK(receiver.MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+}
+
 BOOST_AUTO_TEST_CASE(preagreement_certified_duplicate_stays_quiet_after_backoff_expires)
 {
     PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_duplicate_old_slot",

@@ -694,8 +694,11 @@ struct WorkerTrace {
     // admission. certified_slot_consumed: a committee frame for a slot this
     // worker has already appended, consumed at admission. Neither is queued.
     // settled_rate_limited: either kind refused because the sender's
-    // separate budget for consumed frames is empty.
+    // separate budget for consumed frames is empty. refused_before_hash: a
+    // frame refused before its bytes were hashed, because no budget of the
+    // sender could admit it (or its framing is malformed).
     bool coalesced{false}, certified_slot_consumed{false}, settled_rate_limited{false};
+    bool refused_before_hash{false};
     bool delivery_completion{false}, predicate_ready_before_wait{false};
     std::optional<flowmesh::WireHeader> header;
     flowmesh::WireMessageKind kind{flowmesh::WireMessageKind::ACTION};
@@ -759,6 +762,7 @@ struct WorkerTrace {
             row.pushKV("coalesced", coalesced);
             row.pushKV("certified_slot_consumed", certified_slot_consumed);
             row.pushKV("settled_rate_limited", settled_rate_limited);
+            row.pushKV("refused_before_hash", refused_before_hash);
             row.pushKV("delivery_completion", delivery_completion);
             if (header) {
                 row.pushKV("market_id", header->market_id.GetHex());
@@ -2451,6 +2455,12 @@ void FlowMeshRuntime::ProcessDeliveryEvent(const FlowMeshDeliveryEvent& event)
     // Written is not remotely verified: retain while semantically relevant.
 }
 
+uint64_t FlowMeshRuntime::AdmissionHashCountForTest() const
+{
+    std::lock_guard<std::mutex> lock{m_queue_mutex};
+    return m_admission_hashes;
+}
+
 std::vector<FlowMeshRuntimeDeliverySnapshot> FlowMeshRuntime::DeliverySnapshots(
     const std::optional<flowmesh::MarketId> market_id) const
 {
@@ -3076,17 +3086,15 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
         (message.payload.empty() || message.payload.size() > flowmesh::FLOWMESH_AGREEMENT_MAX_BYTES)) {
         return flowmesh::QueueResult::MALFORMED;
     }
-    // Hash outside the queue lock; a bounded frame is at most four MiB.
-    const std::optional<uint256> agreement_payload{
-        message.kind == flowmesh::WireMessageKind::AGREEMENT
-            ? std::optional<uint256>{Hash(message.payload)} : std::nullopt};
-    // A CERTIFICATE's entry bytes (up to 2 MiB) are hashed only when the
-    // record of recent appends holds an entry under this exact wire header,
-    // and never under the queue lock (see below). A first copy of a new
-    // certificate is never hashed here.
+    // An AGREEMENT's payload (up to 4 MiB) is hashed only when this market
+    // has verified agreement bytes on record, and a CERTIFICATE's entry
+    // bytes (up to 2 MiB) only when the record of recent appends holds an
+    // entry under this exact wire header. Either is hashed outside the queue
+    // lock and only while the sender could still be admitted (hash_unlocked
+    // below). A first copy of a new certificate is never hashed here.
     const auto certificate_bytes{message.kind == flowmesh::WireMessageKind::CERTIFICATE
         ? CertifiedEntryBytes(message.payload) : std::nullopt};
-    std::optional<uint256> certificate_entry;
+    std::optional<uint256> agreement_payload, certificate_entry;
     if (trace.enabled) trace.queue_lock_requested_us = TraceNow(*m_config.clock);
     std::unique_lock<std::mutex> lock{m_queue_mutex};
     if (trace.enabled) {
@@ -3130,6 +3138,40 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
         }
         return result;
     };
+    // Hashing is admission's one costly step, and a refused FMN2 frame is
+    // offered again on every retry (100 ms..1 s backoff for up to 30 s).
+    // Before unlocking to hash, check without spending whether the sender
+    // still has a settled or a committee token that could admit this frame.
+    // If neither could, the frame is refused RATE_LIMITED unhashed, whatever
+    // its hash, and counted with the settled refusals (its settled budget is
+    // empty). Only one verdict moves: exact agreement bytes under a changed
+    // header, which the hash shows to be MALFORMED, are found so on a retry
+    // once a token is back. In every other case the result is the hashed
+    // path's. Returns the early result, or nullopt with `out` set and the
+    // lock held again.
+    const auto hash_unlocked = [&](const auto& bytes, std::optional<uint256>& out)
+        -> std::optional<flowmesh::QueueResult> { // Caller holds `lock`.
+        const auto admissible{m_queue.PeekSettledOrCommittee(peer, message, m_config.clock->Now())};
+        if (admissible != flowmesh::QueueResult::ACCEPTED) {
+            if (admissible == flowmesh::QueueResult::RATE_LIMITED) ++m_settled_rate_limited[message.header.market_id];
+            if (trace.enabled) {
+                trace.result = admissible;
+                trace.settled_rate_limited = admissible == flowmesh::QueueResult::RATE_LIMITED;
+                trace.refused_before_hash = true;
+            }
+            return admissible;
+        }
+        ++m_admission_hashes;
+        lock.unlock();
+        out = Hash(bytes);
+        lock.lock();
+        // Admission may have stopped, or the market been reset, meanwhile.
+        if (!m_started || m_stopping) return flowmesh::QueueResult::STOPPED;
+        if (m_admitted_markets.count(message.header.market_id) == 0) {
+            return flowmesh::QueueResult::MARKET_LIMIT;
+        }
+        return std::nullopt;
+    };
     // The agreement engine already verified and retained these exact bytes.
     // Another copy can add no vote or proof, but it used to spend one of the
     // sender's eight committee admissions per second and, once refused, hold
@@ -3137,6 +3179,12 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     // first proposal. Consume it here. A copy is let through again whenever
     // its recovery forward is due, and different bytes (such as a COMMIT
     // repeated with newly attached proof) are never matched.
+    if (message.kind == flowmesh::WireMessageKind::AGREEMENT) {
+        const auto quiet{m_agreement_quiet.find(message.header.market_id)};
+        if (quiet != m_agreement_quiet.end() && !quiet->second.payloads.empty()) {
+            if (const auto early{hash_unlocked(message.payload, agreement_payload)}) return *early;
+        }
+    }
     if (agreement_payload) {
         const auto quiet{m_agreement_quiet.find(message.header.market_id)};
         if (quiet != m_agreement_quiet.end()) {
@@ -3176,8 +3224,9 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     //
     // Cheap checks first, under the lock: a recorded append for this market,
     // a sequence below the next one to append and, for a CERTIFICATE, a
-    // recorded entry under the same wire header. Only then are the entry
-    // bytes hashed, outside the lock, and the record consulted again.
+    // recorded entry under the same wire header. Only then, and only if the
+    // sender could still be admitted, are the entry bytes hashed, outside
+    // the lock, and the record consulted again.
     enum class Settled { NO, YES, NEEDS_ENTRY_HASH };
     const auto settled_slot = [&] { // Caller holds m_queue_mutex.
         if (message.kind != flowmesh::WireMessageKind::ATTESTATION &&
@@ -3197,14 +3246,7 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     };
     auto settled{settled_slot()};
     if (settled == Settled::NEEDS_ENTRY_HASH) {
-        lock.unlock();
-        certificate_entry = Hash(*certificate_bytes);
-        lock.lock();
-        // Admission may have stopped, or the market been reset, meanwhile.
-        if (!m_started || m_stopping) return flowmesh::QueueResult::STOPPED;
-        if (m_admitted_markets.count(message.header.market_id) == 0) {
-            return flowmesh::QueueResult::MARKET_LIMIT;
-        }
+        if (const auto early{hash_unlocked(*certificate_bytes, certificate_entry)}) return *early;
         settled = settled_slot();
     }
     if (settled == Settled::YES) {

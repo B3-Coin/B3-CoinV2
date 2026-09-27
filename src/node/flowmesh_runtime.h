@@ -223,9 +223,11 @@ struct FlowMeshRuntimeDeliverySnapshot {
     uint64_t certified_slot_frames_consumed{0};
     // Frames of either kind above refused RATE_LIMITED because their sender
     // spent one of its separate budgets for consumed frames (per market, or
-    // across all markets). Honest relays measured with four validators stay
-    // far below both; a non-zero value points at a flooding peer, or at a
-    // larger committee whose honest relays outgrew the sizing.
+    // across all markets). This includes a frame refused before admission
+    // hashed it, because its sender had no settled and no committee token
+    // left. Honest relays measured with four validators stay far below both
+    // budgets; a non-zero value points at a flooding peer, or at a larger
+    // committee whose honest relays outgrew the sizing.
     uint64_t settled_frames_rate_limited{0};
     size_t pending_objects{0}, pending_bytes{0};
     size_t deferred_objects{0}, deferred_bytes{0};
@@ -527,6 +529,9 @@ public:
     std::vector<FlowMeshRuntimeDeliverySnapshot> DeliverySnapshots(
         std::optional<flowmesh::MarketId> market = std::nullopt) const;
 
+    /** Test-only: how many frames' bytes admission has hashed so far. */
+    uint64_t AdmissionHashCountForTest() const;
+
 private:
     struct Market;
     struct CatchupCommand {
@@ -661,6 +666,9 @@ private:
     //! Admitted markets only; guarded by m_queue_mutex. Diagnostic count of
     //! frames refused because their sender's settled-frame budget was spent.
     std::map<flowmesh::MarketId, uint64_t> m_settled_rate_limited;
+    //! Guarded by m_queue_mutex. Frames whose bytes admission hashed (an
+    //! agreement payload, a certificate's entry bytes); test observation.
+    uint64_t m_admission_hashes{0};
     void NoteCertifiedAdmission(const flowmesh::WireHeader& header, const uint256& entry_bytes_hash,
                                 uint64_t next_sequence);
     //! Negotiated connections only, capped independently of incoming hints.

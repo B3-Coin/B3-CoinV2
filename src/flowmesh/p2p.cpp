@@ -564,6 +564,28 @@ QueueResult BoundedWireQueue::ConsumeSettled(const WirePeerId peer, const WireMe
     return QueueResult::ACCEPTED;
 }
 
+QueueResult BoundedWireQueue::PeekSettledOrCommittee(const WirePeerId peer, const WireMessage& message,
+                                                     const WireClock::time_point now) const
+{
+    WireCheck check;
+    if (!CheckWireMessage(message, check)) return QueueResult::MALFORMED;
+    if (message.kind != WireMessageKind::PROPOSAL && message.kind != WireMessageKind::ATTESTATION &&
+        message.kind != WireMessageKind::CERTIFICATE && message.kind != WireMessageKind::AGREEMENT) {
+        return QueueResult::ACCEPTED;
+    }
+    // Refill copies with the spending paths' own arithmetic. A bucket that
+    // does not exist yet would be created full.
+    TokenBucket pair;
+    if (const auto it{m_tokens.find({peer, message.header.market_id})}; it != m_tokens.end()) pair = it->second;
+    Refill(pair, now);
+    SettledPeerBucket across;
+    if (const auto it{m_settled_peer_tokens.find(peer)}; it != m_settled_peer_tokens.end()) across = it->second;
+    Refill(across, now);
+    const bool settled{pair.settled_tokens >= 1.0 && across.tokens >= 1.0};
+    const bool committee{pair.committee_tokens >= 1.0};
+    return settled || committee ? QueueResult::ACCEPTED : QueueResult::RATE_LIMITED;
+}
+
 std::optional<QueuedWireMessage> BoundedWireQueue::Pop()
 {
     for (auto& lane : m_lanes) {
