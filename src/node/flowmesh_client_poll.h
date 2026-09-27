@@ -83,6 +83,17 @@ public:
         return true;
     }
 
+    //! An opportunistic waited read may use the same budget only when no
+    //! ordinary demand is queued. Refusal neither charges nor removes work;
+    //! the caller falls back to Demand/Take, preserving FIFO service even
+    //! when its own action is already queued. Ordinary selected work and its
+    //! endpoint failover continue to use TryChargeAttempt.
+    bool TryChargeUnqueuedAttempt(TimePoint now)
+    {
+        if (!m_demand.empty()) return false;
+        return TryChargeAttempt(now);
+    }
+
     bool CanAttempt(TimePoint now)
     {
         Advance(now);

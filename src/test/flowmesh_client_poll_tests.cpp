@@ -96,6 +96,81 @@ BOOST_AUTO_TEST_CASE(each_failed_or_successful_endpoint_attempt_is_charged)
     BOOST_CHECK_EQUAL(poll.AttemptsInWindow(start + Poll::REFILL_INTERVAL), 3U);
 }
 
+BOOST_AUTO_TEST_CASE(waited_fast_path_yields_to_older_ordinary_demand)
+{
+    Poll poll;
+    // Equal bare ActionIds in different markets must remain distinct.
+    const auto hot{Key(1, 7)}, older{Key(2, 7)}, next{Key(2, 8)};
+    const Poll::TimePoint start{};
+    BOOST_REQUIRE(poll.TryChargeUnqueuedAttempt(start));
+    BOOST_REQUIRE(poll.TryChargeUnqueuedAttempt(start));
+    BOOST_REQUIRE(poll.Demand(older));
+    BOOST_REQUIRE(poll.Demand(next));
+    BOOST_CHECK(!poll.Take(start));
+
+    const std::array expected{older, next, hot};
+    for (size_t i{0}; i < expected.size(); ++i) {
+        const auto now{start + Poll::REFILL_INTERVAL * (i + 1)};
+        // A hot waited caller arrives first at every token refill. Before
+        // the queue guard, it spends that token on itself and starves Take.
+        BOOST_CHECK(!poll.TryChargeUnqueuedAttempt(now));
+        BOOST_CHECK_EQUAL(poll.AttemptsInWindow(now), i + 2);
+        // Model ActionStatus's same-call ordinary fallback: enqueue only
+        // its own key, then service the oldest demand, not necessarily itself.
+        BOOST_REQUIRE(poll.Demand(hot));
+        const auto selected{poll.Take(now)};
+        BOOST_REQUIRE(selected);
+        BOOST_CHECK(*selected == expected[i]);
+        BOOST_REQUIRE(poll.TryChargeAttempt(now));
+        BOOST_REQUIRE(poll.MarkObserved(*selected));
+        BOOST_CHECK_EQUAL(poll.HasObservation(hot), i == expected.size() - 1);
+        BOOST_CHECK(!poll.Take(now));
+    }
+    BOOST_CHECK_EQUAL(poll.DemandCount(), 0U);
+    BOOST_CHECK(poll.TryChargeUnqueuedAttempt(start + 4 * Poll::REFILL_INTERVAL));
+    BOOST_CHECK_EQUAL(poll.AttemptsInWindow(start + 4 * Poll::REFILL_INTERVAL), 6U);
+}
+
+BOOST_AUTO_TEST_CASE(waited_fast_path_yields_even_when_only_its_own_key_is_queued)
+{
+    Poll poll;
+    const auto key{Key(1, 7)};
+    const Poll::TimePoint now{};
+    BOOST_REQUIRE(poll.Demand(key));
+    BOOST_CHECK(!poll.TryChargeUnqueuedAttempt(now));
+    BOOST_CHECK_EQUAL(poll.AttemptsInWindow(now), 0U);
+    BOOST_REQUIRE(poll.Demand(key));
+    BOOST_CHECK_EQUAL(poll.DemandCount(), 1U);
+    const auto selected{poll.Take(now)};
+    BOOST_REQUIRE(selected);
+    BOOST_CHECK(*selected == key);
+    BOOST_REQUIRE(poll.TryChargeAttempt(now));
+    BOOST_CHECK_EQUAL(poll.DemandCount(), 0U);
+    BOOST_CHECK(!poll.HasObservation(key));
+    BOOST_CHECK(poll.TryChargeUnqueuedAttempt(now));
+    BOOST_CHECK(!poll.TryChargeUnqueuedAttempt(now));
+    BOOST_CHECK_EQUAL(poll.AttemptsInWindow(now), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(waited_and_ordinary_attempts_share_one_rolling_budget)
+{
+    Poll poll;
+    const Poll::TimePoint start{};
+    BOOST_REQUIRE(poll.TryChargeUnqueuedAttempt(start));
+    BOOST_REQUIRE(poll.TryChargeAttempt(start));
+    for (size_t i{1}; i <= 14; ++i) {
+        const auto now{start + Poll::REFILL_INTERVAL * i};
+        BOOST_REQUIRE(i % 2 ? poll.TryChargeUnqueuedAttempt(now) : poll.TryChargeAttempt(now));
+    }
+    BOOST_CHECK(!poll.TryChargeUnqueuedAttempt(start + Poll::REFILL_INTERVAL * 15));
+    BOOST_CHECK(!poll.TryChargeAttempt(start + Poll::WINDOW - 1us));
+    BOOST_CHECK_EQUAL(poll.AttemptsInWindow(start + Poll::WINDOW - 1us), 16U);
+    BOOST_CHECK(poll.TryChargeUnqueuedAttempt(start + Poll::WINDOW));
+    BOOST_CHECK(poll.TryChargeAttempt(start + Poll::WINDOW));
+    BOOST_CHECK(!poll.TryChargeUnqueuedAttempt(start + Poll::WINDOW));
+    BOOST_CHECK_EQUAL(poll.AttemptsInWindow(start + Poll::WINDOW), 16U);
+}
+
 BOOST_AUTO_TEST_CASE(smooth_refill_still_obeys_rolling_sixteen_attempt_cap)
 {
     Poll poll;

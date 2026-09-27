@@ -1537,8 +1537,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             // cooldown, and only a successful response clears 'unanswered'.
             if (std::chrono::steady_clock::now() < m_retry_after.at(endpoint)) { outcome("cooldown"); return std::nullopt; }
             if (m_wait_unanswered.at(endpoint)) { outcome("unanswered"); return std::nullopt; }
-            // Exactly one automatic attempt, charged before transport starts.
-            if (!m_action_polls.TryChargeAttempt(std::chrono::steady_clock::now())) { outcome("coalesced"); return std::nullopt; }
+            // Do not let this opportunistic lane bypass queued status work.
+            // Refusal falls through to the ordinary FIFO path in the same
+            // ActionStatus call, which still returns only this action's receipt.
+            if (!m_action_polls.TryChargeUnqueuedAttempt(std::chrono::steady_clock::now())) { outcome("coalesced"); return std::nullopt; }
             target = m_endpoints.at(endpoint);
         }
         timing.Field("wait_ms", uint64_t(wait.count()));
