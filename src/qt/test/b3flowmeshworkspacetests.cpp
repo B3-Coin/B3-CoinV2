@@ -160,6 +160,35 @@ struct StatusReadProbe {
     ~StatusReadProbe() { tableRPC.removeCommand(command.name, &command); }
 };
 
+// The post-submit waited status read, intercepted like StatusReadProbe. A
+// success is a certified-inclusion receipt; nothing is signed or resent.
+struct WaitedReceiptProbe {
+    QSemaphore entered, release;
+    std::atomic_int count{0};
+    std::atomic_bool fail{false};
+    std::mutex mutex;
+    std::vector<UniValue> params;
+    CRPCCommand command;
+    WaitedReceiptProbe() : command{"hidden", "getflowmeshactionstatus",
+        [this](const JSONRPCRequest& request, UniValue& result, bool) {
+            { std::lock_guard lock{mutex}; params.push_back(request.params); }
+            ++count; entered.release();
+            if (!release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic waited status exceeded its test bound"};
+            if (fail) throw std::runtime_error{"Synthetic waited status endpoint unavailable"};
+            result = UniValue{UniValue::VOBJ};
+            result.pushKV("market_id", request.params[0].get_str()); result.pushKV("action_id", request.params[1].get_str());
+            result.pushKV("accepted", true); result.pushKV("receipt_state", "certified_inclusion");
+            result.pushKV("reason", "Canonical action inclusion verified"); result.pushKV("endpoint", "https://operator.invalid:18443");
+            result.pushKV("certificate_verified", true); result.pushKV("outcome_verified", false);
+            result.pushKV("microblock_hash", H(97).GetHex()); result.pushKV("microblock_sequence", 5);
+            return true;
+        }, {}, 998866} {
+        if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
+        tableRPC.appendCommand(command.name, &command);
+    }
+    ~WaitedReceiptProbe() { tableRPC.removeCommand(command.name, &command); }
+};
+
 UniValue ConnectionInfo(const std::string& url = "https://trading.invalid", bool attempted = true, bool transport = true, bool available = true)
 {
     UniValue info{UniValue::VOBJ}; info.pushKV("backend", "remote"); info.pushKV("engine_enabled", false);
@@ -2811,6 +2840,69 @@ private Q_SLOTS:
         QCOMPARE(panel.m_receipt->market, second.market); QVERIFY(panel.m_receipt->no_resubmit);
         QCOMPARE(panel.m_saved_actions.actions[0].signed_bytes_sha256, saved.actions[0].signed_bytes_sha256);
         if (failure || wrong_account) QVERIFY(!panel.m_receipt_error.isEmpty());
+    }
+
+    void signedActionWaitsOnceForItsReceiptAndFailureStaysCertain_data()
+    {
+        QTest::addColumn<QString>("mode");
+        for (const auto* mode : {"certified", "failure", "rejected", "local"}) QTest::newRow(mode) << QString::fromLatin1(mode);
+    }
+    void signedActionWaitsOnceForItsReceiptAndFailureStaysCertain()
+    {
+        QFETCH(QString, mode);
+        WaitedReceiptProbe probe; probe.fail = mode == QStringLiteral("failure");
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        struct Cleanup { WaitedReceiptProbe& probe; B3FlowMeshTradingPanel& panel; ~Cleanup() { probe.release.release(8); panel.cancelAndWait(); } } cleanup{probe, panel};
+        const bool remote{mode != QStringLiteral("local")};
+        if (remote) Observe(panel, Parse(RemoteData()));
+        QCOMPARE(panel.m_market_data.front().remote, remote);
+        QSignalSpy unlock{m_model.get(), &WalletModel::requireUnlock};
+        // The exact private result of a signed order whose submission returned.
+        auto result{std::make_shared<B3FlowMeshTradingPanel::Result>()};
+        B3FlowMeshTrading::Action action;
+        action.operation = B3FlowMeshTrading::Operation::Order; action.market = panel.m_market_data.front();
+        action.side = QStringLiteral("bid"); action.price = 1000; action.amount = 1;
+        result->action = action; result->wallet = panel.m_wallet_name; result->write_attempted = true;
+        B3FlowMeshTrading::Receipt receipt; receipt.action_id = QString::fromStdString(H(98).GetHex()); receipt.market = action.market.id;
+        receipt.state = mode == QStringLiteral("rejected") ? QStringLiteral("rejected") : QStringLiteral("queued");
+        result->receipt = receipt;
+        panel.m_busy = true;
+        panel.finishJob(result);
+        if (mode == QStringLiteral("rejected") || mode == QStringLiteral("local")) {
+            // Terminal, or no transport to wait on: only the ordinary refresh.
+            QVERIFY(!panel.m_active_result || !panel.m_active_result->receipt_wait);
+            QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+            QCOMPARE(probe.count.load(), 0);
+            return;
+        }
+        QVERIFY(probe.entered.tryAcquire(1, 1000));
+        const auto waited{panel.m_active_result}; QVERIFY(waited);
+        QVERIFY(waited->receipt_wait); QVERIFY(!waited->passive); QVERIFY(!waited->write_attempted);
+        QVERIFY(!waited->action); QVERIFY(!waited->exact_retry); QVERIFY(!waited->receipt_only);
+        QVERIFY(!panel.m_busy); QVERIFY(!panel.m_uncertain);
+        {
+            std::lock_guard lock{probe.mutex}; QCOMPARE(probe.params.size(), size_t{1});
+            QCOMPARE(probe.params[0].size(), size_t{3});
+            QCOMPARE(probe.params[0][0].get_str(), action.market.id.toStdString());
+            QCOMPARE(probe.params[0][1].get_str(), receipt.action_id.toStdString());
+            QCOMPARE(probe.params[0][2].getInt<int>(), 2000);
+        }
+        probe.release.release();
+        // The ordinary refresh follows; it has no saved-action source here.
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 3000);
+        QCOMPARE(probe.count.load(), 1); QVERIFY(!waited->write_attempted);
+        QVERIFY(panel.m_receipt); QCOMPARE(panel.m_receipt->action_id, receipt.action_id);
+        QCOMPARE(panel.m_receipt->account, action.market.account);
+        if (mode == QStringLiteral("certified")) {
+            QVERIFY(panel.m_receipt->Included()); QCOMPARE(panel.m_receipt->microblock_sequence, uint64_t{5});
+            QVERIFY(panel.m_receipt_error.isEmpty()); QVERIFY(!panel.m_pending_sequence);
+        } else {
+            // A failed read is not a failed or uncertain submission.
+            QCOMPARE(panel.m_receipt->state, QStringLiteral("queued")); QVERIFY(!panel.m_receipt->Included());
+            QVERIFY(panel.m_receipt_error.contains(QStringLiteral("unavailable")));
+            QVERIFY(panel.m_pending_sequence); QCOMPARE(*panel.m_pending_sequence, action.market.sequence);
+        }
+        QVERIFY(!panel.m_uncertain); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
     }
 
     void shutdownDropsPendingStatusWithoutOwningWalletOrChangingInstruction()

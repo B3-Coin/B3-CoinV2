@@ -81,6 +81,8 @@ SavedActions ParseSavedActions(const UniValue& value);
 //! the caller. The canonical side and raw points remain independently visible.
 QString DescribeSavedAction(const SavedAction& action, std::optional<int> decimals = {}, const QString& ticker = {});
 //! Exact-object status/retry never includes economics, a nonce or signing inputs.
-Request ReceiptParameters(const QString& market, const QString& action_id, bool retry = false);
+//! A positive wait (status reads only, never a retry) asks a remote client to
+//! hold the read open that long, bounded, for certified inclusion.
+Request ReceiptParameters(const QString& market, const QString& action_id, bool retry = false, int wait_ms = 0);
 } // namespace B3FlowMeshTrading
 #endif

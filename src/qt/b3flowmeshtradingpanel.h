@@ -67,6 +67,9 @@ private:
         QString wallet, error, receipt_error, read_market;
         QString receipt_market, receipt_account, receipt_action_id;
         bool broadcast{false}, write_attempted{false}, catalog{false}, exact_retry{false}, receipt_only{false};
+        // Foreground read-only status of the tracked receipt right after its
+        // signed action was sent, waiting briefly for certified inclusion.
+        bool receipt_wait{false};
         bool passive{false}, foreground_read{false}, refresh_yielded{false};
         std::optional<RefreshPhase> refresh_phase;
         uint64_t refresh_epoch{0};
@@ -124,7 +127,8 @@ private:
     bool confirm(const QString& text, bool final_transaction);
     void startJob(std::optional<B3FlowMeshTrading::Action> action = std::nullopt,
                   std::optional<B3AssetTransfer::Prepared> prepared = std::nullopt, bool exact_retry = false, bool receipt_only = false,
-                  std::optional<StatusRead> status_read = std::nullopt, const QString& connect_url = {}, bool foreground_read = false);
+                  std::optional<StatusRead> status_read = std::nullopt, const QString& connect_url = {}, bool foreground_read = false,
+                  bool receipt_wait = false);
     std::optional<StatusRead> selectedStatusRead() const;
     bool statusReadValid(const StatusRead& scope, bool selected) const;
     void requestStatusRead();
@@ -181,6 +185,9 @@ private:
     // Local UI fairness only. After eight yields let one passive phase finish
     // even if another click arrives, so repeated clicks cannot starve data.
     static constexpr unsigned MAX_REFRESH_YIELDS{8};
+    // Longest wait of the post-submit status read; the remote client bounds it
+    // again, and the local engine answers at once.
+    static constexpr int POST_SUBMIT_RECEIPT_WAIT_MS{2000};
     unsigned m_refresh_yields{0};
     uint64_t m_refresh_epoch{0};
     std::optional<B3FlowMeshMarketData::Snapshot> m_snapshot;

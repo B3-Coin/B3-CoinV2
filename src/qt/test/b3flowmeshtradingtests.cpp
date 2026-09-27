@@ -132,6 +132,14 @@ private Q_SLOTS:
         }
         QVERIFY(Rejected([&] { ReceiptParameters(QStringLiteral("bad"), id, true); }));
         QVERIFY(Rejected([&] { ReceiptParameters(market, QString(64, QLatin1Char('0')), true); }));
+        // A status read may add only a bounded wait; a retry never carries one.
+        const auto waited{ReceiptParameters(market, id, false, 2000)};
+        QCOMPARE(waited.method, std::string{"getflowmeshactionstatus"});
+        QCOMPARE(waited.params.size(), size_t{3}); QCOMPARE(waited.params[2].getInt<int>(), 2000);
+        QCOMPARE(waited.params[0].get_str(), market.toStdString()); QCOMPARE(waited.params[1].get_str(), id.toStdString());
+        QCOMPARE(ReceiptParameters(market, id, true, 2000).params.size(), size_t{2});
+        QCOMPARE(ReceiptParameters(market, id, false, 0).params.size(), size_t{2});
+        QCOMPARE(ReceiptParameters(market, id, false, -1).params.size(), size_t{2});
         UniValue legacy{UniValue::VOBJ}; legacy.pushKV("market_id", market.toStdString()); legacy.pushKV("action_id", id.toStdString()); legacy.pushKV("accepted", true);
         const auto receipt{ParseReceipt(legacy, market)}; QCOMPARE(receipt.state, QStringLiteral("queued")); QVERIFY(!receipt.Included());
     }

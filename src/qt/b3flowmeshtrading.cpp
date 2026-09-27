@@ -389,11 +389,13 @@ QString DescribeSavedAction(const SavedAction& action, std::optional<int> decima
     return description;
 }
 
-Request ReceiptParameters(const QString& market, const QString& action_id, bool retry)
+Request ReceiptParameters(const QString& market, const QString& action_id, bool retry, int wait_ms)
 {
     Hash(market); Hash(action_id);
     Request r{retry ? "retryflowmeshaction" : "getflowmeshactionstatus"};
-    r.params.push_back(market.toStdString()); r.params.push_back(action_id.toStdString()); return r;
+    r.params.push_back(market.toStdString()); r.params.push_back(action_id.toStdString());
+    if (!retry && wait_ms > 0) r.params.push_back(wait_ms);
+    return r;
 }
 
 B3AssetTransfer::Prepared ParsePrepared(const UniValue& value, const Action& a, const std::function<bool(const CTxDestination&)>& owned)

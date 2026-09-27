@@ -1015,7 +1015,7 @@ void B3FlowMeshTradingPanel::updateStatusReadState()
 }
 
 void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optional<B3AssetTransfer::Prepared> prepared, bool exact_retry, bool receipt_only,
-                                    std::optional<StatusRead> status_read, const QString& connect_url, bool foreground_read)
+                                    std::optional<StatusRead> status_read, const QString& connect_url, bool foreground_read, bool receipt_wait)
 {
     if (!m_wallet || !m_backend || m_thread) return;
     if (receipt_only) {
@@ -1024,8 +1024,8 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     }
     if (action && !m_saved_actions_ready) return;
     const bool tracked{m_receipt && receiptWalletSelected()};
-    if ((exact_retry || receipt_only) && !tracked) return;
-    if (exact_retry && (m_receipt->Included() || m_receipt->no_resubmit)) return;
+    if ((exact_retry || receipt_only || receipt_wait) && !tracked) return;
+    if ((exact_retry || receipt_wait) && (m_receipt->Included() || m_receipt->no_resubmit)) return;
     const bool watch_queue{action && action->operation != Operation::Checkpoint && action->operation != Operation::Vault &&
         m_snapshot && m_snapshot->market == action->market.id && m_snapshot->pending_actions > 0 && m_queue_age.isValid()};
     const QElapsedTimer queue_watch{m_queue_age};
@@ -1037,11 +1037,11 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     m_busy = action.has_value() || exact_retry; m_loading = !action && !m_snapshot; m_cancel->store(false); m_attempt_age.restart(); updateControls(); m_chart->setLoading(m_loading);
     auto result{std::make_shared<Result>()}; result->action = action; result->prepared = prepared; result->broadcast = prepared.has_value(); result->wallet = m_wallet_name;
     result->connect_url = connect_url;
-    result->exact_retry = exact_retry; result->receipt_only = receipt_only;
-    result->passive = !action && !exact_retry && !receipt_only && connect_url.isEmpty() && !foreground_read;
+    result->exact_retry = exact_retry; result->receipt_only = receipt_only; result->receipt_wait = receipt_wait;
+    result->passive = !action && !exact_retry && !receipt_only && !receipt_wait && connect_url.isEmpty() && !foreground_read;
     result->foreground_read = foreground_read;
     m_yield_refresh->store(false);
-    result->receipt_scope = receipt_only ? status_read : !action && !exact_retry ? selectedStatusRead() : std::nullopt;
+    result->receipt_scope = receipt_only ? status_read : !action && !exact_retry && !receipt_wait ? selectedStatusRead() : std::nullopt;
     m_active_result = result;
     auto* node{&m_wallet->node()}; const auto backend{m_backend}; const auto cancel{m_cancel}; const auto yield_refresh{m_yield_refresh};
     const auto uri{B3AssetTransfer::WalletUri(m_wallet->getWalletName())}; const auto generation{m_generation};
@@ -1120,8 +1120,9 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
                 if (!info.isObject()) throw std::runtime_error{"Trading connection status is unavailable."};
                 result->client_info = std::move(info); return;
             }
-            if (result->exact_retry || result->receipt_only) {
-                const auto request{B3FlowMeshTrading::ReceiptParameters(receipt_market, receipt_id, result->exact_retry)};
+            if (result->exact_retry || result->receipt_only || result->receipt_wait) {
+                const auto request{B3FlowMeshTrading::ReceiptParameters(receipt_market, receipt_id, result->exact_retry,
+                                                                        result->receipt_wait ? POST_SUBMIT_RECEIPT_WAIT_MS : 0)};
                 result->receipt = read_receipt(rpc(request.method, request.params));
                 return;
             }
@@ -1258,7 +1259,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
             if (auxiliary_error) record_failure(auxiliary_error);
             else result->refresh_yielded = true;
         } catch (...) { record_failure(std::current_exception()); }
-        if (!result->refresh_yielded && !result->action && !result->exact_retry && !result->receipt_only) read_client_info();
+        if (!result->refresh_yielded && !result->action && !result->exact_retry && !result->receipt_only && !result->receipt_wait) read_client_info();
     });
     m_thread->setParent(this); connect(m_thread, &QThread::finished, this, [this, result, generation] { if (generation == m_generation) finishJob(result); }); m_thread->start(); updateControls();
 }
@@ -1327,6 +1328,17 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
         m_catalog_age.invalidate(); m_response_age.invalidate(); m_attempt_age.invalidate(); m_read_failures = 0;
         m_read_failed = true; m_read_error = tr("Refreshing selected market after the connection check.");
         m_loading = false; m_busy = false; updateMarketText(); refresh(); return;
+    }
+    if (result->receipt_wait) {
+        // Read only. A failure records the status error and never marks the
+        // submission uncertain; the passive cycle keeps reading its receipt.
+        m_busy = false;
+        if (result->receipt) applyReceipt(*result->receipt);
+        else applyReceiptError(*result, result->error);
+        updateReceiptCard(); updateMarketText();
+        if (m_deferred_review) resumeReview();
+        else refresh();
+        return;
     }
     if (result->exact_retry || result->receipt_only) {
         m_busy = false;
@@ -1442,7 +1454,16 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
                 .arg(result->wallet, B3FlowMeshTrading::DescribeReceipt(*result->receipt), a.market.id, result->receipt->action_id));
         }
     }
-    updateMarketText(); refresh();
+    updateMarketText();
+    // A remote signed action that is not yet terminal: one foreground status
+    // read waits briefly for its certified inclusion, instead of the next
+    // passive receipt cycle noticing it. It never resends or signs.
+    if (!result->broadcast && SignedAction(a.operation) && a.market.remote && result->receipt &&
+        !result->receipt->Included() && result->receipt->state != QStringLiteral("rejected")) {
+        startJob(std::nullopt, std::nullopt, false, false, std::nullopt, {}, false, /*receipt_wait=*/true);
+        if (m_thread) return;
+    }
+    refresh();
 }
 
 void B3FlowMeshTradingPanel::applyMarketCatalog(const Result& result)
