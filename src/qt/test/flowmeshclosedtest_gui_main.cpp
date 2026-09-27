@@ -1,6 +1,8 @@
 // Copyright (c) 2026 The B3Coin Core developers
 // Distributed under the MIT software license, see COPYING.
 #include "flowmeshclosedtest_policy.h"
+#include <bitcoin-build-config.h>
+#include <bitcoin-build-info.h>
 #include <qt/bitcoin.h>
 #include <compat/compat.h>
 #include <util/translation.h>
@@ -23,6 +25,20 @@ extern const TranslateFn G_TRANSLATION_FUN = [](const char* text) {
 const std::function<std::string()> G_TEST_GET_FULL_NAME{};
 
 namespace {
+// Keep the generated identity in a narrow string consumed by runtime output.
+// Optimized std::string construction can split literals into machine constants;
+// packaging must still find the exact ASCII version and source revision.
+constexpr char BUILD_IDENTITY[]{
+    "B3 FlowMesh REGTEST TEST4 version=" CLIENT_VERSION_STRING
+#if defined(BUILD_GIT_COMMIT)
+    " commit=" BUILD_GIT_COMMIT
+#elif defined(BUILD_GIT_TAG)
+    " tag=" BUILD_GIT_TAG
+#else
+    " commit=unknown"
+#endif
+};
+
 int Refuse(const QString& reason)
 {
     std::fprintf(stderr, "B3 FlowMesh REGTEST TEST4 — NOT READY: %s\n", reason.toUtf8().constData());
@@ -35,6 +51,7 @@ int Refuse(const QString& reason)
     QMessageBox box{QMessageBox::Warning, QStringLiteral("B3 FlowMesh REGTEST TEST4 — NOT READY"),
         reason + QStringLiteral("\n\nNo B3 node or wallet was opened. Do not use a normal wallet. Ask the test coordinator for the reviewed test environment."), QMessageBox::Ok};
     box.setTextFormat(Qt::PlainText);
+    box.setDetailedText(QString::fromLatin1(BUILD_IDENTITY));
     box.exec();
     return EXIT_FAILURE;
 }
@@ -42,6 +59,7 @@ int Refuse(const QString& reason)
 
 MAIN_FUNCTION
 {
+    std::fprintf(stderr, "%s\n", BUILD_IDENTITY);
     QString error;
     if (!FlowMeshClosedTest::CheckInvocation(argc, error)) return Refuse(error);
     QFile embedded{QStringLiteral(":/closed-test/profile.json")};

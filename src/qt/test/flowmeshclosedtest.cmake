@@ -13,6 +13,7 @@ if(BUILD_FLOWMESH_REGTEST_CLIENT OR BUILD_GUI_TESTS)
   endif()
   add_executable(test_b3_flowmeshclosed-gui EXCLUDE_FROM_ALL
     flowmeshclosedtest_gui_main.cpp flowmeshclosedtest_policy.cpp ../../init/bitcoin-qt.cpp)
+  add_dependencies(test_b3_flowmeshclosed-gui generate_build_info)
   if(BUILD_FLOWMESH_REGTEST_CLIENT)
     set_target_properties(test_b3_flowmeshclosed-gui PROPERTIES EXCLUDE_FROM_ALL FALSE)
   endif()
