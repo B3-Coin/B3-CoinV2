@@ -534,6 +534,12 @@ struct FlowMeshRuntime::Market {
     uint64_t next_sequence{0};
     uint64_t next_effect_index{0};
     uint256 last_hash;
+    //! (sequence, entry hash) of the last few entries this runtime appended
+    //! durably, oldest first. Only a filter for relayed duplicates; never a
+    //! source of certified state. The runtime halts before durable history
+    //! can disagree with it (RefreshMarker).
+    static constexpr size_t RECENT_DURABLE_ENTRIES{8};
+    std::deque<std::pair<uint64_t, uint256>> recent_durable;
     uint256 certified_state_root;
     std::optional<flowmesh::ProductionCertifiedEnvelope> client_head;
     size_t client_head_seat_count{0};
@@ -1759,6 +1765,8 @@ bool CommitCertified(Market& market,
     }
 
     market.last_hash = certified.entry.GetHash();
+    market.recent_durable.emplace_back(certified.entry.sequence, market.last_hash);
+    if (market.recent_durable.size() > Market::RECENT_DURABLE_ENTRIES) market.recent_durable.pop_front();
     CountObservation(market.delivery.durably_applied);
     DeliveryEvent(market, "durably_applied", flowmesh::WireMessageKind::CERTIFICATE,
                   market.last_hash, certified.entry.sequence, std::nullopt, {}, EntryTrace(certified.entry));
@@ -5067,6 +5075,28 @@ void FlowMeshRuntime::HandleCertificate(
         entry->market_id != market.market_id ||
         !flowmesh::ProductionWireHeaderMatches(message.header, *entry)) {
         return;
+    }
+    // Every validator relays each certificate it applies, so right after its
+    // own commit a node receives the entry again from its peers. For an older
+    // sequence the verified path below only compares the entry hash with the
+    // durable one; when this runtime appended that exact entry itself, it
+    // already holds a verified certificate for it, so skip the pairing check.
+    // A different hash, an older entry not recorded here, and anything at or
+    // above next_sequence still take the verified path, so a conflicting
+    // valid certificate still halts the market with CERTIFICATE_CONFLICT.
+    if (entry->sequence < market.next_sequence) {
+        const uint256 received{entry->GetHash()};
+        const bool durable{entry->sequence + 1 == market.next_sequence
+            ? received == market.last_hash
+            : std::any_of(market.recent_durable.begin(), market.recent_durable.end(), [&](const auto& item) {
+                  return item.first == entry->sequence && item.second == received;
+              })};
+        if (durable) {
+            DeliveryEvent(market, "certificate_duplicate", flowmesh::WireMessageKind::CERTIFICATE,
+                          received, entry->sequence, peer, "entry is already durable; not verified again",
+                          EntryTrace(*entry));
+            return;
+        }
     }
 
     std::optional<flowmesh::ActiveFnBlsSeatSet> certified_seats;

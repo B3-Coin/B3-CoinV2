@@ -2423,6 +2423,99 @@ BOOST_AUTO_TEST_CASE(critical_permanent_halt_retires_outgoing_certificate_not_du
     BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 1U);
 }
 
+BOOST_AUTO_TEST_CASE(durable_duplicate_certificate_is_not_verified_again_but_conflicts_halt)
+{
+    DeliveryRuntimeFixture producer{m_args.GetDataDirBase() / "flowmesh_duplicate_certificate_producer",
+                                   node::FlowMeshDeliveryAdmission::ADMITTED};
+    const auto original{producer.Sent()};
+    const auto proposal{std::find_if(original.begin(), original.end(), [](const auto& relay) {
+        return relay.message.kind == flowmesh::WireMessageKind::PROPOSAL;
+    })};
+    BOOST_REQUIRE(proposal != original.end());
+    const auto decoded{flowmesh::DecodeProductionProposalPayload(proposal->message.payload)};
+    BOOST_REQUIRE(decoded);
+    flowmesh::ProductionEpochGate gate{producer.domain, producer.market, producer.seats.seats};
+    flowmesh::ProductionEntryCheck check;
+    const auto genesis{flowmesh::ExecuteProductionEntry(
+        producer.initial, decoded->entry, producer.domain, producer.market, producer.seats.seats, gate,
+        0, 0, {}, {producer.chain.TipHeight(), std::nullopt, &producer.chain},
+        Filled(0x6b), nullptr, check)};
+    BOOST_REQUIRE(genesis);
+    const auto next{flowmesh::BuildProductionExecutionEntry(
+        genesis->next_state, producer.domain, producer.market, producer.seats.seats, gate,
+        1, decoded->entry.effect_count, decoded->entry.GetHash(), producer.chain.Current(),
+        {producer.chain.TipHeight(), decoded->entry.anchor, &producer.chain}, Filled(0x6b), {}, nullptr, check)};
+    BOOST_REQUIRE(next);
+    // Seats 0-2 sign the applied copies; seats 1-3 form a different, equally
+    // valid certificate for the same entry.
+    const auto payload = [&](const flowmesh::ProductionEntryCore& entry, const std::vector<uint32_t>& signers) {
+        std::vector<flowmesh::IndexedBlsSignature> signatures;
+        const auto context{flowmesh::ProductionCertificateContext(entry)};
+        for (const uint32_t seat : signers) {
+            const auto signature{flowmesh::SignBlsMicroblockCertificate(
+                producer.seats.secrets[seat], context, producer.seats.seats)};
+            BOOST_REQUIRE(signature);
+            signatures.push_back({seat, *signature});
+        }
+        flowmesh::BlsMicroblockCertificate certificate;
+        BOOST_REQUIRE(flowmesh::AssembleProductionEntryCertificate(
+                          entry, producer.seats.seats, signatures, certificate) ==
+                      flowmesh::BlsCertificateAssemblyCheck::OK);
+        const auto encoded{flowmesh::EncodeProductionCertifiedPayload(
+            {entry, certificate}, producer.seats.seats.Size())};
+        BOOST_REQUIRE(encoded);
+        return *encoded;
+    };
+    DeliveryRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_duplicate_certificate",
+                             node::FlowMeshDeliveryAdmission::ADMITTED, false};
+    const auto send = [&](const uint64_t sequence, const std::vector<unsigned char>& bytes) {
+        BOOST_REQUIRE(f.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER,
+            {flowmesh::WireMessageKind::CERTIFICATE,
+             {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, sequence}, bytes}) ==
+            flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
+    };
+    const auto duplicates = [&] {
+        const auto events{f.Snapshot().events};
+        return std::count_if(events.begin(), events.end(), [](const auto& event) {
+            return event.stage == "certificate_duplicate";
+        });
+    };
+    send(0, payload(decoded->entry, {0, 1, 2}));
+    send(1, payload(next->entry, {0, 1, 2}));
+    BOOST_REQUIRE_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 2U);
+    BOOST_REQUIRE_EQUAL(f.Snapshot().durably_applied, 2U);
+    const auto verified{f.Snapshot().verified};
+    const auto relayed{f.Sent().size()};
+
+    // The durable head and an older durable entry, each once under another
+    // valid signer subset and once with a corrupted aggregate: the exact
+    // entry is already durable here, so no copy is verified or relayed.
+    for (const auto& [sequence, entry] : {std::pair{uint64_t{1}, next->entry}, std::pair{uint64_t{0}, decoded->entry}}) {
+        send(sequence, payload(entry, {1, 2, 3}));
+        auto corrupted{payload(entry, {0, 1, 2})};
+        corrupted.back() ^= 1;
+        send(sequence, corrupted);
+    }
+    BOOST_CHECK_EQUAL(duplicates(), 4);
+    BOOST_CHECK_EQUAL(f.Snapshot().verified, verified);
+    BOOST_CHECK_EQUAL(f.Sent().size(), relayed);
+    BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+    BOOST_CHECK_EQUAL(f.runtime->MarketStatus(f.market)->next_sequence, 2U);
+    BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 2U);
+
+    // A validly certified different entry at a durable sequence is still
+    // verified and still halts the market.
+    auto conflicting{decoded->entry};
+    conflicting.state_root = Filled(0x99);
+    BOOST_REQUIRE(conflicting.GetHash() != decoded->entry.GetHash());
+    send(0, payload(conflicting, {1, 2, 3}));
+    BOOST_CHECK_EQUAL(f.Snapshot().verified, verified + 1);
+    BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::CERTIFICATE_CONFLICT);
+    BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 2U);
+    BOOST_CHECK_EQUAL(duplicates(), 4);
+}
+
 BOOST_AUTO_TEST_CASE(catchup_timeout_reduces_page_count_without_relaxing_deadline_or_verification)
 {
     DeliveryRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_adaptive_catchup",
