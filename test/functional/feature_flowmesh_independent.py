@@ -24,10 +24,13 @@ from feature_flowmesh_release import FlowMeshReleaseTest, TRADE_PRICE
 from feature_flowmesh_speed import collect_stall_diagnostic
 from test_framework.flowmesh_net_proxy import BulkFaultProfile, FlowMeshLoopbackProxy
 from test_framework.authproxy import JSONRPCException
-from test_framework.util import assert_equal, p2p_port
+from test_framework.util import assert_equal, assert_raises_rpc_error, p2p_port
 
 
 FLOWMESH_COMMANDS = ("fmhello", "fmaction", "fmprop", "fmattest", "fmcert", "fmget", "fmentries")
+# FlowMeshService::SubmitLocalAction's reconciliation gate. As a receipt it
+# refuses an already signed action before runtime admission.
+RECONCILING_REFUSAL = "FlowMesh service is reconciling the B3 tip"
 
 
 class FlowMeshIndependentTest(FlowMeshReleaseTest):
@@ -278,7 +281,6 @@ class FlowMeshIndependentTest(FlowMeshReleaseTest):
                     response = node.cancelflowmeshorder(market_id, side, sequence)
                 else:
                     response = node.submitflowmeshorder(market_id, side, price, quantity, sequence)
-                return True
             except JSONRPCException as error:
                 # These exact errors are returned before runtime admission:
                 # the service reconciliation gate or GetWalletActionContext's
@@ -297,6 +299,24 @@ class FlowMeshIndependentTest(FlowMeshReleaseTest):
                 admission_refusals.append({"after_ms": (time.monotonic() - started) * 1000,
                                            "reason": error.error["message"]})
                 return False
+            if response["receipt_state"] == "rejected" and response["reason"] == RECONCILING_REFUSAL:
+                # The wallet's status check passed, then a B3 block connected
+                # before the signed action reached the service, whose
+                # reconciliation gate refused it before runtime admission: a
+                # definite rejection, not an unknown outcome. The same
+                # instruction is signed again only after proving that nothing
+                # was retained or admitted: no outbox copy that could be
+                # resent exactly, and no runtime event for the refused action.
+                action_id = response["action_id"]
+                assert_equal(response["accepted"], False)
+                assert_equal(response["sequence"], sequence)
+                assert action_id not in {row["action_id"] for row in node.listflowmeshactions(market_id)["actions"]}
+                assert_raises_rpc_error(-4, "Action is not retained for this wallet's existing FlowMesh account",
+                                        node.getflowmeshactionstatus, market_id, action_id)
+                admission_refusals.append({"after_ms": (time.monotonic() - started) * 1000,
+                                           "reason": response["reason"], "refused_action_id": action_id})
+                return False
+            return True
 
         self.wait_until(admit, timeout=30, check_interval=0.025)
         admitted = time.monotonic()
