@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see COPYING.
 #include <node/flowmesh_timing.h>
 #include <node/flowmesh_client.h>
+#include <node/flowmesh_client_join.h>
 #include <node/flowmesh_client_poll.h>
 #include <node/flowmesh_client_work.h>
 #include <node/flowmesh_client_settlement.h>
@@ -563,8 +564,17 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         // A filtered cursor belongs to this exact account scope, not merely
         // to the market. Another wallet must not inherit skipped events.
         std::optional<uint256> account_scope;
+        // {request started, validated} of the last Refresh that completed
+        // for this cache. Volatile; cleared when a Refresh starts or an own
+        // inclusion newer than this entry is verified. Only a signing
+        // preflight's join reads it.
+        std::optional<std::pair<std::chrono::steady_clock::time_point, std::chrono::steady_clock::time_point>> fresh{};
     };
     std::map<uint256, Cache> m_cache;
+    // Microblock high-water of verified own inclusions per market. Survives
+    // eviction of certified actions from m_pending; only restricts joins.
+    FlowMeshOwnCertifiedThrough m_own_certified_through{CLIENT_MAX_MARKETS};
+    const FlowMeshJoinWindows m_join_windows{};
     // Immutable copy of the retained actions as of the most recent m_work
     // release. Leaf lock, written only by the m_work owner; saved-action
     // reads never wait for network work. Null only if publication failed.
@@ -999,6 +1009,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         p.inclusion_proof = proof;
         if (!p.owner_account.IsNull()) p.receipt.account_id = p.owner_account;
         p.receipt.reason = "Canonical action inclusion verified; execution outcome is not proved by inclusion alone";
+        m_own_certified_through.Record(p.market, entry.sequence);
+        // A cached state older than this inclusion must not feed a join.
+        if (const auto cache{m_cache.find(p.market)}; cache != m_cache.end() &&
+            entry.sequence > cache->second.verified.certified.entry.sequence) cache->second.fresh.reset();
     }
     void Snapshot(const uint256& id, const std::optional<uint256>& account)
     {
@@ -1050,44 +1064,46 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             LearnMetadata(value["status"], pins, endpoint);
         });
     }
-    Cache& Refresh(const uint256& id, const std::optional<uint256>& account, const flowmesh::MarketDataQuery& query)
+    enum class CacheCheck { CURRENT, SCOPE, CHECKPOINT, AUTHORITY, ANCHOR };
+    // Local checks that a cached verified state still applies to this account
+    // under the local B3 chain. No network use.
+    CacheCheck CheckCache(const uint256& id, const Cache& cache, const std::optional<uint256>& account)
     {
-        if (!m_cache.contains(id)) { Snapshot(id, account); return m_cache.at(id); }
-        auto& cache{m_cache.at(id)};
-        if (cache.account_scope != account) {
-            // Switching wallets changes the event filter. A current verified
-            // snapshot is safe, but it is not replay of the other account's
-            // omitted events; surface the gap before advancing its cursor.
-            cache.event_gap = true;
-            { std::lock_guard lock{m_status_mutex}; ++m_status.event_gaps; }
-            Snapshot(id, account); return m_cache.at(id);
-        }
-        bool behind_checkpoint{false};
+        // Switching wallets changes the event filter. A current verified
+        // snapshot is safe, but it is not replay of the other account's
+        // omitted events; surface the gap before advancing its cursor.
+        if (cache.account_scope != account) return CacheCheck::SCOPE;
         {
             LOCK(::cs_main); SyncIndexes();
             const auto checkpoint{m_chainman.ActiveChainstate().ModernFlowMeshCheckpoints().Index().Head(id)};
             const auto& entry{cache.verified.certified.entry};
-            behind_checkpoint = checkpoint && (entry.sequence < checkpoint->core.sequence ||
-                (entry.sequence == checkpoint->core.sequence && entry.GetHash() != checkpoint->core.microblock_hash));
-        }
-        if (behind_checkpoint) {
-            cache.event_gap = true;
-            { std::lock_guard lock{m_status_mutex}; ++m_status.event_gaps; }
-            Snapshot(id, account); return m_cache.at(id);
+            if (checkpoint && (entry.sequence < checkpoint->core.sequence ||
+                (entry.sequence == checkpoint->core.sequence && entry.GetHash() != checkpoint->core.microblock_hash)))
+                return CacheCheck::CHECKPOINT;
         }
         std::string authority_error;
-        const auto authority{ResolveFlowMeshClientSeats(m_chainman, cache.pins, cache.verified.certified.entry, authority_error)};
-        if (!authority) {
+        if (!ResolveFlowMeshClientSeats(m_chainman, cache.pins, cache.verified.certified.entry, authority_error)) return CacheCheck::AUTHORITY;
+        // Retain the durable high-water mark. Only fresh ordinary evidence
+        // can replace the cache; a reorg never rewinds signing history.
+        if (!CanonicalAnchor(cache.verified.certified.entry.anchor)) return CacheCheck::ANCHOR;
+        return CacheCheck::CURRENT;
+    }
+    Cache& Refresh(const uint256& id, const std::optional<uint256>& account, const flowmesh::MarketDataQuery& query)
+    {
+        const auto started{std::chrono::steady_clock::now()};
+        if (const auto it{m_cache.find(id)}; it != m_cache.end()) it->second.fresh.reset();
+        // Stamped only on success; an exception leaves the cache unstamped.
+        const auto done = [&]() -> Cache& {
+            auto& cache{m_cache.at(id)};
+            cache.fresh = std::pair{started, std::chrono::steady_clock::now()};
+            return cache;
+        };
+        if (!m_cache.contains(id)) { Snapshot(id, account); return done(); }
+        auto& cache{m_cache.at(id)};
+        if (CheckCache(id, cache, account) != CacheCheck::CURRENT) {
             cache.event_gap = true;
             { std::lock_guard lock{m_status_mutex}; ++m_status.event_gaps; }
-            Snapshot(id, account); return m_cache.at(id);
-        }
-        if (!CanonicalAnchor(cache.verified.certified.entry.anchor)) {
-            // Retain the durable high-water mark. Only fresh ordinary evidence
-            // can replace the cache; a reorg never rewinds signing history.
-            cache.event_gap = true;
-            { std::lock_guard lock{m_status_mutex}; ++m_status.event_gaps; }
-            Snapshot(id, account); return m_cache.at(id);
+            Snapshot(id, account); return done();
         }
         bool snapshot_needed{false};
         UniValue params{UniValue::VOBJ}; params.pushKV("market_id", id.GetHex());
@@ -1136,7 +1152,48 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             LearnMetadata(value["status"], cache.pins, endpoint);
         });
         if (snapshot_needed) Snapshot(id, account);
-        return m_cache.at(id);
+        return done();
+    }
+    // A foreground wallet signing preflight may reuse the refresh that
+    // completed just before it (typically the refresh it queued behind, or
+    // the balance read that preceded an order) instead of another 'updates'
+    // round trip. Every local chain/authority check and Project's checkpoint
+    // check still run; any doubt falls back to Refresh.
+    Cache* JoinFresh(const uint256& id, const std::optional<uint256>& account)
+    {
+        if (!account || !FlowMeshSigningPreflightScope::Active() ||
+            FlowMeshClientWorkScope::Current() != FlowMeshClientWorkPriority::FOREGROUND ||
+            !m_own_certified_through.Complete()) return nullptr;
+        const auto it{m_cache.find(id)};
+        if (it == m_cache.end() || !it->second.fresh) return nullptr;
+        auto& cache{it->second};
+        try {
+            if (CheckCache(id, cache, account) != CacheCheck::CURRENT) return nullptr;
+            std::vector<FlowMeshJoinOwnAction> own;
+            for (const auto& [key, p] : m_pending) {
+                if (p.market != id || p.action.IsDeposit() || p.action.signer != *account) continue;
+                using Kind = FlowMeshJoinOwnAction::Kind;
+                if (p.receipt.certificate_verified && p.receipt.state == "certified_inclusion") {
+                    own.push_back({Kind::CERTIFIED, p.receipt.microblock_sequence});
+                } else if (p.previously_certified) {
+                    // Certified before a restart, or its proof is being
+                    // renewed: where it was included is not known here.
+                    own.push_back({Kind::CERTIFIED, std::nullopt});
+                } else if (p.receipt.state == "rejected") {
+                    // Send and QueryAction keep a refusal after any possible
+                    // earlier delivery as unknown, so this is definite.
+                    own.push_back({Kind::DEFINITE_REJECTED, std::nullopt});
+                } else {
+                    own.push_back({Kind::UNRESOLVED, std::nullopt});
+                }
+            }
+            if (!FlowMeshCanJoinFreshPreflight(std::chrono::steady_clock::now(), cache.fresh->first, cache.fresh->second,
+                                               cache.verified.certified.entry.sequence, m_own_certified_through.Through(id),
+                                               own, m_join_windows)) return nullptr;
+        } catch (const std::exception&) {
+            return nullptr;
+        }
+        return &cache;
     }
     void ReportedHistory(flowmesh::MarketData& out, const UniValue& reported)
     {
@@ -1400,7 +1457,12 @@ public:
         MarkWorkAcquired(timing_lock_1215);
         MarketStatus status; status.market_id = id; status.remote = true;
         try {
-            auto& cache{Refresh(id, account, {})}; const auto data{Project(cache, account, {})};
+            // Only a signing preflight may join. Explicit reads and Data()
+            // always refresh; a join never re-stamps the cache, so joins
+            // cannot chain.
+            Cache* const joined{JoinFresh(id, account)};
+            if (FlowMeshSigningPreflightScope::Active()) timing_lock_1215.Field("preflight", std::string{joined ? "joined" : "refreshed"});
+            auto& cache{joined ? *joined : Refresh(id, account, {})}; const auto data{Project(cache, account, {})};
             status.domain = cache.pins.domain; status.base_asset = cache.pins.base_asset; status.vault_id = cache.pins.vault_id;
             status.execution_config_id = cache.pins.execution_config_id; status.endpoint = data.endpoint;
             status.available = true; status.running = data.snapshot.running; status.paused = data.snapshot.paused;

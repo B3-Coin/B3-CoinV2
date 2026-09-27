@@ -88,6 +88,7 @@ add_executable(test_bitcoin
   flowmesh_net_tests.cpp
   flowmesh_https_tests.cpp
   flowmesh_client_evidence_tests.cpp
+  flowmesh_client_join_tests.cpp
   flowmesh_client_poll_tests.cpp
   flowmesh_client_work_tests.cpp
   flowmesh_timing_tests.cpp

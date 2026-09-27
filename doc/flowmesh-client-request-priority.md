@@ -79,6 +79,47 @@ Gate spans (`flowmeshtiming`, default off) record `priority`, `linger_window`
 `linger_expired_with_passive_waiting` and `burst_forced_passive_turns`, so the
 window can be checked against captured inter-step gaps in the field.
 
+## Signing preflight join
+
+The wallet's signing preflight (`GetWalletActionContext` -> `Market`) used to
+issue its own `updates` round trip even when it had just queued behind a
+refresh of the same market for the same account, or directly followed a
+balance read (the Qt order path reads `getflowmeshbalance` first). That
+preflight may now reuse ("join") the refresh instead. Only a `Market` call made
+inside the wallet's `FlowMeshSigningPreflightScope` may join: explicit
+`getflowmeshbalance` reads and `Data` always refresh, and a join never
+re-stamps the refresh, so joins cannot chain. The preflight span field
+`preflight` is `joined` or `refreshed`. Like the work scope, the preflight
+scope follows synchronous dispatch on one thread; across a process boundary
+the preflight simply refreshes.
+
+A join is allowed only when all of these hold (`src/node/flowmesh_client_join.h`):
+
+- the caller is a foreground signing preflight and names an account;
+- the reused refresh completed at most 50 ms ago and its request started at
+  most 1000 ms ago (local policy constants, injectable in the pure predicate);
+- every local check a refresh runs before its network call still passes
+  (account scope, B3 checkpoint, seat authority, canonical anchor), and
+  `Project`'s B3 checkpoint check runs as before;
+- the cached entry is at or after every microblock at which this process
+  verified one of its own inclusions on the market, a volatile per-market mark
+  that survives eviction of certified actions from the outbox;
+- the account has no unresolved retained action on the market, and every
+  certified one is known to be included at or before the cached entry (an
+  action certified before a restart refuses the join).
+
+Otherwise the preflight refreshes as before. A join therefore never produces an
+older own account sequence than the refresh would, and it only removes a
+request.
+
+What changes: the preflight is no longer a liveness probe of the endpoint. If
+the endpoint fails within 50 ms of the joined response, the order is signed,
+retained and reported unknown (protected, resolvable by exact retry) instead of
+failing before signing, and its sequence stays blocked until that is resolved.
+Endpoint status gates (paused, halt) and a same-key action from another device
+may be up to 50 ms staler than on the refresh path. For the Qt order path the
+preflight's "fresh market readiness" is the balance read made just before it.
+
 ## Preservation
 
 No outbox, sequence/high-water, exact-action retry, uncertainty, no-resubmit or

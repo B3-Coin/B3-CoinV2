@@ -11,6 +11,7 @@
 #include <modern/asset_output.h>
 #include <modern/mpa.h>
 #include <node/flowmesh_client.h>
+#include <node/flowmesh_client_join.h>
 #include <policy/policy.h>
 #include <rpc/protocol.h>
 #include <rpc/request.h>
@@ -351,7 +352,12 @@ static WalletActionContext GetWalletActionContext(CWallet& wallet,
         secret = *key;
     }
 
-    const auto status{wallet.chain().flowMeshMarketStatus(market_id, account)};
+    // This read may reuse a market refresh verified within the last 50 ms
+    // (node/flowmesh_client_join.h); explicit balance reads always refresh.
+    const auto status{[&] {
+        node::FlowMeshSigningPreflightScope preflight;
+        return wallet.chain().flowMeshMarketStatus(market_id, account);
+    }()};
     if (!status || !status->available || !status->running) {
         throw JSONRPCError(RPC_MISC_ERROR,
                            status && !status->error.empty() ? status->error.substr(0, 1024)
