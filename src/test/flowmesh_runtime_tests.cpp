@@ -7162,6 +7162,130 @@ BOOST_AUTO_TEST_CASE(certified_slot_committee_frames_do_not_spend_committee_admi
     BOOST_CHECK(f.runtimes[0]->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
 }
 
+// The worker's durable-duplicate check covers older appends of this
+// lifetime (recent_durable), not only its head, without verifying the copy
+// again. Admission consumes copies of recorded appends before they reach the
+// worker, so this needs a copy admitted before its append was recorded:
+// runtime 0's worker is held while two certificates for slots it has not yet
+// applied, and then a repeat of the first, are queued behind it.
+BOOST_AUTO_TEST_CASE(worker_recognises_an_older_durable_certificate_without_verifying)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "worker_older_durable_certificate",
+                                 std::chrono::seconds{10}, 3};
+    f.block_commits = false;
+    f.Reach(1);
+
+    // Runtime 0 neither hears nor is heard while the others apply two slots.
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool hold{false}, held{false}, release{false};
+    f.network.SetFilter([&](size_t from, size_t to, const flowmesh::WireMessage& wire) {
+        {
+            std::unique_lock<std::mutex> lock{mutex};
+            if (hold && from == 0 && wire.kind == flowmesh::WireMessageKind::ACTION) {
+                hold = false;
+                held = true;
+                cv.notify_all();
+                cv.wait(lock, [&] { return release; });
+            }
+        }
+        if (from == 0 || to == 0) return false;
+        return f.Observe(wire);
+    });
+    const auto released = [&] {
+        {
+            std::lock_guard<std::mutex> lock{mutex};
+            release = true;
+        }
+        cv.notify_all();
+    };
+    struct Release {
+        std::function<void()> run;
+        ~Release() { run(); }
+    } release_on_exit{released};
+    const auto others_at = [&](const uint64_t sequence) {
+        for (size_t i{1}; i < f.runtimes.size(); ++i) {
+            const auto status{f.runtimes[i]->MarketStatus(f.market)};
+            if (!status || status->next_sequence != sequence ||
+                status->halt != node::FlowMeshRuntimeHalt::NONE) return false;
+        }
+        return true;
+    };
+    for (uint32_t n{0}; n < 2; ++n) {
+        for (size_t i{1}; i < f.runtimes.size(); ++i) {
+            BOOST_REQUIRE(f.runtimes[i]->SubmitLocalAction(f.market, Deposit(COutPoint{f.outpoint.hash, n})) ==
+                          flowmesh::QueueResult::ACCEPTED);
+        }
+        for (size_t attempt{0}; attempt < 16 && !others_at(n + 2); ++attempt) f.Tick(std::chrono::seconds{2});
+        BOOST_REQUIRE(others_at(n + 2));
+    }
+    auto& runtime{*f.runtimes[0]};
+    BOOST_REQUIRE_EQUAL(runtime.MarketStatus(f.market)->next_sequence, 1U);
+    const auto certificate = [&](const uint64_t sequence) {
+        std::string error;
+        std::optional<node::StoredProductionEntry> stored;
+        BOOST_REQUIRE_MESSAGE(f.stores[1]->ReadEntry(sequence, f.seats.seats, stored, error), error);
+        BOOST_REQUIRE(stored);
+        const auto payload{flowmesh::EncodeProductionCertifiedPayload(
+            {stored->entry, stored->certificate}, f.seats.seats.Size())};
+        BOOST_REQUIRE(payload);
+        return flowmesh::WireMessage{flowmesh::WireMessageKind::CERTIFICATE,
+            {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, stored->entry.epoch, sequence}, *payload};
+    };
+    const auto first{certificate(1)};
+    const auto second{certificate(2)};
+    const auto snapshot = [&] {
+        const auto snapshots{runtime.DeliverySnapshots(f.market)};
+        BOOST_REQUIRE_EQUAL(snapshots.size(), 1U);
+        return snapshots.front();
+    };
+    const auto before{snapshot()};
+
+    // Hold runtime 0's worker in its relay of a new peer action. Nothing is
+    // recorded for admission yet, so all three frames are queued.
+    {
+        std::lock_guard<std::mutex> lock{mutex};
+        hold = true;
+    }
+    const auto action{flowmesh::EncodeProductionActionPayload(Deposit(COutPoint{f.outpoint.hash, 2}))};
+    BOOST_REQUIRE(action);
+    BOOST_REQUIRE(runtime.EnqueueWireMessage(9, {flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1}, *action}) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    {
+        std::unique_lock<std::mutex> lock{mutex};
+        BOOST_REQUIRE(cv.wait_for(lock, std::chrono::seconds{10}, [&] { return held; }));
+    }
+    constexpr flowmesh::WirePeerId sender{7};
+    for (const auto* message : {&first, &second, &first}) {
+        BOOST_REQUIRE(runtime.EnqueueWireMessage(sender, *message) == flowmesh::QueueResult::ACCEPTED);
+    }
+    released();
+    f.Drain();
+
+    const auto status{runtime.MarketStatus(f.market)};
+    BOOST_REQUIRE(status);
+    BOOST_CHECK_EQUAL(status->next_sequence, 3U);
+    BOOST_CHECK(status->halt == node::FlowMeshRuntimeHalt::NONE);
+    const auto after{snapshot()};
+    // The action and the two new certificates were verified; the repeat of
+    // the first, now older than the head, was recognised without it.
+    BOOST_CHECK_EQUAL(after.verified, before.verified + 3);
+    BOOST_CHECK_EQUAL(after.certified_slot_frames_consumed, before.certified_slot_frames_consumed);
+    const auto count = [&](const std::string& stage, const uint64_t sequence) {
+        return std::count_if(after.events.begin(), after.events.end(), [&](const auto& event) {
+            return event.stage == stage && event.sequence == sequence;
+        });
+    };
+    BOOST_CHECK_EQUAL(count("certificate_verified", 1), 1);
+    BOOST_CHECK_EQUAL(count("certificate_verified", 2), 1);
+    BOOST_CHECK_EQUAL(count("certificate_duplicate", 1), 1);
+    // Recorded now: a further copy is consumed at admission.
+    BOOST_REQUIRE(runtime.EnqueueWireMessage(sender, first) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK_EQUAL(snapshot().certified_slot_frames_consumed, before.certified_slot_frames_consumed + 1);
+}
+
 // Consumed frames spend no committee token, but a flood of them is still
 // refused: both admission consumptions (exact verified agreement repeats and
 // frames for an already appended slot) draw on the sender's separate
