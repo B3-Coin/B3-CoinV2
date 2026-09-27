@@ -864,6 +864,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         const auto gate{m_work.Inspect()};
         timing.Field("priority", std::string{gate.owner_foreground ? "foreground" : "passive"});
         timing.Field("linger_window", uint64_t{gate.owner_linger_window});
+        timing.Field("linger_after_release", uint64_t{gate.owner_lingers});
         timing.Field("linger_captures", gate.linger_captures);
         timing.Field("linger_expired_with_passive_waiting", gate.linger_expired_with_passive_waiting);
         timing.Field("burst_forced_passive_turns", gate.burst_forced_passive_turns);

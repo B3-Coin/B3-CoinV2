@@ -15,25 +15,50 @@ namespace node {
 
 enum class FlowMeshClientWorkPriority { FOREGROUND, PASSIVE };
 
+/** Whether a FOREGROUND owner's release reserves the idle gate for its next
+ * step (see FlowMeshClientWorkGate). NONE is for a caller that is itself the
+ * only source of the passive work the window would hold back and runs one job
+ * at a time, such as the Qt trading worker: a window after its own foreground
+ * job could only delay its own next refresh. It never changes priority.
+ */
+enum class FlowMeshClientWorkLinger { AFTER_RELEASE, NONE };
+
 /** Request context, not RPC-method classification. A market or saved-action
  * read may be a prerequisite of an approved trade/status request. Such calls
  * remain foreground unless their caller explicitly enters a passive scope.
  * The scope follows synchronous RPC dispatch on this thread, not new threads.
+ * Each scope sets both priority and linger policy (default AFTER_RELEASE);
+ * leaving it restores both.
  */
 class FlowMeshClientWorkScope {
     inline static thread_local FlowMeshClientWorkPriority s_priority{FlowMeshClientWorkPriority::FOREGROUND};
+    inline static thread_local FlowMeshClientWorkLinger s_linger{FlowMeshClientWorkLinger::AFTER_RELEASE};
     const FlowMeshClientWorkPriority m_previous;
+    const FlowMeshClientWorkLinger m_previous_linger;
 
 public:
-    explicit FlowMeshClientWorkScope(FlowMeshClientWorkPriority priority) noexcept : m_previous{s_priority}
+    explicit FlowMeshClientWorkScope(FlowMeshClientWorkPriority priority,
+                                     FlowMeshClientWorkLinger linger = FlowMeshClientWorkLinger::AFTER_RELEASE) noexcept
+        : m_previous{s_priority}, m_previous_linger{s_linger}
     {
         s_priority = priority;
+        s_linger = linger;
     }
-    ~FlowMeshClientWorkScope() { s_priority = m_previous; }
+    ~FlowMeshClientWorkScope()
+    {
+        s_priority = m_previous;
+        s_linger = m_previous_linger;
+    }
     FlowMeshClientWorkScope(const FlowMeshClientWorkScope&) = delete;
     FlowMeshClientWorkScope& operator=(const FlowMeshClientWorkScope&) = delete;
 
     static FlowMeshClientWorkPriority Current() noexcept { return s_priority; }
+    static FlowMeshClientWorkLinger Linger() noexcept { return s_linger; }
+    //! Whether an acquisition in this context leaves a window at its release.
+    static bool LingersAfterRelease() noexcept
+    {
+        return s_priority == FlowMeshClientWorkPriority::FOREGROUND && s_linger == FlowMeshClientWorkLinger::AFTER_RELEASE;
+    }
 };
 
 /** Exclusive, non-preemptive client work gate. This is local scheduling policy,
@@ -48,8 +73,10 @@ public:
  * foreground owner releases, the idle gate lingers for a short window: a queued
  * passive caller waits until it expires, while a foreground caller takes the
  * gate at once. Linger never delays a foreground caller or try_lock on an empty
- * queue, never follows a passive owner, and yields to the burst bound, so a
- * passive caller waits at most eight windows beyond the eight foreground holds.
+ * queue, never follows a passive owner or a foreground owner that acquired in a
+ * FlowMeshClientWorkLinger::NONE scope (recorded at acquisition), and yields to
+ * the burst bound, so a passive caller waits at most eight windows beyond the
+ * eight foreground holds.
  * Expiry is not notified; a passive waiter held by a window waits for its
  * deadline. Local scheduling only: no request is reordered across callers of
  * the same class, and nothing is cancelled.
@@ -97,8 +124,9 @@ class FlowMeshClientWorkGate {
     const std::chrono::milliseconds m_linger;
     // Set only while idle after a foreground owner released.
     std::optional<Clock::time_point> m_linger_until;
-    // Current owner, for its own diagnostics span.
-    bool m_owner_foreground{false}, m_owner_linger_window{false};
+    // Current owner, for its own diagnostics span; m_owner_lingers (recorded
+    // at acquisition) also decides whether its release opens a window.
+    bool m_owner_foreground{false}, m_owner_linger_window{false}, m_owner_lingers{false};
     // Diagnostics only: foreground acquisitions inside a window while passive
     // work waited, windows that expired into a waiting passive caller, and
     // passive turns forced by the burst bound over a foreground caller/window.
@@ -133,6 +161,8 @@ public:
         uint64_t linger_captures;
         uint64_t linger_expired_with_passive_waiting;
         uint64_t burst_forced_passive_turns;
+        //! Whether the current owner's release will open a window.
+        bool owner_lingers;
     };
 
     explicit FlowMeshClientWorkGate(std::chrono::milliseconds linger = FOREGROUND_LINGER) noexcept : m_linger{linger} {}
@@ -142,6 +172,7 @@ public:
     void lock()
     {
         const bool foreground{FlowMeshClientWorkScope::Current() == FlowMeshClientWorkPriority::FOREGROUND};
+        const bool lingers{FlowMeshClientWorkScope::LingersAfterRelease()};
         Waiter waiter;
         std::unique_lock lock{m_mutex};
         auto& queue{foreground ? m_foreground : m_passive};
@@ -178,6 +209,7 @@ public:
         m_active = true;
         m_owner_foreground = foreground;
         m_owner_linger_window = window;
+        m_owner_lingers = lingers;
         m_linger_until.reset();
         if (foreground && m_passive.first) ++m_foreground_burst;
         else m_foreground_burst = 0;
@@ -192,6 +224,7 @@ public:
         m_active = true;
         m_owner_foreground = FlowMeshClientWorkScope::Current() == FlowMeshClientWorkPriority::FOREGROUND;
         m_owner_linger_window = LingerWindow(Clock::now());
+        m_owner_lingers = FlowMeshClientWorkScope::LingersAfterRelease();
         m_linger_until.reset();
         m_foreground_burst = 0;
         return true;
@@ -203,7 +236,7 @@ public:
             std::lock_guard lock{m_mutex};
             assert(m_active);
             m_active = false;
-            if (m_owner_foreground && m_linger.count() > 0) m_linger_until = Clock::now() + m_linger;
+            if (m_owner_lingers && m_linger.count() > 0) m_linger_until = Clock::now() + m_linger;
             else m_linger_until.reset();
         }
         m_changed.notify_all();
@@ -216,7 +249,8 @@ public:
         std::lock_guard lock{m_mutex};
         return {m_foreground.count, m_passive.count, m_active, !m_active && Lingering(Clock::now()),
                 m_active && m_owner_foreground, m_active && m_owner_linger_window,
-                m_linger_captures, m_linger_expired_with_passive_waiting, m_burst_forced_passive_turns};
+                m_linger_captures, m_linger_expired_with_passive_waiting, m_burst_forced_passive_turns,
+                m_active && m_owner_lingers};
     }
 
     //! Read-only test observation; never services or changes queued work.

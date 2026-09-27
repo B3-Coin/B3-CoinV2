@@ -17,6 +17,7 @@
 namespace {
 using Gate = node::FlowMeshClientWorkGate;
 using Priority = node::FlowMeshClientWorkPriority;
+using Linger = node::FlowMeshClientWorkLinger;
 using Scope = node::FlowMeshClientWorkScope;
 using namespace std::chrono_literals;
 
@@ -110,6 +111,35 @@ BOOST_AUTO_TEST_CASE(scope_defaults_foreground_and_restores_nested_context)
         BOOST_CHECK(Scope::Current() == Priority::PASSIVE);
     }
     BOOST_CHECK(Scope::Current() == Priority::FOREGROUND);
+}
+
+BOOST_AUTO_TEST_CASE(scope_sets_and_restores_linger_policy)
+{
+    BOOST_CHECK(Scope::Linger() == Linger::AFTER_RELEASE);
+    BOOST_CHECK(Scope::LingersAfterRelease());
+    {
+        Scope worker{Priority::FOREGROUND, Linger::NONE};
+        BOOST_CHECK(Scope::Current() == Priority::FOREGROUND);
+        BOOST_CHECK(Scope::Linger() == Linger::NONE);
+        BOOST_CHECK(!Scope::LingersAfterRelease());
+        {
+            // Each scope sets both; the default policy applies again.
+            Scope nested{Priority::FOREGROUND};
+            BOOST_CHECK(Scope::LingersAfterRelease());
+        }
+        BOOST_CHECK(!Scope::LingersAfterRelease());
+        {
+            Scope passive{Priority::PASSIVE};
+            BOOST_CHECK(Scope::Linger() == Linger::AFTER_RELEASE);
+            BOOST_CHECK(!Scope::LingersAfterRelease()); // no window follows passive work
+        }
+        std::atomic<bool> child_lingers{false};
+        std::thread child{[&] { child_lingers = Scope::LingersAfterRelease(); }};
+        child.join();
+        BOOST_CHECK(child_lingers.load()); // thread-local: an RPC thread keeps the window
+    }
+    BOOST_CHECK(Scope::Current() == Priority::FOREGROUND);
+    BOOST_CHECK(Scope::Linger() == Linger::AFTER_RELEASE);
 }
 
 BOOST_AUTO_TEST_CASE(scope_is_thread_local_and_not_inherited_by_a_worker)
@@ -289,6 +319,7 @@ BOOST_AUTO_TEST_CASE(foreground_release_reserves_gate_for_next_foreground)
     BOOST_CHECK_EQUAL(captured.passive, 1U);
     BOOST_CHECK(captured.owner_foreground);
     BOOST_CHECK(captured.owner_linger_window);
+    BOOST_CHECK(captured.owner_lingers);
     BOOST_CHECK_EQUAL(captured.linger_captures, 1U);
     BOOST_CHECK(!passive_owned.load());
     run.owner.unlock();
@@ -383,6 +414,74 @@ BOOST_AUTO_TEST_CASE(passive_release_does_not_linger)
     const auto observed{run.gate.Inspect()};
     BOOST_CHECK_EQUAL(observed.linger_expired_with_passive_waiting, 0U);
     BOOST_CHECK_EQUAL(observed.burst_forced_passive_turns, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(no_linger_foreground_release_hands_off_promptly)
+{
+    // The Qt worker's own foreground job, followed by its queued refresh. The
+    // window is long so that a regression fails clearly instead of flaking.
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool owned{false};
+    LingerRun run{10s};
+    Scope worker{Priority::FOREGROUND, Linger::NONE};
+    run.owner.lock();
+    const auto held{run.gate.Inspect()};
+    BOOST_CHECK(held.owner_foreground);
+    BOOST_CHECK(!held.owner_lingers);
+    run.Queue(Priority::PASSIVE, [&] {
+        std::lock_guard lock{mutex};
+        owned = true;
+        condition.notify_all();
+    });
+    BOOST_REQUIRE(run.gate.WaitForQueuedForTest(0, 1, 5s));
+    run.owner.unlock();
+    // Either the refresh already owns the gate or it is about to: no window.
+    BOOST_CHECK(!run.gate.Inspect().lingering);
+    bool observed{false};
+    {
+        std::unique_lock lock{mutex};
+        observed = condition.wait_for(lock, 2s, [&] { return owned; });
+    }
+    BOOST_CHECK(observed);
+    run.gate.ExpireLingerForTest();
+    run.threads.Join();
+    const auto drained{run.gate.Inspect()};
+    BOOST_CHECK_EQUAL(drained.linger_captures, 0U);
+    BOOST_CHECK_EQUAL(drained.linger_expired_with_passive_waiting, 0U);
+    BOOST_CHECK_EQUAL(drained.burst_forced_passive_turns, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(linger_policy_is_recorded_at_acquisition)
+{
+    Gate gate{10s};
+    // Acquired without a window policy, released from an RPC-thread context.
+    {
+        Scope worker{Priority::FOREGROUND, Linger::NONE};
+        gate.lock();
+    }
+    BOOST_CHECK(!gate.Inspect().owner_lingers);
+    gate.unlock();
+    BOOST_CHECK(!gate.Inspect().lingering);
+    // The converse: an ordinary foreground acquisition keeps its window even
+    // if released inside a no-linger scope.
+    gate.lock();
+    BOOST_CHECK(gate.Inspect().owner_lingers);
+    {
+        Scope worker{Priority::FOREGROUND, Linger::NONE};
+        gate.unlock();
+    }
+    BOOST_CHECK(gate.Inspect().lingering);
+    // A no-linger probe on an empty queue still takes the gate inside the
+    // window, and its own release leaves none.
+    {
+        Scope worker{Priority::FOREGROUND, Linger::NONE};
+        BOOST_REQUIRE(gate.try_lock());
+        BOOST_CHECK(gate.Inspect().owner_linger_window);
+        BOOST_CHECK(!gate.Inspect().owner_lingers);
+        gate.unlock();
+    }
+    BOOST_CHECK(!gate.Inspect().lingering);
 }
 
 BOOST_AUTO_TEST_CASE(try_lock_during_linger)

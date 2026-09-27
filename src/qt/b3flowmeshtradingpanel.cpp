@@ -1065,7 +1065,11 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     result->receipt_market = receipt_market; result->receipt_action_id = receipt_id;
     result->receipt_account = status_read ? status_read->account : tracked ? m_pending_account : QString{};
     m_thread = QThread::create([this, generation, node, backend, cancel, yield_refresh, uri, result, selected_id, known_head, route_base, phase, refresh_basis, watch_queue, queue_watch, receipt_market, receipt_id] {
-        const node::FlowMeshClientWorkScope priority{result->passive ? node::FlowMeshClientWorkPriority::PASSIVE : node::FlowMeshClientWorkPriority::FOREGROUND};
+        // This single worker is the backend's only passive caller and runs one
+        // job at a time, so a linger after its own foreground job could only
+        // delay its own follow-up refresh. RPC-thread callers keep the window.
+        const node::FlowMeshClientWorkScope priority{result->passive ? node::FlowMeshClientWorkPriority::PASSIVE : node::FlowMeshClientWorkPriority::FOREGROUND,
+                                                     node::FlowMeshClientWorkLinger::NONE};
         std::exception_ptr auxiliary_error;
         const auto record_failure = [&](std::exception_ptr error) {
             try { std::rethrow_exception(error); }

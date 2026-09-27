@@ -250,6 +250,9 @@ struct FundingReadProbe {
     // Written only by the single worker, inspected only after that worker is
     // drained. Priority belongs to the request context, not the RPC method.
     std::vector<std::pair<std::string, node::FlowMeshClientWorkPriority>> priorities;
+    // Calls whose release would leave the backend gate lingering. The panel's
+    // worker is the only passive caller, so its own jobs must never linger.
+    std::atomic_int lingering_calls{0};
     QSemaphore auxiliary_entered, auxiliary_release;
     QSemaphore entered, release;
     std::atomic_int snapshots{0}, catalogs{0}, balances{0}, effects{0}, receipts{0}, writes{0};
@@ -262,6 +265,7 @@ struct FundingReadProbe {
                 [this, method, run](const JSONRPCRequest&, UniValue& result, bool) {
                     methods.emplace_back(method);
                     priorities.emplace_back(method, node::FlowMeshClientWorkScope::Current());
+                    if (node::FlowMeshClientWorkScope::LingersAfterRelease()) ++lingering_calls;
                     if (held_method == method) { auxiliary_entered.release(); if (!auxiliary_release.tryAcquire(1, 2000)) throw std::runtime_error{"Synthetic auxiliary exceeded its test bound"}; }
                     if (failed_method == method) throw std::runtime_error{"Synthetic auxiliary failed"};
                     result = run(); return true;
@@ -2453,6 +2457,7 @@ private Q_SLOTS:
             } else QVERIFY(priority == node::FlowMeshClientWorkPriority::PASSIVE);
         }
         QVERIFY(foreground_status);
+        QCOMPARE(probe.lingering_calls.load(), 0);
         QCOMPARE(panel.m_saved_actions.actions[0].signed_bytes_sha256, saved.actions[0].signed_bytes_sha256);
         QCOMPARE(panel.m_saved_actions.actions[0].sequence, saved.actions[0].sequence);
         QVERIFY(panel.m_saved_actions.actions[0].receipt.no_resubmit);
@@ -2624,7 +2629,7 @@ private Q_SLOTS:
             if (method == methods[phase_index]) { QVERIFY(priority == node::FlowMeshClientWorkPriority::PASSIVE); saw_passive = true; }
             if (method == "getflowmeshmarketdata") { QVERIFY(priority == node::FlowMeshClientWorkPriority::FOREGROUND); saw_foreground = true; }
         }
-        QVERIFY(saw_passive); QVERIFY(saw_foreground);
+        QVERIFY(saw_passive); QVERIFY(saw_foreground); QCOMPARE(probe.lingering_calls.load(), 0);
         QVERIFY(!panel.m_deferred_review); QVERIFY(!panel.m_confirmation); QVERIFY(!panel.m_unlock); QVERIFY(m_wallet->IsLocked());
     }
 
@@ -3052,6 +3057,7 @@ private Q_SLOTS:
         panel.resumeReview(); QCoreApplication::processEvents(); QCOMPARE(probe.snapshots.load(), 1); // A consumed intent never retries.
         for (const auto& [method, priority] : probe.priorities)
             QVERIFY(priority == (reuse ? node::FlowMeshClientWorkPriority::PASSIVE : node::FlowMeshClientWorkPriority::FOREGROUND));
+        QCOMPARE(probe.lingering_calls.load(), 0);
     }
     void orderReviewAfterReceiptOnlyNeedsOneMarketRead_data()
     {
