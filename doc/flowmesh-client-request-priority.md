@@ -48,6 +48,37 @@ end-to-end latency reduction.
   completion/reset replenishes that local allowance. These two eight-request
   limits are local scheduling policies, not protocol timers or quorum rules.
 
+## Foreground linger
+
+A trade reaches the backend as several separately gated calls: the signing
+preflight (`Market`), `Submit`, then status reads. Before this rule a queued
+passive refresh won each idle gap between them and held the gate for a whole
+remote call. Now, when a foreground owner releases, the idle gate lingers for
+`FlowMeshClientWorkGate::FOREGROUND_LINGER` (50 ms):
+
+- a foreground caller arriving in the window takes the gate at once; linger
+  never delays a foreground caller, and `try_lock` on an empty queue is still
+  prompt;
+- a queued passive caller waits for the window to expire (a deadline wait; no
+  notification marks expiry);
+- no window follows a passive owner;
+- the eight-acquisition burst bound overrides the window, so a passive caller
+  waits at most eight windows (400 ms) beyond the eight foreground holds. An
+  isolated foreground call delays passive work by at most one window.
+
+Under sustained back-to-back RPC trading with a visible Qt panel, a trade makes
+about four contended acquisitions, so the forced passive turn lands inside
+roughly every second trade. A gap longer than the window (for example a slow
+process spawn between two CLI calls) still lets one passive call in, as before.
+A passive call already running when a trade starts is not affected: the gate is
+non-preemptive.
+
+Gate spans (`flowmeshtiming`, default off) record `priority`, `linger_window`
+(acquired inside a window) and the cumulative counters `linger_captures`
+(foreground acquisitions inside a window while passive work waited),
+`linger_expired_with_passive_waiting` and `burst_forced_passive_turns`, so the
+window can be checked against captured inter-step gaps in the field.
+
 ## Preservation
 
 No outbox, sequence/high-water, exact-action retry, uncertainty, no-resubmit or

@@ -510,7 +510,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     const fs::path m_path;
     // Network waits never hold cs_main, a wallet lock or an operator lock.
     // Retain one owner across network/cache/outbox work. Explicit requests
-    // take priority over queued passive refreshes, never preempt an owner.
+    // take priority over queued passive refreshes, never preempt an owner;
+    // after an explicit request the idle gate briefly waits for its next step.
     // Status remains nonblocking; metadata uses its separate lock below.
     FlowMeshClientWorkGate m_work;
     // One TLS connection, owned exclusively under m_work. Reuse changes only
@@ -661,6 +662,19 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             m_retry_after[endpoint] = std::chrono::steady_clock::now() + delay;
         }
         if (error.empty()) m_status.active_endpoint = row.url;
+    }
+    // Called by the m_work owner right after acquisition. Diagnostics only:
+    // shows whether a trade's next step was captured by the gate's linger.
+    void MarkWorkAcquired(FlowMeshTimingSpan& timing) const
+    {
+        timing.Mark("lock_acquired_us");
+        if (!timing.Enabled()) return;
+        const auto gate{m_work.Inspect()};
+        timing.Field("priority", std::string{gate.owner_foreground ? "foreground" : "passive"});
+        timing.Field("linger_window", uint64_t{gate.owner_linger_window});
+        timing.Field("linger_captures", gate.linger_captures);
+        timing.Field("linger_expired_with_passive_waiting", gate.linger_expired_with_passive_waiting);
+        timing.Field("burst_forced_passive_turns", gate.burst_forced_passive_turns);
     }
     UniValue Call(const std::string& method, const UniValue& params,
                   const std::function<void(const UniValue&, size_t)>& validate,
@@ -1176,7 +1190,7 @@ public:
         timing_lock_1145.Field("lock_name", std::string{"client_work"});
         timing_lock_1145.Mark("lock_requested_us");
         std::lock_guard lock{m_work};
-        timing_lock_1145.Mark("lock_acquired_us");
+        MarkWorkAcquired(timing_lock_1145);
         try {
             const auto existing{std::find_if(m_endpoints.begin(), m_endpoints.end(), [&](const auto& candidate) { return candidate.url == endpoint.url; })};
             const bool added{existing == m_endpoints.end()};
@@ -1233,7 +1247,7 @@ public:
         timing_lock_1197.Field("lock_name", std::string{"client_work"});
         timing_lock_1197.Mark("lock_requested_us");
         std::lock_guard lock{m_work};
-        timing_lock_1197.Mark("lock_acquired_us");
+        MarkWorkAcquired(timing_lock_1197);
         std::vector<MarketStatus> out;
         const auto rows{ReadMarkets()};
         // Discovery is bounded metadata; selected market gets full proof on
@@ -1255,7 +1269,7 @@ public:
         timing_lock_1215.Field("lock_name", std::string{"client_work"});
         timing_lock_1215.Mark("lock_requested_us");
         std::lock_guard lock{m_work};
-        timing_lock_1215.Mark("lock_acquired_us");
+        MarkWorkAcquired(timing_lock_1215);
         MarketStatus status; status.market_id = id; status.remote = true;
         try {
             auto& cache{Refresh(id, account, {})}; const auto data{Project(cache, account, {})};
@@ -1289,7 +1303,7 @@ public:
         timing_lock_1245.Field("lock_name", std::string{"client_work"});
         timing_lock_1245.Mark("lock_requested_us");
         std::lock_guard lock{m_work};
-        timing_lock_1245.Mark("lock_acquired_us");
+        MarkWorkAcquired(timing_lock_1245);
         try { return Project(Refresh(id, account, query), account, query); }
         catch (const std::exception& e) { error = e.what(); return std::nullopt; }
     }
@@ -1301,7 +1315,7 @@ public:
         timing_lock_1251.Field("lock_name", std::string{"client_work"});
         timing_lock_1251.Mark("lock_requested_us");
         std::lock_guard lock{m_work};
-        timing_lock_1251.Mark("lock_acquired_us");
+        MarkWorkAcquired(timing_lock_1251);
         Receipt out; out.action_id = action.Id();
         try {
             const auto pins{Pins(market)};
@@ -1349,7 +1363,7 @@ public:
         timing_lock_1293.Field("lock_name", std::string{"client_work"});
         timing_lock_1293.Mark("lock_requested_us");
         std::lock_guard lock{m_work};
-        timing_lock_1293.Mark("lock_acquired_us");
+        MarkWorkAcquired(timing_lock_1293);
         Receipt out; out.action_id = action;
         const auto it{m_pending.find({market, action})};
         if (it == m_pending.end()) { out.reason = "No retained local signed object; action outcome is unknown"; return out; }
@@ -1412,7 +1426,7 @@ public:
         timing_lock_1352.Field("lock_name", std::string{"client_work"});
         timing_lock_1352.Mark("lock_requested_us");
         std::lock_guard lock{m_work};
-        timing_lock_1352.Mark("lock_acquired_us");
+        MarkWorkAcquired(timing_lock_1352);
         std::vector<interfaces::FlowMeshSavedAction> out;
         if (account.IsNull()) return out;
         // m_pending is already bounded by CLIENT_MAX_ACTIONS on admission and
@@ -1496,7 +1510,7 @@ std::optional<interfaces::FlowMeshPendingCheckpoint> RemoteBackend::Checkpoint(c
     timing_lock_1431.Field("lock_name", std::string{"client_work"});
     timing_lock_1431.Mark("lock_requested_us");
     std::lock_guard lock{m_work};
-    timing_lock_1431.Mark("lock_acquired_us");
+    MarkWorkAcquired(timing_lock_1431);
     try {
         UniValue params{UniValue::VOBJ}; params.pushKV("market_id", id.GetHex());
         std::optional<interfaces::FlowMeshPendingCheckpoint> result;
@@ -1514,7 +1528,7 @@ std::vector<interfaces::FlowMeshVaultOperation> RemoteBackend::VaultOperations(c
     timing_lock_1445.Field("lock_name", std::string{"client_work"});
     timing_lock_1445.Mark("lock_requested_us");
     std::lock_guard lock{m_work};
-    timing_lock_1445.Mark("lock_acquired_us");
+    MarkWorkAcquired(timing_lock_1445);
     try {
         UniValue params{UniValue::VOBJ}; if (id) params.pushKV("market_id", id->GetHex());
         std::vector<interfaces::FlowMeshVaultOperation> result;
@@ -1541,7 +1555,7 @@ std::optional<interfaces::FlowMeshVaultOperation> RemoteBackend::VaultOperation(
     timing_lock_1468.Field("lock_name", std::string{"client_work"});
     timing_lock_1468.Mark("lock_requested_us");
     std::lock_guard lock{m_work};
-    timing_lock_1468.Mark("lock_acquired_us");
+    MarkWorkAcquired(timing_lock_1468);
     try {
         UniValue params{UniValue::VOBJ}; params.pushKV("effect_id", id.GetHex());
         std::optional<interfaces::FlowMeshVaultOperation> result;

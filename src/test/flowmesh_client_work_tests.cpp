@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -58,6 +59,31 @@ struct OrderedRun {
     {
         initial.unlock();
         threads.Join();
+    }
+};
+
+// Linger cases hold the gate directly. A failed assertion still releases the
+// owner and ends any window before joining, so no case waits out a long window.
+struct LingerRun {
+    Gate gate;
+    Threads threads;
+    std::unique_lock<Gate> owner{gate, std::defer_lock};
+
+    explicit LingerRun(std::chrono::milliseconds linger) : gate{linger} {}
+    ~LingerRun()
+    {
+        if (owner.owns_lock()) owner.unlock();
+        gate.ExpireLingerForTest();
+        threads.Join();
+    }
+
+    void Queue(Priority priority, std::function<void()> work)
+    {
+        threads.values.emplace_back([this, priority, work = std::move(work)] {
+            Scope scope{priority};
+            std::lock_guard lock{gate};
+            work();
+        });
     }
 };
 } // namespace
@@ -242,6 +268,176 @@ BOOST_AUTO_TEST_CASE(try_lock_is_prompt_and_does_not_barge_a_waiter)
     const bool idle{gate.try_lock()};
     BOOST_CHECK(idle);
     if (idle) gate.unlock();
+}
+
+BOOST_AUTO_TEST_CASE(foreground_release_reserves_gate_for_next_foreground)
+{
+    // A long window proves the reservation; the test ends it explicitly.
+    LingerRun run{10s};
+    std::atomic<bool> passive_owned{false};
+    run.owner.lock();
+    run.Queue(Priority::PASSIVE, [&] { passive_owned = true; });
+    BOOST_REQUIRE(run.gate.WaitForQueuedForTest(0, 1, 5s));
+    run.owner.unlock();
+    BOOST_CHECK(run.gate.Inspect().lingering);
+    // The trade's next step is served before the queued refresh.
+    run.owner.lock();
+    const auto captured{run.gate.Inspect()};
+    BOOST_CHECK(captured.active);
+    BOOST_CHECK_EQUAL(captured.passive, 1U);
+    BOOST_CHECK(captured.owner_foreground);
+    BOOST_CHECK(captured.owner_linger_window);
+    BOOST_CHECK_EQUAL(captured.linger_captures, 1U);
+    BOOST_CHECK(!passive_owned.load());
+    run.owner.unlock();
+    run.gate.ExpireLingerForTest();
+    run.threads.Join();
+    BOOST_CHECK(passive_owned.load());
+    const auto drained{run.gate.Inspect()};
+    BOOST_CHECK(!drained.active);
+    BOOST_CHECK_EQUAL(drained.passive, 0U);
+    BOOST_CHECK_EQUAL(drained.linger_captures, 1U);
+    BOOST_CHECK_EQUAL(drained.linger_expired_with_passive_waiting, 1U);
+    BOOST_CHECK_EQUAL(drained.burst_forced_passive_turns, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(passive_runs_when_foreground_linger_expires)
+{
+    using Clock = std::chrono::steady_clock;
+    LingerRun run{Gate::FOREGROUND_LINGER};
+    Clock::time_point acquired{};
+    run.owner.lock();
+    run.Queue(Priority::PASSIVE, [&] { acquired = Clock::now(); });
+    BOOST_REQUIRE(run.gate.WaitForQueuedForTest(0, 1, 5s));
+    const auto released{Clock::now()};
+    run.owner.unlock();
+    run.threads.Join();
+    // No notification marks expiry: the waiter's own deadline releases it.
+    BOOST_CHECK(acquired - released >= Gate::FOREGROUND_LINGER);
+    BOOST_CHECK(acquired - released < 5s);
+    const auto observed{run.gate.Inspect()};
+    BOOST_CHECK(!observed.lingering);
+    BOOST_CHECK_EQUAL(observed.linger_captures, 0U);
+    BOOST_CHECK_EQUAL(observed.linger_expired_with_passive_waiting, 1U);
+    BOOST_CHECK_EQUAL(observed.burst_forced_passive_turns, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(burst_limit_overrides_foreground_linger)
+{
+    LingerRun run{10s};
+    std::mutex record_mutex;
+    std::vector<int> order;
+    const auto record = [&](int id) {
+        std::lock_guard lock{record_mutex};
+        order.push_back(id);
+    };
+    run.owner.lock();
+    run.Queue(Priority::PASSIVE, [&] { record(100); });
+    BOOST_REQUIRE(run.gate.WaitForQueuedForTest(0, 1, 5s));
+    constexpr int BURST{static_cast<int>(Gate::MAX_FOREGROUND_BURST)};
+    for (int i{1}; i <= BURST; ++i) {
+        run.owner.unlock();
+        run.owner.lock();
+        record(i);
+    }
+    const auto spent{run.gate.Inspect()};
+    BOOST_CHECK_EQUAL(spent.passive, 1U);
+    BOOST_CHECK_EQUAL(spent.linger_captures, Gate::MAX_FOREGROUND_BURST);
+    // The spent allowance ends the window: the refresh runs before the next
+    // foreground step, even though that step is already asking.
+    run.owner.unlock();
+    run.owner.lock();
+    record(BURST + 1);
+    run.owner.unlock();
+    run.threads.Join();
+    std::vector<int> expected;
+    for (int i{1}; i <= BURST; ++i) expected.push_back(i);
+    expected.push_back(100);
+    expected.push_back(BURST + 1);
+    BOOST_CHECK_EQUAL_COLLECTIONS(order.begin(), order.end(), expected.begin(), expected.end());
+    const auto drained{run.gate.Inspect()};
+    BOOST_CHECK_EQUAL(drained.burst_forced_passive_turns, 1U);
+    BOOST_CHECK_EQUAL(drained.linger_expired_with_passive_waiting, 0U);
+    BOOST_CHECK_EQUAL(drained.linger_captures, Gate::MAX_FOREGROUND_BURST);
+}
+
+BOOST_AUTO_TEST_CASE(passive_release_does_not_linger)
+{
+    using Clock = std::chrono::steady_clock;
+    LingerRun run{10s};
+    std::atomic<bool> owned{false};
+    {
+        Scope passive{Priority::PASSIVE};
+        run.owner.lock();
+    }
+    run.Queue(Priority::PASSIVE, [&] { owned = true; });
+    BOOST_REQUIRE(run.gate.WaitForQueuedForTest(0, 1, 5s));
+    const auto released{Clock::now()};
+    run.owner.unlock();
+    BOOST_CHECK(!run.gate.Inspect().lingering);
+    run.threads.Join();
+    BOOST_CHECK(owned.load());
+    BOOST_CHECK(Clock::now() - released < 5s);
+    const auto observed{run.gate.Inspect()};
+    BOOST_CHECK_EQUAL(observed.linger_expired_with_passive_waiting, 0U);
+    BOOST_CHECK_EQUAL(observed.burst_forced_passive_turns, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(try_lock_during_linger)
+{
+    LingerRun run{10s};
+    run.owner.lock();
+    run.owner.unlock();
+    BOOST_CHECK(run.gate.Inspect().lingering);
+    // With no queued caller, a probe is still prompt inside the window.
+    BOOST_REQUIRE(run.owner.try_lock());
+    BOOST_CHECK(run.gate.Inspect().owner_linger_window);
+    run.owner.unlock();
+    std::atomic<bool> owned{false};
+    run.Queue(Priority::PASSIVE, [&] { owned = true; });
+    BOOST_REQUIRE(run.gate.WaitForQueuedForTest(0, 1, 5s));
+    // The window holds the queued refresh, and the probe does not barge it.
+    const bool barged{run.owner.try_lock()};
+    BOOST_CHECK(!barged);
+    if (barged) run.owner.unlock();
+    BOOST_CHECK(!owned.load());
+    run.gate.ExpireLingerForTest();
+    run.threads.Join();
+    BOOST_CHECK(owned.load());
+    const bool idle{run.owner.try_lock()};
+    BOOST_CHECK(idle);
+    if (idle) run.owner.unlock();
+}
+
+BOOST_AUTO_TEST_CASE(zero_linger_reproduces_prior_handoff)
+{
+    LingerRun run{0ms};
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool owned{false}, release{false};
+    run.owner.lock();
+    run.Queue(Priority::PASSIVE, [&] {
+        std::unique_lock lock{mutex};
+        owned = true;
+        condition.notify_all();
+        condition.wait(lock, [&] { return release; });
+    });
+    BOOST_REQUIRE(run.gate.WaitForQueuedForTest(0, 1, 5s));
+    run.owner.unlock();
+    // No reservation: the queued refresh takes the gate at the release.
+    BOOST_CHECK(!run.gate.Inspect().lingering);
+    bool observed{false};
+    {
+        std::unique_lock lock{mutex};
+        observed = condition.wait_for(lock, 5s, [&] { return owned; });
+        release = true;
+    }
+    condition.notify_all();
+    run.threads.Join();
+    BOOST_CHECK(observed);
+    const auto drained{run.gate.Inspect()};
+    BOOST_CHECK_EQUAL(drained.linger_captures, 0U);
+    BOOST_CHECK_EQUAL(drained.linger_expired_with_passive_waiting, 0U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
