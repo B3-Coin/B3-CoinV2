@@ -381,7 +381,12 @@ class TradingApi {
                               Receipt& receipt, FlowMeshTimingSpan& timing)
     {
         // Only for an action this node already recorded ('submit' appends its
-        // queue event before it replies): random ActionIds cannot hold slots.
+        // queue event before it replies), so made-up ActionIds cannot hold
+        // slots. Public ones can: 'updates' lists every retained event's
+        // action_id, so any client may wait on other clients' non-terminal
+        // actions and a few addresses can hold every slot. That only turns
+        // other waited reads into an immediate 'busy' reply (as without
+        // waits); it never delays or changes any reply's receipt.
         if (!tracked) return "untracked";
         const auto now{std::chrono::steady_clock::now()};
         const auto until{std::min(now + wait, http.deadline - API_WAIT_REPLY_RESERVE)};
