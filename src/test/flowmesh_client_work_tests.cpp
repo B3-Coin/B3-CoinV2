@@ -64,6 +64,8 @@ struct OrderedRun {
 
 // Linger cases hold the gate directly. A failed assertion still releases the
 // owner and ends any window before joining, so no case waits out a long window.
+// Declare state that queued work uses BEFORE the run: locals are destroyed in
+// reverse order, and the run's destructor joins the workers that use them.
 struct LingerRun {
     Gate gate;
     Threads threads;
@@ -273,8 +275,8 @@ BOOST_AUTO_TEST_CASE(try_lock_is_prompt_and_does_not_barge_a_waiter)
 BOOST_AUTO_TEST_CASE(foreground_release_reserves_gate_for_next_foreground)
 {
     // A long window proves the reservation; the test ends it explicitly.
-    LingerRun run{10s};
     std::atomic<bool> passive_owned{false};
+    LingerRun run{10s};
     run.owner.lock();
     run.Queue(Priority::PASSIVE, [&] { passive_owned = true; });
     BOOST_REQUIRE(run.gate.WaitForQueuedForTest(0, 1, 5s));
@@ -304,8 +306,8 @@ BOOST_AUTO_TEST_CASE(foreground_release_reserves_gate_for_next_foreground)
 BOOST_AUTO_TEST_CASE(passive_runs_when_foreground_linger_expires)
 {
     using Clock = std::chrono::steady_clock;
-    LingerRun run{Gate::FOREGROUND_LINGER};
     Clock::time_point acquired{};
+    LingerRun run{Gate::FOREGROUND_LINGER};
     run.owner.lock();
     run.Queue(Priority::PASSIVE, [&] { acquired = Clock::now(); });
     BOOST_REQUIRE(run.gate.WaitForQueuedForTest(0, 1, 5s));
@@ -324,13 +326,13 @@ BOOST_AUTO_TEST_CASE(passive_runs_when_foreground_linger_expires)
 
 BOOST_AUTO_TEST_CASE(burst_limit_overrides_foreground_linger)
 {
-    LingerRun run{10s};
     std::mutex record_mutex;
     std::vector<int> order;
     const auto record = [&](int id) {
         std::lock_guard lock{record_mutex};
         order.push_back(id);
     };
+    LingerRun run{10s};
     run.owner.lock();
     run.Queue(Priority::PASSIVE, [&] { record(100); });
     BOOST_REQUIRE(run.gate.WaitForQueuedForTest(0, 1, 5s));
@@ -364,8 +366,8 @@ BOOST_AUTO_TEST_CASE(burst_limit_overrides_foreground_linger)
 BOOST_AUTO_TEST_CASE(passive_release_does_not_linger)
 {
     using Clock = std::chrono::steady_clock;
-    LingerRun run{10s};
     std::atomic<bool> owned{false};
+    LingerRun run{10s};
     {
         Scope passive{Priority::PASSIVE};
         run.owner.lock();
@@ -385,6 +387,7 @@ BOOST_AUTO_TEST_CASE(passive_release_does_not_linger)
 
 BOOST_AUTO_TEST_CASE(try_lock_during_linger)
 {
+    std::atomic<bool> owned{false};
     LingerRun run{10s};
     run.owner.lock();
     run.owner.unlock();
@@ -393,7 +396,6 @@ BOOST_AUTO_TEST_CASE(try_lock_during_linger)
     BOOST_REQUIRE(run.owner.try_lock());
     BOOST_CHECK(run.gate.Inspect().owner_linger_window);
     run.owner.unlock();
-    std::atomic<bool> owned{false};
     run.Queue(Priority::PASSIVE, [&] { owned = true; });
     BOOST_REQUIRE(run.gate.WaitForQueuedForTest(0, 1, 5s));
     // The window holds the queued refresh, and the probe does not barge it.
@@ -411,16 +413,18 @@ BOOST_AUTO_TEST_CASE(try_lock_during_linger)
 
 BOOST_AUTO_TEST_CASE(zero_linger_reproduces_prior_handoff)
 {
-    LingerRun run{0ms};
     std::mutex mutex;
     std::condition_variable condition;
     bool owned{false}, release{false};
+    LingerRun run{0ms};
     run.owner.lock();
     run.Queue(Priority::PASSIVE, [&] {
         std::unique_lock lock{mutex};
         owned = true;
         condition.notify_all();
-        condition.wait(lock, [&] { return release; });
+        // Bounded: after a failed assertion nothing sets release, and the
+        // run's destructor joins this worker.
+        condition.wait_for(lock, 5s, [&] { return release; });
     });
     BOOST_REQUIRE(run.gate.WaitForQueuedForTest(0, 1, 5s));
     run.owner.unlock();
