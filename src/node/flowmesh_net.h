@@ -126,6 +126,11 @@ public:
     //! Retire this owner's delivery id. Partially written frames require a
     //! disconnect; their bytes are never spliced into another signed frame.
     void Cancel(uint64_t delivery_id);
+    //! Local scheduling hint that the sink may now accept frames it refused,
+    //! e.g. after its chain gate reopened. Every held frame is offered again
+    //! on the next I/O pass instead of after its 100 ms..1 s backoff. Never
+    //! admits anything by itself; the 30-second hold limit is unchanged.
+    void NotifyIngressReady();
     FlowMeshNetSnapshot Snapshot() const;
 private:
     struct Impl;

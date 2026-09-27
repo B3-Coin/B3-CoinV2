@@ -261,6 +261,9 @@ struct FlowMeshNetService::Impl {
     // worker-owned, and no lock is held across I/O, crypto, sink or feedback.
     std::map<flowmesh::WirePeerId, std::shared_ptr<EgressPeer>> admission_peers;
     std::map<uint64_t, std::shared_ptr<Packet::Cancellation>> cancellations;
+    // Bumped by NotifyIngressReady; the worker compares it once per pass.
+    std::atomic<uint64_t> ingress_ready{0};
+    uint64_t ingress_ready_seen{0};
     std::array<uint64_t, CHANNELS> next_socket{};
     uint64_t next_connection{1};
     flowmesh::WirePeerId next_peer{-2};
@@ -901,6 +904,17 @@ struct FlowMeshNetService::Impl {
                 if (wait.empty()) { Publish(); std::this_thread::sleep_for(IO_WAIT); continue; }
                 if (!wait.begin()->first->WaitMany(IO_WAIT, wait)) throw std::runtime_error{"FlowMesh socket poll failed"};
                 now = Clock::now();
+                // The sink reports that its refusal reason (normally the B3
+                // reconciliation gate) has cleared. Offer every held frame in
+                // this pass; a renewed refusal restarts the normal backoff.
+                if (const auto ready{ingress_ready.load(std::memory_order_acquire)}; ready != ingress_ready_seen) {
+                    ingress_ready_seen = ready;
+                    for (auto& [id, c] : connections) {
+                        if (!c->pending_ingress) continue;
+                        c->next_ingress_retry = now;
+                        c->ingress_retry_delay = INGRESS_RETRY_INITIAL;
+                    }
+                }
                 if (listener && (wait.at(listener).occurred & Sock::RECV)) Accept(now);
                 // Critical first, then independently capped action and bulk work.
                 // Rotate within each class so a slow/high-volume peer cannot
@@ -1158,6 +1172,10 @@ void FlowMeshNetService::Cancel(uint64_t delivery_id)
     std::lock_guard lock{m_impl->mutex};
     const auto it{m_impl->cancellations.find(delivery_id)};
     if (it != m_impl->cancellations.end()) it->second->cancelled = true;
+}
+void FlowMeshNetService::NotifyIngressReady()
+{
+    m_impl->ingress_ready.fetch_add(1, std::memory_order_release);
 }
 FlowMeshNetSnapshot FlowMeshNetService::Snapshot() const
 {

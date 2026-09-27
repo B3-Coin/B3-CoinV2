@@ -467,6 +467,20 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         ReconciliationTrace(value ? "gate_closed" : "gate_opened", DeliveryGeneration());
     }
 
+    //! Local scheduling hint once the gate has reopened and the runtime tick
+    //! (which requeues older deferred input first) has been requested: frames
+    //! the independent network holds because ingress answered RECONCILING are
+    //! offered again at once instead of after their backoff.
+    void IngressReopened()
+    {
+        std::shared_ptr<FlowMeshNetService> active;
+        {
+            std::lock_guard<std::mutex> lock{mutex};
+            active = network;
+        }
+        if (active) active->NotifyIngressReady();
+    }
+
     bool Acceptable(const flowmesh::AnchorRef& anchor) const override
     {
         ServiceSpan trace{"chain_acceptable", DeliveryGeneration()};
@@ -1804,6 +1818,7 @@ bool FlowMeshService::Start(PeerManager& peerman, std::string& error)
         return true;
     }
     runtime->NotifyTick();
+    m_impl->IngressReopened();
     LogInfo("FlowMesh production service started (transport=%s)\n", m_impl->transport.mode);
     return true;
 }
@@ -2718,7 +2733,10 @@ void FlowMeshService::UpdatedBlockTip(const CBlockIndex* new_tip,
         LogInfo("FlowMesh remains paused: B3 tip changed before reconciliation completed\n");
         return;
     }
+    // Wake the runtime first so older deferred input usually requeues ahead
+    // of frames the independent network has been holding since the gate shut.
     if (runtime) runtime->NotifyTick();
+    m_impl->IngressReopened();
 }
 
 } // namespace node

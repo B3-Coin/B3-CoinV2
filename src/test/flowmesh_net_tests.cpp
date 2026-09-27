@@ -702,6 +702,38 @@ BOOST_AUTO_TEST_CASE(rejected_ingress_is_retained_and_retried_once_per_admission
     }
 }
 
+BOOST_AUTO_TEST_CASE(reconciling_ingress_resumes_on_ready_notification)
+{
+    Sink sink; sink.Admit(Kind::PROPOSAL, flowmesh::QueueResult::RECONCILING);
+    node::FlowMeshNetService server{Config(m_path_root / "fmnet-ingress-ready"), sink}; std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    CKey key; key.MakeNewKey(true); RawChannel live, actions, bulk;
+    const auto address{server.Snapshot().bind_address};
+    BOOST_REQUIRE(Handshake(live, address, key, 0)); BOOST_REQUIRE(Handshake(actions, address, key, 1));
+    BOOST_REQUIRE(Handshake(bulk, address, key, 2));
+    const auto proposal{Message(Kind::PROPOSAL)}, vote{Message(Kind::ATTESTATION)};
+    auto first{Frame(live, key, proposal)}, second{Frame(live, key, vote)};
+    BOOST_REQUIRE(Transfer(*live.socket, first, true)); BOOST_REQUIRE(Transfer(*live.socket, second, true));
+    // Refusals at 0, 100, 300 and 700 ms put the held frame's next offer
+    // 800 ms after the fourth, with the vote queued behind it.
+    BOOST_REQUIRE(Wait([&] { return sink.Attempts(Kind::PROPOSAL) >= 4; }));
+    BOOST_CHECK_EQUAL(sink.Attempts(Kind::ATTESTATION), 0U);
+    sink.Admit(Kind::PROPOSAL, flowmesh::QueueResult::ACCEPTED);
+    const auto start{std::chrono::steady_clock::now()};
+    server.NotifyIngressReady();
+    BOOST_REQUIRE(Wait([&] { return sink.Messages().size() == 2; }));
+    const auto elapsed{std::chrono::steady_clock::now() - start};
+    BOOST_CHECK_MESSAGE(elapsed < 300ms, "held frame waited "
+        << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() << " ms after the ready notification");
+    // One more offer, in order, and nothing re-read or duplicated.
+    BOOST_CHECK_EQUAL(sink.Attempts(Kind::PROPOSAL), 5U);
+    const auto messages{sink.Messages()};
+    BOOST_CHECK(messages[0].message == proposal); BOOST_CHECK(messages[1].message == vote);
+    BOOST_CHECK_EQUAL(messages[0].peer, messages[1].peer);
+    BOOST_CHECK_EQUAL(server.Snapshot().pending_ingress_bytes, 0U);
+    BOOST_CHECK_EQUAL(server.Snapshot().ingress_discarded_messages, 0U);
+}
+
 BOOST_AUTO_TEST_CASE(bulk_admission_backpressure_does_not_block_live_ingress)
 {
     Sink sink; sink.Admit(Kind::ENTRIES, flowmesh::QueueResult::GLOBAL_LIMIT);
