@@ -218,6 +218,7 @@ class SplitHttpsPeer {
     Sock m_socket{m_fd};
     std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> m_context{SSL_CTX_new(TLS_client_method()), SSL_CTX_free};
     std::unique_ptr<SSL, decltype(&SSL_free)> m_ssl{nullptr, SSL_free};
+    size_t m_sessions_offered{0};
 
     bool Again(int result, Clock::time_point deadline)
     {
@@ -229,10 +230,19 @@ class SplitHttpsPeer {
     }
 
 public:
-    SplitHttpsPeer(uint16_t port, const fs::path& certificate)
+    SplitHttpsPeer(uint16_t port, const fs::path& certificate, int max_version = 0)
     {
         BOOST_REQUIRE(m_fd != INVALID_SOCKET);
         BOOST_REQUIRE(m_context);
+        if (max_version) BOOST_REQUIRE_EQUAL(SSL_CTX_set_max_proto_version(m_context.get(), max_version), 1);
+        // Count resumable sessions the server offers (a ticket or a cacheable
+        // session ID). Nothing is stored or offered back to the server.
+        SSL_CTX_set_session_cache_mode(m_context.get(), SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+        BOOST_REQUIRE_EQUAL(SSL_CTX_set_app_data(m_context.get(), this), 1);
+        SSL_CTX_sess_set_new_cb(m_context.get(), [](SSL* ssl, SSL_SESSION*) {
+            ++static_cast<SplitHttpsPeer*>(SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl)))->m_sessions_offered;
+            return 0;
+        });
         SSL_CTX_set_verify(m_context.get(), SSL_VERIFY_PEER, nullptr);
         BOOST_REQUIRE_EQUAL(SSL_CTX_load_verify_locations(m_context.get(), fs::PathToString(certificate).c_str(), nullptr), 1);
         m_ssl.reset(SSL_new(m_context.get()));
@@ -315,6 +325,8 @@ public:
     }
 
     std::string ReadRejection() { return ReadResponse(REJECTION_BODY.size()); }
+    size_t SessionsOffered() const { return m_sessions_offered; }
+    int Version() const { return SSL_version(m_ssl.get()); }
 
     std::string ReadRecord()
     {
@@ -789,6 +801,28 @@ BOOST_AUTO_TEST_CASE(https_reply_bodies_are_exact_across_first_record_boundary)
             BOOST_CHECK_EQUAL(reply.body.size(), body.size());
             BOOST_CHECK(reply.body == body);
             BOOST_CHECK_EQUAL(reply.connection_reused, i != 0);
+        }
+    }
+    server.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_server_issues_no_resumption_tickets)
+{
+    node::FlowMeshHttpsServer server{Options(), [](const auto&) {
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    // The production client never resumes. The server offers neither TLS 1.3
+    // tickets nor a TLS 1.2 ticket or cacheable session ID.
+    for (const int version : {TLS1_3_VERSION, TLS1_2_VERSION}) {
+        BOOST_TEST_CONTEXT("maximum TLS version=" << version) {
+            SplitHttpsPeer peer{server.Port(), cert, version};
+            BOOST_REQUIRE(peer.Send("POST /flowmesh/v1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"));
+            BOOST_REQUIRE(peer.ReadResponse(2).starts_with("HTTP/1.1 200 "));
+            BOOST_CHECK_EQUAL(peer.Version(), version);
+            BOOST_CHECK_EQUAL(peer.SessionsOffered(), 0U);
+            peer.NotifyClose();
         }
     }
     server.Stop();

@@ -108,6 +108,14 @@ SslContext MakeContext(bool server)
     SSL_CTX_set_options(context.get(), SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION);
     SSL_CTX_set_max_early_data(context.get(), 0); // Never transmit trading actions as replayable TLS 0-RTT.
     SSL_CTX_set_default_passwd_cb(context.get(), [](char*, int, int, void*) { return 0; });
+    if (server) {
+        // The client never resumes, so every connection is a full, verified
+        // handshake. Issue no TLS 1.3 or 1.2 tickets and keep no session-ID
+        // cache: no unused records or server-side resumption state.
+        SSL_CTX_set_num_tickets(context.get(), 0);
+        SSL_CTX_set_options(context.get(), SSL_OP_NO_TICKET);
+        SSL_CTX_set_session_cache_mode(context.get(), SSL_SESS_CACHE_OFF);
+    }
     return context;
 }
 
