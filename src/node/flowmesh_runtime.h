@@ -222,8 +222,10 @@ struct FlowMeshRuntimeDeliverySnapshot {
     // admission without a committee token, queue slot or handler pass.
     uint64_t certified_slot_frames_consumed{0};
     // Frames of either kind above refused RATE_LIMITED because their sender
-    // spent its separate budget for consumed frames. Honest relays stay far
-    // below that budget; a non-zero value points at a flooding peer.
+    // spent one of its separate budgets for consumed frames (per market, or
+    // across all markets). Honest relays measured with four validators stay
+    // far below both; a non-zero value points at a flooding peer, or at a
+    // larger committee whose honest relays outgrew the sizing.
     uint64_t settled_frames_rate_limited{0};
     size_t pending_objects{0}, pending_bytes{0};
     size_t deferred_objects{0}, deferred_bytes{0};

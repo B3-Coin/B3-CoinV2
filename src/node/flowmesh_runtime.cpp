@@ -3107,16 +3107,20 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
         return flowmesh::QueueResult::MARKET_LIMIT;
     }
     // Both consumptions below take no committee token or queue slot, but
-    // still spend the sender's separate settled-frame budget (256 burst,
-    // 64/s per peer and market; BoundedWireQueue::ConsumeSettled) after the
-    // unchanged framing verdict. When it is empty the frame is refused
-    // RATE_LIMITED, as a committee frame is: FMN2 then holds that sender's
-    // critical channel and stops reading it, and legacy B3 carriage refuses
-    // the frame. So a flood of settled-slot frames is bounded per peer, not
-    // only by the FMN2 receive budget (256 critical frames/s, 4 MiB/s per
-    // connection), which unauthenticated legacy/dual B3 ingress lacks.
-    // Honest star relays stay far below the budget (measured: at most 27 per
-    // peer and market in any second, 82 in any five seconds).
+    // still spend the sender's separate settled-frame budgets after the
+    // unchanged framing verdict: 256 burst and 64/s per peer and market, and
+    // 512 burst and 128/s per peer across all markets
+    // (BoundedWireQueue::ConsumeSettled). When either is empty the frame is
+    // refused RATE_LIMITED, as a committee frame is: FMN2 then holds that
+    // sender's critical channel and stops reading it, and legacy B3 carriage
+    // refuses the frame. This bounds each peer however many markets it uses,
+    // including unauthenticated legacy/dual B3 ingress, which has no FMN2
+    // receive budget. It does not bound all peers together: on FMN2 only the
+    // shared critical receive bucket does, and a handful of flooding peers
+    // can still empty it (see FLOWMESH_SETTLED_PEER_TOKEN_BURST). Honest
+    // relays stayed far below both budgets with 4 validators (at most 27 per
+    // peer and market in any second, 82 in any five seconds); that sizing
+    // must be re-validated with more seats.
     const auto consume_settled = [&] { // Caller holds m_queue_mutex.
         const auto result{m_queue.ConsumeSettled(peer, message, m_config.clock->Now())};
         if (result == flowmesh::QueueResult::RATE_LIMITED) ++m_settled_rate_limited[message.header.market_id];

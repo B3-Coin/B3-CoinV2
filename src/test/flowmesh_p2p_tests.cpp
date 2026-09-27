@@ -285,6 +285,65 @@ BOOST_AUTO_TEST_CASE(settled_frames_spend_a_separate_bounded_budget)
     BOOST_CHECK(queue.ConsumeSettled(3, vote, later) == QueueResult::ACCEPTED);
 }
 
+// A peer's settled frames in all markets together also spend one per-peer
+// budget, so admitting more markets does not multiply what one peer may have
+// consumed. A refusal by either budget spends nothing from the other.
+BOOST_AUTO_TEST_CASE(settled_frames_are_bounded_per_peer_across_markets)
+{
+    using namespace flowmesh;
+    // The counts below are written for these values.
+    static_assert(FLOWMESH_SETTLED_TOKEN_BURST == 256.0 && FLOWMESH_SETTLED_TOKEN_RATE == 64.0);
+    static_assert(FLOWMESH_SETTLED_PEER_TOKEN_BURST == 512.0 && FLOWMESH_SETTLED_PEER_TOKEN_RATE == 128.0);
+    BoundedWireQueue queue;
+    const auto now{WireClock::time_point{std::chrono::seconds{500}}};
+    const auto in_market = [](const unsigned char market) {
+        auto out{Message(WireMessageKind::ATTESTATION)};
+        out.header.market_id.begin()[1] = market;
+        return out;
+    };
+    const auto consume = [&](const WirePeerId peer, const unsigned char market, const size_t count,
+                             const WireClock::time_point when) {
+        size_t accepted{0};
+        for (size_t i{0}; i < count; ++i) {
+            accepted += queue.ConsumeSettled(peer, in_market(market), when) == QueueResult::ACCEPTED;
+        }
+        return accepted;
+    };
+
+    // One market's own budget binds first; its 50 refusals spend nothing
+    // from the peer's budget, so the other 256 still fit in two further
+    // markets that each stay below their own burst.
+    BOOST_CHECK_EQUAL(consume(3, 1, 306, now), 256U);
+    BOOST_CHECK_EQUAL(consume(3, 2, 128, now), 128U);
+    BOOST_CHECK_EQUAL(consume(3, 3, 128, now), 128U);
+    // The peer's budget is spent: a market with all of its own budget left
+    // refuses too.
+    BOOST_CHECK(queue.ConsumeSettled(3, in_market(4), now) == QueueResult::RATE_LIMITED);
+    BOOST_CHECK_EQUAL(consume(3, 4, 199, now), 0U);
+    auto truncated{in_market(4)};
+    truncated.payload.pop_back();
+    BOOST_CHECK(queue.ConsumeSettled(3, truncated, now) == QueueResult::MALFORMED);
+    BOOST_CHECK(queue.Empty());
+    // Other peers and the committee budget are unaffected.
+    BOOST_CHECK(queue.ConsumeSettled(4, in_market(4), now) == QueueResult::ACCEPTED);
+    BOOST_CHECK(queue.Push(3, in_market(4), now) == QueueResult::ACCEPTED);
+
+    // Two seconds refill 256 of the peer's budget. The 200 refusals above
+    // spent none of market 4's own budget, which is still whole.
+    const auto later{now + std::chrono::seconds{2}};
+    BOOST_CHECK_EQUAL(consume(3, 4, 257, later), 256U);
+    BOOST_CHECK(queue.ConsumeSettled(3, in_market(5), later) == QueueResult::RATE_LIMITED);
+
+    // It refills at its own rate: one more second admits 128 in total,
+    // although market 2 alone could take 256 by then.
+    const auto third{later + std::chrono::seconds{1}};
+    BOOST_CHECK_EQUAL(consume(3, 2, 200, third), 128U);
+
+    // A disconnect resets it with the peer's other buckets.
+    queue.RemovePeer(3);
+    BOOST_CHECK(queue.ConsumeSettled(3, in_market(6), third) == QueueResult::ACCEPTED);
+}
+
 BOOST_AUTO_TEST_CASE(lower_priority_work_is_evicted_but_b3_has_no_dependency)
 {
     using namespace flowmesh;

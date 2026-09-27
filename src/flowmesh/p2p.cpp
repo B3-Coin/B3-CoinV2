@@ -367,6 +367,20 @@ void BoundedWireQueue::Refill(TokenBucket& bucket, const WireClock::time_point n
     }
 }
 
+void BoundedWireQueue::Refill(SettledPeerBucket& bucket, const WireClock::time_point now)
+{
+    if (!bucket.initialized) {
+        bucket.updated = now;
+        bucket.initialized = true;
+    } else if (now > bucket.updated) {
+        const double seconds{
+            std::chrono::duration<double>(now - bucket.updated).count()};
+        bucket.tokens = std::min(FLOWMESH_SETTLED_PEER_TOKEN_BURST,
+                                 bucket.tokens + seconds * FLOWMESH_SETTLED_PEER_TOKEN_RATE);
+        bucket.updated = now;
+    }
+}
+
 bool BoundedWireQueue::ConsumeTokens(const WirePeerId peer,
                                      const WireMessage& message,
                                      const WireClock::time_point now)
@@ -540,8 +554,13 @@ QueueResult BoundedWireQueue::ConsumeSettled(const WirePeerId peer, const WireMe
     // bounds this map as it bounds Push's, and RemovePeer resets it.
     TokenBucket& bucket{m_tokens[{peer, message.header.market_id}]};
     Refill(bucket, now);
-    if (bucket.settled_tokens < 1.0) return QueueResult::RATE_LIMITED;
+    // The peer's budget across all markets; RemovePeer resets it too.
+    SettledPeerBucket& across{m_settled_peer_tokens[peer]};
+    Refill(across, now);
+    // Both or neither: a refusal by one budget spends nothing from the other.
+    if (bucket.settled_tokens < 1.0 || across.tokens < 1.0) return QueueResult::RATE_LIMITED;
     bucket.settled_tokens -= 1.0;
+    across.tokens -= 1.0;
     return QueueResult::ACCEPTED;
 }
 
@@ -577,6 +596,7 @@ void BoundedWireQueue::RemovePeer(const WirePeerId peer)
         }
     }
     m_control_tokens.erase(peer);
+    m_settled_peer_tokens.erase(peer);
 }
 
 size_t BoundedWireQueue::PeerBytes(const WirePeerId peer) const
