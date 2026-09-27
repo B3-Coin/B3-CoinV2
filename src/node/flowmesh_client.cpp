@@ -843,7 +843,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         (void)Text(value, "halt"); (void)Text(value, "error");
         (void)Number(value, "next_microblock_sequence"); (void)Id(value, "last_microblock_hash", true);
     }
-    void EndpointResult(size_t endpoint, bool transport_available, const std::string& error)
+    // names_active is false only for the wait lane, whose endpoint is not the
+    // one ordinary reads and submits use (m_selected): its successful reply
+    // updates that endpoint's row but never the client's active endpoint.
+    void EndpointResult(size_t endpoint, bool transport_available, const std::string& error, bool names_active = true)
     {
         std::lock_guard lock{m_status_mutex};
         auto& row{m_status.endpoints.at(endpoint)};
@@ -860,7 +863,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             m_retry_after[endpoint] = std::chrono::steady_clock::now() + delay;
         }
         if (error.empty()) {
-            m_status.active_endpoint = row.url;
+            if (names_active) m_status.active_endpoint = row.url;
             m_wait_unanswered.at(endpoint) = false;
         }
     }
@@ -1599,7 +1602,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             }
             ApplyActionResult(p, pins, result, endpoint);
             applied = true;
-            EndpointResult(endpoint, true, {});
+            EndpointResult(endpoint, true, {}, /*names_active=*/false);
             if (p.receipt.certificate_verified) {
                 Save();
             } else {

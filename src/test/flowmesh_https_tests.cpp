@@ -2560,4 +2560,45 @@ BOOST_AUTO_TEST_CASE(lane_skips_an_endpoint_that_left_it_unanswered_until_it_ans
     deliverer_server->Stop();
 }
 
+BOOST_AUTO_TEST_CASE(lane_reply_leaves_the_active_endpoint_to_ordinary_reads)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint reads, deliverer;
+    for (auto* endpoint : {&reads, &deliverer}) {
+        endpoint->markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+        endpoint->plain = endpoint->submit = endpoint->waited = Receipt(action, "admitted");
+        endpoint->waited.pushKV("wait_status", "timeout");
+    }
+    auto reads_server{Serve(reads)};
+    auto deliverer_server{Serve(deliverer)};
+    const auto reads_url{Endpoint(reads_server->Port()).url};
+    const auto deliverer_url{Endpoint(deliverer_server->Port()).url};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman,
+        {Endpoint(reads_server->Port()), Endpoint(deliverer_server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_MESSAGE(client->Connect(deliverer_url, error), error);
+    BOOST_REQUIRE_EQUAL(client->ActionStatus(market, action.Id(), true).state, "admitted");
+    BOOST_REQUIRE_MESSAGE(client->Connect(reads_url, error), error);
+    BOOST_REQUIRE_EQUAL(client->Status().active_endpoint, reads_url);
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    // The lane's reply from the delivering endpoint is applied, yet ordinary
+    // reads and submits still use the selected endpoint, which status keeps
+    // naming as active.
+    const auto waited{client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(waited.endpoint, deliverer_url);
+    BOOST_CHECK((deliverer.Counts() == std::array<unsigned, 4>{1, 1, 1, 1}));
+    BOOST_CHECK((reads.Counts() == std::array<unsigned, 4>{0, 0, 0, 1}));
+    const auto status{client->Status()};
+    BOOST_CHECK_EQUAL(status.active_endpoint, reads_url);
+    BOOST_CHECK_EQUAL(status.selected_endpoint, reads_url);
+    BOOST_CHECK(status.endpoints[1].available);
+    BOOST_CHECK(status.endpoints[1].transport_available);
+    client.reset();
+    reads_server->Stop();
+    deliverer_server->Stop();
+}
+
 BOOST_AUTO_TEST_SUITE_END()
