@@ -27,6 +27,7 @@
 #include <array>
 #include <chrono>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -385,6 +386,29 @@ BOOST_AUTO_TEST_CASE(empty_or_stopped_service_cannot_arm_and_failure_keeps_resul
     BOOST_CHECK(!service.SeatKeyStatus().running);
     BOOST_CHECK(service.SeatKeyStatus().armed_pubkeys.empty());
     BOOST_CHECK(result.running); // Failure never fills an alleged success snapshot.
+}
+
+BOOST_AUTO_TEST_CASE(client_action_wait_is_interrupted_by_wake_and_by_stop)
+{
+    using namespace std::chrono_literals;
+    const auto start{std::chrono::steady_clock::now()};
+    auto waiter{std::async(std::launch::async, [&] {
+        return service.WaitClientActionStatus(uint256::ONE, uint256::ONE, start + 5s, {});
+    })};
+    // Repeated wakeups also cover a waiter that has not started sleeping yet.
+    while (waiter.wait_for(10ms) != std::future_status::ready && std::chrono::steady_clock::now() < start + 5s) {
+        service.WakeClientWaiters();
+    }
+    const auto woken{waiter.get()};
+    BOOST_CHECK(woken.result == flowmesh::ClientWaitResult::INTERRUPTED);
+    BOOST_CHECK(!woken.status);
+    BOOST_CHECK(std::chrono::steady_clock::now() - start < 2s);
+    service.Stop();
+    const auto stopped_start{std::chrono::steady_clock::now()};
+    const auto stopped{service.WaitClientActionStatus(uint256::ONE, uint256::ONE, stopped_start + 5s, {})};
+    BOOST_CHECK(stopped.result == flowmesh::ClientWaitResult::INTERRUPTED);
+    BOOST_CHECK(std::chrono::steady_clock::now() - stopped_start < 1s);
+    service.WakeClientWaiters(); // No runtime: a no-op.
 }
 
 BOOST_FIXTURE_TEST_CASE(settlement_requirement_memo_requires_same_head_anchor_and_generation,

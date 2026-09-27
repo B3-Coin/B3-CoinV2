@@ -2980,6 +2980,7 @@ bool FlowMeshRuntime::Start(std::string& error)
     }
     m_stopping = false;
     m_started = true;
+    m_client_waits_closed = false;
     m_worker = std::thread{&FlowMeshRuntime::WorkerLoop, this};
     return true;
 }
@@ -2994,6 +2995,10 @@ void FlowMeshRuntime::Stop()
         abandoned.swap(m_add_market_commands);
         m_work_cv.notify_all();
     }
+    // Client-action observers never wait for a stopping runtime; a wait that
+    // starts after this reads the closed flag before it sleeps.
+    m_client_waits_closed = true;
+    m_client_events.WakeWaiters();
     for (AddMarketCommand& command : abandoned) {
         command.completion->set_value(
             {false, "FlowMesh runtime stopped before adding the market"});
@@ -3503,6 +3508,21 @@ std::optional<flowmesh::ClientEvent> FlowMeshRuntime::ClientActionStatus(
     const flowmesh::MarketId& market_id, const uint256& action_id) const
 {
     return m_client_events.ActionStatus(market_id, action_id);
+}
+
+flowmesh::ClientActionWait FlowMeshRuntime::WaitClientActionStatus(
+    const flowmesh::MarketId& market_id, const uint256& action_id,
+    const std::chrono::steady_clock::time_point deadline,
+    const std::function<bool()>& interrupted) const
+{
+    return m_client_events.WaitActionStatus(market_id, action_id, deadline, [&] {
+        return m_client_waits_closed.load() || (interrupted && interrupted());
+    });
+}
+
+void FlowMeshRuntime::WakeClientWaiters() const
+{
+    m_client_events.WakeWaiters();
 }
 
 bool FlowMeshRuntime::WaitForIdle(const std::chrono::milliseconds timeout)

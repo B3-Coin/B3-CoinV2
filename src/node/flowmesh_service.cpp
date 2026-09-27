@@ -2074,6 +2074,30 @@ std::optional<flowmesh::ClientEvent> FlowMeshService::ClientActionStatus(
     return runtime ? runtime->ClientActionStatus(market_id, action_id) : std::nullopt;
 }
 
+flowmesh::ClientActionWait FlowMeshService::WaitClientActionStatus(
+    const flowmesh::MarketId& market_id, const uint256& action_id,
+    const std::chrono::steady_clock::time_point deadline,
+    const std::function<bool()>& interrupted) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    if (!runtime) return {std::nullopt, flowmesh::ClientWaitResult::INTERRUPTED};
+    return runtime->WaitClientActionStatus(market_id, action_id, deadline, interrupted);
+}
+
+void FlowMeshService::WakeClientWaiters() const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    if (runtime) runtime->WakeClientWaiters();
+}
+
 bool FlowMeshService::SubmitLocalAction(const flowmesh::MarketId& market_id,
                                         const flowmesh::Action& action,
                                         std::string& error)

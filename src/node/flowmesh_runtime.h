@@ -499,6 +499,15 @@ public:
         size_t limit = flowmesh::CLIENT_EVENT_PAGE_MAX) const;
     std::optional<flowmesh::ClientEvent> ClientActionStatus(
         const flowmesh::MarketId& market_id, const uint256& action_id) const;
+    /** Bounded long-poll on the client event log (see ClientEventLog::
+     * WaitActionStatus). Holds no queue or market lock while it sleeps. Before
+     * Start and from Stop on, every current and later wait is INTERRUPTED. */
+    flowmesh::ClientActionWait WaitClientActionStatus(
+        const flowmesh::MarketId& market_id, const uint256& action_id,
+        std::chrono::steady_clock::time_point deadline,
+        const std::function<bool()>& interrupted) const;
+    /** Ends every current client-action wait (shutdown, never a result). */
+    void WakeClientWaiters() const;
 
     /** Test/shutdown aid: waits only for this runtime's current work queue. */
     bool WaitForIdle(std::chrono::milliseconds timeout);
@@ -584,6 +593,8 @@ private:
 
     FlowMeshRuntimeConfig m_config;
     flowmesh::ClientEventLog m_client_events{uint256{}};
+    //! Lock-free, read under the event log's mutex by client-action waits.
+    std::atomic<bool> m_client_waits_closed{true};
     std::vector<FlowMeshRuntimeMarketConfig> m_market_configs;
 
     mutable std::mutex m_market_mutex;

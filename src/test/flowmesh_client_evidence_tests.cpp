@@ -703,4 +703,84 @@ BOOST_AUTO_TEST_CASE(runtime_certified_action_status_recovers_after_restart_with
     BOOST_CHECK_EQUAL(signing_relays.load(), signing_relays_before);
 }
 
+BOOST_AUTO_TEST_CASE(runtime_wait_client_action_status_wakes_on_commit)
+{
+    EvidenceFixture f;
+    EvidenceChain chain{f};
+    NoSeatKeys keys;
+    node::SteadyFlowMeshRuntimeClock clock;
+    node::FlowMeshProductionStore store{DBParams{.path = m_path_root / "client-wait", .cache_bytes = 1 << 20}};
+    std::string error;
+    BOOST_REQUIRE(store.OpenForMarket(f.pins.domain, f.pins.market_id, f.seats, f.state.Root(), error));
+    node::FlowMeshRuntimeConfig config;
+    config.chain = &chain;
+    config.keys = &keys;
+    config.clock = &clock;
+    config.relay = [](node::FlowMeshRuntimeRelay) { return node::FlowMeshRelayResult{}; };
+    node::FlowMeshRuntimeMarketConfig market{.domain = f.pins.domain, .market_id = f.pins.market_id,
+        .treasury_owner_commitment = Filled(9), .active_seats = f.seats, .state = f.state, .store = &store};
+    node::FlowMeshRuntime runtime{config, {market}};
+    // Nothing can be waited for before the runtime starts.
+    BOOST_CHECK(runtime.WaitClientActionStatus(f.pins.market_id, Filled(8), WaitClock::now() + 5s, {}).result ==
+                flowmesh::ClientWaitResult::INTERRUPTED);
+    BOOST_REQUIRE_MESSAGE(runtime.Start(error), error);
+    flowmesh::Action action;
+    action.signer = f.account;
+    action.sequence = 7;
+    action.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_BID);
+    BOOST_REQUIRE(flowmesh::SignAction(f.account_key, f.pins.domain, f.pins.execution_config_id, action));
+    BOOST_REQUIRE(runtime.SubmitLocalAction(f.pins.market_id, action) == flowmesh::QueueResult::ACCEPTED);
+    BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{5}));
+    BOOST_REQUIRE(runtime.ClientActionStatus(f.pins.market_id, action.Id())->kind == flowmesh::ClientEventKind::POOL_ADMITTED);
+
+    flowmesh::ProductionEntryCheck check;
+    flowmesh::ProductionEpochGate gate{f.pins.domain, f.pins.market_id, f.seats};
+    const std::array<flowmesh::Action, 1> actions{action};
+    const auto built{flowmesh::BuildProductionExecutionEntry(f.state, f.pins.domain, f.pins.market_id,
+        f.seats, gate, 0, 0, {}, f.anchor, {130, {}, &chain}, Filled(9), actions, nullptr, check)};
+    BOOST_REQUIRE(built);
+    const flowmesh::ProductionCertifiedEnvelope certified{built->entry, f.Certify(built->entry)};
+    const auto payload{flowmesh::EncodeProductionCertifiedPayload(certified, 4)};
+    BOOST_REQUIRE(payload);
+
+    // The woken waiter reads the payload exactly as the public 'action' read
+    // does. It must find the durable head, never "unavailable".
+    WaitProbe probe;
+    const auto start{WaitClock::now()};
+    auto waiter{std::async(std::launch::async, [&] {
+        const auto result{runtime.WaitClientActionStatus(f.pins.market_id, action.Id(), start + 5s, probe.Predicate())};
+        std::string entry_error;
+        auto entry{result.status ? runtime.ClientCertifiedEntry(f.pins.market_id, result.status->microblock_sequence, entry_error)
+                                 : std::nullopt};
+        return std::pair{result, std::move(entry)};
+    })};
+    probe.AwaitEvaluations(1);
+    BOOST_REQUIRE(runtime.EnqueueWireMessage(7, {flowmesh::WireMessageKind::CERTIFICATE,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.pins.market_id, 0, 0}, *payload}) == flowmesh::QueueResult::ACCEPTED);
+    const auto [result, entry]{waiter.get()};
+    BOOST_CHECK(result.result == flowmesh::ClientWaitResult::TERMINAL);
+    BOOST_REQUIRE(result.status);
+    BOOST_CHECK(result.status->kind == flowmesh::ClientEventKind::CERTIFIED_INCLUDED);
+    BOOST_CHECK_EQUAL(result.status->microblock_sequence, 0U);
+    BOOST_CHECK(result.status->microblock_hash == built->entry.GetHash());
+    BOOST_REQUIRE(entry);
+    BOOST_CHECK(*entry == *payload);
+    BOOST_CHECK(WaitClock::now() - start < 4s);
+
+    // Stop interrupts a current wait promptly, and every later one at once.
+    WaitProbe pending;
+    const auto stop_start{WaitClock::now()};
+    auto stopped{std::async(std::launch::async, [&] {
+        return runtime.WaitClientActionStatus(f.pins.market_id, Filled(8), stop_start + 5s, pending.Predicate());
+    })};
+    pending.AwaitEvaluations(1);
+    runtime.Stop();
+    BOOST_CHECK(stopped.get().result == flowmesh::ClientWaitResult::INTERRUPTED);
+    BOOST_CHECK(runtime.WaitClientActionStatus(f.pins.market_id, action.Id(), WaitClock::now() + 5s, {}).result ==
+                flowmesh::ClientWaitResult::TERMINAL); // Already terminal: returned before any wait.
+    BOOST_CHECK(runtime.WaitClientActionStatus(f.pins.market_id, Filled(8), WaitClock::now() + 5s, {}).result ==
+                flowmesh::ClientWaitResult::INTERRUPTED);
+    BOOST_CHECK(WaitClock::now() - stop_start < 2s);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

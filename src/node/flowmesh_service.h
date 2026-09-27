@@ -16,6 +16,8 @@
 #include <util/fs.h>
 #include <validationinterface.h>
 
+#include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <set>
@@ -175,6 +177,14 @@ public:
         size_t limit = flowmesh::CLIENT_EVENT_PAGE_MAX) const;
     std::optional<flowmesh::ClientEvent> ClientActionStatus(
         const flowmesh::MarketId& market_id, const uint256& action_id) const;
+    /** Bounded client-action long-poll on the current runtime; INTERRUPTED at
+     * once without one. The service mutex is released before it blocks, and
+     * stopping the runtime interrupts it. */
+    flowmesh::ClientActionWait WaitClientActionStatus(
+        const flowmesh::MarketId& market_id, const uint256& action_id,
+        std::chrono::steady_clock::time_point deadline,
+        const std::function<bool()>& interrupted) const;
+    void WakeClientWaiters() const;
 
     bool SubmitLocalAction(const flowmesh::MarketId& market_id,
                            const flowmesh::Action& action,
