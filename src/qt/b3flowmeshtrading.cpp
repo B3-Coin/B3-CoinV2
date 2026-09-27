@@ -223,7 +223,8 @@ UniValue DispatchApproved(const Action& a, bool approved, const std::function<bo
 
 QString Describe(const Action& a)
 {
-    const QString prefix{QStringLiteral("Market: %1\nFull base asset ID: %2\nWallet account: %3\n").arg(a.market.id, a.market.base, a.market.has_account ? a.market.account : QStringLiteral("created during deposit preparation"))};
+    const QString prefix{(a.operation == Operation::Order ? QStringLiteral("Order type: Limit\n") : QString{}) +
+        QStringLiteral("Market: %1\nFull base asset ID: %2\nWallet account: %3\n").arg(a.market.id, a.market.base, a.market.has_account ? a.market.account : QStringLiteral("created during deposit preparation"))};
     QString base_amount = QString::number(a.amount) + QStringLiteral(" raw base-asset units");
     if (a.display_decimals) base_amount = B3FlowMeshMarketData::FormatAmount(a.amount, *a.display_decimals) + QLatin1Char(' ') + a.display_ticker + QStringLiteral(" (%1 atomic units)").arg(a.amount);
     QString amount{base_amount};

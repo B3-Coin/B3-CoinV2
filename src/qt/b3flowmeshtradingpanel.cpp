@@ -166,6 +166,10 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     m_buy = new QPushButton{tr("Buy"), ticket_card}; m_sell = new QPushButton{tr("Sell"), ticket_card};
     m_buy->setObjectName(QStringLiteral("flowMeshBuy")); m_sell->setObjectName(QStringLiteral("flowMeshSell"));
     for (auto* b : {m_buy, m_sell}) { b->setCheckable(true); side_group->addButton(b); sides->addWidget(b); } m_buy->setChecked(true); ticket->addLayout(sides);
+    auto* order_type{Label(tr("Order type: Limit"), ticket_card)};
+    order_type->setObjectName(QStringLiteral("flowMeshOrderType"));
+    order_type->setToolTip(tr("Limit orders clear in the uniform-price auction. Unfilled quantity can remain open until filled, replaced or cancelled. Market orders are not supported in this build."));
+    ticket->addWidget(order_type);
     m_side = new QComboBox{this}; m_side->addItems({QStringLiteral("bid"), QStringLiteral("ask")}); m_side->hide();
     const auto entry = [&](const char* name, int length) {
         auto* field{new QLineEdit{this}}; field->setObjectName(QLatin1String(name)); field->setMaxLength(length); return field;
@@ -477,8 +481,16 @@ void B3FlowMeshTradingPanel::updateTicket()
     const QString ticker{units_known ? m_snapshot->units.ticker : tr("token")}; const bool buy{m_side->currentIndex() == 0}, inverse{inverted()};
     const bool bid{CanonicalSide(buy, inverse) == QStringLiteral("bid")};
     m_buy->setText(inverse ? tr("Buy B3") : tr("Buy")); m_sell->setText(inverse ? tr("Sell B3") : tr("Sell"));
-    m_price_label->setText(inverse ? (buy ? tr("Maximum price · %1 / B3") : tr("Minimum price · %1 / B3")).arg(ticker) : tr("Limit price · B3 / %1").arg(ticker));
-    m_quantity_label->setText(inverse ? (buy ? tr("Spend up to · %1") : tr("Receive up to · %1")).arg(ticker) : tr("Quantity · %1").arg(ticker));
+    m_price_label->setText(inverse ? tr("Limit price · %1 / B3").arg(ticker) : tr("Limit price · B3 / %1").arg(ticker));
+    m_quantity_label->setText(inverse ? (buy ? tr("Spend limit · %1") : tr("Receive limit · %1")).arg(ticker) : tr("Quantity · %1").arg(ticker));
+    m_price->setAccessibleName(m_price_label->text());
+    m_quantity->setAccessibleName(m_quantity_label->text());
+    m_price->setToolTip(buy
+        ? tr("Buy limit: the maximum price you accept, before trading fees. Partial fills and better clearing prices are possible.")
+        : tr("Sell limit: the minimum price you accept, before trading fees. Partial fills and better clearing prices are possible."));
+    m_quantity->setToolTip(inverse
+        ? tr("Exact %1 quantity cap, not an exact B3 quantity. Buy B3 limits the %1 spent; Sell B3 limits the %1 received. No fill is guaranteed; unfilled quantity can remain open.").arg(ticker)
+        : tr("Order quantity in %1. No fill is guaranteed; unfilled quantity can remain open.").arg(ticker));
     m_order->setText(buy ? tr("Review buy order…") : tr("Review sell order…")); m_cancel_order->setText(buy ? tr("Cancel buy order…") : tr("Cancel sell order…"));
     m_ticket_fee->setText(inverse ? (buy ? tr("Actual fee asset: B3 · amount after execution") : tr("Actual fee asset: B3 · paid by B3 receiver")) : tr("Actual fee asset: B3 · seller-paid"));
     QString fee_tooltip{tr("The protocol fee is 0.01% of matched B3 notional, deducted from the B3 receiver's proceeds. Actual fees and allocation depend on certified fills. Submitting an order has no network fee.")};

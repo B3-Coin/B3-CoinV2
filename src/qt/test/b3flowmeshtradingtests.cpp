@@ -603,6 +603,7 @@ private Q_SLOTS:
         action.price = 500;
         action.side = QStringLiteral("ask");
         auto review{Describe(action)};
+        QVERIFY(review.startsWith(QStringLiteral("Order type: Limit\n")));
         QVERIFY(review.contains(QStringLiteral("Buy B3: Spend up to 1 cUSD (1000000 atomic units)")));
         QVERIFY(review.contains(QStringLiteral("2 cUSD / B3")));
         QVERIFY(review.contains(QStringLiteral("Estimated gross B3 at the limit: 0.50 B3")));
@@ -612,6 +613,7 @@ private Q_SLOTS:
         QVERIFY(review.contains(action.market.base));
         action.side = QStringLiteral("bid");
         review = Describe(action);
+        QVERIFY(review.startsWith(QStringLiteral("Order type: Limit\n")));
         QVERIFY(review.contains(QStringLiteral("Sell B3: Receive up to 1 cUSD (1000000 atomic units)")));
         QVERIFY(review.contains(QStringLiteral("not deducted from your token receipt")));
         QVERIFY(review.contains(QStringLiteral("Canonical side: bid")));

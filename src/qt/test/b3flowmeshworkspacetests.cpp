@@ -794,6 +794,32 @@ private Q_SLOTS:
         QVERIFY(panel.m_snapshot == snapshot); QCOMPARE(unlock.count(), 0);
         QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_confirmation);
     }
+    void limitOrderTicketNamesActualTypeAndPreservesUnits()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        const auto snapshot{Parse(Data())}; Observe(panel, snapshot, true);
+        auto* type{panel.findChild<QLabel*>(QStringLiteral("flowMeshOrderType"))};
+        QVERIFY(type);
+        QCOMPARE(type->text(), QStringLiteral("Order type: Limit"));
+        QVERIFY(type->toolTip().contains(QStringLiteral("Market orders are not supported")));
+        QCOMPARE(panel.m_price_label->text(), QStringLiteral("Limit price · tUSD / B3"));
+        QCOMPARE(panel.m_quantity_label->text(), QStringLiteral("Spend limit · tUSD"));
+        QVERIFY(panel.m_price->toolTip().contains(QStringLiteral("maximum")));
+        panel.m_price->setText(QStringLiteral("1.1"));
+        panel.m_quantity->setText(QStringLiteral("0.25"));
+        panel.m_sell->click();
+        QCOMPARE(panel.m_price_label->text(), QStringLiteral("Limit price · tUSD / B3"));
+        QCOMPARE(panel.m_quantity_label->text(), QStringLiteral("Receive limit · tUSD"));
+        QVERIFY(panel.m_price->toolTip().contains(QStringLiteral("minimum")));
+        QVERIFY(panel.m_quantity->toolTip().contains(QStringLiteral("not an exact B3")));
+        QCOMPARE(panel.m_price->text(), QStringLiteral("1.1"));
+        QCOMPARE(panel.m_quantity->text(), QStringLiteral("0.25"));
+        panel.m_orientation->setCurrentIndex(0);
+        QCOMPARE(panel.m_price_label->text(), QStringLiteral("Limit price · B3 / tUSD"));
+        QCOMPARE(panel.m_quantity_label->text(), QStringLiteral("Quantity · tUSD"));
+        QCOMPARE(type->text(), QStringLiteral("Order type: Limit"));
+        QVERIFY(!panel.m_thread); QVERIFY(!panel.m_active_result); QVERIFY(!panel.m_confirmation);
+    }
     void futuresTabIsExplicitlyUnavailableAndDoesNotAlterSpot()
     {
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, SyntheticLimitBook());
@@ -2073,7 +2099,7 @@ private Q_SLOTS:
         QCOMPARE(panel.m_buy->text(), QStringLiteral("Buy B3"));
         QCOMPARE(panel.m_sell->text(), QStringLiteral("Sell B3"));
         panel.m_price->setText(QStringLiteral("1.1")); panel.m_quantity->setText(QStringLiteral("0.000001"));
-        QVERIFY(panel.m_quantity_label->text().contains(QStringLiteral("Spend up to")));
+        QVERIFY(panel.m_quantity_label->text().contains(QStringLiteral("Spend limit")));
         QVERIFY(panel.m_ticket_total->text().contains(QStringLiteral("100/91 tUSD / B3")));
         QVERIFY(panel.m_ticket_total->text().contains(QStringLiteral("if fully filled")));
         QVERIFY(panel.m_ticket_total->toolTip().contains(QStringLiteral("No fill is guaranteed")));
@@ -2081,7 +2107,7 @@ private Q_SLOTS:
         QVERIFY(panel.m_history_view->horizontalHeaderItem(5)->text().contains(QStringLiteral("B3")));
         QVERIFY(panel.m_history_view->horizontalHeaderItem(5)->toolTip().contains(QStringLiteral("not your individual")));
         panel.m_sell->click();
-        QVERIFY(panel.m_quantity_label->text().contains(QStringLiteral("Receive up to")));
+        QVERIFY(panel.m_quantity_label->text().contains(QStringLiteral("Receive limit")));
         QVERIFY(panel.m_ticket_total->text().contains(QStringLiteral("Maximum B3 reservation/spend: 0.000000909 B3")));
         QVERIFY(panel.m_ticket_total->text().contains(QStringLiteral("1000/909 tUSD / B3")));
         QString cancellation_review;
