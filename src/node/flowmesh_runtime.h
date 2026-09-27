@@ -659,6 +659,10 @@ private:
     size_t m_deferred_bytes{0};
     uint256 m_deferred_cursor;
     flowmesh::WireClock::time_point m_next_deferred_retry{};
+    //! Local scheduling only: the chain gate and reconciliation generation
+    //! the deferred retry last observed. A change retries at once.
+    bool m_deferred_gate_open{false};
+    uint64_t m_deferred_gate_generation{0};
     std::set<std::pair<flowmesh::WirePeerId, flowmesh::MarketId>> m_receive_recovery;
     std::optional<std::pair<flowmesh::WirePeerId, flowmesh::MarketId>> m_receive_recovery_cursor;
     FlowMeshCommitteeRelayBudget m_delivery_retry_budget{

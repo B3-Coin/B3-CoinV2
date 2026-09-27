@@ -1551,6 +1551,149 @@ BOOST_AUTO_TEST_CASE(critical_proposal_generation_change_survives_reopened_gate)
     BOOST_CHECK_EQUAL(recipient.Snapshot().durably_applied, 0U);
 }
 
+BOOST_AUTO_TEST_CASE(deferred_critical_messages_requeue_immediately_when_gate_reopens)
+{
+    using Admission = node::FlowMeshDeliveryAdmission;
+    DeliveryRuntimeFixture producer{m_args.GetDataDirBase() / "flowmesh_reopen_producer", Admission::ADMITTED};
+    const auto original{producer.Sent()};
+    const auto proposal{std::find_if(original.begin(), original.end(), [](const auto& relay) {
+        return relay.message.kind == flowmesh::WireMessageKind::PROPOSAL;
+    })};
+    BOOST_REQUIRE(proposal != original.end());
+    const auto decoded{flowmesh::DecodeProductionProposalPayload(proposal->message.payload)};
+    BOOST_REQUIRE(decoded);
+    // Each recipient's construction tick ran a retry pass at this clock time,
+    // which used to pace the reopen tick out for 250 ms. Closed-gate passes
+    // restarted that pacing as well, and a generation change whose gate had
+    // already reopened was never treated as a reopen.
+    for (const std::string gate : {"closed", "closed_passes", "generation"}) {
+        DeliveryRuntimeFixture recipient{m_args.GetDataDirBase() / fs::PathFromString("flowmesh_reopen_" + gate),
+                                         Admission::ADMITTED, false};
+        if (gate == "generation") {
+            BOOST_REQUIRE(!(decoded->entry.anchor == recipient.chain.Current()));
+            recipient.chain.ReconcileOnceWhileChecking(decoded->entry.anchor);
+        } else {
+            recipient.chain.SetReconciled(false);
+        }
+        BOOST_REQUIRE(recipient.runtime->EnqueueWireMessage(DeliveryRuntimeFixture::PEER,
+            proposal->message) == flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(recipient.runtime->WaitForIdle(std::chrono::seconds{2}));
+        BOOST_CHECK_EQUAL(recipient.Snapshot().deferred_objects, 1U);
+        BOOST_CHECK(recipient.Sent().empty());
+        if (gate == "closed_passes") {
+            for (int i{0}; i < 3; ++i) recipient.Tick(std::chrono::milliseconds{100});
+            BOOST_CHECK_EQUAL(recipient.Snapshot().deferred_objects, 1U);
+            BOOST_CHECK(recipient.Sent().empty());
+        }
+        if (gate != "generation") recipient.chain.SetReconciled(true);
+        recipient.Tick(); // the reopen wake-up itself; the clock does not move
+        BOOST_CHECK_EQUAL(recipient.Snapshot().deferred_objects, 0U);
+        BOOST_CHECK_EQUAL(recipient.Snapshot().deferred_bytes, 0U);
+        const auto sent{recipient.Sent()};
+        BOOST_CHECK(std::any_of(sent.begin(), sent.end(), [](const auto& relay) {
+            return relay.message.kind == flowmesh::WireMessageKind::ATTESTATION;
+        }));
+        recipient.CheckLock(original);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(deferred_reopen_pass_is_bounded_to_32_items)
+{
+    // The per-market (16) and per-peer (8) deferral caps need three markets
+    // and five peers to hold more input than one reopen pass may requeue.
+    const uint256 domain{Filled(0x2c)};
+    RuntimeChain chain;
+    chain.m_domain = domain;
+    RuntimeKeys keys; // no local seat: nothing is proposed or signed
+    FixedClock clock;
+    std::vector<flowmesh::MarketId> markets;
+    std::vector<std::unique_ptr<node::FlowMeshProductionStore>> stores;
+    std::vector<node::FlowMeshRuntimeMarketConfig> configs;
+    for (unsigned char i{0}; i < 3; ++i) {
+        const modern::AssetId asset{Filled(static_cast<unsigned char>(0x50 + i))};
+        const auto market{*flowmesh::ComputeFlowMeshMarketId(domain, asset)};
+        const auto seats{Seats(domain, market, 4, 7, 100, Filled(0x71), static_cast<unsigned char>(150 + 8 * i))};
+        const flowmesh::FlowMeshState initial{*flowmesh::ComputeFlowMeshVaultId(domain, market), asset,
+                                              modern::NativeAsset(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+        chain.Add(seats.seats);
+        stores.push_back(std::make_unique<node::FlowMeshProductionStore>(DBParams{
+            .path = m_args.GetDataDirBase() / fs::PathFromString("flowmesh_reopen_budget_" + std::to_string(i)),
+            .cache_bytes = size_t{1} << 20, .wipe_data = true}));
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(stores.back()->OpenForMarket(domain, market, seats.seats, initial.Root(), error), error);
+        configs.push_back(MarketConfig(domain, market, Filled(0x6c), seats.seats, initial, *stores.back(), nullptr));
+        markets.push_back(market);
+    }
+    node::FlowMeshRuntimeConfig config;
+    config.chain = &chain;
+    config.keys = &keys;
+    config.clock = &clock;
+    config.round_timeout = std::chrono::hours{1};
+    config.relay = [](node::FlowMeshRuntimeRelay) { return LegacyRelayResult(); };
+    node::FlowMeshRuntime runtime{config, configs};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(runtime.Start(error), error);
+    const auto tick = [&](const std::chrono::milliseconds elapsed) {
+        BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
+        clock.m_now += elapsed;
+        runtime.NotifyTick();
+        BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
+    };
+    const auto deferred = [&] {
+        size_t total{0};
+        for (const auto& market : markets) {
+            const auto snapshots{runtime.DeliverySnapshots(market)};
+            BOOST_REQUIRE_EQUAL(snapshots.size(), 1U);
+            total += snapshots.front().deferred_objects;
+        }
+        return total;
+    };
+    const auto requeued = [&] {
+        size_t total{0};
+        for (const auto& market : markets) {
+            const auto snapshots{runtime.DeliverySnapshots(market)};
+            BOOST_REQUIRE_EQUAL(snapshots.size(), 1U);
+            total += std::count_if(snapshots.front().events.begin(), snapshots.front().events.end(),
+                                   [](const auto& event) { return event.stage == "receive_requeued"; });
+        }
+        return total;
+    };
+    tick(std::chrono::milliseconds{0});
+
+    // Distinct unverified certificates: never obsolete, dropped once handled.
+    chain.SetReconciled(false);
+    for (uint64_t k{0}; k < 34; ++k) {
+        flowmesh::WireMessage junk;
+        junk.kind = flowmesh::WireMessageKind::CERTIFICATE;
+        junk.header = {flowmesh::FLOWMESH_WIRE_VERSION_V1, markets[k < 12 ? 0 : k < 24 ? 1 : 2], 7, k};
+        junk.payload = {static_cast<unsigned char>(k), 0x42};
+        BOOST_REQUIRE(runtime.EnqueueWireMessage(-2 - static_cast<flowmesh::WirePeerId>(k % 5), junk) ==
+                      flowmesh::QueueResult::ACCEPTED);
+    }
+    BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
+    BOOST_CHECK_EQUAL(deferred(), 34U);
+
+    chain.SetReconciled(true);
+    tick(std::chrono::milliseconds{0});
+    BOOST_CHECK_EQUAL(requeued(), 32U);
+    BOOST_CHECK_EQUAL(deferred(), 2U);
+    // The remainder is paced again from the reopen pass.
+    tick(std::chrono::milliseconds{0});
+    tick(std::chrono::milliseconds{100});
+    BOOST_CHECK_EQUAL(deferred(), 2U);
+    // A reconciliation that both started and ended between two ticks moves
+    // only the generation; that is a reopen too.
+    chain.BumpDeliveryGeneration();
+    tick(std::chrono::milliseconds{0});
+    BOOST_CHECK_EQUAL(deferred(), 0U);
+    BOOST_CHECK_EQUAL(requeued(), 34U);
+    for (const auto& market : markets) {
+        BOOST_CHECK(runtime.MarketStatus(market)->halt == node::FlowMeshRuntimeHalt::NONE);
+        BOOST_CHECK_EQUAL(runtime.MarketStatus(market)->next_sequence, 0U);
+    }
+    runtime.Stop();
+}
+
 BOOST_AUTO_TEST_CASE(critical_certificate_append_retries_reconciliation_without_losing_lock)
 {
     for (const bool reopen : {false, true}) {

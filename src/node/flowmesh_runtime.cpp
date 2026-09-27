@@ -58,6 +58,12 @@ constexpr auto DELIVERY_COMPLETION_TIMEOUT{std::chrono::seconds{5}};
 // Finite memory-only retention during a transient chain/seat transition.
 // Exact verified sources remain available for regeneration after reopening.
 constexpr auto DELIVERY_PAUSE_MAX_AGE{std::chrono::seconds{60}};
+// Deferred reconciliation-race input: an open-gate retry pass runs at most
+// every 250 ms over eight items. The first pass after the gate reopens (or the
+// reconciliation generation moves) runs at once over at most 32 items.
+constexpr auto DEFERRED_RETRY_INTERVAL{std::chrono::milliseconds{250}};
+constexpr size_t DEFERRED_PASS_BUDGET{8};
+constexpr size_t DEFERRED_REOPEN_BUDGET{32};
 constexpr uint64_t MAX_RUNTIME_TRACE_BYTES{64 * 1024 * 1024};
 std::atomic<uint64_t> g_runtime_trace_bytes{0};
 std::atomic<uint64_t> g_runtime_trace_dropped{0};
@@ -2176,6 +2182,10 @@ void FlowMeshRuntime::RetryDeliveries()
 
 void FlowMeshRuntime::DeferMessage(Market& market, const flowmesh::QueuedWireMessage& queued)
 {
+    // Every caller saw the gate closed or the reconciliation generation move.
+    // Record that as a closed observation, so the first open retry pass is a
+    // reopen even when no retry pass ran while the gate was closed.
+    m_deferred_gate_open = false;
     HashWriter writer;
     writer << static_cast<uint8_t>(queued.message.kind) << queued.message.header.market_id
            << queued.message.header.epoch << queued.message.header.sequence << queued.message.payload;
@@ -2206,11 +2216,25 @@ void FlowMeshRuntime::DeferMessage(Market& market, const flowmesh::QueuedWireMes
 
 void FlowMeshRuntime::RetryDeferredMessages()
 {
+    if (m_deferred_messages.empty() && m_receive_recovery.empty()) return;
     const auto now{m_config.clock->Now()};
-    if (now < m_next_deferred_retry) return;
-    m_next_deferred_retry = now + std::chrono::milliseconds{250};
+    // Every market shares this one chain gate; sample it once per pass. The
+    // requeued copy passes the gate again in ProcessMessage, so a gate that
+    // closes during this pass only defers that copy again.
+    const uint64_t generation{m_config.chain->DeliveryGeneration()};
+    const bool open{m_config.chain->Acceptable(m_config.chain->Current())};
+    // Edge-triggered: the first open pass after a closed observation or a
+    // generation change runs now. A closed pass only expires items and does
+    // not consume the pacing interval, so it cannot push the reopen retry to
+    // a later tick; the periodic open pass remains paced.
+    const bool reopened{open && (!m_deferred_gate_open || generation != m_deferred_gate_generation)};
+    m_deferred_gate_open = open;
+    m_deferred_gate_generation = generation;
+    if (open && !reopened && now < m_next_deferred_retry) return;
+    if (open) m_next_deferred_retry = now + DEFERRED_RETRY_INTERVAL;
+    const size_t budget{reopened ? DEFERRED_REOPEN_BUDGET : DEFERRED_PASS_BUDGET};
     auto it{m_deferred_messages.upper_bound(m_deferred_cursor)};
-    for (size_t scanned{0}, maximum{std::min<size_t>(m_deferred_messages.size(), 8)};
+    for (size_t scanned{0}, maximum{std::min<size_t>(m_deferred_messages.size(), budget)};
          scanned < maximum && !m_deferred_messages.empty(); ++scanned) {
         if (it == m_deferred_messages.end()) it = m_deferred_messages.begin();
         const auto current{it++};
@@ -2218,7 +2242,7 @@ void FlowMeshRuntime::RetryDeferredMessages()
         const auto& queued{current->second};
         auto& market{*m_markets.at(queued.message.header.market_id)};
         const bool expired{now >= m_deferred_deadlines.at(current->first)};
-        if (!expired && !market.chain->Acceptable(market.chain->Current())) continue;
+        if (!expired && !open) continue;
         const bool obsolete{queued.message.kind != flowmesh::WireMessageKind::CERTIFICATE &&
                             queued.message.header.sequence < market.next_sequence};
         if (!expired && !obsolete && EnqueueWireMessage(queued.peer, queued.message) != flowmesh::QueueResult::ACCEPTED) {
@@ -2248,7 +2272,7 @@ void FlowMeshRuntime::RetryDeferredMessages()
         const auto current{recovery++};
         m_receive_recovery_cursor = *current;
         auto& market{*m_markets.at(current->second)};
-        if (market.chain->Acceptable(market.chain->Current()) && TryRequestCatchup(market, current->first)) {
+        if (open && TryRequestCatchup(market, current->first)) {
             m_receive_recovery.erase(current);
         }
     }
@@ -2918,6 +2942,8 @@ bool FlowMeshRuntime::Start(std::string& error)
         m_evidence_retry_cursor.SetNull();
         m_delivery_regeneration_cursor.SetNull();
         m_next_delivery_regeneration = {};
+        m_deferred_gate_open = false;
+        m_deferred_gate_generation = 0;
         m_delivery_retry_budget.Reset();
         for (const auto& [market_id, market] : m_markets) {
             if (market->ready) {
