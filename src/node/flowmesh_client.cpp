@@ -1596,6 +1596,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         const auto it{m_pending.find(key)};
         if (it == m_pending.end()) { outcome("not_retained"); return std::nullopt; }
         auto& p{it->second};
+        const bool verified_before{p.receipt.certificate_verified};
         bool applied{false};
         try {
             const auto pins{RecheckActionAuthority(p)};
@@ -1617,20 +1618,21 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             }
         } catch (const std::exception& e) {
             timing.Field("error", std::string{e.what()});
-            // A verified label here was set by this apply (the receipt was not
-            // verified before it). Without one, and with nothing applied,
-            // nothing changed: the ordinary read runs next, in the same call.
-            if (!applied && !p.receipt.certificate_verified) { outcome("failed"); return std::nullopt; }
-            // The reply was applied but the outbox write failed, so the new
-            // state is not durable. Exactly like the ordinary refresh: record
-            // why, and never return (nor leave for the ordinary path to
-            // return) a verified label that was not saved. previously_certified
-            // stays set in memory, so this action is still never resent.
+            // Nothing applied and no verified label: nothing changed, and the
+            // ordinary read runs next, in the same call.
+            if (!applied && !verified_before) { outcome("failed"); return std::nullopt; }
+            // Either the reply was applied but the outbox write failed (the new
+            // state is not durable), or the current authority check rejected a
+            // label another read had verified. Exactly like the ordinary path:
+            // record why, and never return (nor leave for the ordinary path to
+            // return) a verified label that is unsaved or no longer current.
+            // previously_certified stays set in memory, so this action is still
+            // never resent.
             p.receipt.reason = e.what();
             if (p.previously_certified || p.receipt.certificate_verified) {
                 p.receipt.certificate_verified = false; p.receipt.state = "unknown";
             }
-            outcome("save_failed");
+            outcome(applied ? "save_failed" : "authority_failed");
             return p.receipt;
         }
         outcome(p.receipt.certificate_verified ? "certified" : "observed");
