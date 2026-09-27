@@ -322,6 +322,11 @@ class FlowMeshIndependentTest(FlowMeshReleaseTest):
         admitted = time.monotonic()
         assert_equal(response["accepted"], True)
         assert_equal(response["sequence"], sequence)
+        # An action id excludes the signature: signing the refused
+        # instruction again must yield that same action, not another order.
+        for refusal in admission_refusals:
+            if "refused_action_id" in refusal:
+                assert_equal(refusal["refused_action_id"], response["action_id"])
         result = {}
 
         def certified():

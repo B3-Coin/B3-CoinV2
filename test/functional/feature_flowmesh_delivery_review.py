@@ -19,9 +19,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from feature_flowmesh_independent import FlowMeshIndependentTest
+from feature_flowmesh_independent import FlowMeshIndependentTest, RECONCILING_REFUSAL
 from test_framework.authproxy import JSONRPCException
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
 PRE_ADMISSION_REFUSALS = {
@@ -352,6 +352,23 @@ class FlowMeshDeliveryReviewTest(FlowMeshIndependentTest):
             try:
                 response, _, admitted_us = self.measured_rpc(index, method, *params)
                 attempt.update(host_after_us=admitted_us, outcome="admission_response")
+                if response.get("receipt_state") == "rejected" and response.get("reason") == RECONCILING_REFUSAL:
+                    # The same gate, reported after signing: the wallet's
+                    # status check passed, then a B3 block connected before
+                    # the signed action reached the service. A definite
+                    # rejection before runtime admission, not an unknown
+                    # outcome. Sign the same instruction again only after
+                    # proving nothing was retained or admitted: no outbox
+                    # copy to resend exactly, no runtime event for it.
+                    refused = response["action_id"]
+                    assert_equal(response["accepted"], False)
+                    assert_equal(response["sequence"], sequence)
+                    assert refused not in {row["action_id"] for row in node.listflowmeshactions(market_id)["actions"]}
+                    assert_raises_rpc_error(-4, "Action is not retained for this wallet's existing FlowMesh account",
+                                            node.getflowmeshactionstatus, market_id, refused)
+                    attempt.update(outcome="explicit_pre_admission_refusal", reason=response["reason"],
+                                   refused_action_id=refused)
+                    return False
                 return True
             except JSONRPCException as error:
                 attempt.update(host_after_us=monotonic_us(), outcome="rpc_error",
@@ -374,6 +391,11 @@ class FlowMeshDeliveryReviewTest(FlowMeshIndependentTest):
         self.wait_until(admit, timeout=30, check_interval=.025)
         assert_equal(response["accepted"], True)
         assert_equal(response["sequence"], sequence)
+        # An action id excludes the signature: signing the refused
+        # instruction again must yield that same action, not another order.
+        for attempt in attempts:
+            if "refused_action_id" in attempt:
+                assert_equal(attempt["refused_action_id"], response["action_id"])
         heads = {other: {} for other in indices}
         next_poll = {other: 0 for other in indices}
         latest, client_us = {}, None
@@ -749,6 +771,60 @@ class DeliveryReviewMeasurementTests(unittest.TestCase):
         with self.assertRaises(JSONRPCException):
             FlowMeshDeliveryReviewTest.submit_observed(harness, "market", 0, "bid", price=10, indices=[0])
         self.assertEqual(harness.measured_rpc.call_count, 1)
+
+        # The gate's refusal as a rejected receipt is retried only with that
+        # exact reason, and only once nothing is retained and no event exists.
+        refused = {"accepted": False, "sequence": 7, "action_id": "action", "receipt_state": "rejected",
+                   "reason": RECONCILING_REFUSAL}
+        admitted = {"accepted": True, "sequence": 7, "action_id": "action", "receipt_state": "queued"}
+        not_retained = JSONRPCException({"code": -4, "message": "Action is not retained for this wallet's existing FlowMesh account"})
+        node = harness.nodes[0]
+        node.listflowmeshactions.return_value = {"actions": []}
+        node.getflowmeshactionstatus.side_effect = not_retained
+
+        def replies(*values):
+            queue = list(values)
+
+            def reply(*_):
+                before = clock[0]
+                clock[0] += 500
+                return queue.pop(0), before, clock[0]
+            return reply
+
+        harness.samples = []
+        harness.measured_rpc.reset_mock()
+        harness.measured_rpc.side_effect = replies(refused, admitted)
+        with patch(__name__ + ".monotonic_us", side_effect=lambda: clock[0]):
+            FlowMeshDeliveryReviewTest.submit_observed(harness, "market", 0, "bid", price=10, indices=[0])
+        self.assertEqual(harness.measured_rpc.call_count, 2)
+        self.assertEqual(harness.samples[0]["attempts"][0]["outcome"], "explicit_pre_admission_refusal")
+        self.assertEqual(harness.samples[0]["attempts"][0]["refused_action_id"], "action")
+
+        # Any other rejection reason is not retried.
+        harness.measured_rpc.reset_mock()
+        harness.measured_rpc.side_effect = replies(dict(refused, reason="pool refused this attempt"), admitted)
+        with self.assertRaises(AssertionError):
+            FlowMeshDeliveryReviewTest.submit_observed(harness, "market", 0, "bid", price=10, indices=[0])
+        self.assertEqual(harness.measured_rpc.call_count, 1)
+
+        # A retained copy, or a runtime event, forbids signing again.
+        for retained in (True, False):
+            node.listflowmeshactions.return_value = {"actions": [{"action_id": "action"}] if retained else []}
+            node.getflowmeshactionstatus.side_effect = None if not retained else not_retained
+            node.getflowmeshactionstatus.return_value = {"receipt_state": "unknown"}
+            harness.measured_rpc.reset_mock()
+            harness.measured_rpc.side_effect = replies(refused, admitted)
+            with self.assertRaises(AssertionError):
+                FlowMeshDeliveryReviewTest.submit_observed(harness, "market", 0, "bid", price=10, indices=[0])
+            self.assertEqual(harness.measured_rpc.call_count, 1)
+
+        # Signing again must reproduce the refused action.
+        node.listflowmeshactions.return_value = {"actions": []}
+        node.getflowmeshactionstatus.side_effect = not_retained
+        harness.measured_rpc.reset_mock()
+        harness.measured_rpc.side_effect = replies(refused, dict(admitted, action_id="other"))
+        with self.assertRaises(AssertionError):
+            FlowMeshDeliveryReviewTest.submit_observed(harness, "market", 0, "bid", price=10, indices=[0])
 
 
 if __name__ == "__main__":
