@@ -5356,11 +5356,6 @@ void FlowMeshRuntime::HandleCertificate(
                                                   std::move(*candidate)).first;
     }
     if (!CommitCertified(market, *certified, candidate_it->second, reconciliation_deferred)) return;
-    // Durable now: admission may consume later copies of this slot's votes
-    // and of exactly these entry bytes without a committee token.
-    if (const auto bytes{CertifiedEntryBytes(message.payload)}) {
-        NoteCertifiedAdmission(message.header, Hash(*bytes), market.next_sequence);
-    }
     // The next slot is proposed from the maintenance tick. When this node
     // holds the next slot's proposer seat and the market still holds admitted
     // work, it must not wait up to a full tick interval, so reuse the existing
@@ -5375,6 +5370,14 @@ void FlowMeshRuntime::HandleCertificate(
             peer == LOCAL_ACTION_PEER
                 ? std::nullopt
                 : std::optional<flowmesh::WirePeerId>{peer});
+    }
+    // Durable now: admission may consume later copies of this slot's votes
+    // and of exactly these entry bytes without a committee token. Recorded
+    // after the relay so its hash and queue lock stay off the relay path; a
+    // copy admitted before this line is charged and dropped by the durable
+    // duplicate check, as before.
+    if (const auto bytes{CertifiedEntryBytes(message.payload)}) {
+        NoteCertifiedAdmission(message.header, Hash(*bytes), market.next_sequence);
     }
 }
 
