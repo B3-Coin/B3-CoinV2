@@ -3121,14 +3121,17 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     // (BoundedWireQueue::ConsumeSettled). When either is empty the frame is
     // refused RATE_LIMITED, as a committee frame is: FMN2 then holds that
     // sender's critical channel and stops reading it, and legacy B3 carriage
-    // refuses the frame. This bounds each peer however many markets it uses,
-    // including unauthenticated legacy/dual B3 ingress, which has no FMN2
-    // receive budget. It does not bound all peers together: on FMN2 only the
-    // shared critical receive bucket does, and a handful of flooding peers
-    // can still empty it (see FLOWMESH_SETTLED_PEER_TOKEN_BURST). Honest
-    // relays stayed far below both budgets with 4 validators (at most 27 per
-    // peer and market in any second, 82 in any five seconds); that sizing
-    // must be re-validated with more seats.
+    // refuses the frame. A peer is one connection identity (legacy NodeId or
+    // FMN2 session id), so a reconnect or dual carriage gets a fresh budget.
+    // This bounds each such peer however many markets it uses, including
+    // unauthenticated legacy/dual B3 ingress, which has no FMN2 receive
+    // budget. It does not bound all peers together: on FMN2 only the shared
+    // critical receive bucket does, and a handful of flooding peers can still
+    // empty it (see FLOWMESH_SETTLED_PEER_TOKEN_BURST). With 4 validators an
+    // honest sender averaged 8-12 consumed frames per second per market; in
+    // steady state the per-peer budget binds once one sender's summed
+    // sustained settled rate exceeds 128/s, about 11 markets at 12/s. That
+    // sizing must be re-validated with more seats.
     const auto consume_settled = [&] { // Caller holds m_queue_mutex.
         const auto result{m_queue.ConsumeSettled(peer, message, m_config.clock->Now())};
         if (result == flowmesh::QueueResult::RATE_LIMITED) ++m_settled_rate_limited[message.header.market_id];

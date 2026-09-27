@@ -225,9 +225,12 @@ struct FlowMeshRuntimeDeliverySnapshot {
     // spent one of its separate budgets for consumed frames (per market, or
     // across all markets). This includes a frame refused before admission
     // hashed it, because its sender had no settled and no committee token
-    // left. Honest relays measured with four validators stay far below both
-    // budgets; a non-zero value points at a flooding peer, or at a larger
-    // committee whose honest relays outgrew the sizing.
+    // left. A peer is one connection identity (legacy NodeId or FMN2 session
+    // id). In steady state the per-peer budget binds when one sender's summed
+    // sustained settled rate exceeds 128/s (about 11 markets at the 12/s
+    // average measured with four validators); a non-zero value points at a
+    // flooding peer, or at a larger committee or market count whose honest
+    // relays outgrew the sizing.
     uint64_t settled_frames_rate_limited{0};
     size_t pending_objects{0}, pending_bytes{0};
     size_t deferred_objects{0}, deferred_bytes{0};

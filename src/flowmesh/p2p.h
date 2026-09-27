@@ -74,14 +74,19 @@ inline constexpr double FLOWMESH_SETTLED_TOKEN_RATE{64.0};
 // The per-(peer, market) budget alone let one peer consume 256 at once and
 // 64/s in every admitted market, so its total grew with the market count.
 //
+// A "peer" or "sender" here is one connection identity: the legacy B3
+// NodeId, or the FMN2 session's peer id. It is not an operator key, so a
+// reconnect, or the same operator carried over legacy and FMN2 at once
+// (dual carriage), gets a fresh budget.
+//
 // Sizing: in the warm persistent-trades benchmark (4 validators, one market,
-// star relay, no sentry) a sender's consumed frames at one receiver peaked
-// at 27 in any 1 s and 82 in any 5 s (8-12/s on average), against 320 and
-// 576 allowed per market. This budget admits 640 in 1 s and 1152 in 5 s, so
-// four markets all at that peak together keep 5.9x (1 s) and 3.5x (5 s)
-// headroom; honest traffic would bind only with 15 or more markets at their
-// 5 s peak at the same time. For one market the per-market budget binds
-// first.
+// star relay, no sentry) a sender's consumed frames at one receiver averaged
+// 8-12/s and peaked at 27 in any 1 s and 82 in any 5 s, against 320 and 576
+// allowed per market. In steady state the burst (512) only absorbs short
+// peaks and the refill rate decides: this budget binds when one sender's
+// summed sustained settled rate across all markets exceeds 128/s, which is
+// about 11 markets at the measured 12/s average. For one market the
+// per-market budget (64/s) binds first.
 //
 // What this does not bound: it is a per-peer bound only; nothing in
 // admission bounds all peers together. On FMN2 the one aggregate bound is
