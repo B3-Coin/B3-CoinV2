@@ -788,4 +788,122 @@ BOOST_AUTO_TEST_CASE(retry_keeps_exact_denied_message_for_the_next_admission)
     BOOST_CHECK_EQUAL(report->view, 1U);
 }
 
+// Folded slot changes (received candidate bytes, a retained older proposal)
+// are written by the atomic whole-slot batch before a public call returns,
+// even when nothing is signed and no other write follows.
+BOOST_AUTO_TEST_CASE(folded_slot_changes_are_durable_at_every_public_return)
+{
+    const AgreementFixture f;
+    std::string error; bool available{true}; std::vector<AgreementMessage> output;
+    const fs::path path{m_args.GetDataDirBase() / "agreement-folded-return"};
+    const auto keyless = [&] {
+        auto callbacks{f.Callbacks(8, output, available)};
+        callbacks.local_keys = [] { return std::vector<bls::SecretKey>{}; };
+        return callbacks;
+    };
+    {
+        node::FlowMeshAgreement engine{DBParams{.path = path, .cache_bytes = 1 << 20}, keyless()};
+        BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+        BOOST_REQUIRE(engine.Receive(f.Report(0, 4), error));
+        BOOST_REQUIRE(engine.Receive(f.Report(1, 4), error));
+        BOOST_REQUIRE(engine.Receive(f.Report(2, 4), error));
+        BOOST_REQUIRE_EQUAL(engine.View(), 4U);
+        // An authenticated view-zero proposal is only retained: no vote, no
+        // proposal of this view, and no later write in this call.
+        BOOST_REQUIRE(engine.Receive(f.Proposal(f.a), error));
+        BOOST_CHECK(engine.CandidateBytes(f.hash_a) == f.a);
+        BOOST_CHECK(output.empty());
+    }
+    node::FlowMeshAgreement restarted{DBParams{.path = path, .cache_bytes = 1 << 20}, keyless()};
+    BOOST_REQUIRE_MESSAGE(restarted.Open(f.context, f.seats, Filled(77), false, error), error);
+    BOOST_CHECK_EQUAL(restarted.View(), 4U);
+    BOOST_CHECK(restarted.CandidateBytes(f.hash_a) == f.a);
+    BOOST_REQUIRE(restarted.Retry(error));
+    const auto retained{std::find_if(output.begin(), output.end(), [](const auto& message) {
+        return message.stage == AgreementStage::PROPOSAL;
+    })};
+    BOOST_REQUIRE(retained != output.end());
+    BOOST_CHECK(EncodeAgreementMessage(*retained) == EncodeAgreementMessage(f.Proposal(f.a)));
+}
+
+// Every BLS signature follows a synchronous whole-slot write that covers every
+// folded change recorded before it, including the resumed-intent path that
+// has no write of its own; a slot therefore needs two fewer barriers.
+BOOST_AUTO_TEST_CASE(folded_slot_changes_are_synced_before_every_signature)
+{
+    const AgreementFixture f;
+    struct Span { std::string operation; uint64_t id; };
+    std::vector<Span> spans;
+    const auto traced = [&](node::FlowMeshAgreementCallbacks callbacks) {
+        callbacks.trace_clock = [] { return uint64_t{0}; };
+        callbacks.trace = [&](const node::FlowMeshAgreementTrace& event) {
+            spans.push_back({event.operation, event.span_id});
+        };
+        return callbacks;
+    };
+    const auto count = [&](const std::string& operation) {
+        return std::count_if(spans.begin(), spans.end(), [&](const Span& span) { return span.operation == operation; });
+    };
+    const auto check_signatures_follow_sync = [&] {
+        auto ordered{spans};
+        std::sort(ordered.begin(), ordered.end(), [](const Span& x, const Span& y) { return x.id < y.id; });
+        bool dirty{false};
+        size_t signatures{0};
+        for (const Span& span : ordered) {
+            if (span.operation.ends_with("_deferred")) dirty = true;
+            if (span.operation == "journal_write_batch_sync") dirty = false;
+            if (span.operation == "digest_and_bls_sign") {
+                ++signatures;
+                BOOST_CHECK_MESSAGE(!dirty, "signature " << signatures << " preceded its folded write");
+            }
+        }
+        return signatures;
+    };
+    std::string error; bool available{true}; std::vector<AgreementMessage> output;
+
+    // One follower slot: proposal, prepare quorum, commit quorum, decision.
+    {
+        node::FlowMeshAgreement engine{DBParams{.path = "agreement-folded-sync", .cache_bytes = 1 << 20, .memory_only = true},
+                                       traced(f.Callbacks(8, output, available))};
+        BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+        spans.clear();
+        BOOST_REQUIRE(engine.Receive(f.Proposal(f.a), error));
+        for (uint32_t seat{0}; seat < 7; ++seat) BOOST_REQUIRE(engine.Receive(f.Vote(AgreementStage::PREPARE, seat, f.hash_a), error));
+        for (uint32_t seat{0}; seat < 7; ++seat) BOOST_REQUIRE(engine.Receive(f.Vote(AgreementStage::COMMIT, seat, f.hash_a), error));
+        BOOST_REQUIRE(engine.DecidedCandidate() == f.hash_a);
+        BOOST_CHECK_EQUAL(check_signatures_follow_sync(), 2U);
+        BOOST_CHECK_EQUAL(count("persist_candidate_deferred"), 1);
+        BOOST_CHECK_EQUAL(count("persist_prepared_deferred"), 1);
+        // proposal, PREPARE intent + signed, COMMIT intent + signed, decision.
+        BOOST_CHECK_EQUAL(count("journal_write_batch_sync"), 6);
+        BOOST_CHECK(!engine.Halted());
+    }
+
+    // A crashed PREPARE intent resumes after a folded prepared proof arrives.
+    const fs::path path{m_args.GetDataDirBase() / "agreement-folded-resume"};
+    {
+        auto callbacks{f.Callbacks(8, output, available)};
+        callbacks.crash = [](const auto point) {
+            if (point == node::FlowMeshAgreementCrashPoint::AFTER_INTENT_PERSIST) throw std::runtime_error("interrupted intent");
+        };
+        node::FlowMeshAgreement engine{DBParams{.path = path, .cache_bytes = 1 << 20}, std::move(callbacks)};
+        BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+        BOOST_CHECK(!engine.Receive(f.Proposal(f.a), error));
+    }
+    output.clear();
+    node::FlowMeshAgreement restarted{DBParams{.path = path, .cache_bytes = 1 << 20}, traced(f.Callbacks(8, output, available))};
+    BOOST_REQUIRE_MESSAGE(restarted.Open(f.context, f.seats, Filled(77), false, error), error);
+    spans.clear();
+    BOOST_REQUIRE(restarted.Receive(f.Vote(AgreementStage::COMMIT, 0, f.hash_a, 0, f.Prepared(f.hash_a)), error));
+    BOOST_CHECK_EQUAL(count("persist_prepared_deferred"), 1);
+    BOOST_CHECK_EQUAL(count("persist_before_signing"), 1);
+    BOOST_CHECK_GE(check_signatures_follow_sync(), 1U);
+    const auto resumed{std::find_if(output.begin(), output.end(), [](const auto& message) {
+        return message.stage == AgreementStage::PREPARE;
+    })};
+    BOOST_REQUIRE(resumed != output.end());
+    BOOST_CHECK(EncodeAgreementMessage(*resumed) == EncodeAgreementMessage(f.Vote(AgreementStage::PREPARE, 8, f.hash_a)));
+    BOOST_CHECK(!restarted.Halted());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

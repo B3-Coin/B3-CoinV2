@@ -207,6 +207,8 @@ struct FlowMeshAgreement::Impl {
     size_t retry_cursor{0};
     uint32_t proposal_retry_cursor{0};
     std::set<uint256> usable;
+    //! Slot changes recorded but not yet written by an atomic whole-slot batch.
+    bool dirty{false};
     std::optional<uint256> preferred;
     std::optional<uint256> required;
     uint64_t trace_next_span{0}, trace_parent_span{0};
@@ -263,7 +265,41 @@ struct FlowMeshAgreement::Impl {
         batch.Write(SlotKey{'s', Context().epoch, Context().sequence}, slot);
         TraceSpan write{*this, "journal_write_batch_sync"};
         db.WriteBatch(batch, true);
+        // One batch writes the marker and the whole slot, so every pending
+        // change is now durable regardless of which site recorded it.
+        dirty = false;
     }
+    // Record a slot change that no signature or publication depends on yet.
+    // The next Persist writes the same atomic whole-slot batch, and one is
+    // forced before any signing and before every public entry point returns,
+    // so a crash in between is indistinguishable from not having received
+    // the message that caused the change.
+    void MarkDirty(const char* reason)
+    {
+        TraceSpan trace{*this, reason};
+        dirty = true;
+    }
+    void Flush(const char* reason) { if (dirty) Persist(reason); }
+    // Forces the pending whole-slot batch out on every normal return from a
+    // mutating public entry point. A caught failure has already halted the
+    // engine, and an unwritten slot must never outlive that halt silently.
+    struct FlushOnReturn {
+        Impl& s;
+        explicit FlushOnReturn(Impl& impl) : s{impl} {}
+        ~FlushOnReturn()
+        {
+            if (s.halted || !s.dirty) return;
+            try {
+                s.Flush("persist_public_return");
+            } catch (const std::exception& e) {
+                s.halted = true;
+                s.last_error = std::string{"agreement journal flush failed: "} + e.what();
+            } catch (...) {
+                s.halted = true;
+                s.last_error = "agreement journal flush failed";
+            }
+        }
+    };
     std::optional<PreagreementPreparedCertificate> Highest() const
     {
         return slot.highest.empty() ? std::nullopt : DecodePreagreementPrepared(slot.highest);
@@ -447,7 +483,7 @@ struct FlowMeshAgreement::Impl {
         if (restored->size() > MAX_EVIDENCE_BYTES) throw std::runtime_error("agreement evidence resource limit");
         if (*restored != found->second.evidence) {
             found->second.evidence = *restored;
-            Persist("persist_candidate_evidence");
+            MarkDirty("persist_candidate_evidence_deferred");
         }
         usable.insert(hash);
         if (required == hash) required.reset();
@@ -465,7 +501,7 @@ struct FlowMeshAgreement::Impl {
             throw std::runtime_error("agreement candidate/evidence resource limit");
         }
         slot.candidates.emplace(hash, Candidate{bytes, *evidence});
-        Persist("persist_candidate");
+        MarkDirty("persist_candidate_deferred");
         usable.insert(hash);
         if (!preferred) preferred = hash;
         if (required == hash) required.reset();
@@ -479,7 +515,7 @@ struct FlowMeshAgreement::Impl {
         // its evidence becomes usable, without reopening that view's votes.
         if (proposal.view < slot.view && !slot.proposals.contains(proposal.view)) {
             slot.proposals.emplace(proposal.view, *EncodeAgreementMessage(proposal));
-            Persist("persist_old_proposal");
+            MarkDirty("persist_old_proposal_deferred");
         }
         return true;
     }
@@ -552,6 +588,10 @@ struct FlowMeshAgreement::Impl {
             if (!slot.records[index].signed_bytes.empty()) return DecodeAgreementMessage(slot.records[index].signed_bytes);
             if (intent.view < slot.view) return std::nullopt;
         }
+        // Nothing is ever signed against slot state that is not yet durable.
+        // The new-record branch above has just persisted; this covers the
+        // resumed-intent branch and any folded change that preceded it.
+        Flush("persist_before_signing");
         {
             TraceSpan signing{*this, "digest_and_bls_sign", intent.candidate};
             const auto digest{AgreementMessageDigest(intent)};
@@ -593,7 +633,7 @@ struct FlowMeshAgreement::Impl {
             const auto bytes{EncodePreagreementPrepared(prepared)};
             if (!bytes) throw std::runtime_error("prepared proof resource limit");
             slot.highest = *bytes;
-            Persist("persist_prepared");
+            MarkDirty("persist_prepared_deferred");
         }
     }
     bool SaveDecision(const AgreementMessage& message)
@@ -820,6 +860,7 @@ bool FlowMeshAgreement::Advance(const PreagreementContext& context, const Active
 bool FlowMeshAgreement::SubmitCandidate(const std::span<const unsigned char> entry, std::string& error)
 {
     auto& s{*m_impl}; if (!s.Ready(error)) return false;
+    Impl::FlushOnReturn flush{s};
     Impl::TraceSpan trace{s, "submit_candidate"};
     try {
         s.usable.clear();
@@ -836,6 +877,7 @@ bool FlowMeshAgreement::SubmitCandidate(const std::span<const unsigned char> ent
 bool FlowMeshAgreement::Receive(const AgreementMessage& message, std::string& error)
 {
     auto& s{*m_impl}; if (!s.Ready(error)) return false;
+    Impl::FlushOnReturn flush{s};
     Impl::TraceSpan trace{s, "receive", message};
     try {
         s.usable.clear();
@@ -888,6 +930,7 @@ bool FlowMeshAgreement::Receive(const AgreementMessage& message, std::string& er
 bool FlowMeshAgreement::Timeout(std::string& error)
 {
     auto& s{*m_impl}; if (!s.Ready(error)) return false;
+    Impl::FlushOnReturn flush{s};
     Impl::TraceSpan trace{s, "timeout"};
     try {
         s.usable.clear();
@@ -900,6 +943,7 @@ bool FlowMeshAgreement::Timeout(std::string& error)
 bool FlowMeshAgreement::Retry(std::string& error)
 {
     auto& s{*m_impl}; if (!s.Ready(error)) return false;
+    Impl::FlushOnReturn flush{s};
     Impl::TraceSpan trace{s, "retry"};
     try {
         // Evidence and anchors can become available again between retries.
