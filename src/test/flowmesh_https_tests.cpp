@@ -830,6 +830,93 @@ BOOST_AUTO_TEST_CASE(https_server_issues_no_resumption_tickets)
     server.Stop();
 }
 
+BOOST_AUTO_TEST_CASE(https_request_deadline_is_exposed_to_handler)
+{
+    auto options{Options()};
+    options.request_timeout = std::chrono::milliseconds{1500};
+    std::mutex mutex;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    node::FlowMeshHttpsServer server{options, [&](const auto& request) {
+        std::lock_guard lock{mutex};
+        deadline = request.deadline;
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    const auto before{std::chrono::steady_clock::now()};
+    const auto reply{node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    const auto after{std::chrono::steady_clock::now()};
+    BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+    std::lock_guard lock{mutex};
+    BOOST_REQUIRE(deadline);
+    // Fixed at accept (a cold connection), never at handler entry.
+    BOOST_CHECK(*deadline >= before + options.request_timeout);
+    BOOST_CHECK(*deadline <= after + options.request_timeout);
+    server.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_start_and_stop_hooks_bracket_workers_and_release_a_waiting_handler)
+{
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool released{false};
+    std::atomic<unsigned> starts{0}, stops{0}, handled{0}, started_before_handler{0};
+    auto options{Options()};
+    options.request_timeout = std::chrono::seconds{5};
+    options.on_start = [&] {
+        {
+            std::lock_guard lock{mutex};
+            released = false;
+        }
+        ++starts;
+    };
+    options.on_stop = [&] {
+        ++stops;
+        {
+            std::lock_guard lock{mutex};
+            released = true;
+        }
+        condition.notify_all();
+        throw std::runtime_error{"a throwing hook never escapes Stop"};
+    };
+    std::atomic<bool> entered{false};
+    node::FlowMeshHttpsServer server{options, [&](const auto&) {
+        started_before_handler += starts.load() != 0;
+        ++handled;
+        entered = true;
+        std::unique_lock lock{mutex};
+        // Only the stop hook releases this bounded wait before its 4 s bound.
+        condition.wait_for(lock, std::chrono::seconds{4}, [&] { return released; });
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    server.Stop(); // Never started: no stop hook.
+    BOOST_CHECK_EQUAL(stops.load(), 0U);
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    BOOST_CHECK_EQUAL(starts.load(), 1U);
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error); // Already running: no second hook.
+    BOOST_CHECK_EQUAL(starts.load(), 1U);
+    std::thread client{[&] {
+        (void)node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{5}, 1024);
+    }};
+    const auto wait_until{std::chrono::steady_clock::now() + std::chrono::seconds{2}};
+    while (!entered.load() && std::chrono::steady_clock::now() < wait_until) std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    BOOST_REQUIRE(entered.load());
+    const auto stop_started{std::chrono::steady_clock::now()};
+    server.Stop();
+    BOOST_CHECK(std::chrono::steady_clock::now() - stop_started < std::chrono::seconds{1});
+    client.join();
+    BOOST_CHECK_EQUAL(stops.load(), 1U);
+    server.Stop(); // Already stopped: no second hook.
+    BOOST_CHECK_EQUAL(stops.load(), 1U);
+    BOOST_CHECK_EQUAL(handled.load(), 1U);
+    BOOST_CHECK_EQUAL(started_before_handler.load(), 1U);
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    BOOST_CHECK_EQUAL(starts.load(), 2U);
+    server.Stop();
+    BOOST_CHECK_EQUAL(stops.load(), 2U);
+}
+
 BOOST_AUTO_TEST_CASE(https_transport_only_paired_cold_warm_observations)
 {
     // This measures generated loopback HTTPS exchanges, NOT matching, BFT,

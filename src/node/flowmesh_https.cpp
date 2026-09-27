@@ -1010,6 +1010,7 @@ struct FlowMeshHttpsServer::Impl {
         }
         Request request;
         request.remote_address = pending.peer;
+        request.deadline = pending.deadline;
         Response response;
         int failure{400};
         bool keep_alive{false};
@@ -1240,6 +1241,9 @@ bool FlowMeshHttpsServer::Start(std::string& error)
         return false;
     }
     state.stopping = false;
+    if (options.on_start) {
+        try { options.on_start(); } catch (...) {}
+    }
     try {
         for (size_t i{0}; i < options.worker_threads; ++i) state.workers.emplace_back([&state] { state.Worker(); });
         state.accept_thread = std::thread{[&state] { state.Accept(); }};
@@ -1254,9 +1258,14 @@ bool FlowMeshHttpsServer::Start(std::string& error)
 void FlowMeshHttpsServer::Stop()
 {
     auto& state{*m_impl};
-    state.stopping = true;
+    const bool was_running{!state.stopping.exchange(true)};
     state.Wake();
     state.condition.notify_all();
+    // No new request can start now. Let handlers in bounded waits return
+    // before the joins below wait for them.
+    if (was_running && state.options.on_stop) {
+        try { state.options.on_stop(); } catch (...) {}
+    }
     if (state.accept_thread.joinable()) state.accept_thread.join();
     {
         std::lock_guard lock{state.mutex};

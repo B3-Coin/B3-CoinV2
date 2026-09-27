@@ -116,11 +116,22 @@ public:
         std::chrono::milliseconds idle_timeout{FLOWMESH_HTTPS_DEFAULT_IDLE_TIMEOUT};
         std::chrono::milliseconds connection_lifetime{FLOWMESH_HTTPS_DEFAULT_CONNECTION_LIFETIME};
         size_t max_requests_per_connection{128};
+        /** Optional; must not block and should not throw (exceptions are
+         * swallowed). on_start runs in Start just before the workers spawn.
+         * on_stop runs exactly once after each on_start, in Stop after new
+         * work is refused and before any handler is joined, so a handler in
+         * a bounded wait can return promptly. */
+        std::function<void()> on_start;
+        std::function<void()> on_stop;
     };
     struct Request {
         std::string path;
         std::string body;
         std::string remote_address;
+        /** Absolute deadline of this request, fixed when it became readable
+         * (including queue wait). A reply finished after it is never written,
+         * so a handler that waits must leave time to build and send one. */
+        std::chrono::steady_clock::time_point deadline{};
     };
     struct Response {
         int status{200};
