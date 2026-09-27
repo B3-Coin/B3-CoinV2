@@ -22,6 +22,7 @@
 #include <util/result.h>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -778,8 +779,13 @@ public:
         receipt.state = submitFlowMeshAction(market_id, action, receipt.reason) ? "queued" : "rejected";
         return receipt;
     }
+    //! A nonzero wait (only without retry) lets the remote trading client hold
+    //! one read of an action it delivered open at its endpoint, bounded, until
+    //! certified inclusion. It never resends or signs; the local engine
+    //! answers immediately.
     virtual FlowMeshActionReceipt flowMeshActionStatus(const uint256& market_id,
-                                                       const uint256& action_id, bool retry = false)
+                                                       const uint256& action_id, bool retry = false,
+                                                       std::chrono::milliseconds wait = std::chrono::milliseconds{0})
     {
         FlowMeshActionReceipt receipt;
         receipt.action_id = action_id;

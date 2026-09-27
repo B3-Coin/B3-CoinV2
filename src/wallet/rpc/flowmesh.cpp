@@ -11,6 +11,7 @@
 #include <modern/asset_output.h>
 #include <modern/mpa.h>
 #include <node/flowmesh_client.h>
+#include <node/flowmesh_client_action_wait.h>
 #include <node/flowmesh_client_join.h>
 #include <policy/policy.h>
 #include <rpc/protocol.h>
@@ -26,6 +27,7 @@
 #include <univalue.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -585,22 +587,38 @@ static RPCResult AcceptedActionResult(
 
 static RPCHelpMan ActionStatusRPC(const bool retry)
 {
+    std::vector<RPCArg> args{
+        {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte market id"},
+        {"action_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Original nonzero canonical action id"},
+    };
+    // Retry keeps its exact two-argument fresh-query-then-resend contract.
+    if (!retry) {
+        args.emplace_back("wait_ms", RPCArg::Type::NUM, RPCArg::Default{0},
+            strprintf("Remote client only: hold this read open for at most this many milliseconds (0-%d) until certified inclusion of an action this client delivered, when the endpoint that acknowledged the delivery advertises bounded waits. Never resends or signs; the receipt is never less conservative than an immediate read. 0, the local engine and older endpoints read immediately.",
+                      node::FLOWMESH_CLIENT_ACTION_WAIT_MAX.count()));
+    }
     return RPCHelpMan{
         retry ? "retryflowmeshaction" : "getflowmeshactionstatus",
         retry
             ? "Resolve or retry a locally retained FlowMesh action by its original identity, only for this wallet's existing account. Only the saved exact instruction is eligible; no wallet unlock, new signature, account sequence or order is created. A proven certified action is returned without resubmission. Unknown means the outcome is uncertain, not rejected.\n"
             : "Read the locally configured trading backend's receipt for an exact FlowMesh action belonging to this wallet's existing account. This never signs or submits an action. Certificate-verified inclusion is distinct from a verified execution outcome and B3 settlement.\n",
-        {
-            {"market_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "32-byte market id"},
-            {"action_id", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Original nonzero canonical action id"},
-        },
+        std::move(args),
         ActionReceiptResult("Action receipt, including an explicit unknown outcome"),
-        RPCExamples{HelpExampleCli(retry ? "retryflowmeshaction" : "getflowmeshactionstatus", "\"<market_id>\" \"<action_id>\"")},
+        RPCExamples{HelpExampleCli(retry ? "retryflowmeshaction" : "getflowmeshactionstatus", "\"<market_id>\" \"<action_id>\"") +
+                    (retry ? std::string{} : HelpExampleCli("getflowmeshactionstatus", "\"<market_id>\" \"<action_id>\" 2000"))},
         [retry](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
             const auto wallet{GetWalletForJSONRPCRequest(request)};
             if (!wallet) return UniValue::VNULL;
             const uint256 market_id{ParseMarketId(request.params[0])};
             const uint256 action_id{ParseActionId(request.params[1])};
+            std::chrono::milliseconds wait{0};
+            if (!retry && !request.params[2].isNull()) {
+                const auto value{request.params[2].getInt<int64_t>()};
+                if (value < 0 || value > node::FLOWMESH_CLIENT_ACTION_WAIT_MAX.count()) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("wait_ms must be between 0 and %d", node::FLOWMESH_CLIENT_ACTION_WAIT_MAX.count()));
+                }
+                wait = std::chrono::milliseconds{value};
+            }
             const auto account{ExistingWalletAccount(*wallet)};
             if (!account) throw JSONRPCError(RPC_WALLET_ERROR, "This wallet has no FlowMesh account");
             const bool remote{wallet->chain().flowMeshClientStatus().backend == "remote"};
@@ -611,7 +629,7 @@ static RPCHelpMan ActionStatusRPC(const bool retry)
                 if (std::none_of(saved.begin(), saved.end(), [&](const auto& row) { return row.receipt.action_id == action_id; }))
                     throw JSONRPCError(RPC_WALLET_ERROR, "Action is not retained for this wallet's existing FlowMesh account");
             }
-            auto receipt{BoundActionReceipt(wallet->chain().flowMeshActionStatus(market_id, action_id, remote && retry), action_id)};
+            auto receipt{BoundActionReceipt(wallet->chain().flowMeshActionStatus(market_id, action_id, remote && retry, wait), action_id)};
             if (receipt.account_id != account) {
                 throw JSONRPCError(RPC_WALLET_ERROR, "Action is not retained for this wallet's existing FlowMesh account");
             }

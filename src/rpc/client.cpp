@@ -107,6 +107,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "getflowmeshmarketdata", 1, "options" },
     { "getflowmeshactionstatus", 0, "market_id", ParamFormat::STRING },
     { "getflowmeshactionstatus", 1, "action_id", ParamFormat::STRING },
+    { "getflowmeshactionstatus", 2, "wait_ms" },
     { "retryflowmeshaction", 0, "market_id", ParamFormat::STRING },
     { "retryflowmeshaction", 1, "action_id", ParamFormat::STRING },
     { "createflowmeshcheckpoint", 0, "market_id", ParamFormat::STRING },
