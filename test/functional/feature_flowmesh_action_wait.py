@@ -169,9 +169,32 @@ class FlowMeshActionWaitTest(FlowMeshLatencyTest):
             again, elapsed = self.action(market, action_id, WAIT_MAX_MS)
             assert_equal(again["wait_status"], "none")
             assert elapsed < 1000, elapsed
-            other, _ = self.action(market, action_id, index=1)
+            # Validator 0's certificate does not prove validator 1 has already
+            # applied it. The latter deliberately has waits disabled: observe
+            # its ordinary status with a bounded wait for this exact action,
+            # then retain the same hash/sequence equality assertion.
+            other = None
+            replica_reads = 0
+
+            def other_certified():
+                nonlocal other, replica_reads
+                self.pump_b3()
+                other, _ = self.action(market, action_id, index=1)
+                replica_reads += 1
+                if other["receipt_state"] != "certified_inclusion":
+                    assert other["receipt_state"] in {"unknown", "queued", "admitted"}, other
+                    assert_equal(other["certificate_verified"], False)
+                    return False
+                assert_equal(other["certificate_verified"], True)
+                assert "certified_payload" in other and "evidence_error" not in other, other
+                return True
+
+            self.wait_until(other_certified, timeout=60, check_interval=.1)
             assert_equal((other["microblock_sequence"], other["microblock_hash"]),
                          (result["microblock_sequence"], result["microblock_hash"]))
+            self.wait_report["replica1_certified"] = {"ordinary_reads": replica_reads,
+                "microblock_sequence": other["microblock_sequence"],
+                "microblock_hash": other["microblock_hash"]}
 
             # The unchanged client resolves the same action by its ordinary path.
             def client_certified():
