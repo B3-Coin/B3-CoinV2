@@ -35,9 +35,11 @@ struct HttpsRequestResult {
     /** Conservative transport observation, not admission. Once a request
      * could have left this process, failures must be treated as unknown. */
     bool request_may_have_been_sent{false};
-    /** Transport diagnostics only; neither field establishes admission. */
+    /** Transport diagnostics only; none of these fields establishes admission. */
     bool connection_reused{false};
     bool tls_handshake_performed{false};
+    /** TCP_NODELAY was set on the socket this request used (latency only). */
+    bool tcp_nodelay{false};
 };
 
 /** Syntax and pin validation only: no DNS, filesystem or network access. */

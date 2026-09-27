@@ -635,6 +635,35 @@ BOOST_AUTO_TEST_CASE(https_server_disables_nagle_on_accepted_connections)
     BOOST_CHECK_EQUAL(observed.Count(), 2U);
 }
 
+BOOST_AUTO_TEST_CASE(https_client_sets_nodelay_on_its_tls_sockets)
+{
+    // libevent creates the client socket; the flag reports that setsockopt
+    // succeeded on the socket each request used. Ordering before ClientHello
+    // follows from libevent attaching the socket before its handshake starts.
+    node::FlowMeshHttpsServer server{Options(), [](const auto& request) {
+        return node::FlowMeshHttpsServer::Response{200, request.body};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    node::FlowMeshHttpsClient client;
+    for (unsigned int i{0}; i < 3; ++i) {
+        const auto reply{client.Request(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+        BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+        BOOST_CHECK_EQUAL(reply.connection_reused, i != 0);
+        BOOST_CHECK(reply.tcp_nodelay);
+    }
+    client.Reset();
+    const auto cold{client.Request(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(cold.response_received, cold.error);
+    BOOST_CHECK(!cold.connection_reused);
+    BOOST_CHECK(cold.tls_handshake_performed);
+    BOOST_CHECK(cold.tcp_nodelay);
+    const auto one_shot{node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(one_shot.response_received, one_shot.error);
+    BOOST_CHECK(one_shot.tcp_nodelay);
+    server.Stop();
+}
+
 BOOST_AUTO_TEST_CASE(https_transport_only_paired_cold_warm_observations)
 {
     // This measures generated loopback HTTPS exchanges, NOT matching, BFT,

@@ -187,6 +187,8 @@ struct ClientSession {
     bool tls_failed{false};
     bool handshake_done{false};
     bool connection_closed{false};
+    // Descriptor on which TCP_NODELAY was last set; -1 when none is.
+    int nodelay_fd{-1};
 };
 
 int ClientDataIndex()
@@ -220,17 +222,30 @@ int VerifyPeer(int verified, X509_STORE_CTX* certificate_context)
 
 void HandshakeInfo(const SSL* ssl, int where, int)
 {
-    if ((where & SSL_CB_HANDSHAKE_DONE) == 0) return;
-    if (auto* session{static_cast<ClientSession*>(SSL_get_ex_data(ssl, ClientDataIndex()))}) {
-        session->handshake_done = true;
-        auto* call{session->active};
-        if (!call) return;
-        // The HTTP writer may run immediately after this callback. Conservatively
-        // report unknown outcome after successful TLS, even if later writes fail.
-        call->result.request_may_have_been_sent = true;
-        call->result.tls_handshake_performed = true;
-        if (call->timing) call->timing->Mark("tls_handshake_done_us");
+    auto* session{static_cast<ClientSession*>(SSL_get_ex_data(ssl, ClientDataIndex()))};
+    if (!session) return;
+    // Latency only, never a trust condition. evhttp/bufferevent create this
+    // socket and expose no NODELAY option; libevent attaches the connected
+    // socket BIO before it starts the handshake, so the first info event of a
+    // connection sees it. A new handshake implies a new socket even when the
+    // descriptor number was reused, so it is configured again.
+    if (where & SSL_CB_HANDSHAKE_START) session->nodelay_fd = -1;
+    if (const int fd{SSL_get_fd(ssl)}; fd >= 0 && fd != session->nodelay_fd) {
+        const int one{1};
+        const bool set{setsockopt(static_cast<evutil_socket_t>(fd), IPPROTO_TCP, TCP_NODELAY,
+                                  reinterpret_cast<const char*>(&one), sizeof(one)) == 0};
+        session->nodelay_fd = set ? fd : -1;
+        if (session->active) session->active->result.tcp_nodelay = set;
     }
+    if ((where & SSL_CB_HANDSHAKE_DONE) == 0) return;
+    session->handshake_done = true;
+    auto* call{session->active};
+    if (!call) return;
+    // The HTTP writer may run immediately after this callback. Conservatively
+    // report unknown outcome after successful TLS, even if later writes fail.
+    call->result.request_may_have_been_sent = true;
+    call->result.tls_handshake_performed = true;
+    if (call->timing) call->timing->Mark("tls_handshake_done_us");
 }
 
 bool FingerprintCa(const fs::path& path, Clock::time_point deadline,
@@ -827,7 +842,14 @@ HttpsRequestResult FlowMeshHttpsClient::Request(const HttpsEndpoint& endpoint, c
     // Unlike a cold handshake, a warm socket can immediately write. Mark every
     // warm request before make_request makes any of its bytes writer-eligible.
     call.result.connection_reused = warm;
-    if (warm) call.result.request_may_have_been_sent = true;
+    if (warm) {
+        call.result.request_may_have_been_sent = true;
+        // The option persists for the socket's lifetime; a cold request is
+        // reported by the handshake callback that configures its socket.
+        SSL* ssl{bufferevent_openssl_get_ssl(evhttp_connection_get_bufferevent(state.connection.get()))};
+        const int fd{ssl ? SSL_get_fd(ssl) : -1};
+        call.result.tcp_nodelay = fd >= 0 && fd == state.session.nodelay_fd;
+    }
     // libevent owns/frees request whether make_request succeeds or fails.
     if (evhttp_make_request(state.connection.get(), request, EVHTTP_REQ_POST, path.c_str()) != 0) {
         call.result.error = "https-request-setup-failed";
@@ -838,6 +860,7 @@ HttpsRequestResult FlowMeshHttpsClient::Request(const HttpsEndpoint& endpoint, c
     deadline.reset();
     state.session.active = nullptr;
     cleanup.detached = true;
+    timing.Field("tcp_nodelay", uint64_t{call.result.tcp_nodelay});
     if (call.callback_failed) {
         Reset();
         call.result.response_received = false;
