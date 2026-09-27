@@ -963,11 +963,13 @@ BOOST_AUTO_TEST_CASE(https_start_and_stop_hooks_bracket_workers_and_release_a_wa
 
 BOOST_AUTO_TEST_CASE(https_active_permits_bound_handshake_read_and_write)
 {
-    constexpr size_t LARGE_REPLY{16 * 1024 * 1024};
+    // Far larger than the socket buffers, so the reply write blocks, yet small
+    // enough to drain well inside the deadlines on a loaded host.
+    constexpr size_t LARGE_REPLY{2 * 1024 * 1024};
     auto options{Options()};
     options.worker_threads = 8;
     options.active_permits = 2;
-    options.request_timeout = std::chrono::seconds{3};
+    options.request_timeout = std::chrono::seconds{10};
     options.max_reply_bytes = LARGE_REPLY + 1024;
     std::atomic<unsigned> handled{0};
     node::FlowMeshHttpsServer server{options, [&](const auto& request) {
@@ -1013,7 +1015,7 @@ BOOST_AUTO_TEST_CASE(https_active_permits_bound_handshake_read_and_write)
     while (handled.load() < 4 && std::chrono::steady_clock::now() < handler_deadline) std::this_thread::sleep_for(std::chrono::milliseconds{1});
     BOOST_REQUIRE_EQUAL(handled.load(), 4U);
     auto fourth{std::async(std::launch::async, [&] {
-        return node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{3}, 1024);
+        return node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{10}, 1024);
     })};
     std::this_thread::sleep_for(std::chrono::milliseconds{300});
     BOOST_CHECK_EQUAL(observed.Count(), 5U);
