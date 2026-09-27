@@ -108,6 +108,10 @@ public:
 
     uint64_t DeliveryGeneration() const override { return m_delivery_generation.load(); }
 
+    // A reconciliation that started and finished while the worker was idle:
+    // the gate is open again but every generation-stamped observation is old.
+    void BumpDeliveryGeneration() { m_delivery_generation += 2; }
+
     void ReconcileOnceWhileChecking(const flowmesh::AnchorRef& anchor,
                                    const size_t successful_checks = 0,
                                    const bool reopen = true,
@@ -859,6 +863,7 @@ public:
         for (size_t pass{0}; pass < 4; ++pass) for (const auto& runtime : runtimes) {
             if (runtime) BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{5}));
         }
+        if (after_drain) after_drain();
     }
 
     void Tick(const std::chrono::milliseconds advance = std::chrono::milliseconds{0})
@@ -914,6 +919,9 @@ public:
     const std::chrono::milliseconds round_timeout;
     const bool use_links;
     std::chrono::milliseconds elapsed{0};
+    // Optional observer run while every worker is idle, e.g. to read each
+    // bounded delivery-event ring before it can wrap.
+    std::function<void()> after_drain;
     Fmn2LinkModel links{Count};
     const uint256 domain{Filled(0x2e)};
     const modern::AssetId asset{Filled(0x4e)};
@@ -1096,6 +1104,35 @@ void CheckExactDeliveryRetry(const std::vector<node::FlowMeshRuntimeRelay>& orig
         BOOST_CHECK(*before_bytes == *after_bytes);
     }
 }
+
+/** Counts one runtime's entry executions from its bounded delivery-event
+ * ring. Sample after every drain; an event evicted before it was sampled
+ * fails the test instead of silently undercounting. */
+class ExecutionLog
+{
+public:
+    void Sample(const node::FlowMeshRuntime& runtime, const flowmesh::MarketId& market)
+    {
+        const auto snapshots{runtime.DeliverySnapshots(market)};
+        BOOST_REQUIRE_EQUAL(snapshots.size(), 1U);
+        for (const auto& event : snapshots.front().events) {
+            if (event.event_id <= m_last) continue;
+            BOOST_REQUIRE_EQUAL(event.event_id, m_last + 1);
+            m_last = event.event_id;
+            if (event.stage == "execution_started") ++m_started[{event.sequence, event.reason}];
+        }
+    }
+
+    size_t Executions(const uint64_t sequence, const std::string& reason) const
+    {
+        const auto it{m_started.find({sequence, reason})};
+        return it == m_started.end() ? 0 : it->second;
+    }
+
+private:
+    uint64_t m_last{0};
+    std::map<std::pair<uint64_t, std::string>, size_t> m_started;
+};
 
 class ScopedBenchLogging
 {
@@ -7715,6 +7752,175 @@ BOOST_AUTO_TEST_CASE(preagreement_action_wakeup_arms_initial_timeout_without_per
     f.Tick(std::chrono::milliseconds{1});
     BOOST_CHECK_GT(f.view_changes.load(), 0U);
     f.Reach(2);
+}
+
+// The agreement engine re-validates the candidate for every message, retry and
+// finalization of a slot. A follower executes each entry once; the leader
+// executes it twice, once to build it and once to verify it independently
+// before its first agreement signature. Nothing else executes it again while
+// the stamped execution context is unchanged. The FMN2 link model delivers in
+// bounded waves, so each node's 128-event ring is read before it can wrap.
+BOOST_AUTO_TEST_CASE(preagreement_candidate_executes_once_per_unchanged_context)
+{
+    std::array<ExecutionLog, 4> logs;
+    // A long round keeps every retry below inside view zero.
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_execution_once",
+                                 std::chrono::seconds{60}, 1, true};
+    f.after_drain = [&] {
+        for (size_t i{0}; i < f.runtimes.size(); ++i) logs[i].Sample(*f.runtimes[i], f.market);
+    };
+    const auto leader = [&](const uint64_t sequence) -> size_t {
+        return flowmesh::ProductionProposerSeatIndex(sequence, 0, f.seats.seats.Size());
+    };
+    // An idle leader may build (and discard) an empty entry on a tick; only
+    // the build of the proposed entry is fixed, so builds are compared across
+    // the slot rather than counted from the start.
+    const auto builds = [&](const uint64_t sequence) {
+        return logs[leader(sequence)].Executions(sequence, "build_proposal");
+    };
+    const auto check = [&](const uint64_t sequence, const size_t proposed_builds) {
+        BOOST_CHECK_GE(proposed_builds, 1U);
+        BOOST_CHECK_EQUAL(builds(sequence), proposed_builds);
+        for (size_t i{0}; i < f.runtimes.size(); ++i) {
+            BOOST_TEST_CONTEXT("node " << i << " sequence " << sequence) {
+                if (i != leader(sequence)) BOOST_CHECK_EQUAL(logs[i].Executions(sequence, "build_proposal"), 0U);
+                BOOST_CHECK_EQUAL(logs[i].Executions(sequence, "evaluate_candidate"), 1U);
+            }
+        }
+    };
+    const auto steps = [&](const size_t count) { for (size_t i{0}; i < count; ++i) f.Step(); };
+
+    // Genesis: proposal and prepares, with every COMMIT held so the slot keeps
+    // re-validating through four seconds of retries and re-sent votes.
+    steps(80);
+    BOOST_REQUIRE_GT(f.prepares.load(), 0U);
+    BOOST_REQUIRE(f.AllAt(0));
+    BOOST_CHECK_EQUAL(builds(0), 1U);
+    check(0, 1);
+    f.block_commits = false;
+    BOOST_REQUIRE(f.StepUntil(1, std::chrono::seconds{10}));
+    steps(20);
+    BOOST_REQUIRE_GT(f.decisions.load(), 0U);
+    check(0, 1);
+
+    // An action-bearing slot re-authenticates its evidence on every call but
+    // still executes the entry once per node, plus the leader's build.
+    f.block_commits = true;
+    for (const auto& runtime : f.runtimes) {
+        BOOST_REQUIRE(runtime->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    }
+    steps(10);
+    BOOST_REQUIRE_GT(logs[leader(1)].Executions(1, "evaluate_candidate"), 0U);
+    const size_t proposed{builds(1)};
+    steps(70);
+    BOOST_REQUIRE(f.AllAt(1));
+    check(1, proposed);
+    f.block_commits = false;
+    BOOST_REQUIRE(f.StepUntil(2, std::chrono::seconds{10}));
+    steps(20);
+    check(1, proposed);
+    for (const auto& runtime : f.runtimes) {
+        BOOST_CHECK_EQUAL(runtime->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 250);
+    }
+}
+
+// Every context change that execution depends on forces exactly one fresh
+// execution, after which the refreshed result is reused again.
+BOOST_AUTO_TEST_CASE(preagreement_candidate_reexecutes_after_generation_or_tip_change)
+{
+    std::array<ExecutionLog, 4> logs;
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_execution_context",
+                                 std::chrono::seconds{60}, 1, true};
+    f.after_drain = [&] {
+        for (size_t i{0}; i < f.runtimes.size(); ++i) logs[i].Sample(*f.runtimes[i], f.market);
+    };
+    const auto evaluated = [&](const size_t i) { return logs[i].Executions(0, "evaluate_candidate"); };
+    const auto steps = [&](const size_t count) { for (size_t i{0}; i < count; ++i) f.Step(); };
+    steps(40);
+    BOOST_REQUIRE(f.AllAt(0));
+    for (size_t i{0}; i < f.runtimes.size(); ++i) BOOST_REQUIRE_EQUAL(evaluated(i), 1U);
+
+    // A reconciliation that started and ended while node 1 was idle.
+    f.chains[1].BumpDeliveryGeneration();
+    steps(60);
+    BOOST_CHECK_EQUAL(evaluated(0), 1U);
+    BOOST_CHECK_EQUAL(evaluated(1), 2U);
+    BOOST_CHECK_EQUAL(evaluated(2), 1U);
+    BOOST_CHECK_EQUAL(evaluated(3), 1U);
+
+    // A new B3 tip on node 2.
+    f.chains[2].SetTipHeight(f.chains[2].TipHeight() + 1);
+    steps(60);
+    BOOST_CHECK_EQUAL(evaluated(1), 2U);
+    BOOST_CHECK_EQUAL(evaluated(2), 2U);
+
+    // Both at once on node 3 still cost one execution.
+    f.chains[3].BumpDeliveryGeneration();
+    f.chains[3].SetTipHeight(f.chains[3].TipHeight() + 1);
+    steps(60);
+    BOOST_CHECK_EQUAL(evaluated(0), 1U);
+    BOOST_CHECK_EQUAL(evaluated(1), 2U);
+    BOOST_CHECK_EQUAL(evaluated(2), 2U);
+    BOOST_CHECK_EQUAL(evaluated(3), 2U);
+
+    // The refreshed candidates decide, certify and apply the same entry.
+    f.block_commits = false;
+    BOOST_REQUIRE(f.StepUntil(1, std::chrono::seconds{10}));
+    steps(20);
+    for (size_t i{0}; i < f.runtimes.size(); ++i) {
+        BOOST_CHECK_EQUAL(evaluated(i), i == 0 ? 1U : 2U);
+        BOOST_CHECK(f.runtimes[i]->MarketStatus(f.market)->last_microblock_hash ==
+                    f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash);
+    }
+}
+
+// A retained, already executed candidate must not be locked or attested while
+// the seat transition is PAUSED, even when its execution context is unchanged
+// and a complete COMMIT quorum and DECISION arrive. The transition kind is a
+// live gate, not part of the reusable execution result.
+BOOST_AUTO_TEST_CASE(preagreement_decided_candidate_not_attested_while_transition_paused)
+{
+    std::array<std::atomic<size_t>, 4> attestations{};
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_paused_reuse", std::chrono::seconds{60}};
+    f.network.SetFilter([&](const size_t from, size_t, const flowmesh::WireMessage& wire) {
+        if (wire.kind == flowmesh::WireMessageKind::ATTESTATION) ++attestations.at(from);
+        return f.Observe(wire);
+    });
+    std::string error;
+    // Every node executes and retains the genesis candidate under CONTINUE.
+    f.Tick();
+    BOOST_REQUIRE_GT(f.commits.load(), 0U);
+    BOOST_REQUIRE(f.AllAt(0));
+
+    // Two seats pause. The other two can decide but cannot certify alone.
+    const std::array<size_t, 2> paused{2, 3};
+    for (const size_t i : paused) f.chains[i].SetTransition(f.market, node::FlowMeshSeatTransitionKind::PAUSED);
+    f.block_commits = false;
+    for (size_t pass{0}; pass < 4; ++pass) f.Tick(std::chrono::seconds{1});
+    BOOST_REQUIRE_GT(f.decisions.load(), 0U);
+    BOOST_REQUIRE(f.AllAt(0));
+    for (size_t i{0}; i < f.runtimes.size(); ++i) {
+        BOOST_TEST_CONTEXT("node " << i) {
+            const bool is_paused{i == paused[0] || i == paused[1]};
+            std::optional<uint256> lock;
+            BOOST_REQUIRE(f.stores[i]->ReadLock({0, 0}, lock, error));
+            BOOST_CHECK_EQUAL(lock.has_value(), !is_paused);
+            BOOST_CHECK_EQUAL(attestations[i].load() > 0, !is_paused);
+        }
+    }
+
+    // Once the transition continues, the same retained candidate completes.
+    for (const size_t i : paused) f.chains[i].SetTransition(f.market, node::FlowMeshSeatTransitionKind::CONTINUE);
+    f.Reach(1);
+    const auto genesis{f.runtimes[0]->MarketStatus(f.market)->last_microblock_hash};
+    for (size_t i{0}; i < f.runtimes.size(); ++i) {
+        std::optional<uint256> lock;
+        BOOST_REQUIRE(f.stores[i]->ReadLock({0, 0}, lock, error));
+        BOOST_REQUIRE(lock);
+        BOOST_CHECK(*lock == genesis);
+        BOOST_CHECK(f.runtimes[i]->MarketStatus(f.market)->last_microblock_hash == genesis);
+    }
+    for (const size_t i : paused) BOOST_CHECK_GT(attestations[i].load(), 0U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -484,6 +484,19 @@ struct FlowMeshRuntime::Market {
             uint32_t round, seat;
             std::array<unsigned char, bls::SIGNATURE_SIZE> signature;
         };
+        // Every runtime input an entry's execution reads that its own header
+        // does not already pin. Entry identity fixes domain/market/epoch/
+        // seat set/sequence/parent/previous state root, and those are
+        // re-checked live on every evaluation; these are the remainder.
+        struct ExecutionStamp {
+            uint64_t delivery_generation{0};
+            int32_t tip_height{0};
+            std::optional<flowmesh::AnchorRef> previous_anchor{};
+            uint64_t next_effect_index{0};
+            uint256 treasury_owner_commitment;
+            uint256 execution_config_id;
+            bool operator==(const ExecutionStamp&) const = default;
+        };
         flowmesh::ProductionEntryCore entry;
         flowmesh::FlowMeshState next_state;
         std::optional<flowmesh::ActiveFnBlsSeatSet> next_seats;
@@ -498,6 +511,8 @@ struct FlowMeshRuntime::Market {
         std::optional<ProposalProof> relay_proof{};
         std::set<uint32_t> local_signers{};
         bool certificate_formed{false};
+        // Context this candidate's retained next_state was produced under.
+        std::optional<ExecutionStamp> execution_stamp{};
     };
     struct EvidenceRetry {
         uint256 candidate_hash;
@@ -1243,13 +1258,18 @@ bool RefreshMarker(Market& market)
     return RecheckAnchors(market);
 }
 
+// The live gates every candidate must clear before it is accepted, retained
+// or signed. These read current runtime and chain state, so they are repeated
+// on every evaluation and are never memoized. They include the transition
+// kind the entry needs: an execution only while the seat transition says
+// CONTINUE, and a handoff only to the exact next seat set the transition
+// names. A PAUSED transition therefore never passes, whether or not the
+// entry is then executed again.
 template <typename Market>
-std::unique_ptr<typename Market::Candidate> EvaluateCandidate(
+std::optional<FlowMeshSeatTransition> CandidateGates(
     Market& market, const flowmesh::ProductionEntryCore& entry,
     const std::vector<flowmesh::Action>* authenticated_evidence)
 {
-    BenchSpan trace{market, "candidate_evaluation_completed", flowmesh::WireMessageKind::PROPOSAL,
-                    uint256{}, entry.sequence};
     if (market.halt != FlowMeshRuntimeHalt::NONE || market.pending_handoff ||
         entry.domain != market.domain || entry.market_id != market.market_id ||
         entry.epoch != market.seats.epoch ||
@@ -1259,20 +1279,61 @@ std::unique_ptr<typename Market::Candidate> EvaluateCandidate(
         entry.previous_state_root != market.state.Root() ||
         !flowmesh::ProductionWireHeaderMatches(HeaderFor(entry), entry) ||
         !market.chain->Acceptable(entry.anchor) || !RecheckAnchors(market)) {
-        return nullptr;
+        return std::nullopt;
     }
     const auto transition{CurrentSeatTransition(market)};
-    if (!transition) return nullptr;
+    if (!transition) return std::nullopt;
     if (authenticated_evidence != nullptr) {
         BenchSpan authentication{market, "candidate_evidence_authentication_completed",
                                 flowmesh::WireMessageKind::PROPOSAL, uint256{}, entry.sequence};
-        if (!AuthenticateCandidateEvidence(market, entry, *authenticated_evidence)) return nullptr;
+        if (!AuthenticateCandidateEvidence(market, entry, *authenticated_evidence)) return std::nullopt;
     }
-
-    const auto anchors{AnchorContext(market)};
     if (entry.kind == static_cast<uint8_t>(
                           flowmesh::ProductionEntryKind::EXECUTION)) {
         if (transition->kind != FlowMeshSeatTransitionKind::CONTINUE) {
+            return std::nullopt;
+        }
+    } else if (entry.kind != static_cast<uint8_t>(
+                                 flowmesh::ProductionEntryKind::EPOCH_HANDOFF) ||
+               transition->kind != FlowMeshSeatTransitionKind::HANDOFF ||
+               !transition->next_seats ||
+               transition->next_seats->epoch != entry.next_epoch ||
+               transition->next_seats->set_hash != entry.next_seat_set_hash) {
+        return std::nullopt;
+    }
+    return transition;
+}
+
+// Sample the execution inputs that entry identity does not pin. A retained
+// candidate may only be reused while every one of these is unchanged.
+template <typename Market>
+typename Market::Candidate::ExecutionStamp CandidateExecutionStamp(
+    const Market& market)
+{
+    return typename Market::Candidate::ExecutionStamp{
+        market.chain->DeliveryGeneration(), market.chain->TipHeight(),
+        market.previous_anchor, market.next_effect_index,
+        market.treasury_owner_commitment, market.state.ConfigId()};
+}
+
+// Execute an entry whose live gates, including its transition kind, have just
+// passed with `transition`. Callers must run CandidateGates first; this never
+// repeats them.
+template <typename Market>
+std::unique_ptr<typename Market::Candidate> ExecuteCandidate(
+    Market& market, const flowmesh::ProductionEntryCore& entry,
+    const FlowMeshSeatTransition& transition,
+    const std::vector<flowmesh::Action>* authenticated_evidence)
+{
+    // Sampled before execution: a candidate is only ever reusable when none
+    // of these moved while it was being produced.
+    const auto stamp{CandidateExecutionStamp(market)};
+    const auto anchors{AnchorContext(market)};
+    if (entry.kind == static_cast<uint8_t>(
+                          flowmesh::ProductionEntryKind::EXECUTION)) {
+        // Already required by CandidateGates; kept so this helper can never
+        // execute under a transition that does not allow it.
+        if (transition.kind != FlowMeshSeatTransitionKind::CONTINUE) {
             return nullptr;
         }
         flowmesh::ProductionEpochGate gate{market.domain, market.market_id,
@@ -1289,35 +1350,54 @@ std::unique_ptr<typename Market::Candidate> EvaluateCandidate(
                       flowmesh::WireMessageKind::PROPOSAL, entry.GetHash(), entry.sequence,
                       std::nullopt, flowmesh::ProductionEntryCheckName(check));
         if (!executed) return nullptr;
-        return std::make_unique<typename Market::Candidate>(
+        auto candidate{std::make_unique<typename Market::Candidate>(
             typename Market::Candidate{entry, executed->next_state,
                                        std::nullopt,
                                        authenticated_evidence
                                            ? *authenticated_evidence
-                                           : std::vector<flowmesh::Action>{}});
+                                           : std::vector<flowmesh::Action>{}})};
+        if (CandidateExecutionStamp(market) == stamp) {
+            candidate->execution_stamp = stamp;
+        }
+        return candidate;
     }
+    // CandidateGates admitted only a handoff to exactly these next seats.
     if (entry.kind != static_cast<uint8_t>(
-                          flowmesh::ProductionEntryKind::EPOCH_HANDOFF)) {
+                          flowmesh::ProductionEntryKind::EPOCH_HANDOFF) ||
+        transition.kind != FlowMeshSeatTransitionKind::HANDOFF ||
+        !transition.next_seats ||
+        transition.next_seats->epoch != entry.next_epoch ||
+        transition.next_seats->set_hash != entry.next_seat_set_hash) {
         return nullptr;
     }
-    if (transition->kind != FlowMeshSeatTransitionKind::HANDOFF ||
-        !transition->next_seats ||
-        transition->next_seats->epoch != entry.next_epoch ||
-        transition->next_seats->set_hash != entry.next_seat_set_hash) {
-        return nullptr;
-    }
-    const auto& next{*transition->next_seats};
+    const auto& next{*transition.next_seats};
     flowmesh::ProductionEntryCheck check;
     const auto expected{flowmesh::BuildProductionHandoffEntry(
         market.state, market.domain, market.market_id, market.seats, next,
         market.next_sequence, market.next_effect_index, market.last_hash,
         entry.anchor, anchors, check)};
     if (!expected || expected->GetHash() != entry.GetHash()) return nullptr;
-    return std::make_unique<typename Market::Candidate>(
+    auto candidate{std::make_unique<typename Market::Candidate>(
         typename Market::Candidate{entry, market.state, next,
                                    authenticated_evidence
                                        ? *authenticated_evidence
-                                       : std::vector<flowmesh::Action>{}});
+                                       : std::vector<flowmesh::Action>{}})};
+    if (CandidateExecutionStamp(market) == stamp) {
+        candidate->execution_stamp = stamp;
+    }
+    return candidate;
+}
+
+template <typename Market>
+std::unique_ptr<typename Market::Candidate> EvaluateCandidate(
+    Market& market, const flowmesh::ProductionEntryCore& entry,
+    const std::vector<flowmesh::Action>* authenticated_evidence)
+{
+    BenchSpan trace{market, "candidate_evaluation_completed", flowmesh::WireMessageKind::PROPOSAL,
+                    uint256{}, entry.sequence};
+    const auto transition{CandidateGates(market, entry, authenticated_evidence)};
+    if (!transition) return nullptr;
+    return ExecuteCandidate(market, entry, *transition, authenticated_evidence);
 }
 
 template <typename Market>
@@ -1382,11 +1462,42 @@ std::optional<std::vector<unsigned char>> ValidateAgreementCandidate(
         if (cached != market.candidates.end()) evidence = cached->second.evidence;
     }
     if (!evidence) return std::nullopt;
-    auto candidate{EvaluateCandidate(market, *entry, &*evidence)};
-    if (!candidate) return std::nullopt;
+    const auto hash{entry->GetHash()};
+    // The agreement engine re-validates the decided candidate for every
+    // message of the slot, and discards the result whenever this exact entry
+    // is already materialized. Execution is deterministic in the entry plus
+    // the stamped runtime inputs, so run every live gate once (including the
+    // transition kind), then reuse the retained result instead of executing
+    // the same entry again. The stamp is compared only after the gates have
+    // passed. Nothing is ever reused across a changed stamp, and no negative
+    // result is retained.
+    // Evidence is not an execution input: ExecuteProductionEntry reads the
+    // entry, and AuthenticateCandidateEvidence has already pinned every
+    // supplied action to entry.actions apart from its own credential. The
+    // retained candidate therefore keeps its own evidence exactly as the
+    // existing try_emplace already did.
+    std::unique_ptr<typename Market::Candidate> candidate;
+    {
+        BenchSpan evaluation{market, "candidate_evaluation_completed", flowmesh::WireMessageKind::PROPOSAL,
+                             uint256{}, entry->sequence};
+        const auto transition{CandidateGates(market, *entry, &*evidence)};
+        if (!transition) return std::nullopt;
+        const auto retained{market.candidates.find(hash)};
+        const bool reusable{
+            retained != market.candidates.end() &&
+            retained->second.execution_stamp &&
+            *retained->second.execution_stamp == CandidateExecutionStamp(market)};
+        if (reusable) {
+            BenchSpan reuse{market, "candidate_evaluation_reused", flowmesh::WireMessageKind::AGREEMENT,
+                            uint256{}, entry->sequence};
+        } else {
+            candidate = ExecuteCandidate(market, *entry, *transition, &*evidence);
+            if (!candidate) return std::nullopt;
+        }
+    }
     BenchSpan materialization{market, "agreement_candidate_materialization_completed",
                              flowmesh::WireMessageKind::AGREEMENT, uint256{}, entry->sequence};
-    if (!market.candidates.contains(entry->GetHash()) &&
+    if (!market.candidates.contains(hash) &&
         market.candidates.size() >= MAX_RUNTIME_CANDIDATES_PER_SEQUENCE) return std::nullopt;
     DataStream encoded;
     WriteCompactSize(encoded, evidence->size());
@@ -1397,8 +1508,19 @@ std::optional<std::vector<unsigned char>> ValidateAgreementCandidate(
         WriteCompactSize(encoded, payload->size());
         encoded.write(std::as_bytes(std::span{*payload}));
     }
-    const auto hash{entry->GetHash()};
-    market.candidates.try_emplace(hash, std::move(*candidate));
+    if (candidate) {
+        // A fresh execution of an already retained entry refreshes only that
+        // candidate's stamp. Its evidence, local signers, relay proof and
+        // certificate state stay as they are, and its next_state is the same
+        // because the entry pins the resulting state root. The stamp is
+        // copied even when it is empty (an input moved while executing), so
+        // the next call executes again. A locally built proposal is never
+        // stamped when it is built: its first independent execution here is
+        // what stamps it, so the leader still verifies what it proposes.
+        const auto stamp{candidate->execution_stamp};
+        auto [it, inserted]{market.candidates.try_emplace(hash, std::move(*candidate))};
+        if (!inserted) it->second.execution_stamp = stamp;
+    }
     if (!evidence->empty() && (!market.evidence_retry || market.evidence_retry->candidate_hash != hash)) {
         market.evidence_retry = typename Market::EvidenceRetry{hash, 0, market.clock->Now()};
     }
