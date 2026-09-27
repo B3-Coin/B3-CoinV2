@@ -16,6 +16,13 @@
 
 namespace node {
 
+/** FlowMeshHttpsServer::Options defaults. The client keeps connection reuse
+ * strictly inside them, so it never sends into a connection that the server
+ * is closing for idleness or age. */
+inline constexpr std::chrono::seconds FLOWMESH_HTTPS_DEFAULT_REQUEST_TIMEOUT{10};
+inline constexpr std::chrono::seconds FLOWMESH_HTTPS_DEFAULT_IDLE_TIMEOUT{30};
+inline constexpr std::chrono::minutes FLOWMESH_HTTPS_DEFAULT_CONNECTION_LIFETIME{5};
+
 struct HttpsEndpoint {
     /** An HTTPS origin, optionally ending in /flowmesh/v1. No userinfo,
      * query, fragment, redirect, or plaintext fallback is supported. */
@@ -102,12 +109,12 @@ public:
         size_t max_connections{64};
         size_t worker_threads{2};
         size_t max_queue{32};
-        std::chrono::milliseconds request_timeout{std::chrono::seconds{10}};
+        std::chrono::milliseconds request_timeout{FLOWMESH_HTTPS_DEFAULT_REQUEST_TIMEOUT};
         /** Sequential HTTP/1.1 reuse only. Idle connections remain within
          * max_connections, and do not occupy handler workers. */
         bool keep_alive{true};
-        std::chrono::milliseconds idle_timeout{std::chrono::seconds{30}};
-        std::chrono::milliseconds connection_lifetime{std::chrono::minutes{5}};
+        std::chrono::milliseconds idle_timeout{FLOWMESH_HTTPS_DEFAULT_IDLE_TIMEOUT};
+        std::chrono::milliseconds connection_lifetime{FLOWMESH_HTTPS_DEFAULT_CONNECTION_LIFETIME};
         size_t max_requests_per_connection{128};
     };
     struct Request {

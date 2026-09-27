@@ -612,9 +612,17 @@ bool NormalizeFlowMeshHttpsEndpoint(HttpsEndpoint& endpoint, std::string& error)
 }
 
 struct FlowMeshHttpsClient::Impl {
-    static constexpr auto MAX_IDLE{std::chrono::seconds{30}};
-    static constexpr auto MAX_AGE{std::chrono::minutes{5}};
+    // Reuse ends strictly before the default server limits, so a warm request
+    // (reported as possibly sent) is never written into a connection that the
+    // server is closing. The server's idle clock starts before the reply
+    // reaches the client, and near the end of its lifetime the server clips a
+    // request's deadline to that lifetime; the margins cover a round trip.
+    static constexpr auto MAX_IDLE{std::chrono::seconds{25}};
+    static constexpr auto MAX_AGE{std::chrono::seconds{285}};
     static constexpr size_t MAX_REQUESTS{100};
+    static_assert(MAX_IDLE + std::chrono::seconds{5} <= FLOWMESH_HTTPS_DEFAULT_IDLE_TIMEOUT);
+    static_assert(MAX_AGE + FLOWMESH_HTTPS_DEFAULT_REQUEST_TIMEOUT + std::chrono::seconds{5} <=
+                  FLOWMESH_HTTPS_DEFAULT_CONNECTION_LIFETIME);
     const bool keep_alive;
     ClientSession session;
     HttpsEndpoint endpoint;
