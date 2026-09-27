@@ -1280,23 +1280,26 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 if (p.market != id || p.action.IsDeposit() || p.action.signer != *account) continue;
                 using Kind = FlowMeshJoinOwnAction::Kind;
                 if (p.receipt.certificate_verified && p.receipt.state == "certified_inclusion") {
-                    own.push_back({Kind::CERTIFIED, p.receipt.microblock_sequence});
+                    own.push_back({Kind::CERTIFIED, p.receipt.microblock_sequence, p.action.sequence});
                 } else if (p.previously_certified) {
                     // Certified before a restart, or its proof is being
-                    // renewed: where it was included is not known here.
-                    own.push_back({Kind::CERTIFIED, std::nullopt});
+                    // renewed: where it was included is not known here. It
+                    // may join only if the cached state already consumed its
+                    // sequence.
+                    own.push_back({Kind::CERTIFIED, std::nullopt, p.action.sequence});
                 } else if (p.receipt.state == "rejected") {
                     // Send and QueryAction keep a refusal after any possible
                     // earlier delivery as unknown, so this is definite.
-                    own.push_back({Kind::DEFINITE_REJECTED, std::nullopt});
+                    own.push_back({Kind::DEFINITE_REJECTED, std::nullopt, p.action.sequence});
                 } else {
-                    own.push_back({Kind::UNRESOLVED, std::nullopt});
+                    own.push_back({Kind::UNRESOLVED, std::nullopt, p.action.sequence});
                 }
             }
+            const auto next_account_sequence{cache.verified.state.NextSequence(*account)};
             const auto allowed = [&] {
                 return FlowMeshCanJoinFreshPreflight(std::chrono::steady_clock::now(), cache.fresh->first, cache.fresh->second,
-                                                     cache.verified.certified.entry.sequence, m_own_certified_through.Through(id),
-                                                     own, m_join_windows);
+                                                     cache.verified.certified.entry.sequence, next_account_sequence,
+                                                     m_own_certified_through.Through(id), own, m_join_windows);
             };
             // Local refusals first (usually a stamp outside the window): a
             // refused join is followed by Refresh, which runs CheckCache.

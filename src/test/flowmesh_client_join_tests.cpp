@@ -18,15 +18,18 @@ using Kind = node::FlowMeshJoinOwnAction::Kind;
 using Windows = node::FlowMeshJoinWindows;
 using namespace std::chrono_literals;
 
-// A refresh started at T0 and validated 20 ms later; the cached entry is 10.
+// A refresh started at T0 and validated 20 ms later; the cached entry is 10
+// and the cached state's next sequence for the signing account is 7.
 const Clock::time_point T0{Clock::time_point{} + 1h};
 const Clock::time_point VALIDATED{T0 + 20ms};
 constexpr uint64_t ENTRY{10};
+constexpr uint64_t NEXT{7};
 
 bool Join(Clock::time_point now, std::vector<Own> own = {}, std::optional<uint64_t> through = std::nullopt,
-          Clock::time_point started = T0, Clock::time_point validated = VALIDATED, const Windows& windows = {})
+          Clock::time_point started = T0, Clock::time_point validated = VALIDATED, const Windows& windows = {},
+          uint64_t next = NEXT)
 {
-    return node::FlowMeshCanJoinFreshPreflight(now, started, validated, ENTRY, through, own, windows);
+    return node::FlowMeshCanJoinFreshPreflight(now, started, validated, ENTRY, next, through, own, windows);
 }
 
 uint256 Market(unsigned char value)
@@ -85,10 +88,43 @@ BOOST_AUTO_TEST_CASE(join_rejects_certified_own_action_not_reflected)
     BOOST_CHECK(Join(VALIDATED, {Own{Kind::CERTIFIED, ENTRY - 1}}));
 }
 
-BOOST_AUTO_TEST_CASE(join_rejects_previously_certified_with_unknown_microblock)
+BOOST_AUTO_TEST_CASE(join_rejects_previously_certified_not_yet_consumed)
 {
     // Certified before a restart: where it was included is not known here.
-    BOOST_CHECK(!Join(VALIDATED, {Own{Kind::CERTIFIED, std::nullopt}}));
+    // A sequence the cached state has not consumed may take effect later.
+    BOOST_CHECK(!Join(VALIDATED, {Own{Kind::CERTIFIED, std::nullopt, NEXT}}));
+    BOOST_CHECK(!Join(VALIDATED, {Own{Kind::CERTIFIED, std::nullopt, NEXT + 1}}));
+    // An account the cached state has never seen has consumed nothing.
+    BOOST_CHECK(!Join(VALIDATED, {Own{Kind::CERTIFIED, std::nullopt, 0}}, std::nullopt, T0, VALIDATED, {}, 0));
+}
+
+BOOST_AUTO_TEST_CASE(join_accepts_previously_certified_already_consumed)
+{
+    // Its sequence is below the cached next sequence: it took effect at or
+    // before the cached entry, or is refused as stale wherever it landed.
+    BOOST_CHECK(Join(VALIDATED, {Own{Kind::CERTIFIED, std::nullopt, NEXT - 1}}));
+    BOOST_CHECK(Join(VALIDATED, {Own{Kind::CERTIFIED, std::nullopt, 0}}));
+    BOOST_CHECK(Join(VALIDATED, {Own{Kind::CERTIFIED, std::nullopt, 0}, Own{Kind::CERTIFIED, std::nullopt, NEXT - 1},
+                                 Own{Kind::CERTIFIED, ENTRY, NEXT - 1}, Own{Kind::DEFINITE_REJECTED, std::nullopt, NEXT}}));
+    // Edge: one below versus equal to the next sequence.
+    BOOST_CHECK(Join(VALIDATED, {Own{Kind::CERTIFIED, std::nullopt, 41}}, std::nullopt, T0, VALIDATED, {}, 42));
+    BOOST_CHECK(!Join(VALIDATED, {Own{Kind::CERTIFIED, std::nullopt, 42}}, std::nullopt, T0, VALIDATED, {}, 42));
+    // One not-yet-consumed row still refuses the whole join.
+    BOOST_CHECK(!Join(VALIDATED, {Own{Kind::CERTIFIED, std::nullopt, 0}, Own{Kind::CERTIFIED, std::nullopt, NEXT}}));
+}
+
+BOOST_AUTO_TEST_CASE(join_sequence_rule_applies_only_to_unknown_microblock)
+{
+    // A known microblock after the cached entry refuses even with a consumed
+    // sequence, and a known one at or before it joins even when not consumed.
+    BOOST_CHECK(!Join(VALIDATED, {Own{Kind::CERTIFIED, ENTRY + 1, 0}}));
+    BOOST_CHECK(Join(VALIDATED, {Own{Kind::CERTIFIED, ENTRY, NEXT + 5}}));
+    // Unresolved actions refuse whatever their sequence.
+    BOOST_CHECK(!Join(VALIDATED, {Own{Kind::UNRESOLVED, std::nullopt, 0}}));
+    BOOST_CHECK(!Join(VALIDATED, {Own{Kind::CERTIFIED, std::nullopt, 0}, Own{Kind::UNRESOLVED, std::nullopt, 0}}));
+    // The windows and the own high-water still apply to a consumed row.
+    BOOST_CHECK(!Join(VALIDATED + 51ms, {Own{Kind::CERTIFIED, std::nullopt, 0}}));
+    BOOST_CHECK(!Join(VALIDATED, {Own{Kind::CERTIFIED, std::nullopt, 0}}, ENTRY + 1));
 }
 
 BOOST_AUTO_TEST_CASE(join_accepts_definite_rejected_and_reflected_certified)
@@ -109,7 +145,7 @@ BOOST_AUTO_TEST_CASE(join_refuses_after_certified_own_action_was_evicted)
     BOOST_CHECK(!through.Through(Market(2)));
     // A refresh stamped before that inclusion (entry 10) is not joinable.
     BOOST_CHECK(!Join(VALIDATED, {}, through.Through(Market(1))));
-    BOOST_CHECK(node::FlowMeshCanJoinFreshPreflight(VALIDATED, T0, VALIDATED, 12, through.Through(Market(1)), {}));
+    BOOST_CHECK(node::FlowMeshCanJoinFreshPreflight(VALIDATED, T0, VALIDATED, 12, NEXT, through.Through(Market(1)), {}));
     // Another market is unaffected.
     BOOST_CHECK(Join(VALIDATED, {}, through.Through(Market(2))));
 }

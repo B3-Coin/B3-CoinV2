@@ -43,6 +43,9 @@ struct FlowMeshJoinOwnAction {
     //! Certified microblock, when this process verified it. Unknown for an
     //! action certified before a restart.
     std::optional<uint64_t> microblock_sequence;
+    //! The signed action's account sequence. Read only for a CERTIFIED
+    //! action whose microblock is unknown.
+    uint64_t sequence{0};
 };
 
 /** Pure join predicate. A join is allowed only when
@@ -52,13 +55,20 @@ struct FlowMeshJoinOwnAction {
  *   certify one of its own actions on this market (own_certified_through),
  *   including actions already evicted from the retained map;
  * - no own action is unresolved; and every certified own action is known to
- *   be included at or before the cached entry.
+ *   be reflected in the cached state: its microblock is at or before the
+ *   cached entry, or, when its microblock is unknown (certified before a
+ *   restart), its account sequence is below the cached state's next sequence
+ *   for the account (cached_next_account_sequence). Such a sequence is
+ *   already consumed in the cached state and account sequences only advance,
+ *   so the action either took effect at or before the cached entry or is
+ *   refused as a stale sequence wherever it was included.
  * Anything else falls back to the ordinary refresh, so a join never yields
  * an older own account state than that refresh would. */
 inline bool FlowMeshCanJoinFreshPreflight(std::chrono::steady_clock::time_point now,
                                           std::chrono::steady_clock::time_point started,
                                           std::chrono::steady_clock::time_point validated,
                                           uint64_t cached_entry_sequence,
+                                          uint64_t cached_next_account_sequence,
                                           std::optional<uint64_t> own_certified_through,
                                           std::span<const FlowMeshJoinOwnAction> own,
                                           const FlowMeshJoinWindows& windows = {})
@@ -68,8 +78,12 @@ inline bool FlowMeshCanJoinFreshPreflight(std::chrono::steady_clock::time_point 
     if (own_certified_through && cached_entry_sequence < *own_certified_through) return false;
     for (const auto& action : own) {
         if (action.kind == FlowMeshJoinOwnAction::Kind::UNRESOLVED) return false;
-        if (action.kind == FlowMeshJoinOwnAction::Kind::CERTIFIED &&
-            (!action.microblock_sequence || *action.microblock_sequence > cached_entry_sequence)) return false;
+        if (action.kind != FlowMeshJoinOwnAction::Kind::CERTIFIED) continue;
+        if (action.microblock_sequence) {
+            if (*action.microblock_sequence > cached_entry_sequence) return false;
+        } else if (action.sequence >= cached_next_account_sequence) {
+            return false;
+        }
     }
     return true;
 }

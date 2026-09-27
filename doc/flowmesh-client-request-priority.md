@@ -113,8 +113,14 @@ A join is allowed only when all of these hold (`src/node/flowmesh_client_join.h`
   verified one of its own inclusions on the market, a volatile per-market mark
   that survives eviction of certified actions from the outbox;
 - the account has no unresolved retained action on the market, and every
-  certified one is known to be included at or before the cached entry (an
-  action certified before a restart refuses the join).
+  certified one is known to be reflected in the cached state: included at or
+  before the cached entry or, for an action certified before a restart (its
+  microblock is not known), signed with an account sequence below the cached
+  state's next sequence for the account. That sequence is already consumed in
+  the cached state and sequences only advance, so such an action either took
+  effect at or before the cached entry or is refused as stale wherever it was
+  included. A restored action whose sequence is not yet consumed refuses the
+  join.
 
 Otherwise the preflight refreshes as before. A join therefore never produces an
 older own account sequence than the refresh would, and it only removes a
