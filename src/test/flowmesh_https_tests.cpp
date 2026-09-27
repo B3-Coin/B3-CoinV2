@@ -4,6 +4,7 @@
 
 #include <node/flowmesh_https.h>
 #include <node/flowmesh_client.h>
+#include <node/flowmesh_client_action_wait.h>
 #include <node/flowmesh_service.h>
 #include <crypto/sha256.h>
 #include <dbwrapper.h>
@@ -1980,6 +1981,48 @@ BOOST_AUTO_TEST_CASE(client_saved_view_reflects_completed_method)
     BOOST_CHECK(client->SavedActions(uint256::ONE, market).empty());
 }
 
+BOOST_AUTO_TEST_CASE(client_waited_status_of_a_restored_action_takes_the_ordinary_path)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 market{uint256::ONE};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{SeedRetainedAction(path, market, owner)};
+    std::atomic<unsigned int> requests{0}, waited{0};
+    // Advertises the wait on every discovery row, but no market exists on the
+    // local chain, so no action read may reach it.
+    node::FlowMeshHttpsServer server{Options(), [&](const node::FlowMeshHttpsServer::Request& request) {
+        ++requests;
+        if (request.body.find("wait_ms") != std::string::npos) ++waited;
+        return node::FlowMeshHttpsServer::Response{200, R"({"ok":true,"result":[],"error":""})"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server)}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    // The endpoint that acknowledged a delivery is volatile, so a restored
+    // action never waits. The ordinary read runs in the same call, with its
+    // local authority check before any network use and the same result.
+    const auto start{std::chrono::steady_clock::now()};
+    const auto receipt{client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000})};
+    BOOST_CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{1});
+    BOOST_CHECK_EQUAL(requests.load(), 0U);
+    BOOST_CHECK(!receipt.certificate_verified);
+    BOOST_CHECK_EQUAL(receipt.state, "unknown");
+    BOOST_CHECK(!receipt.reason.empty());
+    BOOST_CHECK(receipt.action_id == action.Id());
+    const auto ordinary{client->ActionStatus(market, action.Id(), false)};
+    BOOST_CHECK_EQUAL(ordinary.state, receipt.state);
+    BOOST_CHECK_EQUAL(ordinary.reason, receipt.reason);
+    const auto saved{client->SavedActions(owner, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+    BOOST_CHECK(saved[0].may_have_been_sent);
+    BOOST_CHECK(!saved[0].previously_certified);
+    BOOST_CHECK_EQUAL(saved[0].receipt.reason, receipt.reason);
+    BOOST_CHECK_EQUAL(requests.load(), 0U);
+    BOOST_CHECK_EQUAL(waited.load(), 0U);
+    server.Stop();
+}
+
 BOOST_AUTO_TEST_CASE(trading_api_action_wait_contract_and_untracked_actions)
 {
     // Not started: no runtime and no recorded action. The contract checks run
@@ -2007,6 +2050,8 @@ BOOST_AUTO_TEST_CASE(trading_api_action_wait_contract_and_untracked_actions)
         const auto [refused, rejection]{call(*api, ids + ",\"wait_ms\":500")};
         BOOST_CHECK_EQUAL(refused, 400);
         BOOST_CHECK_EQUAL(rejection["error"].get_str(), "Unknown or duplicate client API field");
+        // The error a client matches to withdraw a stale capability.
+        BOOST_CHECK_EQUAL(rejection["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
         api->Stop();
     }
     {

@@ -3,6 +3,7 @@
 #include <node/flowmesh_timing.h>
 #include <node/flowmesh_client.h>
 #include <node/flowmesh_action_wait.h>
+#include <node/flowmesh_client_action_wait.h>
 #include <node/flowmesh_client_join.h>
 #include <node/flowmesh_client_poll.h>
 #include <node/flowmesh_client_work.h>
@@ -57,6 +58,9 @@ constexpr size_t CLIENT_MAX_CACHED_MARKETS{8};
 constexpr size_t CLIENT_MAX_ACTIONS{512};
 constexpr size_t CLIENT_MAX_ENDPOINTS{8};
 constexpr auto CLIENT_REQUEST_TIMEOUT{std::chrono::seconds{5}};
+// A waited 'action' reply carries at most one hex certified entry.
+constexpr size_t CLIENT_ACTION_WAIT_MAX_REPLY{2 * (flowmesh::FLOWMESH_V1_MAX_MICROBLOCK_BYTES + 1024) + 64 * 1024};
+static_assert(CLIENT_ACTION_WAIT_MAX_REPLY <= CLIENT_MAX_REPLY);
 // A waited 'action' read ends at least this long before its HTTPS deadline,
 // leaving time to fetch the certified payload and write the reply.
 constexpr auto API_WAIT_REPLY_RESERVE{std::chrono::milliseconds{1000}};
@@ -224,7 +228,10 @@ public:
         if (out.state == "certified_inclusion") out.certificate_verified = true;
         return out;
     }
-    Receipt ActionStatus(const uint256& id, const uint256& action, bool retry) override
+    // The local engine's status is already current: there is no transport to
+    // hide, so a requested wait is ignored and the read returns immediately.
+    Receipt ActionStatus(const uint256& id, const uint256& action, bool retry,
+                         std::chrono::milliseconds wait = std::chrono::milliseconds{0}) override
     {
         auto out{LocalActionReceipt(m_service.ClientActionStatus(id, action), action)};
         if (retry) out.reason += "; local retry requires the retained original signed action";
@@ -593,6 +600,16 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // One TLS connection, owned exclusively under m_work. Reuse changes only
     // transport setup, not economic retry, state ownership or durability.
     FlowMeshHttpsClient m_https;
+    // Waited status reads use their own TLS connection so that m_work is not
+    // held across a server-side wait. m_wait_lane is only ever try-locked, and
+    // never while holding m_work; a busy lane means an ordinary status read.
+    std::mutex m_wait_lane;
+    FlowMeshHttpsClient m_wait_https;
+    // Set where m_https is reset; the lane revalidates trust before its next use.
+    std::atomic<bool> m_wait_reset{false};
+    // Per endpoint (index-stable, like m_retry_after), under m_work: the bounded
+    // 'action' wait each endpoint last advertised. Zero never sends wait_ms.
+    std::vector<std::chrono::milliseconds> m_action_wait;
     // Never acquire m_work from a wallet metadata lookup: it covers HTTPS.
     mutable std::mutex m_metadata_mutex;
     FlowMeshAssetMetadataCatalog m_metadata;
@@ -621,6 +638,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         std::optional<size_t> automatic_endpoint{};
         // Derived from the immutable bytes for saved-action rows; not durable.
         std::string signed_bytes_sha256{};
+        // Volatile: endpoint that acknowledged this process's latest delivery.
+        // Only a waited status read uses it; lost on restart.
+        std::optional<size_t> delivery_endpoint{};
     };
     std::map<std::pair<uint256, uint256>, Pending> m_pending;
     FlowMeshClientPollScheduler m_action_polls;
@@ -745,6 +765,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             old->second.ticker == metadata->ticker && old->second.source == metadata->source) return;
         m_metadata.insert_or_assign(pins.base_asset, std::move(*metadata));
         m_metadata_generation.fetch_add(1, std::memory_order_release);
+    }
+    // Latency hint from an authenticated status object, never evidence.
+    void LearnActionWait(const UniValue& status, size_t endpoint)
+    {
+        m_action_wait.at(endpoint) = FlowMeshAdvertisedActionWait(status);
     }
 
     void SyncIndexes() EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
@@ -1137,6 +1162,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             }
             SaveRestartState();
             LearnMetadata(value["status"], pins, endpoint);
+            LearnActionWait(value["status"], endpoint);
         });
     }
     enum class CacheCheck { CURRENT, SCOPE, CHECKPOINT, AUTHORITY, ANCHOR };
@@ -1225,6 +1251,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             // page boundary, and the next refresh resumes there.
             (void)Flag(value, "more");
             LearnMetadata(value["status"], cache.pins, endpoint);
+            LearnActionWait(value["status"], endpoint);
         });
         if (snapshot_needed) Snapshot(id, account);
         return done();
@@ -1345,6 +1372,30 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         }
         return pins;
     }
+    // Applies one endpoint's 'action' result to a retained action whose
+    // receipt is not verified. Certified inclusion requires a certificate
+    // valid under local B3 authority that agrees with the receipt; any other
+    // observation keeps a possibly delivered action unresolved. Throws before
+    // changing p when the result is unusable.
+    void ApplyActionResult(Pending& p, const flowmesh::ClientEvidencePins& pins, const UniValue& value, size_t endpoint)
+    {
+        auto receipt{ParseReceipt(value, p.action.Id(), endpoint)};
+        if (receipt.state == "certified_inclusion") {
+            const auto payload{Bytes(value, "certified_payload", flowmesh::FLOWMESH_V1_MAX_MICROBLOCK_BYTES + 1024)};
+            const auto proof{VerifyEntry(pins, payload)};
+            if (proof.entry.GetHash() != receipt.microblock_hash || proof.entry.sequence != receipt.microblock_sequence)
+                Fail("Action receipt and its certificate disagree");
+            Inclusion(p, proof, endpoint, payload);
+        } else if ((receipt.state == "rejected" || receipt.state == "unknown") && p.may_have_been_sent) {
+            // One node's rejection/absence cannot undo an earlier possible
+            // delivery. Preserve uncertainty, not a fresh nonce/order.
+            if (p.receipt.state != "queued" && p.receipt.state != "admitted") p.receipt.state = "unknown";
+            p.receipt.reason = "No verified inclusion yet; endpoint observation: " + receipt.state + ": " + receipt.reason;
+        } else {
+            p.receipt = std::move(receipt);
+        }
+        if (!p.owner_account.IsNull()) p.receipt.account_id = p.owner_account;
+    }
     Receipt QueryAction(Pending& p, bool automatic = false)
     {
         const auto pins{RecheckActionAuthority(p)};
@@ -1352,22 +1403,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (!automatic) p.automatic_endpoint.reset();
         UniValue params{UniValue::VOBJ}; params.pushKV("market_id", p.market.GetHex()); params.pushKV("action_id", p.action.Id().GetHex());
         Call("action", params, [&](const UniValue& value, size_t endpoint) {
-            auto receipt{ParseReceipt(value, p.action.Id(), endpoint)};
-            if (receipt.state == "certified_inclusion") {
-                const auto payload{Bytes(value, "certified_payload", flowmesh::FLOWMESH_V1_MAX_MICROBLOCK_BYTES + 1024)};
-                const auto proof{VerifyEntry(pins, payload)};
-                if (proof.entry.GetHash() != receipt.microblock_hash || proof.entry.sequence != receipt.microblock_sequence)
-                    Fail("Action receipt and its certificate disagree");
-                Inclusion(p, proof, endpoint, payload);
-            } else if ((receipt.state == "rejected" || receipt.state == "unknown") && p.may_have_been_sent) {
-                // One node's rejection/absence cannot undo an earlier possible
-                // delivery. Preserve uncertainty, not a fresh nonce/order.
-                if (p.receipt.state != "queued" && p.receipt.state != "admitted") p.receipt.state = "unknown";
-                p.receipt.reason = "No verified inclusion yet; endpoint observation: " + receipt.state + ": " + receipt.reason;
-            } else {
-                p.receipt = std::move(receipt);
-            }
-            if (!p.owner_account.IsNull()) p.receipt.account_id = p.owner_account;
+            ApplyActionResult(p, pins, value, endpoint);
         }, nullptr, nullptr, nullptr, automatic ? &p : nullptr);
         if (!p.receipt.certificate_verified) m_action_polls.MarkObserved({p.market, p.action.Id()});
         // A non-certifying observation changes only the receipt, which
@@ -1406,6 +1442,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                 if (receipt.state == "rejected" && (prior_possible || earlier_possible)) receipt.state = "unknown";
                 p.receipt = std::move(receipt);
                 if (!p.owner_account.IsNull()) p.receipt.account_id = p.owner_account;
+                p.delivery_endpoint = endpoint;
             }, &possible, &earlier_possible);
         } catch (const std::exception& e) {
             p.receipt.state = "unknown"; p.receipt.reason = e.what();
@@ -1415,6 +1452,125 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         // The write-ahead Save above already made the delivery flag durable;
         // this observation changes only the receipt.
         SaveRestartState(); return p.receipt;
+    }
+    // One waited 'action' read of an action this process delivered, sent on
+    // the lane connection to the endpoint that acknowledged the delivery and
+    // only if that endpoint advertises the wait. m_work is held to select the
+    // target and charge one automatic attempt, and again to apply the reply by
+    // QueryAction's rules, never across the network wait. It never sends or
+    // signs, and a receipt verified meanwhile is returned unchanged. nullopt
+    // means nothing was applied; the caller then takes the ordinary path.
+    std::optional<Receipt> WaitedActionStatus(const uint256& market, const uint256& action, std::chrono::milliseconds requested)
+    {
+        FlowMeshTimingSpan timing{"client_action_wait"};
+        timing.Field("market_id", market);
+        if (timing.Enabled()) timing.Field("action_id", action);
+        const auto outcome = [&](const char* result) { timing.Field("result", std::string{result}); };
+        std::unique_lock lane{m_wait_lane, std::try_to_lock};
+        if (!lane.owns_lock()) { outcome("lane_busy"); return std::nullopt; }
+        const std::pair key{market, action};
+        HttpsEndpoint target;
+        size_t endpoint{0};
+        std::chrono::milliseconds wait{0};
+        timing.Mark("select_lock_requested_us");
+        {
+            WorkLock lock{*this};
+            timing.Mark("select_lock_acquired_us");
+            const auto it{m_pending.find(key)};
+            if (it == m_pending.end()) { outcome("not_retained"); return std::nullopt; }
+            const auto& p{it->second};
+            wait = FlowMeshActionWaitFor({.requested = requested, .may_have_been_sent = p.may_have_been_sent,
+                .certificate_verified = p.receipt.certificate_verified, .previously_certified = p.previously_certified,
+                .rejected = p.receipt.state == "rejected", .delivery_endpoint_known = p.delivery_endpoint.has_value(),
+                .advertised = p.delivery_endpoint ? m_action_wait.at(*p.delivery_endpoint) : std::chrono::milliseconds{0}});
+            if (wait.count() == 0) { outcome("not_eligible"); return std::nullopt; }
+            try {
+                // QueryAction's local authority check, before any network use.
+                const auto pins{Pins(p.market)};
+                if (pins.domain != p.domain || pins.execution_config_id != p.config) { outcome("not_eligible"); return std::nullopt; }
+            } catch (const std::exception&) { outcome("not_eligible"); return std::nullopt; }
+            // Exactly one automatic attempt, charged before transport starts.
+            if (!m_action_polls.TryChargeAttempt(std::chrono::steady_clock::now())) { outcome("coalesced"); return std::nullopt; }
+            endpoint = *p.delivery_endpoint;
+            target = m_endpoints.at(endpoint);
+        }
+        timing.Field("wait_ms", uint64_t(wait.count()));
+        timing.Field("endpoint", target.url);
+        if (m_wait_reset.exchange(false)) m_wait_https.Reset();
+        UniValue params{UniValue::VOBJ};
+        params.pushKV("market_id", market.GetHex()); params.pushKV("action_id", action.GetHex());
+        params.pushKV("wait_ms", uint64_t(wait.count()));
+        UniValue request{UniValue::VOBJ}; request.pushKV("method", "action"); request.pushKV("params", std::move(params));
+        timing.Mark("request_started_us");
+        // The endpoint answers before its own wait ends; the transport bound
+        // is the ordinary one on top of the wait.
+        const auto reply{m_wait_https.Request(target, "/flowmesh/v1", request.write(), wait + CLIENT_REQUEST_TIMEOUT,
+                                              CLIENT_ACTION_WAIT_MAX_REPLY)};
+        timing.Mark("request_completed_us");
+        lane.unlock();
+        timing.Field("connection_reused", uint64_t{reply.connection_reused});
+        timing.Field("tls_handshake_performed", uint64_t{reply.tls_handshake_performed});
+        UniValue result;
+        std::string error;
+        bool unsupported{false};
+        try {
+            if (!reply.response_received) Fail(reply.error.empty() ? "No HTTPS response" : reply.error);
+            UniValue parsed;
+            if (!parsed.read(reply.body)) Fail("Malformed endpoint JSON response");
+            Keys(parsed, {"ok", "result", "error"});
+            if (!Flag(parsed, "ok")) {
+                const auto text{Text(parsed, "error")};
+                unsupported = text == FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR;
+                Fail(text);
+            }
+            if (reply.status != 200) Fail("Unexpected HTTPS response status");
+            result = parsed["result"];
+            // A latency hint only; never evidence.
+            if (result.isObject() && result["wait_status"].isStr()) timing.Field("wait_status", result["wait_status"].get_str());
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        timing.Mark("apply_lock_requested_us");
+        WorkLock lock{*this};
+        timing.Mark("apply_lock_acquired_us");
+        if (unsupported) {
+            // The endpoint no longer offers the wait (for example after a
+            // downgrade). Nothing was applied or resent; wait_ms is sent there
+            // again only after it advertises the capability again.
+            m_action_wait.at(endpoint) = {};
+            outcome("unsupported");
+            return std::nullopt;
+        }
+        if (!error.empty()) {
+            outcome("failed"); timing.Field("error", error);
+            return std::nullopt;
+        }
+        const auto it{m_pending.find(key)};
+        if (it == m_pending.end()) { outcome("not_retained"); return std::nullopt; }
+        auto& p{it->second};
+        try {
+            const auto pins{RecheckActionAuthority(p)};
+            if (p.receipt.certificate_verified) {
+                // Proved by another read meanwhile: never replaced by this one.
+                m_action_polls.Remove(key);
+                outcome("already_verified");
+                return p.receipt;
+            }
+            ApplyActionResult(p, pins, result, endpoint);
+            EndpointResult(endpoint, true, {});
+            if (p.receipt.certificate_verified) {
+                Save();
+            } else {
+                m_action_polls.MarkObserved(key);
+                // A non-certifying observation changes only the receipt.
+                SaveRestartState();
+            }
+        } catch (const std::exception& e) {
+            outcome("failed"); timing.Field("error", std::string{e.what()});
+            return std::nullopt;
+        }
+        outcome(p.receipt.certificate_verified ? "certified" : "observed");
+        return p.receipt;
     }
 public:
     RemoteBackend(ChainstateManager& chainman, std::vector<HttpsEndpoint> endpoints, const fs::path& path)
@@ -1437,6 +1593,7 @@ public:
         RestoreEndpoints();
         m_preferred = m_selected;
         m_retry_after.resize(m_endpoints.size());
+        m_action_wait.resize(m_endpoints.size());
         for (const auto& endpoint : m_endpoints) m_status.endpoints.push_back({endpoint.url, false, {}});
         if (!m_endpoints.empty()) m_status.selected_endpoint = m_endpoints[m_selected].url;
         PublishSavedView();
@@ -1465,9 +1622,11 @@ public:
             if (added) {
                 m_endpoints.push_back(endpoint); m_saved_endpoints = std::move(saved);
                 m_retry_after.emplace_back();
+                m_action_wait.emplace_back();
             }
             m_selected = selected; m_preferred = selected; m_retry_after[selected] = {};
             m_https.Reset(); // Explicit connect revalidates existing trust.
+            m_wait_reset = true;
             {
                 std::lock_guard status_lock{m_status_mutex};
                 if (added) m_status.endpoints.push_back({endpoint.url, false, {}});
@@ -1491,12 +1650,13 @@ private:
     UniValue ReadMarkets()
     {
         UniValue params{UniValue::VOBJ};
-        return Call("markets", params, [&](const UniValue& value, size_t) {
+        return Call("markets", params, [&](const UniValue& value, size_t endpoint) {
             if (!value.isArray() || value.size() > CLIENT_MAX_MARKETS) Fail("Market discovery exceeds bound");
             std::set<uint256> seen;
             for (const auto& row : value.getValues()) {
                 const auto id{Id(row, "market_id")}; if (!seen.insert(id).second) Fail("Duplicate market identity");
                 CheckStatus(row, Pins(id));
+                LearnActionWait(row, endpoint);
             }
         });
     }
@@ -1621,8 +1781,14 @@ public:
             out.state = m_pending.contains({market, action.Id()}) ? "unknown" : "rejected"; out.reason = e.what(); return out;
         }
     }
-    Receipt ActionStatus(const uint256& market, const uint256& action, bool retry) override
+    Receipt ActionStatus(const uint256& market, const uint256& action, bool retry,
+                         std::chrono::milliseconds wait = std::chrono::milliseconds{0}) override
     {
+        // A waited read answers this call only if it applied a usable reply;
+        // otherwise the ordinary status read below runs in the same call.
+        if (!retry && wait.count() > 0) {
+            if (auto waited{WaitedActionStatus(market, action, wait)}) return std::move(*waited);
+        }
         FlowMeshTimingSpan timing_lock_1293{__func__};
         timing_lock_1293.Field("market_id", market);
         timing_lock_1293.Field("action_id", action);
@@ -1733,6 +1899,7 @@ public:
             // An explicit probe opens fresh TLS with the existing trust and
             // bounded failover policy. This is availability, not certification.
             m_https.Reset();
+            m_wait_reset = true;
             // Do not call Markets/Refresh/QueryAction/Send: a connection probe
             // must not touch market caches, account cursors or durable history.
             Call("markets", UniValue{UniValue::VOBJ}, [&](const UniValue& value, size_t) {

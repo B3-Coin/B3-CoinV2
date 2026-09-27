@@ -40,7 +40,12 @@ public:
     virtual std::optional<flowmesh::MarketData> Data(const uint256& market, const std::optional<uint256>& account,
                                                    const flowmesh::MarketDataQuery& query, std::string& error) = 0;
     virtual interfaces::FlowMeshActionReceipt Submit(const uint256& market, const flowmesh::Action& action) = 0;
-    virtual interfaces::FlowMeshActionReceipt ActionStatus(const uint256& market, const uint256& action, bool retry) = 0;
+    //! A nonzero wait (only without retry) lets a remote backend hold one read
+    //! of an action it just delivered open at the endpoint, bounded, until the
+    //! action is certified there. It never resends or signs, and the receipt
+    //! is never less conservative than an immediate read would return.
+    virtual interfaces::FlowMeshActionReceipt ActionStatus(const uint256& market, const uint256& action, bool retry,
+                                                           std::chrono::milliseconds wait = std::chrono::milliseconds{0}) = 0;
     virtual std::vector<interfaces::FlowMeshSavedAction> SavedActions(
         const uint256& account, const std::optional<uint256>& market) { return {}; }
     virtual interfaces::FlowMeshClientStatus Status() const = 0;
