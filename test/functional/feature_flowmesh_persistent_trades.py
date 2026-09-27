@@ -24,8 +24,10 @@ just before its RPC and just after certification, outside the timed span,
 and the pump ticks inside its window, so results can be stratified by
 whether B3 advanced during the measurement. Either option, or
 --record-reconnects, records every sample's HTTPS reuse/handshake flags
-instead of asserting the arm's reuse per sample, so a connection rollover
-or reset stays in the distribution rather than aborting the run. It also
+instead of asserting the warm arm's reuse per sample, so a connection
+rollover or reset stays in the distribution rather than aborting the run.
+The baseline arm keeps its per-sample checks in every mode: a
+close-per-request daemon has no rollover to excuse. It also
 records, rather than fails on, a validator trace stream reaching its
 process-lifetime cap (32,768 rows, about eight samples on node0): that
 stream is then absent from later captures, while the measured timings come
@@ -479,16 +481,19 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                     assert_equal(submissions[action["action_id"]], 1 + len(action["exact_action_retries"]))
             if sample["complete"]:
                 assert requests
-            # Otherwise the flags above are the record, and a sample that paid
-            # a handshake stays in every distribution instead of ending the run.
-            if sample["complete"] and self.strict_samples:
-                if self.options.transport_arm == "warm":
-                    assert sample["HTTPS"]["reused"] > 0, "persistent arm did not reuse HTTPS"
-                    assert bid_requests and bid_requests[0].get("connection_reused") == 1, "measured original bid submit was not warm"
-                else:
-                    assert_equal(sample["HTTPS"]["handshakes"], len(requests))
-                    assert_equal(sample["HTTPS"]["reused"], 0)
-                    assert bid_requests and "tls_handshake_done_us" in bid_requests[0]
+            if sample["complete"] and self.options.transport_arm == "baseline":
+                # A close-per-request daemon handshakes on every request, so
+                # no rollover or reset can excuse reuse: these hold in every
+                # mode, and a reusing daemon cannot pass under this label.
+                assert_equal(sample["HTTPS"]["handshakes"], len(requests))
+                assert_equal(sample["HTTPS"]["reused"], 0)
+                assert bid_requests and "tls_handshake_done_us" in bid_requests[0]
+            # In record mode the flags above are the warm arm's record, and a
+            # sample that paid a handshake stays in every distribution instead
+            # of ending the run.
+            if sample["complete"] and self.options.transport_arm == "warm" and self.strict_samples:
+                assert sample["HTTPS"]["reused"] > 0, "persistent arm did not reuse HTTPS"
+                assert bid_requests and bid_requests[0].get("connection_reused") == 1, "measured original bid submit was not warm"
 
     def write_report(self):
         path = Path(self.options.tmpdir, "persistent-trades.json")
