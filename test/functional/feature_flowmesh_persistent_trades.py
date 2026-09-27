@@ -16,7 +16,13 @@ consensus-only measurement or a claim that inclusion alone proves a fill.
 --samples=N runs N matches, cycling the same price schedule; funding grows
 with N. --status-wait-ms=MS passes MS as getflowmeshactionstatus wait_ms
 when the client binary's help lists that argument (checked once); an older
-binary reads immediately and the report records that. Either option, or
+binary reads immediately and the report records that. While B3 advances, a
+waited read is cut to end when the next mock-time tick is due, so it returns
+to the pump on the same 0.5 s cadence as the 5 ms poll loop and both arms
+see the same B3 workload. Every order records the validators' B3 heights
+just before its RPC and just after certification, outside the timed span,
+and the pump ticks inside its window, so results can be stratified by
+whether B3 advanced during the measurement. Either option, or
 --record-reconnects, records every sample's HTTPS reuse/handshake flags
 instead of asserting the arm's reuse per sample, so a connection rollover
 or reset stays in the distribution rather than aborting the run. It also
@@ -34,7 +40,7 @@ import math
 import re
 import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 from decimal import Decimal
 from pathlib import Path
 
@@ -56,6 +62,9 @@ B3_ATOMS = 1_000_000_000  # Native atomic units per B3.
 # per match. More matches would evict certified orders the final checks read.
 MAX_SAMPLES = (512 - 2) // 2
 STATUS_WAIT_MAX_MS = 2500  # getflowmeshactionstatus wait_ms bound.
+# A waited status read ends when the next B3 pump tick is due; returning
+# later than this after the due time means the pump cadence was not kept.
+PUMP_OVERDUE_BOUND_MS = 100
 
 
 def bounded_int(name, low, high):
@@ -90,6 +99,7 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
         self.strict_samples = not (self.options.record_reconnects or self.options.status_wait_ms or
                                    self.options.samples != len(PRICES))
         self.status_wait_ms = 0  # Effective wait_ms, set once the client binary is known.
+        self.pump_ticks = deque(maxlen=256)  # Host time at the start of recent B3 pump ticks.
         self.capture_clock = None
         self.trade_report = {"format_version": 1, "arm": self.options.transport_arm,
             "harness_smoke": self.options.harness_smoke, "performance_measurement_qualified": False,
@@ -147,6 +157,25 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
         if self.last_market:
             assert not (self.client.chain_path / "flowmesh" / self.last_market).exists()
 
+    def pump_b3(self):
+        # Log when each mock-time tick starts, so an order window can report
+        # the B3 progress it overlapped.
+        due, started = self.next_clock_tick, host_us()
+        super().pump_b3()
+        if self.next_clock_tick != due:
+            self.pump_ticks.append(started)
+
+    def b3_heights(self):
+        return [node.getblockcount() for node in self.nodes]
+
+    def status_read(self, read):
+        """One status read, and how long it kept the harness past a due B3 tick (ms)."""
+        due, begun = self.next_clock_tick, time.monotonic()
+        status = read()
+        if self.clock_indices is None:
+            return status, 0.0
+        return status, max(0.0, time.monotonic() - max(due, begun)) * 1000
+
     @staticmethod
     def saved_actions(rpc, market):
         result = rpc.listflowmeshactions(market)
@@ -181,6 +210,7 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
         status, deadline, retry_at = response, time.monotonic() + 60, time.monotonic() + 1
         retries = []
         next_read = time.monotonic()
+        overdue_ms = 0.0
         while status["receipt_state"] != "certified_inclusion":
             assert time.monotonic() < deadline, "bounded action certification deadline exceeded"
             self.pump_b3()
@@ -197,12 +227,32 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                 # endpoint without the capability) cannot spin.
                 time.sleep(max(0, next_read - time.monotonic()))
                 next_read = time.monotonic() + .005
-                status = rpc.getflowmeshactionstatus(market, action_id, self.status_wait_ms)
+                wait_ms = self.status_wait_ms
+                if self.clock_indices is not None:
+                    # End the wait when the next B3 tick is due, so the loop
+                    # pumps on the poll loop's cadence and both arms run the
+                    # same B3 workload during the measured window.
+                    wait_ms = min(wait_ms, max(1, math.ceil((self.next_clock_tick - time.monotonic()) * 1000)))
+                status, late_ms = self.status_read(lambda: rpc.getflowmeshactionstatus(market, action_id, wait_ms))
+                overdue_ms = max(overdue_ms, late_ms)
             else:
                 time.sleep(.005)
-                status = rpc.getflowmeshactionstatus(market, action_id)
+                status, late_ms = self.status_read(lambda: rpc.getflowmeshactionstatus(market, action_id))
+                overdue_ms = max(overdue_ms, late_ms)
             assert_equal(status["action_id"], action_id)
         sample.update(certified_status=status, certified_host_us=host_us(), exact_action_retries=retries)
+        if "b3" in sample:
+            # Read after the timed span closed. Ticks are counted from the
+            # order RPC start to certification.
+            after = self.b3_heights()
+            start, end = sample["started_host_us"], sample["certified_host_us"]
+            inside = [tick for tick in self.pump_ticks if start <= tick <= end]
+            earlier = [tick for tick in self.pump_ticks if tick < start]
+            sample["b3"].update(heights_after=after,
+                advanced_in_window=any(new > old for old, new in zip(sample["b3"]["heights_before"], after)),
+                pump_ticks_in_window=len(inside), pump_tick_offsets_ms=[(tick - start) / 1000 for tick in inside],
+                last_pump_tick_before_start_ms=(start - earlier[-1]) / 1000 if earlier else None,
+                status_read_max_overdue_ms=overdue_ms)
         assert_equal(status["certificate_verified"], True)
         assert_equal(status["outcome_verified"], False)
         after = self.saved_actions(rpc, market)[action_id]
@@ -219,7 +269,11 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
         for attempt in range(10):
             self.pump_b3()
             try:
-                sample.setdefault("started_host_us", host_us())
+                if "started_host_us" not in sample:
+                    if self.clock_indices is not None:
+                        # Read before the timed span opens.
+                        sample["b3"] = {"heights_before": self.b3_heights()}
+                    sample["started_host_us"] = host_us()
                 response = rpc.submitflowmeshorder(market, side, price, 1, sequence)
                 break
             except JSONRPCException as error:
@@ -499,6 +553,20 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                         for row, paid in zip(samples, reconnected) if not paid], 200),
                     "client_certified_with_handshake": distribution([row["bid"]["client_certified_ms"]
                         for row, paid in zip(samples, reconnected) if paid], 200)}}
+            advanced = [row["bid"]["b3"]["advanced_in_window"] for row in samples]
+            overdue = max(row[key]["b3"]["status_read_max_overdue_ms"] for row in samples for key in ("ask", "bid"))
+            self.trade_report["summary"]["b3_during_bid"] = {
+                "windows_with_pump_tick": sum(row["bid"]["b3"]["pump_ticks_in_window"] > 0 for row in samples),
+                "pump_ticks": sum(row["bid"]["b3"]["pump_ticks_in_window"] for row in samples),
+                "windows_with_b3_advance": sum(advanced),
+                "status_read_max_overdue_ms": overdue,
+                "client_certified_with_b3_advance": distribution([row["bid"]["client_certified_ms"]
+                    for row, moved in zip(samples, advanced) if moved], 200),
+                "client_certified_without_b3_advance": distribution([row["bid"]["client_certified_ms"]
+                    for row, moved in zip(samples, advanced) if not moved], 200)}
+            if self.status_wait_ms:
+                # The waited arm must keep the poll arm's B3 cadence.
+                assert overdue < PUMP_OVERDUE_BOUND_MS, f"a waited status read held the B3 pump {overdue:.1f} ms past its tick"
             self.trade_report["correctness_pass"] = True
             self.trade_report["performance_measurement_qualified"] = not self.options.harness_smoke
         except Exception as error:
