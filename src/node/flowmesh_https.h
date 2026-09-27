@@ -93,8 +93,10 @@ HttpsRequestResult FlowMeshHttpsRequest(const HttpsEndpoint& endpoint,
 /** Restricted TLS listener, independent of administrator/wallet RPC and FMN2.
  * Only POST /flowmesh/v1 is routed to Handler. Handler must be bounded,
  * nonblocking with respect to operator execution, and must implement its own
- * JSON method allowlist and authenticated action admission. TLS authenticates
- * the server; existing signed actions authenticate trading authority.
+ * JSON method allowlist and authenticated action admission. It may block only
+ * in a bounded wait that ends before Request::deadline, with its permit
+ * suspended. TLS authenticates the server; existing signed actions
+ * authenticate trading authority.
  * Start/Stop are externally serialized; Stop joins in-progress handlers.
  * No transport code logs request bodies, TLS keys, or credentials. */
 class FlowMeshHttpsServer {
@@ -116,6 +118,12 @@ public:
         std::chrono::milliseconds idle_timeout{FLOWMESH_HTTPS_DEFAULT_IDLE_TIMEOUT};
         std::chrono::milliseconds connection_lifetime{FLOWMESH_HTTPS_DEFAULT_CONNECTION_LIFETIME};
         size_t max_requests_per_connection{128};
+        /** Connections at once in TLS handshake, request read, handler work,
+         * reply write or close; 0 means worker_threads, at most that. Extra
+         * workers only serve while a handler has suspended its permit, so
+         * handshake CPU, buffered replies and handler concurrency stay within
+         * this bound however many handlers sleep in bounded waits. */
+        size_t active_permits{0};
         /** Optional; must not block and should not throw (exceptions are
          * swallowed). on_start runs in Start just before the workers spawn.
          * on_stop runs exactly once after each on_start, in Stop after new
@@ -132,6 +140,14 @@ public:
          * (including queue wait). A reply finished after it is never written,
          * so a handler that waits must leave time to build and send one. */
         std::chrono::steady_clock::time_point deadline{};
+        /** Set by the server for the handler call only (empty otherwise).
+         * suspend() releases this request's active permit: call it only right
+         * before sleeping in a bounded wait that holds no lock another request
+         * needs. resume() waits for a permit, ahead of queued connections, and
+         * must precede any further work; the server resumes a handler that
+         * returns suspended. Both are idempotent. */
+        std::function<void()> suspend;
+        std::function<void()> resume;
     };
     struct Response {
         int status{200};

@@ -950,6 +950,12 @@ struct FlowMeshHttpsServer::Impl {
     std::condition_variable condition;
     std::deque<std::unique_ptr<Connection>> queue;
     std::vector<std::unique_ptr<Connection>> idle;
+    // Guarded by mutex. Admitted connection work (handshake, read, handler,
+    // write, close) holds one of `permits`; a suspended handler holds none.
+    // A resuming handler is served before any queued connection.
+    size_t permits{0};
+    size_t active{0};
+    size_t resuming{0};
     std::thread accept_thread;
     std::vector<std::thread> workers;
     // Empty in production. Test observation occurs only after immutable
@@ -975,7 +981,27 @@ struct FlowMeshHttpsServer::Impl {
             Clock::now().time_since_epoch()).count()) : 0;
     }
 
-    bool Serve(Connection& pending)
+    void ReleasePermit()
+    {
+        {
+            std::lock_guard lock{mutex};
+            --active;
+        }
+        // Workers wait for a queued connection AND a permit, a resuming
+        // handler only for a permit: wake all so neither can miss it.
+        condition.notify_all();
+    }
+
+    void ResumePermit()
+    {
+        std::unique_lock lock{mutex};
+        ++resuming;
+        condition.wait(lock, [&] { return stopping.load() || active < permits; });
+        --resuming;
+        ++active; // While stopping this may exceed permits; nothing new starts.
+    }
+
+    bool Serve(Connection& pending, bool& permit_held)
     {
         FlowMeshTimingSpan timing{"https_server_serve"};
         timing.Field("enqueued_us", pending.enqueued_us);
@@ -1011,6 +1037,17 @@ struct FlowMeshHttpsServer::Impl {
         Request request;
         request.remote_address = pending.peer;
         request.deadline = pending.deadline;
+        // Valid only during the handler call below.
+        request.suspend = [this, &permit_held] {
+            if (!permit_held) return;
+            ReleasePermit();
+            permit_held = false;
+        };
+        request.resume = [this, &permit_held] {
+            if (permit_held) return;
+            ResumePermit();
+            permit_held = true;
+        };
         Response response;
         int failure{400};
         bool keep_alive{false};
@@ -1022,6 +1059,9 @@ struct FlowMeshHttpsServer::Impl {
         else {
             try { response = handler(request); }
             catch (...) { response = {500, "{\"error\":\"handler-failed\"}"}; }
+            // The reply is checked and written under a permit even when the
+            // handler returned, or threw, while suspended.
+            request.resume();
         }
         timing.Mark("handler_completed_us");
         if (!io.Alive()) return false; // Handler may have admitted; caller must treat timeout as unknown.
@@ -1063,13 +1103,20 @@ struct FlowMeshHttpsServer::Impl {
             std::unique_ptr<Connection> pending;
             {
                 std::unique_lock lock{mutex};
-                condition.wait(lock, [&] { return stopping.load() || !queue.empty(); });
+                // A queued connection starts only under a free permit that no
+                // resuming handler is waiting for; it stays queued (with its
+                // deadline running, as when every worker is busy) until then.
+                condition.wait(lock, [&] {
+                    return stopping.load() || (!queue.empty() && active + resuming < permits);
+                });
                 if (stopping.load()) return;
                 pending = std::move(queue.front());
                 queue.pop_front();
+                ++active;
             }
+            bool permit_held{true};
             try {
-                if (Serve(*pending)) {
+                if (Serve(*pending, permit_held)) {
                     std::lock_guard lock{mutex};
                     if (!stopping.load() && Clock::now() < pending->expires) {
                         pending->idle_deadline = std::min(pending->expires, Clock::now() + options.idle_timeout);
@@ -1078,6 +1125,8 @@ struct FlowMeshHttpsServer::Impl {
                     }
                 }
             } catch (...) { /* Close, never expose an exception body. */ }
+            pending.reset(); // Close (TLS and socket release) under the permit.
+            if (permit_held) ReleasePermit();
         }
     }
 
@@ -1189,6 +1238,7 @@ bool FlowMeshHttpsServer::Start(std::string& error)
         options.max_reply_bytes < 64 || options.max_reply_bytes > MAX_REPLY ||
         options.max_connections == 0 || options.max_connections > 256 ||
         options.worker_threads == 0 || options.worker_threads > 16 ||
+        options.active_permits > options.worker_threads ||
         options.max_queue == 0 || options.max_queue > 256 ||
         options.request_timeout <= Milliseconds{0} || options.request_timeout > MAX_TIMEOUT ||
         options.idle_timeout <= Milliseconds{0} || options.idle_timeout > MAX_TIMEOUT ||
@@ -1240,6 +1290,12 @@ bool FlowMeshHttpsServer::Start(std::string& error)
         error = "https-server-wakeup-failed";
         return false;
     }
+    {
+        std::lock_guard lock{state.mutex};
+        state.permits = options.active_permits ? options.active_permits : options.worker_threads;
+        state.active = 0;
+        state.resuming = 0;
+    }
     state.stopping = false;
     if (options.on_start) {
         try { options.on_start(); } catch (...) {}
@@ -1272,6 +1328,9 @@ void FlowMeshHttpsServer::Stop()
         state.queue.clear();
         state.idle.clear();
     }
+    // Every waiter has observed stopping or is asleep by now (this took the
+    // mutex after stopping was set): wake all, so none can miss it.
+    state.condition.notify_all();
     // Idle/queued peers close before joining admitted handlers, whose existing
     // completion contract is unchanged by persistence.
     for (auto& worker : state.workers) if (worker.joinable()) worker.join();

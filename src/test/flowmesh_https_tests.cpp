@@ -26,6 +26,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -915,6 +916,172 @@ BOOST_AUTO_TEST_CASE(https_start_and_stop_hooks_bracket_workers_and_release_a_wa
     BOOST_CHECK_EQUAL(starts.load(), 2U);
     server.Stop();
     BOOST_CHECK_EQUAL(stops.load(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(https_active_permits_bound_handshake_read_and_write)
+{
+    auto options{Options()};
+    options.worker_threads = 8;
+    options.active_permits = 2;
+    options.request_timeout = std::chrono::seconds{3};
+    std::atomic<unsigned> handled{0};
+    node::FlowMeshHttpsServer server{options, [&](const auto&) {
+        ++handled;
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    ConnectionObservation observed;
+    BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(server, [&](bool nodelay) { observed.Record(nodelay); }));
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    // Each peer completes its handshake, then holds its permit in the read.
+    SplitHttpsPeer first{server.Port(), cert};
+    SplitHttpsPeer second{server.Port(), cert};
+    BOOST_REQUIRE(observed.Await(2));
+    // Six workers are idle, but a third connection never begins its
+    // handshake (the observer runs first, under the permit) until one frees.
+    auto third{std::async(std::launch::async, [&] {
+        return node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{3}, 1024);
+    })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    BOOST_CHECK_EQUAL(observed.Count(), 2U);
+    BOOST_CHECK_EQUAL(handled.load(), 0U);
+    const std::string request{"POST /flowmesh/v1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"};
+    BOOST_REQUIRE(first.Send(request));
+    BOOST_REQUIRE(first.ReadResponse(2).starts_with("HTTP/1.1 200 "));
+    const auto reply{third.get()};
+    BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+    BOOST_CHECK_EQUAL(reply.status, 200);
+    BOOST_CHECK_EQUAL(observed.Count(), 3U);
+    BOOST_REQUIRE(second.Send(request));
+    BOOST_REQUIRE(second.ReadResponse(2).starts_with("HTTP/1.1 200 "));
+    BOOST_CHECK_EQUAL(handled.load(), 3U);
+    server.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_suspended_handler_releases_permit_and_resumes_first)
+{
+    using Clock = std::chrono::steady_clock;
+    auto options{Options()};
+    options.worker_threads = 3;
+    options.active_permits = 1;
+    options.request_timeout = std::chrono::seconds{4};
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool suspended{false}, release{false}, slow_entered{false};
+    std::vector<std::string> order;
+    const auto record = [&](std::string event) {
+        std::lock_guard lock{mutex};
+        order.push_back(std::move(event));
+    };
+    node::FlowMeshHttpsServer server{options, [&](const auto& request) {
+        if (request.body == "wait") {
+            request.suspend();
+            request.suspend(); // Idempotent.
+            std::unique_lock lock{mutex};
+            suspended = true;
+            condition.notify_all();
+            condition.wait_for(lock, std::chrono::seconds{3}, [&] { return release; });
+            lock.unlock();
+            request.resume();
+            request.resume(); // Idempotent.
+            record("wait_resumed");
+            return node::FlowMeshHttpsServer::Response{200, "waited"};
+        }
+        if (request.body == "slow") {
+            {
+                std::lock_guard lock{mutex};
+                slow_entered = true;
+            }
+            condition.notify_all();
+            std::this_thread::sleep_for(std::chrono::milliseconds{500});
+            record("slow_returned");
+            return node::FlowMeshHttpsServer::Response{200, "slow"};
+        }
+        record("fast_entered");
+        return node::FlowMeshHttpsServer::Response{200, "fast"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    const auto post = [&](std::string body) {
+        return std::async(std::launch::async, [&, body] {
+            return node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", body, std::chrono::seconds{4}, 1024);
+        });
+    };
+    auto waiting{post("wait")};
+    {
+        std::unique_lock lock{mutex};
+        BOOST_REQUIRE(condition.wait_for(lock, std::chrono::seconds{2}, [&] { return suspended; }));
+    }
+    // The only permit was released: another connection is served meanwhile.
+    const auto fast_started{Clock::now()};
+    const auto fast{post("fast").get()};
+    BOOST_REQUIRE_MESSAGE(fast.response_received, fast.error);
+    BOOST_CHECK_EQUAL(fast.body, "fast");
+    BOOST_CHECK(Clock::now() - fast_started < std::chrono::seconds{1});
+
+    // While a slow handler holds the permit, release the waiter and queue a
+    // new connection: the resumed handler goes before the queued one.
+    auto slow{post("slow")};
+    {
+        std::unique_lock lock{mutex};
+        BOOST_REQUIRE(condition.wait_for(lock, std::chrono::seconds{2}, [&] { return slow_entered; }));
+        release = true;
+    }
+    condition.notify_all();
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    auto queued{post("fast")};
+    const auto waited{waiting.get()};
+    BOOST_REQUIRE_MESSAGE(waited.response_received, waited.error);
+    BOOST_CHECK_EQUAL(waited.body, "waited");
+    BOOST_CHECK_EQUAL(slow.get().body, "slow");
+    BOOST_CHECK_EQUAL(queued.get().body, "fast");
+    {
+        std::lock_guard lock{mutex};
+        const std::vector<std::string> expected{"fast_entered", "slow_returned", "wait_resumed", "fast_entered"};
+        BOOST_CHECK_EQUAL_COLLECTIONS(order.begin(), order.end(), expected.begin(), expected.end());
+    }
+    server.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_permits_survive_handlers_that_return_suspended)
+{
+    auto options{Options()};
+    options.worker_threads = 2;
+    options.active_permits = 3;
+    std::string error;
+    {
+        node::FlowMeshHttpsServer invalid{options, [](const auto&) { return node::FlowMeshHttpsServer::Response{}; }};
+        BOOST_CHECK(!invalid.Start(error));
+        BOOST_CHECK_EQUAL(error, "https-server-invalid-options");
+    }
+    options.active_permits = 1;
+    options.request_timeout = std::chrono::seconds{2};
+    std::atomic<unsigned> handled{0};
+    node::FlowMeshHttpsServer server{options, [&](const auto& request) {
+        ++handled;
+        request.suspend(); // Returns (or throws) suspended; the server resumes.
+        if (request.body == "throw") throw std::runtime_error{"handler failure"};
+        return node::FlowMeshHttpsServer::Response{200, "{}"};
+    }};
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    node::FlowMeshHttpsClient client;
+    for (const std::string body : {"{}", "throw", "{}", "throw", "{}"}) {
+        const auto reply{client.Request(Endpoint(server), "/flowmesh/v1", body, std::chrono::seconds{2}, 1024)};
+        BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+        BOOST_CHECK_EQUAL(reply.status, body == "throw" ? 500 : 200);
+    }
+    client.Reset();
+    // Still exactly one permit: a peer holding it in its read keeps a second
+    // connection from starting, although the other worker is idle.
+    SplitHttpsPeer holder{server.Port(), cert};
+    const auto blocked{node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::milliseconds{300}, 1024)};
+    BOOST_CHECK(!blocked.response_received);
+    BOOST_REQUIRE(holder.Send("POST /flowmesh/v1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"));
+    BOOST_REQUIRE(holder.ReadResponse(2).starts_with("HTTP/1.1 200 "));
+    const auto next{node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
+    BOOST_REQUIRE_MESSAGE(next.response_received, next.error);
+    BOOST_CHECK_EQUAL(handled.load(), 7U);
+    server.Stop();
 }
 
 BOOST_AUTO_TEST_CASE(https_transport_only_paired_cold_warm_observations)
