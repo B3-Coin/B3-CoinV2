@@ -4,7 +4,9 @@
 
 #include <node/flowmesh_https.h>
 #include <node/flowmesh_client.h>
+#include <crypto/sha256.h>
 #include <dbwrapper.h>
+#include <flowmesh/production_wire.h>
 #include <test/util/setup_common.h>
 #include <util/fs.h>
 #include <util/sock.h>
@@ -1384,7 +1386,44 @@ struct ClientConnectFixture : TestingSetup {
     {
         return {"https://127.0.0.1:" + std::to_string(server.Port()), cert, pin};
     }
+    //! A restart-restored outbox holding one retained public instruction.
+    static flowmesh::Action SeedRetainedAction(const fs::path& path, const uint256& market, const uint256& owner)
+    {
+        flowmesh::Action action;
+        action.signer = owner;
+        action.sequence = 3;
+        action.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_BID);
+        action.credential = {1, 2, 3};
+        const auto bytes{flowmesh::EncodeProductionActionPayload(action)};
+        BOOST_REQUIRE(bytes);
+        UniValue row{UniValue::VOBJ};
+        row.pushKV("market_id", market.GetHex());
+        row.pushKV("domain", uint256::ONE.GetHex());
+        row.pushKV("config", uint256::ONE.GetHex());
+        row.pushKV("action_hex", HexStr(*bytes));
+        row.pushKV("action_id", action.Id().GetHex());
+        row.pushKV("initial_submission_ms", 1);
+        row.pushKV("may_have_been_sent", true);
+        row.pushKV("previously_certified", false);
+        row.pushKV("owner_account", owner.GetHex());
+        UniValue actions{UniValue::VARR};
+        actions.push_back(std::move(row));
+        UniValue root{UniValue::VOBJ};
+        root.pushKV("version", 1);
+        root.pushKV("actions", std::move(actions));
+        root.pushKV("heads", UniValue{UniValue::VARR});
+        CDBWrapper db{DBParams{.path=path, .cache_bytes=1 << 20}};
+        db.Write(std::string{"public-client-v1"}, root.write(), true);
+        return action;
+    }
 };
+
+std::string Sha256Hex(const std::vector<unsigned char>& bytes)
+{
+    unsigned char digest[CSHA256::OUTPUT_SIZE];
+    CSHA256().Write(bytes.data(), bytes.size()).Finalize(digest);
+    return HexStr(digest);
+}
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_client_connect_tests, ClientConnectFixture)
@@ -1601,6 +1640,89 @@ BOOST_AUTO_TEST_CASE(client_invalid_saved_origin_fails_closed_without_reset)
     std::string preserved;
     BOOST_REQUIRE(db.Read(std::string{"public-client-endpoints-v1"}, preserved));
     BOOST_CHECK_EQUAL(preserved, invalid);
+}
+
+BOOST_AUTO_TEST_CASE(client_saved_actions_do_not_wait_for_inflight_network_work)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 market{uint256::ONE};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{SeedRetainedAction(path, market, owner)};
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool entered{false}, release{false};
+    // Holds the one network call (and so the client's work gate) until the
+    // saved-action read below has returned, or at most a bounded time.
+    node::FlowMeshHttpsServer server{Options(), [&](const auto&) {
+        std::unique_lock lock{mutex};
+        entered = true;
+        condition.notify_all();
+        condition.wait_for(lock, std::chrono::seconds{4}, [&] { return release; });
+        return node::FlowMeshHttpsServer::Response{200, R"({"ok":true,"result":[],"error":""})"};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server)}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    std::thread discovery{[&] {
+        try { (void)client->Markets(std::nullopt); } catch (const std::exception&) {}
+    }};
+    bool blocked{false};
+    {
+        std::unique_lock lock{mutex};
+        blocked = condition.wait_for(lock, std::chrono::seconds{2}, [&] { return entered; });
+    }
+    const auto start{std::chrono::steady_clock::now()};
+    const auto saved{client->SavedActions(owner, market)};
+    const auto elapsed{std::chrono::steady_clock::now() - start};
+    {
+        std::lock_guard lock{mutex};
+        release = true;
+    }
+    condition.notify_all();
+    discovery.join();
+    server.Stop();
+    BOOST_CHECK(blocked);
+    BOOST_CHECK(elapsed < std::chrono::seconds{1});
+    BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+    BOOST_CHECK(saved[0].receipt.action_id == action.Id());
+    BOOST_CHECK(saved[0].account_id == owner);
+    BOOST_CHECK(saved[0].market_id == market);
+    BOOST_REQUIRE(saved[0].sequence);
+    BOOST_CHECK_EQUAL(*saved[0].sequence, 3U);
+    BOOST_CHECK_EQUAL(saved[0].canonical_side, "bid");
+    const auto bytes{flowmesh::EncodeProductionActionPayload(action)};
+    BOOST_REQUIRE(bytes);
+    BOOST_CHECK_EQUAL(saved[0].signed_bytes_sha256, Sha256Hex(*bytes));
+    BOOST_CHECK_EQUAL(saved[0].signed_bytes_size, bytes->size());
+    BOOST_CHECK(saved[0].may_have_been_sent);
+    BOOST_CHECK(!saved[0].previously_certified);
+}
+
+BOOST_AUTO_TEST_CASE(client_saved_view_reflects_completed_method)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 market{uint256::ONE};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{SeedRetainedAction(path, market, owner)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto restored{client->SavedActions(owner, market)};
+    BOOST_REQUIRE_EQUAL(restored.size(), 1U);
+    BOOST_CHECK_EQUAL(restored[0].receipt.reason, "Retained original action; fresh status evidence required after restart");
+    // This market is not established on the test chain, so the authority
+    // recheck fails before any network use and records its reason.
+    const auto receipt{client->ActionStatus(market, action.Id(), false)};
+    BOOST_REQUIRE(!receipt.reason.empty());
+    const auto updated{client->SavedActions(owner, market)};
+    BOOST_REQUIRE_EQUAL(updated.size(), 1U);
+    BOOST_CHECK_EQUAL(updated[0].receipt.reason, receipt.reason);
+    BOOST_CHECK(updated[0].receipt.reason != restored[0].receipt.reason);
+    BOOST_CHECK_EQUAL(client->SavedActions(owner, std::nullopt).size(), 1U);
+    BOOST_CHECK(client->SavedActions(owner, uint256{}).empty());
+    BOOST_CHECK(client->SavedActions(uint256{}, market).empty());
+    BOOST_CHECK(client->SavedActions(uint256::ONE, market).empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

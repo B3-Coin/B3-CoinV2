@@ -543,6 +543,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         uint256 owner_account;
         // Volatile read failover cursor; never part of the signed instruction.
         std::optional<size_t> automatic_endpoint{};
+        // Derived from the immutable bytes for saved-action rows; not durable.
+        std::string signed_bytes_sha256{};
     };
     std::map<std::pair<uint256, uint256>, Pending> m_pending;
     FlowMeshClientPollScheduler m_action_polls;
@@ -559,6 +561,82 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         std::optional<uint256> account_scope;
     };
     std::map<uint256, Cache> m_cache;
+    // Immutable copy of the retained actions as of the most recent m_work
+    // release. Leaf lock, written only by the m_work owner; saved-action
+    // reads never wait for network work. Null only if publication failed.
+    mutable std::mutex m_saved_mutex;
+    std::shared_ptr<const std::vector<interfaces::FlowMeshSavedAction>> m_saved_view;
+
+    // Every m_work owner goes through this. Publication runs in the
+    // destructor body, before the member unlocks, so the view always matches
+    // a completed method and never exposes a mid-method state (for example
+    // Send's write-ahead 'unknown' before the network call).
+    class WorkLock {
+        RemoteBackend& m_backend;
+        std::unique_lock<FlowMeshClientWorkGate> m_lock;
+    public:
+        explicit WorkLock(RemoteBackend& backend) : m_backend{backend}, m_lock{backend.m_work} {}
+        WorkLock(RemoteBackend& backend, std::try_to_lock_t) : m_backend{backend}, m_lock{backend.m_work, std::try_to_lock} {}
+        WorkLock(const WorkLock&) = delete;
+        WorkLock& operator=(const WorkLock&) = delete;
+        ~WorkLock() { if (m_lock.owns_lock()) m_backend.PublishSavedView(); }
+        bool owns_lock() const noexcept { return m_lock.owns_lock(); }
+    };
+
+    static std::string BytesSha256Hex(const std::vector<unsigned char>& bytes)
+    {
+        unsigned char digest[CSHA256::OUTPUT_SIZE];
+        CSHA256().Write(bytes.data(), bytes.size()).Finalize(digest);
+        return HexStr(digest);
+    }
+    interfaces::FlowMeshSavedAction SavedRow(const Pending& p) const
+    {
+        interfaces::FlowMeshSavedAction row;
+        row.market_id = p.market; row.domain = p.domain; row.execution_config_id = p.config;
+        row.account_id = p.owner_account; row.receipt = p.receipt;
+        if (!p.action.IsDeposit()) row.sequence = p.action.sequence;
+        row.action_type = p.action.type;
+        switch (static_cast<flowmesh::ActionType>(p.action.type)) {
+        case flowmesh::ActionType::SUBMIT_BID:
+        case flowmesh::ActionType::CANCEL_BID: row.canonical_side = "bid"; break;
+        case flowmesh::ActionType::SUBMIT_ASK:
+        case flowmesh::ActionType::CANCEL_ASK: row.canonical_side = "ask"; break;
+        default: break;
+        }
+        if (!row.canonical_side.empty()) row.canonical_points = p.action.curve;
+        row.signed_bytes_sha256 = p.signed_bytes_sha256.empty() ? BytesSha256Hex(p.bytes) : p.signed_bytes_sha256;
+        row.signed_bytes_size = p.bytes.size();
+        row.initial_submission_ms = p.initial_submission_ms;
+        row.may_have_been_sent = p.may_have_been_sent; row.previously_certified = p.previously_certified;
+        return row;
+    }
+    std::vector<interfaces::FlowMeshSavedAction> SavedActionsLocked(const uint256& account, const std::optional<uint256>& market) const
+    {
+        std::vector<interfaces::FlowMeshSavedAction> out;
+        for (const auto& [key, p] : m_pending) {
+            if (p.owner_account == account && (!market || p.market == *market)) out.push_back(SavedRow(p));
+        }
+        return out;
+    }
+    void PublishSavedView() noexcept
+    {
+        // m_pending is bounded by CLIENT_MAX_ACTIONS. Memory only: no network,
+        // chain-index synchronization or durable write.
+        std::shared_ptr<const std::vector<interfaces::FlowMeshSavedAction>> view;
+        try {
+            auto rows{std::make_shared<std::vector<interfaces::FlowMeshSavedAction>>()};
+            rows->reserve(m_pending.size());
+            for (const auto& [key, p] : m_pending) rows->push_back(SavedRow(p));
+            view = std::move(rows);
+        } catch (...) {
+            // Null makes readers fall back to m_work, never to stale rows.
+        }
+        {
+            std::lock_guard lock{m_saved_mutex};
+            std::swap(m_saved_view, view);
+        }
+        // The previous view is released here, outside the leaf lock.
+    }
 
     void LearnMetadata(const UniValue& status, const flowmesh::ClientEvidencePins& pins, size_t endpoint)
     {
@@ -840,6 +918,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         for (const auto& row : root["actions"].getValues()) {
             Pending p; p.market = Id(row, "market_id"); p.domain = Id(row, "domain"); p.config = Id(row, "config");
             p.bytes = Bytes(row, "action_hex", flowmesh::FLOWMESH_ACTION_MAX_BYTES);
+            p.signed_bytes_sha256 = BytesSha256Hex(p.bytes);
             const auto action{flowmesh::DecodeProductionActionPayload(p.bytes)};
             if (!action || action->Id() != Id(row, "action_id")) Fail("Invalid retained signed action");
             p.action = *action; p.initial_submission_ms = Number(row, "initial_submission_ms");
@@ -1180,6 +1259,7 @@ public:
         m_retry_after.resize(m_endpoints.size());
         for (const auto& endpoint : m_endpoints) m_status.endpoints.push_back({endpoint.url, false, {}});
         if (!m_endpoints.empty()) m_status.selected_endpoint = m_endpoints[m_selected].url;
+        PublishSavedView();
     }
     bool Connect(const std::string& url, std::string& error) override
     {
@@ -1189,7 +1269,7 @@ public:
         FlowMeshTimingSpan timing_lock_1145{__func__};
         timing_lock_1145.Field("lock_name", std::string{"client_work"});
         timing_lock_1145.Mark("lock_requested_us");
-        std::lock_guard lock{m_work};
+        WorkLock lock{*this};
         MarkWorkAcquired(timing_lock_1145);
         try {
             const auto existing{std::find_if(m_endpoints.begin(), m_endpoints.end(), [&](const auto& candidate) { return candidate.url == endpoint.url; })};
@@ -1246,7 +1326,7 @@ public:
         FlowMeshTimingSpan timing_lock_1197{__func__};
         timing_lock_1197.Field("lock_name", std::string{"client_work"});
         timing_lock_1197.Mark("lock_requested_us");
-        std::lock_guard lock{m_work};
+        WorkLock lock{*this};
         MarkWorkAcquired(timing_lock_1197);
         std::vector<MarketStatus> out;
         const auto rows{ReadMarkets()};
@@ -1268,7 +1348,7 @@ public:
         FlowMeshTimingSpan timing_lock_1215{__func__};
         timing_lock_1215.Field("lock_name", std::string{"client_work"});
         timing_lock_1215.Mark("lock_requested_us");
-        std::lock_guard lock{m_work};
+        WorkLock lock{*this};
         MarkWorkAcquired(timing_lock_1215);
         MarketStatus status; status.market_id = id; status.remote = true;
         try {
@@ -1302,7 +1382,7 @@ public:
         FlowMeshTimingSpan timing_lock_1245{__func__};
         timing_lock_1245.Field("lock_name", std::string{"client_work"});
         timing_lock_1245.Mark("lock_requested_us");
-        std::lock_guard lock{m_work};
+        WorkLock lock{*this};
         MarkWorkAcquired(timing_lock_1245);
         try { return Project(Refresh(id, account, query), account, query); }
         catch (const std::exception& e) { error = e.what(); return std::nullopt; }
@@ -1314,7 +1394,7 @@ public:
         if (timing_lock_1251.Enabled()) timing_lock_1251.Field("action_id", action.Id());
         timing_lock_1251.Field("lock_name", std::string{"client_work"});
         timing_lock_1251.Mark("lock_requested_us");
-        std::lock_guard lock{m_work};
+        WorkLock lock{*this};
         MarkWorkAcquired(timing_lock_1251);
         Receipt out; out.action_id = action.Id();
         try {
@@ -1338,6 +1418,7 @@ public:
             }
             Pending pending{market, pins.domain, pins.execution_config_id, action, *bytes,
                 TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now()), false, out, false, {}, action.signer};
+            pending.signed_bytes_sha256 = BytesSha256Hex(pending.bytes);
             if (action.IsDeposit()) {
                 LOCK(::cs_main); SyncIndexes();
                 const auto deposit{m_chainman.ActiveChainstate().ModernFlowMeshVaults().Index().Get(action.outpoint)};
@@ -1362,7 +1443,7 @@ public:
         timing_lock_1293.Field("action_id", action);
         timing_lock_1293.Field("lock_name", std::string{"client_work"});
         timing_lock_1293.Mark("lock_requested_us");
-        std::lock_guard lock{m_work};
+        WorkLock lock{*this};
         MarkWorkAcquired(timing_lock_1293);
         Receipt out; out.action_id = action;
         const auto it{m_pending.find({market, action})};
@@ -1423,35 +1504,27 @@ public:
         const uint256& account, const std::optional<uint256>& market) override
     {
         FlowMeshTimingSpan timing_lock_1352{__func__};
-        timing_lock_1352.Field("lock_name", std::string{"client_work"});
+        timing_lock_1352.Field("lock_name", std::string{"client_saved_view"});
         timing_lock_1352.Mark("lock_requested_us");
-        std::lock_guard lock{m_work};
-        MarkWorkAcquired(timing_lock_1352);
+        std::shared_ptr<const std::vector<interfaces::FlowMeshSavedAction>> view;
+        {
+            std::lock_guard lock{m_saved_mutex};
+            view = m_saved_view;
+        }
+        timing_lock_1352.Mark("lock_acquired_us");
+        timing_lock_1352.Field("view_published", uint64_t{view != nullptr});
+        if (account.IsNull()) return {};
+        // The view reflects every backend method that already returned. A
+        // method still running (for example a Submit whose network call is
+        // in flight) is not reflected yet, so its action reads as not
+        // retained until that Submit returns, instead of waiting for it.
+        if (!view) {
+            WorkLock lock{*this};
+            return SavedActionsLocked(account, market);
+        }
         std::vector<interfaces::FlowMeshSavedAction> out;
-        if (account.IsNull()) return out;
-        // m_pending is already bounded by CLIENT_MAX_ACTIONS on admission and
-        // restore. No network, chain-index synchronization or durable writes.
-        for (const auto& [key, p] : m_pending) {
-            if (p.owner_account != account || (market && p.market != *market)) continue;
-            interfaces::FlowMeshSavedAction row;
-            row.market_id = p.market; row.domain = p.domain; row.execution_config_id = p.config;
-            row.account_id = account; row.receipt = p.receipt;
-            if (!p.action.IsDeposit()) row.sequence = p.action.sequence;
-            row.action_type = p.action.type;
-            switch (static_cast<flowmesh::ActionType>(p.action.type)) {
-            case flowmesh::ActionType::SUBMIT_BID:
-            case flowmesh::ActionType::CANCEL_BID: row.canonical_side = "bid"; break;
-            case flowmesh::ActionType::SUBMIT_ASK:
-            case flowmesh::ActionType::CANCEL_ASK: row.canonical_side = "ask"; break;
-            default: break;
-            }
-            if (!row.canonical_side.empty()) row.canonical_points = p.action.curve;
-            unsigned char digest[CSHA256::OUTPUT_SIZE];
-            CSHA256().Write(p.bytes.data(), p.bytes.size()).Finalize(digest);
-            row.signed_bytes_sha256 = HexStr(digest); row.signed_bytes_size = p.bytes.size();
-            row.initial_submission_ms = p.initial_submission_ms;
-            row.may_have_been_sent = p.may_have_been_sent; row.previously_certified = p.previously_certified;
-            out.push_back(std::move(row));
+        for (const auto& row : *view) {
+            if (row.account_id == account && (!market || row.market_id == *market)) out.push_back(row);
         }
         return out;
     }
@@ -1464,7 +1537,7 @@ public:
         FlowMeshClientReconnectResult out;
         out.status = "busy";
         out.error = "Another FlowMesh client request is running; retry this read-only command after it completes";
-        std::unique_lock work{m_work, std::try_to_lock};
+        WorkLock work{*this, std::try_to_lock};
         if (!work.owns_lock()) return out;
         if (m_endpoints.empty()) {
             out.status = "not_configured";
@@ -1509,7 +1582,7 @@ std::optional<interfaces::FlowMeshPendingCheckpoint> RemoteBackend::Checkpoint(c
     FlowMeshTimingSpan timing_lock_1431{__func__};
     timing_lock_1431.Field("lock_name", std::string{"client_work"});
     timing_lock_1431.Mark("lock_requested_us");
-    std::lock_guard lock{m_work};
+    WorkLock lock{*this};
     MarkWorkAcquired(timing_lock_1431);
     try {
         UniValue params{UniValue::VOBJ}; params.pushKV("market_id", id.GetHex());
@@ -1527,7 +1600,7 @@ std::vector<interfaces::FlowMeshVaultOperation> RemoteBackend::VaultOperations(c
     FlowMeshTimingSpan timing_lock_1445{__func__};
     timing_lock_1445.Field("lock_name", std::string{"client_work"});
     timing_lock_1445.Mark("lock_requested_us");
-    std::lock_guard lock{m_work};
+    WorkLock lock{*this};
     MarkWorkAcquired(timing_lock_1445);
     try {
         UniValue params{UniValue::VOBJ}; if (id) params.pushKV("market_id", id->GetHex());
@@ -1554,7 +1627,7 @@ std::optional<interfaces::FlowMeshVaultOperation> RemoteBackend::VaultOperation(
     FlowMeshTimingSpan timing_lock_1468{__func__};
     timing_lock_1468.Field("lock_name", std::string{"client_work"});
     timing_lock_1468.Mark("lock_requested_us");
-    std::lock_guard lock{m_work};
+    WorkLock lock{*this};
     MarkWorkAcquired(timing_lock_1468);
     try {
         UniValue params{UniValue::VOBJ}; params.pushKV("effect_id", id.GetHex());
