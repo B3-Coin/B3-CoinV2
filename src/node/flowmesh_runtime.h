@@ -641,7 +641,8 @@ private:
     std::thread m_worker;
 
     // Exact signed critical objects: <=8192 / 64 MiB globally, <=16 MiB per
-    // market. Retry at >=1s; lost completion expires at 5s; paused copies
+    // market. Retry at >=1s, or at once when a pause cancelled the admitted
+    // attempt; lost completion expires at 5s; paused copies
     // retire after 60s and halted/disarmed copies retire immediately.
     // Compact proof/entry
     // sources survive retention rotation; no retry creates a signature.

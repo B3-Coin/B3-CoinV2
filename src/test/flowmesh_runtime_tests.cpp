@@ -2270,6 +2270,53 @@ BOOST_AUTO_TEST_CASE(critical_caller_retry_respects_new_local_lock_without_perio
     BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 0U);
 }
 
+BOOST_AUTO_TEST_CASE(critical_paused_delivery_resends_immediately_after_reopen)
+{
+    using Outcome = node::FlowMeshDeliveryOutcome;
+    for (const bool reconciliation : {true, false}) {
+        DeliveryRuntimeFixture f{m_args.GetDataDirBase() / fs::PathFromString(
+            reconciliation ? "flowmesh_resume_reconciliation" : "flowmesh_resume_transition"),
+            node::FlowMeshDeliveryAdmission::ADMITTED};
+        const auto pause = [&](const bool paused) {
+            if (reconciliation) f.chain.SetReconciled(!paused);
+            else f.chain.SetTransition(f.market, paused ? node::FlowMeshSeatTransitionKind::PAUSED
+                                                        : node::FlowMeshSeatTransitionKind::CONTINUE);
+        };
+        // The proposal and the local vote were admitted to the peer and have
+        // not completed; the pause cancels those possibly unsent copies.
+        const auto original{f.Sent()};
+        BOOST_REQUIRE_EQUAL(original.size(), 2U);
+        pause(true);
+        f.Tick(std::chrono::milliseconds{100});
+        const auto cancelled{f.Cancelled()};
+        for (const auto& relay : original) {
+            BOOST_CHECK(std::find(cancelled.begin(), cancelled.end(), relay.delivery_id) != cancelled.end());
+        }
+        BOOST_CHECK_EQUAL(f.Sent().size(), 2U);
+        // Resumed 200 ms after the attempt, not after its one-second repeat.
+        pause(false);
+        f.Tick(std::chrono::milliseconds{100});
+        auto sent{f.Sent()};
+        CheckExactDeliveryRetry(original, sent, 2);
+        BOOST_CHECK_EQUAL(f.Snapshot().pending_objects, 2U);
+
+        // A pause that cancelled nothing, because the peer already took the
+        // bytes, keeps the normal repeat delay.
+        for (size_t i{2}; i < sent.size(); ++i) f.Complete(sent[i], Outcome::SOCKET_WRITTEN);
+        pause(true);
+        f.Tick(std::chrono::milliseconds{100});
+        pause(false);
+        f.Tick(std::chrono::milliseconds{100});
+        BOOST_CHECK_EQUAL(f.Sent().size(), 4U);
+        f.Tick(std::chrono::milliseconds{799});
+        BOOST_CHECK_EQUAL(f.Sent().size(), 4U);
+        f.Tick(std::chrono::milliseconds{1});
+        const std::vector<node::FlowMeshRuntimeRelay> resumed(sent.begin() + 2, sent.end());
+        CheckExactDeliveryRetry(resumed, f.Sent(), 4);
+        f.CheckLock(original);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(critical_paused_retention_expires_and_regenerates_exact_verified_objects)
 {
     using Admission = node::FlowMeshDeliveryAdmission;

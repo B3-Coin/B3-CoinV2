@@ -1828,6 +1828,8 @@ struct FlowMeshRuntime::PendingDelivery {
     bool local_key_required{false};
     flowmesh::WireClock::time_point next_attempt{};
     std::optional<flowmesh::WireClock::time_point> paused_since;
+    //! A pause cancelled this attempt's admitted, possibly unsent copies.
+    bool resend_on_resume{false};
     std::map<flowmesh::WirePeerId, flowmesh::WireClock::time_point> outstanding;
 };
 
@@ -2083,7 +2085,10 @@ bool FlowMeshRuntime::RecheckDelivery(const uint64_t id)
     const auto pause = [&](const char* reason) {
         const auto now{m_config.clock->Now()};
         if (!pending.paused_since) pending.paused_since = now;
-        if (!pending.outstanding.empty() && m_config.cancel_delivery) m_config.cancel_delivery(id);
+        if (!pending.outstanding.empty()) {
+            if (m_config.cancel_delivery) m_config.cancel_delivery(id);
+            pending.resend_on_resume = true;
+        }
         pending.outstanding.clear();
         if (now >= *pending.paused_since + DELIVERY_PAUSE_MAX_AGE) {
             EraseDelivery(id, "pause_expired");
@@ -2118,6 +2123,12 @@ bool FlowMeshRuntime::RecheckDelivery(const uint64_t id)
             return pause("chain_context_paused");
         }
     }
+    // Nothing proves that the copies a pause cancelled left this node, so
+    // resend them at the first bounded retry of the resumed context instead
+    // of waiting out the cancelled attempt's repeat delay. It is still the
+    // same exact signed object, and every retry budget still applies; only a
+    // later admission can arm this again.
+    if (std::exchange(pending.resend_on_resume, false)) pending.next_attempt = {};
     pending.paused_since.reset();
     return true;
 }
