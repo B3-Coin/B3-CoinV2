@@ -1003,7 +1003,7 @@ RPCHelpMan getflowmeshmarketdata()
                     {T::NUM, "proposals_verified_different_round", "Fully checked candidate proposals processed despite differing local rounds; not a count of unique signers"},
                     {T::NUM, "proposals_conflicting_lock", "Authenticated competing proposals ignored while preserving the exact local safety lock; not evidence of a conflicting certificate"},
                     {T::NUM, "attestations_without_candidate", "Decoded attestation frames naming an in-range seat received with no cached candidate; these are not verified votes"},
-                    {T::NUM, "last_message_observed_at", /*optional=*/true, "Local Unix observation time of market traffic, not certified time"},
+                    {T::NUM, "last_message_observed_at", /*optional=*/true, "Local Unix observation time of market traffic processed by the FlowMesh worker, not certified time; frames consumed at admission (exact repeats of verified agreement bytes, committee frames for already appended slots) are not counted"},
                     {T::STR_HEX, "local_locked_candidate", /*optional=*/true, "Cached local safety-lock candidate at the current signing position; no journal is read by this RPC"},
                 }},
             }},

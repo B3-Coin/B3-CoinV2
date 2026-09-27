@@ -331,6 +331,7 @@ static RPCHelpMan getflowmeshdeliveryinfo()
                     {RPCResult::Type::NUM, "receive_deferred", "Critical messages deferred after admission because B3 reconciliation started"},
                     {RPCResult::Type::NUM, "receive_refused", "Deferred ingress capacity or expiry refusals"},
                     {RPCResult::Type::NUM, "agreement_duplicates_coalesced", "Exact repeats of already verified preliminary-agreement bytes consumed at admission; not receipt of anything new"},
+                    {RPCResult::Type::NUM, "certified_slot_frames_consumed", "Committee frames for slots this node already appended (older votes and agreement messages, exact copies of its recent certified entries) consumed at admission without a queue slot or verification; not receipt of anything new"},
                     {RPCResult::Type::NUM, "deferred_objects", "Currently retained critical incoming objects"},
                     {RPCResult::Type::NUM, "deferred_bytes", "Bytes charged to retained critical incoming objects"},
                     {RPCResult::Type::STR, "current_reason", "Most recent delivery/refusal/retry reason"},
@@ -401,6 +402,7 @@ static RPCHelpMan getflowmeshdeliveryinfo()
                 item.pushKV("receive_deferred", snapshot.receive_deferred);
                 item.pushKV("receive_refused", snapshot.receive_refused);
                 item.pushKV("agreement_duplicates_coalesced", snapshot.agreement_duplicates_coalesced);
+                item.pushKV("certified_slot_frames_consumed", snapshot.certified_slot_frames_consumed);
                 item.pushKV("deferred_objects", uint64_t{snapshot.deferred_objects});
                 item.pushKV("deferred_bytes", uint64_t{snapshot.deferred_bytes});
                 item.pushKV("current_reason", snapshot.current_reason);

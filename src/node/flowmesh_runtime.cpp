@@ -690,7 +690,11 @@ struct WorkerTrace {
     uint64_t finish_lock_requested_us{0}, finish_locked_us{0};
     size_t queue_before{0}, queue_after{0}, queue_bytes{0}, control_depth{0};
     bool worker_processing{false}, worker_waiting{false}, tick_pending{false};
-    bool coalesced{false}, delivery_completion{false}, predicate_ready_before_wait{false};
+    // coalesced: an exact repeat of verified AGREEMENT bytes consumed at
+    // admission. certified_slot_consumed: a committee frame for a slot this
+    // worker has already appended, consumed at admission. Neither is queued.
+    bool coalesced{false}, certified_slot_consumed{false};
+    bool delivery_completion{false}, predicate_ready_before_wait{false};
     std::optional<flowmesh::WireHeader> header;
     flowmesh::WireMessageKind kind{flowmesh::WireMessageKind::ACTION};
     std::optional<flowmesh::WirePeerId> peer;
@@ -751,6 +755,7 @@ struct WorkerTrace {
             row.pushKV("worker_waiting", worker_waiting);
             row.pushKV("tick_pending", tick_pending);
             row.pushKV("coalesced", coalesced);
+            row.pushKV("certified_slot_consumed", certified_slot_consumed);
             row.pushKV("delivery_completion", delivery_completion);
             if (header) {
                 row.pushKV("market_id", header->market_id.GetHex());
@@ -3150,7 +3155,7 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
             ++certified->second.consumed;
             if (trace.enabled) {
                 trace.result = flowmesh::QueueResult::ACCEPTED;
-                trace.coalesced = true;
+                trace.certified_slot_consumed = true;
             }
             return flowmesh::QueueResult::ACCEPTED;
         }
