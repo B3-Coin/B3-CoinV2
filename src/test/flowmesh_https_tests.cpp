@@ -4,6 +4,7 @@
 
 #include <node/flowmesh_https.h>
 #include <node/flowmesh_client.h>
+#include <node/flowmesh_service.h>
 #include <crypto/sha256.h>
 #include <dbwrapper.h>
 #include <flowmesh/production_wire.h>
@@ -1977,6 +1978,66 @@ BOOST_AUTO_TEST_CASE(client_saved_view_reflects_completed_method)
     BOOST_CHECK(client->SavedActions(owner, uint256{}).empty());
     BOOST_CHECK(client->SavedActions(uint256{}, market).empty());
     BOOST_CHECK(client->SavedActions(uint256::ONE, market).empty());
+}
+
+BOOST_AUTO_TEST_CASE(trading_api_action_wait_contract_and_untracked_actions)
+{
+    // Not started: no runtime and no recorded action. The contract checks run
+    // before any wait, and an unrecorded action never takes a wait slot.
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-action-wait"};
+    const std::string ids{"\"market_id\":\"" + uint256::ONE.GetHex() + "\",\"action_id\":\"" +
+                          uint256{uint8_t{2}}.GetHex() + "\""};
+    const auto call = [&](node::FlowMeshHttpsServer& server, const std::string& params) {
+        const auto reply{node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1",
+            "{\"method\":\"action\",\"params\":{" + params + "}}", std::chrono::seconds{5}, 1 << 20)};
+        BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+        UniValue value;
+        BOOST_REQUIRE(value.read(reply.body));
+        return std::pair{reply.status, value};
+    };
+    std::string error;
+    {
+        // The default is disabled: exactly the previous request contract.
+        auto api{node::MakeFlowMeshTradingApi(service, Options())};
+        BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+        const auto [status, reply]{call(*api, ids)};
+        BOOST_CHECK_EQUAL(status, 200);
+        BOOST_CHECK_EQUAL(reply["result"]["receipt_state"].get_str(), "unknown");
+        BOOST_CHECK(!reply["result"].exists("wait_status"));
+        const auto [refused, rejection]{call(*api, ids + ",\"wait_ms\":500")};
+        BOOST_CHECK_EQUAL(refused, 400);
+        BOOST_CHECK_EQUAL(rejection["error"].get_str(), "Unknown or duplicate client API field");
+        api->Stop();
+    }
+    {
+        auto api{node::MakeFlowMeshTradingApi(service, Options(), {}, {std::chrono::milliseconds{2000}, 4})};
+        BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+        // A request without wait_ms gets the previous reply shape.
+        const auto [status, reply]{call(*api, ids)};
+        BOOST_CHECK_EQUAL(status, 200);
+        BOOST_CHECK(!reply["result"].exists("wait_status"));
+        for (const std::string wait : {"0", "500", "60000", "18446744073709551615"}) {
+            BOOST_TEST_CONTEXT("wait_ms=" << wait) {
+                const auto start{std::chrono::steady_clock::now()};
+                const auto [waited_status, waited]{call(*api, ids + ",\"wait_ms\":" + wait)};
+                BOOST_CHECK_EQUAL(waited_status, 200); // Large values are clamped, not refused.
+                BOOST_CHECK_EQUAL(waited["result"]["receipt_state"].get_str(), "unknown");
+                BOOST_CHECK_EQUAL(waited["result"]["wait_status"].get_str(), wait == "0" ? "none" : "untracked");
+                BOOST_CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{1});
+            }
+        }
+        for (const std::string bad : {"-1", "1.5", "\"500\"", "true", "18446744073709551616", "1,\"wait_ms\":2"}) {
+            BOOST_TEST_CONTEXT("wait_ms=" << bad) {
+                const auto [bad_status, rejection]{call(*api, ids + ",\"wait_ms\":" + bad)};
+                BOOST_CHECK_EQUAL(bad_status, 400);
+                BOOST_CHECK(!rejection["ok"].get_bool());
+            }
+        }
+        const auto [unknown_status, unknown]{call(*api, ids + ",\"wait\":500")};
+        BOOST_CHECK_EQUAL(unknown_status, 400);
+        BOOST_CHECK_EQUAL(unknown["error"].get_str(), "Unknown or duplicate client API field");
+        api->Stop();
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

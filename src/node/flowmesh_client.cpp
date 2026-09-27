@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see COPYING.
 #include <node/flowmesh_timing.h>
 #include <node/flowmesh_client.h>
+#include <node/flowmesh_action_wait.h>
 #include <node/flowmesh_client_join.h>
 #include <node/flowmesh_client_poll.h>
 #include <node/flowmesh_client_work.h>
@@ -56,6 +57,9 @@ constexpr size_t CLIENT_MAX_CACHED_MARKETS{8};
 constexpr size_t CLIENT_MAX_ACTIONS{512};
 constexpr size_t CLIENT_MAX_ENDPOINTS{8};
 constexpr auto CLIENT_REQUEST_TIMEOUT{std::chrono::seconds{5}};
+// A waited 'action' read ends at least this long before its HTTPS deadline,
+// leaving time to fetch the certified payload and write the reply.
+constexpr auto API_WAIT_REPLY_RESERVE{std::chrono::milliseconds{1000}};
 
 [[noreturn]] void Fail(const std::string& reason) { throw std::runtime_error(reason); }
 void Keys(const UniValue& value, std::initializer_list<const char*> allowed)
@@ -127,6 +131,13 @@ Receipt EventReceipt(const flowmesh::ClientEvent& event)
         break;
     case flowmesh::ClientEventKind::CERTIFIED_HEAD: break;
     }
+    return out;
+}
+Receipt LocalActionReceipt(const std::optional<flowmesh::ClientEvent>& status, const uint256& action)
+{
+    Receipt out; out.action_id = action;
+    if (status) out = EventReceipt(*status);
+    if (out.state == "certified_inclusion") out.certificate_verified = true;
     return out;
 }
 
@@ -215,9 +226,7 @@ public:
     }
     Receipt ActionStatus(const uint256& id, const uint256& action, bool retry) override
     {
-        Receipt out; out.action_id = action;
-        if (const auto status{m_service.ClientActionStatus(id, action)}) out = EventReceipt(*status);
-        if (out.state == "certified_inclusion") out.certificate_verified = true;
+        auto out{LocalActionReceipt(m_service.ClientActionStatus(id, action), action)};
         if (retry) out.reason += "; local retry requires the retained original signed action";
         return out;
     }
@@ -289,6 +298,9 @@ UniValue VaultJson(const interfaces::FlowMeshVaultOperation& op)
 class TradingApi {
     FlowMeshService& m_service;
     LocalBackend m_local;
+    // Zero when the bounded 'action' wait is disabled.
+    const std::chrono::milliseconds m_wait_max;
+    FlowMeshActionWaitSlots m_waits;
     std::mutex m_rate_mutex;
     struct Bucket { std::chrono::steady_clock::time_point time{}; unsigned count{0}; };
     std::map<std::string, Bucket> m_clients;
@@ -300,6 +312,9 @@ class TradingApi {
         if (const auto metadata{m_local.Metadata(status.base_asset)}) {
             out.pushKV("asset_display", FlowMeshAssetMetadataJson(status.domain, status.base_asset, *metadata));
         }
+        // Latency capability, never evidence: clients send wait_ms only to an
+        // endpoint that advertises it, since older servers reject the field.
+        if (m_wait_max.count()) out.pushKV("action_wait_ms_max", uint64_t(m_wait_max.count()));
         return out;
     }
     UniValue MarketResponse(const flowmesh::MarketData& data) const
@@ -352,10 +367,48 @@ class TradingApi {
         if (now - bucket.time >= std::chrono::seconds{1}) { bucket.time = now; bucket.count = 0; }
         return ++bucket.count <= 32;
     }
+    //! Bounded wait for the exact action's terminal status on this node.
+    //! Returns the wait_status label; replaces receipt only after a wait.
+    std::string WaitForAction(const FlowMeshHttpsServer::Request& http, const uint256& market,
+                              const uint256& action_id, const bool tracked, const std::chrono::milliseconds wait,
+                              Receipt& receipt, FlowMeshTimingSpan& timing)
+    {
+        // Only for an action this node already recorded ('submit' appends its
+        // queue event before it replies): random ActionIds cannot hold slots.
+        if (!tracked) return "untracked";
+        const auto now{std::chrono::steady_clock::now()};
+        const auto until{std::min(now + wait, http.deadline - API_WAIT_REPLY_RESERVE)};
+        if (until <= now) return "deadline";
+        auto slot{m_waits.TryAcquire(http.remote_address)};
+        if (!slot) return "busy";
+        timing.Mark("wait_started_us");
+        // Asleep, this request holds no HTTPS permit, so handshake, read and
+        // write concurrency stays at its bound. The server also resumes a
+        // handler that leaves this wait by an exception.
+        if (http.suspend) http.suspend();
+        const auto result{m_service.WaitClientActionStatus(market, action_id, until,
+            [&] { return m_waits.Interrupted(*slot); })};
+        if (http.resume) http.resume();
+        timing.Mark("wait_completed_us");
+        receipt = LocalActionReceipt(result.status, action_id);
+        return flowmesh::ClientWaitResultName(result.result);
+    }
 public:
-    explicit TradingApi(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata)
-        : m_service(service), m_local(service, std::move(metadata)) {}
-    UniValue Call(const UniValue& request)
+    explicit TradingApi(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait)
+        : m_service(service), m_local(service, std::move(metadata)),
+          m_wait_max{wait.waiters == 0 ? std::chrono::milliseconds{0}
+                                       : std::clamp(wait.max, std::chrono::milliseconds{0}, FLOWMESH_API_ACTION_WAIT_MAX)},
+          m_waits{m_wait_max.count() ? std::min(wait.waiters, FLOWMESH_API_ACTION_WAITERS_MAX) : 0} {}
+    size_t WaitSlots() const { return m_waits.Capacity(); }
+    //! Server stop hook: refuse new waits and end every current one.
+    void Interrupt()
+    {
+        m_waits.Close();
+        m_service.WakeClientWaiters();
+    }
+    //! Server start hook.
+    void Reopen() { m_waits.Open(); }
+    UniValue Call(const UniValue& request, const FlowMeshHttpsServer::Request& http)
     {
         FlowMeshTimingSpan timing{"https_server_api"};
         Keys(request, {"method", "params"});
@@ -433,14 +486,36 @@ public:
             return FlowMeshClientReceiptJson(m_local.Submit(id, *action));
         }
         if (method == "action") {
-            Keys(params, {"market_id", "action_id"});
+            // Disabled, the contract is exactly the previous one, in which
+            // wait_ms is an unknown field.
+            if (m_wait_max.count() == 0) Keys(params, {"market_id", "action_id"});
+            else Keys(params, {"market_id", "action_id", "wait_ms"});
             const auto id{Id(params, "market_id")};
-            auto receipt{m_local.ActionStatus(id, Id(params, "action_id"), false)};
+            const auto action_id{Id(params, "action_id")};
+            const bool wait_requested{params.exists("wait_ms")};
+            // Any unsigned integer is clamped to the advertised maximum.
+            const std::chrono::milliseconds wait{wait_requested
+                ? std::min<uint64_t>(Number(params, "wait_ms", std::numeric_limits<uint64_t>::max()), m_wait_max.count())
+                : 0};
+            // Same receipt as the local backend's ActionStatus(id, action, false).
+            const auto status{m_service.ClientActionStatus(id, action_id)};
+            auto receipt{LocalActionReceipt(status, action_id)};
+            std::string wait_status{"none"};
+            if (wait.count() > 0 && receipt.state != "certified_inclusion") {
+                wait_status = WaitForAction(http, id, action_id, status.has_value(), wait, receipt, timing);
+            }
             UniValue out{FlowMeshClientReceiptJson(receipt)};
             if (receipt.state == "certified_inclusion") {
+                // Never built from the event: this waits for the commit's
+                // market lock and reads the durable certified entry.
                 std::string error;
                 if (const auto payload{m_service.ClientCertifiedEntry(id, receipt.microblock_sequence, error)}) out.pushKV("certified_payload", HexStr(*payload));
                 else out.pushKV("evidence_error", error);
+            }
+            if (wait_requested) {
+                // A latency hint only, never evidence; absent unless requested.
+                out.pushKV("wait_status", wait_status);
+                timing.Field("wait_status", wait_status);
             }
             return out;
         }
@@ -478,7 +553,7 @@ public:
             UniValue parsed;
             if (!parsed.read(request.body)) Fail("Malformed public trading request");
             UniValue out{UniValue::VOBJ};
-            out.pushKV("ok", true); out.pushKV("result", Call(parsed));
+            out.pushKV("ok", true); out.pushKV("result", Call(parsed, request));
             auto body{out.write()};
             if (body.size() > CLIENT_MAX_REPLY) Fail("Public trading response exceeds snapshot bound");
             return {200, std::move(body)};
@@ -1765,10 +1840,17 @@ std::unique_ptr<FlowMeshTradingBackend> MakeRemoteFlowMeshBackend(
     catch (const std::exception& e) { error = e.what(); return {}; }
 }
 std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(FlowMeshService& service, FlowMeshHttpsServer::Options options,
-                                                        FlowMeshAssetMetadataCatalog metadata)
+                                                        FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait)
 {
     options.max_reply_bytes = CLIENT_MAX_REPLY;
-    auto api{std::make_shared<TradingApi>(service, std::move(metadata))};
+    auto api{std::make_shared<TradingApi>(service, std::move(metadata), wait)};
+    // Handshake, read, handler and write concurrency stays at the two workers
+    // the API always had. Each wait slot adds a worker that only sleeps in a
+    // suspended wait. Disabled waits leave exactly two workers and permits.
+    options.active_permits = FLOWMESH_API_ACTIVE_PERMITS;
+    options.worker_threads = FLOWMESH_API_ACTIVE_PERMITS + api->WaitSlots();
+    options.on_start = [api] { api->Reopen(); };
+    options.on_stop = [api] { api->Interrupt(); };
     return std::make_unique<FlowMeshHttpsServer>(std::move(options), [api](const auto& request) { return api->Handle(request); });
 }
 } // namespace node

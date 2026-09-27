@@ -48,6 +48,7 @@
 #include <netbase.h>
 #include <netgroup.h>
 #include <node/flowmesh_service.h>
+#include <node/flowmesh_action_wait.h>
 #include <node/flowmesh_client.h>
 #include <node/asset_metadata.h>
 #include <node/finality_recovery_options.h>
@@ -585,6 +586,8 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-flowmeshassetmetadata=<file>", "Explicit public asset label catalog for the FlowMesh operator and its HTTPS clients; JSON array, at most 256 entries/256 KiB. Labels are not issuer or backing proofs. Private wallet labels are never exported. Relative paths use the network datadir; loaded at startup. Requires -enableflowmeshvalidator=1.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshapibind=<ip>", "Numeric bind address for the restricted HTTPS trading API (default: 127.0.0.1)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshapiport=<port>", "Restricted HTTPS trading API port (default: 5650)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapiactionwait=<ms>", strprintf("Longest time the restricted HTTPS trading API holds an action-status read open until this node records the action's certified inclusion; offered only for actions this node has already seen, and advertised to clients (default: %d, 0 disables it and keeps the previous request contract, maximum: %d). Node-local latency policy, not consensus.", node::FLOWMESH_API_ACTION_WAIT_DEFAULT.count(), node::FLOWMESH_API_ACTION_WAIT_MAX.count()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-flowmeshapiactionwaiters=<n>", strprintf("Concurrent waited action-status reads on the restricted HTTPS trading API, at most %d per client IPv4 address or IPv6 /64 (default: %d, 0 disables waits, maximum: %d). Each adds a worker thread that only sleeps; HTTPS handshake, read and write work stays at %d connections at a time.", node::FlowMeshActionWaitSlots::MAX_PER_PEER, node::FLOWMESH_API_ACTION_WAITERS_DEFAULT, node::FLOWMESH_API_ACTION_WAITERS_MAX, node::FLOWMESH_API_ACTIVE_PERMITS), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshapicert=<file>", "PEM server certificate chain for the restricted HTTPS trading API; relative paths are resolved under the network datadir", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-flowmeshapikey=<file>", "PEM TLS server key for the restricted HTTPS trading API (not an FN or wallet key). Encrypted/prompted keys are unsupported; relative paths use the network datadir.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY | ArgsManager::SENSITIVE, OptionsCategory::CONNECTION);
     argsman.AddArg("-asmap=<file>", strprintf("Specify asn mapping used for bucketing of the peers. Relative paths will be prefixed by the net-specific datadir location.%s",
@@ -2100,7 +2103,16 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             }
             if (!options.cert_file.is_absolute()) options.cert_file = args.GetDataDirNet() / options.cert_file;
             if (!options.key_file.is_absolute()) options.key_file = args.GetDataDirNet() / options.key_file;
-            node.flowmesh_api = node::MakeFlowMeshTradingApi(*node.flowmesh, std::move(options), flowmesh_metadata);
+            const auto action_wait{args.GetIntArg("-flowmeshapiactionwait", node::FLOWMESH_API_ACTION_WAIT_DEFAULT.count())};
+            if (action_wait < 0 || action_wait > node::FLOWMESH_API_ACTION_WAIT_MAX.count()) {
+                return InitError(Untranslated(strprintf("-flowmeshapiactionwait must be between 0 and %d", node::FLOWMESH_API_ACTION_WAIT_MAX.count())));
+            }
+            const auto action_waiters{args.GetIntArg("-flowmeshapiactionwaiters", node::FLOWMESH_API_ACTION_WAITERS_DEFAULT)};
+            if (action_waiters < 0 || action_waiters > int64_t(node::FLOWMESH_API_ACTION_WAITERS_MAX)) {
+                return InitError(Untranslated(strprintf("-flowmeshapiactionwaiters must be between 0 and %d", node::FLOWMESH_API_ACTION_WAITERS_MAX)));
+            }
+            const node::FlowMeshTradingApiWait action_wait_policy{std::chrono::milliseconds{action_wait}, size_t(action_waiters)};
+            node.flowmesh_api = node::MakeFlowMeshTradingApi(*node.flowmesh, std::move(options), flowmesh_metadata, action_wait_policy);
             if (!node.flowmesh_api || !node.flowmesh_api->Start(flowmesh_error)) {
                 return InitError(Untranslated("FlowMesh HTTPS API failed to start: " + flowmesh_error));
             }
