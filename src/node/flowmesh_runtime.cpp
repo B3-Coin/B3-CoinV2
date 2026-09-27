@@ -536,8 +536,9 @@ struct FlowMeshRuntime::Market {
     uint256 last_hash;
     //! (sequence, entry hash) of the last few entries this runtime appended
     //! durably, oldest first. Only a filter for relayed duplicates; never a
-    //! source of certified state. The runtime halts before durable history
-    //! can disagree with it (RefreshMarker).
+    //! source of certified state. The store never erases or rewrites an
+    //! appended entry, and the runtime halts if its durable marker ever
+    //! disagrees with last_hash/next_sequence (RefreshMarker).
     static constexpr size_t RECENT_DURABLE_ENTRIES{8};
     std::deque<std::pair<uint64_t, uint256>> recent_durable;
     uint256 certified_state_root;
