@@ -81,6 +81,16 @@ struct FlowMeshPendingCheckpoint {
     uint32_t effect_count{0};
 };
 
+/** Test observation of the service's per-market memos since construction.
+ * Local counters only; never a protocol, durable or public status fact. */
+struct FlowMeshServiceMemoCounts {
+    //! Durable head-entry lookups, and the misses that read, decoded and
+    //! BLS-verified the entry.
+    uint64_t head_entry_lookups{0}, head_entry_reads{0};
+    //! Settlement-requirement lookups, and the misses that derived a plan.
+    uint64_t settlement_lookups{0}, settlement_plans{0};
+};
+
 /** One exact live keyless input selected for a type-9 vault operation. */
 struct FlowMeshVaultInput {
     FlowMeshVaultRecord record;
@@ -190,6 +200,9 @@ public:
                            const flowmesh::Action& action,
                            std::string& error);
     FlowMeshSeatKeyStatus SeatKeyStatus() const;
+    //! For tests: how often the seat transition's memos were consulted and
+    //! how often they had to recompute.
+    FlowMeshServiceMemoCounts MemoCountsForTest() const;
     bool ArmSeatKeys(std::vector<bls::SecretKey> keys, std::string& error,
                      const std::optional<uint256>& expected_fingerprint = std::nullopt,
                      FlowMeshSeatKeyStatus* result = nullptr);

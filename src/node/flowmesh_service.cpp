@@ -348,6 +348,9 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     mutable FlowMeshMarketMemo<FlowMeshHeadEntryKey,
                                std::shared_ptr<const StoredProductionEntry>>
         head_entries;
+    // Test observation only (MemoCountsForTest); relaxed, never a gate.
+    mutable std::atomic<uint64_t> head_entry_lookups{0}, head_entry_reads{0};
+    mutable std::atomic<uint64_t> settlement_lookups{0}, settlement_plans{0};
 
     // `marker` must be the caller's freshly read marker, and next_sequence
     // must be non-zero. The seat set is resolved live on every call and is
@@ -366,9 +369,11 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
                                        marker.next_sequence,
                                        marker.last_microblock_hash,
                                        seats->set_hash};
+        head_entry_lookups.fetch_add(1, std::memory_order_relaxed);
         const auto found{head_entries.Get(
             key,
             [&]() -> std::optional<std::shared_ptr<const StoredProductionEntry>> {
+                head_entry_reads.fetch_add(1, std::memory_order_relaxed);
                 std::optional<StoredProductionEntry> stored;
                 std::string error;
                 if (!store.ReadEntry(last_sequence, *seats, stored, error) ||
@@ -1108,9 +1113,11 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
             market_id, marker->domain, marker->next_sequence,
             marker->last_microblock_hash, through.height, through.hash,
             generation};
+        settlement_lookups.fetch_add(1, std::memory_order_relaxed);
         return settlement_requirements.Get(
             key,
             [&]() -> std::optional<bool> {
+                settlement_plans.fetch_add(1, std::memory_order_relaxed);
                 const auto stored{VerifiedHeadEntry(market_id, *store, *marker)};
                 if (!stored) return std::nullopt;
                 const auto plan{chain_facts->PlanWithdrawalSettlements(
@@ -2163,6 +2170,15 @@ FlowMeshSeatKeyStatus FlowMeshService::SeatKeyStatus() const
 {
     std::lock_guard<std::mutex> lock{m_impl->mutex};
     return m_impl->SeatKeyStatusLocked();
+}
+
+FlowMeshServiceMemoCounts FlowMeshService::MemoCountsForTest() const
+{
+    const auto& s{*m_impl};
+    return {s.head_entry_lookups.load(std::memory_order_relaxed),
+            s.head_entry_reads.load(std::memory_order_relaxed),
+            s.settlement_lookups.load(std::memory_order_relaxed),
+            s.settlement_plans.load(std::memory_order_relaxed)};
 }
 
 bool FlowMeshService::ArmSeatKeys(std::vector<bls::SecretKey> keys,

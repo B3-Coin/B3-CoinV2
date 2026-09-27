@@ -20,6 +20,7 @@
 #include <primitives/block.h>
 #include <test/util/setup_common.h>
 #include <validation.h>
+#include <validationinterface.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -70,6 +71,7 @@ struct FlowMeshServiceRestartSetup : TestingSetup {
     flowmesh::VaultId vault;
     flowmesh::ActiveFnBlsSeatSet seats;
     std::vector<bls::SecretKey> secrets;
+    COutPoint deposit_outpoint;
     CBlockIndex* original_tip{nullptr};
 
     FlowMeshServiceRestartSetup()
@@ -109,6 +111,7 @@ struct FlowMeshServiceRestartSetup : TestingSetup {
         CMutableTransaction bootstrap;
         bootstrap.version = 2;
         bootstrap.vout.push_back(*deposit);
+        deposit_outpoint = COutPoint{bootstrap.GetHash(), 0};
 
         LOCK(::cs_main);
         auto& chainstate{chainman.ActiveChainstate()};
@@ -254,6 +257,42 @@ struct FlowMeshServiceRestartSetup : TestingSetup {
         BOOST_REQUIRE(marker);
         BOOST_CHECK_EQUAL(marker->next_sequence, committed ? 1U : 0U);
         if (committed) BOOST_CHECK(marker->last_microblock_hash == entry.GetHash());
+    }
+
+    //! Connect one synthetic B3 block carrying `records` and index it.
+    void ConnectMpaBlock(const std::vector<CMpaRecord>& records)
+    {
+        LOCK(::cs_main);
+        auto& chainman{*m_node.chainman};
+        auto& chainstate{chainman.ActiveChainstate()};
+        auto& chain{chainstate.m_chain};
+        const auto& params{chainman.GetConsensus()};
+        CMutableTransaction transaction;
+        transaction.version = 2;
+        transaction.mpa = records;
+        CBlock block;
+        block.nVersion = 2;
+        block.hashPrevBlock = chain.Tip()->GetBlockHash();
+        block.nTime = chain.Tip()->nTime + 1;
+        block.nNonce = chain.Height() + 1;
+        block.vtx = {MakeTransactionRef(transaction)};
+        auto* index{chainman.m_blockman.InsertBlockIndex(block.GetHash())};
+        BOOST_REQUIRE(index);
+        index->nHeight = chain.Height() + 1;
+        index->pprev = chain.Tip();
+        index->nTime = block.nTime;
+        index->BuildSkip();
+        chain.SetTip(*index);
+        auto& seat_tracker{chainstate.ModernFnSeats()};
+        auto& vault_tracker{chainstate.ModernFlowMeshVaults()};
+        auto& checkpoint_tracker{chainstate.ModernFlowMeshCheckpoints()};
+        seat_tracker.BlockConnected(block, *index, params);
+        vault_tracker.BlockConnected(block, *index, params);
+        checkpoint_tracker.BlockConnected(block, *index, chain, params,
+                                         seat_tracker.Index(), vault_tracker.Index());
+        BOOST_REQUIRE(seat_tracker.Synced(index->GetBlockHash()));
+        BOOST_REQUIRE(vault_tracker.Synced(index->GetBlockHash()));
+        BOOST_REQUIRE(checkpoint_tracker.Synced(index->GetBlockHash()));
     }
 
     static bool WaitUntil(const std::function<bool()>& predicate)
@@ -701,6 +740,112 @@ BOOST_AUTO_TEST_CASE(preagreement_fresh_local_store_refuses_existing_b3_checkpoi
     std::optional<node::FlowMeshProductionStore::Marker> marker;
     BOOST_REQUIRE(store.ReadMarker(marker, error));
     BOOST_CHECK(!marker); // Refusal happens before a fresh V4 marker is written.
+}
+
+// SeatTransition runs on every runtime tick and candidate gate. Its settlement
+// check reads the durable head entry, which decodes it and re-verifies its
+// aggregated BLS certificate. The service answers from memory only while the
+// head, the observed anchor and the delivery generation are all unchanged.
+BOOST_AUTO_TEST_CASE(seat_transition_verifies_each_durable_head_once_and_replans_per_generation)
+{
+    const auto genesis{Genesis()};
+    Retain(genesis);
+    std::string error;
+    std::optional<node::FlowMeshPendingCheckpoint> checkpoint;
+    {
+        node::FlowMeshService service{*m_node.chainman, ServicePath()};
+        BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+        BOOST_REQUIRE_MESSAGE(service.ArmSeatKeys(secrets, error), error);
+        BOOST_REQUIRE(WaitUntil([&] {
+            const auto status{service.MarketStatus(market)};
+            return status && status->next_sequence == 1 &&
+                   status->halt == node::FlowMeshRuntimeHalt::NONE;
+        }));
+        // Until B3 anchors the market genesis, every transition pauses
+        // before it looks at the head.
+        BOOST_CHECK_EQUAL(service.MemoCountsForTest().head_entry_lookups, 0U);
+        checkpoint = service.NextCheckpointMpa(market, error);
+        BOOST_REQUIRE_MESSAGE(checkpoint, error);
+        BOOST_CHECK_EQUAL(checkpoint->sequence, 0U);
+    }
+    ConnectMpaBlock({checkpoint->record});
+
+    node::FlowMeshService service{*m_node.chainman, ServicePath()};
+    auto& signals{*m_node.validation_signals};
+    signals.RegisterValidationInterface(&service);
+    const struct Registration {
+        ValidationSignals& signals;
+        node::FlowMeshService& service;
+        ~Registration()
+        {
+            signals.UnregisterValidationInterface(&service);
+            signals.SyncWithValidationInterfaceQueue();
+        }
+    } registration{signals, service};
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    const auto counts = [&] { return service.MemoCountsForTest(); };
+    const auto report = [](const char* stage, const node::FlowMeshServiceMemoCounts& observed) {
+        BOOST_TEST_MESSAGE(stage << ": head lookups " << observed.head_entry_lookups << ", reads " << observed.head_entry_reads
+            << "; settlement lookups " << observed.settlement_lookups << ", plans " << observed.settlement_plans);
+    };
+    // Wait for `ticks` more settlement lookups on an unpaused market.
+    const auto settle = [&](const uint64_t ticks) {
+        const uint64_t target{counts().settlement_lookups + ticks};
+        return WaitUntil([&] {
+            const auto status{service.MarketStatus(market)};
+            return status && !status->paused && status->halt == node::FlowMeshRuntimeHalt::NONE &&
+                   counts().settlement_lookups >= target;
+        });
+    };
+
+    // One head, one anchor, one generation: many lookups, one verification.
+    BOOST_REQUIRE(settle(3));
+    const auto first{counts()};
+    report("first", first);
+    BOOST_CHECK_EQUAL(first.head_entry_reads, 1U);
+    BOOST_CHECK_GE(first.settlement_plans, 1U);
+    BOOST_REQUIRE(settle(8));
+    const auto steady{counts()};
+    report("steady", steady);
+    BOOST_CHECK_GE(steady.head_entry_lookups, first.head_entry_lookups + 8);
+    BOOST_CHECK_EQUAL(steady.head_entry_reads, first.head_entry_reads);
+    BOOST_CHECK_EQUAL(steady.settlement_plans, first.settlement_plans);
+
+    // A B3 tip callback reconciles and moves the delivery generation. The
+    // settlement answer is derived again; the unchanged head is not re-read.
+    const CBlockIndex* tip{WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip())};
+    signals.UpdatedBlockTip(tip, nullptr, /*fInitialDownload=*/false);
+    signals.SyncWithValidationInterfaceQueue();
+    BOOST_REQUIRE(settle(8));
+    const auto replanned{counts()};
+    report("replanned", replanned);
+    BOOST_CHECK_GT(replanned.settlement_plans, steady.settlement_plans);
+    BOOST_CHECK_EQUAL(replanned.head_entry_reads, steady.head_entry_reads);
+    BOOST_REQUIRE(settle(8));
+    BOOST_CHECK_EQUAL(counts().settlement_plans, replanned.settlement_plans);
+    BOOST_CHECK_EQUAL(counts().head_entry_reads, replanned.head_entry_reads);
+
+    // A new durable head (a certified deposit entry) is read and verified
+    // exactly once more, and its settlement answer is derived again.
+    BOOST_REQUIRE_MESSAGE(service.ArmSeatKeys(secrets, error), error);
+    flowmesh::Action deposit;
+    deposit.type = static_cast<uint8_t>(flowmesh::ActionType::DEPOSIT);
+    deposit.outpoint = deposit_outpoint;
+    BOOST_REQUIRE_MESSAGE(service.SubmitLocalAction(market, deposit, error), error);
+    BOOST_REQUIRE(WaitUntil([&] {
+        const auto status{service.MarketStatus(market)};
+        return status && status->next_sequence == 2;
+    }));
+    const auto before_new_head{replanned};
+    BOOST_REQUIRE(settle(8));
+    const auto moved{counts()};
+    report("moved", moved);
+    BOOST_CHECK_EQUAL(moved.head_entry_reads, before_new_head.head_entry_reads + 1);
+    BOOST_CHECK_GT(moved.settlement_plans, before_new_head.settlement_plans);
+    BOOST_REQUIRE(settle(8));
+    BOOST_CHECK_EQUAL(counts().head_entry_reads, moved.head_entry_reads);
+    BOOST_CHECK_EQUAL(counts().settlement_plans, moved.settlement_plans);
+    BOOST_CHECK(service.MarketStatus(market)->halt == node::FlowMeshRuntimeHalt::NONE);
 }
 
 BOOST_AUTO_TEST_CASE(dual_ingress_shares_vote_state_and_one_retained_signing_history)
