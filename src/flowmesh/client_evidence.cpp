@@ -179,25 +179,62 @@ const char* ClientEventKindName(const ClientEventKind kind)
     return "unknown";
 }
 
+const char* ClientWaitResultName(const ClientWaitResult result)
+{
+    switch (result) {
+    case ClientWaitResult::TERMINAL: return "terminal";
+    case ClientWaitResult::TIMEOUT: return "timeout";
+    case ClientWaitResult::INTERRUPTED: return "interrupted";
+    case ClientWaitResult::RESTARTED: return "restarted";
+    }
+    return "unknown";
+}
+
 ClientEventLog::ClientEventLog(const uint256& instance_id) : m_instance_id{instance_id} {}
 
 void ClientEventLog::Reset(const uint256& instance_id)
 {
-    std::lock_guard lock{m_mutex};
-    m_instance_id = instance_id;
-    m_last_event_id = 0;
-    m_events.clear();
+    {
+        std::lock_guard lock{m_mutex};
+        m_instance_id = instance_id;
+        m_last_event_id = 0;
+        m_events.clear();
+    }
+    m_changed.notify_all();
 }
 
-void ClientEventLog::Append(ClientEvent event)
+bool ClientEventLog::AppendLocked(ClientEvent&& event)
 {
-    std::lock_guard lock{m_mutex};
     // Practically unreachable; fail closed rather than wrap a resumable cursor.
-    if (m_last_event_id == std::numeric_limits<uint64_t>::max()) return;
+    if (m_last_event_id == std::numeric_limits<uint64_t>::max()) return false;
     event.event_id = ++m_last_event_id;
     event.reason.resize(std::min<size_t>(event.reason.size(), 160));
     m_events.push_back(std::move(event));
     if (m_events.size() > CLIENT_EVENT_CAPACITY) m_events.pop_front();
+    return true;
+}
+
+void ClientEventLog::Append(ClientEvent event)
+{
+    bool notify{false};
+    {
+        std::lock_guard lock{m_mutex};
+        notify = AppendLocked(std::move(event)) && m_waiters != 0;
+    }
+    // After unlocking: a woken waiter never blocks on the appender's lock.
+    if (notify) m_changed.notify_all();
+}
+
+void ClientEventLog::Append(std::vector<ClientEvent> events)
+{
+    bool appended{false};
+    bool notify{false};
+    {
+        std::lock_guard lock{m_mutex};
+        for (auto& event : events) appended = AppendLocked(std::move(event)) || appended;
+        notify = appended && m_waiters != 0;
+    }
+    if (notify) m_changed.notify_all();
 }
 
 ClientEventCursor ClientEventLog::Cursor() const
@@ -239,14 +276,91 @@ std::optional<ClientEvent> ClientEventLog::ActionStatus(const MarketId& market,
                                                       const uint256& action_id) const
 {
     std::lock_guard lock{m_mutex};
+    return ActionStatusLocked(market, action_id, nullptr);
+}
+
+std::optional<ClientEvent> ClientEventLog::ActionStatusLocked(const MarketId& market,
+                                                            const uint256& action_id,
+                                                            ClientEventKind* const newest) const
+{
     std::optional<ClientEvent> out;
     if (action_id.IsNull()) return out;
+    bool first{true};
     for (auto it{m_events.rbegin()}; it != m_events.rend(); ++it) {
         if (it->market_id != market || it->action_id != action_id) continue;
+        if (first && newest) *newest = it->kind;
+        first = false;
         if (!out || StatusPriority(it->kind) > StatusPriority(out->kind)) out = *it;
         if (out->kind == ClientEventKind::CERTIFIED_INCLUDED) break;
     }
     return out;
+}
+
+ClientActionWait ClientEventLog::WaitActionStatus(const MarketId& market, const uint256& action_id,
+                                                  const std::chrono::steady_clock::time_point deadline,
+                                                  const std::function<bool()>& interrupted) const
+{
+    std::unique_lock lock{m_mutex};
+    ClientEventKind newest{ClientEventKind::QUEUE_ADMITTED};
+    ClientActionWait out{ActionStatusLocked(market, action_id, &newest)};
+    const auto terminal = [&] {
+        return out.status && (out.status->kind == ClientEventKind::CERTIFIED_INCLUDED ||
+                              (out.status->kind == ClientEventKind::POOL_REFUSED &&
+                               newest == ClientEventKind::POOL_REFUSED));
+    };
+    if (terminal()) {
+        out.result = ClientWaitResult::TERMINAL;
+        return out;
+    }
+    if (action_id.IsNull()) return out;
+    const uint256 instance{m_instance_id};
+    const uint64_t wake{m_wake_epoch};
+    uint64_t seen{m_last_event_id};
+    // Declared after lock, so it is destroyed, and uncounted, under m_mutex.
+    struct Waiter {
+        size_t& count;
+        explicit Waiter(size_t& waiters) : count{waiters} { ++count; }
+        ~Waiter() { --count; }
+    } waiter{m_waiters};
+    while (true) {
+        if (!m_changed.wait_until(lock, deadline, [&] {
+                return m_last_event_id != seen || m_instance_id != instance ||
+                       m_wake_epoch != wake || (interrupted && interrupted());
+            })) {
+            return out; // TIMEOUT with the current nonterminal status.
+        }
+        if (m_instance_id != instance) {
+            out.status = ActionStatusLocked(market, action_id, nullptr);
+            out.result = ClientWaitResult::RESTARTED;
+            return out;
+        }
+        if (m_wake_epoch != wake || (interrupted && interrupted())) {
+            out.result = ClientWaitResult::INTERRUPTED;
+            return out;
+        }
+        // O(new events): unrelated appends never pay the full status scan.
+        // An eviction gap rescans rather than miss an evicted relevant event.
+        bool relevant{!m_events.empty() && m_events.front().event_id > seen + 1};
+        for (auto it{m_events.rbegin()}; !relevant && it != m_events.rend() && it->event_id > seen; ++it) {
+            relevant = it->market_id == market && it->action_id == action_id;
+        }
+        seen = m_last_event_id;
+        if (!relevant) continue;
+        out.status = ActionStatusLocked(market, action_id, &newest);
+        if (terminal()) {
+            out.result = ClientWaitResult::TERMINAL;
+            return out;
+        }
+    }
+}
+
+void ClientEventLog::WakeWaiters() const
+{
+    {
+        std::lock_guard lock{m_mutex};
+        ++m_wake_epoch;
+    }
+    m_changed.notify_all();
 }
 
 } // namespace flowmesh

@@ -8,9 +8,12 @@
 #include <flowmesh/market_data.h>
 #include <flowmesh/production_wire.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <vector>
 
 namespace flowmesh {
 
@@ -101,7 +104,22 @@ struct ClientEventPage {
     std::vector<ClientEvent> events;
 };
 
-/** Memory-only, globally bounded per runtime. No callbacks or network work.
+enum class ClientWaitResult : uint8_t {
+    TERMINAL,    // certified inclusion, or a refusal that is the newest event
+    TIMEOUT,     // deadline reached; the status is the current, nonterminal one
+    INTERRUPTED, // WakeWaiters() or the caller's interrupt predicate
+    RESTARTED,   // Reset(): a new instance; the status is re-read from it
+};
+const char* ClientWaitResultName(ClientWaitResult result);
+
+struct ClientActionWait {
+    std::optional<ClientEvent> status;
+    ClientWaitResult result{ClientWaitResult::TIMEOUT};
+};
+
+/** Memory-only, globally bounded per runtime. No callbacks or network work; a
+ * condition variable wakes bounded long-poll observers, whose count and
+ * lifetime the caller bounds. The log retains no per-waiter state.
  * An absent action status means unknown/expired, never a definite rejection.
  * Pool refusal is an observation of one attempt, not an execution outcome. */
 class ClientEventLog {
@@ -109,6 +127,10 @@ public:
     explicit ClientEventLog(const uint256& instance_id);
     void Reset(const uint256& instance_id);
     void Append(ClientEvent event);
+    /** Appends in order under one lock with one wakeup, so a commit's head
+     * and inclusion events cost one notification and are never observed
+     * partially applied. */
+    void Append(std::vector<ClientEvent> events);
     ClientEventCursor Cursor() const;
     ClientEventPage Read(const std::optional<ClientEventCursor>& after,
                          const std::optional<MarketId>& market,
@@ -116,11 +138,37 @@ public:
                          size_t limit = CLIENT_EVENT_PAGE_MAX) const;
     std::optional<ClientEvent> ActionStatus(const MarketId& market,
                                           const uint256& action_id) const;
+    /** Blocks until the exact action's ActionStatus is terminal, the bounded
+     * deadline passes, WakeWaiters() or interrupted() ends the wait, or
+     * Reset() starts a new instance. Terminal is CERTIFIED_INCLUDED, or
+     * POOL_REFUSED only while that refusal is also the action's newest event:
+     * a stale refusal followed by an exact retry keeps waiting. Returns the
+     * same status ActionStatus would at return; never an execution outcome.
+     * Sleeps without the log's mutex; only events for this action trigger a
+     * full status scan. interrupted() runs under that mutex and must be a
+     * nonblocking, lock-free read. */
+    ClientActionWait WaitActionStatus(const MarketId& market, const uint256& action_id,
+                                      std::chrono::steady_clock::time_point deadline,
+                                      const std::function<bool()>& interrupted) const;
+    /** Ends every current wait with INTERRUPTED (shutdown, never a result). */
+    void WakeWaiters() const;
 
 private:
+    // Caller holds m_mutex. False only at the fail-closed event-id limit.
+    bool AppendLocked(ClientEvent&& event);
+    // Caller holds m_mutex. newest, when given, receives the kind of the
+    // action's newest retained event (unchanged if there is none).
+    std::optional<ClientEvent> ActionStatusLocked(const MarketId& market,
+                                                const uint256& action_id,
+                                                ClientEventKind* newest) const;
+
     mutable std::mutex m_mutex;
+    mutable std::condition_variable m_changed;
     uint256 m_instance_id;
     uint64_t m_last_event_id{0};
+    mutable uint64_t m_wake_epoch{0};
+    // Current waiters; appends skip the notification when there are none.
+    mutable size_t m_waiters{0};
     std::deque<ClientEvent> m_events;
 };
 

@@ -13,6 +13,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <functional>
+#include <future>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -137,6 +142,36 @@ private:
 class NoSeatKeys final : public node::FlowMeshRuntimeKeyProvider {
     std::vector<bls::SecretKey> LocalSeatKeys(const uint256&,
         const flowmesh::ActiveFnBlsSeatSet&) const override { return {}; }
+};
+
+using WaitClock = std::chrono::steady_clock;
+using namespace std::chrono_literals;
+
+flowmesh::ClientEvent ActionEvent(unsigned char market, unsigned char action, flowmesh::ClientEventKind kind)
+{
+    flowmesh::ClientEvent event;
+    event.market_id = Filled(market);
+    event.action_id = Filled(action);
+    event.kind = kind;
+    return event;
+}
+
+/** The wait's interrupt predicate doubles as a probe: its first evaluation
+ * happens under the log mutex before the waiter sleeps, so any Append after
+ * AwaitEvaluations(1) is observed as a wakeup, not as the initial status. */
+struct WaitProbe {
+    std::atomic<size_t> evaluations{0};
+    std::atomic<bool> interrupt{false};
+    std::function<bool()> Predicate()
+    {
+        return [this] { ++evaluations; return interrupt.load(); };
+    }
+    void AwaitEvaluations(size_t count)
+    {
+        const auto deadline{WaitClock::now() + 5s};
+        while (evaluations.load() < count && WaitClock::now() < deadline) std::this_thread::sleep_for(1ms);
+        BOOST_REQUIRE_GE(evaluations.load(), count);
+    }
 };
 
 } // namespace
@@ -279,6 +314,189 @@ BOOST_AUTO_TEST_CASE(action_status_does_not_regress_when_queue_observation_arriv
     log.Append(event);
     BOOST_CHECK(log.ActionStatus(event.market_id, event.action_id)->kind == flowmesh::ClientEventKind::CERTIFIED_INCLUDED);
     BOOST_CHECK(!log.ActionStatus(event.market_id, Filled(9)));
+}
+
+BOOST_AUTO_TEST_CASE(action_wait_returns_on_certified_inclusion_without_polling)
+{
+    using Kind = flowmesh::ClientEventKind;
+    flowmesh::ClientEventLog log{Filled(1)};
+    log.Append(ActionEvent(2, 3, Kind::QUEUE_ADMITTED));
+    WaitProbe probe;
+    const auto start{WaitClock::now()};
+    auto waiter{std::async(std::launch::async, [&] {
+        return log.WaitActionStatus(Filled(2), Filled(3), start + 5s, probe.Predicate());
+    })};
+    probe.AwaitEvaluations(1);
+    std::this_thread::sleep_for(50ms);
+    log.Append(ActionEvent(2, 3, Kind::POOL_ADMITTED)); // Relevant but nonterminal.
+    // A commit appends its head and inclusion events in one batch.
+    flowmesh::ClientEvent head;
+    head.market_id = Filled(2);
+    head.kind = Kind::CERTIFIED_HEAD;
+    std::vector<flowmesh::ClientEvent> committed{head, ActionEvent(2, 3, Kind::CERTIFIED_INCLUDED)};
+    log.Append(std::move(committed));
+    const auto result{waiter.get()};
+    BOOST_CHECK(result.result == flowmesh::ClientWaitResult::TERMINAL);
+    BOOST_REQUIRE(result.status);
+    BOOST_CHECK(result.status->kind == Kind::CERTIFIED_INCLUDED);
+    BOOST_CHECK_EQUAL(result.status->event_id, 4U);
+    BOOST_CHECK(WaitClock::now() - start < 2s);
+    BOOST_CHECK_EQUAL(std::string{flowmesh::ClientWaitResultName(result.result)}, "terminal");
+    // The batch keeps event order and consecutive, resumable ids.
+    const auto page{log.Read(flowmesh::ClientEventCursor{Filled(1), 0}, {}, {})};
+    BOOST_REQUIRE_EQUAL(page.events.size(), 4U);
+    BOOST_CHECK(page.events[2].kind == Kind::CERTIFIED_HEAD && page.events[2].event_id == 3);
+    BOOST_CHECK(page.events[3].kind == Kind::CERTIFIED_INCLUDED && page.events[3].event_id == 4);
+}
+
+BOOST_AUTO_TEST_CASE(action_wait_times_out_with_current_nonterminal_status)
+{
+    flowmesh::ClientEventLog log{Filled(1)};
+    log.Append(ActionEvent(2, 3, flowmesh::ClientEventKind::POOL_ADMITTED));
+    WaitProbe probe;
+    const auto start{WaitClock::now()};
+    const auto result{log.WaitActionStatus(Filled(2), Filled(3), start + 100ms, probe.Predicate())};
+    BOOST_CHECK(WaitClock::now() - start >= 100ms);
+    BOOST_CHECK(result.result == flowmesh::ClientWaitResult::TIMEOUT);
+    BOOST_REQUIRE(result.status);
+    BOOST_CHECK(result.status->kind == flowmesh::ClientEventKind::POOL_ADMITTED);
+    // A never-recorded action is unknown, never a refusal, after its wait.
+    const auto unknown{log.WaitActionStatus(Filled(2), Filled(9), WaitClock::now() + 20ms, {})};
+    BOOST_CHECK(unknown.result == flowmesh::ClientWaitResult::TIMEOUT);
+    BOOST_CHECK(!unknown.status);
+}
+
+BOOST_AUTO_TEST_CASE(action_wait_ignores_unrelated_events)
+{
+    using Kind = flowmesh::ClientEventKind;
+    flowmesh::ClientEventLog log{Filled(1)};
+    log.Append(ActionEvent(2, 3, Kind::QUEUE_ADMITTED));
+    WaitProbe probe;
+    const auto start{WaitClock::now()};
+    auto waiter{std::async(std::launch::async, [&] {
+        return log.WaitActionStatus(Filled(2), Filled(3), start + 400ms, probe.Predicate());
+    })};
+    probe.AwaitEvaluations(1);
+    // Other actions, and the same ActionId in another market, never end it.
+    for (int i{0}; i < 20; ++i) {
+        log.Append(ActionEvent(2, 4, Kind::CERTIFIED_INCLUDED));
+        log.Append(ActionEvent(5, 3, Kind::CERTIFIED_INCLUDED));
+        std::this_thread::sleep_for(2ms);
+    }
+    const auto result{waiter.get()};
+    BOOST_CHECK(result.result == flowmesh::ClientWaitResult::TIMEOUT);
+    BOOST_REQUIRE(result.status);
+    BOOST_CHECK(result.status->kind == Kind::QUEUE_ADMITTED);
+    BOOST_CHECK(result.status->market_id == Filled(2));
+    // It was woken by unrelated appends and went back to sleep.
+    BOOST_CHECK_GT(probe.evaluations.load(), 1U);
+    BOOST_CHECK(WaitClock::now() - start >= 400ms);
+}
+
+BOOST_AUTO_TEST_CASE(action_wait_stale_refusal_then_retry_is_not_terminal_but_fresh_refusal_is)
+{
+    using Kind = flowmesh::ClientEventKind;
+    flowmesh::ClientEventLog log{Filled(1)};
+    log.Append(ActionEvent(2, 3, Kind::QUEUE_ADMITTED));
+    log.Append(ActionEvent(2, 3, Kind::POOL_REFUSED));
+    const auto fresh{log.WaitActionStatus(Filled(2), Filled(3), WaitClock::now() + 5s, {})};
+    BOOST_CHECK(fresh.result == flowmesh::ClientWaitResult::TERMINAL);
+    BOOST_REQUIRE(fresh.status);
+    BOOST_CHECK(fresh.status->kind == Kind::POOL_REFUSED);
+
+    // An exact retry is newer than the old refusal: keep waiting for it.
+    log.Append(ActionEvent(2, 3, Kind::QUEUE_ADMITTED));
+    const auto stale{log.WaitActionStatus(Filled(2), Filled(3), WaitClock::now() + 100ms, {})};
+    BOOST_CHECK(stale.result == flowmesh::ClientWaitResult::TIMEOUT);
+    BOOST_REQUIRE(stale.status);
+    BOOST_CHECK(stale.status->kind == Kind::POOL_REFUSED);
+
+    // The retry's own refusal is the newest event and ends the wait.
+    WaitProbe probe;
+    auto waiter{std::async(std::launch::async, [&] {
+        return log.WaitActionStatus(Filled(2), Filled(3), WaitClock::now() + 5s, probe.Predicate());
+    })};
+    probe.AwaitEvaluations(1);
+    log.Append(ActionEvent(2, 3, Kind::POOL_REFUSED));
+    const auto refused{waiter.get()};
+    BOOST_CHECK(refused.result == flowmesh::ClientWaitResult::TERMINAL);
+    BOOST_REQUIRE(refused.status);
+    BOOST_CHECK(refused.status->kind == Kind::POOL_REFUSED);
+
+    // Admission outranks a later refusal of another attempt: not terminal.
+    log.Append(ActionEvent(2, 6, Kind::POOL_ADMITTED));
+    log.Append(ActionEvent(2, 6, Kind::POOL_REFUSED));
+    const auto admitted{log.WaitActionStatus(Filled(2), Filled(6), WaitClock::now() + 100ms, {})};
+    BOOST_CHECK(admitted.result == flowmesh::ClientWaitResult::TIMEOUT);
+    BOOST_REQUIRE(admitted.status);
+    BOOST_CHECK(admitted.status->kind == Kind::POOL_ADMITTED);
+}
+
+BOOST_AUTO_TEST_CASE(action_wait_already_certified_returns_immediately)
+{
+    using Kind = flowmesh::ClientEventKind;
+    flowmesh::ClientEventLog log{Filled(1)};
+    log.Append(ActionEvent(2, 3, Kind::CERTIFIED_INCLUDED));
+    log.Append(ActionEvent(2, 3, Kind::QUEUE_ADMITTED)); // Late observation.
+    WaitProbe probe;
+    const auto start{WaitClock::now()};
+    const auto result{log.WaitActionStatus(Filled(2), Filled(3), start + 5s, probe.Predicate())};
+    BOOST_CHECK(WaitClock::now() - start < 1s);
+    BOOST_CHECK(result.result == flowmesh::ClientWaitResult::TERMINAL);
+    BOOST_REQUIRE(result.status);
+    BOOST_CHECK(result.status->kind == Kind::CERTIFIED_INCLUDED);
+    BOOST_CHECK_EQUAL(probe.evaluations.load(), 0U);
+    const auto null_action{log.WaitActionStatus(Filled(2), uint256{}, WaitClock::now() + 5s, {})};
+    BOOST_CHECK(!null_action.status);
+    BOOST_CHECK(WaitClock::now() - start < 1s);
+}
+
+BOOST_AUTO_TEST_CASE(action_wait_interrupt_and_reset_wake_waiters)
+{
+    using Kind = flowmesh::ClientEventKind;
+    flowmesh::ClientEventLog log{Filled(1)};
+    log.Append(ActionEvent(2, 3, Kind::QUEUE_ADMITTED));
+    {
+        WaitProbe probe;
+        const auto start{WaitClock::now()};
+        auto waiter{std::async(std::launch::async, [&] {
+            return log.WaitActionStatus(Filled(2), Filled(3), start + 5s, probe.Predicate());
+        })};
+        probe.AwaitEvaluations(1);
+        log.WakeWaiters();
+        const auto result{waiter.get()};
+        BOOST_CHECK(result.result == flowmesh::ClientWaitResult::INTERRUPTED);
+        BOOST_REQUIRE(result.status);
+        BOOST_CHECK(result.status->kind == Kind::QUEUE_ADMITTED);
+        BOOST_CHECK(WaitClock::now() - start < 2s);
+    }
+    {
+        // An earlier wakeup does not interrupt a later wait.
+        const auto later{log.WaitActionStatus(Filled(2), Filled(3), WaitClock::now() + 50ms, {})};
+        BOOST_CHECK(later.result == flowmesh::ClientWaitResult::TIMEOUT);
+    }
+    {
+        // A caller interrupted before it sleeps returns at once.
+        WaitProbe probe;
+        probe.interrupt = true;
+        const auto start{WaitClock::now()};
+        const auto result{log.WaitActionStatus(Filled(2), Filled(3), start + 5s, probe.Predicate())};
+        BOOST_CHECK(result.result == flowmesh::ClientWaitResult::INTERRUPTED);
+        BOOST_CHECK(WaitClock::now() - start < 1s);
+    }
+    {
+        WaitProbe probe;
+        const auto start{WaitClock::now()};
+        auto waiter{std::async(std::launch::async, [&] {
+            return log.WaitActionStatus(Filled(2), Filled(3), start + 5s, probe.Predicate());
+        })};
+        probe.AwaitEvaluations(1);
+        log.Reset(Filled(7));
+        const auto result{waiter.get()};
+        BOOST_CHECK(result.result == flowmesh::ClientWaitResult::RESTARTED);
+        BOOST_CHECK(!result.status); // The new instance has not seen the action.
+        BOOST_CHECK(WaitClock::now() - start < 2s);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(runtime_certified_action_status_recovers_after_restart_without_resubmission)

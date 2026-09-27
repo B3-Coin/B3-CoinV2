@@ -1775,17 +1775,23 @@ bool CommitCertified(Market& market,
     market.certified_state_root = certified.entry.state_root;
     market.client_head = certified;
     market.client_head_seat_count = market.seats.Size();
-    flowmesh::ClientEvent head_event;
+    // One append and one wakeup for the head and its inclusion events. A
+    // woken client-action waiter still reads the payload through
+    // ClientCertifiedEntry, which waits for this commit's market lock.
+    std::vector<flowmesh::ClientEvent> committed_events;
+    committed_events.reserve(1 + certified.entry.actions.size());
+    flowmesh::ClientEvent& head_event{committed_events.emplace_back()};
     head_event.market_id = market.market_id;
     head_event.kind = flowmesh::ClientEventKind::CERTIFIED_HEAD;
     head_event.microblock_sequence = certified.entry.sequence;
     head_event.microblock_hash = market.last_hash;
-    market.client_events.Append(std::move(head_event));
     for (const auto& action : certified.entry.actions) {
-        ClientActionEvent(market, flowmesh::ClientEventKind::CERTIFIED_INCLUDED,
-                          action, "semantic inclusion only; execution outcome not established by this event",
-                          &certified.entry);
+        committed_events.push_back(MakeClientActionEvent(
+            market, flowmesh::ClientEventKind::CERTIFIED_INCLUDED, action,
+            "semantic inclusion only; execution outcome not established by this event",
+            &certified.entry));
     }
+    market.client_events.Append(std::move(committed_events));
     market.local_observed_at = GetTime();
     ++market.next_sequence;
     market.pool.ClearDuplicateForwards(); // never rewrite a queued retry to the new head
