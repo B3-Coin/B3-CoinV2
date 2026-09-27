@@ -976,7 +976,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // config, exact signed bytes (and so its ActionId), submission time,
     // delivery and certification flags and owner, plus every market's
     // high-water head. Receipts are written for inspection but never
-    // restored: restart always requires fresh status evidence.
+    // restored: restart always requires fresh status evidence. A row's
+    // signed bytes never change, so their SHA-256 (cached when the row is
+    // created in Submit or Restore) stands for them without re-hashing up to
+    // CLIENT_MAX_ACTIONS instructions on every conditional save.
     uint256 RestartDigest() const
     {
         HashWriter hasher{};
@@ -984,8 +987,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         for (const auto& [market, head] : m_highwater) hasher << market << head.first << head.second;
         hasher << uint64_t{m_pending.size()};
         for (const auto& [key, p] : m_pending) {
-            hasher << p.market << p.domain << p.config << p.bytes << p.initial_submission_ms
-                   << p.may_have_been_sent << p.previously_certified << p.owner_account;
+            hasher << p.market << p.domain << p.config
+                   << (p.signed_bytes_sha256.empty() ? BytesSha256Hex(p.bytes) : p.signed_bytes_sha256)
+                   << p.initial_submission_ms << p.may_have_been_sent << p.previously_certified << p.owner_account;
         }
         return hasher.GetSHA256();
     }
