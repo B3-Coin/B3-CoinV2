@@ -650,7 +650,7 @@ RPCResult ClientStatusResult()
     return RPCResult{RPCResult::Type::OBJ, "", "Local trading client status", {
             {RPCResult::Type::STR, "backend", "local or remote"},
             {RPCResult::Type::BOOL, "engine_enabled", "Whether the optional local validator engine is enabled with -enableflowmeshvalidator"},
-            {RPCResult::Type::STR, "active_endpoint", "Endpoint of the most recent successful API result, or empty"},
+            {RPCResult::Type::STR, "active_endpoint", "Endpoint of the most recent successful ordinary API result (not a waited status read, which uses the endpoint that acknowledged the delivery), or empty"},
             {RPCResult::Type::STR, "selected_endpoint", "Explicitly selected remote endpoint, or initial configured endpoint; read failover may use another"},
             {RPCResult::Type::NUM, "event_gaps", "Observed cursor gaps requiring snapshot recovery"},
             {RPCResult::Type::NUM, "pending_actions", "Locally retained actions without a terminal receipt; not trades or fills"},
