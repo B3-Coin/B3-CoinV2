@@ -93,6 +93,47 @@ BOOST_AUTO_TEST_CASE(commands_header_and_strict_shapes_round_trip)
     BOOST_CHECK(check == WireCheck::TOO_LARGE);
 }
 
+// Admission asks only for the framing verdict. It must be exactly the
+// encoder's verdict, check code included, and Push's MALFORMED result.
+BOOST_AUTO_TEST_CASE(framing_check_is_the_encoder_verdict_without_encoding)
+{
+    using namespace flowmesh;
+    std::vector<WireMessage> messages;
+    for (const auto kind : {WireMessageKind::HELLO, WireMessageKind::ACTION,
+                            WireMessageKind::PROPOSAL, WireMessageKind::ATTESTATION,
+                            WireMessageKind::CERTIFICATE, WireMessageKind::GET,
+                            WireMessageKind::ENTRIES, WireMessageKind::AGREEMENT}) {
+        messages.push_back(Message(kind));
+        auto bad_version{Message(kind)};
+        ++bad_version.header.version;
+        messages.push_back(bad_version);
+        auto null_market{Message(kind)};
+        null_market.header.market_id.SetNull();
+        messages.push_back(null_market);
+        auto too_large{Message(kind)};
+        too_large.payload.assign(PayloadLimitForWireKind(kind) + 1, 0x42);
+        messages.push_back(too_large);
+        auto short_payload{Message(kind)};
+        short_payload.payload.pop_back();
+        messages.push_back(short_payload);
+        auto bad_prefix{Message(kind)};
+        bad_prefix.payload.front() ^= 0xff;
+        messages.push_back(bad_prefix);
+    }
+    BoundedWireQueue queue;
+    const auto now{WireClock::time_point{std::chrono::seconds{100}}};
+    size_t refused{0};
+    for (const auto& message : messages) {
+        WireCheck encoded_check{WireCheck::OK}, checked{WireCheck::UNKNOWN_COMMAND};
+        const bool encoded{EncodeWireMessage(message, encoded_check).has_value()};
+        BOOST_CHECK_EQUAL(CheckWireMessage(message, checked), encoded);
+        BOOST_CHECK(checked == encoded_check);
+        BOOST_CHECK_EQUAL(queue.Push(1, message, now) == QueueResult::MALFORMED, !encoded);
+        refused += !encoded;
+    }
+    BOOST_CHECK_GT(refused, 8U * 4U);
+}
+
 BOOST_AUTO_TEST_CASE(agreement_is_distinct_bounded_and_uses_critical_committee_budget)
 {
     using namespace flowmesh;

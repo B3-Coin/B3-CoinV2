@@ -118,6 +118,9 @@ const char* WireCheckName(WireCheck check);
 
 std::optional<std::vector<unsigned char>> EncodeWireMessage(const WireMessage& message,
                                                             WireCheck& check);
+/** EncodeWireMessage's framing verdict without building the encoded bytes.
+ * Admission needs only the verdict; the encoder uses this same check. */
+bool CheckWireMessage(const WireMessage& message, WireCheck& check);
 std::optional<WireMessage> DecodeWireMessage(WireMessageKind kind,
                                              std::span<const unsigned char> bytes,
                                              WireCheck& check);

@@ -3072,12 +3072,15 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     const std::optional<uint256> agreement_payload{
         message.kind == flowmesh::WireMessageKind::AGREEMENT
             ? std::optional<uint256>{Hash(message.payload)} : std::nullopt};
+    // A CERTIFICATE's entry bytes (up to 2 MiB) are hashed only when the
+    // record of recent appends holds an entry under this exact wire header,
+    // and never under the queue lock (see below). A first copy of a new
+    // certificate is never hashed here.
+    const auto certificate_bytes{message.kind == flowmesh::WireMessageKind::CERTIFICATE
+        ? CertifiedEntryBytes(message.payload) : std::nullopt};
     std::optional<uint256> certificate_entry;
-    if (message.kind == flowmesh::WireMessageKind::CERTIFICATE) {
-        if (const auto bytes{CertifiedEntryBytes(message.payload)}) certificate_entry = Hash(*bytes);
-    }
     if (trace.enabled) trace.queue_lock_requested_us = TraceNow(*m_config.clock);
-    std::lock_guard<std::mutex> lock{m_queue_mutex};
+    std::unique_lock<std::mutex> lock{m_queue_mutex};
     if (trace.enabled) {
         trace.queue_locked_us = TraceNow(*m_config.clock);
         trace.queue_before = trace.queue_after = m_queue.Size();
@@ -3138,27 +3141,49 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     // certificate that is not byte-identical to a recorded append
     // (CERTIFICATE_CONFLICT detection), still spends a committee token and
     // takes the verified path.
-    if (message.kind == flowmesh::WireMessageKind::ATTESTATION ||
-        message.kind == flowmesh::WireMessageKind::AGREEMENT ||
-        message.kind == flowmesh::WireMessageKind::CERTIFICATE) {
+    //
+    // Cheap checks first, under the lock: a recorded append for this market,
+    // a sequence below the next one to append and, for a CERTIFICATE, a
+    // recorded entry under the same wire header. Only then are the entry
+    // bytes hashed, outside the lock, and the record consulted again.
+    enum class Settled { NO, YES, NEEDS_ENTRY_HASH };
+    const auto settled_slot = [&] { // Caller holds m_queue_mutex.
+        if (message.kind != flowmesh::WireMessageKind::ATTESTATION &&
+            message.kind != flowmesh::WireMessageKind::AGREEMENT &&
+            message.kind != flowmesh::WireMessageKind::CERTIFICATE) return Settled::NO;
         const auto certified{m_certified_admission.find(message.header.market_id)};
-        if (certified != m_certified_admission.end() &&
-            message.header.sequence < certified->second.next_sequence &&
-            (message.kind != flowmesh::WireMessageKind::CERTIFICATE ||
-             (certificate_entry &&
-              std::any_of(certified->second.entries.begin(), certified->second.entries.end(),
-                          [&](const auto& entry) {
-                              return entry.first == message.header && entry.second == *certificate_entry;
-                          })))) {
-            flowmesh::WireCheck check;
-            if (!flowmesh::EncodeWireMessage(message, check)) return flowmesh::QueueResult::MALFORMED;
-            ++certified->second.consumed;
-            if (trace.enabled) {
-                trace.result = flowmesh::QueueResult::ACCEPTED;
-                trace.certified_slot_consumed = true;
-            }
-            return flowmesh::QueueResult::ACCEPTED;
+        if (certified == m_certified_admission.end() ||
+            message.header.sequence >= certified->second.next_sequence) return Settled::NO;
+        if (message.kind != flowmesh::WireMessageKind::CERTIFICATE) return Settled::YES;
+        if (!certificate_bytes) return Settled::NO;
+        for (const auto& [header, entry_hash] : certified->second.entries) {
+            if (header != message.header) continue;
+            if (!certificate_entry) return Settled::NEEDS_ENTRY_HASH;
+            if (entry_hash == *certificate_entry) return Settled::YES;
         }
+        return Settled::NO;
+    };
+    auto settled{settled_slot()};
+    if (settled == Settled::NEEDS_ENTRY_HASH) {
+        lock.unlock();
+        certificate_entry = Hash(*certificate_bytes);
+        lock.lock();
+        // Admission may have stopped, or the market been reset, meanwhile.
+        if (!m_started || m_stopping) return flowmesh::QueueResult::STOPPED;
+        if (m_admitted_markets.count(message.header.market_id) == 0) {
+            return flowmesh::QueueResult::MARKET_LIMIT;
+        }
+        settled = settled_slot();
+    }
+    if (settled == Settled::YES) {
+        flowmesh::WireCheck check;
+        if (!flowmesh::CheckWireMessage(message, check)) return flowmesh::QueueResult::MALFORMED;
+        ++m_certified_admission.at(message.header.market_id).consumed;
+        if (trace.enabled) {
+            trace.result = flowmesh::QueueResult::ACCEPTED;
+            trace.certified_slot_consumed = true;
+        }
+        return flowmesh::QueueResult::ACCEPTED;
     }
     if (trace.enabled) trace.enqueue_started_us = TraceNow(*m_config.clock);
     const auto result{m_queue.Push(peer, std::move(message),

@@ -184,21 +184,20 @@ const char* WireCheckName(const WireCheck check)
     return "unknown";
 }
 
-std::optional<std::vector<unsigned char>> EncodeWireMessage(
-    const WireMessage& message, WireCheck& check)
+bool CheckWireMessage(const WireMessage& message, WireCheck& check)
 {
     check = WireCheck::OK;
     if (message.header.version != FLOWMESH_WIRE_VERSION_V1) {
         check = WireCheck::BAD_VERSION;
-        return std::nullopt;
+        return false;
     }
     if (message.header.market_id.IsNull()) {
         check = WireCheck::NULL_MARKET;
-        return std::nullopt;
+        return false;
     }
     if (message.payload.size() > PayloadLimitForWireKind(message.kind)) {
         check = WireCheck::TOO_LARGE;
-        return std::nullopt;
+        return false;
     }
     if (!PayloadShapeValid(message.kind, message.payload)) {
         check = message.kind == WireMessageKind::GET
@@ -206,8 +205,15 @@ std::optional<std::vector<unsigned char>> EncodeWireMessage(
                     : message.kind == WireMessageKind::ENTRIES
                           ? WireCheck::BAD_CATCHUP_RESPONSE
                           : WireCheck::WRONG_LENGTH;
-        return std::nullopt;
+        return false;
     }
+    return true;
+}
+
+std::optional<std::vector<unsigned char>> EncodeWireMessage(
+    const WireMessage& message, WireCheck& check)
+{
+    if (!CheckWireMessage(message, check)) return std::nullopt;
     std::vector<unsigned char> out;
     out.reserve(FLOWMESH_WIRE_HEADER_SIZE + message.payload.size());
     AppendU16(out, message.header.version);
@@ -469,8 +475,10 @@ bool BoundedWireQueue::EvictOneLowerPriority(
 QueueResult BoundedWireQueue::Push(const WirePeerId peer, WireMessage message,
                                    const WireClock::time_point now)
 {
+    // Only the framing verdict is needed; never copy a (up to 4 MiB) frame
+    // just to discard the encoding under the caller's queue lock.
     WireCheck check;
-    if (!EncodeWireMessage(message, check)) return QueueResult::MALFORMED;
+    if (!CheckWireMessage(message, check)) return QueueResult::MALFORMED;
     if (!ConsumeTokens(peer, message, now)) return QueueResult::RATE_LIMITED;
 
     const size_t bytes{message.MemoryUsage()};
