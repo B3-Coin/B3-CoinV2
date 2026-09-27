@@ -29,6 +29,11 @@ struct FlowMeshJoinWindows {
     std::chrono::milliseconds max_observation_age{1000};
 };
 
+//! Upper bound of the regtest-only -flowmeshtestjoinwindowms, which sets both
+//! windows so a functional test can make a join deterministic. Production
+//! clients always use the defaults above.
+inline constexpr std::chrono::milliseconds FLOWMESH_TEST_JOIN_WINDOW_MAX{600'000};
+
 //! One retained own action of the signing account on the joined market.
 struct FlowMeshJoinOwnAction {
     enum class Kind {

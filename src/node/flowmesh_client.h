@@ -5,6 +5,7 @@
 
 #include <interfaces/chain.h>
 #include <node/flowmesh_asset_metadata.h>
+#include <node/flowmesh_client_join.h>
 #include <node/flowmesh_https.h>
 #include <univalue.h>
 
@@ -66,9 +67,11 @@ public:
 
 std::unique_ptr<FlowMeshTradingBackend> MakeLocalFlowMeshBackend(
     FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata = {});
+//! join_windows are the wallet signing preflight's join windows; only the
+//! regtest-only -flowmeshtestjoinwindowms passes anything but the defaults.
 std::unique_ptr<FlowMeshTradingBackend> MakeRemoteFlowMeshBackend(
     ChainstateManager& chainman, std::vector<HttpsEndpoint> endpoints,
-    const fs::path& client_datadir, std::string& error);
+    const fs::path& client_datadir, std::string& error, const FlowMeshJoinWindows& join_windows = {});
 
 //! Node-local latency policy for the restricted API's bounded 'action' wait,
 //! never consensus. A zero max or zero waiters disables it: no capability is

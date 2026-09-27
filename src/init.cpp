@@ -725,6 +725,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-acceptnonstdtxn", strprintf("Relay and mine \"non-standard\" transactions (test networks only; default: %u)", DEFAULT_ACCEPT_NON_STD_TXN), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-incrementalrelayfee=<amt>", strprintf("Fee rate (in %s/kvB) used to define cost of relay, used for mempool limiting and replacement policy. (default: %s)", CURRENCY_UNIT, FormatMoney(DEFAULT_INCREMENTAL_RELAY_FEE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-dustrelayfee=<amt>", strprintf("Fee rate (in %s/kvB) used to define dust, the value of an output such that it will cost more than its value in fees at this fee rate to spend it. (default: %s)", CURRENCY_UNIT, FormatMoney(DUST_RELAY_TX_FEE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-flowmeshtestjoinwindowms=<ms>", strprintf("Regtest only, for tests: set both windows within which the HTTPS trading client's wallet signing preflight may reuse a just-verified market refresh instead of requesting another (default: %d ms since that refresh completed and %d ms since it started; 0-%d)", node::FlowMeshJoinWindows{}.completion.count(), node::FlowMeshJoinWindows{}.max_observation_age.count(), node::FLOWMESH_TEST_JOIN_WINDOW_MAX.count()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-acceptstalefeeestimates", strprintf("Read fee estimates even if they are stale (%sdefault: %u) fee estimates are considered stale if they are %s hours old", "regtest only; ", DEFAULT_ACCEPT_STALE_FEE_ESTIMATES, Ticks<std::chrono::hours>(MAX_FILE_AGE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-bytespersigop", strprintf("Equivalent bytes per sigop in transactions for relay and mining (default: %u)", DEFAULT_BYTES_PER_SIGOP), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-datacarrier", strprintf("Relay and mine data carrier transactions (default: %u)", DEFAULT_ACCEPT_DATACARRIER), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
@@ -1196,6 +1197,16 @@ bool AppInitParameterInteraction(const ArgsManager& args)
             if (it == TEST_OPTIONS_DOC.end()) {
                 InitWarning(strprintf(_("Unrecognised option \"%s\" provided in -test=<option>."), option));
             }
+        }
+    }
+
+    if (args.IsArgSet("-flowmeshtestjoinwindowms")) {
+        if (chainparams.GetChainType() != ChainType::REGTEST) {
+            return InitError(Untranslated("-flowmeshtestjoinwindowms can only be used with regtest"));
+        }
+        const int64_t window{args.GetIntArg("-flowmeshtestjoinwindowms", 0)};
+        if (window < 0 || window > node::FLOWMESH_TEST_JOIN_WINDOW_MAX.count()) {
+            return InitError(Untranslated(strprintf("-flowmeshtestjoinwindowms must be between 0 and %d", node::FLOWMESH_TEST_JOIN_WINDOW_MAX.count())));
         }
     }
 
@@ -2028,6 +2039,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (flowmesh_api && !flowmesh_validator) {
         return InitError(Untranslated("-flowmeshapi requires -enableflowmeshvalidator=1"));
     }
+    if (args.IsArgSet("-flowmeshtestjoinwindowms") && flowmesh_validator) {
+        return InitError(Untranslated("-flowmeshtestjoinwindowms applies only to the HTTPS trading client (-enableflowmeshvalidator=0)"));
+    }
     node::FlowMeshAssetMetadataCatalog flowmesh_metadata;
     auto metadata_path{args.GetPathArg("-flowmeshassetmetadata")};
     if (!metadata_path.empty()) {
@@ -2143,8 +2157,15 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             }
             endpoints.push_back(std::move(endpoint));
         }
+        node::FlowMeshJoinWindows join_windows;
+        if (args.IsArgSet("-flowmeshtestjoinwindowms")) {
+            // Regtest-only and bounded, checked in AppInitParameterInteraction.
+            const std::chrono::milliseconds window{args.GetIntArg("-flowmeshtestjoinwindowms", 0)};
+            join_windows = {window, window};
+            LogInfo("FlowMesh signing preflight join windows set to %d ms for tests", window.count());
+        }
         node.flowmesh_trading = node::MakeRemoteFlowMeshBackend(
-            chainman, std::move(endpoints), args.GetDataDirNet() / "flowmesh_client", flowmesh_error);
+            chainman, std::move(endpoints), args.GetDataDirNet() / "flowmesh_client", flowmesh_error, join_windows);
         if (!node.flowmesh_trading) {
             return InitError(Untranslated("FlowMesh trading client failed to initialize: " + flowmesh_error));
         }

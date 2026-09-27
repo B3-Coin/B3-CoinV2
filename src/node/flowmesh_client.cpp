@@ -669,7 +669,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // Microblock high-water of verified own inclusions per market. Survives
     // eviction of certified actions from m_pending; only restricts joins.
     FlowMeshOwnCertifiedThrough m_own_certified_through{CLIENT_MAX_MARKETS};
-    const FlowMeshJoinWindows m_join_windows{};
+    // Local policy; only the regtest-only -flowmeshtestjoinwindowms changes it.
+    const FlowMeshJoinWindows m_join_windows;
     // Immutable copy of the retained actions as of the most recent m_work
     // release. Leaf lock, written only by the m_work owner; saved-action
     // reads never wait for network work. Null only if publication failed.
@@ -1589,8 +1590,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         return p.receipt;
     }
 public:
-    RemoteBackend(ChainstateManager& chainman, std::vector<HttpsEndpoint> endpoints, const fs::path& path)
-        : m_chainman{chainman}, m_path{path}
+    RemoteBackend(ChainstateManager& chainman, std::vector<HttpsEndpoint> endpoints, const fs::path& path,
+                  const FlowMeshJoinWindows& join_windows = {})
+        : m_chainman{chainman}, m_path{path}, m_join_windows{join_windows}
     {
         if (endpoints.size() > CLIENT_MAX_ENDPOINTS) Fail("At most eight independent trading endpoints may be configured");
         for (auto& endpoint : endpoints) {
@@ -2017,9 +2019,10 @@ std::unique_ptr<FlowMeshTradingBackend> MakeLocalFlowMeshBackend(FlowMeshService
     return std::make_unique<LocalBackend>(service, std::move(metadata));
 }
 std::unique_ptr<FlowMeshTradingBackend> MakeRemoteFlowMeshBackend(
-    ChainstateManager& chainman, std::vector<HttpsEndpoint> endpoints, const fs::path& client_datadir, std::string& error)
+    ChainstateManager& chainman, std::vector<HttpsEndpoint> endpoints, const fs::path& client_datadir, std::string& error,
+    const FlowMeshJoinWindows& join_windows)
 {
-    try { return std::make_unique<RemoteBackend>(chainman, std::move(endpoints), client_datadir); }
+    try { return std::make_unique<RemoteBackend>(chainman, std::move(endpoints), client_datadir, join_windows); }
     catch (const std::exception& e) { error = e.what(); return {}; }
 }
 std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(FlowMeshService& service, FlowMeshHttpsServer::Options options,
