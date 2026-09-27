@@ -21,6 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from feature_flowmesh_independent import RECONCILING_REFUSAL
 from feature_flowmesh_latency import FlowMeshLatencyTest, PRE_ADMISSION_REJECTIONS
 from feature_flowmesh_release import TRADE_PRICE
 from test_framework.authproxy import JSONRPCException
@@ -72,13 +73,34 @@ class FlowMeshActionWaitTest(FlowMeshLatencyTest):
         while True:
             self.pump_b3()
             try:
-                return getattr(self.client, method)(*params)
+                response = getattr(self.client, method)(*params)
+                break
             except JSONRPCException as error:
                 # Only an explicit refusal before submission permits signing again.
                 if error.error.get("code") != -1 or error.error.get("message") not in PRE_ADMISSION_REJECTIONS:
                     raise
                 assert time.monotonic() < deadline, "pre-admission gate did not reopen"
                 time.sleep(.05)
+        # A B3 block can connect after the wallet's status check passed and
+        # before the signed action reaches the endpoint, whose reconciliation
+        # gate then refuses it before runtime admission. That is returned as a
+        # receipt (rejected; unknown on a later attempt, which the client
+        # cannot tell from an earlier possible delivery), not as the error
+        # above, and nothing resends it: without this, the reads below would
+        # wait for an action no validator ever admitted. Resend the exact
+        # retained action, never a new signature, until an endpoint queues it.
+        action_id = response["action_id"]
+        while response["receipt_state"] not in {"queued", "admitted"}:
+            assert response["receipt_state"] in {"rejected", "unknown"}, response
+            assert_equal(response["reason"], RECONCILING_REFUSAL)
+            self.wait_report.setdefault("reconciling_refusals", []).append(
+                {"method": method, "action_id": action_id, "receipt_state": response["receipt_state"]})
+            assert time.monotonic() < deadline, "reconciliation gate did not reopen"
+            time.sleep(.05)
+            self.pump_b3()
+            response = self.client.retryflowmeshaction(params[0], action_id)
+            assert_equal(response["action_id"], action_id)
+        return response
 
     def check_capability(self, market):
         for index, advertised in ((0, WAIT_MAX_MS), (1, None)):
@@ -169,6 +191,13 @@ class FlowMeshActionWaitTest(FlowMeshLatencyTest):
             again, elapsed = self.action(market, action_id, WAIT_MAX_MS)
             assert_equal(again["wait_status"], "none")
             assert elapsed < 1000, elapsed
+            # Validator 1 applies the same certificate on its own schedule and
+            # cannot wait server-side (its waits are disabled): poll it until
+            # it reports the inclusion, then compare.
+            def validator1_included():
+                self.pump_b3()
+                return self.action(market, action_id, index=1)[0]["receipt_state"] == "certified_inclusion"
+            self.wait_until(validator1_included, timeout=30, check_interval=.1)
             other, _ = self.action(market, action_id, index=1)
             assert_equal((other["microblock_sequence"], other["microblock_hash"]),
                          (result["microblock_sequence"], result["microblock_hash"]))
