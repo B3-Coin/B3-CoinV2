@@ -100,14 +100,18 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
         # Without the new options every sample keeps its original assertions.
         self.strict_samples = not (self.options.record_reconnects or self.options.status_wait_ms or
                                    self.options.samples != len(PRICES))
-        self.status_wait_ms = 0  # Effective wait_ms, set once the client binary is known.
+        # The wait_ms passed when the client binary accepts it (0: immediate
+        # reads), set once the client is known. Endpoints may still answer at
+        # once; the summary counts which status requests were waited.
+        self.status_wait_ms = 0
         self.pump_ticks = deque(maxlen=256)  # Host time at the start of recent B3 pump ticks.
         self.capture_clock = None
         self.trade_report = {"format_version": 1, "arm": self.options.transport_arm,
             "harness_smoke": self.options.harness_smoke, "performance_measurement_qualified": False,
             "correctness_pass": False, "prices": list(self.prices), "samples": [], "child_exits": [],
             "sample_assertions": "per_sample" if self.strict_samples else "recorded_only",
-            "status_wait": {"requested_ms": self.options.status_wait_ms, "effective_ms": 0},
+            "status_wait": {"requested_ms": self.options.status_wait_ms, "client_accepts_wait_ms": 0,
+                            "measured_reads_end_by_next_b3_tick": True},
             "trace_limits_reached": [],
             "scope": {"operators": 4, "engine_off_clients": 1, "client_wallets": 2,
                 "HTTPS": "direct native TLS listeners; no relay", "B3_advancing": True,
@@ -141,7 +145,7 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
             # unchanged two-argument read; the report records which applied.
             supported = re.search(r"^3\. wait_ms\b", self.client.help("getflowmeshactionstatus"), re.M) is not None
             self.status_wait_ms = self.options.status_wait_ms if supported else 0
-            self.trade_report["status_wait"].update(client_supports_wait_ms=supported, effective_ms=self.status_wait_ms)
+            self.trade_report["status_wait"].update(client_supports_wait_ms=supported, client_accepts_wait_ms=self.status_wait_ms)
 
     def assert_engine_off(self):
         # Client/validator status are wallet RPCs too; the inherited helper
@@ -546,6 +550,12 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
             if self.options.transport_arm == "warm":
                 assert any(row["HTTPS"]["reused"] for row in samples), "persistent arm did not reuse HTTPS"
             reconnected = [row["HTTPS"]["measured_window"]["handshakes"] > 0 for row in samples]
+            callers = Counter()
+            for row in samples:
+                callers.update(row["HTTPS"]["measured_window"]["callers"])
+            first_capped = {}
+            for row in self.trade_report["trace_limits_reached"]:
+                first_capped.setdefault(str(row["node"]), row["sample"])
             self.trade_report["summary"] = {
                 "client_certified": distribution([row["bid"]["client_certified_ms"] for row in samples], 200),
                 "account_state_verified": distribution([row["account_state_verified_ms"] for row in samples], 200),
@@ -554,10 +564,17 @@ class FlowMeshPersistentTradesTest(FlowMeshLatencyTest):
                 "transport": {"measured_bid_submit_warm": sum(row["HTTPS"]["measured_bid_submit_warm"] for row in samples),
                     "measured_window_reconnected": sum(reconnected),
                     "measured_window_handshakes": sum(row["HTTPS"]["measured_window"]["handshakes"] for row in samples),
+                    # Waited-lane versus ordinary status requests inside the
+                    # bid windows: a waited run that fell back reads 'action'.
+                    "measured_window_status_requests": {name: callers[name] for name in ("client_action_wait", "action")},
                     "client_certified_without_handshake": distribution([row["bid"]["client_certified_ms"]
                         for row, paid in zip(samples, reconnected) if not paid], 200),
                     "client_certified_with_handshake": distribution([row["bid"]["client_certified_ms"]
-                        for row, paid in zip(samples, reconnected) if paid], 200)}}
+                        for row, paid in zip(samples, reconnected) if paid], 200)},
+                # Node -> first sample whose capture hit a validator trace cap:
+                # that stream stops inside this capture and is absent from
+                # later ones, and its tracing overhead ends with it.
+                "trace_limits_first_sample": first_capped}
             advanced = [row["bid"]["b3"]["advanced_in_window"] for row in samples]
             overdue = max(row[key]["b3"]["status_read_max_overdue_ms"] for row in samples for key in ("ask", "bid"))
             self.trade_report["summary"]["b3_during_bid"] = {
