@@ -254,10 +254,13 @@ class SplitHttpsPeer {
     }
 
 public:
-    SplitHttpsPeer(uint16_t port, const fs::path& certificate, int max_version = 0)
+    //! receive_buffer, when nonzero, sets SO_RCVBUF before connecting, so a
+    //! peer that stops reading holds back a large reply early.
+    SplitHttpsPeer(uint16_t port, const fs::path& certificate, int max_version = 0, int receive_buffer = 0)
     {
         BOOST_REQUIRE(m_fd != INVALID_SOCKET);
         BOOST_REQUIRE(m_context);
+        if (receive_buffer) BOOST_REQUIRE_EQUAL(m_socket.SetSockOpt(SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof(receive_buffer)), 0);
         if (max_version) BOOST_REQUIRE_EQUAL(SSL_CTX_set_max_proto_version(m_context.get(), max_version), 1);
         // Count resumable sessions the server offers (a ticket or a cacheable
         // session ID). Nothing is stored or offered back to the server.
@@ -349,6 +352,25 @@ public:
     }
 
     std::string ReadRejection() { return ReadResponse(REJECTION_BODY.size()); }
+
+    //! Reads plaintext until the server closes the connection, `limit` bytes
+    //! or 5 s. Returns the byte count and the first bytes (the status line).
+    std::pair<size_t, std::string> Drain(size_t limit)
+    {
+        size_t total{0};
+        std::string head;
+        std::vector<char> bytes(64 * 1024);
+        const auto deadline{Clock::now() + std::chrono::seconds{5}};
+        while (total < limit) {
+            ERR_clear_error();
+            const int result{SSL_read(m_ssl.get(), bytes.data(), static_cast<int>(bytes.size()))};
+            if (result > 0) {
+                if (head.size() < 64) head.append(bytes.data(), std::min<size_t>(result, 64 - head.size()));
+                total += result;
+            } else if (!Again(result, deadline)) break;
+        }
+        return {total, head};
+    }
     size_t SessionsOffered() const { return m_sessions_offered; }
     int Version() const { return SSL_version(m_ssl.get()); }
 
@@ -941,13 +963,16 @@ BOOST_AUTO_TEST_CASE(https_start_and_stop_hooks_bracket_workers_and_release_a_wa
 
 BOOST_AUTO_TEST_CASE(https_active_permits_bound_handshake_read_and_write)
 {
+    constexpr size_t LARGE_REPLY{16 * 1024 * 1024};
     auto options{Options()};
     options.worker_threads = 8;
     options.active_permits = 2;
     options.request_timeout = std::chrono::seconds{3};
+    options.max_reply_bytes = LARGE_REPLY + 1024;
     std::atomic<unsigned> handled{0};
-    node::FlowMeshHttpsServer server{options, [&](const auto&) {
+    node::FlowMeshHttpsServer server{options, [&](const auto& request) {
         ++handled;
+        if (request.body == "large") return node::FlowMeshHttpsServer::Response{200, std::string(LARGE_REPLY, 'x')};
         return node::FlowMeshHttpsServer::Response{200, "{}"};
     }};
     ConnectionObservation observed;
@@ -976,6 +1001,34 @@ BOOST_AUTO_TEST_CASE(https_active_permits_bound_handshake_read_and_write)
     BOOST_REQUIRE(second.Send(request));
     BOOST_REQUIRE(second.ReadResponse(2).starts_with("HTTP/1.1 200 "));
     BOOST_CHECK_EQUAL(handled.load(), 3U);
+
+    // Write: a peer that stops reading a reply far larger than the socket
+    // buffers keeps its permit while the server's write is blocked, and a
+    // peer in its read holds the other; again no further handshake starts.
+    SplitHttpsPeer slow{server.Port(), cert, 0, 4096};
+    SplitHttpsPeer holder{server.Port(), cert};
+    BOOST_REQUIRE(observed.Await(5));
+    BOOST_REQUIRE(slow.Send("POST /flowmesh/v1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nlarge"));
+    const auto handler_deadline{std::chrono::steady_clock::now() + std::chrono::seconds{2}};
+    while (handled.load() < 4 && std::chrono::steady_clock::now() < handler_deadline) std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    BOOST_REQUIRE_EQUAL(handled.load(), 4U);
+    auto fourth{std::async(std::launch::async, [&] {
+        return node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{3}, 1024);
+    })};
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    BOOST_CHECK_EQUAL(observed.Count(), 5U);
+    BOOST_CHECK(fourth.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
+    // Reading the whole reply completes the write and frees that permit.
+    const auto [drained, head]{slow.Drain(LARGE_REPLY + 4096)};
+    BOOST_CHECK(head.starts_with("HTTP/1.1 200 "));
+    BOOST_CHECK_GT(drained, LARGE_REPLY);
+    const auto fourth_reply{fourth.get()};
+    BOOST_REQUIRE_MESSAGE(fourth_reply.response_received, fourth_reply.error);
+    BOOST_CHECK_EQUAL(fourth_reply.status, 200);
+    BOOST_CHECK_EQUAL(observed.Count(), 6U);
+    BOOST_REQUIRE(holder.Send(request));
+    BOOST_REQUIRE(holder.ReadResponse(2).starts_with("HTTP/1.1 200 "));
+    BOOST_CHECK_EQUAL(handled.load(), 6U);
     server.Stop();
 }
 
