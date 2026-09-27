@@ -393,6 +393,91 @@ BOOST_AUTO_TEST_CASE(action_wait_ignores_unrelated_events)
     BOOST_CHECK(WaitClock::now() - start >= 400ms);
 }
 
+BOOST_AUTO_TEST_CASE(action_wait_timeout_forgets_status_evicted_by_unrelated_append)
+{
+    using Kind = flowmesh::ClientEventKind;
+    for (const auto kind : {Kind::QUEUE_ADMITTED, Kind::POOL_ADMITTED}) {
+        flowmesh::ClientEventLog log{Filled(1)};
+        log.Append(ActionEvent(2, 3, kind)); // The watched action is oldest.
+        for (size_t i{1}; i < flowmesh::CLIENT_EVENT_CAPACITY; ++i) {
+            log.Append(ActionEvent(2, 4, Kind::CERTIFIED_INCLUDED));
+        }
+        const auto before{log.ActionStatus(Filled(2), Filled(3))};
+        BOOST_REQUIRE(before);
+        BOOST_CHECK_EQUAL(before->event_id, 1U);
+        BOOST_CHECK_EQUAL(log.Cursor().event_id, flowmesh::CLIENT_EVENT_CAPACITY);
+
+        // Signal from the first predicate evaluation under the log mutex:
+        // the status has already been sampled, and Append cannot acquire
+        // that mutex until the waiter releases it to sleep. No timing sleep
+        // is used to arrange the eviction after the initial status lookup.
+        std::promise<void> sampled;
+        auto sampled_future{sampled.get_future()};
+        std::atomic<bool> signalled{false};
+        auto waiter{std::async(std::launch::async, [&] {
+            return log.WaitActionStatus(Filled(2), Filled(3), WaitClock::now() + 1s, [&] {
+                if (!signalled.exchange(true)) sampled.set_value();
+                return false;
+            });
+        })};
+        BOOST_REQUIRE(sampled_future.wait_for(5s) == std::future_status::ready);
+        BOOST_REQUIRE(waiter.wait_for(0ms) == std::future_status::timeout);
+        log.Append(ActionEvent(2, 4, Kind::CERTIFIED_INCLUDED));
+        // One unrelated append evicts the target without creating a gap
+        // after the waiter's last-seen cursor. Ordinary status is now unknown.
+        const auto current{log.ActionStatus(Filled(2), Filled(3))};
+        BOOST_CHECK(!current);
+        const auto result{waiter.get()};
+        BOOST_CHECK(result.result == flowmesh::ClientWaitResult::TIMEOUT);
+        BOOST_CHECK_EQUAL(result.status.has_value(), current.has_value());
+        BOOST_CHECK(!result.status);
+        const auto page{log.Read({}, {}, {})};
+        BOOST_CHECK_EQUAL(page.oldest_event_id, 2U);
+        BOOST_CHECK_EQUAL(page.latest_event_id - page.oldest_event_id + 1,
+                          flowmesh::CLIENT_EVENT_CAPACITY);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(action_wait_eviction_rechecks_retained_refusal_priority)
+{
+    using Kind = flowmesh::ClientEventKind;
+    flowmesh::ClientEventLog log{Filled(1)};
+    log.Append(ActionEvent(2, 3, Kind::POOL_ADMITTED));
+    log.Append(ActionEvent(2, 3, Kind::POOL_REFUSED));
+    for (size_t i{2}; i < flowmesh::CLIENT_EVENT_CAPACITY; ++i) {
+        log.Append(ActionEvent(2, 4, Kind::CERTIFIED_INCLUDED));
+    }
+    // Admission outranks a later refusal of another attempt while retained.
+    const auto before{log.ActionStatus(Filled(2), Filled(3))};
+    BOOST_REQUIRE(before);
+    BOOST_CHECK(before->kind == Kind::POOL_ADMITTED);
+
+    std::promise<void> sampled;
+    auto sampled_future{sampled.get_future()};
+    std::atomic<bool> signalled{false};
+    auto waiter{std::async(std::launch::async, [&] {
+        return log.WaitActionStatus(Filled(2), Filled(3), WaitClock::now() + 5s, [&] {
+            if (!signalled.exchange(true)) sampled.set_value();
+            return false;
+        });
+    })};
+    BOOST_REQUIRE(sampled_future.wait_for(5s) == std::future_status::ready);
+    BOOST_REQUIRE(waiter.wait_for(0ms) == std::future_status::timeout);
+    log.Append(ActionEvent(2, 4, Kind::CERTIFIED_INCLUDED));
+    // Only the older admission expired. The retained refusal is now both
+    // the ordinary status and this action's newest event, so it is terminal.
+    const auto current{log.ActionStatus(Filled(2), Filled(3))};
+    BOOST_REQUIRE(current);
+    BOOST_CHECK_EQUAL(current->event_id, 2U);
+    BOOST_CHECK(current->kind == Kind::POOL_REFUSED);
+    BOOST_CHECK(waiter.wait_for(1s) == std::future_status::ready);
+    const auto result{waiter.get()};
+    BOOST_CHECK(result.result == flowmesh::ClientWaitResult::TERMINAL);
+    BOOST_REQUIRE(result.status);
+    BOOST_CHECK_EQUAL(result.status->event_id, current->event_id);
+    BOOST_CHECK(result.status->kind == current->kind);
+}
+
 BOOST_AUTO_TEST_CASE(action_wait_stale_refusal_then_retry_is_not_terminal_but_fresh_refusal_is)
 {
     using Kind = flowmesh::ClientEventKind;

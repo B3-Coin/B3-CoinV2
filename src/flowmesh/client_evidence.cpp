@@ -338,9 +338,12 @@ ClientActionWait ClientEventLog::WaitActionStatus(const MarketId& market, const 
             out.result = ClientWaitResult::INTERRUPTED;
             return out;
         }
-        // O(new events): unrelated appends never pay the full status scan.
-        // An eviction gap rescans rather than miss an evicted relevant event.
-        bool relevant{!m_events.empty() && m_events.front().event_id > seen + 1};
+        // O(new events): unrelated appends need a full status scan only when
+        // they evict the cached observation or leave a gap after our cursor.
+        // Eviction may expose a lower-priority retained event, or no status.
+        bool relevant{!m_events.empty() &&
+            (m_events.front().event_id > seen + 1 ||
+             (out.status && out.status->event_id < m_events.front().event_id))};
         for (auto it{m_events.rbegin()}; !relevant && it != m_events.rend() && it->event_id > seen; ++it) {
             relevant = it->market_id == market && it->action_id == action_id;
         }
