@@ -34,6 +34,7 @@
 #include <condition_variable>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -337,6 +338,49 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     // never cached. The memo locks only its own leaf mutex.
     mutable FlowMeshMarketMemo<FlowMeshSettlementRequirementKey, bool>
         settlement_requirements;
+
+    // The durable log is append-only, so the entry named by one exact marker
+    // head never changes. Reading it decodes the entry, re-verifies its
+    // aggregated BLS certificate and recomputes its effect root, and the seat
+    // transition performs that read twice on every candidate gate. Retain the
+    // already-verified result for exactly that head identity, one per market.
+    // Shared and immutable, so a hit never copies the entry's effects.
+    mutable FlowMeshMarketMemo<FlowMeshHeadEntryKey,
+                               std::shared_ptr<const StoredProductionEntry>>
+        head_entries;
+
+    // `marker` must be the caller's freshly read marker, and next_sequence
+    // must be non-zero. The seat set is resolved live on every call and is
+    // part of the key. A rollback changes the head identity and therefore
+    // the key, so a stale entry can never be returned for a new head, and
+    // nothing is retained when the read or the seat lookup fails.
+    std::shared_ptr<const StoredProductionEntry> VerifiedHeadEntry(
+        const flowmesh::MarketId& market_id, FlowMeshProductionStore& store,
+        const FlowMeshProductionStore::Marker& marker) const
+    {
+        const uint64_t last_sequence{marker.next_sequence - 1};
+        const auto seats{SeatSetForSequence(marker.domain, market_id,
+                                            last_sequence)};
+        if (!seats) return nullptr;
+        const FlowMeshHeadEntryKey key{market_id, marker.domain,
+                                       marker.next_sequence,
+                                       marker.last_microblock_hash,
+                                       seats->set_hash};
+        const auto found{head_entries.Get(
+            key,
+            [&]() -> std::optional<std::shared_ptr<const StoredProductionEntry>> {
+                std::optional<StoredProductionEntry> stored;
+                std::string error;
+                if (!store.ReadEntry(last_sequence, *seats, stored, error) ||
+                    !stored) {
+                    return std::nullopt;
+                }
+                return std::make_shared<const StoredProductionEntry>(
+                    std::move(*stored));
+            },
+            [] { return true; })};
+        return found ? *found : nullptr;
+    }
 
     // Caller holds mutex; neither this snapshot nor the CAS token contains secrets.
     FlowMeshSeatKeyStatus SeatKeyStatusLocked() const
@@ -996,15 +1040,8 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         std::string error;
         if (!store->ReadMarker(marker, error) || !marker) return true;
         if (marker->next_sequence == 0) return false;
-        const uint64_t last_sequence{marker->next_sequence - 1};
-        const auto seats{SeatSetForSequence(marker->domain, market_id,
-                                             last_sequence)};
-        if (!seats) return true;
-        std::optional<StoredProductionEntry> stored;
-        if (!store->ReadEntry(last_sequence, *seats, stored, error) ||
-            !stored) {
-            return true;
-        }
+        const auto stored{VerifiedHeadEntry(market_id, *store, *marker)};
+        if (!stored) return true;
         if (stored->settlements.empty()) return false;
         if (marker->last_b3_checkpoint.IsNull()) return true;
 
@@ -1022,7 +1059,7 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
                                  .Index()
                                  .Get(marker->last_b3_checkpoint)};
         return !connected || connected->core.market_id != market_id ||
-               connected->core.sequence < last_sequence;
+               connected->core.sequence < marker->next_sequence - 1;
     }
 
     std::optional<bool> SettlementExecutionRequired(
@@ -1060,15 +1097,8 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
         return settlement_requirements.Get(
             key,
             [&]() -> std::optional<bool> {
-                const uint64_t last_sequence{marker->next_sequence - 1};
-                const auto seats{SeatSetForSequence(marker->domain, market_id,
-                                                     last_sequence)};
-                if (!seats) return std::nullopt;
-                std::optional<StoredProductionEntry> stored;
-                if (!store->ReadEntry(last_sequence, *seats, stored, error) ||
-                    !stored) {
-                    return std::nullopt;
-                }
+                const auto stored{VerifiedHeadEntry(market_id, *store, *marker)};
+                if (!stored) return std::nullopt;
                 const auto plan{chain_facts->PlanWithdrawalSettlements(
                     std::optional<flowmesh::AnchorRef>{stored->entry.anchor},
                     through)};

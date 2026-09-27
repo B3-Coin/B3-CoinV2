@@ -456,6 +456,59 @@ BOOST_FIXTURE_TEST_CASE(settlement_requirement_memo_requires_same_head_anchor_an
     BOOST_CHECK_EQUAL(memo.Size(), 2U);
 }
 
+BOOST_FIXTURE_TEST_CASE(head_entry_memo_requires_same_head_and_seat_set, BasicTestingSetup)
+{
+    using Key = node::FlowMeshHeadEntryKey;
+    using Entry = std::shared_ptr<const node::StoredProductionEntry>;
+    node::FlowMeshMarketMemo<Key, Entry> memo;
+    size_t reads{0};
+    const auto read = [&](const Key& key, const bool readable) {
+        const auto found{memo.Get(key, [&]() -> std::optional<Entry> {
+            ++reads;
+            if (!readable) return std::nullopt;
+            auto entry{std::make_shared<node::StoredProductionEntry>()};
+            entry->entry.sequence = key.next_sequence - 1;
+            return entry;
+        }, [] { return true; })};
+        return found ? *found : nullptr;
+    };
+    const auto filled = [](const unsigned char value) {
+        uint256 out;
+        std::fill(out.begin(), out.end(), value);
+        return out;
+    };
+    const Key base{filled(0x11), filled(0x22), 5, filled(0x33), filled(0x44)};
+
+    // A failed read or seat lookup is never retained.
+    BOOST_CHECK(!read(base, false));
+    BOOST_CHECK(!read(base, false));
+    BOOST_CHECK_EQUAL(reads, 2U);
+    BOOST_CHECK_EQUAL(memo.Size(), 0U);
+
+    // The verified entry is shared, not re-read or copied, for the same head.
+    const auto first{read(base, true)};
+    BOOST_REQUIRE(first);
+    BOOST_CHECK(read(base, true) == first);
+    BOOST_CHECK_EQUAL(reads, 3U);
+
+    std::vector<Key> changed(4, base);
+    changed[0].domain = filled(0x23);
+    changed[1].next_sequence = 6;
+    changed[2].last_microblock_hash = filled(0x34);
+    changed[3].seat_set_hash = filled(0x45);
+    for (const Key& key : changed) {
+        const size_t before{reads};
+        const auto moved{read(key, true)};
+        BOOST_REQUIRE(moved);
+        BOOST_CHECK(moved != first);
+        BOOST_CHECK_EQUAL(reads, before + 1);
+        // A rolled-back or re-verified head replaced the retained entry.
+        BOOST_CHECK(read(base, true) != first);
+        BOOST_CHECK_EQUAL(reads, before + 2);
+    }
+    BOOST_CHECK_EQUAL(memo.Size(), 1U);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_FIXTURE_TEST_SUITE(flowmesh_transport_policy_tests, FlowMeshServiceSetup)

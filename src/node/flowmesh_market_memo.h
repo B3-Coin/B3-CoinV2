@@ -30,6 +30,18 @@ struct FlowMeshSettlementRequirementKey {
     bool operator==(const FlowMeshSettlementRequirementKey&) const = default;
 };
 
+/** The identity of one durable head entry and the seat set its certificate
+ * was verified against. The log is append-only, so the entry named by one
+ * exact head never changes; a rollback moves the head and so the key. */
+struct FlowMeshHeadEntryKey {
+    flowmesh::MarketId market_id;
+    uint256 domain;
+    uint64_t next_sequence{0};
+    uint256 last_microblock_hash;
+    uint256 seat_set_hash;
+    bool operator==(const FlowMeshHeadEntryKey&) const = default;
+};
+
 /** One retained answer per market for one exact observation key.
  *
  * Local scheduling state only, never a protocol or durable fact. A lookup
