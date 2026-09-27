@@ -316,6 +316,23 @@ public:
 
     std::string ReadRejection() { return ReadResponse(REJECTION_BODY.size()); }
 
+    std::string ReadRecord()
+    {
+        // Without read-ahead or pipelining, one successful SSL_read returns
+        // plaintext from exactly one TLS application-data record.
+        std::string record(32 * 1024, '\0');
+        const auto deadline{Clock::now() + std::chrono::seconds{2}};
+        while (true) {
+            ERR_clear_error();
+            const int result{SSL_read(m_ssl.get(), record.data(), static_cast<int>(record.size()))};
+            if (result > 0) {
+                record.resize(result);
+                return record;
+            }
+            if (!Again(result, deadline)) return {};
+        }
+    }
+
     void NotifyClose()
     {
         const auto deadline{Clock::now() + std::chrono::seconds{2}};
@@ -661,6 +678,79 @@ BOOST_AUTO_TEST_CASE(https_client_sets_nodelay_on_its_tls_sockets)
     const auto one_shot{node::FlowMeshHttpsRequest(Endpoint(server), "/flowmesh/v1", "{}", std::chrono::seconds{2}, 1024)};
     BOOST_REQUIRE_MESSAGE(one_shot.response_received, one_shot.error);
     BOOST_CHECK(one_shot.tcp_nodelay);
+    server.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_reply_head_and_small_body_share_one_tls_record)
+{
+    const std::string small(700, 's');
+    std::string large(40000, '\0');
+    for (size_t i{0}; i < large.size(); ++i) large[i] = static_cast<char>('a' + i % 26);
+    node::FlowMeshHttpsServer server{Options(), [&](const auto& request) {
+        return node::FlowMeshHttpsServer::Response{200, request.body == "small" ? small : large};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    const auto post = [](std::string_view body) {
+        return "POST /flowmesh/v1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: " +
+            std::to_string(body.size()) + "\r\n\r\n" + std::string{body};
+    };
+    SplitHttpsPeer peer{server.Port(), cert};
+    BOOST_REQUIRE(peer.Send(post("small")));
+    const auto record{peer.ReadRecord()};
+    BOOST_REQUIRE(record.starts_with("HTTP/1.1 200 "));
+    const auto end{record.find("\r\n\r\n")};
+    BOOST_REQUIRE(end != std::string::npos);
+    BOOST_CHECK_EQUAL(record.size(), end + 4 + small.size());
+    BOOST_CHECK(record.ends_with(small));
+    // A large reply fills its first record, then continues in whole records
+    // with the exact remaining body bytes.
+    BOOST_REQUIRE(peer.Send(post("large")));
+    std::string reply{peer.ReadRecord()};
+    BOOST_CHECK_EQUAL(reply.size(), 16384U);
+    BOOST_REQUIRE(reply.starts_with("HTTP/1.1 200 "));
+    const auto body_start{reply.find("\r\n\r\n")};
+    BOOST_REQUIRE(body_start != std::string::npos);
+    while (reply.size() < body_start + 4 + large.size()) {
+        const auto next{peer.ReadRecord()};
+        BOOST_REQUIRE(!next.empty());
+        BOOST_CHECK_LE(next.size(), 16384U);
+        reply += next;
+    }
+    BOOST_CHECK_EQUAL(reply.size(), body_start + 4 + large.size());
+    BOOST_CHECK(reply.substr(body_start + 4) == large);
+    peer.NotifyClose();
+    server.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(https_reply_bodies_are_exact_across_first_record_boundary)
+{
+    auto options{Options()};
+    options.max_request_bytes = 128 * 1024;
+    node::FlowMeshHttpsServer server{options, [](const auto& request) {
+        return node::FlowMeshHttpsServer::Response{200, request.body};
+    }};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(server.Start(error), error);
+    // A keep-alive reply head is about 129 bytes, so the first record holds
+    // about 16255 body bytes; cover both sides of that boundary.
+    std::vector<size_t> sizes{0, 1};
+    for (size_t size{16230}; size <= 16290; ++size) sizes.push_back(size);
+    sizes.push_back(40000);
+    sizes.push_back(100000);
+    node::FlowMeshHttpsClient client;
+    for (size_t i{0}; i < sizes.size(); ++i) {
+        BOOST_TEST_CONTEXT("body bytes=" << sizes[i]) {
+            std::string body(sizes[i], '\0');
+            for (size_t j{0}; j < body.size(); ++j) body[j] = static_cast<char>('a' + (j * 7 + sizes[i]) % 26);
+            const auto reply{client.Request(Endpoint(server), "/flowmesh/v1", body, std::chrono::seconds{2}, 256 * 1024)};
+            BOOST_REQUIRE_MESSAGE(reply.response_received, reply.error);
+            BOOST_CHECK_EQUAL(reply.status, 200);
+            BOOST_CHECK_EQUAL(reply.body.size(), body.size());
+            BOOST_CHECK(reply.body == body);
+            BOOST_CHECK_EQUAL(reply.connection_reused, i != 0);
+        }
+    }
     server.Stop();
 }
 

@@ -52,6 +52,8 @@ constexpr auto MAX_TIMEOUT{std::chrono::seconds{120}};
 // underlying socket-read work, including TLS records with no application data.
 constexpr size_t MAX_REJECT_DRAIN{MAX_REQUEST + MAX_HEADERS};
 constexpr auto REJECT_CLOSE_TIMEOUT{Milliseconds{250}};
+// Maximum TLS record plaintext; each SSL_write bounded by it is one record.
+constexpr size_t MAX_TLS_RECORD_PLAINTEXT{16384};
 
 template <typename T, auto Free> using Owned = std::unique_ptr<T, decltype(Free)>;
 using SslContext = Owned<SSL_CTX, SSL_CTX_free>;
@@ -402,7 +404,7 @@ public:
     {
         while (Alive()) {
             ERR_clear_error();
-            const int result{SSL_read(m_ssl, data, static_cast<int>(std::min<size_t>(size, 16384)))};
+            const int result{SSL_read(m_ssl, data, static_cast<int>(std::min(size, MAX_TLS_RECORD_PLAINTEXT)))};
             if (result > 0) return result;
             if (!Again(result)) break;
         }
@@ -444,7 +446,7 @@ public:
             // this connection after the response and is never redispatched.
             if (subsequent_input && PendingInput()) *subsequent_input = true;
             ERR_clear_error();
-            const int result{SSL_write(m_ssl, data.data(), static_cast<int>(std::min<size_t>(data.size(), 16384)))};
+            const int result{SSL_write(m_ssl, data.data(), static_cast<int>(std::min(data.size(), MAX_TLS_RECORD_PLAINTEXT)))};
             if (result > 0) data.remove_prefix(result);
             else if (!Again(result)) return false;
         }
@@ -1010,12 +1012,20 @@ struct FlowMeshHttpsServer::Impl {
         bool subsequent_input{!rejected && io.PendingInput()};
         keep_alive = keep_alive && options.keep_alive && !rejected && !subsequent_input &&
             pending.requests < options.max_requests_per_connection && Clock::now() < pending.expires;
-        const std::string header{"HTTP/1.1 " + std::to_string(response.status) +
+        std::string head{"HTTP/1.1 " + std::to_string(response.status) +
             " Response\r\nContent-Type: application/json\r\nContent-Length: " +
             std::to_string(response.body.size()) + "\r\nConnection: " + (keep_alive ? "keep-alive" : "close") +
             "\r\nCache-Control: no-store\r\n\r\n"};
+        // Same HTTP bytes, fewer records: the status line, headers and first
+        // body bytes share one SSL_write (one record), so a small reply is one
+        // record and one segment. Larger bodies continue in record-sized writes
+        // from the original buffer, never a reply-sized copy.
+        const size_t inline_bytes{std::min(response.body.size(),
+            MAX_TLS_RECORD_PLAINTEXT - std::min(head.size(), MAX_TLS_RECORD_PLAINTEXT))};
+        head.append(response.body, 0, inline_bytes);
+        const std::string_view rest{std::string_view{response.body}.substr(inline_bytes)};
         bool* const watch_input{keep_alive ? &subsequent_input : nullptr};
-        if (io.Write(header, watch_input) && io.Write(response.body, watch_input)) {
+        if (io.Write(head, watch_input) && io.Write(rest, watch_input)) {
             timing.Mark("response_written_us");
             if (rejected) {
                 const auto [ciphertext, plaintext]{io.FinishRejectedResponse()};
