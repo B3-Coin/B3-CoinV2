@@ -15,6 +15,7 @@
 #include <modern/mpa.h>
 #include <node/flowmesh_anchor.h>
 #include <node/flowmesh_checkpoint_index.h>
+#include <node/flowmesh_market_memo.h>
 #include <node/fn_seat_index.h>
 #include <primitives/block.h>
 #include <test/util/setup_common.h>
@@ -27,7 +28,9 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -382,6 +385,75 @@ BOOST_AUTO_TEST_CASE(empty_or_stopped_service_cannot_arm_and_failure_keeps_resul
     BOOST_CHECK(!service.SeatKeyStatus().running);
     BOOST_CHECK(service.SeatKeyStatus().armed_pubkeys.empty());
     BOOST_CHECK(result.running); // Failure never fills an alleged success snapshot.
+}
+
+BOOST_FIXTURE_TEST_CASE(settlement_requirement_memo_requires_same_head_anchor_and_generation,
+                        BasicTestingSetup)
+{
+    using Key = node::FlowMeshSettlementRequirementKey;
+    node::FlowMeshMarketMemo<Key, bool> memo;
+    size_t computed{0};
+    const auto answer = [&](const Key& key, const std::optional<bool> result, const bool current = true) {
+        return memo.Get(key, [&] { ++computed; return result; }, [&] { return current; });
+    };
+    const auto filled = [](const unsigned char value) {
+        uint256 out;
+        std::fill(out.begin(), out.end(), value);
+        return out;
+    };
+    const Key base{filled(0x11), filled(0x22), 7, filled(0x33), 250, filled(0x44), 9};
+
+    BOOST_CHECK(answer(base, true) == std::optional<bool>{true});
+    BOOST_CHECK_EQUAL(computed, 1U);
+    // Only an identical head, anchor and generation is answered from memory.
+    BOOST_CHECK(answer(base, false) == std::optional<bool>{true});
+    BOOST_CHECK_EQUAL(computed, 1U);
+    std::vector<Key> changed(6, base);
+    changed[0].domain = filled(0x23);
+    changed[1].next_sequence = 8;
+    changed[2].last_microblock_hash = filled(0x34);
+    changed[3].anchor_height = 251;
+    changed[4].anchor_hash = filled(0x45);
+    changed[5].delivery_generation = 10;
+    for (const Key& key : changed) {
+        const size_t before{computed};
+        BOOST_CHECK(answer(key, false) == std::optional<bool>{false});
+        BOOST_CHECK_EQUAL(computed, before + 1);
+        // The different key replaced this market's single retained answer.
+        BOOST_CHECK(answer(base, true) == std::optional<bool>{true});
+        BOOST_CHECK_EQUAL(computed, before + 2);
+    }
+    BOOST_CHECK_EQUAL(memo.Size(), 1U);
+
+    // An unavailable chain fact is never retained.
+    Key unavailable{base};
+    unavailable.next_sequence = 20;
+    BOOST_CHECK(!answer(unavailable, std::nullopt));
+    BOOST_CHECK(!answer(unavailable, std::nullopt));
+    BOOST_CHECK(answer(base, false) == std::optional<bool>{true});
+    const size_t after_unavailable{computed};
+
+    // An answer derived while the generation moved is returned once but is
+    // not retained, so the next call computes it again.
+    Key moved{base};
+    moved.delivery_generation = 11;
+    BOOST_CHECK(answer(moved, false, /*current=*/false) == std::optional<bool>{false});
+    BOOST_CHECK(answer(moved, true) == std::optional<bool>{true});
+    BOOST_CHECK_EQUAL(computed, after_unavailable + 2);
+    BOOST_CHECK(answer(moved, false) == std::optional<bool>{true});
+    BOOST_CHECK_EQUAL(computed, after_unavailable + 2);
+
+    // Each market keeps its own answer, so alternating markets never thrash.
+    Key other{moved};
+    other.market_id = filled(0x12);
+    BOOST_CHECK(answer(other, false) == std::optional<bool>{false});
+    const size_t both{computed};
+    for (int i{0}; i < 4; ++i) {
+        BOOST_CHECK(answer(moved, false) == std::optional<bool>{true});
+        BOOST_CHECK(answer(other, true) == std::optional<bool>{false});
+    }
+    BOOST_CHECK_EQUAL(computed, both);
+    BOOST_CHECK_EQUAL(memo.Size(), 2U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

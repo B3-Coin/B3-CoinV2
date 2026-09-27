@@ -16,6 +16,7 @@
 #include <net_processing.h>
 #include <node/flowmesh_anchor.h>
 #include <node/flowmesh_checkpoint_index.h>
+#include <node/flowmesh_market_memo.h>
 #include <node/flowmesh_production_store.h>
 #include <node/flowmesh_vault_index.h>
 #include <node/fn_seat_index.h>
@@ -327,6 +328,15 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
     std::atomic<bool> chain_reconciling{false};
     std::atomic<uint64_t> delivery_generation{0};
     uint256 reconciled_tip;
+
+    // Repeat answers for one unchanged durable head and one unchanged chain
+    // observation, one per market so that markets never evict each other.
+    // SeatTransition runs on every candidate gate, and its settlement check
+    // re-reads and re-verifies the previous entry's BLS certificate each
+    // time. Only a settled answer is retained; an unavailable chain fact is
+    // never cached. The memo locks only its own leaf mutex.
+    mutable FlowMeshMarketMemo<FlowMeshSettlementRequirementKey, bool>
+        settlement_requirements;
 
     // Caller holds mutex; neither this snapshot nor the CAS token contains secrets.
     FlowMeshSeatKeyStatus SeatKeyStatusLocked() const
@@ -1031,24 +1041,41 @@ struct FlowMeshService::Impl final : public FlowMeshRuntimeChain,
             store = it->second->store.get();
             chain_facts = it->second->deposits.get();
         }
+        // Sampled before the marker and anchor so that the whole observation
+        // belongs to one delivery generation.
+        const uint64_t generation{DeliveryGeneration()};
         std::optional<FlowMeshProductionStore::Marker> marker;
         std::string error;
         if (!store->ReadMarker(marker, error) || !marker) return std::nullopt;
         if (marker->next_sequence == 0) return false;
-        const uint64_t last_sequence{marker->next_sequence - 1};
-        const auto seats{SeatSetForSequence(marker->domain, market_id,
-                                             last_sequence)};
-        if (!seats) return std::nullopt;
-        std::optional<StoredProductionEntry> stored;
-        if (!store->ReadEntry(last_sequence, *seats, stored, error) ||
-            !stored) {
-            return std::nullopt;
-        }
         const flowmesh::AnchorRef through{anchors.Current()};
-        const auto plan{chain_facts->PlanWithdrawalSettlements(
-            std::optional<flowmesh::AnchorRef>{stored->entry.anchor}, through)};
-        if (!plan) return std::nullopt;
-        return plan->count != 0;
+        // The durable head and the observed anchor together fix this answer.
+        // The generation makes a reconciliation that started and finished
+        // around this call invalidate it. The marker is still read fresh on
+        // every call, so a head that has moved is never answered from here.
+        const FlowMeshSettlementRequirementKey key{
+            market_id, marker->domain, marker->next_sequence,
+            marker->last_microblock_hash, through.height, through.hash,
+            generation};
+        return settlement_requirements.Get(
+            key,
+            [&]() -> std::optional<bool> {
+                const uint64_t last_sequence{marker->next_sequence - 1};
+                const auto seats{SeatSetForSequence(marker->domain, market_id,
+                                                     last_sequence)};
+                if (!seats) return std::nullopt;
+                std::optional<StoredProductionEntry> stored;
+                if (!store->ReadEntry(last_sequence, *seats, stored, error) ||
+                    !stored) {
+                    return std::nullopt;
+                }
+                const auto plan{chain_facts->PlanWithdrawalSettlements(
+                    std::optional<flowmesh::AnchorRef>{stored->entry.anchor},
+                    through)};
+                if (!plan) return std::nullopt;
+                return plan->count != 0;
+            },
+            [&] { return DeliveryGeneration() == generation; });
     }
 
     FlowMeshRelayResult Relay(FlowMeshRuntimeRelay relay) const
