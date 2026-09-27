@@ -1079,6 +1079,20 @@ bool LocalSeatProposesNextSlot(const Market& market)
     });
 }
 
+// The exact entry bytes framed in a CERTIFICATE payload, or nullopt when the
+// framing is invalid (HandleCertificate then refuses the frame as before).
+std::optional<std::span<const unsigned char>> CertifiedEntryBytes(
+    const std::span<const unsigned char> payload)
+{
+    if (payload.size() <= flowmesh::FLOWMESH_CERTIFIED_PAYLOAD_PREFIX_SIZE) return std::nullopt;
+    const uint32_t size{ReadBE32(payload.data())};
+    if (size == 0 || size > flowmesh::FLOWMESH_V1_MAX_MICROBLOCK_BYTES ||
+        payload.size() < flowmesh::FLOWMESH_CERTIFIED_PAYLOAD_PREFIX_SIZE + size) {
+        return std::nullopt;
+    }
+    return payload.subspan(flowmesh::FLOWMESH_CERTIFIED_PAYLOAD_PREFIX_SIZE, size);
+}
+
 template <typename Market>
 bool RecheckAnchors(Market& market)
 {
@@ -2434,10 +2448,11 @@ std::vector<FlowMeshRuntimeDeliverySnapshot> FlowMeshRuntime::DeliverySnapshots(
 {
     // Start() takes the queue lock before the market lock; never nest them
     // in the opposite order here.
-    std::map<flowmesh::MarketId, uint64_t> coalesced;
+    std::map<flowmesh::MarketId, uint64_t> coalesced, consumed;
     {
         std::lock_guard<std::mutex> queue_lock{m_queue_mutex};
         for (const auto& [id, quiet] : m_agreement_quiet) coalesced.emplace(id, quiet.coalesced);
+        for (const auto& [id, certified] : m_certified_admission) consumed.emplace(id, certified.consumed);
     }
     FlowMeshTimingSpan timing_lock_2250{__func__};
     timing_lock_2250.Field("lock_name", std::string{"market_mutex"});
@@ -2451,6 +2466,9 @@ std::vector<FlowMeshRuntimeDeliverySnapshot> FlowMeshRuntime::DeliverySnapshots(
         out.back().event_queue_overflows = m_delivery_event_overflows.load();
         if (const auto count{coalesced.find(id)}; count != coalesced.end()) {
             out.back().agreement_duplicates_coalesced = count->second;
+        }
+        if (const auto count{consumed.find(id)}; count != consumed.end()) {
+            out.back().certified_slot_frames_consumed = count->second;
         }
         out.back().sampled_monotonic_us = TraceNow(*market->clock);
         out.back().trace_global_bytes = g_runtime_trace_bytes.load(std::memory_order_relaxed);
@@ -2962,6 +2980,7 @@ bool FlowMeshRuntime::Start(std::string& error)
         m_client_events.Reset(GetRandHash());
         if (!InitializeMarkets(error)) return false;
         m_admitted_markets.clear();
+        m_certified_admission.clear();
         m_probe_markets.clear();
         m_peer_probe_cursors.clear();
         m_evidence_retry_budget = {};
@@ -3048,6 +3067,10 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     const std::optional<uint256> agreement_payload{
         message.kind == flowmesh::WireMessageKind::AGREEMENT
             ? std::optional<uint256>{Hash(message.payload)} : std::nullopt};
+    std::optional<uint256> certificate_entry;
+    if (message.kind == flowmesh::WireMessageKind::CERTIFICATE) {
+        if (const auto bytes{CertifiedEntryBytes(message.payload)}) certificate_entry = Hash(*bytes);
+    }
     if (trace.enabled) trace.queue_lock_requested_us = TraceNow(*m_config.clock);
     std::lock_guard<std::mutex> lock{m_queue_mutex};
     if (trace.enabled) {
@@ -3095,6 +3118,43 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
             }
         }
     }
+    // Every validator star-relays each vote it verifies and each certificate
+    // it applies, so a slot keeps arriving from every peer after this worker
+    // has appended it. The worker can only drop those frames: HandleAttestation
+    // and HandleAgreement refuse any sequence but the current one, and a
+    // certificate whose exact entry bytes this runtime appended is the
+    // already-durable duplicate HandleCertificate ignores. They still spent
+    // the sender's eight committee admissions per second first and, once
+    // refused, held that sender's critical channel (100 ms..1 s backoff) in
+    // front of its next slot's proposal and votes. Consume them here. Nothing
+    // is queued or processed for them, so no work bound moves; the framing
+    // verdict is unchanged, so a malformed frame still disconnects its sender.
+    // Every frame at or above the durably appended sequence, and every older
+    // certificate that is not byte-identical to a recorded append
+    // (CERTIFICATE_CONFLICT detection), still spends a committee token and
+    // takes the verified path.
+    if (message.kind == flowmesh::WireMessageKind::ATTESTATION ||
+        message.kind == flowmesh::WireMessageKind::AGREEMENT ||
+        message.kind == flowmesh::WireMessageKind::CERTIFICATE) {
+        const auto certified{m_certified_admission.find(message.header.market_id)};
+        if (certified != m_certified_admission.end() &&
+            message.header.sequence < certified->second.next_sequence &&
+            (message.kind != flowmesh::WireMessageKind::CERTIFICATE ||
+             (certificate_entry &&
+              std::any_of(certified->second.entries.begin(), certified->second.entries.end(),
+                          [&](const auto& entry) {
+                              return entry.first == message.header && entry.second == *certificate_entry;
+                          })))) {
+            flowmesh::WireCheck check;
+            if (!flowmesh::EncodeWireMessage(message, check)) return flowmesh::QueueResult::MALFORMED;
+            ++certified->second.consumed;
+            if (trace.enabled) {
+                trace.result = flowmesh::QueueResult::ACCEPTED;
+                trace.coalesced = true;
+            }
+            return flowmesh::QueueResult::ACCEPTED;
+        }
+    }
     if (trace.enabled) trace.enqueue_started_us = TraceNow(*m_config.clock);
     const auto result{m_queue.Push(peer, std::move(message),
                                    m_config.clock->Now())};
@@ -3128,6 +3188,19 @@ void FlowMeshRuntime::QuietAgreementPayload(const flowmesh::WireHeader& header,
         quiet.payloads.erase(quiet.order.front());
         quiet.order.pop_front();
     }
+}
+
+void FlowMeshRuntime::NoteCertifiedAdmission(const flowmesh::WireHeader& header,
+    const uint256& entry_bytes_hash, const uint64_t next_sequence)
+{
+    std::lock_guard<std::mutex> lock{m_queue_mutex};
+    // Only markets admission still serves; an erased record stays erased.
+    if (m_admitted_markets.count(header.market_id) == 0) return;
+    auto& certified{m_certified_admission[header.market_id]};
+    certified.next_sequence = std::max(certified.next_sequence, next_sequence);
+    certified.entries.emplace_back(header, entry_bytes_hash);
+    // Forgetting the oldest entry only means its next copy is verified again.
+    if (certified.entries.size() > CertifiedAdmission::MAX_ENTRIES) certified.entries.pop_front();
 }
 
 void FlowMeshRuntime::FlowMeshPeerConnected(const flowmesh::WirePeerId peer)
@@ -3684,6 +3757,7 @@ void FlowMeshRuntime::ProcessAddMarketCommand(AddMarketCommand command)
     if (ok) {
         std::lock_guard<std::mutex> lock{m_queue_mutex};
         m_admitted_markets.insert(command.market.market_id);
+        m_certified_admission.erase(command.market.market_id);
         if (!m_tick_pending) m_tick_requested_us = TraceNow(*m_config.clock);
         m_tick_pending = true;
         m_work_cv.notify_one();
@@ -5226,6 +5300,11 @@ void FlowMeshRuntime::HandleCertificate(
                                                   std::move(*candidate)).first;
     }
     if (!CommitCertified(market, *certified, candidate_it->second, reconciliation_deferred)) return;
+    // Durable now: admission may consume later copies of this slot's votes
+    // and of exactly these entry bytes without a committee token.
+    if (const auto bytes{CertifiedEntryBytes(message.payload)}) {
+        NoteCertifiedAdmission(message.header, Hash(*bytes), market.next_sequence);
+    }
     // The next slot is proposed from the maintenance tick. When this node
     // holds the next slot's proposer seat and the market still holds admitted
     // work, it must not wait up to a full tick interval, so reuse the existing

@@ -217,6 +217,10 @@ struct FlowMeshRuntimeDeliverySnapshot {
     // Exact repeats of already verified AGREEMENT bytes consumed at admission
     // without a committee token, queue slot or second verification.
     uint64_t agreement_duplicates_coalesced{0};
+    // ATTESTATION/AGREEMENT frames for slots this node has already durably
+    // appended, and exact entry copies of its recent appends, consumed at
+    // admission without a committee token, queue slot or handler pass.
+    uint64_t certified_slot_frames_consumed{0};
     size_t pending_objects{0}, pending_bytes{0};
     size_t deferred_objects{0}, deferred_bytes{0};
     std::string current_reason;
@@ -633,6 +637,23 @@ private:
     std::map<flowmesh::MarketId, AgreementQuiet> m_agreement_quiet;
     void QuietAgreementPayload(const flowmesh::WireHeader& header, const uint256& payload_hash,
                                flowmesh::WireClock::time_point until);
+    //! What this worker has durably appended for a market since the market
+    //! was last (re)initialized, as seen by admission: committee frames for
+    //! those slots are consumed without a committee token (EnqueueWireMessage).
+    //! Written only after a durable append and erased whenever the market is
+    //! (re)initialized. Bounded per admitted market; guarded by m_queue_mutex.
+    struct CertifiedAdmission {
+        static constexpr size_t MAX_ENTRIES{8};
+        //! One past the last durably appended sequence.
+        uint64_t next_sequence{0};
+        //! (exact wire header, SHA256d of the exact entry bytes) of the last
+        //! few durable appends, oldest first.
+        std::deque<std::pair<flowmesh::WireHeader, uint256>> entries;
+        uint64_t consumed{0};
+    };
+    std::map<flowmesh::MarketId, CertifiedAdmission> m_certified_admission;
+    void NoteCertifiedAdmission(const flowmesh::WireHeader& header, const uint256& entry_bytes_hash,
+                                uint64_t next_sequence);
     //! Negotiated connections only, capped independently of incoming hints.
     std::set<flowmesh::WirePeerId> m_discovery_peers;
     std::deque<flowmesh::WirePeerId> m_removed_peers;

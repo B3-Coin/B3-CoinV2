@@ -2487,17 +2487,22 @@ BOOST_AUTO_TEST_CASE(durable_duplicate_certificate_is_not_verified_again_but_con
     BOOST_REQUIRE_EQUAL(f.Snapshot().durably_applied, 2U);
     const auto verified{f.Snapshot().verified};
     const auto relayed{f.Sent().size()};
+    const auto consumed{f.Snapshot().certified_slot_frames_consumed};
 
     // The durable head and an older durable entry, each once under another
     // valid signer subset and once with a corrupted aggregate: the exact
     // entry is already durable here, so no copy is verified or relayed.
+    // Their entry bytes and headers match this runtime's own appends, so
+    // admission consumes them before the worker's duplicate check (which
+    // still covers copies admission has no record of, e.g. after a restart).
     for (const auto& [sequence, entry] : {std::pair{uint64_t{1}, next->entry}, std::pair{uint64_t{0}, decoded->entry}}) {
         send(sequence, payload(entry, {1, 2, 3}));
         auto corrupted{payload(entry, {0, 1, 2})};
         corrupted.back() ^= 1;
         send(sequence, corrupted);
     }
-    BOOST_CHECK_EQUAL(duplicates(), 4);
+    BOOST_CHECK_EQUAL(f.Snapshot().certified_slot_frames_consumed, consumed + 4);
+    BOOST_CHECK_EQUAL(duplicates(), 0);
     BOOST_CHECK_EQUAL(f.Snapshot().verified, verified);
     BOOST_CHECK_EQUAL(f.Sent().size(), relayed);
     BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
@@ -2513,7 +2518,7 @@ BOOST_AUTO_TEST_CASE(durable_duplicate_certificate_is_not_verified_again_but_con
     BOOST_CHECK_EQUAL(f.Snapshot().verified, verified + 1);
     BOOST_CHECK(f.runtime->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::CERTIFICATE_CONFLICT);
     BOOST_CHECK_EQUAL(f.Snapshot().durably_applied, 2U);
-    BOOST_CHECK_EQUAL(duplicates(), 4);
+    BOOST_CHECK_EQUAL(f.Snapshot().certified_slot_frames_consumed, consumed + 4);
 }
 
 BOOST_AUTO_TEST_CASE(catchup_timeout_reduces_page_count_without_relaxing_deadline_or_verification)
@@ -7040,6 +7045,123 @@ BOOST_AUTO_TEST_CASE(preagreement_verified_duplicate_requires_exact_wire_header)
     BOOST_CHECK_EQUAL(receiver.DeliverySnapshots(f.market).front().agreement_duplicates_coalesced, before + 1);
 }
 
+// Every validator star-relays each vote and certificate, so an applied slot
+// keeps arriving from each peer after this node appended it. The worker can
+// only drop those frames. They must not spend the sender's committee
+// admission: otherwise the sender's next-slot proposal and votes are refused
+// and held behind them. Frames for the current slot, and any older
+// certificate that is not byte-identical to an append made here, still spend
+// the unchanged committee tokens and take the verified path.
+BOOST_AUTO_TEST_CASE(certified_slot_committee_frames_do_not_spend_committee_admission)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "certified_slot_committee_frames"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    std::string error;
+    std::optional<node::StoredProductionEntry> stored;
+    BOOST_REQUIRE(f.stores[0]->ReadEntry(0, f.seats.seats, stored, error));
+    BOOST_REQUIRE(stored);
+    // Any valid signer subset: admission matches the entry bytes and header.
+    const auto certificate{flowmesh::EncodeProductionCertifiedPayload(
+        {stored->entry, stored->certificate}, f.seats.seats.Size())};
+    BOOST_REQUIRE(certificate);
+    const flowmesh::WireHeader applied{flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, stored->entry.epoch, 0};
+    const flowmesh::WireHeader current{flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, stored->entry.epoch, 1};
+    const uint256 digest{Filled(0x5c)};
+    const auto vote{flowmesh::EncodeProductionAttestationPayload(
+        {1, f.seats.secrets[1].Sign(std::span<const unsigned char>{digest.begin(), 32})})};
+    BOOST_REQUIRE(vote);
+    // Correctly framed (format 1, a valid stage) but never a verified payload.
+    std::vector<unsigned char> agreement(flowmesh::FLOWMESH_AGREEMENT_MIN_BYTES, 0x5c);
+    agreement[0] = 0;
+    agreement[1] = 1;
+    agreement[2] = 2;
+
+    auto& receiver{*f.runtimes[0]};
+    constexpr flowmesh::WirePeerId sender{1};
+    const auto snapshot = [&] {
+        const auto snapshots{f.runtimes[0]->DeliverySnapshots(f.market)};
+        BOOST_REQUIRE_EQUAL(snapshots.size(), 1U);
+        return snapshots.front();
+    };
+    // Let the sender's bucket refill completely after the slot's own traffic,
+    // then freeze the clock: three times the unchanged 32-message burst.
+    f.clocks[0].m_now += std::chrono::seconds{5};
+    const auto before{snapshot()};
+    for (size_t n{0}; n < 32; ++n) {
+        BOOST_REQUIRE(receiver.EnqueueWireMessage(sender, {flowmesh::WireMessageKind::ATTESTATION, applied, *vote}) ==
+                      flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(receiver.EnqueueWireMessage(sender, {flowmesh::WireMessageKind::AGREEMENT, applied, agreement}) ==
+                      flowmesh::QueueResult::ACCEPTED);
+        BOOST_REQUIRE(receiver.EnqueueWireMessage(sender, {flowmesh::WireMessageKind::CERTIFICATE, applied, *certificate}) ==
+                      flowmesh::QueueResult::ACCEPTED);
+    }
+    f.Drain();
+    auto after{snapshot()};
+    BOOST_CHECK_EQUAL(after.certified_slot_frames_consumed, before.certified_slot_frames_consumed + 96);
+    // Nothing reached the worker: no certificate was verified again.
+    BOOST_CHECK_EQUAL(after.verified, before.verified);
+    BOOST_CHECK(receiver.MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+    // A badly framed frame for the applied slot is still refused as such.
+    BOOST_CHECK(receiver.EnqueueWireMessage(sender, {flowmesh::WireMessageKind::ATTESTATION, applied,
+                    std::vector<unsigned char>(vote->begin(), vote->end() - 1)}) == flowmesh::QueueResult::MALFORMED);
+    BOOST_CHECK(receiver.EnqueueWireMessage(sender, {flowmesh::WireMessageKind::AGREEMENT, applied,
+                    std::vector<unsigned char>(agreement.begin(), agreement.end() - 1)}) == flowmesh::QueueResult::MALFORMED);
+    BOOST_CHECK_EQUAL(snapshot().certified_slot_frames_consumed, before.certified_slot_frames_consumed + 96);
+
+    // The sender's whole burst is still available for the next slot, and it
+    // still bounds everything admission cannot prove settled: the current
+    // slot, a changed header, and different entry bytes at the applied
+    // sequence (the only way a conflicting certificate can arrive).
+    auto relabelled{applied};
+    ++relabelled.epoch;
+    auto different{*certificate};
+    different.back() ^= 1;                                               // same entry bytes, other aggregate
+    auto conflicting{*certificate};
+    conflicting[flowmesh::FLOWMESH_CERTIFIED_PAYLOAD_PREFIX_SIZE + 8] ^= 1; // other entry bytes
+    const std::vector<flowmesh::WireMessage> charged{
+        {flowmesh::WireMessageKind::ATTESTATION, current, *vote},
+        {flowmesh::WireMessageKind::AGREEMENT, current, agreement},
+        {flowmesh::WireMessageKind::CERTIFICATE, relabelled, *certificate},
+        {flowmesh::WireMessageKind::CERTIFICATE, applied, conflicting}};
+    size_t admitted{0}, limited{0};
+    for (size_t n{0}; n < 40; ++n) {
+        const auto result{receiver.EnqueueWireMessage(sender, charged[n % charged.size()])};
+        admitted += result == flowmesh::QueueResult::ACCEPTED;
+        limited += result == flowmesh::QueueResult::RATE_LIMITED;
+    }
+    BOOST_CHECK_EQUAL(admitted, 32U);
+    BOOST_CHECK_EQUAL(limited, 8U);
+    BOOST_REQUIRE(receiver.EnqueueWireMessage(sender, {flowmesh::WireMessageKind::CERTIFICATE, applied, different}) ==
+                  flowmesh::QueueResult::ACCEPTED); // settled entry bytes: consumed even with no token left
+    f.Drain();
+    after = snapshot();
+    BOOST_CHECK_EQUAL(after.certified_slot_frames_consumed, before.certified_slot_frames_consumed + 97);
+    BOOST_CHECK(receiver.MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+
+    // A restarted runtime has appended nothing yet in its lifetime, so the
+    // same exact copy takes the verified path again; the worker still
+    // recognises the durable head without verifying it a second time.
+    f.StopNode(0);
+    f.stores[0].reset();
+    f.stores[0] = std::make_unique<node::FlowMeshProductionStore>(DBParams{
+        .path = f.StorePath(0), .cache_bytes = size_t{1} << 20}, true);
+    BOOST_REQUIRE_MESSAGE(f.stores[0]->OpenForMarket(f.domain, f.market,
+        f.seats.seats, f.initial.Root(), error), error);
+    BOOST_REQUIRE_MESSAGE(f.StartNode(0, f.AgreementPath(0), std::nullopt, error), error);
+    BOOST_REQUIRE(f.AllAt(1));
+    BOOST_REQUIRE(f.runtimes[0]->EnqueueWireMessage(sender, {flowmesh::WireMessageKind::CERTIFICATE, applied, *certificate}) ==
+                  flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    const auto restarted{snapshot()};
+    BOOST_CHECK_EQUAL(restarted.certified_slot_frames_consumed, 0U);
+    BOOST_CHECK(std::any_of(restarted.events.begin(), restarted.events.end(), [](const auto& event) {
+        return event.stage == "certificate_duplicate";
+    }));
+    BOOST_CHECK(f.runtimes[0]->MarketStatus(f.market)->halt == node::FlowMeshRuntimeHalt::NONE);
+}
+
 BOOST_AUTO_TEST_CASE(preagreement_certified_duplicate_stays_quiet_after_backoff_expires)
 {
     PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_duplicate_old_slot",
@@ -7066,8 +7188,9 @@ BOOST_AUTO_TEST_CASE(preagreement_certified_duplicate_stays_quiet_after_backoff_
         BOOST_CHECK_EQUAL(receiver.DeliverySnapshots(f.market).front().agreement_duplicates_coalesced,
                           before + 40 * (sweep + 1));
     }
-    // Different bytes still enter ordinary verification, and the next slot
-    // retains the same unmodified admission budget and full quorum.
+    // Different bytes for the applied slot are consumed at admission too (the
+    // worker could only refuse them), and the next slot retains the same
+    // unmodified admission budget and full quorum.
     auto changed{sample.message};
     changed.payload.back() ^= 1;
     BOOST_REQUIRE(receiver.EnqueueWireMessage(static_cast<int64_t>(sample.from), changed) ==
