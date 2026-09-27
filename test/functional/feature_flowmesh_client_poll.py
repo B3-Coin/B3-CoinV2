@@ -106,6 +106,8 @@ class FlowMeshClientPollTest(FlowMeshLatencyTest):
         # Validator 1 keeps the previous 'action' contract (wait_ms is an
         # unknown field); relays with an odd index forward to it.
         self.extra_args[1].append("-flowmeshapiactionwait=0")
+        # Appended to the client's startup arguments (kept for its restarts).
+        self.client_extra_args = []
         self.poll_report = {"fixture": "focused_engine_off_client_polling", "correctness_pass": False,
                             "automatic_rpc_spans": [], "scope": "generated regtest only; no latency/fill claim"}
 
@@ -119,7 +121,8 @@ class FlowMeshClientPollTest(FlowMeshLatencyTest):
         self.client_args = [*B3_ARGS, "-enableflowmeshvalidator=0", "-debug=0",
                             f"-port={p2p_port(12)}", f"-bind=127.0.0.1:{p2p_port(12)}",
                             f"-flowmeshendpointca={self.pki['ca']}",
-                            *[f"-flowmeshendpoint={relay.url}" for relay in self.tls_relays]]
+                            *[f"-flowmeshendpoint={relay.url}" for relay in self.tls_relays],
+                            *self.client_extra_args]
         self.client = TestNode(4, get_datadir_path(self.options.tmpdir, 4), chain=self.chain,
                                rpchost=None, timewait=self.rpc_timeout, timeout_factor=self.options.timeout_factor,
                                binaries=self.get_binaries(), coverage_dir=self.options.coveragedir,

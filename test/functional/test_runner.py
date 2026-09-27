@@ -124,6 +124,7 @@ BASE_SCRIPTS = [
     'wallet_exportflowmeshkey.py',
     'feature_flowmesh_independent.py',
     'feature_flowmesh_remote_client.py',
+    'feature_flowmesh_client_join.py',
     'mempool_updatefromblock.py',
     'mempool_persist.py',
     # vv Tests less than 60s vv
