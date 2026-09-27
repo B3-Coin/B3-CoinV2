@@ -1051,6 +1051,21 @@ std::vector<std::pair<uint32_t, bls::SecretKey>> LocalSeatKeys(
     return out;
 }
 
+// Whether a local seat is the scheduled proposer of the next slot at the
+// current round. Local wake-up policy only: MaybePropose applies this same
+// schedule again together with every signing gate.
+template <typename Market>
+bool LocalSeatProposesNextSlot(const Market& market)
+{
+    if (market.seats.Size() == 0) return false;
+    const uint32_t proposer{flowmesh::ProductionProposerSeatIndex(
+        market.next_sequence, market.round, market.seats.Size())};
+    const auto keys{LocalSeatKeys(market)};
+    return std::any_of(keys.begin(), keys.end(), [&](const auto& item) {
+        return item.first == proposer;
+    });
+}
+
 template <typename Market>
 bool RecheckAnchors(Market& market)
 {
@@ -5117,6 +5132,14 @@ void FlowMeshRuntime::HandleCertificate(
                                                   std::move(*candidate)).first;
     }
     if (!CommitCertified(market, *certified, candidate_it->second, reconciliation_deferred)) return;
+    // The next slot is proposed from the maintenance tick. When this node
+    // holds the next slot's proposer seat and the market still holds admitted
+    // work, it must not wait up to a full tick interval, so reuse the existing
+    // coalesced wake-up. Every other seat has nothing to propose and keeps its
+    // periodic tick: actions are gossiped, so waking every node would run a
+    // full maintenance pass on each. Every eligibility, reconciliation,
+    // anchor and signing gate still runs inside MaybePropose.
+    if (market.pool.Size() > 0 && LocalSeatProposesNextSlot(market)) NotifyTick();
     if (!from_catchup) {
         RelayMessage(
             market, message, std::nullopt,

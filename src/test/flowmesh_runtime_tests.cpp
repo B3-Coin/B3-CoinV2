@@ -1119,6 +1119,7 @@ public:
             if (event.event_id <= m_last) continue;
             BOOST_REQUIRE_EQUAL(event.event_id, m_last + 1);
             m_last = event.event_id;
+            ++m_stages[{event.sequence, event.stage}];
             if (event.stage == "execution_started") ++m_started[{event.sequence, event.reason}];
         }
     }
@@ -1129,9 +1130,16 @@ public:
         return it == m_started.end() ? 0 : it->second;
     }
 
+    size_t Events(const uint64_t sequence, const std::string& stage) const
+    {
+        const auto it{m_stages.find({sequence, stage})};
+        return it == m_stages.end() ? 0 : it->second;
+    }
+
 private:
     uint64_t m_last{0};
     std::map<std::pair<uint64_t, std::string>, size_t> m_started;
+    std::map<std::pair<uint64_t, std::string>, size_t> m_stages;
 };
 
 class ScopedBenchLogging
@@ -7921,6 +7929,57 @@ BOOST_AUTO_TEST_CASE(preagreement_decided_candidate_not_attested_while_transitio
         BOOST_CHECK(f.runtimes[i]->MarketStatus(f.market)->last_microblock_hash == genesis);
     }
     for (const size_t i : paused) BOOST_CHECK_GT(attestations[i].load(), 0U);
+}
+
+// A certificate that leaves admitted work queued wakes only the next slot's
+// proposer, which proposes at once instead of on its next periodic tick.
+// Every other node keeps its periodic schedule.
+BOOST_AUTO_TEST_CASE(preagreement_certified_slot_with_queued_work_proposes_without_periodic_tick)
+{
+    std::array<ExecutionLog, 4> logs;
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_certified_wakeup",
+                                 std::chrono::seconds{60}, 2, true};
+    f.after_drain = [&] {
+        for (size_t i{0}; i < f.runtimes.size(); ++i) logs[i].Sample(*f.runtimes[i], f.market);
+    };
+    f.block_commits = false;
+    BOOST_REQUIRE(f.StepUntil(1, std::chrono::seconds{10}));
+    for (size_t i{0}; i < 20; ++i) f.Step();
+
+    // Slot one holds its first deposit at COMMIT while a second one queues.
+    f.block_commits = true;
+    for (const auto& runtime : f.runtimes) {
+        BOOST_REQUIRE(runtime->SubmitLocalAction(f.market, Deposit(COutPoint{f.outpoint.hash, 0})) ==
+                      flowmesh::QueueResult::ACCEPTED);
+    }
+    for (size_t i{0}; i < 20; ++i) f.Step();
+    BOOST_REQUIRE(f.AllAt(1));
+    for (const auto& runtime : f.runtimes) {
+        BOOST_REQUIRE(runtime->SubmitLocalAction(f.market, Deposit(COutPoint{f.outpoint.hash, 1})) ==
+                      flowmesh::QueueResult::ACCEPTED);
+    }
+    f.Drain();
+
+    // One explicit tick lets every node re-send its held COMMIT. After that,
+    // only message delivery runs: no periodic tick reaches any runtime.
+    f.block_commits = false;
+    f.Tick(std::chrono::seconds{1});
+    for (size_t wave{0}; wave < 200 && !f.AllAt(3); ++wave) {
+        for (auto& clock : f.clocks) clock.m_now += std::chrono::milliseconds{50};
+        f.links.Pump(f.clocks[0].Now(), f.runtimes);
+        f.Drain();
+    }
+    BOOST_REQUIRE(f.AllAt(3));
+    const size_t proposer{flowmesh::ProductionProposerSeatIndex(2, 0, f.seats.seats.Size())};
+    for (size_t i{0}; i < f.runtimes.size(); ++i) {
+        BOOST_TEST_CONTEXT("node " << i) {
+            // A tick with queued work records the lock acquisition for the
+            // slot it runs in; only the proposer ran one during slot two.
+            BOOST_CHECK_EQUAL(logs[i].Events(2, "tick_market_lock_acquired") > 0, i == proposer);
+            BOOST_CHECK_EQUAL(logs[i].Executions(2, "build_proposal") > 0, i == proposer);
+            BOOST_CHECK_EQUAL(f.runtimes[i]->StateSnapshot(f.market)->LedgerView().Available(f.account, f.asset), 500);
+        }
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
