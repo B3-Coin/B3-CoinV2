@@ -120,7 +120,27 @@ class FlowMeshClientJoinTest(FlowMeshClientPollTest):
         assert not REFRESH_METHODS.intersection(attempt["requests"]), call
         assert_equal(attempt["requests"].count("submit"), 1)
         assert_equal(call["result"]["sequence"], sequence)
-        assert call["result"]["receipt_state"] in {"queued", "admitted", "certified_inclusion"}, call
+        assert self.delivered_or_refused(call["result"]), call
+
+    @staticmethod
+    def delivered_or_refused(receipt):
+        """The endpoint admitted the signed action, or refused it before
+        admission while reconciling (definite; resent exactly below)."""
+        return (receipt["receipt_state"] in {"queued", "admitted", "certified_inclusion"} or
+                (receipt["receipt_state"] == "rejected" and receipt["reason"] in PRE_ADMISSION_REJECTIONS))
+
+    def until_admitted(self, market, action_id, receipt):
+        """Resend the exact signed bytes (never a new signature) while the
+        endpoint refuses them before admission."""
+        deadline = time.monotonic() + 60
+        while receipt["receipt_state"] == "rejected":
+            assert receipt["reason"] in PRE_ADMISSION_REJECTIONS, receipt
+            assert time.monotonic() < deadline, receipt
+            self.pump_b3()
+            time.sleep(.1)
+            receipt = self.client.retryflowmeshaction(market, action_id)
+            assert_equal(receipt["action_id"], action_id)
+        return receipt
 
     def assert_refreshed(self, call):
         first = call["attempts"][0]
@@ -130,7 +150,7 @@ class FlowMeshClientJoinTest(FlowMeshClientPollTest):
     def certified(self, market, action_id):
         marks = self.marks()
         try:
-            return self.wait_certified(market, action_id)
+            return self.wait_certified(market, action_id, allow_exact_retry=True)
         except AssertionError:
             diagnostics = {"status": self.client.getflowmeshactionstatus(market, action_id),
                            "retained": self.own_actions(market).get(action_id),
@@ -190,8 +210,12 @@ class FlowMeshClientJoinTest(FlowMeshClientPollTest):
             pending = self.signed_call("submitflowmeshorder", market, "bid", TRADE_PRICE // 2, 1)
             self.assert_refreshed(pending)  # A verified inclusion again reset the stamp.
             assert_equal(pending["result"]["sequence"], first_sequence + 2)
-            assert pending["result"]["receipt_state"] in {"queued", "admitted"}, pending
+            assert self.delivered_or_refused(pending["result"]), pending
             third = pending["result"]["action_id"]
+            # It must be admitted to stay unresolved: a definite refusal
+            # would let the next preflight join.
+            receipt = self.until_admitted(market, third, pending["result"])
+            assert receipt["receipt_state"] in {"queued", "admitted", "unknown"}, receipt
             assert_equal(self.own_actions(market)[third]["receipt"]["certificate_verified"], False)
             self.client.getflowmeshbalance(market)
             unresolved = self.signed_call("submitflowmeshorder", market, "bid", TRADE_PRICE // 2 - 1, 1)
