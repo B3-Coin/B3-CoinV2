@@ -23,6 +23,7 @@ enum class FlowMeshAgreementCrashPoint {
     AFTER_SIGNED_PERSIST,
     BEFORE_DECISION_PERSIST,
     AFTER_DECISION_PERSIST,
+    BEFORE_INTENT_PERSIST,
 };
 
 /** Local benchmark observation only; never journaled or sent to peers. */

@@ -580,6 +580,7 @@ struct FlowMeshAgreement::Impl {
             index = slot.records.size();
             slot.records.push_back({*bytes, {}});
             record_index.emplace(record_key, index);
+            Crash(FlowMeshAgreementCrashPoint::BEFORE_INTENT_PERSIST);
             Persist("persist_signing_intent"); // Exact message/evidence precede signing.
             Crash(FlowMeshAgreementCrashPoint::AFTER_INTENT_PERSIST);
         } else {
@@ -724,7 +725,12 @@ struct FlowMeshAgreement::Impl {
                 if (!slot.proposals.contains(slot.view)) {
                     slot.proposals.emplace(slot.view, *EncodeAgreementMessage(proposal));
                     slot.changing = false;
-                    Persist("persist_proposal");
+                    // No vote is signed against it unwritten: the first
+                    // PREPARE below writes the whole slot, this proposal and
+                    // `changing` included, in its intent batch, and Sign
+                    // flushes before any signature. A keyless node writes it
+                    // at Retry's pre-relay flush or at the public return.
+                    MarkDirty("persist_proposal_deferred");
                 }
                 for (const auto& [seat, key] : keys) {
                     AgreementMessage vote;
@@ -950,6 +956,9 @@ bool FlowMeshAgreement::Retry(std::string& error)
         s.usable.clear();
         s.RetryOldProposalCandidates();
         s.Pump();
+        // Nothing is published, not even a relay of someone else's proposal,
+        // while a slot change it may carry is unwritten.
+        s.Flush("persist_before_relay");
         // Retain/rebroadcast the authenticated proposal even on a follower.
         // Its entry bytes are the fetch path for a hidden highest-prepared
         // candidate when the original leader is no longer available.
