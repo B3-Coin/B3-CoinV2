@@ -1275,7 +1275,6 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (it == m_cache.end() || !it->second.fresh) return nullptr;
         auto& cache{it->second};
         try {
-            if (CheckCache(id, cache, account) != CacheCheck::CURRENT) return nullptr;
             std::vector<FlowMeshJoinOwnAction> own;
             for (const auto& [key, p] : m_pending) {
                 if (p.market != id || p.action.IsDeposit() || p.action.signer != *account) continue;
@@ -1294,9 +1293,18 @@ class RemoteBackend final : public FlowMeshTradingBackend {
                     own.push_back({Kind::UNRESOLVED, std::nullopt});
                 }
             }
-            if (!FlowMeshCanJoinFreshPreflight(std::chrono::steady_clock::now(), cache.fresh->first, cache.fresh->second,
-                                               cache.verified.certified.entry.sequence, m_own_certified_through.Through(id),
-                                               own, m_join_windows)) return nullptr;
+            const auto allowed = [&] {
+                return FlowMeshCanJoinFreshPreflight(std::chrono::steady_clock::now(), cache.fresh->first, cache.fresh->second,
+                                                     cache.verified.certified.entry.sequence, m_own_certified_through.Through(id),
+                                                     own, m_join_windows);
+            };
+            // Local refusals first (usually a stamp outside the window): a
+            // refused join is followed by Refresh, which runs CheckCache.
+            if (!allowed()) return nullptr;
+            if (CheckCache(id, cache, account) != CacheCheck::CURRENT) return nullptr;
+            // CheckCache can wait for cs_main; the windows bound the reused
+            // observation's age when the join is taken, so check them again.
+            if (!allowed()) return nullptr;
         } catch (const std::exception&) {
             return nullptr;
         }
