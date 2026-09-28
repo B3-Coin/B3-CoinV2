@@ -19,6 +19,7 @@
 #include <node/finality_binding_index.h>
 #include <node/finality_tracker.h>
 #include <node/miner.h>
+#include <node/regtest_finality_policy.h>
 #include <node/stake_registry.h>
 #include <node/staking.h>
 #include <node/validator_set.h>
@@ -39,6 +40,7 @@
 #include <array>
 #include <chrono>
 #include <map>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -141,6 +143,70 @@ BOOST_AUTO_TEST_CASE(regtest_block_download_producer_policy)
     BOOST_CHECK(!should_wait());
     header.nStatus = BLOCK_VALID_TREE | BLOCK_FAILED_VALID;
     BOOST_CHECK(!should_wait());
+}
+
+BOOST_AUTO_TEST_CASE(regtest_finality_carrier_policy_boundaries)
+{
+    const auto set{BuildCoordinationSet({{CoordinationValidator(1), 40},
+                                        {CoordinationValidator(2), 30}})};
+    BOOST_REQUIRE(set.has_value());
+    node::FinalityTracker::State state;
+    state.bootstrapped = true;
+    state.epoch_starts = {82531};
+    state.current = std::make_shared<const node::ValidatorSetSnapshot>(set->WithEpoch(0));
+    state.next = std::make_shared<const node::ValidatorSetSnapshot>(set->WithEpoch(1));
+    Consensus::ModernPosParams pos;
+    pos.finality_epoch_blocks = 200;
+    pos.max_epoch_extension = 200;
+    using Action = node::RegtestFinalityProduction;
+    const auto plan = [&](const int height) {
+        return node::PlanRegtestFinalityProduction(ChainType::REGTEST, state, pos, height);
+    };
+    BOOST_CHECK(plan(82929).action == Action::ALLOW);
+    BOOST_CHECK(plan(82930).action == Action::REQUIRE_HANDOVER);
+    BOOST_CHECK_EQUAL(plan(82930).last_carrier, 82930);
+    BOOST_CHECK_EQUAL(plan(82930).epoch, 0);
+    BOOST_CHECK(plan(82931).action == Action::LINEAGE_BROKEN);
+    state.handover_certified = true;
+    BOOST_CHECK(plan(82930).action == Action::ALLOW);
+    // The real tracker projects normal rotation before applying this policy.
+    state.handover_certified = false;
+    state.epoch = 1;
+    state.epoch_starts.push_back(82931);
+    state.current = state.next;
+    state.next = std::make_shared<const node::ValidatorSetSnapshot>(set->WithEpoch(2));
+    BOOST_CHECK(plan(82931).action == Action::ALLOW);
+    BOOST_CHECK(plan(83330).action == Action::REQUIRE_HANDOVER);
+    state.lineage_broken = true;
+    state.handover_certified = true; // A stale flag cannot erase broken lineage.
+    BOOST_CHECK(plan(83330).action == Action::LINEAGE_BROKEN);
+    for (const auto network : {ChainType::MAIN, ChainType::TESTNET,
+                               ChainType::TESTNET4, ChainType::SIGNET}) {
+        BOOST_CHECK(node::PlanRegtestFinalityProduction(network, state, pos, 83330).action == Action::ALLOW);
+    }
+    state.lineage_broken = false;
+    state.handover_certified = false;
+    state.next.reset();
+    BOOST_CHECK(plan(83330).action == Action::STATE_UNAVAILABLE);
+    state.next = std::make_shared<const node::ValidatorSetSnapshot>(set->WithEpoch(2));
+    state.epoch_starts.clear();
+    BOOST_CHECK(plan(83330).action == Action::STATE_UNAVAILABLE);
+    state.epoch_starts = {82531};
+    BOOST_CHECK(plan(83330).action == Action::STATE_UNAVAILABLE); // wrong epoch index
+    state.epoch = 0;
+    BOOST_CHECK(plan(82530).action == Action::STATE_UNAVAILABLE);
+    pos.finality_epoch_blocks = 0;
+    BOOST_CHECK(plan(83330).action == Action::STATE_UNAVAILABLE);
+    pos.finality_epoch_blocks = std::numeric_limits<int>::max();
+    pos.max_epoch_extension = -1;
+    BOOST_CHECK(plan(83330).action == Action::STATE_UNAVAILABLE);
+    pos.max_epoch_extension = std::numeric_limits<int>::max();
+    state.epoch_starts = {std::numeric_limits<int>::max()};
+    const auto wide{plan(std::numeric_limits<int>::max())};
+    BOOST_CHECK(wide.action == Action::ALLOW);
+    BOOST_CHECK_EQUAL(wide.last_carrier, int64_t{std::numeric_limits<int>::max()} * 3 - 1);
+    state = {};
+    BOOST_CHECK(plan(1).action == Action::ALLOW); // Preserve V1 no-bootstrap mode.
 }
 
 //! Mainnet's sealed transition pins every modern-PoS value explicitly. Other

@@ -30,8 +30,11 @@
 #include <boost/test/unit_test.hpp>
 
 #include <fstream>
+#include <iterator>
+#include <memory>
 #include <span>
 #include <stdexcept>
+#include <utility>
 
 using b3test::FinalityChainFixture;
 
@@ -317,6 +320,372 @@ BOOST_FIXTURE_TEST_CASE(regtest_staking_waits_for_blocks_but_keeps_checkpoint_si
     BOOST_CHECK_GE(Tip()->nHeight, start_height + 2);
     BOOST_CHECK(resumed.finality_signing);
     BOOST_CHECK_GE(resumed.last_signed_height, waiting.last_signed_height);
+}
+
+BOOST_FIXTURE_TEST_CASE(regtest_staking_preserves_last_handover_carrier, FinalityStakingFixture)
+{
+    PrepareFinalityChain();
+    const int last_carrier{m_M + SCALED_E + SCALED_MAX_EXTENSION - 1};
+    ProduceTo(last_carrier - 1, m_vk_a);
+    BOOST_REQUIRE(!FinalityState().handover_certified);
+    BOOST_REQUIRE(!FinalityState().lineage_broken);
+    const fs::path signer_dir{m_path_root / "handover_finality_signer"};
+    std::string error;
+    {
+        node::FinalitySignerStore store;
+        BOOST_REQUIRE_MESSAGE(store.Open(signer_dir, m_domain, m_vk_a, error), error);
+        BOOST_REQUIRE_MESSAGE(store.InitializeEmpty(error), error);
+    }
+    SetMockTime(Tip()->GetBlockTime() + 1);
+    WITH_LOCK(cs_main, m_node.chainman->UpdateIBDStatus());
+    BOOST_REQUIRE(!m_node.chainman->IsInitialBlockDownload());
+    node::StakingLoop loop(*m_node.chainman, nullptr, signer_dir);
+    BOOST_REQUIRE_MESSAGE(loop.StartWithFinalityKey(
+                              m_validator_a, CScript() << OP_TRUE, m_bls_a, error), error);
+    interfaces::StakingStatus waiting;
+    for (int i{0}; i < 600; ++i) {
+        waiting = loop.Status(std::nullopt);
+        if (waiting.blocks_produced > 0 ||
+            waiting.state.find("regtest finality handover required") != std::string::npos) break;
+        UninterruptibleSleep(std::chrono::milliseconds{10});
+        SetMockTime(GetTime() + 30);
+    }
+    // Before the fix an empty final carrier is produced. Stop the worker
+    // before the fatal assertion; preserve this as a real failed regression.
+    if (waiting.blocks_produced != 0) loop.Stop();
+    BOOST_REQUIRE_EQUAL(waiting.blocks_produced, 0);
+    BOOST_REQUIRE_MESSAGE(waiting.state.find("regtest finality handover required") != std::string::npos,
+                          waiting.state << " / " << waiting.last_error);
+    BOOST_CHECK(waiting.finality_signing);
+    BOOST_CHECK_GE(waiting.last_signed_height, m_M + 55);
+    BOOST_CHECK_EQUAL(waiting.next_block_time, 0);
+    BOOST_CHECK_EQUAL(Tip()->nHeight, last_carrier - 1);
+    const auto journal_bytes = [&] {
+        const auto path{node::FinalitySignerStore::StatePath(signer_dir, m_domain, m_vk_a)};
+        std::ifstream stream(path.std_path(), std::ios::binary);
+        BOOST_REQUIRE(stream.is_open());
+        return std::string(std::istreambuf_iterator<char>{stream}, std::istreambuf_iterator<char>{});
+    };
+    const std::string saved_journal{journal_bytes()};
+    BOOST_REQUIRE(!saved_journal.empty());
+
+    // Repeated scheduling attempts must retain the same signing watermark,
+    // and must not consume the final carrier while quorum is unavailable.
+    UninterruptibleSleep(std::chrono::milliseconds{2200});
+    const auto held{loop.Status(std::nullopt)};
+    BOOST_CHECK_EQUAL(held.blocks_produced, 0);
+    BOOST_CHECK_EQUAL(held.last_signed_height, waiting.last_signed_height);
+    BOOST_CHECK(journal_bytes() == saved_journal);
+    BOOST_CHECK(!FinalityState().lineage_broken);
+    // Restart the SAME local signer state while no quorum exists.
+    loop.Stop();
+    {
+        node::FinalitySignerStore store;
+        BOOST_REQUIRE_MESSAGE(store.Open(signer_dir, m_domain, m_vk_a, error), error);
+        BOOST_REQUIRE(store.State().has_value());
+        BOOST_CHECK_EQUAL(store.State()->last_signed_height, waiting.last_signed_height);
+    }
+    BOOST_REQUIRE_MESSAGE(loop.StartWithFinalityKey(
+                              m_validator_a, CScript() << OP_TRUE, m_bls_a, error), error);
+    for (int i{0}; i < 600; ++i) {
+        waiting = loop.Status(std::nullopt);
+        if (waiting.blocks_produced > 0 ||
+            waiting.state.find("regtest finality handover required") != std::string::npos) break;
+        UninterruptibleSleep(std::chrono::milliseconds{10});
+        SetMockTime(GetTime() + 30);
+    }
+    BOOST_CHECK_EQUAL(waiting.blocks_produced, 0);
+    BOOST_CHECK(waiting.finality_signing);
+    BOOST_REQUIRE_MESSAGE(waiting.state.find("regtest finality handover required") != std::string::npos,
+                          "restart did not reach the guarded production attempt: " << waiting.state);
+    BOOST_CHECK(journal_bytes() == saved_journal);
+
+    // An independent B signature supplies the missing headcount. A's own
+    // durable vote is still binding; no recovery exception or reset is used.
+    node::FinalitySigner peer_signer;
+    peer_signer.SetKey(m_bls_b, m_vk_b);
+    {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        BOOST_REQUIRE(!peer_signer.MaybeSign(
+            Finality(), chainstate.m_chain, m_node.chainman->GetConsensus(),
+            chainstate.FinalitySignatures()).empty());
+    }
+    for (int i{0}; i < 1200 && Tip()->nHeight < last_carrier + 1; ++i) {
+        UninterruptibleSleep(std::chrono::milliseconds{10});
+        SetMockTime(GetTime() + 30);
+    }
+    const auto resumed{loop.Status(std::nullopt)};
+    loop.Stop();
+    BOOST_REQUIRE_MESSAGE(Tip()->nHeight >= last_carrier + 1,
+                          resumed.state << " / " << resumed.last_error);
+    BOOST_CHECK(resumed.finality_signing);
+    BOOST_CHECK(!FinalityState().lineage_broken);
+    BOOST_CHECK_EQUAL(FinalityState().epoch, 1U);
+    CBlock carrier;
+    BOOST_REQUIRE(m_node.chainman->m_blockman.ReadBlock(carrier, *IndexAt(last_carrier)));
+    std::optional<modern::FinalityCertificatePair> pair;
+    BOOST_REQUIRE_MESSAGE(modern::MatchFinalityCertificate(*carrier.vtx.at(0), 2, pair, error), error);
+    BOOST_REQUIRE(pair.has_value());
+    BOOST_CHECK_EQUAL(pair->finalized_block.epoch, 0U);
+    BOOST_CHECK_EQUAL(pair->finalized_block.height, static_cast<uint64_t>(m_M + 55));
+    // Tracker reconstruction must agree; this is not a memory-only waiver.
+    WITH_LOCK(cs_main, m_node.chainman->ActiveChainstate().ModernFinality().MarkDirty());
+    BOOST_CHECK(!FinalityState().lineage_broken);
+    BOOST_CHECK_EQUAL(FinalityState().epoch, 1U);
+}
+
+BOOST_FIXTURE_TEST_CASE(regtest_carrier_rejects_previous_epoch_and_broken_lineage, FinalityChainFixture)
+{
+    PrepareFinalityChain();
+    ProduceTo(m_M + 8, m_vk_a);
+    const auto set0{*FinalityState().current};
+    Produce(m_vk_a, {MakeCertificate({m_M + 5, 0, FinalityState().next->SetHash()}, set0)});
+    ProduceTo(m_M + SCALED_E, m_vk_a);
+    BOOST_REQUIRE_EQUAL(FinalityState().epoch, 1U);
+    const int last_carrier{m_M + 2 * SCALED_E + SCALED_MAX_EXTENSION - 1};
+    ProduceTo(last_carrier - 1, m_vk_a);
+    node::BlockAssembler::Options options;
+    options.coinbase_output_script = CScript() << OP_TRUE;
+    options.modern_pos_validator_key = m_vk_a;
+    options.preserve_regtest_finality = true;
+    const auto assemble = [&] {
+        return node::BlockAssembler(m_node.chainman->ActiveChainstate(), nullptr, options).CreateNewBlock();
+    };
+    const auto handover_wait = [](const std::runtime_error& e) {
+        return std::string{e.what()}.find("regtest finality handover required") != std::string::npos;
+    };
+    BOOST_CHECK_EXCEPTION(assemble(), std::runtime_error, handover_wait);
+    // Default/manual assembly is not consensus enforcement; it still builds
+    // an empty carrier under the original rules.
+    options.preserve_regtest_finality = false;
+    BOOST_CHECK(!assemble()->block.vtx.at(0)->HasMpa());
+    options.preserve_regtest_finality = true;
+    const auto submit_vote = [&](const uint64_t epoch, const int height,
+                                 const modern::ValidatorKeyBytes& validator,
+                                 const bls::SecretKey& key) {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        const auto& tracker{Finality()};
+        const auto& state{tracker.Current()};
+        const auto set{epoch == state.epoch ? state.current : state.previous};
+        BOOST_REQUIRE(set);
+        const auto index{set->IndexOf(validator)};
+        BOOST_REQUIRE(index.has_value());
+        const auto finalized{node::FinalitySignaturePool::ExpectedFinalizedBlock(
+            epoch, height, state, chainstate.m_chain, m_node.chainman->GetConsensus())};
+        BOOST_REQUIRE(finalized.has_value());
+        const uint256 digest{modern::FinalityDigest(m_domain, *finalized)};
+        node::FinalitySig vote;
+        vote.epoch = epoch;
+        vote.height = height;
+        vote.index = *index;
+        vote.signature = key.Sign(std::span<const unsigned char>{digest.begin(), 32}).Compressed();
+        return chainstate.FinalitySignatures().Submit(
+            vote, tracker, chainstate.m_chain, m_node.chainman->GetConsensus());
+    };
+    using Accept = node::FinalitySignaturePool::Accept;
+    // This is a genuinely valid, newer previous-epoch certificate. It can be
+    // included by the default assembler, but cannot authorize epoch1 handover.
+    BOOST_REQUIRE(submit_vote(0, m_M + 25, m_vk_a, m_bls_a) == Accept::ACCEPTED);
+    BOOST_REQUIRE(submit_vote(0, m_M + 25, m_vk_b, m_bls_b) == Accept::ACCEPTED);
+    options.preserve_regtest_finality = false;
+    auto previous{assemble()};
+    std::optional<modern::FinalityCertificatePair> pair;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(modern::MatchFinalityCertificate(*previous->block.vtx.at(0), 2, pair, error), error);
+    BOOST_REQUIRE(pair);
+    BOOST_CHECK_EQUAL(pair->finalized_block.epoch, 0U);
+    options.preserve_regtest_finality = true;
+    BOOST_CHECK_EXCEPTION(assemble(), std::runtime_error, handover_wait);
+    // Forged or insufficient current-epoch evidence must still be refused.
+    BOOST_CHECK(submit_vote(1, m_M + 85, m_vk_b, m_bls_a) == Accept::BAD_SIGNATURE);
+    BOOST_REQUIRE(submit_vote(1, m_M + 85, m_vk_a, m_bls_a) == Accept::ACCEPTED);
+    BOOST_CHECK_EXCEPTION(assemble(), std::runtime_error, handover_wait);
+    BOOST_REQUIRE(submit_vote(1, m_M + 85, m_vk_b, m_bls_b) == Accept::ACCEPTED);
+    auto ready{assemble()};
+    BOOST_REQUIRE_MESSAGE(modern::MatchFinalityCertificate(*ready->block.vtx.at(0), 2, pair, error), error);
+    BOOST_REQUIRE(pair);
+    BOOST_CHECK_EQUAL(pair->finalized_block.epoch, 1U);
+    CBlock block{ready->block};
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    Sign(block, m_validator_a);
+    if (block.GetBlockTime() > GetTime()) SetMockTime(block.GetBlockTime());
+    BOOST_REQUIRE(Submit(block));
+    Produce(m_vk_a);
+    BOOST_CHECK_EQUAL(FinalityState().epoch, 2U);
+    BOOST_CHECK(!FinalityState().lineage_broken);
+    // An unguarded external/manual producer can still exhaust a later epoch.
+    // The guarded assembler must report that condition, never clear it.
+    const int expiry{FinalityState().epoch_starts.back() + SCALED_E + SCALED_MAX_EXTENSION};
+    ProduceTo(expiry, m_vk_a);
+    BOOST_REQUIRE(FinalityState().lineage_broken);
+    const auto expired = [](const std::runtime_error& e) {
+        return std::string{e.what()}.find("regtest finality lineage is already broken") != std::string::npos;
+    };
+    BOOST_CHECK_EXCEPTION(assemble(), std::runtime_error, expired);
+    BOOST_CHECK(FinalityState().lineage_broken);
+    options.preserve_regtest_finality = false;
+    BOOST_REQUIRE(assemble());
+    BOOST_CHECK(FinalityState().lineage_broken);
+}
+
+BOOST_FIXTURE_TEST_CASE(regtest_carrier_uses_older_valid_pooled_certificate, FinalityChainFixture)
+{
+    PrepareFinalityChain();
+    // A delayed first handover shifts epoch1 off the checkpoint grid. Its
+    // final carrier is M+92; checkpoint M+90 is too shallow for that carrier.
+    ProduceTo(m_M + 31, m_vk_a);
+    const auto set0{*FinalityState().current};
+    Produce(m_vk_a, {MakeCertificate({m_M + 25, 0, FinalityState().next->SetHash()}, set0)});
+    Produce(m_vk_a);
+    BOOST_REQUIRE_EQUAL(FinalityState().epoch, 1U);
+    BOOST_REQUIRE_EQUAL(FinalityState().epoch_starts.back(), m_M + 33);
+    const int last_carrier{m_M + 92};
+    ProduceTo(last_carrier - 1, m_vk_a);
+    const Consensus::Params& params{m_node.chainman->GetConsensus()};
+    using Accept = node::FinalitySignaturePool::Accept;
+    const auto make_votes = [&](const int height) {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        const auto& state{Finality().Current()};
+        const auto set{state.epoch == 1 ? state.current : state.previous};
+        BOOST_REQUIRE(set);
+        const auto finalized{node::FinalitySignaturePool::ExpectedFinalizedBlock(
+            1, height, state, chainstate.m_chain, params)};
+        BOOST_REQUIRE(finalized);
+        const uint256 digest{modern::FinalityDigest(m_domain, *finalized)};
+        std::vector<node::FinalitySig> votes;
+        for (const auto& [validator, key] : {
+                 std::pair{m_vk_a, &m_bls_a}, std::pair{m_vk_b, &m_bls_b}}) {
+            const auto index{set->IndexOf(validator)};
+            BOOST_REQUIRE(index);
+            node::FinalitySig vote;
+            vote.epoch = 1;
+            vote.height = height;
+            vote.index = *index;
+            vote.signature = key->Sign(std::span<const unsigned char>{digest.begin(), 32}).Compressed();
+            votes.push_back(vote);
+        }
+        return votes;
+    };
+    const auto submit_votes = [&](const std::vector<node::FinalitySig>& votes) {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        const auto& tracker{Finality()};
+        for (const auto& vote : votes) {
+            BOOST_REQUIRE(chainstate.FinalitySignatures().Submit(
+                              vote, tracker, chainstate.m_chain, params) == Accept::ACCEPTED);
+        }
+    };
+    const auto raw_best = [&] {
+        LOCK(cs_main);
+        Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+        return chainstate.FinalitySignatures().BestCertificate(
+            Finality(), chainstate.m_chain, params);
+    };
+    // Retain these exact received messages for replay after the carrier is
+    // disconnected. No signer is rewound or asked to create an older vote.
+    const auto older_votes{make_votes(m_M + 85)};
+    submit_votes(older_votes);
+    const auto older{raw_best()};
+    BOOST_REQUIRE(older);
+    BOOST_REQUIRE_EQUAL(older->first.height, static_cast<uint64_t>(m_M + 85));
+    const auto [older_payload, older_cell]{modern::BuildFinalityCertificate(older->first, older->second)};
+    CMpaRecord record;
+    record.payload_type = modern::MPA_TYPE_FINALITY_CERTIFICATE;
+    record.payload_version = modern::MPA_VERSION_V1;
+    record.payload = older_payload;
+    const uint256 original_carrier{Produce(m_vk_a, {{older_cell, record}})};
+    Produce(m_vk_a);
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, m_M + 93);
+    BOOST_REQUIRE_EQUAL(FinalityState().epoch, 2U);
+    const auto newer_votes{make_votes(m_M + 90)};
+    submit_votes(newer_votes); // Valid previous-epoch votes, now depth3.
+    const auto newer{raw_best()};
+    BOOST_REQUIRE(newer);
+    BOOST_REQUIRE_EQUAL(newer->first.height, static_cast<uint64_t>(m_M + 90));
+    const auto newer_payload{modern::BuildFinalityCertificate(newer->first, newer->second).first};
+
+    // Supported operator rollback on disposable data, NOT spontaneous
+    // higher-work fork choice: remove only the carrier and its descendant,
+    // strictly above the sticky M+85 checkpoint. The pool survives normally.
+    const auto anchor{WITH_LOCK(cs_main, return m_node.chainman->m_blockman.FinalityAnchor())};
+    BOOST_REQUIRE(anchor);
+    BOOST_REQUIRE_EQUAL(anchor->first, m_M + 85);
+    BOOST_REQUIRE(anchor->second == ChainHashAt(m_M + 85));
+    CBlockIndex* const carrier_index{WITH_LOCK(
+        cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(original_carrier))};
+    BOOST_REQUIRE(carrier_index);
+    BOOST_REQUIRE_GT(carrier_index->nHeight - 1, anchor->first);
+    BlockValidationState rollback_state;
+    BOOST_REQUIRE_MESSAGE(m_node.chainman->ActiveChainstate().InvalidateBlock(rollback_state, carrier_index),
+                          rollback_state.ToString());
+    BOOST_REQUIRE_MESSAGE(m_node.chainman->ActiveChainstate().ActivateBestChain(rollback_state),
+                          rollback_state.ToString());
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, last_carrier - 1);
+    BOOST_REQUIRE_EQUAL(FinalityState().epoch, 1U);
+    BOOST_REQUIRE(!FinalityState().handover_certified);
+    BOOST_REQUIRE(!FinalityState().lineage_broken);
+    BOOST_REQUIRE(FinalityState().finalized);
+    BOOST_REQUIRE_EQUAL(FinalityState().finalized->height, m_M + 25);
+    BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.FinalityAnchor()) == anchor);
+    submit_votes(older_votes); // Replay the exact saved M+85 signatures.
+    {
+        LOCK(cs_main);
+        auto& tracker{Finality()};
+        const auto newest{raw_best()};
+        BOOST_REQUIRE(newest);
+        BOOST_CHECK_EQUAL(newest->first.height, static_cast<uint64_t>(m_M + 90));
+        BOOST_CHECK(modern::BuildFinalityCertificate(newest->first, newest->second).first == newer_payload);
+        std::string error;
+        BOOST_CHECK(!tracker.JudgeCandidateCertificate(newest->first, newest->second, *Tip(), params, error));
+        BOOST_CHECK_EQUAL(error, "insufficient-depth");
+        BOOST_REQUIRE_MESSAGE(tracker.JudgeCandidateCertificate(older->first, older->second, *Tip(), params, error), error);
+    }
+    node::BlockAssembler::Options options;
+    options.coinbase_output_script = CScript() << OP_2; // Distinct from the invalidated carrier.
+    options.modern_pos_validator_key = m_vk_a;
+    options.preserve_regtest_finality = true;
+    // Before candidate-aware selection this throws: raw BestCertificate keeps
+    // returning M+90 and the guard cannot deepen the chain to make it usable.
+    std::unique_ptr<node::CBlockTemplate> ready;
+    std::string assembly_error;
+    try {
+        ready = node::BlockAssembler(m_node.chainman->ActiveChainstate(), nullptr, options).CreateNewBlock();
+    } catch (const std::runtime_error& e) {
+        assembly_error = e.what();
+    }
+    BOOST_REQUIRE_MESSAGE(ready, "guarded assembly refused the usable M+85 certificate: " << assembly_error);
+    std::optional<modern::FinalityCertificatePair> pair;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(modern::MatchFinalityCertificate(*ready->block.vtx.at(0), 2, pair, error), error);
+    BOOST_REQUIRE(pair);
+    BOOST_CHECK_EQUAL(pair->finalized_block.epoch, 1U);
+    BOOST_CHECK_EQUAL(pair->finalized_block.height, static_cast<uint64_t>(m_M + 85));
+    BOOST_CHECK(modern::BuildFinalityCertificate(pair->finalized_block, pair->certificate).first == older_payload);
+    {
+        LOCK(cs_main);
+        const auto& pool{m_node.chainman->ActiveChainstate().FinalitySignatures()};
+        BOOST_CHECK_EQUAL(pool.TrackedCheckpoints(), 2U);
+        BOOST_CHECK_EQUAL(pool.SignatureCount(1, m_M + 85), older_votes.size());
+        BOOST_CHECK_EQUAL(pool.SignatureCount(1, m_M + 90), newer_votes.size());
+        const auto newest{raw_best()};
+        BOOST_REQUIRE(newest);
+        BOOST_CHECK(modern::BuildFinalityCertificate(newest->first, newest->second).first == newer_payload);
+    }
+    CBlock block{ready->block};
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    Sign(block, m_validator_a);
+    BOOST_REQUIRE(block.GetHash() != original_carrier);
+    if (block.GetBlockTime() > GetTime()) SetMockTime(block.GetBlockTime());
+    BOOST_REQUIRE(Submit(block));
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, last_carrier);
+    BOOST_CHECK(FinalityState().handover_certified);
+    Produce(m_vk_a);
+    BOOST_CHECK_EQUAL(FinalityState().epoch, 2U);
+    BOOST_CHECK(!FinalityState().lineage_broken);
+    BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.FinalityAnchor()) == anchor);
 }
 
 BOOST_FIXTURE_TEST_CASE(staking_stop_forgets_finality_key_before_another_wallet_starts, FinalityStakingFixture)

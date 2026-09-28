@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <node/miner.h>
+#include <node/regtest_finality_policy.h>
 
 #include <chain.h>
 #include <chainparams.h>
@@ -532,8 +533,11 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // include it in the coinbase -- cell + type-4 record, judged first with
     // the IDENTICAL consensus rule so no invalid certificate is ever emitted.
     // Without a quorum nothing is included: blocks never depend on
-    // certificates and the epoch simply extends (frozen behaviour).
+    // certificates and the epoch simply extends (frozen consensus behaviour).
+    // The local automatic-regtest policy below preserves its last carrier.
     if (b3_modern_pos) {
+        const bool preserve_finality{m_options.preserve_regtest_finality &&
+                                      chainparams.GetChainType() == ChainType::REGTEST};
         node::FinalityTracker& finality{m_chainstate.ModernFinality()};
         const node::BridgeStateIndex* bridge_index{nullptr};
         if (Consensus::BridgeRulesActive(pindexPrev->nHeight, b3_consensus)) {
@@ -546,8 +550,21 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         }
         if (finality.Sync(m_chainstate.m_chain, m_chainstate.m_blockman,
                           b3_consensus, *pindexPrev, bridge_index)) {
+            const RegtestFinalityPlan production_plan{
+                preserve_finality ? PlanRegtestFinalityProduction(
+                                        chainparams.GetChainType(), finality.Projected(nHeight, b3_consensus),
+                                        *b3_consensus.modern_pos, nHeight)
+                                  : RegtestFinalityPlan{}};
+            if (production_plan.action == RegtestFinalityProduction::LINEAGE_BROKEN) {
+                throw std::runtime_error("regtest finality lineage is already broken; local production paused; explicit recovery review required");
+            }
+            if (production_plan.action == RegtestFinalityProduction::STATE_UNAVAILABLE) {
+                throw std::runtime_error("regtest finality state is unavailable; local production paused");
+            }
+            bool included_current_epoch_certificate{false};
             if (auto best{m_chainstate.FinalitySignatures().BestCertificate(finality, m_chainstate.m_chain,
-                                                                            b3_consensus, bridge_index)}) {
+                                                                            b3_consensus, bridge_index,
+                                                                            preserve_finality ? pindexPrev : nullptr)}) {
                 std::string cert_error;
                 if (finality.JudgeCandidateCertificate(best->first, best->second, *pindexPrev, b3_consensus,
                                                        cert_error, bridge_index)) {
@@ -560,6 +577,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
                     record.payload_version = modern::MPA_VERSION_V1;
                     record.payload = payload;
                     coinbaseTx.mpa = {record};
+                    included_current_epoch_certificate = best->first.epoch == production_plan.epoch;
                     LogInfo("CreateNewBlock(): including finality certificate for checkpoint %d (epoch %d)\n",
                             best->first.height, best->first.epoch);
                 } else {
@@ -567,6 +585,14 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
                              cert_error);
                 }
             }
+            if (production_plan.action == RegtestFinalityProduction::REQUIRE_HANDOVER &&
+                !included_current_epoch_certificate) {
+                throw std::runtime_error(strprintf(
+                    "regtest finality handover required: preserving last carrier %d for epoch %d; waiting for a valid current-epoch quorum certificate",
+                    production_plan.last_carrier, production_plan.epoch));
+            }
+        } else if (preserve_finality) {
+            throw std::runtime_error("regtest finality state cannot be synchronized; local production paused");
         }
     }
 

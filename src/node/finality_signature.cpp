@@ -184,7 +184,8 @@ FinalitySignaturePool::Accept FinalitySignaturePool::Submit(const FinalitySig& s
 std::optional<std::pair<modern::FinalizedBlock, modern::FinalityCertificate>>
 FinalitySignaturePool::BestCertificate(const FinalityTracker& tracker, const CChain& chain,
                                        const Consensus::Params& params,
-                                       const BridgeStateIndex* bridge_index) const
+                                       const BridgeStateIndex* bridge_index,
+                                       const CBlockIndex* candidate_parent) const
 {
     const FinalityTracker::State& state{tracker.Current()};
     const auto domain{params.legacy_final_hash
@@ -230,6 +231,16 @@ FinalitySignaturePool::BestCertificate(const FinalityTracker& tracker, const CCh
         const auto aggregate{bls::AggregateSignatures(sigs)};
         if (!aggregate) continue;
         cert.aggregate_sig = aggregate->Compressed();
+        if (candidate_parent) {
+            std::string error;
+            if (!tracker.JudgeCandidateCertificate(*fb, cert, *candidate_parent,
+                                                    params, error, bridge_index)) {
+                // A retained quorum can become temporarily too shallow after
+                // rollback. It must not mask an older usable certificate or
+                // be erased to make progress. At most eight slots are tried.
+                continue;
+            }
+        }
         return std::make_pair(*fb, std::move(cert));
     }
     return std::nullopt;

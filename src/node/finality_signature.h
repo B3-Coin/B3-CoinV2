@@ -110,12 +110,16 @@ public:
      * quorums of its signing set, assembled into (FinalizedBlock, certificate
      * with signer bitmap). Verification-ready; the caller (block assembly)
      * still runs the consensus judge before emitting it. nullopt when no slot
-     * has both quorums.
+     * has both quorums. If candidate_parent is supplied, skip certificates
+     * rejected by the unchanged candidate consensus judge and continue the
+     * bounded scan. This is selection only: no votes or slots are discarded.
+     * The tracker must be synced to that parent; the caller holds cs_main.
      */
     std::optional<std::pair<modern::FinalizedBlock, modern::FinalityCertificate>>
     BestCertificate(const FinalityTracker& tracker, const CChain& chain,
                     const Consensus::Params& params,
-                    const BridgeStateIndex* bridge_index = nullptr) const;
+                    const BridgeStateIndex* bridge_index = nullptr,
+                    const CBlockIndex* candidate_parent = nullptr) const;
 
     //! Drop every slot at or below `finalized_height`.
     void Prune(int finalized_height);

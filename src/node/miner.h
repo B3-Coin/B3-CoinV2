@@ -111,6 +111,11 @@ public:
          * is not eligible. Validation and fork choice never read this option.
          */
         std::optional<uint32_t> modern_pos_round{};
+        /** Local StakingLoop policy only: on regtest preserve the final
+         * legal handover carrier until its coinbase contains a judged
+         * current-epoch certificate. Never consulted by block validation,
+         * ignored on other networks, false for manual/default assemblers. */
+        bool preserve_regtest_finality{false};
     };
 
     explicit BlockAssembler(Chainstate& chainstate, const CTxMemPool* mempool, const Options& options);

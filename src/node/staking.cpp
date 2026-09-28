@@ -829,6 +829,8 @@ void StakingLoop::ThreadLoop()
             options.modern_pos_validator_key = validator;
             options.modern_pos_round = static_cast<uint32_t>(round);
             options.test_block_validity = true;
+            options.preserve_regtest_finality =
+                m_chainman.GetParams().GetChainType() == ChainType::REGTEST;
             const auto tmpl{BlockAssembler(m_chainman.ActiveChainstate(),
                                            m_mempool, options)
                                 .CreateNewBlock()};
@@ -866,11 +868,13 @@ void StakingLoop::ThreadLoop()
                 ++m_blocks_produced;
                 m_last_block_hash = hash;
                 m_state = "producing";
+                if (m_last_error.starts_with("regtest finality ")) m_last_error.clear();
             }
             LogInfo("staking: produced modern-PoS block %s at height %d as proposer %d of %d\n",
                     hash.ToString(), next_height, proposer_plan.rank + 1,
                     proposer_plan.eligible_count);
         } catch (const std::exception& e) {
+            WITH_LOCK(m_mutex, m_next_block_time = 0);
             SetState(strprintf("waiting: %s", e.what()), e.what());
             if (!SleepUnlessStopped(std::chrono::seconds{2})) break;
             continue;
