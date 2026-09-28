@@ -7,6 +7,7 @@
 
 #include <crypto/bls.h>
 #include <interfaces/chain.h>
+#include <kernel/cs_main.h>
 #include <key.h>
 #include <script/script.h>
 #include <sync.h>
@@ -22,9 +23,11 @@
 #include <thread>
 #include <vector>
 
+class CBlockIndex;
 class ChainstateManager;
 class CTxMemPool;
 class PeerManager;
+enum class ChainType;
 
 namespace Consensus {
 struct ModernPosParams;
@@ -67,6 +70,13 @@ PreferredProposerPlan ComputePreferredProposerPlan(
     const std::array<unsigned char, 32>& validator_key,
     const Consensus::ModernPosParams& pos);
 
+/** Regtest-only producer policy, not a block-validity or finality-signing rule.
+ * An accepted header with more height and work may still lack a valid body;
+ * withholding that body can keep local production paused. */
+bool ShouldWaitForRegtestBlockDownload(
+    ChainType network, const CBlockIndex* active_tip,
+    const CBlockIndex* best_header) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
 /**
  * The automatic Modern PoS staking loop (release-v1 validator UX, owner
  * ruling 2026-08-23: "automatic staking loop ... nothing more advanced in
@@ -83,7 +93,8 @@ PreferredProposerPlan ComputePreferredProposerPlan(
  *
  * It produces nothing while the next block is not a modern-PoS block
  * (legacy era, corridor, unpinned boundary, unconfigured rules), during
- * initial block download, or while this validator has no ACTIVE stake.
+ * initial block download, while regtest is catching up to a higher-work
+ * best header, or while this validator has no ACTIVE stake.
  * Everything consensus-relevant lives in the assembler and validation; this
  * class only schedules.
  */

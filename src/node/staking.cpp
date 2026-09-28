@@ -24,6 +24,7 @@
 #include <primitives/block.h>
 #include <pubkey.h>
 #include <support/cleanse.h>
+#include <util/chaintype.h>
 #include <util/check.h>
 #include <util/strencodings.h>
 #include <util/thread.h>
@@ -69,6 +70,16 @@ uint64_t HashModulo(const uint256& value, const uint64_t modulus)
     return (number - (number / divisor) * divisor).GetLow64();
 }
 } // namespace
+
+bool ShouldWaitForRegtestBlockDownload(
+    const ChainType network, const CBlockIndex* active_tip,
+    const CBlockIndex* best_header)
+{
+    return network == ChainType::REGTEST && active_tip && best_header &&
+           best_header->IsValid(BLOCK_VALID_TREE) &&
+           best_header->nHeight > active_tip->nHeight &&
+           best_header->nChainWork > active_tip->nChainWork;
+}
 
 PreferredProposerPlan ComputePreferredProposerPlan(
     const uint256& chain_domain, const uint256& seed, const int height,
@@ -620,6 +631,7 @@ void StakingLoop::ThreadLoop()
         uint256 seed;
         int64_t parent_time{0};
         bool tip_changed{false};
+        bool waiting_for_blocks{false};
         std::string coordination_error;
         try {
             LOCK(::cs_main);
@@ -627,6 +639,10 @@ void StakingLoop::ThreadLoop()
             const CBlockIndex* tip{chainstate.m_chain.Tip()};
             if (!tip || tip->GetBlockHash() != tip_hash) {
                 tip_changed = true;
+            } else if (ShouldWaitForRegtestBlockDownload(
+                           m_chainman.GetParams().GetChainType(), tip,
+                           m_chainman.m_best_header)) {
+                waiting_for_blocks = true;
             } else {
                 parent_time = tip->GetBlockTime();
                 const auto domain{modern::ModernChainDomain(
@@ -665,6 +681,15 @@ void StakingLoop::ThreadLoop()
             coordination_error = e.what();
         }
         if (tip_changed) continue;
+        if (waiting_for_blocks) {
+            // IBD stays false after the first sync. Do not build regtest
+            // forks while downloading a better header chain, but keep the
+            // unchanged checkpoint-signing pass above active on every retry.
+            WITH_LOCK(m_mutex, m_next_block_time = 0);
+            SetState("waiting: regtest block download is behind the best header");
+            if (!SleepUnlessStopped(std::chrono::seconds{1})) break;
+            continue;
+        }
         if (!coordination_error.empty() || !set || seed.IsNull()) {
             if (coordination_error.empty()) {
                 coordination_error = "modern-PoS eligibility seed is unavailable";
@@ -726,11 +751,14 @@ void StakingLoop::ThreadLoop()
         const int64_t round_time_ms{first_round_time_ms + round * round_ms};
         const int64_t next_round_time_ms{round_time_ms + round_ms};
         enum class WaitResult { TIME_REACHED, TIP_CHANGED, STOPPED };
-        const auto tip_is_current = [&] {
+        const auto candidate_is_current = [&] {
             return WITH_LOCK(
                 ::cs_main,
                 const CBlockIndex* current{m_chainman.ActiveChain().Tip()};
-                return current && current->GetBlockHash() == tip_hash);
+                return current && current->GetBlockHash() == tip_hash &&
+                       !ShouldWaitForRegtestBlockDownload(
+                           m_chainman.GetParams().GetChainType(), current,
+                           m_chainman.m_best_header));
         };
         const auto wait_until_or_tip_change = [&](const int64_t target_ms) {
             while (TicksSinceEpoch<std::chrono::milliseconds>(
@@ -738,7 +766,7 @@ void StakingLoop::ThreadLoop()
                 if (!SleepUnlessStopped(std::chrono::milliseconds{250})) {
                     return WaitResult::STOPPED;
                 }
-                if (!tip_is_current()) return WaitResult::TIP_CHANGED;
+                if (!candidate_is_current()) return WaitResult::TIP_CHANGED;
             }
             return WaitResult::TIME_REACHED;
         };
@@ -786,7 +814,7 @@ void StakingLoop::ThreadLoop()
         const WaitResult waited{wait_until_or_tip_change(send_time_ms)};
         if (waited == WaitResult::STOPPED) return;
         if (waited == WaitResult::TIP_CHANGED) continue;
-        if (!tip_is_current() ||
+        if (!candidate_is_current() ||
             TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now()) >=
                 send_deadline_ms) {
             continue;
@@ -805,7 +833,7 @@ void StakingLoop::ThreadLoop()
                                            m_mempool, options)
                                 .CreateNewBlock()};
             CBlock block{tmpl->block};
-            if (block.hashPrevBlock != tip_hash || !tip_is_current() ||
+            if (block.hashPrevBlock != tip_hash || !candidate_is_current() ||
                 TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now()) >=
                     send_deadline_ms) {
                 continue;
@@ -817,7 +845,7 @@ void StakingLoop::ThreadLoop()
                 continue;
             }
             const uint256 hash{block.GetHash()};
-            if (!tip_is_current() ||
+            if (!candidate_is_current() ||
                 TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now()) >=
                     send_deadline_ms) {
                 continue;

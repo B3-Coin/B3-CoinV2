@@ -105,6 +105,44 @@ constexpr int64_t SATURATED_ROUND{128};
 
 BOOST_FIXTURE_TEST_SUITE(modern_pos_tests, BasicTestingSetup)
 
+BOOST_AUTO_TEST_CASE(regtest_block_download_producer_policy)
+{
+    LOCK(cs_main);
+    CBlockIndex tip;
+    tip.nHeight = 100;
+    tip.nChainWork = arith_uint256{100};
+    tip.nStatus = BLOCK_VALID_TREE;
+    CBlockIndex header;
+    header.nHeight = 101;
+    header.nChainWork = arith_uint256{101};
+    header.nStatus = BLOCK_VALID_TREE;
+    const auto should_wait = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+        return node::ShouldWaitForRegtestBlockDownload(ChainType::REGTEST, &tip, &header);
+    };
+    BOOST_CHECK(should_wait());
+    for (const auto network : {ChainType::MAIN, ChainType::TESTNET,
+                               ChainType::TESTNET4, ChainType::SIGNET}) {
+        BOOST_CHECK(!node::ShouldWaitForRegtestBlockDownload(network, &tip, &header));
+    }
+    BOOST_CHECK(!node::ShouldWaitForRegtestBlockDownload(ChainType::REGTEST, nullptr, &header));
+    BOOST_CHECK(!node::ShouldWaitForRegtestBlockDownload(ChainType::REGTEST, &tip, nullptr));
+    BOOST_CHECK(!node::ShouldWaitForRegtestBlockDownload(ChainType::REGTEST, &tip, &tip));
+    header.nHeight = 100;
+    BOOST_CHECK(!should_wait()); // More work alone is not a header-height gap.
+    header.nHeight = 99;
+    BOOST_CHECK(!should_wait());
+    header.nHeight = 101;
+    header.nChainWork = arith_uint256{100};
+    BOOST_CHECK(!should_wait()); // A taller, equal/lower-work fork is not ahead.
+    header.nChainWork = arith_uint256{99};
+    BOOST_CHECK(!should_wait());
+    header.nChainWork = arith_uint256{101};
+    header.nStatus = BLOCK_VALID_RESERVED;
+    BOOST_CHECK(!should_wait());
+    header.nStatus = BLOCK_VALID_TREE | BLOCK_FAILED_VALID;
+    BOOST_CHECK(!should_wait());
+}
+
 //! Mainnet's sealed transition pins every modern-PoS value explicitly. Other
 //! shipped networks remain unconfigured, and no production chain may carry a
 //! test-only injection point.

@@ -253,6 +253,72 @@ BOOST_FIXTURE_TEST_CASE(staking_loop_signs_aggregates_and_finalizes, FinalitySta
     BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.FinalityAnchor()).has_value());
 }
 
+BOOST_FIXTURE_TEST_CASE(regtest_staking_waits_for_blocks_but_keeps_checkpoint_signing, FinalityStakingFixture)
+{
+    PrepareFinalityChain();
+    const fs::path signer_dir{m_path_root / "catchup_finality_signer"};
+    std::string error;
+    {
+        node::FinalitySignerStore store;
+        BOOST_REQUIRE_MESSAGE(store.Open(signer_dir, m_domain, m_vk_a, error), error);
+        BOOST_REQUIRE_MESSAGE(store.InitializeEmpty(error), error);
+    }
+    ProduceTo(m_M + 8, m_vk_a); // M+5 is deep enough to sign.
+    const int start_height{Tip()->nHeight};
+    const CBlock downloaded_block{BuildPosBlock(m_vk_a)};
+    SetMockTime(downloaded_block.GetBlockTime());
+    WITH_LOCK(cs_main, m_node.chainman->UpdateIBDStatus());
+    BOOST_REQUIRE(!m_node.chainman->IsInitialBlockDownload());
+
+    // Learn a real, accepted header without its body after IBD has latched
+    // false. This must pause only local production, not checkpoint signing.
+    BlockValidationState header_state;
+    BOOST_REQUIRE_MESSAGE(m_node.chainman->ProcessNewBlockHeaders(
+                              {{CBlockHeader{downloaded_block}}},
+                              /*min_pow_checked=*/true, header_state),
+                          header_state.ToString());
+    node::StakingLoop loop(*m_node.chainman, /*mempool=*/nullptr, signer_dir);
+    BOOST_REQUIRE_MESSAGE(loop.SetFinalityKey(m_bls_a, m_vk_a, error), error);
+    BOOST_REQUIRE_MESSAGE(loop.Start(m_validator_a, CScript() << OP_TRUE, error), error);
+    interfaces::StakingStatus waiting;
+    for (int i{0}; i < 400; ++i) {
+        waiting = loop.Status(std::nullopt);
+        if (waiting.blocks_produced > 0 ||
+            (waiting.state == "waiting: regtest block download is behind the best header" &&
+             waiting.last_signed_height >= m_M + 5)) break;
+        UninterruptibleSleep(std::chrono::milliseconds{10});
+        SetMockTime(GetTime() + 30);
+    }
+    BOOST_CHECK(waiting.finality_signing);
+    BOOST_CHECK_GE(waiting.last_signed_height, m_M + 5);
+    BOOST_REQUIRE_EQUAL(waiting.blocks_produced, 0U);
+    BOOST_CHECK_EQUAL(waiting.next_block_time, 0);
+    BOOST_CHECK_EQUAL(waiting.state, "waiting: regtest block download is behind the best header");
+    BOOST_CHECK_EQUAL(Tip()->nHeight, start_height);
+    UninterruptibleSleep(std::chrono::milliseconds{1100});
+    const auto still_waiting{loop.Status(std::nullopt)};
+    BOOST_CHECK_EQUAL(still_waiting.blocks_produced, 0U);
+    BOOST_CHECK_EQUAL(still_waiting.state, waiting.state);
+    BOOST_CHECK_EQUAL(still_waiting.last_signed_height, waiting.last_signed_height);
+
+    // Receiving the body closes the gap without resetting/restarting either
+    // signer or staking loop. Ordinary production then resumes.
+    BOOST_REQUIRE(Submit(downloaded_block));
+    interfaces::StakingStatus resumed;
+    for (int i{0}; i < 600; ++i) {
+        resumed = loop.Status(std::nullopt);
+        if (resumed.blocks_produced > 0) break;
+        UninterruptibleSleep(std::chrono::milliseconds{10});
+        SetMockTime(GetTime() + 30);
+    }
+    loop.Stop();
+    BOOST_CHECK_MESSAGE(resumed.blocks_produced > 0,
+                        "loop state: " << resumed.state << " / last error: " << resumed.last_error);
+    BOOST_CHECK_GE(Tip()->nHeight, start_height + 2);
+    BOOST_CHECK(resumed.finality_signing);
+    BOOST_CHECK_GE(resumed.last_signed_height, waiting.last_signed_height);
+}
+
 BOOST_FIXTURE_TEST_CASE(staking_stop_forgets_finality_key_before_another_wallet_starts, FinalityStakingFixture)
 {
     PrepareFinalityChain();
