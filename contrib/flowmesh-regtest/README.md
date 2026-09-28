@@ -1,4 +1,4 @@
-# B3 FlowMesh REGTEST TEST5 — 1.1.5-flowmesh-test.5
+# B3 FlowMesh REGTEST TEST6 — 1.1.5-flowmesh-test.6
 
 This is a temporary, valueless test network. It is NOT a mainnet upgrade or
 finished FlowMesh V2. Do not import any real wallet, seed, private key or FN key.
@@ -12,7 +12,7 @@ finished FlowMesh V2. Do not import any real wallet, seed, private key or FN key
 3. The app accepts **no extra arguments**. Do not edit your normal
    `b3coin.conf`; the approved peer, HTTPS endpoint, public CA and regtest rules
    are built into this app.
-4. If prompted to create a wallet, name it **closed-test**, leaving external
+4. If prompted to create a wallet, the tester app fixes its name to **closed-test**, leaving external
    signer/watch-only options off. Generate it locally; nobody shares a wallet.
 5. Allow block synchronization to catch up. Open Trade -> Spot and select the
    rUSD market (or its exact AssetId if the metadata is not yet available).
@@ -36,7 +36,7 @@ and publisher signing are not claimed.
 
 - Branch: `flowmeshV2-dev`; see the archive's `BUILD-INFO.json` for exact commit,
   binary hashes, embedded profile digest and platform.
-- Connection profile: `vps-regtest-20260928-test5`.
+- Connection profile: `vps-regtest-20260928-test5` (unchanged in TEST6).
 - B3 peer: `88.216.63.161:19547` (regtest only).
 - HTTPS: `https://88.216.63.161:19580/flowmesh/v1`.
 - Public CA file: `session3-ca.pem`.
@@ -48,11 +48,17 @@ and publisher signing are not claimed.
 - Asset: `6fb7668277c3bcc62c60c41f6bb2e39649387c1fb6ef0898857452fdb766130f`.
 - Data stays under the OS's local application-data folder:
   `B3FlowMeshClosedTest/vps-regtest-20260926-test4`.
-  TEST5 reuses the existing TEST4 wallet, outbox, journal, receipts and settings
+  TEST6 reuses the existing TEST4/TEST5 wallet, outbox, journal, receipts and settings
   in place. The reviewed connection update adds a separate versioned CA and
   connection marker while preserving the previous CA and profile marker.
   The regtest consensus rules and genesis are unchanged.
   It is not the earlier Mac operator's `remote_verification` wallet.
+- An existing sole wallet named `test`, created with the earlier UI, is opened
+  **in place**. It is not renamed to `closed-test`. Multiple wallets, other names,
+  unsafe paths or saved settings naming a different wallet are refused for
+  review; nothing is removed. Fresh creation is fixed to `closed-test`, and the
+  tester Create Wallet UI refuses a second wallet. Manual RPC creation of other
+  wallets is unsupported; this is not a general wallet-import tool.
 - Existing data with an unapproved profile, changed trust file, unexpected
   wallet or unsafe path is refused. Preserve it and report the error; do not
   delete a marker, reset the data directory, or import another wallet.
@@ -63,7 +69,8 @@ and publisher signing are not claimed.
 
 ### Connection upgrade is not old-chain recovery
 
-TEST5 fixes endpoint addresses and HTTPS trust only. It does not choose a fork,
+TEST6 retains TEST5's endpoint/trust repair and corrects named-wallet reopening.
+It does not choose a fork,
 erase an old finality anchor, reset signing history, replay orders on another
 chain, or migrate balances from an abandoned regtest session. Before upgrading
 an existing tester installation, compare its block 145 with the current session:
@@ -72,7 +79,7 @@ A different hash means a separate chain-history diagnosis is required. Preserve
 the old data and report it; do not delete locks or reindex to force agreement.
 
 The original profile marker and CA remain in place for inspection. The old
-TEST4 executable can still recognize them after TEST5 exits, so open TEST5,
+TEST4 executable can still recognize them after TEST6 exits, so open TEST6,
 not the old shortcut. Both versions use the same exclusive ownership lock.
 Incomplete or tampered trust files are preserved and refused, not overwritten.
 

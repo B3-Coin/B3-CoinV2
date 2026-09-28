@@ -13,7 +13,7 @@ import tempfile
 import zipfile
 
 SOURCE = Path(__file__).resolve().parents[2]
-VERSION = "1.1.5-flowmesh-test.5"
+VERSION = "1.1.5-flowmesh-test.6"
 PROFILE = "vps-regtest-20260928-test5"
 STORAGE_PROFILE = "vps-regtest-20260926-test4"
 PROFILE_PATH = SOURCE / "contrib/flowmesh-regtest/profile-vps-20260928.json"
@@ -282,7 +282,10 @@ def main():
         binary = payload / "B3FlowMeshRegtest.exe"
         if args.policy_probe_output:
             args.policy_probe_output.mkdir(parents=True, exist_ok=False)
-            portable.PROGRAMS = ("test_b3_flowmeshclosed-policy.exe",)
+            # CI-only probes and generated-wallet roundtrip binaries. These
+            # are never added to the tester archive above.
+            portable.PROGRAMS = ("test_b3_flowmeshclosed-policy.exe", "test_b3_createwalletdialog-qt.exe",
+                                 "b3coind.exe", "b3coin-cli.exe")
             probes = portable.collect_payload(build / "bin", args.depends.resolve(),
                 "x86_64-w64-mingw32-objdump", "x86_64-w64-mingw32-g++-posix")
             for name, path in probes.items():

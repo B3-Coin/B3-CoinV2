@@ -17,6 +17,9 @@ on:
       - '.github/workflows/flowmesh-regtest-build.yml'
       - 'contrib/flowmesh-regtest/**'
       - 'src/qt/test/flowmeshclosedtest*'
+      - 'src/qt/createwalletdialog.*'
+      - 'src/qt/walletcontroller.cpp'
+      - 'src/qt/test/b3createwalletdialogtests.cpp'
 
 permissions:
   contents: read
@@ -80,7 +83,7 @@ jobs:
       - name: Compile guarded app and selected targets
         run: |
           targets=(test_b3_flowmeshclosed-gui)
-          if [[ "$RUN_POLICY_TESTS" == ON ]]; then targets+=(test_b3_flowmeshclosed-policy); fi
+          if [[ "$RUN_POLICY_TESTS" == ON ]]; then targets+=(test_b3_flowmeshclosed-policy test_b3_createwalletdialog-qt b3coind b3coin-cli); fi
           cmake --build build -j"$(nproc)" --target "${targets[@]}"
       - name: Collect pinned public Qt dependency notices
         run: |
@@ -185,8 +188,15 @@ jobs:
             }
             Remove-Item -LiteralPath $writeProbe
             "user=$($identity.Name)`ntemp=$canonical`nowner=$($owner.Value)`npreflight=passed" | Set-Content -LiteralPath $diagnostics
+            $env:B3_TEST_CORE_DAEMON = Join-Path $PSScriptRoot 'b3coind.exe'
+            $env:B3_TEST_CORE_CLI = Join-Path $PSScriptRoot 'b3coin-cli.exe'
+            $env:QT_QPA_PLATFORM = 'minimal'
             & (Join-Path $PSScriptRoot 'test_b3_flowmeshclosed-policy.exe') -o 'policy-results.txt,txt'
             $probeExit = $LASTEXITCODE
+            & (Join-Path $PSScriptRoot 'test_b3_createwalletdialog-qt.exe') -o 'dialog-results.txt,txt'
+            $dialogExit = $LASTEXITCODE
+            $dialogExit | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'dialog-exit-code.txt')
+            if ($probeExit -eq 0 -and $dialogExit -ne 0) { $probeExit = $dialogExit }
           } catch {
             $_ | Out-String | Add-Content -LiteralPath $diagnostics
           }
@@ -197,7 +207,7 @@ jobs:
           try {
             $test = Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -Credential $credential -LoadUserProfile -WorkingDirectory $testDir -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-File',('"{0}"' -f $wrapper) -Wait -PassThru
           } finally {
-            foreach ($name in @('policy-results.txt', 'policy-environment.txt', 'policy-exit-code.txt')) {
+            foreach ($name in @('policy-results.txt', 'policy-environment.txt', 'policy-exit-code.txt', 'dialog-results.txt', 'dialog-exit-code.txt')) {
               $result = Join-Path $testDir $name
               if (Test-Path -LiteralPath $result) { Copy-Item -LiteralPath $result -Destination $name }
             }
@@ -206,6 +216,7 @@ jobs:
           if ([int](Get-Content -LiteralPath 'policy-exit-code.txt') -ne $test.ExitCode) { throw 'Policy wrapper exit status differs' }
           if ($test.ExitCode -ne 0) { throw "Guard policy tests failed: $($test.ExitCode)" }
           Get-Content policy-results.txt
+          Get-Content dialog-results.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -214,6 +225,8 @@ jobs:
             policy-results.txt
             policy-environment.txt
             policy-exit-code.txt
+            dialog-results.txt
+            dialog-exit-code.txt
 
   macos:
     needs: profile
@@ -251,11 +264,15 @@ jobs:
       - name: Compile guarded app and selected targets
         run: |
           targets=(test_b3_flowmeshclosed-gui)
-          if [[ "$RUN_POLICY_TESTS" == ON ]]; then targets+=(test_b3_flowmeshclosed-policy); fi
+          if [[ "$RUN_POLICY_TESTS" == ON ]]; then targets+=(test_b3_flowmeshclosed-policy test_b3_createwalletdialog-qt b3coind b3coin-cli); fi
           cmake --build build -j4 --target "${targets[@]}"
       - name: Execute policy tests
         if: env.RUN_POLICY_TESTS == 'ON'
-        run: build/bin/test_b3_flowmeshclosed-policy -o build/policy-results.txt,txt
+        run: |
+          export B3_TEST_CORE_DAEMON="$GITHUB_WORKSPACE/build/bin/b3coind"
+          export B3_TEST_CORE_CLI="$GITHUB_WORKSPACE/build/bin/b3coin-cli"
+          build/bin/test_b3_flowmeshclosed-policy -o build/policy-results.txt,txt
+          QT_QPA_PLATFORM=minimal build/bin/test_b3_createwalletdialog-qt -o build/dialog-results.txt,txt
       - name: Collect exact-version public dependency notices
         run: |
           qt_version=$(sed -nE 's/^set\(PACKAGE_VERSION "([0-9.]+)"\)/\1/p' "$(brew --prefix qt@6)/lib/cmake/Qt6/Qt6ConfigVersionImpl.cmake")
@@ -276,4 +293,6 @@ jobs:
         if: always() && env.RUN_POLICY_TESTS == 'ON'
         with:
           name: regtest-macos-${{ matrix.architecture }}-policy-results
-          path: build/policy-results.txt
+          path: |
+            build/policy-results.txt
+            build/dialog-results.txt

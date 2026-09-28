@@ -5,6 +5,15 @@
 set(CMAKE_AUTOMOC_MOC_OPTIONS "-p${CMAKE_CURRENT_SOURCE_DIR}")
 
 include(flowmeshclosedtest.cmake)
+if(ENABLE_WALLET AND (BUILD_GUI_TESTS OR BUILD_FLOWMESH_REGTEST_POLICY_TESTS))
+  # Tiny dialog-only regression, also available to the narrow tester CI build.
+  # No node, wallet database, external signer or network is started.
+  add_executable(test_b3_createwalletdialog-qt b3createwalletdialogtests.cpp)
+  target_link_libraries(test_b3_createwalletdialog-qt core_interface bitcoinqt bitcoin_node Qt6::Test)
+  import_plugins(test_b3_createwalletdialog-qt)
+  add_test(NAME test_b3_createwalletdialog-qt COMMAND test_b3_createwalletdialog-qt)
+  set_tests_properties(test_b3_createwalletdialog-qt PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=minimal")
+endif()
 if(NOT BUILD_GUI_TESTS)
   return()
 endif()

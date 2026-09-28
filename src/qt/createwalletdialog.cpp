@@ -10,6 +10,8 @@
 
 #include <qt/guiutil.h>
 
+#include <QDir>
+#include <QFileInfo>
 #include <QPushButton>
 
 CreateWalletDialog::CreateWalletDialog(QWidget* parent) :
@@ -30,7 +32,7 @@ CreateWalletDialog::CreateWalletDialog(QWidget* parent) :
         // set to true, enable it when isEncryptWalletChecked is false.
         ui->disable_privkeys_checkbox->setEnabled(!checked);
 #ifdef ENABLE_EXTERNAL_SIGNER
-        ui->external_signer_checkbox->setEnabled(m_has_signers && !checked);
+        ui->external_signer_checkbox->setEnabled(m_fixed_wallet_name.isEmpty() && m_has_signers && !checked);
 #endif
         // When the disable_privkeys_checkbox is disabled, uncheck it.
         if (!ui->disable_privkeys_checkbox->isEnabled()) {
@@ -99,6 +101,14 @@ CreateWalletDialog::~CreateWalletDialog()
 
 void CreateWalletDialog::setSigners(const std::vector<std::unique_ptr<interfaces::ExternalSigner>>& signers)
 {
+    if (!m_fixed_wallet_name.isEmpty()) {
+        // A guarded test wallet must not inherit an attached device's name or
+        // authority, including when signer discovery finishes after setup.
+        m_has_signers = false;
+        ui->external_signer_checkbox->setChecked(false);
+        ui->external_signer_checkbox->setEnabled(false);
+        return;
+    }
     m_has_signers = !signers.empty();
     if (m_has_signers) {
         ui->external_signer_checkbox->setEnabled(true);
@@ -118,9 +128,29 @@ void CreateWalletDialog::setSigners(const std::vector<std::unique_ptr<interfaces
     }
 }
 
+void CreateWalletDialog::setFixedWalletName(const QString& name)
+{
+    Q_ASSERT(!name.isEmpty());
+    m_fixed_wallet_name = name;
+    m_has_signers = false;
+    ui->external_signer_checkbox->setChecked(false);
+    ui->external_signer_checkbox->setEnabled(false);
+    ui->wallet_name_line_edit->setText(name);
+    ui->wallet_name_line_edit->setReadOnly(true);
+    ui->buttonBox->button(QDialogButtonBox::Ok)->setEnabled(true);
+}
+
+bool CreateWalletDialog::isEmptyWalletDirectory(const QString& path)
+{
+    const QFileInfo info{path};
+    const QDir dir{path};
+    return info.isDir() && !info.isSymLink() && dir.isReadable() &&
+        dir.entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System).isEmpty();
+}
+
 QString CreateWalletDialog::walletName() const
 {
-    return ui->wallet_name_line_edit->text();
+    return m_fixed_wallet_name.isEmpty() ? ui->wallet_name_line_edit->text() : m_fixed_wallet_name;
 }
 
 bool CreateWalletDialog::isEncryptWalletChecked() const

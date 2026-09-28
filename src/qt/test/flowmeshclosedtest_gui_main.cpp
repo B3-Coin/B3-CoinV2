@@ -29,7 +29,7 @@ namespace {
 // Optimized std::string construction can split literals into machine constants;
 // packaging must still find the exact ASCII version and source revision.
 constexpr char BUILD_IDENTITY[]{
-    "B3 FlowMesh REGTEST TEST5 version=" CLIENT_VERSION_STRING
+    "B3 FlowMesh REGTEST TEST6 version=" CLIENT_VERSION_STRING
 #if defined(BUILD_GIT_COMMIT)
     " commit=" BUILD_GIT_COMMIT
 #elif defined(BUILD_GIT_TAG)
@@ -41,14 +41,14 @@ constexpr char BUILD_IDENTITY[]{
 
 int Refuse(const QString& reason)
 {
-    std::fprintf(stderr, "B3 FlowMesh REGTEST TEST5 — NOT READY: %s\n", reason.toUtf8().constData());
+    std::fprintf(stderr, "B3 FlowMesh REGTEST TEST6 — NOT READY: %s\n", reason.toUtf8().constData());
     // A Finder-opened unconfigured package must visibly explain the block. No
     // rejected caller arguments reach Qt, and GuiMain/node/wallet never starts.
     int count{1};
-    char name[]{"B3 FlowMesh REGTEST TEST5"};
+    char name[]{"B3 FlowMesh REGTEST TEST6"};
     char* values[]{name, nullptr};
     QApplication app{count, values};
-    QMessageBox box{QMessageBox::Warning, QStringLiteral("B3 FlowMesh REGTEST TEST5 — NOT READY"),
+    QMessageBox box{QMessageBox::Warning, QStringLiteral("B3 FlowMesh REGTEST TEST6 — NOT READY"),
         reason + QStringLiteral("\n\nNo B3 node or wallet was opened. Do not use a normal wallet. Ask the test coordinator for the reviewed test environment."), QMessageBox::Ok};
     box.setTextFormat(Qt::PlainText);
     box.setDetailedText(QString::fromLatin1(BUILD_IDENTITY));
@@ -87,8 +87,8 @@ MAIN_FUNCTION
     std::vector<char*> pointers;
     for (auto& arg : encoded) pointers.push_back(arg.data());
     pointers.push_back(nullptr);
-    std::fprintf(stderr, "B3 FlowMesh REGTEST TEST5 profile=%s network=regtest validator=0 admin_rpc=0; test tokens have no value; futures informational only\n", profile.id.toUtf8().constData());
+    std::fprintf(stderr, "B3 FlowMesh REGTEST TEST6 profile=%s network=regtest validator=0 admin_rpc=0; test tokens have no value; futures informational only\n", profile.id.toUtf8().constData());
     const int result{GuiMain(static_cast<int>(encoded.size()), pointers.data())};
-    std::fprintf(stderr, "B3 FlowMesh REGTEST TEST5 GuiMain exit status=%d\n", result);
+    std::fprintf(stderr, "B3 FlowMesh REGTEST TEST6 GuiMain exit status=%d\n", result);
     return result;
 }

@@ -152,7 +152,7 @@ bool ExactPrivateFile(const QString& path, const QByteArray& expected, bool crea
     if (matches) { error.clear(); return true; }
     return Fail(error, QStringLiteral("The embedded profile changed. Existing test data is preserved; coordinator review is required."));
 }
-bool PrivateNodeSettings(const QString& path, QString& error)
+bool PrivateNodeSettings(const QString& path, const QString& selected_wallet, QString& error)
 {
 #ifdef Q_OS_WIN
     WindowsStorage::PrivateSecurity security;
@@ -198,7 +198,7 @@ bool PrivateNodeSettings(const QString& path, QString& error)
             // Copy the parsed array. Braces can select QJsonArray's
             // initializer-list constructor and wrap it in another array.
             const QJsonArray wallets = it.value().toArray();
-            if (wallets.isEmpty() || wallets == QJsonArray{QStringLiteral("closed-test")}) continue;
+            if (wallets.isEmpty() || wallets == QJsonArray{selected_wallet}) continue;
         }
         return Fail(error, QStringLiteral("Dedicated node settings contain an unsupported option or wallet. No settings or wallet data were changed."));
     }
@@ -352,10 +352,21 @@ bool PrepareStorage(const Profile& profile, const QString& base, Storage& storag
     storage.settings = QDir{storage.root}.filePath(QStringLiteral("qt-settings"));
     for (const auto& path : {storage.node, network, storage.wallets, storage.settings})
         if (!OwnedDirectory(path, true, error)) return false;
-    // Never silently select another wallet or follow an imported wallet link.
+    // The old UI allowed the observed generated wallet name "test". Admit it
+    // in place only for the exact approved public profile, never by renaming
+    // data or accepting arbitrary paths. Ambiguity remains a safe refusal.
     const auto entries{QDir{storage.wallets}.entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System)};
-    for (const auto& entry : entries)
-        if (entry != QStringLiteral("closed-test")) return Fail(error, QStringLiteral("Unexpected wallet entry in the dedicated test wallet directory; review it without deleting data."));
+    if (entries.size() > 1)
+        return Fail(error, QStringLiteral("Multiple entries in the dedicated test wallet directory; review them without deleting or renaming data."));
+    if (!entries.isEmpty()) {
+        const auto& entry{entries.front()};
+        if (entry != QStringLiteral("closed-test") && !(profile.test5_upgrade && entry == QStringLiteral("test")))
+            return Fail(error, QStringLiteral("Unexpected wallet entry in the dedicated test wallet directory; review it without deleting data."));
+        const auto path{QDir{storage.wallets}.filePath(entry)};
+        if (QFileInfo{path}.isSymLink() || !OwnedDirectory(path, false, error))
+            return Fail(error, QStringLiteral("Test wallet ownership/link inspection failed; expected one private real wallet directory. No wallet was opened."));
+        storage.wallet_name = entry;
+    }
     QDirIterator it{storage.wallets, QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System, QDirIterator::Subdirectories};
     int count{0};
     while (it.hasNext()) {
@@ -376,7 +387,7 @@ bool PrepareStorage(const Profile& profile, const QString& base, Storage& storag
     // normal settings, and refuse redirected or unsupported dedicated content.
     const auto settings{QDir{storage.root}.filePath(QStringLiteral("node-settings.json"))};
     for (const auto& suffix : {QString{}, QStringLiteral(".tmp"), QStringLiteral(".bak"), QStringLiteral(".bak.tmp")})
-        if (!PrivateNodeSettings(settings + suffix, error)) return false;
+        if (!PrivateNodeSettings(settings + suffix, storage.wallet_name, error)) return false;
     if (!profile.test5_upgrade) return ExactPrivateFile(storage.ca, profile.ca, fresh, error);
     const auto connection_path{QDir{storage.root}.filePath(QStringLiteral("connection-test5.identity"))};
     const QByteArray connection_marker{QByteArrayLiteral("B3 FlowMesh CLOSED TEST connection\nprofile-sha256=") + profile.hash + '\n'};
@@ -393,7 +404,9 @@ bool PrepareStorage(const Profile& profile, const QString& base, Storage& storag
 
 QStringList NodeArguments(const Profile& profile, const Storage& storage)
 {
-    if (!profile.ready || storage.node.isEmpty()) return {};
+    if (!profile.ready || storage.node.isEmpty() ||
+        (storage.wallet_name != QStringLiteral("closed-test") &&
+         !(profile.test5_upgrade && storage.wallet_name == QStringLiteral("test")))) return {};
     QStringList args{
         QStringLiteral("-regtest=1"), QStringLiteral("-enableflowmeshvalidator=0"), QStringLiteral("-flowmeshapi=0"),
         QStringLiteral("-server=0"), QStringLiteral("-listen=0"), QStringLiteral("-listenonion=0"),
@@ -402,8 +415,8 @@ QStringList NodeArguments(const Profile& profile, const Storage& storage)
         QStringLiteral("-settings=") + QDir{storage.root}.filePath(QStringLiteral("node-settings.json")),
         QStringLiteral("-choosedatadir=0"), QStringLiteral("-disablewallet=0"),
         // List settings merge unless explicitly negated: suppress persisted
-        // wallet entries before selecting the sole permitted test wallet.
-        QStringLiteral("-nowallet"), QStringLiteral("-wallet=closed-test"),
+        // wallet entries before selecting the sole admitted in-place wallet.
+        QStringLiteral("-nowallet"), QStringLiteral("-wallet=") + storage.wallet_name,
         QStringLiteral("-datadir=") + storage.node, QStringLiteral("-walletdir=") + storage.wallets,
         QStringLiteral("-connect=") + profile.peer, QStringLiteral("-flowmeshendpointca=") + storage.ca,
         QStringLiteral("-b3modernregtest=1"), QStringLiteral("-b3flowmeshtest=1"),

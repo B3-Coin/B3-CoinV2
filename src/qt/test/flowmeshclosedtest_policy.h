@@ -30,6 +30,8 @@ struct Storage {
     QString root;
     QString node;
     QString wallets;
+    // One admitted in-place wallet, never a path or an automatic rename.
+    QString wallet_name{QStringLiteral("closed-test")};
     QString settings;
     QString ca;
     Storage() = default;

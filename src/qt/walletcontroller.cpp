@@ -38,6 +38,17 @@ using wallet::WALLET_FLAG_DESCRIPTORS;
 using wallet::WALLET_FLAG_DISABLE_PRIVATE_KEYS;
 using wallet::WALLET_FLAG_EXTERNAL_SIGNER;
 
+#ifdef B3_FLOWMESH_REGTEST_CLIENT
+namespace {
+bool EmptyGuardedTestWalletDir(interfaces::Node& node)
+{
+    // The launcher creates this dedicated directory. Refuse any existing entry,
+    // not just recognized databases, without deleting or renaming anything.
+    return CreateWalletDialog::isEmptyWalletDirectory(QString::fromStdString(node.walletLoader().getWalletDir()));
+}
+} // namespace
+#endif
+
 WalletController::WalletController(ClientModel& client_model, const PlatformStyle* platform_style, QObject* parent)
     : QObject(parent)
     , m_activity_thread(new QThread(this))
@@ -269,6 +280,15 @@ void CreateWalletActivity::createWallet()
     }
 
     QTimer::singleShot(500ms, worker(), [this, name, flags] {
+#ifdef B3_FLOWMESH_REGTEST_CLIENT
+        // Recheck in the serialized creation worker: another create dialog may
+        // have completed while this dialog or the passphrase prompt was open.
+        if (name != "closed-test" || (flags & WALLET_FLAG_EXTERNAL_SIGNER) || !EmptyGuardedTestWalletDir(node())) {
+            m_error_message = Untranslated("The dedicated regtest wallet directory is not empty or cannot be inspected. Reopen the existing test wallet; no second wallet was created.");
+            QTimer::singleShot(0ms, this, &CreateWalletActivity::finish);
+            return;
+        }
+#endif
         auto wallet{node().walletLoader().createWallet(name, m_passphrase, flags, m_warning_message)};
 
         if (wallet) {
@@ -296,8 +316,18 @@ void CreateWalletActivity::finish()
 
 void CreateWalletActivity::create()
 {
+#ifdef B3_FLOWMESH_REGTEST_CLIENT
+    if (!EmptyGuardedTestWalletDir(node())) {
+        m_error_message = Untranslated("The dedicated regtest wallet directory is not empty or cannot be inspected. Reopen the existing test wallet; no second wallet was created.");
+        finish();
+        return;
+    }
+#endif
     m_create_wallet_dialog = new CreateWalletDialog(m_parent_widget);
 
+#ifdef B3_FLOWMESH_REGTEST_CLIENT
+    m_create_wallet_dialog->setFixedWalletName(QStringLiteral("closed-test"));
+#else
     std::vector<std::unique_ptr<interfaces::ExternalSigner>> signers;
     try {
         signers = node().listExternalSigners();
@@ -309,6 +339,7 @@ void CreateWalletActivity::create()
         signers.clear();
     }
     m_create_wallet_dialog->setSigners(signers);
+#endif
 
     m_create_wallet_dialog->setWindowModality(Qt::ApplicationModal);
     m_create_wallet_dialog->show();

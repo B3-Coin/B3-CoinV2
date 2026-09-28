@@ -30,6 +30,10 @@ public:
     virtual ~CreateWalletDialog();
 
     void setSigners(const std::vector<std::unique_ptr<interfaces::ExternalSigner>>& signers);
+    /** Restrict a guarded test session to its generated local-wallet name. */
+    void setFixedWalletName(const QString& name);
+    /** Read-only guard used by the isolated tester's single-wallet UI. */
+    static bool isEmptyWalletDirectory(const QString& path);
 
     QString walletName() const;
     bool isEncryptWalletChecked() const;
@@ -40,6 +44,7 @@ public:
 private:
     Ui::CreateWalletDialog *ui;
     bool m_has_signers = false;
+    QString m_fixed_wallet_name;
 };
 
 #endif // BITCOIN_QT_CREATEWALLETDIALOG_H
