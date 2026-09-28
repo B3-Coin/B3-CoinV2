@@ -90,7 +90,10 @@ BOOST_FIXTURE_TEST_CASE(exact_vote_is_monotone_idempotent_and_restored,
 BOOST_FIXTURE_TEST_CASE(corrupt_foreign_and_unwritable_state_fail_closed,
                         BasicTestingSetup)
 {
-    const uint256 domain{m_rng.rand256()};
+    uint256 domain{m_rng.rand256()};
+    // Offset 17 is the ninth chain-domain byte after the 9-byte file prefix.
+    // Force the value which made the old fixed-0xa5 "corruption" a no-op.
+    domain.begin()[8] = 0xa5;
     modern::ValidatorKeyBytes validator_a{};
     modern::ValidatorKeyBytes validator_b{};
     validator_a.fill(0x41);
@@ -127,7 +130,12 @@ BOOST_FIXTURE_TEST_CASE(corrupt_foreign_and_unwritable_state_fail_closed,
         FILE* file{fsbridge::fopen(original_path, "r+b")};
         BOOST_REQUIRE(file != nullptr);
         BOOST_REQUIRE(std::fseek(file, 17, SEEK_SET) == 0);
-        const unsigned char byte{0xa5};
+        unsigned char original_byte{};
+        BOOST_REQUIRE(std::fread(&original_byte, 1, 1, file) == 1);
+        BOOST_REQUIRE_EQUAL(original_byte, 0xa5);
+        // Always change a bit: overwriting with a constant could be a no-op.
+        const unsigned char byte{static_cast<unsigned char>(original_byte ^ 0x01)};
+        BOOST_REQUIRE(std::fseek(file, 17, SEEK_SET) == 0);
         BOOST_REQUIRE(std::fwrite(&byte, 1, 1, file) == 1);
         BOOST_REQUIRE(std::fclose(file) == 0);
     }
