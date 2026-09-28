@@ -146,16 +146,74 @@ jobs:
           $testAccount = "$env:COMPUTERNAME\$testUser"
           & icacls $testDir /grant "${testAccount}:(OI)(CI)F" | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare isolated CI account directory' }
+          # -LoadUserProfile still inherits the runner's TEMP/TMP. Configure
+          # a writable temporary root inside the ordinary user's own process.
+          $wrapper = Join-Path $testDir 'run-policy.ps1'
+          @'
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $diagnostics = Join-Path $PSScriptRoot 'policy-environment.txt'
+          $probeExit = 1
+          try {
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+            if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+              throw 'Policy probe must run as an ordinary user'
+            }
+            $tempRoot = Join-Path $PSScriptRoot 'temp'
+            New-Item -ItemType Directory -Path $tempRoot | Out-Null
+            $owner = (Get-Acl -LiteralPath $tempRoot).GetOwner([Security.Principal.SecurityIdentifier])
+            if ($owner.Value -ne $identity.User.Value) { throw 'Temporary root has the wrong owner' }
+            $canonical = (Resolve-Path -LiteralPath $tempRoot).ProviderPath
+            if ($canonical -notmatch '^[A-Za-z]:\\' -or $canonical -ne [IO.Path]::GetFullPath($tempRoot)) {
+              throw 'Temporary root must be an exact local canonical path'
+            }
+            for ($parent = Get-Item -LiteralPath $canonical; $null -ne $parent; $parent = $parent.Parent) {
+              if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw 'Temporary root must not traverse a reparse point'
+              }
+            }
+            $env:TEMP = $canonical
+            $env:TMP = $canonical
+            if ([IO.Path]::GetTempPath().TrimEnd([IO.Path]::DirectorySeparatorChar) -ne $canonical.TrimEnd([IO.Path]::DirectorySeparatorChar)) {
+              throw 'The child process did not select the intended temporary root'
+            }
+            $writeProbe = Join-Path $canonical 'write-preflight.txt'
+            [IO.File]::WriteAllText($writeProbe, 'ordinary-user-temp-preflight')
+            if ([IO.File]::ReadAllText($writeProbe) -ne 'ordinary-user-temp-preflight') {
+              throw 'Temporary write/read preflight failed'
+            }
+            Remove-Item -LiteralPath $writeProbe
+            "user=$($identity.Name)`ntemp=$canonical`nowner=$($owner.Value)`npreflight=passed" | Set-Content -LiteralPath $diagnostics
+            & (Join-Path $PSScriptRoot 'test_b3_flowmeshclosed-policy.exe') -o 'policy-results.txt,txt'
+            $probeExit = $LASTEXITCODE
+          } catch {
+            $_ | Out-String | Add-Content -LiteralPath $diagnostics
+          }
+          $probeExit | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'policy-exit-code.txt')
+          exit $probeExit
+          '@ | Set-Content -LiteralPath $wrapper
           $credential = [pscredential]::new($testAccount, $testPassword)
-          $test = Start-Process -FilePath (Join-Path $testDir 'test_b3_flowmeshclosed-policy.exe') -Credential $credential -LoadUserProfile -WorkingDirectory $testDir -ArgumentList '-o','policy-results.txt,txt' -Wait -PassThru
-          Copy-Item (Join-Path $testDir 'policy-results.txt') policy-results.txt
+          try {
+            $test = Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -Credential $credential -LoadUserProfile -WorkingDirectory $testDir -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-File',('"{0}"' -f $wrapper) -Wait -PassThru
+          } finally {
+            foreach ($name in @('policy-results.txt', 'policy-environment.txt', 'policy-exit-code.txt')) {
+              $result = Join-Path $testDir $name
+              if (Test-Path -LiteralPath $result) { Copy-Item -LiteralPath $result -Destination $name }
+            }
+          }
+          if (!(Test-Path -LiteralPath 'policy-exit-code.txt')) { throw 'Policy wrapper did not record an exit status' }
+          if ([int](Get-Content -LiteralPath 'policy-exit-code.txt') -ne $test.ExitCode) { throw 'Policy wrapper exit status differs' }
           if ($test.ExitCode -ne 0) { throw "Guard policy tests failed: $($test.ExitCode)" }
           Get-Content policy-results.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: regtest-windows-policy-results
-          path: policy-results.txt
+          path: |
+            policy-results.txt
+            policy-environment.txt
+            policy-exit-code.txt
 
   macos:
     needs: profile
