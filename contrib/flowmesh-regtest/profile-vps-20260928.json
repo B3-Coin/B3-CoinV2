@@ -1,0 +1,15 @@
+{
+  "schema": 2,
+  "ready": true,
+  "profile_id": "vps-regtest-20260928-test5",
+  "network": "regtest",
+  "regtest_profile": "flowmesh-client-v1",
+  "public_session_approval": "vps-regtest-20260928-test5",
+  "operator": "B3 project test coordinator (Josh); four generated validators on one VPS",
+  "availability": "Temporary generated-funds session; maintenance ends by 2026-10-11 00:00 UTC or bounded operation budget. HTTPS leaf expires 2026-10-12 14:59:29 UTC. No indefinite availability promise.",
+  "b3_peer": "88.216.63.161:19547",
+  "https_endpoints": [
+    "https://88.216.63.161:19580/flowmesh/v1"
+  ],
+  "ca_pem": "-----BEGIN CERTIFICATE-----\nMIIENTCCAp2gAwIBAgIUYjirOqAkFHX2CSyFQm1oh0XmL48wDQYJKoZIhvcNAQEL\nBQAwKjEoMCYGA1UEAwwfQjMgaXNvbGF0ZWQgcmVndGVzdCBzZXNzaW9uMyBDQTAe\nFw0yNjA5MjgxNDU5MjlaFw0yNjEwMjgxNDU5MjlaMCoxKDAmBgNVBAMMH0IzIGlz\nb2xhdGVkIHJlZ3Rlc3Qgc2Vzc2lvbjMgQ0EwggGiMA0GCSqGSIb3DQEBAQUAA4IB\njwAwggGKAoIBgQCRnzYLL0NptnCAipIY0ZTdpRao1mkFgkTuKXedVijHzrCr4NES\n+UmrL9FQWHwfzM22FnbKjkfw3P0wlH6hrFuIXWCyFTAyGJynrlHypkbzV9PQG/kk\nWGs5FGi9MBgkPhGfhm/Xjfn0TOjCO1ODyK2OlptEucQQtEDIBU0PdiMhYEGSVSPL\n3Za0NxWkq/dMhvNNBa3ie5S6bs8BzmHVJmW1nN9WKtrZ6r6JlCwunIVAmih020/I\nZTlr1b+ZNHaUXNuad6nBCOFTQvJPcL6ozWX0jXPanvK/8l7dUOxPpUzibWKBlVgT\n+X12JDjfSWvXeKW/AUGzksgxfDef2+xHA2rPd6gvu6Pzb8TUEUE6MM/MpSvT1W/9\n5wip2+OrIvqxox/Y+2bCJ6I1wcmRccOX4zUYmf26xZLx2MLGfZKhEenvqi0FUtCe\nbXvqUFA4C29CO5WpeTdarHpkpWJqe2XcqssSMQwa6xW0jkhNr5C/j2IRsv8n8iBR\nktQsnHvSeu/W+V0CAwEAAaNTMFEwHQYDVR0OBBYEFNEp1YzFfCiNlpJEnHCWGwkz\ngnJsMB8GA1UdIwQYMBaAFNEp1YzFfCiNlpJEnHCWGwkzgnJsMA8GA1UdEwEB/wQF\nMAMBAf8wDQYJKoZIhvcNAQELBQADggGBAIOtkY0dUbA9tEYgnZpzXj83msOAIK/h\nJGYH3RjmBeafQyLjqh/7OzLfV0FC2+gIkBoqlDl8sxCTgH5PYAZGbNYy/AIcsvAb\nMGpkc8VSAy1olLyjBEMEM/f+0oPlwpuFWFzLfvnKPcbI+iC3EKXe5S5b674kFZGn\nwo6PF9NCVlluMaWG6Goy8RLST7fziI0as0weDgp7hekJPMw0wBQSXY7rub5RPS/t\nsS0qYq1/K+dczdfeiLIWiHkB901CvL7NHoSWsQAj7c6hceRzqDKj2nV5mVRm6eyq\nNduBDwzpeMrO4M0pnV3Y6MFgxboVmvy1JmayonGe2qeZgEgWtpubJbxUPGtKLxcZ\nM2mOw2zUigdJChG4QWEfVnKa/KngNrxa7Oca2AR4i1uNJuiBABCJrtvRnJE6tDY7\nSQVP1T+O6Ej6h1rxqwXjH1+4GFPsE+owlzPA1TQ7h9mu3KymyYi1xdKumiRvLqhl\nw+53hH/mKpi9ZQ7HZiVl/26/4829oTDO+w==\n-----END CERTIFICATE-----\n"
+}

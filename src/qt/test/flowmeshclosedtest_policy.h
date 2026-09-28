@@ -10,6 +10,9 @@
 namespace FlowMeshClosedTest {
 struct Profile {
     bool ready{false};
+    // Set only for the exact build-time approved TEST5 public session.
+    // Storage identity is independent of the new connection/package identity.
+    bool test5_upgrade{false};
     QString id;
     QString reason;
     QString peer;

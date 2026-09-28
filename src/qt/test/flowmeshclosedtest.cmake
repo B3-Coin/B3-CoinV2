@@ -33,11 +33,11 @@ if(BUILD_FLOWMESH_REGTEST_CLIENT OR BUILD_GUI_TESTS)
     endif()
     set_target_properties(test_b3_flowmeshclosed-gui PROPERTIES
       MACOSX_BUNDLE TRUE
-      MACOSX_BUNDLE_BUNDLE_NAME "B3 FlowMesh REGTEST TEST4"
-      MACOSX_BUNDLE_GUI_IDENTIFIER "org.b3coin.flowmesh.regtest.test4"
+      MACOSX_BUNDLE_BUNDLE_NAME "B3 FlowMesh REGTEST TEST5"
+      MACOSX_BUNDLE_GUI_IDENTIFIER "org.b3coin.flowmesh.regtest.test5"
       MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
-      MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}d4"
-      MACOSX_BUNDLE_INFO_STRING "B3 FlowMesh REGTEST TEST4 ${CLIENT_VERSION_STRING}"
+      MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}d5"
+      MACOSX_BUNDLE_INFO_STRING "B3 FlowMesh REGTEST TEST5 ${CLIENT_VERSION_STRING}"
       MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/flowmeshclosedtest-Info.plist.in")
   elseif(WIN32)
     target_link_libraries(test_b3_flowmeshclosed-gui advapi32)
@@ -46,8 +46,8 @@ if(BUILD_FLOWMESH_REGTEST_CLIENT OR BUILD_GUI_TESTS)
 #include <windows.h>
 1 ICON DISCARDABLE "@PROJECT_SOURCE_DIR@/src/qt/res/icons/bitcoin.ico"
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION @CLIENT_VERSION_MAJOR@,@CLIENT_VERSION_MINOR@,@CLIENT_VERSION_BUILD@,4
-PRODUCTVERSION @CLIENT_VERSION_MAJOR@,@CLIENT_VERSION_MINOR@,@CLIENT_VERSION_BUILD@,4
+FILEVERSION @CLIENT_VERSION_MAJOR@,@CLIENT_VERSION_MINOR@,@CLIENT_VERSION_BUILD@,5
+PRODUCTVERSION @CLIENT_VERSION_MAJOR@,@CLIENT_VERSION_MINOR@,@CLIENT_VERSION_BUILD@,5
 FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 FILEFLAGS VS_FF_PRERELEASE
 FILEOS VOS_NT_WINDOWS32
@@ -58,11 +58,11 @@ BEGIN
     BLOCK "040904E4"
     BEGIN
       VALUE "CompanyName", "B3 FlowMesh project"
-      VALUE "FileDescription", "B3 FlowMesh REGTEST TEST4"
+      VALUE "FileDescription", "B3 FlowMesh REGTEST TEST5"
       VALUE "FileVersion", "@CLIENT_VERSION_STRING@"
       VALUE "InternalName", "test_b3_flowmeshclosed-gui"
       VALUE "OriginalFilename", "B3FlowMeshRegtest.exe"
-      VALUE "ProductName", "B3 FlowMesh REGTEST TEST4"
+      VALUE "ProductName", "B3 FlowMesh REGTEST TEST5"
       VALUE "ProductVersion", "@CLIENT_VERSION_STRING@"
       VALUE "LegalCopyright", "Test tokens have no value. Futures are informational only."
     END
@@ -81,13 +81,17 @@ if(BUILD_FLOWMESH_REGTEST_POLICY_TESTS OR BUILD_GUI_TESTS)
   add_executable(test_b3_flowmeshclosed-policy EXCLUDE_FROM_ALL
     flowmeshclosedtest_policytests.cpp flowmeshclosedtest_policy.cpp)
   # The tests also run on a native Windows runner after cross-compilation;
-  # their reviewed public fixture must travel inside the executable.
-  set(flowmesh_policy_fixture "${PROJECT_SOURCE_DIR}/contrib/flowmesh-regtest/profile-vps-20260926.json")
+  # their current and immutable legacy public fixtures must travel inside the
+  # executable to exercise trust renewal against the existing storage root.
+  set(flowmesh_policy_fixture "${PROJECT_SOURCE_DIR}/contrib/flowmesh-regtest/profile-vps-20260928.json")
+  set(flowmesh_policy_legacy_fixture "${PROJECT_SOURCE_DIR}/contrib/flowmesh-regtest/profile-vps-20260926.json")
   set_source_files_properties("${flowmesh_policy_fixture}" PROPERTIES QT_RESOURCE_ALIAS "profile.json")
+  set_source_files_properties("${flowmesh_policy_legacy_fixture}" PROPERTIES QT_RESOURCE_ALIAS "legacy-profile.json")
   qt_add_resources(test_b3_flowmeshclosed-policy closed_test_policy_fixture
-    PREFIX "/closed-test-test" FILES "${flowmesh_policy_fixture}")
+    PREFIX "/closed-test-test" FILES "${flowmesh_policy_fixture}" "${flowmesh_policy_legacy_fixture}")
   target_compile_definitions(test_b3_flowmeshclosed-policy PRIVATE
-    FLOWMESH_CLOSED_TEST_SOURCE_PROFILE_PATH=":/closed-test-test/profile.json")
+    FLOWMESH_CLOSED_TEST_SOURCE_PROFILE_PATH=":/closed-test-test/profile.json"
+    FLOWMESH_CLOSED_TEST_LEGACY_PROFILE_PATH=":/closed-test-test/legacy-profile.json")
   target_link_libraries(test_b3_flowmeshclosed-policy
     core_interface bitcoin_common bitcoin_util univalue Qt6::Core Qt6::Network Qt6::Test OpenSSL::Crypto)
   if(WIN32)

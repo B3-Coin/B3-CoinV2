@@ -12,5 +12,5 @@
 <key>CFBundlePackageType</key><string>APPL</string>
 ${B3_FLOWMESH_MINIMUM_SYSTEM_VERSION_PLIST}
 <key>NSHighResolutionCapable</key><true/>
-<key>NSHumanReadableCopyright</key><string>REGTEST TEST4 — test tokens have no value. Futures are informational only.</string>
+<key>NSHumanReadableCopyright</key><string>REGTEST TEST5 — test tokens have no value. Futures are informational only.</string>
 </dict></plist>

@@ -13,10 +13,13 @@ import tempfile
 import zipfile
 
 SOURCE = Path(__file__).resolve().parents[2]
-VERSION = "1.1.5-flowmesh-test.4"
-PROFILE = "vps-regtest-20260926-test4"
+VERSION = "1.1.5-flowmesh-test.5"
+PROFILE = "vps-regtest-20260928-test5"
+STORAGE_PROFILE = "vps-regtest-20260926-test4"
+PROFILE_PATH = SOURCE / "contrib/flowmesh-regtest/profile-vps-20260928.json"
+CA_PATH = SOURCE / "contrib/flowmesh-regtest/session3-ca.pem"
 TARGET = "test_b3_flowmeshclosed-gui"
-CA_SHA = "03d252bba9e5723f943415a74038d9367ffe0bfd9e6a683d3a65d43922b23d83"
+CA_SHA = "6e57595b0db6515ce29f2cd9cf29abbc1d691d85b8325f6ced2ae5e368879a51"
 
 def require(ok, message):
     if not ok:
@@ -51,8 +54,8 @@ def validate_profile(raw, ca):
             profile.get("network") == "regtest" and profile.get("profile_id") == PROFILE and
             profile.get("public_session_approval") == PROFILE and
             profile.get("regtest_profile") == "flowmesh-client-v1", "Wrong enabled regtest profile")
-    require(profile.get("b3_peer") == "88.216.63.161:18547" and
-            profile.get("https_endpoints") == ["https://88.216.63.161:18580/flowmesh/v1"], "Unapproved endpoint")
+    require(profile.get("b3_peer") == "88.216.63.161:19547" and
+            profile.get("https_endpoints") == ["https://88.216.63.161:19580/flowmesh/v1"], "Unapproved endpoint")
     require(profile.get("ca_pem", "").encode() == ca and hashlib.sha256(ca).hexdigest() == CA_SHA,
             "Public CA mismatch")
     require(b"PRIVATE KEY" not in raw and len(raw) <= 32768, "Private or oversized profile")
@@ -65,8 +68,8 @@ def version_tuple(value):
 def validate_cache(cache, build):
     require(Path(cache["CMAKE_HOME_DIRECTORY"]).resolve() == SOURCE, "Wrong build source")
     require(cache.get("BUILD_FLOWMESH_REGTEST_CLIENT") == "ON", "Build is not guarded regtest")
-    require(Path(cache["B3_FLOWMESH_CLOSED_TEST_PROFILE"]).resolve() ==
-            SOURCE / "contrib/flowmesh-regtest/profile-vps-20260926.json", "Wrong embedded profile path")
+    require(Path(cache["B3_FLOWMESH_CLOSED_TEST_PROFILE"]).resolve() == PROFILE_PATH,
+            "Wrong embedded profile path")
     require(not cache.get("B3_UPDATE_MANIFEST_URL"), "Production update channel is forbidden")
     # Catch a stale configure/version without trusting output filenames.
     config = (build / "src/config/bitcoin-config.h").read_text() if (build / "src/config/bitcoin-config.h").exists() else ""
@@ -192,7 +195,7 @@ def verify_macos(app, architecture, minimum):
     executable = app / "Contents/MacOS" / TARGET
     frameworks = app / "Contents/Frameworks"
     info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
-    require(info["CFBundleIdentifier"] == "org.b3coin.flowmesh.regtest.test4", "Wrong bundle identity")
+    require(info["CFBundleIdentifier"] == "org.b3coin.flowmesh.regtest.test5", "Wrong bundle identity")
     require(info["CFBundleShortVersionString"] == "1.1.5" and info.get("B3CandidateVersion") == VERSION,
             "Wrong bundle version")
     require(version_tuple(info["LSMinimumSystemVersion"]) == version_tuple(minimum), "Minimum OS metadata differs")
@@ -247,8 +250,8 @@ def main():
     commit = run("git", "rev-parse", "HEAD").strip()
     cache = cache_values(build / "CMakeCache.txt")
     validate_cache(cache, build)
-    profile_path = SOURCE / "contrib/flowmesh-regtest/profile-vps-20260926.json"
-    ca_path = SOURCE / "contrib/flowmesh-regtest/regtest-ca.pem"
+    profile_path = PROFILE_PATH
+    ca_path = CA_PATH
     profile = validate_profile(profile_path.read_bytes(), ca_path.read_bytes())
     notices = args.notices.resolve(strict=True)
     notice_manifest = json.loads((notices / "NOTICE-MANIFEST.json").read_text())
@@ -308,7 +311,7 @@ def main():
         run("codesign", "--force", "--deep", "--sign", "-", app)
         run("codesign", "--verify", "--deep", "--strict", app)
     for name, path in {"README.md": SOURCE / "contrib/flowmesh-regtest/README.md", "COPYING": SOURCE / "COPYING",
-                       "PUBLIC-PROFILE.json": profile_path, "regtest-ca.pem": ca_path}.items():
+                       "PUBLIC-PROFILE.json": profile_path, "session3-ca.pem": ca_path}.items():
         shutil.copy2(path, payload / name)
     (payload / "licenses").mkdir()
     for row in notice_manifest["files"]:
@@ -324,7 +327,8 @@ def main():
             + "Windows exact dependencies and local Qt patches: depends/packages and depends/patches in source.\n"
             + "No restriction on modifying/rebuilding these open-source components for personal use.\n")
     identity = {"format": "b3-regtest-package-v1", "version": VERSION, "source_commit": commit,
-        "profile_id": profile["profile_id"], "profile_sha256": sha(profile_path), "ca_sha256": sha(ca_path),
+        "profile_id": profile["profile_id"], "storage_profile_id": STORAGE_PROFILE,
+        "profile_sha256": sha(profile_path), "ca_sha256": sha(ca_path),
         "platform": args.platform, "minimum_macos": args.minimum_macos if args.platform.startswith("macos-") else None,
         "build_type": cache["CMAKE_BUILD_TYPE"], "guarded_executable": str(binary.relative_to(payload)),
         "qt_notice_version": notice_manifest["qt_version"],

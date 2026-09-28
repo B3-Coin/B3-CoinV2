@@ -82,8 +82,11 @@ bool OwnedDirectory(const QString& path, bool create, QString& error)
 #endif
     return true;
 }
-bool ExactPrivateFile(const QString& path, const QByteArray& expected, bool create, QString& error)
+// Digest mode is read-only and bounded; used solely to recognize the retained
+// public TEST4 CA. It never creates a file containing a digest instead of a CA.
+bool ExactPrivateFile(const QString& path, const QByteArray& expected, bool create, QString& error, bool digest = false)
 {
+    if (digest && create) return Fail(error, QStringLiteral("Digest-only checks cannot create files."));
 #ifdef Q_OS_WIN
     WindowsStorage::PrivateSecurity security;
     if (!security.valid()) return Fail(error, QStringLiteral("Cannot establish private Windows storage permissions."));
@@ -105,13 +108,15 @@ bool ExactPrivateFile(const QString& path, const QByteArray& expected, bool crea
         raw = created.release();
     }
     WindowsStorage::Handle file{raw}; quint64 size{0};
-    if (!file.valid() || !WindowsStorage::PrivateObject(file.get(), false, security, &size) || size != quint64(expected.size()))
+    if (!file.valid() || !WindowsStorage::PrivateObject(file.get(), false, security, &size) ||
+        (digest ? (size == 0 || size > 16384) : size != quint64(expected.size())))
         return Fail(error, QStringLiteral("Missing, redirected or unsafe test profile file; nothing was overwritten."));
     QByteArray bytes;
     if (!WindowsStorage::Read(file.get(), size, bytes)) return Fail(error, QStringLiteral("Cannot read the bounded test profile file."));
 #else
     const auto name{QFile::encodeName(path)};
-    int fd{::open(name.constData(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC)};
+    // Inspect special files without blocking on a substituted FIFO.
+    int fd{::open(name.constData(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)};
     if (fd < 0 && errno == ENOENT && create) {
         fd = ::open(name.constData(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (fd < 0) return Fail(error, QStringLiteral("Cannot exclusively create a test profile file."));
@@ -124,16 +129,17 @@ bool ExactPrivateFile(const QString& path, const QByteArray& expected, bool crea
         const bool synced{::fsync(fd) == 0};
         ::close(fd);
         if (!synced) return Fail(error, QStringLiteral("Cannot durably save the test profile file."));
-        fd = ::open(name.constData(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        fd = ::open(name.constData(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     }
     if (fd < 0) return Fail(error, QStringLiteral("Missing or redirected test profile file; refusing to adopt existing data."));
     struct stat st{};
     if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != ::geteuid() ||
-        st.st_nlink != 1 || (st.st_mode & 0077) != 0 || st.st_size != expected.size()) {
+        st.st_nlink != 1 || (st.st_mode & 0077) != 0 ||
+        (digest ? (st.st_size <= 0 || st.st_size > 16384) : st.st_size != expected.size())) {
         ::close(fd);
         return Fail(error, QStringLiteral("Test profile file ownership, type or size differs; nothing was overwritten."));
     }
-    QByteArray bytes(expected.size(), '\0');
+    QByteArray bytes(st.st_size, '\0');
     qsizetype done{0};
     while (done < bytes.size()) {
         const auto n{::read(fd, bytes.data() + done, bytes.size() - done)};
@@ -142,7 +148,9 @@ bool ExactPrivateFile(const QString& path, const QByteArray& expected, bool crea
     }
     ::close(fd);
 #endif
-    return bytes == expected || Fail(error, QStringLiteral("The embedded profile changed. Existing test data is preserved; coordinator review is required."));
+    const bool matches{(digest ? QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex() : bytes) == expected};
+    if (matches) { error.clear(); return true; }
+    return Fail(error, QStringLiteral("The embedded profile changed. Existing test data is preserved; coordinator review is required."));
 }
 bool PrivateNodeSettings(const QString& path, QString& error)
 {
@@ -222,7 +230,7 @@ bool ParseProfile(const QByteArray& json, Profile& result, QString& error)
     // Schema 2 is a single reviewed public session, not a general escape hatch
     // from the private-peer rule. Its identity, approval, peer, endpoint and CA
     // must all agree with this build-time allowlist.
-    if (public_session && (result.id != QStringLiteral("vps-regtest-20260926-test4") ||
+    if (public_session && (result.id != QStringLiteral("vps-regtest-20260928-test5") ||
         object.value(QStringLiteral("public_session_approval")).toString() != result.id ||
         !object.value(QStringLiteral("ready")).toBool()))
         return Fail(error, QStringLiteral("The public regtest session requires its exact approved profile identity."));
@@ -236,7 +244,7 @@ bool ParseProfile(const QByteArray& json, Profile& result, QString& error)
         return Fail(error, QStringLiteral("Test operator and availability must be explicitly identified."));
     result.peer = object.value(QStringLiteral("b3_peer")).toString();
     if (public_session) {
-        if (result.peer != QStringLiteral("88.216.63.161:18547"))
+        if (result.peer != QStringLiteral("88.216.63.161:19547"))
             return Fail(error, QStringLiteral("The public regtest session peer differs from the approved address."));
     } else if (!PrivatePeer(result.peer)) return Fail(error, QStringLiteral("The B3 test peer must be one explicit private/loopback IPv4 address and port."));
     const auto endpoints{object.value(QStringLiteral("https_endpoints"))};
@@ -252,7 +260,7 @@ bool ParseProfile(const QByteArray& json, Profile& result, QString& error)
             return Fail(error, QStringLiteral("HTTPS TEST endpoints must be distinct strict URLs without credentials, query or fragment."));
         result.endpoints.push_back(text);
     }
-    if (public_session && result.endpoints != QStringList{QStringLiteral("https://88.216.63.161:18580/flowmesh/v1")})
+    if (public_session && result.endpoints != QStringList{QStringLiteral("https://88.216.63.161:19580/flowmesh/v1")})
         return Fail(error, QStringLiteral("The public regtest session requires its single approved HTTPS endpoint."));
     result.ca = object.value(QStringLiteral("ca_pem")).toString().toUtf8();
     if (result.ca.size() > 16384 || result.ca.contains("PRIVATE KEY") ||
@@ -261,8 +269,9 @@ bool ParseProfile(const QByteArray& json, Profile& result, QString& error)
         !PublicCertificate(result.ca))
         return Fail(error, QStringLiteral("A bounded public PEM CA certificate is required; private keys are never accepted."));
     if (public_session && QCryptographicHash::hash(result.ca, QCryptographicHash::Sha256).toHex() !=
-        QByteArrayLiteral("03d252bba9e5723f943415a74038d9367ffe0bfd9e6a683d3a65d43922b23d83"))
+        QByteArrayLiteral("6e57595b0db6515ce29f2cd9cf29abbc1d691d85b8325f6ced2ae5e368879a51"))
         return Fail(error, QStringLiteral("The public regtest session CA differs from the approved public certificate."));
+    result.test5_upgrade = public_session;
     result.ready = true;
     return true;
 }
@@ -296,12 +305,12 @@ bool PrepareStorage(const Profile& profile, const QString& base, Storage& storag
         return Fail(error, QStringLiteral("The platform application-data parent must exist and cannot redirect through symlinks."));
     const QString parent{QDir{base}.filePath(QStringLiteral("B3FlowMeshClosedTest"))};
     if (!OwnedDirectory(parent, true, error)) return false;
-    storage.root = QDir{parent}.filePath(profile.id);
+    // TEST5 updates connection trust, NOT wallet or chain identity. Only its
+    // fully validated build-time public profile gets this fixed storage alias.
+    // No JSON-supplied storage path/alias is accepted.
+    storage.root = QDir{parent}.filePath(profile.test5_upgrade ? QStringLiteral("vps-regtest-20260926-test4") : profile.id);
     const bool fresh{!QFileInfo::exists(storage.root)};
     if (!OwnedDirectory(storage.root, true, error)) return false;
-    const QByteArray marker{QByteArrayLiteral("B3 FlowMesh CLOSED TEST\nprofile-sha256=") + profile.hash + '\n'};
-    if (!ExactPrivateFile(QDir{storage.root}.filePath(QStringLiteral("profile.identity")), marker, fresh, error)) return false;
-
 #ifdef Q_OS_WIN
     WindowsStorage::PrivateSecurity security;
     if (!security.valid()) return Fail(error, QStringLiteral("Cannot establish the private ownership lock."));
@@ -321,6 +330,19 @@ bool PrepareStorage(const Profile& profile, const QString& base, Storage& storag
         ::flock(storage.lock_fd, LOCK_EX | LOCK_NB) != 0)
         return Fail(error, QStringLiteral("The dedicated test instance is already open or its ownership lock is unsafe. No lockfile was deleted."));
 #endif
+
+    // Hold the SAME ownership lock used by the old executable before any new
+    // profile/trust writes. Never replace the initial marker or retained CA.
+    const auto marker_path{QDir{storage.root}.filePath(QStringLiteral("profile.identity"))};
+    const QByteArray marker{QByteArrayLiteral("B3 FlowMesh CLOSED TEST\nprofile-sha256=") + profile.hash + '\n'};
+    bool legacy_storage{false};
+    if (!ExactPrivateFile(marker_path, marker, fresh, error)) {
+        const QByteArray legacy_marker{QByteArrayLiteral("B3 FlowMesh CLOSED TEST\nprofile-sha256=db60ab7507c5908ce5b4ce8575f819fe94fa987600720eabc968f90e297963dc\n")};
+        if (fresh || !profile.test5_upgrade || !ExactPrivateFile(marker_path, legacy_marker, false, error)) return false;
+        legacy_storage = true;
+    }
+    if (legacy_storage && !ExactPrivateFile(QDir{storage.root}.filePath(QStringLiteral("test-endpoint-ca.pem")),
+        QByteArrayLiteral("03d252bba9e5723f943415a74038d9367ffe0bfd9e6a683d3a65d43922b23d83"), false, error, /*digest=*/true)) return false;
 
     storage.node = QDir{storage.root}.filePath(QStringLiteral("node"));
     const QString network{QDir{storage.node}.filePath(QStringLiteral("regtest"))};
@@ -347,13 +369,24 @@ bool PrepareStorage(const Profile& profile, const QString& base, Storage& storag
             return Fail(error, QStringLiteral("Test wallet ownership/link inspection failed; no wallet was opened."));
 #endif
     }
-    storage.ca = QDir{storage.root}.filePath(QStringLiteral("test-endpoint-ca.pem"));
+    storage.ca = QDir{storage.root}.filePath(profile.test5_upgrade ? QStringLiteral("test-endpoint-ca-test5.pem") : QStringLiteral("test-endpoint-ca.pem"));
     // The core must persist CreateWallet's load-on-startup setting. Never load
     // normal settings, and refuse redirected or unsupported dedicated content.
     const auto settings{QDir{storage.root}.filePath(QStringLiteral("node-settings.json"))};
     for (const auto& suffix : {QString{}, QStringLiteral(".tmp"), QStringLiteral(".bak"), QStringLiteral(".bak.tmp")})
         if (!PrivateNodeSettings(settings + suffix, error)) return false;
-    return ExactPrivateFile(storage.ca, profile.ca, fresh, error);
+    if (!profile.test5_upgrade) return ExactPrivateFile(storage.ca, profile.ca, fresh, error);
+    const auto connection_path{QDir{storage.root}.filePath(QStringLiteral("connection-test5.identity"))};
+    const QByteArray connection_marker{QByteArrayLiteral("B3 FlowMesh CLOSED TEST connection\nprofile-sha256=") + profile.hash + '\n'};
+    // Additive, exact and idempotent: interruption between complete writes can
+    // resume. Partial/foreign files fail closed and are retained for inspection.
+    // An existing completion marker cannot bypass the original identity/CA or
+    // wallet/settings validation above. No wallet, outbox or chain bytes change.
+    const QFileInfo connection_file{connection_path};
+    if ((connection_file.exists() || connection_file.isSymLink()) &&
+        !ExactPrivateFile(connection_path, connection_marker, false, error)) return false;
+    if (!ExactPrivateFile(storage.ca, profile.ca, true, error)) return false;
+    return ExactPrivateFile(connection_path, connection_marker, true, error);
 }
 
 QStringList NodeArguments(const Profile& profile, const Storage& storage)

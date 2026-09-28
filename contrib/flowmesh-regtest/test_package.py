@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pure packaging invariants; no network, GUI, wallet, or signing operation."""
 import copy
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -15,18 +16,34 @@ SPEC.loader.exec_module(PACKAGE)
 
 class PackageTests(unittest.TestCase):
     def setUp(self):
-        self.raw = (HERE / "profile-vps-20260926.json").read_bytes()
-        self.ca = (HERE / "regtest-ca.pem").read_bytes()
+        self.raw = (HERE / "profile-vps-20260928.json").read_bytes()
+        self.ca = (HERE / "session3-ca.pem").read_bytes()
         self.profile = json.loads(self.raw)
 
     def test_approved_profile_and_ca(self):
         self.assertEqual(PACKAGE.validate_profile(self.raw, self.ca)["profile_id"], PACKAGE.PROFILE)
 
+    def test_legacy_fixtures_preserved_and_refused_for_new_package(self):
+        raw = (HERE / "profile-vps-20260926.json").read_bytes()
+        ca = (HERE / "regtest-ca.pem").read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(),
+            "db60ab7507c5908ce5b4ce8575f819fe94fa987600720eabc968f90e297963dc")
+        self.assertEqual(hashlib.sha256(ca).hexdigest(),
+            "03d252bba9e5723f943415a74038d9367ffe0bfd9e6a683d3a65d43922b23d83")
+        with self.assertRaisesRegex(RuntimeError, "Wrong enabled regtest profile"):
+            PACKAGE.validate_profile(raw, ca)
+        changed = copy.deepcopy(self.profile)
+        changed["ca_pem"] = ca.decode()
+        with self.assertRaisesRegex(RuntimeError, "Public CA mismatch"):
+            PACKAGE.validate_profile(json.dumps(changed).encode(), ca)
+
     def test_network_version_identity_and_endpoints_are_fixed(self):
         mutations = [("schema", 1), ("ready", False), ("network", "main"),
             ("profile_id", "other"), ("public_session_approval", "other"),
             ("regtest_profile", "other"), ("b3_peer", "88.216.63.161:5647"),
-            ("https_endpoints", ["http://88.216.63.161:18580/flowmesh/v1"]),
+            ("b3_peer", "88.216.63.161:18547"),
+            ("https_endpoints", ["https://88.216.63.161:18580/flowmesh/v1"]),
+            ("https_endpoints", ["http://88.216.63.161:19580/flowmesh/v1"]),
             ("https_endpoints", ["https://88.216.63.161:5650/flowmesh/v1"])]
         for key, value in mutations:
             with self.subTest(key=key, value=value):
@@ -134,7 +151,8 @@ class PackageTests(unittest.TestCase):
                 PACKAGE.version_tuple(value)
 
     def test_public_docs_contain_no_operator_path(self):
-        for name in ("README.md", "profile-vps-20260926.json"):
+        for name in ("README.md", "profile-vps-20260926.json", "regtest-ca.pem",
+                     "profile-vps-20260928.json", "session3-ca.pem"):
             raw = (HERE / name).read_bytes()
             self.assertNotIn(b"/Users/", raw)
             self.assertNotIn(b"-----BEGIN PRIVATE KEY", raw)

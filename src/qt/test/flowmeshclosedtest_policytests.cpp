@@ -7,6 +7,7 @@
 #include <univalue.h>
 #include <util/translation.h>
 #include <QDir>
+#include <QCryptographicHash>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -70,6 +71,37 @@ Profile Parsed()
     Profile profile; QString error;
     if (!ParseProfile(Json(Good()), profile, error)) qFatal("valid unit profile rejected: %s", qPrintable(error));
     return profile;
+}
+Profile PublicParsed()
+{
+    Profile profile; QString error;
+    if (!ParseProfile(Json(PublicGood()), profile, error)) qFatal("approved profile rejected: %s", qPrintable(error));
+    return profile;
+}
+Profile LegacyParsed()
+{
+    QFile fixture{QStringLiteral(FLOWMESH_CLOSED_TEST_LEGACY_PROFILE_PATH)};
+    if (!fixture.open(QIODevice::ReadOnly)) qFatal("legacy profile fixture missing");
+    const auto bytes{fixture.readAll()};
+    const auto object{QJsonDocument::fromJson(bytes).object()};
+    // Reconstruct the old launcher's exact storage, not a newly allowed runtime profile.
+    Profile profile;
+    profile.ready = true;
+    profile.id = object["profile_id"].toString();
+    profile.ca = object["ca_pem"].toString().toUtf8();
+    profile.hash = QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex();
+    return profile;
+}
+QByteArray Read(const QString& path)
+{
+    QFile file{path};
+    if (!file.open(QIODevice::ReadOnly)) qFatal("cannot read test fixture");
+    return file.readAll();
+}
+bool Write(const QString& path, const QByteArray& bytes)
+{
+    QFile file{path};
+    return file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size();
 }
 QString Base(QTemporaryDir& temp) { return QFileInfo{temp.path()}.canonicalFilePath(); }
 bool PrivateDirectory(const QString& path)
@@ -208,9 +240,9 @@ private Q_SLOTS:
         Profile profile; QString error;
         QVERIFY2(ParseProfile(Json(PublicGood()), profile, error), qPrintable(error));
         QVERIFY(profile.ready);
-        QCOMPARE(profile.id, QStringLiteral("vps-regtest-20260926-test4"));
-        QCOMPARE(profile.peer, QStringLiteral("88.216.63.161:18547"));
-        QCOMPARE(profile.endpoints, QStringList{QStringLiteral("https://88.216.63.161:18580/flowmesh/v1")});
+        QCOMPARE(profile.id, QStringLiteral("vps-regtest-20260928-test5"));
+        QCOMPARE(profile.peer, QStringLiteral("88.216.63.161:19547"));
+        QCOMPARE(profile.endpoints, QStringList{QStringLiteral("https://88.216.63.161:19580/flowmesh/v1")});
         QTemporaryDir temp; Storage storage;
         QVERIFY2(PrepareStorage(profile, Base(temp), storage, error), qPrintable(error));
         const auto values{NodeArguments(profile, storage)};
@@ -219,7 +251,7 @@ private Q_SLOTS:
             "-b3corridorreward=2000000000000", "-b3blockinterval=1", "-b3roundseconds=1", "-b3epochlength=200",
             "-b3checkpointinterval=5", "-b3checkpointdepth=3", "-b3maxepochextension=200", "-b3minfinalityset=4",
             "-enableflowmeshvalidator=0", "-flowmeshapi=0", "-server=0", "-listen=0", "-noconf", "-noincludeconf",
-            "-nowallet", "-wallet=closed-test", "-connect=88.216.63.161:18547", "-flowmeshendpoint=https://88.216.63.161:18580/flowmesh/v1"};
+            "-nowallet", "-wallet=closed-test", "-connect=88.216.63.161:19547", "-flowmeshendpoint=https://88.216.63.161:19580/flowmesh/v1"};
         for (const auto& arg : fixed) QCOMPARE(values.count(arg), 1);
         ArgsManager args; QVERIFY2(ConfigureArgs(args, values, error), qPrintable(error));
         args.LockSettings([](common::Settings& settings) {
@@ -249,13 +281,16 @@ private Q_SLOTS:
         add("different-session", "profile_id", "another-session");
         add("mainnet", "network", "main");
         add("wrong-overrides", "regtest_profile", "flowmesh-client-v2");
-        add("peer-ip", "b3_peer", "88.216.63.162:18547");
-        add("peer-port", "b3_peer", "88.216.63.161:18548");
-        add("private-peer", "b3_peer", "127.0.0.1:18547");
-        add("endpoint-ip", "https_endpoints", QJsonArray{"https://88.216.63.162:18580/flowmesh/v1"});
-        add("endpoint-port", "https_endpoints", QJsonArray{"https://88.216.63.161:18581/flowmesh/v1"});
-        add("endpoint-path", "https_endpoints", QJsonArray{"https://88.216.63.161:18580/flowmesh/v2"});
-        add("endpoint-extra", "https_endpoints", QJsonArray{"https://88.216.63.161:18580/flowmesh/v1", "https://localhost"});
+        add("peer-ip", "b3_peer", "88.216.63.162:19547");
+        add("peer-port", "b3_peer", "88.216.63.161:19548");
+        add("private-peer", "b3_peer", "127.0.0.1:19547");
+        add("endpoint-ip", "https_endpoints", QJsonArray{"https://88.216.63.162:19580/flowmesh/v1"});
+        add("endpoint-port", "https_endpoints", QJsonArray{"https://88.216.63.161:19581/flowmesh/v1"});
+        add("endpoint-path", "https_endpoints", QJsonArray{"https://88.216.63.161:19580/flowmesh/v2"});
+        add("endpoint-extra", "https_endpoints", QJsonArray{"https://88.216.63.161:19580/flowmesh/v1", "https://localhost"});
+        add("storage-alias", "storage_id", "vps-regtest-20260926-test4");
+        add("old-peer", "b3_peer", "88.216.63.161:18547");
+        add("old-endpoint", "https_endpoints", QJsonArray{"https://88.216.63.161:18580/flowmesh/v1"});
         add("different-valid-ca", "ca_pem", TEST_CA);
         add("datadir", "datadir", "/external/data");
         add("walletdir", "walletdir", "/external/wallets");
@@ -458,6 +493,151 @@ private Q_SLOTS:
         // clean up the test fixture after the rejection assertion.
         QCOMPARE(::chmod(QFile::encodeName(root).constData(), 0700), 0);
 #endif
+    }
+    void connectionUpgradePreservesAndReopens()
+    {
+        const auto legacy{LegacyParsed()}; const auto current{PublicParsed()};
+        QString error; QTemporaryDir temp; QString root, wallets;
+        {
+            Storage old; QVERIFY2(PrepareStorage(legacy, Base(temp), old, error), qPrintable(error));
+            root = old.root; wallets = old.wallets;
+            QVERIFY(QDir{}.mkdir(wallets + "/closed-test"));
+            // Synthetic byte sentinels, not a claim of native wallet loading.
+            QVERIFY(Write(wallets + "/closed-test/wallet.dat", "generated-wallet-sentinel"));
+            QVERIFY(Write(old.node + "/regtest/saved-actions.fixture", "unknown:original-bytes:id:seq=12\ncertified:no-resubmit:seq=11"));
+            QVERIFY(Write(old.node + "/regtest/chain.fixture", "existing-chain-and-finality-sentinel"));
+            QVERIFY(Write(root + "/node-settings.json", "{\"wallet\":[\"closed-test\"]}"));
+            Storage competing;
+            QVERIFY(!PrepareStorage(current, Base(temp), competing, error));
+            QVERIFY(error.contains("already open"));
+            QVERIFY(!QFileInfo::exists(root + "/connection-test5.identity"));
+            QVERIFY(!QFileInfo::exists(root + "/test-endpoint-ca-test5.pem"));
+        }
+        const auto marker{Read(root + "/profile.identity")}; const auto ca{Read(root + "/test-endpoint-ca.pem")};
+        for (int reopen{0}; reopen < 2; ++reopen) {
+            Storage upgraded;
+            QVERIFY2(PrepareStorage(current, Base(temp), upgraded, error), qPrintable(error));
+            QCOMPARE(upgraded.root, root); QCOMPARE(upgraded.wallets, wallets);
+            QCOMPARE(upgraded.ca, root + "/test-endpoint-ca-test5.pem");
+            QCOMPARE(Read(upgraded.ca), current.ca);
+            QCOMPARE(Read(root + "/profile.identity"), marker);
+            QCOMPARE(Read(root + "/test-endpoint-ca.pem"), ca);
+            QCOMPARE(Read(wallets + "/closed-test/wallet.dat"), QByteArray{"generated-wallet-sentinel"});
+            QCOMPARE(Read(upgraded.node + "/regtest/saved-actions.fixture"), QByteArray{"unknown:original-bytes:id:seq=12\ncertified:no-resubmit:seq=11"});
+            QCOMPARE(Read(upgraded.node + "/regtest/chain.fixture"), QByteArray{"existing-chain-and-finality-sentinel"});
+            QCOMPARE(Read(root + "/node-settings.json"), QByteArray{"{\"wallet\":[\"closed-test\"]}"});
+            const auto args{NodeArguments(current, upgraded)};
+            QVERIFY(args.contains("-flowmeshendpointca=" + upgraded.ca));
+            QVERIFY(args.contains("-flowmeshendpoint=https://88.216.63.161:19580/flowmesh/v1"));
+            QVERIFY(!args.contains("-reindex"));
+        }
+        QVERIFY(!QFileInfo::exists(Base(temp) + "/B3FlowMeshClosedTest/" + current.id));
+    }
+    void connectionUpgradeFreshAndReopen()
+    {
+        const auto current{PublicParsed()}; QString error; QTemporaryDir temp; QString root;
+        {
+            Storage first; QVERIFY2(PrepareStorage(current, Base(temp), first, error), qPrintable(error)); root = first.root;
+            QVERIFY(root.endsWith("/vps-regtest-20260926-test4"));
+            QCOMPARE(Read(first.ca), current.ca);
+        }
+        Storage reopened; QVERIFY2(PrepareStorage(current, Base(temp), reopened, error), qPrintable(error));
+        QCOMPARE(reopened.root, root);
+    }
+    void connectionUpgradeInterrupted_data()
+    {
+        QTest::addColumn<bool>("ca_completed"); QTest::addColumn<bool>("marker_completed");
+        QTest::newRow("before-ca") << false << false;
+        QTest::newRow("after-ca-before-marker") << true << false;
+        QTest::newRow("after-marker") << true << true;
+        QTest::newRow("missing-ca-with-marker") << false << true;
+    }
+    void connectionUpgradeInterrupted()
+    {
+        QFETCH(bool, ca_completed); QFETCH(bool, marker_completed);
+        const auto current{PublicParsed()}; QString error; QTemporaryDir temp; QString root;
+        { Storage old; QVERIFY(PrepareStorage(LegacyParsed(), Base(temp), old, error)); root = old.root; }
+        if (ca_completed) QVERIFY(Write(root + "/test-endpoint-ca-test5.pem", current.ca));
+        if (marker_completed) QVERIFY(Write(root + "/connection-test5.identity",
+            QByteArray{"B3 FlowMesh CLOSED TEST connection\nprofile-sha256="} + current.hash + '\n'));
+        Storage resumed; QVERIFY2(PrepareStorage(current, Base(temp), resumed, error), qPrintable(error));
+        QCOMPARE(resumed.root, root); QCOMPARE(Read(resumed.ca), current.ca);
+    }
+    void connectionUpgradeUnsafeFiles_data()
+    {
+        QTest::addColumn<QString>("filename"); QTest::addColumn<QString>("kind");
+        for (const auto& file : {"profile.identity", "test-endpoint-ca.pem", "test-endpoint-ca-test5.pem", "connection-test5.identity"})
+            for (const auto& kind : {"partial", "mismatch", "symlink", "hardlink", "public", "directory", "fifo"}) {
+#ifdef Q_OS_WIN
+                if (QString::fromLatin1(kind) == "fifo") continue;
+#endif
+                QTest::newRow(qPrintable(QString::fromLatin1(file) + ':' + kind)) << QString::fromLatin1(file) << QString::fromLatin1(kind);
+            }
+    }
+    void connectionUpgradeUnsafeFiles()
+    {
+        QFETCH(QString, filename); QFETCH(QString, kind);
+        const auto current{PublicParsed()}; QString error; QTemporaryDir temp, outside; QString root;
+        { Storage old; QVERIFY(PrepareStorage(LegacyParsed(), Base(temp), old, error)); root = old.root; }
+        { Storage upgraded; QVERIFY(PrepareStorage(current, Base(temp), upgraded, error)); }
+        const auto path{root + '/' + filename}; const auto bytes{Read(path)};
+        if (kind == "partial") QVERIFY(Write(path, bytes.left(bytes.size() / 2)));
+        else if (kind == "mismatch") { auto wrong{bytes}; wrong[0] ^= 1; QVERIFY(Write(path, wrong)); }
+        else if (kind == "public") QVERIFY(PublicReadPermission(path));
+        else {
+            QVERIFY(QFile::remove(path)); // Disposable generated fixture only.
+            if (kind == "directory") QVERIFY(QDir{}.mkdir(path));
+#ifndef Q_OS_WIN
+            else if (kind == "fifo") QCOMPARE(::mkfifo(QFile::encodeName(path).constData(), 0600), 0);
+#endif
+            else {
+                const auto external{Base(outside) + "/untouched"}; QVERIFY(Write(external, bytes));
+                if (kind == "symlink") REQUIRE_SYMBOLIC_LINK(external, path, false);
+                else QVERIFY(HardLink(external, path));
+            }
+        }
+        Storage refused; QVERIFY(!PrepareStorage(current, Base(temp), refused, error)); QVERIFY(!error.isEmpty());
+        QVERIFY(QFileInfo::exists(path));
+        if (kind == "partial") QCOMPARE(Read(path), bytes.left(bytes.size() / 2));
+        if (kind == "mismatch") QVERIFY(Read(path) != bytes);
+        if (QFileInfo::exists(Base(outside) + "/untouched")) QCOMPARE(Read(Base(outside) + "/untouched"), bytes);
+    }
+    void connectionUpgradeRefusesUnknownIdentity()
+    {
+        auto unknown{LegacyParsed()}; unknown.hash[0] ^= 1;
+        QString error; QTemporaryDir temp; QString root;
+        { Storage old; QVERIFY(PrepareStorage(unknown, Base(temp), old, error)); root = old.root; }
+        Storage refused; QVERIFY(!PrepareStorage(PublicParsed(), Base(temp), refused, error));
+        QVERIFY(!QFileInfo::exists(root + "/test-endpoint-ca-test5.pem"));
+        QVERIFY(!QFileInfo::exists(root + "/connection-test5.identity"));
+    }
+    void privateProfileCannotAliasPublicStorage()
+    {
+        auto object{Good()}; object["profile_id"] = "vps-regtest-20260928-test5";
+        Profile profile; QString error; QTemporaryDir temp;
+        QVERIFY(ParseProfile(Json(object), profile, error)); QVERIFY(!profile.test5_upgrade);
+        Storage storage; QVERIFY(PrepareStorage(profile, Base(temp), storage, error));
+        QVERIFY(storage.root.endsWith("/vps-regtest-20260928-test5"));
+        QVERIFY(!QFileInfo::exists(Base(temp) + "/B3FlowMeshClosedTest/vps-regtest-20260926-test4"));
+    }
+    void danglingUpgradeMarkerRefusedBeforeCAWrite()
+    {
+        QString error; QTemporaryDir temp; QString root;
+        { Storage old; QVERIFY(PrepareStorage(LegacyParsed(), Base(temp), old, error)); root = old.root; }
+        const auto marker{root + "/connection-test5.identity"};
+        REQUIRE_SYMBOLIC_LINK(root + "/absent", marker, false);
+        Storage refused; QVERIFY(!PrepareStorage(PublicParsed(), Base(temp), refused, error));
+        QVERIFY(QFileInfo{marker}.isSymLink());
+        QVERIFY(!QFileInfo::exists(root + "/test-endpoint-ca-test5.pem"));
+    }
+    void connectionUpgradeRefusesWalletAndSettingsBeforeWriting()
+    {
+        QString error; QTemporaryDir temp; QString root;
+        { Storage old; QVERIFY(PrepareStorage(LegacyParsed(), Base(temp), old, error)); root = old.root; }
+        QVERIFY(Write(root + "/node-settings.json", "{\"wallet\":[\"unexpected\"]}"));
+        Storage refused; QVERIFY(!PrepareStorage(PublicParsed(), Base(temp), refused, error));
+        QVERIFY(!QFileInfo::exists(root + "/test-endpoint-ca-test5.pem"));
+        QVERIFY(!QFileInfo::exists(root + "/connection-test5.identity"));
     }
     void changedProfilePreservesExistingFiles()
     {

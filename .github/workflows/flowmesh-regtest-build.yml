@@ -75,7 +75,7 @@ jobs:
           -DENABLE_IPC=OFF -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF
           -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF
           -DBUILD_FLOWMESH_REGTEST_CLIENT=ON -DBUILD_FLOWMESH_REGTEST_POLICY_TESTS=${{ env.RUN_POLICY_TESTS }}
-          -DB3_FLOWMESH_CLOSED_TEST_PROFILE=${{ github.workspace }}/contrib/flowmesh-regtest/profile-vps-20260926.json
+          -DB3_FLOWMESH_CLOSED_TEST_PROFILE=${{ github.workspace }}/contrib/flowmesh-regtest/profile-vps-20260928.json
           -DB3_REQUIRE_UPDATE_CHANNEL=OFF
       - name: Compile guarded app and selected targets
         run: |
@@ -185,7 +185,7 @@ jobs:
           -DBUILD_GUI=ON -DENABLE_WALLET=ON -DENABLE_IPC=OFF
           -DBUILD_TESTS=OFF -DBUILD_GUI_TESTS=OFF -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF
           -DBUILD_FLOWMESH_REGTEST_CLIENT=ON -DBUILD_FLOWMESH_REGTEST_POLICY_TESTS=${{ env.RUN_POLICY_TESTS }}
-          -DB3_FLOWMESH_CLOSED_TEST_PROFILE=${{ github.workspace }}/contrib/flowmesh-regtest/profile-vps-20260926.json
+          -DB3_FLOWMESH_CLOSED_TEST_PROFILE=${{ github.workspace }}/contrib/flowmesh-regtest/profile-vps-20260928.json
           -DB3_REQUIRE_UPDATE_CHANNEL=OFF
           -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)"
           -DCMAKE_OSX_ARCHITECTURES=${{ matrix.architecture }}

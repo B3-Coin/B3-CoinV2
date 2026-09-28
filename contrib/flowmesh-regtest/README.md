@@ -1,4 +1,4 @@
-# B3 FlowMesh REGTEST — 1.1.5-flowmesh-test.4
+# B3 FlowMesh REGTEST TEST5 — 1.1.5-flowmesh-test.5
 
 This is a temporary, valueless test network. It is NOT a mainnet upgrade or
 finished FlowMesh V2. Do not import any real wallet, seed, private key or FN key.
@@ -36,24 +36,45 @@ and publisher signing are not claimed.
 
 - Branch: `flowmeshV2-dev`; see the archive's `BUILD-INFO.json` for exact commit,
   binary hashes, embedded profile digest and platform.
-- Profile: `vps-regtest-20260926-test4`.
-- B3 peer: `88.216.63.161:18547` (regtest only).
-- HTTPS: `https://88.216.63.161:18580/flowmesh/v1`.
-- CA file SHA256: `03d252bba9e5723f943415a74038d9367ffe0bfd9e6a683d3a65d43922b23d83`.
+- Connection profile: `vps-regtest-20260928-test5`.
+- B3 peer: `88.216.63.161:19547` (regtest only).
+- HTTPS: `https://88.216.63.161:19580/flowmesh/v1`.
+- Public CA file: `session3-ca.pem`.
+- CA file SHA256: `6e57595b0db6515ce29f2cd9cf29abbc1d691d85b8325f6ced2ae5e368879a51`.
   The application uses this CA only for the test endpoint; it does not install
   it into the operating system trust store or disable hostname/IP verification.
 - Genesis: `10d0f5bb6fde880011fd56ea35dddbf9b32da2a7825f5579ac587a7904d6929a`.
-- Market: `0f36a1dcd1755a98ea2cbc507ad5588bf4dd462045b065641c8add29e9ad936f`.
-- Asset: `ffd80f614f91e15244b3549f81d685a72c5f637da87ff979e97cdc9758134a66`.
+- Market: `ce8374c26dcb226e9e116dd5dfdf4fba75026c3516795b5c767f4406127529cc`.
+- Asset: `6fb7668277c3bcc62c60c41f6bb2e39649387c1fb6ef0898857452fdb766130f`.
 - Data stays under the OS's local application-data folder:
   `B3FlowMeshClosedTest/vps-regtest-20260926-test4`.
+  TEST5 reuses the existing TEST4 wallet, outbox, journal, receipts and settings
+  in place. The reviewed connection update adds a separate versioned CA and
+  connection marker while preserving the previous CA and profile marker.
+  The regtest consensus rules and genesis are unchanged.
   It is not the earlier Mac operator's `remote_verification` wallet.
-- Existing data with a changed profile, unexpected wallet or unsafe path is
-  refused, not deleted or silently migrated. Preserve it and report the error.
+- Existing data with an unapproved profile, changed trust file, unexpected
+  wallet or unsafe path is refused. Preserve it and report the error; do not
+  delete a marker, reset the data directory, or import another wallet.
 - Never copy an operator wallet into this directory. Network selection comes
   from the fixed regtest rules, **not** from using 127.0.0.1 versus 127.0.0.2.
 
 ## Scope and known limits
+
+### Connection upgrade is not old-chain recovery
+
+TEST5 fixes endpoint addresses and HTTPS trust only. It does not choose a fork,
+erase an old finality anchor, reset signing history, replay orders on another
+chain, or migrate balances from an abandoned regtest session. Before upgrading
+an existing tester installation, compare its block 145 with the current session:
+`0961807894e19a06e2df413bf45a4f39c7ee1da1d933e534a4b0039d4e5b1935`.
+A different hash means a separate chain-history diagnosis is required. Preserve
+the old data and report it; do not delete locks or reindex to force agreement.
+
+The original profile marker and CA remain in place for inspection. The old
+TEST4 executable can still recognize them after TEST5 exits, so open TEST5,
+not the old shortcut. Both versions use the same exclusive ownership lock.
+Incomplete or tampered trust files are preserved and refused, not overwritten.
 
 The native engine is V1-based, with the reviewed client/networking and UI
 improvements. Spot includes the reverse B3 view, exact limit-level book and
@@ -69,13 +90,13 @@ mainnet activation, external bridge, arbitrary-load, 200 ms or WAN performance
 qualification is claimed. The original accessibility SIGSEGV remains
 OPEN/UNRESOLVED; no recurrence is not a repair.
 
-The existing VPS session has no seeded two-sided book yet. Deposit sweeps and
-withdrawals require coordinator handling; do not promise automatic liquidity or
+Liquidity is not guaranteed. Deposit sweeps and withdrawals require coordinator
+handling; do not promise automatic liquidity or
 immediate payout. A saved/submitted action is not necessarily certified or filled.
 Do not press Retry repeatedly or replace an uncertain instruction.
 
-Maintenance ends by 2026-10-09 00:00 UTC or the bounded checkpoint/sweep budget.
-The TLS leaf expires 2026-10-10 14:02:31 UTC. Stop if trust or synchronization
+Maintenance ends by 2026-10-11 00:00 UTC or the bounded checkpoint/sweep budget.
+The TLS leaf expires 2026-10-12 14:59:29 UTC. Stop if trust or synchronization
 fails; do not weaken verification. Services may be unavailable before that time.
 
 ## Private bug report
