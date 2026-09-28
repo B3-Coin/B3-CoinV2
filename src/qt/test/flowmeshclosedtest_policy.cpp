@@ -195,7 +195,9 @@ bool PrivateNodeSettings(const QString& path, QString& error)
     for (auto it = object.begin(); it != object.end(); ++it) {
         if (it.key() == QStringLiteral("_warning_") && it.value().isString() && it.value().toString().size() <= 2048) continue;
         if (it.key() == QStringLiteral("wallet") && it.value().isArray()) {
-            const auto wallets{it.value().toArray()};
+            // Copy the parsed array. Braces can select QJsonArray's
+            // initializer-list constructor and wrap it in another array.
+            const QJsonArray wallets = it.value().toArray();
             if (wallets.isEmpty() || wallets == QJsonArray{QStringLiteral("closed-test")}) continue;
         }
         return Fail(error, QStringLiteral("Dedicated node settings contain an unsupported option or wallet. No settings or wallet data were changed."));

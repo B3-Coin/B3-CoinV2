@@ -321,7 +321,7 @@ private Q_SLOTS:
             catch (const std::exception& failure) { QFAIL(failure.what()); }
             QCOMPARE(args.GetArgs("-wallet"), std::vector<std::string>{"closed-test"});
             fs::path file; QVERIFY(args.GetSettingsPath(&file));
-            QCOMPARE(QString::fromStdString(fs::PathToString(file)), root + QStringLiteral("/node-settings.json"));
+            QCOMPARE(QDir::fromNativeSeparators(QString::fromStdString(fs::PathToString(file))), root + QStringLiteral("/node-settings.json"));
         }
         Storage reopened; QVERIFY2(PrepareStorage(profile, Base(temp), reopened, error), qPrintable(error));
         ArgsManager args; QVERIFY2(ConfigureArgs(args, NodeArguments(profile, reopened), error), qPrintable(error));
@@ -667,6 +667,41 @@ private Q_SLOTS:
         Storage next; QVERIFY(!PrepareStorage(profile, Base(temp), next, error));
         QVERIFY(error.contains(QStringLiteral("ownership/link")));
         QVERIFY(QDir{other.path()}.entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty());
+    }
+    void persistedWalletArrayShape_data()
+    {
+        QTest::addColumn<QByteArray>("input"); QTest::addColumn<bool>("accepted");
+        QTest::newRow("empty") << QByteArray{"{\"wallet\":[]}"} << true;
+        QTest::newRow("closed-test") << QByteArray{"{\"wallet\":[\"closed-test\"]}"} << true;
+        QTest::newRow("nested-empty") << QByteArray{"{\"wallet\":[[]]}"} << false;
+        QTest::newRow("nested-closed-test") << QByteArray{"{\"wallet\":[[\"closed-test\"]]}"} << false;
+        QTest::newRow("extra-wallet") << QByteArray{"{\"wallet\":[\"closed-test\",\"other\"]}"} << false;
+        QTest::newRow("duplicate-wallet") << QByteArray{"{\"wallet\":[\"closed-test\",\"closed-test\"]}"} << false;
+        QTest::newRow("wrong-wallet") << QByteArray{"{\"wallet\":[\"other\"]}"} << false;
+        QTest::newRow("wallet-string") << QByteArray{"{\"wallet\":\"closed-test\"}"} << false;
+    }
+    void persistedWalletArrayShape()
+    {
+        QFETCH(QByteArray, input); QFETCH(bool, accepted);
+        QString error; QTemporaryDir temp; QVERIFY(temp.isValid()); QString root;
+        {
+            Storage old; QVERIFY2(PrepareStorage(LegacyParsed(), Base(temp), old, error), qPrintable(error));
+            root = old.root;
+            // Persist raw JSON so construction of the fixture cannot mask an
+            // extra array introduced while reading it in the storage guard.
+            QVERIFY(Write(root + "/node-settings.json", input));
+        }
+        Storage upgraded;
+        const bool prepared = PrepareStorage(PublicParsed(), Base(temp), upgraded, error);
+        QVERIFY2(prepared == accepted, qPrintable(error));
+        QCOMPARE(Read(root + "/node-settings.json"), input);
+        if (accepted) {
+            QCOMPARE(upgraded.root, root);
+        } else {
+            QVERIFY(!error.isEmpty());
+            QVERIFY(!QFileInfo::exists(root + "/connection-test5.identity"));
+            QVERIFY(!QFileInfo::exists(root + "/test-endpoint-ca-test5.pem"));
+        }
     }
     void unsafeSettingsRefused_data()
     {

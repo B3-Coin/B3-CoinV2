@@ -62,6 +62,26 @@ The normal tester-build workflow additionally runs the policy executable on
 native Windows and both Mac architectures when tests are enabled. Refer to the
 actual run for the tested revision/results; a workflow file is not a CI pass.
 
+### Windows qualification follow-up
+
+Native Windows at `5dae4b10016ddea7bd281571e08364545b02757f` reached the storage
+tests after correcting the ordinary CI account's temporary directory. It
+reported 150 passes and two failures: a native-versus-Qt path separator
+comparison in the test, and rejection of the valid persisted JSON
+`{"wallet":["closed-test"]}` during TEST4-to-TEST5 reopening.
+
+The successor normalizes separators only in that assertion, and copy-initializes
+the parsed `QJsonArray` explicitly to avoid the initializer-list wrapping path.
+The accepted settings remain exactly an empty wallet array or one `closed-test`
+entry. Eight additional raw-JSON tests reject nested arrays, extra/duplicate or
+wrong wallets, and a string instead of an array. They verify unchanged settings
+bytes and no new trust files when an input is refused.
+
+The successor's local Mac policy suite passed 168 tests. The compiler-specific
+Windows result must be established by the successor's actual native CI run,
+not inferred from the Mac result. No wallet format, history or signing record
+is changed by this correction.
+
 ## Not old-chain recovery
 
 If a tester remains on the abandoned chain with conflicting checkpoint history,
