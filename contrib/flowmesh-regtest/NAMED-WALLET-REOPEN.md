@@ -57,6 +57,14 @@ dialog suite passed 12 cases, and packaging/profile checks passed 22 tests.
 Native Windows/Intel results must come from the actual successor CI run, not
 be inferred from the local Apple Silicon checks.
 
+The first TEST6 Windows cross-build at `7fc4eef6b754f785b609b6cc1535581886b05e92`
+compiled the application but failed linking the new dialog test: missing
+`interfaces::MakeGuiInit`. Native Windows tests therefore did not execute.
+The successor adds the existing `init/bitcoin-qt.cpp` factory source only to
+that test target, matching the full Qt test target. Its Qt test entry point
+does not call the factory or start a node. CI also watches its CMake definition.
+The failed run is retained; it is not a native test pass.
+
 Synthetic sentinels cover saved unknown/certified instructions and chain/history
 preservation. The core fixture covers real wallet loading, not an attended
 Create Wallet→Quit interaction, power-loss recovery, trading or old-chain repair.

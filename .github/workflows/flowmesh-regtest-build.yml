@@ -20,6 +20,7 @@ on:
       - 'src/qt/createwalletdialog.*'
       - 'src/qt/walletcontroller.cpp'
       - 'src/qt/test/b3createwalletdialogtests.cpp'
+      - 'src/qt/test/CMakeLists.txt'
 
 permissions:
   contents: read
