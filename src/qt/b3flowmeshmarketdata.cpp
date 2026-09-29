@@ -550,4 +550,18 @@ QString StatusText(const Snapshot& s, int64_t response_age, int64_t certificate_
     if (certificate_age < 0 || certificate_age > 10000) return QStringLiteral("Certified state · awaiting another auction; current quorum is not independently proven.");
     return QStringLiteral("Certified updates observed · runtime status alone is not proof of current quorum.");
 }
+
+LinkState ClassifyLink(const LinkInputs& in)
+{
+    if (!in.wallet) return LinkState::None;
+    if (in.polling_ms < 0) return LinkState::Checking;
+    if (!in.read_failed && in.response_age_ms >= 0 && in.response_age_ms <= LINK_FRESH_MS) return LinkState::Live;
+    // A reply older than the current polling interval predates it: only the
+    // time since polling resumed counts, never a hidden interval.
+    const bool before_polling{in.response_age_ms < 0 || in.response_age_ms > in.polling_ms};
+    const int64_t waited{before_polling ? in.polling_ms : in.response_age_ms};
+    if (waited > LINK_STALE_MS) return LinkState::Stale;
+    if (in.read_failed) return LinkState::Reconnecting;
+    return before_polling && waited <= LINK_FRESH_MS ? LinkState::Checking : LinkState::Slow;
+}
 } // namespace B3FlowMeshMarketData

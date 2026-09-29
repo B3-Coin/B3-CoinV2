@@ -11,6 +11,7 @@
 #include <QElapsedTimer>
 #include <QPointer>
 #include <QWidget>
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <memory>
@@ -192,6 +193,11 @@ private:
     void stopWatchWorker(bool join);
     //! The label suffix for the current live-update mode.
     QString liveUpdateText() const;
+    //! The one-line connection banner. Display only: it never gates, and
+    //! Live is exactly the trading gate's freshness (see ClassifyLink).
+    void updateLinkBanner();
+    //! The panel's own read backoff after consecutive failed reads.
+    unsigned readBackoffMs() const { return std::min(10000U, 500U << std::min(4U, m_read_failures)); }
     //! A live update reported that events were missed between two heads.
     void addGapMarker(const QString& market, uint64_t from_sequence, uint64_t to_sequence);
     //! Applies one verified read of the selected market, never moving the
@@ -269,6 +275,15 @@ private:
     uint64_t m_refresh_epoch{0};
     std::optional<B3FlowMeshMarketData::Snapshot> m_snapshot;
     QElapsedTimer m_response_age, m_certificate_age, m_catalog_age, m_attempt_age, m_queue_age;
+    // Restarted when the panel is shown and polls again; invalid while hidden,
+    // so a hidden interval never reads as a stale connection.
+    QElapsedTimer m_polling_since;
+    // Display only: when the selected market's last verified reply arrived,
+    // by the wall clock, and for which market. Never used by any gate.
+    int64_t m_last_live_wall_ms{-1};
+    QString m_last_live_market;
+    // Consecutive failed reads for display (m_read_failures caps at 5).
+    unsigned m_link_attempts{0};
     unsigned m_read_failures{0};
     bool m_loading{false}, m_read_failed{false};
     QString m_read_error;
@@ -292,6 +307,7 @@ private:
     QLineEdit* m_endpoint{nullptr};
     QPushButton* m_connect{nullptr};
     QLabel* m_connection_status{nullptr};
+    QLabel* m_link_banner{nullptr};
     QLineEdit* m_quantity{nullptr};
     QLineEdit* m_amount{nullptr};
     QLineEdit* m_destination{nullptr};

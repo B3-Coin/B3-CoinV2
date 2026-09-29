@@ -4199,6 +4199,60 @@ private Q_SLOTS:
         QVERIFY(!panel.liveUpdateText().contains(QStringLiteral("event gap")));
         QCOMPARE(probe.writes.load(), 0);
     }
+    void connectionBannerShowsLiveReconnectingAndCheckingState()
+    {
+        using Apply = B3FlowMeshTradingPanel::SnapshotApply;
+        FundingReadProbe probe; // Any read the panel starts stays in this process.
+        B3FlowMeshTradingPanel panel;
+        auto* banner{panel.findChild<QLabel*>(QStringLiteral("flowMeshLinkBanner"))};
+        QVERIFY(banner); panel.updateControls(); QVERIFY(banner->isHidden()); // No wallet: no banner.
+        AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        QElapsedTimer age; age.start();
+        QCOMPARE(panel.applySelectedSnapshot(Parse(RemoteData()), age, {}), Apply::APPLIED);
+        panel.show(); QCoreApplication::processEvents();
+        // Not polling (hidden or just shown): checking, never a stale verdict.
+        panel.m_polling_since.invalidate(); panel.updateControls();
+        QCOMPARE(banner->text(), QStringLiteral("Checking connection…")); QVERIFY(banner->isVisible());
+        panel.m_polling_since.start(); panel.updateControls();
+        QCOMPARE(banner->text(), QStringLiteral("Connected · operator.invalid · polling"));
+        QCOMPARE(banner->property("b3role").toString(), QStringLiteral("positive"));
+        QVERIFY(panel.orderReady());
+        panel.m_watch.mode = B3FlowMeshWatch::Mode::Live; panel.updateControls();
+        QCOMPARE(banner->text(), QStringLiteral("Connected · operator.invalid · live updates"));
+        panel.m_watch.mode = B3FlowMeshWatch::Mode::Polling;
+        // A failed read: the attempt, the panel's own next try and the time
+        // of the last verified data (display only).
+        panel.m_read_failed = true; panel.m_read_failures = 2; panel.m_link_attempts = 3; panel.m_attempt_age.start();
+        panel.updateControls();
+        QVERIFY2(banner->text().startsWith(QStringLiteral("Reconnecting · attempt 3 · next try in 2 s · showing verified data from ")), qPrintable(banner->text()));
+        QCOMPARE(banner->property("b3role").toString(), QStringLiteral("accent"));
+        QVERIFY(!panel.orderReady());
+        // An event gap is named while it is recent.
+        panel.m_read_failed = false; panel.addGapMarker(panel.m_snapshot->market, 2, 3); panel.updateControls();
+        QVERIFY(banner->text().endsWith(QStringLiteral(" · event gap: request outcomes are being re-checked")));
+        // The panel's own tick: hidden stops polling, shown starts it again.
+        panel.hide(); QVERIFY(QMetaObject::invokeMethod(panel.m_timer, "timeout")); QVERIFY(!panel.m_polling_since.isValid());
+        panel.show(); QCoreApplication::processEvents(); QVERIFY(QMetaObject::invokeMethod(panel.m_timer, "timeout"));
+        QVERIFY(panel.m_polling_since.isValid());
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void bannerLiveFollowsFreshDataDespiteSelectedEndpointFailure()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        // The client failed over: the selected endpoint's transport failed,
+        // while another endpoint served the verified data now displayed.
+        panel.m_client_info = ConnectionInfo("https://trading.invalid", true, false, false);
+        panel.m_polling_since.start(); panel.show(); QCoreApplication::processEvents(); panel.updateControls();
+        QVERIFY(panel.m_connection_status->text().contains(QStringLiteral("HTTPS connection failed")));
+        auto* banner{panel.findChild<QLabel*>(QStringLiteral("flowMeshLinkBanner"))};
+        QVERIFY(banner->text().startsWith(QStringLiteral("Connected · operator.invalid")));
+        QVERIFY(panel.orderReady());
+        // And whenever the gate's freshness fails, the banner is never Live.
+        panel.m_read_failed = true; panel.updateControls();
+        QVERIFY(!banner->text().startsWith(QStringLiteral("Connected"))); QVERIFY(!panel.orderReady());
+        QVERIFY(!panel.m_thread); QVERIFY(m_wallet->IsLocked());
+    }
     void exportOptInSyntheticVisualFixtures()
     {
         const QString directory{qEnvironmentVariable("FLOWMESH_UI_SNAPSHOT_DIR")};

@@ -112,5 +112,20 @@ std::vector<Depth> Aggregate(const std::vector<Curve>& curves);
 //! Poll health is not evidence that validators currently form a quorum.
 bool AdmissionReady(const Snapshot& snapshot, int64_t response_age_ms, int64_t certificate_age_ms, int64_t queued_without_progress_ms = -1);
 QString StatusText(const Snapshot& snapshot, int64_t response_age_ms, int64_t certificate_age_ms, int64_t queued_without_progress_ms = -1);
+
+//! The trading panel's one-line connection state. Display only: every gate
+//! keeps its own checks. Live is exactly the freshness part of the trading
+//! gate: no failed read and a verified reply at most 3 s old. Time while the
+//! panel was hidden (not polling) never counts as waiting.
+enum class LinkState { None, Checking, Live, Slow, Reconnecting, Stale };
+struct LinkInputs {
+    bool wallet{false}, read_failed{false};
+    //! Age of the last verified reply of the selected market (-1: none).
+    int64_t response_age_ms{-1};
+    //! How long the panel has been polling since it was last shown (-1: not polling).
+    int64_t polling_ms{-1};
+};
+inline constexpr int64_t LINK_FRESH_MS{3000}, LINK_STALE_MS{30'000};
+LinkState ClassifyLink(const LinkInputs& inputs);
 } // namespace B3FlowMeshMarketData
 #endif

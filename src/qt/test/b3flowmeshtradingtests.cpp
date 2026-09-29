@@ -1078,6 +1078,46 @@ private Q_SLOTS:
         p.Finished(Policy::WATCHDOG_MS + 6000, WOutcome::NotWaited, 0.0);
         QVERIFY(p.WatchdogTripped(2 * Policy::WATCHDOG_MS + 6000));
     }
+    void linkStateClassification_data()
+    {
+        using B3FlowMeshMarketData::LinkState;
+        QTest::addColumn<bool>("wallet");
+        QTest::addColumn<bool>("failed");
+        QTest::addColumn<qint64>("response");
+        QTest::addColumn<qint64>("polling");
+        QTest::addColumn<LinkState>("expected");
+        QTest::newRow("no wallet") << false << false << qint64{100} << qint64{100'000} << LinkState::None;
+        QTest::newRow("hidden") << true << false << qint64{100} << qint64{-1} << LinkState::Checking;
+        QTest::newRow("fresh") << true << false << qint64{0} << qint64{100'000} << LinkState::Live;
+        QTest::newRow("fresh edge") << true << false << qint64{3000} << qint64{100'000} << LinkState::Live;
+        // Exactly the gate: a failed read is never Live, however fresh.
+        QTest::newRow("fresh but failed") << true << true << qint64{100} << qint64{100'000} << LinkState::Reconnecting;
+        QTest::newRow("slow") << true << false << qint64{3001} << qint64{100'000} << LinkState::Slow;
+        QTest::newRow("slow edge") << true << false << qint64{30'000} << qint64{100'000} << LinkState::Slow;
+        QTest::newRow("stale") << true << false << qint64{30'001} << qint64{100'000} << LinkState::Stale;
+        QTest::newRow("failed") << true << true << qint64{10'000} << qint64{100'000} << LinkState::Reconnecting;
+        QTest::newRow("failed and stale") << true << true << qint64{60'000} << qint64{100'000} << LinkState::Stale;
+        QTest::newRow("never read, just shown") << true << false << qint64{-1} << qint64{500} << LinkState::Checking;
+        QTest::newRow("never read, waiting") << true << false << qint64{-1} << qint64{5000} << LinkState::Slow;
+        QTest::newRow("never read, failing") << true << true << qint64{-1} << qint64{5000} << LinkState::Reconnecting;
+        QTest::newRow("never read for long") << true << false << qint64{-1} << qint64{31'000} << LinkState::Stale;
+        // A reply from before the panel was hidden: only the time since it
+        // was shown again counts, never the hidden interval.
+        QTest::newRow("shown after an hour") << true << false << qint64{3'600'000} << qint64{200} << LinkState::Checking;
+        QTest::newRow("shown, still waiting") << true << false << qint64{3'600'000} << qint64{4000} << LinkState::Slow;
+        QTest::newRow("shown, failing") << true << true << qint64{3'600'000} << qint64{2000} << LinkState::Reconnecting;
+        QTest::newRow("shown, failing long") << true << true << qint64{3'600'000} << qint64{30'001} << LinkState::Stale;
+    }
+    void linkStateClassification()
+    {
+        using B3FlowMeshMarketData::LinkState;
+        QFETCH(bool, wallet); QFETCH(bool, failed); QFETCH(qint64, response); QFETCH(qint64, polling); QFETCH(LinkState, expected);
+        B3FlowMeshMarketData::LinkInputs inputs;
+        inputs.wallet = wallet; inputs.read_failed = failed; inputs.response_age_ms = response; inputs.polling_ms = polling;
+        QCOMPARE(B3FlowMeshMarketData::ClassifyLink(inputs), expected);
+        // Live is exactly the trading gate's freshness condition.
+        QCOMPARE(expected == LinkState::Live, wallet && polling >= 0 && !failed && response >= 0 && response <= B3FlowMeshMarketData::LINK_FRESH_MS);
+    }
 };
 QTEST_GUILESS_MAIN(B3FlowMeshTradingTests)
 #include "b3flowmeshtradingtests.moc"
