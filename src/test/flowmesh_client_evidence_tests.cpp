@@ -451,6 +451,154 @@ BOOST_AUTO_TEST_CASE(action_wait_already_certified_returns_immediately)
     BOOST_CHECK(WaitClock::now() - start < 1s);
 }
 
+namespace {
+flowmesh::ClientActionNotice Notice(unsigned char market, unsigned char action, flowmesh::ActionReasonCode code)
+{
+    flowmesh::ClientActionNotice notice;
+    notice.market_id = Filled(market);
+    notice.action_id = Filled(action);
+    notice.code = code;
+    return notice;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(notices_do_not_change_v1_pages_ids_or_gaps)
+{
+    using Kind = flowmesh::ClientEventKind;
+    flowmesh::ClientEventLog with{Filled(1)};
+    flowmesh::ClientEventLog without{Filled(1)};
+    for (auto* log : {&with, &without}) {
+        log->Append(ActionEvent(2, 3, Kind::QUEUE_ADMITTED));
+        log->Append(ActionEvent(2, 3, Kind::POOL_ADMITTED));
+    }
+    // A full notice ring and then some: never an event id or ring slot.
+    std::vector<flowmesh::ClientActionNotice> notices;
+    for (size_t i{0}; i < flowmesh::CLIENT_NOTICE_CAPACITY + 10; ++i) {
+        notices.push_back(Notice(2, 3, flowmesh::ActionReasonCode::DROPPED_SEQUENCE_CONSUMED));
+    }
+    with.AppendNotices(std::move(notices));
+    for (auto* log : {&with, &without}) log->Append(ActionEvent(2, 4, Kind::CERTIFIED_INCLUDED));
+    const auto a{with.Read(flowmesh::ClientEventCursor{Filled(1), 0}, {}, {})};
+    const auto b{without.Read(flowmesh::ClientEventCursor{Filled(1), 0}, {}, {})};
+    BOOST_CHECK_EQUAL(a.cursor.event_id, b.cursor.event_id);
+    BOOST_CHECK_EQUAL(a.latest_event_id, 3U);
+    BOOST_CHECK_EQUAL(a.oldest_event_id, b.oldest_event_id);
+    BOOST_CHECK_EQUAL(a.gap, b.gap);
+    BOOST_REQUIRE_EQUAL(a.events.size(), b.events.size());
+    for (size_t i{0}; i < a.events.size(); ++i) {
+        BOOST_CHECK_EQUAL(a.events[i].event_id, b.events[i].event_id);
+        BOOST_CHECK(a.events[i].kind == b.events[i].kind);
+    }
+    BOOST_CHECK(with.ActionStatus(Filled(2), Filled(3))->kind == Kind::POOL_ADMITTED);
+    BOOST_CHECK(with.Cursor().event_id == without.Cursor().event_id);
+    // The newest notice records the log position it was appended at.
+    const auto newest{with.NewestNotice(Filled(2), Filled(3))};
+    BOOST_REQUIRE(newest);
+    BOOST_CHECK_EQUAL(newest->after_event_id, 2U);
+    BOOST_CHECK(!with.NewestNotice(Filled(2), Filled(4)));
+    BOOST_CHECK(!with.NewestNotice(Filled(5), Filled(3)));
+}
+
+BOOST_AUTO_TEST_CASE(v1_wait_is_not_woken_or_ended_by_notices)
+{
+    using Kind = flowmesh::ClientEventKind;
+    flowmesh::ClientEventLog log{Filled(1)};
+    log.Append(ActionEvent(2, 3, Kind::QUEUE_ADMITTED));
+    log.AppendNotices({Notice(2, 3, flowmesh::ActionReasonCode::STALE_SEQUENCE)});
+    WaitProbe probe;
+    const auto start{WaitClock::now()};
+    auto waiter{std::async(std::launch::async, [&] {
+        return log.WaitActionStatus(Filled(2), Filled(3), start + 300ms, probe.Predicate());
+    })};
+    probe.AwaitEvaluations(1);
+    for (int i{0}; i < 10; ++i) {
+        log.AppendNotices({Notice(2, 3, flowmesh::ActionReasonCode::STALE_SEQUENCE)});
+        std::this_thread::sleep_for(2ms);
+    }
+    const auto result{waiter.get()};
+    BOOST_CHECK(result.result == flowmesh::ClientWaitResult::TIMEOUT);
+    BOOST_REQUIRE(result.status);
+    BOOST_CHECK(result.status->kind == Kind::QUEUE_ADMITTED);
+    BOOST_CHECK(!result.notice);
+    // No notice waiter existed, so no notice woke it: one evaluation before
+    // sleeping, one when the deadline passed.
+    BOOST_CHECK_LE(probe.evaluations.load(), 2U);
+    BOOST_CHECK(WaitClock::now() - start >= 300ms);
+}
+
+BOOST_AUTO_TEST_CASE(notice_wait_terminal_only_when_newer_than_events)
+{
+    using Kind = flowmesh::ClientEventKind;
+    using Code = flowmesh::ActionReasonCode;
+    flowmesh::ClientEventLog log{Filled(1)};
+    // An older refusal notice followed by an exact retry's admission is not
+    // terminal: the notice is older than the newest event.
+    log.AppendNotices({Notice(2, 3, Code::STALE_SEQUENCE)});
+    log.Append(ActionEvent(2, 3, Kind::QUEUE_ADMITTED));
+    const auto older{log.WaitActionStatus(Filled(2), Filled(3), WaitClock::now() + 50ms, {}, true)};
+    BOOST_CHECK(older.result == flowmesh::ClientWaitResult::TIMEOUT);
+    BOOST_REQUIRE(older.notice);
+    // A new notice arriving during the wait wakes and ends it.
+    WaitProbe probe;
+    auto waiter{std::async(std::launch::async, [&] {
+        return log.WaitActionStatus(Filled(2), Filled(3), WaitClock::now() + 5s, probe.Predicate(), true);
+    })};
+    probe.AwaitEvaluations(1);
+    log.AppendNotices({Notice(2, 3, Code::DROPPED_SEQUENCE_CONSUMED)});
+    const auto dropped{waiter.get()};
+    BOOST_CHECK(dropped.result == flowmesh::ClientWaitResult::TERMINAL);
+    BOOST_REQUIRE(dropped.notice);
+    BOOST_CHECK(dropped.notice->code == Code::DROPPED_SEQUENCE_CONSUMED);
+    BOOST_REQUIRE(dropped.status);
+    BOOST_CHECK(dropped.status->kind == Kind::QUEUE_ADMITTED);
+    // A notice alone (no event at all) ends it; a non-ending code does not.
+    log.AppendNotices({Notice(2, 7, Code::STALE_SEQUENCE_UNATTRIBUTED)});
+    BOOST_CHECK(log.WaitActionStatus(Filled(2), Filled(7), WaitClock::now() + 5s, {}, true).result ==
+                flowmesh::ClientWaitResult::TERMINAL);
+    log.AppendNotices({Notice(2, 8, Code::FAR_FUTURE_SEQUENCE)});
+    BOOST_CHECK(log.WaitActionStatus(Filled(2), Filled(8), WaitClock::now() + 50ms, {}, true).result ==
+                flowmesh::ClientWaitResult::TIMEOUT);
+    // Certified inclusion stays terminal whatever the notices say.
+    log.Append(ActionEvent(2, 9, Kind::CERTIFIED_INCLUDED));
+    log.AppendNotices({Notice(2, 9, Code::FAR_FUTURE_SEQUENCE)});
+    BOOST_CHECK(log.WaitActionStatus(Filled(2), Filled(9), WaitClock::now() + 5s, {}, true).result ==
+                flowmesh::ClientWaitResult::TERMINAL);
+    // A refusal event appended BEFORE its notice keeps the notice newer.
+    log.Append(ActionEvent(2, 10, Kind::POOL_ADMITTED));
+    log.Append(ActionEvent(2, 10, Kind::POOL_REFUSED));
+    log.AppendNotices({Notice(2, 10, Code::STALE_SEQUENCE)});
+    const auto refused{log.WaitActionStatus(Filled(2), Filled(10), WaitClock::now() + 5s, {}, true)};
+    BOOST_CHECK(refused.result == flowmesh::ClientWaitResult::TERMINAL);
+    BOOST_CHECK(refused.status->kind == Kind::POOL_ADMITTED);
+    // The same state without notices keeps the v1 answer (not terminal).
+    BOOST_CHECK(log.WaitActionStatus(Filled(2), Filled(10), WaitClock::now() + 50ms, {}).result ==
+                flowmesh::ClientWaitResult::TIMEOUT);
+}
+
+BOOST_AUTO_TEST_CASE(notice_ring_bounded_and_reset_with_instance)
+{
+    flowmesh::ClientEventLog log{Filled(1)};
+    std::vector<flowmesh::ClientActionNotice> notices;
+    for (size_t i{0}; i < flowmesh::CLIENT_NOTICE_CAPACITY + 1; ++i) {
+        notices.push_back(Notice(2, static_cast<unsigned char>(i % 200), flowmesh::ActionReasonCode::STALE_SEQUENCE));
+        notices.back().account_sequence = i;
+    }
+    log.AppendNotices(std::move(notices));
+    // The oldest notice was evicted; the newest for action 0 remains.
+    const auto newest{log.NewestNotice(Filled(2), Filled(0))};
+    BOOST_REQUIRE(newest);
+    BOOST_CHECK_EQUAL(newest->account_sequence, 2000U);
+    size_t action_zero{0};
+    for (size_t i{1}; i <= flowmesh::CLIENT_NOTICE_CAPACITY; ++i) action_zero += i % 200 == 0;
+    BOOST_CHECK_GT(action_zero, 0U);
+    log.Reset(Filled(9));
+    BOOST_CHECK(!log.NewestNotice(Filled(2), Filled(0)));
+    BOOST_CHECK(!log.NewestNotice(Filled(2), Filled(1)));
+    BOOST_CHECK(flowmesh::ClientNoticeEndsWait(flowmesh::ActionReasonCode::DEPOSIT_ALREADY_CREDITED));
+    BOOST_CHECK(!flowmesh::ClientNoticeEndsWait(flowmesh::ActionReasonCode::FAR_FUTURE_SEQUENCE));
+    BOOST_CHECK(!flowmesh::ClientNoticeEndsWait(flowmesh::ActionReasonCode::SUBMIT_LANE_FULL));
+}
+
 BOOST_AUTO_TEST_CASE(action_wait_interrupt_and_reset_wake_waiters)
 {
     using Kind = flowmesh::ClientEventKind;

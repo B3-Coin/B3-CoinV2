@@ -5,6 +5,7 @@
 #ifndef B3COIN_FLOWMESH_CLIENT_EVIDENCE_H
 #define B3COIN_FLOWMESH_CLIENT_EVIDENCE_H
 
+#include <flowmesh/action_reason.h>
 #include <flowmesh/market_data.h>
 #include <flowmesh/production_wire.h>
 
@@ -21,6 +22,7 @@ namespace flowmesh {
 inline constexpr size_t CLIENT_STATE_MAX_BYTES{8 * 1024 * 1024};
 inline constexpr size_t CLIENT_EVENT_CAPACITY{2048};
 inline constexpr size_t CLIENT_EVENT_PAGE_MAX{256};
+inline constexpr size_t CLIENT_NOTICE_CAPACITY{2048};
 
 struct ClientEvidencePins {
     uint256 domain;
@@ -79,6 +81,16 @@ enum class ClientEventKind : uint8_t {
 };
 const char* ClientEventKindName(ClientEventKind kind);
 
+//! The certified action that consumed an account sequence: which action, in
+//! which certified microblock. Memory only.
+struct ClientConsumerRef {
+    uint256 action_id;
+    uint64_t microblock_sequence{0};
+    uint256 microblock_hash;
+
+    friend bool operator==(const ClientConsumerRef&, const ClientConsumerRef&) = default;
+};
+
 struct ClientEvent {
     uint64_t event_id{0};
     MarketId market_id;
@@ -93,7 +105,38 @@ struct ClientEvent {
     uint64_t microblock_sequence{0};
     uint256 microblock_hash;
     std::string reason;
+    // Memory-only annotations, never serialized in any v1 reply or page.
+    ActionReasonCode reason_code{ActionReasonCode::NONE};
+    std::optional<ClientConsumerRef> consumed_by;
 };
+
+/**
+ * A local observation about one API-origin action, kept beside (never inside)
+ * the v1 event ring: notices take no event id, no ring capacity and never
+ * appear in a v1 page, status or gap. They name what this node decided about
+ * one attempt (refused, answered from certified state, dropped from its pool)
+ * and, when known, the certified action that consumed the sequence. A notice
+ * is an endpoint claim, never evidence and never an execution outcome.
+ */
+struct ClientActionNotice {
+    //! The event log's last event id when the notice was appended. A notice is
+    //! newer than an event iff after_event_id >= event.event_id.
+    uint64_t after_event_id{0};
+    MarketId market_id;
+    uint256 action_id;
+    AccountId account_id;
+    uint64_t account_sequence{0};
+    uint8_t action_type{0};
+    uint256 signed_action_hash;
+    ActionReasonCode code{ActionReasonCode::NONE};
+    //! Certified NextSequence(signer) this node's decision used.
+    uint64_t next_account_sequence{0};
+    std::optional<ClientConsumerRef> consumed_by;
+};
+
+//! Notice codes that end an opt-in wait: this node will not admit the
+//! attempt, whatever its eventual outcome.
+bool ClientNoticeEndsWait(ActionReasonCode code);
 
 struct ClientEventPage {
     ClientEventCursor cursor;
@@ -115,6 +158,8 @@ const char* ClientWaitResultName(ClientWaitResult result);
 struct ClientActionWait {
     std::optional<ClientEvent> status;
     ClientWaitResult result{ClientWaitResult::TIMEOUT};
+    //! Only for an include_notices wait: the action's newest notice at return.
+    std::optional<ClientActionNotice> notice;
 };
 
 /** Memory-only, globally bounded per runtime. No callbacks or network work; a
@@ -149,18 +194,27 @@ public:
      * nonblocking, lock-free read. */
     ClientActionWait WaitActionStatus(const MarketId& market, const uint256& action_id,
                                       std::chrono::steady_clock::time_point deadline,
-                                      const std::function<bool()>& interrupted) const;
+                                      const std::function<bool()>& interrupted,
+                                      bool include_notices = false) const;
     /** Ends every current wait with INTERRUPTED (shutdown, never a result). */
     void WakeWaiters() const;
+    /** Appends local notices in order under one lock, with at most one
+     * wakeup and only while an include_notices wait exists. Bounded ring of
+     * CLIENT_NOTICE_CAPACITY; never touches the v1 events. */
+    void AppendNotices(std::vector<ClientActionNotice> notices);
+    std::optional<ClientActionNotice> NewestNotice(const MarketId& market, const uint256& action_id) const;
 
 private:
     // Caller holds m_mutex. False only at the fail-closed event-id limit.
     bool AppendLocked(ClientEvent&& event);
     // Caller holds m_mutex. newest, when given, receives the kind of the
     // action's newest retained event (unchanged if there is none).
+    // newest_id, when given, receives that event's id (unchanged if none).
     std::optional<ClientEvent> ActionStatusLocked(const MarketId& market,
                                                 const uint256& action_id,
-                                                ClientEventKind* newest) const;
+                                                ClientEventKind* newest,
+                                                uint64_t* newest_id = nullptr) const;
+    std::optional<ClientActionNotice> NewestNoticeLocked(const MarketId& market, const uint256& action_id) const;
 
     mutable std::mutex m_mutex;
     mutable std::condition_variable m_changed;
@@ -170,6 +224,10 @@ private:
     // Current waiters; appends skip the notification when there are none.
     mutable size_t m_waiters{0};
     std::deque<ClientEvent> m_events;
+    // Notices: a separate ring, their own change counter and waiter count.
+    std::deque<ClientActionNotice> m_notices;
+    uint64_t m_notice_changes{0};
+    mutable size_t m_notice_waiters{0};
 };
 
 } // namespace flowmesh

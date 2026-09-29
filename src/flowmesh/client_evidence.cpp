@@ -192,6 +192,13 @@ const char* ClientWaitResultName(const ClientWaitResult result)
 
 ClientEventLog::ClientEventLog(const uint256& instance_id) : m_instance_id{instance_id} {}
 
+bool ClientNoticeEndsWait(const ActionReasonCode code)
+{
+    return code == ActionReasonCode::STALE_SEQUENCE || code == ActionReasonCode::DROPPED_SEQUENCE_CONSUMED ||
+           code == ActionReasonCode::STALE_SEQUENCE_UNATTRIBUTED ||
+           code == ActionReasonCode::DEPOSIT_ALREADY_CREDITED;
+}
+
 void ClientEventLog::Reset(const uint256& instance_id)
 {
     {
@@ -199,8 +206,42 @@ void ClientEventLog::Reset(const uint256& instance_id)
         m_instance_id = instance_id;
         m_last_event_id = 0;
         m_events.clear();
+        m_notices.clear();
+        ++m_notice_changes;
     }
     m_changed.notify_all();
+}
+
+void ClientEventLog::AppendNotices(std::vector<ClientActionNotice> notices)
+{
+    if (notices.empty()) return;
+    bool notify{false};
+    {
+        std::lock_guard lock{m_mutex};
+        for (auto& notice : notices) {
+            notice.after_event_id = m_last_event_id;
+            m_notices.push_back(std::move(notice));
+            if (m_notices.size() > CLIENT_NOTICE_CAPACITY) m_notices.pop_front();
+        }
+        ++m_notice_changes;
+        notify = m_notice_waiters != 0;
+    }
+    if (notify) m_changed.notify_all();
+}
+
+std::optional<ClientActionNotice> ClientEventLog::NewestNotice(const MarketId& market, const uint256& action_id) const
+{
+    std::lock_guard lock{m_mutex};
+    return NewestNoticeLocked(market, action_id);
+}
+
+std::optional<ClientActionNotice> ClientEventLog::NewestNoticeLocked(const MarketId& market,
+                                                                     const uint256& action_id) const
+{
+    for (auto it{m_notices.rbegin()}; it != m_notices.rend(); ++it) {
+        if (it->market_id == market && it->action_id == action_id) return *it;
+    }
+    return std::nullopt;
 }
 
 bool ClientEventLog::AppendLocked(ClientEvent&& event)
@@ -281,7 +322,8 @@ std::optional<ClientEvent> ClientEventLog::ActionStatus(const MarketId& market,
 
 std::optional<ClientEvent> ClientEventLog::ActionStatusLocked(const MarketId& market,
                                                             const uint256& action_id,
-                                                            ClientEventKind* const newest) const
+                                                            ClientEventKind* const newest,
+                                                            uint64_t* const newest_id) const
 {
     std::optional<ClientEvent> out;
     if (action_id.IsNull()) return out;
@@ -289,6 +331,7 @@ std::optional<ClientEvent> ClientEventLog::ActionStatusLocked(const MarketId& ma
     for (auto it{m_events.rbegin()}; it != m_events.rend(); ++it) {
         if (it->market_id != market || it->action_id != action_id) continue;
         if (first && newest) *newest = it->kind;
+        if (first && newest_id) *newest_id = it->event_id;
         first = false;
         if (!out || StatusPriority(it->kind) > StatusPriority(out->kind)) out = *it;
         if (out->kind == ClientEventKind::CERTIFIED_INCLUDED) break;
@@ -298,15 +341,27 @@ std::optional<ClientEvent> ClientEventLog::ActionStatusLocked(const MarketId& ma
 
 ClientActionWait ClientEventLog::WaitActionStatus(const MarketId& market, const uint256& action_id,
                                                   const std::chrono::steady_clock::time_point deadline,
-                                                  const std::function<bool()>& interrupted) const
+                                                  const std::function<bool()>& interrupted,
+                                                  const bool include_notices) const
 {
     std::unique_lock lock{m_mutex};
     ClientEventKind newest{ClientEventKind::QUEUE_ADMITTED};
-    ClientActionWait out{ActionStatusLocked(market, action_id, &newest)};
+    uint64_t newest_id{0};
+    ClientActionWait out{ActionStatusLocked(market, action_id, &newest, &newest_id)};
+    const auto read_notice = [&] {
+        if (include_notices) out.notice = NewestNoticeLocked(market, action_id);
+    };
+    read_notice();
+    // Without notices this is exactly the v1 predicate. With them, a refusal
+    // notice newer than every event of the action also ends the wait.
     const auto terminal = [&] {
-        return out.status && (out.status->kind == ClientEventKind::CERTIFIED_INCLUDED ||
-                              (out.status->kind == ClientEventKind::POOL_REFUSED &&
-                               newest == ClientEventKind::POOL_REFUSED));
+        if (out.status && (out.status->kind == ClientEventKind::CERTIFIED_INCLUDED ||
+                           (out.status->kind == ClientEventKind::POOL_REFUSED &&
+                            newest == ClientEventKind::POOL_REFUSED))) {
+            return true;
+        }
+        return include_notices && out.notice && ClientNoticeEndsWait(out.notice->code) &&
+               (!out.status || out.notice->after_event_id >= newest_id);
     };
     if (terminal()) {
         out.result = ClientWaitResult::TERMINAL;
@@ -316,21 +371,33 @@ ClientActionWait ClientEventLog::WaitActionStatus(const MarketId& market, const 
     const uint256 instance{m_instance_id};
     const uint64_t wake{m_wake_epoch};
     uint64_t seen{m_last_event_id};
+    uint64_t seen_notices{m_notice_changes};
     // Declared after lock, so it is destroyed, and uncounted, under m_mutex.
     struct Waiter {
         size_t& count;
-        explicit Waiter(size_t& waiters) : count{waiters} { ++count; }
-        ~Waiter() { --count; }
-    } waiter{m_waiters};
+        size_t* notice_count;
+        Waiter(size_t& waiters, size_t* notice_waiters) : count{waiters}, notice_count{notice_waiters}
+        {
+            ++count;
+            if (notice_count) ++*notice_count;
+        }
+        ~Waiter()
+        {
+            --count;
+            if (notice_count) --*notice_count;
+        }
+    } waiter{m_waiters, include_notices ? &m_notice_waiters : nullptr};
     while (true) {
         if (!m_changed.wait_until(lock, deadline, [&] {
                 return m_last_event_id != seen || m_instance_id != instance ||
-                       m_wake_epoch != wake || (interrupted && interrupted());
+                       m_wake_epoch != wake || (interrupted && interrupted()) ||
+                       (include_notices && m_notice_changes != seen_notices);
             })) {
             return out; // TIMEOUT with the current nonterminal status.
         }
         if (m_instance_id != instance) {
             out.status = ActionStatusLocked(market, action_id, nullptr);
+            read_notice();
             out.result = ClientWaitResult::RESTARTED;
             return out;
         }
@@ -345,8 +412,13 @@ ClientActionWait ClientEventLog::WaitActionStatus(const MarketId& market, const 
             relevant = it->market_id == market && it->action_id == action_id;
         }
         seen = m_last_event_id;
+        if (include_notices && m_notice_changes != seen_notices) {
+            seen_notices = m_notice_changes;
+            relevant = true;
+        }
         if (!relevant) continue;
-        out.status = ActionStatusLocked(market, action_id, &newest);
+        out.status = ActionStatusLocked(market, action_id, &newest, &newest_id);
+        read_notice();
         if (terminal()) {
             out.result = ClientWaitResult::TERMINAL;
             return out;
