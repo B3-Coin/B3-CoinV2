@@ -146,7 +146,10 @@ retry in N s)", "live updates reconnecting in N s" or "No live update for
 15 s · reconnecting". Replies answered without waiting are never re-sent at
 once; three in a row fall back to polling for 10 s, busy for 10 s, an
 endpoint without the capability for 60 s, failures back off 1-30 s, and the
-panel never sends more than two watch reads per second.
+panel never sends more than two watch reads per second. When replies the
+client keeps its connection for (`superseded`, `revalidate`, `lane_busy`)
+send the panel from live mode or from a probe to polling, it closes the
+live-update connection with one `watch_ms` 0 read.
 
 A reported gap adds a log line, a separator row in the trade history and an
 "event gap" suffix for 30 s, and the tracked request is reconciled first.

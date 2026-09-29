@@ -2020,8 +2020,12 @@ void B3FlowMeshTradingPanel::finishWatch(const std::shared_ptr<WatchResult>& res
         }
         m_watch.Finished(now, outcome, jitter);
         if (outcome == Outcome::Changed || outcome == Outcome::Quiet) m_watch_watchdog = false;
-        // Left live updates without the client closing their connection.
-        if (before == B3FlowMeshWatch::Mode::Live && m_watch.mode == B3FlowMeshWatch::Mode::Polling && outcome == Outcome::NotWaited) {
+        // Left live updates, or gave up probing, after replies the client
+        // does not close the connection for (superseded, revalidate, ...):
+        // it would otherwise stay open against the endpoint's connection
+        // limit, reused by each later probe and never idling out.
+        if ((before == B3FlowMeshWatch::Mode::Live || before == B3FlowMeshWatch::Mode::Probing) &&
+            m_watch.mode == B3FlowMeshWatch::Mode::Polling && outcome == Outcome::NotWaited) {
             m_watch_release_pending = true;
         }
         if (result->gap) {

@@ -4454,6 +4454,29 @@ private Q_SLOTS:
         panel.m_watch.Disable(); probe.hold_watch = false; probe.watch_release.release(); AwaitWatchWorker(panel);
         QCOMPARE(probe.snapshots.load(), 0); QCOMPARE(probe.writes.load(), 0);
     }
+    void probeThatFallsBackToPollingClosesItsConnection()
+    {
+        // Answered without waiting, again and again (superseded): the client
+        // keeps its live-update connection after such replies, so the panel
+        // closes it when it gives up probing.
+        FundingReadProbe probe; probe.live_ms = 2000; probe.watch_object = WatchObject("superseded", false, false);
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        Live(panel, probe);
+        QCOMPARE(panel.m_watch.mode, B3FlowMeshWatch::Mode::Probing);
+        for (unsigned i{0}; i < B3FlowMeshWatch::Policy::NOT_WAITED_LIMIT; ++i) {
+            // Pacing is covered by the policy tests.
+            panel.m_watch.retry_at = 0; panel.m_watch.tokens = B3FlowMeshWatch::Policy::ARM_BURST;
+            panel.armWatch(); QVERIFY(panel.m_watch_thread); AwaitWatchWorker(panel);
+        }
+        QCOMPARE(panel.m_watch.mode, B3FlowMeshWatch::Mode::Polling);
+        QVERIFY(panel.m_watch_release_pending);
+        QCOMPARE(probe.releases.load(), 0);
+        // The next tick sends the release read (watch_ms 0) once.
+        panel.armWatch(/*release=*/true); AwaitWatchWorker(panel);
+        QCOMPARE(probe.releases.load(), 1);
+        QVERIFY(!panel.m_watch_release_pending);
+        QCOMPARE(probe.watches.load(), int(B3FlowMeshWatch::Policy::NOT_WAITED_LIMIT)); QCOMPARE(probe.writes.load(), 0);
+    }
     void liveModeSkipsMarketPollingButKeepsAuxiliaryCycleAndStatus()
     {
         FundingReadProbe probe; probe.live_ms = 2000; probe.checkpoint = true;
