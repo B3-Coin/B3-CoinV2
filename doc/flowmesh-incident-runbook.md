@@ -154,7 +154,7 @@ start); then escalate.
 |---|---|---|
 | `market_not_installed`, state `not_installed` | The service knows the market but the runtime has not installed it (for example a store that failed to open). | Check `debug.log` for the market; take the bundle; escalate. |
 | `market_halted`, state `halted` | The market halted on this node; see `halt` below. | Per halt code. |
-| `catching_up` | This node has been provably behind for `lag_grace_ms` (10 s): it holds a BLS-verified certificate for a sequence it has not applied (`catchup.proven_target`, `catchup.proven_behind_ms`). That cannot be faked or hidden. | Normal after a restart. Escalate if it lasts more than 10 minutes. |
+| `catching_up` | This node has been provably behind for `lag_grace_ms` (10 s): it holds a BLS-verified certificate for a sequence it has not applied (`catchup.proven_target`, `catchup.proven_behind_ms`). A peer cannot fake this lag, but its absence proves nothing: a node that no certificate from ahead has reached (an idle market, or an isolated node) is never reported `catching_up`. | Normal after a restart. Escalate if it lasts more than 10 minutes. |
 | state `catching_up` | Proven or speculative catch-up is under way. `catchup.speculative` means a verified page arrived without tail slack; it is not a proof and never makes the market not ready. | none unless `catching_up` is reported |
 | state `insufficient_seats` | Fewer than four anchor-final seats (`PAUSED_INSUFFICIENT_SEATS`). | Expected until seats bind; B3 continues. |
 | state `handoff_pending` | A committee handoff waits for its checkpoint to be 30 blocks deep. | ETA: max(0, 30 - (tip height - handoff checkpoint inclusion height)) x the observed B3 block interval. Publish the checkpoint first if it is not yet included. |
@@ -221,8 +221,27 @@ verified.
 - Announce at least 24 hours ahead.
 - Restart one seat at a time. With k seats, never have more than
   k - (floor(2k/3) + 1) of them down at once; for k = 4 that is one.
-- Before the next restart, wait until the restarted node's
-  `getflowmeshhealth` reports `service_ready` and the market rows ready.
+- Before stopping a seat, note its `service.flowmesh_peers` from
+  `getflowmeshhealth`.
+- Readiness alone does not show that a restarted seat has rejoined. For
+  `no_peers_grace_ms` (30 s) after a start the node can report ready with no
+  FlowMesh peer at all, and `catching_up` needs a verified certificate from
+  ahead of it, which an idle market may never send. The absence of
+  `catching_up` does not prove that the node is at the network head.
+- Before restarting the next seat, wait until the restarted node's
+  `getflowmeshhealth` (local RPC) shows all of the following:
+  - at least `no_peers_grace_ms` (30 s) have passed since the node started;
+  - `service_ready` is true and every market row is `ready`;
+  - `service.flowmesh_peers` is at least 1, and back to the count noted
+    before the stop;
+  - in every market row, `catchup.behind` is false and
+    `catchup.peers_hinting_ahead` is 0;
+  - in every market row, `next_microblock_sequence` and
+    `last_microblock_hash` equal those of a healthy seat or API node read at
+    the same time. On an active market the head can move between the two
+    reads; repeat until one pair of reads matches.
+- If these conditions do not hold within 10 minutes, do not restart another
+  seat. Take the bundle (section 5) and escalate.
 
 ## 9. Waiting on owner rulings
 
