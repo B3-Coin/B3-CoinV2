@@ -4747,6 +4747,24 @@ private Q_SLOTS:
         QVERIFY(!panel.m_edit_order->isEnabled());
         QVERIFY(!panel.m_thread); QVERIFY(m_wallet->IsLocked());
     }
+    void submissionNoticeNamesNoRpcAndDetailsKeepTheCommand()
+    {
+        FundingReadProbe probe;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel);
+        auto result{std::make_shared<B3FlowMeshTradingPanel::Result>()};
+        B3FlowMeshTrading::Action action; action.operation = B3FlowMeshTrading::Operation::Order; action.market = panel.m_market_data.front();
+        action.side = QStringLiteral("bid"); action.price = 1000; action.amount = 1;
+        result->action = action; result->wallet = panel.m_wallet_name; result->write_attempted = true;
+        B3FlowMeshTrading::Receipt receipt; receipt.action_id = QString::fromStdString(H(99).GetHex()); receipt.market = action.market.id;
+        receipt.state = QStringLiteral("queued"); result->receipt = receipt;
+        panel.m_busy = true; panel.finishJob(result);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 2000);
+        const auto log{panel.m_log->toPlainText()};
+        QVERIFY(log.contains(QStringLiteral("No automatic retry"))); QVERIFY(log.contains(QStringLiteral("Your orders")));
+        QVERIFY(!log.contains(QStringLiteral("getflowmeshactionstatus"))); QVERIFY(!log.contains(QStringLiteral("retryflowmeshaction")));
+        QVERIFY(panel.m_identity_detail->text().contains(QStringLiteral("getflowmeshactionstatus %1 %2").arg(action.market.id, receipt.action_id)));
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
     void connectionBannerShowsLiveReconnectingAndCheckingState()
     {
         using Apply = B3FlowMeshTradingPanel::SnapshotApply;

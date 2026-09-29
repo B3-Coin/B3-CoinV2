@@ -433,6 +433,9 @@ void B3FlowMeshTradingPanel::updateMarketText()
             details += tr("\nAccount %1 · next sequence %2").arg(selected->account, QString::number(selected->sequence));
             if (s.remote) details += tr("\nEndpoint: %1\nCertificate and account state verified locally. Endpoint availability does not prove current validator quorum or the newest network head.").arg(s.endpoint);
         }
+        if (m_receipt && receiptWalletSelected() && m_pending_market == selected->id) {
+            details += tr("\nTracked request %1. Command line: getflowmeshactionstatus %2 %1 reads its status; retryflowmeshaction %2 %1 resends only its retained signed bytes, never a new signature.").arg(m_receipt->action_id, selected->id);
+        }
     }
     // Build the final copy before touching labels: intermediate variants of
     // unchanged data still invalidate layouts and accessibility observations.
@@ -1669,8 +1672,9 @@ void B3FlowMeshTradingPanel::applyJobResult(const std::shared_ptr<Result>& resul
             m_tracked_title = B3FlowMeshTrading::ShortTitle(a); m_tracked_kind = B3FlowMeshTrading::KindOf(a.operation);
             m_tracked_title_key = RequestKey(a.market.id, a.market.account, result->receipt->action_id);
             applyReceipt(*result->receipt);
-            notice(tr("Wallet: %1\n%2\nNo automatic retry. Check this exact action with getflowmeshactionstatus %3 %4; retryflowmeshaction resends only retained bytes, never signs a replacement.")
-                .arg(result->wallet, B3FlowMeshTrading::DescribeReceipt(*result->receipt), a.market.id, result->receipt->action_id));
+            // Command names live in Details; the log says where to look.
+            notice(tr("Wallet: %1\n%2\nNo automatic retry. Its progress is shown under Your orders and Saved requests; a resend only ever uses the retained signed bytes, never a new signature.")
+                .arg(result->wallet, B3FlowMeshTrading::DescribeReceipt(*result->receipt)));
         }
     }
     updateMarketText();
