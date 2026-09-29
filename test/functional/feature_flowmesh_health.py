@@ -228,18 +228,28 @@ class FlowMeshHealthTest(FlowMeshLatencyTest):
 
     def check_isolation(self, market):
         # Every FMN2 connection runs through a loopback byte relay; stopping
-        # them all leaves each validator without FlowMesh peers.
-        for proxy in self.proxies:
-            proxy.stop()
-        isolated_started = time.monotonic()
+        # them all leaves each validator without FlowMesh peers. The grace is
+        # checked on the node's own observation: no_peers_ms comes from the
+        # same clock and the same instant as the verdict. This process's clock
+        # cannot bound it, because a relay closes its sockets before stop()
+        # has joined its threads and returned.
+        reported = []
 
         def isolated():
             health, row = self.market_health(market)
-            return ("no_flowmesh_peers" in health["not_ready"] and row["state"] == "isolated" and
-                    not row["ready"])
+            if "no_flowmesh_peers" not in health["not_ready"]:
+                return False
+            reported.append({"flowmesh_peers": health["service"].get("flowmesh_peers"),
+                             "no_peers_ms": health["service"].get("no_peers_ms")})
+            return row["state"] == "isolated" and not row["ready"]
+        for proxy in self.proxies:
+            proxy.stop()
         self.wait_until(isolated, timeout=30, check_interval=.1)
-        isolated_ms = (time.monotonic() - isolated_started) * 1000
-        assert isolated_ms >= GRACE_MS - 250, isolated_ms
+        # Never reported before the node had been without peers for the whole
+        # grace by its own clock.
+        for observation in reported:
+            assert_equal(observation["flowmesh_peers"], 0)
+            assert observation["no_peers_ms"] is not None and observation["no_peers_ms"] >= GRACE_MS, reported
         for row in self.status_objects(market, 0):
             assert_equal(row["endpoint_ready"], False)
             assert "no_flowmesh_peers" in row["endpoint_not_ready"], row
@@ -262,7 +272,8 @@ class FlowMeshHealthTest(FlowMeshLatencyTest):
             health, row = self.market_health(market)
             return health["service_ready"] and row["ready"]
         self.wait_until(recovered, timeout=90, check_interval=.2)
-        self.health_report["isolation"] = {"reported_after_ms": round(isolated_ms, 3), "recovered": True}
+        self.health_report["isolation"] = {"first_reported_no_peers_ms": reported[0]["no_peers_ms"],
+                                           "reported_polls": len(reported), "recovered": True}
 
     def run_test(self):
         try:
