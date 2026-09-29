@@ -10,6 +10,7 @@
 #include <crypto/common.h>
 #include <flowmesh/market_view.h>
 #include <hash.h>
+#include <logging.h>
 #include <random.h>
 #include <serialize.h>
 #include <streams.h>
@@ -277,6 +278,17 @@ struct FlowMeshRuntime::Market {
     std::map<uint256, std::map<uint32_t, flowmesh::IndexedBlsSignature>>
         attestations;
     std::map<uint32_t, uint256> attested_hash_by_seat;
+    // Seat-misbehaviour evidence, information only: nothing reads these to
+    // decide anything. The store's records ever inserted and those it retains
+    // (newest first, with their ids), detections not recorded, seats whose
+    // equivocation at this slot was already handled, and the write pace.
+    uint64_t seat_evidence_recorded{0};
+    std::shared_ptr<const std::vector<flowmesh::SeatEvidence>> seat_evidence;
+    std::set<uint256> seat_evidence_ids;
+    uint64_t seat_evidence_unrecorded{0};
+    std::set<uint32_t> seat_evidence_slot_seats;
+    flowmesh::WireClock::time_point seat_evidence_window{};
+    size_t seat_evidence_window_writes{0};
     std::optional<flowmesh::WireClock::time_point> last_announcement;
     flowmesh::WireClock::time_point next_announcement{};
     flowmesh::MarketDataRuntimeDiagnostics diagnostics;
@@ -728,6 +740,102 @@ void HaltMarket(Market& market, const FlowMeshRuntimeHalt halt,
     market.halt = halt;
     market.pool.ClearDuplicateForwards();
     market.error = std::move(error);
+}
+
+// Seat-misbehaviour evidence (flowmesh/seat_evidence.h). Information only:
+// recording never changes a relay, verification, signing, halt or commit
+// decision, and a failure here never blocks the market.
+
+//! Detection needs a misbehaving seat; this only bounds the synchronous
+//! store writes such a seat can cause per market.
+constexpr size_t SEAT_EVIDENCE_WRITES_PER_MINUTE{8};
+
+template <typename Market>
+void SetSeatEvidence(Market& market, const SeatEvidenceLog& log)
+{
+    auto retained{std::make_shared<std::vector<flowmesh::SeatEvidence>>()};
+    retained->reserve(log.retained.size());
+    market.seat_evidence_ids.clear();
+    for (const auto& item : log.retained) {
+        retained->push_back(item.evidence);
+        market.seat_evidence_ids.insert(item.evidence.Id());
+    }
+    market.seat_evidence_recorded = log.recorded;
+    market.seat_evidence = std::move(retained);
+}
+
+template <typename Market>
+std::optional<flowmesh::ActiveFnBlsSeatSet> EvidenceSeats(const Market& market, const uint64_t epoch,
+                                                          const uint256& set_hash)
+{
+    if (market.seats.epoch == epoch && market.seats.set_hash == set_hash) return market.seats;
+    return market.chain->SeatSet(market.domain, market.market_id, epoch, set_hash);
+}
+
+//! Keeps `evidence` in the market's store when this node's own chain
+//! verifies it; never a record that others could not check.
+template <typename Market>
+void RecordSeatEvidence(Market& market, const flowmesh::SeatEvidence& evidence)
+{
+    if (market.store == nullptr || market.seat_evidence_ids.contains(evidence.Id())) return;
+    const auto first_seats{EvidenceSeats(market, evidence.first.seat_epoch, evidence.first.seat_set_hash)};
+    const auto second_seats{EvidenceSeats(market, evidence.second.seat_epoch, evidence.second.seat_set_hash)};
+    const auto check{first_seats && second_seats
+                         ? flowmesh::CheckSeatEvidence(evidence, *first_seats, *second_seats)
+                         : flowmesh::SeatEvidenceCheck::WRONG_SEAT_SET};
+    if (check != flowmesh::SeatEvidenceCheck::OK) {
+        ++market.seat_evidence_unrecorded;
+        return;
+    }
+    const auto now{market.clock->Now()};
+    if (now < market.seat_evidence_window || now - market.seat_evidence_window >= std::chrono::minutes{1}) {
+        market.seat_evidence_window = now;
+        market.seat_evidence_window_writes = 0;
+    }
+    if (market.seat_evidence_window_writes >= SEAT_EVIDENCE_WRITES_PER_MINUTE) {
+        ++market.seat_evidence_unrecorded;
+        return;
+    }
+    ++market.seat_evidence_window_writes;
+    bool inserted{false};
+    std::string error;
+    SeatEvidenceLog log;
+    if (!market.store->RecordSeatEvidence(evidence, inserted, error) ||
+        !market.store->ReadSeatEvidence(log, error)) {
+        ++market.seat_evidence_unrecorded;
+        LogWarning("FlowMesh market %s could not record seat-misbehaviour evidence: %s\n",
+                   market.market_id.GetHex(), error);
+        return;
+    }
+    SetSeatEvidence(market, log);
+    if (!inserted) return;
+    LogWarning("FlowMesh market %s recorded seat-misbehaviour evidence %s (%s at sequence %d); "
+               "information only, see getflowmeshhealth\n",
+               market.market_id.GetHex(), evidence.Id().GetHex(),
+               flowmesh::SeatEvidenceKindName(evidence.kind), evidence.first.sequence);
+}
+
+//! `seat` attested `first_hash` at this slot and now `second_hash`, whose
+//! signature has just verified.
+template <typename Market>
+void RecordAttestationEquivocation(Market& market, const uint32_t seat, const uint256& first_hash,
+                                   const uint256& second_hash, const bls::Signature& second_signature)
+{
+    // One record per seat and slot: a third candidate adds nothing new.
+    if (!market.seat_evidence_slot_seats.insert(seat).second) return;
+    const auto first{market.candidates.find(first_hash)};
+    const auto second{market.candidates.find(second_hash)};
+    const auto votes{market.attestations.find(first_hash)};
+    if (first == market.candidates.end() || second == market.candidates.end() ||
+        votes == market.attestations.end()) return;
+    const auto vote{votes->second.find(seat)};
+    if (vote == votes->second.end()) return;
+    RecordSeatEvidence(market, flowmesh::SeatEvidence{
+        flowmesh::SeatEvidenceKind::ATTESTATION_EQUIVOCATION, market.domain, market.market_id,
+        flowmesh::SeatAttestationStatement(flowmesh::ProductionCertificateContext(first->second.entry), seat,
+                                           vote->second.signature),
+        flowmesh::SeatAttestationStatement(flowmesh::ProductionCertificateContext(second->second.entry), seat,
+                                           second_signature)});
 }
 
 template <typename Market>
@@ -1601,6 +1709,7 @@ bool CommitCertified(Market& market,
     market.candidates.clear();
     market.attestations.clear();
     market.attested_hash_by_seat.clear();
+    market.seat_evidence_slot_seats.clear();
     market.evidence_retry.reset();
     market.evidence_retry_eligible = false;
     const auto last_message_observed_at{market.diagnostics.last_message_observed_at};
@@ -2491,6 +2600,17 @@ bool FlowMeshRuntime::InitializeMarket(
         }
     }
     if (!InitializeAgreement(*market, config, error)) return false;
+    {
+        // Information only: unreadable evidence never blocks the market.
+        SeatEvidenceLog log;
+        std::string evidence_error;
+        if (config.store->ReadSeatEvidence(log, evidence_error)) {
+            SetSeatEvidence(*market, log);
+        } else {
+            LogWarning("FlowMesh market %s cannot read its seat-misbehaviour evidence: %s\n",
+                       config.market_id.GetHex(), evidence_error);
+        }
+    }
     RoundEntered(*market, "market_initialized");
     for (auto& event : restored_client_actions) m_client_events.Append(std::move(event));
     m_markets.emplace(config.market_id, std::move(market));
@@ -4269,6 +4389,9 @@ void FlowMeshRuntime::PublishHealth(const flowmesh::WireClock::time_point now, c
         row.head_advanced_at = market.head_advanced_at;
         row.local_observed_at = market.local_observed_at;
         row.lag = market.lag.Summary();
+        row.seat_evidence_recorded = market.seat_evidence_recorded;
+        row.seat_evidence = market.seat_evidence;
+        row.seat_evidence_unrecorded = market.seat_evidence_unrecorded;
     }
     std::shared_ptr<const FlowMeshRuntimeHealthSnapshot> previous;
     {
@@ -5413,6 +5536,8 @@ void FlowMeshRuntime::HandleAttestation(
         prior->second != *matching_hash) {
         DeliveryEvent(market, "attestation_refused", flowmesh::WireMessageKind::ATTESTATION,
                       *matching_hash, market.next_sequence, peer, "seat_already_attested_other_candidate", receive_trace);
+        RecordAttestationEquivocation(market, attestation->seat_index, prior->second, *matching_hash,
+                                      attestation->signature);
         return;
     }
     auto& by_seat{market.attestations[*matching_hash]};
@@ -5608,6 +5733,10 @@ void FlowMeshRuntime::HandleCertificate(
             return;
         }
         if (stored->entry.GetHash() != certified->entry.GetHash()) {
+            RecordSeatEvidence(market, flowmesh::SeatEvidence{
+                flowmesh::SeatEvidenceKind::CERTIFICATE_CONFLICT, market.domain, market.market_id,
+                flowmesh::SeatCertificateStatement(stored->certificate, stored->entry.seat_set_hash),
+                flowmesh::SeatCertificateStatement(certified->certificate, certified->entry.seat_set_hash)});
             HaltMarket(market, FlowMeshRuntimeHalt::CERTIFICATE_CONFLICT,
                        "two valid FlowMesh certificates conflict at one sequence");
         }

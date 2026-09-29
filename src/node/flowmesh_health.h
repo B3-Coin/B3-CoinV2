@@ -7,6 +7,7 @@
 
 #include <flowmesh/market.h>
 #include <flowmesh/p2p.h>
+#include <flowmesh/seat_evidence.h>
 #include <uint256.h>
 
 #include <chrono>
@@ -235,6 +236,15 @@ struct FlowMeshMarketHealthObservation {
     //! Existing local wall-clock observation of the head, display only.
     std::optional<int64_t> local_observed_at;
     FlowMeshLagSummary lag;
+    //! Seat-misbehaviour evidence this node recorded for the market; an
+    //! observation like everything here, never an input to anything. Records
+    //! ever inserted into the market's store, and those it retains (newest
+    //! first; each self-verifiable with flowmesh::CheckSeatEvidence).
+    uint64_t seat_evidence_recorded{0};
+    std::shared_ptr<const std::vector<flowmesh::SeatEvidence>> seat_evidence;
+    //! Detections this process could not record: not verifiable against the
+    //! local chain's seat sets, over the write pace, or a failed write.
+    uint64_t seat_evidence_unrecorded{0};
 };
 
 struct FlowMeshRuntimeHealthSnapshot {

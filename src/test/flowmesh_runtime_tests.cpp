@@ -7235,6 +7235,114 @@ BOOST_AUTO_TEST_CASE(health_snapshot_is_readable_while_the_worker_is_blocked)
     BOOST_REQUIRE(f.runtime->WaitForIdle(std::chrono::seconds{2}));
 }
 
+BOOST_AUTO_TEST_CASE(seat_misbehaviour_evidence_is_recorded_restored_and_changes_nothing)
+{
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_seat_evidence"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    auto health{f.Health()};
+    BOOST_CHECK_EQUAL(health->markets.front().seat_evidence_recorded, 0U);
+    BOOST_REQUIRE(health->markets.front().seat_evidence);
+    BOOST_CHECK(health->markets.front().seat_evidence->empty());
+
+    const auto proposal = [&](const flowmesh::ProductionEntryCore& entry, const uint32_t round) {
+        flowmesh::ProductionProposalEnvelope envelope;
+        envelope.entry = entry;
+        envelope.round = round;
+        envelope.proposer_seat_index = flowmesh::ProductionProposerSeatIndex(0, round, f.seats.seats.Size());
+        const auto digest{flowmesh::ProductionProposalDigest(entry, round)};
+        envelope.proposer_signature = f.seats.secrets[envelope.proposer_seat_index]
+            .Sign(std::span<const unsigned char>{digest.begin(), 32}).Compressed();
+        return flowmesh::WireMessage{flowmesh::WireMessageKind::PROPOSAL,
+                                     {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 0},
+                                     *flowmesh::EncodeProductionProposalPayload(envelope)};
+    };
+    const auto vote = [&](const flowmesh::ProductionEntryCore& entry, const uint32_t seat) {
+        const auto signature{flowmesh::SignBlsMicroblockCertificate(
+            f.seats.secrets[seat], flowmesh::ProductionCertificateContext(entry), f.seats.seats)};
+        BOOST_REQUIRE(signature);
+        return flowmesh::WireMessage{flowmesh::WireMessageKind::ATTESTATION,
+                                     {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 0},
+                                     *flowmesh::EncodeProductionAttestationPayload({seat, *signature})};
+    };
+    // Two valid candidates for sequence 0, in rounds 0 and 1.
+    flowmesh::ProductionEpochGate gate{f.domain, f.market, f.seats.seats};
+    flowmesh::ProductionEntryCheck check;
+    const auto other{flowmesh::BuildProductionExecutionEntry(
+        f.initial, f.domain, f.market, f.seats.seats, gate, 0, 0, {}, f.chain.m_current,
+        {f.chain.TipHeight(), std::nullopt, &f.chain}, f.treasury, {}, nullptr, check)};
+    BOOST_REQUIRE_MESSAGE(other, flowmesh::ProductionEntryCheckName(check));
+    BOOST_REQUIRE(other->entry.GetHash() != f.entries[0].GetHash());
+    f.Send(9, proposal(f.entries[0], 0));
+    f.Send(9, vote(f.entries[0], 2));
+    f.Send(9, proposal(other->entry, 1));
+    // Seat 2 signs the second candidate too: refused as before, and recorded.
+    f.Send(9, vote(other->entry, 2));
+    health = f.Health();
+    {
+        const auto& row{health->markets.front()};
+        BOOST_CHECK_EQUAL(row.seat_evidence_recorded, 1U);
+        BOOST_CHECK_EQUAL(row.seat_evidence_unrecorded, 0U);
+        BOOST_REQUIRE_EQUAL(row.seat_evidence->size(), 1U);
+        const auto& evidence{row.seat_evidence->front()};
+        BOOST_CHECK(evidence.kind == flowmesh::SeatEvidenceKind::ATTESTATION_EQUIVOCATION);
+        BOOST_CHECK_EQUAL(evidence.first.seat_index, 2U);
+        BOOST_CHECK(evidence.first.microblock_hash == f.entries[0].GetHash());
+        BOOST_CHECK(evidence.second.microblock_hash == other->entry.GetHash());
+        BOOST_CHECK(flowmesh::CheckSeatEvidence(evidence, f.seats.seats, f.seats.seats) ==
+                    flowmesh::SeatEvidenceCheck::OK);
+        // Nothing else changed: no halt, no commit.
+        BOOST_CHECK(!row.halted);
+        BOOST_CHECK_EQUAL(row.next_sequence, 0U);
+    }
+    // The same equivocation again adds no record.
+    f.Send(9, vote(other->entry, 2));
+    BOOST_CHECK_EQUAL(f.Health()->markets.front().seat_evidence_recorded, 1U);
+    const auto recorded{health->markets.front().seat_evidence->front()};
+
+    // A restarted runtime restores the record from the market's store.
+    f.runtime->Stop();
+    node::FlowMeshRuntimeConfig config;
+    config.chain = &f.chain;
+    config.keys = &f.keys;
+    config.clock = &f.clock;
+    config.relay = [](node::FlowMeshRuntimeRelay) { return LegacyRelayResult(); };
+    f.runtime = std::make_unique<node::FlowMeshRuntime>(config, std::vector<node::FlowMeshRuntimeMarketConfig>{
+        MarketConfig(f.domain, f.market, f.treasury, f.seats.seats, f.initial, f.store, nullptr)});
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    health = f.Health();
+    BOOST_CHECK_EQUAL(health->markets.front().seat_evidence_recorded, 1U);
+    BOOST_REQUIRE_EQUAL(health->markets.front().seat_evidence->size(), 1U);
+    BOOST_CHECK(health->markets.front().seat_evidence->front() == recorded);
+
+    // Two valid certificates at one sequence: the existing halt, now with its
+    // evidence kept, newest first.
+    f.Certificate(9, 0);
+    auto conflicting{f.entries[0]};
+    conflicting.state_root = Filled(0x99);
+    const auto conflict{flowmesh::EncodeProductionCertifiedPayload(
+        {conflicting, Certify(conflicting, f.seats)}, f.seats.seats.Size())};
+    BOOST_REQUIRE(conflict);
+    f.Send(9, {flowmesh::WireMessageKind::CERTIFICATE,
+               {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 0}, *conflict});
+    f.Send(9, {flowmesh::WireMessageKind::CERTIFICATE,
+               {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 0}, *conflict});
+    health = f.Health();
+    const auto& row{health->markets.front()};
+    BOOST_CHECK_EQUAL(row.halt, "certificate-conflict");
+    BOOST_CHECK_EQUAL(row.seat_evidence_recorded, 2U);
+    BOOST_REQUIRE_EQUAL(row.seat_evidence->size(), 2U);
+    const auto& evidence{row.seat_evidence->front()};
+    BOOST_CHECK(evidence.kind == flowmesh::SeatEvidenceKind::CERTIFICATE_CONFLICT);
+    BOOST_CHECK(evidence.first.microblock_hash == f.entries[0].GetHash());
+    BOOST_CHECK(evidence.second.microblock_hash == conflicting.GetHash());
+    BOOST_CHECK(flowmesh::CheckSeatEvidence(evidence, f.seats.seats, f.seats.seats) ==
+                flowmesh::SeatEvidenceCheck::OK);
+    // Both certificates carry seats 0, 1 and 2: each of them signed both.
+    BOOST_CHECK((flowmesh::SeatEvidenceDoubleSigners(evidence) == std::vector<uint32_t>{0, 1, 2}));
+    BOOST_CHECK(row.seat_evidence->back() == recorded);
+}
+
 BOOST_AUTO_TEST_CASE(preagreement_runtime_commit_gate_genesis_deposit_and_exact_restart)
 {
     PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_runtime_commit"};
