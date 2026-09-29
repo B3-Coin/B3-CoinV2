@@ -396,6 +396,152 @@ QString DescribeReceipt(const Receipt& r)
     return text;
 }
 
+namespace {
+QString BaseAmount(CAmount amount, std::optional<int> decimals, const QString& ticker)
+{
+    if (!decimals) return QStringLiteral("%1 raw units").arg(amount);
+    return B3FlowMeshMarketData::FormatAmount(amount, *decimals) + QLatin1Char(' ') + (ticker.isEmpty() ? QStringLiteral("token") : ticker);
+}
+QString SideTitle(bool bid, bool inverse)
+{
+    // Inverse view: a canonical bid spends B3 (Sell B3), an ask receives it.
+    if (inverse) return bid ? QStringLiteral("Sell B3") : QStringLiteral("Buy B3");
+    return bid ? QStringLiteral("Buy") : QStringLiteral("Sell");
+}
+QString OrderTitle(bool bid, CAmount price, CAmount quantity, std::optional<int> decimals, const QString& ticker, bool inverse)
+{
+    const QString side{SideTitle(bid, inverse && decimals)};
+    if (!decimals) return QStringLiteral("%1 %2 @ %3 B3 atoms per raw unit").arg(side, BaseAmount(quantity, decimals, ticker)).arg(price);
+    const QString token{ticker.isEmpty() ? QStringLiteral("token") : ticker};
+    if (inverse) {
+        return QStringLiteral("%1 · %2 %3 · limit %4 %5/B3").arg(side, bid ? QStringLiteral("receive up to") : QStringLiteral("spend up to"),
+            BaseAmount(quantity, decimals, ticker), B3FlowMeshMarketData::ExactInversePrice(price, *decimals), token);
+    }
+    return QStringLiteral("%1 %2 @ %3 B3/%4").arg(side, BaseAmount(quantity, decimals, ticker), B3FlowMeshMarketData::FormatPrice(price, *decimals), token);
+}
+} // namespace
+
+StageView DescribeStage(const Receipt& r, bool local, RequestKind kind, std::optional<int> decimals, const QString& ticker)
+{
+    StageView v;
+    if (r.NotExecuted()) {
+        // Proven: a different certified action consumed its sequence.
+        v.reached = Stage::Signed; v.flag = StageFlag::NotExecuted; v.terminal = r.Terminal(); v.settled = true;
+        v.status = QStringLiteral("Not executed (its account sequence was used by another certified request)");
+        v.outcome = QStringLiteral("✕ not executed");
+        return v;
+    }
+    if (r.Included() && r.outcome_verified && r.outcome) {
+        const auto& o{*r.outcome};
+        v.reached = Stage::OutcomeVerified; v.terminal = r.Terminal(); v.settled = true;
+        if (o.status == QStringLiteral("applied")) {
+            v.status = QStringLiteral("Executed in certified batch #%1").arg(o.microblock_sequence);
+            if (kind == RequestKind::Cancel) v.outcome = QStringLiteral("✓ cancelled");
+            else if (kind == RequestKind::Order && o.fill) {
+                if (o.fill->superseded_in_entry) v.outcome = QStringLiteral("✓ replaced before clearing · no fill");
+                else if (o.fill->quantity == 0) v.outcome = QStringLiteral("✓ no fill yet · resting");
+                else v.outcome = QStringLiteral("✓ filled %1").arg(BaseAmount(o.fill->quantity, decimals, ticker));
+            } else v.outcome = QStringLiteral("✓ applied");
+        } else {
+            v.flag = StageFlag::NotExecuted;
+            v.status = (o.status == QStringLiteral("rejected") ? QStringLiteral("Not executed (%1)") : QStringLiteral("Included but not executed (%1)"))
+                           .arg(o.reason_text.isEmpty() ? o.reason_code : o.reason_text);
+            v.outcome = QStringLiteral("✕ not executed");
+        }
+        if (!o.final) v.status += QStringLiteral(" · not final");
+        return v;
+    }
+    if (r.Included()) {
+        v.reached = Stage::Certified; v.settled = true;
+        v.status = QStringLiteral("Included in certified batch #%1 · applied or rejected is not reported").arg(r.microblock_sequence);
+        v.outcome = QStringLiteral("not reported");
+        return v;
+    }
+    if (r.no_resubmit) {
+        v.reached = Stage::Certified; v.flag = StageFlag::CertifiedEarlier; v.settled = true;
+        v.status = QStringLiteral("Certified earlier · fresh proof pending · never resent");
+        v.outcome = QStringLiteral("not reported");
+        return v;
+    }
+    // Before verified inclusion the receipt state decides; the backend stage
+    // only tells a retained, never-sent instruction from a possibly sent one.
+    if (r.state == QStringLiteral("admitted")) {
+        v.reached = Stage::Admitted;
+        v.status = local ? QStringLiteral("Admitted by your node") : QStringLiteral("Endpoint reports admission (unverified)");
+    } else if (r.state == QStringLiteral("queued")) {
+        v.reached = Stage::Sent;
+        v.status = local ? QStringLiteral("Queued by your node") : QStringLiteral("Endpoint queued it (reported)");
+    } else if (r.state == QStringLiteral("rejected")) {
+        v.reached = Stage::Signed; v.flag = StageFlag::Refused;
+        v.status = QStringLiteral("Refusal reported · treated as unknown until reviewed");
+    } else if (r.stage == QStringLiteral("signed")) {
+        v.reached = Stage::Signed;
+        v.status = QStringLiteral("Signed and saved · not sent yet");
+    } else {
+        v.reached = r.stage == QStringLiteral("sent") ? Stage::Sent : Stage::Signed; v.flag = StageFlag::Uncertain;
+        v.status = local ? QStringLiteral("Outcome unknown · never re-signed") : QStringLiteral("Delivery unconfirmed · outcome unknown · never re-signed");
+    }
+    return v;
+}
+
+QString StageName(Stage stage)
+{
+    switch (stage) {
+    case Stage::Signing: return QStringLiteral("Signing");
+    case Stage::Signed: return QStringLiteral("Signed");
+    case Stage::Sent: return QStringLiteral("Sent");
+    case Stage::Admitted: return QStringLiteral("Admitted");
+    case Stage::Certified: return QStringLiteral("Certified");
+    case Stage::OutcomeVerified: return QStringLiteral("Outcome verified");
+    }
+    return {};
+}
+
+RequestKind KindOf(Operation operation)
+{
+    return operation == Operation::Order ? RequestKind::Order : operation == Operation::Cancel ? RequestKind::Cancel : RequestKind::Other;
+}
+
+RequestKind KindOf(const SavedAction& action)
+{
+    return action.type <= 1 ? RequestKind::Order : action.type <= 3 ? RequestKind::Cancel : RequestKind::Other;
+}
+
+QString ShortTitle(const Action& a)
+{
+    const bool bid{a.side == QStringLiteral("bid")};
+    const QString native{QString::fromStdString(FormatMoney(a.amount)) + QStringLiteral(" B3")};
+    switch (a.operation) {
+    case Operation::Order: return OrderTitle(bid, a.price, a.amount, a.display_decimals, a.display_ticker, a.inverse_display);
+    case Operation::Cancel: return QStringLiteral("Cancel %1").arg(SideTitle(bid, a.inverse_display));
+    case Operation::Withdraw: return QStringLiteral("Withdraw %1").arg(a.native ? native : BaseAmount(a.amount, a.display_decimals, a.display_ticker));
+    case Operation::Deposit: return QStringLiteral("Deposit %1").arg(a.native ? native : BaseAmount(a.amount, a.display_decimals, a.display_ticker));
+    case Operation::Admit: return QStringLiteral("Admit deposit %1…:%2").arg(a.txid.left(12)).arg(a.vout);
+    case Operation::Checkpoint: return QStringLiteral("Publish checkpoint");
+    case Operation::Vault: return QStringLiteral("Publish vault transaction");
+    }
+    return {};
+}
+
+QString ShortTitle(const SavedAction& a, std::optional<int> decimals, const QString& ticker, bool inverse)
+{
+    const bool bid{a.type == 0 || a.type == 2};
+    if (a.type == 2 || a.type == 3) return QStringLiteral("Cancel %1").arg(SideTitle(bid, inverse));
+    if (a.type <= 1) {
+        // The same exact limit shapes DescribeSavedAction recognises; any
+        // other curve is named, never re-priced.
+        const auto& p{a.canonical_points};
+        if (p.size() == 2 && p[0].price < MAX_MONEY && p[1].price == p[0].price + 1 &&
+            (bid ? p[0].quantity > 0 && p[1].quantity == 0 : p[0].quantity == 0 && p[1].quantity > 0)) {
+            return OrderTitle(bid, bid ? p[0].price : p[1].price, bid ? p[0].quantity : p[1].quantity, decimals, ticker, inverse);
+        }
+        return QStringLiteral("%1 order%2").arg(SideTitle(bid, inverse), a.sequence ? QStringLiteral(" · sequence %1").arg(*a.sequence) : QString{});
+    }
+    if (a.type == 4) return QStringLiteral("Withdrawal request");
+    if (a.type == 5) return QStringLiteral("Deposit admission");
+    return QStringLiteral("Request (type %1)").arg(a.type);
+}
+
 SavedActions ParseSavedActions(const UniValue& value)
 {
     if (Text(Field(value, "source")) != QStringLiteral("local-retained-outbox")) Fail("Unexpected saved-action source.");

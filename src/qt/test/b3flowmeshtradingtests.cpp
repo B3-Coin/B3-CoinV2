@@ -244,6 +244,118 @@ private Q_SLOTS:
         r.outcome.reset(); r.outcome_verified = false;
         QVERIFY(DescribeReceipt(r).contains(QStringLiteral("Execution outcome is unknown")));
     }
+    void stageMappingIsNeverStrongerThanTheReceipt()
+    {
+        Receipt r; r.action_id = QString::fromStdString(H(8).GetHex());
+        // A backend stage the receipt's evidence does not support falls back
+        // to the receipt state, never upward.
+        for (const auto* claimed : {"certified", "outcome_verified", "not_executed", "admitted", "queued"}) {
+            r.state = QStringLiteral("unknown"); r.stage = QString::fromLatin1(claimed);
+            const auto v{DescribeStage(r, false, RequestKind::Order)};
+            QVERIFY(v.reached <= Stage::Signed); QCOMPARE(v.flag, StageFlag::Uncertain);
+            QVERIFY(!v.terminal); QVERIFY(!v.settled); QVERIFY(v.outcome.isEmpty());
+        }
+        r.stage = QStringLiteral("sent");
+        QCOMPARE(DescribeStage(r, false, RequestKind::Order).reached, Stage::Sent);
+        r.stage = QStringLiteral("signed");
+        auto v{DescribeStage(r, false, RequestKind::Order)};
+        QCOMPARE(v.reached, Stage::Signed); QCOMPARE(v.flag, StageFlag::None); QVERIFY(v.status.contains(QStringLiteral("not sent yet")));
+        // A certified_inclusion state without a verified certificate is not Certified.
+        r.state = QStringLiteral("certified_inclusion"); r.stage = QStringLiteral("certified"); r.certificate_verified = false;
+        QVERIFY(DescribeStage(r, false, RequestKind::Order).reached < Stage::Certified);
+        // Reported admission is labelled as a report, not a verification.
+        r.state = QStringLiteral("admitted"); r.stage = QStringLiteral("admitted");
+        v = DescribeStage(r, false, RequestKind::Order);
+        QCOMPARE(v.reached, Stage::Admitted); QVERIFY(v.status.contains(QStringLiteral("unverified")));
+        QCOMPARE(DescribeStage(r, true, RequestKind::Order).status, QStringLiteral("Admitted by your node"));
+        r.state = QStringLiteral("queued"); r.stage = QStringLiteral("queued");
+        QCOMPARE(DescribeStage(r, false, RequestKind::Order).reached, Stage::Sent);
+        // An outcome flag without verified inclusion is never an outcome.
+        r.state = QStringLiteral("admitted"); r.outcome_verified = true;
+        QVERIFY(DescribeStage(r, false, RequestKind::Order).reached < Stage::Certified);
+    }
+    void rejectedOrUnknownNeverBecomeNotExecutedWithoutVerifiedOutcome()
+    {
+        Receipt r; r.action_id = QString::fromStdString(H(8).GetHex());
+        for (const auto* state : {"rejected", "unknown"}) {
+            for (const auto* code : {"", "POOL_REFUSED", "NOT_EXECUTED_SEQUENCE_CONSUMED"}) {
+                r.state = QString::fromLatin1(state); r.stage = r.state == QStringLiteral("rejected") ? QStringLiteral("refused") : QStringLiteral("sent");
+                r.reason_code = QString::fromLatin1(code);
+                const auto v{DescribeStage(r, false, RequestKind::Order)};
+                QVERIFY(v.flag != StageFlag::NotExecuted); QVERIFY(!v.terminal); QVERIFY(!v.settled);
+                QVERIFY(!v.status.contains(QStringLiteral("Not executed")));
+                QCOMPARE(v.flag, r.state == QStringLiteral("rejected") ? StageFlag::Refused : StageFlag::Uncertain);
+            }
+        }
+        // Only a verified consumer proof makes it terminal.
+        r.state = QStringLiteral("rejected"); r.outcome_verified = true;
+        Outcome proof; proof.status = QStringLiteral("not_executed"); proof.final = true;
+        proof.reason_code = QStringLiteral("NOT_EXECUTED_SEQUENCE_CONSUMED"); proof.consumed_by = QString::fromStdString(H(12).GetHex());
+        r.outcome = proof;
+        const auto v{DescribeStage(r, false, RequestKind::Order)};
+        QCOMPARE(v.flag, StageFlag::NotExecuted); QVERIFY(v.terminal); QVERIFY(v.settled);
+        QVERIFY(v.status.startsWith(QStringLiteral("Not executed ("))); QCOMPARE(v.outcome, QStringLiteral("✕ not executed"));
+        QVERIFY(v.reached < Stage::Certified);
+    }
+    void certifiedRequiresVerifiedInclusionOrRetainedProtection()
+    {
+        Receipt r; r.action_id = QString::fromStdString(H(8).GetHex());
+        r.state = QStringLiteral("unknown"); r.no_resubmit = true;
+        auto v{DescribeStage(r, false, RequestKind::Order)};
+        QCOMPARE(v.reached, Stage::Certified); QCOMPARE(v.flag, StageFlag::CertifiedEarlier); QVERIFY(v.settled); QVERIFY(!v.terminal);
+        QVERIFY(v.status.contains(QStringLiteral("earlier"))); QVERIFY(v.status.contains(QStringLiteral("never resent")));
+        r.no_resubmit = false;
+        r.state = QStringLiteral("certified_inclusion"); r.certificate_verified = true; r.stage = QStringLiteral("certified");
+        r.microblock_hash = QString::fromStdString(H(9).GetHex()); r.microblock_sequence = 812;
+        v = DescribeStage(r, false, RequestKind::Order);
+        QCOMPARE(v.reached, Stage::Certified); QCOMPARE(v.flag, StageFlag::None); QVERIFY(v.settled); QVERIFY(!v.terminal);
+        // REJECTED_BY_STATE still consumes the sequence: inclusion alone never says applied.
+        QVERIFY(v.status.contains(QStringLiteral("#812"))); QVERIFY(v.status.contains(QStringLiteral("applied or rejected is not reported")));
+        QCOMPARE(v.outcome, QStringLiteral("not reported"));
+        // A verified outcome of the including entry: filled, resting, cancelled.
+        Outcome o; o.status = QStringLiteral("applied"); o.final = true; o.microblock_sequence = 812; o.microblock_hash = r.microblock_hash;
+        o.reason_code = QStringLiteral("APPLIED"); o.fill = Outcome::Fill{QStringLiteral("bid"), true, false, 250'000, 1000, 250'000'000, 25'000, 249'975'000};
+        r.outcome = o; r.outcome_verified = true;
+        v = DescribeStage(r, false, RequestKind::Order, 6, QStringLiteral("tUSD"));
+        QCOMPARE(v.reached, Stage::OutcomeVerified); QVERIFY(v.terminal); QCOMPARE(v.outcome, QStringLiteral("✓ filled 0.25 tUSD"));
+        r.outcome->fill->quantity = 0;
+        QCOMPARE(DescribeStage(r, false, RequestKind::Order, 6, QStringLiteral("tUSD")).outcome, QStringLiteral("✓ no fill yet · resting"));
+        r.outcome->fill.reset();
+        QCOMPARE(DescribeStage(r, false, RequestKind::Cancel).outcome, QStringLiteral("✓ cancelled"));
+        // A verified rejection names its reason; an included, not-final one says so.
+        r.outcome->status = QStringLiteral("rejected"); r.outcome->reason_text = QStringLiteral("Insufficient certified balance");
+        v = DescribeStage(r, false, RequestKind::Order);
+        QCOMPARE(v.flag, StageFlag::NotExecuted); QCOMPARE(v.status, QStringLiteral("Not executed (Insufficient certified balance)")); QVERIFY(v.terminal);
+        r.outcome->status = QStringLiteral("included_not_executed"); r.outcome->final = false; r.outcome->reason_text = QStringLiteral("sequence was not next");
+        v = DescribeStage(r, false, RequestKind::Order);
+        QCOMPARE(v.flag, StageFlag::NotExecuted); QVERIFY(!v.terminal); QVERIFY(v.status.endsWith(QStringLiteral("not final")));
+    }
+    void shortTitlesUseExactUnitsAndNoRpcNames()
+    {
+        auto a{Order()}; a.price = 1000; a.amount = 1'000'000; a.display_decimals = 6; a.display_ticker = QStringLiteral("tUSD");
+        QCOMPARE(ShortTitle(a), QStringLiteral("Buy 1 tUSD @ 1 B3/tUSD"));
+        a.side = QStringLiteral("ask"); QCOMPARE(ShortTitle(a), QStringLiteral("Sell 1 tUSD @ 1 B3/tUSD"));
+        // Inverse view: a canonical ask receives B3 (Buy B3) and spends tokens.
+        a.inverse_display = true; a.price = 500;
+        QCOMPARE(ShortTitle(a), QStringLiteral("Buy B3 · spend up to 1 tUSD · limit 2 tUSD/B3"));
+        a.display_decimals.reset(); a.display_ticker.clear();
+        QVERIFY(ShortTitle(a).contains(QStringLiteral("raw units")));
+        auto cancel{Order()}; cancel.operation = Operation::Cancel;
+        QCOMPARE(ShortTitle(cancel), QStringLiteral("Cancel Buy"));
+        cancel.inverse_display = true; QCOMPARE(ShortTitle(cancel), QStringLiteral("Cancel Sell B3"));
+        SavedAction saved; saved.type = 0; saved.sequence = 7;
+        saved.canonical_points = {{1000, 1'000'000}, {1001, 0}};
+        QCOMPARE(ShortTitle(saved, 6, QStringLiteral("tUSD"), false), QStringLiteral("Buy 1 tUSD @ 1 B3/tUSD"));
+        saved.canonical_points = {{1000, 1'000'000}, {1005, 0}}; // not the exact limit shape: named, never re-priced
+        QCOMPARE(ShortTitle(saved, 6, QStringLiteral("tUSD"), false), QStringLiteral("Buy order · sequence 7"));
+        saved.type = 3; QCOMPARE(ShortTitle(saved, 6, QStringLiteral("tUSD"), true), QStringLiteral("Cancel Buy B3"));
+        saved.type = 4; QCOMPARE(ShortTitle(saved, std::nullopt, {}, false), QStringLiteral("Withdrawal request"));
+        QCOMPARE(KindOf(Operation::Order), RequestKind::Order); QCOMPARE(KindOf(Operation::Cancel), RequestKind::Cancel);
+        QCOMPARE(KindOf(Operation::Withdraw), RequestKind::Other);
+        for (const auto& title : {ShortTitle(Order()), ShortTitle(cancel), ShortTitle(saved, std::nullopt, {}, false)}) {
+            QVERIFY(!title.contains(QStringLiteral("flowmesh"), Qt::CaseInsensitive));
+        }
+    }
     void exactReceiptRetryHasNoSigningOrEconomicArguments()
     {
         const auto market{Order().market.id}, id{QString::fromStdString(H(8).GetHex())};

@@ -6,6 +6,7 @@
 #include <qt/b3assettransfer.h>
 #include <univalue.h>
 #include <QString>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <vector>
@@ -115,6 +116,41 @@ QString DescribeReceipt(const Receipt& receipt);
 //! Strict parse of a verified outcome object (fails closed).
 Outcome ParseOutcome(const UniValue& value);
 QString DescribeOutcome(const Outcome& outcome);
+//! A request row's progress. Signed, Sent and Admitted are historical facts;
+//! Certified and OutcomeVerified follow only current verified evidence.
+enum class Stage : uint8_t { Signing, Signed, Sent, Admitted, Certified, OutcomeVerified };
+enum class StageFlag : uint8_t { None, Uncertain, Refused, CertifiedEarlier, NotExecuted };
+//! What the request asked for: only an order can report a fill.
+enum class RequestKind : uint8_t { Order, Cancel, Other };
+struct StageView {
+    Stage reached{Stage::Signing};
+    StageFlag flag{StageFlag::None};
+    //! A verified final outcome or a proven non-execution: it never changes.
+    bool terminal{false};
+    //! Nothing further is expected for display: verified inclusion, a verified
+    //! outcome, a proven non-execution or retained certification.
+    bool settled{false};
+    //! One line for the row; never an RPC name.
+    QString status;
+    //! The verified-outcome cell: empty until certified, "not reported" when
+    //! inclusion is verified but no per-action outcome is.
+    QString outcome;
+};
+//! Maps the backend's display stage (node::FlowMeshReceiptStage, the single
+//! source) and never shows more than the receipt proves: Certified needs
+//! verified inclusion (or the retained no-resubmit record, labelled
+//! "earlier"), a verified outcome needs outcome_verified, and "not executed"
+//! needs a verified outcome. A reported refusal or an unknown outcome is
+//! never terminal. A stage the receipt does not support falls back to its state.
+StageView DescribeStage(const Receipt& receipt, bool local, RequestKind kind,
+                        std::optional<int> decimals = {}, const QString& ticker = {});
+QString StageName(Stage stage);
+//! A short request title in exact display units ("Buy 1 tUSD @ 1 B3/tUSD",
+//! "Cancel Sell B3"); never an RPC name or a guessed amount.
+QString ShortTitle(const Action& action);
+QString ShortTitle(const SavedAction& action, std::optional<int> decimals, const QString& ticker, bool inverse);
+RequestKind KindOf(Operation operation);
+RequestKind KindOf(const SavedAction& action);
 SavedActions ParseSavedActions(const UniValue& value);
 //! Metadata enrichment is optional and must be bound to the exact market by
 //! the caller. The canonical side and raw points remain independently visible.
