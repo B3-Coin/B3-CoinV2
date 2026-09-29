@@ -78,9 +78,12 @@ six-event commit append takes about 0.3 us with 10 idle watchers, and about
 waits at most `watch_ms` (0-2000; at most 1500 is used) for a change and then
 returns the same verified data plus a `watch` object: `status` (the closed
 set above plus this client's `not_eligible`, `lane_busy`, `superseded`,
-`unsupported`, `failed`, `revalidate`, `invalid`, `other`), `supported`,
-`waited`, `gap`, `endpoint` and `endpoint_live_ms`. When `supported` or
-`waited` is false, callers pace their next read themselves (at least 500 ms).
+`unsupported`, `failed`, `revalidate`, `invalid`, `ticks_catchup`, `other`),
+`supported`, `waited`, `gap`, `endpoint` and `endpoint_live_ms`. When
+`waited` is false, callers pace their next read themselves (at least
+500 ms). `ticks_catchup` (an eligible watch replaced once per head by an
+ordinary read for missing clearing ticks) has `waited` true and keeps the
+watch connection.
 `watch_ms` 0 is an ordinary read that also closes the live-update
 connection. The wallet is held for at most `watch_ms` plus 5 s.
 

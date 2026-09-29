@@ -105,7 +105,7 @@ BOOST_AUTO_TEST_CASE(watch_status_labels_are_a_closed_set)
         BOOST_CHECK_EQUAL(node::FlowMeshWatchStatusLabel(server), server);
     }
     // ... anything else, including this client's own labels, is "other".
-    for (const char* unexpected : {"", "READY", "failed", "unsupported", "superseded", "x"}) {
+    for (const char* unexpected : {"", "READY", "failed", "unsupported", "superseded", "ticks_catchup", "x"}) {
         BOOST_CHECK_EQUAL(node::FlowMeshWatchStatusLabel(unexpected), "other");
     }
     // Only a reply after which the caller may watch again at once is "waited".

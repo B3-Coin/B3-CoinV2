@@ -1169,9 +1169,9 @@ RPCHelpMan getflowmeshmarketdata()
                 {T::NUM, "draft_fill_max", /*optional=*/true, "Upper bound of the draft's fill"},
             }},
             {T::OBJ, "watch", /*optional=*/true, "Present only when watch_ms was given: this read's local latency observation, never evidence", {
-                {T::STR, "status", "none, no_cursor, head_changed, ready, gap, timeout, interrupted, restarted, busy, deadline (endpoint), or not_eligible, lane_busy, superseded, unsupported, failed, revalidate, invalid, other (this client)"},
+                {T::STR, "status", "none, no_cursor, head_changed, ready, gap, timeout, interrupted, restarted, busy, deadline (endpoint), or not_eligible, lane_busy, superseded, unsupported, failed, revalidate, invalid, ticks_catchup, other (this client)"},
                 {T::BOOL, "supported", "The endpoint (or the local engine) served the watch"},
-                {T::BOOL, "waited", "It waited or reported a change or gap; otherwise pace the next read"},
+                {T::BOOL, "waited", "It waited or reported a change or gap, or (ticks_catchup) read ordinarily once for clearing ticks; watch again at once. Otherwise pace the next read"},
                 {T::BOOL, "gap", "This read found an event gap"},
                 {T::STR, "endpoint", "Endpoint the watch was for, or empty"},
                 {T::NUM, "endpoint_live_ms", "That endpoint's advertised live-update maximum, or zero"},

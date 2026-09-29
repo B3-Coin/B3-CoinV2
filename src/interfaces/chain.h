@@ -398,8 +398,9 @@ struct FlowMeshMarketWatch {
     std::string status{"none"};
     //! An endpoint (or the local engine) served the watch.
     bool supported{false};
-    //! It waited, or reported a change or gap: the caller may watch again at
-    //! once. Otherwise the caller paces itself.
+    //! It waited, or reported a change or gap, or (ticks_catchup) the watch
+    //! was eligible but this call read ordinarily once for clearing ticks:
+    //! the caller may watch again at once. Otherwise the caller paces itself.
     bool waited{false};
     //! This read found an event gap (events may have been missed).
     bool gap{false};

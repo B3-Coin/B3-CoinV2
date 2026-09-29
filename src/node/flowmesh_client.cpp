@@ -3341,6 +3341,7 @@ public:
         HttpsEndpoint target;
         size_t endpoint{0};
         std::chrono::milliseconds wait{0};
+        bool ticks_catchup{false};
         flowmesh::ClientEventCursor sent_cursor;
         std::string body;
         timing.Mark("select_lock_requested_us");
@@ -3378,6 +3379,7 @@ public:
                     if ((ring.ticks.empty() || ring.ticks.back().sequence < head.sequence) && ring.catchup_head != head.GetHash()) {
                         ring.catchup_head = head.GetHash();
                         wait = {};
+                        ticks_catchup = true;
                     }
                 }
                 if (wait.count()) {
@@ -3395,6 +3397,15 @@ public:
                     target = m_endpoints.at(endpoint);
                 }
             }
+        }
+        if (ticks_catchup) {
+            // The watch was eligible: this read only fetches the ticks. The
+            // lane keeps its connection for the watch that follows at once
+            // (the next one at this head is sent).
+            lane.unlock();
+            auto out{ordinary("ticks_catchup")};
+            watch.waited = true;
+            return out;
         }
         if (!wait.count()) {
             // Not watching now: the lane's kept-alive connection would only

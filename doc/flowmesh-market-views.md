@@ -89,7 +89,8 @@ flapping advertisement) is read once more at once without them, is not marked
 unavailable, and its advertisement is ignored for ten minutes. A live-update
 read whose held ticks stop short of the verified head (a signing preflight's
 snapshot asks for none) gives up its watch once per head so that an ordinary
-read fetches them.
+read fetches them. Its watch status is `ticks_catchup` with `waited` true:
+the watch connection is kept and the caller may watch again at once.
 
 ## 2. Indicative next clearing
 

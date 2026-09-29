@@ -85,13 +85,15 @@ inline std::chrono::milliseconds FlowMeshUpdatesWatchFor(const FlowMeshWatchElig
 
 //! The closed set of watch labels a caller sees. The first ten are the
 //! endpoint's own watch_status values; the rest are this client's.
-inline constexpr std::array<std::string_view, 18> FLOWMESH_CLIENT_WATCH_LABELS{
+inline constexpr std::array<std::string_view, 19> FLOWMESH_CLIENT_WATCH_LABELS{
     // Endpoint.
     "none", "no_cursor", "head_changed", "ready", "gap", "timeout", "interrupted", "restarted", "busy", "deadline",
     // Client: not sent, lane in use, reply older than the cache, capability
     // withdrawn, transport or reply failure, authority changed while it
-    // slept, reply failed verification, unknown endpoint label.
-    "not_eligible", "lane_busy", "superseded", "unsupported", "failed", "revalidate", "invalid", "other"};
+    // slept, reply failed verification, an ordinary read taken once per head
+    // for clearing ticks instead of an eligible watch (watch again at once),
+    // unknown endpoint label (always last).
+    "not_eligible", "lane_busy", "superseded", "unsupported", "failed", "revalidate", "invalid", "ticks_catchup", "other"};
 
 //! An endpoint's watch_status mapped into the closed set; anything the
 //! endpoint may not send is "other".

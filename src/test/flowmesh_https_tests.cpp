@@ -5971,26 +5971,42 @@ BOOST_AUTO_TEST_CASE(live_update_reads_fetch_missing_ticks_once_with_an_ordinary
     const auto held{client->Data(market, std::nullopt, TickPage(), error)};
     BOOST_REQUIRE_MESSAGE(held, error);
     BOOST_REQUIRE(held->ticks && held->ticks->available);
-    // A new head verified by a read that asks for no ticks (as a signing
-    // preflight's): the held ticks now stop short of it.
-    live.Deposit();
-    BOOST_REQUIRE(client->Market(market, std::nullopt));
     auto query{TickPage()};
+    query.known_head = held->snapshot.last_microblock_hash;
     const auto watch_read = [&] {
         interfaces::FlowMeshMarketWatch watch;
         auto data{client->Watch(market, std::nullopt, query, std::chrono::milliseconds{300}, watch, error)};
         BOOST_REQUIRE_MESSAGE(data, error);
         return std::pair{std::move(*data), watch};
     };
+    // A watch: the lane now holds a kept-alive connection.
+    const auto [held_again, opened]{watch_read()};
+    BOOST_CHECK(opened.supported && opened.waited);
+    // A new head verified by a read that asks for no ticks (as a signing
+    // preflight's): the held ticks now stop short of it.
+    live.Deposit();
+    BOOST_REQUIRE(client->Market(market, std::nullopt));
     const auto [caught_up, first]{watch_read()};
-    BOOST_CHECK_EQUAL(first.status, "not_eligible");
+    // Only the ticks were missing: the caller may watch again at once.
+    BOOST_CHECK_EQUAL(first.status, "ticks_catchup");
+    BOOST_CHECK(!first.supported);
+    BOOST_CHECK(first.waited);
+    BOOST_CHECK(first.endpoint_live_ms > 0);
     BOOST_REQUIRE(caught_up.ticks && caught_up.ticks->available);
     BOOST_CHECK(caught_up.ticks->ticks.back().microblock_hash == caught_up.snapshot.last_microblock_hash);
-    // Current again: the next read watches.
+    // Current again: the next read watches, on the lane's kept connection.
     query.known_head = caught_up.snapshot.last_microblock_hash;
-    const auto [quiet, second]{watch_read()};
-    BOOST_CHECK(second.supported);
-    BOOST_REQUIRE(quiet.ticks && quiet.ticks->available);
+    std::vector<UniValue> spans;
+    {
+        TimingCapture timing;
+        const auto [quiet, second]{watch_read()};
+        spans = timing.Stop("client_market_watch");
+        BOOST_CHECK(second.supported);
+        BOOST_REQUIRE(quiet.ticks && quiet.ticks->available);
+    }
+    BOOST_REQUIRE_EQUAL(spans.size(), 1U);
+    BOOST_REQUIRE(spans[0].exists("connection_reused"));
+    BOOST_CHECK_EQUAL(spans[0]["connection_reused"].getInt<uint64_t>(), 1U);
     client.reset();
 }
 
