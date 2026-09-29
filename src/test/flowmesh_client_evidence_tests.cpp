@@ -18,6 +18,9 @@
 #include <cstring>
 #include <functional>
 #include <future>
+#include <map>
+#include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -709,6 +712,49 @@ BOOST_AUTO_TEST_CASE(identity_shares_apply_only_once_full)
     shares.Clear();
     BOOST_CHECK_EQUAL(shares.Size(), 0U);
     BOOST_CHECK(!shares.Identity(serial));
+}
+
+BOOST_AUTO_TEST_CASE(identity_shares_match_their_rules_over_random_use)
+{
+    // A direct model of the documented rules, against the indexed one:
+    // every insert's dropped serial and every recorded identity agree.
+    for (const auto& [capacity, share] : {std::pair<size_t, size_t>{8, 2}, {12, 3}, {5, 1}, {16, 16}}) {
+        FastRandomContext rng{/*fDeterministic=*/true};
+        flowmesh::IdentityShares shares{capacity, share};
+        std::map<uint64_t, std::string> model; // oldest first
+        uint64_t serial{0};
+        const auto held = [&](const std::string& identity) {
+            return static_cast<size_t>(std::count_if(model.begin(), model.end(), [&](const auto& e) { return e.second == identity; }));
+        };
+        for (int step{0}; step < 4000; ++step) {
+            if (!model.empty() && rng.randrange(4) == 0) {
+                // Forget a recorded serial, the oldest of its identity or not.
+                auto it{model.begin()};
+                std::advance(it, rng.randrange(model.size()));
+                shares.Erase(it->first);
+                model.erase(it);
+            } else {
+                const std::string identity{static_cast<char>('a' + rng.randrange(6))};
+                const size_t before{held(identity)};
+                model.emplace(++serial, identity);
+                std::optional<uint64_t> expected;
+                if (model.size() > capacity) {
+                    const auto own_oldest{std::find_if(model.begin(), model.end(), [&](const auto& e) { return e.second == identity; })};
+                    const auto over{std::find_if(model.begin(), model.end(), [&](const auto& e) { return held(e.second) > share; })};
+                    expected = before >= share ? own_oldest->first : over != model.end() ? over->first : model.begin()->first;
+                    model.erase(*expected);
+                }
+                BOOST_CHECK(shares.Insert(serial, identity) == expected);
+            }
+            BOOST_REQUIRE_EQUAL(shares.Size(), model.size());
+        }
+        for (uint64_t n{1}; n <= serial; ++n) {
+            const auto* identity{shares.Identity(n)};
+            const auto it{model.find(n)};
+            BOOST_CHECK_EQUAL(identity != nullptr, it != model.end());
+            if (identity && it != model.end()) BOOST_CHECK_EQUAL(*identity, it->second);
+        }
+    }
 }
 
 namespace {

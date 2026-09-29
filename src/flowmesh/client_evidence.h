@@ -54,7 +54,9 @@ inline constexpr size_t CLIENT_NOTICE_PER_SUBMITTER{64};
  * entries, an identity over its share loses its oldest first, and an
  * identity within its share loses an entry only when every identity is
  * within its share, which takes more than capacity / share identities.
- * Every operation is logarithmic in the entries held.
+ * Every operation is logarithmic in the entries held. Insert either
+ * records the entry or, if an allocation throws, changes nothing; Erase
+ * never throws.
  */
 class IdentityShares
 {
@@ -64,7 +66,7 @@ public:
      * Returns the serial to drop when this makes one entry too many; it is
      * never `serial` itself and is already forgotten here. */
     std::optional<uint64_t> Insert(uint64_t serial, const std::string& identity);
-    //! Forgets `serial`, if recorded.
+    //! Forgets `serial`, if recorded. Never throws.
     void Erase(uint64_t serial);
     //! The identity `serial` was recorded for, if it is recorded.
     const std::string* Identity(uint64_t serial) const;
@@ -73,9 +75,13 @@ public:
 
 private:
     using Serials = std::map<std::string, std::set<uint64_t>>;
+    using SerialNode = std::set<uint64_t>::node_type;
     // An identity over its share has its oldest serial in m_over_share.
-    void Unindex(const Serials::iterator& owner);
-    void Index(const Serials::iterator& owner);
+    std::optional<uint64_t> Indexed(const std::set<uint64_t>& serials) const;
+    //! Moves an identity's m_over_share entry from `before` to `after`
+    //! (either may be none). A new entry uses `spare`, which must then hold
+    //! a node; nothing here allocates.
+    void Reindex(std::optional<uint64_t> before, std::optional<uint64_t> after, SerialNode& spare);
 
     size_t m_capacity;
     size_t m_share;

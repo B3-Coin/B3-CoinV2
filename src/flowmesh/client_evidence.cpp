@@ -209,24 +209,46 @@ ClientEventLog::ClientEventLog(const uint256& instance_id) : m_instance_id{insta
 IdentityShares::IdentityShares(const size_t capacity, const size_t share)
     : m_capacity{std::max<size_t>(capacity, 1)}, m_share{std::max<size_t>(share, 1)} {}
 
-void IdentityShares::Unindex(const Serials::iterator& owner)
+std::optional<uint64_t> IdentityShares::Indexed(const std::set<uint64_t>& serials) const
 {
-    if (owner->second.size() > m_share) m_over_share.erase(*owner->second.begin());
+    if (serials.size() <= m_share) return std::nullopt;
+    return *serials.begin();
 }
 
-void IdentityShares::Index(const Serials::iterator& owner)
+void IdentityShares::Reindex(const std::optional<uint64_t> before, const std::optional<uint64_t> after, SerialNode& spare)
 {
-    if (owner->second.size() > m_share) m_over_share.insert(*owner->second.begin());
+    if (before == after) return;
+    if (!after) {
+        m_over_share.erase(*before);
+        return;
+    }
+    // Moves an existing index node, or uses the caller's spare one: no
+    // allocation, so no throw.
+    SerialNode node{before ? m_over_share.extract(*before) : std::move(spare)};
+    node.value() = *after;
+    m_over_share.insert(std::move(node));
 }
 
 std::optional<uint64_t> IdentityShares::Insert(const uint64_t serial, const std::string& identity)
 {
+    // Every allocation comes first, so a throw (such as bad_alloc) leaves
+    // this unchanged and m_identity, m_serials and m_over_share in step.
+    // The identity's slot is the last allocation; nothing after it throws.
+    const auto make = [](const uint64_t value) {
+        std::set<uint64_t> one{value};
+        return one.extract(one.begin());
+    };
+    SerialNode entry{make(serial)}, spare{make(serial)};
+    auto identity_entry{[&] {
+        std::map<uint64_t, std::string> one{{serial, identity}};
+        return one.extract(one.begin());
+    }()};
     const auto owner{m_serials.try_emplace(identity).first};
     const size_t held{owner->second.size()};
-    Unindex(owner);
-    owner->second.insert(serial);
-    Index(owner);
-    m_identity.emplace(serial, identity);
+    const auto before{Indexed(owner->second)};
+    owner->second.insert(std::move(entry));
+    Reindex(before, Indexed(owner->second), spare);
+    m_identity.insert(std::move(identity_entry));
     if (m_identity.size() <= m_capacity) return std::nullopt;
     // `serial` is the newest entry: at `share` or more the identity has an
     // older one, within its share it is not over it, and past the capacity
@@ -240,16 +262,16 @@ std::optional<uint64_t> IdentityShares::Insert(const uint64_t serial, const std:
 
 void IdentityShares::Erase(const uint64_t serial)
 {
+    // Allocates nothing: an identity still over its share after this has its
+    // index node moved to its new oldest serial.
     const auto it{m_identity.find(serial)};
     if (it == m_identity.end()) return;
     const auto owner{m_serials.find(it->second)};
-    Unindex(owner);
+    const auto before{Indexed(owner->second)};
     owner->second.erase(serial);
-    if (owner->second.empty()) {
-        m_serials.erase(owner);
-    } else {
-        Index(owner);
-    }
+    SerialNode none;
+    Reindex(before, Indexed(owner->second), none);
+    if (owner->second.empty()) m_serials.erase(owner);
     m_identity.erase(it);
 }
 
