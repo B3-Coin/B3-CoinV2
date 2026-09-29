@@ -38,6 +38,7 @@
 #include <QPersistentModelIndex>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QScrollBar>
 #include <QSemaphore>
 #include <QSettings>
@@ -4710,6 +4711,50 @@ private Q_SLOTS:
         // Keys are FIFO-bounded.
         for (size_t i{0}; i < B3FlowMeshToasts::MAX_KEYS; ++i) toasts->push(QStringLiteral("k%1").arg(i), Kind::Info, QStringLiteral("n"), milliseconds{60'000});
         QVERIFY(toasts->push(QStringLiteral("a"), Kind::Info, QStringLiteral("evicted key"), milliseconds{60'000}));
+    }
+    void toastsOverlayTheVisiblePageWithoutMovingTheTicket()
+    {
+        using Kind = B3FlowMeshToasts::Kind;
+        using std::chrono::milliseconds;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.resize(1100, 520); panel.show(); QCoreApplication::processEvents();
+        auto* scroll{panel.findChild<QScrollArea*>()}; QVERIFY(scroll);
+        auto* viewport{scroll->viewport()}; auto* strip{panel.m_toasts};
+        const auto at = [&](const QWidget* widget) { return QRect{widget->mapTo(&panel, QPoint{}), widget->size()}; };
+        const std::vector<const QWidget*> page{panel.m_buy, panel.m_price, panel.m_quantity, panel.m_order, panel.m_chart, panel.m_activity, panel.m_edit_order};
+        std::vector<QRect> before; for (const auto* widget : page) before.push_back(at(widget));
+        const auto unmoved = [&] {
+            for (size_t i{0}; i < page.size(); ++i) if (at(page[i]) != before[i]) return false;
+            return true;
+        };
+        // Whole, inside the visible page, on top of the content under it and,
+        // at these widths, clear of the order button.
+        const auto overlays = [&] {
+            if (!strip->isVisible() || !viewport->rect().contains(strip->geometry())) return false;
+            if (strip->geometry().intersects(QRect{panel.m_order->mapTo(viewport, QPoint{}), panel.m_order->size()})) return false;
+            for (const auto* frame : strip->findChildren<QFrame*>(QString{}, Qt::FindDirectChildrenOnly)) {
+                if (!strip->rect().contains(frame->geometry())) return false;
+            }
+            const auto* hit{viewport->childAt(strip->geometry().center())};
+            return hit && (hit == strip || strip->isAncestorOf(hit));
+        };
+        panel.toast(QStringLiteral("a"), Kind::Info, QStringLiteral("Certified: Buy 1 tUSD @ 1 B3/tUSD · included in batch #9"), milliseconds{60'000});
+        panel.toast(QStringLiteral("b"), Kind::Warning, QStringLiteral("Connection lost · last verified data is shown and new orders are paused. Your requests are re-checked first when it returns."), milliseconds{50});
+        QCoreApplication::processEvents();
+        QCOMPARE(strip->texts().size(), 2);
+        QVERIFY(unmoved()); QVERIFY(overlays());
+        QTRY_COMPARE_WITH_TIMEOUT(strip->texts().size(), 1, 2000);
+        QCoreApplication::processEvents();
+        QVERIFY(unmoved()); QVERIFY(overlays());
+        // Scrolled to the end of the page, a notice is still in view.
+        auto* bar{scroll->verticalScrollBar()}; QVERIFY(bar->maximum() > 0);
+        bar->setValue(bar->maximum()); QCoreApplication::processEvents();
+        panel.toast(QStringLiteral("c"), Kind::Success, QStringLiteral("Executed: Buy 1 tUSD @ 1 B3/tUSD · filled 0.25 tUSD"), milliseconds{60'000});
+        QCoreApplication::processEvents(); QVERIFY(overlays());
+        // It follows a resized page.
+        panel.resize(760, 480); QCoreApplication::processEvents(); QVERIFY(overlays());
+        strip->clear(); QVERIFY(strip->isHidden());
+        QVERIFY(!panel.m_thread); QVERIFY(m_wallet->IsLocked());
     }
     void terminalToastsFireOncePerActionAndNotForHistoricalRows()
     {

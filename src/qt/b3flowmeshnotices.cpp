@@ -4,6 +4,7 @@
 
 #include <qt/b3theme.h>
 
+#include <QEvent>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -20,6 +21,8 @@ B3FlowMeshToasts::B3FlowMeshToasts(QWidget* parent) : QWidget{parent}
     m_layout = new QVBoxLayout{this};
     m_layout->setContentsMargins(0, 0, 0, 0);
     m_layout->setSpacing(4);
+    // Follows the parent's size; it is deliberately in no layout.
+    if (parent) parent->installEventFilter(this);
     hide();
 }
 
@@ -60,8 +63,11 @@ bool B3FlowMeshToasts::push(const QString& key, const Kind kind, const QString& 
     QTimer::singleShot(ttl, frame, &QObject::deleteLater);
     connect(frame, &QObject::destroyed, this, [this](QObject* removed) { prune(removed); });
     m_layout->addWidget(frame);
+    // Shown now, not when the layout gets to it, so place() measures it.
+    frame->show();
     m_frames.emplace_back(frame);
     show();
+    place();
     return true;
 }
 
@@ -92,6 +98,30 @@ QStringList B3FlowMeshToasts::texts() const
         if (const auto* label{frame->findChild<QLabel*>()}) out << label->text();
     }
     return out;
+}
+
+bool B3FlowMeshToasts::event(QEvent* event)
+{
+    const bool handled{QWidget::event(event)};
+    // A notice was added, removed or re-wrapped: resize to fit, in place.
+    if (event->type() == QEvent::LayoutRequest) place();
+    return handled;
+}
+
+bool B3FlowMeshToasts::eventFilter(QObject* watched, QEvent* event)
+{
+    if (watched == parentWidget() && event->type() == QEvent::Resize) place();
+    return QWidget::eventFilter(watched, event);
+}
+
+void B3FlowMeshToasts::place()
+{
+    auto* parent{parentWidget()};
+    if (!parent || m_frames.empty()) return;
+    const int width{std::max(1, std::min(MAX_WIDTH, parent->width() - 2 * MARGIN))};
+    const int height{hasHeightForWidth() ? heightForWidth(width) : sizeHint().height()};
+    setGeometry(MARGIN, MARGIN, width, height);
+    raise();
 }
 
 void B3FlowMeshToasts::prune(const QObject* removed)

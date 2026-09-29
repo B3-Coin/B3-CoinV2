@@ -12,6 +12,7 @@
 #include <deque>
 #include <set>
 
+class QEvent;
 class QFrame;
 class QVBoxLayout;
 
@@ -20,7 +21,11 @@ class QVBoxLayout;
  * Display only: a toast never enables, approves or resends anything. Each
  * key is shown at most once for the widget's lifetime (the key set is
  * FIFO-bounded), at most three toasts are on screen (the oldest goes
- * first), and each disappears after its own interval or when dismissed. */
+ * first), and each disappears after its own interval or when dismissed.
+ *
+ * An overlay: it is never put in a layout, but floats above its parent's
+ * other children, anchored to the parent's top-left corner, so a notice
+ * appearing or expiring never moves any other widget. */
 class B3FlowMeshToasts : public QWidget
 {
     Q_OBJECT
@@ -38,8 +43,15 @@ public:
     //! The texts on screen, oldest first.
     QStringList texts() const;
 
+protected:
+    bool event(QEvent* event) override;
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
 private:
+    static constexpr int MAX_WIDTH{440}, MARGIN{8};
     void prune(const QObject* removed = nullptr);
+    //! Sizes the strip to its notices and anchors it above the parent's content.
+    void place();
     QVBoxLayout* m_layout{nullptr};
     std::deque<QPointer<QFrame>> m_frames;
     std::set<QString> m_keys;

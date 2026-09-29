@@ -127,7 +127,10 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
     auto* scroll{new QScrollArea{this}}; scroll->setWidgetResizable(true);
     auto* content{new QWidget{scroll}}; auto* layout{new QVBoxLayout{content}};
     layout->setContentsMargins(12, 10, 12, 12); layout->setSpacing(8);
-    m_toasts = new B3FlowMeshToasts{content}; layout->addWidget(m_toasts);
+    // Notices float over the top-left of the visible page, away from the
+    // ticket: in no layout, so they never move it, and they stay in view
+    // however far the page is scrolled.
+    m_toasts = new B3FlowMeshToasts{scroll->viewport()};
     auto* connection_row{new QHBoxLayout};
     m_endpoint = new QLineEdit{content}; m_endpoint->setObjectName(QStringLiteral("flowMeshEndpoint"));
     m_endpoint->setMaxLength(2048); m_endpoint->setPlaceholderText(tr("https://trading.example.org"));
