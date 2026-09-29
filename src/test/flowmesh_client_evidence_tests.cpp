@@ -625,14 +625,28 @@ BOOST_AUTO_TEST_CASE(public_notices_never_evict_node_notices)
     auto node{Notice(2, 3, Code::DROPPED_SEQUENCE_CONSUMED)};
     node.origin = Origin::NODE;
     log.AppendNotices({node});
-    // Public traffic fills and turns over its own ring several times.
+    // Public traffic fills and turns over its own ring several times. It
+    // comes from 96 identities (IPv6 /64s) of 64 notices each: more than
+    // the 32 whose shares fill the ring, so the ring itself overflows.
+    const auto flooded = [](const uint32_t n) {
+        uint256 id{Filled(0xee)};
+        std::memcpy(id.begin(), &n, sizeof(n));
+        return id;
+    };
+    uint32_t n{0};
     for (int round{0}; round < 3; ++round) {
         std::vector<flowmesh::ClientActionNotice> flood;
-        for (size_t i{0}; i < flowmesh::CLIENT_NOTICE_CAPACITY; ++i) {
-            flood.push_back(Notice(2, static_cast<unsigned char>(4 + i % 200), Code::DEPOSIT_FACTS_UNAVAILABLE));
+        for (size_t i{0}; i < flowmesh::CLIENT_NOTICE_CAPACITY; ++i, ++n) {
+            flood.push_back(Notice(2, 0, Code::DEPOSIT_FACTS_UNAVAILABLE));
+            flood.back().action_id = flooded(n);
+            flood.back().submitter = strprintf("ipv6/64:%016x", n / flowmesh::CLIENT_NOTICE_PER_SUBMITTER);
         }
         log.AppendNotices(std::move(flood));
     }
+    BOOST_CHECK(!log.NewestNotice(Filled(2), flooded(0)));
+    BOOST_CHECK(!log.NewestNotice(Filled(2), flooded(n - flowmesh::CLIENT_NOTICE_CAPACITY - 1)));
+    BOOST_CHECK(log.NewestNotice(Filled(2), flooded(n - flowmesh::CLIENT_NOTICE_CAPACITY)));
+    BOOST_CHECK(log.NewestNotice(Filled(2), flooded(n - 1)));
     const auto kept{log.NewestNotice(Filled(2), Filled(3))};
     BOOST_REQUIRE(kept);
     BOOST_CHECK(kept->code == Code::DROPPED_SEQUENCE_CONSUMED);
@@ -660,7 +674,7 @@ BOOST_AUTO_TEST_CASE(public_notices_never_evict_node_notices)
     log.Reset(Filled(8));
     BOOST_CHECK(!log.NewestNotice(Filled(2), Filled(9)));
     BOOST_CHECK(!log.NewestNotice(Filled(2), Filled(250)));
-    BOOST_CHECK(!log.NewestNotice(Filled(2), Filled(4)));
+    BOOST_CHECK(!log.NewestNotice(Filled(2), flooded(n - 1)));
 }
 
 BOOST_AUTO_TEST_CASE(identity_shares_apply_only_once_full)

@@ -10189,16 +10189,24 @@ BOOST_AUTO_TEST_CASE(public_submission_notices_never_evict_node_notices)
     BOOST_CHECK(runtime.SubmitLocalActionChecked(f.market, loser, flowmesh::ClientNoticeOrigin::NODE).admission.code ==
                 flowmesh::ActionReasonCode::STALE_SEQUENCE);
     // More than a whole ring of public notices: authenticated attempts far
-    // ahead of the certified sequence, from fresh keys.
+    // ahead of the certified sequence, from 33 public identities (IPv6 /64s)
+    // of 64 each. The 33rd identity's notices overflow the public ring
+    // itself, oldest first; its per-identity shares alone never would.
     CKey flood;
     flood.MakeNewKey(true);
-    for (uint32_t n{0}; n < flowmesh::CLIENT_NOTICE_CAPACITY + 64; ++n) {
-        const auto far{SignedAction(flood, f.domain, config, 1000 + n, flowmesh::ActionType::CANCEL_ASK)};
-        BOOST_REQUIRE(runtime.SubmitLocalActionChecked(f.market, far).admission.code ==
-                      flowmesh::ActionReasonCode::FAR_FUTURE_SEQUENCE);
+    const auto far = [&](const uint32_t n) {
+        return SignedAction(flood, f.domain, config, 1000 + n, flowmesh::ActionType::CANCEL_ASK);
+    };
+    constexpr uint32_t FLOOD{flowmesh::CLIENT_NOTICE_CAPACITY + flowmesh::CLIENT_NOTICE_PER_SUBMITTER};
+    for (uint32_t n{0}; n < FLOOD; ++n) {
+        const auto who{strprintf("ipv6/64:%016x", n / flowmesh::CLIENT_NOTICE_PER_SUBMITTER)};
+        BOOST_REQUIRE(runtime.SubmitLocalActionChecked(f.market, far(n), flowmesh::ClientNoticeOrigin::PUBLIC, who)
+                          .admission.code == flowmesh::ActionReasonCode::FAR_FUTURE_SEQUENCE);
     }
-    BOOST_CHECK(!runtime.NewestClientNotice(
-        f.market, SignedAction(flood, f.domain, config, 1000, flowmesh::ActionType::CANCEL_ASK).Id())); // evicted
+    BOOST_CHECK(!runtime.NewestClientNotice(f.market, far(0).Id())); // evicted
+    BOOST_CHECK(!runtime.NewestClientNotice(f.market, far(FLOOD - flowmesh::CLIENT_NOTICE_CAPACITY - 1).Id()));
+    BOOST_CHECK(runtime.NewestClientNotice(f.market, far(FLOOD - flowmesh::CLIENT_NOTICE_CAPACITY).Id()));
+    BOOST_CHECK(runtime.NewestClientNotice(f.market, far(FLOOD - 1).Id()));
     const auto kept{runtime.NewestClientNotice(f.market, loser.Id())};
     BOOST_REQUIRE(kept);
     BOOST_CHECK(kept->code == flowmesh::ActionReasonCode::STALE_SEQUENCE);
