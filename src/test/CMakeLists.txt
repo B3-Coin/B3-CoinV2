@@ -72,6 +72,7 @@ add_executable(test_bitcoin
   flatfile_tests.cpp
   flowmesh_action_pool_tests.cpp
   flowmesh_action_reason_tests.cpp
+  flowmesh_api_admission_tests.cpp
   flowmesh_asset_metadata_tests.cpp
   public_asset_metadata_tests.cpp
   flowmesh_batch_tests.cpp

@@ -3,6 +3,7 @@
 #include <node/flowmesh_timing.h>
 #include <node/flowmesh_client.h>
 #include <node/flowmesh_action_wait.h>
+#include <node/flowmesh_api_admission.h>
 #include <node/flowmesh_client_action_wait.h>
 #include <node/flowmesh_client_join.h>
 #include <node/flowmesh_client_poll.h>
@@ -340,11 +341,9 @@ class TradingApi {
     // Zero when the bounded 'action' wait is disabled.
     const std::chrono::milliseconds m_wait_max;
     FlowMeshActionWaitSlots m_waits;
-    std::mutex m_rate_mutex;
+    //! Pre-parse trade-write and read budgets (see flowmesh_api_admission.h).
+    FlowMeshApiAdmission m_admission;
     struct Bucket { std::chrono::steady_clock::time_point time{}; unsigned count{0}; };
-    std::map<std::string, Bucket> m_clients;
-    unsigned m_global_count{0};
-    std::chrono::steady_clock::time_point m_global_time{};
     // Public 'health' method; disabled keeps the exact previous contract.
     const bool m_health;
     std::mutex m_health_mutex;
@@ -426,22 +425,6 @@ class TradingApi {
         // It is not part of the certified entry or authenticated account state.
         out.pushKV("chain_reconciling", snapshot.chain_reconciling);
         return out;
-    }
-    bool Admit(const std::string& peer)
-    {
-        // Charged before decoding/authentication and before the operator's
-        // local-action queue. Bounded identities, requests and global rate.
-        std::lock_guard lock(m_rate_mutex);
-        const auto now{std::chrono::steady_clock::now()};
-        if (now - m_global_time >= std::chrono::seconds{1}) { m_global_time = now; m_global_count = 0; }
-        if (++m_global_count > 128) return false;
-        if (!m_clients.contains(peer) && m_clients.size() >= 1024) {
-            std::erase_if(m_clients, [&](const auto& pair) { return now - pair.second.time > std::chrono::minutes{1}; });
-            if (m_clients.size() >= 1024) return false;
-        }
-        auto& bucket{m_clients[peer]};
-        if (now - bucket.time >= std::chrono::seconds{1}) { bucket.time = now; bucket.count = 0; }
-        return ++bucket.count <= 32;
     }
     //! Bounded wait for the exact action's terminal status on this node.
     //! Returns the wait_status label; replaces receipt only after a wait.
@@ -653,7 +636,12 @@ public:
     FlowMeshHttpsServer::Response Handle(const FlowMeshHttpsServer::Request& request)
     {
         try {
-            if (!Admit(request.remote_address)) return {429, "{\"ok\":false,\"error\":\"Public trading request budget exhausted before admission\"}"};
+            // Charged before decoding/authentication and before the operator's
+            // local-action queue: bounded identities, per-class and total rates.
+            if (m_admission.Admit(request.remote_address, ClassifyFlowMeshApiRequest(request.body),
+                                  std::chrono::steady_clock::now()) != FlowMeshApiAdmission::Result::ADMITTED) {
+                return {429, std::string{FLOWMESH_API_BUDGET_EXHAUSTED_BODY}};
+            }
             UniValue parsed;
             if (!parsed.read(request.body)) Fail("Malformed public trading request");
             UniValue out{UniValue::VOBJ};
