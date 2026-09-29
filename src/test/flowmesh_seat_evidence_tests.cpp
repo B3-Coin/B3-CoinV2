@@ -460,6 +460,46 @@ BOOST_AUTO_TEST_CASE(recorder_spends_the_pace_on_a_detection_that_fails_its_chec
     BOOST_CHECK_EQUAL(market.seat_evidence_unrecorded, node::SEAT_EVIDENCE_CHECKS_PER_MINUTE + 1);
 }
 
+BOOST_AUTO_TEST_CASE(recorder_keeps_a_check_each_minute_for_a_certificate_conflict)
+{
+    EvidenceFixture f;
+    RecorderMarket market{f};
+    // Eight different equivocations in one minute: seats 0..3 at two
+    // sequences.
+    const auto equivocation = [&](const uint32_t seat, const uint64_t sequence) {
+        const auto a{f.Context(Filled(0xa1), sequence)};
+        const auto b{f.Context(Filled(0xb2), sequence)};
+        return flowmesh::SeatEvidence{flowmesh::SeatEvidenceKind::ATTESTATION_EQUIVOCATION, f.domain, f.market,
+                                      flowmesh::SeatAttestationStatement(a, seat, f.Sign(seat, a)),
+                                      flowmesh::SeatAttestationStatement(b, seat, f.Sign(seat, b)),
+                                      f.seats.seats.members[seat].key.Key().Compressed()};
+    };
+    for (const uint64_t sequence : {5U, 6U}) {
+        for (uint32_t seat{0}; seat < 4; ++seat) node::RecordSeatEvidence(market, equivocation(seat, sequence), false, false);
+    }
+    // They stop one check short of the minute's eight.
+    const size_t equivocations{node::SEAT_EVIDENCE_CHECKS_PER_MINUTE - node::SEAT_EVIDENCE_CONFLICT_RESERVE};
+    BOOST_CHECK_EQUAL(equivocations, 7U);
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.checks, equivocations);
+    BOOST_CHECK_EQUAL(market.seat_evidence_recorded, equivocations);
+    BOOST_CHECK_EQUAL(market.seat_evidence_unrecorded, 1U);
+    // A certificate conflict in the same minute is still checked and recorded.
+    node::RecordSeatEvidence(market, f.Conflict(), false, false);
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.checks, node::SEAT_EVIDENCE_CHECKS_PER_MINUTE);
+    BOOST_CHECK_EQUAL(market.seat_evidence_recorded, equivocations + 1);
+    BOOST_REQUIRE(market.seat_evidence);
+    BOOST_CHECK(market.seat_evidence->front().kind == flowmesh::SeatEvidenceKind::CERTIFICATE_CONFLICT);
+    // The minute's pace still bounds everything: nothing more is checked.
+    auto another{f.Conflict()};
+    std::swap(another.first, another.second);
+    another.second.microblock_hash = Filled(0xc3);
+    node::RecordSeatEvidence(market, another, false, false);
+    node::RecordSeatEvidence(market, equivocation(0, 7), false, false);
+    BOOST_CHECK_EQUAL(market.seat_evidence_work.checks, node::SEAT_EVIDENCE_CHECKS_PER_MINUTE);
+    BOOST_CHECK_EQUAL(market.seat_evidence_unrecorded, 3U);
+    BOOST_CHECK_EQUAL(market.store_impl.writes, equivocations + 1);
+}
+
 BOOST_AUTO_TEST_CASE(encoding_is_canonical_and_strict)
 {
     EvidenceFixture f;

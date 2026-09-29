@@ -34,6 +34,12 @@ namespace node {
 //! verification, so a detection beyond it costs only its id and is counted
 //! as unrecorded.
 inline constexpr size_t SEAT_EVIDENCE_CHECKS_PER_MINUTE{8};
+//! Of each minute's checks, this many are kept for a CERTIFICATE_CONFLICT;
+//! attestation equivocations stop short of them. A conflict halts its
+//! market, which then drops every later non-GET frame, so it is detected at
+//! most once per market and process: equivocations that spent the minute
+//! first can no longer leave it unrecorded.
+inline constexpr size_t SEAT_EVIDENCE_CONFLICT_RESERVE{1};
 
 template <typename Market>
 void SetSeatEvidence(Market& market, const SeatEvidenceLog& log)
@@ -81,7 +87,10 @@ void RecordSeatEvidence(Market& market, const flowmesh::SeatEvidence& evidence,
         market.seat_evidence_window = now;
         market.seat_evidence_window_checks = 0;
     }
-    if (market.seat_evidence_window_checks >= SEAT_EVIDENCE_CHECKS_PER_MINUTE) {
+    const size_t pace{evidence.kind == flowmesh::SeatEvidenceKind::CERTIFICATE_CONFLICT
+                          ? SEAT_EVIDENCE_CHECKS_PER_MINUTE
+                          : SEAT_EVIDENCE_CHECKS_PER_MINUTE - SEAT_EVIDENCE_CONFLICT_RESERVE};
+    if (market.seat_evidence_window_checks >= pace) {
         ++market.seat_evidence_unrecorded;
         return;
     }

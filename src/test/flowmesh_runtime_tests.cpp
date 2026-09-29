@@ -7433,12 +7433,13 @@ BOOST_AUTO_TEST_CASE(seat_misbehaviour_flood_costs_bounded_verification_work)
     BOOST_CHECK(flowmesh::CheckSeatEvidence(health->markets.front().seat_evidence->front(), f.seats.seats,
                                             f.seats.seats) == flowmesh::SeatEvidenceCheck::OK);
 
-    // More equivocations than the pace allows in one minute.
+    // More equivocations than the pace allows in one minute: they stop one
+    // check short of it, which is kept for a certificate conflict.
     equivocate(0, {0, 1, 3});
     f.Certificate(9, 0);
     open_slot(1);
     equivocate(1, {0, 1, 2, 3});
-    BOOST_CHECK_EQUAL(work().checks, 8U);
+    BOOST_CHECK_EQUAL(work().checks, 7U);
     f.Certificate(9, 1);
     open_slot(2);
     equivocate(2, {0, 1});
@@ -7447,21 +7448,21 @@ BOOST_AUTO_TEST_CASE(seat_misbehaviour_flood_costs_bounded_verification_work)
         const auto& row{health->markets.front()};
         BOOST_CHECK_EQUAL(row.next_sequence, 2U);
         BOOST_CHECK(!row.halted);
-        BOOST_CHECK_EQUAL(row.seat_evidence_recorded, 8U);
-        BOOST_CHECK_EQUAL(row.seat_evidence->size(), 8U);
+        BOOST_CHECK_EQUAL(row.seat_evidence_recorded, 7U);
+        BOOST_CHECK_EQUAL(row.seat_evidence->size(), 7U);
         // Paced out before any check: counted, never verified or written.
-        BOOST_CHECK_EQUAL(row.seat_evidence_unrecorded, 2U);
+        BOOST_CHECK_EQUAL(row.seat_evidence_unrecorded, 3U);
     }
-    BOOST_CHECK_EQUAL(work().checks, 8U);
+    BOOST_CHECK_EQUAL(work().checks, 7U);
     BOOST_CHECK_EQUAL(work().seat_set_checks + work().signature_checks + work().chain_lookups, 0U);
 
     // A new minute checks and records again.
     f.clock.m_now += std::chrono::minutes{1};
     equivocate(2, {2, 3});
     health = f.Health();
-    BOOST_CHECK_EQUAL(health->markets.front().seat_evidence_recorded, 10U);
-    BOOST_CHECK_EQUAL(health->markets.front().seat_evidence_unrecorded, 2U);
-    BOOST_CHECK_EQUAL(work().checks, 10U);
+    BOOST_CHECK_EQUAL(health->markets.front().seat_evidence_recorded, 9U);
+    BOOST_CHECK_EQUAL(health->markets.front().seat_evidence_unrecorded, 3U);
+    BOOST_CHECK_EQUAL(work().checks, 9U);
     BOOST_CHECK_EQUAL(work().seat_set_checks + work().signature_checks + work().chain_lookups, 0U);
     for (const auto& evidence : *health->markets.front().seat_evidence) {
         BOOST_CHECK(flowmesh::CheckSeatEvidence(evidence, f.seats.seats, f.seats.seats) ==
@@ -7478,8 +7479,8 @@ BOOST_AUTO_TEST_CASE(seat_misbehaviour_flood_costs_bounded_verification_work)
     send({flowmesh::WireMessageKind::CERTIFICATE, header(0), *conflict});
     health = f.Health();
     BOOST_CHECK_EQUAL(health->markets.front().halt, "certificate-conflict");
-    BOOST_CHECK_EQUAL(health->markets.front().seat_evidence_recorded, 11U);
-    BOOST_CHECK_EQUAL(work().checks, 11U);
+    BOOST_CHECK_EQUAL(health->markets.front().seat_evidence_recorded, 10U);
+    BOOST_CHECK_EQUAL(work().checks, 10U);
     BOOST_CHECK_EQUAL(work().chain_lookups, 0U);
     BOOST_CHECK_EQUAL(work().seat_set_checks, 1U);
     BOOST_CHECK_EQUAL(work().signature_checks, 1U);

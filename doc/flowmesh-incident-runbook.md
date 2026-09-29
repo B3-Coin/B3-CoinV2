@@ -259,9 +259,11 @@ newest 64 records, deduplicated, and they survive restarts. Per market and
 minute the node checks at most 8 new detections and writes only those that
 verify (one synced write each); it does not verify again a seat set or a
 signature it already verified when the vote or certificate arrived.
-Detections beyond the 8 are not checked at all. They, detections that fail
-the check (each still uses one of the 8) and failed writes only increase
-`unrecorded`; a failed write also logs a warning in `debug.log`.
+Attestation equivocations use at most 7 of the 8; the last is kept for a
+certificate conflict, which halts the market and so is detected at most
+once. Detections beyond the pace are not checked at all. They, detections
+that fail the check (each still uses one of the 8) and failed writes only
+increase `unrecorded`; a failed write also logs a warning in `debug.log`.
 
 When `recorded` increases:
 
