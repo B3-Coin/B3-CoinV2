@@ -575,6 +575,22 @@ BOOST_AUTO_TEST_CASE(notice_wait_terminal_only_when_newer_than_events)
                 flowmesh::ClientWaitResult::TIMEOUT);
 }
 
+BOOST_AUTO_TEST_CASE(newest_notice_if_newer_than_every_event)
+{
+    using Kind = flowmesh::ClientEventKind;
+    flowmesh::ClientEventLog log{Filled(1)};
+    log.AppendNotices({Notice(2, 3, flowmesh::ActionReasonCode::STALE_SEQUENCE)});
+    BOOST_CHECK(log.NewestNoticeIfNewer(Filled(2), Filled(3))); // no event at all
+    log.Append(ActionEvent(2, 3, Kind::QUEUE_ADMITTED));
+    BOOST_CHECK(!log.NewestNoticeIfNewer(Filled(2), Filled(3))); // an exact retry is newer
+    BOOST_CHECK(log.NewestNotice(Filled(2), Filled(3)));
+    log.AppendNotices({Notice(2, 3, flowmesh::ActionReasonCode::DROPPED_SEQUENCE_CONSUMED)});
+    const auto newer{log.NewestNoticeIfNewer(Filled(2), Filled(3))};
+    BOOST_REQUIRE(newer);
+    BOOST_CHECK(newer->code == flowmesh::ActionReasonCode::DROPPED_SEQUENCE_CONSUMED);
+    BOOST_CHECK(!log.NewestNoticeIfNewer(Filled(2), Filled(4)));
+}
+
 BOOST_AUTO_TEST_CASE(notice_ring_bounded_and_reset_with_instance)
 {
     flowmesh::ClientEventLog log{Filled(1)};

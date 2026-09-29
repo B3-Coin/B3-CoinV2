@@ -3230,6 +3230,12 @@ std::optional<flowmesh::ClientActionNotice> FlowMeshRuntime::NewestClientNotice(
     return m_client_events.NewestNotice(market_id, action_id);
 }
 
+std::optional<flowmesh::ClientActionNotice> FlowMeshRuntime::NewestClientNoticeIfNewer(
+    const flowmesh::MarketId& market_id, const uint256& action_id) const
+{
+    return m_client_events.NewestNoticeIfNewer(market_id, action_id);
+}
+
 FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
     const flowmesh::MarketId& market_id, const flowmesh::Action& action)
 {
@@ -3569,6 +3575,7 @@ FlowMeshClientOutcomeParts FlowMeshRuntime::ClientOutcomeParts(
     const auto it{m_markets.find(market_id)};
     if (it == m_markets.end()) return out;
     const auto* item{it->second->recent.Find(sequence)};
+    out.sequence_retained = item != nullptr;
     if (!item || item->hash != hash) return out;
     out.found = true;
     if (want_payload && item->envelope) {

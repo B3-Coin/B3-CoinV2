@@ -450,6 +450,8 @@ public:
 struct FlowMeshClientOutcomeParts {
     //! The exact (sequence, hash) is retained in the recent window.
     bool found{false};
+    //! The sequence is retained, whatever its hash.
+    bool sequence_retained{false};
     std::shared_ptr<const flowmesh::ProductionCertifiedEnvelope> envelope;
     size_t seat_count{0};
     //! The store's own re-execution record, when retained.
@@ -542,6 +544,10 @@ public:
     flowmesh::ClientEventCursor ClientEventCursor() const;
     //! The newest local notice for this exact action, if retained.
     std::optional<flowmesh::ClientActionNotice> NewestClientNotice(
+        const flowmesh::MarketId& market_id, const uint256& action_id) const;
+    //! The newest local notice only while it is newer than every retained
+    //! event of this exact action.
+    std::optional<flowmesh::ClientActionNotice> NewestClientNoticeIfNewer(
         const flowmesh::MarketId& market_id, const uint256& action_id) const;
 
     std::optional<FlowMeshRuntimeMarketStatus> MarketStatus(

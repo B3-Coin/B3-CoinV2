@@ -2182,7 +2182,7 @@ std::optional<flowmesh::ClientEvent> FlowMeshService::ClientActionStatus(
 flowmesh::ClientActionWait FlowMeshService::WaitClientActionStatus(
     const flowmesh::MarketId& market_id, const uint256& action_id,
     const std::chrono::steady_clock::time_point deadline,
-    const std::function<bool()>& interrupted) const
+    const std::function<bool()>& interrupted, const bool include_notices) const
 {
     std::shared_ptr<FlowMeshRuntime> runtime;
     {
@@ -2190,7 +2190,40 @@ flowmesh::ClientActionWait FlowMeshService::WaitClientActionStatus(
         runtime = m_impl->runtime;
     }
     if (!runtime) return {std::nullopt, flowmesh::ClientWaitResult::INTERRUPTED};
-    return runtime->WaitClientActionStatus(market_id, action_id, deadline, interrupted);
+    return runtime->WaitClientActionStatus(market_id, action_id, deadline, interrupted, include_notices);
+}
+
+std::optional<std::pair<uint64_t, uint256>> FlowMeshService::ClientRecentInclusion(
+    const flowmesh::MarketId& market_id, const uint256& action_id) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    return runtime ? runtime->ClientRecentInclusion(market_id, action_id) : std::nullopt;
+}
+
+FlowMeshClientOutcomeParts FlowMeshService::ClientOutcomeParts(
+    const flowmesh::MarketId& market_id, const uint64_t sequence, const uint256& hash, const bool want_payload) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    return runtime ? runtime->ClientOutcomeParts(market_id, sequence, hash, want_payload) : FlowMeshClientOutcomeParts{};
+}
+
+std::optional<flowmesh::ClientActionNotice> FlowMeshService::NewestClientNoticeIfNewer(
+    const flowmesh::MarketId& market_id, const uint256& action_id) const
+{
+    std::shared_ptr<FlowMeshRuntime> runtime;
+    {
+        std::lock_guard lock{m_impl->mutex};
+        runtime = m_impl->runtime;
+    }
+    return runtime ? runtime->NewestClientNoticeIfNewer(market_id, action_id) : std::nullopt;
 }
 
 void FlowMeshService::WakeClientWaiters() const

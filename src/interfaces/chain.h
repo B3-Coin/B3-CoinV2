@@ -299,6 +299,9 @@ struct FlowMeshActionReceipt {
     uint64_t microblock_sequence{0};
     //! Locally derived owner of the retained instruction, never an endpoint row.
     std::optional<uint256> account_id;
+    //! flowmesh::ActionReasonCode name of the observation or outcome this
+    //! receipt reports, or empty. Never evidence by itself.
+    std::string reason_code;
     bool Admitted() const { return state == "queued" || state == "admitted" || state == "certified_inclusion"; }
 };
 

@@ -2977,3 +2977,90 @@ BOOST_AUTO_TEST_CASE(order_budget_refuses_orders_not_cancels_before_authenticati
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_api_outcome_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(api_outcome_contract_advert_and_opt_in_only)
+{
+    node::FlowMeshService service{*m_node.chainman, m_path_root / "api-outcome"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE(service.Market(market));
+    const std::string ids{"{\"market_id\":\"" + market.GetHex() + "\",\"action_id\":\"" +
+                          uint256{uint8_t{2}}.GetHex() + "\""};
+    const std::string evidence_params{"{\"market_id\":\"" + market.GetHex() +
+        "\",\"microblock_sequence\":7,\"microblock_hash\":\"" + uint256{uint8_t{3}}.GetHex() + "\"}"};
+    std::string v1_reply;
+    {
+        // api_outcome_param_and_method_rejected_when_disabled: the factory
+        // default is disabled, exactly the previous contract.
+        auto api{node::MakeFlowMeshTradingApi(service, Options())};
+        BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+        const auto endpoint{Endpoint(api->Port())};
+        const auto [status, reply]{ApiCall(endpoint, "action", ids + "}")};
+        BOOST_REQUIRE_EQUAL(status, 200);
+        v1_reply = reply["result"].write();
+        const auto [param_status, param]{ApiCall(endpoint, "action", ids + ",\"outcome\":true}")};
+        BOOST_CHECK_EQUAL(param_status, 400);
+        BOOST_CHECK_EQUAL(param["error"].get_str(), node::FLOWMESH_CLIENT_UNKNOWN_FIELD_ERROR);
+        const auto [method_status, method]{ApiCall(endpoint, "outcome_evidence", evidence_params)};
+        BOOST_CHECK_EQUAL(method_status, 400);
+        BOOST_CHECK_EQUAL(method["error"].get_str(), "This method is not exposed by the public trading API");
+        // api_outcome_advert_only_when_enabled.
+        const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+        BOOST_REQUIRE_EQUAL(markets_status, 200);
+        BOOST_CHECK(!markets["result"][0].exists("action_outcome_v1"));
+        api->Stop();
+    }
+    {
+        auto api{node::MakeFlowMeshTradingApi(service, Options(), {}, {}, {}, {true})};
+        BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+        const auto endpoint{Endpoint(api->Port())};
+        const auto [markets_status, markets]{ApiCall(endpoint, "markets", "{}")};
+        BOOST_REQUIRE_EQUAL(markets_status, 200);
+        BOOST_CHECK(markets["result"][0]["action_outcome_v1"].get_bool());
+        auto keys{PreviousStatusKeys(markets["result"][0])};
+        keys.insert("action_outcome_v1");
+        BOOST_CHECK(KeySet(markets["result"][0]) == keys);
+        // api_v1_replies_byte_identical_without_opt_in: without "outcome"
+        // (or with false) the reply is the v1 reply, byte for byte.
+        const auto [status, reply]{ApiCall(endpoint, "action", ids + "}")};
+        BOOST_REQUIRE_EQUAL(status, 200);
+        BOOST_CHECK_EQUAL(reply["result"].write(), v1_reply);
+        const auto [false_status, opted_out]{ApiCall(endpoint, "action", ids + ",\"outcome\":false}")};
+        BOOST_REQUIRE_EQUAL(false_status, 200);
+        BOOST_CHECK_EQUAL(opted_out["result"].write(), v1_reply);
+        const auto [bad_status, bad]{ApiCall(endpoint, "action", ids + ",\"outcome\":1}")};
+        BOOST_CHECK_EQUAL(bad_status, 400);
+        BOOST_CHECK_EQUAL(bad["error"].get_str(), "Expected boolean: outcome");
+        // Opted in, an unknown action is still unknown, with no evidence parts.
+        const auto [opt_status, opted]{ApiCall(endpoint, "action", ids + ",\"outcome\":true}")};
+        BOOST_REQUIRE_EQUAL(opt_status, 200);
+        BOOST_CHECK_EQUAL(opted["result"]["receipt_state"].get_str(), "unknown");
+        BOOST_CHECK(!opted["result"].exists("outcome_evidence"));
+        BOOST_CHECK(!opted["result"].exists("outcome_evidence_error"));
+        BOOST_CHECK(!opted["result"].exists("pool_notice"));
+        // The method answers only from memory: nothing retained is EXPIRED.
+        const auto [expired_status, expired]{ApiCall(endpoint, "outcome_evidence", evidence_params)};
+        BOOST_CHECK_EQUAL(expired_status, 400);
+        BOOST_CHECK_EQUAL(expired["error"].get_str(), "FlowMesh outcome evidence is unavailable: EXPIRED");
+        const auto [unknown_status, unknown]{ApiCall(endpoint, "outcome_evidence",
+            "{\"market_id\":\"" + market.GetHex() + "\",\"microblock_sequence\":7}")};
+        BOOST_CHECK_EQUAL(unknown_status, 400);
+        BOOST_CHECK_EQUAL(unknown["error"].get_str(), "Invalid text: microblock_hash");
+        // api_outcome_extra_parts_charge_tokens: the method costs one more
+        // read token; refused, it is the documented budget error.
+        std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+        const auto start{std::chrono::steady_clock::now()};
+        for (int i{0}; i < 27; ++i) ApiCall(endpoint, "markets", "{}");
+        const auto [spent_status, spent]{ApiCall(endpoint, "outcome_evidence", evidence_params)};
+        if (std::chrono::steady_clock::now() - start < std::chrono::milliseconds{900}) {
+            BOOST_CHECK_EQUAL(spent_status, 400);
+            BOOST_CHECK_EQUAL(spent["error"].get_str(), node::FLOWMESH_API_OUTCOME_BUDGET_ERROR);
+        }
+        api->Stop();
+    }
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()

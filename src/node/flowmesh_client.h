@@ -103,15 +103,31 @@ inline constexpr unsigned FLOWMESH_API_HEALTH_PER_CLIENT_PER_SECOND{4};
 inline constexpr std::chrono::milliseconds FLOWMESH_API_HEALTH_CACHE{250};
 inline constexpr const char* FLOWMESH_API_HEALTH_BUDGET_ERROR{"Public health request budget exhausted"};
 
+//! Node-local policy for opt-in, verifiable action outcomes on the restricted
+//! API: the "action_outcome_v1" advert in status objects, the 'action'
+//! parameter "outcome" and the 'outcome_evidence' method. Disabled keeps the
+//! exact previous request and reply contract. Evidence comes only from this
+//! node's in-memory recent window, never from the store.
+struct FlowMeshTradingApiOutcome {
+    bool enabled{false};
+};
+inline constexpr const char* FLOWMESH_API_OUTCOME_BUDGET_ERROR{
+    "Public trading request budget exhausted before outcome evidence"};
+
 //! Restricted HTTPS adapter. It holds no wallet and never invokes the RPC table.
 std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(
     FlowMeshService& service, FlowMeshHttpsServer::Options options,
     FlowMeshAssetMetadataCatalog metadata = {}, FlowMeshTradingApiWait wait = {},
-    FlowMeshTradingApiHealth health = {});
+    FlowMeshTradingApiHealth health = {}, FlowMeshTradingApiOutcome outcome = {});
 
 //! Shared public projection used by the wallet RPC and restricted endpoint.
 UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data);
-UniValue FlowMeshClientReceiptJson(const interfaces::FlowMeshActionReceipt& receipt);
+//! PUBLIC_V1 writes exactly the previous receipt keys (updates, submit, a v1
+//! 'action' reply, the outbox row). PUBLIC_OUTCOME_V1 (an opt-in 'action'
+//! reply) adds reason_code when known; LOCAL_RPC adds it too.
+enum class FlowMeshReceiptJsonScope : uint8_t { PUBLIC_V1, PUBLIC_OUTCOME_V1, LOCAL_RPC };
+UniValue FlowMeshClientReceiptJson(const interfaces::FlowMeshActionReceipt& receipt,
+                                   FlowMeshReceiptJsonScope scope = FlowMeshReceiptJsonScope::PUBLIC_V1);
 UniValue FlowMeshClientStatusJson(const interfaces::FlowMeshClientStatus& status);
 } // namespace node
 #endif

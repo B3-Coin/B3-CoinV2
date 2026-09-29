@@ -139,7 +139,8 @@ UniValue FlowMeshClientMarketDataJson(const flowmesh::MarketData& data)
     out.pushKV("history", std::move(history));
     return out;
 }
-UniValue FlowMeshClientReceiptJson(const interfaces::FlowMeshActionReceipt& receipt)
+UniValue FlowMeshClientReceiptJson(const interfaces::FlowMeshActionReceipt& receipt,
+                                   const FlowMeshReceiptJsonScope scope)
 {
     UniValue out{UniValue::VOBJ};
     out.pushKV("action_id", receipt.action_id.GetHex());
@@ -153,6 +154,9 @@ UniValue FlowMeshClientReceiptJson(const interfaces::FlowMeshActionReceipt& rece
     if (!receipt.microblock_hash.IsNull()) {
         out.pushKV("microblock_hash", receipt.microblock_hash.GetHex());
         out.pushKV("microblock_sequence", receipt.microblock_sequence);
+    }
+    if (scope != FlowMeshReceiptJsonScope::PUBLIC_V1 && !receipt.reason_code.empty()) {
+        out.pushKV("reason_code", receipt.reason_code);
     }
     return out;
 }

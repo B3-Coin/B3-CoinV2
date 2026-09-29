@@ -18,7 +18,9 @@
 #include <crypto/sha256.h>
 #include <dbwrapper.h>
 #include <flowmesh/auth.h>
+#include <flowmesh/action_reason.h>
 #include <flowmesh/client_evidence.h>
+#include <flowmesh/outcome_evidence.h>
 #include <flowmesh/production_wire.h>
 #include <hash.h>
 #include <modern/chain_domain.h>
@@ -131,6 +133,8 @@ Receipt EventReceipt(const flowmesh::ClientEvent& event)
     out.action_id = event.action_id;
     if (!event.account_id.IsNull()) out.account_id = event.account_id;
     out.reason = event.reason;
+    // Memory-only annotation: written only by the opt-in and local scopes.
+    out.reason_code = std::string{flowmesh::ActionReasonName(event.reason_code)};
     switch (event.kind) {
     case flowmesh::ClientEventKind::QUEUE_ADMITTED: out.state = "queued"; break;
     case flowmesh::ClientEventKind::POOL_ADMITTED: out.state = "admitted"; break;
@@ -229,6 +233,7 @@ public:
         case FlowMeshLocalAdmission::Kind::ENQUEUE: break;
         case FlowMeshLocalAdmission::Kind::ALREADY_INCLUDED:
             // Answered from this engine's certified data: never "rejected".
+            out.reason_code = std::string{flowmesh::ActionReasonName(submitted.admission.code)};
             out.state = "certified_inclusion";
             out.microblock_sequence = submitted.admission.included->first;
             out.microblock_hash = submitted.admission.included->second;
@@ -238,10 +243,12 @@ public:
         case FlowMeshLocalAdmission::Kind::REFUSE:
             out.state = "rejected";
             out.reason = FlowMeshLocalAdmissionText(submitted.admission);
+            out.reason_code = std::string{flowmesh::ActionReasonName(submitted.admission.code)};
             return out;
         case FlowMeshLocalAdmission::Kind::UNKNOWN_OUTCOME:
             out.state = "unknown";
             out.reason = FlowMeshLocalAdmissionText(submitted.admission);
+            out.reason_code = std::string{flowmesh::ActionReasonName(submitted.admission.code)};
             return out;
         }
         out.state = "queued";
@@ -346,6 +353,8 @@ class TradingApi {
     struct Bucket { std::chrono::steady_clock::time_point time{}; unsigned count{0}; };
     // Public 'health' method; disabled keeps the exact previous contract.
     const bool m_health;
+    // Opt-in verifiable outcomes; disabled keeps the exact previous contract.
+    const bool m_outcome;
     std::mutex m_health_mutex;
     //! Per PeerKey, at most 1,024 identities; guarded by m_health_mutex.
     std::map<std::string, Bucket> m_health_clients;
@@ -389,6 +398,8 @@ class TradingApi {
         // Latency capability, never evidence: clients send wait_ms only to an
         // endpoint that advertises it, since older servers reject the field.
         if (m_wait_max.count()) out.pushKV("action_wait_ms_max", uint64_t(m_wait_max.count()));
+        // Capability, never evidence: clients send "outcome" only here.
+        if (m_outcome) out.pushKV("action_outcome_v1", true);
         AddReadiness(out, status.market_id, health);
         return out;
     }
@@ -430,7 +441,7 @@ class TradingApi {
     //! Returns the wait_status label; replaces receipt only after a wait.
     std::string WaitForAction(const FlowMeshHttpsServer::Request& http, const uint256& market,
                               const uint256& action_id, const bool tracked, const std::chrono::milliseconds wait,
-                              Receipt& receipt, FlowMeshTimingSpan& timing)
+                              Receipt& receipt, FlowMeshTimingSpan& timing, const bool include_notices = false)
     {
         // Only for an action this node already recorded ('submit' appends its
         // queue event before it replies), so made-up ActionIds cannot hold
@@ -451,20 +462,88 @@ class TradingApi {
         // handler that leaves this wait by an exception.
         if (http.suspend) http.suspend();
         const auto result{m_service.WaitClientActionStatus(market, action_id, until,
-            [&] { return m_waits.Interrupted(*slot); })};
+            [&] { return m_waits.Interrupted(*slot); }, include_notices)};
         if (http.resume) http.resume();
         timing.Mark("wait_completed_us");
         receipt = LocalActionReceipt(result.status, action_id);
         return flowmesh::ClientWaitResultName(result.result);
     }
+    //! Encodes one retained record outside every runtime lock.
+    static std::optional<std::string> EvidenceHex(const ProductionOutcomeRecord& record)
+    {
+        if (record.too_large) return std::nullopt;
+        const auto bytes{flowmesh::EncodeExecutionOutcomeEvidenceV1(record.sequence, record.entry_hash,
+                                                                     record.preimage, record.effects)};
+        return bytes ? std::optional{HexStr(*bytes)} : std::nullopt;
+    }
+    //! The opt-in outcome parts of an 'action' reply. Every part comes from
+    //! the runtime's in-memory window (never the store) and costs one more
+    //! admission token; a refused token degrades to *_error "BUDGET".
+    void AppendOutcomeFields(UniValue& out, const FlowMeshHttpsServer::Request& http, const uint256& market,
+                             const uint256& action_id, const Receipt& receipt)
+    {
+        const auto charge = [&] {
+            return m_admission.ChargeExtra(http.remote_address, FlowMeshApiRequestClass::READ,
+                                           std::chrono::steady_clock::now());
+        };
+        if (receipt.state == "certified_inclusion") {
+            if (!charge()) {
+                out.pushKV("outcome_evidence_error", "BUDGET");
+            } else {
+                const auto parts{m_service.ClientOutcomeParts(market, receipt.microblock_sequence, receipt.microblock_hash, false)};
+                if (!parts.found || !parts.outcome) {
+                    out.pushKV("outcome_evidence_error", "EXPIRED");
+                } else if (const auto hex{EvidenceHex(*parts.outcome)}) {
+                    out.pushKV("outcome_evidence", *hex);
+                } else {
+                    out.pushKV("outcome_evidence_error", "TOO_LARGE");
+                }
+            }
+        }
+        const auto notice{m_service.NewestClientNoticeIfNewer(market, action_id)};
+        if (!notice) return;
+        UniValue pool{UniValue::VOBJ};
+        pool.pushKV("reason_code", std::string{flowmesh::ActionReasonName(notice->code)});
+        pool.pushKV("account_sequence", notice->account_sequence);
+        pool.pushKV("next_account_sequence", notice->next_account_sequence);
+        if (notice->consumed_by) {
+            UniValue consumer{UniValue::VOBJ};
+            consumer.pushKV("action_id", notice->consumed_by->action_id.GetHex());
+            consumer.pushKV("microblock_sequence", notice->consumed_by->microblock_sequence);
+            consumer.pushKV("microblock_hash", notice->consumed_by->microblock_hash.GetHex());
+            pool.pushKV("consumed_by", std::move(consumer));
+        }
+        out.pushKV("pool_notice", std::move(pool));
+        if (!notice->consumed_by) return;
+        // The consumer's certified entry and its outcome evidence, so a client
+        // can prove this action never executes.
+        if (!charge()) {
+            out.pushKV("consumer_evidence_error", "BUDGET");
+            return;
+        }
+        const auto parts{m_service.ClientOutcomeParts(market, notice->consumed_by->microblock_sequence,
+                                                      notice->consumed_by->microblock_hash, true)};
+        if (!parts.found || !parts.envelope || !parts.outcome) {
+            out.pushKV("consumer_evidence_error", "EXPIRED");
+            return;
+        }
+        const auto payload{flowmesh::EncodeProductionCertifiedPayload(*parts.envelope, parts.seat_count)};
+        const auto evidence{EvidenceHex(*parts.outcome)};
+        if (!payload || !evidence) {
+            out.pushKV("consumer_evidence_error", "TOO_LARGE");
+            return;
+        }
+        out.pushKV("consumer_certified_payload", HexStr(*payload));
+        out.pushKV("consumer_outcome_evidence", *evidence);
+    }
 public:
     explicit TradingApi(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait,
-                        const FlowMeshTradingApiHealth health)
+                        const FlowMeshTradingApiHealth health, const FlowMeshTradingApiOutcome outcome)
         : m_service(service), m_local(service, std::move(metadata)),
           m_wait_max{wait.waiters == 0 ? std::chrono::milliseconds{0}
                                        : std::clamp(wait.max, std::chrono::milliseconds{0}, FLOWMESH_API_ACTION_WAIT_MAX)},
           m_waits{m_wait_max.count() ? std::min(wait.waiters, FLOWMESH_API_ACTION_WAITERS_MAX) : 0},
-          m_health{health.enabled} {}
+          m_health{health.enabled}, m_outcome{outcome.enabled} {}
     size_t WaitSlots() const { return m_waits.Capacity(); }
     //! Server stop hook: refuse new waits and end every current one.
     void Interrupt()
@@ -569,12 +648,16 @@ public:
         }
         if (method == "action") {
             // Disabled, the contract is exactly the previous one, in which
-            // wait_ms is an unknown field.
-            if (m_wait_max.count() == 0) Keys(params, {"market_id", "action_id"});
-            else Keys(params, {"market_id", "action_id", "wait_ms"});
+            // wait_ms and outcome are unknown fields.
+            if (m_wait_max.count() == 0 && !m_outcome) Keys(params, {"market_id", "action_id"});
+            else if (!m_outcome) Keys(params, {"market_id", "action_id", "wait_ms"});
+            else if (m_wait_max.count() == 0) Keys(params, {"market_id", "action_id", "outcome"});
+            else Keys(params, {"market_id", "action_id", "wait_ms", "outcome"});
             const auto id{Id(params, "market_id")};
             const auto action_id{Id(params, "action_id")};
             const bool wait_requested{params.exists("wait_ms")};
+            // "outcome": false is exactly the v1 request.
+            const bool outcome{params.exists("outcome") && Flag(params, "outcome")};
             // Any unsigned integer is clamped to the advertised maximum.
             const std::chrono::milliseconds wait{wait_requested
                 ? std::min<uint64_t>(Number(params, "wait_ms", std::numeric_limits<uint64_t>::max()), m_wait_max.count())
@@ -582,11 +665,29 @@ public:
             // Same receipt as the local backend's ActionStatus(id, action, false).
             const auto status{m_service.ClientActionStatus(id, action_id)};
             auto receipt{LocalActionReceipt(status, action_id)};
+            // Opt-in only: an executed action whose inclusion event left the
+            // ring is still answered from the in-memory certified window.
+            const auto recent_inclusion = [&] {
+                if (!outcome || receipt.state == "certified_inclusion") return;
+                if (const auto included{m_service.ClientRecentInclusion(id, action_id)}) {
+                    receipt = LocalActionReceipt(std::nullopt, action_id);
+                    receipt.state = "certified_inclusion";
+                    receipt.microblock_sequence = included->first;
+                    receipt.microblock_hash = included->second;
+                    receipt.certificate_verified = true;
+                    receipt.reason = "certified inclusion retained by this endpoint; execution outcome established only by outcome evidence";
+                }
+            };
+            recent_inclusion();
             std::string wait_status{"none"};
             if (wait.count() > 0 && receipt.state != "certified_inclusion") {
-                wait_status = WaitForAction(http, id, action_id, status.has_value(), wait, receipt, timing);
+                // An opt-in wait also ends on a newer refusal or drop notice.
+                const bool tracked{status.has_value() || (outcome && m_service.NewestClientNoticeIfNewer(id, action_id))};
+                wait_status = WaitForAction(http, id, action_id, tracked, wait, receipt, timing, outcome);
+                recent_inclusion();
             }
-            UniValue out{FlowMeshClientReceiptJson(receipt)};
+            UniValue out{FlowMeshClientReceiptJson(receipt, outcome ? FlowMeshReceiptJsonScope::PUBLIC_OUTCOME_V1
+                                                                    : FlowMeshReceiptJsonScope::PUBLIC_V1)};
             if (receipt.state == "certified_inclusion") {
                 // Never built from the event: this waits for the commit's
                 // market lock and reads the durable certified entry.
@@ -594,11 +695,34 @@ public:
                 if (const auto payload{m_service.ClientCertifiedEntry(id, receipt.microblock_sequence, error)}) out.pushKV("certified_payload", HexStr(*payload));
                 else out.pushKV("evidence_error", error);
             }
+            if (outcome) AppendOutcomeFields(out, http, id, action_id, receipt);
             if (wait_requested) {
                 // A latency hint only, never evidence; absent unless requested.
                 out.pushKV("wait_status", wait_status);
                 timing.Field("wait_status", wait_status);
             }
+            return out;
+        }
+        if (method == "outcome_evidence" && m_outcome) {
+            // Memory only: the runtime's retained re-execution record, never
+            // a payload and never a store read. One extra admission token.
+            Keys(params, {"market_id", "microblock_sequence", "microblock_hash"});
+            const auto id{Id(params, "market_id")};
+            const auto sequence{Number(params, "microblock_sequence")};
+            const auto hash{Id(params, "microblock_hash")};
+            if (!m_admission.ChargeExtra(http.remote_address, FlowMeshApiRequestClass::READ, std::chrono::steady_clock::now())) {
+                Fail(FLOWMESH_API_OUTCOME_BUDGET_ERROR);
+            }
+            const auto parts{m_service.ClientOutcomeParts(id, sequence, hash, false)};
+            if (!parts.found) {
+                Fail(std::string{"FlowMesh outcome evidence is unavailable: "} +
+                     (parts.sequence_retained ? "HASH_MISMATCH" : "EXPIRED"));
+            }
+            if (!parts.outcome) Fail("FlowMesh outcome evidence is unavailable: EXPIRED");
+            const auto hex{EvidenceHex(*parts.outcome)};
+            if (!hex) Fail("FlowMesh outcome evidence is unavailable: TOO_LARGE");
+            UniValue out{UniValue::VOBJ};
+            out.pushKV("outcome_evidence", *hex);
             return out;
         }
         if (method == "checkpoint") {
@@ -2201,10 +2325,10 @@ std::unique_ptr<FlowMeshTradingBackend> MakeRemoteFlowMeshBackend(
 }
 std::unique_ptr<FlowMeshHttpsServer> MakeFlowMeshTradingApi(FlowMeshService& service, FlowMeshHttpsServer::Options options,
                                                         FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait,
-                                                        const FlowMeshTradingApiHealth health)
+                                                        const FlowMeshTradingApiHealth health, const FlowMeshTradingApiOutcome outcome)
 {
     options.max_reply_bytes = CLIENT_MAX_REPLY;
-    auto api{std::make_shared<TradingApi>(service, std::move(metadata), wait, health)};
+    auto api{std::make_shared<TradingApi>(service, std::move(metadata), wait, health, outcome)};
     // Handshake, read, handler and write concurrency stays at the two workers
     // the API always had. Each wait slot adds a worker that only sleeps in a
     // suspended wait. Disabled waits leave exactly two workers and permits.

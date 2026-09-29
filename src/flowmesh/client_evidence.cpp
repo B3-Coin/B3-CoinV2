@@ -235,6 +235,19 @@ std::optional<ClientActionNotice> ClientEventLog::NewestNotice(const MarketId& m
     return NewestNoticeLocked(market, action_id);
 }
 
+std::optional<ClientActionNotice> ClientEventLog::NewestNoticeIfNewer(const MarketId& market,
+                                                                     const uint256& action_id) const
+{
+    std::lock_guard lock{m_mutex};
+    auto notice{NewestNoticeLocked(market, action_id)};
+    if (!notice) return notice;
+    uint64_t newest_id{0};
+    if (ActionStatusLocked(market, action_id, nullptr, &newest_id) && notice->after_event_id < newest_id) {
+        return std::nullopt;
+    }
+    return notice;
+}
+
 std::optional<ClientActionNotice> ClientEventLog::NewestNoticeLocked(const MarketId& market,
                                                                      const uint256& action_id) const
 {

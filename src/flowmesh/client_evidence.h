@@ -203,6 +203,9 @@ public:
      * CLIENT_NOTICE_CAPACITY; never touches the v1 events. */
     void AppendNotices(std::vector<ClientActionNotice> notices);
     std::optional<ClientActionNotice> NewestNotice(const MarketId& market, const uint256& action_id) const;
+    //! The newest notice only while it is newer than every retained event of
+    //! the action (or the action has none), under one lock.
+    std::optional<ClientActionNotice> NewestNoticeIfNewer(const MarketId& market, const uint256& action_id) const;
 
 private:
     // Caller holds m_mutex. False only at the fail-closed event-id limit.

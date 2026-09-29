@@ -215,8 +215,16 @@ public:
     flowmesh::ClientActionWait WaitClientActionStatus(
         const flowmesh::MarketId& market_id, const uint256& action_id,
         std::chrono::steady_clock::time_point deadline,
-        const std::function<bool()>& interrupted) const;
+        const std::function<bool()>& interrupted, bool include_notices = false) const;
     void WakeClientWaiters() const;
+    //! Memory-only reads of the runtime's recent certified window and local
+    //! notices (see FlowMeshRuntime); empty without a runtime.
+    std::optional<std::pair<uint64_t, uint256>> ClientRecentInclusion(
+        const flowmesh::MarketId& market_id, const uint256& action_id) const;
+    FlowMeshClientOutcomeParts ClientOutcomeParts(
+        const flowmesh::MarketId& market_id, uint64_t sequence, const uint256& hash, bool want_payload) const;
+    std::optional<flowmesh::ClientActionNotice> NewestClientNoticeIfNewer(
+        const flowmesh::MarketId& market_id, const uint256& action_id) const;
 
     /** Bool fallback: true only when the action was queued or is already
      * included in a certified microblock; `error` explains anything else. */
