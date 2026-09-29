@@ -205,6 +205,10 @@ enum class QueueResult : uint8_t {
 struct QueuedWireMessage {
     WirePeerId peer{0};
     WireMessage message;
+    //! This node's own bookkeeping, never framed or relayed: whoever queued
+    //! the frame counted it (FlowMeshRuntime: towards a public submitter),
+    //! so the worker settles exactly the frames marked.
+    bool counted{false};
 };
 
 /**
@@ -219,8 +223,10 @@ struct QueuedWireMessage {
 class BoundedWireQueue
 {
 public:
+    //! `counted` is carried to Pop unchanged (QueuedWireMessage::counted)
+    //! and plays no part in admission.
     QueueResult Push(WirePeerId peer, WireMessage message,
-                     WireClock::time_point now = WireClock::now());
+                     WireClock::time_point now = WireClock::now(), bool counted = false);
     //! Admission of a frame the caller has proven its worker would only
     //! drop. Nothing is queued and no committee token is spent: the framing
     //! verdict is Push's, then one settled-frame token of (peer, market) and

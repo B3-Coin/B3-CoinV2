@@ -10,6 +10,7 @@
 #include <flowmesh/outcome_evidence.h>
 #include <hash.h>
 #include <logging.h>
+#include <node/flowmesh_action_pool.h>
 #include <test/util/flowmesh.h>
 #include <test/util/setup_common.h>
 
@@ -29,6 +30,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -366,6 +368,7 @@ public:
         const COutPoint& outpoint,
         const flowmesh::AnchorRef& anchor) const override
     {
+        if (on_get) on_get();
         if (anchor != required_anchor && (!additional_anchor || anchor != *additional_anchor)) return std::nullopt;
         const auto it{entries.find(outpoint)};
         return it == entries.end()
@@ -392,6 +395,9 @@ public:
     flowmesh::AnchorRef required_anchor;
     std::optional<flowmesh::AnchorRef> additional_anchor;
     std::map<COutPoint, flowmesh::DepositInfo> entries;
+    //! Run first by every GetDeposit call, on the calling thread. Set and
+    //! reset only while no runtime is working.
+    std::function<void()> on_get;
 };
 
 flowmesh::Action Deposit(const COutPoint& outpoint)
@@ -10169,6 +10175,54 @@ BOOST_AUTO_TEST_CASE(public_submitters_are_remembered_only_while_the_action_is_l
     BOOST_REQUIRE(dropped->consumed_by);
     BOOST_CHECK(dropped->consumed_by->action_id == consumer.Id());
     BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(only_a_counted_frame_settles_its_public_submitter)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "notice_submitter_counted"};
+    f.block_commits = false;
+    f.Reach(1);
+    f.Drain();
+    f.block_commits = true;
+    auto& runtime{*f.runtimes[0]};
+    const std::string client{"198.51.100.7"};
+    const auto deposit{Deposit(f.outpoint)};
+    // The client's public deposit counts its frame, then checks its anchored
+    // facts on the submitting thread before queueing the frame: hold it there.
+    std::promise<void> entered, release;
+    const auto released{release.get_future().share()};
+    std::atomic<bool> armed{true};
+    f.deposits.on_get = [&] {
+        if (!armed.exchange(false)) return;
+        entered.set_value();
+        released.wait();
+    };
+    node::FlowMeshLocalSubmitResult submitted;
+    std::thread submitter{[&] {
+        submitted = runtime.SubmitLocalActionChecked(f.market, deposit, flowmesh::ClientNoticeOrigin::PUBLIC, client);
+    }};
+    entered.get_future().wait();
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 1U);
+    // Meanwhile a local frame of the same action that nobody counted, as this
+    // node's own would be, is handled and refused: its header is not current
+    // authority, so the pool does not take it.
+    const flowmesh::WireHeader stale{flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch + 1, 1};
+    BOOST_REQUIRE(runtime.EnqueueWireMessage(node::FLOWMESH_LOCAL_ACTION_PEER, {flowmesh::WireMessageKind::ACTION, stale,
+        *flowmesh::EncodeProductionActionPayload(deposit)}) == flowmesh::QueueResult::ACCEPTED);
+    f.Drain();
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
+    // It settled nothing: the client's counted frame is still to come.
+    BOOST_CHECK_EQUAL(runtime.PublicSubmitterForTest(f.market, deposit.Id()).value_or("(none)"), client);
+    release.set_value();
+    submitter.join();
+    f.Drain();
+    f.deposits.on_get = nullptr;
+    BOOST_REQUIRE(submitted.queued && *submitted.queued == flowmesh::QueueResult::ACCEPTED);
+    // The counted frame pooled the deposit and settled itself; the pool
+    // holds the action, so its attribution stays.
+    BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 1U);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmitterForTest(f.market, deposit.Id()).value_or("(none)"), client);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 1U);
 }
 
 BOOST_AUTO_TEST_CASE(public_submission_notices_never_evict_node_notices)

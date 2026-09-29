@@ -279,8 +279,10 @@ struct FlowMeshRuntime::Market {
     std::map<uint64_t, uint256> public_submission_ids;
     flowmesh::IdentityShares public_submitters{PUBLIC_SUBMITTER_ACTIONS, flowmesh::CLIENT_NOTICE_PER_SUBMITTER};
     /** A PUBLIC frame of `id` from `submitter` is about to be queued. True
-     * when it was counted: the caller then settles it with PublicFrameDone
-     * if the queue refuses it; the worker settles every frame it takes. */
+     * when it was counted: the caller then queues it marked counted
+     * (QueuedWireMessage::counted) and settles it with PublicFrameDone if
+     * the queue refuses it; the worker settles every counted frame it takes,
+     * and only those. */
     bool NotePublicFrame(const uint256& id, const std::string& submitter)
     {
         auto it{public_submissions.find(id)};
@@ -313,7 +315,7 @@ struct FlowMeshRuntime::Market {
         if (it->second.frames < std::numeric_limits<uint32_t>::max()) ++it->second.frames;
         return true;
     }
-    //! One local frame of `id` left the queue: handled by the worker, or
+    //! One counted frame of `id` left the queue: handled by the worker, or
     //! refused by the queue.
     void PublicFrameDone(const uint256& id)
     {
@@ -2358,6 +2360,17 @@ size_t FlowMeshRuntime::PublicSubmittersForTest(const flowmesh::MarketId& market
     return it == m_markets.end() ? 0 : it->second->public_submissions.size();
 }
 
+std::optional<std::string> FlowMeshRuntime::PublicSubmitterForTest(const flowmesh::MarketId& market_id, const uint256& action_id) const
+{
+    std::lock_guard<std::mutex> lock{m_market_mutex};
+    const auto it{m_markets.find(market_id)};
+    if (it == m_markets.end()) return std::nullopt;
+    const auto entry{it->second->public_submissions.find(action_id)};
+    if (entry == it->second->public_submissions.end()) return std::nullopt;
+    const auto* identity{it->second->public_submitters.Identity(entry->second.serial)};
+    return identity ? std::optional<std::string>{*identity} : std::nullopt;
+}
+
 FlowMeshSeatEvidenceWork FlowMeshRuntime::SeatEvidenceWorkForTest() const
 {
     std::lock_guard<std::mutex> lock{m_market_mutex};
@@ -3044,6 +3057,12 @@ void FlowMeshRuntime::Stop()
 flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     const flowmesh::WirePeerId peer, flowmesh::WireMessage message)
 {
+    return Enqueue(peer, std::move(message), /*counted=*/false);
+}
+
+flowmesh::QueueResult FlowMeshRuntime::Enqueue(
+    const flowmesh::WirePeerId peer, flowmesh::WireMessage message, const bool counted)
+{
     WorkerTrace trace{*m_config.clock, "wire_enqueue"};
     trace.Wire(message, peer);
     if (message.kind == flowmesh::WireMessageKind::AGREEMENT &&
@@ -3226,7 +3245,7 @@ flowmesh::QueueResult FlowMeshRuntime::EnqueueWireMessage(
     }
     if (trace.enabled) trace.enqueue_started_us = TraceNow(*m_config.clock);
     const auto result{m_queue.Push(peer, std::move(message),
-                                   m_config.clock->Now())};
+                                   m_config.clock->Now(), counted)};
     if (trace.enabled) {
         trace.enqueued_us = TraceNow(*m_config.clock);
         trace.result = result;
@@ -3538,7 +3557,7 @@ FlowMeshLocalSubmitResult FlowMeshRuntime::SubmitLocalActionChecked(
     trace.wire_hash = WireTrace(message).wire_hash;
     const uint64_t sequence{message.header.sequence};
     out.cursor_before = m_client_events.Cursor();
-    const auto result{EnqueueWireMessage(LOCAL_ACTION_PEER, std::move(message))};
+    const auto result{Enqueue(LOCAL_ACTION_PEER, std::move(message), counted)};
     out.queued = result;
     trace.observed_monotonic_us = TraceNow(*m_config.clock);
     // Preserve submission's original lock scope. This is the observed push
@@ -4224,9 +4243,11 @@ void FlowMeshRuntime::ProcessMessage(
     const auto it{m_markets.find(queued.message.header.market_id)};
     if (it == m_markets.end()) return;
     Market& market{*it->second};
-    // A local action frame leaves the queue here however it is answered,
-    // including by every early return below. Its public submitter is
-    // settled on the way out, after any notice about it was tagged.
+    // A counted local action frame leaves the queue here however it is
+    // answered, including by every early return below. Its public submitter
+    // is settled on the way out, after any notice about it was tagged. Only
+    // a counted frame settles: one counted for nobody (this node's own, or a
+    // public one without an identity) never ends another frame's count.
     struct LocalFrameSettle {
         Market& market;
         std::optional<uint256> id;
@@ -4235,7 +4256,7 @@ void FlowMeshRuntime::ProcessMessage(
             if (id) market.PublicFrameDone(*id);
         }
     } settle{market, std::nullopt};
-    if (queued.peer == LOCAL_ACTION_PEER && queued.message.kind == flowmesh::WireMessageKind::ACTION &&
+    if (queued.counted && queued.peer == LOCAL_ACTION_PEER && queued.message.kind == flowmesh::WireMessageKind::ACTION &&
         !market.public_submissions.empty()) {
         if (const auto action{flowmesh::DecodeProductionActionPayload(queued.message.payload)}) settle.id = action->Id();
     }

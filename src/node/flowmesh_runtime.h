@@ -668,6 +668,9 @@ public:
     FlowMeshSeatEvidenceWork SeatEvidenceWorkForTest() const;
     /** Test-only: public actions whose submitter the market remembers. */
     size_t PublicSubmittersForTest(const flowmesh::MarketId& market_id) const;
+    /** Test-only: the identity the market remembers as `action_id`'s public
+     * submitter, if any. */
+    std::optional<std::string> PublicSubmitterForTest(const flowmesh::MarketId& market_id, const uint256& action_id) const;
 
 private:
     struct Market;
@@ -684,6 +687,8 @@ private:
     bool InitializeMarket(const FlowMeshRuntimeMarketConfig& config,
                           std::string& error);
     void WorkerLoop();
+    //! EnqueueWireMessage, with the frame marked counted (QueuedWireMessage).
+    flowmesh::QueueResult Enqueue(flowmesh::WirePeerId peer, flowmesh::WireMessage message, bool counted);
     void ProcessMessage(const flowmesh::QueuedWireMessage& queued, uint64_t dequeued_us);
     void ProcessTick(uint64_t requested_us, uint64_t dequeued_us);
     struct PendingDelivery;

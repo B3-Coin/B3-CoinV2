@@ -240,6 +240,31 @@ BOOST_AUTO_TEST_CASE(priority_lanes_protect_certificates_and_enforce_rate_limits
                 QueueResult::ACCEPTED);
 }
 
+// The counted mark is the enqueuer's own bookkeeping: carried to Pop as
+// given, and never a reason to admit or refuse a frame.
+BOOST_AUTO_TEST_CASE(counted_mark_is_carried_unchanged_and_admits_nothing)
+{
+    using namespace flowmesh;
+    const auto now{WireClock::time_point{std::chrono::seconds{100}}};
+    BoundedWireQueue queue;
+    for (const bool counted : {true, false, true}) {
+        BOOST_REQUIRE(queue.Push(1, Message(WireMessageKind::ACTION), now, counted) == QueueResult::ACCEPTED);
+    }
+    BOOST_REQUIRE(queue.Push(1, Message(WireMessageKind::ACTION), now) == QueueResult::ACCEPTED);
+    for (const bool counted : {true, false, true, false}) {
+        const auto item{queue.Pop()};
+        BOOST_REQUIRE(item);
+        BOOST_CHECK_EQUAL(item->counted, counted);
+    }
+    BOOST_CHECK(queue.Empty());
+    BoundedWireQueue limited;
+    for (size_t i{0}; i < 256; ++i) {
+        BOOST_REQUIRE(limited.Push(2, Message(WireMessageKind::ACTION), now, i % 2 == 0) == QueueResult::ACCEPTED);
+    }
+    BOOST_CHECK(limited.Push(2, Message(WireMessageKind::ACTION), now, true) == QueueResult::RATE_LIMITED);
+    BOOST_CHECK(limited.Push(2, Message(WireMessageKind::ACTION), now) == QueueResult::RATE_LIMITED);
+}
+
 // Frames the runtime proves its worker would only drop take no committee
 // token or queue slot, but a separate, generous per-(peer, market) budget
 // still bounds them, after the unchanged framing verdict.
