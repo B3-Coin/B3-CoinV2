@@ -6,6 +6,8 @@
 #include <flowmesh/market.h>
 #include <util/strencodings.h>
 #include <util/int128.h>
+#include <QObject>
+#include <QStringList>
 #include <algorithm>
 #include <map>
 #include <set>
@@ -155,6 +157,163 @@ std::vector<Curve> Curves(const UniValue& v, size_t limit) {
     }
     return out;
 }
+TickPage Ticks(const UniValue& v, const Snapshot& s)
+{
+    TickPage page;
+    try {
+        page.available = Flag(F(v, "available"));
+        const auto source{Text(F(v, "source"))};
+        if (source != QStringLiteral("local_engine") && source != QStringLiteral("endpoint_reported")) Fail("Unknown tick source.");
+        page.remote = source == QStringLiteral("endpoint_reported");
+        if (!page.available) {
+            page.reason = Text(F(v, "unavailable_reason")).left(160);
+            return page;
+        }
+        page.gap = Flag(F(v, "gap")); page.more = Flag(F(v, "more"));
+        const auto& rows{F(v, "ticks")};
+        if (!rows.isArray() || rows.size() > MAX_HELD_TICKS) Fail("Oversized tick page.");
+        for (const auto& row : rows.getValues()) {
+            Tick t; t.sequence = Count(F(row, "sequence")); t.hash = Id(F(row, "microblock_hash"));
+            t.kind = Text(F(row, "kind")); t.side = Text(F(row, "imbalance_side")); t.cleared = Flag(F(row, "cleared"));
+            t.price = Amount(F(row, "price")); t.volume = Amount(F(row, "volume")); t.imbalance = Amount(F(row, "imbalance"));
+            if (t.kind != QStringLiteral("execution") && t.kind != QStringLiteral("settlement") && t.kind != QStringLiteral("handoff")) Fail("Unknown tick kind.");
+            if (t.side != QStringLiteral("none") && t.side != QStringLiteral("bid") && t.side != QStringLiteral("ask") && t.side != QStringLiteral("unknown")) Fail("Unknown tick side.");
+            if (t.cleared ? t.kind != QStringLiteral("execution") || t.volume == 0 : t.price != 0 || t.volume != 0 || t.imbalance != 0 || t.side != QStringLiteral("none")) Fail("Inconsistent tick.");
+            if (t.sequence >= s.next_sequence || (!page.ticks.empty() && t.sequence != page.ticks.back().sequence + 1)) Fail("Ticks are not consecutive within the snapshot.");
+            page.ticks.push_back(std::move(t));
+        }
+    } catch (const std::exception&) {
+        page = {};
+        page.reason = QStringLiteral("malformed");
+    }
+    return page;
+}
+Indicative IndicativeOf(const UniValue& v, const Snapshot& s)
+{
+    Indicative out;
+    try {
+        if (Flag(F(v, "certified"))) Fail("An indicative clearing is never certified.");
+        out.available = Flag(F(v, "available"));
+        out.head = Id(F(v, "head"), true);
+        const auto& draft{F(v, "draft")};
+        if (!draft.isNull()) {
+            out.has_draft = true; out.draft_side = Text(F(draft, "side"));
+            if (out.draft_side != QStringLiteral("bid") && out.draft_side != QStringLiteral("ask")) Fail("Unknown draft side.");
+            out.draft_price = Amount(F(draft, "price")); out.draft_quantity = Amount(F(draft, "quantity"));
+            out.replaces = Flag(F(draft, "replaces_standing_curve"));
+        }
+        if (!out.available) {
+            out.reason = Text(F(v, "unavailable_reason")).left(160);
+            return out;
+        }
+        // A view of another head than this snapshot's is not shown.
+        if (out.head != s.head) Fail("Indicative clearing of another head.");
+        out.cleared = Flag(F(v, "cleared")); out.price = Amount(F(v, "price")); out.volume = Amount(F(v, "volume"));
+        out.imbalance = Amount(F(v, "imbalance")); out.side = Text(F(v, "imbalance_side"));
+        if (out.side != QStringLiteral("none") && out.side != QStringLiteral("bid") && out.side != QStringLiteral("ask")) Fail("Unknown indicative side.");
+        if (!out.cleared && (out.price != 0 || out.volume != 0)) Fail("Inconsistent indicative clearing.");
+        for (const auto& [key, field] : {std::pair{"best_bid", &out.best_bid}, std::pair{"best_ask", &out.best_ask},
+                                         std::pair{"draft_fill_min", &out.fill_min}, std::pair{"draft_fill_max", &out.fill_max}}) {
+            if (!F(v, key).isNull()) *field = Amount(F(v, key));
+        }
+        if (out.fill_min.has_value() != out.fill_max.has_value() || (out.fill_min && (!out.has_draft || *out.fill_min > *out.fill_max ||
+            *out.fill_max > out.volume || *out.fill_max > out.draft_quantity))) Fail("Inconsistent indicative fill.");
+    } catch (const std::exception&) {
+        const bool draft{out.has_draft};
+        const auto side{out.draft_side};
+        const auto price{out.draft_price}, quantity{out.draft_quantity};
+        out = {};
+        out.reason = QStringLiteral("malformed");
+        out.has_draft = draft; out.draft_side = side; out.draft_price = price; out.draft_quantity = quantity;
+    }
+    return out;
+}
+}
+
+bool MergeHeldTicks(std::deque<Tick>& held, const TickPage& page)
+{
+    if (!page.available) return false;
+    bool kept{!page.gap};
+    for (const auto& tick : page.ticks) {
+        if (!held.empty() && tick.sequence <= held.back().sequence && tick.sequence >= held.front().sequence) {
+            if (held[tick.sequence - held.front().sequence] == tick) continue;
+            held.clear();
+            kept = false;
+        } else if (!held.empty() && tick.sequence != held.back().sequence + 1) {
+            held.clear();
+            kept = false;
+        }
+        held.push_back(tick);
+        if (held.size() > MAX_HELD_TICKS) held.pop_front();
+    }
+    return kept;
+}
+
+std::vector<Trade> TicksAsTrades(const std::deque<Tick>& held)
+{
+    std::vector<Trade> out;
+    for (const auto& tick : held) {
+        Trade t; t.sequence = tick.sequence; t.hash = tick.hash; t.cleared = tick.cleared;
+        t.price = tick.price; t.quantity = tick.volume;
+        // Exact, as the engine's matched notional; an overflow is no candle.
+        if (tick.cleared && (tick.volume == 0 || tick.price > MAX_MONEY / tick.volume)) continue;
+        t.notional = tick.price * tick.volume;
+        out.push_back(t);
+    }
+    return out;
+}
+
+QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported)
+{
+    QString text;
+    if (tick.kind == QStringLiteral("handoff")) text = QObject::tr("Microblock #%1 · validator handoff, no auction").arg(tick.sequence);
+    else if (tick.kind == QStringLiteral("settlement")) text = QObject::tr("Microblock #%1 · withdrawal settlement, no auction").arg(tick.sequence);
+    else if (!tick.cleared) text = QObject::tr("Auction #%1 · no match").arg(tick.sequence);
+    else if (!ValidUnits(units)) text = QObject::tr("Auction #%1 · matched (asset precision unavailable)").arg(tick.sequence);
+    else {
+        const QString price_units{inverse ? QObject::tr("%1 / B3").arg(units.ticker) : QObject::tr("B3 / %1").arg(units.ticker)};
+        text = QObject::tr("Auction #%1 · %2 %3 at %4 %5").arg(tick.sequence).arg(FormatAmount(tick.volume, units.decimals), units.ticker,
+                                                               inverse && tick.price == 0 ? QObject::tr("zero") : FormatDisplayPrice(tick.price, units.decimals, inverse), price_units);
+        // In the B3 view a canonical bid (buying the token) sells B3.
+        const bool bid{tick.side == QStringLiteral("bid")};
+        if (tick.side == QStringLiteral("unknown")) text += QObject::tr(" · unfilled side not observed");
+        else if (tick.side != QStringLiteral("none")) {
+            const QString who{inverse ? (bid ? QObject::tr("B3 sellers") : QObject::tr("B3 buyers")) : (bid ? QObject::tr("buyers") : QObject::tr("sellers"))};
+            text += QObject::tr(" · %1 left %2 %3 unfilled").arg(who, FormatAmount(tick.imbalance, units.decimals), units.ticker);
+        }
+    }
+    if (endpoint_reported) text += QObject::tr(" · endpoint-reported");
+    return text;
+}
+
+QString IndicativeText(const Indicative& view, const Units& units, bool inverse)
+{
+    if (!view.available) return view.reason.isEmpty() ? QString{} : QObject::tr("Indicative price unavailable (%1)").arg(view.reason);
+    if (!ValidUnits(units)) return {};
+    const auto price = [&](CAmount raw) {
+        return inverse && raw == 0 ? QObject::tr("zero") : FormatDisplayPrice(raw, units.decimals, inverse);
+    };
+    const QString price_units{inverse ? QObject::tr("%1 / B3").arg(units.ticker) : QObject::tr("B3 / %1").arg(units.ticker)};
+    // In the B3 view the best bid (buying the token) is the lowest B3 price.
+    QStringList touch;
+    const auto& high{inverse ? view.best_ask : view.best_bid};
+    const auto& low{inverse ? view.best_bid : view.best_ask};
+    if (high) touch << QObject::tr("best bid %1").arg(price(*high));
+    if (low) touch << QObject::tr("best ask %1").arg(price(*low));
+    const QString book{touch.isEmpty() ? QString{} : QStringLiteral(" · ") + touch.join(QStringLiteral(" · "))};
+    const QString label{QObject::tr("Indicative, not certified")};
+    if (!view.has_draft) {
+        if (!view.cleared) return label + QObject::tr(": no cross") + book;
+        return label + QObject::tr(": standing orders would clear at %1 %2 for %3 %4").arg(price(view.price), price_units, FormatAmount(view.volume, units.decimals), units.ticker);
+    }
+    if (!view.cleared || !view.fill_max || *view.fill_max == 0) {
+        return label + QObject::tr(": this order would not match now") + book + QObject::tr(" · other pending orders excluded");
+    }
+    const QString fill{*view.fill_min == *view.fill_max ? FormatAmount(*view.fill_max, units.decimals)
+                                                        : QObject::tr("%1 to %2").arg(FormatAmount(*view.fill_min, units.decimals), FormatAmount(*view.fill_max, units.decimals))};
+    return label + QObject::tr(": would clear at %1 %2, filling %3 of %4 %5 if submitted now (other pending orders excluded%6)")
+        .arg(price(view.price), price_units, fill, FormatAmount(view.draft_quantity, units.decimals), units.ticker,
+             view.replaces ? QObject::tr("; replaces your standing order on this side") : QString{});
 }
 
 QString FormatAmount(CAmount raw, int decimals)
@@ -575,6 +734,10 @@ Snapshot Parse(const UniValue& value)
     s.units.quantity_step = Amount(F(value, "quantity_lot_raw")); s.units.price_step = Amount(F(value, "price_tick_raw"));
     if (s.units.quantity_step != 1 || s.units.price_step != 1) Fail("Unsupported v1 market unit grid.");
     if (s.active_seats > 1'000'000 || s.quorum_required > s.active_seats) Fail("Invalid configured validator threshold.");
+    // Optional display sections, read before the unchanged return and each
+    // failing closed on its own.
+    if (!F(value, "clearing_ticks").isNull()) s.ticks = Ticks(F(value, "clearing_ticks"), s);
+    if (!F(value, "indicative").isNull()) s.indicative = IndicativeOf(F(value, "indicative"), s);
     if (s.unchanged) return s;
     const auto& liquidity{F(value, "liquidity")}; s.curves_complete = Flag(F(liquidity, "complete")); s.curves = Curves(F(liquidity, "curves"), 128); s.depth = Aggregate(s.curves);
     if (s.curves_complete && Count(F(liquidity, "total_curves")) != s.curves.size()) Fail("Complete liquidity count does not match its curves.");

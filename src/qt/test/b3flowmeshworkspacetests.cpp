@@ -96,6 +96,41 @@ UniValue RemoteData(bool trade = true)
     proof.pushKV("b3_checkpoint_confirmed", false); proof.pushKV("event_gap", false); v.pushKV("verification", proof); return v;
 }
 
+UniValue TickJson(uint64_t sequence, const uint256& hash, bool cleared, const char* side = "none", const char* kind = "execution")
+{
+    UniValue t{UniValue::VOBJ}; t.pushKV("sequence", sequence); t.pushKV("microblock_hash", hash.GetHex()); t.pushKV("kind", kind);
+    t.pushKV("cleared", cleared); t.pushKV("price", cleared ? 1000 : 0); t.pushKV("volume", cleared ? 250'000 : 0);
+    t.pushKV("imbalance", cleared && std::string{side} != "none" ? 50'000 : 0); t.pushKV("imbalance_side", side);
+    return t;
+}
+UniValue TickPageJson(const std::vector<UniValue>& ticks, bool remote = true)
+{
+    UniValue page{UniValue::VOBJ}; page.pushKV("available", true); page.pushKV("source", remote ? "endpoint_reported" : "local_engine");
+    page.pushKV("gap", false); page.pushKV("more", false); UniValue rows{UniValue::VARR}; for (const auto& t : ticks) rows.push_back(t);
+    page.pushKV("ticks", rows); return page;
+}
+//! A what-if for the offline ticket (buy 1 tUSD at 1 B3), on Data()'s head.
+UniValue IndicativeJson(bool draft = true, const uint256& head = H(4))
+{
+    UniValue v{UniValue::VOBJ}; v.pushKV("available", true); v.pushKV("certified", false); v.pushKV("excludes_pending_actions", true);
+    v.pushKV("basis", draft ? "verified_standing_curves_with_draft" : "verified_standing_curves"); v.pushKV("head", head.GetHex());
+    if (draft) {
+        UniValue d{UniValue::VOBJ}; d.pushKV("side", "bid"); d.pushKV("price", 1000); d.pushKV("quantity", 1'000'000);
+        d.pushKV("account_known", true); d.pushKV("replaces_standing_curve", true); d.pushKV("assumes_admission", true); v.pushKV("draft", d);
+    }
+    v.pushKV("cleared", draft); v.pushKV("price", draft ? 1000 : 0); v.pushKV("volume", draft ? 250'000 : 0); v.pushKV("imbalance", draft ? 750'000 : 0);
+    v.pushKV("imbalance_side", draft ? "bid" : "none"); v.pushKV("best_bid", 1000); v.pushKV("best_ask", 1001);
+    if (draft) { v.pushKV("draft_fill_min", 187'500); v.pushKV("draft_fill_max", 187'500); }
+    return v;
+}
+UniValue RemoteDataWithViews()
+{
+    auto v{RemoteData()};
+    v.pushKV("clearing_ticks", TickPageJson({TickJson(1, H(12), false), TickJson(2, H(4), true, "bid")}));
+    v.pushKV("indicative", IndicativeJson());
+    return v;
+}
+
 Curve LimitCurve(const char* side, unsigned char owner, CAmount price, CAmount quantity, CAmount filled = 0)
 {
     Curve curve;
@@ -1690,6 +1725,101 @@ private Q_SLOTS:
         const auto full{Data()}; UniValue small{UniValue::VOBJ};
         for (const auto* key : {"market_id", "base_asset_id", "domain", "execution_config_id", "quote_asset", "matching_model", "quantity_lot_raw", "price_tick_raw", "snapshot"}) small.pushKV(key, full[key]);
         small.pushKV("unchanged", true); const auto s{Parse(small)}; QVERIFY(s.unchanged); QVERIFY(!s.units.known); QVERIFY(s.history.empty());
+    }
+    void marketViewSectionsParseAndFailClosedPerSection()
+    {
+        auto v{RemoteDataWithViews()};
+        const auto s{Parse(v)};
+        QVERIFY(s.ticks && s.ticks->available && s.ticks->remote);
+        QCOMPARE(s.ticks->ticks.size(), size_t{2});
+        const auto& tick{s.ticks->ticks[1]};
+        QCOMPARE(tick.sequence, uint64_t{2}); QCOMPARE(tick.hash, s.head); QVERIFY(tick.cleared);
+        QCOMPARE(tick.price, CAmount{1000}); QCOMPARE(tick.volume, CAmount{250'000}); QCOMPARE(tick.imbalance, CAmount{50'000}); QCOMPARE(tick.side, QStringLiteral("bid"));
+        QVERIFY(s.indicative && s.indicative->available && s.indicative->cleared && s.indicative->has_draft && s.indicative->replaces);
+        QCOMPARE(s.indicative->draft_side, QStringLiteral("bid")); QCOMPARE(s.indicative->draft_quantity, CAmount{1'000'000});
+        QCOMPARE(*s.indicative->fill_max, CAmount{187'500}); QCOMPARE(*s.indicative->best_ask, CAmount{1001});
+        QCOMPARE(s.history.size(), size_t{1});
+        // A malformed section is unavailable; the rest of the reply is not.
+        const auto broken = [&](const char* key, const UniValue& section) {
+            auto bad{RemoteDataWithViews()}; bad.pushKV(key, section); return Parse(bad);
+        };
+        for (const auto& ticks : {TickPageJson({TickJson(3, H(4), true)}), TickPageJson({TickJson(1, H(12), false), TickJson(3, H(4), false)}),
+                                  TickPageJson({TickJson(2, H(4), false, "bid")}), TickPageJson({TickJson(2, H(4), true, "none", "handoff")})}) {
+            const auto parsed{broken("clearing_ticks", ticks)};
+            QVERIFY(parsed.ticks && !parsed.ticks->available && parsed.ticks->ticks.empty());
+            QCOMPARE(parsed.ticks->reason, QStringLiteral("malformed"));
+            QCOMPARE(parsed.history.size(), size_t{1}); QVERIFY(parsed.indicative->available);
+        }
+        auto certified{IndicativeJson()}; certified.pushKV("certified", true);
+        for (const auto& indicative : {IndicativeJson(true, H(9)), certified}) {
+            const auto parsed{broken("indicative", indicative)};
+            QVERIFY(parsed.indicative && !parsed.indicative->available);
+            QCOMPARE(parsed.indicative->reason, QStringLiteral("malformed"));
+            QVERIFY(parsed.ticks->available);
+        }
+        // An unchanged reply carries both sections.
+        UniValue small{UniValue::VOBJ};
+        for (const auto* key : {"market_id", "base_asset_id", "domain", "execution_config_id", "quote_asset", "matching_model", "quantity_lot_raw", "price_tick_raw", "snapshot", "clearing_ticks", "indicative"}) small.pushKV(key, v[key]);
+        small.pushKV("unchanged", true);
+        const auto light{Parse(small)};
+        QVERIFY(light.unchanged && light.ticks && light.ticks->available && light.indicative && light.indicative->available);
+        // A node's own unavailability is kept as its reason.
+        UniValue off{UniValue::VOBJ}; off.pushKV("available", false); off.pushKV("unavailable_reason", "endpoint_does_not_advertise_clearing_ticks");
+        off.pushKV("source", "endpoint_reported"); off.pushKV("gap", false); off.pushKV("more", false); off.pushKV("ticks", UniValue{UniValue::VARR});
+        QCOMPARE(broken("clearing_ticks", off).ticks->reason, QStringLiteral("endpoint_does_not_advertise_clearing_ticks"));
+    }
+    void heldTicksExtendOnlyConsecutiveAgreeingPages()
+    {
+        const auto tick = [](uint64_t sequence, bool cleared = false) {
+            Tick t; t.sequence = sequence; t.hash = QString::number(sequence); t.kind = QStringLiteral("execution"); t.side = QStringLiteral("none");
+            t.cleared = cleared; if (cleared) { t.price = 10; t.volume = 1; } return t;
+        };
+        const auto page = [](std::vector<Tick> ticks, bool gap = false) { TickPage p; p.available = true; p.gap = gap; p.ticks = std::move(ticks); return p; };
+        const auto sequences = [](const std::deque<Tick>& held) { std::vector<uint64_t> out; for (const auto& t : held) out.push_back(t.sequence); return out; };
+        std::deque<Tick> held;
+        QVERIFY(MergeHeldTicks(held, page({tick(1), tick(2)})));
+        QVERIFY(MergeHeldTicks(held, page({tick(3, true)})));
+        QVERIFY(MergeHeldTicks(held, page({tick(2), tick(3, true), tick(4)})));
+        QCOMPARE(sequences(held), (std::vector<uint64_t>{1, 2, 3, 4}));
+        QVERIFY(!MergeHeldTicks(held, TickPage{}));
+        QCOMPARE(held.size(), size_t{4});
+        // A tick that disagrees with one held, or a skip, starts again.
+        QVERIFY(!MergeHeldTicks(held, page({tick(4, true), tick(5)})));
+        QCOMPARE(sequences(held), (std::vector<uint64_t>{4, 5}));
+        QVERIFY(!MergeHeldTicks(held, page({tick(9)}, true)));
+        QCOMPARE(sequences(held), (std::vector<uint64_t>{9}));
+        for (uint64_t next{10}; next < 10 + 2 * MAX_HELD_TICKS; ++next) MergeHeldTicks(held, page({tick(next)}));
+        QCOMPARE(held.size(), MAX_HELD_TICKS);
+        QCOMPARE(held.back().sequence, uint64_t{9 + 2 * MAX_HELD_TICKS});
+        // The chart reads cleared ticks as clearings with their exact notional.
+        std::deque<Tick> two{tick(1), tick(2, true)};
+        const auto trades{TicksAsTrades(two)};
+        QCOMPARE(trades.size(), size_t{2}); QVERIFY(!trades[0].cleared); QCOMPARE(trades[1].notional, CAmount{10});
+        QCOMPARE(B3FlowMeshChart::AggregateCandles(trades, 1).size(), size_t{1});
+    }
+    void clearingStripAndIndicativeTextAreLabelledAndOriented()
+    {
+        const auto s{Parse(RemoteDataWithViews())};
+        const auto& tick{s.ticks->ticks[1]};
+        QCOMPARE(ClearingTickText(tick, s.units, false, true), QStringLiteral("Auction #2 · 0.25 tUSD at 1 B3 / tUSD · buyers left 0.05 tUSD unfilled · endpoint-reported"));
+        const auto inverse{ClearingTickText(tick, s.units, true, false)};
+        QVERIFY(inverse.contains(QStringLiteral("tUSD / B3"))); QVERIFY(inverse.contains(QStringLiteral("B3 sellers left 0.05 tUSD unfilled")));
+        QVERIFY(!inverse.contains(QStringLiteral("endpoint-reported")));
+        QCOMPARE(ClearingTickText(s.ticks->ticks[0], s.units, false, false), QStringLiteral("Auction #1 · no match"));
+        auto other{tick}; other.kind = QStringLiteral("handoff"); other.cleared = false;
+        QVERIFY(ClearingTickText(other, s.units, false, false).contains(QStringLiteral("validator handoff, no auction")));
+        other = tick; other.side = QStringLiteral("unknown");
+        QVERIFY(ClearingTickText(other, s.units, false, false).contains(QStringLiteral("unfilled side not observed")));
+        const auto what_if{IndicativeText(*s.indicative, s.units, false)};
+        QVERIFY(what_if.startsWith(QStringLiteral("Indicative, not certified")));
+        QVERIFY(what_if.contains(QStringLiteral("would clear at 1 B3 / tUSD, filling 0.1875 of 1 tUSD")));
+        QVERIFY(what_if.contains(QStringLiteral("other pending orders excluded"))); QVERIFY(what_if.contains(QStringLiteral("replaces your standing order")));
+        auto standing{Parse([] { auto v{RemoteData()}; v.pushKV("indicative", IndicativeJson(false)); return v; }())};
+        QCOMPARE(IndicativeText(*standing.indicative, standing.units, false), QStringLiteral("Indicative, not certified: no cross · best bid 1 · best ask 1.001"));
+        auto bounds{*s.indicative}; bounds.fill_max = 187'501;
+        QVERIFY(IndicativeText(bounds, s.units, false).contains(QStringLiteral("filling 0.1875 to 0.187501 of 1 tUSD")));
+        Indicative unavailable; unavailable.reason = QStringLiteral("work_budget");
+        QCOMPARE(IndicativeText(unavailable, s.units, false), QStringLiteral("Indicative price unavailable (work_budget)"));
     }
     void catalogSurvivesUncertifiedFirstMarket()
     {

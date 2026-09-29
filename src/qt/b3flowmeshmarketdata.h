@@ -8,6 +8,7 @@
 #include <univalue.h>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <vector>
 
@@ -62,6 +63,36 @@ struct Trade {
     CAmount price{0}, quantity{0}, notional{0}, fee{0}, own_buy{0}, own_sell{0};
     bool operator==(const Trade&) const = default;
 };
+//! One certified microblock as an auction tick (getflowmeshmarketdata
+//! "clearing_ticks"): kind execution, settlement or handoff; side of the
+//! unfilled interest bid, ask, none or unknown. Sequence only, no time.
+struct Tick {
+    uint64_t sequence{0};
+    QString hash, kind, side;
+    bool cleared{false};
+    CAmount price{0}, volume{0}, imbalance{0};
+    bool operator==(const Tick&) const = default;
+};
+//! A reply's tick page. A malformed section is only unavailable ("malformed");
+//! it never fails the read or is shown as data.
+struct TickPage {
+    bool available{false}, remote{false}, gap{false}, more{false};
+    QString reason;
+    std::vector<Tick> ticks;
+    bool operator==(const TickPage&) const = default;
+};
+//! The node's indicative next clearing ("indicative"): never certified.
+struct Indicative {
+    bool available{false}, cleared{false};
+    QString reason, head, side;
+    CAmount price{0}, volume{0}, imbalance{0};
+    std::optional<CAmount> best_bid, best_ask, fill_min, fill_max;
+    //! The draft it was computed for: canonical side, price and quantity.
+    bool has_draft{false}, replaces{false};
+    QString draft_side;
+    CAmount draft_price{0}, draft_quantity{0};
+    bool operator==(const Indicative&) const = default;
+};
 struct Snapshot {
     QString market, base, domain, config, head, state_root, account, halt, error;
     Units units;
@@ -77,8 +108,25 @@ struct Snapshot {
     std::vector<Curve> curves, own_curves;
     std::vector<Trade> history;
     std::vector<Depth> depth;
+    //! Optional display sections, also on unchanged replies.
+    std::optional<TickPage> ticks;
+    std::optional<Indicative> indicative;
     bool operator==(const Snapshot&) const = default;
 };
+//! Ticks the panel holds for one market: consecutive, oldest first, at most
+//! MAX_HELD_TICKS. An available page extends them; a page that skips ticks or
+//! disagrees with one already held replaces them. Returns false when the held
+//! ticks were replaced (or the page was unavailable).
+inline constexpr size_t MAX_HELD_TICKS{256};
+bool MergeHeldTicks(std::deque<Tick>& held, const TickPage& page);
+//! The held ticks as the chart's trades: cleared ticks with their exact
+//! notional (price x volume; fees are not part of a tick), others as clearings
+//! without a match.
+std::vector<Trade> TicksAsTrades(const std::deque<Tick>& held);
+//! "Auction #N · …" for the latest tick, in the display orientation.
+QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported);
+//! The indicative line for the ticket; empty when there is nothing to say.
+QString IndicativeText(const Indicative& view, const Units& units, bool inverse);
 //! A price-grouped projection of exact limit-shaped curves, not FIFO orders.
 //! Raw fields always retain canonical units: base raw quantity and B3 atoms.
 //! Inverse amount is gross B3 at this limit, not a promised execution amount.
