@@ -108,12 +108,39 @@ enum class SeatEvidenceCheck : uint8_t {
 };
 const char* SeatEvidenceCheckName(SeatEvidenceCheck check);
 
+/** Expensive steps of CheckSeatEvidence that its caller has already completed
+ * itself, with an OK result, for these exact inputs, so the check need not
+ * repeat them. Set a flag only for work this node did; the default repeats
+ * everything. The cheap checks (shape, the conflict, each set's market, epoch
+ * and hash, and the seat key) always run. */
+struct SeatEvidencePrechecked {
+    //! The supplied set passed CheckActiveFnBlsSeatSet under the record's domain.
+    bool first_seats{false};
+    bool second_seats{false};
+    //! The statement's signature verified over Context(statement) under the
+    //! set the statement names.
+    bool first_signature{false};
+    bool second_signature{false};
+};
+
+//! Expensive steps one CheckSeatEvidence call started.
+struct SeatEvidenceWork {
+    //! Seat-set validations, including the one inside each certificate check.
+    uint64_t seat_set_checks{0};
+    //! BLS verifications: one seat's signature or one aggregate certificate.
+    uint64_t signature_checks{0};
+};
+
 /** Check `evidence` against the seat set of each statement. The caller
  * supplies those sets from its own B3 chain, never from the record; each must
- * be the complete valid set for (market, epoch, seat_set_hash) it names. */
+ * be the complete valid set for (market, epoch, seat_set_hash) it names.
+ * `prechecked` skips only the steps it names; `work`, when given, counts the
+ * expensive steps this call started. */
 SeatEvidenceCheck CheckSeatEvidence(const SeatEvidence& evidence,
                                     const ActiveFnBlsSeatSet& first_seats,
-                                    const ActiveFnBlsSeatSet& second_seats);
+                                    const ActiveFnBlsSeatSet& second_seats,
+                                    const SeatEvidencePrechecked& prechecked = {},
+                                    SeatEvidenceWork* work = nullptr);
 
 //! A seat's attestation as one statement.
 SeatEvidenceStatement SeatAttestationStatement(const BlsCertificateContext& context, uint32_t seat_index,

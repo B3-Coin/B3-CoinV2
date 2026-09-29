@@ -7344,6 +7344,147 @@ BOOST_AUTO_TEST_CASE(seat_misbehaviour_evidence_is_recorded_restored_and_changes
     BOOST_CHECK(row.seat_evidence->back() == recorded);
 }
 
+BOOST_AUTO_TEST_CASE(seat_misbehaviour_flood_costs_bounded_verification_work)
+{
+    HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_seat_evidence_flood"};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(f.runtime->Start(error), error);
+    // Each frame from its own connection: the flood is bounded here by the
+    // recorder, not by any sender's committee-frame budget.
+    flowmesh::WirePeerId next_peer{100};
+    const auto send = [&](flowmesh::WireMessage message) { f.Send(next_peer++, std::move(message)); };
+    const auto header = [&](const uint64_t sequence) {
+        return flowmesh::WireHeader{flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, sequence};
+    };
+    const auto proposal = [&](const flowmesh::ProductionEntryCore& entry, const uint32_t round) {
+        flowmesh::ProductionProposalEnvelope envelope;
+        envelope.entry = entry;
+        envelope.round = round;
+        envelope.proposer_seat_index = flowmesh::ProductionProposerSeatIndex(entry.sequence, round, f.seats.seats.Size());
+        const auto digest{flowmesh::ProductionProposalDigest(entry, round)};
+        envelope.proposer_signature = f.seats.secrets[envelope.proposer_seat_index]
+            .Sign(std::span<const unsigned char>{digest.begin(), 32}).Compressed();
+        return flowmesh::WireMessage{flowmesh::WireMessageKind::PROPOSAL, header(entry.sequence),
+                                     *flowmesh::EncodeProductionProposalPayload(envelope)};
+    };
+    const auto vote = [&](const flowmesh::ProductionEntryCore& entry, const uint32_t seat) {
+        const auto signature{flowmesh::SignBlsMicroblockCertificate(
+            f.seats.secrets[seat], flowmesh::ProductionCertificateContext(entry), f.seats.seats)};
+        BOOST_REQUIRE(signature);
+        return flowmesh::WireMessage{flowmesh::WireMessageKind::ATTESTATION, header(entry.sequence),
+                                     *flowmesh::EncodeProductionAttestationPayload({seat, *signature})};
+    };
+    // Beside each certified entry, a valid second candidate at its sequence
+    // that differs only in its anchor.
+    std::vector<flowmesh::ProductionEntryCore> others;
+    {
+        flowmesh::ProductionEpochGate gate{f.domain, f.market, f.seats.seats};
+        flowmesh::ProductionEntryCheck check;
+        std::optional<flowmesh::FlowMeshState> state{f.initial};
+        uint256 parent;
+        std::optional<flowmesh::AnchorRef> previous;
+        for (uint64_t sequence{0}; sequence < f.entries.size(); ++sequence) {
+            const auto other{flowmesh::BuildProductionExecutionEntry(
+                *state, f.domain, f.market, f.seats.seats, gate, sequence, 0, parent, f.chain.m_current,
+                {f.chain.TipHeight(), previous, &f.chain}, f.treasury, {}, nullptr, check)};
+            BOOST_REQUIRE_MESSAGE(other, flowmesh::ProductionEntryCheckName(check));
+            BOOST_REQUIRE(other->entry.GetHash() != f.entries[sequence].GetHash());
+            others.push_back(other->entry);
+            const auto same{flowmesh::BuildProductionExecutionEntry(
+                *state, f.domain, f.market, f.seats.seats, gate, sequence, 0, parent, {100, Filled(0x71)},
+                {f.chain.TipHeight(), previous, &f.chain}, f.treasury, {}, nullptr, check)};
+            BOOST_REQUIRE(same && same->entry.GetHash() == f.entries[sequence].GetHash());
+            state = same->next_state;
+            parent = same->entry.GetHash();
+            previous = same->entry.anchor;
+        }
+    }
+    // Two candidates at the slot, two seats' votes on each: no quorum, and
+    // then `seats` sign the other candidate as well (each one detection).
+    const auto equivocate = [&](const uint64_t sequence, const std::vector<uint32_t>& seats) {
+        for (const uint32_t seat : seats) {
+            send(vote(seat < 2 ? others[sequence] : f.entries[sequence], seat));
+        }
+    };
+    const auto open_slot = [&](const uint64_t sequence) {
+        send(proposal(f.entries[sequence], 0));
+        send(proposal(others[sequence], 1));
+        for (const uint32_t seat : {0U, 1U}) send(vote(f.entries[sequence], seat));
+        for (const uint32_t seat : {2U, 3U}) send(vote(others[sequence], seat));
+    };
+    const auto work = [&] { return f.runtime->SeatEvidenceWorkForTest(); };
+
+    // One seat's equivocation, then a flood of duplicates and repeats of it.
+    open_slot(0);
+    equivocate(0, {2});
+    for (int i{0}; i < 32; ++i) {
+        send(vote(f.entries[0], 2));
+        send(vote(others[0], 2));
+    }
+    auto health{f.Health()};
+    BOOST_CHECK_EQUAL(health->markets.front().seat_evidence_recorded, 1U);
+    BOOST_CHECK_EQUAL(health->markets.front().seat_evidence_unrecorded, 0U);
+    // Checked once, without verifying again the seat set or the two
+    // signatures this node verified when it received the votes.
+    BOOST_CHECK_EQUAL(work().checks, 1U);
+    BOOST_CHECK_EQUAL(work().chain_lookups, 0U);
+    BOOST_CHECK_EQUAL(work().seat_set_checks, 0U);
+    BOOST_CHECK_EQUAL(work().signature_checks, 0U);
+    BOOST_CHECK(flowmesh::CheckSeatEvidence(health->markets.front().seat_evidence->front(), f.seats.seats,
+                                            f.seats.seats) == flowmesh::SeatEvidenceCheck::OK);
+
+    // More equivocations than the pace allows in one minute.
+    equivocate(0, {0, 1, 3});
+    f.Certificate(9, 0);
+    open_slot(1);
+    equivocate(1, {0, 1, 2, 3});
+    BOOST_CHECK_EQUAL(work().checks, 8U);
+    f.Certificate(9, 1);
+    open_slot(2);
+    equivocate(2, {0, 1});
+    health = f.Health();
+    {
+        const auto& row{health->markets.front()};
+        BOOST_CHECK_EQUAL(row.next_sequence, 2U);
+        BOOST_CHECK(!row.halted);
+        BOOST_CHECK_EQUAL(row.seat_evidence_recorded, 8U);
+        BOOST_CHECK_EQUAL(row.seat_evidence->size(), 8U);
+        // Paced out before any check: counted, never verified or written.
+        BOOST_CHECK_EQUAL(row.seat_evidence_unrecorded, 2U);
+    }
+    BOOST_CHECK_EQUAL(work().checks, 8U);
+    BOOST_CHECK_EQUAL(work().seat_set_checks + work().signature_checks + work().chain_lookups, 0U);
+
+    // A new minute checks and records again.
+    f.clock.m_now += std::chrono::minutes{1};
+    equivocate(2, {2, 3});
+    health = f.Health();
+    BOOST_CHECK_EQUAL(health->markets.front().seat_evidence_recorded, 10U);
+    BOOST_CHECK_EQUAL(health->markets.front().seat_evidence_unrecorded, 2U);
+    BOOST_CHECK_EQUAL(work().checks, 10U);
+    BOOST_CHECK_EQUAL(work().seat_set_checks + work().signature_checks + work().chain_lookups, 0U);
+    for (const auto& evidence : *health->markets.front().seat_evidence) {
+        BOOST_CHECK(flowmesh::CheckSeatEvidence(evidence, f.seats.seats, f.seats.seats) ==
+                    flowmesh::SeatEvidenceCheck::OK);
+    }
+
+    // A certificate conflict re-verifies only the certificate read from the
+    // store; the received one verified just before the halt.
+    auto conflicting{f.entries[0]};
+    conflicting.state_root = Filled(0x99);
+    const auto conflict{flowmesh::EncodeProductionCertifiedPayload(
+        {conflicting, Certify(conflicting, f.seats)}, f.seats.seats.Size())};
+    BOOST_REQUIRE(conflict);
+    send({flowmesh::WireMessageKind::CERTIFICATE, header(0), *conflict});
+    health = f.Health();
+    BOOST_CHECK_EQUAL(health->markets.front().halt, "certificate-conflict");
+    BOOST_CHECK_EQUAL(health->markets.front().seat_evidence_recorded, 11U);
+    BOOST_CHECK_EQUAL(work().checks, 11U);
+    BOOST_CHECK_EQUAL(work().chain_lookups, 0U);
+    BOOST_CHECK_EQUAL(work().seat_set_checks, 1U);
+    BOOST_CHECK_EQUAL(work().signature_checks, 1U);
+}
+
 BOOST_AUTO_TEST_CASE(preagreement_runtime_commit_gate_genesis_deposit_and_exact_restart)
 {
     PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "preagreement_runtime_commit"};

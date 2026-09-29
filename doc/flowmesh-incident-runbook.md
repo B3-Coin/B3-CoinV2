@@ -255,10 +255,13 @@ byte order, the reverse of their hex display. A record is kept only after
 this node has checked it against its own chain.
 
 Retention: the market's store (`<flowmesh datadir>/<market_id>`) keeps the
-newest 64 records, deduplicated, and they survive restarts. It writes at
-most 8 records per market per minute. Detections beyond that, detections
-this node cannot verify and failed writes only increase `unrecorded`; a
-failed write also logs a warning in `debug.log`.
+newest 64 records, deduplicated, and they survive restarts. Per market and
+minute the node checks at most 8 new detections and writes only those that
+verify (one synced write each); it does not verify again a seat set or a
+signature it already verified when the vote or certificate arrived.
+Detections beyond the 8 are not checked at all. They, detections that fail
+the check (each still uses one of the 8) and failed writes only increase
+`unrecorded`; a failed write also logs a warning in `debug.log`.
 
 When `recorded` increases:
 

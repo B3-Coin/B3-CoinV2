@@ -77,22 +77,31 @@ BlsMicroblockCertificate Certificate(const SeatEvidenceStatement& statement)
     return out;
 }
 
+//! `validated`: the caller already validated `seats` (SeatEvidencePrechecked).
 bool SeatSetMatches(const SeatEvidence& evidence, const SeatEvidenceStatement& statement,
-                    const ActiveFnBlsSeatSet& seats)
+                    const ActiveFnBlsSeatSet& seats, const bool validated, SeatEvidenceWork& work)
 {
-    return seats.market_id == evidence.market_id && seats.epoch == statement.seat_epoch &&
-           seats.set_hash == statement.seat_set_hash &&
-           CheckActiveFnBlsSeatSet(evidence.domain, seats) == BlsSeatSetCheck::OK;
+    if (seats.market_id != evidence.market_id || seats.epoch != statement.seat_epoch ||
+        seats.set_hash != statement.seat_set_hash) {
+        return false;
+    }
+    if (validated) return true;
+    ++work.seat_set_checks;
+    return CheckActiveFnBlsSeatSet(evidence.domain, seats) == BlsSeatSetCheck::OK;
 }
 
 bool StatementSignatureValid(const SeatEvidence& evidence, const SeatEvidenceStatement& statement,
-                             const ActiveFnBlsSeatSet& seats)
+                             const ActiveFnBlsSeatSet& seats, SeatEvidenceWork& work)
 {
     const auto context{evidence.Context(statement)};
     if (evidence.kind == SeatEvidenceKind::CERTIFICATE_CONFLICT) {
+        // The certificate check validates the set again before it verifies.
+        ++work.seat_set_checks;
+        ++work.signature_checks;
         return CheckBlsMicroblockCertificate(Certificate(statement), context, seats) == BlsCertificateCheck::OK;
     }
     if (statement.seat_index >= seats.Size()) return false;
+    ++work.signature_checks;
     const auto signature{bls::Signature::Decode(statement.signature)};
     if (!signature) return false;
     const uint256 digest{FlowMeshBlsCertificateDigest(context)};
@@ -182,8 +191,11 @@ std::optional<SeatEvidence> DecodeSeatEvidence(const std::span<const unsigned ch
 }
 
 SeatEvidenceCheck CheckSeatEvidence(const SeatEvidence& evidence, const ActiveFnBlsSeatSet& first_seats,
-                                    const ActiveFnBlsSeatSet& second_seats)
+                                    const ActiveFnBlsSeatSet& second_seats, const SeatEvidencePrechecked& prechecked,
+                                    SeatEvidenceWork* const work)
 {
+    SeatEvidenceWork unused;
+    SeatEvidenceWork& counted{work != nullptr ? *work : unused};
     if (!Shape(evidence)) return SeatEvidenceCheck::MALFORMED;
     const auto& a{evidence.first};
     const auto& b{evidence.second};
@@ -192,7 +204,8 @@ SeatEvidenceCheck CheckSeatEvidence(const SeatEvidence& evidence, const ActiveFn
         (a.seat_index != b.seat_index || a.seat_epoch != b.seat_epoch || a.seat_set_hash != b.seat_set_hash)) {
         return SeatEvidenceCheck::NOT_CONFLICTING;
     }
-    if (!SeatSetMatches(evidence, a, first_seats) || !SeatSetMatches(evidence, b, second_seats)) {
+    if (!SeatSetMatches(evidence, a, first_seats, prechecked.first_seats, counted) ||
+        !SeatSetMatches(evidence, b, second_seats, prechecked.second_seats, counted)) {
         return SeatEvidenceCheck::WRONG_SEAT_SET;
     }
     if (evidence.kind == SeatEvidenceKind::ATTESTATION_EQUIVOCATION &&
@@ -200,8 +213,12 @@ SeatEvidenceCheck CheckSeatEvidence(const SeatEvidence& evidence, const ActiveFn
          *evidence.seat_public_key != first_seats.members[a.seat_index].key.Key().Compressed())) {
         return SeatEvidenceCheck::WRONG_SEAT_KEY;
     }
-    if (!StatementSignatureValid(evidence, a, first_seats)) return SeatEvidenceCheck::BAD_FIRST_SIGNATURE;
-    if (!StatementSignatureValid(evidence, b, second_seats)) return SeatEvidenceCheck::BAD_SECOND_SIGNATURE;
+    if (!prechecked.first_signature && !StatementSignatureValid(evidence, a, first_seats, counted)) {
+        return SeatEvidenceCheck::BAD_FIRST_SIGNATURE;
+    }
+    if (!prechecked.second_signature && !StatementSignatureValid(evidence, b, second_seats, counted)) {
+        return SeatEvidenceCheck::BAD_SECOND_SIGNATURE;
+    }
     return SeatEvidenceCheck::OK;
 }
 

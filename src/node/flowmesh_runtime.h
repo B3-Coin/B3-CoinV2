@@ -460,6 +460,17 @@ struct FlowMeshClientOutcomeParts {
     std::shared_ptr<const ProductionOutcomeRecord> outcome;
 };
 
+/** The seat-misbehaviour recorder's verification work (observation only). */
+struct FlowMeshSeatEvidenceWork {
+    //! Detections checked: past the dedup and the per-market pace.
+    uint64_t checks{0};
+    //! Chain seat-set reads for a set other than the market's installed one.
+    uint64_t chain_lookups{0};
+    //! Seat-set validations and BLS verifications (flowmesh::SeatEvidenceWork).
+    uint64_t seat_set_checks{0};
+    uint64_t signature_checks{0};
+};
+
 /** One local API/RPC submission: the certified-state decision and, only when
  * that decision is ENQUEUE, the bounded queue's verdict. */
 struct FlowMeshLocalSubmitResult {
@@ -648,6 +659,8 @@ public:
 
     /** Test-only: how many frames' bytes admission has hashed so far. */
     uint64_t AdmissionHashCountForTest() const;
+    /** Test-only: the seat-misbehaviour recorder's work, summed over markets. */
+    FlowMeshSeatEvidenceWork SeatEvidenceWorkForTest() const;
 
 private:
     struct Market;

@@ -214,6 +214,60 @@ BOOST_AUTO_TEST_CASE(certificate_conflict_is_self_verifiable_and_names_double_si
     BOOST_CHECK(f.Check(keyed) == flowmesh::SeatEvidenceCheck::MALFORMED);
 }
 
+BOOST_AUTO_TEST_CASE(prechecked_steps_are_skipped_and_everything_else_still_checked)
+{
+    EvidenceFixture f;
+    const auto check = [&](const flowmesh::SeatEvidence& evidence, const flowmesh::SeatEvidencePrechecked& prechecked,
+                           flowmesh::SeatEvidenceWork& work, const flowmesh::ActiveFnBlsSeatSet* first = nullptr) {
+        work = {};
+        return flowmesh::CheckSeatEvidence(evidence, first ? *first : f.seats.seats, f.seats.seats, prechecked, &work);
+    };
+    const flowmesh::SeatEvidencePrechecked all{true, true, true, true};
+    flowmesh::SeatEvidenceWork work;
+
+    // The full check validates both sets and verifies both signatures.
+    const auto equivocation{f.Equivocation()};
+    BOOST_CHECK(check(equivocation, {}, work) == flowmesh::SeatEvidenceCheck::OK);
+    BOOST_CHECK_EQUAL(work.seat_set_checks, 2U);
+    BOOST_CHECK_EQUAL(work.signature_checks, 2U);
+    // What the caller already did is not repeated.
+    BOOST_CHECK(check(equivocation, all, work) == flowmesh::SeatEvidenceCheck::OK);
+    BOOST_CHECK_EQUAL(work.seat_set_checks, 0U);
+    BOOST_CHECK_EQUAL(work.signature_checks, 0U);
+    BOOST_CHECK(check(equivocation, {true, true, false, true}, work) == flowmesh::SeatEvidenceCheck::OK);
+    BOOST_CHECK_EQUAL(work.seat_set_checks, 0U);
+    BOOST_CHECK_EQUAL(work.signature_checks, 1U);
+    // Only what is named is skipped: an unflagged bad signature still fails.
+    auto forged{equivocation};
+    forged.second.signature = f.Sign(1, f.Context(Filled(0xb2))).Compressed();
+    BOOST_CHECK(check(forged, {true, true, true, false}, work) == flowmesh::SeatEvidenceCheck::BAD_SECOND_SIGNATURE);
+    BOOST_CHECK_EQUAL(work.signature_checks, 1U);
+    // The cheap checks always run, whatever is flagged.
+    auto same{equivocation};
+    same.second = same.first;
+    BOOST_CHECK(check(same, all, work) == flowmesh::SeatEvidenceCheck::NOT_CONFLICTING);
+    BOOST_CHECK(check(equivocation, all, work, &f.other_seats.seats) == flowmesh::SeatEvidenceCheck::WRONG_SEAT_SET);
+    auto other_key{equivocation};
+    other_key.seat_public_key = f.seats.seats.members[1].key.Key().Compressed();
+    BOOST_CHECK(check(other_key, all, work) == flowmesh::SeatEvidenceCheck::WRONG_SEAT_KEY);
+    auto keyless{equivocation};
+    keyless.seat_public_key.reset();
+    BOOST_CHECK(check(keyless, all, work) == flowmesh::SeatEvidenceCheck::MALFORMED);
+    BOOST_CHECK_EQUAL(work.seat_set_checks + work.signature_checks, 0U);
+
+    // A certificate check validates its set again: two steps per statement.
+    const auto conflict{f.Conflict()};
+    BOOST_CHECK(check(conflict, {}, work) == flowmesh::SeatEvidenceCheck::OK);
+    BOOST_CHECK_EQUAL(work.seat_set_checks, 4U);
+    BOOST_CHECK_EQUAL(work.signature_checks, 2U);
+    BOOST_CHECK(check(conflict, {true, true, false, true}, work) == flowmesh::SeatEvidenceCheck::OK);
+    BOOST_CHECK_EQUAL(work.seat_set_checks, 1U);
+    BOOST_CHECK_EQUAL(work.signature_checks, 1U);
+    // Without a work sink the result is the same.
+    BOOST_CHECK(flowmesh::CheckSeatEvidence(conflict, f.seats.seats, f.seats.seats, all) ==
+                flowmesh::SeatEvidenceCheck::OK);
+}
+
 BOOST_AUTO_TEST_CASE(encoding_is_canonical_and_strict)
 {
     EvidenceFixture f;
