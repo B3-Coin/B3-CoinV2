@@ -1658,7 +1658,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (const auto cache{m_cache.find(p.market)}; cache != m_cache.end() &&
             entry.sequence > cache->second.verified.certified.entry.sequence) cache->second.fresh.reset();
     }
-    void Snapshot(const uint256& id, const std::optional<uint256>& account)
+    //! `page` is the cursor of the 'updates' page that asked for this
+    //! snapshot, if any: events from there on are still delivered, so none
+    //! is skipped unless the snapshot comes from another event log.
+    void Snapshot(const uint256& id, const std::optional<uint256>& account,
+                  const std::optional<flowmesh::ClientEventCursor>& page = std::nullopt)
     {
         const auto pins{Pins(id)};
         UniValue params{UniValue::VOBJ}; params.pushKV("market_id", id.GetHex());
@@ -1692,13 +1696,25 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             // Preserve rollback detection before exposing this state. An
             // unchanged head is already durable and needs no new write.
             SaveRestartState();
+            // The snapshot's cursor is its endpoint's log position when the
+            // state was captured, at or after the page that asked for it.
+            // Resume from the page within the same log, so the events in
+            // between are still delivered as hints and none is skipped;
+            // another log (another endpoint, or a restart) skipped them.
+            flowmesh::ClientEventCursor cursor{evidence.cursor};
+            bool skipped{false};
+            if (page && page->instance_id == evidence.cursor.instance_id) {
+                cursor.event_id = std::min(page->event_id, evidence.cursor.event_id);
+            } else if (page) {
+                skipped = true;
+            }
             // Heads/actions are durable, event cursors are not. Restart or
             // bounded cache eviction requires an explicit snapshot gap even
             // when the certified head itself has not changed.
-            const bool gap{lost_cursor || (m_cache.contains(id) && m_cache.at(id).event_gap)};
+            const bool gap{lost_cursor || skipped || (m_cache.contains(id) && m_cache.at(id).event_gap)};
             if (m_cache.size() >= CLIENT_MAX_CACHED_MARKETS && !m_cache.contains(id)) m_cache.erase(m_cache.begin());
-            m_cache.insert_or_assign(id, Cache{pins, std::move(*verified), evidence.cursor, value["status"], value["reported_data"], endpoint, gap, account});
-            if (lost_cursor) { std::lock_guard lock{m_status_mutex}; ++m_status.event_gaps; }
+            m_cache.insert_or_assign(id, Cache{pins, std::move(*verified), cursor, value["status"], value["reported_data"], endpoint, gap, account});
+            if (lost_cursor || skipped) { std::lock_guard lock{m_status_mutex}; ++m_status.event_gaps; }
             for (auto& [key, pending] : m_pending) {
                 if (pending.market != id) continue;
                 if (std::any_of(entry.actions.begin(), entry.actions.end(), [&](const auto& action) { return action.Id() == pending.action.Id(); }))
@@ -1763,7 +1779,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         Call("updates", params, [&](const UniValue& value, size_t endpoint) {
             snapshot_needed = ApplyUpdatesPage(cache, id, value, endpoint);
         });
-        if (snapshot_needed) Snapshot(id, account);
+        if (snapshot_needed) Snapshot(id, account, flowmesh::ClientEventCursor{cache.cursor});
         return done();
     }
     //! Verifies one 'updates' page against the cache and applies its cursor
@@ -1792,14 +1808,9 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         if (reported_sequence < cache.verified.certified.entry.sequence + 1) Fail("Endpoint reported a stale microblock head");
         if (reported_sequence == cache.verified.certified.entry.sequence + 1 && reported_head != cache.verified.certified.entry.GetHash())
             Fail("Endpoint reported a conflicting equal-height head");
+        // The snapshot this asks for resumes from this page's cursor, so the
+        // events after it are still delivered (see Snapshot).
         const bool snapshot_needed{gap || reported_head != cache.verified.certified.entry.GetHash()};
-        if (snapshot_needed && !gap) {
-            // The atomically exported snapshot can advance past events
-            // produced after this page. Explicit resynchronization is
-            // reported instead of silently treating those events as seen.
-            cache.event_gap = true;
-            std::lock_guard lock{m_status_mutex}; ++m_status.event_gaps;
-        }
         cache.cursor = cursor; cache.endpoint = endpoint; cache.status = value["status"];
         if (value.exists("reported_data") && !value["reported_data"]["unchanged"].isTrue()) cache.reported = value["reported_data"];
         // A 'more' page is not skipped: cursor remains at the returned

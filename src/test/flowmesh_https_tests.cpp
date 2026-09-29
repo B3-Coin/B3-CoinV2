@@ -2289,6 +2289,8 @@ struct ClientLaneFixture : TestingSetup {
     flowmesh::VaultId vault;
     flowmesh::ActiveFnBlsSeatSet seats;
     std::vector<bls::SecretKey> secrets;
+    //! The bootstrap user deposit established on this chain (account 0x41).
+    COutPoint deposit_outpoint;
     CBlockIndex* original_tip{nullptr};
 
     ClientLaneFixture()
@@ -2321,6 +2323,7 @@ struct ClientLaneFixture : TestingSetup {
         CMutableTransaction bootstrap;
         bootstrap.version = 2;
         bootstrap.vout.push_back(*deposit);
+        deposit_outpoint = COutPoint{bootstrap.GetHash(), 0};
 
         LOCK(::cs_main);
         auto& chainstate{chainman.ActiveChainstate()};
@@ -2375,6 +2378,41 @@ struct ClientLaneFixture : TestingSetup {
     {
         LOCK(::cs_main);
         m_node.chainman->ActiveChain().SetTip(*original_tip);
+    }
+
+    //! Connect one synthetic B3 block carrying `records` and index it.
+    void ConnectMpaBlock(const std::vector<CMpaRecord>& records)
+    {
+        LOCK(::cs_main);
+        auto& chainman{*m_node.chainman};
+        auto& chainstate{chainman.ActiveChainstate()};
+        auto& chain{chainstate.m_chain};
+        const auto& params{chainman.GetConsensus()};
+        CMutableTransaction transaction;
+        transaction.version = 2;
+        transaction.mpa = records;
+        CBlock block;
+        block.nVersion = 2;
+        block.hashPrevBlock = chain.Tip()->GetBlockHash();
+        block.nTime = chain.Tip()->nTime + 1;
+        block.nNonce = chain.Height() + 1;
+        block.vtx = {MakeTransactionRef(transaction)};
+        auto* index{chainman.m_blockman.InsertBlockIndex(block.GetHash())};
+        BOOST_REQUIRE(index);
+        index->nHeight = chain.Height() + 1;
+        index->pprev = chain.Tip();
+        index->nTime = block.nTime;
+        index->BuildSkip();
+        chain.SetTip(*index);
+        auto& seat_tracker{chainstate.ModernFnSeats()};
+        auto& vault_tracker{chainstate.ModernFlowMeshVaults()};
+        auto& checkpoint_tracker{chainstate.ModernFlowMeshCheckpoints()};
+        seat_tracker.BlockConnected(block, *index, params);
+        vault_tracker.BlockConnected(block, *index, params);
+        checkpoint_tracker.BlockConnected(block, *index, chain, params, seat_tracker.Index(), vault_tracker.Index());
+        BOOST_REQUIRE(seat_tracker.Synced(index->GetBlockHash()));
+        BOOST_REQUIRE(vault_tracker.Synced(index->GetBlockHash()));
+        BOOST_REQUIRE(checkpoint_tracker.Synced(index->GetBlockHash()));
     }
 
     node::FlowMeshHttpsServer::Options Options(uint16_t port = 0) const
@@ -3946,6 +3984,129 @@ BOOST_AUTO_TEST_CASE(updates_watch_page_fits_its_reply_bound)
     const auto size{node::FlowMeshClientUpdatesPageJson(page).write().size()};
     BOOST_TEST_MESSAGE("worst-case watched page: " << size << " bytes");
     BOOST_CHECK_LT(size + 64 * 1024, node::FLOWMESH_API_WATCH_MAX_REPLY);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+/** A running service on the lane fixture's chain whose four armed seats
+ * certify the market genesis, served by a real restricted API. Restart()
+ * replaces both on the same datadir and port: a new event-log instance. */
+struct LiveMarket {
+    ClientLaneFixture& fixture;
+    const fs::path path;
+    const node::FlowMeshTradingApiWatch watch;
+    std::unique_ptr<node::FlowMeshService> service;
+    std::unique_ptr<node::FlowMeshHttpsServer> api;
+    uint16_t port{0};
+    LiveMarket(ClientLaneFixture& f, fs::path p, const node::FlowMeshTradingApiWatch w = {})
+        : fixture{f}, path{std::move(p)}, watch{w}
+    {
+        // Certify the market genesis, publish its checkpoint on B3, and start
+        // again: the market then admits actions.
+        Start();
+        std::string error;
+        const auto checkpoint{service->NextCheckpointMpa(fixture.market, error)};
+        BOOST_REQUIRE_MESSAGE(checkpoint, error);
+        Stop();
+        fixture.ConnectMpaBlock({checkpoint->record});
+        Start();
+    }
+    ~LiveMarket() { Stop(); }
+    void Start()
+    {
+        service = std::make_unique<node::FlowMeshService>(*fixture.m_node.chainman, path);
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(service->Start(*fixture.m_node.peerman, error), error);
+        BOOST_REQUIRE_MESSAGE(service->ArmSeatKeys(fixture.secrets, error), error);
+        auto options{fixture.Options(port)};
+        options.request_timeout = std::chrono::seconds{10};
+        api = node::MakeFlowMeshTradingApi(*service, options, {}, {}, {}, {}, watch);
+        BOOST_REQUIRE_MESSAGE(api->Start(error), error);
+        port = api->Port();
+        BOOST_REQUIRE(WaitSequence(1));
+    }
+    void Stop()
+    {
+        if (api) api->Stop();
+        api.reset();
+        if (service) service->Stop();
+        service.reset();
+    }
+    void Restart()
+    {
+        const auto next{service->MarketStatus(fixture.market)->next_sequence};
+        Stop();
+        Start();
+        BOOST_REQUIRE(WaitSequence(next));
+    }
+    bool WaitSequence(const uint64_t next) const
+    {
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{10}};
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto status{service->MarketStatus(fixture.market)};
+            if (status && status->next_sequence >= next && status->halt == node::FlowMeshRuntimeHalt::NONE) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        return false;
+    }
+    //! Certifies one more entry: the fixture's bootstrap user deposit.
+    void Deposit()
+    {
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{10}};
+        while (service->MarketStatus(fixture.market)->paused && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        const auto next{service->MarketStatus(fixture.market)->next_sequence};
+        flowmesh::Action deposit;
+        deposit.type = static_cast<uint8_t>(flowmesh::ActionType::DEPOSIT);
+        deposit.outpoint = fixture.deposit_outpoint;
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(service->SubmitLocalAction(fixture.market, deposit, error), error);
+        BOOST_REQUIRE(WaitSequence(next + 1));
+    }
+    node::HttpsEndpoint Endpoint() const { return fixture.Endpoint(port); }
+};
+
+flowmesh::MarketDataQuery Page()
+{
+    flowmesh::MarketDataQuery query;
+    query.limit = 100;
+    return query;
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_watch_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(event_gap_is_raised_only_when_a_snapshot_skips_events)
+{
+    LiveMarket live{*this, m_path_root / "gap-service"};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {live.Endpoint()}, m_path_root / "gap-client", error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    const auto first{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(first, error);
+    BOOST_CHECK_EQUAL(first->snapshot.next_microblock_sequence, 1U);
+    BOOST_CHECK(!first->event_gap);
+    // A new head is read through a snapshot taken after the page that
+    // reported it. The events in between are still delivered: no gap.
+    live.Deposit();
+    const auto moved{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(moved, error);
+    BOOST_CHECK_EQUAL(moved->snapshot.next_microblock_sequence, 2U);
+    BOOST_CHECK(!moved->event_gap);
+    BOOST_CHECK_EQUAL(client->Status().event_gaps, 0U);
+    const auto again{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(again, error);
+    BOOST_CHECK(!again->event_gap);
+    BOOST_CHECK_EQUAL(client->Status().event_gaps, 0U);
+    // A restarted endpoint has a new event log: its events were skipped.
+    live.Restart();
+    const auto restarted{client->Data(market, std::nullopt, Page(), error)};
+    BOOST_REQUIRE_MESSAGE(restarted, error);
+    BOOST_CHECK(restarted->event_gap);
+    BOOST_CHECK_EQUAL(client->Status().event_gaps, 1U);
+    client.reset();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

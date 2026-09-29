@@ -1034,7 +1034,7 @@ RPCHelpMan getflowmeshmarketdata()
                 {T::BOOL, "execution_result_verified", "Execution results independently replayed; a state certificate alone is insufficient"},
                 {T::BOOL, "b3_checkpoint_confirmed", "B3 checkpoint confirmation independently checked"},
                 {T::BOOL, "history_endpoint_reported", "History is endpoint-reported rather than independently execution-verified"},
-                {T::BOOL, "event_gap", "Explicit cursor gap requiring snapshot recovery"},
+                {T::BOOL, "event_gap", "Sticky: the client's event cursor for this market was lost at least once (endpoint-reported gap, other endpoint or restarted endpoint, restart of this client, or a wallet/authority change), so events in between may never have been seen; balances and orders still come only from verified snapshots"},
                 {T::BOOL, "freshest_network_head_proven", "False: a valid response does not prove the freshest network head"},
             }},
             {T::OBJ, "base_metadata", /*optional=*/true, "Verified display precision and sourced cosmetic labels, including on unchanged responses; does not certify backing", {
