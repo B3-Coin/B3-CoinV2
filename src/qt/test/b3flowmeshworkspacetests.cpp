@@ -307,6 +307,14 @@ struct FundingReadProbe {
     std::atomic_int watches{0}, releases{0};
     std::atomic_bool hold_watch{false}, fail_watch{false};
     QSemaphore watch_entered, watch_release;
+    //! A busy validator, as the remote client sees it: a live-update read
+    //! waits 1.2 s (no event of its own market and account) and is answered
+    //! with superseded_object (after an ordinary read) when an ordinary market
+    //! read ran meanwhile, since any read then moves the client's event cursor
+    //! under the outstanding watch.
+    std::atomic_bool supersede_on_concurrent_read{false};
+    UniValue superseded_object{UniValue::VOBJ};
+    std::atomic_int superseded{0};
     int live_ms{0};
     //! Every getflowmeshmarketdata options object, in order.
     std::vector<UniValue> market_options;
@@ -365,6 +373,11 @@ struct FundingReadProbe {
                     if (options.isObject() && options.exists("watch_ms")) {
                         if (options["watch_ms"].getInt<int>() == 0) { ++releases; result = data; result.pushKV("watch", watch_object); return true; }
                         ++watches; watch_entered.release();
+                        if (supersede_on_concurrent_read) {
+                            const int before{snapshots.load()};
+                            std::this_thread::sleep_for(std::chrono::milliseconds{1200});
+                            if (snapshots.load() != before) { ++superseded; result = data; result.pushKV("watch", superseded_object); return true; }
+                        }
                         if (hold_watch && !watch_release.tryAcquire(1, 3000)) throw std::runtime_error{"Synthetic watch exceeded its test bound"};
                         if (fail_watch) throw std::runtime_error{"Synthetic live update unavailable"};
                         result = watch_data; result.pushKV("watch", watch_object); return true;
@@ -4399,6 +4412,47 @@ private Q_SLOTS:
         QVERIFY(panel.liveSkipsPoll());
         panel.m_watch.Disable(); probe.hold_watch = false; probe.watch_release.release(); AwaitWatchWorker(panel);
         QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void probeOnABusyMarketReachesLiveBesideThePollingTimer()
+    {
+        // Every ordinary market read beside a live-update read supersedes it,
+        // as on a busy validator. The ticking panel still gets its probe
+        // through: the probe is armed first and holds the tick's market read.
+        FundingReadProbe probe; probe.live_ms = 2000; probe.watch_object = WatchObject("timeout", true, true);
+        probe.superseded_object = WatchObject("superseded", false, false); probe.supersede_on_concurrent_read = true;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        Live(panel, probe);
+        QCOMPARE(panel.m_watch.mode, B3FlowMeshWatch::Mode::Probing);
+        panel.m_timer->start();
+        QTRY_COMPARE_WITH_TIMEOUT(panel.m_watch.mode, B3FlowMeshWatch::Mode::Live, 4000);
+        QCOMPARE(probe.superseded.load(), 0);
+        QVERIFY(probe.watches.load() >= 1);
+        panel.m_timer->stop();
+        panel.m_watch.Disable(); AwaitWatchWorker(panel);
+        QTRY_VERIFY_WITH_TIMEOUT(!panel.m_thread, 3000);
+        QCOMPARE(probe.writes.load(), 0); QVERIFY(m_wallet->IsLocked());
+    }
+    void probeWaitsForAnInFlightReadAndHoldsTheNextPoll()
+    {
+        FundingReadProbe probe; probe.live_ms = 2000; probe.watch_object = WatchObject("timeout", true, true); probe.hold_watch = true;
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.m_refresh_phase = B3FlowMeshTradingPanel::RefreshPhase::None; panel.m_catalog_age.start();
+        Live(panel, probe);
+        QCOMPARE(panel.m_watch.mode, B3FlowMeshWatch::Mode::Probing);
+        // A job in flight may be reading the market: no probe beside it.
+        ReadInFlight(panel);
+        panel.armWatch(); QVERIFY(!panel.m_watch_thread); QCOMPARE(probe.watches.load(), 0);
+        delete panel.m_thread; panel.m_thread = nullptr;
+        QVERIFY(!panel.liveSkipsPoll());
+        // Once it is armed, the probe holds the market read for a bounded time.
+        panel.armWatch(); QVERIFY(panel.m_watch_thread);
+        QVERIFY(probe.watch_entered.tryAcquire(1, 2000));
+        QVERIFY(panel.m_watch.ProbeHoldsPoll(panel.m_watch_clock.elapsed()));
+        QVERIFY(panel.liveSkipsPoll());
+        panel.m_watch.armed_at = panel.m_watch_clock.elapsed() - B3FlowMeshWatch::Policy::PROBE_HOLD_MS;
+        QVERIFY(!panel.liveSkipsPoll());
+        panel.m_watch.Disable(); probe.hold_watch = false; probe.watch_release.release(); AwaitWatchWorker(panel);
+        QCOMPARE(probe.snapshots.load(), 0); QCOMPARE(probe.writes.load(), 0);
     }
     void liveModeSkipsMarketPollingButKeepsAuxiliaryCycleAndStatus()
     {

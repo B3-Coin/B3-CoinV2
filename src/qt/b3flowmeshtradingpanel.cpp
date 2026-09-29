@@ -347,10 +347,12 @@ B3FlowMeshTradingPanel::B3FlowMeshTradingPanel(QWidget* parent) : QWidget{parent
         if (!m_polling_since.isValid()) m_polling_since.start();
         updateMarketText();
         updateWatchState();
-        // While live updates arrive, the 500 ms tick keeps display ageing and
-        // the auxiliary cycle; the watch supplies the market read.
-        if (!liveSkipsPoll()) refresh();
+        // A watch is armed before the poll, so a probe it starts holds this
+        // tick's market read. While live updates arrive (or a probe is
+        // outstanding), the 500 ms tick keeps display ageing and the
+        // auxiliary cycle; the watch supplies the market read.
         armWatch();
+        if (!liveSkipsPoll()) refresh();
         if (m_watch_release_pending && m_watch.mode != B3FlowMeshWatch::Mode::Live && m_watch.mode != B3FlowMeshWatch::Mode::Probing) armWatch(/*release=*/true);
     });
     connect(qApp, &QCoreApplication::aboutToQuit, this, [this] { m_closing = true; cancelAndWait(); });
@@ -1367,8 +1369,7 @@ void B3FlowMeshTradingPanel::startJob(std::optional<Action> action, std::optiona
     m_last_job_was_reconcile = result->reconcile_first;
     // Live updates supply the selected market's read: a passive job then runs
     // only its auxiliary phase. Foreground, review and action reads always read.
-    result->live = result->passive && m_watch.mode == B3FlowMeshWatch::Mode::Live && !m_read_failed && !m_watch_watchdog &&
-        selected && m_snapshot && m_snapshot->market == selected->id;
+    result->live = result->passive && watchSuppliesRead();
     const auto refresh_basis{m_snapshot};
     result->markets = m_market_data; result->effects = m_effect_data;
     if (m_snapshot && m_snapshot->market == selected_id) result->basis_sequence = m_snapshot->next_sequence;
@@ -1861,11 +1862,16 @@ auto B3FlowMeshTradingPanel::scheduledPassivePhase() const -> RefreshPhase
         tracked ? RefreshPhase::Receipt : RefreshPhase::None;
 }
 
-bool B3FlowMeshTradingPanel::liveSkipsPoll() const
+bool B3FlowMeshTradingPanel::watchSuppliesRead() const
 {
     const auto selected{market()};
-    return m_watch.mode == B3FlowMeshWatch::Mode::Live && !m_read_failed && !m_watch_watchdog && selected && m_snapshot &&
-        m_snapshot->market == selected->id && !m_deferred_connect && !m_deferred_status && nextPassivePhase() == RefreshPhase::None;
+    return m_watch.SuppliesMarketRead(m_watch_clock.elapsed()) && !m_read_failed && !m_watch_watchdog && selected && m_snapshot &&
+        m_snapshot->market == selected->id;
+}
+
+bool B3FlowMeshTradingPanel::liveSkipsPoll() const
+{
+    return watchSuppliesRead() && !m_deferred_connect && !m_deferred_status && nextPassivePhase() == RefreshPhase::None;
 }
 
 void B3FlowMeshTradingPanel::updateWatchState()
@@ -1917,6 +1923,9 @@ void B3FlowMeshTradingPanel::armWatch(const bool release)
         return;
     }
     if (!release) {
+        // A probe starts only with no job in flight: an ordinary market read
+        // already on its way would move the client's cursor under it.
+        if (m_thread && m_watch.mode != B3FlowMeshWatch::Mode::Live) return;
         if (m_busy || !isVisible() || !m_security_warning.isEmpty() || m_read_failed || !m_watch.MayArm(m_watch_clock.elapsed())) return;
         m_watch.Armed(m_watch_clock.elapsed());
     }

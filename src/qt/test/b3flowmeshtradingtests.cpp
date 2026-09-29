@@ -1174,6 +1174,25 @@ private Q_SLOTS:
         for (size_t i{2}; i < arms.size(); ++i) QVERIFY(arms[i] - arms[i - 2] >= Policy::ARM_REFILL_MS);
         QCOMPARE(p.mode, Mode::Live); QVERIFY(!p.PollEveryTick());
     }
+    void watchProbeHoldsTheMarketPollForABoundedTime()
+    {
+        using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using WOutcome = B3FlowMeshWatch::Outcome;
+        Policy p; p.Enable(0, true);
+        // Nothing outstanding: probing keeps the ordinary poll.
+        QVERIFY(!p.SuppliesMarketRead(0));
+        QVERIFY(p.MayArm(0)); p.Armed(0);
+        QVERIFY(p.ProbeHoldsPoll(0)); QVERIFY(p.SuppliesMarketRead(Policy::PROBE_HOLD_MS - 1));
+        // A probe the endpoint holds on to never freezes the display longer.
+        QVERIFY(!p.SuppliesMarketRead(Policy::PROBE_HOLD_MS));
+        p.Finished(1000, WOutcome::NotWaited, 0.0);
+        QCOMPARE(p.mode, Mode::Probing); QVERIFY(!p.SuppliesMarketRead(1000));
+        QVERIFY(p.MayArm(1000 + Policy::TICK_MS)); p.Armed(1000 + Policy::TICK_MS);
+        QVERIFY(p.SuppliesMarketRead(1000 + Policy::TICK_MS));
+        p.Finished(2000, WOutcome::Quiet, 0.0);
+        QCOMPARE(p.mode, Mode::Live); QVERIFY(!p.ProbeHoldsPoll(2000)); QVERIFY(p.SuppliesMarketRead(2000));
+        QVERIFY(p.MayArm(2000)); p.Armed(2000); p.Finished(2000, WOutcome::Failed, 0.0);
+        QCOMPARE(p.mode, Mode::Backoff); QVERIFY(!p.SuppliesMarketRead(2000));
+    }
     void watchQuietRepliesRearmImmediately()
     {
         using B3FlowMeshWatch::Policy; using B3FlowMeshWatch::Mode; using B3FlowMeshWatch::Classify; using WOutcome = B3FlowMeshWatch::Outcome;

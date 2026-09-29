@@ -132,6 +132,14 @@ refresh every 5 s); only the market read of a passive refresh is left to the
 watch. Foreground, review and action reads are unchanged, and the trading
 gates are unchanged (new orders stop after 3 s without a verified update).
 
+Any ordinary read of the market moves the remote client's event cursor, and a
+watch whose cursor moved while it slept is answered `superseded`. So a probe
+(trying live updates, before the first waited reply) is armed on the tick
+before its poll, only when no passive job is in flight, and holds the market
+read of the passive jobs started while it is outstanding, for at most the
+watch plus 3 s. Otherwise, on a busy validator every probe would be
+superseded by the poll beside it and the panel would never reach live mode.
+
 The connection line shows the mode: "live updates", "polling every 0.5 s
 (endpoint offers no live updates)", "polling (live-update capacity full,
 retry in N s)", "live updates reconnecting in N s" or "No live update for

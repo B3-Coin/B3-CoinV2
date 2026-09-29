@@ -17,7 +17,7 @@ namespace B3FlowMeshWatch {
  * market read; trading gates never depend on this policy. */
 enum class Mode {
     Off,     //!< Not watching: no wallet, hidden, or not yet enabled.
-    Probing, //!< Trying a watch; ordinary polling continues meanwhile.
+    Probing, //!< Trying a watch; ordinary polling continues between probes.
     Live,    //!< Watches arrive: the 500 ms market poll is skipped.
     Polling, //!< The endpoint offers none, or its watch slots are full.
     Backoff, //!< A watch failed; retry after 1, 2, 4 ... 30 s.
@@ -46,6 +46,9 @@ struct Policy {
     static constexpr int64_t NOT_WAITED_RETRY_MS{10000};
     static constexpr unsigned NOT_WAITED_LIMIT{3};    //!< Consecutive, then Polling.
     static constexpr int64_t AUX_REFRESH_MS{5000};    //!< Catalog/status/effects/receipt cadence while Live.
+    //! Longest an outstanding probe holds the market poll: its wait plus a
+    //! slow link's round trips (a new TLS connection and a snapshot).
+    static constexpr int64_t PROBE_HOLD_MS{WATCH_MS + 3000};
     //! Hard floor on the read rate, whatever the outcome: a burst of two,
     //! then one more every 500 ms (at most two watch reads per second).
     static constexpr int ARM_BURST{2};
@@ -71,8 +74,19 @@ struct Policy {
     //! The watchdog tripped: ordinary polling resumes at once, and watching
     //! again waits for the outstanding read and a backoff.
     void Watchdog(int64_t now);
-    //! Polling, Probing, Backoff and Off keep today's 500 ms market poll.
+    //! Polling, Probing, Backoff and Off keep today's 500 ms market poll
+    //! (Probing: except while ProbeHoldsPoll).
     bool PollEveryTick() const { return mode != Mode::Live; }
+    //! A probe is outstanding, for at most PROBE_HOLD_MS: its market read is
+    //! left to it, as when Live. Any ordinary read of the market moves the
+    //! client's event cursor, which supersedes the outstanding watch, so a
+    //! poll beside it would keep a busy market's probe from ever waiting.
+    bool ProbeHoldsPoll(int64_t now) const
+    {
+        return mode == Mode::Probing && outstanding && now - armed_at < PROBE_HOLD_MS;
+    }
+    //! The watch supplies the market read: Live, or a probe holding the poll.
+    bool SuppliesMarketRead(int64_t now) const { return mode == Mode::Live || ProbeHoldsPoll(now); }
     //! A watch outstanding, or Live without a waited reply, for 15 s.
     bool WatchdogTripped(int64_t now) const;
     //! Backoff after `failures` consecutive failures, before jitter.

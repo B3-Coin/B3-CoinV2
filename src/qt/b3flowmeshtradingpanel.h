@@ -250,8 +250,10 @@ private:
     RefreshPhase scheduledPassivePhase() const;
     //! A pending reconcile may replace the next passive job's phase now.
     bool reconcileDue() const;
-    //! Live updates supply the selected market's read, so a passive refresh
-    //! without an auxiliary phase is skipped.
+    //! The watch supplies the selected market's read (Live, or a probe that
+    //! holds the poll), so a passive job reads only its auxiliary phase.
+    bool watchSuppliesRead() const;
+    //! ... and a passive refresh without an auxiliary phase is skipped.
     bool liveSkipsPoll() const;
     //! Re-keys the live-update policy on wallet, market and the endpoint the
     //! displayed data came from; runs the watchdog.
