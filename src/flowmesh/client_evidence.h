@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -23,6 +24,9 @@ inline constexpr size_t CLIENT_STATE_MAX_BYTES{8 * 1024 * 1024};
 inline constexpr size_t CLIENT_EVENT_CAPACITY{2048};
 inline constexpr size_t CLIENT_EVENT_PAGE_MAX{256};
 inline constexpr size_t CLIENT_NOTICE_CAPACITY{2048};
+//! Concurrent event watches (ClientEventLog::WaitEvents) per log. Defence in
+//! depth only: every caller bounds its own watchers far below this.
+inline constexpr size_t CLIENT_EVENT_MAX_WATCHERS{64};
 
 struct ClientEvidencePins {
     uint256 domain;
@@ -162,9 +166,22 @@ struct ClientActionWait {
     std::optional<ClientActionNotice> notice;
 };
 
+//! Why an event watch (ClientEventLog::WaitEvents) returned. A latency
+//! observation only, never evidence: the caller reads the page itself.
+enum class ClientWatchResult : uint8_t {
+    READY,       // Read(after, market, account) would now return an event
+    GAP,         // Read(after, ...) would now report a gap
+    TIMEOUT,     // deadline reached with nothing new for this filter
+    INTERRUPTED, // WakeWaiters() or the caller's interrupt predicate
+    RESTARTED,   // Reset(): a new instance (Read then reports a gap)
+    BUSY,        // CLIENT_EVENT_MAX_WATCHERS watches already registered
+};
+const char* ClientWatchResultName(ClientWatchResult result);
+
 /** Memory-only, globally bounded per runtime. No callbacks or network work; a
  * condition variable wakes bounded long-poll observers, whose count and
- * lifetime the caller bounds. The log retains no per-waiter state.
+ * lifetime the caller bounds. The only per-waiter state is the registration
+ * of a current event watch (at most CLIENT_EVENT_MAX_WATCHERS).
  * An absent action status means unknown/expired, never a definite rejection.
  * Pool refusal is an observation of one attempt, not an execution outcome. */
 class ClientEventLog {
@@ -198,6 +215,26 @@ public:
                                       bool include_notices = false) const;
     /** Ends every current wait with INTERRUPTED (shutdown, never a result). */
     void WakeWaiters() const;
+    /** Nonblocking, O(events after the cursor): READY or GAP exactly when
+     * Read(after, market, account) would now return an event or report a
+     * gap, otherwise TIMEOUT. */
+    ClientWatchResult EventsPending(const ClientEventCursor& after, const std::optional<MarketId>& market,
+                                    const std::optional<AccountId>& account) const;
+    /** Blocks until EventsPending(after, market, account) is no longer
+     * TIMEOUT, the bounded deadline passes, WakeWaiters() or interrupted()
+     * ends the wait, or Reset() starts a new instance; BUSY at once while
+     * CLIENT_EVENT_MAX_WATCHERS watches exist. Returns no events: the caller
+     * reads its page with Read(), exactly as an unwaited reader does.
+     * The watcher sleeps on its own condition variable, which an append
+     * signals only when it matches the watcher's filter or evicts its cursor,
+     * and notifies after the log's mutex is released. interrupted() runs
+     * under that mutex and must be a nonblocking, lock-free read. */
+    ClientWatchResult WaitEvents(const ClientEventCursor& after, const std::optional<MarketId>& market,
+                                 const std::optional<AccountId>& account,
+                                 std::chrono::steady_clock::time_point deadline,
+                                 const std::function<bool()>& interrupted) const;
+    //! Test observation: current event watches.
+    size_t WatchersForTest() const;
     /** Appends local notices in order under one lock, with at most one
      * wakeup and only while an include_notices wait exists. Bounded ring of
      * CLIENT_NOTICE_CAPACITY; never touches the v1 events. */
@@ -208,6 +245,36 @@ public:
     std::optional<ClientActionNotice> NewestNoticeIfNewer(const MarketId& market, const uint256& action_id) const;
 
 private:
+    //! The one filter shared by Read() and event watches, so they never disagree.
+    static bool Matches(const ClientEvent& event, const std::optional<MarketId>& market,
+                        const std::optional<AccountId>& account)
+    {
+        return (!market || event.market_id == *market) &&
+               (!account || event.kind == ClientEventKind::CERTIFIED_HEAD || event.account_id == *account);
+    }
+    //! One registered WaitEvents call. Shared, so that an appender can
+    //! notify it after unlocking even when the watch has returned meanwhile.
+    struct EventWatcher {
+        EventWatcher(const ClientEventCursor& after_in, const std::optional<MarketId>& market_in,
+                     const std::optional<AccountId>& account_in)
+            : after{after_in}, market{market_in}, account{account_in} {}
+        const ClientEventCursor after;
+        const std::optional<MarketId> market;
+        const std::optional<AccountId> account;
+        std::condition_variable changed;
+        //! Guarded by m_mutex.
+        bool signalled{false};
+    };
+    using Signalled = std::vector<std::shared_ptr<EventWatcher>>;
+    // Caller holds m_mutex.
+    ClientWatchResult PendingLocked(const ClientEventCursor& after, const std::optional<MarketId>& market,
+                                    const std::optional<AccountId>& account) const;
+    // Caller holds m_mutex. Marks each unmarked watcher that an event with an
+    // id above `appended_after` matches, or whose cursor the ring no longer
+    // retains; without a bound, every watcher. The caller notifies `out`
+    // after unlocking.
+    void SignalWatchersLocked(std::optional<uint64_t> appended_after, Signalled& out) const;
+    static void Notify(const Signalled& watchers);
     // Caller holds m_mutex. False only at the fail-closed event-id limit.
     bool AppendLocked(ClientEvent&& event);
     // Caller holds m_mutex. newest, when given, receives the kind of the
@@ -231,6 +298,8 @@ private:
     std::deque<ClientActionNotice> m_notices;
     uint64_t m_notice_changes{0};
     mutable size_t m_notice_waiters{0};
+    // Current event watches; guarded by m_mutex, at most CLIENT_EVENT_MAX_WATCHERS.
+    mutable std::vector<std::shared_ptr<EventWatcher>> m_watchers;
 };
 
 } // namespace flowmesh

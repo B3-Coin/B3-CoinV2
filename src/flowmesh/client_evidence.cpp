@@ -5,6 +5,7 @@
 #include <flowmesh/client_evidence.h>
 
 #include <streams.h>
+#include <util/check.h>
 
 #include <algorithm>
 #include <limits>
@@ -190,6 +191,19 @@ const char* ClientWaitResultName(const ClientWaitResult result)
     return "unknown";
 }
 
+const char* ClientWatchResultName(const ClientWatchResult result)
+{
+    switch (result) {
+    case ClientWatchResult::READY: return "ready";
+    case ClientWatchResult::GAP: return "gap";
+    case ClientWatchResult::TIMEOUT: return "timeout";
+    case ClientWatchResult::INTERRUPTED: return "interrupted";
+    case ClientWatchResult::RESTARTED: return "restarted";
+    case ClientWatchResult::BUSY: return "busy";
+    }
+    return "unknown";
+}
+
 ClientEventLog::ClientEventLog(const uint256& instance_id) : m_instance_id{instance_id} {}
 
 bool ClientNoticeEndsWait(const ActionReasonCode code)
@@ -201,6 +215,7 @@ bool ClientNoticeEndsWait(const ActionReasonCode code)
 
 void ClientEventLog::Reset(const uint256& instance_id)
 {
+    Signalled signalled;
     {
         std::lock_guard lock{m_mutex};
         m_instance_id = instance_id;
@@ -208,8 +223,34 @@ void ClientEventLog::Reset(const uint256& instance_id)
         m_events.clear();
         m_notices.clear();
         ++m_notice_changes;
+        SignalWatchersLocked(std::nullopt, signalled);
     }
     m_changed.notify_all();
+    Notify(signalled);
+}
+
+void ClientEventLog::SignalWatchersLocked(const std::optional<uint64_t> appended_after, Signalled& out) const
+{
+    for (const auto& watcher : m_watchers) {
+        if (watcher->signalled) continue;
+        // Read()'s eviction rule: the cursor can no longer be resumed.
+        bool wake{!appended_after ||
+                  (!m_events.empty() && watcher->after.event_id < m_events.front().event_id - 1)};
+        // Only the retained new events; an evicted new one also evicted the cursor.
+        for (auto it{m_events.rbegin()}; !wake && it != m_events.rend() && it->event_id > *appended_after; ++it) {
+            wake = Matches(*it, watcher->market, watcher->account);
+        }
+        if (!wake) continue;
+        watcher->signalled = true;
+        out.push_back(watcher);
+    }
+}
+
+void ClientEventLog::Notify(const Signalled& watchers)
+{
+    // After unlocking: a woken watcher never blocks on the appender's lock.
+    // The shared owner keeps a watcher that already returned alive.
+    for (const auto& watcher : watchers) watcher->changed.notify_one();
 }
 
 void ClientEventLog::AppendNotices(std::vector<ClientActionNotice> notices)
@@ -271,24 +312,33 @@ bool ClientEventLog::AppendLocked(ClientEvent&& event)
 void ClientEventLog::Append(ClientEvent event)
 {
     bool notify{false};
+    Signalled signalled;
     {
         std::lock_guard lock{m_mutex};
-        notify = AppendLocked(std::move(event)) && m_waiters != 0;
+        const uint64_t before{m_last_event_id};
+        const bool appended{AppendLocked(std::move(event))};
+        notify = appended && m_waiters != 0;
+        if (appended && !m_watchers.empty()) SignalWatchersLocked(before, signalled);
     }
     // After unlocking: a woken waiter never blocks on the appender's lock.
     if (notify) m_changed.notify_all();
+    Notify(signalled);
 }
 
 void ClientEventLog::Append(std::vector<ClientEvent> events)
 {
     bool appended{false};
     bool notify{false};
+    Signalled signalled;
     {
         std::lock_guard lock{m_mutex};
+        const uint64_t before{m_last_event_id};
         for (auto& event : events) appended = AppendLocked(std::move(event)) || appended;
         notify = appended && m_waiters != 0;
+        if (appended && !m_watchers.empty()) SignalWatchersLocked(before, signalled);
     }
     if (notify) m_changed.notify_all();
+    Notify(signalled);
 }
 
 ClientEventCursor ClientEventLog::Cursor() const
@@ -318,8 +368,7 @@ ClientEventPage ClientEventLog::Read(const std::optional<ClientEventCursor>& aft
         if (event.event_id <= out.cursor.event_id) continue;
         if (out.events.size() == limit) { out.more = true; break; }
         out.cursor.event_id = event.event_id;
-        if (market && event.market_id != *market) continue;
-        if (account && event.kind != ClientEventKind::CERTIFIED_HEAD && event.account_id != *account) continue;
+        if (!Matches(event, market, account)) continue;
         out.events.push_back(event);
     }
     if (!out.more) out.cursor.event_id = m_last_event_id;
@@ -441,11 +490,83 @@ ClientActionWait ClientEventLog::WaitActionStatus(const MarketId& market, const 
 
 void ClientEventLog::WakeWaiters() const
 {
+    Signalled signalled;
     {
         std::lock_guard lock{m_mutex};
         ++m_wake_epoch;
+        SignalWatchersLocked(std::nullopt, signalled);
     }
     m_changed.notify_all();
+    Notify(signalled);
+}
+
+ClientWatchResult ClientEventLog::PendingLocked(const ClientEventCursor& after, const std::optional<MarketId>& market,
+                                                const std::optional<AccountId>& account) const
+{
+    // Read()'s gap rule: another instance, a future cursor or an evicted one.
+    if (after.instance_id != m_instance_id || after.event_id > m_last_event_id ||
+        (!m_events.empty() && after.event_id < m_events.front().event_id - 1)) {
+        return ClientWatchResult::GAP;
+    }
+    for (auto it{m_events.rbegin()}; it != m_events.rend() && it->event_id > after.event_id; ++it) {
+        if (Matches(*it, market, account)) return ClientWatchResult::READY;
+    }
+    return ClientWatchResult::TIMEOUT;
+}
+
+ClientWatchResult ClientEventLog::EventsPending(const ClientEventCursor& after, const std::optional<MarketId>& market,
+                                                const std::optional<AccountId>& account) const
+{
+    std::lock_guard lock{m_mutex};
+    return PendingLocked(after, market, account);
+}
+
+ClientWatchResult ClientEventLog::WaitEvents(const ClientEventCursor& after, const std::optional<MarketId>& market,
+                                             const std::optional<AccountId>& account,
+                                             const std::chrono::steady_clock::time_point deadline,
+                                             const std::function<bool()>& interrupted) const
+{
+    std::unique_lock lock{m_mutex};
+    // The pending check and the registration share the lock every append
+    // signals under, so no append can fall between them.
+    if (const auto now{PendingLocked(after, market, account)}; now != ClientWatchResult::TIMEOUT) return now;
+    if (m_watchers.size() >= CLIENT_EVENT_MAX_WATCHERS) return ClientWatchResult::BUSY;
+    const uint256 instance{m_instance_id};
+    const uint64_t wake{m_wake_epoch};
+    const auto self{std::make_shared<EventWatcher>(after, market, account)};
+    m_watchers.push_back(self);
+    // Declared after lock, so it is destroyed, and deregistered, under m_mutex.
+    struct Deregister {
+        std::vector<std::shared_ptr<EventWatcher>>& watchers;
+        const EventWatcher* self;
+        ~Deregister()
+        {
+            const auto it{std::find_if(watchers.begin(), watchers.end(),
+                                       [&](const auto& watcher) { return watcher.get() == self; })};
+            // Registered above under this same lock; only this call removes it.
+            Assert(it != watchers.end());
+            watchers.erase(it);
+        }
+    } deregister{m_watchers, self.get()};
+    while (true) {
+        if (!self->changed.wait_until(lock, deadline, [&] {
+                return self->signalled || m_instance_id != instance || m_wake_epoch != wake ||
+                       (interrupted && interrupted());
+            })) {
+            return ClientWatchResult::TIMEOUT;
+        }
+        if (m_instance_id != instance) return ClientWatchResult::RESTARTED;
+        if (m_wake_epoch != wake || (interrupted && interrupted())) return ClientWatchResult::INTERRUPTED;
+        if (const auto now{PendingLocked(after, market, account)}; now != ClientWatchResult::TIMEOUT) return now;
+        // Defensive: an append signals only a READY or GAP condition.
+        self->signalled = false;
+    }
+}
+
+size_t ClientEventLog::WatchersForTest() const
+{
+    std::lock_guard lock{m_mutex};
+    return m_watchers.size();
 }
 
 } // namespace flowmesh

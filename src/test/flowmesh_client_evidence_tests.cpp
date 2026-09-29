@@ -5,6 +5,7 @@
 #include <flowmesh/auth.h>
 #include <flowmesh/client_evidence.h>
 #include <node/flowmesh_runtime.h>
+#include <random.h>
 #include <test/util/flowmesh.h>
 #include <test/util/setup_common.h>
 
@@ -661,6 +662,253 @@ BOOST_AUTO_TEST_CASE(action_wait_interrupt_and_reset_wake_waiters)
         BOOST_CHECK(!result.status); // The new instance has not seen the action.
         BOOST_CHECK(WaitClock::now() - start < 2s);
     }
+}
+
+namespace {
+flowmesh::ClientEvent AccountEvent(unsigned char market, unsigned char account, flowmesh::ClientEventKind kind)
+{
+    flowmesh::ClientEvent event;
+    event.market_id = Filled(market);
+    event.account_id = Filled(account);
+    event.action_id = Filled(static_cast<unsigned char>(account + 100));
+    event.kind = kind;
+    return event;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(event_watch_returns_at_once_for_pending_events_and_gaps)
+{
+    using Kind = flowmesh::ClientEventKind;
+    using Watch = flowmesh::ClientWatchResult;
+    flowmesh::ClientEventLog log{Filled(1)};
+    log.Append(AccountEvent(2, 4, Kind::POOL_ADMITTED));
+    const auto current{log.Cursor()};
+    const auto start{WaitClock::now()};
+    // Nothing new after the current cursor: a watch has to wait.
+    BOOST_CHECK(log.EventsPending(current, Filled(2), Filled(4)) == Watch::TIMEOUT);
+    // Another instance, a cursor in the future: gaps, answered at once.
+    BOOST_CHECK(log.WaitEvents({Filled(9), 1}, Filled(2), Filled(4), start + 5s, {}) == Watch::GAP);
+    BOOST_CHECK(log.WaitEvents({Filled(1), 7}, Filled(2), Filled(4), start + 5s, {}) == Watch::GAP);
+    // An event after the cursor that the filter keeps.
+    BOOST_CHECK(log.WaitEvents({Filled(1), 0}, Filled(2), Filled(4), start + 5s, {}) == Watch::READY);
+    // ... but not one the filter drops.
+    BOOST_CHECK(log.EventsPending({Filled(1), 0}, Filled(2), Filled(5)) == Watch::TIMEOUT);
+    BOOST_CHECK(log.EventsPending({Filled(1), 0}, Filled(3), std::nullopt) == Watch::TIMEOUT);
+    // A certified head is relevant to every account of its market.
+    log.Append(AccountEvent(2, 0, Kind::CERTIFIED_HEAD));
+    BOOST_CHECK(log.WaitEvents(current, Filled(2), Filled(5), start + 5s, {}) == Watch::READY);
+    // An evicted cursor.
+    for (size_t i{0}; i < flowmesh::CLIENT_EVENT_CAPACITY; ++i) log.Append(AccountEvent(3, 4, Kind::POOL_ADMITTED));
+    BOOST_CHECK(log.WaitEvents(current, Filled(2), Filled(5), start + 5s, {}) == Watch::GAP);
+    BOOST_CHECK(WaitClock::now() - start < 1s);
+    BOOST_CHECK_EQUAL(log.WatchersForTest(), 0U);
+    BOOST_CHECK_EQUAL(std::string{flowmesh::ClientWatchResultName(Watch::READY)}, "ready");
+    BOOST_CHECK_EQUAL(std::string{flowmesh::ClientWatchResultName(Watch::BUSY)}, "busy");
+}
+
+BOOST_AUTO_TEST_CASE(event_watch_pending_agrees_with_read)
+{
+    using Kind = flowmesh::ClientEventKind;
+    using Watch = flowmesh::ClientWatchResult;
+    FastRandomContext rng{/*fDeterministic=*/true};
+    constexpr std::array KINDS{Kind::QUEUE_ADMITTED, Kind::POOL_ADMITTED, Kind::POOL_REFUSED,
+                               Kind::CERTIFIED_INCLUDED, Kind::CERTIFIED_HEAD};
+    for (int round{0}; round < 40; ++round) {
+        flowmesh::ClientEventLog log{Filled(1)};
+        const auto events{rng.randrange(flowmesh::CLIENT_EVENT_CAPACITY + 40)};
+        for (uint64_t i{0}; i < events; ++i) {
+            log.Append(AccountEvent(static_cast<unsigned char>(2 + rng.randrange(2)),
+                                    static_cast<unsigned char>(4 + rng.randrange(2)), KINDS[rng.randrange(KINDS.size())]));
+        }
+        const auto last{log.Cursor().event_id};
+        for (int probe{0}; probe < 60; ++probe) {
+            const flowmesh::ClientEventCursor cursor{rng.randrange(8) == 0 ? Filled(9) : Filled(1),
+                                                     rng.randrange(last + 3)};
+            const std::optional<uint256> market{rng.randbool() ? std::optional{Filled(static_cast<unsigned char>(2 + rng.randrange(3)))} : std::nullopt};
+            const std::optional<uint256> account{rng.randbool() ? std::optional{Filled(static_cast<unsigned char>(4 + rng.randrange(3)))} : std::nullopt};
+            const auto page{log.Read(cursor, market, account)};
+            const auto pending{log.EventsPending(cursor, market, account)};
+            BOOST_CHECK_EQUAL(pending == Watch::GAP, page.gap);
+            BOOST_CHECK_EQUAL(pending == Watch::READY, !page.gap && !page.events.empty());
+            BOOST_CHECK_EQUAL(pending == Watch::TIMEOUT, !page.gap && page.events.empty());
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(event_watch_wakes_only_on_relevant_appends)
+{
+    using Kind = flowmesh::ClientEventKind;
+    for (const bool head : {true, false}) {
+        flowmesh::ClientEventLog log{Filled(1)};
+        log.Append(AccountEvent(2, 4, Kind::POOL_ADMITTED));
+        const auto cursor{log.Cursor()};
+        WaitProbe probe;
+        const auto start{WaitClock::now()};
+        auto watcher{std::async(std::launch::async, [&] {
+            return log.WaitEvents(cursor, Filled(2), Filled(4), start + 5s, probe.Predicate());
+        })};
+        probe.AwaitEvaluations(1);
+        // Another market's events, and another account's non-head events in
+        // this market, neither end nor even wake it.
+        for (int i{0}; i < 20; ++i) {
+            log.Append(AccountEvent(3, 4, Kind::CERTIFIED_HEAD));
+            log.Append(std::vector{AccountEvent(2, 5, Kind::POOL_ADMITTED), AccountEvent(2, 5, Kind::CERTIFIED_INCLUDED)});
+        }
+        std::this_thread::sleep_for(50ms);
+        BOOST_CHECK(watcher.wait_for(0s) == std::future_status::timeout);
+        BOOST_CHECK_LE(probe.evaluations.load(), 2U); // At most one spurious wakeup.
+        BOOST_CHECK_EQUAL(log.WatchersForTest(), 1U);
+        // Its market's certified head, or its own account's event, does.
+        if (head) log.Append(AccountEvent(2, 0, Kind::CERTIFIED_HEAD));
+        else log.Append(AccountEvent(2, 4, Kind::CERTIFIED_INCLUDED));
+        BOOST_CHECK(watcher.get() == flowmesh::ClientWatchResult::READY);
+        BOOST_CHECK(WaitClock::now() - start < 3s);
+        BOOST_CHECK_EQUAL(log.WatchersForTest(), 0U);
+        // The page it now reads holds exactly that event.
+        const auto page{log.Read(cursor, Filled(2), Filled(4))};
+        BOOST_REQUIRE_EQUAL(page.events.size(), 1U);
+        BOOST_CHECK(page.events[0].kind == (head ? Kind::CERTIFIED_HEAD : Kind::CERTIFIED_INCLUDED));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(event_watch_detects_cursor_eviction_while_waiting)
+{
+    using Kind = flowmesh::ClientEventKind;
+    flowmesh::ClientEventLog log{Filled(1)};
+    log.Append(AccountEvent(2, 4, Kind::POOL_ADMITTED));
+    const auto cursor{log.Cursor()};
+    WaitProbe probe;
+    auto watcher{std::async(std::launch::async, [&] {
+        return log.WaitEvents(cursor, Filled(2), Filled(4), WaitClock::now() + 5s, probe.Predicate());
+    })};
+    probe.AwaitEvaluations(1);
+    // Unrelated events only, until the ring no longer retains the cursor.
+    for (size_t i{0}; i < flowmesh::CLIENT_EVENT_CAPACITY; ++i) log.Append(AccountEvent(3, 4, Kind::POOL_ADMITTED));
+    BOOST_CHECK(watcher.wait_for(50ms) == std::future_status::timeout);
+    log.Append(AccountEvent(3, 4, Kind::POOL_ADMITTED));
+    BOOST_CHECK(watcher.get() == flowmesh::ClientWatchResult::GAP);
+    BOOST_CHECK(log.Read(cursor, Filled(2), Filled(4)).gap);
+    // A single batch larger than the ring, too.
+    const auto second{log.Cursor()};
+    auto batched{std::async(std::launch::async, [&] {
+        return log.WaitEvents(second, Filled(2), Filled(4), WaitClock::now() + 5s, {});
+    })};
+    while (log.WatchersForTest() == 0) std::this_thread::sleep_for(1ms);
+    log.Append(std::vector<flowmesh::ClientEvent>(flowmesh::CLIENT_EVENT_CAPACITY + 2, AccountEvent(3, 4, Kind::POOL_ADMITTED)));
+    BOOST_CHECK(batched.get() == flowmesh::ClientWatchResult::GAP);
+}
+
+BOOST_AUTO_TEST_CASE(event_watch_times_out_without_events)
+{
+    flowmesh::ClientEventLog log{Filled(1)};
+    const auto start{WaitClock::now()};
+    BOOST_CHECK(log.WaitEvents(log.Cursor(), Filled(2), std::nullopt, start + 100ms, {}) == flowmesh::ClientWatchResult::TIMEOUT);
+    BOOST_CHECK(WaitClock::now() - start >= 100ms);
+    BOOST_CHECK(WaitClock::now() - start < 2s);
+    BOOST_CHECK_EQUAL(log.WatchersForTest(), 0U);
+    // A deadline already passed returns without registering.
+    BOOST_CHECK(log.WaitEvents(log.Cursor(), Filled(2), std::nullopt, start, {}) == flowmesh::ClientWatchResult::TIMEOUT);
+}
+
+BOOST_AUTO_TEST_CASE(event_watch_interrupt_wakewaiters_and_reset_end_waits)
+{
+    using Watch = flowmesh::ClientWatchResult;
+    flowmesh::ClientEventLog log{Filled(1)};
+    {
+        WaitProbe probe;
+        const auto start{WaitClock::now()};
+        auto watcher{std::async(std::launch::async, [&] {
+            return log.WaitEvents(log.Cursor(), Filled(2), std::nullopt, start + 5s, probe.Predicate());
+        })};
+        probe.AwaitEvaluations(1);
+        log.WakeWaiters();
+        BOOST_CHECK(watcher.get() == Watch::INTERRUPTED);
+        BOOST_CHECK(WaitClock::now() - start < 2s);
+    }
+    {
+        // An earlier wakeup does not end a later watch.
+        BOOST_CHECK(log.WaitEvents(log.Cursor(), Filled(2), std::nullopt, WaitClock::now() + 50ms, {}) == Watch::TIMEOUT);
+        // A caller interrupted before it sleeps returns at once.
+        WaitProbe probe;
+        probe.interrupt = true;
+        const auto start{WaitClock::now()};
+        BOOST_CHECK(log.WaitEvents(log.Cursor(), Filled(2), std::nullopt, start + 5s, probe.Predicate()) == Watch::INTERRUPTED);
+        BOOST_CHECK(WaitClock::now() - start < 1s);
+    }
+    {
+        WaitProbe probe;
+        const auto start{WaitClock::now()};
+        auto watcher{std::async(std::launch::async, [&] {
+            return log.WaitEvents(log.Cursor(), Filled(2), std::nullopt, start + 5s, probe.Predicate());
+        })};
+        probe.AwaitEvaluations(1);
+        log.Reset(Filled(7));
+        BOOST_CHECK(watcher.get() == Watch::RESTARTED);
+        BOOST_CHECK(WaitClock::now() - start < 2s);
+    }
+    BOOST_CHECK_EQUAL(log.WatchersForTest(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(event_watch_registration_cap_returns_busy)
+{
+    flowmesh::ClientEventLog log{Filled(1)};
+    const auto cursor{log.Cursor()};
+    std::vector<std::future<flowmesh::ClientWatchResult>> watchers;
+    for (size_t i{0}; i < flowmesh::CLIENT_EVENT_MAX_WATCHERS; ++i) {
+        watchers.push_back(std::async(std::launch::async, [&] {
+            return log.WaitEvents(cursor, Filled(2), std::nullopt, WaitClock::now() + 10s, {});
+        }));
+    }
+    const auto deadline{WaitClock::now() + 5s};
+    while (log.WatchersForTest() < flowmesh::CLIENT_EVENT_MAX_WATCHERS && WaitClock::now() < deadline) std::this_thread::sleep_for(1ms);
+    BOOST_REQUIRE_EQUAL(log.WatchersForTest(), flowmesh::CLIENT_EVENT_MAX_WATCHERS);
+    const auto start{WaitClock::now()};
+    BOOST_CHECK(log.WaitEvents(cursor, Filled(2), std::nullopt, start + 5s, {}) == flowmesh::ClientWatchResult::BUSY);
+    BOOST_CHECK(WaitClock::now() - start < 1s);
+    // An already answerable watch never needs a registration.
+    log.Append(AccountEvent(3, 4, flowmesh::ClientEventKind::POOL_ADMITTED));
+    BOOST_CHECK(log.WaitEvents(cursor, Filled(3), std::nullopt, start + 5s, {}) == flowmesh::ClientWatchResult::READY);
+    // One relevant append ends every registered watch.
+    log.Append(AccountEvent(2, 4, flowmesh::ClientEventKind::CERTIFIED_HEAD));
+    for (auto& watcher : watchers) BOOST_CHECK(watcher.get() == flowmesh::ClientWatchResult::READY);
+    BOOST_CHECK_EQUAL(log.WatchersForTest(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(event_watch_does_not_disturb_action_waits)
+{
+    using Kind = flowmesh::ClientEventKind;
+    flowmesh::ClientEventLog log{Filled(1)};
+    log.Append(ActionEvent(2, 3, Kind::QUEUE_ADMITTED));
+    const auto cursor{log.Cursor()};
+    const auto start{WaitClock::now()};
+    auto action{std::async(std::launch::async, [&] {
+        return log.WaitActionStatus(Filled(2), Filled(3), start + 300ms, {});
+    })};
+    auto watcher{std::async(std::launch::async, [&] {
+        return log.WaitEvents(cursor, Filled(2), std::nullopt, start + 5s, {});
+    })};
+    while (log.WatchersForTest() == 0) std::this_thread::sleep_for(1ms);
+    // Relevant to the watch, not to the action.
+    log.Append(ActionEvent(2, 4, Kind::CERTIFIED_INCLUDED));
+    BOOST_CHECK(watcher.get() == flowmesh::ClientWatchResult::READY);
+    const auto waited{action.get()};
+    BOOST_CHECK(waited.result == flowmesh::ClientWaitResult::TIMEOUT);
+    BOOST_REQUIRE(waited.status);
+    BOOST_CHECK(waited.status->kind == Kind::QUEUE_ADMITTED);
+    BOOST_CHECK(WaitClock::now() - start >= 300ms);
+    // With a watch registered, the action's inclusion still ends its wait.
+    const auto next{log.Cursor()};
+    auto second{std::async(std::launch::async, [&] {
+        return log.WaitEvents(next, Filled(5), std::nullopt, WaitClock::now() + 300ms, {});
+    })};
+    WaitProbe probe;
+    auto terminal{std::async(std::launch::async, [&] {
+        return log.WaitActionStatus(Filled(2), Filled(3), WaitClock::now() + 5s, probe.Predicate());
+    })};
+    probe.AwaitEvaluations(1);
+    log.Append(ActionEvent(2, 3, Kind::CERTIFIED_INCLUDED));
+    BOOST_CHECK(terminal.get().result == flowmesh::ClientWaitResult::TERMINAL);
+    BOOST_CHECK(second.get() == flowmesh::ClientWatchResult::TIMEOUT);
 }
 
 BOOST_AUTO_TEST_CASE(runtime_certified_action_status_recovers_after_restart_without_resubmission)
