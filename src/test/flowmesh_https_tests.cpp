@@ -7,6 +7,7 @@
 #include <node/flowmesh_client_action_wait.h>
 #include <node/flowmesh_client_outcome.h>
 #include <node/flowmesh_service.h>
+#include <node/flowmesh_timing.h>
 #include <chain.h>
 #include <consensus/era.h>
 #include <consensus/flowmesh_params.h>
@@ -49,6 +50,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -2325,12 +2327,17 @@ struct ScriptedEndpoint {
     //! and how often each was read.
     std::map<std::string, UniValue> by_action;
     std::map<std::string, unsigned> by_action_reads;
+    //! Called with the method and params before `mutex` is taken, so a test
+    //! can hold one request while others (on other connections) are served.
+    //! Set before the endpoint serves.
+    std::function<void(const std::string&, const UniValue&)> before;
 
     node::FlowMeshHttpsServer::Response Handle(const node::FlowMeshHttpsServer::Request& request)
     {
         UniValue json;
         if (!json.read(request.body) || !json.isObject() || !json["method"].isStr()) return {400, R"({"ok":false,"error":"test","result":null})"};
         const auto& method{json["method"].get_str()};
+        if (before) before(method, json["params"]);
         std::lock_guard lock{mutex};
         UniValue out{UniValue::VOBJ};
         out.pushKV("ok", true);
@@ -2372,6 +2379,61 @@ struct ScriptedEndpoint {
     {
         std::lock_guard lock{mutex};
         return {plain_reads, waited_reads, submits, market_reads};
+    }
+};
+
+//! Holds the requests a ScriptedEndpoint::before hook passes to Hold until
+//! Release (at most 4 s), and tells the test when they arrived.
+struct RequestGate {
+    std::mutex mutex;
+    std::condition_variable condition;
+    unsigned entered{0};
+    bool released{false};
+    void Hold()
+    {
+        std::unique_lock lock{mutex};
+        ++entered;
+        condition.notify_all();
+        condition.wait_for(lock, std::chrono::seconds{4}, [&] { return released; });
+    }
+    bool AwaitEntered(const unsigned count = 1)
+    {
+        std::unique_lock lock{mutex};
+        return condition.wait_for(lock, std::chrono::seconds{3}, [&] { return entered >= count; });
+    }
+    void Release()
+    {
+        {
+            std::lock_guard lock{mutex};
+            released = true;
+        }
+        condition.notify_all();
+    }
+};
+
+//! Records this process's FlowMesh timing spans (default off, as in
+//! production) for one test; Stop returns the events of one stage.
+struct TimingCapture {
+    bool active{true};
+    TimingCapture() { node::FlowMeshTimingControl("start"); }
+    ~TimingCapture()
+    {
+        if (!active) return;
+        try {
+            node::FlowMeshTimingControl("stop");
+        } catch (...) {
+        }
+    }
+    std::vector<UniValue> Stop(const std::string& stage)
+    {
+        active = false;
+        const auto capture{node::FlowMeshTimingControl("stop")};
+        std::vector<UniValue> out;
+        for (const auto& row : capture["events"].getValues()) {
+            const auto& event{row["event"]};
+            if (event["stage"].isStr() && event["stage"].get_str() == stage) out.push_back(event);
+        }
+        return out;
     }
 };
 
@@ -2529,9 +2591,15 @@ struct ClientLaneFixture : TestingSetup {
     {
         return {"https://127.0.0.1:" + std::to_string(port), cert, pin};
     }
-    std::unique_ptr<node::FlowMeshHttpsServer> Serve(ScriptedEndpoint& endpoint, uint16_t port = 0) const
+    //! `connections`, when set, is told of every connection the endpoint admits.
+    std::unique_ptr<node::FlowMeshHttpsServer> Serve(ScriptedEndpoint& endpoint, uint16_t port = 0,
+                                                     ConnectionObservation* connections = nullptr) const
     {
         auto server{std::make_unique<node::FlowMeshHttpsServer>(Options(port), [&endpoint](const auto& request) { return endpoint.Handle(request); })};
+        if (connections) {
+            BOOST_REQUIRE(node::FlowMeshHttpsTestAccess::ObserveConnection(*server,
+                [connections](bool tcp_nodelay) { connections->Record(tcp_nodelay); }));
+        }
         std::string error;
         BOOST_REQUIRE_MESSAGE(server->Start(error), error);
         return server;
@@ -2907,6 +2975,154 @@ BOOST_AUTO_TEST_CASE(lane_needs_a_delivery_acknowledged_in_this_process)
     const auto delivered{client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000})};
     BOOST_CHECK_EQUAL(delivered.state, "admitted");
     BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{2, 1, 1, 1}));
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(lane_borrows_the_warm_ordinary_connection_for_its_first_waited_read)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+    validator.plain = validator.submit = Receipt(action, "admitted");
+    validator.waited = CertifiedReceipt(action);
+    validator.waited.pushKV("wait_status", "terminal");
+    ConnectionObservation connections;
+    auto server{Serve(validator, 0, &connections)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_REQUIRE_EQUAL(client->ActionStatus(market, action.Id(), true).state, "admitted");
+    BOOST_REQUIRE_EQUAL(connections.Count(), 1U);
+    std::this_thread::sleep_for(std::chrono::milliseconds{150}); // Refill the automatic read budget.
+
+    // The lane has never connected; the ordinary connection just delivered
+    // the action. The waited read carries it: the endpoint sees no second
+    // connection and the read performs no TLS handshake.
+    std::vector<UniValue> spans;
+    interfaces::FlowMeshActionReceipt waited;
+    {
+        TimingCapture timing;
+        waited = client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000});
+        spans = timing.Stop("client_action_wait");
+    }
+    BOOST_CHECK(waited.certificate_verified);
+    BOOST_CHECK_EQUAL(waited.state, "certified_inclusion");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{1, 1, 1, 1}));
+    BOOST_CHECK_EQUAL(connections.Count(), 1U);
+    BOOST_REQUIRE_EQUAL(spans.size(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["borrowed"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["connection_reused"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["tls_handshake_performed"].getInt<uint64_t>(), 0U);
+    BOOST_CHECK_EQUAL(spans[0]["handed_back"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["result"].get_str(), "certified");
+    // Handed back: ordinary work keeps using the same connection.
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{1, 1, 1, 2}));
+    BOOST_CHECK_EQUAL(connections.Count(), 1U);
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(lane_keeps_the_carried_connection_when_ordinary_work_opened_its_own)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+    validator.plain = validator.submit = validator.waited = Receipt(action, "admitted");
+    validator.waited.pushKV("wait_status", "timeout");
+    RequestGate gate;
+    std::atomic<bool> hold{true};
+    validator.before = [&](const std::string& method, const UniValue& params) {
+        if (method == "action" && params.exists("wait_ms") && hold.exchange(false)) gate.Hold();
+    };
+    ConnectionObservation connections;
+    auto server{Serve(validator, 0, &connections)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_REQUIRE_EQUAL(client->ActionStatus(market, action.Id(), true).state, "admitted");
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+
+    TimingCapture timing;
+    std::thread waiter{[&] { (void)client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000}); }};
+    BOOST_REQUIRE(gate.AwaitEntered());
+    // While the lane carries the connection, ordinary work is not blocked
+    // by the wait and opens its own connection.
+    BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_CHECK_EQUAL(connections.Count(), 2U);
+    gate.Release();
+    waiter.join();
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    // Both sessions are warm now: the lane keeps what it carried and the
+    // next waited read uses it without borrowing or a handshake.
+    (void)client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000});
+    BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto spans{timing.Stop("client_action_wait")};
+    BOOST_CHECK_EQUAL(connections.Count(), 2U);
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{1, 2, 1, 3}));
+    BOOST_REQUIRE_EQUAL(spans.size(), 2U);
+    BOOST_CHECK_EQUAL(spans[0]["borrowed"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["handed_back"].getInt<uint64_t>(), 0U);
+    BOOST_CHECK_EQUAL(spans[1]["borrowed"].getInt<uint64_t>(), 0U);
+    BOOST_CHECK_EQUAL(spans[1]["connection_reused"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[1]["tls_handshake_performed"].getInt<uint64_t>(), 0U);
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(lane_hands_back_no_connection_that_an_explicit_reconnect_reset)
+{
+    const fs::path path{m_path_root / "client"};
+    const uint256 owner{*uint256::FromHex(std::string(64, '4'))};
+    const auto action{Seed(path, owner)};
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+    validator.plain = validator.submit = validator.waited = Receipt(action, "admitted");
+    validator.waited.pushKV("wait_status", "timeout");
+    RequestGate gate;
+    std::atomic<bool> hold{true};
+    validator.before = [&](const std::string& method, const UniValue& params) {
+        if (method == "action" && params.exists("wait_ms") && hold.exchange(false)) gate.Hold();
+    };
+    ConnectionObservation connections;
+    auto server{Serve(validator, 0, &connections)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    BOOST_REQUIRE_EQUAL(client->ActionStatus(market, action.Id(), true).state, "admitted");
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+
+    TimingCapture timing;
+    std::thread waiter{[&] { (void)client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000}); }};
+    BOOST_REQUIRE(gate.AwaitEntered());
+    // An explicit reconnect revalidates trust while the lane carries the
+    // connection verified before it: that one is never handed back.
+    BOOST_CHECK_EQUAL(client->Reconnect().status, "reachable");
+    BOOST_CHECK_EQUAL(connections.Count(), 2U);
+    gate.Release();
+    waiter.join();
+    // Ordinary work keeps the reconnect's connection.
+    BOOST_CHECK_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    std::this_thread::sleep_for(std::chrono::milliseconds{150});
+    // The lane drops what it carried before its next request, then carries
+    // the reconnect's verified connection.
+    (void)client->ActionStatus(market, action.Id(), false, std::chrono::milliseconds{2000});
+    const auto spans{timing.Stop("client_action_wait")};
+    BOOST_CHECK_EQUAL(connections.Count(), 2U);
+    BOOST_REQUIRE_EQUAL(spans.size(), 2U);
+    BOOST_CHECK_EQUAL(spans[0]["borrowed"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[0]["handed_back"].getInt<uint64_t>(), 0U);
+    BOOST_CHECK_EQUAL(spans[1]["borrowed"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[1]["connection_reused"].getInt<uint64_t>(), 1U);
+    BOOST_CHECK_EQUAL(spans[1]["handed_back"].getInt<uint64_t>(), 1U);
     client.reset();
     server->Stop();
 }

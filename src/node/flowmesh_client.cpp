@@ -1064,13 +1064,18 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     FlowMeshClientWorkGate m_work;
     // One TLS connection, owned exclusively under m_work. Reuse changes only
     // transport setup, not economic retry, state ownership or durability.
+    // A waited read whose own connection is cold may carry this verified one
+    // on the wait lane (swapped under m_work with the lane held) and hands it
+    // back under m_work; meanwhile m_https holds the lane's previous session
+    // and opens its own connection if ordinary work needs one.
     FlowMeshHttpsClient m_https;
     // Waited status reads use their own TLS connection so that m_work is not
     // held across a server-side wait. m_wait_lane is only ever try-locked, and
     // never while holding m_work; a busy lane means an ordinary status read.
     std::mutex m_wait_lane;
     FlowMeshHttpsClient m_wait_https;
-    // Set where m_https is reset; the lane revalidates trust before its next use.
+    // Set where m_https is reset, under m_work; the lane consumes it under
+    // m_work and revalidates trust before its next use.
     std::atomic<bool> m_wait_reset{false};
     // Per endpoint (index-stable, like m_retry_after), under m_work: the bounded
     // 'action' wait each endpoint last advertised. Zero never sends wait_ms.
@@ -2342,6 +2347,27 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         // this observation changes only the receipt.
         SaveRestartState(); return p.receipt;
     }
+    //! Under m_work while holding the wait lane, right before a lane request
+    //! to `target`: consumes a pending trust reset (set with m_work held by
+    //! Connect and Reconnect), then carries m_https's connection on the lane
+    //! when only that one would be reused for `target`. True if it did.
+    bool BorrowForLane(const HttpsEndpoint& target)
+    {
+        if (m_wait_reset.exchange(false)) m_wait_https.Reset();
+        return !m_wait_https.Warm(target) && m_https.Warm(target) && m_wait_https.Swap(m_https);
+    }
+    //! Under m_work, still holding the wait lane, after that request: hands a
+    //! carried connection back if it is still reusable, no explicit Connect
+    //! or Reconnect reset trust meanwhile (the lane then drops it before its
+    //! next use), and ordinary work has not meanwhile opened a connection to
+    //! the selected endpoint (the lane then keeps the carried one). True if
+    //! it did.
+    bool ReturnLaneBorrow(const bool borrowed, const HttpsEndpoint& target)
+    {
+        if (!borrowed || m_wait_reset.load() || !m_wait_https.Warm(target) ||
+            m_https.Warm(m_endpoints.at(m_selected))) return false;
+        return m_https.Swap(m_wait_https);
+    }
     // One waited 'action' read of an action this process delivered, sent on
     // the lane connection to the endpoint that acknowledged the delivery and
     // only if that endpoint advertises the wait. m_work is held to select the
@@ -2359,6 +2385,14 @@ class RemoteBackend final : public FlowMeshTradingBackend {
     // cooldown, and a lane request that got no HTTP response keeps the lane
     // off that endpoint until a successful response from it is recorded, so
     // an endpoint that goes silent costs that extra time once, not per call.
+    //
+    // Transport: the lane's own connection goes cold after 25 s without a
+    // waited read, which is every trade of a sporadic trader, while m_https
+    // to the same endpoint is usually warm (the preflight, the submission
+    // and passive refreshes just used it). Then the request carries that
+    // verified connection instead of a new TCP + TLS setup, and it is handed
+    // back when the reply has been applied. Transport only: the same bytes
+    // are sent and Request re-checks origin, pin and CA content first.
     std::optional<Receipt> WaitedActionStatus(const uint256& market, const uint256& action, std::chrono::milliseconds requested)
     {
         FlowMeshTimingSpan timing{"client_action_wait"};
@@ -2372,6 +2406,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         size_t endpoint{0};
         std::chrono::milliseconds wait{0};
         bool with_outcome{false};
+        bool borrowed{false};
         timing.Mark("select_lock_requested_us");
         {
             WorkLock lock{*this};
@@ -2398,10 +2433,11 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             if (!m_action_polls.TryChargeAttempt(std::chrono::steady_clock::now())) { outcome("coalesced"); return std::nullopt; }
             target = m_endpoints.at(endpoint);
             with_outcome = m_action_outcome.at(endpoint);
+            borrowed = BorrowForLane(target);
         }
         timing.Field("wait_ms", uint64_t(wait.count()));
         timing.Field("endpoint", target.url);
-        if (m_wait_reset.exchange(false)) m_wait_https.Reset();
+        timing.Field("borrowed", uint64_t{borrowed});
         UniValue params{UniValue::VOBJ};
         params.pushKV("market_id", market.GetHex()); params.pushKV("action_id", action.GetHex());
         params.pushKV("wait_ms", uint64_t(wait.count()));
@@ -2413,7 +2449,7 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         const auto reply{m_wait_https.Request(target, "/flowmesh/v1", request.write(), wait + CLIENT_REQUEST_TIMEOUT,
                                               with_outcome ? CLIENT_ACTION_OUTCOME_MAX_REPLY : CLIENT_ACTION_WAIT_MAX_REPLY)};
         timing.Mark("request_completed_us");
-        lane.unlock();
+        // The lane stays held until a carried connection is handed back.
         timing.Field("connection_reused", uint64_t{reply.connection_reused});
         timing.Field("tls_handshake_performed", uint64_t{reply.tls_handshake_performed});
         UniValue result;
@@ -2439,6 +2475,8 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         timing.Mark("apply_lock_requested_us");
         WorkLock lock{*this};
         timing.Mark("apply_lock_acquired_us");
+        timing.Field("handed_back", uint64_t{ReturnLaneBorrow(borrowed, target)});
+        lane.unlock();
         if (!reply.response_received) m_wait_unanswered.at(endpoint) = true;
         m_action_polls.RecordExtraCost(std::chrono::steady_clock::now(), OutcomeExtraCost(result));
         if (unsupported) {
