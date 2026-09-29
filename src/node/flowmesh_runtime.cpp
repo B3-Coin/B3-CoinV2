@@ -3887,6 +3887,16 @@ void FlowMeshRuntime::ProcessAddMarketCommand(AddMarketCommand command)
             if (command.market.readiness == FlowMeshRuntimeMarketReadiness::READY) {
                 m_probe_markets.push_back(command.market.market_id);
             }
+            // Health: an added market (or a shell replaced by a ready one)
+            // is observed before AddMarket returns, not up to a tick later.
+            size_t connected_peers{0};
+            std::optional<flowmesh::WireClock::time_point> no_peers_since;
+            {
+                std::lock_guard<std::mutex> queue_lock{m_queue_mutex};
+                connected_peers = m_connected_peers.size();
+                no_peers_since = m_no_peers_since;
+            }
+            PublishHealth(m_config.clock->Now(), connected_peers, no_peers_since, /*force=*/true);
         }
     }
     if (ok) {

@@ -7026,6 +7026,43 @@ BOOST_AUTO_TEST_CASE(health_lag_is_proven_only_by_verified_certificates_and_spec
     BOOST_CHECK(!f.Lag(f.Health()).behind_since);
 }
 
+BOOST_AUTO_TEST_CASE(health_snapshot_includes_an_added_market_before_add_returns)
+{
+    const uint256 domain{Filled(0x1d)};
+    const modern::AssetId asset{Filled(0x3d)};
+    const auto market{*flowmesh::ComputeFlowMeshMarketId(domain, asset)};
+    const auto vault{*flowmesh::ComputeFlowMeshVaultId(domain, market)};
+    const SeatFixture seats{Seats(domain, market, 4, 7, 100, Filled(0x71), 150)};
+    RuntimeChain chain;
+    chain.m_domain = domain;
+    chain.Add(seats.seats);
+    RuntimeKeys keys;
+    FixedClock clock;
+    const flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(), flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
+    node::FlowMeshProductionStore store{DBParams{
+        .path = m_args.GetDataDirBase() / "flowmesh_health_added_market",
+        .cache_bytes = size_t{1} << 20, .wipe_data = true}};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(store.OpenForMarket(domain, market, seats.seats, initial.Root(), error), error);
+    node::FlowMeshRuntimeConfig config;
+    config.chain = &chain;
+    config.keys = &keys;
+    config.clock = &clock;
+    config.relay = [](node::FlowMeshRuntimeRelay) { return LegacyRelayResult(); };
+    node::FlowMeshRuntime runtime{config, {}};
+    BOOST_REQUIRE_MESSAGE(runtime.Start(error), error);
+    BOOST_REQUIRE(runtime.HealthSnapshot());
+    BOOST_CHECK(runtime.HealthSnapshot()->markets.empty());
+    // No tick and no clock movement: AddMarket itself publishes.
+    BOOST_REQUIRE_MESSAGE(runtime.AddMarket(MarketConfig(domain, market, Filled(0x5d), seats.seats, initial, store, nullptr),
+                                            error), error);
+    const auto health{runtime.HealthSnapshot()};
+    BOOST_REQUIRE_EQUAL(health->markets.size(), 1U);
+    BOOST_CHECK(health->markets.front().market_id == market);
+    BOOST_CHECK(health->markets.front().installed);
+    runtime.Stop();
+}
+
 BOOST_AUTO_TEST_CASE(health_snapshot_is_readable_while_the_worker_is_blocked)
 {
     HealthRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_health_blocked"};
