@@ -2433,6 +2433,80 @@ class RemoteBackend final : public FlowMeshTradingBackend {
             m_https.Warm(m_endpoints.at(m_selected))) return false;
         return m_https.Swap(m_wait_https);
     }
+    //! Applies an endpoint's 'action' reply that arrived on the wait lane (a
+    //! waited read's, or the one a waited submission embeds) to p, under
+    //! m_work, by QueryAction's rules. A receipt verified, or an action proven
+    //! not executed, meanwhile is returned unchanged (evidence for the same
+    //! entry may still verify its outcome). An applied certification is saved
+    //! before it is returned. nullopt when nothing was applied and no verified
+    //! label changed: the caller falls back to its ordinary path. A reply
+    //! applied whose outbox save then failed, or a verified label the current
+    //! authority no longer accepts, is returned unverified with the failure as
+    //! its reason. `label` names the result for diagnostics.
+    std::optional<Receipt> ApplyLaneResult(Pending& p, const UniValue& result, const size_t endpoint,
+                                           FlowMeshTimingSpan& timing, std::string& label)
+    {
+        const std::pair key{p.market, p.action.Id()};
+        const bool verified_before{p.receipt.certificate_verified || ProvenNotExecuted(p)};
+        bool applied{false};
+        try {
+            const auto pins{RecheckActionAuthority(p)};
+            if (p.receipt.certificate_verified) {
+                // Proved by another read meanwhile: never replaced by this one.
+                // Evidence in this reply for the same entry may still verify
+                // its outcome; the inclusion fields are never touched.
+                m_action_polls.Remove(key);
+                if (!p.receipt.outcome_verified && result.isObject() && result["certified_payload"].isStr() &&
+                    !p.inclusion_proof.empty()) {
+                    try {
+                        const auto entry{EntryPrefix(p.inclusion_proof)};
+                        if (entry.GetHash() == p.receipt.microblock_hash &&
+                            Id(result, "microblock_hash") == p.receipt.microblock_hash) {
+                            ApplyOutcomeEvidence(p, entry, result, endpoint);
+                        }
+                    } catch (const std::exception&) {}
+                }
+                label = "already_verified";
+                return p.receipt;
+            }
+            if (ProvenNotExecuted(p)) {
+                // Proven not executed meanwhile: final, never replaced.
+                m_action_polls.Remove(key);
+                label = "already_verified";
+                return p.receipt;
+            }
+            ApplyActionResult(p, pins, result, endpoint);
+            applied = true;
+            EndpointResult(endpoint, true, {}, /*names_active=*/false);
+            if (p.receipt.certificate_verified) {
+                Save();
+            } else if (ProvenNotExecuted(p)) {
+                // MarkNotExecuted already wrote its marker synchronously.
+            } else {
+                m_action_polls.MarkObserved(key);
+                // A non-certifying observation changes only the receipt.
+                SaveRestartState();
+            }
+        } catch (const std::exception& e) {
+            timing.Field("error", std::string{e.what()});
+            // Nothing applied and no verified label: nothing changed, and the
+            // caller's ordinary path runs next, in the same call.
+            if (!applied && !verified_before) { label = "failed"; return std::nullopt; }
+            // Either the reply was applied but the outbox write failed (the new
+            // state is not durable), or the current authority check rejected a
+            // label another read had verified. Exactly like the ordinary path:
+            // record why, and never return (nor leave for the ordinary path to
+            // return) a verified label that is unsaved or no longer current.
+            // previously_certified stays set in memory, so this action is still
+            // never resent.
+            p.receipt.reason = e.what();
+            if (p.previously_certified || p.receipt.certificate_verified || p.not_executed) WithdrawVerifiedLabels(p.receipt);
+            label = applied ? "save_failed" : "authority_failed";
+            return p.receipt;
+        }
+        label = p.receipt.certificate_verified ? "certified" : "observed";
+        return p.receipt;
+    }
     // One waited 'action' read of an action this process delivered, sent on
     // the lane connection to the endpoint that acknowledged the delivery and
     // only if that endpoint advertises the wait. m_work is held to select the
@@ -2560,66 +2634,10 @@ class RemoteBackend final : public FlowMeshTradingBackend {
         }
         const auto it{m_pending.find(key)};
         if (it == m_pending.end()) { outcome("not_retained"); return std::nullopt; }
-        auto& p{it->second};
-        const bool verified_before{p.receipt.certificate_verified || ProvenNotExecuted(p)};
-        bool applied{false};
-        try {
-            const auto pins{RecheckActionAuthority(p)};
-            if (p.receipt.certificate_verified) {
-                // Proved by another read meanwhile: never replaced by this one.
-                // Evidence in this reply for the same entry may still verify
-                // its outcome; the inclusion fields are never touched.
-                m_action_polls.Remove(key);
-                if (!p.receipt.outcome_verified && result.isObject() && result["certified_payload"].isStr() &&
-                    !p.inclusion_proof.empty()) {
-                    try {
-                        const auto entry{EntryPrefix(p.inclusion_proof)};
-                        if (entry.GetHash() == p.receipt.microblock_hash &&
-                            Id(result, "microblock_hash") == p.receipt.microblock_hash) {
-                            ApplyOutcomeEvidence(p, entry, result, endpoint);
-                        }
-                    } catch (const std::exception&) {}
-                }
-                outcome("already_verified");
-                return p.receipt;
-            }
-            if (ProvenNotExecuted(p)) {
-                // Proven not executed meanwhile: final, never replaced.
-                m_action_polls.Remove(key);
-                outcome("already_verified");
-                return p.receipt;
-            }
-            ApplyActionResult(p, pins, result, endpoint);
-            applied = true;
-            EndpointResult(endpoint, true, {}, /*names_active=*/false);
-            if (p.receipt.certificate_verified) {
-                Save();
-            } else if (ProvenNotExecuted(p)) {
-                // MarkNotExecuted already wrote its marker synchronously.
-            } else {
-                m_action_polls.MarkObserved(key);
-                // A non-certifying observation changes only the receipt.
-                SaveRestartState();
-            }
-        } catch (const std::exception& e) {
-            timing.Field("error", std::string{e.what()});
-            // Nothing applied and no verified label: nothing changed, and the
-            // ordinary read runs next, in the same call.
-            if (!applied && !verified_before) { outcome("failed"); return std::nullopt; }
-            // Either the reply was applied but the outbox write failed (the new
-            // state is not durable), or the current authority check rejected a
-            // label another read had verified. Exactly like the ordinary path:
-            // record why, and never return (nor leave for the ordinary path to
-            // return) a verified label that is unsaved or no longer current.
-            // previously_certified stays set in memory, so this action is still
-            // never resent.
-            p.receipt.reason = e.what();
-            if (p.previously_certified || p.receipt.certificate_verified || p.not_executed) WithdrawVerifiedLabels(p.receipt);
-            outcome(applied ? "save_failed" : "authority_failed");
-            return p.receipt;
-        }
-        outcome(p.receipt.certificate_verified ? "certified" : "observed");
-        return p.receipt;
+        std::string label;
+        auto applied{ApplyLaneResult(it->second, result, endpoint, timing, label)};
+        outcome(label.c_str());
+        return applied;
     }
 public:
     RemoteBackend(ChainstateManager& chainman, std::vector<HttpsEndpoint> endpoints, const fs::path& path,
