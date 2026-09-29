@@ -4746,6 +4746,51 @@ private Q_SLOTS:
         QVERIFY(panel.m_toasts->texts().back().contains(QStringLiteral("never re-signed")));
         QVERIFY(!panel.m_thread); QVERIFY(m_wallet->IsLocked());
     }
+    void notFinalOutcomeStaysInProgressWithoutNotExecutedNotice()
+    {
+        B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));
+        panel.show(); QCoreApplication::processEvents();
+        auto* view{panel.findChild<QTableWidget*>(QStringLiteral("flowMeshPendingActions"))};
+        B3FlowMeshTrading::SavedActions saved; saved.account = panel.m_snapshot->account; saved.actions = {SavedBid(panel, 90, "queued", "queued")};
+        panel.restoreSavedActions(saved);
+        QVERIFY(panel.m_toasts->texts().isEmpty());
+        // Verified inclusion first; then its outcome: included, but its
+        // sequence was not next. The same bytes may still execute later, so a
+        // new order could execute twice.
+        auto receipt{saved.actions[0].receipt}; Certify(receipt, 9);
+        panel.applyReceipt(receipt);
+        QCOMPARE(view->item(0, 5)->text(), QStringLiteral("not reported"));
+        B3FlowMeshTrading::Outcome outcome; outcome.status = QStringLiteral("included_not_executed"); outcome.final = false;
+        outcome.reason_code = QStringLiteral("INCLUDED_BAD_SEQUENCE"); outcome.reason_text = QStringLiteral("Included but not executed: its sequence was not next.");
+        outcome.microblock_sequence = 9; outcome.microblock_hash = receipt.microblock_hash;
+        receipt.outcome = outcome; receipt.outcome_verified = true; receipt.stage = QStringLiteral("outcome_verified");
+        panel.applyReceipt(receipt); panel.applyReceipt(receipt);
+        QCOMPARE(RowText(view, 0).mid(1, 5), (QStringList{QStringLiteral("✓"), QStringLiteral("✓"), QStringLiteral("✓"), QStringLiteral("✓"), QStringLiteral("not executed yet · may still execute")}));
+        QVERIFY(view->item(0, 6)->text().contains(QStringLiteral("may still execute")));
+        QCOMPARE(view->item(0, 6)->foreground().color(), B3Theme::kAccent);
+        // Only the verified inclusion is announced, never "not executed".
+        QCOMPARE(panel.m_toasts->texts(), (QStringList{QStringLiteral("Certified: Buy 1 tUSD @ 1 B3/tUSD · included in batch #9")}));
+        // It is not settled: it stays in progress after the linger interval.
+        for (auto& [key, seen] : panel.m_request_seen) seen.settled_age.invalidate();
+        panel.m_last_settled.invalidate(); panel.updateControls();
+        QVERIFY(!view->isHidden()); QCOMPARE(view->rowCount(), 1);
+        // A proven final outcome settles it: announced once, then it lingers
+        // afresh, although its inclusion settled it before.
+        receipt.state = QStringLiteral("rejected"); receipt.stage = QStringLiteral("not_executed"); receipt.certificate_verified = false;
+        receipt.microblock_hash.clear(); receipt.microblock_sequence = 0;
+        outcome.status = QStringLiteral("not_executed"); outcome.final = true; outcome.reason_code = QStringLiteral("NOT_EXECUTED_SEQUENCE_CONSUMED");
+        outcome.consumed_by = QString::fromStdString(H(92).GetHex()); outcome.consumed_in_sequence = 10;
+        receipt.outcome = outcome;
+        panel.applyReceipt(receipt); panel.applyReceipt(receipt);
+        QCOMPARE(view->item(0, 5)->text(), QStringLiteral("✕ not executed"));
+        QCOMPARE(view->item(0, 6)->foreground().color(), B3Theme::kNegative);
+        QCOMPARE(panel.m_toasts->texts().size(), 2);
+        QVERIFY(panel.m_toasts->texts().back().startsWith(QStringLiteral("Buy 1 tUSD @ 1 B3/tUSD · Not executed (")));
+        panel.updateControls(); QVERIFY(!view->isHidden());
+        for (auto& [key, seen] : panel.m_request_seen) seen.settled_age.invalidate();
+        panel.updateControls(); QVERIFY(view->isHidden());
+        QVERIFY(!panel.m_thread); QVERIFY(m_wallet->IsLocked());
+    }
     void noToastsDuringTeardownOrWalletSwitch()
     {
         B3FlowMeshTradingPanel panel; AttachOfflineWallet(panel); Observe(panel, Parse(RemoteData()));

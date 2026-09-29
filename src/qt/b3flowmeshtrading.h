@@ -90,6 +90,15 @@ struct Receipt {
     bool Terminal() const { return outcome_verified && outcome && outcome->final; }
     //! Proven never to execute: a different certified action used its sequence.
     bool NotExecuted() const { return outcome_verified && outcome && outcome->status == QStringLiteral("not_executed"); }
+    //! A verified outcome that is not final and not applied (a bad-sequence
+    //! or equivocating inclusion, an uncredited deposit, or an unrecognised
+    //! reason): the exact bytes may still execute, or the deposit still be
+    //! credited, later. Never displayed as "not executed" or as settled.
+    bool MayStillExecute() const { return outcome_verified && outcome && !outcome->final && outcome->status != QStringLiteral("applied"); }
+    //! Nothing further is expected for display: verified inclusion, a verified
+    //! outcome, a proven non-execution or retained certification, unless a
+    //! verified outcome says the exact bytes may still execute.
+    bool Settled() const { return (Included() || no_resubmit || NotExecuted() || (outcome_verified && outcome)) && !MayStillExecute(); }
 };
 struct SavedAction {
     struct Point { CAmount price{0}, quantity{0}; bool operator==(const Point&) const = default; };
@@ -135,7 +144,9 @@ QString DescribeOutcome(const Outcome& outcome);
 //! A request row's progress. Signed, Sent and Admitted are historical facts;
 //! Certified and OutcomeVerified follow only current verified evidence.
 enum class Stage : uint8_t { Signing, Signed, Sent, Admitted, Certified, OutcomeVerified };
-enum class StageFlag : uint8_t { None, Uncertain, Refused, CertifiedEarlier, NotExecuted };
+//! NotExecuted is shown only for a final verified outcome; NotFinal marks a
+//! verified outcome whose exact bytes may still execute (Receipt::MayStillExecute).
+enum class StageFlag : uint8_t { None, Uncertain, Refused, CertifiedEarlier, NotExecuted, NotFinal };
 //! What the request asked for: only an order can report a fill.
 enum class RequestKind : uint8_t { Order, Cancel, Other };
 struct StageView {
@@ -143,8 +154,8 @@ struct StageView {
     StageFlag flag{StageFlag::None};
     //! A verified final outcome or a proven non-execution: it never changes.
     bool terminal{false};
-    //! Nothing further is expected for display: verified inclusion, a verified
-    //! outcome, a proven non-execution or retained certification.
+    //! Equals Receipt::Settled() for every receipt ParseReceipt accepts:
+    //! nothing further is expected for display.
     bool settled{false};
     //! One line for the row; never an RPC name.
     QString status;
@@ -156,8 +167,10 @@ struct StageView {
 //! source) and never shows more than the receipt proves: Certified needs
 //! verified inclusion (or the retained no-resubmit record, labelled
 //! "earlier"), a verified outcome needs outcome_verified, and "not executed"
-//! needs a verified outcome. A reported refusal or an unknown outcome is
-//! never terminal. A stage the receipt does not support falls back to its state.
+//! needs a final verified outcome. A verified outcome that is not final is
+//! shown as "not executed yet · may still execute" and is never settled. A
+//! reported refusal or an unknown outcome is never terminal. A stage the
+//! receipt does not support falls back to its state.
 StageView DescribeStage(const Receipt& receipt, bool local, RequestKind kind,
                         std::optional<int> decimals = {}, const QString& ticker = {});
 QString StageName(Stage stage);

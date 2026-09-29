@@ -409,8 +409,10 @@ Outcome ParseOutcome(const UniValue& value)
 QString DescribeOutcome(const Outcome& o)
 {
     if (o.status == QStringLiteral("not_executed")) {
-        return QStringLiteral("Never executes: its account sequence was used by another certified request (%1…) in batch #%2.")
-            .arg(o.consumed_by.left(16)).arg(o.consumed_in_sequence);
+        // "Never executes" only when final (an unrecognised reason is not).
+        return QStringLiteral("%1: its account sequence was used by another certified request (%2…) in batch #%3.%4")
+            .arg(o.final ? QStringLiteral("Never executes") : QStringLiteral("Reported not executed"), o.consumed_by.left(16),
+                 QString::number(o.consumed_in_sequence), o.final ? QString{} : QStringLiteral(" Not final."));
     }
     QString text;
     if (o.status == QStringLiteral("applied")) text = QStringLiteral("Executed in certified batch #%1.").arg(o.microblock_sequence);
@@ -450,8 +452,19 @@ QString DescribeReceipt(const Receipt& r)
 StageView DescribeStage(const Receipt& r, bool local, RequestKind kind, std::optional<int> decimals, const QString& ticker)
 {
     StageView v;
+    if (r.MayStillExecute() && (r.NotExecuted() || r.Included())) {
+        // Verified, but not final: the exact bytes may still execute (or a
+        // deposit still be credited) later. Never "not executed", never settled.
+        const auto& o{*r.outcome};
+        const QString reason{o.reason_text.isEmpty() ? o.reason_code : o.reason_text};
+        v.reached = r.Included() ? Stage::OutcomeVerified : Stage::Signed; v.flag = StageFlag::NotFinal;
+        v.status = r.Included() ? QStringLiteral("Included in certified batch #%1, not executed yet · not final, may still execute (%2)").arg(QString::number(o.microblock_sequence), reason)
+                                : QStringLiteral("Not executed yet · not final, may still execute (%1)").arg(reason);
+        v.outcome = QStringLiteral("not executed yet · may still execute");
+        return v;
+    }
     if (r.NotExecuted()) {
-        // Proven: a different certified action consumed its sequence.
+        // Proven and final: a different certified action consumed its sequence.
         v.reached = Stage::Signed; v.flag = StageFlag::NotExecuted; v.terminal = r.Terminal(); v.settled = true;
         v.status = QStringLiteral("Not executed (its account sequence was used by another certified request)");
         v.outcome = QStringLiteral("✕ not executed");
@@ -469,11 +482,13 @@ StageView DescribeStage(const Receipt& r, bool local, RequestKind kind, std::opt
                 else v.outcome = QStringLiteral("✓ filled %1").arg(BaseAmount(o.fill->quantity, decimals, ticker));
             } else v.outcome = QStringLiteral("✓ applied");
         } else {
+            // Final here: a non-final one is shown above as "may still execute".
             v.flag = StageFlag::NotExecuted;
             v.status = (o.status == QStringLiteral("rejected") ? QStringLiteral("Not executed (%1)") : QStringLiteral("Included but not executed (%1)"))
                            .arg(o.reason_text.isEmpty() ? o.reason_code : o.reason_text);
             v.outcome = QStringLiteral("✕ not executed");
         }
+        // Only an applied outcome with an unrecognised reason reaches this.
         if (!o.final) v.status += QStringLiteral(" · not final");
         return v;
     }

@@ -2401,9 +2401,10 @@ void B3FlowMeshTradingPanel::observeRequests()
             while (m_request_order.size() > MAX_REQUEST_KEYS) { m_request_seen.erase(m_request_order.front()); m_request_order.pop_front(); }
         }
         // Settled history (most saved rows) needs no stage text: its events
-        // follow from the receipt's verified facts, as in DescribeStage.
+        // follow from the receipt's verified facts, as in DescribeStage. Only a
+        // final outcome is "not executed"; one that may still execute is not settled.
         const bool outcome{receipt.Included() && receipt.outcome_verified && receipt.outcome};
-        const bool settled{receipt.Included() || receipt.no_resubmit || receipt.NotExecuted() || outcome};
+        const bool settled{receipt.Settled()};
         std::optional<StageView> view;
         const auto describe = [&]() -> const StageView& {
             if (!view) {
@@ -2416,11 +2417,14 @@ void B3FlowMeshTradingPanel::observeRequests()
         };
         unsigned now{(receipt.Included() ? CERTIFIED : 0U) |
                      (outcome && receipt.outcome->status == QStringLiteral("applied") ? EXECUTED : 0U) |
-                     (receipt.NotExecuted() || (outcome && receipt.outcome->status != QStringLiteral("applied")) ? NOT_EXECUTED : 0U)};
+                     (receipt.Terminal() && receipt.outcome->status != QStringLiteral("applied") ? NOT_EXECUTED : 0U)};
         if (!settled) {
             // Only the historical facts are kept: never Certified or an outcome.
             seen->second.high = std::max(seen->second.high, std::min(describe().reached, Stage::Admitted));
             now |= (describe().flag == StageFlag::Uncertain ? UNCERTAIN : 0U) | (describe().flag == StageFlag::Refused ? REFUSED : 0U);
+            // Unsettled again (included, but it may still execute): it lingers
+            // afresh once a final outcome settles it.
+            seen->second.settled = false;
         } else if (!seen->second.settled) {
             seen->second.settled = true;
             if (!seed) { seen->second.settled_age.start(); m_last_settled.start(); }
@@ -2510,14 +2514,15 @@ void B3FlowMeshTradingPanel::updatePendingView()
         const auto seen{m_request_seen.find(key)};
         return seen != m_request_seen.end() && seen->second.settled_age.isValid() && seen->second.settled_age.elapsed() < REQUEST_LINGER_MS;
     };
-    const auto settled = [](const Receipt& r) { return r.Included() || r.no_resubmit || r.NotExecuted() || (r.outcome_verified && r.outcome); };
+    const auto settled = [](const Receipt& r) { return r.Settled(); };
     const auto receipt_row = [&](const QString& key, const QString& title, const Receipt& r, RequestKind kind) {
         const auto view{DescribeStage(r, local, kind, decimals, ticker)};
         Stage reached{view.reached};
         if (const auto seen{m_request_seen.find(key)}; seen != m_request_seen.end() && reached < Stage::Certified) reached = std::max(reached, seen->second.high);
         Row row;
         row.cells << title;
-        const bool stuck{view.flag == StageFlag::Uncertain || view.flag == StageFlag::Refused};
+        // Unknown, refused, or verified but not final (it may still execute).
+        const bool stuck{view.flag == StageFlag::Uncertain || view.flag == StageFlag::Refused || view.flag == StageFlag::NotFinal};
         for (int i{0}; i < columns.size(); ++i) {
             const auto stage{static_cast<Stage>(static_cast<int>(Stage::Signed) + i)};
             QString cell, access;

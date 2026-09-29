@@ -328,7 +328,67 @@ private Q_SLOTS:
         QCOMPARE(v.flag, StageFlag::NotExecuted); QCOMPARE(v.status, QStringLiteral("Not executed (Insufficient certified balance)")); QVERIFY(v.terminal);
         r.outcome->status = QStringLiteral("included_not_executed"); r.outcome->final = false; r.outcome->reason_text = QStringLiteral("sequence was not next");
         v = DescribeStage(r, false, RequestKind::Order);
-        QCOMPARE(v.flag, StageFlag::NotExecuted); QVERIFY(!v.terminal); QVERIFY(v.status.endsWith(QStringLiteral("not final")));
+        QCOMPARE(v.flag, StageFlag::NotFinal); QVERIFY(!v.terminal); QVERIFY(!v.settled);
+        QCOMPARE(v.status, QStringLiteral("Included in certified batch #812, not executed yet · not final, may still execute (sequence was not next)"));
+        QCOMPARE(v.outcome, QStringLiteral("not executed yet · may still execute"));
+    }
+    void onlyFinalOutcomesShowNotExecuted_data()
+    {
+        QTest::addColumn<QString>("status");
+        QTest::addColumn<QString>("code");
+        QTest::addColumn<bool>("final"); // As the node reports it.
+        QTest::addColumn<bool>("definite");
+        // The node's non-final outcomes: the exact bytes may still execute,
+        // or the deposit still be credited, later.
+        QTest::newRow("deposit not credited") << QStringLiteral("rejected") << QStringLiteral("DEPOSIT_NOT_CREDITED") << false << false;
+        QTest::newRow("included bad sequence") << QStringLiteral("included_not_executed") << QStringLiteral("INCLUDED_BAD_SEQUENCE") << false << false;
+        QTest::newRow("included equivocation") << QStringLiteral("included_not_executed") << QStringLiteral("INCLUDED_EQUIVOCATION") << false << false;
+        // A final claim with an unrecognised reason is parsed as not final.
+        QTest::newRow("unrecognised rejection") << QStringLiteral("rejected") << QStringLiteral("SOMETHING_NEW") << true << false;
+        QTest::newRow("unrecognised consumer") << QStringLiteral("not_executed") << QStringLiteral("SOMETHING_NEW") << true << false;
+        // Proven final outcomes.
+        QTest::newRow("rejected by state") << QStringLiteral("rejected") << QStringLiteral("REJECTED_BY_STATE") << true << true;
+        QTest::newRow("included malformed") << QStringLiteral("included_not_executed") << QStringLiteral("INCLUDED_MALFORMED") << true << true;
+        QTest::newRow("sequence consumed") << QStringLiteral("not_executed") << QStringLiteral("NOT_EXECUTED_SEQUENCE_CONSUMED") << true << true;
+    }
+    void onlyFinalOutcomesShowNotExecuted()
+    {
+        QFETCH(QString, status); QFETCH(QString, code); QFETCH(bool, final); QFETCH(bool, definite);
+        const auto a{Order()};
+        const bool consumed{status == QStringLiteral("not_executed")};
+        UniValue v{UniValue::VOBJ};
+        v.pushKV("market_id", a.market.id.toStdString()); v.pushKV("action_id", H(8).GetHex());
+        v.pushKV("accepted", !consumed); v.pushKV("receipt_state", consumed ? "rejected" : "certified_inclusion"); v.pushKV("reason", "");
+        v.pushKV("endpoint", ""); v.pushKV("certificate_verified", !consumed); v.pushKV("outcome_verified", true);
+        if (!consumed) { v.pushKV("microblock_hash", H(9).GetHex()); v.pushKV("microblock_sequence", 3); }
+        v.pushKV("reason_code", code.toStdString()); v.pushKV("stage", consumed ? "not_executed" : "outcome_verified");
+        UniValue outcome{UniValue::VOBJ};
+        outcome.pushKV("status", status.toStdString()); outcome.pushKV("final", final); outcome.pushKV("reason_code", code.toStdString());
+        outcome.pushKV("reason_text", "Synthetic reason."); outcome.pushKV("evidence", consumed ? "certified_sequence_consumer" : "certified_result_preimage");
+        outcome.pushKV("microblock_sequence", 3); outcome.pushKV("microblock_hash", H(9).GetHex());
+        if (consumed) {
+            UniValue consumer{UniValue::VOBJ};
+            consumer.pushKV("action_id", H(12).GetHex()); consumer.pushKV("microblock_sequence", 3); consumer.pushKV("microblock_hash", H(9).GetHex());
+            outcome.pushKV("consumed_by", consumer);
+        }
+        v.pushKV("outcome", outcome);
+        const auto r{ParseReceipt(v, a.market.id)};
+        QCOMPARE(r.Terminal(), definite); QCOMPARE(r.MayStillExecute(), !definite); QCOMPARE(r.Settled(), definite);
+        QCOMPARE(DescribeReceipt(r).contains(QStringLiteral("Never executes")), consumed && definite);
+        for (const auto kind : {RequestKind::Order, RequestKind::Cancel, RequestKind::Other}) {
+            const auto view{DescribeStage(r, false, kind)};
+            QCOMPARE(view.settled, r.Settled()); QCOMPARE(view.terminal, definite);
+            QCOMPARE(view.reached, consumed ? Stage::Signed : Stage::OutcomeVerified);
+            if (definite) {
+                QCOMPARE(view.flag, StageFlag::NotExecuted); QCOMPARE(view.outcome, QStringLiteral("✕ not executed"));
+                QVERIFY(!view.status.contains(QStringLiteral("not final")));
+            } else {
+                // Never a definite "not executed", and never settled: it stays in view.
+                QCOMPARE(view.flag, StageFlag::NotFinal); QCOMPARE(view.outcome, QStringLiteral("not executed yet · may still execute"));
+                QVERIFY(view.status.contains(QStringLiteral("not final, may still execute")));
+                QVERIFY(!view.status.startsWith(QStringLiteral("Not executed (")));
+            }
+        }
     }
     void shortTitlesUseExactUnitsAndNoRpcNames()
     {
