@@ -169,16 +169,22 @@ void FlowMeshLagTracker::Expire(const Clock::time_point now)
     Update(now);
 }
 
+bool FlowMeshLagTracker::ProvenBehind() const
+{
+    return m_proven_next && *m_proven_next > m_local_next;
+}
+
 bool FlowMeshLagTracker::Behind() const
 {
-    return (m_proven_next && *m_proven_next > m_local_next) || m_speculative;
+    return ProvenBehind() || m_speculative;
 }
 
 FlowMeshLagSummary FlowMeshLagTracker::Summary() const
 {
     FlowMeshLagSummary out;
     out.behind_since = m_behind_since;
-    if (m_proven_next && *m_proven_next > m_local_next) out.proven_target = m_proven_next;
+    out.proven_since = m_proven_since;
+    if (ProvenBehind()) out.proven_target = m_proven_next;
     out.speculative = m_speculative;
     for (const auto& [peer, hint] : m_hints) {
         (void)peer;
@@ -197,11 +203,15 @@ void FlowMeshLagTracker::EndSpeculative()
 
 void FlowMeshLagTracker::Update(const Clock::time_point now)
 {
-    if (!Behind()) {
-        m_behind_since.reset();
-    } else if (!m_behind_since) {
-        m_behind_since = now;
-    }
+    const auto edge = [&](const bool behind, std::optional<Clock::time_point>& since) {
+        if (!behind) {
+            since.reset();
+        } else if (!since) {
+            since = now;
+        }
+    };
+    edge(Behind(), m_behind_since);
+    edge(ProvenBehind(), m_proven_since);
 }
 
 bool FlowMeshServiceHealth::Ready() const
@@ -262,7 +272,8 @@ FlowMeshMarketReadiness EvaluateFlowMeshMarketReadiness(
         Add(out.not_ready, FlowMeshNotReady::MARKET_NOT_INSTALLED);
     } else {
         if (market->halted) Add(out.not_ready, FlowMeshNotReady::MARKET_HALTED);
-        if (market->lag.behind_since && now - *market->lag.behind_since >= policy.lag_grace) {
+        // Only locally proven lag: never a speculative page or a hint.
+        if (market->lag.proven_since && now - *market->lag.proven_since >= policy.lag_grace) {
             Add(out.not_ready, FlowMeshNotReady::CATCHING_UP);
         }
     }
@@ -395,6 +406,7 @@ UniValue FlowMeshServiceHealthJson(const FlowMeshServiceHealth& health, const bo
             catchup.pushKV("behind", market->lag.behind_since.has_value());
             if (market->lag.behind_since) catchup.pushKV("behind_ms", ElapsedMs(*market->lag.behind_since, now));
             if (market->lag.proven_target) catchup.pushKV("proven_target", *market->lag.proven_target);
+            if (market->lag.proven_since) catchup.pushKV("proven_behind_ms", ElapsedMs(*market->lag.proven_since, now));
             catchup.pushKV("speculative", market->lag.speculative);
             if (operator_detail) {
                 if (market->lag.peer_hint_next_sequence) {

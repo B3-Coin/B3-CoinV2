@@ -6975,6 +6975,7 @@ BOOST_AUTO_TEST_CASE(health_lag_is_proven_only_by_verified_certificates_and_spec
     health = f.Health();
     const auto behind_since{f.clock.m_now - std::chrono::milliseconds{250}};
     BOOST_CHECK(f.Lag(health).behind_since == behind_since);
+    BOOST_CHECK(f.Lag(health).proven_since == behind_since);
     BOOST_CHECK_EQUAL(*f.Lag(health).proven_target, 2U);
     BOOST_CHECK_EQUAL(f.Gets(9), 1U);
     // A catch-up page of one entry with tail slack advances the head but not
@@ -7007,6 +7008,7 @@ BOOST_AUTO_TEST_CASE(health_lag_is_proven_only_by_verified_certificates_and_spec
     BOOST_CHECK_EQUAL(health->markets.front().next_sequence, 3U);
     BOOST_CHECK(f.Lag(health).speculative);
     BOOST_CHECK(f.Lag(health).behind_since);
+    BOOST_CHECK(!f.Lag(health).proven_since);
     BOOST_CHECK(!f.Lag(health).proven_target);
     f.clock.m_now += std::chrono::seconds{1}; // Refill the control budget.
     f.Hello(11, 3);

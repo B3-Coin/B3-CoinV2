@@ -154,7 +154,8 @@ start); then escalate.
 |---|---|---|
 | `market_not_installed`, state `not_installed` | The service knows the market but the runtime has not installed it (for example a store that failed to open). | Check `debug.log` for the market; take the bundle; escalate. |
 | `market_halted`, state `halted` | The market halted on this node; see `halt` below. | Per halt code. |
-| `catching_up`, state `catching_up` | Proven or speculative catch-up has lasted `lag_grace_ms` (10 s). `catchup.proven_target` comes from a BLS-verified certificate and cannot be faked or hidden; `catchup.speculative` is a page without tail slack, not a proof. | Normal after a restart. Escalate if it lasts more than 10 minutes. |
+| `catching_up` | This node has been provably behind for `lag_grace_ms` (10 s): it holds a BLS-verified certificate for a sequence it has not applied (`catchup.proven_target`, `catchup.proven_behind_ms`). That cannot be faked or hidden. | Normal after a restart. Escalate if it lasts more than 10 minutes. |
+| state `catching_up` | Proven or speculative catch-up is under way. `catchup.speculative` means a verified page arrived without tail slack; it is not a proof and never makes the market not ready. | none unless `catching_up` is reported |
 | state `insufficient_seats` | Fewer than four anchor-final seats (`PAUSED_INSUFFICIENT_SEATS`). | Expected until seats bind; B3 continues. |
 | state `handoff_pending` | A committee handoff waits for its checkpoint to be 30 blocks deep. | ETA: max(0, 30 - (tip height - handoff checkpoint inclusion height)) x the observed B3 block interval. Publish the checkpoint first if it is not yet included. |
 | state `paused` | Paused for `pause_reason`; see below. | Per pause reason. |

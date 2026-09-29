@@ -129,15 +129,19 @@ private:
 };
 
 struct FlowMeshLagSummary {
-    //! Behind (proven or speculative) continuously since.
+    //! Behind (proven or speculative) continuously since. A label only.
     std::optional<flowmesh::WireClock::time_point> behind_since;
+    //! Provably behind continuously since: the only lag that decides
+    //! readiness (catching_up).
+    std::optional<flowmesh::WireClock::time_point> proven_since;
     //! One past the highest BLS-verified certificate this node holds for a
     //! sequence it has not applied yet. Cannot be forged or hidden: it clears
     //! only when this node's own head passes it.
     std::optional<uint64_t> proven_target;
     //! A verified catch-up page arrived without tail slack, so the serving
-    //! peer may hold more. Not a proof: it ends on a tail-slack page, on that
-    //! peer announcing a head at or below ours, or after SPECULATIVE_TTL.
+    //! peer may hold more. Not a proof and never a readiness input: it ends
+    //! on a tail-slack page, on that peer announcing a head at or below ours,
+    //! or after SPECULATIVE_TTL.
     bool speculative{false};
     //! Unverified HELLO hints, display only; they never decide readiness.
     std::optional<uint64_t> peer_hint_next_sequence;
@@ -153,10 +157,11 @@ struct FlowMeshLagSummary {
  * announcement or timeout clears it. Speculative lag starts from an applied
  * catch-up page without tail slack. A live commit never ends either kind:
  * deferred catch-up certificates are retried through the live path, and an
- * old certificate relayed for our next sequence must not hide a lag. The
- * start time is kept per tracker and recomputed from Behind() after every
- * change, so page-by-page progress never restarts it. Bounded: at most
- * MAX_HINTS hints and MAX_SPECULATIVE_PEERS peers.
+ * old certificate relayed for our next sequence must not hide a lag. Only
+ * proven lag decides readiness; speculative lag and hints are shown. Start
+ * times are kept per tracker and recomputed after every change, so
+ * page-by-page progress never restarts them. Bounded: at most MAX_HINTS
+ * hints and MAX_SPECULATIVE_PEERS peers.
  */
 class FlowMeshLagTracker
 {
@@ -184,6 +189,7 @@ public:
     void Expire(Clock::time_point now);
 
     bool Behind() const;
+    bool ProvenBehind() const;
     FlowMeshLagSummary Summary() const;
 
 private:
@@ -201,6 +207,7 @@ private:
     std::set<flowmesh::WirePeerId> m_speculative_peers;
     std::map<flowmesh::WirePeerId, Hint> m_hints;
     std::optional<Clock::time_point> m_behind_since;
+    std::optional<Clock::time_point> m_proven_since;
 };
 
 //! One market as the runtime worker last published it. Values only.

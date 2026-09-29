@@ -167,7 +167,9 @@ BOOST_AUTO_TEST_CASE(lag_tracker_proven_lag_survives_commits_announcements_and_t
     node::FlowMeshLagTracker lag{5};
     lag.Proven(9, T0); // A verified certificate for sequence 9.
     BOOST_CHECK(lag.Behind());
+    BOOST_CHECK(lag.ProvenBehind());
     BOOST_CHECK(lag.Summary().behind_since == T0);
+    BOOST_CHECK(lag.Summary().proven_since == T0);
     BOOST_CHECK_EQUAL(*lag.Summary().proven_target, 10U);
     // Page-by-page progress, a deferred catch-up certificate retried through
     // the live path, or an old certificate relayed for our next sequence:
@@ -177,6 +179,7 @@ BOOST_AUTO_TEST_CASE(lag_tracker_proven_lag_survives_commits_announcements_and_t
         lag.LocalAdvanced(next, T0 + std::chrono::seconds{next});
         BOOST_CHECK(lag.Behind());
         BOOST_CHECK(lag.Summary().behind_since == T0);
+        BOOST_CHECK(lag.Summary().proven_since == T0);
     }
     // No announcement from any peer, and no timeout, clears proven lag.
     for (flowmesh::WirePeerId peer{0}; peer < 4; ++peer) lag.Hello(peer, 9, T0 + 20s);
@@ -190,6 +193,7 @@ BOOST_AUTO_TEST_CASE(lag_tracker_proven_lag_survives_commits_announcements_and_t
     lag.LocalAdvanced(13, T0 + 12min);
     BOOST_CHECK(!lag.Behind());
     BOOST_CHECK(!lag.Summary().behind_since);
+    BOOST_CHECK(!lag.Summary().proven_since);
     BOOST_CHECK(!lag.Summary().proven_target);
     // A certificate below the local head proves nothing.
     lag.Proven(3, T0 + 13min);
@@ -202,6 +206,9 @@ BOOST_AUTO_TEST_CASE(lag_tracker_speculative_lag_ends_only_by_its_peer_tail_slac
     lag.Speculative(7, T0);
     BOOST_CHECK(lag.Behind());
     BOOST_CHECK(lag.Summary().speculative);
+    // Speculative lag is shown, never proven.
+    BOOST_CHECK(!lag.ProvenBehind());
+    BOOST_CHECK(!lag.Summary().proven_since);
     BOOST_CHECK(!lag.Summary().proven_target);
     // Page-by-page progress keeps the episode's start.
     lag.LocalAdvanced(8, T0 + 1s);
@@ -248,6 +255,7 @@ BOOST_AUTO_TEST_CASE(lag_tracker_speculative_end_keeps_proven_lag)
     lag.Hello(1, 0, T0 + 3s);
     BOOST_CHECK(lag.Behind());
     BOOST_CHECK(lag.Summary().behind_since == T0);
+    BOOST_CHECK(lag.Summary().proven_since == T0);
     BOOST_CHECK(!lag.Summary().speculative);
     lag.LocalAdvanced(5, T0 + 4s);
     BOOST_CHECK(!lag.Behind());
@@ -329,8 +337,17 @@ BOOST_AUTO_TEST_CASE(market_readiness_is_market_scoped_and_labels_one_state)
     BOOST_CHECK(Names(readiness.not_ready) == Names_t{"market_halted"});
     BOOST_CHECK_EQUAL(readiness.state, "halted");
 
+    // Only locally proven lag decides readiness. Speculative lag (a page
+    // without tail slack) is labelled but never makes a market not ready.
+    auto speculative{Market(3)};
+    speculative.lag.behind_since = T0;
+    speculative.lag.speculative = true;
+    readiness = evaluate({}, &speculative, T0 + 1h);
+    BOOST_CHECK(readiness.ready);
+    BOOST_CHECK_EQUAL(readiness.state, "catching_up");
     auto behind{Market(3)};
-    behind.lag.behind_since = T0;
+    behind.lag.behind_since = behind.lag.proven_since = T0;
+    behind.lag.proven_target = 20;
     readiness = evaluate({}, &behind, T0 + 9s);
     BOOST_CHECK(readiness.ready);
     BOOST_CHECK_EQUAL(readiness.state, "catching_up");
@@ -414,7 +431,7 @@ BOOST_AUTO_TEST_CASE(health_json_is_versioned_omits_absent_values_and_operator_t
     live.proposal_wait_reason = "proposer_not_local";
     live.head_advanced_at = T0 - 850ms;
     live.local_observed_at = 1'790'000'000;
-    live.lag.behind_since = T0 - 3s;
+    live.lag.behind_since = live.lag.proven_since = T0 - 3s;
     live.lag.proven_target = 12;
     live.lag.peer_hint_next_sequence = 40;
     live.lag.peers_hinting_ahead = 2;
@@ -456,7 +473,9 @@ BOOST_AUTO_TEST_CASE(health_json_is_versioned_omits_absent_values_and_operator_t
     BOOST_CHECK_EQUAL(markets[0]["head_age_ms"].getInt<int64_t>(), 850);
     BOOST_CHECK_EQUAL(markets[0]["head_local_observed_unix"].getInt<int64_t>(), 1'790'000'000);
     BOOST_CHECK_EQUAL(markets[0]["state"].get_str(), "catching_up");
-    BOOST_CHECK(Keys(markets[0]["catchup"]) == (std::set<std::string>{"behind", "behind_ms", "proven_target", "speculative"}));
+    BOOST_CHECK(Keys(markets[0]["catchup"]) == (std::set<std::string>{"behind", "behind_ms", "proven_target", "proven_behind_ms",
+                                                                       "speculative"}));
+    BOOST_CHECK_EQUAL(markets[0]["catchup"]["proven_behind_ms"].getInt<int64_t>(), 3000);
     BOOST_CHECK_EQUAL(markets[0]["catchup"]["behind_ms"].getInt<int64_t>(), 3000);
     BOOST_CHECK_EQUAL(markets[0]["catchup"]["proven_target"].getInt<uint64_t>(), 12U);
     BOOST_CHECK(Keys(markets[1]["catchup"]) == (std::set<std::string>{"behind", "speculative"}));
