@@ -363,7 +363,10 @@ public:
         watch.gap = result == flowmesh::ClientWatchResult::GAP || result == flowmesh::ClientWatchResult::RESTARTED;
         return Data(id, account, query, error);
     }
-    Receipt Submit(const uint256& id, const flowmesh::Action& action) override
+    // The local engine's status is already current: a requested wait is
+    // ignored, as by ActionStatus.
+    Receipt Submit(const uint256& id, const flowmesh::Action& action,
+                   std::chrono::milliseconds wait = std::chrono::milliseconds{0}) override
     {
         Receipt out; out.action_id = action.Id();
         const auto submitted{m_service.SubmitLocalActionChecked(id, action)};
@@ -3012,13 +3015,28 @@ public:
         if (applied) return applied;
         return ordinary(fallback);
     }
-    Receipt Submit(const uint256& market, const flowmesh::Action& action) override
+    Receipt Submit(const uint256& market, const flowmesh::Action& action,
+                   std::chrono::milliseconds wait = std::chrono::milliseconds{0}) override
     {
         FlowMeshTimingSpan timing_lock_1251{__func__};
         timing_lock_1251.Field("market_id", market);
         if (timing_lock_1251.Enabled()) timing_lock_1251.Field("action_id", action.Id());
         timing_lock_1251.Field("lock_name", std::string{"client_work"});
         timing_lock_1251.Mark("lock_requested_us");
+        Receipt out{SubmitOrdinary(market, action, timing_lock_1251)};
+        // At most one bounded waited read of the action just delivered: what
+        // a caller's getflowmeshactionstatus(wait_ms) right after this call
+        // would send, without that caller's turnaround. It never resends.
+        if (wait.count() > 0 && out.state != "rejected" && !out.certificate_verified) {
+            if (auto waited{WaitedActionStatus(market, action.Id(), wait)}) return std::move(*waited);
+        }
+        return out;
+    }
+private:
+    //! Retains a new exact signed action (Save before its first send) and
+    //! delivers it, or redelivers a retained one, by Send; all under m_work.
+    Receipt SubmitOrdinary(const uint256& market, const flowmesh::Action& action, FlowMeshTimingSpan& timing_lock_1251)
+    {
         WorkLock lock{*this};
         MarkWorkAcquired(timing_lock_1251);
         Receipt out; out.action_id = action.Id();
@@ -3065,6 +3083,7 @@ public:
             out.state = m_pending.contains({market, action.Id()}) ? "unknown" : "rejected"; out.reason = e.what(); return out;
         }
     }
+public:
     Receipt ActionStatus(const uint256& market, const uint256& action, bool retry,
                          std::chrono::milliseconds wait = std::chrono::milliseconds{0}) override
     {

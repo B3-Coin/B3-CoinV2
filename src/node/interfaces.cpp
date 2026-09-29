@@ -1322,10 +1322,10 @@ public:
         return m_node.flowmesh->SubmitLocalAction(market_id, action, error);
     }
     interfaces::FlowMeshActionReceipt submitFlowMeshActionReceipt(
-        const uint256& market_id, const flowmesh::Action& action) override
+        const uint256& market_id, const flowmesh::Action& action, std::chrono::milliseconds wait) override
     {
-        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Submit(market_id, action);
-        return interfaces::Chain::submitFlowMeshActionReceipt(market_id, action);
+        if (m_node.flowmesh_trading) return m_node.flowmesh_trading->Submit(market_id, action, wait);
+        return interfaces::Chain::submitFlowMeshActionReceipt(market_id, action, wait);
     }
     interfaces::FlowMeshActionReceipt flowMeshActionStatus(
         const uint256& market_id, const uint256& action_id, bool retry, std::chrono::milliseconds wait) override

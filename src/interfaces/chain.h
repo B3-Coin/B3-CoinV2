@@ -862,8 +862,13 @@ public:
     virtual bool submitFlowMeshAction(const uint256& market_id,
                                       const flowmesh::Action& action,
                                       std::string& error) = 0;
+    //! A nonzero wait lets the remote trading client wait, bounded and at
+    //! most once, at its endpoint for the delivered action's certified
+    //! inclusion before returning. It never resends or signs to wait; the
+    //! local engine answers immediately.
     virtual FlowMeshActionReceipt submitFlowMeshActionReceipt(const uint256& market_id,
-                                                             const flowmesh::Action& action)
+                                                             const flowmesh::Action& action,
+                                                             std::chrono::milliseconds wait = std::chrono::milliseconds{0})
     {
         FlowMeshActionReceipt receipt;
         receipt.action_id = action.Id();

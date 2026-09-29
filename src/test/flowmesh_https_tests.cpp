@@ -2331,6 +2331,14 @@ struct ScriptedEndpoint {
     //! can hold one request while others (on other connections) are served.
     //! Set before the endpoint serves.
     std::function<void(const std::string&, const UniValue&)> before;
+    //! Submissions carrying wait_ms, counted apart from `submits` and
+    //! answered with `waited_submit`, or, with reject_submit_wait, with the
+    //! unknown-field error (a downgraded endpoint).
+    unsigned waited_submits{0};
+    UniValue waited_submit{UniValue::VOBJ};
+    bool reject_submit_wait{false};
+    //! The params of every submission, in arrival order.
+    std::vector<UniValue> submitted;
 
     node::FlowMeshHttpsServer::Response Handle(const node::FlowMeshHttpsServer::Request& request)
     {
@@ -2356,8 +2364,15 @@ struct ScriptedEndpoint {
             ++market_reads;
             out.pushKV("result", markets);
         } else if (method == "submit") {
-            ++submits;
-            out.pushKV("result", submit);
+            submitted.push_back(json["params"]);
+            if (json["params"].exists("wait_ms")) {
+                ++waited_submits;
+                if (reject_submit_wait) return {400, R"({"ok":false,"error":"Unknown or duplicate client API field"})"};
+                out.pushKV("result", waited_submit);
+            } else {
+                ++submits;
+                out.pushKV("result", submit);
+            }
         } else if (method == "action" && json["params"].exists("wait_ms")) {
             ++waited_reads;
             out.pushKV("result", waited);
@@ -2609,8 +2624,9 @@ struct ClientLaneFixture : TestingSetup {
     {
         return ClientConnectFixture::SeedRetainedAction(path, market, owner, domain, config);
     }
-    //! This market's discovery row, advertising `wait` when nonzero.
-    UniValue MarketRow(std::chrono::milliseconds wait) const
+    //! This market's discovery row, advertising `wait` (and `submit_wait`
+    //! on 'submit') when nonzero.
+    UniValue MarketRow(std::chrono::milliseconds wait, std::chrono::milliseconds submit_wait = std::chrono::milliseconds{0}) const
     {
         UniValue row{UniValue::VOBJ};
         row.pushKV("domain", domain.GetHex()); row.pushKV("market_id", market.GetHex());
@@ -2620,7 +2636,22 @@ struct ClientLaneFixture : TestingSetup {
         row.pushKV("halt", ""); row.pushKV("error", "");
         row.pushKV("next_microblock_sequence", 1); row.pushKV("last_microblock_hash", uint256{}.GetHex());
         if (wait.count()) row.pushKV("action_wait_ms_max", wait.count());
+        if (submit_wait.count()) row.pushKV("submit_wait_ms_max", submit_wait.count());
         return row;
+    }
+    //! A cancel signed by this fixture's trading key under this market's pins.
+    flowmesh::Action SignedCancel(const uint64_t sequence) const
+    {
+        CKey key;
+        std::array<unsigned char, 32> secret{};
+        secret.back() = 0x5a;
+        key.Set(secret.begin(), secret.end(), true);
+        flowmesh::Action action;
+        action.signer = flowmesh::AccountForKey(XOnlyPubKey{key.GetPubKey()});
+        action.sequence = sequence;
+        action.type = static_cast<uint8_t>(flowmesh::ActionType::CANCEL_BID);
+        BOOST_REQUIRE(flowmesh::SignAction(key, domain, config, action));
+        return action;
     }
     static UniValue Receipt(const flowmesh::Action& action, const std::string& state)
     {
@@ -3123,6 +3154,83 @@ BOOST_AUTO_TEST_CASE(lane_hands_back_no_connection_that_an_explicit_reconnect_re
     BOOST_CHECK_EQUAL(spans[1]["borrowed"].getInt<uint64_t>(), 1U);
     BOOST_CHECK_EQUAL(spans[1]["connection_reused"].getInt<uint64_t>(), 1U);
     BOOST_CHECK_EQUAL(spans[1]["handed_back"].getInt<uint64_t>(), 1U);
+    client.reset();
+    server->Stop();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(flowmesh_client_submit_wait_tests, ClientLaneFixture)
+
+BOOST_AUTO_TEST_CASE(waited_submit_without_a_submit_advert_chains_one_waited_read)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    // An f8a3432 endpoint: the action wait only.
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+    validator.submit = Receipt(action, "admitted");
+    validator.waited = CertifiedReceipt(action);
+    validator.waited.pushKV("wait_status", "terminal");
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    // The ordinary submission, then one waited read of the exact action at
+    // the endpoint that acknowledged it: the verified inclusion in one call.
+    const auto receipt{client->Submit(market, action, std::chrono::milliseconds{2000})};
+    BOOST_CHECK(receipt.certificate_verified);
+    BOOST_CHECK_EQUAL(receipt.state, "certified_inclusion");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 1, 1, 1}));
+    {
+        std::lock_guard lock{validator.mutex};
+        BOOST_CHECK_EQUAL(validator.waited_submits, 0U);
+        BOOST_REQUIRE_EQUAL(validator.submitted.size(), 1U);
+        BOOST_CHECK(!validator.submitted[0].exists("wait_ms"));
+        BOOST_CHECK_EQUAL(validator.submitted[0]["action_hex"].get_str(), HexStr(*flowmesh::EncodeProductionActionPayload(action)));
+    }
+    const auto saved{client->SavedActions(action.signer, market)};
+    BOOST_REQUIRE_EQUAL(saved.size(), 1U);
+    BOOST_CHECK(saved[0].receipt.certificate_verified);
+    BOOST_CHECK(saved[0].may_have_been_sent);
+    client.reset();
+    server->Stop();
+    const auto durable{DurableRow(path, action)};
+    BOOST_CHECK(durable["may_have_been_sent"].get_bool());
+    BOOST_CHECK_EQUAL(durable["receipt"]["receipt_state"].get_str(), "certified_inclusion");
+}
+
+BOOST_AUTO_TEST_CASE(waited_submit_without_any_wait_advert_is_one_plain_submission)
+{
+    const fs::path path{m_path_root / "client"};
+    const auto action{SignedCancel(4)};
+    // A c10c952 endpoint: no waits at all.
+    ScriptedEndpoint validator;
+    validator.markets.push_back(MarketRow(std::chrono::milliseconds{0}));
+    validator.submit = Receipt(action, "admitted");
+    validator.waited = CertifiedReceipt(action);
+    auto server{Serve(validator)};
+    std::string error;
+    auto client{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(server->Port())}, path, error)};
+    BOOST_REQUIRE_MESSAGE(client, error);
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto receipt{client->Submit(market, action, std::chrono::milliseconds{2000})};
+    BOOST_CHECK(!receipt.certificate_verified);
+    BOOST_CHECK_EQUAL(receipt.state, "admitted");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 0, 1, 1}));
+    // A definite refusal never waits either, even where waits are offered.
+    const auto refused_action{SignedCancel(5)};
+    {
+        std::lock_guard lock{validator.mutex};
+        validator.markets = UniValue{UniValue::VARR};
+        validator.markets.push_back(MarketRow(std::chrono::milliseconds{1000}));
+        validator.submit = Receipt(refused_action, "rejected");
+    }
+    BOOST_REQUIRE_EQUAL(client->Markets(std::nullopt).size(), 1U);
+    const auto refused{client->Submit(market, refused_action, std::chrono::milliseconds{2000})};
+    BOOST_CHECK_EQUAL(refused.state, "rejected");
+    BOOST_CHECK((validator.Counts() == std::array<unsigned, 4>{0, 0, 2, 2}));
     client.reset();
     server->Stop();
 }

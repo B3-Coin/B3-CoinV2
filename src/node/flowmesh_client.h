@@ -55,7 +55,15 @@ public:
         watch.status = "unsupported";
         return Data(market, account, query, error);
     }
-    virtual interfaces::FlowMeshActionReceipt Submit(const uint256& market, const flowmesh::Action& action) = 0;
+    //! A nonzero wait lets a remote backend return a verified inclusion from
+    //! this call: at most one bounded wait at the endpoint for the delivered
+    //! action's certification, in the submission itself where the endpoint
+    //! offers it, else as one waited status read right after the delivery.
+    //! It never signs or resends to wait, and the receipt is never less
+    //! conservative than an unwaited Submit followed by that read. The local
+    //! engine answers at once.
+    virtual interfaces::FlowMeshActionReceipt Submit(const uint256& market, const flowmesh::Action& action,
+                                                     std::chrono::milliseconds wait = std::chrono::milliseconds{0}) = 0;
     //! A nonzero wait (only without retry) lets a remote backend hold one read
     //! of an action it just delivered open at the endpoint, bounded, until the
     //! action is certified there. It never resends or signs, and the receipt
