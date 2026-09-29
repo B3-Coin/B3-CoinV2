@@ -608,7 +608,7 @@ void B3FlowMeshTradingPanel::updateTicket()
             AdmissionReady(*m_snapshot, m_response_age.isValid() ? m_response_age.elapsed() : -1, -1, m_queue_age.isValid() ? m_queue_age.elapsed() : -1)};
         QString error;
         const auto limit{fresh ? marketableLimit(&error) : std::nullopt};
-        if (!fresh) error = tr("Waiting for fresh certified market data.");
+        if (!fresh) error = tr("Waiting for fresh certified data from a tradable market; no price is set.");
         if (m_price->text() != (limit ? limit->display : QString{})) { const QSignalBlocker block{m_price}; m_price->setText(limit ? limit->display : QString{}); }
         QString note{error};
         if (limit) {

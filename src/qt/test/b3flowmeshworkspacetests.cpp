@@ -4632,6 +4632,9 @@ private Q_SLOTS:
         // Stale data never prices.
         panel.m_read_failed = true; panel.updateTicket(); QVERIFY(panel.m_price->text().isEmpty()); QVERIFY(note->text().contains(QStringLiteral("fresh certified")));
         panel.m_read_failed = false; panel.updateTicket(); QCOMPARE(panel.m_price->text(), QStringLiteral("1.01"));
+        // Nor does a market that is not tradable, however fresh its data.
+        panel.m_snapshot->paused = true; panel.updateTicket(); QVERIFY(panel.m_price->text().isEmpty()); QVERIFY(note->text().contains(QStringLiteral("tradable market")));
+        panel.m_snapshot->paused = false; panel.updateTicket(); QCOMPARE(panel.m_price->text(), QStringLiteral("1.01"));
         marketable->setChecked(false); QVERIFY(!panel.m_price->isReadOnly()); QVERIFY(note->isHidden());
         QVERIFY(!panel.m_thread); QVERIFY(!panel.m_confirmation); QCOMPARE(unlock.count(), 0); QVERIFY(m_wallet->IsLocked());
     }
