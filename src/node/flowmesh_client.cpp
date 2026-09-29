@@ -759,6 +759,54 @@ class TradingApi {
         out.pushKV("consumer_certified_payload", HexStr(*payload));
         out.pushKV("consumer_outcome_evidence", *evidence);
     }
+    //! The 'action' reply for one ActionId: its receipt after an optional
+    //! bounded wait, the durable certified entry (or why it is unavailable)
+    //! for a certified inclusion, the opt-in outcome parts, and wait_status
+    //! only when a wait was requested.
+    UniValue ActionReply(const FlowMeshHttpsServer::Request& http, const uint256& id, const uint256& action_id,
+                         const std::optional<std::chrono::milliseconds> wait, const bool outcome, FlowMeshTimingSpan& timing)
+    {
+        // Same receipt as the local backend's ActionStatus(id, action, false).
+        const auto status{m_service.ClientActionStatus(id, action_id)};
+        auto receipt{LocalActionReceipt(status, action_id)};
+        // Opt-in only: an executed action whose inclusion event left the
+        // ring is still answered from the in-memory certified window.
+        const auto recent_inclusion = [&] {
+            if (!outcome || receipt.state == "certified_inclusion") return;
+            if (const auto included{m_service.ClientRecentInclusion(id, action_id)}) {
+                receipt = LocalActionReceipt(std::nullopt, action_id);
+                receipt.state = "certified_inclusion";
+                receipt.microblock_sequence = included->first;
+                receipt.microblock_hash = included->second;
+                receipt.certificate_verified = true;
+                receipt.reason = "certified inclusion retained by this endpoint; execution outcome established only by outcome evidence";
+            }
+        };
+        recent_inclusion();
+        std::string wait_status{"none"};
+        if (wait && wait->count() > 0 && receipt.state != "certified_inclusion") {
+            // An opt-in wait also ends on a newer refusal or drop notice.
+            const bool tracked{status.has_value() || (outcome && m_service.NewestClientNoticeIfNewer(id, action_id))};
+            wait_status = WaitForAction(http, id, action_id, tracked, *wait, receipt, timing, outcome);
+            recent_inclusion();
+        }
+        UniValue out{FlowMeshClientReceiptJson(receipt, outcome ? FlowMeshReceiptJsonScope::PUBLIC_OUTCOME_V1
+                                                                : FlowMeshReceiptJsonScope::PUBLIC_V1)};
+        if (receipt.state == "certified_inclusion") {
+            // Never built from the event: this waits for the commit's
+            // market lock and reads the durable certified entry.
+            std::string error;
+            if (const auto payload{m_service.ClientCertifiedEntry(id, receipt.microblock_sequence, error)}) out.pushKV("certified_payload", HexStr(*payload));
+            else out.pushKV("evidence_error", error);
+        }
+        if (outcome) AppendOutcomeFields(out, http, id, action_id, receipt);
+        if (wait) {
+            // A latency hint only, never evidence; absent unless requested.
+            out.pushKV("wait_status", wait_status);
+            timing.Field("wait_status", wait_status);
+        }
+        return out;
+    }
 public:
     explicit TradingApi(FlowMeshService& service, FlowMeshAssetMetadataCatalog metadata, const FlowMeshTradingApiWait wait,
                         const FlowMeshTradingApiHealth health, const FlowMeshTradingApiOutcome outcome,
@@ -889,53 +937,14 @@ public:
             else Keys(params, {"market_id", "action_id", "wait_ms", "outcome"});
             const auto id{Id(params, "market_id")};
             const auto action_id{Id(params, "action_id")};
-            const bool wait_requested{params.exists("wait_ms")};
             // "outcome": false is exactly the v1 request.
             const bool outcome{params.exists("outcome") && Flag(params, "outcome")};
             // Any unsigned integer is clamped to the advertised maximum.
-            const std::chrono::milliseconds wait{wait_requested
-                ? std::min<uint64_t>(Number(params, "wait_ms", std::numeric_limits<uint64_t>::max()), m_wait_max.count())
-                : 0};
-            // Same receipt as the local backend's ActionStatus(id, action, false).
-            const auto status{m_service.ClientActionStatus(id, action_id)};
-            auto receipt{LocalActionReceipt(status, action_id)};
-            // Opt-in only: an executed action whose inclusion event left the
-            // ring is still answered from the in-memory certified window.
-            const auto recent_inclusion = [&] {
-                if (!outcome || receipt.state == "certified_inclusion") return;
-                if (const auto included{m_service.ClientRecentInclusion(id, action_id)}) {
-                    receipt = LocalActionReceipt(std::nullopt, action_id);
-                    receipt.state = "certified_inclusion";
-                    receipt.microblock_sequence = included->first;
-                    receipt.microblock_hash = included->second;
-                    receipt.certificate_verified = true;
-                    receipt.reason = "certified inclusion retained by this endpoint; execution outcome established only by outcome evidence";
-                }
-            };
-            recent_inclusion();
-            std::string wait_status{"none"};
-            if (wait.count() > 0 && receipt.state != "certified_inclusion") {
-                // An opt-in wait also ends on a newer refusal or drop notice.
-                const bool tracked{status.has_value() || (outcome && m_service.NewestClientNoticeIfNewer(id, action_id))};
-                wait_status = WaitForAction(http, id, action_id, tracked, wait, receipt, timing, outcome);
-                recent_inclusion();
-            }
-            UniValue out{FlowMeshClientReceiptJson(receipt, outcome ? FlowMeshReceiptJsonScope::PUBLIC_OUTCOME_V1
-                                                                    : FlowMeshReceiptJsonScope::PUBLIC_V1)};
-            if (receipt.state == "certified_inclusion") {
-                // Never built from the event: this waits for the commit's
-                // market lock and reads the durable certified entry.
-                std::string error;
-                if (const auto payload{m_service.ClientCertifiedEntry(id, receipt.microblock_sequence, error)}) out.pushKV("certified_payload", HexStr(*payload));
-                else out.pushKV("evidence_error", error);
-            }
-            if (outcome) AppendOutcomeFields(out, http, id, action_id, receipt);
-            if (wait_requested) {
-                // A latency hint only, never evidence; absent unless requested.
-                out.pushKV("wait_status", wait_status);
-                timing.Field("wait_status", wait_status);
-            }
-            return out;
+            const std::optional<std::chrono::milliseconds> wait{params.exists("wait_ms")
+                ? std::optional{std::chrono::milliseconds{
+                      std::min<uint64_t>(Number(params, "wait_ms", std::numeric_limits<uint64_t>::max()), m_wait_max.count())}}
+                : std::nullopt};
+            return ActionReply(http, id, action_id, wait, outcome, timing);
         }
         if (method == "outcome_evidence" && m_outcome) {
             // Memory only: the runtime's retained re-execution record, never
