@@ -15,6 +15,7 @@
 #include <util/int128.h>
 #include <util/translation.h>
 #include <QTest>
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 #include <vector>
@@ -398,6 +399,10 @@ private Q_SLOTS:
         // Inverse view: a canonical ask receives B3 (Buy B3) and spends tokens.
         a.inverse_display = true; a.price = 500;
         QCOMPARE(ShortTitle(a), QStringLiteral("Buy B3 · spend up to 1 tUSD · limit 2 tUSD/B3"));
+        // A label shows a rounded reciprocal; the review shows the exact limit.
+        a.price = 1009; QCOMPARE(ShortTitle(a), QStringLiteral("Buy B3 · spend up to 1 tUSD · limit ≈0.99108 tUSD/B3"));
+        QVERIFY(Describe(a).contains(QStringLiteral("1000/1009")));
+        a.price = 500;
         a.display_decimals.reset(); a.display_ticker.clear();
         QVERIFY(ShortTitle(a).contains(QStringLiteral("raw units")));
         auto cancel{Order()}; cancel.operation = Operation::Cancel;
@@ -540,7 +545,7 @@ private Q_SLOTS:
         QCOMPARE(ExactInversePrice(502, 6), QStringLiteral("500/251"));
         QCOMPARE(ExactInversePrice(901, 6), QStringLiteral("1000/901"));
         const auto approximate{FormatDisplayPrice(901, 6, true)};
-        QVERIFY(approximate.startsWith(QStringLiteral("≈")));
+        QCOMPARE(approximate, QStringLiteral("≈1.11"));
         QVERIFY(!ParseDisplayPrice(approximate, units, true));
         QVERIFY(!ParseDisplayPrice(QStringLiteral("1.1"), units, true));
         QVERIFY(!ParseDisplayPrice(QStringLiteral("1.996"), units, true));
@@ -586,6 +591,70 @@ private Q_SLOTS:
         QVERIFY(!ParseDisplayPrice(QStringLiteral("2"), unknown, true));
         unknown = units; unknown.decimals = 19;
         QVERIFY(!ParseDisplayPrice(QStringLiteral("2"), unknown, true));
+    }
+    void displayPricesShareOneBoundedFormatter()
+    {
+        using namespace B3FlowMeshMarketData;
+        const auto units{TokenUnits()};
+        // Token per B3: one digit more than price / step tells a price from its
+        // neighbouring ticks; half up, trailing zeros trimmed, exact kept.
+        const auto last{DisplayPrice(1009, units, true)};
+        QCOMPARE(last.text, QStringLiteral("≈0.99108")); QCOMPARE(last.exact, QStringLiteral("1000/1009")); QVERIFY(last.approximate);
+        QCOMPARE(DisplayPrice(1010, units, true).text, QStringLiteral("≈0.9901"));
+        QCOMPARE(DisplayPrice(1001, units, true).text, QStringLiteral("≈0.999"));
+        QCOMPARE(DisplayPrice(999, units, true).text, QStringLiteral("≈1.001"));
+        QCOMPARE(FormatDisplayPrice(1009, units, true), last.text);
+        for (const CAmount raw : {CAmount{500}, CAmount{800}, CAmount{1000}, CAmount{2000}}) {
+            const auto exact{DisplayPrice(raw, units, true)};
+            QVERIFY(!exact.approximate); QCOMPARE(exact.text, exact.exact); QCOMPARE(exact.exact, ExactInversePrice(raw, 6));
+        }
+        // Never rounded into the integer part; a carry runs through nines.
+        QCOMPARE(DisplayPrice(3, units, true).text, QStringLiteral("≈333"));
+        QCOMPARE(DisplayPrice(6, units, true).text, QStringLiteral("≈167"));
+        QCOMPARE(DisplayPrice(7, 0, true, 1).text, QStringLiteral("≈142857143"));
+        QCOMPARE(DisplayPrice(1'000'001, 6, true, 1000).text, QStringLiteral("≈0.001"));
+        QCOMPARE(DisplayPrice(1'000'001, 0, true, 10'000).text, QStringLiteral("≈1000"));
+        // The verified step sets the precision, capped; without one at most 6.
+        QCOMPARE(DisplayPrice(123'456'789, 0, true, 1).text, QStringLiteral("≈8.1000001"));
+        QCOMPARE(DisplayPrice(123'456'789, 0, true, 1'000'000).text, QStringLiteral("≈8.1"));
+        QCOMPARE(DisplayPrice(123'456'789, 0, true).text, QStringLiteral("≈8.1"));
+        auto unverified{units}; unverified.known = false;
+        QCOMPARE(DisplayPrice(123'456'789, unverified, true), DisplayPrice(123'456'789, 6, true));
+        // Too small for 18 places: the exact form, never "≈0".
+        QVERIFY(!DisplayPrice(MAX_MONEY, 18, true).approximate);
+        QCOMPARE(DisplayPrice(MAX_MONEY, 18, true).text, ExactInversePrice(MAX_MONEY, 18));
+        // B3 per token is always exact at the asset precision.
+        for (const CAmount raw : {CAmount{1}, CAmount{1009}, CAmount{123'456'789}, MAX_MONEY}) {
+            for (const int decimals : {0, 6, 9, 18}) {
+                const auto p{DisplayPrice(raw, TokenUnits(decimals), false)};
+                QVERIFY(!p.approximate); QCOMPARE(p.text, FormatPrice(raw, decimals)); QCOMPARE(p.exact, p.text);
+            }
+        }
+        for (const auto& invalid : {DisplayPrice(0, units, true), DisplayPrice(-1, units, true), DisplayPrice(MAX_MONEY + 1, units, true), DisplayPrice(1, 19, true), DisplayPrice(-1, units, false)}) {
+            QCOMPARE(invalid.text, QStringLiteral("—")); QVERIFY(!invalid.approximate);
+        }
+        // Display text never becomes an order input; the exact form does.
+        QVERIFY(!ParseDisplayPrice(last.text, units, true)); QVERIFY(!ParseDisplayLimit(last.text, units, true, true));
+        QCOMPARE(ParseDisplayPrice(last.exact, units, true).value(), CAmount{1009});
+        // Bounded everywhere: at most MAX_PRICE_SIGNIFICANT_DIGITS unless the
+        // integer part needs more, and at most 18 decimal places.
+        for (const int decimals : {0, 6, 9, 18}) {
+            for (const CAmount step : {CAmount{0}, CAmount{1}, CAmount{7}}) {
+                for (const CAmount raw : {CAmount{1}, CAmount{2}, CAmount{3}, CAmount{7}, CAmount{901}, CAmount{1009}, CAmount{123'456'789}, MAX_MONEY - 1, MAX_MONEY}) {
+                    const auto p{DisplayPrice(raw, decimals, true, step)};
+                    QCOMPARE(ParseDisplayPrice(p.exact, TokenUnits(decimals), true).value(), raw);
+                    if (!p.approximate) { QCOMPARE(p.text, p.exact); continue; }
+                    QVERIFY(p.text.startsWith(QStringLiteral("≈")));
+                    const QString number{p.text.mid(1)};
+                    const QString integer{number.section(QLatin1Char('.'), 0, 0)}, fraction{number.section(QLatin1Char('.'), 1)};
+                    QVERIFY(fraction.size() <= 18); QVERIFY(!fraction.endsWith(QLatin1Char('0')));
+                    QString significant{integer == QStringLiteral("0") ? fraction : integer + fraction};
+                    while (significant.startsWith(QLatin1Char('0'))) significant.remove(0, 1);
+                    const int bound{step > 0 ? MAX_PRICE_SIGNIFICANT_DIGITS : FALLBACK_PRICE_SIGNIFICANT_DIGITS};
+                    QVERIFY2(significant.size() <= std::max<qsizetype>(bound, integer == QStringLiteral("0") ? 0 : integer.size()), qPrintable(p.text));
+                }
+            }
+        }
     }
     void sideAwareLimitsPreserveTheExistingThirtyTwoVectorStudy()
     {

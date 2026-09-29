@@ -9,6 +9,7 @@
 #include <QObject>
 #include <QStringList>
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -62,24 +63,72 @@ std::optional<Ratio> InverseRatio(CAmount raw, int decimals)
     r.numerator /= divisor; r.denominator /= divisor;
     return r;
 }
-QString RatioText(const Ratio& ratio, bool exact)
+//! The exact decimal when it ends within 18 places, else the reduced
+//! fraction: both parse back to the same canonical tick.
+QString ExactRatioText(const Ratio& ratio)
 {
     QString result{WideText(ratio.numerator / ratio.denominator)};
     Wide remainder{ratio.numerator % ratio.denominator};
     if (remainder == 0) return result;
     result += QLatin1Char('.');
-    // Formatting only. Truncation is explicitly marked and never accepted as
-    // an executable price. A reduced fraction represents every canonical tick.
     for (int i{0}; i < 18 && remainder != 0; ++i) {
         remainder *= 10;
         result += QChar{static_cast<ushort>('0' + static_cast<unsigned>(remainder / ratio.denominator))};
         remainder %= ratio.denominator;
     }
-    while (result.endsWith(QLatin1Char('0'))) result.chop(1);
-    if (result.endsWith(QLatin1Char('.'))) result.chop(1);
     if (remainder == 0) return result;
-    if (exact || result == QStringLiteral("0")) return WideText(ratio.numerator) + QLatin1Char('/') + WideText(ratio.denominator);
-    return QStringLiteral("≈") + result;
+    return WideText(ratio.numerator) + QLatin1Char('/') + WideText(ratio.denominator);
+}
+struct Rounded {
+    QString text;
+    bool exact{true};
+    //! The decimal place it rounded at, before trailing zeros were trimmed.
+    int places{0};
+};
+//! Display rounding of a positive ratio, half up: to `significant` digits,
+//! never into the integer part, and to at most `max_places` decimal places.
+//! Trailing zeros are trimmed. A denominator whose remainder cannot be
+//! multiplied by ten is not rounded (nullopt): callers show the exact form.
+std::optional<Rounded> RoundRatio(const Ratio& ratio, int significant, int max_places)
+{
+    if (ratio.denominator == 0 || ratio.denominator > ~Wide{0} / 10) return std::nullopt;
+    Rounded out;
+    Wide integer{ratio.numerator / ratio.denominator}, remainder{ratio.numerator % ratio.denominator};
+    int digits{integer == 0 ? 0 : static_cast<int>(WideText(integer).size())};
+    QString fraction;
+    while (out.places < max_places && digits < significant) {
+        remainder *= 10;
+        const unsigned digit{static_cast<unsigned>(remainder / ratio.denominator)};
+        remainder %= ratio.denominator;
+        fraction += QChar{static_cast<ushort>('0' + digit)};
+        ++out.places;
+        if (digits > 0 || digit != 0) ++digits;
+    }
+    out.exact = remainder == 0;
+    if (remainder >= ratio.denominator - remainder && remainder != 0) {
+        qsizetype i{fraction.size()};
+        for (; i > 0 && fraction.at(i - 1) == QLatin1Char('9'); --i) fraction[i - 1] = QLatin1Char('0');
+        if (i > 0) fraction[i - 1] = QChar{static_cast<ushort>(fraction.at(i - 1).unicode() + 1)};
+        else ++integer;
+    }
+    while (fraction.endsWith(QLatin1Char('0'))) fraction.chop(1);
+    out.text = WideText(integer) + (fraction.isEmpty() ? QString{} : QLatin1Char('.') + fraction);
+    return out;
+}
+//! Adjacent canonical ticks p and p + step have reciprocals about 1 / (p /
+//! step) apart, relatively: one more digit than p / step has tells them apart.
+int InverseSignificantDigits(CAmount raw, CAmount step)
+{
+    const bool known{step > 0};
+    const uint64_t ticks{std::max<uint64_t>(static_cast<uint64_t>(raw) / static_cast<uint64_t>(known ? step : 1), 1)};
+    const int digits{static_cast<int>(QString::number(ticks).size()) + 1};
+    return std::min(digits, known ? MAX_PRICE_SIGNIFICANT_DIGITS : FALLBACK_PRICE_SIGNIFICANT_DIGITS);
+}
+std::optional<Rounded> RoundInverse(CAmount raw, int decimals, CAmount step)
+{
+    const auto ratio{InverseRatio(raw, decimals)};
+    if (!ratio) return std::nullopt;
+    return RoundRatio(*ratio, InverseSignificantDigits(raw, step), 18);
 }
 // Only formatting needs this wider-than-128-bit denominator. Each digit's
 // product/carry is bounded by ten times a uint64_t; no economic value is cast.
@@ -98,11 +147,12 @@ QString MultiplyDecimal(const QString& value, uint64_t factor)
     }
     return result;
 }
-QString LimitSpread(CAmount bid, CAmount ask, int decimals, bool inverse)
+//! Empty `exact` when there is no spread to show.
+PriceText LimitSpread(CAmount bid, CAmount ask, int decimals, CAmount step, bool inverse)
 {
     if (ask < bid || (inverse && (bid == 0 || ask == 0))) return {};
-    if (!inverse) return FormatPrice(ask - bid, decimals);
-    if (bid == ask) return QStringLiteral("0");
+    if (!inverse) return DisplayPrice(ask - bid, decimals, false, step);
+    if (bid == ask) return {QStringLiteral("0"), QStringLiteral("0"), false};
     // 10^9 * (ask - bid) / (10^decimals * bid * ask). The raw-price
     // product fits 128 bits, but multiplication by token precision may not.
     Wide numerator{Wide{KILO_COIN} * static_cast<uint64_t>(ask - bid)};
@@ -114,10 +164,25 @@ QString LimitSpread(CAmount bid, CAmount ask, int decimals, bool inverse)
         *factor /= divisor;
     }
     const Wide maximum{~Wide{0}};
-    // RatioText's long division multiplies a remainder by ten. Beyond that
-    // bound an exact reduced fraction avoids both overflow and approximation.
-    if (denominator <= (maximum / 10) / scale) return RatioText({numerator, denominator * scale}, true);
-    return WideText(numerator) + QLatin1Char('/') + MultiplyDecimal(WideText(denominator), static_cast<uint64_t>(scale));
+    // The long division multiplies a remainder by ten. Beyond that bound an
+    // exact reduced fraction avoids both overflow and approximation.
+    if (denominator > (maximum / 10) / scale) {
+        const QString exact{WideText(numerator) + QLatin1Char('/') + MultiplyDecimal(WideText(denominator), static_cast<uint64_t>(scale))};
+        return {exact, exact, false};
+    }
+    const Ratio spread{numerator, denominator * scale};
+    PriceText out;
+    out.exact = out.text = ExactRatioText(spread);
+    // Display only: as many decimal places as the two best prices show, so
+    // the spread reads against them. A spread finer than that stays exact.
+    const auto bid_shown{RoundInverse(bid, decimals, step)}, ask_shown{RoundInverse(ask, decimals, step)};
+    if (!bid_shown || !ask_shown) return out;
+    const auto rounded{RoundRatio(spread, std::numeric_limits<int>::max(), std::max(bid_shown->places, ask_shown->places))};
+    if (rounded && !rounded->exact && rounded->text != QStringLiteral("0")) {
+        out.text = QStringLiteral("≈") + rounded->text;
+        out.approximate = true;
+    }
+    return out;
 }
 [[noreturn]] void Fail(const char* text) { throw std::runtime_error{text}; }
 bool ValidUnits(const Units& u) { return u.known && u.decimals >= 0 && u.decimals <= 18 && u.quantity_step > 0 && u.price_step > 0; }
@@ -263,8 +328,9 @@ std::vector<Trade> TicksAsTrades(const std::deque<Tick>& held)
     return out;
 }
 
-QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported)
+QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported, QString* exact_prices)
 {
+    if (exact_prices) exact_prices->clear();
     QString text;
     if (tick.kind == QStringLiteral("handoff")) text = QObject::tr("Microblock #%1 · validator handoff, no auction").arg(tick.sequence);
     else if (tick.kind == QStringLiteral("settlement")) text = QObject::tr("Microblock #%1 · withdrawal settlement, no auction").arg(tick.sequence);
@@ -272,8 +338,10 @@ QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, boo
     else if (!ValidUnits(units)) text = QObject::tr("Auction #%1 · matched (asset precision unavailable)").arg(tick.sequence);
     else {
         const QString price_units{inverse ? QObject::tr("%1 / B3").arg(units.ticker) : QObject::tr("B3 / %1").arg(units.ticker)};
+        const auto price{DisplayPrice(tick.price, units, inverse)};
+        if (exact_prices && price.approximate) *exact_prices = QObject::tr("Exact price: %1 %2").arg(price.exact, price_units);
         text = QObject::tr("Auction #%1 · %2 %3 at %4 %5").arg(tick.sequence).arg(FormatAmount(tick.volume, units.decimals), units.ticker,
-                                                               inverse && tick.price == 0 ? QObject::tr("zero") : FormatDisplayPrice(tick.price, units.decimals, inverse), price_units);
+                                                               inverse && tick.price == 0 ? QObject::tr("zero") : price.text, price_units);
         // In the B3 view a canonical bid (buying the token) sells B3.
         const bool bid{tick.side == QStringLiteral("bid")};
         if (tick.side == QStringLiteral("unknown")) text += QObject::tr(" · unfilled side not observed");
@@ -286,14 +354,23 @@ QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, boo
     return text;
 }
 
-QString IndicativeText(const Indicative& view, const Units& units, bool inverse)
+QString IndicativeText(const Indicative& view, const Units& units, bool inverse, QString* exact_prices)
 {
+    if (exact_prices) exact_prices->clear();
     if (!view.available) return view.reason.isEmpty() ? QString{} : QObject::tr("Indicative price unavailable (%1)").arg(view.reason);
     if (!ValidUnits(units)) return {};
-    const auto price = [&](CAmount raw) {
-        return inverse && raw == 0 ? QObject::tr("zero") : FormatDisplayPrice(raw, units.decimals, inverse);
-    };
     const QString price_units{inverse ? QObject::tr("%1 / B3").arg(units.ticker) : QObject::tr("B3 / %1").arg(units.ticker)};
+    QStringList exact;
+    const auto price = [&](CAmount raw) {
+        if (inverse && raw == 0) return QObject::tr("zero");
+        const auto shown{DisplayPrice(raw, units, inverse)};
+        if (shown.approximate && !exact.contains(shown.exact)) exact << shown.exact;
+        return shown.text;
+    };
+    const auto finish = [&](const QString& text) {
+        if (exact_prices && !exact.isEmpty()) *exact_prices = QObject::tr("Exact prices: %1 %2").arg(exact.join(QStringLiteral(", ")), price_units);
+        return text;
+    };
     // In the B3 view the best bid (buying the token) is the lowest B3 price.
     QStringList touch;
     const auto& high{inverse ? view.best_ask : view.best_bid};
@@ -303,17 +380,17 @@ QString IndicativeText(const Indicative& view, const Units& units, bool inverse)
     const QString book{touch.isEmpty() ? QString{} : QStringLiteral(" · ") + touch.join(QStringLiteral(" · "))};
     const QString label{QObject::tr("Indicative, not certified")};
     if (!view.has_draft) {
-        if (!view.cleared) return label + QObject::tr(": no cross") + book;
-        return label + QObject::tr(": standing orders would clear at %1 %2 for %3 %4").arg(price(view.price), price_units, FormatAmount(view.volume, units.decimals), units.ticker);
+        if (!view.cleared) return finish(label + QObject::tr(": no cross") + book);
+        return finish(label + QObject::tr(": standing orders would clear at %1 %2 for %3 %4").arg(price(view.price), price_units, FormatAmount(view.volume, units.decimals), units.ticker));
     }
     if (!view.cleared || !view.fill_max || *view.fill_max == 0) {
-        return label + QObject::tr(": this order would not match now") + book + QObject::tr(" · other pending orders excluded");
+        return finish(label + QObject::tr(": this order would not match now") + book + QObject::tr(" · other pending orders excluded"));
     }
     const QString fill{*view.fill_min == *view.fill_max ? FormatAmount(*view.fill_max, units.decimals)
                                                         : QObject::tr("%1 to %2").arg(FormatAmount(*view.fill_min, units.decimals), FormatAmount(*view.fill_max, units.decimals))};
-    return label + QObject::tr(": would clear at %1 %2, filling %3 of %4 %5 if submitted now (other pending orders excluded%6)")
+    return finish(label + QObject::tr(": would clear at %1 %2, filling %3 of %4 %5 if submitted now (other pending orders excluded%6)")
         .arg(price(view.price), price_units, fill, FormatAmount(view.draft_quantity, units.decimals), units.ticker,
-             view.replaces ? QObject::tr("; replaces your standing order on this side") : QString{});
+             view.replaces ? QObject::tr("; replaces your standing order on this side") : QString{}));
 }
 
 QString FormatAmount(CAmount raw, int decimals)
@@ -332,16 +409,30 @@ QString FormatPrice(CAmount raw, int decimals)
     if (decimals <= 9) return FormatAmount(raw, 9 - decimals);
     return raw == 0 ? QStringLiteral("0") : QString::number(raw) + QString(decimals - 9, QLatin1Char('0'));
 }
-QString FormatDisplayPrice(CAmount raw, int decimals, bool inverse)
+PriceText DisplayPrice(CAmount raw, int decimals, bool inverse, CAmount step)
 {
-    if (!inverse) return FormatPrice(raw, decimals);
-    const auto ratio{InverseRatio(raw, decimals)};
-    return ratio ? RatioText(*ratio, false) : QStringLiteral("—");
+    PriceText out;
+    // B3 per token: a whole number of B3 atoms per token atom always ends
+    // within the asset precision, so it is shown exactly.
+    out.exact = out.text = inverse ? ExactInversePrice(raw, decimals) : FormatPrice(raw, decimals);
+    if (!inverse) return out;
+    const auto rounded{RoundInverse(raw, decimals, step)};
+    // Too small for 18 places, or not roundable: the exact form, never "≈0".
+    if (!rounded || rounded->exact || rounded->text == QStringLiteral("0")) return out;
+    out.text = QStringLiteral("≈") + rounded->text;
+    out.approximate = true;
+    return out;
 }
+PriceText DisplayPrice(CAmount raw, const Units& units, bool inverse)
+{
+    return DisplayPrice(raw, units.decimals, inverse, ValidUnits(units) ? units.price_step : 0);
+}
+QString FormatDisplayPrice(CAmount raw, int decimals, bool inverse) { return DisplayPrice(raw, decimals, inverse).text; }
+QString FormatDisplayPrice(CAmount raw, const Units& units, bool inverse) { return DisplayPrice(raw, units, inverse).text; }
 QString ExactInversePrice(CAmount raw, int decimals)
 {
     const auto ratio{InverseRatio(raw, decimals)};
-    return ratio ? RatioText(*ratio, true) : QStringLiteral("—");
+    return ratio ? ExactRatioText(*ratio) : QStringLiteral("—");
 }
 QString FormatDepthQuantity(CAmount price, CAmount quantity, int decimals, bool inverse)
 {
@@ -570,7 +661,9 @@ LimitBook ProjectLimitBook(const Snapshot& snapshot, bool inverse)
     std::sort(out.bids.begin(), out.bids.end(), descending);
     out.complete = snapshot.curves_complete && out.general_curves == 0 && out.invalid_curves == 0 && out.zero_inverse_curves == 0;
     if (out.complete && out.units_known && out.canonical_best_bid && out.canonical_best_ask) {
-        out.spread = LimitSpread(*out.canonical_best_bid, *out.canonical_best_ask, snapshot.units.decimals, inverse);
+        const auto spread{LimitSpread(*out.canonical_best_bid, *out.canonical_best_ask, snapshot.units.decimals, snapshot.units.price_step, inverse)};
+        out.spread = spread.exact;
+        out.spread_display = spread.text;
     }
     return out;
 }

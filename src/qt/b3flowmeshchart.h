@@ -40,8 +40,12 @@ public:
     static QString FormatCandleVolume(const Candle& candle, int base_decimals, bool inverse);
     int pricePointCount() const;
     QString emptyMessage() const;
+    //! The exact form of every price the last paint showed rounded (empty
+    //! when none was). The hover tooltip adds it to toolTip().
+    QString exactPrices() const { return m_exact_prices; }
     QSize minimumSizeHint() const override { return {280, 260}; }
 protected:
+    bool event(QEvent*) override;
     void paintEvent(QPaintEvent*) override;
     void mouseMoveEvent(QMouseEvent*) override;
     void leaveEvent(QEvent*) override;
@@ -54,5 +58,6 @@ private:
     bool m_loading{false}, m_stale{false};
     bool m_inverted{false};
     QPointF m_pointer{-1, -1};
+    QString m_exact_prices;
 };
 #endif

@@ -249,11 +249,14 @@ QString OrderTitle(bool bid, CAmount price, CAmount quantity, std::optional<int>
     const QString side{SideTitle(bid, inverse && decimals)};
     if (!decimals) return QStringLiteral("%1 %2 @ %3 B3 atoms per raw unit").arg(side, BaseAmount(quantity, decimals, ticker)).arg(price);
     const QString token{ticker.isEmpty() ? QStringLiteral("token") : ticker};
+    // A short label: the shared display formatter. The review and the saved
+    // request's details show the exact signed limit.
+    const QString limit{B3FlowMeshMarketData::FormatDisplayPrice(price, *decimals, inverse)};
     if (inverse) {
         return QStringLiteral("%1 · %2 %3 · limit %4 %5/B3").arg(side, bid ? QStringLiteral("receive up to") : QStringLiteral("spend up to"),
-            BaseAmount(quantity, decimals, ticker), B3FlowMeshMarketData::ExactInversePrice(price, *decimals), token);
+            BaseAmount(quantity, decimals, ticker), limit, token);
     }
-    return QStringLiteral("%1 %2 @ %3 B3/%4").arg(side, BaseAmount(quantity, decimals, ticker), B3FlowMeshMarketData::FormatPrice(price, *decimals), token);
+    return QStringLiteral("%1 %2 @ %3 B3/%4").arg(side, BaseAmount(quantity, decimals, ticker), limit, token);
 }
 //! The marketable-limit disclosure, in the review's own orientation and units.
 QString MarketableDisclosure(const Action& a)

@@ -2,10 +2,12 @@
 // Distributed under the MIT software license, see COPYING.
 #include <qt/b3flowmeshchart.h>
 #include <qt/b3theme.h>
+#include <QHelpEvent>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QStringList>
+#include <QToolTip>
 #include <algorithm>
 #include <cmath>
 
@@ -110,15 +112,28 @@ QString B3FlowMeshChart::emptyMessage() const {
     }
     return m_inverted && !m_snapshot->depth.empty() ? tr("No finite inverse depth price\nZero-price samples remain visible in the liquidity table.") : tr("No orders yet\nOrders appear after certification.");
 }
+bool B3FlowMeshChart::event(QEvent* e)
+{
+    if (e->type() != QEvent::ToolTip) return QWidget::event(e);
+    const QString text{m_exact_prices.isEmpty() ? toolTip() : toolTip().isEmpty() ? m_exact_prices : toolTip() + QStringLiteral("\n\n") + m_exact_prices};
+    if (text.isEmpty()) {
+        QToolTip::hideText();
+        e->ignore();
+    } else {
+        QToolTip::showText(static_cast<QHelpEvent*>(e)->globalPos(), text, this);
+    }
+    return true;
+}
 void B3FlowMeshChart::mouseMoveEvent(QMouseEvent* e) { m_pointer = e->position(); update(); }
 void B3FlowMeshChart::leaveEvent(QEvent*) { m_pointer = {-1, -1}; update(); }
 void B3FlowMeshChart::paintEvent(QPaintEvent*)
 {
     QPainter p{this}; p.setRenderHint(QPainter::Antialiasing); p.fillRect(rect(), B3Theme::kSurface);
     p.setFont(QFont{font().family(), 9});
+    m_exact_prices.clear();
     int axis_width{88};
     if (m_snapshot && m_mode == Mode::Prices) for (const auto& candle : m_candles) for (const auto price : {candle.low, candle.high}) {
-        axis_width = std::max(axis_width, p.fontMetrics().horizontalAdvance(FormatDisplayPrice(price, m_snapshot->units.decimals, m_inverted)) + 12);
+        axis_width = std::max(axis_width, p.fontMetrics().horizontalAdvance(FormatDisplayPrice(price, m_snapshot->units, m_inverted)) + 12);
     }
     axis_width = std::min(axis_width, std::max(88, width() / 3));
     const QRectF plot{12, m_mode == Mode::Prices ? 70.0 : 26.0, static_cast<qreal>(std::max(20, width() - axis_width - 16)), static_cast<qreal>(std::max(20, height() - (m_mode == Mode::Prices ? 130 : 66)))};
@@ -136,6 +151,14 @@ void B3FlowMeshChart::paintEvent(QPaintEvent*)
     const auto price_coordinate = [&](CAmount price) { return m_inverted ? 1.0 / static_cast<double>(price) : static_cast<double>(price); };
     const QString price_units{(m_inverted ? QStringLiteral("%1 / B3") : QStringLiteral("B3 / %1")).arg(units.ticker)};
     const QString quantity_units{m_inverted ? QStringLiteral("B3 gross") : units.ticker};
+    // Every price label: the shared display formatter. Rounded ones are
+    // listed exactly for the hover tooltip.
+    QStringList exact;
+    const auto label = [&](const QString& name, CAmount price) {
+        const auto shown{DisplayPrice(price, units, m_inverted)};
+        if (shown.approximate) exact << name + QLatin1Char(' ') + shown.exact;
+        return shown.text;
+    };
     if (m_mode == Mode::Prices) {
         CAmount canonical_low{std::min(m_candles.front().low, m_candles.front().high)}, canonical_high{std::max(m_candles.front().low, m_candles.front().high)};
         util::Unsigned128 max_volume{1};
@@ -178,8 +201,8 @@ void B3FlowMeshChart::paintEvent(QPaintEvent*)
         }
         const CAmount high{m_inverted ? canonical_low : canonical_high}, low{m_inverted ? canonical_high : canonical_low};
         p.setPen(B3Theme::kTextSecondary);
-        p.drawText(QRectF{plot.right() + 6, y(high) - 8, static_cast<qreal>(axis_width - 6), 18}, FormatDisplayPrice(high, units.decimals, m_inverted));
-        if (low != high) p.drawText(QRectF{plot.right() + 6, y(low) - 8, static_cast<qreal>(axis_width - 6), 18}, FormatDisplayPrice(low, units.decimals, m_inverted));
+        p.drawText(QRectF{plot.right() + 6, y(high) - 8, static_cast<qreal>(axis_width - 6), 18}, label(tr("axis high"), high));
+        if (low != high) p.drawText(QRectF{plot.right() + 6, y(low) - 8, static_cast<qreal>(axis_width - 6), 18}, label(tr("axis low"), low));
         p.drawText(QRectF{plot.left(), plot.bottom() + 5, plot.width(), 18}, Qt::AlignLeft, QStringLiteral("#%1").arg(first.first_sequence));
         if (first.first_sequence != last.last_sequence) p.drawText(QRectF{plot.left(), plot.bottom() + 5, plot.width(), 18}, Qt::AlignRight, QStringLiteral("#%1").arg(last.last_sequence));
         p.drawText(QRectF{plot.left(), plot.bottom() + 26, plot.width(), 18}, Qt::AlignCenter, tr("Microblock sequence · %1 / candle · gaps unfilled").arg(m_candle_interval));
@@ -192,8 +215,8 @@ void B3FlowMeshChart::paintEvent(QPaintEvent*)
             p.drawLine(QPointF{x(*selected), plot.top()}, QPointF{x(*selected), plot.bottom()});
             p.drawLine(QPointF{plot.left(), m_pointer.y()}, QPointF{plot.right(), m_pointer.y()});
         }
-        const auto label = [&](CAmount price) { return FormatDisplayPrice(price, units.decimals, m_inverted); };
-        const QStringList ohlc{tr("O %1").arg(label(selected->open)), tr("H %1").arg(label(selected->high)), tr("L %1").arg(label(selected->low)), tr("C %1").arg(label(selected->close))};
+        const QStringList ohlc{tr("O %1").arg(label(tr("O"), selected->open)), tr("H %1").arg(label(tr("H"), selected->high)),
+                               tr("L %1").arg(label(tr("L"), selected->low)), tr("C %1").arg(label(tr("C"), selected->close))};
         p.setPen(B3Theme::kTextPrimary);
         const qreal field_width{(width() - 24) / 2.0};
         for (int i{0}; i < ohlc.size(); ++i) p.drawText(QRectF{plot.left() + (i % 2) * field_width, 24.0 + (i / 2) * 18, field_width, 18}, p.fontMetrics().elidedText(ohlc[i], Qt::ElideRight, static_cast<int>(field_width - 8)));
@@ -220,8 +243,9 @@ void B3FlowMeshChart::paintEvent(QPaintEvent*)
         }
         p.setPen(B3Theme::kTextSecondary); p.drawText(QRectF{plot.left(), 2, plot.width(), 18}, s.curves_complete ? tr("Aggregate demand / supply · %1").arg(quantity_units) : tr("PARTIAL curve page · not total market liquidity"));
         p.drawText(QRectF{plot.right() + 6, plot.top(), 78, 18}, FormatDepthQuantity(max_price, max_base, units.decimals, m_inverted));
-        p.drawText(QRectF{plot.left(), plot.bottom() + 8, plot.width(), 20}, Qt::AlignLeft, FormatDisplayPrice(first, units.decimals, m_inverted));
-        p.drawText(QRectF{plot.left(), plot.bottom() + 8, plot.width(), 20}, Qt::AlignRight, FormatDisplayPrice(last, units.decimals, m_inverted) + QLatin1Char(' ') + price_units);
+        p.drawText(QRectF{plot.left(), plot.bottom() + 8, plot.width(), 20}, Qt::AlignLeft, label(tr("axis left"), first));
+        p.drawText(QRectF{plot.left(), plot.bottom() + 8, plot.width(), 20}, Qt::AlignRight, label(tr("axis right"), last) + QLatin1Char(' ') + price_units);
     }
+    if (!exact.isEmpty()) m_exact_prices = tr("Exact prices (%1): %2").arg(price_units, exact.join(QStringLiteral(" · ")));
     if (m_stale) { p.setPen(B3Theme::kWarning); p.drawText(plot.adjusted(8, 30, -8, -8), Qt::AlignTop | Qt::AlignRight, tr("STALE · retained certified data")); }
 }

@@ -23,9 +23,34 @@ struct Units {
 };
 QString FormatAmount(CAmount raw, int decimals);
 QString FormatPrice(CAmount raw_atoms_per_raw_unit, int base_decimals);
-//! Orientation never changes canonical market data or the signed integer grid.
-//! Approximate display prices are marked; use ExactInversePrice for order input.
+//! The one formatter for every FlowMesh price shown to a person. Display
+//! only: order inputs, order reviews and signed actions keep the exact forms
+//! (FormatPrice, ExactInversePrice, ParseDisplayLimit); `text` is never
+//! parsed into an action. Orientation never changes canonical market data.
+//!
+//! `text` carries at most the market's meaningful precision, trailing zeros
+//! trimmed. B3 per token is exact: a canonical price is a whole number of B3
+//! atoms per token atom, so the asset precision bounds its decimals. Token
+//! per B3 keeps the significant digits that tell a price from its
+//! neighbouring canonical ticks (one more than the digits of price / price
+//! step), at most MAX_PRICE_SIGNIFICANT_DIGITS, and at most
+//! FALLBACK_PRICE_SIGNIFICANT_DIGITS when no verified price step is given.
+//! It rounds half up, never into the integer part, and to at most 18
+//! decimal places. A rounded value starts with "≈" and `exact` holds the
+//! exact decimal or reduced fraction for a tooltip; otherwise both match.
+inline constexpr int MAX_PRICE_SIGNIFICANT_DIGITS{8}, FALLBACK_PRICE_SIGNIFICANT_DIGITS{6};
+struct PriceText {
+    QString text, exact;
+    bool approximate{false};
+    bool operator==(const PriceText&) const = default;
+};
+//! price_step <= 0: no verified step (FALLBACK_PRICE_SIGNIFICANT_DIGITS).
+PriceText DisplayPrice(CAmount raw_price, int base_decimals, bool inverse, CAmount price_step = 0);
+//! Uses the verified price step of valid units.
+PriceText DisplayPrice(CAmount raw_price, const Units& units, bool inverse);
+//! DisplayPrice(...).text.
 QString FormatDisplayPrice(CAmount raw_price, int base_decimals, bool inverse = false);
+QString FormatDisplayPrice(CAmount raw_price, const Units& units, bool inverse);
 QString ExactInversePrice(CAmount raw_price, int base_decimals);
 //! Exact sampled gross B3 when inverted; not a fixed-B3 order quantity.
 QString FormatDepthQuantity(CAmount raw_price, CAmount base_quantity, int base_decimals, bool inverse);
@@ -124,9 +149,11 @@ bool MergeHeldTicks(std::deque<Tick>& held, const TickPage& page);
 //! without a match.
 std::vector<Trade> TicksAsTrades(const std::deque<Tick>& held);
 //! "Auction #N · …" for the latest tick, in the display orientation.
-QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported);
+//! `exact_prices`, when given, receives the exact form of every price the
+//! text shows rounded (empty when none was), for a tooltip.
+QString ClearingTickText(const Tick& tick, const Units& units, bool inverse, bool endpoint_reported, QString* exact_prices = nullptr);
 //! The indicative line for the ticket; empty when there is nothing to say.
-QString IndicativeText(const Indicative& view, const Units& units, bool inverse);
+QString IndicativeText(const Indicative& view, const Units& units, bool inverse, QString* exact_prices = nullptr);
 //! A price-grouped projection of exact limit-shaped curves, not FIFO orders.
 //! Raw fields always retain canonical units: base raw quantity and B3 atoms.
 //! Inverse amount is gross B3 at this limit, not a promised execution amount.
@@ -148,6 +175,9 @@ struct LimitBook {
     // Exact decimal or rational; empty for incomplete, one-sided, crossed, or
     // unknown-unit books. Never present a partial-limit spread as market-wide.
     QString spread;
+    // The spread as displayed: token per B3 rounds to the decimal places the
+    // two best prices are displayed with (then marked "≈"); else `spread`.
+    QString spread_display;
     bool operator==(const LimitBook&) const = default;
 };
 //! Only exact MakeLimitBidCurve / MakeLimitAskCurve shapes are projected.

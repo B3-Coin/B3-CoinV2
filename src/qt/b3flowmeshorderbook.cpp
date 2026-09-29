@@ -74,7 +74,7 @@ QTableWidget* Table(QWidget* parent, const char* name, const QColor& color, bool
     table->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     return table;
 }
-void Rows(QTableWidget* table, const std::vector<B3FlowMeshMarketData::LimitLevel>& levels, bool asks, bool inverse, int decimals, const QColor& color)
+void Rows(QTableWidget* table, const std::vector<B3FlowMeshMarketData::LimitLevel>& levels, bool asks, bool inverse, const B3FlowMeshMarketData::Units& units, const QColor& color)
 {
     using namespace B3FlowMeshMarketData;
     const size_t count{std::min(VISIBLE_LEVELS, levels.size())};
@@ -93,9 +93,9 @@ void Rows(QTableWidget* table, const std::vector<B3FlowMeshMarketData::LimitLeve
         const auto& level{levels[begin + row]};
         cumulative += inverse ? level.gross_notional : level.remaining;
         const double fraction{total ? static_cast<double>(cumulative) / static_cast<double>(total) : 0.0};
-        const QStringList values{FormatDisplayPrice(level.canonical_price, decimals, inverse), level.amount, level.total};
+        const QStringList values{FormatDisplayPrice(level.canonical_price, units, inverse), level.amount, level.total};
         const QString tooltip{QObject::tr("Price: %1\nAmount: %2\nTotal: %3\n%4 limit order(s) at this level. Total is this level's notional, not a promised fill. Shading is cumulative amount from the best shown level.").arg(level.price, level.amount, level.total).arg(level.curve_count) +
-            (inverse ? QObject::tr("\nExact reciprocal price: %1\nAmount is gross B3 at the limit; original token caps remain unchanged. Actual B3 and fees depend on the auction fill.").arg(ExactInversePrice(level.canonical_price, decimals)) : QString{})};
+            (inverse ? QObject::tr("\nExact reciprocal price: %1\nAmount is gross B3 at the limit; original token caps remain unchanged. Actual B3 and fees depend on the auction fill.").arg(ExactInversePrice(level.canonical_price, units.decimals)) : QString{})};
         for (int c{0}; c < 3; ++c) {
             auto* item{table->item(row, c)};
             if (!item) {
@@ -147,22 +147,26 @@ void B3FlowMeshOrderBook::setSnapshot(const std::optional<B3FlowMeshMarketData::
         if (table->horizontalHeaderItem(c)->toolTip() != labels[c]) table->horizontalHeaderItem(c)->setToolTip(labels[c]);
     }
     if (!known || !snapshot->certified || (snapshot->remote && (!snapshot->certificate_verified || !snapshot->account_state_verified))) {
-        Rows(m_asks, {}, true, inverse, 0, B3Theme::kNegative); Rows(m_bids, {}, false, inverse, 0, B3Theme::kPositive);
-        m_last->setText(tr("Last trade  —")); m_spread->setText(tr("Spread  —"));
+        Rows(m_asks, {}, true, inverse, {}, B3Theme::kNegative); Rows(m_bids, {}, false, inverse, {}, B3Theme::kPositive);
+        m_last->setText(tr("Last trade  —")); m_spread->setText(tr("Spread  —")); m_spread->setToolTip(QString{});
+        m_last->setToolTip(tr("Historical last trade, not the current book midpoint. Endpoint-reported history is not independently execution-verified when marked reported."));
         m_note->setText(!snapshot ? tr("Select a market · no snapshot") : !known ? tr("Verified asset precision required") : tr("Verified order state unavailable")); return;
     }
     const auto& s{*snapshot}; const auto book{ProjectLimitBook(s, inverse)};
-    Rows(m_asks, book.asks, true, inverse, s.units.decimals, B3Theme::kNegative);
-    Rows(m_bids, book.bids, false, inverse, s.units.decimals, B3Theme::kPositive);
-    QString last{tr("Last trade  —")};
+    Rows(m_asks, book.asks, true, inverse, s.units, B3Theme::kNegative);
+    Rows(m_bids, book.bids, false, inverse, s.units, B3Theme::kPositive);
+    QString last{tr("Last trade  —")}, last_tip{tr("Historical last trade, not the current book midpoint. Endpoint-reported history is not independently execution-verified when marked reported.")};
     for (auto it{s.history.rbegin()}; it != s.history.rend(); ++it) if (it->cleared && it->quantity > 0) {
-        last = (s.remote && !s.execution_result_verified ? tr("Reported last  %1 %2") : tr("Last trade  %1 %2"))
-            .arg(FormatDisplayPrice(it->price, s.units.decimals, inverse), quote); break;
+        const auto price{DisplayPrice(it->price, s.units, inverse)};
+        last = (s.remote && !s.execution_result_verified ? tr("Reported last  %1 %2") : tr("Last trade  %1 %2")).arg(price.text, quote);
+        if (price.approximate) last_tip += tr("\nExact price: %1 %2").arg(price.exact, quote);
+        break;
     }
     m_last->setText(last);
-    m_last->setToolTip(tr("Historical last trade, not the current book midpoint. Endpoint-reported history is not independently execution-verified when marked reported."));
+    m_last->setToolTip(last_tip);
     const bool crossed{book.canonical_best_bid && book.canonical_best_ask && *book.canonical_best_bid > *book.canonical_best_ask};
-    m_spread->setText(!book.spread.isEmpty() ? tr("Spread  %1 %2").arg(book.spread, quote) : crossed ? tr("Crossed auction levels · no positive spread") : book.complete ? tr("Spread  — · two sides required") : tr("Spread unavailable · partial limit book"));
+    m_spread->setText(!book.spread.isEmpty() ? tr("Spread  %1 %2").arg(book.spread_display, quote) : crossed ? tr("Crossed auction levels · no positive spread") : book.complete ? tr("Spread  — · two sides required") : tr("Spread unavailable · partial limit book"));
+    m_spread->setToolTip(!book.spread.isEmpty() && book.spread_display != book.spread ? tr("Exact spread: %1 %2").arg(book.spread, quote) : QString{});
     QString note{tr("Limit orders · uniform-price auction")};
     if (book.asks.empty() && book.bids.empty()) note += tr("\nNo displayable limit orders");
     if (!s.curves_complete) note += tr("\nPartial snapshot · other orders may be missing");
